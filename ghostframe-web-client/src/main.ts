@@ -8,13 +8,15 @@ function log(msg: string) {
 }
 
 async function main() {
-  // The server's Tailscale hostname and the ephemeral cert hash
-  // will be provided at runtime via URL params or config
+  // The `host` parameter is expected to already include the port, because
+  // the E2E test's loopback UDP forwarder binds to 127.0.0.1:<random>. If no
+  // host is passed, fall back to the production tailnet hostname + default
+  // port so a developer can load the page manually against a running xdaemon.
   const url = new URL(window.location.href);
-  const serverHost = url.searchParams.get('host') || 'ghostframe-server';
-  const certHash = url.searchParams.get('certHash') || '';
+  const serverHost = url.searchParams.get('host') ?? 'ghostframe-server:4443';
+  const certHash = url.searchParams.get('certHash') ?? '';
 
-  const wtUrl = `https://${serverHost}:4443/`;
+  const wtUrl = `https://${serverHost}/`;
 
   log(`Connecting to ${wtUrl}...`);
 
