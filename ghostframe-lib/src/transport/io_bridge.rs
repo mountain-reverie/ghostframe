@@ -14,7 +14,7 @@
 
 use std::future::{pending, Future};
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::unix::io::FromRawFd;
 use std::pin::Pin;
 use std::time::Instant;
@@ -28,6 +28,11 @@ use crate::transport::ghostbridge::{
     encode_frame, parse_frame_rest, GhostbridgeConfig, GhostbridgeHandle,
 };
 use crate::transport::quic::QuicServer;
+
+/// Scratch buffer size for quinn-proto's `endpoint.handle` / `conn.poll_transmit`.
+/// Sized above a 1500-byte MTU with headroom for ECN/padding; quinn-proto may
+/// write a full datagram into this buffer in a single call.
+const QUIC_SCRATCH: usize = 2048;
 
 pub struct IoBridge {
     /// Keep the ghostbridge handle alive so the socketpair fd stays open.
@@ -66,7 +71,12 @@ impl IoBridge {
         let server = QuicServer::new()?;
         tracing::info!(cert_sha256 = %server.cert_info().sha256_hex, "QUIC server ready");
 
-        let local_addr: SocketAddr = "0.0.0.0:4443".parse().unwrap();
+        // Derive local_addr from listen_addr so that quinn-proto's local_ip
+        // hint matches the port we actually bound. listen_addr is in the form
+        // "[host]:port" or ":port"; for M0 the host is always "0.0.0.0".
+        let port = parse_listen_port(listen_addr)?;
+        let local_addr = SocketAddr::from((IpAddr::V4(Ipv4Addr::UNSPECIFIED), port));
+
         Ok(Self {
             _handle: Some(handle),
             stream,
@@ -146,7 +156,7 @@ impl IoBridge {
 
         let packet = parse_frame_rest(&rest, payload_len)?;
 
-        let mut buf: Vec<u8> = Vec::with_capacity(2048);
+        let mut buf: Vec<u8> = Vec::with_capacity(QUIC_SCRATCH);
         let data = BytesMut::from(packet.payload.as_slice());
 
         if let Some(transmit) = self.server.handle_datagram(
@@ -169,7 +179,7 @@ impl IoBridge {
     /// Write all pending outbound QUIC transmits back to ghostbridge.
     async fn drain_outbound(&mut self) -> io::Result<()> {
         let now = Instant::now();
-        let mut buf: Vec<u8> = Vec::with_capacity(2048);
+        let mut buf: Vec<u8> = Vec::with_capacity(QUIC_SCRATCH);
 
         loop {
             buf.clear();
@@ -210,6 +220,20 @@ impl IoBridge {
     }
 }
 
+/// Parse the port from a `":<port>"` or `"<host>:<port>"` listen address.
+fn parse_listen_port(listen_addr: &str) -> io::Result<u16> {
+    listen_addr
+        .rsplit(':')
+        .next()
+        .and_then(|s| s.parse::<u16>().ok())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid listen_addr: {listen_addr}"),
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,24 +244,66 @@ mod tests {
     #[tokio::test]
     async fn run_exits_cleanly_on_eof() {
         let (our_end, peer) = UnixStream::pair().expect("UnixStream::pair failed");
-
         let server = QuicServer::new().expect("QuicServer::new failed");
         let mut bridge = IoBridge::new_with_stream_for_test(our_end, server);
 
-        // Spawn run() as a task.
         let run_handle = tokio::spawn(async move { bridge.run().await });
-
-        // Drop the peer end to trigger EOF on `our_end`.
         drop(peer);
 
-        // run() should return Ok(()) within a short timeout.
         let result = tokio::time::timeout(std::time::Duration::from_secs(5), run_handle).await;
-
         match result {
-            Ok(Ok(Ok(()))) => { /* expected */ }
+            Ok(Ok(Ok(()))) => {}
             Ok(Ok(Err(e))) => panic!("run() returned Err: {e}"),
             Ok(Err(join_err)) => panic!("task panicked: {join_err}"),
             Err(_) => panic!("run() did not return within timeout"),
         }
+    }
+
+    /// A malformed frame must be logged and swallowed without killing the
+    /// event loop. We write a short header declaring `total_len = 4`, which
+    /// fails `process_inbound`'s minimum-size check, then drop the peer to
+    /// trigger clean shutdown. The `Ok(())` return proves the loop kept
+    /// running after the error.
+    #[tokio::test]
+    async fn run_survives_malformed_frame() {
+        use tokio::io::AsyncWriteExt;
+
+        let (our_end, mut peer) = UnixStream::pair().expect("UnixStream::pair failed");
+        let server = QuicServer::new().expect("QuicServer::new failed");
+        let mut bridge = IoBridge::new_with_stream_for_test(our_end, server);
+
+        let run_handle = tokio::spawn(async move { bridge.run().await });
+
+        // total_len=4 (smaller than 8 header), payload_len=0. `read_exact`
+        // will consume these 8 bytes; `process_inbound` then rejects with
+        // "frame too short" and the loop continues.
+        let bogus = [0u8, 0, 0, 4, 0, 0, 0, 0];
+        peer.write_all(&bogus).await.expect("peer write failed");
+        peer.flush().await.ok();
+
+        // Give the loop a moment to observe and swallow the error.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(peer);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), run_handle).await;
+        match result {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(e))) => panic!("run() returned Err: {e}"),
+            Ok(Err(join_err)) => panic!("task panicked: {join_err}"),
+            Err(_) => panic!("run() did not return within timeout"),
+        }
+    }
+
+    #[test]
+    fn parse_listen_port_accepts_bare_port() {
+        assert_eq!(parse_listen_port(":4443").unwrap(), 4443);
+        assert_eq!(parse_listen_port("0.0.0.0:4443").unwrap(), 4443);
+        assert_eq!(parse_listen_port("[::]:4443").unwrap(), 4443);
+    }
+
+    #[test]
+    fn parse_listen_port_rejects_garbage() {
+        assert!(parse_listen_port("nope").is_err());
+        assert!(parse_listen_port(":abc").is_err());
     }
 }
