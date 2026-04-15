@@ -1,0 +1,10 @@
+[package]
+name = "ghostframe-xdaemon"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ghostframe-lib = { path = "../ghostframe-lib" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
