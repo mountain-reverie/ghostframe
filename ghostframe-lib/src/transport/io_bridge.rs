@@ -20,6 +20,8 @@ use std::pin::Pin;
 use std::time::Instant;
 
 use bytes::BytesMut;
+use quinn_proto::{ConnectionHandle, Event, StreamEvent};
+use std::collections::HashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream as TokioUnixStream;
 use tokio::time::{sleep_until, Instant as TokioInstant};
@@ -28,6 +30,7 @@ use crate::transport::ghostbridge::{
     encode_frame, parse_frame_rest, GhostbridgeConfig, GhostbridgeHandle,
 };
 use crate::transport::quic::QuicServer;
+use crate::transport::webtransport::WebTransportServer;
 
 /// Scratch buffer size for quinn-proto's `endpoint.handle` / `conn.poll_transmit`.
 /// Sized above a 1500-byte MTU with headroom for ECN/padding; quinn-proto may
@@ -44,6 +47,8 @@ pub struct IoBridge {
     /// The local address of the UDP listener; passed as `local_ip` to
     /// quinn-proto.  M0: we only bind a single port so this is constant.
     local_addr: SocketAddr,
+    /// Per-connection WebTransport handshake state.
+    wt_sessions: HashMap<ConnectionHandle, WebTransportServer>,
 }
 
 impl IoBridge {
@@ -82,6 +87,7 @@ impl IoBridge {
             stream,
             server,
             local_addr,
+            wt_sessions: HashMap::new(),
         })
     }
 
@@ -196,13 +202,71 @@ impl IoBridge {
         Ok(())
     }
 
-    /// Log all pending application-level QUIC events.
-    ///
-    /// Task 6 / Task 8 will add real handling here (WebTransport handshake,
-    /// ping/pong dispatch).
+    /// Drain all pending application-level QUIC events and drive the
+    /// WebTransport handshake state machine.
     fn drain_app_events(&mut self) {
-        while let Some((handle, event)) = self.server.poll_events() {
+        // Collect events first so we can mutably borrow `self.wt_sessions` and
+        // `self.server.connections` in the same loop body.
+        let mut events_buf: Vec<(ConnectionHandle, Event)> = Vec::new();
+        while let Some(pair) = self.server.poll_events() {
+            events_buf.push(pair);
+        }
+
+        for (handle, event) in events_buf {
             tracing::trace!(?handle, ?event, "app event");
+
+            match event {
+                Event::Connected => {
+                    // New connection fully established — start the H3 handshake.
+                    let wt = self.wt_sessions.entry(handle).or_default();
+                    if let Some(conn) = self.server.connections.get_mut(&handle) {
+                        wt.on_new_connection(conn);
+                    }
+                }
+
+                Event::Stream(StreamEvent::Opened { dir }) => {
+                    // Accept all newly-opened peer streams for this direction.
+                    if let (Some(wt), Some(conn)) = (
+                        self.wt_sessions.get_mut(&handle),
+                        self.server.connections.get_mut(&handle),
+                    ) {
+                        wt.on_stream_opened(conn, dir);
+                    }
+                }
+
+                Event::Stream(StreamEvent::Readable { id }) => {
+                    if let (Some(wt), Some(conn)) = (
+                        self.wt_sessions.get_mut(&handle),
+                        self.server.connections.get_mut(&handle),
+                    ) {
+                        wt.on_stream_readable(conn, id);
+                    }
+                }
+
+                Event::DatagramReceived => {
+                    if let Some(wt) = self.wt_sessions.get_mut(&handle) {
+                        if let Some(conn) = self.server.connections.get_mut(&handle) {
+                            while let Some(payload) = wt.recv_datagram(conn) {
+                                // Task 8 replaces this log with ping/pong dispatch.
+                                tracing::debug!(
+                                    ?handle,
+                                    bytes = payload.len(),
+                                    "WebTransport datagram received"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                Event::ConnectionLost { reason } => {
+                    tracing::info!(?handle, %reason, "connection lost");
+                    self.wt_sessions.remove(&handle);
+                }
+
+                _ => {
+                    // HandshakeDataReady, DatagramsUnblocked, etc. — no action needed.
+                }
+            }
         }
     }
 
@@ -216,6 +280,7 @@ impl IoBridge {
             stream,
             server,
             local_addr: "0.0.0.0:4443".parse().unwrap(),
+            wt_sessions: HashMap::new(),
         }
     }
 }
