@@ -1,1 +1,16 @@
+/target
 .worktrees/
+Cargo.lock.bak
+
+# Node / web client build output
+node_modules/
+ghostframe-web-client/dist/
+
+# Editor / OS cruft
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Tailscale state dirs used by local manual smoke tests
+/tmp/ghostframe-ts*
