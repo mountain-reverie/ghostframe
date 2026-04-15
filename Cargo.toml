@@ -36,8 +36,9 @@ libc = { version = "=0.2.185" }
 # cbindgen 0.29.2 — latest stable 0.x
 cbindgen = { version = "=0.29.2" }
 
-# sha2 0.11.0 — latest stable (0.11.0 is fully released, not a pre-release)
-sha2 = { version = "=0.11.0" }
+# sha2 0.10.9 — pinned to 0.10.x to avoid duplicate-version conflicts with
+# other RustCrypto crates in the rustls/quinn tree (0.11.x is a major bump).
+sha2 = { version = "=0.10.9" }
 
 # hex 0.4.3 — latest stable 0.4.x
 hex = { version = "=0.4.3" }
