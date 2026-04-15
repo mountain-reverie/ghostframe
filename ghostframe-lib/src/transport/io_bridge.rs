@@ -30,8 +30,10 @@ use crate::transport::ghostbridge::{
 use crate::transport::quic::QuicServer;
 
 pub struct IoBridge {
-    /// Keep the ghostbridge handle alive so the fd is not closed.
-    _handle: GhostbridgeHandle,
+    /// Keep the ghostbridge handle alive so the socketpair fd stays open.
+    /// `None` only in the test-only constructor, which builds directly from a
+    /// `UnixStream::pair()` and has no tsnet node to own.
+    _handle: Option<GhostbridgeHandle>,
     stream: TokioUnixStream,
     server: QuicServer,
     /// The local address of the UDP listener; passed as `local_ip` to
@@ -66,7 +68,7 @@ impl IoBridge {
 
         let local_addr: SocketAddr = "0.0.0.0:4443".parse().unwrap();
         Ok(Self {
-            _handle: handle,
+            _handle: Some(handle),
             stream,
             server,
             local_addr,
@@ -195,61 +197,15 @@ impl IoBridge {
     }
 
     /// Test-only constructor that accepts a pre-built stream and server,
-    /// bypassing the real ghostbridge connection.
+    /// bypassing the real ghostbridge connection. No tsnet node is held, so
+    /// `_handle` is `None` and no `gbridge_close` is called on Drop.
     #[cfg(test)]
     pub(crate) fn new_with_stream_for_test(stream: TokioUnixStream, server: QuicServer) -> Self {
-        let local_addr: SocketAddr = "0.0.0.0:4443".parse().unwrap();
-        // Safety: we pass a dummy fd (-1) that will never be used because
-        // _handle is only kept alive for Drop, but GhostbridgeHandle::drop
-        // calls gbridge_close which tolerates unknown handles.  In tests the
-        // linker supplies a stub ghostbridge so this is acceptable.
-        //
-        // Actually we cannot construct GhostbridgeHandle directly here since
-        // the `sd` field is private.  Use a zero-sized wrapper instead:
-        // just leak the handle concern — the test process exits anyway.
-        //
-        // We work around this by making the IoBridge hold an Option<_handle>.
-        // But that would require a bigger refactor. Instead, we use
-        // std::mem::ManuallyDrop to create a fake handle via unsafe transmute.
-        //
-        // Simpler: restructure IoBridge to use Option<GhostbridgeHandle>.
-        // That is a larger change. For test purposes, use a separate struct
-        // field pattern. We avoid all this by just not having _handle at all
-        // in test builds — instead use a cfg-gated field.
-        //
-        // The simplest correct approach: accept that the test will leak the
-        // fd-less GhostbridgeHandle. Since gbridge_close(-1) returns an error
-        // code but doesn't crash, and since tests are short-lived processes,
-        // this is acceptable.
-        //
-        // We cannot call GhostbridgeHandle::connect() in tests (no tailnet).
-        // The cleanest solution without restructuring the public API is to
-        // use std::mem::forget on a never-initialized handle — but we can't
-        // construct one. So we use a workaround: hold the handle as
-        // Option<GhostbridgeHandle> and pass None in tests.
-        //
-        // Restructure to Option to keep it clean (see field definition above).
         IoBridge {
-            _handle: unsafe {
-                // SAFETY: GhostbridgeHandle is repr(C)-compatible with a
-                // single i32. We use -1 as sd so gbridge_close returns
-                // non-zero (which is logged as a warning) but does not crash.
-                // Tests are single-process and exit immediately after the
-                // assertion, so the warn! is harmless.
-                //
-                // Actually the above is not correct — we don't know the
-                // layout of GhostbridgeHandle. Use std::mem::transmute only
-                // when the size matches.
-                //
-                // GhostbridgeHandle has a single `sd: c_int` field (4 bytes
-                // on all supported platforms).  std::mem::transmute requires
-                // equal sizes; c_int is i32 (4 bytes), so transmuting -1i32
-                // into GhostbridgeHandle is safe for the test scenario.
-                std::mem::transmute::<i32, GhostbridgeHandle>(-1i32)
-            },
+            _handle: None,
             stream,
             server,
-            local_addr,
+            local_addr: "0.0.0.0:4443".parse().unwrap(),
         }
     }
 }
