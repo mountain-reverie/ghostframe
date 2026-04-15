@@ -14,3 +14,7 @@ ghostframe-web-client/dist/
 
 # Tailscale state dirs used by local manual smoke tests
 /tmp/ghostframe-ts*
+
+# Ghostbridge build artifacts
+ghostbridge/libghostbridge.a
+ghostbridge/libghostbridge.h
