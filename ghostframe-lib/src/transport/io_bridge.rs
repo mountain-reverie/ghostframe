@@ -29,6 +29,7 @@ use tokio::time::{sleep_until, Instant as TokioInstant};
 use crate::transport::ghostbridge::{
     encode_frame, parse_frame_rest, GhostbridgeConfig, GhostbridgeHandle,
 };
+use crate::transport::protocol::{PING_PAYLOAD, PONG_PAYLOAD};
 use crate::transport::quic::QuicServer;
 use crate::transport::webtransport::WebTransportServer;
 
@@ -247,12 +248,18 @@ impl IoBridge {
                     if let Some(wt) = self.wt_sessions.get_mut(&handle) {
                         if let Some(conn) = self.server.connections.get_mut(&handle) {
                             while let Some(payload) = wt.recv_datagram(conn) {
-                                // Task 8 replaces this log with ping/pong dispatch.
-                                tracing::debug!(
-                                    ?handle,
-                                    bytes = payload.len(),
-                                    "WebTransport datagram received"
-                                );
+                                if let Some(response) = handle_datagram_payload(&payload) {
+                                    tracing::debug!(?handle, "ping received, sending pong");
+                                    if let Err(e) = wt.send_datagram(conn, response) {
+                                        tracing::warn!(?handle, error = ?e, "failed to send pong");
+                                    }
+                                } else {
+                                    tracing::trace!(
+                                        ?handle,
+                                        bytes = payload.len(),
+                                        "WebTransport datagram received (unknown payload)"
+                                    );
+                                }
                             }
                         }
                     }
@@ -282,6 +289,18 @@ impl IoBridge {
             local_addr: "0.0.0.0:4443".parse().unwrap(),
             wt_sessions: HashMap::new(),
         }
+    }
+}
+
+/// Dispatch a raw WebTransport datagram payload.
+///
+/// Returns `Some(response)` when a reply should be sent, or `None` for
+/// unknown payloads (which the caller logs at trace level).
+pub(crate) fn handle_datagram_payload(payload: &[u8]) -> Option<&'static [u8]> {
+    if payload == PING_PAYLOAD {
+        Some(PONG_PAYLOAD)
+    } else {
+        None
     }
 }
 
@@ -357,6 +376,13 @@ mod tests {
             Ok(Err(join_err)) => panic!("task panicked: {join_err}"),
             Err(_) => panic!("run() did not return within timeout"),
         }
+    }
+
+    #[test]
+    fn ping_produces_pong() {
+        assert_eq!(handle_datagram_payload(b"ping"), Some(&b"pong"[..]));
+        assert_eq!(handle_datagram_payload(b"not ping"), None);
+        assert_eq!(handle_datagram_payload(b""), None);
     }
 
     #[test]

@@ -5,6 +5,6 @@ edition = "2021"
 
 [dependencies]
 ghostframe-lib = { path = "../ghostframe-lib" }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
