@@ -29,7 +29,6 @@ var (
 
 type serverHandle struct {
 	server *tsnet.Server
-	cancel context.CancelFunc
 }
 
 // setNonblock sets O_NONBLOCK on a raw fd. The Rust side wraps this fd in
@@ -45,7 +44,6 @@ func gbridge_new(cHostname, cAuthkey, cStateDir, cControlURL *C.char, sdOut *C.i
 	stateDir := C.GoString(cStateDir)
 	controlURL := C.GoString(cControlURL)
 
-	ctx, cancel := context.WithCancel(context.Background())
 	s := &tsnet.Server{
 		Hostname: hostname,
 		AuthKey:  authkey,
@@ -58,10 +56,9 @@ func gbridge_new(cHostname, cAuthkey, cStateDir, cControlURL *C.char, sdOut *C.i
 	serversMu.Lock()
 	id := nextHandle
 	nextHandle++
-	servers[id] = &serverHandle{server: s, cancel: cancel}
+	servers[id] = &serverHandle{server: s}
 	serversMu.Unlock()
 
-	_ = ctx
 	*sdOut = C.int32_t(id)
 	return 0
 }
@@ -132,7 +129,6 @@ func gbridge_close(sd C.int32_t) C.gbridge_status {
 	if !ok {
 		return -1
 	}
-	h.cancel()
 	h.server.Close()
 	return 0
 }
@@ -243,7 +239,9 @@ func spawnPacketBridge(conn readFromWriter, goFd int) {
 			}
 			totalLen := binary.BigEndian.Uint32(header[0:4])
 			payloadLen := binary.BigEndian.Uint32(header[4:8])
-			if totalLen < 8+payloadLen+3 {
+			// Promote to uint64 so the minimum-frame-size check cannot wrap
+			// if a malformed peer sends a huge payloadLen.
+			if uint64(totalLen) < uint64(payloadLen)+11 {
 				return // malformed
 			}
 			rest := make([]byte, totalLen-8)
