@@ -171,7 +171,12 @@ mod tests {
     #[test]
     fn can_create_endpoint() {
         let server = QuicServer::new().expect("endpoint creation should succeed");
-        // SHA-256 hex string is always exactly 64 hex characters.
-        assert_eq!(server.cert_info().sha256_hex.len(), 64);
+        // SHA-256 hex string is always exactly 64 lowercase hex characters.
+        let hash = &server.cert_info().sha256_hex;
+        assert_eq!(hash.len(), 64);
+        assert!(
+            hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "cert hash should be pure hex, got: {hash}"
+        );
     }
 }
