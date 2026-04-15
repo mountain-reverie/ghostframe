@@ -3,7 +3,7 @@
 //! Task 4: constructs a `quinn_proto::Endpoint` configured for WebTransport
 //! (HTTP/3 ALPN, datagrams enabled), generates a self-signed cert with
 //! `localhost` and `127.0.0.1` SANs, and exports the SHA-256 of the cert DER
-//! for browser cert-hash pinning.  Method bodies are stubs filled by Task 5.
+//! for browser cert-hash pinning.  Method bodies filled in Task 5.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -25,11 +25,9 @@ pub struct CertInfo {
 }
 
 pub struct QuicServer {
-    /// The quinn-proto endpoint state machine.  Consumed by Task 5 (I/O bridge).
-    #[allow(dead_code)]
+    /// The quinn-proto endpoint state machine.
     pub(crate) endpoint: Endpoint,
-    /// Active connections keyed by their handle.  Populated by Task 5.
-    #[allow(dead_code)]
+    /// Active connections keyed by their handle.
     pub(crate) connections: HashMap<ConnectionHandle, Connection>,
     /// Certificate fingerprint for browser pinning.
     pub(crate) cert_info: CertInfo,
@@ -108,17 +106,17 @@ impl QuicServer {
     }
 
     // -------------------------------------------------------------------------
-    // Method surface consumed by the I/O bridge (Task 5).
-    // Bodies are intentionally left as `unimplemented!` stubs so that Task 5
-    // only needs to fill them in without changing signatures.
+    // Method surface consumed by the I/O bridge.
     // -------------------------------------------------------------------------
 
     /// Feed an inbound UDP datagram into the endpoint state machine.
     ///
-    /// `local_ip` is the destination IP of the received packet (may be `None`
-    /// if the OS didn't report it); `ecn` carries the ECN codepoint.
-    /// In quinn-proto 0.11 `Endpoint::handle` takes `Option<IpAddr>` (not
-    /// `SocketAddr`) for `local_ip`, and owns the `data: BytesMut`.
+    /// Handles all three `DatagramEvent` variants internally:
+    /// - `NewConnection(Incoming)` — auto-accepted; new `Connection` inserted
+    ///   into `self.connections`.
+    /// - `ConnectionEvent(handle, event)` — dispatched to the right connection.
+    /// - `Response(Transmit)` — returned to the caller so the I/O bridge can
+    ///   write the response bytes (already in `buf`) back to ghostbridge.
     pub fn handle_datagram(
         &mut self,
         now: Instant,
@@ -127,40 +125,125 @@ impl QuicServer {
         ecn: Option<EcnCodepoint>,
         data: BytesMut,
         buf: &mut Vec<u8>,
-    ) -> Option<DatagramEvent> {
-        let _ = (now, remote, local_ip, ecn, data, buf);
-        unimplemented!("Task 5")
+    ) -> Option<Transmit> {
+        match self.endpoint.handle(now, remote, local_ip, ecn, data, buf) {
+            None => None,
+
+            Some(DatagramEvent::NewConnection(incoming)) => {
+                match self.endpoint.accept(incoming, now, buf, None) {
+                    Ok((handle, conn)) => {
+                        tracing::debug!(?handle, %remote, "new QUIC connection accepted");
+                        self.connections.insert(handle, conn);
+                        None
+                    }
+                    Err(err) => {
+                        tracing::warn!(%remote, cause=%err.cause, "connection accept failed");
+                        // err.response is an optional Transmit (e.g. CONNECTION_CLOSE)
+                        err.response
+                    }
+                }
+            }
+
+            Some(DatagramEvent::ConnectionEvent(handle, event)) => {
+                if let Some(conn) = self.connections.get_mut(&handle) {
+                    conn.handle_event(event);
+                } else {
+                    tracing::warn!(?handle, "ConnectionEvent for unknown connection");
+                }
+                None
+            }
+
+            Some(DatagramEvent::Response(transmit)) => Some(transmit),
+        }
     }
 
-    /// Drain one pending outbound transmit from a connection.
+    /// Drain one pending outbound transmit from any connection.
     ///
-    /// In quinn-proto 0.11 `Connection::poll_transmit` takes
-    /// `(now, max_datagrams: usize, buf: &mut Vec<u8>)`.
+    /// The caller is responsible for clearing `buf` between successive calls so
+    /// each call writes a fresh datagram into the shared scratch buffer.
+    ///
+    /// Returns `None` when all connections have been drained.
     pub fn poll_transmit(
         &mut self,
         now: Instant,
         max_datagrams: usize,
         buf: &mut Vec<u8>,
     ) -> Option<Transmit> {
-        let _ = (now, max_datagrams, buf);
-        unimplemented!("Task 5")
+        for conn in self.connections.values_mut() {
+            if let Some(t) = conn.poll_transmit(now, max_datagrams, buf) {
+                return Some(t);
+            }
+        }
+        None
     }
 
     /// Earliest deadline across all connections, for driving the tokio timer.
-    pub fn next_timeout(&self) -> Option<Instant> {
-        unimplemented!("Task 5")
+    pub fn next_timeout(&mut self) -> Option<Instant> {
+        self.connections
+            .values_mut()
+            .filter_map(|conn| conn.poll_timeout())
+            .min()
     }
 
-    /// Fire all connection timeouts whose deadline has passed.
+    /// Fire all connection timeouts whose deadline has passed, then prune
+    /// connections that have fully drained.
     pub fn handle_timeout(&mut self, now: Instant) {
-        let _ = now;
-        unimplemented!("Task 5")
+        for conn in self.connections.values_mut() {
+            if conn.poll_timeout().is_some_and(|t| t <= now) {
+                conn.handle_timeout(now);
+            }
+        }
+        // Prune drained connections.
+        self.connections.retain(|handle, conn| {
+            if conn.is_drained() {
+                tracing::debug!(?handle, "connection drained, removing");
+                false
+            } else {
+                true
+            }
+        });
+        // Drain endpoint events produced by handle_timeout on connections.
+        self.drain_endpoint_events();
     }
 
-    /// Drain one application-level event (new connection, stream data, datagram
-    /// received, connection closed, …).
+    /// Drain one application-level event from any connection.
+    ///
+    /// Also removes connections that emit `Event::ConnectionLost`.
     pub fn poll_events(&mut self) -> Option<(ConnectionHandle, Event)> {
-        unimplemented!("Task 5")
+        // Collect handles so we can mutably borrow one at a time.
+        let handles: Vec<ConnectionHandle> = self.connections.keys().copied().collect();
+        for handle in handles {
+            if let Some(conn) = self.connections.get_mut(&handle) {
+                if let Some(event) = conn.poll() {
+                    let lost = matches!(event, Event::ConnectionLost { .. });
+                    if lost {
+                        self.connections.remove(&handle);
+                    }
+                    return Some((handle, event));
+                }
+            }
+        }
+        None
+    }
+
+    /// Drain `EndpointEvent`s from every connection and feed them back into the
+    /// endpoint.  Any resulting `ConnectionEvent`s are fed back to the
+    /// corresponding connection.
+    pub(crate) fn drain_endpoint_events(&mut self) {
+        let handles: Vec<ConnectionHandle> = self.connections.keys().copied().collect();
+        for handle in handles {
+            while let Some(ep_event) = self
+                .connections
+                .get_mut(&handle)
+                .and_then(|conn| conn.poll_endpoint_events())
+            {
+                if let Some(conn_event) = self.endpoint.handle_event(handle, ep_event) {
+                    if let Some(conn) = self.connections.get_mut(&handle) {
+                        conn.handle_event(conn_event);
+                    }
+                }
+            }
+        }
     }
 }
 
