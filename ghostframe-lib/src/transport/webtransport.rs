@@ -284,6 +284,14 @@ impl WebTransportServer {
             Err(web_transport_proto::SettingsError::UnexpectedEnd) => {
                 // Partial data — wait for more bytes.
             }
+            Err(web_transport_proto::SettingsError::UnexpectedStreamType(_)) => {
+                // Chrome opens QPACK encoder (0x02) and decoder (0x03) streams
+                // alongside the HTTP/3 control stream (0x00). We don't need
+                // their contents for M0; silently drop the buffer so we stop
+                // trying to decode them as SETTINGS.
+                tracing::trace!(stream_id = ?sid, "dropping non-control uni stream");
+                self.stream_bufs.remove(&sid);
+            }
             Err(e) => {
                 tracing::warn!(stream_id = ?sid, error = ?e, "SETTINGS decode error");
                 self.stream_bufs.remove(&sid);
@@ -322,9 +330,22 @@ impl WebTransportServer {
                     return;
                 }
 
+                // ConnectResponse is tiny (~20 bytes) and written on a fresh
+                // bidi stream, so a partial write would indicate flow-control
+                // exhaustion that points at a deeper problem. Warn rather
+                // than silently accept a short write.
                 match conn.send_stream(sid).write(&resp_buf) {
-                    Ok(n) => {
+                    Ok(n) if n == resp_buf.len() => {
                         tracing::debug!(stream_id = ?sid, bytes = n, "WebTransport 200 response sent");
+                    }
+                    Ok(n) => {
+                        tracing::warn!(
+                            stream_id = ?sid,
+                            written = n,
+                            expected = resp_buf.len(),
+                            "short write on CONNECT response"
+                        );
+                        return;
                     }
                     Err(e) => {
                         tracing::warn!(stream_id = ?sid, error = ?e, "failed to write CONNECT response");
