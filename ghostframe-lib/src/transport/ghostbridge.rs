@@ -181,7 +181,10 @@ impl UdpPacketConn {
 /// Shared between tests here and the tokio I/O bridge.
 ///
 /// `rest` is expected to contain `[payload (payload_len bytes)][port u16 BE][host\0]`.
-pub(crate) fn parse_frame_rest(rest: &[u8], payload_len: usize) -> io::Result<UdpPacket> {
+///
+/// Visibility is `pub` so the E2E integration test harness can reuse the
+/// framing implementation without duplicating it.
+pub fn parse_frame_rest(rest: &[u8], payload_len: usize) -> io::Result<UdpPacket> {
     // Minimum rest length is payload + 2 (port) + 1 (NUL terminator).
     if rest.len() < payload_len.saturating_add(3) {
         return Err(io::Error::new(
@@ -215,7 +218,10 @@ pub(crate) fn parse_frame_rest(rest: &[u8], payload_len: usize) -> io::Result<Ud
 
 /// Encode a UDP payload + destination address as a single framed packet for
 /// the ghostbridge socketpair. Shared between sync tests and the tokio bridge.
-pub(crate) fn encode_frame(payload: &[u8], addr: &SocketAddr) -> Vec<u8> {
+///
+/// Visibility is `pub` so the E2E integration test harness can reuse the
+/// framing implementation without duplicating it.
+pub fn encode_frame(payload: &[u8], addr: &SocketAddr) -> Vec<u8> {
     let host = addr.ip().to_string();
     let host_bytes = host.as_bytes();
     let total_len = (4 + 4 + payload.len() + 2 + host_bytes.len() + 1) as u32;

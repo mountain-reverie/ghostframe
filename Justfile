@@ -11,7 +11,8 @@ test-e2e:
     cargo test --test e2e
 
 containers-build:
-    docker build -t ghostframe/test-server tests/containers/test-server/
+    cargo build --release -p ghostframe-xdaemon
+    docker build -t ghostframe/test-server -f tests/containers/test-server/Dockerfile .
 
 lint:
     cargo clippy -- -D warnings
