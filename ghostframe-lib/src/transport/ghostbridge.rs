@@ -1,6 +1,23 @@
+//! Rust FFI bindings to the ghostbridge Go `c-archive`.
+//!
+//! Ghostbridge exposes `tsnet.Server.ListenPacket` / `Dial` as C-callable
+//! functions that return a Unix-domain socketpair fd. Each datagram crossing
+//! the fd is wrapped in a small length-prefixed frame so a single fd can
+//! carry UDP payload + source/destination address:
+//!
+//! ```text
+//! [total_len u32 BE] [payload_len u32 BE] [payload] [port u16 BE] [host\0]
+//! ```
+//!
+//! The returned fd is in `O_NONBLOCK` mode; production callers consume it via
+//! [`UdpPacketConn::into_raw_fd`] and wrap it in `tokio::net::UnixStream` in
+//! the I/O bridge (Task 5). The helpers [`parse_frame_rest`] and
+//! [`encode_frame`] are shared between the sync and async paths so there's
+//! exactly one implementation of the wire format.
+
 use std::ffi::{c_char, c_int, CStr, CString};
-use std::io::{self, Read, Write};
-use std::net::SocketAddr;
+use std::io;
+use std::net::{IpAddr, SocketAddr};
 use std::os::unix::io::{FromRawFd, IntoRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 
@@ -21,6 +38,8 @@ extern "C" {
 
 #[derive(Debug, thiserror::Error)]
 pub enum GhostbridgeError {
+    /// Raw return code from a ghostbridge C function. See `ghostbridge/main.go`
+    /// for the full set of negative values.
     #[error("ghostbridge C call failed: {0} (rc={1})")]
     Ffi(&'static str, c_int),
     #[error("invalid C string: {0}")]
@@ -74,7 +93,7 @@ impl GhostbridgeHandle {
     }
 
     /// Listen for incoming UDP packets on `addr` (e.g. `":4443"`).
-    /// Returns an owned socketpair fd already in O_NONBLOCK mode.
+    /// Returns an owned non-blocking socketpair fd wrapped as [`UdpPacketConn`].
     pub fn listen_udp(&self, addr: &str) -> Result<UdpPacketConn, GhostbridgeError> {
         let c_addr = CString::new(addr)?;
         let mut fd: c_int = -1;
@@ -82,7 +101,7 @@ impl GhostbridgeHandle {
         if rc < 0 {
             return Err(GhostbridgeError::Ffi("gbridge_listen_udp", rc));
         }
-        UdpPacketConn::from_raw_fd(fd)
+        Ok(UdpPacketConn::from_raw_fd(fd))
     }
 
     /// Dial a remote UDP address over the tailnet. Used by the E2E test to
@@ -94,10 +113,10 @@ impl GhostbridgeHandle {
         if rc < 0 {
             return Err(GhostbridgeError::Ffi("gbridge_dial_udp", rc));
         }
-        UdpPacketConn::from_raw_fd(fd)
+        Ok(UdpPacketConn::from_raw_fd(fd))
     }
 
-    pub fn get_ips(&self) -> Result<Vec<std::net::IpAddr>, GhostbridgeError> {
+    pub fn get_ips(&self) -> Result<Vec<IpAddr>, GhostbridgeError> {
         let mut buf = [0u8; 1024];
         let rc = unsafe { gbridge_getips(self.sd, buf.as_mut_ptr() as *mut c_char, buf.len()) };
         if rc < 0 {
@@ -119,7 +138,10 @@ impl GhostbridgeHandle {
 
 impl Drop for GhostbridgeHandle {
     fn drop(&mut self) {
-        unsafe { gbridge_close(self.sd) };
+        let rc = unsafe { gbridge_close(self.sd) };
+        if rc < 0 {
+            tracing::warn!(sd = self.sd, rc, "gbridge_close returned non-zero");
+        }
     }
 }
 
@@ -130,66 +152,46 @@ pub struct UdpPacket {
     pub addr: SocketAddr,
 }
 
-/// A framed UDP packet connection over a ghostbridge socketpair fd.
-///
-/// Owns the fd (via `UnixStream`) and is `!Sync` — all methods take `&mut self`.
-/// The fd is in O_NONBLOCK mode; the sync methods below exist only for unit
-/// tests. Production code consumes the raw fd via `into_raw_fd()` and wraps it
-/// in `tokio::net::UnixStream` (see Task 5).
+/// Owns a ghostbridge socketpair fd until it is handed off to the tokio I/O
+/// bridge via [`UdpPacketConn::into_raw_fd`]. The fd is in `O_NONBLOCK` mode,
+/// so reading/writing through the contained `UnixStream` directly would
+/// surface `WouldBlock` — production code should always wrap the raw fd in
+/// `tokio::net::UnixStream` before use.
 pub struct UdpPacketConn {
     stream: UnixStream,
 }
 
 impl UdpPacketConn {
-    fn from_raw_fd(fd: c_int) -> Result<Self, GhostbridgeError> {
-        // Safety: the fd is freshly returned from ghostbridge and nothing else owns it.
+    fn from_raw_fd(fd: c_int) -> Self {
+        // Safety: the fd is freshly returned from ghostbridge and nothing else
+        // owns it. ghostbridge sets O_NONBLOCK before returning the fd.
         let stream = unsafe { UnixStream::from_raw_fd(fd) };
-        // ghostbridge already set O_NONBLOCK, but tell std explicitly so that
-        // Read/Write honor it without EAGAIN being surfaced as an error in blocking calls.
-        stream.set_nonblocking(false)?; // unit tests use blocking I/O
-        Ok(Self { stream })
+        Self { stream }
     }
 
+    /// Consume the wrapper and return the raw non-blocking fd. The caller is
+    /// responsible for the fd's lifetime from this point forward — typically
+    /// by handing it to `tokio::net::UnixStream::from_std`.
     pub fn into_raw_fd(self) -> RawFd {
         self.stream.into_raw_fd()
     }
-
-    /// **Blocking** framed read. Only used by unit tests; production path uses tokio.
-    pub fn recv_from(&mut self) -> io::Result<UdpPacket> {
-        let mut header = [0u8; 8];
-        read_exact(&mut self.stream, &mut header)?;
-        let total_len = u32::from_be_bytes(header[0..4].try_into().unwrap()) as usize;
-        let payload_len = u32::from_be_bytes(header[4..8].try_into().unwrap()) as usize;
-        if total_len < 8 + payload_len + 3 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too short"));
-        }
-        let mut rest = vec![0u8; total_len - 8];
-        read_exact(&mut self.stream, &mut rest)?;
-        parse_frame_rest(&rest, payload_len)
-    }
-
-    /// **Blocking** framed write. Only used by unit tests.
-    pub fn send_to(&mut self, payload: &[u8], addr: &SocketAddr) -> io::Result<()> {
-        let frame = encode_frame(payload, addr);
-        self.stream.write_all(&frame)
-    }
 }
 
-fn read_exact(stream: &mut UnixStream, buf: &mut [u8]) -> io::Result<()> {
-    let mut off = 0;
-    while off < buf.len() {
-        let n = stream.read(&mut buf[off..])?;
-        if n == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed"));
-        }
-        off += n;
-    }
-    Ok(())
-}
-
-/// Parse the post-header bytes of a frame into an `UdpPacket`.
-/// Shared between the blocking path (above) and the tokio path (Task 5).
+/// Parse the post-header bytes of a frame into an [`UdpPacket`].
+/// Shared between tests here and the tokio I/O bridge (Task 5 will be the
+/// first non-test caller).
+///
+/// `rest` is expected to contain `[payload (payload_len bytes)][port u16 BE][host\0]`.
+#[allow(dead_code)] // Task 5 wires this into the tokio I/O bridge.
 pub(crate) fn parse_frame_rest(rest: &[u8], payload_len: usize) -> io::Result<UdpPacket> {
+    // Minimum rest length is payload + 2 (port) + 1 (NUL terminator).
+    if rest.len() < payload_len.saturating_add(3) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame rest shorter than declared payload",
+        ));
+    }
+
     let payload = rest[..payload_len].to_vec();
     let port = u16::from_be_bytes(rest[payload_len..payload_len + 2].try_into().unwrap());
     let host_bytes = &rest[payload_len + 2..];
@@ -197,12 +199,25 @@ pub(crate) fn parse_frame_rest(rest: &[u8], payload_len: usize) -> io::Result<Ud
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "frame host not null-terminated"))?
         .to_str()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "frame host not utf-8"))?;
-    let addr: SocketAddr = format!("{}:{}", host_str, port)
-        .parse()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid socket address"))?;
+
+    // IPv6 address literals contain colons and must be bracketed before
+    // parsing as a SocketAddr. ghostbridge stores the bare IP string
+    // produced by `net.SplitHostPort`, so this is the only place to add
+    // the brackets.
+    let addr: SocketAddr = if host_str.contains(':') {
+        format!("[{}]:{}", host_str, port)
+    } else {
+        format!("{}:{}", host_str, port)
+    }
+    .parse()
+    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid socket address"))?;
+
     Ok(UdpPacket { payload, addr })
 }
 
+/// Encode a UDP payload + destination address as a single framed packet for
+/// the ghostbridge socketpair. Shared between sync tests and the tokio bridge.
+#[allow(dead_code)] // Task 5 wires this into the tokio I/O bridge.
 pub(crate) fn encode_frame(payload: &[u8], addr: &SocketAddr) -> Vec<u8> {
     let host = addr.ip().to_string();
     let host_bytes = host.as_bytes();
@@ -221,53 +236,43 @@ pub(crate) fn encode_frame(payload: &[u8], addr: &SocketAddr) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
-    use std::os::unix::net::UnixStream;
 
-    #[test]
-    fn framing_round_trip() {
-        let (mut a, mut b) = UnixStream::pair().unwrap();
+    fn roundtrip(payload: &[u8], addr_str: &str) {
+        let addr: SocketAddr = addr_str.parse().unwrap();
+        let frame = encode_frame(payload, &addr);
 
-        let payload = b"hello world";
-        let _addr: std::net::SocketAddr = "100.64.0.2:4443".parse().unwrap();
+        let total_len = u32::from_be_bytes(frame[0..4].try_into().unwrap()) as usize;
+        let payload_len = u32::from_be_bytes(frame[4..8].try_into().unwrap()) as usize;
+        assert_eq!(total_len, frame.len(), "total_len must cover the frame");
+        assert_eq!(payload_len, payload.len(), "payload_len must match input");
 
-        // Write
-        let mut frame = Vec::new();
-        frame.extend_from_slice(&((4 + 4 + payload.len() + 2 + 9 + 1) as u32).to_be_bytes());
-        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-        frame.extend_from_slice(payload);
-        frame.extend_from_slice(&4443u16.to_be_bytes());
-        frame.extend_from_slice(b"100.64.0.2");
-        frame.push(0);
-        a.write_all(&frame).unwrap();
-        a.flush().unwrap();
-
-        // Read
-        let mut header = [0u8; 8];
-        b.read_exact(&mut header).unwrap();
-        let total_len = u32::from_be_bytes(header[0..4].try_into().unwrap()) as usize;
-        let payload_len = u32::from_be_bytes(header[4..8].try_into().unwrap()) as usize;
-        let mut rest = vec![0u8; total_len - 8];
-        b.read_exact(&mut rest).unwrap();
-
-        assert_eq!(&rest[..payload_len], payload);
+        let pkt = parse_frame_rest(&frame[8..], payload_len).unwrap();
+        assert_eq!(pkt.payload, payload);
+        assert_eq!(pkt.addr, addr);
     }
 
     #[test]
-    fn encode_then_parse() {
-        let payload = b"test datagram";
-        let addr: SocketAddr = "192.168.1.1:1234".parse().unwrap();
+    fn roundtrip_ipv4() {
+        roundtrip(b"hello world", "100.64.0.2:4443");
+    }
 
-        let frame = encode_frame(payload, &addr);
+    #[test]
+    fn roundtrip_ipv6() {
+        // Tailscale allocates IPv6 ULAs in fd7a::/48; this regression-guards
+        // the colon-bracketing path in parse_frame_rest.
+        roundtrip(b"ipv6 datagram", "[fd7a:115c:a1e0::2]:4443");
+    }
 
-        // Parse the header
-        let total_len = u32::from_be_bytes(frame[0..4].try_into().unwrap()) as usize;
-        let payload_len = u32::from_be_bytes(frame[4..8].try_into().unwrap()) as usize;
-        assert_eq!(total_len, frame.len());
+    #[test]
+    fn roundtrip_empty_payload() {
+        roundtrip(b"", "127.0.0.1:1");
+    }
 
-        let rest = &frame[8..];
-        let pkt = parse_frame_rest(rest, payload_len).unwrap();
-        assert_eq!(pkt.payload, payload);
-        assert_eq!(pkt.addr, addr);
+    #[test]
+    fn parse_frame_rest_rejects_short_rest() {
+        // Claim payload_len = 10 but only provide 4 bytes.
+        let rest = [1, 2, 3, 4];
+        let err = parse_frame_rest(&rest, 10).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }
