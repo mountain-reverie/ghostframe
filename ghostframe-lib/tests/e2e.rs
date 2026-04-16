@@ -15,12 +15,14 @@ async fn e2e_quic_ping_pong_over_tailscale() -> Result<()> {
     // ImageExt methods (with_container_name, with_network, etc.) because
     // ImageExt converts GenericImage into ContainerRequest<GenericImage>.
     let _headscale: ContainerAsync<GenericImage> =
-        GenericImage::new("headscale/headscale", "0.28.0")
+        GenericImage::new("ghostframe/test-headscale", "latest")
             .with_exposed_port(8080.tcp())
             .with_container_name("headscale")
             .with_network(helpers::NETWORK_NAME)
-            // testcontainers 0.27: method is `with_ready_conditions`
-            .with_ready_conditions(vec![WaitFor::message_on_stderr("listening")])
+            // Headscale emits this line to stdout after binding all listeners.
+            .with_ready_conditions(vec![WaitFor::message_on_stdout(
+                "listening and serving HTTP",
+            )])
             .start()
             .await?;
 

@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/binary"
 	"io"
+	"log"
 	"net"
 	"strconv"
 	"strings"
@@ -81,8 +82,10 @@ func gbridge_listen_udp(sd C.int32_t, cAddr *C.char, fdOut *C.int32_t) C.gbridge
 	if h == nil {
 		return -1
 	}
-	conn, err := h.server.ListenPacket("udp", C.GoString(cAddr))
+	addr := C.GoString(cAddr)
+	conn, err := h.server.ListenPacket("udp", addr)
 	if err != nil {
+		log.Printf("ghostbridge: ListenPacket(udp, %q) failed: %v", addr, err)
 		return -3
 	}
 	goFd, cFd, err := makeSocketpair()

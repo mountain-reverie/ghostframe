@@ -16,6 +16,10 @@ pub const NETWORK_NAME: &str = "ghostframe-e2e";
 
 /// Create a headscale preauth key for the given user. Idempotent — if the
 /// user already exists the `users create` error is ignored.
+///
+/// Headscale 0.28 requires `--user <numeric_id>` (not name) for preauthkeys.
+/// So we create the user by name, then look up its numeric ID via `users list`,
+/// and pass that ID to `preauthkeys create`.
 pub async fn create_preauth_key(container_name: &str, user: &str) -> Result<String> {
     // Idempotent: ignore "user already exists" error.
     let _ = tokio::process::Command::new("docker")
@@ -25,6 +29,27 @@ pub async fn create_preauth_key(container_name: &str, user: &str) -> Result<Stri
         .status()
         .await?;
 
+    // Look up the numeric user ID — headscale 0.28 requires it for preauthkeys.
+    let list_out = tokio::process::Command::new("docker")
+        .args([
+            "exec",
+            container_name,
+            "headscale",
+            "users",
+            "list",
+            "--output",
+            "json",
+        ])
+        .output()
+        .await
+        .context("running headscale users list")?;
+    let users: serde_json::Value = serde_json::from_slice(&list_out.stdout)?;
+    let user_id = users
+        .as_array()
+        .and_then(|arr| arr.iter().find(|u| u["name"].as_str() == Some(user)))
+        .and_then(|u| u["id"].as_u64())
+        .ok_or_else(|| anyhow!("user {user} not found in headscale users list"))?;
+
     let out = tokio::process::Command::new("docker")
         .args([
             "exec",
@@ -33,7 +58,7 @@ pub async fn create_preauth_key(container_name: &str, user: &str) -> Result<Stri
             "preauthkeys",
             "create",
             "--user",
-            user,
+            &user_id.to_string(),
             "--reusable",
             "--expiration",
             "1h",

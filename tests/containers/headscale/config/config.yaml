@@ -1,5 +1,6 @@
 server_url: http://headscale:8080
 listen_addr: 0.0.0.0:8080
+metrics_listen_addr: 0.0.0.0:9090
 grpc_listen_addr: 0.0.0.0:50443
 grpc_allow_insecure: true
 noise:
@@ -11,8 +12,24 @@ database:
   type: sqlite
   sqlite:
     path: /var/lib/headscale/db.sqlite
+derp:
+  server:
+    enabled: true
+    region_id: 999
+    region_code: test-embedded
+    region_name: Test Embedded DERP
+    stun_listen_addr: "0.0.0.0:3478"
+    private_key_path: /var/lib/headscale/derp_server_private.key
+  urls: []
+  paths: []
+  auto_update_enabled: false
 dns:
   magic_dns: true
   base_domain: test.tailnet
+  nameservers:
+    global:
+      - 1.1.1.1
+      - 8.8.8.8
+  override_local_dns: false
 log:
   level: info

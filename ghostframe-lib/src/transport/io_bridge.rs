@@ -14,7 +14,7 @@
 
 use std::future::{pending, Future};
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::os::unix::io::FromRawFd;
 use std::pin::Pin;
 use std::time::Instant;
@@ -64,12 +64,28 @@ impl IoBridge {
         let ips = handle.get_ips()?;
         tracing::info!(?ips, "ghostbridge node joined tailnet");
 
-        let udp = handle.listen_udp(listen_addr)?;
+        // tsnet.ListenPacket rejects a bare ":port" address with "address
+        // must be a valid IP". Bind instead to our first IPv4 tailnet IP on
+        // the caller-supplied port.
+        let port = parse_listen_port(listen_addr)?;
+        let bind_ip = ips
+            .iter()
+            .find(|ip| ip.is_ipv4())
+            .or_else(|| ips.first())
+            .copied()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    "tsnet node reported no tailnet IPs",
+                )
+            })?;
+        let bind = format!("{bind_ip}:{port}");
+        tracing::info!(%bind, "binding UDP listener on tailnet IP");
+
+        let udp = handle.listen_udp(&bind)?;
         let raw_fd = udp.into_raw_fd();
 
-        // Convert to std::os::unix::net::UnixStream → tokio::net::UnixStream.
-        // ghostbridge already set O_NONBLOCK on this fd; set_nonblocking is a
-        // no-op sanity call.
+        // Wrap the non-blocking ghostbridge fd as a tokio UnixStream.
         let std_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(raw_fd) };
         std_stream.set_nonblocking(true)?;
         let stream = TokioUnixStream::from_std(std_stream)?;
@@ -77,11 +93,9 @@ impl IoBridge {
         let server = QuicServer::new()?;
         tracing::info!(cert_sha256 = %server.cert_info().sha256_hex, "QUIC server ready");
 
-        // Derive local_addr from listen_addr so that quinn-proto's local_ip
-        // hint matches the port we actually bound. listen_addr is in the form
-        // "[host]:port" or ":port"; for M0 the host is always "0.0.0.0".
-        let port = parse_listen_port(listen_addr)?;
-        let local_addr = SocketAddr::from((IpAddr::V4(Ipv4Addr::UNSPECIFIED), port));
+        // local_addr is the tailnet-rooted socket we bound; quinn-proto uses
+        // its IP as the `local_ip` hint for inbound packets.
+        let local_addr = SocketAddr::new(bind_ip, port);
 
         Ok(Self {
             _handle: Some(handle),

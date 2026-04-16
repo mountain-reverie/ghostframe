@@ -418,6 +418,8 @@ package main
 /*
 #include <stdint.h>
 #include <string.h>
+
+typedef int32_t gbridge_status;
 */
 import "C"
 

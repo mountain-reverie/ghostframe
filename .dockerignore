@@ -1,0 +1,13 @@
+target/*
+!target/release
+target/release/*
+!target/release/ghostframe-xdaemon
+.worktrees/
+.git/
+node_modules/
+ghostframe-web-client/node_modules/
+ghostframe-web-client/dist/
+ghostbridge/libghostbridge.a
+ghostbridge/libghostbridge.h
+docs/
+*.md

@@ -13,6 +13,7 @@ test-e2e:
 containers-build:
     cargo build --release -p ghostframe-xdaemon
     docker build -t ghostframe/test-server -f tests/containers/test-server/Dockerfile .
+    docker build -t ghostframe/test-headscale -f tests/containers/headscale/Dockerfile tests/containers/headscale/
 
 lint:
     cargo clippy -- -D warnings
