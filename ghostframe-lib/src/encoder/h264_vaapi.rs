@@ -5,6 +5,8 @@
 
 extern crate ffmpeg_next as ffmpeg;
 
+use std::sync::Once;
+
 use ffmpeg::codec;
 use ffmpeg::encoder;
 use ffmpeg::format::Pixel;
@@ -12,6 +14,8 @@ use ffmpeg::frame;
 use ffmpeg::software::scaling;
 use ffmpeg::Packet;
 use ffmpeg::Rational;
+
+static FFMPEG_INIT: Once = Once::new();
 
 use super::EncodedTile;
 use crate::transport::protocol::Codec as GfCodec;
@@ -27,14 +31,15 @@ const TILE_H: u32 = 32;
 pub struct H264VaapiEncoder {
     encoder: encoder::Video,
     scaler: scaling::Context,
-    frame_count: u64,
     pts: i64,
 }
 
 impl H264VaapiEncoder {
     /// Create a new encoder, preferring VA-API but falling back to libx264.
     pub fn new() -> Result<Self, ffmpeg::Error> {
-        ffmpeg::init()?;
+        FFMPEG_INIT.call_once(|| {
+            ffmpeg::init().expect("ffmpeg::init() failed");
+        });
 
         // Try VA-API first; if it fails to open, fall back to libx264.
         if let Some(vaapi_codec) = encoder::find_by_name("h264_vaapi") {
@@ -91,7 +96,6 @@ impl H264VaapiEncoder {
         Ok(Self {
             encoder: opened,
             scaler,
-            frame_count: 0,
             pts: 0,
         })
     }
@@ -101,11 +105,9 @@ impl H264VaapiEncoder {
     /// Returns `Ok(None)` if the encoder buffers the frame without producing
     /// output yet (unlikely with zerolatency, but possible with VA-API).
     pub fn encode(&mut self, bgra_tile: &[u8]) -> Result<Option<EncodedTile>, ffmpeg::Error> {
-        assert_eq!(
-            bgra_tile.len(),
-            (TILE_W * TILE_H * 4) as usize,
-            "expected 4096-byte BGRA tile"
-        );
+        if bgra_tile.len() != (TILE_W * TILE_H * 4) as usize {
+            return Err(ffmpeg::Error::InvalidData);
+        }
 
         // Build a BGRA frame from the raw bytes.
         let mut bgra_frame = frame::Video::new(Pixel::BGRA, TILE_W, TILE_H);
@@ -124,7 +126,6 @@ impl H264VaapiEncoder {
         self.scaler.run(&bgra_frame, &mut enc_frame)?;
         enc_frame.set_pts(Some(self.pts));
         self.pts += 1;
-        self.frame_count += 1;
 
         // Send frame to encoder
         self.encoder.send_frame(&enc_frame)?;
@@ -144,16 +145,9 @@ impl H264VaapiEncoder {
                 }))
             }
             Err(ffmpeg::Error::Other { errno: libc::EAGAIN }) => Ok(None),
-            Err(e) if is_eagain(&e) => Ok(None),
             Err(e) => Err(e),
         }
     }
-}
-
-/// Check if an ffmpeg error represents EAGAIN (encoder needs more input).
-fn is_eagain(e: &ffmpeg::Error) -> bool {
-    // ffmpeg-next may report EAGAIN differently across platforms
-    matches!(e, ffmpeg::Error::Other { errno } if *errno == libc::EAGAIN)
 }
 
 #[cfg(test)]
