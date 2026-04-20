@@ -1,13 +1,18 @@
 <!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>Ghostframe M0</title>
-</head>
-<body>
-  <h1>Ghostframe M0 — Ping/Pong</h1>
-  <div id="status">Connecting...</div>
-  <div id="log"></div>
-  <script type="module" src="/src/main.ts"></script>
-</body>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Ghostframe</title>
+    <style>
+      body { margin: 0; background: #111; color: #eee; font-family: monospace; }
+      #status { padding: 8px; }
+      #canvas { display: block; }
+    </style>
+  </head>
+  <body>
+    <div id="status">Connecting...</div>
+    <canvas id="canvas"></canvas>
+    <div id="log" style="padding: 8px; font-size: 12px; max-height: 200px; overflow-y: auto;"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
 </html>

@@ -1,10 +1,35 @@
+import {
+  DATAGRAM_HEADER_SIZE,
+  TILE_HEADER_SIZE,
+  TILE_SIZE,
+  Codec,
+  decodeDatagramHeader,
+  decodeTileHeader,
+  tileKey,
+  TileAssembly,
+} from './decoder';
+import { TileRenderer } from './renderer';
+
 const statusEl = document.getElementById('status')!;
 const logEl = document.getElementById('log')!;
+const canvasEl = document.getElementById('canvas') as HTMLCanvasElement;
 
 function log(msg: string) {
   const line = document.createElement('div');
   line.textContent = msg;
   logEl.appendChild(line);
+  // Keep log from growing unbounded
+  while (logEl.childElementCount > 50) {
+    logEl.removeChild(logEl.firstChild!);
+  }
+}
+
+function hexToBuffer(hex: string): ArrayBuffer {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) {
+    bytes[i / 2] = parseInt(hex.substr(i, 2), 16);
+  }
+  return bytes.buffer;
 }
 
 async function main() {
@@ -39,12 +64,14 @@ async function main() {
   log('Connected!');
   statusEl.textContent = 'Connected';
 
-  // Send ping datagram
-  const pingData = new Uint8Array([0x70, 0x69, 0x6E, 0x67]); // "ping"
-  const writer = transport.datagrams.writable.getWriter();
-  await writer.write(pingData);
-  writer.releaseLock();
-  log('Sent: ping');
+  const renderer = new TileRenderer(canvasEl);
+  // Default canvas size; will grow as tiles arrive
+  renderer.resize(1280, 720);
+
+  // Tile assembly state: key -> TileAssembly
+  const assemblies = new Map<string, TileAssembly>();
+  let latestFrameSeq = 0;
+  let firstTileRendered = false;
 
   // Receive datagrams
   const reader = transport.datagrams.readable.getReader();
@@ -52,22 +79,108 @@ async function main() {
     const { value, done } = await reader.read();
     if (done) break;
 
-    const text = new TextDecoder().decode(value);
-    log(`Received: ${text} (${value.byteLength} bytes)`);
+    if (!value || value.byteLength === 0) continue;
 
-    if (text === 'pong') {
-      statusEl.textContent = 'Ping/Pong successful!';
-      log('M0 COMPLETE: Ping/Pong datagram round-trip verified!');
+    // Backward compat: small text datagrams (ping/pong)
+    if (value.byteLength < 20) {
+      const text = new TextDecoder().decode(value);
+      log(`Received: ${text} (${value.byteLength} bytes)`);
+      if (text === 'pong') {
+        statusEl.textContent = 'Ping/Pong successful!';
+        log('M0 COMPLETE: Ping/Pong datagram round-trip verified!');
+      }
+      continue;
+    }
+
+    // Must have at least datagram header + tile header
+    if (value.byteLength < DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE) {
+      log(`Datagram too short: ${value.byteLength} bytes`);
+      continue;
+    }
+
+    const view = new DataView(value.buffer, value.byteOffset, value.byteLength);
+    const dgramHdr = decodeDatagramHeader(view, 0);
+    const tileHdr = decodeTileHeader(view, DATAGRAM_HEADER_SIZE);
+
+    // Track the latest frame sequence number
+    if (dgramHdr.frameSeq > latestFrameSeq) {
+      latestFrameSeq = dgramHdr.frameSeq;
+    }
+
+    // Evict stale assemblies (frames more than 2 behind the latest)
+    const staleThreshold = latestFrameSeq - 2;
+    for (const [k, asm] of assemblies) {
+      const seq = parseInt(k.split(':')[0], 10);
+      if (seq < staleThreshold) {
+        assemblies.delete(k);
+      }
+    }
+
+    // Only handle Raw codec for now
+    if (tileHdr.codec !== Codec.Raw) {
+      // Skip non-raw tiles silently
+      continue;
+    }
+
+    const key = tileKey(dgramHdr.frameSeq, tileHdr.tileX, tileHdr.tileY);
+    const payloadOffset = DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE;
+    const fragData = new Uint8Array(value.buffer, value.byteOffset + payloadOffset, value.byteLength - payloadOffset);
+
+    let asm = assemblies.get(key);
+    if (!asm) {
+      asm = {
+        header: tileHdr,
+        fragments: new Array(dgramHdr.fragTotal).fill(null),
+        received: 0,
+      };
+      assemblies.set(key, asm);
+    }
+
+    // Store this fragment if not already received
+    if (asm.fragments[dgramHdr.fragIdx] === null) {
+      asm.fragments[dgramHdr.fragIdx] = fragData.slice(); // copy
+      asm.received += 1;
+    }
+
+    // Check if all fragments have arrived
+    if (asm.received === dgramHdr.fragTotal) {
+      assemblies.delete(key);
+
+      // Reassemble payload
+      const totalLen = asm.fragments.reduce((acc, f) => acc + (f ? f.byteLength : 0), 0);
+      const payload = new Uint8Array(totalLen);
+      let offset = 0;
+      for (const frag of asm.fragments) {
+        if (frag) {
+          payload.set(frag, offset);
+          offset += frag.byteLength;
+        }
+      }
+
+      // Ensure canvas is large enough
+      const minWidth = (tileHdr.tileX + 1) * TILE_SIZE;
+      const minHeight = (tileHdr.tileY + 1) * TILE_SIZE;
+      if (canvasEl.width < minWidth || canvasEl.height < minHeight) {
+        renderer.resize(
+          Math.max(canvasEl.width, minWidth),
+          Math.max(canvasEl.height, minHeight)
+        );
+      }
+
+      renderer.drawRawTile(tileHdr.tileX, tileHdr.tileY, payload);
+
+      if (!firstTileRendered) {
+        firstTileRendered = true;
+        // Log tile diagnostic for E2E debugging
+        const sample = Array.from(payload.slice(0, 16))
+          .map(b => b.toString(16).padStart(2, '0'))
+          .join(' ');
+        log(`First tile: (${tileHdr.tileX},${tileHdr.tileY}) ${payload.byteLength}B`);
+        log(`First bytes: ${sample}`);
+        statusEl.textContent = 'Receiving frames';
+      }
     }
   }
-}
-
-function hexToBuffer(hex: string): ArrayBuffer {
-  const bytes = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < hex.length; i += 2) {
-    bytes[i / 2] = parseInt(hex.substr(i, 2), 16);
-  }
-  return bytes.buffer;
 }
 
 main().catch((e) => {
