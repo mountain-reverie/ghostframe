@@ -13,14 +13,44 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"unsafe"
 
+	"tailscale.com/envknob"
+	"tailscale.com/net/netns"
 	"tailscale.com/tsnet"
 )
+
+func init() {
+	// TS_DEBUG_USE_DERP_HTTP=1 makes the tailscale DERP client connect to the
+	// DERP relay server using HTTP instead of HTTPS. This is required when
+	// using headscale's embedded DERP without TLS (http:// server_url).
+	// We use envknob.Setenv so that the already-registered envknob pointer
+	// gets updated — plain os.Setenv is too late because tailscale packages
+	// register their env knobs at package-init time.
+	if os.Getenv("TS_DEBUG_USE_DERP_HTTP") == "" {
+		log.Printf("ghostbridge: init: setting TS_DEBUG_USE_DERP_HTTP=1 via envknob")
+		envknob.Setenv("TS_DEBUG_USE_DERP_HTTP", "1")
+	} else {
+		log.Printf("ghostbridge: init: TS_DEBUG_USE_DERP_HTTP already set to %q", os.Getenv("TS_DEBUG_USE_DERP_HTTP"))
+	}
+
+	// Disable netns socket marking (SO_MARK / SO_BINDTODEVICE).
+	//
+	// In a normal tailscaled installation, netns marks outbound sockets so
+	// that DERP and control-plane traffic bypasses the TUN and goes out the
+	// real network interface. In a userspace-only tsnet node (our case),
+	// there is no TUN, so the routing-loop protection is unnecessary — and
+	// it actively breaks things when DERP is behind Docker port-mapping
+	// (the bind-to-device selects the wrong interface). tsnet's own test
+	// suite disables netns for exactly this reason.
+	netns.SetEnabled(false)
+	log.Printf("ghostbridge: init: netns socket marking disabled")
+}
 
 var (
 	servers    = make(map[int32]*serverHandle)
@@ -70,9 +100,14 @@ func gbridge_up(sd C.int32_t) C.gbridge_status {
 	if h == nil {
 		return -1
 	}
-	if _, err := h.server.Up(context.Background()); err != nil {
+	log.Printf("ghostbridge: gbridge_up: calling server.Up()")
+	st, err := h.server.Up(context.Background())
+	if err != nil {
+		log.Printf("ghostbridge: gbridge_up: server.Up() error: %v", err)
 		return -2
 	}
+	ips := st.TailscaleIPs
+	log.Printf("ghostbridge: gbridge_up: server.Up() done, state=%s ips=%v", st.BackendState, ips)
 	return 0
 }
 
@@ -104,11 +139,15 @@ func gbridge_dial_udp(sd C.int32_t, cRemote *C.char, fdOut *C.int32_t) C.gbridge
 	if h == nil {
 		return -1
 	}
+	remote := C.GoString(cRemote)
+	log.Printf("ghostbridge: dialing udp %q", remote)
 	// tsnet.Server.Dial returns a net.Conn; for UDP it wraps the packet conn.
-	netConn, err := h.server.Dial(context.Background(), "udp", C.GoString(cRemote))
+	netConn, err := h.server.Dial(context.Background(), "udp", remote)
 	if err != nil {
+		log.Printf("ghostbridge: dial udp %q failed: %v", remote, err)
 		return -3
 	}
+	log.Printf("ghostbridge: dial udp %q succeeded, remote=%s local=%s", remote, netConn.RemoteAddr(), netConn.LocalAddr())
 	// Wrap as PacketConn-like: reads come from this one peer, writes go to it.
 	pc := &dialedPacketConn{Conn: netConn}
 	goFd, cFd, err := makeSocketpair()
@@ -215,10 +254,16 @@ func spawnPacketBridge(conn readFromWriter, goFd int) {
 	go func() {
 		defer syscall.Close(goFd)
 		buf := make([]byte, 65535)
+		pktCount := 0
 		for {
 			n, srcAddr, err := conn.ReadFrom(buf)
 			if err != nil {
+				log.Printf("ghostbridge: tsnet->rust ReadFrom error after %d pkts: %v", pktCount, err)
 				return
+			}
+			pktCount++
+			if pktCount <= 5 {
+				log.Printf("ghostbridge: tsnet->rust pkt #%d %d bytes from %s", pktCount, n, srcAddr)
 			}
 			host, port, err := net.SplitHostPort(srcAddr.String())
 			if err != nil {
@@ -236,9 +281,15 @@ func spawnPacketBridge(conn readFromWriter, goFd int) {
 	go func() {
 		defer conn.Close()
 		header := make([]byte, 8)
+		pktCount := 0
 		for {
 			if _, err := readFull(goFd, header); err != nil {
+				log.Printf("ghostbridge: rust->tsnet readFull error after %d pkts: %v", pktCount, err)
 				return
+			}
+			pktCount++
+			if pktCount <= 5 {
+				log.Printf("ghostbridge: rust->tsnet pkt #%d", pktCount)
 			}
 			totalLen := binary.BigEndian.Uint32(header[0:4])
 			payloadLen := binary.BigEndian.Uint32(header[4:8])
