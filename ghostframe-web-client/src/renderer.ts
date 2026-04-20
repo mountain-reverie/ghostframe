@@ -31,4 +31,10 @@ export class TileRenderer {
     const imageData = new ImageData(rgba, TILE_SIZE, TILE_SIZE);
     this.ctx.putImageData(imageData, px, py);
   }
+
+  drawVideoFrame(tileX: number, tileY: number, frame: VideoFrame) {
+    const px = tileX * TILE_SIZE;
+    const py = tileY * TILE_SIZE;
+    this.ctx.drawImage(frame, px, py, TILE_SIZE, TILE_SIZE);
+  }
 }

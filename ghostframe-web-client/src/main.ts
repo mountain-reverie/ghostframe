@@ -7,6 +7,7 @@ import {
   decodeTileHeader,
   tileKey,
   TileAssembly,
+  H264TileDecoder,
 } from './decoder';
 import { TileRenderer } from './renderer';
 
@@ -68,6 +69,21 @@ async function main() {
   // Default canvas size; will grow as tiles arrive
   renderer.resize(1280, 720);
 
+  // Per-tile H.264 decoders
+  const h264Decoders = new Map<string, H264TileDecoder>();
+
+  function getH264Decoder(tileX: number, tileY: number): H264TileDecoder {
+    const key = `${tileX}:${tileY}`;
+    let dec = h264Decoders.get(key);
+    if (!dec) {
+      dec = new H264TileDecoder((frame: VideoFrame) => {
+        renderer.drawVideoFrame(tileX, tileY, frame);
+      });
+      h264Decoders.set(key, dec);
+    }
+    return dec;
+  }
+
   // Tile assembly state: key -> TileAssembly
   const assemblies = new Map<string, TileAssembly>();
   let latestFrameSeq = 0;
@@ -116,9 +132,8 @@ async function main() {
       }
     }
 
-    // Only handle Raw codec for now
-    if (tileHdr.codec !== Codec.Raw) {
-      // Skip non-raw tiles silently
+    // Skip codec: tile unchanged, canvas retains last content
+    if (tileHdr.codec === Codec.Skip) {
       continue;
     }
 
@@ -167,7 +182,13 @@ async function main() {
         );
       }
 
-      renderer.drawRawTile(tileHdr.tileX, tileHdr.tileY, payload);
+      // Decode based on codec
+      if (asm.header.codec === Codec.Raw) {
+        renderer.drawRawTile(tileHdr.tileX, tileHdr.tileY, payload);
+      } else if (asm.header.codec === Codec.H264) {
+        const dec = getH264Decoder(tileHdr.tileX, tileHdr.tileY);
+        dec.decode(payload);
+      }
 
       if (!firstTileRendered) {
         firstTileRendered = true;
