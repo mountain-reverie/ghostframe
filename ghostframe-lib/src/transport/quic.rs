@@ -28,7 +28,7 @@ pub struct QuicServer {
     /// The quinn-proto endpoint state machine.
     pub(crate) endpoint: Endpoint,
     /// Active connections keyed by their handle.
-    pub(crate) connections: HashMap<ConnectionHandle, Connection>,
+    pub connections: HashMap<ConnectionHandle, Connection>,
     /// Certificate fingerprint for browser pinning.
     pub(crate) cert_info: CertInfo,
 }
@@ -43,11 +43,20 @@ impl QuicServer {
         // SANs include both "localhost" (DNS) and "127.0.0.1" (IP) so that
         // Chromium's cert-hash pinning works when the E2E forwarder is bound to
         // 127.0.0.1 (Task 9).
-        let cert =
-            rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])?;
-        // rcgen 0.14.x: DER bytes live on `cert.cert`; key is `signing_key`.
-        let cert_der = cert.cert.der().to_vec();
-        let key_der = cert.signing_key.serialize_der();
+        //
+        // W3C WebTransport spec requires serverCertificateHashes certs to have a
+        // validity period of at most 14 days. `generate_simple_self_signed` uses
+        // the rcgen default (~1 year), which Chrome rejects with
+        // CERTIFICATE_VERIFY_FAILED.
+        let mut params =
+            rcgen::CertificateParams::new(vec!["localhost".into(), "127.0.0.1".into()])?;
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now;
+        params.not_after = now + time::Duration::days(13);
+        let key_pair = rcgen::KeyPair::generate()?;
+        let cert = params.self_signed(&key_pair)?;
+        let cert_der = cert.der().to_vec();
+        let key_der = key_pair.serialize_der();
 
         // --- 2. SHA-256 fingerprint for browser certificateHashes ---
         let sha256_hex = {
@@ -138,7 +147,6 @@ impl QuicServer {
                     }
                     Err(err) => {
                         tracing::warn!(%remote, cause=%err.cause, "connection accept failed");
-                        // err.response is an optional Transmit (e.g. CONNECTION_CLOSE)
                         err.response
                     }
                 }
@@ -210,11 +218,11 @@ impl QuicServer {
     ///
     /// Also removes connections that emit `Event::ConnectionLost`.
     pub fn poll_events(&mut self) -> Option<(ConnectionHandle, Event)> {
-        // Collect handles so we can mutably borrow one at a time.
         let handles: Vec<ConnectionHandle> = self.connections.keys().copied().collect();
         for handle in handles {
             if let Some(conn) = self.connections.get_mut(&handle) {
                 if let Some(event) = conn.poll() {
+                    tracing::trace!(?handle, ?event, "poll_events: event found");
                     let lost = matches!(event, Event::ConnectionLost { .. });
                     if lost {
                         self.connections.remove(&handle);
@@ -229,7 +237,7 @@ impl QuicServer {
     /// Drain `EndpointEvent`s from every connection and feed them back into the
     /// endpoint.  Any resulting `ConnectionEvent`s are fed back to the
     /// corresponding connection.
-    pub(crate) fn drain_endpoint_events(&mut self) {
+    pub fn drain_endpoint_events(&mut self) {
         let handles: Vec<ConnectionHandle> = self.connections.keys().copied().collect();
         for handle in handles {
             while let Some(ep_event) = self
@@ -261,5 +269,18 @@ mod tests {
             hash.chars().all(|c| c.is_ascii_hexdigit()),
             "cert hash should be pure hex, got: {hash}"
         );
+    }
+
+    #[test]
+    fn dump_cert_for_inspection() {
+        let mut params =
+            rcgen::CertificateParams::new(vec!["localhost".into(), "127.0.0.1".into()]).unwrap();
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now;
+        params.not_after = now + time::Duration::days(13);
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        std::fs::write("/tmp/test_cert.der", cert.der()).unwrap();
+        println!("Cert written to /tmp/test_cert.der");
     }
 }
