@@ -1,4 +1,5 @@
 pub mod capture;
+pub mod encoder;
 pub mod transport;
 pub mod tile;
 pub mod server;

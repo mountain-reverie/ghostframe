@@ -52,3 +52,6 @@ time = { version = "0.3" }
 
 # ash 0.38 — raw Vulkan bindings for DMA-BUF import readback
 ash = { version = "0.38", default-features = false, features = ["std", "debug", "loaded"] }
+
+# ffmpeg-next 8.1.0 — Rust bindings for FFmpeg (libavcodec, libavutil, libswscale)
+ffmpeg-next = { version = "=8.1.0" }
