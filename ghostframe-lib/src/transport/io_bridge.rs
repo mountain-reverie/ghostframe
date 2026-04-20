@@ -150,9 +150,19 @@ impl IoBridge {
             }
 
             // Always drain after either branch.
+            //
+            // Ordering is critical: drain_app_events may write new stream
+            // data (e.g. HTTP/3 SETTINGS on Connected, or a 200 response
+            // on CONNECT), so we must call drain_outbound *again* after
+            // drain_app_events to flush any newly-queued transmits.
+            // Without this second flush, the data sits in quinn-proto's
+            // send buffer until the next loop iteration — which may never
+            // come if the peer is waiting for that data (deadlock).
             self.drain_outbound().await?;
             self.server.drain_endpoint_events();
             self.drain_app_events();
+            self.server.drain_endpoint_events();
+            self.drain_outbound().await?;
         }
     }
 
@@ -180,6 +190,7 @@ impl IoBridge {
         let mut buf: Vec<u8> = Vec::with_capacity(QUIC_SCRATCH);
         let data = BytesMut::from(packet.payload.as_slice());
 
+        tracing::trace!(remote = %packet.addr, payload_len, "processing inbound datagram");
         if let Some(transmit) = self.server.handle_datagram(
             Instant::now(),
             packet.addr,
@@ -208,6 +219,7 @@ impl IoBridge {
                 None => break,
                 Some(transmit) => {
                     let payload = &buf[..transmit.size];
+                    tracing::trace!(size = transmit.size, dst = %transmit.destination, "outbound transmit");
                     let frame = encode_frame(payload, &transmit.destination);
                     self.stream.write_all(&frame).await?;
                 }
@@ -219,15 +231,16 @@ impl IoBridge {
 
     /// Drain all pending application-level QUIC events and drive the
     /// WebTransport handshake state machine.
+    ///
+    /// Events are polled and processed one at a time rather than collected
+    /// up-front because processing an `Opened` event calls `accept()` +
+    /// `read()`, which may cause quinn-proto to generate new `Readable`
+    /// events that would be missed if we had already finished polling.
     fn drain_app_events(&mut self) {
-        // Collect events first so we can mutably borrow `self.wt_sessions` and
-        // `self.server.connections` in the same loop body.
-        let mut events_buf: Vec<(ConnectionHandle, Event)> = Vec::new();
-        while let Some(pair) = self.server.poll_events() {
-            events_buf.push(pair);
-        }
-
-        for (handle, event) in events_buf {
+        loop {
+            let Some((handle, event)) = self.server.poll_events() else {
+                break;
+            };
             tracing::trace!(?handle, ?event, "app event");
 
             match event {
