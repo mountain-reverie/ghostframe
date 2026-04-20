@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "ghostframe-lib",
     "ghostframe-xdaemon",
+    "ghostframe-test-pattern",
 ]
 
 [workspace.dependencies]
@@ -48,3 +49,6 @@ hex = { version = "=0.4.3" }
 
 # time — used by rcgen for cert validity; re-exported to set not_before/not_after
 time = { version = "0.3" }
+
+# ash 0.38 — raw Vulkan bindings for DMA-BUF import readback
+ash = { version = "0.38", default-features = false, features = ["std", "debug", "loaded"] }

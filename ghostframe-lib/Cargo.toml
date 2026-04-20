@@ -19,6 +19,7 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 libc = { workspace = true }
 time = { workspace = true }
+ash = { workspace = true }
 
 [build-dependencies]
 cbindgen = { workspace = true }
