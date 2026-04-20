@@ -24,12 +24,17 @@ use quinn_proto::{ConnectionHandle, Event, StreamEvent};
 use std::collections::HashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream as TokioUnixStream;
+use tokio::sync::mpsc;
 use tokio::time::{sleep_until, Instant as TokioInstant};
 
+use crate::server::FrameSubmission;
+use crate::tile::TileGrid;
 use crate::transport::ghostbridge::{
     encode_frame, parse_frame_rest, GhostbridgeConfig, GhostbridgeHandle,
 };
-use crate::transport::protocol::{PING_PAYLOAD, PONG_PAYLOAD};
+use crate::transport::protocol::{
+    Codec, fragment_tile, max_fragment_payload, PING_PAYLOAD, PONG_PAYLOAD,
+};
 use crate::transport::quic::QuicServer;
 use crate::transport::webtransport::WebTransportServer;
 
@@ -50,6 +55,10 @@ pub struct IoBridge {
     local_addr: SocketAddr,
     /// Per-connection WebTransport handshake state.
     wt_sessions: HashMap<ConnectionHandle, WebTransportServer>,
+    /// Inbound channel of captured frames to be fragmented and sent as datagrams.
+    frame_rx: Option<mpsc::Receiver<FrameSubmission>>,
+    /// Monotonically increasing frame sequence number (wrapping).
+    frame_seq: u32,
 }
 
 impl IoBridge {
@@ -103,12 +112,99 @@ impl IoBridge {
             server,
             local_addr,
             wt_sessions: HashMap::new(),
+            frame_rx: None,
+            frame_seq: 0,
         })
+    }
+
+    /// Create a new `IoBridge` wired to an inbound frame channel.
+    ///
+    /// Equivalent to [`new`] but attaches `frame_rx` so that captured frames
+    /// are fragmented and sent as WebTransport datagrams to all connected peers.
+    pub async fn new_with_frames(
+        ghostbridge_config: &GhostbridgeConfig,
+        listen_addr: &str,
+        frame_rx: mpsc::Receiver<FrameSubmission>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let mut bridge = Self::new(ghostbridge_config, listen_addr).await?;
+        bridge.frame_rx = Some(frame_rx);
+        Ok(bridge)
     }
 
     /// Return the SHA-256 hex fingerprint of the server's self-signed cert.
     pub fn cert_hash_sha256(&self) -> &str {
         &self.server.cert_info().sha256_hex
+    }
+
+    /// Fragment a captured frame and send the resulting datagrams to all
+    /// connected WebTransport sessions.
+    /// Maximum bytes for the WebTransport VarInt session-ID prefix.
+    /// A quarter-stream-id up to 63 encodes in 1 byte; we budget 2 for safety.
+    const WT_VARINT_OVERHEAD: usize = 2;
+
+    fn process_frame(&mut self, frame: FrameSubmission) {
+        let grid = TileGrid::new(frame.width, frame.height);
+        self.frame_seq = self.frame_seq.wrapping_add(1);
+        let seq = self.frame_seq;
+
+        // Determine the maximum fragment payload from the smallest connected
+        // session's QUIC max datagram size.  We subtract the WebTransport
+        // VarInt prefix and our own headers so the final QUIC DATAGRAM frame
+        // fits within the path MTU.
+        let max_frag = {
+            let mut min_size: Option<usize> = None;
+            for (handle, wt) in &self.wt_sessions {
+                if !wt.is_connected() {
+                    continue;
+                }
+                if let Some(conn) = self.server.connections.get_mut(handle) {
+                    if let Some(sz) = conn.datagrams().max_size() {
+                        let usable = max_fragment_payload(
+                            sz.saturating_sub(Self::WT_VARINT_OVERHEAD),
+                        );
+                        min_size = Some(match min_size {
+                            Some(prev) => prev.min(usable),
+                            None => usable,
+                        });
+                    }
+                }
+            }
+            match min_size {
+                Some(0) | None => {
+                    // No connected sessions or MTU too small — skip frame.
+                    return;
+                }
+                Some(sz) => sz,
+            }
+        };
+
+        for (tile_x, tile_y) in grid.iter_coords() {
+            let tile_data = grid.extract_tile(&frame.pixels, frame.stride, tile_x, tile_y);
+
+            let datagrams = fragment_tile(
+                seq,
+                tile_x as u8,
+                tile_y as u8,
+                Codec::Raw,
+                &tile_data,
+                frame.timestamp_us,
+                max_frag,
+            );
+
+            for dg in &datagrams {
+                for (handle, wt) in &mut self.wt_sessions {
+                    if !wt.is_connected() {
+                        continue;
+                    }
+                    if let Some(conn) = self.server.connections.get_mut(handle) {
+                        if let Err(e) = wt.send_datagram(conn, dg) {
+                            tracing::trace!(?handle, tile_x, tile_y, error = ?e,
+                                "datagram send failed (congestion/buffer full)");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Run the event loop until the ghostbridge fd is closed (EOF).
@@ -132,7 +228,19 @@ impl IoBridge {
                     self.server.handle_timeout(Instant::now());
                 }
 
-                // 2. Inbound framed UDP packet from ghostbridge.
+                // 2. Frame submission from capture thread.
+                frame = async {
+                    match self.frame_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(frame) = frame {
+                        self.process_frame(frame);
+                    }
+                }
+
+                // 3. Inbound framed UDP packet from ghostbridge.
                 read_res = self.stream.read_exact(&mut header) => {
                     match read_res {
                         Ok(_) => {
@@ -315,6 +423,24 @@ impl IoBridge {
             server,
             local_addr: "0.0.0.0:4443".parse().unwrap(),
             wt_sessions: HashMap::new(),
+            frame_rx: None,
+            frame_seq: 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_frames_for_test(
+        stream: TokioUnixStream, server: QuicServer,
+        frame_rx: mpsc::Receiver<FrameSubmission>,
+    ) -> Self {
+        IoBridge {
+            _handle: None,
+            stream,
+            server,
+            local_addr: "0.0.0.0:4443".parse().unwrap(),
+            wt_sessions: HashMap::new(),
+            frame_rx: Some(frame_rx),
+            frame_seq: 0,
         }
     }
 }
@@ -423,5 +549,44 @@ mod tests {
     fn parse_listen_port_rejects_garbage() {
         assert!(parse_listen_port("nope").is_err());
         assert!(parse_listen_port(":abc").is_err());
+    }
+
+    #[tokio::test]
+    async fn process_frame_produces_no_panic() {
+        let (our_end, _peer) = UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("server");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+
+        let frame = crate::server::FrameSubmission {
+            width: 64, height: 64, stride: 64 * 4,
+            pixels: vec![0xFF; 64 * 64 * 4],
+            timestamp_us: 1000,
+        };
+        // No connected sessions, so datagrams go nowhere, but should not panic
+        bridge.process_frame(frame);
+    }
+
+    #[tokio::test]
+    async fn process_frame_increments_frame_seq() {
+        let (our_end, _peer) = UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("server");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+
+        assert_eq!(bridge.frame_seq, 0);
+        assert!(bridge.frame_rx.is_some());
+
+        let make_frame = || crate::server::FrameSubmission {
+            width: 32, height: 32, stride: 32 * 4,
+            pixels: vec![0; 32 * 32 * 4],
+            timestamp_us: 0,
+        };
+
+        bridge.process_frame(make_frame());
+        assert_eq!(bridge.frame_seq, 1);
+
+        bridge.process_frame(make_frame());
+        assert_eq!(bridge.frame_seq, 2);
     }
 }
