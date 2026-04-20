@@ -159,10 +159,6 @@ pub async fn start_forwarder(local_bind: &str, upstream: UdpPacketConn) -> Resul
                 res = sock.recv_from(&mut buf) => {
                     let Ok((n, from)) = res else { return };
                     client = Some(from);
-                    // Destination address is whatever the server sees — not our concern
-                    // because the far side of the socketpair is a *dialed* PacketConn
-                    // (ghostbridge gbridge_dial_udp), so all writes go to the dialed peer.
-                    // We still must frame with *some* addr; use the from addr as a placeholder.
                     let frame = encode_frame(&buf[..n], &from);
                     if upstream.write_all(&frame).await.is_err() { return; }
                 }

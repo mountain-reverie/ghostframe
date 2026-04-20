@@ -29,6 +29,12 @@ async function main() {
     transport = new WebTransport(wtUrl);
   }
 
+  // Log close reason if the connection fails before ready.
+  transport.closed.then(
+    (info) => log(`Transport closed: code=${info.closeCode} reason=${info.reason}`),
+    (err) => log(`Transport closed with error: ${err}`)
+  );
+
   await transport.ready;
   log('Connected!');
   statusEl.textContent = 'Connected';
