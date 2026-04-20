@@ -1,5 +1,6 @@
 mod drm_capture;
 mod x11_capture;
+mod xdamage;
 
 use std::env;
 use std::os::unix::io::AsRawFd;
@@ -77,6 +78,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     };
 
+    let xdamage_monitor = xdamage::XDamageMonitor::new();
+    if xdamage_monitor.is_some() {
+        tracing::info!("XDamage monitoring active");
+    } else {
+        tracing::info!("XDamage not available, using full-frame dirty detection");
+    }
+
     tracing::info!("Server ready, entering capture loop");
 
     let frame_interval = Duration::from_micros(1_000_000 / capture_fps);
@@ -84,6 +92,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     loop {
         let capture_start = std::time::Instant::now();
+
+        let damage_tiles = xdamage_monitor.as_ref().map(|m| m.drain_damage());
 
         let submission = match &backend {
             CaptureBackend::Drm { vk } => match drm_capture::capture_prime_fd() {
@@ -112,7 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         stride: geom.stride,
                         pixels,
                         timestamp_us,
-                        damage_tiles: None,
+                        damage_tiles: damage_tiles.clone(),
                     })
                 }
                 Err(e) => {
@@ -123,7 +133,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             CaptureBackend::X11 { capture } => {
                 let timestamp_us = (frame_count * frame_interval.as_micros() as u64) as u32;
                 match capture.capture(timestamp_us) {
-                    Ok(frame) => Some(frame),
+                    Ok(mut frame) => {
+                        frame.damage_tiles = damage_tiles.clone();
+                        Some(frame)
+                    }
                     Err(e) => {
                         tracing::warn!("X11 capture failed: {e}");
                         None
