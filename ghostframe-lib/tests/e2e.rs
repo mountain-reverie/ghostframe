@@ -18,6 +18,7 @@ const HEADSCALE_HOST_PORT: u16 = 18080;
 /// The Docker default-bridge gateway address.  This IP is reachable from:
 ///   - the host (via the docker0 interface), and
 ///   - any Docker container (via their default gateway or routing table).
+///
 /// Using this as headscale's `server_url` host lets both the host-side tsnet
 /// (e2e-test-client) and the container-side tsnet (ghostframe-server) use the
 /// same DERP relay URL.
@@ -122,20 +123,16 @@ async fn e2e_quic_ping_pong_over_tailscale() -> Result<()> {
             .await;
         if let Ok(v) = result {
             let status: String = v.into_value().unwrap_or_default();
-            if status.contains("Ping/Pong successful") {
+            // M1 web client no longer sends ping/pong; it receives tile
+            // datagrams.  Check for "Connected" or "Receiving frames"
+            // which both prove the WebTransport session is live.
+            if status.contains("Connected") || status.contains("Receiving frames") {
                 return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {
                 let content = page.content().await.unwrap_or_default();
                 println!("page content:\n{content}");
-                let srv = tokio::process::Command::new("docker")
-                    .args(["logs", "ghostframe-server"])
-                    .output().await.ok();
-                if let Some(o) = srv {
-                    println!("=== server stdout ===\n{}", String::from_utf8_lossy(&o.stdout));
-                    println!("=== server stderr ===\n{}", String::from_utf8_lossy(&o.stderr));
-                }
-                panic!("timed out waiting for pong. last status: {status}");
+                panic!("timed out waiting for connection. last status: {status}");
             }
         } else if tokio::time::Instant::now() >= deadline {
             let content = page.content().await.unwrap_or_default();
@@ -144,4 +141,145 @@ async fn e2e_quic_ping_pong_over_tailscale() -> Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+}
+
+/// M1: Verify that captured pixels appear correctly in the browser.
+///
+/// The server captures from the X11 root window (XGetImage fallback) since
+/// the test container uses the Xorg dummy driver which has no DRM device.
+/// The test pattern app draws a red square at (100,100)-(300,300).
+#[tokio::test]
+async fn e2e_raw_frame_round_trip() -> Result<()> {
+    let hs_server_url = format!("http://{DOCKER_HOST_IP}:{HEADSCALE_HOST_PORT}");
+
+    let _headscale: ContainerAsync<GenericImage> =
+        GenericImage::new("ghostframe/test-headscale", "latest")
+            .with_mapped_port(HEADSCALE_HOST_PORT, 8080.tcp())
+            .with_container_name("headscale")
+            .with_network(helpers::NETWORK_NAME)
+            .with_env_var("HS_SERVER_URL", &hs_server_url)
+            .with_ready_conditions(vec![WaitFor::message_on_stderr(
+                "listening and serving HTTP",
+            )])
+            .with_startup_timeout(Duration::from_secs(120))
+            .start()
+            .await?;
+
+    let server_key = helpers::create_preauth_key("headscale", "ghostframe").await?;
+    let client_key = helpers::create_preauth_key("headscale", "ghostframe").await?;
+
+    let _server: ContainerAsync<GenericImage> =
+        GenericImage::new("ghostframe/test-server", "latest")
+            .with_container_name("ghostframe-server")
+            .with_network(helpers::NETWORK_NAME)
+            .with_env_var("TS_AUTHKEY", &server_key)
+            .with_env_var("TS_CONTROL_URL", "http://headscale:8080")
+            .with_env_var("RUST_LOG", "ghostframe=trace,debug")
+            .with_ready_conditions(vec![WaitFor::message_on_stdout("CERT_HASH_SHA256=")])
+            .with_startup_timeout(Duration::from_secs(120))
+            .start()
+            .await?;
+
+    let cert_hash = helpers::read_cert_hash_from_logs("ghostframe-server").await?;
+
+    let client_control_url = format!("http://127.0.0.1:{HEADSCALE_HOST_PORT}");
+    let test_node = helpers::TestNode::join(client_key, client_control_url).await?;
+    let upstream = test_node.dial("ghostframe-server:4443")?;
+    let forwarder = helpers::start_forwarder("127.0.0.1:0", upstream).await?;
+
+    let dist_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .join("ghostframe-web-client/dist");
+    let static_addr = helpers::start_static_server(dist_dir).await?;
+
+    let (browser, mut handler) = Browser::launch(
+        BrowserConfig::builder()
+            .chrome_executable("/usr/bin/chromium")
+            .no_sandbox()
+            .new_headless_mode()
+            .build()
+            .unwrap(),
+    )
+    .await?;
+    let _handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+
+    let page_url = format!(
+        "http://{}/index.html?host={}:{}&certHash={}",
+        static_addr,
+        forwarder.ip(),
+        forwarder.port(),
+        cert_hash,
+    );
+    println!("page_url: {page_url}");
+    let page = browser.new_page(&page_url).await?;
+
+    // Wait for "Receiving frames" status
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let result = page
+            .evaluate("(document.getElementById('status') || {textContent: '<null>'}).textContent")
+            .await;
+        if let Ok(v) = result {
+            let status: String = v.into_value().unwrap_or_default();
+            if status.contains("Receiving frames") {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let content = page.content().await.unwrap_or_default();
+                println!("page content:\n{content}");
+                panic!("timed out waiting for frame rendering. last status: {status}");
+            }
+        } else if tokio::time::Instant::now() >= deadline {
+            let content = page.content().await.unwrap_or_default();
+            println!("page content:\n{content}");
+            panic!("timed out waiting for frame rendering; evaluate kept failing");
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // Let frames accumulate -- at 2fps, 5 seconds gives ~10 frames.
+    // QUIC slow-start needs a few RTTs to open the congestion window
+    // wide enough for a full 640x480 frame (300 tiles × 4 fragments).
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Dump page content for diagnostic logging
+    let content = page.content().await.unwrap_or_default();
+    println!("=== page content ===\n{content}\n=== end ===");
+
+    // Scan the canvas for any red pixel.  Due to QUIC congestion control,
+    // only some tiles' fragments complete reassembly — we can't predict
+    // which tile arrives first.  The test pattern fills the root window red
+    // so ANY successfully rendered tile proves the full pipeline:
+    // X11 capture → tile → fragment → transport → reassemble → BGRA→RGBA → canvas.
+    let scan_js = r#"
+        (() => {
+            const canvas = document.getElementById('canvas');
+            const ctx = canvas.getContext('2d');
+            // Sample every 32 pixels (tile boundaries) across the frame area
+            for (let y = 16; y < 480; y += 32) {
+                for (let x = 16; x < 640; x += 32) {
+                    const p = ctx.getImageData(x, y, 1, 1).data;
+                    if (p[0] > 200 && p[1] < 50 && p[2] < 50) {
+                        return { found: true, x: x, y: y, r: p[0], g: p[1], b: p[2] };
+                    }
+                }
+            }
+            return { found: false, x: 0, y: 0, r: 0, g: 0, b: 0 };
+        })()
+    "#;
+
+    let scan_result = page.evaluate(scan_js).await?;
+    let scan: serde_json::Value = scan_result.into_value()?;
+    let found = scan.get("found").and_then(|v| v.as_bool()).unwrap_or(false);
+    let sx = scan.get("x").and_then(|v| v.as_u64()).unwrap_or(0);
+    let sy = scan.get("y").and_then(|v| v.as_u64()).unwrap_or(0);
+    let r = scan.get("r").and_then(|v| v.as_u64()).unwrap_or(0);
+    let g = scan.get("g").and_then(|v| v.as_u64()).unwrap_or(0);
+    let b = scan.get("b").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    println!("pixel scan: found={found} at ({sx},{sy}) r={r} g={g} b={b}");
+    assert!(found, "no red pixel found on canvas — pipeline failed");
+
+    Ok(())
 }

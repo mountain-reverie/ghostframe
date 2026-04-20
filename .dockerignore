@@ -2,6 +2,7 @@ target/*
 !target/release
 target/release/*
 !target/release/ghostframe-xdaemon
+!target/release/ghostframe-test-pattern
 .worktrees/
 .git/
 node_modules/
