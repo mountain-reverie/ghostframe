@@ -58,26 +58,30 @@ impl TileGrid {
     }
 }
 
+/// Tracks which tiles changed between consecutive frames.
+///
+/// Uses a single flat `Vec<u8>` buffer to store all previous tile data,
+/// avoiding one heap allocation per tile. On the first frame (when the
+/// buffer is empty) every tile is reported as dirty.
 pub struct DirtyTracker {
     cols: u32,
     rows: u32,
-    prev_tiles: Vec<Vec<u8>>,
+    prev_tiles: Vec<u8>,
 }
 
 impl DirtyTracker {
     pub fn new(cols: u32, rows: u32) -> Self {
-        let count = (cols * rows) as usize;
         Self {
             cols,
             rows,
-            prev_tiles: vec![Vec::new(); count],
+            prev_tiles: Vec::new(),
         }
     }
 
     pub fn resize(&mut self, cols: u32, rows: u32) {
         self.cols = cols;
         self.rows = rows;
-        self.prev_tiles = vec![Vec::new(); (cols * rows) as usize];
+        self.prev_tiles.clear();
     }
 
     pub fn update(&mut self, pixels: &[u8], stride: u32, width: u32, height: u32) -> Vec<(u32, u32)> {
@@ -85,12 +89,19 @@ impl DirtyTracker {
         if grid.cols != self.cols || grid.rows != self.rows {
             self.resize(grid.cols, grid.rows);
         }
+        let first_frame = self.prev_tiles.is_empty();
+        if first_frame {
+            let count = (self.cols * self.rows) as usize;
+            self.prev_tiles.resize(count * TILE_BYTES, 0);
+        }
         let mut dirty = Vec::new();
         for (tile_x, tile_y) in grid.iter_coords() {
             let idx = (tile_y * self.cols + tile_x) as usize;
             let current = grid.extract_tile(pixels, stride, tile_x, tile_y);
-            if self.prev_tiles[idx] != current {
-                self.prev_tiles[idx] = current;
+            let prev = &self.prev_tiles[idx * TILE_BYTES..(idx + 1) * TILE_BYTES];
+            if first_frame || prev != current.as_slice() {
+                self.prev_tiles[idx * TILE_BYTES..(idx + 1) * TILE_BYTES]
+                    .copy_from_slice(&current);
                 dirty.push((tile_x, tile_y));
             }
         }
@@ -109,6 +120,11 @@ impl DirtyTracker {
         if grid.cols != self.cols || grid.rows != self.rows {
             self.resize(grid.cols, grid.rows);
         }
+        let first_frame = self.prev_tiles.is_empty();
+        if first_frame {
+            let count = (self.cols * self.rows) as usize;
+            self.prev_tiles.resize(count * TILE_BYTES, 0);
+        }
         let mut dirty = Vec::new();
         for &(tile_x, tile_y) in hints {
             if tile_x >= self.cols || tile_y >= self.rows {
@@ -116,8 +132,10 @@ impl DirtyTracker {
             }
             let idx = (tile_y * self.cols + tile_x) as usize;
             let current = grid.extract_tile(pixels, stride, tile_x, tile_y);
-            if self.prev_tiles[idx] != current {
-                self.prev_tiles[idx] = current;
+            let prev = &self.prev_tiles[idx * TILE_BYTES..(idx + 1) * TILE_BYTES];
+            if first_frame || prev != current.as_slice() {
+                self.prev_tiles[idx * TILE_BYTES..(idx + 1) * TILE_BYTES]
+                    .copy_from_slice(&current);
                 dirty.push((tile_x, tile_y));
             }
         }
