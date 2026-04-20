@@ -27,8 +27,9 @@ use tokio::net::UnixStream as TokioUnixStream;
 use tokio::sync::mpsc;
 use tokio::time::{sleep_until, Instant as TokioInstant};
 
+use crate::encoder::h264_vaapi::H264VaapiEncoder;
 use crate::server::FrameSubmission;
-use crate::tile::TileGrid;
+use crate::tile::{DirtyTracker, TileGrid};
 use crate::transport::ghostbridge::{
     encode_frame, parse_frame_rest, GhostbridgeConfig, GhostbridgeHandle,
 };
@@ -59,6 +60,12 @@ pub struct IoBridge {
     frame_rx: Option<mpsc::Receiver<FrameSubmission>>,
     /// Monotonically increasing frame sequence number (wrapping).
     frame_seq: u32,
+    /// Per-tile dirty detection.
+    dirty_tracker: DirtyTracker,
+    /// Per-tile H.264 encoders, keyed by (tile_x, tile_y). Lazily initialized.
+    encoders: HashMap<(u32, u32), H264VaapiEncoder>,
+    /// Whether H.264 encoding is available (checked once at startup).
+    h264_available: bool,
 }
 
 impl IoBridge {
@@ -106,6 +113,8 @@ impl IoBridge {
         // its IP as the `local_ip` hint for inbound packets.
         let local_addr = SocketAddr::new(bind_ip, port);
 
+        let h264_available = H264VaapiEncoder::new().is_ok();
+
         Ok(Self {
             _handle: Some(handle),
             stream,
@@ -114,6 +123,9 @@ impl IoBridge {
             wt_sessions: HashMap::new(),
             frame_rx: None,
             frame_seq: 0,
+            dirty_tracker: DirtyTracker::new(0, 0),
+            encoders: HashMap::new(),
+            h264_available,
         })
     }
 
@@ -147,6 +159,20 @@ impl IoBridge {
         self.frame_seq = self.frame_seq.wrapping_add(1);
         let seq = self.frame_seq;
 
+        // Determine dirty tiles
+        let dirty_tiles = match &frame.damage_tiles {
+            Some(hints) => self.dirty_tracker.update_with_hints(
+                &frame.pixels, frame.stride, frame.width, frame.height, hints,
+            ),
+            None => self.dirty_tracker.update(
+                &frame.pixels, frame.stride, frame.width, frame.height,
+            ),
+        };
+
+        if dirty_tiles.is_empty() {
+            return;
+        }
+
         // Determine the maximum fragment payload from the smallest connected
         // session's QUIC max datagram size.  We subtract the WebTransport
         // VarInt prefix and our own headers so the final QUIC DATAGRAM frame
@@ -178,15 +204,32 @@ impl IoBridge {
             }
         };
 
-        for (tile_x, tile_y) in grid.iter_coords() {
-            let tile_data = grid.extract_tile(&frame.pixels, frame.stride, tile_x, tile_y);
+        // Encode and send only dirty tiles
+        for (tile_x, tile_y) in &dirty_tiles {
+            let tile_data = grid.extract_tile(&frame.pixels, frame.stride, *tile_x, *tile_y);
+
+            let (codec, payload) = if self.h264_available {
+                let encoder = self.encoders
+                    .entry((*tile_x, *tile_y))
+                    .or_insert_with(|| H264VaapiEncoder::new().unwrap());
+                match encoder.encode(&tile_data) {
+                    Ok(Some(encoded)) => (encoded.codec, encoded.payload),
+                    Ok(None) => (Codec::Raw, tile_data),
+                    Err(e) => {
+                        tracing::warn!(tile_x, tile_y, error = %e, "H.264 encode failed, sending raw");
+                        (Codec::Raw, tile_data)
+                    }
+                }
+            } else {
+                (Codec::Raw, tile_data)
+            };
 
             let datagrams = fragment_tile(
                 seq,
-                tile_x as u8,
-                tile_y as u8,
-                Codec::Raw,
-                &tile_data,
+                *tile_x as u8,
+                *tile_y as u8,
+                codec,
+                &payload,
                 frame.timestamp_us,
                 max_frag,
             );
@@ -425,6 +468,9 @@ impl IoBridge {
             wt_sessions: HashMap::new(),
             frame_rx: None,
             frame_seq: 0,
+            dirty_tracker: DirtyTracker::new(0, 0),
+            encoders: HashMap::new(),
+            h264_available: false,
         }
     }
 
@@ -441,6 +487,9 @@ impl IoBridge {
             wt_sessions: HashMap::new(),
             frame_rx: Some(frame_rx),
             frame_seq: 0,
+            dirty_tracker: DirtyTracker::new(0, 0),
+            encoders: HashMap::new(),
+            h264_available: false,
         }
     }
 }
@@ -562,6 +611,7 @@ mod tests {
             width: 64, height: 64, stride: 64 * 4,
             pixels: vec![0xFF; 64 * 64 * 4],
             timestamp_us: 1000,
+            damage_tiles: None,
         };
         // No connected sessions, so datagrams go nowhere, but should not panic
         bridge.process_frame(frame);
@@ -581,6 +631,7 @@ mod tests {
             width: 32, height: 32, stride: 32 * 4,
             pixels: vec![0; 32 * 32 * 4],
             timestamp_us: 0,
+            damage_tiles: None,
         };
 
         bridge.process_frame(make_frame());

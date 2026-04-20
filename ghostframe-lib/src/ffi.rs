@@ -89,6 +89,7 @@ pub unsafe extern "C" fn gf_server_submit_frame(
         stride,
         pixels: pixel_data,
         timestamp_us,
+        damage_tiles: None,
     };
 
     // Use the stored runtime to drive the async send.

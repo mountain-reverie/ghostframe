@@ -22,6 +22,8 @@ pub struct FrameSubmission {
     pub pixels: Vec<u8>,
     /// Capture timestamp in microseconds.
     pub timestamp_us: u32,
+    /// Optional damage hints as tile coordinates. If `None`, all tiles are checked.
+    pub damage_tiles: Option<Vec<(u32, u32)>>,
 }
 
 // ── GhostframeServer ─────────────────────────────────────────────────────────
@@ -103,6 +105,7 @@ mod tests {
             stride: 1920 * 4,
             pixels: vec![0u8; 1920 * 1080 * 4],
             timestamp_us: 0,
+            damage_tiles: None,
         };
         assert_eq!(sub.width, 1920);
         assert_eq!(sub.pixels.len(), 1920 * 1080 * 4);

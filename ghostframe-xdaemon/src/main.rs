@@ -112,6 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         stride: geom.stride,
                         pixels,
                         timestamp_us,
+                        damage_tiles: None,
                     })
                 }
                 Err(e) => {

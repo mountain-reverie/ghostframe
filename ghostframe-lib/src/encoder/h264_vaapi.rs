@@ -34,6 +34,11 @@ pub struct H264VaapiEncoder {
     pts: i64,
 }
 
+// SAFETY: ffmpeg encoder/scaler contexts contain raw pointers but do not use
+// thread-local state. A single encoder instance is only accessed from one
+// thread at a time (the IoBridge event loop), so Send is safe.
+unsafe impl Send for H264VaapiEncoder {}
+
 impl H264VaapiEncoder {
     /// Create a new encoder, preferring VA-API but falling back to libx264.
     pub fn new() -> Result<Self, ffmpeg::Error> {

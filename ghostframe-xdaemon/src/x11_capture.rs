@@ -63,6 +63,7 @@ impl X11Capture {
             stride,
             pixels: reply.data,
             timestamp_us,
+            damage_tiles: None,
         })
     }
 }
