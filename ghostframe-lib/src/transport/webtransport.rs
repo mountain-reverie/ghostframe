@@ -89,6 +89,19 @@ impl WebTransportServer {
         self.connected
     }
 
+    /// Return all stream IDs known to this session (for force-read polling).
+    pub fn all_known_stream_ids(&self) -> Vec<StreamId> {
+        let mut ids: Vec<StreamId> = self.stream_bufs.keys().copied().collect();
+        ids.extend(self.pending_bidi_streams.iter().copied());
+        if let Some(s) = self.peer_control_stream {
+            ids.push(s);
+        }
+        if let Some(s) = self.session_stream {
+            ids.push(s);
+        }
+        ids
+    }
+
     // ── Called by the I/O bridge ─────────────────────────────────────────────
 
     /// Called immediately after a new QUIC connection is accepted.
@@ -143,15 +156,20 @@ impl WebTransportServer {
     /// `conn.streams().accept(dir)` before returning.
     pub fn on_stream_opened(&mut self, conn: &mut Connection, dir: Dir) {
         // Accept *all* newly opened streams in this direction.
+        let mut new_streams = Vec::new();
         while let Some(sid) = conn.streams().accept(dir) {
             tracing::debug!(stream_id = ?sid, ?dir, "peer opened stream");
             if dir == Dir::Bi {
-                // Bidirectional: candidate WebTransport CONNECT stream.
-                // Queue it; we'll process it when data arrives.
                 self.pending_bidi_streams.push(sid);
             }
-            // Unidirectional streams: we learn their purpose when data arrives
-            // (`on_stream_readable`). Nothing to do here yet.
+            new_streams.push(sid);
+        }
+        // Quinn-proto may buffer initial data with the stream-open event
+        // without generating a separate Readable event.  Eagerly try to
+        // read from every newly-accepted stream so the handshake doesn't
+        // stall waiting for an event that will never come.
+        for sid in new_streams {
+            self.on_stream_readable(conn, sid);
         }
     }
 
@@ -164,7 +182,11 @@ impl WebTransportServer {
         let bytes = match drain_stream(conn, sid) {
             Ok(b) => b,
             Err(DrainError::Read(quinn_proto::ReadError::Blocked)) => {
-                // No data available yet; will be retried on next Readable event.
+                tracing::debug!(stream_id = ?sid, "stream read: blocked (no data yet)");
+                return;
+            }
+            Err(DrainError::Readable(ref e)) => {
+                tracing::warn!(stream_id = ?sid, error = ?e, "stream read: readable error");
                 return;
             }
             Err(e) => {
@@ -174,8 +196,11 @@ impl WebTransportServer {
         };
 
         if bytes.is_empty() {
+            tracing::trace!(stream_id = ?sid, "stream read: 0 bytes");
             return;
         }
+
+        tracing::debug!(stream_id = ?sid, bytes = bytes.len(), "stream data read");
 
         // Determine what this stream carries.
         let is_known_peer_control = self.peer_control_stream == Some(sid);
@@ -404,8 +429,18 @@ fn drain_stream(conn: &mut Connection, sid: StreamId) -> Result<Vec<u8>, DrainEr
     let mut out = Vec::new();
     let mut recv = conn.recv_stream(sid);
     let mut chunks = recv.read(true).map_err(DrainError::Readable)?;
-    while let Some(chunk) = chunks.next(usize::MAX).map_err(DrainError::Read)? {
-        out.extend_from_slice(&chunk.bytes);
+    loop {
+        match chunks.next(usize::MAX) {
+            Ok(Some(chunk)) => {
+                out.extend_from_slice(&chunk.bytes);
+            }
+            Ok(None) => break,                          // FIN reached
+            Err(quinn_proto::ReadError::Blocked) => break, // no more data yet
+            Err(e) => {
+                let _ = chunks.finalize();
+                return Err(DrainError::Read(e));
+            }
+        }
     }
     let _ = chunks.finalize();
     Ok(out)
