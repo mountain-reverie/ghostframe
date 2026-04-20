@@ -58,6 +58,119 @@ impl TileGrid {
     }
 }
 
+pub struct DirtyTracker {
+    cols: u32,
+    rows: u32,
+    prev_tiles: Vec<Vec<u8>>,
+}
+
+impl DirtyTracker {
+    pub fn new(cols: u32, rows: u32) -> Self {
+        let count = (cols * rows) as usize;
+        Self {
+            cols,
+            rows,
+            prev_tiles: vec![Vec::new(); count],
+        }
+    }
+
+    pub fn resize(&mut self, cols: u32, rows: u32) {
+        self.cols = cols;
+        self.rows = rows;
+        self.prev_tiles = vec![Vec::new(); (cols * rows) as usize];
+    }
+
+    pub fn update(&mut self, pixels: &[u8], stride: u32, width: u32, height: u32) -> Vec<(u32, u32)> {
+        let grid = TileGrid::new(width, height);
+        if grid.cols != self.cols || grid.rows != self.rows {
+            self.resize(grid.cols, grid.rows);
+        }
+        let mut dirty = Vec::new();
+        for (tile_x, tile_y) in grid.iter_coords() {
+            let idx = (tile_y * self.cols + tile_x) as usize;
+            let current = grid.extract_tile(pixels, stride, tile_x, tile_y);
+            if self.prev_tiles[idx] != current {
+                self.prev_tiles[idx] = current;
+                dirty.push((tile_x, tile_y));
+            }
+        }
+        dirty
+    }
+
+    pub fn update_with_hints(
+        &mut self,
+        pixels: &[u8],
+        stride: u32,
+        width: u32,
+        height: u32,
+        hints: &[(u32, u32)],
+    ) -> Vec<(u32, u32)> {
+        let grid = TileGrid::new(width, height);
+        if grid.cols != self.cols || grid.rows != self.rows {
+            self.resize(grid.cols, grid.rows);
+        }
+        let mut dirty = Vec::new();
+        for &(tile_x, tile_y) in hints {
+            if tile_x >= self.cols || tile_y >= self.rows {
+                continue;
+            }
+            let idx = (tile_y * self.cols + tile_x) as usize;
+            let current = grid.extract_tile(pixels, stride, tile_x, tile_y);
+            if self.prev_tiles[idx] != current {
+                self.prev_tiles[idx] = current;
+                dirty.push((tile_x, tile_y));
+            }
+        }
+        dirty
+    }
+}
+
+#[cfg(test)]
+mod dirty_tests {
+    use super::*;
+
+    #[test]
+    fn first_frame_all_dirty() {
+        let mut tracker = DirtyTracker::new(2, 2);
+        let frame = vec![0u8; TILE_BYTES * 4]; // 2x2 grid, all zeros
+        let dirty = tracker.update(&frame, 64 * 4, 64, 64);
+        assert_eq!(dirty, vec![(0, 0), (1, 0), (0, 1), (1, 1)]);
+    }
+
+    #[test]
+    fn unchanged_tiles_are_clean() {
+        let mut tracker = DirtyTracker::new(2, 2);
+        let frame = vec![42u8; TILE_BYTES * 4];
+        let _ = tracker.update(&frame, 64 * 4, 64, 64);
+        let dirty = tracker.update(&frame, 64 * 4, 64, 64);
+        assert!(dirty.is_empty());
+    }
+
+    #[test]
+    fn changed_tile_detected() {
+        let mut tracker = DirtyTracker::new(2, 2);
+        let frame = vec![0u8; 64 * 64 * 4];
+        let _ = tracker.update(&frame, 64 * 4, 64, 64);
+
+        let mut frame2 = frame.clone();
+        frame2[33 * 4] = 255;
+        let dirty = tracker.update(&frame2, 64 * 4, 64, 64);
+        assert_eq!(dirty, vec![(1, 0)]);
+    }
+
+    #[test]
+    fn damage_hints_narrow_check() {
+        let mut tracker = DirtyTracker::new(2, 2);
+        let frame = vec![0u8; 64 * 64 * 4];
+        let _ = tracker.update(&frame, 64 * 4, 64, 64);
+
+        let mut frame2 = frame.clone();
+        for b in frame2.iter_mut() { *b = 99; }
+        let dirty = tracker.update_with_hints(&frame2, 64 * 4, 64, 64, &[(0, 0)]);
+        assert_eq!(dirty, vec![(0, 0)]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
