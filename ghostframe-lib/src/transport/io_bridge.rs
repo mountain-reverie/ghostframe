@@ -209,16 +209,28 @@ impl IoBridge {
             let tile_data = grid.extract_tile(&frame.pixels, frame.stride, *tile_x, *tile_y);
 
             let (codec, payload) = if self.h264_available {
-                let encoder = self.encoders
-                    .entry((*tile_x, *tile_y))
-                    .or_insert_with(|| H264VaapiEncoder::new().unwrap());
-                match encoder.encode(&tile_data) {
-                    Ok(Some(encoded)) => (encoded.codec, encoded.payload),
-                    Ok(None) => (Codec::Raw, tile_data),
-                    Err(e) => {
-                        tracing::warn!(tile_x, tile_y, error = %e, "H.264 encode failed, sending raw");
-                        (Codec::Raw, tile_data)
-                    }
+                use std::collections::hash_map::Entry;
+                let encoder = match self.encoders.entry((*tile_x, *tile_y)) {
+                    Entry::Occupied(e) => Some(e.into_mut()),
+                    Entry::Vacant(e) => match H264VaapiEncoder::new() {
+                        Ok(enc) => Some(e.insert(enc)),
+                        Err(err) => {
+                            tracing::warn!(tile_x, tile_y, error = %err,
+                                "H.264 encoder creation failed, sending raw");
+                            None
+                        }
+                    },
+                };
+                match encoder {
+                    Some(enc) => match enc.encode(&tile_data) {
+                        Ok(Some(encoded)) => (encoded.codec, encoded.payload),
+                        Ok(None) => (Codec::Raw, tile_data),
+                        Err(e) => {
+                            tracing::warn!(tile_x, tile_y, error = %e, "H.264 encode failed, sending raw");
+                            (Codec::Raw, tile_data)
+                        }
+                    },
+                    None => (Codec::Raw, tile_data),
                 }
             } else {
                 (Codec::Raw, tile_data)
