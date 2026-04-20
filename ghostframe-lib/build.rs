@@ -42,17 +42,11 @@ fn main() {
     let cbindgen_config = cbindgen::Config::from_root_or_default(&manifest_dir);
     let include_dir = PathBuf::from(&manifest_dir).join("include");
     std::fs::create_dir_all(&include_dir).expect("Failed to create include/ directory");
-    let result = cbindgen::Builder::new()
+    let bindings = cbindgen::Builder::new()
         .with_config(cbindgen_config)
         .with_crate(manifest_dir.clone())
         .with_language(cbindgen::Language::C)
-        .generate();
-    match result {
-        Ok(bindings) => {
-            bindings.write_to_file(include_dir.join("ghostframe.h"));
-        }
-        Err(e) => {
-            println!("cargo:warning=cbindgen header generation skipped (no exports yet): {e}");
-        }
-    }
+        .generate()
+        .expect("cbindgen failed");
+    bindings.write_to_file(include_dir.join("ghostframe.h"));
 }
