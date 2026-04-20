@@ -8,6 +8,10 @@ RUN apt-get update && apt-get install -y \
     x11-utils \
     mesa-utils \
     libgl1-mesa-dri \
+    libavcodec60 \
+    libavutil58 \
+    libswscale7 \
+    libx264-dev \
     && rm -rf /var/lib/apt/lists/*
 
 COPY target/release/ghostframe-xdaemon /usr/local/bin/ghostframe-xdaemon
