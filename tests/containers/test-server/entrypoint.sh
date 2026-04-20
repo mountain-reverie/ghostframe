@@ -17,8 +17,8 @@ export DISPLAY=:99
 Xorg :99 -config /etc/X11/xorg.conf &
 sleep 2
 
-# Paint root window red
-ghostframe-test-pattern --solid-red &
+# Paint root window — default is --solid-red, override with TEST_PATTERN env var
+ghostframe-test-pattern ${TEST_PATTERN:---solid-red} &
 sleep 1
 
 # Start xdaemon (captures X11 root, serves via WebTransport)
