@@ -106,6 +106,12 @@ impl DatagramHeader {
             timestamp_us: u32::from_be_bytes(data[8..12].try_into().unwrap()),
         })
     }
+
+    /// Returns `true` if this datagram is a parity (FEC) fragment.
+    /// Parity fragments have `frag_idx >= frag_total`.
+    pub fn is_parity(&self) -> bool {
+        self.frag_idx >= self.frag_total
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -226,6 +232,56 @@ pub fn decode_tile_datagram(data: &[u8]) -> Result<(DatagramHeader, TileHeader, 
     let th = TileHeader::decode(rest)?;
     let payload = &rest[TILE_HEADER_SIZE..];
     Ok((dh, th, payload))
+}
+
+// ---------------------------------------------------------------------------
+// build_parity_datagrams
+// ---------------------------------------------------------------------------
+
+/// Build parity datagrams for a tile's source fragments.
+///
+/// `frag_total` is the number of source fragments (from `fragment_tile`).
+/// `parities` is the output of `fec::generate_parity`: `(group_start, parity_payload)` pairs.
+///
+/// Parity datagrams have `frag_idx` starting at `frag_total` (so they sort after source fragments)
+/// and `frag_total` set to the source fragment count (so the receiver knows how many source
+/// fragments to expect).
+pub fn build_parity_datagrams(
+    frame_seq: u32,
+    tile_x: u8,
+    tile_y: u8,
+    codec: Codec,
+    timestamp_us: u32,
+    frag_total: u16,
+    parities: &[(u16, Vec<u8>)],
+) -> Vec<Vec<u8>> {
+    parities
+        .iter()
+        .enumerate()
+        .map(|(parity_idx, (_group_start, parity_payload))| {
+            let dh = DatagramHeader {
+                frame_seq,
+                frag_idx: frag_total + parity_idx as u16,
+                frag_total,
+                timestamp_us,
+            };
+            let th = TileHeader {
+                tile_x,
+                tile_y,
+                codec,
+                lz4: false,
+                generation: 0,
+                payload_len: 0, // not meaningful for parity
+            };
+            let mut buf = Vec::with_capacity(
+                DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE + parity_payload.len(),
+            );
+            dh.encode(&mut buf);
+            th.encode(&mut buf);
+            buf.extend_from_slice(parity_payload);
+            buf
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -369,5 +425,65 @@ mod tests {
         assert_eq!(th.codec, Codec::Skip);
         assert_eq!(th.payload_len, 0);
         assert!(frag_payload.is_empty());
+    }
+
+    #[test]
+    fn is_parity_datagram() {
+        // Source fragment: frag_idx < frag_total
+        let source = DatagramHeader {
+            frame_seq: 1, frag_idx: 2, frag_total: 8, timestamp_us: 0,
+        };
+        assert!(!source.is_parity());
+
+        // Parity fragment: frag_idx >= frag_total
+        let parity = DatagramHeader {
+            frame_seq: 1, frag_idx: 8, frag_total: 8, timestamp_us: 0,
+        };
+        assert!(parity.is_parity());
+    }
+
+    #[test]
+    fn fragment_tile_with_parity_roundtrip() {
+        use crate::transport::fec;
+
+        let payload: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+        let max_frag = 1200;
+        let k = 4;
+
+        // Generate source datagrams
+        let source_dgs = fragment_tile(7, 2, 3, Codec::H264, &payload, 999, max_frag);
+        let frag_total = source_dgs.len();
+        assert_eq!(frag_total, 4); // ceil(4096/1200) = 4
+
+        // Extract source payloads (bytes after headers)
+        let source_payloads: Vec<&[u8]> = source_dgs.iter().map(|dg| {
+            &dg[DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE..]
+        }).collect();
+
+        // Generate parity
+        let parities = fec::generate_parity(&source_payloads, k);
+        assert_eq!(parities.len(), 1); // 4 frags / K=4 = 1 parity group
+
+        // Build parity datagrams using the helper
+        let parity_dgs = build_parity_datagrams(
+            7, 2, 3, Codec::H264, 999,
+            frag_total as u16,
+            &parities,
+        );
+        assert_eq!(parity_dgs.len(), 1);
+
+        // Decode the parity datagram
+        let (dh, th, parity_payload) = decode_tile_datagram(&parity_dgs[0]).unwrap();
+        assert!(dh.is_parity());
+        assert_eq!(dh.frag_idx, frag_total as u16); // first parity index
+        assert_eq!(dh.frag_total, frag_total as u16); // source fragment count preserved
+        assert_eq!(th.codec, Codec::H264);
+        assert_eq!(th.tile_x, 2);
+        assert_eq!(th.tile_y, 3);
+
+        // Verify parity payload has the parity header
+        let (group_start, group_len, _xor_data) = fec::decode_parity_payload(parity_payload).unwrap();
+        assert_eq!(group_start, 0);
+        assert_eq!(group_len, 4);
     }
 }
