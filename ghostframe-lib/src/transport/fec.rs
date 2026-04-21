@@ -28,6 +28,8 @@ pub fn generate_parity(fragment_payloads: &[&[u8]], k: usize) -> Vec<(u16, Vec<u
         return vec![];
     }
 
+    assert!(k <= u8::MAX as usize, "FEC group size k must fit in u8 (max 255)");
+
     let mut result = Vec::new();
 
     for (chunk_idx, chunk) in fragment_payloads.chunks(k).enumerate() {
@@ -71,6 +73,7 @@ pub fn decode_parity_payload(payload: &[u8]) -> Option<(u16, u8, &[u8])> {
 /// `received` contains the payloads of all fragments that were received (not the missing one).
 /// `parity_xor_data` is the raw XOR data from the parity packet (after stripping the header).
 pub fn recover_fragment(received: &[&[u8]], parity_xor_data: &[u8]) -> Vec<u8> {
+    debug_assert!(!received.is_empty(), "recovery requires at least one received fragment");
     let max_len = received
         .iter()
         .map(|p| p.len())

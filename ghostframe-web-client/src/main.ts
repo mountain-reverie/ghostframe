@@ -116,6 +116,50 @@ async function main() {
   let latestFrameSeq = 0;
   let firstTileRendered = false;
 
+  /** Reassemble completed tile and decode/render it. */
+  function finishAssembly(asmKey: string, asm: TileAssembly) {
+    assemblies.delete(asmKey);
+
+    const totalLen = asm.fragments.reduce((acc, f) => acc + (f ? f.byteLength : 0), 0);
+    const payload = new Uint8Array(totalLen);
+    let off = 0;
+    for (const frag of asm.fragments) {
+      if (frag) {
+        payload.set(frag, off);
+        off += frag.byteLength;
+      }
+    }
+
+    const tX = asm.header.tileX;
+    const tY = asm.header.tileY;
+
+    const minWidth = (tX + 1) * TILE_SIZE;
+    const minHeight = (tY + 1) * TILE_SIZE;
+    if (canvasEl.width < minWidth || canvasEl.height < minHeight) {
+      renderer.resize(
+        Math.max(canvasEl.width, minWidth),
+        Math.max(canvasEl.height, minHeight)
+      );
+    }
+
+    if (asm.header.codec === Codec.Raw) {
+      renderer.drawRawTile(tX, tY, payload);
+    } else if (asm.header.codec === Codec.H264) {
+      const dec = getH264Decoder(tX, tY);
+      dec.decode(payload);
+    }
+
+    if (!firstTileRendered) {
+      firstTileRendered = true;
+      const sample = Array.from(payload.slice(0, 16))
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join(' ');
+      log(`First tile: (${tX},${tY}) ${payload.byteLength}B`);
+      log(`First bytes: ${sample}`);
+      statusEl.textContent = 'Receiving frames';
+    }
+  }
+
   // Receive datagrams
   const reader = transport.datagrams.readable.getReader();
   while (true) {
@@ -143,7 +187,7 @@ async function main() {
 
     const view = new DataView(value.buffer, value.byteOffset, value.byteLength);
     const dgramHdr = decodeDatagramHeader(view, 0);
-    lossTracker.onDatagram(dgramHdr.frameSeq);
+    lossTracker.onDatagram();
     const tileHdr = decodeTileHeader(view, DATAGRAM_HEADER_SIZE);
 
     // Track the latest frame sequence number
@@ -156,6 +200,10 @@ async function main() {
     for (const [k, asm] of assemblies) {
       const seq = parseInt(k.split(':')[0], 10);
       if (seq < staleThreshold) {
+        // Count missing fragments as lost datagrams
+        if (asm.received < asm.fragments.length) {
+          lossTracker.onStaleTile(asm.fragments.length, asm.received);
+        }
         assemblies.delete(k);
         parityMap.delete(k);
       }
@@ -174,6 +222,23 @@ async function main() {
         value.buffer, value.byteOffset + payloadOffset, value.byteLength - payloadOffset
       );
       pr.addParity(parityPayload);
+
+      // Parity arrived — check if a pending assembly can now recover
+      const asmKey = tileKey(dgramHdr.frameSeq, tileHdr.tileX, tileHdr.tileY);
+      const pendingAsm = assemblies.get(asmKey);
+      if (pendingAsm && pendingAsm.received === dgramHdr.fragTotal - 1) {
+        const missingIdx = pendingAsm.fragments.findIndex(f => f === null);
+        if (missingIdx >= 0) {
+          const recovered = pr.tryRecover(missingIdx, pendingAsm.fragments);
+          if (recovered) {
+            pendingAsm.fragments[missingIdx] = recovered;
+            pendingAsm.received++;
+            lossTracker.onFecRecovery();
+            // Assembly now complete — reassemble and render
+            finishAssembly(asmKey, pendingAsm);
+          }
+        }
+      }
       continue; // Don't process as a source fragment
     }
 
@@ -221,47 +286,7 @@ async function main() {
 
     // Check if all fragments have arrived
     if (asm.received === dgramHdr.fragTotal) {
-      assemblies.delete(key);
-
-      // Reassemble payload
-      const totalLen = asm.fragments.reduce((acc, f) => acc + (f ? f.byteLength : 0), 0);
-      const payload = new Uint8Array(totalLen);
-      let offset = 0;
-      for (const frag of asm.fragments) {
-        if (frag) {
-          payload.set(frag, offset);
-          offset += frag.byteLength;
-        }
-      }
-
-      // Ensure canvas is large enough
-      const minWidth = (tileHdr.tileX + 1) * TILE_SIZE;
-      const minHeight = (tileHdr.tileY + 1) * TILE_SIZE;
-      if (canvasEl.width < minWidth || canvasEl.height < minHeight) {
-        renderer.resize(
-          Math.max(canvasEl.width, minWidth),
-          Math.max(canvasEl.height, minHeight)
-        );
-      }
-
-      // Decode based on codec
-      if (asm.header.codec === Codec.Raw) {
-        renderer.drawRawTile(tileHdr.tileX, tileHdr.tileY, payload);
-      } else if (asm.header.codec === Codec.H264) {
-        const dec = getH264Decoder(tileHdr.tileX, tileHdr.tileY);
-        dec.decode(payload);
-      }
-
-      if (!firstTileRendered) {
-        firstTileRendered = true;
-        // Log tile diagnostic for E2E debugging
-        const sample = Array.from(payload.slice(0, 16))
-          .map(b => b.toString(16).padStart(2, '0'))
-          .join(' ');
-        log(`First tile: (${tileHdr.tileX},${tileHdr.tileY}) ${payload.byteLength}B`);
-        log(`First bytes: ${sample}`);
-        statusEl.textContent = 'Receiving frames';
-      }
+      finishAssembly(key, asm);
     }
   }
 }

@@ -3,6 +3,17 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+/**
+ * Size of the parity packet header in bytes:
+ *   - group_start: u16 BE (2 bytes)
+ *   - group_len:   u8    (1 byte)
+ */
+#define PARITY_HEADER_SIZE 3
+
+#define FEEDBACK_MSG_TYPE 1
+
+#define FEEDBACK_SIZE 22
+
 #define DATAGRAM_HEADER_SIZE 12
 
 #define TILE_HEADER_SIZE 8

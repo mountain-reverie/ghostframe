@@ -518,15 +518,21 @@ impl IoBridge {
             .flat_map(|wt| wt.drain_feedback())
             .collect();
         for data in &feedback_data {
-            if let Some(fb) = ReceiverFeedback::decode(data) {
-                tracing::debug!(
-                    received = fb.datagrams_received,
-                    lost = fb.datagrams_lost,
-                    recovered_fec = fb.datagrams_recovered_fec,
-                    loss_rate = %format!("{:.2}%", fb.loss_rate() * 100.0),
-                    "receiver feedback"
-                );
-                self.update_fec_from_feedback(&fb);
+            // Stream data may contain multiple concatenated 22-byte messages.
+            use crate::transport::feedback::FEEDBACK_SIZE;
+            let mut offset = 0;
+            while offset + FEEDBACK_SIZE <= data.len() {
+                if let Some(fb) = ReceiverFeedback::decode(&data[offset..]) {
+                    tracing::debug!(
+                        received = fb.datagrams_received,
+                        lost = fb.datagrams_lost,
+                        recovered_fec = fb.datagrams_recovered_fec,
+                        loss_rate = %format!("{:.2}%", fb.loss_rate() * 100.0),
+                        "receiver feedback"
+                    );
+                    self.update_fec_from_feedback(&fb);
+                }
+                offset += FEEDBACK_SIZE;
             }
         }
     }
