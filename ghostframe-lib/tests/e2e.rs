@@ -660,3 +660,39 @@ async fn e2e_multi_tile_grid() -> Result<()> {
 
     Ok(())
 }
+
+/// FEC: Verify that XOR parity generation doesn't break the rendering pipeline.
+///
+/// Forces FEC on via GHOSTFRAME_FEC_K=4 and checks that the H.264 pipeline
+/// still renders frames correctly with parity datagrams being generated and
+/// sent alongside source fragments.
+#[tokio::test]
+async fn e2e_fec_parity_enabled() -> Result<()> {
+    let setup = setup_e2e_with_env("--solid-red", &[("GHOSTFRAME_FEC_K", "4")]).await?;
+
+    // Wait for frames + QUIC congestion window
+    tokio::time::sleep(Duration::from_secs(6)).await;
+
+    // Scan for red pixel — same as e2e_solid_color but with FEC active
+    let scan_js = r#"
+        (() => {
+            const canvas = document.getElementById('canvas');
+            const ctx = canvas.getContext('2d');
+            for (let y = 16; y < 480; y += 32) {
+                for (let x = 16; x < 640; x += 32) {
+                    const p = ctx.getImageData(x, y, 1, 1).data;
+                    if (p[0] > 180 && p[1] < 80 && p[2] < 80) {
+                        return { found: true, x, y, r: p[0], g: p[1], b: p[2] };
+                    }
+                }
+            }
+            return { found: false };
+        })()
+    "#;
+
+    let scan: serde_json::Value = setup.page.evaluate(scan_js).await?.into_value()?;
+    let found = scan.get("found").and_then(|v| v.as_bool()).unwrap_or(false);
+    assert!(found, "no red pixel found — FEC parity may have broken the H.264 pipeline");
+
+    Ok(())
+}
