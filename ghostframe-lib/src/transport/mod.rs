@@ -1,4 +1,5 @@
 pub mod fec;
+pub mod feedback;
 pub mod ghostbridge;
 pub mod io_bridge;
 pub mod protocol;
