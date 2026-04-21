@@ -510,6 +510,25 @@ impl IoBridge {
                 }
             }
         }
+
+        // Process any feedback data received on non-session bidi streams.
+        let feedback_data: Vec<Vec<u8>> = self
+            .wt_sessions
+            .values_mut()
+            .flat_map(|wt| wt.drain_feedback())
+            .collect();
+        for data in &feedback_data {
+            if let Some(fb) = ReceiverFeedback::decode(data) {
+                tracing::debug!(
+                    received = fb.datagrams_received,
+                    lost = fb.datagrams_lost,
+                    recovered_fec = fb.datagrams_recovered_fec,
+                    loss_rate = %format!("{:.2}%", fb.loss_rate() * 100.0),
+                    "receiver feedback"
+                );
+                self.update_fec_from_feedback(&fb);
+            }
+        }
     }
 
     /// Test-only constructor that accepts a pre-built stream and server,

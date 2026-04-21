@@ -67,6 +67,9 @@ pub struct WebTransportServer {
     /// but not yet seen in `on_stream_readable`.  We queue them here from
     /// `on_stream_opened` (which doesn't yet have data).
     pending_bidi_streams: Vec<StreamId>,
+    /// Data received on non-session bidi streams after the session is established.
+    /// Used for ReceiverFeedback messages from the client.
+    feedback_queue: Vec<Vec<u8>>,
 }
 
 impl WebTransportServer {
@@ -81,6 +84,7 @@ impl WebTransportServer {
             connected: false,
             stream_bufs: HashMap::new(),
             pending_bidi_streams: Vec::new(),
+            feedback_queue: Vec::new(),
         }
     }
 
@@ -280,6 +284,11 @@ impl WebTransportServer {
         conn.datagrams().send(Bytes::from(buf), true)
     }
 
+    /// Drain all queued feedback data received on non-session bidi streams.
+    pub fn drain_feedback(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.feedback_queue)
+    }
+
     // ── Internal helpers ─────────────────────────────────────────────────────
 
     /// Try to decode a peer SETTINGS frame from the buffered data for `sid`.
@@ -329,7 +338,15 @@ impl WebTransportServer {
     /// On success: sends a 200 response and marks the session as connected.
     fn try_decode_connect(&mut self, conn: &mut Connection, sid: StreamId) {
         if self.connected {
-            // Already have a session; ignore additional CONNECT streams.
+            // Already have a session — this bidi stream is not a CONNECT request.
+            // Route its data to the feedback queue (used for ReceiverFeedback).
+            if let Some(buf) = self.stream_bufs.remove(&sid) {
+                let data = buf.as_slice().to_vec();
+                if !data.is_empty() {
+                    self.feedback_queue.push(data);
+                }
+            }
+            self.pending_bidi_streams.retain(|&s| s != sid);
             return;
         }
 
