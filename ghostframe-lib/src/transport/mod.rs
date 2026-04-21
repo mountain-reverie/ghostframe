@@ -1,3 +1,4 @@
+pub mod fec;
 pub mod ghostbridge;
 pub mod io_bridge;
 pub mod protocol;
