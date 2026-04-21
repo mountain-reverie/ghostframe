@@ -35,6 +35,13 @@ export class TileRenderer {
   drawVideoFrame(tileX: number, tileY: number, frame: VideoFrame) {
     const px = tileX * TILE_SIZE;
     const py = tileY * TILE_SIZE;
-    this.ctx.drawImage(frame, px, py, TILE_SIZE, TILE_SIZE);
+    // The encoded frame may be larger than TILE_SIZE (e.g. 128x128 when
+    // VA-API pads for hardware minimum constraints).  Crop the top-left
+    // TILE_SIZE x TILE_SIZE region which contains the actual tile content.
+    this.ctx.drawImage(
+      frame,
+      0, 0, TILE_SIZE, TILE_SIZE,         // source rect (crop)
+      px, py, TILE_SIZE, TILE_SIZE,        // destination rect
+    );
   }
 }

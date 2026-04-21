@@ -75,10 +75,15 @@ export class H264TileDecoder {
       },
     });
 
+    // The coded dimensions may be larger than the tile size when VA-API
+    // pads to the hardware minimum (e.g. 128x128 on AMD).  WebCodecs will
+    // read the actual dimensions from the SPS, but we still need a
+    // reasonable initial hint.  Using 128 covers the common VA-API case
+    // while libx264 at 32x32 also works (decoder auto-adjusts from SPS).
     this.decoder.configure({
       codec: 'avc1.42001e', // Baseline profile, level 3.0
-      codedWidth: 32,
-      codedHeight: 32,
+      codedWidth: 128,
+      codedHeight: 128,
       optimizeForLatency: true,
     });
   }

@@ -21,11 +21,13 @@ libc = { workspace = true }
 time = { workspace = true }
 ash = { workspace = true }
 ffmpeg-next = { workspace = true }
+ffmpeg-sys-next = "8.1.0"
 
 [build-dependencies]
 cbindgen = { workspace = true }
 
 [dev-dependencies]
+tracing-subscriber = { workspace = true }
 testcontainers = "0.27"
 chromiumoxide = "0.9"
 serde_json = "1"
