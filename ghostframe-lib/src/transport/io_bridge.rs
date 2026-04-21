@@ -33,8 +33,11 @@ use crate::tile::{DirtyTracker, TileGrid};
 use crate::transport::ghostbridge::{
     encode_frame, parse_frame_rest, GhostbridgeConfig, GhostbridgeHandle,
 };
+use crate::transport::fec;
+use crate::transport::feedback::ReceiverFeedback;
 use crate::transport::protocol::{
-    Codec, fragment_tile, max_fragment_payload, PING_PAYLOAD, PONG_PAYLOAD,
+    build_parity_datagrams, Codec, fragment_tile, max_fragment_payload,
+    DATAGRAM_HEADER_SIZE, PING_PAYLOAD, PONG_PAYLOAD, TILE_HEADER_SIZE,
 };
 use crate::transport::quic::QuicServer;
 use crate::transport::webtransport::WebTransportServer;
@@ -66,6 +69,12 @@ pub struct IoBridge {
     encoders: HashMap<(u32, u32), H264VaapiEncoder>,
     /// Whether H.264 encoding is available (checked once at startup).
     h264_available: bool,
+    /// FEC parity group size. 0 = disabled.
+    fec_k: usize,
+    /// Loss rate threshold to enable FEC (0.005 = 0.5%).
+    fec_enable_threshold: f64,
+    /// Loss rate threshold to disable FEC (hysteresis).
+    fec_disable_threshold: f64,
 }
 
 impl IoBridge {
@@ -126,6 +135,12 @@ impl IoBridge {
             dirty_tracker: DirtyTracker::new(0, 0),
             encoders: HashMap::new(),
             h264_available,
+            fec_k: std::env::var("GHOSTFRAME_FEC_K")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0),
+            fec_enable_threshold: 0.005,
+            fec_disable_threshold: 0.002,
         })
     }
 
@@ -255,6 +270,36 @@ impl IoBridge {
                         if let Err(e) = wt.send_datagram(conn, dg) {
                             tracing::trace!(?handle, tile_x, tile_y, error = ?e,
                                 "datagram send failed (congestion/buffer full)");
+                        }
+                    }
+                }
+            }
+
+            // Generate and send FEC parity datagrams if enabled
+            if self.fec_k > 0 && codec == Codec::H264 && datagrams.len() > 1 {
+                let source_payloads: Vec<&[u8]> = datagrams.iter().map(|dg| {
+                    &dg[DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE..]
+                }).collect();
+                let parities = fec::generate_parity(&source_payloads, self.fec_k);
+                let parity_dgs = build_parity_datagrams(
+                    seq,
+                    *tile_x as u8,
+                    *tile_y as u8,
+                    codec,
+                    frame.timestamp_us,
+                    datagrams.len() as u16,
+                    &parities,
+                );
+                for pdg in &parity_dgs {
+                    for (handle, wt) in &mut self.wt_sessions {
+                        if !wt.is_connected() {
+                            continue;
+                        }
+                        if let Some(conn) = self.server.connections.get_mut(handle) {
+                            if let Err(e) = wt.send_datagram(conn, pdg) {
+                                tracing::trace!(?handle, tile_x, tile_y, error = ?e,
+                                    "parity datagram send failed");
+                            }
                         }
                     }
                 }
@@ -483,6 +528,9 @@ impl IoBridge {
             dirty_tracker: DirtyTracker::new(0, 0),
             encoders: HashMap::new(),
             h264_available: false,
+            fec_k: 0,
+            fec_enable_threshold: 0.005,
+            fec_disable_threshold: 0.002,
         }
     }
 
@@ -502,6 +550,22 @@ impl IoBridge {
             dirty_tracker: DirtyTracker::new(0, 0),
             encoders: HashMap::new(),
             h264_available: false,
+            fec_k: 0,
+            fec_enable_threshold: 0.005,
+            fec_disable_threshold: 0.002,
+        }
+    }
+
+    /// Update FEC parity state based on receiver feedback.
+    /// Enables parity (K=4) when loss exceeds threshold, disables when it drops.
+    fn update_fec_from_feedback(&mut self, fb: &ReceiverFeedback) {
+        let loss = fb.loss_rate();
+        if self.fec_k == 0 && loss >= self.fec_enable_threshold {
+            self.fec_k = 4;
+            tracing::info!(loss_rate = %format!("{:.2}%", loss * 100.0), "FEC enabled (K=4)");
+        } else if self.fec_k > 0 && loss < self.fec_disable_threshold {
+            self.fec_k = 0;
+            tracing::info!(loss_rate = %format!("{:.2}%", loss * 100.0), "FEC disabled");
         }
     }
 }
@@ -627,6 +691,42 @@ mod tests {
         };
         // No connected sessions, so datagrams go nowhere, but should not panic
         bridge.process_frame(frame);
+    }
+
+    #[tokio::test]
+    async fn fec_toggle_from_feedback() {
+        let (our_end, _peer) = UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("server");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+
+        assert_eq!(bridge.fec_k, 0, "FEC starts disabled");
+
+        // High loss → enable
+        let fb_high = crate::transport::feedback::ReceiverFeedback {
+            timestamp_ns: 0,
+            datagrams_received: 95,
+            datagrams_lost: 5,
+            datagrams_recovered_fec: 0,
+            suspension_detected: false,
+        };
+        bridge.update_fec_from_feedback(&fb_high);
+        assert_eq!(bridge.fec_k, 4, "FEC should be enabled at 5% loss");
+
+        // Still losing — stays enabled
+        bridge.update_fec_from_feedback(&fb_high);
+        assert_eq!(bridge.fec_k, 4);
+
+        // Low loss → disable
+        let fb_low = crate::transport::feedback::ReceiverFeedback {
+            timestamp_ns: 0,
+            datagrams_received: 1000,
+            datagrams_lost: 1,
+            datagrams_recovered_fec: 0,
+            suspension_detected: false,
+        };
+        bridge.update_fec_from_feedback(&fb_low);
+        assert_eq!(bridge.fec_k, 0, "FEC should be disabled at 0.1% loss");
     }
 
     #[tokio::test]
