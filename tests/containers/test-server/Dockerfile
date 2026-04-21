@@ -18,6 +18,7 @@ COPY target/release/ghostframe-xdaemon /usr/local/bin/ghostframe-xdaemon
 COPY target/release/ghostframe-test-pattern /usr/local/bin/ghostframe-test-pattern
 COPY tests/containers/test-server/entrypoint.sh /entrypoint.sh
 COPY tests/containers/test-server/xorg.conf /etc/X11/xorg.conf
+COPY tests/containers/test-server/xorg-odd.conf /etc/X11/xorg-odd.conf
 RUN chmod +x /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]

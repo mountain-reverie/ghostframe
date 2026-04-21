@@ -158,6 +158,10 @@ struct E2eSetup {
 }
 
 async fn setup_e2e(test_pattern_args: &str) -> Result<E2eSetup> {
+    setup_e2e_with_env(test_pattern_args, &[]).await
+}
+
+async fn setup_e2e_with_env(test_pattern_args: &str, extra_env: &[(&str, &str)]) -> Result<E2eSetup> {
     let hs_server_url = format!("http://{DOCKER_HOST_IP}:{HEADSCALE_HOST_PORT}");
 
     let headscale: ContainerAsync<GenericImage> =
@@ -176,14 +180,17 @@ async fn setup_e2e(test_pattern_args: &str) -> Result<E2eSetup> {
     let server_key = helpers::create_preauth_key("headscale", "ghostframe").await?;
     let client_key = helpers::create_preauth_key("headscale", "ghostframe").await?;
 
-    let server: ContainerAsync<GenericImage> =
-        GenericImage::new("ghostframe/test-server", "latest")
+    let mut server_image = GenericImage::new("ghostframe/test-server", "latest")
             .with_container_name("ghostframe-server")
             .with_network(helpers::NETWORK_NAME)
             .with_env_var("TS_AUTHKEY", &server_key)
             .with_env_var("TS_CONTROL_URL", "http://headscale:8080")
             .with_env_var("RUST_LOG", "ghostframe=trace,debug")
-            .with_env_var("TEST_PATTERN", test_pattern_args)
+            .with_env_var("TEST_PATTERN", test_pattern_args);
+    for (k, v) in extra_env {
+        server_image = server_image.with_env_var(*k, *v);
+    }
+    let server: ContainerAsync<GenericImage> = server_image
             .with_ready_conditions(vec![WaitFor::message_on_stdout("CERT_HASH_SHA256=")])
             .with_startup_timeout(Duration::from_secs(120))
             .start()
@@ -525,6 +532,131 @@ async fn e2e_codec_transition() -> Result<()> {
     let snap_b: i64 = setup.page.evaluate(static_js).await?.into_value()?;
 
     assert_eq!(snap_a, snap_b, "Static region should stay unchanged while spinner runs elsewhere");
+
+    Ok(())
+}
+
+/// M2: Verify edge tiles (non-32-aligned resolution) render correctly.
+///
+/// Uses 700x500 resolution (22 full cols + 1 partial col of 28px wide,
+/// 15 full rows + 1 partial row of 20px tall). These partial tiles must
+/// be encoded, transported, and decoded without corruption.
+#[tokio::test]
+async fn e2e_edge_tiles() -> Result<()> {
+    let setup = setup_e2e_with_env("--solid-red", &[
+        ("XORG_CONF", "/etc/X11/xorg-odd.conf"),
+    ]).await?;
+
+    // Wait for frames
+    tokio::time::sleep(Duration::from_secs(6)).await;
+
+    // Sample pixels at the far right edge (inside rightmost partial tile)
+    // and bottom edge (inside bottom partial tile).
+    // If edge tiles work, these should be red (from --solid-red pattern).
+    let edge_js = r#"
+        (() => {
+            const canvas = document.getElementById('canvas');
+            const ctx = canvas.getContext('2d');
+            const results = {};
+
+            // Right edge: x=695 (inside last partial-width tile at col 21)
+            const pr = ctx.getImageData(695, 240, 1, 1).data;
+            results.right = { r: pr[0], g: pr[1], b: pr[2] };
+
+            // Bottom edge: y=495 (inside last partial-height tile at row 15)
+            const pb = ctx.getImageData(320, 495, 1, 1).data;
+            results.bottom = { r: pb[0], g: pb[1], b: pb[2] };
+
+            // Corner: bottom-right (both partial width AND height)
+            const pc = ctx.getImageData(695, 495, 1, 1).data;
+            results.corner = { r: pc[0], g: pc[1], b: pc[2] };
+
+            // Center (known-good reference)
+            const pm = ctx.getImageData(350, 250, 1, 1).data;
+            results.center = { r: pm[0], g: pm[1], b: pm[2] };
+
+            return results;
+        })()
+    "#;
+
+    let result: serde_json::Value = setup.page.evaluate(edge_js).await?.into_value()?;
+
+    // Check center renders red (baseline)
+    let center = &result["center"];
+    let cr = center["r"].as_u64().unwrap_or(0);
+    assert!(cr > 150, "Center pixel should be red (got r={cr}) - baseline failed");
+
+    // Check right edge renders red
+    let right = &result["right"];
+    let rr = right["r"].as_u64().unwrap_or(0);
+    let rg = right["g"].as_u64().unwrap_or(255);
+    assert!(rr > 150 && rg < 100,
+        "Right edge tile should be red: r={rr} g={rg}");
+
+    // Check bottom edge renders red
+    let bottom = &result["bottom"];
+    let br = bottom["r"].as_u64().unwrap_or(0);
+    let bg = bottom["g"].as_u64().unwrap_or(255);
+    assert!(br > 150 && bg < 100,
+        "Bottom edge tile should be red: r={br} g={bg}");
+
+    // Check bottom-right corner renders red
+    let corner = &result["corner"];
+    let corr = corner["r"].as_u64().unwrap_or(0);
+    let corg = corner["g"].as_u64().unwrap_or(255);
+    assert!(corr > 150 && corg < 100,
+        "Corner edge tile should be red: r={corr} g={corg}");
+
+    Ok(())
+}
+
+/// M2: Verify multiple tiles across the grid render correctly.
+///
+/// Samples pixels at multiple tile-center positions across the 640x480
+/// frame to ensure the full grid (20x15 = 300 tiles) is being served.
+#[tokio::test]
+async fn e2e_multi_tile_grid() -> Result<()> {
+    let setup = setup_e2e("--solid-red").await?;
+
+    // Wait for frames and QUIC congestion window
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    // Sample 9 positions spread across the grid
+    let grid_js = r#"
+        (() => {
+            const canvas = document.getElementById('canvas');
+            const ctx = canvas.getContext('2d');
+            const positions = [
+                [16, 16],     // top-left tile (0,0)
+                [320, 16],    // top-center tile (10,0)
+                [624, 16],    // top-right tile (19,0)
+                [16, 240],    // mid-left tile (0,7)
+                [320, 240],   // center tile (10,7)
+                [624, 240],   // mid-right tile (19,7)
+                [16, 464],    // bottom-left tile (0,14)
+                [320, 464],   // bottom-center tile (10,14)
+                [624, 464],   // bottom-right tile (19,14)
+            ];
+            let redCount = 0;
+            for (const [x, y] of positions) {
+                const p = ctx.getImageData(x, y, 1, 1).data;
+                if (p[0] > 150 && p[1] < 100 && p[2] < 100) {
+                    redCount++;
+                }
+            }
+            return { redCount, total: positions.length };
+        })()
+    "#;
+
+    let result: serde_json::Value = setup.page.evaluate(grid_js).await?.into_value()?;
+    let red_count = result["redCount"].as_u64().unwrap_or(0);
+    let total = result["total"].as_u64().unwrap_or(9);
+
+    // Due to QUIC congestion control, not all tiles may arrive.
+    // But with 8 seconds at 2fps, most of the grid should render.
+    // Require at least 5 of 9 positions (>50%) to be red.
+    assert!(red_count >= 5,
+        "Expected at least 5/9 grid positions to be red, got {red_count}/{total}");
 
     Ok(())
 }

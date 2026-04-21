@@ -14,7 +14,7 @@ export CAPTURE_FPS=${CAPTURE_FPS:-2}
 export DISPLAY=:99
 
 # Start X with dummy driver
-Xorg :99 -config /etc/X11/xorg.conf &
+Xorg :99 -config ${XORG_CONF:-/etc/X11/xorg.conf} &
 sleep 2
 
 # Paint root window — default is --solid-red, override with TEST_PATTERN env var
