@@ -10,6 +10,8 @@ import {
   H264TileDecoder,
 } from './decoder';
 import { TileRenderer } from './renderer';
+import { ParityRecovery } from './fec';
+import { LossTracker } from './feedback';
 
 const statusEl = document.getElementById('status')!;
 const logEl = document.getElementById('log')!;
@@ -65,6 +67,31 @@ async function main() {
   log('Connected!');
   statusEl.textContent = 'Connected';
 
+  const parityMap = new Map<string, ParityRecovery>();
+  const lossTracker = new LossTracker();
+
+  // Send periodic receiver feedback on a bidi stream
+  const feedbackWriter = await (async () => {
+    try {
+      const bidi = await transport.createBidirectionalStream();
+      return bidi.writable.getWriter();
+    } catch {
+      console.warn('Could not open feedback stream');
+      return null;
+    }
+  })();
+
+  if (feedbackWriter) {
+    setInterval(async () => {
+      try {
+        const msg = lossTracker.encodeFeedback();
+        await feedbackWriter.write(msg);
+      } catch {
+        // Stream closed — stop reporting
+      }
+    }, 100); // Every 100ms per spec
+  }
+
   const renderer = new TileRenderer(canvasEl);
   // Default canvas size; will grow as tiles arrive
   renderer.resize(1280, 720);
@@ -116,6 +143,7 @@ async function main() {
 
     const view = new DataView(value.buffer, value.byteOffset, value.byteLength);
     const dgramHdr = decodeDatagramHeader(view, 0);
+    lossTracker.onDatagram(dgramHdr.frameSeq);
     const tileHdr = decodeTileHeader(view, DATAGRAM_HEADER_SIZE);
 
     // Track the latest frame sequence number
@@ -129,7 +157,24 @@ async function main() {
       const seq = parseInt(k.split(':')[0], 10);
       if (seq < staleThreshold) {
         assemblies.delete(k);
+        parityMap.delete(k);
       }
+    }
+
+    // Parity datagram: store for potential recovery (must precede Skip check)
+    if (dgramHdr.fragIdx >= dgramHdr.fragTotal) {
+      const pKey = tileKey(dgramHdr.frameSeq, tileHdr.tileX, tileHdr.tileY);
+      let pr = parityMap.get(pKey);
+      if (!pr) {
+        pr = new ParityRecovery();
+        parityMap.set(pKey, pr);
+      }
+      const payloadOffset = DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE;
+      const parityPayload = new Uint8Array(
+        value.buffer, value.byteOffset + payloadOffset, value.byteLength - payloadOffset
+      );
+      pr.addParity(parityPayload);
+      continue; // Don't process as a source fragment
     }
 
     // Skip codec: tile unchanged, canvas retains last content
@@ -155,6 +200,23 @@ async function main() {
     if (asm.fragments[dgramHdr.fragIdx] === null) {
       asm.fragments[dgramHdr.fragIdx] = fragData.slice(); // copy
       asm.received += 1;
+    }
+
+    // Attempt FEC recovery if we have almost all fragments
+    if (asm.received === dgramHdr.fragTotal - 1) {
+      const pKey = tileKey(dgramHdr.frameSeq, tileHdr.tileX, tileHdr.tileY);
+      const pr = parityMap.get(pKey);
+      if (pr) {
+        const missingIdx = asm.fragments.findIndex(f => f === null);
+        if (missingIdx >= 0) {
+          const recovered = pr.tryRecover(missingIdx, asm.fragments);
+          if (recovered) {
+            asm.fragments[missingIdx] = recovered;
+            asm.received++;
+            lossTracker.onFecRecovery();
+          }
+        }
+      }
     }
 
     // Check if all fragments have arrived
