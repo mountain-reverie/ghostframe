@@ -32,6 +32,16 @@ export class TileRenderer {
     this.ctx.putImageData(imageData, px, py);
   }
 
+  /** Draw a full-frame VideoFrame covering the entire canvas. */
+  drawFullFrame(frame: VideoFrame) {
+    const w = frame.displayWidth;
+    const h = frame.displayHeight;
+    if (this.canvas.width !== w || this.canvas.height !== h) {
+      this.resize(w, h);
+    }
+    this.ctx.drawImage(frame, 0, 0);
+  }
+
   drawVideoFrame(tileX: number, tileY: number, frame: VideoFrame) {
     const px = tileX * TILE_SIZE;
     const py = tileY * TILE_SIZE;
