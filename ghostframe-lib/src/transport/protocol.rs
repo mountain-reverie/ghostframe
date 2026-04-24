@@ -294,6 +294,184 @@ pub fn max_fragment_payload(max_datagram_size: usize) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// Discriminator: tile vs frame datagrams
+// ---------------------------------------------------------------------------
+
+/// Bit 31 of frame_seq distinguishes tile datagrams from frame datagrams.
+/// Frame datagrams: bit 31 = 0. Tile datagrams: bit 31 = 1.
+pub const TILE_DATAGRAM_FLAG: u32 = 1 << 31;
+
+/// Returns true if the datagram is a tile-level datagram (bit 31 of frame_seq = 1).
+pub fn is_tile_datagram(data: &[u8]) -> bool {
+    if data.len() < 4 {
+        return false;
+    }
+    let first_u32 = u32::from_be_bytes(data[0..4].try_into().unwrap());
+    (first_u32 & TILE_DATAGRAM_FLAG) != 0
+}
+
+// ---------------------------------------------------------------------------
+// FrameHeader (14 bytes)
+//   [0..4]  frame_seq:     u32 BE (bit 31 always 0)
+//   [4..6]  frag_idx:      u16 BE
+//   [6..8]  frag_total:    u16 BE
+//   [8..12] timestamp_us:  u32 BE
+//   [12]    flags:         u8  (bit 0 = is_keyframe)
+//   [13]    reserved:      u8
+// ---------------------------------------------------------------------------
+
+pub const FRAME_HEADER_SIZE: usize = 14;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameHeader {
+    pub frame_seq: u32,
+    pub frag_idx: u16,
+    pub frag_total: u16,
+    pub timestamp_us: u32,
+    pub flags: u8,
+    pub reserved: u8,
+}
+
+impl FrameHeader {
+    pub fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&self.frame_seq.to_be_bytes());
+        buf.extend_from_slice(&self.frag_idx.to_be_bytes());
+        buf.extend_from_slice(&self.frag_total.to_be_bytes());
+        buf.extend_from_slice(&self.timestamp_us.to_be_bytes());
+        buf.push(self.flags);
+        buf.push(self.reserved);
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self, ProtocolError> {
+        if data.len() < FRAME_HEADER_SIZE {
+            return Err(ProtocolError::TooShort {
+                expected: FRAME_HEADER_SIZE,
+                got: data.len(),
+            });
+        }
+        Ok(FrameHeader {
+            frame_seq: u32::from_be_bytes(data[0..4].try_into().unwrap()),
+            frag_idx: u16::from_be_bytes(data[4..6].try_into().unwrap()),
+            frag_total: u16::from_be_bytes(data[6..8].try_into().unwrap()),
+            timestamp_us: u32::from_be_bytes(data[8..12].try_into().unwrap()),
+            flags: data[12],
+            reserved: data[13],
+        })
+    }
+
+    /// Returns `true` if this datagram is a parity (FEC) fragment.
+    /// Parity fragments have `frag_idx >= frag_total`.
+    pub fn is_parity(&self) -> bool {
+        self.frag_idx >= self.frag_total
+    }
+
+    /// Returns `true` if the keyframe flag (bit 0) is set.
+    pub fn is_keyframe(&self) -> bool {
+        (self.flags & 0x01) != 0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fragment_frame
+// ---------------------------------------------------------------------------
+
+/// Fragments a full-frame H.264 payload into MTU-sized datagrams.
+///
+/// Each datagram = [FrameHeader (14 B)][payload_fragment].
+/// Empty payload → single datagram with no payload bytes.
+pub fn fragment_frame(
+    frame_seq: u32,
+    timestamp_us: u32,
+    is_keyframe: bool,
+    payload: &[u8],
+    max_fragment_payload: usize,
+) -> Vec<Vec<u8>> {
+    assert!(
+        max_fragment_payload > 0,
+        "max_fragment_payload must be > 0; got 0 (datagram size too small to fit headers)"
+    );
+
+    let flags: u8 = if is_keyframe { 0x01 } else { 0x00 };
+
+    let chunks: Vec<&[u8]> = if payload.is_empty() {
+        vec![&[]]
+    } else {
+        payload.chunks(max_fragment_payload).collect()
+    };
+
+    let frag_total = chunks.len() as u16;
+
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(idx, chunk)| {
+            let fh = FrameHeader {
+                frame_seq,
+                frag_idx: idx as u16,
+                frag_total,
+                timestamp_us,
+                flags,
+                reserved: 0,
+            };
+            let mut buf = Vec::with_capacity(FRAME_HEADER_SIZE + chunk.len());
+            fh.encode(&mut buf);
+            buf.extend_from_slice(chunk);
+            buf
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// decode_frame_datagram
+// ---------------------------------------------------------------------------
+
+/// Decodes a frame datagram into its FrameHeader and payload slice.
+pub fn decode_frame_datagram(data: &[u8]) -> Result<(FrameHeader, &[u8]), ProtocolError> {
+    let fh = FrameHeader::decode(data)?;
+    let payload = &data[FRAME_HEADER_SIZE..];
+    Ok((fh, payload))
+}
+
+// ---------------------------------------------------------------------------
+// max_frame_fragment_payload
+// ---------------------------------------------------------------------------
+
+/// Returns the maximum frame payload bytes that fit in one datagram of `max_datagram_size`.
+pub fn max_frame_fragment_payload(max_datagram_size: usize) -> usize {
+    max_datagram_size.saturating_sub(FRAME_HEADER_SIZE)
+}
+
+// ---------------------------------------------------------------------------
+// build_frame_parity_datagram
+// ---------------------------------------------------------------------------
+
+/// Builds a parity datagram for a frame's source fragments.
+///
+/// The parity datagram uses `frag_idx = frag_total` to signal it is a parity fragment.
+/// `frag_total` is the number of source fragments (from `fragment_frame`).
+pub fn build_frame_parity_datagram(
+    frame_seq: u32,
+    timestamp_us: u32,
+    is_keyframe: bool,
+    frag_total: u16,
+    parity_payload: &[u8],
+) -> Vec<u8> {
+    let flags: u8 = if is_keyframe { 0x01 } else { 0x00 };
+    let fh = FrameHeader {
+        frame_seq,
+        frag_idx: frag_total, // signals parity
+        frag_total,
+        timestamp_us,
+        flags,
+        reserved: 0,
+    };
+    let mut buf = Vec::with_capacity(FRAME_HEADER_SIZE + parity_payload.len());
+    fh.encode(&mut buf);
+    buf.extend_from_slice(parity_payload);
+    buf
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -485,5 +663,96 @@ mod tests {
         let (group_start, group_len, _xor_data) = fec::decode_parity_payload(parity_payload).unwrap();
         assert_eq!(group_start, 0);
         assert_eq!(group_len, 4);
+    }
+
+    #[test]
+    fn frame_header_roundtrip() {
+        let original = FrameHeader {
+            frame_seq: 0x0000_1234,
+            frag_idx: 2,
+            frag_total: 5,
+            timestamp_us: 987_654_321,
+            flags: 0x01,
+            reserved: 0,
+        };
+        let mut buf = Vec::new();
+        original.encode(&mut buf);
+        assert_eq!(buf.len(), FRAME_HEADER_SIZE);
+        let decoded = FrameHeader::decode(&buf).unwrap();
+        assert_eq!(decoded, original);
+        assert!(decoded.is_keyframe());
+        assert!(!decoded.is_parity());
+    }
+
+    #[test]
+    fn frame_header_discriminator() {
+        // Frame datagram: bit 31 of frame_seq = 0
+        let fh = FrameHeader {
+            frame_seq: 42,
+            frag_idx: 0,
+            frag_total: 1,
+            timestamp_us: 0,
+            flags: 0,
+            reserved: 0,
+        };
+        let mut frame_buf = Vec::new();
+        fh.encode(&mut frame_buf);
+        assert!(!is_tile_datagram(&frame_buf), "frame datagram must have bit 31 = 0");
+
+        // Tile datagram: bit 31 of frame_seq = 1 (TILE_DATAGRAM_FLAG set)
+        let dh = DatagramHeader {
+            frame_seq: TILE_DATAGRAM_FLAG | 42,
+            frag_idx: 0,
+            frag_total: 1,
+            timestamp_us: 0,
+        };
+        let mut tile_buf = Vec::new();
+        dh.encode(&mut tile_buf);
+        // Pad with a tile header's worth of zeros so is_tile_datagram only checks first 4 bytes
+        tile_buf.extend_from_slice(&[0u8; TILE_HEADER_SIZE]);
+        assert!(is_tile_datagram(&tile_buf), "tile datagram must have bit 31 = 1");
+    }
+
+    #[test]
+    fn fragment_frame_single() {
+        let payload = vec![0xCDu8; 500];
+        let datagrams = fragment_frame(10, 8000, true, &payload, 1200);
+        assert_eq!(datagrams.len(), 1);
+
+        let (fh, frag_payload) = decode_frame_datagram(&datagrams[0]).unwrap();
+        assert_eq!(fh.frame_seq, 10);
+        assert_eq!(fh.frag_idx, 0);
+        assert_eq!(fh.frag_total, 1);
+        assert_eq!(fh.timestamp_us, 8000);
+        assert!(fh.is_keyframe());
+        assert!(!fh.is_parity());
+        assert_eq!(frag_payload, payload.as_slice());
+    }
+
+    #[test]
+    fn fragment_frame_multiple() {
+        let payload: Vec<u8> = (0u8..=255).cycle().take(5000).collect();
+        let max_frag = 1200;
+        let datagrams = fragment_frame(99, 12345, false, &payload, max_frag);
+
+        // ceil(5000 / 1200) = 5
+        assert_eq!(datagrams.len(), 5);
+
+        for (i, dg) in datagrams.iter().enumerate() {
+            let (fh, _) = decode_frame_datagram(dg).unwrap();
+            assert_eq!(fh.frame_seq, 99);
+            assert_eq!(fh.frag_idx, i as u16);
+            assert_eq!(fh.frag_total, 5);
+            assert_eq!(fh.timestamp_us, 12345);
+            assert!(!fh.is_keyframe());
+        }
+
+        // Reassemble and verify matches original.
+        let mut reassembled = Vec::new();
+        for dg in &datagrams {
+            let (_, frag) = decode_frame_datagram(dg).unwrap();
+            reassembled.extend_from_slice(frag);
+        }
+        assert_eq!(reassembled, payload);
     }
 }
