@@ -55,6 +55,8 @@ struct PrevFrame {
     image: vk::Image,
     memory: vk::DeviceMemory,
     view: vk::ImageView,
+    /// Current Vulkan image layout — tracks transitions across frames.
+    layout: vk::ImageLayout,
     #[allow(dead_code)]
     width: u32,
     #[allow(dead_code)]
@@ -421,13 +423,17 @@ impl GpuDirtyTracker {
                 .src_access_mask(vk::AccessFlags::HOST_WRITE)
                 .dst_access_mask(vk::AccessFlags::SHADER_READ),
             vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::PREINITIALIZED)
+                .old_layout(prev.layout)
                 .new_layout(vk::ImageLayout::GENERAL)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(prev.image)
                 .subresource_range(subresource_range)
-                .src_access_mask(vk::AccessFlags::HOST_WRITE)
+                .src_access_mask(if prev.layout == vk::ImageLayout::PREINITIALIZED {
+                    vk::AccessFlags::HOST_WRITE
+                } else {
+                    vk::AccessFlags::SHADER_READ
+                })
                 .dst_access_mask(vk::AccessFlags::SHADER_READ),
         ];
         self.device.cmd_pipeline_barrier(
@@ -507,9 +513,12 @@ impl GpuDirtyTracker {
             .collect();
 
         // --- Swap prev_image ---
-        // Destroy old prev, promote current to prev
+        // Destroy old prev, promote current to prev.
+        // Current was transitioned to GENERAL during the dispatch.
         let old_prev = self.prev_image.take().unwrap();
         self.destroy_prev_frame(old_prev);
+        let mut current = current;
+        current.layout = vk::ImageLayout::GENERAL;
         self.prev_image = Some(current);
 
         // --- Free descriptor set ---
@@ -607,6 +616,7 @@ impl GpuDirtyTracker {
             image,
             memory,
             view,
+            layout: vk::ImageLayout::PREINITIALIZED,
             width,
             height,
         })
