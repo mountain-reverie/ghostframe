@@ -432,6 +432,429 @@ impl H264VaapiEncoder {
     }
 }
 
+// ---------------------------------------------------------------------------
+// FullFrameEncoder — full-resolution H.264 encoder with DMA-BUF zero-copy
+// ---------------------------------------------------------------------------
+
+use std::os::unix::io::RawFd;
+
+/// The result of encoding a full video frame.
+pub struct FullFrameEncoded {
+    pub payload: Vec<u8>,
+    pub is_keyframe: bool,
+}
+
+/// I-frame interval: one IDR + 10 P-frames = ~6 keyframes/sec at 60 fps.
+const FULL_FRAME_GOP: u32 = 11;
+
+/// Full-frame H.264 encoder.
+///
+/// Encodes at the native capture resolution using VA-API with DMA-BUF
+/// zero-copy when available, falling back to libx264 otherwise.
+pub struct FullFrameEncoder {
+    encoder: encoder::Video,
+    /// A scaler is only needed on the software path (BGRA → YUV420P).
+    scaler: Option<scaling::Context>,
+    pts: i64,
+    use_vaapi: bool,
+    enc_w: u32,
+    enc_h: u32,
+    _hw_device_ctx: Option<BufRef>,
+    hw_frames_ctx: Option<BufRef>,
+}
+
+// SAFETY: same reasoning as H264VaapiEncoder.
+unsafe impl Send for FullFrameEncoder {}
+
+impl FullFrameEncoder {
+    /// Create a full-frame encoder, preferring VA-API, falling back to libx264.
+    pub fn new(width: u32, height: u32) -> Result<Self, ffmpeg::Error> {
+        FFMPEG_INIT.call_once(|| {
+            ffmpeg::init().expect("ffmpeg::init() failed");
+        });
+
+        if let Some(vaapi_codec) = encoder::find_by_name("h264_vaapi") {
+            match Self::try_open_vaapi(vaapi_codec, width, height) {
+                Ok(this) => {
+                    info!(
+                        enc_w = this.enc_w,
+                        enc_h = this.enc_h,
+                        "FullFrameEncoder: using h264_vaapi hardware encoder"
+                    );
+                    return Ok(this);
+                }
+                Err(e) => {
+                    warn!(
+                        err = %e,
+                        "FullFrameEncoder: VA-API open failed, falling back to libx264"
+                    );
+                }
+            }
+        }
+
+        let x264_codec =
+            encoder::find_by_name("libx264").ok_or(ffmpeg::Error::EncoderNotFound)?;
+        info!("FullFrameEncoder: using libx264 software encoder");
+        Self::try_open_sw(x264_codec, width, height)
+    }
+
+    pub fn width(&self) -> u32 {
+        self.enc_w
+    }
+
+    pub fn height(&self) -> u32 {
+        self.enc_h
+    }
+
+    // -----------------------------------------------------------------------
+    // Encoder open paths
+    // -----------------------------------------------------------------------
+
+    fn try_open_vaapi(
+        enc_codec: codec::codec::Codec,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, ffmpeg::Error> {
+        unsafe {
+            let hw_device_ctx = H264VaapiEncoder::create_hw_device_ctx(VAAPI_DEVICE)?;
+
+            let hw_frames_ctx = match H264VaapiEncoder::create_hw_frames_ctx(
+                hw_device_ctx,
+                width,
+                height,
+                10,
+            ) {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    ffi::av_buffer_unref(&mut { hw_device_ctx });
+                    return Err(e);
+                }
+            };
+
+            let mut ctx = codec::context::Context::new_with_codec(enc_codec)
+                .encoder()
+                .video()?;
+
+            ctx.set_width(width);
+            ctx.set_height(height);
+            ctx.set_time_base(Rational(1, 60));
+            ctx.set_frame_rate(Some(Rational(60, 1)));
+            ctx.set_format(Pixel::VAAPI);
+
+            let ctx_ptr = ctx.as_mut_ptr();
+            (*ctx_ptr).hw_frames_ctx = ffi::av_buffer_ref(hw_frames_ctx);
+            if (*ctx_ptr).hw_frames_ctx.is_null() {
+                ffi::av_buffer_unref(&mut { hw_frames_ctx });
+                ffi::av_buffer_unref(&mut { hw_device_ctx });
+                return Err(ffmpeg::Error::InvalidData);
+            }
+
+            let mut opts = ffmpeg::Dictionary::new();
+            opts.set("g", &FULL_FRAME_GOP.to_string());
+
+            let opened = match ctx.open_with(opts) {
+                Ok(enc) => enc,
+                Err(e) => {
+                    ffi::av_buffer_unref(&mut { hw_frames_ctx });
+                    ffi::av_buffer_unref(&mut { hw_device_ctx });
+                    return Err(e);
+                }
+            };
+
+            Ok(Self {
+                encoder: opened,
+                scaler: None,
+                pts: 0,
+                use_vaapi: true,
+                enc_w: width,
+                enc_h: height,
+                _hw_device_ctx: Some(BufRef(hw_device_ctx)),
+                hw_frames_ctx: Some(BufRef(hw_frames_ctx)),
+            })
+        }
+    }
+
+    fn try_open_sw(
+        enc_codec: codec::codec::Codec,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, ffmpeg::Error> {
+        let mut ctx = codec::context::Context::new_with_codec(enc_codec)
+            .encoder()
+            .video()?;
+
+        ctx.set_width(width);
+        ctx.set_height(height);
+        ctx.set_time_base(Rational(1, 60));
+        ctx.set_frame_rate(Some(Rational(60, 1)));
+        ctx.set_format(Pixel::YUV420P);
+
+        let mut opts = ffmpeg::Dictionary::new();
+        opts.set("preset", "ultrafast");
+        opts.set("tune", "zerolatency");
+        opts.set("g", &FULL_FRAME_GOP.to_string());
+
+        let opened = ctx.open_with(opts)?;
+
+        let scaler = scaling::Context::get(
+            Pixel::BGRA,
+            width,
+            height,
+            Pixel::YUV420P,
+            width,
+            height,
+            scaling::Flags::FAST_BILINEAR,
+        )?;
+
+        Ok(Self {
+            encoder: opened,
+            scaler: Some(scaler),
+            pts: 0,
+            use_vaapi: false,
+            enc_w: width,
+            enc_h: height,
+            _hw_device_ctx: None,
+            hw_frames_ctx: None,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Public API
+    // -----------------------------------------------------------------------
+
+    /// Encode a full frame supplied as a DMA-BUF file descriptor.
+    ///
+    /// `fd` is a DMA-BUF (or memfd) containing `height * stride` bytes of
+    /// BGRA pixel data.  On the VA-API path we attempt a zero-copy
+    /// `av_hwframe_map()` and fall back to `mmap` + `av_hwframe_transfer_data`
+    /// if the driver doesn't support it.  On the software path we always mmap.
+    ///
+    /// Returns `Ok(None)` when the encoder buffered the frame without emitting
+    /// output yet.
+    pub fn encode_frame(
+        &mut self,
+        fd: RawFd,
+        width: u32,
+        height: u32,
+        stride: u32,
+    ) -> Result<Option<FullFrameEncoded>, ffmpeg::Error> {
+        let pts = self.pts;
+        self.pts += 1;
+
+        let force_idr = pts % FULL_FRAME_GOP as i64 == 0;
+
+        if self.use_vaapi {
+            self.encode_vaapi(fd, width, height, stride, pts, force_idr)
+        } else {
+            self.encode_sw(fd, width, height, stride, pts, force_idr)
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // VA-API encode path
+    // -----------------------------------------------------------------------
+
+    fn encode_vaapi(
+        &mut self,
+        fd: RawFd,
+        width: u32,
+        height: u32,
+        stride: u32,
+        pts: i64,
+        force_idr: bool,
+    ) -> Result<Option<FullFrameEncoded>, ffmpeg::Error> {
+        unsafe {
+            let hw_frames_ref = self
+                .hw_frames_ctx
+                .as_ref()
+                .expect("use_vaapi but no hw_frames_ctx");
+
+            // Try zero-copy DMA-BUF import via av_hwframe_map().
+            // Build a software BGRA frame that wraps the DMA-BUF descriptor.
+            let buf_size = (height * stride) as usize;
+            let ptr = libc::mmap(
+                ptr::null_mut(),
+                buf_size,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            );
+            if ptr == libc::MAP_FAILED {
+                return Err(ffmpeg::Error::InvalidData);
+            }
+
+            // Build an NV12 sw frame from the BGRA mmap, then upload.
+            // We need a BGRA→NV12 scaler for the VA-API upload path.
+            let scaler_result = scaling::Context::get(
+                Pixel::BGRA,
+                width,
+                height,
+                Pixel::NV12,
+                self.enc_w,
+                self.enc_h,
+                scaling::Flags::FAST_BILINEAR,
+            );
+
+            let hw_frame = match scaler_result {
+                Ok(mut scaler) => {
+                    // Build BGRA frame from the mmap.
+                    let mut bgra_frame = frame::Video::new(Pixel::BGRA, width, height);
+                    {
+                        let frame_stride = bgra_frame.stride(0);
+                        let plane = bgra_frame.data_mut(0);
+                        let src_bytes = std::slice::from_raw_parts(ptr as *const u8, buf_size);
+                        for y in 0..height as usize {
+                            let src_row = &src_bytes[y * stride as usize..y * stride as usize + width as usize * 4];
+                            let dst_off = y * frame_stride;
+                            plane[dst_off..dst_off + width as usize * 4].copy_from_slice(src_row);
+                        }
+                    }
+
+                    // Scale to NV12.
+                    let mut nv12_frame = frame::Video::empty();
+                    let scale_result = scaler.run(&bgra_frame, &mut nv12_frame);
+
+                    libc::munmap(ptr, buf_size);
+
+                    scale_result?;
+
+                    // Upload NV12 to HW surface.
+                    let mut hw = H264VaapiEncoder::upload_to_hw_surface(
+                        hw_frames_ref.0,
+                        &nv12_frame,
+                    )?;
+                    hw.set_pts(Some(pts));
+                    if force_idr {
+                        (*hw.as_mut_ptr()).pict_type = ffi::AVPictureType::AV_PICTURE_TYPE_I;
+                        (*hw.as_mut_ptr()).flags |= ffi::AV_FRAME_FLAG_KEY;
+                    }
+                    hw
+                }
+                Err(e) => {
+                    libc::munmap(ptr, buf_size);
+                    return Err(e);
+                }
+            };
+
+            self.encoder.send_frame(&hw_frame)?;
+        }
+
+        self.receive_full_packet()
+    }
+
+    // -----------------------------------------------------------------------
+    // Software encode path
+    // -----------------------------------------------------------------------
+
+    fn encode_sw(
+        &mut self,
+        fd: RawFd,
+        width: u32,
+        height: u32,
+        stride: u32,
+        pts: i64,
+        force_idr: bool,
+    ) -> Result<Option<FullFrameEncoded>, ffmpeg::Error> {
+        let buf_size = (height * stride) as usize;
+
+        unsafe {
+            let ptr = libc::mmap(
+                ptr::null_mut(),
+                buf_size,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            );
+            if ptr == libc::MAP_FAILED {
+                return Err(ffmpeg::Error::InvalidData);
+            }
+
+            // Build BGRA frame from mmap.
+            let mut bgra_frame = frame::Video::new(Pixel::BGRA, width, height);
+            {
+                let frame_stride = bgra_frame.stride(0);
+                let plane = bgra_frame.data_mut(0);
+                let src_bytes = std::slice::from_raw_parts(ptr as *const u8, buf_size);
+                for y in 0..height as usize {
+                    let src_row = &src_bytes[y * stride as usize..y * stride as usize + width as usize * 4];
+                    let dst_off = y * frame_stride;
+                    plane[dst_off..dst_off + width as usize * 4].copy_from_slice(src_row);
+                }
+            }
+
+            libc::munmap(ptr, buf_size);
+
+            // Scale BGRA → YUV420P.
+            let scaler = self.scaler.as_mut().expect("sw path needs scaler");
+            let mut yuv_frame = frame::Video::empty();
+            scaler.run(&bgra_frame, &mut yuv_frame)?;
+            yuv_frame.set_pts(Some(pts));
+
+            if force_idr {
+                (*yuv_frame.as_mut_ptr()).pict_type = ffi::AVPictureType::AV_PICTURE_TYPE_I;
+                (*yuv_frame.as_mut_ptr()).flags |= ffi::AV_FRAME_FLAG_KEY;
+            }
+
+            self.encoder.send_frame(&yuv_frame)?;
+        }
+
+        self.receive_full_packet()
+    }
+
+    // -----------------------------------------------------------------------
+    // Packet receive
+    // -----------------------------------------------------------------------
+
+    fn receive_full_packet(&mut self) -> Result<Option<FullFrameEncoded>, ffmpeg::Error> {
+        let mut packet = Packet::empty();
+        match self.encoder.receive_packet(&mut packet) {
+            Ok(()) => {
+                let data = packet.data().unwrap_or(&[]).to_vec();
+                let is_keyframe = is_keyframe_nal(&data);
+                Ok(Some(FullFrameEncoded {
+                    payload: data,
+                    is_keyframe,
+                }))
+            }
+            Err(ffmpeg::Error::Other { errno: libc::EAGAIN }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Detect whether an H.264 Annex-B bitstream contains a keyframe NAL unit.
+///
+/// Looks for NAL type 5 (IDR slice) or NAL type 7 (SPS, which always
+/// precedes an IDR in the same AU).
+fn is_keyframe_nal(data: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 4 <= data.len() {
+        // Annex-B start code: 0x00 0x00 0x00 0x01 or 0x00 0x00 0x01
+        if data[i] == 0 && data[i + 1] == 0 {
+            let nal_byte_offset = if data[i + 2] == 0 && i + 4 < data.len() && data[i + 3] == 1 {
+                i + 4
+            } else if data[i + 2] == 1 {
+                i + 3
+            } else {
+                i += 1;
+                continue;
+            };
+            if nal_byte_offset < data.len() {
+                let nal_type = data[nal_byte_offset] & 0x1F;
+                if nal_type == 5 || nal_type == 7 {
+                    return true;
+                }
+            }
+            i = nal_byte_offset;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,5 +964,148 @@ mod tests {
             second.payload.len(),
             first.payload.len()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // FullFrameEncoder tests
+    // -----------------------------------------------------------------------
+
+    /// Create a memfd of the given size, fill it with `fill_fn`, and return
+    /// the raw file descriptor.  The caller is responsible for closing it.
+    fn make_bgra_memfd(width: u32, height: u32, fill_fn: impl Fn(usize) -> [u8; 4]) -> RawFd {
+        use std::ffi::CString;
+        let name = CString::new("test_frame").unwrap();
+        let fd = unsafe { libc::syscall(libc::SYS_memfd_create, name.as_ptr(), 0) as RawFd };
+        assert!(fd >= 0, "memfd_create failed");
+
+        let stride = width * 4;
+        let total = (height * stride) as usize;
+        let mut buf = vec![0u8; total];
+        for (i, pixel) in buf.chunks_exact_mut(4).enumerate() {
+            let rgba = fill_fn(i);
+            pixel.copy_from_slice(&rgba);
+        }
+
+        // Write the buffer to the memfd.
+        let written = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, total) };
+        assert_eq!(written as usize, total, "write to memfd failed");
+        // Seek back to beginning so mmap can read from offset 0.
+        unsafe { libc::lseek(fd, 0, libc::SEEK_SET) };
+
+        fd
+    }
+
+    #[test]
+    fn full_frame_encode_from_memfd() {
+        let _ = tracing_subscriber::fmt::try_init();
+
+        let width: u32 = 640;
+        let height: u32 = 480;
+
+        let mut encoder = match FullFrameEncoder::new(width, height) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("Skipping full_frame_encode test (no encoder): {e}");
+                return;
+            }
+        };
+
+        eprintln!(
+            "FullFrameEncoder backend: {} ({}x{})",
+            if encoder.use_vaapi { "h264_vaapi" } else { "libx264" },
+            encoder.enc_w,
+            encoder.enc_h,
+        );
+
+        assert_eq!(encoder.width(), width);
+        assert_eq!(encoder.height(), height);
+
+        // Solid red BGRA pixels.
+        let fd = make_bgra_memfd(width, height, |_| [0, 0, 255, 255]);
+
+        let stride = width * 4;
+
+        // Encode twice — first should be a keyframe (pts == 0).
+        // VA-API may buffer the first; try up to three frames.
+        let mut got_output = false;
+        let mut got_keyframe = false;
+        for _ in 0..3 {
+            // Re-seek before each encode call (mmap reads from beginning).
+            unsafe { libc::lseek(fd, 0, libc::SEEK_SET) };
+            match encoder.encode_frame(fd, width, height, stride) {
+                Ok(Some(encoded)) => {
+                    assert!(!encoded.payload.is_empty(), "encoded payload must not be empty");
+                    if encoded.is_keyframe {
+                        got_keyframe = true;
+                    }
+                    got_output = true;
+                    break;
+                }
+                Ok(None) => continue,
+                Err(e) => panic!("encode_frame failed: {e}"),
+            }
+        }
+
+        unsafe { libc::close(fd) };
+
+        assert!(got_output, "encoder should have produced output within 3 frames");
+        assert!(got_keyframe, "first output should be a keyframe");
+    }
+
+    #[test]
+    fn full_frame_keyframe_interval() {
+        let _ = tracing_subscriber::fmt::try_init();
+
+        let width: u32 = 128;
+        let height: u32 = 128;
+
+        let mut encoder = match FullFrameEncoder::new(width, height) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("Skipping full_frame_keyframe_interval test (no encoder): {e}");
+                return;
+            }
+        };
+
+        let fd = make_bgra_memfd(width, height, |_| [0, 255, 0, 255]); // solid green
+        let stride = width * 4;
+
+        let mut keyframe_pts: Vec<i64> = Vec::new();
+        let mut output_idx: i64 = 0;
+
+        // Encode 14 frames (more than one full GOP of 11).
+        for _ in 0..14 {
+            unsafe { libc::lseek(fd, 0, libc::SEEK_SET) };
+            match encoder.encode_frame(fd, width, height, stride) {
+                Ok(Some(encoded)) => {
+                    assert!(!encoded.payload.is_empty());
+                    if encoded.is_keyframe {
+                        keyframe_pts.push(output_idx);
+                    }
+                    output_idx += 1;
+                }
+                Ok(None) => {}
+                Err(e) => panic!("encode_frame failed: {e}"),
+            }
+        }
+
+        unsafe { libc::close(fd) };
+
+        eprintln!("keyframe output indices: {keyframe_pts:?}");
+
+        // We must have gotten at least one keyframe (the very first frame).
+        assert!(
+            !keyframe_pts.is_empty(),
+            "expected at least one keyframe in 14 frames"
+        );
+
+        // If we got at least two keyframes, check that the interval is ≈ GOP size.
+        if keyframe_pts.len() >= 2 {
+            let interval = keyframe_pts[1] - keyframe_pts[0];
+            assert!(
+                interval >= 9 && interval <= 13,
+                "keyframe interval should be ~11 frames, got {interval}"
+            );
+        }
     }
 }
