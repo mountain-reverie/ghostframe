@@ -1,3 +1,16 @@
+/// FEC group size for I-frames: K=2 → ~50% parity overhead.
+const FEC_K_IFRAME: usize = 2;
+
+/// FEC group size for P-frames: K=5 → ~20% parity overhead.
+const FEC_K_PFRAME: usize = 5;
+
+/// Returns the FEC group size based on whether the frame is a keyframe.
+/// Keyframes get stronger FEC (smaller K = more parity) because they're
+/// critical for decoder state recovery.
+pub fn fec_group_size(is_keyframe: bool) -> usize {
+    if is_keyframe { FEC_K_IFRAME } else { FEC_K_PFRAME }
+}
+
 /// Size of the parity packet header in bytes:
 ///   - group_start: u16 BE (2 bytes)
 ///   - group_len:   u8    (1 byte)
@@ -259,5 +272,31 @@ mod tests {
         let payloads: Vec<Vec<u8>> = vec![vec![0x01], vec![0x02]];
         let refs: Vec<&[u8]> = payloads.iter().map(|v| v.as_slice()).collect();
         assert!(generate_parity(&refs, 0).is_empty());
+    }
+
+    #[test]
+    fn fec_ratio_for_keyframe_is_higher() {
+        let k_iframe = fec_group_size(true);
+        let k_pframe = fec_group_size(false);
+        assert!(k_iframe < k_pframe,
+            "I-frame FEC group size ({k_iframe}) should be smaller than P-frame ({k_pframe})");
+    }
+
+    #[test]
+    fn generate_parity_with_iframe_ratio() {
+        let payloads: Vec<Vec<u8>> = (0u8..8).map(|i| vec![i * 10]).collect();
+        let refs: Vec<&[u8]> = payloads.iter().map(|v| v.as_slice()).collect();
+        let k = fec_group_size(true);
+        let parity = generate_parity(&refs, k);
+        assert_eq!(parity.len(), 4, "I-frame with K={k} and 8 frags should produce 4 parity groups");
+    }
+
+    #[test]
+    fn generate_parity_with_pframe_ratio() {
+        let payloads: Vec<Vec<u8>> = (0u8..8).map(|i| vec![i * 10]).collect();
+        let refs: Vec<&[u8]> = payloads.iter().map(|v| v.as_slice()).collect();
+        let k = fec_group_size(false);
+        let parity = generate_parity(&refs, k);
+        assert_eq!(parity.len(), 2, "P-frame with K={k} and 8 frags should produce 2 parity groups");
     }
 }
