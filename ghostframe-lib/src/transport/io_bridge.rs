@@ -15,7 +15,7 @@
 use std::future::{pending, Future};
 use std::io;
 use std::net::SocketAddr;
-use std::os::unix::io::FromRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::pin::Pin;
 use std::time::Instant;
 
@@ -27,17 +27,20 @@ use tokio::net::UnixStream as TokioUnixStream;
 use tokio::sync::mpsc;
 use tokio::time::{sleep_until, Instant as TokioInstant};
 
-use crate::encoder::h264_vaapi::H264VaapiEncoder;
+use crate::capture::gpu_diff::GpuDirtyTracker;
+use crate::encoder::h264_vaapi::{FullFrameEncoder, H264VaapiEncoder};
 use crate::server::FrameSubmission;
 use crate::tile::{DirtyTracker, TileGrid};
 use crate::transport::ghostbridge::{
     encode_frame, parse_frame_rest, GhostbridgeConfig, GhostbridgeHandle,
 };
 use crate::transport::fec;
+use crate::transport::fec::fec_group_size;
 use crate::transport::feedback::ReceiverFeedback;
 use crate::transport::protocol::{
-    build_parity_datagrams, Codec, fragment_tile, max_fragment_payload,
-    DATAGRAM_HEADER_SIZE, PING_PAYLOAD, PONG_PAYLOAD, TILE_HEADER_SIZE,
+    build_frame_parity_datagram, build_parity_datagrams, Codec, fragment_frame, fragment_tile,
+    max_fragment_payload, DATAGRAM_HEADER_SIZE, FRAME_HEADER_SIZE, PING_PAYLOAD, PONG_PAYLOAD,
+    TILE_DATAGRAM_FLAG, TILE_HEADER_SIZE,
 };
 use crate::transport::quic::QuicServer;
 use crate::transport::webtransport::WebTransportServer;
@@ -79,6 +82,10 @@ pub struct IoBridge {
     fec_enable_threshold: f64,
     /// Loss rate threshold to disable FEC (hysteresis).
     fec_disable_threshold: f64,
+    /// GPU-accelerated dirty tracker (Vulkan compute SAD).
+    gpu_dirty_tracker: Option<GpuDirtyTracker>,
+    /// Full-frame H.264 encoder (VA-API zero-copy).
+    full_frame_encoder: Option<FullFrameEncoder>,
 }
 
 impl IoBridge {
@@ -128,6 +135,11 @@ impl IoBridge {
 
         let h264_available = H264VaapiEncoder::new().is_ok();
 
+        let gpu_dirty_tracker = GpuDirtyTracker::new(2048 * 2).ok();
+        if gpu_dirty_tracker.is_some() {
+            tracing::info!("GPU dirty tracker initialized (Vulkan compute SAD)");
+        }
+
         Ok(Self {
             _handle: Some(handle),
             stream,
@@ -146,6 +158,8 @@ impl IoBridge {
                 .unwrap_or(0),
             fec_enable_threshold: 0.005,
             fec_disable_threshold: 0.002,
+            gpu_dirty_tracker,
+            full_frame_encoder: None,
         })
     }
 
@@ -174,7 +188,52 @@ impl IoBridge {
     /// A quarter-stream-id up to 63 encodes in 1 byte; we budget 2 for safety.
     const WT_VARINT_OVERHEAD: usize = 2;
 
+    /// Dispatch to GPU or CPU pipeline depending on whether a DMA-BUF fd is
+    /// available and the GPU dirty tracker has been initialized.
     fn process_frame(&mut self, frame: FrameSubmission) {
+        if frame.dmabuf_fd.is_some() && self.gpu_dirty_tracker.is_some() {
+            self.process_frame_gpu(frame);
+        } else {
+            self.process_frame_cpu(frame);
+        }
+    }
+
+    /// Compute the maximum datagram size from the smallest connected session.
+    fn compute_max_datagram_size(&mut self) -> Option<usize> {
+        let mut min_size: Option<usize> = None;
+        for (handle, wt) in &self.wt_sessions {
+            if !wt.is_connected() {
+                continue;
+            }
+            if let Some(conn) = self.server.connections.get_mut(handle) {
+                if let Some(sz) = conn.datagrams().max_size() {
+                    let usable = sz.saturating_sub(Self::WT_VARINT_OVERHEAD);
+                    min_size = Some(match min_size {
+                        Some(prev) => prev.min(usable),
+                        None => usable,
+                    });
+                }
+            }
+        }
+        min_size.filter(|&sz| sz > 0)
+    }
+
+    /// Send a datagram to all connected WebTransport sessions.
+    fn send_to_all_sessions(&mut self, dg: &[u8]) {
+        for (handle, wt) in &mut self.wt_sessions {
+            if !wt.is_connected() {
+                continue;
+            }
+            if let Some(conn) = self.server.connections.get_mut(handle) {
+                if let Err(e) = wt.send_datagram(conn, dg) {
+                    tracing::trace!(?handle, error = ?e, "datagram send failed");
+                }
+            }
+        }
+    }
+
+    /// CPU-side tile-based pipeline (original implementation).
+    fn process_frame_cpu(&mut self, frame: FrameSubmission) {
         let grid = TileGrid::new(frame.width, frame.height);
         self.frame_seq = self.frame_seq.wrapping_add(1);
         let seq = self.frame_seq;
@@ -280,7 +339,7 @@ impl IoBridge {
             };
 
             let datagrams = fragment_tile(
-                seq,
+                seq | TILE_DATAGRAM_FLAG,
                 *tile_x as u8,
                 *tile_y as u8,
                 codec,
@@ -310,7 +369,7 @@ impl IoBridge {
                 }).collect();
                 let parities = fec::generate_parity(&source_payloads, self.fec_k);
                 let parity_dgs = build_parity_datagrams(
-                    seq,
+                    seq | TILE_DATAGRAM_FLAG,
                     *tile_x as u8,
                     *tile_y as u8,
                     codec,
@@ -333,7 +392,94 @@ impl IoBridge {
                 }
             }
         }
+    }
 
+    /// GPU-accelerated full-frame pipeline: Vulkan compute dirty detection +
+    /// VA-API zero-copy H.264 encoding.
+    fn process_frame_gpu(&mut self, frame: FrameSubmission) {
+        let fd = frame.dmabuf_fd.as_ref().unwrap();
+        let raw_fd = fd.as_raw_fd();
+
+        self.frame_seq = self.frame_seq.wrapping_add(1);
+        let seq = self.frame_seq;
+
+        // 1. Check for connected sessions
+        let max_dg_size = match self.compute_max_datagram_size() {
+            Some(sz) => sz,
+            None => return,
+        };
+
+        // 2. GPU dirty detection
+        let gpu_tracker = self.gpu_dirty_tracker.as_mut().unwrap();
+        let dirty_tiles = match gpu_tracker.diff(raw_fd, frame.width, frame.height, frame.stride) {
+            Ok(tiles) => tiles,
+            Err(e) => {
+                tracing::warn!("GPU diff failed: {e}, falling back to CPU path");
+                self.process_frame_cpu(frame);
+                return;
+            }
+        };
+
+        if dirty_tiles.is_empty() {
+            return;
+        }
+
+        // 3. Lazily initialize full-frame encoder
+        let needs_init = match &self.full_frame_encoder {
+            Some(enc) => enc.width() != frame.width || enc.height() != frame.height,
+            None => true,
+        };
+        if needs_init {
+            match FullFrameEncoder::new(frame.width, frame.height) {
+                Ok(enc) => {
+                    self.full_frame_encoder = Some(enc);
+                }
+                Err(e) => {
+                    tracing::warn!("Full-frame encoder init failed: {e}");
+                    return;
+                }
+            }
+        }
+
+        // 4. Encode full frame
+        let encoder = self.full_frame_encoder.as_mut().unwrap();
+        let encoded = match encoder.encode_frame(raw_fd, frame.width, frame.height, frame.stride) {
+            Ok(Some(enc)) => enc,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!("Full-frame encode failed: {e}");
+                return;
+            }
+        };
+
+        // 5. Fragment and send
+        let datagrams = fragment_frame(
+            seq,
+            frame.timestamp_us,
+            encoded.is_keyframe,
+            &encoded.payload,
+            max_dg_size,
+        );
+
+        for dg in &datagrams {
+            self.send_to_all_sessions(dg);
+        }
+
+        // 6. FEC parity
+        let fec_k = fec_group_size(encoded.is_keyframe);
+        if datagrams.len() > 1 {
+            let source_payloads: Vec<&[u8]> = datagrams.iter()
+                .map(|dg| &dg[FRAME_HEADER_SIZE..])
+                .collect();
+            let parities = fec::generate_parity(&source_payloads, fec_k);
+            for (_group_start, parity_payload) in &parities {
+                let parity_dg = build_frame_parity_datagram(
+                    seq, frame.timestamp_us, encoded.is_keyframe,
+                    datagrams.len() as u16, parity_payload,
+                );
+                self.send_to_all_sessions(&parity_dg);
+            }
+        }
     }
 
     /// Run the event loop until the ghostbridge fd is closed (EOF).
@@ -597,6 +743,8 @@ impl IoBridge {
             fec_k: 0,
             fec_enable_threshold: 0.005,
             fec_disable_threshold: 0.002,
+            gpu_dirty_tracker: None,
+            full_frame_encoder: None,
         }
     }
 
@@ -620,6 +768,8 @@ impl IoBridge {
             fec_k: 0,
             fec_enable_threshold: 0.005,
             fec_disable_threshold: 0.002,
+            gpu_dirty_tracker: None,
+            full_frame_encoder: None,
         }
     }
 
