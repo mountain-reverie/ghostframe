@@ -499,7 +499,8 @@ impl IoBridge {
 
     /// Handle a NACK by retransmitting the requested fragment, but only if
     /// QUIC RTT is low enough for the retransmission to arrive before the
-    /// next frame.
+    /// next frame. Wired in once client-side NACK sending is integrated.
+    #[allow(dead_code)]
     fn handle_nack(&mut self, nack: NackMessage, handle: ConnectionHandle) {
         if let Some(conn) = self.server.connections.get_mut(&handle) {
             let rtt = conn.stats().path.rtt;
