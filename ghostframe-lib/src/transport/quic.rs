@@ -88,7 +88,9 @@ impl QuicServer {
         // `datagram_receive_buffer_size` takes `Option<usize>`.
         transport_config.datagram_receive_buffer_size(Some(65536));
         // `datagram_send_buffer_size` takes `usize` (not Option) in quinn-proto 0.11.
-        transport_config.datagram_send_buffer_size(65536);
+        // Sized for a full raw-codec frame: 20 tiles × ~55 fragments × 1200 bytes ≈ 1.3 MB.
+        // With drop=true on send, a too-small buffer silently discards tiles.
+        transport_config.datagram_send_buffer_size(2 * 1024 * 1024);
 
         // --- 6. ServerConfig ---
         let mut server_config = ServerConfig::with_crypto(Arc::new(quic_tls));
