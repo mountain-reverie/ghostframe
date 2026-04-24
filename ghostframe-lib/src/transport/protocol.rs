@@ -472,6 +472,38 @@ pub fn build_frame_parity_datagram(
 }
 
 // ---------------------------------------------------------------------------
+// NACK message (sent by client on bidi stream)
+// ---------------------------------------------------------------------------
+
+/// NACK message size: frame_seq (4) + frag_idx (2) = 6 bytes.
+pub const NACK_SIZE: usize = 6;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NackMessage {
+    pub frame_seq: u32,
+    pub frag_idx: u16,
+}
+
+impl NackMessage {
+    pub fn encode(&self) -> [u8; NACK_SIZE] {
+        let mut buf = [0u8; NACK_SIZE];
+        buf[0..4].copy_from_slice(&self.frame_seq.to_be_bytes());
+        buf[4..6].copy_from_slice(&self.frag_idx.to_be_bytes());
+        buf
+    }
+
+    pub fn decode(data: &[u8]) -> Option<Self> {
+        if data.len() < NACK_SIZE {
+            return None;
+        }
+        Some(NackMessage {
+            frame_seq: u32::from_be_bytes(data[0..4].try_into().unwrap()),
+            frag_idx: u16::from_be_bytes(data[4..6].try_into().unwrap()),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -754,5 +786,20 @@ mod tests {
             reassembled.extend_from_slice(frag);
         }
         assert_eq!(reassembled, payload);
+    }
+
+    #[test]
+    fn nack_message_roundtrip() {
+        let nack = NackMessage { frame_seq: 42, frag_idx: 3 };
+        let encoded = nack.encode();
+        assert_eq!(encoded.len(), NACK_SIZE);
+        let decoded = NackMessage::decode(&encoded).unwrap();
+        assert_eq!(decoded, nack);
+    }
+
+    #[test]
+    fn nack_message_short_input() {
+        assert!(NackMessage::decode(&[0u8; 5]).is_none());
+        assert!(NackMessage::decode(&[0u8; 6]).is_some());
     }
 }

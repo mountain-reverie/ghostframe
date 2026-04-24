@@ -39,8 +39,8 @@ use crate::transport::fec::fec_group_size;
 use crate::transport::feedback::ReceiverFeedback;
 use crate::transport::protocol::{
     build_frame_parity_datagram, build_parity_datagrams, Codec, fragment_frame, fragment_tile,
-    max_fragment_payload, DATAGRAM_HEADER_SIZE, FRAME_HEADER_SIZE, PING_PAYLOAD, PONG_PAYLOAD,
-    TILE_DATAGRAM_FLAG, TILE_HEADER_SIZE,
+    max_fragment_payload, FrameHeader, NackMessage, DATAGRAM_HEADER_SIZE, FRAME_HEADER_SIZE,
+    PING_PAYLOAD, PONG_PAYLOAD, TILE_DATAGRAM_FLAG, TILE_HEADER_SIZE,
 };
 use crate::transport::quic::QuicServer;
 use crate::transport::webtransport::WebTransportServer;
@@ -86,6 +86,8 @@ pub struct IoBridge {
     gpu_dirty_tracker: Option<GpuDirtyTracker>,
     /// Full-frame H.264 encoder (VA-API zero-copy).
     full_frame_encoder: Option<FullFrameEncoder>,
+    /// Recent frame fragments for NACK retransmission. Key: (frame_seq, frag_idx).
+    recent_frame_fragments: HashMap<(u32, u16), Vec<u8>>,
 }
 
 impl IoBridge {
@@ -160,6 +162,7 @@ impl IoBridge {
             fec_disable_threshold: 0.002,
             gpu_dirty_tracker,
             full_frame_encoder: None,
+            recent_frame_fragments: HashMap::new(),
         })
     }
 
@@ -480,6 +483,46 @@ impl IoBridge {
                 self.send_to_all_sessions(&parity_dg);
             }
         }
+
+        // Store fragments for potential NACK retransmission (keep last 3 frames)
+        let oldest_kept = seq.wrapping_sub(3);
+        self.recent_frame_fragments.retain(|(s, _), _| {
+            // Keep if within 3 frames of current seq (wrapping-aware)
+            s.wrapping_sub(oldest_kept) <= 3
+        });
+        for dg in &datagrams {
+            if let Ok(hdr) = FrameHeader::decode(dg) {
+                self.recent_frame_fragments.insert((hdr.frame_seq, hdr.frag_idx), dg.clone());
+            }
+        }
+    }
+
+    /// Handle a NACK by retransmitting the requested fragment, but only if
+    /// QUIC RTT is low enough for the retransmission to arrive before the
+    /// next frame.
+    fn handle_nack(&mut self, nack: NackMessage, handle: ConnectionHandle) {
+        if let Some(conn) = self.server.connections.get_mut(&handle) {
+            let rtt = conn.stats().path.rtt;
+            let frame_interval = std::time::Duration::from_micros(16_667); // ~60fps
+
+            if rtt < frame_interval {
+                if let Some(dg) = self.recent_frame_fragments.get(&(nack.frame_seq, nack.frag_idx)) {
+                    let dg = dg.clone();
+                    if let Some(wt) = self.wt_sessions.get_mut(&handle) {
+                        let _ = wt.send_datagram(conn, &dg);
+                        tracing::trace!(
+                            frame_seq = nack.frame_seq, frag_idx = nack.frag_idx,
+                            "NACK retransmit"
+                        );
+                    }
+                }
+            } else {
+                tracing::trace!(
+                    ?rtt, frame_seq = nack.frame_seq,
+                    "NACK skipped — RTT too high for retransmission"
+                );
+            }
+        }
     }
 
     /// Run the event loop until the ghostbridge fd is closed (EOF).
@@ -745,6 +788,7 @@ impl IoBridge {
             fec_disable_threshold: 0.002,
             gpu_dirty_tracker: None,
             full_frame_encoder: None,
+            recent_frame_fragments: HashMap::new(),
         }
     }
 
@@ -770,6 +814,7 @@ impl IoBridge {
             fec_disable_threshold: 0.002,
             gpu_dirty_tracker: None,
             full_frame_encoder: None,
+            recent_frame_fragments: HashMap::new(),
         }
     }
 
