@@ -62,6 +62,7 @@ impl X11Capture {
             height,
             stride,
             pixels: reply.data,
+            dmabuf_fd: None,
             timestamp_us,
             damage_tiles: None,
         })

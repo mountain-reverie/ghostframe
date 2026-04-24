@@ -65,6 +65,10 @@ pub struct IoBridge {
     frame_seq: u32,
     /// Per-tile dirty detection.
     dirty_tracker: DirtyTracker,
+    /// Remaining frames to force all-dirty after a new session connects.
+    /// QUIC slow-start can only deliver a fraction of tiles in the first burst;
+    /// forcing dirty for several frames lets the congestion window open.
+    force_dirty_frames: u32,
     /// Per-tile H.264 encoders, keyed by (tile_x, tile_y). Lazily initialized.
     encoders: HashMap<(u32, u32), H264VaapiEncoder>,
     /// Whether H.264 encoding is available (checked once at startup).
@@ -133,6 +137,7 @@ impl IoBridge {
             frame_rx: None,
             frame_seq: 0,
             dirty_tracker: DirtyTracker::new(0, 0),
+            force_dirty_frames: 0,
             encoders: HashMap::new(),
             h264_available,
             fec_k: std::env::var("GHOSTFRAME_FEC_K")
@@ -174,24 +179,11 @@ impl IoBridge {
         self.frame_seq = self.frame_seq.wrapping_add(1);
         let seq = self.frame_seq;
 
-        // Determine dirty tiles
-        let dirty_tiles = match &frame.damage_tiles {
-            Some(hints) => self.dirty_tracker.update_with_hints(
-                &frame.pixels, frame.stride, frame.width, frame.height, hints,
-            ),
-            None => self.dirty_tracker.update(
-                &frame.pixels, frame.stride, frame.width, frame.height,
-            ),
-        };
-
-        if dirty_tiles.is_empty() {
-            return;
-        }
-
         // Determine the maximum fragment payload from the smallest connected
-        // session's QUIC max datagram size.  We subtract the WebTransport
-        // VarInt prefix and our own headers so the final QUIC DATAGRAM frame
-        // fits within the path MTU.
+        // session's QUIC max datagram size.  Check for connected sessions
+        // BEFORE updating the dirty tracker — otherwise the tracker consumes
+        // frame state even when no client is listening, and once a client
+        // connects the content appears "unchanged" so nothing is ever sent.
         let max_frag = {
             let mut min_size: Option<usize> = None;
             for (handle, wt) in &self.wt_sessions {
@@ -212,12 +204,48 @@ impl IoBridge {
             }
             match min_size {
                 Some(0) | None => {
-                    // No connected sessions or MTU too small — skip frame.
+                    // No connected sessions or MTU too small — skip frame
+                    // without updating dirty tracker state.
                     return;
                 }
                 Some(sz) => sz,
             }
         };
+
+        // During QUIC slow-start after a new session connects, datagrams may
+        // be silently dropped by congestion control. Use no-commit mode so
+        // dropped tiles remain dirty on subsequent frames until the congestion
+        // window opens up enough to deliver them all.
+        let no_commit = self.force_dirty_frames > 0;
+        if no_commit {
+            self.force_dirty_frames -= 1;
+        }
+
+        // Determine dirty tiles (only after confirming we have a connected session).
+        // During slow-start (no_commit), ignore damage hints and do full-frame
+        // comparison without committing, so unsent tiles stay dirty.
+        let dirty_tiles = if no_commit {
+            self.dirty_tracker.update_no_commit(
+                &frame.pixels, frame.stride, frame.width, frame.height,
+            )
+        } else {
+            match &frame.damage_tiles {
+                Some(hints) => {
+                    self.dirty_tracker.update_with_hints(
+                        &frame.pixels, frame.stride, frame.width, frame.height, hints,
+                    )
+                }
+                None => {
+                    self.dirty_tracker.update(
+                        &frame.pixels, frame.stride, frame.width, frame.height,
+                    )
+                }
+            }
+        };
+
+        if dirty_tiles.is_empty() {
+            return;
+        }
 
         // Encode and send only dirty tiles
         for (tile_x, tile_y) in &dirty_tiles {
@@ -305,6 +333,7 @@ impl IoBridge {
                 }
             }
         }
+
     }
 
     /// Run the event loop until the ghostbridge fd is closed (EOF).
@@ -475,7 +504,18 @@ impl IoBridge {
                         self.wt_sessions.get_mut(&handle),
                         self.server.connections.get_mut(&handle),
                     ) {
+                        let was_connected = wt.is_connected();
                         wt.on_stream_readable(conn, id);
+                        if !was_connected && wt.is_connected() {
+                            // New WebTransport session just became active.
+                            // Reset dirty tracker and force all-dirty for
+                            // several frames so QUIC slow-start can open the
+                            // congestion window. A single burst can't deliver
+                            // all 300+ tiles for a 640x480 screen.
+                            self.dirty_tracker.reset();
+                            self.force_dirty_frames = 20;
+                            tracing::debug!(?handle, "new session connected, dirty tracker reset");
+                        }
                     }
                 }
 
@@ -551,6 +591,7 @@ impl IoBridge {
             frame_rx: None,
             frame_seq: 0,
             dirty_tracker: DirtyTracker::new(0, 0),
+            force_dirty_frames: 0,
             encoders: HashMap::new(),
             h264_available: false,
             fec_k: 0,
@@ -573,6 +614,7 @@ impl IoBridge {
             frame_rx: Some(frame_rx),
             frame_seq: 0,
             dirty_tracker: DirtyTracker::new(0, 0),
+            force_dirty_frames: 0,
             encoders: HashMap::new(),
             h264_available: false,
             fec_k: 0,
@@ -711,6 +753,7 @@ mod tests {
         let frame = crate::server::FrameSubmission {
             width: 64, height: 64, stride: 64 * 4,
             pixels: vec![0xFF; 64 * 64 * 4],
+            dmabuf_fd: None,
             timestamp_us: 1000,
             damage_tiles: None,
         };
@@ -767,6 +810,7 @@ mod tests {
         let make_frame = || crate::server::FrameSubmission {
             width: 32, height: 32, stride: 32 * 4,
             pixels: vec![0; 32 * 32 * 4],
+            dmabuf_fd: None,
             timestamp_us: 0,
             damage_tiles: None,
         };

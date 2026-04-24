@@ -93,7 +93,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     loop {
         let capture_start = std::time::Instant::now();
 
-        let damage_tiles = xdamage_monitor.as_ref().map(|m| m.drain_damage());
+        // XDamage drain: Some(non-empty) = only check these tiles, None = check all.
+        // An empty drain means no damage events since last call — but we still need
+        // to fall back to full-frame comparison (None) so the dirty tracker can detect
+        // the first frame for a newly connected client.
+        let damage_tiles = xdamage_monitor
+            .as_ref()
+            .and_then(|m| {
+                let tiles = m.drain_damage();
+                if tiles.is_empty() { None } else { Some(tiles) }
+            });
 
         let submission = match &backend {
             CaptureBackend::Drm { vk } => match drm_capture::capture_prime_fd() {
@@ -121,6 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         height: geom.height,
                         stride: geom.stride,
                         pixels,
+                        dmabuf_fd: None,
                         timestamp_us,
                         damage_tiles: damage_tiles.clone(),
                     })

@@ -3,6 +3,7 @@
 //! `GhostframeServer` wraps an `IoBridge` event loop and exposes a
 //! `submit_frame` channel for pushing captured frames into the pipeline.
 
+use std::os::unix::io::OwnedFd;
 use tokio::sync::mpsc;
 
 use crate::transport::ghostbridge::GhostbridgeConfig;
@@ -20,6 +21,9 @@ pub struct FrameSubmission {
     pub stride: u32,
     /// BGRA pixel data; length must equal `stride * height`.
     pub pixels: Vec<u8>,
+    /// DMA-BUF file descriptor for zero-copy GPU access.
+    /// When present, the GPU pipeline uses this directly instead of `pixels`.
+    pub dmabuf_fd: Option<OwnedFd>,
     /// Capture timestamp in microseconds.
     pub timestamp_us: u32,
     /// Optional damage hints as tile coordinates. If `None`, all tiles are checked.
@@ -104,6 +108,7 @@ mod tests {
             height: 1080,
             stride: 1920 * 4,
             pixels: vec![0u8; 1920 * 1080 * 4],
+            dmabuf_fd: None,
             timestamp_us: 0,
             damage_tiles: None,
         };
