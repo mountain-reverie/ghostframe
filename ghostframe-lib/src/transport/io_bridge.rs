@@ -398,7 +398,7 @@ impl IoBridge {
     }
 
     /// GPU-accelerated full-frame pipeline: Vulkan compute dirty detection +
-    /// VA-API zero-copy H.264 encoding.
+    /// BGRA→NV12 conversion + VA-API zero-copy H.264 encoding.
     fn process_frame_gpu(&mut self, frame: FrameSubmission) {
         let fd = frame.dmabuf_fd.as_ref().unwrap();
         let raw_fd = fd.as_raw_fd();
@@ -406,37 +406,34 @@ impl IoBridge {
         self.frame_seq = self.frame_seq.wrapping_add(1);
         let seq = self.frame_seq;
 
-        // 1. Check for connected sessions
         let max_dg_size = match self.compute_max_datagram_size() {
             Some(sz) => sz,
             None => return,
         };
 
-        // 2. GPU dirty detection
-        let gpu_tracker = self.gpu_frame_processor.as_mut().unwrap();
-        let dirty_tiles = match gpu_tracker.diff(raw_fd, frame.width, frame.height, frame.stride) {
-            Ok(tiles) => tiles,
+        // GPU pipeline: SAD dirty detection + BGRA→NV12 conversion
+        let processor = self.gpu_frame_processor.as_mut().unwrap();
+        let analysis = match processor.process_frame(raw_fd, frame.width, frame.height, frame.stride) {
+            Ok(a) => a,
             Err(e) => {
-                tracing::warn!("GPU diff failed: {e}, falling back to CPU path");
+                tracing::warn!("GPU process_frame failed: {e}, falling back to CPU path");
                 self.process_frame_cpu(frame);
                 return;
             }
         };
 
-        if dirty_tiles.is_empty() {
+        if analysis.dirty_tiles.is_empty() {
             return;
         }
 
-        // 3. Lazily initialize full-frame encoder
+        // Lazily initialize full-frame encoder
         let needs_init = match &self.full_frame_encoder {
             Some(enc) => enc.width() != frame.width || enc.height() != frame.height,
             None => true,
         };
         if needs_init {
             match FullFrameEncoder::new(frame.width, frame.height) {
-                Ok(enc) => {
-                    self.full_frame_encoder = Some(enc);
-                }
+                Ok(enc) => { self.full_frame_encoder = Some(enc); }
                 Err(e) => {
                     tracing::warn!("Full-frame encoder init failed: {e}");
                     return;
@@ -444,18 +441,25 @@ impl IoBridge {
             }
         }
 
-        // 4. Encode full frame
+        // Encode the NV12 DMA-BUF directly (zero-copy)
         let encoder = self.full_frame_encoder.as_mut().unwrap();
-        let encoded = match encoder.encode_frame(raw_fd, frame.width, frame.height, frame.stride) {
+        let encoded = match encoder.encode_nv12_dmabuf(
+            analysis.nv12_dmabuf_fd.as_raw_fd(),
+            analysis.nv12_width,
+            analysis.nv12_height,
+            analysis.nv12_y_stride,
+            analysis.nv12_uv_stride,
+            analysis.nv12_uv_offset,
+        ) {
             Ok(Some(enc)) => enc,
             Ok(None) => return,
             Err(e) => {
-                tracing::warn!("Full-frame encode failed: {e}");
+                tracing::warn!("NV12 encode failed: {e}");
                 return;
             }
         };
 
-        // 5. Fragment and send
+        // Fragment and send — keep the existing code from here onwards
         let datagrams = fragment_frame(
             seq,
             frame.timestamp_us,
@@ -468,7 +472,7 @@ impl IoBridge {
             self.send_to_all_sessions(dg);
         }
 
-        // 6. FEC parity
+        // FEC parity
         let fec_k = fec_group_size(encoded.is_keyframe);
         if datagrams.len() > 1 {
             let source_payloads: Vec<&[u8]> = datagrams.iter()
@@ -484,12 +488,9 @@ impl IoBridge {
             }
         }
 
-        // Store fragments for potential NACK retransmission (keep last 3 frames)
+        // Store fragments for NACK
         let oldest_kept = seq.wrapping_sub(3);
-        self.recent_frame_fragments.retain(|(s, _), _| {
-            // Keep if within 3 frames of current seq (wrapping-aware)
-            s.wrapping_sub(oldest_kept) <= 3
-        });
+        self.recent_frame_fragments.retain(|(s, _), _| s.wrapping_sub(oldest_kept) <= 3);
         for dg in &datagrams {
             if let Ok(hdr) = FrameHeader::decode(dg) {
                 self.recent_frame_fragments.insert((hdr.frame_seq, hdr.frag_idx), dg.clone());
