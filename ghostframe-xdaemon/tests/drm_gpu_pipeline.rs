@@ -1,8 +1,8 @@
 //! Real DRM capture → GPU zero-copy pipeline integration test.
 //!
 //! This test exercises the actual production path on machines with a GPU:
-//! DRM framebuffer export → DMA-BUF → GpuFrameProcessor (Vulkan SAD + NV12) →
-//! FullFrameEncoder (VA-API H.264 via encode_nv12_dmabuf) → protocol fragmentation.
+//! DRM framebuffer export → DMA-BUF → GpuFrameProcessor (Vulkan SAD) →
+//! FullFrameEncoder (VA-API VPP BGRA→NV12 + H.264) → protocol fragmentation.
 //!
 //! Skips gracefully if no DRM device or GPU is available.
 //!
@@ -108,7 +108,7 @@ fn drm_capture_to_gpu_pipeline() {
 
     let raw_fd = dmabuf_fd.as_raw_fd();
 
-    // 2. GPU dirty detection + NV12 conversion via process_frame
+    // 2. GPU dirty detection via Vulkan SAD
     let mut processor = match GpuFrameProcessor::new(4096) {
         Ok(t) => t,
         Err(e) => {
@@ -117,10 +117,10 @@ fn drm_capture_to_gpu_pipeline() {
         }
     };
 
-    let analysis = match processor.process_frame(raw_fd, width, height, stride) {
-        Ok(a) => a,
+    let dirty_tiles = match processor.diff(raw_fd, width, height, stride) {
+        Ok(t) => t,
         Err(e) => {
-            eprintln!("Skipping: process_frame failed on real DMA-BUF: {e}");
+            eprintln!("Skipping: diff failed on real DMA-BUF: {e}");
             return;
         }
     };
@@ -130,17 +130,17 @@ fn drm_capture_to_gpu_pipeline() {
     let total_tiles = cols * rows;
     eprintln!(
         "First frame: {}/{} tiles dirty ({}x{} grid)",
-        analysis.dirty_tiles.len(),
+        dirty_tiles.len(),
         total_tiles,
         cols,
         rows
     );
     assert!(
-        !analysis.dirty_tiles.is_empty(),
+        !dirty_tiles.is_empty(),
         "first frame should report tiles as dirty"
     );
 
-    // 3. Full-frame H.264 encode via encode_nv12_dmabuf (zero-copy NV12 path)
+    // 3. Full-frame H.264 encode via encode_bgra_dmabuf (VA-API VPP zero-copy)
     let mut encoder = match FullFrameEncoder::new(width, height) {
         Ok(e) => e,
         Err(e) => {
@@ -149,19 +149,10 @@ fn drm_capture_to_gpu_pipeline() {
         }
     };
 
-    let nv12_fd = analysis.nv12_dmabuf_fd.as_raw_fd();
-
     // Encode up to 3 frames (VA-API may buffer the first)
     let mut encoded = None;
     for i in 0..3 {
-        match encoder.encode_nv12_dmabuf(
-            nv12_fd,
-            analysis.nv12_width,
-            analysis.nv12_height,
-            analysis.nv12_y_stride,
-            analysis.nv12_uv_stride,
-            analysis.nv12_uv_offset,
-        ) {
+        match encoder.encode_bgra_dmabuf(raw_fd, width, height, stride) {
             Ok(Some(enc)) => {
                 eprintln!(
                     "Frame {i}: {} bytes, keyframe={}",
@@ -176,7 +167,7 @@ fn drm_capture_to_gpu_pipeline() {
                 eprintln!("Frame {i}: buffered (no output yet)");
             }
             Err(e) => {
-                eprintln!("Skipping: encode_nv12_dmabuf failed: {e}");
+                eprintln!("Skipping: encode_bgra_dmabuf failed: {e}");
                 return;
             }
         }
@@ -200,5 +191,5 @@ fn drm_capture_to_gpu_pipeline() {
     assert_eq!(hdr.frame_seq, 1);
     assert!(hdr.is_keyframe());
 
-    eprintln!("DRM → GpuFrameProcessor (SAD+NV12) → encode_nv12_dmabuf → fragment: PASS");
+    eprintln!("DRM → GpuFrameProcessor (SAD) → encode_bgra_dmabuf (VPP) → fragment: PASS");
 }
