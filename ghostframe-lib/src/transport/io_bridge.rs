@@ -27,7 +27,7 @@ use tokio::net::UnixStream as TokioUnixStream;
 use tokio::sync::mpsc;
 use tokio::time::{sleep_until, Instant as TokioInstant};
 
-use crate::capture::gpu_diff::GpuDirtyTracker;
+use crate::capture::gpu_pipeline::GpuFrameProcessor;
 use crate::encoder::h264_vaapi::{FullFrameEncoder, H264VaapiEncoder};
 use crate::server::FrameSubmission;
 use crate::tile::{DirtyTracker, TileGrid};
@@ -83,7 +83,7 @@ pub struct IoBridge {
     /// Loss rate threshold to disable FEC (hysteresis).
     fec_disable_threshold: f64,
     /// GPU-accelerated dirty tracker (Vulkan compute SAD).
-    gpu_dirty_tracker: Option<GpuDirtyTracker>,
+    gpu_frame_processor: Option<GpuFrameProcessor>,
     /// Full-frame H.264 encoder (VA-API zero-copy).
     full_frame_encoder: Option<FullFrameEncoder>,
     /// Recent frame fragments for NACK retransmission. Key: (frame_seq, frag_idx).
@@ -137,8 +137,8 @@ impl IoBridge {
 
         let h264_available = H264VaapiEncoder::new().is_ok();
 
-        let gpu_dirty_tracker = GpuDirtyTracker::new(2048 * 2).ok();
-        if gpu_dirty_tracker.is_some() {
+        let gpu_frame_processor = GpuFrameProcessor::new(2048 * 2).ok();
+        if gpu_frame_processor.is_some() {
             tracing::info!("GPU dirty tracker initialized (Vulkan compute SAD)");
         }
 
@@ -160,7 +160,7 @@ impl IoBridge {
                 .unwrap_or(0),
             fec_enable_threshold: 0.005,
             fec_disable_threshold: 0.002,
-            gpu_dirty_tracker,
+            gpu_frame_processor,
             full_frame_encoder: None,
             recent_frame_fragments: HashMap::new(),
         })
@@ -194,7 +194,7 @@ impl IoBridge {
     /// Dispatch to GPU or CPU pipeline depending on whether a DMA-BUF fd is
     /// available and the GPU dirty tracker has been initialized.
     fn process_frame(&mut self, frame: FrameSubmission) {
-        if frame.dmabuf_fd.is_some() && self.gpu_dirty_tracker.is_some() {
+        if frame.dmabuf_fd.is_some() && self.gpu_frame_processor.is_some() {
             self.process_frame_gpu(frame);
         } else {
             self.process_frame_cpu(frame);
@@ -413,7 +413,7 @@ impl IoBridge {
         };
 
         // 2. GPU dirty detection
-        let gpu_tracker = self.gpu_dirty_tracker.as_mut().unwrap();
+        let gpu_tracker = self.gpu_frame_processor.as_mut().unwrap();
         let dirty_tiles = match gpu_tracker.diff(raw_fd, frame.width, frame.height, frame.stride) {
             Ok(tiles) => tiles,
             Err(e) => {
@@ -787,7 +787,7 @@ impl IoBridge {
             fec_k: 0,
             fec_enable_threshold: 0.005,
             fec_disable_threshold: 0.002,
-            gpu_dirty_tracker: None,
+            gpu_frame_processor: None,
             full_frame_encoder: None,
             recent_frame_fragments: HashMap::new(),
         }
@@ -813,7 +813,7 @@ impl IoBridge {
             fec_k: 0,
             fec_enable_threshold: 0.005,
             fec_disable_threshold: 0.002,
-            gpu_dirty_tracker: None,
+            gpu_frame_processor: None,
             full_frame_encoder: None,
             recent_frame_fragments: HashMap::new(),
         }

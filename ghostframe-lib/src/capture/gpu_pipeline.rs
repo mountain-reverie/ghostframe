@@ -1,6 +1,6 @@
 //! GPU-accelerated dirty tile detection via Vulkan compute (SAD shader).
 //!
-//! [`GpuDirtyTracker`] imports each frame as a DMA-BUF VkImage, runs the
+//! [`GpuFrameProcessor`] imports each frame as a DMA-BUF VkImage, runs the
 //! `tile_sad` compute shader that computes per-tile Sum of Absolute Differences
 //! against the previous frame, then reads back ~8 KB of SAD scores to decide
 //! which 32×32-pixel tiles changed.
@@ -24,11 +24,11 @@ const SAD_THRESHOLD: u32 = 64;
 
 /// Vulkan compute-based dirty tile tracker.
 ///
-/// Call [`diff`][GpuDirtyTracker::diff] each frame with the DMA-BUF fd,
+/// Call [`diff`][GpuFrameProcessor::diff] each frame with the DMA-BUF fd,
 /// resolution and stride.  The returned `Vec<u32>` contains the flat tile
 /// indices (`tile_y * cols + tile_x`) of every tile whose SAD score exceeded
 /// the threshold.
-pub struct GpuDirtyTracker {
+pub struct GpuFrameProcessor {
     _entry: ash::Entry,
     instance: ash::Instance,
     physical_device: vk::PhysicalDevice,
@@ -63,16 +63,16 @@ struct PrevFrame {
     height: u32,
 }
 
-// Safety: GpuDirtyTracker is used from a single tokio task; Vulkan objects are
+// Safety: GpuFrameProcessor is used from a single tokio task; Vulkan objects are
 // not thread-safe on their own but we never share them across threads.
-unsafe impl Send for GpuDirtyTracker {}
+unsafe impl Send for GpuFrameProcessor {}
 
 // ---------------------------------------------------------------------------
 // Constructor
 // ---------------------------------------------------------------------------
 
-impl GpuDirtyTracker {
-    /// Create a new `GpuDirtyTracker` capable of tracking up to `max_tiles` tiles.
+impl GpuFrameProcessor {
+    /// Create a new `GpuFrameProcessor` capable of tracking up to `max_tiles` tiles.
     pub fn new(max_tiles: u32) -> Result<Self, Box<dyn std::error::Error>> {
         unsafe { Self::new_inner(max_tiles) }
     }
@@ -295,7 +295,7 @@ impl GpuDirtyTracker {
 // diff()
 // ---------------------------------------------------------------------------
 
-impl GpuDirtyTracker {
+impl GpuFrameProcessor {
     /// Compare the DMA-BUF frame at `fd` against the previous frame.
     ///
     /// Returns flat tile indices of dirty tiles.  On the first call (no
@@ -634,7 +634,7 @@ impl GpuDirtyTracker {
 // Drop
 // ---------------------------------------------------------------------------
 
-impl Drop for GpuDirtyTracker {
+impl Drop for GpuFrameProcessor {
     fn drop(&mut self) {
         unsafe {
             self.device.device_wait_idle().ok();
@@ -720,7 +720,7 @@ mod tests {
 
     #[test]
     fn gpu_dirty_tracker_creates_successfully() {
-        match GpuDirtyTracker::new(2048) {
+        match GpuFrameProcessor::new(2048) {
             Ok(tracker) => {
                 assert!(tracker.max_tiles > 0);
             }
@@ -738,7 +738,7 @@ mod tests {
         // Solid red pixel
         let pixel: [u8; 4] = [0, 0, 255, 255]; // BGRA: R
 
-        let mut tracker = match GpuDirtyTracker::new(256) {
+        let mut tracker = match GpuFrameProcessor::new(256) {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("Skipping identical_frames test (no Vulkan GPU?): {e}");
@@ -790,7 +790,7 @@ mod tests {
         let height = 64u32;
         let stride = width * 4;
 
-        let mut tracker = match GpuDirtyTracker::new(256) {
+        let mut tracker = match GpuFrameProcessor::new(256) {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("Skipping changed_pixel test (no Vulkan GPU?): {e}");

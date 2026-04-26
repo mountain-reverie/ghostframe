@@ -9,7 +9,7 @@
 
 use std::os::unix::io::RawFd;
 
-use ghostframe_lib::capture::gpu_diff::GpuDirtyTracker;
+use ghostframe_lib::capture::gpu_pipeline::GpuFrameProcessor;
 use ghostframe_lib::encoder::h264_vaapi::{FullFrameEncoded, FullFrameEncoder};
 use ghostframe_lib::transport::protocol::{decode_frame_datagram, fragment_frame};
 
@@ -102,11 +102,11 @@ unsafe fn create_changed_memfd(
 // Test 1: GPU dirty detection
 // ---------------------------------------------------------------------------
 
-/// Verify GpuDirtyTracker detects changes between two frames.
+/// Verify GpuFrameProcessor detects changes between two frames.
 /// Skips if no Vulkan GPU is available.
 #[test]
 fn gpu_pipeline_dirty_detection() {
-    let mut tracker = match GpuDirtyTracker::new(256) {
+    let mut tracker = match GpuFrameProcessor::new(256) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("Skipping gpu_pipeline_dirty_detection (no Vulkan GPU?): {e}");
@@ -268,7 +268,7 @@ fn gpu_pipeline_end_to_end() {
     let stride = width * 4;
 
     // 1. Create both components; skip if either fails.
-    let mut tracker = match GpuDirtyTracker::new(512) {
+    let mut tracker = match GpuFrameProcessor::new(512) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("Skipping gpu_pipeline_end_to_end (no Vulkan GPU?): {e}");

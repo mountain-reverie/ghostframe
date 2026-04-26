@@ -1,2 +1,2 @@
 pub mod dmabuf;
-pub mod gpu_diff;
+pub mod gpu_pipeline;
