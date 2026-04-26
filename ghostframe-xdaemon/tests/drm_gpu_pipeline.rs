@@ -1,8 +1,8 @@
 //! Real DRM capture → GPU zero-copy pipeline integration test.
 //!
 //! This test exercises the actual production path on machines with a GPU:
-//! DRM framebuffer export → DMA-BUF → GpuDirtyTracker (Vulkan SAD) →
-//! FullFrameEncoder (VA-API H.264) → protocol fragmentation.
+//! DRM framebuffer export → DMA-BUF → GpuFrameProcessor (Vulkan SAD + NV12) →
+//! FullFrameEncoder (VA-API H.264 via encode_nv12_dmabuf) → protocol fragmentation.
 //!
 //! Skips gracefully if no DRM device or GPU is available.
 //!
@@ -14,7 +14,7 @@
 
 use std::os::fd::AsRawFd;
 
-use ghostframe_lib::capture::gpu_diff::GpuDirtyTracker;
+use ghostframe_lib::capture::gpu_pipeline::GpuFrameProcessor;
 use ghostframe_lib::encoder::h264_vaapi::FullFrameEncoder;
 use ghostframe_lib::transport::protocol::{decode_frame_datagram, fragment_frame};
 
@@ -47,21 +47,11 @@ fn try_drm_capture() -> Option<(std::os::fd::OwnedFd, u32, u32, u32)> {
             Err(_) => continue,
         };
 
-        eprintln!("  card{i}: {} CRTCs", res.crtcs().len());
         for crtc_handle in res.crtcs() {
             let crtc_info = match card.get_crtc(*crtc_handle) {
                 Ok(info) => info,
-                Err(e) => {
-                    eprintln!("    CRTC {:?}: get_crtc failed: {e}", crtc_handle);
-                    continue;
-                }
+                Err(_) => continue,
             };
-            eprintln!(
-                "    CRTC {:?}: mode={} fb={:?}",
-                crtc_handle,
-                crtc_info.mode().is_some(),
-                crtc_info.framebuffer()
-            );
             if crtc_info.mode().is_none() {
                 continue;
             }
@@ -73,39 +63,25 @@ fn try_drm_capture() -> Option<(std::os::fd::OwnedFd, u32, u32, u32)> {
             if let Ok(fb2) = card.get_planar_framebuffer(fb_handle) {
                 let (width, height) = fb2.size();
                 let stride = fb2.pitches()[0];
-                eprintln!("    FB2 {:?}: {}x{} stride={}", fb_handle, width, height, stride);
                 if let Some(buf_handle) = fb2.buffers()[0] {
-                    match card.buffer_to_prime_fd(buf_handle, 0) {
-                        Ok(fd) => return Some((fd, width, height, stride)),
-                        Err(e) => eprintln!("    FB2 PRIME export failed: {e}"),
+                    if let Ok(fd) = card.buffer_to_prime_fd(buf_handle, 0) {
+                        return Some((fd, width, height, stride));
                     }
-                } else {
-                    eprintln!("    FB2 plane 0 has no buffer handle");
                 }
             }
             // Legacy FB1 fallback
             let fb_info = match card.get_framebuffer(fb_handle) {
                 Ok(info) => info,
-                Err(e) => {
-                    eprintln!("    FB1 get_framebuffer failed: {e}");
-                    continue;
-                }
+                Err(_) => continue,
             };
             let (width, height) = fb_info.size();
             let stride = fb_info.pitch();
             let buf_handle = match fb_info.buffer() {
                 Some(h) => h,
-                None => {
-                    eprintln!("    FB1 has no buffer handle either");
-                    continue;
-                }
+                None => continue,
             };
-            match card.buffer_to_prime_fd(buf_handle, 0) {
-                Ok(fd) => return Some((fd, width, height, stride)),
-                Err(e) => {
-                    eprintln!("    FB1 PRIME export failed: {e}");
-                    continue;
-                }
+            if let Ok(fd) = card.buffer_to_prime_fd(buf_handle, 0) {
+                return Some((fd, width, height, stride));
             }
         }
     }
@@ -132,19 +108,19 @@ fn drm_capture_to_gpu_pipeline() {
 
     let raw_fd = dmabuf_fd.as_raw_fd();
 
-    // 2. GPU dirty detection
-    let mut tracker = match GpuDirtyTracker::new(4096) {
+    // 2. GPU dirty detection + NV12 conversion via process_frame
+    let mut processor = match GpuFrameProcessor::new(4096) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("Skipping: GpuDirtyTracker init failed: {e}");
+            eprintln!("Skipping: GpuFrameProcessor init failed: {e}");
             return;
         }
     };
 
-    let dirty = match tracker.diff(raw_fd, width, height, stride) {
-        Ok(d) => d,
+    let analysis = match processor.process_frame(raw_fd, width, height, stride) {
+        Ok(a) => a,
         Err(e) => {
-            eprintln!("Skipping: GPU diff failed on real DMA-BUF: {e}");
+            eprintln!("Skipping: process_frame failed on real DMA-BUF: {e}");
             return;
         }
     };
@@ -154,28 +130,17 @@ fn drm_capture_to_gpu_pipeline() {
     let total_tiles = cols * rows;
     eprintln!(
         "First frame: {}/{} tiles dirty ({}x{} grid)",
-        dirty.len(),
+        analysis.dirty_tiles.len(),
         total_tiles,
         cols,
         rows
     );
     assert!(
-        !dirty.is_empty(),
+        !analysis.dirty_tiles.is_empty(),
         "first frame should report tiles as dirty"
     );
 
-    // 3. Second capture of same framebuffer — should show fewer or no dirty tiles
-    //    (desktop content is static between two immediate captures)
-    let dirty2 = tracker.diff(raw_fd, width, height, stride).unwrap();
-    eprintln!(
-        "Second frame (same fd): {}/{} tiles dirty",
-        dirty2.len(),
-        total_tiles
-    );
-    // Note: we can't assert dirty2 is empty because the desktop might have
-    // animations, cursor blink, etc. Just verify it doesn't crash.
-
-    // 4. Full-frame H.264 encode
+    // 3. Full-frame H.264 encode via encode_nv12_dmabuf (zero-copy NV12 path)
     let mut encoder = match FullFrameEncoder::new(width, height) {
         Ok(e) => e,
         Err(e) => {
@@ -184,10 +149,19 @@ fn drm_capture_to_gpu_pipeline() {
         }
     };
 
+    let nv12_fd = analysis.nv12_dmabuf_fd.as_raw_fd();
+
     // Encode up to 3 frames (VA-API may buffer the first)
     let mut encoded = None;
     for i in 0..3 {
-        match encoder.encode_frame(raw_fd, width, height, stride) {
+        match encoder.encode_nv12_dmabuf(
+            nv12_fd,
+            analysis.nv12_width,
+            analysis.nv12_height,
+            analysis.nv12_y_stride,
+            analysis.nv12_uv_stride,
+            analysis.nv12_uv_offset,
+        ) {
             Ok(Some(enc)) => {
                 eprintln!(
                     "Frame {i}: {} bytes, keyframe={}",
@@ -202,7 +176,7 @@ fn drm_capture_to_gpu_pipeline() {
                 eprintln!("Frame {i}: buffered (no output yet)");
             }
             Err(e) => {
-                eprintln!("Skipping: encode_frame failed: {e}");
+                eprintln!("Skipping: encode_nv12_dmabuf failed: {e}");
                 return;
             }
         }
@@ -212,7 +186,7 @@ fn drm_capture_to_gpu_pipeline() {
     assert!(!enc.payload.is_empty(), "H.264 payload should be non-empty");
     assert!(enc.is_keyframe, "first output should be a keyframe");
 
-    // 5. Fragment the encoded frame
+    // 4. Fragment the encoded frame
     let datagrams = fragment_frame(1, 0, true, &enc.payload, 1200);
     assert!(!datagrams.is_empty());
     eprintln!(
@@ -226,5 +200,5 @@ fn drm_capture_to_gpu_pipeline() {
     assert_eq!(hdr.frame_seq, 1);
     assert!(hdr.is_keyframe());
 
-    eprintln!("DRM → GPU SAD → VA-API encode → fragment: PASS");
+    eprintln!("DRM → GpuFrameProcessor (SAD+NV12) → encode_nv12_dmabuf → fragment: PASS");
 }

@@ -7,7 +7,7 @@
 //!
 //! Run: cargo test --test gpu_pipeline
 
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 
 use ghostframe_lib::capture::gpu_pipeline::GpuFrameProcessor;
 use ghostframe_lib::encoder::h264_vaapi::{FullFrameEncoded, FullFrameEncoder};
@@ -378,4 +378,59 @@ fn gpu_pipeline_end_to_end() {
 
         libc::close(fd2);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Test 4: NV12 conversion
+// ---------------------------------------------------------------------------
+
+/// Verify GpuFrameProcessor produces a valid NV12 DMA-BUF on process_frame.
+/// Skips if no Vulkan GPU is available or memfd is not accepted for NV12 export.
+#[test]
+fn gpu_pipeline_nv12_conversion() {
+    let mut processor = match GpuFrameProcessor::new(256) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Skipping: no Vulkan GPU: {e}");
+            return;
+        }
+    };
+
+    let width = 128u32;
+    let height = 128u32;
+    let stride = width * 4;
+
+    let fd = unsafe { create_solid_memfd(width, height, 0, 0, 255) }; // solid red in BGRA
+
+    match processor.process_frame(fd, width, height, stride) {
+        Ok(analysis) => {
+            let cols = width.div_ceil(32);
+            let rows = height.div_ceil(32);
+            assert_eq!(
+                analysis.dirty_tiles.len() as u32,
+                cols * rows,
+                "first frame should report all tiles dirty"
+            );
+
+            // NV12 fd should be valid
+            assert!(analysis.nv12_dmabuf_fd.as_raw_fd() >= 0);
+            assert_eq!(analysis.nv12_width, width);
+            assert_eq!(analysis.nv12_height, height);
+            assert_eq!(analysis.nv12_y_stride, width);
+            assert_eq!(analysis.nv12_uv_stride, width);
+            assert_eq!(analysis.nv12_uv_offset, width * height);
+
+            eprintln!(
+                "NV12 conversion OK: fd={}, {}x{}, y_stride={}, uv_offset={}",
+                analysis.nv12_dmabuf_fd.as_raw_fd(),
+                analysis.nv12_width, analysis.nv12_height,
+                analysis.nv12_y_stride, analysis.nv12_uv_offset,
+            );
+        }
+        Err(e) => {
+            eprintln!("Skipping: process_frame failed (memfd not accepted for NV12 export): {e}");
+        }
+    }
+
+    unsafe { libc::close(fd) };
 }
