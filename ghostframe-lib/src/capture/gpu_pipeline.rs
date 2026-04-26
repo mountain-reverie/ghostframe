@@ -5,11 +5,16 @@
 //! against the previous frame, then reads back ~8 KB of SAD scores to decide
 //! which 32×32-pixel tiles changed.
 //!
+//! A second compute pass (`bgra_to_nv12`) converts the current frame to NV12
+//! format in a device-local buffer that is exported as a DMA-BUF fd, ready for
+//! VA-API H.264 encoding.
+//!
 //! This replaces the CPU-based dirty tracker for the M2 zero-copy GPU pipeline.
 
 use ash::vk;
 use std::ffi::CStr;
 use std::io;
+use std::os::unix::io::{FromRawFd, OwnedFd};
 
 /// Pixels-per-tile dimension (matches shader local_size_x/y).
 const TILE_SIZE: u32 = 32;
@@ -19,15 +24,34 @@ const TILE_SIZE: u32 = 32;
 const SAD_THRESHOLD: u32 = 64;
 
 // ---------------------------------------------------------------------------
+// Public result type
+// ---------------------------------------------------------------------------
+
+/// Result of [`GpuFrameProcessor::process_frame`].
+pub struct FrameAnalysis {
+    /// Flat tile indices of dirty tiles (tile_y * cols + tile_x).
+    pub dirty_tiles: Vec<u32>,
+    /// Exported DMA-BUF fd for the NV12 output buffer.
+    pub nv12_dmabuf_fd: OwnedFd,
+    pub nv12_width: u32,
+    pub nv12_height: u32,
+    pub nv12_y_stride: u32,
+    pub nv12_uv_stride: u32,
+    pub nv12_uv_offset: u32,
+}
+
+// ---------------------------------------------------------------------------
 // Public struct
 // ---------------------------------------------------------------------------
 
-/// Vulkan compute-based dirty tile tracker.
+/// Vulkan compute-based dirty tile tracker + BGRA→NV12 converter.
 ///
-/// Call [`diff`][GpuFrameProcessor::diff] each frame with the DMA-BUF fd,
-/// resolution and stride.  The returned `Vec<u32>` contains the flat tile
-/// indices (`tile_y * cols + tile_x`) of every tile whose SAD score exceeded
-/// the threshold.
+/// Call [`process_frame`][GpuFrameProcessor::process_frame] each frame with the
+/// DMA-BUF fd, resolution and stride.  Returns a [`FrameAnalysis`] containing
+/// dirty tile indices and an exportable NV12 DMA-BUF fd.
+///
+/// [`diff`][GpuFrameProcessor::diff] is a convenience wrapper that returns only
+/// the dirty tile indices.
 pub struct GpuFrameProcessor {
     _entry: ash::Entry,
     instance: ash::Instance,
@@ -37,6 +61,7 @@ pub struct GpuFrameProcessor {
     #[allow(dead_code)]
     queue_family_index: u32,
     command_pool: vk::CommandPool,
+    // SAD pipeline
     shader_module: vk::ShaderModule,
     pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
@@ -49,6 +74,15 @@ pub struct GpuFrameProcessor {
     max_tiles: u32,
     last_width: u32,
     last_height: u32,
+    // NV12 conversion pipeline
+    nv12_shader_module: vk::ShaderModule,
+    nv12_pipeline: vk::Pipeline,
+    nv12_pipeline_layout: vk::PipelineLayout,
+    nv12_descriptor_set_layout: vk::DescriptorSetLayout,
+    nv12_buffer: vk::Buffer,
+    nv12_memory: vk::DeviceMemory,
+    nv12_buf_size: usize,
+    external_memory_fd_fn: ash::khr::external_memory_fd::Device,
 }
 
 struct PrevFrame {
@@ -158,19 +192,17 @@ impl GpuFrameProcessor {
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         let command_pool = device.create_command_pool(&pool_ci, None)?;
 
-        // --- Shader module ---
+        // --- SAD Shader module ---
         let spv = include_bytes!("shaders/tile_sad.spv");
-        // SPIR-V words must be u32-aligned; ash handles alignment internally via
-        // make_spirv_raw but we use the raw slice approach here.
         let spv_words = ash::util::read_spv(&mut std::io::Cursor::new(spv.as_slice()))?;
         let shader_module_ci = vk::ShaderModuleCreateInfo::default().code(&spv_words);
         let shader_module = device.create_shader_module(&shader_module_ci, None)?;
 
-        // --- Descriptor set layout ---
+        // --- SAD Descriptor set layout ---
         // binding 0: STORAGE_IMAGE (current frame)
         // binding 1: STORAGE_IMAGE (prev frame)
         // binding 2: STORAGE_BUFFER (SAD output)
-        let bindings = [
+        let sad_bindings = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
                 .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
@@ -187,10 +219,10 @@ impl GpuFrameProcessor {
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
         ];
-        let dsl_ci = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+        let dsl_ci = vk::DescriptorSetLayoutCreateInfo::default().bindings(&sad_bindings);
         let descriptor_set_layout = device.create_descriptor_set_layout(&dsl_ci, None)?;
 
-        // --- Pipeline layout ---
+        // --- SAD Pipeline layout ---
         // Push constants: 3 x u32 = 12 bytes (frame_width, frame_height, cols)
         let push_range = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
@@ -201,7 +233,7 @@ impl GpuFrameProcessor {
             .push_constant_ranges(&push_range);
         let pipeline_layout = device.create_pipeline_layout(&pipeline_layout_ci, None)?;
 
-        // --- Compute pipeline ---
+        // --- SAD Compute pipeline ---
         let entry_name = c"main";
         let stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
@@ -217,22 +249,80 @@ impl GpuFrameProcessor {
             .map_err(|(_, e)| e)?;
         let pipeline = pipelines[0];
 
+        // --- NV12 Shader module ---
+        let nv12_spv = include_bytes!("shaders/bgra_to_nv12.spv");
+        let nv12_spv_words = ash::util::read_spv(&mut std::io::Cursor::new(nv12_spv.as_slice()))?;
+        let nv12_shader_module_ci = vk::ShaderModuleCreateInfo::default().code(&nv12_spv_words);
+        let nv12_shader_module = device.create_shader_module(&nv12_shader_module_ci, None)?;
+
+        // --- NV12 Descriptor set layout ---
+        // binding 0: STORAGE_IMAGE (BGRA input)
+        // binding 1: STORAGE_BUFFER (NV12 output)
+        let nv12_bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        ];
+        let nv12_dsl_ci =
+            vk::DescriptorSetLayoutCreateInfo::default().bindings(&nv12_bindings);
+        let nv12_descriptor_set_layout =
+            device.create_descriptor_set_layout(&nv12_dsl_ci, None)?;
+
+        // --- NV12 Pipeline layout ---
+        // Push constants: 5 x u32 = 20 bytes (width, height, y_stride, uv_offset, uv_stride)
+        let nv12_push_range = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .offset(0)
+            .size(20)];
+        let nv12_pipeline_layout_ci = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(std::slice::from_ref(&nv12_descriptor_set_layout))
+            .push_constant_ranges(&nv12_push_range);
+        let nv12_pipeline_layout =
+            device.create_pipeline_layout(&nv12_pipeline_layout_ci, None)?;
+
+        // --- NV12 Compute pipeline ---
+        let nv12_stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(nv12_shader_module)
+            .name(entry_name);
+
+        let nv12_compute_ci = vk::ComputePipelineCreateInfo::default()
+            .stage(nv12_stage)
+            .layout(nv12_pipeline_layout);
+
+        let nv12_pipelines = device
+            .create_compute_pipelines(vk::PipelineCache::null(), &[nv12_compute_ci], None)
+            .map_err(|(_, e)| e)?;
+        let nv12_pipeline = nv12_pipelines[0];
+
+        // --- External memory fd function loader ---
+        let external_memory_fd_fn =
+            ash::khr::external_memory_fd::Device::new(&instance, &device);
+
         // --- Descriptor pool ---
-        // Allocate enough for 1 set per frame with FREE_DESCRIPTOR_SET so we can
-        // free individual sets after each frame.
+        // 2 sets per frame: one for SAD (2 STORAGE_IMAGE + 1 STORAGE_BUFFER),
+        // one for NV12 (1 STORAGE_IMAGE + 1 STORAGE_BUFFER).
+        // STORAGE_IMAGE total: 3, STORAGE_BUFFER total: 2, max_sets: 2.
         let pool_sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_IMAGE,
-                descriptor_count: 2,
+                descriptor_count: 3,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: 1,
+                descriptor_count: 2,
             },
         ];
         let dp_ci = vk::DescriptorPoolCreateInfo::default()
             .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
-            .max_sets(1)
+            .max_sets(2)
             .pool_sizes(&pool_sizes);
         let descriptor_pool = device.create_descriptor_pool(&dp_ci, None)?;
 
@@ -287,38 +377,47 @@ impl GpuFrameProcessor {
             max_tiles,
             last_width: 0,
             last_height: 0,
+            nv12_shader_module,
+            nv12_pipeline,
+            nv12_pipeline_layout,
+            nv12_descriptor_set_layout,
+            nv12_buffer: vk::Buffer::null(),
+            nv12_memory: vk::DeviceMemory::null(),
+            nv12_buf_size: 0,
+            external_memory_fd_fn,
         })
     }
 }
 
 // ---------------------------------------------------------------------------
-// diff()
+// process_frame() — main entry point
 // ---------------------------------------------------------------------------
 
 impl GpuFrameProcessor {
-    /// Compare the DMA-BUF frame at `fd` against the previous frame.
+    /// Run SAD dirty detection + BGRA→NV12 conversion in a single command buffer.
     ///
-    /// Returns flat tile indices of dirty tiles.  On the first call (no
-    /// previous frame), all tiles are returned as dirty.
+    /// Returns [`FrameAnalysis`] with dirty tile indices and an exported NV12
+    /// DMA-BUF fd.  On the first call (no previous frame), all tiles are
+    /// returned as dirty and only the NV12 pass runs.
     ///
     /// The `fd` is **not** consumed; this function dups it internally.
-    pub fn diff(
+    pub fn process_frame(
         &mut self,
         fd: std::os::unix::io::RawFd,
         width: u32,
         height: u32,
         stride: u32,
-    ) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
-        unsafe { self.diff_inner(fd, width, height, stride) }
+    ) -> Result<FrameAnalysis, Box<dyn std::error::Error>> {
+        unsafe { self.process_frame_inner(fd, width, height, stride) }
     }
 
-    unsafe fn diff_inner(
+    unsafe fn process_frame_inner(
         &mut self,
         fd: std::os::unix::io::RawFd,
         width: u32,
         height: u32,
         stride: u32,
-    ) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+    ) -> Result<FrameAnalysis, Box<dyn std::error::Error>> {
         let cols = width.div_ceil(TILE_SIZE);
         let rows = height.div_ceil(TILE_SIZE);
         let tile_count = cols * rows;
@@ -331,7 +430,7 @@ impl GpuFrameProcessor {
             .into());
         }
 
-        // Drop prev_image if resolution changed
+        // Drop prev_image and NV12 buffer if resolution changed
         if width != self.last_width || height != self.last_height {
             if let Some(prev) = self.prev_image.take() {
                 self.destroy_prev_frame(prev);
@@ -340,28 +439,175 @@ impl GpuFrameProcessor {
             self.last_height = height;
         }
 
+        // Ensure NV12 buffer is allocated (or reallocated on resolution change)
+        let y_stride = width;
+        let uv_stride = width;
+        let uv_offset = y_stride * height;
+        let needed = (width * height) as usize + (width * height / 2) as usize;
+        if self.nv12_buf_size != needed {
+            self.allocate_nv12_buffer(width, height)?;
+        }
+
         // --- Import DMA-BUF as VkImage ---
         let current = self.import_dmabuf(fd, width, height, stride)?;
 
-        // --- First frame: store as prev, return all tiles dirty ---
+        // NV12 push constants
+        let nv12_push: [u32; 5] = [width, height, y_stride, uv_offset, uv_stride];
+
+        // --- First frame: no SAD, just NV12 ---
         if self.prev_image.is_none() {
-            self.prev_image = Some(current);
+            // Allocate NV12 descriptor set
+            let nv12_set_layouts = [self.nv12_descriptor_set_layout];
+            let nv12_ds_alloc = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(self.descriptor_pool)
+                .set_layouts(&nv12_set_layouts);
+            let nv12_descriptor_sets = self.device.allocate_descriptor_sets(&nv12_ds_alloc)?;
+            let nv12_ds = nv12_descriptor_sets[0];
+
+            let nv12_image_info = [vk::DescriptorImageInfo::default()
+                .image_view(current.view)
+                .image_layout(vk::ImageLayout::GENERAL)];
+            let nv12_buffer_info = [vk::DescriptorBufferInfo::default()
+                .buffer(self.nv12_buffer)
+                .offset(0)
+                .range(vk::WHOLE_SIZE)];
+            let nv12_writes = [
+                vk::WriteDescriptorSet::default()
+                    .dst_set(nv12_ds)
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                    .image_info(&nv12_image_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(nv12_ds)
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&nv12_buffer_info),
+            ];
+            self.device.update_descriptor_sets(&nv12_writes, &[]);
+
+            // Record command buffer: barrier → NV12 dispatch → buffer barrier
+            let cmd_alloc = vk::CommandBufferAllocateInfo::default()
+                .command_pool(self.command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let cmd_bufs = self.device.allocate_command_buffers(&cmd_alloc)?;
+            let cmd = cmd_bufs[0];
+
+            let begin_info = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            self.device.begin_command_buffer(cmd, &begin_info)?;
+
+            let subresource_range = vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            };
+            let img_barrier = [vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::PREINITIALIZED)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(current.image)
+                .subresource_range(subresource_range)
+                .src_access_mask(vk::AccessFlags::HOST_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)];
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::HOST,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &img_barrier,
+            );
+
+            self.device
+                .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.nv12_pipeline);
+            self.device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                self.nv12_pipeline_layout,
+                0,
+                &[nv12_ds],
+                &[],
+            );
+            let nv12_push_bytes = std::slice::from_raw_parts(
+                nv12_push.as_ptr() as *const u8,
+                std::mem::size_of_val(&nv12_push),
+            );
+            self.device.cmd_push_constants(
+                cmd,
+                self.nv12_pipeline_layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                nv12_push_bytes,
+            );
+            self.device
+                .cmd_dispatch(cmd, width / 2, height / 2, 1);
+
+            let nv12_buf_barrier = [vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.nv12_buffer)
+                .offset(0)
+                .size(vk::WHOLE_SIZE)];
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[],
+                &nv12_buf_barrier,
+                &[],
+            );
+
+            self.device.end_command_buffer(cmd)?;
+
+            let fence_ci = vk::FenceCreateInfo::default();
+            let fence = self.device.create_fence(&fence_ci, None)?;
+            let submit_info = vk::SubmitInfo::default().command_buffers(&cmd_bufs);
+            self.device.queue_submit(self.queue, &[submit_info], fence)?;
+            self.device.wait_for_fences(&[fence], true, u64::MAX)?;
+            self.device.destroy_fence(fence, None);
+            self.device
+                .free_command_buffers(self.command_pool, &cmd_bufs);
+            self.device
+                .free_descriptor_sets(self.descriptor_pool, &[nv12_ds])?;
+
+            let nv12_dmabuf_fd = self.export_nv12_dmabuf()?;
             let all_dirty: Vec<u32> = (0..tile_count).collect();
-            return Ok(all_dirty);
+
+            let mut cur = current;
+            cur.layout = vk::ImageLayout::GENERAL;
+            self.prev_image = Some(cur);
+
+            return Ok(FrameAnalysis {
+                dirty_tiles: all_dirty,
+                nv12_dmabuf_fd,
+                nv12_width: width,
+                nv12_height: height,
+                nv12_y_stride: y_stride,
+                nv12_uv_stride: uv_stride,
+                nv12_uv_offset: uv_offset,
+            });
         }
 
+        // --- Subsequent frames: SAD + NV12 in one command buffer ---
         let prev = self.prev_image.as_ref().unwrap();
 
-        // --- Allocate descriptor set ---
-        let set_layouts = [self.descriptor_set_layout];
-        let ds_alloc_info = vk::DescriptorSetAllocateInfo::default()
+        // --- Allocate descriptor sets ---
+        // SAD descriptor set
+        let sad_set_layouts = [self.descriptor_set_layout];
+        let sad_ds_alloc = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
-            .set_layouts(&set_layouts);
-        let descriptor_sets = self.device.allocate_descriptor_sets(&ds_alloc_info)?;
-        let ds = descriptor_sets[0];
+            .set_layouts(&sad_set_layouts);
+        let sad_descriptor_sets = self.device.allocate_descriptor_sets(&sad_ds_alloc)?;
+        let sad_ds = sad_descriptor_sets[0];
 
-        // Update descriptor set:
-        // binding 0 = current_frame, binding 1 = prev_frame, binding 2 = SAD buffer
         let current_image_info = [vk::DescriptorImageInfo::default()
             .image_view(current.view)
             .image_layout(vk::ImageLayout::GENERAL)];
@@ -372,25 +618,54 @@ impl GpuFrameProcessor {
             .buffer(self.sad_buffer)
             .offset(0)
             .range(vk::WHOLE_SIZE)];
-
-        let writes = [
+        let sad_writes = [
             vk::WriteDescriptorSet::default()
-                .dst_set(ds)
+                .dst_set(sad_ds)
                 .dst_binding(0)
                 .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                 .image_info(&current_image_info),
             vk::WriteDescriptorSet::default()
-                .dst_set(ds)
+                .dst_set(sad_ds)
                 .dst_binding(1)
                 .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                 .image_info(&prev_image_info),
             vk::WriteDescriptorSet::default()
-                .dst_set(ds)
+                .dst_set(sad_ds)
                 .dst_binding(2)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(&sad_buffer_info),
         ];
-        self.device.update_descriptor_sets(&writes, &[]);
+        self.device.update_descriptor_sets(&sad_writes, &[]);
+
+        // NV12 descriptor set
+        let nv12_set_layouts = [self.nv12_descriptor_set_layout];
+        let nv12_ds_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(&nv12_set_layouts);
+        let nv12_descriptor_sets = self.device.allocate_descriptor_sets(&nv12_ds_alloc)?;
+        let nv12_ds = nv12_descriptor_sets[0];
+
+        // Note: current_image_info re-used for NV12 binding 0
+        let nv12_current_image_info = [vk::DescriptorImageInfo::default()
+            .image_view(current.view)
+            .image_layout(vk::ImageLayout::GENERAL)];
+        let nv12_buffer_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.nv12_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let nv12_writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(nv12_ds)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(&nv12_current_image_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(nv12_ds)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&nv12_buffer_info),
+        ];
+        self.device.update_descriptor_sets(&nv12_writes, &[]);
 
         // --- Command buffer ---
         let cmd_alloc = vk::CommandBufferAllocateInfo::default()
@@ -404,7 +679,7 @@ impl GpuFrameProcessor {
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         self.device.begin_command_buffer(cmd, &begin_info)?;
 
-        // Transition both images PREINITIALIZED -> GENERAL
+        // 1. Image barriers: current (PREINITIALIZED→GENERAL) + prev (layout→GENERAL)
         let subresource_range = vk::ImageSubresourceRange {
             aspect_mask: vk::ImageAspectFlags::COLOR,
             base_mip_level: 0,
@@ -446,7 +721,7 @@ impl GpuFrameProcessor {
             &barriers,
         );
 
-        // Bind pipeline and descriptor set
+        // 2. SAD dispatch
         self.device
             .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline);
         self.device.cmd_bind_descriptor_sets(
@@ -454,11 +729,9 @@ impl GpuFrameProcessor {
             vk::PipelineBindPoint::COMPUTE,
             self.pipeline_layout,
             0,
-            &[ds],
+            &[sad_ds],
             &[],
         );
-
-        // Push constants: [frame_width, frame_height, cols]
         let push_data: [u32; 3] = [width, height, cols];
         let push_bytes = std::slice::from_raw_parts(
             push_data.as_ptr() as *const u8,
@@ -471,40 +744,85 @@ impl GpuFrameProcessor {
             0,
             push_bytes,
         );
-
-        // Dispatch one workgroup per tile
         self.device.cmd_dispatch(cmd, cols, rows, 1);
 
-        // Memory barrier: SHADER_WRITE -> HOST_READ on SAD buffer
-        let buf_barrier = [vk::BufferMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::HOST_READ)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.sad_buffer)
-            .offset(0)
-            .size(vk::WHOLE_SIZE)];
+        // 3. Pipeline barrier between SAD and NV12 dispatches
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)],
+            &[],
+            &[],
+        );
+
+        // 4. NV12 dispatch
+        self.device
+            .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.nv12_pipeline);
+        self.device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.nv12_pipeline_layout,
+            0,
+            &[nv12_ds],
+            &[],
+        );
+        let nv12_push_bytes = std::slice::from_raw_parts(
+            nv12_push.as_ptr() as *const u8,
+            std::mem::size_of_val(&nv12_push),
+        );
+        self.device.cmd_push_constants(
+            cmd,
+            self.nv12_pipeline_layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            nv12_push_bytes,
+        );
+        self.device.cmd_dispatch(cmd, width / 2, height / 2, 1);
+
+        // 5. Buffer barriers: SAD + NV12 → HOST_READ
+        let buf_barriers = [
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.sad_buffer)
+                .offset(0)
+                .size(vk::WHOLE_SIZE),
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.nv12_buffer)
+                .offset(0)
+                .size(vk::WHOLE_SIZE),
+        ];
         self.device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::COMPUTE_SHADER,
             vk::PipelineStageFlags::HOST,
             vk::DependencyFlags::empty(),
             &[],
-            &buf_barrier,
+            &buf_barriers,
             &[],
         );
 
         self.device.end_command_buffer(cmd)?;
 
-        // --- Submit and wait ---
+        // 6. Submit and wait
         let fence_ci = vk::FenceCreateInfo::default();
         let fence = self.device.create_fence(&fence_ci, None)?;
         let submit_info = vk::SubmitInfo::default().command_buffers(&cmd_bufs);
         self.device.queue_submit(self.queue, &[submit_info], fence)?;
-        self.device
-            .wait_for_fences(&[fence], true, u64::MAX)?;
+        self.device.wait_for_fences(&[fence], true, u64::MAX)?;
         self.device.destroy_fence(fence, None);
-        self.device.free_command_buffers(self.command_pool, &cmd_bufs);
+        self.device
+            .free_command_buffers(self.command_pool, &cmd_bufs);
 
         // --- Read SAD values ---
         let sad_slice = std::slice::from_raw_parts(self.sad_ptr, tile_count as usize);
@@ -512,22 +830,129 @@ impl GpuFrameProcessor {
             .filter(|&i| sad_slice[i as usize] > SAD_THRESHOLD)
             .collect();
 
+        // --- Export NV12 DMA-BUF ---
+        let nv12_dmabuf_fd = self.export_nv12_dmabuf()?;
+
+        // --- Free descriptor sets ---
+        self.device
+            .free_descriptor_sets(self.descriptor_pool, &[sad_ds, nv12_ds])?;
+
         // --- Swap prev_image ---
-        // Destroy old prev, promote current to prev.
-        // Current was transitioned to GENERAL during the dispatch.
         let old_prev = self.prev_image.take().unwrap();
         self.destroy_prev_frame(old_prev);
-        let mut current = current;
-        current.layout = vk::ImageLayout::GENERAL;
-        self.prev_image = Some(current);
+        let mut cur = current;
+        cur.layout = vk::ImageLayout::GENERAL;
+        self.prev_image = Some(cur);
 
-        // --- Free descriptor set ---
-        self.device
-            .free_descriptor_sets(self.descriptor_pool, &[ds])?;
+        Ok(FrameAnalysis {
+            dirty_tiles: dirty,
+            nv12_dmabuf_fd,
+            nv12_width: width,
+            nv12_height: height,
+            nv12_y_stride: y_stride,
+            nv12_uv_stride: uv_stride,
+            nv12_uv_offset: uv_offset,
+        })
+    }
+}
 
-        Ok(dirty)
+// ---------------------------------------------------------------------------
+// diff() — convenience wrapper
+// ---------------------------------------------------------------------------
+
+impl GpuFrameProcessor {
+    /// Compare the DMA-BUF frame at `fd` against the previous frame.
+    ///
+    /// Returns flat tile indices of dirty tiles.  On the first call (no
+    /// previous frame), all tiles are returned as dirty.
+    ///
+    /// The `fd` is **not** consumed; this function dups it internally.
+    pub fn diff(
+        &mut self,
+        fd: std::os::unix::io::RawFd,
+        width: u32,
+        height: u32,
+        stride: u32,
+    ) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+        let analysis = self.process_frame(fd, width, height, stride)?;
+        Ok(analysis.dirty_tiles)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NV12 buffer helpers
+// ---------------------------------------------------------------------------
+
+impl GpuFrameProcessor {
+    /// Allocate (or reallocate) the device-local exportable NV12 output buffer.
+    unsafe fn allocate_nv12_buffer(
+        &mut self,
+        width: u32,
+        height: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Free old buffers if present
+        if self.nv12_buffer != vk::Buffer::null() {
+            self.device.destroy_buffer(self.nv12_buffer, None);
+            self.device.free_memory(self.nv12_memory, None);
+            self.nv12_buffer = vk::Buffer::null();
+            self.nv12_memory = vk::DeviceMemory::null();
+        }
+
+        let y_size = (width * height) as usize;
+        let uv_size = (width * height / 2) as usize;
+        let total = y_size + uv_size;
+
+        // Create buffer with external memory flag
+        let mut ext_buf_info = vk::ExternalMemoryBufferCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let buf_ci = vk::BufferCreateInfo::default()
+            .size(total as vk::DeviceSize)
+            .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .push_next(&mut ext_buf_info);
+        let buffer = self.device.create_buffer(&buf_ci, None)?;
+        let reqs = self.device.get_buffer_memory_requirements(buffer);
+
+        // Allocate with export flag
+        let mut export_info = vk::ExportMemoryAllocateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let mem_props = self
+            .instance
+            .get_physical_device_memory_properties(self.physical_device);
+        let mem_type =
+            find_memory_type(&mem_props, reqs.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                .or_else(|| {
+                    find_memory_type(&mem_props, reqs.memory_type_bits, vk::MemoryPropertyFlags::empty())
+                })
+                .ok_or("no memory type for exportable NV12 buffer")?;
+        let mut alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(reqs.size)
+            .memory_type_index(mem_type);
+        alloc = alloc.push_next(&mut export_info);
+        let memory = self.device.allocate_memory(&alloc, None)?;
+        self.device.bind_buffer_memory(buffer, memory, 0)?;
+
+        self.nv12_buffer = buffer;
+        self.nv12_memory = memory;
+        self.nv12_buf_size = total;
+        Ok(())
     }
 
+    /// Export the NV12 buffer memory as a DMA-BUF fd.
+    unsafe fn export_nv12_dmabuf(&self) -> Result<OwnedFd, Box<dyn std::error::Error>> {
+        let get_fd_info = vk::MemoryGetFdInfoKHR::default()
+            .memory(self.nv12_memory)
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let fd = self.external_memory_fd_fn.get_memory_fd(&get_fd_info)?;
+        Ok(OwnedFd::from_raw_fd(fd))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DMA-BUF import helpers
+// ---------------------------------------------------------------------------
+
+impl GpuFrameProcessor {
     /// Import a DMA-BUF fd as a VkImage + VkImageView.
     unsafe fn import_dmabuf(
         &self,
@@ -643,6 +1068,20 @@ impl Drop for GpuFrameProcessor {
                 self.destroy_prev_frame(prev);
             }
 
+            // NV12 resources
+            if self.nv12_buffer != vk::Buffer::null() {
+                self.device.destroy_buffer(self.nv12_buffer, None);
+                self.device.free_memory(self.nv12_memory, None);
+            }
+            self.device.destroy_pipeline(self.nv12_pipeline, None);
+            self.device
+                .destroy_pipeline_layout(self.nv12_pipeline_layout, None);
+            self.device
+                .destroy_descriptor_set_layout(self.nv12_descriptor_set_layout, None);
+            self.device
+                .destroy_shader_module(self.nv12_shader_module, None);
+
+            // SAD resources
             self.device.unmap_memory(self.sad_memory);
             self.device.destroy_buffer(self.sad_buffer, None);
             self.device.free_memory(self.sad_memory, None);
