@@ -697,6 +697,117 @@ impl FullFrameEncoder {
         }
     }
 
+    /// Encode an NV12 DMA-BUF directly via VA-API zero-copy import.
+    ///
+    /// The DMA-BUF must contain NV12 data: Y plane at offset 0, interleaved
+    /// UV plane at `uv_offset`. No CPU pixel access — the DMA-BUF maps
+    /// directly into a VA-API surface.
+    pub fn encode_nv12_dmabuf(
+        &mut self,
+        nv12_fd: RawFd,
+        width: u32,
+        height: u32,
+        y_stride: u32,
+        uv_stride: u32,
+        uv_offset: u32,
+    ) -> Result<Option<FullFrameEncoded>, ffmpeg::Error> {
+        let pts = self.pts;
+        self.pts += 1;
+        let force_idr = pts % FULL_FRAME_GOP as i64 == 0;
+
+        if !self.use_vaapi {
+            return Err(ffmpeg::Error::InvalidData);
+        }
+
+        unsafe {
+            let hw_frames_ref = self.hw_frames_ctx.as_ref()
+                .expect("use_vaapi but no hw_frames_ctx");
+
+            let hw_frame = Self::import_nv12_dmabuf(
+                hw_frames_ref.0, nv12_fd, width, height,
+                y_stride, uv_stride, uv_offset, pts, force_idr,
+            )?;
+
+            self.encoder.send_frame(&hw_frame)?;
+        }
+
+        self.receive_full_packet()
+    }
+
+    /// Import an NV12 DMA-BUF as a VA-API surface via DRM PRIME mapping.
+    /// NV12→NV12 (same sw_format) so av_hwframe_map succeeds.
+    unsafe fn import_nv12_dmabuf(
+        hw_frames_ctx: *mut ffi::AVBufferRef,
+        fd: RawFd,
+        width: u32,
+        height: u32,
+        y_stride: u32,
+        uv_stride: u32,
+        uv_offset: u32,
+        pts: i64,
+        force_idr: bool,
+    ) -> Result<frame::Video, ffmpeg::Error> {
+        // DRM_FORMAT_NV12 = fourcc('N','V','1','2')
+        const DRM_FORMAT_NV12: u32 = 0x3231564e;
+        const DRM_FORMAT_MOD_INVALID: u64 = 0x00ffffffffffffff;
+
+        let y_size = (y_stride as usize) * (height as usize);
+        let uv_size = (uv_stride as usize) * (height as usize / 2);
+        let total_size = y_size + uv_size;
+
+        let mut desc = Box::new(std::mem::zeroed::<ffi::AVDRMFrameDescriptor>());
+        desc.nb_objects = 1;
+        desc.objects[0] = ffi::AVDRMObjectDescriptor {
+            fd: libc::dup(fd),
+            size: total_size,
+            format_modifier: DRM_FORMAT_MOD_INVALID,
+        };
+        desc.nb_layers = 1;
+        desc.layers[0].format = DRM_FORMAT_NV12;
+        desc.layers[0].nb_planes = 2;
+        desc.layers[0].planes[0] = ffi::AVDRMPlaneDescriptor {
+            object_index: 0,
+            offset: 0,
+            pitch: y_stride as isize,
+        };
+        desc.layers[0].planes[1] = ffi::AVDRMPlaneDescriptor {
+            object_index: 0,
+            offset: uv_offset as isize,
+            pitch: uv_stride as isize,
+        };
+
+        let mut drm_frame = frame::Video::empty();
+        let drm_ptr = drm_frame.as_mut_ptr();
+        (*drm_ptr).format = ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
+        (*drm_ptr).width = width as i32;
+        (*drm_ptr).height = height as i32;
+        (*drm_ptr).data[0] = desc.as_mut() as *mut ffi::AVDRMFrameDescriptor as *mut u8;
+
+        let mut hw_frame = frame::Video::empty();
+        let hw_ptr = hw_frame.as_mut_ptr();
+        let ret = ffi::av_hwframe_get_buffer(hw_frames_ctx, hw_ptr, 0);
+        if ret < 0 {
+            libc::close(desc.objects[0].fd);
+            return Err(ffmpeg::Error::from(ret));
+        }
+
+        let ret = ffi::av_hwframe_map(hw_ptr, drm_ptr, ffi::AV_HWFRAME_MAP_READ as i32);
+        libc::close(desc.objects[0].fd);
+        (*drm_ptr).data[0] = ptr::null_mut();
+
+        if ret < 0 {
+            return Err(ffmpeg::Error::from(ret));
+        }
+
+        hw_frame.set_pts(Some(pts));
+        if force_idr {
+            (*hw_ptr).pict_type = ffi::AVPictureType::AV_PICTURE_TYPE_I;
+            (*hw_ptr).flags |= ffi::AV_FRAME_FLAG_KEY;
+        }
+
+        Ok(hw_frame)
+    }
+
     // -----------------------------------------------------------------------
     // VA-API encode path
     // -----------------------------------------------------------------------
