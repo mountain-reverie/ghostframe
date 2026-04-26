@@ -1,0 +1,97 @@
+// bgra_to_nv12.comp
+// Convert a BGRA (B8G8R8A8_UNORM) storage image to a packed NV12 buffer.
+//
+// VkImage is B8G8R8A8_UNORM so imageLoad returns vec4(B, G, R, A) in [0,1].
+//
+// Workgroup: 2x2 — each workgroup processes one 2x2 pixel block.
+// Dispatch:  (width/2, height/2, 1) workgroups.
+//
+// Bindings:
+//   0 — rgba8 readonly storage image  (BGRA input)
+//   1 — std430 storage buffer         (NV12 output: Y plane then UV plane)
+//
+// Push constants (20 bytes):
+//   width, height, y_stride, uv_offset, uv_stride
+//
+// Color conversion: BT.601 full range
+//   R = bgra.b,  G = bgra.g,  B = bgra.r   (channel swap — see above)
+//   Y  =  0.299*R + 0.587*G + 0.114*B
+//   U  = -0.169*R - 0.331*G + 0.500*B + 0.502
+//   V  =  0.500*R - 0.419*G - 0.081*B + 0.502
+//
+// Byte writes use atomicAnd+atomicOr to safely merge individual bytes into the
+// u32 array without races between adjacent workgroups.
+
+#version 450
+
+layout(local_size_x = 2, local_size_y = 2, local_size_z = 1) in;
+
+// Binding 0: BGRA input image (B8G8R8A8_UNORM — channels arrive as .r=B, .g=G, .b=R)
+layout(binding = 0, rgba8) readonly uniform image2D bgra_in;
+
+// Binding 1: NV12 output buffer (byte-addressed via u32 words)
+layout(binding = 1, std430) buffer NV12Output {
+    uint data[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    uint y_stride;
+    uint uv_offset;
+    uint uv_stride;
+};
+
+// Write a single byte at byte-address `addr` with value `val` (0–255).
+// Two-step atomic RMW: clear the target byte, then OR in the new value.
+void write_byte(uint addr, uint val) {
+    uint word_addr   = addr / 4u;
+    uint byte_offset = addr % 4u;
+    uint shift       = byte_offset * 8u;
+    atomicAnd(data[word_addr], ~(0xFFu << shift));
+    atomicOr (data[word_addr],  (val   << shift));
+}
+
+void main() {
+    uint lx = gl_LocalInvocationID.x;  // 0 or 1
+    uint ly = gl_LocalInvocationID.y;  // 0 or 1
+
+    // Global pixel coordinates
+    uint px = gl_WorkGroupID.x * 2u + lx;
+    uint py = gl_WorkGroupID.y * 2u + ly;
+
+    // Guard against non-power-of-two dimensions
+    if (px >= width || py >= height) {
+        return;
+    }
+
+    // Load pixel.  imageLoad on B8G8R8A8_UNORM returns vec4(B, G, R, A).
+    vec4 bgra = imageLoad(bgra_in, ivec2(px, py));
+
+    float R = bgra.b;   // red   component lives in the .b channel
+    float G = bgra.g;
+    float B = bgra.r;   // blue  component lives in the .r channel
+
+    // ---- Luma (Y) --------------------------------------------------------
+    float Yf = 0.299 * R + 0.587 * G + 0.114 * B;
+    uint  Y  = uint(clamp(Yf * 255.0 + 0.5, 0.0, 255.0));
+
+    uint y_addr = py * y_stride + px;
+    write_byte(y_addr, Y);
+
+    // ---- Chroma (UV) — only thread (0,0) of each workgroup writes --------
+    if (lx == 0u && ly == 0u) {
+        float Uf = -0.169 * R - 0.331 * G + 0.500 * B + 0.502;
+        float Vf =  0.500 * R - 0.419 * G - 0.081 * B + 0.502;
+
+        uint U = uint(clamp(Uf * 255.0 + 0.5, 0.0, 255.0));
+        uint V = uint(clamp(Vf * 255.0 + 0.5, 0.0, 255.0));
+
+        // UV row index = py/2, UV column (byte pair) starts at px
+        uint uv_row  = gl_WorkGroupID.y;
+        uint uv_base = uv_offset + uv_row * uv_stride + px;  // px == 2*workgroup_x
+
+        write_byte(uv_base,     U);
+        write_byte(uv_base + 1u, V);
+    }
+}
