@@ -67,6 +67,10 @@ pub struct DirtyTracker {
     cols: u32,
     rows: u32,
     prev_tiles: Vec<u8>,
+    /// True once at least one committing update (`update` or `update_with_hints`)
+    /// has been called. Used to detect the transition out of QUIC slow-start mode,
+    /// where prev_tiles holds all-zeros rather than actual committed pixel data.
+    committed: bool,
 }
 
 impl DirtyTracker {
@@ -75,6 +79,7 @@ impl DirtyTracker {
             cols,
             rows,
             prev_tiles: Vec::new(),
+            committed: false,
         }
     }
 
@@ -82,12 +87,21 @@ impl DirtyTracker {
         self.cols = cols;
         self.rows = rows;
         self.prev_tiles.clear();
+        self.committed = false;
     }
 
     /// Clear all stored state so the next frame is treated as the first
     /// (all tiles reported dirty). Used when a new client connects.
     pub fn reset(&mut self) {
         self.prev_tiles.clear();
+        self.committed = false;
+    }
+
+    /// Returns true if at least one committing update has been performed.
+    /// False means prev_tiles holds all-zeros (QUIC slow-start baseline),
+    /// not actual captured pixel data.
+    pub fn has_been_committed(&self) -> bool {
+        self.committed
     }
 
     pub fn update(&mut self, pixels: &[u8], stride: u32, width: u32, height: u32) -> Vec<(u32, u32)> {
@@ -123,6 +137,9 @@ impl DirtyTracker {
                 }
                 dirty.push((tile_x, tile_y));
             }
+        }
+        if commit {
+            self.committed = true;
         }
         dirty
     }
@@ -183,6 +200,9 @@ impl DirtyTracker {
                 }
                 dirty.push((tile_x, tile_y));
             }
+        }
+        if commit {
+            self.committed = true;
         }
         dirty
     }

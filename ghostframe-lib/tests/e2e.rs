@@ -735,7 +735,6 @@ fn luminance(c: &serde_json::Value) -> f64 {
     0.2126 * r + 0.7152 * g + 0.0722 * b
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 enum RegionCheck {
     /// Every sampled pixel must be solidly red.
@@ -748,7 +747,6 @@ enum RegionCheck {
     Changing,
 }
 
-#[allow(dead_code)]
 async fn assert_region_rendered(
     page: &chromiumoxide::Page,
     region: &ghostframe_test_pattern::mixed::Region,
@@ -908,6 +906,33 @@ async fn e2e_fec_parity_enabled() -> Result<()> {
     let scan: serde_json::Value = setup.page.evaluate(scan_js).await?.into_value()?;
     let found = scan.get("found").and_then(|v| v.as_bool()).unwrap_or(false);
     assert!(found, "no red pixel found — FEC parity may have broken the H.264 pipeline");
+
+    Ok(())
+}
+
+/// Mixed-content rendering test. Pre-M3 (single codec) the assertion is
+/// per-region rendering correctness. Post-M3 the same REGIONS table will
+/// drive codec-selection assertions via a future stats channel — see
+/// `Region::expected_codec`.
+#[tokio::test]
+async fn e2e_multi_pattern() -> Result<()> {
+    use ghostframe_test_pattern::mixed::{region, SETTLE};
+
+    let setup = setup_e2e("--mixed").await?;
+
+    // SETTLE is 7s — enough for QUIC slow-start to open and at least two
+    // spinner frames to land.
+    tokio::time::sleep(SETTLE).await;
+
+    assert_region_rendered(&setup.page, region("solid"),    RegionCheck::SolidRed).await?;
+    assert_region_rendered(&setup.page, region("text"),     RegionCheck::Legible).await?;
+    assert_region_rendered(&setup.page, region("gradient"), RegionCheck::SmoothGradient).await?;
+    assert_region_rendered(&setup.page, region("spinner"),  RegionCheck::Changing).await?;
+
+    // TODO(M3): once the classifier ships, also assert that each region's
+    //           tiles are encoded with `region.expected_codec`. Will require
+    //           a per-tile codec stats channel from server → test (not
+    //           shipped pre-M3).
 
     Ok(())
 }

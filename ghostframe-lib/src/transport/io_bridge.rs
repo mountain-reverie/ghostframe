@@ -286,8 +286,20 @@ impl IoBridge {
         // Determine dirty tiles (only after confirming we have a connected session).
         // During slow-start (no_commit), ignore damage hints and do full-frame
         // comparison without committing, so unsent tiles stay dirty.
+        //
+        // On the first commit frame after slow-start ends, do a full-frame scan
+        // regardless of XDamage hints. During no-commit mode prev_tiles is never
+        // updated (it stays all-zeros), so switching immediately to hinted mode
+        // would only check the animated region (e.g. spinner) and silently skip
+        // static regions — leaving solid/text/gradient tiles committed as zeros and
+        // never retransmitted. A full scan at the transition commits every tile.
         let dirty_tiles = if no_commit {
             self.dirty_tracker.update_no_commit(
+                &frame.pixels, frame.stride, frame.width, frame.height,
+            )
+        } else if !self.dirty_tracker.has_been_committed() {
+            // First commit frame: full scan so every tile is flushed from baseline.
+            self.dirty_tracker.update(
                 &frame.pixels, frame.stride, frame.width, frame.height,
             )
         } else {
