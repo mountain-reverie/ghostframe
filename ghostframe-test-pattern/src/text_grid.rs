@@ -40,6 +40,7 @@ pub fn glyph_pixel(n: usize, px: u32, py: u32) -> (u32, u32) {
 
 /// Hand-picked sample positions. The e2e test asserts contrast across these
 /// pairs: each ink pixel paired with a same-row background pixel.
+#[derive(Debug)]
 pub struct SamplePair {
     pub ink: (u32, u32),
     pub bg: (u32, u32),
@@ -50,18 +51,22 @@ pub struct SamplePair {
 /// caught here, not papered over.
 ///
 /// Positions chosen on this string ("GHOSTFRAME / TILE / TEST"):
-///   index 0 = 'G'  — top-left bowl of the G is ink at glyph-px (1,0)
-///   index 6 = 'A'  — apex pixel at glyph-px (2,1)
-///   index 14 = 'T' — crossbar at glyph-px (1,0)
-///   index 20 = 'T' — same letter, different position
+///   index 0  = 'G' — second pixel of top arc:  glyph-px (1,0) is ink,
+///                    leftmost pixel glyph-px (0,0) is bg.
+///   index 7  = 'A' — apex row glyph-px (2,0) is ink (row0=0b001100),
+///                    leftmost pixel glyph-px (0,0) is bg.
+///   index 14 = 'I' — second pixel of top serif: glyph-px (1,0) is ink
+///                    (row0=0b011110), leftmost glyph-px (0,1) is bg.
+///   index 20 = 'T' — crossbar glyph-px (1,0) is ink (row0=0b111111),
+///                    body-below glyph-px (0,1) is bg (row1=0b001100).
 pub const SAMPLES: &[SamplePair] = &[
     SamplePair {
-        ink: (ORIGIN_X + 1,  ORIGIN_Y + 0),
-        bg:  (ORIGIN_X + 0,  ORIGIN_Y + 0),
+        ink: (ORIGIN_X + 1,              ORIGIN_Y + 0),
+        bg:  (ORIGIN_X + 0,              ORIGIN_Y + 0),
     },
     SamplePair {
-        ink: (ORIGIN_X + 6 * GLYPH_W + 2, ORIGIN_Y + 1),
-        bg:  (ORIGIN_X + 6 * GLYPH_W + 0, ORIGIN_Y + 1),
+        ink: (ORIGIN_X + 7 * GLYPH_W + 2, ORIGIN_Y + 0),
+        bg:  (ORIGIN_X + 7 * GLYPH_W + 0, ORIGIN_Y + 0),
     },
     SamplePair {
         ink: (ORIGIN_X + 14 * GLYPH_W + 1, ORIGIN_Y + 0),

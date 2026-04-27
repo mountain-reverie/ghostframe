@@ -661,6 +661,80 @@ async fn e2e_multi_tile_grid() -> Result<()> {
     Ok(())
 }
 
+/// Pre-M3: validate text legibility via per-pixel contrast at known glyph
+/// positions. Post-M3 (CDF 5/3 refinement) this test should be tightened
+/// to assert SSIM > 0.99 against a reference PNG; see TODO below.
+#[tokio::test]
+async fn e2e_text_clarity() -> Result<()> {
+    use ghostframe_test_pattern::text_grid::SAMPLES;
+
+    let setup = setup_e2e("--text-grid").await?;
+
+    // Allow QUIC slow-start + a couple of frames so every glyph tile arrives.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+
+    // ── (a) Per-pair contrast: ink position must be much brighter than bg.
+    for (i, pair) in SAMPLES.iter().enumerate() {
+        let probe_js = format!(
+            r#"
+            (() => {{
+                const canvas = document.getElementById('canvas');
+                const ctx = canvas.getContext('2d');
+                const ink = ctx.getImageData({ix}, {iy}, 1, 1).data;
+                const bg  = ctx.getImageData({bx}, {by}, 1, 1).data;
+                return {{
+                    ink: {{ r: ink[0], g: ink[1], b: ink[2] }},
+                    bg:  {{ r: bg[0],  g: bg[1],  b: bg[2]  }},
+                }};
+            }})()
+            "#,
+            ix = pair.ink.0, iy = pair.ink.1,
+            bx = pair.bg.0,  by = pair.bg.1,
+        );
+        let probe: serde_json::Value = setup.page.evaluate(probe_js.as_str()).await?.into_value()?;
+
+        let ink_lum = luminance(&probe["ink"]);
+        let bg_lum  = luminance(&probe["bg"]);
+
+        assert!(
+            ink_lum - bg_lum > 80.0,
+            "sample {i}: insufficient contrast (ink {ink_lum:.0} - bg {bg_lum:.0}); pair={pair:?}"
+        );
+        assert!(ink_lum > 150.0, "sample {i}: ink too dark — luminance {ink_lum:.0}");
+        assert!(bg_lum  <  80.0, "sample {i}: bg too bright — luminance {bg_lum:.0}");
+    }
+
+    // ── (b) Stability: two snapshots 2s apart must be byte-identical.
+    let hash_js = r#"
+        (() => {
+            const canvas = document.getElementById('canvas');
+            const ctx = canvas.getContext('2d');
+            const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+            let h = 0;
+            for (let i = 0; i < data.length; i++) h = ((h << 5) - h + data[i]) | 0;
+            return h;
+        })()
+    "#;
+    let h1: i64 = setup.page.evaluate(hash_js).await?.into_value()?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let h2: i64 = setup.page.evaluate(hash_js).await?.into_value()?;
+    assert_eq!(h1, h2, "text canvas drifted between snapshots");
+
+    // TODO(M3): replace the contrast check with SSIM > 0.99 against
+    //           tests/fixtures/text_grid_reference.png once CDF 5/3
+    //           refinement is wired and lossless reconstruction works.
+
+    Ok(())
+}
+
+fn luminance(c: &serde_json::Value) -> f64 {
+    let r = c["r"].as_f64().unwrap_or(0.0);
+    let g = c["g"].as_f64().unwrap_or(0.0);
+    let b = c["b"].as_f64().unwrap_or(0.0);
+    // Rec. 709 luma — close enough for "is this pixel ink or bg".
+    0.2126 * r + 0.7152 * g + 0.0722 * b
+}
+
 /// FEC: Verify that XOR parity generation doesn't break the rendering pipeline.
 ///
 /// Forces FEC on via GHOSTFRAME_FEC_K=4 and checks that the H.264 pipeline
