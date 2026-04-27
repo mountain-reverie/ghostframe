@@ -1,0 +1,74 @@
+#version 450
+
+// Each workgroup processes a 2x2 pixel block:
+// - 4 threads produce 4 Y values
+// - Thread (0,0) produces 1 interleaved UV pair from the (0,0) pixel
+//
+// Dispatch: (width/2, height/2, 1) workgroups.
+// Output buffer layout: Y plane at offset 0, UV plane at uv_offset.
+
+layout(local_size_x = 2, local_size_y = 2, local_size_z = 1) in;
+
+// Input: BGRA image (B8G8R8A8_UNORM imported from DMA-BUF).
+// Note: imageLoad on B8G8R8A8_UNORM returns vec4(B, G, R, A) in .rgba.
+layout(binding = 0, rgba8) readonly uniform image2D bgra_input;
+
+// Output: NV12 byte buffer as u32 array (we use atomic byte writes).
+layout(binding = 1, std430) buffer NV12Output { uint data[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    uint y_stride;
+    uint uv_offset;
+    uint uv_stride;
+};
+
+void main() {
+    uint lx = gl_LocalInvocationID.x;
+    uint ly = gl_LocalInvocationID.y;
+    uint local_idx = ly * 2 + lx;
+
+    uint px = gl_WorkGroupID.x * 2 + lx;
+    uint py = gl_WorkGroupID.y * 2 + ly;
+
+    if (px >= width || py >= height) return;
+
+    vec4 bgra = imageLoad(bgra_input, ivec2(px, py));
+    // B8G8R8A8 maps to .r=B, .g=G, .b=R, .a=A
+    float R = bgra.b;
+    float G = bgra.g;
+    float B = bgra.r;
+
+    // BT.601 full range
+    float Y_f = 0.299 * R + 0.587 * G + 0.114 * B;
+    uint y_byte = clamp(uint(Y_f * 255.0 + 0.5), 0u, 255u);
+
+    uint y_addr = py * y_stride + px;
+    uint y_word = y_addr / 4;
+    uint y_off = (y_addr % 4) * 8;
+    atomicAnd(data[y_word], ~(0xFFu << y_off));
+    atomicOr(data[y_word], y_byte << y_off);
+
+    if (local_idx == 0) {
+        float U_f = -0.169 * R - 0.331 * G + 0.500 * B + 0.502;
+        float V_f =  0.500 * R - 0.419 * G - 0.081 * B + 0.502;
+        uint u_byte = clamp(uint(U_f * 255.0 + 0.5), 0u, 255u);
+        uint v_byte = clamp(uint(V_f * 255.0 + 0.5), 0u, 255u);
+
+        uint chroma_x = gl_WorkGroupID.x;
+        uint chroma_y = gl_WorkGroupID.y;
+        uint uv_addr = uv_offset + chroma_y * uv_stride + chroma_x * 2;
+
+        uint u_word = uv_addr / 4;
+        uint u_off = (uv_addr % 4) * 8;
+        atomicAnd(data[u_word], ~(0xFFu << u_off));
+        atomicOr(data[u_word], u_byte << u_off);
+
+        uint v_addr = uv_addr + 1;
+        uint v_word = v_addr / 4;
+        uint v_off = (v_addr % 4) * 8;
+        atomicAnd(data[v_word], ~(0xFFu << v_off));
+        atomicOr(data[v_word], v_byte << v_off);
+    }
+}
