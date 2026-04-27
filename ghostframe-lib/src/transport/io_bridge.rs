@@ -411,18 +411,18 @@ impl IoBridge {
             None => return,
         };
 
-        // GPU pipeline: Vulkan SAD dirty detection
+        // GPU pipeline: Vulkan SAD dirty detection + NV12 conversion
         let processor = self.gpu_frame_processor.as_mut().unwrap();
-        let dirty_tiles = match processor.diff(raw_fd, frame.width, frame.height, frame.stride) {
-            Ok(t) => t,
+        let analysis = match processor.process_frame(raw_fd, frame.width, frame.height, frame.stride) {
+            Ok(a) => a,
             Err(e) => {
-                tracing::warn!("GPU diff failed: {e}, falling back to CPU path");
+                tracing::warn!("GPU process_frame failed: {e}, falling back to CPU path");
                 self.process_frame_cpu(frame);
                 return;
             }
         };
 
-        if dirty_tiles.is_empty() {
+        if analysis.dirty_tiles.is_empty() {
             return;
         }
 
@@ -441,18 +441,20 @@ impl IoBridge {
             }
         }
 
-        // Encode the BGRA DMA-BUF directly via VA-API VPP (zero-copy)
+        // Encode from the GPU-computed NV12 HOST_VISIBLE buffer
         let encoder = self.full_frame_encoder.as_mut().unwrap();
-        let encoded = match encoder.encode_bgra_dmabuf(
-            raw_fd,
-            frame.width,
-            frame.height,
-            frame.stride,
+        let encoded = match encoder.encode_nv12_buffer(
+            analysis.nv12_data,
+            analysis.nv12_width,
+            analysis.nv12_height,
+            analysis.nv12_y_stride,
+            analysis.nv12_uv_stride,
+            analysis.nv12_uv_offset,
         ) {
             Ok(Some(enc)) => enc,
             Ok(None) => return,
             Err(e) => {
-                tracing::warn!("BGRA encode failed: {e}");
+                tracing::warn!("NV12 encode failed: {e}");
                 return;
             }
         };
