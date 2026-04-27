@@ -237,3 +237,49 @@ proptest! {
         prop_assert!(dirty.is_empty(), "out-of-range hint produced dirty tiles: {:?}", dirty);
     }
 }
+
+proptest! {
+    /// Inv 8 supplement: DirtyTracker on padded-stride frames produces the
+    /// same dirty set as on the equivalent packed-stride frame.
+    ///
+    /// Builds two buffers carrying identical visible pixels — one packed
+    /// (stride == width * BPP) and one with row padding — and asserts both
+    /// trackers see the same per-tile change pattern.
+    #[test]
+    fn dirty_packed_vs_padded_match(
+        w in dim(),
+        h in dim(),
+        pad_px in 1u32..=8,
+        flip_x in 0u32..MAX_DIM,
+        flip_y in 0u32..MAX_DIM,
+    ) {
+        let stride_packed = w * BPP;
+        let stride_padded = (w + pad_px) * BPP;
+
+        let mut packed = vec![0u8; (stride_packed * h) as usize];
+        let mut padded = vec![0u8; (stride_padded * h) as usize];
+
+        // Frame A — all zeros (already initialised). Frame B — flip one pixel.
+        let fx = flip_x % w;
+        let fy = flip_y % h;
+        let off_packed = (fy * stride_packed + fx * BPP) as usize;
+        let off_padded = (fy * stride_padded + fx * BPP) as usize;
+
+        let grid = TileGrid::new(w, h);
+        let mut t_packed = DirtyTracker::new(grid.cols, grid.rows);
+        let mut t_padded = DirtyTracker::new(grid.cols, grid.rows);
+
+        // Settle on frame A.
+        let _ = t_packed.update(&packed, stride_packed, w, h);
+        let _ = t_padded.update(&padded, stride_padded, w, h);
+
+        // Apply the same visible pixel change to both.
+        packed[off_packed] = 0xFF;
+        padded[off_padded] = 0xFF;
+
+        let dirty_packed = t_packed.update(&packed, stride_packed, w, h);
+        let dirty_padded = t_padded.update(&padded, stride_padded, w, h);
+
+        prop_assert_eq!(dirty_packed, dirty_padded);
+    }
+}
