@@ -7,6 +7,9 @@
 //! clears it.  This guarantees `XGetImage` on the root returns red pixels
 //! regardless of compositor/WM presence.
 
+#[allow(dead_code)] mod font;
+#[allow(dead_code)] mod text_grid;
+
 use clap::Parser;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::*;
