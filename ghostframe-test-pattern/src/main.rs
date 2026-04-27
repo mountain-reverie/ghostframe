@@ -7,7 +7,7 @@
 //! clears it.  This guarantees `XGetImage` on the root returns red pixels
 //! regardless of compositor/WM presence.
 
-use ghostframe_test_pattern::text_grid;
+use ghostframe_test_pattern::{mixed, text_grid};
 
 use clap::Parser;
 use x11rb::connection::Connection;
@@ -29,6 +29,12 @@ struct Args {
     #[arg(long)]
     text_grid: bool,
 
+    /// Draw the four-region mixed pattern (solid + text + gradient + spinner).
+    /// Spawns the spinner loop forever; mutually exclusive with --solid-red,
+    /// --spinner, --text-grid (those are ignored when --mixed is set).
+    #[arg(long)]
+    mixed: bool,
+
     /// (Ignored — kept for CLI compat.) Window width.
     #[arg(long, default_value = "640")]
     width: u16,
@@ -43,6 +49,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (conn, screen_num) = x11rb::connect(None)?;
     let screen = &conn.setup().roots[screen_num];
     let root = screen.root;
+
+    if args.mixed {
+        // Mutually exclusive — render four regions and run the spinner forever.
+        return mixed::render_and_spin(&conn, root);
+    }
 
     if args.solid_red {
         // Paint the root window background red.
