@@ -5,8 +5,8 @@
 
 use proptest::prelude::*;
 
-use super::proptest_strategies::dim;
-use super::{TileGrid, BPP, TILE_BYTES, TILE_SIZE};
+use super::proptest_strategies::{dim, frame_packed, MAX_DIM};
+use super::{DirtyTracker, TileGrid, BPP, TILE_BYTES, TILE_SIZE};
 
 // ── TileGrid ────────────────────────────────────────────────────────────────
 
@@ -92,5 +92,130 @@ proptest! {
             let b = grid.extract_tile(&padded, stride_padded, tx, ty);
             prop_assert_eq!(a, b);
         }
+    }
+}
+
+// ── DirtyTracker ────────────────────────────────────────────────────────────
+
+proptest! {
+    /// Inv 3 (idempotence): same frame submitted twice → second update is empty.
+    #[test]
+    fn dirty_same_frame_twice_clean(frame in frame_packed()) {
+        let grid = TileGrid::new(frame.width, frame.height);
+        let mut tracker = DirtyTracker::new(grid.cols, grid.rows);
+        let _ = tracker.update(&frame.pixels, frame.stride, frame.width, frame.height);
+        let again = tracker.update(&frame.pixels, frame.stride, frame.width, frame.height);
+        prop_assert!(again.is_empty(), "expected no dirty tiles, got {:?}", again);
+    }
+
+    /// Inv 4 (first-frame): first update reports every tile coord exactly once.
+    #[test]
+    fn dirty_first_frame_all_dirty_unique(frame in frame_packed()) {
+        let grid = TileGrid::new(frame.width, frame.height);
+        let mut tracker = DirtyTracker::new(grid.cols, grid.rows);
+        let dirty = tracker.update(&frame.pixels, frame.stride, frame.width, frame.height);
+
+        prop_assert_eq!(dirty.len() as u32, grid.tile_count());
+
+        let mut sorted = dirty.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        prop_assert_eq!(sorted.len(), dirty.len(), "first-frame dirty list had duplicates");
+    }
+
+    /// Inv 5 (hint subset): update_with_hints can only report tiles in the
+    /// hint set, and only those whose pixels actually differ.
+    #[test]
+    fn dirty_with_hints_is_subset(
+        frame_a in frame_packed(),
+        // Force frame_b to share dimensions with frame_a so the tracker isn't reset.
+        delta in proptest::collection::vec(any::<u8>(), 0..1024),
+    ) {
+        let grid = TileGrid::new(frame_a.width, frame_a.height);
+        let mut tracker = DirtyTracker::new(grid.cols, grid.rows);
+        let _ = tracker.update(&frame_a.pixels, frame_a.stride, frame_a.width, frame_a.height);
+
+        // Build frame_b: same buffer with a few bytes overwritten.
+        let mut buf = frame_a.pixels.clone();
+        for (i, b) in delta.iter().enumerate().take(buf.len()) {
+            buf[i] = *b;
+        }
+
+        // Use every grid tile as a hint — equivalent to update().
+        let hints: Vec<_> = grid.iter_coords().collect();
+        let dirty_hints = tracker.update_with_hints(
+            &buf, frame_a.stride, frame_a.width, frame_a.height, &hints,
+        );
+
+        // Every reported tile must appear in the hint set.
+        for d in &dirty_hints {
+            prop_assert!(hints.contains(d), "{:?} reported but not hinted", d);
+        }
+    }
+
+    /// Inv 6 (no_commit idempotent): two consecutive update_no_commit calls
+    /// with the same frame return identical dirty sets.
+    #[test]
+    fn dirty_no_commit_idempotent(
+        frame_a in frame_packed(),
+        frame_b_seed in any::<u8>(),
+    ) {
+        let grid = TileGrid::new(frame_a.width, frame_a.height);
+        let mut tracker = DirtyTracker::new(grid.cols, grid.rows);
+        let _ = tracker.update(&frame_a.pixels, frame_a.stride, frame_a.width, frame_a.height);
+
+        // Frame B differs by overwriting one pixel with a derived value.
+        let mut buf = frame_a.pixels.clone();
+        if !buf.is_empty() {
+            buf[0] = buf[0].wrapping_add(frame_b_seed.max(1));
+        }
+
+        let first = tracker.update_no_commit(&buf, frame_a.stride, frame_a.width, frame_a.height);
+        let second = tracker.update_no_commit(&buf, frame_a.stride, frame_a.width, frame_a.height);
+        prop_assert_eq!(first, second);
+    }
+
+    /// Inv 7 (resize-on-mismatch): submitting a frame at a new (cols, rows)
+    /// resets prior state, so the next update reports every tile dirty.
+    #[test]
+    fn dirty_resize_clears_state(
+        frame_a in frame_packed(),
+        // Small dim deltas guarantee a different (cols, rows).
+        new_w in (TILE_SIZE * 2)..=MAX_DIM,
+        new_h in (TILE_SIZE * 2)..=MAX_DIM,
+    ) {
+        prop_assume!(
+            new_w.div_ceil(TILE_SIZE) != frame_a.width.div_ceil(TILE_SIZE)
+                || new_h.div_ceil(TILE_SIZE) != frame_a.height.div_ceil(TILE_SIZE)
+        );
+
+        let grid_a = TileGrid::new(frame_a.width, frame_a.height);
+        let mut tracker = DirtyTracker::new(grid_a.cols, grid_a.rows);
+        let _ = tracker.update(&frame_a.pixels, frame_a.stride, frame_a.width, frame_a.height);
+
+        let stride_b = new_w * BPP;
+        let buf_b = vec![0u8; (stride_b * new_h) as usize];
+        let dirty = tracker.update(&buf_b, stride_b, new_w, new_h);
+
+        let grid_b = TileGrid::new(new_w, new_h);
+        prop_assert_eq!(dirty.len() as u32, grid_b.tile_count());
+    }
+
+    /// Inv 5 supplement: any hint outside the grid is silently dropped.
+    #[test]
+    fn dirty_with_hints_out_of_range_dropped(
+        frame in frame_packed(),
+        bogus_x in (MAX_DIM / TILE_SIZE + 8)..(MAX_DIM / TILE_SIZE + 32),
+        bogus_y in (MAX_DIM / TILE_SIZE + 8)..(MAX_DIM / TILE_SIZE + 32),
+    ) {
+        let grid = TileGrid::new(frame.width, frame.height);
+        let mut tracker = DirtyTracker::new(grid.cols, grid.rows);
+        let _ = tracker.update(&frame.pixels, frame.stride, frame.width, frame.height);
+
+        let hints = vec![(bogus_x, bogus_y)];
+        let dirty = tracker.update_with_hints(
+            &frame.pixels, frame.stride, frame.width, frame.height, &hints,
+        );
+        prop_assert!(dirty.is_empty(), "out-of-range hint produced dirty tiles: {:?}", dirty);
     }
 }
