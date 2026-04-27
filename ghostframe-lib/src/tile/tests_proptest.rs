@@ -123,33 +123,45 @@ proptest! {
         prop_assert_eq!(sorted.len(), dirty.len(), "first-frame dirty list had duplicates");
     }
 
-    /// Inv 5 (hint subset): update_with_hints can only report tiles in the
-    /// hint set, and only those whose pixels actually differ.
+    /// Inv 5 (hint subset): update_with_hints only reports tiles in the
+    /// hint set, even when un-hinted tiles also have changed pixels.
     #[test]
     fn dirty_with_hints_is_subset(
         frame_a in frame_packed(),
-        // Force frame_b to share dimensions with frame_a so the tracker isn't reset.
+        // delta dirties many tiles indiscriminately so the test exercises
+        // both hinted-and-changed and un-hinted-but-changed cases.
         delta in proptest::collection::vec(any::<u8>(), 0..1024),
+        // hint_mask drives a strict subset of the grid through cycle().
+        hint_mask in proptest::collection::vec(any::<bool>(), 1..=64usize),
     ) {
         let grid = TileGrid::new(frame_a.width, frame_a.height);
         let mut tracker = DirtyTracker::new(grid.cols, grid.rows);
         let _ = tracker.update(&frame_a.pixels, frame_a.stride, frame_a.width, frame_a.height);
 
-        // Build frame_b: same buffer with a few bytes overwritten.
+        // frame_b: same buffer with bytes overwritten — likely dirties most tiles.
         let mut buf = frame_a.pixels.clone();
         for (i, b) in delta.iter().enumerate().take(buf.len()) {
             buf[i] = *b;
         }
 
-        // Use every grid tile as a hint — equivalent to update().
-        let hints: Vec<_> = grid.iter_coords().collect();
-        let dirty_hints = tracker.update_with_hints(
+        // Build the hint subset by zip+cycle of the bool mask over all coords.
+        let all_coords: Vec<(u32, u32)> = grid.iter_coords().collect();
+        let hints: Vec<(u32, u32)> = all_coords.iter()
+            .zip(hint_mask.iter().cycle())
+            .filter_map(|(c, &keep)| if keep { Some(*c) } else { None })
+            .collect();
+        let hint_set: std::collections::HashSet<(u32, u32)> = hints.iter().copied().collect();
+
+        let dirty = tracker.update_with_hints(
             &buf, frame_a.stride, frame_a.width, frame_a.height, &hints,
         );
 
-        // Every reported tile must appear in the hint set.
-        for d in &dirty_hints {
-            prop_assert!(hints.contains(d), "{:?} reported but not hinted", d);
+        for d in &dirty {
+            prop_assert!(
+                hint_set.contains(d),
+                "{:?} reported but not in hint set {:?}",
+                d, hints
+            );
         }
     }
 
@@ -180,7 +192,8 @@ proptest! {
     #[test]
     fn dirty_resize_clears_state(
         frame_a in frame_packed(),
-        // Small dim deltas guarantee a different (cols, rows).
+        // prop_assume! below filters cases where the new grid coincidentally
+        // matches the original tile dimensions.
         new_w in (TILE_SIZE * 2)..=MAX_DIM,
         new_h in (TILE_SIZE * 2)..=MAX_DIM,
     ) {
@@ -199,6 +212,11 @@ proptest! {
 
         let grid_b = TileGrid::new(new_w, new_h);
         prop_assert_eq!(dirty.len() as u32, grid_b.tile_count());
+
+        let mut sorted = dirty.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        prop_assert_eq!(sorted.len(), dirty.len(), "resize first-frame dirty list had duplicates");
     }
 
     /// Inv 5 supplement: any hint outside the grid is silently dropped.
