@@ -285,3 +285,27 @@ proptest! {
         prop_assert_eq!(dirty_packed, dirty_padded);
     }
 }
+
+// ── M3 classifier invariants (TODO) ─────────────────────────────────────────
+//
+// The following properties cannot be implemented today because the types they
+// reference do not exist yet — they will land with the M3 classifier work
+// (§4.2 / §4.3 of docs/specs/ghostframe-initial-spec.md).
+//
+// Add them in the same `proptest! { ... }` style once `TileMetrics` and
+// `CodecState` are defined:
+//
+// * C1 — idle_frames > 0          ⇒ CodecState::Skip
+// * C2 — change_freq < 5 Hz AND
+//        change_magnitude < 0.1
+//        sustained 30 frames      ⇒ never CodecState::H264
+// * C3 — unique_colors == 1       ⇒ CodecState::Solid
+// * C4 — codec selection is a pure function of TileMetrics
+// * C5 — high-frequency low-magnitude (cursor blink) never enters H.264
+// * C6 — H.264 → idle transition must traverse a lossy intermediate codec
+//        before refinement begins
+//
+// Strategies: build a `TileMetrics` strategy in `proptest_strategies.rs`
+// alongside `frame_packed()`. The classifier function under test should
+// accept `&TileMetrics` and a `&CodecState` (current state) and return the
+// next `CodecState`.
