@@ -1,6 +1,6 @@
-//! Headless GPU integration test: DMA-BUF → SAD dirty detection → H.264 encode → fragment.
+//! Headless GPU integration test: DMA-BUF → SAD dirty detection + NV12 conversion → H.264 encode → fragment.
 //!
-//! Exercises the zero-copy GPU pipeline without Docker, X11, or a browser.
+//! Exercises the GPU pipeline without Docker, X11, or a browser.
 //! Uses `memfd_create` to produce memory-backed file descriptors that behave
 //! like DMA-BUFs for the mmap/import path (though they lack GPU-local backing
 //! on most drivers, which is why each test skips gracefully on failure).
@@ -259,8 +259,8 @@ fn gpu_pipeline_full_frame_encode() {
 // Test 3: Full pipeline end-to-end
 // ---------------------------------------------------------------------------
 
-/// Full pipeline: DMA-BUF → GPU dirty detection → full-frame encode → fragment.
-/// This is the path that runs in production on machines with DRM capture.
+/// Full pipeline: DMA-BUF → GPU process_frame (SAD + NV12) → encode_nv12_buffer → fragment.
+/// This is the production path using HOST_VISIBLE NV12 output from the GPU compute shader.
 #[test]
 fn gpu_pipeline_end_to_end() {
     let width = 256u32;
@@ -268,7 +268,7 @@ fn gpu_pipeline_end_to_end() {
     let stride = width * 4;
 
     // 1. Create both components; skip if either fails.
-    let mut tracker = match GpuFrameProcessor::new(512) {
+    let mut processor = match GpuFrameProcessor::new(512) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("Skipping gpu_pipeline_end_to_end (no Vulkan GPU?): {e}");
@@ -288,22 +288,29 @@ fn gpu_pipeline_end_to_end() {
         // 2. First frame: solid cyan
         let fd1 = create_solid_memfd(width, height, 255, 255, 0); // B=255, G=255, R=0
 
-        // 3. Diff → all dirty
-        let dirty = match tracker.diff(fd1, width, height, stride) {
-            Ok(v) => v,
+        // 3. process_frame → dirty tiles + NV12 data
+        let analysis = match processor.process_frame(fd1, width, height, stride) {
+            Ok(a) => a,
             Err(e) => {
                 libc::close(fd1);
                 eprintln!("Skipping gpu_pipeline_end_to_end (memfd not accepted as DMA-BUF): {e}");
                 return;
             }
         };
-        assert!(!dirty.is_empty(), "first frame: some tiles must be dirty");
+        assert!(!analysis.dirty_tiles.is_empty(), "first frame: some tiles must be dirty");
+        assert!(!analysis.nv12_data.is_null(), "NV12 data should not be null");
 
-        // Encode — try up to 3 frames for VA-API buffering.
+        // 4. Encode via encode_nv12_buffer — try up to 3 attempts for VA-API buffering.
         let mut frame_output: Option<FullFrameEncoded> = None;
         for _ in 0..3 {
-            libc::lseek(fd1, 0, libc::SEEK_SET);
-            match encoder.encode_frame(fd1, width, height, stride) {
+            match encoder.encode_nv12_buffer(
+                analysis.nv12_data,
+                analysis.nv12_width,
+                analysis.nv12_height,
+                analysis.nv12_y_stride,
+                analysis.nv12_uv_stride,
+                analysis.nv12_uv_offset,
+            ) {
                 Ok(Some(enc)) => {
                     frame_output = Some(enc);
                     break;
@@ -311,7 +318,7 @@ fn gpu_pipeline_end_to_end() {
                 Ok(None) => continue,
                 Err(e) => {
                     libc::close(fd1);
-                    eprintln!("Skipping gpu_pipeline_end_to_end (encode_frame failed): {e}");
+                    eprintln!("Skipping gpu_pipeline_end_to_end (encode_nv12_buffer failed): {e}");
                     return;
                 }
             }
@@ -333,23 +340,24 @@ fn gpu_pipeline_end_to_end() {
             assert!(hdr.is_keyframe(), "first datagram should be marked keyframe");
         }
 
-        // 4. Second frame: same content → no dirty tiles expected
-        let dirty2 = match tracker.diff(fd1, width, height, stride) {
-            Ok(v) => v,
+        // 5. Second frame: same content → no dirty tiles expected
+        let analysis2 = match processor.process_frame(fd1, width, height, stride) {
+            Ok(a) => a,
             Err(e) => {
                 libc::close(fd1);
-                eprintln!("Second diff failed: {e}");
+                eprintln!("Second process_frame failed: {e}");
                 return;
             }
         };
         assert!(
-            dirty2.is_empty(),
-            "static second frame should have no dirty tiles, got: {dirty2:?}"
+            analysis2.dirty_tiles.is_empty(),
+            "static second frame should have no dirty tiles, got: {:?}",
+            analysis2.dirty_tiles
         );
 
         libc::close(fd1);
 
-        // 5. Third frame: change one tile → diff detects change → encode
+        // 6. Third frame: change one tile → process_frame detects change → encode
         let fd2 = create_changed_memfd(
             width, height,
             255, 255, 0, // base: cyan
@@ -357,26 +365,111 @@ fn gpu_pipeline_end_to_end() {
             0, 0, 255,   // change: red (BGRA)
         );
 
-        let dirty3 = match tracker.diff(fd2, width, height, stride) {
-            Ok(v) => v,
+        let analysis3 = match processor.process_frame(fd2, width, height, stride) {
+            Ok(a) => a,
             Err(e) => {
                 libc::close(fd2);
-                eprintln!("Third diff failed (non-fatal): {e}");
+                eprintln!("Third process_frame failed (non-fatal): {e}");
                 return;
             }
         };
-        assert!(!dirty3.is_empty(), "changed frame must have at least one dirty tile");
+        assert!(!analysis3.dirty_tiles.is_empty(), "changed frame must have at least one dirty tile");
 
-        // P-frame encode (past frame 0 → not forced IDR unless at GOP boundary)
-        libc::lseek(fd2, 0, libc::SEEK_SET);
-        match encoder.encode_frame(fd2, width, height, stride) {
+        // P-frame encode
+        match encoder.encode_nv12_buffer(
+            analysis3.nv12_data,
+            analysis3.nv12_width,
+            analysis3.nv12_height,
+            analysis3.nv12_y_stride,
+            analysis3.nv12_uv_stride,
+            analysis3.nv12_uv_offset,
+        ) {
             Ok(Some(_)) | Ok(None) => {}
             Err(e) => {
-                eprintln!("Third encode_frame error (non-fatal): {e}");
+                eprintln!("Third encode_nv12_buffer error (non-fatal): {e}");
             }
         }
 
         libc::close(fd2);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 4: NV12 conversion via process_frame
+// ---------------------------------------------------------------------------
+
+/// Verify that process_frame produces non-null NV12 data with correct layout.
+/// Also checks that diff() still works as a wrapper around process_frame.
+#[test]
+fn gpu_pipeline_nv12_conversion() {
+    let width = 128u32;
+    let height = 128u32;
+    let stride = width * 4;
+
+    let mut processor = match GpuFrameProcessor::new(256) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("Skipping gpu_pipeline_nv12_conversion (no Vulkan GPU?): {e}");
+            return;
+        }
+    };
+
+    unsafe {
+        // Solid blue (BGRA: B=255, G=0, R=0, A=255)
+        // Expected Y for pure blue (R=0,G=0,B=1.0): Y = 0.299*0 + 0.587*0 + 0.114*1 = 0.114 → ~29
+        let fd = create_solid_memfd(width, height, 255, 0, 0);
+
+        let analysis = match processor.process_frame(fd, width, height, stride) {
+            Ok(a) => a,
+            Err(e) => {
+                libc::close(fd);
+                eprintln!("Skipping gpu_pipeline_nv12_conversion (memfd not accepted as DMA-BUF): {e}");
+                return;
+            }
+        };
+        libc::close(fd);
+
+        // All tiles dirty on first frame
+        assert_eq!(
+            analysis.dirty_tiles.len(),
+            (width / 32) as usize * (height / 32) as usize,
+            "first frame: all tiles should be dirty"
+        );
+
+        // NV12 pointer must not be null
+        assert!(!analysis.nv12_data.is_null());
+        assert_eq!(analysis.nv12_width, width);
+        assert_eq!(analysis.nv12_height, height);
+        assert_eq!(analysis.nv12_y_stride, width);
+        assert_eq!(analysis.nv12_uv_stride, width);
+        assert_eq!(analysis.nv12_uv_offset, width * height);
+
+        // Check Y plane average for solid blue
+        let y_slice = std::slice::from_raw_parts(analysis.nv12_data, (width * height) as usize);
+        let y_sum: u64 = y_slice.iter().map(|&b| b as u64).sum();
+        let y_avg = y_sum / y_slice.len() as u64;
+        // BT.601 pure blue Y ≈ 29; allow generous tolerance for GPU rounding
+        assert!(
+            y_avg < 60,
+            "Y for solid blue should be ~29 (low luminance), got avg {y_avg}"
+        );
+
+        // diff() wrapper should still work (returns only dirty tiles)
+        let fd2 = create_solid_memfd(width, height, 255, 0, 0); // same content
+        let dirty = match processor.diff(fd2, width, height, stride) {
+            Ok(v) => v,
+            Err(e) => {
+                libc::close(fd2);
+                eprintln!("diff() wrapper failed: {e}");
+                return;
+            }
+        };
+        libc::close(fd2);
+
+        assert!(
+            dirty.is_empty(),
+            "identical frame via diff() should produce no dirty tiles, got: {dirty:?}"
+        );
     }
 }
 
