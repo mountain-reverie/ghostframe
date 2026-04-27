@@ -274,12 +274,14 @@ proptest! {
         let _ = t_padded.update(&padded, stride_padded, w, h);
 
         // Apply the same visible pixel change to both.
-        packed[off_packed] = 0xFF;
-        padded[off_padded] = 0xFF;
+        packed[off_packed..off_packed + 4].copy_from_slice(&[0xFF, 0x00, 0x00, 0xFF]);
+        padded[off_padded..off_padded + 4].copy_from_slice(&[0xFF, 0x00, 0x00, 0xFF]);
 
-        let dirty_packed = t_packed.update(&packed, stride_packed, w, h);
-        let dirty_padded = t_padded.update(&padded, stride_padded, w, h);
+        let mut dirty_packed = t_packed.update(&packed, stride_packed, w, h);
+        let mut dirty_padded = t_padded.update(&padded, stride_padded, w, h);
 
+        dirty_packed.sort_unstable();
+        dirty_padded.sort_unstable();
         prop_assert_eq!(dirty_packed, dirty_padded);
     }
 }
