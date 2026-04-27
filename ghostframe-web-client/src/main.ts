@@ -1,13 +1,8 @@
 import {
-  DATAGRAM_HEADER_SIZE,
-  TILE_HEADER_SIZE,
-  TILE_SIZE,
-  Codec,
-  decodeDatagramHeader,
-  decodeTileHeader,
-  tileKey,
-  TileAssembly,
-  H264TileDecoder,
+  DATAGRAM_HEADER_SIZE, TILE_HEADER_SIZE, TILE_SIZE, Codec,
+  decodeDatagramHeader, decodeTileHeader, tileKey, TileAssembly, H264TileDecoder,
+  FRAME_HEADER_SIZE, TILE_DATAGRAM_FLAG, FrameAssembly,
+  isTileDatagram, decodeFrameHeader, frameKey, FullFrameDecoder,
 } from './decoder';
 import { TileRenderer } from './renderer';
 import { ParityRecovery } from './fec';
@@ -99,6 +94,11 @@ async function main() {
   // Per-tile H.264 decoders
   const h264Decoders = new Map<string, H264TileDecoder>();
 
+  // Full-frame decoder and reassembly state
+  let fullFrameDecoder: FullFrameDecoder | null = null;
+  const frameAssemblies = new Map<string, FrameAssembly>();
+  let latestFullFrameSeq = 0;
+
   function getH264Decoder(tileX: number, tileY: number): H264TileDecoder {
     const key = `${tileX}:${tileY}`;
     let dec = h264Decoders.get(key);
@@ -186,7 +186,88 @@ async function main() {
     }
 
     const view = new DataView(value.buffer, value.byteOffset, value.byteLength);
+
+    // Dispatch: frame-level (bit 31 = 0) or tile-level (bit 31 = 1)
+    if (!isTileDatagram(view, 0)) {
+      // Frame-level datagram
+      if (value.byteLength < FRAME_HEADER_SIZE) continue;
+
+      const frameHdr = decodeFrameHeader(view, 0);
+      lossTracker.onDatagram();
+
+      // Stale frame discard
+      if (frameHdr.frameSeq < latestFullFrameSeq - 2) continue;
+      if (frameHdr.frameSeq > latestFullFrameSeq) {
+        latestFullFrameSeq = frameHdr.frameSeq;
+      }
+
+      // Evict stale frame assemblies
+      for (const [k, asm] of frameAssemblies) {
+        const seq = parseInt(k.split(':')[1], 10);
+        if (seq < latestFullFrameSeq - 2) {
+          if (asm.received < asm.fragments.length) {
+            lossTracker.onStaleTile(asm.fragments.length, asm.received);
+          }
+          frameAssemblies.delete(k);
+        }
+      }
+
+      // Parity datagrams (frag_idx >= frag_total)
+      if (frameHdr.fragIdx >= frameHdr.fragTotal) continue;
+
+      const fKey = frameKey(frameHdr.frameSeq);
+      const payloadOffset = FRAME_HEADER_SIZE;
+      const fragData = new Uint8Array(
+        value.buffer, value.byteOffset + payloadOffset,
+        value.byteLength - payloadOffset,
+      );
+
+      let asm = frameAssemblies.get(fKey);
+      if (!asm) {
+        asm = {
+          header: frameHdr,
+          fragments: new Array(frameHdr.fragTotal).fill(null),
+          received: 0,
+        };
+        frameAssemblies.set(fKey, asm);
+      }
+
+      if (asm.fragments[frameHdr.fragIdx] === null) {
+        asm.fragments[frameHdr.fragIdx] = fragData.slice();
+        asm.received += 1;
+      }
+
+      if (asm.received === frameHdr.fragTotal) {
+        frameAssemblies.delete(fKey);
+
+        const totalLen = asm.fragments.reduce((acc, f) => acc + (f ? f.byteLength : 0), 0);
+        const payload = new Uint8Array(totalLen);
+        let off = 0;
+        for (const frag of asm.fragments) {
+          if (frag) { payload.set(frag, off); off += frag.byteLength; }
+        }
+
+        if (!fullFrameDecoder) {
+          fullFrameDecoder = new FullFrameDecoder((frame: VideoFrame) => {
+            renderer.drawFullFrame(frame);
+          }, 1920, 1080);
+        }
+
+        fullFrameDecoder.decode(payload, asm.header.isKeyframe);
+
+        if (!firstTileRendered) {
+          firstTileRendered = true;
+          log(`First full frame: ${payload.byteLength}B ${asm.header.isKeyframe ? '(keyframe)' : ''}`);
+          statusEl.textContent = 'Receiving frames';
+        }
+      }
+
+      continue; // Don't fall through to tile processing
+    }
+
+    // --- Tile-level datagram processing ---
     const dgramHdr = decodeDatagramHeader(view, 0);
+    dgramHdr.frameSeq = dgramHdr.frameSeq & ~TILE_DATAGRAM_FLAG;
     lossTracker.onDatagram();
     const tileHdr = decodeTileHeader(view, DATAGRAM_HEADER_SIZE);
 

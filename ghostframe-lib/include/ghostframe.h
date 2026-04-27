@@ -18,6 +18,19 @@
 
 #define TILE_HEADER_SIZE 8
 
+/**
+ * Bit 31 of frame_seq distinguishes tile datagrams from frame datagrams.
+ * Frame datagrams: bit 31 = 0. Tile datagrams: bit 31 = 1.
+ */
+#define TILE_DATAGRAM_FLAG (1 << 31)
+
+#define FRAME_HEADER_SIZE 14
+
+/**
+ * NACK message size: frame_seq (4) + frag_idx (2) = 6 bytes.
+ */
+#define NACK_SIZE 6
+
 #define TILE_SIZE 32
 
 #define BPP 4

@@ -84,7 +84,24 @@ impl DirtyTracker {
         self.prev_tiles.clear();
     }
 
+    /// Clear all stored state so the next frame is treated as the first
+    /// (all tiles reported dirty). Used when a new client connects.
+    pub fn reset(&mut self) {
+        self.prev_tiles.clear();
+    }
+
     pub fn update(&mut self, pixels: &[u8], stride: u32, width: u32, height: u32) -> Vec<(u32, u32)> {
+        self.update_inner(pixels, stride, width, height, true)
+    }
+
+    /// Like `update`, but don't store current tiles as prev — dirty tiles will
+    /// remain dirty on the next call. Used during QUIC slow-start where
+    /// datagrams may be silently dropped by congestion control.
+    pub fn update_no_commit(&mut self, pixels: &[u8], stride: u32, width: u32, height: u32) -> Vec<(u32, u32)> {
+        self.update_inner(pixels, stride, width, height, false)
+    }
+
+    fn update_inner(&mut self, pixels: &[u8], stride: u32, width: u32, height: u32, commit: bool) -> Vec<(u32, u32)> {
         let grid = TileGrid::new(width, height);
         if grid.cols != self.cols || grid.rows != self.rows {
             self.resize(grid.cols, grid.rows);
@@ -100,8 +117,10 @@ impl DirtyTracker {
             let current = grid.extract_tile(pixels, stride, tile_x, tile_y);
             let prev = &self.prev_tiles[idx * TILE_BYTES..(idx + 1) * TILE_BYTES];
             if first_frame || prev != current.as_slice() {
-                self.prev_tiles[idx * TILE_BYTES..(idx + 1) * TILE_BYTES]
-                    .copy_from_slice(&current);
+                if commit {
+                    self.prev_tiles[idx * TILE_BYTES..(idx + 1) * TILE_BYTES]
+                        .copy_from_slice(&current);
+                }
                 dirty.push((tile_x, tile_y));
             }
         }
@@ -115,6 +134,30 @@ impl DirtyTracker {
         width: u32,
         height: u32,
         hints: &[(u32, u32)],
+    ) -> Vec<(u32, u32)> {
+        self.update_with_hints_inner(pixels, stride, width, height, hints, true)
+    }
+
+    /// Like `update_with_hints`, but don't commit — see `update_no_commit`.
+    pub fn update_with_hints_no_commit(
+        &mut self,
+        pixels: &[u8],
+        stride: u32,
+        width: u32,
+        height: u32,
+        hints: &[(u32, u32)],
+    ) -> Vec<(u32, u32)> {
+        self.update_with_hints_inner(pixels, stride, width, height, hints, false)
+    }
+
+    fn update_with_hints_inner(
+        &mut self,
+        pixels: &[u8],
+        stride: u32,
+        width: u32,
+        height: u32,
+        hints: &[(u32, u32)],
+        commit: bool,
     ) -> Vec<(u32, u32)> {
         let grid = TileGrid::new(width, height);
         if grid.cols != self.cols || grid.rows != self.rows {
@@ -134,8 +177,10 @@ impl DirtyTracker {
             let current = grid.extract_tile(pixels, stride, tile_x, tile_y);
             let prev = &self.prev_tiles[idx * TILE_BYTES..(idx + 1) * TILE_BYTES];
             if first_frame || prev != current.as_slice() {
-                self.prev_tiles[idx * TILE_BYTES..(idx + 1) * TILE_BYTES]
-                    .copy_from_slice(&current);
+                if commit {
+                    self.prev_tiles[idx * TILE_BYTES..(idx + 1) * TILE_BYTES]
+                        .copy_from_slice(&current);
+                }
                 dirty.push((tile_x, tile_y));
             }
         }

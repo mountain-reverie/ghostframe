@@ -1,0 +1,63 @@
+// tile_sad.comp
+// Compute per-tile Sum of Absolute Differences (SAD) between current and previous frame.
+//
+// Dispatch: one workgroup per tile (ceil(width/32) * ceil(height/32) workgroups).
+// Each thread handles one pixel within the 32x32 tile.
+// Shared memory reduction sums per-pixel differences into a single SAD score per tile.
+
+#version 450
+
+layout(local_size_x = 32, local_size_y = 32, local_size_z = 1) in;
+
+layout(binding = 0, rgba8) readonly uniform image2D current_frame;
+layout(binding = 1, rgba8) readonly uniform image2D prev_frame;
+
+layout(binding = 2, std430) buffer SadOutput {
+    uint sad_values[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint frame_width;
+    uint frame_height;
+    uint cols;  // number of tile columns
+};
+
+shared uint shared_sad[1024]; // 32*32 = 1024 threads per workgroup
+
+void main() {
+    uint local_idx = gl_LocalInvocationID.y * 32 + gl_LocalInvocationID.x;
+    uint tile_x = gl_WorkGroupID.x;
+    uint tile_y = gl_WorkGroupID.y;
+
+    // Pixel coordinates in the frame
+    uint px = tile_x * 32 + gl_LocalInvocationID.x;
+    uint py = tile_y * 32 + gl_LocalInvocationID.y;
+
+    uint diff = 0;
+    if (px < frame_width && py < frame_height) {
+        ivec2 coord = ivec2(px, py);
+        vec4 cur = imageLoad(current_frame, coord);
+        vec4 prev = imageLoad(prev_frame, coord);
+
+        // SAD over RGB channels (ignore alpha), scale from [0,1] to [0,255]
+        diff = uint(abs(cur.r - prev.r) * 255.0)
+             + uint(abs(cur.g - prev.g) * 255.0)
+             + uint(abs(cur.b - prev.b) * 255.0);
+    }
+
+    shared_sad[local_idx] = diff;
+    barrier();
+
+    // Parallel reduction (sum)
+    for (uint stride = 512; stride > 0; stride >>= 1) {
+        if (local_idx < stride) {
+            shared_sad[local_idx] += shared_sad[local_idx + stride];
+        }
+        barrier();
+    }
+
+    if (local_idx == 0) {
+        uint tile_idx = tile_y * cols + tile_x;
+        sad_values[tile_idx] = shared_sad[0];
+    }
+}

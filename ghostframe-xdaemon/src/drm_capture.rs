@@ -63,16 +63,26 @@ pub fn capture_prime_fd() -> std::io::Result<(OwnedFd, FbGeometry)> {
             None => continue,
         };
 
-        let fb_info = card.get_framebuffer(fb_handle)?;
-        let (width, height) = fb_info.size();
-        let stride = fb_info.pitch();
-
-        // Export the GEM buffer handle as a PRIME fd (DMA-BUF).
-        let buf_handle = fb_info
-            .buffer()
-            .ok_or_else(|| std::io::Error::other("framebuffer has no backing buffer handle"))?;
-
-        let prime_fd = card.buffer_to_prime_fd(buf_handle, 0)?;
+        // Try FB2 (drmModeGetFB2) first — handles GBM/multi-plane framebuffers
+        // that the modern modesetting driver creates. Fall back to legacy FB1.
+        let (width, height, stride, prime_fd) =
+            if let Ok(fb2) = card.get_planar_framebuffer(fb_handle) {
+                let (w, h) = fb2.size();
+                let s = fb2.pitches()[0];
+                let buf_handle = fb2.buffers()[0]
+                    .ok_or_else(|| std::io::Error::other("FB2 plane 0 has no buffer handle"))?;
+                let fd = card.buffer_to_prime_fd(buf_handle, 0)?;
+                (w, h, s, fd)
+            } else {
+                let fb_info = card.get_framebuffer(fb_handle)?;
+                let (w, h) = fb_info.size();
+                let s = fb_info.pitch();
+                let buf_handle = fb_info
+                    .buffer()
+                    .ok_or_else(|| std::io::Error::other("FB1 has no backing buffer handle"))?;
+                let fd = card.buffer_to_prime_fd(buf_handle, 0)?;
+                (w, h, s, fd)
+            };
 
         tracing::info!(
             width,

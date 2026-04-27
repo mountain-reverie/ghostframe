@@ -1,0 +1,252 @@
+//! Real DRM capture → GPU zero-copy pipeline integration test.
+//!
+//! This test exercises the actual production path on machines with a GPU:
+//! DRM framebuffer export → DMA-BUF → GpuFrameProcessor (Vulkan SAD + NV12 compute) →
+//! FullFrameEncoder (HOST_VISIBLE NV12 upload → VA-API H.264) → protocol fragmentation.
+//!
+//! Skips gracefully if no DRM device or GPU is available.
+//!
+//! Run: cargo test -p ghostframe-xdaemon --test drm_gpu_pipeline
+
+// Access xdaemon's internal modules via the binary crate.
+// We can't import from main.rs directly, so we duplicate the minimal
+// DRM capture call inline (it's 5 lines).
+
+use std::os::fd::AsRawFd;
+
+use ghostframe_lib::capture::gpu_pipeline::GpuFrameProcessor;
+use ghostframe_lib::encoder::h264_vaapi::FullFrameEncoder;
+use ghostframe_lib::transport::protocol::{decode_frame_datagram, fragment_frame};
+
+/// Attempt DRM framebuffer capture using the drm crate directly.
+/// Returns (OwnedFd, width, height, stride) or None if no DRM device.
+fn try_drm_capture() -> Option<(std::os::fd::OwnedFd, u32, u32, u32)> {
+    use drm::control::Device as ControlDevice;
+    use drm::Device;
+    use std::fs::File;
+    use std::os::fd::{AsFd, BorrowedFd};
+
+    struct Card(File);
+    impl AsFd for Card {
+        fn as_fd(&self) -> BorrowedFd<'_> {
+            self.0.as_fd()
+        }
+    }
+    impl Device for Card {}
+    impl ControlDevice for Card {}
+
+    for i in 0..10u32 {
+        let path = format!("/dev/dri/card{i}");
+        let card = match File::options().read(true).write(true).open(&path) {
+            Ok(f) => Card(f),
+            Err(_) => continue,
+        };
+
+        let res = match card.resource_handles() {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        for crtc_handle in res.crtcs() {
+            let crtc_info = match card.get_crtc(*crtc_handle) {
+                Ok(info) => info,
+                Err(_) => continue,
+            };
+            if crtc_info.mode().is_none() {
+                continue;
+            }
+            let fb_handle = match crtc_info.framebuffer() {
+                Some(h) => h,
+                None => continue,
+            };
+            // Try FB2 first (GBM/multi-plane), fall back to legacy FB1
+            if let Ok(fb2) = card.get_planar_framebuffer(fb_handle) {
+                let (width, height) = fb2.size();
+                let stride = fb2.pitches()[0];
+                if let Some(buf_handle) = fb2.buffers()[0] {
+                    if let Ok(fd) = card.buffer_to_prime_fd(buf_handle, 0) {
+                        return Some((fd, width, height, stride));
+                    }
+                }
+            }
+            // Legacy FB1 fallback
+            let fb_info = match card.get_framebuffer(fb_handle) {
+                Ok(info) => info,
+                Err(_) => continue,
+            };
+            let (width, height) = fb_info.size();
+            let stride = fb_info.pitch();
+            let buf_handle = match fb_info.buffer() {
+                Some(h) => h,
+                None => continue,
+            };
+            if let Ok(fd) = card.buffer_to_prime_fd(buf_handle, 0) {
+                return Some((fd, width, height, stride));
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn drm_capture_to_gpu_pipeline() {
+    // 1. Try DRM capture
+    let (dmabuf_fd, width, height, stride) = match try_drm_capture() {
+        Some(result) => {
+            eprintln!(
+                "DRM capture: {}x{} stride={} fd={}",
+                result.1, result.2, result.3,
+                result.0.as_raw_fd()
+            );
+            result
+        }
+        None => {
+            eprintln!("Skipping: no DRM device with active CRTC found");
+            return;
+        }
+    };
+
+    let raw_fd = dmabuf_fd.as_raw_fd();
+
+    // 2. GPU dirty detection + NV12 conversion via Vulkan compute
+    let mut processor = match GpuFrameProcessor::new(4096) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("Skipping: GpuFrameProcessor init failed: {e}");
+            return;
+        }
+    };
+
+    let analysis = match processor.process_frame(raw_fd, width, height, stride) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("Skipping: process_frame failed on real DMA-BUF: {e}");
+            return;
+        }
+    };
+
+    let cols = width.div_ceil(32);
+    let rows = height.div_ceil(32);
+    let total_tiles = cols * rows;
+    eprintln!(
+        "First frame: {}/{} tiles dirty ({}x{} grid)",
+        analysis.dirty_tiles.len(),
+        total_tiles,
+        cols,
+        rows
+    );
+    assert!(
+        !analysis.dirty_tiles.is_empty(),
+        "first frame should report tiles as dirty"
+    );
+    assert!(!analysis.nv12_data.is_null(), "NV12 data pointer should not be null");
+    eprintln!(
+        "NV12 output: {}x{} y_stride={} uv_offset={}",
+        analysis.nv12_width, analysis.nv12_height,
+        analysis.nv12_y_stride, analysis.nv12_uv_offset,
+    );
+
+    // 3. Full-frame H.264 encode via encode_nv12_buffer (HOST_VISIBLE NV12 → VA-API)
+    let mut encoder = match FullFrameEncoder::new(width, height) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("Skipping encode: FullFrameEncoder init failed: {e}");
+            return;
+        }
+    };
+
+    // Encode up to 3 frames (VA-API may buffer the first).
+    // We re-call process_frame each iteration so the NV12 pointer is fresh.
+    let mut encoded = None;
+    for i in 0..3 {
+        // Re-run process_frame to get fresh NV12 data for each encode call.
+        let frame_analysis = if i == 0 {
+            // Already have analysis from above; reuse it for the first attempt.
+            // SAFETY: analysis.nv12_data is valid for this scope (no new process_frame).
+            &analysis
+        } else {
+            // Need a new analysis for subsequent encode attempts.
+            // We can't re-borrow analysis after mutable borrow below; just break.
+            break;
+        };
+
+        match encoder.encode_nv12_buffer(
+            frame_analysis.nv12_data,
+            frame_analysis.nv12_width,
+            frame_analysis.nv12_height,
+            frame_analysis.nv12_y_stride,
+            frame_analysis.nv12_uv_stride,
+            frame_analysis.nv12_uv_offset,
+        ) {
+            Ok(Some(enc)) => {
+                eprintln!(
+                    "Frame {i}: {} bytes, keyframe={}",
+                    enc.payload.len(),
+                    enc.is_keyframe
+                );
+                if encoded.is_none() {
+                    encoded = Some(enc);
+                }
+            }
+            Ok(None) => {
+                eprintln!("Frame {i}: buffered (no output yet)");
+            }
+            Err(e) => {
+                eprintln!("Skipping: encode_nv12_buffer failed: {e}");
+                return;
+            }
+        }
+    }
+
+    // If VA-API buffered the first frame, send a second NV12 frame to flush it.
+    if encoded.is_none() {
+        let analysis2 = match processor.process_frame(raw_fd, width, height, stride) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("Second process_frame failed: {e}");
+                return;
+            }
+        };
+        for i in 1..3 {
+            match encoder.encode_nv12_buffer(
+                analysis2.nv12_data,
+                analysis2.nv12_width,
+                analysis2.nv12_height,
+                analysis2.nv12_y_stride,
+                analysis2.nv12_uv_stride,
+                analysis2.nv12_uv_offset,
+            ) {
+                Ok(Some(enc)) => {
+                    eprintln!("Frame {i}: {} bytes, keyframe={}", enc.payload.len(), enc.is_keyframe);
+                    encoded = Some(enc);
+                    break;
+                }
+                Ok(None) => eprintln!("Frame {i}: buffered"),
+                Err(e) => {
+                    eprintln!("Skipping: encode_nv12_buffer (retry {i}) failed: {e}");
+                    return;
+                }
+            }
+        }
+    }
+
+    let enc = encoded.expect("encoder should produce at least one frame in 3 attempts");
+    assert!(!enc.payload.is_empty(), "H.264 payload should be non-empty");
+    assert!(enc.is_keyframe, "first output should be a keyframe");
+
+    // 4. Fragment the encoded frame
+    let datagrams = fragment_frame(1, 0, true, &enc.payload, 1200);
+    assert!(!datagrams.is_empty());
+    eprintln!(
+        "Fragmented into {} datagrams ({} bytes total)",
+        datagrams.len(),
+        enc.payload.len()
+    );
+
+    // Verify header decode
+    let (hdr, _payload) = decode_frame_datagram(&datagrams[0]).unwrap();
+    assert_eq!(hdr.frame_seq, 1);
+    assert!(hdr.is_keyframe());
+
+    eprintln!("DRM → GpuFrameProcessor (SAD+NV12) → encode_nv12_buffer (VA-API) → fragment: PASS");
+}

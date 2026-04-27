@@ -134,3 +134,94 @@ export class H264TileDecoder {
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// Frame-level protocol (full-frame H.264)
+// ---------------------------------------------------------------------------
+
+export const FRAME_HEADER_SIZE = 14;
+export const TILE_DATAGRAM_FLAG = 0x80000000;
+
+export interface FrameHeader {
+  frameSeq: number;
+  fragIdx: number;
+  fragTotal: number;
+  timestampUs: number;
+  isKeyframe: boolean;
+}
+
+export function isTileDatagram(view: DataView, offset: number): boolean {
+  const firstU32 = view.getUint32(offset, false);
+  return (firstU32 & TILE_DATAGRAM_FLAG) !== 0;
+}
+
+export function decodeFrameHeader(view: DataView, offset: number): FrameHeader {
+  return {
+    frameSeq: view.getUint32(offset, false) & ~TILE_DATAGRAM_FLAG,
+    fragIdx: view.getUint16(offset + 4, false),
+    fragTotal: view.getUint16(offset + 6, false),
+    timestampUs: view.getUint32(offset + 8, false),
+    isKeyframe: (view.getUint8(offset + 12) & 1) !== 0,
+  };
+}
+
+export function frameKey(frameSeq: number): string {
+  return `frame:${frameSeq}`;
+}
+
+export interface FrameAssembly {
+  header: FrameHeader;
+  fragments: (Uint8Array | null)[];
+  received: number;
+}
+
+export class FullFrameDecoder {
+  private decoder: VideoDecoder;
+  private latestFrame: VideoFrame | null = null;
+
+  constructor(
+    private onFrame: (frame: VideoFrame) => void,
+    width: number,
+    height: number,
+  ) {
+    this.decoder = new VideoDecoder({
+      output: (frame: VideoFrame) => {
+        if (this.latestFrame) {
+          this.latestFrame.close();
+        }
+        this.latestFrame = frame;
+        this.onFrame(frame);
+      },
+      error: (e: DOMException) => {
+        console.error('Full-frame H264 decode error:', e.message);
+      },
+    });
+
+    this.decoder.configure({
+      codec: 'avc1.42001e',
+      codedWidth: width,
+      codedHeight: height,
+      optimizeForLatency: true,
+    });
+  }
+
+  decode(nalData: Uint8Array, isKeyframe: boolean) {
+    if (this.decoder.state === 'closed') return;
+    const chunk = new EncodedVideoChunk({
+      type: isKeyframe ? 'key' : 'delta',
+      timestamp: 0,
+      data: nalData,
+    });
+    this.decoder.decode(chunk);
+  }
+
+  close() {
+    if (this.decoder.state !== 'closed') {
+      this.decoder.close();
+    }
+    if (this.latestFrame) {
+      this.latestFrame.close();
+      this.latestFrame = null;
+    }
+  }
+}

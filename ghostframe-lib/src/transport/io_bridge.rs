@@ -15,7 +15,7 @@
 use std::future::{pending, Future};
 use std::io;
 use std::net::SocketAddr;
-use std::os::unix::io::FromRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::pin::Pin;
 use std::time::Instant;
 
@@ -27,17 +27,20 @@ use tokio::net::UnixStream as TokioUnixStream;
 use tokio::sync::mpsc;
 use tokio::time::{sleep_until, Instant as TokioInstant};
 
-use crate::encoder::h264_vaapi::H264VaapiEncoder;
+use crate::capture::gpu_pipeline::GpuFrameProcessor;
+use crate::encoder::h264_vaapi::{FullFrameEncoder, H264VaapiEncoder};
 use crate::server::FrameSubmission;
 use crate::tile::{DirtyTracker, TileGrid};
 use crate::transport::ghostbridge::{
     encode_frame, parse_frame_rest, GhostbridgeConfig, GhostbridgeHandle,
 };
 use crate::transport::fec;
+use crate::transport::fec::fec_group_size;
 use crate::transport::feedback::ReceiverFeedback;
 use crate::transport::protocol::{
-    build_parity_datagrams, Codec, fragment_tile, max_fragment_payload,
-    DATAGRAM_HEADER_SIZE, PING_PAYLOAD, PONG_PAYLOAD, TILE_HEADER_SIZE,
+    build_frame_parity_datagram, build_parity_datagrams, Codec, fragment_frame, fragment_tile,
+    max_fragment_payload, FrameHeader, NackMessage, DATAGRAM_HEADER_SIZE, FRAME_HEADER_SIZE,
+    PING_PAYLOAD, PONG_PAYLOAD, TILE_DATAGRAM_FLAG, TILE_HEADER_SIZE,
 };
 use crate::transport::quic::QuicServer;
 use crate::transport::webtransport::WebTransportServer;
@@ -65,6 +68,10 @@ pub struct IoBridge {
     frame_seq: u32,
     /// Per-tile dirty detection.
     dirty_tracker: DirtyTracker,
+    /// Remaining frames to force all-dirty after a new session connects.
+    /// QUIC slow-start can only deliver a fraction of tiles in the first burst;
+    /// forcing dirty for several frames lets the congestion window open.
+    force_dirty_frames: u32,
     /// Per-tile H.264 encoders, keyed by (tile_x, tile_y). Lazily initialized.
     encoders: HashMap<(u32, u32), H264VaapiEncoder>,
     /// Whether H.264 encoding is available (checked once at startup).
@@ -75,6 +82,12 @@ pub struct IoBridge {
     fec_enable_threshold: f64,
     /// Loss rate threshold to disable FEC (hysteresis).
     fec_disable_threshold: f64,
+    /// GPU-accelerated dirty tracker (Vulkan compute SAD).
+    gpu_frame_processor: Option<GpuFrameProcessor>,
+    /// Full-frame H.264 encoder (VA-API zero-copy).
+    full_frame_encoder: Option<FullFrameEncoder>,
+    /// Recent frame fragments for NACK retransmission. Key: (frame_seq, frag_idx).
+    recent_frame_fragments: HashMap<(u32, u16), Vec<u8>>,
 }
 
 impl IoBridge {
@@ -124,6 +137,11 @@ impl IoBridge {
 
         let h264_available = H264VaapiEncoder::new().is_ok();
 
+        let gpu_frame_processor = GpuFrameProcessor::new(2048 * 2).ok();
+        if gpu_frame_processor.is_some() {
+            tracing::info!("GPU dirty tracker initialized (Vulkan compute SAD)");
+        }
+
         Ok(Self {
             _handle: Some(handle),
             stream,
@@ -133,6 +151,7 @@ impl IoBridge {
             frame_rx: None,
             frame_seq: 0,
             dirty_tracker: DirtyTracker::new(0, 0),
+            force_dirty_frames: 0,
             encoders: HashMap::new(),
             h264_available,
             fec_k: std::env::var("GHOSTFRAME_FEC_K")
@@ -141,6 +160,9 @@ impl IoBridge {
                 .unwrap_or(0),
             fec_enable_threshold: 0.005,
             fec_disable_threshold: 0.002,
+            gpu_frame_processor,
+            full_frame_encoder: None,
+            recent_frame_fragments: HashMap::new(),
         })
     }
 
@@ -169,29 +191,61 @@ impl IoBridge {
     /// A quarter-stream-id up to 63 encodes in 1 byte; we budget 2 for safety.
     const WT_VARINT_OVERHEAD: usize = 2;
 
+    /// Dispatch to GPU or CPU pipeline depending on whether a DMA-BUF fd is
+    /// available and the GPU dirty tracker has been initialized.
     fn process_frame(&mut self, frame: FrameSubmission) {
+        if frame.dmabuf_fd.is_some() && self.gpu_frame_processor.is_some() {
+            self.process_frame_gpu(frame);
+        } else {
+            self.process_frame_cpu(frame);
+        }
+    }
+
+    /// Compute the maximum datagram size from the smallest connected session.
+    fn compute_max_datagram_size(&mut self) -> Option<usize> {
+        let mut min_size: Option<usize> = None;
+        for (handle, wt) in &self.wt_sessions {
+            if !wt.is_connected() {
+                continue;
+            }
+            if let Some(conn) = self.server.connections.get_mut(handle) {
+                if let Some(sz) = conn.datagrams().max_size() {
+                    let usable = sz.saturating_sub(Self::WT_VARINT_OVERHEAD);
+                    min_size = Some(match min_size {
+                        Some(prev) => prev.min(usable),
+                        None => usable,
+                    });
+                }
+            }
+        }
+        min_size.filter(|&sz| sz > 0)
+    }
+
+    /// Send a datagram to all connected WebTransport sessions.
+    fn send_to_all_sessions(&mut self, dg: &[u8]) {
+        for (handle, wt) in &mut self.wt_sessions {
+            if !wt.is_connected() {
+                continue;
+            }
+            if let Some(conn) = self.server.connections.get_mut(handle) {
+                if let Err(e) = wt.send_datagram(conn, dg) {
+                    tracing::trace!(?handle, error = ?e, "datagram send failed");
+                }
+            }
+        }
+    }
+
+    /// CPU-side tile-based pipeline (original implementation).
+    fn process_frame_cpu(&mut self, frame: FrameSubmission) {
         let grid = TileGrid::new(frame.width, frame.height);
         self.frame_seq = self.frame_seq.wrapping_add(1);
         let seq = self.frame_seq;
 
-        // Determine dirty tiles
-        let dirty_tiles = match &frame.damage_tiles {
-            Some(hints) => self.dirty_tracker.update_with_hints(
-                &frame.pixels, frame.stride, frame.width, frame.height, hints,
-            ),
-            None => self.dirty_tracker.update(
-                &frame.pixels, frame.stride, frame.width, frame.height,
-            ),
-        };
-
-        if dirty_tiles.is_empty() {
-            return;
-        }
-
         // Determine the maximum fragment payload from the smallest connected
-        // session's QUIC max datagram size.  We subtract the WebTransport
-        // VarInt prefix and our own headers so the final QUIC DATAGRAM frame
-        // fits within the path MTU.
+        // session's QUIC max datagram size.  Check for connected sessions
+        // BEFORE updating the dirty tracker — otherwise the tracker consumes
+        // frame state even when no client is listening, and once a client
+        // connects the content appears "unchanged" so nothing is ever sent.
         let max_frag = {
             let mut min_size: Option<usize> = None;
             for (handle, wt) in &self.wt_sessions {
@@ -212,12 +266,48 @@ impl IoBridge {
             }
             match min_size {
                 Some(0) | None => {
-                    // No connected sessions or MTU too small — skip frame.
+                    // No connected sessions or MTU too small — skip frame
+                    // without updating dirty tracker state.
                     return;
                 }
                 Some(sz) => sz,
             }
         };
+
+        // During QUIC slow-start after a new session connects, datagrams may
+        // be silently dropped by congestion control. Use no-commit mode so
+        // dropped tiles remain dirty on subsequent frames until the congestion
+        // window opens up enough to deliver them all.
+        let no_commit = self.force_dirty_frames > 0;
+        if no_commit {
+            self.force_dirty_frames -= 1;
+        }
+
+        // Determine dirty tiles (only after confirming we have a connected session).
+        // During slow-start (no_commit), ignore damage hints and do full-frame
+        // comparison without committing, so unsent tiles stay dirty.
+        let dirty_tiles = if no_commit {
+            self.dirty_tracker.update_no_commit(
+                &frame.pixels, frame.stride, frame.width, frame.height,
+            )
+        } else {
+            match &frame.damage_tiles {
+                Some(hints) => {
+                    self.dirty_tracker.update_with_hints(
+                        &frame.pixels, frame.stride, frame.width, frame.height, hints,
+                    )
+                }
+                None => {
+                    self.dirty_tracker.update(
+                        &frame.pixels, frame.stride, frame.width, frame.height,
+                    )
+                }
+            }
+        };
+
+        if dirty_tiles.is_empty() {
+            return;
+        }
 
         // Encode and send only dirty tiles
         for (tile_x, tile_y) in &dirty_tiles {
@@ -252,7 +342,7 @@ impl IoBridge {
             };
 
             let datagrams = fragment_tile(
-                seq,
+                seq | TILE_DATAGRAM_FLAG,
                 *tile_x as u8,
                 *tile_y as u8,
                 codec,
@@ -282,7 +372,7 @@ impl IoBridge {
                 }).collect();
                 let parities = fec::generate_parity(&source_payloads, self.fec_k);
                 let parity_dgs = build_parity_datagrams(
-                    seq,
+                    seq | TILE_DATAGRAM_FLAG,
                     *tile_x as u8,
                     *tile_y as u8,
                     codec,
@@ -303,6 +393,136 @@ impl IoBridge {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// GPU-accelerated full-frame pipeline: Vulkan compute dirty detection +
+    /// VA-API VPP BGRA→NV12 conversion + H.264 encoding (true zero-copy).
+    fn process_frame_gpu(&mut self, frame: FrameSubmission) {
+        let fd = frame.dmabuf_fd.as_ref().unwrap();
+        let raw_fd = fd.as_raw_fd();
+
+        self.frame_seq = self.frame_seq.wrapping_add(1);
+        let seq = self.frame_seq;
+
+        let max_dg_size = match self.compute_max_datagram_size() {
+            Some(sz) => sz,
+            None => return,
+        };
+
+        // GPU pipeline: Vulkan SAD dirty detection + NV12 conversion
+        let processor = self.gpu_frame_processor.as_mut().unwrap();
+        let analysis = match processor.process_frame(raw_fd, frame.width, frame.height, frame.stride) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!("GPU process_frame failed: {e}, falling back to CPU path");
+                self.process_frame_cpu(frame);
+                return;
+            }
+        };
+
+        if analysis.dirty_tiles.is_empty() {
+            return;
+        }
+
+        // Lazily initialize full-frame encoder
+        let needs_init = match &self.full_frame_encoder {
+            Some(enc) => enc.width() != frame.width || enc.height() != frame.height,
+            None => true,
+        };
+        if needs_init {
+            match FullFrameEncoder::new(frame.width, frame.height) {
+                Ok(enc) => { self.full_frame_encoder = Some(enc); }
+                Err(e) => {
+                    tracing::warn!("Full-frame encoder init failed: {e}");
+                    return;
+                }
+            }
+        }
+
+        // Encode from the GPU-computed NV12 HOST_VISIBLE buffer
+        let encoder = self.full_frame_encoder.as_mut().unwrap();
+        let encoded = match encoder.encode_nv12_buffer(
+            analysis.nv12_data,
+            analysis.nv12_width,
+            analysis.nv12_height,
+            analysis.nv12_y_stride,
+            analysis.nv12_uv_stride,
+            analysis.nv12_uv_offset,
+        ) {
+            Ok(Some(enc)) => enc,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!("NV12 encode failed: {e}");
+                return;
+            }
+        };
+
+        // Fragment and send — keep the existing code from here onwards
+        let datagrams = fragment_frame(
+            seq,
+            frame.timestamp_us,
+            encoded.is_keyframe,
+            &encoded.payload,
+            max_dg_size,
+        );
+
+        for dg in &datagrams {
+            self.send_to_all_sessions(dg);
+        }
+
+        // FEC parity
+        let fec_k = fec_group_size(encoded.is_keyframe);
+        if datagrams.len() > 1 {
+            let source_payloads: Vec<&[u8]> = datagrams.iter()
+                .map(|dg| &dg[FRAME_HEADER_SIZE..])
+                .collect();
+            let parities = fec::generate_parity(&source_payloads, fec_k);
+            for (_group_start, parity_payload) in &parities {
+                let parity_dg = build_frame_parity_datagram(
+                    seq, frame.timestamp_us, encoded.is_keyframe,
+                    datagrams.len() as u16, parity_payload,
+                );
+                self.send_to_all_sessions(&parity_dg);
+            }
+        }
+
+        // Store fragments for NACK
+        let oldest_kept = seq.wrapping_sub(3);
+        self.recent_frame_fragments.retain(|(s, _), _| s.wrapping_sub(oldest_kept) <= 3);
+        for dg in &datagrams {
+            if let Ok(hdr) = FrameHeader::decode(dg) {
+                self.recent_frame_fragments.insert((hdr.frame_seq, hdr.frag_idx), dg.clone());
+            }
+        }
+    }
+
+    /// Handle a NACK by retransmitting the requested fragment, but only if
+    /// QUIC RTT is low enough for the retransmission to arrive before the
+    /// next frame. Wired in once client-side NACK sending is integrated.
+    #[allow(dead_code)]
+    fn handle_nack(&mut self, nack: NackMessage, handle: ConnectionHandle) {
+        if let Some(conn) = self.server.connections.get_mut(&handle) {
+            let rtt = conn.stats().path.rtt;
+            let frame_interval = std::time::Duration::from_micros(16_667); // ~60fps
+
+            if rtt < frame_interval {
+                if let Some(dg) = self.recent_frame_fragments.get(&(nack.frame_seq, nack.frag_idx)) {
+                    let dg = dg.clone();
+                    if let Some(wt) = self.wt_sessions.get_mut(&handle) {
+                        let _ = wt.send_datagram(conn, &dg);
+                        tracing::trace!(
+                            frame_seq = nack.frame_seq, frag_idx = nack.frag_idx,
+                            "NACK retransmit"
+                        );
+                    }
+                }
+            } else {
+                tracing::trace!(
+                    ?rtt, frame_seq = nack.frame_seq,
+                    "NACK skipped — RTT too high for retransmission"
+                );
             }
         }
     }
@@ -475,7 +695,18 @@ impl IoBridge {
                         self.wt_sessions.get_mut(&handle),
                         self.server.connections.get_mut(&handle),
                     ) {
+                        let was_connected = wt.is_connected();
                         wt.on_stream_readable(conn, id);
+                        if !was_connected && wt.is_connected() {
+                            // New WebTransport session just became active.
+                            // Reset dirty tracker and force all-dirty for
+                            // several frames so QUIC slow-start can open the
+                            // congestion window. A single burst can't deliver
+                            // all 300+ tiles for a 640x480 screen.
+                            self.dirty_tracker.reset();
+                            self.force_dirty_frames = 20;
+                            tracing::debug!(?handle, "new session connected, dirty tracker reset");
+                        }
                     }
                 }
 
@@ -551,11 +782,15 @@ impl IoBridge {
             frame_rx: None,
             frame_seq: 0,
             dirty_tracker: DirtyTracker::new(0, 0),
+            force_dirty_frames: 0,
             encoders: HashMap::new(),
             h264_available: false,
             fec_k: 0,
             fec_enable_threshold: 0.005,
             fec_disable_threshold: 0.002,
+            gpu_frame_processor: None,
+            full_frame_encoder: None,
+            recent_frame_fragments: HashMap::new(),
         }
     }
 
@@ -573,11 +808,15 @@ impl IoBridge {
             frame_rx: Some(frame_rx),
             frame_seq: 0,
             dirty_tracker: DirtyTracker::new(0, 0),
+            force_dirty_frames: 0,
             encoders: HashMap::new(),
             h264_available: false,
             fec_k: 0,
             fec_enable_threshold: 0.005,
             fec_disable_threshold: 0.002,
+            gpu_frame_processor: None,
+            full_frame_encoder: None,
+            recent_frame_fragments: HashMap::new(),
         }
     }
 
@@ -711,6 +950,7 @@ mod tests {
         let frame = crate::server::FrameSubmission {
             width: 64, height: 64, stride: 64 * 4,
             pixels: vec![0xFF; 64 * 64 * 4],
+            dmabuf_fd: None,
             timestamp_us: 1000,
             damage_tiles: None,
         };
@@ -767,6 +1007,7 @@ mod tests {
         let make_frame = || crate::server::FrameSubmission {
             width: 32, height: 32, stride: 32 * 4,
             pixels: vec![0; 32 * 32 * 4],
+            dmabuf_fd: None,
             timestamp_us: 0,
             damage_tiles: None,
         };
