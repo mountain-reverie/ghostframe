@@ -7,7 +7,7 @@
 //! clears it.  This guarantees `XGetImage` on the root returns red pixels
 //! regardless of compositor/WM presence.
 
-#[allow(dead_code)] mod font;
+mod font;
 #[allow(dead_code)] mod text_grid;
 
 use clap::Parser;
@@ -23,6 +23,12 @@ struct Args {
     /// Draw a cycling-color region that changes every frame (simulates motion).
     #[arg(long)]
     spinner: bool,
+
+    /// Draw a known monospace string at fixed coordinates for the e2e
+    /// text-clarity test. Mutually compatible with --solid-red (text-grid
+    /// is rendered last, after solid-red has cleared the background).
+    #[arg(long)]
+    text_grid: bool,
 
     /// (Ignored — kept for CLI compat.) Window width.
     #[arg(long, default_value = "640")]
@@ -50,6 +56,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         conn.clear_area(false, root, 0, 0, 0, 0)?; // 0,0 = full window
         conn.flush()?;
         eprintln!("test-pattern: root window painted red");
+    }
+
+    if args.text_grid {
+        text_grid::render(&conn, root)?;
     }
 
     if args.spinner {
