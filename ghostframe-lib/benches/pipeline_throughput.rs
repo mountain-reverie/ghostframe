@@ -89,19 +89,26 @@ fn bench_fragment_frame(c: &mut Criterion) {
 
 fn bench_fec_parity(c: &mut Criterion) {
     let mut group = c.benchmark_group("fec_parity");
-    // Simulate a frame split across 64 fragments of 1186 bytes each, K=4.
+
+    // Simulate a frame split across 64 fragments of 1186 bytes each.
+    // K values track production: fec_group_size(true) = I-frame K,
+    // fec_group_size(false) = P-frame K. Benching production constants
+    // means the numbers stay representative if those defaults change.
     let frags: Vec<Vec<u8>> = (0..64).map(|_| vec![0u8; 1186]).collect();
     let total_bytes: u64 = frags.iter().map(|f| f.len() as u64).sum();
-    group.throughput(Throughput::Bytes(total_bytes));
-    group.bench_function("k4_64frags", |b| {
-        b.iter(|| {
-            for chunk in frags.chunks(4) {
-                let refs: Vec<&[u8]> = chunk.iter().map(|v| v.as_slice()).collect();
-                // xor_payloads(payloads, max_len) — second arg is the max payload length to XOR over.
-                black_box(fec::xor_payloads(&refs, 1186));
-            }
+
+    for (label, is_keyframe) in [("iframe", true), ("pframe", false)] {
+        let k = fec::fec_group_size(is_keyframe);
+        group.throughput(Throughput::Bytes(total_bytes));
+        group.bench_with_input(BenchmarkId::from_parameter(label), &k, |b, &k| {
+            b.iter(|| {
+                for chunk in frags.chunks(k) {
+                    let refs: Vec<&[u8]> = chunk.iter().map(|v| v.as_slice()).collect();
+                    black_box(fec::xor_payloads(&refs, 1186));
+                }
+            });
         });
-    });
+    }
     group.finish();
 }
 
