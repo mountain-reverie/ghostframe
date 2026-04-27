@@ -52,3 +52,7 @@ lz4_flex = "0.11"
 [[bench]]
 name = "codec_latency"
 harness = false
+
+[[bench]]
+name = "pipeline_throughput"
+harness = false
