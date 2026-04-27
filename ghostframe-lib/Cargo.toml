@@ -56,3 +56,7 @@ harness = false
 [[bench]]
 name = "pipeline_throughput"
 harness = false
+
+[[bench]]
+name = "codec_callgrind"
+harness = false
