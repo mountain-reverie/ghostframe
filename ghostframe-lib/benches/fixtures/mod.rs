@@ -4,14 +4,12 @@
 //! module (or a sibling file) — no changes needed in the bench files
 //! themselves.
 
-#![allow(dead_code)]
-
-pub mod flat_ui;
-pub mod gradient;
-pub mod motion;
-pub mod photo;
-pub mod solid;
-pub mod text;
+#[allow(dead_code)] pub mod flat_ui;
+#[allow(dead_code)] pub mod gradient;
+#[allow(dead_code)] pub mod motion;
+#[allow(dead_code)] pub mod photo;
+#[allow(dead_code)] pub mod solid;
+#[allow(dead_code)] pub mod text;
 
 /// Edge length of a single tile, in pixels. Mirrors `ghostframe_lib::tile::TILE_SIZE`.
 pub const TILE_SIZE: u32 = 32;
@@ -71,8 +69,15 @@ impl ContentClass {
 /// Trait every bench-able codec implements.
 ///
 /// One instance per codec is created up front; the bench loop calls `encode`
-/// repeatedly. `name` and `lz4` together form the bench-id namespace
-/// (e.g. `h264/text`, `h264+lz4/text`).
+/// repeatedly.
+///
+/// **Display naming contract:** `name()` returns the codec name only (no
+/// suffix). Callers constructing bench-id strings or report headers MUST
+/// check `lz4()` and append `"+lz4"` themselves when the wrapper is active.
+/// Example: `if encoder.lz4() { format!("{}+lz4", encoder.name()) } else { encoder.name().to_string() }`.
+/// Returning a dynamic string from `name()` is not possible because the
+/// `'static` lifetime would force a leak — callers compose the display
+/// name instead.
 pub trait BenchEncoder {
     fn name(&self) -> &'static str;
     fn lz4(&self) -> bool {
