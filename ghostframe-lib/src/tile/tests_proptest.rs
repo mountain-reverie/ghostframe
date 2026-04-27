@@ -5,8 +5,8 @@
 
 use proptest::prelude::*;
 
-use super::proptest_strategies::{damage_hints, dim, frame_packed, frame_padded, Frame, MAX_DIM};
-use super::{DirtyTracker, TileGrid, BPP, TILE_BYTES, TILE_SIZE};
+use super::proptest_strategies::dim;
+use super::{TileGrid, BPP, TILE_BYTES, TILE_SIZE};
 
 // ── TileGrid ────────────────────────────────────────────────────────────────
 
@@ -21,7 +21,8 @@ proptest! {
         prop_assert_eq!(grid.rows, h.div_ceil(TILE_SIZE));
     }
 
-    /// Inv 1b: iter_coords yields exactly tile_count distinct (col, row) pairs.
+    /// Inv 1b: iter_coords yields exactly tile_count distinct (col, row) pairs,
+    /// each within the half-open ranges [0, cols) and [0, rows).
     #[test]
     fn tile_grid_iter_coords_complete(w in dim(), h in dim()) {
         let grid = TileGrid::new(w, h);
@@ -32,6 +33,11 @@ proptest! {
         sorted.sort_unstable();
         sorted.dedup();
         prop_assert_eq!(sorted.len(), coords.len(), "iter_coords yielded duplicates");
+
+        for &(col, row) in &coords {
+            prop_assert!(col < grid.cols, "col {} out of range (cols={})", col, grid.cols);
+            prop_assert!(row < grid.rows, "row {} out of range (rows={})", row, grid.rows);
+        }
     }
 
     /// Inv 2: extract_tile is total — never panics for any in-range coord
