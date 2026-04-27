@@ -5,3 +5,4 @@
 
 pub mod font;
 pub mod text_grid;
+pub mod mixed;
