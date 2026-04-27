@@ -189,6 +189,9 @@ impl DirtyTracker {
 }
 
 #[cfg(test)]
+mod proptest_strategies;
+
+#[cfg(test)]
 mod dirty_tests {
     use super::*;
 
