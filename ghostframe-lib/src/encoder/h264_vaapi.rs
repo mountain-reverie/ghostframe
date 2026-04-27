@@ -16,7 +16,6 @@ use std::sync::Once;
 
 use ffmpeg::codec;
 use ffmpeg::encoder;
-use ffmpeg::filter;
 use ffmpeg::format::Pixel;
 use ffmpeg::frame;
 use ffmpeg::software::scaling;
@@ -450,8 +449,8 @@ const FULL_FRAME_GOP: u32 = 11;
 
 /// Full-frame H.264 encoder.
 ///
-/// Encodes at the native capture resolution using VA-API with DMA-BUF
-/// zero-copy when available, falling back to libx264 otherwise.
+/// Encodes at the native capture resolution using VA-API with NV12 HOST_VISIBLE
+/// buffer upload (from the GPU compute shader) or CPU software fallback.
 pub struct FullFrameEncoder {
     encoder: encoder::Video,
     /// A scaler is only needed on the software path (BGRA → YUV420P).
@@ -463,13 +462,7 @@ pub struct FullFrameEncoder {
     _hw_device_ctx: Option<BufRef>,
     hw_frames_ctx: Option<BufRef>,
     /// DRM device context for DMA-BUF zero-copy import.
-    /// When present, DMA-BUFs are imported via DRM PRIME → VAAPI mapping
-    /// (the VA-API context is derived from this DRM context).
     _drm_device_ctx: Option<BufRef>,
-    /// VAAPI hw_frames_ctx with sw_format=BGRA for VPP input.
-    bgra_hw_frames_ctx: Option<BufRef>,
-    /// VPP filter graph for BGRA→NV12 conversion (lazily initialized).
-    filter_graph: Option<filter::Graph>,
 }
 
 // SAFETY: same reasoning as H264VaapiEncoder.
@@ -582,30 +575,6 @@ impl FullFrameEncoder {
                 }
             };
 
-            // BGRA hw_frames_ctx for VPP input (encode_bgra_dmabuf path)
-            let bgra_frames_ctx = {
-                let ctx = ffi::av_hwframe_ctx_alloc(hw_device_ctx);
-                if ctx.is_null() {
-                    ffi::av_buffer_unref(&mut { hw_frames_ctx });
-                    ffi::av_buffer_unref(&mut { hw_device_ctx });
-                    return Err(ffmpeg::Error::InvalidData);
-                }
-                let frames_ctx = (*ctx).data as *mut ffi::AVHWFramesContext;
-                (*frames_ctx).format = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
-                (*frames_ctx).sw_format = ffi::AVPixelFormat::AV_PIX_FMT_BGRA;
-                (*frames_ctx).width = width as i32;
-                (*frames_ctx).height = height as i32;
-                (*frames_ctx).initial_pool_size = 4;
-                let ret = ffi::av_hwframe_ctx_init(ctx);
-                if ret < 0 {
-                    ffi::av_buffer_unref(&mut { ctx });
-                    ffi::av_buffer_unref(&mut { hw_frames_ctx });
-                    ffi::av_buffer_unref(&mut { hw_device_ctx });
-                    return Err(ffmpeg::Error::from(ret));
-                }
-                ctx
-            };
-
             let mut ctx = codec::context::Context::new_with_codec(enc_codec)
                 .encoder()
                 .video()?;
@@ -619,7 +588,6 @@ impl FullFrameEncoder {
             let ctx_ptr = ctx.as_mut_ptr();
             (*ctx_ptr).hw_frames_ctx = ffi::av_buffer_ref(hw_frames_ctx);
             if (*ctx_ptr).hw_frames_ctx.is_null() {
-                ffi::av_buffer_unref(&mut { bgra_frames_ctx });
                 ffi::av_buffer_unref(&mut { hw_frames_ctx });
                 ffi::av_buffer_unref(&mut { hw_device_ctx });
                 return Err(ffmpeg::Error::InvalidData);
@@ -631,7 +599,6 @@ impl FullFrameEncoder {
             let opened = match ctx.open_with(opts) {
                 Ok(enc) => enc,
                 Err(e) => {
-                    ffi::av_buffer_unref(&mut { bgra_frames_ctx });
                     ffi::av_buffer_unref(&mut { hw_frames_ctx });
                     ffi::av_buffer_unref(&mut { hw_device_ctx });
                     return Err(e);
@@ -648,8 +615,6 @@ impl FullFrameEncoder {
                 _hw_device_ctx: Some(BufRef(hw_device_ctx)),
                 hw_frames_ctx: Some(BufRef(hw_frames_ctx)),
                 _drm_device_ctx: drm_device_ctx.ok().map(BufRef),
-                bgra_hw_frames_ctx: Some(BufRef(bgra_frames_ctx)),
-                filter_graph: None,
             })
         }
     }
@@ -696,8 +661,6 @@ impl FullFrameEncoder {
             _hw_device_ctx: None,
             hw_frames_ctx: None,
             _drm_device_ctx: None,
-            bgra_hw_frames_ctx: None,
-            filter_graph: None,
         })
     }
 
@@ -733,165 +696,96 @@ impl FullFrameEncoder {
         }
     }
 
-    /// Encode a BGRA DMA-BUF directly via VA-API zero-copy import + VPP BGRA→NV12 conversion.
+    /// Encode a full frame from a software NV12 buffer produced by the GPU compute shader.
     ///
-    /// The DMA-BUF must contain BGRA pixel data at `stride` bytes per row.
-    /// VA-API VPP converts BGRA→NV12 on the GPU; no CPU pixel access occurs.
+    /// `nv12_data` points to a HOST_VISIBLE GPU buffer: Y plane at offset 0,
+    /// UV plane at `uv_offset`. The buffer is borrowed — no ownership transfer occurs.
+    ///
+    /// On the VA-API path the NV12 data is uploaded to a VAAPI surface via
+    /// `av_hwframe_transfer_data`. On the software path a CPU YUV420P scaler is
+    /// used instead (for machines without VA-API).
     ///
     /// Returns `Ok(None)` if the encoder buffered the frame without emitting output yet.
-    pub fn encode_bgra_dmabuf(
+    pub fn encode_nv12_buffer(
         &mut self,
-        bgra_fd: RawFd,
+        nv12_data: *const u8,
         width: u32,
         height: u32,
-        stride: u32,
+        y_stride: u32,
+        uv_stride: u32,
+        uv_offset: u32,
     ) -> Result<Option<FullFrameEncoded>, ffmpeg::Error> {
         let pts = self.pts;
         self.pts += 1;
         let force_idr = pts % FULL_FRAME_GOP as i64 == 0;
 
-        if !self.use_vaapi {
-            return Err(ffmpeg::Error::InvalidData);
-        }
-
         unsafe {
-            let bgra_ctx = self.bgra_hw_frames_ctx.as_ref()
-                .expect("use_vaapi but no bgra_hw_frames_ctx");
+            // Build a software NV12 AVFrame whose data pointers point into nv12_data.
+            // We do NOT own this memory — set buf[0] to null so ffmpeg won't free it.
+            let mut sw_frame = frame::Video::empty();
+            let sw_ptr = sw_frame.as_mut_ptr();
+            (*sw_ptr).format = ffi::AVPixelFormat::AV_PIX_FMT_NV12 as i32;
+            (*sw_ptr).width = width as i32;
+            (*sw_ptr).height = height as i32;
+            // Y plane
+            (*sw_ptr).data[0] = nv12_data as *mut u8;
+            (*sw_ptr).linesize[0] = y_stride as i32;
+            // UV plane (interleaved)
+            (*sw_ptr).data[1] = nv12_data.add(uv_offset as usize) as *mut u8;
+            (*sw_ptr).linesize[1] = uv_stride as i32;
 
-            // Build DRM PRIME frame from the BGRA DMA-BUF
-            // DRM_FORMAT_XRGB8888 = fourcc('X','R','2','4') — matches BGRA w/ ignored alpha
-            const DRM_FORMAT_XRGB8888: u32 = 0x34325258;
-            const DRM_FORMAT_MOD_INVALID: u64 = 0x00ffffffffffffff;
-            let buf_size = (height as usize) * (stride as usize);
+            sw_frame.set_pts(Some(pts));
 
-            let mut desc = Box::new(std::mem::zeroed::<ffi::AVDRMFrameDescriptor>());
-            desc.nb_objects = 1;
-            desc.objects[0] = ffi::AVDRMObjectDescriptor {
-                fd: libc::dup(bgra_fd),
-                size: buf_size,
-                format_modifier: DRM_FORMAT_MOD_INVALID,
-            };
-            desc.nb_layers = 1;
-            desc.layers[0].format = DRM_FORMAT_XRGB8888;
-            desc.layers[0].nb_planes = 1;
-            desc.layers[0].planes[0] = ffi::AVDRMPlaneDescriptor {
-                object_index: 0,
-                offset: 0,
-                pitch: stride as isize,
-            };
+            if self.use_vaapi {
+                // Upload software NV12 → VAAPI hardware surface.
+                let hw_frames_ref = self
+                    .hw_frames_ctx
+                    .as_ref()
+                    .expect("use_vaapi but no hw_frames_ctx");
 
-            let mut drm_frame = frame::Video::empty();
-            let drm_ptr = drm_frame.as_mut_ptr();
-            (*drm_ptr).format = ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
-            (*drm_ptr).width = width as i32;
-            (*drm_ptr).height = height as i32;
-            (*drm_ptr).data[0] = desc.as_mut() as *mut ffi::AVDRMFrameDescriptor as *mut u8;
+                let mut hw_frame =
+                    H264VaapiEncoder::upload_to_hw_surface(hw_frames_ref.0, &sw_frame)?;
+                hw_frame.set_pts(Some(pts));
 
-            // Map DRM PRIME → BGRA VAAPI surface
-            let mut bgra_hw = frame::Video::empty();
-            let bgra_ptr = bgra_hw.as_mut_ptr();
-            let ret = ffi::av_hwframe_get_buffer(bgra_ctx.0, bgra_ptr, 0);
-            if ret < 0 {
-                libc::close(desc.objects[0].fd);
-                return Err(ffmpeg::Error::from(ret));
+                if force_idr {
+                    (*hw_frame.as_mut_ptr()).pict_type = ffi::AVPictureType::AV_PICTURE_TYPE_I;
+                    (*hw_frame.as_mut_ptr()).flags |= ffi::AV_FRAME_FLAG_KEY;
+                }
+
+                self.encoder.send_frame(&hw_frame)?;
+            } else {
+                // Software fallback: convert NV12 → YUV420P via swscale.
+                let scaler = self.scaler.get_or_insert_with(|| {
+                    scaling::Context::get(
+                        Pixel::NV12,
+                        width,
+                        height,
+                        Pixel::YUV420P,
+                        width,
+                        height,
+                        scaling::Flags::FAST_BILINEAR,
+                    )
+                    .expect("swscale NV12→YUV420P context failed")
+                });
+
+                let mut yuv_frame = frame::Video::empty();
+                scaler.run(&sw_frame, &mut yuv_frame)?;
+                yuv_frame.set_pts(Some(pts));
+
+                if force_idr {
+                    (*yuv_frame.as_mut_ptr()).pict_type = ffi::AVPictureType::AV_PICTURE_TYPE_I;
+                    (*yuv_frame.as_mut_ptr()).flags |= ffi::AV_FRAME_FLAG_KEY;
+                }
+
+                self.encoder.send_frame(&yuv_frame)?;
             }
-            let ret = ffi::av_hwframe_map(bgra_ptr, drm_ptr, ffi::AV_HWFRAME_MAP_READ as i32);
-            libc::close(desc.objects[0].fd);
-            (*drm_ptr).data[0] = ptr::null_mut();
-            if ret < 0 {
-                return Err(ffmpeg::Error::from(ret));
-            }
-
-            bgra_hw.set_pts(Some(pts));
-
-            // Lazily initialize the VPP filter graph
-            if self.filter_graph.is_none() {
-                let graph = Self::build_vpp_graph(width, height, bgra_ctx.0)?;
-                self.filter_graph = Some(graph);
-            }
-
-            let graph = self.filter_graph.as_mut().unwrap();
-
-            // Push BGRA VAAPI frame into buffer source
-            {
-                let mut src_ctx = graph.get("in").ok_or(ffmpeg::Error::FilterNotFound)?;
-                src_ctx.source().add(&*bgra_hw)?;
-            }
-
-            // Pull NV12 VAAPI frame from buffer sink
-            let mut nv12_hw = frame::Video::empty();
-            {
-                let mut sink_ctx = graph.get("out").ok_or(ffmpeg::Error::FilterNotFound)?;
-                sink_ctx.sink().frame(&mut *nv12_hw)?;
-            }
-
-            nv12_hw.set_pts(Some(pts));
-            if force_idr {
-                (*nv12_hw.as_mut_ptr()).pict_type = ffi::AVPictureType::AV_PICTURE_TYPE_I;
-                (*nv12_hw.as_mut_ptr()).flags |= ffi::AV_FRAME_FLAG_KEY;
-            }
-
-            self.encoder.send_frame(&nv12_hw)?;
         }
 
         self.receive_full_packet()
     }
 
-    /// Build a VPP filter graph: buffer (BGRA VAAPI) → scale_vaapi=format=nv12 → buffersink (NV12 VAAPI).
-    unsafe fn build_vpp_graph(
-        width: u32,
-        height: u32,
-        bgra_frames_ctx: *mut ffi::AVBufferRef,
-    ) -> Result<filter::Graph, ffmpeg::Error> {
-        let mut graph = filter::Graph::new();
-
-        // Buffer source — args describe the input format
-        let args = format!(
-            "video_size={}x{}:pix_fmt={}:time_base=1/60:pixel_aspect=1/1",
-            width,
-            height,
-            ffi::AVPixelFormat::AV_PIX_FMT_VAAPI as i32,
-        );
-        let buffer_filter = filter::find("buffer").ok_or(ffmpeg::Error::FilterNotFound)?;
-        let mut src_ctx = graph.add(&buffer_filter, "in", &args)?;
-
-        // Set hw_frames_ctx on the buffer source so it knows the VAAPI pool
-        {
-            let src_ptr = src_ctx.as_mut_ptr();
-            let params = ffi::av_buffersrc_parameters_alloc();
-            if params.is_null() {
-                return Err(ffmpeg::Error::Bug);
-            }
-            (*params).format = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI as i32;
-            (*params).width = width as i32;
-            (*params).height = height as i32;
-            (*params).hw_frames_ctx = ffi::av_buffer_ref(bgra_frames_ctx);
-            let time_base = ffi::AVRational { num: 1, den: 60 };
-            (*params).time_base = time_base;
-            let ret = ffi::av_buffersrc_parameters_set(src_ptr, params);
-            ffi::av_free(params as *mut _);
-            if ret < 0 {
-                return Err(ffmpeg::Error::from(ret));
-            }
-        }
-
-        // Buffer sink
-        let buffersink_filter = filter::find("buffersink").ok_or(ffmpeg::Error::FilterNotFound)?;
-        let _sink_ctx = graph.add(&buffersink_filter, "out", "")?;
-
-        // Chain: in → scale_vaapi=format=nv12 → out
-        graph
-            .output("in", 0)?
-            .input("out", 0)?
-            .parse("scale_vaapi=format=nv12")?;
-
-        graph.validate()?;
-
-        Ok(graph)
-    }
-
     // -----------------------------------------------------------------------
-    // VA-API encode path
+    // VA-API encode path (encode_frame / encode_vaapi / mmap_scale_upload)
     // -----------------------------------------------------------------------
 
     fn encode_vaapi(
