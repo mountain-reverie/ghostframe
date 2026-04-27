@@ -5,9 +5,12 @@
 
 use criterion::{criterion_group, criterion_main, Criterion};
 
-#[cfg(feature = "gpu-bench")]
+#[cfg(any(feature = "gpu-bench", feature = "m3"))]
 #[path = "fixtures/mod.rs"]
 mod fixtures;
+
+#[cfg(any(feature = "gpu-bench", feature = "m3"))]
+use fixtures::BenchEncoder;
 
 // ── H.264 (per-tile) ───────────────────────────────────────────────────────
 //
@@ -19,7 +22,7 @@ mod fixtures;
 use criterion::{black_box, BenchmarkId};
 
 #[cfg(feature = "gpu-bench")]
-use fixtures::{BenchEncoder, ContentClass, Lz4Wrapper, TILE_BYTES};
+use fixtures::{ContentClass, Lz4Wrapper, TILE_BYTES};
 
 #[cfg(feature = "gpu-bench")]
 struct H264TileEncoder {
@@ -55,6 +58,7 @@ impl BenchEncoder for H264TileEncoder {
 // ── M3 placeholders ─────────────────────────────────────────────────────────
 
 #[cfg(feature = "m3")]
+#[allow(dead_code)]
 struct PalRleEncoder;
 
 #[cfg(feature = "m3")]

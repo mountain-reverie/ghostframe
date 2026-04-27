@@ -4,6 +4,9 @@
 //! module (or a sibling file) — no changes needed in the bench files
 //! themselves.
 
+// Not all items are used under every feature combination; suppress noise.
+#![allow(dead_code)]
+
 #[allow(dead_code)] pub mod flat_ui;
 #[allow(dead_code)] pub mod gradient;
 #[allow(dead_code)] pub mod motion;
