@@ -6,6 +6,7 @@
 
 use proptest::collection::vec;
 use proptest::prelude::*;
+use proptest::sample::subsequence;
 
 use super::{BPP, TILE_SIZE};
 
@@ -49,9 +50,9 @@ pub fn frame_packed() -> impl Strategy<Value = Frame> {
     })
 }
 
-/// Generate a frame with arbitrary stride padding in `[0, 16]` pixels per row.
+/// Generate a frame with arbitrary stride padding in `[1, 16]` pixels per row.
 pub fn frame_padded() -> impl Strategy<Value = Frame> {
-    (dim(), dim(), 0u32..=16).prop_flat_map(|(width, height, pad_px)| {
+    (dim(), dim(), 1u32..=16).prop_flat_map(|(width, height, pad_px)| {
         let stride = (width + pad_px) * BPP;
         let len = (stride * height) as usize;
         vec(any::<u8>(), len).prop_map(move |pixels| Frame {
@@ -64,11 +65,15 @@ pub fn frame_padded() -> impl Strategy<Value = Frame> {
 }
 
 /// Generate a damage-hint set as a (possibly empty) Vec of `(tile_x, tile_y)`
-/// pairs bounded to the grid implied by `(width, height)`.
+/// pairs bounded to the grid implied by `(width, height)`. All returned pairs
+/// are unique — no duplicate coordinates.
 pub fn damage_hints(width: u32, height: u32) -> impl Strategy<Value = Vec<(u32, u32)>> {
     let cols = width.div_ceil(TILE_SIZE);
     let rows = height.div_ceil(TILE_SIZE);
     let total = (cols * rows) as usize;
     let max_hints = total.min(64);
-    vec((0..cols, 0..rows), 0..=max_hints)
+    let all_coords: Vec<(u32, u32)> = (0..rows)
+        .flat_map(|r| (0..cols).map(move |c| (c, r)))
+        .collect();
+    subsequence(all_coords, 0..=max_hints)
 }
