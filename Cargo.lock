@@ -1267,6 +1267,7 @@ dependencies = [
  "ffmpeg-next",
  "ffmpeg-sys-next",
  "futures",
+ "ghostframe-test-pattern",
  "hex",
  "iai-callgrind",
  "libc",

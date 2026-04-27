@@ -3,6 +3,14 @@ name = "ghostframe-test-pattern"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "ghostframe_test_pattern"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ghostframe-test-pattern"
+path = "src/main.rs"
+
 [dependencies]
 x11rb = "0.13"
 clap = { version = "4", features = ["derive"] }
