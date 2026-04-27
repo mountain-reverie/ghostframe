@@ -6,6 +6,14 @@ edition = "2021"
 [lib]
 crate-type = ["cdylib", "staticlib", "rlib"]
 
+[features]
+default = []
+# Enables benches that require real VA-API / Vulkan (skipped on CI without GPU).
+gpu-bench = []
+# Enables benches for codecs not yet implemented (BC1, PalRle, CDF53, Solid).
+# Currently a no-op; flip on as each codec lands in M3.
+m3 = []
+
 [dependencies]
 quinn-proto = { workspace = true }
 tokio = { workspace = true }
@@ -37,3 +45,6 @@ tower-http = { version = "0.6", features = ["fs"] }
 futures = "0.3"
 url = "2"
 proptest = "1"
+criterion = { version = "0.5", features = ["html_reports"] }
+iai-callgrind = "0.14"
+lz4_flex = "0.11"
