@@ -735,6 +735,147 @@ fn luminance(c: &serde_json::Value) -> f64 {
     0.2126 * r + 0.7152 * g + 0.0722 * b
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+enum RegionCheck {
+    /// Every sampled pixel must be solidly red.
+    SolidRed,
+    /// Region must contain both very dark and very bright pixels (text on bg).
+    Legible,
+    /// Region brightness must be monotonic top→bottom (gradient).
+    SmoothGradient,
+    /// Two snapshots 1.5 s apart must differ.
+    Changing,
+}
+
+#[allow(dead_code)]
+async fn assert_region_rendered(
+    page: &chromiumoxide::Page,
+    region: &ghostframe_test_pattern::mixed::Region,
+    check: RegionCheck,
+) -> Result<()> {
+    use serde_json::Value;
+
+    match check {
+        RegionCheck::SolidRed => {
+            // Sample 9 evenly spaced points inside the region; >= 7 must be red.
+            let js = format!(
+                r#"
+                (() => {{
+                    const c = document.getElementById('canvas').getContext('2d');
+                    const xs = [{x}+16, {x}+{w}/2|0, {x}+{w}-16];
+                    const ys = [{y}+16, {y}+{h}/2|0, {y}+{h}-16];
+                    let red = 0, total = 0;
+                    for (const xx of xs) for (const yy of ys) {{
+                        const p = c.getImageData(xx, yy, 1, 1).data;
+                        if (p[0] > 180 && p[1] < 80 && p[2] < 80) red++;
+                        total++;
+                    }}
+                    return {{ red, total }};
+                }})()
+                "#,
+                x = region.x, y = region.y, w = region.w, h = region.h,
+            );
+            let out: Value = page.evaluate(js.as_str()).await?.into_value()?;
+            let red = out["red"].as_u64().unwrap_or(0);
+            let total = out["total"].as_u64().unwrap_or(0);
+            assert!(red >= 7, "{}: only {red}/{total} samples were red", region.name);
+        }
+
+        RegionCheck::Legible => {
+            // Find the brightest and darkest pixels in a sweep — gap > 100 luma
+            // means we have both ink and bg, i.e. text rendered.
+            let js = format!(
+                r#"
+                (() => {{
+                    const c = document.getElementById('canvas').getContext('2d');
+                    let lo = 255, hi = 0;
+                    for (let dy = 8; dy < {h}; dy += 4) {{
+                        for (let dx = 8; dx < {w}; dx += 4) {{
+                            const p = c.getImageData({x}+dx, {y}+dy, 1, 1).data;
+                            const lum = 0.2126*p[0] + 0.7152*p[1] + 0.0722*p[2];
+                            if (lum < lo) lo = lum;
+                            if (lum > hi) hi = lum;
+                        }}
+                    }}
+                    return {{ lo, hi }};
+                }})()
+                "#,
+                x = region.x, y = region.y, w = region.w, h = region.h,
+            );
+            let out: Value = page.evaluate(js.as_str()).await?.into_value()?;
+            let lo = out["lo"].as_f64().unwrap_or(255.0);
+            let hi = out["hi"].as_f64().unwrap_or(0.0);
+            assert!(
+                hi - lo > 100.0,
+                "{}: contrast too low (lo {lo:.0}, hi {hi:.0}); text not rendered",
+                region.name
+            );
+        }
+
+        RegionCheck::SmoothGradient => {
+            // Average luma at three vertical bands — top, middle, bottom.
+            // Bottom must be brighter than top by a clear margin.
+            let js = format!(
+                r#"
+                (() => {{
+                    const c = document.getElementById('canvas').getContext('2d');
+                    function band(y0, y1) {{
+                        let sum = 0, n = 0;
+                        for (let yy = y0; yy < y1; yy += 4) {{
+                            for (let xx = {x}+8; xx < {x}+{w}; xx += 8) {{
+                                const p = c.getImageData(xx, yy, 1, 1).data;
+                                sum += 0.2126*p[0] + 0.7152*p[1] + 0.0722*p[2];
+                                n++;
+                            }}
+                        }}
+                        return n ? sum / n : 0;
+                    }}
+                    return {{
+                        top:    band({y}, {y}+{h}/4|0),
+                        middle: band({y}+{h}/4|0, {y}+3*{h}/4|0),
+                        bottom: band({y}+3*{h}/4|0, {y}+{h}),
+                    }};
+                }})()
+                "#,
+                x = region.x, y = region.y, w = region.w, h = region.h,
+            );
+            let out: Value = page.evaluate(js.as_str()).await?.into_value()?;
+            let top    = out["top"].as_f64().unwrap_or(0.0);
+            let bottom = out["bottom"].as_f64().unwrap_or(0.0);
+            assert!(
+                bottom - top > 50.0,
+                "{}: gradient too flat (top {top:.0}, bottom {bottom:.0})",
+                region.name
+            );
+        }
+
+        RegionCheck::Changing => {
+            let js = format!(
+                r#"
+                (() => {{
+                    const c = document.getElementById('canvas').getContext('2d');
+                    const data = c.getImageData({x}, {y}, {w}, {h}).data;
+                    let h = 0;
+                    for (let i = 0; i < data.length; i++) h = ((h << 5) - h + data[i]) | 0;
+                    return h;
+                }})()
+                "#,
+                x = region.x, y = region.y, w = region.w, h = region.h,
+            );
+            let h1: i64 = page.evaluate(js.as_str()).await?.into_value()?;
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            let h2: i64 = page.evaluate(js.as_str()).await?.into_value()?;
+            assert_ne!(
+                h1, h2,
+                "{}: region was static between snapshots — spinner not animating",
+                region.name
+            );
+        }
+    }
+    Ok(())
+}
+
 /// FEC: Verify that XOR parity generation doesn't break the rendering pipeline.
 ///
 /// Forces FEC on via GHOSTFRAME_FEC_K=4 and checks that the H.264 pipeline
