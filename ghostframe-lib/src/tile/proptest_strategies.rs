@@ -26,6 +26,7 @@ pub struct Frame {
 
 impl Frame {
     /// Number of bytes the buffer must hold for `(stride, height)`.
+    #[allow(dead_code)]
     pub fn buf_len(&self) -> usize {
         (self.stride * self.height) as usize
     }
@@ -51,6 +52,7 @@ pub fn frame_packed() -> impl Strategy<Value = Frame> {
 }
 
 /// Generate a frame with arbitrary stride padding in `[1, 16]` pixels per row.
+#[allow(dead_code)]
 pub fn frame_padded() -> impl Strategy<Value = Frame> {
     (dim(), dim(), 1u32..=16).prop_flat_map(|(width, height, pad_px)| {
         let stride = (width + pad_px) * BPP;
@@ -67,6 +69,7 @@ pub fn frame_padded() -> impl Strategy<Value = Frame> {
 /// Generate a damage-hint set as a (possibly empty) Vec of `(tile_x, tile_y)`
 /// pairs bounded to the grid implied by `(width, height)`. All returned pairs
 /// are unique — no duplicate coordinates.
+#[allow(dead_code)]
 pub fn damage_hints(width: u32, height: u32) -> impl Strategy<Value = Vec<(u32, u32)>> {
     let cols = width.div_ceil(TILE_SIZE);
     let rows = height.div_ceil(TILE_SIZE);
