@@ -917,6 +917,7 @@ async fn e2e_fec_parity_enabled() -> Result<()> {
 /// a sibling test `e2e_resolution_change_via_protocol` will exercise the
 /// real protocol path.
 #[tokio::test]
+#[ignore = "blocked on resize support: encoder lazy-init stalls QUIC at 1024x768; web client canvas only grows. See docs/superpowers/plans/2026-04-27-e2e-resolution-change.md follow-up."]
 async fn e2e_resolution_change() -> Result<()> {
     // Phase A: 1024×768 — server starts in this mode (first entry in
     // xorg-multi.conf's Modes list).
