@@ -51,6 +51,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     xserver-xorg-core \
     xserver-xorg-video-dummy \
+    x11-xserver-utils \
     x11-utils \
     mesa-utils \
     libgl1-mesa-dri \
@@ -67,6 +68,7 @@ COPY --from=builder /build/target/release/ghostframe-test-pattern /usr/local/bin
 COPY tests/containers/test-server/entrypoint.sh /entrypoint.sh
 COPY tests/containers/test-server/xorg.conf /etc/X11/xorg.conf
 COPY tests/containers/test-server/xorg-odd.conf /etc/X11/xorg-odd.conf
+COPY tests/containers/test-server/xorg-multi.conf /etc/X11/xorg-multi.conf
 RUN chmod +x /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]
