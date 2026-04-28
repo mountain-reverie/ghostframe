@@ -88,8 +88,11 @@ async function main() {
   }
 
   const renderer = new TileRenderer(canvasEl);
-  // Default canvas size; will grow as tiles arrive
-  renderer.resize(1280, 720);
+  // Canvas starts at 0×0 and grows as tiles arrive.  Starting at a non-zero
+  // "default" size prevents the canvas from ever shrinking to the actual
+  // frame dimensions (tile pipeline uses Math.max), which breaks resolution-
+  // change detection in tests.
+  renderer.resize(0, 0);
 
   // Per-tile H.264 decoders
   const h264Decoders = new Map<string, H264TileDecoder>();

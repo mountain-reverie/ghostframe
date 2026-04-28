@@ -910,6 +910,101 @@ async fn e2e_fec_parity_enabled() -> Result<()> {
     Ok(())
 }
 
+/// Validates the pipeline survives a mid-stream resolution change.
+///
+/// Pre-M3 there is no client→server `DisplayLayout` protocol — the test
+/// triggers the change via xrandr inside the server container. Post-M4,
+/// a sibling test `e2e_resolution_change_via_protocol` will exercise the
+/// real protocol path.
+#[tokio::test]
+async fn e2e_resolution_change() -> Result<()> {
+    // Phase A: 1024×768 — server starts in this mode (first entry in
+    // xorg-multi.conf's Modes list).
+    let setup = setup_e2e_with_env(
+        "--solid-red",
+        &[("XORG_CONF", "/etc/X11/xorg-multi.conf")],
+    ).await?;
+
+    // Wait for QUIC slow-start + initial frames.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Assert: canvas is 1024×768 and a center pixel is red.
+    let dims_a: (u32, u32) = setup.page
+        .evaluate(r#"
+            (() => {
+                const c = document.getElementById('canvas');
+                return [c.width, c.height];
+            })()
+        "#)
+        .await?
+        .into_value()?;
+    assert_eq!(dims_a, (1024, 768), "phase A: canvas dimensions");
+
+    let red_a: bool = setup.page
+        .evaluate(r#"
+            (() => {
+                const c = document.getElementById('canvas').getContext('2d');
+                const p = c.getImageData(512, 384, 1, 1).data;
+                return p[0] > 180 && p[1] < 80 && p[2] < 80;
+            })()
+        "#)
+        .await?
+        .into_value()?;
+    assert!(red_a, "phase A: center pixel not red");
+
+    // ── Trigger the resolution change. ──────────────────────────────────────
+
+    // 1. xrandr to switch the dummy driver to 640×480.
+    let (out, err, status) = helpers::docker_run_in_container(
+        "ghostframe-server",
+        &[("DISPLAY", ":99")],
+        &["xrandr", "--output", "DUMMY0", "--mode", "640x480"],
+    ).await?;
+    assert_eq!(
+        status, 0,
+        "xrandr exited with {status}: stdout={out:?} stderr={err:?}"
+    );
+
+    // 2. Re-paint the root window — dummy driver clears framebuffer on mode change.
+    let (_, _, status) = helpers::docker_run_in_container(
+        "ghostframe-server",
+        &[("DISPLAY", ":99")],
+        &["/usr/local/bin/ghostframe-test-pattern", "--solid-red"],
+    ).await?;
+    // The test-pattern process forks/daemonises; if status != 0 the binary failed.
+    assert_eq!(status, 0, "re-paint after resolution change failed");
+
+    // ── Phase B: assert the client picks up the new dimensions. ─────────────
+
+    // Allow time for: encoder reset, keyframe, several frames, canvas resize.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    let dims_b: (u32, u32) = setup.page
+        .evaluate(r#"
+            (() => {
+                const c = document.getElementById('canvas');
+                return [c.width, c.height];
+            })()
+        "#)
+        .await?
+        .into_value()?;
+    assert_eq!(dims_b, (640, 480), "phase B: canvas did not resize to 640x480");
+
+    let red_b: bool = setup.page
+        .evaluate(r#"
+            (() => {
+                const c = document.getElementById('canvas').getContext('2d');
+                const p = c.getImageData(320, 240, 1, 1).data;
+                return p[0] > 180 && p[1] < 80 && p[2] < 80;
+            })()
+        "#)
+        .await?
+        .into_value()?;
+    assert!(red_b, "phase B: center pixel not red after resize");
+
+    Ok(())
+}
+
 /// Mixed-content rendering test. Pre-M3 (single codec) the assertion is
 /// per-region rendering correctness. Post-M3 the same REGIONS table will
 /// drive codec-selection assertions via a future stats channel — see
