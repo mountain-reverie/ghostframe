@@ -193,3 +193,28 @@ pub async fn start_static_server(dir: impl AsRef<Path>) -> Result<SocketAddr> {
     });
     Ok(addr)
 }
+
+/// Run `docker exec [-e <env>...] <container> <args...>` against an
+/// already-running container, and return `(stdout, stderr, exit_code)`.
+///
+/// Uses `tokio::process::Command` (no shell — args are passed directly to
+/// `execve`). Pass environment variables as `("KEY", "value")` tuples —
+/// useful for invoking X11 client tools that need `DISPLAY=:99`.
+pub async fn docker_run_in_container(
+    container: &str,
+    env: &[(&str, &str)],
+    args: &[&str],
+) -> Result<(String, String, i32)> {
+    let mut cmd = tokio::process::Command::new("docker");
+    cmd.arg("exec");
+    for (k, v) in env {
+        cmd.arg("-e").arg(format!("{k}={v}"));
+    }
+    cmd.arg(container).args(args);
+    let out = cmd.output().await.context("running docker exec")?;
+    Ok((
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+        out.status.code().unwrap_or(-1),
+    ))
+}
