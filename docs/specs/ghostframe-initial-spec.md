@@ -699,12 +699,34 @@ For non-H.264 tiles (palettized RLE, BC1, CDF 5/3), the GPU compute shader produ
 | Rate control | CBR | Predictable bandwidth |
 | B-frames | None (`ip_period=1`) | Minimum latency |
 | GOP | Infinite + intra-refresh | No IDR bitrate spikes |
-| Intra refresh | Rolling row | Spread I-data across frames |
-| Slices | 1 per frame | Simplicity |
+| Intra refresh | Rolling row | Spread I-data across frames (full cycle default: 60 frames = ~1s at 60fps) |
+| Slices | Multiple, MTU-sized (~1200 bytes each) | Limits packet-loss blast radius to one slice |
 | Latency preset | Ultra-low | VA: `VA_ENC_TUNING_LOW_LATENCY`; NVENC: `NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY` |
 | VBV buffer size | `bitrate / fps` | Single-frame buffer |
 
-**Reference frame invalidation (NVENC):** When client reports packet loss, encoder invalidates the lost reference frame and uses the last-acknowledged frame as reference. Avoids full IDR.
+**Error resilience strategy (layered):**
+
+1. **Intra refresh (primary).** The encoder continuously refreshes a band of macroblocks as intra-coded, cycling across the full frame. If packets are lost, the corruption is limited to the affected region and gets repaired within one intra-refresh cycle. No keyframes, no full-frame dependency chain, no IDR bandwidth spikes. This is the single most important error resilience mechanism for low-latency H.264 streaming.
+
+2. **Reference frame invalidation (NVENC/VA-API).** When client reports packet loss, encoder invalidates the lost reference frame and uses the last-acknowledged frame as reference. Avoids full IDR. This is a fast-path recovery that works within 1-2 frames.
+
+3. **Application-level retransmission (existing).** Lost H.264 fragment datagrams are retried until a new frame supersedes the old one (see section 4.4). During active 60fps streaming, the 16ms inter-frame gap rarely allows successful retransmission. During cooldown (frame rate dropping, transition to idle), inter-frame gaps grow and retries have time to deliver the last complete frame — which becomes the base image for CDF 5/3 wavelet refinement.
+
+4. **Adaptive XOR parity (optional, for WiFi).** When the observed packet loss rate exceeds a threshold (default 0.5%), the server generates XOR parity packets for H.264 frames. Group every K source fragments (default K=4), XOR them to produce one parity fragment. If any single fragment in the group is lost, the receiver recovers it immediately by XORing the parity with the received fragments — no round-trip needed. Overhead: 1/K = 25% at K=4, 12.5% at K=8. Adaptive: parity is only generated when loss is detected and disabled when loss rate drops below threshold. This handles the most common WiFi loss pattern (isolated single-packet drops).
+
+```
+XOR parity for H.264 frame with 16 fragments, K=4:
+
+Source:  [F0] [F1] [F2] [F3]  [F4] [F5] [F6] [F7]  [F8] ...
+Parity:             [P0]                 [P1]              [P2] ...
+         P0 = F0⊕F1⊕F2⊕F3    P1 = F4⊕F5⊕F6⊕F7
+
+If F2 is lost: F2 = P0⊕F0⊕F1⊕F3 (recovered without retransmission)
+If F2 and F3 both lost: cannot recover from single XOR parity
+  → fall back to retransmission or wait for intra refresh
+```
+
+The receiver reports recovered-via-FEC packets separately from received packets in the `ReceiverFeedback` message, so the QUIC congestion controller still sees the loss signal (per QUIC-FEC design principle).
 
 ### 5.3 Non-H.264 Codecs
 
@@ -774,6 +796,22 @@ When running as a compositor module in an existing desktop session, PipeWire is 
 **Encoding (both paths):**
 
 Opus at 64-128 kbit/s, configured with `Application::LowDelay` (5ms frame size for minimum latency, 26.5ms default for better quality). Built-in Packet Loss Concealment handles dropped QUIC datagrams gracefully.
+
+**Audio packet duplication (RED-style loss protection):**
+
+Each Opus packet is sent twice: once immediately, and once duplicated inside the next audio datagram. The receiver discards duplicates by sequence number. This is the same approach as RTP redundant audio (RFC 2198 / RED) used in WebRTC — zero complexity, doubles audio bandwidth (negligible: ~15 kbit/s at 128 kbit/s Opus), and eliminates audio glitches from single-packet losses. Isolated packet loss is the dominant WiFi loss pattern, and Opus packets are tiny (~80-160 bytes per 20ms frame), so the duplication overhead is insignificant compared to video bandwidth.
+
+```
+Datagram N:   [Opus frame N]  [Opus frame N-1 (redundant copy)]
+Datagram N+1: [Opus frame N+1] [Opus frame N (redundant copy)]
+
+If datagram N is lost:
+  → frame N-1 already delivered by datagram N-1
+  → frame N recovered from redundant copy in datagram N+1
+  → only a burst of 2+ consecutive lost datagrams causes an audio gap
+```
+
+When the bandwidth estimator signals congestion, audio duplication can be disabled to reclaim bandwidth, falling back to Opus's built-in PLC for loss concealment.
 
 **Synchronization:**
 
@@ -862,8 +900,8 @@ loop {
 | Channel | Transport | Content | Priority |
 |---------|-----------|---------|----------|
 | Input | QUIC unidirectional stream (reliable, client→server) | Keyboard, mouse, touch events | 1 (highest) |
-| Video frames | QUIC datagrams (unreliable, app-level retry for H.264) | New/changed tiles + H.264 fragment retries (until superseded) | 2 |
-| Audio | QUIC datagrams (unreliable) | Opus packets | 3 |
+| Video frames | QUIC datagrams (unreliable, app-level retry + adaptive XOR parity for H.264) | New/changed tiles + H.264 fragment retries (until superseded) + XOR parity packets | 2 |
+| Audio | QUIC datagrams (unreliable, RED-style duplication) | Opus packets — each packet sent twice for loss protection | 3 |
 | Cursor | QUIC datagrams (unreliable) | Cursor image + position updates | 4 |
 | Control | QUIC bidirectional stream (reliable) | Session setup, display config, codec negotiation, palette table updates | 4 |
 | Extensions (reliable) | QUIC bidirectional stream per channel | Custom channel data, length-prefixed messages | 5 |
@@ -1151,7 +1189,9 @@ When the delay gradient turns sharply positive (queue building), or when QUIC re
 2. Increase CDF 5/3 quantization on non-text tiles (fewer bit-planes sent)
 3. Pause refinement entirely (zero refinement passes until gradient stabilizes)
 4. Drop Opus audio to lower bitrate (128→64 kbit/s)
-5. Increase tile skip threshold — require higher magnitude to classify as "changed"
+5. Disable audio packet duplication (fall back to Opus PLC)
+6. Disable H.264 XOR parity (save bandwidth, rely on intra refresh + retransmission)
+7. Increase tile skip threshold — require higher magnitude to classify as "changed"
 
 **Recovery (gradual):**
 
@@ -1161,6 +1201,8 @@ When the delay gradient returns to zero/negative and QUIC congestion window grow
 2. Restore tile classification thresholds over 500ms
 3. Resume refinement at 50% of previous rate, increase to full over 2s
 4. Restore Opus bitrate
+5. Re-enable audio packet duplication
+6. Re-enable H.264 XOR parity if loss rate still warrants it
 
 **Receiver feedback message (lightweight, periodic):**
 
@@ -1171,6 +1213,7 @@ pub struct ReceiverFeedback {
     pub timestamp_ns: u64,          // client monotonic clock
     pub datagrams_received: u32,    // since last feedback
     pub datagrams_lost: u32,        // gaps detected in sequence numbers
+    pub datagrams_recovered_fec: u32, // recovered via XOR parity (not counted as received for congestion control)
     pub min_one_way_delay_us: u32,  // minimum OWD in this interval
     pub max_one_way_delay_us: u32,  // maximum OWD (detects jitter)
     pub suspension_detected: bool,  // client saw >100ms gap
