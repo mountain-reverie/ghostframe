@@ -88,9 +88,12 @@ mod cost_tests {
 }
 
 /// Pure classifier: maps current per-tile metrics + previous codec state to a
-/// next codec state. Rules from source spec §4.2 evaluated in order; sentinel
-/// fields (`UNIQUE_COLORS_UNKNOWN`, NaN `edge_density`) cause rules consulting
-/// them to skip.
+/// next codec state. Rules from source spec §4.2 evaluated in order.
+///
+/// Sentinel handling: `unique_colors == UNIQUE_COLORS_UNKNOWN` causes rules
+/// 3, 6, and 7 (the colour-count consumers) to skip. `edge_density` is not
+/// read by any M3.0 rule — its NaN sentinel exists for forward compatibility
+/// with M3.3 rules.
 ///
 /// Hysteresis: while in `H264`, stay in H264 unless `change_freq_hz < 5.0`.
 /// (Per-tile hysteresis differs from the frame-mode hysteresis in
@@ -122,12 +125,13 @@ pub fn classify_tile(metrics: &TileMetrics, prev: &CodecState) -> CodecState {
         return CodecState::Bc1;
     }
 
-    // Rule 4: medium freq AND currently H264 ⇒ stay H264 (per-tile hysteresis)
+    // Rule 4: medium freq AND currently H264 ⇒ stay H264 (per-tile hysteresis).
+    // Rule 5 (medium freq AND not H264 ⇒ BC1) is the else branch below.
     if (5.0..=15.0).contains(&freq) {
         if let CodecState::H264 { frames_in_h264 } = prev {
             return CodecState::H264 { frames_in_h264: frames_in_h264.saturating_add(1) };
         }
-        return CodecState::Bc1;
+        return CodecState::Bc1;  // Rule 5
     }
 
     // Rule 6: single color ⇒ Solid
@@ -233,5 +237,50 @@ mod classify_tests {
         let m = metrics(2.0, 0.05, 0, super::super::UNIQUE_COLORS_UNKNOWN);
         let next = classify_tile(&m, &CodecState::Skip);
         assert!(matches!(next, CodecState::Cdf53 { .. }));
+    }
+
+    #[test]
+    fn magnitude_at_threshold_routes_to_rule_3_not_rule_2() {
+        // Rule 2 uses mag > 0.3 (strict); Rule 3 uses mag <= 0.3.
+        // At exactly 0.3, the tile must NOT classify as H264.
+        let m = metrics(60.0, 0.3, 0, super::super::UNIQUE_COLORS_UNKNOWN);
+        let next = classify_tile(&m, &CodecState::Skip);
+        assert!(!matches!(next, CodecState::H264 { .. }),
+            "mag = 0.3 must fall through to Rule 3 (BC1/PalRle), got {next:?}");
+    }
+
+    #[test]
+    fn freq_at_15_lands_in_rule_4_range() {
+        // Rules 2/3 use freq > 15.0 (strict); Rule 4 uses 5.0..=15.0 (inclusive).
+        // freq = 15.0 must hit Rule 4 (BC1 with no prev H264), not Rules 2/3.
+        let m = metrics(15.0, 0.5, 0, super::super::UNIQUE_COLORS_UNKNOWN);
+        assert_eq!(classify_tile(&m, &CodecState::Skip), CodecState::Bc1);
+    }
+
+    #[test]
+    fn freq_at_5_lands_in_rule_4_range() {
+        // Lower bound of Rule 4 is inclusive — freq = 5.0 must hit Rule 4.
+        let m = metrics(5.0, 0.05, 0, super::super::UNIQUE_COLORS_UNKNOWN);
+        assert_eq!(classify_tile(&m, &CodecState::Skip), CodecState::Bc1);
+    }
+
+    #[test]
+    fn first_h264_entry_starts_counter_at_one() {
+        // Load-bearing for Task 5's sustain logic: the counter starts at 1, not 0.
+        let m = metrics(60.0, 0.5, 0, super::super::UNIQUE_COLORS_UNKNOWN);
+        assert_eq!(
+            classify_tile(&m, &CodecState::Skip),
+            CodecState::H264 { frames_in_h264: 1 },
+        );
+    }
+
+    #[test]
+    fn cdf53_fallback_uses_max_passes_9() {
+        // §4.4 specifies 9 bit-planes; the fallback must encode that constant.
+        let m = metrics(2.0, 0.05, 0, super::super::UNIQUE_COLORS_UNKNOWN);
+        assert_eq!(
+            classify_tile(&m, &CodecState::Skip),
+            CodecState::Cdf53 { passes_sent: 0, max_passes: 9 },
+        );
     }
 }
