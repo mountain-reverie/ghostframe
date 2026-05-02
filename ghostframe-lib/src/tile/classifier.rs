@@ -339,17 +339,12 @@ impl Classifier {
         debug_assert!(!tentative_states.is_empty(),
             "decide_frame_mode called with no dirty tiles — short-circuit at the call site");
 
-        // Cost path.
-        //
-        // Enter comparison: H264-classified tiles are excluded from the us sum
-        // because their `estimated_tile_us` returns `h264_frame_us` (the full
-        // VA-API frame cost), which would spuriously dominate the tile-codec
-        // cost estimate and shadow the motion fast-path's absolute-floor guard.
-        // H264 tiles are already handled by the motion fast-path below.
-        //
-        // Exit comparison: use all tiles (including H264 byte cost) so that a
-        // non-empty dirty set always has non-zero tile-codec cost, keeping the
-        // deadband effective.
+        // Cost path. H264-classified tiles are excluded from the per-tile µs
+        // sum because `estimated_tile_us(H264)` returns the full-frame VA-API
+        // cost (`h264_frame_us`), which can't be summed per-tile coherently —
+        // those tiles are accounted for separately by the motion fast-path.
+        // All tiles' byte costs ARE summed so any non-empty dirty set carries
+        // non-zero tile-codec cost, keeping the deadband effective.
         let non_h264_us: f32 = tentative_states.iter()
             .filter(|s| !matches!(s, CodecState::H264 { .. }))
             .map(|s| self.cost.estimated_tile_us(*s))
@@ -357,9 +352,8 @@ impl Classifier {
         let all_tile_bytes: u32 = tentative_states.iter()
             .map(|s| self.cost.estimated_tile_bytes(*s))
             .sum();
-        let tile_codec_cost_enter =
+        let tile_codec_cost =
             non_h264_us + (all_tile_bytes as f32) / self.cost.bytes_per_us;
-        let tile_codec_cost_exit = tile_codec_cost_enter; // same formula, kept for clarity
         let h264_cost = self.cost.h264_frame_us
             + (self.cost.h264_frame_bytes as f32) / self.cost.bytes_per_us;
 
@@ -370,11 +364,11 @@ impl Classifier {
         let dirty_count = tentative_states.len() as u32;
         let motion_fraction = h264_tile_count as f32 / dirty_count.max(1) as f32;
 
-        let cost_enter = tile_codec_cost_enter > h264_cost * self.enter_factor;
+        let cost_enter = tile_codec_cost > h264_cost * self.enter_factor;
         let motion_enter = h264_tile_count >= self.motion_tile_min_absolute
             && motion_fraction > self.motion_tile_threshold;
         let enter_now = cost_enter || motion_enter;
-        let exit_now = tile_codec_cost_exit < h264_cost * self.exit_factor;
+        let exit_now = tile_codec_cost < h264_cost * self.exit_factor;
 
         match prev_mode {
             FrameMode::TileCodec => {
@@ -480,5 +474,24 @@ mod decide_tests {
         for _ in 0..50 {
             assert_eq!(c.decide_frame_mode(&states, FrameMode::H264), FrameMode::H264);
         }
+    }
+
+    #[test]
+    fn enters_h264_after_sustain_frames_via_cost_path_only() {
+        // 200 Cdf53 tiles: cost = 200*50 µs + 200*1300 B/12.5 B/µs = 30_800 µs.
+        // > h264_cost (3960) × enter_factor (1.3) = 5148 → cost_enter = true.
+        // h264_tile_count = 0 < motion_tile_min_absolute (8) → motion_enter = false.
+        // This is the cost-only enter path — exercises a code branch the other
+        // enter-path tests don't reach (they hit motion_enter simultaneously).
+        let mut c = Classifier::default();
+        let states = vec![CodecState::Cdf53 { passes_sent: 0, max_passes: 9 }; 200];
+        for _ in 0..(c.enter_sustain_frames - 1) {
+            assert_eq!(
+                c.decide_frame_mode(&states, FrameMode::TileCodec),
+                FrameMode::TileCodec,
+                "should not enter before sustain elapsed",
+            );
+        }
+        assert_eq!(c.decide_frame_mode(&states, FrameMode::TileCodec), FrameMode::H264);
     }
 }
