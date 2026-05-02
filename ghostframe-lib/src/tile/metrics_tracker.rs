@@ -52,6 +52,11 @@ impl MetricsTracker {
     }
 
     fn idx(&self, tile_x: u32, tile_y: u32) -> usize {
+        debug_assert!(
+            tile_x < self.cols && tile_y < self.rows,
+            "tile ({tile_x},{tile_y}) out of bounds for {}×{} grid",
+            self.cols, self.rows,
+        );
         (tile_y * self.cols + tile_x) as usize
     }
 
@@ -126,8 +131,10 @@ mod tests {
         for _ in 0..30 {
             t.record_frame(&[(0, 0)]);
         }
-        // freq → 60 - 60*(0.9^30) ≈ 57.5
-        assert!(t.get(0, 0).change_freq_hz > 50.0);
+        // freq → 60 - 60*(0.9^30) ≈ 57.5. Bounded range catches inverted-alpha
+        // bugs (alpha=0.9 climb would give exactly 60.0).
+        let f = t.get(0, 0).change_freq_hz;
+        assert!(f > 50.0 && f < 59.0, "EMA climb out of expected range: {f}");
     }
 
     #[test]
