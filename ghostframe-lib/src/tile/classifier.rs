@@ -14,10 +14,13 @@ pub struct CostModel {
     pub palrle_us: f32,        // ~5    µs (nibble-pack 1024 px)
     pub bc1_us: f32,           // ~50   µs (Vulkan compute, dispatched)
     pub cdf53_us: f32,         // ~50   µs (Vulkan compute, dispatched)
-    pub raw_us: f32,           // ~1    µs (memcpy)
     pub h264_frame_us: f32,    // ~3000 µs (VA-API full-frame encode @ 1080p)
+    /// Estimated bytes for a full-frame H.264 emission. Conservative default
+    /// (1080p, ~6 Mbit/s @ 60 fps → ~12 KB / frame). Updated alongside
+    /// `bytes_per_us` when the source spec §6.5 estimator lands (M4+).
+    pub h264_frame_bytes: u32,
     /// Bandwidth weighting; placeholder until source spec §6.5 estimator lands.
-    /// Default value matches a typical home-LAN link (100 Mbps → ~12 B/µs).
+    /// Default value matches a typical home-LAN link (100 Mbps → ~12.5 B/µs).
     pub bytes_per_us: f32,
 }
 
@@ -28,9 +31,9 @@ impl Default for CostModel {
             palrle_us: 5.0,
             bc1_us: 50.0,
             cdf53_us: 50.0,
-            raw_us: 1.0,
             h264_frame_us: 3000.0,
-            bytes_per_us: 12.0,
+            h264_frame_bytes: 12_000,
+            bytes_per_us: 12.5,
         }
     }
 }
@@ -41,9 +44,9 @@ impl CostModel {
         match state {
             CodecState::Skip => 0,
             CodecState::Solid => 4,
-            CodecState::PalRle { .. } => 200,            // §4.7 typical text
+            CodecState::PalRle { .. } => 200,            // §5.3: typical text 100–200 B; upper bound
             CodecState::Bc1 => 512,
-            CodecState::Cdf53 { .. } => 1300,            // total to lossless
+            CodecState::Cdf53 { .. } => 1300,            // §4.4: 1.0–1.3 KB to lossless; upper bound
             CodecState::PixelPerfect => 0,
             CodecState::H264 { .. } => TILE_BYTES as u32, // upper bound; classified-as-H264 tile
         }
@@ -59,12 +62,6 @@ impl CostModel {
             CodecState::Cdf53 { .. } => self.cdf53_us,
             CodecState::H264 { .. } => self.h264_frame_us,
         }
-    }
-
-    /// Estimated bytes for a full-frame H.264 emission. Conservative default
-    /// (1080p, ~6 Mbit/s @ 60 fps → ~12 KB / frame).
-    pub fn estimated_h264_frame_bytes(&self) -> u32 {
-        12_000
     }
 }
 
