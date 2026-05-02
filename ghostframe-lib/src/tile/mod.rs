@@ -85,6 +85,9 @@ pub enum FrameMode {
     TileCodec,
 }
 
+pub mod metrics_tracker;
+pub use metrics_tracker::MetricsTracker;
+
 #[derive(Debug, Clone)]
 pub struct TileGrid {
     pub width: u32,
