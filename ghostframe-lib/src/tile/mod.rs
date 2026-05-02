@@ -89,7 +89,7 @@ pub mod metrics_tracker;
 pub use metrics_tracker::MetricsTracker;
 
 pub mod classifier;
-pub use classifier::CostModel;
+pub use classifier::{Classifier, CostModel};
 
 #[derive(Debug, Clone)]
 pub struct TileGrid {

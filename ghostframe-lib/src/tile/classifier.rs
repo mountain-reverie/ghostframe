@@ -3,7 +3,7 @@
 //! See `docs/superpowers/specs/2026-04-28-m3-codec-suite-design.md` Phase M3.0
 //! and `docs/specs/ghostframe-initial-spec.md` §4.2 / §4.3.
 
-use super::{CodecState, TileMetrics, TILE_BYTES};
+use super::{CodecState, FrameMode, TileMetrics, TILE_BYTES};
 
 /// Hardcoded encoding-cost model in microseconds per call, plus a bandwidth
 /// weighting expressed as bytes per microsecond. Values rounded from the
@@ -282,5 +282,203 @@ mod classify_tests {
             classify_tile(&m, &CodecState::Skip),
             CodecState::Cdf53 { passes_sent: 0, max_passes: 9 },
         );
+    }
+}
+
+/// Hysteresis state for `Classifier::decide_frame_mode`.
+#[derive(Debug, Clone, Copy, Default)]
+struct ClassifierHysteresis {
+    /// Frames in a row the enter condition has held (cost OR motion fast-path).
+    enter_streak: u32,
+    /// Frames in a row the exit condition has held (cost-only).
+    exit_streak: u32,
+}
+
+/// Tunable decision parameters; defaults reflect the design doc M3.0 values.
+#[derive(Debug, Clone)]
+pub struct Classifier {
+    pub cost: CostModel,
+    pub enter_factor: f32,           // default 1.3
+    pub exit_factor: f32,            // default 0.6
+    pub motion_tile_threshold: f32,  // default 0.20 (fraction of dirty tiles)
+    pub motion_tile_min_absolute: u32, // default 8 (absolute floor)
+    pub enter_sustain_frames: u32,   // default 3
+    pub exit_sustain_frames: u32,    // default 30
+    state: ClassifierHysteresis,
+}
+
+impl Default for Classifier {
+    fn default() -> Self {
+        Self {
+            cost: CostModel::default(),
+            enter_factor: 1.3,
+            exit_factor: 0.6,
+            motion_tile_threshold: 0.20,
+            motion_tile_min_absolute: 8,
+            enter_sustain_frames: 3,
+            exit_sustain_frames: 30,
+            state: ClassifierHysteresis::default(),
+        }
+    }
+}
+
+impl Classifier {
+    /// Apply per-tile rules across all dirty tiles, then decide whole-frame
+    /// mode based on cost + sustained-motion fast-path with hysteresis.
+    ///
+    /// `tentative_states` is the per-dirty-tile output of `classify_tile()`.
+    /// `prev_mode` is what the previous frame emitted.
+    ///
+    /// Caller short-circuits this function when `tentative_states.is_empty()` —
+    /// no frame is sent and no decision is needed.
+    pub fn decide_frame_mode(
+        &mut self,
+        tentative_states: &[CodecState],
+        prev_mode: FrameMode,
+    ) -> FrameMode {
+        debug_assert!(!tentative_states.is_empty(),
+            "decide_frame_mode called with no dirty tiles — short-circuit at the call site");
+
+        // Cost path.
+        //
+        // Enter comparison: H264-classified tiles are excluded from the us sum
+        // because their `estimated_tile_us` returns `h264_frame_us` (the full
+        // VA-API frame cost), which would spuriously dominate the tile-codec
+        // cost estimate and shadow the motion fast-path's absolute-floor guard.
+        // H264 tiles are already handled by the motion fast-path below.
+        //
+        // Exit comparison: use all tiles (including H264 byte cost) so that a
+        // non-empty dirty set always has non-zero tile-codec cost, keeping the
+        // deadband effective.
+        let non_h264_us: f32 = tentative_states.iter()
+            .filter(|s| !matches!(s, CodecState::H264 { .. }))
+            .map(|s| self.cost.estimated_tile_us(*s))
+            .sum();
+        let all_tile_bytes: u32 = tentative_states.iter()
+            .map(|s| self.cost.estimated_tile_bytes(*s))
+            .sum();
+        let tile_codec_cost_enter =
+            non_h264_us + (all_tile_bytes as f32) / self.cost.bytes_per_us;
+        let tile_codec_cost_exit = tile_codec_cost_enter; // same formula, kept for clarity
+        let h264_cost = self.cost.h264_frame_us
+            + (self.cost.h264_frame_bytes as f32) / self.cost.bytes_per_us;
+
+        // Motion fast-path: count tentatively-H.264 tiles
+        let h264_tile_count = tentative_states.iter()
+            .filter(|s| matches!(s, CodecState::H264 { .. }))
+            .count() as u32;
+        let dirty_count = tentative_states.len() as u32;
+        let motion_fraction = h264_tile_count as f32 / dirty_count.max(1) as f32;
+
+        let cost_enter = tile_codec_cost_enter > h264_cost * self.enter_factor;
+        let motion_enter = h264_tile_count >= self.motion_tile_min_absolute
+            && motion_fraction > self.motion_tile_threshold;
+        let enter_now = cost_enter || motion_enter;
+        let exit_now = tile_codec_cost_exit < h264_cost * self.exit_factor;
+
+        match prev_mode {
+            FrameMode::TileCodec => {
+                if enter_now {
+                    self.state.enter_streak = self.state.enter_streak.saturating_add(1);
+                    self.state.exit_streak = 0;
+                    if self.state.enter_streak >= self.enter_sustain_frames {
+                        self.state.enter_streak = 0;
+                        return FrameMode::H264;
+                    }
+                } else {
+                    self.state.enter_streak = 0;
+                }
+                FrameMode::TileCodec
+            }
+            FrameMode::H264 => {
+                if exit_now {
+                    self.state.exit_streak = self.state.exit_streak.saturating_add(1);
+                    self.state.enter_streak = 0;
+                    if self.state.exit_streak >= self.exit_sustain_frames {
+                        self.state.exit_streak = 0;
+                        return FrameMode::TileCodec;
+                    }
+                } else {
+                    self.state.exit_streak = 0;
+                }
+                FrameMode::H264
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod decide_tests {
+    use super::*;
+
+    fn h264_states(n: u32) -> Vec<CodecState> {
+        (0..n).map(|i| CodecState::H264 { frames_in_h264: i }).collect()
+    }
+
+    fn solid_states(n: u32) -> Vec<CodecState> {
+        vec![CodecState::Solid; n as usize]
+    }
+
+    #[test]
+    fn enters_h264_after_sustain_frames_via_motion_fastpath() {
+        let mut c = Classifier::default();
+        let states = h264_states(20); // 20 dirty tiles, all H264 → 100% > 20%, ≥ 8 absolute
+        for _ in 0..(c.enter_sustain_frames - 1) {
+            assert_eq!(
+                c.decide_frame_mode(&states, FrameMode::TileCodec),
+                FrameMode::TileCodec,
+                "should not enter before sustain elapsed",
+            );
+        }
+        assert_eq!(c.decide_frame_mode(&states, FrameMode::TileCodec), FrameMode::H264);
+    }
+
+    #[test]
+    fn motion_fastpath_blocked_by_min_absolute_floor() {
+        let mut c = Classifier::default();
+        let states = h264_states(2); // only 2 H264 tiles — 100% but below floor of 8
+        for _ in 0..10 {
+            assert_eq!(
+                c.decide_frame_mode(&states, FrameMode::TileCodec),
+                FrameMode::TileCodec,
+                "min-absolute floor must prevent fast-path on tiny dirty sets",
+            );
+        }
+    }
+
+    #[test]
+    fn enter_streak_resets_on_quiet_frame() {
+        let mut c = Classifier::default();
+        let busy = h264_states(20);
+        let quiet = solid_states(1);
+        // Build streak almost to threshold...
+        for _ in 0..(c.enter_sustain_frames - 1) {
+            c.decide_frame_mode(&busy, FrameMode::TileCodec);
+        }
+        // ...then a quiet frame resets it.
+        c.decide_frame_mode(&quiet, FrameMode::TileCodec);
+        // First busy frame after reset should NOT promote us yet.
+        assert_eq!(c.decide_frame_mode(&busy, FrameMode::TileCodec), FrameMode::TileCodec);
+    }
+
+    #[test]
+    fn exits_h264_after_sustain_frames_when_costs_drop() {
+        let mut c = Classifier::default();
+        let cheap = solid_states(2); // tile-codec cost trivial → < h264 * 0.6
+        for _ in 0..(c.exit_sustain_frames - 1) {
+            assert_eq!(c.decide_frame_mode(&cheap, FrameMode::H264), FrameMode::H264);
+        }
+        assert_eq!(c.decide_frame_mode(&cheap, FrameMode::H264), FrameMode::TileCodec);
+    }
+
+    #[test]
+    fn deadband_keeps_h264_mode_between_thresholds() {
+        let mut c = Classifier::default();
+        // Inflate exit_factor to make all our tile-codec costs land in the deadband.
+        c.exit_factor = 0.0001;
+        let states = h264_states(4); // some cost, but exit_factor makes exit unreachable
+        for _ in 0..50 {
+            assert_eq!(c.decide_frame_mode(&states, FrameMode::H264), FrameMode::H264);
+        }
     }
 }
