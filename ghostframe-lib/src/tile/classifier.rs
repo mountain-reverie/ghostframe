@@ -3,7 +3,7 @@
 //! See `docs/superpowers/specs/2026-04-28-m3-codec-suite-design.md` Phase M3.0
 //! and `docs/specs/ghostframe-initial-spec.md` §4.2 / §4.3.
 
-use super::{CodecState, TILE_BYTES};
+use super::{CodecState, TileMetrics, TILE_BYTES};
 
 /// Hardcoded encoding-cost model in microseconds per call, plus a bandwidth
 /// weighting expressed as bytes per microsecond. Values rounded from the
@@ -84,5 +84,154 @@ mod cost_tests {
         assert_eq!(c.estimated_tile_us(CodecState::PixelPerfect), 0.0);
         assert_eq!(c.estimated_tile_bytes(CodecState::Skip), 0);
         assert_eq!(c.estimated_tile_bytes(CodecState::PixelPerfect), 0);
+    }
+}
+
+/// Pure classifier: maps current per-tile metrics + previous codec state to a
+/// next codec state. Rules from source spec §4.2 evaluated in order; sentinel
+/// fields (`UNIQUE_COLORS_UNKNOWN`, NaN `edge_density`) cause rules consulting
+/// them to skip.
+///
+/// Hysteresis: while in `H264`, stay in H264 unless `change_freq_hz < 5.0`.
+/// (Per-tile hysteresis differs from the frame-mode hysteresis in
+/// `Classifier::decide_frame_mode`.)
+pub fn classify_tile(metrics: &TileMetrics, prev: &CodecState) -> CodecState {
+    // Rule 1: idle ⇒ Skip
+    if metrics.idle_frames > 0 {
+        return CodecState::Skip;
+    }
+
+    let freq = metrics.change_freq_hz;
+    let mag = metrics.change_magnitude;
+    let uc_known = metrics.unique_colors != super::UNIQUE_COLORS_UNKNOWN;
+
+    // Rule 2: high freq AND high magnitude ⇒ H264
+    if freq > 15.0 && mag > 0.3 {
+        let frames = match prev {
+            CodecState::H264 { frames_in_h264 } => frames_in_h264.saturating_add(1),
+            _ => 1,
+        };
+        return CodecState::H264 { frames_in_h264: frames };
+    }
+
+    // Rule 3: high freq AND low magnitude ⇒ PalRle if few colors known, else BC1
+    if freq > 15.0 && mag <= 0.3 {
+        if uc_known && metrics.unique_colors <= 16 {
+            return CodecState::PalRle { palette_id: 0 };
+        }
+        return CodecState::Bc1;
+    }
+
+    // Rule 4: medium freq AND currently H264 ⇒ stay H264 (per-tile hysteresis)
+    if (5.0..=15.0).contains(&freq) {
+        if let CodecState::H264 { frames_in_h264 } = prev {
+            return CodecState::H264 { frames_in_h264: frames_in_h264.saturating_add(1) };
+        }
+        return CodecState::Bc1;
+    }
+
+    // Rule 6: single color ⇒ Solid
+    if uc_known && metrics.unique_colors <= 1 {
+        return CodecState::Solid;
+    }
+
+    // Rule 7: ≤16 colors ⇒ PalRle
+    if uc_known && metrics.unique_colors <= 16 {
+        return CodecState::PalRle { palette_id: 0 };
+    }
+
+    // Rule 8: fallback ⇒ Cdf53 (lossy → refinement). M3.0 emission is Raw.
+    CodecState::Cdf53 { passes_sent: 0, max_passes: 9 }
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::*;
+
+    fn metrics(freq: f32, mag: f32, idle: u32, unique_colors: u16) -> TileMetrics {
+        TileMetrics {
+            change_freq_hz: freq,
+            change_magnitude: mag,
+            idle_frames: idle,
+            unique_colors,
+            edge_density: super::super::EDGE_DENSITY_UNKNOWN,
+            codec_state: CodecState::Skip,
+        }
+    }
+
+    #[test]
+    fn idle_tile_classified_as_skip() {
+        let m = metrics(0.0, 0.0, 1, super::super::UNIQUE_COLORS_UNKNOWN);
+        assert_eq!(classify_tile(&m, &CodecState::Solid), CodecState::Skip);
+    }
+
+    #[test]
+    fn high_freq_high_magnitude_picks_h264() {
+        let m = metrics(60.0, 0.5, 0, super::super::UNIQUE_COLORS_UNKNOWN);
+        let next = classify_tile(&m, &CodecState::Skip);
+        assert!(matches!(next, CodecState::H264 { .. }));
+    }
+
+    #[test]
+    fn h264_state_increments_frames_counter() {
+        let m = metrics(60.0, 0.5, 0, super::super::UNIQUE_COLORS_UNKNOWN);
+        let next = classify_tile(&m, &CodecState::H264 { frames_in_h264: 7 });
+        assert_eq!(next, CodecState::H264 { frames_in_h264: 8 });
+    }
+
+    #[test]
+    fn high_freq_low_magnitude_few_colors_picks_palrle() {
+        let m = metrics(60.0, 0.05, 0, 4);
+        assert_eq!(
+            classify_tile(&m, &CodecState::Skip),
+            CodecState::PalRle { palette_id: 0 },
+        );
+    }
+
+    #[test]
+    fn high_freq_low_magnitude_many_colors_picks_bc1() {
+        let m = metrics(60.0, 0.05, 0, 200);
+        assert_eq!(classify_tile(&m, &CodecState::Skip), CodecState::Bc1);
+    }
+
+    #[test]
+    fn high_freq_low_magnitude_sentinel_unique_colors_picks_bc1() {
+        let m = metrics(60.0, 0.05, 0, super::super::UNIQUE_COLORS_UNKNOWN);
+        assert_eq!(classify_tile(&m, &CodecState::Skip), CodecState::Bc1);
+    }
+
+    #[test]
+    fn medium_freq_holds_h264_via_hysteresis() {
+        let m = metrics(8.0, 0.05, 0, super::super::UNIQUE_COLORS_UNKNOWN);
+        let next = classify_tile(&m, &CodecState::H264 { frames_in_h264: 3 });
+        assert_eq!(next, CodecState::H264 { frames_in_h264: 4 });
+    }
+
+    #[test]
+    fn medium_freq_no_prior_h264_picks_bc1() {
+        let m = metrics(8.0, 0.05, 0, super::super::UNIQUE_COLORS_UNKNOWN);
+        assert_eq!(classify_tile(&m, &CodecState::Skip), CodecState::Bc1);
+    }
+
+    #[test]
+    fn low_freq_single_color_picks_solid() {
+        let m = metrics(2.0, 0.05, 0, 1);
+        assert_eq!(classify_tile(&m, &CodecState::Skip), CodecState::Solid);
+    }
+
+    #[test]
+    fn low_freq_few_colors_picks_palrle() {
+        let m = metrics(2.0, 0.05, 0, 8);
+        assert_eq!(
+            classify_tile(&m, &CodecState::Skip),
+            CodecState::PalRle { palette_id: 0 },
+        );
+    }
+
+    #[test]
+    fn low_freq_sentinel_unique_colors_falls_through_to_cdf53() {
+        let m = metrics(2.0, 0.05, 0, super::super::UNIQUE_COLORS_UNKNOWN);
+        let next = classify_tile(&m, &CodecState::Skip);
+        assert!(matches!(next, CodecState::Cdf53 { .. }));
     }
 }
