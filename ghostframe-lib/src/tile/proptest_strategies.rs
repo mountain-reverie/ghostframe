@@ -80,3 +80,58 @@ pub fn damage_hints(width: u32, height: u32) -> impl Strategy<Value = Vec<(u32, 
         .collect();
     subsequence(all_coords, 0..=max_hints)
 }
+
+use super::{CodecState, TileMetrics, EDGE_DENSITY_UNKNOWN, UNIQUE_COLORS_UNKNOWN};
+
+/// A `CodecState` strategy. PalRle and Cdf53 carry randomized inner fields.
+pub fn codec_state() -> impl Strategy<Value = CodecState> {
+    prop_oneof![
+        Just(CodecState::Skip),
+        any::<u32>().prop_map(|f| CodecState::H264 { frames_in_h264: f }),
+        Just(CodecState::Bc1),
+        any::<u8>().prop_map(|p| CodecState::PalRle { palette_id: p }),
+        Just(CodecState::Solid),
+        (any::<u8>(), 1u8..=9u8).prop_map(|(s, m)| {
+            CodecState::Cdf53 { passes_sent: s.min(m), max_passes: m }
+        }),
+        Just(CodecState::PixelPerfect),
+    ]
+}
+
+/// A `TileMetrics` strategy with sentinel `unique_colors` and `edge_density`
+/// (matching M3.0 reality where GPU-derived fields aren't populated yet).
+pub fn tile_metrics() -> impl Strategy<Value = TileMetrics> {
+    (
+        0.0f32..=120.0,           // change_freq_hz
+        0.0f32..=1.0,             // change_magnitude
+        0u32..=600,               // idle_frames
+        codec_state(),
+    ).prop_map(|(freq, mag, idle, st)| TileMetrics {
+        change_freq_hz: freq,
+        change_magnitude: mag,
+        unique_colors: UNIQUE_COLORS_UNKNOWN,
+        edge_density: EDGE_DENSITY_UNKNOWN,
+        idle_frames: idle,
+        codec_state: st,
+    })
+}
+
+/// A `TileMetrics` strategy with a known `unique_colors` value (no sentinel).
+/// Used by rule-table invariants that depend on the colour-count axis.
+#[allow(dead_code)]
+pub fn tile_metrics_with_colors() -> impl Strategy<Value = TileMetrics> {
+    (
+        0.0f32..=120.0,
+        0.0f32..=1.0,
+        0u32..=600,
+        1u16..=256,
+        codec_state(),
+    ).prop_map(|(freq, mag, idle, uc, st)| TileMetrics {
+        change_freq_hz: freq,
+        change_magnitude: mag,
+        unique_colors: uc,
+        edge_density: EDGE_DENSITY_UNKNOWN,
+        idle_frames: idle,
+        codec_state: st,
+    })
+}
