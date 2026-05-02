@@ -88,6 +88,9 @@ pub enum FrameMode {
 pub mod metrics_tracker;
 pub use metrics_tracker::MetricsTracker;
 
+pub mod classifier;
+pub use classifier::CostModel;
+
 #[derive(Debug, Clone)]
 pub struct TileGrid {
     pub width: u32,
