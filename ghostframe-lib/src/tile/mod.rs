@@ -2,6 +2,80 @@ pub const TILE_SIZE: u32 = 32;
 pub const BPP: u32 = 4;
 pub const TILE_BYTES: usize = (TILE_SIZE * TILE_SIZE * BPP) as usize;
 
+/// Sentinel value for `TileMetrics::unique_colors` indicating the GPU compute
+/// estimator has not run yet (M3.0 always uses this — backing lands in M3.3).
+/// Classifier rules consulting `unique_colors` treat the sentinel as "unknown".
+pub const UNIQUE_COLORS_UNKNOWN: u16 = u16::MAX;
+
+/// Sentinel value for `TileMetrics::edge_density` indicating the GPU compute
+/// estimator has not run yet (M3.0 always uses this — backing lands in M3.3).
+/// Classifier rules consulting `edge_density` treat NaN as "unknown".
+pub const EDGE_DENSITY_UNKNOWN: f32 = f32::NAN;
+
+/// Per-tile metrics consumed by the classifier. See
+/// `docs/specs/ghostframe-initial-spec.md` §4.2.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TileMetrics {
+    /// Exponential moving average of change frequency (Hz). Alpha = 0.1.
+    /// Updated each frame: `freq = freq * 0.9 + (changed ? 60.0 : 0.0) * 0.1`.
+    pub change_freq_hz: f32,
+
+    /// SAD of the most recent change normalized to [0.0, 1.0] per pixel.
+    /// 0.0 means identical, 1.0 means every pixel maximally different.
+    pub change_magnitude: f32,
+
+    /// Approximate distinct color count from a hash-based GPU estimator.
+    /// In M3.0 always `UNIQUE_COLORS_UNKNOWN`; populated in M3.3.
+    pub unique_colors: u16,
+
+    /// Fraction of pixels with high gradient. In M3.0 always `EDGE_DENSITY_UNKNOWN`;
+    /// populated in M3.3.
+    pub edge_density: f32,
+
+    /// Consecutive frames this tile has been clean (not in the dirty set).
+    /// Reset to 0 when the tile becomes dirty.
+    pub idle_frames: u32,
+
+    /// Last-decided per-tile codec state.
+    pub codec_state: CodecState,
+}
+
+impl Default for TileMetrics {
+    fn default() -> Self {
+        Self {
+            change_freq_hz: 0.0,
+            change_magnitude: 0.0,
+            unique_colors: UNIQUE_COLORS_UNKNOWN,
+            edge_density: EDGE_DENSITY_UNKNOWN,
+            idle_frames: 0,
+            codec_state: CodecState::Skip,
+        }
+    }
+}
+
+/// Per-tile codec assignment. Variant set is fixed by the source spec; M3.0
+/// only ever produces `Skip`, `Raw`, or values that fall back to Raw at emission
+/// time because no real per-tile codecs exist yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodecState {
+    Skip,
+    H264 { frames_in_h264: u32 },
+    Bc1,
+    PalRle { palette_id: u8 },
+    Solid,
+    Cdf53 { passes_sent: u8, max_passes: u8 },
+    PixelPerfect,
+}
+
+/// Whole-frame emission mode chosen by the classifier per frame_seq.
+/// `H264` means the full-frame VA-API encoder runs; `TileCodec` means each
+/// dirty tile is emitted as its own tile datagram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameMode {
+    H264,
+    TileCodec,
+}
+
 #[derive(Debug, Clone)]
 pub struct TileGrid {
     pub width: u32,
@@ -330,5 +404,15 @@ mod tests {
         let tile = grid.extract_tile(&pixels, stride, 1, 1);
 
         assert_eq!(tile.len(), TILE_BYTES);
+    }
+
+    #[test]
+    fn tile_metrics_default_uses_sentinels() {
+        let m = TileMetrics::default();
+        assert_eq!(m.unique_colors, UNIQUE_COLORS_UNKNOWN);
+        assert!(m.edge_density.is_nan());
+        assert_eq!(m.codec_state, CodecState::Skip);
+        assert_eq!(m.idle_frames, 0);
+        assert_eq!(m.change_freq_hz, 0.0);
     }
 }
