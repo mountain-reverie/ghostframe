@@ -14,6 +14,11 @@ pub const EDGE_DENSITY_UNKNOWN: f32 = f32::NAN;
 
 /// Per-tile metrics consumed by the classifier. See
 /// `docs/specs/ghostframe-initial-spec.md` §4.2.
+///
+/// Note: `PartialEq` is intentionally partial — two default-initialized
+/// `TileMetrics` values compare unequal because `edge_density` is NaN.
+/// Callers testing equality must check `edge_density` with `.is_nan()`
+/// separately when the sentinel may be in effect.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TileMetrics {
     /// Exponential moving average of change frequency (Hz). Alpha = 0.1.
@@ -36,7 +41,9 @@ pub struct TileMetrics {
     /// Reset to 0 when the tile becomes dirty.
     pub idle_frames: u32,
 
-    /// Last-decided per-tile codec state.
+    /// Last-decided per-tile codec state. Acts as hysteresis input on the
+    /// next call to `classify_tile()` — the classifier reads it before
+    /// overwriting it.
     pub codec_state: CodecState,
 }
 
@@ -53,9 +60,11 @@ impl Default for TileMetrics {
     }
 }
 
-/// Per-tile codec assignment. Variant set is fixed by the source spec; M3.0
-/// only ever produces `Skip`, `Raw`, or values that fall back to Raw at emission
-/// time because no real per-tile codecs exist yet.
+/// Per-tile codec assignment chosen by the classifier. Variant set is fixed
+/// by the source spec. In M3.0 the classifier may return any of these values,
+/// but the io_bridge emission layer maps every non-Skip variant to
+/// `Codec::Raw` on the wire because no real per-tile encoders exist until
+/// M3.1+.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodecState {
     Skip,
@@ -414,5 +423,9 @@ mod tests {
         assert_eq!(m.codec_state, CodecState::Skip);
         assert_eq!(m.idle_frames, 0);
         assert_eq!(m.change_freq_hz, 0.0);
+        // Pin the NaN reflexivity trap: defaults compare unequal because of the
+        // edge_density sentinel. Task 6 callers must avoid raw assert_eq! when
+        // the sentinel may be in effect.
+        assert_ne!(TileMetrics::default(), TileMetrics::default());
     }
 }
