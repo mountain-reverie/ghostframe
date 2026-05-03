@@ -513,7 +513,11 @@ impl FullFrameEncoder {
 
     /// Request that the next encoded frame be an IDR (instantaneous decoder
     /// refresh) regardless of GOP timing. The flag is one-shot: it is
-    /// consumed by the next `encode_nv12_buffer` or `encode_frame` call.
+    /// consumed at the top of the next `encode_nv12_buffer` or `encode_frame`
+    /// call (cleared atomically with the `force_idr` decision).
+    ///
+    /// If that encode call returns `Err`, the request is dropped silently —
+    /// callers must call `request_keyframe()` again on retry.
     ///
     /// Used by the M3.0 mode-switch logic so a `TileCodec → H264` transition
     /// gives the client a fresh decoding anchor.
@@ -1366,18 +1370,33 @@ mod tests {
         let _ = encoder.encode_nv12_buffer(
             nv12.as_ptr(), width, height, width, width, width * height,
         );
-        // PTS 1 normally would NOT be a keyframe (FULL_FRAME_GOP = 11). Request one.
+        // PTS 1 normally would NOT be a keyframe (FULL_FRAME_GOP = 11). Request one,
+        // then drain frames until a packet emerges — the encoder may buffer the first
+        // few PTS values before emitting the IDR. The first emitted packet must be a
+        // keyframe; if no packet appears within a reasonable window the test fails.
         encoder.request_keyframe();
-        let result = encoder
-            .encode_nv12_buffer(nv12.as_ptr(), width, height, width, width, width * height)
-            .expect("encode succeeds");
-        if let Some(out) = result {
-            assert!(out.is_keyframe,
-                "request_keyframe() must force IDR on the next frame");
+        let mut keyframe_observed = false;
+        let mut keyframe_pts = None;
+        for pts in 1..=4 {
+            if let Ok(Some(out)) = encoder.encode_nv12_buffer(
+                nv12.as_ptr(), width, height, width, width, width * height,
+            ) {
+                assert!(out.is_keyframe,
+                    "first packet after request_keyframe() must be IDR (got P-frame at drain pts={pts})");
+                keyframe_observed = true;
+                keyframe_pts = Some(pts);
+                break;
+            }
         }
-        // Subsequent encodes should NOT be keyframes (latch was one-shot).
+        assert!(keyframe_observed,
+            "encoder buffered all PTS 1-4 frames; no IDR ever emitted");
+
+        // Subsequent encodes (continuing PTS sequence after the keyframe) should NOT
+        // all be keyframes — the latch was one-shot. Drain another 5 frames; at least
+        // one must be a P-frame. Stop well before PTS 11 (next natural GOP boundary).
+        let start_pts = keyframe_pts.unwrap() + 1;
         let mut saw_p_frame = false;
-        for _ in 0..5 {
+        for _pts in start_pts..(start_pts + 5).min(10) {
             if let Ok(Some(out)) = encoder.encode_nv12_buffer(
                 nv12.as_ptr(), width, height, width, width, width * height,
             ) {
