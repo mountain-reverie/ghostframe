@@ -1,12 +1,13 @@
-//! Property-based invariants for `TileGrid` and `DirtyTracker`.
+//! Property-based invariants for `TileGrid`, `DirtyTracker`, and the per-tile classifier.
 //!
 //! These encode rules from §4.1 / §4.2 of the spec so that the M3 classifier
 //! work — which builds on top of these primitives — has a regression net.
 
 use proptest::prelude::*;
 
-use super::proptest_strategies::{dim, frame_packed, MAX_DIM};
-use super::{DirtyTracker, TileGrid, BPP, TILE_BYTES, TILE_SIZE};
+use super::classifier::classify_tile;
+use super::proptest_strategies::{codec_state, dim, frame_packed, tile_metrics, MAX_DIM};
+use super::{CodecState, DirtyTracker, TileGrid, BPP, TILE_BYTES, TILE_SIZE};
 
 // ── TileGrid ────────────────────────────────────────────────────────────────
 
@@ -291,10 +292,6 @@ proptest! {
 // C1, C2, C4, C5 land in M3.0 alongside the classifier. C3 (Solid) defers to
 // M3.1 (which ships the Solid encoder). C6 (H.264 → idle traverses lossy
 // intermediate before refinement) defers to M3.3 (which ships refinement).
-
-use super::classifier::classify_tile;
-use super::proptest_strategies::{codec_state, tile_metrics};
-use super::CodecState;
 
 proptest! {
     /// C1 — idle_frames > 0 ⇒ CodecState::Skip

@@ -8,7 +8,7 @@ use proptest::collection::vec;
 use proptest::prelude::*;
 use proptest::sample::subsequence;
 
-use super::{BPP, TILE_SIZE};
+use super::{CodecState, TileMetrics, BPP, EDGE_DENSITY_UNKNOWN, TILE_SIZE, UNIQUE_COLORS_UNKNOWN};
 
 /// Maximum frame dimension generated. 256 = up to 8x8 tiles, plenty to
 /// exercise edge tiles, multiple rows, and damage-hint subsets while keeping
@@ -81,8 +81,6 @@ pub fn damage_hints(width: u32, height: u32) -> impl Strategy<Value = Vec<(u32, 
     subsequence(all_coords, 0..=max_hints)
 }
 
-use super::{CodecState, TileMetrics, EDGE_DENSITY_UNKNOWN, UNIQUE_COLORS_UNKNOWN};
-
 /// A `CodecState` strategy. PalRle and Cdf53 carry randomized inner fields.
 pub fn codec_state() -> impl Strategy<Value = CodecState> {
     prop_oneof![
@@ -92,7 +90,10 @@ pub fn codec_state() -> impl Strategy<Value = CodecState> {
         any::<u8>().prop_map(|p| CodecState::PalRle { palette_id: p }),
         Just(CodecState::Solid),
         (any::<u8>(), 1u8..=9u8).prop_map(|(s, m)| {
-            CodecState::Cdf53 { passes_sent: s.min(m), max_passes: m }
+            CodecState::Cdf53 {
+                passes_sent: s.min(m),
+                max_passes: m,
+            }
         }),
         Just(CodecState::PixelPerfect),
     ]
@@ -102,18 +103,19 @@ pub fn codec_state() -> impl Strategy<Value = CodecState> {
 /// (matching M3.0 reality where GPU-derived fields aren't populated yet).
 pub fn tile_metrics() -> impl Strategy<Value = TileMetrics> {
     (
-        0.0f32..=120.0,           // change_freq_hz
-        0.0f32..=1.0,             // change_magnitude
-        0u32..=600,               // idle_frames
+        0.0f32..=120.0, // change_freq_hz
+        0.0f32..=1.0,   // change_magnitude
+        0u32..=600,     // idle_frames
         codec_state(),
-    ).prop_map(|(freq, mag, idle, st)| TileMetrics {
-        change_freq_hz: freq,
-        change_magnitude: mag,
-        unique_colors: UNIQUE_COLORS_UNKNOWN,
-        edge_density: EDGE_DENSITY_UNKNOWN,
-        idle_frames: idle,
-        codec_state: st,
-    })
+    )
+        .prop_map(|(freq, mag, idle, st)| TileMetrics {
+            change_freq_hz: freq,
+            change_magnitude: mag,
+            unique_colors: UNIQUE_COLORS_UNKNOWN,
+            edge_density: EDGE_DENSITY_UNKNOWN,
+            idle_frames: idle,
+            codec_state: st,
+        })
 }
 
 /// A `TileMetrics` strategy with a known `unique_colors` value (no sentinel).
@@ -126,12 +128,13 @@ pub fn tile_metrics_with_colors() -> impl Strategy<Value = TileMetrics> {
         0u32..=600,
         1u16..=256,
         codec_state(),
-    ).prop_map(|(freq, mag, idle, uc, st)| TileMetrics {
-        change_freq_hz: freq,
-        change_magnitude: mag,
-        unique_colors: uc,
-        edge_density: EDGE_DENSITY_UNKNOWN,
-        idle_frames: idle,
-        codec_state: st,
-    })
+    )
+        .prop_map(|(freq, mag, idle, uc, st)| TileMetrics {
+            change_freq_hz: freq,
+            change_magnitude: mag,
+            unique_colors: uc,
+            edge_density: EDGE_DENSITY_UNKNOWN,
+            idle_frames: idle,
+            codec_state: st,
+        })
 }
