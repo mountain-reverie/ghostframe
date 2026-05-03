@@ -463,6 +463,9 @@ pub struct FullFrameEncoder {
     hw_frames_ctx: Option<BufRef>,
     /// DRM device context for DMA-BUF zero-copy import.
     _drm_device_ctx: Option<BufRef>,
+    /// One-shot keyframe request: set by `request_keyframe()`, cleared on next
+    /// `encode_nv12_buffer` / `encode_frame` call.
+    keyframe_pending: bool,
 }
 
 // SAFETY: same reasoning as H264VaapiEncoder.
@@ -506,6 +509,16 @@ impl FullFrameEncoder {
 
     pub fn height(&self) -> u32 {
         self.enc_h
+    }
+
+    /// Request that the next encoded frame be an IDR (instantaneous decoder
+    /// refresh) regardless of GOP timing. The flag is one-shot: it is
+    /// consumed by the next `encode_nv12_buffer` or `encode_frame` call.
+    ///
+    /// Used by the M3.0 mode-switch logic so a `TileCodec → H264` transition
+    /// gives the client a fresh decoding anchor.
+    pub fn request_keyframe(&mut self) {
+        self.keyframe_pending = true;
     }
 
     /// Create a DRM device context for the given render node.
@@ -615,6 +628,7 @@ impl FullFrameEncoder {
                 _hw_device_ctx: Some(BufRef(hw_device_ctx)),
                 hw_frames_ctx: Some(BufRef(hw_frames_ctx)),
                 _drm_device_ctx: drm_device_ctx.ok().map(BufRef),
+                keyframe_pending: false,
             })
         }
     }
@@ -661,6 +675,7 @@ impl FullFrameEncoder {
             _hw_device_ctx: None,
             hw_frames_ctx: None,
             _drm_device_ctx: None,
+            keyframe_pending: false,
         })
     }
 
@@ -687,7 +702,8 @@ impl FullFrameEncoder {
         let pts = self.pts;
         self.pts += 1;
 
-        let force_idr = pts % FULL_FRAME_GOP as i64 == 0;
+        let force_idr = pts % FULL_FRAME_GOP as i64 == 0 || self.keyframe_pending;
+        self.keyframe_pending = false;
 
         if self.use_vaapi {
             self.encode_vaapi(fd, width, height, stride, pts, force_idr)
@@ -717,7 +733,8 @@ impl FullFrameEncoder {
     ) -> Result<Option<FullFrameEncoded>, ffmpeg::Error> {
         let pts = self.pts;
         self.pts += 1;
-        let force_idr = pts % FULL_FRAME_GOP as i64 == 0;
+        let force_idr = pts % FULL_FRAME_GOP as i64 == 0 || self.keyframe_pending;
+        self.keyframe_pending = false;
 
         unsafe {
             // Build a software NV12 AVFrame whose data pointers point into nv12_data.
@@ -1330,5 +1347,43 @@ mod tests {
                 "keyframe interval should be ~11 frames, got {interval}"
             );
         }
+    }
+
+    #[test]
+    fn request_keyframe_forces_idr_outside_gop_boundary() {
+        let width = 320;
+        let height = 240;
+        let mut encoder = match FullFrameEncoder::new(width, height) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("Skipping request_keyframe test (no encoder): {e}");
+                return;
+            }
+        };
+        // PTS 0 is automatically a keyframe; consume it.
+        let nv12_size = (width * height * 3 / 2) as usize;
+        let nv12 = vec![128u8; nv12_size];
+        let _ = encoder.encode_nv12_buffer(
+            nv12.as_ptr(), width, height, width, width, width * height,
+        );
+        // PTS 1 normally would NOT be a keyframe (FULL_FRAME_GOP = 11). Request one.
+        encoder.request_keyframe();
+        let result = encoder
+            .encode_nv12_buffer(nv12.as_ptr(), width, height, width, width, width * height)
+            .expect("encode succeeds");
+        if let Some(out) = result {
+            assert!(out.is_keyframe,
+                "request_keyframe() must force IDR on the next frame");
+        }
+        // Subsequent encodes should NOT be keyframes (latch was one-shot).
+        let mut saw_p_frame = false;
+        for _ in 0..5 {
+            if let Ok(Some(out)) = encoder.encode_nv12_buffer(
+                nv12.as_ptr(), width, height, width, width, width * height,
+            ) {
+                if !out.is_keyframe { saw_p_frame = true; break; }
+            }
+        }
+        assert!(saw_p_frame, "latch must not persist beyond one frame");
     }
 }
