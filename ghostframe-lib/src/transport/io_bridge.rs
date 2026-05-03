@@ -28,7 +28,7 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep_until, Instant as TokioInstant};
 
 use crate::capture::gpu_pipeline::GpuFrameProcessor;
-use crate::encoder::h264_vaapi::{FullFrameEncoder, H264VaapiEncoder};
+use crate::encoder::h264_vaapi::FullFrameEncoder;
 use crate::server::FrameSubmission;
 use crate::tile::{DirtyTracker, TileGrid};
 use crate::transport::ghostbridge::{
@@ -72,10 +72,6 @@ pub struct IoBridge {
     /// QUIC slow-start can only deliver a fraction of tiles in the first burst;
     /// forcing dirty for several frames lets the congestion window open.
     force_dirty_frames: u32,
-    /// Per-tile H.264 encoders, keyed by (tile_x, tile_y). Lazily initialized.
-    encoders: HashMap<(u32, u32), H264VaapiEncoder>,
-    /// Whether H.264 encoding is available (checked once at startup).
-    h264_available: bool,
     /// FEC parity group size. 0 = disabled.
     fec_k: usize,
     /// Loss rate threshold to enable FEC (0.005 = 0.5%).
@@ -135,8 +131,6 @@ impl IoBridge {
         // its IP as the `local_ip` hint for inbound packets.
         let local_addr = SocketAddr::new(bind_ip, port);
 
-        let h264_available = H264VaapiEncoder::new().is_ok();
-
         let gpu_frame_processor = GpuFrameProcessor::new(2048 * 2).ok();
         if gpu_frame_processor.is_some() {
             tracing::info!("GPU dirty tracker initialized (Vulkan compute SAD)");
@@ -152,8 +146,6 @@ impl IoBridge {
             frame_seq: 0,
             dirty_tracker: DirtyTracker::new(0, 0),
             force_dirty_frames: 0,
-            encoders: HashMap::new(),
-            h264_available,
             fec_k: std::env::var("GHOSTFRAME_FEC_K")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
@@ -325,33 +317,9 @@ impl IoBridge {
         for (tile_x, tile_y) in &dirty_tiles {
             let tile_data = grid.extract_tile(&frame.pixels, frame.stride, *tile_x, *tile_y);
 
-            let (codec, payload) = if self.h264_available {
-                use std::collections::hash_map::Entry;
-                let encoder = match self.encoders.entry((*tile_x, *tile_y)) {
-                    Entry::Occupied(e) => Some(e.into_mut()),
-                    Entry::Vacant(e) => match H264VaapiEncoder::new() {
-                        Ok(enc) => Some(e.insert(enc)),
-                        Err(err) => {
-                            tracing::warn!(tile_x, tile_y, error = %err,
-                                "H.264 encoder creation failed, sending raw");
-                            None
-                        }
-                    },
-                };
-                match encoder {
-                    Some(enc) => match enc.encode(&tile_data) {
-                        Ok(Some(encoded)) => (encoded.codec, encoded.payload),
-                        Ok(None) => (Codec::Raw, tile_data),
-                        Err(e) => {
-                            tracing::warn!(tile_x, tile_y, error = %e, "H.264 encode failed, sending raw");
-                            (Codec::Raw, tile_data)
-                        }
-                    },
-                    None => (Codec::Raw, tile_data),
-                }
-            } else {
-                (Codec::Raw, tile_data)
-            };
+            // M3.0: CPU path always emits Raw. No full-frame H.264 emitter
+            // here yet — see design Future Work #7 for the eventual wire-up.
+            let (codec, payload) = (Codec::Raw, tile_data);
 
             let datagrams = fragment_tile(
                 seq | TILE_DATAGRAM_FLAG,
@@ -795,8 +763,6 @@ impl IoBridge {
             frame_seq: 0,
             dirty_tracker: DirtyTracker::new(0, 0),
             force_dirty_frames: 0,
-            encoders: HashMap::new(),
-            h264_available: false,
             fec_k: 0,
             fec_enable_threshold: 0.005,
             fec_disable_threshold: 0.002,
@@ -821,8 +787,6 @@ impl IoBridge {
             frame_seq: 0,
             dirty_tracker: DirtyTracker::new(0, 0),
             force_dirty_frames: 0,
-            encoders: HashMap::new(),
-            h264_available: false,
             fec_k: 0,
             fec_enable_threshold: 0.005,
             fec_disable_threshold: 0.002,
