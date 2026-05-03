@@ -346,6 +346,9 @@ impl IoBridge {
             }
 
             // Generate and send FEC parity datagrams if enabled
+            // NOTE (M3.0): unreachable in the CPU path — `codec` is always
+            // `Codec::Raw` here per design D13. Retained as plumbing for M3.1+
+            // when per-tile codecs land and the guard condition is widened.
             if self.fec_k > 0 && codec == Codec::H264 && datagrams.len() > 1 {
                 let source_payloads: Vec<&[u8]> = datagrams.iter().map(|dg| {
                     &dg[DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE..]
