@@ -1032,3 +1032,68 @@ async fn e2e_multi_pattern() -> Result<()> {
 
     Ok(())
 }
+
+/// M3.0: Verify the classifier switches between TileCodec and H264 frame
+/// modes in response to alternating static/motion content.
+///
+/// The test pattern toggles every 3 seconds. We sample the web client's
+/// per-mode datagram counters every 250 ms over ~14 seconds and assert that
+/// at least one "static window" saw mostly tile datagrams and at least one
+/// "motion window" saw mostly frame datagrams.
+#[tokio::test]
+#[ignore = "requires GPU runner with /dev/dri"]
+async fn e2e_mode_switch() -> Result<()> {
+    let setup = setup_e2e("--mode-switch-cycle 3").await?;
+
+    // 14 seconds covers two full 6-second cycles plus settle time.
+    let total = Duration::from_secs(14);
+    let interval = Duration::from_millis(250);
+    let started = tokio::time::Instant::now();
+    let mut samples: Vec<(u64, u64, u64)> = Vec::new(); // (elapsed_ms, tile, frame)
+
+    while tokio::time::Instant::now() - started < total {
+        let v: serde_json::Value = setup
+            .page
+            .evaluate(
+                "(() => { const s = window.__ghostframeStats || {tileDatagrams:0, frameDatagrams:0}; return {t: s.tileDatagrams, f: s.frameDatagrams}; })()",
+            )
+            .await?
+            .into_value()?;
+        let elapsed_ms = (tokio::time::Instant::now() - started).as_millis() as u64;
+        let tile = v["t"].as_u64().unwrap_or(0);
+        let frame = v["f"].as_u64().unwrap_or(0);
+        samples.push((elapsed_ms, tile, frame));
+        tokio::time::sleep(interval).await;
+    }
+
+    // Compute per-sample deltas (events per 250 ms window).
+    let deltas: Vec<(u64, i64, i64)> = samples
+        .windows(2)
+        .map(|w| {
+            (
+                w[1].0,
+                w[1].1 as i64 - w[0].1 as i64,
+                w[1].2 as i64 - w[0].2 as i64,
+            )
+        })
+        .collect();
+
+    // Find at least one window dominated by tile datagrams (TileCodec mode)
+    // and at least one dominated by frame datagrams (H264 mode).
+    let tile_dominant = deltas.iter().any(|(_, dt, df)| *dt > 0 && *df == 0);
+    let frame_dominant = deltas.iter().any(|(_, _, df)| *df >= 5);
+
+    // Print diagnostic table for failure debugging.
+    if !tile_dominant || !frame_dominant {
+        for (ms, dt, df) in &deltas {
+            eprintln!("t={ms:>5}ms  +tile={dt:>4}  +frame={df:>4}");
+        }
+    }
+
+    assert!(tile_dominant,
+        "expected at least one 250 ms window to be tile-dominated (TileCodec mode); none observed");
+    assert!(frame_dominant,
+        "expected at least one 250 ms window to be frame-dominated (H264 mode); none observed");
+
+    Ok(())
+}
