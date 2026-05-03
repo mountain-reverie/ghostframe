@@ -79,8 +79,8 @@ The existing per-tile `H264VaapiEncoder` in `encoder/h264_vaapi.rs` was preserve
 pub struct TileMetrics {
     pub change_freq_hz: f32,        // EMA, alpha = 0.1
     pub change_magnitude: f32,      // SAD / area, normalized to [0, 1]
-    pub unique_colors: u16,         // hash-based estimate from GPU compute output
-    pub edge_density: f32,          // gradient pixel fraction
+    pub unique_colors: u16,         // hash-based estimate from GPU compute output (sentinel in M3.0)
+    pub edge_density: f32,          // gradient pixel fraction (sentinel in M3.0)
     pub idle_frames: u32,
     pub codec_state: CodecState,
 }
@@ -98,6 +98,10 @@ pub enum CodecState {
 pub enum FrameMode { H264, TileCodec }
 ```
 
+**Storage:** per-tile state lives in a `Vec<TileMetrics>` of length `cols × rows`, parallel to `DirtyTracker.prev_tiles`, recreated on `resize()`. Indexed by `tile_y * cols + tile_x`.
+
+**M3.0 sentinel policy for GPU-derived metrics:** `unique_colors` and `edge_density` require GPU compute support that doesn't land until M3.3. In M3.0 they are populated with sentinels — `unique_colors = u16::MAX`, `edge_density = f32::NAN` — and any classifier rule that consults them treats the sentinel as "unknown, do not match". Unit tests inject concrete values directly into `TileMetrics` to exercise rules. `change_freq_hz` (EMA from dirty-tile observation) and `idle_frames` (incremented per frame on no-change, reset to 0 on dirty) are populated normally because they only require the existing dirty detector.
+
 ### New module `ghostframe-lib/src/tile/classifier.rs`
 
 ```rust
@@ -108,14 +112,15 @@ pub struct CostModel {
     pub cdf53_us: f32,         // ~50 µs    (Vulkan compute, dispatched)
     pub raw_us: f32,           // ~1 µs     (memcpy)
     pub h264_frame_us: f32,    // ~3000 µs  (VA-API full-frame encode @ 1080p)
-    pub bytes_per_us: f32,     // bandwidth weighting (link-rate aware)
+    pub bytes_per_us: f32,     // bandwidth weighting; see "Bandwidth source" below
 }
 
 pub struct Classifier {
     cost: CostModel,
     enter_factor: f32,         // default 1.3
     exit_factor: f32,          // default 0.6
-    motion_tile_threshold: f32,// default 0.20 (20% of tiles)
+    motion_tile_threshold: f32,// default 0.20 (20% of dirty tiles)
+    motion_tile_min_absolute: u32, // default 8 — absolute floor; both fraction AND count must hold
     enter_sustain_frames: u32, // default 3
     exit_sustain_frames: u32,  // default 30
     state: ClassifierHysteresis,
@@ -137,6 +142,14 @@ impl Classifier {
 
 The values in `CostModel` are placeholders rounded from the spec's GPU compute claims. M3.5 retunes them from real measurements on actual hardware.
 
+**Bandwidth source for `bytes_per_us`:** source spec §6.5 specifies a two-layer bandwidth estimator (QUIC congestion controller as ceiling + app-level estimator from `ReceiverFeedback` loss/throughput). That machinery is not yet implemented (M4+ work). M3.0 uses a hardcoded placeholder consistent with a typical home-LAN link (e.g. 100 Mbps → ~12 bytes/µs). The classifier reads `bytes_per_us` through a single accessor so the wire-up to the §6.5 estimator is a one-call change once it lands.
+
+### Spec divergence on enter/exit (intentional)
+
+Source spec §4.3 expresses H.264 entry/exit as metric-based rules (`change_freq > 15 Hz AND change_magnitude > 0.3`, sustained 10 frames to enter; `freq < 5 Hz OR magnitude < 0.1`, sustained 30 to exit). The M3.0 design replaces this with a cost-based decision plus a sustained-motion fast-path on tile-classification counts. Rationale: the cost path generalizes — it adapts as new codecs land and as `bytes_per_us` becomes link-aware — whereas the metric thresholds were a hand-tuned proxy for cost. The fast-path preserves the spirit of "lots of moving tiles → H.264".
+
+Post-M3 evolution (recorded in Future work below): augment the cost decision with a **trend signal** — current frame cost combined with a short rolling window of past costs and per-frame H.264-tile fractions — so the classifier predicts when a stream is becoming video-ish before the steady-state cost rule catches up. This adds frequency awareness without re-introducing the hand-tuned thresholds.
+
 ### Mode-switch rule
 
 ```
@@ -147,18 +160,24 @@ h264_cost       = h264_frame_us
 
 enter_h264 if   (tile_codec_cost > h264_cost × ENTER_FACTOR)
                 sustained ENTER_SUSTAIN_FRAMES
-             OR (#tiles_classified_H264 / #dirty_tiles > MOTION_TILE_THRESHOLD)
+             OR (#tiles_classified_H264 >= MOTION_TILE_MIN_ABSOLUTE
+                 AND #tiles_classified_H264 / max(#dirty_tiles, 1) > MOTION_TILE_THRESHOLD)
                 sustained ENTER_SUSTAIN_FRAMES
 exit_h264  if   (tile_codec_cost < h264_cost × EXIT_FACTOR)
                 sustained EXIT_SUSTAIN_FRAMES
 deadband   otherwise → keep prev_mode
 ```
 
+The absolute-count floor on the fast-path prevents a single H.264-classified tile out of one or two dirty tiles (cursor blink, single-pixel UI tick) from promoting the whole frame to H.264. If `#dirty_tiles == 0` the function is short-circuited at the call site — `decide_frame_mode` is only consulted when there is at least one dirty tile to dispatch.
+
 ### `io_bridge` changes
 
-- `process_frame_gpu` and `process_frame_cpu` consult the classifier first to pick `FrameMode`.
-- `H264` mode → existing full-frame VA-API path. On *re-entry* (prev was `TileCodec`), force an I-frame so the client has a fresh anchor.
+- `process_frame_gpu` consults the classifier to pick `FrameMode`. Both modes are supported on this path.
+- `process_frame_cpu` **always** stays in `TileCodec` mode emitting `Codec::Raw`. The CPU fallback path does not gain a full-frame H.264 emitter in M3.0 — wiring `FullFrameEncoder` (libx264 backend) into the CPU path is recorded as future work; today's CPU path is a degraded fallback used only when the GPU pipeline is unavailable, and emitting Raw matches that reality.
+- `H264` mode (GPU path only) → existing full-frame VA-API path. On *re-entry* (prev was `TileCodec`), force an IDR so the client has a fresh anchor.
 - `TileCodec` mode → for each dirty tile, emit one tile datagram. In Phase 0 the codec is always `Codec::Raw` because no per-tile codecs exist yet; later phases swap in real codecs per `CodecState`.
+
+**Force-IDR API addition.** `FullFrameEncoder.encode_nv12_buffer` currently computes `force_idr` internally from `pts % FULL_FRAME_GOP == 0` (h264_vaapi.rs:720). M3.0 adds a `request_keyframe()` method on `FullFrameEncoder` that latches a one-shot flag OR'd into the next encode's `force_idr`. The mode-switch logic calls this on every `TileCodec → H264` transition.
 
 ### Cleanup
 
@@ -168,9 +187,11 @@ deadband   otherwise → keep prev_mode
 ### Testing
 
 - Unit tests on `classify_tile` (rule table) using `proptest_strategies::TileMetrics` (introduce strategy alongside existing `frame_packed`).
-- Unit tests on `decide_frame_mode` boundary cases — cost just above/below threshold; hysteresis enter/exit timing.
-- Re-enable the M3 classifier proptest invariants C1–C6 currently TODO'd at `tile/tests_proptest.rs:289`.
+- Unit tests on `decide_frame_mode` boundary cases — cost just above/below threshold; hysteresis enter/exit timing; `MOTION_TILE_MIN_ABSOLUTE` floor (single H.264-classified tile out of one or two dirty tiles must NOT trip the fast-path).
+- Re-enable the M3 classifier proptest invariants applicable to M3.0 — **C1, C2, C4, C5** — at `tile/tests_proptest.rs:289`. **C3** (Solid) defers to M3.1 (which ships the Solid encoder), **C6** (refinement traversal) defers to M3.3 (which ships refinement). Both are tracked in their respective phase sections below.
 - E2E `e2e_mode_switch` (new): test pattern alternates between fully-static and fully-moving content; protocol-layer assertion that `frame_seq` N is one mode or the other (never both) and that mode flips happen at the right boundaries with the right hysteresis.
+
+**Test-pattern dependency:** `e2e_mode_switch` requires a new mode flag in `ghostframe-test-pattern` (e.g. `--mode-switch-cycle SECS`) that drives synthetic content alternating between fully-static and fully-moving regions on a known cadence. This is part of M3.0 deliverables.
 
 ### Out of scope for M3.0
 
@@ -266,8 +287,13 @@ Max size: 1 + 1 + 64 × 4 = 258 bytes — well under the 1200-byte MTU budget.
 
 - Unit tests on `Scheduler`: round-robin fairness, retry timing, generation invalidation cancels stale work, budget enforcement.
 - Unit tests on `AckBatcher`: flush-on-count and flush-on-time, encoding/decoding roundtrip.
+- **Re-enable proptest invariant C3** (deferred from M3.0) — `unique_colors == 1 ⇒ CodecState::Solid` — now that the Solid encoder backs the classifier rule end-to-end.
 - E2E `e2e_solid_color` (extend existing): assert solid regions emit `Codec::Solid` 4-byte payloads, render correctly, survive simulated 5 % datagram loss via retries.
 - E2E `e2e_ack_loss` (new): drop 100 % of ACK datagrams for 2 s; assert the server keeps retrying, no retry storm (rate-limited by RTT-based retry interval and budget), and tiles eventually render once ACKs flow again.
+
+### Wire-protocol additions deferred from M3.0
+
+The `(gen << 4) | pass_idx` packing in `TileHeader` byte `[3]` (see Wire Protocol Additions section) lands here in M3.1 alongside the scheduler, since M3.0 does not use generations or passes. M2 sites continue to set `generation = 0`; the byte split is backward-compatible.
 
 ### Out of scope for M3.1
 
@@ -434,6 +460,7 @@ The classifier needs a read-only handle to the palette table to test feasibility
 - Unit tests: forward + inverse CDF 5/3 on a fixed seed → exact reconstruction (lossless gate).
 - Unit tests: bit-plane extraction → bit-plane reassembly → exact coefficients.
 - Property test: `forward(t) → drop bottom-K bit-planes → inverse → SSIM` monotonically increases as K decreases (fewer dropped planes = higher SSIM).
+- **Re-enable proptest invariant C6** (deferred from M3.0) — H.264 → idle transition must traverse a lossy intermediate codec (BC1 or PalRle, depending on what's available at this point) before refinement begins. C6 lands here because refinement is what closes the loop.
 - E2E `e2e_progressive_refinement` (new): static-after-motion test pattern; SSIM measured at 1 s, 3 s, 5 s; assert monotone non-decreasing AND eventual 1.0.
 - E2E `e2e_refinement_cancel` (new): start refinement, change content mid-stream, verify old-gen passes are dropped client-side and new-gen passes arrive.
 
@@ -550,9 +577,9 @@ This phase has **no new code paths**. It runs the existing bench harness on real
 
 That's the only new top-level discriminator. Palette delivery rides inline in PalRle tile datagrams (codec-specific framing — see M3.2).
 
-### Generation + pass packing
+### Generation + pass packing (lands in M3.1)
 
-`TileHeader` byte `[3]` becomes `(generation << 4) | pass_idx` — 4 bits each. Header stays at 8 bytes total.
+`TileHeader` byte `[3]` becomes `(generation << 4) | pass_idx` — 4 bits each. Header stays at 8 bytes total. M3.0 does not need this packing (no scheduler, no passes); M3.1 ships it alongside the scheduler and ACK protocol.
 
 ```
 [3]    (gen: u4) << 4 | (pass: u4)
@@ -599,6 +626,8 @@ All wire additions are net-new message types with their own discriminators. No e
 3. **Palette delivery via dedicated control channel** if piggybacking ever proves insufficient (e.g. pathological palette churn relative to tile churn). Today's design intentionally avoids this complexity.
 4. **Intra-refresh tuning across H.264 mode re-entries.** Current plan forces an I-frame on every re-entry. If mode switches turn out to be frequent, this might be too costly; future work to evaluate alternatives.
 5. **More than 16 generations / passes per tile** — if a future codec needs > 16 passes, the gen+pass byte split is the constraint to revisit.
+6. **Trend-tracking in the mode-switch decision.** Augment cost-only entry/exit with a short rolling window of past frame costs and per-frame H.264-tile fractions, so the classifier predicts video-ish streams before the steady-state cost rule catches up. Replaces what the source spec §4.3 metric-based rules were originally hand-tuned to do; intentionally deferred from M3.0 because the cost rule is sufficient for first deployment and trend logic carries oscillation risk that benefits from real bench data (M3.5).
+7. **CPU-path full-frame H.264 emission.** M3.0 keeps the CPU path (`process_frame_cpu`) on tile-codec-Raw because no GPU is the degraded fallback case. If CPU-path quality becomes a real concern, wire `FullFrameEncoder` (libx264 backend) into the CPU path so it can also emit H.264 mode.
 
 ### Explicit out-of-scope for M3
 
@@ -628,6 +657,12 @@ Preserving source-spec §13 non-goals where relevant:
 | D10 | M3.4 (BC1) is conditional on M3.5 bench dominance check | Source spec §12 anticipates BC1 may be dropped if CDF 5/3 dominates. |
 | D11 | Per-codec brainstorm + design spec required before writing-plans for M3.2, M3.3, M3.4 | Codec-specific implementation details are too deep to lock in the umbrella. |
 | D12 | Remove per-tile `H264VaapiEncoder` in M3.0 | No longer used under the frame-mode architecture. |
+| D13 | M3.0 CPU path stays in tile-codec-Raw mode; no `FullFrameEncoder` wire-up CPU-side | CPU path is the degraded fallback when no GPU; emitting Raw matches that reality. Tracked in Future Work #7. |
+| D14 | M3.0 replaces source-spec §4.3 metric-based H.264 enter/exit rules with cost-based rules + sustained-motion fast-path | Cost generalizes as new codecs land and as `bytes_per_us` becomes link-aware; trend-tracking that re-introduces frequency awareness without hand-tuned thresholds is post-M3 (Future Work #6). |
+| D15 | M3.0 `MOTION_TILE_MIN_ABSOLUTE` floor on the fast-path | Fraction-only rule trips on cursor blinks and single-pixel UI ticks; an absolute floor prevents whole-frame H.264 promotion for trivial dirty counts. |
+| D16 | M3.0 GPU-derived metrics use sentinel values; rules consulting them treat sentinel as "no match" | GPU compute backing for `unique_colors` / `edge_density` doesn't land until M3.3; sentinels keep the type populated and tests inject concrete values. |
+| D17 | `bytes_per_us` placeholder in M3.0; wired to the §6.5 estimator once it exists (M4+) | The estimator is upstream future work; classifier reads through one accessor so swap-in is a one-call change. |
+| D18 | Force-IDR via new `FullFrameEncoder.request_keyframe()` one-shot flag | Existing API computes `force_idr` only from PTS; mode re-entry needs an external trigger. |
 
 ---
 
