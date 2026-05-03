@@ -323,6 +323,13 @@ impl Default for Classifier {
 }
 
 impl Classifier {
+    /// Clear hysteresis state so the next `decide_frame_mode` starts fresh.
+    /// Call this when a new client session connects (so prior session's
+    /// streak counters don't influence the decision for the new client).
+    pub fn reset(&mut self) {
+        self.state = ClassifierHysteresis::default();
+    }
+
     /// Apply per-tile rules across all dirty tiles, then decide whole-frame
     /// mode based on cost + sustained-motion fast-path with hysteresis.
     ///

@@ -27,6 +27,9 @@ pub struct TileMetrics {
 
     /// SAD of the most recent change normalized to [0.0, 1.0] per pixel.
     /// 0.0 means identical, 1.0 means every pixel maximally different.
+    /// In M3.0 this field is always 0.0 — `MetricsTracker::record_frame` only
+    /// updates `change_freq_hz` and `idle_frames` from the dirty bitmap.
+    /// Populated in M3.1+ from GPU SAD output.
     pub change_magnitude: f32,
 
     /// Approximate distinct color count from a hash-based GPU estimator.

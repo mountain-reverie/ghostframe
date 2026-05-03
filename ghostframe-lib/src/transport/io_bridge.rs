@@ -420,8 +420,8 @@ impl IoBridge {
 
         // Convert flat tile indices (Vec<u32>) into (tile_x, tile_y) pairs
         // matching the row-major layout used by MetricsTracker / TileGrid.
-        let cols = (frame.width + crate::tile::TILE_SIZE - 1) / crate::tile::TILE_SIZE;
-        let rows = (frame.height + crate::tile::TILE_SIZE - 1) / crate::tile::TILE_SIZE;
+        let cols = frame.width.div_ceil(crate::tile::TILE_SIZE);
+        let rows = frame.height.div_ceil(crate::tile::TILE_SIZE);
         let dirty_xy: Vec<(u32, u32)> = analysis
             .dirty_tiles
             .iter()
@@ -776,6 +776,9 @@ impl IoBridge {
                             // congestion window. A single burst can't deliver
                             // all 300+ tiles for a 640x480 screen.
                             self.dirty_tracker.reset();
+                            self.metrics_tracker.reset();
+                            self.classifier.reset();
+                            self.frame_mode = crate::tile::FrameMode::TileCodec;
                             self.force_dirty_frames = 20;
                             tracing::debug!(?handle, "new session connected, dirty tracker reset");
                         }
