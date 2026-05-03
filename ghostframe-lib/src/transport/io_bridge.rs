@@ -68,6 +68,12 @@ pub struct IoBridge {
     frame_seq: u32,
     /// Per-tile dirty detection.
     dirty_tracker: DirtyTracker,
+    /// Per-tile metrics fed to the classifier each frame.
+    metrics_tracker: crate::tile::MetricsTracker,
+    /// Cost-aware frame-mode + per-tile classifier.
+    classifier: crate::tile::Classifier,
+    /// Last-emitted frame mode (carried across frames for hysteresis).
+    frame_mode: crate::tile::FrameMode,
     /// Remaining frames to force all-dirty after a new session connects.
     /// QUIC slow-start can only deliver a fraction of tiles in the first burst;
     /// forcing dirty for several frames lets the congestion window open.
@@ -145,6 +151,9 @@ impl IoBridge {
             frame_rx: None,
             frame_seq: 0,
             dirty_tracker: DirtyTracker::new(0, 0),
+            metrics_tracker: crate::tile::MetricsTracker::new(0, 0),
+            classifier: crate::tile::Classifier::default(),
+            frame_mode: crate::tile::FrameMode::TileCodec,
             force_dirty_frames: 0,
             fec_k: std::env::var("GHOSTFRAME_FEC_K")
                 .ok()
@@ -409,76 +418,156 @@ impl IoBridge {
             return;
         }
 
-        // Lazily initialize full-frame encoder
-        let needs_init = match &self.full_frame_encoder {
-            Some(enc) => enc.width() != frame.width || enc.height() != frame.height,
-            None => true,
-        };
-        if needs_init {
-            match FullFrameEncoder::new(frame.width, frame.height) {
-                Ok(enc) => { self.full_frame_encoder = Some(enc); }
-                Err(e) => {
-                    tracing::warn!("Full-frame encoder init failed: {e}");
+        // Convert flat tile indices (Vec<u32>) into (tile_x, tile_y) pairs
+        // matching the row-major layout used by MetricsTracker / TileGrid.
+        let cols = (frame.width + crate::tile::TILE_SIZE - 1) / crate::tile::TILE_SIZE;
+        let rows = (frame.height + crate::tile::TILE_SIZE - 1) / crate::tile::TILE_SIZE;
+        let dirty_xy: Vec<(u32, u32)> = analysis
+            .dirty_tiles
+            .iter()
+            .map(|&idx| (idx % cols, idx / cols))
+            .collect();
+
+        // Keep metrics_tracker grid in sync with the dirty-detection grid.
+        if self.metrics_tracker.cols() != cols || self.metrics_tracker.rows() != rows {
+            self.metrics_tracker.resize(cols, rows);
+        }
+        self.metrics_tracker.record_frame(&dirty_xy);
+
+        // Per-dirty-tile tentative classification.
+        use crate::tile::{classifier::classify_tile, FrameMode};
+        let tentative: Vec<crate::tile::CodecState> = dirty_xy
+            .iter()
+            .map(|&(tx, ty)| {
+                let m = self.metrics_tracker.get(tx, ty);
+                let prev = m.codec_state;
+                classify_tile(m, &prev)
+            })
+            .collect();
+
+        // Frame-mode decision.
+        let new_mode = self.classifier.decide_frame_mode(&tentative, self.frame_mode);
+
+        // Persist tentative state back into per-tile metrics.
+        for (i, &(tx, ty)) in dirty_xy.iter().enumerate() {
+            self.metrics_tracker.get_mut(tx, ty).codec_state = tentative[i];
+        }
+
+        match new_mode {
+            FrameMode::H264 => {
+                // Lazily initialize full-frame encoder
+                let needs_init = match &self.full_frame_encoder {
+                    Some(enc) => enc.width() != frame.width || enc.height() != frame.height,
+                    None => true,
+                };
+                if needs_init {
+                    match FullFrameEncoder::new(frame.width, frame.height) {
+                        Ok(enc) => { self.full_frame_encoder = Some(enc); }
+                        Err(e) => {
+                            tracing::warn!("Full-frame encoder init failed: {e}");
+                            return;
+                        }
+                    }
+                }
+
+                // Re-entry into H264: force IDR for a fresh client anchor.
+                if self.frame_mode == FrameMode::TileCodec {
+                    if let Some(enc) = self.full_frame_encoder.as_mut() {
+                        enc.request_keyframe();
+                    }
+                }
+
+                // Encode from the GPU-computed NV12 HOST_VISIBLE buffer
+                let encoder = self.full_frame_encoder.as_mut().unwrap();
+                let encoded = match encoder.encode_nv12_buffer(
+                    analysis.nv12_data,
+                    analysis.nv12_width,
+                    analysis.nv12_height,
+                    analysis.nv12_y_stride,
+                    analysis.nv12_uv_stride,
+                    analysis.nv12_uv_offset,
+                ) {
+                    Ok(Some(enc)) => enc,
+                    Ok(None) => {
+                        self.frame_mode = new_mode;
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::warn!("NV12 encode failed: {e}");
+                        self.frame_mode = new_mode;
+                        return;
+                    }
+                };
+
+                // Fragment and send — keep the existing code from here onwards
+                let datagrams = fragment_frame(
+                    seq,
+                    frame.timestamp_us,
+                    encoded.is_keyframe,
+                    &encoded.payload,
+                    max_dg_size,
+                );
+
+                for dg in &datagrams {
+                    self.send_to_all_sessions(dg);
+                }
+
+                // FEC parity
+                let fec_k = fec_group_size(encoded.is_keyframe);
+                if datagrams.len() > 1 {
+                    let source_payloads: Vec<&[u8]> = datagrams.iter()
+                        .map(|dg| &dg[FRAME_HEADER_SIZE..])
+                        .collect();
+                    let parities = fec::generate_parity(&source_payloads, fec_k);
+                    for (_group_start, parity_payload) in &parities {
+                        let parity_dg = build_frame_parity_datagram(
+                            seq, frame.timestamp_us, encoded.is_keyframe,
+                            datagrams.len() as u16, parity_payload,
+                        );
+                        self.send_to_all_sessions(&parity_dg);
+                    }
+                }
+
+                // Store fragments for NACK
+                let oldest_kept = seq.wrapping_sub(3);
+                self.recent_frame_fragments.retain(|(s, _), _| s.wrapping_sub(oldest_kept) <= 3);
+                for dg in &datagrams {
+                    if let Ok(hdr) = FrameHeader::decode(dg) {
+                        self.recent_frame_fragments.insert((hdr.frame_seq, hdr.frag_idx), dg.clone());
+                    }
+                }
+            }
+            FrameMode::TileCodec => {
+                // Emit each dirty tile as Codec::Raw — same loop shape as
+                // process_frame_cpu's tile-emit path. fragment_tile expects
+                // the per-fragment payload size, not the raw datagram size.
+                let max_frag = max_fragment_payload(max_dg_size);
+                if max_frag == 0 {
+                    self.frame_mode = new_mode;
                     return;
+                }
+                let grid = TileGrid::new(frame.width, frame.height);
+                for &(tile_x, tile_y) in &dirty_xy {
+                    let tile_data = grid.extract_tile(
+                        &frame.pixels, frame.stride, tile_x, tile_y,
+                    );
+                    let datagrams = fragment_tile(
+                        seq | TILE_DATAGRAM_FLAG,
+                        tile_x as u8,
+                        tile_y as u8,
+                        Codec::Raw,
+                        &tile_data,
+                        frame.timestamp_us,
+                        max_frag,
+                    );
+                    for dg in &datagrams {
+                        self.send_to_all_sessions(dg);
+                    }
                 }
             }
         }
 
-        // Encode from the GPU-computed NV12 HOST_VISIBLE buffer
-        let encoder = self.full_frame_encoder.as_mut().unwrap();
-        let encoded = match encoder.encode_nv12_buffer(
-            analysis.nv12_data,
-            analysis.nv12_width,
-            analysis.nv12_height,
-            analysis.nv12_y_stride,
-            analysis.nv12_uv_stride,
-            analysis.nv12_uv_offset,
-        ) {
-            Ok(Some(enc)) => enc,
-            Ok(None) => return,
-            Err(e) => {
-                tracing::warn!("NV12 encode failed: {e}");
-                return;
-            }
-        };
-
-        // Fragment and send — keep the existing code from here onwards
-        let datagrams = fragment_frame(
-            seq,
-            frame.timestamp_us,
-            encoded.is_keyframe,
-            &encoded.payload,
-            max_dg_size,
-        );
-
-        for dg in &datagrams {
-            self.send_to_all_sessions(dg);
-        }
-
-        // FEC parity
-        let fec_k = fec_group_size(encoded.is_keyframe);
-        if datagrams.len() > 1 {
-            let source_payloads: Vec<&[u8]> = datagrams.iter()
-                .map(|dg| &dg[FRAME_HEADER_SIZE..])
-                .collect();
-            let parities = fec::generate_parity(&source_payloads, fec_k);
-            for (_group_start, parity_payload) in &parities {
-                let parity_dg = build_frame_parity_datagram(
-                    seq, frame.timestamp_us, encoded.is_keyframe,
-                    datagrams.len() as u16, parity_payload,
-                );
-                self.send_to_all_sessions(&parity_dg);
-            }
-        }
-
-        // Store fragments for NACK
-        let oldest_kept = seq.wrapping_sub(3);
-        self.recent_frame_fragments.retain(|(s, _), _| s.wrapping_sub(oldest_kept) <= 3);
-        for dg in &datagrams {
-            if let Ok(hdr) = FrameHeader::decode(dg) {
-                self.recent_frame_fragments.insert((hdr.frame_seq, hdr.frag_idx), dg.clone());
-            }
-        }
+        self.frame_mode = new_mode;
     }
 
     /// Handle a NACK by retransmitting the requested fragment, but only if
@@ -765,6 +854,9 @@ impl IoBridge {
             frame_rx: None,
             frame_seq: 0,
             dirty_tracker: DirtyTracker::new(0, 0),
+            metrics_tracker: crate::tile::MetricsTracker::new(0, 0),
+            classifier: crate::tile::Classifier::default(),
+            frame_mode: crate::tile::FrameMode::TileCodec,
             force_dirty_frames: 0,
             fec_k: 0,
             fec_enable_threshold: 0.005,
@@ -789,6 +881,9 @@ impl IoBridge {
             frame_rx: Some(frame_rx),
             frame_seq: 0,
             dirty_tracker: DirtyTracker::new(0, 0),
+            metrics_tracker: crate::tile::MetricsTracker::new(0, 0),
+            classifier: crate::tile::Classifier::default(),
+            frame_mode: crate::tile::FrameMode::TileCodec,
             force_dirty_frames: 0,
             fec_k: 0,
             fec_enable_threshold: 0.005,
