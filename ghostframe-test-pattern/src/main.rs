@@ -35,6 +35,12 @@ struct Args {
     #[arg(long)]
     mixed: bool,
 
+    /// Cycle between static and motion content every `SECS` seconds (so the
+    /// full cycle is `2 * SECS`). Drives `e2e_mode_switch` to verify the
+    /// classifier flips between H264 and TileCodec modes.
+    #[arg(long)]
+    mode_switch_cycle: Option<u64>,
+
     /// (Ignored — kept for CLI compat.) Window width.
     #[arg(long, default_value = "640")]
     width: u16,
@@ -49,6 +55,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (conn, screen_num) = x11rb::connect(None)?;
     let screen = &conn.setup().roots[screen_num];
     let root = screen.root;
+
+    if let Some(secs) = args.mode_switch_cycle {
+        let half = std::time::Duration::from_secs(secs);
+        return ghostframe_test_pattern::mode_switch::run(&conn, root, half);
+    }
 
     if args.mixed {
         // Mutually exclusive — render four regions and run the spinner forever.
