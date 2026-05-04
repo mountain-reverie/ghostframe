@@ -56,6 +56,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     x11-utils \
     mesa-utils \
     libgl1-mesa-dri \
+    libvulkan1 \
+    mesa-vulkan-drivers \
+    vulkan-tools \
     libavcodec60 \
     libavdevice60 \
     libavutil58 \
