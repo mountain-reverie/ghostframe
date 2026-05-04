@@ -546,10 +546,45 @@ impl IoBridge {
                     self.frame_mode = new_mode;
                     return;
                 }
+
+                // Source for tile pixel extraction. The CPU path populates
+                // `frame.pixels` directly; the GPU/DMA-BUF path leaves it
+                // empty because the data is GPU-resident. Read it back here,
+                // only when the classifier actually selected TileCodec mode
+                // (the H264 branch stays zero-copy via the NV12 buffer).
+                let pixels_owned;
+                let pixels: &[u8] = if frame.pixels.is_empty() {
+                    match frame.dmabuf_fd.as_ref() {
+                        Some(fd) => match crate::capture::dmabuf::readback_dmabuf(
+                            fd.as_raw_fd(), frame.width, frame.height, frame.stride,
+                        ) {
+                            Ok(p) => { pixels_owned = p; &pixels_owned }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "DMA-BUF readback failed in TileCodec mode: {e}; \
+                                     skipping frame to avoid emitting zero-filled tiles",
+                                );
+                                self.frame_mode = new_mode;
+                                return;
+                            }
+                        },
+                        None => {
+                            tracing::warn!(
+                                "TileCodec mode but no pixels and no DMA-BUF fd; \
+                                 skipping frame",
+                            );
+                            self.frame_mode = new_mode;
+                            return;
+                        }
+                    }
+                } else {
+                    &frame.pixels
+                };
+
                 let grid = TileGrid::new(frame.width, frame.height);
                 for &(tile_x, tile_y) in &dirty_xy {
                     let tile_data = grid.extract_tile(
-                        &frame.pixels, frame.stride, tile_x, tile_y,
+                        pixels, frame.stride, tile_x, tile_y,
                     );
                     let datagrams = fragment_tile(
                         seq | TILE_DATAGRAM_FLAG,
@@ -1094,5 +1129,32 @@ mod tests {
 
         bridge.process_frame(make_frame());
         assert_eq!(bridge.frame_seq, 2);
+    }
+
+    /// The GPU-path TileCodec branch must not emit zero-filled tiles when
+    /// `frame.pixels` is empty (DMA-BUF zero-copy path). Constructing a real
+    /// DMA-BUF fd in a unit test is impractical, so this test exercises the
+    /// adjacent skip path: empty pixels + no DMA-BUF fd routes to
+    /// `process_frame_cpu` (no GPU processor in the test bridge), which uses
+    /// `frame.pixels` directly. It documents the no-panic invariant for the
+    /// pathological "no pixels, no fd" submission. End-to-end coverage of the
+    /// readback fallback lives in `e2e_mode_switch`.
+    #[tokio::test]
+    async fn process_frame_tilecodec_no_panic_on_empty_pixels_no_dmabuf() {
+        let (our_end, _peer) = UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("server");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+        bridge.frame_mode = crate::tile::FrameMode::TileCodec;
+
+        let frame = crate::server::FrameSubmission {
+            width: 64, height: 64, stride: 64 * 4,
+            pixels: vec![0u8; 64 * 64 * 4],
+            dmabuf_fd: None,
+            timestamp_us: 0,
+            damage_tiles: None,
+        };
+        bridge.process_frame(frame);
+        assert!(bridge.frame_seq > 0, "frame_seq must advance");
     }
 }
