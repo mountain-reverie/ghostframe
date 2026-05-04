@@ -13,8 +13,21 @@ export DRM_DEVICE=${DRM_DEVICE:-/dev/dri/card0}
 export CAPTURE_FPS=${CAPTURE_FPS:-2}
 export DISPLAY=:99
 
-# Start X with dummy driver
-Xorg :99 -config ${XORG_CONF:-/etc/X11/xorg.conf} &
+# If XORG_CONF is unset, auto-detect the right config:
+#   - /etc/X11/xorg-vkms.conf if /dev/dri/card0 is a VKMS device
+#     (presence-of-Writeback connector heuristic).
+#   - /etc/X11/xorg.conf (Driver "dummy") otherwise.
+if [ -z "${XORG_CONF:-}" ]; then
+    if [ -e /sys/class/drm/card0-Writeback-1 ]; then
+        XORG_CONF=/etc/X11/xorg-vkms.conf
+        echo "entrypoint: detected VKMS card0 (writeback connector) — using xorg-vkms.conf"
+    else
+        XORG_CONF=/etc/X11/xorg.conf
+        echo "entrypoint: no VKMS detected — using xorg.conf (dummy driver)"
+    fi
+fi
+
+Xorg :99 -config "$XORG_CONF" &
 sleep 2
 
 # Paint root window — default is --solid-red, override with TEST_PATTERN env var

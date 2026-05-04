@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::Result;
 use chromiumoxide::{Browser, BrowserConfig};
 use futures::StreamExt;
-use testcontainers::core::{IntoContainerPort, WaitFor};
+use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
 use testcontainers::{runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt};
 
 /// Fixed host port for headscale.  Using a fixed port lets us construct the
@@ -158,10 +158,26 @@ struct E2eSetup {
 }
 
 async fn setup_e2e(test_pattern_args: &str) -> Result<E2eSetup> {
-    setup_e2e_with_env(test_pattern_args, &[]).await
+    setup_e2e_inner(test_pattern_args, &[], false).await
 }
 
 async fn setup_e2e_with_env(test_pattern_args: &str, extra_env: &[(&str, &str)]) -> Result<E2eSetup> {
+    setup_e2e_inner(test_pattern_args, extra_env, false).await
+}
+
+/// Variant of `setup_e2e` that bind-mounts the host's `/dev/dri` into the
+/// container and runs privileged so `xdaemon`'s DRM capture can use VKMS
+/// (host must have `vkms` module loaded with `enable_writeback=1`). The
+/// container's Xorg switches to the modesetting driver via `XORG_CONF`.
+async fn setup_e2e_gpu(test_pattern_args: &str) -> Result<E2eSetup> {
+    setup_e2e_inner(test_pattern_args, &[], true).await
+}
+
+async fn setup_e2e_inner(
+    test_pattern_args: &str,
+    extra_env: &[(&str, &str)],
+    gpu: bool,
+) -> Result<E2eSetup> {
     let hs_server_url = format!("http://{DOCKER_HOST_IP}:{HEADSCALE_HOST_PORT}");
 
     let headscale: ContainerAsync<GenericImage> =
@@ -189,6 +205,16 @@ async fn setup_e2e_with_env(test_pattern_args: &str, extra_env: &[(&str, &str)])
             .with_env_var("TEST_PATTERN", test_pattern_args);
     for (k, v) in extra_env {
         server_image = server_image.with_env_var(*k, *v);
+    }
+    if gpu {
+        // Switch Xorg to the modesetting driver targeting VKMS card0.
+        server_image = server_image.with_env_var("XORG_CONF", "/etc/X11/xorg-vkms.conf");
+        // Bind-mount the host's DRM nodes so the container's Xorg + xdaemon
+        // can drive VKMS card0 and use renderD128 for VA-API.
+        server_image = server_image.with_mount(Mount::bind_mount("/dev/dri", "/dev/dri"));
+        // Privileged is the pragmatic choice for solo dev; production CI
+        // would narrow to cap_add(SYS_ADMIN) + cgroup device rules.
+        server_image = server_image.with_privileged(true);
     }
     let server: ContainerAsync<GenericImage> = server_image
             .with_ready_conditions(vec![WaitFor::message_on_stdout("CERT_HASH_SHA256=")])
@@ -1041,9 +1067,9 @@ async fn e2e_multi_pattern() -> Result<()> {
 /// at least one "static window" saw mostly tile datagrams and at least one
 /// "motion window" saw mostly frame datagrams.
 #[tokio::test]
-#[ignore = "requires GPU runner with /dev/dri"]
+#[ignore = "requires host VKMS module (sudo modprobe vkms enable_writeback=1) and Docker GPU passthrough"]
 async fn e2e_mode_switch() -> Result<()> {
-    let setup = setup_e2e("--mode-switch-cycle 3").await?;
+    let setup = setup_e2e_gpu("--mode-switch-cycle 3").await?;
 
     // 14 seconds covers two full 6-second cycles plus settle time.
     let total = Duration::from_secs(14);
