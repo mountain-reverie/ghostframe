@@ -523,24 +523,71 @@ impl GpuFrameProcessor {
         // Ensure the NV12 output buffer is allocated at the right size.
         self.ensure_nv12_buffer(width, height)?;
 
-        // Import DMA-BUF as VkImage.
+        // Import DMA-BUF as VkImage. This is transient: we destroy it at the
+        // end of this function. We never reuse it as the SAD `prev_image`
+        // because PRIME-exported FBs share physical memory across imports
+        // (active scanout BO doesn't change between captures), so a previous
+        // import would always be byte-identical to a fresh one and SAD = 0.
         let current = self.import_dmabuf(fd, width, height, stride)?;
+        // Result must always destroy `current` at end. Use a closure-style
+        // cleanup by carrying it forward and explicitly destroying.
+        let result = self.process_frame_with_imported(
+            &current,
+            width,
+            height,
+            tile_count,
+            cols,
+            rows,
+        );
+        // Always clean up the imported DMA-BUF VkImage (transient).
+        self.destroy_prev_frame(current);
+        result
+    }
 
+    /// Run SAD + NV12 + snapshot-copy against an already-imported DMA-BUF
+    /// VkImage. Splits out the destruction of `current` from
+    /// [`process_frame_inner`] so the cleanup path is bullet-proof regardless
+    /// of which step errors out.
+    unsafe fn process_frame_with_imported(
+        &mut self,
+        current: &PrevFrame,
+        width: u32,
+        height: u32,
+        tile_count: u32,
+        cols: u32,
+        rows: u32,
+    ) -> Result<FrameAnalysis, Box<dyn std::error::Error>> {
         let nv12 = self.nv12_buffer.as_ref().unwrap();
         let (nv12_buffer, nv12_y_stride, nv12_uv_stride, nv12_uv_offset) =
             (nv12.buffer, nv12.y_stride, nv12.uv_stride, nv12.uv_offset);
         let nv12_ptr = nv12.ptr;
 
-        // --- First frame: no SAD, mark all dirty, just run NV12 conversion ---
+        // --- First frame: no SAD, mark all dirty, run NV12, copy current →
+        // newly-allocated owned snapshot for next frame's SAD source. ---
         if self.prev_image.is_none() {
             let all_dirty: Vec<u32> = (0..tile_count).collect();
 
-            // Run NV12 conversion only (no SAD).
-            self.run_nv12_only(&current, width, height, nv12_buffer, nv12_y_stride, nv12_uv_offset, nv12_uv_stride)?;
+            // Allocate the owned snapshot image once. It persists for the
+            // lifetime of the processor (until resolution changes).
+            let snapshot = self.allocate_owned_image(width, height)?;
 
-            let mut cur = current;
-            cur.layout = vk::ImageLayout::GENERAL;
-            self.prev_image = Some(cur);
+            // Run NV12 conversion AND snapshot copy in one cmd buffer. The
+            // snapshot is what we will compare future frames against.
+            self.run_nv12_and_snapshot(
+                current,
+                &snapshot,
+                width,
+                height,
+                nv12_buffer,
+                nv12_y_stride,
+                nv12_uv_offset,
+                nv12_uv_stride,
+                /*snapshot_was_undefined=*/ true,
+            )?;
+
+            let mut snap = snapshot;
+            snap.layout = vk::ImageLayout::GENERAL;
+            self.prev_image = Some(snap);
 
             return Ok(FrameAnalysis {
                 dirty_tiles: all_dirty,
@@ -554,7 +601,15 @@ impl GpuFrameProcessor {
         }
 
         // --- Subsequent frames: both SAD and NV12 in one command buffer ---
-        let prev = self.prev_image.as_ref().unwrap();
+        // Pull the fields we need from prev_image up-front so we don't hold a
+        // borrow on `self.prev_image` while we mutably touch other parts of
+        // `self`. prev_image is owned (allocate_owned_image) and persistent —
+        // its `image`/`view` handles stay valid until `prev_image` is replaced
+        // (only on resolution change), so caching them by value is safe within
+        // this call.
+        let prev_image = self.prev_image.as_ref().unwrap().image;
+        let prev_view = self.prev_image.as_ref().unwrap().view;
+        let prev_layout = self.prev_image.as_ref().unwrap().layout;
 
         // Allocate descriptor sets for both passes.
         let sad_set_layouts = [self.descriptor_set_layout];
@@ -576,7 +631,7 @@ impl GpuFrameProcessor {
             .image_view(current.view)
             .image_layout(vk::ImageLayout::GENERAL)];
         let prev_image_info = [vk::DescriptorImageInfo::default()
-            .image_view(prev.view)
+            .image_view(prev_view)
             .image_layout(vk::ImageLayout::GENERAL)];
         let sad_buffer_info = [vk::DescriptorBufferInfo::default()
             .buffer(self.sad_buffer)
@@ -654,13 +709,13 @@ impl GpuFrameProcessor {
                 .src_access_mask(vk::AccessFlags::HOST_WRITE)
                 .dst_access_mask(vk::AccessFlags::SHADER_READ),
             vk::ImageMemoryBarrier::default()
-                .old_layout(prev.layout)
+                .old_layout(prev_layout)
                 .new_layout(vk::ImageLayout::GENERAL)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(prev.image)
+                .image(prev_image)
                 .subresource_range(subresource_range)
-                .src_access_mask(if prev.layout == vk::ImageLayout::PREINITIALIZED {
+                .src_access_mask(if prev_layout == vk::ImageLayout::PREINITIALIZED {
                     vk::AccessFlags::HOST_WRITE
                 } else {
                     vk::AccessFlags::SHADER_READ
@@ -744,6 +799,91 @@ impl GpuFrameProcessor {
         let nv12_groups_y = height.div_ceil(2);
         self.device.cmd_dispatch(cmd, nv12_groups_x, nv12_groups_y, 1);
 
+        // 5a. Snapshot copy: current (DMA-BUF) → prev_image (owned). This
+        // makes prev_image a true point-in-time snapshot of THIS frame for
+        // the next frame's SAD comparison. Must run AFTER both SAD and NV12
+        // shader reads, since they read from current.
+        let copy_barriers = [
+            // current: SHADER_READ → TRANSFER_READ
+            vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(current.image)
+                .subresource_range(subresource_range)
+                .src_access_mask(vk::AccessFlags::SHADER_READ)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ),
+            // prev_image: SHADER_READ → TRANSFER_WRITE
+            vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(prev_image)
+                .subresource_range(subresource_range)
+                .src_access_mask(vk::AccessFlags::SHADER_READ)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE),
+        ];
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &copy_barriers,
+        );
+
+        let copy_region = [vk::ImageCopy::default()
+            .src_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .src_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+            .dst_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .dst_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })];
+        self.device.cmd_copy_image(
+            cmd,
+            current.image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            prev_image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &copy_region,
+        );
+
+        // 5b. Restore prev_image to GENERAL for next frame's SAD pass.
+        let post_copy_barrier = [vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(prev_image)
+            .subresource_range(subresource_range)
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)];
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &post_copy_barrier,
+        );
+
         // 5. Barriers: SAD buffer → HOST_READ; NV12 buffer → HOST_READ
         let buf_barriers = [
             vk::BufferMemoryBarrier::default()
@@ -790,16 +930,33 @@ impl GpuFrameProcessor {
             .filter(|&i| sad_slice[i as usize] > SAD_THRESHOLD)
             .collect();
 
+        // Diagnostic: SAD distribution. Helps diagnose "no dirty tiles ever" cases
+        // where the FB exported via PRIME isn't seeing Xorg renders (PageFlip,
+        // ShadowFB-not-flushing, DMA-BUF coherency, etc.).
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let max_sad = sad_slice.iter().copied().max().unwrap_or(0);
+            let nonzero = sad_slice.iter().filter(|&&s| s > 0).count();
+            tracing::debug!(
+                tile_count,
+                dirty_count = dirty.len(),
+                max_sad,
+                nonzero_sad_tiles = nonzero,
+                threshold = SAD_THRESHOLD,
+                "SAD pass complete"
+            );
+        }
+
         // 8. Free descriptor sets
         self.device
             .free_descriptor_sets(self.descriptor_pool, &[sad_ds, nv12_ds])?;
 
-        // 9. Swap prev_image
-        let old_prev = self.prev_image.take().unwrap();
-        self.destroy_prev_frame(old_prev);
-        let mut cur = current;
-        cur.layout = vk::ImageLayout::GENERAL;
-        self.prev_image = Some(cur);
+        // 9. prev_image is persistent (own-allocated, layout still GENERAL
+        // after the post-copy barrier). It now holds a snapshot of THIS frame
+        // for next frame's SAD comparison. The imported `current` is destroyed
+        // by the caller (process_frame_inner).
+        if let Some(prev_mut) = self.prev_image.as_mut() {
+            prev_mut.layout = vk::ImageLayout::GENERAL;
+        }
 
         Ok(FrameAnalysis {
             dirty_tiles: dirty,
@@ -814,15 +971,27 @@ impl GpuFrameProcessor {
 
     /// Run only the NV12 conversion (used on the first frame, when there is no
     /// previous frame to compare against for SAD).
-    unsafe fn run_nv12_only(
+    /// First-frame helper: NV12 conversion + snapshot copy.
+    ///
+    /// On the first frame we have no SAD comparison to do (no prev), so we
+    /// only run NV12 and then `cmdCopyImage(current → snapshot)` to seed
+    /// `snapshot` with this frame's content for subsequent SAD passes.
+    ///
+    /// `snapshot_was_undefined`: pass `true` if `snapshot` is freshly allocated
+    /// (`vk::ImageLayout::UNDEFINED`); we transition it directly to
+    /// `TRANSFER_DST_OPTIMAL`. If `false`, we transition from `GENERAL`.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run_nv12_and_snapshot(
         &self,
         current: &PrevFrame,
+        snapshot: &PrevFrame,
         width: u32,
         height: u32,
         nv12_buffer: vk::Buffer,
         nv12_y_stride: u32,
         nv12_uv_offset: u32,
         nv12_uv_stride: u32,
+        snapshot_was_undefined: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Allocate NV12 descriptor set.
         let nv12_set_layouts = [self.nv12_descriptor_set_layout];
@@ -917,6 +1086,96 @@ impl GpuFrameProcessor {
         let nv12_groups_x = width.div_ceil(2);
         let nv12_groups_y = height.div_ceil(2);
         self.device.cmd_dispatch(cmd, nv12_groups_x, nv12_groups_y, 1);
+
+        // Snapshot copy: current (GENERAL) → snapshot (TRANSFER_DST_OPTIMAL).
+        let snap_old_layout = if snapshot_was_undefined {
+            vk::ImageLayout::UNDEFINED
+        } else {
+            vk::ImageLayout::GENERAL
+        };
+        let snap_old_access = if snapshot_was_undefined {
+            vk::AccessFlags::empty()
+        } else {
+            vk::AccessFlags::SHADER_READ
+        };
+        let snap_barriers = [
+            vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(current.image)
+                .subresource_range(subresource_range)
+                .src_access_mask(vk::AccessFlags::SHADER_READ)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ),
+            vk::ImageMemoryBarrier::default()
+                .old_layout(snap_old_layout)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(snapshot.image)
+                .subresource_range(subresource_range)
+                .src_access_mask(snap_old_access)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE),
+        ];
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &snap_barriers,
+        );
+
+        let copy_region = [vk::ImageCopy::default()
+            .src_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .src_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+            .dst_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .dst_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })];
+        self.device.cmd_copy_image(
+            cmd,
+            current.image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            snapshot.image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &copy_region,
+        );
+
+        // Restore snapshot to GENERAL for next frame's SAD pass.
+        let post_copy_barrier = [vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(snapshot.image)
+            .subresource_range(subresource_range)
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)];
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &post_copy_barrier,
+        );
 
         // NV12 buffer → HOST_READ
         let buf_barrier = [vk::BufferMemoryBarrier::default()
@@ -1083,6 +1342,90 @@ impl GpuFrameProcessor {
         self.device.destroy_image_view(frame.view, None);
         self.device.destroy_image(frame.image, None);
         self.device.free_memory(frame.memory, None);
+    }
+
+    /// Allocate an own (non-DMA-BUF, DEVICE_LOCAL) `B8G8R8A8_UNORM` image used
+    /// as the persistent "previous frame" snapshot for SAD comparison.
+    ///
+    /// Why this exists: the live framebuffer exported via PRIME has unstable
+    /// memory semantics — every `import_dmabuf()` call returns VkImages backed
+    /// by the SAME physical memory (the active scanout buffer that Xorg/KMS
+    /// keeps writing to). Using one of those imports as `prev_image` makes
+    /// SAD compare two views of the SAME bytes at SAME instant → SAD always 0
+    /// → no dirty tiles ever detected. We instead `cmdCopyImage(current →
+    /// prev_snapshot)` after each frame to capture a true point-in-time
+    /// snapshot independent of the live FB.
+    unsafe fn allocate_owned_image(
+        &self,
+        width: u32,
+        height: u32,
+    ) -> Result<PrevFrame, Box<dyn std::error::Error>> {
+        // STORAGE so SAD shader can imageLoad; TRANSFER_DST so we can
+        // cmdCopyImage from the imported DMA-BUF into it; OPTIMAL tiling
+        // for best read perf (we never CPU-map this image).
+        let image_ci = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::B8G8R8A8_UNORM)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+
+        let image = self.device.create_image(&image_ci, None)?;
+        let mem_reqs = self.device.get_image_memory_requirements(image);
+
+        let mem_props = self
+            .instance
+            .get_physical_device_memory_properties(self.physical_device);
+        let mem_type = find_memory_type(
+            &mem_props,
+            mem_reqs.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )
+        .or_else(|| find_memory_type(&mem_props, mem_reqs.memory_type_bits, vk::MemoryPropertyFlags::empty()))
+        .ok_or("no suitable memory type for owned snapshot image")?;
+
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(mem_reqs.size)
+            .memory_type_index(mem_type);
+        let memory = self.device.allocate_memory(&alloc_info, None)?;
+        self.device.bind_image_memory(image, memory, 0)?;
+
+        let view_ci = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(vk::Format::B8G8R8A8_UNORM)
+            .components(vk::ComponentMapping {
+                r: vk::ComponentSwizzle::IDENTITY,
+                g: vk::ComponentSwizzle::IDENTITY,
+                b: vk::ComponentSwizzle::IDENTITY,
+                a: vk::ComponentSwizzle::IDENTITY,
+            })
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        let view = self.device.create_image_view(&view_ci, None)?;
+
+        Ok(PrevFrame {
+            image,
+            memory,
+            view,
+            layout: vk::ImageLayout::UNDEFINED,
+            width,
+            height,
+        })
     }
 }
 

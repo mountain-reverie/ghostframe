@@ -400,7 +400,10 @@ impl IoBridge {
 
         let max_dg_size = match self.compute_max_datagram_size() {
             Some(sz) => sz,
-            None => return,
+            None => {
+                tracing::debug!(seq, "process_frame_gpu: no connected sessions, dropping");
+                return;
+            }
         };
 
         // GPU pipeline: Vulkan SAD dirty detection + NV12 conversion
@@ -413,6 +416,12 @@ impl IoBridge {
                 return;
             }
         };
+
+        tracing::debug!(
+            seq,
+            dirty_count = analysis.dirty_tiles.len(),
+            "process_frame_gpu: dirty tile detection complete"
+        );
 
         if analysis.dirty_tiles.is_empty() {
             return;
