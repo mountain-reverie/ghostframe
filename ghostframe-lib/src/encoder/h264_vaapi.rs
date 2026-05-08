@@ -659,19 +659,16 @@ impl FullFrameEncoder {
 
         let opened = ctx.open_with(opts)?;
 
-        let scaler = scaling::Context::get(
-            Pixel::BGRA,
-            width,
-            height,
-            Pixel::YUV420P,
-            width,
-            height,
-            scaling::Flags::FAST_BILINEAR,
-        )?;
+        // Note: we don't preinitialize the scaler here. `encode_frame`
+        // (BGRA input) and `encode_nv12_buffer` (NV12 input) each lazily
+        // create a scaler with the correct *input* pixel format on first
+        // use. Pre-creating a BGRA scaler would cause `encode_nv12_buffer`
+        // to receive `Error::InputChanged` from `scaler.run` because the
+        // input format wouldn't match (NV12 vs BGRA).
 
         Ok(Self {
             encoder: opened,
-            scaler: Some(scaler),
+            scaler: None,
             pts: 0,
             use_vaapi: false,
             enc_w: width,
@@ -1030,8 +1027,21 @@ impl FullFrameEncoder {
 
             libc::munmap(ptr, buf_size);
 
-            // Scale BGRA → YUV420P.
-            let scaler = self.scaler.as_mut().expect("sw path needs scaler");
+            // Scale BGRA → YUV420P. The scaler is lazily created on first
+            // use so it always matches the actual input pixel format
+            // (BGRA here vs NV12 in `encode_nv12_buffer`).
+            let scaler = self.scaler.get_or_insert_with(|| {
+                scaling::Context::get(
+                    Pixel::BGRA,
+                    width,
+                    height,
+                    Pixel::YUV420P,
+                    width,
+                    height,
+                    scaling::Flags::FAST_BILINEAR,
+                )
+                .expect("swscale BGRA→YUV420P context failed")
+            });
             let mut yuv_frame = frame::Video::empty();
             scaler.run(&bgra_frame, &mut yuv_frame)?;
             yuv_frame.set_pts(Some(pts));
