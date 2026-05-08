@@ -18,6 +18,12 @@ export DISPLAY=:99
 # read the FB the test-pattern attaches.
 if [[ "${TEST_PATTERN:-}" == *--drm-direct* ]]; then
     echo "entrypoint: TEST_PATTERN is DRM-direct, skipping Xorg"
+    # Override the line-13 default of 2 fps: the DRM-direct path is
+    # GPU-light (no Xorg compositor in the loop) and needs a higher capture
+    # rate so the classifier-flip e2e windows see enough H.264 datagrams
+    # during motion phases. Caller can override via CAPTURE_FPS_DRM_DIRECT
+    # for ad-hoc experiments.
+    export CAPTURE_FPS=${CAPTURE_FPS_DRM_DIRECT:-30}
     ghostframe-test-pattern ${TEST_PATTERN} &
     sleep 1
     exec /usr/local/bin/ghostframe-xdaemon
