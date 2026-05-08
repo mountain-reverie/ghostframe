@@ -1294,6 +1294,9 @@ name = "ghostframe-test-pattern"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "drm",
+ "drm-ffi",
+ "libc",
  "x11rb",
 ]
 

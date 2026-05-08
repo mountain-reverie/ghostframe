@@ -7,3 +7,4 @@ pub mod font;
 pub mod text_grid;
 pub mod mixed;
 pub mod mode_switch;
+pub mod drm_direct;

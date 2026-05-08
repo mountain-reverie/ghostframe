@@ -13,6 +13,16 @@ export DRM_DEVICE=${DRM_DEVICE:-/dev/dri/card0}
 export CAPTURE_FPS=${CAPTURE_FPS:-2}
 export DISPLAY=:99
 
+# If TEST_PATTERN uses DRM-direct mode, skip Xorg entirely — test-pattern
+# will be the DRM master itself and ghostframe-xdaemon's drm_capture will
+# read the FB the test-pattern attaches.
+if [[ "${TEST_PATTERN:-}" == *--drm-direct* ]]; then
+    echo "entrypoint: TEST_PATTERN is DRM-direct, skipping Xorg"
+    ghostframe-test-pattern ${TEST_PATTERN} &
+    sleep 1
+    exec /usr/local/bin/ghostframe-xdaemon
+fi
+
 # If XORG_CONF is unset, auto-detect the right config:
 #   - /etc/X11/xorg-vkms.conf if /dev/dri/card0 is a VKMS device
 #     (presence-of-Writeback connector heuristic).

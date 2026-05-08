@@ -1069,7 +1069,7 @@ async fn e2e_multi_pattern() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires host VKMS module (sudo modprobe vkms enable_writeback=1) and Docker GPU passthrough"]
 async fn e2e_mode_switch() -> Result<()> {
-    let setup = setup_e2e_gpu("--mode-switch-cycle 3").await?;
+    let setup = setup_e2e_gpu("--drm-direct --mode-switch-cycle 3").await?;
 
     // 14 seconds covers two full 6-second cycles plus settle time.
     let total = Duration::from_secs(14);
