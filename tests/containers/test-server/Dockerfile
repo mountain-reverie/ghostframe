@@ -41,7 +41,8 @@ COPY ghostframe-xdaemon/ ghostframe-xdaemon/
 COPY ghostframe-test-pattern/ ghostframe-test-pattern/
 
 ENV CARGO_BUILD_JOBS=1
-RUN cargo build --release -p ghostframe-xdaemon -p ghostframe-test-pattern
+RUN cargo build --release -p ghostframe-xdaemon -p ghostframe-test-pattern \
+    && cargo build --release -p ghostframe-xdaemon --example writeback_probe
 
 # Stage 2: Runtime image
 FROM ubuntu:24.04
@@ -69,6 +70,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /build/target/release/ghostframe-xdaemon /usr/local/bin/ghostframe-xdaemon
 COPY --from=builder /build/target/release/ghostframe-test-pattern /usr/local/bin/ghostframe-test-pattern
+COPY --from=builder /build/target/release/examples/writeback_probe /usr/local/bin/writeback_probe
 COPY tests/containers/test-server/entrypoint.sh /entrypoint.sh
 COPY tests/containers/test-server/xorg.conf /etc/X11/xorg.conf
 COPY tests/containers/test-server/xorg-odd.conf /etc/X11/xorg-odd.conf
