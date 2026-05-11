@@ -35,6 +35,24 @@ struct Args {
     #[arg(long)]
     mixed: bool,
 
+    /// Cycle between static and motion content every `SECS` seconds (so the
+    /// full cycle is `2 * SECS`). Drives `e2e_mode_switch` to verify the
+    /// classifier flips between H264 and TileCodec modes.
+    #[arg(long)]
+    mode_switch_cycle: Option<u64>,
+
+    /// Run as a DRM master and paint directly to `/dev/dri/card<N>`'s scanout
+    /// instead of speaking X11. Required for environments where Xorg holds
+    /// the DRM master and prevents framebuffer-update propagation (e.g.
+    /// VKMS). Mutually exclusive with the X11 modes; combine with
+    /// `--mode-switch-cycle`.
+    #[arg(long)]
+    drm_direct: bool,
+
+    /// DRM device path for `--drm-direct`. Defaults to `/dev/dri/card0`.
+    #[arg(long, default_value = "/dev/dri/card0")]
+    drm_device: String,
+
     /// (Ignored — kept for CLI compat.) Window width.
     #[arg(long, default_value = "640")]
     width: u16,
@@ -46,9 +64,26 @@ struct Args {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+
+    // DRM-direct path: take DRM master and paint straight to scanout.
+    // Must run before any X11 connect attempt — there is no X server in
+    // this configuration.
+    if args.drm_direct {
+        let secs = args.mode_switch_cycle.ok_or_else(|| {
+            "--drm-direct requires --mode-switch-cycle SECS".to_string()
+        })?;
+        let half = std::time::Duration::from_secs(secs);
+        return ghostframe_test_pattern::drm_direct::run(&args.drm_device, half);
+    }
+
     let (conn, screen_num) = x11rb::connect(None)?;
     let screen = &conn.setup().roots[screen_num];
     let root = screen.root;
+
+    if let Some(secs) = args.mode_switch_cycle {
+        let half = std::time::Duration::from_secs(secs);
+        return ghostframe_test_pattern::mode_switch::run(&conn, root, half);
+    }
 
     if args.mixed {
         // Mutually exclusive — render four regions and run the spinner forever.

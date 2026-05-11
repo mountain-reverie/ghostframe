@@ -163,6 +163,12 @@ async function main() {
     }
   }
 
+  // Test-instrumentation counters. Polled by `e2e_mode_switch` via Playwright.
+  // Reset on every new session so cumulative counts match the test's window.
+  // Type comes from src/globals.d.ts.
+  window.__ghostframeStats = { tileDatagrams: 0, frameDatagrams: 0 };
+  const stats = window.__ghostframeStats;
+
   // Receive datagrams
   const reader = transport.datagrams.readable.getReader();
   while (true) {
@@ -197,6 +203,7 @@ async function main() {
 
       const frameHdr = decodeFrameHeader(view, 0);
       lossTracker.onDatagram();
+      stats.frameDatagrams++;
 
       // Stale frame discard
       if (frameHdr.frameSeq < latestFullFrameSeq - 2) continue;
@@ -272,6 +279,7 @@ async function main() {
     const dgramHdr = decodeDatagramHeader(view, 0);
     dgramHdr.frameSeq = dgramHdr.frameSeq & ~TILE_DATAGRAM_FLAG;
     lossTracker.onDatagram();
+    stats.tileDatagrams++;
     const tileHdr = decodeTileHeader(view, DATAGRAM_HEADER_SIZE);
 
     // Track the latest frame sequence number

@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::Result;
 use chromiumoxide::{Browser, BrowserConfig};
 use futures::StreamExt;
-use testcontainers::core::{IntoContainerPort, WaitFor};
+use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
 use testcontainers::{runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt};
 
 /// Fixed host port for headscale.  Using a fixed port lets us construct the
@@ -158,10 +158,26 @@ struct E2eSetup {
 }
 
 async fn setup_e2e(test_pattern_args: &str) -> Result<E2eSetup> {
-    setup_e2e_with_env(test_pattern_args, &[]).await
+    setup_e2e_inner(test_pattern_args, &[], false).await
 }
 
 async fn setup_e2e_with_env(test_pattern_args: &str, extra_env: &[(&str, &str)]) -> Result<E2eSetup> {
+    setup_e2e_inner(test_pattern_args, extra_env, false).await
+}
+
+/// Variant of `setup_e2e` that bind-mounts the host's `/dev/dri` into the
+/// container and runs privileged so `xdaemon`'s DRM capture can use VKMS
+/// (host must have `vkms` module loaded with `enable_writeback=1`). The
+/// container's Xorg switches to the modesetting driver via `XORG_CONF`.
+async fn setup_e2e_gpu(test_pattern_args: &str) -> Result<E2eSetup> {
+    setup_e2e_inner(test_pattern_args, &[], true).await
+}
+
+async fn setup_e2e_inner(
+    test_pattern_args: &str,
+    extra_env: &[(&str, &str)],
+    gpu: bool,
+) -> Result<E2eSetup> {
     let hs_server_url = format!("http://{DOCKER_HOST_IP}:{HEADSCALE_HOST_PORT}");
 
     let headscale: ContainerAsync<GenericImage> =
@@ -189,6 +205,16 @@ async fn setup_e2e_with_env(test_pattern_args: &str, extra_env: &[(&str, &str)])
             .with_env_var("TEST_PATTERN", test_pattern_args);
     for (k, v) in extra_env {
         server_image = server_image.with_env_var(*k, *v);
+    }
+    if gpu {
+        // Switch Xorg to the modesetting driver targeting VKMS card0.
+        server_image = server_image.with_env_var("XORG_CONF", "/etc/X11/xorg-vkms.conf");
+        // Bind-mount the host's DRM nodes so the container's Xorg + xdaemon
+        // can drive VKMS card0 and use renderD128 for VA-API.
+        server_image = server_image.with_mount(Mount::bind_mount("/dev/dri", "/dev/dri"));
+        // Privileged is the pragmatic choice for solo dev; production CI
+        // would narrow to cap_add(SYS_ADMIN) + cgroup device rules.
+        server_image = server_image.with_privileged(true);
     }
     let server: ContainerAsync<GenericImage> = server_image
             .with_ready_conditions(vec![WaitFor::message_on_stdout("CERT_HASH_SHA256=")])
@@ -1029,6 +1055,160 @@ async fn e2e_multi_pattern() -> Result<()> {
     //           tiles are encoded with `region.expected_codec`. Will require
     //           a per-tile codec stats channel from server → test (not
     //           shipped pre-M3).
+
+    Ok(())
+}
+
+/// M3.0: Verify the classifier switches between TileCodec and H264 frame
+/// modes in response to alternating static/motion content.
+///
+/// The test pattern toggles every 3 seconds (--mode-switch-cycle 3): static,
+/// then motion, then static, etc. We sample the web client's per-mode datagram
+/// counters every 250 ms over ~20 seconds. Because the test pattern starts on
+/// its own clock inside the container, we anchor the timeline to the FIRST
+/// sample with non-zero datagrams, then bin subsequent deltas into 3-second
+/// "phases" relative to that anchor.
+///
+/// Assertions:
+/// - both datagram kinds must be observed (basic precondition: tile_seen && frame_seen),
+/// - at least one phase must be H264-dominated (frame deltas substantially
+///   outnumber tile deltas — characteristic of a motion phase),
+/// - some phase must contain TileCodec emissions,
+/// - **at least 2 distinct frame-dominated phases must be observed.** This is
+///   the load-bearing proof of bidirectional mode switching: the classifier
+///   must have ENTERED H264 (phase 1), then EXITED it (otherwise we wouldn't
+///   see a *distinct* later entry), then RE-ENTERED H264 (phase 2). Both
+///   directions exercised transitively without depending on observable
+///   datagrams during the exit (static halves are silent — no dirty tiles →
+///   no datagrams either way, regardless of mode).
+///
+/// FUTURE PHASE (M3.3+): once progressive CDF 5/3 refinement is wired, the
+/// static halves will produce wavelet bit-plane datagrams (lossless build-up
+/// from H264 snapshot toward pixel-perfect). At that point the test can
+/// observe **direct** mode transitions during static phases (Frame →
+/// refinement-Tile datagrams instead of silence), and the "≥2 distinct
+/// frame-dominated phases" indirection can tighten to "≥2 explicit Frame→Tile
+/// flips and ≥1 explicit Tile→Frame flip." Tracked in memory note
+/// `project_m33_static_refinement.md`.
+#[tokio::test]
+async fn e2e_mode_switch() -> Result<()> {
+    let setup = setup_e2e_gpu("--drm-direct --mode-switch-cycle 3").await?;
+
+    // 20 seconds: covers three full 6-second cycles plus startup settle.
+    // The shorter 14s window occasionally hits a startup race where most
+    // sampling lands on static halves and frame_seen flakes false.
+    let total = Duration::from_secs(20);
+    let interval = Duration::from_millis(250);
+    let started = tokio::time::Instant::now();
+    let mut samples: Vec<(u64, u64, u64)> = Vec::new(); // (elapsed_ms, tile, frame)
+
+    while tokio::time::Instant::now() - started < total {
+        let v: serde_json::Value = setup
+            .page
+            .evaluate(
+                "(() => { const s = window.__ghostframeStats || {tileDatagrams:0, frameDatagrams:0}; return {t: s.tileDatagrams, f: s.frameDatagrams}; })()",
+            )
+            .await?
+            .into_value()?;
+        let elapsed_ms = (tokio::time::Instant::now() - started).as_millis() as u64;
+        let tile = v["t"].as_u64().unwrap_or(0);
+        let frame = v["f"].as_u64().unwrap_or(0);
+        samples.push((elapsed_ms, tile, frame));
+        tokio::time::sleep(interval).await;
+    }
+
+    // Compute per-sample deltas (events per 250 ms window).
+    let deltas: Vec<(u64, i64, i64)> = samples
+        .windows(2)
+        .map(|w| {
+            (
+                w[1].0,
+                w[1].1 as i64 - w[0].1 as i64,
+                w[1].2 as i64 - w[0].2 as i64,
+            )
+        })
+        .collect();
+
+    let tile_seen  = deltas.iter().any(|(_, dt, _)| *dt > 0);
+    let frame_seen = deltas.iter().any(|(_, _, df)| *df > 0);
+
+    // Anchor timeline to the first non-zero delta — that's our best estimate
+    // of when the test pattern began streaming.
+    let t_first_data = deltas
+        .iter()
+        .find(|(_, dt, df)| *dt > 0 || *df > 0)
+        .map(|(t, _, _)| *t);
+
+    // Bin into 3-second phases relative to t_first_data.
+    // PHASE_MS matches --mode-switch-cycle 3 (3000 ms per static/motion half).
+    const PHASE_MS: u64 = 3000;
+    let mut phases: Vec<(i64, i64)> = Vec::new(); // (tile_total, frame_total)
+    if let Some(anchor) = t_first_data {
+        for (t, dt, df) in &deltas {
+            if *t < anchor { continue; }
+            let phase_idx = ((*t - anchor) / PHASE_MS) as usize;
+            while phases.len() <= phase_idx {
+                phases.push((0, 0));
+            }
+            phases[phase_idx].0 += *dt;
+            phases[phase_idx].1 += *df;
+        }
+    }
+
+    // Frame-dominated phase: H264 frames substantially outnumber tile datagrams.
+    // Use a 5x ratio with a minimum frame count to filter noise around
+    // cooldown periods where a few residual frame fragments could fire.
+    const FRAME_DOMINANCE_RATIO: i64 = 5;
+    const MIN_FRAME_COUNT_FOR_DOMINANCE: i64 = 10;
+    let is_frame_dominated = |(t, f): &(i64, i64)| -> bool {
+        *f >= MIN_FRAME_COUNT_FOR_DOMINANCE && *f >= FRAME_DOMINANCE_RATIO * t.max(&1)
+    };
+    let frame_dominated_phases: Vec<usize> = phases.iter()
+        .enumerate()
+        .filter(|(_, p)| is_frame_dominated(*p))
+        .map(|(i, _)| i)
+        .collect();
+
+    // Tile presence is harder to isolate because H.264 cooldown frames may
+    // overlap static phases. Just require non-zero tile emission in any phase.
+    let tile_present_phase = phases.iter().any(|(t, _)| *t > 0);
+
+    // Diagnostic table — print on any failure.
+    let pass = tile_seen
+        && frame_seen
+        && tile_present_phase
+        && frame_dominated_phases.len() >= 2;
+    if !pass {
+        eprintln!("--- per-sample deltas ---");
+        for (ms, dt, df) in &deltas {
+            eprintln!("t={ms:>5}ms  +tile={dt:>4}  +frame={df:>4}");
+        }
+        eprintln!("--- per-phase totals (anchor={:?}) ---", t_first_data);
+        for (i, (t, f)) in phases.iter().enumerate() {
+            let marker = if is_frame_dominated(&(*t, *f)) { " <FRAME-DOMINATED>" } else { "" };
+            eprintln!("phase {i}  tile={t:>5}  frame={f:>5}{marker}");
+        }
+        eprintln!(
+            "tile_seen={tile_seen} frame_seen={frame_seen} tile_present_phase={tile_present_phase} frame_dominated_phases={frame_dominated_phases:?}"
+        );
+    }
+
+    assert!(tile_seen,
+        "expected at least one tile datagram during the test (TileCodec mode); none observed");
+    assert!(frame_seen,
+        "expected at least one frame datagram during the test (H264 mode); none observed");
+    assert!(tile_present_phase,
+        "expected at least one phase containing TileCodec datagrams; classifier may be stuck in H264");
+    // Load-bearing assertion: 2+ distinct frame-dominated phases proves the
+    // classifier entered H264, *left it* (else the later phase wouldn't be a
+    // distinct entry), and re-entered. Both directions exercised transitively.
+    // This is the strongest assertion the architecture currently permits —
+    // static halves emit no datagrams, so direct Frame→Tile transitions can't
+    // be observed. See M3.3 future-work note in the function docstring.
+    assert!(frame_dominated_phases.len() >= 2,
+        "expected at least 2 distinct frame-dominated phases (proves classifier flipped both \
+         directions: H264 → exit → H264). Observed frame-dominated phase indices: {:?}",
+        frame_dominated_phases);
 
     Ok(())
 }

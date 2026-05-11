@@ -40,7 +40,7 @@ COPY ghostframe-lib/ ghostframe-lib/
 COPY ghostframe-xdaemon/ ghostframe-xdaemon/
 COPY ghostframe-test-pattern/ ghostframe-test-pattern/
 
-ENV CARGO_BUILD_JOBS=1
+ENV CARGO_BUILD_JOBS=2
 RUN cargo build --release -p ghostframe-xdaemon -p ghostframe-test-pattern
 
 # Stage 2: Runtime image
@@ -51,10 +51,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     xserver-xorg-core \
     xserver-xorg-video-dummy \
+    xserver-xorg-video-modesetting \
     x11-xserver-utils \
     x11-utils \
     mesa-utils \
     libgl1-mesa-dri \
+    libvulkan1 \
+    mesa-vulkan-drivers \
+    vulkan-tools \
     libavcodec60 \
     libavdevice60 \
     libavutil58 \
@@ -69,6 +73,7 @@ COPY tests/containers/test-server/entrypoint.sh /entrypoint.sh
 COPY tests/containers/test-server/xorg.conf /etc/X11/xorg.conf
 COPY tests/containers/test-server/xorg-odd.conf /etc/X11/xorg-odd.conf
 COPY tests/containers/test-server/xorg-multi.conf /etc/X11/xorg-multi.conf
+COPY tests/containers/test-server/xorg-vkms.conf /etc/X11/xorg-vkms.conf
 RUN chmod +x /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]
