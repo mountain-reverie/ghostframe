@@ -336,16 +336,14 @@ impl Classifier {
     /// `tentative_states` is the per-dirty-tile output of `classify_tile()`.
     /// `prev_mode` is what the previous frame emitted.
     ///
-    /// Caller short-circuits this function when `tentative_states.is_empty()` —
-    /// no frame is sent and no decision is needed.
+    /// Empty `tentative_states` is valid — it represents a frame with no dirty
+    /// tiles. In H264 mode, this contributes toward the exit-sustain counter
+    /// (cost is 0, below exit threshold).
     pub fn decide_frame_mode(
         &mut self,
         tentative_states: &[CodecState],
         prev_mode: FrameMode,
     ) -> FrameMode {
-        debug_assert!(!tentative_states.is_empty(),
-            "decide_frame_mode called with no dirty tiles — short-circuit at the call site");
-
         // Cost path. H264-classified tiles are excluded from the per-tile µs
         // sum because `estimated_tile_us(H264)` returns the full-frame VA-API
         // cost (`h264_frame_us`), which can't be summed per-tile coherently —
@@ -500,5 +498,44 @@ mod decide_tests {
             );
         }
         assert_eq!(c.decide_frame_mode(&states, FrameMode::TileCodec), FrameMode::H264);
+    }
+
+    #[test]
+    fn empty_tentative_in_h264_drives_exit_streak_to_completion() {
+        let mut c = Classifier::default();
+        // Pre-establish H264 mode by feeding enough enter-triggering frames.
+        let busy = h264_states(20);
+        for _ in 0..c.enter_sustain_frames {
+            c.decide_frame_mode(&busy, FrameMode::TileCodec);
+        }
+        // Now classifier is "in" H264 — caller would have set self.frame_mode = H264.
+
+        // Simulate frames with no dirty tiles (static content).
+        let empty: Vec<CodecState> = Vec::new();
+        for _ in 0..(c.exit_sustain_frames - 1) {
+            assert_eq!(
+                c.decide_frame_mode(&empty, FrameMode::H264),
+                FrameMode::H264,
+                "should not exit before sustain elapsed",
+            );
+        }
+        assert_eq!(
+            c.decide_frame_mode(&empty, FrameMode::H264),
+            FrameMode::TileCodec,
+            "empty dirty tiles for exit_sustain frames must flip H264 → TileCodec",
+        );
+    }
+
+    #[test]
+    fn empty_tentative_in_tilecodec_stays_tilecodec() {
+        let mut c = Classifier::default();
+        let empty: Vec<CodecState> = Vec::new();
+        for _ in 0..100 {
+            assert_eq!(
+                c.decide_frame_mode(&empty, FrameMode::TileCodec),
+                FrameMode::TileCodec,
+                "no input should never trigger H264 entry",
+            );
+        }
     }
 }

@@ -423,10 +423,6 @@ impl IoBridge {
             "process_frame_gpu: dirty tile detection complete"
         );
 
-        if analysis.dirty_tiles.is_empty() {
-            return;
-        }
-
         // Convert flat tile indices (Vec<u32>) into (tile_x, tile_y) pairs
         // matching the row-major layout used by MetricsTracker / TileGrid.
         let cols = frame.width.div_ceil(crate::tile::TILE_SIZE);
@@ -441,9 +437,12 @@ impl IoBridge {
         if self.metrics_tracker.cols() != cols || self.metrics_tracker.rows() != rows {
             self.metrics_tracker.resize(cols, rows);
         }
+        // Always update per-tile metrics — idle_frames advances on every frame,
+        // EMA decays toward 0 when tiles aren't dirty.
         self.metrics_tracker.record_frame(&dirty_xy);
 
-        // Per-dirty-tile tentative classification.
+        // Classify each dirty tile. Empty dirty_xy → empty tentative — that's
+        // the no-motion signal the classifier needs to exit H264 after exit_sustain.
         use crate::tile::{classifier::classify_tile, FrameMode};
         let tentative: Vec<crate::tile::CodecState> = dirty_xy
             .iter()
@@ -454,12 +453,25 @@ impl IoBridge {
             })
             .collect();
 
-        // Frame-mode decision.
-        let new_mode = self.classifier.decide_frame_mode(&tentative, self.frame_mode);
+        // Capture previous mode before evaluating the classifier, so the
+        // keyframe-request guard below can compare prev vs. new.
+        let prev_mode = self.frame_mode;
 
-        // Persist tentative state back into per-tile metrics.
+        // Always evaluate mode — empty tentative drives the exit-sustain counter.
+        let new_mode = self.classifier.decide_frame_mode(&tentative, prev_mode);
+
+        // Persist tentative state back into per-tile metrics for dirty tiles only.
         for (i, &(tx, ty)) in dirty_xy.iter().enumerate() {
             self.metrics_tracker.get_mut(tx, ty).codec_state = tentative[i];
+        }
+
+        // Update frame mode for next frame's hysteresis reference.
+        self.frame_mode = new_mode;
+
+        // No dirty tiles → nothing to emit (regardless of mode). The classifier
+        // already saw this frame above, so the exit-sustain counter advances.
+        if dirty_xy.is_empty() {
+            return;
         }
 
         match new_mode {
@@ -480,7 +492,7 @@ impl IoBridge {
                 }
 
                 // Re-entry into H264: force IDR for a fresh client anchor.
-                if self.frame_mode == FrameMode::TileCodec {
+                if prev_mode == FrameMode::TileCodec {
                     if let Some(enc) = self.full_frame_encoder.as_mut() {
                         enc.request_keyframe();
                     }
@@ -498,12 +510,10 @@ impl IoBridge {
                 ) {
                     Ok(Some(enc)) => enc,
                     Ok(None) => {
-                        self.frame_mode = new_mode;
                         return;
                     }
                     Err(e) => {
                         tracing::warn!("NV12 encode failed: {e}");
-                        self.frame_mode = new_mode;
                         return;
                     }
                 };
@@ -552,7 +562,6 @@ impl IoBridge {
                 // the per-fragment payload size, not the raw datagram size.
                 let max_frag = max_fragment_payload(max_dg_size);
                 if max_frag == 0 {
-                    self.frame_mode = new_mode;
                     return;
                 }
 
@@ -573,7 +582,6 @@ impl IoBridge {
                                     "DMA-BUF readback failed in TileCodec mode: {e}; \
                                      skipping frame to avoid emitting zero-filled tiles",
                                 );
-                                self.frame_mode = new_mode;
                                 return;
                             }
                         },
@@ -582,7 +590,6 @@ impl IoBridge {
                                 "TileCodec mode but no pixels and no DMA-BUF fd; \
                                  skipping frame",
                             );
-                            self.frame_mode = new_mode;
                             return;
                         }
                     }
@@ -610,8 +617,6 @@ impl IoBridge {
                 }
             }
         }
-
-        self.frame_mode = new_mode;
     }
 
     /// Handle a NACK by retransmitting the requested fragment, but only if
