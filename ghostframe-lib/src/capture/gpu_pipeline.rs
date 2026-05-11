@@ -17,6 +17,78 @@ use ash::vk;
 use std::ffi::CStr;
 use std::io;
 
+// ---------------------------------------------------------------------------
+// RAII guards for per-frame transient Vulkan resources
+// ---------------------------------------------------------------------------
+//
+// `process_frame_with_imported` and `run_nv12_and_snapshot` allocate descriptor
+// sets, command buffers, and fences per call. Without RAII guards, any `?`
+// early-exit would leak those resources — and the descriptor pool has bounded
+// capacity (`max_sets=2`), so a few leaked sets would brick subsequent frames.
+//
+// Each guard frees its resource on drop; for these per-frame transients the
+// success path also goes through drop (no ownership transfer), so the
+// previously-explicit cleanup at the end of the success path collapses to
+// "let the guard drop normally at end of scope".
+
+struct ScopedDescriptorSets<'a> {
+    device: &'a ash::Device,
+    pool: vk::DescriptorPool,
+    sets: Vec<vk::DescriptorSet>,
+}
+
+impl Drop for ScopedDescriptorSets<'_> {
+    fn drop(&mut self) {
+        if !self.sets.is_empty() {
+            // SAFETY: sets/pool came from a successful allocate_descriptor_sets
+            // on `self.device`; freeing on drop is the matching deallocation.
+            // The pool was created with FREE_DESCRIPTOR_SET so this is legal.
+            // Errors are ignored — there's nothing useful to do on a free
+            // failure during teardown.
+            unsafe {
+                let _ = self.device.free_descriptor_sets(self.pool, &self.sets);
+            }
+        }
+    }
+}
+
+struct ScopedCommandBuffers<'a> {
+    device: &'a ash::Device,
+    pool: vk::CommandPool,
+    bufs: Vec<vk::CommandBuffer>,
+}
+
+impl Drop for ScopedCommandBuffers<'_> {
+    fn drop(&mut self) {
+        if !self.bufs.is_empty() {
+            // SAFETY: bufs/pool came from allocate_command_buffers on
+            // `self.device`. Free is the matching deallocation. Caller is
+            // responsible for ensuring the buffers are no longer in use
+            // (we only drop after wait_for_fences).
+            unsafe {
+                self.device.free_command_buffers(self.pool, &self.bufs);
+            }
+        }
+    }
+}
+
+struct ScopedFence<'a> {
+    device: &'a ash::Device,
+    fence: vk::Fence,
+}
+
+impl Drop for ScopedFence<'_> {
+    fn drop(&mut self) {
+        if self.fence != vk::Fence::null() {
+            // SAFETY: fence was created via create_fence on `self.device`.
+            // Caller must wait_for_fences before dropping (we do).
+            unsafe {
+                self.device.destroy_fence(self.fence, None);
+            }
+        }
+    }
+}
+
 /// Pixels-per-tile dimension (matches shader local_size_x/y).
 const TILE_SIZE: u32 = 32;
 
@@ -582,7 +654,6 @@ impl GpuFrameProcessor {
                 nv12_y_stride,
                 nv12_uv_offset,
                 nv12_uv_stride,
-                /*snapshot_was_undefined=*/ true,
             )?;
 
             let mut snap = snapshot;
@@ -611,20 +682,29 @@ impl GpuFrameProcessor {
         let prev_view = self.prev_image.as_ref().unwrap().view;
         let prev_layout = self.prev_image.as_ref().unwrap().layout;
 
-        // Allocate descriptor sets for both passes.
+        // Allocate descriptor sets for both passes. Wrap in RAII guards so any
+        // subsequent `?` early-exit frees the sets back to the bounded pool.
         let sad_set_layouts = [self.descriptor_set_layout];
         let sad_ds_alloc = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
             .set_layouts(&sad_set_layouts);
-        let sad_descriptor_sets = self.device.allocate_descriptor_sets(&sad_ds_alloc)?;
-        let sad_ds = sad_descriptor_sets[0];
+        let sad_ds_guard = ScopedDescriptorSets {
+            device: &self.device,
+            pool: self.descriptor_pool,
+            sets: self.device.allocate_descriptor_sets(&sad_ds_alloc)?,
+        };
+        let sad_ds = sad_ds_guard.sets[0];
 
         let nv12_set_layouts = [self.nv12_descriptor_set_layout];
         let nv12_ds_alloc = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
             .set_layouts(&nv12_set_layouts);
-        let nv12_descriptor_sets = self.device.allocate_descriptor_sets(&nv12_ds_alloc)?;
-        let nv12_ds = nv12_descriptor_sets[0];
+        let nv12_ds_guard = ScopedDescriptorSets {
+            device: &self.device,
+            pool: self.descriptor_pool,
+            sets: self.device.allocate_descriptor_sets(&nv12_ds_alloc)?,
+        };
+        let nv12_ds = nv12_ds_guard.sets[0];
 
         // Write SAD descriptor set.
         let current_image_info = [vk::DescriptorImageInfo::default()
@@ -678,13 +758,17 @@ impl GpuFrameProcessor {
         ];
         self.device.update_descriptor_sets(&nv12_writes, &[]);
 
-        // --- Command buffer ---
+        // --- Command buffer (RAII-guarded) ---
         let cmd_alloc = vk::CommandBufferAllocateInfo::default()
             .command_pool(self.command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
             .command_buffer_count(1);
-        let cmd_bufs = self.device.allocate_command_buffers(&cmd_alloc)?;
-        let cmd = cmd_bufs[0];
+        let cmd_guard = ScopedCommandBuffers {
+            device: &self.device,
+            pool: self.command_pool,
+            bufs: self.device.allocate_command_buffers(&cmd_alloc)?,
+        };
+        let cmd = cmd_guard.bufs[0];
 
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
@@ -757,18 +841,17 @@ impl GpuFrameProcessor {
         );
         self.device.cmd_dispatch(cmd, cols, rows, 1);
 
-        // 3. Barrier between SAD and NV12 dispatches (shared image read is fine,
-        //    but NV12 also writes to its buffer; SAD writes to its own buffer).
-        //    A simple COMPUTE→COMPUTE barrier on the image is sufficient.
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &[],
-        );
+        // 3. No barrier needed between SAD and NV12 dispatches:
+        //    - both read `current.image` (read-after-read is hazard-free),
+        //    - SAD writes `sad_buffer` and NV12 writes `nv12_buffer` — disjoint
+        //      regions, no overlap.
+        //    A previous version inserted an empty execution-only
+        //    COMPUTE→COMPUTE barrier here; per Vulkan 1.1 spec §6.1
+        //    (Execution and Memory Dependencies), an execution barrier with no
+        //    memory/buffer/image barriers and no access masks introduces no
+        //    memory dependency, and same-queue same-stage sequential dispatches
+        //    already have implicit execution ordering — so it was a no-op.
+        //    The HOST-readback barrier at step 5 covers both buffers.
 
         // 4. NV12 dispatch
         self.device
@@ -915,14 +998,17 @@ impl GpuFrameProcessor {
 
         self.device.end_command_buffer(cmd)?;
 
-        // 6. Submit and wait
+        // 6. Submit and wait. Fence is RAII-guarded so an early `?` can't leak it.
         let fence_ci = vk::FenceCreateInfo::default();
-        let fence = self.device.create_fence(&fence_ci, None)?;
-        let submit_info = vk::SubmitInfo::default().command_buffers(&cmd_bufs);
-        self.device.queue_submit(self.queue, &[submit_info], fence)?;
-        self.device.wait_for_fences(&[fence], true, u64::MAX)?;
-        self.device.destroy_fence(fence, None);
-        self.device.free_command_buffers(self.command_pool, &cmd_bufs);
+        let fence_guard = ScopedFence {
+            device: &self.device,
+            fence: self.device.create_fence(&fence_ci, None)?,
+        };
+        let submit_info = vk::SubmitInfo::default().command_buffers(&cmd_guard.bufs);
+        self.device
+            .queue_submit(self.queue, &[submit_info], fence_guard.fence)?;
+        self.device
+            .wait_for_fences(&[fence_guard.fence], true, u64::MAX)?;
 
         // 7. Read SAD values
         let sad_slice = std::slice::from_raw_parts(self.sad_ptr, tile_count as usize);
@@ -946,9 +1032,10 @@ impl GpuFrameProcessor {
             );
         }
 
-        // 8. Free descriptor sets
-        self.device
-            .free_descriptor_sets(self.descriptor_pool, &[sad_ds, nv12_ds])?;
+        // 8. Per-frame transients (descriptor sets, command buffer, fence) are
+        //    freed when their RAII guards drop at end of scope. We touch the
+        //    guards here to keep them alive past the `wait_for_fences` above.
+        let _ = (&sad_ds_guard, &nv12_ds_guard, &cmd_guard, &fence_guard);
 
         // 9. prev_image is persistent (own-allocated, layout still GENERAL
         // after the post-copy barrier). It now holds a snapshot of THIS frame
@@ -969,17 +1056,15 @@ impl GpuFrameProcessor {
         })
     }
 
-    /// Run only the NV12 conversion (used on the first frame, when there is no
-    /// previous frame to compare against for SAD).
     /// First-frame helper: NV12 conversion + snapshot copy.
     ///
     /// On the first frame we have no SAD comparison to do (no prev), so we
     /// only run NV12 and then `cmdCopyImage(current → snapshot)` to seed
     /// `snapshot` with this frame's content for subsequent SAD passes.
     ///
-    /// `snapshot_was_undefined`: pass `true` if `snapshot` is freshly allocated
-    /// (`vk::ImageLayout::UNDEFINED`); we transition it directly to
-    /// `TRANSFER_DST_OPTIMAL`. If `false`, we transition from `GENERAL`.
+    /// `snapshot` is always freshly allocated by the caller
+    /// (`allocate_owned_image`), so its starting layout is
+    /// `vk::ImageLayout::UNDEFINED` — we hardcode that transition.
     #[allow(clippy::too_many_arguments)]
     unsafe fn run_nv12_and_snapshot(
         &self,
@@ -991,15 +1076,19 @@ impl GpuFrameProcessor {
         nv12_y_stride: u32,
         nv12_uv_offset: u32,
         nv12_uv_stride: u32,
-        snapshot_was_undefined: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // Allocate NV12 descriptor set.
+        // Allocate NV12 descriptor set, RAII-guarded so any subsequent `?`
+        // early-exit returns the set to the bounded pool.
         let nv12_set_layouts = [self.nv12_descriptor_set_layout];
         let nv12_ds_alloc = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
             .set_layouts(&nv12_set_layouts);
-        let nv12_descriptor_sets = self.device.allocate_descriptor_sets(&nv12_ds_alloc)?;
-        let nv12_ds = nv12_descriptor_sets[0];
+        let nv12_ds_guard = ScopedDescriptorSets {
+            device: &self.device,
+            pool: self.descriptor_pool,
+            sets: self.device.allocate_descriptor_sets(&nv12_ds_alloc)?,
+        };
+        let nv12_ds = nv12_ds_guard.sets[0];
 
         let nv12_image_info = [vk::DescriptorImageInfo::default()
             .image_view(current.view)
@@ -1026,8 +1115,12 @@ impl GpuFrameProcessor {
             .command_pool(self.command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
             .command_buffer_count(1);
-        let cmd_bufs = self.device.allocate_command_buffers(&cmd_alloc)?;
-        let cmd = cmd_bufs[0];
+        let cmd_guard = ScopedCommandBuffers {
+            device: &self.device,
+            pool: self.command_pool,
+            bufs: self.device.allocate_command_buffers(&cmd_alloc)?,
+        };
+        let cmd = cmd_guard.bufs[0];
 
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
@@ -1088,16 +1181,9 @@ impl GpuFrameProcessor {
         self.device.cmd_dispatch(cmd, nv12_groups_x, nv12_groups_y, 1);
 
         // Snapshot copy: current (GENERAL) → snapshot (TRANSFER_DST_OPTIMAL).
-        let snap_old_layout = if snapshot_was_undefined {
-            vk::ImageLayout::UNDEFINED
-        } else {
-            vk::ImageLayout::GENERAL
-        };
-        let snap_old_access = if snapshot_was_undefined {
-            vk::AccessFlags::empty()
-        } else {
-            vk::AccessFlags::SHADER_READ
-        };
+        // `snapshot` is always freshly allocated by `allocate_owned_image` and
+        // its initial layout is UNDEFINED, so we hardcode that transition (no
+        // prior shader access to wait on).
         let snap_barriers = [
             vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::GENERAL)
@@ -1109,13 +1195,13 @@ impl GpuFrameProcessor {
                 .src_access_mask(vk::AccessFlags::SHADER_READ)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_READ),
             vk::ImageMemoryBarrier::default()
-                .old_layout(snap_old_layout)
+                .old_layout(vk::ImageLayout::UNDEFINED)
                 .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(snapshot.image)
                 .subresource_range(subresource_range)
-                .src_access_mask(snap_old_access)
+                .src_access_mask(vk::AccessFlags::empty())
                 .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE),
         ];
         self.device.cmd_pipeline_barrier(
@@ -1198,15 +1284,22 @@ impl GpuFrameProcessor {
 
         self.device.end_command_buffer(cmd)?;
 
+        // Fence is RAII-guarded so an early `?` can't leak it.
         let fence_ci = vk::FenceCreateInfo::default();
-        let fence = self.device.create_fence(&fence_ci, None)?;
-        let submit_info = vk::SubmitInfo::default().command_buffers(&cmd_bufs);
-        self.device.queue_submit(self.queue, &[submit_info], fence)?;
-        self.device.wait_for_fences(&[fence], true, u64::MAX)?;
-        self.device.destroy_fence(fence, None);
-        self.device.free_command_buffers(self.command_pool, &cmd_bufs);
+        let fence_guard = ScopedFence {
+            device: &self.device,
+            fence: self.device.create_fence(&fence_ci, None)?,
+        };
+        let submit_info = vk::SubmitInfo::default().command_buffers(&cmd_guard.bufs);
+        self.device
+            .queue_submit(self.queue, &[submit_info], fence_guard.fence)?;
+        self.device
+            .wait_for_fences(&[fence_guard.fence], true, u64::MAX)?;
 
-        self.device.free_descriptor_sets(self.descriptor_pool, &[nv12_ds])?;
+        // Per-frame transients (descriptor set, command buffer, fence) are
+        // freed when their RAII guards drop at end of scope. Touch them here
+        // to keep them alive past `wait_for_fences`.
+        let _ = (&nv12_ds_guard, &cmd_guard, &fence_guard);
 
         Ok(())
     }
