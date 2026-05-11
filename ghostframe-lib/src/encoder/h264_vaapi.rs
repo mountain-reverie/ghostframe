@@ -525,6 +525,13 @@ impl FullFrameEncoder {
         self.keyframe_pending = true;
     }
 
+    /// Test-only: peek at the pending-keyframe flag so reconnect coverage can
+    /// verify `request_keyframe()` was called without driving a real encode.
+    #[cfg(test)]
+    pub fn keyframe_pending(&self) -> bool {
+        self.keyframe_pending
+    }
+
     /// Create a DRM device context for the given render node.
     /// Used to derive a VAAPI context that supports DRM PRIME frame import.
     unsafe fn create_drm_device_ctx(

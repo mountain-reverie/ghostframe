@@ -32,7 +32,13 @@ use drm::Device;
 /// in memory bytes are `[B=0xA0, G=0x40, R=0x20, X=0x00]`. Matches the
 /// X11-based mode_switch's intent (steel-blue-ish).
 const STATIC_BG_PIXEL: u32 = 0x00_20_40_A0;
-const MOTION_TICK: Duration = Duration::from_millis(50);
+/// Motion paint interval. MUST be < capture interval so every captured frame
+/// sees a fresh paint and Vulkan SAD reports dirty tiles. With CAPTURE_FPS=30
+/// (33 ms), 50 ms paints would leave every-other capture seeing no change
+/// (empty dirty → classifier's `enter_streak` resets → never reaches sustain
+/// → mode never flips to H264). 16 ms (~60 Hz paint) safely beats any
+/// reasonable capture rate.
+const MOTION_TICK: Duration = Duration::from_millis(16);
 /// Band height matches `ghostframe-lib::tile::TILE_SIZE` (32 px) so every
 /// motion-band exactly covers one tile row in the capture grid. Kept in sync
 /// manually since `ghostframe-test-pattern` has no `ghostframe-lib`
