@@ -11,6 +11,13 @@
 //!
 //! Pixel format: XRGB8888 / DRM_FOURCC_XR24, packed as `[B, G, R, X]` little
 //! endian. Same convention used by VKMS' writeback target buffer.
+//!
+//! Resource cleanup: this is a test fixture that runs an infinite paint
+//! loop. The framebuffer + dumb buffer + DRM master are released by the
+//! kernel on process exit (including SIGKILL). For long-lived test
+//! sessions that get repeatedly SIGKILLed, the kernel may accumulate
+//! GEM handles in VKMS driver state — restart vkms via `rmmod && modprobe`
+//! if you see DRM-side resource exhaustion.
 
 use std::fs::File;
 use std::os::fd::{AsFd, BorrowedFd};
@@ -60,12 +67,23 @@ pub fn run(card_path: &str, half_cycle: Duration) -> Result<(), Box<dyn std::err
     // If another client (Xorg) holds it, we fail loudly so the test
     // operator knows to remove that client.
     if let Err(e) = drm_ffi::auth::acquire_master(card.as_fd()) {
-        // EACCES is typical when another client is master. EINVAL can
-        // happen when we already are master implicitly (some kernels).
-        // We log and continue — modeset below will tell us authoritatively.
-        eprintln!(
-            "drm_direct: acquire_master returned {e} (continuing; may already be master)"
-        );
+        // EACCES typically means another DRM client (Xorg/Wayland) owns
+        // master and `set_crtc` will also EACCES — surface that clearly.
+        // Other errors (e.g. EINVAL on some kernels when we already are
+        // master implicitly) are noisier and not necessarily fatal; we log
+        // and continue — modeset below will tell us authoritatively.
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            eprintln!(
+                "drm_direct: acquire_master EACCES — another DRM client owns master \
+                 on {card_path}. If set_crtc below also EACCES, check that no \
+                 Xorg/Wayland compositor is holding this device (host config: \
+                 /etc/X11/xorg.conf.d/*-ignore-vkms.conf with MatchDriver+Ignore=true)."
+            );
+        } else {
+            eprintln!(
+                "drm_direct: acquire_master returned {e} (continuing; may already be master)"
+            );
+        }
     } else {
         eprintln!("drm_direct: acquired DRM master on {card_path}");
     }
@@ -132,7 +150,7 @@ pub fn run(card_path: &str, half_cycle: Duration) -> Result<(), Box<dyn std::err
         .map_err(|e| format!("add_framebuffer: {e}"))?;
 
     // Pre-fill with the static background so set_crtc has valid content.
-    fill_solid(&card, &mut db, pitch, mode_h, STATIC_BG_PIXEL)?;
+    fill_solid(&card, &mut db, pitch, mode_w, mode_h, STATIC_BG_PIXEL)?;
 
     // Modeset: bind FB to CRTC and connector. This is where master-conflict
     // EACCES would surface.
@@ -153,7 +171,7 @@ pub fn run(card_path: &str, half_cycle: Duration) -> Result<(), Box<dyn std::err
         let cycle_start = Instant::now();
 
         // Static half: paint the buffer once with the solid colour.
-        fill_solid(&card, &mut db, pitch, mode_h, STATIC_BG_PIXEL)?;
+        fill_solid(&card, &mut db, pitch, mode_w, mode_h, STATIC_BG_PIXEL)?;
         thread::sleep(half_cycle);
 
         // Motion half: rewrite tile-aligned bands of shifting colours every
@@ -167,12 +185,16 @@ pub fn run(card_path: &str, half_cycle: Duration) -> Result<(), Box<dyn std::err
     }
 }
 
-/// Fill the buffer with a single packed-XRGB pixel value (rows respect
-/// `pitch`, which may exceed `width * 4`).
+/// Fill the buffer with a single packed-XRGB pixel value. Writes only the
+/// active `width * 4` bytes per row; any trailing pitch padding is left
+/// untouched (it isn't sampled by VKMS, but being conservative avoids
+/// surprises if this code is ever reused on a real GPU with a tighter
+/// pitch contract).
 fn fill_solid(
     card: &Card,
     db: &mut drm::control::dumbbuffer::DumbBuffer,
     pitch: u32,
+    width: u32,
     height: u32,
     pixel: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -181,11 +203,11 @@ fn fill_solid(
         .map_err(|e| format!("map_dumb_buffer: {e}"))?;
     let bytes = map.as_mut();
     let row_pitch = pitch as usize;
+    let row_active = (width as usize) * 4;
     let pixel_bytes = pixel.to_le_bytes();
     for y in 0..height as usize {
         let row_start = y * row_pitch;
-        // Each pixel is 4 bytes (XRGB8888).
-        let row_end = row_start + row_pitch;
+        let row_end = row_start + row_active;
         let row = &mut bytes[row_start..row_end];
         for chunk in row.chunks_exact_mut(4) {
             chunk.copy_from_slice(&pixel_bytes);
@@ -228,8 +250,7 @@ fn paint_motion(
         .map_err(|e| format!("map_dumb_buffer: {e}"))?;
     let bytes = map.as_mut();
     let row_pitch = pitch as usize;
-    let row_active_bytes = (width as usize) * 4;
-    let _ = row_active_bytes; // we fill full pitch since bg is uniform per row
+    let row_active = (width as usize) * 4;
     let mut band_idx: u8 = 0;
     let mut y = 0u32;
     while y < height {
@@ -247,7 +268,7 @@ fn paint_motion(
         let band_end = (y + BAND_H).min(height);
         for row in y..band_end {
             let row_start = (row as usize) * row_pitch;
-            let row_slice = &mut bytes[row_start..row_start + row_pitch];
+            let row_slice = &mut bytes[row_start..row_start + row_active];
             for chunk in row_slice.chunks_exact_mut(4) {
                 chunk.copy_from_slice(&pixel_bytes);
             }
