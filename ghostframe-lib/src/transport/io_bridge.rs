@@ -820,14 +820,16 @@ impl IoBridge {
                         wt.on_stream_readable(conn, id);
                         if !was_connected && wt.is_connected() {
                             // New WebTransport session just became active.
-                            // Reset dirty tracker and force all-dirty for
-                            // several frames so QUIC slow-start can open the
-                            // congestion window. A single burst can't deliver
-                            // all 300+ tiles for a 640x480 screen.
+                            // Initialize frame_mode to H264 so the first frame
+                            // emits a single compact IDR (~50 datagrams) instead
+                            // of an all-tiles raw burst (~8000 datagrams) that
+                            // QUIC slow-start would mostly drop. Classifier exits
+                            // back to TileCodec naturally after exit_sustain frames
+                            // of empty dirty (Task 17).
                             self.dirty_tracker.reset();
                             self.metrics_tracker.reset();
                             self.classifier.reset();
-                            self.frame_mode = crate::tile::FrameMode::TileCodec;
+                            self.frame_mode = crate::tile::FrameMode::H264;
                             self.force_dirty_frames = 20;
                             tracing::debug!(?handle, "new session connected, dirty tracker reset");
                         }
