@@ -21,7 +21,9 @@ pub struct CostModel {
     pub h264_frame_bytes: u32,
     /// Bandwidth weighting; placeholder until source spec §6.5 estimator lands.
     /// Default value matches a typical home-LAN link (100 Mbps → ~12.5 B/µs).
-    pub bytes_per_us: f32,
+    /// Private — accessed via `bytes_per_us()` per design D17 so the §6.5
+    /// estimator wire-up is a one-call change later.
+    bytes_per_us: f32,
 }
 
 impl Default for CostModel {
@@ -39,6 +41,14 @@ impl Default for CostModel {
 }
 
 impl CostModel {
+    /// Bandwidth weighting in B/µs. Currently a hardcoded placeholder
+    /// (~12.5 = 100 Mbps). Will be wired to the source-spec §6.5 estimator
+    /// in M4+; this single accessor is the swap-in point (per design D17).
+    pub fn bytes_per_us(&self) -> f32 { self.bytes_per_us }
+
+    /// Update the bandwidth weighting (call from §6.5 estimator).
+    pub fn set_bytes_per_us(&mut self, value: f32) { self.bytes_per_us = value; }
+
     /// Estimated emission size in bytes for a tile assigned to `state`.
     pub fn estimated_tile_bytes(&self, state: CodecState) -> u32 {
         match state {
@@ -74,7 +84,7 @@ mod cost_tests {
         let c = CostModel::default();
         // H.264 should dominate per-tile codec costs.
         assert!(c.h264_frame_us > c.solid_us * 1000.0);
-        assert!(c.bytes_per_us > 0.0);
+        assert!(c.bytes_per_us() > 0.0);
     }
 
     #[test]
@@ -95,9 +105,12 @@ mod cost_tests {
 /// read by any M3.0 rule — its NaN sentinel exists for forward compatibility
 /// with M3.3 rules.
 ///
-/// Hysteresis: while in `H264`, stay in H264 unless `change_freq_hz < 5.0`.
-/// (Per-tile hysteresis differs from the frame-mode hysteresis in
-/// `Classifier::decide_frame_mode`.)
+/// Hysteresis: when previous state is `H264`, the medium-frequency band
+/// (5-15 Hz) holds the tile in `H264 { frames_in_h264: n+1 }` rather than
+/// dropping to BC1 (Rule 4). Outside the medium-frequency band the rules
+/// apply normally — a tile that drops to low-freq (< 5 Hz) is re-classified
+/// fresh per Rules 6-8. (Per-tile hysteresis differs from the frame-mode
+/// hysteresis in `Classifier::decide_frame_mode`.)
 pub fn classify_tile(metrics: &TileMetrics, prev: &CodecState) -> CodecState {
     // Rule 1: idle ⇒ Skip
     if metrics.idle_frames > 0 {
@@ -275,6 +288,28 @@ mod classify_tests {
     }
 
     #[test]
+    fn unique_colors_16_picks_palrle() {
+        let m = metrics(2.0, 0.05, 0, 16);
+        assert_eq!(classify_tile(&m, &CodecState::Skip), CodecState::PalRle { palette_id: 0 });
+    }
+
+    #[test]
+    fn unique_colors_17_falls_through_to_cdf53() {
+        let m = metrics(2.0, 0.05, 0, 17);
+        assert!(matches!(classify_tile(&m, &CodecState::Skip), CodecState::Cdf53 { .. }));
+    }
+
+    #[test]
+    fn h264_tile_at_low_freq_falls_through_to_rules_6_to_8() {
+        // freq < 5.0 with prev=H264: rules 6-8 apply normally, NOT H264 hysteresis.
+        // Pins the doc-comment behavior — hysteresis only acts in the medium-freq band.
+        let m = metrics(2.0, 0.05, 0, 1);  // single color
+        let next = classify_tile(&m, &CodecState::H264 { frames_in_h264: 99 });
+        assert_eq!(next, CodecState::Solid,
+            "doc-comment hysteresis claim is per-rule-4 only — at low freq, normal rules apply");
+    }
+
+    #[test]
     fn cdf53_fallback_uses_max_passes_9() {
         // §4.4 specifies 9 bit-planes; the fallback must encode that constant.
         let m = metrics(2.0, 0.05, 0, super::super::UNIQUE_COLORS_UNKNOWN);
@@ -339,6 +374,16 @@ impl Classifier {
     /// Empty `tentative_states` is valid — it represents a frame with no dirty
     /// tiles. In H264 mode, this contributes toward the exit-sustain counter
     /// (cost is 0, below exit threshold).
+    ///
+    /// **M3.0 caveat:** `MetricsTracker::record_frame` doesn't populate
+    /// `change_magnitude` (the value comes from GPU SAD output that lands in
+    /// M3.1+). With magnitude permanently 0.0, `classify_tile` never returns
+    /// H264 from Rule 2 on real frames — so the motion fast-path's
+    /// `motion_tile_min_absolute` and `motion_tile_threshold` thresholds are
+    /// dormant in production and the cost path is the only entry trigger.
+    /// Unit tests construct H264 tile states directly to exercise the
+    /// fast-path; this stays exercised by tests until M3.1+ wires real
+    /// magnitude.
     pub fn decide_frame_mode(
         &mut self,
         tentative_states: &[CodecState],
@@ -357,10 +402,11 @@ impl Classifier {
         let all_tile_bytes: u32 = tentative_states.iter()
             .map(|s| self.cost.estimated_tile_bytes(*s))
             .sum();
+        let bytes_per_us = self.cost.bytes_per_us();
         let tile_codec_cost =
-            non_h264_us + (all_tile_bytes as f32) / self.cost.bytes_per_us;
+            non_h264_us + (all_tile_bytes as f32) / bytes_per_us;
         let h264_cost = self.cost.h264_frame_us
-            + (self.cost.h264_frame_bytes as f32) / self.cost.bytes_per_us;
+            + (self.cost.h264_frame_bytes as f32) / bytes_per_us;
 
         // Motion fast-path: count tentatively-H.264 tiles
         let h264_tile_count = tentative_states.iter()
@@ -524,6 +570,23 @@ mod decide_tests {
             FrameMode::TileCodec,
             "empty dirty tiles for exit_sustain frames must flip H264 → TileCodec",
         );
+    }
+
+    #[test]
+    fn motion_fastpath_at_min_absolute_boundary() {
+        // n=7 (just below floor=8): must NOT trip even at 100% motion fraction.
+        let mut c = Classifier::default();
+        let n7 = h264_states(7);
+        for _ in 0..10 {
+            assert_eq!(c.decide_frame_mode(&n7, FrameMode::TileCodec), FrameMode::TileCodec);
+        }
+        // n=8 (at floor): must trip after sustain.
+        let mut c = Classifier::default();
+        let n8 = h264_states(8);
+        for _ in 0..(c.enter_sustain_frames - 1) {
+            assert_eq!(c.decide_frame_mode(&n8, FrameMode::TileCodec), FrameMode::TileCodec);
+        }
+        assert_eq!(c.decide_frame_mode(&n8, FrameMode::TileCodec), FrameMode::H264);
     }
 
     #[test]
