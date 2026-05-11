@@ -6,8 +6,13 @@
 use proptest::prelude::*;
 
 use super::classifier::classify_tile;
-use super::proptest_strategies::{codec_state, dim, frame_packed, tile_metrics, MAX_DIM};
-use super::{CodecState, DirtyTracker, TileGrid, BPP, TILE_BYTES, TILE_SIZE};
+use super::proptest_strategies::{
+    codec_state, dim, frame_packed, tile_metrics, tile_metrics_with_colors, MAX_DIM,
+};
+use super::{
+    CodecState, DirtyTracker, TileGrid, TileMetrics, BPP, EDGE_DENSITY_UNKNOWN, TILE_BYTES,
+    TILE_SIZE, UNIQUE_COLORS_UNKNOWN,
+};
 
 // ── TileGrid ────────────────────────────────────────────────────────────────
 
@@ -306,17 +311,49 @@ proptest! {
     /// Note: with sentinel colours, the §4.2 path goes through the fallback
     /// (Cdf53) — never H264 — for low-freq tiles. Hysteresis on H264 only
     /// applies in the medium-freq band (5–15 Hz).
+    /// Varies freq across `[0.0, 5.0)` and mag across `[0.0, 0.1)` so the
+    /// sentinel-only sub-region of Rule-7/8 fall-through is fully swept.
     #[test]
-    fn c2_low_freq_low_magnitude_never_h264(
-        mut m in tile_metrics(),
+    fn c2_low_freq_low_magnitude_never_h264_sentinel_colors(
+        freq in 0.0f32..5.0,
+        mag in 0.0f32..0.1,
         prev in codec_state(),
     ) {
-        m.change_freq_hz = 4.9;     // strictly below 5
-        m.change_magnitude = 0.05;  // strictly below 0.1
-        m.idle_frames = 0;
+        let m = TileMetrics {
+            change_freq_hz: freq,
+            change_magnitude: mag,
+            idle_frames: 0,
+            unique_colors: UNIQUE_COLORS_UNKNOWN,
+            edge_density: EDGE_DENSITY_UNKNOWN,
+            codec_state: CodecState::Skip,
+        };
         let next = classify_tile(&m, &prev);
         prop_assert!(!matches!(next, CodecState::H264 { .. }),
-            "low-freq low-magnitude tile must never classify as H264, got {:?}", next);
+            "low-freq low-magnitude tile must never classify as H264 (got {:?} for freq={}, mag={})",
+            next, freq, mag);
+    }
+
+    /// C2b — same invariant as C2 but with concrete unique_colors values, so
+    /// rules 6/7 (Solid / PalRle) participate alongside the Cdf53 fallback.
+    #[test]
+    fn c2_low_freq_low_magnitude_never_h264_concrete_colors(
+        freq in 0.0f32..5.0,
+        mag in 0.0f32..0.1,
+        uc in 1u16..=256,
+        prev in codec_state(),
+    ) {
+        let m = TileMetrics {
+            change_freq_hz: freq,
+            change_magnitude: mag,
+            idle_frames: 0,
+            unique_colors: uc,
+            edge_density: EDGE_DENSITY_UNKNOWN,
+            codec_state: CodecState::Skip,
+        };
+        let next = classify_tile(&m, &prev);
+        prop_assert!(!matches!(next, CodecState::H264 { .. }),
+            "low-freq low-magnitude tile must never classify as H264 (got {:?} for freq={}, mag={}, uc={})",
+            next, freq, mag, uc);
     }
 
     /// C4 — codec selection is a pure function of (TileMetrics, prev) — same
@@ -330,17 +367,68 @@ proptest! {
 
     /// C5 — high-frequency low-magnitude (cursor blink) never enters H.264.
     /// Rule 3 routes these to PalRle or BC1 unconditionally.
+    /// Varies freq across `(15.0, 120.0]` and mag across `[0.0, 0.3]` so the
+    /// entire low-magnitude sub-band of Rule 3 is swept.
     #[test]
-    fn c5_cursor_blink_pattern_never_h264(
-        mut m in tile_metrics(),
+    fn c5_cursor_blink_pattern_never_h264_sentinel_colors(
+        freq in 15.001f32..=120.0,
+        mag in 0.0f32..=0.3,
         prev in codec_state(),
     ) {
-        m.change_freq_hz = 30.0;
-        m.change_magnitude = 0.05;
-        m.idle_frames = 0;
+        let m = TileMetrics {
+            change_freq_hz: freq,
+            change_magnitude: mag,
+            idle_frames: 0,
+            unique_colors: UNIQUE_COLORS_UNKNOWN,
+            edge_density: EDGE_DENSITY_UNKNOWN,
+            codec_state: CodecState::Skip,
+        };
         let next = classify_tile(&m, &prev);
         prop_assert!(!matches!(next, CodecState::H264 { .. }),
-            "cursor-blink pattern must never classify as H264, got {:?}", next);
+            "cursor-blink pattern must never classify as H264 (got {:?} for freq={}, mag={})",
+            next, freq, mag);
+    }
+
+    /// C5b — same invariant as C5 but with concrete unique_colors so the
+    /// PalRle branch of Rule 3 participates alongside the BC1 fallback.
+    #[test]
+    fn c5_cursor_blink_pattern_never_h264_concrete_colors(
+        freq in 15.001f32..=120.0,
+        mag in 0.0f32..=0.3,
+        uc in 1u16..=256,
+        prev in codec_state(),
+    ) {
+        let m = TileMetrics {
+            change_freq_hz: freq,
+            change_magnitude: mag,
+            idle_frames: 0,
+            unique_colors: uc,
+            edge_density: EDGE_DENSITY_UNKNOWN,
+            codec_state: CodecState::Skip,
+        };
+        let next = classify_tile(&m, &prev);
+        prop_assert!(!matches!(next, CodecState::H264 { .. }),
+            "cursor-blink pattern must never classify as H264 (got {:?} for freq={}, mag={}, uc={})",
+            next, freq, mag, uc);
+    }
+
+    /// C7 — Rule 6/7/8 colour-threshold table: at low freq + low magnitude,
+    /// `unique_colors == 1` ⇒ Solid, `2..=16` ⇒ PalRle, `> 16` ⇒ Cdf53 fallback.
+    /// Uses `tile_metrics_with_colors` to vary the non-sentinel colour-count axis.
+    #[test]
+    fn c7_rule_7_color_threshold(mut m in tile_metrics_with_colors()) {
+        m.change_freq_hz = 2.0;
+        m.change_magnitude = 0.05;
+        m.idle_frames = 0;
+        let next = classify_tile(&m, &CodecState::Skip);
+        if m.unique_colors == 1 {
+            prop_assert_eq!(next, CodecState::Solid);
+        } else if m.unique_colors <= 16 {
+            prop_assert_eq!(next, CodecState::PalRle { palette_id: 0 });
+        } else {
+            let is_cdf53 = matches!(next, CodecState::Cdf53 { .. });
+            prop_assert!(is_cdf53, "expected Cdf53 fallback, got {:?}", next);
+        }
     }
 
     // C3 (Solid) — deferred to M3.1; tracked in the design doc M3.1 testing section.

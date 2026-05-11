@@ -120,7 +120,6 @@ pub fn tile_metrics() -> impl Strategy<Value = TileMetrics> {
 
 /// A `TileMetrics` strategy with a known `unique_colors` value (no sentinel).
 /// Used by rule-table invariants that depend on the colour-count axis.
-#[allow(dead_code)]
 pub fn tile_metrics_with_colors() -> impl Strategy<Value = TileMetrics> {
     (
         0.0f32..=120.0,
