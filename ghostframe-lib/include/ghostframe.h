@@ -38,6 +38,15 @@
 #define TILE_BYTES (uintptr_t)((TILE_SIZE * TILE_SIZE) * BPP)
 
 /**
+ * Sentinel value for `TileMetrics::unique_colors` indicating the GPU compute
+ * estimator has not run yet (M3.0 always uses this — backing lands in M3.3).
+ * Classifier rules consulting `unique_colors` treat the sentinel as "unknown".
+ */
+#define UNIQUE_COLORS_UNKNOWN UINT16_MAX
+
+
+
+/**
  * Bundles a `GhostframeServer` with the tokio `Runtime` that owns its
  * background tasks.  Drop order matters: the server (and its spawned
  * IoBridge task) must be dropped *before* the runtime shuts down.
