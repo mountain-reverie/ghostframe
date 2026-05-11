@@ -247,18 +247,6 @@ impl DirtyTracker {
         self.update_with_hints_inner(pixels, stride, width, height, hints, true)
     }
 
-    /// Like `update_with_hints`, but don't commit — see `update_no_commit`.
-    pub fn update_with_hints_no_commit(
-        &mut self,
-        pixels: &[u8],
-        stride: u32,
-        width: u32,
-        height: u32,
-        hints: &[(u32, u32)],
-    ) -> Vec<(u32, u32)> {
-        self.update_with_hints_inner(pixels, stride, width, height, hints, false)
-    }
-
     fn update_with_hints_inner(
         &mut self,
         pixels: &[u8],
