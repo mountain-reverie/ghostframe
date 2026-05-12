@@ -23,6 +23,16 @@
 #define TILE_HEADER_SIZE 8
 
 /**
+ * Sentinel tile coordinates marking a control message that carries the
+ * current frame dimensions rather than pixel data. Tile coords are `u8`;
+ * 0xFF (255) is structurally impossible at any sensible resolution
+ * (would imply >8000 px width), so the receiver can route on the sentinel.
+ */
+#define FRAME_DIMENSIONS_SENTINEL_X 255
+
+#define FRAME_DIMENSIONS_SENTINEL_Y 255
+
+/**
  * Bit 31 of frame_seq distinguishes tile datagrams from frame datagrams.
  * Frame datagrams: bit 31 = 0. Tile datagrams: bit 31 = 1.
  */
