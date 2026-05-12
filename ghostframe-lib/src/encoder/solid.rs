@@ -15,8 +15,7 @@ pub enum SolidDecodeError {
 /// Caller is responsible for ensuring the tile is truly uniform; the classifier
 /// rule `unique_colors == 1` enforces this upstream.
 pub fn encode_solid(tile_bgra: &[u8]) -> [u8; 4] {
-    debug_assert!(tile_bgra.len() >= 4);
-    [tile_bgra[0], tile_bgra[1], tile_bgra[2], tile_bgra[3]]
+    tile_bgra[..4].try_into().expect("tile must be at least 4 bytes")
 }
 
 /// Decode a 4-byte BGRA Solid payload. Returns the BGRA color the client
@@ -25,7 +24,7 @@ pub fn decode_solid(payload: &[u8]) -> Result<[u8; 4], SolidDecodeError> {
     if payload.len() != 4 {
         return Err(SolidDecodeError::WrongSize(payload.len()));
     }
-    Ok([payload[0], payload[1], payload[2], payload[3]])
+    Ok(payload[..4].try_into().unwrap())
 }
 
 #[cfg(test)]
