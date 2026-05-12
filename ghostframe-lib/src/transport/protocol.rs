@@ -174,6 +174,7 @@ impl TileHeader {
 ///
 /// Each datagram = [DatagramHeader (12 B)][TileHeader (8 B)][payload_fragment].
 /// Empty payload (e.g. Skip codec) → single datagram with no payload bytes.
+#[allow(clippy::too_many_arguments)]
 pub fn fragment_tile(
     frame_seq: u32,
     tile_x: u8,

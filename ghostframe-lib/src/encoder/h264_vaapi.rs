@@ -730,6 +730,7 @@ impl FullFrameEncoder {
     /// used instead (for machines without VA-API).
     ///
     /// Returns `Ok(None)` if the encoder buffered the frame without emitting output yet.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn encode_nv12_buffer(
         &mut self,
         nv12_data: *const u8,
@@ -930,6 +931,7 @@ impl FullFrameEncoder {
     }
 
     /// Fallback: mmap the fd, scale BGRA→NV12 on CPU, upload to VA-API surface.
+    #[allow(clippy::too_many_arguments)]
     unsafe fn mmap_scale_upload(
         hw_frames_ctx: *mut ffi::AVBufferRef,
         fd: RawFd,

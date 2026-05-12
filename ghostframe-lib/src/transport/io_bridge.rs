@@ -352,6 +352,7 @@ impl IoBridge {
     /// Shared scheduler dispatch: grid-sync → RTT update → bump+encode+enqueue
     /// per dirty tile → tick → fragment+send. Called by both `process_frame_cpu`
     /// and `process_frame_gpu`'s `FrameMode::TileCodec` branch.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch_dirty_tiles_via_scheduler(
         &mut self,
         dirty: &[(u32, u32)],
