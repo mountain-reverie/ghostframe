@@ -2157,7 +2157,10 @@ mod tests {
                 }
             };
             libc::close(fd1);
-            assert!(first.tile_analysis.is_null(), "first-frame analysis is null by design");
+            assert!(
+                first.tile_analysis.is_null(),
+                "first-frame analysis is null by design"
+            );
 
             // Second frame: same content. Now the analysis pipeline dispatches.
             let fd2 = make_memfd(width, height, pixel);
@@ -2205,7 +2208,9 @@ mod tests {
         unsafe {
             let make_fd = |name_suffix: &str| -> std::os::unix::io::RawFd {
                 let size = (stride * height) as usize;
-                let name = std::ffi::CString::new(format!("ghost-test-checkerboard-{}", name_suffix)).unwrap();
+                let name =
+                    std::ffi::CString::new(format!("ghost-test-checkerboard-{}", name_suffix))
+                        .unwrap();
                 let fd = libc::memfd_create(name.as_ptr(), 0);
                 assert!(fd >= 0);
                 libc::ftruncate(fd, size as i64);
@@ -2246,7 +2251,10 @@ mod tests {
                 }
             };
             libc::close(fd1);
-            assert!(first.tile_analysis.is_null(), "first-frame analysis is null by design");
+            assert!(
+                first.tile_analysis.is_null(),
+                "first-frame analysis is null by design"
+            );
 
             // Second frame: same content. Now the analysis pipeline dispatches.
             let fd2 = make_fd("real");
@@ -2323,7 +2331,8 @@ mod tests {
 
             let make_fd = |name_suffix: &str| -> std::os::unix::io::RawFd {
                 let size = (stride * height) as usize;
-                let name = std::ffi::CString::new(format!("ghost-test-overflow-{}", name_suffix)).unwrap();
+                let name =
+                    std::ffi::CString::new(format!("ghost-test-overflow-{}", name_suffix)).unwrap();
                 let fd = libc::memfd_create(name.as_ptr(), 0);
                 assert!(fd >= 0);
                 libc::ftruncate(fd, size as i64);
@@ -2364,7 +2373,10 @@ mod tests {
                 }
             };
             libc::close(fd1);
-            assert!(first.tile_analysis.is_null(), "first-frame analysis is null by design");
+            assert!(
+                first.tile_analysis.is_null(),
+                "first-frame analysis is null by design"
+            );
 
             // Second frame: same content. Now the analysis pipeline dispatches.
             let fd2 = make_fd("real");
@@ -2416,7 +2428,8 @@ mod tests {
         unsafe {
             let make_fd = |name_suffix: &str| -> std::os::unix::io::RawFd {
                 let size = (stride * height) as usize;
-                let name = std::ffi::CString::new(format!("ghost-test-edge-{}", name_suffix)).unwrap();
+                let name =
+                    std::ffi::CString::new(format!("ghost-test-edge-{}", name_suffix)).unwrap();
                 let fd = libc::memfd_create(name.as_ptr(), 0);
                 assert!(fd >= 0);
                 libc::ftruncate(fd, size as i64);
@@ -2454,7 +2467,10 @@ mod tests {
                 }
             };
             libc::close(fd1);
-            assert!(first.tile_analysis.is_null(), "first-frame analysis is null by design");
+            assert!(
+                first.tile_analysis.is_null(),
+                "first-frame analysis is null by design"
+            );
 
             // Second frame: same content. Now the analysis pipeline dispatches.
             let fd2 = make_fd("real");
@@ -2516,7 +2532,10 @@ mod tests {
                 }
             };
             libc::close(fd1);
-            assert!(first.tile_analysis.is_null(), "first-frame analysis is null by design");
+            assert!(
+                first.tile_analysis.is_null(),
+                "first-frame analysis is null by design"
+            );
 
             // Second frame: same content. Now the analysis pipeline dispatches.
             let fd2 = make_memfd(width, height, pixel);
@@ -2569,7 +2588,8 @@ mod tests {
 
             let make_fd = |name_suffix: &str| -> std::os::unix::io::RawFd {
                 let size = (stride * height) as usize;
-                let name = std::ffi::CString::new(format!("ghost-test-multitile-{}", name_suffix)).unwrap();
+                let name = std::ffi::CString::new(format!("ghost-test-multitile-{}", name_suffix))
+                    .unwrap();
                 let fd = libc::memfd_create(name.as_ptr(), 0);
                 assert!(fd >= 0);
                 libc::ftruncate(fd, size as i64);
@@ -2631,7 +2651,10 @@ mod tests {
                 }
             };
             libc::close(fd1);
-            assert!(first.tile_analysis.is_null(), "first-frame analysis is null by design");
+            assert!(
+                first.tile_analysis.is_null(),
+                "first-frame analysis is null by design"
+            );
 
             // Second frame: same content. Now the analysis pipeline dispatches.
             let fd2 = make_fd("real");
