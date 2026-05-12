@@ -1717,19 +1717,19 @@ impl Drop for GpuFrameProcessor {
                 .destroy_shader_module(self.nv12_shader_module, None);
 
             // SAD pipeline
-            self.device
-                .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
             self.device.destroy_pipeline(self.pipeline, None);
             self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
+            self.device
+                .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
             self.device.destroy_shader_module(self.shader_module, None);
 
             // Analysis pipeline
-            self.device
-                .destroy_descriptor_set_layout(self.analysis_descriptor_set_layout, None);
             self.device.destroy_pipeline(self.analysis_pipeline, None);
             self.device
                 .destroy_pipeline_layout(self.analysis_pipeline_layout, None);
+            self.device
+                .destroy_descriptor_set_layout(self.analysis_descriptor_set_layout, None);
             self.device
                 .destroy_shader_module(self.analysis_shader_module, None);
 
