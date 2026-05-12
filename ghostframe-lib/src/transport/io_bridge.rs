@@ -38,10 +38,9 @@ use crate::transport::fec;
 use crate::transport::fec::fec_group_size;
 use crate::transport::feedback::ReceiverFeedback;
 use crate::transport::protocol::{
-    build_frame_parity_datagram, build_parity_datagrams, Codec, fragment_frame, fragment_tile,
+    build_frame_parity_datagram, Codec, fragment_frame, fragment_tile,
     max_fragment_payload, max_frame_fragment_payload, FrameHeader, NackMessage,
     DATAGRAM_HEADER_SIZE, FRAME_HEADER_SIZE, PING_PAYLOAD, PONG_PAYLOAD, TILE_DATAGRAM_FLAG,
-    TILE_HEADER_SIZE,
 };
 use crate::transport::quic::QuicServer;
 use crate::transport::webtransport::WebTransportServer;
@@ -252,10 +251,12 @@ impl IoBridge {
         let seq = self.frame_seq;
 
         // Determine the maximum fragment payload from the smallest connected
-        // session's QUIC max datagram size.  Check for connected sessions
-        // BEFORE updating the dirty tracker — otherwise the tracker consumes
-        // frame state even when no client is listening, and once a client
-        // connects the content appears "unchanged" so nothing is ever sent.
+        // session's QUIC max datagram size. M3.1: we no longer short-circuit
+        // here when no session is connected — the Scheduler must be fed dirty
+        // tiles so that pending work survives until a client arrives. The send
+        // step uses `send_to_all_sessions`, which is a no-op when the session
+        // map is empty. Fall back to a conservative estimate (1280 B datagram)
+        // when no session has advertised an MTU yet.
         let max_frag = {
             let mut min_size: Option<usize> = None;
             for (handle, wt) in &self.wt_sessions {
@@ -267,21 +268,18 @@ impl IoBridge {
                         let usable = max_fragment_payload(
                             sz.saturating_sub(Self::WT_VARINT_OVERHEAD),
                         );
-                        min_size = Some(match min_size {
-                            Some(prev) => prev.min(usable),
-                            None => usable,
-                        });
+                        if usable > 0 {
+                            min_size = Some(match min_size {
+                                Some(prev) => prev.min(usable),
+                                None => usable,
+                            });
+                        }
                     }
                 }
             }
-            match min_size {
-                Some(0) | None => {
-                    // No connected sessions or MTU too small — skip frame
-                    // without updating dirty tracker state.
-                    return;
-                }
-                Some(sz) => sz,
-            }
+            // Fall back to a conservative MTU estimate (1280 B) when no
+            // session has provided a real size yet.
+            min_size.unwrap_or_else(|| max_fragment_payload(1280))
         };
 
         // During QUIC slow-start after a new session connects, datagrams may
@@ -331,69 +329,54 @@ impl IoBridge {
             return;
         }
 
-        // Encode and send only dirty tiles
-        for (tile_x, tile_y) in &dirty_tiles {
-            let tile_data = grid.extract_tile(&frame.pixels, frame.stride, *tile_x, *tile_y);
+        // Route emission through the Scheduler — same pattern as the GPU path's
+        // TileCodec branch. M3.1: CPU path emits Codec::Raw exclusively because
+        // classifier rules are sentinel-gated (D1) until M3.3 GPU compute lands.
+        if self.metrics_tracker.cols() != grid.cols || self.metrics_tracker.rows() != grid.rows {
+            self.metrics_tracker.resize(grid.cols, grid.rows);
+            self.scheduler.resize(grid.cols, grid.rows);
+        }
 
-            // M3.0: CPU path always emits Raw. No full-frame H.264 emitter
-            // here yet — see design Future Work #7 for the eventual wire-up.
-            let (codec, payload) = (Codec::Raw, tile_data);
+        let rtt = self.server.connections.values()
+            .map(|c| c.stats().path.rtt)
+            .min()
+            .unwrap_or_else(|| std::time::Duration::from_millis(20));
+        self.scheduler.set_rtt(rtt);
 
+        use crate::transport::scheduler::{TileWork, WorkState};
+        use std::time::Instant;
+        for &(tile_x, tile_y) in &dirty_tiles {
+            self.scheduler.bump_generation(tile_x as u8, tile_y as u8);
+            let gen = self.scheduler.generation_for(tile_x as u8, tile_y as u8);
+            let tile_data = grid.extract_tile(&frame.pixels, frame.stride, tile_x, tile_y);
+            self.scheduler.enqueue(TileWork {
+                tile_x: tile_x as u8,
+                tile_y: tile_y as u8,
+                generation: gen,
+                pass_idx: 0,
+                total_passes: 1,
+                codec: Codec::Raw,
+                payload: tile_data,
+                queued_at: Instant::now(),
+                last_sent_at: None,
+                state: WorkState::Pending,
+            });
+        }
+
+        let drained = self.scheduler.tick(usize::MAX);
+        for work in drained {
             let datagrams = fragment_tile(
                 seq | TILE_DATAGRAM_FLAG,
-                *tile_x as u8,
-                *tile_y as u8,
-                codec,
-                &payload,
-                frame.timestamp_us,
-                max_frag,
+                work.tile_x, work.tile_y,
+                work.codec, &work.payload,
+                frame.timestamp_us, max_frag,
             );
-
-            for dg in &datagrams {
-                for (handle, wt) in &mut self.wt_sessions {
-                    if !wt.is_connected() {
-                        continue;
-                    }
-                    if let Some(conn) = self.server.connections.get_mut(handle) {
-                        if let Err(e) = wt.send_datagram(conn, dg) {
-                            tracing::trace!(?handle, tile_x, tile_y, error = ?e,
-                                "datagram send failed (congestion/buffer full)");
-                        }
-                    }
+            let header_byte = ((work.generation & 0x0F) << 4) | (work.pass_idx & 0x0F);
+            for mut dg in datagrams {
+                if dg.len() > DATAGRAM_HEADER_SIZE + 3 {
+                    dg[DATAGRAM_HEADER_SIZE + 3] = header_byte;
                 }
-            }
-
-            // Generate and send FEC parity datagrams if enabled
-            // NOTE (M3.0): unreachable in the CPU path — `codec` is always
-            // `Codec::Raw` here per design D13. Retained as plumbing for M3.1+
-            // when per-tile codecs land and the guard condition is widened.
-            if self.fec_k > 0 && codec == Codec::H264 && datagrams.len() > 1 {
-                let source_payloads: Vec<&[u8]> = datagrams.iter().map(|dg| {
-                    &dg[DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE..]
-                }).collect();
-                let parities = fec::generate_parity(&source_payloads, self.fec_k);
-                let parity_dgs = build_parity_datagrams(
-                    seq | TILE_DATAGRAM_FLAG,
-                    *tile_x as u8,
-                    *tile_y as u8,
-                    codec,
-                    frame.timestamp_us,
-                    datagrams.len() as u16,
-                    &parities,
-                );
-                for pdg in &parity_dgs {
-                    for (handle, wt) in &mut self.wt_sessions {
-                        if !wt.is_connected() {
-                            continue;
-                        }
-                        if let Some(conn) = self.server.connections.get_mut(handle) {
-                            if let Err(e) = wt.send_datagram(conn, pdg) {
-                                tracing::trace!(?handle, tile_x, tile_y, error = ?e,
-                                    "parity datagram send failed");
-                            }
-                        }
-                    }
-                }
+                self.send_to_all_sessions(&dg);
             }
         }
     }
@@ -1255,6 +1238,43 @@ mod tests {
         };
         bridge.process_frame(frame);
         assert!(bridge.frame_seq > 0, "frame_seq must advance");
+    }
+
+    /// CPU path must route dirty tiles through the scheduler and emit on tick,
+    /// matching the GPU path's pattern. The test forces a known frame through
+    /// the CPU path (no GPU processor on the test bridge) and verifies the
+    /// scheduler observed enqueue+tick by inspecting state post-call.
+    #[tokio::test]
+    async fn cpu_path_routes_through_scheduler() {
+        let (our_end, _peer) = UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("server");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+        bridge.frame_mode = crate::tile::FrameMode::TileCodec;
+
+        let frame = crate::server::FrameSubmission {
+            width: 64, height: 64, stride: 64 * 4,
+            pixels: vec![0xAAu8; 64 * 64 * 4],
+            dmabuf_fd: None,
+            timestamp_us: 0,
+            damage_tiles: None,
+        };
+        bridge.process_frame(frame);
+
+        // The grid is 2x2 (64x64 at 32-pixel tiles). On the first commit
+        // every tile is dirty (full scan). Scheduler must have observed those
+        // tiles. With no connected session, the datagrams produced by tick()
+        // are sent to zero sessions but the queue mutation is still observable.
+        let queued = bridge.scheduler.peek_for_test();
+        // After tick, each enqueued work is InFlight.
+        for w in &queued {
+            assert_eq!(w.state, crate::transport::scheduler::WorkState::InFlight,
+                "tick should have promoted Pending→InFlight, got {:?}", w.state);
+            assert_eq!(w.codec, crate::transport::protocol::Codec::Raw,
+                "CPU path emits Raw in M3.1 (classifier sentinel-gated)");
+        }
+        // The scheduler observed at least one tile.
+        assert!(!queued.is_empty(), "scheduler should have at least one tile post-frame");
     }
 
     /// `Classifier::reset` must zero hysteresis streaks, so a single busy
