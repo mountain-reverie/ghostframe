@@ -127,6 +127,12 @@ async function main() {
   const assemblies = new Map<string, TileAssembly>();
   let latestFrameSeq = 0;
   let firstTileRendered = false;
+  // Set to true once the frame-dimensions sentinel has been processed.
+  // The per-tile fallback resize is only a safety net for pre-sentinel tiles;
+  // once dimensions are known, the fallback must not fire because edge-tile
+  // coordinates (e.g. tX=21 in a 700px-wide frame) would compute
+  // (tX+1)*TILE_SIZE = 704 > 700 and spuriously clear the canvas every frame.
+  let frameDimensionsKnown = false;
 
   /** Reassemble completed tile and decode/render it. */
   function finishAssembly(asmKey: string, asm: TileAssembly) {
@@ -155,17 +161,25 @@ async function main() {
         const w = view.getUint32(0, false); // big-endian
         const h = view.getUint32(4, false);
         renderer.resize(w, h);
+        frameDimensionsKnown = true;
       }
       return;
     }
 
-    const minWidth = (tX + 1) * TILE_SIZE;
-    const minHeight = (tY + 1) * TILE_SIZE;
-    if (canvasEl.width < minWidth || canvasEl.height < minHeight) {
-      renderer.resize(
-        Math.max(canvasEl.width, minWidth),
-        Math.max(canvasEl.height, minHeight)
-      );
+    // Fallback: expand canvas to fit this tile if we haven't yet received the
+    // frame-dimensions sentinel. Once dimensions are known, skip this entirely —
+    // edge tiles compute (tX+1)*TILE_SIZE which can exceed the actual frame
+    // width (e.g., tX=21 → 704 in a 700-px-wide frame), causing a spurious
+    // resize that clears the canvas on every frame containing that edge tile.
+    if (!frameDimensionsKnown) {
+      const minWidth = (tX + 1) * TILE_SIZE;
+      const minHeight = (tY + 1) * TILE_SIZE;
+      if (canvasEl.width < minWidth || canvasEl.height < minHeight) {
+        renderer.resize(
+          Math.max(canvasEl.width, minWidth),
+          Math.max(canvasEl.height, minHeight)
+        );
+      }
     }
 
     if (asm.header.codec === Codec.Raw) {
@@ -381,6 +395,7 @@ async function main() {
         const w = dimView.getUint32(0, false); // big-endian
         const h = dimView.getUint32(4, false);
         renderer.resize(w, h);
+        frameDimensionsKnown = true;
       }
       continue;
     }
