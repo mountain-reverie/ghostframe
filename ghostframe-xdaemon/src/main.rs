@@ -12,7 +12,9 @@ enum CaptureBackend {
     /// DRM/KMS capture — passes DMA-BUF fd directly for zero-copy GPU pipeline.
     Drm,
     /// X11 GetImage fallback (for containers without DRM).
-    X11 { capture: Box<x11_capture::X11Capture> },
+    X11 {
+        capture: Box<x11_capture::X11Capture>,
+    },
 }
 
 #[tokio::main]
@@ -51,14 +53,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let backend = match drm_capture::capture_prime_fd() {
         Ok((fd, geom)) => {
             drop(fd);
-            tracing::info!(width = geom.width, height = geom.height, "DRM capture available (zero-copy GPU path)");
+            tracing::info!(
+                width = geom.width,
+                height = geom.height,
+                "DRM capture available (zero-copy GPU path)"
+            );
             CaptureBackend::Drm
         }
         Err(e) => {
             tracing::warn!("DRM capture unavailable: {e}");
             tracing::info!("Falling back to X11 capture");
             let capture = x11_capture::X11Capture::new()?;
-            CaptureBackend::X11 { capture: Box::new(capture) }
+            CaptureBackend::X11 {
+                capture: Box::new(capture),
+            }
         }
     };
 
@@ -81,12 +89,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // An empty drain means no damage events since last call — but we still need
         // to fall back to full-frame comparison (None) so the dirty tracker can detect
         // the first frame for a newly connected client.
-        let damage_tiles = xdamage_monitor
-            .as_ref()
-            .and_then(|m| {
-                let tiles = m.drain_damage();
-                if tiles.is_empty() { None } else { Some(tiles) }
-            });
+        let damage_tiles = xdamage_monitor.as_ref().and_then(|m| {
+            let tiles = m.drain_damage();
+            if tiles.is_empty() {
+                None
+            } else {
+                Some(tiles)
+            }
+        });
 
         let submission = match &backend {
             CaptureBackend::Drm => match drm_capture::capture_prime_fd() {

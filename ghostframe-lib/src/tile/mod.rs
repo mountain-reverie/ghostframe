@@ -108,7 +108,12 @@ impl TileGrid {
     pub fn new(width: u32, height: u32) -> Self {
         let cols = width.div_ceil(TILE_SIZE);
         let rows = height.div_ceil(TILE_SIZE);
-        Self { width, height, cols, rows }
+        Self {
+            width,
+            height,
+            cols,
+            rows,
+        }
     }
 
     pub fn tile_count(&self) -> u32 {
@@ -198,18 +203,37 @@ impl DirtyTracker {
         self.committed
     }
 
-    pub fn update(&mut self, pixels: &[u8], stride: u32, width: u32, height: u32) -> Vec<(u32, u32)> {
+    pub fn update(
+        &mut self,
+        pixels: &[u8],
+        stride: u32,
+        width: u32,
+        height: u32,
+    ) -> Vec<(u32, u32)> {
         self.update_inner(pixels, stride, width, height, true)
     }
 
     /// Like `update`, but don't store current tiles as prev — dirty tiles will
     /// remain dirty on the next call. Used during QUIC slow-start where
     /// datagrams may be silently dropped by congestion control.
-    pub fn update_no_commit(&mut self, pixels: &[u8], stride: u32, width: u32, height: u32) -> Vec<(u32, u32)> {
+    pub fn update_no_commit(
+        &mut self,
+        pixels: &[u8],
+        stride: u32,
+        width: u32,
+        height: u32,
+    ) -> Vec<(u32, u32)> {
         self.update_inner(pixels, stride, width, height, false)
     }
 
-    fn update_inner(&mut self, pixels: &[u8], stride: u32, width: u32, height: u32, commit: bool) -> Vec<(u32, u32)> {
+    fn update_inner(
+        &mut self,
+        pixels: &[u8],
+        stride: u32,
+        width: u32,
+        height: u32,
+        commit: bool,
+    ) -> Vec<(u32, u32)> {
         let grid = TileGrid::new(width, height);
         if grid.cols != self.cols || grid.rows != self.rows {
             self.resize(grid.cols, grid.rows);
@@ -336,7 +360,9 @@ mod dirty_tests {
         let _ = tracker.update(&frame, 64 * 4, 64, 64);
 
         let mut frame2 = frame.clone();
-        for b in frame2.iter_mut() { *b = 99; }
+        for b in frame2.iter_mut() {
+            *b = 99;
+        }
         let dirty = tracker.update_with_hints(&frame2, 64 * 4, 64, 64, &[(0, 0)]);
         assert_eq!(dirty, vec![(0, 0)]);
     }
@@ -377,8 +403,8 @@ mod tests {
         for row in 0..32u32 {
             for col in 32..64u32 {
                 let off = (row * stride + col * BPP) as usize;
-                pixels[off] = 0;   // B
-                pixels[off + 1] = 0;   // G
+                pixels[off] = 0; // B
+                pixels[off + 1] = 0; // G
                 pixels[off + 2] = 255; // R
                 pixels[off + 3] = 255; // A
             }

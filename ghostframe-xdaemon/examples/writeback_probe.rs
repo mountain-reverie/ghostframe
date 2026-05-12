@@ -22,9 +22,7 @@ use std::num::NonZeroU32;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
 use drm::buffer::{Buffer, DrmFourcc};
-use drm::control::{
-    atomic::AtomicModeReq, connector, AtomicCommitFlags, Device as ControlDevice,
-};
+use drm::control::{atomic::AtomicModeReq, connector, AtomicCommitFlags, Device as ControlDevice};
 use drm::{ClientCapability, Device};
 
 struct Card(File);
@@ -38,7 +36,9 @@ impl Device for Card {}
 impl ControlDevice for Card {}
 
 fn main() -> std::io::Result<()> {
-    let path = std::env::args().nth(1).unwrap_or_else(|| "/dev/dri/card0".to_string());
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "/dev/dri/card0".to_string());
     eprintln!("opening {path}");
     let card = Card(File::options().read(true).write(true).open(&path)?);
 
@@ -46,7 +46,9 @@ fn main() -> std::io::Result<()> {
     card.set_client_capability(ClientCapability::Atomic, true)
         .map_err(|e| std::io::Error::other(format!("set_client_capability(Atomic): {e}")))?;
     card.set_client_capability(ClientCapability::WritebackConnectors, true)
-        .map_err(|e| std::io::Error::other(format!("set_client_capability(WritebackConnectors): {e}")))?;
+        .map_err(|e| {
+            std::io::Error::other(format!("set_client_capability(WritebackConnectors): {e}"))
+        })?;
 
     let res = card.resource_handles()?;
 
@@ -61,15 +63,12 @@ fn main() -> std::io::Result<()> {
         if let (Some(mode), Some(_fb)) = (info.mode(), info.framebuffer()) {
             active_crtc = Some(*c);
             active_mode = Some(mode);
-            eprintln!(
-                "active CRTC {:?}: {}x{}",
-                c, mode.size().0, mode.size().1
-            );
+            eprintln!("active CRTC {:?}: {}x{}", c, mode.size().0, mode.size().1);
             break;
         }
     }
-    let active_crtc = active_crtc
-        .ok_or_else(|| std::io::Error::other("no active CRTC with mode+FB"))?;
+    let active_crtc =
+        active_crtc.ok_or_else(|| std::io::Error::other("no active CRTC with mode+FB"))?;
     let mode = active_mode.unwrap();
     let (w, h) = mode.size();
     let (w, h) = (w as u32, h as u32);
@@ -82,14 +81,17 @@ fn main() -> std::io::Result<()> {
             Err(_) => continue,
         };
         if info.interface() == connector::Interface::Writeback {
-            eprintln!("writeback connector: {:?} (interface_id={})",
-                      c, info.interface_id());
+            eprintln!(
+                "writeback connector: {:?} (interface_id={})",
+                c,
+                info.interface_id()
+            );
             wb_connector = Some(*c);
             break;
         }
     }
-    let wb_connector = wb_connector
-        .ok_or_else(|| std::io::Error::other("no writeback connector"))?;
+    let wb_connector =
+        wb_connector.ok_or_else(|| std::io::Error::other("no writeback connector"))?;
 
     // Look up writeback property handles by name.
     let props = card.get_properties(wb_connector)?;
@@ -106,12 +108,12 @@ fn main() -> std::io::Result<()> {
             _ => {}
         }
     }
-    let wb_fb_id_prop = wb_fb_id_prop
-        .ok_or_else(|| std::io::Error::other("WRITEBACK_FB_ID property not found"))?;
+    let wb_fb_id_prop =
+        wb_fb_id_prop.ok_or_else(|| std::io::Error::other("WRITEBACK_FB_ID property not found"))?;
     let wb_out_fence_ptr_prop = wb_out_fence_ptr_prop
         .ok_or_else(|| std::io::Error::other("WRITEBACK_OUT_FENCE_PTR property not found"))?;
-    let crtc_id_prop = crtc_id_prop
-        .ok_or_else(|| std::io::Error::other("CRTC_ID property not found"))?;
+    let crtc_id_prop =
+        crtc_id_prop.ok_or_else(|| std::io::Error::other("CRTC_ID property not found"))?;
     eprintln!(
         "props: WB_FB_ID={:?} WB_OUT_FENCE_PTR={:?} CRTC_ID={:?}",
         wb_fb_id_prop, wb_out_fence_ptr_prop, crtc_id_prop
@@ -119,8 +121,12 @@ fn main() -> std::io::Result<()> {
 
     // Allocate persistent target dumb buffer (XR24, no alpha).
     let mut dumb = card.create_dumb_buffer((w, h), DrmFourcc::Xrgb8888, 32)?;
-    eprintln!("dumb buffer: {}x{} pitch={}",
-              dumb.size().0, dumb.size().1, dumb.pitch());
+    eprintln!(
+        "dumb buffer: {}x{} pitch={}",
+        dumb.size().0,
+        dumb.size().1,
+        dumb.pitch()
+    );
 
     // Wrap as FB.
     let target_fb = card.add_framebuffer(&dumb, 24, 32)?;
@@ -134,21 +140,9 @@ fn main() -> std::io::Result<()> {
     let conn_raw = NonZeroU32::new(u32::from(wb_connector))
         .ok_or_else(|| std::io::Error::other("connector handle is zero"))?;
     let mut req = AtomicModeReq::new();
-    req.add_raw_property(
-        conn_raw,
-        crtc_id_prop,
-        u64::from(u32::from(active_crtc)),
-    );
-    req.add_raw_property(
-        conn_raw,
-        wb_fb_id_prop,
-        u64::from(u32::from(target_fb)),
-    );
-    req.add_raw_property(
-        conn_raw,
-        wb_out_fence_ptr_prop,
-        out_fence_ptr_addr,
-    );
+    req.add_raw_property(conn_raw, crtc_id_prop, u64::from(u32::from(active_crtc)));
+    req.add_raw_property(conn_raw, wb_fb_id_prop, u64::from(u32::from(target_fb)));
+    req.add_raw_property(conn_raw, wb_out_fence_ptr_prop, out_fence_ptr_addr);
 
     eprintln!("submitting atomic commit (ALLOW_MODESET)");
     card.atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req)?;

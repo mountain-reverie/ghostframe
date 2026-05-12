@@ -300,8 +300,7 @@ impl GpuFrameProcessor {
             chosen.ok_or("no Vulkan device supports DMA-BUF import extensions")?;
 
         // --- Queue family: prefer COMPUTE-only, fall back to GRAPHICS|COMPUTE ---
-        let queue_families =
-            instance.get_physical_device_queue_family_properties(physical_device);
+        let queue_families = instance.get_physical_device_queue_family_properties(physical_device);
 
         let queue_family_index = queue_families
             .iter()
@@ -354,10 +353,8 @@ impl GpuFrameProcessor {
         let analysis_spv = include_bytes!("shaders/tile_analysis.spv");
         let analysis_spv_words =
             ash::util::read_spv(&mut std::io::Cursor::new(analysis_spv.as_slice()))?;
-        let analysis_shader_ci =
-            vk::ShaderModuleCreateInfo::default().code(&analysis_spv_words);
-        let analysis_shader_module =
-            device.create_shader_module(&analysis_shader_ci, None)?;
+        let analysis_shader_ci = vk::ShaderModuleCreateInfo::default().code(&analysis_spv_words);
+        let analysis_shader_module = device.create_shader_module(&analysis_shader_ci, None)?;
 
         // --- SAD Descriptor set layout ---
         // binding 0: STORAGE_IMAGE (current frame)
@@ -423,10 +420,8 @@ impl GpuFrameProcessor {
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
         ];
-        let nv12_dsl_ci =
-            vk::DescriptorSetLayoutCreateInfo::default().bindings(&nv12_bindings);
-        let nv12_descriptor_set_layout =
-            device.create_descriptor_set_layout(&nv12_dsl_ci, None)?;
+        let nv12_dsl_ci = vk::DescriptorSetLayoutCreateInfo::default().bindings(&nv12_bindings);
+        let nv12_descriptor_set_layout = device.create_descriptor_set_layout(&nv12_dsl_ci, None)?;
 
         // --- NV12 Pipeline layout ---
         // Push constants: 5 x u32 = 20 bytes (width, height, y_stride, uv_offset, uv_stride)
@@ -437,8 +432,7 @@ impl GpuFrameProcessor {
         let nv12_pipeline_layout_ci = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(std::slice::from_ref(&nv12_descriptor_set_layout))
             .push_constant_ranges(&nv12_push_range);
-        let nv12_pipeline_layout =
-            device.create_pipeline_layout(&nv12_pipeline_layout_ci, None)?;
+        let nv12_pipeline_layout = device.create_pipeline_layout(&nv12_pipeline_layout_ci, None)?;
 
         // --- NV12 Compute pipeline ---
         let nv12_stage = vk::PipelineShaderStageCreateInfo::default()
@@ -543,12 +537,8 @@ impl GpuFrameProcessor {
         let sad_memory = device.allocate_memory(&sad_alloc, None)?;
         device.bind_buffer_memory(sad_buffer, sad_memory, 0)?;
 
-        let sad_ptr = device.map_memory(
-            sad_memory,
-            0,
-            sad_buf_size,
-            vk::MemoryMapFlags::empty(),
-        )? as *mut u32;
+        let sad_ptr = device.map_memory(sad_memory, 0, sad_buf_size, vk::MemoryMapFlags::empty())?
+            as *mut u32;
 
         // --- Analysis output buffer ---
         let analysis_entry_bytes = std::mem::size_of::<TileAnalysis>() as vk::DeviceSize;
@@ -669,7 +659,9 @@ impl GpuFrameProcessor {
         let memory = self.device.allocate_memory(&alloc, None)?;
         self.device.bind_buffer_memory(buffer, memory, 0)?;
 
-        let ptr = self.device.map_memory(memory, 0, total, vk::MemoryMapFlags::empty())? as *mut u8;
+        let ptr =
+            self.device
+                .map_memory(memory, 0, total, vk::MemoryMapFlags::empty())? as *mut u8;
 
         self.nv12_buffer = Some(NV12Buffer {
             buffer,
@@ -749,14 +741,8 @@ impl GpuFrameProcessor {
         let current = self.import_dmabuf(fd, width, height, stride)?;
         // Result must always destroy `current` at end. Use a closure-style
         // cleanup by carrying it forward and explicitly destroying.
-        let result = self.process_frame_with_imported(
-            &current,
-            width,
-            height,
-            tile_count,
-            cols,
-            rows,
-        );
+        let result =
+            self.process_frame_with_imported(&current, width, height, tile_count, cols, rows);
         // Always clean up the imported DMA-BUF VkImage (transient).
         self.destroy_prev_frame(current);
         result
@@ -1061,16 +1047,14 @@ impl GpuFrameProcessor {
         // NV12 shader: workgroup = 2x2 pixels, dispatch = (width/2, height/2, 1)
         let nv12_groups_x = width.div_ceil(2);
         let nv12_groups_y = height.div_ceil(2);
-        self.device.cmd_dispatch(cmd, nv12_groups_x, nv12_groups_y, 1);
+        self.device
+            .cmd_dispatch(cmd, nv12_groups_x, nv12_groups_y, 1);
 
         // 4b. Analysis dispatch. No barrier needed vs SAD/NV12 — all read
         // current_frame read-only and write to disjoint buffers; the final
         // HOST-readback barrier covers all three output buffers.
-        self.device.cmd_bind_pipeline(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.analysis_pipeline,
-        );
+        self.device
+            .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.analysis_pipeline);
         self.device.cmd_bind_descriptor_sets(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
@@ -1254,7 +1238,13 @@ impl GpuFrameProcessor {
         // 8. Per-frame transients (descriptor sets, command buffer, fence) are
         //    freed when their RAII guards drop at end of scope. We touch the
         //    guards here to keep them alive past the `wait_for_fences` above.
-        let _ = (&sad_ds_guard, &nv12_ds_guard, &analysis_ds_guard, &cmd_guard, &fence_guard);
+        let _ = (
+            &sad_ds_guard,
+            &nv12_ds_guard,
+            &analysis_ds_guard,
+            &cmd_guard,
+            &fence_guard,
+        );
 
         // 9. prev_image is persistent (own-allocated, layout still GENERAL
         // after the post-copy barrier). It now holds a snapshot of THIS frame
@@ -1399,7 +1389,8 @@ impl GpuFrameProcessor {
         );
         let nv12_groups_x = width.div_ceil(2);
         let nv12_groups_y = height.div_ceil(2);
-        self.device.cmd_dispatch(cmd, nv12_groups_x, nv12_groups_y, 1);
+        self.device
+            .cmd_dispatch(cmd, nv12_groups_x, nv12_groups_y, 1);
 
         // Snapshot copy: current (GENERAL) → snapshot (TRANSFER_DST_OPTIMAL).
         // `snapshot` is always freshly allocated by `allocate_owned_image` and
@@ -1581,13 +1572,12 @@ impl GpuFrameProcessor {
             .instance
             .get_physical_device_memory_properties(self.physical_device);
 
-        let image_mem_type = find_memory_type(
-            &mem_props,
-            u32::MAX,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        )
-        .or_else(|| find_memory_type(&mem_props, u32::MAX, vk::MemoryPropertyFlags::empty()))
-        .ok_or("no suitable memory type for DMA-BUF import")?;
+        let image_mem_type =
+            find_memory_type(&mem_props, u32::MAX, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                .or_else(|| {
+                    find_memory_type(&mem_props, u32::MAX, vk::MemoryPropertyFlags::empty())
+                })
+                .ok_or("no suitable memory type for DMA-BUF import")?;
 
         let mut alloc_info = vk::MemoryAllocateInfo::default()
             .allocation_size(size)
@@ -1704,7 +1694,13 @@ impl GpuFrameProcessor {
             mem_reqs.memory_type_bits,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
         )
-        .or_else(|| find_memory_type(&mem_props, mem_reqs.memory_type_bits, vk::MemoryPropertyFlags::empty()))
+        .or_else(|| {
+            find_memory_type(
+                &mem_props,
+                mem_reqs.memory_type_bits,
+                vk::MemoryPropertyFlags::empty(),
+            )
+        })
         .ok_or("no suitable memory type for owned snapshot image")?;
 
         let alloc_info = vk::MemoryAllocateInfo::default()
@@ -1777,8 +1773,7 @@ impl Drop for GpuFrameProcessor {
                 .destroy_descriptor_pool(self.descriptor_pool, None);
 
             // NV12 pipeline
-            self.device
-                .destroy_pipeline(self.nv12_pipeline, None);
+            self.device.destroy_pipeline(self.nv12_pipeline, None);
             self.device
                 .destroy_pipeline_layout(self.nv12_pipeline_layout, None);
             self.device
@@ -2033,7 +2028,9 @@ mod tests {
                 Ok(a) => a,
                 Err(e) => {
                     libc::close(fd);
-                    eprintln!("Skipping process_frame_returns_nv12_data (memfd not a real DMA-BUF): {e}");
+                    eprintln!(
+                        "Skipping process_frame_returns_nv12_data (memfd not a real DMA-BUF): {e}"
+                    );
                     return;
                 }
             };
@@ -2050,7 +2047,10 @@ mod tests {
             assert_eq!(analysis.dirty_tiles.len(), 4, "first frame: 4 tiles dirty");
 
             // Pointer must not be null
-            assert!(!analysis.nv12_data.is_null(), "nv12_data pointer should not be null");
+            assert!(
+                !analysis.nv12_data.is_null(),
+                "nv12_data pointer should not be null"
+            );
 
             // Verify Y values for solid red (R=1.0, G=0, B=0):
             // Y = 0.299*1 + 0.587*0 + 0.114*0 = 0.299 → ~76
@@ -2066,15 +2066,28 @@ mod tests {
 
     #[test]
     fn tile_analysis_struct_has_expected_layout() {
-        assert_eq!(std::mem::size_of::<TileAnalysis>(), 80, "TileAnalysis must be 80 bytes");
-        assert_eq!(std::mem::align_of::<TileAnalysis>(), 4, "TileAnalysis alignment");
+        assert_eq!(
+            std::mem::size_of::<TileAnalysis>(),
+            80,
+            "TileAnalysis must be 80 bytes"
+        );
+        assert_eq!(
+            std::mem::align_of::<TileAnalysis>(),
+            4,
+            "TileAnalysis alignment"
+        );
 
         // Offsets match std430 layout from the shader.
-        let zero = TileAnalysis { count: 0, edge_density_thou: 0, _pad: [0; 2], colors: [0; 16] };
+        let zero = TileAnalysis {
+            count: 0,
+            edge_density_thou: 0,
+            _pad: [0; 2],
+            colors: [0; 16],
+        };
         let base = &zero as *const _ as usize;
-        assert_eq!(&zero.count             as *const _ as usize - base, 0);
+        assert_eq!(&zero.count as *const _ as usize - base, 0);
         assert_eq!(&zero.edge_density_thou as *const _ as usize - base, 4);
-        assert_eq!(&zero.colors            as *const _ as usize - base, 16);
+        assert_eq!(&zero.colors as *const _ as usize - base, 16);
     }
 
     #[test]
@@ -2082,14 +2095,27 @@ mod tests {
         // Build a fake FrameAnalysis backed by a heap Vec so we can exercise the
         // slice helper without spinning up Vulkan.
         let mut backing = vec![
-            TileAnalysis { count: 1, edge_density_thou: 100, _pad: [0; 2], colors: [0xAAAAAAAAu32; 16] },
-            TileAnalysis { count: 2, edge_density_thou: 200, _pad: [0; 2], colors: [0xBBBBBBBBu32; 16] },
+            TileAnalysis {
+                count: 1,
+                edge_density_thou: 100,
+                _pad: [0; 2],
+                colors: [0xAAAAAAAAu32; 16],
+            },
+            TileAnalysis {
+                count: 2,
+                edge_density_thou: 200,
+                _pad: [0; 2],
+                colors: [0xBBBBBBBBu32; 16],
+            },
         ];
         let analysis = FrameAnalysis {
             dirty_tiles: vec![],
             nv12_data: std::ptr::null(),
-            nv12_width: 0, nv12_height: 0,
-            nv12_y_stride: 0, nv12_uv_stride: 0, nv12_uv_offset: 0,
+            nv12_width: 0,
+            nv12_height: 0,
+            nv12_y_stride: 0,
+            nv12_uv_stride: 0,
+            nv12_uv_offset: 0,
             tile_analysis: backing.as_mut_ptr() as *const TileAnalysis,
             tile_analysis_len: 2,
         };
@@ -2129,12 +2155,18 @@ mod tests {
             };
             libc::close(fd);
 
-            assert!(!analysis.tile_analysis.is_null(), "tile_analysis pointer must not be null");
+            assert!(
+                !analysis.tile_analysis.is_null(),
+                "tile_analysis pointer must not be null"
+            );
             assert_eq!(analysis.tile_analysis_len, 1, "32x32 frame → 1 tile");
             let slice = analysis.tile_analysis_slice();
             assert_eq!(slice.len(), 1);
             assert_eq!(slice[0].count, 1, "solid tile → count=1");
-            assert_eq!(slice[0].colors[0], 0xFFFF0000u32, "BGRA(0,0,255,255) → 0xFFFF0000");
+            assert_eq!(
+                slice[0].colors[0], 0xFFFF0000u32,
+                "BGRA(0,0,255,255) → 0xFFFF0000"
+            );
             assert_eq!(slice[0].edge_density_thou, 0, "solid tile → no edges");
         }
     }
@@ -2161,8 +2193,12 @@ mod tests {
             assert!(fd >= 0);
             libc::ftruncate(fd, size as i64);
             let ptr = libc::mmap(
-                std::ptr::null_mut(), size,
-                libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0,
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
             );
             assert_ne!(ptr, libc::MAP_FAILED);
             let frame = std::slice::from_raw_parts_mut(ptr as *mut u8, size);
@@ -2170,9 +2206,9 @@ mod tests {
                 for x in 0..width {
                     let offset = ((y * stride) + x * 4) as usize;
                     let bgra = if (x + y) & 1 == 0 {
-                        [255, 0, 0, 255]   // blue
+                        [255, 0, 0, 255] // blue
                     } else {
-                        [0, 0, 255, 255]   // red
+                        [0, 0, 255, 255] // red
                     };
                     frame[offset..offset + 4].copy_from_slice(&bgra);
                 }
@@ -2193,13 +2229,14 @@ mod tests {
             assert_eq!(entry.count, 2, "checkerboard → 2 unique colors");
 
             // Both colors must appear; order is slot-traversal, not specified.
-            let blue: u32 = 0xFF0000FF;   // B=255, G=0, R=0, A=255 → 0xFF | 0 | 0 | 0xFF000000
-            let red:  u32 = 0xFFFF0000;   // B=0, G=0, R=255, A=255
+            let blue: u32 = 0xFF0000FF; // B=255, G=0, R=0, A=255 → 0xFF | 0 | 0 | 0xFF000000
+            let red: u32 = 0xFFFF0000; // B=0, G=0, R=255, A=255
             assert!(
-                (entry.colors[0] == blue || entry.colors[1] == blue) &&
-                (entry.colors[0] == red  || entry.colors[1] == red),
+                (entry.colors[0] == blue || entry.colors[1] == blue)
+                    && (entry.colors[0] == red || entry.colors[1] == red),
                 "expected both red and blue, got [{:#x}, {:#x}]",
-                entry.colors[0], entry.colors[1]
+                entry.colors[0],
+                entry.colors[1]
             );
 
             // Most pixels border a different color on at least one cardinal axis;
@@ -2235,26 +2272,41 @@ mod tests {
             assert!(fd >= 0);
             libc::ftruncate(fd, size as i64);
             let ptr = libc::mmap(
-                std::ptr::null_mut(), size,
-                libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0,
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
             );
             assert_ne!(ptr, libc::MAP_FAILED);
             let frame = std::slice::from_raw_parts_mut(ptr as *mut u8, size);
             // 17 distinct BGRA colors. Background = color 0.
             let colors: [[u8; 4]; 17] = [
-                [10, 20, 30, 255],   [40, 50, 60, 255],   [70, 80, 90, 255],
-                [100, 110, 120, 255], [130, 140, 150, 255], [160, 170, 180, 255],
-                [190, 200, 210, 255], [220, 230, 240, 255], [5, 15, 25, 255],
-                [35, 45, 55, 255],   [65, 75, 85, 255],   [95, 105, 115, 255],
-                [125, 135, 145, 255], [155, 165, 175, 255], [185, 195, 205, 255],
-                [215, 225, 235, 255], [245, 250, 254, 255],
+                [10, 20, 30, 255],
+                [40, 50, 60, 255],
+                [70, 80, 90, 255],
+                [100, 110, 120, 255],
+                [130, 140, 150, 255],
+                [160, 170, 180, 255],
+                [190, 200, 210, 255],
+                [220, 230, 240, 255],
+                [5, 15, 25, 255],
+                [35, 45, 55, 255],
+                [65, 75, 85, 255],
+                [95, 105, 115, 255],
+                [125, 135, 145, 255],
+                [155, 165, 175, 255],
+                [185, 195, 205, 255],
+                [215, 225, 235, 255],
+                [245, 250, 254, 255],
             ];
             for chunk in frame.chunks_exact_mut(4) {
                 chunk.copy_from_slice(&colors[0]);
             }
             // Place each of the 17 colors at distinct pixel positions.
             for (i, c) in colors.iter().enumerate() {
-                let x = (i as u32 * 7) % width;   // stride 7 keeps placements spread out
+                let x = (i as u32 * 7) % width; // stride 7 keeps placements spread out
                 let y = (i as u32 * 11) % height;
                 let off = ((y * stride) + x * 4) as usize;
                 frame[off..off + 4].copy_from_slice(c);
@@ -2313,19 +2365,23 @@ mod tests {
             assert!(fd >= 0);
             libc::ftruncate(fd, size as i64);
             let ptr = libc::mmap(
-                std::ptr::null_mut(), size,
-                libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0,
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
             );
             assert_ne!(ptr, libc::MAP_FAILED);
             let frame = std::slice::from_raw_parts_mut(ptr as *mut u8, size);
             for chunk in frame.chunks_exact_mut(4) {
-                chunk.copy_from_slice(&[0, 0, 255, 255]);   // red BGRA
+                chunk.copy_from_slice(&[0, 0, 255, 255]); // red BGRA
             }
             // Inject one bright-green pixel at (x=35, y=10) — interior of tile (1,0):
             // tile (1,0) covers x=32..40, y=0..32; (35,10) is in-bounds and not on
             // the frame edge.
             let off = ((10u32 * stride) + 35 * 4) as usize;
-            frame[off..off + 4].copy_from_slice(&[0, 255, 0, 255]);   // green BGRA
+            frame[off..off + 4].copy_from_slice(&[0, 255, 0, 255]); // green BGRA
             libc::munmap(ptr, size);
 
             let analysis = match processor.process_frame(fd, width, height, stride) {
@@ -2387,7 +2443,10 @@ mod tests {
 
             let entry = &analysis.tile_analysis_slice()[0];
             assert_eq!(entry.count, 1, "transparent-black tile → count=1");
-            assert_eq!(entry.colors[0], 0x00000000u32, "BGRA(0,0,0,0) survives mask");
+            assert_eq!(
+                entry.colors[0], 0x00000000u32,
+                "BGRA(0,0,0,0) survives mask"
+            );
             assert_eq!(entry.edge_density_thou, 0);
         }
     }
@@ -2420,15 +2479,19 @@ mod tests {
             assert!(fd >= 0);
             libc::ftruncate(fd, size as i64);
             let ptr = libc::mmap(
-                std::ptr::null_mut(), size,
-                libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0,
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
             );
             assert_ne!(ptr, libc::MAP_FAILED);
             let frame = std::slice::from_raw_parts_mut(ptr as *mut u8, size);
 
-            let red:    [u8; 4] = [0, 0, 255, 255];
-            let blue:   [u8; 4] = [255, 0, 0, 255];
-            let green:  [u8; 4] = [0, 255, 0, 255];
+            let red: [u8; 4] = [0, 0, 255, 255];
+            let blue: [u8; 4] = [255, 0, 0, 255];
+            let green: [u8; 4] = [0, 255, 0, 255];
             let yellow: [u8; 4] = [0, 255, 255, 255];
 
             // Fill helper.
@@ -2439,9 +2502,13 @@ mod tests {
 
             for y in 0..32 {
                 // tile (0,0): red
-                for x in 0..32 { put(x, y, red); }
+                for x in 0..32 {
+                    put(x, y, red);
+                }
                 // tile (1,0): blue
-                for x in 32..64 { put(x, y, blue); }
+                for x in 32..64 {
+                    put(x, y, blue);
+                }
             }
             for y in 32..64 {
                 // tile (0,1): red/blue checker

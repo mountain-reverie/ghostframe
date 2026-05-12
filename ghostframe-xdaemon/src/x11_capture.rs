@@ -30,7 +30,12 @@ impl X11Capture {
         let width = screen.width_in_pixels;
         let height = screen.height_in_pixels;
         tracing::info!(width, height, "X11 capture connected to display");
-        Ok(Self { conn, root, width, height })
+        Ok(Self {
+            conn,
+            root,
+            width,
+            height,
+        })
     }
 
     /// Capture the root window as a `FrameSubmission`.

@@ -22,14 +22,19 @@ impl MetricsTracker {
         }
     }
 
-    pub fn cols(&self) -> u32 { self.cols }
-    pub fn rows(&self) -> u32 { self.rows }
+    pub fn cols(&self) -> u32 {
+        self.cols
+    }
+    pub fn rows(&self) -> u32 {
+        self.rows
+    }
 
     pub fn resize(&mut self, cols: u32, rows: u32) {
         self.cols = cols;
         self.rows = rows;
         self.metrics.clear();
-        self.metrics.resize((cols * rows) as usize, TileMetrics::default());
+        self.metrics
+            .resize((cols * rows) as usize, TileMetrics::default());
     }
 
     pub fn reset(&mut self) {
@@ -55,7 +60,8 @@ impl MetricsTracker {
         debug_assert!(
             tile_x < self.cols && tile_y < self.rows,
             "tile ({tile_x},{tile_y}) out of bounds for {}×{} grid",
-            self.cols, self.rows,
+            self.cols,
+            self.rows,
         );
         (tile_y * self.cols + tile_x) as usize
     }
@@ -141,8 +147,12 @@ mod tests {
     fn record_frame_ema_decays_for_clean_tile() {
         let mut t = MetricsTracker::new(1, 1);
         // Prime to 60 Hz then go clean
-        for _ in 0..30 { t.record_frame(&[(0, 0)]); }
-        for _ in 0..30 { t.record_frame(&[]); }
+        for _ in 0..30 {
+            t.record_frame(&[(0, 0)]);
+        }
+        for _ in 0..30 {
+            t.record_frame(&[]);
+        }
         assert!(t.get(0, 0).change_freq_hz < 5.0);
     }
 
@@ -150,7 +160,7 @@ mod tests {
     fn record_frame_ignores_out_of_range_dirty_coords() {
         let mut t = MetricsTracker::new(2, 2);
         t.record_frame(&[(99, 99)]); // out of range
-        // No panic, all tiles treated as clean.
+                                     // No panic, all tiles treated as clean.
         for m in t.metrics() {
             assert_eq!(m.idle_frames, 1);
         }

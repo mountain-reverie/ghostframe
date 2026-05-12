@@ -31,16 +31,16 @@ use crate::capture::gpu_pipeline::GpuFrameProcessor;
 use crate::encoder::h264_vaapi::FullFrameEncoder;
 use crate::server::FrameSubmission;
 use crate::tile::{DirtyTracker, TileGrid};
-use crate::transport::ghostbridge::{
-    encode_frame, parse_frame_rest, GhostbridgeConfig, GhostbridgeHandle,
-};
 use crate::transport::fec;
 use crate::transport::fec::fec_group_size;
 use crate::transport::feedback::ReceiverFeedback;
+use crate::transport::ghostbridge::{
+    encode_frame, parse_frame_rest, GhostbridgeConfig, GhostbridgeHandle,
+};
 use crate::transport::protocol::{
-    build_frame_parity_datagram, Codec, fragment_frame, fragment_tile,
-    max_fragment_payload, max_frame_fragment_payload, FrameHeader, NackMessage,
-    FRAME_HEADER_SIZE, PING_PAYLOAD, PONG_PAYLOAD, TILE_DATAGRAM_FLAG,
+    build_frame_parity_datagram, fragment_frame, fragment_tile, max_fragment_payload,
+    max_frame_fragment_payload, Codec, FrameHeader, NackMessage, FRAME_HEADER_SIZE, PING_PAYLOAD,
+    PONG_PAYLOAD, TILE_DATAGRAM_FLAG,
 };
 use crate::transport::quic::QuicServer;
 use crate::transport::webtransport::WebTransportServer;
@@ -64,10 +64,12 @@ pub(crate) fn populate_gpu_metrics(
 ) {
     for &(tx, ty) in dirty {
         let idx = (ty as usize) * (cols as usize) + (tx as usize);
-        let Some(entry) = tile_analysis.get(idx) else { continue; };
+        let Some(entry) = tile_analysis.get(idx) else {
+            continue;
+        };
         let m = tracker.get_mut(tx, ty);
         m.unique_colors = entry.count.min(u16::MAX as u32) as u16;
-        m.edge_density  = entry.edge_density_thou as f32 / 1000.0;
+        m.edge_density = entry.edge_density_thou as f32 / 1000.0;
     }
 }
 
@@ -156,12 +158,15 @@ impl IoBridge {
     ///    default `all`.
     /// - `GHOSTFRAME_<DIR>_LOSS_SEED` — u64, default 0.
     #[cfg(any(test, feature = "test-loss-injection"))]
-    fn loss_injector_from_env(direction: &str) -> Option<crate::transport::loss_injection::LossInjector> {
+    fn loss_injector_from_env(
+        direction: &str,
+    ) -> Option<crate::transport::loss_injection::LossInjector> {
         let prob_var = format!("GHOSTFRAME_{direction}_LOSS_PROBABILITY");
         let pred_var = format!("GHOSTFRAME_{direction}_LOSS_PREDICATE");
         let seed_var = format!("GHOSTFRAME_{direction}_LOSS_SEED");
 
-        let prob: f32 = std::env::var(&prob_var).ok()
+        let prob: f32 = std::env::var(&prob_var)
+            .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.0);
         if prob <= 0.0 {
@@ -170,10 +175,14 @@ impl IoBridge {
 
         // Predicate: function pointer that classifies an outbound/inbound
         // datagram by its first byte. Selected by the *_LOSS_PREDICATE env var.
-        fn predicate_all(_: &[u8]) -> bool { true }
+        fn predicate_all(_: &[u8]) -> bool {
+            true
+        }
         // Tile datagrams set bit 31 of frame_seq (TILE_DATAGRAM_FLAG = 0x80000000),
         // which is the high bit of byte [0] in big-endian wire order.
-        fn predicate_tile(dg: &[u8]) -> bool { !dg.is_empty() && (dg[0] & 0x80) != 0 }
+        fn predicate_tile(dg: &[u8]) -> bool {
+            !dg.is_empty() && (dg[0] & 0x80) != 0
+        }
         // ACK_BATCH_MSG_TYPE = 0x02 (see transport/ack.rs).
         fn predicate_ack(dg: &[u8]) -> bool {
             dg.first().copied() == Some(crate::transport::ack::ACK_BATCH_MSG_TYPE)
@@ -185,12 +194,19 @@ impl IoBridge {
                 Ok("ack") => predicate_ack,
                 _ => predicate_all,
             };
-        let seed: u64 = std::env::var(&seed_var).ok()
+        let seed: u64 = std::env::var(&seed_var)
+            .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
 
-        tracing::info!(direction, prob, "test-loss-injection: installed LossInjector");
-        Some(crate::transport::loss_injection::LossInjector::new(prob, predicate, seed))
+        tracing::info!(
+            direction,
+            prob,
+            "test-loss-injection: installed LossInjector"
+        );
+        Some(crate::transport::loss_injection::LossInjector::new(
+            prob, predicate, seed,
+        ))
     }
 
     /// Create a new `IoBridge` by connecting to ghostbridge and opening a UDP
@@ -370,7 +386,10 @@ impl IoBridge {
         }
 
         // RTT estimate across connected sessions; default to 20 ms if none.
-        let rtt = self.server.connections.values()
+        let rtt = self
+            .server
+            .connections
+            .values()
             .map(|c| c.stats().path.rtt)
             .min()
             .unwrap_or_else(|| std::time::Duration::from_millis(20));
@@ -449,7 +468,8 @@ impl IoBridge {
         if data[0] == crate::transport::ack::ACK_BATCH_MSG_TYPE {
             if let Ok(batch) = crate::transport::ack::AckBatch::decode(data) {
                 for e in batch.entries {
-                    self.scheduler.on_ack(e.tile_x, e.tile_y, e.generation, e.pass);
+                    self.scheduler
+                        .on_ack(e.tile_x, e.tile_y, e.generation, e.pass);
                 }
             }
         }
@@ -475,9 +495,8 @@ impl IoBridge {
                 }
                 if let Some(conn) = self.server.connections.get_mut(handle) {
                     if let Some(sz) = conn.datagrams().max_size() {
-                        let usable = max_fragment_payload(
-                            sz.saturating_sub(Self::WT_VARINT_OVERHEAD),
-                        );
+                        let usable =
+                            max_fragment_payload(sz.saturating_sub(Self::WT_VARINT_OVERHEAD));
                         min_size = Some(match min_size {
                             Some(prev) => prev.min(usable),
                             None => usable,
@@ -534,25 +553,30 @@ impl IoBridge {
         // never retransmitted. A full scan at the transition commits every tile.
         let dirty_tiles = if no_commit {
             self.dirty_tracker.update_no_commit(
-                &frame.pixels, frame.stride, frame.width, frame.height,
+                &frame.pixels,
+                frame.stride,
+                frame.width,
+                frame.height,
             )
         } else if !self.dirty_tracker.has_been_committed() {
             // First commit frame: full scan so every tile is flushed from baseline.
-            self.dirty_tracker.update(
-                &frame.pixels, frame.stride, frame.width, frame.height,
-            )
+            self.dirty_tracker
+                .update(&frame.pixels, frame.stride, frame.width, frame.height)
         } else {
             match &frame.damage_tiles {
-                Some(hints) => {
-                    self.dirty_tracker.update_with_hints(
-                        &frame.pixels, frame.stride, frame.width, frame.height, hints,
-                    )
-                }
-                None => {
-                    self.dirty_tracker.update(
-                        &frame.pixels, frame.stride, frame.width, frame.height,
-                    )
-                }
+                Some(hints) => self.dirty_tracker.update_with_hints(
+                    &frame.pixels,
+                    frame.stride,
+                    frame.width,
+                    frame.height,
+                    hints,
+                ),
+                None => self.dirty_tracker.update(
+                    &frame.pixels,
+                    frame.stride,
+                    frame.width,
+                    frame.height,
+                ),
             }
         };
 
@@ -616,14 +640,15 @@ impl IoBridge {
 
         // GPU pipeline: Vulkan SAD dirty detection + NV12 conversion
         let processor = self.gpu_frame_processor.as_mut().unwrap();
-        let analysis = match processor.process_frame(raw_fd, frame.width, frame.height, frame.stride) {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::warn!("GPU process_frame failed: {e}, falling back to CPU path");
-                self.process_frame_cpu(frame);
-                return;
-            }
-        };
+        let analysis =
+            match processor.process_frame(raw_fd, frame.width, frame.height, frame.stride) {
+                Ok(a) => a,
+                Err(e) => {
+                    tracing::warn!("GPU process_frame failed: {e}, falling back to CPU path");
+                    self.process_frame_cpu(frame);
+                    return;
+                }
+            };
 
         tracing::debug!(
             seq,
@@ -711,7 +736,9 @@ impl IoBridge {
                 };
                 if needs_init {
                     match FullFrameEncoder::new(frame.width, frame.height) {
-                        Ok(enc) => { self.full_frame_encoder = Some(enc); }
+                        Ok(enc) => {
+                            self.full_frame_encoder = Some(enc);
+                        }
                         Err(e) => {
                             tracing::warn!("Full-frame encoder init failed: {e}");
                             return;
@@ -766,14 +793,18 @@ impl IoBridge {
                 // FEC parity
                 let fec_k = fec_group_size(encoded.is_keyframe);
                 if datagrams.len() > 1 {
-                    let source_payloads: Vec<&[u8]> = datagrams.iter()
+                    let source_payloads: Vec<&[u8]> = datagrams
+                        .iter()
                         .map(|dg| &dg[FRAME_HEADER_SIZE..])
                         .collect();
                     let parities = fec::generate_parity(&source_payloads, fec_k);
                     for (_group_start, parity_payload) in &parities {
                         let parity_dg = build_frame_parity_datagram(
-                            seq, frame.timestamp_us, encoded.is_keyframe,
-                            datagrams.len() as u16, parity_payload,
+                            seq,
+                            frame.timestamp_us,
+                            encoded.is_keyframe,
+                            datagrams.len() as u16,
+                            parity_payload,
                         );
                         self.send_to_all_sessions(&parity_dg);
                     }
@@ -781,10 +812,12 @@ impl IoBridge {
 
                 // Store fragments for NACK
                 let oldest_kept = seq.wrapping_sub(3);
-                self.recent_frame_fragments.retain(|(s, _), _| s.wrapping_sub(oldest_kept) <= 3);
+                self.recent_frame_fragments
+                    .retain(|(s, _), _| s.wrapping_sub(oldest_kept) <= 3);
                 for dg in &datagrams {
                     if let Ok(hdr) = FrameHeader::decode(dg) {
-                        self.recent_frame_fragments.insert((hdr.frame_seq, hdr.frag_idx), dg.clone());
+                        self.recent_frame_fragments
+                            .insert((hdr.frame_seq, hdr.frag_idx), dg.clone());
                     }
                 }
             }
@@ -800,9 +833,15 @@ impl IoBridge {
                 let pixels: &[u8] = if frame.pixels.is_empty() {
                     match frame.dmabuf_fd.as_ref() {
                         Some(fd) => match crate::capture::dmabuf::readback_dmabuf(
-                            fd.as_raw_fd(), frame.width, frame.height, frame.stride,
+                            fd.as_raw_fd(),
+                            frame.width,
+                            frame.height,
+                            frame.stride,
                         ) {
-                            Ok(p) => { pixels_owned = p; &pixels_owned }
+                            Ok(p) => {
+                                pixels_owned = p;
+                                &pixels_owned
+                            }
                             Err(e) => {
                                 tracing::warn!(
                                     "DMA-BUF readback failed in TileCodec mode: {e}; \
@@ -848,19 +887,24 @@ impl IoBridge {
             let frame_interval = std::time::Duration::from_micros(16_667); // ~60fps
 
             if rtt < frame_interval {
-                if let Some(dg) = self.recent_frame_fragments.get(&(nack.frame_seq, nack.frag_idx)) {
+                if let Some(dg) = self
+                    .recent_frame_fragments
+                    .get(&(nack.frame_seq, nack.frag_idx))
+                {
                     let dg = dg.clone();
                     if let Some(wt) = self.wt_sessions.get_mut(&handle) {
                         let _ = wt.send_datagram(conn, &dg);
                         tracing::trace!(
-                            frame_seq = nack.frame_seq, frag_idx = nack.frag_idx,
+                            frame_seq = nack.frame_seq,
+                            frag_idx = nack.frag_idx,
                             "NACK retransmit"
                         );
                     }
                 }
             } else {
                 tracing::trace!(
-                    ?rtt, frame_seq = nack.frame_seq,
+                    ?rtt,
+                    frame_seq = nack.frame_seq,
                     "NACK skipped — RTT too high for retransmission"
                 );
             }
@@ -1171,7 +1215,8 @@ impl IoBridge {
 
     #[cfg(test)]
     pub(crate) fn new_with_frames_for_test(
-        stream: TokioUnixStream, server: QuicServer,
+        stream: TokioUnixStream,
+        server: QuicServer,
         frame_rx: mpsc::Receiver<FrameSubmission>,
     ) -> Self {
         IoBridge {
@@ -1331,7 +1376,9 @@ mod tests {
         let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
 
         let frame = crate::server::FrameSubmission {
-            width: 64, height: 64, stride: 64 * 4,
+            width: 64,
+            height: 64,
+            stride: 64 * 4,
             pixels: vec![0xFF; 64 * 64 * 4],
             dmabuf_fd: None,
             timestamp_us: 1000,
@@ -1388,7 +1435,9 @@ mod tests {
         assert!(bridge.frame_rx.is_some());
 
         let make_frame = || crate::server::FrameSubmission {
-            width: 32, height: 32, stride: 32 * 4,
+            width: 32,
+            height: 32,
+            stride: 32 * 4,
             pixels: vec![0; 32 * 32 * 4],
             dmabuf_fd: None,
             timestamp_us: 0,
@@ -1419,7 +1468,9 @@ mod tests {
         bridge.frame_mode = crate::tile::FrameMode::TileCodec;
 
         let frame = crate::server::FrameSubmission {
-            width: 64, height: 64, stride: 64 * 4,
+            width: 64,
+            height: 64,
+            stride: 64 * 4,
             pixels: vec![0u8; 64 * 64 * 4],
             dmabuf_fd: None,
             timestamp_us: 0,
@@ -1492,9 +1543,17 @@ mod tests {
         if let Ok(enc) = crate::encoder::h264_vaapi::FullFrameEncoder::new(640, 480) {
             bridge.full_frame_encoder = Some(enc);
             // Simulate the side-effect of the session-connect path.
-            bridge.full_frame_encoder.as_mut().unwrap().request_keyframe();
+            bridge
+                .full_frame_encoder
+                .as_mut()
+                .unwrap()
+                .request_keyframe();
             assert!(
-                bridge.full_frame_encoder.as_ref().unwrap().keyframe_pending(),
+                bridge
+                    .full_frame_encoder
+                    .as_ref()
+                    .unwrap()
+                    .keyframe_pending(),
                 "encoder must have keyframe_pending after session reconnect"
             );
         }
@@ -1514,11 +1573,18 @@ mod tests {
 
         // Seed the scheduler with one InFlight item.
         bridge.scheduler.resize(4, 4);
-        bridge.scheduler.enqueue(TileWork::raw_for_test(1, 2, 0, vec![1, 2, 3]));
+        bridge
+            .scheduler
+            .enqueue(TileWork::raw_for_test(1, 2, 0, vec![1, 2, 3]));
         let _ = bridge.scheduler.tick(usize::MAX); // promote to InFlight
 
         let batch = AckBatch {
-            entries: vec![AckEntry { tile_x: 1, tile_y: 2, generation: 0, pass: 0 }],
+            entries: vec![AckEntry {
+                tile_x: 1,
+                tile_y: 2,
+                generation: 0,
+                pass: 0,
+            }],
         };
         bridge.dispatch_ack_datagram(&batch.encode());
 
@@ -1589,8 +1655,8 @@ mod tests {
         std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "0.5");
         std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE", "tile");
         std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_SEED", "42");
-        let inj = IoBridge::loss_injector_from_env("OUTBOUND")
-            .expect("probability > 0 must yield Some");
+        let inj =
+            IoBridge::loss_injector_from_env("OUTBOUND").expect("probability > 0 must yield Some");
         // Force two calls for determinism — same seed = same outcome.
         let mut inj2 = IoBridge::loss_injector_from_env("OUTBOUND").unwrap();
         let mut inj_copy = inj;
@@ -1598,7 +1664,10 @@ mod tests {
         let tile_dg = [0x80u8, 0, 0, 1];
         // ACK datagram first byte (0x02) → predicate doesn't match → never drops.
         let ack_dg = [0x02u8, 0, 0, 0];
-        assert!(!inj_copy.should_drop(&ack_dg), "tile predicate filters ack out");
+        assert!(
+            !inj_copy.should_drop(&ack_dg),
+            "tile predicate filters ack out"
+        );
         assert!(!inj2.should_drop(&ack_dg));
         // Tile path may or may not drop on a given call; just exercise it.
         let _ = inj_copy.should_drop(&tile_dg);
@@ -1618,8 +1687,8 @@ mod tests {
     /// reads CodecState::Solid for a tile.
     #[tokio::test]
     async fn dispatch_via_scheduler_gpu_policy_emits_solid_for_solid_state() {
-        use crate::transport::scheduler::WorkState;
         use crate::tile::CodecState;
+        use crate::transport::scheduler::WorkState;
         let (our_end, _peer) = UnixStream::pair().expect("pair");
         let server = QuicServer::new().expect("server");
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
@@ -1633,7 +1702,13 @@ mod tests {
         let dirty = vec![(0u32, 0u32)];
 
         bridge.dispatch_dirty_tiles_via_scheduler(
-            &dirty, &grid, &pixels, 64 * 4, 1, 0, 1200,
+            &dirty,
+            &grid,
+            &pixels,
+            64 * 4,
+            1,
+            0,
+            1200,
             SchedulerEmissionPolicy::GpuClassifierDriven,
         );
 
@@ -1651,8 +1726,18 @@ mod tests {
 
         let mut tracker = MetricsTracker::new(2, 1);
         let analysis = vec![
-            TileAnalysis { count: 1, edge_density_thou: 0, _pad: [0; 2], colors: [0; 16] },
-            TileAnalysis { count: 17, edge_density_thou: 850, _pad: [0; 2], colors: [0; 16] },
+            TileAnalysis {
+                count: 1,
+                edge_density_thou: 0,
+                _pad: [0; 2],
+                colors: [0; 16],
+            },
+            TileAnalysis {
+                count: 17,
+                edge_density_thou: 850,
+                _pad: [0; 2],
+                colors: [0; 16],
+            },
         ];
         let dirty: Vec<(u32, u32)> = vec![(0, 0), (1, 0)];
 
@@ -1673,18 +1758,35 @@ mod tests {
         let mut tracker = MetricsTracker::new(2, 1);
         // Pre-seed tile (1,0) to a known sentinel so we can prove it stayed.
         tracker.get_mut(1, 0).unique_colors = u16::MAX;
-        tracker.get_mut(1, 0).edge_density  = f32::NAN;
+        tracker.get_mut(1, 0).edge_density = f32::NAN;
 
         let analysis = vec![
-            TileAnalysis { count: 5, edge_density_thou: 100, _pad: [0; 2], colors: [0; 16] },
-            TileAnalysis { count: 9, edge_density_thou: 200, _pad: [0; 2], colors: [0; 16] },
+            TileAnalysis {
+                count: 5,
+                edge_density_thou: 100,
+                _pad: [0; 2],
+                colors: [0; 16],
+            },
+            TileAnalysis {
+                count: 9,
+                edge_density_thou: 200,
+                _pad: [0; 2],
+                colors: [0; 16],
+            },
         ];
         // Only (0,0) is dirty.
         let dirty: Vec<(u32, u32)> = vec![(0, 0)];
         super::populate_gpu_metrics(&mut tracker, &dirty, 2, &analysis);
 
         assert_eq!(tracker.get(0, 0).unique_colors, 5);
-        assert_eq!(tracker.get(1, 0).unique_colors, u16::MAX, "non-dirty tile untouched");
-        assert!(tracker.get(1, 0).edge_density.is_nan(), "non-dirty tile untouched");
+        assert_eq!(
+            tracker.get(1, 0).unique_colors,
+            u16::MAX,
+            "non-dirty tile untouched"
+        );
+        assert!(
+            tracker.get(1, 0).edge_density.is_nan(),
+            "non-dirty tile untouched"
+        );
     }
 }

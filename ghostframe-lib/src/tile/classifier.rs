@@ -10,11 +10,11 @@ use super::{CodecState, FrameMode, TileMetrics, TILE_BYTES};
 /// source spec's GPU compute claims; M3.5 retunes from real measurements.
 #[derive(Debug, Clone, Copy)]
 pub struct CostModel {
-    pub solid_us: f32,         // ~0.5  µs (4-byte memcpy)
-    pub palrle_us: f32,        // ~5    µs (nibble-pack 1024 px)
-    pub bc1_us: f32,           // ~50   µs (Vulkan compute, dispatched)
-    pub cdf53_us: f32,         // ~50   µs (Vulkan compute, dispatched)
-    pub h264_frame_us: f32,    // ~3000 µs (VA-API full-frame encode @ 1080p)
+    pub solid_us: f32,      // ~0.5  µs (4-byte memcpy)
+    pub palrle_us: f32,     // ~5    µs (nibble-pack 1024 px)
+    pub bc1_us: f32,        // ~50   µs (Vulkan compute, dispatched)
+    pub cdf53_us: f32,      // ~50   µs (Vulkan compute, dispatched)
+    pub h264_frame_us: f32, // ~3000 µs (VA-API full-frame encode @ 1080p)
     /// Estimated bytes for a full-frame H.264 emission. Conservative default
     /// (1080p, ~6 Mbit/s @ 60 fps → ~12 KB / frame). Updated alongside
     /// `bytes_per_us` when the source spec §6.5 estimator lands (M4+).
@@ -44,19 +44,23 @@ impl CostModel {
     /// Bandwidth weighting in B/µs. Currently a hardcoded placeholder
     /// (~12.5 = 100 Mbps). Will be wired to the source-spec §6.5 estimator
     /// in M4+; this single accessor is the swap-in point (per design D17).
-    pub fn bytes_per_us(&self) -> f32 { self.bytes_per_us }
+    pub fn bytes_per_us(&self) -> f32 {
+        self.bytes_per_us
+    }
 
     /// Update the bandwidth weighting (call from §6.5 estimator).
-    pub fn set_bytes_per_us(&mut self, value: f32) { self.bytes_per_us = value; }
+    pub fn set_bytes_per_us(&mut self, value: f32) {
+        self.bytes_per_us = value;
+    }
 
     /// Estimated emission size in bytes for a tile assigned to `state`.
     pub fn estimated_tile_bytes(&self, state: CodecState) -> u32 {
         match state {
             CodecState::Skip => 0,
             CodecState::Solid => 4,
-            CodecState::PalRle { .. } => 200,            // §5.3: typical text 100–200 B; upper bound
+            CodecState::PalRle { .. } => 200, // §5.3: typical text 100–200 B; upper bound
             CodecState::Bc1 => 512,
-            CodecState::Cdf53 { .. } => 1300,            // §4.4: 1.0–1.3 KB to lossless; upper bound
+            CodecState::Cdf53 { .. } => 1300, // §4.4: 1.0–1.3 KB to lossless; upper bound
             CodecState::PixelPerfect => 0,
             CodecState::H264 { .. } => TILE_BYTES as u32, // upper bound; classified-as-H264 tile
         }
@@ -127,7 +131,9 @@ pub fn classify_tile(metrics: &TileMetrics, prev: &CodecState) -> CodecState {
             CodecState::H264 { frames_in_h264 } => frames_in_h264.saturating_add(1),
             _ => 1,
         };
-        return CodecState::H264 { frames_in_h264: frames };
+        return CodecState::H264 {
+            frames_in_h264: frames,
+        };
     }
 
     // Rule 3: high freq AND low magnitude ⇒ PalRle if few colors known, else BC1
@@ -142,9 +148,11 @@ pub fn classify_tile(metrics: &TileMetrics, prev: &CodecState) -> CodecState {
     // Rule 5 (medium freq AND not H264 ⇒ BC1) is the else branch below.
     if (5.0..=15.0).contains(&freq) {
         if let CodecState::H264 { frames_in_h264 } = prev {
-            return CodecState::H264 { frames_in_h264: frames_in_h264.saturating_add(1) };
+            return CodecState::H264 {
+                frames_in_h264: frames_in_h264.saturating_add(1),
+            };
         }
-        return CodecState::Bc1;  // Rule 5
+        return CodecState::Bc1; // Rule 5
     }
 
     // Rule 6: single color ⇒ Solid
@@ -158,7 +166,10 @@ pub fn classify_tile(metrics: &TileMetrics, prev: &CodecState) -> CodecState {
     }
 
     // Rule 8: fallback ⇒ Cdf53 (lossy → refinement). M3.0 emission is Raw.
-    CodecState::Cdf53 { passes_sent: 0, max_passes: 9 }
+    CodecState::Cdf53 {
+        passes_sent: 0,
+        max_passes: 9,
+    }
 }
 
 #[cfg(test)]
@@ -258,8 +269,10 @@ mod classify_tests {
         // At exactly 0.3, the tile must NOT classify as H264.
         let m = metrics(60.0, 0.3, 0, super::super::UNIQUE_COLORS_UNKNOWN);
         let next = classify_tile(&m, &CodecState::Skip);
-        assert!(!matches!(next, CodecState::H264 { .. }),
-            "mag = 0.3 must fall through to Rule 3 (BC1/PalRle), got {next:?}");
+        assert!(
+            !matches!(next, CodecState::H264 { .. }),
+            "mag = 0.3 must fall through to Rule 3 (BC1/PalRle), got {next:?}"
+        );
     }
 
     #[test]
@@ -290,23 +303,32 @@ mod classify_tests {
     #[test]
     fn unique_colors_16_picks_palrle() {
         let m = metrics(2.0, 0.05, 0, 16);
-        assert_eq!(classify_tile(&m, &CodecState::Skip), CodecState::PalRle { palette_id: 0 });
+        assert_eq!(
+            classify_tile(&m, &CodecState::Skip),
+            CodecState::PalRle { palette_id: 0 }
+        );
     }
 
     #[test]
     fn unique_colors_17_falls_through_to_cdf53() {
         let m = metrics(2.0, 0.05, 0, 17);
-        assert!(matches!(classify_tile(&m, &CodecState::Skip), CodecState::Cdf53 { .. }));
+        assert!(matches!(
+            classify_tile(&m, &CodecState::Skip),
+            CodecState::Cdf53 { .. }
+        ));
     }
 
     #[test]
     fn h264_tile_at_low_freq_falls_through_to_rules_6_to_8() {
         // freq < 5.0 with prev=H264: rules 6-8 apply normally, NOT H264 hysteresis.
         // Pins the doc-comment behavior — hysteresis only acts in the medium-freq band.
-        let m = metrics(2.0, 0.05, 0, 1);  // single color
+        let m = metrics(2.0, 0.05, 0, 1); // single color
         let next = classify_tile(&m, &CodecState::H264 { frames_in_h264: 99 });
-        assert_eq!(next, CodecState::Solid,
-            "doc-comment hysteresis claim is per-rule-4 only — at low freq, normal rules apply");
+        assert_eq!(
+            next,
+            CodecState::Solid,
+            "doc-comment hysteresis claim is per-rule-4 only — at low freq, normal rules apply"
+        );
     }
 
     #[test]
@@ -315,7 +337,10 @@ mod classify_tests {
         let m = metrics(2.0, 0.05, 0, super::super::UNIQUE_COLORS_UNKNOWN);
         assert_eq!(
             classify_tile(&m, &CodecState::Skip),
-            CodecState::Cdf53 { passes_sent: 0, max_passes: 9 },
+            CodecState::Cdf53 {
+                passes_sent: 0,
+                max_passes: 9
+            },
         );
     }
 }
@@ -333,12 +358,12 @@ struct ClassifierHysteresis {
 #[derive(Debug, Clone)]
 pub struct Classifier {
     pub cost: CostModel,
-    pub enter_factor: f32,           // default 1.3
-    pub exit_factor: f32,            // default 0.6
-    pub motion_tile_threshold: f32,  // default 0.20 (fraction of dirty tiles)
+    pub enter_factor: f32,             // default 1.3
+    pub exit_factor: f32,              // default 0.6
+    pub motion_tile_threshold: f32,    // default 0.20 (fraction of dirty tiles)
     pub motion_tile_min_absolute: u32, // default 8 (absolute floor)
-    pub enter_sustain_frames: u32,   // default 3
-    pub exit_sustain_frames: u32,    // default 30
+    pub enter_sustain_frames: u32,     // default 3
+    pub exit_sustain_frames: u32,      // default 30
     state: ClassifierHysteresis,
 }
 
@@ -395,21 +420,23 @@ impl Classifier {
         // those tiles are accounted for separately by the motion fast-path.
         // All tiles' byte costs ARE summed so any non-empty dirty set carries
         // non-zero tile-codec cost, keeping the deadband effective.
-        let non_h264_us: f32 = tentative_states.iter()
+        let non_h264_us: f32 = tentative_states
+            .iter()
             .filter(|s| !matches!(s, CodecState::H264 { .. }))
             .map(|s| self.cost.estimated_tile_us(*s))
             .sum();
-        let all_tile_bytes: u32 = tentative_states.iter()
+        let all_tile_bytes: u32 = tentative_states
+            .iter()
             .map(|s| self.cost.estimated_tile_bytes(*s))
             .sum();
         let bytes_per_us = self.cost.bytes_per_us();
-        let tile_codec_cost =
-            non_h264_us + (all_tile_bytes as f32) / bytes_per_us;
-        let h264_cost = self.cost.h264_frame_us
-            + (self.cost.h264_frame_bytes as f32) / bytes_per_us;
+        let tile_codec_cost = non_h264_us + (all_tile_bytes as f32) / bytes_per_us;
+        let h264_cost =
+            self.cost.h264_frame_us + (self.cost.h264_frame_bytes as f32) / bytes_per_us;
 
         // Motion fast-path: count tentatively-H.264 tiles
-        let h264_tile_count = tentative_states.iter()
+        let h264_tile_count = tentative_states
+            .iter()
             .filter(|s| matches!(s, CodecState::H264 { .. }))
             .count() as u32;
         let dirty_count = tentative_states.len() as u32;
@@ -457,7 +484,9 @@ mod decide_tests {
     use super::*;
 
     fn h264_states(n: u32) -> Vec<CodecState> {
-        (0..n).map(|i| CodecState::H264 { frames_in_h264: i }).collect()
+        (0..n)
+            .map(|i| CodecState::H264 { frames_in_h264: i })
+            .collect()
     }
 
     fn solid_states(n: u32) -> Vec<CodecState> {
@@ -475,7 +504,10 @@ mod decide_tests {
                 "should not enter before sustain elapsed",
             );
         }
-        assert_eq!(c.decide_frame_mode(&states, FrameMode::TileCodec), FrameMode::H264);
+        assert_eq!(
+            c.decide_frame_mode(&states, FrameMode::TileCodec),
+            FrameMode::H264
+        );
     }
 
     #[test]
@@ -503,7 +535,10 @@ mod decide_tests {
         // ...then a quiet frame resets it.
         c.decide_frame_mode(&quiet, FrameMode::TileCodec);
         // First busy frame after reset should NOT promote us yet.
-        assert_eq!(c.decide_frame_mode(&busy, FrameMode::TileCodec), FrameMode::TileCodec);
+        assert_eq!(
+            c.decide_frame_mode(&busy, FrameMode::TileCodec),
+            FrameMode::TileCodec
+        );
     }
 
     #[test]
@@ -511,9 +546,15 @@ mod decide_tests {
         let mut c = Classifier::default();
         let cheap = solid_states(2); // tile-codec cost trivial → < h264 * 0.6
         for _ in 0..(c.exit_sustain_frames - 1) {
-            assert_eq!(c.decide_frame_mode(&cheap, FrameMode::H264), FrameMode::H264);
+            assert_eq!(
+                c.decide_frame_mode(&cheap, FrameMode::H264),
+                FrameMode::H264
+            );
         }
-        assert_eq!(c.decide_frame_mode(&cheap, FrameMode::H264), FrameMode::TileCodec);
+        assert_eq!(
+            c.decide_frame_mode(&cheap, FrameMode::H264),
+            FrameMode::TileCodec
+        );
     }
 
     #[test]
@@ -523,7 +564,10 @@ mod decide_tests {
         c.exit_factor = 0.0001;
         let states = h264_states(4); // some cost, but exit_factor makes exit unreachable
         for _ in 0..50 {
-            assert_eq!(c.decide_frame_mode(&states, FrameMode::H264), FrameMode::H264);
+            assert_eq!(
+                c.decide_frame_mode(&states, FrameMode::H264),
+                FrameMode::H264
+            );
         }
     }
 
@@ -535,7 +579,13 @@ mod decide_tests {
         // This is the cost-only enter path — exercises a code branch the other
         // enter-path tests don't reach (they hit motion_enter simultaneously).
         let mut c = Classifier::default();
-        let states = vec![CodecState::Cdf53 { passes_sent: 0, max_passes: 9 }; 200];
+        let states = vec![
+            CodecState::Cdf53 {
+                passes_sent: 0,
+                max_passes: 9
+            };
+            200
+        ];
         for _ in 0..(c.enter_sustain_frames - 1) {
             assert_eq!(
                 c.decide_frame_mode(&states, FrameMode::TileCodec),
@@ -543,7 +593,10 @@ mod decide_tests {
                 "should not enter before sustain elapsed",
             );
         }
-        assert_eq!(c.decide_frame_mode(&states, FrameMode::TileCodec), FrameMode::H264);
+        assert_eq!(
+            c.decide_frame_mode(&states, FrameMode::TileCodec),
+            FrameMode::H264
+        );
     }
 
     #[test]
@@ -578,15 +631,24 @@ mod decide_tests {
         let mut c = Classifier::default();
         let n7 = h264_states(7);
         for _ in 0..10 {
-            assert_eq!(c.decide_frame_mode(&n7, FrameMode::TileCodec), FrameMode::TileCodec);
+            assert_eq!(
+                c.decide_frame_mode(&n7, FrameMode::TileCodec),
+                FrameMode::TileCodec
+            );
         }
         // n=8 (at floor): must trip after sustain.
         let mut c = Classifier::default();
         let n8 = h264_states(8);
         for _ in 0..(c.enter_sustain_frames - 1) {
-            assert_eq!(c.decide_frame_mode(&n8, FrameMode::TileCodec), FrameMode::TileCodec);
+            assert_eq!(
+                c.decide_frame_mode(&n8, FrameMode::TileCodec),
+                FrameMode::TileCodec
+            );
         }
-        assert_eq!(c.decide_frame_mode(&n8, FrameMode::TileCodec), FrameMode::H264);
+        assert_eq!(
+            c.decide_frame_mode(&n8, FrameMode::TileCodec),
+            FrameMode::H264
+        );
     }
 
     #[test]

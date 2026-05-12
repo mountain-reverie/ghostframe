@@ -233,7 +233,9 @@ pub fn fragment_tile(
 // ---------------------------------------------------------------------------
 
 /// Decodes a datagram into its DatagramHeader, TileHeader, and payload slice.
-pub fn decode_tile_datagram(data: &[u8]) -> Result<(DatagramHeader, TileHeader, &[u8]), ProtocolError> {
+pub fn decode_tile_datagram(
+    data: &[u8],
+) -> Result<(DatagramHeader, TileHeader, &[u8]), ProtocolError> {
     let dh = DatagramHeader::decode(data)?;
     let rest = &data[DATAGRAM_HEADER_SIZE..];
     let th = TileHeader::decode(rest)?;
@@ -281,9 +283,8 @@ pub fn build_parity_datagrams(
                 pass: 0,
                 payload_len: 0, // not meaningful for parity
             };
-            let mut buf = Vec::with_capacity(
-                DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE + parity_payload.len(),
-            );
+            let mut buf =
+                Vec::with_capacity(DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE + parity_payload.len());
             dh.encode(&mut buf);
             th.encode(&mut buf);
             buf.extend_from_slice(parity_payload);
@@ -752,13 +753,19 @@ mod tests {
     fn is_parity_datagram() {
         // Source fragment: frag_idx < frag_total
         let source = DatagramHeader {
-            frame_seq: 1, frag_idx: 2, frag_total: 8, timestamp_us: 0,
+            frame_seq: 1,
+            frag_idx: 2,
+            frag_total: 8,
+            timestamp_us: 0,
         };
         assert!(!source.is_parity());
 
         // Parity fragment: frag_idx >= frag_total
         let parity = DatagramHeader {
-            frame_seq: 1, frag_idx: 8, frag_total: 8, timestamp_us: 0,
+            frame_seq: 1,
+            frag_idx: 8,
+            frag_total: 8,
+            timestamp_us: 0,
         };
         assert!(parity.is_parity());
     }
@@ -777,20 +784,18 @@ mod tests {
         assert_eq!(frag_total, 4); // ceil(4096/1200) = 4
 
         // Extract source payloads (bytes after headers)
-        let source_payloads: Vec<&[u8]> = source_dgs.iter().map(|dg| {
-            &dg[DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE..]
-        }).collect();
+        let source_payloads: Vec<&[u8]> = source_dgs
+            .iter()
+            .map(|dg| &dg[DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE..])
+            .collect();
 
         // Generate parity
         let parities = fec::generate_parity(&source_payloads, k);
         assert_eq!(parities.len(), 1); // 4 frags / K=4 = 1 parity group
 
         // Build parity datagrams using the helper
-        let parity_dgs = build_parity_datagrams(
-            7, 2, 3, Codec::H264, 999,
-            frag_total as u16,
-            &parities,
-        );
+        let parity_dgs =
+            build_parity_datagrams(7, 2, 3, Codec::H264, 999, frag_total as u16, &parities);
         assert_eq!(parity_dgs.len(), 1);
 
         // Decode the parity datagram
@@ -803,7 +808,8 @@ mod tests {
         assert_eq!(th.tile_y, 3);
 
         // Verify parity payload has the parity header
-        let (group_start, group_len, _xor_data) = fec::decode_parity_payload(parity_payload).unwrap();
+        let (group_start, group_len, _xor_data) =
+            fec::decode_parity_payload(parity_payload).unwrap();
         assert_eq!(group_start, 0);
         assert_eq!(group_len, 4);
     }
@@ -840,7 +846,10 @@ mod tests {
         };
         let mut frame_buf = Vec::new();
         fh.encode(&mut frame_buf);
-        assert!(!is_tile_datagram(&frame_buf), "frame datagram must have bit 31 = 0");
+        assert!(
+            !is_tile_datagram(&frame_buf),
+            "frame datagram must have bit 31 = 0"
+        );
 
         // Tile datagram: bit 31 of frame_seq = 1 (TILE_DATAGRAM_FLAG set)
         let dh = DatagramHeader {
@@ -853,7 +862,10 @@ mod tests {
         dh.encode(&mut tile_buf);
         // Pad with a tile header's worth of zeros so is_tile_datagram only checks first 4 bytes
         tile_buf.extend_from_slice(&[0u8; TILE_HEADER_SIZE]);
-        assert!(is_tile_datagram(&tile_buf), "tile datagram must have bit 31 = 1");
+        assert!(
+            is_tile_datagram(&tile_buf),
+            "tile datagram must have bit 31 = 1"
+        );
     }
 
     #[test]
@@ -901,7 +913,10 @@ mod tests {
 
     #[test]
     fn nack_message_roundtrip() {
-        let nack = NackMessage { frame_seq: 42, frag_idx: 3 };
+        let nack = NackMessage {
+            frame_seq: 42,
+            frag_idx: 3,
+        };
         let encoded = nack.encode();
         assert_eq!(encoded.len(), NACK_SIZE);
         let decoded = NackMessage::decode(&encoded).unwrap();
@@ -917,17 +932,18 @@ mod tests {
     #[test]
     fn frame_dimensions_datagram_roundtrip() {
         let dg = build_frame_dimensions_datagram(
-            /*frame_seq*/ 42,
-            /*ts*/ 1000,
-            /*width*/ 1920,
-            /*height*/ 1080,
+            /*frame_seq*/ 42, /*ts*/ 1000, /*width*/ 1920, /*height*/ 1080,
         );
         // Total: 12 (DatagramHeader) + 8 (TileHeader) + 8 (payload) = 28 bytes.
         assert_eq!(dg.len(), 28);
 
         let (dh, th, payload) = decode_tile_datagram(&dg).expect("decode failed");
         // Tile-datagram flag must be set in frame_seq.
-        assert_ne!(dh.frame_seq & TILE_DATAGRAM_FLAG, 0, "TILE_DATAGRAM_FLAG must be set");
+        assert_ne!(
+            dh.frame_seq & TILE_DATAGRAM_FLAG,
+            0,
+            "TILE_DATAGRAM_FLAG must be set"
+        );
         assert_eq!(dh.frame_seq & !TILE_DATAGRAM_FLAG, 42);
         assert_eq!(dh.frag_idx, 0);
         assert_eq!(dh.frag_total, 1);

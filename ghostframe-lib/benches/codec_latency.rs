@@ -40,7 +40,9 @@ impl H264TileEncoder {
 
 #[cfg(feature = "gpu-bench")]
 impl BenchEncoder for H264TileEncoder {
-    fn name(&self) -> &'static str { "h264" }
+    fn name(&self) -> &'static str {
+        "h264"
+    }
     fn encode(&mut self, tile: &[u8]) -> Vec<u8> {
         // Loop on Ok(None) — VA-API may buffer the first frame; without
         // looping, the buffered iteration would record a near-zero time
@@ -63,7 +65,9 @@ struct PalRleEncoder;
 
 #[cfg(feature = "m3")]
 impl BenchEncoder for PalRleEncoder {
-    fn name(&self) -> &'static str { "pal_rle" }
+    fn name(&self) -> &'static str {
+        "pal_rle"
+    }
     fn encode(&mut self, _tile: &[u8]) -> Vec<u8> {
         unimplemented!("PalRle encoder lands in M3");
     }

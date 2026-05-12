@@ -111,8 +111,8 @@ pub fn run(card_path: &str, half_cycle: Duration) -> Result<(), Box<dyn std::err
             break;
         }
     }
-    let (conn_info, mode) = chosen
-        .ok_or_else(|| "no connected DRM connector with a valid mode".to_string())?;
+    let (conn_info, mode) =
+        chosen.ok_or_else(|| "no connected DRM connector with a valid mode".to_string())?;
 
     let (mode_w, mode_h) = mode.size();
     let mode_w = mode_w as u32;
@@ -138,9 +138,8 @@ pub fn run(card_path: &str, half_cycle: Duration) -> Result<(), Box<dyn std::err
             break 'outer;
         }
     }
-    let crtc_handle = chosen_crtc.ok_or_else(|| {
-        "no compatible CRTC found for connector's encoders".to_string()
-    })?;
+    let crtc_handle = chosen_crtc
+        .ok_or_else(|| "no compatible CRTC found for connector's encoders".to_string())?;
     eprintln!("drm_direct: CRTC handle = {:?}", crtc_handle);
 
     // Create the dumb buffer that will be the scanout source.
@@ -261,12 +260,8 @@ fn paint_motion(
     let mut y = 0u32;
     while y < height {
         let r = motion_phase.wrapping_mul(3).wrapping_add(band_idx);
-        let g = motion_phase
-            .wrapping_mul(5)
-            .wrapping_add(band_idx ^ 0x55);
-        let b = motion_phase
-            .wrapping_mul(7)
-            .wrapping_add(band_idx ^ 0xAA);
+        let g = motion_phase.wrapping_mul(5).wrapping_add(band_idx ^ 0x55);
+        let b = motion_phase.wrapping_mul(7).wrapping_add(band_idx ^ 0xAA);
         // XRGB8888 little-endian: bytes [B, G, R, X]
         let pixel = ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
         let pixel_bytes = pixel.to_le_bytes();

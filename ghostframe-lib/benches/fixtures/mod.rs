@@ -7,12 +7,18 @@
 // Not all items are used under every feature combination; suppress noise.
 #![allow(dead_code)]
 
-#[allow(dead_code)] pub mod flat_ui;
-#[allow(dead_code)] pub mod gradient;
-#[allow(dead_code)] pub mod motion;
-#[allow(dead_code)] pub mod photo;
-#[allow(dead_code)] pub mod solid;
-#[allow(dead_code)] pub mod text;
+#[allow(dead_code)]
+pub mod flat_ui;
+#[allow(dead_code)]
+pub mod gradient;
+#[allow(dead_code)]
+pub mod motion;
+#[allow(dead_code)]
+pub mod photo;
+#[allow(dead_code)]
+pub mod solid;
+#[allow(dead_code)]
+pub mod text;
 
 /// Edge length of a single tile, in pixels. Mirrors `ghostframe_lib::tile::TILE_SIZE`.
 pub const TILE_SIZE: u32 = 32;

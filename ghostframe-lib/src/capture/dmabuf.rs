@@ -99,9 +99,9 @@ impl VulkanReadback {
         for &pdev in &phys_devices {
             let supported = instance.enumerate_device_extension_properties(pdev)?;
             let has_all = required_device_exts.iter().all(|req| {
-                supported.iter().any(|ext| {
-                    CStr::from_ptr(ext.extension_name.as_ptr()) == *req
-                })
+                supported
+                    .iter()
+                    .any(|ext| CStr::from_ptr(ext.extension_name.as_ptr()) == *req)
             });
             if has_all {
                 chosen = Some(pdev);
@@ -118,8 +118,7 @@ impl VulkanReadback {
             .into_owned();
 
         // --- Queue family ---
-        let queue_families =
-            instance.get_physical_device_queue_family_properties(physical_device);
+        let queue_families = instance.get_physical_device_queue_family_properties(physical_device);
         let queue_family_index = queue_families
             .iter()
             .position(|qf| qf.queue_flags.contains(vk::QueueFlags::TRANSFER))
@@ -351,19 +350,17 @@ impl VulkanReadback {
         self.device.queue_wait_idle(self.queue)?;
 
         // --- Map staging buffer and copy pixels ---
-        let data_ptr = self.device.map_memory(
-            staging_memory,
-            0,
-            size,
-            vk::MemoryMapFlags::empty(),
-        )?;
+        let data_ptr =
+            self.device
+                .map_memory(staging_memory, 0, size, vk::MemoryMapFlags::empty())?;
 
         let mut pixels = vec![0u8; size as usize];
         std::ptr::copy_nonoverlapping(data_ptr as *const u8, pixels.as_mut_ptr(), size as usize);
         self.device.unmap_memory(staging_memory);
 
         // --- Cleanup ---
-        self.device.free_command_buffers(self.command_pool, &cmd_bufs);
+        self.device
+            .free_command_buffers(self.command_pool, &cmd_bufs);
         self.device.destroy_buffer(staging_buffer, None);
         self.device.free_memory(staging_memory, None);
         self.device.destroy_image(image, None);

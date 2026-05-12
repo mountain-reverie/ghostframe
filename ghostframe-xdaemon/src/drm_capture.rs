@@ -194,9 +194,7 @@ fn initialize_state() -> std::io::Result<CaptureState> {
             None
         }
         Err(e) => {
-            tracing::warn!(
-                "writeback probe failed ({e}); falling back to modesetting FB capture"
-            );
+            tracing::warn!("writeback probe failed ({e}); falling back to modesetting FB capture");
             None
         }
     };
@@ -272,17 +270,15 @@ fn probe_writeback(
     let out_fence_ptr_prop = wb_out_fence_ptr.ok_or_else(|| {
         std::io::Error::other("writeback connector lacks WRITEBACK_OUT_FENCE_PTR property")
     })?;
-    let crtc_id_prop = crtc_id_prop.ok_or_else(|| {
-        std::io::Error::other("writeback connector lacks CRTC_ID property")
-    })?;
+    let crtc_id_prop = crtc_id_prop
+        .ok_or_else(|| std::io::Error::other("writeback connector lacks CRTC_ID property"))?;
     let _ = crtc; // silence unused-warning when no probe failure path uses crtc
 
     // Allocate the persistent target buffer (XR24 = X8R8G8B8 little-endian).
     // VKMS supports XR24/AR24/RG16 for writeback; XR24 matches Xorg's
     // 24-bit truecolor scanout perfectly so the writeback composition is
     // a 1:1 copy.
-    let target_buffer =
-        card.create_dumb_buffer((mode_w, mode_h), DrmFourcc::Xrgb8888, 32)?;
+    let target_buffer = card.create_dumb_buffer((mode_w, mode_h), DrmFourcc::Xrgb8888, 32)?;
     let stride = target_buffer.pitch();
     let target_fb = card.add_framebuffer(&target_buffer, 24, 32)?;
 
@@ -372,11 +368,7 @@ fn capture_via_writeback(
 
     let mut req = AtomicModeReq::new();
     req.add_raw_property(conn_raw, wb.crtc_id_prop, u64::from(u32::from(crtc)));
-    req.add_raw_property(
-        conn_raw,
-        wb.fb_id_prop,
-        u64::from(u32::from(wb.target_fb)),
-    );
+    req.add_raw_property(conn_raw, wb.fb_id_prop, u64::from(u32::from(wb.target_fb)));
     req.add_raw_property(conn_raw, wb.out_fence_ptr_prop, out_fence_ptr_addr);
 
     // ALLOW_MODESET: enabling/disabling the writeback connector counts as
@@ -421,24 +413,24 @@ fn capture_via_modesetting_fb(
 
     // Try FB2 (drmModeGetFB2) first — handles GBM/multi-plane framebuffers
     // that the modern modesetting driver creates. Fall back to legacy FB1.
-    let (width, height, stride, prime_fd) =
-        if let Ok(fb2) = card.get_planar_framebuffer(fb_handle) {
-            let (w, h) = fb2.size();
-            let s = fb2.pitches()[0];
-            let buf_handle = fb2.buffers()[0]
-                .ok_or_else(|| std::io::Error::other("FB2 plane 0 has no buffer handle"))?;
-            let fd = card.buffer_to_prime_fd(buf_handle, 0)?;
-            (w, h, s, fd)
-        } else {
-            let fb_info = card.get_framebuffer(fb_handle)?;
-            let (w, h) = fb_info.size();
-            let s = fb_info.pitch();
-            let buf_handle = fb_info
-                .buffer()
-                .ok_or_else(|| std::io::Error::other("FB1 has no backing buffer handle"))?;
-            let fd = card.buffer_to_prime_fd(buf_handle, 0)?;
-            (w, h, s, fd)
-        };
+    let (width, height, stride, prime_fd) = if let Ok(fb2) = card.get_planar_framebuffer(fb_handle)
+    {
+        let (w, h) = fb2.size();
+        let s = fb2.pitches()[0];
+        let buf_handle = fb2.buffers()[0]
+            .ok_or_else(|| std::io::Error::other("FB2 plane 0 has no buffer handle"))?;
+        let fd = card.buffer_to_prime_fd(buf_handle, 0)?;
+        (w, h, s, fd)
+    } else {
+        let fb_info = card.get_framebuffer(fb_handle)?;
+        let (w, h) = fb_info.size();
+        let s = fb_info.pitch();
+        let buf_handle = fb_info
+            .buffer()
+            .ok_or_else(|| std::io::Error::other("FB1 has no backing buffer handle"))?;
+        let fd = card.buffer_to_prime_fd(buf_handle, 0)?;
+        (w, h, s, fd)
+    };
 
     Ok((
         prime_fd,

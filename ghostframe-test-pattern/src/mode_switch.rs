@@ -60,9 +60,16 @@ pub fn run<C: Connection>(
                 let b = motion_phase.wrapping_mul(7).wrapping_add(idx ^ 0xAA);
                 let pixel = ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
                 conn.change_gc(gc, &ChangeGCAux::new().foreground(pixel))?;
-                conn.poly_fill_rectangle(root, gc, &[Rectangle {
-                    x: 0, y: y as i16, width: width as u16, height: BAND_H,
-                }])?;
+                conn.poly_fill_rectangle(
+                    root,
+                    gc,
+                    &[Rectangle {
+                        x: 0,
+                        y: y as i16,
+                        width: width as u16,
+                        height: BAND_H,
+                    }],
+                )?;
             }
             conn.flush()?;
             motion_phase = motion_phase.wrapping_add(7);

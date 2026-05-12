@@ -39,9 +39,9 @@ const VAAPI_DEVICE: &str = "/dev/dri/renderD128";
 /// Candidate encoding resolutions to try when the tile size is below the
 /// hardware minimum. Sorted ascending; the first one that succeeds wins.
 const VAAPI_CANDIDATE_SIZES: &[(u32, u32)] = &[
-    (TILE_W, TILE_H),   // try native size first
-    (128, 128),          // common AMD minimum
-    (256, 256),          // fallback
+    (TILE_W, TILE_H), // try native size first
+    (128, 128),       // common AMD minimum
+    (256, 256),       // fallback
 ];
 
 /// RAII wrapper around `*mut AVBufferRef` so we don't leak hw contexts.
@@ -120,8 +120,7 @@ impl H264VaapiEncoder {
             }
         }
 
-        let x264_codec =
-            encoder::find_by_name("libx264").ok_or(ffmpeg::Error::EncoderNotFound)?;
+        let x264_codec = encoder::find_by_name("libx264").ok_or(ffmpeg::Error::EncoderNotFound)?;
         info!("H264VaapiEncoder: using libx264 software encoder");
         Self::try_open_sw(x264_codec)
     }
@@ -134,8 +133,7 @@ impl H264VaapiEncoder {
     unsafe fn create_hw_device_ctx(
         device_path: &str,
     ) -> Result<*mut ffi::AVBufferRef, ffmpeg::Error> {
-        let device_cstr =
-            CString::new(device_path).map_err(|_| ffmpeg::Error::InvalidData)?;
+        let device_cstr = CString::new(device_path).map_err(|_| ffmpeg::Error::InvalidData)?;
         let mut hw_device_ctx: *mut ffi::AVBufferRef = ptr::null_mut();
         let ret = ffi::av_hwdevice_ctx_create(
             &mut hw_device_ctx,
@@ -400,8 +398,7 @@ impl H264VaapiEncoder {
                 .hw_frames_ctx
                 .as_ref()
                 .expect("use_vaapi but no hw_frames_ctx");
-            let mut hw_frame =
-                unsafe { Self::upload_to_hw_surface(hw_frames_ref.0, &nv12_frame)? };
+            let mut hw_frame = unsafe { Self::upload_to_hw_surface(hw_frames_ref.0, &nv12_frame)? };
             hw_frame.set_pts(nv12_frame.pts());
             self.encoder.send_frame(&hw_frame)?;
         } else {
@@ -426,7 +423,9 @@ impl H264VaapiEncoder {
                     payload: data,
                 }))
             }
-            Err(ffmpeg::Error::Other { errno: libc::EAGAIN }) => Ok(None),
+            Err(ffmpeg::Error::Other {
+                errno: libc::EAGAIN,
+            }) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -497,8 +496,7 @@ impl FullFrameEncoder {
             }
         }
 
-        let x264_codec =
-            encoder::find_by_name("libx264").ok_or(ffmpeg::Error::EncoderNotFound)?;
+        let x264_codec = encoder::find_by_name("libx264").ok_or(ffmpeg::Error::EncoderNotFound)?;
         info!("FullFrameEncoder: using libx264 software encoder");
         Self::try_open_sw(x264_codec, width, height)
     }
@@ -537,8 +535,7 @@ impl FullFrameEncoder {
     unsafe fn create_drm_device_ctx(
         device_path: &str,
     ) -> Result<*mut ffi::AVBufferRef, ffmpeg::Error> {
-        let device_cstr =
-            CString::new(device_path).map_err(|_| ffmpeg::Error::InvalidData)?;
+        let device_cstr = CString::new(device_path).map_err(|_| ffmpeg::Error::InvalidData)?;
         let mut drm_ctx: *mut ffi::AVBufferRef = ptr::null_mut();
         let ret = ffi::av_hwdevice_ctx_create(
             &mut drm_ctx,
@@ -586,18 +583,14 @@ impl FullFrameEncoder {
             };
 
             // NV12 hw_frames_ctx for encoder output
-            let hw_frames_ctx = match H264VaapiEncoder::create_hw_frames_ctx(
-                hw_device_ctx,
-                width,
-                height,
-                10,
-            ) {
-                Ok(ctx) => ctx,
-                Err(e) => {
-                    ffi::av_buffer_unref(&mut { hw_device_ctx });
-                    return Err(e);
-                }
-            };
+            let hw_frames_ctx =
+                match H264VaapiEncoder::create_hw_frames_ctx(hw_device_ctx, width, height, 10) {
+                    Ok(ctx) => ctx,
+                    Err(e) => {
+                        ffi::av_buffer_unref(&mut { hw_device_ctx });
+                        return Err(e);
+                    }
+                };
 
             let mut ctx = codec::context::Context::new_with_codec(enc_codec)
                 .encoder()
@@ -831,7 +824,15 @@ impl FullFrameEncoder {
 
             // Try zero-copy DMA-BUF import via DRM PRIME → av_hwframe_map().
             // This avoids any CPU pixel access — the DMA-BUF stays on the GPU.
-            let hw_frame = match Self::try_drm_prime_import(hw_frames_ref.0, fd, width, height, stride, pts, force_idr) {
+            let hw_frame = match Self::try_drm_prime_import(
+                hw_frames_ref.0,
+                fd,
+                width,
+                height,
+                stride,
+                pts,
+                force_idr,
+            ) {
                 Ok(frame) => frame,
                 Err(_) => {
                     // Fall back to mmap + CPU scale + upload for non-GPU-local
@@ -839,7 +840,17 @@ impl FullFrameEncoder {
                     // NOTE: This fallback will fail for real GPU DMA-BUFs
                     // (device VRAM can't be mmap'd). A VPP BGRA→NV12 pipeline
                     // is needed for true zero-copy encode — tracked as a gap.
-                    Self::mmap_scale_upload(hw_frames_ref.0, fd, width, height, stride, self.enc_w, self.enc_h, pts, force_idr)?
+                    Self::mmap_scale_upload(
+                        hw_frames_ref.0,
+                        fd,
+                        width,
+                        height,
+                        stride,
+                        self.enc_w,
+                        self.enc_h,
+                        pts,
+                        force_idr,
+                    )?
                 }
             };
 
@@ -907,11 +918,7 @@ impl FullFrameEncoder {
         // Map the DRM PRIME frame into the VAAPI surface.
         // This works because the VAAPI device was derived from the DRM device,
         // so ffmpeg knows how to cross-map between DRM and VAAPI.
-        let ret = ffi::av_hwframe_map(
-            hw_ptr,
-            drm_ptr,
-            ffi::AV_HWFRAME_MAP_READ as i32,
-        );
+        let ret = ffi::av_hwframe_map(hw_ptr, drm_ptr, ffi::AV_HWFRAME_MAP_READ as i32);
 
         // Clean up dup'd fd and desc pointer
         libc::close(desc.objects[0].fd);
@@ -972,7 +979,8 @@ impl FullFrameEncoder {
             let plane = bgra_frame.data_mut(0);
             let src_bytes = std::slice::from_raw_parts(ptr as *const u8, buf_size);
             for y in 0..height as usize {
-                let src_row = &src_bytes[y * stride as usize..y * stride as usize + width as usize * 4];
+                let src_row =
+                    &src_bytes[y * stride as usize..y * stride as usize + width as usize * 4];
                 let dst_off = y * frame_stride;
                 plane[dst_off..dst_off + width as usize * 4].copy_from_slice(src_row);
             }
@@ -1028,7 +1036,8 @@ impl FullFrameEncoder {
                 let plane = bgra_frame.data_mut(0);
                 let src_bytes = std::slice::from_raw_parts(ptr as *const u8, buf_size);
                 for y in 0..height as usize {
-                    let src_row = &src_bytes[y * stride as usize..y * stride as usize + width as usize * 4];
+                    let src_row =
+                        &src_bytes[y * stride as usize..y * stride as usize + width as usize * 4];
                     let dst_off = y * frame_stride;
                     plane[dst_off..dst_off + width as usize * 4].copy_from_slice(src_row);
                 }
@@ -1081,7 +1090,9 @@ impl FullFrameEncoder {
                     is_keyframe,
                 }))
             }
-            Err(ffmpeg::Error::Other { errno: libc::EAGAIN }) => Ok(None),
+            Err(ffmpeg::Error::Other {
+                errno: libc::EAGAIN,
+            }) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -1136,7 +1147,11 @@ mod tests {
 
         eprintln!(
             "encoder backend: {} ({}x{})",
-            if encoder.use_vaapi { "h264_vaapi" } else { "libx264" },
+            if encoder.use_vaapi {
+                "h264_vaapi"
+            } else {
+                "libx264"
+            },
             encoder.enc_w,
             encoder.enc_h,
         );
@@ -1191,7 +1206,11 @@ mod tests {
 
         eprintln!(
             "encoder backend: {} ({}x{})",
-            if encoder.use_vaapi { "h264_vaapi" } else { "libx264" },
+            if encoder.use_vaapi {
+                "h264_vaapi"
+            } else {
+                "libx264"
+            },
             encoder.enc_w,
             encoder.enc_h,
         );
@@ -1275,7 +1294,11 @@ mod tests {
 
         eprintln!(
             "FullFrameEncoder backend: {} ({}x{})",
-            if encoder.use_vaapi { "h264_vaapi" } else { "libx264" },
+            if encoder.use_vaapi {
+                "h264_vaapi"
+            } else {
+                "libx264"
+            },
             encoder.enc_w,
             encoder.enc_h,
         );
@@ -1297,7 +1320,10 @@ mod tests {
             unsafe { libc::lseek(fd, 0, libc::SEEK_SET) };
             match encoder.encode_frame(fd, width, height, stride) {
                 Ok(Some(encoded)) => {
-                    assert!(!encoded.payload.is_empty(), "encoded payload must not be empty");
+                    assert!(
+                        !encoded.payload.is_empty(),
+                        "encoded payload must not be empty"
+                    );
                     if encoded.is_keyframe {
                         got_keyframe = true;
                     }
@@ -1311,7 +1337,10 @@ mod tests {
 
         unsafe { libc::close(fd) };
 
-        assert!(got_output, "encoder should have produced output within 3 frames");
+        assert!(
+            got_output,
+            "encoder should have produced output within 3 frames"
+        );
         assert!(got_keyframe, "first output should be a keyframe");
     }
 
@@ -1386,9 +1415,8 @@ mod tests {
         // PTS 0 is automatically a keyframe; consume it.
         let nv12_size = (width * height * 3 / 2) as usize;
         let nv12 = vec![128u8; nv12_size];
-        let _ = encoder.encode_nv12_buffer(
-            nv12.as_ptr(), width, height, width, width, width * height,
-        );
+        let _ =
+            encoder.encode_nv12_buffer(nv12.as_ptr(), width, height, width, width, width * height);
         // PTS 1 normally would NOT be a keyframe (FULL_FRAME_GOP = 11). Request one,
         // then drain frames until a packet emerges — the encoder may buffer the first
         // few PTS values before emitting the IDR. The first emitted packet must be a
@@ -1398,7 +1426,12 @@ mod tests {
         let mut keyframe_pts = None;
         for pts in 1..=4 {
             if let Ok(Some(out)) = encoder.encode_nv12_buffer(
-                nv12.as_ptr(), width, height, width, width, width * height,
+                nv12.as_ptr(),
+                width,
+                height,
+                width,
+                width,
+                width * height,
             ) {
                 assert!(out.is_keyframe,
                     "first packet after request_keyframe() must be IDR (got P-frame at drain pts={pts})");
@@ -1407,8 +1440,10 @@ mod tests {
                 break;
             }
         }
-        assert!(keyframe_observed,
-            "encoder buffered all PTS 1-4 frames; no IDR ever emitted");
+        assert!(
+            keyframe_observed,
+            "encoder buffered all PTS 1-4 frames; no IDR ever emitted"
+        );
 
         // Subsequent encodes (continuing PTS sequence after the keyframe) should NOT
         // all be keyframes — the latch was one-shot. Drain another 5 frames; at least
@@ -1417,9 +1452,17 @@ mod tests {
         let mut saw_p_frame = false;
         for _pts in start_pts..(start_pts + 5).min(10) {
             if let Ok(Some(out)) = encoder.encode_nv12_buffer(
-                nv12.as_ptr(), width, height, width, width, width * height,
+                nv12.as_ptr(),
+                width,
+                height,
+                width,
+                width,
+                width * height,
             ) {
-                if !out.is_keyframe { saw_p_frame = true; break; }
+                if !out.is_keyframe {
+                    saw_p_frame = true;
+                    break;
+                }
             }
         }
         assert!(saw_p_frame, "latch must not persist beyond one frame");

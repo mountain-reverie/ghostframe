@@ -95,7 +95,9 @@ fn drm_capture_to_gpu_pipeline() {
         Some(result) => {
             eprintln!(
                 "DRM capture: {}x{} stride={} fd={}",
-                result.1, result.2, result.3,
+                result.1,
+                result.2,
+                result.3,
                 result.0.as_raw_fd()
             );
             result
@@ -139,11 +141,13 @@ fn drm_capture_to_gpu_pipeline() {
         !analysis.dirty_tiles.is_empty(),
         "first frame should report tiles as dirty"
     );
-    assert!(!analysis.nv12_data.is_null(), "NV12 data pointer should not be null");
+    assert!(
+        !analysis.nv12_data.is_null(),
+        "NV12 data pointer should not be null"
+    );
     eprintln!(
         "NV12 output: {}x{} y_stride={} uv_offset={}",
-        analysis.nv12_width, analysis.nv12_height,
-        analysis.nv12_y_stride, analysis.nv12_uv_offset,
+        analysis.nv12_width, analysis.nv12_height, analysis.nv12_y_stride, analysis.nv12_uv_offset,
     );
 
     // 3. Full-frame H.264 encode via encode_nv12_buffer (HOST_VISIBLE NV12 → VA-API)
@@ -217,7 +221,11 @@ fn drm_capture_to_gpu_pipeline() {
                 analysis2.nv12_uv_offset,
             ) {
                 Ok(Some(enc)) => {
-                    eprintln!("Frame {i}: {} bytes, keyframe={}", enc.payload.len(), enc.is_keyframe);
+                    eprintln!(
+                        "Frame {i}: {} bytes, keyframe={}",
+                        enc.payload.len(),
+                        enc.is_keyframe
+                    );
                     encoded = Some(enc);
                     break;
                 }

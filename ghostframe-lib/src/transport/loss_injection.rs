@@ -15,7 +15,9 @@ struct SplitMix {
 }
 
 impl SplitMix {
-    fn new(seed: u64) -> Self { Self { state: seed } }
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
     fn next_u64(&mut self) -> u64 {
         self.state = self.state.wrapping_add(0x9E3779B97F4A7C15);
         let mut z = self.state;
@@ -36,7 +38,11 @@ pub struct LossInjector {
 
 impl LossInjector {
     pub fn new(drop_probability: f32, predicate: DropPredicate, seed: u64) -> Self {
-        Self { drop_probability, predicate, rng: SplitMix::new(seed) }
+        Self {
+            drop_probability,
+            predicate,
+            rng: SplitMix::new(seed),
+        }
     }
 
     pub fn should_drop(&mut self, datagram: &[u8]) -> bool {

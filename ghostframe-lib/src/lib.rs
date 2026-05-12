@@ -1,13 +1,13 @@
 pub mod capture;
 pub mod encoder;
-pub mod transport;
-pub mod tile;
-pub mod server;
 pub mod ffi;
+pub mod server;
+pub mod tile;
+pub mod transport;
 
+pub use server::{FrameSubmission, GhostframeServer};
 pub use transport::ghostbridge::{GhostbridgeConfig, GhostbridgeError};
 pub use transport::io_bridge::IoBridge;
-pub use server::{FrameSubmission, GhostframeServer};
 
 /// Framing primitives re-exported for the E2E test harness.
 ///

@@ -451,7 +451,7 @@ fn drain_stream(conn: &mut Connection, sid: StreamId) -> Result<Vec<u8>, DrainEr
             Ok(Some(chunk)) => {
                 out.extend_from_slice(&chunk.bytes);
             }
-            Ok(None) => break,                          // FIN reached
+            Ok(None) => break,                             // FIN reached
             Err(quinn_proto::ReadError::Blocked) => break, // no more data yet
             Err(e) => {
                 let _ = chunks.finalize();

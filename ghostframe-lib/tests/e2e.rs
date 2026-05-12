@@ -161,7 +161,10 @@ async fn setup_e2e(test_pattern_args: &str) -> Result<E2eSetup> {
     setup_e2e_inner(test_pattern_args, &[], false).await
 }
 
-async fn setup_e2e_with_env(test_pattern_args: &str, extra_env: &[(&str, &str)]) -> Result<E2eSetup> {
+async fn setup_e2e_with_env(
+    test_pattern_args: &str,
+    extra_env: &[(&str, &str)],
+) -> Result<E2eSetup> {
     setup_e2e_inner(test_pattern_args, extra_env, false).await
 }
 
@@ -197,12 +200,12 @@ async fn setup_e2e_inner(
     let client_key = helpers::create_preauth_key("headscale", "ghostframe").await?;
 
     let mut server_image = GenericImage::new("ghostframe/test-server", "latest")
-            .with_container_name("ghostframe-server")
-            .with_network(helpers::NETWORK_NAME)
-            .with_env_var("TS_AUTHKEY", &server_key)
-            .with_env_var("TS_CONTROL_URL", "http://headscale:8080")
-            .with_env_var("RUST_LOG", "ghostframe=trace,debug")
-            .with_env_var("TEST_PATTERN", test_pattern_args);
+        .with_container_name("ghostframe-server")
+        .with_network(helpers::NETWORK_NAME)
+        .with_env_var("TS_AUTHKEY", &server_key)
+        .with_env_var("TS_CONTROL_URL", "http://headscale:8080")
+        .with_env_var("RUST_LOG", "ghostframe=trace,debug")
+        .with_env_var("TEST_PATTERN", test_pattern_args);
     for (k, v) in extra_env {
         server_image = server_image.with_env_var(*k, *v);
     }
@@ -217,10 +220,10 @@ async fn setup_e2e_inner(
         server_image = server_image.with_privileged(true);
     }
     let server: ContainerAsync<GenericImage> = server_image
-            .with_ready_conditions(vec![WaitFor::message_on_stdout("CERT_HASH_SHA256=")])
-            .with_startup_timeout(Duration::from_secs(120))
-            .start()
-            .await?;
+        .with_ready_conditions(vec![WaitFor::message_on_stdout("CERT_HASH_SHA256=")])
+        .with_startup_timeout(Duration::from_secs(120))
+        .start()
+        .await?;
 
     let cert_hash = helpers::read_cert_hash_from_logs("ghostframe-server").await?;
 
@@ -465,7 +468,10 @@ async fn e2e_solid_color() -> Result<()> {
 
     let scan: serde_json::Value = setup.page.evaluate(scan_js).await?.into_value()?;
     let found = scan.get("found").and_then(|v| v.as_bool()).unwrap_or(false);
-    assert!(found, "no red pixel found on canvas — H.264 pipeline failed");
+    assert!(
+        found,
+        "no red pixel found on canvas — H.264 pipeline failed"
+    );
 
     Ok(())
 }
@@ -488,7 +494,8 @@ async fn e2e_solid_color_5pct_loss() -> Result<()> {
             ("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE", "tile"),
             ("GHOSTFRAME_OUTBOUND_LOSS_SEED", "42"),
         ],
-    ).await?;
+    )
+    .await?;
 
     // Allow extra time vs baseline (5 s) for retransmits.
     tokio::time::sleep(Duration::from_secs(7)).await;
@@ -511,7 +518,10 @@ async fn e2e_solid_color_5pct_loss() -> Result<()> {
     "#;
     let scan: serde_json::Value = setup.page.evaluate(scan_js).await?.into_value()?;
     let found = scan.get("found").and_then(|v| v.as_bool()).unwrap_or(false);
-    assert!(found, "no red pixel found under 5% loss — retransmission broken");
+    assert!(
+        found,
+        "no red pixel found under 5% loss — retransmission broken"
+    );
     Ok(())
 }
 
@@ -542,7 +552,10 @@ async fn e2e_tile_skip() -> Result<()> {
     tokio::time::sleep(Duration::from_secs(2)).await;
     let snap_b: i64 = setup.page.evaluate(snapshot_js).await?.into_value()?;
 
-    assert_eq!(snap_a, snap_b, "Static content should produce identical canvas snapshots");
+    assert_eq!(
+        snap_a, snap_b,
+        "Static content should produce identical canvas snapshots"
+    );
 
     Ok(())
 }
@@ -573,7 +586,10 @@ async fn e2e_h264_motion() -> Result<()> {
     tokio::time::sleep(Duration::from_secs(2)).await;
     let snap_b: i64 = setup.page.evaluate(sample_js).await?.into_value()?;
 
-    assert_ne!(snap_a, snap_b, "Spinner region should change between snapshots");
+    assert_ne!(
+        snap_a, snap_b,
+        "Spinner region should change between snapshots"
+    );
 
     Ok(())
 }
@@ -608,7 +624,10 @@ async fn e2e_codec_transition() -> Result<()> {
     tokio::time::sleep(Duration::from_secs(2)).await;
     let snap_b: i64 = setup.page.evaluate(static_js).await?.into_value()?;
 
-    assert_eq!(snap_a, snap_b, "Static region should stay unchanged while spinner runs elsewhere");
+    assert_eq!(
+        snap_a, snap_b,
+        "Static region should stay unchanged while spinner runs elsewhere"
+    );
 
     Ok(())
 }
@@ -620,9 +639,8 @@ async fn e2e_codec_transition() -> Result<()> {
 /// be encoded, transported, and decoded without corruption.
 #[tokio::test]
 async fn e2e_edge_tiles() -> Result<()> {
-    let setup = setup_e2e_with_env("--solid-red", &[
-        ("XORG_CONF", "/etc/X11/xorg-odd.conf"),
-    ]).await?;
+    let setup =
+        setup_e2e_with_env("--solid-red", &[("XORG_CONF", "/etc/X11/xorg-odd.conf")]).await?;
 
     // Wait for frames
     tokio::time::sleep(Duration::from_secs(6)).await;
@@ -661,28 +679,37 @@ async fn e2e_edge_tiles() -> Result<()> {
     // Check center renders red (baseline)
     let center = &result["center"];
     let cr = center["r"].as_u64().unwrap_or(0);
-    assert!(cr > 150, "Center pixel should be red (got r={cr}) - baseline failed");
+    assert!(
+        cr > 150,
+        "Center pixel should be red (got r={cr}) - baseline failed"
+    );
 
     // Check right edge renders red
     let right = &result["right"];
     let rr = right["r"].as_u64().unwrap_or(0);
     let rg = right["g"].as_u64().unwrap_or(255);
-    assert!(rr > 150 && rg < 100,
-        "Right edge tile should be red: r={rr} g={rg}");
+    assert!(
+        rr > 150 && rg < 100,
+        "Right edge tile should be red: r={rr} g={rg}"
+    );
 
     // Check bottom edge renders red
     let bottom = &result["bottom"];
     let br = bottom["r"].as_u64().unwrap_or(0);
     let bg = bottom["g"].as_u64().unwrap_or(255);
-    assert!(br > 150 && bg < 100,
-        "Bottom edge tile should be red: r={br} g={bg}");
+    assert!(
+        br > 150 && bg < 100,
+        "Bottom edge tile should be red: r={br} g={bg}"
+    );
 
     // Check bottom-right corner renders red
     let corner = &result["corner"];
     let corr = corner["r"].as_u64().unwrap_or(0);
     let corg = corner["g"].as_u64().unwrap_or(255);
-    assert!(corr > 150 && corg < 100,
-        "Corner edge tile should be red: r={corr} g={corg}");
+    assert!(
+        corr > 150 && corg < 100,
+        "Corner edge tile should be red: r={corr} g={corg}"
+    );
 
     Ok(())
 }
@@ -732,8 +759,10 @@ async fn e2e_multi_tile_grid() -> Result<()> {
     // Due to QUIC congestion control, not all tiles may arrive.
     // But with 8 seconds at 2fps, most of the grid should render.
     // Require at least 5 of 9 positions (>50%) to be red.
-    assert!(red_count >= 5,
-        "Expected at least 5/9 grid positions to be red, got {red_count}/{total}");
+    assert!(
+        red_count >= 5,
+        "Expected at least 5/9 grid positions to be red, got {red_count}/{total}"
+    );
 
     Ok(())
 }
@@ -765,20 +794,29 @@ async fn e2e_text_clarity() -> Result<()> {
                 }};
             }})()
             "#,
-            ix = pair.ink.0, iy = pair.ink.1,
-            bx = pair.bg.0,  by = pair.bg.1,
+            ix = pair.ink.0,
+            iy = pair.ink.1,
+            bx = pair.bg.0,
+            by = pair.bg.1,
         );
-        let probe: serde_json::Value = setup.page.evaluate(probe_js.as_str()).await?.into_value()?;
+        let probe: serde_json::Value =
+            setup.page.evaluate(probe_js.as_str()).await?.into_value()?;
 
         let ink_lum = luminance(&probe["ink"]);
-        let bg_lum  = luminance(&probe["bg"]);
+        let bg_lum = luminance(&probe["bg"]);
 
         assert!(
             ink_lum - bg_lum > 80.0,
             "sample {i}: insufficient contrast (ink {ink_lum:.0} - bg {bg_lum:.0}); pair={pair:?}"
         );
-        assert!(ink_lum > 150.0, "sample {i}: ink too dark — luminance {ink_lum:.0}");
-        assert!(bg_lum  <  80.0, "sample {i}: bg too bright — luminance {bg_lum:.0}");
+        assert!(
+            ink_lum > 150.0,
+            "sample {i}: ink too dark — luminance {ink_lum:.0}"
+        );
+        assert!(
+            bg_lum < 80.0,
+            "sample {i}: bg too bright — luminance {bg_lum:.0}"
+        );
     }
 
     // ── (b) Stability: two snapshots 2s apart must be byte-identical.
@@ -849,12 +887,19 @@ async fn assert_region_rendered(
                     return {{ red, total }};
                 }})()
                 "#,
-                x = region.x, y = region.y, w = region.w, h = region.h,
+                x = region.x,
+                y = region.y,
+                w = region.w,
+                h = region.h,
             );
             let out: Value = page.evaluate(js.as_str()).await?.into_value()?;
             let red = out["red"].as_u64().unwrap_or(0);
             let total = out["total"].as_u64().unwrap_or(0);
-            assert!(red >= 7, "{}: only {red}/{total} samples were red", region.name);
+            assert!(
+                red >= 7,
+                "{}: only {red}/{total} samples were red",
+                region.name
+            );
         }
 
         RegionCheck::Legible => {
@@ -876,7 +921,10 @@ async fn assert_region_rendered(
                     return {{ lo, hi }};
                 }})()
                 "#,
-                x = region.x, y = region.y, w = region.w, h = region.h,
+                x = region.x,
+                y = region.y,
+                w = region.w,
+                h = region.h,
             );
             let out: Value = page.evaluate(js.as_str()).await?.into_value()?;
             let lo = out["lo"].as_f64().unwrap_or(255.0);
@@ -913,10 +961,13 @@ async fn assert_region_rendered(
                     }};
                 }})()
                 "#,
-                x = region.x, y = region.y, w = region.w, h = region.h,
+                x = region.x,
+                y = region.y,
+                w = region.w,
+                h = region.h,
             );
             let out: Value = page.evaluate(js.as_str()).await?.into_value()?;
-            let top    = out["top"].as_f64().unwrap_or(0.0);
+            let top = out["top"].as_f64().unwrap_or(0.0);
             let bottom = out["bottom"].as_f64().unwrap_or(0.0);
             assert!(
                 bottom - top > 50.0,
@@ -936,7 +987,10 @@ async fn assert_region_rendered(
                     return h;
                 }})()
                 "#,
-                x = region.x, y = region.y, w = region.w, h = region.h,
+                x = region.x,
+                y = region.y,
+                w = region.w,
+                h = region.h,
             );
             let h1: i64 = page.evaluate(js.as_str()).await?.into_value()?;
             tokio::time::sleep(Duration::from_millis(1500)).await;
@@ -982,7 +1036,10 @@ async fn e2e_fec_parity_enabled() -> Result<()> {
 
     let scan: serde_json::Value = setup.page.evaluate(scan_js).await?.into_value()?;
     let found = scan.get("found").and_then(|v| v.as_bool()).unwrap_or(false);
-    assert!(found, "no red pixel found — FEC parity may have broken the H.264 pipeline");
+    assert!(
+        found,
+        "no red pixel found — FEC parity may have broken the H.264 pipeline"
+    );
 
     Ok(())
 }
@@ -998,34 +1055,38 @@ async fn e2e_fec_parity_enabled() -> Result<()> {
 async fn e2e_resolution_change() -> Result<()> {
     // Phase A: 1024×768 — server starts in this mode (first entry in
     // xorg-multi.conf's Modes list).
-    let setup = setup_e2e_with_env(
-        "--solid-red",
-        &[("XORG_CONF", "/etc/X11/xorg-multi.conf")],
-    ).await?;
+    let setup =
+        setup_e2e_with_env("--solid-red", &[("XORG_CONF", "/etc/X11/xorg-multi.conf")]).await?;
 
     // Wait for QUIC slow-start + initial frames.
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Assert: canvas is 1024×768 and a center pixel is red.
-    let dims_a: (u32, u32) = setup.page
-        .evaluate(r#"
+    let dims_a: (u32, u32) = setup
+        .page
+        .evaluate(
+            r#"
             (() => {
                 const c = document.getElementById('canvas');
                 return [c.width, c.height];
             })()
-        "#)
+        "#,
+        )
         .await?
         .into_value()?;
     assert_eq!(dims_a, (1024, 768), "phase A: canvas dimensions");
 
-    let red_a: bool = setup.page
-        .evaluate(r#"
+    let red_a: bool = setup
+        .page
+        .evaluate(
+            r#"
             (() => {
                 const c = document.getElementById('canvas').getContext('2d');
                 const p = c.getImageData(512, 384, 1, 1).data;
                 return p[0] > 180 && p[1] < 80 && p[2] < 80;
             })()
-        "#)
+        "#,
+        )
         .await?
         .into_value()?;
     assert!(red_a, "phase A: center pixel not red");
@@ -1037,7 +1098,8 @@ async fn e2e_resolution_change() -> Result<()> {
         "ghostframe-server",
         &[("DISPLAY", ":99")],
         &["xrandr", "--output", "DUMMY0", "--mode", "640x480"],
-    ).await?;
+    )
+    .await?;
     assert_eq!(
         status, 0,
         "xrandr exited with {status}: stdout={out:?} stderr={err:?}"
@@ -1048,7 +1110,8 @@ async fn e2e_resolution_change() -> Result<()> {
         "ghostframe-server",
         &[("DISPLAY", ":99")],
         &["/usr/local/bin/ghostframe-test-pattern", "--solid-red"],
-    ).await?;
+    )
+    .await?;
     // The test-pattern process forks/daemonises; if status != 0 the binary failed.
     assert_eq!(status, 0, "re-paint after resolution change failed");
 
@@ -1057,25 +1120,35 @@ async fn e2e_resolution_change() -> Result<()> {
     // Allow time for: encoder reset, keyframe, several frames, canvas resize.
     tokio::time::sleep(Duration::from_secs(8)).await;
 
-    let dims_b: (u32, u32) = setup.page
-        .evaluate(r#"
+    let dims_b: (u32, u32) = setup
+        .page
+        .evaluate(
+            r#"
             (() => {
                 const c = document.getElementById('canvas');
                 return [c.width, c.height];
             })()
-        "#)
+        "#,
+        )
         .await?
         .into_value()?;
-    assert_eq!(dims_b, (640, 480), "phase B: canvas did not resize to 640x480");
+    assert_eq!(
+        dims_b,
+        (640, 480),
+        "phase B: canvas did not resize to 640x480"
+    );
 
-    let red_b: bool = setup.page
-        .evaluate(r#"
+    let red_b: bool = setup
+        .page
+        .evaluate(
+            r#"
             (() => {
                 const c = document.getElementById('canvas').getContext('2d');
                 const p = c.getImageData(320, 240, 1, 1).data;
                 return p[0] > 180 && p[1] < 80 && p[2] < 80;
             })()
-        "#)
+        "#,
+        )
         .await?
         .into_value()?;
     assert!(red_b, "phase B: center pixel not red after resize");
@@ -1097,10 +1170,10 @@ async fn e2e_multi_pattern() -> Result<()> {
     // spinner frames to land.
     tokio::time::sleep(SETTLE).await;
 
-    assert_region_rendered(&setup.page, region("solid"),    RegionCheck::SolidRed).await?;
-    assert_region_rendered(&setup.page, region("text"),     RegionCheck::Legible).await?;
+    assert_region_rendered(&setup.page, region("solid"), RegionCheck::SolidRed).await?;
+    assert_region_rendered(&setup.page, region("text"), RegionCheck::Legible).await?;
     assert_region_rendered(&setup.page, region("gradient"), RegionCheck::SmoothGradient).await?;
-    assert_region_rendered(&setup.page, region("spinner"),  RegionCheck::Changing).await?;
+    assert_region_rendered(&setup.page, region("spinner"), RegionCheck::Changing).await?;
 
     // TODO(M3): once the classifier ships, also assert that each region's
     //           tiles are encoded with `region.expected_codec`. Will require
@@ -1180,7 +1253,7 @@ async fn e2e_mode_switch() -> Result<()> {
         })
         .collect();
 
-    let tile_seen  = deltas.iter().any(|(_, dt, _)| *dt > 0);
+    let tile_seen = deltas.iter().any(|(_, dt, _)| *dt > 0);
     let frame_seen = deltas.iter().any(|(_, _, df)| *df > 0);
 
     // Anchor timeline to the first non-zero delta — that's our best estimate
@@ -1196,7 +1269,9 @@ async fn e2e_mode_switch() -> Result<()> {
     let mut phases: Vec<(i64, i64)> = Vec::new(); // (tile_total, frame_total)
     if let Some(anchor) = t_first_data {
         for (t, dt, df) in &deltas {
-            if *t < anchor { continue; }
+            if *t < anchor {
+                continue;
+            }
             let phase_idx = ((*t - anchor) / PHASE_MS) as usize;
             while phases.len() <= phase_idx {
                 phases.push((0, 0));
@@ -1214,7 +1289,8 @@ async fn e2e_mode_switch() -> Result<()> {
     let is_frame_dominated = |(t, f): &(i64, i64)| -> bool {
         *f >= MIN_FRAME_COUNT_FOR_DOMINANCE && *f >= FRAME_DOMINANCE_RATIO * t.max(&1)
     };
-    let frame_dominated_phases: Vec<usize> = phases.iter()
+    let frame_dominated_phases: Vec<usize> = phases
+        .iter()
         .enumerate()
         .filter(|(_, p)| is_frame_dominated(*p))
         .map(|(i, _)| i)
@@ -1225,10 +1301,7 @@ async fn e2e_mode_switch() -> Result<()> {
     let tile_present_phase = phases.iter().any(|(t, _)| *t > 0);
 
     // Diagnostic table — print on any failure.
-    let pass = tile_seen
-        && frame_seen
-        && tile_present_phase
-        && frame_dominated_phases.len() >= 2;
+    let pass = tile_seen && frame_seen && tile_present_phase && frame_dominated_phases.len() >= 2;
     if !pass {
         eprintln!("--- per-sample deltas ---");
         for (ms, dt, df) in &deltas {
@@ -1236,7 +1309,11 @@ async fn e2e_mode_switch() -> Result<()> {
         }
         eprintln!("--- per-phase totals (anchor={:?}) ---", t_first_data);
         for (i, (t, f)) in phases.iter().enumerate() {
-            let marker = if is_frame_dominated(&(*t, *f)) { " <FRAME-DOMINATED>" } else { "" };
+            let marker = if is_frame_dominated(&(*t, *f)) {
+                " <FRAME-DOMINATED>"
+            } else {
+                ""
+            };
             eprintln!("phase {i}  tile={t:>5}  frame={f:>5}{marker}");
         }
         eprintln!(
@@ -1244,10 +1321,14 @@ async fn e2e_mode_switch() -> Result<()> {
         );
     }
 
-    assert!(tile_seen,
-        "expected at least one tile datagram during the test (TileCodec mode); none observed");
-    assert!(frame_seen,
-        "expected at least one frame datagram during the test (H264 mode); none observed");
+    assert!(
+        tile_seen,
+        "expected at least one tile datagram during the test (TileCodec mode); none observed"
+    );
+    assert!(
+        frame_seen,
+        "expected at least one frame datagram during the test (H264 mode); none observed"
+    );
     assert!(tile_present_phase,
         "expected at least one phase containing TileCodec datagrams; classifier may be stuck in H264");
     // Load-bearing assertion: 2+ distinct frame-dominated phases proves the
@@ -1256,10 +1337,12 @@ async fn e2e_mode_switch() -> Result<()> {
     // This is the strongest assertion the architecture currently permits —
     // static halves emit no datagrams, so direct Frame→Tile transitions can't
     // be observed. See M3.3 future-work note in the function docstring.
-    assert!(frame_dominated_phases.len() >= 2,
+    assert!(
+        frame_dominated_phases.len() >= 2,
         "expected at least 2 distinct frame-dominated phases (proves classifier flipped both \
          directions: H264 → exit → H264). Observed frame-dominated phase indices: {:?}",
-        frame_dominated_phases);
+        frame_dominated_phases
+    );
 
     Ok(())
 }
@@ -1287,7 +1370,8 @@ async fn e2e_ack_loss() -> Result<()> {
             ("GHOSTFRAME_INBOUND_LOSS_PREDICATE", "ack"),
             ("GHOSTFRAME_INBOUND_LOSS_SEED", "99"),
         ],
-    ).await?;
+    )
+    .await?;
 
     tokio::time::sleep(Duration::from_secs(5)).await;
 

@@ -61,20 +61,20 @@ pub struct SamplePair {
 ///                    body-below glyph-px (0,1) is bg (row1=0b001100).
 pub const SAMPLES: &[SamplePair] = &[
     SamplePair {
-        ink: (ORIGIN_X + 1,              ORIGIN_Y + 0),
-        bg:  (ORIGIN_X + 0,              ORIGIN_Y + 0),
+        ink: (ORIGIN_X + 1, ORIGIN_Y + 0),
+        bg: (ORIGIN_X + 0, ORIGIN_Y + 0),
     },
     SamplePair {
         ink: (ORIGIN_X + 7 * GLYPH_W + 2, ORIGIN_Y + 0),
-        bg:  (ORIGIN_X + 7 * GLYPH_W + 0, ORIGIN_Y + 0),
+        bg: (ORIGIN_X + 7 * GLYPH_W + 0, ORIGIN_Y + 0),
     },
     SamplePair {
         ink: (ORIGIN_X + 14 * GLYPH_W + 1, ORIGIN_Y + 0),
-        bg:  (ORIGIN_X + 14 * GLYPH_W + 0, ORIGIN_Y + 1),
+        bg: (ORIGIN_X + 14 * GLYPH_W + 0, ORIGIN_Y + 1),
     },
     SamplePair {
         ink: (ORIGIN_X + 20 * GLYPH_W + 1, ORIGIN_Y + 0),
-        bg:  (ORIGIN_X + 20 * GLYPH_W + 0, ORIGIN_Y + 1),
+        bg: (ORIGIN_X + 20 * GLYPH_W + 0, ORIGIN_Y + 1),
     },
 ];
 
@@ -114,6 +114,9 @@ pub fn render<C: Connection>(conn: &C, root: u32) -> Result<(), Box<dyn std::err
     conn.poly_fill_rectangle(root, gc, &rects)?;
     conn.flush()?;
 
-    eprintln!("test-pattern: text-grid rendered ({} ink pixels)", rects.len());
+    eprintln!(
+        "test-pattern: text-grid rendered ({} ink pixels)",
+        rects.len()
+    );
     Ok(())
 }

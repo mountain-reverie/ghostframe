@@ -126,7 +126,9 @@ fn gpu_pipeline_dirty_detection() {
             Ok(v) => v,
             Err(e) => {
                 libc::close(fd1);
-                eprintln!("Skipping gpu_pipeline_dirty_detection (memfd not accepted as DMA-BUF): {e}");
+                eprintln!(
+                    "Skipping gpu_pipeline_dirty_detection (memfd not accepted as DMA-BUF): {e}"
+                );
                 return;
             }
         };
@@ -159,10 +161,9 @@ fn gpu_pipeline_dirty_detection() {
 
         // Frame 3: tile (1,0) changed to red — only that tile should be dirty
         let fd3 = create_changed_memfd(
-            width, height,
-            255, 0, 0,   // base: blue
-            1, 0,        // tile (col=1, row=0)
-            0, 0, 255,   // change: red (B=0, G=0, R=255 in BGRA)
+            width, height, 255, 0, 0, // base: blue
+            1, 0, // tile (col=1, row=0)
+            0, 0, 255, // change: red (B=0, G=0, R=255 in BGRA)
         );
         let third = match tracker.diff(fd3, width, height, stride) {
             Ok(v) => v,
@@ -218,7 +219,10 @@ fn gpu_pipeline_full_frame_encode() {
             libc::lseek(fd, 0, libc::SEEK_SET);
             match encoder.encode_frame(fd, width, height, stride) {
                 Ok(Some(encoded)) => {
-                    assert!(!encoded.payload.is_empty(), "encoded payload must not be empty");
+                    assert!(
+                        !encoded.payload.is_empty(),
+                        "encoded payload must not be empty"
+                    );
                     if encoded.is_keyframe {
                         got_keyframe = true;
                     }
@@ -297,8 +301,14 @@ fn gpu_pipeline_end_to_end() {
                 return;
             }
         };
-        assert!(!analysis.dirty_tiles.is_empty(), "first frame: some tiles must be dirty");
-        assert!(!analysis.nv12_data.is_null(), "NV12 data should not be null");
+        assert!(
+            !analysis.dirty_tiles.is_empty(),
+            "first frame: some tiles must be dirty"
+        );
+        assert!(
+            !analysis.nv12_data.is_null(),
+            "NV12 data should not be null"
+        );
 
         // 4. Encode via encode_nv12_buffer — try up to 3 attempts for VA-API buffering.
         let mut frame_output: Option<FullFrameEncoded> = None;
@@ -331,13 +341,19 @@ fn gpu_pipeline_end_to_end() {
             // Fragment it (MTU = 1200, max_fragment_payload = 1200 - 14 header bytes)
             let max_payload = 1200usize.saturating_sub(14);
             let datagrams = fragment_frame(1, 0, enc.is_keyframe, &enc.payload, max_payload);
-            assert!(!datagrams.is_empty(), "fragmentation should produce at least one datagram");
+            assert!(
+                !datagrams.is_empty(),
+                "fragmentation should produce at least one datagram"
+            );
 
             // Verify we can decode the first datagram header back
-            let (hdr, _payload) = decode_frame_datagram(&datagrams[0])
-                .expect("first datagram should be decodable");
+            let (hdr, _payload) =
+                decode_frame_datagram(&datagrams[0]).expect("first datagram should be decodable");
             assert_eq!(hdr.frame_seq, 1, "frame_seq should be 1");
-            assert!(hdr.is_keyframe(), "first datagram should be marked keyframe");
+            assert!(
+                hdr.is_keyframe(),
+                "first datagram should be marked keyframe"
+            );
         }
 
         // 5. Second frame: same content → no dirty tiles expected
@@ -359,10 +375,9 @@ fn gpu_pipeline_end_to_end() {
 
         // 6. Third frame: change one tile → process_frame detects change → encode
         let fd2 = create_changed_memfd(
-            width, height,
-            255, 255, 0, // base: cyan
-            2, 2,        // tile (col=2, row=2)
-            0, 0, 255,   // change: red (BGRA)
+            width, height, 255, 255, 0, // base: cyan
+            2, 2, // tile (col=2, row=2)
+            0, 0, 255, // change: red (BGRA)
         );
 
         let analysis3 = match processor.process_frame(fd2, width, height, stride) {
@@ -373,7 +388,10 @@ fn gpu_pipeline_end_to_end() {
                 return;
             }
         };
-        assert!(!analysis3.dirty_tiles.is_empty(), "changed frame must have at least one dirty tile");
+        assert!(
+            !analysis3.dirty_tiles.is_empty(),
+            "changed frame must have at least one dirty tile"
+        );
 
         // P-frame encode
         match encoder.encode_nv12_buffer(
@@ -423,7 +441,9 @@ fn gpu_pipeline_nv12_conversion() {
             Ok(a) => a,
             Err(e) => {
                 libc::close(fd);
-                eprintln!("Skipping gpu_pipeline_nv12_conversion (memfd not accepted as DMA-BUF): {e}");
+                eprintln!(
+                    "Skipping gpu_pipeline_nv12_conversion (memfd not accepted as DMA-BUF): {e}"
+                );
                 return;
             }
         };
@@ -497,7 +517,7 @@ fn tile_analysis_populated_on_subsequent_frame() {
         // First frame: opaque red. analysis.tile_analysis is null on first frame
         // (the analysis pipeline isn't dispatched until the second frame, which
         // is the steady-state path).
-        let fd1 = create_solid_memfd(width, height, /*B=*/0, /*G=*/0, /*R=*/255);
+        let fd1 = create_solid_memfd(width, height, /*B=*/ 0, /*G=*/ 0, /*R=*/ 255);
         let first = match processor.process_frame(fd1, width, height, stride) {
             Ok(a) => a,
             Err(e) => {
@@ -507,7 +527,10 @@ fn tile_analysis_populated_on_subsequent_frame() {
             }
         };
         libc::close(fd1);
-        assert!(first.tile_analysis.is_null(), "first-frame analysis is null by design");
+        assert!(
+            first.tile_analysis.is_null(),
+            "first-frame analysis is null by design"
+        );
 
         // Second frame: same opaque red. Now the analysis pipeline dispatches.
         let fd2 = create_solid_memfd(width, height, 0, 0, 255);
@@ -521,7 +544,10 @@ fn tile_analysis_populated_on_subsequent_frame() {
         };
         libc::close(fd2);
 
-        assert!(!second.tile_analysis.is_null(), "second-frame analysis non-null");
+        assert!(
+            !second.tile_analysis.is_null(),
+            "second-frame analysis non-null"
+        );
         assert_eq!(second.tile_analysis_len, 1, "32x32 frame → 1 tile");
         let slice = second.tile_analysis_slice();
         assert_eq!(slice.len(), 1);

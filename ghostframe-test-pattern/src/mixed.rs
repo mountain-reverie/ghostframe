@@ -26,10 +26,38 @@ pub struct Region {
 
 /// Default 640×480 layout — split into four 320×240 quadrants.
 pub const REGIONS: &[Region] = &[
-    Region { name: "solid",    x: 0,   y: 0,   w: 320, h: 240, expected_codec: "Solid"  },
-    Region { name: "text",     x: 320, y: 0,   w: 320, h: 240, expected_codec: "PalRle" },
-    Region { name: "gradient", x: 0,   y: 240, w: 320, h: 240, expected_codec: "Bc1"    },
-    Region { name: "spinner",  x: 320, y: 240, w: 320, h: 240, expected_codec: "H264"   },
+    Region {
+        name: "solid",
+        x: 0,
+        y: 0,
+        w: 320,
+        h: 240,
+        expected_codec: "Solid",
+    },
+    Region {
+        name: "text",
+        x: 320,
+        y: 0,
+        w: 320,
+        h: 240,
+        expected_codec: "PalRle",
+    },
+    Region {
+        name: "gradient",
+        x: 0,
+        y: 240,
+        w: 320,
+        h: 240,
+        expected_codec: "Bc1",
+    },
+    Region {
+        name: "spinner",
+        x: 320,
+        y: 240,
+        w: 320,
+        h: 240,
+        expected_codec: "H264",
+    },
 ];
 
 /// Look up a region by name. Panics if not found — REGIONS is a fixed table.
@@ -54,10 +82,7 @@ pub fn render_and_spin<C: Connection>(
     spinner_loop(conn, root, region("spinner"))
 }
 
-fn paint_static<C: Connection>(
-    conn: &C,
-    root: u32,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn paint_static<C: Connection>(conn: &C, root: u32) -> Result<(), Box<dyn std::error::Error>> {
     paint_solid(conn, root, region("solid"))?;
     paint_text(conn, root, region("text"))?;
     paint_gradient(conn, root, region("gradient"))?;
@@ -73,10 +98,16 @@ fn paint_solid<C: Connection>(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let gc = conn.generate_id()?;
     conn.create_gc(gc, root, &CreateGCAux::new().foreground(0x00FF_0000))?; // red
-    conn.poly_fill_rectangle(root, gc, &[Rectangle {
-        x: r.x as i16, y: r.y as i16,
-        width: r.w as u16, height: r.h as u16,
-    }])?;
+    conn.poly_fill_rectangle(
+        root,
+        gc,
+        &[Rectangle {
+            x: r.x as i16,
+            y: r.y as i16,
+            width: r.w as u16,
+            height: r.h as u16,
+        }],
+    )?;
     Ok(())
 }
 
@@ -88,10 +119,16 @@ fn paint_text<C: Connection>(
     // Background fill — near-black so unlit pixels are deterministic.
     let bg_gc = conn.generate_id()?;
     conn.create_gc(bg_gc, root, &CreateGCAux::new().foreground(0x0014_1414))?;
-    conn.poly_fill_rectangle(root, bg_gc, &[Rectangle {
-        x: r.x as i16, y: r.y as i16,
-        width: r.w as u16, height: r.h as u16,
-    }])?;
+    conn.poly_fill_rectangle(
+        root,
+        bg_gc,
+        &[Rectangle {
+            x: r.x as i16,
+            y: r.y as i16,
+            width: r.w as u16,
+            height: r.h as u16,
+        }],
+    )?;
 
     // Foreground GC — near-white text.
     let fg_gc = conn.generate_id()?;
@@ -110,7 +147,8 @@ fn paint_text<C: Connection>(
                     rects.push(Rectangle {
                         x: (glyph_x + px) as i16,
                         y: (glyph_y + py) as i16,
-                        width: 1, height: 1,
+                        width: 1,
+                        height: 1,
                     });
                 }
             }
@@ -134,12 +172,16 @@ fn paint_gradient<C: Connection>(
         let pixel = (v << 16) | (v << 8) | (255 - v); // ramp R+G; B counter-ramp
         let gc = conn.generate_id()?;
         conn.create_gc(gc, root, &CreateGCAux::new().foreground(pixel))?;
-        conn.poly_fill_rectangle(root, gc, &[Rectangle {
-            x: r.x as i16,
-            y: (r.y + i * stripe_h) as i16,
-            width: r.w as u16,
-            height: stripe_h as u16,
-        }])?;
+        conn.poly_fill_rectangle(
+            root,
+            gc,
+            &[Rectangle {
+                x: r.x as i16,
+                y: (r.y + i * stripe_h) as i16,
+                width: r.w as u16,
+                height: stripe_h as u16,
+            }],
+        )?;
     }
     Ok(())
 }
@@ -158,10 +200,16 @@ fn spinner_loop<C: Connection>(
         let b_ch = hue.wrapping_add(170);
         let pixel = ((r_ch as u32) << 16) | ((g_ch as u32) << 8) | (b_ch as u32);
         conn.change_gc(gc, &ChangeGCAux::new().foreground(pixel))?;
-        conn.poly_fill_rectangle(root, gc, &[Rectangle {
-            x: r.x as i16, y: r.y as i16,
-            width: r.w as u16, height: r.h as u16,
-        }])?;
+        conn.poly_fill_rectangle(
+            root,
+            gc,
+            &[Rectangle {
+                x: r.x as i16,
+                y: r.y as i16,
+                width: r.w as u16,
+                height: r.h as u16,
+            }],
+        )?;
         conn.flush()?;
         std::thread::sleep(Duration::from_millis(100));
         hue = hue.wrapping_add(25);

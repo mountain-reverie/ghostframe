@@ -119,8 +119,7 @@ impl TestEndpoint {
                 }
                 Some(DatagramEvent::Response(transmit)) => {
                     let size = transmit.size;
-                    self.outbound
-                        .extend(split_transmit(transmit, &buf[..size]));
+                    self.outbound.extend(split_transmit(transmit, &buf[..size]));
                     buf.clear();
                 }
             }
@@ -155,8 +154,7 @@ impl TestEndpoint {
 
                 while let Some(transmit) = conn.poll_transmit(now, 10, &mut buf) {
                     let size = transmit.size;
-                    self.outbound
-                        .extend(split_transmit(transmit, &buf[..size]));
+                    self.outbound.extend(split_transmit(transmit, &buf[..size]));
                     buf.clear();
                 }
 
@@ -185,8 +183,7 @@ impl TestEndpoint {
             Err(error) => {
                 if let Some(transmit) = error.response {
                     let size = transmit.size;
-                    self.outbound
-                        .extend(split_transmit(transmit, &buf[..size]));
+                    self.outbound.extend(split_transmit(transmit, &buf[..size]));
                 }
             }
         }
@@ -374,12 +371,7 @@ fn loopback_h3_handshake() {
     let mut client_config = ClientConfig::new(Arc::new(quic_client_tls));
     client_config.transport_config(Arc::new(client_transport));
 
-    let client_ep = Endpoint::new(
-        Arc::new(EndpointConfig::default()),
-        None,
-        false,
-        None,
-    );
+    let client_ep = Endpoint::new(Arc::new(EndpointConfig::default()), None, false, None);
 
     // -- Addresses --
     let server_addr = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 4443);

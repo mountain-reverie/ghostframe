@@ -89,7 +89,12 @@ mod tests {
     #[test]
     fn batch_roundtrip_single_entry() {
         let batch = AckBatch {
-            entries: vec![AckEntry { tile_x: 3, tile_y: 4, generation: 2, pass: 1 }],
+            entries: vec![AckEntry {
+                tile_x: 3,
+                tile_y: 4,
+                generation: 2,
+                pass: 1,
+            }],
         };
         let bytes = batch.encode();
         assert_eq!(bytes[0], ACK_BATCH_MSG_TYPE);
@@ -105,7 +110,12 @@ mod tests {
     #[test]
     fn batch_at_max_capacity_fits_under_mtu() {
         let entries: Vec<_> = (0..64)
-            .map(|i| AckEntry { tile_x: i as u8, tile_y: 0, generation: 0, pass: 0 })
+            .map(|i| AckEntry {
+                tile_x: i as u8,
+                tile_y: 0,
+                generation: 0,
+                pass: 0,
+            })
             .collect();
         let batch = AckBatch { entries };
         let bytes = batch.encode();

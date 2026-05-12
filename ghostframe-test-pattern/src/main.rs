@@ -69,9 +69,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Must run before any X11 connect attempt — there is no X server in
     // this configuration.
     if args.drm_direct {
-        let secs = args.mode_switch_cycle.ok_or_else(|| {
-            "--drm-direct requires --mode-switch-cycle SECS".to_string()
-        })?;
+        let secs = args
+            .mode_switch_cycle
+            .ok_or_else(|| "--drm-direct requires --mode-switch-cycle SECS".to_string())?;
         let half = std::time::Duration::from_secs(secs);
         return ghostframe_test_pattern::drm_direct::run(&args.drm_device, half);
     }
@@ -121,9 +121,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             conn.change_gc(gc, &ChangeGCAux::new().foreground(pixel))?;
             // Draw a filled rectangle at (100, 100), size 64x64
-            conn.poly_fill_rectangle(root, gc, &[Rectangle {
-                x: 100, y: 100, width: 64, height: 64,
-            }])?;
+            conn.poly_fill_rectangle(
+                root,
+                gc,
+                &[Rectangle {
+                    x: 100,
+                    y: 100,
+                    width: 64,
+                    height: 64,
+                }],
+            )?;
             conn.flush()?;
 
             std::thread::sleep(std::time::Duration::from_millis(100));

@@ -20,8 +20,8 @@ pub enum WorkState {
 pub struct TileWork {
     pub tile_x: u8,
     pub tile_y: u8,
-    pub generation: u8,    // 4 bits effective
-    pub pass_idx: u8,      // 4 bits effective; 0 for single-pass codecs
+    pub generation: u8, // 4 bits effective
+    pub pass_idx: u8,   // 4 bits effective; 0 for single-pass codecs
     pub total_passes: u8,
     pub codec: Codec,
     pub payload: Vec<u8>,
@@ -96,9 +96,15 @@ impl Scheduler {
         self.rtt = rtt;
     }
 
-    pub fn cols(&self) -> u32 { self.cols }
-    pub fn rows(&self) -> u32 { self.rows }
-    pub fn queue_len(&self) -> usize { self.queue.len() }
+    pub fn cols(&self) -> u32 {
+        self.cols
+    }
+    pub fn rows(&self) -> u32 {
+        self.rows
+    }
+    pub fn queue_len(&self) -> usize {
+        self.queue.len()
+    }
 
     pub fn generation_for(&self, tile_x: u8, tile_y: u8) -> u8 {
         let idx = (tile_y as usize) * (self.cols as usize) + (tile_x as usize);
@@ -138,7 +144,10 @@ impl Scheduler {
 
     #[cfg(test)]
     pub fn queue_states_for_test(&self) -> Vec<(u8, u8, WorkState)> {
-        self.queue.iter().map(|w| (w.tile_x, w.tile_y, w.state)).collect()
+        self.queue
+            .iter()
+            .map(|w| (w.tile_x, w.tile_y, w.state))
+            .collect()
     }
 
     /// Mark matching tile work as `Acked` so the next `tick` drops it.
@@ -177,7 +186,8 @@ impl Scheduler {
         let retry_after = 2 * self.rtt;
 
         // First pass: drop terminal-state entries.
-        self.queue.retain(|w| !matches!(w.state, WorkState::Superseded | WorkState::Acked));
+        self.queue
+            .retain(|w| !matches!(w.state, WorkState::Superseded | WorkState::Acked));
 
         let mut out = Vec::new();
         let mut spent = 0usize;
@@ -248,8 +258,12 @@ mod tests {
         s.bump_generation(1, 2);
         // (1,2) work superseded; (3,0) work untouched.
         let states = s.queue_states_for_test();
-        assert!(states.iter().any(|(x, y, st)| *x == 1 && *y == 2 && *st == WorkState::Superseded));
-        assert!(states.iter().any(|(x, y, st)| *x == 3 && *y == 0 && *st == WorkState::Pending));
+        assert!(states
+            .iter()
+            .any(|(x, y, st)| *x == 1 && *y == 2 && *st == WorkState::Superseded));
+        assert!(states
+            .iter()
+            .any(|(x, y, st)| *x == 3 && *y == 0 && *st == WorkState::Pending));
     }
 
     #[test]
@@ -259,7 +273,9 @@ mod tests {
         // The queued work is at gen=3; bumping any gen on that tile invalidates it.
         s.bump_generation(1, 2);
         let states = s.queue_states_for_test();
-        assert!(states.iter().any(|(x, y, st)| *x == 1 && *y == 2 && *st == WorkState::Superseded));
+        assert!(states
+            .iter()
+            .any(|(x, y, st)| *x == 1 && *y == 2 && *st == WorkState::Superseded));
     }
 
     #[test]
@@ -268,8 +284,11 @@ mod tests {
         let stale_instant = Instant::now() - Duration::from_secs(10);
         let before_enqueue = Instant::now();
         s.enqueue(TileWork {
-            tile_x: 1, tile_y: 2,
-            generation: 0, pass_idx: 0, total_passes: 1,
+            tile_x: 1,
+            tile_y: 2,
+            generation: 0,
+            pass_idx: 0,
+            total_passes: 1,
             codec: Codec::Raw,
             payload: vec![1, 2, 3],
             queued_at: stale_instant,
@@ -281,7 +300,10 @@ mod tests {
         let w = &queued[0];
         assert_eq!(w.state, WorkState::Pending);
         assert!(w.last_sent_at.is_none());
-        assert!(w.queued_at >= before_enqueue, "queued_at must be refreshed by enqueue");
+        assert!(
+            w.queued_at >= before_enqueue,
+            "queued_at must be refreshed by enqueue"
+        );
     }
 
     #[test]
@@ -334,8 +356,16 @@ mod tests {
         // First (100) fits; second (cumulative 200) crosses 150 but is returned
         // as a whole tile (we allow up to and including the tile that crosses the cap).
         // Third never gets eligibility because the budget check breaks the loop.
-        assert_eq!(out.len(), 2, "budget allows whole tiles up to and including the one that crosses the cap");
-        assert_eq!(s.queue_len(), 3, "all three are still queued; tick doesn't drop InFlight until ACK or supersede");
+        assert_eq!(
+            out.len(),
+            2,
+            "budget allows whole tiles up to and including the one that crosses the cap"
+        );
+        assert_eq!(
+            s.queue_len(),
+            3,
+            "all three are still queued; tick doesn't drop InFlight until ACK or supersede"
+        );
     }
 
     #[test]
@@ -394,8 +424,8 @@ mod tests {
         s.enqueue(TileWork::raw_for_test(0, 0, 0, vec![1]));
         s.bump_generation(0, 0); // marks Superseded
         s.on_ack(0, 0, 0, 0); // would match by tile_x/y/gen/pass — but work is Superseded
-        // The work stays Superseded (not promoted to Acked). Tick still drops it
-        // via the Superseded retain path.
+                              // The work stays Superseded (not promoted to Acked). Tick still drops it
+                              // via the Superseded retain path.
         let out = s.tick(usize::MAX);
         assert!(out.is_empty());
         assert_eq!(s.queue_len(), 0);

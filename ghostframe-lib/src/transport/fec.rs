@@ -8,7 +8,11 @@ const FEC_K_PFRAME: usize = 5;
 /// Keyframes get stronger FEC (smaller K = more parity) because they're
 /// critical for decoder state recovery.
 pub fn fec_group_size(is_keyframe: bool) -> usize {
-    if is_keyframe { FEC_K_IFRAME } else { FEC_K_PFRAME }
+    if is_keyframe {
+        FEC_K_IFRAME
+    } else {
+        FEC_K_PFRAME
+    }
 }
 
 /// Size of the parity packet header in bytes:
@@ -41,7 +45,10 @@ pub fn generate_parity(fragment_payloads: &[&[u8]], k: usize) -> Vec<(u16, Vec<u
         return vec![];
     }
 
-    assert!(k <= u8::MAX as usize, "FEC group size k must fit in u8 (max 255)");
+    assert!(
+        k <= u8::MAX as usize,
+        "FEC group size k must fit in u8 (max 255)"
+    );
 
     let mut result = Vec::new();
 
@@ -86,7 +93,10 @@ pub fn decode_parity_payload(payload: &[u8]) -> Option<(u16, u8, &[u8])> {
 /// `received` contains the payloads of all fragments that were received (not the missing one).
 /// `parity_xor_data` is the raw XOR data from the parity packet (after stripping the header).
 pub fn recover_fragment(received: &[&[u8]], parity_xor_data: &[u8]) -> Vec<u8> {
-    debug_assert!(!received.is_empty(), "recovery requires at least one received fragment");
+    debug_assert!(
+        !received.is_empty(),
+        "recovery requires at least one received fragment"
+    );
     let max_len = received
         .iter()
         .map(|p| p.len())
@@ -170,7 +180,11 @@ mod tests {
         let payloads: Vec<Vec<u8>> = (0u8..5).map(|i| vec![i]).collect();
         let refs: Vec<&[u8]> = payloads.iter().map(|v| v.as_slice()).collect();
         let parity = generate_parity(&refs, 4);
-        assert_eq!(parity.len(), 1, "only first group of 4 should produce parity");
+        assert_eq!(
+            parity.len(),
+            1,
+            "only first group of 4 should produce parity"
+        );
         assert_eq!(parity[0].0, 0u16);
     }
 
@@ -192,10 +206,17 @@ mod tests {
         let (_, _, xor_data) = decode_parity_payload(parity_payload).unwrap();
 
         // Received = all except frag[2]
-        let received: Vec<&[u8]> = vec![frags[0].as_slice(), frags[1].as_slice(), frags[3].as_slice()];
+        let received: Vec<&[u8]> = vec![
+            frags[0].as_slice(),
+            frags[1].as_slice(),
+            frags[3].as_slice(),
+        ];
         let recovered = recover_fragment(&received, xor_data);
 
-        assert_eq!(recovered, frags[2], "recovered fragment should match original");
+        assert_eq!(
+            recovered, frags[2],
+            "recovered fragment should match original"
+        );
     }
 
     #[test]
@@ -213,7 +234,11 @@ mod tests {
         let (_, parity_payload) = &parity[0];
         let (_, _, xor_data) = decode_parity_payload(parity_payload).unwrap();
 
-        let received: Vec<&[u8]> = vec![frags[1].as_slice(), frags[2].as_slice(), frags[3].as_slice()];
+        let received: Vec<&[u8]> = vec![
+            frags[1].as_slice(),
+            frags[2].as_slice(),
+            frags[3].as_slice(),
+        ];
         let recovered = recover_fragment(&received, xor_data);
 
         assert_eq!(recovered, frags[0]);
@@ -246,7 +271,10 @@ mod tests {
         let recovered = recover_fragment(&received, xor_data);
 
         // recovered byte 0 = 0x01, bytes 1..2 = 0x00 (padding artifacts)
-        assert_eq!(recovered[0], 0x01, "first byte should match original fragment");
+        assert_eq!(
+            recovered[0], 0x01,
+            "first byte should match original fragment"
+        );
         // The recovered slice has length equal to the max of all inputs (3 bytes here)
         // bytes beyond the original are zero (XOR cancels out)
         assert_eq!(recovered[1], 0x00);
@@ -278,8 +306,10 @@ mod tests {
     fn fec_ratio_for_keyframe_is_higher() {
         let k_iframe = fec_group_size(true);
         let k_pframe = fec_group_size(false);
-        assert!(k_iframe < k_pframe,
-            "I-frame FEC group size ({k_iframe}) should be smaller than P-frame ({k_pframe})");
+        assert!(
+            k_iframe < k_pframe,
+            "I-frame FEC group size ({k_iframe}) should be smaller than P-frame ({k_pframe})"
+        );
     }
 
     #[test]
@@ -288,7 +318,11 @@ mod tests {
         let refs: Vec<&[u8]> = payloads.iter().map(|v| v.as_slice()).collect();
         let k = fec_group_size(true);
         let parity = generate_parity(&refs, k);
-        assert_eq!(parity.len(), 4, "I-frame with K={k} and 8 frags should produce 4 parity groups");
+        assert_eq!(
+            parity.len(),
+            4,
+            "I-frame with K={k} and 8 frags should produce 4 parity groups"
+        );
     }
 
     #[test]
@@ -297,6 +331,10 @@ mod tests {
         let refs: Vec<&[u8]> = payloads.iter().map(|v| v.as_slice()).collect();
         let k = fec_group_size(false);
         let parity = generate_parity(&refs, k);
-        assert_eq!(parity.len(), 2, "P-frame with K={k} and 8 frags should produce 2 parity groups");
+        assert_eq!(
+            parity.len(),
+            2,
+            "P-frame with K={k} and 8 frags should produce 2 parity groups"
+        );
     }
 }
