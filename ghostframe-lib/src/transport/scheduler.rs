@@ -133,6 +133,25 @@ impl Scheduler {
         self.queue.iter().map(|w| (w.tile_x, w.tile_y, w.state)).collect()
     }
 
+    /// Mark matching tile work as `Acked` so the next `tick` drops it.
+    /// Stale-gen acks (gen/pass don't match anything in the queue, or only
+    /// match Superseded entries) are silently ignored — the work is no
+    /// longer in flight.
+    pub fn on_ack(&mut self, tile_x: u8, tile_y: u8, generation: u8, pass: u8) {
+        for work in self.queue.iter_mut() {
+            if work.tile_x == tile_x
+                && work.tile_y == tile_y
+                && work.generation == generation
+                && work.pass_idx == pass
+                && !matches!(work.state, WorkState::Superseded)
+            {
+                work.state = WorkState::Acked;
+                return;
+            }
+        }
+        // No match: ignore.
+    }
+
     /// Drain the queue per the M3.1 single-pass scheduling rule:
     ///
     /// - Drop `Superseded` and `Acked` entries (terminal states).
@@ -309,5 +328,50 @@ mod tests {
         // Third never gets eligibility because the budget check breaks the loop.
         assert_eq!(out.len(), 2, "budget allows whole tiles up to and including the one that crosses the cap");
         assert_eq!(s.queue_len(), 3, "all three are still queued; tick doesn't drop InFlight until ACK or supersede");
+    }
+
+    #[test]
+    fn on_ack_clears_matching_inflight_work() {
+        let mut s = Scheduler::new(4, 4);
+        s.enqueue(TileWork::raw_for_test(1, 2, 0, vec![1]));
+        let _ = s.tick(usize::MAX); // promote to InFlight
+        s.on_ack(1, 2, 0, 0);
+        // Next tick should drop it.
+        let out = s.tick(usize::MAX);
+        assert!(out.is_empty());
+        assert_eq!(s.queue_len(), 0);
+    }
+
+    #[test]
+    fn on_ack_with_wrong_gen_is_a_noop() {
+        let mut s = Scheduler::new(4, 4);
+        s.set_rtt(Duration::from_millis(50)); // long RTT so next tick won't retry
+        s.enqueue(TileWork::raw_for_test(1, 2, 5, vec![1]));
+        let _ = s.tick(usize::MAX);
+        s.on_ack(1, 2, 4, 0); // wrong gen
+        let next = s.tick(usize::MAX); // not yet 2×RTT — empty
+        assert!(next.is_empty());
+        // The work is still queued.
+        assert_eq!(s.queue_len(), 1);
+    }
+
+    #[test]
+    fn on_ack_unknown_tile_does_not_panic() {
+        let mut s = Scheduler::new(4, 4);
+        s.on_ack(7, 7, 0, 0);
+        assert_eq!(s.queue_len(), 0);
+    }
+
+    #[test]
+    fn on_ack_does_not_touch_superseded_work() {
+        let mut s = Scheduler::new(4, 4);
+        s.enqueue(TileWork::raw_for_test(0, 0, 0, vec![1]));
+        s.bump_generation(0, 0); // marks Superseded
+        s.on_ack(0, 0, 0, 0); // would match by tile_x/y/gen/pass — but work is Superseded
+        // The work stays Superseded (not promoted to Acked). Tick still drops it
+        // via the Superseded retain path.
+        let out = s.tick(usize::MAX);
+        assert!(out.is_empty());
+        assert_eq!(s.queue_len(), 0);
     }
 }
