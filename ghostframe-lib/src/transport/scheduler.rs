@@ -97,10 +97,18 @@ impl Scheduler {
         self.generations.get(idx).copied().unwrap_or(0)
     }
 
-    /// Stub — replaced with real impl in Task 6 (this task only needs
-    /// it to compile so the resize test can verify queue clearing).
-    pub fn enqueue(&mut self, work: TileWork) {
+    pub fn enqueue(&mut self, mut work: TileWork) {
+        debug_assert!((work.tile_x as u32) < self.cols, "tile_x out of bounds");
+        debug_assert!((work.tile_y as u32) < self.rows, "tile_y out of bounds");
+        work.queued_at = Instant::now();
+        work.last_sent_at = None;
+        work.state = WorkState::Pending;
         self.queue.push_back(work);
+    }
+
+    #[cfg(test)]
+    pub fn peek_for_test(&self) -> Vec<TileWork> {
+        self.queue.iter().cloned().collect()
     }
 
     pub fn bump_generation(&mut self, tile_x: u8, tile_y: u8) -> u8 {
@@ -181,5 +189,27 @@ mod tests {
         s.bump_generation(1, 2);
         let states = s.queue_states_for_test();
         assert!(states.iter().any(|(x, y, st)| *x == 1 && *y == 2 && *st == WorkState::Superseded));
+    }
+
+    #[test]
+    fn enqueue_normalizes_state_to_pending_and_refreshes_queued_at() {
+        let mut s = Scheduler::new(4, 4);
+        let stale_instant = Instant::now() - Duration::from_secs(10);
+        let before_enqueue = Instant::now();
+        s.enqueue(TileWork {
+            tile_x: 1, tile_y: 2,
+            generation: 0, pass_idx: 0, total_passes: 1,
+            codec: Codec::Raw,
+            payload: vec![1, 2, 3],
+            queued_at: stale_instant,
+            last_sent_at: Some(stale_instant),
+            state: WorkState::Acked, // wrong state — enqueue must normalize
+        });
+        let queued = s.peek_for_test();
+        assert_eq!(queued.len(), 1);
+        let w = &queued[0];
+        assert_eq!(w.state, WorkState::Pending);
+        assert!(w.last_sent_at.is_none());
+        assert!(w.queued_at >= before_enqueue, "queued_at must be refreshed by enqueue");
     }
 }
