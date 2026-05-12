@@ -50,6 +50,26 @@ use crate::transport::webtransport::WebTransportServer;
 /// write a full datagram into this buffer in a single call.
 const QUIC_SCRATCH: usize = 2048;
 
+/// Write GPU-derived per-tile metrics into the tracker for the dirty tiles.
+///
+/// Non-dirty tile entries in `tracker` are untouched. Caller is responsible
+/// for ensuring `tile_analysis.len() >= cols * tracker.rows()` and that
+/// every `(tx, ty)` in `dirty` is within the tracker grid.
+pub(crate) fn populate_gpu_metrics(
+    tracker: &mut crate::tile::MetricsTracker,
+    dirty: &[(u32, u32)],
+    cols: u32,
+    tile_analysis: &[crate::capture::gpu_pipeline::TileAnalysis],
+) {
+    for &(tx, ty) in dirty {
+        let idx = (ty as usize) * (cols as usize) + (tx as usize);
+        let Some(entry) = tile_analysis.get(idx) else { continue; };
+        let m = tracker.get_mut(tx, ty);
+        m.unique_colors = entry.count.min(u16::MAX as u32) as u16;
+        m.edge_density  = entry.edge_density_thou as f32 / 1000.0;
+    }
+}
+
 /// FEC parity defaults — enable when loss exceeds this threshold.
 const FEC_ENABLE_THRESHOLD: f64 = 0.005;
 /// FEC parity defaults — disable when loss drops below this threshold (hysteresis).
@@ -578,6 +598,16 @@ impl IoBridge {
         // Always update per-tile metrics — idle_frames advances on every frame,
         // EMA decays toward 0 when tiles aren't dirty.
         self.metrics_tracker.record_frame(&dirty_xy);
+
+        // Populate GPU-derived metrics (unique_colors, edge_density) for the dirty
+        // tiles from the tile_analysis buffer. The classifier rule for PalRLE
+        // (and Solid, post-M3.1) reads these.
+        populate_gpu_metrics(
+            &mut self.metrics_tracker,
+            &dirty_xy,
+            cols,
+            analysis.tile_analysis_slice(),
+        );
 
         // Classify each dirty tile. Empty dirty_xy → empty tentative — that's
         // the no-motion signal the classifier needs to exit H264 after exit_sustain.
@@ -1557,5 +1587,49 @@ mod tests {
         assert_eq!(queued[0].codec, Codec::Solid);
         assert_eq!(queued[0].payload.len(), 4, "Solid is 4 bytes BGRA");
         assert_eq!(queued[0].state, WorkState::InFlight);
+    }
+
+    #[test]
+    fn populate_gpu_metrics_writes_unique_colors_and_edge_density() {
+        use crate::capture::gpu_pipeline::TileAnalysis;
+        use crate::tile::MetricsTracker;
+
+        let mut tracker = MetricsTracker::new(2, 1);
+        let analysis = vec![
+            TileAnalysis { count: 1, edge_density_thou: 0, _pad: [0; 2], colors: [0; 16] },
+            TileAnalysis { count: 17, edge_density_thou: 850, _pad: [0; 2], colors: [0; 16] },
+        ];
+        let dirty: Vec<(u32, u32)> = vec![(0, 0), (1, 0)];
+
+        super::populate_gpu_metrics(&mut tracker, &dirty, 2, &analysis);
+
+        assert_eq!(tracker.get(0, 0).unique_colors, 1);
+        assert!(tracker.get(0, 0).edge_density.abs() < 1e-6);
+
+        assert_eq!(tracker.get(1, 0).unique_colors, 17);
+        assert!((tracker.get(1, 0).edge_density - 0.850).abs() < 1e-6);
+    }
+
+    #[test]
+    fn populate_gpu_metrics_skips_non_dirty_tiles() {
+        use crate::capture::gpu_pipeline::TileAnalysis;
+        use crate::tile::MetricsTracker;
+
+        let mut tracker = MetricsTracker::new(2, 1);
+        // Pre-seed tile (1,0) to a known sentinel so we can prove it stayed.
+        tracker.get_mut(1, 0).unique_colors = u16::MAX;
+        tracker.get_mut(1, 0).edge_density  = f32::NAN;
+
+        let analysis = vec![
+            TileAnalysis { count: 5, edge_density_thou: 100, _pad: [0; 2], colors: [0; 16] },
+            TileAnalysis { count: 9, edge_density_thou: 200, _pad: [0; 2], colors: [0; 16] },
+        ];
+        // Only (0,0) is dirty.
+        let dirty: Vec<(u32, u32)> = vec![(0, 0)];
+        super::populate_gpu_metrics(&mut tracker, &dirty, 2, &analysis);
+
+        assert_eq!(tracker.get(0, 0).unique_colors, 5);
+        assert_eq!(tracker.get(1, 0).unique_colors, u16::MAX, "non-dirty tile untouched");
+        assert!(tracker.get(1, 0).edge_density.is_nan(), "non-dirty tile untouched");
     }
 }
