@@ -917,6 +917,7 @@ impl IoBridge {
                             self.dirty_tracker.reset();
                             self.metrics_tracker.reset();
                             self.classifier.reset();
+                            self.scheduler.clear();
                             self.frame_mode = crate::tile::FrameMode::H264;
                             // `force_dirty_frames` is consumed only by
                             // `process_frame_cpu` (no_commit slow-start mitigation).

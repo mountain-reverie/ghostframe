@@ -84,6 +84,14 @@ impl Scheduler {
         self.queue.clear();
     }
 
+    /// Drain all pending and in-flight work. Generations are preserved so
+    /// any late ACKs from the prior session still no-op cleanly (their
+    /// matching work is gone). Called on session reconnect to prevent stale
+    /// work from polluting the new client's first tick.
+    pub fn clear(&mut self) {
+        self.queue.clear();
+    }
+
     pub fn set_rtt(&mut self, rtt: Duration) {
         self.rtt = rtt;
     }
@@ -359,6 +367,24 @@ mod tests {
     fn on_ack_unknown_tile_does_not_panic() {
         let mut s = Scheduler::new(4, 4);
         s.on_ack(7, 7, 0, 0);
+        assert_eq!(s.queue_len(), 0);
+    }
+
+    #[test]
+    fn clear_drains_queue_but_preserves_generations() {
+        let mut s = Scheduler::new(4, 4);
+        s.bump_generation(1, 2); // gen = 1
+        s.bump_generation(1, 2); // gen = 2
+        s.enqueue(TileWork::raw_for_test(1, 2, 2, vec![1, 2]));
+        s.enqueue(TileWork::raw_for_test(0, 0, 0, vec![3, 4]));
+        assert_eq!(s.queue_len(), 2);
+        s.clear();
+        assert_eq!(s.queue_len(), 0);
+        // Generations survive so stale-gen ACKs from prior session are still
+        // distinguishable from current-gen work in any new tile we enqueue.
+        assert_eq!(s.generation_for(1, 2), 2);
+        // A stale ACK against the cleared work is a noop (no matching entry).
+        s.on_ack(1, 2, 2, 0);
         assert_eq!(s.queue_len(), 0);
     }
 
