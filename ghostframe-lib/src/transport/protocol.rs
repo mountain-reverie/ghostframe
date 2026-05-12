@@ -179,15 +179,12 @@ pub fn fragment_tile(
     tile_x: u8,
     tile_y: u8,
     codec: Codec,
+    generation: u8,
+    pass: u8,
     payload: &[u8],
     timestamp_us: u32,
     max_fragment_payload: usize,
 ) -> Vec<Vec<u8>> {
-    // NOTE: TileHeader constructed here uses generation=0, pass=0. Sites that
-    // need real generation/pass values byte-patch `dg[DATAGRAM_HEADER_SIZE + 3]`
-    // after this returns (see io_bridge.rs::process_frame_cpu and
-    // process_frame_gpu). If you change the byte [3] format, update both
-    // patch sites.
     assert!(
         max_fragment_payload > 0,
         "max_fragment_payload must be > 0; got 0 (datagram size too small to fit headers)"
@@ -217,8 +214,8 @@ pub fn fragment_tile(
                 tile_y,
                 codec,
                 lz4: false,
-                generation: 0,
-                pass: 0,
+                generation,
+                pass,
                 payload_len: payload.len() as u32,
             };
             let mut buf = Vec::with_capacity(DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE + chunk.len());
@@ -650,7 +647,7 @@ mod tests {
     #[test]
     fn encode_tile_datagram_single_fragment() {
         let payload = vec![0xABu8; 100];
-        let datagrams = fragment_tile(1, 2, 3, Codec::Raw, &payload, 5000, 1200);
+        let datagrams = fragment_tile(1, 2, 3, Codec::Raw, 0, 0, &payload, 5000, 1200);
         assert_eq!(datagrams.len(), 1);
 
         let dg = &datagrams[0];
@@ -673,7 +670,7 @@ mod tests {
     fn fragment_tile_multiple_fragments() {
         let payload: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
         let max_frag = 1200;
-        let datagrams = fragment_tile(7, 0, 0, Codec::H264, &payload, 999, max_frag);
+        let datagrams = fragment_tile(7, 0, 0, Codec::H264, 0, 0, &payload, 999, max_frag);
 
         // ceil(4096 / 1200) = 4
         assert_eq!(datagrams.len(), 4);
@@ -698,7 +695,7 @@ mod tests {
 
     #[test]
     fn fragment_tile_empty_payload_skip_codec() {
-        let datagrams = fragment_tile(0, 0, 0, Codec::Skip, &[], 0, 1200);
+        let datagrams = fragment_tile(0, 0, 0, Codec::Skip, 0, 0, &[], 0, 1200);
         assert_eq!(datagrams.len(), 1);
 
         let (dh, th, frag_payload) = decode_tile_datagram(&datagrams[0]).unwrap();
@@ -732,7 +729,7 @@ mod tests {
         let k = 4;
 
         // Generate source datagrams
-        let source_dgs = fragment_tile(7, 2, 3, Codec::H264, &payload, 999, max_frag);
+        let source_dgs = fragment_tile(7, 2, 3, Codec::H264, 0, 0, &payload, 999, max_frag);
         let frag_total = source_dgs.len();
         assert_eq!(frag_total, 4); // ceil(4096/1200) = 4
 

@@ -40,7 +40,7 @@ use crate::transport::feedback::ReceiverFeedback;
 use crate::transport::protocol::{
     build_frame_parity_datagram, Codec, fragment_frame, fragment_tile,
     max_fragment_payload, max_frame_fragment_payload, FrameHeader, NackMessage,
-    DATAGRAM_HEADER_SIZE, FRAME_HEADER_SIZE, PING_PAYLOAD, PONG_PAYLOAD, TILE_DATAGRAM_FLAG,
+    FRAME_HEADER_SIZE, PING_PAYLOAD, PONG_PAYLOAD, TILE_DATAGRAM_FLAG,
 };
 use crate::transport::quic::QuicServer;
 use crate::transport::webtransport::WebTransportServer;
@@ -103,6 +103,16 @@ pub struct IoBridge {
     full_frame_encoder: Option<FullFrameEncoder>,
     /// Recent frame fragments for NACK retransmission. Key: (frame_seq, frag_idx).
     recent_frame_fragments: HashMap<(u32, u16), Vec<u8>>,
+}
+
+/// Selects how `dispatch_dirty_tiles_via_scheduler` picks a codec per tile.
+pub(crate) enum SchedulerEmissionPolicy {
+    /// CPU path: every tile emits `Codec::Raw` regardless of classifier state.
+    /// M3.1 D1 keeps the classifier sentinel-gated; this is the actual behavior.
+    CpuRawOnly,
+    /// GPU path: per-tile `CodecState` drives codec choice. `CodecState::Solid`
+    /// → `encode_solid`; everything else → `Codec::Raw`.
+    GpuClassifierDriven,
 }
 
 impl IoBridge {
@@ -260,6 +270,88 @@ impl IoBridge {
         }
     }
 
+    /// Shared scheduler dispatch: grid-sync → RTT update → bump+encode+enqueue
+    /// per dirty tile → tick → fragment+send. Called by both `process_frame_cpu`
+    /// and `process_frame_gpu`'s `FrameMode::TileCodec` branch.
+    pub(crate) fn dispatch_dirty_tiles_via_scheduler(
+        &mut self,
+        dirty: &[(u32, u32)],
+        grid: &crate::tile::TileGrid,
+        pixels: &[u8],
+        stride: u32,
+        seq: u32,
+        timestamp_us: u32,
+        max_frag: usize,
+        policy: SchedulerEmissionPolicy,
+    ) {
+        // Grid sync — keep scheduler in lockstep with the dirty-detection grid.
+        if self.scheduler.cols() != grid.cols || self.scheduler.rows() != grid.rows {
+            self.scheduler.resize(grid.cols, grid.rows);
+        }
+
+        // RTT estimate across connected sessions; default to 20 ms if none.
+        let rtt = self.server.connections.values()
+            .map(|c| c.stats().path.rtt)
+            .min()
+            .unwrap_or_else(|| std::time::Duration::from_millis(20));
+        self.scheduler.set_rtt(rtt);
+
+        use crate::transport::scheduler::{TileWork, WorkState};
+        use std::time::Instant;
+
+        for &(tile_x, tile_y) in dirty {
+            self.scheduler.bump_generation(tile_x as u8, tile_y as u8);
+            let gen = self.scheduler.generation_for(tile_x as u8, tile_y as u8);
+            let tile_data = grid.extract_tile(pixels, stride, tile_x, tile_y);
+
+            let (codec, payload) = match policy {
+                SchedulerEmissionPolicy::CpuRawOnly => (Codec::Raw, tile_data),
+                SchedulerEmissionPolicy::GpuClassifierDriven => {
+                    use crate::tile::CodecState;
+                    let codec_state = self.metrics_tracker.get(tile_x, tile_y).codec_state;
+                    match codec_state {
+                        CodecState::Solid => {
+                            let solid = crate::encoder::solid::encode_solid(&tile_data);
+                            (Codec::Solid, solid.to_vec())
+                        }
+                        _ => (Codec::Raw, tile_data),
+                    }
+                }
+            };
+
+            self.scheduler.enqueue(TileWork {
+                tile_x: tile_x as u8,
+                tile_y: tile_y as u8,
+                generation: gen,
+                pass_idx: 0,
+                total_passes: 1,
+                codec,
+                payload,
+                queued_at: Instant::now(),
+                last_sent_at: None,
+                state: WorkState::Pending,
+            });
+        }
+
+        let drained = self.scheduler.tick(usize::MAX);
+        for work in drained {
+            let datagrams = fragment_tile(
+                seq | TILE_DATAGRAM_FLAG,
+                work.tile_x,
+                work.tile_y,
+                work.codec,
+                work.generation,
+                work.pass_idx,
+                &work.payload,
+                timestamp_us,
+                max_frag,
+            );
+            for dg in &datagrams {
+                self.send_to_all_sessions(dg);
+            }
+        }
+    }
+
     /// Route a single inbound datagram into the appropriate handler.
     /// Currently dispatches ACK_BATCH_MSG_TYPE; future M3.x message types
     /// can be added here. Unknown discriminators are silently dropped
@@ -370,56 +462,23 @@ impl IoBridge {
             return;
         }
 
-        // Route emission through the Scheduler — same pattern as the GPU path's
-        // TileCodec branch. M3.1: CPU path emits Codec::Raw exclusively because
-        // classifier rules are sentinel-gated (D1) until M3.3 GPU compute lands.
+        // Also sync metrics_tracker grid so it stays aligned with dirty_tracker.
         if self.metrics_tracker.cols() != grid.cols || self.metrics_tracker.rows() != grid.rows {
             self.metrics_tracker.resize(grid.cols, grid.rows);
-            self.scheduler.resize(grid.cols, grid.rows);
         }
 
-        let rtt = self.server.connections.values()
-            .map(|c| c.stats().path.rtt)
-            .min()
-            .unwrap_or_else(|| std::time::Duration::from_millis(20));
-        self.scheduler.set_rtt(rtt);
-
-        use crate::transport::scheduler::{TileWork, WorkState};
-        use std::time::Instant;
-        for &(tile_x, tile_y) in &dirty_tiles {
-            self.scheduler.bump_generation(tile_x as u8, tile_y as u8);
-            let gen = self.scheduler.generation_for(tile_x as u8, tile_y as u8);
-            let tile_data = grid.extract_tile(&frame.pixels, frame.stride, tile_x, tile_y);
-            self.scheduler.enqueue(TileWork {
-                tile_x: tile_x as u8,
-                tile_y: tile_y as u8,
-                generation: gen,
-                pass_idx: 0,
-                total_passes: 1,
-                codec: Codec::Raw,
-                payload: tile_data,
-                queued_at: Instant::now(),
-                last_sent_at: None,
-                state: WorkState::Pending,
-            });
-        }
-
-        let drained = self.scheduler.tick(usize::MAX);
-        for work in drained {
-            let datagrams = fragment_tile(
-                seq | TILE_DATAGRAM_FLAG,
-                work.tile_x, work.tile_y,
-                work.codec, &work.payload,
-                frame.timestamp_us, max_frag,
-            );
-            let header_byte = ((work.generation & 0x0F) << 4) | (work.pass_idx & 0x0F);
-            for mut dg in datagrams {
-                debug_assert!(dg.len() > DATAGRAM_HEADER_SIZE + 3,
-                    "fragment_tile must return datagrams with full headers");
-                dg[DATAGRAM_HEADER_SIZE + 3] = header_byte;
-                self.send_to_all_sessions(&dg);
-            }
-        }
+        // Route through the shared scheduler-dispatch helper. CPU path emits
+        // Codec::Raw per M3.1 D1 (classifier sentinel-gated).
+        self.dispatch_dirty_tiles_via_scheduler(
+            &dirty_tiles,
+            &grid,
+            &frame.pixels,
+            frame.stride,
+            seq,
+            frame.timestamp_us,
+            max_frag,
+            SchedulerEmissionPolicy::CpuRawOnly,
+        );
     }
 
     /// GPU-accelerated full-frame pipeline: Vulkan compute dirty detection +
@@ -639,70 +698,16 @@ impl IoBridge {
 
                 let grid = TileGrid::new(frame.width, frame.height);
 
-                // Best available RTT estimate across connected sessions.
-                let rtt = self.server.connections.values()
-                    .map(|c| c.stats().path.rtt)
-                    .min()
-                    .unwrap_or_else(|| std::time::Duration::from_millis(20));
-                self.scheduler.set_rtt(rtt);
-
-                use crate::encoder::solid::encode_solid;
-                use crate::tile::CodecState;
-                use crate::transport::scheduler::{TileWork, WorkState};
-                use std::time::Instant;
-                for &(tile_x, tile_y) in &dirty_xy {
-                    self.scheduler.bump_generation(tile_x as u8, tile_y as u8);
-                    let gen = self.scheduler.generation_for(tile_x as u8, tile_y as u8);
-                    let codec_state = self.metrics_tracker.get(tile_x, tile_y).codec_state;
-                    let (codec, payload) = match codec_state {
-                        CodecState::Solid => {
-                            let td = grid.extract_tile(pixels, frame.stride, tile_x, tile_y);
-                            let solid = encode_solid(&td);
-                            (Codec::Solid, solid.to_vec())
-                        }
-                        // All other states emit Raw via the scheduler in M3.1.
-                        // Real per-tile codecs (PalRle, Bc1, Cdf53) arrive in M3.2+.
-                        _ => {
-                            let td = grid.extract_tile(pixels, frame.stride, tile_x, tile_y);
-                            (Codec::Raw, td)
-                        }
-                    };
-                    self.scheduler.enqueue(TileWork {
-                        tile_x: tile_x as u8,
-                        tile_y: tile_y as u8,
-                        generation: gen,
-                        pass_idx: 0,
-                        total_passes: 1,
-                        codec,
-                        payload,
-                        queued_at: Instant::now(),
-                        last_sent_at: None,
-                        state: WorkState::Pending,
-                    });
-                }
-
-                let drained = self.scheduler.tick(usize::MAX);
-                for work in drained {
-                    let datagrams = fragment_tile(
-                        seq | TILE_DATAGRAM_FLAG,
-                        work.tile_x,
-                        work.tile_y,
-                        work.codec,
-                        &work.payload,
-                        frame.timestamp_us,
-                        max_frag,
-                    );
-                    // fragment_tile constructs TileHeader with generation=0, pass=0
-                    // (per its current signature). Patch byte [3] of each datagram
-                    // to carry our actual gen/pass. This is byte (DATAGRAM_HEADER_SIZE + 3).
-                    let header_byte = ((work.generation & 0x0F) << 4) | (work.pass_idx & 0x0F);
-                    for mut dg in datagrams {
-                        debug_assert!(dg.len() > DATAGRAM_HEADER_SIZE + 3,
-                            "fragment_tile must return datagrams with full headers");
-                        dg[DATAGRAM_HEADER_SIZE + 3] = header_byte;
-                        self.send_to_all_sessions(&dg);
-                    }
-                }
+                self.dispatch_dirty_tiles_via_scheduler(
+                    &dirty_xy,
+                    &grid,
+                    pixels,
+                    frame.stride,
+                    seq,
+                    frame.timestamp_us,
+                    max_frag,
+                    SchedulerEmissionPolicy::GpuClassifierDriven,
+                );
             }
         }
     }
@@ -1405,5 +1410,70 @@ mod tests {
         bridge.dispatch_ack_datagram(&[]);
         bridge.dispatch_ack_datagram(&[0xFF, 0x00, 0x00]);
         bridge.dispatch_ack_datagram(&[0x01, 0, 0]); // FEEDBACK_MSG_TYPE — unrelated
+    }
+
+    /// dispatch_dirty_tiles_via_scheduler enqueues the right work in the
+    /// right codec/state for the CPU policy, even without a connected
+    /// session. This is the "Gap 3" fix from the final M3.1 review.
+    #[tokio::test]
+    async fn dispatch_via_scheduler_cpu_policy_enqueues_raw_tiles() {
+        use crate::transport::scheduler::WorkState;
+        let (our_end, _peer) = UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("server");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+
+        let pixels = vec![0xAAu8; 64 * 64 * 4];
+        let grid = crate::tile::TileGrid::new(64, 64);
+        let dirty = vec![(0u32, 0u32), (1, 1)];
+
+        bridge.dispatch_dirty_tiles_via_scheduler(
+            &dirty,
+            &grid,
+            &pixels,
+            64 * 4,
+            /* seq */ 1,
+            /* timestamp_us */ 0,
+            /* max_frag */ 1200,
+            SchedulerEmissionPolicy::CpuRawOnly,
+        );
+
+        let queued = bridge.scheduler.peek_for_test();
+        assert_eq!(queued.len(), 2, "scheduler must hold both dirty tiles");
+        for w in &queued {
+            assert_eq!(w.state, WorkState::InFlight, "tick should have promoted");
+            assert_eq!(w.codec, Codec::Raw, "CPU policy emits Raw only");
+            assert_eq!(w.pass_idx, 0);
+        }
+    }
+
+    /// dispatch_dirty_tiles_via_scheduler emits Solid bytes when the GPU policy
+    /// reads CodecState::Solid for a tile.
+    #[tokio::test]
+    async fn dispatch_via_scheduler_gpu_policy_emits_solid_for_solid_state() {
+        use crate::transport::scheduler::WorkState;
+        use crate::tile::CodecState;
+        let (our_end, _peer) = UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("server");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+        bridge.scheduler.resize(2, 2);
+        bridge.metrics_tracker.resize(2, 2);
+        bridge.metrics_tracker.get_mut(0, 0).codec_state = CodecState::Solid;
+
+        let pixels = vec![0xBBu8; 64 * 64 * 4];
+        let grid = crate::tile::TileGrid::new(64, 64);
+        let dirty = vec![(0u32, 0u32)];
+
+        bridge.dispatch_dirty_tiles_via_scheduler(
+            &dirty, &grid, &pixels, 64 * 4, 1, 0, 1200,
+            SchedulerEmissionPolicy::GpuClassifierDriven,
+        );
+
+        let queued = bridge.scheduler.peek_for_test();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].codec, Codec::Solid);
+        assert_eq!(queued[0].payload.len(), 4, "Solid is 4 bytes BGRA");
+        assert_eq!(queued[0].state, WorkState::InFlight);
     }
 }
