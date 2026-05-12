@@ -605,9 +605,29 @@ mod tests {
     }
 
     #[test]
-    fn tile_header_pass_clipped_to_4_bits() {
+    fn tile_header_decode_max_nibble_values() {
         // Decoding a byte with gen=15, pass=15 yields the max values.
         let buf = vec![0, 0, 0, 0xFF, 0, 0, 0, 4];
+        let decoded = TileHeader::decode(&buf).unwrap();
+        assert_eq!(decoded.generation, 15);
+        assert_eq!(decoded.pass, 15);
+    }
+
+    #[test]
+    fn tile_header_encode_clips_generation_and_pass_to_4_bits() {
+        // generation=0x1F and pass=0x1F should both clip to 0x0F on the wire.
+        let h = TileHeader {
+            tile_x: 0,
+            tile_y: 0,
+            codec: Codec::Raw,
+            lz4: false,
+            generation: 0x1F,
+            pass: 0x1F,
+            payload_len: 0,
+        };
+        let mut buf = Vec::new();
+        h.encode(&mut buf);
+        assert_eq!(buf[3], 0xFF, "both nibbles must clip to 0x0F");
         let decoded = TileHeader::decode(&buf).unwrap();
         assert_eq!(decoded.generation, 15);
         assert_eq!(decoded.pass, 15);
