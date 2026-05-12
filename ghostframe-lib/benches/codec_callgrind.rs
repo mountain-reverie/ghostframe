@@ -58,6 +58,7 @@ fn tile_header_encode_decode() {
         codec: Codec::H264,
         lz4: false,
         generation: 1,
+        pass: 0,
         payload_len: 1024,
     };
     let mut buf = Vec::with_capacity(TILE_HEADER_SIZE);

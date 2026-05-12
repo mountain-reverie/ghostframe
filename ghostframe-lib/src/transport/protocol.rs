@@ -119,7 +119,7 @@ impl DatagramHeader {
 //   [0]    tile_x
 //   [1]    tile_y
 //   [2]    (codec << 1) | lz4
-//   [3]    generation
+//   [3]    (generation: u4) << 4 | (pass: u4)
 //   [4..8] payload_len: u32 BE
 // ---------------------------------------------------------------------------
 
@@ -129,7 +129,8 @@ pub struct TileHeader {
     pub tile_y: u8,
     pub codec: Codec,
     pub lz4: bool,
-    pub generation: u8,
+    pub generation: u8, // 4 bits effective (0..=15)
+    pub pass: u8,       // 4 bits effective (0..=15)
     pub payload_len: u32,
 }
 
@@ -138,7 +139,7 @@ impl TileHeader {
         buf.push(self.tile_x);
         buf.push(self.tile_y);
         buf.push(((self.codec as u8) << 1) | (self.lz4 as u8));
-        buf.push(self.generation);
+        buf.push(((self.generation & 0x0F) << 4) | (self.pass & 0x0F));
         buf.extend_from_slice(&self.payload_len.to_be_bytes());
     }
 
@@ -152,12 +153,14 @@ impl TileHeader {
         let packed = data[2];
         let codec = Codec::from_u8(packed >> 1)?;
         let lz4 = (packed & 1) != 0;
+        let gen_pass = data[3];
         Ok(TileHeader {
             tile_x: data[0],
             tile_y: data[1],
             codec,
             lz4,
-            generation: data[3],
+            generation: gen_pass >> 4,
+            pass: gen_pass & 0x0F,
             payload_len: u32::from_be_bytes(data[4..8].try_into().unwrap()),
         })
     }
@@ -210,6 +213,7 @@ pub fn fragment_tile(
                 codec,
                 lz4: false,
                 generation: 0,
+                pass: 0,
                 payload_len: payload.len() as u32,
             };
             let mut buf = Vec::with_capacity(DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE + chunk.len());
@@ -271,6 +275,7 @@ pub fn build_parity_datagrams(
                 codec,
                 lz4: false,
                 generation: 0,
+                pass: 0,
                 payload_len: 0, // not meaningful for parity
             };
             let mut buf = Vec::with_capacity(
@@ -546,7 +551,8 @@ mod tests {
             tile_y: 3,
             codec: Codec::H264,
             lz4: false,
-            generation: 42,
+            generation: 10,
+            pass: 0,
             payload_len: 99_999,
         };
         let mut buf = Vec::new();
@@ -565,6 +571,7 @@ mod tests {
             codec: Codec::Raw,
             lz4: true,
             generation: 0,
+            pass: 0,
             payload_len: 0,
         };
         let mut buf = Vec::new();
@@ -574,6 +581,45 @@ mod tests {
         let decoded = TileHeader::decode(&buf).unwrap();
         assert_eq!(decoded.codec, Codec::Raw);
         assert!(decoded.lz4);
+    }
+
+    #[test]
+    fn tile_header_gen_pass_packing_roundtrip() {
+        let original = TileHeader {
+            tile_x: 1,
+            tile_y: 2,
+            codec: Codec::Solid,
+            lz4: false,
+            generation: 5,
+            pass: 9,
+            payload_len: 4,
+        };
+        let mut buf = Vec::new();
+        original.encode(&mut buf);
+        // Byte [3] must be (5 << 4) | 9 = 0x59
+        assert_eq!(buf[3], 0x59);
+        let decoded = TileHeader::decode(&buf).unwrap();
+        assert_eq!(decoded.generation, 5);
+        assert_eq!(decoded.pass, 9);
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn tile_header_pass_clipped_to_4_bits() {
+        // Decoding a byte with gen=15, pass=15 yields the max values.
+        let buf = vec![0, 0, 0, 0xFF, 0, 0, 0, 4];
+        let decoded = TileHeader::decode(&buf).unwrap();
+        assert_eq!(decoded.generation, 15);
+        assert_eq!(decoded.pass, 15);
+    }
+
+    #[test]
+    fn tile_header_legacy_generation_zero_decodes_as_pass_zero() {
+        // Existing M2 wire format with generation=0 must decode as gen=0, pass=0.
+        let buf = vec![3, 4, 0, 0x00, 0, 0, 0, 0];
+        let decoded = TileHeader::decode(&buf).unwrap();
+        assert_eq!(decoded.generation, 0);
+        assert_eq!(decoded.pass, 0);
     }
 
     #[test]
