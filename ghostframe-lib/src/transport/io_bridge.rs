@@ -52,9 +52,10 @@ const QUIC_SCRATCH: usize = 2048;
 
 /// Write GPU-derived per-tile metrics into the tracker for the dirty tiles.
 ///
-/// Non-dirty tile entries in `tracker` are untouched. Caller is responsible
-/// for ensuring `tile_analysis.len() >= cols * tracker.rows()` and that
-/// every `(tx, ty)` in `dirty` is within the tracker grid.
+/// Non-dirty tile entries in `tracker` are untouched. If a computed index
+/// falls outside `tile_analysis`, that tile is silently skipped — this is
+/// what makes the first-frame path safe to call with an empty slice.
+/// Caller must ensure every `(tx, ty)` in `dirty` is within the tracker grid.
 pub(crate) fn populate_gpu_metrics(
     tracker: &mut crate::tile::MetricsTracker,
     dirty: &[(u32, u32)],

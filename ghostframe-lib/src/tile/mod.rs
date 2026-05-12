@@ -33,11 +33,13 @@ pub struct TileMetrics {
     pub change_magnitude: f32,
 
     /// Approximate distinct color count from a hash-based GPU estimator.
-    /// In M3.0 always `UNIQUE_COLORS_UNKNOWN`; populated in M3.3.
+    /// On the CPU path stays at `UNIQUE_COLORS_UNKNOWN`; populated on the GPU
+    /// path by `tile_analysis.comp` (pre-M3.2 phase onwards).
     pub unique_colors: u16,
 
-    /// Fraction of pixels with high gradient. In M3.0 always `EDGE_DENSITY_UNKNOWN`;
-    /// populated in M3.3.
+    /// Fraction of pixels with high gradient. On the CPU path stays at
+    /// `EDGE_DENSITY_UNKNOWN`; populated on the GPU path by `tile_analysis.comp`
+    /// (pre-M3.2 phase onwards).
     pub edge_density: f32,
 
     /// Consecutive frames this tile has been clean (not in the dirty set).
