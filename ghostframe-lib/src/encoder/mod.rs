@@ -1,6 +1,7 @@
 //! Tile encoding: converts raw BGRA tile data into compressed payloads.
 
 pub mod h264_vaapi;
+pub mod solid;
 
 use crate::transport::protocol::Codec;
 
