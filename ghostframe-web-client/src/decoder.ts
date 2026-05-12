@@ -18,7 +18,8 @@ export interface TileHeader {
   tileY: number;
   codec: Codec;
   lz4: boolean;
-  generation: number;
+  generation: number; // 4 bits effective (0..=15)
+  pass: number;       // 4 bits effective (0..=15)
   payloadLen: number;
 }
 
@@ -38,7 +39,8 @@ export function decodeTileHeader(view: DataView, offset: number): TileHeader {
     tileY: view.getUint8(offset + 1),
     codec: (codecLz4 >> 1) as Codec,
     lz4: (codecLz4 & 1) !== 0,
-    generation: view.getUint8(offset + 3),
+    generation: view.getUint8(offset + 3) >> 4,
+    pass: view.getUint8(offset + 3) & 0x0F,
     payloadLen: view.getUint32(offset + 4, false),
   };
 }
