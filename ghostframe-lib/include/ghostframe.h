@@ -3,6 +3,10 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+#define ACK_BATCH_MSG_TYPE 2
+
+#define MAX_ACK_ENTRIES_PER_BATCH 64
+
 /**
  * Size of the parity packet header in bytes:
  *   - group_start: u16 BE (2 bytes)

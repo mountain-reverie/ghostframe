@@ -30,16 +30,21 @@ if [[ "${TEST_PATTERN:-}" == *--drm-direct* ]]; then
 fi
 
 # If XORG_CONF is unset, auto-detect the right config:
-#   - /etc/X11/xorg-vkms.conf if /dev/dri/card0 is a VKMS device
-#     (presence-of-Writeback connector heuristic).
+#   - /etc/X11/xorg-vkms.conf if /dev/dri/card0 is accessible IN the
+#     container AND the host sysfs shows a Writeback-1 connector on it.
+#     Both conditions must be true: the writeback-connector sysfs entry
+#     visible via the host-mounted /sys can be seen even when /dev/dri is
+#     NOT bind-mounted into the container, so checking /sys alone causes
+#     false positives when the host has vkms loaded but the test doesn't
+#     use a GPU bind-mount (i.e. all non-GPU e2e tests).
 #   - /etc/X11/xorg.conf (Driver "dummy") otherwise.
 if [ -z "${XORG_CONF:-}" ]; then
-    if [ -e /sys/class/drm/card0-Writeback-1 ]; then
+    if [ -e /dev/dri/card0 ] && [ -e /sys/class/drm/card0-Writeback-1 ]; then
         XORG_CONF=/etc/X11/xorg-vkms.conf
-        echo "entrypoint: detected VKMS card0 (writeback connector) — using xorg-vkms.conf"
+        echo "entrypoint: detected VKMS card0 (writeback connector, /dev/dri/card0 present) — using xorg-vkms.conf"
     else
         XORG_CONF=/etc/X11/xorg.conf
-        echo "entrypoint: no VKMS detected — using xorg.conf (dummy driver)"
+        echo "entrypoint: no VKMS DRM device in container — using xorg.conf (dummy driver)"
     fi
 fi
 
