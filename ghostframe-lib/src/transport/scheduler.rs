@@ -132,6 +132,42 @@ impl Scheduler {
     pub fn queue_states_for_test(&self) -> Vec<(u8, u8, WorkState)> {
         self.queue.iter().map(|w| (w.tile_x, w.tile_y, w.state)).collect()
     }
+
+    /// Drain the queue per the M3.1 single-pass scheduling rule:
+    /// - Drop `Superseded` and `Acked` entries.
+    /// - Return `Pending` and `InFlight`-past-retry items, up to `budget_bytes`.
+    /// Returned items are promoted to `InFlight` with `last_sent_at = now`.
+    pub fn tick(&mut self, budget_bytes: usize) -> Vec<TileWork> {
+        let now = Instant::now();
+        let retry_after = 2 * self.rtt;
+
+        // First pass: drop terminal-state entries.
+        self.queue.retain(|w| !matches!(w.state, WorkState::Superseded | WorkState::Acked));
+
+        let mut out = Vec::new();
+        let mut spent = 0usize;
+        for work in self.queue.iter_mut() {
+            let eligible = match work.state {
+                WorkState::Pending => true,
+                WorkState::InFlight => work
+                    .last_sent_at
+                    .map(|t| now.duration_since(t) >= retry_after)
+                    .unwrap_or(true),
+                _ => false,
+            };
+            if !eligible {
+                continue;
+            }
+            if spent >= budget_bytes {
+                break;
+            }
+            work.state = WorkState::InFlight;
+            work.last_sent_at = Some(now);
+            spent = spent.saturating_add(work.payload.len());
+            out.push(work.clone());
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -211,5 +247,59 @@ mod tests {
         assert_eq!(w.state, WorkState::Pending);
         assert!(w.last_sent_at.is_none());
         assert!(w.queued_at >= before_enqueue, "queued_at must be refreshed by enqueue");
+    }
+
+    #[test]
+    fn tick_returns_pending_and_promotes_to_inflight() {
+        let mut s = Scheduler::new(4, 4);
+        s.enqueue(TileWork::raw_for_test(0, 0, 0, vec![1, 2, 3]));
+        s.enqueue(TileWork::raw_for_test(1, 0, 0, vec![4, 5, 6]));
+        let out = s.tick(usize::MAX);
+        assert_eq!(out.len(), 2);
+        for w in &s.peek_for_test() {
+            assert_eq!(w.state, WorkState::InFlight);
+            assert!(w.last_sent_at.is_some());
+        }
+    }
+
+    #[test]
+    fn tick_drops_superseded_entries() {
+        let mut s = Scheduler::new(4, 4);
+        s.enqueue(TileWork::raw_for_test(0, 0, 0, vec![1]));
+        s.bump_generation(0, 0); // marks the work Superseded
+        let out = s.tick(usize::MAX);
+        assert!(out.is_empty());
+        assert_eq!(s.queue_len(), 0);
+    }
+
+    #[test]
+    fn tick_retries_inflight_after_2x_rtt() {
+        let mut s = Scheduler::new(4, 4);
+        s.set_rtt(Duration::from_millis(1));
+        s.enqueue(TileWork::raw_for_test(0, 0, 0, vec![1]));
+        let first = s.tick(usize::MAX);
+        assert_eq!(first.len(), 1);
+
+        // Immediately ticking again — within 2×RTT, no retry.
+        let second = s.tick(usize::MAX);
+        assert!(second.is_empty());
+
+        std::thread::sleep(Duration::from_millis(3));
+        let third = s.tick(usize::MAX);
+        assert_eq!(third.len(), 1, "InFlight work should retry after 2×RTT");
+    }
+
+    #[test]
+    fn tick_respects_budget_bytes() {
+        let mut s = Scheduler::new(4, 4);
+        s.enqueue(TileWork::raw_for_test(0, 0, 0, vec![0; 100]));
+        s.enqueue(TileWork::raw_for_test(1, 0, 0, vec![0; 100]));
+        s.enqueue(TileWork::raw_for_test(2, 0, 0, vec![0; 100]));
+        let out = s.tick(150);
+        // First (100) fits; second (cumulative 200) crosses 150 but is returned
+        // as a whole tile (we allow up to and including the tile that crosses the cap).
+        // Third never gets eligibility because the budget check breaks the loop.
+        assert_eq!(out.len(), 2, "budget allows whole tiles up to and including the one that crosses the cap");
+        assert_eq!(s.queue_len(), 3, "all three are still queued; tick doesn't drop InFlight until ACK or supersede");
     }
 }
