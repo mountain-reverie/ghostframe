@@ -7,3 +7,6 @@ pub mod protocol;
 pub mod quic;
 pub mod scheduler;
 pub mod webtransport;
+
+#[cfg(any(test, feature = "test-loss-injection"))]
+pub mod loss_injection;
