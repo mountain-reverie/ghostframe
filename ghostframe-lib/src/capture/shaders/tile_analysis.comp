@@ -1,0 +1,167 @@
+// tile_analysis.comp
+// Per-tile analysis: unique-color count + palette extraction + edge density.
+//
+// Dispatch: one workgroup per tile (ceil(width/32) × ceil(height/32)).
+// Each thread handles one pixel within the 32×32 tile.
+//
+// Outputs per tile (std430 binding 1):
+//   uint  count;             // 1..16 valid, 17 = overflow
+//   uint  edge_density_thou; // 0..1000 per-mille
+//   uint  _pad0; _pad1;      // 16-byte alignment for colors[]
+//   uint  colors[16];        // packed BGRA, only valid when count <= 16
+
+#version 450
+
+layout(local_size_x = 32, local_size_y = 32, local_size_z = 1) in;
+
+layout(binding = 0, rgba8) readonly uniform image2D current_frame;
+
+struct TileAnalysis {
+    uint  count;
+    uint  edge_density_thou;
+    uint  _pad0;
+    uint  _pad1;
+    uint  colors[16];
+};
+
+layout(binding = 1, std430) buffer AnalysisOutput {
+    TileAnalysis tiles[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint frame_width;
+    uint frame_height;
+    uint cols;
+};
+
+// XOR mask: lets stored value 0 mean "empty slot" without colliding with
+// real BGRA values. Note: BGRA value 0xA5A5A5A5 maps to stored 0 and is
+// unrepresentable. In production X11 buffers, alpha is always 0xFF, so
+// alpha=0xA5 never occurs.
+const uint MASK = 0xA5A5A5A5u;
+
+// Knuth multiplicative hash, truncated to 5 bits → 32 slots.
+uint hash5(uint value) {
+    return (value * 2654435761u) >> 27;
+}
+
+const uint EDGE_GRAD_THRESHOLD = 48u;  // see design O2
+
+shared uint slot_color[32];
+shared uint count;
+shared uint overflow_flag;
+shared uint edge_count;
+shared uint pixels_in_bounds;
+
+uint pack_bgra(vec4 p) {
+    uint b = uint(p.b * 255.0 + 0.5);
+    uint g = uint(p.g * 255.0 + 0.5);
+    uint r = uint(p.r * 255.0 + 0.5);
+    uint a = uint(p.a * 255.0 + 0.5);
+    return b | (g << 8) | (r << 16) | (a << 24);
+}
+
+int rgb_sum(vec4 p) {
+    return int(p.r * 255.0 + 0.5)
+         + int(p.g * 255.0 + 0.5)
+         + int(p.b * 255.0 + 0.5);
+}
+
+void main() {
+    uint local_idx = gl_LocalInvocationID.y * 32u + gl_LocalInvocationID.x;
+    uint tile_x = gl_WorkGroupID.x;
+    uint tile_y = gl_WorkGroupID.y;
+    int px = int(tile_x * 32u + gl_LocalInvocationID.x);
+    int py = int(tile_y * 32u + gl_LocalInvocationID.y);
+    bool in_bounds = (px < int(frame_width)) && (py < int(frame_height));
+
+    // ---- Init shared state (cooperative). ----
+    if (local_idx < 32u) {
+        slot_color[local_idx] = 0u;
+    }
+    if (local_idx == 0u) {
+        count = 0u;
+        overflow_flag = 0u;
+        edge_count = 0u;
+        // Per-tile pixels-in-bounds for the edge_density denominator.
+        uint w_in = min(32u, frame_width  - tile_x * 32u);
+        uint h_in = min(32u, frame_height - tile_y * 32u);
+        pixels_in_bounds = w_in * h_in;
+    }
+    barrier();
+
+    // ---- Phase 1: unique-color hash set. ----
+    if (in_bounds) {
+        vec4 p = imageLoad(current_frame, ivec2(px, py));
+        uint value = pack_bgra(p);
+        uint masked = value ^ MASK;
+        uint h = hash5(value);
+        for (uint probe = 0u; probe < 32u; ++probe) {
+            // Early bail-out: another thread saw overflow.
+            if (overflow_flag != 0u) break;
+            uint slot = (h + probe) & 31u;
+            uint prev = atomicCompSwap(slot_color[slot], 0u, masked);
+            if (prev == 0u) {
+                // We claimed the slot.
+                uint new_count = atomicAdd(count, 1u) + 1u;
+                if (new_count >= 17u) {
+                    overflow_flag = 1u;
+                }
+                break;
+            }
+            if (prev == masked) {
+                // Duplicate of our own value already present — done.
+                break;
+            }
+            // Collision with a different value — probe next slot.
+        }
+    }
+    barrier();
+
+    // ---- Phase 1 writeback (thread 0). ----
+    if (local_idx == 0u) {
+        uint tile_idx = tile_y * cols + tile_x;
+        uint final_count = min(count, 17u);
+        tiles[tile_idx].count = final_count;
+        // Scan slots and emit up-to-16 colors in slot-traversal order.
+        uint emitted = 0u;
+        for (uint s = 0u; s < 32u && emitted < 16u; ++s) {
+            uint v = slot_color[s];
+            if (v != 0u) {
+                tiles[tile_idx].colors[emitted] = v ^ MASK;
+                emitted += 1u;
+            }
+        }
+        // Zero any unused slots so consumers see deterministic data.
+        for (uint s = emitted; s < 16u; ++s) {
+            tiles[tile_idx].colors[s] = 0u;
+        }
+    }
+
+    // ---- Phase 2: Sobel-style edge density on summed RGB. ----
+    int s_self  = 0, s_left = 0, s_right = 0, s_up = 0, s_down = 0;
+    if (in_bounds) {
+        int xm = clamp(px - 1, 0, int(frame_width)  - 1);
+        int xp = clamp(px + 1, 0, int(frame_width)  - 1);
+        int ym = clamp(py - 1, 0, int(frame_height) - 1);
+        int yp = clamp(py + 1, 0, int(frame_height) - 1);
+        s_self  = rgb_sum(imageLoad(current_frame, ivec2(px, py)));
+        s_left  = rgb_sum(imageLoad(current_frame, ivec2(xm, py)));
+        s_right = rgb_sum(imageLoad(current_frame, ivec2(xp, py)));
+        s_up    = rgb_sum(imageLoad(current_frame, ivec2(px, ym)));
+        s_down  = rgb_sum(imageLoad(current_frame, ivec2(px, yp)));
+        int gx = abs(s_right - s_left);
+        int gy = abs(s_down  - s_up);
+        int grad = gx + gy;
+        if (grad > int(EDGE_GRAD_THRESHOLD)) {
+            atomicAdd(edge_count, 1u);
+        }
+    }
+    barrier();
+
+    if (local_idx == 0u) {
+        uint tile_idx = tile_y * cols + tile_x;
+        uint denom = max(pixels_in_bounds, 1u);
+        tiles[tile_idx].edge_density_thou = (edge_count * 1000u) / denom;
+    }
+}
