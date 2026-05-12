@@ -100,6 +100,26 @@ const SAD_THRESHOLD: u32 = 64;
 // Public types
 // ---------------------------------------------------------------------------
 
+/// Per-tile analysis output from the `tile_analysis.comp` shader.
+///
+/// Layout matches the std430 struct in `shaders/tile_analysis.comp`:
+/// 80 bytes per tile, 4-byte aligned. `_pad` exists to push `colors`
+/// to offset 16 in std430.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TileAnalysis {
+    /// Distinct color count. 1..=16 means `colors` holds that many valid
+    /// entries. `17` is the overflow sentinel — PalRLE-infeasible; the
+    /// `colors` array is undefined.
+    pub count: u32,
+    /// Per-mille (0..=1000) fraction of pixels above the gradient threshold.
+    pub edge_density_thou: u32,
+    pub _pad: [u32; 2],
+    /// Packed BGRA values: byte 0 = B, byte 1 = G, byte 2 = R, byte 3 = A.
+    /// Order is slot-traversal order (not insertion order). Valid up to `count`.
+    pub colors: [u32; 16],
+}
+
 /// Result of [`GpuFrameProcessor::process_frame`].
 pub struct FrameAnalysis {
     /// Flat tile indices of tiles that changed since the previous frame.
@@ -112,6 +132,24 @@ pub struct FrameAnalysis {
     pub nv12_y_stride: u32,
     pub nv12_uv_stride: u32,
     pub nv12_uv_offset: u32,
+    /// Pointer to the per-tile analysis buffer (one `TileAnalysis` per tile,
+    /// row-major, `tile_y * cols + tile_x`). Valid until the next call to
+    /// `process_frame`.
+    pub tile_analysis: *const TileAnalysis,
+    /// Number of entries reachable via `tile_analysis` (= cols × rows).
+    pub tile_analysis_len: u32,
+}
+
+impl FrameAnalysis {
+    pub fn tile_analysis_slice(&self) -> &[TileAnalysis] {
+        if self.tile_analysis.is_null() || self.tile_analysis_len == 0 {
+            return &[];
+        }
+        // SAFETY: pointer is into HOST_VISIBLE mapped GPU memory owned by
+        // GpuFrameProcessor; valid until the next process_frame call. Lifetime
+        // tied to &self.
+        unsafe { std::slice::from_raw_parts(self.tile_analysis, self.tile_analysis_len as usize) }
+    }
 }
 
 // SAFETY: nv12_data is a pointer to GPU-managed HOST_VISIBLE memory.
@@ -668,6 +706,8 @@ impl GpuFrameProcessor {
                 nv12_y_stride,
                 nv12_uv_stride,
                 nv12_uv_offset,
+                tile_analysis: std::ptr::null(),
+                tile_analysis_len: 0,
             });
         }
 
@@ -1053,6 +1093,8 @@ impl GpuFrameProcessor {
             nv12_y_stride,
             nv12_uv_stride,
             nv12_uv_offset,
+            tile_analysis: std::ptr::null(),
+            tile_analysis_len: 0,
         })
     }
 
@@ -1827,5 +1869,41 @@ mod tests {
                 "Y for solid red should be ~76, got average {y_avg}"
             );
         }
+    }
+
+    #[test]
+    fn tile_analysis_struct_has_expected_layout() {
+        assert_eq!(std::mem::size_of::<TileAnalysis>(), 80, "TileAnalysis must be 80 bytes");
+        assert_eq!(std::mem::align_of::<TileAnalysis>(), 4, "TileAnalysis alignment");
+
+        // Offsets match std430 layout from the shader.
+        let zero = TileAnalysis { count: 0, edge_density_thou: 0, _pad: [0; 2], colors: [0; 16] };
+        let base = &zero as *const _ as usize;
+        assert_eq!(&zero.count             as *const _ as usize - base, 0);
+        assert_eq!(&zero.edge_density_thou as *const _ as usize - base, 4);
+        assert_eq!(&zero.colors            as *const _ as usize - base, 16);
+    }
+
+    #[test]
+    fn frame_analysis_tile_analysis_slice_returns_correct_range() {
+        // Build a fake FrameAnalysis backed by a heap Vec so we can exercise the
+        // slice helper without spinning up Vulkan.
+        let mut backing = vec![
+            TileAnalysis { count: 1, edge_density_thou: 100, _pad: [0; 2], colors: [0xAAAAAAAAu32; 16] },
+            TileAnalysis { count: 2, edge_density_thou: 200, _pad: [0; 2], colors: [0xBBBBBBBBu32; 16] },
+        ];
+        let analysis = FrameAnalysis {
+            dirty_tiles: vec![],
+            nv12_data: std::ptr::null(),
+            nv12_width: 0, nv12_height: 0,
+            nv12_y_stride: 0, nv12_uv_stride: 0, nv12_uv_offset: 0,
+            tile_analysis: backing.as_mut_ptr() as *const TileAnalysis,
+            tile_analysis_len: 2,
+        };
+        let slice = analysis.tile_analysis_slice();
+        assert_eq!(slice.len(), 2);
+        assert_eq!(slice[0].count, 1);
+        assert_eq!(slice[1].edge_density_thou, 200);
+        assert_eq!(slice[1].colors[0], 0xBBBBBBBBu32);
     }
 }
