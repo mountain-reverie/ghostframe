@@ -115,6 +115,13 @@ async function main() {
     return dec;
   }
 
+  // Batched ACK sender — fire-and-forget unreliable datagrams back to server.
+  const ackWriter = transport.datagrams.writable.getWriter();
+  const ackBatcher = new AckBatcher((dg) => {
+    // Fire-and-forget write; failure is acceptable (ACKs are unreliable).
+    ackWriter.write(dg).catch(() => {});
+  });
+
   // Tile assembly state: key -> TileAssembly
   const assemblies = new Map<string, TileAssembly>();
   let latestFrameSeq = 0;
@@ -182,13 +189,6 @@ async function main() {
   // Type comes from src/globals.d.ts.
   window.__ghostframeStats = { tileDatagrams: 0, frameDatagrams: 0 };
   const stats = window.__ghostframeStats;
-
-  // Batched ACK sender — fire-and-forget unreliable datagrams back to server.
-  const ackWriter = transport.datagrams.writable.getWriter();
-  const ackBatcher = new AckBatcher((dg) => {
-    // Fire-and-forget write; failure is acceptable (ACKs are unreliable).
-    ackWriter.write(dg).catch(() => {});
-  });
 
   // Receive datagrams
   const reader = transport.datagrams.readable.getReader();

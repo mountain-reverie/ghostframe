@@ -414,9 +414,9 @@ impl IoBridge {
             );
             let header_byte = ((work.generation & 0x0F) << 4) | (work.pass_idx & 0x0F);
             for mut dg in datagrams {
-                if dg.len() > DATAGRAM_HEADER_SIZE + 3 {
-                    dg[DATAGRAM_HEADER_SIZE + 3] = header_byte;
-                }
+                debug_assert!(dg.len() > DATAGRAM_HEADER_SIZE + 3,
+                    "fragment_tile must return datagrams with full headers");
+                dg[DATAGRAM_HEADER_SIZE + 3] = header_byte;
                 self.send_to_all_sessions(&dg);
             }
         }
@@ -697,9 +697,9 @@ impl IoBridge {
                     // to carry our actual gen/pass. This is byte (DATAGRAM_HEADER_SIZE + 3).
                     let header_byte = ((work.generation & 0x0F) << 4) | (work.pass_idx & 0x0F);
                     for mut dg in datagrams {
-                        if dg.len() > DATAGRAM_HEADER_SIZE + 3 {
-                            dg[DATAGRAM_HEADER_SIZE + 3] = header_byte;
-                        }
+                        debug_assert!(dg.len() > DATAGRAM_HEADER_SIZE + 3,
+                            "fragment_tile must return datagrams with full headers");
+                        dg[DATAGRAM_HEADER_SIZE + 3] = header_byte;
                         self.send_to_all_sessions(&dg);
                     }
                 }

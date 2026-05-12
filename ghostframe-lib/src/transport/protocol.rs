@@ -183,6 +183,11 @@ pub fn fragment_tile(
     timestamp_us: u32,
     max_fragment_payload: usize,
 ) -> Vec<Vec<u8>> {
+    // NOTE: TileHeader constructed here uses generation=0, pass=0. Sites that
+    // need real generation/pass values byte-patch `dg[DATAGRAM_HEADER_SIZE + 3]`
+    // after this returns (see io_bridge.rs::process_frame_cpu and
+    // process_frame_gpu). If you change the byte [3] format, update both
+    // patch sites.
     assert!(
         max_fragment_payload > 0,
         "max_fragment_payload must be > 0; got 0 (datagram size too small to fit headers)"
