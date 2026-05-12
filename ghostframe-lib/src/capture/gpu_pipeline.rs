@@ -1095,8 +1095,8 @@ impl GpuFrameProcessor {
 
         // 5a. Snapshot copy: current (DMA-BUF) → prev_image (owned). This
         // makes prev_image a true point-in-time snapshot of THIS frame for
-        // the next frame's SAD comparison. Must run AFTER both SAD and NV12
-        // shader reads, since they read from current.
+        // the next frame's SAD comparison. Must run AFTER all three shader
+        // dispatches (SAD, NV12, analysis), since they all read from current.
         let copy_barriers = [
             // current: SHADER_READ → TRANSFER_READ
             vk::ImageMemoryBarrier::default()
