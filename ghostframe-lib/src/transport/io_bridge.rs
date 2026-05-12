@@ -81,6 +81,12 @@ pub struct IoBridge {
     frame_mode: crate::tile::FrameMode,
     /// Round-robin tile-work scheduler shared by both CPU and GPU emission paths.
     scheduler: crate::transport::scheduler::Scheduler,
+    /// Cfg-gated outbound-datagram loss injector for e2e tests.
+    #[cfg(any(test, feature = "test-loss-injection"))]
+    pub(crate) outbound_loss: Option<crate::transport::loss_injection::LossInjector>,
+    /// Cfg-gated inbound-datagram loss injector for e2e tests.
+    #[cfg(any(test, feature = "test-loss-injection"))]
+    pub(crate) inbound_loss: Option<crate::transport::loss_injection::LossInjector>,
     /// Remaining frames to force all-dirty after a new session connects.
     /// QUIC slow-start can only deliver a fraction of tiles in the first burst;
     /// forcing dirty for several frames lets the congestion window open.
@@ -162,6 +168,10 @@ impl IoBridge {
             classifier: crate::tile::Classifier::default(),
             frame_mode: crate::tile::FrameMode::TileCodec,
             scheduler: crate::transport::scheduler::Scheduler::new(0, 0),
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            outbound_loss: None,
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            inbound_loss: None,
             force_dirty_frames: 0,
             fec_k: std::env::var("GHOSTFRAME_FEC_K")
                 .ok()
@@ -232,6 +242,12 @@ impl IoBridge {
 
     /// Send a datagram to all connected WebTransport sessions.
     fn send_to_all_sessions(&mut self, dg: &[u8]) {
+        #[cfg(any(test, feature = "test-loss-injection"))]
+        if let Some(inj) = self.outbound_loss.as_mut() {
+            if inj.should_drop(dg) {
+                return;
+            }
+        }
         for (handle, wt) in &mut self.wt_sessions {
             if !wt.is_connected() {
                 continue;
@@ -242,6 +258,30 @@ impl IoBridge {
                 }
             }
         }
+    }
+
+    /// Route a single inbound datagram into the appropriate handler.
+    /// Currently dispatches ACK_BATCH_MSG_TYPE; future M3.x message types
+    /// can be added here. Unknown discriminators are silently dropped
+    /// (forward-compatible).
+    pub(crate) fn dispatch_ack_datagram(&mut self, data: &[u8]) {
+        #[cfg(any(test, feature = "test-loss-injection"))]
+        if let Some(inj) = self.inbound_loss.as_mut() {
+            if inj.should_drop(data) {
+                return;
+            }
+        }
+        if data.is_empty() {
+            return;
+        }
+        if data[0] == crate::transport::ack::ACK_BATCH_MSG_TYPE {
+            if let Ok(batch) = crate::transport::ack::AckBatch::decode(data) {
+                for e in batch.entries {
+                    self.scheduler.on_ack(e.tile_x, e.tile_y, e.generation, e.pass);
+                }
+            }
+        }
+        // Other discriminators: silently ignore. Forward-compatible.
     }
 
     /// CPU-side tile-based pipeline (original implementation).
@@ -902,6 +942,11 @@ impl IoBridge {
                 }
 
                 Event::DatagramReceived => {
+                    // First pass: drain all available datagrams from the session,
+                    // also responding to pings inline (since we already hold the
+                    // wt+conn borrows). Defer ACK/etc. dispatch to a second pass
+                    // because dispatch_ack_datagram takes `&mut self`.
+                    let mut to_dispatch: Vec<Vec<u8>> = Vec::new();
                     if let Some(wt) = self.wt_sessions.get_mut(&handle) {
                         if let Some(conn) = self.server.connections.get_mut(&handle) {
                             while let Some(payload) = wt.recv_datagram(conn) {
@@ -911,14 +956,13 @@ impl IoBridge {
                                         tracing::warn!(?handle, error = ?e, "failed to send pong");
                                     }
                                 } else {
-                                    tracing::trace!(
-                                        ?handle,
-                                        bytes = payload.len(),
-                                        "WebTransport datagram received (unknown payload)"
-                                    );
+                                    to_dispatch.push(payload);
                                 }
                             }
                         }
+                    }
+                    for dg in to_dispatch {
+                        self.dispatch_ack_datagram(&dg);
                     }
                 }
 
@@ -977,6 +1021,10 @@ impl IoBridge {
             classifier: crate::tile::Classifier::default(),
             frame_mode: crate::tile::FrameMode::TileCodec,
             scheduler: crate::transport::scheduler::Scheduler::new(0, 0),
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            outbound_loss: None,
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            inbound_loss: None,
             force_dirty_frames: 0,
             fec_k: 0,
             fec_enable_threshold: FEC_ENABLE_THRESHOLD,
@@ -1005,6 +1053,10 @@ impl IoBridge {
             classifier: crate::tile::Classifier::default(),
             frame_mode: crate::tile::FrameMode::TileCodec,
             scheduler: crate::transport::scheduler::Scheduler::new(0, 0),
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            outbound_loss: None,
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            inbound_loss: None,
             force_dirty_frames: 0,
             fec_k: 0,
             fec_enable_threshold: FEC_ENABLE_THRESHOLD,
@@ -1310,5 +1362,47 @@ mod tests {
                 "encoder must have keyframe_pending after session reconnect"
             );
         }
+    }
+
+    /// An inbound ACK_BATCH datagram routed through dispatch_ack_datagram
+    /// must mark the matching in-flight tile work as Acked.
+    #[tokio::test]
+    async fn dispatch_ack_datagram_clears_in_flight_work() {
+        use crate::transport::ack::{AckBatch, AckEntry};
+        use crate::transport::scheduler::TileWork;
+
+        let (our_end, _peer) = UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("server");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+
+        // Seed the scheduler with one InFlight item.
+        bridge.scheduler.resize(4, 4);
+        bridge.scheduler.enqueue(TileWork::raw_for_test(1, 2, 0, vec![1, 2, 3]));
+        let _ = bridge.scheduler.tick(usize::MAX); // promote to InFlight
+
+        let batch = AckBatch {
+            entries: vec![AckEntry { tile_x: 1, tile_y: 2, generation: 0, pass: 0 }],
+        };
+        bridge.dispatch_ack_datagram(&batch.encode());
+
+        // Next tick: nothing eligible — the Acked entry was dropped via retain.
+        let out = bridge.scheduler.tick(usize::MAX);
+        assert!(out.is_empty());
+        assert_eq!(bridge.scheduler.queue_len(), 0);
+    }
+
+    /// dispatch_ack_datagram silently ignores datagrams whose first byte
+    /// isn't ACK_BATCH_MSG_TYPE.
+    #[tokio::test]
+    async fn dispatch_ack_datagram_ignores_unknown_msg_types() {
+        let (our_end, _peer) = UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("server");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+        // Should not panic on empty/random/unknown payloads.
+        bridge.dispatch_ack_datagram(&[]);
+        bridge.dispatch_ack_datagram(&[0xFF, 0x00, 0x00]);
+        bridge.dispatch_ack_datagram(&[0x01, 0, 0]); // FEEDBACK_MSG_TYPE — unrelated
     }
 }
