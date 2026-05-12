@@ -75,6 +75,10 @@ pub(crate) fn populate_gpu_metrics(
 const FEC_ENABLE_THRESHOLD: f64 = 0.005;
 /// FEC parity defaults — disable when loss drops below this threshold (hysteresis).
 const FEC_DISABLE_THRESHOLD: f64 = 0.002;
+/// Number of frames the server re-emits the frame-dimensions datagram after
+/// any dimension change. At 5% packet loss, probability of all 10 being lost
+/// is 0.05^10 ≈ 9.7e-14.
+const FRAME_DIMENSIONS_RETRANSMITS: u8 = 10;
 
 pub struct IoBridge {
     /// Keep the ghostbridge handle alive so the socketpair fd stays open.
@@ -124,6 +128,13 @@ pub struct IoBridge {
     full_frame_encoder: Option<FullFrameEncoder>,
     /// Recent frame fragments for NACK retransmission. Key: (frame_seq, frag_idx).
     recent_frame_fragments: HashMap<(u32, u16), Vec<u8>>,
+    /// Last (width, height) the server emitted as a frame-dimensions datagram.
+    /// `None` means we've never emitted dimensions (first frame upcoming).
+    last_emitted_dimensions: Option<(u32, u32)>,
+    /// Frames remaining in the current retransmit window for the dimensions
+    /// message. Each dimension change resets this to N=10. While > 0, every
+    /// frame re-emits the dimensions datagram; loss tolerance is 0.05^10 ≈ 1e-13.
+    dimensions_retransmits_left: u8,
 }
 
 /// Selects how `dispatch_dirty_tiles_via_scheduler` picks a codec per tile.
@@ -258,6 +269,8 @@ impl IoBridge {
             gpu_frame_processor,
             full_frame_encoder: None,
             recent_frame_fragments: HashMap::new(),
+            last_emitted_dimensions: None,
+            dimensions_retransmits_left: 0,
         })
     }
 
@@ -481,6 +494,24 @@ impl IoBridge {
             }
         };
 
+        // Emit frame-dimensions datagram on first frame, on dimension change,
+        // and N more times after any change to absorb datagram loss.
+        let dims_changed = self.last_emitted_dimensions != Some((frame.width, frame.height));
+        if dims_changed {
+            self.dimensions_retransmits_left = FRAME_DIMENSIONS_RETRANSMITS;
+            self.last_emitted_dimensions = Some((frame.width, frame.height));
+        }
+        if self.dimensions_retransmits_left > 0 {
+            let dg = crate::transport::protocol::build_frame_dimensions_datagram(
+                seq,
+                frame.timestamp_us,
+                frame.width,
+                frame.height,
+            );
+            self.send_to_all_sessions(&dg);
+            self.dimensions_retransmits_left -= 1;
+        }
+
         // During QUIC slow-start after a new session connects, datagrams may
         // be silently dropped by congestion control. Use no-commit mode so
         // dropped tiles remain dirty on subsequent frames until the congestion
@@ -563,6 +594,24 @@ impl IoBridge {
                 return;
             }
         };
+
+        // Emit frame-dimensions datagram on first frame, on dimension change,
+        // and N more times after any change to absorb datagram loss.
+        let dims_changed = self.last_emitted_dimensions != Some((frame.width, frame.height));
+        if dims_changed {
+            self.dimensions_retransmits_left = FRAME_DIMENSIONS_RETRANSMITS;
+            self.last_emitted_dimensions = Some((frame.width, frame.height));
+        }
+        if self.dimensions_retransmits_left > 0 {
+            let dg = crate::transport::protocol::build_frame_dimensions_datagram(
+                seq,
+                frame.timestamp_us,
+                frame.width,
+                frame.height,
+            );
+            self.send_to_all_sessions(&dg);
+            self.dimensions_retransmits_left -= 1;
+        }
 
         // GPU pipeline: Vulkan SAD dirty detection + NV12 conversion
         let processor = self.gpu_frame_processor.as_mut().unwrap();
@@ -1114,6 +1163,8 @@ impl IoBridge {
             gpu_frame_processor: None,
             full_frame_encoder: None,
             recent_frame_fragments: HashMap::new(),
+            last_emitted_dimensions: None,
+            dimensions_retransmits_left: 0,
         }
     }
 
@@ -1146,6 +1197,8 @@ impl IoBridge {
             gpu_frame_processor: None,
             full_frame_encoder: None,
             recent_frame_fragments: HashMap::new(),
+            last_emitted_dimensions: None,
+            dimensions_retransmits_left: 0,
         }
     }
 

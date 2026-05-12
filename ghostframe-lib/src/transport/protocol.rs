@@ -301,6 +301,48 @@ pub fn max_fragment_payload(max_datagram_size: usize) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// build_frame_dimensions_datagram
+// ---------------------------------------------------------------------------
+
+/// Sentinel tile coordinates marking a control message that carries the
+/// current frame dimensions rather than pixel data. Tile coords are `u8`;
+/// 0xFF (255) is structurally impossible at any sensible resolution
+/// (would imply >8000 px width), so the receiver can route on the sentinel.
+pub const FRAME_DIMENSIONS_SENTINEL_X: u8 = 0xFF;
+pub const FRAME_DIMENSIONS_SENTINEL_Y: u8 = 0xFF;
+
+/// Build a single frame-dimensions datagram.
+///
+/// Format: standard tile datagram with `(tile_x, tile_y) = (0xFF, 0xFF)`,
+/// `codec = Codec::Skip`, and an 8-byte payload `[width: u32 BE][height: u32 BE]`.
+///
+/// Always fits in a single datagram (8-byte payload, 28-byte total).
+pub fn build_frame_dimensions_datagram(
+    frame_seq: u32,
+    timestamp_us: u32,
+    width: u32,
+    height: u32,
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(8);
+    payload.extend_from_slice(&width.to_be_bytes());
+    payload.extend_from_slice(&height.to_be_bytes());
+
+    let datagrams = fragment_tile(
+        frame_seq | TILE_DATAGRAM_FLAG,
+        FRAME_DIMENSIONS_SENTINEL_X,
+        FRAME_DIMENSIONS_SENTINEL_Y,
+        Codec::Skip,
+        /* generation */ 0,
+        /* pass */ 0,
+        &payload,
+        timestamp_us,
+        /* max_fragment_payload */ 8,
+    );
+    debug_assert_eq!(datagrams.len(), 1, "frame dimensions must fit one datagram");
+    datagrams.into_iter().next().unwrap()
+}
+
+// ---------------------------------------------------------------------------
 // Discriminator: tile vs frame datagrams
 // ---------------------------------------------------------------------------
 
@@ -869,5 +911,36 @@ mod tests {
     fn nack_message_short_input() {
         assert!(NackMessage::decode(&[0u8; 5]).is_none());
         assert!(NackMessage::decode(&[0u8; 6]).is_some());
+    }
+
+    #[test]
+    fn frame_dimensions_datagram_roundtrip() {
+        let dg = build_frame_dimensions_datagram(
+            /*frame_seq*/ 42,
+            /*ts*/ 1000,
+            /*width*/ 1920,
+            /*height*/ 1080,
+        );
+        // Total: 12 (DatagramHeader) + 8 (TileHeader) + 8 (payload) = 28 bytes.
+        assert_eq!(dg.len(), 28);
+
+        let (dh, th, payload) = decode_tile_datagram(&dg).expect("decode failed");
+        // Tile-datagram flag must be set in frame_seq.
+        assert_ne!(dh.frame_seq & TILE_DATAGRAM_FLAG, 0, "TILE_DATAGRAM_FLAG must be set");
+        assert_eq!(dh.frame_seq & !TILE_DATAGRAM_FLAG, 42);
+        assert_eq!(dh.frag_idx, 0);
+        assert_eq!(dh.frag_total, 1);
+        assert_eq!(dh.timestamp_us, 1000);
+
+        assert_eq!(th.tile_x, FRAME_DIMENSIONS_SENTINEL_X);
+        assert_eq!(th.tile_y, FRAME_DIMENSIONS_SENTINEL_Y);
+        assert_eq!(th.codec, Codec::Skip);
+        assert_eq!(th.payload_len, 8);
+
+        assert_eq!(payload.len(), 8);
+        let w = u32::from_be_bytes(payload[0..4].try_into().unwrap());
+        let h = u32::from_be_bytes(payload[4..8].try_into().unwrap());
+        assert_eq!(w, 1920);
+        assert_eq!(h, 1080);
     }
 }
