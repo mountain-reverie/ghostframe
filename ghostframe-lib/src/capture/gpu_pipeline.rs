@@ -2392,4 +2392,92 @@ mod tests {
             assert_eq!(entry.edge_density_thou, 0);
         }
     }
+
+    #[test]
+    fn process_frame_tile_analysis_multi_tile_independence() {
+        // 64×64 frame → 2x2 tile grid:
+        //   tile (0,0): solid red          → count=1
+        //   tile (1,0): solid blue         → count=1
+        //   tile (0,1): red-blue checker   → count=2
+        //   tile (1,1): three colors       → count=3
+        // Verifies the per-tile output slot is correctly addressed and there
+        // is no cross-talk between tiles.
+        let width = 64u32;
+        let height = 64u32;
+        let stride = width * 4;
+
+        let mut processor = match GpuFrameProcessor::new(256) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("Skipping multi-tile test (no Vulkan GPU?): {e}");
+                return;
+            }
+        };
+
+        unsafe {
+            let size = (stride * height) as usize;
+            let name = std::ffi::CString::new("ghost-test-multitile").unwrap();
+            let fd = libc::memfd_create(name.as_ptr(), 0);
+            assert!(fd >= 0);
+            libc::ftruncate(fd, size as i64);
+            let ptr = libc::mmap(
+                std::ptr::null_mut(), size,
+                libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0,
+            );
+            assert_ne!(ptr, libc::MAP_FAILED);
+            let frame = std::slice::from_raw_parts_mut(ptr as *mut u8, size);
+
+            let red:    [u8; 4] = [0, 0, 255, 255];
+            let blue:   [u8; 4] = [255, 0, 0, 255];
+            let green:  [u8; 4] = [0, 255, 0, 255];
+            let yellow: [u8; 4] = [0, 255, 255, 255];
+
+            // Fill helper.
+            let mut put = |x: u32, y: u32, c: [u8; 4]| {
+                let off = ((y * stride) + x * 4) as usize;
+                frame[off..off + 4].copy_from_slice(&c);
+            };
+
+            for y in 0..32 {
+                // tile (0,0): red
+                for x in 0..32 { put(x, y, red); }
+                // tile (1,0): blue
+                for x in 32..64 { put(x, y, blue); }
+            }
+            for y in 32..64 {
+                // tile (0,1): red/blue checker
+                for x in 0..32 {
+                    put(x, y, if (x + y) & 1 == 0 { red } else { blue });
+                }
+                // tile (1,1): three colors striped vertically (red/green/yellow)
+                for x in 32..64 {
+                    let c = match (x - 32) / 11 {
+                        0 => red,
+                        1 => green,
+                        _ => yellow,
+                    };
+                    put(x, y, c);
+                }
+            }
+            libc::munmap(ptr, size);
+
+            let analysis = match processor.process_frame(fd, width, height, stride) {
+                Ok(a) => a,
+                Err(e) => {
+                    libc::close(fd);
+                    eprintln!("Skipping multi-tile (memfd not a real DMA-BUF): {e}");
+                    return;
+                }
+            };
+            libc::close(fd);
+
+            let slice = analysis.tile_analysis_slice();
+            assert_eq!(analysis.tile_analysis_len, 4);
+            // cols = 2; index = y * 2 + x
+            assert_eq!(slice[0].count, 1, "tile (0,0) red");
+            assert_eq!(slice[1].count, 1, "tile (1,0) blue");
+            assert_eq!(slice[2].count, 2, "tile (0,1) checker");
+            assert_eq!(slice[3].count, 3, "tile (1,1) three stripes");
+        }
+    }
 }
