@@ -438,10 +438,14 @@ async fn e2e_raw_frame_round_trip() -> Result<()> {
 /// M2: Solid red renders correctly through H.264 pipeline (color fidelity).
 ///
 /// M3.1: This test also exercises the new Scheduler-routed tile-codec
-/// emission path. Under M3.1 the CPU path always emits `Codec::Raw` (D1
-/// keeps the classifier sentinel-gated), but every dirty tile flows
-/// through `Scheduler::enqueue → tick → fragment_tile`. End-to-end Solid
-/// firing waits on M3.3 GPU compute.
+/// emission path — every dirty tile flows through
+/// `Scheduler::enqueue → tick → fragment_tile`.
+///
+/// Pre-M3.2: GPU `tile_analysis.comp` now populates real `unique_colors`
+/// from live content on the GPU path, so the classifier's Solid rule
+/// (`unique_colors == 1`) fires end-to-end without `force_codec_state_for_test`.
+/// The CPU path still emits `Codec::Raw` since `process_frame_cpu` keeps the
+/// sentinel (no GPU compute available there).
 #[tokio::test]
 async fn e2e_solid_color() -> Result<()> {
     let setup = setup_e2e("--solid-red").await?;

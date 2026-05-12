@@ -154,9 +154,10 @@ impl FrameAnalysis {
     }
 }
 
-// SAFETY: nv12_data is a pointer to GPU-managed HOST_VISIBLE memory.
-// The FrameAnalysis is consumed before the next process_frame call so the
-// data is stable. GpuFrameProcessor is used from a single tokio task.
+// SAFETY: `nv12_data` and `tile_analysis` are both pointers to GPU-managed
+// HOST_VISIBLE memory owned by `GpuFrameProcessor`. The FrameAnalysis is
+// consumed before the next `process_frame` call so the data is stable.
+// GpuFrameProcessor is used from a single tokio task.
 unsafe impl Send for FrameAnalysis {}
 
 /// Vulkan compute-based dirty tile tracker with integrated NV12 conversion.

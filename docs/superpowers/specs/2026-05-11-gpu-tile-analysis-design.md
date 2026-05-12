@@ -94,7 +94,7 @@ shared uint overflow_flag;
 - Each thread reads its pixel via `imageLoad(current_frame, ivec2(px, py))`, packs BGRA → `u32`.
 - Out-of-bounds threads (px ≥ frame_width or py ≥ frame_height) skip the insert step but still execute the subsequent `barrier()` — GLSL requires all threads in a workgroup to reach every barrier.
 - The XOR-mask trick: `MASK = 0xA5A5A5A5`. Insert stores `value ^ MASK` so a stored slot of `0` unambiguously means "empty" (no BGRA value xor-masks to `0`, since that would require the input to equal `MASK`, and `MASK` is XOR-masked to `0` only by itself — but `0xA5A5A5A5` is also a valid color, so we accept that this single value cannot be represented; in practice unreachable on real screen content, and the e2e/unit tests skip this color).
-- Insert: hash = `(value * 2654435761u) & 31` (Knuth multiplicative); linear probe with `atomicCompSwap(slot_color[h], 0u, value ^ MASK)`. On success → `atomicAdd(count, 1u)`. On finding `value ^ MASK` already present in that slot → done (duplicate of own value). On collision with a different stored value → probe next slot (`h = (h + 1) & 31`).
+- Insert: hash = `(value * 2654435761u) >> 27` (Knuth multiplicative, high 5 bits); linear probe with `atomicCompSwap(slot_color[h], 0u, value ^ MASK)`. On success → `atomicAdd(count, 1u)`. On finding `value ^ MASK` already present in that slot → done (duplicate of own value). On collision with a different stored value → probe next slot (`h = (h + 1) & 31`). The shipped shader uses `>> 27` rather than the originally-drafted `& 31`: both produce 5-bit results, but `>> 27` selects the better-mixed high bits of the multiplicative product (the standard Knuth recipe).
 - After every insert attempt, threads read `count`; if `>= 17`, set `overflow_flag` to `1` and stop probing.
 - `barrier()` after the insert phase — all threads, including those that did not insert.
 - Thread 0 reads `count` (clamped to 17 on output) and linearly scans `slot_color[0..32]`, XOR-unmasking each non-zero slot and writing up to 16 values into the output `colors[]` array in slot-traversal order. If `count > 16`, the output `colors[]` is undefined per contract; thread 0 still writes whatever it finds (cost: 32 reads + ≤16 writes; bounded).
@@ -225,7 +225,7 @@ The hash-set algorithm is correct under the following invariants:
 - The XOR-mask `0xA5A5A5A5` is not a fixed point of any reasonable BGRA value, so the empty-slot sentinel (`0` in the slot) never collides with a stored value.
 - `atomicCompSwap` provides the only mutation primitive on `slot_color[]`; the "found same value already" check (compare-and-do-nothing) ensures duplicate inserts of the same color don't double-count.
 - The overflow flag is read after a `barrier()`, so all threads observe a consistent decision.
-- Multiplicative hash `value * 2654435761u & 31` is well-distributed for typical BGRA inputs; on pathological inputs the linear probe terminates after at most 32 steps and either finds a match, finds an empty slot, or hits the overflow guard.
+- Multiplicative hash `(value * 2654435761u) >> 27` is well-distributed for typical BGRA inputs; on pathological inputs the linear probe terminates after at most 32 steps and either finds a match, finds an empty slot, or hits the overflow guard.
 
 ---
 
