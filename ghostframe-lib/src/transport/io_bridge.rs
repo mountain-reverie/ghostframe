@@ -1094,6 +1094,14 @@ impl IoBridge {
                             self.classifier.reset();
                             self.scheduler.clear();
                             self.frame_mode = crate::tile::FrameMode::H264;
+                            // Re-prime the frame-dimensions retransmit counter so
+                            // the new client receives the sentinel on its first
+                            // frames even if the screen has been at a stable
+                            // resolution for >FRAME_DIMENSIONS_RETRANSMITS frames.
+                            // Without this, the client's per-tile fallback resize
+                            // (gated on !frameDimensionsKnown) takes over and
+                            // re-introduces the canvas-resize-clears-tiles bug.
+                            self.dimensions_retransmits_left = FRAME_DIMENSIONS_RETRANSMITS;
                             // `force_dirty_frames` is consumed only by
                             // `process_frame_cpu` (no_commit slow-start mitigation).
                             // The GPU path doesn't read it — skip setting it when a
