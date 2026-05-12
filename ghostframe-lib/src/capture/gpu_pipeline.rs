@@ -2355,4 +2355,41 @@ mod tests {
             let _ = cols; // suppress unused warning in case future asserts drop the index calc
         }
     }
+
+    #[test]
+    fn process_frame_tile_analysis_xor_mask_handles_zero_bgra() {
+        // BGRA = 0x00000000 (transparent black) — must round-trip through the
+        // hash set despite raw 0 being the "empty slot" sentinel. The XOR mask
+        // means 0x00000000 is stored as 0xA5A5A5A5 in the slot.
+        let width = 32u32;
+        let height = 32u32;
+        let stride = width * 4;
+        let pixel: [u8; 4] = [0, 0, 0, 0];
+
+        let mut processor = match GpuFrameProcessor::new(256) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("Skipping XOR-mask test (no Vulkan GPU?): {e}");
+                return;
+            }
+        };
+
+        unsafe {
+            let fd = make_memfd(width, height, pixel);
+            let analysis = match processor.process_frame(fd, width, height, stride) {
+                Ok(a) => a,
+                Err(e) => {
+                    libc::close(fd);
+                    eprintln!("Skipping XOR-mask (memfd not a real DMA-BUF): {e}");
+                    return;
+                }
+            };
+            libc::close(fd);
+
+            let entry = &analysis.tile_analysis_slice()[0];
+            assert_eq!(entry.count, 1, "transparent-black tile → count=1");
+            assert_eq!(entry.colors[0], 0x00000000u32, "BGRA(0,0,0,0) survives mask");
+            assert_eq!(entry.edge_density_thou, 0);
+        }
+    }
 }
