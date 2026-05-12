@@ -2276,4 +2276,83 @@ mod tests {
             // colors[] is undefined per contract — do not assert on it.
         }
     }
+
+    #[test]
+    fn process_frame_tile_analysis_frame_edge_denominator() {
+        // 40×40 frame → 2x2 tile grid:
+        //   tile (0,0): 32×32 full
+        //   tile (1,0): 8×32 right-edge partial (256 pixels in-bounds)
+        //   tile (0,1): 32×8 bottom-edge partial (256 pixels in-bounds)
+        //   tile (1,1): 8×8 corner partial (64 pixels in-bounds)
+        //
+        // Fill everything red. Inject ONE off-color pixel into tile (1,0) at a
+        // non-edge interior position. Gradient triggers there.
+        //
+        // Expected edge_density_thou for tile (1,0):
+        //   The off-color pixel and ~2 immediate neighbors register gradient.
+        //   With denom=256 and ~3 gradient-pixels, density ≈ 11. With a naive
+        //   denom=1024 it'd be ≈ 2. Assertion is >5 (real) vs <5 (would catch
+        //   bad denominator).
+        let width = 40u32;
+        let height = 40u32;
+        let stride = width * 4;
+        let cols = 2u32;
+
+        let mut processor = match GpuFrameProcessor::new(256) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("Skipping frame-edge test (no Vulkan GPU?): {e}");
+                return;
+            }
+        };
+
+        unsafe {
+            let size = (stride * height) as usize;
+            let name = std::ffi::CString::new("ghost-test-edge").unwrap();
+            let fd = libc::memfd_create(name.as_ptr(), 0);
+            assert!(fd >= 0);
+            libc::ftruncate(fd, size as i64);
+            let ptr = libc::mmap(
+                std::ptr::null_mut(), size,
+                libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0,
+            );
+            assert_ne!(ptr, libc::MAP_FAILED);
+            let frame = std::slice::from_raw_parts_mut(ptr as *mut u8, size);
+            for chunk in frame.chunks_exact_mut(4) {
+                chunk.copy_from_slice(&[0, 0, 255, 255]);   // red BGRA
+            }
+            // Inject one bright-green pixel at (x=35, y=10) — interior of tile (1,0):
+            // tile (1,0) covers x=32..40, y=0..32; (35,10) is in-bounds and not on
+            // the frame edge.
+            let off = ((10u32 * stride) + 35 * 4) as usize;
+            frame[off..off + 4].copy_from_slice(&[0, 255, 0, 255]);   // green BGRA
+            libc::munmap(ptr, size);
+
+            let analysis = match processor.process_frame(fd, width, height, stride) {
+                Ok(a) => a,
+                Err(e) => {
+                    libc::close(fd);
+                    eprintln!("Skipping frame-edge (memfd not a real DMA-BUF): {e}");
+                    return;
+                }
+            };
+            libc::close(fd);
+
+            let slice = analysis.tile_analysis_slice();
+            assert_eq!(analysis.tile_analysis_len, 4, "40x40 → 2x2 tile grid");
+
+            // Tile (1,0) — index = 0 * cols + 1 = 1
+            let edge_tile = &slice[1];
+            assert_eq!(edge_tile.count, 2, "tile (1,0) has red + green");
+            // With proper denominator=256: density ≈ (~3 * 1000) / 256 ≈ 11
+            // With naive denominator=1024: density ≈ (~3 * 1000) / 1024 ≈ 2
+            assert!(
+                edge_tile.edge_density_thou > 5,
+                "frame-edge tile denominator wrong: density = {} (expected > 5 with denom=256)",
+                edge_tile.edge_density_thou
+            );
+
+            let _ = cols; // suppress unused warning in case future asserts drop the index calc
+        }
+    }
 }
