@@ -189,6 +189,18 @@ pub struct GpuFrameProcessor {
     nv12_pipeline_layout: vk::PipelineLayout,
     nv12_descriptor_set_layout: vk::DescriptorSetLayout,
 
+    // Tile-analysis pipeline (new)
+    analysis_shader_module: vk::ShaderModule,
+    analysis_pipeline: vk::Pipeline,
+    analysis_pipeline_layout: vk::PipelineLayout,
+    analysis_descriptor_set_layout: vk::DescriptorSetLayout,
+    // HOST_VISIBLE | HOST_COHERENT, persistently mapped. Layout matches
+    // `TileAnalysis` (80 bytes per tile).
+    analysis_buffer: vk::Buffer,
+    analysis_memory: vk::DeviceMemory,
+    #[allow(dead_code)] // used in Task 4 dispatch
+    analysis_ptr: *mut TileAnalysis,
+
     descriptor_pool: vk::DescriptorPool,
     prev_image: Option<PrevFrame>,
 
@@ -339,6 +351,15 @@ impl GpuFrameProcessor {
         let nv12_shader_ci = vk::ShaderModuleCreateInfo::default().code(&nv12_spv_words);
         let nv12_shader_module = device.create_shader_module(&nv12_shader_ci, None)?;
 
+        // --- Analysis Shader module ---
+        let analysis_spv = include_bytes!("shaders/tile_analysis.spv");
+        let analysis_spv_words =
+            ash::util::read_spv(&mut std::io::Cursor::new(analysis_spv.as_slice()))?;
+        let analysis_shader_ci =
+            vk::ShaderModuleCreateInfo::default().code(&analysis_spv_words);
+        let analysis_shader_module =
+            device.create_shader_module(&analysis_shader_ci, None)?;
+
         // --- SAD Descriptor set layout ---
         // binding 0: STORAGE_IMAGE (current frame)
         // binding 1: STORAGE_IMAGE (prev frame)
@@ -433,21 +454,71 @@ impl GpuFrameProcessor {
             .map_err(|(_, e)| e)?;
         let nv12_pipeline = nv12_pipelines[0];
 
+        // --- Analysis Descriptor set layout ---
+        // binding 0: STORAGE_IMAGE (current frame, read-only in shader)
+        // binding 1: STORAGE_BUFFER (analysis output)
+        let analysis_bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        ];
+        let analysis_dsl_ci =
+            vk::DescriptorSetLayoutCreateInfo::default().bindings(&analysis_bindings);
+        let analysis_descriptor_set_layout =
+            device.create_descriptor_set_layout(&analysis_dsl_ci, None)?;
+
+        // --- Analysis Pipeline layout ---
+        // Push constants: 3 x u32 = 12 bytes (frame_width, frame_height, cols) — same
+        // shape as SAD's, but a distinct pipeline-layout object is required because
+        // descriptor sets differ.
+        let analysis_push_range = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .offset(0)
+            .size(12)];
+        let analysis_pipeline_layout_ci = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(std::slice::from_ref(&analysis_descriptor_set_layout))
+            .push_constant_ranges(&analysis_push_range);
+        let analysis_pipeline_layout =
+            device.create_pipeline_layout(&analysis_pipeline_layout_ci, None)?;
+
+        // --- Analysis Compute pipeline ---
+        let analysis_stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(analysis_shader_module)
+            .name(entry_name);
+        let analysis_compute_ci = vk::ComputePipelineCreateInfo::default()
+            .stage(analysis_stage)
+            .layout(analysis_pipeline_layout);
+        let analysis_pipelines = device
+            .create_compute_pipelines(vk::PipelineCache::null(), &[analysis_compute_ci], None)
+            .map_err(|(_, e)| e)?;
+        let analysis_pipeline = analysis_pipelines[0];
+
         // --- Descriptor pool ---
-        // 2 sets: SAD (2 STORAGE_IMAGE + 1 STORAGE_BUFFER) + NV12 (1 STORAGE_IMAGE + 1 STORAGE_BUFFER)
+        // 3 sets: SAD (2 STORAGE_IMAGE + 1 STORAGE_BUFFER)
+        //       + NV12 (1 STORAGE_IMAGE + 1 STORAGE_BUFFER)
+        //       + Analysis (1 STORAGE_IMAGE + 1 STORAGE_BUFFER)
+        // Total: 4 STORAGE_IMAGE, 3 STORAGE_BUFFER, 3 max_sets.
         let pool_sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_IMAGE,
-                descriptor_count: 3,
+                descriptor_count: 4,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: 2,
+                descriptor_count: 3,
             },
         ];
         let dp_ci = vk::DescriptorPoolCreateInfo::default()
             .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
-            .max_sets(2)
+            .max_sets(3)
             .pool_sizes(&pool_sizes);
         let descriptor_pool = device.create_descriptor_pool(&dp_ci, None)?;
 
@@ -480,6 +551,35 @@ impl GpuFrameProcessor {
             vk::MemoryMapFlags::empty(),
         )? as *mut u32;
 
+        // --- Analysis output buffer ---
+        let analysis_entry_bytes = std::mem::size_of::<TileAnalysis>() as vk::DeviceSize;
+        let analysis_buf_size = (max_tiles as vk::DeviceSize) * analysis_entry_bytes;
+        let analysis_buf_ci = vk::BufferCreateInfo::default()
+            .size(analysis_buf_size)
+            .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let analysis_buffer = device.create_buffer(&analysis_buf_ci, None)?;
+        let analysis_buf_reqs = device.get_buffer_memory_requirements(analysis_buffer);
+        let analysis_mem_type = find_memory_type(
+            &mem_props,
+            analysis_buf_reqs.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )
+        .ok_or("no host-visible memory type for analysis buffer")?;
+
+        let analysis_alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(analysis_buf_reqs.size)
+            .memory_type_index(analysis_mem_type);
+        let analysis_memory = device.allocate_memory(&analysis_alloc, None)?;
+        device.bind_buffer_memory(analysis_buffer, analysis_memory, 0)?;
+
+        let analysis_ptr = device.map_memory(
+            analysis_memory,
+            0,
+            analysis_buf_size,
+            vk::MemoryMapFlags::empty(),
+        )? as *mut TileAnalysis;
+
         Ok(Self {
             _entry: entry,
             instance,
@@ -496,6 +596,13 @@ impl GpuFrameProcessor {
             nv12_pipeline,
             nv12_pipeline_layout,
             nv12_descriptor_set_layout,
+            analysis_shader_module,
+            analysis_pipeline,
+            analysis_pipeline_layout,
+            analysis_descriptor_set_layout,
+            analysis_buffer,
+            analysis_memory,
+            analysis_ptr,
             descriptor_pool,
             prev_image: None,
             sad_buffer,
@@ -1591,6 +1698,11 @@ impl Drop for GpuFrameProcessor {
             self.device.destroy_buffer(self.sad_buffer, None);
             self.device.free_memory(self.sad_memory, None);
 
+            // Analysis buffer
+            self.device.unmap_memory(self.analysis_memory);
+            self.device.destroy_buffer(self.analysis_buffer, None);
+            self.device.free_memory(self.analysis_memory, None);
+
             self.device
                 .destroy_descriptor_pool(self.descriptor_pool, None);
 
@@ -1611,6 +1723,15 @@ impl Drop for GpuFrameProcessor {
             self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
             self.device.destroy_shader_module(self.shader_module, None);
+
+            // Analysis pipeline
+            self.device
+                .destroy_descriptor_set_layout(self.analysis_descriptor_set_layout, None);
+            self.device.destroy_pipeline(self.analysis_pipeline, None);
+            self.device
+                .destroy_pipeline_layout(self.analysis_pipeline_layout, None);
+            self.device
+                .destroy_shader_module(self.analysis_shader_module, None);
 
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_device(None);
