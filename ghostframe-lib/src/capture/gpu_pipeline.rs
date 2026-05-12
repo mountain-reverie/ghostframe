@@ -198,7 +198,6 @@ pub struct GpuFrameProcessor {
     // `TileAnalysis` (80 bytes per tile).
     analysis_buffer: vk::Buffer,
     analysis_memory: vk::DeviceMemory,
-    #[allow(dead_code)] // used in Task 4 dispatch
     analysis_ptr: *mut TileAnalysis,
 
     descriptor_pool: vk::DescriptorPool,
@@ -855,6 +854,17 @@ impl GpuFrameProcessor {
         };
         let nv12_ds = nv12_ds_guard.sets[0];
 
+        let analysis_set_layouts = [self.analysis_descriptor_set_layout];
+        let analysis_ds_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(&analysis_set_layouts);
+        let analysis_ds_guard = ScopedDescriptorSets {
+            device: &self.device,
+            pool: self.descriptor_pool,
+            sets: self.device.allocate_descriptor_sets(&analysis_ds_alloc)?,
+        };
+        let analysis_ds = analysis_ds_guard.sets[0];
+
         // Write SAD descriptor set.
         let current_image_info = [vk::DescriptorImageInfo::default()
             .image_view(current.view)
@@ -906,6 +916,28 @@ impl GpuFrameProcessor {
                 .buffer_info(&nv12_buffer_info),
         ];
         self.device.update_descriptor_sets(&nv12_writes, &[]);
+
+        // Write Analysis descriptor set.
+        let analysis_image_info = [vk::DescriptorImageInfo::default()
+            .image_view(current.view)
+            .image_layout(vk::ImageLayout::GENERAL)];
+        let analysis_buffer_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.analysis_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let analysis_writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(analysis_ds)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(&analysis_image_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(analysis_ds)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&analysis_buffer_info),
+        ];
+        self.device.update_descriptor_sets(&analysis_writes, &[]);
 
         // --- Command buffer (RAII-guarded) ---
         let cmd_alloc = vk::CommandBufferAllocateInfo::default()
@@ -1031,6 +1063,36 @@ impl GpuFrameProcessor {
         let nv12_groups_y = height.div_ceil(2);
         self.device.cmd_dispatch(cmd, nv12_groups_x, nv12_groups_y, 1);
 
+        // 4b. Analysis dispatch. No barrier needed vs SAD/NV12 — all read
+        // current_frame read-only and write to disjoint buffers; the final
+        // HOST-readback barrier covers all three output buffers.
+        self.device.cmd_bind_pipeline(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.analysis_pipeline,
+        );
+        self.device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.analysis_pipeline_layout,
+            0,
+            &[analysis_ds],
+            &[],
+        );
+        let analysis_push: [u32; 3] = [width, height, cols];
+        let analysis_push_bytes = std::slice::from_raw_parts(
+            analysis_push.as_ptr() as *const u8,
+            std::mem::size_of_val(&analysis_push),
+        );
+        self.device.cmd_push_constants(
+            cmd,
+            self.analysis_pipeline_layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            analysis_push_bytes,
+        );
+        self.device.cmd_dispatch(cmd, cols, rows, 1);
+
         // 5a. Snapshot copy: current (DMA-BUF) → prev_image (owned). This
         // makes prev_image a true point-in-time snapshot of THIS frame for
         // the next frame's SAD comparison. Must run AFTER both SAD and NV12
@@ -1116,7 +1178,7 @@ impl GpuFrameProcessor {
             &post_copy_barrier,
         );
 
-        // 5. Barriers: SAD buffer → HOST_READ; NV12 buffer → HOST_READ
+        // 5. Barriers: SAD buffer → HOST_READ; NV12 buffer → HOST_READ; analysis buffer → HOST_READ
         let buf_barriers = [
             vk::BufferMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE)
@@ -1132,6 +1194,14 @@ impl GpuFrameProcessor {
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .buffer(nv12_buffer)
+                .offset(0)
+                .size(vk::WHOLE_SIZE),
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.analysis_buffer)
                 .offset(0)
                 .size(vk::WHOLE_SIZE),
         ];
@@ -1184,7 +1254,7 @@ impl GpuFrameProcessor {
         // 8. Per-frame transients (descriptor sets, command buffer, fence) are
         //    freed when their RAII guards drop at end of scope. We touch the
         //    guards here to keep them alive past the `wait_for_fences` above.
-        let _ = (&sad_ds_guard, &nv12_ds_guard, &cmd_guard, &fence_guard);
+        let _ = (&sad_ds_guard, &nv12_ds_guard, &analysis_ds_guard, &cmd_guard, &fence_guard);
 
         // 9. prev_image is persistent (own-allocated, layout still GENERAL
         // after the post-copy barrier). It now holds a snapshot of THIS frame
@@ -1202,8 +1272,8 @@ impl GpuFrameProcessor {
             nv12_y_stride,
             nv12_uv_stride,
             nv12_uv_offset,
-            tile_analysis: std::ptr::null(),
-            tile_analysis_len: 0,
+            tile_analysis: self.analysis_ptr as *const TileAnalysis,
+            tile_analysis_len: cols * rows,
         })
     }
 
@@ -2028,5 +2098,44 @@ mod tests {
         assert_eq!(slice[0].count, 1);
         assert_eq!(slice[1].edge_density_thou, 200);
         assert_eq!(slice[1].colors[0], 0xBBBBBBBBu32);
+    }
+
+    #[test]
+    fn process_frame_returns_tile_analysis_for_solid_red() {
+        // Solid red 32×32 → exactly one tile, count=1, edge_density_thou=0.
+        let width = 32u32;
+        let height = 32u32;
+        let stride = width * 4;
+        // BGRA: B=0, G=0, R=255, A=255 → packed u32 = 0xFFFF0000
+        let pixel: [u8; 4] = [0, 0, 255, 255];
+
+        let mut processor = match GpuFrameProcessor::new(256) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("Skipping process_frame_returns_tile_analysis (no Vulkan GPU?): {e}");
+                return;
+            }
+        };
+
+        unsafe {
+            let fd = make_memfd(width, height, pixel);
+            let analysis = match processor.process_frame(fd, width, height, stride) {
+                Ok(a) => a,
+                Err(e) => {
+                    libc::close(fd);
+                    eprintln!("Skipping (memfd not a real DMA-BUF): {e}");
+                    return;
+                }
+            };
+            libc::close(fd);
+
+            assert!(!analysis.tile_analysis.is_null(), "tile_analysis pointer must not be null");
+            assert_eq!(analysis.tile_analysis_len, 1, "32x32 frame → 1 tile");
+            let slice = analysis.tile_analysis_slice();
+            assert_eq!(slice.len(), 1);
+            assert_eq!(slice[0].count, 1, "solid tile → count=1");
+            assert_eq!(slice[0].colors[0], 0xFFFF0000u32, "BGRA(0,0,255,255) → 0xFFFF0000");
+            assert_eq!(slice[0].edge_density_thou, 0, "solid tile → no edges");
+        }
     }
 }
