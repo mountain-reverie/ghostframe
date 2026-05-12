@@ -619,7 +619,6 @@ async fn e2e_codec_transition() -> Result<()> {
 /// 15 full rows + 1 partial row of 20px tall). These partial tiles must
 /// be encoded, transported, and decoded without corruption.
 #[tokio::test]
-#[ignore = "blocked on canvas-resize-clears-tiles: setting canvas.width/height erases previously drawn tiles; tiles that arrive before the canvas reaches its final size (triggered by the last edge tile) are wiped, so the center-pixel baseline consistently reads r=0. Fix requires rendering into an off-screen buffer and only blitting once the canvas is at final size (or a server-side frame-dimensions message so the client pre-sizes the canvas before tiles arrive)."]
 async fn e2e_edge_tiles() -> Result<()> {
     let setup = setup_e2e_with_env("--solid-red", &[
         ("XORG_CONF", "/etc/X11/xorg-odd.conf"),
@@ -693,7 +692,6 @@ async fn e2e_edge_tiles() -> Result<()> {
 /// Samples pixels at multiple tile-center positions across the 640x480
 /// frame to ensure the full grid (20x15 = 300 tiles) is being served.
 #[tokio::test]
-#[ignore = "blocked on canvas-resize-clears-tiles: the web client grows the canvas tile-by-tile and each canvas.width/height assignment erases all previously drawn content. Tiles that arrive before the canvas reaches 640x480 (triggered by tile (19,14)) are wiped, leaving only the few tiles that arrive last. Specific grid positions therefore consistently fail the 5/9 threshold. Fix: pre-size the canvas via a server-side frame-dimensions message before emitting the first tile."]
 async fn e2e_multi_tile_grid() -> Result<()> {
     let setup = setup_e2e("--solid-red").await?;
 
@@ -744,7 +742,6 @@ async fn e2e_multi_tile_grid() -> Result<()> {
 /// positions. Post-M3 (CDF 5/3 refinement) this test should be tightened
 /// to assert SSIM > 0.99 against a reference PNG; see TODO below.
 #[tokio::test]
-#[ignore = "blocked on canvas-resize-clears-tiles: the web client resizes canvas dynamically as tiles arrive; each canvas.width/height write clears the entire canvas. Glyph-region tiles at (81,100) arrive before the canvas has reached 640x480, so they are erased by later resizes triggered by tiles at higher tile coords. Both ink and bg read as 0. Fix: pre-size canvas via a server-side frame-dimensions message before the first tile."]
 async fn e2e_text_clarity() -> Result<()> {
     use ghostframe_test_pattern::text_grid::SAMPLES;
 
@@ -1091,7 +1088,6 @@ async fn e2e_resolution_change() -> Result<()> {
 /// drive codec-selection assertions via a future stats channel — see
 /// `Region::expected_codec`.
 #[tokio::test]
-#[ignore = "blocked on canvas-resize-clears-tiles: same root cause as e2e_edge_tiles / e2e_multi_tile_grid. The solid region (top-left 320x240, tiles 0..9,0..7) is entirely wiped by the canvas resize triggered when the spinner region's last tile extends the canvas to 640x480. Solid region reads 0/9 red. Fix: pre-size canvas from a server-supplied frame-dimensions message before tiles arrive."]
 async fn e2e_multi_pattern() -> Result<()> {
     use ghostframe_test_pattern::mixed::{region, SETTLE};
 
