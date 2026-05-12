@@ -2341,8 +2341,9 @@ mod tests {
             let slice = analysis.tile_analysis_slice();
             assert_eq!(analysis.tile_analysis_len, 4, "40x40 → 2x2 tile grid");
 
-            // Tile (1,0) — index = 0 * cols + 1 = 1
-            let edge_tile = &slice[1];
+            // Tile (1,0): row 0, col 1 of a `cols`-wide grid.
+            let tile_10_idx = (0 * cols + 1) as usize;
+            let edge_tile = &slice[tile_10_idx];
             assert_eq!(edge_tile.count, 2, "tile (1,0) has red + green");
             // With proper denominator=256: density ≈ (~3 * 1000) / 256 ≈ 11
             // With naive denominator=1024: density ≈ (~3 * 1000) / 1024 ≈ 2
@@ -2351,8 +2352,6 @@ mod tests {
                 "frame-edge tile denominator wrong: density = {} (expected > 5 with denom=256)",
                 edge_tile.edge_density_thou
             );
-
-            let _ = cols; // suppress unused warning in case future asserts drop the index calc
         }
     }
 
