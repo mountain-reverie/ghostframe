@@ -80,6 +80,8 @@ pub struct IoBridge {
     classifier: crate::tile::Classifier,
     /// Last-emitted frame mode (carried across frames for hysteresis).
     frame_mode: crate::tile::FrameMode,
+    /// Round-robin tile-work scheduler shared by both CPU and GPU emission paths.
+    scheduler: crate::transport::scheduler::Scheduler,
     /// Remaining frames to force all-dirty after a new session connects.
     /// QUIC slow-start can only deliver a fraction of tiles in the first burst;
     /// forcing dirty for several frames lets the congestion window open.
@@ -160,6 +162,7 @@ impl IoBridge {
             metrics_tracker: crate::tile::MetricsTracker::new(0, 0),
             classifier: crate::tile::Classifier::default(),
             frame_mode: crate::tile::FrameMode::TileCodec,
+            scheduler: crate::transport::scheduler::Scheduler::new(0, 0),
             force_dirty_frames: 0,
             fec_k: std::env::var("GHOSTFRAME_FEC_K")
                 .ok()
@@ -439,9 +442,10 @@ impl IoBridge {
             .map(|&idx| (idx % cols, idx / cols))
             .collect();
 
-        // Keep metrics_tracker grid in sync with the dirty-detection grid.
+        // Keep metrics_tracker AND scheduler grids in sync with dirty-detection.
         if self.metrics_tracker.cols() != cols || self.metrics_tracker.rows() != rows {
             self.metrics_tracker.resize(cols, rows);
+            self.scheduler.resize(cols, rows);
         }
         // Always update per-tile metrics — idle_frames advances on every frame,
         // EMA decays toward 0 when tiles aren't dirty.
@@ -576,19 +580,13 @@ impl IoBridge {
                 }
             }
             FrameMode::TileCodec => {
-                // Emit each dirty tile as Codec::Raw — same loop shape as
-                // process_frame_cpu's tile-emit path. fragment_tile expects
-                // the per-fragment payload size, not the raw datagram size.
                 let max_frag = max_fragment_payload(max_dg_size);
                 if max_frag == 0 {
                     return;
                 }
 
-                // Source for tile pixel extraction. The CPU path populates
-                // `frame.pixels` directly; the GPU/DMA-BUF path leaves it
-                // empty because the data is GPU-resident. Read it back here,
-                // only when the classifier actually selected TileCodec mode
-                // (the H264 branch stays zero-copy via the NV12 buffer).
+                // Source for tile pixel extraction. CPU path populates
+                // `frame.pixels`; GPU/DMA-BUF leaves it empty.
                 let pixels_owned;
                 let pixels: &[u8] = if frame.pixels.is_empty() {
                     match frame.dmabuf_fd.as_ref() {
@@ -606,8 +604,7 @@ impl IoBridge {
                         },
                         None => {
                             tracing::warn!(
-                                "TileCodec mode but no pixels and no DMA-BUF fd; \
-                                 skipping frame",
+                                "TileCodec mode but no pixels and no DMA-BUF fd; skipping frame",
                             );
                             return;
                         }
@@ -617,21 +614,69 @@ impl IoBridge {
                 };
 
                 let grid = TileGrid::new(frame.width, frame.height);
+
+                // Best available RTT estimate across connected sessions.
+                let rtt = self.server.connections.values()
+                    .map(|c| c.stats().path.rtt)
+                    .min()
+                    .unwrap_or_else(|| std::time::Duration::from_millis(20));
+                self.scheduler.set_rtt(rtt);
+
+                use crate::encoder::solid::encode_solid;
+                use crate::tile::CodecState;
+                use crate::transport::scheduler::{TileWork, WorkState};
+                use std::time::Instant;
                 for &(tile_x, tile_y) in &dirty_xy {
-                    let tile_data = grid.extract_tile(
-                        pixels, frame.stride, tile_x, tile_y,
-                    );
+                    self.scheduler.bump_generation(tile_x as u8, tile_y as u8);
+                    let gen = self.scheduler.generation_for(tile_x as u8, tile_y as u8);
+                    let codec_state = self.metrics_tracker.get(tile_x, tile_y).codec_state;
+                    let (codec, payload) = match codec_state {
+                        CodecState::Solid => {
+                            let td = grid.extract_tile(pixels, frame.stride, tile_x, tile_y);
+                            let solid = encode_solid(&td);
+                            (Codec::Solid, solid.to_vec())
+                        }
+                        // All other states emit Raw via the scheduler in M3.1.
+                        // Real per-tile codecs (PalRle, Bc1, Cdf53) arrive in M3.2+.
+                        _ => {
+                            let td = grid.extract_tile(pixels, frame.stride, tile_x, tile_y);
+                            (Codec::Raw, td)
+                        }
+                    };
+                    self.scheduler.enqueue(TileWork {
+                        tile_x: tile_x as u8,
+                        tile_y: tile_y as u8,
+                        generation: gen,
+                        pass_idx: 0,
+                        total_passes: 1,
+                        codec,
+                        payload,
+                        queued_at: Instant::now(),
+                        last_sent_at: None,
+                        state: WorkState::Pending,
+                    });
+                }
+
+                let drained = self.scheduler.tick(usize::MAX);
+                for work in drained {
                     let datagrams = fragment_tile(
                         seq | TILE_DATAGRAM_FLAG,
-                        tile_x as u8,
-                        tile_y as u8,
-                        Codec::Raw,
-                        &tile_data,
+                        work.tile_x,
+                        work.tile_y,
+                        work.codec,
+                        &work.payload,
                         frame.timestamp_us,
                         max_frag,
                     );
-                    for dg in &datagrams {
-                        self.send_to_all_sessions(dg);
+                    // fragment_tile constructs TileHeader with generation=0, pass=0
+                    // (per its current signature). Patch byte [3] of each datagram
+                    // to carry our actual gen/pass. This is byte (DATAGRAM_HEADER_SIZE + 3).
+                    let header_byte = ((work.generation & 0x0F) << 4) | (work.pass_idx & 0x0F);
+                    for mut dg in datagrams {
+                        if dg.len() > DATAGRAM_HEADER_SIZE + 3 {
+                            dg[DATAGRAM_HEADER_SIZE + 3] = header_byte;
+                        }
+                        self.send_to_all_sessions(&dg);
                     }
                 }
             }
@@ -947,6 +992,7 @@ impl IoBridge {
             metrics_tracker: crate::tile::MetricsTracker::new(0, 0),
             classifier: crate::tile::Classifier::default(),
             frame_mode: crate::tile::FrameMode::TileCodec,
+            scheduler: crate::transport::scheduler::Scheduler::new(0, 0),
             force_dirty_frames: 0,
             fec_k: 0,
             fec_enable_threshold: FEC_ENABLE_THRESHOLD,
@@ -974,6 +1020,7 @@ impl IoBridge {
             metrics_tracker: crate::tile::MetricsTracker::new(0, 0),
             classifier: crate::tile::Classifier::default(),
             frame_mode: crate::tile::FrameMode::TileCodec,
+            scheduler: crate::transport::scheduler::Scheduler::new(0, 0),
             force_dirty_frames: 0,
             fec_k: 0,
             fec_enable_threshold: FEC_ENABLE_THRESHOLD,
@@ -1231,6 +1278,20 @@ mod tests {
             c.decide_frame_mode(&busy, FrameMode::TileCodec),
             FrameMode::TileCodec
         );
+    }
+
+    /// IoBridge must hold a Scheduler that resizes alongside metrics_tracker
+    /// and dirty_tracker. This test verifies the scheduler field is present
+    /// and zero-sized at construction time.
+    #[tokio::test]
+    async fn iobridge_holds_scheduler_zero_sized_on_construction() {
+        let (our_end, _peer) = UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("server");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+        assert_eq!(bridge.scheduler.cols(), 0);
+        assert_eq!(bridge.scheduler.rows(), 0);
+        assert_eq!(bridge.scheduler.queue_len(), 0);
     }
 
     /// Coverage for C1: when a new session reconnects, the existing
