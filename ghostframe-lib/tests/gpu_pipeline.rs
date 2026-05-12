@@ -473,3 +473,60 @@ fn gpu_pipeline_nv12_conversion() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Test 5: tile_analysis on subsequent frame
+// ---------------------------------------------------------------------------
+
+/// Verify first-frame returns null tile_analysis (by design) and the second
+/// frame returns a populated buffer with the expected solid-red contents.
+#[test]
+fn tile_analysis_populated_on_subsequent_frame() {
+    let width = 32u32;
+    let height = 32u32;
+    let stride = width * 4;
+
+    let mut processor = match GpuFrameProcessor::new(256) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Skipping tile_analysis integration (no Vulkan GPU?): {e}");
+            return;
+        }
+    };
+
+    unsafe {
+        // First frame: opaque red. analysis.tile_analysis is null on first frame
+        // (the analysis pipeline isn't dispatched until the second frame, which
+        // is the steady-state path).
+        let fd1 = create_solid_memfd(width, height, /*B=*/0, /*G=*/0, /*R=*/255);
+        let first = match processor.process_frame(fd1, width, height, stride) {
+            Ok(a) => a,
+            Err(e) => {
+                libc::close(fd1);
+                eprintln!("Skipping (memfd not a real DMA-BUF): {e}");
+                return;
+            }
+        };
+        libc::close(fd1);
+        assert!(first.tile_analysis.is_null(), "first-frame analysis is null by design");
+
+        // Second frame: same opaque red. Now the analysis pipeline dispatches.
+        let fd2 = create_solid_memfd(width, height, 0, 0, 255);
+        let second = match processor.process_frame(fd2, width, height, stride) {
+            Ok(a) => a,
+            Err(e) => {
+                libc::close(fd2);
+                eprintln!("Skipping second frame: {e}");
+                return;
+            }
+        };
+        libc::close(fd2);
+
+        assert!(!second.tile_analysis.is_null(), "second-frame analysis non-null");
+        assert_eq!(second.tile_analysis_len, 1, "32x32 frame → 1 tile");
+        let slice = second.tile_analysis_slice();
+        assert_eq!(slice.len(), 1);
+        assert_eq!(slice[0].count, 1, "solid tile → count=1");
+        assert_eq!(slice[0].colors[0], 0xFFFF0000u32);
+        assert_eq!(slice[0].edge_density_thou, 0);
+    }
+}
