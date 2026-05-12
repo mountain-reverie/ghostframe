@@ -5,4 +5,5 @@ pub mod ghostbridge;
 pub mod io_bridge;
 pub mod protocol;
 pub mod quic;
+pub mod scheduler;
 pub mod webtransport;
