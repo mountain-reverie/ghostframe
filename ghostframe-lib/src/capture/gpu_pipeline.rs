@@ -2212,4 +2212,68 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn process_frame_tile_analysis_overflow_at_17_colors() {
+        // Place 17 distinct colors spread across the tile. Expect count=17 sentinel.
+        let width = 32u32;
+        let height = 32u32;
+        let stride = width * 4;
+
+        let mut processor = match GpuFrameProcessor::new(256) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("Skipping overflow test (no Vulkan GPU?): {e}");
+                return;
+            }
+        };
+
+        unsafe {
+            let size = (stride * height) as usize;
+            let name = std::ffi::CString::new("ghost-test-overflow").unwrap();
+            let fd = libc::memfd_create(name.as_ptr(), 0);
+            assert!(fd >= 0);
+            libc::ftruncate(fd, size as i64);
+            let ptr = libc::mmap(
+                std::ptr::null_mut(), size,
+                libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0,
+            );
+            assert_ne!(ptr, libc::MAP_FAILED);
+            let frame = std::slice::from_raw_parts_mut(ptr as *mut u8, size);
+            // 17 distinct BGRA colors. Background = color 0.
+            let colors: [[u8; 4]; 17] = [
+                [10, 20, 30, 255],   [40, 50, 60, 255],   [70, 80, 90, 255],
+                [100, 110, 120, 255], [130, 140, 150, 255], [160, 170, 180, 255],
+                [190, 200, 210, 255], [220, 230, 240, 255], [5, 15, 25, 255],
+                [35, 45, 55, 255],   [65, 75, 85, 255],   [95, 105, 115, 255],
+                [125, 135, 145, 255], [155, 165, 175, 255], [185, 195, 205, 255],
+                [215, 225, 235, 255], [245, 250, 254, 255],
+            ];
+            for chunk in frame.chunks_exact_mut(4) {
+                chunk.copy_from_slice(&colors[0]);
+            }
+            // Place each of the 17 colors at distinct pixel positions.
+            for (i, c) in colors.iter().enumerate() {
+                let x = (i as u32 * 7) % width;   // stride 7 keeps placements spread out
+                let y = (i as u32 * 11) % height;
+                let off = ((y * stride) + x * 4) as usize;
+                frame[off..off + 4].copy_from_slice(c);
+            }
+            libc::munmap(ptr, size);
+
+            let analysis = match processor.process_frame(fd, width, height, stride) {
+                Ok(a) => a,
+                Err(e) => {
+                    libc::close(fd);
+                    eprintln!("Skipping overflow (memfd not a real DMA-BUF): {e}");
+                    return;
+                }
+            };
+            libc::close(fd);
+
+            let entry = &analysis.tile_analysis_slice()[0];
+            assert_eq!(entry.count, 17, "17 distinct colors → overflow sentinel");
+            // colors[] is undefined per contract — do not assert on it.
+        }
+    }
 }
