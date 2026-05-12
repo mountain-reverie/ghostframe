@@ -2,6 +2,17 @@ export const DATAGRAM_HEADER_SIZE = 12;
 export const TILE_HEADER_SIZE = 8;
 export const TILE_SIZE = 32;
 
+/**
+ * Sentinel tile coordinates marking a "tile datagram" that actually carries
+ * a frame-dimensions message instead of pixel data. Tile coords are u8;
+ * 0xFF (255) is structurally impossible at any sensible resolution
+ * (would imply a screen ≥ 8000 px wide), so the receiver routes on the sentinel.
+ *
+ * Payload: 8 bytes — `[width: u32 BE][height: u32 BE]`.
+ */
+export const FRAME_DIMENSIONS_SENTINEL_X = 0xFF;
+export const FRAME_DIMENSIONS_SENTINEL_Y = 0xFF;
+
 export const enum Codec {
   Skip = 0, H264 = 1, PalRle = 2, Bc1 = 3, Solid = 4, Raw = 5, Cdf53 = 6,
 }

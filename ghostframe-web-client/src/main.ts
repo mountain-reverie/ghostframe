@@ -3,6 +3,7 @@ import {
   decodeDatagramHeader, decodeTileHeader, tileKey, TileAssembly, H264TileDecoder,
   FRAME_HEADER_SIZE, TILE_DATAGRAM_FLAG, FrameAssembly,
   isTileDatagram, decodeFrameHeader, frameKey, FullFrameDecoder,
+  FRAME_DIMENSIONS_SENTINEL_X, FRAME_DIMENSIONS_SENTINEL_Y,
 } from './decoder';
 import { TileRenderer } from './renderer';
 import { ParityRecovery } from './fec';
@@ -143,6 +144,20 @@ async function main() {
 
     const tX = asm.header.tileX;
     const tY = asm.header.tileY;
+
+    // Frame-dimensions control message — sentinel tile coords (0xFF, 0xFF)
+    // identify a tile-shaped datagram that actually carries (width, height).
+    // The server pre-sizes the canvas this way so tiles arrive after the
+    // canvas is at final size, avoiding the canvas-resize-clears-tiles bug.
+    if (tX === FRAME_DIMENSIONS_SENTINEL_X && tY === FRAME_DIMENSIONS_SENTINEL_Y) {
+      if (payload.byteLength >= 8) {
+        const view = new DataView(payload.buffer, payload.byteOffset, 8);
+        const w = view.getUint32(0, false); // big-endian
+        const h = view.getUint32(4, false);
+        renderer.resize(w, h);
+      }
+      return;
+    }
 
     const minWidth = (tX + 1) * TILE_SIZE;
     const minHeight = (tY + 1) * TILE_SIZE;
@@ -353,6 +368,21 @@ async function main() {
         }
       }
       continue; // Don't process as a source fragment
+    }
+
+    // Frame-dimensions control message — sentinel tile coords (0xFF, 0xFF) with
+    // codec Skip and an 8-byte BE [width, height] payload. Must be handled before
+    // the generic Skip guard below (which would silently discard the payload).
+    if (tileHdr.tileX === FRAME_DIMENSIONS_SENTINEL_X && tileHdr.tileY === FRAME_DIMENSIONS_SENTINEL_Y) {
+      const payloadStart = DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE;
+      const payloadBytes = value.byteLength - payloadStart;
+      if (payloadBytes >= 8) {
+        const dimView = new DataView(value.buffer, value.byteOffset + payloadStart, 8);
+        const w = dimView.getUint32(0, false); // big-endian
+        const h = dimView.getUint32(4, false);
+        renderer.resize(w, h);
+      }
+      continue;
     }
 
     // Skip codec: tile unchanged, canvas retains last content
