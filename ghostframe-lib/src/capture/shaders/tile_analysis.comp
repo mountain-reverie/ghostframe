@@ -139,13 +139,12 @@ void main() {
     }
 
     // ---- Phase 2: Sobel-style edge density on summed RGB. ----
-    int s_self  = 0, s_left = 0, s_right = 0, s_up = 0, s_down = 0;
+    int s_left = 0, s_right = 0, s_up = 0, s_down = 0;
     if (in_bounds) {
         int xm = clamp(px - 1, 0, int(frame_width)  - 1);
         int xp = clamp(px + 1, 0, int(frame_width)  - 1);
         int ym = clamp(py - 1, 0, int(frame_height) - 1);
         int yp = clamp(py + 1, 0, int(frame_height) - 1);
-        s_self  = rgb_sum(imageLoad(current_frame, ivec2(px, py)));
         s_left  = rgb_sum(imageLoad(current_frame, ivec2(xm, py)));
         s_right = rgb_sum(imageLoad(current_frame, ivec2(xp, py)));
         s_up    = rgb_sum(imageLoad(current_frame, ivec2(px, ym)));
