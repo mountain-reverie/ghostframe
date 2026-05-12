@@ -2144,16 +2144,31 @@ mod tests {
         };
 
         unsafe {
-            let fd = make_memfd(width, height, pixel);
-            let analysis = match processor.process_frame(fd, width, height, stride) {
+            // First frame: NV12 + snapshot only, no analysis dispatch.
+            // tile_analysis is null by design — we just need to seed prev_image.
+            let fd1 = make_memfd(width, height, pixel);
+            let first = match processor.process_frame(fd1, width, height, stride) {
                 Ok(a) => a,
                 Err(e) => {
-                    libc::close(fd);
+                    libc::close(fd1);
                     eprintln!("Skipping (memfd not a real DMA-BUF): {e}");
                     return;
                 }
             };
-            libc::close(fd);
+            libc::close(fd1);
+            assert!(first.tile_analysis.is_null(), "first-frame analysis is null by design");
+
+            // Second frame: same content. Now the analysis pipeline dispatches.
+            let fd2 = make_memfd(width, height, pixel);
+            let analysis = match processor.process_frame(fd2, width, height, stride) {
+                Ok(a) => a,
+                Err(e) => {
+                    libc::close(fd2);
+                    eprintln!("Skipping (memfd not a real DMA-BUF): {e}");
+                    return;
+                }
+            };
+            libc::close(fd2);
 
             assert!(
                 !analysis.tile_analysis.is_null(),
@@ -2187,43 +2202,62 @@ mod tests {
         };
 
         unsafe {
-            let size = (stride * height) as usize;
-            let name = std::ffi::CString::new("ghost-test-checkerboard").unwrap();
-            let fd = libc::memfd_create(name.as_ptr(), 0);
-            assert!(fd >= 0);
-            libc::ftruncate(fd, size as i64);
-            let ptr = libc::mmap(
-                std::ptr::null_mut(),
-                size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            );
-            assert_ne!(ptr, libc::MAP_FAILED);
-            let frame = std::slice::from_raw_parts_mut(ptr as *mut u8, size);
-            for y in 0..height {
-                for x in 0..width {
-                    let offset = ((y * stride) + x * 4) as usize;
-                    let bgra = if (x + y) & 1 == 0 {
-                        [255, 0, 0, 255] // blue
-                    } else {
-                        [0, 0, 255, 255] // red
-                    };
-                    frame[offset..offset + 4].copy_from_slice(&bgra);
+            let make_fd = |name_suffix: &str| -> std::os::unix::io::RawFd {
+                let size = (stride * height) as usize;
+                let name = std::ffi::CString::new(format!("ghost-test-checkerboard-{}", name_suffix)).unwrap();
+                let fd = libc::memfd_create(name.as_ptr(), 0);
+                assert!(fd >= 0);
+                libc::ftruncate(fd, size as i64);
+                let ptr = libc::mmap(
+                    std::ptr::null_mut(),
+                    size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                );
+                assert_ne!(ptr, libc::MAP_FAILED);
+                let frame = std::slice::from_raw_parts_mut(ptr as *mut u8, size);
+                for y in 0..height {
+                    for x in 0..width {
+                        let offset = ((y * stride) + x * 4) as usize;
+                        let bgra = if (x + y) & 1 == 0 {
+                            [255, 0, 0, 255] // blue
+                        } else {
+                            [0, 0, 255, 255] // red
+                        };
+                        frame[offset..offset + 4].copy_from_slice(&bgra);
+                    }
                 }
-            }
-            libc::munmap(ptr, size);
+                libc::munmap(ptr, size);
+                fd
+            };
 
-            let analysis = match processor.process_frame(fd, width, height, stride) {
+            // First frame: NV12 + snapshot only, no analysis dispatch.
+            // tile_analysis is null by design — we just need to seed prev_image.
+            let fd1 = make_fd("seed");
+            let first = match processor.process_frame(fd1, width, height, stride) {
                 Ok(a) => a,
                 Err(e) => {
-                    libc::close(fd);
+                    libc::close(fd1);
                     eprintln!("Skipping checkerboard (memfd not a real DMA-BUF): {e}");
                     return;
                 }
             };
-            libc::close(fd);
+            libc::close(fd1);
+            assert!(first.tile_analysis.is_null(), "first-frame analysis is null by design");
+
+            // Second frame: same content. Now the analysis pipeline dispatches.
+            let fd2 = make_fd("real");
+            let analysis = match processor.process_frame(fd2, width, height, stride) {
+                Ok(a) => a,
+                Err(e) => {
+                    libc::close(fd2);
+                    eprintln!("Skipping checkerboard (memfd not a real DMA-BUF): {e}");
+                    return;
+                }
+            };
+            libc::close(fd2);
 
             let entry = &analysis.tile_analysis_slice()[0];
             assert_eq!(entry.count, 2, "checkerboard → 2 unique colors");
@@ -2266,22 +2300,6 @@ mod tests {
         };
 
         unsafe {
-            let size = (stride * height) as usize;
-            let name = std::ffi::CString::new("ghost-test-overflow").unwrap();
-            let fd = libc::memfd_create(name.as_ptr(), 0);
-            assert!(fd >= 0);
-            libc::ftruncate(fd, size as i64);
-            let ptr = libc::mmap(
-                std::ptr::null_mut(),
-                size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            );
-            assert_ne!(ptr, libc::MAP_FAILED);
-            let frame = std::slice::from_raw_parts_mut(ptr as *mut u8, size);
-            // 17 distinct BGRA colors. Background = color 0.
             let colors: [[u8; 4]; 17] = [
                 [10, 20, 30, 255],
                 [40, 50, 60, 255],
@@ -2301,27 +2319,63 @@ mod tests {
                 [215, 225, 235, 255],
                 [245, 250, 254, 255],
             ];
-            for chunk in frame.chunks_exact_mut(4) {
-                chunk.copy_from_slice(&colors[0]);
-            }
-            // Place each of the 17 colors at distinct pixel positions.
-            for (i, c) in colors.iter().enumerate() {
-                let x = (i as u32 * 7) % width; // stride 7 keeps placements spread out
-                let y = (i as u32 * 11) % height;
-                let off = ((y * stride) + x * 4) as usize;
-                frame[off..off + 4].copy_from_slice(c);
-            }
-            libc::munmap(ptr, size);
 
-            let analysis = match processor.process_frame(fd, width, height, stride) {
+            let make_fd = |name_suffix: &str| -> std::os::unix::io::RawFd {
+                let size = (stride * height) as usize;
+                let name = std::ffi::CString::new(format!("ghost-test-overflow-{}", name_suffix)).unwrap();
+                let fd = libc::memfd_create(name.as_ptr(), 0);
+                assert!(fd >= 0);
+                libc::ftruncate(fd, size as i64);
+                let ptr = libc::mmap(
+                    std::ptr::null_mut(),
+                    size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                );
+                assert_ne!(ptr, libc::MAP_FAILED);
+                let frame = std::slice::from_raw_parts_mut(ptr as *mut u8, size);
+                // 17 distinct BGRA colors. Background = color 0.
+                for chunk in frame.chunks_exact_mut(4) {
+                    chunk.copy_from_slice(&colors[0]);
+                }
+                // Place each of the 17 colors at distinct pixel positions.
+                for (i, c) in colors.iter().enumerate() {
+                    let x = (i as u32 * 7) % width; // stride 7 keeps placements spread out
+                    let y = (i as u32 * 11) % height;
+                    let off = ((y * stride) + x * 4) as usize;
+                    frame[off..off + 4].copy_from_slice(c);
+                }
+                libc::munmap(ptr, size);
+                fd
+            };
+
+            // First frame: NV12 + snapshot only, no analysis dispatch.
+            // tile_analysis is null by design — we just need to seed prev_image.
+            let fd1 = make_fd("seed");
+            let first = match processor.process_frame(fd1, width, height, stride) {
                 Ok(a) => a,
                 Err(e) => {
-                    libc::close(fd);
+                    libc::close(fd1);
                     eprintln!("Skipping overflow (memfd not a real DMA-BUF): {e}");
                     return;
                 }
             };
-            libc::close(fd);
+            libc::close(fd1);
+            assert!(first.tile_analysis.is_null(), "first-frame analysis is null by design");
+
+            // Second frame: same content. Now the analysis pipeline dispatches.
+            let fd2 = make_fd("real");
+            let analysis = match processor.process_frame(fd2, width, height, stride) {
+                Ok(a) => a,
+                Err(e) => {
+                    libc::close(fd2);
+                    eprintln!("Skipping overflow (memfd not a real DMA-BUF): {e}");
+                    return;
+                }
+            };
+            libc::close(fd2);
 
             let entry = &analysis.tile_analysis_slice()[0];
             assert_eq!(entry.count, 17, "17 distinct colors → overflow sentinel");
@@ -2359,40 +2413,59 @@ mod tests {
         };
 
         unsafe {
-            let size = (stride * height) as usize;
-            let name = std::ffi::CString::new("ghost-test-edge").unwrap();
-            let fd = libc::memfd_create(name.as_ptr(), 0);
-            assert!(fd >= 0);
-            libc::ftruncate(fd, size as i64);
-            let ptr = libc::mmap(
-                std::ptr::null_mut(),
-                size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            );
-            assert_ne!(ptr, libc::MAP_FAILED);
-            let frame = std::slice::from_raw_parts_mut(ptr as *mut u8, size);
-            for chunk in frame.chunks_exact_mut(4) {
-                chunk.copy_from_slice(&[0, 0, 255, 255]); // red BGRA
-            }
-            // Inject one bright-green pixel at (x=35, y=10) — interior of tile (1,0):
-            // tile (1,0) covers x=32..40, y=0..32; (35,10) is in-bounds and not on
-            // the frame edge.
-            let off = ((10u32 * stride) + 35 * 4) as usize;
-            frame[off..off + 4].copy_from_slice(&[0, 255, 0, 255]); // green BGRA
-            libc::munmap(ptr, size);
+            let make_fd = |name_suffix: &str| -> std::os::unix::io::RawFd {
+                let size = (stride * height) as usize;
+                let name = std::ffi::CString::new(format!("ghost-test-edge-{}", name_suffix)).unwrap();
+                let fd = libc::memfd_create(name.as_ptr(), 0);
+                assert!(fd >= 0);
+                libc::ftruncate(fd, size as i64);
+                let ptr = libc::mmap(
+                    std::ptr::null_mut(),
+                    size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                );
+                assert_ne!(ptr, libc::MAP_FAILED);
+                let frame = std::slice::from_raw_parts_mut(ptr as *mut u8, size);
+                for chunk in frame.chunks_exact_mut(4) {
+                    chunk.copy_from_slice(&[0, 0, 255, 255]); // red BGRA
+                }
+                // Inject one bright-green pixel at (x=35, y=10) — interior of tile (1,0):
+                // tile (1,0) covers x=32..40, y=0..32; (35,10) is in-bounds and not on
+                // the frame edge.
+                let off = ((10u32 * stride) + 35 * 4) as usize;
+                frame[off..off + 4].copy_from_slice(&[0, 255, 0, 255]); // green BGRA
+                libc::munmap(ptr, size);
+                fd
+            };
 
-            let analysis = match processor.process_frame(fd, width, height, stride) {
+            // First frame: NV12 + snapshot only, no analysis dispatch.
+            // tile_analysis is null by design — we just need to seed prev_image.
+            let fd1 = make_fd("seed");
+            let first = match processor.process_frame(fd1, width, height, stride) {
                 Ok(a) => a,
                 Err(e) => {
-                    libc::close(fd);
+                    libc::close(fd1);
                     eprintln!("Skipping frame-edge (memfd not a real DMA-BUF): {e}");
                     return;
                 }
             };
-            libc::close(fd);
+            libc::close(fd1);
+            assert!(first.tile_analysis.is_null(), "first-frame analysis is null by design");
+
+            // Second frame: same content. Now the analysis pipeline dispatches.
+            let fd2 = make_fd("real");
+            let analysis = match processor.process_frame(fd2, width, height, stride) {
+                Ok(a) => a,
+                Err(e) => {
+                    libc::close(fd2);
+                    eprintln!("Skipping frame-edge (memfd not a real DMA-BUF): {e}");
+                    return;
+                }
+            };
+            libc::close(fd2);
 
             let slice = analysis.tile_analysis_slice();
             assert_eq!(analysis.tile_analysis_len, 4, "40x40 → 2x2 tile grid");
@@ -2430,16 +2503,31 @@ mod tests {
         };
 
         unsafe {
-            let fd = make_memfd(width, height, pixel);
-            let analysis = match processor.process_frame(fd, width, height, stride) {
+            // First frame: NV12 + snapshot only, no analysis dispatch.
+            // tile_analysis is null by design — we just need to seed prev_image.
+            let fd1 = make_memfd(width, height, pixel);
+            let first = match processor.process_frame(fd1, width, height, stride) {
                 Ok(a) => a,
                 Err(e) => {
-                    libc::close(fd);
+                    libc::close(fd1);
                     eprintln!("Skipping XOR-mask (memfd not a real DMA-BUF): {e}");
                     return;
                 }
             };
-            libc::close(fd);
+            libc::close(fd1);
+            assert!(first.tile_analysis.is_null(), "first-frame analysis is null by design");
+
+            // Second frame: same content. Now the analysis pipeline dispatches.
+            let fd2 = make_memfd(width, height, pixel);
+            let analysis = match processor.process_frame(fd2, width, height, stride) {
+                Ok(a) => a,
+                Err(e) => {
+                    libc::close(fd2);
+                    eprintln!("Skipping XOR-mask (memfd not a real DMA-BUF): {e}");
+                    return;
+                }
+            };
+            libc::close(fd2);
 
             let entry = &analysis.tile_analysis_slice()[0];
             assert_eq!(entry.count, 1, "transparent-black tile → count=1");
@@ -2473,69 +2561,88 @@ mod tests {
         };
 
         unsafe {
-            let size = (stride * height) as usize;
-            let name = std::ffi::CString::new("ghost-test-multitile").unwrap();
-            let fd = libc::memfd_create(name.as_ptr(), 0);
-            assert!(fd >= 0);
-            libc::ftruncate(fd, size as i64);
-            let ptr = libc::mmap(
-                std::ptr::null_mut(),
-                size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            );
-            assert_ne!(ptr, libc::MAP_FAILED);
-            let frame = std::slice::from_raw_parts_mut(ptr as *mut u8, size);
-
             let red: [u8; 4] = [0, 0, 255, 255];
             let blue: [u8; 4] = [255, 0, 0, 255];
             let green: [u8; 4] = [0, 255, 0, 255];
             let yellow: [u8; 4] = [0, 255, 255, 255];
 
-            // Fill helper.
-            let mut put = |x: u32, y: u32, c: [u8; 4]| {
-                let off = ((y * stride) + x * 4) as usize;
-                frame[off..off + 4].copy_from_slice(&c);
+            let make_fd = |name_suffix: &str| -> std::os::unix::io::RawFd {
+                let size = (stride * height) as usize;
+                let name = std::ffi::CString::new(format!("ghost-test-multitile-{}", name_suffix)).unwrap();
+                let fd = libc::memfd_create(name.as_ptr(), 0);
+                assert!(fd >= 0);
+                libc::ftruncate(fd, size as i64);
+                let ptr = libc::mmap(
+                    std::ptr::null_mut(),
+                    size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                );
+                assert_ne!(ptr, libc::MAP_FAILED);
+                let frame = std::slice::from_raw_parts_mut(ptr as *mut u8, size);
+
+                // Fill helper.
+                let mut put = |x: u32, y: u32, c: [u8; 4]| {
+                    let off = ((y * stride) + x * 4) as usize;
+                    frame[off..off + 4].copy_from_slice(&c);
+                };
+
+                for y in 0..32 {
+                    // tile (0,0): red
+                    for x in 0..32 {
+                        put(x, y, red);
+                    }
+                    // tile (1,0): blue
+                    for x in 32..64 {
+                        put(x, y, blue);
+                    }
+                }
+                for y in 32..64 {
+                    // tile (0,1): red/blue checker
+                    for x in 0..32 {
+                        put(x, y, if (x + y) & 1 == 0 { red } else { blue });
+                    }
+                    // tile (1,1): three colors striped vertically (red/green/yellow)
+                    for x in 32..64 {
+                        let c = match (x - 32) / 11 {
+                            0 => red,
+                            1 => green,
+                            _ => yellow,
+                        };
+                        put(x, y, c);
+                    }
+                }
+                libc::munmap(ptr, size);
+                fd
             };
 
-            for y in 0..32 {
-                // tile (0,0): red
-                for x in 0..32 {
-                    put(x, y, red);
-                }
-                // tile (1,0): blue
-                for x in 32..64 {
-                    put(x, y, blue);
-                }
-            }
-            for y in 32..64 {
-                // tile (0,1): red/blue checker
-                for x in 0..32 {
-                    put(x, y, if (x + y) & 1 == 0 { red } else { blue });
-                }
-                // tile (1,1): three colors striped vertically (red/green/yellow)
-                for x in 32..64 {
-                    let c = match (x - 32) / 11 {
-                        0 => red,
-                        1 => green,
-                        _ => yellow,
-                    };
-                    put(x, y, c);
-                }
-            }
-            libc::munmap(ptr, size);
-
-            let analysis = match processor.process_frame(fd, width, height, stride) {
+            // First frame: NV12 + snapshot only, no analysis dispatch.
+            // tile_analysis is null by design — we just need to seed prev_image.
+            let fd1 = make_fd("seed");
+            let first = match processor.process_frame(fd1, width, height, stride) {
                 Ok(a) => a,
                 Err(e) => {
-                    libc::close(fd);
+                    libc::close(fd1);
                     eprintln!("Skipping multi-tile (memfd not a real DMA-BUF): {e}");
                     return;
                 }
             };
-            libc::close(fd);
+            libc::close(fd1);
+            assert!(first.tile_analysis.is_null(), "first-frame analysis is null by design");
+
+            // Second frame: same content. Now the analysis pipeline dispatches.
+            let fd2 = make_fd("real");
+            let analysis = match processor.process_frame(fd2, width, height, stride) {
+                Ok(a) => a,
+                Err(e) => {
+                    libc::close(fd2);
+                    eprintln!("Skipping multi-tile (memfd not a real DMA-BUF): {e}");
+                    return;
+                }
+            };
+            libc::close(fd2);
 
             let slice = analysis.tile_analysis_slice();
             assert_eq!(analysis.tile_analysis_len, 4);
