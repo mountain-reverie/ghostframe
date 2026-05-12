@@ -2138,4 +2138,78 @@ mod tests {
             assert_eq!(slice[0].edge_density_thou, 0, "solid tile → no edges");
         }
     }
+
+    #[test]
+    fn process_frame_tile_analysis_checkerboard() {
+        // 32×32 frame with 1-pixel checkerboard: pixel (x,y) is red if (x+y)&1, else blue.
+        let width = 32u32;
+        let height = 32u32;
+        let stride = width * 4;
+
+        let mut processor = match GpuFrameProcessor::new(256) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("Skipping checkerboard test (no Vulkan GPU?): {e}");
+                return;
+            }
+        };
+
+        unsafe {
+            let size = (stride * height) as usize;
+            let name = std::ffi::CString::new("ghost-test-checkerboard").unwrap();
+            let fd = libc::memfd_create(name.as_ptr(), 0);
+            assert!(fd >= 0);
+            libc::ftruncate(fd, size as i64);
+            let ptr = libc::mmap(
+                std::ptr::null_mut(), size,
+                libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0,
+            );
+            assert_ne!(ptr, libc::MAP_FAILED);
+            let frame = std::slice::from_raw_parts_mut(ptr as *mut u8, size);
+            for y in 0..height {
+                for x in 0..width {
+                    let offset = ((y * stride) + x * 4) as usize;
+                    let bgra = if (x + y) & 1 == 0 {
+                        [255, 0, 0, 255]   // blue
+                    } else {
+                        [0, 0, 255, 255]   // red
+                    };
+                    frame[offset..offset + 4].copy_from_slice(&bgra);
+                }
+            }
+            libc::munmap(ptr, size);
+
+            let analysis = match processor.process_frame(fd, width, height, stride) {
+                Ok(a) => a,
+                Err(e) => {
+                    libc::close(fd);
+                    eprintln!("Skipping checkerboard (memfd not a real DMA-BUF): {e}");
+                    return;
+                }
+            };
+            libc::close(fd);
+
+            let entry = &analysis.tile_analysis_slice()[0];
+            assert_eq!(entry.count, 2, "checkerboard → 2 unique colors");
+
+            // Both colors must appear; order is slot-traversal, not specified.
+            let blue: u32 = 0xFF0000FF;   // B=255, G=0, R=0, A=255 → 0xFF | 0 | 0 | 0xFF000000
+            let red:  u32 = 0xFFFF0000;   // B=0, G=0, R=255, A=255
+            assert!(
+                (entry.colors[0] == blue || entry.colors[1] == blue) &&
+                (entry.colors[0] == red  || entry.colors[1] == red),
+                "expected both red and blue, got [{:#x}, {:#x}]",
+                entry.colors[0], entry.colors[1]
+            );
+
+            // Most pixels border a different color on at least one cardinal axis;
+            // edge pixels (clamped) reduce density slightly. Lower bound is
+            // generous to absorb edge effects.
+            assert!(
+                entry.edge_density_thou > 700,
+                "checkerboard → edge_density_thou should be high, got {}",
+                entry.edge_density_thou
+            );
+        }
+    }
 }
