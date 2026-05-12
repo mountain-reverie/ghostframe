@@ -38,10 +38,9 @@ use crate::transport::fec;
 use crate::transport::fec::fec_group_size;
 use crate::transport::feedback::ReceiverFeedback;
 use crate::transport::protocol::{
-    build_frame_parity_datagram, build_parity_datagrams, Codec, fragment_frame, fragment_tile,
+    build_frame_parity_datagram, Codec, fragment_frame, fragment_tile,
     max_fragment_payload, max_frame_fragment_payload, FrameHeader, NackMessage,
-    DATAGRAM_HEADER_SIZE, FRAME_HEADER_SIZE, PING_PAYLOAD, PONG_PAYLOAD, TILE_DATAGRAM_FLAG,
-    TILE_HEADER_SIZE,
+    FRAME_HEADER_SIZE, PING_PAYLOAD, PONG_PAYLOAD, TILE_DATAGRAM_FLAG,
 };
 use crate::transport::quic::QuicServer;
 use crate::transport::webtransport::WebTransportServer;
@@ -80,6 +79,14 @@ pub struct IoBridge {
     classifier: crate::tile::Classifier,
     /// Last-emitted frame mode (carried across frames for hysteresis).
     frame_mode: crate::tile::FrameMode,
+    /// Round-robin tile-work scheduler shared by both CPU and GPU emission paths.
+    scheduler: crate::transport::scheduler::Scheduler,
+    /// Cfg-gated outbound-datagram loss injector for e2e tests.
+    #[cfg(any(test, feature = "test-loss-injection"))]
+    pub(crate) outbound_loss: Option<crate::transport::loss_injection::LossInjector>,
+    /// Cfg-gated inbound-datagram loss injector for e2e tests.
+    #[cfg(any(test, feature = "test-loss-injection"))]
+    pub(crate) inbound_loss: Option<crate::transport::loss_injection::LossInjector>,
     /// Remaining frames to force all-dirty after a new session connects.
     /// QUIC slow-start can only deliver a fraction of tiles in the first burst;
     /// forcing dirty for several frames lets the congestion window open.
@@ -98,7 +105,62 @@ pub struct IoBridge {
     recent_frame_fragments: HashMap<(u32, u16), Vec<u8>>,
 }
 
+/// Selects how `dispatch_dirty_tiles_via_scheduler` picks a codec per tile.
+pub(crate) enum SchedulerEmissionPolicy {
+    /// CPU path: every tile emits `Codec::Raw` regardless of classifier state.
+    /// M3.1 D1 keeps the classifier sentinel-gated; this is the actual behavior.
+    CpuRawOnly,
+    /// GPU path: per-tile `CodecState` drives codec choice. `CodecState::Solid`
+    /// → `encode_solid`; everything else → `Codec::Raw`.
+    GpuClassifierDriven,
+}
+
 impl IoBridge {
+    /// Build a `LossInjector` from environment variables. Returns `None` if
+    /// the relevant probability is 0 or env vars aren't set. Recognized env vars
+    /// (where `<DIR>` is either `OUTBOUND` or `INBOUND`):
+    /// - `GHOSTFRAME_<DIR>_LOSS_PROBABILITY` — f32 in [0.0, 1.0], default 0.0
+    /// - `GHOSTFRAME_<DIR>_LOSS_PREDICATE` — one of `all` / `tile` / `ack`,
+    ///    default `all`.
+    /// - `GHOSTFRAME_<DIR>_LOSS_SEED` — u64, default 0.
+    #[cfg(any(test, feature = "test-loss-injection"))]
+    fn loss_injector_from_env(direction: &str) -> Option<crate::transport::loss_injection::LossInjector> {
+        let prob_var = format!("GHOSTFRAME_{direction}_LOSS_PROBABILITY");
+        let pred_var = format!("GHOSTFRAME_{direction}_LOSS_PREDICATE");
+        let seed_var = format!("GHOSTFRAME_{direction}_LOSS_SEED");
+
+        let prob: f32 = std::env::var(&prob_var).ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        if prob <= 0.0 {
+            return None;
+        }
+
+        // Predicate: function pointer that classifies an outbound/inbound
+        // datagram by its first byte. Selected by the *_LOSS_PREDICATE env var.
+        fn predicate_all(_: &[u8]) -> bool { true }
+        // Tile datagrams set bit 31 of frame_seq (TILE_DATAGRAM_FLAG = 0x80000000),
+        // which is the high bit of byte [0] in big-endian wire order.
+        fn predicate_tile(dg: &[u8]) -> bool { !dg.is_empty() && (dg[0] & 0x80) != 0 }
+        // ACK_BATCH_MSG_TYPE = 0x02 (see transport/ack.rs).
+        fn predicate_ack(dg: &[u8]) -> bool {
+            dg.first().copied() == Some(crate::transport::ack::ACK_BATCH_MSG_TYPE)
+        }
+
+        let predicate: crate::transport::loss_injection::DropPredicate =
+            match std::env::var(&pred_var).as_deref() {
+                Ok("tile") => predicate_tile,
+                Ok("ack") => predicate_ack,
+                _ => predicate_all,
+            };
+        let seed: u64 = std::env::var(&seed_var).ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        tracing::info!(direction, prob, "test-loss-injection: installed LossInjector");
+        Some(crate::transport::loss_injection::LossInjector::new(prob, predicate, seed))
+    }
+
     /// Create a new `IoBridge` by connecting to ghostbridge and opening a UDP
     /// listener on `listen_addr` (e.g. `":4443"`).
     pub async fn new(
@@ -160,6 +222,11 @@ impl IoBridge {
             metrics_tracker: crate::tile::MetricsTracker::new(0, 0),
             classifier: crate::tile::Classifier::default(),
             frame_mode: crate::tile::FrameMode::TileCodec,
+            scheduler: crate::transport::scheduler::Scheduler::new(0, 0),
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            outbound_loss: Self::loss_injector_from_env("OUTBOUND"),
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            inbound_loss: Self::loss_injector_from_env("INBOUND"),
             force_dirty_frames: 0,
             fec_k: std::env::var("GHOSTFRAME_FEC_K")
                 .ok()
@@ -230,6 +297,12 @@ impl IoBridge {
 
     /// Send a datagram to all connected WebTransport sessions.
     fn send_to_all_sessions(&mut self, dg: &[u8]) {
+        #[cfg(any(test, feature = "test-loss-injection"))]
+        if let Some(inj) = self.outbound_loss.as_mut() {
+            if inj.should_drop(dg) {
+                return;
+            }
+        }
         for (handle, wt) in &mut self.wt_sessions {
             if !wt.is_connected() {
                 continue;
@@ -240,6 +313,112 @@ impl IoBridge {
                 }
             }
         }
+    }
+
+    /// Shared scheduler dispatch: grid-sync → RTT update → bump+encode+enqueue
+    /// per dirty tile → tick → fragment+send. Called by both `process_frame_cpu`
+    /// and `process_frame_gpu`'s `FrameMode::TileCodec` branch.
+    pub(crate) fn dispatch_dirty_tiles_via_scheduler(
+        &mut self,
+        dirty: &[(u32, u32)],
+        grid: &crate::tile::TileGrid,
+        pixels: &[u8],
+        stride: u32,
+        seq: u32,
+        timestamp_us: u32,
+        max_frag: usize,
+        policy: SchedulerEmissionPolicy,
+    ) {
+        // Grid sync — keep scheduler in lockstep with the dirty-detection grid.
+        if self.scheduler.cols() != grid.cols || self.scheduler.rows() != grid.rows {
+            self.scheduler.resize(grid.cols, grid.rows);
+        }
+
+        // RTT estimate across connected sessions; default to 20 ms if none.
+        let rtt = self.server.connections.values()
+            .map(|c| c.stats().path.rtt)
+            .min()
+            .unwrap_or_else(|| std::time::Duration::from_millis(20));
+        self.scheduler.set_rtt(rtt);
+
+        use crate::transport::scheduler::{TileWork, WorkState};
+        use std::time::Instant;
+
+        for &(tile_x, tile_y) in dirty {
+            self.scheduler.bump_generation(tile_x as u8, tile_y as u8);
+            let gen = self.scheduler.generation_for(tile_x as u8, tile_y as u8);
+            let tile_data = grid.extract_tile(pixels, stride, tile_x, tile_y);
+
+            let (codec, payload) = match policy {
+                SchedulerEmissionPolicy::CpuRawOnly => (Codec::Raw, tile_data),
+                SchedulerEmissionPolicy::GpuClassifierDriven => {
+                    use crate::tile::CodecState;
+                    let codec_state = self.metrics_tracker.get(tile_x, tile_y).codec_state;
+                    match codec_state {
+                        CodecState::Solid => {
+                            let solid = crate::encoder::solid::encode_solid(&tile_data);
+                            (Codec::Solid, solid.to_vec())
+                        }
+                        _ => (Codec::Raw, tile_data),
+                    }
+                }
+            };
+
+            self.scheduler.enqueue(TileWork {
+                tile_x: tile_x as u8,
+                tile_y: tile_y as u8,
+                generation: gen,
+                pass_idx: 0,
+                total_passes: 1,
+                codec,
+                payload,
+                queued_at: Instant::now(),
+                last_sent_at: None,
+                state: WorkState::Pending,
+            });
+        }
+
+        let drained = self.scheduler.tick(usize::MAX);
+        for work in drained {
+            let datagrams = fragment_tile(
+                seq | TILE_DATAGRAM_FLAG,
+                work.tile_x,
+                work.tile_y,
+                work.codec,
+                work.generation,
+                work.pass_idx,
+                &work.payload,
+                timestamp_us,
+                max_frag,
+            );
+            for dg in &datagrams {
+                self.send_to_all_sessions(dg);
+            }
+        }
+    }
+
+    /// Route a single inbound datagram into the appropriate handler.
+    /// Currently dispatches ACK_BATCH_MSG_TYPE; future M3.x message types
+    /// can be added here. Unknown discriminators are silently dropped
+    /// (forward-compatible).
+    pub(crate) fn dispatch_ack_datagram(&mut self, data: &[u8]) {
+        #[cfg(any(test, feature = "test-loss-injection"))]
+        if let Some(inj) = self.inbound_loss.as_mut() {
+            if inj.should_drop(data) {
+                return;
+            }
+        }
+        if data.is_empty() {
+            return;
+        }
+        if data[0] == crate::transport::ack::ACK_BATCH_MSG_TYPE {
+            if let Ok(batch) = crate::transport::ack::AckBatch::decode(data) {
+                for e in batch.entries {
+                    self.scheduler.on_ack(e.tile_x, e.tile_y, e.generation, e.pass);
+                }
+            }
+        }
+        // Other discriminators: silently ignore. Forward-compatible.
     }
 
     /// CPU-side tile-based pipeline (original implementation).
@@ -328,71 +507,23 @@ impl IoBridge {
             return;
         }
 
-        // Encode and send only dirty tiles
-        for (tile_x, tile_y) in &dirty_tiles {
-            let tile_data = grid.extract_tile(&frame.pixels, frame.stride, *tile_x, *tile_y);
-
-            // M3.0: CPU path always emits Raw. No full-frame H.264 emitter
-            // here yet — see design Future Work #7 for the eventual wire-up.
-            let (codec, payload) = (Codec::Raw, tile_data);
-
-            let datagrams = fragment_tile(
-                seq | TILE_DATAGRAM_FLAG,
-                *tile_x as u8,
-                *tile_y as u8,
-                codec,
-                &payload,
-                frame.timestamp_us,
-                max_frag,
-            );
-
-            for dg in &datagrams {
-                for (handle, wt) in &mut self.wt_sessions {
-                    if !wt.is_connected() {
-                        continue;
-                    }
-                    if let Some(conn) = self.server.connections.get_mut(handle) {
-                        if let Err(e) = wt.send_datagram(conn, dg) {
-                            tracing::trace!(?handle, tile_x, tile_y, error = ?e,
-                                "datagram send failed (congestion/buffer full)");
-                        }
-                    }
-                }
-            }
-
-            // Generate and send FEC parity datagrams if enabled
-            // NOTE (M3.0): unreachable in the CPU path — `codec` is always
-            // `Codec::Raw` here per design D13. Retained as plumbing for M3.1+
-            // when per-tile codecs land and the guard condition is widened.
-            if self.fec_k > 0 && codec == Codec::H264 && datagrams.len() > 1 {
-                let source_payloads: Vec<&[u8]> = datagrams.iter().map(|dg| {
-                    &dg[DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE..]
-                }).collect();
-                let parities = fec::generate_parity(&source_payloads, self.fec_k);
-                let parity_dgs = build_parity_datagrams(
-                    seq | TILE_DATAGRAM_FLAG,
-                    *tile_x as u8,
-                    *tile_y as u8,
-                    codec,
-                    frame.timestamp_us,
-                    datagrams.len() as u16,
-                    &parities,
-                );
-                for pdg in &parity_dgs {
-                    for (handle, wt) in &mut self.wt_sessions {
-                        if !wt.is_connected() {
-                            continue;
-                        }
-                        if let Some(conn) = self.server.connections.get_mut(handle) {
-                            if let Err(e) = wt.send_datagram(conn, pdg) {
-                                tracing::trace!(?handle, tile_x, tile_y, error = ?e,
-                                    "parity datagram send failed");
-                            }
-                        }
-                    }
-                }
-            }
+        // Also sync metrics_tracker grid so it stays aligned with dirty_tracker.
+        if self.metrics_tracker.cols() != grid.cols || self.metrics_tracker.rows() != grid.rows {
+            self.metrics_tracker.resize(grid.cols, grid.rows);
         }
+
+        // Route through the shared scheduler-dispatch helper. CPU path emits
+        // Codec::Raw per M3.1 D1 (classifier sentinel-gated).
+        self.dispatch_dirty_tiles_via_scheduler(
+            &dirty_tiles,
+            &grid,
+            &frame.pixels,
+            frame.stride,
+            seq,
+            frame.timestamp_us,
+            max_frag,
+            SchedulerEmissionPolicy::CpuRawOnly,
+        );
     }
 
     /// GPU-accelerated full-frame pipeline: Vulkan compute dirty detection +
@@ -439,9 +570,10 @@ impl IoBridge {
             .map(|&idx| (idx % cols, idx / cols))
             .collect();
 
-        // Keep metrics_tracker grid in sync with the dirty-detection grid.
+        // Keep metrics_tracker AND scheduler grids in sync with dirty-detection.
         if self.metrics_tracker.cols() != cols || self.metrics_tracker.rows() != rows {
             self.metrics_tracker.resize(cols, rows);
+            self.scheduler.resize(cols, rows);
         }
         // Always update per-tile metrics — idle_frames advances on every frame,
         // EMA decays toward 0 when tiles aren't dirty.
@@ -576,19 +708,13 @@ impl IoBridge {
                 }
             }
             FrameMode::TileCodec => {
-                // Emit each dirty tile as Codec::Raw — same loop shape as
-                // process_frame_cpu's tile-emit path. fragment_tile expects
-                // the per-fragment payload size, not the raw datagram size.
                 let max_frag = max_fragment_payload(max_dg_size);
                 if max_frag == 0 {
                     return;
                 }
 
-                // Source for tile pixel extraction. The CPU path populates
-                // `frame.pixels` directly; the GPU/DMA-BUF path leaves it
-                // empty because the data is GPU-resident. Read it back here,
-                // only when the classifier actually selected TileCodec mode
-                // (the H264 branch stays zero-copy via the NV12 buffer).
+                // Source for tile pixel extraction. CPU path populates
+                // `frame.pixels`; GPU/DMA-BUF leaves it empty.
                 let pixels_owned;
                 let pixels: &[u8] = if frame.pixels.is_empty() {
                     match frame.dmabuf_fd.as_ref() {
@@ -606,8 +732,7 @@ impl IoBridge {
                         },
                         None => {
                             tracing::warn!(
-                                "TileCodec mode but no pixels and no DMA-BUF fd; \
-                                 skipping frame",
+                                "TileCodec mode but no pixels and no DMA-BUF fd; skipping frame",
                             );
                             return;
                         }
@@ -617,23 +742,17 @@ impl IoBridge {
                 };
 
                 let grid = TileGrid::new(frame.width, frame.height);
-                for &(tile_x, tile_y) in &dirty_xy {
-                    let tile_data = grid.extract_tile(
-                        pixels, frame.stride, tile_x, tile_y,
-                    );
-                    let datagrams = fragment_tile(
-                        seq | TILE_DATAGRAM_FLAG,
-                        tile_x as u8,
-                        tile_y as u8,
-                        Codec::Raw,
-                        &tile_data,
-                        frame.timestamp_us,
-                        max_frag,
-                    );
-                    for dg in &datagrams {
-                        self.send_to_all_sessions(dg);
-                    }
-                }
+
+                self.dispatch_dirty_tiles_via_scheduler(
+                    &dirty_xy,
+                    &grid,
+                    pixels,
+                    frame.stride,
+                    seq,
+                    frame.timestamp_us,
+                    max_frag,
+                    SchedulerEmissionPolicy::GpuClassifierDriven,
+                );
             }
         }
     }
@@ -848,6 +967,7 @@ impl IoBridge {
                             self.dirty_tracker.reset();
                             self.metrics_tracker.reset();
                             self.classifier.reset();
+                            self.scheduler.clear();
                             self.frame_mode = crate::tile::FrameMode::H264;
                             // `force_dirty_frames` is consumed only by
                             // `process_frame_cpu` (no_commit slow-start mitigation).
@@ -873,6 +993,11 @@ impl IoBridge {
                 }
 
                 Event::DatagramReceived => {
+                    // First pass: drain all available datagrams from the session,
+                    // also responding to pings inline (since we already hold the
+                    // wt+conn borrows). Defer ACK/etc. dispatch to a second pass
+                    // because dispatch_ack_datagram takes `&mut self`.
+                    let mut to_dispatch: Vec<Vec<u8>> = Vec::new();
                     if let Some(wt) = self.wt_sessions.get_mut(&handle) {
                         if let Some(conn) = self.server.connections.get_mut(&handle) {
                             while let Some(payload) = wt.recv_datagram(conn) {
@@ -882,14 +1007,13 @@ impl IoBridge {
                                         tracing::warn!(?handle, error = ?e, "failed to send pong");
                                     }
                                 } else {
-                                    tracing::trace!(
-                                        ?handle,
-                                        bytes = payload.len(),
-                                        "WebTransport datagram received (unknown payload)"
-                                    );
+                                    to_dispatch.push(payload);
                                 }
                             }
                         }
+                    }
+                    for dg in to_dispatch {
+                        self.dispatch_ack_datagram(&dg);
                     }
                 }
 
@@ -947,6 +1071,11 @@ impl IoBridge {
             metrics_tracker: crate::tile::MetricsTracker::new(0, 0),
             classifier: crate::tile::Classifier::default(),
             frame_mode: crate::tile::FrameMode::TileCodec,
+            scheduler: crate::transport::scheduler::Scheduler::new(0, 0),
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            outbound_loss: None,
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            inbound_loss: None,
             force_dirty_frames: 0,
             fec_k: 0,
             fec_enable_threshold: FEC_ENABLE_THRESHOLD,
@@ -974,6 +1103,11 @@ impl IoBridge {
             metrics_tracker: crate::tile::MetricsTracker::new(0, 0),
             classifier: crate::tile::Classifier::default(),
             frame_mode: crate::tile::FrameMode::TileCodec,
+            scheduler: crate::transport::scheduler::Scheduler::new(0, 0),
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            outbound_loss: None,
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            inbound_loss: None,
             force_dirty_frames: 0,
             fec_k: 0,
             fec_enable_threshold: FEC_ENABLE_THRESHOLD,
@@ -1210,6 +1344,13 @@ mod tests {
         assert!(bridge.frame_seq > 0, "frame_seq must advance");
     }
 
+    // Note: Task 11 CPU-path scheduler integration is not unit-testable without
+    // a connected WebTransport session (the no-sessions early-return is
+    // intentional — it prevents the dirty tracker from absorbing frame state
+    // before any client can see it). Integration coverage lives in:
+    //   - transport::scheduler::tests::* — scheduler behavior in isolation.
+    //   - tests/e2e.rs::e2e_solid_color (Task 15) — full pipeline with client.
+
     /// `Classifier::reset` must zero hysteresis streaks, so a single busy
     /// frame after reset can NOT promote to H264 (it needs `enter_sustain_frames`
     /// consecutive busy frames). Without reset, a partial enter streak from a
@@ -1231,6 +1372,20 @@ mod tests {
             c.decide_frame_mode(&busy, FrameMode::TileCodec),
             FrameMode::TileCodec
         );
+    }
+
+    /// IoBridge must hold a Scheduler that resizes alongside metrics_tracker
+    /// and dirty_tracker. This test verifies the scheduler field is present
+    /// and zero-sized at construction time.
+    #[tokio::test]
+    async fn iobridge_holds_scheduler_zero_sized_on_construction() {
+        let (our_end, _peer) = UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("server");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+        assert_eq!(bridge.scheduler.cols(), 0);
+        assert_eq!(bridge.scheduler.rows(), 0);
+        assert_eq!(bridge.scheduler.queue_len(), 0);
     }
 
     /// Coverage for C1: when a new session reconnects, the existing
@@ -1258,5 +1413,149 @@ mod tests {
                 "encoder must have keyframe_pending after session reconnect"
             );
         }
+    }
+
+    /// An inbound ACK_BATCH datagram routed through dispatch_ack_datagram
+    /// must mark the matching in-flight tile work as Acked.
+    #[tokio::test]
+    async fn dispatch_ack_datagram_clears_in_flight_work() {
+        use crate::transport::ack::{AckBatch, AckEntry};
+        use crate::transport::scheduler::TileWork;
+
+        let (our_end, _peer) = UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("server");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+
+        // Seed the scheduler with one InFlight item.
+        bridge.scheduler.resize(4, 4);
+        bridge.scheduler.enqueue(TileWork::raw_for_test(1, 2, 0, vec![1, 2, 3]));
+        let _ = bridge.scheduler.tick(usize::MAX); // promote to InFlight
+
+        let batch = AckBatch {
+            entries: vec![AckEntry { tile_x: 1, tile_y: 2, generation: 0, pass: 0 }],
+        };
+        bridge.dispatch_ack_datagram(&batch.encode());
+
+        // Next tick: nothing eligible — the Acked entry was dropped via retain.
+        let out = bridge.scheduler.tick(usize::MAX);
+        assert!(out.is_empty());
+        assert_eq!(bridge.scheduler.queue_len(), 0);
+    }
+
+    /// dispatch_ack_datagram silently ignores datagrams whose first byte
+    /// isn't ACK_BATCH_MSG_TYPE.
+    #[tokio::test]
+    async fn dispatch_ack_datagram_ignores_unknown_msg_types() {
+        let (our_end, _peer) = UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("server");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+        // Should not panic on empty/random/unknown payloads.
+        bridge.dispatch_ack_datagram(&[]);
+        bridge.dispatch_ack_datagram(&[0xFF, 0x00, 0x00]);
+        bridge.dispatch_ack_datagram(&[0x01, 0, 0]); // FEEDBACK_MSG_TYPE — unrelated
+    }
+
+    /// dispatch_dirty_tiles_via_scheduler enqueues the right work in the
+    /// right codec/state for the CPU policy, even without a connected
+    /// session. This is the "Gap 3" fix from the final M3.1 review.
+    #[tokio::test]
+    async fn dispatch_via_scheduler_cpu_policy_enqueues_raw_tiles() {
+        use crate::transport::scheduler::WorkState;
+        let (our_end, _peer) = UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("server");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+
+        let pixels = vec![0xAAu8; 64 * 64 * 4];
+        let grid = crate::tile::TileGrid::new(64, 64);
+        let dirty = vec![(0u32, 0u32), (1, 1)];
+
+        bridge.dispatch_dirty_tiles_via_scheduler(
+            &dirty,
+            &grid,
+            &pixels,
+            64 * 4,
+            /* seq */ 1,
+            /* timestamp_us */ 0,
+            /* max_frag */ 1200,
+            SchedulerEmissionPolicy::CpuRawOnly,
+        );
+
+        let queued = bridge.scheduler.peek_for_test();
+        assert_eq!(queued.len(), 2, "scheduler must hold both dirty tiles");
+        for w in &queued {
+            assert_eq!(w.state, WorkState::InFlight, "tick should have promoted");
+            assert_eq!(w.codec, Codec::Raw, "CPU policy emits Raw only");
+            assert_eq!(w.pass_idx, 0);
+        }
+    }
+
+    // NOTE: the two tests below use std::env::set_var / remove_var which is
+    // inherently order-sensitive in concurrent test runs.  Must run with
+    // --test-threads=1 to avoid races with other tests that don't touch these
+    // env vars.  The project convention (reference_testing.md) already requires
+    // --test-threads=1 for the lib test suite.
+
+    #[test]
+    fn loss_injector_from_env_parses_probability_and_predicate() {
+        // Use std::env carefully: serial within this test.
+        std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "0.5");
+        std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE", "tile");
+        std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_SEED", "42");
+        let inj = IoBridge::loss_injector_from_env("OUTBOUND")
+            .expect("probability > 0 must yield Some");
+        // Force two calls for determinism — same seed = same outcome.
+        let mut inj2 = IoBridge::loss_injector_from_env("OUTBOUND").unwrap();
+        let mut inj_copy = inj;
+        // Tile-datagram first byte (high bit set) → predicate matches → may drop.
+        let tile_dg = [0x80u8, 0, 0, 1];
+        // ACK datagram first byte (0x02) → predicate doesn't match → never drops.
+        let ack_dg = [0x02u8, 0, 0, 0];
+        assert!(!inj_copy.should_drop(&ack_dg), "tile predicate filters ack out");
+        assert!(!inj2.should_drop(&ack_dg));
+        // Tile path may or may not drop on a given call; just exercise it.
+        let _ = inj_copy.should_drop(&tile_dg);
+        std::env::remove_var("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY");
+        std::env::remove_var("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE");
+        std::env::remove_var("GHOSTFRAME_OUTBOUND_LOSS_SEED");
+    }
+
+    #[test]
+    fn loss_injector_from_env_returns_none_when_unset() {
+        // Ensure no leftover from prior tests.
+        std::env::remove_var("GHOSTFRAME_INBOUND_LOSS_PROBABILITY");
+        assert!(IoBridge::loss_injector_from_env("INBOUND").is_none());
+    }
+
+    /// dispatch_dirty_tiles_via_scheduler emits Solid bytes when the GPU policy
+    /// reads CodecState::Solid for a tile.
+    #[tokio::test]
+    async fn dispatch_via_scheduler_gpu_policy_emits_solid_for_solid_state() {
+        use crate::transport::scheduler::WorkState;
+        use crate::tile::CodecState;
+        let (our_end, _peer) = UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("server");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+        bridge.scheduler.resize(2, 2);
+        bridge.metrics_tracker.resize(2, 2);
+        bridge.metrics_tracker.get_mut(0, 0).codec_state = CodecState::Solid;
+
+        let pixels = vec![0xBBu8; 64 * 64 * 4];
+        let grid = crate::tile::TileGrid::new(64, 64);
+        let dirty = vec![(0u32, 0u32)];
+
+        bridge.dispatch_dirty_tiles_via_scheduler(
+            &dirty, &grid, &pixels, 64 * 4, 1, 0, 1200,
+            SchedulerEmissionPolicy::GpuClassifierDriven,
+        );
+
+        let queued = bridge.scheduler.peek_for_test();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].codec, Codec::Solid);
+        assert_eq!(queued[0].payload.len(), 4, "Solid is 4 bytes BGRA");
+        assert_eq!(queued[0].state, WorkState::InFlight);
     }
 }

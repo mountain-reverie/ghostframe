@@ -105,7 +105,10 @@ struct WritebackState {
     stride: u32,
 }
 
-static STATE: OnceLock<Mutex<CaptureState>> = OnceLock::new();
+/// `None` means DRM initialisation failed on the first attempt; subsequent
+/// calls will return the same `Err` without retrying (DRM devices don't
+/// appear mid-process without a bind-mount change).
+static STATE: OnceLock<Option<Mutex<CaptureState>>> = OnceLock::new();
 
 /// Open the first available DRM card and prepare a capture path.
 ///
@@ -115,16 +118,23 @@ static STATE: OnceLock<Mutex<CaptureState>> = OnceLock::new();
 /// First call performs the probe (open card, look for writeback connector,
 /// allocate target buffer if applicable). Subsequent calls reuse the
 /// cached state.
+///
+/// Returns `Err` — not a panic — if no DRM card is available or
+/// initialisation fails, allowing callers like `main` to fall back to the
+/// X11 capture path.
 pub fn capture_prime_fd() -> std::io::Result<(OwnedFd, FbGeometry)> {
-    let state_mutex = STATE.get_or_init(|| {
-        Mutex::new(initialize_state().unwrap_or_else(|e| {
-            // We can't return an error from get_or_init's closure; if
-            // initialization fails, panic so the daemon's main() catches
-            // it on next call. In practice initialize_state only fails if
-            // /dev/dri is missing, which is fatal anyway.
-            panic!("DRM capture state init failed: {e}");
-        }))
+    let slot = STATE.get_or_init(|| match initialize_state() {
+        Ok(state) => Some(Mutex::new(state)),
+        Err(e) => {
+            tracing::debug!("DRM capture init failed (will use X11 fallback): {e}");
+            None
+        }
     });
+
+    let state_mutex = slot
+        .as_ref()
+        .ok_or_else(|| std::io::Error::other("DRM capture not available"))?;
+
     let state = state_mutex.lock().expect("DRM capture state poisoned");
 
     // Borrow the writeback option separately so the rest of the state

@@ -431,7 +431,46 @@ proptest! {
         }
     }
 
-    // C3 (Solid) — deferred to M3.1; tracked in the design doc M3.1 testing section.
+    // C3 (Solid: `unique_colors == 1 ⇒ Solid`) is covered by `c7_rule_7_color_threshold`
+    // above under the rule-table conditions (low freq, low magnitude, idle_frames=0).
+    // An unconditional form would conflict with C1 (idle ⇒ Skip) and the high-freq
+    // routing rules. M3.1 design addendum (D1) keeps the classifier sentinel-gated;
+    // C3's intent is satisfied by C7 plus the new `c3_solid_dispatch_through_encoder`
+    // below, which verifies the encoder is wired end-to-end.
+    //
     // C6 (H264 → idle traverses lossy intermediate before refinement) — deferred
     //   to M3.3; tracked in the design doc M3.3 testing section.
+
+    /// C3 — when classifier picks Solid for a uniform tile, the encode/decode
+    /// roundtrip exactly preserves the BGRA color. This binds the classifier
+    /// decision to the encoder behavior, closing the loop deferred from M3.0.
+    #[test]
+    fn c3_solid_dispatch_through_encoder(
+        b in 0u8..=255,
+        g in 0u8..=255,
+        r in 0u8..=255,
+        a in 0u8..=255,
+    ) {
+        use crate::encoder::solid::{encode_solid, decode_solid};
+        // A uniform 32×32 BGRA tile.
+        let mut tile = vec![0u8; 32 * 32 * 4];
+        for px in tile.chunks_exact_mut(4) {
+            px.copy_from_slice(&[b, g, r, a]);
+        }
+        // Classifier setup mirroring C7's low-freq, low-mag, non-idle, uniform-color path.
+        let m = TileMetrics {
+            change_freq_hz: 2.0,
+            change_magnitude: 0.05,
+            idle_frames: 0,
+            unique_colors: 1,
+            edge_density: EDGE_DENSITY_UNKNOWN,
+            codec_state: CodecState::Skip,
+        };
+        let next = classify_tile(&m, &CodecState::Skip);
+        prop_assert_eq!(next, CodecState::Solid);
+
+        let encoded = encode_solid(&tile);
+        let decoded = decode_solid(&encoded).expect("valid 4-byte payload");
+        prop_assert_eq!(decoded, [b, g, r, a]);
+    }
 }

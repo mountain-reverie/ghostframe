@@ -58,6 +58,7 @@ fn tile_header_encode_decode() {
         codec: Codec::H264,
         lz4: false,
         generation: 1,
+        pass: 0,
         payload_len: 1024,
     };
     let mut buf = Vec::with_capacity(TILE_HEADER_SIZE);
@@ -69,7 +70,7 @@ fn tile_header_encode_decode() {
 fn fragment_tile_4kb() {
     let payload = vec![0u8; 4096];
     let max = max_fragment_payload(1200);
-    std::hint::black_box(fragment_tile(0u32, 0u8, 0u8, Codec::H264, &payload, 0u32, max));
+    std::hint::black_box(fragment_tile(0u32, 0u8, 0u8, Codec::H264, 0u8, 0u8, &payload, 0u32, max));
 }
 
 #[library_benchmark]

@@ -41,7 +41,12 @@ COPY ghostframe-xdaemon/ ghostframe-xdaemon/
 COPY ghostframe-test-pattern/ ghostframe-test-pattern/
 
 ENV CARGO_BUILD_JOBS=2
-RUN cargo build --release -p ghostframe-xdaemon -p ghostframe-test-pattern
+# Enable the lib's `test-loss-injection` feature so e2e tests can drive
+# deterministic packet/ACK drops via GHOSTFRAME_{OUTBOUND,INBOUND}_LOSS_*
+# env vars. Production builds (separate Dockerfile or release pipeline)
+# do NOT enable this feature.
+RUN cargo build --release -p ghostframe-xdaemon -p ghostframe-test-pattern \
+    --features ghostframe-lib/test-loss-injection
 
 # Stage 2: Runtime image
 FROM ubuntu:24.04

@@ -13,6 +13,9 @@ gpu-bench = []
 # Enables benches for codecs not yet implemented (BC1, PalRle, CDF53, Solid).
 # Currently a no-op; flip on as each codec lands in M3.
 m3 = []
+# Exposes the deterministic loss-injection module outside of cfg(test).
+# Used by E2E integration tests that live in a separate crate.
+test-loss-injection = []
 
 [dependencies]
 quinn-proto = { workspace = true }

@@ -54,4 +54,21 @@ export class TileRenderer {
       px, py, TILE_SIZE, TILE_SIZE,        // destination rect
     );
   }
+
+  /**
+   * Draw a Solid-codec tile: fill a TILE_SIZE × TILE_SIZE region with one
+   * BGRA color. The payload is 4 bytes [B, G, R, A] matching the server's
+   * `encode_solid` output.
+   */
+  drawSolidTile(tileX: number, tileY: number, bgra: Uint8Array) {
+    const px = tileX * TILE_SIZE;
+    const py = tileY * TILE_SIZE;
+    const b = bgra[0];
+    const g = bgra[1];
+    const r = bgra[2];
+    // Force opaque per project convention — X11/DRM use BGRX, alpha
+    // can be 0 which destroys color in putImageData; same applies here.
+    this.ctx.fillStyle = `rgb(${r}, ${g}, ${b})`;
+    this.ctx.fillRect(px, py, TILE_SIZE, TILE_SIZE);
+  }
 }

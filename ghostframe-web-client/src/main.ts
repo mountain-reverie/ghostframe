@@ -7,6 +7,7 @@ import {
 import { TileRenderer } from './renderer';
 import { ParityRecovery } from './fec';
 import { LossTracker } from './feedback';
+import { AckBatcher } from './ack';
 
 const statusEl = document.getElementById('status')!;
 const logEl = document.getElementById('log')!;
@@ -114,6 +115,13 @@ async function main() {
     return dec;
   }
 
+  // Batched ACK sender — fire-and-forget unreliable datagrams back to server.
+  const ackWriter = transport.datagrams.writable.getWriter();
+  const ackBatcher = new AckBatcher((dg) => {
+    // Fire-and-forget write; failure is acceptable (ACKs are unreliable).
+    ackWriter.write(dg).catch(() => {});
+  });
+
   // Tile assembly state: key -> TileAssembly
   const assemblies = new Map<string, TileAssembly>();
   let latestFrameSeq = 0;
@@ -150,6 +158,11 @@ async function main() {
     } else if (asm.header.codec === Codec.H264) {
       const dec = getH264Decoder(tX, tY);
       dec.decode(payload);
+    } else if (asm.header.codec === Codec.Solid) {
+      // 4-byte BGRA payload.
+      if (payload.byteLength === 4) {
+        renderer.drawSolidTile(tX, tY, payload);
+      }
     }
 
     if (!firstTileRendered) {
@@ -161,6 +174,14 @@ async function main() {
       log(`First bytes: ${sample}`);
       statusEl.textContent = 'Receiving frames';
     }
+
+    // Acknowledge this tile completion for the server's scheduler.
+    ackBatcher.add({
+      tileX: tX,
+      tileY: tY,
+      generation: asm.header.generation,
+      pass: asm.header.pass,
+    });
   }
 
   // Test-instrumentation counters. Polled by `e2e_mode_switch` via Playwright.

@@ -433,6 +433,12 @@ async fn e2e_raw_frame_round_trip() -> Result<()> {
 }
 
 /// M2: Solid red renders correctly through H.264 pipeline (color fidelity).
+///
+/// M3.1: This test also exercises the new Scheduler-routed tile-codec
+/// emission path. Under M3.1 the CPU path always emits `Codec::Raw` (D1
+/// keeps the classifier sentinel-gated), but every dirty tile flows
+/// through `Scheduler::enqueue → tick → fragment_tile`. End-to-end Solid
+/// firing waits on M3.3 GPU compute.
 #[tokio::test]
 async fn e2e_solid_color() -> Result<()> {
     let setup = setup_e2e("--solid-red").await?;
@@ -461,6 +467,51 @@ async fn e2e_solid_color() -> Result<()> {
     let found = scan.get("found").and_then(|v| v.as_bool()).unwrap_or(false);
     assert!(found, "no red pixel found on canvas — H.264 pipeline failed");
 
+    Ok(())
+}
+
+/// M3.1 Task 19: Server retransmission survives 5% outbound datagram loss.
+///
+/// Sets `GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY=0.05` and predicate `tile`,
+/// so 5% of tile datagrams (those with TILE_DATAGRAM_FLAG set) are dropped
+/// at the server's `send_to_all_sessions` boundary. Frame/H.264 datagrams
+/// are untouched. The Scheduler's 2×RTT retry must compensate.
+///
+/// Expected: canvas still renders red within the same 5 s window as the
+/// no-loss baseline, plus a small extra margin for retransmits.
+#[tokio::test]
+async fn e2e_solid_color_5pct_loss() -> Result<()> {
+    let setup = setup_e2e_with_env(
+        "--solid-red",
+        &[
+            ("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "0.05"),
+            ("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE", "tile"),
+            ("GHOSTFRAME_OUTBOUND_LOSS_SEED", "42"),
+        ],
+    ).await?;
+
+    // Allow extra time vs baseline (5 s) for retransmits.
+    tokio::time::sleep(Duration::from_secs(7)).await;
+
+    // Same red-pixel scan as e2e_solid_color.
+    let scan_js = r#"
+        (() => {
+            const canvas = document.getElementById('canvas');
+            const ctx = canvas.getContext('2d');
+            for (let y = 16; y < 480; y += 32) {
+                for (let x = 16; x < 640; x += 32) {
+                    const p = ctx.getImageData(x, y, 1, 1).data;
+                    if (p[0] > 180 && p[1] < 80 && p[2] < 80) {
+                        return { found: true, x, y };
+                    }
+                }
+            }
+            return { found: false };
+        })()
+    "#;
+    let scan: serde_json::Value = setup.page.evaluate(scan_js).await?.into_value()?;
+    let found = scan.get("found").and_then(|v| v.as_bool()).unwrap_or(false);
+    assert!(found, "no red pixel found under 5% loss — retransmission broken");
     Ok(())
 }
 
@@ -1210,5 +1261,52 @@ async fn e2e_mode_switch() -> Result<()> {
          directions: H264 → exit → H264). Observed frame-dominated phase indices: {:?}",
         frame_dominated_phases);
 
+    Ok(())
+}
+
+/// M3.1 Task 19: Server survives sustained 100% ACK drop without retry storm.
+///
+/// `GHOSTFRAME_INBOUND_LOSS_PROBABILITY=1.0` + predicate `ack` drops every
+/// inbound `ACK_BATCH_MSG_TYPE (0x02)` datagram at the server boundary.
+/// Server tile-codec emissions never get their ACKs, so the Scheduler holds
+/// InFlight work and retries every 2×RTT — but `bump_generation` supersedes
+/// stale entries on the next dirty frame, keeping the queue bounded.
+///
+/// We don't assert a specific queue cap end-to-end (no server-side stats
+/// exposed yet — tracked as a future memory note). We do assert:
+/// 1. No panic / connection drop within 5 s.
+/// 2. Canvas renders red (server stays in H.264 mode for the initial
+///    burst since red is uniform; classifier exits to TileCodec after
+///    exit_sustain frames; ACK drop doesn't impact H.264 datagrams).
+#[tokio::test]
+async fn e2e_ack_loss() -> Result<()> {
+    let setup = setup_e2e_with_env(
+        "--solid-red",
+        &[
+            ("GHOSTFRAME_INBOUND_LOSS_PROBABILITY", "1.0"),
+            ("GHOSTFRAME_INBOUND_LOSS_PREDICATE", "ack"),
+            ("GHOSTFRAME_INBOUND_LOSS_SEED", "99"),
+        ],
+    ).await?;
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let scan_js = r#"
+        (() => {
+            const canvas = document.getElementById('canvas');
+            const ctx = canvas.getContext('2d');
+            for (let y = 16; y < 480; y += 32) {
+                for (let x = 16; x < 640; x += 32) {
+                    const p = ctx.getImageData(x, y, 1, 1).data;
+                    if (p[0] > 180 && p[1] < 80 && p[2] < 80) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        })()
+    "#;
+    let found: bool = setup.page.evaluate(scan_js).await?.into_value()?;
+    assert!(found, "canvas blank under 100% ACK drop — recovery broken");
     Ok(())
 }
