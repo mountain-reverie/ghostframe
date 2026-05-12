@@ -116,6 +116,51 @@ pub(crate) enum SchedulerEmissionPolicy {
 }
 
 impl IoBridge {
+    /// Build a `LossInjector` from environment variables. Returns `None` if
+    /// the relevant probability is 0 or env vars aren't set. Recognized env vars
+    /// (where `<DIR>` is either `OUTBOUND` or `INBOUND`):
+    /// - `GHOSTFRAME_<DIR>_LOSS_PROBABILITY` — f32 in [0.0, 1.0], default 0.0
+    /// - `GHOSTFRAME_<DIR>_LOSS_PREDICATE` — one of `all` / `tile` / `ack`,
+    ///    default `all`.
+    /// - `GHOSTFRAME_<DIR>_LOSS_SEED` — u64, default 0.
+    #[cfg(any(test, feature = "test-loss-injection"))]
+    fn loss_injector_from_env(direction: &str) -> Option<crate::transport::loss_injection::LossInjector> {
+        let prob_var = format!("GHOSTFRAME_{direction}_LOSS_PROBABILITY");
+        let pred_var = format!("GHOSTFRAME_{direction}_LOSS_PREDICATE");
+        let seed_var = format!("GHOSTFRAME_{direction}_LOSS_SEED");
+
+        let prob: f32 = std::env::var(&prob_var).ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        if prob <= 0.0 {
+            return None;
+        }
+
+        // Predicate: function pointer that classifies an outbound/inbound
+        // datagram by its first byte. Selected by the *_LOSS_PREDICATE env var.
+        fn predicate_all(_: &[u8]) -> bool { true }
+        // Tile datagrams set bit 31 of frame_seq (TILE_DATAGRAM_FLAG = 0x80000000),
+        // which is the high bit of byte [0] in big-endian wire order.
+        fn predicate_tile(dg: &[u8]) -> bool { !dg.is_empty() && (dg[0] & 0x80) != 0 }
+        // ACK_BATCH_MSG_TYPE = 0x02 (see transport/ack.rs).
+        fn predicate_ack(dg: &[u8]) -> bool {
+            dg.first().copied() == Some(crate::transport::ack::ACK_BATCH_MSG_TYPE)
+        }
+
+        let predicate: crate::transport::loss_injection::DropPredicate =
+            match std::env::var(&pred_var).as_deref() {
+                Ok("tile") => predicate_tile,
+                Ok("ack") => predicate_ack,
+                _ => predicate_all,
+            };
+        let seed: u64 = std::env::var(&seed_var).ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        tracing::info!(direction, prob, "test-loss-injection: installed LossInjector");
+        Some(crate::transport::loss_injection::LossInjector::new(prob, predicate, seed))
+    }
+
     /// Create a new `IoBridge` by connecting to ghostbridge and opening a UDP
     /// listener on `listen_addr` (e.g. `":4443"`).
     pub async fn new(
@@ -179,9 +224,9 @@ impl IoBridge {
             frame_mode: crate::tile::FrameMode::TileCodec,
             scheduler: crate::transport::scheduler::Scheduler::new(0, 0),
             #[cfg(any(test, feature = "test-loss-injection"))]
-            outbound_loss: None,
+            outbound_loss: Self::loss_injector_from_env("OUTBOUND"),
             #[cfg(any(test, feature = "test-loss-injection"))]
-            inbound_loss: None,
+            inbound_loss: Self::loss_injector_from_env("INBOUND"),
             force_dirty_frames: 0,
             fec_k: std::env::var("GHOSTFRAME_FEC_K")
                 .ok()
@@ -1445,6 +1490,43 @@ mod tests {
             assert_eq!(w.codec, Codec::Raw, "CPU policy emits Raw only");
             assert_eq!(w.pass_idx, 0);
         }
+    }
+
+    // NOTE: the two tests below use std::env::set_var / remove_var which is
+    // inherently order-sensitive in concurrent test runs.  Must run with
+    // --test-threads=1 to avoid races with other tests that don't touch these
+    // env vars.  The project convention (reference_testing.md) already requires
+    // --test-threads=1 for the lib test suite.
+
+    #[test]
+    fn loss_injector_from_env_parses_probability_and_predicate() {
+        // Use std::env carefully: serial within this test.
+        std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "0.5");
+        std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE", "tile");
+        std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_SEED", "42");
+        let inj = IoBridge::loss_injector_from_env("OUTBOUND")
+            .expect("probability > 0 must yield Some");
+        // Force two calls for determinism — same seed = same outcome.
+        let mut inj2 = IoBridge::loss_injector_from_env("OUTBOUND").unwrap();
+        let mut inj_copy = inj;
+        // Tile-datagram first byte (high bit set) → predicate matches → may drop.
+        let tile_dg = [0x80u8, 0, 0, 1];
+        // ACK datagram first byte (0x02) → predicate doesn't match → never drops.
+        let ack_dg = [0x02u8, 0, 0, 0];
+        assert!(!inj_copy.should_drop(&ack_dg), "tile predicate filters ack out");
+        assert!(!inj2.should_drop(&ack_dg));
+        // Tile path may or may not drop on a given call; just exercise it.
+        let _ = inj_copy.should_drop(&tile_dg);
+        std::env::remove_var("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY");
+        std::env::remove_var("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE");
+        std::env::remove_var("GHOSTFRAME_OUTBOUND_LOSS_SEED");
+    }
+
+    #[test]
+    fn loss_injector_from_env_returns_none_when_unset() {
+        // Ensure no leftover from prior tests.
+        std::env::remove_var("GHOSTFRAME_INBOUND_LOSS_PROBABILITY");
+        assert!(IoBridge::loss_injector_from_env("INBOUND").is_none());
     }
 
     /// dispatch_dirty_tiles_via_scheduler emits Solid bytes when the GPU policy

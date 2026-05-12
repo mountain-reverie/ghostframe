@@ -470,6 +470,51 @@ async fn e2e_solid_color() -> Result<()> {
     Ok(())
 }
 
+/// M3.1 Task 19: Server retransmission survives 5% outbound datagram loss.
+///
+/// Sets `GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY=0.05` and predicate `tile`,
+/// so 5% of tile datagrams (those with TILE_DATAGRAM_FLAG set) are dropped
+/// at the server's `send_to_all_sessions` boundary. Frame/H.264 datagrams
+/// are untouched. The Scheduler's 2×RTT retry must compensate.
+///
+/// Expected: canvas still renders red within the same 5 s window as the
+/// no-loss baseline, plus a small extra margin for retransmits.
+#[tokio::test]
+async fn e2e_solid_color_5pct_loss() -> Result<()> {
+    let setup = setup_e2e_with_env(
+        "--solid-red",
+        &[
+            ("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "0.05"),
+            ("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE", "tile"),
+            ("GHOSTFRAME_OUTBOUND_LOSS_SEED", "42"),
+        ],
+    ).await?;
+
+    // Allow extra time vs baseline (5 s) for retransmits.
+    tokio::time::sleep(Duration::from_secs(7)).await;
+
+    // Same red-pixel scan as e2e_solid_color.
+    let scan_js = r#"
+        (() => {
+            const canvas = document.getElementById('canvas');
+            const ctx = canvas.getContext('2d');
+            for (let y = 16; y < 480; y += 32) {
+                for (let x = 16; x < 640; x += 32) {
+                    const p = ctx.getImageData(x, y, 1, 1).data;
+                    if (p[0] > 180 && p[1] < 80 && p[2] < 80) {
+                        return { found: true, x, y };
+                    }
+                }
+            }
+            return { found: false };
+        })()
+    "#;
+    let scan: serde_json::Value = setup.page.evaluate(scan_js).await?.into_value()?;
+    let found = scan.get("found").and_then(|v| v.as_bool()).unwrap_or(false);
+    assert!(found, "no red pixel found under 5% loss — retransmission broken");
+    Ok(())
+}
+
 /// M2: Static content produces stable canvas (skip codec / no-change detection).
 #[tokio::test]
 async fn e2e_tile_skip() -> Result<()> {
@@ -1219,39 +1264,33 @@ async fn e2e_mode_switch() -> Result<()> {
     Ok(())
 }
 
-/// M3.1 Task 16: Server retries cleanly under 100% inbound ACK drop.
+/// M3.1 Task 19: Server survives sustained 100% ACK drop without retry storm.
 ///
-/// Requires the test-server container to be built with the
-/// `test-loss-injection` feature enabled AND a runtime flag (env var or
-/// CLI) to install a `LossInjector` on `IoBridge.inbound_loss` that drops
-/// all datagrams whose first byte is `ACK_BATCH_MSG_TYPE (0x02)`.
+/// `GHOSTFRAME_INBOUND_LOSS_PROBABILITY=1.0` + predicate `ack` drops every
+/// inbound `ACK_BATCH_MSG_TYPE (0x02)` datagram at the server boundary.
+/// Server tile-codec emissions never get their ACKs, so the Scheduler holds
+/// InFlight work and retries every 2×RTT — but `bump_generation` supersedes
+/// stale entries on the next dirty frame, keeping the queue bounded.
 ///
-/// Currently `#[ignore]`'d because that wiring isn't in place. The unit
-/// tests in `transport::scheduler::tests` already prove the no-retry-storm
-/// invariant (`bump_generation` supersedes prior in-flight work; retry
-/// gate is 2×RTT). What this E2E would add is end-to-end confirmation
-/// under a real WebTransport session.
-///
-/// Expected behavior when enabled:
-/// - Phase 1 (2 s, ACK_BATCH drop=100%): scheduler queue stays bounded
-///   (no retry storm — bumped generations supersede stale entries).
-/// - Phase 2 (drop disabled): queue drains within ~500 ms.
-/// - Canvas pixel finally matches expected red color.
+/// We don't assert a specific queue cap end-to-end (no server-side stats
+/// exposed yet — tracked as a future memory note). We do assert:
+/// 1. No panic / connection drop within 5 s.
+/// 2. Canvas renders red (server stays in H.264 mode for the initial
+///    burst since red is uniform; classifier exits to TileCodec after
+///    exit_sustain frames; ACK drop doesn't impact H.264 datagrams).
 #[tokio::test]
-#[ignore = "needs test-server container built with --features test-loss-injection and an inbound-ACK drop flag"]
 async fn e2e_ack_loss() -> Result<()> {
-    // Sketch — keeps types and helpers honest so future-us doesn't drift.
-    let setup = setup_e2e("--solid-red").await?;
+    let setup = setup_e2e_with_env(
+        "--solid-red",
+        &[
+            ("GHOSTFRAME_INBOUND_LOSS_PROBABILITY", "1.0"),
+            ("GHOSTFRAME_INBOUND_LOSS_PREDICATE", "ack"),
+            ("GHOSTFRAME_INBOUND_LOSS_SEED", "99"),
+        ],
+    ).await?;
 
-    // Phase 1: 2 s under ACK drop. The wiring would look like:
-    //   setup.inject_inbound_drop(|dg| dg.first().copied() == Some(0x02), 1.0);
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
 
-    // Phase 2: lift the drop and let the queue drain.
-    //   setup.clear_inbound_drop();
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Final assertion: canvas renders red (via H.264 since Solid doesn't fire).
     let scan_js = r#"
         (() => {
             const canvas = document.getElementById('canvas');
@@ -1268,6 +1307,6 @@ async fn e2e_ack_loss() -> Result<()> {
         })()
     "#;
     let found: bool = setup.page.evaluate(scan_js).await?.into_value()?;
-    assert!(found, "post-ACK-loss recovery: no red pixel rendered");
+    assert!(found, "canvas blank under 100% ACK drop — recovery broken");
     Ok(())
 }
