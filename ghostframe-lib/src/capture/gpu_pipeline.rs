@@ -146,8 +146,10 @@ impl FrameAnalysis {
             return &[];
         }
         // SAFETY: pointer is into HOST_VISIBLE mapped GPU memory owned by
-        // GpuFrameProcessor; valid until the next process_frame call. Lifetime
-        // tied to &self.
+        // GpuFrameProcessor. The borrow checker prevents the returned slice
+        // from outliving the &self borrow; the caller must additionally not
+        // hold this FrameAnalysis across a subsequent process_frame() call,
+        // which may recycle the underlying GPU buffer.
         unsafe { std::slice::from_raw_parts(self.tile_analysis, self.tile_analysis_len as usize) }
     }
 }
