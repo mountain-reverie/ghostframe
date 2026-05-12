@@ -134,9 +134,17 @@ impl Scheduler {
     }
 
     /// Drain the queue per the M3.1 single-pass scheduling rule:
-    /// - Drop `Superseded` and `Acked` entries.
-    /// - Return `Pending` and `InFlight`-past-retry items, up to `budget_bytes`.
-    /// Returned items are promoted to `InFlight` with `last_sent_at = now`.
+    ///
+    /// - Drop `Superseded` and `Acked` entries (terminal states).
+    /// - Return `Pending` items, and `InFlight` items past their `2 × rtt`
+    ///   retry threshold. Returned items are promoted to `InFlight` with
+    ///   `last_sent_at = now`.
+    ///
+    /// `budget_bytes` is a **soft cap**: the first tile whose cumulative
+    /// payload size crosses `budget_bytes` is still returned; the loop
+    /// stops before the next eligible tile. Pass `usize::MAX` to disable
+    /// budgeting (the M3.1 call site does this; M3.3 will pass real values
+    /// once refinement competes with fresh tiles for bandwidth).
     pub fn tick(&mut self, budget_bytes: usize) -> Vec<TileWork> {
         let now = Instant::now();
         let retry_after = 2 * self.rtt;
@@ -275,7 +283,7 @@ mod tests {
     #[test]
     fn tick_retries_inflight_after_2x_rtt() {
         let mut s = Scheduler::new(4, 4);
-        s.set_rtt(Duration::from_millis(1));
+        s.set_rtt(Duration::from_millis(5));
         s.enqueue(TileWork::raw_for_test(0, 0, 0, vec![1]));
         let first = s.tick(usize::MAX);
         assert_eq!(first.len(), 1);
@@ -284,7 +292,7 @@ mod tests {
         let second = s.tick(usize::MAX);
         assert!(second.is_empty());
 
-        std::thread::sleep(Duration::from_millis(3));
+        std::thread::sleep(Duration::from_millis(15));
         let third = s.tick(usize::MAX);
         assert_eq!(third.len(), 1, "InFlight work should retry after 2×RTT");
     }
