@@ -74,6 +74,8 @@ bool palettes_equal(uint tile_idx, uint pal_idx) {
 }
 
 const uint PROBE_BUDGET = 16u;
+// SENTINEL = 255 = "frame palette set overflow". Valid slot ids are 0..254;
+// slot 255 is reserved as the sentinel value to disambiguate from real inserts.
 const uint SENTINEL = 0xFFu;
 
 // Write a u8 into packed per_tile_id buffer (4 u8s per u32, little-endian).
@@ -97,6 +99,9 @@ void main() {
 
     for (uint probe = 0u; probe < PROBE_BUDGET; probe++) {
         uint slot = (h + probe) & 0xFFu;
+        if (slot == 255u) {
+            continue; // slot 255 reserved as sentinel
+        }
         uint expected = 0u;
         uint desired = (h & 0xFFFF0000u) | (slot + 1u);
         uint prev = atomicCompSwap(hash_slots[slot], expected, desired);

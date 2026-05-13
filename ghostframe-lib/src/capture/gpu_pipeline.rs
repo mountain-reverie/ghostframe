@@ -2979,6 +2979,29 @@ mod tests {
     }
 
     #[test]
+    fn frame_palette_entry_raw_has_expected_layout() {
+        assert_eq!(
+            std::mem::size_of::<FramePaletteEntryRaw>(),
+            80,
+            "FramePaletteEntryRaw must be 80 bytes (std430 layout)"
+        );
+        assert_eq!(
+            std::mem::align_of::<FramePaletteEntryRaw>(),
+            4,
+            "FramePaletteEntryRaw alignment"
+        );
+        let zero = FramePaletteEntryRaw {
+            count: 0,
+            _pad: [0; 3],
+            colors: [0; 16],
+        };
+        let base = &zero as *const _ as usize;
+        assert_eq!(&zero.count as *const _ as usize - base, 0, "count offset");
+        assert_eq!(&zero._pad as *const _ as usize - base, 4, "_pad offset");
+        assert_eq!(&zero.colors as *const _ as usize - base, 16, "colors offset");
+    }
+
+    #[test]
     fn frame_analysis_tile_analysis_slice_returns_correct_range() {
         // Build a fake FrameAnalysis backed by a heap Vec so we can exercise the
         // slice helper without spinning up Vulkan.
