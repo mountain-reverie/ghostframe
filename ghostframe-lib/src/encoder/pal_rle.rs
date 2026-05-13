@@ -35,6 +35,112 @@ pub struct FramePaletteStats {
     pub fell_back_to_raw: u32,
 }
 
+/// Bitset over `PALETTE_TABLE_SLOTS` slots. Plain `[bool; 256]` form chosen
+/// for simplicity (32 bytes) — no external crate needed.
+#[derive(Debug, Clone, Copy)]
+pub struct PaletteIdBitSet {
+    bits: [bool; PALETTE_TABLE_SLOTS],
+}
+
+impl PaletteIdBitSet {
+    pub fn new() -> Self {
+        Self {
+            bits: [false; PALETTE_TABLE_SLOTS],
+        }
+    }
+    pub fn contains(&self, id: u8) -> bool {
+        self.bits[id as usize]
+    }
+    pub fn insert(&mut self, id: u8) {
+        self.bits[id as usize] = true;
+    }
+    pub fn remove(&mut self, id: u8) {
+        self.bits[id as usize] = false;
+    }
+    pub fn clear(&mut self) {
+        self.bits.fill(false);
+    }
+}
+
+impl Default for PaletteIdBitSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Persistent 256-slot palette table. Single-client invariant — owned
+/// directly by `IoBridge`, no per-session wrapping (see design D3).
+pub struct PaletteTable {
+    pub entries: [Option<PaletteEntry>; PALETTE_TABLE_SLOTS],
+    pub slot_state: [SlotState; PALETTE_TABLE_SLOTS],
+    pub ref_count: [u32; PALETTE_TABLE_SLOTS],
+    pub delivered: PaletteIdBitSet,
+    pub in_flight_carrying: [u32; PALETTE_TABLE_SLOTS],
+    pub free_lru: std::collections::VecDeque<u8>,
+    pub stats_frame: FramePaletteStats,
+}
+
+impl PaletteTable {
+    pub fn new() -> Self {
+        Self {
+            entries: [None; PALETTE_TABLE_SLOTS],
+            slot_state: [SlotState::Empty; PALETTE_TABLE_SLOTS],
+            ref_count: [0; PALETTE_TABLE_SLOTS],
+            delivered: PaletteIdBitSet::new(),
+            in_flight_carrying: [0; PALETTE_TABLE_SLOTS],
+            free_lru: std::collections::VecDeque::new(),
+            stats_frame: FramePaletteStats::default(),
+        }
+    }
+
+    /// Linear scan over (Held ∪ FreeButCached) slots. Returns the first id
+    /// whose `entries[id]` byte-equals `palette` (sorted-set equality —
+    /// canonical sort is required upstream).
+    pub fn find_matching(&self, palette: &PaletteEntry) -> Option<u8> {
+        for id in 0..PALETTE_TABLE_SLOTS {
+            if self.slot_state[id] == SlotState::Empty {
+                continue;
+            }
+            if let Some(e) = &self.entries[id] {
+                if e == palette {
+                    return Some(id as u8);
+                }
+            }
+        }
+        None
+    }
+
+    /// Increment `ref_count[id]`; promote `FreeButCached` → `Held` if it was
+    /// the entry-into-use transition. No-op for `Empty` (caller bug — debug
+    /// assert).
+    pub fn acquire(&mut self, id: u8) {
+        debug_assert!(self.slot_state[id as usize] != SlotState::Empty);
+        if self.slot_state[id as usize] == SlotState::FreeButCached {
+            self.slot_state[id as usize] = SlotState::Held;
+            // Remove from free_lru if present.
+            self.free_lru.retain(|&x| x != id);
+        }
+        self.ref_count[id as usize] = self.ref_count[id as usize].saturating_add(1);
+    }
+
+    /// Decrement `ref_count[id]`; drop `Held` → `FreeButCached` at zero and
+    /// push onto `free_lru` tail.
+    pub fn release(&mut self, id: u8) {
+        debug_assert!(self.slot_state[id as usize] == SlotState::Held);
+        self.ref_count[id as usize] = self.ref_count[id as usize].saturating_sub(1);
+        if self.ref_count[id as usize] == 0 {
+            self.slot_state[id as usize] = SlotState::FreeButCached;
+            self.free_lru.push_back(id);
+        }
+    }
+}
+
+impl Default for PaletteTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum PalRleDecodeError {
     #[error("payload too short: needed {needed} bytes at offset {offset}, got {got}")]
@@ -68,5 +174,77 @@ mod tests {
     fn slot_state_variants_distinct() {
         assert_ne!(SlotState::Empty, SlotState::Held);
         assert_ne!(SlotState::Held, SlotState::FreeButCached);
+    }
+
+    fn make_palette(colors: &[[u8; 4]]) -> PaletteEntry {
+        let mut e = PaletteEntry::default();
+        for (i, c) in colors.iter().enumerate() {
+            e.colors[i] = *c;
+        }
+        e.count = colors.len() as u8;
+        e
+    }
+
+    #[test]
+    fn empty_table_has_no_matches() {
+        let t = PaletteTable::new();
+        let p = make_palette(&[[10, 20, 30, 255]]);
+        assert_eq!(t.find_matching(&p), None);
+    }
+
+    #[test]
+    fn acquire_promotes_empty_slot_to_held() {
+        let mut t = PaletteTable::new();
+        let p = make_palette(&[[10, 20, 30, 255], [40, 50, 60, 255]]);
+        // Manually inject for this test — full allocate ladder comes in Task 4.
+        t.entries[7] = Some(p);
+        t.slot_state[7] = SlotState::FreeButCached;
+        t.acquire(7);
+        assert_eq!(t.slot_state[7], SlotState::Held);
+        assert_eq!(t.ref_count[7], 1);
+    }
+
+    #[test]
+    fn release_drops_to_free_but_cached_at_zero() {
+        let mut t = PaletteTable::new();
+        let p = make_palette(&[[1, 2, 3, 255]]);
+        t.entries[3] = Some(p);
+        t.slot_state[3] = SlotState::FreeButCached;
+        t.acquire(3);
+        t.acquire(3);
+        t.release(3);
+        assert_eq!(t.slot_state[3], SlotState::Held);
+        assert_eq!(t.ref_count[3], 1);
+        t.release(3);
+        assert_eq!(t.slot_state[3], SlotState::FreeButCached);
+        assert_eq!(t.ref_count[3], 0);
+    }
+
+    #[test]
+    fn find_matching_hits_held_slots() {
+        let mut t = PaletteTable::new();
+        let p = make_palette(&[[10, 20, 30, 255], [40, 50, 60, 255]]);
+        t.entries[5] = Some(p);
+        t.slot_state[5] = SlotState::Held;
+        assert_eq!(t.find_matching(&p), Some(5));
+    }
+
+    #[test]
+    fn find_matching_hits_free_but_cached_slots() {
+        let mut t = PaletteTable::new();
+        let p = make_palette(&[[10, 20, 30, 255]]);
+        t.entries[9] = Some(p);
+        t.slot_state[9] = SlotState::FreeButCached;
+        assert_eq!(t.find_matching(&p), Some(9));
+    }
+
+    #[test]
+    fn find_matching_ignores_empty_slots() {
+        let mut t = PaletteTable::new();
+        let p = make_palette(&[[10, 20, 30, 255]]);
+        // entries[4] left None; slot_state[4] is Empty.
+        t.entries[4] = None;
+        t.slot_state[4] = SlotState::Empty;
+        assert_eq!(t.find_matching(&p), None);
     }
 }
