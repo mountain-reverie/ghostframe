@@ -568,6 +568,96 @@ impl IoBridge {
         // Other discriminators: silently ignore. Forward-compatible.
     }
 
+    /// Parse a concatenated FEEDBACK-stream byte buffer, dispatching by
+    /// message-type byte. Supports:
+    /// - `0x01` FEEDBACK_MSG_TYPE  (22 bytes)  — `ReceiverFeedback`
+    /// - `0x03` HELLO_MSG_TYPE     (2 bytes)   — capability advertisement
+    /// - `0x04` DECODE_ERROR_MSG_TYPE (5 bytes) — per-tile decode failure
+    ///
+    /// Unknown message types abort parsing of the rest of the buffer
+    /// (we can't safely advance past an unknown variable-length message).
+    /// Future message types must extend this dispatcher.
+    pub(crate) fn dispatch_feedback_bytes(&mut self, data: &[u8]) {
+        use crate::transport::client_caps::{HelloMsg, HELLO_MSG_TYPE, HELLO_SIZE};
+        use crate::transport::decode_error::{DecodeErrorMsg, DECODE_ERROR_MSG_TYPE, DECODE_ERROR_SIZE};
+        use crate::transport::feedback::{FEEDBACK_MSG_TYPE, FEEDBACK_SIZE};
+
+        let mut offset = 0;
+        while offset < data.len() {
+            let msg_type = data[offset];
+            match msg_type {
+                FEEDBACK_MSG_TYPE => {
+                    if offset + FEEDBACK_SIZE > data.len() { break; }
+                    if let Some(fb) = ReceiverFeedback::decode(&data[offset..]) {
+                        tracing::debug!(
+                            received = fb.datagrams_received,
+                            lost = fb.datagrams_lost,
+                            recovered_fec = fb.datagrams_recovered_fec,
+                            loss_rate = %format!("{:.2}%", fb.loss_rate() * 100.0),
+                            "receiver feedback"
+                        );
+                        self.update_fec_from_feedback(&fb);
+                    }
+                    offset += FEEDBACK_SIZE;
+                }
+                HELLO_MSG_TYPE => {
+                    if offset + HELLO_SIZE > data.len() { break; }
+                    if let Some(msg) = HelloMsg::decode(&data[offset..]) {
+                        self.apply_hello(msg);
+                    }
+                    offset += HELLO_SIZE;
+                }
+                DECODE_ERROR_MSG_TYPE => {
+                    if offset + DECODE_ERROR_SIZE > data.len() { break; }
+                    if let Some(msg) = DecodeErrorMsg::decode(&data[offset..]) {
+                        self.handle_decode_error(msg);
+                    }
+                    offset += DECODE_ERROR_SIZE;
+                }
+                unknown => {
+                    tracing::warn!(
+                        msg_type = unknown,
+                        "unknown feedback-stream message type; dropping rest of buffer"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    /// React to a client-reported decode error. Most error codes are
+    /// log-only in M3.2b; code 3 (ERR_THIN_UNCACHED_PALETTE) triggers
+    /// `force_rebundle` so the next emission for that palette includes
+    /// the palette block again.
+    pub(crate) fn handle_decode_error(
+        &mut self,
+        msg: crate::transport::decode_error::DecodeErrorMsg,
+    ) {
+        use crate::transport::decode_error::ERR_THIN_UNCACHED_PALETTE;
+        use crate::tile::CodecState;
+
+        tracing::warn!(
+            codec = msg.codec,
+            tile_x = msg.tile_x,
+            tile_y = msg.tile_y,
+            error_code = msg.error_code,
+            "client decode error"
+        );
+
+        if msg.error_code == ERR_THIN_UNCACHED_PALETTE {
+            // Recover which palette_id was last emitted for this tile by
+            // consulting metrics_tracker.codec_state.
+            let m = self.metrics_tracker.get(msg.tile_x as u32, msg.tile_y as u32);
+            if let CodecState::PalRle { palette_id } = m.codec_state {
+                self.palette_table.force_rebundle(palette_id);
+                tracing::info!(
+                    palette_id,
+                    "force_rebundle: next emission for palette will include bundled palette block"
+                );
+            }
+        }
+    }
+
     /// CPU-side tile-based pipeline (original implementation).
     fn process_frame_cpu(&mut self, frame: FrameSubmission) {
         let grid = TileGrid::new(frame.width, frame.height);
@@ -1299,22 +1389,7 @@ impl IoBridge {
             .flat_map(|wt| wt.drain_feedback())
             .collect();
         for data in &feedback_data {
-            // Stream data may contain multiple concatenated 22-byte messages.
-            use crate::transport::feedback::FEEDBACK_SIZE;
-            let mut offset = 0;
-            while offset + FEEDBACK_SIZE <= data.len() {
-                if let Some(fb) = ReceiverFeedback::decode(&data[offset..]) {
-                    tracing::debug!(
-                        received = fb.datagrams_received,
-                        lost = fb.datagrams_lost,
-                        recovered_fec = fb.datagrams_recovered_fec,
-                        loss_rate = %format!("{:.2}%", fb.loss_rate() * 100.0),
-                        "receiver feedback"
-                    );
-                    self.update_fec_from_feedback(&fb);
-                }
-                offset += FEEDBACK_SIZE;
-            }
+            self.dispatch_feedback_bytes(data);
         }
     }
 
@@ -2501,5 +2576,52 @@ mod tests {
         let payload = &map[&(1, 1)];
         assert_eq!(payload[0], 0x01, "bundled flag (bit 0 set)");
         // indices_raw promotion only applies to thin path; bundled passes through unchanged.
+    }
+
+    #[tokio::test]
+    async fn feedback_stream_parses_hello_then_feedback_then_decode_error() {
+        use crate::transport::client_caps::{ClientCapabilities, HelloMsg};
+        use crate::transport::decode_error::{DecodeErrorMsg, ERR_THIN_UNCACHED_PALETTE};
+        use crate::transport::feedback::ReceiverFeedback;
+        use crate::encoder::pal_rle::PaletteEntry;
+
+        let mut bridge = make_bridge_for_test().await;
+
+        // Pre-populate palette_table slot 7 as delivered, so the decode-error
+        // path can find a palette to clear. The metrics_tracker also needs
+        // to record that tile (3, 4) is currently rendering palette_id=7
+        // for handle_decode_error to locate it.
+        let pal = PaletteEntry { count: 1, colors: [[10, 20, 30, 255]; 16] };
+        bridge.palette_table.write_bytes(7, &pal);
+        bridge.palette_table.delivered.insert(7);
+        bridge.metrics_tracker.resize(8, 8);
+        bridge.metrics_tracker.get_mut(3, 4).codec_state =
+            crate::tile::CodecState::PalRle { palette_id: 7 };
+
+        // Concatenated stream: HELLO (2 B) + FEEDBACK (22 B) + DECODE_ERROR (5 B) = 29 bytes
+        let hello = HelloMsg { caps: ClientCapabilities { indices_raw_enabled: true } };
+        let fb = ReceiverFeedback {
+            timestamp_ns: 0, datagrams_received: 0, datagrams_lost: 0,
+            datagrams_recovered_fec: 0, suspension_detected: false,
+        };
+        let err = DecodeErrorMsg {
+            codec: 2, tile_x: 3, tile_y: 4, error_code: ERR_THIN_UNCACHED_PALETTE,
+        };
+
+        let mut buf = Vec::new();
+        hello.encode(&mut buf);
+        fb.encode(&mut buf);
+        err.encode(&mut buf);
+        assert_eq!(buf.len(), 2 + 22 + 5);
+
+        bridge.dispatch_feedback_bytes(&buf);
+
+        // HELLO applied:
+        assert!(bridge.current_client_caps().indices_raw_enabled,
+            "HELLO message must apply caps");
+
+        // DECODE_ERROR with code 3 cleared the delivered bit (via force_rebundle):
+        assert!(!bridge.palette_table.delivered.contains(7),
+            "ERR_THIN_UNCACHED_PALETTE must clear delivered bit via force_rebundle");
     }
 }
