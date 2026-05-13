@@ -154,6 +154,18 @@ pub(crate) enum SchedulerEmissionPolicy {
     GpuClassifierDriven,
 }
 
+/// Per-tile staging produced by Phase A, consumed by Phase B.
+#[derive(Debug, Clone)]
+pub(crate) struct PalRleTileWorkPrep {
+    pub tile_xy: (u32, u32),
+    /// Owned copy of 512 B index slice. Owned (not borrowed) so Phase B's
+    /// rayon parallel iter is `Send`.
+    pub indices: [u8; 512],
+    pub palette: crate::encoder::pal_rle::PaletteEntry,
+    pub palette_id: u8,
+    pub bundled: bool,
+}
+
 impl IoBridge {
     /// Build a `LossInjector` from environment variables. Returns `None` if
     /// the relevant probability is 0 or env vars aren't set. Recognized env vars
@@ -1200,6 +1212,83 @@ impl IoBridge {
         }
     }
 
+    /// Phase A: serially walk the GPU's compact list, map each tile's
+    /// frame-local palette id to a persistent slot via PaletteTable, and
+    /// produce per-tile work preps for Phase B.
+    pub(crate) fn phase_a_palette_allocation(
+        &mut self,
+        cols: u32,
+        compact_list: &[u32],
+        per_tile_frame_palette_id: &[u8],
+        folded_into: &[u32], // 256 entries
+        frame_palette_set: &[crate::capture::gpu_pipeline::FramePaletteEntryRaw],
+        index_buffer: &[u8], // compact_list.len() * 512 bytes
+    ) -> Vec<PalRleTileWorkPrep> {
+        use crate::encoder::pal_rle::PaletteEntry;
+        use crate::tile::CodecState;
+
+        let mut preps: Vec<PalRleTileWorkPrep> = Vec::with_capacity(compact_list.len());
+        for (c, &tile_idx) in compact_list.iter().enumerate() {
+            let tx = tile_idx % cols;
+            let ty = tile_idx / cols;
+
+            // Honour the classifier's actual decision.
+            if !matches!(
+                self.metrics_tracker.get(tx, ty).codec_state,
+                CodecState::PalRle { .. }
+            ) {
+                continue;
+            }
+
+            let pal_id_local = per_tile_frame_palette_id[c];
+            if pal_id_local == 0xFF {
+                // Stage 2a sentinel — frame-palette-set overflow.
+                self.metrics_tracker.get_mut(tx, ty).codec_state = CodecState::Skip;
+                self.palette_table.stats_frame.fell_back_to_raw += 1;
+                continue;
+            }
+            let effective = (folded_into[pal_id_local as usize] & 0xFF) as usize;
+            let raw = &frame_palette_set[effective];
+            let mut palette = PaletteEntry::default();
+            palette.count = raw.count as u8;
+            for i in 0..palette.count as usize {
+                let v = raw.colors[i];
+                palette.colors[i] = [
+                    (v & 0xFF) as u8,
+                    ((v >> 8) & 0xFF) as u8,
+                    ((v >> 16) & 0xFF) as u8,
+                    ((v >> 24) & 0xFF) as u8,
+                ];
+            }
+
+            match self.palette_table.acquire_or_allocate(&palette) {
+                Some(id) => {
+                    let bundled = !self.palette_table.delivered.contains(id);
+                    if bundled {
+                        self.palette_table.in_flight_carrying[id as usize] += 1;
+                    }
+                    let mut indices = [0u8; 512];
+                    indices.copy_from_slice(&index_buffer[c * 512..(c + 1) * 512]);
+                    self.metrics_tracker.get_mut(tx, ty).codec_state =
+                        CodecState::PalRle { palette_id: id };
+                    self.palette_table.stats_frame.reused_or_allocated += 1;
+                    preps.push(PalRleTileWorkPrep {
+                        tile_xy: (tx, ty),
+                        indices,
+                        palette,
+                        palette_id: id,
+                        bundled,
+                    });
+                }
+                None => {
+                    self.metrics_tracker.get_mut(tx, ty).codec_state = CodecState::Skip;
+                    self.palette_table.stats_frame.fell_back_to_raw += 1;
+                }
+            }
+        }
+        preps
+    }
+
     /// Test-only constructor that accepts a pre-built stream and server,
     /// bypassing the real ghostbridge connection. No tsnet node is held, so
     /// `_handle` is `None` and no `gbridge_close` is called on Drop.
@@ -1856,5 +1945,138 @@ mod tests {
             !bridge.palette_table.delivered.contains(255),
             "delivered[255] must start false"
         );
+    }
+
+    #[tokio::test]
+    async fn phase_a_allocates_and_marks_bundled_for_first_emission() {
+        use crate::tile::CodecState;
+
+        let (our_end, _peer) = UnixStream::pair().expect("UnixStream::pair failed");
+        let server = QuicServer::new().expect("QuicServer::new failed");
+        let mut bridge = IoBridge::new_with_stream_for_test(our_end, server);
+        let cols = 4;
+        bridge.metrics_tracker.resize(cols, 2);
+        bridge.metrics_tracker.get_mut(0, 0).codec_state = CodecState::PalRle { palette_id: 0 };
+
+        let compact_list = vec![0u32];
+        let per_tile_id = vec![0u8];
+        // folded_into[0] = default-self = ((255-1)<<8) | 0
+        let folded_into = vec![((255u32 - 1) << 8) | 0u32; 256];
+
+        // Build a frame_palette_set with slot 0 populated (count=1, color BGRA[10,20,30,255]).
+        let mut frame_palette_set = vec![
+            crate::capture::gpu_pipeline::FramePaletteEntryRaw {
+                count: 0,
+                _pad: [0; 3],
+                colors: [0; 16],
+            };
+            256
+        ];
+        frame_palette_set[0].count = 1;
+        frame_palette_set[0].colors[0] = 10 | (20 << 8) | (30 << 16) | (255 << 24);
+        let index_buffer = vec![0u8; 512];
+
+        let preps = bridge.phase_a_palette_allocation(
+            cols,
+            &compact_list,
+            &per_tile_id,
+            &folded_into,
+            &frame_palette_set,
+            &index_buffer,
+        );
+
+        assert_eq!(preps.len(), 1);
+        assert_eq!(preps[0].tile_xy, (0, 0));
+        assert_eq!(preps[0].palette.count, 1);
+        assert_eq!(preps[0].palette.colors[0], [10, 20, 30, 255]);
+        assert!(preps[0].bundled, "first emission must bundle");
+        assert_eq!(preps[0].palette_id, 0);
+        assert_eq!(bridge.palette_table.in_flight_carrying[0], 1);
+        assert!(!bridge.palette_table.delivered.contains(0));
+    }
+
+    #[tokio::test]
+    async fn phase_a_marks_thin_when_delivered_already_set() {
+        use crate::encoder::pal_rle::PaletteEntry;
+        use crate::tile::CodecState;
+
+        let (our_end, _peer) = UnixStream::pair().expect("UnixStream::pair failed");
+        let server = QuicServer::new().expect("QuicServer::new failed");
+        let mut bridge = IoBridge::new_with_stream_for_test(our_end, server);
+        let cols = 4;
+        bridge.metrics_tracker.resize(cols, 2);
+        bridge.metrics_tracker.get_mut(0, 0).codec_state = CodecState::PalRle { palette_id: 0 };
+
+        // Pre-populate persistent slot 3 with exact palette + delivered=true.
+        let mut p = PaletteEntry::default();
+        p.colors[0] = [10, 20, 30, 255];
+        p.count = 1;
+        bridge.palette_table.entries[3] = Some(p);
+        bridge.palette_table.slot_state[3] = crate::encoder::pal_rle::SlotState::FreeButCached;
+        bridge.palette_table.delivered.insert(3);
+        bridge.palette_table.free_lru.push_back(3);
+
+        let compact_list = vec![0u32];
+        let per_tile_id = vec![0u8];
+        let folded_into = vec![((255u32 - 1) << 8) | 0u32; 256];
+        let mut frame_palette_set = vec![
+            crate::capture::gpu_pipeline::FramePaletteEntryRaw {
+                count: 0,
+                _pad: [0; 3],
+                colors: [0; 16],
+            };
+            256
+        ];
+        frame_palette_set[0].count = 1;
+        frame_palette_set[0].colors[0] = 10 | (20 << 8) | (30 << 16) | (255 << 24);
+        let index_buffer = vec![0u8; 512];
+
+        let preps = bridge.phase_a_palette_allocation(
+            cols,
+            &compact_list,
+            &per_tile_id,
+            &folded_into,
+            &frame_palette_set,
+            &index_buffer,
+        );
+
+        assert_eq!(preps.len(), 1);
+        assert_eq!(preps[0].palette_id, 3, "find_matching should hit slot 3");
+        assert!(!preps[0].bundled, "delivered=true → thin payload");
+        assert_eq!(bridge.palette_table.in_flight_carrying[3], 0);
+    }
+
+    #[tokio::test]
+    async fn phase_a_falls_back_to_raw_on_sentinel() {
+        use crate::tile::CodecState;
+
+        let (our_end, _peer) = UnixStream::pair().expect("UnixStream::pair failed");
+        let server = QuicServer::new().expect("QuicServer::new failed");
+        let mut bridge = IoBridge::new_with_stream_for_test(our_end, server);
+        let cols = 4;
+        bridge.metrics_tracker.resize(cols, 2);
+        bridge.metrics_tracker.get_mut(0, 0).codec_state = CodecState::PalRle { palette_id: 0 };
+
+        let compact_list = vec![0u32];
+        let per_tile_id = vec![0xFFu8]; // overflow sentinel
+        let folded_into = vec![0u32; 256];
+        let frame_palette_set = vec![];
+        let index_buffer = vec![];
+
+        let preps = bridge.phase_a_palette_allocation(
+            cols,
+            &compact_list,
+            &per_tile_id,
+            &folded_into,
+            &frame_palette_set,
+            &index_buffer,
+        );
+
+        assert!(preps.is_empty());
+        assert_eq!(
+            bridge.metrics_tracker.get(0, 0).codec_state,
+            CodecState::Skip
+        );
+        assert_eq!(bridge.palette_table.stats_frame.fell_back_to_raw, 1);
     }
 }
