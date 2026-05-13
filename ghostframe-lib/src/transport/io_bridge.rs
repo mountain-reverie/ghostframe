@@ -1289,6 +1289,26 @@ impl IoBridge {
         preps
     }
 
+    /// Phase B: rayon-parallel per-tile encode of PalRle payloads.
+    /// Returns a HashMap keyed by (tile_x, tile_y) for Phase C lookup.
+    pub(crate) fn phase_b_encode_payloads(
+        preps: &[PalRleTileWorkPrep],
+    ) -> std::collections::HashMap<(u32, u32), Vec<u8>> {
+        use rayon::prelude::*;
+        preps
+            .par_iter()
+            .map(|p| {
+                let payload = crate::encoder::pal_rle::encode_pal_rle_payload(
+                    &p.indices,
+                    &p.palette,
+                    p.palette_id,
+                    p.bundled,
+                );
+                (p.tile_xy, payload)
+            })
+            .collect()
+    }
+
     /// Test-only constructor that accepts a pre-built stream and server,
     /// bypassing the real ghostbridge connection. No tsnet node is held, so
     /// `_handle` is `None` and no `gbridge_close` is called on Drop.
@@ -2078,5 +2098,40 @@ mod tests {
             CodecState::Skip
         );
         assert_eq!(bridge.palette_table.stats_frame.fell_back_to_raw, 1);
+    }
+
+    #[test]
+    fn phase_b_encodes_each_prep_in_parallel() {
+        use crate::encoder::pal_rle::PaletteEntry;
+
+        let mut palette = PaletteEntry::default();
+        palette.colors[0] = [1, 2, 3, 255];
+        palette.count = 1;
+        let preps = vec![
+            PalRleTileWorkPrep {
+                tile_xy: (0, 0),
+                indices: [0; 512],
+                palette,
+                palette_id: 7,
+                bundled: true,
+            },
+            PalRleTileWorkPrep {
+                tile_xy: (1, 0),
+                indices: [0; 512],
+                palette,
+                palette_id: 7,
+                bundled: false,
+            },
+        ];
+        let encoded = IoBridge::phase_b_encode_payloads(&preps);
+        assert_eq!(encoded.len(), 2);
+        let p00 = &encoded[&(0u32, 0u32)];
+        let p10 = &encoded[&(1u32, 0u32)];
+        // Bundled has flag bit 0 set.
+        assert_eq!(p00[0] & 0x01, 0x01);
+        assert_eq!(p10[0] & 0x01, 0x00);
+        // Both reference id 7.
+        assert_eq!(p00[1], 7);
+        assert_eq!(p10[1], 7);
     }
 }
