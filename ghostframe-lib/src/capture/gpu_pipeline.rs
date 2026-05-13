@@ -377,6 +377,20 @@ pub struct GpuFrameProcessor {
     // FrameAnalysis::folded_into after Stage 2b dispatch.
     folded_into_ptr: *mut u32,
 
+    // pal_rle_index pipeline (Stage 3)
+    pal_rle_index_shader_module: vk::ShaderModule,
+    pal_rle_index_pipeline: vk::Pipeline,
+    pal_rle_index_pipeline_layout: vk::PipelineLayout,
+    pal_rle_index_descriptor_set_layout: vk::DescriptorSetLayout,
+    // HOST_VISIBLE | HOST_COHERENT, size = max_tiles * 512 bytes.
+    // Each tile occupies 128 u32 entries (512 bytes) of packed 4-bit indices.
+    // Persistently mapped for CPU readback after Stage 3 dispatch.
+    index_buffer: vk::Buffer,
+    index_buffer_memory: vk::DeviceMemory,
+    // Task 13b will read this pointer to retrieve the packed index data.
+    #[allow(dead_code)]
+    index_buffer_ptr: *mut u8,
+
     descriptor_pool: vk::DescriptorPool,
     prev_image: Option<PrevFrame>,
 
@@ -793,8 +807,90 @@ impl GpuFrameProcessor {
             .map_err(|(_, e)| e)?;
         let palrle_indirect_args_pipeline = palrle_indirect_args_pipelines[0];
 
+        // --- pal_rle_index shader module (Stage 3) ---
+        let pal_rle_index_spv = include_bytes!("shaders/pal_rle_index.spv");
+        let pal_rle_index_spv_words =
+            ash::util::read_spv(&mut std::io::Cursor::new(pal_rle_index_spv.as_slice()))?;
+        let pal_rle_index_shader_ci =
+            vk::ShaderModuleCreateInfo::default().code(&pal_rle_index_spv_words);
+        let pal_rle_index_shader_module =
+            device.create_shader_module(&pal_rle_index_shader_ci, None)?;
+
+        // --- pal_rle_index descriptor set layout ---
+        // binding 0: STORAGE_IMAGE (current_frame, read-only)
+        // binding 1: STORAGE_BUFFER (compact_list, read-only)
+        // binding 2: STORAGE_BUFFER (frame_palette_set, read-only)
+        // binding 3: STORAGE_BUFFER (per_tile_frame_palette_id, read-only)
+        // binding 4: STORAGE_BUFFER (folded_into, read-only)
+        // binding 5: STORAGE_BUFFER (index_buffer output)
+        let pal_rle_index_bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(3)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(4)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(5)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        ];
+        let pal_rle_index_dsl_ci =
+            vk::DescriptorSetLayoutCreateInfo::default().bindings(&pal_rle_index_bindings);
+        let pal_rle_index_descriptor_set_layout =
+            device.create_descriptor_set_layout(&pal_rle_index_dsl_ci, None)?;
+
+        // --- pal_rle_index pipeline layout ---
+        // Push constants: 1 × u32 = 4 bytes (cols).
+        let pal_rle_index_push_range = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .offset(0)
+            .size(4)];
+        let pal_rle_index_pipeline_layout_ci = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(std::slice::from_ref(&pal_rle_index_descriptor_set_layout))
+            .push_constant_ranges(&pal_rle_index_push_range);
+        let pal_rle_index_pipeline_layout =
+            device.create_pipeline_layout(&pal_rle_index_pipeline_layout_ci, None)?;
+
+        // --- pal_rle_index compute pipeline ---
+        let pal_rle_index_stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(pal_rle_index_shader_module)
+            .name(entry_name);
+        let pal_rle_index_compute_ci = vk::ComputePipelineCreateInfo::default()
+            .stage(pal_rle_index_stage)
+            .layout(pal_rle_index_pipeline_layout);
+        let pal_rle_index_pipelines = device
+            .create_compute_pipelines(
+                vk::PipelineCache::null(),
+                &[pal_rle_index_compute_ci],
+                None,
+            )
+            .map_err(|(_, e)| e)?;
+        let pal_rle_index_pipeline = pal_rle_index_pipelines[0];
+
         // --- Descriptor pool ---
-        // 8 sets: SAD (2 STORAGE_IMAGE + 1 STORAGE_BUFFER)
+        // 9 sets: SAD (2 STORAGE_IMAGE + 1 STORAGE_BUFFER)
         //       + NV12 (1 STORAGE_IMAGE + 1 STORAGE_BUFFER)
         //       + Analysis (1 STORAGE_IMAGE + 1 STORAGE_BUFFER)
         //       + palrle_compact (4 STORAGE_BUFFER)
@@ -802,20 +898,21 @@ impl GpuFrameProcessor {
         //       + palette_fold (6 STORAGE_BUFFER)
         //       + palette_subset_fold_init (1 STORAGE_BUFFER)
         //       + palette_subset_fold (2 STORAGE_BUFFER)
-        // Total: 4 STORAGE_IMAGE, 18 STORAGE_BUFFER, 8 max_sets.
+        //       + pal_rle_index (1 STORAGE_IMAGE + 5 STORAGE_BUFFER)
+        // Total: 5 STORAGE_IMAGE, 23 STORAGE_BUFFER, 9 max_sets.
         let pool_sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_IMAGE,
-                descriptor_count: 4,
+                descriptor_count: 5,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: 18,
+                descriptor_count: 23,
             },
         ];
         let dp_ci = vk::DescriptorPoolCreateInfo::default()
             .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
-            .max_sets(8)
+            .max_sets(9)
             .pool_sizes(&pool_sizes);
         let descriptor_pool = device.create_descriptor_pool(&dp_ci, None)?;
 
@@ -1328,6 +1425,34 @@ impl GpuFrameProcessor {
             vk::MemoryMapFlags::empty(),
         )? as *mut u32;
 
+        // --- index_buffer (Stage 3 output) ---
+        // max_tiles * 512 bytes: each tile has 128 u32 entries of packed 4-bit indices.
+        // HOST_VISIBLE | HOST_COHERENT, STORAGE_BUFFER, persistently mapped.
+        let index_buffer_size = (max_tiles as vk::DeviceSize) * 512;
+        let index_buf_ci = vk::BufferCreateInfo::default()
+            .size(index_buffer_size)
+            .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let index_buffer = device.create_buffer(&index_buf_ci, None)?;
+        let index_buf_reqs = device.get_buffer_memory_requirements(index_buffer);
+        let index_mem_type = find_memory_type(
+            &mem_props,
+            index_buf_reqs.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )
+        .ok_or("no host-visible memory type for index_buffer")?;
+        let index_alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(index_buf_reqs.size)
+            .memory_type_index(index_mem_type);
+        let index_buffer_memory = device.allocate_memory(&index_alloc, None)?;
+        device.bind_buffer_memory(index_buffer, index_buffer_memory, 0)?;
+        let index_buffer_ptr = device.map_memory(
+            index_buffer_memory,
+            0,
+            index_buffer_size,
+            vk::MemoryMapFlags::empty(),
+        )? as *mut u8;
+
         Ok(Self {
             _entry: entry,
             instance,
@@ -1393,6 +1518,13 @@ impl GpuFrameProcessor {
             folded_into_buffer,
             folded_into_memory,
             folded_into_ptr,
+            pal_rle_index_shader_module,
+            pal_rle_index_pipeline,
+            pal_rle_index_pipeline_layout,
+            pal_rle_index_descriptor_set_layout,
+            index_buffer,
+            index_buffer_memory,
+            index_buffer_ptr,
             descriptor_pool,
             prev_image: None,
             sad_buffer,
@@ -3355,6 +3487,23 @@ impl Drop for GpuFrameProcessor {
             self.device.unmap_memory(self.folded_into_memory);
             self.device.destroy_buffer(self.folded_into_buffer, None);
             self.device.free_memory(self.folded_into_memory, None);
+
+            // pal_rle_index pipeline (Stage 3)
+            self.device
+                .destroy_pipeline(self.pal_rle_index_pipeline, None);
+            self.device
+                .destroy_pipeline_layout(self.pal_rle_index_pipeline_layout, None);
+            self.device.destroy_descriptor_set_layout(
+                self.pal_rle_index_descriptor_set_layout,
+                None,
+            );
+            self.device
+                .destroy_shader_module(self.pal_rle_index_shader_module, None);
+
+            // index_buffer (Stage 3 output)
+            self.device.unmap_memory(self.index_buffer_memory);
+            self.device.destroy_buffer(self.index_buffer, None);
+            self.device.free_memory(self.index_buffer_memory, None);
 
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_device(None);

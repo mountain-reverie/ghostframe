@@ -1,0 +1,128 @@
+// pal_rle_index.comp
+// Stage 3: per-pixel palette lookup → 4-bit index, packed atomically into a
+// shared scratch buffer, then bulk-written to global index_buffer.
+//
+// Dispatch: vkCmdDispatchIndirect(palrle_indirect_dispatch_args).
+// One workgroup per compact slot, 32×32 = 1024 threads per workgroup.
+
+#version 450
+
+layout(local_size_x = 32, local_size_y = 32, local_size_z = 1) in;
+
+layout(binding = 0, rgba8) readonly uniform image2D current_frame;
+
+layout(binding = 1, std430) readonly buffer CompactList {
+    uint compact_list[];
+};
+
+struct PaletteEntry {
+    uint count;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+    uint colors[16];
+};
+layout(binding = 2, std430) readonly buffer FramePaletteSet {
+    PaletteEntry frame_palettes[];
+};
+
+layout(binding = 3, std430) readonly buffer PerTileFramePaletteId {
+    uint per_tile_id_packed[]; // u8 entries packed into u32s, little-endian
+};
+
+layout(binding = 4, std430) readonly buffer FoldedInto {
+    uint folded_into[];
+};
+
+layout(binding = 5, std430) buffer IndexBuffer {
+    uint index_buffer_u32[]; // each tile: 128 u32 entries = 512 bytes
+};
+
+layout(push_constant) uniform PushConstants {
+    uint cols;
+};
+
+shared uint scratch[128]; // 1024 nibbles = 128 u32s
+shared uint shared_palette[16];
+shared uint shared_count;
+shared uint shared_skip;
+shared uint shared_effective_id;
+
+uint pack_bgra(vec4 p) {
+    uint b = uint(p.b * 255.0 + 0.5);
+    uint g = uint(p.g * 255.0 + 0.5);
+    uint r = uint(p.r * 255.0 + 0.5);
+    uint a = uint(p.a * 255.0 + 0.5);
+    return b | (g << 8) | (r << 16) | (a << 24);
+}
+
+// Binary search on canonical-sorted palette.
+uint binary_search(uint packed, uint count) {
+    uint lo = 0u;
+    uint hi = count;
+    while (lo < hi) {
+        uint mid = (lo + hi) >> 1u;
+        if (shared_palette[mid] < packed) {
+            lo = mid + 1u;
+        } else {
+            hi = mid;
+        }
+    }
+    // Defensive: clamp if not found (classifier feasibility guarantees presence).
+    if (lo >= count) lo = count - 1u;
+    return lo;
+}
+
+void main() {
+    uint local_idx = gl_LocalInvocationID.y * 32u + gl_LocalInvocationID.x;
+    uint c_slot = gl_WorkGroupID.x;
+    uint tile_idx = compact_list[c_slot];
+
+    // Thread 0: read per_tile_id (packed u8 → u32 index). 4 u8 per u32, little-endian.
+    if (local_idx == 0u) {
+        uint packed_word = per_tile_id_packed[c_slot >> 2u];
+        uint shift = (c_slot & 3u) * 8u;
+        uint frame_pal_id_local = (packed_word >> shift) & 0xFFu;
+        shared_skip = (frame_pal_id_local == 0xFFu) ? 1u : 0u;
+        if (shared_skip == 0u) {
+            shared_effective_id = folded_into[frame_pal_id_local] & 0xFFu;
+            shared_count = frame_palettes[shared_effective_id].count;
+        }
+    }
+
+    // Zero scratch (all 128 entries).
+    if (local_idx < 128u) {
+        scratch[local_idx] = 0u;
+    }
+    barrier();
+
+    if (shared_skip == 1u) return;
+
+    // Cooperative palette load (16 threads).
+    if (local_idx < 16u) {
+        shared_palette[local_idx] = frame_palettes[shared_effective_id].colors[local_idx];
+    }
+    barrier();
+
+    // Compute this thread's pixel BGRA.
+    uint tile_x = tile_idx % cols;
+    uint tile_y = tile_idx / cols;
+    ivec2 frame_pixel = ivec2(int(tile_x * 32u + gl_LocalInvocationID.x),
+                              int(tile_y * 32u + gl_LocalInvocationID.y));
+    vec4 px = imageLoad(current_frame, frame_pixel);
+    uint packed = pack_bgra(px);
+
+    uint idx = binary_search(packed, shared_count);
+
+    // Atomic-OR into shared scratch.
+    uint word = local_idx >> 3u;       // local_idx / 8 → 0..127
+    uint shift_bits = (local_idx & 7u) * 4u;
+    atomicOr(scratch[word], idx << shift_bits);
+
+    barrier();
+
+    // First 128 threads write scratch back to global index_buffer.
+    if (local_idx < 128u) {
+        index_buffer_u32[c_slot * 128u + local_idx] = scratch[local_idx];
+    }
+}
