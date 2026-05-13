@@ -889,7 +889,6 @@ mod tests {
     }
 
     use proptest::prelude::*;
-    use proptest::strategy::ValueTree;
 
     fn arb_palette() -> impl Strategy<Value = PaletteEntry> {
         (1u8..=16).prop_flat_map(|count| {
@@ -920,10 +919,11 @@ mod tests {
     proptest! {
         #[test]
         fn proptest_encode_decode_bundled_roundtrip(
-            palette in arb_palette(),
+            (palette, packed) in arb_palette().prop_flat_map(|p| {
+                let count = p.count;
+                arb_indices_against(count).prop_map(move |packed| (p, packed))
+            })
         ) {
-            let packed = arb_indices_against(palette.count)
-                .new_tree(&mut proptest::test_runner::TestRunner::default()).unwrap().current();
             let payload = encode_pal_rle_payload(&packed, &palette, 0, true);
             let dec = decode_pal_rle(&payload, None).unwrap();
 
@@ -937,11 +937,12 @@ mod tests {
                 expected[pixel * 4..pixel * 4 + 4].copy_from_slice(&color);
             }
             prop_assert_eq!(dec.pixels, expected);
+            prop_assert_eq!(dec.updated_palette, Some((0u8, palette)));
         }
 
         #[test]
         fn proptest_palette_table_acquire_release_balanced(
-            ops in prop::collection::vec(0u8..=PALETTE_TABLE_SLOTS as u8, 1..50)
+            ops in prop::collection::vec(0u8..32u8, 1..50)
         ) {
             let mut t = PaletteTable::new();
             // Pre-allocate slots 0..32 with synthetic palettes.
@@ -956,9 +957,8 @@ mod tests {
             }
             let mut acquired: Vec<u8> = Vec::new();
             for op in ops {
-                let slot = (op as usize) % 32;
-                t.acquire(slot as u8);
-                acquired.push(slot as u8);
+                t.acquire(op);
+                acquired.push(op);
             }
             // Release in reverse order; ref_counts should reach zero everywhere.
             for &id in acquired.iter().rev() {
