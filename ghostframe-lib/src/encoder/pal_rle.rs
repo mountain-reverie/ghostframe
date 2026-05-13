@@ -5,6 +5,8 @@
 //! the M3.2a single-client invariant. See
 //! `docs/superpowers/specs/2026-05-13-palrle-codec-design.md`.
 
+use std::collections::VecDeque;
+
 /// Maximum colors in a PalRLE palette. Tiles with more unique colors fall
 /// through the classifier to BC1/Cdf53.
 pub const MAX_PALETTE_COUNT: usize = 16;
@@ -76,7 +78,7 @@ pub struct PaletteTable {
     pub ref_count: [u32; PALETTE_TABLE_SLOTS],
     pub delivered: PaletteIdBitSet,
     pub in_flight_carrying: [u32; PALETTE_TABLE_SLOTS],
-    pub free_lru: std::collections::VecDeque<u8>,
+    pub free_lru: VecDeque<u8>,
     pub stats_frame: FramePaletteStats,
 }
 
@@ -88,7 +90,7 @@ impl PaletteTable {
             ref_count: [0; PALETTE_TABLE_SLOTS],
             delivered: PaletteIdBitSet::new(),
             in_flight_carrying: [0; PALETTE_TABLE_SLOTS],
-            free_lru: std::collections::VecDeque::new(),
+            free_lru: VecDeque::new(),
             stats_frame: FramePaletteStats::default(),
         }
     }
@@ -193,7 +195,7 @@ mod tests {
     }
 
     #[test]
-    fn acquire_promotes_empty_slot_to_held() {
+    fn acquire_promotes_free_but_cached_to_held() {
         let mut t = PaletteTable::new();
         let p = make_palette(&[[10, 20, 30, 255], [40, 50, 60, 255]]);
         // Manually inject for this test — full allocate ladder comes in Task 4.
@@ -218,6 +220,27 @@ mod tests {
         t.release(3);
         assert_eq!(t.slot_state[3], SlotState::FreeButCached);
         assert_eq!(t.ref_count[3], 0);
+        assert!(t.free_lru.contains(&3), "release at ref_count=0 must push id to free_lru");
+    }
+
+    #[test]
+    fn acquire_removes_id_from_free_lru() {
+        let mut t = PaletteTable::new();
+        let p1 = make_palette(&[[1, 1, 1, 255]]);
+        let p2 = make_palette(&[[2, 2, 2, 255]]);
+        // Two FreeButCached slots in free_lru.
+        t.entries[10] = Some(p1);
+        t.slot_state[10] = SlotState::FreeButCached;
+        t.free_lru.push_back(10);
+        t.entries[20] = Some(p2);
+        t.slot_state[20] = SlotState::FreeButCached;
+        t.free_lru.push_back(20);
+        // Re-acquire slot 10; it must leave free_lru while 20 stays.
+        t.acquire(10);
+        assert!(!t.free_lru.contains(&10), "acquired slot must be removed from free_lru");
+        assert!(t.free_lru.contains(&20), "other free slot must remain");
+        assert_eq!(t.slot_state[10], SlotState::Held);
+        assert_eq!(t.ref_count[10], 1);
     }
 
     #[test]
