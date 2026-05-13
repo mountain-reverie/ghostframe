@@ -529,6 +529,70 @@ async fn e2e_solid_color_5pct_loss() -> Result<()> {
     Ok(())
 }
 
+/// Drop 5% of bundled PalRle datagrams and verify the text-grid still
+/// renders correctly via 2×RTT retransmissions.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_palrle_5pct_loss() -> Result<()> {
+    use ghostframe_test_pattern::text_grid::SAMPLES;
+
+    let setup = setup_e2e_with_env(
+        "--text-grid",
+        &[
+            ("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "0.05"),
+            ("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE", "palrle_bundled"),
+            ("GHOSTFRAME_OUTBOUND_LOSS_SEED", "42"),
+        ],
+    )
+    .await?;
+
+    // ~7s — enough for QUIC slow-start + 2×RTT retransmits to settle.
+    tokio::time::sleep(Duration::from_secs(7)).await;
+
+    // Sanity: PalRle codec should appear in the recorded codec stream.
+    let codec_list: Vec<u8> = setup
+        .page
+        .evaluate("window.__ghostframeRecordedCodecs || []")
+        .await?
+        .into_value()?;
+    assert!(
+        codec_list.contains(&2u8),
+        "e2e_palrle_5pct_loss: expected Codec::PalRle (2) on the wire; saw codecs: {:?}",
+        codec_list
+    );
+
+    // Stability: text region must legibly render despite drops. Use the
+    // same contrast check as e2e_text_clarity for one sample.
+    let pair = &SAMPLES[0];
+    let probe_js = format!(
+        r#"
+        (() => {{
+            const canvas = document.getElementById('canvas');
+            const ctx = canvas.getContext('2d');
+            const ink = ctx.getImageData({ix}, {iy}, 1, 1).data;
+            const bg  = ctx.getImageData({bx}, {by}, 1, 1).data;
+            return {{
+                ink: {{ r: ink[0], g: ink[1], b: ink[2] }},
+                bg:  {{ r: bg[0],  g: bg[1],  b: bg[2]  }},
+            }};
+        }})()
+        "#,
+        ix = pair.ink.0,
+        iy = pair.ink.1,
+        bx = pair.bg.0,
+        by = pair.bg.1,
+    );
+    let probe: serde_json::Value =
+        setup.page.evaluate(probe_js.as_str()).await?.into_value()?;
+    let ink_lum = luminance(&probe["ink"]);
+    let bg_lum = luminance(&probe["bg"]);
+    assert!(
+        ink_lum - bg_lum > 60.0,
+        "e2e_palrle_5pct_loss: text degraded — ink_lum={ink_lum:.0}, bg_lum={bg_lum:.0}"
+    );
+
+    Ok(())
+}
+
 /// M2: Static content produces stable canvas (skip codec / no-change detection).
 #[tokio::test]
 async fn e2e_tile_skip() -> Result<()> {
