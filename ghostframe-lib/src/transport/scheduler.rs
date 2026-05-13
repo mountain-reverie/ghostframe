@@ -16,6 +16,24 @@ pub enum WorkState {
     Superseded,
 }
 
+/// Returned by `Scheduler::on_ack` and `Scheduler::bump_generation_collecting`
+/// when a TileWork is resolved (ACKed or superseded). Carries the bare minimum
+/// the IoBridge needs to update palette-table state without retaining payload
+/// ownership.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedTileWork {
+    pub tile_x: u8,
+    pub tile_y: u8,
+    pub generation: u8,
+    pub pass: u8,
+    pub codec: crate::transport::protocol::Codec,
+    /// For `Codec::PalRle`, the persistent palette id (payload byte [1]).
+    /// For other codecs, `None`.
+    pub palette_id: Option<u8>,
+    /// Whether the resolved work was an ACK (true) or a supersession (false).
+    pub via_ack: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct TileWork {
     pub tile_x: u8,
@@ -154,19 +172,72 @@ impl Scheduler {
     /// Stale-gen acks (gen/pass don't match anything in the queue, or only
     /// match Superseded entries) are silently ignored — the work is no
     /// longer in flight.
-    pub fn on_ack(&mut self, tile_x: u8, tile_y: u8, generation: u8, pass: u8) {
-        for work in self.queue.iter_mut() {
-            if work.tile_x == tile_x
-                && work.tile_y == tile_y
-                && work.generation == generation
-                && work.pass_idx == pass
-                && !matches!(work.state, WorkState::Superseded)
+    ///
+    /// Returns a `Vec<ResolvedTileWork>` describing each entry that was
+    /// ACKed (normally at most one). Callers that don't need the resolved
+    /// metadata can simply drop the return value.
+    pub fn on_ack(&mut self, tile_x: u8, tile_y: u8, generation: u8, pass: u8) -> Vec<ResolvedTileWork> {
+        let mut resolved: Vec<ResolvedTileWork> = Vec::new();
+        for entry in self.queue.iter_mut() {
+            if entry.tile_x == tile_x
+                && entry.tile_y == tile_y
+                && entry.generation == generation
+                && entry.pass_idx == pass
+                && entry.state == WorkState::InFlight
             {
-                work.state = WorkState::Acked;
-                return;
+                entry.state = WorkState::Acked;
+                let palette_id = if entry.codec == Codec::PalRle && entry.payload.len() >= 2 {
+                    Some(entry.payload[1])
+                } else {
+                    None
+                };
+                resolved.push(ResolvedTileWork {
+                    tile_x,
+                    tile_y,
+                    generation,
+                    pass,
+                    codec: entry.codec,
+                    palette_id,
+                    via_ack: true,
+                });
             }
         }
-        // No match: ignore.
+        self.queue.retain(|w| w.state != WorkState::Acked);
+        resolved
+    }
+
+    /// Like `bump_generation` but returns work that was superseded so callers
+    /// can update downstream state (e.g. PaletteTable in_flight_carrying).
+    pub fn bump_generation_collecting(&mut self, tile_x: u8, tile_y: u8)
+        -> (u8, Vec<ResolvedTileWork>)
+    {
+        let mut resolved: Vec<ResolvedTileWork> = Vec::new();
+        for entry in self.queue.iter_mut() {
+            if entry.tile_x == tile_x
+                && entry.tile_y == tile_y
+                && entry.state != WorkState::Acked
+                && entry.state != WorkState::Superseded
+            {
+                let palette_id = if entry.codec == Codec::PalRle && entry.payload.len() >= 2 {
+                    Some(entry.payload[1])
+                } else {
+                    None
+                };
+                resolved.push(ResolvedTileWork {
+                    tile_x,
+                    tile_y,
+                    generation: entry.generation,
+                    pass: entry.pass_idx,
+                    codec: entry.codec,
+                    palette_id,
+                    via_ack: false,
+                });
+                entry.state = WorkState::Superseded;
+            }
+        }
+        let new_gen = self.bump_generation(tile_x, tile_y);
+        self.queue.retain(|w| w.state != WorkState::Superseded);
+        (new_gen, resolved)
     }
 
     /// Drain the queue per the M3.1 single-pass scheduling rule:
@@ -429,5 +500,73 @@ mod tests {
         let out = s.tick(usize::MAX);
         assert!(out.is_empty());
         assert_eq!(s.queue_len(), 0);
+    }
+
+    #[test]
+    fn on_ack_returns_resolved_work_for_palrle_tile() {
+        use crate::transport::protocol::Codec;
+        let mut s = Scheduler::new(2, 2);
+        s.enqueue(TileWork {
+            tile_x: 0, tile_y: 0,
+            generation: 0, pass_idx: 0, total_passes: 1,
+            codec: Codec::PalRle,
+            payload: vec![0x01u8, 7, 0, 0, 0, 0],
+            queued_at: std::time::Instant::now(),
+            last_sent_at: None,
+            state: WorkState::Pending,
+        });
+        let _ = s.tick(usize::MAX);
+
+        let resolved = s.on_ack(0, 0, 0, 0);
+        assert_eq!(resolved.len(), 1);
+        let r = resolved[0];
+        assert_eq!(r.tile_x, 0);
+        assert_eq!(r.tile_y, 0);
+        assert_eq!(r.codec, Codec::PalRle);
+        assert_eq!(r.palette_id, Some(7));
+        assert!(r.via_ack);
+    }
+
+    #[test]
+    fn on_ack_for_solid_tile_has_none_palette_id() {
+        use crate::transport::protocol::Codec;
+        let mut s = Scheduler::new(2, 2);
+        s.enqueue(TileWork {
+            tile_x: 0, tile_y: 1,
+            generation: 0, pass_idx: 0, total_passes: 1,
+            codec: Codec::Solid,
+            payload: vec![10, 20, 30, 255],
+            queued_at: std::time::Instant::now(),
+            last_sent_at: None,
+            state: WorkState::Pending,
+        });
+        let _ = s.tick(usize::MAX);
+        let resolved = s.on_ack(0, 1, 0, 0);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].codec, Codec::Solid);
+        assert_eq!(resolved[0].palette_id, None);
+        assert!(resolved[0].via_ack);
+    }
+
+    #[test]
+    fn bump_generation_collecting_returns_superseded_palrle_work() {
+        use crate::transport::protocol::Codec;
+        let mut s = Scheduler::new(2, 2);
+        s.enqueue(TileWork {
+            tile_x: 1, tile_y: 0,
+            generation: 0, pass_idx: 0, total_passes: 1,
+            codec: Codec::PalRle,
+            payload: vec![0x01u8, 9, 0, 0, 0, 0],
+            queued_at: std::time::Instant::now(),
+            last_sent_at: None,
+            state: WorkState::Pending,
+        });
+        let _ = s.tick(usize::MAX);
+        let (new_gen, resolved) = s.bump_generation_collecting(1, 0);
+        assert_eq!(new_gen, 1); // generation incremented
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].codec, Codec::PalRle);
+        assert_eq!(resolved[0].palette_id, Some(9));
+        assert!(!resolved[0].via_ack);
     }
 }
