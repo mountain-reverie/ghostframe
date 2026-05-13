@@ -247,27 +247,21 @@ impl Default for PaletteTable {
 /// RLE bytes: `(index << 4) | (run_len - 1)`. Max run is 16; longer runs
 /// emit multiple bytes.
 pub fn encode_pal_rle_indices(packed_indices: &[u8; 512]) -> Vec<u8> {
-    let mut out: Vec<u8> = Vec::with_capacity(64); // typical best case
+    let mut out: Vec<u8> = Vec::with_capacity(64); // best case (single-color tile)
     let mut cur_idx: u8 = packed_indices[0] & 0x0F;
     let mut cur_run: u8 = 0;
 
-    for pixel in 0..1024usize {
-        let byte = packed_indices[pixel / 2];
-        let idx = if pixel % 2 == 0 {
-            byte & 0x0F
-        } else {
-            (byte >> 4) & 0x0F
-        };
-
-        if idx == cur_idx && cur_run < 16 {
-            cur_run += 1;
-        } else {
-            out.push((cur_idx << 4) | (cur_run - 1));
-            cur_idx = idx;
-            cur_run = 1;
+    for &byte in packed_indices.iter() {
+        for idx in [byte & 0x0F, byte >> 4] {
+            if idx == cur_idx && cur_run < 16 {
+                cur_run += 1;
+            } else {
+                out.push((cur_idx << 4) | (cur_run - 1));
+                cur_idx = idx;
+                cur_run = 1;
+            }
         }
     }
-    // Flush final run.
     out.push((cur_idx << 4) | (cur_run - 1));
     out
 }
