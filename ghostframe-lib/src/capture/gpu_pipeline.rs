@@ -2677,4 +2677,121 @@ mod tests {
             assert_eq!(slice[3].count, 3, "tile (1,1) three stripes");
         }
     }
+
+    #[test]
+    fn tile_analysis_colors_are_canonical_sorted() {
+        // 64×32 frame → 2 tiles side by side (tile 0 left, tile 1 right).
+        // Each tile has exactly 3 colors: red, green, blue.
+        // The colors are placed in *different spatial order* in each tile to
+        // verify the sort output is the same regardless of hash-table order.
+        //
+        // BGRA packed-u32 ascending order:
+        //   blue  [255,0,0,255]   = 0xFF00_00FF
+        //   green [0,255,0,255]   = 0xFF00_FF00
+        //   red   [0,0,255,255]   = 0xFFFF_0000
+        let width = 64u32;
+        let height = 32u32;
+        let stride = width * 4;
+
+        let mut processor = match GpuFrameProcessor::new(256) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("Skipping canonical-sort test (no Vulkan GPU?): {e}");
+                return;
+            }
+        };
+
+        unsafe {
+            // BGRA byte order: [B, G, R, A]
+            let red:   [u8; 4] = [0, 0, 255, 255];
+            let green: [u8; 4] = [0, 255, 0, 255];
+            let blue:  [u8; 4] = [255, 0, 0, 255];
+
+            let make_fd = |name_suffix: &str, fill: bool| -> std::os::unix::io::RawFd {
+                let size = (stride * height) as usize;
+                let name = std::ffi::CString::new(format!("ghost-sort-test-{}", name_suffix))
+                    .unwrap();
+                let fd = libc::memfd_create(name.as_ptr(), 0);
+                assert!(fd >= 0);
+                libc::ftruncate(fd, size as i64);
+                let ptr = libc::mmap(
+                    std::ptr::null_mut(),
+                    size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                );
+                assert_ne!(ptr, libc::MAP_FAILED);
+                let frame = std::slice::from_raw_parts_mut(ptr as *mut u8, size);
+
+                if fill {
+                    let mut put = |x: u32, y: u32, c: [u8; 4]| {
+                        let off = ((y * stride) + x * 4) as usize;
+                        frame[off..off + 4].copy_from_slice(&c);
+                    };
+                    for y in 0..32u32 {
+                        for x in 0..32u32 {
+                            // Tile 0: red(x<11) | green(x<22) | blue(rest).
+                            let c = if x < 11 { red } else if x < 22 { green } else { blue };
+                            put(x, y, c);
+                            // Tile 1 (x+32): blue(x<11) | red(x<22) | green(rest).
+                            let c2 = if x < 11 { blue } else if x < 22 { red } else { green };
+                            put(x + 32, y, c2);
+                        }
+                    }
+                }
+                // seed frame stays zeroed
+
+                libc::munmap(ptr, size);
+                fd
+            };
+
+            // First frame: seed prev_image (tile_analysis will be null).
+            let fd1 = make_fd("seed", false);
+            let first = match processor.process_frame(fd1, width, height, stride) {
+                Ok(a) => a,
+                Err(e) => {
+                    libc::close(fd1);
+                    eprintln!("Skipping canonical-sort test (memfd not a real DMA-BUF): {e}");
+                    return;
+                }
+            };
+            libc::close(fd1);
+            assert!(
+                first.tile_analysis.is_null(),
+                "first-frame analysis is null by design"
+            );
+
+            // Second frame: real content — triggers tile_analysis dispatch.
+            let fd2 = make_fd("real", true);
+            let analysis = match processor.process_frame(fd2, width, height, stride) {
+                Ok(a) => a,
+                Err(e) => {
+                    libc::close(fd2);
+                    eprintln!("Skipping canonical-sort test (memfd not a real DMA-BUF): {e}");
+                    return;
+                }
+            };
+            libc::close(fd2);
+
+            let slice = analysis.tile_analysis_slice();
+            assert_eq!(slice.len(), 2, "64x32 frame → 2 tiles");
+
+            // BGRA packed-u32 ascending order:
+            //   blue  (B=255,G=0,R=0,A=255) = 0xFF00_00FF
+            //   green (B=0,G=255,R=0,A=255) = 0xFF00_FF00
+            //   red   (B=0,G=0,R=255,A=255) = 0xFFFF_0000
+            let blue_p:  u32 = 0xFF00_00FF;
+            let green_p: u32 = 0xFF00_FF00;
+            let red_p:   u32 = 0xFFFF_0000;
+
+            for (tile_i, entry) in slice.iter().enumerate() {
+                assert_eq!(entry.count, 3, "tile {}: expected count 3", tile_i);
+                assert_eq!(entry.colors[0], blue_p,  "tile {}: slot 0 should be blue",  tile_i);
+                assert_eq!(entry.colors[1], green_p, "tile {}: slot 1 should be green", tile_i);
+                assert_eq!(entry.colors[2], red_p,   "tile {}: slot 2 should be red",   tile_i);
+            }
+        }
+    }
 }

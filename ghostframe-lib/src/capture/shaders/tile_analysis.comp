@@ -48,6 +48,7 @@ uint hash5(uint value) {
 const uint EDGE_GRAD_THRESHOLD = 48u;  // see design O2
 
 shared uint slot_color[32];
+shared uint shared_sort_buf[16];
 shared uint count;
 shared uint overflow_flag;
 shared uint edge_count;
@@ -118,24 +119,53 @@ void main() {
     }
     barrier();
 
-    // ---- Phase 1 writeback (thread 0). ----
+    // ---- Phase 1 writeback: thread 0 scans slots into shared_sort_buf. ----
     if (local_idx == 0u) {
         uint tile_idx = tile_y * cols + tile_x;
         uint final_count = min(count, 17u);
         tiles[tile_idx].count = final_count;
-        // Scan slots and emit up-to-16 colors in slot-traversal order.
+        // Collect up to 16 un-XOR'd colors into shared_sort_buf; sentinel-pad rest.
         uint emitted = 0u;
         for (uint s = 0u; s < 32u && emitted < 16u; ++s) {
             uint v = slot_color[s];
             if (v != 0u) {
-                tiles[tile_idx].colors[emitted] = v ^ MASK;
+                shared_sort_buf[emitted] = v ^ MASK;
                 emitted += 1u;
             }
         }
-        // Zero any unused slots so consumers see deterministic data.
+        // Pad unused slots with 0xFFFFFFFF so they sort to the high end.
         for (uint s = emitted; s < 16u; ++s) {
-            tiles[tile_idx].colors[s] = 0u;
+            shared_sort_buf[s] = 0xFFFFFFFFu;
         }
+    }
+    barrier();
+
+    // ---- Bitonic sort of shared_sort_buf[0..16] (canonical BGRA ascending). ----
+    // 4-stage bitonic network (log2(16) = 4 stages).
+    for (uint k = 2u; k <= 16u; k <<= 1) {
+        for (uint j = k >> 1; j > 0u; j >>= 1) {
+            if (local_idx < 16u) {
+                uint partner = local_idx ^ j;
+                if (partner > local_idx) {
+                    bool dir = (local_idx & k) == 0u;
+                    uint a = shared_sort_buf[local_idx];
+                    uint b = shared_sort_buf[partner];
+                    if ((a > b) == dir) {
+                        shared_sort_buf[local_idx] = b;
+                        shared_sort_buf[partner] = a;
+                    }
+                }
+            }
+            barrier();
+        }
+    }
+
+    // Write canonical-sorted colors back. Slots past count remain zero in output.
+    if (local_idx < 16u) {
+        uint tile_idx = tile_y * cols + tile_x;
+        uint final_count = tiles[tile_idx].count;
+        uint v = shared_sort_buf[local_idx];
+        tiles[tile_idx].colors[local_idx] = (local_idx < final_count && v != 0xFFFFFFFFu) ? v : 0u;
     }
 
     // ---- Phase 2: Sobel-style edge density on summed RGB. ----
