@@ -1522,7 +1522,8 @@ impl GpuFrameProcessor {
             0,
             compact_push_bytes,
         );
-        self.device.cmd_dispatch(cmd, cols, rows, 1);
+        // tile_idx = gl_WorkGroupID.x; bound check `tile_idx < cols * rows` is in the shader.
+        self.device.cmd_dispatch(cmd, cols * rows, 1, 1);
 
         // Barrier between Stage 1.5a and 1.5b: shader write → shader read on count.
         let buf_barrier_count = vk::BufferMemoryBarrier::default()
