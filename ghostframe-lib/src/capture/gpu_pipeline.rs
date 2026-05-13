@@ -258,15 +258,22 @@ impl FrameAnalysis {
     }
 
     /// Returns the 512 nibble-packed index bytes for compact slot `c`.
-    /// Only c_slots in 0..palrle_compact_count have meaningful data;
-    /// slices for other c values contain stale bytes from prior frames.
+    /// Only c values in `0..palrle_compact_count` have meaningful data;
+    /// other slots may contain stale bytes from prior frames.
+    ///
+    /// Returns an empty slice (rather than panicking) if `c` is at or past
+    /// `palrle_compact_count`. Callers should iterate `0..palrle_compact_count`
+    /// to get meaningful data.
     pub fn index_buffer_slice_for(&self, c: usize) -> &[u8] {
         if self.index_buffer.is_null() {
             return &[];
         }
-        // SAFETY: pointer is into HOST_VISIBLE mapped GPU memory owned by
-        // GpuFrameProcessor. Caller must not hold this FrameAnalysis across
-        // a subsequent process_frame() call. Each compact slot occupies 512 bytes.
+        if (c as u32) >= self.palrle_compact_count {
+            return &[];
+        }
+        // SAFETY: same lifetime contract as other slice helpers; c is
+        // bounded by palrle_compact_count which is bounded by max_tiles
+        // by GPU shader contract.
         unsafe { std::slice::from_raw_parts(self.index_buffer.add(c * 512), 512) }
     }
 }
@@ -2696,10 +2703,23 @@ impl GpuFrameProcessor {
         // ============================================================
         // Stage 3: pal_rle_index — per-pixel binary search → 4-bit index stream
         // ============================================================
-        // current_frame stays in GENERAL layout throughout (no transition needed).
-        // Stage 2a/2b output barriers above make frame_palette_set,
-        // per_tile_frame_palette_id, and folded_into visible to this dispatch.
-        // palrle_compact_list was barriered by stage_2a_input_barriers.
+        //
+        // Barrier chain visibility for Stage 3 inputs:
+        //   - current_frame image: layout GENERAL (set at top of frame, valid
+        //     through end of compute section).
+        //   - palrle_compact_list: written by Stage 1.5a, barriered for
+        //     SHADER_READ in stage_2a_input_barriers; visibility propagates
+        //     transitively because no intervening writer touches it.
+        //   - frame_palette_set & per_tile_frame_palette_id: written by Stage 2a,
+        //     barriered for SHADER_READ in stage_2a_output_barriers. Visibility
+        //     remains valid for Stage 3 because Stage 2b (which executes
+        //     between Stage 2a's barrier and this dispatch) does NOT write
+        //     these buffers — only folded_into.
+        //   - folded_into: written by Stage 2b fold, barriered for SHADER_READ
+        //     in stage_2b_output_barrier directly above.
+        //
+        // All five inputs are correctly visible at COMPUTE_SHADER stage by
+        // Vulkan execution-dependency rules.
         self.device.cmd_bind_pipeline(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
