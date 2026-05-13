@@ -364,12 +364,12 @@ pub fn decode_pal_rle(
         if color[3] == 0 {
             color[3] = 255;
         }
+        if pixel_idx + run_len > 1024 {
+            return Err(PalRleDecodeError::PixelCountMismatch {
+                decoded: pixel_idx + run_len,
+            });
+        }
         for _ in 0..run_len {
-            if pixel_idx >= 1024 {
-                return Err(PalRleDecodeError::PixelCountMismatch {
-                    decoded: pixel_idx + 1,
-                });
-            }
             let off = (pixel_idx as usize) * 4;
             pixels[off..off + 4].copy_from_slice(&color);
             pixel_idx += 1;
@@ -400,7 +400,7 @@ pub enum PalRleDecodeError {
     #[error("decoded {decoded} pixels, expected 1024")]
     PixelCountMismatch { decoded: u32 },
 
-    #[error("palette count {0} exceeds MAX_PALETTE_COUNT")]
+    #[error("palette count {0} is invalid (must be 1..=16)")]
     PaletteCountOutOfRange(u8),
 }
 
