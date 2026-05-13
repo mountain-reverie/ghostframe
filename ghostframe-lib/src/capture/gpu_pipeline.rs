@@ -193,22 +193,26 @@ impl FrameAnalysis {
         }
     }
 
+    /// Returns the full 256-entry frame palette set buffer (the entire hash
+    /// table). Entries are HASH-INDEXED, not dense — the shader writes a
+    /// palette into `slot = (hash + probe) & 0xFFu`, so slot positions
+    /// reachable by `per_tile_frame_palette_id` are valid; other positions
+    /// contain stale bytes from previous frames.
+    ///
+    /// Callers must NEVER iterate this slice linearly. Index into it using
+    /// values obtained from `per_tile_frame_palette_id_slice()` (Task 12+
+    /// will also consult `folded_into`). The `frame_palette_set_count`
+    /// field is the high-water mark of claimed slot IDs and is informational
+    /// only (useful for stats / observability).
     pub fn frame_palette_set_slice(&self) -> &[FramePaletteEntryRaw] {
-        if self.frame_palette_set.is_null() || self.frame_palette_set_count == 0 {
+        if self.frame_palette_set.is_null() {
             return &[];
         }
-        // SAFETY: pointer is into HOST_VISIBLE mapped GPU memory owned by
-        // GpuFrameProcessor. The borrow checker prevents the returned slice
-        // from outliving the &self borrow; the caller must not hold this
-        // FrameAnalysis across a subsequent process_frame() call.
-        // Note: this slice's entries are SPARSE — only entries 0..frame_palette_set_count
-        // whose hash slot was claimed contain valid bytes. Iterate per_tile_frame_palette_id
-        // to find which slot index a tile actually uses.
+        // SAFETY: same lifetime contract as tile_analysis_slice. The 256
+        // entries are the entire allocated hash-table buffer, owned by
+        // GpuFrameProcessor and stable until the next process_frame call.
         unsafe {
-            std::slice::from_raw_parts(
-                self.frame_palette_set,
-                self.frame_palette_set_count as usize,
-            )
+            std::slice::from_raw_parts(self.frame_palette_set, 256)
         }
     }
 
@@ -230,10 +234,11 @@ impl FrameAnalysis {
     }
 }
 
-// SAFETY: `nv12_data` and `tile_analysis` are both pointers to GPU-managed
-// HOST_VISIBLE memory owned by `GpuFrameProcessor`. The FrameAnalysis is
-// consumed before the next `process_frame` call so the data is stable.
-// GpuFrameProcessor is used from a single tokio task.
+// SAFETY: `nv12_data`, `tile_analysis`, `palrle_compact_list`,
+// `frame_palette_set`, and `per_tile_frame_palette_id` are all pointers to
+// GPU-managed HOST_VISIBLE memory owned by `GpuFrameProcessor`. The
+// FrameAnalysis is consumed before the next `process_frame` call so the
+// data is stable. GpuFrameProcessor is used from a single tokio task.
 unsafe impl Send for FrameAnalysis {}
 
 /// Vulkan compute-based dirty tile tracker with integrated NV12 conversion.
@@ -313,14 +318,14 @@ pub struct GpuFrameProcessor {
     // HOST_VISIBLE | HOST_COHERENT, 256 * 80 = 20480 bytes. Persistently mapped.
     frame_palette_set_buffer: vk::Buffer,
     frame_palette_set_memory: vk::DeviceMemory,
-    // Task 11b will read this pointer to retrieve per-frame palette entries.
-    #[allow(dead_code)]
+    // Persistent CPU mapping of the frame palette set buffer; pointed to by
+    // FrameAnalysis::frame_palette_set.
     frame_palette_set_ptr: *mut FramePaletteEntryRaw,
     // HOST_VISIBLE | HOST_COHERENT | TRANSFER_DST, 4 bytes. Persistently mapped.
     frame_palette_count_buffer: vk::Buffer,
     frame_palette_count_memory: vk::DeviceMemory,
-    // Task 11b will read this pointer to retrieve the palette count.
-    #[allow(dead_code)]
+    // Persistent CPU mapping of the frame palette count buffer; pointed to by
+    // FrameAnalysis::frame_palette_set_count (high-water mark of claimed slot IDs).
     frame_palette_count_ptr: *mut u32,
     // HOST_VISIBLE | HOST_COHERENT | TRANSFER_DST, 256 * 4 = 1024 bytes.
     // No persistent CPU mapping needed (Stage 2a is the only consumer).
@@ -329,8 +334,8 @@ pub struct GpuFrameProcessor {
     // HOST_VISIBLE | HOST_COHERENT | TRANSFER_DST, (max_tiles+3)/4*4 bytes. Persistently mapped.
     per_tile_frame_palette_id_buffer: vk::Buffer,
     per_tile_frame_palette_id_memory: vk::DeviceMemory,
-    // Task 11b will read this pointer to retrieve per-tile palette IDs.
-    #[allow(dead_code)]
+    // Persistent CPU mapping of the per-tile frame palette ID buffer; pointed
+    // to by FrameAnalysis::per_tile_frame_palette_id.
     per_tile_frame_palette_id_ptr: *mut u8,
 
     descriptor_pool: vk::DescriptorPool,
