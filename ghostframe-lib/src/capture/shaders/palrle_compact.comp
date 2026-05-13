@@ -1,0 +1,50 @@
+// palrle_compact.comp
+// Stage 1.5: produce the dense list of (dirty AND count<=16) tile indices.
+//
+// Dispatch: one workgroup per tile (cols × rows × 1).
+// One thread per workgroup does the work.
+
+#version 450
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0, std430) readonly buffer SadBuffer {
+    uint sad[];
+};
+
+struct TileAnalysis {
+    uint  count;
+    uint  edge_density_thou;
+    uint  _pad0;
+    uint  _pad1;
+    uint  colors[16];
+};
+layout(binding = 1, std430) readonly buffer AnalysisInput {
+    TileAnalysis tiles[];
+};
+
+layout(binding = 2, std430) buffer CompactList {
+    uint list[];
+};
+
+layout(binding = 3, std430) buffer CompactCount {
+    uint count;
+};
+
+layout(push_constant) uniform PushConstants {
+    uint cols;
+    uint rows;
+    uint dirty_threshold;
+};
+
+void main() {
+    uint tile_idx = gl_WorkGroupID.x;
+    if (tile_idx >= cols * rows) return;
+
+    uint sad_v = sad[tile_idx];
+    uint c = tiles[tile_idx].count;
+    if (sad_v >= dirty_threshold && c <= 16u && c >= 1u) {
+        uint slot = atomicAdd(count, 1u);
+        list[slot] = tile_idx;
+    }
+}

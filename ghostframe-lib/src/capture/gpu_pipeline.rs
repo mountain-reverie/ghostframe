@@ -201,6 +201,34 @@ pub struct GpuFrameProcessor {
     analysis_memory: vk::DeviceMemory,
     analysis_ptr: *mut TileAnalysis,
 
+    // PalRLE compact pipeline (Stage 1.5)
+    palrle_compact_shader_module: vk::ShaderModule,
+    palrle_compact_pipeline: vk::Pipeline,
+    palrle_compact_pipeline_layout: vk::PipelineLayout,
+    palrle_compact_descriptor_set_layout: vk::DescriptorSetLayout,
+    // HOST_VISIBLE | HOST_COHERENT, persistently mapped. One u32 per tile.
+    palrle_compact_list_buffer: vk::Buffer,
+    palrle_compact_list_memory: vk::DeviceMemory,
+    // Task 10b will read this pointer to retrieve the compact tile index list.
+    #[allow(dead_code)]
+    palrle_compact_list_ptr: *mut u32,
+    // HOST_VISIBLE | HOST_COHERENT | TRANSFER_DST, persistently mapped. 4 bytes.
+    palrle_compact_count_buffer: vk::Buffer,
+    palrle_compact_count_memory: vk::DeviceMemory,
+    // Task 10b will read this pointer to retrieve the compact tile count.
+    #[allow(dead_code)]
+    palrle_compact_count_ptr: *mut u32,
+
+    // PalRLE indirect-args pipeline (Stage 1.5b)
+    palrle_indirect_args_shader_module: vk::ShaderModule,
+    palrle_indirect_args_pipeline: vk::Pipeline,
+    palrle_indirect_args_pipeline_layout: vk::PipelineLayout,
+    palrle_indirect_args_descriptor_set_layout: vk::DescriptorSetLayout,
+    // HOST_VISIBLE | HOST_COHERENT, size = 12 bytes. Written by shader; used as
+    // INDIRECT_BUFFER for vkCmdDispatchIndirect in Task 10b.
+    palrle_indirect_args_buffer: vk::Buffer,
+    palrle_indirect_args_memory: vk::DeviceMemory,
+
     descriptor_pool: vk::DescriptorPool,
     prev_image: Option<PrevFrame>,
 
@@ -495,11 +523,135 @@ impl GpuFrameProcessor {
             .map_err(|(_, e)| e)?;
         let analysis_pipeline = analysis_pipelines[0];
 
+        // --- PalRLE compact shader module ---
+        let palrle_compact_spv = include_bytes!("shaders/palrle_compact.spv");
+        let palrle_compact_spv_words =
+            ash::util::read_spv(&mut std::io::Cursor::new(palrle_compact_spv.as_slice()))?;
+        let palrle_compact_shader_ci =
+            vk::ShaderModuleCreateInfo::default().code(&palrle_compact_spv_words);
+        let palrle_compact_shader_module =
+            device.create_shader_module(&palrle_compact_shader_ci, None)?;
+
+        // --- PalRLE compact descriptor set layout ---
+        // binding 0: STORAGE_BUFFER (SAD output, read-only)
+        // binding 1: STORAGE_BUFFER (tile analysis, read-only)
+        // binding 2: STORAGE_BUFFER (compact list output)
+        // binding 3: STORAGE_BUFFER (compact count output)
+        let palrle_compact_bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(3)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        ];
+        let palrle_compact_dsl_ci =
+            vk::DescriptorSetLayoutCreateInfo::default().bindings(&palrle_compact_bindings);
+        let palrle_compact_descriptor_set_layout =
+            device.create_descriptor_set_layout(&palrle_compact_dsl_ci, None)?;
+
+        // --- PalRLE compact pipeline layout ---
+        // Push constants: 3 x u32 = 12 bytes (cols, rows, dirty_threshold)
+        let palrle_compact_push_range = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .offset(0)
+            .size(12)];
+        let palrle_compact_pipeline_layout_ci = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(std::slice::from_ref(&palrle_compact_descriptor_set_layout))
+            .push_constant_ranges(&palrle_compact_push_range);
+        let palrle_compact_pipeline_layout =
+            device.create_pipeline_layout(&palrle_compact_pipeline_layout_ci, None)?;
+
+        // --- PalRLE compact compute pipeline ---
+        let palrle_compact_stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(palrle_compact_shader_module)
+            .name(entry_name);
+        let palrle_compact_compute_ci = vk::ComputePipelineCreateInfo::default()
+            .stage(palrle_compact_stage)
+            .layout(palrle_compact_pipeline_layout);
+        let palrle_compact_pipelines = device
+            .create_compute_pipelines(
+                vk::PipelineCache::null(),
+                &[palrle_compact_compute_ci],
+                None,
+            )
+            .map_err(|(_, e)| e)?;
+        let palrle_compact_pipeline = palrle_compact_pipelines[0];
+
+        // --- PalRLE indirect-args shader module ---
+        let palrle_indirect_args_spv = include_bytes!("shaders/palrle_indirect_args.spv");
+        let palrle_indirect_args_spv_words =
+            ash::util::read_spv(&mut std::io::Cursor::new(palrle_indirect_args_spv.as_slice()))?;
+        let palrle_indirect_args_shader_ci =
+            vk::ShaderModuleCreateInfo::default().code(&palrle_indirect_args_spv_words);
+        let palrle_indirect_args_shader_module =
+            device.create_shader_module(&palrle_indirect_args_shader_ci, None)?;
+
+        // --- PalRLE indirect-args descriptor set layout ---
+        // binding 0: STORAGE_BUFFER (compact count, read-only)
+        // binding 1: STORAGE_BUFFER (indirect args output)
+        let palrle_indirect_args_bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        ];
+        let palrle_indirect_args_dsl_ci =
+            vk::DescriptorSetLayoutCreateInfo::default().bindings(&palrle_indirect_args_bindings);
+        let palrle_indirect_args_descriptor_set_layout =
+            device.create_descriptor_set_layout(&palrle_indirect_args_dsl_ci, None)?;
+
+        // --- PalRLE indirect-args pipeline layout (no push constants) ---
+        let palrle_indirect_args_pipeline_layout_ci = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(std::slice::from_ref(&palrle_indirect_args_descriptor_set_layout));
+        let palrle_indirect_args_pipeline_layout =
+            device.create_pipeline_layout(&palrle_indirect_args_pipeline_layout_ci, None)?;
+
+        // --- PalRLE indirect-args compute pipeline ---
+        let palrle_indirect_args_stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(palrle_indirect_args_shader_module)
+            .name(entry_name);
+        let palrle_indirect_args_compute_ci = vk::ComputePipelineCreateInfo::default()
+            .stage(palrle_indirect_args_stage)
+            .layout(palrle_indirect_args_pipeline_layout);
+        let palrle_indirect_args_pipelines = device
+            .create_compute_pipelines(
+                vk::PipelineCache::null(),
+                &[palrle_indirect_args_compute_ci],
+                None,
+            )
+            .map_err(|(_, e)| e)?;
+        let palrle_indirect_args_pipeline = palrle_indirect_args_pipelines[0];
+
         // --- Descriptor pool ---
         // 3 sets: SAD (2 STORAGE_IMAGE + 1 STORAGE_BUFFER)
         //       + NV12 (1 STORAGE_IMAGE + 1 STORAGE_BUFFER)
         //       + Analysis (1 STORAGE_IMAGE + 1 STORAGE_BUFFER)
-        // Total: 4 STORAGE_IMAGE, 3 STORAGE_BUFFER, 3 max_sets.
+        //       + palrle_compact (4 STORAGE_BUFFER)
+        //       + palrle_indirect_args (2 STORAGE_BUFFER)
+        // Total: 4 STORAGE_IMAGE, 9 STORAGE_BUFFER, 5 max_sets.
         let pool_sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_IMAGE,
@@ -507,12 +659,12 @@ impl GpuFrameProcessor {
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: 3,
+                descriptor_count: 9,
             },
         ];
         let dp_ci = vk::DescriptorPoolCreateInfo::default()
             .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
-            .max_sets(3)
+            .max_sets(5)
             .pool_sizes(&pool_sizes);
         let descriptor_pool = device.create_descriptor_pool(&dp_ci, None)?;
 
@@ -570,6 +722,117 @@ impl GpuFrameProcessor {
             vk::MemoryMapFlags::empty(),
         )? as *mut TileAnalysis;
 
+        // --- PalRLE compact list buffer ---
+        // One u32 per tile slot. HOST_VISIBLE | HOST_COHERENT, STORAGE_BUFFER.
+        let palrle_compact_list_size = (max_tiles * 4) as vk::DeviceSize;
+        let palrle_compact_list_buf_ci = vk::BufferCreateInfo::default()
+            .size(palrle_compact_list_size)
+            .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let palrle_compact_list_buffer = device.create_buffer(&palrle_compact_list_buf_ci, None)?;
+        let palrle_compact_list_reqs =
+            device.get_buffer_memory_requirements(palrle_compact_list_buffer);
+        let palrle_compact_list_mem_type = find_memory_type(
+            &mem_props,
+            palrle_compact_list_reqs.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )
+        .ok_or("no host-visible memory type for palrle compact list buffer")?;
+        let palrle_compact_list_alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(palrle_compact_list_reqs.size)
+            .memory_type_index(palrle_compact_list_mem_type);
+        let palrle_compact_list_memory = device.allocate_memory(&palrle_compact_list_alloc, None)?;
+        device.bind_buffer_memory(
+            palrle_compact_list_buffer,
+            palrle_compact_list_memory,
+            0,
+        )?;
+        let palrle_compact_list_ptr = device.map_memory(
+            palrle_compact_list_memory,
+            0,
+            palrle_compact_list_size,
+            vk::MemoryMapFlags::empty(),
+        )? as *mut u32;
+
+        // --- PalRLE compact count buffer ---
+        // 4 bytes (one u32). HOST_VISIBLE | HOST_COHERENT, STORAGE_BUFFER | TRANSFER_DST.
+        let palrle_compact_count_size = 4_u64;
+        let palrle_compact_count_buf_ci = vk::BufferCreateInfo::default()
+            .size(palrle_compact_count_size)
+            .usage(
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            )
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let palrle_compact_count_buffer =
+            device.create_buffer(&palrle_compact_count_buf_ci, None)?;
+        let palrle_compact_count_reqs =
+            device.get_buffer_memory_requirements(palrle_compact_count_buffer);
+        let palrle_compact_count_mem_type = find_memory_type(
+            &mem_props,
+            palrle_compact_count_reqs.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )
+        .ok_or("no host-visible memory type for palrle compact count buffer")?;
+        let palrle_compact_count_alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(palrle_compact_count_reqs.size)
+            .memory_type_index(palrle_compact_count_mem_type);
+        let palrle_compact_count_memory =
+            device.allocate_memory(&palrle_compact_count_alloc, None)?;
+        device.bind_buffer_memory(
+            palrle_compact_count_buffer,
+            palrle_compact_count_memory,
+            0,
+        )?;
+        let palrle_compact_count_ptr = device.map_memory(
+            palrle_compact_count_memory,
+            0,
+            palrle_compact_count_size,
+            vk::MemoryMapFlags::empty(),
+        )? as *mut u32;
+
+        // --- PalRLE indirect args buffer ---
+        // 12 bytes (3 u32s: group_count_x/y/z). Written by shader, read as
+        // INDIRECT_BUFFER. HOST_VISIBLE | HOST_COHERENT for simple initialization
+        // (no staging buffer needed, and avoids DEVICE_LOCAL complication in Drop).
+        let palrle_indirect_args_size = 12_u64;
+        let palrle_indirect_args_buf_ci = vk::BufferCreateInfo::default()
+            .size(palrle_indirect_args_size)
+            .usage(
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::INDIRECT_BUFFER,
+            )
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let palrle_indirect_args_buffer =
+            device.create_buffer(&palrle_indirect_args_buf_ci, None)?;
+        let palrle_indirect_args_reqs =
+            device.get_buffer_memory_requirements(palrle_indirect_args_buffer);
+        let palrle_indirect_args_mem_type = find_memory_type(
+            &mem_props,
+            palrle_indirect_args_reqs.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )
+        .ok_or("no host-visible memory type for palrle indirect args buffer")?;
+        let palrle_indirect_args_alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(palrle_indirect_args_reqs.size)
+            .memory_type_index(palrle_indirect_args_mem_type);
+        let palrle_indirect_args_memory =
+            device.allocate_memory(&palrle_indirect_args_alloc, None)?;
+        device.bind_buffer_memory(
+            palrle_indirect_args_buffer,
+            palrle_indirect_args_memory,
+            0,
+        )?;
+        // Initialize to (0, 1, 1) so a stale dispatch is a safe no-op.
+        let init_ptr = device.map_memory(
+            palrle_indirect_args_memory,
+            0,
+            palrle_indirect_args_size,
+            vk::MemoryMapFlags::empty(),
+        )? as *mut u32;
+        init_ptr.write(0);
+        init_ptr.add(1).write(1);
+        init_ptr.add(2).write(1);
+        device.unmap_memory(palrle_indirect_args_memory);
+
         Ok(Self {
             _entry: entry,
             instance,
@@ -593,6 +856,22 @@ impl GpuFrameProcessor {
             analysis_buffer,
             analysis_memory,
             analysis_ptr,
+            palrle_compact_shader_module,
+            palrle_compact_pipeline,
+            palrle_compact_pipeline_layout,
+            palrle_compact_descriptor_set_layout,
+            palrle_compact_list_buffer,
+            palrle_compact_list_memory,
+            palrle_compact_list_ptr,
+            palrle_compact_count_buffer,
+            palrle_compact_count_memory,
+            palrle_compact_count_ptr,
+            palrle_indirect_args_shader_module,
+            palrle_indirect_args_pipeline,
+            palrle_indirect_args_pipeline_layout,
+            palrle_indirect_args_descriptor_set_layout,
+            palrle_indirect_args_buffer,
+            palrle_indirect_args_memory,
             descriptor_pool,
             prev_image: None,
             sad_buffer,
@@ -1770,6 +2049,25 @@ impl Drop for GpuFrameProcessor {
             self.device.destroy_buffer(self.analysis_buffer, None);
             self.device.free_memory(self.analysis_memory, None);
 
+            // PalRLE compact list buffer
+            self.device.unmap_memory(self.palrle_compact_list_memory);
+            self.device
+                .destroy_buffer(self.palrle_compact_list_buffer, None);
+            self.device.free_memory(self.palrle_compact_list_memory, None);
+
+            // PalRLE compact count buffer
+            self.device.unmap_memory(self.palrle_compact_count_memory);
+            self.device
+                .destroy_buffer(self.palrle_compact_count_buffer, None);
+            self.device
+                .free_memory(self.palrle_compact_count_memory, None);
+
+            // PalRLE indirect args buffer (no CPU mapping to unmap)
+            self.device
+                .destroy_buffer(self.palrle_indirect_args_buffer, None);
+            self.device
+                .free_memory(self.palrle_indirect_args_memory, None);
+
             self.device
                 .destroy_descriptor_pool(self.descriptor_pool, None);
 
@@ -1798,6 +2096,30 @@ impl Drop for GpuFrameProcessor {
                 .destroy_descriptor_set_layout(self.analysis_descriptor_set_layout, None);
             self.device
                 .destroy_shader_module(self.analysis_shader_module, None);
+
+            // PalRLE compact pipeline
+            self.device
+                .destroy_pipeline(self.palrle_compact_pipeline, None);
+            self.device
+                .destroy_pipeline_layout(self.palrle_compact_pipeline_layout, None);
+            self.device.destroy_descriptor_set_layout(
+                self.palrle_compact_descriptor_set_layout,
+                None,
+            );
+            self.device
+                .destroy_shader_module(self.palrle_compact_shader_module, None);
+
+            // PalRLE indirect-args pipeline
+            self.device
+                .destroy_pipeline(self.palrle_indirect_args_pipeline, None);
+            self.device
+                .destroy_pipeline_layout(self.palrle_indirect_args_pipeline_layout, None);
+            self.device.destroy_descriptor_set_layout(
+                self.palrle_indirect_args_descriptor_set_layout,
+                None,
+            );
+            self.device
+                .destroy_shader_module(self.palrle_indirect_args_shader_module, None);
 
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_device(None);
