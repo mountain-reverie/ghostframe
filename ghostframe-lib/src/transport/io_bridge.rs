@@ -204,11 +204,30 @@ impl IoBridge {
         fn predicate_ack(dg: &[u8]) -> bool {
             dg.first().copied() == Some(crate::transport::ack::ACK_BATCH_MSG_TYPE)
         }
+        // PalRle tile datagrams: tile datagram flag set, codec field = PalRle (2),
+        // payload byte 0 has bundle flag set (0x01).
+        // Wire layout: [DatagramHeader 12][TileHeader 8][payload].
+        // TileHeader byte [2] (wire index 14) = (codec << 1) | lz4.
+        fn predicate_palrle_bundled(dg: &[u8]) -> bool {
+            dg.len() >= 21
+                && (dg[0] & 0x80) != 0
+                && (dg[14] >> 1) == (crate::transport::protocol::Codec::PalRle as u8)
+                && (dg[20] & 0x01) != 0
+        }
+        // Inverse: PalRle tile datagrams without the bundle flag.
+        fn predicate_palrle_thin(dg: &[u8]) -> bool {
+            dg.len() >= 21
+                && (dg[0] & 0x80) != 0
+                && (dg[14] >> 1) == (crate::transport::protocol::Codec::PalRle as u8)
+                && (dg[20] & 0x01) == 0
+        }
 
         let predicate: crate::transport::loss_injection::DropPredicate =
             match std::env::var(&pred_var).as_deref() {
                 Ok("tile") => predicate_tile,
                 Ok("ack") => predicate_ack,
+                Ok("palrle_bundled") => predicate_palrle_bundled,
+                Ok("palrle_thin") => predicate_palrle_thin,
                 _ => predicate_all,
             };
         let seed: u64 = std::env::var(&seed_var)
@@ -2247,5 +2266,59 @@ mod tests {
 
         assert!(bridge.palette_table.delivered.contains(7));
         assert_eq!(bridge.palette_table.in_flight_carrying[7], 0);
+    }
+
+    #[test]
+    fn palrle_bundled_predicate_matches_bundled_datagram() {
+        // Synthetic wire: tile datagram, codec=PalRle, flags byte with bundle bit.
+        let mut wire = vec![0u8; 21];
+        wire[0] = 0x80; // tile datagram flag
+        wire[14] = (crate::transport::protocol::Codec::PalRle as u8) << 1;
+        wire[20] = 0x01; // bundled
+        std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "1.0");
+        std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE", "palrle_bundled");
+        std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_SEED", "1");
+        let mut inj = IoBridge::loss_injector_from_env("OUTBOUND").unwrap();
+        assert!(inj.should_drop(&wire));
+        std::env::remove_var("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY");
+        std::env::remove_var("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE");
+        std::env::remove_var("GHOSTFRAME_OUTBOUND_LOSS_SEED");
+    }
+
+    #[test]
+    fn palrle_bundled_predicate_rejects_thin_datagram() {
+        let mut wire = vec![0u8; 21];
+        wire[0] = 0x80;
+        wire[14] = (crate::transport::protocol::Codec::PalRle as u8) << 1;
+        wire[20] = 0x00; // thin
+        std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "1.0");
+        std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE", "palrle_bundled");
+        std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_SEED", "1");
+        let mut inj = IoBridge::loss_injector_from_env("OUTBOUND").unwrap();
+        assert!(!inj.should_drop(&wire));
+        std::env::remove_var("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY");
+        std::env::remove_var("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE");
+        std::env::remove_var("GHOSTFRAME_OUTBOUND_LOSS_SEED");
+    }
+
+    #[test]
+    fn palrle_thin_predicate_matches_thin_only() {
+        let mut wire = vec![0u8; 21];
+        wire[0] = 0x80;
+        wire[14] = (crate::transport::protocol::Codec::PalRle as u8) << 1;
+        wire[20] = 0x00;
+        std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "1.0");
+        std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE", "palrle_thin");
+        std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_SEED", "1");
+        let mut inj = IoBridge::loss_injector_from_env("OUTBOUND").unwrap();
+        assert!(inj.should_drop(&wire));
+        wire[20] = 0x01;
+        // Re-create inj since it consumed RNG state; or just check the predicate behavior:
+        // (the predicate is the only filter at proba=1.0, so should_drop is purely predicate-driven)
+        let mut inj2 = IoBridge::loss_injector_from_env("OUTBOUND").unwrap();
+        assert!(!inj2.should_drop(&wire));
+        std::env::remove_var("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY");
+        std::env::remove_var("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE");
+        std::env::remove_var("GHOSTFRAME_OUTBOUND_LOSS_SEED");
     }
 }
