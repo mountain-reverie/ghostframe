@@ -423,8 +423,15 @@ impl IoBridge {
         use std::time::Instant;
 
         for &(tile_x, tile_y) in dirty {
-            self.scheduler.bump_generation(tile_x as u8, tile_y as u8);
-            let gen = self.scheduler.generation_for(tile_x as u8, tile_y as u8);
+            let (gen, superseded) =
+                self.scheduler.bump_generation_collecting(tile_x as u8, tile_y as u8);
+            for s in superseded {
+                if let Some(pid) = s.palette_id {
+                    let pid_usize = pid as usize;
+                    let cnt = self.palette_table.in_flight_carrying[pid_usize];
+                    self.palette_table.in_flight_carrying[pid_usize] = cnt.saturating_sub(1);
+                }
+            }
             let tile_data = grid.extract_tile(pixels, stride, tile_x, tile_y);
 
             let (codec, payload) = match policy {
@@ -503,9 +510,25 @@ impl IoBridge {
         if data[0] == crate::transport::ack::ACK_BATCH_MSG_TYPE {
             if let Ok(batch) = crate::transport::ack::AckBatch::decode(data) {
                 for e in batch.entries {
-                    // TODO Task 22: consume ResolvedTileWork to update palette delivery
-                    let _ = self.scheduler
+                    let resolved = self.scheduler
                         .on_ack(e.tile_x, e.tile_y, e.generation, e.pass);
+                    for r in resolved {
+                        if let Some(pid) = r.palette_id {
+                            let pid_usize = pid as usize;
+                            if !self.palette_table.delivered.contains(pid) {
+                                self.palette_table.delivered.insert(pid);
+                            }
+                            let cnt = self.palette_table.in_flight_carrying[pid_usize];
+                            self.palette_table.in_flight_carrying[pid_usize] = cnt.saturating_sub(1);
+                            if cnt == 0 {
+                                tracing::warn!(
+                                    target: "palrle.alloc",
+                                    palette_id = pid,
+                                    "in_flight_carrying underflow — enqueue/ack pairing bug",
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2184,5 +2207,45 @@ mod tests {
         // Both reference id 7.
         assert_eq!(p00[1], 7);
         assert_eq!(p10[1], 7);
+    }
+
+    #[tokio::test]
+    async fn ack_for_palrle_tile_sets_delivered_and_decrements_in_flight() {
+        use crate::encoder::pal_rle::{PaletteEntry, SlotState};
+
+        let (our_end, _peer) = UnixStream::pair().expect("UnixStream::pair failed");
+        let server = QuicServer::new().expect("QuicServer::new failed");
+        let mut bridge = IoBridge::new_with_stream_for_test(our_end, server);
+        // Resize scheduler so tile (0,0) is in-bounds.
+        bridge.scheduler.resize(1, 1);
+
+        let mut p = PaletteEntry::default();
+        p.colors[0] = [1, 2, 3, 255];
+        p.count = 1;
+        bridge.palette_table.entries[7] = Some(p);
+        bridge.palette_table.slot_state[7] = SlotState::Held;
+        bridge.palette_table.in_flight_carrying[7] = 1;
+
+        // Enqueue a PalRle TileWork referencing palette 7.
+        bridge.scheduler.enqueue(crate::transport::scheduler::TileWork {
+            tile_x: 0,
+            tile_y: 0,
+            generation: 0,
+            pass_idx: 0,
+            total_passes: 1,
+            codec: crate::transport::protocol::Codec::PalRle,
+            payload: vec![0x01u8, 7, 1, 1, 2, 3, 255, 0xF0],
+            queued_at: std::time::Instant::now(),
+            last_sent_at: None,
+            state: crate::transport::scheduler::WorkState::Pending,
+        });
+        let _ = bridge.scheduler.tick(usize::MAX);
+
+        // Build synthetic AckBatch wire: [0x02, count=1, tile_x=0, tile_y=0, (gen=0<<4)|pass=0, reserved=0]
+        let wire = vec![0x02u8, 1, 0, 0, 0, 0];
+        bridge.dispatch_ack_datagram(&wire);
+
+        assert!(bridge.palette_table.delivered.contains(7));
+        assert_eq!(bridge.palette_table.in_flight_carrying[7], 0);
     }
 }
