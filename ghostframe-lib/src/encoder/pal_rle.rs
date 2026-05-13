@@ -297,6 +297,23 @@ pub fn encode_pal_rle_payload(
     out
 }
 
+/// Build the M3.2b `indices_raw` PalRLE wire payload: flags (bit 1) +
+/// palette_id + raw 512-byte 4-bit-packed indices (no RLE expansion).
+///
+/// This is the "thin equivalent" of the bundled/thin paths but skips the
+/// nibble-RLE encoding step entirely. The client must support `indices_raw`
+/// (advertised via HELLO bit 0) for the server to emit this variant.
+pub fn encode_pal_rle_payload_indices_raw(
+    packed_indices: &[u8; 512],
+    palette_id: u8,
+) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(514);
+    out.push(0x02); // flags: bit 1 = indices_raw, bit 0 = not bundled
+    out.push(palette_id);
+    out.extend_from_slice(packed_indices);
+    out
+}
+
 /// Returned bundle from `decode_pal_rle` — pixel data plus, if the payload
 /// was bundled, the (palette_id, palette) the client should cache.
 #[derive(Debug)]
@@ -952,6 +969,23 @@ mod tests {
         t.force_rebundle(7);
         // Should be a no-op, no panic.
         assert!(!t.delivered.contains(7));
+    }
+
+    #[test]
+    fn indices_raw_payload_layout_thin() {
+        // Thin variant: flags = 0x02 (bit 1 set, bit 0 clear), then palette_id,
+        // then 512 bytes of raw 4-bit-packed indices.
+        let mut packed = [0u8; 512];
+        // Distinct pattern so we can verify the bytes round-trip verbatim.
+        for (i, b) in packed.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(3);
+        }
+        let payload = encode_pal_rle_payload_indices_raw(&packed, 42);
+        assert_eq!(payload.len(), 514, "[flags=1][palette_id=1][indices=512] = 514 bytes");
+        assert_eq!(payload[0], 0x02, "flags bit 1 set, bit 0 clear");
+        assert_eq!(payload[1], 42, "palette_id");
+        assert_eq!(&payload[2..], &packed[..],
+            "indices block must be verbatim copy of packed_indices");
     }
 
     proptest! {
