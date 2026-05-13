@@ -468,7 +468,8 @@ impl IoBridge {
         if data[0] == crate::transport::ack::ACK_BATCH_MSG_TYPE {
             if let Ok(batch) = crate::transport::ack::AckBatch::decode(data) {
                 for e in batch.entries {
-                    self.scheduler
+                    // TODO Task 22: consume ResolvedTileWork to update palette delivery
+                    let _ = self.scheduler
                         .on_ack(e.tile_x, e.tile_y, e.generation, e.pass);
                 }
             }

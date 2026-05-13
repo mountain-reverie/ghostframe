@@ -168,14 +168,14 @@ impl Scheduler {
             .collect()
     }
 
-    /// Mark matching tile work as `Acked` so the next `tick` drops it.
-    /// Stale-gen acks (gen/pass don't match anything in the queue, or only
-    /// match Superseded entries) are silently ignored — the work is no
-    /// longer in flight.
+    /// Match (tile_x, tile_y, generation, pass) against in-flight queue entries
+    /// and mark each match as `Acked`. Returns the resolved entries (codec,
+    /// palette_id, etc.) so callers can update downstream state.
     ///
-    /// Returns a `Vec<ResolvedTileWork>` describing each entry that was
-    /// ACKed (normally at most one). Callers that don't need the resolved
-    /// metadata can simply drop the return value.
+    /// Only entries with `WorkState::InFlight` are eligible. Entries in other
+    /// states (`Pending`, `Acked`, `Superseded`) are ignored. Stale-generation
+    /// or stale-pass ACKs match no entry and produce an empty vector.
+    #[must_use = "ResolvedTileWork is needed by IoBridge to update palette delivery state"]
     pub fn on_ack(&mut self, tile_x: u8, tile_y: u8, generation: u8, pass: u8) -> Vec<ResolvedTileWork> {
         let mut resolved: Vec<ResolvedTileWork> = Vec::new();
         for entry in self.queue.iter_mut() {
@@ -186,8 +186,13 @@ impl Scheduler {
                 && entry.state == WorkState::InFlight
             {
                 entry.state = WorkState::Acked;
-                let palette_id = if entry.codec == Codec::PalRle && entry.payload.len() >= 2 {
-                    Some(entry.payload[1])
+                let palette_id = if entry.codec == Codec::PalRle {
+                    debug_assert!(
+                        entry.payload.len() >= 2,
+                        "PalRle TileWork has malformed payload: {} bytes",
+                        entry.payload.len()
+                    );
+                    entry.payload.get(1).copied()
                 } else {
                     None
                 };
@@ -206,8 +211,14 @@ impl Scheduler {
         resolved
     }
 
-    /// Like `bump_generation` but returns work that was superseded so callers
-    /// can update downstream state (e.g. PaletteTable in_flight_carrying).
+    /// Like `bump_generation` but returns the work that was superseded so
+    /// callers can update downstream state (e.g. `PaletteTable::in_flight_carrying`).
+    ///
+    /// Safe to call `bump_generation` internally after pre-marking entries
+    /// `Superseded`: `bump_generation`'s loop skips entries already in
+    /// `Superseded` or `Acked` state. If that guard ever changes, this
+    /// function's safety needs re-verification.
+    #[must_use = "ResolvedTileWork is needed by IoBridge to update palette delivery state on supersession"]
     pub fn bump_generation_collecting(&mut self, tile_x: u8, tile_y: u8)
         -> (u8, Vec<ResolvedTileWork>)
     {
@@ -218,8 +229,13 @@ impl Scheduler {
                 && entry.state != WorkState::Acked
                 && entry.state != WorkState::Superseded
             {
-                let palette_id = if entry.codec == Codec::PalRle && entry.payload.len() >= 2 {
-                    Some(entry.payload[1])
+                let palette_id = if entry.codec == Codec::PalRle {
+                    debug_assert!(
+                        entry.payload.len() >= 2,
+                        "PalRle TileWork has malformed payload: {} bytes",
+                        entry.payload.len()
+                    );
+                    entry.payload.get(1).copied()
                 } else {
                     None
                 };
@@ -444,7 +460,7 @@ mod tests {
         let mut s = Scheduler::new(4, 4);
         s.enqueue(TileWork::raw_for_test(1, 2, 0, vec![1]));
         let _ = s.tick(usize::MAX); // promote to InFlight
-        s.on_ack(1, 2, 0, 0);
+        let _ = s.on_ack(1, 2, 0, 0);
         // Next tick should drop it.
         let out = s.tick(usize::MAX);
         assert!(out.is_empty());
@@ -457,7 +473,7 @@ mod tests {
         s.set_rtt(Duration::from_millis(50)); // long RTT so next tick won't retry
         s.enqueue(TileWork::raw_for_test(1, 2, 5, vec![1]));
         let _ = s.tick(usize::MAX);
-        s.on_ack(1, 2, 4, 0); // wrong gen
+        let _ = s.on_ack(1, 2, 4, 0); // wrong gen
         let next = s.tick(usize::MAX); // not yet 2×RTT — empty
         assert!(next.is_empty());
         // The work is still queued.
@@ -467,7 +483,7 @@ mod tests {
     #[test]
     fn on_ack_unknown_tile_does_not_panic() {
         let mut s = Scheduler::new(4, 4);
-        s.on_ack(7, 7, 0, 0);
+        let _ = s.on_ack(7, 7, 0, 0);
         assert_eq!(s.queue_len(), 0);
     }
 
@@ -485,7 +501,7 @@ mod tests {
         // distinguishable from current-gen work in any new tile we enqueue.
         assert_eq!(s.generation_for(1, 2), 2);
         // A stale ACK against the cleared work is a noop (no matching entry).
-        s.on_ack(1, 2, 2, 0);
+        let _ = s.on_ack(1, 2, 2, 0);
         assert_eq!(s.queue_len(), 0);
     }
 
@@ -494,7 +510,7 @@ mod tests {
         let mut s = Scheduler::new(4, 4);
         s.enqueue(TileWork::raw_for_test(0, 0, 0, vec![1]));
         s.bump_generation(0, 0); // marks Superseded
-        s.on_ack(0, 0, 0, 0); // would match by tile_x/y/gen/pass — but work is Superseded
+        let _ = s.on_ack(0, 0, 0, 0); // would match by tile_x/y/gen/pass — but work is Superseded
                               // The work stays Superseded (not promoted to Acked). Tick still drops it
                               // via the Superseded retain path.
         let out = s.tick(usize::MAX);
