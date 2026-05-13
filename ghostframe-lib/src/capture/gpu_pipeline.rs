@@ -138,6 +138,11 @@ pub struct FrameAnalysis {
     pub tile_analysis: *const TileAnalysis,
     /// Number of entries reachable via `tile_analysis` (= cols × rows).
     pub tile_analysis_len: u32,
+    /// Pointer to the compact list of (dirty AND PalRLE-feasible) tile indices.
+    /// Valid until next process_frame call. Read `palrle_compact_count` entries.
+    pub palrle_compact_list: *const u32,
+    /// Number of valid entries in `palrle_compact_list`.
+    pub palrle_compact_count: u32,
 }
 
 impl FrameAnalysis {
@@ -151,6 +156,19 @@ impl FrameAnalysis {
         // hold this FrameAnalysis across a subsequent process_frame() call,
         // which may recycle the underlying GPU buffer.
         unsafe { std::slice::from_raw_parts(self.tile_analysis, self.tile_analysis_len as usize) }
+    }
+
+    pub fn palrle_compact_list_slice(&self) -> &[u32] {
+        if self.palrle_compact_list.is_null() || self.palrle_compact_count == 0 {
+            return &[];
+        }
+        // SAFETY: pointer is into HOST_VISIBLE mapped GPU memory owned by
+        // GpuFrameProcessor. The borrow checker prevents the returned slice
+        // from outliving the &self borrow; the caller must not hold this
+        // FrameAnalysis across a subsequent process_frame() call.
+        unsafe {
+            std::slice::from_raw_parts(self.palrle_compact_list, self.palrle_compact_count as usize)
+        }
     }
 }
 
@@ -1085,6 +1103,8 @@ impl GpuFrameProcessor {
                 nv12_uv_offset,
                 tile_analysis: std::ptr::null(),
                 tile_analysis_len: 0,
+                palrle_compact_list: std::ptr::null(),
+                palrle_compact_count: 0,
             });
         }
 
@@ -1133,6 +1153,28 @@ impl GpuFrameProcessor {
             sets: self.device.allocate_descriptor_sets(&analysis_ds_alloc)?,
         };
         let analysis_ds = analysis_ds_guard.sets[0];
+
+        let palrle_compact_set_layouts = [self.palrle_compact_descriptor_set_layout];
+        let palrle_compact_ds_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(&palrle_compact_set_layouts);
+        let palrle_compact_ds_guard = ScopedDescriptorSets {
+            device: &self.device,
+            pool: self.descriptor_pool,
+            sets: self.device.allocate_descriptor_sets(&palrle_compact_ds_alloc)?,
+        };
+        let palrle_compact_ds = palrle_compact_ds_guard.sets[0];
+
+        let palrle_indirect_args_set_layouts = [self.palrle_indirect_args_descriptor_set_layout];
+        let palrle_indirect_args_ds_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(&palrle_indirect_args_set_layouts);
+        let palrle_indirect_args_ds_guard = ScopedDescriptorSets {
+            device: &self.device,
+            pool: self.descriptor_pool,
+            sets: self.device.allocate_descriptor_sets(&palrle_indirect_args_ds_alloc)?,
+        };
+        let palrle_indirect_args_ds = palrle_indirect_args_ds_guard.sets[0];
 
         // Write SAD descriptor set.
         let current_image_info = [vk::DescriptorImageInfo::default()
@@ -1207,6 +1249,77 @@ impl GpuFrameProcessor {
                 .buffer_info(&analysis_buffer_info),
         ];
         self.device.update_descriptor_sets(&analysis_writes, &[]);
+
+        // Write palrle_compact descriptor set.
+        // binding 0: sad_buffer (read-only in shader)
+        // binding 1: analysis_buffer (read-only in shader)
+        // binding 2: palrle_compact_list_buffer (write)
+        // binding 3: palrle_compact_count_buffer (atomic write)
+        let palrle_compact_sad_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.sad_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let palrle_compact_analysis_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.analysis_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let palrle_compact_list_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.palrle_compact_list_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let palrle_compact_count_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.palrle_compact_count_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let palrle_compact_writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(palrle_compact_ds)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&palrle_compact_sad_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(palrle_compact_ds)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&palrle_compact_analysis_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(palrle_compact_ds)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&palrle_compact_list_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(palrle_compact_ds)
+                .dst_binding(3)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&palrle_compact_count_info),
+        ];
+        self.device.update_descriptor_sets(&palrle_compact_writes, &[]);
+
+        // Write palrle_indirect_args descriptor set.
+        // binding 0: palrle_compact_count_buffer (read)
+        // binding 1: palrle_indirect_args_buffer (write)
+        let palrle_indirect_count_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.palrle_compact_count_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let palrle_indirect_args_buf_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.palrle_indirect_args_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let palrle_indirect_args_writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(palrle_indirect_args_ds)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&palrle_indirect_count_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(palrle_indirect_args_ds)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&palrle_indirect_args_buf_info),
+        ];
+        self.device
+            .update_descriptor_sets(&palrle_indirect_args_writes, &[]);
 
         // --- Command buffer (RAII-guarded) ---
         let cmd_alloc = vk::CommandBufferAllocateInfo::default()
@@ -1360,6 +1473,113 @@ impl GpuFrameProcessor {
         );
         self.device.cmd_dispatch(cmd, cols, rows, 1);
 
+        // Stage 1.5: zero compact_count, dispatch compact scan, dispatch indirect-args writer.
+        self.device
+            .cmd_fill_buffer(cmd, self.palrle_compact_count_buffer, 0, 4, 0);
+
+        // Barrier: transfer-write → shader-read/write
+        let buf_barrier_fill = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(self.palrle_compact_count_buffer)
+            .offset(0)
+            .size(4);
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            std::slice::from_ref(&buf_barrier_fill),
+            &[],
+        );
+
+        // Stage 1.5a: bind palrle_compact pipeline.
+        self.device.cmd_bind_pipeline(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.palrle_compact_pipeline,
+        );
+        self.device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.palrle_compact_pipeline_layout,
+            0,
+            &[palrle_compact_ds],
+            &[],
+        );
+        let compact_push: [u32; 3] = [cols, rows, SAD_THRESHOLD];
+        let compact_push_bytes = std::slice::from_raw_parts(
+            compact_push.as_ptr() as *const u8,
+            std::mem::size_of_val(&compact_push),
+        );
+        self.device.cmd_push_constants(
+            cmd,
+            self.palrle_compact_pipeline_layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            compact_push_bytes,
+        );
+        self.device.cmd_dispatch(cmd, cols, rows, 1);
+
+        // Barrier between Stage 1.5a and 1.5b: shader write → shader read on count.
+        let buf_barrier_count = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(self.palrle_compact_count_buffer)
+            .offset(0)
+            .size(4);
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            std::slice::from_ref(&buf_barrier_count),
+            &[],
+        );
+
+        // Stage 1.5b: indirect-args writer.
+        self.device.cmd_bind_pipeline(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.palrle_indirect_args_pipeline,
+        );
+        self.device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.palrle_indirect_args_pipeline_layout,
+            0,
+            &[palrle_indirect_args_ds],
+            &[],
+        );
+        self.device.cmd_dispatch(cmd, 1, 1, 1);
+
+        // Barrier for future stages (Task 11+) to consume indirect args.
+        let buf_barrier_args = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(
+                vk::AccessFlags::INDIRECT_COMMAND_READ | vk::AccessFlags::SHADER_READ,
+            )
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(self.palrle_indirect_args_buffer)
+            .offset(0)
+            .size(12);
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::DRAW_INDIRECT | vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            std::slice::from_ref(&buf_barrier_args),
+            &[],
+        );
+
         // 5a. Snapshot copy: current (DMA-BUF) → prev_image (owned). This
         // makes prev_image a true point-in-time snapshot of THIS frame for
         // the next frame's SAD comparison. Must run AFTER all three shader
@@ -1445,7 +1665,8 @@ impl GpuFrameProcessor {
             &post_copy_barrier,
         );
 
-        // 5. Barriers: SAD buffer → HOST_READ; NV12 buffer → HOST_READ; analysis buffer → HOST_READ
+        // 5. Barriers: SAD buffer → HOST_READ; NV12 buffer → HOST_READ;
+        //    analysis buffer → HOST_READ; palrle compact list + count → HOST_READ.
         let buf_barriers = [
             vk::BufferMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE)
@@ -1469,6 +1690,22 @@ impl GpuFrameProcessor {
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .buffer(self.analysis_buffer)
+                .offset(0)
+                .size(vk::WHOLE_SIZE),
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.palrle_compact_list_buffer)
+                .offset(0)
+                .size(vk::WHOLE_SIZE),
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.palrle_compact_count_buffer)
                 .offset(0)
                 .size(vk::WHOLE_SIZE),
         ];
@@ -1525,6 +1762,8 @@ impl GpuFrameProcessor {
             &sad_ds_guard,
             &nv12_ds_guard,
             &analysis_ds_guard,
+            &palrle_compact_ds_guard,
+            &palrle_indirect_args_ds_guard,
             &cmd_guard,
             &fence_guard,
         );
@@ -1547,6 +1786,8 @@ impl GpuFrameProcessor {
             nv12_uv_offset,
             tile_analysis: self.analysis_ptr as *const TileAnalysis,
             tile_analysis_len: cols * rows,
+            palrle_compact_list: self.palrle_compact_list_ptr as *const u32,
+            palrle_compact_count: *self.palrle_compact_count_ptr,
         })
     }
 
@@ -2444,6 +2685,8 @@ mod tests {
             nv12_uv_offset: 0,
             tile_analysis: backing.as_mut_ptr() as *const TileAnalysis,
             tile_analysis_len: 2,
+            palrle_compact_list: std::ptr::null(),
+            palrle_compact_count: 0,
         };
         let slice = analysis.tile_analysis_slice();
         assert_eq!(slice.len(), 2);
@@ -3117,6 +3360,166 @@ mod tests {
                 assert_eq!(entry.colors[1], green_p, "tile {}: slot 1 should be green", tile_i);
                 assert_eq!(entry.colors[2], red_p,   "tile {}: slot 2 should be red",   tile_i);
             }
+        }
+    }
+
+    /// Verify that `palrle_compact_list` contains exactly the tiles that are
+    /// both SAD-dirty and have a feasible palette (count 1..=16).
+    ///
+    /// Frame layout (96×32, 3 tiles of 32×32 each):
+    ///   tile 0 (x 0..31):   solid red  → count=1, feasible
+    ///   tile 1 (x 32..63):  4-color quadrant text → count=4, feasible
+    ///   tile 2 (x 64..95):  photographic gradient → count>16, NOT feasible
+    ///
+    /// Two-call pattern: seed frame (all zeros) then real frame.
+    #[test]
+    fn process_frame_returns_palrle_compact_list_for_text_tiles() {
+        let width = 96u32;
+        let height = 32u32;
+        let stride = width * 4;
+
+        let mut processor = match GpuFrameProcessor::new(256) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("Skipping palrle compact test (no Vulkan GPU?): {e}");
+                return;
+            }
+        };
+
+        unsafe {
+            // --- Build the seed frame (all black zeros) ---
+            let size = (stride * height) as usize;
+            let name_seed = std::ffi::CString::new("ghost-palrle-seed").unwrap();
+            let fd_seed = libc::memfd_create(name_seed.as_ptr(), 0);
+            assert!(fd_seed >= 0);
+            libc::ftruncate(fd_seed, size as i64);
+            let ptr_seed = libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd_seed,
+                0,
+            );
+            assert_ne!(ptr_seed, libc::MAP_FAILED);
+            // Zero-fill (all pixels black).
+            std::ptr::write_bytes(ptr_seed as *mut u8, 0, size);
+            libc::munmap(ptr_seed, size);
+
+            let first = match processor.process_frame(fd_seed, width, height, stride) {
+                Ok(a) => a,
+                Err(e) => {
+                    libc::close(fd_seed);
+                    eprintln!("Skipping palrle compact test (memfd not a real DMA-BUF): {e}");
+                    return;
+                }
+            };
+            libc::close(fd_seed);
+            // First frame: tile_analysis is null, compact list is null.
+            assert!(
+                first.tile_analysis.is_null(),
+                "first-frame analysis is null by design"
+            );
+            assert!(
+                first.palrle_compact_list.is_null(),
+                "first-frame compact list is null by design"
+            );
+
+            // --- Build the real frame ---
+            let name_real = std::ffi::CString::new("ghost-palrle-real").unwrap();
+            let fd_real = libc::memfd_create(name_real.as_ptr(), 0);
+            assert!(fd_real >= 0);
+            libc::ftruncate(fd_real, size as i64);
+            let ptr_real = libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd_real,
+                0,
+            );
+            assert_ne!(ptr_real, libc::MAP_FAILED);
+            let frame = std::slice::from_raw_parts_mut(ptr_real as *mut u8, size);
+
+            // tile 0 (x 0..31): solid red (BGRA: B=0,G=0,R=255,A=255)
+            for y in 0..32u32 {
+                for x in 0..32u32 {
+                    let off = ((y * stride) + x * 4) as usize;
+                    frame[off..off + 4].copy_from_slice(&[0, 0, 255, 255]);
+                }
+            }
+            // tile 1 (x 32..63): 4 colors in quadrants
+            for y in 0..32u32 {
+                for x in 32..64u32 {
+                    let off = ((y * stride) + x * 4) as usize;
+                    let c = if y < 16 && x < 48 {
+                        [0u8, 0, 0, 255]
+                    } else if y < 16 {
+                        [255, 255, 255, 255]
+                    } else if x < 48 {
+                        [128, 128, 128, 255]
+                    } else {
+                        [200, 200, 200, 255]
+                    };
+                    frame[off..off + 4].copy_from_slice(&c);
+                }
+            }
+            // tile 2 (x 64..95): gradient (many colors)
+            for y in 0..32u32 {
+                for x in 64..96u32 {
+                    let off = ((y * stride) + x * 4) as usize;
+                    let local_x = (x - 64) as u8;
+                    frame[off..off + 4]
+                        .copy_from_slice(&[local_x, y as u8, local_x.wrapping_add(y as u8), 255]);
+                }
+            }
+
+            libc::munmap(ptr_real, size);
+
+            let analysis = match processor.process_frame(fd_real, width, height, stride) {
+                Ok(a) => a,
+                Err(e) => {
+                    libc::close(fd_real);
+                    eprintln!("Skipping palrle compact test second frame (memfd not a real DMA-BUF): {e}");
+                    return;
+                }
+            };
+            libc::close(fd_real);
+
+            // Sanity-check that tile_analysis ran.
+            assert!(
+                !analysis.tile_analysis.is_null(),
+                "second-frame tile_analysis must not be null"
+            );
+            assert_eq!(analysis.tile_analysis_len, 3, "96x32 → 3 tiles");
+
+            // Compact list must be non-null.
+            assert!(
+                !analysis.palrle_compact_list.is_null(),
+                "palrle_compact_list must not be null on second frame"
+            );
+
+            let list = analysis.palrle_compact_list_slice();
+
+            // tile 0 (count=1) and tile 1 (count=4) must appear.
+            assert!(
+                list.contains(&0),
+                "tile 0 (solid red, count=1) should be in compact list; got {list:?}"
+            );
+            assert!(
+                list.contains(&1),
+                "tile 1 (4-color, count=4) should be in compact list; got {list:?}"
+            );
+            // tile 2 has count > 16 → must NOT appear.
+            assert!(
+                !list.contains(&2),
+                "tile 2 (gradient, count>16) must NOT be in compact list; got {list:?}"
+            );
+            assert_eq!(
+                analysis.palrle_compact_count, 2,
+                "only 2 tiles are PalRLE-feasible; got count={}",
+                analysis.palrle_compact_count
+            );
         }
     }
 }
