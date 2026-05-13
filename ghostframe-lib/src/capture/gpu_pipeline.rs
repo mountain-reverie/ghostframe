@@ -171,6 +171,12 @@ pub struct FrameAnalysis {
     /// when no superset was found. Extract the resolved palette id via `entry & 0xFF`.
     /// Null on the first frame. Valid until next process_frame call.
     pub folded_into: *const u32,
+    /// Pointer to the Stage 3 index buffer (packed 4-bit palette indices).
+    /// Each compact slot `c` occupies 512 bytes at offset `c * 512`.
+    /// Only slots 0..palrle_compact_count have valid data; other slots retain
+    /// stale bytes from prior frames. Null on the first frame.
+    /// Valid until next process_frame call.
+    pub index_buffer: *const u8,
 }
 
 impl FrameAnalysis {
@@ -250,13 +256,27 @@ impl FrameAnalysis {
         // SAFETY: same lifetime as other GPU-pointer slice helpers.
         unsafe { std::slice::from_raw_parts(self.folded_into, 256) }
     }
+
+    /// Returns the 512 nibble-packed index bytes for compact slot `c`.
+    /// Only c_slots in 0..palrle_compact_count have meaningful data;
+    /// slices for other c values contain stale bytes from prior frames.
+    pub fn index_buffer_slice_for(&self, c: usize) -> &[u8] {
+        if self.index_buffer.is_null() {
+            return &[];
+        }
+        // SAFETY: pointer is into HOST_VISIBLE mapped GPU memory owned by
+        // GpuFrameProcessor. Caller must not hold this FrameAnalysis across
+        // a subsequent process_frame() call. Each compact slot occupies 512 bytes.
+        unsafe { std::slice::from_raw_parts(self.index_buffer.add(c * 512), 512) }
+    }
 }
 
 // SAFETY: `nv12_data`, `tile_analysis`, `palrle_compact_list`,
-// `frame_palette_set`, `per_tile_frame_palette_id`, and `folded_into` are all
-// pointers to GPU-managed HOST_VISIBLE memory owned by `GpuFrameProcessor`. The
-// FrameAnalysis is consumed before the next `process_frame` call so the
-// data is stable. GpuFrameProcessor is used from a single tokio task.
+// `frame_palette_set`, `per_tile_frame_palette_id`, `folded_into`, and
+// `index_buffer` are all pointers to GPU-managed HOST_VISIBLE memory owned
+// by `GpuFrameProcessor`. The FrameAnalysis is consumed before the next
+// `process_frame` call so the data is stable. GpuFrameProcessor is used
+// from a single tokio task.
 unsafe impl Send for FrameAnalysis {}
 
 /// Vulkan compute-based dirty tile tracker with integrated NV12 conversion.
@@ -387,8 +407,8 @@ pub struct GpuFrameProcessor {
     // Persistently mapped for CPU readback after Stage 3 dispatch.
     index_buffer: vk::Buffer,
     index_buffer_memory: vk::DeviceMemory,
-    // Task 13b will read this pointer to retrieve the packed index data.
-    #[allow(dead_code)]
+    // Persistent CPU mapping of the index buffer; pointed to by
+    // FrameAnalysis::index_buffer after Stage 3 dispatch.
     index_buffer_ptr: *mut u8,
 
     descriptor_pool: vk::DescriptorPool,
@@ -1741,6 +1761,7 @@ impl GpuFrameProcessor {
                 frame_palette_set_count: 0,
                 per_tile_frame_palette_id: std::ptr::null(),
                 folded_into: std::ptr::null(),
+                index_buffer: std::ptr::null(),
             });
         }
 
@@ -1853,6 +1874,17 @@ impl GpuFrameProcessor {
                 .allocate_descriptor_sets(&palette_subset_fold_ds_alloc)?,
         };
         let palette_subset_fold_descriptor_set = palette_subset_fold_ds_guard.sets[0];
+
+        // pal_rle_index descriptor set (Stage 3)
+        let pal_rle_index_ds_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(std::slice::from_ref(&self.pal_rle_index_descriptor_set_layout));
+        let pal_rle_index_ds_guard = ScopedDescriptorSets {
+            device: &self.device,
+            pool: self.descriptor_pool,
+            sets: self.device.allocate_descriptor_sets(&pal_rle_index_ds_alloc)?,
+        };
+        let pal_rle_index_descriptor_set = pal_rle_index_ds_guard.sets[0];
 
         // Write SAD descriptor set.
         let current_image_info = [vk::DescriptorImageInfo::default()
@@ -2102,6 +2134,71 @@ impl GpuFrameProcessor {
                 .buffer_info(&subset_fold_folded_into_info),
         ];
         self.device.update_descriptor_sets(&subset_fold_writes, &[]);
+
+        // Write pal_rle_index descriptor set (Stage 3).
+        // binding 0: STORAGE_IMAGE (current_frame, read-only)
+        // binding 1: STORAGE_BUFFER (palrle_compact_list_buffer, read-only)
+        // binding 2: STORAGE_BUFFER (frame_palette_set_buffer, read-only)
+        // binding 3: STORAGE_BUFFER (per_tile_frame_palette_id_buffer, read-only)
+        // binding 4: STORAGE_BUFFER (folded_into_buffer, read-only)
+        // binding 5: STORAGE_BUFFER (index_buffer, write)
+        let pal_rle_index_image_info = [vk::DescriptorImageInfo::default()
+            .image_view(current.view)
+            .image_layout(vk::ImageLayout::GENERAL)];
+        let pal_rle_index_compact_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.palrle_compact_list_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let pal_rle_index_fps_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.frame_palette_set_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let pal_rle_index_ptfpi_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.per_tile_frame_palette_id_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let pal_rle_index_folded_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.folded_into_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let pal_rle_index_out_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.index_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let pal_rle_index_writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(pal_rle_index_descriptor_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(&pal_rle_index_image_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(pal_rle_index_descriptor_set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&pal_rle_index_compact_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(pal_rle_index_descriptor_set)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&pal_rle_index_fps_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(pal_rle_index_descriptor_set)
+                .dst_binding(3)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&pal_rle_index_ptfpi_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(pal_rle_index_descriptor_set)
+                .dst_binding(4)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&pal_rle_index_folded_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(pal_rle_index_descriptor_set)
+                .dst_binding(5)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&pal_rle_index_out_info),
+        ];
+        self.device
+            .update_descriptor_sets(&pal_rle_index_writes, &[]);
 
         // --- Command buffer (RAII-guarded) ---
         let cmd_alloc = vk::CommandBufferAllocateInfo::default()
@@ -2577,7 +2674,7 @@ impl GpuFrameProcessor {
         );
         self.device.cmd_dispatch(cmd, 256, 1, 1);
 
-        // Barrier for downstream consumers (Task 13 + HOST readback).
+        // Barrier for Stage 3 consumers and HOST readback.
         let stage_2b_output_barrier = vk::BufferMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::SHADER_WRITE)
             .dst_access_mask(vk::AccessFlags::SHADER_READ)
@@ -2595,6 +2692,42 @@ impl GpuFrameProcessor {
             std::slice::from_ref(&stage_2b_output_barrier),
             &[],
         );
+
+        // ============================================================
+        // Stage 3: pal_rle_index — per-pixel binary search → 4-bit index stream
+        // ============================================================
+        // current_frame stays in GENERAL layout throughout (no transition needed).
+        // Stage 2a/2b output barriers above make frame_palette_set,
+        // per_tile_frame_palette_id, and folded_into visible to this dispatch.
+        // palrle_compact_list was barriered by stage_2a_input_barriers.
+        self.device.cmd_bind_pipeline(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.pal_rle_index_pipeline,
+        );
+        self.device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.pal_rle_index_pipeline_layout,
+            0,
+            &[pal_rle_index_descriptor_set],
+            &[],
+        );
+        let stage3_push: [u32; 1] = [cols];
+        let stage3_push_bytes = std::slice::from_raw_parts(
+            stage3_push.as_ptr() as *const u8,
+            std::mem::size_of_val(&stage3_push),
+        );
+        self.device.cmd_push_constants(
+            cmd,
+            self.pal_rle_index_pipeline_layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            stage3_push_bytes,
+        );
+        // Indirect dispatch: uses palrle_indirect_args_buffer (barriered at Stage 1.5b).
+        self.device
+            .cmd_dispatch_indirect(cmd, self.palrle_indirect_args_buffer, 0);
 
         // 5a. Snapshot copy: current (DMA-BUF) → prev_image (owned). This
         // makes prev_image a true point-in-time snapshot of THIS frame for
@@ -2760,6 +2893,15 @@ impl GpuFrameProcessor {
                 .buffer(self.folded_into_buffer)
                 .offset(0)
                 .size(1024),
+            // Stage 3 output
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.index_buffer)
+                .offset(0)
+                .size(vk::WHOLE_SIZE),
         ];
         self.device.cmd_pipeline_barrier(
             cmd,
@@ -2819,6 +2961,7 @@ impl GpuFrameProcessor {
             &palette_fold_ds_guard,
             &palette_subset_fold_init_ds_guard,
             &palette_subset_fold_ds_guard,
+            &pal_rle_index_ds_guard,
             &cmd_guard,
             &fence_guard,
         );
@@ -2847,6 +2990,7 @@ impl GpuFrameProcessor {
             frame_palette_set_count: *self.frame_palette_count_ptr,
             per_tile_frame_palette_id: self.per_tile_frame_palette_id_ptr as *const u8,
             folded_into: self.folded_into_ptr as *const u32,
+            index_buffer: self.index_buffer_ptr as *const u8,
         })
     }
 
@@ -3854,6 +3998,7 @@ mod tests {
             frame_palette_set_count: 0,
             per_tile_frame_palette_id: std::ptr::null(),
             folded_into: std::ptr::null(),
+            index_buffer: std::ptr::null(),
         };
         let slice = analysis.tile_analysis_slice();
         assert_eq!(slice.len(), 2);
@@ -4948,6 +5093,146 @@ mod tests {
                 resolved_for_superset as u8, superset_id,
                 "superset palette {} should stay self-referential", superset_id
             );
+        }
+    }
+
+    /// Stage 3 GPU integration test: 32×32 tile with top half black (index 0)
+    /// and bottom half white (index 1). After dispatch, the 512 index bytes
+    /// should encode the half-and-half pattern as packed 4-bit nibbles.
+    ///
+    /// Pixel layout: 32×32 = 1024 pixels. Each byte holds two 4-bit indices
+    /// (low nibble = even pixel, high nibble = odd pixel). First 512 pixels
+    /// (top half) → index 0; next 512 pixels (bottom half) → index 1.
+    /// Bytes 0..=255: low=0, high=0 (pixels 0..=511 all black → index 0)
+    /// Bytes 256..=511: low=1, high=1 (pixels 512..=1023 all white → index 1)
+    #[test]
+    fn process_frame_emits_correct_indices_for_two_color_tile() {
+        let width = 32u32;
+        let height = 32u32;
+        let stride = width * 4;
+
+        let mut proc = match GpuFrameProcessor::new(32) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Skipping index emission test (no Vulkan GPU?): {e}");
+                return;
+            }
+        };
+
+        unsafe {
+            let size = (stride * height) as usize;
+
+            let make_frame_fd = |name: &str, fill: &dyn Fn(&mut [u8])| -> std::os::unix::io::RawFd {
+                let cname = std::ffi::CString::new(name).unwrap();
+                let fd = libc::memfd_create(cname.as_ptr(), 0);
+                assert!(fd >= 0);
+                libc::ftruncate(fd, size as i64);
+                let ptr = libc::mmap(
+                    std::ptr::null_mut(),
+                    size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                );
+                assert_ne!(ptr, libc::MAP_FAILED);
+                let frame = std::slice::from_raw_parts_mut(ptr as *mut u8, size);
+                fill(frame);
+                libc::munmap(ptr, size);
+                fd
+            };
+
+            // Seed frame: all black (to initialize prev_image).
+            let fd_seed = make_frame_fd("ghost-idx-seed", &|frame| {
+                std::ptr::write_bytes(frame.as_mut_ptr(), 0, size);
+            });
+            let first = match proc.process_frame(fd_seed, width, height, stride) {
+                Ok(a) => a,
+                Err(e) => {
+                    libc::close(fd_seed);
+                    eprintln!("Skipping index emission test (memfd not a real DMA-BUF): {e}");
+                    return;
+                }
+            };
+            libc::close(fd_seed);
+            assert!(
+                first.index_buffer.is_null(),
+                "first-frame index_buffer is null by design"
+            );
+
+            // Real frame: top half black (y<16), bottom half white (y>=16).
+            let fd_real = make_frame_fd("ghost-idx-real", &|frame| {
+                for y in 0..height {
+                    for x in 0..width {
+                        let off = ((y * stride) + x * 4) as usize;
+                        let c: [u8; 4] = if y < 16 {
+                            [0, 0, 0, 255]     // BGRA black
+                        } else {
+                            [255, 255, 255, 255] // BGRA white
+                        };
+                        frame[off..off + 4].copy_from_slice(&c);
+                    }
+                }
+            });
+            let analysis = match proc.process_frame(fd_real, width, height, stride) {
+                Ok(a) => a,
+                Err(e) => {
+                    libc::close(fd_real);
+                    eprintln!(
+                        "Skipping index emission test second frame (memfd not a real DMA-BUF): {e}"
+                    );
+                    return;
+                }
+            };
+            libc::close(fd_real);
+
+            // The 32×32 tile has exactly 2 colors → palrle_compact_count == 1.
+            assert_eq!(
+                analysis.palrle_compact_count, 1,
+                "32×32 two-color tile: compact_count should be 1, got {}",
+                analysis.palrle_compact_count
+            );
+            assert!(
+                !analysis.index_buffer.is_null(),
+                "index_buffer must not be null after Stage 3 dispatch"
+            );
+
+            let indices = analysis.index_buffer_slice_for(0);
+            assert_eq!(indices.len(), 512, "index_buffer_slice_for must return 512 bytes");
+
+            // 32×32 = 1024 pixels total, packed 2 per byte (low nibble first).
+            // Top half: pixels 0..511 → all black → index 0 → both nibbles 0.
+            // Bottom half: pixels 512..1023 → all white → index 1 → both nibbles 1.
+            // Bytes 0..=255 correspond to pixel pairs 0..=511 → index 0.
+            // Bytes 256..=511 correspond to pixel pairs 512..=1023 → index 1.
+            for byte_idx in 0..256usize {
+                let low = indices[byte_idx] & 0x0F;
+                let high = (indices[byte_idx] >> 4) & 0x0F;
+                assert_eq!(
+                    low, 0,
+                    "byte {} low nibble: pixel {} should be index 0 (black)",
+                    byte_idx, byte_idx * 2
+                );
+                assert_eq!(
+                    high, 0,
+                    "byte {} high nibble: pixel {} should be index 0 (black)",
+                    byte_idx, byte_idx * 2 + 1
+                );
+            }
+            for byte_idx in 256..512usize {
+                let low = indices[byte_idx] & 0x0F;
+                let high = (indices[byte_idx] >> 4) & 0x0F;
+                assert_eq!(
+                    low, 1,
+                    "byte {} low nibble: pixel {} should be index 1 (white)",
+                    byte_idx, byte_idx * 2
+                );
+                assert_eq!(
+                    high, 1,
+                    "byte {} high nibble: pixel {} should be index 1 (white)",
+                    byte_idx, byte_idx * 2 + 1
+                );
+            }
         }
     }
 }
