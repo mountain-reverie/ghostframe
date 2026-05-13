@@ -5,8 +5,6 @@
 //! the M3.2a single-client invariant. See
 //! `docs/superpowers/specs/2026-05-13-palrle-codec-design.md`.
 
-use thiserror::Error;
-
 /// Maximum colors in a PalRLE palette. Tiles with more unique colors fall
 /// through the classifier to BC1/Cdf53.
 pub const MAX_PALETTE_COUNT: usize = 16;
@@ -16,19 +14,10 @@ pub const PALETTE_TABLE_SLOTS: usize = 256;
 
 /// Canonical palette entry. Colors are BGRA-ascending sorted (matching the
 /// canonical sort appended to `tile_analysis.comp`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct PaletteEntry {
     pub colors: [[u8; 4]; MAX_PALETTE_COUNT],
     pub count: u8,
-}
-
-impl Default for PaletteEntry {
-    fn default() -> Self {
-        Self {
-            colors: [[0; 4]; MAX_PALETTE_COUNT],
-            count: 0,
-        }
-    }
 }
 
 /// Per-slot lifecycle.
@@ -46,7 +35,7 @@ pub struct FramePaletteStats {
     pub fell_back_to_raw: u32,
 }
 
-#[derive(Debug, Error, PartialEq)]
+#[derive(Debug, thiserror::Error, PartialEq)]
 pub enum PalRleDecodeError {
     #[error("payload too short: needed {needed} bytes at offset {offset}, got {got}")]
     Truncated { needed: usize, offset: usize, got: usize },
