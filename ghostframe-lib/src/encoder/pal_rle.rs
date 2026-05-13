@@ -266,6 +266,126 @@ pub fn encode_pal_rle_indices(packed_indices: &[u8; 512]) -> Vec<u8> {
     out
 }
 
+/// Build the full PalRle wire payload: flags + palette_id +
+/// optional bundled palette block + nibble-packed RLE bytes.
+pub fn encode_pal_rle_payload(
+    packed_indices: &[u8; 512],
+    palette: &PaletteEntry,
+    palette_id: u8,
+    bundled: bool,
+) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(if bundled { 256 } else { 128 });
+    out.push(if bundled { 0x01 } else { 0x00 }); // flags
+    out.push(palette_id);
+    if bundled {
+        out.push(palette.count);
+        for i in 0..palette.count as usize {
+            out.extend_from_slice(&palette.colors[i]);
+        }
+    }
+    out.extend(encode_pal_rle_indices(packed_indices));
+    out
+}
+
+/// Returned bundle from `decode_pal_rle` — pixel data plus, if the payload
+/// was bundled, the (palette_id, palette) the client should cache.
+#[derive(Debug)]
+pub struct DecodedPalRle {
+    pub pixels: Vec<u8>, // 1024 × 4 BGRA bytes = 4096 bytes
+    pub updated_palette: Option<(u8, PaletteEntry)>,
+}
+
+/// Server-side parity decoder. Mirrors `ghostframe-web-client/src/decoder.ts`
+/// `decodePalRle`. Used in roundtrip tests; not on the runtime hot path.
+pub fn decode_pal_rle(
+    payload: &[u8],
+    cached_palette: Option<&PaletteEntry>,
+) -> Result<DecodedPalRle, PalRleDecodeError> {
+    let needed = |n: usize, off: usize| -> Result<(), PalRleDecodeError> {
+        if payload.len() < off + n {
+            Err(PalRleDecodeError::Truncated {
+                needed: n,
+                offset: off,
+                got: payload.len().saturating_sub(off),
+            })
+        } else {
+            Ok(())
+        }
+    };
+
+    needed(2, 0)?;
+    let flags = payload[0];
+    let palette_id = payload[1];
+    let bundled = (flags & 0x01) != 0;
+
+    let mut cursor = 2usize;
+    let palette_owned: Option<PaletteEntry> = if bundled {
+        needed(1, cursor)?;
+        let count = payload[cursor];
+        cursor += 1;
+        if count as usize > MAX_PALETTE_COUNT || count == 0 {
+            return Err(PalRleDecodeError::PaletteCountOutOfRange(count));
+        }
+        needed(count as usize * 4, cursor)?;
+        let mut p = PaletteEntry::default();
+        p.count = count;
+        for i in 0..count as usize {
+            p.colors[i].copy_from_slice(&payload[cursor..cursor + 4]);
+            cursor += 4;
+        }
+        Some(p)
+    } else {
+        None
+    };
+
+    // Resolve the palette ref we'll use for RLE expansion.
+    let palette: &PaletteEntry = match (&palette_owned, cached_palette) {
+        (Some(p), _) => p,
+        (None, Some(p)) => p,
+        (None, None) => return Err(PalRleDecodeError::UncachedPalette(palette_id)),
+    };
+
+    // Decode RLE: each byte = (idx<<4) | (run-1). Total pixels must = 1024.
+    let mut pixels = vec![0u8; 1024 * 4];
+    let mut pixel_idx: u32 = 0;
+    while cursor < payload.len() {
+        let b = payload[cursor];
+        cursor += 1;
+        let idx = (b >> 4) & 0x0F;
+        let run_len = ((b & 0x0F) as u32) + 1;
+        if idx >= palette.count {
+            return Err(PalRleDecodeError::IndexOutOfRange {
+                index: idx,
+                count: palette.count,
+            });
+        }
+        let mut color = palette.colors[idx as usize];
+        // Per design Section 7: force alpha=255 when source is 0 (BGRX quirk).
+        if color[3] == 0 {
+            color[3] = 255;
+        }
+        for _ in 0..run_len {
+            if pixel_idx >= 1024 {
+                return Err(PalRleDecodeError::PixelCountMismatch {
+                    decoded: pixel_idx + 1,
+                });
+            }
+            let off = (pixel_idx as usize) * 4;
+            pixels[off..off + 4].copy_from_slice(&color);
+            pixel_idx += 1;
+        }
+    }
+    if pixel_idx != 1024 {
+        return Err(PalRleDecodeError::PixelCountMismatch { decoded: pixel_idx });
+    }
+
+    let updated_palette = palette_owned.map(|p| (palette_id, p));
+    Ok(DecodedPalRle {
+        pixels,
+        updated_palette,
+    })
+}
+
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum PalRleDecodeError {
     #[error("payload too short: needed {needed} bytes at offset {offset}, got {got}")]
@@ -667,5 +787,104 @@ mod tests {
         let rle = encode_pal_rle_indices(&packed);
         assert_eq!(rle[0], (0 << 4) | 2, "run of 3 zeros = len 3 → encoded 2");
         assert_eq!(rle[1], (1 << 4) | 1, "run of 2 ones  = len 2 → encoded 1");
+    }
+
+    #[test]
+    fn payload_bundled_layout_has_flag_id_count_palette_then_rle() {
+        let palette = make_palette(&[[10, 20, 30, 255], [40, 50, 60, 255]]);
+        let indices = vec![0u8; 1024];
+        let packed = make_indices_4bit(&indices);
+        let payload = encode_pal_rle_payload(&packed, &palette, 7, true);
+
+        assert_eq!(payload[0] & 0x01, 0x01, "bundle flag set");
+        assert_eq!(payload[1], 7, "palette id");
+        assert_eq!(payload[2], 2, "count = 2");
+        // Colors block: 2 entries × 4 bytes = 8 bytes starting at offset 3.
+        assert_eq!(&payload[3..7], &[10, 20, 30, 255]);
+        assert_eq!(&payload[7..11], &[40, 50, 60, 255]);
+        // RLE bytes after offset 11.
+        assert!(payload.len() > 11);
+    }
+
+    #[test]
+    fn payload_thin_layout_skips_palette_block() {
+        let palette = make_palette(&[[10, 20, 30, 255]]);
+        let indices = vec![0u8; 1024];
+        let packed = make_indices_4bit(&indices);
+        let payload = encode_pal_rle_payload(&packed, &palette, 42, false);
+
+        assert_eq!(payload[0] & 0x01, 0x00, "bundle flag clear");
+        assert_eq!(payload[1], 42, "palette id");
+        // RLE starts immediately at offset 2.
+        // All-same → 64 bytes RLE → total 66 bytes.
+        assert_eq!(payload.len(), 66);
+    }
+
+    #[test]
+    fn decode_bundled_extracts_palette() {
+        let palette = make_palette(&[[1, 2, 3, 255], [4, 5, 6, 255]]);
+        let indices: Vec<u8> = (0..1024).map(|i| (i % 2) as u8).collect();
+        let packed = make_indices_4bit(&indices);
+        let payload = encode_pal_rle_payload(&packed, &palette, 9, true);
+
+        let result = decode_pal_rle(&payload, None).unwrap();
+        // Pixel 0 → palette[0] = [1,2,3,255]; pixel 1 → palette[1].
+        assert_eq!(&result.pixels[0..4], &[1, 2, 3, 255]);
+        assert_eq!(&result.pixels[4..8], &[4, 5, 6, 255]);
+        assert_eq!(result.updated_palette, Some((9, palette)));
+    }
+
+    #[test]
+    fn decode_thin_requires_cached_palette() {
+        let palette = make_palette(&[[10, 20, 30, 255]]);
+        let indices = vec![0u8; 1024];
+        let packed = make_indices_4bit(&indices);
+        let payload = encode_pal_rle_payload(&packed, &palette, 5, false);
+
+        // No cached palette → error.
+        let err = decode_pal_rle(&payload, None).unwrap_err();
+        assert_eq!(err, PalRleDecodeError::UncachedPalette(5));
+
+        // With cached palette → ok.
+        let result = decode_pal_rle(&payload, Some(&palette)).unwrap();
+        assert_eq!(&result.pixels[0..4], &[10, 20, 30, 255]);
+        assert!(result.updated_palette.is_none());
+    }
+
+    #[test]
+    fn decode_rejects_index_out_of_range() {
+        // Build a payload by hand: thin flag, palette_id=0, then a byte (idx=3, run=0)
+        // when the cached palette only has 2 entries.
+        let palette = make_palette(&[[1, 2, 3, 255], [4, 5, 6, 255]]);
+        let mut payload = vec![0x00u8, 0]; // thin, id=0
+        // 1024 indices = 1024 pixels worth. (idx=3, run=0) covers 1 pixel. Need 1023 more.
+        payload.push((3 << 4) | 0);
+        payload.push((0 << 4) | 15); // run of 16
+        for _ in 0..((1024 - 1 - 16) / 16) {
+            payload.push((0 << 4) | 15);
+        }
+        // Remainder: (1024 - 1 - 16 - (62*16)) = 1024 - 1 - 16 - 992 = 15
+        payload.push((0 << 4) | 14);
+        let err = decode_pal_rle(&payload, Some(&palette)).unwrap_err();
+        assert!(matches!(err, PalRleDecodeError::IndexOutOfRange { .. }));
+    }
+
+    #[test]
+    fn encode_decode_roundtrip_exact_pixels() {
+        let palette = make_palette(&[
+            [10, 20, 30, 255],
+            [40, 50, 60, 255],
+            [70, 80, 90, 255],
+        ]);
+        // 1024 pixels with arbitrary palette indices.
+        let indices: Vec<u8> = (0..1024).map(|i| (i % 3) as u8).collect();
+        let packed = make_indices_4bit(&indices);
+        let payload = encode_pal_rle_payload(&packed, &palette, 11, true);
+        let result = decode_pal_rle(&payload, None).unwrap();
+        for pixel in 0..1024 {
+            let expected = palette.colors[indices[pixel] as usize];
+            let off = pixel * 4;
+            assert_eq!(&result.pixels[off..off + 4], &expected, "pixel {}", pixel);
+        }
     }
 }
