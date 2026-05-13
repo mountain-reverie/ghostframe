@@ -210,6 +210,16 @@ impl PaletteTable {
         self.stats_frame = FramePaletteStats::default();
     }
 
+    /// Mark a palette slot as needing rebundling on its next emission.
+    /// Called when the client reports a thin payload referenced an
+    /// uncached palette_id (decode-error code 3 / ERR_THIN_UNCACHED_PALETTE).
+    ///
+    /// Clears only the `delivered` bit; the palette bytes stay intact so
+    /// subsequent encode passes can still reference them via `acquire_or_allocate`.
+    pub fn force_rebundle(&mut self, palette_id: u8) {
+        self.delivered.remove(palette_id);
+    }
+
     /// Per-design Section 2 — the 4-way allocation ladder.
     /// Returns the slot id on success; `None` if every slot is `Held`
     /// or `FreeButCached` with no overwrite-eligible candidate.
@@ -914,6 +924,34 @@ mod tests {
             }
             out
         })
+    }
+
+    #[test]
+    fn force_rebundle_clears_delivered_bit() {
+        let mut t = PaletteTable::new();
+        let pal = PaletteEntry { count: 1, colors: [[10, 20, 30, 255]; 16] };
+        // Force a slot to delivered state.
+        t.write_bytes(5, &pal);
+        t.delivered.insert(5);
+        assert!(t.delivered.contains(5));
+
+        t.force_rebundle(5);
+
+        assert!(!t.delivered.contains(5),
+            "force_rebundle must clear the delivered bit so the next emission re-bundles");
+        // The palette content stays put — we only cleared the delivered flag.
+        assert_eq!(t.entries[5].as_ref().unwrap().count, 1);
+        assert_eq!(t.entries[5].as_ref().unwrap().colors[0], [10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn force_rebundle_no_op_on_undelivered() {
+        let mut t = PaletteTable::new();
+        // Slot 7 is empty / undelivered.
+        assert!(!t.delivered.contains(7));
+        t.force_rebundle(7);
+        // Should be a no-op, no panic.
+        assert!(!t.delivered.contains(7));
     }
 
     proptest! {
