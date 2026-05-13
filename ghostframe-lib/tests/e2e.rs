@@ -593,6 +593,79 @@ async fn e2e_palrle_5pct_loss() -> Result<()> {
     Ok(())
 }
 
+/// Force a client reconnect mid-stream; verify the server's warm-cache
+/// palette table re-delivers palettes on the new session and the text
+/// region renders correctly post-reset.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_palrle_session_reset() -> Result<()> {
+    use ghostframe_test_pattern::text_grid::SAMPLES;
+
+    let setup = setup_e2e("--text-grid").await?;
+
+    // Phase 1: let the initial connection settle and render text.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    // Capture a baseline luminance reading.
+    let pair = &SAMPLES[0];
+    let probe_js = format!(
+        r#"
+        (() => {{
+            const canvas = document.getElementById('canvas');
+            const ctx = canvas.getContext('2d');
+            const ink = ctx.getImageData({ix}, {iy}, 1, 1).data;
+            const bg  = ctx.getImageData({bx}, {by}, 1, 1).data;
+            return {{
+                ink: {{ r: ink[0], g: ink[1], b: ink[2] }},
+                bg:  {{ r: bg[0],  g: bg[1],  b: bg[2]  }},
+            }};
+        }})()
+        "#,
+        ix = pair.ink.0, iy = pair.ink.1,
+        bx = pair.bg.0,  by = pair.bg.1,
+    );
+    let baseline: serde_json::Value =
+        setup.page.evaluate(probe_js.as_str()).await?.into_value()?;
+    let baseline_ink_lum = luminance(&baseline["ink"]);
+    let baseline_bg_lum = luminance(&baseline["bg"]);
+    assert!(
+        baseline_ink_lum - baseline_bg_lum > 80.0,
+        "baseline text not legible — pre-reset assertion failed"
+    );
+
+    // Phase 2: force a reconnect by reloading the page.
+    // The server's on_session_reset will clear delivered/ref_count/in_flight
+    // but preserve slot bytes (warm cache). Subsequent emissions will
+    // re-bundle palettes (delivered=false) until ACKed.
+    setup.page.reload().await?;
+
+    // Allow the new session to settle + re-render.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    // Phase 3: assert post-reset legibility.
+    let post: serde_json::Value =
+        setup.page.evaluate(probe_js.as_str()).await?.into_value()?;
+    let post_ink_lum = luminance(&post["ink"]);
+    let post_bg_lum = luminance(&post["bg"]);
+    assert!(
+        post_ink_lum - post_bg_lum > 80.0,
+        "post-reset text not legible — warm-cache re-bundling broken (ink={post_ink_lum:.0}, bg={post_bg_lum:.0})"
+    );
+
+    // Protocol-layer: post-reset codec stream should include PalRle.
+    let codec_list: Vec<u8> = setup
+        .page
+        .evaluate("window.__ghostframeRecordedCodecs || []")
+        .await?
+        .into_value()?;
+    assert!(
+        codec_list.contains(&2u8),
+        "e2e_palrle_session_reset: expected Codec::PalRle (2) post-reset; saw codecs: {:?}",
+        codec_list
+    );
+
+    Ok(())
+}
+
 /// M2: Static content produces stable canvas (skip codec / no-change detection).
 #[tokio::test]
 async fn e2e_tile_skip() -> Result<()> {
