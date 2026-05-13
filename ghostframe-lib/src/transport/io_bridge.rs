@@ -449,6 +449,11 @@ impl IoBridge {
                     let pid_usize = pid as usize;
                     let cnt = self.palette_table.in_flight_carrying[pid_usize];
                     self.palette_table.in_flight_carrying[pid_usize] = cnt.saturating_sub(1);
+                    // Release the acquire from Phase A. Supersession means the tile
+                    // work is dropped without ever being ACKed.
+                    if self.palette_table.ref_count[pid_usize] > 0 {
+                        self.palette_table.release(pid);
+                    }
                 }
             }
             let tile_data = grid.extract_tile(pixels, stride, tile_x, tile_y);
@@ -545,6 +550,11 @@ impl IoBridge {
                                     palette_id = pid,
                                     "in_flight_carrying underflow — enqueue/ack pairing bug",
                                 );
+                            }
+                            // Release the acquire from Phase A. ref_count > 0 means tile work
+                            // was in flight; on ACK we let the slot become FreeButCached.
+                            if self.palette_table.ref_count[pid_usize] > 0 {
+                                self.palette_table.release(pid);
                             }
                         }
                     }
@@ -2266,6 +2276,44 @@ mod tests {
 
         assert!(bridge.palette_table.delivered.contains(7));
         assert_eq!(bridge.palette_table.in_flight_carrying[7], 0);
+    }
+
+    #[tokio::test]
+    async fn ack_for_palrle_tile_releases_ref_count() {
+        use crate::encoder::pal_rle::{PaletteEntry, SlotState};
+
+        let (our_end, _peer) = UnixStream::pair().expect("UnixStream::pair failed");
+        let server = QuicServer::new().expect("QuicServer::new failed");
+        let mut bridge = IoBridge::new_with_stream_for_test(our_end, server);
+        bridge.scheduler.resize(1, 1);
+
+        let mut p = PaletteEntry::default();
+        p.colors[0] = [1, 2, 3, 255];
+        p.count = 1;
+        bridge.palette_table.entries[5] = Some(p);
+        bridge.palette_table.slot_state[5] = SlotState::Held;
+        bridge.palette_table.ref_count[5] = 1;
+        bridge.palette_table.in_flight_carrying[5] = 1;
+
+        bridge.scheduler.enqueue(crate::transport::scheduler::TileWork {
+            tile_x: 0, tile_y: 0, generation: 0, pass_idx: 0, total_passes: 1,
+            codec: crate::transport::protocol::Codec::PalRle,
+            payload: vec![0x01u8, 5, 1, 1, 2, 3, 255, 0xF0],
+            queued_at: std::time::Instant::now(),
+            last_sent_at: None,
+            state: crate::transport::scheduler::WorkState::Pending,
+        });
+        let _ = bridge.scheduler.tick(usize::MAX);
+
+        let wire = vec![0x02u8, 1, 0, 0, 0, 0];
+        bridge.dispatch_ack_datagram(&wire);
+
+        assert_eq!(bridge.palette_table.ref_count[5], 0, "ACK must release the Phase A acquire");
+        assert_eq!(
+            bridge.palette_table.slot_state[5],
+            SlotState::FreeButCached,
+            "slot must transition to FreeButCached after ref_count reaches 0"
+        );
     }
 
     #[test]
