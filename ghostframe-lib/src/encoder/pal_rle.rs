@@ -242,6 +242,36 @@ impl Default for PaletteTable {
     }
 }
 
+/// Walk 1024 nibbles in `packed_indices` row-major (low nibble of byte 0
+/// = pixel 0, high nibble of byte 0 = pixel 1, …) and emit nibble-packed
+/// RLE bytes: `(index << 4) | (run_len - 1)`. Max run is 16; longer runs
+/// emit multiple bytes.
+pub fn encode_pal_rle_indices(packed_indices: &[u8; 512]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(64); // typical best case
+    let mut cur_idx: u8 = packed_indices[0] & 0x0F;
+    let mut cur_run: u8 = 0;
+
+    for pixel in 0..1024usize {
+        let byte = packed_indices[pixel / 2];
+        let idx = if pixel % 2 == 0 {
+            byte & 0x0F
+        } else {
+            (byte >> 4) & 0x0F
+        };
+
+        if idx == cur_idx && cur_run < 16 {
+            cur_run += 1;
+        } else {
+            out.push((cur_idx << 4) | (cur_run - 1));
+            cur_idx = idx;
+            cur_run = 1;
+        }
+    }
+    // Flush final run.
+    out.push((cur_idx << 4) | (cur_run - 1));
+    out
+}
+
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum PalRleDecodeError {
     #[error("payload too short: needed {needed} bytes at offset {offset}, got {got}")]
@@ -587,5 +617,61 @@ mod tests {
         t.on_session_reset();
         // Warm cache still finds the palette by bytes.
         assert_eq!(t.find_matching(&p), Some(42));
+    }
+
+    fn make_indices_4bit(indices: &[u8]) -> [u8; 512] {
+        // Packs `indices` (one nibble each, low nibble of byte 0 first) into 512 bytes.
+        assert!(indices.len() <= 1024);
+        let mut out = [0u8; 512];
+        for (i, &idx) in indices.iter().enumerate() {
+            let byte = i / 2;
+            let shift = (i % 2) * 4;
+            out[byte] |= (idx & 0x0F) << shift;
+        }
+        out
+    }
+
+    #[test]
+    fn rle_all_same_color_compresses_to_64_bytes() {
+        // 1024 pixels all index 5 → 64 runs of length 16 → 64 RLE bytes.
+        let indices = vec![5u8; 1024];
+        let packed = make_indices_4bit(&indices);
+        let rle = encode_pal_rle_indices(&packed);
+        assert_eq!(rle.len(), 64);
+        for &b in &rle {
+            assert_eq!(b, (5 << 4) | 15, "each byte should be (idx 5, run 16)");
+        }
+    }
+
+    #[test]
+    fn rle_alternating_colors_emits_one_byte_per_pixel() {
+        // Alternating 0, 1, 0, 1, ... — every pixel is a run-of-1.
+        let indices: Vec<u8> = (0..1024).map(|i| (i % 2) as u8).collect();
+        let packed = make_indices_4bit(&indices);
+        let rle = encode_pal_rle_indices(&packed);
+        assert_eq!(rle.len(), 1024);
+        assert_eq!(rle[0], 0x00);
+        assert_eq!(rle[1], 0x10);
+        assert_eq!(rle[2], 0x00);
+    }
+
+    #[test]
+    fn rle_run_caps_at_16() {
+        let mut indices = vec![3u8; 17];
+        indices.extend(vec![0u8; 1024 - 17]);
+        let packed = make_indices_4bit(&indices);
+        let rle = encode_pal_rle_indices(&packed);
+        assert_eq!(rle[0], 0x3F);
+        assert_eq!(rle[1], 0x30);
+    }
+
+    #[test]
+    fn rle_pair_pattern_correct_offsets() {
+        let mut indices = vec![0u8, 0, 0, 1, 1];
+        indices.extend(vec![0u8; 1024 - 5]);
+        let packed = make_indices_4bit(&indices);
+        let rle = encode_pal_rle_indices(&packed);
+        assert_eq!(rle[0], (0 << 4) | 2, "run of 3 zeros = len 3 → encoded 2");
+        assert_eq!(rle[1], (1 << 4) | 1, "run of 2 ones  = len 2 → encoded 1");
     }
 }
