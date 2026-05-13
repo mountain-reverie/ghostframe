@@ -1473,6 +1473,35 @@ impl GpuFrameProcessor {
         );
         self.device.cmd_dispatch(cmd, cols, rows, 1);
 
+        // Inter-dispatch barrier: SAD + tile_analysis writes must be visible to Stage 1.5a reads.
+        let buf_barrier_inputs = [
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.sad_buffer)
+                .offset(0)
+                .size(vk::WHOLE_SIZE),
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.analysis_buffer)
+                .offset(0)
+                .size(vk::WHOLE_SIZE),
+        ];
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &buf_barrier_inputs,
+            &[],
+        );
+
         // Stage 1.5: zero compact_count, dispatch compact scan, dispatch indirect-args writer.
         self.device
             .cmd_fill_buffer(cmd, self.palrle_compact_count_buffer, 0, 4, 0);
@@ -1712,7 +1741,7 @@ impl GpuFrameProcessor {
         ];
         self.device.cmd_pipeline_barrier(
             cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
             vk::PipelineStageFlags::HOST,
             vk::DependencyFlags::empty(),
             &[],
