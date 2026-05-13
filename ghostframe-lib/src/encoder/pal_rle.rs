@@ -887,4 +887,87 @@ mod tests {
             assert_eq!(&result.pixels[off..off + 4], &expected, "pixel {}", pixel);
         }
     }
+
+    use proptest::prelude::*;
+    use proptest::strategy::ValueTree;
+
+    fn arb_palette() -> impl Strategy<Value = PaletteEntry> {
+        (1u8..=16).prop_flat_map(|count| {
+            prop::collection::vec(any::<[u8; 4]>(), count as usize..=count as usize)
+                .prop_map(move |cols| {
+                    let mut p = PaletteEntry::default();
+                    for (i, c) in cols.iter().enumerate() {
+                        p.colors[i] = *c;
+                    }
+                    p.count = count;
+                    p
+                })
+        })
+    }
+
+    fn arb_indices_against(count: u8) -> impl Strategy<Value = [u8; 512]> {
+        prop::collection::vec(0u8..count, 1024..=1024).prop_map(|v| {
+            let mut out = [0u8; 512];
+            for (i, &idx) in v.iter().enumerate() {
+                let byte = i / 2;
+                let shift = (i % 2) * 4;
+                out[byte] |= (idx & 0x0F) << shift;
+            }
+            out
+        })
+    }
+
+    proptest! {
+        #[test]
+        fn proptest_encode_decode_bundled_roundtrip(
+            palette in arb_palette(),
+        ) {
+            let packed = arb_indices_against(palette.count)
+                .new_tree(&mut proptest::test_runner::TestRunner::default()).unwrap().current();
+            let payload = encode_pal_rle_payload(&packed, &palette, 0, true);
+            let dec = decode_pal_rle(&payload, None).unwrap();
+
+            // Reconstruct expected pixels via direct index lookup.
+            let mut expected = vec![0u8; 1024 * 4];
+            for pixel in 0..1024usize {
+                let byte = packed[pixel / 2];
+                let idx = if pixel % 2 == 0 { byte & 0x0F } else { (byte >> 4) & 0x0F };
+                let mut color = palette.colors[idx as usize];
+                if color[3] == 0 { color[3] = 255; }
+                expected[pixel * 4..pixel * 4 + 4].copy_from_slice(&color);
+            }
+            prop_assert_eq!(dec.pixels, expected);
+        }
+
+        #[test]
+        fn proptest_palette_table_acquire_release_balanced(
+            ops in prop::collection::vec(0u8..=PALETTE_TABLE_SLOTS as u8, 1..50)
+        ) {
+            let mut t = PaletteTable::new();
+            // Pre-allocate slots 0..32 with synthetic palettes.
+            for id in 0..32u8 {
+                let mut p = PaletteEntry::default();
+                p.colors[0] = [id, 0, 0, 255];
+                p.count = 1;
+                t.entries[id as usize] = Some(p);
+                t.slot_state[id as usize] = SlotState::FreeButCached;
+                t.free_lru.push_back(id);
+                t.delivered.insert(id);
+            }
+            let mut acquired: Vec<u8> = Vec::new();
+            for op in ops {
+                let slot = (op as usize) % 32;
+                t.acquire(slot as u8);
+                acquired.push(slot as u8);
+            }
+            // Release in reverse order; ref_counts should reach zero everywhere.
+            for &id in acquired.iter().rev() {
+                t.release(id);
+            }
+            for id in 0..32 {
+                prop_assert_eq!(t.ref_count[id], 0);
+                prop_assert_eq!(t.slot_state[id], SlotState::FreeButCached);
+            }
+        }
+    }
 }
