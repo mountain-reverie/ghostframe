@@ -135,6 +135,58 @@ impl PaletteTable {
             self.free_lru.push_back(id);
         }
     }
+
+    /// A slot's bytes can be safely overwritten when no in-flight tile
+    /// could observe a mismatch between the bytes the server sent and the
+    /// bytes currently in the slot. Two sufficient conditions, per design D4:
+    /// - `delivered[id] == true` (client has rendered using these bytes)
+    /// - `in_flight_carrying[id] == 0` AND `delivered[id] == false`
+    ///   (bytes never reached the wire)
+    /// Combined with the always-required `ref_count == 0` precondition.
+    pub fn overwrite_eligible(&self, id: u8) -> bool {
+        if self.ref_count[id as usize] != 0 {
+            return false;
+        }
+        self.delivered.contains(id) || self.in_flight_carrying[id as usize] == 0
+    }
+
+    /// Replace the slot's bytes and reset the per-slot tracking state.
+    /// Caller must have verified `overwrite_eligible` (debug assert here).
+    pub fn write_bytes(&mut self, id: u8, palette: &PaletteEntry) {
+        debug_assert!(self.overwrite_eligible(id) || self.slot_state[id as usize] == SlotState::Empty);
+        self.entries[id as usize] = Some(*palette);
+        self.slot_state[id as usize] = SlotState::Held;
+        self.ref_count[id as usize] = 0;
+        self.delivered.remove(id);
+        self.in_flight_carrying[id as usize] = 0;
+        // Make sure stale free_lru entries don't linger.
+        self.free_lru.retain(|&x| x != id);
+    }
+
+    /// First Empty slot by id ascending. None if every slot is non-Empty.
+    pub fn find_empty_slot(&self) -> Option<u8> {
+        for id in 0..PALETTE_TABLE_SLOTS {
+            if self.slot_state[id] == SlotState::Empty {
+                return Some(id as u8);
+            }
+        }
+        None
+    }
+
+    /// Oldest FreeButCached slot that passes `overwrite_eligible`.
+    /// Drains ineligible front entries (they stay in free_lru in case they
+    /// become eligible later via ACK).
+    pub fn find_eligible_free_slot(&self) -> Option<u8> {
+        // We walk in age order without mutating self — find first hit.
+        for &id in &self.free_lru {
+            if self.slot_state[id as usize] == SlotState::FreeButCached
+                && self.overwrite_eligible(id)
+            {
+                return Some(id);
+            }
+        }
+        None
+    }
 }
 
 impl Default for PaletteTable {
@@ -269,5 +321,101 @@ mod tests {
         t.entries[4] = None;
         t.slot_state[4] = SlotState::Empty;
         assert_eq!(t.find_matching(&p), None);
+    }
+
+    #[test]
+    fn overwrite_eligible_requires_zero_ref_count() {
+        let mut t = PaletteTable::new();
+        let p = make_palette(&[[1, 2, 3, 255]]);
+        t.entries[2] = Some(p);
+        t.slot_state[2] = SlotState::Held;
+        t.ref_count[2] = 1;
+        assert!(!t.overwrite_eligible(2), "ref_count > 0 must block overwrite");
+    }
+
+    #[test]
+    fn overwrite_eligible_passes_when_delivered() {
+        let mut t = PaletteTable::new();
+        t.entries[3] = Some(make_palette(&[[1, 2, 3, 255]]));
+        t.slot_state[3] = SlotState::FreeButCached;
+        t.delivered.insert(3);
+        assert!(t.overwrite_eligible(3));
+    }
+
+    #[test]
+    fn overwrite_eligible_passes_when_never_sent() {
+        let mut t = PaletteTable::new();
+        t.entries[4] = Some(make_palette(&[[1, 2, 3, 255]]));
+        t.slot_state[4] = SlotState::FreeButCached;
+        // delivered = false, in_flight_carrying = 0  → never-sent case.
+        assert!(t.overwrite_eligible(4));
+    }
+
+    #[test]
+    fn overwrite_eligible_blocked_when_in_flight_not_delivered() {
+        let mut t = PaletteTable::new();
+        t.entries[5] = Some(make_palette(&[[1, 2, 3, 255]]));
+        t.slot_state[5] = SlotState::FreeButCached;
+        t.in_flight_carrying[5] = 1;
+        assert!(!t.overwrite_eligible(5));
+    }
+
+    #[test]
+    fn write_bytes_replaces_entry_and_resets_to_held() {
+        let mut t = PaletteTable::new();
+        let new_pal = make_palette(&[[9, 9, 9, 255], [10, 10, 10, 255]]);
+        t.write_bytes(11, &new_pal);
+        assert_eq!(t.entries[11], Some(new_pal));
+        assert_eq!(t.slot_state[11], SlotState::Held);
+        assert_eq!(t.ref_count[11], 0);
+        assert!(!t.delivered.contains(11));
+        assert_eq!(t.in_flight_carrying[11], 0);
+    }
+
+    #[test]
+    fn find_empty_slot_returns_lowest_empty() {
+        let mut t = PaletteTable::new();
+        // Mark slot 0 as Held to force scan past it.
+        t.entries[0] = Some(make_palette(&[[1, 1, 1, 255]]));
+        t.slot_state[0] = SlotState::Held;
+        assert_eq!(t.find_empty_slot(), Some(1));
+    }
+
+    #[test]
+    fn find_empty_slot_returns_none_when_full() {
+        let mut t = PaletteTable::new();
+        for id in 0..PALETTE_TABLE_SLOTS {
+            t.slot_state[id] = SlotState::Held;
+            t.entries[id] = Some(make_palette(&[[id as u8, 0, 0, 255]]));
+        }
+        assert_eq!(t.find_empty_slot(), None);
+    }
+
+    #[test]
+    fn find_eligible_free_slot_picks_lru_head() {
+        let mut t = PaletteTable::new();
+        for id in [7u8, 13, 22] {
+            t.entries[id as usize] = Some(make_palette(&[[id, 0, 0, 255]]));
+            t.slot_state[id as usize] = SlotState::FreeButCached;
+            t.delivered.insert(id); // make all overwrite-eligible
+            t.free_lru.push_back(id);
+        }
+        assert_eq!(t.find_eligible_free_slot(), Some(7));
+    }
+
+    #[test]
+    fn find_eligible_free_slot_skips_ineligible_entries() {
+        let mut t = PaletteTable::new();
+        // 7: in_flight, not delivered → ineligible
+        t.entries[7] = Some(make_palette(&[[7, 0, 0, 255]]));
+        t.slot_state[7] = SlotState::FreeButCached;
+        t.in_flight_carrying[7] = 1;
+        t.free_lru.push_back(7);
+        // 13: delivered → eligible
+        t.entries[13] = Some(make_palette(&[[13, 0, 0, 255]]));
+        t.slot_state[13] = SlotState::FreeButCached;
+        t.delivered.insert(13);
+        t.free_lru.push_back(13);
+        assert_eq!(t.find_eligible_free_slot(), Some(13));
     }
 }
