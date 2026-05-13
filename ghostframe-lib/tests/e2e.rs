@@ -839,6 +839,20 @@ async fn e2e_text_clarity() -> Result<()> {
     let h2: i64 = setup.page.evaluate(hash_js).await?.into_value()?;
     assert_eq!(h1, h2, "text canvas drifted between snapshots");
 
+    // ── (c) Protocol-layer: at least one tile must have been transmitted as PalRle.
+    // The text-grid pattern has many uniform-colour glyph backgrounds and
+    // limited-palette glyph runs that the classifier should pick PalRle for.
+    let codec_list: Vec<u8> = setup
+        .page
+        .evaluate("window.__ghostframeRecordedCodecs || []")
+        .await?
+        .into_value()?;
+    assert!(
+        codec_list.contains(&2u8),
+        "e2e_text_clarity: expected Codec::PalRle (2) on the wire; observed codecs: {:?}",
+        codec_list
+    );
+
     // TODO(M3): replace the contrast check with SSIM > 0.99 against
     //           tests/fixtures/text_grid_reference.png once CDF 5/3
     //           refinement is wired and lossless reconstruction works.

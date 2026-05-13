@@ -194,6 +194,16 @@ async function main() {
       }
     }
 
+    // Test instrumentation: record codecs for E2E protocol-layer assertions.
+    // Cheap (one array push per tile); production users won't notice.
+    if (typeof window !== "undefined") {
+      const w = window as unknown as { __ghostframeRecordedCodecs?: number[] };
+      if (!w.__ghostframeRecordedCodecs) {
+        w.__ghostframeRecordedCodecs = [];
+      }
+      w.__ghostframeRecordedCodecs.push(asm.header.codec);
+    }
+
     if (asm.header.codec === Codec.Raw) {
       renderer.drawRawTile(tX, tY, payload);
     } else if (asm.header.codec === Codec.H264) {
