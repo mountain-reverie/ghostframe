@@ -124,6 +124,10 @@ void main() {
         uint tile_idx = tile_y * cols + tile_x;
         uint final_count = min(count, 17u);
         tiles[tile_idx].count = final_count;
+        // Republish the final count in shared memory for the 16-thread sort
+        // writeback below — barrier() only guarantees Workgroup-memory
+        // visibility, not StorageBuffer.
+        count = final_count;
         // Collect up to 16 un-XOR'd colors into shared_sort_buf; sentinel-pad rest.
         uint emitted = 0u;
         for (uint s = 0u; s < 32u && emitted < 16u; ++s) {
@@ -163,9 +167,9 @@ void main() {
     // Write canonical-sorted colors back. Slots past count remain zero in output.
     if (local_idx < 16u) {
         uint tile_idx = tile_y * cols + tile_x;
-        uint final_count = tiles[tile_idx].count;
+        uint final_count = count;
         uint v = shared_sort_buf[local_idx];
-        tiles[tile_idx].colors[local_idx] = (local_idx < final_count && v != 0xFFFFFFFFu) ? v : 0u;
+        tiles[tile_idx].colors[local_idx] = (local_idx < final_count) ? v : 0u;
     }
 
     // ---- Phase 2: Sobel-style edge density on summed RGB. ----
