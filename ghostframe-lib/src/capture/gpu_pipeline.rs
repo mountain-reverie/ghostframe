@@ -801,8 +801,8 @@ impl GpuFrameProcessor {
         //       + palrle_indirect_args (2 STORAGE_BUFFER)
         //       + palette_fold (6 STORAGE_BUFFER)
         //       + palette_subset_fold_init (1 STORAGE_BUFFER)
-        //       + palette_subset_fold (3 STORAGE_BUFFER)
-        // Total: 4 STORAGE_IMAGE, 19 STORAGE_BUFFER, 8 max_sets.
+        //       + palette_subset_fold (2 STORAGE_BUFFER)
+        // Total: 4 STORAGE_IMAGE, 18 STORAGE_BUFFER, 8 max_sets.
         let pool_sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_IMAGE,
@@ -810,7 +810,7 @@ impl GpuFrameProcessor {
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: 19,
+                descriptor_count: 18,
             },
         ];
         let dp_ci = vk::DescriptorPoolCreateInfo::default()
@@ -1251,8 +1251,7 @@ impl GpuFrameProcessor {
 
         // --- palette_subset_fold descriptor set layout ---
         // binding 0: STORAGE_BUFFER (FramePaletteSet, read-only)
-        // binding 1: STORAGE_BUFFER (FramePaletteSetCount, read-only)
-        // binding 2: STORAGE_BUFFER (FoldedInto, read-write)
+        // binding 1: STORAGE_BUFFER (FoldedInto, read-write)
         let palette_subset_fold_bindings = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
@@ -1261,11 +1260,6 @@ impl GpuFrameProcessor {
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
             vk::DescriptorSetLayoutBinding::default()
                 .binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(2)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
@@ -1954,14 +1948,9 @@ impl GpuFrameProcessor {
 
         // Write palette_subset_fold descriptor set.
         // binding 0: frame_palette_set_buffer (read-only)
-        // binding 1: frame_palette_count_buffer (read-only)
-        // binding 2: folded_into_buffer (read-write)
+        // binding 1: folded_into_buffer (read-write)
         let subset_fold_set_info = [vk::DescriptorBufferInfo::default()
             .buffer(self.frame_palette_set_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let subset_fold_count_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.frame_palette_count_buffer)
             .offset(0)
             .range(vk::WHOLE_SIZE)];
         let subset_fold_folded_into_info = [vk::DescriptorBufferInfo::default()
@@ -1977,11 +1966,6 @@ impl GpuFrameProcessor {
             vk::WriteDescriptorSet::default()
                 .dst_set(palette_subset_fold_descriptor_set)
                 .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&subset_fold_count_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(palette_subset_fold_descriptor_set)
-                .dst_binding(2)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(&subset_fold_folded_into_info),
         ];
@@ -4793,25 +4777,27 @@ mod tests {
             let ids = analysis.per_tile_frame_palette_id_slice();
             assert_eq!(ids.len(), 2, "per_tile_id length must equal compact_count");
 
-            let id0 = ids[0]; // palette ID for tile 0 (3-color, the subset)
-            let id1 = ids[1]; // palette ID for tile 1 (4-color, the superset)
+            let id0 = ids[0];
+            let id1 = ids[1];
 
-            // folded_into[id0] (the smaller palette) should resolve to id1 (the superset).
-            let resolved_for_0 = folded[id0 as usize] & 0xFF;
+            // Determine which compact slot is the subset vs the superset via
+            // palette count. Workgroup execution order is non-deterministic.
+            let palettes = analysis.frame_palette_set_slice();
+            let (subset_id, superset_id) = if palettes[id0 as usize].count < palettes[id1 as usize].count {
+                (id0, id1)
+            } else {
+                (id1, id0)
+            };
+
+            let resolved_for_subset = folded[subset_id as usize] & 0xFFu32;
             assert_eq!(
-                resolved_for_0 as u8, id1,
-                "subset palette {} should fold into superset {}; \
-                 folded[{}] = {:#010x}",
-                id0, id1, id0, folded[id0 as usize]
+                resolved_for_subset as u8, superset_id,
+                "subset palette {} should fold into superset {}", subset_id, superset_id
             );
-
-            // folded_into[id1] should be self-referential (default-self sentinel).
-            let resolved_for_1 = folded[id1 as usize] & 0xFF;
+            let resolved_for_superset = folded[superset_id as usize] & 0xFFu32;
             assert_eq!(
-                resolved_for_1 as u8, id1,
-                "superset palette {} should fold to itself; \
-                 folded[{}] = {:#010x}",
-                id1, id1, folded[id1 as usize]
+                resolved_for_superset as u8, superset_id,
+                "superset palette {} should stay self-referential", superset_id
             );
         }
     }

@@ -27,11 +27,7 @@ layout(binding = 0, std430) readonly buffer FramePaletteSet {
     PaletteEntry frame_palettes[];
 };
 
-layout(binding = 1, std430) readonly buffer FramePaletteSetCount {
-    uint frame_palette_count;
-};
-
-layout(binding = 2, std430) buffer FoldedInto {
+layout(binding = 1, std430) buffer FoldedInto {
     uint folded_into[]; // 256 entries: encoded as (255 - count_B) << 8 | id_B
 };
 
