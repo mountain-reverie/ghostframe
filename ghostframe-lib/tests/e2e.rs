@@ -860,6 +860,52 @@ async fn e2e_text_clarity() -> Result<()> {
     Ok(())
 }
 
+/// Exercise palette-table reuse-and-overwrite under sequential churn.
+/// 300 distinct 4-color palettes are drawn one at a time; the server's
+/// 256-slot table must reuse via overwrite-eligible (delivered=true) slots.
+#[tokio::test]
+async fn e2e_palette_eviction() -> Result<()> {
+    let setup = setup_e2e("--palette-churn 300").await?;
+
+    // ~8s for the pattern to play out at ~5 frames per region × 300.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    // Sample the final palette region — should display content (not all-black).
+    let probe_js = r#"
+        (() => {
+            const canvas = document.getElementById('canvas');
+            const ctx = canvas.getContext('2d');
+            const sample = ctx.getImageData(108, 108, 1, 1).data;
+            return { r: sample[0], g: sample[1], b: sample[2] };
+        })()
+    "#;
+    let sample: serde_json::Value =
+        setup.page.evaluate(probe_js).await?.into_value()?;
+    let r = sample["r"].as_f64().unwrap_or(0.0);
+    let g = sample["g"].as_f64().unwrap_or(0.0);
+    let b = sample["b"].as_f64().unwrap_or(0.0);
+    assert!(
+        r + g + b > 30.0,
+        "final palette region should be visible after churn (rgb=({r},{g},{b}))"
+    );
+
+    // Protocol-layer: PalRle codec should appear on the wire repeatedly.
+    let codec_list: Vec<u8> = setup
+        .page
+        .evaluate("window.__ghostframeRecordedCodecs || []")
+        .await?
+        .into_value()?;
+    let palrle_count = codec_list.iter().filter(|&&c| c == 2).count();
+    assert!(
+        palrle_count >= 10,
+        "expected many Codec::PalRle tiles during churn, saw {} PalRle of {} total",
+        palrle_count,
+        codec_list.len()
+    );
+
+    Ok(())
+}
+
 fn luminance(c: &serde_json::Value) -> f64 {
     let r = c["r"].as_f64().unwrap_or(0.0);
     let g = c["g"].as_f64().unwrap_or(0.0);

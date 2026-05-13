@@ -41,6 +41,11 @@ struct Args {
     #[arg(long)]
     mode_switch_cycle: Option<u64>,
 
+    /// Draw `count` sequential text-like regions, each with a distinct
+    /// 4-color palette, cycling over ~5 seconds. Drives e2e_palette_eviction.
+    #[arg(long)]
+    palette_churn: Option<u32>,
+
     /// Run as a DRM master and paint directly to `/dev/dri/card<N>`'s scanout
     /// instead of speaking X11. Required for environments where Xorg holds
     /// the DRM master and prevents framebuffer-update propagation (e.g.
@@ -79,6 +84,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (conn, screen_num) = x11rb::connect(None)?;
     let screen = &conn.setup().roots[screen_num];
     let root = screen.root;
+
+    if let Some(count) = args.palette_churn {
+        return ghostframe_test_pattern::palette_churn::run(&conn, root, count);
+    }
 
     if let Some(secs) = args.mode_switch_cycle {
         let half = std::time::Duration::from_secs(secs);
