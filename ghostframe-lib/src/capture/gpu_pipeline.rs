@@ -165,6 +165,12 @@ pub struct FrameAnalysis {
     /// index for the corresponding compact tile.
     /// Valid until next process_frame call.
     pub per_tile_frame_palette_id: *const u8,
+    /// Pointer to the Stage 2b folded_into array (256 entries of u32).
+    /// Each entry encodes the best strict superset found for that palette slot:
+    /// `((255 - count_B) << 8) | id_B`, or `(255 << 8) | self_id` (default-self)
+    /// when no superset was found. Extract the resolved palette id via `entry & 0xFF`.
+    /// Null on the first frame. Valid until next process_frame call.
+    pub folded_into: *const u32,
 }
 
 impl FrameAnalysis {
@@ -232,11 +238,23 @@ impl FrameAnalysis {
             )
         }
     }
+
+    /// Returns the full 256-entry folded_into array. Each entry is
+    /// `((255 - count_B) << 8) | id_B` for a slot that found a strict
+    /// superset, or `(255 << 8) | self_id` (default-self) otherwise.
+    /// Callers extract the resolved palette id via `entry & 0xFF`.
+    pub fn folded_into_slice(&self) -> &[u32] {
+        if self.folded_into.is_null() {
+            return &[];
+        }
+        // SAFETY: same lifetime as other GPU-pointer slice helpers.
+        unsafe { std::slice::from_raw_parts(self.folded_into, 256) }
+    }
 }
 
 // SAFETY: `nv12_data`, `tile_analysis`, `palrle_compact_list`,
-// `frame_palette_set`, and `per_tile_frame_palette_id` are all pointers to
-// GPU-managed HOST_VISIBLE memory owned by `GpuFrameProcessor`. The
+// `frame_palette_set`, `per_tile_frame_palette_id`, and `folded_into` are all
+// pointers to GPU-managed HOST_VISIBLE memory owned by `GpuFrameProcessor`. The
 // FrameAnalysis is consumed before the next `process_frame` call so the
 // data is stable. GpuFrameProcessor is used from a single tokio task.
 unsafe impl Send for FrameAnalysis {}
@@ -355,8 +373,8 @@ pub struct GpuFrameProcessor {
     // Persistently mapped; Task 12b will read this after the Stage 2b dispatch.
     folded_into_buffer: vk::Buffer,
     folded_into_memory: vk::DeviceMemory,
-    // Task 12b will read this pointer to retrieve the folded_into array.
-    #[allow(dead_code)]
+    // Persistent CPU mapping of the folded_into buffer; pointed to by
+    // FrameAnalysis::folded_into after Stage 2b dispatch.
     folded_into_ptr: *mut u32,
 
     descriptor_pool: vk::DescriptorPool,
@@ -1596,6 +1614,7 @@ impl GpuFrameProcessor {
                 frame_palette_set: std::ptr::null(),
                 frame_palette_set_count: 0,
                 per_tile_frame_palette_id: std::ptr::null(),
+                folded_into: std::ptr::null(),
             });
         }
 
@@ -1677,6 +1696,37 @@ impl GpuFrameProcessor {
             sets: self.device.allocate_descriptor_sets(&palette_fold_ds_alloc)?,
         };
         let palette_fold_descriptor_set = palette_fold_ds_guard.sets[0];
+
+        // palette_subset_fold_init descriptor set (Stage 2b init)
+        let palette_subset_fold_init_ds_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(std::slice::from_ref(
+                &self.palette_subset_fold_init_descriptor_set_layout,
+            ));
+        let palette_subset_fold_init_ds_guard = ScopedDescriptorSets {
+            device: &self.device,
+            pool: self.descriptor_pool,
+            sets: self
+                .device
+                .allocate_descriptor_sets(&palette_subset_fold_init_ds_alloc)?,
+        };
+        let palette_subset_fold_init_descriptor_set =
+            palette_subset_fold_init_ds_guard.sets[0];
+
+        // palette_subset_fold descriptor set (Stage 2b)
+        let palette_subset_fold_ds_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(std::slice::from_ref(
+                &self.palette_subset_fold_descriptor_set_layout,
+            ));
+        let palette_subset_fold_ds_guard = ScopedDescriptorSets {
+            device: &self.device,
+            pool: self.descriptor_pool,
+            sets: self
+                .device
+                .allocate_descriptor_sets(&palette_subset_fold_ds_alloc)?,
+        };
+        let palette_subset_fold_descriptor_set = palette_subset_fold_ds_guard.sets[0];
 
         // Write SAD descriptor set.
         let current_image_info = [vk::DescriptorImageInfo::default()
@@ -1887,6 +1937,55 @@ impl GpuFrameProcessor {
                 .buffer_info(&palette_fold_per_tile_info),
         ];
         self.device.update_descriptor_sets(&palette_fold_writes, &[]);
+
+        // Write palette_subset_fold_init descriptor set.
+        // binding 0: folded_into_buffer (write)
+        let subset_fold_init_folded_into_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.folded_into_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let subset_fold_init_writes = [vk::WriteDescriptorSet::default()
+            .dst_set(palette_subset_fold_init_descriptor_set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&subset_fold_init_folded_into_info)];
+        self.device
+            .update_descriptor_sets(&subset_fold_init_writes, &[]);
+
+        // Write palette_subset_fold descriptor set.
+        // binding 0: frame_palette_set_buffer (read-only)
+        // binding 1: frame_palette_count_buffer (read-only)
+        // binding 2: folded_into_buffer (read-write)
+        let subset_fold_set_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.frame_palette_set_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let subset_fold_count_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.frame_palette_count_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let subset_fold_folded_into_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.folded_into_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let subset_fold_writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(palette_subset_fold_descriptor_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&subset_fold_set_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(palette_subset_fold_descriptor_set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&subset_fold_count_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(palette_subset_fold_descriptor_set)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&subset_fold_folded_into_info),
+        ];
+        self.device.update_descriptor_sets(&subset_fold_writes, &[]);
 
         // --- Command buffer (RAII-guarded) ---
         let cmd_alloc = vk::CommandBufferAllocateInfo::default()
@@ -2181,11 +2280,15 @@ impl GpuFrameProcessor {
         // Stage 2a: palette_fold (intra-frame palette dedup)
         // ============================================================
 
-        // Zero the three buffers that the shader uses as state/output:
+        // Zero the four buffers that Stage 2a uses as state/output, plus
+        // frame_palette_set_buffer which Stage 2b reads (count==0 per slot check):
+        //   frame_palette_set (Stage 2b checks count==0 to detect empty slots)
         //   frame_palette_count (atomic write target)
         //   hash_table (atomic CAS state, must start empty)
         //   per_tile_frame_palette_id (output, must start zero for atomicAnd/Or pattern)
         let pal_id_bytes = ((self.max_tiles + 3) & !3u32) as vk::DeviceSize;
+        self.device
+            .cmd_fill_buffer(cmd, self.frame_palette_set_buffer, 0, 20480, 0);
         self.device
             .cmd_fill_buffer(cmd, self.frame_palette_count_buffer, 0, 4, 0);
         self.device
@@ -2196,6 +2299,14 @@ impl GpuFrameProcessor {
         // Barrier: zero-fills + compact_list write must be visible to Stage 2a.
         // srcStageMask covers TRANSFER (zero-fills) and COMPUTE_SHADER (compact_list write).
         let stage_2a_input_barriers = [
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.frame_palette_set_buffer)
+                .offset(0)
+                .size(20480),
             vk::BufferMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
@@ -2292,6 +2403,80 @@ impl GpuFrameProcessor {
             vk::DependencyFlags::empty(),
             &[],
             &stage_2a_output_barriers,
+            &[],
+        );
+
+        // ============================================================
+        // Stage 2b init: write default-self sentinel to folded_into
+        // ============================================================
+        self.device.cmd_bind_pipeline(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.palette_subset_fold_init_pipeline,
+        );
+        self.device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.palette_subset_fold_init_pipeline_layout,
+            0,
+            &[palette_subset_fold_init_descriptor_set],
+            &[],
+        );
+        self.device.cmd_dispatch(cmd, 1, 1, 1);
+
+        // Barrier between init and fold: folded_into writes must be visible.
+        let stage_2b_init_to_fold_barrier = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(self.folded_into_buffer)
+            .offset(0)
+            .size(1024);
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            std::slice::from_ref(&stage_2b_init_to_fold_barrier),
+            &[],
+        );
+
+        // ============================================================
+        // Stage 2b fold: atomicMin-based subset detection
+        // ============================================================
+        self.device.cmd_bind_pipeline(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.palette_subset_fold_pipeline,
+        );
+        self.device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.palette_subset_fold_pipeline_layout,
+            0,
+            &[palette_subset_fold_descriptor_set],
+            &[],
+        );
+        self.device.cmd_dispatch(cmd, 256, 1, 1);
+
+        // Barrier for downstream consumers (Task 13 + HOST readback).
+        let stage_2b_output_barrier = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(self.folded_into_buffer)
+            .offset(0)
+            .size(1024);
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            std::slice::from_ref(&stage_2b_output_barrier),
             &[],
         );
 
@@ -2450,6 +2635,15 @@ impl GpuFrameProcessor {
                 .buffer(self.per_tile_frame_palette_id_buffer)
                 .offset(0)
                 .size(pal_id_bytes),
+            // Stage 2b output
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.folded_into_buffer)
+                .offset(0)
+                .size(1024),
         ];
         self.device.cmd_pipeline_barrier(
             cmd,
@@ -2507,6 +2701,8 @@ impl GpuFrameProcessor {
             &palrle_compact_ds_guard,
             &palrle_indirect_args_ds_guard,
             &palette_fold_ds_guard,
+            &palette_subset_fold_init_ds_guard,
+            &palette_subset_fold_ds_guard,
             &cmd_guard,
             &fence_guard,
         );
@@ -2534,6 +2730,7 @@ impl GpuFrameProcessor {
             frame_palette_set: self.frame_palette_set_ptr as *const FramePaletteEntryRaw,
             frame_palette_set_count: *self.frame_palette_count_ptr,
             per_tile_frame_palette_id: self.per_tile_frame_palette_id_ptr as *const u8,
+            folded_into: self.folded_into_ptr as *const u32,
         })
     }
 
@@ -3523,6 +3720,7 @@ mod tests {
             frame_palette_set: std::ptr::null(),
             frame_palette_set_count: 0,
             per_tile_frame_palette_id: std::ptr::null(),
+            folded_into: std::ptr::null(),
         };
         let slice = analysis.tile_analysis_slice();
         assert_eq!(slice.len(), 2);
@@ -4470,6 +4668,151 @@ mod tests {
             for (i, &id) in ids.iter().enumerate() {
                 assert_eq!(id, 0, "tile {} per_tile_id should be 0, got {}", i, id);
             }
+        }
+    }
+
+    /// Stage 2b: two tiles where tile 0 has palette {black, white, grey} (3 colors)
+    /// and tile 1 has palette {black, white, grey, blue/red} (4 colors — superset of tile 0).
+    /// After dispatch, tile 0's folded_into entry should resolve to tile 1's palette slot.
+    #[test]
+    fn process_frame_folds_subset_palette() {
+        let width = 64u32;
+        let height = 32u32;
+        let stride = width * 4;
+
+        let mut proc = match GpuFrameProcessor::new(64) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Skipping subset-fold test (no Vulkan GPU?): {e}");
+                return;
+            }
+        };
+
+        unsafe {
+            let size = (stride * height) as usize;
+
+            // Helper: allocate a memfd, fill it, and return the fd.
+            let make_frame_fd = |name: &str, fill: &dyn Fn(&mut [u8])| -> std::os::unix::io::RawFd {
+                let cname = std::ffi::CString::new(name).unwrap();
+                let fd = libc::memfd_create(cname.as_ptr(), 0);
+                assert!(fd >= 0);
+                libc::ftruncate(fd, size as i64);
+                let ptr = libc::mmap(
+                    std::ptr::null_mut(),
+                    size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                );
+                assert_ne!(ptr, libc::MAP_FAILED);
+                let frame = std::slice::from_raw_parts_mut(ptr as *mut u8, size);
+                fill(frame);
+                libc::munmap(ptr, size);
+                fd
+            };
+
+            // Seed frame: all black (to initialize prev_image).
+            let fd_seed = make_frame_fd("ghost-subset-seed", &|frame| {
+                std::ptr::write_bytes(frame.as_mut_ptr(), 0, size);
+            });
+            let first = match proc.process_frame(fd_seed, width, height, stride) {
+                Ok(a) => a,
+                Err(e) => {
+                    libc::close(fd_seed);
+                    eprintln!("Skipping subset-fold (memfd not a real DMA-BUF): {e}");
+                    return;
+                }
+            };
+            libc::close(fd_seed);
+            assert!(
+                first.folded_into.is_null(),
+                "first-frame folded_into is null by design"
+            );
+
+            // Real frame:
+            //   tile 0 (x=0..32): palette {black, white, grey} (3 colors)
+            //   tile 1 (x=32..64): palette {black, white, grey, red/blue} (4 colors)
+            // Tile 0's palette is a strict subset of tile 1's palette.
+            let fd_real = make_frame_fd("ghost-subset-real", &|frame| {
+                // tile 0: 3-color cycling pattern
+                for y in 0..32u32 {
+                    for x in 0..32u32 {
+                        let off = ((y * stride) + x * 4) as usize;
+                        let c: [u8; 4] = match (x + y * 32) % 3 {
+                            0 => [0, 0, 0, 255],       // black BGRA
+                            1 => [255, 255, 255, 255],  // white BGRA
+                            _ => [128, 128, 128, 255],  // grey BGRA
+                        };
+                        frame[off..off + 4].copy_from_slice(&c);
+                    }
+                }
+                // tile 1: 4-color cycling pattern (superset of tile 0)
+                for y in 0..32u32 {
+                    for x in 32..64u32 {
+                        let off = ((y * stride) + x * 4) as usize;
+                        let c: [u8; 4] = match (x + y * 32) % 4 {
+                            0 => [0, 0, 0, 255],       // black BGRA
+                            1 => [255, 255, 255, 255],  // white BGRA
+                            2 => [128, 128, 128, 255],  // grey BGRA
+                            _ => [255, 0, 0, 255],      // blue BGRA (B=255,G=0,R=0)
+                        };
+                        frame[off..off + 4].copy_from_slice(&c);
+                    }
+                }
+            });
+            let analysis = match proc.process_frame(fd_real, width, height, stride) {
+                Ok(a) => a,
+                Err(e) => {
+                    libc::close(fd_real);
+                    eprintln!(
+                        "Skipping subset-fold second frame (memfd not a real DMA-BUF): {e}"
+                    );
+                    return;
+                }
+            };
+            libc::close(fd_real);
+
+            // Both tiles must be PalRLE-feasible (count <= 16).
+            assert_eq!(
+                analysis.palrle_compact_count, 2,
+                "expected 2 compact tiles; got {}",
+                analysis.palrle_compact_count
+            );
+
+            // Stage 2a: 2 distinct palettes.
+            assert_eq!(
+                analysis.frame_palette_set_count, 2,
+                "tile 0 (3-color) and tile 1 (4-color) → 2 unique frame palettes; got {}",
+                analysis.frame_palette_set_count
+            );
+
+            let folded = analysis.folded_into_slice();
+            assert_eq!(folded.len(), 256, "folded_into must have 256 entries");
+
+            let ids = analysis.per_tile_frame_palette_id_slice();
+            assert_eq!(ids.len(), 2, "per_tile_id length must equal compact_count");
+
+            let id0 = ids[0]; // palette ID for tile 0 (3-color, the subset)
+            let id1 = ids[1]; // palette ID for tile 1 (4-color, the superset)
+
+            // folded_into[id0] (the smaller palette) should resolve to id1 (the superset).
+            let resolved_for_0 = folded[id0 as usize] & 0xFF;
+            assert_eq!(
+                resolved_for_0 as u8, id1,
+                "subset palette {} should fold into superset {}; \
+                 folded[{}] = {:#010x}",
+                id0, id1, id0, folded[id0 as usize]
+            );
+
+            // folded_into[id1] should be self-referential (default-self sentinel).
+            let resolved_for_1 = folded[id1 as usize] & 0xFF;
+            assert_eq!(
+                resolved_for_1 as u8, id1,
+                "superset palette {} should fold to itself; \
+                 folded[{}] = {:#010x}",
+                id1, id1, folded[id1 as usize]
+            );
         }
     }
 }
