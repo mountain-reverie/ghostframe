@@ -200,14 +200,13 @@ impl PaletteTable {
         // 2. find_eligible_free_slot → overwrite
         if let Some(id) = self.find_eligible_free_slot() {
             self.write_bytes(id, palette);
-            // write_bytes already cleared delivered & in_flight; slot is Held with rc=0.
-            self.ref_count[id as usize] = 1;
+            self.acquire(id);
             return Some(id);
         }
         // 3. find_empty_slot → write
         if let Some(id) = self.find_empty_slot() {
             self.write_bytes(id, palette);
-            self.ref_count[id as usize] = 1;
+            self.acquire(id);
             return Some(id);
         }
         // 4. fail
@@ -480,6 +479,9 @@ mod tests {
         assert_eq!(id, 9);
         assert_eq!(t.entries[9], Some(new_pal));
         assert!(!t.delivered.contains(9));
+        assert_eq!(t.slot_state[9], SlotState::Held);
+        assert_eq!(t.ref_count[9], 1);
+        assert!(!t.free_lru.contains(&9));
     }
 
     #[test]
