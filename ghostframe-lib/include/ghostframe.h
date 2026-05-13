@@ -3,6 +3,17 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+/**
+ * Maximum colors in a PalRLE palette. Tiles with more unique colors fall
+ * through the classifier to BC1/Cdf53.
+ */
+#define MAX_PALETTE_COUNT 16
+
+/**
+ * Persistent palette table capacity.
+ */
+#define PALETTE_TABLE_SLOTS 256
+
 #define TILE_SIZE 32
 
 #define BPP 4

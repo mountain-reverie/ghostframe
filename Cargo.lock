@@ -1274,6 +1274,7 @@ dependencies = [
  "lz4_flex",
  "proptest",
  "quinn-proto",
+ "rayon",
  "rcgen",
  "rustls",
  "serde_json",
