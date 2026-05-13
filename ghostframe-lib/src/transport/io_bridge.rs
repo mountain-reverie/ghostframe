@@ -2624,4 +2624,55 @@ mod tests {
         assert!(!bridge.palette_table.delivered.contains(7),
             "ERR_THIN_UNCACHED_PALETTE must clear delivered bit via force_rebundle");
     }
+
+    #[tokio::test]
+    async fn decode_error_3_triggers_force_rebundle() {
+        use crate::transport::decode_error::{DecodeErrorMsg, ERR_THIN_UNCACHED_PALETTE};
+        use crate::tile::CodecState;
+        use crate::encoder::pal_rle::PaletteEntry;
+
+        let mut bridge = make_bridge_for_test().await;
+
+        // Set up state: palette_table slot 5 is in the "delivered" state so the
+        // next emission for that palette would be thin. metrics_tracker records
+        // that tile (3, 4) is currently rendering palette_id=5.
+        let pal = PaletteEntry { count: 1, colors: [[10, 20, 30, 255]; 16] };
+        bridge.palette_table.write_bytes(5, &pal);
+        bridge.palette_table.delivered.insert(5);
+        bridge.metrics_tracker.resize(8, 8);
+        bridge.metrics_tracker.get_mut(3, 4).codec_state = CodecState::PalRle { palette_id: 5 };
+
+        // Simulate client reporting thin-uncached for that tile.
+        let msg = DecodeErrorMsg {
+            codec: 2, tile_x: 3, tile_y: 4, error_code: ERR_THIN_UNCACHED_PALETTE,
+        };
+        bridge.handle_decode_error(msg);
+
+        // delivered bit must be cleared so the next emission rebundles.
+        assert!(!bridge.palette_table.delivered.contains(5),
+            "force_rebundle should clear the delivered bit for palette_id=5");
+    }
+
+    #[tokio::test]
+    async fn decode_error_other_codes_no_op_on_palette_table() {
+        use crate::transport::decode_error::{DecodeErrorMsg, ERR_INDEX_OOB};
+        use crate::tile::CodecState;
+        use crate::encoder::pal_rle::PaletteEntry;
+
+        let mut bridge = make_bridge_for_test().await;
+        let pal = PaletteEntry { count: 1, colors: [[10, 20, 30, 255]; 16] };
+        bridge.palette_table.write_bytes(5, &pal);
+        bridge.palette_table.delivered.insert(5);
+        bridge.metrics_tracker.resize(8, 8);
+        bridge.metrics_tracker.get_mut(3, 4).codec_state = CodecState::PalRle { palette_id: 5 };
+
+        let msg = DecodeErrorMsg {
+            codec: 2, tile_x: 3, tile_y: 4, error_code: ERR_INDEX_OOB,
+        };
+        bridge.handle_decode_error(msg);
+
+        // Code 5 is log-only in M3.2b — delivered must remain set.
+        assert!(bridge.palette_table.delivered.contains(5),
+            "ERR_INDEX_OOB should not clear delivered bit (M3.2b leaves it as a future hook)");
+    }
 }
