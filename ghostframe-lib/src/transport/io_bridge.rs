@@ -1392,19 +1392,44 @@ impl IoBridge {
 
     /// Phase B: rayon-parallel per-tile encode of PalRle payloads.
     /// Returns a HashMap keyed by (tile_x, tile_y) for Phase C lookup.
+    ///
+    /// Legacy entry point — equivalent to `phase_b_encode_payloads_with_caps`
+    /// with default (no-capabilities) client. Kept for callers that haven't
+    /// threaded capabilities through yet.
     pub(crate) fn phase_b_encode_payloads(
         preps: &[PalRleTileWorkPrep],
+    ) -> std::collections::HashMap<(u32, u32), Vec<u8>> {
+        Self::phase_b_encode_payloads_with_caps(
+            preps,
+            &crate::transport::client_caps::ClientCapabilities::default(),
+        )
+    }
+
+    /// Phase B with explicit client capabilities. When
+    /// `caps.indices_raw_enabled == true`, thin payloads are emitted as
+    /// `indices_raw` (flags bit 1) instead of nibble-RLE. Bundled payloads
+    /// always use the bundled format regardless of caps.
+    pub(crate) fn phase_b_encode_payloads_with_caps(
+        preps: &[PalRleTileWorkPrep],
+        caps: &crate::transport::client_caps::ClientCapabilities,
     ) -> std::collections::HashMap<(u32, u32), Vec<u8>> {
         use rayon::prelude::*;
         preps
             .par_iter()
             .map(|p| {
-                let payload = crate::encoder::pal_rle::encode_pal_rle_payload(
-                    &p.indices,
-                    &p.palette,
-                    p.palette_id,
-                    p.bundled,
-                );
+                let payload = if !p.bundled && caps.indices_raw_enabled {
+                    crate::encoder::pal_rle::encode_pal_rle_payload_indices_raw(
+                        &p.indices,
+                        p.palette_id,
+                    )
+                } else {
+                    crate::encoder::pal_rle::encode_pal_rle_payload(
+                        &p.indices,
+                        &p.palette,
+                        p.palette_id,
+                        p.bundled,
+                    )
+                };
                 (p.tile_xy, payload)
             })
             .collect()
@@ -2368,5 +2393,64 @@ mod tests {
         std::env::remove_var("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY");
         std::env::remove_var("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE");
         std::env::remove_var("GHOSTFRAME_OUTBOUND_LOSS_SEED");
+    }
+
+    #[test]
+    fn phase_b_emits_indices_raw_when_caps_enabled_and_thin() {
+        use crate::encoder::pal_rle::PaletteEntry;
+        let prep = PalRleTileWorkPrep {
+            tile_xy: (0, 0),
+            indices: [0xAB; 512],
+            palette: PaletteEntry { count: 2, colors: [[0xFF, 0, 0, 0xFF]; 16] },
+            palette_id: 9,
+            bundled: false, // thin path
+        };
+        let caps = crate::transport::client_caps::ClientCapabilities {
+            indices_raw_enabled: true,
+        };
+        let map = IoBridge::phase_b_encode_payloads_with_caps(&[prep], &caps);
+        let payload = &map[&(0, 0)];
+        assert_eq!(payload[0], 0x02, "indices_raw flag (bit 1)");
+        assert_eq!(payload[1], 9, "palette_id");
+        assert_eq!(payload.len(), 514, "fixed-size indices_raw payload");
+    }
+
+    #[test]
+    fn phase_b_emits_thin_rle_when_caps_disabled() {
+        use crate::encoder::pal_rle::PaletteEntry;
+        let prep = PalRleTileWorkPrep {
+            tile_xy: (5, 7),
+            indices: [0x00; 512], // all-same index → max-compressible RLE
+            palette: PaletteEntry { count: 1, colors: [[0xFF, 0, 0, 0xFF]; 16] },
+            palette_id: 3,
+            bundled: false, // thin path
+        };
+        let caps = crate::transport::client_caps::ClientCapabilities {
+            indices_raw_enabled: false,
+        };
+        let map = IoBridge::phase_b_encode_payloads_with_caps(&[prep], &caps);
+        let payload = &map[&(5, 7)];
+        assert_eq!(payload[0], 0x00, "thin flag (bit 0 clear, bit 1 clear)");
+        assert_eq!(payload[1], 3, "palette_id");
+        assert!(payload.len() < 514, "RLE compresses single-index tile far below 514");
+    }
+
+    #[test]
+    fn phase_b_emits_bundled_when_bundled_regardless_of_caps() {
+        use crate::encoder::pal_rle::PaletteEntry;
+        let prep = PalRleTileWorkPrep {
+            tile_xy: (1, 1),
+            indices: [0x00; 512],
+            palette: PaletteEntry { count: 1, colors: [[0xFF, 0, 0, 0xFF]; 16] },
+            palette_id: 12,
+            bundled: true,
+        };
+        let caps = crate::transport::client_caps::ClientCapabilities {
+            indices_raw_enabled: true,
+        };
+        let map = IoBridge::phase_b_encode_payloads_with_caps(&[prep], &caps);
+        let payload = &map[&(1, 1)];
+        assert_eq!(payload[0], 0x01, "bundled flag (bit 0 set)");
+        // indices_raw promotion only applies to thin path; bundled passes through unchanged.
     }
 }
