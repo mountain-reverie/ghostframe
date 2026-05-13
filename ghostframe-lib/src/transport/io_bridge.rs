@@ -123,6 +123,9 @@ pub struct IoBridge {
     /// Persistent palette table for PalRLE codec emission. M3.2a single-client
     /// invariant — flat server-wide state.
     pub(crate) palette_table: crate::encoder::pal_rle::PaletteTable,
+    /// Capabilities advertised by the connected client via HELLO. Defaults to
+    /// all-disabled until the client sends a HELLO message.
+    client_caps: crate::transport::client_caps::ClientCapabilities,
     /// FEC parity group size. 0 = disabled.
     fec_k: usize,
     /// Loss rate threshold to enable FEC (0.005 = 0.5%).
@@ -318,6 +321,7 @@ impl IoBridge {
             inbound_loss: Self::loss_injector_from_env("INBOUND"),
             force_dirty_frames: 0,
             palette_table: crate::encoder::pal_rle::PaletteTable::new(),
+            client_caps: crate::transport::client_caps::ClientCapabilities::default(),
             fec_k: std::env::var("GHOSTFRAME_FEC_K")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
@@ -975,7 +979,8 @@ impl IoBridge {
                 );
 
                 // Phase B — rayon parallel encode.
-                let mut palrle_payloads = IoBridge::phase_b_encode_payloads(&preps);
+                let caps = self.client_caps;
+                let mut palrle_payloads = IoBridge::phase_b_encode_payloads_with_caps(&preps, &caps);
 
                 self.dispatch_dirty_tiles_via_scheduler(
                     &dirty_xy,
@@ -1464,6 +1469,7 @@ impl IoBridge {
             inbound_loss: None,
             force_dirty_frames: 0,
             palette_table: crate::encoder::pal_rle::PaletteTable::new(),
+            client_caps: crate::transport::client_caps::ClientCapabilities::default(),
             fec_k: 0,
             fec_enable_threshold: FEC_ENABLE_THRESHOLD,
             fec_disable_threshold: FEC_DISABLE_THRESHOLD,
@@ -1505,6 +1511,7 @@ impl IoBridge {
             inbound_loss: None,
             force_dirty_frames: 0,
             palette_table: crate::encoder::pal_rle::PaletteTable::new(),
+            client_caps: crate::transport::client_caps::ClientCapabilities::default(),
             fec_k: 0,
             fec_enable_threshold: FEC_ENABLE_THRESHOLD,
             fec_disable_threshold: FEC_DISABLE_THRESHOLD,
@@ -1514,6 +1521,21 @@ impl IoBridge {
             last_emitted_dimensions: None,
             dimensions_retransmits_left: 0,
         }
+    }
+
+    /// Return the capabilities most recently advertised by the client via HELLO.
+    /// Returns `ClientCapabilities::default()` until the first HELLO is received.
+    pub fn current_client_caps(&self) -> crate::transport::client_caps::ClientCapabilities {
+        self.client_caps
+    }
+
+    /// Update capabilities from a parsed HELLO message.
+    pub(crate) fn apply_hello(&mut self, msg: crate::transport::client_caps::HelloMsg) {
+        self.client_caps = msg.caps;
+        tracing::info!(
+            indices_raw = msg.caps.indices_raw_enabled,
+            "HELLO received, client capabilities updated"
+        );
     }
 
     /// Update FEC parity state based on receiver feedback.
@@ -1560,6 +1582,33 @@ fn parse_listen_port(listen_addr: &str) -> io::Result<u16> {
 mod tests {
     use super::*;
     use tokio::net::UnixStream;
+
+    /// Test-only helper: construct an IoBridge with a fresh UnixStream pair
+    /// and QuicServer. Discards the peer end of the stream pair (caller
+    /// doesn't need to interact with it).
+    async fn make_bridge_for_test() -> IoBridge {
+        let (our_end, _peer) = UnixStream::pair().expect("UnixStream::pair failed");
+        let server = QuicServer::new().expect("QuicServer::new failed");
+        IoBridge::new_with_stream_for_test(our_end, server)
+    }
+
+    #[tokio::test]
+    async fn caps_default_to_disabled_until_hello() {
+        use crate::transport::client_caps::ClientCapabilities;
+        let bridge = make_bridge_for_test().await;
+        // Before any HELLO, current_client_caps() returns the default.
+        assert_eq!(bridge.current_client_caps(), ClientCapabilities::default());
+        assert!(!bridge.current_client_caps().indices_raw_enabled);
+    }
+
+    #[tokio::test]
+    async fn apply_hello_enables_indices_raw() {
+        use crate::transport::client_caps::{ClientCapabilities, HelloMsg};
+        let mut bridge = make_bridge_for_test().await;
+        let msg = HelloMsg { caps: ClientCapabilities { indices_raw_enabled: true } };
+        bridge.apply_hello(msg);
+        assert!(bridge.current_client_caps().indices_raw_enabled);
+    }
 
     /// Verify that `IoBridge::run` returns `Ok(())` when the peer end of the
     /// socketpair is dropped (EOF from ghostbridge).
