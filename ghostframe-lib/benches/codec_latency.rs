@@ -61,15 +61,65 @@ impl BenchEncoder for H264TileEncoder {
 
 #[cfg(feature = "m3")]
 #[allow(dead_code)]
-struct PalRleEncoder;
+struct PalRleEncoder {
+    palette_table: ghostframe_lib::encoder::pal_rle::PaletteTable,
+}
+
+#[cfg(feature = "m3")]
+impl PalRleEncoder {
+    #[allow(dead_code)]
+    fn new() -> Self {
+        Self {
+            palette_table: ghostframe_lib::encoder::pal_rle::PaletteTable::new(),
+        }
+    }
+}
 
 #[cfg(feature = "m3")]
 impl BenchEncoder for PalRleEncoder {
     fn name(&self) -> &'static str {
         "pal_rle"
     }
-    fn encode(&mut self, _tile: &[u8]) -> Vec<u8> {
-        unimplemented!("PalRle encoder lands in M3");
+    fn encode(&mut self, tile_bgra: &[u8]) -> Vec<u8> {
+        use ghostframe_lib::encoder::pal_rle::{
+            encode_pal_rle_payload, PaletteEntry, MAX_PALETTE_COUNT,
+        };
+
+        // Extract unique colors from the BGRA tile.
+        let mut seen: Vec<[u8; 4]> = Vec::with_capacity(16);
+        for chunk in tile_bgra.chunks_exact(4) {
+            let c: [u8; 4] = chunk.try_into().unwrap();
+            if !seen.contains(&c) {
+                if seen.len() >= MAX_PALETTE_COUNT {
+                    // Tile not PalRLE-feasible — bench harness records empty payload.
+                    return Vec::new();
+                }
+                seen.push(c);
+            }
+        }
+        // Canonical-sort by BGRA-as-u32 ascending (matches the GPU sort
+        // in tile_analysis.comp Stage 1 extension).
+        seen.sort_by_key(|c| u32::from_le_bytes(*c));
+
+        let mut palette = PaletteEntry::default();
+        for (i, c) in seen.iter().enumerate() {
+            palette.colors[i] = *c;
+        }
+        palette.count = seen.len() as u8;
+
+        // Build the 4-bit index stream (low nibble of byte 0 = pixel 0).
+        let mut indices = [0u8; 512];
+        for (pixel, chunk) in tile_bgra.chunks_exact(4).enumerate() {
+            let c: [u8; 4] = chunk.try_into().unwrap();
+            let idx = seen.iter().position(|x| x == &c).unwrap() as u8;
+            let byte = pixel / 2;
+            let shift = (pixel % 2) * 4;
+            indices[byte] |= (idx & 0x0F) << shift;
+        }
+
+        let id = self.palette_table.acquire_or_allocate(&palette).unwrap_or(0);
+        let bundled = !self.palette_table.delivered.contains(id);
+        encode_pal_rle_payload(&indices, &palette, id, bundled)
     }
 }
 
@@ -120,6 +170,17 @@ fn run_codecs(c: &mut Criterion) {
         } else {
             eprintln!("h264: VA-API encoder unavailable, skipping");
         }
+    }
+    #[cfg(all(feature = "gpu-bench", feature = "m3"))]
+    {
+        // PalRle bench (CPU-side encode).
+        let mut palrle = PalRleEncoder::new();
+        bench_codec(c, &mut palrle);
+
+        // LZ4-wrapped variant.
+        let palrle_lz4 = PalRleEncoder::new();
+        let mut wrapped = Lz4Wrapper::new(palrle_lz4);
+        bench_codec(c, &mut wrapped);
     }
     #[cfg(not(feature = "gpu-bench"))]
     {
