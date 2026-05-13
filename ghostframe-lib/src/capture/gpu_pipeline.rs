@@ -153,6 +153,18 @@ pub struct FrameAnalysis {
     pub palrle_compact_list: *const u32,
     /// Number of valid entries in `palrle_compact_list`.
     pub palrle_compact_count: u32,
+    /// Pointer to the per-frame palette set (Stage 2a output).
+    /// 256 slots of `FramePaletteEntryRaw`; only entries 0..frame_palette_set_count
+    /// whose hash slot was claimed contain valid data.
+    /// Valid until next process_frame call.
+    pub frame_palette_set: *const FramePaletteEntryRaw,
+    /// Number of unique palettes in this frame.
+    pub frame_palette_set_count: u32,
+    /// Pointer to per-tile frame palette ID array (Stage 2a output).
+    /// Length = `palrle_compact_count`. Each byte is the frame palette slot
+    /// index for the corresponding compact tile.
+    /// Valid until next process_frame call.
+    pub per_tile_frame_palette_id: *const u8,
 }
 
 impl FrameAnalysis {
@@ -178,6 +190,42 @@ impl FrameAnalysis {
         // FrameAnalysis across a subsequent process_frame() call.
         unsafe {
             std::slice::from_raw_parts(self.palrle_compact_list, self.palrle_compact_count as usize)
+        }
+    }
+
+    pub fn frame_palette_set_slice(&self) -> &[FramePaletteEntryRaw] {
+        if self.frame_palette_set.is_null() || self.frame_palette_set_count == 0 {
+            return &[];
+        }
+        // SAFETY: pointer is into HOST_VISIBLE mapped GPU memory owned by
+        // GpuFrameProcessor. The borrow checker prevents the returned slice
+        // from outliving the &self borrow; the caller must not hold this
+        // FrameAnalysis across a subsequent process_frame() call.
+        // Note: this slice's entries are SPARSE — only entries 0..frame_palette_set_count
+        // whose hash slot was claimed contain valid bytes. Iterate per_tile_frame_palette_id
+        // to find which slot index a tile actually uses.
+        unsafe {
+            std::slice::from_raw_parts(
+                self.frame_palette_set,
+                self.frame_palette_set_count as usize,
+            )
+        }
+    }
+
+    pub fn per_tile_frame_palette_id_slice(&self) -> &[u8] {
+        if self.per_tile_frame_palette_id.is_null() || self.palrle_compact_count == 0 {
+            return &[];
+        }
+        // SAFETY: pointer is into HOST_VISIBLE mapped GPU memory owned by
+        // GpuFrameProcessor. The borrow checker prevents the returned slice
+        // from outliving the &self borrow; the caller must not hold this
+        // FrameAnalysis across a subsequent process_frame() call.
+        // Length = palrle_compact_count (one byte per compact slot).
+        unsafe {
+            std::slice::from_raw_parts(
+                self.per_tile_frame_palette_id,
+                self.palrle_compact_count as usize,
+            )
         }
     }
 }
@@ -1361,6 +1409,9 @@ impl GpuFrameProcessor {
                 tile_analysis_len: 0,
                 palrle_compact_list: std::ptr::null(),
                 palrle_compact_count: 0,
+                frame_palette_set: std::ptr::null(),
+                frame_palette_set_count: 0,
+                per_tile_frame_palette_id: std::ptr::null(),
             });
         }
 
@@ -1431,6 +1482,17 @@ impl GpuFrameProcessor {
             sets: self.device.allocate_descriptor_sets(&palrle_indirect_args_ds_alloc)?,
         };
         let palrle_indirect_args_ds = palrle_indirect_args_ds_guard.sets[0];
+
+        // palette_fold descriptor set (Stage 2a)
+        let palette_fold_ds_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(std::slice::from_ref(&self.palette_fold_descriptor_set_layout));
+        let palette_fold_ds_guard = ScopedDescriptorSets {
+            device: &self.device,
+            pool: self.descriptor_pool,
+            sets: self.device.allocate_descriptor_sets(&palette_fold_ds_alloc)?,
+        };
+        let palette_fold_descriptor_set = palette_fold_ds_guard.sets[0];
 
         // Write SAD descriptor set.
         let current_image_info = [vk::DescriptorImageInfo::default()
@@ -1576,6 +1638,71 @@ impl GpuFrameProcessor {
         ];
         self.device
             .update_descriptor_sets(&palrle_indirect_args_writes, &[]);
+
+        // Write palette_fold descriptor set.
+        // binding 0: analysis_buffer (read-only)
+        // binding 1: palrle_compact_list_buffer (read-only)
+        // binding 2: frame_palette_set_buffer (write)
+        // binding 3: frame_palette_count_buffer (atomic write)
+        // binding 4: hash_table_buffer (atomic CAS state)
+        // binding 5: per_tile_frame_palette_id_buffer (write)
+        let palette_fold_analysis_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.analysis_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let palette_fold_compact_list_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.palrle_compact_list_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let palette_fold_set_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.frame_palette_set_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let palette_fold_count_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.frame_palette_count_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let palette_fold_hash_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.hash_table_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let palette_fold_per_tile_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.per_tile_frame_palette_id_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let palette_fold_writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(palette_fold_descriptor_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&palette_fold_analysis_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(palette_fold_descriptor_set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&palette_fold_compact_list_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(palette_fold_descriptor_set)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&palette_fold_set_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(palette_fold_descriptor_set)
+                .dst_binding(3)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&palette_fold_count_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(palette_fold_descriptor_set)
+                .dst_binding(4)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&palette_fold_hash_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(palette_fold_descriptor_set)
+                .dst_binding(5)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&palette_fold_per_tile_info),
+        ];
+        self.device.update_descriptor_sets(&palette_fold_writes, &[]);
 
         // --- Command buffer (RAII-guarded) ---
         let cmd_alloc = vk::CommandBufferAllocateInfo::default()
@@ -1866,6 +1993,124 @@ impl GpuFrameProcessor {
             &[],
         );
 
+        // ============================================================
+        // Stage 2a: palette_fold (intra-frame palette dedup)
+        // ============================================================
+
+        // Zero the three buffers that the shader uses as state/output:
+        //   frame_palette_count (atomic write target)
+        //   hash_table (atomic CAS state, must start empty)
+        //   per_tile_frame_palette_id (output, must start zero for atomicAnd/Or pattern)
+        let pal_id_bytes = ((self.max_tiles + 3) & !3u32) as vk::DeviceSize;
+        self.device
+            .cmd_fill_buffer(cmd, self.frame_palette_count_buffer, 0, 4, 0);
+        self.device
+            .cmd_fill_buffer(cmd, self.hash_table_buffer, 0, 1024, 0);
+        self.device
+            .cmd_fill_buffer(cmd, self.per_tile_frame_palette_id_buffer, 0, pal_id_bytes, 0);
+
+        // Barrier: zero-fills + compact_list write must be visible to Stage 2a.
+        // srcStageMask covers TRANSFER (zero-fills) and COMPUTE_SHADER (compact_list write).
+        let stage_2a_input_barriers = [
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.frame_palette_count_buffer)
+                .offset(0)
+                .size(4),
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.hash_table_buffer)
+                .offset(0)
+                .size(1024),
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.per_tile_frame_palette_id_buffer)
+                .offset(0)
+                .size(pal_id_bytes),
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.palrle_compact_list_buffer)
+                .offset(0)
+                .size(vk::WHOLE_SIZE),
+        ];
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &stage_2a_input_barriers,
+            &[],
+        );
+
+        // Stage 2a: indirect dispatch.
+        self.device.cmd_bind_pipeline(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.palette_fold_pipeline,
+        );
+        self.device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.palette_fold_pipeline_layout,
+            0,
+            &[palette_fold_descriptor_set],
+            &[],
+        );
+        // palrle_indirect_args_buffer already barriered for INDIRECT_COMMAND_READ
+        // by the Stage 1.5b barrier above.
+        self.device
+            .cmd_dispatch_indirect(cmd, self.palrle_indirect_args_buffer, 0);
+
+        // Barrier: Stage 2a outputs available to downstream stages and HOST readback.
+        let stage_2a_output_barriers = [
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.frame_palette_set_buffer)
+                .offset(0)
+                .size(vk::WHOLE_SIZE),
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.frame_palette_count_buffer)
+                .offset(0)
+                .size(4),
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.per_tile_frame_palette_id_buffer)
+                .offset(0)
+                .size(pal_id_bytes),
+        ];
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &stage_2a_output_barriers,
+            &[],
+        );
+
         // 5a. Snapshot copy: current (DMA-BUF) → prev_image (owned). This
         // makes prev_image a true point-in-time snapshot of THIS frame for
         // the next frame's SAD comparison. Must run AFTER all three shader
@@ -1952,7 +2197,9 @@ impl GpuFrameProcessor {
         );
 
         // 5. Barriers: SAD buffer → HOST_READ; NV12 buffer → HOST_READ;
-        //    analysis buffer → HOST_READ; palrle compact list + count → HOST_READ.
+        //    analysis buffer → HOST_READ; palrle compact list + count → HOST_READ;
+        //    Stage 2a outputs (frame_palette_set, frame_palette_count,
+        //    per_tile_frame_palette_id) → HOST_READ.
         let buf_barriers = [
             vk::BufferMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE)
@@ -1994,6 +2241,31 @@ impl GpuFrameProcessor {
                 .buffer(self.palrle_compact_count_buffer)
                 .offset(0)
                 .size(vk::WHOLE_SIZE),
+            // Stage 2a outputs
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.frame_palette_set_buffer)
+                .offset(0)
+                .size(vk::WHOLE_SIZE),
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.frame_palette_count_buffer)
+                .offset(0)
+                .size(4),
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.per_tile_frame_palette_id_buffer)
+                .offset(0)
+                .size(pal_id_bytes),
         ];
         self.device.cmd_pipeline_barrier(
             cmd,
@@ -2050,6 +2322,7 @@ impl GpuFrameProcessor {
             &analysis_ds_guard,
             &palrle_compact_ds_guard,
             &palrle_indirect_args_ds_guard,
+            &palette_fold_ds_guard,
             &cmd_guard,
             &fence_guard,
         );
@@ -2074,6 +2347,9 @@ impl GpuFrameProcessor {
             tile_analysis_len: cols * rows,
             palrle_compact_list: self.palrle_compact_list_ptr as *const u32,
             palrle_compact_count: *self.palrle_compact_count_ptr,
+            frame_palette_set: self.frame_palette_set_ptr as *const FramePaletteEntryRaw,
+            frame_palette_set_count: *self.frame_palette_count_ptr,
+            per_tile_frame_palette_id: self.per_tile_frame_palette_id_ptr as *const u8,
         })
     }
 
@@ -3031,6 +3307,9 @@ mod tests {
             tile_analysis_len: 2,
             palrle_compact_list: std::ptr::null(),
             palrle_compact_count: 0,
+            frame_palette_set: std::ptr::null(),
+            frame_palette_set_count: 0,
+            per_tile_frame_palette_id: std::ptr::null(),
         };
         let slice = analysis.tile_analysis_slice();
         assert_eq!(slice.len(), 2);
@@ -3864,6 +4143,120 @@ mod tests {
                 "only 2 tiles are PalRLE-feasible; got count={}",
                 analysis.palrle_compact_count
             );
+        }
+    }
+
+    /// Stage 2a: 4 tiles each with identical 2-color palette {black, white}.
+    /// Expected: 4 compact entries, 1 unique frame palette, all per_tile_id == 0.
+    #[test]
+    fn process_frame_dedups_identical_palettes_within_frame() {
+        let width = 128u32;
+        let height = 32u32;
+        let stride = width * 4;
+
+        let mut proc = match GpuFrameProcessor::new(128) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Skipping dedup test (no Vulkan GPU?): {e}");
+                return;
+            }
+        };
+
+        unsafe {
+            // --- Seed frame: all black ---
+            let size = (stride * height) as usize;
+            let name_seed = std::ffi::CString::new("ghost-dedup-seed").unwrap();
+            let fd_seed = libc::memfd_create(name_seed.as_ptr(), 0);
+            assert!(fd_seed >= 0);
+            libc::ftruncate(fd_seed, size as i64);
+            let ptr_seed = libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd_seed,
+                0,
+            );
+            assert_ne!(ptr_seed, libc::MAP_FAILED);
+            std::ptr::write_bytes(ptr_seed as *mut u8, 0, size);
+            libc::munmap(ptr_seed, size);
+
+            let first = match proc.process_frame(fd_seed, width, height, stride) {
+                Ok(a) => a,
+                Err(e) => {
+                    libc::close(fd_seed);
+                    eprintln!("Skipping dedup test (memfd not a real DMA-BUF): {e}");
+                    return;
+                }
+            };
+            libc::close(fd_seed);
+            assert!(
+                first.frame_palette_set.is_null(),
+                "first-frame frame_palette_set is null by design"
+            );
+
+            // --- Real frame: 4 tiles (32x32 each), each with identical 2-color
+            // checkerboard {black, white} ---
+            let name_real = std::ffi::CString::new("ghost-dedup-real").unwrap();
+            let fd_real = libc::memfd_create(name_real.as_ptr(), 0);
+            assert!(fd_real >= 0);
+            libc::ftruncate(fd_real, size as i64);
+            let ptr_real = libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd_real,
+                0,
+            );
+            assert_ne!(ptr_real, libc::MAP_FAILED);
+            let frame = std::slice::from_raw_parts_mut(ptr_real as *mut u8, size);
+
+            for tile_x in 0..4u32 {
+                for y in 0..32u32 {
+                    for x in 0..32u32 {
+                        let off = ((y * stride) + (tile_x * 32 + x) * 4) as usize;
+                        let c = if (x + y) % 2 == 0 {
+                            [0u8, 0, 0, 255]     // black BGRA
+                        } else {
+                            [255u8, 255, 255, 255] // white BGRA
+                        };
+                        frame[off..off + 4].copy_from_slice(&c);
+                    }
+                }
+            }
+            libc::munmap(ptr_real, size);
+
+            let analysis = match proc.process_frame(fd_real, width, height, stride) {
+                Ok(a) => a,
+                Err(e) => {
+                    libc::close(fd_real);
+                    eprintln!("Skipping dedup test second frame (memfd not a real DMA-BUF): {e}");
+                    return;
+                }
+            };
+            libc::close(fd_real);
+
+            // 4 tiles, all feasible (count=2 each).
+            assert_eq!(
+                analysis.palrle_compact_count, 4,
+                "expected 4 compact tiles; got {}",
+                analysis.palrle_compact_count
+            );
+
+            // Stage 2a: all 4 tiles share the same palette → 1 unique frame palette.
+            assert_eq!(
+                analysis.frame_palette_set_count, 1,
+                "4 identical-palette tiles → 1 unique frame palette; got {}",
+                analysis.frame_palette_set_count
+            );
+
+            // All per-tile IDs must map to frame palette slot 0.
+            let ids = analysis.per_tile_frame_palette_id_slice();
+            assert_eq!(ids.len(), 4, "per_tile_id length must equal compact_count");
+            for (i, &id) in ids.iter().enumerate() {
+                assert_eq!(id, 0, "tile {} per_tile_id should be 0, got {}", i, id);
+            }
         }
     }
 }
