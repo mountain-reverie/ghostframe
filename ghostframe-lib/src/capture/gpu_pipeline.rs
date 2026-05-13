@@ -1283,10 +1283,12 @@ impl GpuFrameProcessor {
         let palette_subset_fold_pipeline = palette_subset_fold_pipelines[0];
 
         // --- folded_into buffer ---
+        // folded_into_buffer: each frame is reset by palette_subset_fold_init.comp
+        // (the init shader writes the default-self sentinel). TRANSFER_DST is kept
+        // for symmetry with other Stage 2 buffers and to permit a future fallback
+        // to vkCmdFillBuffer if the init dispatch is ever replaced.
         // 256 slots × 4 bytes = 1024 bytes. HOST_VISIBLE | HOST_COHERENT,
-        // STORAGE_BUFFER | TRANSFER_DST. Persistently mapped for CPU readback
-        // (Task 12b+). The init shader writes the initial sentinel values each
-        // frame before the fold dispatch.
+        // persistently mapped for CPU readback (Task 12b+).
         let folded_into_size = 256_u64 * 4;
         let folded_into_buf_ci = vk::BufferCreateInfo::default()
             .size(folded_into_size)

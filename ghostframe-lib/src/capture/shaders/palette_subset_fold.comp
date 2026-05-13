@@ -5,6 +5,12 @@
 // Workgroups whose slot is empty (count == 0) early-out.
 // 256 threads per workgroup, one per candidate superset B;
 // threads whose b_id slot is empty also early-out.
+//
+// PRECONDITION: frame_palette_set_buffer is zero-filled before Stage 2a runs
+// each frame (vkCmdFillBuffer in Task 12b). This is what makes `count == 0`
+// a reliable "this slot is unused" discriminator. Without the per-frame
+// zero-fill, stale `count > 0` from the previous frame's unclaimed slots
+// would cause subset checks against garbage palette bytes.
 
 #version 450
 
@@ -63,6 +69,8 @@ void main() {
 
     uint cnt_a = frame_palettes[a_id].count;
     uint cnt_b = frame_palettes[b_id].count;
+    // Fast-path: avoid the is_subset call when B is smaller than A.
+    // is_subset itself also checks this; this is a pure optimization.
     if (cnt_b < cnt_a) return; // can't be a superset
 
     if (is_subset(a_id, b_id)) {
