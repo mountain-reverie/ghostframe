@@ -338,6 +338,27 @@ pub struct GpuFrameProcessor {
     // to by FrameAnalysis::per_tile_frame_palette_id.
     per_tile_frame_palette_id_ptr: *mut u8,
 
+    // palette_subset_fold_init pipeline (Stage 2b init)
+    palette_subset_fold_init_shader_module: vk::ShaderModule,
+    palette_subset_fold_init_pipeline: vk::Pipeline,
+    palette_subset_fold_init_pipeline_layout: vk::PipelineLayout,
+    palette_subset_fold_init_descriptor_set_layout: vk::DescriptorSetLayout,
+
+    // palette_subset_fold pipeline (Stage 2b)
+    palette_subset_fold_shader_module: vk::ShaderModule,
+    palette_subset_fold_pipeline: vk::Pipeline,
+    palette_subset_fold_pipeline_layout: vk::PipelineLayout,
+    palette_subset_fold_descriptor_set_layout: vk::DescriptorSetLayout,
+
+    // Stage 2b output: folded_into[i] encodes the best superset for slot i.
+    // 256 × 4 = 1024 bytes. HOST_VISIBLE | HOST_COHERENT | STORAGE_BUFFER | TRANSFER_DST.
+    // Persistently mapped; Task 12b will read this after the Stage 2b dispatch.
+    folded_into_buffer: vk::Buffer,
+    folded_into_memory: vk::DeviceMemory,
+    // Task 12b will read this pointer to retrieve the folded_into array.
+    #[allow(dead_code)]
+    folded_into_ptr: *mut u32,
+
     descriptor_pool: vk::DescriptorPool,
     prev_image: Option<PrevFrame>,
 
@@ -755,13 +776,15 @@ impl GpuFrameProcessor {
         let palrle_indirect_args_pipeline = palrle_indirect_args_pipelines[0];
 
         // --- Descriptor pool ---
-        // 6 sets: SAD (2 STORAGE_IMAGE + 1 STORAGE_BUFFER)
+        // 8 sets: SAD (2 STORAGE_IMAGE + 1 STORAGE_BUFFER)
         //       + NV12 (1 STORAGE_IMAGE + 1 STORAGE_BUFFER)
         //       + Analysis (1 STORAGE_IMAGE + 1 STORAGE_BUFFER)
         //       + palrle_compact (4 STORAGE_BUFFER)
         //       + palrle_indirect_args (2 STORAGE_BUFFER)
         //       + palette_fold (6 STORAGE_BUFFER)
-        // Total: 4 STORAGE_IMAGE, 15 STORAGE_BUFFER, 6 max_sets.
+        //       + palette_subset_fold_init (1 STORAGE_BUFFER)
+        //       + palette_subset_fold (3 STORAGE_BUFFER)
+        // Total: 4 STORAGE_IMAGE, 19 STORAGE_BUFFER, 8 max_sets.
         let pool_sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_IMAGE,
@@ -769,12 +792,12 @@ impl GpuFrameProcessor {
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: 15,
+                descriptor_count: 19,
             },
         ];
         let dp_ci = vk::DescriptorPoolCreateInfo::default()
             .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
-            .max_sets(6)
+            .max_sets(8)
             .pool_sizes(&pool_sizes);
         let descriptor_pool = device.create_descriptor_pool(&dp_ci, None)?;
 
@@ -1024,11 +1047,13 @@ impl GpuFrameProcessor {
 
         // --- frame_palette_set buffer ---
         // 256 PaletteEntry slots × 80 bytes = 20480 bytes.
-        // HOST_VISIBLE | HOST_COHERENT, STORAGE_BUFFER.
+        // HOST_VISIBLE | HOST_COHERENT, STORAGE_BUFFER | TRANSFER_DST.
+        // TRANSFER_DST allows Task 12b to zero-fill between frames via
+        // cmd_fill_buffer so Stage 2b can safely check count == 0 per slot.
         let frame_palette_set_size = (256 * std::mem::size_of::<FramePaletteEntryRaw>()) as vk::DeviceSize;
         let frame_palette_set_buf_ci = vk::BufferCreateInfo::default()
             .size(frame_palette_set_size)
-            .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+            .usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let frame_palette_set_buffer = device.create_buffer(&frame_palette_set_buf_ci, None)?;
         let frame_palette_set_reqs =
@@ -1148,6 +1173,147 @@ impl GpuFrameProcessor {
             vk::MemoryMapFlags::empty(),
         )? as *mut u8;
 
+        // --- palette_subset_fold_init shader module ---
+        let palette_subset_fold_init_spv =
+            include_bytes!("shaders/palette_subset_fold_init.spv");
+        let palette_subset_fold_init_spv_words = ash::util::read_spv(&mut std::io::Cursor::new(
+            palette_subset_fold_init_spv.as_slice(),
+        ))?;
+        let palette_subset_fold_init_shader_ci =
+            vk::ShaderModuleCreateInfo::default().code(&palette_subset_fold_init_spv_words);
+        let palette_subset_fold_init_shader_module =
+            device.create_shader_module(&palette_subset_fold_init_shader_ci, None)?;
+
+        // --- palette_subset_fold_init descriptor set layout ---
+        // binding 0: STORAGE_BUFFER (FoldedInto)
+        let palette_subset_fold_init_bindings = [vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)];
+        let palette_subset_fold_init_dsl_ci = vk::DescriptorSetLayoutCreateInfo::default()
+            .bindings(&palette_subset_fold_init_bindings);
+        let palette_subset_fold_init_descriptor_set_layout =
+            device.create_descriptor_set_layout(&palette_subset_fold_init_dsl_ci, None)?;
+
+        // --- palette_subset_fold_init pipeline layout (no push constants) ---
+        let palette_subset_fold_init_pipeline_layout_ci = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(std::slice::from_ref(
+                &palette_subset_fold_init_descriptor_set_layout,
+            ));
+        let palette_subset_fold_init_pipeline_layout =
+            device.create_pipeline_layout(&palette_subset_fold_init_pipeline_layout_ci, None)?;
+
+        // --- palette_subset_fold_init compute pipeline ---
+        let palette_subset_fold_init_stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(palette_subset_fold_init_shader_module)
+            .name(entry_name);
+        let palette_subset_fold_init_compute_ci = vk::ComputePipelineCreateInfo::default()
+            .stage(palette_subset_fold_init_stage)
+            .layout(palette_subset_fold_init_pipeline_layout);
+        let palette_subset_fold_init_pipelines = device
+            .create_compute_pipelines(
+                vk::PipelineCache::null(),
+                &[palette_subset_fold_init_compute_ci],
+                None,
+            )
+            .map_err(|(_, e)| e)?;
+        let palette_subset_fold_init_pipeline = palette_subset_fold_init_pipelines[0];
+
+        // --- palette_subset_fold shader module ---
+        let palette_subset_fold_spv = include_bytes!("shaders/palette_subset_fold.spv");
+        let palette_subset_fold_spv_words = ash::util::read_spv(&mut std::io::Cursor::new(
+            palette_subset_fold_spv.as_slice(),
+        ))?;
+        let palette_subset_fold_shader_ci =
+            vk::ShaderModuleCreateInfo::default().code(&palette_subset_fold_spv_words);
+        let palette_subset_fold_shader_module =
+            device.create_shader_module(&palette_subset_fold_shader_ci, None)?;
+
+        // --- palette_subset_fold descriptor set layout ---
+        // binding 0: STORAGE_BUFFER (FramePaletteSet, read-only)
+        // binding 1: STORAGE_BUFFER (FramePaletteSetCount, read-only)
+        // binding 2: STORAGE_BUFFER (FoldedInto, read-write)
+        let palette_subset_fold_bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        ];
+        let palette_subset_fold_dsl_ci = vk::DescriptorSetLayoutCreateInfo::default()
+            .bindings(&palette_subset_fold_bindings);
+        let palette_subset_fold_descriptor_set_layout =
+            device.create_descriptor_set_layout(&palette_subset_fold_dsl_ci, None)?;
+
+        // --- palette_subset_fold pipeline layout (no push constants) ---
+        let palette_subset_fold_pipeline_layout_ci = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(std::slice::from_ref(
+                &palette_subset_fold_descriptor_set_layout,
+            ));
+        let palette_subset_fold_pipeline_layout =
+            device.create_pipeline_layout(&palette_subset_fold_pipeline_layout_ci, None)?;
+
+        // --- palette_subset_fold compute pipeline ---
+        let palette_subset_fold_stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(palette_subset_fold_shader_module)
+            .name(entry_name);
+        let palette_subset_fold_compute_ci = vk::ComputePipelineCreateInfo::default()
+            .stage(palette_subset_fold_stage)
+            .layout(palette_subset_fold_pipeline_layout);
+        let palette_subset_fold_pipelines = device
+            .create_compute_pipelines(
+                vk::PipelineCache::null(),
+                &[palette_subset_fold_compute_ci],
+                None,
+            )
+            .map_err(|(_, e)| e)?;
+        let palette_subset_fold_pipeline = palette_subset_fold_pipelines[0];
+
+        // --- folded_into buffer ---
+        // 256 slots × 4 bytes = 1024 bytes. HOST_VISIBLE | HOST_COHERENT,
+        // STORAGE_BUFFER | TRANSFER_DST. Persistently mapped for CPU readback
+        // (Task 12b+). The init shader writes the initial sentinel values each
+        // frame before the fold dispatch.
+        let folded_into_size = 256_u64 * 4;
+        let folded_into_buf_ci = vk::BufferCreateInfo::default()
+            .size(folded_into_size)
+            .usage(
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            )
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let folded_into_buffer = device.create_buffer(&folded_into_buf_ci, None)?;
+        let folded_into_reqs = device.get_buffer_memory_requirements(folded_into_buffer);
+        let folded_into_mem_type = find_memory_type(
+            &mem_props,
+            folded_into_reqs.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )
+        .ok_or("no host-visible memory type for folded_into buffer")?;
+        let folded_into_alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(folded_into_reqs.size)
+            .memory_type_index(folded_into_mem_type);
+        let folded_into_memory = device.allocate_memory(&folded_into_alloc, None)?;
+        device.bind_buffer_memory(folded_into_buffer, folded_into_memory, 0)?;
+        let folded_into_ptr = device.map_memory(
+            folded_into_memory,
+            0,
+            folded_into_size,
+            vk::MemoryMapFlags::empty(),
+        )? as *mut u32;
+
         Ok(Self {
             _entry: entry,
             instance,
@@ -1202,6 +1368,17 @@ impl GpuFrameProcessor {
             per_tile_frame_palette_id_buffer,
             per_tile_frame_palette_id_memory,
             per_tile_frame_palette_id_ptr,
+            palette_subset_fold_init_shader_module,
+            palette_subset_fold_init_pipeline,
+            palette_subset_fold_init_pipeline_layout,
+            palette_subset_fold_init_descriptor_set_layout,
+            palette_subset_fold_shader_module,
+            palette_subset_fold_pipeline,
+            palette_subset_fold_pipeline_layout,
+            palette_subset_fold_descriptor_set_layout,
+            folded_into_buffer,
+            folded_into_memory,
+            folded_into_ptr,
             descriptor_pool,
             prev_image: None,
             sad_buffer,
@@ -2966,6 +3143,35 @@ impl Drop for GpuFrameProcessor {
             );
             self.device
                 .destroy_shader_module(self.palette_fold_shader_module, None);
+
+            // palette_subset_fold_init pipeline
+            self.device
+                .destroy_pipeline(self.palette_subset_fold_init_pipeline, None);
+            self.device
+                .destroy_pipeline_layout(self.palette_subset_fold_init_pipeline_layout, None);
+            self.device.destroy_descriptor_set_layout(
+                self.palette_subset_fold_init_descriptor_set_layout,
+                None,
+            );
+            self.device
+                .destroy_shader_module(self.palette_subset_fold_init_shader_module, None);
+
+            // palette_subset_fold pipeline
+            self.device
+                .destroy_pipeline(self.palette_subset_fold_pipeline, None);
+            self.device
+                .destroy_pipeline_layout(self.palette_subset_fold_pipeline_layout, None);
+            self.device.destroy_descriptor_set_layout(
+                self.palette_subset_fold_descriptor_set_layout,
+                None,
+            );
+            self.device
+                .destroy_shader_module(self.palette_subset_fold_shader_module, None);
+
+            // folded_into buffer
+            self.device.unmap_memory(self.folded_into_memory);
+            self.device.destroy_buffer(self.folded_into_buffer, None);
+            self.device.free_memory(self.folded_into_memory, None);
 
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_device(None);

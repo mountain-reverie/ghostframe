@@ -1,0 +1,73 @@
+// palette_subset_fold.comp
+// Stage 2b: detect palette A ⊆ palette B and arrange A's tiles to use B.
+//
+// Dispatch: vkCmdDispatch(256, 1, 1) — one workgroup per slot (256 workgroups).
+// Workgroups whose slot is empty (count == 0) early-out.
+// 256 threads per workgroup, one per candidate superset B;
+// threads whose b_id slot is empty also early-out.
+
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+struct PaletteEntry {
+    uint count;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+    uint colors[16];
+};
+layout(binding = 0, std430) readonly buffer FramePaletteSet {
+    PaletteEntry frame_palettes[];
+};
+
+layout(binding = 1, std430) readonly buffer FramePaletteSetCount {
+    uint frame_palette_count;
+};
+
+layout(binding = 2, std430) buffer FoldedInto {
+    uint folded_into[]; // 256 entries: encoded as (255 - count_B) << 8 | id_B
+};
+
+bool is_subset(uint a_pal_id, uint b_pal_id) {
+    uint cnt_a = frame_palettes[a_pal_id].count;
+    uint cnt_b = frame_palettes[b_pal_id].count;
+    if (cnt_b < cnt_a) return false;
+
+    // Linear sorted-set inclusion: walk both in ascending order.
+    uint i = 0u;
+    uint j = 0u;
+    while (i < cnt_a && j < cnt_b) {
+        uint a = frame_palettes[a_pal_id].colors[i];
+        uint b = frame_palettes[b_pal_id].colors[j];
+        if (a == b) {
+            i++; j++;
+        } else if (a < b) {
+            // a not in b → not subset
+            return false;
+        } else {
+            j++;
+        }
+    }
+    return i == cnt_a;
+}
+
+void main() {
+    uint a_id = gl_WorkGroupID.x;
+    // Early-out: if A slot is empty, skip.
+    if (frame_palettes[a_id].count == 0u) return;
+
+    uint b_id = gl_LocalInvocationID.x;
+    if (frame_palettes[b_id].count == 0u) return;
+    if (b_id == a_id) return;
+
+    uint cnt_a = frame_palettes[a_id].count;
+    uint cnt_b = frame_palettes[b_id].count;
+    if (cnt_b < cnt_a) return; // can't be a superset
+
+    if (is_subset(a_id, b_id)) {
+        // Encode tiebreaker: larger count wins (lower key), then lower id.
+        uint key = ((255u - cnt_b) << 8u) | b_id;
+        atomicMin(folded_into[a_id], key);
+    }
+}

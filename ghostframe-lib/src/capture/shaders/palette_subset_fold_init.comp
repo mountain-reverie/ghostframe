@@ -1,0 +1,15 @@
+// palette_subset_fold_init.comp
+// Initializes folded_into[i] = (255 << 8) | i for every slot.
+// Dispatch: 1 workgroup, 256 threads.
+
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0, std430) buffer FoldedInto {
+    uint folded_into[];
+};
+
+void main() {
+    uint i = gl_LocalInvocationID.x;
+    folded_into[i] = (255u << 8u) | i;
+}
