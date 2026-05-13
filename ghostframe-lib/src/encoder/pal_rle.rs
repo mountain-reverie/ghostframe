@@ -187,6 +187,32 @@ impl PaletteTable {
         }
         None
     }
+
+    /// Per-design Section 2 — the 4-way allocation ladder.
+    /// Returns the slot id on success; `None` if every slot is `Held`
+    /// or `FreeButCached` with no overwrite-eligible candidate.
+    pub fn acquire_or_allocate(&mut self, palette: &PaletteEntry) -> Option<u8> {
+        // 1. find_matching → reuse
+        if let Some(id) = self.find_matching(palette) {
+            self.acquire(id);
+            return Some(id);
+        }
+        // 2. find_eligible_free_slot → overwrite
+        if let Some(id) = self.find_eligible_free_slot() {
+            self.write_bytes(id, palette);
+            // write_bytes already cleared delivered & in_flight; slot is Held with rc=0.
+            self.ref_count[id as usize] = 1;
+            return Some(id);
+        }
+        // 3. find_empty_slot → write
+        if let Some(id) = self.find_empty_slot() {
+            self.write_bytes(id, palette);
+            self.ref_count[id as usize] = 1;
+            return Some(id);
+        }
+        // 4. fail
+        None
+    }
 }
 
 impl Default for PaletteTable {
@@ -417,5 +443,66 @@ mod tests {
         t.delivered.insert(13);
         t.free_lru.push_back(13);
         assert_eq!(t.find_eligible_free_slot(), Some(13));
+    }
+
+    #[test]
+    fn acquire_or_allocate_returns_match_when_present() {
+        let mut t = PaletteTable::new();
+        let p = make_palette(&[[1, 2, 3, 255]]);
+        t.entries[42] = Some(p);
+        t.slot_state[42] = SlotState::FreeButCached;
+        let id = t.acquire_or_allocate(&p).unwrap();
+        assert_eq!(id, 42);
+        assert_eq!(t.slot_state[42], SlotState::Held);
+        assert_eq!(t.ref_count[42], 1);
+    }
+
+    #[test]
+    fn acquire_or_allocate_uses_eligible_free_slot_when_no_match() {
+        let mut t = PaletteTable::new();
+        // Pre-populate slot 9 with a different palette, FreeButCached + delivered.
+        let old = make_palette(&[[1, 2, 3, 255]]);
+        t.entries[9] = Some(old);
+        t.slot_state[9] = SlotState::FreeButCached;
+        t.delivered.insert(9);
+        t.free_lru.push_back(9);
+
+        // Mark all earlier slots as Held so find_empty_slot returns one >= 10
+        // and the 4-way ladder picks step 2 (find_eligible_free_slot).
+        for id in 0..9 {
+            t.slot_state[id] = SlotState::Held;
+            t.entries[id] = Some(make_palette(&[[id as u8, 7, 7, 255]]));
+        }
+        // Slots 10..256 are Empty; find_empty would normally return 10.
+        // But ladder step 2 fires before step 3 — so slot 9 wins.
+        let new_pal = make_palette(&[[99, 99, 99, 255]]);
+        let id = t.acquire_or_allocate(&new_pal).unwrap();
+        assert_eq!(id, 9);
+        assert_eq!(t.entries[9], Some(new_pal));
+        assert!(!t.delivered.contains(9));
+    }
+
+    #[test]
+    fn acquire_or_allocate_uses_empty_slot_when_no_match_no_eligible() {
+        let mut t = PaletteTable::new();
+        let p = make_palette(&[[5, 5, 5, 255]]);
+        let id = t.acquire_or_allocate(&p).unwrap();
+        assert_eq!(id, 0); // first empty
+        assert_eq!(t.entries[0], Some(p));
+        assert_eq!(t.slot_state[0], SlotState::Held);
+        assert_eq!(t.ref_count[0], 1);
+    }
+
+    #[test]
+    fn acquire_or_allocate_returns_none_when_full_and_all_ineligible() {
+        let mut t = PaletteTable::new();
+        for id in 0..PALETTE_TABLE_SLOTS {
+            let p = make_palette(&[[id as u8, 0, 0, 255]]);
+            t.entries[id] = Some(p);
+            t.slot_state[id] = SlotState::Held;
+            t.ref_count[id] = 1;
+        }
+        let new_pal = make_palette(&[[200, 200, 200, 255]]);
+        assert_eq!(t.acquire_or_allocate(&new_pal), None);
     }
 }
