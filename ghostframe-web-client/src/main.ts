@@ -4,8 +4,10 @@ import {
   FRAME_HEADER_SIZE, TILE_DATAGRAM_FLAG, FrameAssembly,
   isTileDatagram, decodeFrameHeader, frameKey, FullFrameDecoder,
   FRAME_DIMENSIONS_SENTINEL_X, FRAME_DIMENSIONS_SENTINEL_Y,
-} from './decoder';
-import { TileRenderer } from './renderer';
+  decodePalRle, PalRleDecodeError,
+} from './decoder.js';
+import { TileRenderer } from './renderer.js';
+import { PaletteCache } from './palette.js';
 import { ParityRecovery } from './fec';
 import { LossTracker } from './feedback';
 import { AckBatcher } from './ack';
@@ -45,6 +47,10 @@ async function main() {
 
   log(`Connecting to ${wtUrl}...`);
 
+  // Per-session palette storage for PalRle codec — declared early so the
+  // transport.closed callback (registered below) can close over it safely.
+  const paletteCache = new PaletteCache();
+
   let transport: WebTransport;
   if (certHash) {
     transport = new WebTransport(wtUrl, {
@@ -56,8 +62,14 @@ async function main() {
 
   // Log close reason if the connection fails before ready.
   transport.closed.then(
-    (info) => log(`Transport closed: code=${info.closeCode} reason=${info.reason}`),
-    (err) => log(`Transport closed with error: ${err}`)
+    (info) => {
+      log(`Transport closed: code=${info.closeCode} reason=${info.reason}`);
+      paletteCache.clear();
+    },
+    (err) => {
+      log(`Transport closed with error: ${err}`);
+      paletteCache.clear();
+    }
   );
 
   await transport.ready;
@@ -191,6 +203,17 @@ async function main() {
       // 4-byte BGRA payload.
       if (payload.byteLength === 4) {
         renderer.drawSolidTile(tX, tY, payload);
+      }
+    } else if (asm.header.codec === Codec.PalRle) {
+      try {
+        const { bgra } = decodePalRle(payload, paletteCache);
+        renderer.drawPalRleTile(tX, tY, bgra);
+      } catch (e) {
+        if (e instanceof PalRleDecodeError) {
+          console.warn("[palrle]", e.message);
+        } else {
+          throw e;
+        }
       }
     }
 

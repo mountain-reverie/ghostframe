@@ -71,22 +71,23 @@ export class TileRenderer {
     this.ctx.fillStyle = `rgb(${r}, ${g}, ${b})`;
     this.ctx.fillRect(px, py, TILE_SIZE, TILE_SIZE);
   }
-}
 
-export function drawPalRleTile(
-    ctx: CanvasRenderingContext2D,
-    tileX: number,
-    tileY: number,
-    bgra: Uint8ClampedArray,
-): void {
+  /**
+   * Draw a PalRle-codec tile. The decoded pixel data is BGRA; swap to RGBA
+   * for ImageData per project convention.
+   */
+  drawPalRleTile(tileX: number, tileY: number, bgra: Uint8ClampedArray) {
+    const px = tileX * TILE_SIZE;
+    const py = tileY * TILE_SIZE;
     // ImageData expects RGBA in browsers; decoder emits BGRA. Swap per pixel.
     const rgba = new Uint8ClampedArray(bgra.length);
     for (let i = 0; i < bgra.length; i += 4) {
-        rgba[i]     = bgra[i + 2]; // R from B-slot
-        rgba[i + 1] = bgra[i + 1]; // G
-        rgba[i + 2] = bgra[i];     // B from R-slot
-        rgba[i + 3] = bgra[i + 3]; // A
+      rgba[i]     = bgra[i + 2]; // R from B-slot
+      rgba[i + 1] = bgra[i + 1]; // G
+      rgba[i + 2] = bgra[i];     // B from R-slot
+      rgba[i + 3] = bgra[i + 3]; // A
     }
-    const imageData = new ImageData(rgba, 32, 32);
-    ctx.putImageData(imageData, tileX * 32, tileY * 32);
+    const imageData = new ImageData(rgba, TILE_SIZE, TILE_SIZE);
+    this.ctx.putImageData(imageData, px, py);
+  }
 }
