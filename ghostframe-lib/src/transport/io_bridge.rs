@@ -27,6 +27,8 @@ use tokio::net::UnixStream as TokioUnixStream;
 use tokio::sync::mpsc;
 use tokio::time::{sleep_until, Instant as TokioInstant};
 
+use rayon::prelude::*;
+
 use crate::capture::gpu_pipeline::GpuFrameProcessor;
 use crate::encoder::h264_vaapi::FullFrameEncoder;
 use crate::server::FrameSubmission;
@@ -260,6 +262,11 @@ impl IoBridge {
         if gpu_frame_processor.is_some() {
             tracing::info!("GPU dirty tracker initialized (Vulkan compute SAD)");
         }
+
+        // Warm rayon's global thread pool so the first PalRLE-heavy frame
+        // doesn't pay thread-spin-up latency on the hot path (design Section 4).
+        rayon::iter::IntoParallelIterator::into_par_iter(0..1u32)
+            .for_each(|_| {});
 
         Ok(Self {
             _handle: Some(handle),
@@ -1198,6 +1205,11 @@ impl IoBridge {
     /// `_handle` is `None` and no `gbridge_close` is called on Drop.
     #[cfg(test)]
     pub(crate) fn new_with_stream_for_test(stream: TokioUnixStream, server: QuicServer) -> Self {
+        // Warm rayon's global thread pool so the first PalRLE-heavy frame
+        // doesn't pay thread-spin-up latency on the hot path (design Section 4).
+        rayon::iter::IntoParallelIterator::into_par_iter(0..1u32)
+            .for_each(|_| {});
+
         IoBridge {
             _handle: None,
             stream,
@@ -1234,6 +1246,11 @@ impl IoBridge {
         server: QuicServer,
         frame_rx: mpsc::Receiver<FrameSubmission>,
     ) -> Self {
+        // Warm rayon's global thread pool so the first PalRLE-heavy frame
+        // doesn't pay thread-spin-up latency on the hot path (design Section 4).
+        rayon::iter::IntoParallelIterator::into_par_iter(0..1u32)
+            .for_each(|_| {});
+
         IoBridge {
             _handle: None,
             stream,
