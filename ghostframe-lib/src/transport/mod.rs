@@ -1,4 +1,5 @@
 pub mod ack;
+pub mod client_caps;
 pub mod fec;
 pub mod feedback;
 pub mod ghostbridge;
