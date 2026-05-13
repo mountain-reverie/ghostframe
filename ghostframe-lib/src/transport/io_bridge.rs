@@ -900,6 +900,40 @@ impl IoBridge {
 
                 let grid = TileGrid::new(frame.width, frame.height);
 
+                // Phase A — serial palette-table allocation per dirty PalRle-feasible tile.
+                let cols = grid.cols;
+                let palrle_compact_count = analysis.palrle_compact_count;
+                let preps = self.phase_a_palette_allocation(
+                    cols,
+                    analysis.palrle_compact_list_slice(),
+                    // per_tile_frame_palette_id is a *const u8 with length = compact_count
+                    if palrle_compact_count > 0 && !analysis.per_tile_frame_palette_id.is_null() {
+                        unsafe {
+                            std::slice::from_raw_parts(
+                                analysis.per_tile_frame_palette_id,
+                                palrle_compact_count as usize,
+                            )
+                        }
+                    } else {
+                        &[]
+                    },
+                    analysis.folded_into_slice(),
+                    analysis.frame_palette_set_slice(),
+                    if palrle_compact_count > 0 && !analysis.index_buffer.is_null() {
+                        unsafe {
+                            std::slice::from_raw_parts(
+                                analysis.index_buffer,
+                                (palrle_compact_count * 512) as usize,
+                            )
+                        }
+                    } else {
+                        &[]
+                    },
+                );
+
+                // Phase B — rayon parallel encode.
+                let mut palrle_payloads = IoBridge::phase_b_encode_payloads(&preps);
+
                 self.dispatch_dirty_tiles_via_scheduler(
                     &dirty_xy,
                     &grid,
@@ -909,8 +943,18 @@ impl IoBridge {
                     frame.timestamp_us,
                     max_frag,
                     SchedulerEmissionPolicy::GpuClassifierDriven,
-                    None,
+                    Some(&mut palrle_payloads),
                 );
+
+                // Frame stats — emit per design Section 4.
+                tracing::debug!(
+                    target: "palrle.frame",
+                    reused_or_allocated = self.palette_table.stats_frame.reused_or_allocated,
+                    fell_back_to_raw = self.palette_table.stats_frame.fell_back_to_raw,
+                    unique_frame_palettes = analysis.frame_palette_set_count,
+                    "palrle frame stats"
+                );
+                self.palette_table.stats_frame = Default::default();
             }
         }
     }
