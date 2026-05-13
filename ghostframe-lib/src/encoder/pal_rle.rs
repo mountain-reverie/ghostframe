@@ -173,9 +173,9 @@ impl PaletteTable {
         None
     }
 
-    /// Oldest FreeButCached slot that passes `overwrite_eligible`.
-    /// Drains ineligible front entries (they stay in free_lru in case they
-    /// become eligible later via ACK).
+    /// Oldest FreeButCached slot that passes `overwrite_eligible`, in LRU
+    /// age order. Ineligible entries are skipped but not removed — they may
+    /// become eligible later when their in-flight ACK arrives.
     pub fn find_eligible_free_slot(&self) -> Option<u8> {
         // We walk in age order without mutating self — find first hit.
         for &id in &self.free_lru {
