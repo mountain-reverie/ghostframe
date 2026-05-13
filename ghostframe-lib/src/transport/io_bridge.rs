@@ -402,6 +402,7 @@ impl IoBridge {
         timestamp_us: u32,
         max_frag: usize,
         policy: SchedulerEmissionPolicy,
+        mut palrle_payloads: Option<&mut std::collections::HashMap<(u32, u32), Vec<u8>>>,
     ) {
         // Grid sync — keep scheduler in lockstep with the dirty-detection grid.
         if self.scheduler.cols() != grid.cols || self.scheduler.rows() != grid.rows {
@@ -435,6 +436,17 @@ impl IoBridge {
                         CodecState::Solid => {
                             let solid = crate::encoder::solid::encode_solid(&tile_data);
                             (Codec::Solid, solid.to_vec())
+                        }
+                        CodecState::PalRle { .. } => {
+                            let payload = if let Some(m) = palrle_payloads.as_mut() {
+                                m.remove(&(tile_x, tile_y))
+                            } else {
+                                None
+                            };
+                            match payload {
+                                Some(p) => (Codec::PalRle, p),
+                                None => (Codec::Raw, tile_data), // table-full fallback or no GPU prep
+                            }
                         }
                         _ => (Codec::Raw, tile_data),
                     }
@@ -624,6 +636,7 @@ impl IoBridge {
             frame.timestamp_us,
             max_frag,
             SchedulerEmissionPolicy::CpuRawOnly,
+            None,
         );
     }
 
@@ -896,6 +909,7 @@ impl IoBridge {
                     frame.timestamp_us,
                     max_frag,
                     SchedulerEmissionPolicy::GpuClassifierDriven,
+                    None,
                 );
             }
         }
@@ -1774,6 +1788,7 @@ mod tests {
             /* timestamp_us */ 0,
             /* max_frag */ 1200,
             SchedulerEmissionPolicy::CpuRawOnly,
+            None,
         );
 
         let queued = bridge.scheduler.peek_for_test();
@@ -1852,6 +1867,7 @@ mod tests {
             0,
             1200,
             SchedulerEmissionPolicy::GpuClassifierDriven,
+            None,
         );
 
         let queued = bridge.scheduler.peek_for_test();
