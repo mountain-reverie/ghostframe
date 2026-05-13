@@ -118,6 +118,9 @@ pub struct IoBridge {
     /// QUIC slow-start can only deliver a fraction of tiles in the first burst;
     /// forcing dirty for several frames lets the congestion window open.
     force_dirty_frames: u32,
+    /// Persistent palette table for PalRLE codec emission. M3.2a single-client
+    /// invariant — flat server-wide state.
+    pub(crate) palette_table: crate::encoder::pal_rle::PaletteTable,
     /// FEC parity group size. 0 = disabled.
     fec_k: usize,
     /// Loss rate threshold to enable FEC (0.005 = 0.5%).
@@ -276,6 +279,7 @@ impl IoBridge {
             #[cfg(any(test, feature = "test-loss-injection"))]
             inbound_loss: Self::loss_injector_from_env("INBOUND"),
             force_dirty_frames: 0,
+            palette_table: crate::encoder::pal_rle::PaletteTable::new(),
             fec_k: std::env::var("GHOSTFRAME_FEC_K")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
@@ -1094,6 +1098,7 @@ impl IoBridge {
                             self.metrics_tracker.reset();
                             self.classifier.reset();
                             self.scheduler.clear();
+                            self.palette_table.on_session_reset();
                             self.frame_mode = crate::tile::FrameMode::H264;
                             // Re-prime the frame-dimensions retransmit counter so
                             // the new client receives the sentinel on its first
@@ -1211,6 +1216,7 @@ impl IoBridge {
             #[cfg(any(test, feature = "test-loss-injection"))]
             inbound_loss: None,
             force_dirty_frames: 0,
+            palette_table: crate::encoder::pal_rle::PaletteTable::new(),
             fec_k: 0,
             fec_enable_threshold: FEC_ENABLE_THRESHOLD,
             fec_disable_threshold: FEC_DISABLE_THRESHOLD,
@@ -1246,6 +1252,7 @@ impl IoBridge {
             #[cfg(any(test, feature = "test-loss-injection"))]
             inbound_loss: None,
             force_dirty_frames: 0,
+            palette_table: crate::encoder::pal_rle::PaletteTable::new(),
             fec_k: 0,
             fec_enable_threshold: FEC_ENABLE_THRESHOLD,
             fec_disable_threshold: FEC_DISABLE_THRESHOLD,
@@ -1796,6 +1803,41 @@ mod tests {
         assert!(
             tracker.get(1, 0).edge_density.is_nan(),
             "non-dirty tile untouched"
+        );
+    }
+
+    /// Verify that `IoBridge` constructors initialize `palette_table` to an
+    /// all-empty state. M3.2a: palette state is per-server, so a fresh bridge
+    /// must start with no allocated slots.
+    #[tokio::test]
+    async fn io_bridge_constructs_with_empty_palette_table() {
+        let (our_end, _peer) = UnixStream::pair().expect("UnixStream::pair failed");
+        let server = QuicServer::new().expect("QuicServer::new failed");
+        let bridge = IoBridge::new_with_stream_for_test(our_end, server);
+
+        for id in 0..crate::encoder::pal_rle::PALETTE_TABLE_SLOTS {
+            assert_eq!(
+                bridge.palette_table.slot_state[id],
+                crate::encoder::pal_rle::SlotState::Empty,
+                "slot {id} must start Empty"
+            );
+            assert!(
+                bridge.palette_table.entries[id].is_none(),
+                "slot {id} entries must start None"
+            );
+            assert_eq!(
+                bridge.palette_table.ref_count[id], 0,
+                "slot {id} ref_count must start 0"
+            );
+        }
+        // Spot-check that the delivered bitset contains no ids.
+        assert!(
+            !bridge.palette_table.delivered.contains(0),
+            "delivered[0] must start false"
+        );
+        assert!(
+            !bridge.palette_table.delivered.contains(255),
+            "delivered[255] must start false"
         );
     }
 }
