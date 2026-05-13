@@ -906,19 +906,10 @@ impl IoBridge {
                 let preps = self.phase_a_palette_allocation(
                     cols,
                     analysis.palrle_compact_list_slice(),
-                    // per_tile_frame_palette_id is a *const u8 with length = compact_count
-                    if palrle_compact_count > 0 && !analysis.per_tile_frame_palette_id.is_null() {
-                        unsafe {
-                            std::slice::from_raw_parts(
-                                analysis.per_tile_frame_palette_id,
-                                palrle_compact_count as usize,
-                            )
-                        }
-                    } else {
-                        &[]
-                    },
+                    analysis.per_tile_frame_palette_id_slice(),
                     analysis.folded_into_slice(),
                     analysis.frame_palette_set_slice(),
+                    // No bulk slice helper exists for index_buffer (only per-tile); keep inline.
                     if palrle_compact_count > 0 && !analysis.index_buffer.is_null() {
                         unsafe {
                             std::slice::from_raw_parts(
