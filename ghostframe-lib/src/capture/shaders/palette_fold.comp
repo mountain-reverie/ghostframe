@@ -1,0 +1,123 @@
+// palette_fold.comp
+// Stage 2a: intra-frame palette dedup. Maps each PalRLE-feasible dirty tile
+// to a frame_palette_set slot via open-addressed atomic hash table.
+//
+// Dispatch: vkCmdDispatchIndirect(palrle_indirect_dispatch_args), one
+// workgroup per compact slot. 16 threads per workgroup (only thread 0 does
+// the meaningful work; others idle).
+
+#version 450
+
+layout(local_size_x = 16, local_size_y = 1, local_size_z = 1) in;
+
+struct TileAnalysis {
+    uint  count;
+    uint  edge_density_thou;
+    uint  _pad0;
+    uint  _pad1;
+    uint  colors[16];
+};
+
+layout(binding = 0, std430) readonly buffer AnalysisInput {
+    TileAnalysis tiles[];
+};
+
+layout(binding = 1, std430) readonly buffer CompactList {
+    uint compact_list[];
+};
+
+struct PaletteEntry {
+    uint count;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+    uint colors[16];
+};
+layout(binding = 2, std430) buffer FramePaletteSet {
+    PaletteEntry frame_palettes[]; // 256 entries pre-allocated
+};
+
+layout(binding = 3, std430) buffer FramePaletteSetCount {
+    uint frame_palette_count;
+};
+
+// Hash slot table: slot[i] = (hash<<16 | frame_palette_id+1)   0 means empty.
+layout(binding = 4, std430) buffer HashTable {
+    uint hash_slots[]; // 256 entries
+};
+
+layout(binding = 5, std430) buffer PerTileFramePaletteId {
+    uint per_tile_id[]; // packed u8 per compact slot
+};
+
+// FNV-1a hash on the 16 packed colors (in canonical-sorted order).
+uint fnv1a(uint tile_idx) {
+    uint h = 2166136261u;
+    uint c = tiles[tile_idx].count;
+    for (uint i = 0u; i < c; i++) {
+        uint v = tiles[tile_idx].colors[i];
+        h ^= (v        ) & 0xFFu; h *= 16777619u;
+        h ^= (v >>  8u) & 0xFFu; h *= 16777619u;
+        h ^= (v >> 16u) & 0xFFu; h *= 16777619u;
+        h ^= (v >> 24u) & 0xFFu; h *= 16777619u;
+    }
+    return h;
+}
+
+bool palettes_equal(uint tile_idx, uint pal_idx) {
+    uint c = tiles[tile_idx].count;
+    if (frame_palettes[pal_idx].count != c) return false;
+    for (uint i = 0u; i < c; i++) {
+        if (tiles[tile_idx].colors[i] != frame_palettes[pal_idx].colors[i]) return false;
+    }
+    return true;
+}
+
+const uint PROBE_BUDGET = 16u;
+const uint SENTINEL = 0xFFu;
+
+// Write a u8 into packed per_tile_id buffer (4 u8s per u32, little-endian).
+void write_per_tile_id(uint c_slot, uint id) {
+    uint word_idx = c_slot >> 2u;
+    uint shift = (c_slot & 3u) * 8u;
+    uint mask = 0xFFu << shift;
+    // We use atomicOr — caller guarantees one writer per c_slot, but we
+    // need to be safe against the simultaneous writes to other shifts in
+    // the same word from other workgroups.
+    atomicAnd(per_tile_id[word_idx], ~mask);
+    atomicOr(per_tile_id[word_idx], (id & 0xFFu) << shift);
+}
+
+void main() {
+    if (gl_LocalInvocationID.x != 0u) return;
+
+    uint c_slot = gl_WorkGroupID.x;
+    uint tile_idx = compact_list[c_slot];
+    uint h = fnv1a(tile_idx);
+
+    for (uint probe = 0u; probe < PROBE_BUDGET; probe++) {
+        uint slot = (h + probe) & 0xFFu;
+        uint expected = 0u;
+        uint desired = (h & 0xFFFF0000u) | (slot + 1u);
+        uint prev = atomicCompSwap(hash_slots[slot], expected, desired);
+        if (prev == 0u) {
+            // We claimed it. Write our palette bytes.
+            uint cnt = tiles[tile_idx].count;
+            frame_palettes[slot].count = cnt;
+            for (uint i = 0u; i < cnt; i++) {
+                frame_palettes[slot].colors[i] = tiles[tile_idx].colors[i];
+            }
+            atomicMax(frame_palette_count, slot + 1u);
+            write_per_tile_id(c_slot, slot);
+            return;
+        }
+        if ((prev & 0xFFFF0000u) == (h & 0xFFFF0000u)) {
+            if (palettes_equal(tile_idx, slot)) {
+                write_per_tile_id(c_slot, slot);
+                return;
+            }
+        }
+    }
+    // Probe budget exhausted → sentinel.
+    write_per_tile_id(c_slot, SENTINEL);
+}

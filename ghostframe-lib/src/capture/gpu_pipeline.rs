@@ -120,6 +120,16 @@ pub struct TileAnalysis {
     pub colors: [u32; 16],
 }
 
+/// std430 mirror of `palette_fold.comp` `PaletteEntry`: 80 bytes,
+/// 16-byte aligned (count + 3 pad + 16 packed BGRA colors).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FramePaletteEntryRaw {
+    pub count: u32,
+    pub _pad: [u32; 3],
+    pub colors: [u32; 16],
+}
+
 /// Result of [`GpuFrameProcessor::process_frame`].
 pub struct FrameAnalysis {
     /// Flat tile indices of tiles that changed since the previous frame.
@@ -246,6 +256,34 @@ pub struct GpuFrameProcessor {
     // INDIRECT_BUFFER for vkCmdDispatchIndirect in Task 10b.
     palrle_indirect_args_buffer: vk::Buffer,
     palrle_indirect_args_memory: vk::DeviceMemory,
+
+    // palette_fold pipeline (Stage 2a)
+    palette_fold_shader_module: vk::ShaderModule,
+    palette_fold_pipeline: vk::Pipeline,
+    palette_fold_pipeline_layout: vk::PipelineLayout,
+    palette_fold_descriptor_set_layout: vk::DescriptorSetLayout,
+    // HOST_VISIBLE | HOST_COHERENT, 256 * 80 = 20480 bytes. Persistently mapped.
+    frame_palette_set_buffer: vk::Buffer,
+    frame_palette_set_memory: vk::DeviceMemory,
+    // Task 11b will read this pointer to retrieve per-frame palette entries.
+    #[allow(dead_code)]
+    frame_palette_set_ptr: *mut FramePaletteEntryRaw,
+    // HOST_VISIBLE | HOST_COHERENT | TRANSFER_DST, 4 bytes. Persistently mapped.
+    frame_palette_count_buffer: vk::Buffer,
+    frame_palette_count_memory: vk::DeviceMemory,
+    // Task 11b will read this pointer to retrieve the palette count.
+    #[allow(dead_code)]
+    frame_palette_count_ptr: *mut u32,
+    // HOST_VISIBLE | HOST_COHERENT | TRANSFER_DST, 256 * 4 = 1024 bytes.
+    // No persistent CPU mapping needed (Stage 2a is the only consumer).
+    hash_table_buffer: vk::Buffer,
+    hash_table_memory: vk::DeviceMemory,
+    // HOST_VISIBLE | HOST_COHERENT | TRANSFER_DST, (max_tiles+3)/4*4 bytes. Persistently mapped.
+    per_tile_frame_palette_id_buffer: vk::Buffer,
+    per_tile_frame_palette_id_memory: vk::DeviceMemory,
+    // Task 11b will read this pointer to retrieve per-tile palette IDs.
+    #[allow(dead_code)]
+    per_tile_frame_palette_id_ptr: *mut u8,
 
     descriptor_pool: vk::DescriptorPool,
     prev_image: Option<PrevFrame>,
@@ -664,12 +702,13 @@ impl GpuFrameProcessor {
         let palrle_indirect_args_pipeline = palrle_indirect_args_pipelines[0];
 
         // --- Descriptor pool ---
-        // 5 sets: SAD (2 STORAGE_IMAGE + 1 STORAGE_BUFFER)
+        // 6 sets: SAD (2 STORAGE_IMAGE + 1 STORAGE_BUFFER)
         //       + NV12 (1 STORAGE_IMAGE + 1 STORAGE_BUFFER)
         //       + Analysis (1 STORAGE_IMAGE + 1 STORAGE_BUFFER)
         //       + palrle_compact (4 STORAGE_BUFFER)
         //       + palrle_indirect_args (2 STORAGE_BUFFER)
-        // Total: 4 STORAGE_IMAGE, 9 STORAGE_BUFFER, 5 max_sets.
+        //       + palette_fold (6 STORAGE_BUFFER)
+        // Total: 4 STORAGE_IMAGE, 15 STORAGE_BUFFER, 6 max_sets.
         let pool_sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_IMAGE,
@@ -677,12 +716,12 @@ impl GpuFrameProcessor {
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: 9,
+                descriptor_count: 15,
             },
         ];
         let dp_ci = vk::DescriptorPoolCreateInfo::default()
             .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
-            .max_sets(5)
+            .max_sets(6)
             .pool_sizes(&pool_sizes);
         let descriptor_pool = device.create_descriptor_pool(&dp_ci, None)?;
 
@@ -854,6 +893,208 @@ impl GpuFrameProcessor {
         init_ptr.add(2).write(1);
         device.unmap_memory(palrle_indirect_args_memory);
 
+        // --- palette_fold shader module ---
+        let palette_fold_spv = include_bytes!("shaders/palette_fold.spv");
+        let palette_fold_spv_words =
+            ash::util::read_spv(&mut std::io::Cursor::new(palette_fold_spv.as_slice()))?;
+        let palette_fold_shader_ci =
+            vk::ShaderModuleCreateInfo::default().code(&palette_fold_spv_words);
+        let palette_fold_shader_module =
+            device.create_shader_module(&palette_fold_shader_ci, None)?;
+
+        // --- palette_fold descriptor set layout ---
+        // binding 0: STORAGE_BUFFER (tile analysis input, read-only)
+        // binding 1: STORAGE_BUFFER (compact list input, read-only)
+        // binding 2: STORAGE_BUFFER (frame_palette_set output)
+        // binding 3: STORAGE_BUFFER (frame_palette_count output)
+        // binding 4: STORAGE_BUFFER (hash_table, per-frame scratch)
+        // binding 5: STORAGE_BUFFER (per_tile_frame_palette_id output)
+        let palette_fold_bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(3)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(4)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(5)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        ];
+        let palette_fold_dsl_ci =
+            vk::DescriptorSetLayoutCreateInfo::default().bindings(&palette_fold_bindings);
+        let palette_fold_descriptor_set_layout =
+            device.create_descriptor_set_layout(&palette_fold_dsl_ci, None)?;
+
+        // --- palette_fold pipeline layout (no push constants) ---
+        let palette_fold_pipeline_layout_ci = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(std::slice::from_ref(&palette_fold_descriptor_set_layout));
+        let palette_fold_pipeline_layout =
+            device.create_pipeline_layout(&palette_fold_pipeline_layout_ci, None)?;
+
+        // --- palette_fold compute pipeline ---
+        let palette_fold_stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(palette_fold_shader_module)
+            .name(entry_name);
+        let palette_fold_compute_ci = vk::ComputePipelineCreateInfo::default()
+            .stage(palette_fold_stage)
+            .layout(palette_fold_pipeline_layout);
+        let palette_fold_pipelines = device
+            .create_compute_pipelines(
+                vk::PipelineCache::null(),
+                &[palette_fold_compute_ci],
+                None,
+            )
+            .map_err(|(_, e)| e)?;
+        let palette_fold_pipeline = palette_fold_pipelines[0];
+
+        // --- frame_palette_set buffer ---
+        // 256 PaletteEntry slots × 80 bytes = 20480 bytes.
+        // HOST_VISIBLE | HOST_COHERENT, STORAGE_BUFFER.
+        let frame_palette_set_size = (256 * std::mem::size_of::<FramePaletteEntryRaw>()) as vk::DeviceSize;
+        let frame_palette_set_buf_ci = vk::BufferCreateInfo::default()
+            .size(frame_palette_set_size)
+            .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let frame_palette_set_buffer = device.create_buffer(&frame_palette_set_buf_ci, None)?;
+        let frame_palette_set_reqs =
+            device.get_buffer_memory_requirements(frame_palette_set_buffer);
+        let frame_palette_set_mem_type = find_memory_type(
+            &mem_props,
+            frame_palette_set_reqs.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )
+        .ok_or("no host-visible memory type for frame_palette_set buffer")?;
+        let frame_palette_set_alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(frame_palette_set_reqs.size)
+            .memory_type_index(frame_palette_set_mem_type);
+        let frame_palette_set_memory = device.allocate_memory(&frame_palette_set_alloc, None)?;
+        device.bind_buffer_memory(frame_palette_set_buffer, frame_palette_set_memory, 0)?;
+        let frame_palette_set_ptr = device.map_memory(
+            frame_palette_set_memory,
+            0,
+            frame_palette_set_size,
+            vk::MemoryMapFlags::empty(),
+        )? as *mut FramePaletteEntryRaw;
+
+        // --- frame_palette_count buffer ---
+        // 4 bytes. HOST_VISIBLE | HOST_COHERENT | TRANSFER_DST (for cmd_fill_buffer zero between frames).
+        let frame_palette_count_size = 4_u64;
+        let frame_palette_count_buf_ci = vk::BufferCreateInfo::default()
+            .size(frame_palette_count_size)
+            .usage(
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            )
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let frame_palette_count_buffer =
+            device.create_buffer(&frame_palette_count_buf_ci, None)?;
+        let frame_palette_count_reqs =
+            device.get_buffer_memory_requirements(frame_palette_count_buffer);
+        let frame_palette_count_mem_type = find_memory_type(
+            &mem_props,
+            frame_palette_count_reqs.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )
+        .ok_or("no host-visible memory type for frame_palette_count buffer")?;
+        let frame_palette_count_alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(frame_palette_count_reqs.size)
+            .memory_type_index(frame_palette_count_mem_type);
+        let frame_palette_count_memory =
+            device.allocate_memory(&frame_palette_count_alloc, None)?;
+        device.bind_buffer_memory(
+            frame_palette_count_buffer,
+            frame_palette_count_memory,
+            0,
+        )?;
+        let frame_palette_count_ptr = device.map_memory(
+            frame_palette_count_memory,
+            0,
+            frame_palette_count_size,
+            vk::MemoryMapFlags::empty(),
+        )? as *mut u32;
+
+        // --- hash_table buffer ---
+        // 256 slots × 4 bytes = 1024 bytes. HOST_VISIBLE | HOST_COHERENT | TRANSFER_DST.
+        // No persistent CPU mapping needed.
+        let hash_table_size = 256_u64 * 4;
+        let hash_table_buf_ci = vk::BufferCreateInfo::default()
+            .size(hash_table_size)
+            .usage(
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            )
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let hash_table_buffer = device.create_buffer(&hash_table_buf_ci, None)?;
+        let hash_table_reqs = device.get_buffer_memory_requirements(hash_table_buffer);
+        let hash_table_mem_type = find_memory_type(
+            &mem_props,
+            hash_table_reqs.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )
+        .ok_or("no host-visible memory type for hash_table buffer")?;
+        let hash_table_alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(hash_table_reqs.size)
+            .memory_type_index(hash_table_mem_type);
+        let hash_table_memory = device.allocate_memory(&hash_table_alloc, None)?;
+        device.bind_buffer_memory(hash_table_buffer, hash_table_memory, 0)?;
+
+        // --- per_tile_frame_palette_id buffer ---
+        // (max_tiles + 3) / 4 * 4 bytes (round up to u32 alignment).
+        // HOST_VISIBLE | HOST_COHERENT | TRANSFER_DST, STORAGE_BUFFER.
+        let per_tile_id_size = (((max_tiles + 3) / 4 * 4) as vk::DeviceSize).max(4);
+        let per_tile_id_buf_ci = vk::BufferCreateInfo::default()
+            .size(per_tile_id_size)
+            .usage(
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            )
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let per_tile_frame_palette_id_buffer =
+            device.create_buffer(&per_tile_id_buf_ci, None)?;
+        let per_tile_id_reqs =
+            device.get_buffer_memory_requirements(per_tile_frame_palette_id_buffer);
+        let per_tile_id_mem_type = find_memory_type(
+            &mem_props,
+            per_tile_id_reqs.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )
+        .ok_or("no host-visible memory type for per_tile_frame_palette_id buffer")?;
+        let per_tile_id_alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(per_tile_id_reqs.size)
+            .memory_type_index(per_tile_id_mem_type);
+        let per_tile_frame_palette_id_memory =
+            device.allocate_memory(&per_tile_id_alloc, None)?;
+        device.bind_buffer_memory(
+            per_tile_frame_palette_id_buffer,
+            per_tile_frame_palette_id_memory,
+            0,
+        )?;
+        let per_tile_frame_palette_id_ptr = device.map_memory(
+            per_tile_frame_palette_id_memory,
+            0,
+            per_tile_id_size,
+            vk::MemoryMapFlags::empty(),
+        )? as *mut u8;
+
         Ok(Self {
             _entry: entry,
             instance,
@@ -893,6 +1134,21 @@ impl GpuFrameProcessor {
             palrle_indirect_args_descriptor_set_layout,
             palrle_indirect_args_buffer,
             palrle_indirect_args_memory,
+            palette_fold_shader_module,
+            palette_fold_pipeline,
+            palette_fold_pipeline_layout,
+            palette_fold_descriptor_set_layout,
+            frame_palette_set_buffer,
+            frame_palette_set_memory,
+            frame_palette_set_ptr,
+            frame_palette_count_buffer,
+            frame_palette_count_memory,
+            frame_palette_count_ptr,
+            hash_table_buffer,
+            hash_table_memory,
+            per_tile_frame_palette_id_buffer,
+            per_tile_frame_palette_id_memory,
+            per_tile_frame_palette_id_ptr,
             descriptor_pool,
             prev_image: None,
             sad_buffer,
@@ -2342,6 +2598,29 @@ impl Drop for GpuFrameProcessor {
             self.device
                 .free_memory(self.palrle_indirect_args_memory, None);
 
+            // palette_fold buffers
+            self.device.unmap_memory(self.per_tile_frame_palette_id_memory);
+            self.device
+                .destroy_buffer(self.per_tile_frame_palette_id_buffer, None);
+            self.device
+                .free_memory(self.per_tile_frame_palette_id_memory, None);
+
+            // hash_table buffer (no persistent CPU mapping)
+            self.device.destroy_buffer(self.hash_table_buffer, None);
+            self.device.free_memory(self.hash_table_memory, None);
+
+            self.device.unmap_memory(self.frame_palette_count_memory);
+            self.device
+                .destroy_buffer(self.frame_palette_count_buffer, None);
+            self.device
+                .free_memory(self.frame_palette_count_memory, None);
+
+            self.device.unmap_memory(self.frame_palette_set_memory);
+            self.device
+                .destroy_buffer(self.frame_palette_set_buffer, None);
+            self.device
+                .free_memory(self.frame_palette_set_memory, None);
+
             self.device
                 .destroy_descriptor_pool(self.descriptor_pool, None);
 
@@ -2394,6 +2673,18 @@ impl Drop for GpuFrameProcessor {
             );
             self.device
                 .destroy_shader_module(self.palrle_indirect_args_shader_module, None);
+
+            // palette_fold pipeline
+            self.device
+                .destroy_pipeline(self.palette_fold_pipeline, None);
+            self.device
+                .destroy_pipeline_layout(self.palette_fold_pipeline_layout, None);
+            self.device.destroy_descriptor_set_layout(
+                self.palette_fold_descriptor_set_layout,
+                None,
+            );
+            self.device
+                .destroy_shader_module(self.palette_fold_shader_module, None);
 
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_device(None);
