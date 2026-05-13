@@ -115,6 +115,12 @@ mod cost_tests {
 /// apply normally — a tile that drops to low-freq (< 5 Hz) is re-classified
 /// fresh per Rules 6-8. (Per-tile hysteresis differs from the frame-mode
 /// hysteresis in `Classifier::decide_frame_mode`.)
+///
+/// **Palette-id placeholder convention.** When this function returns
+/// `CodecState::PalRle { palette_id: 0 }`, the `0` is a feasibility
+/// placeholder, not a real persistent slot id. `IoBridge::phase_a_palette_allocation`
+/// overwrites the field with the real id (or downgrades to `Skip` on
+/// allocation failure). See design Section 6.
 pub fn classify_tile(metrics: &TileMetrics, prev: &CodecState) -> CodecState {
     // Rule 1: idle ⇒ Skip
     if metrics.idle_frames > 0 {

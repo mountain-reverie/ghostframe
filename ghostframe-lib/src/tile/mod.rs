@@ -75,6 +75,19 @@ pub enum CodecState {
     Skip,
     H264 { frames_in_h264: u32 },
     Bc1,
+    /// PalRLE-classified tile.
+    ///
+    /// `palette_id` semantics depend on lifecycle position (design D8):
+    /// - **Pre-Phase-A** (immediately after `classify_tile`): `palette_id == 0`
+    ///   is a *feasibility placeholder* meaning "this tile is PalRLE-feasible,
+    ///   no persistent slot allocated yet".
+    /// - **Post-Phase-A** (overwritten by `IoBridge::phase_a_palette_allocation`):
+    ///   `palette_id` is the real persistent slot id 0..=255, used by Phase B
+    ///   to encode the wire payload and by the client to look up the palette.
+    ///
+    /// The boundary is clear in code: Phase A is the only thing that
+    /// overwrites this field. Other code paths that read `CodecState::PalRle`
+    /// outside the Phase-A boundary should treat `palette_id` as the real id.
     PalRle { palette_id: u8 },
     Solid,
     Cdf53 { passes_sent: u8, max_passes: u8 },
