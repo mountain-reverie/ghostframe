@@ -1428,7 +1428,7 @@ impl GpuFrameProcessor {
         // --- index_buffer (Stage 3 output) ---
         // max_tiles * 512 bytes: each tile has 128 u32 entries of packed 4-bit indices.
         // HOST_VISIBLE | HOST_COHERENT, STORAGE_BUFFER, persistently mapped.
-        let index_buffer_size = (max_tiles as vk::DeviceSize) * 512;
+        let index_buffer_size = ((max_tiles as vk::DeviceSize) * 512).max(512);
         let index_buf_ci = vk::BufferCreateInfo::default()
             .size(index_buffer_size)
             .usage(vk::BufferUsageFlags::STORAGE_BUFFER)

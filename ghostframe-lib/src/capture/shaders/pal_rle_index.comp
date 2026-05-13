@@ -58,6 +58,7 @@ uint pack_bgra(vec4 p) {
 
 // Binary search on canonical-sorted palette.
 uint binary_search(uint packed, uint count) {
+    if (count == 0u) return 0u; // unreachable under classifier feasibility; defensive
     uint lo = 0u;
     uint hi = count;
     while (lo < hi) {
@@ -84,6 +85,8 @@ void main() {
         uint shift = (c_slot & 3u) * 8u;
         uint frame_pal_id_local = (packed_word >> shift) & 0xFFu;
         shared_skip = (frame_pal_id_local == 0xFFu) ? 1u : 0u;
+        shared_effective_id = 0u;
+        shared_count = 0u;
         if (shared_skip == 0u) {
             shared_effective_id = folded_into[frame_pal_id_local] & 0xFFu;
             shared_count = frame_palettes[shared_effective_id].count;
@@ -94,6 +97,13 @@ void main() {
     if (local_idx < 128u) {
         scratch[local_idx] = 0u;
     }
+    // Barrier synchronises 4 pre-barrier writes:
+    //   - scratch[0..128] zeroed by threads 0..127
+    //   - shared_skip written by thread 0
+    //   - shared_effective_id written by thread 0 (only if shared_skip == 0)
+    //   - shared_count written by thread 0 (only if shared_skip == 0)
+    // All four are read by threads in subsequent blocks. Do not move any
+    // shared write across this barrier without re-evaluating the safety.
     barrier();
 
     if (shared_skip == 1u) return;
@@ -109,6 +119,14 @@ void main() {
     uint tile_y = tile_idx / cols;
     ivec2 frame_pixel = ivec2(int(tile_x * 32u + gl_LocalInvocationID.x),
                               int(tile_y * 32u + gl_LocalInvocationID.y));
+    // PRECONDITION: Stage 1.5 (palrle_compact) compacts only full 32×32 dirty tiles
+    // (count >= 1). For frame widths/heights not divisible by 32, the partial-tile
+    // tail is handled by other code paths (or skipped via dirty filtering); we
+    // assume `frame_pixel` is always in-bounds here. Out-of-bounds imageLoad
+    // returns (0,0,0,0) under Vulkan robustness, which would pack to 0x00000000
+    // — that color isn't necessarily in the tile's palette and binary_search
+    // would silently return slot 0 (wrong indices). The dirty-tile invariant
+    // prevents this.
     vec4 px = imageLoad(current_frame, frame_pixel);
     uint packed = pack_bgra(px);
 
