@@ -646,7 +646,7 @@ impl GpuFrameProcessor {
         let palrle_indirect_args_pipeline = palrle_indirect_args_pipelines[0];
 
         // --- Descriptor pool ---
-        // 3 sets: SAD (2 STORAGE_IMAGE + 1 STORAGE_BUFFER)
+        // 5 sets: SAD (2 STORAGE_IMAGE + 1 STORAGE_BUFFER)
         //       + NV12 (1 STORAGE_IMAGE + 1 STORAGE_BUFFER)
         //       + Analysis (1 STORAGE_IMAGE + 1 STORAGE_BUFFER)
         //       + palrle_compact (4 STORAGE_BUFFER)
@@ -794,6 +794,9 @@ impl GpuFrameProcessor {
         // 12 bytes (3 u32s: group_count_x/y/z). Written by shader, read as
         // INDIRECT_BUFFER. HOST_VISIBLE | HOST_COHERENT for simple initialization
         // (no staging buffer needed, and avoids DEVICE_LOCAL complication in Drop).
+        // HOST_VISIBLE chosen (deviation from spec D14: DEVICE_LOCAL) for simpler
+        // init — vkCmdDispatchIndirect reads correctly from HOST_VISIBLE memory.
+        // PCIe-bar read cost is acceptable for 12 B per frame.
         let palrle_indirect_args_size = 12_u64;
         let palrle_indirect_args_buf_ci = vk::BufferCreateInfo::default()
             .size(palrle_indirect_args_size)

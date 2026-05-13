@@ -43,7 +43,7 @@ void main() {
 
     uint sad_v = sad[tile_idx];
     uint c = tiles[tile_idx].count;
-    if (sad_v >= dirty_threshold && c <= 16u && c >= 1u) {
+    if (sad_v > dirty_threshold && c <= 16u && c >= 1u) {
         uint slot = atomicAdd(count, 1u);
         list[slot] = tile_idx;
     }
