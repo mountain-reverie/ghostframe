@@ -54,9 +54,21 @@ export class WebGpuRenderer {
   get presentFormat(): GPUTextureFormat { return this.gpu.presentFormat; }
 
   resize(width: number, height: number): void {
+    // Zero dimensions are a no-op: we can't create valid GPU textures with 0×0
+    // size, and no tiles can exist before the frame dimensions sentinel arrives.
+    if (width === 0 || height === 0) return;
     if (this.canvas.width !== width || this.canvas.height !== height) {
       this.canvas.width = width;
       this.canvas.height = height;
+      // Changing canvas.width / canvas.height invalidates the WebGPU canvas
+      // context (per spec the current texture is expired and the swap-chain
+      // must be reconfigured).  Re-call configure() so getCurrentTexture()
+      // returns a correctly-sized texture on the next rAF tick.
+      this.context.configure({
+        device: this.gpu.device,
+        format: this.gpu.presentFormat,
+        alphaMode: 'opaque',
+      });
     }
     this.framebuffer.resize(width, height);
     this.solidPipeline.updateCanvasSize(width, height);
@@ -106,6 +118,13 @@ export class WebGpuRenderer {
   encodeAndPresentFrame(
     onDecodeError: (codec: number, tileX: number, tileY: number, code: number) => void,
   ): { palrle: number; solid: number; raw: number; h264: number } {
+    // Guard: if the framebuffer hasn't been sized yet (resize(w,h) with w,h>0 not
+    // called), skip the GPU work — no texture targets are valid yet.
+    if (!this.framebuffer.texture) {
+      return { palrle: 0, solid: 0, raw: 0, h264: 0 };
+    }
+    // Expose framebuffer for test instrumentation (__readPixel / __readPixelRect).
+    (window as any).__ghostframeRenderer = { device: this.gpu.device, texture: this.framebuffer.texture };
     // ---- Steps 1-2: Drain palette updates + pre-validate PalRle batch ----
     const palRleEntries: PalRleEntry[] = [];
     for (const q of this.palRleQueue) {

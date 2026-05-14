@@ -38,17 +38,83 @@ async function main() {
   const serverHost = url.searchParams.get('host') ?? 'ghostframe-server:4443';
   const certHash = url.searchParams.get('certHash') ?? '';
 
-  // WebGPU canvases cannot be read via canvas.getContext('2d').getImageData.
-  // Expose a globally-callable readPixel helper that copies a 1×1 region
-  // of the WebGPU canvas into a temporary 2D canvas, then reads back from
-  // it. Used by E2E tests that need to assert pixel values without invasive
-  // renderer-side instrumentation.
-  (window as any).__readPixel = (x: number, y: number) => {
-    const tmp = document.createElement('canvas');
-    tmp.width = 1; tmp.height = 1;
-    const ctx = tmp.getContext('2d')!;
-    ctx.drawImage(canvasEl, x, y, 1, 1, 0, 0, 1, 1);
-    return Array.from(ctx.getImageData(0, 0, 1, 1).data); // [R, G, B, A]
+  // WebGPU canvases cannot be reliably read via canvas.getContext('2d').getImageData
+  // in Chrome 147 when the canvas has been resized after initial configuration
+  // (the compositor's copy may lag behind). Instead, read directly from the
+  // GPU framebuffer texture via a staging buffer (COPY_SRC → MAP_READ).
+  //
+  // Both __readPixel and __readPixelRect return Promises; the E2E test
+  // framework (chromiumoxide) resolves the returned Promise automatically.
+  (window as any).__readPixel = async (x: number, y: number): Promise<number[]> => {
+    const rendererRef: any = (window as any).__ghostframeRenderer;
+    if (!rendererRef) {
+      // Fallback to drawImage if renderer not exposed yet
+      const tmp = document.createElement('canvas');
+      tmp.width = 1; tmp.height = 1;
+      const ctx = tmp.getContext('2d')!;
+      ctx.drawImage(canvasEl, x, y, 1, 1, 0, 0, 1, 1);
+      return Array.from(ctx.getImageData(0, 0, 1, 1).data);
+    }
+    const { device, texture } = rendererRef;
+    if (!device || !texture) return [0, 0, 0, 0];
+    // Row size must be a multiple of 256 bytes.
+    const bytesPerRow = 256;
+    const staging = device.createBuffer({
+      size: bytesPerRow,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+    const enc = device.createCommandEncoder();
+    enc.copyTextureToBuffer(
+      { texture, origin: { x, y } },
+      { buffer: staging, bytesPerRow },
+      [1, 1],
+    );
+    device.queue.submit([enc.finish()]);
+    await staging.mapAsync(GPUMapMode.READ);
+    const view = new Uint8Array(staging.getMappedRange(0, 4));
+    const result = Array.from(view) as number[];
+    staging.unmap();
+    staging.destroy();
+    return result; // [R, G, B, A]
+  };
+
+  // Multi-pixel variant for hash-based E2E stability checks.
+  (window as any).__readPixelRect = async (x: number, y: number, w: number, h: number): Promise<number[]> => {
+    const rendererRef: any = (window as any).__ghostframeRenderer;
+    if (!rendererRef) {
+      const tmp = document.createElement('canvas');
+      tmp.width = w; tmp.height = h;
+      const ctx = tmp.getContext('2d')!;
+      ctx.drawImage(canvasEl, x, y, w, h, 0, 0, w, h);
+      return Array.from(ctx.getImageData(0, 0, w, h).data);
+    }
+    const { device, texture } = rendererRef;
+    if (!device || !texture) return new Array(w * h * 4).fill(0);
+    // bytesPerRow must be multiple of 256
+    const bytesPerRow = Math.ceil(w * 4 / 256) * 256;
+    const staging = device.createBuffer({
+      size: bytesPerRow * h,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+    const enc = device.createCommandEncoder();
+    enc.copyTextureToBuffer(
+      { texture, origin: { x, y } },
+      { buffer: staging, bytesPerRow },
+      [w, h],
+    );
+    device.queue.submit([enc.finish()]);
+    await staging.mapAsync(GPUMapMode.READ);
+    // Compact: remove row padding
+    const raw = new Uint8Array(staging.getMappedRange());
+    const result: number[] = [];
+    for (let row = 0; row < h; row++) {
+      for (let col = 0; col < w * 4; col++) {
+        result.push(raw[row * bytesPerRow + col]);
+      }
+    }
+    staging.unmap();
+    staging.destroy();
+    return result;
   };
 
   const wtUrl = `https://${serverHost}/`;
@@ -248,7 +314,10 @@ async function main() {
   }
 
   // rAF loop — drains queues, flushes one frame per animation tick.
+  let __rafTicks = 0;
   function tick() {
+    __rafTicks++;
+    (window as any).__ghostframeRafTicks = __rafTicks;
     renderer.encodeAndPresentFrame((codec, tx, ty, code) => {
       decodeErrorBatcher.report({ codec, tileX: tx, tileY: ty, errorCode: code });
     });

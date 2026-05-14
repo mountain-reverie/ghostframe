@@ -45,7 +45,8 @@ export class Framebuffer {
         GPUTextureUsage.STORAGE_BINDING |
         GPUTextureUsage.TEXTURE_BINDING |
         GPUTextureUsage.RENDER_ATTACHMENT |
-        GPUTextureUsage.COPY_DST,
+        GPUTextureUsage.COPY_DST |
+        GPUTextureUsage.COPY_SRC,
     });
     this.view = this.texture.createView();
     this.width = width;
