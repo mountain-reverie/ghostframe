@@ -33,6 +33,28 @@
 
 #define MAX_ACK_ENTRIES_PER_BATCH 64
 
+#define HELLO_MSG_TYPE 3
+
+#define HELLO_SIZE 2
+
+#define DECODE_ERROR_MSG_TYPE 4
+
+#define DECODE_ERROR_SIZE 5
+
+#define ERR_PAYLOAD_TOO_SHORT 1
+
+#define ERR_COUNT_OUT_OF_RANGE 2
+
+#define ERR_THIN_UNCACHED_PALETTE 3
+
+#define ERR_BUNDLED_TRUNCATED 4
+
+#define ERR_INDEX_OOB 5
+
+#define ERR_RLE_OVERSHOOT 6
+
+#define ERR_RLE_UNDERSHOOT 7
+
 /**
  * Size of the parity packet header in bytes:
  *   - group_start: u16 BE (2 bytes)
