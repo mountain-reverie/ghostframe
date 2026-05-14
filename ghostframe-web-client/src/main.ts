@@ -38,6 +38,19 @@ async function main() {
   const serverHost = url.searchParams.get('host') ?? 'ghostframe-server:4443';
   const certHash = url.searchParams.get('certHash') ?? '';
 
+  // WebGPU canvases cannot be read via canvas.getContext('2d').getImageData.
+  // Expose a globally-callable readPixel helper that copies a 1×1 region
+  // of the WebGPU canvas into a temporary 2D canvas, then reads back from
+  // it. Used by E2E tests that need to assert pixel values without invasive
+  // renderer-side instrumentation.
+  (window as any).__readPixel = (x: number, y: number) => {
+    const tmp = document.createElement('canvas');
+    tmp.width = 1; tmp.height = 1;
+    const ctx = tmp.getContext('2d')!;
+    ctx.drawImage(canvasEl, x, y, 1, 1, 0, 0, 1, 1);
+    return Array.from(ctx.getImageData(0, 0, 1, 1).data); // [R, G, B, A]
+  };
+
   const wtUrl = `https://${serverHost}/`;
 
   log(`Connecting to ${wtUrl}...`);

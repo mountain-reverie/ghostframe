@@ -158,14 +158,14 @@ struct E2eSetup {
 }
 
 async fn setup_e2e(test_pattern_args: &str) -> Result<E2eSetup> {
-    setup_e2e_inner(test_pattern_args, &[], false).await
+    setup_e2e_inner(test_pattern_args, &[], false, false).await
 }
 
 async fn setup_e2e_with_env(
     test_pattern_args: &str,
     extra_env: &[(&str, &str)],
 ) -> Result<E2eSetup> {
-    setup_e2e_inner(test_pattern_args, extra_env, false).await
+    setup_e2e_inner(test_pattern_args, extra_env, false, false).await
 }
 
 /// Variant of `setup_e2e` that bind-mounts the host's `/dev/dri` into the
@@ -173,13 +173,34 @@ async fn setup_e2e_with_env(
 /// (host must have `vkms` module loaded with `enable_writeback=1`). The
 /// container's Xorg switches to the modesetting driver via `XORG_CONF`.
 async fn setup_e2e_gpu(test_pattern_args: &str) -> Result<E2eSetup> {
-    setup_e2e_inner(test_pattern_args, &[], true).await
+    setup_e2e_inner(test_pattern_args, &[], true, false).await
+}
+
+/// Configures Chromium with WebGPU enabled. Uses real GPU passthrough
+/// when /dev/dri/renderD128 exists on the host; falls back to SwiftShader
+/// (CPU WebGPU) otherwise.
+async fn setup_e2e_webgpu(test_pattern_args: &str) -> Result<E2eSetup> {
+    setup_e2e_inner(test_pattern_args, &[], false, true).await
+}
+
+/// WebGPU + extra env vars on the server container.
+async fn setup_e2e_webgpu_with_env(
+    test_pattern_args: &str,
+    extra_env: &[(&str, &str)],
+) -> Result<E2eSetup> {
+    setup_e2e_inner(test_pattern_args, extra_env, false, true).await
+}
+
+/// WebGPU + GPU passthrough on the server (bind /dev/dri + privileged).
+async fn setup_e2e_webgpu_gpu(test_pattern_args: &str) -> Result<E2eSetup> {
+    setup_e2e_inner(test_pattern_args, &[], true, true).await
 }
 
 async fn setup_e2e_inner(
     test_pattern_args: &str,
     extra_env: &[(&str, &str)],
     gpu: bool,
+    webgpu: bool,
 ) -> Result<E2eSetup> {
     let hs_server_url = format!("http://{DOCKER_HOST_IP}:{HEADSCALE_HOST_PORT}");
 
@@ -238,15 +259,34 @@ async fn setup_e2e_inner(
         .join("ghostframe-web-client/dist");
     let static_addr = helpers::start_static_server(dist_dir).await?;
 
-    let (browser, mut handler) = Browser::launch(
-        BrowserConfig::builder()
-            .chrome_executable("/usr/bin/chromium")
-            .no_sandbox()
-            .new_headless_mode()
-            .build()
-            .unwrap(),
-    )
-    .await?;
+    // Build chromium args. When `webgpu == true`, enable WebGPU; pick the
+    // GPU passthrough path if /dev/dri/renderD128 is host-available, else
+    // fall back to SwiftShader.
+    let force_swiftshader = std::env::var("GHOSTFRAME_E2E_FORCE_SWIFTSHADER")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let mut chromium_args: Vec<String> = Vec::new();
+    if webgpu {
+        let has_gpu = !force_swiftshader && std::path::Path::new("/dev/dri/renderD128").exists();
+        if has_gpu {
+            chromium_args.push("--enable-features=Vulkan,WebGPU".to_string());
+            chromium_args.push("--use-vulkan".to_string());
+            chromium_args.push("--ignore-gpu-blocklist".to_string());
+        } else {
+            chromium_args.push("--enable-unsafe-swiftshader".to_string());
+            chromium_args.push("--enable-features=Vulkan,WebGPU".to_string());
+            chromium_args.push("--use-angle=swiftshader".to_string());
+            chromium_args.push("--disable-gpu".to_string());
+        }
+    }
+    let mut builder = BrowserConfig::builder()
+        .chrome_executable("/usr/bin/chromium")
+        .no_sandbox()
+        .new_headless_mode();
+    for arg in &chromium_args {
+        builder = builder.arg(arg.as_str());
+    }
+    let (browser, mut handler) = Browser::launch(builder.build().unwrap()).await?;
     let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
     let page_url = format!(
