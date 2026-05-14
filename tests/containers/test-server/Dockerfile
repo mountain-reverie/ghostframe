@@ -41,6 +41,9 @@ COPY ghostframe-xdaemon/ ghostframe-xdaemon/
 COPY ghostframe-test-pattern/ ghostframe-test-pattern/
 
 ENV CARGO_BUILD_JOBS=2
+# ffmpeg-next overflows rustc's default 8 MiB stack on this codebase; bump
+# to 16 MiB (the value rustc itself suggests when it crashes).
+ENV RUST_MIN_STACK=16777216
 # Enable the lib's `test-loss-injection` feature so e2e tests can drive
 # deterministic packet/ACK drops via GHOSTFRAME_{OUTBOUND,INBOUND}_LOSS_*
 # env vars. Production builds (separate Dockerfile or release pipeline)
