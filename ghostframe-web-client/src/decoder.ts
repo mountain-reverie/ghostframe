@@ -198,9 +198,8 @@ export class FullFrameDecoder {
   ) {
     this.decoder = new VideoDecoder({
       output: (frame: VideoFrame) => {
-        if (this.latestFrame) {
-          this.latestFrame.close();
-        }
+        // M3.2b: the rAF tick is the sole closer of consumed VideoFrames.
+        // Do NOT auto-close the previous frame here.
         this.latestFrame = frame;
         this.onFrame(frame);
       },
