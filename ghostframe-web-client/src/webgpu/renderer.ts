@@ -1,10 +1,15 @@
 import { initWebGpu, type WebGpuInitResult } from './init.js';
+import { Framebuffer } from './framebuffer.js';
 
 export class WebGpuRenderer {
+  framebuffer: Framebuffer;
+
   private constructor(
     private gpu: WebGpuInitResult,
     private canvas: HTMLCanvasElement,
-  ) {}
+  ) {
+    this.framebuffer = new Framebuffer(gpu.device, gpu.presentFormat);
+  }
 
   static async create(canvas: HTMLCanvasElement): Promise<WebGpuRenderer> {
     const gpu = await initWebGpu(canvas);
@@ -19,7 +24,15 @@ export class WebGpuRenderer {
     if (this.canvas.width !== width || this.canvas.height !== height) {
       this.canvas.width = width;
       this.canvas.height = height;
-      // Subsequent tasks will rebuild framebuffer + bind groups here.
     }
+    this.framebuffer.resize(width, height);
+  }
+
+  /** Render one rAF tick — for now, only the present blit. */
+  encodeFrame(): void {
+    const swapTex = this.context.getCurrentTexture();
+    const encoder = this.device.createCommandEncoder();
+    this.framebuffer.encodePresentBlit(encoder, swapTex.createView());
+    this.device.queue.submit([encoder.finish()]);
   }
 }
