@@ -1,14 +1,17 @@
 import { initWebGpu, type WebGpuInitResult } from './init.js';
 import { Framebuffer } from './framebuffer.js';
+import { SolidPipeline, type SolidTile } from './solid.js';
 
 export class WebGpuRenderer {
   framebuffer: Framebuffer;
+  solidPipeline: SolidPipeline;
 
   private constructor(
     private gpu: WebGpuInitResult,
     private canvas: HTMLCanvasElement,
   ) {
     this.framebuffer = new Framebuffer(gpu.device, gpu.presentFormat);
+    this.solidPipeline = new SolidPipeline(gpu.device);
   }
 
   static async create(canvas: HTMLCanvasElement): Promise<WebGpuRenderer> {
@@ -26,6 +29,7 @@ export class WebGpuRenderer {
       this.canvas.height = height;
     }
     this.framebuffer.resize(width, height);
+    this.solidPipeline.updateCanvasSize(width, height);
   }
 
   /** Render one rAF tick — for now, only the present blit. */
