@@ -92,11 +92,30 @@ async fn e2e_quic_ping_pong_over_tailscale() -> Result<()> {
         .join("ghostframe-web-client/dist");
     let static_addr = helpers::start_static_server(dist_dir).await?;
 
+    // Use DISPLAY=:0 (no --headless) so WebGPU requestAdapter() succeeds.
+    // headless=new blocks GPU adapters; running against the host X session fixes it.
+    let chrome_profile = std::env::temp_dir().join(format!(
+        "chromiumoxide-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos()
+    ));
     let (browser, mut handler) = Browser::launch(
         BrowserConfig::builder()
             .chrome_executable("/usr/bin/chromium")
             .no_sandbox()
-            .new_headless_mode()
+            .user_data_dir(&chrome_profile)
+            .with_head()
+            .env("DISPLAY", ":0")
+            // Use tuple form so "Vulkan,WebGPU" merges into DEFAULT_ARGS'
+            // "enable-features" entry (key "enable-features") rather than
+            // creating a separate "enable-features=Vulkan,WebGPU" key.
+            // Chrome 147+ only honours one --enable-features flag per key.
+            .arg(("enable-features", "Vulkan,WebGPU"))
+            .arg("use-vulkan")
+            .arg("ignore-gpu-blocklist")
             .build()
             .unwrap(),
     )
@@ -262,29 +281,65 @@ async fn setup_e2e_inner(
     // Build chromium args. When `webgpu == true`, enable WebGPU; pick the
     // GPU passthrough path if /dev/dri/renderD128 is host-available, else
     // fall back to SwiftShader.
+    //
+    // IMPORTANT: `--headless=new` (chromiumoxide's `new_headless_mode()`) uses
+    // Chromium's Ozone headless backend which doesn't support WebGPU adapters —
+    // `requestAdapter()` always returns null.  When WebGPU is required we must
+    // use `HeadlessMode::False` (no --headless flag) and route Chromium through
+    // the host X server (`DISPLAY=:0`).  The E2E machine always has a live X
+    // session (LightDM on :0) so this is safe for both CI and dev machines.
     let force_swiftshader = std::env::var("GHOSTFRAME_E2E_FORCE_SWIFTSHADER")
         .map(|v| v == "1")
         .unwrap_or(false);
-    let mut chromium_args: Vec<String> = Vec::new();
-    if webgpu {
-        let has_gpu = !force_swiftshader && std::path::Path::new("/dev/dri/renderD128").exists();
-        if has_gpu {
-            chromium_args.push("--enable-features=Vulkan,WebGPU".to_string());
-            chromium_args.push("--use-vulkan".to_string());
-            chromium_args.push("--ignore-gpu-blocklist".to_string());
-        } else {
-            chromium_args.push("--enable-unsafe-swiftshader".to_string());
-            chromium_args.push("--enable-features=Vulkan,WebGPU".to_string());
-            chromium_args.push("--use-angle=swiftshader".to_string());
-            chromium_args.push("--disable-gpu".to_string());
-        }
-    }
+    // Use a per-test-run temporary profile directory so successive Chrome
+    // launches don't share — or corrupt — each other's profile state.
+    // chromiumoxide defaults to /tmp/chromiumoxide-runner (shared across all
+    // tests) which causes "Opening in existing browser session" failures and
+    // stale SingletonLock files after abnormal exits.
+    let chrome_profile_dir = std::env::temp_dir().join(format!(
+        "chromiumoxide-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos()
+    ));
     let mut builder = BrowserConfig::builder()
         .chrome_executable("/usr/bin/chromium")
         .no_sandbox()
-        .new_headless_mode();
-    for arg in &chromium_args {
-        builder = builder.arg(arg.as_str());
+        .user_data_dir(&chrome_profile_dir);
+    if webgpu {
+        // Use a real X display so the GPU/WebGPU backend can initialise.
+        // `--headless=new` (new_headless_mode) uses Chromium's Ozone backend
+        // which disables GPU adapters; requestAdapter() always returns null.
+        // `.with_head()` passes NO --headless flag; DISPLAY=:0 routes rendering
+        // through the host's live X session (LightDM on :0).
+        builder = builder.with_head().env("DISPLAY", ":0");
+
+        let has_gpu = !force_swiftshader && std::path::Path::new("/dev/dri/renderD128").exists();
+        if has_gpu {
+            // IMPORTANT: chromiumoxide's ArgsBuilder merges values into the same
+            // HashMap entry when the key matches.  The DEFAULT_ARGS already contains
+            // `--enable-features=NetworkService,NetworkServiceInProcess`.  Passing
+            // the tuple form ("enable-features", "Vulkan,WebGPU") adds "Vulkan,WebGPU"
+            // to that same entry, producing a single merged flag:
+            //   --enable-features=NetworkService,NetworkServiceInProcess,Vulkan,WebGPU
+            //
+            // Passing a bare string "enable-features=Vulkan,WebGPU" would create a
+            // SEPARATE HashMap key and Chrome 147+ only honours the first occurrence,
+            // leaving WebGPU disabled.
+            builder = builder
+                .arg(("enable-features", "Vulkan,WebGPU"))
+                .arg("use-vulkan")
+                .arg("ignore-gpu-blocklist");
+        } else {
+            builder = builder
+                .arg("enable-unsafe-swiftshader")
+                .arg(("enable-features", "Vulkan,WebGPU"))
+                .arg(("use-angle", "swiftshader"));
+        }
+    } else {
+        builder = builder.new_headless_mode();
     }
     let (browser, mut handler) = Browser::launch(builder.build().unwrap()).await?;
     let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
@@ -384,11 +439,28 @@ async fn e2e_raw_frame_round_trip() -> Result<()> {
         .join("ghostframe-web-client/dist");
     let static_addr = helpers::start_static_server(dist_dir).await?;
 
+    // Use DISPLAY=:0 (no --headless) so WebGPU requestAdapter() succeeds.
+    // headless=new blocks GPU adapters; running against the host X session fixes it.
+    let chrome_profile = std::env::temp_dir().join(format!(
+        "chromiumoxide-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos()
+    ));
     let (browser, mut handler) = Browser::launch(
         BrowserConfig::builder()
             .chrome_executable("/usr/bin/chromium")
             .no_sandbox()
-            .new_headless_mode()
+            .user_data_dir(&chrome_profile)
+            .with_head()
+            .env("DISPLAY", ":0")
+            // Tuple form merges into DEFAULT_ARGS' "enable-features" entry so
+            // Chrome sees a single --enable-features=...,Vulkan,WebGPU flag.
+            .arg(("enable-features", "Vulkan,WebGPU"))
+            .arg("use-vulkan")
+            .arg("ignore-gpu-blocklist")
             .build()
             .unwrap(),
     )
@@ -444,13 +516,11 @@ async fn e2e_raw_frame_round_trip() -> Result<()> {
     // so ANY successfully rendered tile proves the full pipeline:
     // X11 capture → tile → fragment → transport → reassemble → BGRA→RGBA → canvas.
     let scan_js = r#"
-        (() => {
-            const canvas = document.getElementById('canvas');
-            const ctx = canvas.getContext('2d');
+        (async () => {
             // Sample every 32 pixels (tile boundaries) across the frame area
             for (let y = 16; y < 480; y += 32) {
                 for (let x = 16; x < 640; x += 32) {
-                    const p = ctx.getImageData(x, y, 1, 1).data;
+                    const p = await window.__readPixel(x, y);
                     if (p[0] > 200 && p[1] < 50 && p[2] < 50) {
                         return { found: true, x: x, y: y, r: p[0], g: p[1], b: p[2] };
                     }
@@ -488,19 +558,17 @@ async fn e2e_raw_frame_round_trip() -> Result<()> {
 /// sentinel (no GPU compute available there).
 #[tokio::test]
 async fn e2e_solid_color() -> Result<()> {
-    let setup = setup_e2e("--solid-red").await?;
+    let setup = setup_e2e_webgpu("--solid-red").await?;
 
     // Wait for frames to accumulate and QUIC congestion window to open
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Scan for red pixel — H.264 is lossy so allow wider tolerance than Raw
     let scan_js = r#"
-        (() => {
-            const canvas = document.getElementById('canvas');
-            const ctx = canvas.getContext('2d');
+        (async () => {
             for (let y = 16; y < 480; y += 32) {
                 for (let x = 16; x < 640; x += 32) {
-                    const p = ctx.getImageData(x, y, 1, 1).data;
+                    const p = await window.__readPixel(x, y);
                     if (p[0] > 180 && p[1] < 80 && p[2] < 80) {
                         return { found: true, x, y, r: p[0], g: p[1], b: p[2] };
                     }
@@ -512,6 +580,78 @@ async fn e2e_solid_color() -> Result<()> {
 
     let scan: serde_json::Value = setup.page.evaluate(scan_js).await?.into_value()?;
     let found = scan.get("found").and_then(|v| v.as_bool()).unwrap_or(false);
+    if !found {
+        // Diagnostic: sample a few pixels to understand what the canvas contains
+        if let Ok(v) = setup.page.evaluate(r#"
+            (async () => {
+                const pts = [[16,16],[160,240],[320,240],[480,240]];
+                const results = [];
+                for (const [x,y] of pts) {
+                    const p = await window.__readPixel(x,y);
+                    results.push(`(${x},${y})=[${p.join(',')}]`);
+                }
+                return results.join(' ');
+            })()
+        "#).await {
+            let diag: String = v.into_value().unwrap_or_default();
+            println!("pixel diag: {diag}");
+        }
+        // Check canvas size, page log, and stats
+        if let Ok(v) = setup.page.evaluate(
+            "document.getElementById('canvas')?.width + 'x' + document.getElementById('canvas')?.height"
+        ).await {
+            let csz: String = v.into_value().unwrap_or_default();
+            println!("canvas size: {csz}");
+        }
+        if let Ok(v) = setup.page.evaluate(
+            "Array.from(document.getElementById('log')?.querySelectorAll('div') || []).map(d => d.textContent).join('|')"
+        ).await {
+            let log_content: String = v.into_value().unwrap_or_default();
+            println!("page log: {log_content}");
+        }
+        if let Ok(v) = setup.page.evaluate(
+            "JSON.stringify(window.__ghostframeStats)"
+        ).await {
+            let stats: String = v.into_value().unwrap_or_default();
+            println!("frame stats: {stats}");
+        }
+        if let Ok(v) = setup.page.evaluate(
+            "JSON.stringify({rafTicks: window.__ghostframeRafTicks||0})"
+        ).await {
+            let counters: String = v.into_value().unwrap_or_default();
+            println!("counters: {counters}");
+        }
+        // Read the ACTUAL framebuffer texture using GPU staging readback
+        if let Ok(v) = setup.page.evaluate(r#"
+            (async () => {
+                try {
+                    const ref_ = window.__ghostframeRenderer;
+                    if (!ref_) return 'renderer_not_exposed';
+                    const { device, texture } = ref_;
+                    if (!device || !texture) return `renderer_missing device=${!!device} texture=${!!texture}`;
+                    const staging = device.createBuffer({
+                        size: 256,
+                        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+                    });
+                    const enc = device.createCommandEncoder();
+                    enc.copyTextureToBuffer(
+                        { texture, origin: {x:0,y:0} },
+                        { buffer: staging, bytesPerRow: 256 },
+                        [1, 1]
+                    );
+                    device.queue.submit([enc.finish()]);
+                    await staging.mapAsync(GPUMapMode.READ);
+                    const view = new Uint8Array(staging.getMappedRange(0, 4));
+                    const px = Array.from(view);
+                    staging.unmap();
+                    return `fb_pixel_00: [${px}] texW=${texture.width} texH=${texture.height}`;
+                } catch(e) { return `fb_readback_err: ${e}`; }
+            })()
+        "#).await {
+            let fb_rb: String = v.into_value().unwrap_or_default();
+            println!("framebuffer px: {fb_rb}");
+        }
+    }
     assert!(
         found,
         "no red pixel found on canvas — H.264 pipeline failed"
@@ -531,7 +671,7 @@ async fn e2e_solid_color() -> Result<()> {
 /// no-loss baseline, plus a small extra margin for retransmits.
 #[tokio::test]
 async fn e2e_solid_color_5pct_loss() -> Result<()> {
-    let setup = setup_e2e_with_env(
+    let setup = setup_e2e_webgpu_with_env(
         "--solid-red",
         &[
             ("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "0.05"),
@@ -546,12 +686,10 @@ async fn e2e_solid_color_5pct_loss() -> Result<()> {
 
     // Same red-pixel scan as e2e_solid_color.
     let scan_js = r#"
-        (() => {
-            const canvas = document.getElementById('canvas');
-            const ctx = canvas.getContext('2d');
+        (async () => {
             for (let y = 16; y < 480; y += 32) {
                 for (let x = 16; x < 640; x += 32) {
-                    const p = ctx.getImageData(x, y, 1, 1).data;
+                    const p = await window.__readPixel(x, y);
                     if (p[0] > 180 && p[1] < 80 && p[2] < 80) {
                         return { found: true, x, y };
                     }
@@ -575,7 +713,7 @@ async fn e2e_solid_color_5pct_loss() -> Result<()> {
 async fn e2e_palrle_5pct_loss() -> Result<()> {
     use ghostframe_test_pattern::text_grid::SAMPLES;
 
-    let setup = setup_e2e_with_env(
+    let setup = setup_e2e_webgpu_with_env(
         "--text-grid",
         &[
             ("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "0.05"),
@@ -605,11 +743,9 @@ async fn e2e_palrle_5pct_loss() -> Result<()> {
     let pair = &SAMPLES[0];
     let probe_js = format!(
         r#"
-        (() => {{
-            const canvas = document.getElementById('canvas');
-            const ctx = canvas.getContext('2d');
-            const ink = ctx.getImageData({ix}, {iy}, 1, 1).data;
-            const bg  = ctx.getImageData({bx}, {by}, 1, 1).data;
+        (async () => {{
+            const ink = await window.__readPixel({ix}, {iy});
+            const bg  = await window.__readPixel({bx}, {by});
             return {{
                 ink: {{ r: ink[0], g: ink[1], b: ink[2] }},
                 bg:  {{ r: bg[0],  g: bg[1],  b: bg[2]  }},
@@ -640,7 +776,7 @@ async fn e2e_palrle_5pct_loss() -> Result<()> {
 async fn e2e_palrle_session_reset() -> Result<()> {
     use ghostframe_test_pattern::text_grid::SAMPLES;
 
-    let setup = setup_e2e("--text-grid").await?;
+    let setup = setup_e2e_webgpu("--text-grid").await?;
 
     // Phase 1: let the initial connection settle and render text.
     tokio::time::sleep(Duration::from_secs(4)).await;
@@ -649,11 +785,9 @@ async fn e2e_palrle_session_reset() -> Result<()> {
     let pair = &SAMPLES[0];
     let probe_js = format!(
         r#"
-        (() => {{
-            const canvas = document.getElementById('canvas');
-            const ctx = canvas.getContext('2d');
-            const ink = ctx.getImageData({ix}, {iy}, 1, 1).data;
-            const bg  = ctx.getImageData({bx}, {by}, 1, 1).data;
+        (async () => {{
+            const ink = await window.__readPixel({ix}, {iy});
+            const bg  = await window.__readPixel({bx}, {by});
             return {{
                 ink: {{ r: ink[0], g: ink[1], b: ink[2] }},
                 bg:  {{ r: bg[0],  g: bg[1],  b: bg[2]  }},
@@ -709,17 +843,16 @@ async fn e2e_palrle_session_reset() -> Result<()> {
 /// M2: Static content produces stable canvas (skip codec / no-change detection).
 #[tokio::test]
 async fn e2e_tile_skip() -> Result<()> {
-    let setup = setup_e2e("--solid-red").await?;
+    let setup = setup_e2e_webgpu("--solid-red").await?;
 
     // Wait for initial frames to settle
     tokio::time::sleep(Duration::from_secs(6)).await;
 
     // Take two canvas snapshots 2 seconds apart
     let snapshot_js = r#"
-        (() => {
+        (async () => {
             const canvas = document.getElementById('canvas');
-            const ctx = canvas.getContext('2d');
-            const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+            const data = await window.__readPixelRect(0, 0, canvas.width, canvas.height);
             // Return checksum of all pixel data
             let hash = 0;
             for (let i = 0; i < data.length; i++) {
@@ -744,17 +877,15 @@ async fn e2e_tile_skip() -> Result<()> {
 /// M2: Motion region produces different frames via H.264 decoding.
 #[tokio::test]
 async fn e2e_h264_motion() -> Result<()> {
-    let setup = setup_e2e("--solid-red --spinner").await?;
+    let setup = setup_e2e_webgpu("--solid-red --spinner").await?;
 
     // Wait for frames
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Sample the spinner region (100,100)-(164,164) at two time points
     let sample_js = r#"
-        (() => {
-            const canvas = document.getElementById('canvas');
-            const ctx = canvas.getContext('2d');
-            const data = ctx.getImageData(116, 116, 32, 32).data;
+        (async () => {
+            const data = await window.__readPixelRect(116, 116, 32, 32);
             let hash = 0;
             for (let i = 0; i < data.length; i++) {
                 hash = ((hash << 5) - hash + data[i]) | 0;
@@ -780,7 +911,7 @@ async fn e2e_h264_motion() -> Result<()> {
 /// proving skip detection works for unchanged tiles.
 #[tokio::test]
 async fn e2e_codec_transition() -> Result<()> {
-    let setup = setup_e2e("--solid-red --spinner").await?;
+    let setup = setup_e2e_webgpu("--solid-red --spinner").await?;
 
     // The spinner keeps running in this test. What we actually test is that
     // the STATIC region (outside the spinner) stays stable over time.
@@ -789,10 +920,8 @@ async fn e2e_codec_transition() -> Result<()> {
 
     // Sample a region OUTSIDE the spinner (top-left corner, tile 0,0)
     let static_js = r#"
-        (() => {
-            const canvas = document.getElementById('canvas');
-            const ctx = canvas.getContext('2d');
-            const data = ctx.getImageData(0, 0, 32, 32).data;
+        (async () => {
+            const data = await window.__readPixelRect(0, 0, 32, 32);
             let hash = 0;
             for (let i = 0; i < data.length; i++) {
                 hash = ((hash << 5) - hash + data[i]) | 0;
@@ -821,7 +950,7 @@ async fn e2e_codec_transition() -> Result<()> {
 #[tokio::test]
 async fn e2e_edge_tiles() -> Result<()> {
     let setup =
-        setup_e2e_with_env("--solid-red", &[("XORG_CONF", "/etc/X11/xorg-odd.conf")]).await?;
+        setup_e2e_webgpu_with_env("--solid-red", &[("XORG_CONF", "/etc/X11/xorg-odd.conf")]).await?;
 
     // Wait for frames
     tokio::time::sleep(Duration::from_secs(6)).await;
@@ -830,25 +959,23 @@ async fn e2e_edge_tiles() -> Result<()> {
     // and bottom edge (inside bottom partial tile).
     // If edge tiles work, these should be red (from --solid-red pattern).
     let edge_js = r#"
-        (() => {
-            const canvas = document.getElementById('canvas');
-            const ctx = canvas.getContext('2d');
+        (async () => {
             const results = {};
 
             // Right edge: x=695 (inside last partial-width tile at col 21)
-            const pr = ctx.getImageData(695, 240, 1, 1).data;
+            const pr = await window.__readPixel(695, 240);
             results.right = { r: pr[0], g: pr[1], b: pr[2] };
 
             // Bottom edge: y=495 (inside last partial-height tile at row 15)
-            const pb = ctx.getImageData(320, 495, 1, 1).data;
+            const pb = await window.__readPixel(320, 495);
             results.bottom = { r: pb[0], g: pb[1], b: pb[2] };
 
             // Corner: bottom-right (both partial width AND height)
-            const pc = ctx.getImageData(695, 495, 1, 1).data;
+            const pc = await window.__readPixel(695, 495);
             results.corner = { r: pc[0], g: pc[1], b: pc[2] };
 
             // Center (known-good reference)
-            const pm = ctx.getImageData(350, 250, 1, 1).data;
+            const pm = await window.__readPixel(350, 250);
             results.center = { r: pm[0], g: pm[1], b: pm[2] };
 
             return results;
@@ -901,16 +1028,14 @@ async fn e2e_edge_tiles() -> Result<()> {
 /// frame to ensure the full grid (20x15 = 300 tiles) is being served.
 #[tokio::test]
 async fn e2e_multi_tile_grid() -> Result<()> {
-    let setup = setup_e2e("--solid-red").await?;
+    let setup = setup_e2e_webgpu("--solid-red").await?;
 
     // Wait for frames and QUIC congestion window
     tokio::time::sleep(Duration::from_secs(8)).await;
 
     // Sample 9 positions spread across the grid
     let grid_js = r#"
-        (() => {
-            const canvas = document.getElementById('canvas');
-            const ctx = canvas.getContext('2d');
+        (async () => {
             const positions = [
                 [16, 16],     // top-left tile (0,0)
                 [320, 16],    // top-center tile (10,0)
@@ -924,7 +1049,7 @@ async fn e2e_multi_tile_grid() -> Result<()> {
             ];
             let redCount = 0;
             for (const [x, y] of positions) {
-                const p = ctx.getImageData(x, y, 1, 1).data;
+                const p = await window.__readPixel(x, y);
                 if (p[0] > 150 && p[1] < 100 && p[2] < 100) {
                     redCount++;
                 }
@@ -955,7 +1080,7 @@ async fn e2e_multi_tile_grid() -> Result<()> {
 async fn e2e_text_clarity() -> Result<()> {
     use ghostframe_test_pattern::text_grid::SAMPLES;
 
-    let setup = setup_e2e("--text-grid").await?;
+    let setup = setup_e2e_webgpu("--text-grid").await?;
 
     // Allow QUIC slow-start + a couple of frames so every glyph tile arrives.
     tokio::time::sleep(Duration::from_secs(6)).await;
@@ -964,11 +1089,9 @@ async fn e2e_text_clarity() -> Result<()> {
     for (i, pair) in SAMPLES.iter().enumerate() {
         let probe_js = format!(
             r#"
-            (() => {{
-                const canvas = document.getElementById('canvas');
-                const ctx = canvas.getContext('2d');
-                const ink = ctx.getImageData({ix}, {iy}, 1, 1).data;
-                const bg  = ctx.getImageData({bx}, {by}, 1, 1).data;
+            (async () => {{
+                const ink = await window.__readPixel({ix}, {iy});
+                const bg  = await window.__readPixel({bx}, {by});
                 return {{
                     ink: {{ r: ink[0], g: ink[1], b: ink[2] }},
                     bg:  {{ r: bg[0],  g: bg[1],  b: bg[2]  }},
@@ -1002,10 +1125,9 @@ async fn e2e_text_clarity() -> Result<()> {
 
     // ── (b) Stability: two snapshots 2s apart must be byte-identical.
     let hash_js = r#"
-        (() => {
+        (async () => {
             const canvas = document.getElementById('canvas');
-            const ctx = canvas.getContext('2d');
-            const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+            const data = await window.__readPixelRect(0, 0, canvas.width, canvas.height);
             let h = 0;
             for (let i = 0; i < data.length; i++) h = ((h << 5) - h + data[i]) | 0;
             return h;
@@ -1042,17 +1164,15 @@ async fn e2e_text_clarity() -> Result<()> {
 /// 256-slot table must reuse via overwrite-eligible (delivered=true) slots.
 #[tokio::test]
 async fn e2e_palette_eviction() -> Result<()> {
-    let setup = setup_e2e("--palette-churn 300").await?;
+    let setup = setup_e2e_webgpu("--palette-churn 300").await?;
 
     // ~8s for the pattern to play out at ~5 frames per region × 300.
     tokio::time::sleep(Duration::from_secs(8)).await;
 
     // Sample the final palette region — should display content (not all-black).
     let probe_js = r#"
-        (() => {
-            const canvas = document.getElementById('canvas');
-            const ctx = canvas.getContext('2d');
-            const sample = ctx.getImageData(108, 108, 1, 1).data;
+        (async () => {
+            const sample = await window.__readPixel(108, 108);
             return { r: sample[0], g: sample[1], b: sample[2] };
         })()
     "#;
@@ -1115,13 +1235,12 @@ async fn assert_region_rendered(
             // Sample 9 evenly spaced points inside the region; >= 7 must be red.
             let js = format!(
                 r#"
-                (() => {{
-                    const c = document.getElementById('canvas').getContext('2d');
+                (async () => {{
                     const xs = [{x}+16, {x}+{w}/2|0, {x}+{w}-16];
                     const ys = [{y}+16, {y}+{h}/2|0, {y}+{h}-16];
                     let red = 0, total = 0;
                     for (const xx of xs) for (const yy of ys) {{
-                        const p = c.getImageData(xx, yy, 1, 1).data;
+                        const p = await window.__readPixel(xx, yy);
                         if (p[0] > 180 && p[1] < 80 && p[2] < 80) red++;
                         total++;
                     }}
@@ -1148,12 +1267,11 @@ async fn assert_region_rendered(
             // means we have both ink and bg, i.e. text rendered.
             let js = format!(
                 r#"
-                (() => {{
-                    const c = document.getElementById('canvas').getContext('2d');
+                (async () => {{
                     let lo = 255, hi = 0;
                     for (let dy = 8; dy < {h}; dy += 4) {{
                         for (let dx = 8; dx < {w}; dx += 4) {{
-                            const p = c.getImageData({x}+dx, {y}+dy, 1, 1).data;
+                            const p = await window.__readPixel({x}+dx, {y}+dy);
                             const lum = 0.2126*p[0] + 0.7152*p[1] + 0.0722*p[2];
                             if (lum < lo) lo = lum;
                             if (lum > hi) hi = lum;
@@ -1182,13 +1300,12 @@ async fn assert_region_rendered(
             // Bottom must be brighter than top by a clear margin.
             let js = format!(
                 r#"
-                (() => {{
-                    const c = document.getElementById('canvas').getContext('2d');
-                    function band(y0, y1) {{
+                (async () => {{
+                    async function band(y0, y1) {{
                         let sum = 0, n = 0;
                         for (let yy = y0; yy < y1; yy += 4) {{
                             for (let xx = {x}+8; xx < {x}+{w}; xx += 8) {{
-                                const p = c.getImageData(xx, yy, 1, 1).data;
+                                const p = await window.__readPixel(xx, yy);
                                 sum += 0.2126*p[0] + 0.7152*p[1] + 0.0722*p[2];
                                 n++;
                             }}
@@ -1196,9 +1313,9 @@ async fn assert_region_rendered(
                         return n ? sum / n : 0;
                     }}
                     return {{
-                        top:    band({y}, {y}+{h}/4|0),
-                        middle: band({y}+{h}/4|0, {y}+3*{h}/4|0),
-                        bottom: band({y}+3*{h}/4|0, {y}+{h}),
+                        top:    await band({y}, {y}+{h}/4|0),
+                        middle: await band({y}+{h}/4|0, {y}+3*{h}/4|0),
+                        bottom: await band({y}+3*{h}/4|0, {y}+{h}),
                     }};
                 }})()
                 "#,
@@ -1220,9 +1337,8 @@ async fn assert_region_rendered(
         RegionCheck::Changing => {
             let js = format!(
                 r#"
-                (() => {{
-                    const c = document.getElementById('canvas').getContext('2d');
-                    const data = c.getImageData({x}, {y}, {w}, {h}).data;
+                (async () => {{
+                    const data = await window.__readPixelRect({x}, {y}, {w}, {h});
                     let h = 0;
                     for (let i = 0; i < data.length; i++) h = ((h << 5) - h + data[i]) | 0;
                     return h;
@@ -1253,19 +1369,17 @@ async fn assert_region_rendered(
 /// sent alongside source fragments.
 #[tokio::test]
 async fn e2e_fec_parity_enabled() -> Result<()> {
-    let setup = setup_e2e_with_env("--solid-red", &[("GHOSTFRAME_FEC_K", "4")]).await?;
+    let setup = setup_e2e_webgpu_with_env("--solid-red", &[("GHOSTFRAME_FEC_K", "4")]).await?;
 
     // Wait for frames + QUIC congestion window
     tokio::time::sleep(Duration::from_secs(6)).await;
 
     // Scan for red pixel — same as e2e_solid_color but with FEC active
     let scan_js = r#"
-        (() => {
-            const canvas = document.getElementById('canvas');
-            const ctx = canvas.getContext('2d');
+        (async () => {
             for (let y = 16; y < 480; y += 32) {
                 for (let x = 16; x < 640; x += 32) {
-                    const p = ctx.getImageData(x, y, 1, 1).data;
+                    const p = await window.__readPixel(x, y);
                     if (p[0] > 180 && p[1] < 80 && p[2] < 80) {
                         return { found: true, x, y, r: p[0], g: p[1], b: p[2] };
                     }
@@ -1297,7 +1411,7 @@ async fn e2e_resolution_change() -> Result<()> {
     // Phase A: 1024×768 — server starts in this mode (first entry in
     // xorg-multi.conf's Modes list).
     let setup =
-        setup_e2e_with_env("--solid-red", &[("XORG_CONF", "/etc/X11/xorg-multi.conf")]).await?;
+        setup_e2e_webgpu_with_env("--solid-red", &[("XORG_CONF", "/etc/X11/xorg-multi.conf")]).await?;
 
     // Wait for QUIC slow-start + initial frames.
     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -1321,9 +1435,8 @@ async fn e2e_resolution_change() -> Result<()> {
         .page
         .evaluate(
             r#"
-            (() => {
-                const c = document.getElementById('canvas').getContext('2d');
-                const p = c.getImageData(512, 384, 1, 1).data;
+            (async () => {
+                const p = await window.__readPixel(512, 384);
                 return p[0] > 180 && p[1] < 80 && p[2] < 80;
             })()
         "#,
@@ -1383,9 +1496,8 @@ async fn e2e_resolution_change() -> Result<()> {
         .page
         .evaluate(
             r#"
-            (() => {
-                const c = document.getElementById('canvas').getContext('2d');
-                const p = c.getImageData(320, 240, 1, 1).data;
+            (async () => {
+                const p = await window.__readPixel(320, 240);
                 return p[0] > 180 && p[1] < 80 && p[2] < 80;
             })()
         "#,
@@ -1405,7 +1517,7 @@ async fn e2e_resolution_change() -> Result<()> {
 async fn e2e_multi_pattern() -> Result<()> {
     use ghostframe_test_pattern::mixed::{region, SETTLE};
 
-    let setup = setup_e2e("--mixed").await?;
+    let setup = setup_e2e_webgpu("--mixed").await?;
 
     // SETTLE is 7s — enough for QUIC slow-start to open and at least two
     // spinner frames to land.
@@ -1457,7 +1569,7 @@ async fn e2e_multi_pattern() -> Result<()> {
 /// `project_m33_static_refinement.md`.
 #[tokio::test]
 async fn e2e_mode_switch() -> Result<()> {
-    let setup = setup_e2e_gpu("--drm-direct --mode-switch-cycle 3").await?;
+    let setup = setup_e2e_webgpu_gpu("--drm-direct --mode-switch-cycle 3").await?;
 
     // 20 seconds: covers three full 6-second cycles plus startup settle.
     // The shorter 14s window occasionally hits a startup race where most
@@ -1604,7 +1716,7 @@ async fn e2e_mode_switch() -> Result<()> {
 ///    exit_sustain frames; ACK drop doesn't impact H.264 datagrams).
 #[tokio::test]
 async fn e2e_ack_loss() -> Result<()> {
-    let setup = setup_e2e_with_env(
+    let setup = setup_e2e_webgpu_with_env(
         "--solid-red",
         &[
             ("GHOSTFRAME_INBOUND_LOSS_PROBABILITY", "1.0"),
@@ -1617,12 +1729,10 @@ async fn e2e_ack_loss() -> Result<()> {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     let scan_js = r#"
-        (() => {
-            const canvas = document.getElementById('canvas');
-            const ctx = canvas.getContext('2d');
+        (async () => {
             for (let y = 16; y < 480; y += 32) {
                 for (let x = 16; x < 640; x += 32) {
-                    const p = ctx.getImageData(x, y, 1, 1).data;
+                    const p = await window.__readPixel(x, y);
                     if (p[0] > 180 && p[1] < 80 && p[2] < 80) {
                         return true;
                     }
@@ -1635,3 +1745,4 @@ async fn e2e_ack_loss() -> Result<()> {
     assert!(found, "canvas blank under 100% ACK drop — recovery broken");
     Ok(())
 }
+
