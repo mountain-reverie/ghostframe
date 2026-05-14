@@ -14,6 +14,8 @@ export enum PalRleVariant {
 
 export interface PalRleEntry {
   variant: PalRleVariant;
+  tileX: number;
+  tileY: number;
   paletteId: number;
   count: number;                 // 1..16
   indices: Uint8Array;           // 512 bytes (1024 × 4-bit indices, low-nibble = even pixel)
@@ -39,6 +41,8 @@ export type PrevalidateResult =
 export function prevalidatePalRle(
   payload: Uint8Array,
   shadow: PaletteShadow,
+  tileX: number,
+  tileY: number,
 ): PrevalidateResult {
   if (payload.length < 2) {
     return { ok: false, errorCode: ERR_PAYLOAD_TOO_SHORT };
@@ -62,6 +66,8 @@ export function prevalidatePalRle(
       ok: true,
       entry: {
         variant: PalRleVariant.IndicesRaw,
+        tileX,
+        tileY,
         paletteId,
         count: shadow.count(paletteId),
         indices,
@@ -103,6 +109,8 @@ export function prevalidatePalRle(
     ok: true,
     entry: {
       variant: bundled ? PalRleVariant.Bundled : PalRleVariant.Thin,
+      tileX,
+      tileY,
       paletteId,
       count,
       indices,
