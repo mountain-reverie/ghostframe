@@ -1,10 +1,12 @@
 import { initWebGpu, type WebGpuInitResult } from './init.js';
 import { Framebuffer } from './framebuffer.js';
 import { SolidPipeline, type SolidTile } from './solid.js';
+import { H264Pipeline } from './h264.js';
 
 export class WebGpuRenderer {
   framebuffer: Framebuffer;
   solidPipeline: SolidPipeline;
+  h264Pipeline: H264Pipeline;
 
   private constructor(
     private gpu: WebGpuInitResult,
@@ -12,6 +14,7 @@ export class WebGpuRenderer {
   ) {
     this.framebuffer = new Framebuffer(gpu.device, gpu.presentFormat);
     this.solidPipeline = new SolidPipeline(gpu.device);
+    this.h264Pipeline = new H264Pipeline(gpu.device);
   }
 
   static async create(canvas: HTMLCanvasElement): Promise<WebGpuRenderer> {
