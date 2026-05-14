@@ -41,6 +41,30 @@ export class WebGpuRenderer {
     this.palrlePipeline.resize(maxTiles, this.framebuffer.view);
   }
 
+  /**
+   * Upload a Raw tile's BGRA payload directly into the framebuffer's
+   * 32×32 region. Swaps BGRA→RGBA on CPU before upload (framebuffer
+   * format is rgba8unorm per Design D12).
+   */
+  writeRawTile(tileX: number, tileY: number, bgra: Uint8Array): void {
+    if (bgra.length !== 32 * 32 * 4) {
+      throw new Error(`writeRawTile: payload length ${bgra.length} != 4096`);
+    }
+    const rgba = new Uint8Array(bgra.length);
+    for (let i = 0; i < bgra.length; i += 4) {
+      rgba[i + 0] = bgra[i + 2]; // R from B-slot
+      rgba[i + 1] = bgra[i + 1]; // G
+      rgba[i + 2] = bgra[i + 0]; // B from R-slot
+      rgba[i + 3] = bgra[i + 3] === 0 ? 255 : bgra[i + 3]; // force alpha (BGRX quirk)
+    }
+    this.device.queue.writeTexture(
+      { texture: this.framebuffer.texture, origin: { x: tileX * 32, y: tileY * 32 } },
+      rgba,
+      { bytesPerRow: 32 * 4, rowsPerImage: 32 },
+      { width: 32, height: 32 },
+    );
+  }
+
   /** Render one rAF tick — for now, only the present blit. */
   encodeFrame(): void {
     const swapTex = this.context.getCurrentTexture();
