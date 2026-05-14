@@ -1,5 +1,3 @@
-import { PaletteCache, type Bgra, type PaletteId } from "./palette.js";
-
 export const DATAGRAM_HEADER_SIZE = 12;
 export const TILE_HEADER_SIZE = 8;
 export const TILE_SIZE = 32;
@@ -79,9 +77,8 @@ export class H264TileDecoder {
   constructor(private onFrame: (frame: VideoFrame) => void) {
     this.decoder = new VideoDecoder({
       output: (frame: VideoFrame) => {
-        if (this.latestFrame) {
-          this.latestFrame.close();
-        }
+        // M3.2b: the rAF tick is the sole closer of consumed VideoFrames.
+        // Do NOT auto-close the previous frame here.
         this.latestFrame = frame;
         this.onFrame(frame);
       },
@@ -241,119 +238,3 @@ export class FullFrameDecoder {
   }
 }
 
-export class PalRleDecodeError extends Error {
-    constructor(message: string) {
-        super(message);
-        this.name = "PalRleDecodeError";
-    }
-}
-
-export interface DecodedPalRle {
-    bgra: Uint8ClampedArray;
-    updatedPaletteId?: PaletteId;
-}
-
-/**
- * Decode a PalRle wire payload into 32×32 BGRA pixels.
- *
- * Wire layout:
- *   [0]    flags (bit 0 = palette_bundled)
- *   [1]    palette_id (0..255)
- *   if bundled:
- *     [2]    count (1..16)
- *     [3..]  count * 4 bytes BGRA palette colors
- *   [...]  nibble-packed RLE bytes (high nibble = idx, low nibble = run-1)
- *
- * Bundled payloads upsert the palette into the cache; thin payloads
- * require the cache to already contain the palette_id.
- */
-export function decodePalRle(
-    payload: Uint8Array,
-    cache: PaletteCache,
-): DecodedPalRle {
-    if (payload.length < 2) {
-        throw new PalRleDecodeError(`PalRle payload too short: ${payload.length}`);
-    }
-    let cursor = 0;
-    const flags = payload[cursor++];
-    const paletteId = payload[cursor++];
-    const bundled = (flags & 0x01) !== 0;
-
-    let palette: Bgra[];
-    let updated: PaletteId | undefined;
-
-    if (bundled) {
-        if (cursor >= payload.length) {
-            throw new PalRleDecodeError("PalRle bundled payload missing count");
-        }
-        const count = payload[cursor++];
-        if (count < 1 || count > 16) {
-            throw new PalRleDecodeError(`PalRle count ${count} out of range`);
-        }
-        if (cursor + count * 4 > payload.length) {
-            throw new PalRleDecodeError(
-                `PalRle bundled payload truncated: need ${count * 4} more bytes`,
-            );
-        }
-        const colors: Bgra[] = new Array(count);
-        for (let i = 0; i < count; i++) {
-            colors[i] = [
-                payload[cursor++],
-                payload[cursor++],
-                payload[cursor++],
-                payload[cursor++],
-            ];
-        }
-        cache.upsert(paletteId, colors);
-        palette = colors;
-        updated = paletteId;
-    } else {
-        const cached = cache.get(paletteId);
-        if (!cached) {
-            throw new PalRleDecodeError(
-                `PalRle thin payload references uncached palette ${paletteId}`,
-            );
-        }
-        palette = cached;
-    }
-
-    const bgra = new Uint8ClampedArray(32 * 32 * 4);
-    let pixelIdx = 0;
-    while (cursor < payload.length) {
-        const b = payload[cursor++];
-        const colorIdx = (b >> 4) & 0x0F;
-        const runLen = (b & 0x0F) + 1;
-        if (colorIdx >= palette.length) {
-            throw new PalRleDecodeError(
-                `palette index ${colorIdx} >= count ${palette.length}`,
-            );
-        }
-        const c = palette[colorIdx];
-        const bb = c[0];
-        const gg = c[1];
-        const rr = c[2];
-        let aa = c[3];
-        // Force alpha = 255 to work around X11 BGRX alpha=0 quirk
-        // (see memory: feedback_canvas_alpha.md).
-        if (aa === 0) aa = 255;
-        for (let i = 0; i < runLen; i++) {
-            if (pixelIdx >= 1024) {
-                throw new PalRleDecodeError(
-                    `PalRle decoded ${pixelIdx + 1} pixels, expected 1024`,
-                );
-            }
-            const offset = pixelIdx * 4;
-            bgra[offset] = bb;
-            bgra[offset + 1] = gg;
-            bgra[offset + 2] = rr;
-            bgra[offset + 3] = aa;
-            pixelIdx++;
-        }
-    }
-    if (pixelIdx !== 1024) {
-        throw new PalRleDecodeError(
-            `PalRle decoded ${pixelIdx} pixels, expected 1024`,
-        );
-    }
-    return { bgra, updatedPaletteId: updated };
-}
