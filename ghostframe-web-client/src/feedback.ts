@@ -54,3 +54,52 @@ export class LossTracker {
     return buf;
   }
 }
+
+// ---------------------------------------------------------------------------
+// HELLO message (msg_type = 0x03) — capability advertisement
+// ---------------------------------------------------------------------------
+
+export const HELLO_MSG_TYPE = 0x03;
+export const HELLO_SIZE = 2;
+
+export interface ClientCapabilities {
+  indicesRawEnabled: boolean;
+}
+
+export function encodeHello(caps: ClientCapabilities): Uint8Array {
+  let capsByte = 0;
+  if (caps.indicesRawEnabled) capsByte |= 0x01;
+  return new Uint8Array([HELLO_MSG_TYPE, capsByte]);
+}
+
+// ---------------------------------------------------------------------------
+// DECODE_ERROR message (msg_type = 0x04) — per-tile decode failure
+// ---------------------------------------------------------------------------
+
+export const DECODE_ERROR_MSG_TYPE = 0x04;
+export const DECODE_ERROR_SIZE = 5;
+
+export const ERR_PAYLOAD_TOO_SHORT = 1;
+export const ERR_COUNT_OUT_OF_RANGE = 2;
+export const ERR_THIN_UNCACHED_PALETTE = 3;
+export const ERR_BUNDLED_TRUNCATED = 4;
+export const ERR_INDEX_OOB = 5;
+export const ERR_RLE_OVERSHOOT = 6;
+export const ERR_RLE_UNDERSHOOT = 7;
+
+export interface DecodeErrorMsg {
+  codec: number;
+  tileX: number;
+  tileY: number;
+  errorCode: number;
+}
+
+export function encodeDecodeError(m: DecodeErrorMsg): Uint8Array {
+  return new Uint8Array([
+    DECODE_ERROR_MSG_TYPE,
+    m.codec & 0xFF,
+    m.tileX & 0xFF,
+    m.tileY & 0xFF,
+    m.errorCode & 0xFF,
+  ]);
+}
