@@ -248,6 +248,14 @@ impl IoBridge {
         ))
     }
 
+    /// Returns `true` when `GHOSTFRAME_DIAGNOSE_TILES` is set to `"1"` or `"true"`.
+    fn diagnose_tiles_from_env() -> bool {
+        matches!(
+            std::env::var("GHOSTFRAME_DIAGNOSE_TILES").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    }
+
     /// Create a new `IoBridge` by connecting to ghostbridge and opening a UDP
     /// listener on `listen_addr` (e.g. `":4443"`).
     pub async fn new(
@@ -664,6 +672,15 @@ impl IoBridge {
         self.frame_seq = self.frame_seq.wrapping_add(1);
         let seq = self.frame_seq;
 
+        // One-shot BGRA frame dump: write raw pixels to the path in
+        // GHOSTFRAME_DUMP_FRAME, then clear the env-var so subsequent frames
+        // are not re-dumped.
+        if let Ok(path) = std::env::var("GHOSTFRAME_DUMP_FRAME") {
+            let _ = std::fs::write(&path, &frame.pixels);
+            std::env::remove_var("GHOSTFRAME_DUMP_FRAME");
+            tracing::info!(target: "ghostframe::diagnose", "dumped frame to {}", path);
+        }
+
         // Determine the maximum fragment payload from the smallest connected
         // session's QUIC max datagram size.  Check for connected sessions
         // BEFORE updating the dirty tracker — otherwise the tracker consumes
@@ -890,6 +907,22 @@ impl IoBridge {
         // Persist tentative state back into per-tile metrics for dirty tiles only.
         for (i, &(tx, ty)) in dirty_xy.iter().enumerate() {
             self.metrics_tracker.get_mut(tx, ty).codec_state = tentative[i];
+        }
+
+        // Per-tile diagnostic tracing: emit one log line per dirty tile when
+        // GHOSTFRAME_DIAGNOSE_TILES=1 (or =true).  Parseable by downstream awk.
+        if Self::diagnose_tiles_from_env() {
+            for &(tx, ty) in &dirty_xy {
+                let m = self.metrics_tracker.get(tx, ty);
+                tracing::info!(
+                    target: "ghostframe::diagnose",
+                    tile_x = tx,
+                    tile_y = ty,
+                    unique_colors = m.unique_colors,
+                    codec_state = ?m.codec_state,
+                    "per-tile"
+                );
+            }
         }
 
         if new_mode != self.frame_mode {
@@ -2081,6 +2114,17 @@ mod tests {
         // Ensure no leftover from prior tests.
         std::env::remove_var("GHOSTFRAME_INBOUND_LOSS_PROBABILITY");
         assert!(IoBridge::loss_injector_from_env("INBOUND").is_none());
+    }
+
+    #[test]
+    fn diagnose_tiles_env_var_parses() {
+        std::env::set_var("GHOSTFRAME_DIAGNOSE_TILES", "1");
+        let on = IoBridge::diagnose_tiles_from_env();
+        std::env::remove_var("GHOSTFRAME_DIAGNOSE_TILES");
+        assert!(on);
+
+        let off = IoBridge::diagnose_tiles_from_env();
+        assert!(!off);
     }
 
     /// dispatch_dirty_tiles_via_scheduler emits Solid bytes when the GPU policy
