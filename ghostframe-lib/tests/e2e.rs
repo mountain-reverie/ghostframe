@@ -215,6 +215,14 @@ async fn setup_e2e_webgpu_gpu(test_pattern_args: &str) -> Result<E2eSetup> {
     setup_e2e_inner(test_pattern_args, &[], true, true).await
 }
 
+/// WebGPU client + GPU server bind-mount + extra env vars.
+async fn setup_e2e_webgpu_gpu_with_env(
+    test_pattern_args: &str,
+    extra_env: &[(&str, &str)],
+) -> Result<E2eSetup> {
+    setup_e2e_inner(test_pattern_args, extra_env, true, true).await
+}
+
 async fn setup_e2e_inner(
     test_pattern_args: &str,
     extra_env: &[(&str, &str)],
@@ -713,7 +721,7 @@ async fn e2e_solid_color_5pct_loss() -> Result<()> {
 async fn e2e_palrle_5pct_loss() -> Result<()> {
     use ghostframe_test_pattern::text_grid::SAMPLES;
 
-    let setup = setup_e2e_webgpu_with_env(
+    let setup = setup_e2e_webgpu_gpu_with_env(
         "--text-grid",
         &[
             ("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "0.05"),
@@ -776,7 +784,7 @@ async fn e2e_palrle_5pct_loss() -> Result<()> {
 async fn e2e_palrle_session_reset() -> Result<()> {
     use ghostframe_test_pattern::text_grid::SAMPLES;
 
-    let setup = setup_e2e_webgpu("--text-grid").await?;
+    let setup = setup_e2e_webgpu_gpu("--text-grid").await?;
 
     // Phase 1: let the initial connection settle and render text.
     tokio::time::sleep(Duration::from_secs(4)).await;
@@ -950,7 +958,7 @@ async fn e2e_codec_transition() -> Result<()> {
 #[tokio::test]
 async fn e2e_edge_tiles() -> Result<()> {
     let setup =
-        setup_e2e_webgpu_with_env("--solid-red", &[("XORG_CONF", "/etc/X11/xorg-odd.conf")]).await?;
+        setup_e2e_webgpu_gpu_with_env("--solid-red", &[("XORG_CONF", "/etc/X11/xorg-odd.conf")]).await?;
 
     // Wait for frames
     tokio::time::sleep(Duration::from_secs(6)).await;
@@ -1080,7 +1088,7 @@ async fn e2e_multi_tile_grid() -> Result<()> {
 async fn e2e_text_clarity() -> Result<()> {
     use ghostframe_test_pattern::text_grid::SAMPLES;
 
-    let setup = setup_e2e_webgpu("--text-grid").await?;
+    let setup = setup_e2e_webgpu_gpu("--text-grid").await?;
 
     // Allow QUIC slow-start + a couple of frames so every glyph tile arrives.
     tokio::time::sleep(Duration::from_secs(6)).await;
@@ -1164,7 +1172,7 @@ async fn e2e_text_clarity() -> Result<()> {
 /// 256-slot table must reuse via overwrite-eligible (delivered=true) slots.
 #[tokio::test]
 async fn e2e_palette_eviction() -> Result<()> {
-    let setup = setup_e2e_webgpu("--palette-churn 300").await?;
+    let setup = setup_e2e_webgpu_gpu("--palette-churn 300").await?;
 
     // ~8s for the pattern to play out at ~5 frames per region × 300.
     tokio::time::sleep(Duration::from_secs(8)).await;
