@@ -9,3 +9,4 @@ pub mod mixed;
 pub mod mode_switch;
 pub mod palette_churn;
 pub mod text_grid;
+pub mod text_grid_drm;

@@ -47,7 +47,7 @@ const BAND_H: u32 = 32;
 
 /// Thin wrapper around an open DRM device file so we can implement the
 /// `drm` crate's traits.
-struct Card(File);
+pub(crate) struct Card(pub(crate) File);
 
 impl AsFd for Card {
     fn as_fd(&self) -> BorrowedFd<'_> {
@@ -58,9 +58,25 @@ impl AsFd for Card {
 impl Device for Card {}
 impl ControlDevice for Card {}
 
-/// Become the DRM master, set up a dumb-buffer scanout, and run the
-/// static/motion paint loop.
-pub fn run(card_path: &str, half_cycle: Duration) -> Result<(), Box<dyn std::error::Error>> {
+/// All the DRM resources needed to paint into a scanout framebuffer each
+/// frame. Returned by [`setup_dumb_scanout`]; callers re-map per paint cycle.
+pub(crate) struct DrmScanout {
+    pub card: Card,
+    pub db: drm::control::dumbbuffer::DumbBuffer,
+    pub pitch: u32,
+    pub mode_w: u32,
+    pub mode_h: u32,
+}
+
+/// Open the DRM device at `card_path`, acquire master, pick the first
+/// connected connector + mode, allocate a dumb buffer, attach it as a
+/// framebuffer, pre-fill with [`STATIC_BG_PIXEL`], and call `set_crtc`.
+///
+/// Returns a [`DrmScanout`] the caller uses to re-map and repaint each frame.
+/// The framebuffer stays bound until the process exits (kernel cleanup).
+pub(crate) fn setup_dumb_scanout(
+    card_path: &str,
+) -> Result<DrmScanout, Box<dyn std::error::Error>> {
     let file = File::options()
         .read(true)
         .write(true)
@@ -167,6 +183,20 @@ pub fn run(card_path: &str, half_cycle: Duration) -> Result<(), Box<dyn std::err
         Some(mode),
     )
     .map_err(|e| format!("set_crtc: {e}"))?;
+
+    Ok(DrmScanout {
+        card,
+        db,
+        pitch,
+        mode_w,
+        mode_h,
+    })
+}
+
+/// Become the DRM master, set up a dumb-buffer scanout, and run the
+/// static/motion paint loop.
+pub fn run(card_path: &str, half_cycle: Duration) -> Result<(), Box<dyn std::error::Error>> {
+    let mut scanout = setup_dumb_scanout(card_path)?;
     eprintln!("drm_direct: scanout active — entering paint loop");
 
     let cycle = half_cycle * 2;
@@ -176,14 +206,28 @@ pub fn run(card_path: &str, half_cycle: Duration) -> Result<(), Box<dyn std::err
         let cycle_start = Instant::now();
 
         // Static half: paint the buffer once with the solid colour.
-        fill_solid(&card, &mut db, pitch, mode_w, mode_h, STATIC_BG_PIXEL)?;
+        fill_solid(
+            &scanout.card,
+            &mut scanout.db,
+            scanout.pitch,
+            scanout.mode_w,
+            scanout.mode_h,
+            STATIC_BG_PIXEL,
+        )?;
         thread::sleep(half_cycle);
 
         // Motion half: rewrite tile-aligned bands of shifting colours every
         // MOTION_TICK so the capture grid sees fresh dirty tiles every frame.
         let motion_deadline = cycle_start + cycle;
         while Instant::now() < motion_deadline {
-            paint_motion(&card, &mut db, pitch, mode_w, mode_h, motion_phase)?;
+            paint_motion(
+                &scanout.card,
+                &mut scanout.db,
+                scanout.pitch,
+                scanout.mode_w,
+                scanout.mode_h,
+                motion_phase,
+            )?;
             motion_phase = motion_phase.wrapping_add(7);
             thread::sleep(MOTION_TICK);
         }
@@ -228,7 +272,7 @@ fn fill_solid(
 /// are also exposed (read-side) to a Vulkan importer via PRIME-exported
 /// DMA-BUF. Without this, GPU reads can lag by a frame or two and the
 /// SAD-based dirty detector sees zero changes.
-fn msync_buffer(bytes: &mut [u8]) {
+pub(crate) fn msync_buffer(bytes: &mut [u8]) {
     // SAFETY: `bytes` came from a successful `map_dumb_buffer` mmap, so
     // (ptr, len) is a valid mapped region. MS_SYNC blocks until writes are
     // committed; MS_INVALIDATE drops other-mapping cache lines.
