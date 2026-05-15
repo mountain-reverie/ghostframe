@@ -371,6 +371,12 @@ impl IoBridge {
 
     /// Dispatch to GPU or CPU pipeline depending on whether a DMA-BUF fd is
     /// available and the GPU dirty tracker has been initialized.
+    ///
+    /// NOTE: `GHOSTFRAME_DUMP_FRAME` only fires on the CPU path. The DRM/DMA-BUF
+    /// capture backend sets `frame.pixels = Vec::new()` and puts pixel data
+    /// exclusively in the DMA-BUF fd, so there is nothing to dump here without a
+    /// DMA-BUF readback (out of scope for M3.2c). If you need a raw-BGRA dump on
+    /// the GPU path, implement DMA-BUF readback in `process_frame_gpu` first.
     fn process_frame(&mut self, frame: FrameSubmission) {
         if frame.dmabuf_fd.is_some() && self.gpu_frame_processor.is_some() {
             self.process_frame_gpu(frame);
@@ -675,6 +681,13 @@ impl IoBridge {
         // One-shot BGRA frame dump: write raw pixels to the path in
         // GHOSTFRAME_DUMP_FRAME, then clear the env-var so subsequent frames
         // are not re-dumped.
+        //
+        // CPU-path only: the DRM/DMA-BUF capture backend (GPU path) always
+        // constructs FrameSubmission with `pixels = Vec::new()`, placing pixel
+        // data exclusively in the DMA-BUF fd. Hoisting this block to
+        // `process_frame()` would therefore write zero bytes on the GPU path.
+        // DMA-BUF readback support (to make this work on the GPU path) is
+        // deferred beyond M3.2c.
         if let Ok(path) = std::env::var("GHOSTFRAME_DUMP_FRAME") {
             let _ = std::fs::write(&path, &frame.pixels);
             std::env::remove_var("GHOSTFRAME_DUMP_FRAME");
