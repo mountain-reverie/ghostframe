@@ -1498,6 +1498,13 @@ impl IoBridge {
             .par_iter()
             .map(|p| {
                 let payload = if !p.bundled && caps.indices_raw_enabled {
+                    tracing::info!(
+                        target: "palrle.wire",
+                        palette_id = p.palette_id,
+                        tile_x = p.tile_xy.0,
+                        tile_y = p.tile_xy.1,
+                        "indices_raw emitted"
+                    );
                     crate::encoder::pal_rle::encode_pal_rle_payload_indices_raw(
                         &p.indices,
                         p.palette_id,

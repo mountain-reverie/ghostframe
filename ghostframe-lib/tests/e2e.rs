@@ -1798,3 +1798,160 @@ async fn e2e_ack_loss() -> Result<()> {
     Ok(())
 }
 
+
+/// M3.2b: verifies the client emits a HELLO (msg_type 0x03) immediately
+/// after `await transport.ready`, and that the server parses it via the
+/// new `dispatch_feedback_bytes` path and applies `indices_raw_enabled`.
+///
+/// Scraping `docker logs ghostframe-server` is the cheapest assertion
+/// path: `apply_hello` emits `HELLO received, client capabilities updated
+/// indices_raw=true` at INFO level. If both substrings appear, the
+/// HELLO message arrived, was parsed, and updated the per-bridge caps.
+///
+/// The companion "indices_raw emitted" assertion (that PalRle thin tiles
+/// flip to the new wire variant) is deferred to M3.2c — it requires the
+/// test-pattern → Xorg-on-VKMS → modesetting-FB capture path to produce
+/// PalRle-feasible content, which it currently does not. See the
+/// `project_m32c_deferred` memory note.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_indices_raw_handshake() -> Result<()> {
+    let _setup = setup_e2e_webgpu("--solid-red").await?;
+
+    // Allow time for: page load -> WebGPU init -> WebTransport.ready ->
+    // feedback bidi stream open -> HELLO write -> server parse.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let out = std::process::Command::new("docker")
+        .args(["logs", "ghostframe-server"])
+        .output()
+        .expect("running docker logs");
+    let raw_logs = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    // tracing-subscriber emits ANSI color escapes around field names/values
+    // when stdout is a TTY. Strip them so substring assertions are stable.
+    let logs: String = raw_logs.chars().fold((String::new(), false), |(mut acc, in_esc), c| {
+        if in_esc {
+            (acc, c != 'm')
+        } else if c == '\x1b' {
+            (acc, true)
+        } else {
+            acc.push(c);
+            (acc, false)
+        }
+    }).0;
+
+    assert!(
+        logs.contains("HELLO received"),
+        "expected 'HELLO received' tracing line in server logs; got:\n{logs}"
+    );
+    assert!(
+        logs.contains("indices_raw=true"),
+        "expected 'indices_raw=true' in server logs (caps payload); got:\n{logs}"
+    );
+
+    Ok(())
+}
+
+/// M3.2b: round-trip test for the decode-error wire protocol —
+/// loss injection drops every bundled PalRle datagram, so the client
+/// receives thin payloads referencing palettes it never cached. Phase 1
+/// taxonomy says this is error_code=3 (ERR_THIN_UNCACHED_PALETTE); the
+/// client emits a 0x04 DECODE_ERROR; the server's `handle_decode_error`
+/// calls `force_rebundle`, clearing the `delivered` bit so the next
+/// dirty pass re-bundles the palette.
+///
+/// **Deferred to M3.2c**: this round-trip requires PalRle tiles to be
+/// emitted in the first place, which the current Xorg-on-VKMS +
+/// modesetting-FB capture path does not do for `--text-grid`. The
+/// server-side logic IS covered by unit tests
+/// (`decode_error_3_triggers_force_rebundle`,
+/// `decode_error_other_codes_no_op_on_palette_table`); the client-side
+/// wire encoding is covered by `tests/decode_error_batcher.test.ts`.
+/// What's missing is the full integration. Re-enable once M3.2c repairs
+/// the capture path. See `project_m32c_deferred` memory note.
+#[ignore = "M3.2c: requires PalRle wire emission which the test capture path doesn't yield"]
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_decode_error_thin_uncached() -> Result<()> {
+    let _setup = setup_e2e_webgpu_gpu_with_env(
+        "--text-grid",
+        &[
+            ("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "1.0"),
+            ("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE", "palrle_bundled"),
+            ("GHOSTFRAME_OUTBOUND_LOSS_SEED", "42"),
+        ],
+    )
+    .await?;
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let out = std::process::Command::new("docker")
+        .args(["logs", "ghostframe-server"])
+        .output()
+        .expect("running docker logs");
+    let raw_logs = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let logs: String = raw_logs.chars().fold((String::new(), false), |(mut acc, in_esc), c| {
+        if in_esc {
+            (acc, c != 'm')
+        } else if c == '\x1b' {
+            (acc, true)
+        } else {
+            acc.push(c);
+            (acc, false)
+        }
+    }).0;
+
+    let force_rebundle_count = logs.matches("force_rebundle").count();
+    assert!(
+        force_rebundle_count > 0,
+        "expected >=1 'force_rebundle' lines in server logs; got 0. logs:\n{logs}"
+    );
+    Ok(())
+}
+
+/// M3.2b: verifies the SwiftShader/CPU WebGPU adapter path actually works.
+///
+/// On Xvfb (the test harness), Mesa Vulkan can't initialise (no DRI3), so
+/// Chromium's `--enable-unsafe-webgpu` falls back to a software adapter.
+/// This test confirms a frame still renders end-to-end through that path.
+/// It is a sanity guard: if a future change re-enables `--use-vulkan`,
+/// this test will hang on `requestAdapter()` and surface the regression.
+///
+/// (There is no separate "real GPU" path under the current harness; the
+/// host's hardware Vulkan would only be exercised by running outside
+/// Xvfb, which is out of scope.)
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_webgpu_fallback_swiftshader() -> Result<()> {
+    let setup = setup_e2e_webgpu("--solid-red").await?;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Scan for at least one red pixel — the same shape as e2e_solid_color
+    // but using a coarser tolerance (SwiftShader colour conversion can be
+    // slightly off in the H.264 fast path).
+    let scan_js = r#"
+        (async () => {
+            for (let y = 16; y < 480; y += 32) {
+                for (let x = 16; x < 640; x += 32) {
+                    const p = await window.__readPixel(x, y);
+                    if (p[0] > 150 && p[1] < 100 && p[2] < 100) {
+                        return { found: true, x, y, r: p[0], g: p[1], b: p[2] };
+                    }
+                }
+            }
+            return { found: false };
+        })()
+    "#;
+    let scan: serde_json::Value = setup.page.evaluate(scan_js).await?.into_value()?;
+    let found = scan.get("found").and_then(|v| v.as_bool()).unwrap_or(false);
+    assert!(
+        found,
+        "no red pixel rendered through SwiftShader WebGPU path; scan returned {scan}"
+    );
+    Ok(())
+}
