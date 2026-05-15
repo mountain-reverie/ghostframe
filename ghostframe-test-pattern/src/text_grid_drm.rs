@@ -12,12 +12,14 @@ use drm::control::Device as ControlDevice;
 
 use crate::drm_direct::{msync_buffer, setup_dumb_scanout};
 use crate::font::{pixel_set, GLYPH_H, GLYPH_W};
-use crate::text_grid::{BG_PIXEL, FG_PIXEL, ORIGIN_X, ORIGIN_Y, TEXT};
+use crate::text_grid::{char_origin, BG_PIXEL, FG_PIXEL, TEXT};
 
-/// Repaint interval — beats capture rate so the SAD detector sees fresh
-/// pixels every capture. Matches the rationale in drm_direct.rs's
-/// MOTION_TICK (~60 Hz paint beats any reasonable capture FPS).
-const REPAINT_INTERVAL: Duration = Duration::from_millis(33); // ~30 Hz, conservative
+/// Repaint interval — content is static (text doesn't change frame-to-frame),
+/// so 30 Hz is sufficient: each capture sees a freshly-written buffer, the
+/// SAD detector reports the tile as unchanged and skip-codec kicks in.
+/// drm_direct.rs's MOTION_TICK (16 ms) is for dynamic content where every
+/// capture needs new pixels; we don't need that here.
+const REPAINT_INTERVAL: Duration = Duration::from_millis(33); // ~30 Hz
 
 pub fn run(card_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut scanout = setup_dumb_scanout(card_path)?;
@@ -51,8 +53,7 @@ pub fn run(card_path: &str) -> Result<(), Box<dyn std::error::Error>> {
         // Foreground glyphs.
         let fg_bytes = FG_PIXEL.to_le_bytes();
         for (n, ch) in TEXT.chars().enumerate() {
-            let gx0 = ORIGIN_X + n as u32 * GLYPH_W;
-            let gy0 = ORIGIN_Y;
+            let (gx0, gy0) = char_origin(n);
             for py in 0..GLYPH_H {
                 for px in 0..GLYPH_W {
                     if pixel_set(ch, px, py) {

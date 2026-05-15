@@ -70,7 +70,11 @@ pub(crate) struct DrmScanout {
 
 /// Open the DRM device at `card_path`, acquire master, pick the first
 /// connected connector + mode, allocate a dumb buffer, attach it as a
-/// framebuffer, pre-fill with [`STATIC_BG_PIXEL`], and call `set_crtc`.
+/// framebuffer, and call `set_crtc`.
+///
+/// The dumb buffer is zero-initialised (black) at this point; callers are
+/// responsible for filling it with their own background before entering their
+/// paint loop.
 ///
 /// Returns a [`DrmScanout`] the caller uses to re-map and repaint each frame.
 /// The framebuffer stays bound until the process exits (kernel cleanup).
@@ -159,7 +163,7 @@ pub(crate) fn setup_dumb_scanout(
     eprintln!("drm_direct: CRTC handle = {:?}", crtc_handle);
 
     // Create the dumb buffer that will be the scanout source.
-    let mut db = card
+    let db = card
         .create_dumb_buffer((mode_w, mode_h), DrmFourcc::Xrgb8888, 32)
         .map_err(|e| format!("create_dumb_buffer({mode_w}x{mode_h}): {e}"))?;
     let pitch = db.pitch();
@@ -169,9 +173,6 @@ pub(crate) fn setup_dumb_scanout(
     let fb = card
         .add_framebuffer(&db, 24, 32)
         .map_err(|e| format!("add_framebuffer: {e}"))?;
-
-    // Pre-fill with the static background so set_crtc has valid content.
-    fill_solid(&card, &mut db, pitch, mode_w, mode_h, STATIC_BG_PIXEL)?;
 
     // Modeset: bind FB to CRTC and connector. This is where master-conflict
     // EACCES would surface.
@@ -197,6 +198,15 @@ pub(crate) fn setup_dumb_scanout(
 /// static/motion paint loop.
 pub fn run(card_path: &str, half_cycle: Duration) -> Result<(), Box<dyn std::error::Error>> {
     let mut scanout = setup_dumb_scanout(card_path)?;
+    // Pre-fill with the static background before the first capture sees any pixels.
+    fill_solid(
+        &scanout.card,
+        &mut scanout.db,
+        scanout.pitch,
+        scanout.mode_w,
+        scanout.mode_h,
+        STATIC_BG_PIXEL,
+    )?;
     eprintln!("drm_direct: scanout active — entering paint loop");
 
     let cycle = half_cycle * 2;
