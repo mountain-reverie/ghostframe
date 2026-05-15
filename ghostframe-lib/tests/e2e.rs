@@ -92,8 +92,9 @@ async fn e2e_quic_ping_pong_over_tailscale() -> Result<()> {
         .join("ghostframe-web-client/dist");
     let static_addr = helpers::start_static_server(dist_dir).await?;
 
-    // Use DISPLAY=:0 (no --headless) so WebGPU requestAdapter() succeeds.
-    // headless=new blocks GPU adapters; running against the host X session fixes it.
+    // Spawn a private Xvfb (own xauth, own display number) so WebGPU
+    // initialization doesn't depend on the host LightDM session.
+    let _xvfb = helpers::spawn_xvfb()?;
     let chrome_profile = std::env::temp_dir().join(format!(
         "chromiumoxide-{}-{}",
         std::process::id(),
@@ -108,13 +109,24 @@ async fn e2e_quic_ping_pong_over_tailscale() -> Result<()> {
             .no_sandbox()
             .user_data_dir(&chrome_profile)
             .with_head()
-            .env("DISPLAY", ":0")
-            // Use tuple form so "Vulkan,WebGPU" merges into DEFAULT_ARGS'
-            // "enable-features" entry (key "enable-features") rather than
-            // creating a separate "enable-features=Vulkan,WebGPU" key.
-            // Chrome 147+ only honours one --enable-features flag per key.
-            .arg(("enable-features", "Vulkan,WebGPU"))
-            .arg("use-vulkan")
+            .env("DISPLAY", _xvfb.display.clone())
+            .env("XAUTHORITY", _xvfb.xauth_path().to_string_lossy().to_string())
+            // IMPORTANT: do NOT force Vulkan (no `--use-vulkan`, no
+            // `Vulkan` in `--enable-features`) on a private Xvfb display.
+            // Mesa's `radeon_icd` Vulkan driver requires DRI3 for
+            // swapchain presentation; Xvfb does not implement DRI3.
+            // With Vulkan forced on, the GPU process fails Skia/GrContext
+            // init and Dawn's `requestAdapter()` hangs forever — the page
+            // never reaches `new WebTransport()` and the test times out
+            // with status stuck on "Connecting...".
+            //
+            // `--enable-unsafe-webgpu` lets Chromium expose the
+            // SwiftShader/OpenGL fallback adapter on displays without a
+            // real GPU+DRI3 path. Tuple form merges with DEFAULT_ARGS'
+            // existing `enable-features` entry (Chrome 147+ only honours
+            // the first --enable-features key).
+            .arg(("enable-features", "WebGPU"))
+            .arg("enable-unsafe-webgpu")
             .arg("ignore-gpu-blocklist")
             .build()
             .unwrap(),
@@ -173,6 +185,9 @@ struct E2eSetup {
     _handler_task: tokio::task::JoinHandle<()>,
     _test_node: helpers::TestNode,
     _forwarder: SocketAddr,
+    /// Private Xvfb instance for WebGPU runs. Dropped after the browser to
+    /// ensure Chrome detaches from the X server before it's killed.
+    _xvfb: Option<helpers::XvfbGuard>,
     page: chromiumoxide::Page,
 }
 
@@ -316,36 +331,44 @@ async fn setup_e2e_inner(
         .chrome_executable("/usr/bin/chromium")
         .no_sandbox()
         .user_data_dir(&chrome_profile_dir);
+    // When `webgpu == true`, Chromium needs a real X display (Ozone headless
+    // disables GPU adapters). We spawn a private Xvfb rather than reusing
+    // the host's :0 — no LightDM xauth coupling, no session-state surprises,
+    // and the X server is torn down deterministically on test drop.
+    let xvfb = if webgpu {
+        let guard = helpers::spawn_xvfb()?;
+        builder = builder
+            .with_head()
+            .env("DISPLAY", guard.display.clone())
+            .env("XAUTHORITY", guard.xauth_path().to_string_lossy().to_string());
+        Some(guard)
+    } else {
+        None
+    };
     if webgpu {
-        // Use a real X display so the GPU/WebGPU backend can initialise.
-        // `--headless=new` (new_headless_mode) uses Chromium's Ozone backend
-        // which disables GPU adapters; requestAdapter() always returns null.
-        // `.with_head()` passes NO --headless flag; DISPLAY=:0 routes rendering
-        // through the host's live X session (LightDM on :0).
-        builder = builder.with_head().env("DISPLAY", ":0");
-
-        let has_gpu = !force_swiftshader && std::path::Path::new("/dev/dri/renderD128").exists();
-        if has_gpu {
-            // IMPORTANT: chromiumoxide's ArgsBuilder merges values into the same
-            // HashMap entry when the key matches.  The DEFAULT_ARGS already contains
-            // `--enable-features=NetworkService,NetworkServiceInProcess`.  Passing
-            // the tuple form ("enable-features", "Vulkan,WebGPU") adds "Vulkan,WebGPU"
-            // to that same entry, producing a single merged flag:
-            //   --enable-features=NetworkService,NetworkServiceInProcess,Vulkan,WebGPU
-            //
-            // Passing a bare string "enable-features=Vulkan,WebGPU" would create a
-            // SEPARATE HashMap key and Chrome 147+ only honours the first occurrence,
-            // leaving WebGPU disabled.
-            builder = builder
-                .arg(("enable-features", "Vulkan,WebGPU"))
-                .arg("use-vulkan")
-                .arg("ignore-gpu-blocklist");
-        } else {
-            builder = builder
-                .arg("enable-unsafe-swiftshader")
-                .arg(("enable-features", "Vulkan,WebGPU"))
-                .arg(("use-angle", "swiftshader"));
-        }
+        // IMPORTANT: do NOT pass `--use-vulkan` or include `Vulkan` in the
+        // `--enable-features` set when running on a private Xvfb. Mesa's
+        // `radeon_icd` Vulkan driver requires DRI3 for swapchain presentation
+        // (`MESA: info: vulkan: No DRI3 support detected - required for
+        // presentation`); Xvfb does not implement DRI3. With Vulkan forced on,
+        // the GPU process fails to create its Skia/GrContext and Dawn's
+        // `requestAdapter()` HANGS forever, blocking the page before any
+        // WebTransport call is made — the test then times out after 30s with
+        // status stuck on "Connecting...".
+        //
+        // Solution: enable WebGPU without forcing Vulkan, and pass
+        // `--enable-unsafe-webgpu` so Chromium accepts the SwiftShader/OpenGL
+        // fallback adapter. This works on both Xvfb and a real X session.
+        //
+        // chromiumoxide's ArgsBuilder merges tuple-form args into the same
+        // HashMap entry that DEFAULT_ARGS uses (`enable-features`), giving a
+        // single combined `--enable-features=NetworkService,...,WebGPU` flag.
+        // Chrome 147+ only honours the first occurrence of each flag.
+        builder = builder
+            .arg(("enable-features", "WebGPU"))
+            .arg("enable-unsafe-webgpu")
+            .arg("ignore-gpu-blocklist");
+        let _ = force_swiftshader; // kept for future opt-in; SwiftShader is now the default fallback path.
     } else {
         builder = builder.new_headless_mode();
     }
@@ -393,6 +416,7 @@ async fn setup_e2e_inner(
         _handler_task: handler_task,
         _test_node: test_node,
         _forwarder: forwarder,
+        _xvfb: xvfb,
         page,
     })
 }
@@ -447,8 +471,9 @@ async fn e2e_raw_frame_round_trip() -> Result<()> {
         .join("ghostframe-web-client/dist");
     let static_addr = helpers::start_static_server(dist_dir).await?;
 
-    // Use DISPLAY=:0 (no --headless) so WebGPU requestAdapter() succeeds.
-    // headless=new blocks GPU adapters; running against the host X session fixes it.
+    // Spawn a private Xvfb (own xauth, own display number) so WebGPU
+    // initialization doesn't depend on the host LightDM session.
+    let _xvfb = helpers::spawn_xvfb()?;
     let chrome_profile = std::env::temp_dir().join(format!(
         "chromiumoxide-{}-{}",
         std::process::id(),
@@ -463,11 +488,14 @@ async fn e2e_raw_frame_round_trip() -> Result<()> {
             .no_sandbox()
             .user_data_dir(&chrome_profile)
             .with_head()
-            .env("DISPLAY", ":0")
-            // Tuple form merges into DEFAULT_ARGS' "enable-features" entry so
-            // Chrome sees a single --enable-features=...,Vulkan,WebGPU flag.
-            .arg(("enable-features", "Vulkan,WebGPU"))
-            .arg("use-vulkan")
+            .env("DISPLAY", _xvfb.display.clone())
+            .env("XAUTHORITY", _xvfb.xauth_path().to_string_lossy().to_string())
+            // Do NOT force Vulkan on Xvfb — see the long comment in
+            // `e2e_quic_ping_pong_over_tailscale` and `setup_e2e_inner`.
+            // Mesa Vulkan needs DRI3 which Xvfb lacks, and forcing it
+            // hangs Dawn's `requestAdapter()` indefinitely.
+            .arg(("enable-features", "WebGPU"))
+            .arg("enable-unsafe-webgpu")
             .arg("ignore-gpu-blocklist")
             .build()
             .unwrap(),

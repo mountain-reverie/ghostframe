@@ -218,3 +218,125 @@ pub async fn docker_run_in_container(
         out.status.code().unwrap_or(-1),
     ))
 }
+
+// ---------------------------------------------------------------------------
+// Xvfb test display
+// ---------------------------------------------------------------------------
+
+use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::PathBuf;
+use std::process::{Child, Command};
+use std::time::Instant;
+
+/// Owns a Xvfb child process + its xauth cookie file. Drop kills the X
+/// server and removes the auth file, isolating tests from the host's
+/// LightDM session (no DISPLAY=:0 / no /run/lightdm/root/:0 dependency).
+pub struct XvfbGuard {
+    child: Child,
+    xauth_path: PathBuf,
+    pub display: String,
+}
+
+impl XvfbGuard {
+    pub fn xauth_path(&self) -> &Path {
+        &self.xauth_path
+    }
+}
+
+impl Drop for XvfbGuard {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_file(&self.xauth_path);
+    }
+}
+
+/// Spawn a private Xvfb instance on the first free display in :99..:199.
+/// Returns once the X11 unix socket appears (or after 10 s deadline).
+///
+/// The xauth cookie is a fresh 16-byte random value written in
+/// MIT-MAGIC-COOKIE-1 format with `family = FamilyWild`; this matches
+/// any client and avoids the hostname-lookup the FamilyLocal path needs.
+pub fn spawn_xvfb() -> Result<XvfbGuard> {
+    let display_num = find_free_display()?;
+    let display = format!(":{display_num}");
+
+    let mut cookie = [0u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .context("opening /dev/urandom for xauth cookie")?
+        .read_exact(&mut cookie)
+        .context("reading /dev/urandom")?;
+
+    let xauth_path = std::env::temp_dir().join(format!(
+        "ghostframe-e2e-xauth-{}-{}",
+        std::process::id(),
+        display_num,
+    ));
+    write_xauth_file(&xauth_path, display_num, &cookie)
+        .context("writing xauth file")?;
+
+    let child = Command::new("Xvfb")
+        .arg(&display)
+        .args(["-screen", "0", "1920x1080x24"])
+        .args(["-auth", xauth_path.to_str().unwrap()])
+        .arg("-nolisten").arg("tcp")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("spawning Xvfb (is xorg-server-xvfb installed?)")?;
+
+    // Wait for the X11 unix socket to appear.
+    let socket_path = format!("/tmp/.X11-unix/X{display_num}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !Path::new(&socket_path).exists() {
+        if Instant::now() > deadline {
+            return Err(anyhow!("Xvfb {display} did not start within 10s"));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    Ok(XvfbGuard {
+        child,
+        xauth_path,
+        display,
+    })
+}
+
+fn find_free_display() -> Result<u32> {
+    for n in 99..200 {
+        let socket = format!("/tmp/.X11-unix/X{n}");
+        if !Path::new(&socket).exists() {
+            return Ok(n);
+        }
+    }
+    Err(anyhow!("no free X display number in 99..200"))
+}
+
+fn write_xauth_file(path: &Path, display_num: u32, cookie: &[u8; 16]) -> std::io::Result<()> {
+    let display_str = display_num.to_string();
+    let name = b"MIT-MAGIC-COOKIE-1";
+
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+
+    // family = 0xFFFF (FamilyWild — matches any client family/host)
+    f.write_all(&0xFFFFu16.to_be_bytes())?;
+    // empty address
+    f.write_all(&0u16.to_be_bytes())?;
+    // display number as a decimal string
+    f.write_all(&(display_str.len() as u16).to_be_bytes())?;
+    f.write_all(display_str.as_bytes())?;
+    // protocol name
+    f.write_all(&(name.len() as u16).to_be_bytes())?;
+    f.write_all(name)?;
+    // cookie payload
+    f.write_all(&(cookie.len() as u16).to_be_bytes())?;
+    f.write_all(cookie)?;
+
+    Ok(())
+}
