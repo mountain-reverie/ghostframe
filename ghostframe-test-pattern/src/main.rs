@@ -70,6 +70,14 @@ struct Args {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
+    // DRM-direct text-grid mode: paint text glyphs directly to scanout,
+    // bypassing Xorg. Required for E2E tests where Xorg-on-VKMS yields
+    // >16 unique colours per tile and PalRle never wins classification.
+    // See docs/superpowers/specs/2026-05-15-m3.2c-verification-design.md.
+    if args.drm_direct && args.text_grid {
+        return ghostframe_test_pattern::text_grid_drm::run(&args.drm_device);
+    }
+
     // DRM-direct path: take DRM master and paint straight to scanout.
     // Must run before any X11 connect attempt — there is no X server in
     // this configuration.
