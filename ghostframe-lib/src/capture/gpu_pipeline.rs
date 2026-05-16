@@ -1780,13 +1780,13 @@ impl GpuFrameProcessor {
                 nv12_uv_offset,
                 tile_analysis: self.analysis_ptr as *const TileAnalysis,
                 tile_analysis_len: cols * rows,
-                palrle_compact_list: std::ptr::null(),
-                palrle_compact_count: 0,
-                frame_palette_set: std::ptr::null(),
-                frame_palette_set_count: 0,
-                per_tile_frame_palette_id: std::ptr::null(),
-                folded_into: std::ptr::null(),
-                index_buffer: std::ptr::null(),
+                palrle_compact_list: self.palrle_compact_list_ptr as *const u32,
+                palrle_compact_count: *self.palrle_compact_count_ptr,
+                frame_palette_set: self.frame_palette_set_ptr as *const FramePaletteEntryRaw,
+                frame_palette_set_count: *self.frame_palette_count_ptr,
+                per_tile_frame_palette_id: self.per_tile_frame_palette_id_ptr as *const u8,
+                folded_into: self.folded_into_ptr as *const u32,
+                index_buffer: self.index_buffer_ptr as *const u8,
             });
         }
 
@@ -3129,6 +3129,297 @@ impl GpuFrameProcessor {
         ];
         self.device.update_descriptor_sets(&analysis_writes, &[]);
 
+        // Allocate descriptor sets for Stages 1.5-3 (all RAII-guarded).
+        let palrle_compact_set_layouts = [self.palrle_compact_descriptor_set_layout];
+        let palrle_compact_ds_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(&palrle_compact_set_layouts);
+        let palrle_compact_ds_guard = ScopedDescriptorSets {
+            device: &self.device,
+            pool: self.descriptor_pool,
+            sets: self.device.allocate_descriptor_sets(&palrle_compact_ds_alloc)?,
+        };
+        let palrle_compact_ds = palrle_compact_ds_guard.sets[0];
+
+        let palrle_indirect_args_set_layouts = [self.palrle_indirect_args_descriptor_set_layout];
+        let palrle_indirect_args_ds_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(&palrle_indirect_args_set_layouts);
+        let palrle_indirect_args_ds_guard = ScopedDescriptorSets {
+            device: &self.device,
+            pool: self.descriptor_pool,
+            sets: self.device.allocate_descriptor_sets(&palrle_indirect_args_ds_alloc)?,
+        };
+        let palrle_indirect_args_ds = palrle_indirect_args_ds_guard.sets[0];
+
+        let palette_fold_ds_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(std::slice::from_ref(&self.palette_fold_descriptor_set_layout));
+        let palette_fold_ds_guard = ScopedDescriptorSets {
+            device: &self.device,
+            pool: self.descriptor_pool,
+            sets: self.device.allocate_descriptor_sets(&palette_fold_ds_alloc)?,
+        };
+        let palette_fold_descriptor_set = palette_fold_ds_guard.sets[0];
+
+        let palette_subset_fold_init_ds_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(std::slice::from_ref(
+                &self.palette_subset_fold_init_descriptor_set_layout,
+            ));
+        let palette_subset_fold_init_ds_guard = ScopedDescriptorSets {
+            device: &self.device,
+            pool: self.descriptor_pool,
+            sets: self
+                .device
+                .allocate_descriptor_sets(&palette_subset_fold_init_ds_alloc)?,
+        };
+        let palette_subset_fold_init_descriptor_set =
+            palette_subset_fold_init_ds_guard.sets[0];
+
+        let palette_subset_fold_ds_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(std::slice::from_ref(
+                &self.palette_subset_fold_descriptor_set_layout,
+            ));
+        let palette_subset_fold_ds_guard = ScopedDescriptorSets {
+            device: &self.device,
+            pool: self.descriptor_pool,
+            sets: self
+                .device
+                .allocate_descriptor_sets(&palette_subset_fold_ds_alloc)?,
+        };
+        let palette_subset_fold_descriptor_set = palette_subset_fold_ds_guard.sets[0];
+
+        let pal_rle_index_ds_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(std::slice::from_ref(&self.pal_rle_index_descriptor_set_layout));
+        let pal_rle_index_ds_guard = ScopedDescriptorSets {
+            device: &self.device,
+            pool: self.descriptor_pool,
+            sets: self.device.allocate_descriptor_sets(&pal_rle_index_ds_alloc)?,
+        };
+        let pal_rle_index_descriptor_set = pal_rle_index_ds_guard.sets[0];
+
+        // Write palrle_compact descriptor set.
+        let palrle_compact_sad_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.sad_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let palrle_compact_analysis_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.analysis_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let palrle_compact_list_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.palrle_compact_list_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let palrle_compact_count_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.palrle_compact_count_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let palrle_compact_writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(palrle_compact_ds)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&palrle_compact_sad_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(palrle_compact_ds)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&palrle_compact_analysis_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(palrle_compact_ds)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&palrle_compact_list_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(palrle_compact_ds)
+                .dst_binding(3)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&palrle_compact_count_info),
+        ];
+        self.device.update_descriptor_sets(&palrle_compact_writes, &[]);
+
+        // Write palrle_indirect_args descriptor set.
+        let palrle_indirect_count_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.palrle_compact_count_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let palrle_indirect_args_buf_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.palrle_indirect_args_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let palrle_indirect_args_writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(palrle_indirect_args_ds)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&palrle_indirect_count_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(palrle_indirect_args_ds)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&palrle_indirect_args_buf_info),
+        ];
+        self.device
+            .update_descriptor_sets(&palrle_indirect_args_writes, &[]);
+
+        // Write palette_fold descriptor set.
+        let palette_fold_analysis_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.analysis_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let palette_fold_compact_list_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.palrle_compact_list_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let palette_fold_set_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.frame_palette_set_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let palette_fold_count_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.frame_palette_count_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let palette_fold_hash_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.hash_table_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let palette_fold_per_tile_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.per_tile_frame_palette_id_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let palette_fold_writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(palette_fold_descriptor_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&palette_fold_analysis_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(palette_fold_descriptor_set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&palette_fold_compact_list_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(palette_fold_descriptor_set)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&palette_fold_set_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(palette_fold_descriptor_set)
+                .dst_binding(3)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&palette_fold_count_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(palette_fold_descriptor_set)
+                .dst_binding(4)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&palette_fold_hash_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(palette_fold_descriptor_set)
+                .dst_binding(5)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&palette_fold_per_tile_info),
+        ];
+        self.device.update_descriptor_sets(&palette_fold_writes, &[]);
+
+        // Write palette_subset_fold_init descriptor set.
+        let subset_fold_init_folded_into_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.folded_into_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let subset_fold_init_writes = [vk::WriteDescriptorSet::default()
+            .dst_set(palette_subset_fold_init_descriptor_set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&subset_fold_init_folded_into_info)];
+        self.device
+            .update_descriptor_sets(&subset_fold_init_writes, &[]);
+
+        // Write palette_subset_fold descriptor set.
+        let subset_fold_set_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.frame_palette_set_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let subset_fold_folded_into_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.folded_into_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let subset_fold_writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(palette_subset_fold_descriptor_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&subset_fold_set_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(palette_subset_fold_descriptor_set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&subset_fold_folded_into_info),
+        ];
+        self.device.update_descriptor_sets(&subset_fold_writes, &[]);
+
+        // Write pal_rle_index descriptor set (Stage 3).
+        let pal_rle_index_image_info = [vk::DescriptorImageInfo::default()
+            .image_view(current.view)
+            .image_layout(vk::ImageLayout::GENERAL)];
+        let pal_rle_index_compact_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.palrle_compact_list_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let pal_rle_index_fps_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.frame_palette_set_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let pal_rle_index_ptfpi_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.per_tile_frame_palette_id_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let pal_rle_index_folded_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.folded_into_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let pal_rle_index_out_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.index_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let pal_rle_index_writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(pal_rle_index_descriptor_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(&pal_rle_index_image_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(pal_rle_index_descriptor_set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&pal_rle_index_compact_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(pal_rle_index_descriptor_set)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&pal_rle_index_fps_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(pal_rle_index_descriptor_set)
+                .dst_binding(3)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&pal_rle_index_ptfpi_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(pal_rle_index_descriptor_set)
+                .dst_binding(4)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&pal_rle_index_folded_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(pal_rle_index_descriptor_set)
+                .dst_binding(5)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&pal_rle_index_out_info),
+        ];
+        self.device
+            .update_descriptor_sets(&pal_rle_index_writes, &[]);
+
         let cmd_alloc = vk::CommandBufferAllocateInfo::default()
             .command_pool(self.command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
@@ -3229,10 +3520,389 @@ impl GpuFrameProcessor {
         );
         self.device.cmd_dispatch(cmd, cols, rows, 1);
 
+        // ============================================================
+        // Stages 1.5–3: PalRle compact, indirect args, palette fold,
+        // subset fold, and index generation.
+        //
+        // No prev_image on the first frame means SAD didn't run.
+        // Pre-fill sad_buffer with 0xFFFFFFFF so palrle_compact sees
+        // every tile as dirty (SAD_THRESHOLD = 64, and
+        // 0xFFFFFFFF > 64 is always TRUE).
+        // ============================================================
+        self.device
+            .cmd_fill_buffer(cmd, self.sad_buffer, 0, vk::WHOLE_SIZE, 0xFFFF_FFFFu32);
+
+        // Inter-dispatch barrier: analysis write + sad pre-fill must be
+        // visible to Stage 1.5a reads.
+        // srcStageMask covers COMPUTE_SHADER (analysis write) and TRANSFER
+        // (cmd_fill_buffer).
+        let buf_barrier_inputs = [
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.sad_buffer)
+                .offset(0)
+                .size(vk::WHOLE_SIZE),
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.analysis_buffer)
+                .offset(0)
+                .size(vk::WHOLE_SIZE),
+        ];
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &buf_barrier_inputs,
+            &[],
+        );
+
+        // Stage 1.5: zero compact_count, dispatch compact scan, dispatch indirect-args writer.
+        self.device
+            .cmd_fill_buffer(cmd, self.palrle_compact_count_buffer, 0, 4, 0);
+
+        // Barrier: transfer-write → shader-read/write
+        let buf_barrier_fill = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(self.palrle_compact_count_buffer)
+            .offset(0)
+            .size(4);
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            std::slice::from_ref(&buf_barrier_fill),
+            &[],
+        );
+
+        // Stage 1.5a: bind palrle_compact pipeline.
+        self.device.cmd_bind_pipeline(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.palrle_compact_pipeline,
+        );
+        self.device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.palrle_compact_pipeline_layout,
+            0,
+            &[palrle_compact_ds],
+            &[],
+        );
+        let compact_push: [u32; 3] = [cols, rows, SAD_THRESHOLD];
+        let compact_push_bytes = std::slice::from_raw_parts(
+            compact_push.as_ptr() as *const u8,
+            std::mem::size_of_val(&compact_push),
+        );
+        self.device.cmd_push_constants(
+            cmd,
+            self.palrle_compact_pipeline_layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            compact_push_bytes,
+        );
+        self.device.cmd_dispatch(cmd, cols * rows, 1, 1);
+
+        // Barrier between Stage 1.5a and 1.5b: shader write → shader read on count.
+        let buf_barrier_count = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(self.palrle_compact_count_buffer)
+            .offset(0)
+            .size(4);
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            std::slice::from_ref(&buf_barrier_count),
+            &[],
+        );
+
+        // Stage 1.5b: indirect-args writer.
+        self.device.cmd_bind_pipeline(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.palrle_indirect_args_pipeline,
+        );
+        self.device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.palrle_indirect_args_pipeline_layout,
+            0,
+            &[palrle_indirect_args_ds],
+            &[],
+        );
+        self.device.cmd_dispatch(cmd, 1, 1, 1);
+
+        // Barrier for future stages to consume indirect args.
+        let buf_barrier_args = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(
+                vk::AccessFlags::INDIRECT_COMMAND_READ | vk::AccessFlags::SHADER_READ,
+            )
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(self.palrle_indirect_args_buffer)
+            .offset(0)
+            .size(12);
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::DRAW_INDIRECT | vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            std::slice::from_ref(&buf_barrier_args),
+            &[],
+        );
+
+        // ============================================================
+        // Stage 2a: palette_fold (intra-frame palette dedup)
+        // ============================================================
+        let pal_id_bytes = ((self.max_tiles + 3) & !3u32) as vk::DeviceSize;
+        self.device
+            .cmd_fill_buffer(cmd, self.frame_palette_set_buffer, 0, 20480, 0);
+        self.device
+            .cmd_fill_buffer(cmd, self.frame_palette_count_buffer, 0, 4, 0);
+        self.device
+            .cmd_fill_buffer(cmd, self.hash_table_buffer, 0, 1024, 0);
+        self.device
+            .cmd_fill_buffer(cmd, self.per_tile_frame_palette_id_buffer, 0, pal_id_bytes, 0);
+
+        // Barrier: zero-fills + compact_list write must be visible to Stage 2a.
+        let stage_2a_input_barriers = [
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.frame_palette_set_buffer)
+                .offset(0)
+                .size(20480),
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.frame_palette_count_buffer)
+                .offset(0)
+                .size(4),
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.hash_table_buffer)
+                .offset(0)
+                .size(1024),
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.per_tile_frame_palette_id_buffer)
+                .offset(0)
+                .size(pal_id_bytes),
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.palrle_compact_list_buffer)
+                .offset(0)
+                .size(vk::WHOLE_SIZE),
+        ];
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &stage_2a_input_barriers,
+            &[],
+        );
+
+        // Stage 2a: indirect dispatch.
+        self.device.cmd_bind_pipeline(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.palette_fold_pipeline,
+        );
+        self.device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.palette_fold_pipeline_layout,
+            0,
+            &[palette_fold_descriptor_set],
+            &[],
+        );
+        self.device
+            .cmd_dispatch_indirect(cmd, self.palrle_indirect_args_buffer, 0);
+
+        // Barrier: Stage 2a outputs available to downstream stages.
+        let stage_2a_output_barriers = [
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.frame_palette_set_buffer)
+                .offset(0)
+                .size(vk::WHOLE_SIZE),
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.frame_palette_count_buffer)
+                .offset(0)
+                .size(4),
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.per_tile_frame_palette_id_buffer)
+                .offset(0)
+                .size(pal_id_bytes),
+        ];
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &stage_2a_output_barriers,
+            &[],
+        );
+
+        // ============================================================
+        // Stage 2b init: write default-self sentinel to folded_into
+        // ============================================================
+        self.device.cmd_bind_pipeline(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.palette_subset_fold_init_pipeline,
+        );
+        self.device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.palette_subset_fold_init_pipeline_layout,
+            0,
+            &[palette_subset_fold_init_descriptor_set],
+            &[],
+        );
+        self.device.cmd_dispatch(cmd, 1, 1, 1);
+
+        // Barrier between init and fold: folded_into writes must be visible.
+        let stage_2b_init_to_fold_barrier = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(self.folded_into_buffer)
+            .offset(0)
+            .size(1024);
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            std::slice::from_ref(&stage_2b_init_to_fold_barrier),
+            &[],
+        );
+
+        // ============================================================
+        // Stage 2b fold: atomicMin-based subset detection
+        // ============================================================
+        self.device.cmd_bind_pipeline(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.palette_subset_fold_pipeline,
+        );
+        self.device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.palette_subset_fold_pipeline_layout,
+            0,
+            &[palette_subset_fold_descriptor_set],
+            &[],
+        );
+        self.device.cmd_dispatch(cmd, 256, 1, 1);
+
+        // Barrier for Stage 3 consumers and HOST readback.
+        let stage_2b_output_barrier = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(self.folded_into_buffer)
+            .offset(0)
+            .size(1024);
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            std::slice::from_ref(&stage_2b_output_barrier),
+            &[],
+        );
+
+        // ============================================================
+        // Stage 3: pal_rle_index
+        // ============================================================
+        self.device.cmd_bind_pipeline(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.pal_rle_index_pipeline,
+        );
+        self.device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.pal_rle_index_pipeline_layout,
+            0,
+            &[pal_rle_index_descriptor_set],
+            &[],
+        );
+        let stage3_push: [u32; 1] = [cols];
+        let stage3_push_bytes = std::slice::from_raw_parts(
+            stage3_push.as_ptr() as *const u8,
+            std::mem::size_of_val(&stage3_push),
+        );
+        self.device.cmd_push_constants(
+            cmd,
+            self.pal_rle_index_pipeline_layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            stage3_push_bytes,
+        );
+        self.device
+            .cmd_dispatch_indirect(cmd, self.palrle_indirect_args_buffer, 0);
+
         // Snapshot copy: current (GENERAL) → snapshot (TRANSFER_DST_OPTIMAL).
         // `snapshot` is always freshly allocated by `allocate_owned_image` and
         // its initial layout is UNDEFINED, so we hardcode that transition (no
         // prior shader access to wait on).
+        //
+        // Stage 3 reads current.image (SHADER_READ). The srcAccessMask for
+        // current covers all compute reads up to this point.
         let snap_barriers = [
             vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::GENERAL)
@@ -3312,9 +3982,19 @@ impl GpuFrameProcessor {
             &post_copy_barrier,
         );
 
-        // NV12 + Analysis buffers → HOST_READ. Both are HOST_VISIBLE |
-        // HOST_COHERENT and consumed via raw pointer on return.
+        // All output buffers → HOST_READ. These are HOST_VISIBLE | HOST_COHERENT
+        // and consumed via raw pointer on return.
+        // srcStageMask covers both COMPUTE_SHADER (shader writes) and TRANSFER
+        // (cmd_fill_buffer on sad_buffer and palrle_compact_count_buffer).
         let buf_barrier = [
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.sad_buffer)
+                .offset(0)
+                .size(vk::WHOLE_SIZE),
             vk::BufferMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                 .dst_access_mask(vk::AccessFlags::HOST_READ)
@@ -3331,10 +4011,69 @@ impl GpuFrameProcessor {
                 .buffer(self.analysis_buffer)
                 .offset(0)
                 .size(vk::WHOLE_SIZE),
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.palrle_compact_list_buffer)
+                .offset(0)
+                .size(vk::WHOLE_SIZE),
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.palrle_compact_count_buffer)
+                .offset(0)
+                .size(vk::WHOLE_SIZE),
+            // Stage 2a outputs
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.frame_palette_set_buffer)
+                .offset(0)
+                .size(vk::WHOLE_SIZE),
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.frame_palette_count_buffer)
+                .offset(0)
+                .size(4),
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.per_tile_frame_palette_id_buffer)
+                .offset(0)
+                .size(pal_id_bytes),
+            // Stage 2b output
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.folded_into_buffer)
+                .offset(0)
+                .size(1024),
+            // Stage 3 output
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.index_buffer)
+                .offset(0)
+                .size(vk::WHOLE_SIZE),
         ];
         self.device.cmd_pipeline_barrier(
             cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
             vk::PipelineStageFlags::HOST,
             vk::DependencyFlags::empty(),
             &[],
@@ -3359,7 +4098,18 @@ impl GpuFrameProcessor {
         // Per-frame transients (descriptor sets, command buffer, fence) are
         // freed when their RAII guards drop at end of scope. Touch them here
         // to keep them alive past `wait_for_fences`.
-        let _ = (&nv12_ds_guard, &analysis_ds_guard, &cmd_guard, &fence_guard);
+        let _ = (
+            &nv12_ds_guard,
+            &analysis_ds_guard,
+            &palrle_compact_ds_guard,
+            &palrle_indirect_args_ds_guard,
+            &palette_fold_ds_guard,
+            &palette_subset_fold_init_ds_guard,
+            &palette_subset_fold_ds_guard,
+            &pal_rle_index_ds_guard,
+            &cmd_guard,
+            &fence_guard,
+        );
 
         Ok(())
     }
@@ -4864,17 +5614,17 @@ mod tests {
                 }
             };
             libc::close(fd_seed);
-            // First frame: tile_analysis now populated (M3.2c fix), but
-            // compact list is still null — Phase B passes don't run on first
-            // frame by design.
+            // First frame: tile_analysis and compact_list are both populated
+            // (Task 6.D fix). The seed frame is all-black: 3 tiles each with
+            // count=1 (solid black), all PalRLE-feasible.
             assert!(
                 !first.tile_analysis.is_null(),
-                "first-frame analysis must be populated (M3.2c fix)"
+                "first-frame analysis must be populated"
             );
             assert_eq!(first.tile_analysis_len, 3, "96x32 → 3 tiles");
             assert!(
-                first.palrle_compact_list.is_null(),
-                "first-frame compact list is null by design"
+                !first.palrle_compact_list.is_null(),
+                "first-frame compact list is now populated (Task 6.D fix)"
             );
 
             // --- Build the real frame ---
@@ -5019,9 +5769,10 @@ mod tests {
                 }
             };
             libc::close(fd_seed);
+            // First frame: frame_palette_set is now populated (Task 6.D fix).
             assert!(
-                first.frame_palette_set.is_null(),
-                "first-frame frame_palette_set is null by design"
+                !first.frame_palette_set.is_null(),
+                "first-frame frame_palette_set is now populated (Task 6.D fix)"
             );
 
             // --- Real frame: 4 tiles (32x32 each), each with identical 2-color
@@ -5143,9 +5894,10 @@ mod tests {
                 }
             };
             libc::close(fd_seed);
+            // First frame: folded_into is now populated (Task 6.D fix).
             assert!(
-                first.folded_into.is_null(),
-                "first-frame folded_into is null by design"
+                !first.folded_into.is_null(),
+                "first-frame folded_into is now populated (Task 6.D fix)"
             );
 
             // Real frame:
@@ -5295,9 +6047,10 @@ mod tests {
                 }
             };
             libc::close(fd_seed);
+            // First frame: index_buffer is now populated (Task 6.D fix).
             assert!(
-                first.index_buffer.is_null(),
-                "first-frame index_buffer is null by design"
+                !first.index_buffer.is_null(),
+                "first-frame index_buffer is now populated (Task 6.D fix)"
             );
 
             // Real frame: top half black (y<16), bottom half white (y>=16).
