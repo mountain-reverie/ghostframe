@@ -4,6 +4,21 @@
 //! little-endian), bypassing Xorg. Required for E2E tests under
 //! Xorg-on-VKMS where the capture path yields > 16 unique colours per
 //! tile and PalRle never wins classification. See M3.2c W1 design notes.
+//!
+//! ## Paint-once design
+//!
+//! The text content is static (it never changes frame-to-frame).  We paint
+//! the full BG + FG frame **once** before entering the keep-alive loop, then
+//! only call `msync_buffer` each tick to flush CPU write-combine caches to
+//! the underlying shmem pages so the GPU's DMA-BUF import always sees the
+//! committed pixels.
+//!
+//! Painting on every loop iteration (the naïve approach) introduced a
+//! race window: between the BG fill and the FG glyph paint the buffer
+//! contained a partially-painted frame.  If xdaemon captured during that
+//! window the GPU saw all-BG tiles, classified them as Solid, and the
+//! client rendered BG at every ink position.  Painting once eliminates the
+//! race entirely.
 
 use std::thread;
 use std::time::Duration;
@@ -14,17 +29,15 @@ use crate::drm_direct::{msync_buffer, setup_dumb_scanout};
 use crate::font::{pixel_set, GLYPH_H, GLYPH_W};
 use crate::text_grid::{char_origin, BG_PIXEL, FG_PIXEL, TEXT};
 
-/// Repaint interval — content is static (text doesn't change frame-to-frame),
-/// so 30 Hz is sufficient: each capture sees a freshly-written buffer, the
-/// SAD detector reports the tile as unchanged and skip-codec kicks in.
-/// drm_direct.rs's MOTION_TICK (16 ms) is for dynamic content where every
-/// capture needs new pixels; we don't need that here.
-const REPAINT_INTERVAL: Duration = Duration::from_millis(33); // ~30 Hz
+/// How often we call `msync_buffer` to keep the DMA-BUF pages coherent
+/// with the GPU importer.  The content is static so this is purely a cache
+/// flush, not a repaint.  30 Hz is more than enough.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(33);
 
 pub fn run(card_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut scanout = setup_dumb_scanout(card_path)?;
     eprintln!(
-        "text_grid_drm: scanout {}x{} active — entering paint loop",
+        "text_grid_drm: scanout {}x{} active — painting once then entering keepalive loop",
         scanout.mode_w, scanout.mode_h
     );
 
@@ -32,7 +45,8 @@ pub fn run(card_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let width = scanout.mode_w;
     let height = scanout.mode_h;
 
-    loop {
+    // ── One-time paint ──────────────────────────────────────────────────────
+    {
         let mut map = scanout
             .card
             .map_dumb_buffer(&mut scanout.db)
@@ -69,8 +83,23 @@ pub fn run(card_path: &str) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         msync_buffer(bytes);
-        drop(map); // explicit drop before sleeping so the kernel sees the writes promptly
+        // `map` drops here, releasing the mmap before the keepalive loop.
+    }
 
-        thread::sleep(REPAINT_INTERVAL);
+    eprintln!("text_grid_drm: initial paint complete — entering keepalive loop");
+
+    // ── Keepalive loop ──────────────────────────────────────────────────────
+    // Map the buffer periodically and call msync to ensure the GPU-side
+    // DMA-BUF importer sees the committed bytes from the initial paint.
+    // No pixel writes happen here — content is static.
+    loop {
+        thread::sleep(KEEPALIVE_INTERVAL);
+        {
+            let mut map = scanout
+                .card
+                .map_dumb_buffer(&mut scanout.db)
+                .map_err(|e| format!("map_dumb_buffer keepalive: {e}"))?;
+            msync_buffer(map.as_mut());
+        }
     }
 }

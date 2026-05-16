@@ -256,6 +256,15 @@ impl IoBridge {
         )
     }
 
+    /// Returns `true` when `GHOSTFRAME_DIAGNOSE_GPU_PIPELINE` is set.
+    /// Enables one-line-per-frame logging of FrameAnalysis output buffer state.
+    fn diagnose_gpu_pipeline_from_env() -> bool {
+        matches!(
+            std::env::var("GHOSTFRAME_DIAGNOSE_GPU_PIPELINE").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    }
+
     /// Create a new `IoBridge` by connecting to ghostbridge and opening a UDP
     /// listener on `listen_addr` (e.g. `":4443"`).
     pub async fn new(
@@ -868,6 +877,33 @@ impl IoBridge {
             dirty_count = analysis.dirty_tiles.len(),
             "process_frame_gpu: dirty tile detection complete"
         );
+
+        // GPU pipeline diagnostic: one line per frame showing the state of
+        // every output buffer FrameAnalysis exposes. Drives W1 root-cause
+        // investigation when unique_colors stays at UNIQUE_COLORS_UNKNOWN.
+        if Self::diagnose_gpu_pipeline_from_env() {
+            let ta_slice = analysis.tile_analysis_slice();
+            let first_nonzero = ta_slice
+                .iter()
+                .take(2048)
+                .enumerate()
+                .find(|(_, t)| t.count != 0)
+                .map(|(i, t)| (i, t.count, t.edge_density_thou));
+            tracing::info!(
+                target: "ghostframe::diagnose",
+                seq,
+                dirty_count = analysis.dirty_tiles.len(),
+                tile_analysis_is_null = analysis.tile_analysis.is_null(),
+                tile_analysis_len = analysis.tile_analysis_len,
+                tile_analysis_slice_len = ta_slice.len(),
+                first_nonzero_idx = first_nonzero.map(|(i, _, _)| i),
+                first_nonzero_count = first_nonzero.map(|(_, c, _)| c),
+                first_nonzero_edge_thou = first_nonzero.map(|(_, _, e)| e),
+                palrle_compact_count = analysis.palrle_compact_count,
+                frame_palette_set_count = analysis.frame_palette_set_count,
+                "gpu-pipeline"
+            );
+        }
 
         // Convert flat tile indices (Vec<u32>) into (tile_x, tile_y) pairs
         // matching the row-major layout used by MetricsTracker / TileGrid.

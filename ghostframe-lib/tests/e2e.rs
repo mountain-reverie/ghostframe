@@ -749,13 +749,12 @@ async fn e2e_solid_color_5pct_loss() -> Result<()> {
 // content; classifier never sees PalRle-feasible unique_colors. Defective
 // from inception (gpu=false original setup) and not fixed by the gpu=true
 // migration. Re-enable once M3.2c repairs the test-pattern capture path.
-#[ignore = "M3.2c: text-grid via VKMS captures as Raw, not PalRle"]
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_palrle_5pct_loss() -> Result<()> {
     use ghostframe_test_pattern::text_grid::SAMPLES;
 
     let setup = setup_e2e_webgpu_gpu_with_env(
-        "--text-grid",
+        "--text-grid --drm-direct",
         &[
             ("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "0.05"),
             ("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE", "palrle_bundled"),
@@ -816,12 +815,11 @@ async fn e2e_palrle_5pct_loss() -> Result<()> {
 // M3.2c: depends on text-grid producing PalRle tiles, which the
 // Xorg-on-VKMS + modesetting-FB capture path does not. See
 // e2e_palrle_5pct_loss for the same root cause.
-#[ignore = "M3.2c: text-grid via VKMS captures as Raw, not PalRle"]
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_palrle_session_reset() -> Result<()> {
     use ghostframe_test_pattern::text_grid::SAMPLES;
 
-    let setup = setup_e2e_webgpu_gpu("--text-grid").await?;
+    let setup = setup_e2e_webgpu_gpu("--text-grid --drm-direct").await?;
 
     // Phase 1: let the initial connection settle and render text.
     tokio::time::sleep(Duration::from_secs(4)).await;
@@ -1127,12 +1125,11 @@ async fn e2e_multi_tile_grid() -> Result<()> {
 /// to assert SSIM > 0.99 against a reference PNG; see TODO below.
 // M3.2c: text-grid via Xorg-on-VKMS yields all-Raw tiles, no PalRle
 // emission; ink pixels read 0. Same root cause as e2e_palrle_5pct_loss.
-#[ignore = "M3.2c: text-grid via VKMS captures as Raw, ink reads as 0"]
 #[tokio::test]
 async fn e2e_text_clarity() -> Result<()> {
     use ghostframe_test_pattern::text_grid::SAMPLES;
 
-    let setup = setup_e2e_webgpu_gpu("--text-grid").await?;
+    let setup = setup_e2e_webgpu_gpu("--text-grid --drm-direct").await?;
 
     // Allow QUIC slow-start + a couple of frames so every glyph tile arrives.
     tokio::time::sleep(Duration::from_secs(6)).await;
