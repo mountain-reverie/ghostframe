@@ -581,6 +581,35 @@ async fn e2e_raw_frame_round_trip() -> Result<()> {
     Ok(())
 }
 
+/// W2 — Verify __readPixel returns correct RGBA at sampled (x, y) by
+/// dispatching a debug compute pipeline that writes a known gradient
+/// (r=x&255, g=y&255, b=0, a=255) to the framebuffer texture, then
+/// asserting the readback matches at 16 sample points.  Blocks every
+/// other M3.2c pixel-accuracy assertion: if __readPixel lies, the
+/// rest of the milestone silently lies too.
+#[tokio::test]
+async fn e2e_readpixel_correctness() -> Result<()> {
+    let setup = setup_e2e_webgpu("--solid-red").await?;
+    // Give the renderer time to size the framebuffer (depends on the first
+    // frame_dimensions sentinel arriving from the server).
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let result: serde_json::Value = setup
+        .page
+        .evaluate("window.__readGradientGolden()")
+        .await?
+        .into_value()?;
+
+    let ok = result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    let mismatches = result.get("mismatches").cloned().unwrap_or_default();
+    assert!(
+        ok,
+        "__readPixel correctness mismatches: {}",
+        serde_json::to_string_pretty(&mismatches).unwrap_or_default()
+    );
+    Ok(())
+}
+
 /// M2: Solid red renders correctly through H.264 pipeline (color fidelity).
 ///
 /// M3.1: This test also exercises the new Scheduler-routed tile-codec

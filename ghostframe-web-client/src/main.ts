@@ -5,6 +5,7 @@ import {
   isTileDatagram, decodeFrameHeader, frameKey, FullFrameDecoder,
   FRAME_DIMENSIONS_SENTINEL_X, FRAME_DIMENSIONS_SENTINEL_Y,
 } from './decoder.js';
+import debugGradientWgsl from './webgpu/shaders/debug_gradient.wgsl?raw';
 import { WebGpuRenderer } from './webgpu/renderer.js';
 import { WebGpuUnavailableError } from './webgpu/init.js';
 import { ParityRecovery } from './fec';
@@ -115,6 +116,69 @@ async function main() {
     staging.unmap();
     staging.destroy();
     return result;
+  };
+
+  // Debug-only: dispatch a compute pipeline that writes a known gradient
+  // (r=x&255, g=y&255, b=0, a=255) to the framebuffer, then read back via
+  // __readPixel at sample points.  Used by e2e_readpixel_correctness to
+  // verify __readPixel before any production-codec pixel assertion is
+  // trusted.  See spec/2026-05-15-m3.2c-verification-design.md §W2.
+  (window as any).__readGradientGolden = async (): Promise<{
+    ok: boolean;
+    mismatches: Array<{ x: number; y: number; got: number[]; want: number[] }>;
+  }> => {
+    const rendererRef: any = (window as any).__ghostframeRenderer;
+    if (!rendererRef) {
+      return { ok: false, mismatches: [{ x: -1, y: -1, got: [], want: [] }] };
+    }
+    const { device, texture } = rendererRef;
+    if (!device || !texture) {
+      return { ok: false, mismatches: [{ x: -1, y: -1, got: [], want: [] }] };
+    }
+    const fbW = texture.width;
+    const fbH = texture.height;
+    if (fbW === 0 || fbH === 0) {
+      return { ok: false, mismatches: [{ x: -1, y: -1, got: [], want: [] }] };
+    }
+    // Build the debug compute pipeline (fresh per call — cheap, debug-only).
+    const module = device.createShaderModule({ code: debugGradientWgsl });
+    const pipeline = device.createComputePipeline({
+      layout: 'auto',
+      compute: { module, entryPoint: 'debug_gradient' },
+    });
+    const bindGroup = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: texture.createView() }],
+    });
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(Math.ceil(fbW / 8), Math.ceil(fbH / 8), 1);
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+    await device.queue.onSubmittedWorkDone();
+
+    // Sample 16 points — corners, edges, near-256 wrap boundaries, center.
+    const samplePoints: Array<[number, number]> = [
+      [0, 0], [1, 0], [255, 0], [256, 0],
+      [0, 1], [0, 255], [0, 256],
+      [100, 200], [16, 16], [31, 31], [32, 32], [63, 63],
+      [Math.floor(fbW / 2), Math.floor(fbH / 2)],
+      [fbW - 1, fbH - 1],
+      [Math.min(255, fbW - 1), Math.min(255, fbH - 1)],
+      [Math.min(256, fbW - 1), Math.min(256, fbH - 1)],
+    ];
+    const mismatches: Array<{ x: number; y: number; got: number[]; want: number[] }> = [];
+    for (const [x, y] of samplePoints) {
+      if (x >= fbW || y >= fbH || x < 0 || y < 0) continue;
+      const got = await (window as any).__readPixel(x, y);
+      const want = [x & 0xFF, y & 0xFF, 0, 255];
+      if (got[0] !== want[0] || got[1] !== want[1] || got[2] !== want[2] || got[3] !== want[3]) {
+        mismatches.push({ x, y, got, want });
+      }
+    }
+    return { ok: mismatches.length === 0, mismatches };
   };
 
   const wtUrl = `https://${serverHost}/`;
