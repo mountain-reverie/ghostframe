@@ -21,7 +21,7 @@ use std::io;
 // RAII guards for per-frame transient Vulkan resources
 // ---------------------------------------------------------------------------
 //
-// `process_frame_with_imported` and `run_nv12_and_snapshot` allocate descriptor
+// `process_frame_with_imported` and `run_first_frame_passes` allocate descriptor
 // sets, command buffers, and fences per call. Without RAII guards, any `?`
 // early-exit would leak those resources — and the descriptor pool has bounded
 // capacity (`max_sets=2`), so a few leaked sets would brick subsequent frames.
@@ -1726,8 +1726,23 @@ impl GpuFrameProcessor {
             (nv12.buffer, nv12.y_stride, nv12.uv_stride, nv12.uv_offset);
         let nv12_ptr = nv12.ptr;
 
-        // --- First frame: no SAD, mark all dirty, run NV12, copy current →
-        // newly-allocated owned snapshot for next frame's SAD source. ---
+        // --- First frame: no SAD (no prev to compare), mark all dirty, run
+        // NV12 + tile_analysis, copy current → newly-allocated owned snapshot
+        // for next frame's SAD source.
+        //
+        // tile_analysis runs on the first frame because it only reads the
+        // current frame's pixels (no dependency on prev_image). Without it,
+        // every tile's `unique_colors` stays at UNIQUE_COLORS_UNKNOWN, which
+        // forces the classifier into Codec::Raw for static content where the
+        // first frame is the only frame with dirty tiles. See
+        // docs/superpowers/specs/2026-05-15-m3.2c-verification-design.md.
+        //
+        // The downstream Stage 1.5/2a/2b/3 passes (palrle_compact /
+        // palette_fold / palette_subset_fold / pal_rle_index) intentionally
+        // remain skipped on the first frame: they feed Phase B PalRle
+        // encoding, which is keyed by classifier output, not by historical
+        // state — so tile_analysis populated is sufficient for the classifier
+        // to pick Solid/PalRle. ---
         if self.prev_image.is_none() {
             let all_dirty: Vec<u32> = (0..tile_count).collect();
 
@@ -1735,13 +1750,16 @@ impl GpuFrameProcessor {
             // lifetime of the processor (until resolution changes).
             let snapshot = self.allocate_owned_image(width, height)?;
 
-            // Run NV12 conversion AND snapshot copy in one cmd buffer. The
-            // snapshot is what we will compare future frames against.
-            self.run_nv12_and_snapshot(
+            // Run NV12 conversion + tile_analysis + snapshot copy in one cmd
+            // buffer. The snapshot is what we will compare future frames
+            // against.
+            self.run_first_frame_passes(
                 current,
                 &snapshot,
                 width,
                 height,
+                cols,
+                rows,
                 nv12_buffer,
                 nv12_y_stride,
                 nv12_uv_offset,
@@ -1760,8 +1778,8 @@ impl GpuFrameProcessor {
                 nv12_y_stride,
                 nv12_uv_stride,
                 nv12_uv_offset,
-                tile_analysis: std::ptr::null(),
-                tile_analysis_len: 0,
+                tile_analysis: self.analysis_ptr as *const TileAnalysis,
+                tile_analysis_len: cols * rows,
                 palrle_compact_list: std::ptr::null(),
                 palrle_compact_count: 0,
                 frame_palette_set: std::ptr::null(),
@@ -3014,22 +3032,31 @@ impl GpuFrameProcessor {
         })
     }
 
-    /// First-frame helper: NV12 conversion + snapshot copy.
+    /// First-frame helper: NV12 conversion + tile_analysis + snapshot copy.
     ///
     /// On the first frame we have no SAD comparison to do (no prev), so we
-    /// only run NV12 and then `cmdCopyImage(current → snapshot)` to seed
-    /// `snapshot` with this frame's content for subsequent SAD passes.
+    /// run NV12 (chroma subsampling for the encoder) and tile_analysis (so
+    /// the classifier sees a populated `unique_colors` on the only frame
+    /// with dirty tiles for static content), then
+    /// `cmdCopyImage(current → snapshot)` to seed `snapshot` with this
+    /// frame's content for subsequent SAD passes.
+    ///
+    /// All three steps share a single command buffer + fence to keep
+    /// first-frame submission cost identical in shape to the steady-state
+    /// subsequent-frames branch.
     ///
     /// `snapshot` is always freshly allocated by the caller
     /// (`allocate_owned_image`), so its starting layout is
     /// `vk::ImageLayout::UNDEFINED` — we hardcode that transition.
     #[allow(clippy::too_many_arguments)]
-    unsafe fn run_nv12_and_snapshot(
+    unsafe fn run_first_frame_passes(
         &self,
         current: &PrevFrame,
         snapshot: &PrevFrame,
         width: u32,
         height: u32,
+        cols: u32,
+        rows: u32,
         nv12_buffer: vk::Buffer,
         nv12_y_stride: u32,
         nv12_uv_offset: u32,
@@ -3068,6 +3095,39 @@ impl GpuFrameProcessor {
                 .buffer_info(&nv12_buf_info),
         ];
         self.device.update_descriptor_sets(&nv12_writes, &[]);
+
+        // Allocate Analysis descriptor set, also RAII-guarded.
+        let analysis_set_layouts = [self.analysis_descriptor_set_layout];
+        let analysis_ds_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(&analysis_set_layouts);
+        let analysis_ds_guard = ScopedDescriptorSets {
+            device: &self.device,
+            pool: self.descriptor_pool,
+            sets: self.device.allocate_descriptor_sets(&analysis_ds_alloc)?,
+        };
+        let analysis_ds = analysis_ds_guard.sets[0];
+
+        let analysis_image_info = [vk::DescriptorImageInfo::default()
+            .image_view(current.view)
+            .image_layout(vk::ImageLayout::GENERAL)];
+        let analysis_buffer_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.analysis_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let analysis_writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(analysis_ds)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(&analysis_image_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(analysis_ds)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&analysis_buffer_info),
+        ];
+        self.device.update_descriptor_sets(&analysis_writes, &[]);
 
         let cmd_alloc = vk::CommandBufferAllocateInfo::default()
             .command_pool(self.command_pool)
@@ -3138,6 +3198,36 @@ impl GpuFrameProcessor {
         let nv12_groups_y = height.div_ceil(2);
         self.device
             .cmd_dispatch(cmd, nv12_groups_x, nv12_groups_y, 1);
+
+        // Analysis dispatch. No barrier needed vs NV12 — both read `current`
+        // read-only (read-after-read is hazard-free) and write to disjoint
+        // buffers (`nv12_buffer` vs `self.analysis_buffer`). The
+        // COMPUTE→HOST buffer barrier below covers both writes. This mirrors
+        // the subsequent-frames branch comment at the SAD/NV12/Analysis
+        // dispatch trio.
+        self.device
+            .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.analysis_pipeline);
+        self.device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.analysis_pipeline_layout,
+            0,
+            &[analysis_ds],
+            &[],
+        );
+        let analysis_push: [u32; 3] = [width, height, cols];
+        let analysis_push_bytes = std::slice::from_raw_parts(
+            analysis_push.as_ptr() as *const u8,
+            std::mem::size_of_val(&analysis_push),
+        );
+        self.device.cmd_push_constants(
+            cmd,
+            self.analysis_pipeline_layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            analysis_push_bytes,
+        );
+        self.device.cmd_dispatch(cmd, cols, rows, 1);
 
         // Snapshot copy: current (GENERAL) → snapshot (TRANSFER_DST_OPTIMAL).
         // `snapshot` is always freshly allocated by `allocate_owned_image` and
@@ -3222,15 +3312,26 @@ impl GpuFrameProcessor {
             &post_copy_barrier,
         );
 
-        // NV12 buffer → HOST_READ
-        let buf_barrier = [vk::BufferMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::HOST_READ)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(nv12_buffer)
-            .offset(0)
-            .size(vk::WHOLE_SIZE)];
+        // NV12 + Analysis buffers → HOST_READ. Both are HOST_VISIBLE |
+        // HOST_COHERENT and consumed via raw pointer on return.
+        let buf_barrier = [
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(nv12_buffer)
+                .offset(0)
+                .size(vk::WHOLE_SIZE),
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.analysis_buffer)
+                .offset(0)
+                .size(vk::WHOLE_SIZE),
+        ];
         self.device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -3255,10 +3356,10 @@ impl GpuFrameProcessor {
         self.device
             .wait_for_fences(&[fence_guard.fence], true, u64::MAX)?;
 
-        // Per-frame transients (descriptor set, command buffer, fence) are
+        // Per-frame transients (descriptor sets, command buffer, fence) are
         // freed when their RAII guards drop at end of scope. Touch them here
         // to keep them alive past `wait_for_fences`.
-        let _ = (&nv12_ds_guard, &cmd_guard, &fence_guard);
+        let _ = (&nv12_ds_guard, &analysis_ds_guard, &cmd_guard, &fence_guard);
 
         Ok(())
     }
@@ -4045,8 +4146,9 @@ mod tests {
         };
 
         unsafe {
-            // First frame: NV12 + snapshot only, no analysis dispatch.
-            // tile_analysis is null by design — we just need to seed prev_image.
+            // First frame: tile_analysis now runs even without a prev_image,
+            // so the slice must be populated. This is the M3.2c fix that
+            // unblocks static-content classification (solid/PalRLE).
             let fd1 = make_memfd(width, height, pixel);
             let first = match processor.process_frame(fd1, width, height, stride) {
                 Ok(a) => a,
@@ -4058,11 +4160,19 @@ mod tests {
             };
             libc::close(fd1);
             assert!(
-                first.tile_analysis.is_null(),
-                "first-frame analysis is null by design"
+                !first.tile_analysis.is_null(),
+                "first-frame analysis must be populated (M3.2c fix)"
+            );
+            assert_eq!(first.tile_analysis_len, 1);
+            let first_slice = first.tile_analysis_slice();
+            assert_eq!(first_slice.len(), 1);
+            assert_eq!(first_slice[0].count, 1, "solid red tile → 1 unique color");
+            assert_eq!(
+                first_slice[0].colors[0], 0xFFFF0000u32,
+                "BGRA(0,0,255,255) → 0xFFFF0000"
             );
 
-            // Second frame: same content. Now the analysis pipeline dispatches.
+            // Second frame: same content. Pipeline runs end-to-end.
             let fd2 = make_memfd(width, height, pixel);
             let analysis = match processor.process_frame(fd2, width, height, stride) {
                 Ok(a) => a,
@@ -4139,8 +4249,8 @@ mod tests {
                 fd
             };
 
-            // First frame: NV12 + snapshot only, no analysis dispatch.
-            // tile_analysis is null by design — we just need to seed prev_image.
+            // First frame: tile_analysis runs (M3.2c). Seed prev_image and
+            // verify first-frame slice is populated.
             let fd1 = make_fd("seed");
             let first = match processor.process_frame(fd1, width, height, stride) {
                 Ok(a) => a,
@@ -4152,9 +4262,10 @@ mod tests {
             };
             libc::close(fd1);
             assert!(
-                first.tile_analysis.is_null(),
-                "first-frame analysis is null by design"
+                !first.tile_analysis.is_null(),
+                "first-frame analysis must be populated (M3.2c fix)"
             );
+            assert_eq!(first.tile_analysis_len, 1);
 
             // Second frame: same content. Now the analysis pipeline dispatches.
             let fd2 = make_fd("real");
@@ -4261,8 +4372,8 @@ mod tests {
                 fd
             };
 
-            // First frame: NV12 + snapshot only, no analysis dispatch.
-            // tile_analysis is null by design — we just need to seed prev_image.
+            // First frame: tile_analysis runs (M3.2c). Seed prev_image and
+            // confirm slice is populated.
             let fd1 = make_fd("seed");
             let first = match processor.process_frame(fd1, width, height, stride) {
                 Ok(a) => a,
@@ -4274,9 +4385,10 @@ mod tests {
             };
             libc::close(fd1);
             assert!(
-                first.tile_analysis.is_null(),
-                "first-frame analysis is null by design"
+                !first.tile_analysis.is_null(),
+                "first-frame analysis must be populated (M3.2c fix)"
             );
+            assert_eq!(first.tile_analysis_len, 1);
 
             // Second frame: same content. Now the analysis pipeline dispatches.
             let fd2 = make_fd("real");
@@ -4355,8 +4467,8 @@ mod tests {
                 fd
             };
 
-            // First frame: NV12 + snapshot only, no analysis dispatch.
-            // tile_analysis is null by design — we just need to seed prev_image.
+            // First frame: tile_analysis runs (M3.2c). Seed prev_image and
+            // confirm slice is populated.
             let fd1 = make_fd("seed");
             let first = match processor.process_frame(fd1, width, height, stride) {
                 Ok(a) => a,
@@ -4368,9 +4480,10 @@ mod tests {
             };
             libc::close(fd1);
             assert!(
-                first.tile_analysis.is_null(),
-                "first-frame analysis is null by design"
+                !first.tile_analysis.is_null(),
+                "first-frame analysis must be populated (M3.2c fix)"
             );
+            assert_eq!(first.tile_analysis_len, 4, "40x40 → 2x2 tile grid");
 
             // Second frame: same content. Now the analysis pipeline dispatches.
             let fd2 = make_fd("real");
@@ -4420,8 +4533,8 @@ mod tests {
         };
 
         unsafe {
-            // First frame: NV12 + snapshot only, no analysis dispatch.
-            // tile_analysis is null by design — we just need to seed prev_image.
+            // First frame: tile_analysis runs (M3.2c). Seed prev_image and
+            // confirm slice is populated.
             let fd1 = make_memfd(width, height, pixel);
             let first = match processor.process_frame(fd1, width, height, stride) {
                 Ok(a) => a,
@@ -4433,9 +4546,10 @@ mod tests {
             };
             libc::close(fd1);
             assert!(
-                first.tile_analysis.is_null(),
-                "first-frame analysis is null by design"
+                !first.tile_analysis.is_null(),
+                "first-frame analysis must be populated (M3.2c fix)"
             );
+            assert_eq!(first.tile_analysis_len, 1);
 
             // Second frame: same content. Now the analysis pipeline dispatches.
             let fd2 = make_memfd(width, height, pixel);
@@ -4539,8 +4653,8 @@ mod tests {
                 fd
             };
 
-            // First frame: NV12 + snapshot only, no analysis dispatch.
-            // tile_analysis is null by design — we just need to seed prev_image.
+            // First frame: tile_analysis runs (M3.2c). Seed prev_image and
+            // confirm slice is populated.
             let fd1 = make_fd("seed");
             let first = match processor.process_frame(fd1, width, height, stride) {
                 Ok(a) => a,
@@ -4552,9 +4666,10 @@ mod tests {
             };
             libc::close(fd1);
             assert!(
-                first.tile_analysis.is_null(),
-                "first-frame analysis is null by design"
+                !first.tile_analysis.is_null(),
+                "first-frame analysis must be populated (M3.2c fix)"
             );
+            assert_eq!(first.tile_analysis_len, 4);
 
             // Second frame: same content. Now the analysis pipeline dispatches.
             let fd2 = make_fd("real");
@@ -4647,7 +4762,8 @@ mod tests {
                 fd
             };
 
-            // First frame: seed prev_image (tile_analysis will be null).
+            // First frame: tile_analysis runs (M3.2c). Seed frame is zeroed,
+            // but the slice must still be populated.
             let fd1 = make_fd("seed", false);
             let first = match processor.process_frame(fd1, width, height, stride) {
                 Ok(a) => a,
@@ -4659,9 +4775,10 @@ mod tests {
             };
             libc::close(fd1);
             assert!(
-                first.tile_analysis.is_null(),
-                "first-frame analysis is null by design"
+                !first.tile_analysis.is_null(),
+                "first-frame analysis must be populated (M3.2c fix)"
             );
+            assert_eq!(first.tile_analysis_len, 2, "64x32 frame → 2 tiles");
 
             // Second frame: real content — triggers tile_analysis dispatch.
             let fd2 = make_fd("real", true);
@@ -4747,11 +4864,14 @@ mod tests {
                 }
             };
             libc::close(fd_seed);
-            // First frame: tile_analysis is null, compact list is null.
+            // First frame: tile_analysis now populated (M3.2c fix), but
+            // compact list is still null — Phase B passes don't run on first
+            // frame by design.
             assert!(
-                first.tile_analysis.is_null(),
-                "first-frame analysis is null by design"
+                !first.tile_analysis.is_null(),
+                "first-frame analysis must be populated (M3.2c fix)"
             );
+            assert_eq!(first.tile_analysis_len, 3, "96x32 → 3 tiles");
             assert!(
                 first.palrle_compact_list.is_null(),
                 "first-frame compact list is null by design"
