@@ -105,7 +105,7 @@ mod cost_tests {
 /// next codec state. Rules from source spec §4.2 evaluated in order.
 ///
 /// Sentinel handling: `unique_colors == UNIQUE_COLORS_UNKNOWN` causes rules
-/// 3, 6, and 7 (the colour-count consumers) to skip. `edge_density` is not
+/// 3, 5, 6, and 7 (the colour-count consumers) to skip. `edge_density` is not
 /// read by any M3.0 rule — its NaN sentinel exists for forward compatibility
 /// with M3.3 rules.
 ///
@@ -151,14 +151,22 @@ pub fn classify_tile(metrics: &TileMetrics, prev: &CodecState) -> CodecState {
     }
 
     // Rule 4: medium freq AND currently H264 ⇒ stay H264 (per-tile hysteresis).
-    // Rule 5 (medium freq AND not H264 ⇒ BC1) is the else branch below.
+    // Rule 5 (medium freq AND not H264) prefers a lossless codec when color
+    // info is known (mirrors Rule 3's structure for high-freq + low-mag),
+    // and falls back to Bc1 only when color info is unavailable.
     if (5.0..=15.0).contains(&freq) {
         if let CodecState::H264 { frames_in_h264 } = prev {
             return CodecState::H264 {
                 frames_in_h264: frames_in_h264.saturating_add(1),
             };
         }
-        return CodecState::Bc1; // Rule 5
+        if uc_known && metrics.unique_colors <= 1 {
+            return CodecState::Solid;
+        }
+        if uc_known && metrics.unique_colors <= 16 {
+            return CodecState::PalRle { palette_id: 0 };
+        }
+        return CodecState::Bc1; // Rule 5 fallback
     }
 
     // Rule 6: single color ⇒ Solid
@@ -347,6 +355,51 @@ mod classify_tests {
                 passes_sent: 0,
                 max_passes: 9
             },
+        );
+    }
+
+    #[test]
+    fn medium_freq_with_single_color_prefers_solid_over_bc1() {
+        // Rule 5 modification: medium freq + uc_known + 1 unique color ⇒ Solid,
+        // not Bc1. Mirrors Rule 3's structure for high-freq + low-mag.
+        let m = metrics(6.0, 0.05, 0, 1);
+        assert_eq!(classify_tile(&m, &CodecState::Bc1), CodecState::Solid);
+    }
+
+    #[test]
+    fn medium_freq_with_few_colors_prefers_palrle_over_bc1() {
+        // Rule 5 modification: medium freq + uc_known + 2..16 unique colors ⇒ PalRle.
+        let m = metrics(8.0, 0.10, 0, 8);
+        assert_eq!(
+            classify_tile(&m, &CodecState::Bc1),
+            CodecState::PalRle { palette_id: 0 }
+        );
+    }
+
+    #[test]
+    fn medium_freq_with_many_colors_still_falls_back_to_bc1() {
+        // Rule 5 fallback: medium freq + uc_known + > 16 colors ⇒ Bc1.
+        let m = metrics(6.0, 0.05, 0, 100);
+        assert_eq!(classify_tile(&m, &CodecState::Bc1), CodecState::Bc1);
+    }
+
+    #[test]
+    fn medium_freq_unknown_colors_falls_back_to_bc1() {
+        // Rule 5 fallback: medium freq + unknown colors ⇒ Bc1.
+        let m = metrics(6.0, 0.05, 0, super::super::UNIQUE_COLORS_UNKNOWN);
+        assert_eq!(classify_tile(&m, &CodecState::Bc1), CodecState::Bc1);
+    }
+
+    #[test]
+    fn medium_freq_h264_hysteresis_takes_precedence_over_lossless() {
+        // H264 hysteresis at medium freq must beat the new lossless-preference
+        // (an in-motion tile briefly hitting unique_colors=1 shouldn't drop to
+        // Solid mid-motion).
+        let m = metrics(8.0, 0.05, 0, 1);
+        let prev = CodecState::H264 { frames_in_h264: 7 };
+        assert_eq!(
+            classify_tile(&m, &prev),
+            CodecState::H264 { frames_in_h264: 8 }
         );
     }
 }
