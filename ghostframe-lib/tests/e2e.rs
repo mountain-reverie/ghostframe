@@ -1163,16 +1163,6 @@ async fn e2e_text_clarity() -> Result<()> {
     // Allow QUIC slow-start + a couple of frames so every glyph tile arrives.
     tokio::time::sleep(Duration::from_secs(6)).await;
 
-    // [DIAG-B1] dump __palrleProbe before assertions
-    let probe_json: serde_json::Value = setup
-        .page
-        .evaluate("window.__palrleProbe || {}")
-        .await?
-        .into_value()?;
-    eprintln!("=== __palrleProbe ===");
-    eprintln!("{}", serde_json::to_string_pretty(&probe_json).unwrap_or_default());
-    eprintln!("=== END __palrleProbe ===");
-
     // ── (a) Per-pair contrast: ink position must be much brighter than bg.
     for (i, pair) in SAMPLES.iter().enumerate() {
         let probe_js = format!(

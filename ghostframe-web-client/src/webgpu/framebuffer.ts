@@ -37,7 +37,9 @@ export class Framebuffer {
 
   resize(width: number, height: number): void {
     if (this.texture && this.width === width && this.height === height) return;
-    if (this.texture) this.texture.destroy();
+    const oldTexture = this.texture;
+    const oldW = this.width;
+    const oldH = this.height;
     this.texture = this.device.createTexture({
       size: { width, height },
       format: 'rgba8unorm',
@@ -48,6 +50,23 @@ export class Framebuffer {
         GPUTextureUsage.COPY_DST |
         GPUTextureUsage.COPY_SRC,
     });
+    // Preserve already-rendered content across resize. Without this copy,
+    // any PalRle / Solid / H264 tiles written into the framebuffer before the
+    // sentinel-driven resize (which can land late on a slow QUIC startup)
+    // are lost when the texture is destroyed — the new texture is
+    // zero-initialized per spec.  M3.2c B1 root cause.
+    if (oldTexture && oldW > 0 && oldH > 0 && width > 0 && height > 0) {
+      const copyW = Math.min(oldW, width);
+      const copyH = Math.min(oldH, height);
+      const encoder = this.device.createCommandEncoder();
+      encoder.copyTextureToTexture(
+        { texture: oldTexture },
+        { texture: this.texture },
+        { width: copyW, height: copyH },
+      );
+      this.device.queue.submit([encoder.finish()]);
+    }
+    if (oldTexture) oldTexture.destroy();
     this.view = this.texture.createView();
     this.width = width;
     this.height = height;

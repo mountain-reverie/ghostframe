@@ -1,6 +1,18 @@
-// PalRLE compute decode: one workgroup per tile, 32×32 threads per workgroup.
-// Each thread reads its 4-bit index, looks up palette_atlas, writes one pixel
-// to the framebuffer's tile region. Detects in-shader errors (codes 5..7).
+// PalRLE compute decode: FOUR workgroups per tile (in a 2x2 arrangement),
+// 16×16 threads per workgroup = 256 invocations per workgroup.  Total
+// 4×256 = 1024 threads covering the tile's 32×32 pixels (one per pixel).
+//
+// Why 256 invocations: WebGPU's default maxComputeInvocationsPerWorkgroup
+// is 256, and several common adapters (e.g., Chrome's GPU process on
+// Mesa) report exactly 256 — meaning a one-workgroup-per-tile design at
+// 32×32 = 1024 invocations would silently fail pipeline validation and
+// produce no pixel writes.  Splitting into 4 workgroups stays within the
+// portable 256 limit.
+//
+// Dispatch shape from palrle.ts: dispatchWorkgroups(num_tiles, 2, 2)
+//   wg.x = tile_idx
+//   wg.y = sub_tile_y (0 or 1, selects upper / lower 16-pixel half)
+//   wg.z = sub_tile_x (0 or 1, selects left / right 16-pixel half)
 
 struct TileWork {
   tile_x      : u32,
@@ -19,13 +31,17 @@ struct TileWork {
 @group(0) @binding(3) var framebuffer: texture_storage_2d<rgba8unorm, write>;
 @group(0) @binding(4) var<storage, read_write> errors: array<atomic<u32>>;
 
-@compute @workgroup_size(32, 32, 1)
+@compute @workgroup_size(16, 16, 1)
 fn main(
   @builtin(workgroup_id) wg: vec3<u32>,
   @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
   let work = tile_work[wg.x];
-  let pixel_in_tile = lid.y * 32u + lid.x;  // 0..1023
+  // Each workgroup covers a 16×16 sub-region of the 32×32 tile.
+  // wg.y / wg.z pick which sub-region (0 or 1 each).
+  let pixel_x_in_tile = wg.z * 16u + lid.x;  // 0..31
+  let pixel_y_in_tile = wg.y * 16u + lid.y;  // 0..31
+  let pixel_in_tile = pixel_y_in_tile * 32u + pixel_x_in_tile;  // 0..1023
   let nibble_idx = pixel_in_tile;
 
   // Locate the 4-bit nibble in indices_buf.
@@ -43,6 +59,7 @@ fn main(
   }
 
   if (color_idx >= work.count) {
+    // wg.x is tile_idx (one error slot per tile, shared across sub-workgroups).
     atomicStore(&errors[wg.x], 5u);  // ERR_INDEX_OOB
     return;
   }
@@ -55,8 +72,8 @@ fn main(
   textureStore(
     framebuffer,
     vec2<i32>(
-      i32(work.tile_x * 32u + lid.x),
-      i32(work.tile_y * 32u + lid.y),
+      i32(work.tile_x * 32u + pixel_x_in_tile),
+      i32(work.tile_y * 32u + pixel_y_in_tile),
     ),
     rgba,
   );

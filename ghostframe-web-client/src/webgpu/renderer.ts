@@ -125,38 +125,14 @@ export class WebGpuRenderer {
     }
     // Expose framebuffer for test instrumentation (__readPixel / __readPixelRect).
     (window as any).__ghostframeRenderer = { device: this.gpu.device, texture: this.framebuffer.texture };
-    // ---- [DIAG-B1] probe init ----
-    const _probe = (window as any).__palrleProbe = (window as any).__palrleProbe || {
-      entriesPerTick: [],
-      prevalidateFails: [],
-      prevalidateOk: [],
-      errorsBufferReads: [],
-      dispatchCounts: [],
-      tileWorkPacked: [],
-    };
-
     // ---- Steps 1-2: Drain palette updates + pre-validate PalRle batch ----
     const palRleEntries: PalRleEntry[] = [];
     for (const q of this.palRleQueue) {
       const r = prevalidatePalRle(q.payload, this.paletteShadow, q.tileX, q.tileY);
       if (!r.ok) {
         onDecodeError(2 /* Codec.PalRle */, q.tileX, q.tileY, r.errorCode);
-        // [DIAG-B1] record prevalidate failure
-        _probe.prevalidateFails.push({ tileX: q.tileX, tileY: q.tileY, errorCode: r.errorCode });
         continue;
       }
-      // [DIAG-B1] record prevalidate success
-      _probe.prevalidateOk.push({
-        tileX: q.tileX,
-        tileY: q.tileY,
-        variant: r.entry.variant,
-        paletteId: r.entry.paletteId,
-        count: r.entry.count,
-        indicesPreview: Array.from(r.entry.indices.subarray(0, 8)),
-        paletteUpsertPreview: r.entry.paletteUpsert
-          ? Array.from(r.entry.paletteUpsert.subarray(0, Math.min(8, r.entry.paletteUpsert.length)))
-          : null,
-      });
       // Bundled upserts palette to the atlas immediately so subsequent
       // thin/indices_raw entries in the same rAF see the palette.
       if (r.entry.variant === PalRleVariant.Bundled && r.entry.paletteUpsert) {
@@ -180,9 +156,6 @@ export class WebGpuRenderer {
 
     // ---- Step 5: upload PalRle batched buffers ----
     const palRleCount = this.palrlePipeline.uploadBatch(palRleEntries);
-    // [DIAG-B1] record entries and dispatch counts
-    _probe.entriesPerTick.push(palRleEntries.length);
-    _probe.dispatchCounts.push(palRleCount);
 
     // ---- Step 6: encoder ----
     const encoder = this.device.createCommandEncoder();
@@ -233,11 +206,6 @@ export class WebGpuRenderer {
       const staging = this.palrlePipeline.errorsStaging;
       staging.mapAsync(GPUMapMode.READ, 0, batch * 4).then(() => {
         const view = new Uint32Array(staging.getMappedRange(0, batch * 4));
-        // [DIAG-B1] record full errors buffer before iterating
-        (window as any).__palrleProbe.errorsBufferReads.push({
-          batch,
-          codes: Array.from(view),
-        });
         for (let i = 0; i < batch; i++) {
           if (view[i] !== 0) {
             // Map back to (tileX, tileY) via the same order palRleEntries had

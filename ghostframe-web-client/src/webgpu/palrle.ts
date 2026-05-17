@@ -94,24 +94,6 @@ export class PalRlePipeline {
     }
     this.device.queue.writeBuffer(this.tileWorkBuffer, 0, tileWork);
     this.device.queue.writeBuffer(this.indicesBuffer, 0, indices);
-
-    // [DIAG-B1] capture tile_work packed contents
-    const _probe = (window as any).__palrleProbe;
-    if (_probe) {
-      for (let c = 0; c < entries.length; c++) {
-        const e = entries[c];
-        _probe.tileWorkPacked.push({
-          c,
-          tileX: e.tileX,
-          tileY: e.tileY,
-          paletteId: e.paletteId,
-          count: e.count,
-          payloadOff: c * 512,
-          tileWorkWords: Array.from(tileWork.subarray(c * 8, c * 8 + 8)),
-        });
-      }
-    }
-
     return entries.length;
   }
 
@@ -121,7 +103,10 @@ export class PalRlePipeline {
     const pass = encoder.beginComputePass();
     pass.setPipeline(this.pipeline);
     pass.setBindGroup(0, this.bindGroup);
-    pass.dispatchWorkgroups(batchSize, 1, 1);
+    // 4 workgroups per tile arranged as (1, 2, 2) — matches the shader's
+    // 16×16 sub-region tiling within each 32×32 tile.  See palrle_decode.wgsl
+    // for why we can't dispatch a single (32, 32, 1) workgroup per tile.
+    pass.dispatchWorkgroups(batchSize, 2, 2);
     pass.end();
   }
 
