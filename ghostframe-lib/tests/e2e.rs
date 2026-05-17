@@ -725,6 +725,24 @@ async fn e2e_solid_color() -> Result<()> {
     Ok(())
 }
 
+/// W4 (M3.2c) — Verify the H.264 render pipeline produces output
+/// structurally similar to a checked-in golden reference via SSIM.
+///
+/// The golden is captured once via `GHOSTFRAME_BLESS_GOLDENS=1` and then
+/// asserted against on subsequent runs. Threshold 0.95 (hybrid SSIM via
+/// `image-compare`); lower in 0.01 increments if intermittently flaky.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_h264_ssim_golden() -> Result<()> {
+    let setup = setup_e2e_webgpu("--solid-red").await?;
+    // Allow time for: page load, WebGPU init, H.264 codec startup, and
+    // the first few key frames to settle.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let captured = helpers::screenshot_canvas(&setup.page).await?;
+    let golden_path =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/e2e/golden/h264_solid_red_t5s.png");
+    helpers::assert_ssim_against_golden(&captured, golden_path, 0.95)
+}
+
 /// M3.1 Task 19: Server retransmission survives 5% outbound datagram loss.
 ///
 /// Sets `GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY=0.05` and predicate `tile`,
