@@ -58,6 +58,12 @@ struct Args {
     #[arg(long, default_value = "/dev/dri/card0")]
     drm_device: String,
 
+    /// Paint four 32x32 corner tiles in fixed colours (RED/GREEN/BLUE/YELLOW)
+    /// plus a central 64x64 motion region. Combine with `--drm-direct` to
+    /// paint to the DRM dumb-buffer scanout. Drives `e2e_solid_per_tile_pixels`.
+    #[arg(long)]
+    solid_per_tile: bool,
+
     /// (Ignored — kept for CLI compat.) Window width.
     #[arg(long, default_value = "640")]
     width: u16,
@@ -69,6 +75,14 @@ struct Args {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+
+    // DRM-direct solid-per-tile mode: paint fixed corner tiles + a small
+    // central motion region so the classifier sees `unique_colors == 1`
+    // per corner and picks `CodecState::Solid`. Drives
+    // `e2e_solid_per_tile_pixels` (M3.2c W3/B3).
+    if args.drm_direct && args.solid_per_tile {
+        return ghostframe_test_pattern::solid_per_tile::run(&args.drm_device);
+    }
 
     // DRM-direct text-grid mode: paint text glyphs directly to scanout,
     // bypassing Xorg. Required for E2E tests where Xorg-on-VKMS yields
