@@ -94,6 +94,24 @@ export class PalRlePipeline {
     }
     this.device.queue.writeBuffer(this.tileWorkBuffer, 0, tileWork);
     this.device.queue.writeBuffer(this.indicesBuffer, 0, indices);
+
+    // [DIAG-B1] capture tile_work packed contents
+    const _probe = (window as any).__palrleProbe;
+    if (_probe) {
+      for (let c = 0; c < entries.length; c++) {
+        const e = entries[c];
+        _probe.tileWorkPacked.push({
+          c,
+          tileX: e.tileX,
+          tileY: e.tileY,
+          paletteId: e.paletteId,
+          count: e.count,
+          payloadOff: c * 512,
+          tileWorkWords: Array.from(tileWork.subarray(c * 8, c * 8 + 8)),
+        });
+      }
+    }
+
     return entries.length;
   }
 
