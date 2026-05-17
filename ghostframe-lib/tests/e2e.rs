@@ -838,6 +838,66 @@ async fn e2e_palrle_5pct_loss() -> Result<()> {
     Ok(())
 }
 
+/// W3/B3 — Verify the Solid WGSL render pipeline produces correct
+/// per-tile colors through the real WebTransport → WebGPU pipeline.
+/// Uses the `solid_per_tile` test-pattern's four uniform-color corner
+/// tiles (RED/GREEN/BLUE/YELLOW) so the classifier picks `Codec::Solid`
+/// and the shader writes the expected RGBA.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_solid_per_tile_pixels() -> Result<()> {
+    use ghostframe_test_pattern::solid_per_tile::samples;
+
+    let setup = setup_e2e_webgpu_gpu("--solid-per-tile --drm-direct").await?;
+    // Allow page load → WebGPU init → first frame capture → palette/solid
+    // emission → render. The corners get one bundled Solid frame each;
+    // the motion region keeps the codec pipeline engaged so the classifier
+    // doesn't fall back to whole-frame H.264.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Sanity: Codec::Solid (wire enum = 4) must appear on the wire.
+    let codecs: Vec<u8> = setup
+        .page
+        .evaluate("window.__ghostframeRecordedCodecs || []")
+        .await?
+        .into_value()?;
+    assert!(
+        codecs.contains(&4u8),
+        "expected Codec::Solid (4) on the wire; saw codecs: {:?}",
+        codecs
+    );
+
+    // Discover the actual canvas size: solid_per_tile anchors its corner
+    // tiles relative to the scanout resolution, which depends on the
+    // first DRM connector mode VKMS reports (varies between hosts).
+    let dims: (u32, u32) = setup
+        .page
+        .evaluate(
+            "(() => { const c = document.querySelector('canvas'); return [c.width, c.height]; })()",
+        )
+        .await?
+        .into_value()?;
+    let (width, height) = dims;
+    assert!(
+        width >= 128 && height >= 128,
+        "canvas too small to host corner samples: {}x{}",
+        width,
+        height
+    );
+
+    for s in samples(width, height) {
+        let probe_js = format!("window.__readPixel({}, {})", s.x, s.y);
+        let got: Vec<u8> = setup.page.evaluate(probe_js.as_str()).await?.into_value()?;
+        assert_eq!(
+            got,
+            s.expected_rgba.to_vec(),
+            "corner ({}, {}) mismatch: got {:?}, expected {:?}",
+            s.x, s.y, got, s.expected_rgba
+        );
+    }
+
+    Ok(())
+}
+
 /// Force a client reconnect mid-stream; verify the server's warm-cache
 /// palette table re-delivers palettes on the new session and the text
 /// region renders correctly post-reset.

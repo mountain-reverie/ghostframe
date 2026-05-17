@@ -44,6 +44,11 @@ use drm::control::Device as ControlDevice;
 use crate::drm_direct::{msync_buffer, setup_dumb_scanout};
 
 /// Dark-grey background. Packed XRGB8888 → bytes `[0x14, 0x14, 0x14, 0x00]`.
+/// X (high byte) stays 0x00 to match the rest of the codebase's "X is don't
+/// care" convention. The client framebuffer ends up with alpha=0x00 in this
+/// channel; canvas `alphaMode: 'opaque'` masks that visually, but exact-pixel
+/// assertions must expect alpha=0x00 to match what the production shader
+/// actually writes (no alpha-force in the Solid/PalRle pipelines).
 const BG_PIXEL: u32 = 0x0014_1414;
 
 /// Corner colours, packed XRGB8888 little-endian.
@@ -64,8 +69,11 @@ const MOTION_TICK: Duration = Duration::from_millis(16);
 /// One classifier-Solid sample location plus the colour the WebGPU client's
 /// `__readPixel` is expected to return at that coordinate.
 ///
-/// The expected RGBA is non-premultiplied, alpha forced to 0xFF — matching
-/// the BGRA→RGBA swizzle + alpha-force convention applied client-side.
+/// The expected RGBA matches what the production Solid/PalRle shaders write
+/// to the framebuffer: BGRA→RGBA swizzle of the wire bytes, alpha byte
+/// passed through unchanged. The test pattern paints with X=0x00, so the
+/// alpha channel reads back as 0x00. (Canvas alphaMode='opaque' makes this
+/// visually identical to alpha=0xFF.)
 pub struct CornerSample {
     pub x: u32,
     pub y: u32,
@@ -83,22 +91,22 @@ pub fn samples(width: u32, height: u32) -> Vec<CornerSample> {
         CornerSample {
             x: 16,
             y: 16,
-            expected_rgba: [0xFF, 0x00, 0x00, 0xFF],
+            expected_rgba: [0xFF, 0x00, 0x00, 0x00],
         }, // top-left RED
         CornerSample {
             x: bx,
             y: 16,
-            expected_rgba: [0x00, 0xFF, 0x00, 0xFF],
+            expected_rgba: [0x00, 0xFF, 0x00, 0x00],
         }, // top-right GREEN
         CornerSample {
             x: 16,
             y: by,
-            expected_rgba: [0x00, 0x00, 0xFF, 0xFF],
+            expected_rgba: [0x00, 0x00, 0xFF, 0x00],
         }, // bottom-left BLUE
         CornerSample {
             x: bx,
             y: by,
-            expected_rgba: [0xFF, 0xFF, 0x00, 0xFF],
+            expected_rgba: [0xFF, 0xFF, 0x00, 0x00],
         }, // bottom-right YELLOW
     ]
 }
