@@ -116,6 +116,12 @@ pub struct IoBridge {
     /// Cfg-gated inbound-datagram loss injector for e2e tests.
     #[cfg(any(test, feature = "test-loss-injection"))]
     pub(crate) inbound_loss: Option<crate::transport::loss_injection::LossInjector>,
+    /// Cfg-gated one-shot OOB-PalRle injection coordinate for e2e tests.
+    /// When set to `Some((x, y))`, the next PalRle payload encoded for the
+    /// matching tile coordinate is replaced with a hand-built bundled payload
+    /// containing an out-of-bounds palette index. Cleared after firing once.
+    #[cfg(any(test, feature = "test-loss-injection"))]
+    pub(crate) oob_inject_at: Option<(u32, u32)>,
     /// Remaining frames to force all-dirty after a new session connects.
     /// QUIC slow-start can only deliver a fraction of tiles in the first burst;
     /// forcing dirty for several frames lets the congestion window open.
@@ -248,6 +254,19 @@ impl IoBridge {
         ))
     }
 
+    /// Parse `GHOSTFRAME_INJECT_OOB_PALRLE` as `"x,y"` (two u32 separated by a
+    /// comma). Returns `None` when the env var is unset or unparseable. The
+    /// resulting coordinate is stored on `IoBridge` and consumed (set to `None`)
+    /// the first time the matching tile is encoded.
+    #[cfg(any(test, feature = "test-loss-injection"))]
+    fn oob_injector_from_env() -> Option<(u32, u32)> {
+        let raw = std::env::var("GHOSTFRAME_INJECT_OOB_PALRLE").ok()?;
+        let mut parts = raw.split(',');
+        let x = parts.next()?.parse::<u32>().ok()?;
+        let y = parts.next()?.parse::<u32>().ok()?;
+        Some((x, y))
+    }
+
     /// Returns `true` when `GHOSTFRAME_DIAGNOSE_TILES` is set to `"1"` or `"true"`.
     fn diagnose_tiles_from_env() -> bool {
         matches!(
@@ -336,6 +355,8 @@ impl IoBridge {
             outbound_loss: Self::loss_injector_from_env("OUTBOUND"),
             #[cfg(any(test, feature = "test-loss-injection"))]
             inbound_loss: Self::loss_injector_from_env("INBOUND"),
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            oob_inject_at: Self::oob_injector_from_env(),
             force_dirty_frames: 0,
             palette_table: crate::encoder::pal_rle::PaletteTable::new(),
             client_caps: crate::transport::client_caps::ClientCapabilities::default(),
@@ -1152,7 +1173,16 @@ impl IoBridge {
 
                 // Phase B — rayon parallel encode.
                 let caps = self.client_caps;
-                let mut palrle_payloads = IoBridge::phase_b_encode_payloads_with_caps(&preps, &caps);
+                #[cfg(any(test, feature = "test-loss-injection"))]
+                let inject = self.oob_inject_at;
+                #[cfg(not(any(test, feature = "test-loss-injection")))]
+                let inject: Option<(u32, u32)> = None;
+                let mut palrle_payloads =
+                    IoBridge::phase_b_encode_payloads_with_caps(&preps, &caps, inject);
+                #[cfg(any(test, feature = "test-loss-injection"))]
+                if inject.is_some() {
+                    self.oob_inject_at = None;
+                }
 
                 self.dispatch_dirty_tiles_via_scheduler(
                     &dirty_xy,
@@ -1564,6 +1594,7 @@ impl IoBridge {
         Self::phase_b_encode_payloads_with_caps(
             preps,
             &crate::transport::client_caps::ClientCapabilities::default(),
+            None,
         )
     }
 
@@ -1571,15 +1602,23 @@ impl IoBridge {
     /// `caps.indices_raw_enabled == true`, thin payloads are emitted as
     /// `indices_raw` (flags bit 1) instead of nibble-RLE. Bundled payloads
     /// always use the bundled format regardless of caps.
+    ///
+    /// `inject_at` is an optional cfg-gated test hook: when the tile at the
+    /// matching `(tile_x, tile_y)` is encoded, its payload is replaced with a
+    /// hand-built bundled payload whose single RLE byte references palette
+    /// index 2 against a count=1 palette. The client GPU shader detects the
+    /// OOB and writes `error_code = 5 (ERR_INDEX_OOB)` to its per-tile error
+    /// slot. The wire format is documented in `palrle-codec-design.md`.
     pub(crate) fn phase_b_encode_payloads_with_caps(
         preps: &[PalRleTileWorkPrep],
         caps: &crate::transport::client_caps::ClientCapabilities,
+        inject_at: Option<(u32, u32)>,
     ) -> std::collections::HashMap<(u32, u32), Vec<u8>> {
         use rayon::prelude::*;
         preps
             .par_iter()
             .map(|p| {
-                let payload = if !p.bundled && caps.indices_raw_enabled {
+                let mut payload = if !p.bundled && caps.indices_raw_enabled {
                     tracing::info!(
                         target: "palrle.wire",
                         palette_id = p.palette_id,
@@ -1599,6 +1638,20 @@ impl IoBridge {
                         p.bundled,
                     )
                 };
+                if let Some(inject) = inject_at {
+                    if p.tile_xy == inject {
+                        // Hand-built bundled payload with palette count=1 but
+                        // an RLE byte referencing palette index 2 (OOB). See
+                        // wire-format docs above for byte-by-byte breakdown.
+                        payload = vec![0x01u8, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xFF, 0x20];
+                        tracing::info!(
+                            target: "palrle.wire",
+                            tile_x = p.tile_xy.0,
+                            tile_y = p.tile_xy.1,
+                            "test-hook: injected OOB PalRle payload"
+                        );
+                    }
+                }
                 (p.tile_xy, payload)
             })
             .collect()
@@ -1631,6 +1684,8 @@ impl IoBridge {
             outbound_loss: None,
             #[cfg(any(test, feature = "test-loss-injection"))]
             inbound_loss: None,
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            oob_inject_at: None,
             force_dirty_frames: 0,
             palette_table: crate::encoder::pal_rle::PaletteTable::new(),
             client_caps: crate::transport::client_caps::ClientCapabilities::default(),
@@ -1673,6 +1728,8 @@ impl IoBridge {
             outbound_loss: None,
             #[cfg(any(test, feature = "test-loss-injection"))]
             inbound_loss: None,
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            oob_inject_at: None,
             force_dirty_frames: 0,
             palette_table: crate::encoder::pal_rle::PaletteTable::new(),
             client_caps: crate::transport::client_caps::ClientCapabilities::default(),
@@ -2165,6 +2222,20 @@ mod tests {
         assert!(IoBridge::loss_injector_from_env("INBOUND").is_none());
     }
 
+    #[cfg(any(test, feature = "test-loss-injection"))]
+    #[test]
+    fn oob_injector_from_env_parses() {
+        // Saved/restored to avoid leaking into sibling tests that run in the
+        // same process (cargo test default uses threads but env-var leak is a
+        // common test fragility — guard explicitly).
+        let prev = std::env::var("GHOSTFRAME_INJECT_OOB_PALRLE").ok();
+        std::env::set_var("GHOSTFRAME_INJECT_OOB_PALRLE", "5,7");
+        let inj = IoBridge::oob_injector_from_env();
+        if let Some(p) = prev { std::env::set_var("GHOSTFRAME_INJECT_OOB_PALRLE", p); }
+        else { std::env::remove_var("GHOSTFRAME_INJECT_OOB_PALRLE"); }
+        assert_eq!(inj, Some((5u32, 7u32)));
+    }
+
     #[test]
     fn diagnose_tiles_env_var_parses() {
         std::env::set_var("GHOSTFRAME_DIAGNOSE_TILES", "1");
@@ -2632,7 +2703,7 @@ mod tests {
         let caps = crate::transport::client_caps::ClientCapabilities {
             indices_raw_enabled: true,
         };
-        let map = IoBridge::phase_b_encode_payloads_with_caps(&[prep], &caps);
+        let map = IoBridge::phase_b_encode_payloads_with_caps(&[prep], &caps, None);
         let payload = &map[&(0, 0)];
         assert_eq!(payload[0], 0x02, "indices_raw flag (bit 1)");
         assert_eq!(payload[1], 9, "palette_id");
@@ -2652,7 +2723,7 @@ mod tests {
         let caps = crate::transport::client_caps::ClientCapabilities {
             indices_raw_enabled: false,
         };
-        let map = IoBridge::phase_b_encode_payloads_with_caps(&[prep], &caps);
+        let map = IoBridge::phase_b_encode_payloads_with_caps(&[prep], &caps, None);
         let payload = &map[&(5, 7)];
         assert_eq!(payload[0], 0x00, "thin flag (bit 0 clear, bit 1 clear)");
         assert_eq!(payload[1], 3, "palette_id");
@@ -2672,7 +2743,7 @@ mod tests {
         let caps = crate::transport::client_caps::ClientCapabilities {
             indices_raw_enabled: true,
         };
-        let map = IoBridge::phase_b_encode_payloads_with_caps(&[prep], &caps);
+        let map = IoBridge::phase_b_encode_payloads_with_caps(&[prep], &caps, None);
         let payload = &map[&(1, 1)];
         assert_eq!(payload[0], 0x01, "bundled flag (bit 0 set)");
         // indices_raw promotion only applies to thin path; bundled passes through unchanged.
