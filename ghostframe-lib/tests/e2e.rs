@@ -269,18 +269,18 @@ async fn setup_e2e_inner(
         .with_env_var("TS_CONTROL_URL", "http://headscale:8080")
         .with_env_var("RUST_LOG", "ghostframe=trace,debug")
         .with_env_var("TEST_PATTERN", test_pattern_args);
+    if gpu {
+        // GPU-path defaults (overridable via extra_env): use the modesetting
+        // Xorg config that targets VKMS card0, bind-mount host DRM nodes,
+        // and run privileged so xdaemon can drive VKMS.
+        server_image = server_image.with_env_var("XORG_CONF", "/etc/X11/xorg-vkms.conf");
+        server_image = server_image.with_mount(Mount::bind_mount("/dev/dri", "/dev/dri"));
+        server_image = server_image.with_privileged(true);
+    }
+    // extra_env applied LAST so tests can override defaults like XORG_CONF
+    // (e.g. e2e_edge_tiles overrides to xorg-odd.conf for the 700×500 mode).
     for (k, v) in extra_env {
         server_image = server_image.with_env_var(*k, *v);
-    }
-    if gpu {
-        // Switch Xorg to the modesetting driver targeting VKMS card0.
-        server_image = server_image.with_env_var("XORG_CONF", "/etc/X11/xorg-vkms.conf");
-        // Bind-mount the host's DRM nodes so the container's Xorg + xdaemon
-        // can drive VKMS card0 and use renderD128 for VA-API.
-        server_image = server_image.with_mount(Mount::bind_mount("/dev/dri", "/dev/dri"));
-        // Privileged is the pragmatic choice for solo dev; production CI
-        // would narrow to cap_add(SYS_ADMIN) + cgroup device rules.
-        server_image = server_image.with_privileged(true);
     }
     let server: ContainerAsync<GenericImage> = server_image
         .with_ready_conditions(vec![WaitFor::message_on_stdout("CERT_HASH_SHA256=")])
@@ -1179,14 +1179,53 @@ async fn e2e_codec_transition() -> Result<()> {
 // M3.2c: center pixel reads r=0 under WebGPU + Xvfb + odd-resolution VKMS
 // capture. Likely the GPU pipeline or framebuffer-size logic mishandles
 // non-tile-aligned resolutions; separate investigation needed.
-#[ignore = "M3.2c: odd-resolution capture path renders empty canvas under WebGPU"]
+// M3.2c W5 finding (2026-05-17): with the setup-helper XORG_CONF override
+// bug fixed (extra_env now applied LAST) and the test switched to the
+// non-GPU helper so Xorg-on-dummy at 700×500 is the actual capture source,
+// the canvas correctly grows to 700×500 and full-tile pixels (e.g. (16,16),
+// (350,250)) render red as expected. But the PARTIAL edge tiles (col 21 =
+// pixels 672..699 with 4-px truncated edge, row 15 = pixels 480..499 with
+// 12-px truncated edge) render as transparent black: __readPixel(695,240),
+// (320,495), (695,495), (699,499) all return [0,0,0,0]. Server-side
+// `TileGrid::extract_tile` zero-pads partial tiles to 32×32 correctly, so
+// the wire payloads are well-formed; the issue is on the client-renderer
+// side. Possible roots: framebuffer texture vs canvas dimensions mismatch,
+// Solid pipeline NDC math at the partial-extent boundary, or rendered tile
+// region beyond framebuffer extents getting silently dropped. Deeper
+// investigation exceeds the W5 1-day hard-stop; carry over post-M3.2c.
+// The diagnostic readback below stays in-tree as a starting point for the
+// follow-up. See ~/.claude/projects/-home-cedric-work-ghostframe/memory/
+// project_m32c_partial.md and the spec's W5 section.
+#[ignore = "M3.2c carry-over: 700×500 capture renders full-tile pixels correctly but partial edge tiles render transparent; see W5 carry-over notes"]
 #[tokio::test]
 async fn e2e_edge_tiles() -> Result<()> {
+    // Use the non-GPU path so xorg-odd.conf's dummy driver at 700×500 is
+    // the actual capture source. With gpu=true the container's bind-mounted
+    // VKMS DRM device dominates (1024×768) and Xorg's dummy framebuffer is
+    // ignored by drm_capture — defeats the purpose of the odd-resolution
+    // test.
     let setup =
-        setup_e2e_webgpu_gpu_with_env("--solid-red", &[("XORG_CONF", "/etc/X11/xorg-odd.conf")]).await?;
+        setup_e2e_webgpu_with_env("--solid-red", &[("XORG_CONF", "/etc/X11/xorg-odd.conf")]).await?;
 
     // Wait for frames
     tokio::time::sleep(Duration::from_secs(6)).await;
+
+    // W5 diagnostic: dump a matrix of sample points so a failure tells us
+    // WHICH region is broken (all-empty vs edge-only vs corner-only).
+    let diag_js = r#"
+        (async () => {
+            const pts = [[0,0],[16,16],[349,249],[699,499],[350,250],[695,495],[695,240],[320,495]];
+            const out = {};
+            for (const [x,y] of pts) {
+                out[x+","+y] = await window.__readPixel(x, y);
+            }
+            const canv = document.querySelector('canvas');
+            out._canvas = [canv ? canv.width : -1, canv ? canv.height : -1];
+            return out;
+        })()
+    "#;
+    let diag: serde_json::Value = setup.page.evaluate(diag_js).await?.into_value()?;
+    eprintln!("e2e_edge_tiles diagnostic: {}", serde_json::to_string_pretty(&diag).unwrap());
 
     // Sample pixels at the far right edge (inside rightmost partial tile)
     // and bottom edge (inside bottom partial tile).
