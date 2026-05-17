@@ -52,6 +52,8 @@ proptest = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
 iai-callgrind = "0.14"
 lz4_flex = "0.11"
+image-compare = "0.4"
+image = { version = "0.25", features = ["png"] }
 ghostframe-test-pattern = { path = "../ghostframe-test-pattern" }
 
 [[bench]]
