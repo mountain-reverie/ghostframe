@@ -898,6 +898,82 @@ async fn e2e_solid_per_tile_pixels() -> Result<()> {
     Ok(())
 }
 
+/// W3/B7 — Verify the GPU shader's OOB-index error detection reaches
+/// the server via the FEEDBACK stream as DECODE_ERROR code 5
+/// (ERR_INDEX_OOB).
+///
+/// The server-side test hook GHOSTFRAME_INJECT_OOB_PALRLE replaces the
+/// next PalRle payload for tile (15, 11) with a hand-built bundled
+/// payload whose single RLE byte references palette index 2 against a
+/// count=1 palette. The client's compute shader detects the OOB,
+/// atomically writes 5 to its per-tile error slot, and main.ts forwards
+/// the error over the FEEDBACK bidi stream. The server's
+/// handle_decode_error logs the message via tracing::warn — we
+/// substring-match the rendered log line.
+///
+/// Test pattern: `--solid-per-tile --drm-direct` is the most reliable
+/// PalRle-emitting pattern that ships today. The 64×64 motion region is
+/// centred on the scanout; for VKMS's typical 1024×768 mode it lands at
+/// pixels (480..544, 352..416), i.e. tiles (15..17, 11..13). The four
+/// motion-region tiles classify as `PalRle` (Rule 3: high-freq low-mag,
+/// few colours) every frame, while the corners stay `Solid` and the BG
+/// stays `Skip`. Tile (15, 11) is one of those four — empirically
+/// verified with GHOSTFRAME_DIAGNOSE_TILES=1 against the same harness.
+///
+/// IMPORTANT: the server-side hook consumes `oob_inject_at` on the
+/// FIRST PalRle-bearing frame regardless of whether the target tile is
+/// in the per-frame `preps`. Pinning to a tile that is *reliably* PalRle
+/// on the very first dirty pass is required — the motion-region tiles
+/// satisfy that constraint; first-frame-Solid tiles (corners, BG) do not.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_palrle_oob_index() -> Result<()> {
+    let _setup = setup_e2e_webgpu_gpu_with_env(
+        "--solid-per-tile --drm-direct",
+        &[("GHOSTFRAME_INJECT_OOB_PALRLE", "15,11")],
+    )
+    .await?;
+
+    // Allow time for: page load → WebGPU init → first frame capture →
+    // OOB injection → shader-side OOB detection → mapAsync readback →
+    // FEEDBACK stream write → server warn-log.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    // Read server logs (same pattern as e2e_indices_raw_handshake).
+    let out = std::process::Command::new("docker")
+        .args(["logs", "ghostframe-server"])
+        .output()
+        .expect("running docker logs");
+    let raw_logs = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    // tracing-subscriber emits ANSI escapes when stdout is a TTY; strip
+    // them so substring assertions are stable (same approach as
+    // e2e_indices_raw_handshake).
+    let logs: String = raw_logs.chars().fold((String::new(), false), |(mut acc, in_esc), c| {
+        if in_esc {
+            (acc, c != 'm')
+        } else if c == '\x1b' {
+            (acc, true)
+        } else {
+            acc.push(c);
+            (acc, false)
+        }
+    }).0;
+
+    assert!(
+        logs.contains("client decode error"),
+        "expected 'client decode error' tracing line in server logs; got:\n{logs}"
+    );
+    assert!(
+        logs.contains("error_code=5"),
+        "expected 'error_code=5' in server logs (DECODE_ERROR for ERR_INDEX_OOB); got:\n{logs}"
+    );
+
+    Ok(())
+}
+
 /// Force a client reconnect mid-stream; verify the server's warm-cache
 /// palette table re-delivers palettes on the new session and the text
 /// region renders correctly post-reset.

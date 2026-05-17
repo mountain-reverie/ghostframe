@@ -1177,10 +1177,17 @@ impl IoBridge {
                 let inject = self.oob_inject_at;
                 #[cfg(not(any(test, feature = "test-loss-injection")))]
                 let inject: Option<(u32, u32)> = None;
+                // Only consume the one-shot injection when the target tile
+                // is actually in this frame's preps — otherwise the hook
+                // would be silently spent on the first PalRle frame whose
+                // preps happen to exclude the injection target.
+                let inject_will_fire = inject
+                    .map(|xy| preps.iter().any(|p| p.tile_xy == xy))
+                    .unwrap_or(false);
                 let mut palrle_payloads =
                     IoBridge::phase_b_encode_payloads_with_caps(&preps, &caps, inject);
                 #[cfg(any(test, feature = "test-loss-injection"))]
-                if inject.is_some() {
+                if inject_will_fire {
                     self.oob_inject_at = None;
                 }
 
@@ -1640,10 +1647,17 @@ impl IoBridge {
                 };
                 if let Some(inject) = inject_at {
                     if p.tile_xy == inject {
-                        // Hand-built bundled payload with palette count=1 but
-                        // an RLE byte referencing palette index 2 (OOB). See
-                        // wire-format docs above for byte-by-byte breakdown.
-                        payload = vec![0x01u8, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xFF, 0x20];
+                        // Hand-built bundled payload: flags=0x01 (bundled),
+                        // palette_id=0, count=1, one BGRA red entry, then 64
+                        // RLE bytes of 0x2F (index=2, run_len=16) covering
+                        // all 1024 tile pixels. Passes client prevalidation
+                        // (which insists on exactly 1024 pixels) so the GPU
+                        // compute shader actually runs and detects the OOB
+                        // (color_idx=2 >= count=1), writing error_code=5.
+                        let mut p_inj = Vec::with_capacity(7 + 64);
+                        p_inj.extend_from_slice(&[0x01u8, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xFF]);
+                        p_inj.extend(std::iter::repeat(0x2Fu8).take(64));
+                        payload = p_inj;
                         tracing::info!(
                             target: "palrle.wire",
                             tile_x = p.tile_xy.0,
