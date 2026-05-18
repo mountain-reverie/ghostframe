@@ -1157,24 +1157,15 @@ async fn e2e_codec_transition() -> Result<()> {
 // M3.2c: center pixel reads r=0 under WebGPU + Xvfb + odd-resolution VKMS
 // capture. Likely the GPU pipeline or framebuffer-size logic mishandles
 // non-tile-aligned resolutions; separate investigation needed.
-// M3.2c W5 finding (2026-05-17): with the setup-helper XORG_CONF override
-// bug fixed (extra_env now applied LAST) and the test switched to the
-// non-GPU helper so Xorg-on-dummy at 700×500 is the actual capture source,
-// the canvas correctly grows to 700×500 and full-tile pixels (e.g. (16,16),
-// (350,250)) render red as expected. But the PARTIAL edge tiles (col 21 =
-// pixels 672..699 with 4-px truncated edge, row 15 = pixels 480..499 with
-// 12-px truncated edge) render as transparent black: __readPixel(695,240),
-// (320,495), (695,495), (699,499) all return [0,0,0,0]. Server-side
-// `TileGrid::extract_tile` zero-pads partial tiles to 32×32 correctly, so
-// the wire payloads are well-formed; the issue is on the client-renderer
-// side. Possible roots: framebuffer texture vs canvas dimensions mismatch,
-// Solid pipeline NDC math at the partial-extent boundary, or rendered tile
-// region beyond framebuffer extents getting silently dropped. Deeper
-// investigation exceeds the W5 1-day hard-stop; carry over post-M3.2c.
-// The diagnostic readback below stays in-tree as a starting point for the
-// follow-up. See ~/.claude/projects/-home-cedric-work-ghostframe/memory/
-// project_m32c_partial.md and the spec's W5 section.
-#[ignore = "M3.2c carry-over: 700×500 capture renders full-tile pixels correctly but partial edge tiles render transparent; see W5 carry-over notes"]
+// W5 closure (2026-05-18): partial edge tiles at non-tile-aligned
+// resolutions (e.g. 700×500 here, col 21 = pixels 672..699, row 15 =
+// pixels 480..499) now render correctly. Root cause was WebGPU
+// `writeTexture(origin.x=672, extent.width=32)` against a 700-wide
+// framebuffer tripping the "origin+size > texture.size" validation
+// and silently dropping the entire tile. Fix in commit `e78f081`
+// clips `writeRawTile`'s extent to fb bounds. Full Phase-1
+// diagnostic trail kept in-tree for future debugging — see
+// `docs/superpowers/specs/2026-05-17-edge-tiles-diagnose-fix-design.md`.
 #[tokio::test]
 async fn e2e_edge_tiles() -> Result<()> {
     // Use the non-GPU path so xorg-odd.conf's dummy driver at 700×500 is
