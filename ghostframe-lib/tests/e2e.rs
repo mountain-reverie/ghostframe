@@ -2052,16 +2052,27 @@ async fn e2e_indices_raw_handshake() -> Result<()> {
 /// wire encoding is covered by `tests/decode_error_batcher.test.ts`.
 /// What's missing is the full integration. Re-enable once M3.2c repairs
 /// the capture path. See `project_m32c_deferred` memory note.
-// Re-ignored after the W1/B1 fixes landed (commits 4a4c2f6, eadc632,
-// aef882b, 90c4d12).  The wire-path is fixed AND PalRle is rendering, but
-// the test design relies on the server eventually emitting THIN payloads
-// (so client can fire ERR_THIN_UNCACHED_PALETTE → DECODE_ERROR → server
-// force_rebundle).  With 100% bundled loss against static text content,
-// the server's palette never reaches delivered=true (no ACKs come back),
-// so the thin emission path never fires.  Needs a different test design:
-// multi-palette content, OR partial loss + dynamic content, OR a
-// dedicated "force-thin" server knob.  Track in project_m32c_deferred.md.
-#[ignore = "M3.2c follow-up: test design needs multi-palette / dynamic content for thin emission"]
+// Re-investigated 2026-05-17/18 via natural-pipeline approach (session-reset
+// hook + page.reload). Diagnosis confirmed the test cannot fire
+// ERR_THIN_UNCACHED via the natural pipeline under current architecture for
+// two independent reasons:
+//
+//   (1) palette_table.on_session_reset is dead code in production: the
+//       new-session gate at io_bridge.rs:1446 (!was_connected &&
+//       wt.is_connected()) never fires because Stream(Opened)'s eager-read
+//       completes the CONNECT handshake before Stream(Readable) runs, so
+//       was_connected is already true when the readable arrives.
+//
+//   (2) Even with delivered preserved, a 2-color flip thrashes palette
+//       slot 0 every cycle: find_matching fails, find_eligible_free_slot
+//       returns slot 0 (oldest LRU), write_bytes overwrites and clears
+//       delivered. The server emits BUNDLED then THIN within the same
+//       flip cycle, so the client never sees thin against an empty shadow.
+//
+// Full diagnosis at /home/cedric/.claude/projects/-home-cedric-work-ghostframe/
+// memory/project_decode_error_thin_diagnosis.md.  Closing this test cleanly
+// requires fixing (1) and (2), both of which are out of M3.2c scope.
+#[ignore = "M3.2c carry-over: natural pipeline blocked by latent on_session_reset dead-code + LRU thrashing on 2-palette workloads — see project_decode_error_thin_diagnosis.md"]
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_decode_error_thin_uncached() -> Result<()> {
     let _setup = setup_e2e_webgpu_gpu_with_env(
