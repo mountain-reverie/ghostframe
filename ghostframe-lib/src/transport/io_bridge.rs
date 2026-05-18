@@ -267,6 +267,20 @@ impl IoBridge {
         Some((x, y))
     }
 
+    /// Cfg-gated test hook: parse `GHOSTFRAME_SKIP_PALETTE_SESSION_RESET`.
+    /// When `"1"` or `"true"`, the new-session handler will preserve the
+    /// `palette_table.delivered` bitset across the session reset (other
+    /// per-session state still resets normally). Drives the e2e for the
+    /// ERR_THIN_UNCACHED_PALETTE round-trip — see
+    /// `docs/superpowers/specs/2026-05-17-decode-error-thin-uncached-design.md`.
+    #[cfg(any(test, feature = "test-loss-injection"))]
+    fn skip_palette_session_reset_from_env() -> bool {
+        matches!(
+            std::env::var("GHOSTFRAME_SKIP_PALETTE_SESSION_RESET").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    }
+
     /// Returns `true` when `GHOSTFRAME_DIAGNOSE_TILES` is set to `"1"` or `"true"`.
     fn diagnose_tiles_from_env() -> bool {
         matches!(
@@ -2248,6 +2262,24 @@ mod tests {
         if let Some(p) = prev { std::env::set_var("GHOSTFRAME_INJECT_OOB_PALRLE", p); }
         else { std::env::remove_var("GHOSTFRAME_INJECT_OOB_PALRLE"); }
         assert_eq!(inj, Some((5u32, 7u32)));
+    }
+
+    #[cfg(any(test, feature = "test-loss-injection"))]
+    #[test]
+    fn skip_palette_session_reset_from_env_parses() {
+        let prev = std::env::var("GHOSTFRAME_SKIP_PALETTE_SESSION_RESET").ok();
+        std::env::set_var("GHOSTFRAME_SKIP_PALETTE_SESSION_RESET", "1");
+        let got = IoBridge::skip_palette_session_reset_from_env();
+        if let Some(p) = prev {
+            std::env::set_var("GHOSTFRAME_SKIP_PALETTE_SESSION_RESET", p);
+        } else {
+            std::env::remove_var("GHOSTFRAME_SKIP_PALETTE_SESSION_RESET");
+        }
+        assert!(got, "env=1 must yield true");
+
+        // Default (unset) is false.
+        std::env::remove_var("GHOSTFRAME_SKIP_PALETTE_SESSION_RESET");
+        assert!(!IoBridge::skip_palette_session_reset_from_env(), "unset must yield false");
     }
 
     #[test]
