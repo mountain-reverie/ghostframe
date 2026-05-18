@@ -299,6 +299,34 @@ async function main() {
   function finishAssembly(asmKey: string, asm: TileAssembly) {
     assemblies.delete(asmKey);
 
+    // asmKey format is `${frameSeq}:${tileX}:${tileY}` — extract frameSeq for
+    // test instrumentation (TileHeader itself doesn't carry frameSeq).
+    const frameSeqFromKey = parseInt(asmKey.split(':')[0], 10);
+
+    function recordingResize(
+      newW: number,
+      newH: number,
+      trigger: 'sentinel' | 'fallback-expand',
+      seq: number,
+    ) {
+      const oldW = renderer.framebuffer.width;
+      const oldH = renderer.framebuffer.height;
+      renderer.resize(newW, newH);
+      if (typeof window !== "undefined") {
+        const w = window as unknown as {
+          __ghostframeRecordedResizes?: Array<{
+            seq: number; oldW: number; oldH: number;
+            newW: number; newH: number;
+            trigger: 'sentinel' | 'fallback-expand';
+          }>;
+        };
+        if (!w.__ghostframeRecordedResizes) {
+          w.__ghostframeRecordedResizes = [];
+        }
+        w.__ghostframeRecordedResizes.push({ seq, oldW, oldH, newW, newH, trigger });
+      }
+    }
+
     const totalLen = asm.fragments.reduce((acc, f) => acc + (f ? f.byteLength : 0), 0);
     const payload = new Uint8Array(totalLen);
     let off = 0;
@@ -318,7 +346,7 @@ async function main() {
         const view = new DataView(payload.buffer, payload.byteOffset, 8);
         const w = view.getUint32(0, false);
         const h = view.getUint32(4, false);
-        renderer.resize(w, h);
+        recordingResize(w, h, 'sentinel', frameSeqFromKey);
         frameDimensionsKnown = true;
       }
       return;
@@ -330,20 +358,48 @@ async function main() {
       const minWidth = (tX + 1) * TILE_SIZE;
       const minHeight = (tY + 1) * TILE_SIZE;
       if (canvasEl.width < minWidth || canvasEl.height < minHeight) {
-        renderer.resize(
+        recordingResize(
           Math.max(canvasEl.width, minWidth),
-          Math.max(canvasEl.height, minHeight)
+          Math.max(canvasEl.height, minHeight),
+          'fallback-expand',
+          frameSeqFromKey,
         );
       }
     }
 
     // Test instrumentation: record codecs for E2E protocol-layer assertions.
+    // Per-tile event log adds {tileX, tileY, codec, payloadLen, fbWidth, fbHeight}
+    // so e2e_edge_tiles can correlate which tiles arrived against the framebuffer
+    // dimensions at the moment they were queued (W5 diagnostic).
     if (typeof window !== "undefined") {
-      const w = window as unknown as { __ghostframeRecordedCodecs?: number[] };
+      const w = window as unknown as {
+        __ghostframeRecordedCodecs?: number[];
+        __ghostframeRecordedTiles?: Array<{
+          seq: number;
+          tileX: number;
+          tileY: number;
+          codec: number;
+          payloadLen: number;
+          fbWidth: number;
+          fbHeight: number;
+        }>;
+      };
       if (!w.__ghostframeRecordedCodecs) {
         w.__ghostframeRecordedCodecs = [];
       }
+      if (!w.__ghostframeRecordedTiles) {
+        w.__ghostframeRecordedTiles = [];
+      }
       w.__ghostframeRecordedCodecs.push(asm.header.codec);
+      w.__ghostframeRecordedTiles.push({
+        seq: frameSeqFromKey,
+        tileX: tX,
+        tileY: tY,
+        codec: asm.header.codec,
+        payloadLen: payload.byteLength,
+        fbWidth: renderer.framebuffer.width,
+        fbHeight: renderer.framebuffer.height,
+      });
     }
 
     if (asm.header.codec === Codec.Raw) {

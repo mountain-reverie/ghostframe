@@ -1205,6 +1205,25 @@ async fn e2e_edge_tiles() -> Result<()> {
     let diag: serde_json::Value = setup.page.evaluate(diag_js).await?.into_value()?;
     eprintln!("e2e_edge_tiles diagnostic: {}", serde_json::to_string_pretty(&diag).unwrap());
 
+    let tiles: serde_json::Value = setup
+        .page
+        .evaluate("window.__ghostframeRecordedTiles || []")
+        .await?
+        .into_value()?;
+    let resizes: serde_json::Value = setup
+        .page
+        .evaluate("window.__ghostframeRecordedResizes || []")
+        .await?
+        .into_value()?;
+    eprintln!(
+        "e2e_edge_tiles tiles: {}",
+        serde_json::to_string_pretty(&tiles).unwrap()
+    );
+    eprintln!(
+        "e2e_edge_tiles resizes: {}",
+        serde_json::to_string_pretty(&resizes).unwrap()
+    );
+
     // Sample pixels at the far right edge (inside rightmost partial tile)
     // and bottom edge (inside bottom partial tile).
     // If edge tiles work, these should be red (from --solid-red pattern).
