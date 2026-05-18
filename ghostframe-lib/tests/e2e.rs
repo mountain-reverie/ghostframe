@@ -956,29 +956,7 @@ async fn e2e_palrle_oob_index() -> Result<()> {
     // FEEDBACK stream write → server warn-log.
     tokio::time::sleep(Duration::from_secs(8)).await;
 
-    // Read server logs (same pattern as e2e_indices_raw_handshake).
-    let out = std::process::Command::new("docker")
-        .args(["logs", "ghostframe-server"])
-        .output()
-        .expect("running docker logs");
-    let raw_logs = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    // tracing-subscriber emits ANSI escapes when stdout is a TTY; strip
-    // them so substring assertions are stable (same approach as
-    // e2e_indices_raw_handshake).
-    let logs: String = raw_logs.chars().fold((String::new(), false), |(mut acc, in_esc), c| {
-        if in_esc {
-            (acc, c != 'm')
-        } else if c == '\x1b' {
-            (acc, true)
-        } else {
-            acc.push(c);
-            (acc, false)
-        }
-    }).0;
+    let logs = helpers::read_server_logs_stripped("ghostframe-server");
 
     assert!(
         logs.contains("client decode error"),
@@ -2043,27 +2021,7 @@ async fn e2e_indices_raw_handshake() -> Result<()> {
     // feedback bidi stream open -> HELLO write -> server parse.
     tokio::time::sleep(Duration::from_secs(5)).await;
 
-    let out = std::process::Command::new("docker")
-        .args(["logs", "ghostframe-server"])
-        .output()
-        .expect("running docker logs");
-    let raw_logs = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    // tracing-subscriber emits ANSI color escapes around field names/values
-    // when stdout is a TTY. Strip them so substring assertions are stable.
-    let logs: String = raw_logs.chars().fold((String::new(), false), |(mut acc, in_esc), c| {
-        if in_esc {
-            (acc, c != 'm')
-        } else if c == '\x1b' {
-            (acc, true)
-        } else {
-            acc.push(c);
-            (acc, false)
-        }
-    }).0;
+    let logs = helpers::read_server_logs_stripped("ghostframe-server");
 
     assert!(
         logs.contains("HELLO received"),

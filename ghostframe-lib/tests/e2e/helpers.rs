@@ -405,3 +405,28 @@ pub fn assert_ssim_against_golden(
     }
     Ok(())
 }
+
+/// Read `docker logs <container>` (stdout + stderr concatenated) and strip
+/// ANSI escape sequences so substring assertions are stable across TTY /
+/// non-TTY contexts. Used by tests that assert on tracing-subscriber output.
+pub fn read_server_logs_stripped(container_name: &str) -> String {
+    let out = std::process::Command::new("docker")
+        .args(["logs", container_name])
+        .output()
+        .expect("running docker logs");
+    let raw = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    raw.chars().fold((String::new(), false), |(mut acc, in_esc), c| {
+        if in_esc {
+            (acc, c != 'm')
+        } else if c == '\x1b' {
+            (acc, true)
+        } else {
+            acc.push(c);
+            (acc, false)
+        }
+    }).0
+}
