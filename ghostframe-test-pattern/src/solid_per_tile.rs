@@ -37,7 +37,7 @@
 //! `drm_direct::MOTION_TICK`).
 
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use drm::control::Device as ControlDevice;
 
@@ -181,7 +181,7 @@ pub fn run(card_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let motion_size = MOTION_SIZE.min(width).min(height);
     let motion_x = width.saturating_sub(motion_size) / 2;
     let motion_y = height.saturating_sub(motion_size) / 2;
-    let mut motion_phase: u8 = 0;
+    let start = Instant::now();
 
     loop {
         {
@@ -191,13 +191,19 @@ pub fn run(card_path: &str) -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|e| format!("map_dumb_buffer motion: {e}"))?;
             let bytes = map.as_mut();
 
-            // Compute a cycling colour for this tick. Cheap LCG-ish mix; the
-            // exact palette doesn't matter, only that the bytes change each
-            // tick so SAD reports the central tiles dirty.
-            let r = motion_phase.wrapping_mul(3);
-            let g = motion_phase.wrapping_mul(5).wrapping_add(0x55);
-            let b = motion_phase.wrapping_mul(7).wrapping_add(0xAA);
-            let pixel = ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
+            // 2-color flip at 33ms cadence (≈30Hz). Both colours form stable
+            // 1-color palettes; the same two palette slots get re-used every
+            // cycle, so palette_table.delivered stays set for both across the
+            // e2e test's page-reload. Required by e2e_decode_error_thin_uncached
+            // (A5/B6) — see
+            // docs/superpowers/specs/2026-05-17-decode-error-thin-uncached-design.md.
+            const FLIP_RED: u32 = 0x00FF_0000;
+            const FLIP_BLUE: u32 = 0x0000_00FF;
+            let pixel = if (start.elapsed().as_millis() / 33) % 2 == 0 {
+                FLIP_RED
+            } else {
+                FLIP_BLUE
+            };
 
             fill_rect(
                 bytes,
@@ -213,7 +219,6 @@ pub fn run(card_path: &str) -> Result<(), Box<dyn std::error::Error>> {
 
             msync_buffer(bytes);
         }
-        motion_phase = motion_phase.wrapping_add(7);
         thread::sleep(MOTION_TICK);
     }
 }
