@@ -122,6 +122,13 @@ pub struct IoBridge {
     /// containing an out-of-bounds palette index. Cleared after firing once.
     #[cfg(any(test, feature = "test-loss-injection"))]
     pub(crate) oob_inject_at: Option<(u32, u32)>,
+    /// Cfg-gated test hook: when true, the new-session handler preserves the
+    /// `palette_table.delivered` bitset across the session reset (it still
+    /// resets in_flight_carrying / ref_count / etc.). Drives the
+    /// e2e_decode_error_thin_uncached round-trip by simulating a client
+    /// that lost palette shadow without the server noticing.
+    #[cfg(any(test, feature = "test-loss-injection"))]
+    pub(crate) skip_palette_session_reset: bool,
     /// Remaining frames to force all-dirty after a new session connects.
     /// QUIC slow-start can only deliver a fraction of tiles in the first burst;
     /// forcing dirty for several frames lets the congestion window open.
@@ -371,6 +378,8 @@ impl IoBridge {
             inbound_loss: Self::loss_injector_from_env("INBOUND"),
             #[cfg(any(test, feature = "test-loss-injection"))]
             oob_inject_at: Self::oob_injector_from_env(),
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            skip_palette_session_reset: Self::skip_palette_session_reset_from_env(),
             force_dirty_frames: 0,
             palette_table: crate::encoder::pal_rle::PaletteTable::new(),
             client_caps: crate::transport::client_caps::ClientCapabilities::default(),
@@ -1446,7 +1455,16 @@ impl IoBridge {
                             self.metrics_tracker.reset();
                             self.classifier.reset();
                             self.scheduler.clear();
-                            self.palette_table.on_session_reset(false);
+                            #[cfg(any(test, feature = "test-loss-injection"))]
+                            let preserve_delivered = self.skip_palette_session_reset;
+                            #[cfg(not(any(test, feature = "test-loss-injection")))]
+                            let preserve_delivered = false;
+                            self.palette_table.on_session_reset(preserve_delivered);
+                            if preserve_delivered {
+                                tracing::info!(
+                                    "test-hook: preserving palette_table.delivered across session reset (GHOSTFRAME_SKIP_PALETTE_SESSION_RESET=1)"
+                                );
+                            }
                             self.frame_mode = crate::tile::FrameMode::H264;
                             // Re-prime the frame-dimensions retransmit counter so
                             // the new client receives the sentinel on its first
@@ -1714,6 +1732,8 @@ impl IoBridge {
             inbound_loss: None,
             #[cfg(any(test, feature = "test-loss-injection"))]
             oob_inject_at: None,
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            skip_palette_session_reset: false,
             force_dirty_frames: 0,
             palette_table: crate::encoder::pal_rle::PaletteTable::new(),
             client_caps: crate::transport::client_caps::ClientCapabilities::default(),
@@ -1758,6 +1778,8 @@ impl IoBridge {
             inbound_loss: None,
             #[cfg(any(test, feature = "test-loss-injection"))]
             oob_inject_at: None,
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            skip_palette_session_reset: false,
             force_dirty_frames: 0,
             palette_table: crate::encoder::pal_rle::PaletteTable::new(),
             client_caps: crate::transport::client_caps::ClientCapabilities::default(),
