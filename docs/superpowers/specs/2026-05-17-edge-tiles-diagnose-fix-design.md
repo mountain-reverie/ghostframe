@@ -227,3 +227,23 @@ If the fix lands without `#[ignore]` removed, that's a bug. Reviewer must verify
 - Predecessor session memory: `~/.claude/projects/-home-cedric-work-ghostframe/memory/project_m32c_near_complete.md`
 - Original M3.2c verification design: `docs/superpowers/specs/2026-05-15-m3.2c-verification-design.md` § W5
 - Diagnostic env-var conventions reference: `~/.claude/projects/-home-cedric-work-ghostframe/memory/reference_e2e_diagnose.md`
+
+## Phase 1 findings (2026-05-18)
+
+**Bucket matched:** R3 (Raw writeTexture out-of-bounds).
+
+**Evidence (from `/tmp/edge_diag.log`):**
+
+```
+e2e_edge_tiles tiles: [
+  { codec: 5, fbWidth: 700, fbHeight: 500, payloadLen: 4096, seq: 12, tileX: 21, tileY: 0 },
+  { codec: 5, fbWidth: 700, fbHeight: 500, payloadLen: 4096, seq: 12, tileX: 21, tileY: 1 },
+  ... (every col 21 tile classified as Codec::Raw, full 32×32 payload)
+]
+```
+
+Canvas is sized correctly to 700×500 (matching the test pattern). Server emits Raw with the full 32×32 zero-padded tile payload (per `TileGrid::extract_tile`). The client's `writeRawTile` tries `writeTexture(origin.x = 21*32 = 672, extent.width = 32)` against a 700-wide framebuffer — `origin.x + width = 704 > 700` → WebGPU validation error → silent drop → pixel stays at the default (transparent black).
+
+(Side note: `resizes` was empty in this run. The canvas reaches 700×500 through some path that doesn't go through the `recordingResize` helper, OR the recorder loads after the first resize. Not blocking — the tile classification is enough to confirm R3.)
+
+**Chosen Phase 2 path:** R3 template — clip `writeRawTile`'s extent to `min(32, fb.width - tileX*32) × min(32, fb.height - tileY*32)` and pack the source bytes tightly (`bytesPerRow = copyW * 4`) so writeTexture sees a contiguous source.
