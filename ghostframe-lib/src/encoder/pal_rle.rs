@@ -192,8 +192,10 @@ impl PaletteTable {
     /// reset all per-slot tracking but preserve slot bytes (warm cache).
     /// Next session may hit `find_matching` on persistent text colors and
     /// avoid re-bundling identical palettes from scratch.
-    pub fn on_session_reset(&mut self) {
-        self.delivered.clear();
+    pub fn on_session_reset(&mut self, preserve_delivered: bool) {
+        if !preserve_delivered {
+            self.delivered.clear();
+        }
         self.in_flight_carrying.fill(0);
         self.ref_count.fill(0);
         self.free_lru.clear();
@@ -711,7 +713,7 @@ mod tests {
         t.delivered.insert(7);
         t.in_flight_carrying[7] = 2;
 
-        t.on_session_reset();
+        t.on_session_reset(false);
 
         assert_eq!(t.entries[7], Some(p), "bytes preserved (warm cache)");
         assert_eq!(t.slot_state[7], SlotState::FreeButCached);
@@ -721,10 +723,36 @@ mod tests {
     }
 
     #[test]
+    fn on_session_reset_preserve_delivered_keeps_bit() {
+        let mut t = PaletteTable::new();
+        // Allocate and "deliver" a palette.
+        let p = PaletteEntry {
+            count: 2,
+            colors: { let mut c = [[0u8; 4]; 16]; c[0] = [0xFF, 0, 0, 0xFF]; c[1] = [0, 0, 0xFF, 0xFF]; c },
+        };
+        let id = t.acquire_or_allocate(&p).unwrap();
+        t.delivered.insert(id);
+        t.in_flight_carrying[id as usize] = 3;
+        t.ref_count[id as usize] = 1;
+        assert!(t.delivered.contains(id), "precondition: delivered set");
+
+        // preserve_delivered=true: delivered bit stays, other per-session state still resets.
+        t.on_session_reset(true);
+        assert!(t.delivered.contains(id),
+            "preserve_delivered=true must keep the delivered bit set");
+        assert_eq!(t.in_flight_carrying[id as usize], 0,
+            "in_flight_carrying still resets");
+        assert_eq!(t.ref_count[id as usize], 0,
+            "ref_count still resets");
+        assert!(t.entries[id as usize].is_some(),
+            "palette bytes preserved (warm cache)");
+    }
+
+    #[test]
     fn on_session_reset_keeps_empty_slots_empty() {
         let mut t = PaletteTable::new();
         // slot 99 untouched
-        t.on_session_reset();
+        t.on_session_reset(false);
         assert_eq!(t.slot_state[99], SlotState::Empty);
         assert!(t.entries[99].is_none());
     }
@@ -739,7 +767,7 @@ mod tests {
         t.entries[8] = Some(p2);
         t.slot_state[8] = SlotState::FreeButCached;
 
-        t.on_session_reset();
+        t.on_session_reset(false);
 
         // Both 5 and 8 become FreeButCached; free_lru contains both.
         assert!(t.free_lru.contains(&5));
@@ -755,7 +783,7 @@ mod tests {
         t.delivered.insert(42);
         t.in_flight_carrying[42] = 1;
 
-        t.on_session_reset();
+        t.on_session_reset(false);
         // Warm cache still finds the palette by bytes.
         assert_eq!(t.find_matching(&p), Some(42));
     }

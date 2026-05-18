@@ -1432,7 +1432,7 @@ impl IoBridge {
                             self.metrics_tracker.reset();
                             self.classifier.reset();
                             self.scheduler.clear();
-                            self.palette_table.on_session_reset();
+                            self.palette_table.on_session_reset(false);
                             self.frame_mode = crate::tile::FrameMode::H264;
                             // Re-prime the frame-dimensions retransmit counter so
                             // the new client receives the sentinel on its first
