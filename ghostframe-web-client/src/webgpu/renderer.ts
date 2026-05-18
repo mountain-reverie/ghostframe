@@ -85,18 +85,36 @@ export class WebGpuRenderer {
     if (bgra.length !== 32 * 32 * 4) {
       throw new Error(`writeRawTile: payload length ${bgra.length} != 4096`);
     }
-    const rgba = new Uint8Array(bgra.length);
-    for (let i = 0; i < bgra.length; i += 4) {
-      rgba[i + 0] = bgra[i + 2]; // R from B-slot
-      rgba[i + 1] = bgra[i + 1]; // G
-      rgba[i + 2] = bgra[i + 0]; // B from R-slot
-      rgba[i + 3] = bgra[i + 3] === 0 ? 255 : bgra[i + 3]; // force alpha (BGRX quirk)
+    // Clip the destination extent to the framebuffer bounds — partial edge
+    // tiles at non-32-aligned resolutions (e.g. 700×500 in e2e_edge_tiles)
+    // would otherwise trip a WebGPU validation error
+    // ("origin + size > texture.size") and silently drop the entire tile.
+    const fbW = this.framebuffer.width;
+    const fbH = this.framebuffer.height;
+    const dstX = tileX * 32;
+    const dstY = tileY * 32;
+    if (dstX >= fbW || dstY >= fbH) return; // tile entirely outside framebuffer
+    const copyW = Math.min(32, fbW - dstX);
+    const copyH = Math.min(32, fbH - dstY);
+
+    // BGRA→RGBA swap, only for the bytes we'll actually upload. Pack tightly
+    // (bytesPerRow = copyW * 4) so writeTexture sees a contiguous source.
+    const rgba = new Uint8Array(copyW * copyH * 4);
+    for (let row = 0; row < copyH; row++) {
+      for (let col = 0; col < copyW; col++) {
+        const srcOff = (row * 32 + col) * 4;
+        const dstOff = (row * copyW + col) * 4;
+        rgba[dstOff + 0] = bgra[srcOff + 2]; // R from B-slot
+        rgba[dstOff + 1] = bgra[srcOff + 1]; // G
+        rgba[dstOff + 2] = bgra[srcOff + 0]; // B from R-slot
+        rgba[dstOff + 3] = bgra[srcOff + 3] === 0 ? 255 : bgra[srcOff + 3]; // force alpha (BGRX quirk)
+      }
     }
     this.device.queue.writeTexture(
-      { texture: this.framebuffer.texture, origin: { x: tileX * 32, y: tileY * 32 } },
+      { texture: this.framebuffer.texture, origin: { x: dstX, y: dstY } },
       rgba,
-      { bytesPerRow: 32 * 4, rowsPerImage: 32 },
-      { width: 32, height: 32 },
+      { bytesPerRow: copyW * 4, rowsPerImage: copyH },
+      { width: copyW, height: copyH },
     );
   }
 
