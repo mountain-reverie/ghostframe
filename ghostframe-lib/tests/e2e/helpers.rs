@@ -430,3 +430,39 @@ pub fn read_server_logs_stripped(container_name: &str) -> String {
         }
     }).0
 }
+
+/// Pre-test hygiene: remove stale `/tmp/.X11-unix/X<N>` socket files and
+/// matching `/tmp/.X<N>-lock` lock files for `N in 99..=199`, but skip any
+/// socket that's currently backed by a live X server (connect probe returns
+/// Ok). Without this, accumulated stale sockets from prior test runs cause
+/// `spawn_xvfb` to fail with "no free X display number in 99..200" after
+/// ~100 test invocations have leaked Xvfb sockets.
+///
+/// Called once at the top of `setup_e2e_inner` so it runs once per test.
+pub fn cleanup_stale_xvfb_sockets() {
+    use std::os::unix::net::UnixStream;
+    use std::path::Path;
+    let mut removed = 0;
+    for n in 99..=199u32 {
+        let socket = format!("/tmp/.X11-unix/X{n}");
+        let lock = format!("/tmp/.X{n}-lock");
+        if !Path::new(&socket).exists() && !Path::new(&lock).exists() {
+            continue;
+        }
+        match UnixStream::connect(&socket) {
+            Ok(_) => continue, // live X server bound; keep
+            Err(e) if matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) => {
+                let _ = std::fs::remove_file(&socket);
+                let _ = std::fs::remove_file(&lock);
+                removed += 1;
+            }
+            Err(_) => continue,
+        }
+    }
+    if removed > 0 {
+        eprintln!("cleanup_stale_xvfb_sockets: removed {removed} stale entries");
+    }
+}
