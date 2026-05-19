@@ -921,6 +921,53 @@ async fn e2e_solid_per_tile_pixels() -> Result<()> {
     Ok(())
 }
 
+/// W3/B1 — Exact-pixel verification of the PalRLE compute shader.
+///
+/// Drives `--palrle-exact --drm-direct`'s four 32×32 PalRle tiles
+/// (checkerboard / horizontal stripes / vertical stripes / 2×2 blocks,
+/// all sharing a 2-color red/blue palette) and asserts exact RGBA at
+/// 16 sample points. Catches nibble-swap, per-pixel arithmetic,
+/// BGRA→RGBA swizzle, and tile-coord bugs that the existing PalRle
+/// tests (e2e_palrle_5pct_loss, e2e_text_clarity, e2e_palrle_oob_index)
+/// don't surface under text-luminance or codec-classification checks.
+///
+/// Closes M3.2c B1 follow-up.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_palrle_exact_pixels() -> Result<()> {
+    use ghostframe_test_pattern::palrle_exact::samples;
+
+    let setup = setup_e2e_webgpu_gpu("--palrle-exact --drm-direct").await?;
+    // 5s covers QUIC slow-start + first-frame H.264 phase + classifier
+    // transition to PalRle for the four 2-color test tiles.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Sanity: PalRle codec (wire enum 2) must appear on the wire.
+    let codecs: Vec<u8> = setup
+        .page
+        .evaluate("window.__ghostframeRecordedCodecs || []")
+        .await?
+        .into_value()?;
+    assert!(
+        codecs.contains(&2u8),
+        "expected Codec::PalRle (2); saw codecs: {:?}",
+        codecs
+    );
+
+    // Exact-pixel assertions across all four test tiles.
+    for sample in samples() {
+        let probe = format!("window.__readPixel({}, {})", sample.x, sample.y);
+        let got: Vec<u8> = setup.page.evaluate(probe.as_str()).await?.into_value()?;
+        assert_eq!(
+            got,
+            sample.expected_rgba.to_vec(),
+            "pixel ({}, {}) mismatch: got {:?}, expected {:?}",
+            sample.x, sample.y, got, sample.expected_rgba
+        );
+    }
+
+    Ok(())
+}
+
 /// W3/B7 — Verify the GPU shader's OOB-index error detection reaches
 /// the server via the FEEDBACK stream as DECODE_ERROR code 5
 /// (ERR_INDEX_OOB).
