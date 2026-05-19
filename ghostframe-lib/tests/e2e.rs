@@ -2050,82 +2050,63 @@ async fn e2e_indices_raw_handshake() -> Result<()> {
     Ok(())
 }
 
-/// M3.2b: round-trip test for the decode-error wire protocol —
-/// loss injection drops every bundled PalRle datagram, so the client
-/// receives thin payloads referencing palettes it never cached. Phase 1
-/// taxonomy says this is error_code=3 (ERR_THIN_UNCACHED_PALETTE); the
-/// client emits a 0x04 DECODE_ERROR; the server's `handle_decode_error`
-/// calls `force_rebundle`, clearing the `delivered` bit so the next
-/// dirty pass re-bundles the palette.
+/// W3 / A5 / B6 — Verify the ERR_THIN_UNCACHED_PALETTE round-trip:
+/// the server emits thin against a palette the client doesn't have
+/// (after the shadow is cleared by a page reload), the client reports
+/// DECODE_ERROR code 3, and the server logs + calls `force_rebundle`.
 ///
-/// **Deferred to M3.2c**: this round-trip requires PalRle tiles to be
-/// emitted in the first place, which the current Xorg-on-VKMS +
-/// modesetting-FB capture path does not do for `--text-grid`. The
-/// server-side logic IS covered by unit tests
-/// (`decode_error_3_triggers_force_rebundle`,
-/// `decode_error_other_codes_no_op_on_palette_table`); the client-side
-/// wire encoding is covered by `tests/decode_error_batcher.test.ts`.
-/// What's missing is the full integration. Re-enable once M3.2c repairs
-/// the capture path. See `project_m32c_deferred` memory note.
-// Re-investigated 2026-05-17/18 via natural-pipeline approach (session-reset
-// hook + page.reload). Diagnosis confirmed the test cannot fire
-// ERR_THIN_UNCACHED via the natural pipeline under current architecture for
-// two independent reasons:
-//
-//   (1) palette_table.on_session_reset is dead code in production: the
-//       new-session gate at io_bridge.rs:1446 (!was_connected &&
-//       wt.is_connected()) never fires because Stream(Opened)'s eager-read
-//       completes the CONNECT handshake before Stream(Readable) runs, so
-//       was_connected is already true when the readable arrives.
-//
-//   (2) Even with delivered preserved, a 2-color flip thrashes palette
-//       slot 0 every cycle: find_matching fails, find_eligible_free_slot
-//       returns slot 0 (oldest LRU), write_bytes overwrites and clears
-//       delivered. The server emits BUNDLED then THIN within the same
-//       flip cycle, so the client never sees thin against an empty shadow.
-//
-// Full diagnosis at /home/cedric/.claude/projects/-home-cedric-work-ghostframe/
-// memory/project_decode_error_thin_diagnosis.md.  Closing this test cleanly
-// requires fixing (1) and (2), both of which are out of M3.2c scope.
-#[ignore = "M3.2c carry-over: natural pipeline blocked by latent on_session_reset dead-code + LRU thrashing on 2-palette workloads — see project_decode_error_thin_diagnosis.md"]
+/// Closed 2026-05-18 by fixing two latent prod bugs identified in the
+/// diagnosis (`project_decode_error_thin_diagnosis.md`):
+///   - Bug A: `IoBridge::maybe_fire_session_reset` now uses
+///     `session_resets_fired` + `has_seen_prior_session` to fire reset
+///     once per reconnect (not on first connect).
+///   - Bug B: `acquire_or_allocate` ladder reordered so `find_empty_slot`
+///     runs before `find_eligible_free_slot`, eliminating the 2-palette
+///     slot-0 thrashing that previously cleared `delivered` every frame.
+///
+/// `GHOSTFRAME_SKIP_PALETTE_SESSION_RESET=1` instructs the reset body to
+/// preserve `palette_table.delivered`. Combined with `page.reload()` (which
+/// clears the client's palette shadow), this drives the natural pipeline
+/// end-to-end: server emits thin → client sees thin against empty shadow →
+/// ERR_THIN_UNCACHED_PALETTE → DECODE_ERROR feedback → server logs +
+/// force_rebundle.
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_decode_error_thin_uncached() -> Result<()> {
-    let _setup = setup_e2e_webgpu_gpu_with_env(
-        "--text-grid --drm-direct",
-        &[
-            ("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "1.0"),
-            ("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE", "palrle_bundled"),
-            ("GHOSTFRAME_OUTBOUND_LOSS_SEED", "42"),
-        ],
+    let setup = setup_e2e_webgpu_gpu_with_env(
+        "--solid-per-tile --drm-direct",
+        &[("GHOSTFRAME_SKIP_PALETTE_SESSION_RESET", "1")],
     )
     .await?;
-
+    // Phase 1: let session 1 deliver and ACK both 2-color-flip palettes.
     tokio::time::sleep(Duration::from_secs(5)).await;
 
-    let out = std::process::Command::new("docker")
-        .args(["logs", "ghostframe-server"])
-        .output()
-        .expect("running docker logs");
-    let raw_logs = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    let logs: String = raw_logs.chars().fold((String::new(), false), |(mut acc, in_esc), c| {
-        if in_esc {
-            (acc, c != 'm')
-        } else if c == '\x1b' {
-            (acc, true)
-        } else {
-            acc.push(c);
-            (acc, false)
-        }
-    }).0;
+    // Phase 2: trigger a session reconnect. Browser drops the
+    // WebTransport session; renderer.onSessionReset clears the client
+    // palette shadow + zeroes the GPU atlas. Server's new-session
+    // handler runs maybe_fire_session_reset → has_seen_prior_session is
+    // now true → fire_session_reset runs → because the env-var hook is
+    // active, palette_table.delivered is PRESERVED.
+    setup.page.reload().await?;
 
-    let force_rebundle_count = logs.matches("force_rebundle").count();
+    // Phase 3: post-reload, the next motion-region dirty pass causes
+    // server to look up the (re-found via find_matching) palette slot,
+    // delivered=true → thin emission → client decodes against empty
+    // shadow → ERR_THIN_UNCACHED_PALETTE → DECODE_ERROR → server logs
+    // + force_rebundle.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+
+    let logs = helpers::read_server_logs_stripped("ghostframe-server");
     assert!(
-        force_rebundle_count > 0,
-        "expected >=1 'force_rebundle' lines in server logs; got 0. logs:\n{logs}"
+        logs.contains("client decode error"),
+        "expected 'client decode error' tracing line in server logs; got:\n{logs}"
+    );
+    assert!(
+        logs.contains("error_code=3"),
+        "expected 'error_code=3' (ERR_THIN_UNCACHED_PALETTE); got:\n{logs}"
+    );
+    assert!(
+        logs.contains("force_rebundle"),
+        "expected 'force_rebundle' INFO line in server logs; got:\n{logs}"
     );
     Ok(())
 }
