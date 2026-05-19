@@ -474,6 +474,28 @@ struct NV12Buffer {
     uv_offset: u32,
 }
 
+/// The four NV12 destination-buffer fields needed by the per-frame compute
+/// passes. Trivially `Copy` so the value can be threaded by value into helper
+/// functions without holding a borrow on the parent `NV12Buffer`.
+#[derive(Clone, Copy)]
+struct Nv12OutputLayout {
+    buffer: vk::Buffer,
+    y_stride: u32,
+    uv_offset: u32,
+    uv_stride: u32,
+}
+
+impl Nv12OutputLayout {
+    fn from_buffer(b: &NV12Buffer) -> Self {
+        Self {
+            buffer: b.buffer,
+            y_stride: b.y_stride,
+            uv_offset: b.uv_offset,
+            uv_stride: b.uv_stride,
+        }
+    }
+}
+
 struct PrevFrame {
     image: vk::Image,
     memory: vk::DeviceMemory,
@@ -1463,8 +1485,13 @@ impl GpuFrameProcessor {
         rows: u32,
     ) -> Result<FrameAnalysis, Box<dyn std::error::Error>> {
         let nv12 = self.nv12_buffer.as_ref().unwrap();
-        let (nv12_buffer, nv12_y_stride, nv12_uv_stride, nv12_uv_offset) =
-            (nv12.buffer, nv12.y_stride, nv12.uv_stride, nv12.uv_offset);
+        let nv12_layout = Nv12OutputLayout::from_buffer(nv12);
+        let Nv12OutputLayout {
+            buffer: nv12_buffer,
+            y_stride: nv12_y_stride,
+            uv_offset: nv12_uv_offset,
+            uv_stride: nv12_uv_stride,
+        } = nv12_layout;
         let nv12_ptr = nv12.ptr;
 
         // --- First frame: no SAD (no prev to compare), mark all dirty, run
@@ -1501,10 +1528,7 @@ impl GpuFrameProcessor {
                 height,
                 cols,
                 rows,
-                nv12_buffer,
-                nv12_y_stride,
-                nv12_uv_offset,
-                nv12_uv_stride,
+                nv12_layout,
             )?;
 
             let mut snap = snapshot;
@@ -2789,7 +2813,6 @@ impl GpuFrameProcessor {
     /// `snapshot` is always freshly allocated by the caller
     /// (`allocate_owned_image`), so its starting layout is
     /// `vk::ImageLayout::UNDEFINED` — we hardcode that transition.
-    #[allow(clippy::too_many_arguments)]
     unsafe fn run_first_frame_passes(
         &self,
         current: &PrevFrame,
@@ -2798,11 +2821,14 @@ impl GpuFrameProcessor {
         height: u32,
         cols: u32,
         rows: u32,
-        nv12_buffer: vk::Buffer,
-        nv12_y_stride: u32,
-        nv12_uv_offset: u32,
-        nv12_uv_stride: u32,
+        nv12: Nv12OutputLayout,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let Nv12OutputLayout {
+            buffer: nv12_buffer,
+            y_stride: nv12_y_stride,
+            uv_offset: nv12_uv_offset,
+            uv_stride: nv12_uv_stride,
+        } = nv12;
         // Allocate NV12 descriptor set, RAII-guarded so any subsequent `?`
         // early-exit returns the set to the bounded pool.
         let nv12_set_layouts = [self.nv12_descriptor_set_layout];
