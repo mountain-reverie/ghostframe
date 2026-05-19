@@ -20,6 +20,27 @@ use std::io;
 use super::pipeline_builder::{self, BindingSpec};
 
 // ---------------------------------------------------------------------------
+// Pipeline-wide constants
+// ---------------------------------------------------------------------------
+//
+// These values are coupled to the SPIR-V/WGSL shaders under `shaders/`. Any
+// change here requires the matching shader update and a re-build of the
+// `.spv` artefacts.
+
+/// Slots in the per-frame palette set (and the same-sized `folded_into`
+/// array). The shaders address palettes by `slot ∈ [0, PALETTE_HASH_SLOTS)`.
+const PALETTE_HASH_SLOTS: usize = 256;
+
+/// Bytes per tile in the nibble-packed index buffer:
+/// 32×32 pixels × 4 bits/pixel = 512 bytes per tile.
+const PER_TILE_INDEX_BYTES: vk::DeviceSize = 512;
+
+/// Byte size of a buffer that holds one `u32` per palette slot.
+/// Used for `hash_table_buffer` (open-addressed slot pointers) and
+/// `folded_into_buffer` (resolved fold-into IDs).
+const PALETTE_SLOT_U32_BYTES: vk::DeviceSize = (PALETTE_HASH_SLOTS as vk::DeviceSize) * 4;
+
+// ---------------------------------------------------------------------------
 // RAII guards for per-frame transient Vulkan resources
 // ---------------------------------------------------------------------------
 //
@@ -222,11 +243,12 @@ impl FrameAnalysis {
         if self.frame_palette_set.is_null() {
             return &[];
         }
-        // SAFETY: same lifetime contract as tile_analysis_slice. The 256
-        // entries are the entire allocated hash-table buffer, owned by
-        // GpuFrameProcessor and stable until the next process_frame call.
+        // SAFETY: same lifetime contract as tile_analysis_slice. The
+        // PALETTE_HASH_SLOTS entries are the entire allocated hash-table
+        // buffer, owned by GpuFrameProcessor and stable until the next
+        // process_frame call.
         unsafe {
-            std::slice::from_raw_parts(self.frame_palette_set, 256)
+            std::slice::from_raw_parts(self.frame_palette_set, PALETTE_HASH_SLOTS)
         }
     }
 
@@ -247,7 +269,7 @@ impl FrameAnalysis {
         }
     }
 
-    /// Returns the full 256-entry folded_into array. Each entry is
+    /// Returns the full `PALETTE_HASH_SLOTS`-entry folded_into array. Each entry is
     /// `((255 - count_B) << 8) | id_B` for a slot that found a strict
     /// superset, or `(255 << 8) | self_id` (default-self) otherwise.
     /// Callers extract the resolved palette id via `entry & 0xFF`.
@@ -256,10 +278,10 @@ impl FrameAnalysis {
             return &[];
         }
         // SAFETY: same lifetime as other GPU-pointer slice helpers.
-        unsafe { std::slice::from_raw_parts(self.folded_into, 256) }
+        unsafe { std::slice::from_raw_parts(self.folded_into, PALETTE_HASH_SLOTS) }
     }
 
-    /// Returns the 512 nibble-packed index bytes for compact slot `c`.
+    /// Returns the `PER_TILE_INDEX_BYTES` (512) nibble-packed index bytes for compact slot `c`.
     /// Only c values in `0..palrle_compact_count` have meaningful data;
     /// other slots may contain stale bytes from prior frames.
     ///
@@ -276,7 +298,8 @@ impl FrameAnalysis {
         // SAFETY: same lifetime contract as other slice helpers; c is
         // bounded by palrle_compact_count which is bounded by max_tiles
         // by GPU shader contract.
-        unsafe { std::slice::from_raw_parts(self.index_buffer.add(c * 512), 512) }
+        let stride = PER_TILE_INDEX_BYTES as usize;
+        unsafe { std::slice::from_raw_parts(self.index_buffer.add(c * stride), stride) }
     }
 }
 
@@ -958,7 +981,8 @@ impl GpuFrameProcessor {
         // HOST_VISIBLE | HOST_COHERENT, STORAGE_BUFFER | TRANSFER_DST.
         // TRANSFER_DST allows Task 12b to zero-fill between frames via
         // cmd_fill_buffer so Stage 2b can safely check count == 0 per slot.
-        let frame_palette_set_size = (256 * std::mem::size_of::<FramePaletteEntryRaw>()) as vk::DeviceSize;
+        let frame_palette_set_size =
+            (PALETTE_HASH_SLOTS * std::mem::size_of::<FramePaletteEntryRaw>()) as vk::DeviceSize;
         let frame_palette_set_buf_ci = vk::BufferCreateInfo::default()
             .size(frame_palette_set_size)
             .usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
@@ -1171,7 +1195,8 @@ impl GpuFrameProcessor {
         // --- index_buffer (Stage 3 output) ---
         // max_tiles * 512 bytes: each tile has 128 u32 entries of packed 4-bit indices.
         // HOST_VISIBLE | HOST_COHERENT, STORAGE_BUFFER, persistently mapped.
-        let index_buffer_size = ((max_tiles as vk::DeviceSize) * 512).max(512);
+        let index_buffer_size =
+            ((max_tiles as vk::DeviceSize) * PER_TILE_INDEX_BYTES).max(PER_TILE_INDEX_BYTES);
         let index_buf_ci = vk::BufferCreateInfo::default()
             .size(index_buffer_size)
             .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
@@ -2246,7 +2271,7 @@ impl GpuFrameProcessor {
         self.device
             .cmd_fill_buffer(cmd, self.frame_palette_count_buffer, 0, 4, 0);
         self.device
-            .cmd_fill_buffer(cmd, self.hash_table_buffer, 0, 1024, 0);
+            .cmd_fill_buffer(cmd, self.hash_table_buffer, 0, PALETTE_SLOT_U32_BYTES, 0);
         self.device
             .cmd_fill_buffer(cmd, self.per_tile_frame_palette_id_buffer, 0, pal_id_bytes, 0);
 
@@ -2276,7 +2301,7 @@ impl GpuFrameProcessor {
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .buffer(self.hash_table_buffer)
                 .offset(0)
-                .size(1024),
+                .size(PALETTE_SLOT_U32_BYTES),
             vk::BufferMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
@@ -2386,7 +2411,7 @@ impl GpuFrameProcessor {
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .buffer(self.folded_into_buffer)
             .offset(0)
-            .size(1024);
+            .size(PALETTE_SLOT_U32_BYTES);
         self.device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -2413,7 +2438,7 @@ impl GpuFrameProcessor {
             &[palette_subset_fold_descriptor_set],
             &[],
         );
-        self.device.cmd_dispatch(cmd, 256, 1, 1);
+        self.device.cmd_dispatch(cmd, PALETTE_HASH_SLOTS as u32, 1, 1);
 
         // Barrier for Stage 3 consumers and HOST readback.
         let stage_2b_output_barrier = vk::BufferMemoryBarrier::default()
@@ -2423,7 +2448,7 @@ impl GpuFrameProcessor {
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .buffer(self.folded_into_buffer)
             .offset(0)
-            .size(1024);
+            .size(PALETTE_SLOT_U32_BYTES);
         self.device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -2646,7 +2671,7 @@ impl GpuFrameProcessor {
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .buffer(self.folded_into_buffer)
                 .offset(0)
-                .size(1024),
+                .size(PALETTE_SLOT_U32_BYTES),
             // Stage 3 output
             vk::BufferMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE)
@@ -3396,7 +3421,7 @@ impl GpuFrameProcessor {
         self.device
             .cmd_fill_buffer(cmd, self.frame_palette_count_buffer, 0, 4, 0);
         self.device
-            .cmd_fill_buffer(cmd, self.hash_table_buffer, 0, 1024, 0);
+            .cmd_fill_buffer(cmd, self.hash_table_buffer, 0, PALETTE_SLOT_U32_BYTES, 0);
         self.device
             .cmd_fill_buffer(cmd, self.per_tile_frame_palette_id_buffer, 0, pal_id_bytes, 0);
 
@@ -3425,7 +3450,7 @@ impl GpuFrameProcessor {
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .buffer(self.hash_table_buffer)
                 .offset(0)
-                .size(1024),
+                .size(PALETTE_SLOT_U32_BYTES),
             vk::BufferMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
@@ -3533,7 +3558,7 @@ impl GpuFrameProcessor {
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .buffer(self.folded_into_buffer)
             .offset(0)
-            .size(1024);
+            .size(PALETTE_SLOT_U32_BYTES);
         self.device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -3560,7 +3585,7 @@ impl GpuFrameProcessor {
             &[palette_subset_fold_descriptor_set],
             &[],
         );
-        self.device.cmd_dispatch(cmd, 256, 1, 1);
+        self.device.cmd_dispatch(cmd, PALETTE_HASH_SLOTS as u32, 1, 1);
 
         // Barrier for Stage 3 consumers and HOST readback.
         let stage_2b_output_barrier = vk::BufferMemoryBarrier::default()
@@ -3570,7 +3595,7 @@ impl GpuFrameProcessor {
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .buffer(self.folded_into_buffer)
             .offset(0)
-            .size(1024);
+            .size(PALETTE_SLOT_U32_BYTES);
         self.device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -3776,7 +3801,7 @@ impl GpuFrameProcessor {
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .buffer(self.folded_into_buffer)
                 .offset(0)
-                .size(1024),
+                .size(PALETTE_SLOT_U32_BYTES),
             // Stage 3 output
             vk::BufferMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE)
