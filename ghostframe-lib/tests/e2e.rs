@@ -2155,11 +2155,28 @@ async fn e2e_decode_error_thin_uncached() -> Result<()> {
     // active, palette_table.delivered is PRESERVED.
     setup.page.reload().await?;
 
-    // Phase 3: post-reload, the next motion-region dirty pass causes
-    // server to look up the (re-found via find_matching) palette slot,
-    // delivered=true → thin emission → client decodes against empty
-    // shadow → ERR_THIN_UNCACHED_PALETTE → DECODE_ERROR → server logs
-    // + force_rebundle.
+    // Wait for session 2 to actually establish before timing-budgeting
+    // the natural-flow phase 3. We watch for the SECOND "HELLO received"
+    // log line on the server — session 1 logged the first one in phase 1.
+    // 10s ceiling covers QUIC slow-start under load; in practice ~1s.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let logs = helpers::read_server_logs_stripped("ghostframe-server");
+        if logs.matches("HELLO received").count() >= 2 {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!(
+                "session 2 HELLO did not arrive within 10s of page.reload(); \
+                 reconnect path may be broken. logs:\n{logs}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Phase 3: post-reload, server emits thin → client errors against
+    // empty shadow → DECODE_ERROR → server logs + force_rebundle. 6s
+    // covers handle_decode_error round-trip from the second HELLO.
     tokio::time::sleep(Duration::from_secs(6)).await;
 
     let logs = helpers::read_server_logs_stripped("ghostframe-server");
