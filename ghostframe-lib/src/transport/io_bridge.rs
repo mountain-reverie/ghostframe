@@ -41,8 +41,8 @@ use crate::transport::ghostbridge::{
 };
 use crate::transport::protocol::{
     build_frame_parity_datagram, fragment_frame, fragment_tile, max_fragment_payload,
-    max_frame_fragment_payload, Codec, FrameHeader, NackMessage, FRAME_HEADER_SIZE, PING_PAYLOAD,
-    PONG_PAYLOAD, TILE_DATAGRAM_FLAG,
+    max_frame_fragment_payload, Codec, FrameHeader, NackMessage, TileFragmentInputs,
+    FRAME_HEADER_SIZE, PING_PAYLOAD, PONG_PAYLOAD, TILE_DATAGRAM_FLAG,
 };
 use crate::transport::quic::QuicServer;
 use crate::transport::webtransport::WebTransportServer;
@@ -595,14 +595,16 @@ impl IoBridge {
         let drained = self.scheduler.tick(usize::MAX);
         for work in drained {
             let datagrams = fragment_tile(
-                seq | TILE_DATAGRAM_FLAG,
-                work.tile_x,
-                work.tile_y,
-                work.codec,
-                work.generation,
-                work.pass_idx,
+                &TileFragmentInputs {
+                    frame_seq: seq | TILE_DATAGRAM_FLAG,
+                    tile_x: work.tile_x,
+                    tile_y: work.tile_y,
+                    codec: work.codec,
+                    generation: work.generation,
+                    pass: work.pass_idx,
+                    timestamp_us,
+                },
                 &work.payload,
-                timestamp_us,
                 max_frag,
             );
             for dg in &datagrams {

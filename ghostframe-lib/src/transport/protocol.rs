@@ -170,20 +170,29 @@ impl TileHeader {
 // fragment_tile
 // ---------------------------------------------------------------------------
 
+/// Identifying inputs that get stamped into every fragment of one tile.
+///
+/// Bundles the per-tile fields that fill in the [`DatagramHeader`] (minus
+/// `frag_idx` / `frag_total`, which are computed during fragmentation) and
+/// the [`TileHeader`] (minus `payload_len`, also computed).
+#[derive(Clone, Copy, Debug)]
+pub struct TileFragmentInputs {
+    pub frame_seq: u32,
+    pub tile_x: u8,
+    pub tile_y: u8,
+    pub codec: Codec,
+    pub generation: u8,
+    pub pass: u8,
+    pub timestamp_us: u32,
+}
+
 /// Fragments a tile payload into MTU-sized datagrams.
 ///
 /// Each datagram = [DatagramHeader (12 B)][TileHeader (8 B)][payload_fragment].
 /// Empty payload (e.g. Skip codec) → single datagram with no payload bytes.
-#[allow(clippy::too_many_arguments)]
 pub fn fragment_tile(
-    frame_seq: u32,
-    tile_x: u8,
-    tile_y: u8,
-    codec: Codec,
-    generation: u8,
-    pass: u8,
+    inputs: &TileFragmentInputs,
     payload: &[u8],
-    timestamp_us: u32,
     max_fragment_payload: usize,
 ) -> Vec<Vec<u8>> {
     assert!(
@@ -205,18 +214,18 @@ pub fn fragment_tile(
         .enumerate()
         .map(|(idx, chunk)| {
             let dh = DatagramHeader {
-                frame_seq,
+                frame_seq: inputs.frame_seq,
                 frag_idx: idx as u16,
                 frag_total,
-                timestamp_us,
+                timestamp_us: inputs.timestamp_us,
             };
             let th = TileHeader {
-                tile_x,
-                tile_y,
-                codec,
+                tile_x: inputs.tile_x,
+                tile_y: inputs.tile_y,
+                codec: inputs.codec,
                 lz4: false,
-                generation,
-                pass,
+                generation: inputs.generation,
+                pass: inputs.pass,
                 payload_len: payload.len() as u32,
             };
             let mut buf = Vec::with_capacity(DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE + chunk.len());
@@ -329,17 +338,16 @@ pub fn build_frame_dimensions_datagram(
     payload.extend_from_slice(&width.to_be_bytes());
     payload.extend_from_slice(&height.to_be_bytes());
 
-    let datagrams = fragment_tile(
-        frame_seq | TILE_DATAGRAM_FLAG,
-        FRAME_DIMENSIONS_SENTINEL_X,
-        FRAME_DIMENSIONS_SENTINEL_Y,
-        Codec::Skip,
-        /* generation */ 0,
-        /* pass */ 0,
-        &payload,
+    let inputs = TileFragmentInputs {
+        frame_seq: frame_seq | TILE_DATAGRAM_FLAG,
+        tile_x: FRAME_DIMENSIONS_SENTINEL_X,
+        tile_y: FRAME_DIMENSIONS_SENTINEL_Y,
+        codec: Codec::Skip,
+        generation: 0,
+        pass: 0,
         timestamp_us,
-        /* max_fragment_payload */ 8,
-    );
+    };
+    let datagrams = fragment_tile(&inputs, &payload, /* max_fragment_payload */ 8);
     debug_assert_eq!(datagrams.len(), 1, "frame dimensions must fit one datagram");
     datagrams.into_iter().next().unwrap()
 }
@@ -691,7 +699,19 @@ mod tests {
     #[test]
     fn encode_tile_datagram_single_fragment() {
         let payload = vec![0xABu8; 100];
-        let datagrams = fragment_tile(1, 2, 3, Codec::Raw, 0, 0, &payload, 5000, 1200);
+        let datagrams = fragment_tile(
+            &TileFragmentInputs {
+                frame_seq: 1,
+                tile_x: 2,
+                tile_y: 3,
+                codec: Codec::Raw,
+                generation: 0,
+                pass: 0,
+                timestamp_us: 5000,
+            },
+            &payload,
+            1200,
+        );
         assert_eq!(datagrams.len(), 1);
 
         let dg = &datagrams[0];
@@ -714,7 +734,19 @@ mod tests {
     fn fragment_tile_multiple_fragments() {
         let payload: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
         let max_frag = 1200;
-        let datagrams = fragment_tile(7, 0, 0, Codec::H264, 0, 0, &payload, 999, max_frag);
+        let datagrams = fragment_tile(
+            &TileFragmentInputs {
+                frame_seq: 7,
+                tile_x: 0,
+                tile_y: 0,
+                codec: Codec::H264,
+                generation: 0,
+                pass: 0,
+                timestamp_us: 999,
+            },
+            &payload,
+            max_frag,
+        );
 
         // ceil(4096 / 1200) = 4
         assert_eq!(datagrams.len(), 4);
@@ -739,7 +771,19 @@ mod tests {
 
     #[test]
     fn fragment_tile_empty_payload_skip_codec() {
-        let datagrams = fragment_tile(0, 0, 0, Codec::Skip, 0, 0, &[], 0, 1200);
+        let datagrams = fragment_tile(
+            &TileFragmentInputs {
+                frame_seq: 0,
+                tile_x: 0,
+                tile_y: 0,
+                codec: Codec::Skip,
+                generation: 0,
+                pass: 0,
+                timestamp_us: 0,
+            },
+            &[],
+            1200,
+        );
         assert_eq!(datagrams.len(), 1);
 
         let (dh, th, frag_payload) = decode_tile_datagram(&datagrams[0]).unwrap();
@@ -779,7 +823,19 @@ mod tests {
         let k = 4;
 
         // Generate source datagrams
-        let source_dgs = fragment_tile(7, 2, 3, Codec::H264, 0, 0, &payload, 999, max_frag);
+        let source_dgs = fragment_tile(
+            &TileFragmentInputs {
+                frame_seq: 7,
+                tile_x: 2,
+                tile_y: 3,
+                codec: Codec::H264,
+                generation: 0,
+                pass: 0,
+                timestamp_us: 999,
+            },
+            &payload,
+            max_frag,
+        );
         let frag_total = source_dgs.len();
         assert_eq!(frag_total, 4); // ceil(4096/1200) = 4
 
