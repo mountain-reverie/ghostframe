@@ -69,12 +69,15 @@ fn main(
   let bgra = unpack4x8unorm(bgra_packed);
   let rgba = bgra.zyxw; // BGRA -> RGBA swizzle
 
+  let fb_dims = textureDimensions(framebuffer);
+  let dst_x = work.tile_x * 32u + pixel_x_in_tile;
+  let dst_y = work.tile_y * 32u + pixel_y_in_tile;
+  if (dst_x >= fb_dims.x || dst_y >= fb_dims.y) {
+    return;
+  }
   textureStore(
     framebuffer,
-    vec2<i32>(
-      i32(work.tile_x * 32u + pixel_x_in_tile),
-      i32(work.tile_y * 32u + pixel_y_in_tile),
-    ),
+    vec2<i32>(i32(dst_x), i32(dst_y)),
     rgba,
   );
 }
