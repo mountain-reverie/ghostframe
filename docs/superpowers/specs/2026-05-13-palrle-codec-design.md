@@ -567,9 +567,11 @@ Reasoning: a slot's bytes can be safely overwritten when no in-flight tile could
 See `acquire_or_allocate` in Phase A above. The 4-way ladder:
 
 1. `find_matching` — full byte-equal scan over (Held ∪ FreeButCached). Returns existing slot id; `acquire` increments ref_count.
-2. `find_eligible_free_slot` — `free_lru` oldest entry that passes `overwrite_eligible`. On hit: overwrite bytes, clear delivered, zero `in_flight_carrying`, acquire.
-3. `find_empty_slot` — first `Empty`. On hit: write bytes, acquire.
+2. `find_empty_slot` — first `Empty`. On hit: write bytes, acquire.
+3. `find_eligible_free_slot` — `free_lru` oldest entry that passes `overwrite_eligible`. On hit: overwrite bytes, clear delivered, zero `in_flight_carrying`, acquire.
 4. fail (return None) — caller falls back to `Codec::Raw` for the tile.
+
+**Rationale for the path-2/path-3 order**: prefer truly-fresh empty slots to extend cache lifetime; only evict a FreeButCached entry when the cache is genuinely full. An earlier version of this design (pre-2026-05-18) had paths 2 and 3 swapped, which thrashed slot 0 on small palette working sets — a 2-color flip would call `find_eligible_free_slot` and get the same oldest slot every cycle, then `write_bytes` would clear `delivered`. The existing FreeButCached entry for the OTHER colour was never used. With the current order, an N=2 working set occupies slots 0 and 1 and `find_matching` hits both stably; eviction only kicks in once all 256 slots are non-Empty.
 
 ### Connection lifecycle
 
