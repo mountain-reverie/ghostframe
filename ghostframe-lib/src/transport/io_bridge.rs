@@ -101,6 +101,14 @@ pub struct IoBridge {
     /// for a handle; cleared on `Event::ConnectionLost` so a rare
     /// reconnect-with-same-handle re-fires the reset.
     session_resets_fired: HashSet<ConnectionHandle>,
+    /// Tracks whether ANY client has previously established a session.
+    /// Initial value `false`. Flips to `true` permanently after the first
+    /// `maybe_fire_session_reset` for a connected handle. Used to skip the
+    /// reset body on the FIRST connect (where dirty_tracker / classifier /
+    /// scheduler / etc. are in their initial-startup state and the test
+    /// suite implicitly depends on that state surviving session
+    /// establishment). Reconnects fire the reset body normally.
+    has_seen_prior_session: bool,
     /// Inbound channel of captured frames to be fragmented and sent as datagrams.
     frame_rx: Option<mpsc::Receiver<FrameSubmission>>,
     /// Monotonically increasing frame sequence number (wrapping).
@@ -371,6 +379,7 @@ impl IoBridge {
             local_addr,
             wt_sessions: HashMap::new(),
             session_resets_fired: HashSet::new(),
+            has_seen_prior_session: false,
             frame_rx: None,
             frame_seq: 0,
             dirty_tracker: DirtyTracker::new(0, 0),
@@ -731,16 +740,23 @@ impl IoBridge {
         }
     }
 
-    /// Gate for `fire_session_reset`: fires exactly once per new connection
-    /// handle when its `WebTransportServer` reports `is_connected() == true`.
-    /// Both `Stream(Opened)` and `Stream(Readable)` event handlers will call
-    /// this (Task 4); the `HashSet::insert` return value (true on first
-    /// insertion, false on duplicate) ensures the reset fires exactly once.
+    /// Gate for `fire_session_reset`: fires the reset body exactly once per
+    /// connection handle when its `WebTransportServer` reports
+    /// `is_connected() == true`, AND when at least one prior session has
+    /// existed (i.e., this is a reconnect, not the first ever connect).
+    /// The first-connect case is intentionally skipped because the reset
+    /// body has RECONNECT-specific side effects (frame_mode → H264,
+    /// scheduler clear, force_dirty_frames=20, request_keyframe) that are
+    /// no-ops on a fresh server but break test setups that capture frames
+    /// before the client connects.
     fn maybe_fire_session_reset(&mut self, handle: ConnectionHandle) {
         let Some(wt) = self.wt_sessions.get(&handle) else { return; };
-        if wt.is_connected() && self.session_resets_fired.insert(handle) {
+        if !wt.is_connected() { return; }
+        if !self.session_resets_fired.insert(handle) { return; }
+        if self.has_seen_prior_session {
             self.fire_session_reset(handle);
         }
+        self.has_seen_prior_session = true;
     }
 
     /// Reset per-session state on a new WebTransport session. Called by
@@ -1509,6 +1525,7 @@ impl IoBridge {
                     ) {
                         wt.on_stream_opened(conn, dir);
                     }
+                    self.maybe_fire_session_reset(handle);
                 }
 
                 Event::Stream(StreamEvent::Readable { id }) => {
@@ -1516,12 +1533,9 @@ impl IoBridge {
                         self.wt_sessions.get_mut(&handle),
                         self.server.connections.get_mut(&handle),
                     ) {
-                        let was_connected = wt.is_connected();
                         wt.on_stream_readable(conn, id);
-                        if !was_connected && wt.is_connected() {
-                            self.fire_session_reset(handle);
-                        }
                     }
+                    self.maybe_fire_session_reset(handle);
                 }
 
                 Event::DatagramReceived => {
@@ -1552,6 +1566,7 @@ impl IoBridge {
                 Event::ConnectionLost { reason } => {
                     tracing::info!(?handle, %reason, "connection lost");
                     self.wt_sessions.remove(&handle);
+                    self.session_resets_fired.remove(&handle);
                 }
 
                 _ => {
@@ -1747,6 +1762,7 @@ impl IoBridge {
             local_addr: "0.0.0.0:4443".parse().unwrap(),
             wt_sessions: HashMap::new(),
             session_resets_fired: HashSet::new(),
+            has_seen_prior_session: false,
             frame_rx: None,
             frame_seq: 0,
             dirty_tracker: DirtyTracker::new(0, 0),
@@ -1794,6 +1810,7 @@ impl IoBridge {
             local_addr: "0.0.0.0:4443".parse().unwrap(),
             wt_sessions: HashMap::new(),
             session_resets_fired: HashSet::new(),
+            has_seen_prior_session: false,
             frame_rx: Some(frame_rx),
             frame_seq: 0,
             dirty_tracker: DirtyTracker::new(0, 0),
@@ -2316,49 +2333,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn maybe_fire_session_reset_fires_exactly_once_per_handle() {
+    async fn maybe_fire_session_reset_skips_first_connect_fires_on_reconnect() {
         use crate::transport::quic::QuicServer;
         use crate::transport::webtransport::WebTransportServer;
         use quinn_proto::ConnectionHandle;
         use tokio::net::UnixStream as TokioUnixStream;
 
         let (stream, _peer) = TokioUnixStream::pair().expect("UnixStream::pair");
-        let server = QuicServer::new().expect("QuicServer::new failed");
+        let server = QuicServer::new().expect("QuicServer::new");
         let mut bridge = IoBridge::new_with_stream_for_test(stream, server);
 
-        // Seed an observable side-effect: delivered bit on palette 7.
-        // fire_session_reset is expected to clear delivered (the cfg-gated
-        // skip_palette_session_reset hook defaults to false in this test).
         bridge.palette_table.delivered.insert(7);
 
-        let handle = ConnectionHandle(0);
-        bridge.wt_sessions.insert(handle, WebTransportServer::default());
+        let handle_a = ConnectionHandle(0);
+        bridge.wt_sessions.insert(handle_a, WebTransportServer::default());
 
-        // Pre-condition: WT not yet connected → maybe_fire_session_reset must NOT fire.
-        bridge.maybe_fire_session_reset(handle);
+        // Pre-connected → no fire.
+        bridge.maybe_fire_session_reset(handle_a);
         assert!(
             bridge.palette_table.delivered.contains(7),
-            "not-yet-connected: reset must not fire"
+            "not-yet-connected: no fire"
         );
 
-        // Promote: now connected. First call → fires (delivered cleared).
+        // FIRST connect (no prior session): even though is_connected=true, the
+        // reset body is SKIPPED — has_seen_prior_session was false. Tests that
+        // rely on classifier/scheduler/dirty-tracker state surviving first
+        // connect (e.g. e2e_palrle_5pct_loss, e2e_solid_per_tile_pixels) keep
+        // their pre-existing behavior.
         bridge
             .wt_sessions
-            .get_mut(&handle)
-            .expect("wt session present")
+            .get_mut(&handle_a)
+            .expect("wt session")
             .test_set_connected(true);
-        bridge.maybe_fire_session_reset(handle);
-        assert!(
-            !bridge.palette_table.delivered.contains(7),
-            "first call after connected: reset must fire (delivered cleared)"
-        );
-
-        // Re-arm delivered. Second call must NOT re-fire (gated by session_resets_fired).
-        bridge.palette_table.delivered.insert(7);
-        bridge.maybe_fire_session_reset(handle);
+        bridge.maybe_fire_session_reset(handle_a);
         assert!(
             bridge.palette_table.delivered.contains(7),
-            "second call: reset must not re-fire (gated by session_resets_fired)"
+            "first connect: reset body skipped (has_seen_prior_session was false)"
+        );
+        assert!(
+            bridge.has_seen_prior_session,
+            "first connect: has_seen_prior_session must now be true"
+        );
+
+        // Simulate ConnectionLost on handle_a (per real wiring at Event::ConnectionLost).
+        bridge.wt_sessions.remove(&handle_a);
+        bridge.session_resets_fired.remove(&handle_a);
+
+        // RECONNECT (new handle_b): reset body fires now (has_seen_prior_session=true).
+        let handle_b = ConnectionHandle(1);
+        bridge.wt_sessions.insert(handle_b, WebTransportServer::default());
+        bridge
+            .wt_sessions
+            .get_mut(&handle_b)
+            .expect("wt session b")
+            .test_set_connected(true);
+        bridge.maybe_fire_session_reset(handle_b);
+        assert!(
+            !bridge.palette_table.delivered.contains(7),
+            "reconnect: reset body MUST fire (delivered cleared)"
+        );
+
+        // Re-arm delivered. Second call on handle_b: no re-fire (session_resets_fired gate).
+        bridge.palette_table.delivered.insert(7);
+        bridge.maybe_fire_session_reset(handle_b);
+        assert!(
+            bridge.palette_table.delivered.contains(7),
+            "second call on same handle: must not re-fire"
         );
     }
 
