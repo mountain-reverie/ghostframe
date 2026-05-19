@@ -181,6 +181,18 @@ pub struct IoBridge {
     dimensions_retransmits_left: u8,
 }
 
+/// Per-frame inputs passed into `dispatch_dirty_tiles_via_scheduler`.
+///
+/// Borrows the BGRA pixel buffer and bundles the layout (`stride`) plus the
+/// transport-level identity (`seq`, `timestamp_us`) so callers don't have to
+/// spread four parallel arguments at every dispatch site.
+pub(crate) struct TileDispatchFrame<'a> {
+    pub pixels: &'a [u8],
+    pub stride: u32,
+    pub seq: u32,
+    pub timestamp_us: u32,
+}
+
 /// Selects how `dispatch_dirty_tiles_via_scheduler` picks a codec per tile.
 pub(crate) enum SchedulerEmissionPolicy {
     /// CPU path: every tile emits `Codec::Raw` regardless of classifier state.
@@ -504,19 +516,16 @@ impl IoBridge {
     /// Shared scheduler dispatch: grid-sync → RTT update → bump+encode+enqueue
     /// per dirty tile → tick → fragment+send. Called by both `process_frame_cpu`
     /// and `process_frame_gpu`'s `FrameMode::TileCodec` branch.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch_dirty_tiles_via_scheduler(
         &mut self,
         dirty: &[(u32, u32)],
         grid: &crate::tile::TileGrid,
-        pixels: &[u8],
-        stride: u32,
-        seq: u32,
-        timestamp_us: u32,
+        frame: TileDispatchFrame<'_>,
         max_frag: usize,
         policy: SchedulerEmissionPolicy,
         mut palrle_payloads: Option<&mut std::collections::HashMap<(u32, u32), Vec<u8>>>,
     ) {
+        let TileDispatchFrame { pixels, stride, seq, timestamp_us } = frame;
         // Grid sync — keep scheduler in lockstep with the dirty-detection grid.
         if self.scheduler.cols() != grid.cols || self.scheduler.rows() != grid.rows {
             self.scheduler.resize(grid.cols, grid.rows);
@@ -973,10 +982,12 @@ impl IoBridge {
         self.dispatch_dirty_tiles_via_scheduler(
             &dirty_tiles,
             &grid,
-            &frame.pixels,
-            frame.stride,
-            seq,
-            frame.timestamp_us,
+            TileDispatchFrame {
+                pixels: &frame.pixels,
+                stride: frame.stride,
+                seq,
+                timestamp_us: frame.timestamp_us,
+            },
             max_frag,
             SchedulerEmissionPolicy::CpuRawOnly,
             None,
@@ -1331,10 +1342,12 @@ impl IoBridge {
                 self.dispatch_dirty_tiles_via_scheduler(
                     &dirty_xy,
                     &grid,
-                    pixels,
-                    frame.stride,
-                    seq,
-                    frame.timestamp_us,
+                    TileDispatchFrame {
+                        pixels,
+                        stride: frame.stride,
+                        seq,
+                        timestamp_us: frame.timestamp_us,
+                    },
                     max_frag,
                     SchedulerEmissionPolicy::GpuClassifierDriven,
                     Some(&mut palrle_payloads),
@@ -2283,10 +2296,12 @@ mod tests {
         bridge.dispatch_dirty_tiles_via_scheduler(
             &dirty,
             &grid,
-            &pixels,
-            64 * 4,
-            /* seq */ 1,
-            /* timestamp_us */ 0,
+            TileDispatchFrame {
+                pixels: &pixels,
+                stride: 64 * 4,
+                seq: 1,
+                timestamp_us: 0,
+            },
             /* max_frag */ 1200,
             SchedulerEmissionPolicy::CpuRawOnly,
             None,
@@ -2475,10 +2490,12 @@ mod tests {
         bridge.dispatch_dirty_tiles_via_scheduler(
             &dirty,
             &grid,
-            &pixels,
-            64 * 4,
-            1,
-            0,
+            TileDispatchFrame {
+                pixels: &pixels,
+                stride: 64 * 4,
+                seq: 1,
+                timestamp_us: 0,
+            },
             1200,
             SchedulerEmissionPolicy::GpuClassifierDriven,
             None,
