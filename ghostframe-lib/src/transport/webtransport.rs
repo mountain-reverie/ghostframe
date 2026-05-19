@@ -93,6 +93,19 @@ impl WebTransportServer {
         self.connected
     }
 
+    /// Direct internal-state setter for unit tests. Production callers must
+    /// NOT use this — `connected` should derive from the actual handshake
+    /// state machine via `on_stream_readable` / `on_stream_opened`. This
+    /// exists as a minimal seam to unit-test `IoBridge::maybe_fire_session_reset`
+    /// (closure of M3.2c A5/B6 carry-over). If `WebTransportServer`'s internal
+    /// state ever splits into multi-field "connected"-derivation, this setter
+    /// must be updated to set whichever field(s) cause `is_connected()` to
+    /// return `value`.
+    #[cfg(test)]
+    pub(crate) fn test_set_connected(&mut self, value: bool) {
+        self.connected = value;
+    }
+
     /// Return all stream IDs known to this session (for force-read polling).
     pub fn all_known_stream_ids(&self) -> Vec<StreamId> {
         let mut ids: Vec<StreamId> = self.stream_bufs.keys().copied().collect();
