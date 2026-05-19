@@ -496,6 +496,31 @@ impl Nv12OutputLayout {
     }
 }
 
+/// Frame pixel dimensions together with the derived tile-grid dimensions.
+/// `cols` / `rows` are `width.div_ceil(TILE_SIZE)` / `height.div_ceil(TILE_SIZE)`.
+#[derive(Clone, Copy)]
+struct FrameGeometry {
+    width: u32,
+    height: u32,
+    cols: u32,
+    rows: u32,
+}
+
+impl FrameGeometry {
+    fn from_dims(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            cols: width.div_ceil(TILE_SIZE),
+            rows: height.div_ceil(TILE_SIZE),
+        }
+    }
+
+    fn tile_count(&self) -> u32 {
+        self.cols * self.rows
+    }
+}
+
 struct PrevFrame {
     image: vk::Image,
     memory: vk::DeviceMemory,
@@ -1432,13 +1457,12 @@ impl GpuFrameProcessor {
         height: u32,
         stride: u32,
     ) -> Result<FrameAnalysis, Box<dyn std::error::Error>> {
-        let cols = width.div_ceil(TILE_SIZE);
-        let rows = height.div_ceil(TILE_SIZE);
-        let tile_count = cols * rows;
+        let geom = FrameGeometry::from_dims(width, height);
 
-        if tile_count > self.max_tiles {
+        if geom.tile_count() > self.max_tiles {
             return Err(format!(
-                "tile_count {tile_count} exceeds max_tiles {}",
+                "tile_count {} exceeds max_tiles {}",
+                geom.tile_count(),
                 self.max_tiles
             )
             .into());
@@ -1464,8 +1488,7 @@ impl GpuFrameProcessor {
         let current = self.import_dmabuf(fd, width, height, stride)?;
         // Result must always destroy `current` at end. Use a closure-style
         // cleanup by carrying it forward and explicitly destroying.
-        let result =
-            self.process_frame_with_imported(&current, width, height, tile_count, cols, rows);
+        let result = self.process_frame_with_imported(&current, geom);
         // Always clean up the imported DMA-BUF VkImage (transient).
         self.destroy_prev_frame(current);
         result
@@ -1478,12 +1501,10 @@ impl GpuFrameProcessor {
     unsafe fn process_frame_with_imported(
         &mut self,
         current: &PrevFrame,
-        width: u32,
-        height: u32,
-        tile_count: u32,
-        cols: u32,
-        rows: u32,
+        geom: FrameGeometry,
     ) -> Result<FrameAnalysis, Box<dyn std::error::Error>> {
+        let FrameGeometry { width, height, cols, rows } = geom;
+        let tile_count = geom.tile_count();
         let nv12 = self.nv12_buffer.as_ref().unwrap();
         let nv12_layout = Nv12OutputLayout::from_buffer(nv12);
         let Nv12OutputLayout {
@@ -1521,15 +1542,7 @@ impl GpuFrameProcessor {
             // Run NV12 conversion + tile_analysis + snapshot copy in one cmd
             // buffer. The snapshot is what we will compare future frames
             // against.
-            self.run_first_frame_passes(
-                current,
-                &snapshot,
-                width,
-                height,
-                cols,
-                rows,
-                nv12_layout,
-            )?;
+            self.run_first_frame_passes(current, &snapshot, geom, nv12_layout)?;
 
             let mut snap = snapshot;
             snap.layout = vk::ImageLayout::GENERAL;
@@ -2817,12 +2830,10 @@ impl GpuFrameProcessor {
         &self,
         current: &PrevFrame,
         snapshot: &PrevFrame,
-        width: u32,
-        height: u32,
-        cols: u32,
-        rows: u32,
+        geom: FrameGeometry,
         nv12: Nv12OutputLayout,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let FrameGeometry { width, height, cols, rows } = geom;
         let Nv12OutputLayout {
             buffer: nv12_buffer,
             y_stride: nv12_y_stride,
