@@ -13,6 +13,12 @@ import { LossTracker, encodeHello } from './feedback';
 import { DecodeErrorBatcher } from './decode_error_batcher';
 import { AckBatcher } from './ack';
 
+// Cap test-instrumentation recorder arrays to bound memory + CDP
+// serialisation cost in long-running tests. ~4 KiB worth of entries
+// is plenty for any e2e in the current suite; FIFO drop keeps the
+// most recent observations.
+const MAX_RECORDED_ENTRIES = 4096;
+
 const statusEl = document.getElementById('status')!;
 const logEl = document.getElementById('log')!;
 const canvasEl = document.getElementById('canvas') as HTMLCanvasElement;
@@ -324,6 +330,9 @@ async function main() {
           w.__ghostframeRecordedResizes = [];
         }
         w.__ghostframeRecordedResizes.push({ seq, oldW, oldH, newW, newH, trigger });
+        if (w.__ghostframeRecordedResizes.length > MAX_RECORDED_ENTRIES) {
+          w.__ghostframeRecordedResizes.shift();
+        }
       }
     }
 
@@ -395,8 +404,14 @@ async function main() {
         w.__ghostframeRecordedFlags = [];
       }
       w.__ghostframeRecordedCodecs.push(asm.header.codec);
+      if (w.__ghostframeRecordedCodecs.length > MAX_RECORDED_ENTRIES) {
+        w.__ghostframeRecordedCodecs.shift();
+      }
       if (asm.header.codec === Codec.PalRle) {
         w.__ghostframeRecordedFlags.push(payload[0]);
+        if (w.__ghostframeRecordedFlags.length > MAX_RECORDED_ENTRIES) {
+          w.__ghostframeRecordedFlags.shift();
+        }
       }
       w.__ghostframeRecordedTiles.push({
         seq: frameSeqFromKey,
@@ -407,6 +422,9 @@ async function main() {
         fbWidth: renderer.framebuffer.width,
         fbHeight: renderer.framebuffer.height,
       });
+      if (w.__ghostframeRecordedTiles.length > MAX_RECORDED_ENTRIES) {
+        w.__ghostframeRecordedTiles.shift();
+      }
     }
 
     if (asm.header.codec === Codec.Raw) {
