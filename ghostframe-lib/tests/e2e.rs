@@ -244,6 +244,7 @@ async fn setup_e2e_inner(
     gpu: bool,
     webgpu: bool,
 ) -> Result<E2eSetup> {
+    helpers::cleanup_stale_xvfb_sockets();
     let hs_server_url = format!("http://{DOCKER_HOST_IP}:{HEADSCALE_HOST_PORT}");
 
     let headscale: ContainerAsync<GenericImage> =
