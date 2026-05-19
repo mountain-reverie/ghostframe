@@ -731,6 +731,18 @@ impl IoBridge {
         }
     }
 
+    /// Gate for `fire_session_reset`: fires exactly once per new connection
+    /// handle when its `WebTransportServer` reports `is_connected() == true`.
+    /// Both `Stream(Opened)` and `Stream(Readable)` event handlers will call
+    /// this (Task 4); the `HashSet::insert` return value (true on first
+    /// insertion, false on duplicate) ensures the reset fires exactly once.
+    fn maybe_fire_session_reset(&mut self, handle: ConnectionHandle) {
+        let Some(wt) = self.wt_sessions.get(&handle) else { return; };
+        if wt.is_connected() && self.session_resets_fired.insert(handle) {
+            self.fire_session_reset(handle);
+        }
+    }
+
     /// Reset per-session state on a new WebTransport session. Called by
     /// `maybe_fire_session_reset` (Task 3) once per new connection handle.
     /// Preserves cross-session palette bytes (warm cache) and, when the
@@ -2301,6 +2313,53 @@ mod tests {
         if let Some(p) = prev { std::env::set_var("GHOSTFRAME_INJECT_OOB_PALRLE", p); }
         else { std::env::remove_var("GHOSTFRAME_INJECT_OOB_PALRLE"); }
         assert_eq!(inj, Some((5u32, 7u32)));
+    }
+
+    #[tokio::test]
+    async fn maybe_fire_session_reset_fires_exactly_once_per_handle() {
+        use crate::transport::quic::QuicServer;
+        use crate::transport::webtransport::WebTransportServer;
+        use quinn_proto::ConnectionHandle;
+        use tokio::net::UnixStream as TokioUnixStream;
+
+        let (stream, _peer) = TokioUnixStream::pair().expect("UnixStream::pair");
+        let server = QuicServer::new().expect("QuicServer::new failed");
+        let mut bridge = IoBridge::new_with_stream_for_test(stream, server);
+
+        // Seed an observable side-effect: delivered bit on palette 7.
+        // fire_session_reset is expected to clear delivered (the cfg-gated
+        // skip_palette_session_reset hook defaults to false in this test).
+        bridge.palette_table.delivered.insert(7);
+
+        let handle = ConnectionHandle(0);
+        bridge.wt_sessions.insert(handle, WebTransportServer::default());
+
+        // Pre-condition: WT not yet connected → maybe_fire_session_reset must NOT fire.
+        bridge.maybe_fire_session_reset(handle);
+        assert!(
+            bridge.palette_table.delivered.contains(7),
+            "not-yet-connected: reset must not fire"
+        );
+
+        // Promote: now connected. First call → fires (delivered cleared).
+        bridge
+            .wt_sessions
+            .get_mut(&handle)
+            .expect("wt session present")
+            .test_set_connected(true);
+        bridge.maybe_fire_session_reset(handle);
+        assert!(
+            !bridge.palette_table.delivered.contains(7),
+            "first call after connected: reset must fire (delivered cleared)"
+        );
+
+        // Re-arm delivered. Second call must NOT re-fire (gated by session_resets_fired).
+        bridge.palette_table.delivered.insert(7);
+        bridge.maybe_fire_session_reset(handle);
+        assert!(
+            bridge.palette_table.delivered.contains(7),
+            "second call: reset must not re-fire (gated by session_resets_fired)"
+        );
     }
 
     #[cfg(any(test, feature = "test-loss-injection"))]
