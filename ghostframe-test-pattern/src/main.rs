@@ -64,6 +64,13 @@ struct Args {
     #[arg(long)]
     solid_per_tile: bool,
 
+    /// Paint a four-tile PalRle test scene (checkerboard / horizontal
+    /// stripes / vertical stripes / 2×2 blocks) with a known 2-color
+    /// palette. Combine with `--drm-direct` to paint to the DRM
+    /// dumb-buffer scanout. Drives `e2e_palrle_exact_pixels`.
+    #[arg(long)]
+    palrle_exact: bool,
+
     /// (Ignored — kept for CLI compat.) Window width.
     #[arg(long, default_value = "640")]
     width: u16,
@@ -75,6 +82,13 @@ struct Args {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+
+    // DRM-direct palrle-exact mode: paint four 32×32 PalRle test tiles
+    // with known 2-color patterns. Drives `e2e_palrle_exact_pixels`
+    // (M3.2c B1 follow-up).
+    if args.drm_direct && args.palrle_exact {
+        return ghostframe_test_pattern::palrle_exact::run(&args.drm_device);
+    }
 
     // DRM-direct solid-per-tile mode: paint fixed corner tiles + a small
     // central motion region so the classifier sees `unique_colors == 1`
