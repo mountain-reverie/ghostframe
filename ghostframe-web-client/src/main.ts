@@ -383,6 +383,7 @@ async function main() {
           fbWidth: number;
           fbHeight: number;
         }>;
+        __ghostframeRecordedFlags?: number[];
       };
       if (!w.__ghostframeRecordedCodecs) {
         w.__ghostframeRecordedCodecs = [];
@@ -390,7 +391,13 @@ async function main() {
       if (!w.__ghostframeRecordedTiles) {
         w.__ghostframeRecordedTiles = [];
       }
+      if (!w.__ghostframeRecordedFlags) {
+        w.__ghostframeRecordedFlags = [];
+      }
       w.__ghostframeRecordedCodecs.push(asm.header.codec);
+      if (asm.header.codec === Codec.PalRle) {
+        w.__ghostframeRecordedFlags.push(payload[0]);
+      }
       w.__ghostframeRecordedTiles.push({
         seq: frameSeqFromKey,
         tileX: tX,
