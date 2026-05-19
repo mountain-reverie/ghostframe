@@ -8,6 +8,7 @@ pub mod font;
 pub mod mixed;
 pub mod mode_switch;
 pub mod palette_churn;
+pub mod palrle_exact;
 pub mod solid_per_tile;
 pub mod text_grid;
 pub mod text_grid_drm;
