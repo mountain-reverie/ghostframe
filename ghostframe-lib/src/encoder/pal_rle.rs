@@ -226,24 +226,27 @@ impl PaletteTable {
     /// Returns the slot id on success; `None` if every slot is `Held`
     /// or `FreeButCached` with no overwrite-eligible candidate.
     pub fn acquire_or_allocate(&mut self, palette: &PaletteEntry) -> Option<u8> {
-        // 1. find_matching → reuse
+        // 1. find_matching → reuse existing slot
         if let Some(id) = self.find_matching(palette) {
             self.acquire(id);
             return Some(id);
         }
-        // 2. find_eligible_free_slot → overwrite
-        if let Some(id) = self.find_eligible_free_slot() {
-            self.write_bytes(id, palette);
-            self.acquire(id);
-            return Some(id);
-        }
-        // 3. find_empty_slot → write
+        // 2. find_empty_slot → write to truly-fresh slot.
+        //    Preserves existing FreeButCached entries for future
+        //    find_matching hits; avoids LRU thrashing on small palette sets.
         if let Some(id) = self.find_empty_slot() {
             self.write_bytes(id, palette);
             self.acquire(id);
             return Some(id);
         }
-        // 4. fail
+        // 3. find_eligible_free_slot → evict oldest FreeButCached only when
+        //    no truly-empty slot exists.
+        if let Some(id) = self.find_eligible_free_slot() {
+            self.write_bytes(id, palette);
+            self.acquire(id);
+            return Some(id);
+        }
+        // 4. fail (caller falls back to Codec::Raw for the tile)
         None
     }
 }
@@ -661,14 +664,17 @@ mod tests {
         t.delivered.insert(9);
         t.free_lru.push_back(9);
 
-        // Mark all earlier slots as Held so find_empty_slot returns one >= 10
-        // and the 4-way ladder picks step 2 (find_eligible_free_slot).
-        for id in 0..9 {
+        // Mark ALL other slots as Held so find_empty_slot returns None
+        // and the 4-way ladder is forced to step 3 (find_eligible_free_slot).
+        // (Post-fix ladder: find_matching → find_empty_slot → find_eligible_free_slot.
+        //  Step 2 must fail before step 3 fires.)
+        for id in 0..PALETTE_TABLE_SLOTS {
+            if id == 9 {
+                continue;
+            }
             t.slot_state[id] = SlotState::Held;
-            t.entries[id] = Some(make_palette(&[[id as u8, 7, 7, 255]]));
+            t.entries[id] = Some(make_palette(&[[(id as u8).wrapping_mul(3), 7, 7, 255]]));
         }
-        // Slots 10..256 are Empty; find_empty would normally return 10.
-        // But ladder step 2 fires before step 3 — so slot 9 wins.
         let new_pal = make_palette(&[[99, 99, 99, 255]]);
         let id = t.acquire_or_allocate(&new_pal).unwrap();
         assert_eq!(id, 9);
@@ -688,6 +694,59 @@ mod tests {
         assert_eq!(t.entries[0], Some(p));
         assert_eq!(t.slot_state[0], SlotState::Held);
         assert_eq!(t.ref_count[0], 1);
+    }
+
+    #[test]
+    fn acquire_or_allocate_uses_empty_slots_before_evicting_cached() {
+        let mut t = PaletteTable::new();
+        let p_red = {
+            let mut p = PaletteEntry::default();
+            p.count = 1;
+            p.colors[0] = [0, 0, 0xFF, 0xFF];
+            p
+        };
+        let p_blue = {
+            let mut p = PaletteEntry::default();
+            p.count = 1;
+            p.colors[0] = [0xFF, 0, 0, 0xFF];
+            p
+        };
+
+        // Frame 1: red. Lands in empty slot 0.
+        let id_red = t.acquire_or_allocate(&p_red).expect("alloc red");
+        assert_eq!(id_red, 0);
+        t.release(id_red);                  // end-of-frame release
+        t.delivered.insert(id_red);         // simulate ACK arrival
+
+        // Frame 2: blue. MUST land in empty slot 1, NOT overwrite slot 0.
+        // (This is the regression we're testing — pre-fix, find_eligible_free_slot
+        // would return slot 0 as oldest LRU and write_bytes would clear
+        // delivered[0]. Post-fix, find_empty_slot returns slot 1 first.)
+        let id_blue = t.acquire_or_allocate(&p_blue).expect("alloc blue");
+        assert_eq!(
+            id_blue, 1,
+            "blue should land in empty slot 1, not overwrite slot 0"
+        );
+        assert!(
+            t.delivered.contains(id_red),
+            "delivered on slot 0 must survive the slot 1 allocation"
+        );
+        t.release(id_blue);
+        t.delivered.insert(id_blue);
+
+        // Frame 3: red again. find_matching hits slot 0; no write_bytes call.
+        let id_red_2 = t.acquire_or_allocate(&p_red).expect("re-alloc red");
+        assert_eq!(id_red_2, 0);
+        assert!(
+            t.delivered.contains(0),
+            "find_matching path must preserve delivered"
+        );
+        t.release(id_red_2);
+
+        // Frame 4: blue again. find_matching hits slot 1.
+        let id_blue_2 = t.acquire_or_allocate(&p_blue).expect("re-alloc blue");
+        assert_eq!(id_blue_2, 1);
+        assert!(t.delivered.contains(1));
     }
 
     #[test]
