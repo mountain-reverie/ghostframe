@@ -10,7 +10,6 @@
 
 extern crate ffmpeg_next as ffmpeg;
 
-use std::ffi::CString;
 use std::ptr;
 use std::sync::Once;
 
@@ -27,14 +26,13 @@ use tracing::{info, warn};
 
 static FFMPEG_INIT: Once = Once::new();
 
+use super::nal_parser::is_keyframe_nal;
+use super::vaapi_device::{self, BufRef, VAAPI_DEVICE};
 use super::EncodedTile;
 use crate::transport::protocol::Codec as GfCodec;
 
 const TILE_W: u32 = 32;
 const TILE_H: u32 = 32;
-
-/// Default VA-API render device path.
-const VAAPI_DEVICE: &str = "/dev/dri/renderD128";
 
 /// Candidate encoding resolutions to try when the tile size is below the
 /// hardware minimum. Sorted ascending; the first one that succeeds wins.
@@ -43,20 +41,6 @@ const VAAPI_CANDIDATE_SIZES: &[(u32, u32)] = &[
     (128, 128),       // common AMD minimum
     (256, 256),       // fallback
 ];
-
-/// RAII wrapper around `*mut AVBufferRef` so we don't leak hw contexts.
-struct BufRef(*mut ffi::AVBufferRef);
-
-impl Drop for BufRef {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe { ffi::av_buffer_unref(&mut self.0) };
-        }
-    }
-}
-
-// SAFETY: AVBufferRef is refcounted and thread-safe.
-unsafe impl Send for BufRef {}
 
 /// H.264 encoder for 32x32 BGRA tiles.
 ///
@@ -126,78 +110,6 @@ impl H264VaapiEncoder {
     }
 
     // -----------------------------------------------------------------------
-    // VA-API helpers
-    // -----------------------------------------------------------------------
-
-    /// Create a VA-API hardware device context for the given render node.
-    unsafe fn create_hw_device_ctx(
-        device_path: &str,
-    ) -> Result<*mut ffi::AVBufferRef, ffmpeg::Error> {
-        let device_cstr = CString::new(device_path).map_err(|_| ffmpeg::Error::InvalidData)?;
-        let mut hw_device_ctx: *mut ffi::AVBufferRef = ptr::null_mut();
-        let ret = ffi::av_hwdevice_ctx_create(
-            &mut hw_device_ctx,
-            ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
-            device_cstr.as_ptr(),
-            ptr::null_mut(),
-            0,
-        );
-        if ret < 0 {
-            return Err(ffmpeg::Error::from(ret));
-        }
-        Ok(hw_device_ctx)
-    }
-
-    /// Create a VA-API hardware frames context.
-    unsafe fn create_hw_frames_ctx(
-        hw_device_ctx: *mut ffi::AVBufferRef,
-        width: u32,
-        height: u32,
-        pool_size: i32,
-    ) -> Result<*mut ffi::AVBufferRef, ffmpeg::Error> {
-        let hw_frames_ref = ffi::av_hwframe_ctx_alloc(hw_device_ctx);
-        if hw_frames_ref.is_null() {
-            return Err(ffmpeg::Error::InvalidData);
-        }
-
-        let frames_ctx = (*hw_frames_ref).data as *mut ffi::AVHWFramesContext;
-        (*frames_ctx).format = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
-        (*frames_ctx).sw_format = ffi::AVPixelFormat::AV_PIX_FMT_NV12;
-        (*frames_ctx).width = width as i32;
-        (*frames_ctx).height = height as i32;
-        (*frames_ctx).initial_pool_size = pool_size;
-
-        let ret = ffi::av_hwframe_ctx_init(hw_frames_ref);
-        if ret < 0 {
-            ffi::av_buffer_unref(&mut { hw_frames_ref });
-            return Err(ffmpeg::Error::from(ret));
-        }
-
-        Ok(hw_frames_ref)
-    }
-
-    /// Upload a software NV12 frame to a VA-API hardware surface.
-    unsafe fn upload_to_hw_surface(
-        hw_frames_ctx: *mut ffi::AVBufferRef,
-        sw_frame: &frame::Video,
-    ) -> Result<frame::Video, ffmpeg::Error> {
-        let mut hw_frame = frame::Video::empty();
-        let hw_ptr = hw_frame.as_mut_ptr();
-
-        let ret = ffi::av_hwframe_get_buffer(hw_frames_ctx, hw_ptr, 0);
-        if ret < 0 {
-            return Err(ffmpeg::Error::from(ret));
-        }
-
-        let ret = ffi::av_hwframe_transfer_data(hw_ptr, sw_frame.as_ptr(), 0);
-        if ret < 0 {
-            return Err(ffmpeg::Error::from(ret));
-        }
-
-        Ok(hw_frame)
-    }
-
-    // -----------------------------------------------------------------------
     // Encoder open paths
     // -----------------------------------------------------------------------
 
@@ -209,10 +121,10 @@ impl H264VaapiEncoder {
     ) -> Result<Self, ffmpeg::Error> {
         unsafe {
             // 1. Create HW device context.
-            let hw_device_ctx = Self::create_hw_device_ctx(VAAPI_DEVICE)?;
+            let hw_device_ctx = vaapi_device::create_hw_device_ctx(VAAPI_DEVICE)?;
 
             // 2. Create HW frames context at the requested resolution.
-            let hw_frames_ctx = match Self::create_hw_frames_ctx(hw_device_ctx, enc_w, enc_h, 10) {
+            let hw_frames_ctx = match vaapi_device::create_hw_frames_ctx(hw_device_ctx, enc_w, enc_h, 10) {
                 Ok(ctx) => ctx,
                 Err(e) => {
                     ffi::av_buffer_unref(&mut { hw_device_ctx });
@@ -398,7 +310,7 @@ impl H264VaapiEncoder {
                 .hw_frames_ctx
                 .as_ref()
                 .expect("use_vaapi but no hw_frames_ctx");
-            let mut hw_frame = unsafe { Self::upload_to_hw_surface(hw_frames_ref.0, &nv12_frame)? };
+            let mut hw_frame = unsafe { vaapi_device::upload_to_hw_surface(hw_frames_ref.0, &nv12_frame)? };
             hw_frame.set_pts(nv12_frame.pts());
             self.encoder.send_frame(&hw_frame)?;
         } else {
@@ -530,26 +442,6 @@ impl FullFrameEncoder {
         self.keyframe_pending
     }
 
-    /// Create a DRM device context for the given render node.
-    /// Used to derive a VAAPI context that supports DRM PRIME frame import.
-    unsafe fn create_drm_device_ctx(
-        device_path: &str,
-    ) -> Result<*mut ffi::AVBufferRef, ffmpeg::Error> {
-        let device_cstr = CString::new(device_path).map_err(|_| ffmpeg::Error::InvalidData)?;
-        let mut drm_ctx: *mut ffi::AVBufferRef = ptr::null_mut();
-        let ret = ffi::av_hwdevice_ctx_create(
-            &mut drm_ctx,
-            ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_DRM,
-            device_cstr.as_ptr(),
-            ptr::null_mut(),
-            0,
-        );
-        if ret < 0 {
-            return Err(ffmpeg::Error::from(ret));
-        }
-        Ok(drm_ctx)
-    }
-
     // -----------------------------------------------------------------------
     // Encoder open paths
     // -----------------------------------------------------------------------
@@ -562,7 +454,7 @@ impl FullFrameEncoder {
         unsafe {
             // Create DRM device first, then derive VAAPI from it.
             // This enables DRM PRIME → VAAPI frame mapping for zero-copy DMA-BUF import.
-            let drm_device_ctx = Self::create_drm_device_ctx(VAAPI_DEVICE);
+            let drm_device_ctx = vaapi_device::create_drm_device_ctx(VAAPI_DEVICE);
             let hw_device_ctx = if let Ok(drm_ctx) = drm_device_ctx.as_ref() {
                 // Derive VAAPI from DRM — enables DRM PRIME frame import
                 let mut vaapi_ctx: *mut ffi::AVBufferRef = ptr::null_mut();
@@ -574,17 +466,17 @@ impl FullFrameEncoder {
                 );
                 if ret < 0 || vaapi_ctx.is_null() {
                     // Fall back to direct VAAPI device
-                    H264VaapiEncoder::create_hw_device_ctx(VAAPI_DEVICE)?
+                    vaapi_device::create_hw_device_ctx(VAAPI_DEVICE)?
                 } else {
                     vaapi_ctx
                 }
             } else {
-                H264VaapiEncoder::create_hw_device_ctx(VAAPI_DEVICE)?
+                vaapi_device::create_hw_device_ctx(VAAPI_DEVICE)?
             };
 
             // NV12 hw_frames_ctx for encoder output
             let hw_frames_ctx =
-                match H264VaapiEncoder::create_hw_frames_ctx(hw_device_ctx, width, height, 10) {
+                match vaapi_device::create_hw_frames_ctx(hw_device_ctx, width, height, 10) {
                     Ok(ctx) => ctx,
                     Err(e) => {
                         ffi::av_buffer_unref(&mut { hw_device_ctx });
@@ -763,7 +655,7 @@ impl FullFrameEncoder {
                     .expect("use_vaapi but no hw_frames_ctx");
 
                 let mut hw_frame =
-                    H264VaapiEncoder::upload_to_hw_surface(hw_frames_ref.0, &sw_frame)?;
+                    vaapi_device::upload_to_hw_surface(hw_frames_ref.0, &sw_frame)?;
                 hw_frame.set_pts(Some(pts));
 
                 if force_idr {
@@ -991,7 +883,7 @@ impl FullFrameEncoder {
         libc::munmap(ptr, buf_size);
         scale_result?;
 
-        let mut hw = H264VaapiEncoder::upload_to_hw_surface(hw_frames_ctx, &nv12_frame)?;
+        let mut hw = vaapi_device::upload_to_hw_surface(hw_frames_ctx, &nv12_frame)?;
         hw.set_pts(Some(pts));
         if force_idr {
             (*hw.as_mut_ptr()).pict_type = ffi::AVPictureType::AV_PICTURE_TYPE_I;
@@ -1097,38 +989,6 @@ impl FullFrameEncoder {
         }
     }
 }
-
-/// Detect whether an H.264 Annex-B bitstream contains a keyframe NAL unit.
-///
-/// Looks for NAL type 5 (IDR slice) or NAL type 7 (SPS, which always
-/// precedes an IDR in the same AU).
-fn is_keyframe_nal(data: &[u8]) -> bool {
-    let mut i = 0;
-    while i + 4 <= data.len() {
-        // Annex-B start code: 0x00 0x00 0x00 0x01 or 0x00 0x00 0x01
-        if data[i] == 0 && data[i + 1] == 0 {
-            let nal_byte_offset = if data[i + 2] == 0 && i + 4 < data.len() && data[i + 3] == 1 {
-                i + 4
-            } else if data[i + 2] == 1 {
-                i + 3
-            } else {
-                i += 1;
-                continue;
-            };
-            if nal_byte_offset < data.len() {
-                let nal_type = data[nal_byte_offset] & 0x1F;
-                if nal_type == 5 || nal_type == 7 {
-                    return true;
-                }
-            }
-            i = nal_byte_offset;
-        } else {
-            i += 1;
-        }
-    }
-    false
-}
-
 
 #[cfg(test)]
 #[path = "h264_vaapi_tests.rs"]

@@ -4,6 +4,9 @@ pub mod h264_vaapi;
 pub mod pal_rle;
 pub mod solid;
 
+mod nal_parser;
+mod vaapi_device;
+
 use crate::transport::protocol::Codec;
 
 /// Result of encoding a single tile.
