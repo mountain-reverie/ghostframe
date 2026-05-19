@@ -439,6 +439,14 @@ pub fn read_server_logs_stripped(container_name: &str) -> String {
 /// ~100 test invocations have leaked Xvfb sockets.
 ///
 /// Called once at the top of `setup_e2e_inner` so it runs once per test.
+///
+/// **Serialization assumption**: this helper assumes the project's
+/// `--test-threads=1` convention — only one test setup runs at a
+/// time. Under parallel execution, the helper could remove a socket
+/// that a concurrent `spawn_xvfb` (in another test) just bound to,
+/// causing a TOCTOU race. The cleanup → spawn_xvfb sequence within a
+/// SINGLE test is safe because both are synchronous. If the suite
+/// ever moves to parallel test execution, add a process-wide mutex.
 pub fn cleanup_stale_xvfb_sockets() {
     use std::os::unix::net::UnixStream;
     use std::path::Path;
