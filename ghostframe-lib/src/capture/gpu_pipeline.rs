@@ -17,6 +17,8 @@ use ash::vk;
 use std::ffi::CStr;
 use std::io;
 
+use super::pipeline_builder::{self, BindingSpec};
+
 // ---------------------------------------------------------------------------
 // RAII guards for per-frame transient Vulkan resources
 // ---------------------------------------------------------------------------
@@ -574,143 +576,57 @@ impl GpuFrameProcessor {
         let analysis_shader_ci = vk::ShaderModuleCreateInfo::default().code(&analysis_spv_words);
         let analysis_shader_module = device.create_shader_module(&analysis_shader_ci, None)?;
 
-        // --- SAD Descriptor set layout ---
-        // binding 0: STORAGE_IMAGE (current frame)
-        // binding 1: STORAGE_IMAGE (prev frame)
-        // binding 2: STORAGE_BUFFER (SAD output)
-        let sad_bindings = [
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(2)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-        ];
-        let dsl_ci = vk::DescriptorSetLayoutCreateInfo::default().bindings(&sad_bindings);
-        let descriptor_set_layout = device.create_descriptor_set_layout(&dsl_ci, None)?;
+        // --- SAD compute pipeline ---
+        // Bindings:
+        //   0: STORAGE_IMAGE (current frame)
+        //   1: STORAGE_IMAGE (prev frame)
+        //   2: STORAGE_BUFFER (SAD output)
+        // Push constants: 3 × u32 = 12 bytes (frame_width, frame_height, cols).
+        let (descriptor_set_layout, pipeline_layout, pipeline) =
+            pipeline_builder::build_compute_pipeline(
+                &device,
+                &[
+                    BindingSpec::storage_image(0),
+                    BindingSpec::storage_image(1),
+                    BindingSpec::storage_buffer(2),
+                ],
+                12,
+                shader_module,
+            )?;
 
-        // --- SAD Pipeline layout ---
-        // Push constants: 3 x u32 = 12 bytes (frame_width, frame_height, cols)
-        let sad_push_range = [vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::COMPUTE)
-            .offset(0)
-            .size(12)];
-        let sad_pipeline_layout_ci = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(std::slice::from_ref(&descriptor_set_layout))
-            .push_constant_ranges(&sad_push_range);
-        let pipeline_layout = device.create_pipeline_layout(&sad_pipeline_layout_ci, None)?;
+        // --- NV12 compute pipeline ---
+        // Bindings:
+        //   0: STORAGE_IMAGE (BGRA input)
+        //   1: STORAGE_BUFFER (NV12 output)
+        // Push constants: 5 × u32 = 20 bytes (width, height, y_stride, uv_offset, uv_stride).
+        let (nv12_descriptor_set_layout, nv12_pipeline_layout, nv12_pipeline) =
+            pipeline_builder::build_compute_pipeline(
+                &device,
+                &[
+                    BindingSpec::storage_image(0),
+                    BindingSpec::storage_buffer(1),
+                ],
+                20,
+                nv12_shader_module,
+            )?;
 
-        // --- SAD Compute pipeline ---
-        let entry_name = c"main";
-        let sad_stage = vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(shader_module)
-            .name(entry_name);
-        let sad_compute_ci = vk::ComputePipelineCreateInfo::default()
-            .stage(sad_stage)
-            .layout(pipeline_layout);
-        let pipelines = device
-            .create_compute_pipelines(vk::PipelineCache::null(), &[sad_compute_ci], None)
-            .map_err(|(_, e)| e)?;
-        let pipeline = pipelines[0];
-
-        // --- NV12 Descriptor set layout ---
-        // binding 0: STORAGE_IMAGE (BGRA input)
-        // binding 1: STORAGE_BUFFER (NV12 output)
-        let nv12_bindings = [
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-        ];
-        let nv12_dsl_ci = vk::DescriptorSetLayoutCreateInfo::default().bindings(&nv12_bindings);
-        let nv12_descriptor_set_layout = device.create_descriptor_set_layout(&nv12_dsl_ci, None)?;
-
-        // --- NV12 Pipeline layout ---
-        // Push constants: 5 x u32 = 20 bytes (width, height, y_stride, uv_offset, uv_stride)
-        let nv12_push_range = [vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::COMPUTE)
-            .offset(0)
-            .size(20)];
-        let nv12_pipeline_layout_ci = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(std::slice::from_ref(&nv12_descriptor_set_layout))
-            .push_constant_ranges(&nv12_push_range);
-        let nv12_pipeline_layout = device.create_pipeline_layout(&nv12_pipeline_layout_ci, None)?;
-
-        // --- NV12 Compute pipeline ---
-        let nv12_stage = vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(nv12_shader_module)
-            .name(entry_name);
-        let nv12_compute_ci = vk::ComputePipelineCreateInfo::default()
-            .stage(nv12_stage)
-            .layout(nv12_pipeline_layout);
-        let nv12_pipelines = device
-            .create_compute_pipelines(vk::PipelineCache::null(), &[nv12_compute_ci], None)
-            .map_err(|(_, e)| e)?;
-        let nv12_pipeline = nv12_pipelines[0];
-
-        // --- Analysis Descriptor set layout ---
-        // binding 0: STORAGE_IMAGE (current frame, read-only in shader)
-        // binding 1: STORAGE_BUFFER (analysis output)
-        let analysis_bindings = [
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-        ];
-        let analysis_dsl_ci =
-            vk::DescriptorSetLayoutCreateInfo::default().bindings(&analysis_bindings);
-        let analysis_descriptor_set_layout =
-            device.create_descriptor_set_layout(&analysis_dsl_ci, None)?;
-
-        // --- Analysis Pipeline layout ---
-        // Push constants: 3 x u32 = 12 bytes (frame_width, frame_height, cols) — same
+        // --- Analysis compute pipeline ---
+        // Bindings:
+        //   0: STORAGE_IMAGE (current frame, read-only in shader)
+        //   1: STORAGE_BUFFER (analysis output)
+        // Push constants: 3 × u32 = 12 bytes (frame_width, frame_height, cols) — same
         // shape as SAD's, but a distinct pipeline-layout object is required because
         // descriptor sets differ.
-        let analysis_push_range = [vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::COMPUTE)
-            .offset(0)
-            .size(12)];
-        let analysis_pipeline_layout_ci = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(std::slice::from_ref(&analysis_descriptor_set_layout))
-            .push_constant_ranges(&analysis_push_range);
-        let analysis_pipeline_layout =
-            device.create_pipeline_layout(&analysis_pipeline_layout_ci, None)?;
-
-        // --- Analysis Compute pipeline ---
-        let analysis_stage = vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(analysis_shader_module)
-            .name(entry_name);
-        let analysis_compute_ci = vk::ComputePipelineCreateInfo::default()
-            .stage(analysis_stage)
-            .layout(analysis_pipeline_layout);
-        let analysis_pipelines = device
-            .create_compute_pipelines(vk::PipelineCache::null(), &[analysis_compute_ci], None)
-            .map_err(|(_, e)| e)?;
-        let analysis_pipeline = analysis_pipelines[0];
+        let (analysis_descriptor_set_layout, analysis_pipeline_layout, analysis_pipeline) =
+            pipeline_builder::build_compute_pipeline(
+                &device,
+                &[
+                    BindingSpec::storage_image(0),
+                    BindingSpec::storage_buffer(1),
+                ],
+                12,
+                analysis_shader_module,
+            )?;
 
         // --- PalRLE compact shader module ---
         let palrle_compact_spv = include_bytes!("shaders/palrle_compact.spv");
@@ -721,66 +637,28 @@ impl GpuFrameProcessor {
         let palrle_compact_shader_module =
             device.create_shader_module(&palrle_compact_shader_ci, None)?;
 
-        // --- PalRLE compact descriptor set layout ---
-        // binding 0: STORAGE_BUFFER (SAD output, read-only)
-        // binding 1: STORAGE_BUFFER (tile analysis, read-only)
-        // binding 2: STORAGE_BUFFER (compact list output)
-        // binding 3: STORAGE_BUFFER (compact count output)
-        let palrle_compact_bindings = [
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(2)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(3)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-        ];
-        let palrle_compact_dsl_ci =
-            vk::DescriptorSetLayoutCreateInfo::default().bindings(&palrle_compact_bindings);
-        let palrle_compact_descriptor_set_layout =
-            device.create_descriptor_set_layout(&palrle_compact_dsl_ci, None)?;
-
-        // --- PalRLE compact pipeline layout ---
-        // Push constants: 3 x u32 = 12 bytes (cols, rows, dirty_threshold)
-        let palrle_compact_push_range = [vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::COMPUTE)
-            .offset(0)
-            .size(12)];
-        let palrle_compact_pipeline_layout_ci = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(std::slice::from_ref(&palrle_compact_descriptor_set_layout))
-            .push_constant_ranges(&palrle_compact_push_range);
-        let palrle_compact_pipeline_layout =
-            device.create_pipeline_layout(&palrle_compact_pipeline_layout_ci, None)?;
-
         // --- PalRLE compact compute pipeline ---
-        let palrle_compact_stage = vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(palrle_compact_shader_module)
-            .name(entry_name);
-        let palrle_compact_compute_ci = vk::ComputePipelineCreateInfo::default()
-            .stage(palrle_compact_stage)
-            .layout(palrle_compact_pipeline_layout);
-        let palrle_compact_pipelines = device
-            .create_compute_pipelines(
-                vk::PipelineCache::null(),
-                &[palrle_compact_compute_ci],
-                None,
-            )
-            .map_err(|(_, e)| e)?;
-        let palrle_compact_pipeline = palrle_compact_pipelines[0];
+        // Bindings:
+        //   0: STORAGE_BUFFER (SAD output, read-only)
+        //   1: STORAGE_BUFFER (tile analysis, read-only)
+        //   2: STORAGE_BUFFER (compact list output)
+        //   3: STORAGE_BUFFER (compact count output)
+        // Push constants: 3 × u32 = 12 bytes (cols, rows, dirty_threshold).
+        let (
+            palrle_compact_descriptor_set_layout,
+            palrle_compact_pipeline_layout,
+            palrle_compact_pipeline,
+        ) = pipeline_builder::build_compute_pipeline(
+            &device,
+            &[
+                BindingSpec::storage_buffer(0),
+                BindingSpec::storage_buffer(1),
+                BindingSpec::storage_buffer(2),
+                BindingSpec::storage_buffer(3),
+            ],
+            12,
+            palrle_compact_shader_module,
+        )?;
 
         // --- PalRLE indirect-args shader module ---
         let palrle_indirect_args_spv = include_bytes!("shaders/palrle_indirect_args.spv");
@@ -791,48 +669,23 @@ impl GpuFrameProcessor {
         let palrle_indirect_args_shader_module =
             device.create_shader_module(&palrle_indirect_args_shader_ci, None)?;
 
-        // --- PalRLE indirect-args descriptor set layout ---
-        // binding 0: STORAGE_BUFFER (compact count, read-only)
-        // binding 1: STORAGE_BUFFER (indirect args output)
-        let palrle_indirect_args_bindings = [
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-        ];
-        let palrle_indirect_args_dsl_ci =
-            vk::DescriptorSetLayoutCreateInfo::default().bindings(&palrle_indirect_args_bindings);
-        let palrle_indirect_args_descriptor_set_layout =
-            device.create_descriptor_set_layout(&palrle_indirect_args_dsl_ci, None)?;
-
-        // --- PalRLE indirect-args pipeline layout (no push constants) ---
-        let palrle_indirect_args_pipeline_layout_ci = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(std::slice::from_ref(&palrle_indirect_args_descriptor_set_layout));
-        let palrle_indirect_args_pipeline_layout =
-            device.create_pipeline_layout(&palrle_indirect_args_pipeline_layout_ci, None)?;
-
-        // --- PalRLE indirect-args compute pipeline ---
-        let palrle_indirect_args_stage = vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(palrle_indirect_args_shader_module)
-            .name(entry_name);
-        let palrle_indirect_args_compute_ci = vk::ComputePipelineCreateInfo::default()
-            .stage(palrle_indirect_args_stage)
-            .layout(palrle_indirect_args_pipeline_layout);
-        let palrle_indirect_args_pipelines = device
-            .create_compute_pipelines(
-                vk::PipelineCache::null(),
-                &[palrle_indirect_args_compute_ci],
-                None,
-            )
-            .map_err(|(_, e)| e)?;
-        let palrle_indirect_args_pipeline = palrle_indirect_args_pipelines[0];
+        // --- PalRLE indirect-args compute pipeline (no push constants) ---
+        // Bindings:
+        //   0: STORAGE_BUFFER (compact count, read-only)
+        //   1: STORAGE_BUFFER (indirect args output)
+        let (
+            palrle_indirect_args_descriptor_set_layout,
+            palrle_indirect_args_pipeline_layout,
+            palrle_indirect_args_pipeline,
+        ) = pipeline_builder::build_compute_pipeline(
+            &device,
+            &[
+                BindingSpec::storage_buffer(0),
+                BindingSpec::storage_buffer(1),
+            ],
+            0,
+            palrle_indirect_args_shader_module,
+        )?;
 
         // --- pal_rle_index shader module (Stage 3) ---
         let pal_rle_index_spv = include_bytes!("shaders/pal_rle_index.spv");
@@ -843,78 +696,32 @@ impl GpuFrameProcessor {
         let pal_rle_index_shader_module =
             device.create_shader_module(&pal_rle_index_shader_ci, None)?;
 
-        // --- pal_rle_index descriptor set layout ---
-        // binding 0: STORAGE_IMAGE (current_frame, read-only)
-        // binding 1: STORAGE_BUFFER (compact_list, read-only)
-        // binding 2: STORAGE_BUFFER (frame_palette_set, read-only)
-        // binding 3: STORAGE_BUFFER (per_tile_frame_palette_id, read-only)
-        // binding 4: STORAGE_BUFFER (folded_into, read-only)
-        // binding 5: STORAGE_BUFFER (index_buffer output)
-        let pal_rle_index_bindings = [
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(2)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(3)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(4)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(5)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-        ];
-        let pal_rle_index_dsl_ci =
-            vk::DescriptorSetLayoutCreateInfo::default().bindings(&pal_rle_index_bindings);
-        let pal_rle_index_descriptor_set_layout =
-            device.create_descriptor_set_layout(&pal_rle_index_dsl_ci, None)?;
-
-        // --- pal_rle_index pipeline layout ---
-        // Push constants: 1 × u32 = 4 bytes (cols).
-        let pal_rle_index_push_range = [vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::COMPUTE)
-            .offset(0)
-            .size(4)];
-        let pal_rle_index_pipeline_layout_ci = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(std::slice::from_ref(&pal_rle_index_descriptor_set_layout))
-            .push_constant_ranges(&pal_rle_index_push_range);
-        let pal_rle_index_pipeline_layout =
-            device.create_pipeline_layout(&pal_rle_index_pipeline_layout_ci, None)?;
-
         // --- pal_rle_index compute pipeline ---
-        let pal_rle_index_stage = vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(pal_rle_index_shader_module)
-            .name(entry_name);
-        let pal_rle_index_compute_ci = vk::ComputePipelineCreateInfo::default()
-            .stage(pal_rle_index_stage)
-            .layout(pal_rle_index_pipeline_layout);
-        let pal_rle_index_pipelines = device
-            .create_compute_pipelines(
-                vk::PipelineCache::null(),
-                &[pal_rle_index_compute_ci],
-                None,
-            )
-            .map_err(|(_, e)| e)?;
-        let pal_rle_index_pipeline = pal_rle_index_pipelines[0];
+        // Bindings:
+        //   0: STORAGE_IMAGE (current_frame, read-only)
+        //   1: STORAGE_BUFFER (compact_list, read-only)
+        //   2: STORAGE_BUFFER (frame_palette_set, read-only)
+        //   3: STORAGE_BUFFER (per_tile_frame_palette_id, read-only)
+        //   4: STORAGE_BUFFER (folded_into, read-only)
+        //   5: STORAGE_BUFFER (index_buffer output)
+        // Push constants: 1 × u32 = 4 bytes (cols).
+        let (
+            pal_rle_index_descriptor_set_layout,
+            pal_rle_index_pipeline_layout,
+            pal_rle_index_pipeline,
+        ) = pipeline_builder::build_compute_pipeline(
+            &device,
+            &[
+                BindingSpec::storage_image(0),
+                BindingSpec::storage_buffer(1),
+                BindingSpec::storage_buffer(2),
+                BindingSpec::storage_buffer(3),
+                BindingSpec::storage_buffer(4),
+                BindingSpec::storage_buffer(5),
+            ],
+            4,
+            pal_rle_index_shader_module,
+        )?;
 
         // --- Descriptor pool ---
         // 9 sets: SAD (2 STORAGE_IMAGE + 1 STORAGE_BUFFER)
@@ -1120,72 +927,31 @@ impl GpuFrameProcessor {
         let palette_fold_shader_module =
             device.create_shader_module(&palette_fold_shader_ci, None)?;
 
-        // --- palette_fold descriptor set layout ---
-        // binding 0: STORAGE_BUFFER (tile analysis input, read-only)
-        // binding 1: STORAGE_BUFFER (compact list input, read-only)
-        // binding 2: STORAGE_BUFFER (frame_palette_set output)
-        // binding 3: STORAGE_BUFFER (frame_palette_count output)
-        // binding 4: STORAGE_BUFFER (hash_table, per-frame scratch)
-        // binding 5: STORAGE_BUFFER (per_tile_frame_palette_id output)
-        let palette_fold_bindings = [
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(2)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(3)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(4)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(5)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-        ];
-        let palette_fold_dsl_ci =
-            vk::DescriptorSetLayoutCreateInfo::default().bindings(&palette_fold_bindings);
-        let palette_fold_descriptor_set_layout =
-            device.create_descriptor_set_layout(&palette_fold_dsl_ci, None)?;
-
-        // --- palette_fold pipeline layout (no push constants) ---
-        let palette_fold_pipeline_layout_ci = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(std::slice::from_ref(&palette_fold_descriptor_set_layout));
-        let palette_fold_pipeline_layout =
-            device.create_pipeline_layout(&palette_fold_pipeline_layout_ci, None)?;
-
-        // --- palette_fold compute pipeline ---
-        let palette_fold_stage = vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(palette_fold_shader_module)
-            .name(entry_name);
-        let palette_fold_compute_ci = vk::ComputePipelineCreateInfo::default()
-            .stage(palette_fold_stage)
-            .layout(palette_fold_pipeline_layout);
-        let palette_fold_pipelines = device
-            .create_compute_pipelines(
-                vk::PipelineCache::null(),
-                &[palette_fold_compute_ci],
-                None,
-            )
-            .map_err(|(_, e)| e)?;
-        let palette_fold_pipeline = palette_fold_pipelines[0];
+        // --- palette_fold compute pipeline (no push constants) ---
+        // Bindings:
+        //   0: STORAGE_BUFFER (tile analysis input, read-only)
+        //   1: STORAGE_BUFFER (compact list input, read-only)
+        //   2: STORAGE_BUFFER (frame_palette_set output)
+        //   3: STORAGE_BUFFER (frame_palette_count output)
+        //   4: STORAGE_BUFFER (hash_table, per-frame scratch)
+        //   5: STORAGE_BUFFER (per_tile_frame_palette_id output)
+        let (
+            palette_fold_descriptor_set_layout,
+            palette_fold_pipeline_layout,
+            palette_fold_pipeline,
+        ) = pipeline_builder::build_compute_pipeline(
+            &device,
+            &[
+                BindingSpec::storage_buffer(0),
+                BindingSpec::storage_buffer(1),
+                BindingSpec::storage_buffer(2),
+                BindingSpec::storage_buffer(3),
+                BindingSpec::storage_buffer(4),
+                BindingSpec::storage_buffer(5),
+            ],
+            0,
+            palette_fold_shader_module,
+        )?;
 
         // --- frame_palette_set buffer ---
         // 256 PaletteEntry slots × 80 bytes = 20480 bytes.
@@ -1326,42 +1092,19 @@ impl GpuFrameProcessor {
         let palette_subset_fold_init_shader_module =
             device.create_shader_module(&palette_subset_fold_init_shader_ci, None)?;
 
-        // --- palette_subset_fold_init descriptor set layout ---
-        // binding 0: STORAGE_BUFFER (FoldedInto)
-        let palette_subset_fold_init_bindings = [vk::DescriptorSetLayoutBinding::default()
-            .binding(0)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::COMPUTE)];
-        let palette_subset_fold_init_dsl_ci = vk::DescriptorSetLayoutCreateInfo::default()
-            .bindings(&palette_subset_fold_init_bindings);
-        let palette_subset_fold_init_descriptor_set_layout =
-            device.create_descriptor_set_layout(&palette_subset_fold_init_dsl_ci, None)?;
-
-        // --- palette_subset_fold_init pipeline layout (no push constants) ---
-        let palette_subset_fold_init_pipeline_layout_ci = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(std::slice::from_ref(
-                &palette_subset_fold_init_descriptor_set_layout,
-            ));
-        let palette_subset_fold_init_pipeline_layout =
-            device.create_pipeline_layout(&palette_subset_fold_init_pipeline_layout_ci, None)?;
-
-        // --- palette_subset_fold_init compute pipeline ---
-        let palette_subset_fold_init_stage = vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(palette_subset_fold_init_shader_module)
-            .name(entry_name);
-        let palette_subset_fold_init_compute_ci = vk::ComputePipelineCreateInfo::default()
-            .stage(palette_subset_fold_init_stage)
-            .layout(palette_subset_fold_init_pipeline_layout);
-        let palette_subset_fold_init_pipelines = device
-            .create_compute_pipelines(
-                vk::PipelineCache::null(),
-                &[palette_subset_fold_init_compute_ci],
-                None,
-            )
-            .map_err(|(_, e)| e)?;
-        let palette_subset_fold_init_pipeline = palette_subset_fold_init_pipelines[0];
+        // --- palette_subset_fold_init compute pipeline (no push constants) ---
+        // Bindings:
+        //   0: STORAGE_BUFFER (FoldedInto)
+        let (
+            palette_subset_fold_init_descriptor_set_layout,
+            palette_subset_fold_init_pipeline_layout,
+            palette_subset_fold_init_pipeline,
+        ) = pipeline_builder::build_compute_pipeline(
+            &device,
+            &[BindingSpec::storage_buffer(0)],
+            0,
+            palette_subset_fold_init_shader_module,
+        )?;
 
         // --- palette_subset_fold shader module ---
         let palette_subset_fold_spv = include_bytes!("shaders/palette_subset_fold.spv");
@@ -1373,50 +1116,23 @@ impl GpuFrameProcessor {
         let palette_subset_fold_shader_module =
             device.create_shader_module(&palette_subset_fold_shader_ci, None)?;
 
-        // --- palette_subset_fold descriptor set layout ---
-        // binding 0: STORAGE_BUFFER (FramePaletteSet, read-only)
-        // binding 1: STORAGE_BUFFER (FoldedInto, read-write)
-        let palette_subset_fold_bindings = [
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE),
-        ];
-        let palette_subset_fold_dsl_ci = vk::DescriptorSetLayoutCreateInfo::default()
-            .bindings(&palette_subset_fold_bindings);
-        let palette_subset_fold_descriptor_set_layout =
-            device.create_descriptor_set_layout(&palette_subset_fold_dsl_ci, None)?;
-
-        // --- palette_subset_fold pipeline layout (no push constants) ---
-        let palette_subset_fold_pipeline_layout_ci = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(std::slice::from_ref(
-                &palette_subset_fold_descriptor_set_layout,
-            ));
-        let palette_subset_fold_pipeline_layout =
-            device.create_pipeline_layout(&palette_subset_fold_pipeline_layout_ci, None)?;
-
-        // --- palette_subset_fold compute pipeline ---
-        let palette_subset_fold_stage = vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(palette_subset_fold_shader_module)
-            .name(entry_name);
-        let palette_subset_fold_compute_ci = vk::ComputePipelineCreateInfo::default()
-            .stage(palette_subset_fold_stage)
-            .layout(palette_subset_fold_pipeline_layout);
-        let palette_subset_fold_pipelines = device
-            .create_compute_pipelines(
-                vk::PipelineCache::null(),
-                &[palette_subset_fold_compute_ci],
-                None,
-            )
-            .map_err(|(_, e)| e)?;
-        let palette_subset_fold_pipeline = palette_subset_fold_pipelines[0];
+        // --- palette_subset_fold compute pipeline (no push constants) ---
+        // Bindings:
+        //   0: STORAGE_BUFFER (FramePaletteSet, read-only)
+        //   1: STORAGE_BUFFER (FoldedInto, read-write)
+        let (
+            palette_subset_fold_descriptor_set_layout,
+            palette_subset_fold_pipeline_layout,
+            palette_subset_fold_pipeline,
+        ) = pipeline_builder::build_compute_pipeline(
+            &device,
+            &[
+                BindingSpec::storage_buffer(0),
+                BindingSpec::storage_buffer(1),
+            ],
+            0,
+            palette_subset_fold_shader_module,
+        )?;
 
         // --- folded_into buffer ---
         // folded_into_buffer: each frame is reset by palette_subset_fold_init.comp
