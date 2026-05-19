@@ -101,13 +101,21 @@ pub struct IoBridge {
     /// for a handle; cleared on `Event::ConnectionLost` so a rare
     /// reconnect-with-same-handle re-fires the reset.
     session_resets_fired: HashSet<ConnectionHandle>,
-    /// Tracks whether ANY client has previously established a session.
-    /// Initial value `false`. Flips to `true` permanently after the first
-    /// `maybe_fire_session_reset` for a connected handle. Used to skip the
-    /// reset body on the FIRST connect (where dirty_tracker / classifier /
-    /// scheduler / etc. are in their initial-startup state and the test
-    /// suite implicitly depends on that state surviving session
+    /// Tracks whether ANY client has previously established a session
+    /// on THIS `IoBridge` instance. Initial value `false`. Flips to
+    /// `true` permanently after the first `maybe_fire_session_reset`
+    /// for a connected handle. Used to skip the reset body on the
+    /// FIRST connect (where dirty_tracker / classifier / scheduler /
+    /// etc. are in their initial-startup state and the test suite
+    /// implicitly depends on that state surviving session
     /// establishment). Reconnects fire the reset body normally.
+    ///
+    /// **Lifecycle assumption**: this field is scoped to a single
+    /// `IoBridge` instance. The single-server-process model used in
+    /// production never recycles an IoBridge — each server boot
+    /// constructs a fresh one. If a future API ever exposes an
+    /// IoBridge::reset() (e.g. for config reload), this field MUST
+    /// be reset to `false` there.
     has_seen_prior_session: bool,
     /// Inbound channel of captured frames to be fragmented and sent as datagrams.
     frame_rx: Option<mpsc::Receiver<FrameSubmission>>,
@@ -755,6 +763,19 @@ impl IoBridge {
         if !self.session_resets_fired.insert(handle) { return; }
         if self.has_seen_prior_session {
             self.fire_session_reset(handle);
+        }
+        // Implicit lifecycle invariant: ConnectionHandle ordering is monotonic
+        // within an IoBridge instance. If this breaks (e.g. a future test
+        // recycles handles), the `has_seen_prior_session` latch logic will
+        // misclassify the new "first" connect as a reconnect. Debug-assert
+        // surfaces the violation rather than silently producing wrong behaviour.
+        #[cfg(debug_assertions)]
+        if !self.has_seen_prior_session {
+            debug_assert!(
+                self.session_resets_fired.len() == 1,
+                "has_seen_prior_session=false but session_resets_fired has >1 entry — \
+                 IoBridge state inconsistency (lifecycle violation?)"
+            );
         }
         self.has_seen_prior_session = true;
     }
