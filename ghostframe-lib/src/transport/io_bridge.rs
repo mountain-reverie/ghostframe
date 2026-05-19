@@ -21,7 +21,7 @@ use std::time::Instant;
 
 use bytes::BytesMut;
 use quinn_proto::{ConnectionHandle, Event, StreamEvent};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream as TokioUnixStream;
 use tokio::sync::mpsc;
@@ -96,6 +96,11 @@ pub struct IoBridge {
     local_addr: SocketAddr,
     /// Per-connection WebTransport handshake state.
     wt_sessions: HashMap<ConnectionHandle, WebTransportServer>,
+    /// Per-handle "have we already fired on_session_reset for this
+    /// connection?" tracking. Set when `maybe_fire_session_reset` runs
+    /// for a handle; cleared on `Event::ConnectionLost` so a rare
+    /// reconnect-with-same-handle re-fires the reset.
+    session_resets_fired: HashSet<ConnectionHandle>,
     /// Inbound channel of captured frames to be fragmented and sent as datagrams.
     frame_rx: Option<mpsc::Receiver<FrameSubmission>>,
     /// Monotonically increasing frame sequence number (wrapping).
@@ -365,6 +370,7 @@ impl IoBridge {
             server,
             local_addr,
             wt_sessions: HashMap::new(),
+            session_resets_fired: HashSet::new(),
             frame_rx: None,
             frame_seq: 0,
             dirty_tracker: DirtyTracker::new(0, 0),
@@ -723,6 +729,63 @@ impl IoBridge {
                 );
             }
         }
+    }
+
+    /// Reset per-session state on a new WebTransport session. Called by
+    /// `maybe_fire_session_reset` (Task 3) once per new connection handle.
+    /// Preserves cross-session palette bytes (warm cache) and, when the
+    /// cfg-gated test hook GHOSTFRAME_SKIP_PALETTE_SESSION_RESET=1 is
+    /// active, also preserves `palette_table.delivered`.
+    fn fire_session_reset(&mut self, handle: ConnectionHandle) {
+        // New WebTransport session just became active.
+        // Initialize frame_mode to H264 so the first frame
+        // emits a single compact IDR (~50 datagrams) instead
+        // of an all-tiles raw burst (~8000 datagrams) that
+        // QUIC slow-start would mostly drop. Classifier exits
+        // back to TileCodec naturally after exit_sustain frames
+        // of empty dirty (Task 17).
+        self.dirty_tracker.reset();
+        self.metrics_tracker.reset();
+        self.classifier.reset();
+        self.scheduler.clear();
+        #[cfg(any(test, feature = "test-loss-injection"))]
+        let preserve_delivered = self.skip_palette_session_reset;
+        #[cfg(not(any(test, feature = "test-loss-injection")))]
+        let preserve_delivered = false;
+        self.palette_table.on_session_reset(preserve_delivered);
+        if preserve_delivered {
+            tracing::info!(
+                "test-hook: preserving palette_table.delivered across session reset (GHOSTFRAME_SKIP_PALETTE_SESSION_RESET=1)"
+            );
+        }
+        self.frame_mode = crate::tile::FrameMode::H264;
+        // Re-prime the frame-dimensions retransmit counter so
+        // the new client receives the sentinel on its first
+        // frames even if the screen has been at a stable
+        // resolution for >FRAME_DIMENSIONS_RETRANSMITS frames.
+        // Without this, the client's per-tile fallback resize
+        // (gated on !frameDimensionsKnown) takes over and
+        // re-introduces the canvas-resize-clears-tiles bug.
+        self.dimensions_retransmits_left = FRAME_DIMENSIONS_RETRANSMITS;
+        // `force_dirty_frames` is consumed only by
+        // `process_frame_cpu` (no_commit slow-start mitigation).
+        // The GPU path doesn't read it — skip setting it when a
+        // GPU processor is active to avoid implying behavior that
+        // doesn't fire on that branch.
+        if self.gpu_frame_processor.is_none() {
+            self.force_dirty_frames = 20;
+        }
+        // Force IDR on the existing encoder so the new client
+        // gets a fresh anchor. Without this, a client connecting
+        // mid-stream may receive P-frames referencing GOPs from
+        // the prior session and decode garbage until the next
+        // natural keyframe (~10 frames later at GOP=11). The
+        // first-time-only escape (lazy `FullFrameEncoder::new`
+        // with pts=0 → IDR) only covers cold start.
+        if let Some(enc) = self.full_frame_encoder.as_mut() {
+            enc.request_keyframe();
+        }
+        tracing::debug!(?handle, "new session connected, dirty tracker reset");
     }
 
     /// CPU-side tile-based pipeline (original implementation).
@@ -1444,55 +1507,7 @@ impl IoBridge {
                         let was_connected = wt.is_connected();
                         wt.on_stream_readable(conn, id);
                         if !was_connected && wt.is_connected() {
-                            // New WebTransport session just became active.
-                            // Initialize frame_mode to H264 so the first frame
-                            // emits a single compact IDR (~50 datagrams) instead
-                            // of an all-tiles raw burst (~8000 datagrams) that
-                            // QUIC slow-start would mostly drop. Classifier exits
-                            // back to TileCodec naturally after exit_sustain frames
-                            // of empty dirty (Task 17).
-                            self.dirty_tracker.reset();
-                            self.metrics_tracker.reset();
-                            self.classifier.reset();
-                            self.scheduler.clear();
-                            #[cfg(any(test, feature = "test-loss-injection"))]
-                            let preserve_delivered = self.skip_palette_session_reset;
-                            #[cfg(not(any(test, feature = "test-loss-injection")))]
-                            let preserve_delivered = false;
-                            self.palette_table.on_session_reset(preserve_delivered);
-                            if preserve_delivered {
-                                tracing::info!(
-                                    "test-hook: preserving palette_table.delivered across session reset (GHOSTFRAME_SKIP_PALETTE_SESSION_RESET=1)"
-                                );
-                            }
-                            self.frame_mode = crate::tile::FrameMode::H264;
-                            // Re-prime the frame-dimensions retransmit counter so
-                            // the new client receives the sentinel on its first
-                            // frames even if the screen has been at a stable
-                            // resolution for >FRAME_DIMENSIONS_RETRANSMITS frames.
-                            // Without this, the client's per-tile fallback resize
-                            // (gated on !frameDimensionsKnown) takes over and
-                            // re-introduces the canvas-resize-clears-tiles bug.
-                            self.dimensions_retransmits_left = FRAME_DIMENSIONS_RETRANSMITS;
-                            // `force_dirty_frames` is consumed only by
-                            // `process_frame_cpu` (no_commit slow-start mitigation).
-                            // The GPU path doesn't read it — skip setting it when a
-                            // GPU processor is active to avoid implying behavior that
-                            // doesn't fire on that branch.
-                            if self.gpu_frame_processor.is_none() {
-                                self.force_dirty_frames = 20;
-                            }
-                            // Force IDR on the existing encoder so the new client
-                            // gets a fresh anchor. Without this, a client connecting
-                            // mid-stream may receive P-frames referencing GOPs from
-                            // the prior session and decode garbage until the next
-                            // natural keyframe (~10 frames later at GOP=11). The
-                            // first-time-only escape (lazy `FullFrameEncoder::new`
-                            // with pts=0 → IDR) only covers cold start.
-                            if let Some(enc) = self.full_frame_encoder.as_mut() {
-                                enc.request_keyframe();
-                            }
-                            tracing::debug!(?handle, "new session connected, dirty tracker reset");
+                            self.fire_session_reset(handle);
                         }
                     }
                 }
@@ -1719,6 +1734,7 @@ impl IoBridge {
             server,
             local_addr: "0.0.0.0:4443".parse().unwrap(),
             wt_sessions: HashMap::new(),
+            session_resets_fired: HashSet::new(),
             frame_rx: None,
             frame_seq: 0,
             dirty_tracker: DirtyTracker::new(0, 0),
@@ -1765,6 +1781,7 @@ impl IoBridge {
             server,
             local_addr: "0.0.0.0:4443".parse().unwrap(),
             wt_sessions: HashMap::new(),
+            session_resets_fired: HashSet::new(),
             frame_rx: Some(frame_rx),
             frame_seq: 0,
             dirty_tracker: DirtyTracker::new(0, 0),
