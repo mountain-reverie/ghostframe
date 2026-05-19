@@ -2,6 +2,10 @@
 .worktrees/
 Cargo.lock.bak
 
+# Stray build artifacts and session-recording leftovers
+*.rlib
+tmux-client-*.log
+
 # Node / web client build output
 node_modules/
 ghostframe-web-client/dist/

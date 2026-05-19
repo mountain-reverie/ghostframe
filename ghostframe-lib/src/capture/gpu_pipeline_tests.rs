@@ -341,9 +341,9 @@ fn process_frame_returns_tile_analysis_for_solid_red() {
     };
 
     unsafe {
-        // First frame: tile_analysis now runs even without a prev_image,
-        // so the slice must be populated. This is the M3.2c fix that
-        // unblocks static-content classification (solid/PalRLE).
+        // First frame: tile_analysis runs even without a prev_image,
+        // so the slice must be populated — unblocks static-content
+        // classification (solid/PalRLE).
         let fd1 = make_memfd(width, height, pixel);
         let first = match processor.process_frame(fd1, width, height, stride) {
             Ok(a) => a,
@@ -356,7 +356,7 @@ fn process_frame_returns_tile_analysis_for_solid_red() {
         libc::close(fd1);
         assert!(
             !first.tile_analysis.is_null(),
-            "first-frame analysis must be populated (M3.2c fix)"
+            "first-frame analysis must be populated"
         );
         assert_eq!(first.tile_analysis_len, 1);
         let first_slice = first.tile_analysis_slice();
@@ -458,7 +458,7 @@ fn process_frame_tile_analysis_checkerboard() {
         libc::close(fd1);
         assert!(
             !first.tile_analysis.is_null(),
-            "first-frame analysis must be populated (M3.2c fix)"
+            "first-frame analysis must be populated"
         );
         assert_eq!(first.tile_analysis_len, 1);
 
@@ -581,7 +581,7 @@ fn process_frame_tile_analysis_overflow_at_17_colors() {
         libc::close(fd1);
         assert!(
             !first.tile_analysis.is_null(),
-            "first-frame analysis must be populated (M3.2c fix)"
+            "first-frame analysis must be populated"
         );
         assert_eq!(first.tile_analysis_len, 1);
 
@@ -676,7 +676,7 @@ fn process_frame_tile_analysis_frame_edge_denominator() {
         libc::close(fd1);
         assert!(
             !first.tile_analysis.is_null(),
-            "first-frame analysis must be populated (M3.2c fix)"
+            "first-frame analysis must be populated"
         );
         assert_eq!(first.tile_analysis_len, 4, "40x40 → 2x2 tile grid");
 
@@ -742,7 +742,7 @@ fn process_frame_tile_analysis_xor_mask_handles_zero_bgra() {
         libc::close(fd1);
         assert!(
             !first.tile_analysis.is_null(),
-            "first-frame analysis must be populated (M3.2c fix)"
+            "first-frame analysis must be populated"
         );
         assert_eq!(first.tile_analysis_len, 1);
 
@@ -862,7 +862,7 @@ fn process_frame_tile_analysis_multi_tile_independence() {
         libc::close(fd1);
         assert!(
             !first.tile_analysis.is_null(),
-            "first-frame analysis must be populated (M3.2c fix)"
+            "first-frame analysis must be populated"
         );
         assert_eq!(first.tile_analysis_len, 4);
 
@@ -971,7 +971,7 @@ fn tile_analysis_colors_are_canonical_sorted() {
         libc::close(fd1);
         assert!(
             !first.tile_analysis.is_null(),
-            "first-frame analysis must be populated (M3.2c fix)"
+            "first-frame analysis must be populated"
         );
         assert_eq!(first.tile_analysis_len, 2, "64x32 frame → 2 tiles");
 
@@ -1060,7 +1060,7 @@ fn process_frame_returns_palrle_compact_list_for_text_tiles() {
         };
         libc::close(fd_seed);
         // First frame: tile_analysis and compact_list are both populated
-        // (Task 6.D fix). The seed frame is all-black: 3 tiles each with
+        //. The seed frame is all-black: 3 tiles each with
         // count=1 (solid black), all PalRLE-feasible.
         assert!(
             !first.tile_analysis.is_null(),
@@ -1069,7 +1069,7 @@ fn process_frame_returns_palrle_compact_list_for_text_tiles() {
         assert_eq!(first.tile_analysis_len, 3, "96x32 → 3 tiles");
         assert!(
             !first.palrle_compact_list.is_null(),
-            "first-frame compact list is now populated (Task 6.D fix)"
+            "first-frame compact list is now populated"
         );
 
         // --- Build the real frame ---
@@ -1214,10 +1214,10 @@ fn process_frame_dedups_identical_palettes_within_frame() {
             }
         };
         libc::close(fd_seed);
-        // First frame: frame_palette_set is now populated (Task 6.D fix).
+        // First frame: frame_palette_set is now populated.
         assert!(
             !first.frame_palette_set.is_null(),
-            "first-frame frame_palette_set is now populated (Task 6.D fix)"
+            "first-frame frame_palette_set is now populated"
         );
 
         // --- Real frame: 4 tiles (32x32 each), each with identical 2-color
@@ -1339,10 +1339,10 @@ fn process_frame_folds_subset_palette() {
             }
         };
         libc::close(fd_seed);
-        // First frame: folded_into is now populated (Task 6.D fix).
+        // First frame: folded_into is now populated.
         assert!(
             !first.folded_into.is_null(),
-            "first-frame folded_into is now populated (Task 6.D fix)"
+            "first-frame folded_into is now populated"
         );
 
         // Real frame:
@@ -1492,10 +1492,10 @@ fn process_frame_emits_correct_indices_for_two_color_tile() {
             }
         };
         libc::close(fd_seed);
-        // First frame: index_buffer is now populated (Task 6.D fix).
+        // First frame: index_buffer is now populated.
         assert!(
             !first.index_buffer.is_null(),
-            "first-frame index_buffer is now populated (Task 6.D fix)"
+            "first-frame index_buffer is now populated"
         );
 
         // Real frame: top half black (y<16), bottom half white (y>=16).
