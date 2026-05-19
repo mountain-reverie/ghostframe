@@ -2014,30 +2014,37 @@ async fn e2e_ack_loss() -> Result<()> {
 }
 
 
-/// M3.2b: verifies the client emits a HELLO (msg_type 0x03) immediately
-/// after `await transport.ready`, and that the server parses it via the
-/// new `dispatch_feedback_bytes` path and applies `indices_raw_enabled`.
+/// M3.2b/B2: HELLO + caps + wire-level indices_raw emission.
 ///
-/// Scraping `docker logs ghostframe-server` is the cheapest assertion
-/// path: `apply_hello` emits `HELLO received, client capabilities updated
-/// indices_raw=true` at INFO level. If both substrings appear, the
-/// HELLO message arrived, was parsed, and updated the per-bridge caps.
+/// Three assertions land in one test:
+///   1. The client sends HELLO immediately after `transport.ready` — verified
+///      by "HELLO received" tracing line in server logs.
+///   2. The server's `dispatch_feedback_bytes` → `apply_hello` path updates
+///      per-bridge `caps.indices_raw_enabled` — verified by "indices_raw=true"
+///      in server logs.
+///   3. At least one PalRle wire payload received by the client has flags
+///      bit 1 set (indices_raw, 0x02) — verified by reading back
+///      `window.__ghostframeRecordedFlags` from the client.
 ///
-/// The companion "indices_raw emitted" assertion (that PalRle thin tiles
-/// flip to the new wire variant) is deferred to M3.2c — it requires the
-/// test-pattern → Xorg-on-VKMS → modesetting-FB capture path to produce
-/// PalRle-feasible content, which it currently does not. See the
-/// `project_m32c_deferred` memory note.
+/// Closes the M3.2c B2 deferral (originally blocked on a PalRle-emitting
+/// test pattern + the latent on_session_reset / LRU bugs, all fixed by
+/// 2026-05-18). Uses `--solid-per-tile --drm-direct`: motion region's
+/// 2-color flip emits bundled palette in the first frame for each color,
+/// the client ACKs, server marks delivered=true, and subsequent dirty
+/// frames for the same palette emit thin+indices_raw (flags=0x02).
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_indices_raw_handshake() -> Result<()> {
-    let _setup = setup_e2e_webgpu("--solid-red").await?;
+    let setup = setup_e2e_webgpu_gpu("--solid-per-tile --drm-direct").await?;
 
-    // Allow time for: page load -> WebGPU init -> WebTransport.ready ->
-    // feedback bidi stream open -> HELLO write -> server parse.
+    // Allow time for: page load → WebGPU init → WebTransport.ready →
+    // HELLO write → server parse → first PalRle bundled emission →
+    // client ACK → server delivered=true → subsequent dirty pass emits
+    // thin + indices_raw. 5s comfortably covers QUIC slow-start + the
+    // initial H264-startup phase + several 2-color flip cycles.
     tokio::time::sleep(Duration::from_secs(5)).await;
 
+    // Assertions 1 + 2: HELLO arrived and caps were applied.
     let logs = helpers::read_server_logs_stripped("ghostframe-server");
-
     assert!(
         logs.contains("HELLO received"),
         "expected 'HELLO received' tracing line in server logs; got:\n{logs}"
@@ -2045,6 +2052,19 @@ async fn e2e_indices_raw_handshake() -> Result<()> {
     assert!(
         logs.contains("indices_raw=true"),
         "expected 'indices_raw=true' in server logs (caps payload); got:\n{logs}"
+    );
+
+    // Assertion 3 (B2): at least one PalRle wire payload had the
+    // indices_raw flag (bit 1) set.
+    let flags: Vec<u8> = setup
+        .page
+        .evaluate("window.__ghostframeRecordedFlags || []")
+        .await?
+        .into_value()?;
+    assert!(
+        flags.iter().any(|&f| (f & 0x02) != 0),
+        "expected at least one PalRle tile with indices_raw flag (bit 1) set; got: {:?}",
+        flags
     );
 
     Ok(())
