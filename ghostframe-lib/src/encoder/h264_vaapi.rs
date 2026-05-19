@@ -355,6 +355,20 @@ pub struct FullFrameEncoded {
     pub is_keyframe: bool,
 }
 
+/// Inputs that describe one DMA-BUF-backed frame to be encoded.
+///
+/// Threaded through `encode_vaapi` → `try_drm_prime_import` / `mmap_scale_upload`
+/// and `encode_sw` so the source-buffer description and per-frame metadata
+/// travel as one value.
+struct DmabufFrameInputs {
+    fd: RawFd,
+    width: u32,
+    height: u32,
+    stride: u32,
+    pts: i64,
+    force_idr: bool,
+}
+
 /// I-frame interval: one IDR + 10 P-frames = ~6 keyframes/sec at 60 fps.
 const FULL_FRAME_GOP: u32 = 11;
 
@@ -598,10 +612,19 @@ impl FullFrameEncoder {
         let force_idr = pts % FULL_FRAME_GOP as i64 == 0 || self.keyframe_pending;
         self.keyframe_pending = false;
 
+        let input = DmabufFrameInputs {
+            fd,
+            width,
+            height,
+            stride,
+            pts,
+            force_idr,
+        };
+
         if self.use_vaapi {
-            self.encode_vaapi(fd, width, height, stride, pts, force_idr)
+            self.encode_vaapi(&input)
         } else {
-            self.encode_sw(fd, width, height, stride, pts, force_idr)
+            self.encode_sw(&input)
         }
     }
 
@@ -701,12 +724,7 @@ impl FullFrameEncoder {
 
     fn encode_vaapi(
         &mut self,
-        fd: RawFd,
-        width: u32,
-        height: u32,
-        stride: u32,
-        pts: i64,
-        force_idr: bool,
+        input: &DmabufFrameInputs,
     ) -> Result<Option<FullFrameEncoded>, ffmpeg::Error> {
         unsafe {
             let hw_frames_ref = self
@@ -716,15 +734,7 @@ impl FullFrameEncoder {
 
             // Try zero-copy DMA-BUF import via DRM PRIME → av_hwframe_map().
             // This avoids any CPU pixel access — the DMA-BUF stays on the GPU.
-            let hw_frame = match Self::try_drm_prime_import(
-                hw_frames_ref.0,
-                fd,
-                width,
-                height,
-                stride,
-                pts,
-                force_idr,
-            ) {
+            let hw_frame = match Self::try_drm_prime_import(hw_frames_ref.0, input) {
                 Ok(frame) => frame,
                 Err(_) => {
                     // Fall back to mmap + CPU scale + upload for non-GPU-local
@@ -732,17 +742,7 @@ impl FullFrameEncoder {
                     // NOTE: This fallback will fail for real GPU DMA-BUFs
                     // (device VRAM can't be mmap'd). A VPP BGRA→NV12 pipeline
                     // is needed for true zero-copy encode — tracked as a gap.
-                    Self::mmap_scale_upload(
-                        hw_frames_ref.0,
-                        fd,
-                        width,
-                        height,
-                        stride,
-                        self.enc_w,
-                        self.enc_h,
-                        pts,
-                        force_idr,
-                    )?
+                    Self::mmap_scale_upload(hw_frames_ref.0, input, self.enc_w, self.enc_h)?
                 }
             };
 
@@ -760,17 +760,13 @@ impl FullFrameEncoder {
     /// Color conversion (XRGB8888→NV12) happens on the GPU via VPP.
     unsafe fn try_drm_prime_import(
         hw_frames_ctx: *mut ffi::AVBufferRef,
-        fd: RawFd,
-        width: u32,
-        height: u32,
-        stride: u32,
-        pts: i64,
-        force_idr: bool,
+        input: &DmabufFrameInputs,
     ) -> Result<frame::Video, ffmpeg::Error> {
         // DRM_FORMAT_XRGB8888 = fourcc('X','R','2','4')
         const DRM_FORMAT_XRGB8888: u32 = 0x34325258;
         const DRM_FORMAT_MOD_INVALID: u64 = 0x00ffffffffffffff;
 
+        let &DmabufFrameInputs { fd, width, height, stride, pts, force_idr } = input;
         let buf_size = (height as usize) * (stride as usize);
 
         // Build the DRM frame descriptor. Box keeps it stable in memory.
@@ -830,18 +826,13 @@ impl FullFrameEncoder {
     }
 
     /// Fallback: mmap the fd, scale BGRA→NV12 on CPU, upload to VA-API surface.
-    #[allow(clippy::too_many_arguments)]
     unsafe fn mmap_scale_upload(
         hw_frames_ctx: *mut ffi::AVBufferRef,
-        fd: RawFd,
-        width: u32,
-        height: u32,
-        stride: u32,
+        input: &DmabufFrameInputs,
         enc_w: u32,
         enc_h: u32,
-        pts: i64,
-        force_idr: bool,
     ) -> Result<frame::Video, ffmpeg::Error> {
+        let &DmabufFrameInputs { fd, width, height, stride, pts, force_idr } = input;
         let buf_size = (height * stride) as usize;
         let ptr = libc::mmap(
             ptr::null_mut(),
@@ -899,13 +890,9 @@ impl FullFrameEncoder {
 
     fn encode_sw(
         &mut self,
-        fd: RawFd,
-        width: u32,
-        height: u32,
-        stride: u32,
-        pts: i64,
-        force_idr: bool,
+        input: &DmabufFrameInputs,
     ) -> Result<Option<FullFrameEncoded>, ffmpeg::Error> {
+        let &DmabufFrameInputs { fd, width, height, stride, pts, force_idr } = input;
         let buf_size = (height * stride) as usize;
 
         unsafe {
