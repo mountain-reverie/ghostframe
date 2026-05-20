@@ -135,8 +135,12 @@ export class WebGpuRenderer {
     }
     this.videoFramesToClose = [];
 
-    // Clear queued-but-not-yet-drawn H.264 tiles so stale frames from a
-    // previous session don't bleed into the first rAF of the next one.
+    // Close queued-but-not-yet-drawn H.264 tile frames so their backing
+    // resources are released promptly, then clear the queue so stale frames
+    // from a previous session don't bleed into the first rAF of the next.
+    for (const h of this.h264Queue) {
+      try { h.frame.close(); } catch { /* already closed — safe to swallow */ }
+    }
     this.h264Queue.length = 0;
 
     const zeros = new Uint8Array(16 * 1024);
