@@ -36,6 +36,58 @@ const TILE_H: u32 = 32;
 
 /// Candidate encoding resolutions to try when the tile size is below the
 /// hardware minimum. Sorted ascending; the first one that succeeds wins.
+/// Mmap a BGRA framebuffer from a file descriptor and copy it into an owned
+/// `frame::Video`. The mmap is released before this function returns; the
+/// returned frame owns its own buffer.
+///
+/// Shared by the VAAPI mmap fallback path (`mmap_scale_upload`) and the
+/// software encode path (`encode_sw`) — both of these need to lift BGRA pixels
+/// off a DMA-BUF / memfd into an FFmpeg frame before handing the frame to a
+/// scaler with a stage-specific destination format (NV12 for VAAPI, YUV420P
+/// for libx264). A stride mismatch between source and destination at the
+/// copy loop has historically been the most subtle bug class here; centralising
+/// the copy keeps both call sites in lockstep.
+///
+/// # Safety
+///
+/// Caller must ensure `fd` is a valid file descriptor backing at least
+/// `height * stride` bytes of readable memory.
+unsafe fn mmap_bgra_frame(
+    fd: RawFd,
+    width: u32,
+    height: u32,
+    stride: u32,
+) -> Result<frame::Video, ffmpeg::Error> {
+    let buf_size = (height * stride) as usize;
+    let ptr = libc::mmap(
+        ptr::null_mut(),
+        buf_size,
+        libc::PROT_READ,
+        libc::MAP_SHARED,
+        fd,
+        0,
+    );
+    if ptr == libc::MAP_FAILED {
+        return Err(ffmpeg::Error::InvalidData);
+    }
+
+    let mut bgra_frame = frame::Video::new(Pixel::BGRA, width, height);
+    {
+        let frame_stride = bgra_frame.stride(0);
+        let plane = bgra_frame.data_mut(0);
+        let src_bytes = std::slice::from_raw_parts(ptr as *const u8, buf_size);
+        for y in 0..height as usize {
+            let src_row =
+                &src_bytes[y * stride as usize..y * stride as usize + width as usize * 4];
+            let dst_off = y * frame_stride;
+            plane[dst_off..dst_off + width as usize * 4].copy_from_slice(src_row);
+        }
+    }
+
+    libc::munmap(ptr, buf_size);
+    Ok(bgra_frame)
+}
+
 const VAAPI_CANDIDATE_SIZES: &[(u32, u32)] = &[
     (TILE_W, TILE_H), // try native size first
     (128, 128),       // common AMD minimum
@@ -833,18 +885,8 @@ impl FullFrameEncoder {
         enc_h: u32,
     ) -> Result<frame::Video, ffmpeg::Error> {
         let &DmabufFrameInputs { fd, width, height, stride, pts, force_idr } = input;
-        let buf_size = (height * stride) as usize;
-        let ptr = libc::mmap(
-            ptr::null_mut(),
-            buf_size,
-            libc::PROT_READ,
-            libc::MAP_SHARED,
-            fd,
-            0,
-        );
-        if ptr == libc::MAP_FAILED {
-            return Err(ffmpeg::Error::InvalidData);
-        }
+
+        let bgra_frame = mmap_bgra_frame(fd, width, height, stride)?;
 
         let mut scaler = scaling::Context::get(
             Pixel::BGRA,
@@ -856,23 +898,8 @@ impl FullFrameEncoder {
             scaling::Flags::FAST_BILINEAR,
         )?;
 
-        let mut bgra_frame = frame::Video::new(Pixel::BGRA, width, height);
-        {
-            let frame_stride = bgra_frame.stride(0);
-            let plane = bgra_frame.data_mut(0);
-            let src_bytes = std::slice::from_raw_parts(ptr as *const u8, buf_size);
-            for y in 0..height as usize {
-                let src_row =
-                    &src_bytes[y * stride as usize..y * stride as usize + width as usize * 4];
-                let dst_off = y * frame_stride;
-                plane[dst_off..dst_off + width as usize * 4].copy_from_slice(src_row);
-            }
-        }
-
         let mut nv12_frame = frame::Video::empty();
-        let scale_result = scaler.run(&bgra_frame, &mut nv12_frame);
-        libc::munmap(ptr, buf_size);
-        scale_result?;
+        scaler.run(&bgra_frame, &mut nv12_frame)?;
 
         let mut hw = vaapi_device::upload_to_hw_surface(hw_frames_ctx, &nv12_frame)?;
         hw.set_pts(Some(pts));
@@ -893,36 +920,9 @@ impl FullFrameEncoder {
         input: &DmabufFrameInputs,
     ) -> Result<Option<FullFrameEncoded>, ffmpeg::Error> {
         let &DmabufFrameInputs { fd, width, height, stride, pts, force_idr } = input;
-        let buf_size = (height * stride) as usize;
 
         unsafe {
-            let ptr = libc::mmap(
-                ptr::null_mut(),
-                buf_size,
-                libc::PROT_READ,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            );
-            if ptr == libc::MAP_FAILED {
-                return Err(ffmpeg::Error::InvalidData);
-            }
-
-            // Build BGRA frame from mmap.
-            let mut bgra_frame = frame::Video::new(Pixel::BGRA, width, height);
-            {
-                let frame_stride = bgra_frame.stride(0);
-                let plane = bgra_frame.data_mut(0);
-                let src_bytes = std::slice::from_raw_parts(ptr as *const u8, buf_size);
-                for y in 0..height as usize {
-                    let src_row =
-                        &src_bytes[y * stride as usize..y * stride as usize + width as usize * 4];
-                    let dst_off = y * frame_stride;
-                    plane[dst_off..dst_off + width as usize * 4].copy_from_slice(src_row);
-                }
-            }
-
-            libc::munmap(ptr, buf_size);
+            let bgra_frame = mmap_bgra_frame(fd, width, height, stride)?;
 
             // Scale BGRA → YUV420P. The scaler is lazily created on first
             // use so it always matches the actual input pixel format
