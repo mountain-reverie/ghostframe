@@ -281,17 +281,7 @@ impl GpuFrameProcessor {
         // subsequent `?` early-exit frees the sets back to the bounded pool.
         // Note: SAD descriptor set is allocated inside run_sad_stage (called below).
         // Note: NV12 descriptor set is allocated inside run_nv12_stage (called below).
-
-        let analysis_set_layouts = [self.analysis_descriptor_set_layout];
-        let analysis_ds_alloc = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(&analysis_set_layouts);
-        let analysis_ds_guard = ScopedDescriptorSets {
-            device: &self.device,
-            pool: self.descriptor_pool,
-            sets: self.device.allocate_descriptor_sets(&analysis_ds_alloc)?,
-        };
-        let analysis_ds = analysis_ds_guard.sets[0];
+        // Note: analysis descriptor set is allocated inside run_analysis_stage (called below).
 
         let palrle_compact_set_layouts = [self.palrle_compact_descriptor_set_layout];
         let palrle_compact_ds_alloc = vk::DescriptorSetAllocateInfo::default()
@@ -367,28 +357,6 @@ impl GpuFrameProcessor {
             sets: self.device.allocate_descriptor_sets(&pal_rle_index_ds_alloc)?,
         };
         let pal_rle_index_descriptor_set = pal_rle_index_ds_guard.sets[0];
-
-        // Write Analysis descriptor set.
-        let analysis_image_info = [vk::DescriptorImageInfo::default()
-            .image_view(current.view)
-            .image_layout(vk::ImageLayout::GENERAL)];
-        let analysis_buffer_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.analysis_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let analysis_writes = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(analysis_ds)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                .image_info(&analysis_image_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(analysis_ds)
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&analysis_buffer_info),
-        ];
-        self.device.update_descriptor_sets(&analysis_writes, &[]);
 
         // Write palrle_compact descriptor set.
         // binding 0: sad_buffer (read-only in shader)
@@ -723,29 +691,13 @@ impl GpuFrameProcessor {
         // 4b. Analysis dispatch. No barrier needed vs SAD/NV12 — all read
         // current_frame read-only and write to disjoint buffers; the final
         // HOST-readback barrier covers all three output buffers.
-        self.device
-            .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.analysis_pipeline);
-        self.device.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.analysis_pipeline_layout,
-            0,
-            &[analysis_ds],
-            &[],
-        );
         let analysis_push: [u32; 3] = [width, height, cols];
-        let analysis_push_bytes = std::slice::from_raw_parts(
-            analysis_push.as_ptr() as *const u8,
-            std::mem::size_of_val(&analysis_push),
-        );
-        self.device.cmd_push_constants(
+        let analysis_ds_guard = self.run_analysis_stage(
             cmd,
-            self.analysis_pipeline_layout,
-            vk::ShaderStageFlags::COMPUTE,
-            0,
-            analysis_push_bytes,
-        );
-        self.device.cmd_dispatch(cmd, cols, rows, 1);
+            current.view,
+            &analysis_push,
+            (cols, rows, 1),
+        )?;
 
         // Inter-dispatch barrier: SAD + tile_analysis writes must be visible to Stage 1.5a reads.
         let buf_barrier_inputs = [
@@ -1360,10 +1312,10 @@ impl GpuFrameProcessor {
         // 8. Per-frame transients (descriptor sets, command buffer, fence) are
         //    freed when their RAII guards drop at end of scope. We touch the
         //    guards here to keep them alive past the `wait_for_fences` above.
-        //    sad_ds_guard and nv12_ds_guard are dropped explicitly before step 9
-        //    to release the immutable borrows on self (both are returned from
-        //    helper methods whose lifetimes are tied to &self) before the mutable
-        //    self.prev_image borrow.
+        //    sad_ds_guard, nv12_ds_guard and analysis_ds_guard are dropped
+        //    explicitly before step 9 to release the immutable borrows on self
+        //    (all are returned from helper methods whose lifetimes are tied to
+        //    &self) before the mutable self.prev_image borrow.
         //    GPU-safety: these drops must NOT move above the `wait_for_fences` at
         //    step 6 — releasing descriptor sets while the GPU is still using them
         //    is undefined behaviour (use-after-free in the descriptor pool).
@@ -1381,6 +1333,7 @@ impl GpuFrameProcessor {
         );
         drop(sad_ds_guard);
         drop(nv12_ds_guard);
+        drop(analysis_ds_guard);
 
         // 9. prev_image is persistent (own-allocated, layout still GENERAL
         // after the post-copy barrier). It now holds a snapshot of THIS frame
@@ -1441,39 +1394,7 @@ impl GpuFrameProcessor {
             uv_stride: nv12_uv_stride,
         } = nv12;
         // Note: NV12 descriptor set is allocated inside run_nv12_stage (called below).
-
-        // Allocate Analysis descriptor set, also RAII-guarded.
-        let analysis_set_layouts = [self.analysis_descriptor_set_layout];
-        let analysis_ds_alloc = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(&analysis_set_layouts);
-        let analysis_ds_guard = ScopedDescriptorSets {
-            device: &self.device,
-            pool: self.descriptor_pool,
-            sets: self.device.allocate_descriptor_sets(&analysis_ds_alloc)?,
-        };
-        let analysis_ds = analysis_ds_guard.sets[0];
-
-        let analysis_image_info = [vk::DescriptorImageInfo::default()
-            .image_view(current.view)
-            .image_layout(vk::ImageLayout::GENERAL)];
-        let analysis_buffer_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.analysis_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let analysis_writes = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(analysis_ds)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                .image_info(&analysis_image_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(analysis_ds)
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&analysis_buffer_info),
-        ];
-        self.device.update_descriptor_sets(&analysis_writes, &[]);
+        // Note: analysis descriptor set is allocated inside run_analysis_stage (called below).
 
         // Allocate descriptor sets for Stages 1.5-3 (all RAII-guarded).
         let palrle_compact_set_layouts = [self.palrle_compact_descriptor_set_layout];
@@ -1824,29 +1745,13 @@ impl GpuFrameProcessor {
         // COMPUTE→HOST buffer barrier below covers both writes. This mirrors
         // the subsequent-frames branch comment at the SAD/NV12/Analysis
         // dispatch trio.
-        self.device
-            .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.analysis_pipeline);
-        self.device.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.analysis_pipeline_layout,
-            0,
-            &[analysis_ds],
-            &[],
-        );
         let analysis_push: [u32; 3] = [width, height, cols];
-        let analysis_push_bytes = std::slice::from_raw_parts(
-            analysis_push.as_ptr() as *const u8,
-            std::mem::size_of_val(&analysis_push),
-        );
-        self.device.cmd_push_constants(
+        let analysis_ds_guard = self.run_analysis_stage(
             cmd,
-            self.analysis_pipeline_layout,
-            vk::ShaderStageFlags::COMPUTE,
-            0,
-            analysis_push_bytes,
-        );
-        self.device.cmd_dispatch(cmd, cols, rows, 1);
+            current.view,
+            &analysis_push,
+            (cols, rows, 1),
+        )?;
 
         // ============================================================
         // Stages 1.5–3: PalRle compact, indirect args, palette fold,
@@ -2825,6 +2730,96 @@ impl GpuFrameProcessor {
         self.device.cmd_push_constants(
             cmd,
             self.nv12_pipeline_layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            push_bytes,
+        );
+        self.device
+            .cmd_dispatch(cmd, workgroups.0, workgroups.1, workgroups.2);
+
+        Ok(guard)
+    }
+
+    /// Per-tile color analysis compute dispatch.
+    ///
+    /// Reads the current frame image (binding 0, STORAGE_IMAGE), writes
+    /// per-tile `TileAnalysis` entries to the analysis buffer (binding 1,
+    /// STORAGE_BUFFER). Push constants are `[width, height, cols]` (12 bytes).
+    ///
+    /// Caller must invoke `cmd_pipeline_barrier` AFTER this call to make
+    /// the analysis buffer visible to downstream stages (palrle_compact /
+    /// palette_fold) or to the host (HOST_READ on the persistent mapped
+    /// pointer).
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure: `cmd` is recording; `current_view` is in GENERAL
+    /// layout; workgroup count is `(cols, rows, 1)` (one workgroup per
+    /// tile); and the returned guard is held alive until `wait_for_fences`
+    /// returns for the command buffer (dropping it earlier returns the
+    /// descriptor set to the pool while the GPU is still using it).
+    unsafe fn run_analysis_stage<'a>(
+        &'a self,
+        cmd: vk::CommandBuffer,
+        current_view: vk::ImageView,
+        push_constants: &[u32],
+        workgroups: (u32, u32, u32),
+    ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
+        // Allocate one descriptor set from the pool. The returned guard frees
+        // it on drop, ensuring the bounded pool doesn't leak on early-exit.
+        let analysis_set_layouts = [self.analysis_descriptor_set_layout];
+        let analysis_ds_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(&analysis_set_layouts);
+        let guard = ScopedDescriptorSets {
+            device: &self.device,
+            pool: self.descriptor_pool,
+            sets: self.device.allocate_descriptor_sets(&analysis_ds_alloc)?,
+        };
+        let analysis_ds = guard.sets[0];
+
+        // Write the two analysis descriptors:
+        //   binding 0 — current frame image   (STORAGE_IMAGE,  read)
+        //   binding 1 — analysis output buffer (STORAGE_BUFFER, write)
+        let analysis_image_info = [vk::DescriptorImageInfo::default()
+            .image_view(current_view)
+            .image_layout(vk::ImageLayout::GENERAL)];
+        let analysis_buffer_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.analysis_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let analysis_writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(analysis_ds)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(&analysis_image_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(analysis_ds)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&analysis_buffer_info),
+        ];
+        self.device.update_descriptor_sets(&analysis_writes, &[]);
+
+        // Bind + push + dispatch.
+        self.device
+            .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.analysis_pipeline);
+        self.device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.analysis_pipeline_layout,
+            0,
+            &[analysis_ds],
+            &[],
+        );
+        let push_bytes = std::slice::from_raw_parts(
+            push_constants.as_ptr() as *const u8,
+            std::mem::size_of_val(push_constants),
+        );
+        self.device.cmd_push_constants(
+            cmd,
+            self.analysis_pipeline_layout,
             vk::ShaderStageFlags::COMPUTE,
             0,
             push_bytes,
