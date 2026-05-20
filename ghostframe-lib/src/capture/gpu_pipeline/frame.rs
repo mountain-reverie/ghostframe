@@ -280,17 +280,7 @@ impl GpuFrameProcessor {
         // Allocate descriptor sets for both passes. Wrap in RAII guards so any
         // subsequent `?` early-exit frees the sets back to the bounded pool.
         // Note: SAD descriptor set is allocated inside run_sad_stage (called below).
-
-        let nv12_set_layouts = [self.nv12_descriptor_set_layout];
-        let nv12_ds_alloc = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(&nv12_set_layouts);
-        let nv12_ds_guard = ScopedDescriptorSets {
-            device: &self.device,
-            pool: self.descriptor_pool,
-            sets: self.device.allocate_descriptor_sets(&nv12_ds_alloc)?,
-        };
-        let nv12_ds = nv12_ds_guard.sets[0];
+        // Note: NV12 descriptor set is allocated inside run_nv12_stage (called below).
 
         let analysis_set_layouts = [self.analysis_descriptor_set_layout];
         let analysis_ds_alloc = vk::DescriptorSetAllocateInfo::default()
@@ -377,28 +367,6 @@ impl GpuFrameProcessor {
             sets: self.device.allocate_descriptor_sets(&pal_rle_index_ds_alloc)?,
         };
         let pal_rle_index_descriptor_set = pal_rle_index_ds_guard.sets[0];
-
-        // Write NV12 descriptor set.
-        let nv12_image_info = [vk::DescriptorImageInfo::default()
-            .image_view(current.view)
-            .image_layout(vk::ImageLayout::GENERAL)];
-        let nv12_buffer_info = [vk::DescriptorBufferInfo::default()
-            .buffer(nv12_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let nv12_writes = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(nv12_ds)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                .image_info(&nv12_image_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(nv12_ds)
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&nv12_buffer_info),
-        ];
-        self.device.update_descriptor_sets(&nv12_writes, &[]);
 
         // Write Analysis descriptor set.
         let analysis_image_info = [vk::DescriptorImageInfo::default()
@@ -743,34 +711,14 @@ impl GpuFrameProcessor {
         //    The HOST-readback barrier at step 5 covers both buffers.
 
         // 4. NV12 dispatch
-        self.device
-            .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.nv12_pipeline);
-        self.device.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.nv12_pipeline_layout,
-            0,
-            &[nv12_ds],
-            &[],
-        );
-        // Push constants: width, height, y_stride, uv_offset, uv_stride (5 x u32 = 20 bytes)
         let nv12_push: [u32; 5] = [width, height, nv12_y_stride, nv12_uv_offset, nv12_uv_stride];
-        let nv12_push_bytes = std::slice::from_raw_parts(
-            nv12_push.as_ptr() as *const u8,
-            std::mem::size_of_val(&nv12_push),
-        );
-        self.device.cmd_push_constants(
+        let nv12_ds_guard = self.run_nv12_stage(
             cmd,
-            self.nv12_pipeline_layout,
-            vk::ShaderStageFlags::COMPUTE,
-            0,
-            nv12_push_bytes,
-        );
-        // NV12 shader: workgroup = 2x2 pixels, dispatch = (width/2, height/2, 1)
-        let nv12_groups_x = width.div_ceil(2);
-        let nv12_groups_y = height.div_ceil(2);
-        self.device
-            .cmd_dispatch(cmd, nv12_groups_x, nv12_groups_y, 1);
+            current.view,
+            nv12_buffer,
+            &nv12_push,
+            (width.div_ceil(2), height.div_ceil(2), 1),
+        )?;
 
         // 4b. Analysis dispatch. No barrier needed vs SAD/NV12 — all read
         // current_frame read-only and write to disjoint buffers; the final
@@ -1412,12 +1360,13 @@ impl GpuFrameProcessor {
         // 8. Per-frame transients (descriptor sets, command buffer, fence) are
         //    freed when their RAII guards drop at end of scope. We touch the
         //    guards here to keep them alive past the `wait_for_fences` above.
-        //    sad_ds_guard is dropped explicitly before step 9 to release the
-        //    immutable borrow on self (it is returned from run_sad_stage, whose
-        //    lifetime is tied to &self) before the mutable self.prev_image borrow.
-        //    GPU-safety: this drop must NOT move above the `wait_for_fences` at
-        //    step 6 — releasing the descriptor set while the GPU is still using
-        //    it is undefined behaviour (use-after-free in the descriptor pool).
+        //    sad_ds_guard and nv12_ds_guard are dropped explicitly before step 9
+        //    to release the immutable borrows on self (both are returned from
+        //    helper methods whose lifetimes are tied to &self) before the mutable
+        //    self.prev_image borrow.
+        //    GPU-safety: these drops must NOT move above the `wait_for_fences` at
+        //    step 6 — releasing descriptor sets while the GPU is still using them
+        //    is undefined behaviour (use-after-free in the descriptor pool).
         let _ = (
             &nv12_ds_guard,
             &analysis_ds_guard,
@@ -1431,6 +1380,7 @@ impl GpuFrameProcessor {
             &fence_guard,
         );
         drop(sad_ds_guard);
+        drop(nv12_ds_guard);
 
         // 9. prev_image is persistent (own-allocated, layout still GENERAL
         // after the post-copy barrier). It now holds a snapshot of THIS frame
@@ -1490,39 +1440,7 @@ impl GpuFrameProcessor {
             uv_offset: nv12_uv_offset,
             uv_stride: nv12_uv_stride,
         } = nv12;
-        // Allocate NV12 descriptor set, RAII-guarded so any subsequent `?`
-        // early-exit returns the set to the bounded pool.
-        let nv12_set_layouts = [self.nv12_descriptor_set_layout];
-        let nv12_ds_alloc = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(&nv12_set_layouts);
-        let nv12_ds_guard = ScopedDescriptorSets {
-            device: &self.device,
-            pool: self.descriptor_pool,
-            sets: self.device.allocate_descriptor_sets(&nv12_ds_alloc)?,
-        };
-        let nv12_ds = nv12_ds_guard.sets[0];
-
-        let nv12_image_info = [vk::DescriptorImageInfo::default()
-            .image_view(current.view)
-            .image_layout(vk::ImageLayout::GENERAL)];
-        let nv12_buf_info = [vk::DescriptorBufferInfo::default()
-            .buffer(nv12_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let nv12_writes = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(nv12_ds)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                .image_info(&nv12_image_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(nv12_ds)
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&nv12_buf_info),
-        ];
-        self.device.update_descriptor_sets(&nv12_writes, &[]);
+        // Note: NV12 descriptor set is allocated inside run_nv12_stage (called below).
 
         // Allocate Analysis descriptor set, also RAII-guarded.
         let analysis_set_layouts = [self.analysis_descriptor_set_layout];
@@ -1891,32 +1809,14 @@ impl GpuFrameProcessor {
         );
 
         // NV12 dispatch
-        self.device
-            .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.nv12_pipeline);
-        self.device.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.nv12_pipeline_layout,
-            0,
-            &[nv12_ds],
-            &[],
-        );
         let nv12_push: [u32; 5] = [width, height, nv12_y_stride, nv12_uv_offset, nv12_uv_stride];
-        let nv12_push_bytes = std::slice::from_raw_parts(
-            nv12_push.as_ptr() as *const u8,
-            std::mem::size_of_val(&nv12_push),
-        );
-        self.device.cmd_push_constants(
+        let nv12_ds_guard = self.run_nv12_stage(
             cmd,
-            self.nv12_pipeline_layout,
-            vk::ShaderStageFlags::COMPUTE,
-            0,
-            nv12_push_bytes,
-        );
-        let nv12_groups_x = width.div_ceil(2);
-        let nv12_groups_y = height.div_ceil(2);
-        self.device
-            .cmd_dispatch(cmd, nv12_groups_x, nv12_groups_y, 1);
+            current.view,
+            nv12_buffer,
+            &nv12_push,
+            (width.div_ceil(2), height.div_ceil(2), 1),
+        )?;
 
         // Analysis dispatch. No barrier needed vs NV12 — both read `current`
         // read-only (read-after-read is hazard-free) and write to disjoint
@@ -2830,6 +2730,101 @@ impl GpuFrameProcessor {
         self.device.cmd_push_constants(
             cmd,
             self.pipeline_layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            push_bytes,
+        );
+        self.device
+            .cmd_dispatch(cmd, workgroups.0, workgroups.1, workgroups.2);
+
+        Ok(guard)
+    }
+
+    /// NV12 (BGRA → NV12) compute dispatch.
+    ///
+    /// Reads the current frame image (binding 0, STORAGE_IMAGE), writes
+    /// to the NV12 HOST_VISIBLE output buffer (binding 1, STORAGE_BUFFER).
+    /// Push constants are `[width, height, y_stride, uv_offset, uv_stride]`
+    /// (20 bytes).
+    ///
+    /// Caller must invoke `cmd_pipeline_barrier` AFTER this call to make
+    /// the NV12 buffer's HOST_VISIBLE memory writes visible to the host
+    /// (HOST_READ access for the readback).
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure: `cmd` is currently recording; `current_view` is
+    /// in `vk::ImageLayout::GENERAL`; `nv12_buffer` is bound to memory and
+    /// sized for `width * height + uv_offset + (width * height / 2)` bytes;
+    /// the workgroup count matches the shader's half-resolution NV12
+    /// dispatch shape; and the returned guard is held alive until
+    /// `wait_for_fences` returns for the command buffer (dropping it
+    /// earlier returns the descriptor set to the pool while the GPU is
+    /// still using it).
+    unsafe fn run_nv12_stage<'a>(
+        &'a self,
+        cmd: vk::CommandBuffer,
+        current_view: vk::ImageView,
+        nv12_buffer: vk::Buffer,
+        push_constants: &[u32],
+        workgroups: (u32, u32, u32),
+    ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
+        // Allocate one descriptor set from the pool. The returned guard frees
+        // it on drop, ensuring the bounded pool doesn't leak on early-exit.
+        let nv12_set_layouts = [self.nv12_descriptor_set_layout];
+        let nv12_ds_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(&nv12_set_layouts);
+        let guard = ScopedDescriptorSets {
+            device: &self.device,
+            pool: self.descriptor_pool,
+            sets: self.device.allocate_descriptor_sets(&nv12_ds_alloc)?,
+        };
+        let nv12_ds = guard.sets[0];
+
+        // Write the two NV12 descriptors:
+        //   binding 0 — current frame image  (STORAGE_IMAGE,  read)
+        //   binding 1 — NV12 output buffer   (STORAGE_BUFFER, write)
+        let nv12_image_info = [vk::DescriptorImageInfo::default()
+            .image_view(current_view)
+            .image_layout(vk::ImageLayout::GENERAL)];
+        let nv12_buffer_info = [vk::DescriptorBufferInfo::default()
+            .buffer(nv12_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let nv12_writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(nv12_ds)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(&nv12_image_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(nv12_ds)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&nv12_buffer_info),
+        ];
+        self.device.update_descriptor_sets(&nv12_writes, &[]);
+
+        // Bind + push + dispatch.
+        // NV12 shader: workgroup = 2x2 pixels, dispatch = (width/2, height/2, 1)
+        self.device
+            .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.nv12_pipeline);
+        self.device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.nv12_pipeline_layout,
+            0,
+            &[nv12_ds],
+            &[],
+        );
+        let push_bytes = std::slice::from_raw_parts(
+            push_constants.as_ptr() as *const u8,
+            std::mem::size_of_val(push_constants),
+        );
+        self.device.cmd_push_constants(
+            cmd,
+            self.nv12_pipeline_layout,
             vk::ShaderStageFlags::COMPUTE,
             0,
             push_bytes,
