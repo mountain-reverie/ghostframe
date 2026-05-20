@@ -1,0 +1,32 @@
+[package]
+name = "ghostframe-bench"
+version = "0.1.0"
+edition = "2021"
+
+# Empty library — this crate exists to host benchmarks in `benches/`.
+# criterion and iai-callgrind live here instead of in ghostframe-lib so
+# that `cargo test --lib --package ghostframe-lib` doesn't have to compile
+# them.
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+# Forwarded from ghostframe-lib: enables benches that require real VA-API /
+# Vulkan (skipped on CI without GPU). The bench .rs files gate code on this
+# feature name, so the crate must redeclare it for the cfg attributes to
+# resolve.
+gpu-bench = ["ghostframe-lib/gpu-bench"]
+# Forwarded from ghostframe-lib: codecs not yet implemented. No-op for now;
+# flip on as each codec lands in M3.
+m3 = ["ghostframe-lib/m3"]
+
+[dependencies]
+ghostframe-lib = { path = "../ghostframe-lib" }
+ghostframe-test-pattern = { path = "../ghostframe-test-pattern" }
+
+[dev-dependencies]
+# Versions copied verbatim from ghostframe-lib/Cargo.toml.
+criterion = { version = "0.5", features = ["html_reports"] }
+iai-callgrind = "0.14"

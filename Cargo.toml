@@ -4,6 +4,8 @@ members = [
     "ghostframe-lib",
     "ghostframe-xdaemon",
     "ghostframe-test-pattern",
+    "ghostframe-e2e",
+    "ghostframe-bench",
 ]
 
 [workspace.dependencies]

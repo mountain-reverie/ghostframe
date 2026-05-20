@@ -1457,6 +1457,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "ghostframe-bench"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "ghostframe-lib",
+ "ghostframe-test-pattern",
+ "iai-callgrind",
+]
+
+[[package]]
+name = "ghostframe-e2e"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum 0.7.9",
+ "bytes",
+ "chromiumoxide",
+ "futures",
+ "ghostframe-lib",
+ "ghostframe-test-pattern",
+ "image",
+ "image-compare",
+ "serde_json",
+ "testcontainers",
+ "tokio",
+ "tower-http",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
 name = "ghostframe-lib"
 version = "0.1.0"
 dependencies = [
