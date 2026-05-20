@@ -283,17 +283,7 @@ impl GpuFrameProcessor {
         // Note: NV12 descriptor set is allocated inside run_nv12_stage (called below).
         // Note: analysis descriptor set is allocated inside run_analysis_stage (called below).
         // Note: palrle_compact descriptor set is allocated inside run_palrle_compact_stage (called below).
-
-        let palrle_indirect_args_set_layouts = [self.palrle_indirect_args_descriptor_set_layout];
-        let palrle_indirect_args_ds_alloc = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(&palrle_indirect_args_set_layouts);
-        let palrle_indirect_args_ds_guard = ScopedDescriptorSets {
-            device: &self.device,
-            pool: self.descriptor_pool,
-            sets: self.device.allocate_descriptor_sets(&palrle_indirect_args_ds_alloc)?,
-        };
-        let palrle_indirect_args_ds = palrle_indirect_args_ds_guard.sets[0];
+        // Note: palrle_indirect_args descriptor set is allocated inside run_palrle_indirect_args_stage (called below).
 
         // palette_fold descriptor set (Stage 2a)
         let palette_fold_ds_alloc = vk::DescriptorSetAllocateInfo::default()
@@ -347,32 +337,6 @@ impl GpuFrameProcessor {
             sets: self.device.allocate_descriptor_sets(&pal_rle_index_ds_alloc)?,
         };
         let pal_rle_index_descriptor_set = pal_rle_index_ds_guard.sets[0];
-
-        // Write palrle_indirect_args descriptor set.
-        // binding 0: palrle_compact_count_buffer (read)
-        // binding 1: palrle_indirect_args_buffer (write)
-        let palrle_indirect_count_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.palrle_compact_count_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let palrle_indirect_args_buf_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.palrle_indirect_args_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let palrle_indirect_args_writes = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(palrle_indirect_args_ds)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&palrle_indirect_count_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(palrle_indirect_args_ds)
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&palrle_indirect_args_buf_info),
-        ];
-        self.device
-            .update_descriptor_sets(&palrle_indirect_args_writes, &[]);
 
         // Write palette_fold descriptor set.
         // binding 0: analysis_buffer (read-only)
@@ -725,20 +689,7 @@ impl GpuFrameProcessor {
         );
 
         // Stage 1.5b: indirect-args writer.
-        self.device.cmd_bind_pipeline(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.palrle_indirect_args_pipeline,
-        );
-        self.device.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.palrle_indirect_args_pipeline_layout,
-            0,
-            &[palrle_indirect_args_ds],
-            &[],
-        );
-        self.device.cmd_dispatch(cmd, 1, 1, 1);
+        let palrle_indirect_args_ds_guard = self.run_palrle_indirect_args_stage(cmd)?;
 
         // Barrier for future stages (Task 11+) to consume indirect args.
         let buf_barrier_args = vk::BufferMemoryBarrier::default()
@@ -1237,11 +1188,11 @@ impl GpuFrameProcessor {
         // 8. Per-frame transients (descriptor sets, command buffer, fence) are
         //    freed when their RAII guards drop at end of scope. We touch the
         //    guards here to keep them alive past the `wait_for_fences` above.
-        //    sad_ds_guard, nv12_ds_guard, analysis_ds_guard, and
-        //    palrle_compact_ds_guard are dropped explicitly before step 9 to
-        //    release the immutable borrows on self (all are returned from helper
-        //    methods whose lifetimes are tied to &self) before the mutable
-        //    self.prev_image borrow.
+        //    sad_ds_guard, nv12_ds_guard, analysis_ds_guard,
+        //    palrle_compact_ds_guard, and palrle_indirect_args_ds_guard are
+        //    dropped explicitly before step 9 to release the immutable borrows
+        //    on self (all are returned from helper methods whose lifetimes are
+        //    tied to &self) before the mutable self.prev_image borrow.
         //    GPU-safety: these drops must NOT move above the `wait_for_fences` at
         //    step 6 — releasing descriptor sets while the GPU is still using them
         //    is undefined behaviour (use-after-free in the descriptor pool).
@@ -1261,6 +1212,7 @@ impl GpuFrameProcessor {
         drop(nv12_ds_guard);
         drop(analysis_ds_guard);
         drop(palrle_compact_ds_guard);
+        drop(palrle_indirect_args_ds_guard);
 
         // 9. prev_image is persistent (own-allocated, layout still GENERAL
         // after the post-copy barrier). It now holds a snapshot of THIS frame
@@ -1323,19 +1275,9 @@ impl GpuFrameProcessor {
         // Note: NV12 descriptor set is allocated inside run_nv12_stage (called below).
         // Note: analysis descriptor set is allocated inside run_analysis_stage (called below).
         // Note: palrle_compact descriptor set is allocated inside run_palrle_compact_stage (called below).
+        // Note: palrle_indirect_args descriptor set is allocated inside run_palrle_indirect_args_stage (called below).
 
-        // Allocate descriptor sets for Stages 1.5b-3 (all RAII-guarded).
-        let palrle_indirect_args_set_layouts = [self.palrle_indirect_args_descriptor_set_layout];
-        let palrle_indirect_args_ds_alloc = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(&palrle_indirect_args_set_layouts);
-        let palrle_indirect_args_ds_guard = ScopedDescriptorSets {
-            device: &self.device,
-            pool: self.descriptor_pool,
-            sets: self.device.allocate_descriptor_sets(&palrle_indirect_args_ds_alloc)?,
-        };
-        let palrle_indirect_args_ds = palrle_indirect_args_ds_guard.sets[0];
-
+        // Allocate descriptor sets for Stages 2a-3 (all RAII-guarded).
         let palette_fold_ds_alloc = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
             .set_layouts(std::slice::from_ref(&self.palette_fold_descriptor_set_layout));
@@ -1384,30 +1326,6 @@ impl GpuFrameProcessor {
             sets: self.device.allocate_descriptor_sets(&pal_rle_index_ds_alloc)?,
         };
         let pal_rle_index_descriptor_set = pal_rle_index_ds_guard.sets[0];
-
-        // Write palrle_indirect_args descriptor set.
-        let palrle_indirect_count_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.palrle_compact_count_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let palrle_indirect_args_buf_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.palrle_indirect_args_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let palrle_indirect_args_writes = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(palrle_indirect_args_ds)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&palrle_indirect_count_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(palrle_indirect_args_ds)
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&palrle_indirect_args_buf_info),
-        ];
-        self.device
-            .update_descriptor_sets(&palrle_indirect_args_writes, &[]);
 
         // Write palette_fold descriptor set.
         let palette_fold_analysis_info = [vk::DescriptorBufferInfo::default()
@@ -1725,20 +1643,7 @@ impl GpuFrameProcessor {
         );
 
         // Stage 1.5b: indirect-args writer.
-        self.device.cmd_bind_pipeline(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.palrle_indirect_args_pipeline,
-        );
-        self.device.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.palrle_indirect_args_pipeline_layout,
-            0,
-            &[palrle_indirect_args_ds],
-            &[],
-        );
-        self.device.cmd_dispatch(cmd, 1, 1, 1);
+        let palrle_indirect_args_ds_guard = self.run_palrle_indirect_args_stage(cmd)?;
 
         // Barrier for future stages to consume indirect args.
         let buf_barrier_args = vk::BufferMemoryBarrier::default()
@@ -2798,6 +2703,87 @@ impl GpuFrameProcessor {
         );
         self.device
             .cmd_dispatch(cmd, workgroups.0, workgroups.1, workgroups.2);
+
+        Ok(guard)
+    }
+
+    /// PalRLE indirect-args compute dispatch (builds the dispatch params
+    /// for the pal_rle_index stage from the compact count).
+    ///
+    /// Reads the compact count (binding 0, STORAGE_BUFFER); writes
+    /// indirect dispatch args (binding 1, STORAGE_BUFFER). No push
+    /// constants. Workgroups `(1, 1, 1)` (single-workgroup transform).
+    ///
+    /// Caller must invoke `cmd_pipeline_barrier` AFTER this call so the
+    /// indirect-args buffer is visible to the subsequent
+    /// `cmd_dispatch_indirect` consumer (`pal_rle_index`).
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure: `cmd` is recording; the compact count buffer
+    /// has been populated by a preceding palrle_compact dispatch and a
+    /// barrier; the indirect args buffer is bound to memory; and the
+    /// returned guard is held alive until `wait_for_fences` returns for
+    /// the command buffer (dropping it earlier returns the descriptor set
+    /// to the pool while the GPU is still using it).
+    unsafe fn run_palrle_indirect_args_stage<'a>(
+        &'a self,
+        cmd: vk::CommandBuffer,
+    ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
+        // Allocate one descriptor set from the pool. The returned guard frees
+        // it on drop, ensuring the bounded pool doesn't leak on early-exit.
+        let palrle_indirect_args_set_layouts = [self.palrle_indirect_args_descriptor_set_layout];
+        let palrle_indirect_args_ds_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(&palrle_indirect_args_set_layouts);
+        let guard = ScopedDescriptorSets {
+            device: &self.device,
+            pool: self.descriptor_pool,
+            sets: self.device.allocate_descriptor_sets(&palrle_indirect_args_ds_alloc)?,
+        };
+        let palrle_indirect_args_ds = guard.sets[0];
+
+        // Write the two palrle_indirect_args descriptors (both STORAGE_BUFFER):
+        //   binding 0 — palrle_compact_count_buffer  (read)
+        //   binding 1 — palrle_indirect_args_buffer  (write)
+        let palrle_indirect_count_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.palrle_compact_count_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let palrle_indirect_args_buf_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.palrle_indirect_args_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let palrle_indirect_args_writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(palrle_indirect_args_ds)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&palrle_indirect_count_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(palrle_indirect_args_ds)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&palrle_indirect_args_buf_info),
+        ];
+        self.device
+            .update_descriptor_sets(&palrle_indirect_args_writes, &[]);
+
+        // Bind + dispatch. No push constants for this stage.
+        self.device.cmd_bind_pipeline(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.palrle_indirect_args_pipeline,
+        );
+        self.device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.palrle_indirect_args_pipeline_layout,
+            0,
+            &[palrle_indirect_args_ds],
+            &[],
+        );
+        self.device.cmd_dispatch(cmd, 1, 1, 1);
 
         Ok(guard)
     }
