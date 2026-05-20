@@ -1415,6 +1415,9 @@ impl GpuFrameProcessor {
         //    sad_ds_guard is dropped explicitly before step 9 to release the
         //    immutable borrow on self (it is returned from run_sad_stage, whose
         //    lifetime is tied to &self) before the mutable self.prev_image borrow.
+        //    GPU-safety: this drop must NOT move above the `wait_for_fences` at
+        //    step 6 — releasing the descriptor set while the GPU is still using
+        //    it is undefined behaviour (use-after-free in the descriptor pool).
         let _ = (
             &nv12_ds_guard,
             &analysis_ds_guard,
@@ -2751,7 +2754,10 @@ impl GpuFrameProcessor {
     /// Caller must ensure: `cmd` is currently recording; the image views
     /// passed are in `vk::ImageLayout::GENERAL` and remain valid for the
     /// duration of the recording; the workgroup count `(cols, rows, 1)`
-    /// matches the SAD shader's expected dispatch shape.
+    /// matches the SAD shader's expected dispatch shape; and the returned
+    /// guard is held alive until `wait_for_fences` returns for the command
+    /// buffer containing this dispatch — dropping it earlier returns the
+    /// descriptor set to the pool while the GPU is still using it.
     unsafe fn run_sad_stage<'a>(
         &'a self,
         cmd: vk::CommandBuffer,
@@ -2814,7 +2820,7 @@ impl GpuFrameProcessor {
             vk::PipelineBindPoint::COMPUTE,
             self.pipeline_layout,
             0,
-            &[guard.sets[0]],
+            &[sad_ds],
             &[],
         );
         let push_bytes = std::slice::from_raw_parts(
