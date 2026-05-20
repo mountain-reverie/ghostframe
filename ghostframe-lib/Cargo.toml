@@ -55,15 +55,3 @@ lz4_flex = "0.11"
 image-compare = "0.4"
 image = { version = "0.25", features = ["png"] }
 ghostframe-test-pattern = { path = "../ghostframe-test-pattern" }
-
-[[bench]]
-name = "codec_latency"
-harness = false
-
-[[bench]]
-name = "pipeline_throughput"
-harness = false
-
-[[bench]]
-name = "codec_callgrind"
-harness = false

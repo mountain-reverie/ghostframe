@@ -18,7 +18,7 @@ use iai_callgrind::{library_benchmark, library_benchmark_group, main};
 use ghostframe_lib::transport::fec;
 use ghostframe_lib::transport::protocol::{
     fragment_frame, fragment_tile, max_fragment_payload, Codec, DatagramHeader, FrameHeader,
-    TileHeader, DATAGRAM_HEADER_SIZE, FRAME_HEADER_SIZE, TILE_HEADER_SIZE,
+    TileFragmentInputs, TileHeader, DATAGRAM_HEADER_SIZE, FRAME_HEADER_SIZE, TILE_HEADER_SIZE,
 };
 
 #[library_benchmark]
@@ -69,17 +69,16 @@ fn tile_header_encode_decode() {
 fn fragment_tile_4kb() {
     let payload = vec![0u8; 4096];
     let max = max_fragment_payload(1200);
-    std::hint::black_box(fragment_tile(
-        0u32,
-        0u8,
-        0u8,
-        Codec::H264,
-        0u8,
-        0u8,
-        &payload,
-        0u32,
-        max,
-    ));
+    let inputs = TileFragmentInputs {
+        frame_seq: 0,
+        tile_x: 0,
+        tile_y: 0,
+        codec: Codec::H264,
+        generation: 0,
+        pass: 0,
+        timestamp_us: 0,
+    };
+    std::hint::black_box(fragment_tile(&inputs, &payload, max));
 }
 
 #[library_benchmark]

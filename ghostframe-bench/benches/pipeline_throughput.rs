@@ -10,7 +10,7 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use ghostframe_lib::tile::{DirtyTracker, BPP, TILE_SIZE};
 use ghostframe_lib::transport::fec;
 use ghostframe_lib::transport::protocol::{
-    fragment_frame, fragment_tile, max_fragment_payload, Codec,
+    fragment_frame, fragment_tile, max_fragment_payload, Codec, TileFragmentInputs,
 };
 
 const FRAME_SIZES: &[(u32, u32)] = &[
@@ -63,19 +63,17 @@ fn bench_fragment_tile(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &payload, |b, p| {
             let max_payload = max_fragment_payload(1200);
+            let inputs = TileFragmentInputs {
+                frame_seq: 0,
+                tile_x: 0,
+                tile_y: 0,
+                codec: Codec::H264,
+                generation: 0,
+                pass: 0,
+                timestamp_us: 0,
+            };
             b.iter(|| {
-                // fragment_tile(frame_seq, tile_x, tile_y, codec, payload, timestamp_us, max_payload)
-                black_box(fragment_tile(
-                    0u32,
-                    0u8,
-                    0u8,
-                    Codec::H264,
-                    0u8,
-                    0u8,
-                    p,
-                    0u32,
-                    max_payload,
-                ));
+                black_box(fragment_tile(&inputs, p, max_payload));
             });
         });
     }
