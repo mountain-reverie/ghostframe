@@ -290,6 +290,28 @@ Per-commit: `git revert <sha>`.
 - `cargo build --tests --package ghostframe-lib -j 1` peaks at materially
   less RSS than 894 MB (expected: 400–600 MB).
 
+## Post-split measurement (recorded after Task 5)
+
+Incremental rebuild after `touch <crate>/src/lib.rs`, under
+`systemd-run --user --scope -p MemoryMax=18G --quiet -- ... -j 1`:
+
+| Command | Pre-split peak RSS | Post-split peak RSS | Delta |
+|---|---|---|---|
+| `cargo build --tests --package ghostframe-lib` | 894 MB | **453 MB** | **−49%** |
+| `cargo build --tests --package ghostframe-e2e` | n/a (didn't exist) | 588 MB | — |
+
+The lib's routine test-compile no longer pulls chromiumoxide,
+testcontainers, axum, tower-http, criterion, iai-callgrind, image, or
+image-compare into its compilation unit. `ghostframe-e2e` bears those
+deps but in its own rustc invocation, so it doesn't penalise `cargo
+test --package ghostframe-lib` or `cargo test --lib`.
+
+Cold-build (full cache invalidation) peak should be roughly
+proportional: the ~19 GB rustc spike that triggered the OOM during the
+gpu_pipeline split is expected to be ~halved for routine lib-only
+builds, and the e2e crate's spike is bounded by its own dep graph
+(separate process, can't accumulate).
+
 ## Out of scope
 
 - Reorganizing test logic or adding new tests.
