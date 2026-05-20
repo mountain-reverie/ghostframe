@@ -214,14 +214,36 @@ async function main() {
     transport = new WebTransport(wtUrl);
   }
 
+  function onSessionReset() {
+    // Drain videoFramesToClose and clear the h264Queue FIRST so that the
+    // per-decoder close() calls below don't hit a double-close hazard on
+    // latestFrame (renderer may have moved the same VideoFrame into
+    // videoFramesToClose on the previous rAF).
+    renderer.onSessionReset();
+
+    // Close every per-tile H.264 decoder to release the underlying VideoDecoder
+    // instances. Iterate then clear — not clear-then-iterate — so each decoder's
+    // close() runs before the reference is dropped.
+    for (const dec of h264Decoders.values()) {
+      dec.close();
+    }
+    h264Decoders.clear();
+
+    // Close the full-frame decoder if one was created this session.
+    if (fullFrameDecoder) {
+      fullFrameDecoder.close();
+      fullFrameDecoder = null;
+    }
+  }
+
   transport.closed.then(
     (info) => {
       log(`Transport closed: code=${info.closeCode} reason=${info.reason}`);
-      renderer.onSessionReset();
+      onSessionReset();
     },
     (err) => {
       log(`Transport closed with error: ${err}`);
-      renderer.onSessionReset();
+      onSessionReset();
     }
   );
 

@@ -121,8 +121,24 @@ export class WebGpuRenderer {
   /**
    * Zero the palette atlas + CPU shadow on session reset (transport.closed).
    * Framebuffer texture is left in place; next session paints over.
+   *
+   * Must be called BEFORE the caller closes any H264TileDecoder instances so
+   * that the videoFramesToClose drain runs first and avoids double-close.
    */
   onSessionReset(): void {
+    // Drain pending VideoFrames before any per-decoder close() runs.  Frames
+    // here have already been submitted to the GPU; we close them eagerly so
+    // that the subsequent dec.close() in main.ts doesn't hit a double-close
+    // hazard on latestFrame.
+    for (const f of this.videoFramesToClose) {
+      try { f.close(); } catch { /* already closed — safe to swallow */ }
+    }
+    this.videoFramesToClose = [];
+
+    // Clear queued-but-not-yet-drawn H.264 tiles so stale frames from a
+    // previous session don't bleed into the first rAF of the next one.
+    this.h264Queue.length = 0;
+
     const zeros = new Uint8Array(16 * 1024);
     this.device.queue.writeBuffer(this.palrlePipeline.paletteAtlas, 0, zeros);
     this.paletteShadow.clear();
