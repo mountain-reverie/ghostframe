@@ -257,7 +257,14 @@ export class WebGpuRenderer {
         }
         staging.unmap();
         this.errorsReadbackInFlight = false;
-      }).catch(() => { this.errorsReadbackInFlight = false; });
+      }).catch((err) => {
+        // mapAsync rejects on device loss, OOM, or validation failure.
+        // Without this log, a silently-broken errors readback path is
+        // nearly impossible to diagnose — the lib looks alive but stops
+        // reporting decode errors.
+        console.warn('palrle errors mapAsync failed:', err);
+        this.errorsReadbackInFlight = false;
+      });
     }
 
     // ---- Step 14: cleanup consumed VideoFrames ----

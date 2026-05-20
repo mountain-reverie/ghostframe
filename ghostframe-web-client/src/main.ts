@@ -150,9 +150,19 @@ async function main() {
     }
   }
 
+  // Decode-error writer can throw once when the feedback stream closes
+  // mid-session. The catch logs the first error per writer so a broken
+  // feedback path is discoverable; subsequent writes are silent to avoid
+  // spamming the console during normal teardown.
+  let decodeErrorWriteLogged = false;
   const decodeErrorBatcher = new DecodeErrorBatcher((bytes) => {
     if (feedbackWriter) {
-      feedbackWriter.write(bytes).catch(() => {});
+      feedbackWriter.write(bytes).catch((err) => {
+        if (!decodeErrorWriteLogged) {
+          console.warn('decode-error feedback write failed:', err);
+          decodeErrorWriteLogged = true;
+        }
+      });
     }
   });
 
@@ -189,10 +199,18 @@ async function main() {
     return dec;
   }
 
-  // Batched ACK sender — fire-and-forget unreliable datagrams.
+  // Batched ACK sender — fire-and-forget unreliable datagrams. The catch
+  // logs the first error per writer so a broken ACK path is discoverable;
+  // subsequent writes are silent to avoid spamming during normal teardown.
   const ackWriter = transport.datagrams.writable.getWriter();
+  let ackWriteLogged = false;
   const ackBatcher = new AckBatcher((dg) => {
-    ackWriter.write(dg).catch(() => {});
+    ackWriter.write(dg).catch((err) => {
+      if (!ackWriteLogged) {
+        console.warn('ACK datagram write failed:', err);
+        ackWriteLogged = true;
+      }
+    });
   });
 
   const assemblies = new Map<string, TileAssembly>();
