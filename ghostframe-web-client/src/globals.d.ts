@@ -5,9 +5,43 @@ declare module '*.wgsl?raw' {
   export default content;
 }
 
-// Type augmentation for ad-hoc test-instrumentation properties on `window`.
-// Polled by Playwright in `e2e_mode_switch` (see `ghostframe-lib/tests/e2e.rs`).
+// Type augmentation for test-instrumentation / e2e-readback properties
+// exposed on `window` by diagnostics.ts and renderer.ts.
+// Polled by Playwright in the ghostframe e2e suite
+// (see `ghostframe-lib/tests/e2e.rs`).
 
 interface Window {
-  __ghostframeStats: { tileDatagrams: number; frameDatagrams: number };
+  // ----- stats counters (set at startup, incremented in the datagram loop) -----
+  __ghostframeStats: { tileDatagrams: number; frameDatagrams: number } | undefined;
+  /** rAF tick counter; incremented every requestAnimationFrame callback. */
+  __ghostframeRafTicks: number | undefined;
+
+  // ----- renderer reference (set per-frame in renderer.ts) --------------------
+  __ghostframeRenderer: { device: GPUDevice; texture: GPUTexture } | undefined;
+
+  // ----- recorder arrays (FIFO-capped, pushed from diagnostics.ts) ------------
+  __ghostframeRecordedCodecs: number[] | undefined;
+  __ghostframeRecordedFlags: number[] | undefined;
+  __ghostframeRecordedResizes: Array<{
+    seq: number;
+    oldW: number; oldH: number;
+    newW: number; newH: number;
+    trigger: 'sentinel' | 'fallback-expand';
+  }> | undefined;
+  __ghostframeRecordedTiles: Array<{
+    seq: number;
+    tileX: number; tileY: number;
+    codec: number;
+    payloadLen: number;
+    fbWidth: number;
+    fbHeight: number;
+  }> | undefined;
+
+  // ----- GPU readback helpers (set at startup by diagnostics.ts) ---------------
+  __readPixel(x: number, y: number): Promise<number[]>;
+  __readPixelRect(x: number, y: number, w: number, h: number): Promise<number[]>;
+  __readGradientGolden(): Promise<{
+    ok: boolean;
+    mismatches: Array<{ x: number; y: number; got: number[]; want: number[] }>;
+  }>;
 }

@@ -5,19 +5,13 @@ import {
   isTileDatagram, decodeFrameHeader, frameKey, FullFrameDecoder,
   FRAME_DIMENSIONS_SENTINEL_X, FRAME_DIMENSIONS_SENTINEL_Y,
 } from './decoder.js';
-import debugGradientWgsl from './webgpu/shaders/debug_gradient.wgsl?raw';
 import { WebGpuRenderer } from './webgpu/renderer.js';
 import { WebGpuUnavailableError } from './webgpu/init.js';
 import { ParityRecovery } from './fec';
 import { LossTracker, encodeHello } from './feedback';
 import { DecodeErrorBatcher } from './decode_error_batcher';
 import { AckBatcher } from './ack';
-
-// Cap test-instrumentation recorder arrays to bound memory + CDP
-// serialisation cost in long-running tests. ~4 KiB worth of entries
-// is plenty for any e2e in the current suite; FIFO drop keeps the
-// most recent observations.
-const MAX_RECORDED_ENTRIES = 4096;
+import { initDiagnostics } from './diagnostics.js';
 
 const statusEl = document.getElementById('status')!;
 const logEl = document.getElementById('log')!;
@@ -45,148 +39,6 @@ async function main() {
   const serverHost = url.searchParams.get('host') ?? 'ghostframe-server:4443';
   const certHash = url.searchParams.get('certHash') ?? '';
 
-  // WebGPU canvases cannot be reliably read via canvas.getContext('2d').getImageData
-  // in Chrome 147 when the canvas has been resized after initial configuration
-  // (the compositor's copy may lag behind). Instead, read directly from the
-  // GPU framebuffer texture via a staging buffer (COPY_SRC → MAP_READ).
-  //
-  // Both __readPixel and __readPixelRect return Promises; the E2E test
-  // framework (chromiumoxide) resolves the returned Promise automatically.
-  (window as any).__readPixel = async (x: number, y: number): Promise<number[]> => {
-    const rendererRef: any = (window as any).__ghostframeRenderer;
-    if (!rendererRef) {
-      // Fallback to drawImage if renderer not exposed yet
-      const tmp = document.createElement('canvas');
-      tmp.width = 1; tmp.height = 1;
-      const ctx = tmp.getContext('2d')!;
-      ctx.drawImage(canvasEl, x, y, 1, 1, 0, 0, 1, 1);
-      return Array.from(ctx.getImageData(0, 0, 1, 1).data);
-    }
-    const { device, texture } = rendererRef;
-    if (!device || !texture) return [0, 0, 0, 0];
-    // Row size must be a multiple of 256 bytes.
-    const bytesPerRow = 256;
-    const staging = device.createBuffer({
-      size: bytesPerRow,
-      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-    });
-    const enc = device.createCommandEncoder();
-    enc.copyTextureToBuffer(
-      { texture, origin: { x, y } },
-      { buffer: staging, bytesPerRow },
-      [1, 1],
-    );
-    device.queue.submit([enc.finish()]);
-    await staging.mapAsync(GPUMapMode.READ);
-    const view = new Uint8Array(staging.getMappedRange(0, 4));
-    const result = Array.from(view) as number[];
-    staging.unmap();
-    staging.destroy();
-    return result; // [R, G, B, A]
-  };
-
-  // Multi-pixel variant for hash-based E2E stability checks.
-  (window as any).__readPixelRect = async (x: number, y: number, w: number, h: number): Promise<number[]> => {
-    const rendererRef: any = (window as any).__ghostframeRenderer;
-    if (!rendererRef) {
-      const tmp = document.createElement('canvas');
-      tmp.width = w; tmp.height = h;
-      const ctx = tmp.getContext('2d')!;
-      ctx.drawImage(canvasEl, x, y, w, h, 0, 0, w, h);
-      return Array.from(ctx.getImageData(0, 0, w, h).data);
-    }
-    const { device, texture } = rendererRef;
-    if (!device || !texture) return new Array(w * h * 4).fill(0);
-    // bytesPerRow must be multiple of 256
-    const bytesPerRow = Math.ceil(w * 4 / 256) * 256;
-    const staging = device.createBuffer({
-      size: bytesPerRow * h,
-      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-    });
-    const enc = device.createCommandEncoder();
-    enc.copyTextureToBuffer(
-      { texture, origin: { x, y } },
-      { buffer: staging, bytesPerRow },
-      [w, h],
-    );
-    device.queue.submit([enc.finish()]);
-    await staging.mapAsync(GPUMapMode.READ);
-    // Compact: remove row padding
-    const raw = new Uint8Array(staging.getMappedRange());
-    const result: number[] = [];
-    for (let row = 0; row < h; row++) {
-      for (let col = 0; col < w * 4; col++) {
-        result.push(raw[row * bytesPerRow + col]);
-      }
-    }
-    staging.unmap();
-    staging.destroy();
-    return result;
-  };
-
-  // Debug-only: dispatch a compute pipeline that writes a known gradient
-  // (r=x&255, g=y&255, b=0, a=255) to the framebuffer, then read back via
-  // __readPixel at sample points.  Used by e2e_readpixel_correctness to
-  // verify __readPixel before any production-codec pixel assertion is
-  // trusted.  See spec/2026-05-15-m3.2c-verification-design.md §W2.
-  (window as any).__readGradientGolden = async (): Promise<{
-    ok: boolean;
-    mismatches: Array<{ x: number; y: number; got: number[]; want: number[] }>;
-  }> => {
-    const rendererRef: any = (window as any).__ghostframeRenderer;
-    if (!rendererRef) {
-      return { ok: false, mismatches: [{ x: -1, y: -1, got: [], want: [] }] };
-    }
-    const { device, texture } = rendererRef;
-    if (!device || !texture) {
-      return { ok: false, mismatches: [{ x: -1, y: -1, got: [], want: [] }] };
-    }
-    const fbW = texture.width;
-    const fbH = texture.height;
-    if (fbW === 0 || fbH === 0) {
-      return { ok: false, mismatches: [{ x: -1, y: -1, got: [], want: [] }] };
-    }
-    // Build the debug compute pipeline (fresh per call — cheap, debug-only).
-    const module = device.createShaderModule({ code: debugGradientWgsl });
-    const pipeline = device.createComputePipeline({
-      layout: 'auto',
-      compute: { module, entryPoint: 'debug_gradient' },
-    });
-    const bindGroup = device.createBindGroup({
-      layout: pipeline.getBindGroupLayout(0),
-      entries: [{ binding: 0, resource: texture.createView() }],
-    });
-    const encoder = device.createCommandEncoder();
-    const pass = encoder.beginComputePass();
-    pass.setPipeline(pipeline);
-    pass.setBindGroup(0, bindGroup);
-    pass.dispatchWorkgroups(Math.ceil(fbW / 8), Math.ceil(fbH / 8), 1);
-    pass.end();
-    device.queue.submit([encoder.finish()]);
-    await device.queue.onSubmittedWorkDone();
-
-    // Sample 16 points — corners, edges, near-256 wrap boundaries, center.
-    const samplePoints: Array<[number, number]> = [
-      [0, 0], [1, 0], [255, 0], [256, 0],
-      [0, 1], [0, 255], [0, 256],
-      [100, 200], [16, 16], [31, 31], [32, 32], [63, 63],
-      [Math.floor(fbW / 2), Math.floor(fbH / 2)],
-      [fbW - 1, fbH - 1],
-      [Math.min(255, fbW - 1), Math.min(255, fbH - 1)],
-      [Math.min(256, fbW - 1), Math.min(256, fbH - 1)],
-    ];
-    const mismatches: Array<{ x: number; y: number; got: number[]; want: number[] }> = [];
-    for (const [x, y] of samplePoints) {
-      if (x >= fbW || y >= fbH || x < 0 || y < 0) continue;
-      const got = await (window as any).__readPixel(x, y);
-      const want = [x & 0xFF, y & 0xFF, 0, 255];
-      if (got[0] !== want[0] || got[1] !== want[1] || got[2] !== want[2] || got[3] !== want[3]) {
-        mismatches.push({ x, y, got, want });
-      }
-    }
-    return { ok: mismatches.length === 0, mismatches };
-  };
-
   const wtUrl = `https://${serverHost}/`;
 
   log(`Connecting to ${wtUrl}...`);
@@ -204,6 +56,16 @@ async function main() {
     throw e;
   }
   renderer.resize(0, 0);
+
+  // Wire all test/e2e diagnostic globals onto `window` via diagnostics.ts.
+  // The getRenderer callback is called lazily (per __readPixel invocation)
+  // so it always reflects the current framebuffer texture set by
+  // renderer.encodeAndPresentFrame on the previous rAF tick.
+  const diag = initDiagnostics({
+    canvas: canvasEl,
+    getRenderer: () => window.__ghostframeRenderer ?? null,
+  });
+  const stats = diag.stats;
 
   let transport: WebTransport;
   if (certHash) {
@@ -340,22 +202,7 @@ async function main() {
       const oldW = renderer.framebuffer.width;
       const oldH = renderer.framebuffer.height;
       renderer.resize(newW, newH);
-      if (typeof window !== "undefined") {
-        const w = window as unknown as {
-          __ghostframeRecordedResizes?: Array<{
-            seq: number; oldW: number; oldH: number;
-            newW: number; newH: number;
-            trigger: 'sentinel' | 'fallback-expand';
-          }>;
-        };
-        if (!w.__ghostframeRecordedResizes) {
-          w.__ghostframeRecordedResizes = [];
-        }
-        w.__ghostframeRecordedResizes.push({ seq, oldW, oldH, newW, newH, trigger });
-        if (w.__ghostframeRecordedResizes.length > MAX_RECORDED_ENTRIES) {
-          w.__ghostframeRecordedResizes.shift();
-        }
-      }
+      diag.recordResize({ seq, oldW, oldH, newW, newH, trigger });
     }
 
     const totalLen = asm.fragments.reduce((acc, f) => acc + (f ? f.byteLength : 0), 0);
@@ -402,52 +249,16 @@ async function main() {
     // Per-tile event log adds {tileX, tileY, codec, payloadLen, fbWidth, fbHeight}
     // so e2e_edge_tiles can correlate which tiles arrived against the framebuffer
     // dimensions at the moment they were queued (W5 diagnostic).
-    if (typeof window !== "undefined") {
-      const w = window as unknown as {
-        __ghostframeRecordedCodecs?: number[];
-        __ghostframeRecordedTiles?: Array<{
-          seq: number;
-          tileX: number;
-          tileY: number;
-          codec: number;
-          payloadLen: number;
-          fbWidth: number;
-          fbHeight: number;
-        }>;
-        __ghostframeRecordedFlags?: number[];
-      };
-      if (!w.__ghostframeRecordedCodecs) {
-        w.__ghostframeRecordedCodecs = [];
-      }
-      if (!w.__ghostframeRecordedTiles) {
-        w.__ghostframeRecordedTiles = [];
-      }
-      if (!w.__ghostframeRecordedFlags) {
-        w.__ghostframeRecordedFlags = [];
-      }
-      w.__ghostframeRecordedCodecs.push(asm.header.codec);
-      if (w.__ghostframeRecordedCodecs.length > MAX_RECORDED_ENTRIES) {
-        w.__ghostframeRecordedCodecs.shift();
-      }
-      if (asm.header.codec === Codec.PalRle) {
-        w.__ghostframeRecordedFlags.push(payload[0]);
-        if (w.__ghostframeRecordedFlags.length > MAX_RECORDED_ENTRIES) {
-          w.__ghostframeRecordedFlags.shift();
-        }
-      }
-      w.__ghostframeRecordedTiles.push({
-        seq: frameSeqFromKey,
-        tileX: tX,
-        tileY: tY,
-        codec: asm.header.codec,
-        payloadLen: payload.byteLength,
-        fbWidth: renderer.framebuffer.width,
-        fbHeight: renderer.framebuffer.height,
-      });
-      if (w.__ghostframeRecordedTiles.length > MAX_RECORDED_ENTRIES) {
-        w.__ghostframeRecordedTiles.shift();
-      }
-    }
+    diag.recordTile({
+      seq: frameSeqFromKey,
+      tileX: tX,
+      tileY: tY,
+      codec: asm.header.codec,
+      payloadLen: payload.byteLength,
+      fbWidth: renderer.framebuffer.width,
+      fbHeight: renderer.framebuffer.height,
+      palRleFlag: asm.header.codec === Codec.PalRle ? payload[0] : undefined,
+    });
 
     if (asm.header.codec === Codec.Raw) {
       renderer.rawQueue.push({ tileX: tX, tileY: tY, bgra: payload });
@@ -484,17 +295,13 @@ async function main() {
   let __rafTicks = 0;
   function tick() {
     __rafTicks++;
-    (window as any).__ghostframeRafTicks = __rafTicks;
+    diag.recordRafTick(__rafTicks);
     renderer.encodeAndPresentFrame((codec, tx, ty, code) => {
       decodeErrorBatcher.report({ codec, tileX: tx, tileY: ty, errorCode: code });
     });
     requestAnimationFrame(tick);
   }
   requestAnimationFrame(tick);
-
-  // Test-instrumentation counters.
-  window.__ghostframeStats = { tileDatagrams: 0, frameDatagrams: 0 };
-  const stats = window.__ghostframeStats;
 
   // Receive datagrams.
   const reader = transport.datagrams.readable.getReader();

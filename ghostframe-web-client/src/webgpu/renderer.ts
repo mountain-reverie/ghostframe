@@ -158,7 +158,7 @@ export class WebGpuRenderer {
       return { palrle: 0, solid: 0, raw: 0, h264: 0 };
     }
     // Expose framebuffer for test instrumentation (__readPixel / __readPixelRect).
-    (window as any).__ghostframeRenderer = { device: this.gpu.device, texture: this.framebuffer.texture };
+    window.__ghostframeRenderer = { device: this.gpu.device, texture: this.framebuffer.texture };
     // ---- Steps 1-2: Drain palette updates + pre-validate PalRle batch ----
     const palRleEntries: PalRleEntry[] = [];
     for (const q of this.palRleQueue) {
