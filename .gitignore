@@ -16,6 +16,9 @@ ghostframe-web-client/dist/
 *.swp
 .DS_Store
 
+# Claude Code session artifacts (local state, never committed)
+.claude/
+
 # Tailscale state dirs used by local manual smoke tests
 /tmp/ghostframe-ts*
 
