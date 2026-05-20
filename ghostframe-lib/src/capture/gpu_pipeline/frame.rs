@@ -282,17 +282,7 @@ impl GpuFrameProcessor {
         // Note: SAD descriptor set is allocated inside run_sad_stage (called below).
         // Note: NV12 descriptor set is allocated inside run_nv12_stage (called below).
         // Note: analysis descriptor set is allocated inside run_analysis_stage (called below).
-
-        let palrle_compact_set_layouts = [self.palrle_compact_descriptor_set_layout];
-        let palrle_compact_ds_alloc = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(&palrle_compact_set_layouts);
-        let palrle_compact_ds_guard = ScopedDescriptorSets {
-            device: &self.device,
-            pool: self.descriptor_pool,
-            sets: self.device.allocate_descriptor_sets(&palrle_compact_ds_alloc)?,
-        };
-        let palrle_compact_ds = palrle_compact_ds_guard.sets[0];
+        // Note: palrle_compact descriptor set is allocated inside run_palrle_compact_stage (called below).
 
         let palrle_indirect_args_set_layouts = [self.palrle_indirect_args_descriptor_set_layout];
         let palrle_indirect_args_ds_alloc = vk::DescriptorSetAllocateInfo::default()
@@ -357,51 +347,6 @@ impl GpuFrameProcessor {
             sets: self.device.allocate_descriptor_sets(&pal_rle_index_ds_alloc)?,
         };
         let pal_rle_index_descriptor_set = pal_rle_index_ds_guard.sets[0];
-
-        // Write palrle_compact descriptor set.
-        // binding 0: sad_buffer (read-only in shader)
-        // binding 1: analysis_buffer (read-only in shader)
-        // binding 2: palrle_compact_list_buffer (write)
-        // binding 3: palrle_compact_count_buffer (atomic write)
-        let palrle_compact_sad_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.sad_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let palrle_compact_analysis_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.analysis_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let palrle_compact_list_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.palrle_compact_list_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let palrle_compact_count_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.palrle_compact_count_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let palrle_compact_writes = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(palrle_compact_ds)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&palrle_compact_sad_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(palrle_compact_ds)
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&palrle_compact_analysis_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(palrle_compact_ds)
-                .dst_binding(2)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&palrle_compact_list_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(palrle_compact_ds)
-                .dst_binding(3)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&palrle_compact_count_info),
-        ];
-        self.device.update_descriptor_sets(&palrle_compact_writes, &[]);
 
         // Write palrle_indirect_args descriptor set.
         // binding 0: palrle_compact_count_buffer (read)
@@ -751,34 +696,14 @@ impl GpuFrameProcessor {
             &[],
         );
 
-        // Stage 1.5a: bind palrle_compact pipeline.
-        self.device.cmd_bind_pipeline(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.palrle_compact_pipeline,
-        );
-        self.device.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.palrle_compact_pipeline_layout,
-            0,
-            &[palrle_compact_ds],
-            &[],
-        );
-        let compact_push: [u32; 3] = [cols, rows, SAD_THRESHOLD];
-        let compact_push_bytes = std::slice::from_raw_parts(
-            compact_push.as_ptr() as *const u8,
-            std::mem::size_of_val(&compact_push),
-        );
-        self.device.cmd_push_constants(
-            cmd,
-            self.palrle_compact_pipeline_layout,
-            vk::ShaderStageFlags::COMPUTE,
-            0,
-            compact_push_bytes,
-        );
+        // Stage 1.5a: palrle_compact dispatch.
         // tile_idx = gl_WorkGroupID.x; bound check `tile_idx < cols * rows` is in the shader.
-        self.device.cmd_dispatch(cmd, cols * rows, 1, 1);
+        let palrle_compact_push: [u32; 3] = [cols, rows, SAD_THRESHOLD];
+        let palrle_compact_ds_guard = self.run_palrle_compact_stage(
+            cmd,
+            &palrle_compact_push,
+            (cols * rows, 1, 1),
+        )?;
 
         // Barrier between Stage 1.5a and 1.5b: shader write → shader read on count.
         let buf_barrier_count = vk::BufferMemoryBarrier::default()
@@ -1312,10 +1237,11 @@ impl GpuFrameProcessor {
         // 8. Per-frame transients (descriptor sets, command buffer, fence) are
         //    freed when their RAII guards drop at end of scope. We touch the
         //    guards here to keep them alive past the `wait_for_fences` above.
-        //    sad_ds_guard, nv12_ds_guard and analysis_ds_guard are dropped
-        //    explicitly before step 9 to release the immutable borrows on self
-        //    (all are returned from helper methods whose lifetimes are tied to
-        //    &self) before the mutable self.prev_image borrow.
+        //    sad_ds_guard, nv12_ds_guard, analysis_ds_guard, and
+        //    palrle_compact_ds_guard are dropped explicitly before step 9 to
+        //    release the immutable borrows on self (all are returned from helper
+        //    methods whose lifetimes are tied to &self) before the mutable
+        //    self.prev_image borrow.
         //    GPU-safety: these drops must NOT move above the `wait_for_fences` at
         //    step 6 — releasing descriptor sets while the GPU is still using them
         //    is undefined behaviour (use-after-free in the descriptor pool).
@@ -1334,6 +1260,7 @@ impl GpuFrameProcessor {
         drop(sad_ds_guard);
         drop(nv12_ds_guard);
         drop(analysis_ds_guard);
+        drop(palrle_compact_ds_guard);
 
         // 9. prev_image is persistent (own-allocated, layout still GENERAL
         // after the post-copy barrier). It now holds a snapshot of THIS frame
@@ -1395,19 +1322,9 @@ impl GpuFrameProcessor {
         } = nv12;
         // Note: NV12 descriptor set is allocated inside run_nv12_stage (called below).
         // Note: analysis descriptor set is allocated inside run_analysis_stage (called below).
+        // Note: palrle_compact descriptor set is allocated inside run_palrle_compact_stage (called below).
 
-        // Allocate descriptor sets for Stages 1.5-3 (all RAII-guarded).
-        let palrle_compact_set_layouts = [self.palrle_compact_descriptor_set_layout];
-        let palrle_compact_ds_alloc = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(&palrle_compact_set_layouts);
-        let palrle_compact_ds_guard = ScopedDescriptorSets {
-            device: &self.device,
-            pool: self.descriptor_pool,
-            sets: self.device.allocate_descriptor_sets(&palrle_compact_ds_alloc)?,
-        };
-        let palrle_compact_ds = palrle_compact_ds_guard.sets[0];
-
+        // Allocate descriptor sets for Stages 1.5b-3 (all RAII-guarded).
         let palrle_indirect_args_set_layouts = [self.palrle_indirect_args_descriptor_set_layout];
         let palrle_indirect_args_ds_alloc = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
@@ -1467,47 +1384,6 @@ impl GpuFrameProcessor {
             sets: self.device.allocate_descriptor_sets(&pal_rle_index_ds_alloc)?,
         };
         let pal_rle_index_descriptor_set = pal_rle_index_ds_guard.sets[0];
-
-        // Write palrle_compact descriptor set.
-        let palrle_compact_sad_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.sad_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let palrle_compact_analysis_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.analysis_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let palrle_compact_list_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.palrle_compact_list_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let palrle_compact_count_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.palrle_compact_count_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let palrle_compact_writes = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(palrle_compact_ds)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&palrle_compact_sad_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(palrle_compact_ds)
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&palrle_compact_analysis_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(palrle_compact_ds)
-                .dst_binding(2)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&palrle_compact_list_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(palrle_compact_ds)
-                .dst_binding(3)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&palrle_compact_count_info),
-        ];
-        self.device.update_descriptor_sets(&palrle_compact_writes, &[]);
 
         // Write palrle_indirect_args descriptor set.
         let palrle_indirect_count_info = [vk::DescriptorBufferInfo::default()
@@ -1820,33 +1696,14 @@ impl GpuFrameProcessor {
             &[],
         );
 
-        // Stage 1.5a: bind palrle_compact pipeline.
-        self.device.cmd_bind_pipeline(
+        // Stage 1.5a: palrle_compact dispatch.
+        // tile_idx = gl_WorkGroupID.x; bound check `tile_idx < cols * rows` is in the shader.
+        let palrle_compact_push: [u32; 3] = [cols, rows, SAD_THRESHOLD];
+        let palrle_compact_ds_guard = self.run_palrle_compact_stage(
             cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.palrle_compact_pipeline,
-        );
-        self.device.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.palrle_compact_pipeline_layout,
-            0,
-            &[palrle_compact_ds],
-            &[],
-        );
-        let compact_push: [u32; 3] = [cols, rows, SAD_THRESHOLD];
-        let compact_push_bytes = std::slice::from_raw_parts(
-            compact_push.as_ptr() as *const u8,
-            std::mem::size_of_val(&compact_push),
-        );
-        self.device.cmd_push_constants(
-            cmd,
-            self.palrle_compact_pipeline_layout,
-            vk::ShaderStageFlags::COMPUTE,
-            0,
-            compact_push_bytes,
-        );
-        self.device.cmd_dispatch(cmd, cols * rows, 1, 1);
+            &palrle_compact_push,
+            (cols * rows, 1, 1),
+        )?;
 
         // Barrier between Stage 1.5a and 1.5b: shader write → shader read on count.
         let buf_barrier_count = vk::BufferMemoryBarrier::default()
@@ -2820,6 +2677,121 @@ impl GpuFrameProcessor {
         self.device.cmd_push_constants(
             cmd,
             self.analysis_pipeline_layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            push_bytes,
+        );
+        self.device
+            .cmd_dispatch(cmd, workgroups.0, workgroups.1, workgroups.2);
+
+        Ok(guard)
+    }
+
+    /// PalRLE compact compute dispatch.
+    ///
+    /// Reads SAD output (binding 0, STORAGE_BUFFER) and tile analysis
+    /// (binding 1, STORAGE_BUFFER); writes the compact list of
+    /// PalRLE-feasible tile indices (binding 2) and the compact count
+    /// (binding 3). Push constants are `[cols, rows, dirty_threshold]`.
+    ///
+    /// Caller must invoke `cmd_pipeline_barrier` AFTER this call so that
+    /// the compact list and count buffers are visible to the downstream
+    /// `palrle_indirect_args` and `palette_fold` stages.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure: `cmd` is recording; the SAD and analysis buffers
+    /// are populated and made visible via a preceding barrier (or were
+    /// reset/zeroed appropriately); workgroup count `(cols * rows, 1, 1)`
+    /// matches the shader's per-tile dispatch implementation; and the returned
+    /// guard is held alive until `wait_for_fences` returns for the command
+    /// buffer (dropping it earlier returns the descriptor set to the pool
+    /// while the GPU is still using it).
+    unsafe fn run_palrle_compact_stage<'a>(
+        &'a self,
+        cmd: vk::CommandBuffer,
+        push_constants: &[u32],
+        workgroups: (u32, u32, u32),
+    ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
+        // Allocate one descriptor set from the pool. The returned guard frees
+        // it on drop, ensuring the bounded pool doesn't leak on early-exit.
+        let palrle_compact_set_layouts = [self.palrle_compact_descriptor_set_layout];
+        let palrle_compact_ds_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(&palrle_compact_set_layouts);
+        let guard = ScopedDescriptorSets {
+            device: &self.device,
+            pool: self.descriptor_pool,
+            sets: self.device.allocate_descriptor_sets(&palrle_compact_ds_alloc)?,
+        };
+        let palrle_compact_ds = guard.sets[0];
+
+        // Write the four palrle_compact descriptors (all STORAGE_BUFFER):
+        //   binding 0 — sad_buffer               (read)
+        //   binding 1 — analysis_buffer           (read)
+        //   binding 2 — palrle_compact_list_buffer (write)
+        //   binding 3 — palrle_compact_count_buffer (atomic write)
+        let palrle_compact_sad_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.sad_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let palrle_compact_analysis_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.analysis_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let palrle_compact_list_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.palrle_compact_list_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let palrle_compact_count_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.palrle_compact_count_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let palrle_compact_writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(palrle_compact_ds)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&palrle_compact_sad_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(palrle_compact_ds)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&palrle_compact_analysis_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(palrle_compact_ds)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&palrle_compact_list_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(palrle_compact_ds)
+                .dst_binding(3)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&palrle_compact_count_info),
+        ];
+        self.device.update_descriptor_sets(&palrle_compact_writes, &[]);
+
+        // Bind + push + dispatch.
+        self.device.cmd_bind_pipeline(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.palrle_compact_pipeline,
+        );
+        self.device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.palrle_compact_pipeline_layout,
+            0,
+            &[palrle_compact_ds],
+            &[],
+        );
+        let push_bytes = std::slice::from_raw_parts(
+            push_constants.as_ptr() as *const u8,
+            std::mem::size_of_val(push_constants),
+        );
+        self.device.cmd_push_constants(
+            cmd,
+            self.palrle_compact_pipeline_layout,
             vk::ShaderStageFlags::COMPUTE,
             0,
             push_bytes,
