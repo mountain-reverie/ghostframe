@@ -289,81 +289,7 @@ impl GpuFrameProcessor {
         // Note: palette_subset_fold_init descriptor set is allocated inside run_palette_subset_fold_init_stage (called below).
         // Note: palette_subset_fold descriptor set is allocated inside run_palette_subset_fold_stage (called below).
 
-        // pal_rle_index descriptor set (Stage 3)
-        let pal_rle_index_ds_alloc = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(std::slice::from_ref(&self.pal_rle_index_descriptor_set_layout));
-        let pal_rle_index_ds_guard = ScopedDescriptorSets {
-            device: &self.device,
-            pool: self.descriptor_pool,
-            sets: self.device.allocate_descriptor_sets(&pal_rle_index_ds_alloc)?,
-        };
-        let pal_rle_index_descriptor_set = pal_rle_index_ds_guard.sets[0];
-
-        // Write pal_rle_index descriptor set (Stage 3).
-        // binding 0: STORAGE_IMAGE (current_frame, read-only)
-        // binding 1: STORAGE_BUFFER (palrle_compact_list_buffer, read-only)
-        // binding 2: STORAGE_BUFFER (frame_palette_set_buffer, read-only)
-        // binding 3: STORAGE_BUFFER (per_tile_frame_palette_id_buffer, read-only)
-        // binding 4: STORAGE_BUFFER (folded_into_buffer, read-only)
-        // binding 5: STORAGE_BUFFER (index_buffer, write)
-        let pal_rle_index_image_info = [vk::DescriptorImageInfo::default()
-            .image_view(current.view)
-            .image_layout(vk::ImageLayout::GENERAL)];
-        let pal_rle_index_compact_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.palrle_compact_list_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let pal_rle_index_fps_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.frame_palette_set_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let pal_rle_index_ptfpi_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.per_tile_frame_palette_id_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let pal_rle_index_folded_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.folded_into_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let pal_rle_index_out_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.index_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let pal_rle_index_writes = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(pal_rle_index_descriptor_set)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                .image_info(&pal_rle_index_image_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(pal_rle_index_descriptor_set)
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&pal_rle_index_compact_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(pal_rle_index_descriptor_set)
-                .dst_binding(2)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&pal_rle_index_fps_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(pal_rle_index_descriptor_set)
-                .dst_binding(3)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&pal_rle_index_ptfpi_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(pal_rle_index_descriptor_set)
-                .dst_binding(4)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&pal_rle_index_folded_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(pal_rle_index_descriptor_set)
-                .dst_binding(5)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&pal_rle_index_out_info),
-        ];
-        self.device
-            .update_descriptor_sets(&pal_rle_index_writes, &[]);
+        // Note: pal_rle_index descriptor set is allocated inside run_pal_rle_index_stage (called below).
 
         // --- Command buffer (RAII-guarded) ---
         let cmd_alloc = vk::CommandBufferAllocateInfo::default()
@@ -753,34 +679,12 @@ impl GpuFrameProcessor {
         //
         // All five inputs are correctly visible at COMPUTE_SHADER stage by
         // Vulkan execution-dependency rules.
-        self.device.cmd_bind_pipeline(
+        let pal_rle_index_push: [u32; 1] = [cols];
+        let pal_rle_index_ds_guard = self.run_pal_rle_index_stage(
             cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.pal_rle_index_pipeline,
-        );
-        self.device.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.pal_rle_index_pipeline_layout,
-            0,
-            &[pal_rle_index_descriptor_set],
-            &[],
-        );
-        let stage3_push: [u32; 1] = [cols];
-        let stage3_push_bytes = std::slice::from_raw_parts(
-            stage3_push.as_ptr() as *const u8,
-            std::mem::size_of_val(&stage3_push),
-        );
-        self.device.cmd_push_constants(
-            cmd,
-            self.pal_rle_index_pipeline_layout,
-            vk::ShaderStageFlags::COMPUTE,
-            0,
-            stage3_push_bytes,
-        );
-        // Indirect dispatch: uses palrle_indirect_args_buffer (barriered at Stage 1.5b).
-        self.device
-            .cmd_dispatch_indirect(cmd, self.palrle_indirect_args_buffer, 0);
+            current.view,
+            &pal_rle_index_push,
+        )?;
 
         // 5a. Snapshot copy: current (DMA-BUF) → prev_image (owned). This
         // makes prev_image a true point-in-time snapshot of THIS frame for
@@ -1006,8 +910,10 @@ impl GpuFrameProcessor {
         //    freed when their RAII guards drop at end of scope. We touch the
         //    guards here to keep them alive past the `wait_for_fences` above.
         //    sad_ds_guard, nv12_ds_guard, analysis_ds_guard,
-        //    palrle_compact_ds_guard, palrle_indirect_args_ds_guard, and
-        //    palette_fold_ds_guard are dropped explicitly before step 9 to
+        //    palrle_compact_ds_guard, palrle_indirect_args_ds_guard,
+        //    palette_fold_ds_guard, palette_subset_fold_init_ds_guard,
+        //    palette_subset_fold_ds_guard, and pal_rle_index_ds_guard are
+        //    dropped explicitly before step 9 to
         //    release the immutable borrows on self (all are returned from helper
         //    methods whose lifetimes are tied to &self) before the mutable
         //    self.prev_image borrow.
@@ -1034,6 +940,7 @@ impl GpuFrameProcessor {
         drop(palette_fold_ds_guard);
         drop(palette_subset_fold_init_ds_guard);
         drop(palette_subset_fold_ds_guard);
+        drop(pal_rle_index_ds_guard);
 
         // 9. prev_image is persistent (own-allocated, layout still GENERAL
         // after the post-copy barrier). It now holds a snapshot of THIS frame
@@ -1102,75 +1009,7 @@ impl GpuFrameProcessor {
         // Note: palette_fold descriptor set is allocated inside run_palette_fold_stage (called below).
         // Note: palette_subset_fold_init descriptor set is allocated inside run_palette_subset_fold_init_stage (called below).
         // Note: palette_subset_fold descriptor set is allocated inside run_palette_subset_fold_stage (called below).
-
-        let pal_rle_index_ds_alloc = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(std::slice::from_ref(&self.pal_rle_index_descriptor_set_layout));
-        let pal_rle_index_ds_guard = ScopedDescriptorSets {
-            device: &self.device,
-            pool: self.descriptor_pool,
-            sets: self.device.allocate_descriptor_sets(&pal_rle_index_ds_alloc)?,
-        };
-        let pal_rle_index_descriptor_set = pal_rle_index_ds_guard.sets[0];
-
-        // Write pal_rle_index descriptor set (Stage 3).
-        let pal_rle_index_image_info = [vk::DescriptorImageInfo::default()
-            .image_view(current.view)
-            .image_layout(vk::ImageLayout::GENERAL)];
-        let pal_rle_index_compact_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.palrle_compact_list_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let pal_rle_index_fps_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.frame_palette_set_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let pal_rle_index_ptfpi_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.per_tile_frame_palette_id_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let pal_rle_index_folded_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.folded_into_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let pal_rle_index_out_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.index_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let pal_rle_index_writes = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(pal_rle_index_descriptor_set)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                .image_info(&pal_rle_index_image_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(pal_rle_index_descriptor_set)
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&pal_rle_index_compact_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(pal_rle_index_descriptor_set)
-                .dst_binding(2)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&pal_rle_index_fps_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(pal_rle_index_descriptor_set)
-                .dst_binding(3)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&pal_rle_index_ptfpi_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(pal_rle_index_descriptor_set)
-                .dst_binding(4)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&pal_rle_index_folded_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(pal_rle_index_descriptor_set)
-                .dst_binding(5)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&pal_rle_index_out_info),
-        ];
-        self.device
-            .update_descriptor_sets(&pal_rle_index_writes, &[]);
+        // Note: pal_rle_index descriptor set is allocated inside run_pal_rle_index_stage (called below).
 
         let cmd_alloc = vk::CommandBufferAllocateInfo::default()
             .command_pool(self.command_pool)
@@ -1515,33 +1354,12 @@ impl GpuFrameProcessor {
         // ============================================================
         // Stage 3: pal_rle_index
         // ============================================================
-        self.device.cmd_bind_pipeline(
+        let pal_rle_index_push: [u32; 1] = [cols];
+        let pal_rle_index_ds_guard = self.run_pal_rle_index_stage(
             cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.pal_rle_index_pipeline,
-        );
-        self.device.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.pal_rle_index_pipeline_layout,
-            0,
-            &[pal_rle_index_descriptor_set],
-            &[],
-        );
-        let stage3_push: [u32; 1] = [cols];
-        let stage3_push_bytes = std::slice::from_raw_parts(
-            stage3_push.as_ptr() as *const u8,
-            std::mem::size_of_val(&stage3_push),
-        );
-        self.device.cmd_push_constants(
-            cmd,
-            self.pal_rle_index_pipeline_layout,
-            vk::ShaderStageFlags::COMPUTE,
-            0,
-            stage3_push_bytes,
-        );
-        self.device
-            .cmd_dispatch_indirect(cmd, self.palrle_indirect_args_buffer, 0);
+            current.view,
+            &pal_rle_index_push,
+        )?;
 
         // Snapshot copy: current (GENERAL) → snapshot (TRANSFER_DST_OPTIMAL).
         // `snapshot` is always freshly allocated by `allocate_owned_image` and
@@ -2718,6 +2536,145 @@ impl GpuFrameProcessor {
             &[],
         );
         self.device.cmd_dispatch(cmd, PALETTE_HASH_SLOTS as u32, 1, 1);
+
+        Ok(guard)
+    }
+
+    /// Stage 3 — pal_rle_index compute dispatch (emits the nibble-packed
+    /// index buffer for each PalRLE-feasible tile).
+    ///
+    /// Bindings: current frame (0, STORAGE_IMAGE r/o), compact_list (1,
+    /// STORAGE_BUFFER r/o), frame_palette_set (2, r/o),
+    /// per_tile_frame_palette_id (3, r/o), folded_into (4, r/o),
+    /// index_buffer (5, r/w). Push constants `[cols]` (4 bytes).
+    ///
+    /// Uses `cmd_dispatch_indirect` against
+    /// `self.palrle_indirect_args_buffer` at offset 0 — the workgroup count
+    /// was computed at runtime by the preceding palrle_indirect_args stage.
+    ///
+    /// Caller must invoke `cmd_pipeline_barrier` AFTER this call so the
+    /// index_buffer writes are visible to the host-readback.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure: `cmd` is recording; `current_view` is in
+    /// `vk::ImageLayout::GENERAL`; preceding stages (compact, fold,
+    /// subset_fold) have populated their outputs with barriers; the
+    /// indirect-args buffer holds a valid `(group_x, group_y, group_z)`
+    /// triple at offset 0; and the returned guard is held alive until
+    /// `wait_for_fences` returns for the command buffer.
+    unsafe fn run_pal_rle_index_stage<'a>(
+        &'a self,
+        cmd: vk::CommandBuffer,
+        current_view: vk::ImageView,
+        push_constants: &[u32],
+    ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
+        // Allocate one descriptor set from the pool. The returned guard frees
+        // it on drop, ensuring the bounded pool doesn't leak on early-exit.
+        let pal_rle_index_set_layouts = [self.pal_rle_index_descriptor_set_layout];
+        let pal_rle_index_ds_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(&pal_rle_index_set_layouts);
+        let guard = ScopedDescriptorSets {
+            device: &self.device,
+            pool: self.descriptor_pool,
+            sets: self.device.allocate_descriptor_sets(&pal_rle_index_ds_alloc)?,
+        };
+        let pal_rle_index_ds = guard.sets[0];
+
+        // Write the six pal_rle_index descriptors:
+        //   binding 0 — current frame image (STORAGE_IMAGE, read-only)
+        //   binding 1 — palrle_compact_list_buffer (STORAGE_BUFFER, read-only)
+        //   binding 2 — frame_palette_set_buffer (STORAGE_BUFFER, read-only)
+        //   binding 3 — per_tile_frame_palette_id_buffer (STORAGE_BUFFER, read-only)
+        //   binding 4 — folded_into_buffer (STORAGE_BUFFER, read-only)
+        //   binding 5 — index_buffer (STORAGE_BUFFER, read-write)
+        let pal_rle_index_image_info = [vk::DescriptorImageInfo::default()
+            .image_view(current_view)
+            .image_layout(vk::ImageLayout::GENERAL)];
+        let pal_rle_index_compact_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.palrle_compact_list_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let pal_rle_index_fps_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.frame_palette_set_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let pal_rle_index_ptfpi_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.per_tile_frame_palette_id_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let pal_rle_index_folded_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.folded_into_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let pal_rle_index_out_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.index_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let pal_rle_index_writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(pal_rle_index_ds)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(&pal_rle_index_image_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(pal_rle_index_ds)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&pal_rle_index_compact_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(pal_rle_index_ds)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&pal_rle_index_fps_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(pal_rle_index_ds)
+                .dst_binding(3)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&pal_rle_index_ptfpi_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(pal_rle_index_ds)
+                .dst_binding(4)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&pal_rle_index_folded_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(pal_rle_index_ds)
+                .dst_binding(5)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&pal_rle_index_out_info),
+        ];
+        self.device.update_descriptor_sets(&pal_rle_index_writes, &[]);
+
+        // Bind + push + indirect dispatch.
+        self.device.cmd_bind_pipeline(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.pal_rle_index_pipeline,
+        );
+        self.device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.pal_rle_index_pipeline_layout,
+            0,
+            &[pal_rle_index_ds],
+            &[],
+        );
+        let push_bytes = std::slice::from_raw_parts(
+            push_constants.as_ptr() as *const u8,
+            std::mem::size_of_val(push_constants),
+        );
+        self.device.cmd_push_constants(
+            cmd,
+            self.pal_rle_index_pipeline_layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            push_bytes,
+        );
+        // palrle_indirect_args_buffer already barriered for INDIRECT_COMMAND_READ
+        // by the preceding palrle_indirect_args stage barrier in the orchestrator.
+        self.device
+            .cmd_dispatch_indirect(cmd, self.palrle_indirect_args_buffer, 0);
 
         Ok(guard)
     }
