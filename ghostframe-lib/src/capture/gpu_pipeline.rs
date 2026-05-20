@@ -17,7 +17,9 @@ use ash::vk;
 use std::ffi::CStr;
 use std::io;
 
-use super::pipeline_builder::{self, BindingSpec};
+use super::pipeline_builder::{
+    self, alloc_host_buffer, alloc_host_buffer_mapped, find_memory_type, BindingSpec,
+};
 
 // ---------------------------------------------------------------------------
 // Pipeline-wide constants
@@ -822,125 +824,50 @@ impl GpuFrameProcessor {
 
         // --- SAD output buffer ---
         let sad_buf_size = (max_tiles * 4) as vk::DeviceSize;
-        let buf_ci = vk::BufferCreateInfo::default()
-            .size(sad_buf_size)
-            .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let sad_buffer = device.create_buffer(&buf_ci, None)?;
-        let buf_reqs = device.get_buffer_memory_requirements(sad_buffer);
         let mem_props = instance.get_physical_device_memory_properties(physical_device);
-        let sad_mem_type = find_memory_type(
+        let (sad_buffer, sad_memory, sad_ptr) = alloc_host_buffer_mapped::<u32>(
+            &device,
             &mem_props,
-            buf_reqs.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )
-        .ok_or("no host-visible memory type for SAD buffer")?;
-
-        let sad_alloc = vk::MemoryAllocateInfo::default()
-            .allocation_size(buf_reqs.size)
-            .memory_type_index(sad_mem_type);
-        let sad_memory = device.allocate_memory(&sad_alloc, None)?;
-        device.bind_buffer_memory(sad_buffer, sad_memory, 0)?;
-
-        let sad_ptr = device.map_memory(sad_memory, 0, sad_buf_size, vk::MemoryMapFlags::empty())?
-            as *mut u32;
+            sad_buf_size,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            "SAD buffer",
+        )?;
 
         // --- Analysis output buffer ---
         let analysis_entry_bytes = std::mem::size_of::<TileAnalysis>() as vk::DeviceSize;
         let analysis_buf_size = (max_tiles as vk::DeviceSize) * analysis_entry_bytes;
-        let analysis_buf_ci = vk::BufferCreateInfo::default()
-            .size(analysis_buf_size)
-            .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let analysis_buffer = device.create_buffer(&analysis_buf_ci, None)?;
-        let analysis_buf_reqs = device.get_buffer_memory_requirements(analysis_buffer);
-        let analysis_mem_type = find_memory_type(
-            &mem_props,
-            analysis_buf_reqs.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )
-        .ok_or("no host-visible memory type for analysis buffer")?;
-
-        let analysis_alloc = vk::MemoryAllocateInfo::default()
-            .allocation_size(analysis_buf_reqs.size)
-            .memory_type_index(analysis_mem_type);
-        let analysis_memory = device.allocate_memory(&analysis_alloc, None)?;
-        device.bind_buffer_memory(analysis_buffer, analysis_memory, 0)?;
-
-        let analysis_ptr = device.map_memory(
-            analysis_memory,
-            0,
-            analysis_buf_size,
-            vk::MemoryMapFlags::empty(),
-        )? as *mut TileAnalysis;
+        let (analysis_buffer, analysis_memory, analysis_ptr) =
+            alloc_host_buffer_mapped::<TileAnalysis>(
+                &device,
+                &mem_props,
+                analysis_buf_size,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                "analysis buffer",
+            )?;
 
         // --- PalRLE compact list buffer ---
         // One u32 per tile slot. HOST_VISIBLE | HOST_COHERENT, STORAGE_BUFFER.
         let palrle_compact_list_size = (max_tiles * 4) as vk::DeviceSize;
-        let palrle_compact_list_buf_ci = vk::BufferCreateInfo::default()
-            .size(palrle_compact_list_size)
-            .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let palrle_compact_list_buffer = device.create_buffer(&palrle_compact_list_buf_ci, None)?;
-        let palrle_compact_list_reqs =
-            device.get_buffer_memory_requirements(palrle_compact_list_buffer);
-        let palrle_compact_list_mem_type = find_memory_type(
-            &mem_props,
-            palrle_compact_list_reqs.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )
-        .ok_or("no host-visible memory type for palrle compact list buffer")?;
-        let palrle_compact_list_alloc = vk::MemoryAllocateInfo::default()
-            .allocation_size(palrle_compact_list_reqs.size)
-            .memory_type_index(palrle_compact_list_mem_type);
-        let palrle_compact_list_memory = device.allocate_memory(&palrle_compact_list_alloc, None)?;
-        device.bind_buffer_memory(
-            palrle_compact_list_buffer,
-            palrle_compact_list_memory,
-            0,
-        )?;
-        let palrle_compact_list_ptr = device.map_memory(
-            palrle_compact_list_memory,
-            0,
-            palrle_compact_list_size,
-            vk::MemoryMapFlags::empty(),
-        )? as *mut u32;
+        let (palrle_compact_list_buffer, palrle_compact_list_memory, palrle_compact_list_ptr) =
+            alloc_host_buffer_mapped::<u32>(
+                &device,
+                &mem_props,
+                palrle_compact_list_size,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                "palrle compact list buffer",
+            )?;
 
         // --- PalRLE compact count buffer ---
         // 4 bytes (one u32). HOST_VISIBLE | HOST_COHERENT, STORAGE_BUFFER | TRANSFER_DST.
         let palrle_compact_count_size = 4_u64;
-        let palrle_compact_count_buf_ci = vk::BufferCreateInfo::default()
-            .size(palrle_compact_count_size)
-            .usage(
+        let (palrle_compact_count_buffer, palrle_compact_count_memory, palrle_compact_count_ptr) =
+            alloc_host_buffer_mapped::<u32>(
+                &device,
+                &mem_props,
+                palrle_compact_count_size,
                 vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-            )
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let palrle_compact_count_buffer =
-            device.create_buffer(&palrle_compact_count_buf_ci, None)?;
-        let palrle_compact_count_reqs =
-            device.get_buffer_memory_requirements(palrle_compact_count_buffer);
-        let palrle_compact_count_mem_type = find_memory_type(
-            &mem_props,
-            palrle_compact_count_reqs.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )
-        .ok_or("no host-visible memory type for palrle compact count buffer")?;
-        let palrle_compact_count_alloc = vk::MemoryAllocateInfo::default()
-            .allocation_size(palrle_compact_count_reqs.size)
-            .memory_type_index(palrle_compact_count_mem_type);
-        let palrle_compact_count_memory =
-            device.allocate_memory(&palrle_compact_count_alloc, None)?;
-        device.bind_buffer_memory(
-            palrle_compact_count_buffer,
-            palrle_compact_count_memory,
-            0,
-        )?;
-        let palrle_compact_count_ptr = device.map_memory(
-            palrle_compact_count_memory,
-            0,
-            palrle_compact_count_size,
-            vk::MemoryMapFlags::empty(),
-        )? as *mut u32;
+                "palrle compact count buffer",
+            )?;
 
         // --- PalRLE indirect args buffer ---
         // 12 bytes (3 u32s: group_count_x/y/z). Written by shader, read as
@@ -950,39 +877,15 @@ impl GpuFrameProcessor {
         // init — vkCmdDispatchIndirect reads correctly from HOST_VISIBLE memory.
         // PCIe-bar read cost is acceptable for 12 B per frame.
         let palrle_indirect_args_size = 12_u64;
-        let palrle_indirect_args_buf_ci = vk::BufferCreateInfo::default()
-            .size(palrle_indirect_args_size)
-            .usage(
+        let (palrle_indirect_args_buffer, palrle_indirect_args_memory, init_ptr) =
+            alloc_host_buffer_mapped::<u32>(
+                &device,
+                &mem_props,
+                palrle_indirect_args_size,
                 vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::INDIRECT_BUFFER,
-            )
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let palrle_indirect_args_buffer =
-            device.create_buffer(&palrle_indirect_args_buf_ci, None)?;
-        let palrle_indirect_args_reqs =
-            device.get_buffer_memory_requirements(palrle_indirect_args_buffer);
-        let palrle_indirect_args_mem_type = find_memory_type(
-            &mem_props,
-            palrle_indirect_args_reqs.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )
-        .ok_or("no host-visible memory type for palrle indirect args buffer")?;
-        let palrle_indirect_args_alloc = vk::MemoryAllocateInfo::default()
-            .allocation_size(palrle_indirect_args_reqs.size)
-            .memory_type_index(palrle_indirect_args_mem_type);
-        let palrle_indirect_args_memory =
-            device.allocate_memory(&palrle_indirect_args_alloc, None)?;
-        device.bind_buffer_memory(
-            palrle_indirect_args_buffer,
-            palrle_indirect_args_memory,
-            0,
-        )?;
+                "palrle indirect args buffer",
+            )?;
         // Initialize to (0, 1, 1) so a stale dispatch is a safe no-op.
-        let init_ptr = device.map_memory(
-            palrle_indirect_args_memory,
-            0,
-            palrle_indirect_args_size,
-            vk::MemoryMapFlags::empty(),
-        )? as *mut u32;
         init_ptr.write(0);
         init_ptr.add(1).write(1);
         init_ptr.add(2).write(1);
@@ -1030,127 +933,53 @@ impl GpuFrameProcessor {
         // cmd_fill_buffer so Stage 2b can safely check count == 0 per slot.
         let frame_palette_set_size =
             (PALETTE_HASH_SLOTS * std::mem::size_of::<FramePaletteEntryRaw>()) as vk::DeviceSize;
-        let frame_palette_set_buf_ci = vk::BufferCreateInfo::default()
-            .size(frame_palette_set_size)
-            .usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let frame_palette_set_buffer = device.create_buffer(&frame_palette_set_buf_ci, None)?;
-        let frame_palette_set_reqs =
-            device.get_buffer_memory_requirements(frame_palette_set_buffer);
-        let frame_palette_set_mem_type = find_memory_type(
-            &mem_props,
-            frame_palette_set_reqs.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )
-        .ok_or("no host-visible memory type for frame_palette_set buffer")?;
-        let frame_palette_set_alloc = vk::MemoryAllocateInfo::default()
-            .allocation_size(frame_palette_set_reqs.size)
-            .memory_type_index(frame_palette_set_mem_type);
-        let frame_palette_set_memory = device.allocate_memory(&frame_palette_set_alloc, None)?;
-        device.bind_buffer_memory(frame_palette_set_buffer, frame_palette_set_memory, 0)?;
-        let frame_palette_set_ptr = device.map_memory(
-            frame_palette_set_memory,
-            0,
-            frame_palette_set_size,
-            vk::MemoryMapFlags::empty(),
-        )? as *mut FramePaletteEntryRaw;
+        let (frame_palette_set_buffer, frame_palette_set_memory, frame_palette_set_ptr) =
+            alloc_host_buffer_mapped::<FramePaletteEntryRaw>(
+                &device,
+                &mem_props,
+                frame_palette_set_size,
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                "frame_palette_set buffer",
+            )?;
 
         // --- frame_palette_count buffer ---
         // 4 bytes. HOST_VISIBLE | HOST_COHERENT | TRANSFER_DST (for cmd_fill_buffer zero between frames).
         let frame_palette_count_size = 4_u64;
-        let frame_palette_count_buf_ci = vk::BufferCreateInfo::default()
-            .size(frame_palette_count_size)
-            .usage(
+        let (frame_palette_count_buffer, frame_palette_count_memory, frame_palette_count_ptr) =
+            alloc_host_buffer_mapped::<u32>(
+                &device,
+                &mem_props,
+                frame_palette_count_size,
                 vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-            )
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let frame_palette_count_buffer =
-            device.create_buffer(&frame_palette_count_buf_ci, None)?;
-        let frame_palette_count_reqs =
-            device.get_buffer_memory_requirements(frame_palette_count_buffer);
-        let frame_palette_count_mem_type = find_memory_type(
-            &mem_props,
-            frame_palette_count_reqs.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )
-        .ok_or("no host-visible memory type for frame_palette_count buffer")?;
-        let frame_palette_count_alloc = vk::MemoryAllocateInfo::default()
-            .allocation_size(frame_palette_count_reqs.size)
-            .memory_type_index(frame_palette_count_mem_type);
-        let frame_palette_count_memory =
-            device.allocate_memory(&frame_palette_count_alloc, None)?;
-        device.bind_buffer_memory(
-            frame_palette_count_buffer,
-            frame_palette_count_memory,
-            0,
-        )?;
-        let frame_palette_count_ptr = device.map_memory(
-            frame_palette_count_memory,
-            0,
-            frame_palette_count_size,
-            vk::MemoryMapFlags::empty(),
-        )? as *mut u32;
+                "frame_palette_count buffer",
+            )?;
 
         // --- hash_table buffer ---
         // 256 slots × 4 bytes = 1024 bytes. HOST_VISIBLE | HOST_COHERENT | TRANSFER_DST.
         // No persistent CPU mapping needed.
-        let hash_table_size = 256_u64 * 4;
-        let hash_table_buf_ci = vk::BufferCreateInfo::default()
-            .size(hash_table_size)
-            .usage(
-                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-            )
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let hash_table_buffer = device.create_buffer(&hash_table_buf_ci, None)?;
-        let hash_table_reqs = device.get_buffer_memory_requirements(hash_table_buffer);
-        let hash_table_mem_type = find_memory_type(
+        let (hash_table_buffer, hash_table_memory) = alloc_host_buffer(
+            &device,
             &mem_props,
-            hash_table_reqs.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )
-        .ok_or("no host-visible memory type for hash_table buffer")?;
-        let hash_table_alloc = vk::MemoryAllocateInfo::default()
-            .allocation_size(hash_table_reqs.size)
-            .memory_type_index(hash_table_mem_type);
-        let hash_table_memory = device.allocate_memory(&hash_table_alloc, None)?;
-        device.bind_buffer_memory(hash_table_buffer, hash_table_memory, 0)?;
+            PALETTE_SLOT_U32_BYTES,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            "hash_table buffer",
+        )?;
 
         // --- per_tile_frame_palette_id buffer ---
         // (max_tiles + 3) / 4 * 4 bytes (round up to u32 alignment).
         // HOST_VISIBLE | HOST_COHERENT | TRANSFER_DST, STORAGE_BUFFER.
         let per_tile_id_size = (((max_tiles + 3) / 4 * 4) as vk::DeviceSize).max(4);
-        let per_tile_id_buf_ci = vk::BufferCreateInfo::default()
-            .size(per_tile_id_size)
-            .usage(
-                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-            )
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let per_tile_frame_palette_id_buffer =
-            device.create_buffer(&per_tile_id_buf_ci, None)?;
-        let per_tile_id_reqs =
-            device.get_buffer_memory_requirements(per_tile_frame_palette_id_buffer);
-        let per_tile_id_mem_type = find_memory_type(
-            &mem_props,
-            per_tile_id_reqs.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )
-        .ok_or("no host-visible memory type for per_tile_frame_palette_id buffer")?;
-        let per_tile_id_alloc = vk::MemoryAllocateInfo::default()
-            .allocation_size(per_tile_id_reqs.size)
-            .memory_type_index(per_tile_id_mem_type);
-        let per_tile_frame_palette_id_memory =
-            device.allocate_memory(&per_tile_id_alloc, None)?;
-        device.bind_buffer_memory(
+        let (
             per_tile_frame_palette_id_buffer,
             per_tile_frame_palette_id_memory,
-            0,
-        )?;
-        let per_tile_frame_palette_id_ptr = device.map_memory(
-            per_tile_frame_palette_id_memory,
-            0,
+            per_tile_frame_palette_id_ptr,
+        ) = alloc_host_buffer_mapped::<u8>(
+            &device,
+            &mem_props,
             per_tile_id_size,
-            vk::MemoryMapFlags::empty(),
-        )? as *mut u8;
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            "per_tile_frame_palette_id buffer",
+        )?;
 
         // --- palette_subset_fold_init shader module ---
         let palette_subset_fold_init_spv =
@@ -1212,61 +1041,28 @@ impl GpuFrameProcessor {
         // to vkCmdFillBuffer if the init dispatch is ever replaced.
         // 256 slots × 4 bytes = 1024 bytes. HOST_VISIBLE | HOST_COHERENT,
         // persistently mapped for CPU readback (Task 12b+).
-        let folded_into_size = 256_u64 * 4;
-        let folded_into_buf_ci = vk::BufferCreateInfo::default()
-            .size(folded_into_size)
-            .usage(
+        let (folded_into_buffer, folded_into_memory, folded_into_ptr) =
+            alloc_host_buffer_mapped::<u32>(
+                &device,
+                &mem_props,
+                PALETTE_SLOT_U32_BYTES,
                 vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-            )
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let folded_into_buffer = device.create_buffer(&folded_into_buf_ci, None)?;
-        let folded_into_reqs = device.get_buffer_memory_requirements(folded_into_buffer);
-        let folded_into_mem_type = find_memory_type(
-            &mem_props,
-            folded_into_reqs.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )
-        .ok_or("no host-visible memory type for folded_into buffer")?;
-        let folded_into_alloc = vk::MemoryAllocateInfo::default()
-            .allocation_size(folded_into_reqs.size)
-            .memory_type_index(folded_into_mem_type);
-        let folded_into_memory = device.allocate_memory(&folded_into_alloc, None)?;
-        device.bind_buffer_memory(folded_into_buffer, folded_into_memory, 0)?;
-        let folded_into_ptr = device.map_memory(
-            folded_into_memory,
-            0,
-            folded_into_size,
-            vk::MemoryMapFlags::empty(),
-        )? as *mut u32;
+                "folded_into buffer",
+            )?;
 
         // --- index_buffer (Stage 3 output) ---
         // max_tiles * 512 bytes: each tile has 128 u32 entries of packed 4-bit indices.
         // HOST_VISIBLE | HOST_COHERENT, STORAGE_BUFFER, persistently mapped.
         let index_buffer_size =
             ((max_tiles as vk::DeviceSize) * PER_TILE_INDEX_BYTES).max(PER_TILE_INDEX_BYTES);
-        let index_buf_ci = vk::BufferCreateInfo::default()
-            .size(index_buffer_size)
-            .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let index_buffer = device.create_buffer(&index_buf_ci, None)?;
-        let index_buf_reqs = device.get_buffer_memory_requirements(index_buffer);
-        let index_mem_type = find_memory_type(
-            &mem_props,
-            index_buf_reqs.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )
-        .ok_or("no host-visible memory type for index_buffer")?;
-        let index_alloc = vk::MemoryAllocateInfo::default()
-            .allocation_size(index_buf_reqs.size)
-            .memory_type_index(index_mem_type);
-        let index_buffer_memory = device.allocate_memory(&index_alloc, None)?;
-        device.bind_buffer_memory(index_buffer, index_buffer_memory, 0)?;
-        let index_buffer_ptr = device.map_memory(
-            index_buffer_memory,
-            0,
-            index_buffer_size,
-            vk::MemoryMapFlags::empty(),
-        )? as *mut u8;
+        let (index_buffer, index_buffer_memory, index_buffer_ptr) =
+            alloc_host_buffer_mapped::<u8>(
+                &device,
+                &mem_props,
+                index_buffer_size,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                "index buffer",
+            )?;
 
         Ok(Self {
             _entry: entry,
@@ -1383,33 +1179,16 @@ impl GpuFrameProcessor {
         let uv_offset = y_stride * height; // UV follows immediately after Y
         let total = (uv_offset + uv_stride * height.div_ceil(2)) as vk::DeviceSize;
 
-        let buf_ci = vk::BufferCreateInfo::default()
-            .size(total)
-            .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let buffer = self.device.create_buffer(&buf_ci, None)?;
-        let reqs = self.device.get_buffer_memory_requirements(buffer);
-
         let mem_props = self
             .instance
             .get_physical_device_memory_properties(self.physical_device);
-
-        let mem_type = find_memory_type(
+        let (buffer, memory, ptr) = alloc_host_buffer_mapped::<u8>(
+            &self.device,
             &mem_props,
-            reqs.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )
-        .ok_or("no host-visible memory type for NV12 buffer")?;
-
-        let alloc = vk::MemoryAllocateInfo::default()
-            .allocation_size(reqs.size)
-            .memory_type_index(mem_type);
-        let memory = self.device.allocate_memory(&alloc, None)?;
-        self.device.bind_buffer_memory(buffer, memory, 0)?;
-
-        let ptr =
-            self.device
-                .map_memory(memory, 0, total, vk::MemoryMapFlags::empty())? as *mut u8;
+            total,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            "NV12 buffer",
+        )?;
 
         self.nv12_buffer = Some(NV12Buffer {
             buffer,
@@ -4303,25 +4082,6 @@ impl Drop for GpuFrameProcessor {
             self.instance.destroy_instance(None);
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Find a memory type index matching the given type filter and property flags.
-fn find_memory_type(
-    mem_props: &vk::PhysicalDeviceMemoryProperties,
-    type_filter: u32,
-    required_flags: vk::MemoryPropertyFlags,
-) -> Option<u32> {
-    (0..mem_props.memory_type_count).find(|&i| {
-        let suitable = (type_filter & (1 << i)) != 0;
-        let has_flags = mem_props.memory_types[i as usize]
-            .property_flags
-            .contains(required_flags);
-        suitable && has_flags
-    })
 }
 
 
