@@ -286,22 +286,7 @@ impl GpuFrameProcessor {
         // Note: palrle_indirect_args descriptor set is allocated inside run_palrle_indirect_args_stage (called below).
 
         // Note: palette_fold descriptor set is allocated inside run_palette_fold_stage (called below).
-
-        // palette_subset_fold_init descriptor set (Stage 2b init)
-        let palette_subset_fold_init_ds_alloc = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(std::slice::from_ref(
-                &self.palette_subset_fold_init_descriptor_set_layout,
-            ));
-        let palette_subset_fold_init_ds_guard = ScopedDescriptorSets {
-            device: &self.device,
-            pool: self.descriptor_pool,
-            sets: self
-                .device
-                .allocate_descriptor_sets(&palette_subset_fold_init_ds_alloc)?,
-        };
-        let palette_subset_fold_init_descriptor_set =
-            palette_subset_fold_init_ds_guard.sets[0];
+        // Note: palette_subset_fold_init descriptor set is allocated inside run_palette_subset_fold_init_stage (called below).
 
         // palette_subset_fold descriptor set (Stage 2b)
         let palette_subset_fold_ds_alloc = vk::DescriptorSetAllocateInfo::default()
@@ -328,20 +313,6 @@ impl GpuFrameProcessor {
             sets: self.device.allocate_descriptor_sets(&pal_rle_index_ds_alloc)?,
         };
         let pal_rle_index_descriptor_set = pal_rle_index_ds_guard.sets[0];
-
-        // Write palette_subset_fold_init descriptor set.
-        // binding 0: folded_into_buffer (write)
-        let subset_fold_init_folded_into_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.folded_into_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let subset_fold_init_writes = [vk::WriteDescriptorSet::default()
-            .dst_set(palette_subset_fold_init_descriptor_set)
-            .dst_binding(0)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .buffer_info(&subset_fold_init_folded_into_info)];
-        self.device
-            .update_descriptor_sets(&subset_fold_init_writes, &[]);
 
         // Write palette_subset_fold descriptor set.
         // binding 0: frame_palette_set_buffer (read-only)
@@ -755,20 +726,8 @@ impl GpuFrameProcessor {
         // ============================================================
         // Stage 2b init: write default-self sentinel to folded_into
         // ============================================================
-        self.device.cmd_bind_pipeline(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.palette_subset_fold_init_pipeline,
-        );
-        self.device.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.palette_subset_fold_init_pipeline_layout,
-            0,
-            &[palette_subset_fold_init_descriptor_set],
-            &[],
-        );
-        self.device.cmd_dispatch(cmd, 1, 1, 1);
+        let palette_subset_fold_init_ds_guard =
+            self.run_palette_subset_fold_init_stage(cmd, (1, 1, 1))?;
 
         // Barrier between init and fold: folded_into writes must be visible.
         let stage_2b_init_to_fold_barrier = vk::BufferMemoryBarrier::default()
@@ -1125,6 +1084,7 @@ impl GpuFrameProcessor {
         drop(palrle_compact_ds_guard);
         drop(palrle_indirect_args_ds_guard);
         drop(palette_fold_ds_guard);
+        drop(palette_subset_fold_init_ds_guard);
 
         // 9. prev_image is persistent (own-allocated, layout still GENERAL
         // after the post-copy barrier). It now holds a snapshot of THIS frame
@@ -1191,21 +1151,7 @@ impl GpuFrameProcessor {
 
         // Allocate descriptor sets for Stages 2b-3 (all RAII-guarded).
         // Note: palette_fold descriptor set is allocated inside run_palette_fold_stage (called below).
-
-        let palette_subset_fold_init_ds_alloc = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(std::slice::from_ref(
-                &self.palette_subset_fold_init_descriptor_set_layout,
-            ));
-        let palette_subset_fold_init_ds_guard = ScopedDescriptorSets {
-            device: &self.device,
-            pool: self.descriptor_pool,
-            sets: self
-                .device
-                .allocate_descriptor_sets(&palette_subset_fold_init_ds_alloc)?,
-        };
-        let palette_subset_fold_init_descriptor_set =
-            palette_subset_fold_init_ds_guard.sets[0];
+        // Note: palette_subset_fold_init descriptor set is allocated inside run_palette_subset_fold_init_stage (called below).
 
         let palette_subset_fold_ds_alloc = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
@@ -1230,19 +1176,6 @@ impl GpuFrameProcessor {
             sets: self.device.allocate_descriptor_sets(&pal_rle_index_ds_alloc)?,
         };
         let pal_rle_index_descriptor_set = pal_rle_index_ds_guard.sets[0];
-
-        // Write palette_subset_fold_init descriptor set.
-        let subset_fold_init_folded_into_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.folded_into_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let subset_fold_init_writes = [vk::WriteDescriptorSet::default()
-            .dst_set(palette_subset_fold_init_descriptor_set)
-            .dst_binding(0)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .buffer_info(&subset_fold_init_folded_into_info)];
-        self.device
-            .update_descriptor_sets(&subset_fold_init_writes, &[]);
 
         // Write palette_subset_fold descriptor set.
         let subset_fold_set_info = [vk::DescriptorBufferInfo::default()
@@ -1620,20 +1553,8 @@ impl GpuFrameProcessor {
         // ============================================================
         // Stage 2b init: write default-self sentinel to folded_into
         // ============================================================
-        self.device.cmd_bind_pipeline(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.palette_subset_fold_init_pipeline,
-        );
-        self.device.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.palette_subset_fold_init_pipeline_layout,
-            0,
-            &[palette_subset_fold_init_descriptor_set],
-            &[],
-        );
-        self.device.cmd_dispatch(cmd, 1, 1, 1);
+        let palette_subset_fold_init_ds_guard =
+            self.run_palette_subset_fold_init_stage(cmd, (1, 1, 1))?;
 
         // Barrier between init and fold: folded_into writes must be visible.
         let stage_2b_init_to_fold_barrier = vk::BufferMemoryBarrier::default()
@@ -2748,6 +2669,76 @@ impl GpuFrameProcessor {
         // by the Stage 1.5b barrier in the orchestrator.
         self.device
             .cmd_dispatch_indirect(cmd, self.palrle_indirect_args_buffer, 0);
+
+        Ok(guard)
+    }
+
+    /// Stage 2b init — zero out the `folded_into` array to the default-self
+    /// sentinel before the subset-fold scan.
+    ///
+    /// Single STORAGE_BUFFER binding: `folded_into_buffer` at binding 0.
+    /// No push constants.
+    ///
+    /// Caller must invoke `cmd_pipeline_barrier` AFTER this call so the
+    /// folded_into writes are visible to the subsequent
+    /// `palette_subset_fold` stage.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure: `cmd` is recording; `folded_into_buffer` is
+    /// bound to memory; the workgroup count provided initializes every
+    /// `PALETTE_HASH_SLOTS` entry (consult the shader's `@workgroup_size`
+    /// attribute); and the returned guard is held alive until
+    /// `wait_for_fences` returns for the command buffer (dropping it
+    /// earlier returns the descriptor set to the pool while the GPU is
+    /// still using it).
+    unsafe fn run_palette_subset_fold_init_stage<'a>(
+        &'a self,
+        cmd: vk::CommandBuffer,
+        workgroups: (u32, u32, u32),
+    ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
+        // Allocate one descriptor set from the pool. The returned guard frees
+        // it on drop, ensuring the bounded pool doesn't leak on early-exit.
+        let palette_subset_fold_init_set_layouts = [self.palette_subset_fold_init_descriptor_set_layout];
+        let palette_subset_fold_init_ds_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(&palette_subset_fold_init_set_layouts);
+        let guard = ScopedDescriptorSets {
+            device: &self.device,
+            pool: self.descriptor_pool,
+            sets: self.device.allocate_descriptor_sets(&palette_subset_fold_init_ds_alloc)?,
+        };
+        let palette_subset_fold_init_ds = guard.sets[0];
+
+        // Write the single palette_subset_fold_init descriptor (STORAGE_BUFFER):
+        //   binding 0 — folded_into_buffer (write)
+        let palette_subset_fold_init_folded_into_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.folded_into_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let palette_subset_fold_init_writes = [vk::WriteDescriptorSet::default()
+            .dst_set(palette_subset_fold_init_ds)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&palette_subset_fold_init_folded_into_info)];
+        self.device
+            .update_descriptor_sets(&palette_subset_fold_init_writes, &[]);
+
+        // Bind + direct dispatch. No push constants for this stage.
+        self.device.cmd_bind_pipeline(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.palette_subset_fold_init_pipeline,
+        );
+        self.device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.palette_subset_fold_init_pipeline_layout,
+            0,
+            &[palette_subset_fold_init_ds],
+            &[],
+        );
+        self.device.cmd_dispatch(cmd, workgroups.0, workgroups.1, workgroups.2);
 
         Ok(guard)
     }
