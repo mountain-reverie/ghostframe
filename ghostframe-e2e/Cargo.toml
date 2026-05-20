@@ -16,6 +16,12 @@ path = "src/lib.rs"
 # GHOSTFRAME_OUTBOUND_LOSS_* / GHOSTFRAME_INBOUND_LOSS_* env vars take effect.
 ghostframe-lib = { path = "../ghostframe-lib", features = ["test-loss-injection"] }
 ghostframe-test-pattern = { path = "../ghostframe-test-pattern" }
+# loopback_h3 integration test uses quinn-proto directly for QUIC/H3 harness.
+quinn-proto = { workspace = true }
+rustls = { workspace = true }
+rcgen = { workspace = true }
+time = { workspace = true }
+web-transport-proto = { workspace = true }
 
 [dev-dependencies]
 # Versions copied verbatim from ghostframe-lib/Cargo.toml's [dev-dependencies].

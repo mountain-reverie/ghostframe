@@ -1479,12 +1479,17 @@ dependencies = [
  "ghostframe-test-pattern",
  "image",
  "image-compare",
+ "quinn-proto",
+ "rcgen",
+ "rustls",
  "serde_json",
  "testcontainers",
+ "time",
  "tokio",
  "tower-http",
  "tracing-subscriber",
  "url",
+ "web-transport-proto",
 ]
 
 [[package]]
