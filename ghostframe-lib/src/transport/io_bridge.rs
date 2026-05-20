@@ -513,6 +513,34 @@ impl IoBridge {
         }
     }
 
+    /// Emit the frame-dimensions datagram on the first frame of each session and
+    /// whenever dimensions change, retransmitting `FRAME_DIMENSIONS_RETRANSMITS`
+    /// additional times to absorb datagram loss. Called by both
+    /// `process_frame_cpu` and `process_frame_gpu`.
+    fn emit_frame_dimensions(
+        &mut self,
+        seq: u32,
+        timestamp_us: u32,
+        width: u32,
+        height: u32,
+    ) {
+        let dims_changed = self.last_emitted_dimensions != Some((width, height));
+        if dims_changed {
+            self.dimensions_retransmits_left = FRAME_DIMENSIONS_RETRANSMITS;
+            self.last_emitted_dimensions = Some((width, height));
+        }
+        if self.dimensions_retransmits_left > 0 {
+            let dg = crate::transport::protocol::build_frame_dimensions_datagram(
+                seq,
+                timestamp_us,
+                width,
+                height,
+            );
+            self.send_to_all_sessions(&dg);
+            self.dimensions_retransmits_left -= 1;
+        }
+    }
+
     /// Shared scheduler dispatch: grid-sync → RTT update → bump+encode+enqueue
     /// per dirty tile → tick → fragment+send. Called by both `process_frame_cpu`
     /// and `process_frame_gpu`'s `FrameMode::TileCodec` branch.
@@ -904,21 +932,7 @@ impl IoBridge {
 
         // Emit frame-dimensions datagram on first frame, on dimension change,
         // and N more times after any change to absorb datagram loss.
-        let dims_changed = self.last_emitted_dimensions != Some((frame.width, frame.height));
-        if dims_changed {
-            self.dimensions_retransmits_left = FRAME_DIMENSIONS_RETRANSMITS;
-            self.last_emitted_dimensions = Some((frame.width, frame.height));
-        }
-        if self.dimensions_retransmits_left > 0 {
-            let dg = crate::transport::protocol::build_frame_dimensions_datagram(
-                seq,
-                frame.timestamp_us,
-                frame.width,
-                frame.height,
-            );
-            self.send_to_all_sessions(&dg);
-            self.dimensions_retransmits_left -= 1;
-        }
+        self.emit_frame_dimensions(seq, frame.timestamp_us, frame.width, frame.height);
 
         // During QUIC slow-start after a new session connects, datagrams may
         // be silently dropped by congestion control. Use no-commit mode so
@@ -1013,21 +1027,7 @@ impl IoBridge {
 
         // Emit frame-dimensions datagram on first frame, on dimension change,
         // and N more times after any change to absorb datagram loss.
-        let dims_changed = self.last_emitted_dimensions != Some((frame.width, frame.height));
-        if dims_changed {
-            self.dimensions_retransmits_left = FRAME_DIMENSIONS_RETRANSMITS;
-            self.last_emitted_dimensions = Some((frame.width, frame.height));
-        }
-        if self.dimensions_retransmits_left > 0 {
-            let dg = crate::transport::protocol::build_frame_dimensions_datagram(
-                seq,
-                frame.timestamp_us,
-                frame.width,
-                frame.height,
-            );
-            self.send_to_all_sessions(&dg);
-            self.dimensions_retransmits_left -= 1;
-        }
+        self.emit_frame_dimensions(seq, frame.timestamp_us, frame.width, frame.height);
 
         // GPU pipeline: Vulkan SAD dirty detection + NV12 conversion
         let processor = self.gpu_frame_processor.as_mut().unwrap();
@@ -1084,7 +1084,9 @@ impl IoBridge {
             .map(|&idx| (idx % cols, idx / cols))
             .collect();
 
-        // Keep metrics_tracker AND scheduler grids in sync with dirty-detection.
+        // Keep metrics_tracker AND scheduler grids in sync with dirty-detection
+        // (before the early return on empty dirty_xy, so the scheduler stays
+        // consistent even when no tiles are dispatched this frame).
         if self.metrics_tracker.cols() != cols || self.metrics_tracker.rows() != rows {
             self.metrics_tracker.resize(cols, rows);
             self.scheduler.resize(cols, rows);
