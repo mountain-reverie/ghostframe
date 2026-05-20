@@ -279,16 +279,7 @@ impl GpuFrameProcessor {
 
         // Allocate descriptor sets for both passes. Wrap in RAII guards so any
         // subsequent `?` early-exit frees the sets back to the bounded pool.
-        let sad_set_layouts = [self.descriptor_set_layout];
-        let sad_ds_alloc = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(&sad_set_layouts);
-        let sad_ds_guard = ScopedDescriptorSets {
-            device: &self.device,
-            pool: self.descriptor_pool,
-            sets: self.device.allocate_descriptor_sets(&sad_ds_alloc)?,
-        };
-        let sad_ds = sad_ds_guard.sets[0];
+        // Note: SAD descriptor set is allocated inside run_sad_stage (called below).
 
         let nv12_set_layouts = [self.nv12_descriptor_set_layout];
         let nv12_ds_alloc = vk::DescriptorSetAllocateInfo::default()
@@ -386,36 +377,6 @@ impl GpuFrameProcessor {
             sets: self.device.allocate_descriptor_sets(&pal_rle_index_ds_alloc)?,
         };
         let pal_rle_index_descriptor_set = pal_rle_index_ds_guard.sets[0];
-
-        // Write SAD descriptor set.
-        let current_image_info = [vk::DescriptorImageInfo::default()
-            .image_view(current.view)
-            .image_layout(vk::ImageLayout::GENERAL)];
-        let prev_image_info = [vk::DescriptorImageInfo::default()
-            .image_view(prev_view)
-            .image_layout(vk::ImageLayout::GENERAL)];
-        let sad_buffer_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.sad_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let sad_writes = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(sad_ds)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                .image_info(&current_image_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(sad_ds)
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                .image_info(&prev_image_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(sad_ds)
-                .dst_binding(2)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&sad_buffer_info),
-        ];
-        self.device.update_descriptor_sets(&sad_writes, &[]);
 
         // Write NV12 descriptor set.
         let nv12_image_info = [vk::DescriptorImageInfo::default()
@@ -760,29 +721,14 @@ impl GpuFrameProcessor {
         );
 
         // 2. SAD dispatch
-        self.device
-            .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline);
-        self.device.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.pipeline_layout,
-            0,
-            &[sad_ds],
-            &[],
-        );
         let sad_push: [u32; 3] = [width, height, cols];
-        let sad_push_bytes = std::slice::from_raw_parts(
-            sad_push.as_ptr() as *const u8,
-            std::mem::size_of_val(&sad_push),
-        );
-        self.device.cmd_push_constants(
+        let sad_ds_guard = self.run_sad_stage(
             cmd,
-            self.pipeline_layout,
-            vk::ShaderStageFlags::COMPUTE,
-            0,
-            sad_push_bytes,
-        );
-        self.device.cmd_dispatch(cmd, cols, rows, 1);
+            current.view,
+            prev_view,
+            &sad_push,
+            (cols, rows, 1),
+        )?;
 
         // 3. No barrier needed between SAD and NV12 dispatches:
         //    - both read `current.image` (read-after-read is hazard-free),
@@ -1466,8 +1412,10 @@ impl GpuFrameProcessor {
         // 8. Per-frame transients (descriptor sets, command buffer, fence) are
         //    freed when their RAII guards drop at end of scope. We touch the
         //    guards here to keep them alive past the `wait_for_fences` above.
+        //    sad_ds_guard is dropped explicitly before step 9 to release the
+        //    immutable borrow on self (it is returned from run_sad_stage, whose
+        //    lifetime is tied to &self) before the mutable self.prev_image borrow.
         let _ = (
-            &sad_ds_guard,
             &nv12_ds_guard,
             &analysis_ds_guard,
             &palrle_compact_ds_guard,
@@ -1479,6 +1427,7 @@ impl GpuFrameProcessor {
             &cmd_guard,
             &fence_guard,
         );
+        drop(sad_ds_guard);
 
         // 9. prev_image is persistent (own-allocated, layout still GENERAL
         // after the post-copy barrier). It now holds a snapshot of THIS frame
@@ -2785,5 +2734,103 @@ impl GpuFrameProcessor {
             width,
             height,
         })
+    }
+
+    /// SAD (Sum of Absolute Differences) compute dispatch.
+    ///
+    /// Reads the current frame image (binding 0) and the previous-frame
+    /// owned-image snapshot (binding 1), writes per-tile SAD scores to
+    /// the SAD output buffer (binding 2). Push constants are
+    /// `[width, height, cols]` (12 bytes).
+    ///
+    /// Caller must invoke `cmd_pipeline_barrier` AFTER this call to make
+    /// the SAD output buffer visible to downstream stages.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure: `cmd` is currently recording; the image views
+    /// passed are in `vk::ImageLayout::GENERAL` and remain valid for the
+    /// duration of the recording; the workgroup count `(cols, rows, 1)`
+    /// matches the SAD shader's expected dispatch shape.
+    unsafe fn run_sad_stage<'a>(
+        &'a self,
+        cmd: vk::CommandBuffer,
+        current_view: vk::ImageView,
+        prev_view: vk::ImageView,
+        push_constants: &[u32],
+        workgroups: (u32, u32, u32),
+    ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
+        // Allocate one descriptor set from the pool. The returned guard frees
+        // it on drop, ensuring the bounded pool doesn't leak on early-exit.
+        let sad_set_layouts = [self.descriptor_set_layout];
+        let sad_ds_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(&sad_set_layouts);
+        let guard = ScopedDescriptorSets {
+            device: &self.device,
+            pool: self.descriptor_pool,
+            sets: self.device.allocate_descriptor_sets(&sad_ds_alloc)?,
+        };
+        let sad_ds = guard.sets[0];
+
+        // Write the three SAD descriptors:
+        //   binding 0 — current frame image (STORAGE_IMAGE, read)
+        //   binding 1 — previous frame image (STORAGE_IMAGE, read)
+        //   binding 2 — SAD output buffer    (STORAGE_BUFFER, write)
+        let current_image_info = [vk::DescriptorImageInfo::default()
+            .image_view(current_view)
+            .image_layout(vk::ImageLayout::GENERAL)];
+        let prev_image_info = [vk::DescriptorImageInfo::default()
+            .image_view(prev_view)
+            .image_layout(vk::ImageLayout::GENERAL)];
+        let sad_buffer_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.sad_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let sad_writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(sad_ds)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(&current_image_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(sad_ds)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(&prev_image_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(sad_ds)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&sad_buffer_info),
+        ];
+        self.device.update_descriptor_sets(&sad_writes, &[]);
+
+        // Bind + push + dispatch.
+        self.device
+            .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline);
+        self.device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.pipeline_layout,
+            0,
+            &[guard.sets[0]],
+            &[],
+        );
+        let push_bytes = std::slice::from_raw_parts(
+            push_constants.as_ptr() as *const u8,
+            std::mem::size_of_val(push_constants),
+        );
+        self.device.cmd_push_constants(
+            cmd,
+            self.pipeline_layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            push_bytes,
+        );
+        self.device
+            .cmd_dispatch(cmd, workgroups.0, workgroups.1, workgroups.2);
+
+        Ok(guard)
     }
 }
