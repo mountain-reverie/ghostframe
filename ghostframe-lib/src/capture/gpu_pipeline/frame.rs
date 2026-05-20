@@ -285,16 +285,7 @@ impl GpuFrameProcessor {
         // Note: palrle_compact descriptor set is allocated inside run_palrle_compact_stage (called below).
         // Note: palrle_indirect_args descriptor set is allocated inside run_palrle_indirect_args_stage (called below).
 
-        // palette_fold descriptor set (Stage 2a)
-        let palette_fold_ds_alloc = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(std::slice::from_ref(&self.palette_fold_descriptor_set_layout));
-        let palette_fold_ds_guard = ScopedDescriptorSets {
-            device: &self.device,
-            pool: self.descriptor_pool,
-            sets: self.device.allocate_descriptor_sets(&palette_fold_ds_alloc)?,
-        };
-        let palette_fold_descriptor_set = palette_fold_ds_guard.sets[0];
+        // Note: palette_fold descriptor set is allocated inside run_palette_fold_stage (called below).
 
         // palette_subset_fold_init descriptor set (Stage 2b init)
         let palette_subset_fold_init_ds_alloc = vk::DescriptorSetAllocateInfo::default()
@@ -337,71 +328,6 @@ impl GpuFrameProcessor {
             sets: self.device.allocate_descriptor_sets(&pal_rle_index_ds_alloc)?,
         };
         let pal_rle_index_descriptor_set = pal_rle_index_ds_guard.sets[0];
-
-        // Write palette_fold descriptor set.
-        // binding 0: analysis_buffer (read-only)
-        // binding 1: palrle_compact_list_buffer (read-only)
-        // binding 2: frame_palette_set_buffer (write)
-        // binding 3: frame_palette_count_buffer (atomic write)
-        // binding 4: hash_table_buffer (atomic CAS state)
-        // binding 5: per_tile_frame_palette_id_buffer (write)
-        let palette_fold_analysis_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.analysis_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let palette_fold_compact_list_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.palrle_compact_list_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let palette_fold_set_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.frame_palette_set_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let palette_fold_count_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.frame_palette_count_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let palette_fold_hash_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.hash_table_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let palette_fold_per_tile_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.per_tile_frame_palette_id_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let palette_fold_writes = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(palette_fold_descriptor_set)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&palette_fold_analysis_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(palette_fold_descriptor_set)
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&palette_fold_compact_list_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(palette_fold_descriptor_set)
-                .dst_binding(2)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&palette_fold_set_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(palette_fold_descriptor_set)
-                .dst_binding(3)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&palette_fold_count_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(palette_fold_descriptor_set)
-                .dst_binding(4)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&palette_fold_hash_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(palette_fold_descriptor_set)
-                .dst_binding(5)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&palette_fold_per_tile_info),
-        ];
-        self.device.update_descriptor_sets(&palette_fold_writes, &[]);
 
         // Write palette_subset_fold_init descriptor set.
         // binding 0: folded_into_buffer (write)
@@ -786,24 +712,8 @@ impl GpuFrameProcessor {
             &[],
         );
 
-        // Stage 2a: indirect dispatch.
-        self.device.cmd_bind_pipeline(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.palette_fold_pipeline,
-        );
-        self.device.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.palette_fold_pipeline_layout,
-            0,
-            &[palette_fold_descriptor_set],
-            &[],
-        );
-        // palrle_indirect_args_buffer already barriered for INDIRECT_COMMAND_READ
-        // by the Stage 1.5b barrier above.
-        self.device
-            .cmd_dispatch_indirect(cmd, self.palrle_indirect_args_buffer, 0);
+        // Stage 2a: palette fold (indirect dispatch via helper).
+        let palette_fold_ds_guard = self.run_palette_fold_stage(cmd)?;
 
         // Barrier: Stage 2a outputs available to downstream stages and HOST readback.
         let stage_2a_output_barriers = [
@@ -1189,10 +1099,11 @@ impl GpuFrameProcessor {
         //    freed when their RAII guards drop at end of scope. We touch the
         //    guards here to keep them alive past the `wait_for_fences` above.
         //    sad_ds_guard, nv12_ds_guard, analysis_ds_guard,
-        //    palrle_compact_ds_guard, and palrle_indirect_args_ds_guard are
-        //    dropped explicitly before step 9 to release the immutable borrows
-        //    on self (all are returned from helper methods whose lifetimes are
-        //    tied to &self) before the mutable self.prev_image borrow.
+        //    palrle_compact_ds_guard, palrle_indirect_args_ds_guard, and
+        //    palette_fold_ds_guard are dropped explicitly before step 9 to
+        //    release the immutable borrows on self (all are returned from helper
+        //    methods whose lifetimes are tied to &self) before the mutable
+        //    self.prev_image borrow.
         //    GPU-safety: these drops must NOT move above the `wait_for_fences` at
         //    step 6 — releasing descriptor sets while the GPU is still using them
         //    is undefined behaviour (use-after-free in the descriptor pool).
@@ -1213,6 +1124,7 @@ impl GpuFrameProcessor {
         drop(analysis_ds_guard);
         drop(palrle_compact_ds_guard);
         drop(palrle_indirect_args_ds_guard);
+        drop(palette_fold_ds_guard);
 
         // 9. prev_image is persistent (own-allocated, layout still GENERAL
         // after the post-copy barrier). It now holds a snapshot of THIS frame
@@ -1277,16 +1189,8 @@ impl GpuFrameProcessor {
         // Note: palrle_compact descriptor set is allocated inside run_palrle_compact_stage (called below).
         // Note: palrle_indirect_args descriptor set is allocated inside run_palrle_indirect_args_stage (called below).
 
-        // Allocate descriptor sets for Stages 2a-3 (all RAII-guarded).
-        let palette_fold_ds_alloc = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(std::slice::from_ref(&self.palette_fold_descriptor_set_layout));
-        let palette_fold_ds_guard = ScopedDescriptorSets {
-            device: &self.device,
-            pool: self.descriptor_pool,
-            sets: self.device.allocate_descriptor_sets(&palette_fold_ds_alloc)?,
-        };
-        let palette_fold_descriptor_set = palette_fold_ds_guard.sets[0];
+        // Allocate descriptor sets for Stages 2b-3 (all RAII-guarded).
+        // Note: palette_fold descriptor set is allocated inside run_palette_fold_stage (called below).
 
         let palette_subset_fold_init_ds_alloc = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
@@ -1326,65 +1230,6 @@ impl GpuFrameProcessor {
             sets: self.device.allocate_descriptor_sets(&pal_rle_index_ds_alloc)?,
         };
         let pal_rle_index_descriptor_set = pal_rle_index_ds_guard.sets[0];
-
-        // Write palette_fold descriptor set.
-        let palette_fold_analysis_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.analysis_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let palette_fold_compact_list_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.palrle_compact_list_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let palette_fold_set_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.frame_palette_set_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let palette_fold_count_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.frame_palette_count_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let palette_fold_hash_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.hash_table_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let palette_fold_per_tile_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.per_tile_frame_palette_id_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let palette_fold_writes = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(palette_fold_descriptor_set)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&palette_fold_analysis_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(palette_fold_descriptor_set)
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&palette_fold_compact_list_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(palette_fold_descriptor_set)
-                .dst_binding(2)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&palette_fold_set_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(palette_fold_descriptor_set)
-                .dst_binding(3)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&palette_fold_count_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(palette_fold_descriptor_set)
-                .dst_binding(4)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&palette_fold_hash_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(palette_fold_descriptor_set)
-                .dst_binding(5)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&palette_fold_per_tile_info),
-        ];
-        self.device.update_descriptor_sets(&palette_fold_writes, &[]);
 
         // Write palette_subset_fold_init descriptor set.
         let subset_fold_init_folded_into_info = [vk::DescriptorBufferInfo::default()
@@ -1732,22 +1577,8 @@ impl GpuFrameProcessor {
             &[],
         );
 
-        // Stage 2a: indirect dispatch.
-        self.device.cmd_bind_pipeline(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.palette_fold_pipeline,
-        );
-        self.device.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.palette_fold_pipeline_layout,
-            0,
-            &[palette_fold_descriptor_set],
-            &[],
-        );
-        self.device
-            .cmd_dispatch_indirect(cmd, self.palrle_indirect_args_buffer, 0);
+        // Stage 2a: palette fold (indirect dispatch via helper).
+        let palette_fold_ds_guard = self.run_palette_fold_stage(cmd)?;
 
         // Barrier: Stage 2a outputs available to downstream stages.
         let stage_2a_output_barriers = [
@@ -2784,6 +2615,139 @@ impl GpuFrameProcessor {
             &[],
         );
         self.device.cmd_dispatch(cmd, 1, 1, 1);
+
+        Ok(guard)
+    }
+
+    /// Stage 2a — palette fold compute dispatch (builds the per-frame
+    /// palette set by merging duplicate tile palettes).
+    ///
+    /// Six STORAGE_BUFFER bindings: tile analysis (0 r/o), compact list
+    /// (1 r/o), frame_palette_set (2 r/w), frame_palette_count (3 r/w),
+    /// hash_table scratch (4 r/w), per_tile_frame_palette_id (5 r/w).
+    /// No push constants.
+    ///
+    /// Uses `cmd_dispatch_indirect` reading from
+    /// `self.palrle_indirect_args_buffer` at offset 0 (the workgroup
+    /// count is determined at runtime by the palrle_indirect_args stage,
+    /// not at record time — there is no fixed `(x, y, z)` tuple).
+    ///
+    /// Caller must invoke `cmd_pipeline_barrier` AFTER this call so the
+    /// subsequent palette_subset_fold stages and the host-readback can
+    /// see the writes to frame_palette_set / frame_palette_count /
+    /// per_tile_frame_palette_id.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure: `cmd` is recording; preceding stages have
+    /// populated `analysis_buffer` and `palrle_compact_list_buffer` (with
+    /// barriers); `hash_table_buffer` has been cleared earlier in the
+    /// command buffer (`vkCmdFillBuffer`); `palrle_indirect_args_buffer`
+    /// has been populated by `run_palrle_indirect_args_stage` and barriered
+    /// for `INDIRECT_COMMAND_READ`; and the returned guard is held
+    /// alive until `wait_for_fences` returns for the command buffer
+    /// (dropping it earlier returns the descriptor set to the pool while
+    /// the GPU is still using it).
+    unsafe fn run_palette_fold_stage<'a>(
+        &'a self,
+        cmd: vk::CommandBuffer,
+    ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
+        // Allocate one descriptor set from the pool. The returned guard frees
+        // it on drop, ensuring the bounded pool doesn't leak on early-exit.
+        let palette_fold_set_layouts = [self.palette_fold_descriptor_set_layout];
+        let palette_fold_ds_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(&palette_fold_set_layouts);
+        let guard = ScopedDescriptorSets {
+            device: &self.device,
+            pool: self.descriptor_pool,
+            sets: self.device.allocate_descriptor_sets(&palette_fold_ds_alloc)?,
+        };
+        let palette_fold_ds = guard.sets[0];
+
+        // Write the six palette_fold descriptors (all STORAGE_BUFFER):
+        //   binding 0 — analysis_buffer              (read)
+        //   binding 1 — palrle_compact_list_buffer   (read)
+        //   binding 2 — frame_palette_set_buffer     (read/write)
+        //   binding 3 — frame_palette_count_buffer   (read/write)
+        //   binding 4 — hash_table_buffer            (read/write scratch)
+        //   binding 5 — per_tile_frame_palette_id_buffer (write)
+        let palette_fold_analysis_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.analysis_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let palette_fold_compact_list_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.palrle_compact_list_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let palette_fold_set_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.frame_palette_set_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let palette_fold_count_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.frame_palette_count_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let palette_fold_hash_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.hash_table_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let palette_fold_per_tile_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.per_tile_frame_palette_id_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let palette_fold_writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(palette_fold_ds)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&palette_fold_analysis_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(palette_fold_ds)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&palette_fold_compact_list_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(palette_fold_ds)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&palette_fold_set_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(palette_fold_ds)
+                .dst_binding(3)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&palette_fold_count_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(palette_fold_ds)
+                .dst_binding(4)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&palette_fold_hash_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(palette_fold_ds)
+                .dst_binding(5)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&palette_fold_per_tile_info),
+        ];
+        self.device.update_descriptor_sets(&palette_fold_writes, &[]);
+
+        // Bind + indirect dispatch. No push constants for this stage.
+        self.device.cmd_bind_pipeline(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.palette_fold_pipeline,
+        );
+        self.device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.palette_fold_pipeline_layout,
+            0,
+            &[palette_fold_ds],
+            &[],
+        );
+        // palrle_indirect_args_buffer already barriered for INDIRECT_COMMAND_READ
+        // by the Stage 1.5b barrier in the orchestrator.
+        self.device
+            .cmd_dispatch_indirect(cmd, self.palrle_indirect_args_buffer, 0);
 
         Ok(guard)
     }
