@@ -1573,3 +1573,43 @@ fn process_frame_emits_correct_indices_for_two_color_tile() {
         }
     }
 }
+
+#[test]
+fn reset_for_session_drops_prev_image_and_sets_counter() {
+    let mut processor = match GpuFrameProcessor::new(256) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Skipping reset_for_session test (no Vulkan GPU?): {e}");
+            return;
+        }
+    };
+
+    // Counter starts at 0; prev_image starts None.
+    assert_eq!(processor.force_all_dirty_remaining, 0);
+    assert!(processor.prev_image.is_none());
+
+    // Drive one frame to populate prev_image.
+    let width = 64u32;
+    let height = 64u32;
+    let stride = width * 4;
+    let pixel: [u8; 4] = [0, 0, 255, 255];
+    unsafe {
+        let fd = make_memfd(width, height, pixel);
+        let result = processor.diff(fd, width, height, stride);
+        libc::close(fd);
+        match result {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("Skipping reset_for_session test (memfd not DMA-BUF?): {e}");
+                return;
+            }
+        }
+    }
+    assert!(processor.prev_image.is_some(), "diff should populate prev_image");
+
+    // The API under test.
+    processor.reset_for_session(20);
+
+    assert!(processor.prev_image.is_none(), "reset_for_session must drop prev_image");
+    assert_eq!(processor.force_all_dirty_remaining, 20);
+}

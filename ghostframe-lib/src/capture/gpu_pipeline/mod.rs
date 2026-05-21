@@ -381,6 +381,13 @@ pub struct GpuFrameProcessor {
 
     last_width: u32,
     last_height: u32,
+
+    /// Counter for the post-session-reset cushion. While > 0, the first-frame
+    /// branch in `process_frame_with_imported` skips the snapshot copy and
+    /// leaves `prev_image = None`, so every frame is reported fully dirty
+    /// without committing a new baseline. Mirrors the CPU path's
+    /// `force_dirty_frames` no-commit semantics.
+    force_all_dirty_remaining: u32,
 }
 
 struct NV12Buffer {
@@ -507,6 +514,27 @@ impl GpuFrameProcessor {
     ) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
         let analysis = self.process_frame(fd, width, height, stride)?;
         Ok(analysis.dirty_tiles)
+    }
+
+    /// Reset per-session state on a new WebTransport session, matching the
+    /// CPU path's `dirty_tracker.reset() + force_dirty_frames = N` shape.
+    ///
+    /// Drops the cached `prev_image` (freeing its Vulkan resources) AND sets
+    /// the no-commit cushion to `force_frames` frames. During the cushion,
+    /// every frame is reported as fully dirty without snapshotting
+    /// `prev_image`, so datagrams dropped by QUIC slow-start naturally
+    /// resurface as dirty on subsequent frames.
+    pub fn reset_for_session(&mut self, force_frames: u32) {
+        unsafe {
+            // device_wait_idle ensures no in-flight GPU work still references
+            // the prev_image we're about to destroy. The Drop impl uses the
+            // same pattern.
+            self.device.device_wait_idle().ok();
+            if let Some(prev) = self.prev_image.take() {
+                self.destroy_prev_frame(prev);
+            }
+        }
+        self.force_all_dirty_remaining = force_frames;
     }
 }
 
