@@ -240,7 +240,7 @@ impl GpuFrameProcessor {
             // Run NV12 conversion + tile_analysis + snapshot copy in one cmd
             // buffer. The snapshot is what we will compare future frames
             // against.
-            self.run_first_frame_passes(current, &snapshot, geom, nv12_layout)?;
+            self.run_first_frame_passes(current, Some(&snapshot), geom, nv12_layout)?;
 
             let mut snap = snapshot;
             snap.layout = vk::ImageLayout::GENERAL;
@@ -989,7 +989,7 @@ impl GpuFrameProcessor {
     unsafe fn run_first_frame_passes(
         &self,
         current: &PrevFrame,
-        snapshot: &PrevFrame,
+        snapshot: Option<&PrevFrame>,
         geom: FrameGeometry,
         nv12: Nv12OutputLayout,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1368,84 +1368,91 @@ impl GpuFrameProcessor {
         //
         // Stage 3 reads current.image (SHADER_READ). The srcAccessMask for
         // current covers all compute reads up to this point.
-        let snap_barriers = [
-            vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::GENERAL)
-                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        //
+        // When `snapshot` is `None` (session-reset cushion), the entire block
+        // is skipped: `current.image` stays in `GENERAL` (no transition to
+        // `TRANSFER_SRC_OPTIMAL` happens), and the subsequent `buf_barrier`
+        // targets buffers only — it doesn't depend on `current`'s layout.
+        if let Some(snap) = snapshot {
+            let snap_barriers = [
+                vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(current.image)
+                    .subresource_range(subresource_range)
+                    .src_access_mask(vk::AccessFlags::SHADER_READ)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ),
+                vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(snap.image)
+                    .subresource_range(subresource_range)
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE),
+            ];
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &snap_barriers,
+            );
+
+            let copy_region = [vk::ImageCopy::default()
+                .src_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .src_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                .dst_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .dst_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                .extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                })];
+            self.device.cmd_copy_image(
+                cmd,
+                current.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                snap.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &copy_region,
+            );
+
+            // Restore snapshot to GENERAL for next frame's SAD pass.
+            let post_copy_barrier = [vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::GENERAL)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(current.image)
+                .image(snap.image)
                 .subresource_range(subresource_range)
-                .src_access_mask(vk::AccessFlags::SHADER_READ)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_READ),
-            vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(snapshot.image)
-                .subresource_range(subresource_range)
-                .src_access_mask(vk::AccessFlags::empty())
-                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE),
-        ];
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &snap_barriers,
-        );
-
-        let copy_region = [vk::ImageCopy::default()
-            .src_subresource(vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            })
-            .src_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
-            .dst_subresource(vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            })
-            .dst_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
-            .extent(vk::Extent3D {
-                width,
-                height,
-                depth: 1,
-            })];
-        self.device.cmd_copy_image(
-            cmd,
-            current.image,
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            snapshot.image,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &copy_region,
-        );
-
-        // Restore snapshot to GENERAL for next frame's SAD pass.
-        let post_copy_barrier = [vk::ImageMemoryBarrier::default()
-            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .new_layout(vk::ImageLayout::GENERAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(snapshot.image)
-            .subresource_range(subresource_range)
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ)];
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &post_copy_barrier,
-        );
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)];
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &post_copy_barrier,
+            );
+        }
 
         // All output buffers → HOST_READ. These are HOST_VISIBLE | HOST_COHERENT
         // and consumed via raw pointer on return.
