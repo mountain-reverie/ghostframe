@@ -233,18 +233,34 @@ impl GpuFrameProcessor {
         if self.prev_image.is_none() {
             let all_dirty: Vec<u32> = (0..tile_count).collect();
 
-            // Allocate the owned snapshot image once. It persists for the
-            // lifetime of the processor (until resolution changes).
-            let snapshot = self.allocate_owned_image(width, height)?;
+            // Session-reset cushion: while the counter is > 0, run all stages
+            // but DO NOT snapshot the current frame as the new baseline.
+            // prev_image stays None so the next frame hits this branch again
+            // and re-emits all tiles dirty. Mirrors the CPU path's
+            // `force_dirty_frames` no-commit semantics — datagrams dropped
+            // during QUIC slow-start re-surface as dirty until a real
+            // commit-frame snapshot lands.
+            let no_commit = self.force_all_dirty_remaining > 0;
+            let snapshot = if no_commit {
+                None
+            } else {
+                // Allocate the owned snapshot image once. It persists for the
+                // lifetime of the processor (until resolution changes).
+                Some(self.allocate_owned_image(width, height)?)
+            };
 
             // Run NV12 conversion + tile_analysis + snapshot copy in one cmd
             // buffer. The snapshot is what we will compare future frames
             // against.
-            self.run_first_frame_passes(current, Some(&snapshot), geom, nv12_layout)?;
+            self.run_first_frame_passes(current, snapshot.as_ref(), geom, nv12_layout)?;
 
-            let mut snap = snapshot;
-            snap.layout = vk::ImageLayout::GENERAL;
-            self.prev_image = Some(snap);
+            if let Some(mut snap) = snapshot {
+                snap.layout = vk::ImageLayout::GENERAL;
+                self.prev_image = Some(snap);
+            }
+            if no_commit {
+                self.force_all_dirty_remaining -= 1;
+            }
 
             return Ok(FrameAnalysis {
                 dirty_tiles: all_dirty,

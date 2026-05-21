@@ -1613,3 +1613,84 @@ fn reset_for_session_drops_prev_image_and_sets_counter() {
     assert!(processor.prev_image.is_none(), "reset_for_session must drop prev_image");
     assert_eq!(processor.force_all_dirty_remaining, 20);
 }
+
+#[test]
+fn reset_for_session_cushion_keeps_all_dirty_and_prev_image_none() {
+    let width = 64u32;
+    let height = 64u32;
+    let stride = width * 4;
+    let pixel: [u8; 4] = [0, 0, 255, 255];
+    let tile_count = (width / 32) * (height / 32); // 2 * 2 = 4
+
+    let mut processor = match GpuFrameProcessor::new(256) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Skipping cushion test (no Vulkan GPU?): {e}");
+            return;
+        }
+    };
+
+    unsafe {
+        // Prime: first frame populates prev_image and reports all dirty.
+        let fd = make_memfd(width, height, pixel);
+        let dirty = match processor.diff(fd, width, height, stride) {
+            Ok(v) => v,
+            Err(e) => {
+                libc::close(fd);
+                eprintln!("Skipping cushion test (memfd not DMA-BUF?): {e}");
+                return;
+            }
+        };
+        libc::close(fd);
+        assert_eq!(dirty.len() as u32, tile_count, "first frame: all dirty");
+        assert!(processor.prev_image.is_some(), "first frame populates prev_image");
+
+        // Sanity: second identical frame produces 0 dirty.
+        let fd = make_memfd(width, height, pixel);
+        let dirty = processor.diff(fd, width, height, stride).unwrap();
+        libc::close(fd);
+        assert_eq!(dirty.len(), 0, "identical content: SAD reports 0 dirty");
+
+        // Engage the cushion.
+        processor.reset_for_session(3);
+        assert!(processor.prev_image.is_none());
+
+        // Cushion frames 1..=3: all dirty, prev_image stays None.
+        for i in 1..=3 {
+            let fd = make_memfd(width, height, pixel);
+            let dirty = processor.diff(fd, width, height, stride).unwrap();
+            libc::close(fd);
+            assert_eq!(
+                dirty.len() as u32,
+                tile_count,
+                "cushion frame {i}: should be all dirty"
+            );
+            assert!(
+                processor.prev_image.is_none(),
+                "cushion frame {i}: prev_image must stay None during cushion"
+            );
+        }
+        assert_eq!(processor.force_all_dirty_remaining, 0);
+
+        // Frame 4: counter is 0, prev_image is still None → first-frame-with-snapshot.
+        // All dirty AND prev_image becomes Some.
+        let fd = make_memfd(width, height, pixel);
+        let dirty = processor.diff(fd, width, height, stride).unwrap();
+        libc::close(fd);
+        assert_eq!(
+            dirty.len() as u32,
+            tile_count,
+            "post-cushion first commit frame: all dirty"
+        );
+        assert!(
+            processor.prev_image.is_some(),
+            "post-cushion first commit frame: prev_image must be Some"
+        );
+
+        // Frame 5: normal SAD against the just-committed snapshot.
+        let fd = make_memfd(width, height, pixel);
+        let dirty = processor.diff(fd, width, height, stride).unwrap();
+        libc::close(fd);
+        assert_eq!(dirty.len(), 0, "normal SAD resumed: 0 dirty for unchanged content");
+    }
+}
