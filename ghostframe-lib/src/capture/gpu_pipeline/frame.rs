@@ -983,9 +983,10 @@ impl GpuFrameProcessor {
     /// first-frame submission cost identical in shape to the steady-state
     /// subsequent-frames branch.
     ///
-    /// `snapshot` is always freshly allocated by the caller
-    /// (`allocate_owned_image`), so its starting layout is
+    /// When `snapshot` is `Some`, the `PrevFrame` is always freshly allocated
+    /// by the caller (`allocate_owned_image`), so its starting layout is
     /// `vk::ImageLayout::UNDEFINED` — we hardcode that transition.
+    /// When `snapshot` is `None` the snapshot-copy block is skipped entirely.
     unsafe fn run_first_frame_passes(
         &self,
         current: &PrevFrame,
@@ -1362,9 +1363,9 @@ impl GpuFrameProcessor {
         )?;
 
         // Snapshot copy: current (GENERAL) → snapshot (TRANSFER_DST_OPTIMAL).
-        // `snapshot` is always freshly allocated by `allocate_owned_image` and
-        // its initial layout is UNDEFINED, so we hardcode that transition (no
-        // prior shader access to wait on).
+        // Inside this `Some` arm the `PrevFrame` is always freshly allocated
+        // by `allocate_owned_image`, so its initial layout is UNDEFINED and we
+        // hardcode that transition (no prior shader access to wait on).
         //
         // Stage 3 reads current.image (SHADER_READ). The srcAccessMask for
         // current covers all compute reads up to this point.
