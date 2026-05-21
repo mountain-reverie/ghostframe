@@ -855,13 +855,18 @@ impl IoBridge {
         // (gated on !frameDimensionsKnown) takes over and
         // re-introduces the canvas-resize-clears-tiles bug.
         self.dimensions_retransmits_left = FRAME_DIMENSIONS_RETRANSMITS;
-        // `force_dirty_frames` is consumed only by
-        // `process_frame_cpu` (no_commit slow-start mitigation).
-        // The GPU path doesn't read it — skip setting it when a
-        // GPU processor is active to avoid implying behavior that
-        // doesn't fire on that branch.
-        if self.gpu_frame_processor.is_none() {
-            self.force_dirty_frames = 20;
+        // Slow-start cushion: 20 frames of all-tiles-dirty so a tile
+        // dropped during QUIC slow-start re-emerges as dirty on the next
+        // frame. Each path has its own implementation — CPU's
+        // `force_dirty_frames` runs dirty_tracker in no-commit mode;
+        // GPU's `reset_for_session` drops prev_image and runs the
+        // no-snapshot first-frame path for N frames. Set both
+        // unconditionally — `process_frame_gpu` ignores `force_dirty_frames`
+        // and `gpu_frame_processor` is None on the CPU-only path, so the
+        // wrong-path setter is harmless either way.
+        self.force_dirty_frames = 20;
+        if let Some(p) = self.gpu_frame_processor.as_mut() {
+            p.reset_for_session(20);
         }
         // Force IDR on the existing encoder so the new client
         // gets a fresh anchor. Without this, a client connecting
