@@ -856,14 +856,18 @@ impl IoBridge {
         // re-introduces the canvas-resize-clears-tiles bug.
         self.dimensions_retransmits_left = FRAME_DIMENSIONS_RETRANSMITS;
         // Slow-start cushion: 20 frames of all-tiles-dirty so a tile
-        // dropped during QUIC slow-start re-emerges as dirty on the next
-        // frame. Each path has its own implementation — CPU's
+        // dropped during QUIC slow-start re-emerges as dirty on the
+        // next frame. Each path has its own implementation — CPU's
         // `force_dirty_frames` runs dirty_tracker in no-commit mode;
         // GPU's `reset_for_session` drops prev_image and runs the
-        // no-snapshot first-frame path for N frames. Set both
-        // unconditionally — `process_frame_gpu` ignores `force_dirty_frames`
-        // and `gpu_frame_processor` is None on the CPU-only path, so the
-        // wrong-path setter is harmless either way.
+        // no-snapshot first-frame path for N frames.
+        //
+        // Both are set unconditionally. On the CPU-only path,
+        // `gpu_frame_processor` is None so the `if let` is a no-op.
+        // On the GPU path, `force_dirty_frames` is normally ignored
+        // by `process_frame_gpu` — but IS consumed if the Vulkan
+        // call errors and the frame falls back to `process_frame_cpu`,
+        // which is exactly the correct behaviour on that error path.
         self.force_dirty_frames = 20;
         if let Some(p) = self.gpu_frame_processor.as_mut() {
             p.reset_for_session(20);
