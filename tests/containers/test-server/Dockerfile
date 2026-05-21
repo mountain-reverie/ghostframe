@@ -33,6 +33,15 @@ COPY Cargo.toml Cargo.lock ./
 COPY ghostframe-lib/Cargo.toml ghostframe-lib/Cargo.toml
 COPY ghostframe-xdaemon/Cargo.toml ghostframe-xdaemon/Cargo.toml
 COPY ghostframe-test-pattern/Cargo.toml ghostframe-test-pattern/Cargo.toml
+# Workspace members not built here but required for cargo to resolve the
+# workspace manifest. Empty src/lib.rs stubs are enough.
+COPY ghostframe-e2e/Cargo.toml ghostframe-e2e/Cargo.toml
+COPY ghostframe-e2e/src/lib.rs ghostframe-e2e/src/lib.rs
+COPY ghostframe-bench/Cargo.toml ghostframe-bench/Cargo.toml
+COPY ghostframe-bench/src/lib.rs ghostframe-bench/src/lib.rs
+# Cargo.toml declares [[bench]] targets; the .rs files must exist for the
+# manifest to parse, even though they aren't compiled by `-p ghostframe-xdaemon`.
+COPY ghostframe-bench/benches/ ghostframe-bench/benches/
 COPY ghostbridge/ ghostbridge/
 
 # Copy full source
