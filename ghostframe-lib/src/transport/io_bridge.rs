@@ -1161,6 +1161,31 @@ impl IoBridge {
                 seq,
                 "classifier flipped frame mode"
             );
+
+            // H264 → TileCodec architectural invariant: invalidate the GPU SAD
+            // baseline so the next TileCodec frame re-emits every tile,
+            // overwriting whatever the H.264 phase rendered. Without this,
+            // static content produces 0 dirty tiles on mode entry (prev_image
+            // is current relative to the static screen) and the lossless tile
+            // codecs never get a chance to upgrade the canvas from the H.264
+            // lossy render. Symmetric to the existing `request_keyframe()` on
+            // TileCodec → H264 at io_bridge.rs:1195-1199: each direction of the
+            // mode flip resets the state that the entering mode relies on
+            // (H.264 GOP for the H264 direction, GPU SAD baseline for the
+            // TileCodec direction).
+            //
+            // force_frames = 1 (not 20) because we're past QUIC slow-start by
+            // the time exit_sustain elapses; ACK-based retries handle
+            // individual datagram drops on the lossless tiles.
+            if prev_mode == FrameMode::H264 && new_mode == FrameMode::TileCodec {
+                if let Some(p) = self.gpu_frame_processor.as_mut() {
+                    p.invalidate_baseline(1);
+                    tracing::info!(
+                        seq,
+                        "H264→TileCodec handoff: invalidate_baseline(1) — lossless repaint"
+                    );
+                }
+            }
         }
 
         // Update frame mode for next frame's hysteresis reference.
