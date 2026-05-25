@@ -525,7 +525,7 @@ impl GpuFrameProcessor {
     /// burst) naturally re-surface as dirty until the cushion exhausts and
     /// the next frame becomes the first real snapshot.
     ///
-    /// Two call sites today:
+    /// Call sites:
     /// - `fire_session_reset` calls with `force_frames = 20` to cover QUIC
     ///   slow-start datagram loss after a new session connects.
     /// - The H264 → TileCodec mode-flip handoff in `process_frame_gpu` calls
