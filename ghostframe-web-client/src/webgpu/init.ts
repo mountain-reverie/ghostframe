@@ -3,8 +3,6 @@ export interface WebGpuInitResult {
   device: GPUDevice;
   context: GPUCanvasContext;
   presentFormat: GPUTextureFormat;
-  /** True when running on SwiftShader (software renderer). */
-  isSwiftShader: boolean;
 }
 
 export class WebGpuUnavailableError extends Error {
@@ -58,27 +56,5 @@ export async function initWebGpu(canvas: HTMLCanvasElement): Promise<WebGpuInitR
     format: presentFormat,
     alphaMode: 'opaque',
   });
-
-  // Detect SwiftShader (software renderer) via adapter info. On SwiftShader,
-  // WebCodecs VideoDecoder crashes the GPU process; callers should skip H.264
-  // decode when isSwiftShader=true.
-  let isSwiftShader = false;
-  try {
-    // adapter.info is synchronous per the WebGPU spec (Chrome 121+).
-    const info = adapter.info;
-    const desc = (info.description ?? '').toLowerCase();
-    const vendor = (info.vendor ?? '').toLowerCase();
-    const arch = ((info as any).architecture ?? '').toLowerCase();
-    isSwiftShader = desc.includes('swiftshader')
-      || arch.includes('swiftshader')
-      || (vendor === '' && desc === ''); // fallback: empty adapter info usually means SwiftShader in headless
-    (window as any).__gpuAdapterInfo = { vendor, description: desc, architecture: arch };
-  } catch {
-    // adapter.info not available — also try isFallbackAdapter
-    try {
-      isSwiftShader = !!(adapter as any).isFallbackAdapter;
-    } catch { /* ignore */ }
-  }
-
-  return { adapter, device, context, presentFormat, isSwiftShader };
+  return { adapter, device, context, presentFormat };
 }

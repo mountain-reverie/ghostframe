@@ -1161,19 +1161,6 @@ impl IoBridge {
                 seq,
                 "classifier flipped frame mode"
             );
-            // H264 → TileCodec transition: force one full-dirty frame so
-            // TileCodec clients get a complete repaint on mode exit.  Without
-            // this, static content produces 0 dirty tiles on the transition
-            // frame, so TileCodec never sends anything and the canvas stays
-            // black.  reset_for_session(1) drops prev_image and sets the
-            // one-shot dirty cushion; the *next* frame's run_first_frame_passes
-            // will use snapshot=None → all tiles dirty → TileCodec emits a
-            // full repaint.
-            if prev_mode == FrameMode::H264 && new_mode == FrameMode::TileCodec {
-                if let Some(p) = self.gpu_frame_processor.as_mut() {
-                    p.reset_for_session(1);
-                }
-            }
         }
 
         // Update frame mode for next frame's hysteresis reference.
