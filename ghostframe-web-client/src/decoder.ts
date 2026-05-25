@@ -205,22 +205,37 @@ export class FullFrameDecoder {
       },
       error: (e: DOMException) => {
         console.error('Full-frame H264 decode error:', e.message);
+        (window as any).__fullFrameDecodeError = e.message;
+        // Close the decoder on error to prevent repeated decode attempts
+        // that may cause additional GPU device stress (e.g. in SwiftShader).
+        if (this.decoder.state !== 'closed') {
+          this.decoder.close();
+        }
       },
     });
 
     this.decoder.configure({
-      codec: 'avc1.42001e',
+      codec: 'avc1.42c020',   // Baseline profile, Level 3.2 — matches libx264 output SPS
       codedWidth: width,
       codedHeight: height,
       optimizeForLatency: true,
     });
   }
 
-  decode(nalData: Uint8Array, isKeyframe: boolean) {
+  private nextTimestamp = 0;
+
+  decode(nalData: Uint8Array, isKeyframe: boolean, timestampUs?: number) {
     if (this.decoder.state === 'closed') return;
+    // Use the provided server-side timestamp or fall back to a monotonically
+    // incrementing counter (1000µs per frame). The WebCodecs spec requires
+    // strictly-increasing timestamps; a static 0 causes "Decoding error"
+    // after the first P-frame on some implementations (e.g. SwiftShader).
+    const ts = (timestampUs !== undefined && timestampUs > 0)
+      ? timestampUs
+      : (this.nextTimestamp += 1000);
     const chunk = new EncodedVideoChunk({
       type: isKeyframe ? 'key' : 'delta',
-      timestamp: 0,
+      timestamp: ts,
       data: nalData,
     });
     this.decoder.decode(chunk);

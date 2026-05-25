@@ -1022,20 +1022,27 @@ async fn e2e_palrle_oob_index() -> Result<()> {
     Ok(())
 }
 
-/// Force a client reconnect mid-stream; verify the server's warm-cache
-/// palette table re-delivers palettes on the new session and the text
-/// region renders correctly post-reset.
-// M3.2c follow-up: post-page-reload the server doesn't re-emit static
-// content (SAD sees no dirty tiles since text_grid_drm content is
-// unchanged), so the new client receives nothing for text tiles and the
-// canvas stays blank.  Needs server-side "new session → re-classify all
-// tiles" logic (probably M3.5).  See project_m32c_deferred.md.
-#[ignore = "M3.2c follow-up: post-reset server doesn't re-emit static content; needs session-aware re-classification"]
+/// Force a client reconnect mid-stream; verify the post-reset rendering
+/// pipeline survives — text remains legible after `page.reload()`.
+///
+/// Closure path: `fire_session_reset` calls
+/// `GpuFrameProcessor::reset_for_session(20)`, which drops the Vulkan SAD
+/// `prev_image` and runs the no-snapshot first-frame path for 20 frames
+/// (mirroring the CPU path's `force_dirty_frames` cushion). On reset the
+/// classifier is forced to `FrameMode::H264` with a one-shot `request_keyframe`,
+/// so the post-reset emission is an H.264 IDR carrying the text content;
+/// PalRle wire emission does not fire for static content under this load-
+/// shedding rule. The warm-cache-bundling scenario (post-reset bundled
+/// PalRle re-delivery) needs dynamic content to fire any PalRle at all and
+/// is covered by a separate follow-up test.
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_palrle_session_reset() -> Result<()> {
     use ghostframe_test_pattern::text_grid::SAMPLES;
 
-    let setup = setup_e2e_webgpu_gpu("--text-grid --drm-direct").await?;
+    let setup = setup_e2e_webgpu_gpu_with_env(
+        "--text-grid --drm-direct",
+        &[("GHOSTFRAME_DUMP_NV12_ON_IDR", "1")],
+    ).await?;
 
     // Phase 1: let the initial connection settle and render text.
     tokio::time::sleep(Duration::from_secs(4)).await;
@@ -1066,34 +1073,207 @@ async fn e2e_palrle_session_reset() -> Result<()> {
     );
 
     // Phase 2: force a reconnect by reloading the page.
-    // The server's on_session_reset will clear delivered/ref_count/in_flight
-    // but preserve slot bytes (warm cache). Subsequent emissions will
-    // re-bundle palettes (delivered=false) until ACKed.
     setup.page.reload().await?;
 
-    // Allow the new session to settle + re-render.
-    tokio::time::sleep(Duration::from_secs(4)).await;
+    // Wait for session 2 to actually establish: poll server logs for the
+    // second "HELLO received" line.  10s ceiling covers QUIC slow-start;
+    // in practice ~1-2s.  (Same pattern as e2e_decode_error_thin_uncached.)
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let logs = helpers::read_server_logs_stripped("ghostframe-server");
+        if logs.matches("HELLO received").count() >= 2 {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!(
+                "session 2 HELLO did not arrive within 10s of page.reload(); \
+                 reconnect path may be broken. server logs:\n{logs}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 
-    // Phase 3: assert post-reset legibility.
+    // Allow the H.264 IDR (emitted by fire_session_reset) to arrive and
+    // be rendered by the client's WebGPU pipeline. Also wait until the
+    // renderer has actually processed at least one frame post-reset
+    // (window.__ghostframeRenderer is set in encodeAndPresentFrame after
+    // the framebuffer is sized).
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Extra wait until the renderer exposes a non-null reference (meaning
+    // the H.264 frame has been decoded + rAF has run at least once with
+    // a sized framebuffer).
+    let renderer_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let result = setup
+            .page
+            .evaluate("!!(window.__ghostframeRenderer)")
+            .await;
+        if let Ok(v) = result {
+            let ready: bool = v.into_value().unwrap_or(false);
+            if ready { break; }
+        }
+        if std::time::Instant::now() > renderer_deadline {
+            println!("WARNING: window.__ghostframeRenderer never set after 5s — WebGPU may be stuck");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // If the WebGPU device was lost (SwiftShader WebCodecs crash), wait for
+    // device recreation to complete. The recovery path is async and may take
+    // up to ~5s (requestAdapter retry loop). Without this wait, we'd read
+    // diagnostics before the new device has rendered any TileCodec frames.
+    let device_recreate_deadline = std::time::Instant::now() + Duration::from_secs(12);
+    loop {
+        let result = setup
+            .page
+            .evaluate("(window.__webgpuDeviceLostCount||0) === 0 || (window.__webgpuDeviceRecreated||0) > 0 || (window.__webgpuRecreationError != null)")
+            .await;
+        if let Ok(v) = result {
+            let done: bool = v.into_value().unwrap_or(false);
+            if done { break; }
+        }
+        if std::time::Instant::now() > device_recreate_deadline {
+            println!("WARNING: device lost but recreation not confirmed after 12s");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // Additional settle time after device recreation so the rAF has at least
+    // one tick to drain the pending tile queues and render to the canvas.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Phase 3: assert post-reset legibility. After session reset the server
+    // runs H.264 for ~20 frames (skipped on SwiftShader to prevent GPU process
+    // crash), then transitions to TileCodec which repaints the full frame.
+    // Use the GPU readback probe (__readPixel) which reads directly from the
+    // WebGPU framebuffer texture — this is more reliable than 2D-canvas
+    // drawImage in headless SwiftShader where compositing is not guaranteed.
+    let post_probe_js = format!(
+        r#"
+        (async () => {{
+            const ink = await window.__readPixel({ix}, {iy});
+            const bg  = await window.__readPixel({bx}, {by});
+            return {{
+                ink: {{ r: ink[0], g: ink[1], b: ink[2] }},
+                bg:  {{ r: bg[0],  g: bg[1],  b: bg[2]  }},
+            }};
+        }})()
+        "#,
+        ix = pair.ink.0, iy = pair.ink.1,
+        bx = pair.bg.0,  by = pair.bg.1,
+    );
+    // Dump diagnostics before the assertion so failures are diagnosable.
+    if let Ok(v) = setup
+        .page
+        .evaluate("(document.getElementById('status') || {textContent: '<null>'}).textContent")
+        .await
+    {
+        let status: String = v.into_value().unwrap_or_default();
+        println!("post-reset page status: {status:?}");
+    }
+    if let Ok(v) = setup
+        .page
+        .evaluate("JSON.stringify({rafTicks: window.__ghostframeRafTicks||0, codecs: window.__ghostframeRecordedCodecs||[], tiles: (window.__ghostframeRecordedTiles||[]).length, stats: window.__ghostframeStats||{}})")
+        .await
+    {
+        let diag: String = v.into_value().unwrap_or_default();
+        println!("post-reset diagnostics: {diag}");
+    }
+    // Check if the canvas has non-zero pixels anywhere (not just at the probe point)
+    if let Ok(v) = setup
+        .page
+        .evaluate(r#"
+        (() => {
+            const canvas = document.getElementById('canvas');
+            const tmp = document.createElement('canvas');
+            tmp.width = Math.min(canvas.width, 64);
+            tmp.height = Math.min(canvas.height, 64);
+            const ctx = tmp.getContext('2d');
+            ctx.drawImage(canvas, 0, 0, tmp.width, tmp.height, 0, 0, tmp.width, tmp.height);
+            const data = ctx.getImageData(0, 0, tmp.width, tmp.height).data;
+            let nonzero = 0;
+            for (let i = 0; i < data.length; i += 4) {
+                if (data[i] > 0 || data[i+1] > 0 || data[i+2] > 0) nonzero++;
+            }
+            return {nonzero, total: tmp.width * tmp.height, w: canvas.width, h: canvas.height};
+        })()
+        "#)
+        .await
+    {
+        let canvas_diag: String = v.into_value::<serde_json::Value>()
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        println!("post-reset canvas non-zero pixels: {canvas_diag}");
+    }
+    if let Ok(v) = setup
+        .page
+        .evaluate("JSON.stringify({w: (document.getElementById('canvas')||{}).width||0, h: (document.getElementById('canvas')||{}).height||0})")
+        .await
+    {
+        let dims: String = v.into_value().unwrap_or_default();
+        println!("post-reset canvas dims: {dims}");
+    }
+    if let Ok(v) = setup
+        .page
+        .evaluate("JSON.stringify({decoderDims: window.__fullFrameDecoderDims||null, outputCount: window.__fullFrameOutputCount||0, decodeError: window.__fullFrameDecodeError||null, h264Rendered: window.__h264RenderedCount||0, pixelSamples: window.__fullFramePixelSamples||[], copyToErrors: window.__fullFrameCopyToErrors||[], payloadSizes: window.__fullFramePayloadSizes||[], deviceLostCount: window.__webgpuDeviceLostCount||0, deviceLostReason: window.__webgpuDeviceLostReason||null, deviceRecreated: window.__webgpuDeviceRecreated||0, recreationAttempts: window.__webgpuRecreationAttempts||0, recreationError: window.__webgpuRecreationError||null, isSwiftShader: window.__ghostframeIsSwiftShader||false, gpuAdapterInfo: window.__gpuAdapterInfo||null})")
+        .await
+    {
+        let dec_diag: String = v.into_value().unwrap_or_default();
+        println!("post-reset decoder diagnostics: {dec_diag}");
+    }
+    // GPU readback probe (reads directly from framebuffer texture, bypasses compositor)
+    let gpu_probe_js = format!(
+        r#"
+        (async () => {{
+            const ink = await window.__readPixel({ix}, {iy});
+            const bg  = await window.__readPixel({bx}, {by});
+            return {{
+                ink: {{ r: ink[0], g: ink[1], b: ink[2] }},
+                bg:  {{ r: bg[0],  g: bg[1],  b: bg[2]  }},
+            }};
+        }})()
+        "#,
+        ix = pair.ink.0, iy = pair.ink.1,
+        bx = pair.bg.0,  by = pair.bg.1,
+    );
+    match setup.page.evaluate(gpu_probe_js.as_str()).await {
+        Ok(v) => {
+            let gpu_result: String = v.into_value::<serde_json::Value>()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|e| format!("parse_err: {e}"));
+            println!("post-reset GPU readback probe: {gpu_result}");
+        }
+        Err(e) => println!("post-reset GPU readback probe error: {e}"),
+    }
+    let server_logs_post = helpers::read_server_logs_stripped("ghostframe-server");
+    let hello_count = server_logs_post.matches("HELLO received").count();
+    let session_reset_count = server_logs_post.matches("new session connected, dirty tracker reset").count();
+    let fire_session_reset_count = server_logs_post.matches("fire_session_reset").count();
+    println!("server HELLO count: {hello_count}");
+    println!("server session_reset_count: {session_reset_count}");
+    println!("server fire_session_reset_count: {fire_session_reset_count}");
+    // Print lines around HELLO and session reset events (skip "no connected sessions" noise)
+    let interesting: Vec<&str> = server_logs_post.lines().filter(|l|
+        (l.contains("HELLO") || l.contains("frame_mode") ||
+        l.contains("fire_session") || l.contains("new session connected") ||
+        l.contains("classifier flipped") || l.contains("is_keyframe") ||
+        l.contains("H264") || l.contains("IDR") ||
+        l.contains("session reset") || l.contains("session connected")) &&
+        !l.contains("no connected sessions")
+    ).collect();
+    println!("server interesting lines ({}):", interesting.len());
+    for line in interesting.iter().take(200) {
+        println!("  {line}");
+    }
+
     let post: serde_json::Value =
-        setup.page.evaluate(probe_js.as_str()).await?.into_value()?;
+        setup.page.evaluate(post_probe_js.as_str()).await?.into_value()?;
     let post_ink_lum = luminance(&post["ink"]);
     let post_bg_lum = luminance(&post["bg"]);
     assert!(
         post_ink_lum - post_bg_lum > 80.0,
-        "post-reset text not legible — warm-cache re-bundling broken (ink={post_ink_lum:.0}, bg={post_bg_lum:.0})"
-    );
-
-    // Protocol-layer: post-reset codec stream should include PalRle.
-    let codec_list: Vec<u8> = setup
-        .page
-        .evaluate("window.__ghostframeRecordedCodecs || []")
-        .await?
-        .into_value()?;
-    assert!(
-        codec_list.contains(&2u8),
-        "e2e_palrle_session_reset: expected Codec::PalRle (2) post-reset; saw codecs: {:?}",
-        codec_list
+        "post-reset text not legible — session reset broke the rendering pipeline (ink={post_ink_lum:.0}, bg={post_bg_lum:.0})"
     );
 
     Ok(())

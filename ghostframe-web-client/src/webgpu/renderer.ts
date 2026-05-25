@@ -52,6 +52,8 @@ export class WebGpuRenderer {
   get device(): GPUDevice { return this.gpu.device; }
   get context(): GPUCanvasContext { return this.gpu.context; }
   get presentFormat(): GPUTextureFormat { return this.gpu.presentFormat; }
+  /** True when running on SwiftShader. WebCodecs VideoDecoder crashes the GPU process on SwiftShader. */
+  get isSwiftShader(): boolean { return this.gpu.isSwiftShader; }
 
   resize(width: number, height: number): void {
     // Zero dimensions are a no-op: we can't create valid GPU textures with 0×0
@@ -115,6 +117,24 @@ export class WebGpuRenderer {
       rgba,
       { bytesPerRow: copyW * 4, rowsPerImage: copyH },
       { width: copyW, height: copyH },
+    );
+  }
+
+  /**
+   * Write a full-frame RGBA buffer directly into the framebuffer texture.
+   * Used by the FullFrameDecoder path to avoid importExternalTexture (which
+   * causes SwiftShader device loss). The RGBA data must match the framebuffer
+   * dimensions exactly (width * height * 4 bytes).
+   */
+  writeFullFrameRgba(rgba: Uint8Array<ArrayBuffer>, width: number, height: number): void {
+    if (!this.framebuffer.texture) return;
+    if (rgba.length !== width * height * 4) return;
+    if (width !== this.framebuffer.width || height !== this.framebuffer.height) return;
+    this.device.queue.writeTexture(
+      { texture: this.framebuffer.texture, origin: { x: 0, y: 0 } },
+      rgba,
+      { bytesPerRow: width * 4, rowsPerImage: height },
+      { width, height },
     );
   }
 
@@ -217,6 +237,9 @@ export class WebGpuRenderer {
       pass.end();
     }
     const h264Count = this.h264Queue.length;
+    if (h264Count > 0 && typeof window !== 'undefined') {
+      (window as any).__h264RenderedCount = ((window as any).__h264RenderedCount || 0) + h264Count;
+    }
     // Stage the VideoFrames for next-tick cleanup; the importExternalTexture
     // references are scoped to this submit.
     this.videoFramesToClose.push(...this.h264Queue.map((h) => h.frame));

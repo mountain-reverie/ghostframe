@@ -705,6 +705,27 @@ impl FullFrameEncoder {
         let force_idr = pts % FULL_FRAME_GOP as i64 == 0 || self.keyframe_pending;
         self.keyframe_pending = false;
 
+        // Diagnostic: on IDR frames, log the first 16 Y-plane bytes to verify
+        // the NV12 buffer actually contains screen content (not zeros/black).
+        // This is env-var gated so it only fires when GHOSTFRAME_DUMP_NV12_ON_IDR=1.
+        if force_idr && std::env::var("GHOSTFRAME_DUMP_NV12_ON_IDR").is_ok() {
+            let n = std::cmp::min(32, (width * height) as usize);
+            let y_bytes: Vec<u8> = unsafe { std::slice::from_raw_parts(nv12_data, n) }
+                .iter()
+                .copied()
+                .collect();
+            info!(
+                pts,
+                width,
+                height,
+                y_stride,
+                uv_offset,
+                first_32_y_bytes = ?y_bytes,
+                use_vaapi = self.use_vaapi,
+                "encode_nv12_buffer IDR: NV12 Y-plane first bytes"
+            );
+        }
+
         unsafe {
             // Build a software NV12 AVFrame whose data pointers point into nv12_data.
             // We do NOT own this memory — set buf[0] to null so ffmpeg won't free it.

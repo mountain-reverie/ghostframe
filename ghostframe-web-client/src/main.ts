@@ -5,8 +5,9 @@ import {
   isTileDatagram, decodeFrameHeader, frameKey, FullFrameDecoder,
   FRAME_DIMENSIONS_SENTINEL_X, FRAME_DIMENSIONS_SENTINEL_Y,
 } from './decoder.js';
-import { WebGpuRenderer } from './webgpu/renderer.js';
+import { WebGpuRenderer, type PalRleQueued, type RawQueued } from './webgpu/renderer.js';
 import { WebGpuUnavailableError } from './webgpu/init.js';
+import type { SolidTile } from './webgpu/solid.js';
 import { ParityRecovery } from './fec';
 import { LossTracker, encodeHello } from './feedback';
 import { DecodeErrorBatcher } from './decode_error_batcher';
@@ -56,6 +57,61 @@ async function main() {
     throw e;
   }
   renderer.resize(0, 0);
+  // Expose renderer type for test diagnostics.
+  (window as any).__ghostframeIsSwiftShader = renderer.isSwiftShader;
+
+  // Device-lost recovery: if the GPU device is lost (e.g. SwiftShader crashes
+  // when the WebCodecs VideoDecoder is used), recreate the renderer so the
+  // WebGPU pipeline can resume. Tiles queued after recreation will be
+  // processed against the new device. The recovery handler re-registers
+  // itself on the new device so subsequent losses are also handled.
+  // True while the WebGPU device is lost and recreation is pending.
+  // finishAssembly routes tiles into the stable pending-* queues below
+  // instead of the renderer's queues so they survive renderer recreation.
+  let deviceLostPending = false;
+
+  // Stable tile buffers that survive renderer recreation. finishAssembly
+  // routes tiles here when deviceLostPending=true; the device-lost handler
+  // drains them into the new renderer once recreation completes.
+  const pendingPalRle: PalRleQueued[] = [];
+  const pendingSolid: SolidTile[] = [];
+  const pendingRaw: RawQueued[] = [];
+
+  function installDeviceLostHandler(r: WebGpuRenderer) {
+    r.device.lost.then(async (info) => {
+      console.warn(`WebGPU device lost (reason=${info.reason}): ${info.message}`);
+      (window as any).__webgpuDeviceLostCount = ((window as any).__webgpuDeviceLostCount || 0) + 1;
+      (window as any).__webgpuDeviceLostReason = info.reason;
+      deviceLostPending = true;
+      // Capture dimensions before the old renderer is replaced.
+      const savedW = r.framebuffer.width;
+      const savedH = r.framebuffer.height;
+      try {
+        (window as any).__webgpuRecreationAttempts = ((window as any).__webgpuRecreationAttempts || 0) + 1;
+        const newRenderer = await WebGpuRenderer.create(canvasEl);
+        if (savedW > 0 && savedH > 0) {
+          newRenderer.resize(savedW, savedH);
+        }
+        // Drain any tiles that arrived during the device-loss window.
+        for (const t of pendingPalRle) newRenderer.palRleQueue.push(t);
+        for (const t of pendingSolid) newRenderer.solidQueue.push(t);
+        for (const t of pendingRaw) newRenderer.rawQueue.push(t);
+        pendingPalRle.length = 0;
+        pendingSolid.length = 0;
+        pendingRaw.length = 0;
+        renderer = newRenderer;
+        deviceLostPending = false;
+        installDeviceLostHandler(newRenderer);
+        console.info('WebGPU device recreated after loss');
+        (window as any).__webgpuDeviceRecreated = ((window as any).__webgpuDeviceRecreated || 0) + 1;
+      } catch (e) {
+        console.error('WebGPU device recreation failed:', e);
+        (window as any).__webgpuRecreationError = String(e);
+        deviceLostPending = false; // don't block tiles forever on failed recreation
+      }
+    });
+  }
+  installDeviceLostHandler(renderer);
 
   // Wire all test/e2e diagnostic globals onto `window` via diagnostics.ts.
   // The getRenderer callback is called lazily (per __readPixel invocation)
@@ -294,16 +350,28 @@ async function main() {
     });
 
     if (asm.header.codec === Codec.Raw) {
-      renderer.rawQueue.push({ tileX: tX, tileY: tY, bgra: payload });
+      if (deviceLostPending) {
+        pendingRaw.push({ tileX: tX, tileY: tY, bgra: payload });
+      } else {
+        renderer.rawQueue.push({ tileX: tX, tileY: tY, bgra: payload });
+      }
     } else if (asm.header.codec === Codec.H264) {
       const dec = getH264Decoder(tX, tY);
       dec.decode(payload);
     } else if (asm.header.codec === Codec.Solid) {
       if (payload.byteLength === 4) {
-        renderer.solidQueue.push({ tileX: tX, tileY: tY, bgra: payload });
+        if (deviceLostPending) {
+          pendingSolid.push({ tileX: tX, tileY: tY, bgra: payload });
+        } else {
+          renderer.solidQueue.push({ tileX: tX, tileY: tY, bgra: payload });
+        }
       }
     } else if (asm.header.codec === Codec.PalRle) {
-      renderer.palRleQueue.push({ tileX: tX, tileY: tY, payload });
+      if (deviceLostPending) {
+        pendingPalRle.push({ tileX: tX, tileY: tY, payload });
+      } else {
+        renderer.palRleQueue.push({ tileX: tX, tileY: tY, payload });
+      }
     }
 
     if (!firstTileRendered) {
@@ -419,13 +487,50 @@ async function main() {
           if (frag) { payload.set(frag, off); off += frag.byteLength; }
         }
 
-        if (!fullFrameDecoder) {
-          fullFrameDecoder = new FullFrameDecoder((frame: VideoFrame) => {
-            renderer.h264Queue.push({ tileX: -1, tileY: -1, frame });
-          }, 1920, 1080);
-        }
+        // Skip full-frame H.264 decode on SwiftShader: WebCodecs VideoDecoder
+        // crashes the GPU process on SwiftShader, permanently destroying the
+        // WebGPU device. TileCodec (PalRle) will repaint everything after the
+        // H.264→TileCodec transition anyway, so dropping H.264 frames here is
+        // acceptable in the software-renderer path.
+        if (!renderer.isSwiftShader) {
+          if (!fullFrameDecoder) {
+            const fbW = renderer.framebuffer.width || 1920;
+            const fbH = renderer.framebuffer.height || 1080;
+            (window as any).__fullFrameDecoderDims = { w: fbW, h: fbH };
+            fullFrameDecoder = new FullFrameDecoder((frame: VideoFrame) => {
+              const cnt = ((window as any).__fullFrameOutputCount || 0) + 1;
+              (window as any).__fullFrameOutputCount = cnt;
+              const frameW = frame.displayWidth;
+              const frameH = frame.displayHeight;
+              // Use copyTo() to extract RGBA pixels and write directly to the
+              // framebuffer texture. This avoids importExternalTexture which
+              // causes SwiftShader device loss in the e2e headless environment.
+              const rgba = new Uint8Array(new ArrayBuffer(frameW * frameH * 4));
+              frame.copyTo(rgba, { format: 'RGBA' }).then(() => {
+                // Sample pixel at (100,100) for diagnostics
+                const pixOff = (100 * frameW + 100) * 4;
+                if (!((window as any).__fullFramePixelSamples)) (window as any).__fullFramePixelSamples = [];
+                (window as any).__fullFramePixelSamples.push({
+                  n: cnt, w: frameW, h: frameH,
+                  r: rgba[pixOff], g: rgba[pixOff+1], b: rgba[pixOff+2],
+                  fbW: renderer.framebuffer.width, fbH: renderer.framebuffer.height,
+                });
+                renderer.writeFullFrameRgba(rgba, frameW, frameH);
+                frame.close();
+              }).catch((e) => {
+                if (!((window as any).__fullFrameCopyToErrors)) (window as any).__fullFrameCopyToErrors = [];
+                (window as any).__fullFrameCopyToErrors.push({ n: cnt, err: String(e) });
+                frame.close();
+              });
+            }, fbW, fbH);
+          }
 
-        fullFrameDecoder.decode(payload, asm.header.isKeyframe);
+          if (!(window as any).__fullFramePayloadSizes) (window as any).__fullFramePayloadSizes = [];
+          // Capture first 16 bytes of first IDR as hex for analysis
+          const hex16 = Array.from(payload.slice(0, 16)).map(b => b.toString(16).padStart(2,'0')).join(' ');
+          (window as any).__fullFramePayloadSizes.push({ size: payload.byteLength, isKeyframe: asm.header.isKeyframe, hex16 });
+          fullFrameDecoder.decode(payload, asm.header.isKeyframe, asm.header.timestampUs);
+        }
 
         if (!firstTileRendered) {
           firstTileRendered = true;
