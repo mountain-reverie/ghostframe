@@ -1575,11 +1575,11 @@ fn process_frame_emits_correct_indices_for_two_color_tile() {
 }
 
 #[test]
-fn reset_for_session_drops_prev_image_and_sets_counter() {
+fn invalidate_baseline_drops_prev_image_and_sets_counter() {
     let mut processor = match GpuFrameProcessor::new(256) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("Skipping reset_for_session test (no Vulkan GPU?): {e}");
+            eprintln!("Skipping invalidate_baseline test (no Vulkan GPU?): {e}");
             return;
         }
     };
@@ -1600,7 +1600,7 @@ fn reset_for_session_drops_prev_image_and_sets_counter() {
         match result {
             Ok(_) => {}
             Err(e) => {
-                eprintln!("Skipping reset_for_session test (memfd not DMA-BUF?): {e}");
+                eprintln!("Skipping invalidate_baseline test (memfd not DMA-BUF?): {e}");
                 return;
             }
         }
@@ -1608,14 +1608,14 @@ fn reset_for_session_drops_prev_image_and_sets_counter() {
     assert!(processor.prev_image.is_some(), "diff should populate prev_image");
 
     // The API under test.
-    processor.reset_for_session(20);
+    processor.invalidate_baseline(20);
 
-    assert!(processor.prev_image.is_none(), "reset_for_session must drop prev_image");
+    assert!(processor.prev_image.is_none(), "invalidate_baseline must drop prev_image");
     assert_eq!(processor.force_all_dirty_remaining, 20);
 }
 
 #[test]
-fn reset_for_session_cushion_keeps_all_dirty_and_prev_image_none() {
+fn invalidate_baseline_cushion_keeps_all_dirty_and_prev_image_none() {
     let width = 64u32;
     let height = 64u32;
     let stride = width * 4;
@@ -1652,7 +1652,7 @@ fn reset_for_session_cushion_keeps_all_dirty_and_prev_image_none() {
         assert_eq!(dirty.len(), 0, "identical content: SAD reports 0 dirty");
 
         // Engage the cushion.
-        processor.reset_for_session(3);
+        processor.invalidate_baseline(3);
         assert!(processor.prev_image.is_none());
 
         // Cushion frames 1..=3: all dirty, prev_image stays None.

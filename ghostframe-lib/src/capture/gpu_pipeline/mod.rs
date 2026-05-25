@@ -516,15 +516,22 @@ impl GpuFrameProcessor {
         Ok(analysis.dirty_tiles)
     }
 
-    /// Reset per-session state on a new WebTransport session, matching the
-    /// CPU path's `dirty_tracker.reset() + force_dirty_frames = N` shape.
+    /// Invalidate the GPU SAD baseline by dropping `prev_image` and arming the
+    /// no-snapshot cushion for the next `force_frames` frames.
     ///
-    /// Drops the cached `prev_image` (freeing its Vulkan resources) AND sets
-    /// the no-commit cushion to `force_frames` frames. During the cushion,
-    /// every frame is reported as fully dirty without snapshotting
-    /// `prev_image`, so datagrams dropped by QUIC slow-start naturally
-    /// resurface as dirty on subsequent frames.
-    pub fn reset_for_session(&mut self, force_frames: u32) {
+    /// While the cushion is active, every frame is reported as fully dirty
+    /// without snapshotting a new baseline — datagrams dropped during the
+    /// cushion period (e.g. QUIC slow-start, or a lossy→lossless repaint
+    /// burst) naturally re-surface as dirty until the cushion exhausts and
+    /// the next frame becomes the first real snapshot.
+    ///
+    /// Two call sites today:
+    /// - `fire_session_reset` calls with `force_frames = 20` to cover QUIC
+    ///   slow-start datagram loss after a new session connects.
+    /// - The H264 → TileCodec mode-flip handoff in `process_frame_gpu` calls
+    ///   with `force_frames = 1` to trigger a one-shot lossless full-repaint
+    ///   that overwrites the H.264 lossy render.
+    pub fn invalidate_baseline(&mut self, force_frames: u32) {
         unsafe {
             // device_wait_idle ensures no in-flight GPU work still references
             // the prev_image we're about to destroy. The Drop impl uses the

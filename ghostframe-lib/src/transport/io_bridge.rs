@@ -859,7 +859,7 @@ impl IoBridge {
         // dropped during QUIC slow-start re-emerges as dirty on the
         // next frame. Each path has its own implementation — CPU's
         // `force_dirty_frames` runs dirty_tracker in no-commit mode;
-        // GPU's `reset_for_session` drops prev_image and runs the
+        // GPU's `invalidate_baseline` drops prev_image and runs the
         // no-snapshot first-frame path for N frames.
         //
         // Both are set unconditionally. On the CPU-only path,
@@ -870,7 +870,7 @@ impl IoBridge {
         // which is exactly the correct behaviour on that error path.
         self.force_dirty_frames = 20;
         if let Some(p) = self.gpu_frame_processor.as_mut() {
-            p.reset_for_session(20);
+            p.invalidate_baseline(20);
         }
         // Force IDR on the existing encoder so the new client
         // gets a fresh anchor. Without this, a client connecting
