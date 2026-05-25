@@ -1022,15 +1022,23 @@ async fn e2e_palrle_oob_index() -> Result<()> {
     Ok(())
 }
 
-/// Force a client reconnect mid-stream; verify the server's warm-cache
-/// palette table re-delivers palettes on the new session and the text
-/// region renders correctly post-reset.
-// M3.2c follow-up: post-page-reload the server doesn't re-emit static
-// content (SAD sees no dirty tiles since text_grid_drm content is
-// unchanged), so the new client receives nothing for text tiles and the
-// canvas stays blank.  Needs server-side "new session → re-classify all
-// tiles" logic (probably M3.5).  See project_m32c_deferred.md.
-#[ignore = "M3.2c follow-up: post-reset server doesn't re-emit static content; needs session-aware re-classification"]
+/// Force a client reconnect mid-stream; verify the H264 → TileCodec
+/// mode-flip handoff repaints the canvas with lossless content
+/// post-reset.
+///
+/// Closure path:
+/// - `fire_session_reset` forces `frame_mode = H264` + `request_keyframe`
+///   for the initial post-reset burst (lossy IDR + P-frames).
+/// - After `exit_sustain_frames = 30` of static content, the classifier
+///   transitions H264 → TileCodec. The mode-flip handoff invalidates
+///   the GPU SAD baseline via `invalidate_baseline(1)`, so the next
+///   TileCodec frame reports all tiles dirty and PalRle emissions
+///   repaint the canvas with lossless content.
+///
+/// The 4s post-reset wait covers both phases (H.264 burst ~1s, handoff
+/// at ~1s, lossless repaint over the next ~250ms).
+///
+/// Spec: docs/superpowers/specs/2026-05-25-h264-tilecodec-handoff-design.md
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_palrle_session_reset() -> Result<()> {
     use ghostframe_test_pattern::text_grid::SAMPLES;
@@ -1862,25 +1870,22 @@ async fn e2e_multi_pattern() -> Result<()> {
 ///
 /// Assertions:
 /// - both datagram kinds must be observed (basic precondition: tile_seen && frame_seen),
-/// - at least one phase must be H264-dominated (frame deltas substantially
-///   outnumber tile deltas — characteristic of a motion phase),
-/// - some phase must contain TileCodec emissions,
-/// - **at least 2 distinct frame-dominated phases must be observed.** This is
-///   the load-bearing proof of bidirectional mode switching: the classifier
-///   must have ENTERED H264 (phase 1), then EXITED it (otherwise we wouldn't
-///   see a *distinct* later entry), then RE-ENTERED H264 (phase 2). Both
-///   directions exercised transitively without depending on observable
-///   datagrams during the exit (static halves are silent — no dirty tiles →
-///   no datagrams either way, regardless of mode).
+/// - at least one phase must contain TileCodec datagrams,
+/// - **at least 2 distinct H264-active phases must be observed.** An H264-active
+///   phase has H.264 frame-datagram count ≥ `MIN_FRAME_COUNT_FOR_H264_PHASE`,
+///   which only happens when the classifier is in H.264 mode for most of the
+///   phase. Two distinct H264-active phases prove the classifier ENTERED
+///   H264 (phase A), EXITED it (else the later phase wouldn't be distinct),
+///   and RE-ENTERED H264 (phase B). Both directions exercised transitively.
 ///
-/// FUTURE PHASE (M3.3+): once progressive CDF 5/3 refinement is wired, the
-/// static halves will produce wavelet bit-plane datagrams (lossless build-up
-/// from H264 snapshot toward pixel-perfect). At that point the test can
-/// observe **direct** mode transitions during static phases (Frame →
-/// refinement-Tile datagrams instead of silence), and the "≥2 distinct
-/// frame-dominated phases" indirection can tighten to "≥2 explicit Frame→Tile
-/// flips and ≥1 explicit Tile→Frame flip." Tracked in memory note
-/// `project_m33_static_refinement.md`.
+/// Prior assertion shape (`frame > 5 * tile`) was invalidated by the
+/// H264 → TileCodec mode-flip handoff added 2026-05-25: that handoff fires
+/// `invalidate_baseline(1)` on every classifier exit from H.264, producing a
+/// 768-tile burst per transition. Tile counts in motion phases are now in the
+/// thousands (multiple oscillations per phase × 768 tiles each), so a
+/// ratio-based assertion no longer cleanly identifies H.264 mode. The
+/// absolute-frame-count threshold (≥ 150 H.264 datagrams) directly measures
+/// "classifier was in H.264 mode this phase" without relying on tile counts.
 #[tokio::test]
 async fn e2e_mode_switch() -> Result<()> {
     let setup = setup_e2e_webgpu_gpu("--drm-direct --mode-switch-cycle 3").await?;
@@ -1948,18 +1953,23 @@ async fn e2e_mode_switch() -> Result<()> {
         }
     }
 
-    // Frame-dominated phase: H264 frames substantially outnumber tile datagrams.
-    // Use a 5x ratio with a minimum frame count to filter noise around
-    // cooldown periods where a few residual frame fragments could fire.
-    const FRAME_DOMINANCE_RATIO: i64 = 5;
-    const MIN_FRAME_COUNT_FOR_DOMINANCE: i64 = 10;
-    let is_frame_dominated = |(t, f): &(i64, i64)| -> bool {
-        *f >= MIN_FRAME_COUNT_FOR_DOMINANCE && *f >= FRAME_DOMINANCE_RATIO * t.max(&1)
+    // H264-active phase: phase where the classifier was in H.264 mode for
+    // most of the phase, identifiable by a high count of H.264 frame
+    // datagrams (which only flow when frame_mode == H264). 150 is comfortably
+    // above the residual frame-datagram count seen in non-H264 phases
+    // (typically 35-67 from the exit_sustain tail) and well below what a
+    // motion phase produces (typically 474-503 in 3-second motion windows).
+    // Replaces the prior ratio-based "frame_dominated" check, which was
+    // invalidated by the H264 → TileCodec mode-flip handoff producing
+    // visible tile bursts during motion phases.
+    const MIN_FRAME_COUNT_FOR_H264_PHASE: i64 = 150;
+    let is_h264_active_phase = |(_t, f): &(i64, i64)| -> bool {
+        *f >= MIN_FRAME_COUNT_FOR_H264_PHASE
     };
-    let frame_dominated_phases: Vec<usize> = phases
+    let h264_active_phases: Vec<usize> = phases
         .iter()
         .enumerate()
-        .filter(|(_, p)| is_frame_dominated(*p))
+        .filter(|(_, p)| is_h264_active_phase(*p))
         .map(|(i, _)| i)
         .collect();
 
@@ -1968,7 +1978,7 @@ async fn e2e_mode_switch() -> Result<()> {
     let tile_present_phase = phases.iter().any(|(t, _)| *t > 0);
 
     // Diagnostic table — print on any failure.
-    let pass = tile_seen && frame_seen && tile_present_phase && frame_dominated_phases.len() >= 2;
+    let pass = tile_seen && frame_seen && tile_present_phase && h264_active_phases.len() >= 2;
     if !pass {
         eprintln!("--- per-sample deltas ---");
         for (ms, dt, df) in &deltas {
@@ -1976,15 +1986,15 @@ async fn e2e_mode_switch() -> Result<()> {
         }
         eprintln!("--- per-phase totals (anchor={:?}) ---", t_first_data);
         for (i, (t, f)) in phases.iter().enumerate() {
-            let marker = if is_frame_dominated(&(*t, *f)) {
-                " <FRAME-DOMINATED>"
+            let marker = if is_h264_active_phase(&(*t, *f)) {
+                " <H264-ACTIVE>"
             } else {
                 ""
             };
             eprintln!("phase {i}  tile={t:>5}  frame={f:>5}{marker}");
         }
         eprintln!(
-            "tile_seen={tile_seen} frame_seen={frame_seen} tile_present_phase={tile_present_phase} frame_dominated_phases={frame_dominated_phases:?}"
+            "tile_seen={tile_seen} frame_seen={frame_seen} tile_present_phase={tile_present_phase} h264_active_phases={h264_active_phases:?}"
         );
     }
 
@@ -1998,17 +2008,17 @@ async fn e2e_mode_switch() -> Result<()> {
     );
     assert!(tile_present_phase,
         "expected at least one phase containing TileCodec datagrams; classifier may be stuck in H264");
-    // Load-bearing assertion: 2+ distinct frame-dominated phases proves the
+    // Load-bearing assertion: 2+ distinct H264-active phases proves the
     // classifier entered H264, *left it* (else the later phase wouldn't be a
-    // distinct entry), and re-entered. Both directions exercised transitively.
-    // This is the strongest assertion the architecture currently permits —
-    // static halves emit no datagrams, so direct Frame→Tile transitions can't
-    // be observed. See M3.3 future-work note in the function docstring.
+    // distinct entry), and re-entered. Both directions exercised transitively
+    // via the H.264-frame-datagram-count signal — H.264 datagrams flow only
+    // when frame_mode == H264, so a high count means the classifier was
+    // actively in H.264 mode for that phase.
     assert!(
-        frame_dominated_phases.len() >= 2,
-        "expected at least 2 distinct frame-dominated phases (proves classifier flipped both \
-         directions: H264 → exit → H264). Observed frame-dominated phase indices: {:?}",
-        frame_dominated_phases
+        h264_active_phases.len() >= 2,
+        "expected at least 2 distinct H264-active phases (proves classifier flipped both \
+         directions: H264 → exit → H264). Observed H264-active phase indices: {:?}",
+        h264_active_phases
     );
 
     Ok(())
