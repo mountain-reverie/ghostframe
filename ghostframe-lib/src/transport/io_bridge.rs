@@ -1169,10 +1169,10 @@ impl IoBridge {
             // is current relative to the static screen) and the lossless tile
             // codecs never get a chance to upgrade the canvas from the H.264
             // lossy render. Symmetric to the existing `request_keyframe()` on
-            // TileCodec → H264 at io_bridge.rs:1195-1199: each direction of the
-            // mode flip resets the state that the entering mode relies on
-            // (H.264 GOP for the H264 direction, GPU SAD baseline for the
-            // TileCodec direction).
+            // TileCodec → H264 in the `FrameMode::H264` match arm below: each
+            // direction of the mode flip resets the state that the entering mode
+            // relies on (H.264 GOP for the H264 direction, GPU SAD baseline for
+            // the TileCodec direction).
             //
             // force_frames = 1 (not 20) because we're past QUIC slow-start by
             // the time exit_sustain elapses; ACK-based retries handle
