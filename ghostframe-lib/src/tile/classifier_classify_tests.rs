@@ -212,3 +212,46 @@ fn medium_freq_h264_hysteresis_takes_precedence_over_lossless() {
         CodecState::H264 { frames_in_h264: 8 }
     );
 }
+
+// ---- gate_codec_state tests ----
+
+#[test]
+fn gate_keeps_cdf53_when_both_gates_true() {
+    let cdf53_state = CodecState::Cdf53 { passes_sent: 0, max_passes: 14 };
+    let result = gate_codec_state(cdf53_state, true, true);
+    assert!(
+        matches!(result, CodecState::Cdf53 { .. }),
+        "expected Cdf53 retained when both gates open; got {result:?}"
+    );
+}
+
+#[test]
+fn gate_downgrades_when_env_flag_off() {
+    let cdf53_state = CodecState::Cdf53 { passes_sent: 0, max_passes: 14 };
+    let result = gate_codec_state(cdf53_state, false, true);
+    assert!(
+        !matches!(result, CodecState::Cdf53 { .. }),
+        "expected non-Cdf53 fallback when env flag false; got {result:?}"
+    );
+}
+
+#[test]
+fn gate_downgrades_when_client_lacks_capability() {
+    let cdf53_state = CodecState::Cdf53 { passes_sent: 0, max_passes: 14 };
+    let result = gate_codec_state(cdf53_state, true, false);
+    assert!(
+        !matches!(result, CodecState::Cdf53 { .. }),
+        "expected non-Cdf53 fallback when client capability false; got {result:?}"
+    );
+}
+
+#[test]
+fn gate_passes_non_cdf53_states_through_unchanged() {
+    // Solid, Bc1, PalRle, etc. are untouched by the gate even when both gates closed.
+    let solid = CodecState::Solid;
+    let result = gate_codec_state(solid, false, false);
+    assert!(
+        matches!(result, CodecState::Solid),
+        "expected Solid passed through unchanged; got {result:?}"
+    );
+}

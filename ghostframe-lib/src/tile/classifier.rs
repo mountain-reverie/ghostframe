@@ -168,6 +168,31 @@ pub fn classify_tile(metrics: &TileMetrics, prev: &CodecState) -> CodecState {
     }
 }
 
+/// Apply the Cdf53 emission gates to a classifier-produced [`CodecState`].
+///
+/// If the state is [`CodecState::Cdf53`] and either gate is closed, downgrade
+/// to the pre-M3.3a high-color fallback ([`CodecState::Bc1`] — io_bridge maps
+/// this to `Codec::Raw` on the wire, preserving M3.2 behavior). Non-Cdf53
+/// states pass through unchanged.
+///
+/// Gates:
+/// - `cdf53_enabled`: server-side env flag `GHOSTFRAME_ENABLE_CDF53`.
+/// - `client_supports_cdf53`: per-session HELLO `supports_cdf53` capability bit.
+pub fn gate_codec_state(
+    state: CodecState,
+    cdf53_enabled: bool,
+    client_supports_cdf53: bool,
+) -> CodecState {
+    if matches!(state, CodecState::Cdf53 { .. }) && !(cdf53_enabled && client_supports_cdf53) {
+        // Downgrade to Bc1: the Rule-5 / pre-M3.3a high-color fallback.
+        // io_bridge's `_ => (Codec::Raw, tile_data)` arm already handles Bc1
+        // as Raw emission, so no wire-format change occurs.
+        CodecState::Bc1
+    } else {
+        state
+    }
+}
+
 #[cfg(test)]
 #[path = "classifier_classify_tests.rs"]
 mod classify_tests;

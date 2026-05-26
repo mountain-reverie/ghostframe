@@ -166,6 +166,11 @@ pub struct IoBridge {
     fec_enable_threshold: f64,
     /// Loss rate threshold to disable FEC (hysteresis).
     fec_disable_threshold: f64,
+    /// Server-side env flag: `GHOSTFRAME_ENABLE_CDF53`.
+    /// When false (default), `gate_codec_state` downgrades Cdf53 → Bc1 (Raw on
+    /// wire), preserving M3.2 behavior. Set to true by the operator to enable
+    /// CDF 5/3 emission once Task 9 Phase B encoding is wired in.
+    cdf53_enabled: bool,
     /// GPU-accelerated dirty tracker (Vulkan compute SAD).
     gpu_frame_processor: Option<GpuFrameProcessor>,
     /// Full-frame H.264 encoder (VA-API zero-copy).
@@ -387,6 +392,13 @@ impl IoBridge {
             tracing::info!("GPU dirty tracker initialized (Vulkan compute SAD)");
         }
 
+        let cdf53_enabled = std::env::var("GHOSTFRAME_ENABLE_CDF53")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if cdf53_enabled {
+            tracing::info!("GHOSTFRAME_ENABLE_CDF53=1: Cdf53 codec enabled");
+        }
+
         // Warm rayon's global thread pool so the first PalRLE-heavy frame
         // doesn't pay thread-spin-up latency on the hot path (design Section 4).
         rayon::iter::IntoParallelIterator::into_par_iter(0..1u32)
@@ -424,6 +436,7 @@ impl IoBridge {
                 .unwrap_or(0),
             fec_enable_threshold: FEC_ENABLE_THRESHOLD,
             fec_disable_threshold: FEC_DISABLE_THRESHOLD,
+            cdf53_enabled,
             gpu_frame_processor,
             full_frame_encoder: None,
             recent_frame_fragments: HashMap::new(),
@@ -1856,6 +1869,7 @@ impl IoBridge {
             fec_k: 0,
             fec_enable_threshold: FEC_ENABLE_THRESHOLD,
             fec_disable_threshold: FEC_DISABLE_THRESHOLD,
+            cdf53_enabled: false,
             gpu_frame_processor: None,
             full_frame_encoder: None,
             recent_frame_fragments: HashMap::new(),
@@ -1904,6 +1918,7 @@ impl IoBridge {
             fec_k: 0,
             fec_enable_threshold: FEC_ENABLE_THRESHOLD,
             fec_disable_threshold: FEC_DISABLE_THRESHOLD,
+            cdf53_enabled: false,
             gpu_frame_processor: None,
             full_frame_encoder: None,
             recent_frame_fragments: HashMap::new(),
