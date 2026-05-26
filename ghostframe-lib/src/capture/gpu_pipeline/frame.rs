@@ -610,6 +610,81 @@ impl GpuFrameProcessor {
         );
 
         // ============================================================
+        // Stage 4c: cdf53_forward L1 → L2 → L3 (per-tile wavelet transform)
+        // ============================================================
+
+        // Stage 4c-L1: 32×32 BGRA tile → 4 × 16×16 subbands.
+        let cdf53_forward_l1_ds_guard = self.run_cdf53_forward_l1_stage(
+            cmd,
+            current.view,
+            cols,
+            rows,
+        )?;
+
+        // Barrier L1 → L2: coefficient writes from L1 must be visible to L2.
+        let buf_barrier_l1_to_l2 = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(self.cdf53_coefficients_buffer)
+            .offset(0)
+            .size(vk::WHOLE_SIZE);
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            std::slice::from_ref(&buf_barrier_l1_to_l2),
+            &[],
+        );
+
+        // Stage 4c-L2: 16×16 LL1 → 4 × 8×8 subbands.
+        let cdf53_forward_l2_ds_guard = self.run_cdf53_forward_l2_stage(cmd, cols, rows)?;
+
+        // Barrier L2 → L3: coefficient writes from L2 must be visible to L3.
+        let buf_barrier_l2_to_l3 = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(self.cdf53_coefficients_buffer)
+            .offset(0)
+            .size(vk::WHOLE_SIZE);
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            std::slice::from_ref(&buf_barrier_l2_to_l3),
+            &[],
+        );
+
+        // Stage 4c-L3: 8×8 LL2 → 4 × 4×4 subbands. Final wavelet coefficients.
+        let cdf53_forward_l3_ds_guard = self.run_cdf53_forward_l3_stage(cmd, cols, rows)?;
+
+        // Barrier L3 → HOST_READ: Phase B reads coefficient buffer after fence.
+        let buf_barrier_l3_host = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::HOST_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(self.cdf53_coefficients_buffer)
+            .offset(0)
+            .size(vk::WHOLE_SIZE);
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::HOST,
+            vk::DependencyFlags::empty(),
+            &[],
+            std::slice::from_ref(&buf_barrier_l3_host),
+            &[],
+        );
+
+        // ============================================================
         // Stage 2a: palette_fold (intra-frame palette dedup)
         // ============================================================
 
@@ -1025,6 +1100,7 @@ impl GpuFrameProcessor {
         //    sad_ds_guard, nv12_ds_guard, analysis_ds_guard,
         //    palrle_compact_ds_guard, palrle_indirect_args_ds_guard,
         //    cdf53_compact_ds_guard, cdf53_indirect_args_ds_guard,
+        //    cdf53_forward_l1/l2/l3_ds_guard,
         //    palette_fold_ds_guard, palette_subset_fold_init_ds_guard,
         //    palette_subset_fold_ds_guard, and pal_rle_index_ds_guard are
         //    dropped explicitly before step 9 to
@@ -1041,6 +1117,9 @@ impl GpuFrameProcessor {
             &palrle_indirect_args_ds_guard,
             &cdf53_compact_ds_guard,
             &cdf53_indirect_args_ds_guard,
+            &cdf53_forward_l1_ds_guard,
+            &cdf53_forward_l2_ds_guard,
+            &cdf53_forward_l3_ds_guard,
             &palette_fold_ds_guard,
             &palette_subset_fold_init_ds_guard,
             &palette_subset_fold_ds_guard,
@@ -1055,6 +1134,9 @@ impl GpuFrameProcessor {
         drop(palrle_indirect_args_ds_guard);
         drop(cdf53_compact_ds_guard);
         drop(cdf53_indirect_args_ds_guard);
+        drop(cdf53_forward_l1_ds_guard);
+        drop(cdf53_forward_l2_ds_guard);
+        drop(cdf53_forward_l3_ds_guard);
         drop(palette_fold_ds_guard);
         drop(palette_subset_fold_init_ds_guard);
         drop(palette_subset_fold_ds_guard);
@@ -1407,6 +1489,81 @@ impl GpuFrameProcessor {
                 buf_barrier_cdf53_list_host,
                 buf_barrier_cdf53_count_host,
             ],
+            &[],
+        );
+
+        // ============================================================
+        // Stage 4c: cdf53_forward L1 → L2 → L3 (first-frame path)
+        // ============================================================
+
+        // Stage 4c-L1: 32×32 BGRA tile → 4 × 16×16 subbands.
+        let cdf53_forward_l1_ds_guard = self.run_cdf53_forward_l1_stage(
+            cmd,
+            current.view,
+            cols,
+            rows,
+        )?;
+
+        // Barrier L1 → L2
+        let buf_barrier_l1_to_l2 = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(self.cdf53_coefficients_buffer)
+            .offset(0)
+            .size(vk::WHOLE_SIZE);
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            std::slice::from_ref(&buf_barrier_l1_to_l2),
+            &[],
+        );
+
+        // Stage 4c-L2: 16×16 LL1 → 4 × 8×8 subbands.
+        let cdf53_forward_l2_ds_guard = self.run_cdf53_forward_l2_stage(cmd, cols, rows)?;
+
+        // Barrier L2 → L3
+        let buf_barrier_l2_to_l3 = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(self.cdf53_coefficients_buffer)
+            .offset(0)
+            .size(vk::WHOLE_SIZE);
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            std::slice::from_ref(&buf_barrier_l2_to_l3),
+            &[],
+        );
+
+        // Stage 4c-L3: 8×8 LL2 → final LL3/HL3/LH3/HH3 subbands.
+        let cdf53_forward_l3_ds_guard = self.run_cdf53_forward_l3_stage(cmd, cols, rows)?;
+
+        // Barrier L3 → HOST_READ: Phase B reads coefficient buffer after fence.
+        let buf_barrier_l3_host = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::HOST_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(self.cdf53_coefficients_buffer)
+            .offset(0)
+            .size(vk::WHOLE_SIZE);
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::HOST,
+            vk::DependencyFlags::empty(),
+            &[],
+            std::slice::from_ref(&buf_barrier_l3_host),
             &[],
         );
 
@@ -1791,6 +1948,9 @@ impl GpuFrameProcessor {
             &palrle_indirect_args_ds_guard,
             &cdf53_compact_ds_guard,
             &cdf53_indirect_args_ds_guard,
+            &cdf53_forward_l1_ds_guard,
+            &cdf53_forward_l2_ds_guard,
+            &cdf53_forward_l3_ds_guard,
             &palette_fold_ds_guard,
             &palette_subset_fold_init_ds_guard,
             &palette_subset_fold_ds_guard,
@@ -3074,6 +3234,273 @@ impl GpuFrameProcessor {
         // by the preceding palrle_indirect_args stage barrier in the orchestrator.
         self.device
             .cmd_dispatch_indirect(cmd, self.palrle_indirect_args_buffer, 0);
+
+        Ok(guard)
+    }
+
+    /// Stage 4c-L1 — CDF 5/3 forward wavelet, level 1.
+    ///
+    /// Reads the current frame image (STORAGE_IMAGE) and compact list
+    /// (STORAGE_BUFFER), writes coefficient buffer (STORAGE_BUFFER).
+    /// Dispatches via `cmd_dispatch_indirect` from `cdf53_dispatch_args_buffer`.
+    ///
+    /// Caller must:
+    ///   - Ensure `current_view` is in `GENERAL` layout (same state as for SAD/NV12).
+    ///   - Ensure `cdf53_dispatch_args_buffer` is barriered for `INDIRECT_COMMAND_READ`.
+    ///   - Add a SHADER_WRITE → SHADER_READ barrier on `cdf53_coefficients_buffer`
+    ///     after this call before dispatching L2.
+    ///   - Hold the returned guard alive until after `wait_for_fences`.
+    unsafe fn run_cdf53_forward_l1_stage<'a>(
+        &'a self,
+        cmd: vk::CommandBuffer,
+        current_view: vk::ImageView,
+        cols: u32,
+        rows: u32,
+    ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
+        let set_layouts = [self.cdf53_forward_l1_descriptor_set_layout];
+        let ds_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(&set_layouts);
+        let guard = ScopedDescriptorSets {
+            device: &self.device,
+            pool: self.descriptor_pool,
+            sets: self.device.allocate_descriptor_sets(&ds_alloc)?,
+        };
+        let ds = guard.sets[0];
+
+        // Binding 0: current frame STORAGE_IMAGE (read-only in shader, rgba8)
+        let image_info = [vk::DescriptorImageInfo::default()
+            .image_view(current_view)
+            .image_layout(vk::ImageLayout::GENERAL)];
+        // Binding 1: cdf53_compact_list (read-only)
+        let compact_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.cdf53_compact_list_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        // Binding 2: cdf53_coefficients (write)
+        let coeff_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.cdf53_coefficients_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(ds)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(&image_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(ds)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&compact_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(ds)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&coeff_info),
+        ];
+        self.device.update_descriptor_sets(&writes, &[]);
+
+        let push_vals: [u32; 2] = [cols, rows];
+        let push_bytes = std::slice::from_raw_parts(
+            push_vals.as_ptr() as *const u8,
+            std::mem::size_of_val(&push_vals),
+        );
+
+        self.device.cmd_bind_pipeline(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.cdf53_forward_l1_pipeline,
+        );
+        self.device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.cdf53_forward_l1_pipeline_layout,
+            0,
+            &[ds],
+            &[],
+        );
+        self.device.cmd_push_constants(
+            cmd,
+            self.cdf53_forward_l1_pipeline_layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            push_bytes,
+        );
+        // cdf53_dispatch_args_buffer already barriered for INDIRECT_COMMAND_READ
+        // by the preceding cdf53_indirect_args stage barrier in the orchestrator.
+        self.device
+            .cmd_dispatch_indirect(cmd, self.cdf53_dispatch_args_buffer, 0);
+
+        Ok(guard)
+    }
+
+    /// Stage 4c-L2 — CDF 5/3 forward wavelet, level 2.
+    ///
+    /// Reads LL1 from `cdf53_coefficients_buffer[0..256]` (per channel),
+    /// overwrites those offsets with LL2/HL2/LH2/HH2.
+    /// Dispatches via `cmd_dispatch_indirect` from `cdf53_dispatch_args_buffer`.
+    ///
+    /// Caller must:
+    ///   - Ensure a SHADER_WRITE → SHADER_READ barrier on `cdf53_coefficients_buffer`
+    ///     was issued after L1.
+    ///   - Add a SHADER_WRITE → SHADER_READ barrier on `cdf53_coefficients_buffer`
+    ///     after this call before dispatching L3.
+    ///   - Hold the returned guard alive until after `wait_for_fences`.
+    unsafe fn run_cdf53_forward_l2_stage<'a>(
+        &'a self,
+        cmd: vk::CommandBuffer,
+        cols: u32,
+        rows: u32,
+    ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
+        let set_layouts = [self.cdf53_forward_l2_descriptor_set_layout];
+        let ds_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(&set_layouts);
+        let guard = ScopedDescriptorSets {
+            device: &self.device,
+            pool: self.descriptor_pool,
+            sets: self.device.allocate_descriptor_sets(&ds_alloc)?,
+        };
+        let ds = guard.sets[0];
+
+        // Binding 0: cdf53_compact_list (read-only)
+        let compact_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.cdf53_compact_list_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        // Binding 1: cdf53_coefficients (read LL1, write L2 subbands)
+        let coeff_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.cdf53_coefficients_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(ds)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&compact_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(ds)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&coeff_info),
+        ];
+        self.device.update_descriptor_sets(&writes, &[]);
+
+        let push_vals: [u32; 2] = [cols, rows];
+        let push_bytes = std::slice::from_raw_parts(
+            push_vals.as_ptr() as *const u8,
+            std::mem::size_of_val(&push_vals),
+        );
+
+        self.device.cmd_bind_pipeline(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.cdf53_forward_l2_pipeline,
+        );
+        self.device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.cdf53_forward_l2_pipeline_layout,
+            0,
+            &[ds],
+            &[],
+        );
+        self.device.cmd_push_constants(
+            cmd,
+            self.cdf53_forward_l2_pipeline_layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            push_bytes,
+        );
+        self.device
+            .cmd_dispatch_indirect(cmd, self.cdf53_dispatch_args_buffer, 0);
+
+        Ok(guard)
+    }
+
+    /// Stage 4c-L3 — CDF 5/3 forward wavelet, level 3.
+    ///
+    /// Reads LL2 from `cdf53_coefficients_buffer[0..64]` (per channel),
+    /// overwrites those offsets with LL3/HL3/LH3/HH3.
+    /// Dispatches via `cmd_dispatch_indirect` from `cdf53_dispatch_args_buffer`.
+    ///
+    /// Caller must:
+    ///   - Ensure a SHADER_WRITE → SHADER_READ barrier on `cdf53_coefficients_buffer`
+    ///     was issued after L2.
+    ///   - Add a SHADER_WRITE → HOST_READ barrier on `cdf53_coefficients_buffer`
+    ///     after this call for Phase B readback.
+    ///   - Hold the returned guard alive until after `wait_for_fences`.
+    unsafe fn run_cdf53_forward_l3_stage<'a>(
+        &'a self,
+        cmd: vk::CommandBuffer,
+        cols: u32,
+        rows: u32,
+    ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
+        let set_layouts = [self.cdf53_forward_l3_descriptor_set_layout];
+        let ds_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(&set_layouts);
+        let guard = ScopedDescriptorSets {
+            device: &self.device,
+            pool: self.descriptor_pool,
+            sets: self.device.allocate_descriptor_sets(&ds_alloc)?,
+        };
+        let ds = guard.sets[0];
+
+        // Binding 0: cdf53_compact_list (read-only)
+        let compact_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.cdf53_compact_list_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        // Binding 1: cdf53_coefficients (read LL2, write L3 subbands)
+        let coeff_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.cdf53_coefficients_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(ds)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&compact_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(ds)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&coeff_info),
+        ];
+        self.device.update_descriptor_sets(&writes, &[]);
+
+        let push_vals: [u32; 2] = [cols, rows];
+        let push_bytes = std::slice::from_raw_parts(
+            push_vals.as_ptr() as *const u8,
+            std::mem::size_of_val(&push_vals),
+        );
+
+        self.device.cmd_bind_pipeline(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.cdf53_forward_l3_pipeline,
+        );
+        self.device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.cdf53_forward_l3_pipeline_layout,
+            0,
+            &[ds],
+            &[],
+        );
+        self.device.cmd_push_constants(
+            cmd,
+            self.cdf53_forward_l3_pipeline_layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            push_bytes,
+        );
+        self.device
+            .cmd_dispatch_indirect(cmd, self.cdf53_dispatch_args_buffer, 0);
 
         Ok(guard)
     }

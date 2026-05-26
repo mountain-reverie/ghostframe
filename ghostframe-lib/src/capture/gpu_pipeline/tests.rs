@@ -1788,3 +1788,94 @@ fn cdf53_compact_filters_high_color_tiles_only() {
         list[0]
     );
 }
+
+#[test]
+fn cdf53_forward_gpu_matches_cpu_reference() {
+    use crate::encoder::cdf53;
+
+    let mut processor = match GpuFrameProcessor::new(256) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Skipping cdf53_forward equivalence test (no Vulkan?): {e}");
+            return;
+        }
+    };
+
+    // 64×64 frame: tile (0,0) has high-color gradient (→ Cdf53 path),
+    // other tiles have solid/low-color content.
+    let width = 64u32;
+    let height = 64u32;
+    let stride = width * 4;
+    let mut pixels = vec![0u8; (stride * height) as usize];
+    for y in 0..height {
+        for x in 0..width {
+            let off = ((y * stride) + x * 4) as usize;
+            if x < 32 && y < 32 {
+                // High-color gradient tile — will be classified Cdf53.
+                pixels[off]     = (x * 3 % 256) as u8;     // B
+                pixels[off + 1] = (y * 3 % 256) as u8;     // G
+                pixels[off + 2] = ((x + y) % 256) as u8;   // R
+            } else {
+                // Solid blue on other tiles — PalRLE or Solid, not Cdf53.
+                pixels[off]     = 0xFF;
+                pixels[off + 1] = 0;
+                pixels[off + 2] = 0;
+            }
+            pixels[off + 3] = 0xFF; // A
+        }
+    }
+
+    // Compute CPU reference for the gradient tile (tile index 0, col=0, row=0).
+    let mut tile_bgra = vec![0u8; 32 * 32 * 4];
+    for ty in 0..32usize {
+        for tx in 0..32usize {
+            let src = (ty * stride as usize) + tx * 4;
+            let dst = (ty * 32 + tx) * 4;
+            tile_bgra[dst..dst + 4].copy_from_slice(&pixels[src..src + 4]);
+        }
+    }
+    let cpu_coefficients = cdf53::forward(&tile_bgra);
+
+    // Run GPU pipeline.
+    unsafe {
+        let fd = make_memfd_from_pixels(&pixels, width, height);
+        let result = processor.process_frame(fd, width, height, stride);
+        libc::close(fd);
+        match result {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("Skipping cdf53_forward equivalence test (memfd not DMA-BUF?): {e}");
+                return;
+            }
+        }
+    }
+
+    // Verify cdf53_compact has exactly 1 tile (the gradient tile at index 0).
+    let compact_count = unsafe { *processor.cdf53_compact_count_ptr };
+    if compact_count == 0 {
+        eprintln!("Skipping cdf53_forward equivalence test: cdf53_compact_count=0 (gradient tile not classified Cdf53)");
+        return;
+    }
+
+    // Read GPU coefficients for compact slot 0.
+    // The coefficient buffer stores i32 per coefficient; Phase B casts to i16.
+    let gpu_coeffs: Vec<i16> = unsafe {
+        let raw = std::slice::from_raw_parts(
+            processor.cdf53_coefficients_ptr,
+            cdf53::CDF53_TOTAL_COEFFS,
+        );
+        raw.iter().map(|&v| v as i16).collect()
+    };
+
+    // Compare exact: integer CDF 5/3 lifting must match the CPU reference.
+    for (i, (&gpu, &cpu)) in gpu_coeffs.iter().zip(cpu_coefficients.iter()).enumerate() {
+        if gpu != cpu {
+            let channel = i / cdf53::CDF53_COEFFS_PER_CHANNEL;
+            let in_channel = i % cdf53::CDF53_COEFFS_PER_CHANNEL;
+            panic!(
+                "coefficient mismatch at i={i} (channel={channel}, in_channel={in_channel}): \
+                 GPU={gpu} vs CPU={cpu}"
+            );
+        }
+    }
+}

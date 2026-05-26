@@ -1,0 +1,220 @@
+// cdf53_forward_l1.comp
+// Stage 4c-L1: CDF 5/3 forward wavelet, level 1.
+// 32x32 tile -> 16x16 LL1 + 3 x 16x16 detail bands.
+//
+// Each workgroup processes one Cdf53-eligible tile (indexed via
+// cdf53_compact_list[workgroup_id.x]).
+// workgroup_size = (16, 16, 1) = 256 invocations.
+// Each invocation handles a 2x2 block of input pixels (load phase),
+// then participates in barriers while serial lifting runs.
+//
+// Lifting is done serially by a single elected invocation per row/col
+// for correctness. Optimization deferred to M3.3c.
+//
+// Output layout per channel (1024 i32 coefficients):
+//   [  0..256) = LL1 (written to be overwritten by L2)
+//   [256..512) = HL1
+//   [512..768) = LH1
+//   [768..1024) = HH1
+//
+// This layout lets L2 read LL1 from offsets 0..256 and overwrite in place.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// Workgroup-shared 32x32 scratch buffer (one channel processed at a time).
+shared int scratch[32 * 32];
+
+// Binding 0: current BGRA frame (STORAGE_IMAGE, rgba8 format).
+// Read via imageLoad to get raw unorm bytes without float rounding.
+layout(set = 0, binding = 0, rgba8) readonly uniform image2D current_frame;
+
+// Binding 1: compact list of Cdf53-eligible tile indices (Stage 4a output).
+layout(set = 0, binding = 1, std430) readonly buffer Cdf53CompactList {
+    uint tile_indices[];
+};
+
+// Binding 2: output coefficient buffer (i32 per coefficient).
+// L2 reads LL1 from offsets 0..256 and overwrites them.
+layout(set = 0, binding = 2, std430) buffer Cdf53Coefficients {
+    int coefficients[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint cols;
+    uint rows;
+};
+
+const uint COEFFS_PER_CHANNEL = 1024u;
+const uint CHANNELS = 3u;
+
+// Load one channel of a 32x32 tile into shared scratch.
+// Each invocation loads a 2x2 block.
+void load_channel(uint tile_x, uint tile_y, uint channel) {
+    uint base_x = tile_x * 32u + gl_LocalInvocationID.x * 2u;
+    uint base_y = tile_y * 32u + gl_LocalInvocationID.y * 2u;
+    for (uint dy = 0u; dy < 2u; dy++) {
+        for (uint dx = 0u; dx < 2u; dx++) {
+            ivec2 coord = ivec2(int(base_x + dx), int(base_y + dy));
+            vec4 px = imageLoad(current_frame, coord);
+            // imageLoad on rgba8 returns normalized [0..1] floats.
+            // Convert to [0..255] integer via round(). Channels: r=R, g=G, b=B.
+            // BGRA memory order: channel 0 = B, 1 = G, 2 = R.
+            int v;
+            if (channel == 0u) {
+                v = int(round(px.b * 255.0));
+            } else if (channel == 1u) {
+                v = int(round(px.g * 255.0));
+            } else {
+                v = int(round(px.r * 255.0));
+            }
+            uint local_x = gl_LocalInvocationID.x * 2u + dx;
+            uint local_y = gl_LocalInvocationID.y * 2u + dy;
+            scratch[local_y * 32u + local_x] = v;
+        }
+    }
+    barrier();
+}
+
+// CDF 5/3 horizontal lifting + deinterleave on one row of length 32.
+// Only the invocation with (local_y == row) and (local_x == 0) performs the work.
+// All invocations wait at the barrier after.
+void row_lifting(uint row) {
+    if (gl_LocalInvocationID.x == 0u && gl_LocalInvocationID.y == row) {
+        // Predict step: x[2i+1] -= (x[2i] + x[2i+2]) >> 1
+        // Mirror boundary: x[2i+2] = x[2i] when 2i+1 is last index (n-1=31)
+        for (uint i = 1u; i < 32u; i += 2u) {
+            int left = scratch[row * 32u + (i - 1u)];
+            int right;
+            if (i + 1u < 32u) {
+                right = scratch[row * 32u + (i + 1u)];
+            } else {
+                right = scratch[row * 32u + (i - 1u)]; // mirror
+            }
+            scratch[row * 32u + i] -= (left + right) >> 1;
+        }
+        // Update step: x[2i] += (x[2i-1] + x[2i+1] + 2) >> 2
+        // Mirror: x[-1] = x[1], x[n] = x[n-1]
+        for (uint i = 0u; i < 32u; i += 2u) {
+            int left;
+            if (i == 0u) {
+                left = scratch[row * 32u + 1u]; // mirror: x[-1] = x[1]
+            } else {
+                left = scratch[row * 32u + (i - 1u)];
+            }
+            int right;
+            if (i + 1u < 32u) {
+                right = scratch[row * 32u + (i + 1u)];
+            } else {
+                right = scratch[row * 32u + (i - 1u)]; // mirror
+            }
+            scratch[row * 32u + i] += (left + right + 2) >> 2;
+        }
+        // Deinterleave: [L0 L1 ... L15 H0 H1 ... H15]
+        int tmp[32];
+        for (uint j = 0u; j < 16u; j++) {
+            tmp[j]      = scratch[row * 32u + 2u * j];
+            tmp[16u + j] = scratch[row * 32u + 2u * j + 1u];
+        }
+        for (uint j = 0u; j < 32u; j++) {
+            scratch[row * 32u + j] = tmp[j];
+        }
+    }
+    barrier();
+}
+
+// CDF 5/3 vertical lifting + deinterleave on one column of length 32.
+// Only the invocation with (local_x == col) and (local_y == 0) performs the work.
+// All invocations wait at the barrier after.
+void col_lifting(uint col) {
+    if (gl_LocalInvocationID.y == 0u && gl_LocalInvocationID.x == col) {
+        // Predict step
+        for (uint j = 1u; j < 32u; j += 2u) {
+            int up = scratch[(j - 1u) * 32u + col];
+            int down;
+            if (j + 1u < 32u) {
+                down = scratch[(j + 1u) * 32u + col];
+            } else {
+                down = scratch[(j - 1u) * 32u + col]; // mirror
+            }
+            scratch[j * 32u + col] -= (up + down) >> 1;
+        }
+        // Update step
+        for (uint j = 0u; j < 32u; j += 2u) {
+            int up;
+            if (j == 0u) {
+                up = scratch[32u + col]; // mirror: x[-1] = x[1]
+            } else {
+                up = scratch[(j - 1u) * 32u + col];
+            }
+            int down;
+            if (j + 1u < 32u) {
+                down = scratch[(j + 1u) * 32u + col];
+            } else {
+                down = scratch[(j - 1u) * 32u + col]; // mirror
+            }
+            scratch[j * 32u + col] += (up + down + 2) >> 2;
+        }
+        // Deinterleave column
+        int tmp[32];
+        for (uint j = 0u; j < 16u; j++) {
+            tmp[j]      = scratch[(2u * j)       * 32u + col];
+            tmp[16u + j] = scratch[(2u * j + 1u) * 32u + col];
+        }
+        for (uint j = 0u; j < 32u; j++) {
+            scratch[j * 32u + col] = tmp[j];
+        }
+    }
+    barrier();
+}
+
+// Write all four level-1 subbands from scratch to the coefficient buffer.
+// After horizontal + vertical lifting + deinterleave:
+//   scratch[ly][lx]           (ly<16, lx<16)  = LL1
+//   scratch[ly][lx+16]        (ly<16, lx<16)  = HL1
+//   scratch[ly+16][lx]        (ly<16, lx<16)  = LH1
+//   scratch[ly+16][lx+16]     (ly<16, lx<16)  = HH1
+//
+// Coefficient buffer layout per channel (1024 i32s):
+//   [  0..256) = LL1  → indices [ly*16 + lx]
+//   [256..512) = HL1  → indices [ly*16 + lx + 256]
+//   [512..768) = LH1  → indices [ly*16 + lx + 512]
+//   [768..1024) = HH1 → indices [ly*16 + lx + 768]
+void write_outputs(uint compact_slot, uint channel) {
+    uint channel_offset = compact_slot * COEFFS_PER_CHANNEL * CHANNELS
+                        + channel * COEFFS_PER_CHANNEL;
+    uint lx = gl_LocalInvocationID.x;
+    uint ly = gl_LocalInvocationID.y;
+
+    coefficients[channel_offset +   0u + ly * 16u + lx] = scratch[ly         * 32u + lx];
+    coefficients[channel_offset + 256u + ly * 16u + lx] = scratch[ly         * 32u + (lx + 16u)];
+    coefficients[channel_offset + 512u + ly * 16u + lx] = scratch[(ly + 16u) * 32u + lx];
+    coefficients[channel_offset + 768u + ly * 16u + lx] = scratch[(ly + 16u) * 32u + (lx + 16u)];
+}
+
+void main() {
+    uint compact_slot = gl_WorkGroupID.x;
+    uint tile_idx     = tile_indices[compact_slot];
+    uint tile_x       = tile_idx % cols;
+    uint tile_y       = tile_idx / cols;
+
+    for (uint channel = 0u; channel < CHANNELS; channel++) {
+        // Load channel pixels into shared scratch.
+        load_channel(tile_x, tile_y, channel);
+
+        // Horizontal lifting on all 32 rows.
+        for (uint row = 0u; row < 32u; row++) {
+            row_lifting(row);
+        }
+        // Vertical lifting on all 32 columns.
+        for (uint col = 0u; col < 32u; col++) {
+            col_lifting(col);
+        }
+
+        // Write all four subbands to the coefficient buffer.
+        write_outputs(compact_slot, channel);
+
+        // Barrier before next channel reuses scratch.
+        barrier();
+    }
+}

@@ -1,0 +1,189 @@
+// cdf53_forward_l2.comp
+// Stage 4c-L2: CDF 5/3 forward wavelet, level 2.
+// 16x16 LL1 subband -> 8x8 LL2 + 3 x 8x8 detail bands.
+//
+// Reads LL1 from coefficients[channel_offset + 0..256] (written by L1).
+// Overwrites offsets 0..256 with L2 results:
+//   [  0.. 64) = LL2
+//   [ 64..128) = HL2
+//   [128..192) = LH2
+//   [192..256) = HH2
+//
+// workgroup_size = (16, 16, 1) = 256 invocations.
+// Each invocation loads exactly 1 LL1 coefficient into shared scratch.
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// Workgroup-shared 16x16 scratch buffer.
+shared int scratch[16 * 16];
+
+// Binding 0: compact list of Cdf53-eligible tile indices.
+layout(set = 0, binding = 0, std430) readonly buffer Cdf53CompactList {
+    uint tile_indices[];
+};
+
+// Binding 1: coefficient buffer (i32 per coefficient, 1024 per channel).
+layout(set = 0, binding = 1, std430) buffer Cdf53Coefficients {
+    int coefficients[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint cols;
+    uint rows;
+};
+
+const uint COEFFS_PER_CHANNEL = 1024u;
+const uint CHANNELS = 3u;
+
+// Load LL1 (16x16) from coefficient buffer into shared scratch.
+// Each invocation loads exactly 1 coefficient.
+void load_ll1(uint compact_slot, uint channel) {
+    uint channel_offset = compact_slot * COEFFS_PER_CHANNEL * CHANNELS
+                        + channel * COEFFS_PER_CHANNEL;
+    uint lx = gl_LocalInvocationID.x; // 0..15
+    uint ly = gl_LocalInvocationID.y; // 0..15
+    // LL1 occupies offsets 0..256 in row-major order.
+    scratch[ly * 16u + lx] = coefficients[channel_offset + ly * 16u + lx];
+    barrier();
+}
+
+// CDF 5/3 horizontal lifting + deinterleave on one row of length 16.
+// Only invocation (local_x==0, local_y==row) performs the work.
+void row_lifting(uint row) {
+    if (gl_LocalInvocationID.x == 0u && gl_LocalInvocationID.y == row) {
+        // Predict: x[2i+1] -= (x[2i] + x[2i+2]) >> 1
+        for (uint i = 1u; i < 16u; i += 2u) {
+            int left = scratch[row * 16u + (i - 1u)];
+            int right;
+            if (i + 1u < 16u) {
+                right = scratch[row * 16u + (i + 1u)];
+            } else {
+                right = scratch[row * 16u + (i - 1u)]; // mirror
+            }
+            scratch[row * 16u + i] -= (left + right) >> 1;
+        }
+        // Update: x[2i] += (x[2i-1] + x[2i+1] + 2) >> 2
+        for (uint i = 0u; i < 16u; i += 2u) {
+            int left;
+            if (i == 0u) {
+                left = scratch[row * 16u + 1u]; // mirror
+            } else {
+                left = scratch[row * 16u + (i - 1u)];
+            }
+            int right;
+            if (i + 1u < 16u) {
+                right = scratch[row * 16u + (i + 1u)];
+            } else {
+                right = scratch[row * 16u + (i - 1u)]; // mirror
+            }
+            scratch[row * 16u + i] += (left + right + 2) >> 2;
+        }
+        // Deinterleave: [L0..L7 H0..H7]
+        int tmp[16];
+        for (uint j = 0u; j < 8u; j++) {
+            tmp[j]     = scratch[row * 16u + 2u * j];
+            tmp[8u + j] = scratch[row * 16u + 2u * j + 1u];
+        }
+        for (uint j = 0u; j < 16u; j++) {
+            scratch[row * 16u + j] = tmp[j];
+        }
+    }
+    barrier();
+}
+
+// CDF 5/3 vertical lifting + deinterleave on one column of length 16.
+// Only invocation (local_x==col, local_y==0) performs the work.
+void col_lifting(uint col) {
+    if (gl_LocalInvocationID.y == 0u && gl_LocalInvocationID.x == col) {
+        // Predict
+        for (uint j = 1u; j < 16u; j += 2u) {
+            int up = scratch[(j - 1u) * 16u + col];
+            int down;
+            if (j + 1u < 16u) {
+                down = scratch[(j + 1u) * 16u + col];
+            } else {
+                down = scratch[(j - 1u) * 16u + col]; // mirror
+            }
+            scratch[j * 16u + col] -= (up + down) >> 1;
+        }
+        // Update
+        for (uint j = 0u; j < 16u; j += 2u) {
+            int up;
+            if (j == 0u) {
+                up = scratch[16u + col]; // mirror: x[-1] = x[1]
+            } else {
+                up = scratch[(j - 1u) * 16u + col];
+            }
+            int down;
+            if (j + 1u < 16u) {
+                down = scratch[(j + 1u) * 16u + col];
+            } else {
+                down = scratch[(j - 1u) * 16u + col]; // mirror
+            }
+            scratch[j * 16u + col] += (up + down + 2) >> 2;
+        }
+        // Deinterleave column
+        int tmp[16];
+        for (uint j = 0u; j < 8u; j++) {
+            tmp[j]     = scratch[(2u * j)       * 16u + col];
+            tmp[8u + j] = scratch[(2u * j + 1u) * 16u + col];
+        }
+        for (uint j = 0u; j < 16u; j++) {
+            scratch[j * 16u + col] = tmp[j];
+        }
+    }
+    barrier();
+}
+
+// Write L2 results to the coefficient buffer (overwrites LL1 region 0..256).
+// After lifting on 16x16:
+//   scratch[ly][lx]     (ly<8, lx<8)  = LL2
+//   scratch[ly][lx+8]   (ly<8, lx<8)  = HL2
+//   scratch[ly+8][lx]   (ly<8, lx<8)  = LH2
+//   scratch[ly+8][lx+8] (ly<8, lx<8)  = HH2
+//
+// Output layout in coefficients[channel_offset + 0..256]:
+//   [  0.. 64) = LL2 row-major 8x8
+//   [ 64..128) = HL2 row-major 8x8
+//   [128..192) = LH2 row-major 8x8
+//   [192..256) = HH2 row-major 8x8
+//
+// Only invocations with lx<8 and ly<8 write (one coefficient per band).
+void write_outputs(uint compact_slot, uint channel) {
+    uint channel_offset = compact_slot * COEFFS_PER_CHANNEL * CHANNELS
+                        + channel * COEFFS_PER_CHANNEL;
+    uint lx = gl_LocalInvocationID.x; // 0..15
+    uint ly = gl_LocalInvocationID.y; // 0..15
+
+    if (lx < 8u && ly < 8u) {
+        coefficients[channel_offset +   0u + ly * 8u + lx] = scratch[ly       * 16u + lx];
+        coefficients[channel_offset +  64u + ly * 8u + lx] = scratch[ly       * 16u + (lx + 8u)];
+        coefficients[channel_offset + 128u + ly * 8u + lx] = scratch[(ly + 8u) * 16u + lx];
+        coefficients[channel_offset + 192u + ly * 8u + lx] = scratch[(ly + 8u) * 16u + (lx + 8u)];
+    }
+}
+
+void main() {
+    uint compact_slot = gl_WorkGroupID.x;
+
+    for (uint channel = 0u; channel < CHANNELS; channel++) {
+        // Load LL1 from coefficient buffer into shared scratch.
+        load_ll1(compact_slot, channel);
+
+        // Horizontal lifting on all 16 rows.
+        for (uint row = 0u; row < 16u; row++) {
+            row_lifting(row);
+        }
+        // Vertical lifting on all 16 columns.
+        for (uint col = 0u; col < 16u; col++) {
+            col_lifting(col);
+        }
+
+        // Write L2 subbands into coefficient buffer (overwrites LL1 region).
+        write_outputs(compact_slot, channel);
+
+        // Barrier before next channel reuses scratch.
+        barrier();
+    }
+}

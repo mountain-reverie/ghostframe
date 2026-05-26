@@ -328,6 +328,34 @@ pub struct GpuFrameProcessor {
     cdf53_indirect_args_pipeline_layout: vk::PipelineLayout,
     cdf53_indirect_args_descriptor_set_layout: vk::DescriptorSetLayout,
 
+    // Cdf53 coefficient buffer (Stage 4c, added M3.3a Task 7)
+    // max_tiles * 3 channels * 1024 i32 = max_tiles * 12 KiB.
+    // HOST_VISIBLE | HOST_COHERENT, persistently mapped for Phase B readback.
+    cdf53_coefficients_buffer: vk::Buffer,
+    cdf53_coefficients_memory: vk::DeviceMemory,
+    // Persistent CPU mapping of the coefficient buffer.
+    // Each compact slot `c` occupies `3 * 1024` i32 entries at
+    // offset `c * 3 * 1024`. Phase B reads and casts each i32 to i16.
+    pub cdf53_coefficients_ptr: *const i32,
+
+    // Cdf53 forward L1 pipeline (Stage 4c-L1, added M3.3a Task 7)
+    cdf53_forward_l1_shader_module: vk::ShaderModule,
+    cdf53_forward_l1_pipeline: vk::Pipeline,
+    cdf53_forward_l1_pipeline_layout: vk::PipelineLayout,
+    cdf53_forward_l1_descriptor_set_layout: vk::DescriptorSetLayout,
+
+    // Cdf53 forward L2 pipeline (Stage 4c-L2, added M3.3a Task 7)
+    cdf53_forward_l2_shader_module: vk::ShaderModule,
+    cdf53_forward_l2_pipeline: vk::Pipeline,
+    cdf53_forward_l2_pipeline_layout: vk::PipelineLayout,
+    cdf53_forward_l2_descriptor_set_layout: vk::DescriptorSetLayout,
+
+    // Cdf53 forward L3 pipeline (Stage 4c-L3, added M3.3a Task 7)
+    cdf53_forward_l3_shader_module: vk::ShaderModule,
+    cdf53_forward_l3_pipeline: vk::Pipeline,
+    cdf53_forward_l3_pipeline_layout: vk::PipelineLayout,
+    cdf53_forward_l3_descriptor_set_layout: vk::DescriptorSetLayout,
+
     // PalRLE indirect-args pipeline (Stage 1.5b)
     palrle_indirect_args_shader_module: vk::ShaderModule,
     palrle_indirect_args_pipeline: vk::Pipeline,
@@ -732,6 +760,47 @@ impl Drop for GpuFrameProcessor {
             );
             self.device
                 .destroy_shader_module(self.cdf53_indirect_args_shader_module, None);
+
+            // Cdf53 coefficient buffer (Stage 4c)
+            self.device.unmap_memory(self.cdf53_coefficients_memory);
+            self.device.destroy_buffer(self.cdf53_coefficients_buffer, None);
+            self.device.free_memory(self.cdf53_coefficients_memory, None);
+
+            // Cdf53 forward L1 pipeline (Stage 4c-L1)
+            self.device
+                .destroy_pipeline(self.cdf53_forward_l1_pipeline, None);
+            self.device
+                .destroy_pipeline_layout(self.cdf53_forward_l1_pipeline_layout, None);
+            self.device.destroy_descriptor_set_layout(
+                self.cdf53_forward_l1_descriptor_set_layout,
+                None,
+            );
+            self.device
+                .destroy_shader_module(self.cdf53_forward_l1_shader_module, None);
+
+            // Cdf53 forward L2 pipeline (Stage 4c-L2)
+            self.device
+                .destroy_pipeline(self.cdf53_forward_l2_pipeline, None);
+            self.device
+                .destroy_pipeline_layout(self.cdf53_forward_l2_pipeline_layout, None);
+            self.device.destroy_descriptor_set_layout(
+                self.cdf53_forward_l2_descriptor_set_layout,
+                None,
+            );
+            self.device
+                .destroy_shader_module(self.cdf53_forward_l2_shader_module, None);
+
+            // Cdf53 forward L3 pipeline (Stage 4c-L3)
+            self.device
+                .destroy_pipeline(self.cdf53_forward_l3_pipeline, None);
+            self.device
+                .destroy_pipeline_layout(self.cdf53_forward_l3_pipeline_layout, None);
+            self.device.destroy_descriptor_set_layout(
+                self.cdf53_forward_l3_descriptor_set_layout,
+                None,
+            );
+            self.device
+                .destroy_shader_module(self.cdf53_forward_l3_shader_module, None);
 
             // PalRLE indirect-args pipeline
             self.device

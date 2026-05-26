@@ -291,8 +291,94 @@ impl GpuFrameProcessor {
             pal_rle_index_shader_module,
         )?;
 
+        // --- Cdf53 forward L1 shader module (Stage 4c-L1) ---
+        let cdf53_forward_l1_spv = include_bytes!("../shaders/cdf53_forward_l1.spv");
+        let cdf53_forward_l1_spv_words =
+            ash::util::read_spv(&mut std::io::Cursor::new(cdf53_forward_l1_spv.as_slice()))?;
+        let cdf53_forward_l1_shader_ci =
+            vk::ShaderModuleCreateInfo::default().code(&cdf53_forward_l1_spv_words);
+        let cdf53_forward_l1_shader_module =
+            device.create_shader_module(&cdf53_forward_l1_shader_ci, None)?;
+
+        // --- Cdf53 forward L1 compute pipeline ---
+        // Bindings:
+        //   0: STORAGE_IMAGE  (current_frame, read-only)
+        //   1: STORAGE_BUFFER (cdf53_compact_list, read-only)
+        //   2: STORAGE_BUFFER (cdf53_coefficients, read-write)
+        // Push constants: 2 × u32 = 8 bytes (cols, rows).
+        let (
+            cdf53_forward_l1_descriptor_set_layout,
+            cdf53_forward_l1_pipeline_layout,
+            cdf53_forward_l1_pipeline,
+        ) = pipeline_builder::build_compute_pipeline(
+            &device,
+            &[
+                BindingSpec::storage_image(0),
+                BindingSpec::storage_buffer(1),
+                BindingSpec::storage_buffer(2),
+            ],
+            8,
+            cdf53_forward_l1_shader_module,
+        )?;
+
+        // --- Cdf53 forward L2 shader module (Stage 4c-L2) ---
+        let cdf53_forward_l2_spv = include_bytes!("../shaders/cdf53_forward_l2.spv");
+        let cdf53_forward_l2_spv_words =
+            ash::util::read_spv(&mut std::io::Cursor::new(cdf53_forward_l2_spv.as_slice()))?;
+        let cdf53_forward_l2_shader_ci =
+            vk::ShaderModuleCreateInfo::default().code(&cdf53_forward_l2_spv_words);
+        let cdf53_forward_l2_shader_module =
+            device.create_shader_module(&cdf53_forward_l2_shader_ci, None)?;
+
+        // --- Cdf53 forward L2 compute pipeline ---
+        // Bindings:
+        //   0: STORAGE_BUFFER (cdf53_compact_list, read-only)
+        //   1: STORAGE_BUFFER (cdf53_coefficients, read-write)
+        // Push constants: 2 × u32 = 8 bytes (cols, rows).
+        let (
+            cdf53_forward_l2_descriptor_set_layout,
+            cdf53_forward_l2_pipeline_layout,
+            cdf53_forward_l2_pipeline,
+        ) = pipeline_builder::build_compute_pipeline(
+            &device,
+            &[
+                BindingSpec::storage_buffer(0),
+                BindingSpec::storage_buffer(1),
+            ],
+            8,
+            cdf53_forward_l2_shader_module,
+        )?;
+
+        // --- Cdf53 forward L3 shader module (Stage 4c-L3) ---
+        let cdf53_forward_l3_spv = include_bytes!("../shaders/cdf53_forward_l3.spv");
+        let cdf53_forward_l3_spv_words =
+            ash::util::read_spv(&mut std::io::Cursor::new(cdf53_forward_l3_spv.as_slice()))?;
+        let cdf53_forward_l3_shader_ci =
+            vk::ShaderModuleCreateInfo::default().code(&cdf53_forward_l3_spv_words);
+        let cdf53_forward_l3_shader_module =
+            device.create_shader_module(&cdf53_forward_l3_shader_ci, None)?;
+
+        // --- Cdf53 forward L3 compute pipeline ---
+        // Bindings:
+        //   0: STORAGE_BUFFER (cdf53_compact_list, read-only)
+        //   1: STORAGE_BUFFER (cdf53_coefficients, read-write)
+        // Push constants: 2 × u32 = 8 bytes (cols, rows).
+        let (
+            cdf53_forward_l3_descriptor_set_layout,
+            cdf53_forward_l3_pipeline_layout,
+            cdf53_forward_l3_pipeline,
+        ) = pipeline_builder::build_compute_pipeline(
+            &device,
+            &[
+                BindingSpec::storage_buffer(0),
+                BindingSpec::storage_buffer(1),
+            ],
+            8,
+            cdf53_forward_l3_shader_module,
+        )?;
+
         // --- Descriptor pool ---
-        // 11 sets: SAD (2 STORAGE_IMAGE + 1 STORAGE_BUFFER)
+        // 14 sets: SAD (2 STORAGE_IMAGE + 1 STORAGE_BUFFER)
         //        + NV12 (1 STORAGE_IMAGE + 1 STORAGE_BUFFER)
         //        + Analysis (1 STORAGE_IMAGE + 1 STORAGE_BUFFER)
         //        + palrle_compact (4 STORAGE_BUFFER)
@@ -303,20 +389,23 @@ impl GpuFrameProcessor {
         //        + pal_rle_index (1 STORAGE_IMAGE + 5 STORAGE_BUFFER)
         //        + cdf53_compact (4 STORAGE_BUFFER)   ← added M3.3a Task 5
         //        + cdf53_indirect_args (2 STORAGE_BUFFER)  ← added M3.3a Task 6
-        // Total: 5 STORAGE_IMAGE, 29 STORAGE_BUFFER, 11 max_sets.
+        //        + cdf53_forward_l1 (1 STORAGE_IMAGE + 2 STORAGE_BUFFER) ← Task 7
+        //        + cdf53_forward_l2 (2 STORAGE_BUFFER)   ← Task 7
+        //        + cdf53_forward_l3 (2 STORAGE_BUFFER)   ← Task 7
+        // Total: 7 STORAGE_IMAGE, 35 STORAGE_BUFFER, 14 max_sets.
         let pool_sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_IMAGE,
-                descriptor_count: 5,
+                descriptor_count: 7,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: 29,
+                descriptor_count: 35,
             },
         ];
         let dp_ci = vk::DescriptorPoolCreateInfo::default()
             .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
-            .max_sets(11)
+            .max_sets(14)
             .pool_sizes(&pool_sizes);
         let descriptor_pool = device.create_descriptor_pool(&dp_ci, None)?;
 
@@ -634,6 +723,25 @@ impl GpuFrameProcessor {
                 "index buffer",
             )?;
 
+        // --- Cdf53 coefficient buffer (Stage 4c) ---
+        // max_tiles * 3 channels * 1024 i32 = max_tiles * 12 KiB.
+        // Using i32 (4 bytes) storage for GPU shader compatibility — GLSL
+        // `int coefficients[]` writes full 32-bit words. Phase B reads and
+        // casts to i16 via `v as i16` (truncates high 16 bits, which are
+        // always sign-extension of a 16-bit wavelet coefficient).
+        // Minimum size: 1 slot * 3 * 1024 * 4 = 12288 bytes.
+        let cdf53_coefficients_size =
+            ((max_tiles as vk::DeviceSize) * 3 * 1024 * 4).max(3 * 1024 * 4);
+        let (cdf53_coefficients_buffer, cdf53_coefficients_memory, cdf53_coefficients_ptr_mut) =
+            alloc_host_buffer_mapped::<i32>(
+                &device,
+                &mem_props,
+                cdf53_coefficients_size,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                "cdf53 coefficients buffer",
+            )?;
+        let cdf53_coefficients_ptr = cdf53_coefficients_ptr_mut as *const i32;
+
         Ok(Self {
             _entry: entry,
             instance,
@@ -683,6 +791,21 @@ impl GpuFrameProcessor {
             cdf53_indirect_args_pipeline,
             cdf53_indirect_args_pipeline_layout,
             cdf53_indirect_args_descriptor_set_layout,
+            cdf53_coefficients_buffer,
+            cdf53_coefficients_memory,
+            cdf53_coefficients_ptr,
+            cdf53_forward_l1_shader_module,
+            cdf53_forward_l1_pipeline,
+            cdf53_forward_l1_pipeline_layout,
+            cdf53_forward_l1_descriptor_set_layout,
+            cdf53_forward_l2_shader_module,
+            cdf53_forward_l2_pipeline,
+            cdf53_forward_l2_pipeline_layout,
+            cdf53_forward_l2_descriptor_set_layout,
+            cdf53_forward_l3_shader_module,
+            cdf53_forward_l3_pipeline,
+            cdf53_forward_l3_pipeline_layout,
+            cdf53_forward_l3_descriptor_set_layout,
             palrle_indirect_args_shader_module,
             palrle_indirect_args_pipeline,
             palrle_indirect_args_pipeline_layout,
