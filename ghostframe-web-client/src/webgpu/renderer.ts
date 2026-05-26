@@ -122,8 +122,9 @@ export class WebGpuRenderer {
    * Zero the palette atlas + CPU shadow on session reset (transport.closed).
    * Framebuffer texture is left in place; next session paints over.
    *
-   * Must be called BEFORE the caller closes any H264TileDecoder instances so
-   * that the videoFramesToClose drain runs first and avoids double-close.
+   * Must be called BEFORE the caller closes the FullFrameDecoder so that the
+   * videoFramesToClose drain runs first and avoids double-close on the
+   * decoder's latestFrame.
    */
   onSessionReset(): void {
     // Drain pending VideoFrames before any per-decoder close() runs.  Frames

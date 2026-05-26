@@ -1,6 +1,6 @@
 import {
   DATAGRAM_HEADER_SIZE, TILE_HEADER_SIZE, TILE_SIZE, Codec,
-  decodeDatagramHeader, decodeTileHeader, tileKey, TileAssembly, H264TileDecoder,
+  decodeDatagramHeader, decodeTileHeader, tileKey, TileAssembly,
   FRAME_HEADER_SIZE, TILE_DATAGRAM_FLAG, FrameAssembly,
   isTileDatagram, decodeFrameHeader, frameKey, FullFrameDecoder,
   FRAME_DIMENSIONS_SENTINEL_X, FRAME_DIMENSIONS_SENTINEL_Y,
@@ -91,18 +91,10 @@ async function main() {
     }
 
     // Drain videoFramesToClose and clear the h264Queue FIRST so that the
-    // per-decoder close() calls below don't hit a double-close hazard on
-    // latestFrame (renderer may have moved the same VideoFrame into
+    // fullFrameDecoder.close() call below doesn't hit a double-close hazard
+    // on its latestFrame (renderer may have moved the same VideoFrame into
     // videoFramesToClose on the previous rAF).
     renderer.onSessionReset();
-
-    // Close every per-tile H.264 decoder to release the underlying VideoDecoder
-    // instances. Iterate then clear — not clear-then-iterate — so each decoder's
-    // close() runs before the reference is dropped.
-    for (const dec of h264Decoders.values()) {
-      dec.close();
-    }
-    h264Decoders.clear();
 
     // Close the full-frame decoder if one was created this session.
     if (fullFrameDecoder) {
@@ -179,25 +171,10 @@ async function main() {
     }, 100);
   }
 
-  // Per-tile H.264 decoders.
-  const h264Decoders = new Map<string, H264TileDecoder>();
-
   // Full-frame decoder and reassembly state.
   let fullFrameDecoder: FullFrameDecoder | null = null;
   const frameAssemblies = new Map<string, FrameAssembly>();
   let latestFullFrameSeq = 0;
-
-  function getH264Decoder(tileX: number, tileY: number): H264TileDecoder {
-    const key = `${tileX}:${tileY}`;
-    let dec = h264Decoders.get(key);
-    if (!dec) {
-      dec = new H264TileDecoder((frame: VideoFrame) => {
-        renderer.h264Queue.push({ tileX, tileY, frame });
-      });
-      h264Decoders.set(key, dec);
-    }
-    return dec;
-  }
 
   // Batched ACK sender — fire-and-forget unreliable datagrams. The catch
   // logs the first error per writer so a broken ACK path is discoverable;
@@ -295,9 +272,6 @@ async function main() {
 
     if (asm.header.codec === Codec.Raw) {
       renderer.rawQueue.push({ tileX: tX, tileY: tY, bgra: payload });
-    } else if (asm.header.codec === Codec.H264) {
-      const dec = getH264Decoder(tX, tY);
-      dec.decode(payload);
     } else if (asm.header.codec === Codec.Solid) {
       if (payload.byteLength === 4) {
         renderer.solidQueue.push({ tileX: tX, tileY: tY, bgra: payload });
