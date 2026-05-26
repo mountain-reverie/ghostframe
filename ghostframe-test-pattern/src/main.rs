@@ -71,6 +71,14 @@ struct Args {
     #[arg(long)]
     palrle_exact: bool,
 
+    /// Paint a full-screen diagonal RGB gradient. Each 32×32 tile has >16
+    /// unique colors so the classifier picks the high-color path
+    /// (Raw fallback, or Cdf53 when GHOSTFRAME_ENABLE_CDF53 is set).
+    /// Combine with `--drm-direct` to paint to the DRM dumb-buffer scanout.
+    /// Drives the M3.3a e2e tests.
+    #[arg(long)]
+    gradient: bool,
+
     /// (Ignored — kept for CLI compat.) Window width.
     #[arg(long, default_value = "640")]
     width: u16,
@@ -96,6 +104,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `e2e_solid_per_tile_pixels` (M3.2c W3/B3).
     if args.drm_direct && args.solid_per_tile {
         return ghostframe_test_pattern::solid_per_tile::run(&args.drm_device);
+    }
+
+    // DRM-direct gradient mode: full-screen high-color gradient for M3.3a
+    // Cdf53 e2e tests. No X11 path; gradient is DRM-only.
+    if args.drm_direct && args.gradient {
+        return ghostframe_test_pattern::gradient::run(&args.drm_device);
     }
 
     // DRM-direct text-grid mode: paint text glyphs directly to scanout,

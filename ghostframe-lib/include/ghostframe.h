@@ -4,6 +4,29 @@
 #include <stdlib.h>
 
 /**
+ * Number of progressive passes emitted per Cdf53 tile.
+ * = 1 sign-bit-plane + 13 magnitude bit-planes covering worst-case
+ * 14-bit signed coefficients after 3 levels of CDF 5/3 lifting on
+ * 8-bit input.
+ */
+#define CDF53_PASS_COUNT 14
+
+/**
+ * Per-tile coefficient count per channel: 1024 (32×32 tile).
+ */
+#define CDF53_COEFFS_PER_CHANNEL 1024
+
+/**
+ * Number of color channels encoded: BGR (alpha dropped, always 0xFF).
+ */
+#define CDF53_CHANNELS 3
+
+/**
+ * Total coefficients per tile = 3072.
+ */
+#define CDF53_TOTAL_COEFFS (CDF53_CHANNELS * CDF53_COEFFS_PER_CHANNEL)
+
+/**
  * Maximum colors in a PalRLE palette. Tiles with more unique colors fall
  * through the classifier to BC1/Cdf53.
  */

@@ -5,6 +5,7 @@
 
 pub mod drm_direct;
 pub mod font;
+pub mod gradient;
 pub mod mixed;
 pub mod mode_switch;
 pub mod palette_churn;
