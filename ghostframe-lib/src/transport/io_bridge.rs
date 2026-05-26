@@ -1994,7 +1994,7 @@ mod tests {
     async fn apply_hello_enables_indices_raw() {
         use crate::transport::client_caps::{ClientCapabilities, HelloMsg};
         let mut bridge = make_bridge_for_test().await;
-        let msg = HelloMsg { caps: ClientCapabilities { indices_raw_enabled: true } };
+        let msg = HelloMsg { caps: ClientCapabilities { indices_raw_enabled: true, ..Default::default() } };
         bridge.apply_hello(msg);
         assert!(bridge.current_client_caps().indices_raw_enabled);
     }
@@ -2962,6 +2962,7 @@ mod tests {
         };
         let caps = crate::transport::client_caps::ClientCapabilities {
             indices_raw_enabled: true,
+            ..Default::default()
         };
         let map = IoBridge::phase_b_encode_payloads_with_caps(&[prep], &caps, None);
         let payload = &map[&(0, 0)];
@@ -2982,6 +2983,7 @@ mod tests {
         };
         let caps = crate::transport::client_caps::ClientCapabilities {
             indices_raw_enabled: false,
+            ..Default::default()
         };
         let map = IoBridge::phase_b_encode_payloads_with_caps(&[prep], &caps, None);
         let payload = &map[&(5, 7)];
@@ -3002,6 +3004,7 @@ mod tests {
         };
         let caps = crate::transport::client_caps::ClientCapabilities {
             indices_raw_enabled: true,
+            ..Default::default()
         };
         let map = IoBridge::phase_b_encode_payloads_with_caps(&[prep], &caps, None);
         let payload = &map[&(1, 1)];
@@ -3030,7 +3033,7 @@ mod tests {
             crate::tile::CodecState::PalRle { palette_id: 7 };
 
         // Concatenated stream: HELLO (2 B) + FEEDBACK (22 B) + DECODE_ERROR (5 B) = 29 bytes
-        let hello = HelloMsg { caps: ClientCapabilities { indices_raw_enabled: true } };
+        let hello = HelloMsg { caps: ClientCapabilities { indices_raw_enabled: true, ..Default::default() } };
         let fb = ReceiverFeedback {
             timestamp_ns: 0, datagrams_received: 0, datagrams_lost: 0,
             datagrams_recovered_fec: 0, suspension_detected: false,

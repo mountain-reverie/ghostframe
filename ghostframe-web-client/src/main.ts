@@ -136,7 +136,7 @@ async function main() {
   // Emit HELLO immediately. We hard-require WebGPU, so indicesRawEnabled is unconditional.
   if (feedbackWriter) {
     try {
-      await feedbackWriter.write(encodeHello({ indicesRawEnabled: true }));
+      await feedbackWriter.write(encodeHello({ indicesRawEnabled: true, supportsCdf53: true }));
     } catch (e) {
       console.warn('HELLO write failed:', e);
     }
