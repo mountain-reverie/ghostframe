@@ -317,6 +317,17 @@ pub struct GpuFrameProcessor {
     #[allow(dead_code)]
     cdf53_compact_count_ptr: *const u32,
 
+    // Cdf53 indirect-args pipeline (Stage 4b, added M3.3a)
+    cdf53_dispatch_args_buffer: vk::Buffer,
+    cdf53_dispatch_args_memory: vk::DeviceMemory,
+    // No CPU pointer — HOST_VISIBLE only for simple alloc; read by GPU via
+    // vkCmdDispatchIndirect. Written once per frame by cdf53_indirect_args shader.
+
+    cdf53_indirect_args_shader_module: vk::ShaderModule,
+    cdf53_indirect_args_pipeline: vk::Pipeline,
+    cdf53_indirect_args_pipeline_layout: vk::PipelineLayout,
+    cdf53_indirect_args_descriptor_set_layout: vk::DescriptorSetLayout,
+
     // PalRLE indirect-args pipeline (Stage 1.5b)
     palrle_indirect_args_shader_module: vk::ShaderModule,
     palrle_indirect_args_pipeline: vk::Pipeline,
@@ -705,6 +716,22 @@ impl Drop for GpuFrameProcessor {
             );
             self.device
                 .destroy_shader_module(self.cdf53_compact_shader_module, None);
+
+            // Cdf53 indirect-args buffer (Stage 4b)
+            self.device.destroy_buffer(self.cdf53_dispatch_args_buffer, None);
+            self.device.free_memory(self.cdf53_dispatch_args_memory, None);
+
+            // Cdf53 indirect-args pipeline (Stage 4b)
+            self.device
+                .destroy_pipeline(self.cdf53_indirect_args_pipeline, None);
+            self.device
+                .destroy_pipeline_layout(self.cdf53_indirect_args_pipeline_layout, None);
+            self.device.destroy_descriptor_set_layout(
+                self.cdf53_indirect_args_descriptor_set_layout,
+                None,
+            );
+            self.device
+                .destroy_shader_module(self.cdf53_indirect_args_shader_module, None);
 
             // PalRLE indirect-args pipeline
             self.device

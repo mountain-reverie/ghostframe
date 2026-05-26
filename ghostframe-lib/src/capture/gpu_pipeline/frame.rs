@@ -542,32 +542,70 @@ impl GpuFrameProcessor {
             &cdf53_compact_push,
             (cols * rows, 1, 1),
         )?;
-        // Barrier: Stage 4a writes → HOST_READ (for CPU readback after fence).
-        let buf_barrier_cdf53_out = [
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.cdf53_compact_list_buffer)
-                .offset(0)
-                .size(vk::WHOLE_SIZE),
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.cdf53_compact_count_buffer)
-                .offset(0)
-                .size(4),
-        ];
+        // Barrier between Stage 4a and 4b: shader write → shader read on count.
+        let buf_barrier_cdf53_count = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(self.cdf53_compact_count_buffer)
+            .offset(0)
+            .size(4);
         self.device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::HOST,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
             vk::DependencyFlags::empty(),
             &[],
-            &buf_barrier_cdf53_out,
+            std::slice::from_ref(&buf_barrier_cdf53_count),
+            &[],
+        );
+
+        // Stage 4b: cdf53_indirect_args writer.
+        let cdf53_indirect_args_ds_guard = self.run_cdf53_indirect_args_stage(cmd)?;
+
+        // Barrier: dispatch_args SHADER_WRITE → INDIRECT_COMMAND_READ | SHADER_READ
+        // for Stage 4c (cdf53_forward, Task 7) via vkCmdDispatchIndirect.
+        let buf_barrier_cdf53_args = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(
+                vk::AccessFlags::INDIRECT_COMMAND_READ | vk::AccessFlags::SHADER_READ,
+            )
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(self.cdf53_dispatch_args_buffer)
+            .offset(0)
+            .size(12);
+        // Barrier: compact_list + compact_count → HOST_READ (CPU readback after fence).
+        let buf_barrier_cdf53_list_host = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::HOST_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(self.cdf53_compact_list_buffer)
+            .offset(0)
+            .size(vk::WHOLE_SIZE);
+        let buf_barrier_cdf53_count_host = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::SHADER_READ)
+            .dst_access_mask(vk::AccessFlags::HOST_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(self.cdf53_compact_count_buffer)
+            .offset(0)
+            .size(4);
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::DRAW_INDIRECT
+                | vk::PipelineStageFlags::COMPUTE_SHADER
+                | vk::PipelineStageFlags::HOST,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[
+                buf_barrier_cdf53_args,
+                buf_barrier_cdf53_list_host,
+                buf_barrier_cdf53_count_host,
+            ],
             &[],
         );
 
@@ -986,7 +1024,7 @@ impl GpuFrameProcessor {
         //    guards here to keep them alive past the `wait_for_fences` above.
         //    sad_ds_guard, nv12_ds_guard, analysis_ds_guard,
         //    palrle_compact_ds_guard, palrle_indirect_args_ds_guard,
-        //    cdf53_compact_ds_guard,
+        //    cdf53_compact_ds_guard, cdf53_indirect_args_ds_guard,
         //    palette_fold_ds_guard, palette_subset_fold_init_ds_guard,
         //    palette_subset_fold_ds_guard, and pal_rle_index_ds_guard are
         //    dropped explicitly before step 9 to
@@ -1002,6 +1040,7 @@ impl GpuFrameProcessor {
             &palrle_compact_ds_guard,
             &palrle_indirect_args_ds_guard,
             &cdf53_compact_ds_guard,
+            &cdf53_indirect_args_ds_guard,
             &palette_fold_ds_guard,
             &palette_subset_fold_init_ds_guard,
             &palette_subset_fold_ds_guard,
@@ -1015,6 +1054,7 @@ impl GpuFrameProcessor {
         drop(palrle_compact_ds_guard);
         drop(palrle_indirect_args_ds_guard);
         drop(cdf53_compact_ds_guard);
+        drop(cdf53_indirect_args_ds_guard);
         drop(palette_fold_ds_guard);
         drop(palette_subset_fold_init_ds_guard);
         drop(palette_subset_fold_ds_guard);
@@ -1302,32 +1342,71 @@ impl GpuFrameProcessor {
             &cdf53_compact_push,
             (cols * rows, 1, 1),
         )?;
-        // Barrier: Stage 4a writes → HOST_READ (for CPU readback after fence).
-        let buf_barrier_cdf53_out = [
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.cdf53_compact_list_buffer)
-                .offset(0)
-                .size(vk::WHOLE_SIZE),
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.cdf53_compact_count_buffer)
-                .offset(0)
-                .size(4),
-        ];
+        // Barrier between Stage 4a and 4b: shader write → shader read on count
+        // (first-frame path).
+        let buf_barrier_cdf53_count = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(self.cdf53_compact_count_buffer)
+            .offset(0)
+            .size(4);
         self.device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::HOST,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
             vk::DependencyFlags::empty(),
             &[],
-            &buf_barrier_cdf53_out,
+            std::slice::from_ref(&buf_barrier_cdf53_count),
+            &[],
+        );
+
+        // Stage 4b: cdf53_indirect_args writer (first-frame path).
+        let cdf53_indirect_args_ds_guard = self.run_cdf53_indirect_args_stage(cmd)?;
+
+        // Barrier: dispatch_args SHADER_WRITE → INDIRECT_COMMAND_READ | SHADER_READ
+        // for Stage 4c (cdf53_forward, Task 7) via vkCmdDispatchIndirect.
+        let buf_barrier_cdf53_args = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(
+                vk::AccessFlags::INDIRECT_COMMAND_READ | vk::AccessFlags::SHADER_READ,
+            )
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(self.cdf53_dispatch_args_buffer)
+            .offset(0)
+            .size(12);
+        // Barrier: compact_list + compact_count → HOST_READ (CPU readback after fence).
+        let buf_barrier_cdf53_list_host = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::HOST_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(self.cdf53_compact_list_buffer)
+            .offset(0)
+            .size(vk::WHOLE_SIZE);
+        let buf_barrier_cdf53_count_host = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::SHADER_READ)
+            .dst_access_mask(vk::AccessFlags::HOST_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(self.cdf53_compact_count_buffer)
+            .offset(0)
+            .size(4);
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::DRAW_INDIRECT
+                | vk::PipelineStageFlags::COMPUTE_SHADER
+                | vk::PipelineStageFlags::HOST,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[
+                buf_barrier_cdf53_args,
+                buf_barrier_cdf53_list_host,
+                buf_barrier_cdf53_count_host,
+            ],
             &[],
         );
 
@@ -1711,6 +1790,7 @@ impl GpuFrameProcessor {
             &palrle_compact_ds_guard,
             &palrle_indirect_args_ds_guard,
             &cdf53_compact_ds_guard,
+            &cdf53_indirect_args_ds_guard,
             &palette_fold_ds_guard,
             &palette_subset_fold_init_ds_guard,
             &palette_subset_fold_ds_guard,
@@ -2494,6 +2574,82 @@ impl GpuFrameProcessor {
             self.palrle_indirect_args_pipeline_layout,
             0,
             &[palrle_indirect_args_ds],
+            &[],
+        );
+        self.device.cmd_dispatch(cmd, 1, 1, 1);
+
+        Ok(guard)
+    }
+
+    /// Stage 4b — cdf53 indirect-args writer.
+    ///
+    /// Reads `cdf53_compact_count_buffer` (binding 0) and writes the
+    /// vkCmdDispatchIndirect args `(count, 1, 1)` to `cdf53_dispatch_args_buffer`
+    /// (binding 1). Dispatch is always (1, 1, 1): one thread sets the three u32s.
+    ///
+    /// Caller must have issued a SHADER_WRITE → SHADER_READ barrier on
+    /// `cdf53_compact_count_buffer` before calling this (the post-cdf53_compact
+    /// barrier covers this). Caller must issue a SHADER_WRITE →
+    /// INDIRECT_COMMAND_READ barrier on `cdf53_dispatch_args_buffer` after
+    /// returning.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure: `cmd` is recording; `cdf53_compact_count_buffer`
+    /// has been written and barriered; the returned guard is held alive until
+    /// `wait_for_fences` returns.
+    unsafe fn run_cdf53_indirect_args_stage<'a>(
+        &'a self,
+        cmd: vk::CommandBuffer,
+    ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
+        let set_layouts = [self.cdf53_indirect_args_descriptor_set_layout];
+        let ds_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(&set_layouts);
+        let guard = ScopedDescriptorSets {
+            device: &self.device,
+            pool: self.descriptor_pool,
+            sets: self.device.allocate_descriptor_sets(&ds_alloc)?,
+        };
+        let ds = guard.sets[0];
+
+        // Write the two cdf53_indirect_args descriptors (both STORAGE_BUFFER):
+        //   binding 0 — cdf53_compact_count_buffer  (read)
+        //   binding 1 — cdf53_dispatch_args_buffer  (write)
+        let count_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.cdf53_compact_count_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let args_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.cdf53_dispatch_args_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(ds)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&count_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(ds)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&args_info),
+        ];
+        self.device.update_descriptor_sets(&writes, &[]);
+
+        // Bind + dispatch. No push constants for this stage.
+        self.device.cmd_bind_pipeline(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.cdf53_indirect_args_pipeline,
+        );
+        self.device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.cdf53_indirect_args_pipeline_layout,
+            0,
+            &[ds],
             &[],
         );
         self.device.cmd_dispatch(cmd, 1, 1, 1);

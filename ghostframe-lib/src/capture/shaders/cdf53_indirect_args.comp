@@ -1,0 +1,28 @@
+// cdf53_indirect_args.comp
+// Stage 4b: convert cdf53_compact_count into vkCmdDispatchIndirect args
+// for the subsequent Stage 4c (cdf53_forward_l1/l2/l3) dispatches.
+// Dispatch: 1 workgroup, 1 thread.
+//
+// All three forward levels reuse the SAME indirect args buffer because they
+// all dispatch one workgroup per Cdf53-eligible tile (count from compact_count).
+
+#version 450
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0, std430) readonly buffer CompactCount {
+    uint count;
+};
+
+layout(binding = 1, std430) buffer IndirectArgs {
+    uint group_count_x;
+    uint group_count_y;
+    uint group_count_z;
+};
+
+void main() {
+    if (gl_GlobalInvocationID.x == 0u) {
+        group_count_x = count;
+        group_count_y = 1u;
+        group_count_z = 1u;
+    }
+}
