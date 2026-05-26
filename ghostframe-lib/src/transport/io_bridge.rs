@@ -586,6 +586,28 @@ impl IoBridge {
         use std::time::Instant;
 
         for &(tile_x, tile_y) in dirty {
+            // For GpuClassifierDriven, check whether this tile is handled by
+            // Path B (Cdf53 refinement queue, enqueued above by Phase B) BEFORE
+            // calling bump_generation_collecting. bump_generation supersedes all
+            // queued work for the tile — so calling it on a Cdf53 tile would
+            // invalidate the refinement passes Phase B just enqueued.
+            if matches!(policy, SchedulerEmissionPolicy::GpuClassifierDriven) {
+                use crate::tile::CodecState;
+                let raw_codec_state = self.metrics_tracker.get(tile_x, tile_y).codec_state;
+                let codec_state = crate::tile::classifier::gate_codec_state(
+                    raw_codec_state,
+                    self.cdf53_enabled,
+                    self.client_caps.supports_cdf53,
+                );
+                if matches!(codec_state, CodecState::Cdf53 { .. }) {
+                    // Gate open + Cdf53 retained → Phase B handles emission via
+                    // the refinement queue (generation already bumped by Phase B).
+                    // Skip entirely: do NOT bump generation (would supersede Phase
+                    // B's enqueued passes), do NOT enqueue to priority_queue.
+                    continue;
+                }
+            }
+
             let (gen, superseded) =
                 self.scheduler.bump_generation_collecting(tile_x as u8, tile_y as u8);
             for s in superseded {
@@ -606,7 +628,17 @@ impl IoBridge {
                 SchedulerEmissionPolicy::CpuRawOnly => (Codec::Raw, tile_data),
                 SchedulerEmissionPolicy::GpuClassifierDriven => {
                     use crate::tile::CodecState;
-                    let codec_state = self.metrics_tracker.get(tile_x, tile_y).codec_state;
+                    let raw_codec_state = self.metrics_tracker.get(tile_x, tile_y).codec_state;
+                    // Apply the Cdf53 emission gate before deciding the wire codec.
+                    // Cdf53 tiles were already skipped above (before bump_generation);
+                    // only non-Cdf53 tiles reach this point.
+                    // When gates closed, gate_codec_state downgrades Cdf53 → Bc1,
+                    // and the existing _ => Raw fallback fires, preserving M3.2 behavior.
+                    let codec_state = crate::tile::classifier::gate_codec_state(
+                        raw_codec_state,
+                        self.cdf53_enabled,
+                        self.client_caps.supports_cdf53,
+                    );
                     match codec_state {
                         CodecState::Solid => {
                             let solid = crate::encoder::solid::encode_solid(&tile_data);
@@ -1448,6 +1480,21 @@ impl IoBridge {
                                 );
                             }
                             self.scheduler.enqueue_refinement(tile_x, tile_y, gen, passes);
+                            // Override the CPU classifier's codec_state so that
+                            // dispatch_dirty_tiles_via_scheduler's pre-check can
+                            // correctly identify this tile as Cdf53 and skip the
+                            // priority-queue enqueue (which would otherwise supersede
+                            // the refinement passes just enqueued above).
+                            // The CPU may have classified this tile as Bc1 (e.g. on the
+                            // first frame when freq is medium and Rule 5 fires), but
+                            // the GPU compact list and coefficient buffer are authoritative
+                            // for Cdf53 emission.
+                            self.metrics_tracker
+                                .get_mut(tile_x as u32, tile_y as u32)
+                                .codec_state = crate::tile::CodecState::Cdf53 {
+                                    passes_sent: 0,
+                                    max_passes: 9,
+                                };
                         }
                     }
                 }
