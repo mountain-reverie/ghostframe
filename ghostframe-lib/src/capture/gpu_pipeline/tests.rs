@@ -1,3 +1,34 @@
+/// Create a memfd from a pre-built pixel slice (BGRA, stride = width * 4).
+///
+/// Helper for tests that need non-uniform pixel data.
+unsafe fn make_memfd_from_pixels(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+) -> std::os::unix::io::RawFd {
+    let stride = width * 4;
+    let size = (stride * height) as usize;
+    assert_eq!(pixels.len(), size, "pixels length mismatch");
+    let name = std::ffi::CString::new("ghost-test-pixels").unwrap();
+    let fd = libc::memfd_create(name.as_ptr(), 0);
+    assert!(fd >= 0, "memfd_create failed");
+    libc::ftruncate(fd, size as i64);
+
+    let ptr = libc::mmap(
+        std::ptr::null_mut(),
+        size,
+        libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_SHARED,
+        fd,
+        0,
+    );
+    assert_ne!(ptr, libc::MAP_FAILED);
+    let slice = std::slice::from_raw_parts_mut(ptr as *mut u8, size);
+    slice.copy_from_slice(pixels);
+    libc::munmap(ptr, size);
+    fd
+}
+
 /// Create a memfd of `size` bytes filled with `pixel` repeated, return the fd.
 ///
 /// Helper shared by tests.
@@ -1693,4 +1724,67 @@ fn invalidate_baseline_cushion_keeps_all_dirty_and_prev_image_none() {
         libc::close(fd);
         assert_eq!(dirty.len(), 0, "normal SAD resumed: 0 dirty for unchanged content");
     }
+}
+
+#[test]
+fn cdf53_compact_filters_high_color_tiles_only() {
+    let mut processor = match GpuFrameProcessor::new(256) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Skipping cdf53_compact test (no Vulkan GPU?): {e}");
+            return;
+        }
+    };
+
+    // 64×64 frame = 4 tiles (2×2 at 32×32 tile size).
+    // Top-left tile (0,0) = gradient (high-color); others = solid blue (≤2 colors).
+    let width = 64u32;
+    let height = 64u32;
+    let stride = width * 4;
+    let mut pixels = vec![0u8; (stride * height) as usize];
+    for y in 0..height {
+        for x in 0..width {
+            let off = ((y * stride) + x * 4) as usize;
+            let in_gradient = (x < 32) && (y < 32);
+            if in_gradient {
+                // Dense gradient: up to 32*32 = 1024 unique colors — well above 16.
+                pixels[off]     = (x * 3) as u8;
+                pixels[off + 1] = (y * 3) as u8;
+                pixels[off + 2] = (x + y) as u8;
+            } else {
+                // Solid blue — 1 unique color per tile.
+                pixels[off]     = 0;
+                pixels[off + 1] = 0;
+                pixels[off + 2] = 0xFF;
+            }
+            pixels[off + 3] = 0xFF;
+        }
+    }
+
+    unsafe {
+        let fd = make_memfd_from_pixels(&pixels, width, height);
+        let result = processor.process_frame(fd, width, height, stride);
+        libc::close(fd);
+        let _ = match result {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("Skipping cdf53_compact test (memfd not DMA-BUF?): {e}");
+                return;
+            }
+        };
+    }
+
+    let count = unsafe { *processor.cdf53_compact_count_ptr };
+    assert_eq!(
+        count, 1,
+        "expected exactly 1 high-color tile in compact list; got {count}"
+    );
+    let list = unsafe {
+        std::slice::from_raw_parts(processor.cdf53_compact_list_ptr, count as usize)
+    };
+    assert_eq!(
+        list[0], 0,
+        "expected tile index 0 (top-left gradient); got {}",
+        list[0]
+    );
 }

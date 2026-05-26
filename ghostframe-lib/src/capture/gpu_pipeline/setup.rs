@@ -195,6 +195,39 @@ impl GpuFrameProcessor {
             palrle_compact_shader_module,
         )?;
 
+        // --- Cdf53 compact shader module (Stage 4a) ---
+        let cdf53_compact_spv = include_bytes!("../shaders/cdf53_compact.spv");
+        let cdf53_compact_spv_words =
+            ash::util::read_spv(&mut std::io::Cursor::new(cdf53_compact_spv.as_slice()))?;
+        let cdf53_compact_shader_ci =
+            vk::ShaderModuleCreateInfo::default().code(&cdf53_compact_spv_words);
+        let cdf53_compact_shader_module =
+            device.create_shader_module(&cdf53_compact_shader_ci, None)?;
+
+        // --- Cdf53 compact compute pipeline ---
+        // Bindings:
+        //   0: STORAGE_BUFFER (SAD output, read-only)
+        //   1: STORAGE_BUFFER (tile analysis, read-only)
+        //   2: STORAGE_BUFFER (cdf53 compact list output)
+        //   3: STORAGE_BUFFER (cdf53 compact count output)
+        // Push constants: 4 × u32 = 16 bytes
+        //   (cols, rows, dirty_threshold, unique_colors_unknown_sentinel).
+        let (
+            cdf53_compact_descriptor_set_layout,
+            cdf53_compact_pipeline_layout,
+            cdf53_compact_pipeline,
+        ) = pipeline_builder::build_compute_pipeline(
+            &device,
+            &[
+                BindingSpec::storage_buffer(0),
+                BindingSpec::storage_buffer(1),
+                BindingSpec::storage_buffer(2),
+                BindingSpec::storage_buffer(3),
+            ],
+            16,
+            cdf53_compact_shader_module,
+        )?;
+
         // --- PalRLE indirect-args shader module ---
         let palrle_indirect_args_spv = include_bytes!("../shaders/palrle_indirect_args.spv");
         let palrle_indirect_args_spv_words =
@@ -259,16 +292,17 @@ impl GpuFrameProcessor {
         )?;
 
         // --- Descriptor pool ---
-        // 9 sets: SAD (2 STORAGE_IMAGE + 1 STORAGE_BUFFER)
-        //       + NV12 (1 STORAGE_IMAGE + 1 STORAGE_BUFFER)
-        //       + Analysis (1 STORAGE_IMAGE + 1 STORAGE_BUFFER)
-        //       + palrle_compact (4 STORAGE_BUFFER)
-        //       + palrle_indirect_args (2 STORAGE_BUFFER)
-        //       + palette_fold (6 STORAGE_BUFFER)
-        //       + palette_subset_fold_init (1 STORAGE_BUFFER)
-        //       + palette_subset_fold (2 STORAGE_BUFFER)
-        //       + pal_rle_index (1 STORAGE_IMAGE + 5 STORAGE_BUFFER)
-        // Total: 5 STORAGE_IMAGE, 23 STORAGE_BUFFER, 9 max_sets.
+        // 10 sets: SAD (2 STORAGE_IMAGE + 1 STORAGE_BUFFER)
+        //        + NV12 (1 STORAGE_IMAGE + 1 STORAGE_BUFFER)
+        //        + Analysis (1 STORAGE_IMAGE + 1 STORAGE_BUFFER)
+        //        + palrle_compact (4 STORAGE_BUFFER)
+        //        + palrle_indirect_args (2 STORAGE_BUFFER)
+        //        + palette_fold (6 STORAGE_BUFFER)
+        //        + palette_subset_fold_init (1 STORAGE_BUFFER)
+        //        + palette_subset_fold (2 STORAGE_BUFFER)
+        //        + pal_rle_index (1 STORAGE_IMAGE + 5 STORAGE_BUFFER)
+        //        + cdf53_compact (4 STORAGE_BUFFER)   ← added M3.3a
+        // Total: 5 STORAGE_IMAGE, 27 STORAGE_BUFFER, 10 max_sets.
         let pool_sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_IMAGE,
@@ -276,12 +310,12 @@ impl GpuFrameProcessor {
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: 23,
+                descriptor_count: 27,
             },
         ];
         let dp_ci = vk::DescriptorPoolCreateInfo::default()
             .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
-            .max_sets(9)
+            .max_sets(10)
             .pool_sizes(&pool_sizes);
         let descriptor_pool = device.create_descriptor_pool(&dp_ci, None)?;
 
@@ -330,6 +364,30 @@ impl GpuFrameProcessor {
                 palrle_compact_count_size,
                 vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
                 "palrle compact count buffer",
+            )?;
+
+        // --- Cdf53 compact list buffer (Stage 4a) ---
+        // One u32 per tile slot. HOST_VISIBLE | HOST_COHERENT, STORAGE_BUFFER.
+        let cdf53_compact_list_size = (max_tiles * 4) as vk::DeviceSize;
+        let (cdf53_compact_list_buffer, cdf53_compact_list_memory, cdf53_compact_list_ptr) =
+            alloc_host_buffer_mapped::<u32>(
+                &device,
+                &mem_props,
+                cdf53_compact_list_size,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                "cdf53 compact list buffer",
+            )?;
+
+        // --- Cdf53 compact count buffer (Stage 4a) ---
+        // 4 bytes (one u32). HOST_VISIBLE | HOST_COHERENT, STORAGE_BUFFER | TRANSFER_DST.
+        let cdf53_compact_count_size = 4_u64;
+        let (cdf53_compact_count_buffer, cdf53_compact_count_memory, cdf53_compact_count_ptr) =
+            alloc_host_buffer_mapped::<u32>(
+                &device,
+                &mem_props,
+                cdf53_compact_count_size,
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                "cdf53 compact count buffer",
             )?;
 
         // --- PalRLE indirect args buffer ---
@@ -560,6 +618,16 @@ impl GpuFrameProcessor {
             palrle_compact_count_buffer,
             palrle_compact_count_memory,
             palrle_compact_count_ptr,
+            cdf53_compact_shader_module,
+            cdf53_compact_pipeline,
+            cdf53_compact_pipeline_layout,
+            cdf53_compact_descriptor_set_layout,
+            cdf53_compact_list_buffer,
+            cdf53_compact_list_memory,
+            cdf53_compact_list_ptr: cdf53_compact_list_ptr as *const u32,
+            cdf53_compact_count_buffer,
+            cdf53_compact_count_memory,
+            cdf53_compact_count_ptr: cdf53_compact_count_ptr as *const u32,
             palrle_indirect_args_shader_module,
             palrle_indirect_args_pipeline,
             palrle_indirect_args_pipeline_layout,

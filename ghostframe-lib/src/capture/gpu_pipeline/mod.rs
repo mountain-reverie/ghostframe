@@ -43,6 +43,11 @@ const TILE_SIZE: u32 = 32;
 /// Chosen to ignore sub-pixel rounding noise while catching any visible change.
 const SAD_THRESHOLD: u32 = 64;
 
+/// The sentinel value stored in `TileAnalysis::count` when the GPU analysis
+/// pass could not count unique colors (e.g., early-exit due to complexity).
+/// Matches `tile::UNIQUE_COLORS_UNKNOWN` (u16::MAX = 65535) cast to u32.
+const UNIQUE_COLORS_UNKNOWN_SENTINEL: u32 = u16::MAX as u32;
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -293,6 +298,24 @@ pub struct GpuFrameProcessor {
     // Task 10b will read this pointer to retrieve the compact tile count.
     #[allow(dead_code)]
     palrle_compact_count_ptr: *mut u32,
+
+    // Cdf53 compact pipeline (Stage 4a, added M3.3a)
+    cdf53_compact_shader_module: vk::ShaderModule,
+    cdf53_compact_pipeline: vk::Pipeline,
+    cdf53_compact_pipeline_layout: vk::PipelineLayout,
+    cdf53_compact_descriptor_set_layout: vk::DescriptorSetLayout,
+    // HOST_VISIBLE | HOST_COHERENT, persistently mapped. One u32 per tile.
+    cdf53_compact_list_buffer: vk::Buffer,
+    cdf53_compact_list_memory: vk::DeviceMemory,
+    // Task 6+ will read this pointer to retrieve the Cdf53 compact tile index list.
+    #[allow(dead_code)]
+    cdf53_compact_list_ptr: *const u32,
+    // HOST_VISIBLE | HOST_COHERENT | TRANSFER_DST, persistently mapped. 4 bytes.
+    cdf53_compact_count_buffer: vk::Buffer,
+    cdf53_compact_count_memory: vk::DeviceMemory,
+    // Task 6+ will read this pointer to retrieve the Cdf53 compact tile count.
+    #[allow(dead_code)]
+    cdf53_compact_count_ptr: *const u32,
 
     // PalRLE indirect-args pipeline (Stage 1.5b)
     palrle_indirect_args_shader_module: vk::ShaderModule,
@@ -657,6 +680,31 @@ impl Drop for GpuFrameProcessor {
             );
             self.device
                 .destroy_shader_module(self.palrle_compact_shader_module, None);
+
+            // Cdf53 compact buffers (Stage 4a)
+            self.device.unmap_memory(self.cdf53_compact_list_memory);
+            self.device
+                .destroy_buffer(self.cdf53_compact_list_buffer, None);
+            self.device
+                .free_memory(self.cdf53_compact_list_memory, None);
+
+            self.device.unmap_memory(self.cdf53_compact_count_memory);
+            self.device
+                .destroy_buffer(self.cdf53_compact_count_buffer, None);
+            self.device
+                .free_memory(self.cdf53_compact_count_memory, None);
+
+            // Cdf53 compact pipeline (Stage 4a)
+            self.device
+                .destroy_pipeline(self.cdf53_compact_pipeline, None);
+            self.device
+                .destroy_pipeline_layout(self.cdf53_compact_pipeline_layout, None);
+            self.device.destroy_descriptor_set_layout(
+                self.cdf53_compact_descriptor_set_layout,
+                None,
+            );
+            self.device
+                .destroy_shader_module(self.cdf53_compact_shader_module, None);
 
             // PalRLE indirect-args pipeline
             self.device

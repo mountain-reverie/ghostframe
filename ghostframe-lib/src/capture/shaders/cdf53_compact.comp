@@ -1,0 +1,56 @@
+// cdf53_compact.comp
+// Stage 4a: produce the dense list of (dirty AND high-color) tile indices
+// for Cdf53 forward processing.
+//
+// Predicate: tile is dirty (sad > threshold) AND tile_analysis.count > 16
+//            AND tile_analysis.count != unique_colors_unknown_sentinel.
+//
+// Mirrors palrle_compact.comp but with the inverse color-count condition.
+// Dispatch: one workgroup per tile (cols × rows × 1). One thread per workgroup.
+
+#version 450
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0, std430) readonly buffer SadBuffer {
+    uint sad[];
+};
+
+struct TileAnalysis {
+    uint  count;
+    uint  edge_density_thou;
+    uint  _pad0;
+    uint  _pad1;
+    uint  colors[16];
+};
+layout(binding = 1, std430) readonly buffer AnalysisInput {
+    TileAnalysis tiles[];
+};
+
+layout(binding = 2, std430) buffer Cdf53CompactList {
+    uint list[];
+};
+
+layout(binding = 3, std430) buffer Cdf53CompactCount {
+    uint count;
+};
+
+layout(push_constant) uniform PushConstants {
+    uint cols;
+    uint rows;
+    uint dirty_threshold;
+    uint unique_colors_unknown_sentinel;
+};
+
+void main() {
+    uint tile_idx = gl_WorkGroupID.x;
+    if (tile_idx >= cols * rows) return;
+
+    uint sad_v = sad[tile_idx];
+    uint c = tiles[tile_idx].count;
+    // High-color: > 16 unique colors AND not the unknown sentinel.
+    if (sad_v > dirty_threshold && c > 16u && c != unique_colors_unknown_sentinel) {
+        uint slot = atomicAdd(count, 1u);
+        list[slot] = tile_idx;
+    }
+}

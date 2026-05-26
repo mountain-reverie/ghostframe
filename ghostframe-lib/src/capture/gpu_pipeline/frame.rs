@@ -512,6 +512,65 @@ impl GpuFrameProcessor {
             &[],
         );
 
+        // Stage 4a: cdf53_compact dispatch.
+        // Zero the atomic count, then dispatch one workgroup per tile.
+        // Reads sad_buffer + analysis_buffer (both already visible via the
+        // buf_barrier_inputs above); writes cdf53_compact_list + count.
+        self.device
+            .cmd_fill_buffer(cmd, self.cdf53_compact_count_buffer, 0, 4, 0);
+        let buf_barrier_cdf53_fill = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(self.cdf53_compact_count_buffer)
+            .offset(0)
+            .size(4);
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            std::slice::from_ref(&buf_barrier_cdf53_fill),
+            &[],
+        );
+        let cdf53_compact_push: [u32; 4] =
+            [cols, rows, SAD_THRESHOLD, UNIQUE_COLORS_UNKNOWN_SENTINEL];
+        let cdf53_compact_ds_guard = self.run_cdf53_compact_stage(
+            cmd,
+            &cdf53_compact_push,
+            (cols * rows, 1, 1),
+        )?;
+        // Barrier: Stage 4a writes → HOST_READ (for CPU readback after fence).
+        let buf_barrier_cdf53_out = [
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.cdf53_compact_list_buffer)
+                .offset(0)
+                .size(vk::WHOLE_SIZE),
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.cdf53_compact_count_buffer)
+                .offset(0)
+                .size(4),
+        ];
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::HOST,
+            vk::DependencyFlags::empty(),
+            &[],
+            &buf_barrier_cdf53_out,
+            &[],
+        );
+
         // ============================================================
         // Stage 2a: palette_fold (intra-frame palette dedup)
         // ============================================================
@@ -927,6 +986,7 @@ impl GpuFrameProcessor {
         //    guards here to keep them alive past the `wait_for_fences` above.
         //    sad_ds_guard, nv12_ds_guard, analysis_ds_guard,
         //    palrle_compact_ds_guard, palrle_indirect_args_ds_guard,
+        //    cdf53_compact_ds_guard,
         //    palette_fold_ds_guard, palette_subset_fold_init_ds_guard,
         //    palette_subset_fold_ds_guard, and pal_rle_index_ds_guard are
         //    dropped explicitly before step 9 to
@@ -941,6 +1001,7 @@ impl GpuFrameProcessor {
             &analysis_ds_guard,
             &palrle_compact_ds_guard,
             &palrle_indirect_args_ds_guard,
+            &cdf53_compact_ds_guard,
             &palette_fold_ds_guard,
             &palette_subset_fold_init_ds_guard,
             &palette_subset_fold_ds_guard,
@@ -953,6 +1014,7 @@ impl GpuFrameProcessor {
         drop(analysis_ds_guard);
         drop(palrle_compact_ds_guard);
         drop(palrle_indirect_args_ds_guard);
+        drop(cdf53_compact_ds_guard);
         drop(palette_fold_ds_guard);
         drop(palette_subset_fold_init_ds_guard);
         drop(palette_subset_fold_ds_guard);
@@ -1210,6 +1272,62 @@ impl GpuFrameProcessor {
             vk::DependencyFlags::empty(),
             &[],
             std::slice::from_ref(&buf_barrier_args),
+            &[],
+        );
+
+        // Stage 4a: cdf53_compact dispatch (first-frame path).
+        self.device
+            .cmd_fill_buffer(cmd, self.cdf53_compact_count_buffer, 0, 4, 0);
+        let buf_barrier_cdf53_fill = vk::BufferMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .buffer(self.cdf53_compact_count_buffer)
+            .offset(0)
+            .size(4);
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            std::slice::from_ref(&buf_barrier_cdf53_fill),
+            &[],
+        );
+        let cdf53_compact_push: [u32; 4] =
+            [cols, rows, SAD_THRESHOLD, UNIQUE_COLORS_UNKNOWN_SENTINEL];
+        let cdf53_compact_ds_guard = self.run_cdf53_compact_stage(
+            cmd,
+            &cdf53_compact_push,
+            (cols * rows, 1, 1),
+        )?;
+        // Barrier: Stage 4a writes → HOST_READ (for CPU readback after fence).
+        let buf_barrier_cdf53_out = [
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.cdf53_compact_list_buffer)
+                .offset(0)
+                .size(vk::WHOLE_SIZE),
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.cdf53_compact_count_buffer)
+                .offset(0)
+                .size(4),
+        ];
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::HOST,
+            vk::DependencyFlags::empty(),
+            &[],
+            &buf_barrier_cdf53_out,
             &[],
         );
 
@@ -1592,6 +1710,7 @@ impl GpuFrameProcessor {
             &analysis_ds_guard,
             &palrle_compact_ds_guard,
             &palrle_indirect_args_ds_guard,
+            &cdf53_compact_ds_guard,
             &palette_fold_ds_guard,
             &palette_subset_fold_init_ds_guard,
             &palette_subset_fold_ds_guard,
@@ -2191,6 +2310,106 @@ impl GpuFrameProcessor {
         self.device.cmd_push_constants(
             cmd,
             self.palrle_compact_pipeline_layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            push_bytes,
+        );
+        self.device
+            .cmd_dispatch(cmd, workgroups.0, workgroups.1, workgroups.2);
+
+        Ok(guard)
+    }
+
+    /// Cdf53 compact compute dispatch (Stage 4a).
+    ///
+    /// Reads sad_buffer + analysis_buffer; writes cdf53_compact_list_buffer +
+    /// cdf53_compact_count_buffer. Predicate: dirty (SAD > threshold) AND
+    /// unique_colors > 16 AND unique_colors != unknown_sentinel.
+    ///
+    /// Mirrors run_palrle_compact_stage but uses the cdf53_compact pipeline.
+    unsafe fn run_cdf53_compact_stage<'a>(
+        &'a self,
+        cmd: vk::CommandBuffer,
+        push_constants: &[u32],
+        workgroups: (u32, u32, u32),
+    ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
+        let cdf53_compact_set_layouts = [self.cdf53_compact_descriptor_set_layout];
+        let cdf53_compact_ds_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(&cdf53_compact_set_layouts);
+        let guard = ScopedDescriptorSets {
+            device: &self.device,
+            pool: self.descriptor_pool,
+            sets: self.device.allocate_descriptor_sets(&cdf53_compact_ds_alloc)?,
+        };
+        let cdf53_compact_ds = guard.sets[0];
+
+        // Write the four cdf53_compact descriptors (all STORAGE_BUFFER):
+        //   binding 0 — sad_buffer                    (read)
+        //   binding 1 — analysis_buffer               (read)
+        //   binding 2 — cdf53_compact_list_buffer     (write)
+        //   binding 3 — cdf53_compact_count_buffer    (atomic write)
+        let cdf53_sad_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.sad_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let cdf53_analysis_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.analysis_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let cdf53_list_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.cdf53_compact_list_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let cdf53_count_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.cdf53_compact_count_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let cdf53_compact_writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(cdf53_compact_ds)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&cdf53_sad_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(cdf53_compact_ds)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&cdf53_analysis_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(cdf53_compact_ds)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&cdf53_list_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(cdf53_compact_ds)
+                .dst_binding(3)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&cdf53_count_info),
+        ];
+        self.device.update_descriptor_sets(&cdf53_compact_writes, &[]);
+
+        // Bind + push + dispatch.
+        self.device.cmd_bind_pipeline(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.cdf53_compact_pipeline,
+        );
+        self.device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.cdf53_compact_pipeline_layout,
+            0,
+            &[cdf53_compact_ds],
+            &[],
+        );
+        let push_bytes = std::slice::from_raw_parts(
+            push_constants.as_ptr() as *const u8,
+            std::mem::size_of_val(push_constants),
+        );
+        self.device.cmd_push_constants(
+            cmd,
+            self.cdf53_compact_pipeline_layout,
             vk::ShaderStageFlags::COMPUTE,
             0,
             push_bytes,
