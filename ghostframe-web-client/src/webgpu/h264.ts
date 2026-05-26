@@ -1,11 +1,5 @@
 import h264Wgsl from './shaders/h264_blit.wgsl?raw';
 
-export interface H264Tile {
-  tileX: number;   // tile coords; -1 for full-frame
-  tileY: number;
-  frame: VideoFrame;
-}
-
 export class H264Pipeline {
   private pipeline: GPURenderPipeline;
   private sampler: GPUSampler;
@@ -30,14 +24,14 @@ export class H264Pipeline {
     });
   }
 
-  /** Draw one H.264 tile (or full-frame if tileX === -1) into the current pass. */
-  drawTile(
+  /** Draw a full-frame H.264 VideoFrame into the current pass. */
+  drawFullFrame(
     pass: GPURenderPassEncoder,
-    tile: H264Tile,
+    frame: VideoFrame,
     canvasWidth: number,
     canvasHeight: number,
   ): void {
-    const ext = this.device.importExternalTexture({ source: tile.frame });
+    const ext = this.device.importExternalTexture({ source: frame });
     const bindGroup = this.device.createBindGroup({
       layout: this.pipeline.getBindGroupLayout(0),
       entries: [
@@ -47,11 +41,7 @@ export class H264Pipeline {
     });
     pass.setPipeline(this.pipeline);
     pass.setBindGroup(0, bindGroup);
-    if (tile.tileX < 0) {
-      pass.setViewport(0, 0, canvasWidth, canvasHeight, 0, 1);
-    } else {
-      pass.setViewport(tile.tileX * 32, tile.tileY * 32, 32, 32, 0, 1);
-    }
+    pass.setViewport(0, 0, canvasWidth, canvasHeight, 0, 1);
     pass.draw(6, 1, 0, 0);
   }
 }

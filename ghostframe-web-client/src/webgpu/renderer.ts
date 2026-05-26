@@ -1,7 +1,7 @@
 import { initWebGpu, type WebGpuInitResult } from './init.js';
 import { Framebuffer } from './framebuffer.js';
 import { SolidPipeline, type SolidTile } from './solid.js';
-import { H264Pipeline, type H264Tile } from './h264.js';
+import { H264Pipeline } from './h264.js';
 import { PalRlePipeline } from './palrle.js';
 import { PaletteShadow } from '../palette_shadow.js';
 import { prevalidatePalRle, PalRleVariant, type PalRleEntry } from '../prevalidate.js';
@@ -27,7 +27,7 @@ export class WebGpuRenderer {
   palRleQueue: PalRleQueued[] = [];
   solidQueue: SolidTile[] = [];
   rawQueue: RawQueued[] = [];
-  h264Queue: H264Tile[] = [];
+  h264Queue: VideoFrame[] = [];
 
   paletteShadow = new PaletteShadow();
   private errorsReadbackInFlight = false;
@@ -136,11 +136,11 @@ export class WebGpuRenderer {
     }
     this.videoFramesToClose = [];
 
-    // Close queued-but-not-yet-drawn H.264 tile frames so their backing
-    // resources are released promptly, then clear the queue so stale frames
-    // from a previous session don't bleed into the first rAF of the next.
-    for (const h of this.h264Queue) {
-      try { h.frame.close(); } catch { /* already closed — safe to swallow */ }
+    // Close queued-but-not-yet-drawn H.264 full-frame VideoFrames so their
+    // backing resources are released promptly, then clear the queue so stale
+    // frames from a previous session don't bleed into the first rAF of the next.
+    for (const f of this.h264Queue) {
+      try { f.close(); } catch { /* already closed — safe to swallow */ }
     }
     this.h264Queue.length = 0;
 
@@ -212,15 +212,15 @@ export class WebGpuRenderer {
         }],
       });
       this.solidPipeline.draw(pass, solidCount);
-      for (const h of this.h264Queue) {
-        this.h264Pipeline.drawTile(pass, h, this.framebuffer.width, this.framebuffer.height);
+      for (const frame of this.h264Queue) {
+        this.h264Pipeline.drawFullFrame(pass, frame, this.framebuffer.width, this.framebuffer.height);
       }
       pass.end();
     }
     const h264Count = this.h264Queue.length;
     // Stage the VideoFrames for next-tick cleanup; the importExternalTexture
     // references are scoped to this submit.
-    this.videoFramesToClose.push(...this.h264Queue.map((h) => h.frame));
+    this.videoFramesToClose.push(...this.h264Queue);
     this.h264Queue.length = 0;
 
     // ---- Step 9: present blit ----

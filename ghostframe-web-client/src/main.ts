@@ -395,7 +395,7 @@ async function main() {
 
         if (!fullFrameDecoder) {
           fullFrameDecoder = new FullFrameDecoder((frame: VideoFrame) => {
-            renderer.h264Queue.push({ tileX: -1, tileY: -1, frame });
+            renderer.h264Queue.push(frame);
           }, 1920, 1080);
         }
 
