@@ -1,5 +1,6 @@
 //! Tile encoding: converts raw BGRA tile data into compressed payloads.
 
+pub mod cdf53;
 pub mod h264_vaapi;
 pub mod pal_rle;
 pub mod solid;
