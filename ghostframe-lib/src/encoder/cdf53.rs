@@ -29,9 +29,9 @@ const BIT_PLANE_BYTES_PER_CHANNEL: usize = CDF53_COEFFS_PER_CHANNEL / 8;
 /// Strips alpha and returns 3072 signed integer coefficients
 /// in [B-coeffs (1024)][G-coeffs (1024)][R-coeffs (1024)] order.
 /// Each channel's coefficients are laid out as:
-///   [LL3 (16)][LH3 (16)][HL3 (16)][HH3 (16)]
-///   [LH2 (64)][HL2 (64)][HH2 (64)]
-///   [LH1 (256)][HL1 (256)][HH1 (256)]
+///   [LL3 (16)][HL3 (16)][LH3 (16)][HH3 (16)]
+///   [HL2 (64)][LH2 (64)][HH2 (64)]
+///   [HL1 (256)][LH1 (256)][HH1 (256)]
 pub fn forward(tile_bgra: &[u8]) -> Vec<i16> {
     assert_eq!(tile_bgra.len(), 32 * 32 * 4, "tile must be 32×32 BGRA");
     let mut output = vec![0i16; CDF53_TOTAL_COEFFS];
@@ -81,16 +81,16 @@ pub fn forward(tile_bgra: &[u8]) -> Vec<i16> {
         let channel_offset = ch * CDF53_COEFFS_PER_CHANNEL;
         let mut out_idx = channel_offset;
 
-        // LL3, LH3, HL3, HH3 (4×4 each → 16 each)
+        // LL3, HL3, LH3, HH3 (4×4 each → 16 each)
         for y in 0..4 { for x in 0..4 { output[out_idx] = work[y][x] as i16; out_idx += 1; } }       // LL3
         for y in 0..4 { for x in 4..8 { output[out_idx] = work[y][x] as i16; out_idx += 1; } }       // HL3
         for y in 4..8 { for x in 0..4 { output[out_idx] = work[y][x] as i16; out_idx += 1; } }       // LH3
         for y in 4..8 { for x in 4..8 { output[out_idx] = work[y][x] as i16; out_idx += 1; } }       // HH3
-        // LH2, HL2, HH2 (8×8 each → 64 each)
+        // HL2, LH2, HH2 (8×8 each → 64 each)
         for y in 0..8  { for x in 8..16  { output[out_idx] = work[y][x] as i16; out_idx += 1; } }    // HL2
         for y in 8..16 { for x in 0..8   { output[out_idx] = work[y][x] as i16; out_idx += 1; } }    // LH2
         for y in 8..16 { for x in 8..16  { output[out_idx] = work[y][x] as i16; out_idx += 1; } }    // HH2
-        // LH1, HL1, HH1 (16×16 each → 256 each)
+        // HL1, LH1, HH1 (16×16 each → 256 each)
         for y in 0..16  { for x in 16..32 { output[out_idx] = work[y][x] as i16; out_idx += 1; } }   // HL1
         for y in 16..32 { for x in 0..16  { output[out_idx] = work[y][x] as i16; out_idx += 1; } }   // LH1
         for y in 16..32 { for x in 16..32 { output[out_idx] = work[y][x] as i16; out_idx += 1; } }   // HH1
@@ -102,7 +102,7 @@ pub fn forward(tile_bgra: &[u8]) -> Vec<i16> {
 
 /// CDF 5/3 lifting on a single row (or column) of length `n` (must be even).
 /// Operates in-place. Lifting steps:
-///   1. predict: x[2i+1] -= (x[2i] + x[2i+2] + 1) / 2     (handle boundary with mirror)
+///   1. predict: x[2i+1] -= (x[2i] + x[2i+2]) / 2          (handle boundary with mirror)
 ///   2. update : x[2i]   += (x[2i-1] + x[2i+1] + 2) / 4   (mirror at boundaries)
 /// After lifting, even indices hold low-pass (L) and odd indices hold high-pass (H).
 /// We then re-arrange to [L_0..L_{n/2-1}, H_0..H_{n/2-1}] (deinterleave).
