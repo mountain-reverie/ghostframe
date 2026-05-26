@@ -1388,6 +1388,70 @@ impl IoBridge {
                     self.oob_inject_at = None;
                 }
 
+                // Phase B — Cdf53 encode bit-plane passes for high-color tiles,
+                // enqueue into the scheduler's refinement queue. Gated on BOTH
+                // the server env flag (GHOSTFRAME_ENABLE_CDF53) AND the client
+                // capability (caps.supports_cdf53, from HELLO).
+                if self.cdf53_enabled && caps.supports_cdf53 {
+                    // Extract raw pointers from the GPU processor up-front so that
+                    // the immutable borrow of self.gpu_frame_processor ends before
+                    // the mutable borrows of self.scheduler below.
+                    // SAFETY: cdf53_compact_count_ptr, cdf53_compact_list_ptr, and
+                    // cdf53_coefficients_ptr are HOST_VISIBLE | HOST_COHERENT mapped
+                    // GPU memory, valid until the next process_frame call. This block
+                    // runs inside the current process_frame_gpu invocation, before
+                    // any subsequent call.
+                    let (cdf53_compact_count_ptr, cdf53_compact_list_ptr, cdf53_coefficients_ptr) = {
+                        let gpu = self.gpu_frame_processor.as_ref().unwrap();
+                        (
+                            gpu.cdf53_compact_count_ptr,
+                            gpu.cdf53_compact_list_ptr,
+                            gpu.cdf53_coefficients_ptr,
+                        )
+                    };
+                    let cdf53_count = unsafe { *cdf53_compact_count_ptr };
+                    if cdf53_count > 0 {
+                        let cdf53_list = unsafe {
+                            std::slice::from_raw_parts(
+                                cdf53_compact_list_ptr,
+                                cdf53_count as usize,
+                            )
+                        };
+                        for (slot, &flat_tile_idx) in cdf53_list.iter().enumerate() {
+                            let tile_x = (flat_tile_idx % cols) as u8;
+                            let tile_y = (flat_tile_idx / cols) as u8;
+                            // Read 3 * 1024 = 3072 i32 values from the compact-slot
+                            // indexed coefficient buffer. The GPU writes i32-wide
+                            // values; CPU casts to i16 (actual coefficient bit-width;
+                            // high bits are sign-extension).
+                            let coeffs_i32 = unsafe {
+                                std::slice::from_raw_parts(
+                                    cdf53_coefficients_ptr
+                                        .add(slot * crate::encoder::cdf53::CDF53_TOTAL_COEFFS),
+                                    crate::encoder::cdf53::CDF53_TOTAL_COEFFS,
+                                )
+                            };
+                            let coeffs_i16: Vec<i16> =
+                                coeffs_i32.iter().map(|&v| v as i16).collect();
+                            let passes = crate::encoder::cdf53::encode_passes(&coeffs_i16);
+                            let gen = self.scheduler.bump_generation(tile_x, tile_y);
+                            // Diagnostic: one line per pass for the e2e log scan.
+                            for (pass_idx, payload) in passes.iter().enumerate() {
+                                tracing::info!(
+                                    target: "ghostframe::cdf53",
+                                    tile_x = tile_x,
+                                    tile_y = tile_y,
+                                    gen = gen,
+                                    pass_idx = pass_idx,
+                                    payload_size = payload.len(),
+                                    "cdf53.emit"
+                                );
+                            }
+                            self.scheduler.enqueue_refinement(tile_x, tile_y, gen, passes);
+                        }
+                    }
+                }
+
                 self.dispatch_dirty_tiles_via_scheduler(
                     &dirty_xy,
                     &grid,

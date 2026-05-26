@@ -307,15 +307,13 @@ pub struct GpuFrameProcessor {
     // HOST_VISIBLE | HOST_COHERENT, persistently mapped. One u32 per tile.
     cdf53_compact_list_buffer: vk::Buffer,
     cdf53_compact_list_memory: vk::DeviceMemory,
-    // Task 6+ will read this pointer to retrieve the Cdf53 compact tile index list.
-    #[allow(dead_code)]
-    cdf53_compact_list_ptr: *const u32,
+    // Phase B in io_bridge reads this to iterate over Cdf53-classified tiles.
+    pub cdf53_compact_list_ptr: *const u32,
     // HOST_VISIBLE | HOST_COHERENT | TRANSFER_DST, persistently mapped. 4 bytes.
     cdf53_compact_count_buffer: vk::Buffer,
     cdf53_compact_count_memory: vk::DeviceMemory,
-    // Task 6+ will read this pointer to retrieve the Cdf53 compact tile count.
-    #[allow(dead_code)]
-    cdf53_compact_count_ptr: *const u32,
+    // Phase B in io_bridge reads this to know how many Cdf53 tiles to process.
+    pub cdf53_compact_count_ptr: *const u32,
 
     // Cdf53 indirect-args pipeline (Stage 4b, added M3.3a)
     cdf53_dispatch_args_buffer: vk::Buffer,
