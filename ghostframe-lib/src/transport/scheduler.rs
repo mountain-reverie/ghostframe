@@ -390,14 +390,14 @@ impl Scheduler {
         const MIN_FRACTION: f32 = 0.05;
         const MAX_FRACTION: f32 = 0.2;
 
-        let rate = if self.delivery_window_emitted == 0 {
-            // No emissions this round (queue empty or fully budgeted on prior rounds).
-            // Treat as zero delivery so that "queue empty for 10 rounds" counts as
-            // sustained low-delivery and does not spuriously advance high_delivery_rounds.
-            0.0
-        } else {
-            self.delivery_window_acked as f32 / self.delivery_window_emitted as f32
-        };
+        // Empty window = no signal. Don't tick either streak counter and don't
+        // reset the window; we may accumulate a partial round if work resumes
+        // before the next tick. The window will reset naturally once work flows.
+        if self.delivery_window_emitted == 0 {
+            return;
+        }
+
+        let rate = self.delivery_window_acked as f32 / self.delivery_window_emitted as f32;
 
         if rate < LOW_DELIVERY {
             self.low_delivery_rounds += 1;
@@ -781,8 +781,11 @@ mod tests {
         for i in 0..200 {
             sch.enqueue_refinement(0, 0, 0, vec![vec![i as u8]; 14]);
         }
+        // tick(250) drains ~250 items per call → queue stays non-empty for 10+
+        // ticks, so every round has emissions + no acks → rate=0 → halving fires
+        // on the 10th low-delivery round.
         for _ in 0..10 {
-            let _ = sch.tick(10_000);
+            let _ = sch.tick(250);
         }
         assert!((sch.current_refinement_fraction() - 0.1).abs() < 1e-6,
             "expected 0.1 after one halving; got {}", sch.current_refinement_fraction());
