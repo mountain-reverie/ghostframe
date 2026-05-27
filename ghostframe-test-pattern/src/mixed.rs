@@ -48,7 +48,7 @@ pub const REGIONS: &[Region] = &[
         y: 240,
         w: 320,
         h: 240,
-        expected_codec: "Bc1",
+        expected_codec: "Cdf53",
     },
     Region {
         name: "spinner",
@@ -163,25 +163,37 @@ fn paint_gradient<C: Connection>(
     root: u32,
     r: &Region,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // 32 horizontal stripes from black at the top to bright blue at the bottom.
-    // Coarse stripes so even at 700×500 capture the gradient is detectable.
-    let stripes: u32 = 32;
-    let stripe_h = r.h / stripes;
-    for i in 0..stripes {
-        let v = ((i * 255) / (stripes - 1)) as u32;
-        let pixel = (v << 16) | (v << 8) | (255 - v); // ramp R+G; B counter-ramp
-        let gc = conn.generate_id()?;
-        conn.create_gc(gc, root, &CreateGCAux::new().foreground(pixel))?;
-        conn.poly_fill_rectangle(
-            root,
-            gc,
-            &[Rectangle {
-                x: r.x as i16,
-                y: (r.y + i * stripe_h) as i16,
-                width: r.w as u16,
-                height: stripe_h as u16,
-            }],
-        )?;
+    // 4×4 block grid with a diagonal RGB ramp. Each 32×32 capture tile holds
+    // 8×8 = 64 distinct block colors, comfortably above the classifier's
+    // 16-color threshold, so the gradient region routes to Cdf53 instead of
+    // collapsing to PalRle (which a coarse-stripe gradient does).
+    let block: u32 = 4;
+    let gc = conn.generate_id()?;
+    conn.create_gc(gc, root, &CreateGCAux::default())?;
+    let mut by = 0;
+    while by < r.h {
+        let mut bx = 0;
+        while bx < r.w {
+            let cx = bx / block;
+            let cy = by / block;
+            let red = ((cx * 3) & 0xFF) as u32;
+            let grn = ((cy * 3) & 0xFF) as u32;
+            let blu = (((cx + cy) * 2) & 0xFF) as u32;
+            let pixel = (red << 16) | (grn << 8) | blu;
+            conn.change_gc(gc, &ChangeGCAux::new().foreground(pixel))?;
+            conn.poly_fill_rectangle(
+                root,
+                gc,
+                &[Rectangle {
+                    x: (r.x + bx) as i16,
+                    y: (r.y + by) as i16,
+                    width: block as u16,
+                    height: block as u16,
+                }],
+            )?;
+            bx += block;
+        }
+        by += block;
     }
     Ok(())
 }
