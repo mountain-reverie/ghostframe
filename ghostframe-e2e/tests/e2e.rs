@@ -2245,3 +2245,101 @@ async fn e2e_webgpu_fallback_swiftshader() -> Result<()> {
     );
     Ok(())
 }
+
+/// M3.3a: high-color content (`--gradient` test pattern) with
+/// `GHOSTFRAME_ENABLE_CDF53=1` → server emits `Codec::Cdf53 (6)` on the wire.
+/// Client side: M3.3a client cannot yet decode Cdf53; datagrams arrive and
+/// are dropped silently but recorded in `__ghostframeRecordedCodecs`.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_cdf53_gradient_emission() -> Result<()> {
+    let setup = setup_e2e_webgpu_gpu_with_env(
+        "--gradient --drm-direct",
+        &[("GHOSTFRAME_ENABLE_CDF53", "1")],
+    )
+    .await?;
+    // 5s settle covers initial H264 burst + mode-flip handoff + Cdf53 emissions.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let codec_list: Vec<u8> = setup
+        .page
+        .evaluate("window.__ghostframeRecordedCodecs || []")
+        .await?
+        .into_value()?;
+    let cdf53_count = codec_list.iter().filter(|&&c| c == 6).count();
+    let non_cdf53_tile_count = codec_list
+        .iter()
+        .filter(|&&c| c != 6 && c != 0 /* Skip not counted */)
+        .count();
+    assert!(
+        cdf53_count > 0,
+        "expected Codec::Cdf53 (6) on wire; saw codecs: {codec_list:?}"
+    );
+    assert!(
+        cdf53_count > non_cdf53_tile_count * 5,
+        "expected gradient to be dominated by Cdf53 emissions; cdf53={cdf53_count} \
+         vs non-cdf53={non_cdf53_tile_count}"
+    );
+
+    // Server log: at least 14 cdf53.emit lines (one full pass sequence).
+    let logs = helpers::read_server_logs_stripped("ghostframe-server");
+    let cdf53_emit_count = logs.lines().filter(|l| l.contains("cdf53.emit")).count();
+    assert!(
+        cdf53_emit_count >= 14,
+        "expected >= 14 cdf53.emit log lines; got {cdf53_emit_count} in logs:\n{logs}"
+    );
+    Ok(())
+}
+
+/// M3.3a: `--mixed` content drives the classifier through multiple codecs.
+/// Verify codec mixing with Cdf53 in the set.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_cdf53_mixed_codecs() -> Result<()> {
+    let setup = setup_e2e_webgpu_gpu_with_env(
+        "--mixed",
+        &[("GHOSTFRAME_ENABLE_CDF53", "1")],
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let codec_list: Vec<u8> = setup
+        .page
+        .evaluate("window.__ghostframeRecordedCodecs || []")
+        .await?
+        .into_value()?;
+    assert!(
+        codec_list.contains(&4u8),
+        "expected Codec::Solid (4) for solid region; saw: {codec_list:?}"
+    );
+    assert!(
+        codec_list.contains(&2u8),
+        "expected Codec::PalRle (2) for text region; saw: {codec_list:?}"
+    );
+    assert!(
+        codec_list.contains(&6u8),
+        "expected Codec::Cdf53 (6) for gradient region; saw: {codec_list:?}"
+    );
+    Ok(())
+}
+
+/// M3.3a regression check: without `GHOSTFRAME_ENABLE_CDF53`, the classifier
+/// falls back to Raw for high-color tiles (preserves M3.2 behavior).
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_cdf53_flag_off() -> Result<()> {
+    let setup = setup_e2e_webgpu_gpu("--gradient --drm-direct").await?;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let codec_list: Vec<u8> = setup
+        .page
+        .evaluate("window.__ghostframeRecordedCodecs || []")
+        .await?
+        .into_value()?;
+    assert!(
+        !codec_list.contains(&6u8),
+        "expected no Codec::Cdf53 (6) without GHOSTFRAME_ENABLE_CDF53; saw: {codec_list:?}"
+    );
+    assert!(
+        codec_list.contains(&5u8),
+        "expected Codec::Raw (5) fallback when Cdf53 disabled; saw: {codec_list:?}"
+    );
+    Ok(())
+}
