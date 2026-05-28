@@ -220,125 +220,162 @@ pub async fn docker_run_in_container(
 }
 
 // ---------------------------------------------------------------------------
-// Xvfb test display
+// Weston headless test display (with XWayland)
 // ---------------------------------------------------------------------------
+//
+// Replaces the previous private-Xvfb harness. Chromium's WebGPU on Linux
+// requires a DRI3-capable display server to expose the host's Mesa Vulkan
+// ICD to Dawn; Xvfb does not provide DRI3, so Dawn fell back to SwiftShader
+// (CPU rasterized). SwiftShader's aggressive cleanup tripped a Dawn
+// Instance-refcount race on page.reload(), reliably losing the new page's
+// device — see `e2e_palrle_session_reset` notes.
+//
+// Weston-headless + xwayland gives us:
+//   - A Wayland compositor backed by GBM on the real GPU (DRI3 works).
+//   - An auto-spawned XWayland server providing a regular DISPLAY for
+//     Chromium's `--ozone-platform=x11`, with system Mesa Vulkan available.
+//   - Robust device lifecycle across reloads (matches production behavior).
 
-use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::Instant;
 
-/// Owns a Xvfb child process + its xauth cookie file. Drop kills the X
-/// server and removes the auth file, isolating tests from the host's
-/// LightDM session (no DISPLAY=:0 / no /run/lightdm/root/:0 dependency).
-pub struct XvfbGuard {
+/// Owns a Weston child process + its private XDG_RUNTIME_DIR. Drop kills
+/// the compositor and removes the runtime dir. Captures both the Wayland
+/// socket name and the XWayland-provided DISPLAY string so callers can
+/// pass either to spawned Chromium processes.
+pub struct WestonGuard {
     child: Child,
-    xauth_path: PathBuf,
+    runtime_dir: PathBuf,
+    /// Wayland socket name relative to `runtime_dir` (e.g., `ghostframe-wl-0`).
+    pub wayland_display: String,
+    /// XWayland DISPLAY string (e.g., `:1`). Picked dynamically by Weston.
     pub display: String,
+    log_path: PathBuf,
 }
 
-impl XvfbGuard {
-    pub fn xauth_path(&self) -> &Path {
-        &self.xauth_path
+impl WestonGuard {
+    pub fn runtime_dir(&self) -> &Path {
+        &self.runtime_dir
     }
 }
 
-impl Drop for XvfbGuard {
+impl Drop for WestonGuard {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_file(&self.xauth_path);
+        let _ = std::fs::remove_dir_all(&self.runtime_dir);
+        let _ = std::fs::remove_file(&self.log_path);
     }
 }
 
-/// Spawn a private Xvfb instance on the first free display in :99..:199.
-/// Returns once the X11 unix socket appears (or after 10 s deadline).
+/// Spawn a private Weston compositor (headless backend, GL renderer,
+/// xwayland enabled). Returns once both the Wayland socket and the X
+/// display socket appear, or after a 15 s deadline.
 ///
-/// The xauth cookie is a fresh 16-byte random value written in
-/// MIT-MAGIC-COOKIE-1 format with `family = FamilyWild`; this matches
-/// any client and avoids the hostname-lookup the FamilyLocal path needs.
-pub fn spawn_xvfb() -> Result<XvfbGuard> {
-    let display_num = find_free_display()?;
-    let display = format!(":{display_num}");
+/// The compositor runs against the host's real GPU via Mesa GBM, exposing
+/// a usable DRI3 path to Chromium. A unique runtime dir keeps multiple
+/// concurrent test runs from clobbering each other (in practice the suite
+/// uses `--test-threads=1`, but the isolation is cheap).
+pub fn spawn_weston_headless() -> Result<WestonGuard> {
+    use std::os::unix::fs::PermissionsExt;
 
-    let mut cookie = [0u8; 16];
-    std::fs::File::open("/dev/urandom")
-        .context("opening /dev/urandom for xauth cookie")?
-        .read_exact(&mut cookie)
-        .context("reading /dev/urandom")?;
-
-    let xauth_path = std::env::temp_dir().join(format!(
-        "ghostframe-e2e-xauth-{}-{}",
-        std::process::id(),
-        display_num,
+    let pid = std::process::id();
+    let runtime_dir = std::env::temp_dir().join(format!(
+        "ghostframe-weston-{}-{}",
+        pid,
+        Instant::now().elapsed().as_nanos(),
     ));
-    write_xauth_file(&xauth_path, display_num, &cookie)
-        .context("writing xauth file")?;
+    std::fs::create_dir_all(&runtime_dir).context("creating weston runtime dir")?;
+    std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700))
+        .context("setting weston runtime dir permissions")?;
 
-    let child = Command::new("Xvfb")
-        .arg(&display)
-        .args(["-screen", "0", "1920x1080x24"])
-        .args(["-auth", xauth_path.to_str().unwrap()])
-        .arg("-nolisten").arg("tcp")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+    // Pick a unique Wayland socket name to avoid colliding with any host
+    // compositor or earlier test runs that leaked sockets.
+    let socket_name = format!("ghostframe-wl-{pid}");
+    let log_path = std::env::temp_dir().join(format!("ghostframe-weston-{pid}.log"));
+    let log_file = std::fs::File::create(&log_path)
+        .context("creating weston log file")?;
+    let log_stderr = log_file.try_clone().context("cloning weston log fd")?;
+
+    // The headless backend renders offscreen but still drives Mesa GBM,
+    // giving Chromium access to the real Vulkan adapter through XWayland.
+    // `--idle-time=0` disables the inactivity timeout (default 5 minutes
+    // would otherwise blank the display mid-test).
+    let child = Command::new("weston")
+        .arg("--backend=headless")
+        .arg("--renderer=gl")
+        .arg("--width=1920")
+        .arg("--height=1080")
+        .arg(format!("--socket={socket_name}"))
+        .arg("--idle-time=0")
+        .arg("--xwayland")
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .stdout(log_file)
+        .stderr(log_stderr)
         .spawn()
-        .context("spawning Xvfb (is xorg-server-xvfb installed?)")?;
+        .context("spawning weston (is the weston package installed?)")?;
 
-    // Wait for the X11 unix socket to appear.
-    let socket_path = format!("/tmp/.X11-unix/X{display_num}");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !Path::new(&socket_path).exists() {
+    // Wait for the Wayland socket to appear inside the runtime dir.
+    let wayland_socket = runtime_dir.join(&socket_name);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !wayland_socket.exists() {
         if Instant::now() > deadline {
-            return Err(anyhow!("Xvfb {display} did not start within 10s"));
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            return Err(anyhow!(
+                "weston wayland socket {wayland_socket:?} did not appear within 15s. log:\n{log}"
+            ));
         }
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    Ok(XvfbGuard {
+    // Wait for Weston's xwayland module to log the X display number, then
+    // verify the X socket itself is bound. Format we look for:
+    //   xserver listening on display :N
+    let display = loop {
+        if Instant::now() > deadline {
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            return Err(anyhow!(
+                "weston xwayland did not start within 15s. log:\n{log}"
+            ));
+        }
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if let Some(d) = parse_weston_xwayland_display(&log) {
+            break d;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let x_socket = format!("/tmp/.X11-unix/X{}", &display[1..]);
+    while !Path::new(&x_socket).exists() {
+        if Instant::now() > deadline {
+            return Err(anyhow!(
+                "weston xwayland announced DISPLAY={display} but socket {x_socket} never appeared"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    Ok(WestonGuard {
         child,
-        xauth_path,
+        runtime_dir,
+        wayland_display: socket_name,
         display,
+        log_path,
     })
 }
 
-fn find_free_display() -> Result<u32> {
-    for n in 99..200 {
-        let socket = format!("/tmp/.X11-unix/X{n}");
-        if !Path::new(&socket).exists() {
-            return Ok(n);
+/// Parse the X display string (`:N`) from Weston's `--xwayland` log line.
+/// Weston 15 logs `xserver listening on display :N`.
+fn parse_weston_xwayland_display(log: &str) -> Option<String> {
+    for line in log.lines() {
+        if let Some(rest) = line.split_once("listening on display ") {
+            let candidate = rest.1.split_whitespace().next()?;
+            if candidate.starts_with(':') {
+                return Some(candidate.to_string());
+            }
         }
     }
-    Err(anyhow!("no free X display number in 99..200"))
-}
-
-fn write_xauth_file(path: &Path, display_num: u32, cookie: &[u8; 16]) -> std::io::Result<()> {
-    let display_str = display_num.to_string();
-    let name = b"MIT-MAGIC-COOKIE-1";
-
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-
-    // family = 0xFFFF (FamilyWild — matches any client family/host)
-    f.write_all(&0xFFFFu16.to_be_bytes())?;
-    // empty address
-    f.write_all(&0u16.to_be_bytes())?;
-    // display number as a decimal string
-    f.write_all(&(display_str.len() as u16).to_be_bytes())?;
-    f.write_all(display_str.as_bytes())?;
-    // protocol name
-    f.write_all(&(name.len() as u16).to_be_bytes())?;
-    f.write_all(name)?;
-    // cookie payload
-    f.write_all(&(cookie.len() as u16).to_be_bytes())?;
-    f.write_all(cookie)?;
-
-    Ok(())
+    None
 }
 
 /// Capture the page's canvas as a PNG (via chromiumoxide's `screenshot`
@@ -432,42 +469,68 @@ pub fn read_server_logs_stripped(container_name: &str) -> String {
 }
 
 /// Pre-test hygiene: remove stale `/tmp/.X11-unix/X<N>` socket files and
-/// matching `/tmp/.X<N>-lock` lock files for `N in 99..=199`, but skip any
+/// matching `/tmp/.X<N>-lock` lock files for `N in 0..=20`, but skip any
 /// socket that's currently backed by a live X server (connect probe returns
-/// Ok). Without this, accumulated stale sockets from prior test runs cause
-/// `spawn_xvfb` to fail with "no free X display number in 99..200" after
-/// ~100 test invocations have leaked Xvfb sockets.
+/// Ok), plus leftover `/tmp/ghostframe-weston-*` runtime dirs and log files.
+/// Without this, accumulated stale sockets from prior test runs eventually
+/// exhaust the low display numbers XWayland picks from (it starts at :1).
 ///
 /// Called once at the top of `setup_e2e_inner` so it runs once per test.
 ///
 /// **Serialization assumption**: this helper assumes the project's
 /// `--test-threads=1` convention — only one test setup runs at a
-/// time. Under parallel execution, the helper could remove a socket
-/// that a concurrent `spawn_xvfb` (in another test) just bound to,
-/// causing a TOCTOU race. The cleanup → spawn_xvfb sequence within a
-/// SINGLE test is safe because both are synchronous. If the suite
-/// ever moves to parallel test execution, add a process-wide mutex.
+/// time. The cleanup → `spawn_weston_headless` sequence within a SINGLE
+/// test is safe because both are synchronous.
 pub fn cleanup_stale_xvfb_sockets() {
     use std::os::unix::net::UnixStream;
     use std::path::Path;
     let mut removed = 0;
-    for n in 99..=199u32 {
-        let socket = format!("/tmp/.X11-unix/X{n}");
-        let lock = format!("/tmp/.X{n}-lock");
-        if !Path::new(&socket).exists() && !Path::new(&lock).exists() {
-            continue;
-        }
-        match UnixStream::connect(&socket) {
-            Ok(_) => continue, // live X server bound; keep
-            Err(e) if matches!(
-                e.kind(),
-                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
-            ) => {
-                let _ = std::fs::remove_file(&socket);
-                let _ = std::fs::remove_file(&lock);
-                removed += 1;
+    // XWayland-launched-by-Weston picks low display numbers (typically :1).
+    // Old Xvfb-based runs used :99..:199 — sweep both ranges so this works
+    // during the transition and stays robust afterwards.
+    let ranges: &[std::ops::RangeInclusive<u32>] = &[0..=20, 99..=199];
+    for range in ranges {
+        for n in range.clone() {
+            let socket = format!("/tmp/.X11-unix/X{n}");
+            let lock = format!("/tmp/.X{n}-lock");
+            if !Path::new(&socket).exists() && !Path::new(&lock).exists() {
+                continue;
             }
-            Err(_) => continue,
+            match UnixStream::connect(&socket) {
+                Ok(_) => continue, // live X server bound; keep
+                Err(e) if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                ) => {
+                    let _ = std::fs::remove_file(&socket);
+                    let _ = std::fs::remove_file(&lock);
+                    removed += 1;
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+    // Sweep stale Weston runtime dirs + log files belonging to PIDs that
+    // are no longer alive. Cheap: stat /proc/<pid>.
+    if let Ok(entries) = std::fs::read_dir("/tmp") {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let pid_str = if let Some(rest) = name.strip_prefix("ghostframe-weston-") {
+                rest.split('-').next().or(Some(rest.trim_end_matches(".log")))
+            } else { None };
+            let Some(pid_str) = pid_str else { continue };
+            let Ok(pid) = pid_str.parse::<u32>() else { continue };
+            if Path::new(&format!("/proc/{pid}")).exists() {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                let _ = std::fs::remove_dir_all(&path);
+            } else {
+                let _ = std::fs::remove_file(&path);
+            }
+            removed += 1;
         }
     }
     if removed > 0 {
