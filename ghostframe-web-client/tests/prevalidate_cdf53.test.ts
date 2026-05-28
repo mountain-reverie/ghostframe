@@ -1,5 +1,14 @@
 import { describe, it, expect } from 'vitest';
 import { rleDecode } from '../src/prevalidate_cdf53.js';
+import {
+  prevalidateCdf53,
+  type PrevalidatedCdf53,
+} from '../src/prevalidate_cdf53.js';
+import {
+  ERR_CDF53_BAD_PASS,
+  ERR_CDF53_TRUNCATED,
+  ERR_CDF53_RLE_LENGTH,
+} from '../src/feedback.js';
 import fixture from '../../ghostframe-e2e/tests/fixtures/cdf53_fixture.json';
 
 describe('rleDecode', () => {
@@ -48,5 +57,51 @@ describe('rleDecode', () => {
         }
       }
     }
+  });
+});
+
+describe('prevalidateCdf53', () => {
+  it('happy-path roundtrip vs fixture', () => {
+    // For each of the 14 passes in the fixture, prevalidate and assert the
+    // packed [B][G][R] bit-planes match bit_planes_per_pass[pass].
+    for (let passIdx = 0; passIdx < fixture.pass_count; passIdx++) {
+      const payload = new Uint8Array(fixture.encoded_passes[passIdx]);
+      const r = prevalidateCdf53(payload, /*gen*/ 1, passIdx);
+      expect(r.ok).toBe(true);
+      if (!r.ok) return; // narrowing for TS
+      expect(r.entry.tileX).toBe(0); // caller-supplied; we don't pass it here, default 0
+      expect(r.entry.gen).toBe(1);
+      expect(r.entry.passIdx).toBe(passIdx);
+      expect(r.entry.bitPlanes.length).toBe(384);
+      for (let ch = 0; ch < 3; ch++) {
+        const expected = fixture.bit_planes_per_pass[passIdx][ch];
+        for (let i = 0; i < 128; i++) {
+          expect(r.entry.bitPlanes[ch * 128 + i]).toBe(expected[i]);
+        }
+      }
+    }
+  });
+
+  it('rejects pass_idx >= 14 with ERR_CDF53_BAD_PASS', () => {
+    const r = prevalidateCdf53(new Uint8Array([0, 1, 0xFF]), 0, 14);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.errorCode).toBe(ERR_CDF53_BAD_PASS);
+  });
+
+  it('rejects truncated section header with ERR_CDF53_TRUNCATED', () => {
+    // Only 1 byte — can't even read the first u16 length.
+    const r = prevalidateCdf53(new Uint8Array([0]), 0, 0);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.errorCode).toBe(ERR_CDF53_TRUNCATED);
+  });
+
+  it('rejects RLE that decodes to wrong byte count with ERR_CDF53_RLE_LENGTH', () => {
+    // One literal byte ⇒ decodes to 1 byte, not 128. Channel B only, then truncated.
+    const r = prevalidateCdf53(new Uint8Array([0, 1, 0x05]), 0, 0);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.errorCode).toBe(ERR_CDF53_RLE_LENGTH);
   });
 });
