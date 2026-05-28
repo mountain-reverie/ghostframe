@@ -1,4 +1,5 @@
 import type { PrevalidatedCdf53 } from '../prevalidate_cdf53.js';
+import integrateWgsl from './shaders/cdf53_integrate.wgsl?raw';
 
 /**
  * Per-tile persistent state for client-side Cdf53 decode.
@@ -29,13 +30,29 @@ export class Cdf53Pipeline {
   private maxTiles = 0;
   private framebufferView!: GPUTextureView;
 
-  constructor(private device: GPUDevice) {}
+  private integratePipeline!: GPUComputePipeline;
+  private integrateBindGroup!: GPUBindGroup;
+  private uniformsBuffer: GPUBuffer;
+
+  constructor(private device: GPUDevice) {
+    this.uniformsBuffer = device.createBuffer({
+      size: 16, // 1 u32 cols + padding to 16 B
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.integratePipeline = device.createComputePipeline({
+      layout: 'auto',
+      compute: {
+        module: device.createShaderModule({ code: integrateWgsl }),
+        entryPoint: 'main',
+      },
+    });
+  }
 
   /**
    * Allocate per-tile buffers for the given max-tile budget. Idempotent for
    * the same maxTiles; reallocates on growth.
    */
-  resize(maxTiles: number, framebufferView: GPUTextureView): void {
+  resize(maxTiles: number, framebufferView: GPUTextureView, frameCols: number): void {
     this.framebufferView = framebufferView;
     if (maxTiles === this.maxTiles) return;
     // Destroy old buffers if any.
@@ -78,6 +95,21 @@ export class Cdf53Pipeline {
       size: maxBatchEntries * 96 * 4,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
+    this.integrateBindGroup = this.device.createBindGroup({
+      layout: this.integratePipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.tileWorkBuffer } },
+        { binding: 1, resource: { buffer: this.bitPlanesBuffer } },
+        { binding: 2, resource: { buffer: this.coefficientBuffer } },
+        { binding: 3, resource: { buffer: this.signBuffer } },
+        { binding: 4, resource: { buffer: this.tileGenBuffer } },
+        { binding: 5, resource: { buffer: this.dirtyTilesBuffer } },
+        { binding: 6, resource: { buffer: this.dirtyTilesCount } },
+        { binding: 7, resource: { buffer: this.uniformsBuffer } },
+      ],
+    });
+    const colsBuf = new Uint32Array([frameCols, 0, 0, 0]);
+    this.device.queue.writeBuffer(this.uniformsBuffer, 0, colsBuf);
     this.maxTiles = maxTiles;
   }
 
@@ -106,8 +138,13 @@ export class Cdf53Pipeline {
   uploadBatch(_entries: readonly PrevalidatedCdf53[]): number {
     throw new Error('Cdf53Pipeline.uploadBatch — not yet implemented (Task 9)');
   }
-  encodeIntegrate(_encoder: GPUCommandEncoder, _batchSize: number): void {
-    throw new Error('Cdf53Pipeline.encodeIntegrate — not yet implemented (Task 7)');
+  encodeIntegrate(encoder: GPUCommandEncoder, batchSize: number): void {
+    if (batchSize === 0) return;
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.integratePipeline);
+    pass.setBindGroup(0, this.integrateBindGroup);
+    pass.dispatchWorkgroups(batchSize);
+    pass.end();
   }
   encodeInverse(_encoder: GPUCommandEncoder): void {
     throw new Error('Cdf53Pipeline.encodeInverse — not yet implemented (Task 10)');
