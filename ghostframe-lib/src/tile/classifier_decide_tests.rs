@@ -99,7 +99,7 @@ fn enters_h264_after_sustain_frames_via_cost_path_only() {
     let states = vec![
         CodecState::Cdf53 {
             passes_sent: 0,
-            max_passes: 9
+            max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
         };
         200
     ];

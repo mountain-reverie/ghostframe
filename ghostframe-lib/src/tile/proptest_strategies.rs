@@ -89,7 +89,7 @@ pub fn codec_state() -> impl Strategy<Value = CodecState> {
         Just(CodecState::Bc1),
         any::<u8>().prop_map(|p| CodecState::PalRle { palette_id: p }),
         Just(CodecState::Solid),
-        (any::<u8>(), 1u8..=9u8).prop_map(|(s, m)| {
+        (any::<u8>(), 1u8..=crate::encoder::cdf53::CDF53_PASS_COUNT as u8).prop_map(|(s, m)| {
             CodecState::Cdf53 {
                 passes_sent: s.min(m),
                 max_passes: m,
