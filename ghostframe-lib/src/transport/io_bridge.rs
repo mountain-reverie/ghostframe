@@ -1493,7 +1493,7 @@ impl IoBridge {
                                 .get_mut(tile_x as u32, tile_y as u32)
                                 .codec_state = crate::tile::CodecState::Cdf53 {
                                     passes_sent: 0,
-                                    max_passes: 9,
+                                    max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
                                 };
                         }
                     }

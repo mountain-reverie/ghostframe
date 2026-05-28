@@ -156,14 +156,15 @@ fn h264_tile_at_low_freq_falls_through_to_rules_6_to_8() {
 }
 
 #[test]
-fn cdf53_fallback_uses_max_passes_9() {
-    // §4.4 specifies 9 bit-planes; the fallback must encode that constant.
+fn cdf53_fallback_uses_cdf53_pass_count() {
+    // The fallback must use CDF53_PASS_COUNT (14) as max_passes, not a
+    // hardcoded 9, so that the full pass budget is visible to the scheduler.
     let m = metrics(2.0, 0.05, 0, super::super::UNIQUE_COLORS_UNKNOWN);
     assert_eq!(
         classify_tile(&m, &CodecState::Skip),
         CodecState::Cdf53 {
             passes_sent: 0,
-            max_passes: 9
+            max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
         },
     );
 }

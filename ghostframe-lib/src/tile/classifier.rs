@@ -164,7 +164,7 @@ pub fn classify_tile(metrics: &TileMetrics, prev: &CodecState) -> CodecState {
     // Rule 8: fallback ⇒ Cdf53 (lossy → refinement). M3.0 emission is Raw.
     CodecState::Cdf53 {
         passes_sent: 0,
-        max_passes: 9,
+        max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
     }
 }
 
