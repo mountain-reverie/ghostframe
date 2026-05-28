@@ -2347,3 +2347,71 @@ async fn e2e_cdf53_flag_off() -> Result<()> {
     );
     Ok(())
 }
+
+/// M3.3b anchor: with the env flag on and the client now decoding Cdf53,
+/// a `--gradient` pattern reaches lossless reconstruction after the full
+/// 14-pass build-up. We sample 16 pixels from the gradient region and
+/// assert the framebuffer matches the gradient formula within ±1 LSB.
+///
+/// The gradient pattern (see ghostframe-test-pattern/src/gradient.rs) is
+/// the deterministic diagonal RGB ramp `B = (x*3)&0xFF, G = (y*3)&0xFF,
+/// R = ((x+y)*2)&0xFF`. After 8s the H264 burst has handed off to
+/// TileCodec and every tile has received all 14 Cdf53 passes.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_cdf53_lossless_buildup() -> Result<()> {
+    let setup = setup_e2e_webgpu_gpu_with_env(
+        "--gradient --drm-direct",
+        &[("GHOSTFRAME_ENABLE_CDF53", "1")],
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    // 16 sample points spread across the framebuffer. The gradient formula
+    // is symmetric so picking arbitrary points still tests the lossless path.
+    let probe_js = r#"
+    (async () => {
+        const samples = [];
+        const pts = [
+          [40, 40], [200, 80], [400, 120], [600, 160],
+          [40, 200], [200, 240], [400, 280], [600, 320],
+          [40, 360], [200, 400], [400, 440], [600, 480],
+          [40, 520], [200, 560], [400, 600], [600, 640],
+        ];
+        for (const [x, y] of pts) {
+            const px = await window.__readPixel(x, y);
+            samples.push({ x, y, r: px[0], g: px[1], b: px[2] });
+        }
+        return samples;
+    })()
+    "#;
+    let samples: Vec<serde_json::Value> = setup
+        .page
+        .evaluate(probe_js)
+        .await?
+        .into_value()?;
+
+    let mut mismatches = Vec::new();
+    for s in &samples {
+        let x = s["x"].as_u64().unwrap() as u32;
+        let y = s["y"].as_u64().unwrap() as u32;
+        let exp_b = ((x.wrapping_mul(3)) & 0xFF) as i32;
+        let exp_g = ((y.wrapping_mul(3)) & 0xFF) as i32;
+        let exp_r = ((x.wrapping_add(y).wrapping_mul(2)) & 0xFF) as i32;
+        let got_r = s["r"].as_i64().unwrap() as i32;
+        let got_g = s["g"].as_i64().unwrap() as i32;
+        let got_b = s["b"].as_i64().unwrap() as i32;
+        let dr = (got_r - exp_r).abs();
+        let dg = (got_g - exp_g).abs();
+        let db = (got_b - exp_b).abs();
+        if dr > 1 || dg > 1 || db > 1 {
+            mismatches.push(format!(
+                "({x},{y}) expected ({exp_r},{exp_g},{exp_b}) got ({got_r},{got_g},{got_b}) Δ=({dr},{dg},{db})"
+            ));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "Cdf53 lossless mismatches: {mismatches:#?}"
+    );
+    Ok(())
+}
