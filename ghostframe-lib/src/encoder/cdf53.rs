@@ -409,6 +409,102 @@ mod tests {
 }
 
 #[cfg(test)]
+mod fixture {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// Regenerate `ghostframe-e2e/tests/fixtures/cdf53_fixture.json` from
+    /// a deterministic seed. Cross-language ground truth — read by TS
+    /// vitest (`prevalidate_cdf53.test.ts`) and WGSL e2e correctness
+    /// tests. Gated `#[ignore]` so a normal `cargo test` doesn't rewrite
+    /// the committed file; run explicitly via:
+    ///
+    ///   cargo test -p ghostframe-lib fixture::write_reference_fixture \
+    ///     -- --ignored --nocapture
+    #[test]
+    #[ignore = "fixture writer — run explicitly when the codec changes"]
+    fn write_reference_fixture() {
+        let pixels = super::tests::make_test_tile(0xCDF5_3B);
+        let coefficients = forward(&pixels);
+        let passes = encode_passes(&coefficients);
+
+        // Pre-RLE bit-planes per pass per channel — what the client's
+        // GPU integrate shader sees after CPU rleDecode.
+        let mut bit_planes_per_pass: Vec<Vec<Vec<u8>>> = Vec::with_capacity(CDF53_PASS_COUNT);
+        for pass_idx in 0..CDF53_PASS_COUNT {
+            let mut per_channel: Vec<Vec<u8>> = Vec::with_capacity(CDF53_CHANNELS);
+            for ch in 0..CDF53_CHANNELS {
+                let off = ch * CDF53_COEFFS_PER_CHANNEL;
+                let channel = &coefficients[off..off + CDF53_COEFFS_PER_CHANNEL];
+                per_channel.push(extract_bit_plane(channel, pass_idx));
+            }
+            bit_planes_per_pass.push(per_channel);
+        }
+
+        let mut json = String::new();
+        json.push_str("{\n");
+        json.push_str(&format!("  \"seed\": \"0xCDF5_3B\",\n"));
+        json.push_str(&format!("  \"tile_size\": 32,\n"));
+        json.push_str(&format!("  \"channels\": 3,\n"));
+        json.push_str(&format!("  \"coefficients_per_channel\": {},\n", CDF53_COEFFS_PER_CHANNEL));
+        json.push_str(&format!("  \"pass_count\": {},\n", CDF53_PASS_COUNT));
+        // pixels (BGRA, 4096 bytes)
+        json.push_str("  \"pixels_bgra\": [");
+        for (i, b) in pixels.iter().enumerate() {
+            if i > 0 { json.push(','); }
+            json.push_str(&b.to_string());
+        }
+        json.push_str("],\n");
+        // expected_coefficients (3072 i16 values, decimal)
+        json.push_str("  \"expected_coefficients\": [");
+        for (i, c) in coefficients.iter().enumerate() {
+            if i > 0 { json.push(','); }
+            json.push_str(&c.to_string());
+        }
+        json.push_str("],\n");
+        // encoded_passes (14 entries, each is the raw RLE-encoded payload bytes)
+        json.push_str("  \"encoded_passes\": [\n");
+        for (i, pass) in passes.iter().enumerate() {
+            if i > 0 { json.push_str(",\n"); }
+            json.push_str("    [");
+            for (j, b) in pass.iter().enumerate() {
+                if j > 0 { json.push(','); }
+                json.push_str(&b.to_string());
+            }
+            json.push(']');
+        }
+        json.push_str("\n  ],\n");
+        // bit_planes_per_pass (14 passes × 3 channels × 128 bytes each, pre-RLE)
+        json.push_str("  \"bit_planes_per_pass\": [\n");
+        for (i, pass) in bit_planes_per_pass.iter().enumerate() {
+            if i > 0 { json.push_str(",\n"); }
+            json.push_str("    [\n");
+            for (j, ch) in pass.iter().enumerate() {
+                if j > 0 { json.push_str(",\n"); }
+                json.push_str("      [");
+                for (k, b) in ch.iter().enumerate() {
+                    if k > 0 { json.push(','); }
+                    json.push_str(&b.to_string());
+                }
+                json.push(']');
+            }
+            json.push_str("\n    ]");
+        }
+        json.push_str("\n  ]\n");
+        json.push_str("}\n");
+
+        // Resolve workspace root via CARGO_MANIFEST_DIR.
+        let path: PathBuf = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent().expect("workspace root")
+            .join("ghostframe-e2e/tests/fixtures/cdf53_fixture.json");
+        std::fs::create_dir_all(path.parent().unwrap())
+            .expect("create fixtures dir");
+        std::fs::write(&path, json).expect("write fixture");
+        eprintln!("wrote fixture: {}", path.display());
+    }
+}
+
+#[cfg(test)]
 mod tests_passes {
     use super::*;
 
