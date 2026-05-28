@@ -3,8 +3,10 @@ import { Framebuffer } from './framebuffer.js';
 import { SolidPipeline, type SolidTile } from './solid.js';
 import { H264Pipeline } from './h264.js';
 import { PalRlePipeline } from './palrle.js';
+import { Cdf53Pipeline } from './cdf53.js';
 import { PaletteShadow } from '../palette_shadow.js';
 import { prevalidatePalRle, PalRleVariant, type PalRleEntry } from '../prevalidate.js';
+import type { PrevalidatedCdf53 } from '../prevalidate_cdf53.js';
 
 export interface PalRleQueued {
   tileX: number;
@@ -23,11 +25,13 @@ export class WebGpuRenderer {
   solidPipeline: SolidPipeline;
   h264Pipeline: H264Pipeline;
   palrlePipeline: PalRlePipeline;
+  cdf53Pipeline: Cdf53Pipeline;
 
   palRleQueue: PalRleQueued[] = [];
   solidQueue: SolidTile[] = [];
   rawQueue: RawQueued[] = [];
   h264Queue: VideoFrame[] = [];
+  cdf53Queue: PrevalidatedCdf53[] = [];
 
   paletteShadow = new PaletteShadow();
   private errorsReadbackInFlight = false;
@@ -42,6 +46,7 @@ export class WebGpuRenderer {
     this.solidPipeline = new SolidPipeline(gpu.device);
     this.h264Pipeline = new H264Pipeline(gpu.device);
     this.palrlePipeline = new PalRlePipeline(gpu.device);
+    this.cdf53Pipeline = new Cdf53Pipeline(gpu.device);
   }
 
   static async create(canvas: HTMLCanvasElement): Promise<WebGpuRenderer> {
@@ -74,6 +79,8 @@ export class WebGpuRenderer {
     this.solidPipeline.updateCanvasSize(width, height);
     const maxTiles = Math.ceil(width / 32) * Math.ceil(height / 32);
     this.palrlePipeline.resize(maxTiles, this.framebuffer.view);
+    const cols = Math.ceil(width / 32);
+    this.cdf53Pipeline.resize(maxTiles, this.framebuffer.view, cols);
   }
 
   /**
@@ -147,6 +154,7 @@ export class WebGpuRenderer {
     const zeros = new Uint8Array(16 * 1024);
     this.device.queue.writeBuffer(this.palrlePipeline.paletteAtlas, 0, zeros);
     this.paletteShadow.clear();
+    this.cdf53Pipeline.clearAllState();
   }
 
   /**
@@ -156,11 +164,11 @@ export class WebGpuRenderer {
    */
   encodeAndPresentFrame(
     onDecodeError: (codec: number, tileX: number, tileY: number, code: number) => void,
-  ): { palrle: number; solid: number; raw: number; h264: number } {
+  ): { palrle: number; solid: number; raw: number; h264: number; cdf53: number } {
     // Guard: if the framebuffer hasn't been sized yet (resize(w,h) with w,h>0 not
     // called), skip the GPU work — no texture targets are valid yet.
     if (!this.framebuffer.texture) {
-      return { palrle: 0, solid: 0, raw: 0, h264: 0 };
+      return { palrle: 0, solid: 0, raw: 0, h264: 0, cdf53: 0 };
     }
     // Expose framebuffer for test instrumentation (__readPixel / __readPixelRect).
     window.__ghostframeRenderer = { device: this.gpu.device, texture: this.framebuffer.texture };
@@ -201,6 +209,12 @@ export class WebGpuRenderer {
 
     // ---- Step 7: PalRle compute pass ----
     this.palrlePipeline.encodeDispatch(encoder, palRleCount);
+
+    // ---- Step 7.5: upload Cdf53 batch + integrate + inverse ----
+    const cdf53Count = this.cdf53Pipeline.uploadBatch(this.cdf53Queue);
+    this.cdf53Pipeline.encodeIntegrate(encoder, cdf53Count);
+    this.cdf53Pipeline.encodeInverse(encoder);
+    this.cdf53Queue.length = 0;
 
     // ---- Step 8: Solid + H264 render pass on framebuffer ----
     if (solidCount > 0 || this.h264Queue.length > 0) {
@@ -272,6 +286,6 @@ export class WebGpuRenderer {
     for (const f of this.videoFramesToClose) f.close();
     this.videoFramesToClose.length = 0;
 
-    return { palrle: palRleCount, solid: solidCount, raw: rawCount, h264: h264Count };
+    return { palrle: palRleCount, solid: solidCount, raw: rawCount, h264: h264Count, cdf53: cdf53Count };
   }
 }
