@@ -5,7 +5,8 @@
     "moduleResolution": "bundler",
     "strict": true,
     "lib": ["ES2022", "DOM", "DOM.AsyncIterable"],
-    "noEmit": true
+    "noEmit": true,
+    "resolveJsonModule": true
   },
   "include": ["src"]
 }
