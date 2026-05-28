@@ -56,7 +56,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>,
   }
   workgroupBarrier();
 
-  // 2. Conditional clear (gen bumped).
+  // 2. Conditional clear (gen bumped). Barrier is outside the if to keep it
+  // in uniform control flow — WGSL requires that. The barrier is a no-op
+  // when we didn't clear, but the cost is negligible.
   if (should_clear != 0u) {
     // coefficientBuffer: 1536 u32 per tile.
     for (var i: u32 = lid; i < 1536u; i = i + 64u) {
@@ -66,8 +68,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>,
     for (var i: u32 = lid; i < 96u; i = i + 64u) {
       atomicStore(&signBuffer[tile_idx * 96u + i], 0u);
     }
-    workgroupBarrier();
   }
+  workgroupBarrier();
 
   // 3. Bit-plane integration.
   for (var ch: u32 = 0u; ch < 3u; ch = ch + 1u) {

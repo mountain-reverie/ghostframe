@@ -8,17 +8,10 @@
 // Four workgroups per dirty tile (one per 16×16 quadrant of the 32×32 tile),
 // @workgroup_size(16, 16, 1) = 256 invocations.
 
-struct Uniforms {
-  cols: u32,
-  _pad: vec3<u32>,
-};
-
 @group(0) @binding(0) var<storage, read> coefficientBuffer: array<u32>;
 @group(0) @binding(1) var<storage, read> signBuffer: array<u32>;
 @group(0) @binding(2) var<storage, read> dirtyTiles: array<u32>;
 @group(0) @binding(3) var<storage, read_write> workArea: array<i32>;
-@group(0) @binding(4) var framebuffer: texture_storage_2d<rgba8unorm, write>;
-@group(0) @binding(5) var<uniform> uniforms: Uniforms;
 
 fn unpack_i16(word: u32, lane: u32) -> i32 {
   let raw = (word >> (lane * 16u)) & 0xFFFFu;

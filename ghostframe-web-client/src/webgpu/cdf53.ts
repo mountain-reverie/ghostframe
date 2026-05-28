@@ -50,7 +50,7 @@ export class Cdf53Pipeline {
 
   constructor(private device: GPUDevice) {
     this.uniformsBuffer = device.createBuffer({
-      size: 16, // 1 u32 cols + padding to 16 B
+      size: 32, // Uniforms { cols: u32, _pad: vec3<u32> } — vec3 alignment forces stride 32.
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
     this.integratePipeline = device.createComputePipeline({
@@ -171,8 +171,6 @@ export class Cdf53Pipeline {
         { binding: 1, resource: { buffer: this.signBuffer } },
         { binding: 2, resource: { buffer: this.dirtyTilesBuffer } },
         { binding: 3, resource: { buffer: this.workAreaBuffer } },
-        { binding: 4, resource: framebufferView },
-        { binding: 5, resource: { buffer: this.uniformsBuffer } },
       ],
     });
     this.inverseL1Pass2BindGroup = this.device.createBindGroup({
