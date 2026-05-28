@@ -12,6 +12,7 @@ import { LossTracker, encodeHello } from './feedback';
 import { DecodeErrorBatcher } from './decode_error_batcher';
 import { AckBatcher } from './ack';
 import { initDiagnostics } from './diagnostics.js';
+import { prevalidateCdf53 } from './prevalidate_cdf53.js';
 
 const statusEl = document.getElementById('status')!;
 const logEl = document.getElementById('log')!;
@@ -278,6 +279,21 @@ async function main() {
       }
     } else if (asm.header.codec === Codec.PalRle) {
       renderer.palRleQueue.push({ tileX: tX, tileY: tY, payload });
+    } else if (asm.header.codec === Codec.Cdf53) {
+      const r = prevalidateCdf53(payload, asm.header.generation, asm.header.pass);
+      if (!r.ok) {
+        decodeErrorBatcher.report({
+          codec: Codec.Cdf53,
+          tileX: tX,
+          tileY: tY,
+          errorCode: r.errorCode,
+        });
+      } else {
+        // Caller-fills tileX/tileY (prevalidate left them at 0).
+        r.entry.tileX = tX;
+        r.entry.tileY = tY;
+        renderer.cdf53Queue.push(r.entry);
+      }
     }
 
     if (!firstTileRendered) {
