@@ -10,7 +10,7 @@
 
 @group(0) @binding(0) var<storage, read> coefficientBuffer: array<u32>;
 @group(0) @binding(1) var<storage, read> signBuffer: array<u32>;
-@group(0) @binding(2) var<storage, read> dirtyTiles: array<u32>;
+@group(0) @binding(2) var<storage, read> tileGen: array<u32>;
 @group(0) @binding(3) var<storage, read_write> workArea: array<i32>;
 
 fn unpack_i16(word: u32, lane: u32) -> i32 {
@@ -31,7 +31,8 @@ fn workarea_idx(tile_idx: u32, ch: u32, y: u32, x: u32) -> u32 {
 @compute @workgroup_size(16, 16, 1)
 fn main(@builtin(workgroup_id) wg: vec3<u32>,
         @builtin(local_invocation_id) lid: vec3<u32>) {
-  let tile_idx = dirtyTiles[wg.x];
+  let tile_idx = wg.x;
+  if (tileGen[tile_idx] == 0u) { return; }
 
   // Channel layout (per cdf53.rs):
   //   HL2 8×8 → ch*1024 + [64..128)

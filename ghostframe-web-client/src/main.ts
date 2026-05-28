@@ -58,6 +58,51 @@ async function main() {
   }
   renderer.resize(0, 0);
 
+  // M3.3b diagnostic: test-only hook to drive Cdf53 inverse with hand-supplied
+  // coefficients (bypasses the integrate shader). Removed once the wavelet
+  // math is verified.
+  (window as any).__cdf53TestInverse = async (
+    coefficientsI16: number[],  // length 3072 (3 channels × 1024 i16 each)
+  ): Promise<number[]> => {
+    const pipe = renderer.cdf53Pipeline;
+    const device = renderer.device;
+
+    // Split signed i16 coefficients into magnitudes + signs.
+    // Pack two i16-magnitude per u32 in coefficientBuffer slot for tile 0.
+    // signBuffer: bit i set if coefficientsI16[i] < 0, packed as u32 words.
+    const coefU32 = new Uint32Array(1536); // 3 channels × 512 u32 = 1536 u32
+    const signU32 = new Uint32Array(96);   // 3 channels × 32 u32 = 96 u32
+    for (let ch = 0; ch < 3; ch++) {
+      for (let i = 0; i < 1024; i++) {
+        const c = coefficientsI16[ch * 1024 + i];
+        const mag = (c < 0 ? -c : c) & 0xFFFF;
+        const wordIdx = ch * 512 + (i >> 1);
+        if ((i & 1) === 0) {
+          coefU32[wordIdx] = (coefU32[wordIdx] & 0xFFFF0000) | mag;
+        } else {
+          coefU32[wordIdx] = (coefU32[wordIdx] & 0x0000FFFF) | (mag << 16);
+        }
+        if (c < 0) {
+          const signWordIdx = ch * 32 + (i >> 5);
+          signU32[signWordIdx] |= 1 << (i & 31);
+        }
+      }
+    }
+    // Write into tile 0 region of each buffer.
+    device.queue.writeBuffer(pipe.coefficientBuffer, 0, coefU32);
+    device.queue.writeBuffer(pipe.signBuffer, 0, signU32);
+    // Mark tile 0 as touched so the inverse early-return passes it through.
+    device.queue.writeBuffer(pipe.tileGenBuffer, 0, new Uint32Array([1]));
+
+    // Run just the inverse passes.
+    const encoder = device.createCommandEncoder();
+    pipe.encodeInverse(encoder);
+    device.queue.submit([encoder.finish()]);
+
+    // Read back tile (0,0) pixels via __readPixelRect.
+    return await (window as any).__readPixelRect(0, 0, 32, 32);
+  };
+
   // Wire all test/e2e diagnostic globals onto `window` via diagnostics.ts.
   // The getRenderer callback is called lazily (per __readPixel invocation)
   // so it always reflects the current framebuffer texture set by

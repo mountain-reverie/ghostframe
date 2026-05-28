@@ -10,7 +10,7 @@ struct Uniforms {
   _pad: vec3<u32>,
 };
 
-@group(0) @binding(0) var<storage, read> dirtyTiles: array<u32>;
+@group(0) @binding(0) var<storage, read> tileGen: array<u32>;
 @group(0) @binding(1) var<storage, read_write> workArea: array<i32>;
 @group(0) @binding(2) var framebuffer: texture_storage_2d<rgba8unorm, write>;
 @group(0) @binding(3) var<uniform> uniforms: Uniforms;
@@ -22,7 +22,8 @@ fn workarea_idx(tile_idx: u32, ch: u32, y: u32, x: u32) -> u32 {
 @compute @workgroup_size(32, 1, 1)
 fn main(@builtin(workgroup_id) wg: vec3<u32>,
         @builtin(local_invocation_index) lid: u32) {
-  let tile_idx = dirtyTiles[wg.x];
+  let tile_idx = wg.x;
+  if (tileGen[tile_idx] == 0u) { return; }
 
   // Inverse vertical pass — each invocation handles ONE column.
   for (var ch: u32 = 0u; ch < 3u; ch = ch + 1u) {

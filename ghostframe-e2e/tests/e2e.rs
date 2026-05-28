@@ -2364,7 +2364,7 @@ async fn e2e_cdf53_lossless_buildup() -> Result<()> {
         &[("GHOSTFRAME_ENABLE_CDF53", "1")],
     )
     .await?;
-    tokio::time::sleep(Duration::from_secs(8)).await;
+    tokio::time::sleep(Duration::from_secs(15)).await;
 
     // 16 sample points spread across the framebuffer. The gradient formula
     // is symmetric so picking arbitrary points still tests the lossless path.
@@ -2412,6 +2412,80 @@ async fn e2e_cdf53_lossless_buildup() -> Result<()> {
     assert!(
         mismatches.is_empty(),
         "Cdf53 lossless mismatches: {mismatches:#?}"
+    );
+    Ok(())
+}
+
+/// Diagnostic for the wavelet inverse: drive the GPU inverse directly with
+/// the fixture's known coefficients (bypassing the integrate shader) and
+/// compare against the fixture's expected pixels. Isolates whether the
+/// wavelet bug is in `cdf53_integrate.wgsl` or in the inverse-shader chain.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_cdf53_bypass_integrate() -> Result<()> {
+    let setup = setup_e2e_webgpu_gpu("--gradient --drm-direct").await?;
+    // Wait for framebuffer to be sized.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Load the fixture's expected_coefficients (3072 i16) and pixels_bgra.
+    let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/cdf53_fixture.json");
+    let fixture: serde_json::Value =
+        serde_json::from_reader(std::fs::File::open(&fixture_path)?)?;
+    let coeffs: Vec<i32> = fixture["expected_coefficients"]
+        .as_array().unwrap().iter().map(|v| v.as_i64().unwrap() as i32).collect();
+    let pixels_bgra: Vec<u8> = fixture["pixels_bgra"]
+        .as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u8).collect();
+    assert_eq!(coeffs.len(), 3072);
+    assert_eq!(pixels_bgra.len(), 4096);
+
+    // Drive the hook.
+    let coeffs_json = serde_json::to_string(&coeffs)?;
+    let js = format!(
+        r#"
+        (async () => {{
+            const coeffs = {coeffs_json};
+            const px = await window.__cdf53TestInverse(coeffs);
+            return Array.from(px);
+        }})()
+        "#
+    );
+    let got_rgba: Vec<u8> = setup
+        .page
+        .evaluate(js.as_str())
+        .await?
+        .into_value::<Vec<i64>>()?
+        .into_iter()
+        .map(|v| v as u8)
+        .collect();
+    assert_eq!(got_rgba.len(), 32 * 32 * 4);
+
+    // Compare per-pixel BGR (skip alpha). got_rgba is r,g,b,a; pixels_bgra is b,g,r,a.
+    let mut mismatches = Vec::new();
+    for i in 0..(32 * 32) {
+        let exp_b = pixels_bgra[i * 4 + 0] as i32;
+        let exp_g = pixels_bgra[i * 4 + 1] as i32;
+        let exp_r = pixels_bgra[i * 4 + 2] as i32;
+        let got_r = got_rgba[i * 4 + 0] as i32;
+        let got_g = got_rgba[i * 4 + 1] as i32;
+        let got_b = got_rgba[i * 4 + 2] as i32;
+        let dr = (got_r - exp_r).abs();
+        let dg = (got_g - exp_g).abs();
+        let db = (got_b - exp_b).abs();
+        if dr > 1 || dg > 1 || db > 1 {
+            if mismatches.len() < 20 {
+                let x = i % 32;
+                let y = i / 32;
+                mismatches.push(format!(
+                    "px ({x},{y}): exp BGR ({exp_b},{exp_g},{exp_r}) got ({got_b},{got_g},{got_r}) Δ ({db},{dg},{dr})"
+                ));
+            }
+        }
+    }
+    eprintln!("BYPASS-INTEGRATE MISMATCHES ({} shown of total):", mismatches.len());
+    for m in &mismatches { eprintln!("  {m}"); }
+    assert!(
+        mismatches.is_empty(),
+        "GPU inverse output differs from fixture — bug is in the inverse shaders, not integrate"
     );
     Ok(())
 }

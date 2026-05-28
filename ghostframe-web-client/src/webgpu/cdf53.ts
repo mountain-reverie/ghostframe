@@ -151,7 +151,7 @@ export class Cdf53Pipeline {
       entries: [
         { binding: 0, resource: { buffer: this.coefficientBuffer } },
         { binding: 1, resource: { buffer: this.signBuffer } },
-        { binding: 2, resource: { buffer: this.dirtyTilesBuffer } },
+        { binding: 2, resource: { buffer: this.tileGenBuffer } },  // was dirtyTilesBuffer
         { binding: 3, resource: { buffer: this.workAreaBuffer } },
       ],
     });
@@ -160,7 +160,7 @@ export class Cdf53Pipeline {
       entries: [
         { binding: 0, resource: { buffer: this.coefficientBuffer } },
         { binding: 1, resource: { buffer: this.signBuffer } },
-        { binding: 2, resource: { buffer: this.dirtyTilesBuffer } },
+        { binding: 2, resource: { buffer: this.tileGenBuffer } },  // was dirtyTilesBuffer
         { binding: 3, resource: { buffer: this.workAreaBuffer } },
       ],
     });
@@ -169,14 +169,14 @@ export class Cdf53Pipeline {
       entries: [
         { binding: 0, resource: { buffer: this.coefficientBuffer } },
         { binding: 1, resource: { buffer: this.signBuffer } },
-        { binding: 2, resource: { buffer: this.dirtyTilesBuffer } },
+        { binding: 2, resource: { buffer: this.tileGenBuffer } },  // was dirtyTilesBuffer
         { binding: 3, resource: { buffer: this.workAreaBuffer } },
       ],
     });
     this.inverseL1Pass2BindGroup = this.device.createBindGroup({
       layout: this.inverseL1Pass2Pipeline.getBindGroupLayout(0),
       entries: [
-        { binding: 0, resource: { buffer: this.dirtyTilesBuffer } },
+        { binding: 0, resource: { buffer: this.tileGenBuffer } },  // was dirtyTilesBuffer
         { binding: 1, resource: { buffer: this.workAreaBuffer } },
         { binding: 2, resource: framebufferView },
         { binding: 3, resource: { buffer: this.uniformsBuffer } },
@@ -244,10 +244,18 @@ export class Cdf53Pipeline {
     pass.dispatchWorkgroups(batchSize);
     pass.end();
   }
+  /**
+   * Encode the four-pass inverse compute chain.
+   *
+   * Always dispatches one workgroup per possible tile slot. Each inverse
+   * shader uses `wg.x` directly as `tile_idx` and early-returns when
+   * `tileGen[tile_idx] == 0` (tile has never received any integrate pass).
+   * This keeps the framebuffer fresh across rAF ticks even when no new
+   * passes arrive this frame — the coefficient state for previously-
+   * integrated tiles is still in `coefficientBuffer + signBuffer`, so
+   * re-running the inverse reproduces the same pixels.
+   */
   encodeInverse(encoder: GPUCommandEncoder): void {
-    // Three inverse passes (L3, L2, L1), then a final L1-pass2 that writes pixels.
-    // We dispatch at fixed maxTiles and let the shaders early-return on indices
-    // ≥ count.  (Wasted workgroups are bounded and cheap; profile if hot.)
     const wgCap = Math.max(this.maxTiles, 1);
     {
       const pass = encoder.beginComputePass();

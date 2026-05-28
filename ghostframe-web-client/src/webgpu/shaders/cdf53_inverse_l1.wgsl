@@ -10,7 +10,7 @@
 
 @group(0) @binding(0) var<storage, read> coefficientBuffer: array<u32>;
 @group(0) @binding(1) var<storage, read> signBuffer: array<u32>;
-@group(0) @binding(2) var<storage, read> dirtyTiles: array<u32>;
+@group(0) @binding(2) var<storage, read> tileGen: array<u32>;
 @group(0) @binding(3) var<storage, read_write> workArea: array<i32>;
 
 fn unpack_i16(word: u32, lane: u32) -> i32 {
@@ -33,7 +33,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>,
         @builtin(local_invocation_id) lid: vec3<u32>) {
   let tile_slot = wg.x / 4u;
   let quadrant = wg.x % 4u;
-  let tile_idx = dirtyTiles[tile_slot];
+  let tile_idx = tile_slot;
+  if (tileGen[tile_idx] == 0u) { return; }
 
   // Per-channel layout for L1 detail:
   //   HL1 16×16 → ch*1024 + [256..512)
