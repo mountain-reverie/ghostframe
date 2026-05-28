@@ -209,8 +209,34 @@ export class Cdf53Pipeline {
   }
 
   // ---- Stubs filled by later tasks ----
-  uploadBatch(_entries: readonly PrevalidatedCdf53[]): number {
-    throw new Error('Cdf53Pipeline.uploadBatch — not yet implemented (Task 9)');
+  uploadBatch(entries: readonly PrevalidatedCdf53[]): number {
+    if (entries.length === 0) return 0;
+    if (entries.length > this.maxTiles * 14) {
+      throw new Error(
+        `Cdf53 batch ${entries.length} exceeds capacity ${this.maxTiles * 14}`,
+      );
+    }
+    // tileWork: 5 u32 per entry — tileX, tileY, gen, passIdx, bitPlanesOffset.
+    const tileWork = new Uint32Array(entries.length * 5);
+    // bitPlanes: 96 u32 = 384 bytes per entry, concatenated.
+    const bitPlanes = new Uint8Array(entries.length * 384);
+    for (let i = 0; i < entries.length; i++) {
+      const e = entries[i];
+      tileWork[i * 5 + 0] = e.tileX;
+      tileWork[i * 5 + 1] = e.tileY;
+      tileWork[i * 5 + 2] = e.gen;
+      tileWork[i * 5 + 3] = e.passIdx;
+      tileWork[i * 5 + 4] = i * 96; // u32 offset = i * 96 u32 = i * 384 bytes
+      bitPlanes.set(e.bitPlanes, i * 384);
+    }
+    this.device.queue.writeBuffer(this.tileWorkBuffer, 0, tileWork);
+    this.device.queue.writeBuffer(this.bitPlanesBuffer, 0, bitPlanes);
+    // Reset per-batch atomic counter + the leading dirtyTilesBuffer region.
+    const countZero = new Uint32Array([0, 0, 0, 0]);
+    this.device.queue.writeBuffer(this.dirtyTilesCount, 0, countZero);
+    const dirtyZeros = new Uint32Array(Math.min(entries.length, this.maxTiles));
+    this.device.queue.writeBuffer(this.dirtyTilesBuffer, 0, dirtyZeros);
+    return entries.length;
   }
   encodeIntegrate(encoder: GPUCommandEncoder, batchSize: number): void {
     if (batchSize === 0) return;
