@@ -54,6 +54,8 @@ export class Cdf53Pipeline {
    */
   resize(maxTiles: number, framebufferView: GPUTextureView, frameCols: number): void {
     this.framebufferView = framebufferView;
+    const colsBuf = new Uint32Array([frameCols, 0, 0, 0]);
+    this.device.queue.writeBuffer(this.uniformsBuffer, 0, colsBuf);
     if (maxTiles === this.maxTiles) return;
     // Destroy old buffers if any.
     if (this.coefficientBuffer) this.coefficientBuffer.destroy();
@@ -108,8 +110,6 @@ export class Cdf53Pipeline {
         { binding: 7, resource: { buffer: this.uniformsBuffer } },
       ],
     });
-    const colsBuf = new Uint32Array([frameCols, 0, 0, 0]);
-    this.device.queue.writeBuffer(this.uniformsBuffer, 0, colsBuf);
     this.maxTiles = maxTiles;
   }
 
