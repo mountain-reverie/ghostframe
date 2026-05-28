@@ -1,5 +1,9 @@
 import type { PrevalidatedCdf53 } from '../prevalidate_cdf53.js';
 import integrateWgsl from './shaders/cdf53_integrate.wgsl?raw';
+import inverseL3Wgsl from './shaders/cdf53_inverse_l3.wgsl?raw';
+import inverseL2Wgsl from './shaders/cdf53_inverse_l2.wgsl?raw';
+import inverseL1Wgsl from './shaders/cdf53_inverse_l1.wgsl?raw';
+import inverseL1Pass2Wgsl from './shaders/cdf53_inverse_l1_pass2.wgsl?raw';
 
 /**
  * Per-tile persistent state for client-side Cdf53 decode.
@@ -26,6 +30,8 @@ export class Cdf53Pipeline {
   // Per-batch upload targets (sized to maxTiles × 14 worst case).
   tileWorkBuffer!: GPUBuffer;
   bitPlanesBuffer!: GPUBuffer;
+  // Inverse-transform scratch (3 channels × 32 × 32 × 4 bytes per tile).
+  workAreaBuffer!: GPUBuffer;
 
   private maxTiles = 0;
   private framebufferView!: GPUTextureView;
@@ -33,6 +39,14 @@ export class Cdf53Pipeline {
   private integratePipeline!: GPUComputePipeline;
   private integrateBindGroup!: GPUBindGroup;
   private uniformsBuffer: GPUBuffer;
+  private inverseL3Pipeline!: GPUComputePipeline;
+  private inverseL2Pipeline!: GPUComputePipeline;
+  private inverseL1Pipeline!: GPUComputePipeline;
+  private inverseL1Pass2Pipeline!: GPUComputePipeline;
+  private inverseL3BindGroup!: GPUBindGroup;
+  private inverseL2BindGroup!: GPUBindGroup;
+  private inverseL1BindGroup!: GPUBindGroup;
+  private inverseL1Pass2BindGroup!: GPUBindGroup;
 
   constructor(private device: GPUDevice) {
     this.uniformsBuffer = device.createBuffer({
@@ -45,6 +59,22 @@ export class Cdf53Pipeline {
         module: device.createShaderModule({ code: integrateWgsl }),
         entryPoint: 'main',
       },
+    });
+    this.inverseL3Pipeline = device.createComputePipeline({
+      layout: 'auto',
+      compute: { module: device.createShaderModule({ code: inverseL3Wgsl }), entryPoint: 'main' },
+    });
+    this.inverseL2Pipeline = device.createComputePipeline({
+      layout: 'auto',
+      compute: { module: device.createShaderModule({ code: inverseL2Wgsl }), entryPoint: 'main' },
+    });
+    this.inverseL1Pipeline = device.createComputePipeline({
+      layout: 'auto',
+      compute: { module: device.createShaderModule({ code: inverseL1Wgsl }), entryPoint: 'main' },
+    });
+    this.inverseL1Pass2Pipeline = device.createComputePipeline({
+      layout: 'auto',
+      compute: { module: device.createShaderModule({ code: inverseL1Pass2Wgsl }), entryPoint: 'main' },
     });
   }
 
@@ -65,6 +95,7 @@ export class Cdf53Pipeline {
     if (this.dirtyTilesCount) this.dirtyTilesCount.destroy();
     if (this.tileWorkBuffer) this.tileWorkBuffer.destroy();
     if (this.bitPlanesBuffer) this.bitPlanesBuffer.destroy();
+    if (this.workAreaBuffer) this.workAreaBuffer.destroy();
 
     this.coefficientBuffer = this.device.createBuffer({
       size: maxTiles * 6144,
@@ -97,6 +128,11 @@ export class Cdf53Pipeline {
       size: maxBatchEntries * 96 * 4,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
+    // 3 channels × 32 × 32 × 4 bytes per tile = 12 KB per tile.
+    this.workAreaBuffer = this.device.createBuffer({
+      size: maxTiles * 12288,
+      usage: GPUBufferUsage.STORAGE,
+    });
     this.integrateBindGroup = this.device.createBindGroup({
       layout: this.integratePipeline.getBindGroupLayout(0),
       entries: [
@@ -108,6 +144,44 @@ export class Cdf53Pipeline {
         { binding: 5, resource: { buffer: this.dirtyTilesBuffer } },
         { binding: 6, resource: { buffer: this.dirtyTilesCount } },
         { binding: 7, resource: { buffer: this.uniformsBuffer } },
+      ],
+    });
+    this.inverseL3BindGroup = this.device.createBindGroup({
+      layout: this.inverseL3Pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.coefficientBuffer } },
+        { binding: 1, resource: { buffer: this.signBuffer } },
+        { binding: 2, resource: { buffer: this.dirtyTilesBuffer } },
+        { binding: 3, resource: { buffer: this.workAreaBuffer } },
+      ],
+    });
+    this.inverseL2BindGroup = this.device.createBindGroup({
+      layout: this.inverseL2Pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.coefficientBuffer } },
+        { binding: 1, resource: { buffer: this.signBuffer } },
+        { binding: 2, resource: { buffer: this.dirtyTilesBuffer } },
+        { binding: 3, resource: { buffer: this.workAreaBuffer } },
+      ],
+    });
+    this.inverseL1BindGroup = this.device.createBindGroup({
+      layout: this.inverseL1Pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.coefficientBuffer } },
+        { binding: 1, resource: { buffer: this.signBuffer } },
+        { binding: 2, resource: { buffer: this.dirtyTilesBuffer } },
+        { binding: 3, resource: { buffer: this.workAreaBuffer } },
+        { binding: 4, resource: framebufferView },
+        { binding: 5, resource: { buffer: this.uniformsBuffer } },
+      ],
+    });
+    this.inverseL1Pass2BindGroup = this.device.createBindGroup({
+      layout: this.inverseL1Pass2Pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.dirtyTilesBuffer } },
+        { binding: 1, resource: { buffer: this.workAreaBuffer } },
+        { binding: 2, resource: framebufferView },
+        { binding: 3, resource: { buffer: this.uniformsBuffer } },
       ],
     });
     this.maxTiles = maxTiles;
@@ -146,7 +220,38 @@ export class Cdf53Pipeline {
     pass.dispatchWorkgroups(batchSize);
     pass.end();
   }
-  encodeInverse(_encoder: GPUCommandEncoder): void {
-    throw new Error('Cdf53Pipeline.encodeInverse — not yet implemented (Task 10)');
+  encodeInverse(encoder: GPUCommandEncoder): void {
+    // Three inverse passes (L3, L2, L1), then a final L1-pass2 that writes pixels.
+    // We dispatch at fixed maxTiles and let the shaders early-return on indices
+    // ≥ count.  (Wasted workgroups are bounded and cheap; profile if hot.)
+    const wgCap = Math.max(this.maxTiles, 1);
+    {
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(this.inverseL3Pipeline);
+      pass.setBindGroup(0, this.inverseL3BindGroup);
+      pass.dispatchWorkgroups(wgCap);
+      pass.end();
+    }
+    {
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(this.inverseL2Pipeline);
+      pass.setBindGroup(0, this.inverseL2BindGroup);
+      pass.dispatchWorkgroups(wgCap);
+      pass.end();
+    }
+    {
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(this.inverseL1Pipeline);
+      pass.setBindGroup(0, this.inverseL1BindGroup);
+      pass.dispatchWorkgroups(wgCap * 4);
+      pass.end();
+    }
+    {
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(this.inverseL1Pass2Pipeline);
+      pass.setBindGroup(0, this.inverseL1Pass2BindGroup);
+      pass.dispatchWorkgroups(wgCap);
+      pass.end();
+    }
   }
 }
