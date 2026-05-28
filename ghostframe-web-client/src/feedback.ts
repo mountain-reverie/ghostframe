@@ -95,6 +95,11 @@ export const ERR_INDEX_OOB = 5;
 export const ERR_RLE_OVERSHOOT = 6;
 export const ERR_RLE_UNDERSHOOT = 7;
 
+// M3.3b: Cdf53 prevalidation error codes.
+export const ERR_CDF53_BAD_PASS = 8;       // pass_idx >= 14
+export const ERR_CDF53_TRUNCATED = 9;      // length field exceeds payload remaining
+export const ERR_CDF53_RLE_LENGTH = 10;    // decoded bit-plane != 128 bytes
+
 export interface DecodeErrorMsg {
   codec: number;
   tileX: number;
