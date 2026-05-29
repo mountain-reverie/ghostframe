@@ -157,6 +157,42 @@ async function main() {
     return { coefficients: coefArr, signs: signArr };
   };
 
+  // M3.3b diagnostic: dump per-tile GPU state (tileGen + coefficients + signs)
+  // for a single tile index. Used by e2e_cdf53_live_tile_state to inspect the
+  // live integrate path under real-world load.
+  (window as any).__cdf53DumpTileState = async (
+    tileIdx: number,
+  ): Promise<{ tileGen: number; coefficients: number[]; signs: number[] }> => {
+    const pipe = renderer.cdf53Pipeline;
+    const device = renderer.device;
+
+    const coefStaging = device.createBuffer({
+      size: 6144, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+    const signStaging = device.createBuffer({
+      size: 384, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+    const genStaging = device.createBuffer({
+      size: 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(pipe.coefficientBuffer, tileIdx * 6144, coefStaging, 0, 6144);
+    enc.copyBufferToBuffer(pipe.signBuffer, tileIdx * 384, signStaging, 0, 384);
+    enc.copyBufferToBuffer(pipe.tileGenBuffer, tileIdx * 4, genStaging, 0, 4);
+    device.queue.submit([enc.finish()]);
+
+    await coefStaging.mapAsync(GPUMapMode.READ);
+    await signStaging.mapAsync(GPUMapMode.READ);
+    await genStaging.mapAsync(GPUMapMode.READ);
+    const coefArr = Array.from(new Uint32Array(coefStaging.getMappedRange()));
+    const signArr = Array.from(new Uint32Array(signStaging.getMappedRange()));
+    const tileGen = new Uint32Array(genStaging.getMappedRange())[0];
+    coefStaging.unmap(); coefStaging.destroy();
+    signStaging.unmap(); signStaging.destroy();
+    genStaging.unmap(); genStaging.destroy();
+    return { tileGen, coefficients: coefArr, signs: signArr };
+  };
+
   // Wire all test/e2e diagnostic globals onto `window` via diagnostics.ts.
   // The getRenderer callback is called lazily (per __readPixel invocation)
   // so it always reflects the current framebuffer texture set by

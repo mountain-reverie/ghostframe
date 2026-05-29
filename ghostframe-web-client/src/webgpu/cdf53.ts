@@ -107,7 +107,7 @@ export class Cdf53Pipeline {
     });
     this.tileGenBuffer = this.device.createBuffer({
       size: maxTiles * 4,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
     });
     this.dirtyTilesBuffer = this.device.createBuffer({
       size: Math.max(maxTiles, 1) * 4,

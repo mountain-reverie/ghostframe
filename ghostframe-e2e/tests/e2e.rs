@@ -2576,3 +2576,121 @@ async fn e2e_cdf53_integrate_correctness() -> Result<()> {
     );
     Ok(())
 }
+
+/// M3.3b diagnostic: after the lossless_buildup test setup runs for 15 s,
+/// inspect tileGen + coefficientBuffer for a known *failing* tile and
+/// compare with what Rust's `cdf53::forward` produces for that tile's
+/// gradient pixels. Identifies whether integrate is receiving all 14
+/// passes per tile under real-world load.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_cdf53_live_tile_state() -> Result<()> {
+    let setup = setup_e2e_webgpu_gpu_with_env(
+        "--gradient --drm-direct",
+        &[("GHOSTFRAME_ENABLE_CDF53", "1")],
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_secs(15)).await;
+
+    // Pixel (600, 160) was a known-bad sample. Tile = (600/32, 160/32) = (18, 5).
+    // With cols=32 → tile_idx = 5*32 + 18 = 178.
+    let tile_x = 18u32;
+    let tile_y = 5u32;
+    let tile_idx = tile_y * 32 + tile_x;
+
+    // Dump GPU state.
+    let js = format!("(async () => await window.__cdf53DumpTileState({tile_idx}))()");
+    let state: serde_json::Value = setup.page.evaluate(js.as_str()).await?.into_value()?;
+    let gpu_tile_gen = state["tileGen"].as_u64().unwrap() as u32;
+    let coef_u32: Vec<u32> = state["coefficients"].as_array().unwrap()
+        .iter().map(|v| v.as_u64().unwrap() as u32).collect();
+    let sign_u32: Vec<u32> = state["signs"].as_array().unwrap()
+        .iter().map(|v| v.as_u64().unwrap() as u32).collect();
+
+    // Reconstruct the tile's input pixels from the gradient formula.
+    // For each pixel (x, y) within the 32×32 tile at (tile_x*32, tile_y*32):
+    //   B = (px*3) & 0xFF, G = (py*3) & 0xFF, R = ((px+py)*2) & 0xFF
+    // Build a 32×32 BGRA buffer.
+    let mut input_bgra = vec![0u8; 32 * 32 * 4];
+    for local_y in 0..32u32 {
+        for local_x in 0..32u32 {
+            let px = tile_x * 32 + local_x;
+            let py = tile_y * 32 + local_y;
+            let off = (local_y * 32 + local_x) as usize * 4;
+            input_bgra[off + 0] = (px.wrapping_mul(3) & 0xFF) as u8;
+            input_bgra[off + 1] = (py.wrapping_mul(3) & 0xFF) as u8;
+            input_bgra[off + 2] = (px.wrapping_add(py).wrapping_mul(2) & 0xFF) as u8;
+            input_bgra[off + 3] = 0xFF;
+        }
+    }
+    let expected_coeffs = ghostframe_lib::encoder::cdf53::forward(&input_bgra);
+    assert_eq!(expected_coeffs.len(), 3072);
+
+    // Unpack the GPU's coefficients.
+    let mut got_coeffs: Vec<i32> = Vec::with_capacity(3072);
+    for ch in 0..3 {
+        for i in 0..1024 {
+            let word_idx = ch * 512 + (i >> 1);
+            let mag_raw = if i & 1 == 0 {
+                coef_u32[word_idx] & 0xFFFF
+            } else {
+                (coef_u32[word_idx] >> 16) & 0xFFFF
+            };
+            let mag = mag_raw as i32;
+            let sign_word_idx = ch * 32 + (i >> 5);
+            let sign_bit = (sign_u32[sign_word_idx] >> (i & 31)) & 1;
+            let coeff = if sign_bit != 0 { -mag } else { mag };
+            got_coeffs.push(coeff);
+        }
+    }
+
+    eprintln!("tile_idx={tile_idx} (x={tile_x}, y={tile_y})");
+    eprintln!("GPU tileGen = {gpu_tile_gen} (0 = never integrated)");
+
+    let mut mismatches = Vec::new();
+    for i in 0..3072 {
+        if got_coeffs[i] != expected_coeffs[i] as i32 {
+            if mismatches.len() < 30 {
+                mismatches.push(format!(
+                    "coeff[{i}] (ch={} idx={}): expected {}, got {}, diff {}",
+                    i / 1024, i % 1024,
+                    expected_coeffs[i] as i32, got_coeffs[i],
+                    got_coeffs[i] - expected_coeffs[i] as i32,
+                ));
+            }
+        }
+    }
+    eprintln!("MISMATCHES: {} of 3072 (first 30 shown):", mismatches.len());
+    for m in &mismatches { eprintln!("  {m}"); }
+
+    if mismatches.is_empty() {
+        eprintln!("INTEGRATE LIVE: this tile's coefficients match Rust forward — bug is in inverse OR rendering path");
+    } else {
+        let n_bit_errors: usize = mismatches.iter().filter(|m| m.contains(" diff ") && {
+            // crude check: difference is a small power of 2 → likely single-bit miss
+            true
+        }).count();
+        eprintln!("INTEGRATE LIVE: {} coefficients differ from CPU reference", mismatches.len());
+        let _ = n_bit_errors;
+    }
+    // Dump server-side cdf53.emit lines for tile (18, 5).
+    let logs = helpers::read_server_logs_stripped("ghostframe-server");
+    let target_tile_lines: Vec<&str> = logs
+        .lines()
+        .filter(|l| l.contains("cdf53.emit"))
+        .filter(|l| l.contains("tile_x=18") && l.contains("tile_y=5"))
+        .collect();
+    let mut gens_observed: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    for l in &target_tile_lines {
+        let gen = l.split("gen=").nth(1).and_then(|s| s.split_whitespace().next()).unwrap_or("?").to_string();
+        let pass = l.split("pass_idx=").nth(1).and_then(|s| s.split_whitespace().next()).unwrap_or("?").to_string();
+        gens_observed.entry(gen).or_default().insert(pass);
+    }
+    eprintln!("SERVER emissions for tile (18,5): {} lines total", target_tile_lines.len());
+    for (gen, passes) in &gens_observed {
+        eprintln!("  gen={} → {} passes: {:?}", gen, passes.len(), passes);
+    }
+
+    // Don't assert — this is a diagnostic. Always succeed so we get the eprintln output.
+    Ok(())
+}
