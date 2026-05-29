@@ -2489,3 +2489,90 @@ async fn e2e_cdf53_bypass_integrate() -> Result<()> {
     );
     Ok(())
 }
+
+/// M3.3b diagnostic: drive the GPU `cdf53_integrate.wgsl` shader directly
+/// with the fixture's 14 RLE-encoded passes for tile 0 and compare the
+/// resulting `coefficientBuffer + signBuffer` against the fixture's
+/// `expected_coefficients`. Isolates whether the integrate shader (or
+/// `uploadBatch`'s packing) correctly accumulates bit-planes.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_cdf53_integrate_correctness() -> Result<()> {
+    let setup = setup_e2e_webgpu_gpu("--gradient --drm-direct").await?;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/cdf53_fixture.json");
+    let fixture: serde_json::Value =
+        serde_json::from_reader(std::fs::File::open(&fixture_path)?)?;
+    let encoded_passes: Vec<Vec<u8>> = fixture["encoded_passes"]
+        .as_array().unwrap().iter().map(|p| {
+            p.as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u8).collect()
+        }).collect();
+    let expected_coeffs: Vec<i32> = fixture["expected_coefficients"]
+        .as_array().unwrap().iter().map(|v| v.as_i64().unwrap() as i32).collect();
+    assert_eq!(encoded_passes.len(), 14);
+    assert_eq!(expected_coeffs.len(), 3072);
+
+    // Drive the hook with all 14 passes (each as a number[]).
+    let passes_js = serde_json::to_string(&encoded_passes
+        .iter().map(|p| p.iter().map(|b| *b as u64).collect::<Vec<_>>())
+        .collect::<Vec<_>>())?;
+    let js = format!(
+        r#"
+        (async () => {{
+            const passes = {passes_js};
+            const r = await window.__cdf53TestIntegrate(passes);
+            return r;
+        }})()
+        "#
+    );
+    let result: serde_json::Value = setup.page.evaluate(js.as_str()).await?.into_value()?;
+    let coef_u32: Vec<u32> = result["coefficients"].as_array().unwrap()
+        .iter().map(|v| v.as_u64().unwrap() as u32).collect();
+    let sign_u32: Vec<u32> = result["signs"].as_array().unwrap()
+        .iter().map(|v| v.as_u64().unwrap() as u32).collect();
+    assert_eq!(coef_u32.len(), 1536);
+    assert_eq!(sign_u32.len(), 96);
+
+    // Unpack u32 to signed i16: low 16 bits for even i, high 16 bits for odd i,
+    // then apply sign from signBuffer.
+    let mut got_coeffs: Vec<i32> = Vec::with_capacity(3072);
+    for ch in 0..3 {
+        for i in 0..1024 {
+            let word_idx = ch * 512 + (i >> 1);
+            let mag_raw = if i & 1 == 0 {
+                coef_u32[word_idx] & 0xFFFF
+            } else {
+                (coef_u32[word_idx] >> 16) & 0xFFFF
+            };
+            // Magnitudes are non-negative; bits 13..15 should stay zero in
+            // valid encoding. Don't sign-extend the i16 here — apply the
+            // sign explicitly from signBuffer.
+            let mag = mag_raw as i32;
+            let sign_word_idx = ch * 32 + (i >> 5);
+            let sign_bit = (sign_u32[sign_word_idx] >> (i & 31)) & 1;
+            let coeff = if sign_bit != 0 { -mag } else { mag };
+            got_coeffs.push(coeff);
+        }
+    }
+
+    // Compare against fixture.expected_coefficients (which are also i32 cast from i16).
+    let mut mismatches = Vec::new();
+    for i in 0..3072 {
+        if got_coeffs[i] != expected_coeffs[i] {
+            if mismatches.len() < 30 {
+                mismatches.push(format!(
+                    "coeff[{}] (ch={}, idx={}): expected {}, got {}",
+                    i, i / 1024, i % 1024, expected_coeffs[i], got_coeffs[i]
+                ));
+            }
+        }
+    }
+    eprintln!("INTEGRATE MISMATCHES: {} total, first 30 shown:", mismatches.len());
+    for m in &mismatches { eprintln!("  {m}"); }
+    assert!(
+        mismatches.is_empty(),
+        "GPU integrate output diverges from fixture.expected_coefficients (see eprintln above)"
+    );
+    Ok(())
+}

@@ -99,11 +99,11 @@ export class Cdf53Pipeline {
 
     this.coefficientBuffer = this.device.createBuffer({
       size: maxTiles * 6144,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
     });
     this.signBuffer = this.device.createBuffer({
       size: maxTiles * 384,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
     });
     this.tileGenBuffer = this.device.createBuffer({
       size: maxTiles * 4,

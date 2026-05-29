@@ -103,6 +103,60 @@ async function main() {
     return await (window as any).__readPixelRect(0, 0, 32, 32);
   };
 
+  // M3.3b diagnostic: test-only hook to drive the Cdf53 integrate shader
+  // directly with hand-supplied RLE-encoded passes for tile 0, then read back
+  // the resulting coefficientBuffer + signBuffer. Used to isolate whether the
+  // integrate shader (or uploadBatch packing) is correct independently of the
+  // wire path.
+  (window as any).__cdf53TestIntegrate = async (
+    encodedPasses: number[][],  // 14 entries, each is the raw RLE-encoded payload as a number[]
+  ): Promise<{ coefficients: number[]; signs: number[] }> => {
+    const pipe = renderer.cdf53Pipeline;
+    const device = renderer.device;
+
+    // Reset per-tile state for tile 0.
+    device.queue.writeBuffer(pipe.coefficientBuffer, 0, new Uint8Array(6144));  // 1536 u32 × 4 B
+    device.queue.writeBuffer(pipe.signBuffer, 0, new Uint8Array(384));          // 96 u32 × 4 B
+    device.queue.writeBuffer(pipe.tileGenBuffer, 0, new Uint32Array([0]));      // force gen-bump on first pass
+
+    // Build the batch from the 14 encoded passes (all for tile 0, gen=1).
+    const entries: Array<{ tileX: number; tileY: number; gen: number; passIdx: number; bitPlanes: Uint8Array }> = [];
+    for (let passIdx = 0; passIdx < encodedPasses.length; passIdx++) {
+      const payload = new Uint8Array(encodedPasses[passIdx]);
+      const r = prevalidateCdf53(payload, 1, passIdx);
+      if (!r.ok) throw new Error('prevalidate failed for pass ' + passIdx + ' err=' + r.errorCode);
+      r.entry.tileX = 0;
+      r.entry.tileY = 0;
+      entries.push(r.entry);
+    }
+
+    // Upload + integrate.
+    pipe.uploadBatch(entries);
+    const encoder = device.createCommandEncoder();
+    pipe.encodeIntegrate(encoder, entries.length);
+    device.queue.submit([encoder.finish()]);
+
+    // Read back coefficientBuffer[0..1536] and signBuffer[0..96] via staging.
+    const coefStaging = device.createBuffer({
+      size: 6144, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+    const signStaging = device.createBuffer({
+      size: 384, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+    const copyEnc = device.createCommandEncoder();
+    copyEnc.copyBufferToBuffer(pipe.coefficientBuffer, 0, coefStaging, 0, 6144);
+    copyEnc.copyBufferToBuffer(pipe.signBuffer, 0, signStaging, 0, 384);
+    device.queue.submit([copyEnc.finish()]);
+
+    await coefStaging.mapAsync(GPUMapMode.READ);
+    await signStaging.mapAsync(GPUMapMode.READ);
+    const coefArr = Array.from(new Uint32Array(coefStaging.getMappedRange()));
+    const signArr = Array.from(new Uint32Array(signStaging.getMappedRange()));
+    coefStaging.unmap(); coefStaging.destroy();
+    signStaging.unmap(); signStaging.destroy();
+    return { coefficients: coefArr, signs: signArr };
+  };
+
   // Wire all test/e2e diagnostic globals onto `window` via diagnostics.ts.
   // The getRenderer callback is called lazily (per __readPixel invocation)
   // so it always reflects the current framebuffer texture set by
