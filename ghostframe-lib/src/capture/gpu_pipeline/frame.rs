@@ -3414,8 +3414,19 @@ impl GpuFrameProcessor {
             0,
             push_bytes,
         );
-        self.device
-            .cmd_dispatch_indirect(cmd, self.cdf53_dispatch_args_buffer, 0);
+        // M3.3b diagnostic: GHOSTFRAME_CDF53_SKIP_L2_L3=1 skips this stage's
+        // dispatch (descriptor set is still bound). Leaves L1's LL1 output in
+        // place at coefficients[0..256] so the host-side diff can verify L1
+        // in isolation. Gated behind `cdf53-diag` feature so production builds
+        // skip the env-var check.
+        #[cfg(feature = "cdf53-diag")]
+        let skip_l2 = std::env::var("GHOSTFRAME_CDF53_SKIP_L2_L3").is_ok();
+        #[cfg(not(feature = "cdf53-diag"))]
+        let skip_l2 = false;
+        if !skip_l2 {
+            self.device
+                .cmd_dispatch_indirect(cmd, self.cdf53_dispatch_args_buffer, 0);
+        }
 
         Ok(guard)
     }
@@ -3499,8 +3510,20 @@ impl GpuFrameProcessor {
             0,
             push_bytes,
         );
-        self.device
-            .cmd_dispatch_indirect(cmd, self.cdf53_dispatch_args_buffer, 0);
+        // M3.3b diagnostic: GHOSTFRAME_CDF53_SKIP_L2_L3=1 or
+        // GHOSTFRAME_CDF53_SKIP_L3=1 skips this stage's dispatch (descriptor
+        // set is still bound). With SKIP_L3 only, L2's output is preserved at
+        // coefficients[0..256] (LL2 region) and the host can verify L2.
+        // Gated behind `cdf53-diag` feature so production skips env-var checks.
+        #[cfg(feature = "cdf53-diag")]
+        let skip_l3 = std::env::var("GHOSTFRAME_CDF53_SKIP_L2_L3").is_ok()
+            || std::env::var("GHOSTFRAME_CDF53_SKIP_L3").is_ok();
+        #[cfg(not(feature = "cdf53-diag"))]
+        let skip_l3 = false;
+        if !skip_l3 {
+            self.device
+                .cmd_dispatch_indirect(cmd, self.cdf53_dispatch_args_buffer, 0);
+        }
 
         Ok(guard)
     }

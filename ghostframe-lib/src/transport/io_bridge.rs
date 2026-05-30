@@ -1465,6 +1465,127 @@ impl IoBridge {
                             };
                             let coeffs_i16: Vec<i16> =
                                 coeffs_i32.iter().map(|&v| v as i16).collect();
+                            // M3.3b diagnostic: when GHOSTFRAME_CDF53_DIFF_TILE=X,Y is
+                            // set, log a one-shot side-by-side comparison of GPU vs
+                            // CPU `cdf53::forward(tile_bgra)` for that tile. Gated
+                            // behind the `cdf53-diag` cargo feature so production
+                            // builds skip the runtime env-var check entirely.
+                            #[cfg(feature = "cdf53-diag")]
+                            if let Ok(spec) = std::env::var("GHOSTFRAME_CDF53_DIFF_TILE") {
+                                if let Some((sx, sy)) = spec.split_once(',') {
+                                    if let (Ok(target_x), Ok(target_y)) =
+                                        (sx.trim().parse::<u32>(), sy.trim().parse::<u32>())
+                                    {
+                                        if tile_x as u32 == target_x && tile_y as u32 == target_y {
+                                            let tile_bgra = grid.extract_tile(
+                                                pixels,
+                                                frame.stride,
+                                                tile_x as u32,
+                                                tile_y as u32,
+                                            );
+                                            // Pick CPU reference based on which dispatches were skipped:
+                                            // SKIP_L2_L3 → L1-only; SKIP_L3 → L2-only; otherwise full.
+                                            let skip_l2_l3 = std::env::var(
+                                                "GHOSTFRAME_CDF53_SKIP_L2_L3",
+                                            )
+                                            .is_ok();
+                                            let skip_l3 = std::env::var("GHOSTFRAME_CDF53_SKIP_L3").is_ok();
+                                            let cpu_coeffs = if skip_l2_l3 {
+                                                crate::encoder::cdf53::forward_level1_only(&tile_bgra)
+                                            } else if skip_l3 {
+                                                crate::encoder::cdf53::forward_level2_only(&tile_bgra)
+                                            } else {
+                                                crate::encoder::cdf53::forward(&tile_bgra)
+                                            };
+                                            // B↔R swap hypothesis: build a fake tile where B and R are
+                                            // swapped in the BGRA buffer, then CPU-forward it. If the GPU
+                                            // result matches THIS, the shader's rgba8/bgra8 mismatch is
+                                            // swapping channel 0 (B) with channel 2 (R).
+                                            let mut tile_swapped = tile_bgra.clone();
+                                            for px in tile_swapped.chunks_exact_mut(4) {
+                                                px.swap(0, 2); // swap B and R bytes
+                                            }
+                                            let cpu_coeffs_swapped =
+                                                crate::encoder::cdf53::forward(&tile_swapped);
+                                            // Sample tile pixels (first 8 BGRA px).
+                                            let bgra_head: Vec<u8> = tile_bgra.iter().take(32).copied().collect();
+                                            tracing::info!(
+                                                target: "ghostframe::cdf53::diff",
+                                                tile_x = tile_x,
+                                                tile_y = tile_y,
+                                                "cdf53.diff.tile_bgra_head_32 = {:?}",
+                                                bgra_head
+                                            );
+                                            let mut n_diff_per_ch = [0usize; 3];
+                                            let mut n_match_swapped_per_ch = [0usize; 3];
+                                            let mut shown = 0usize;
+                                            for i in 0..crate::encoder::cdf53::CDF53_TOTAL_COEFFS {
+                                                let ch = i / 1024;
+                                                if coeffs_i16[i] != cpu_coeffs[i] {
+                                                    n_diff_per_ch[ch] += 1;
+                                                    if shown < 100 {
+                                                        tracing::info!(
+                                                            target: "ghostframe::cdf53::diff",
+                                                            tile_x = tile_x,
+                                                            tile_y = tile_y,
+                                                            "cdf53.diff coef[{i}] ch={} idx={} gpu={} cpu={} diff={} cpu_swap={}",
+                                                            ch,
+                                                            i % 1024,
+                                                            coeffs_i16[i],
+                                                            cpu_coeffs[i],
+                                                            coeffs_i16[i] as i32 - cpu_coeffs[i] as i32,
+                                                            cpu_coeffs_swapped[i],
+                                                        );
+                                                        shown += 1;
+                                                    }
+                                                }
+                                                if coeffs_i16[i] == cpu_coeffs_swapped[i] {
+                                                    n_match_swapped_per_ch[ch] += 1;
+                                                }
+                                            }
+                                            let n_diff = n_diff_per_ch.iter().sum::<usize>();
+                                            // Per-subband mismatches (channel 0 / B only — quickest signal).
+                                            // Subband ranges in per-channel layout:
+                                            //   [0..16] LL3, [16..32] HL3, [32..48] LH3, [48..64] HH3,
+                                            //   [64..128] HL2, [128..192] LH2, [192..256] HH2,
+                                            //   [256..512] HL1, [512..768] LH1, [768..1024] HH1.
+                                            // Per-channel per-subband breakdown. Subband boundaries
+                                            // are within each channel's 1024-coefficient block.
+                                            let mut sb_diff = [[0usize; 10]; 3];
+                                            let band_ranges = [
+                                                (0, 16), (16, 32), (32, 48), (48, 64),
+                                                (64, 128), (128, 192), (192, 256),
+                                                (256, 512), (512, 768), (768, 1024),
+                                            ];
+                                            for ch in 0..3 {
+                                                let base = ch * 1024;
+                                                for (b, (lo, hi)) in band_ranges.iter().enumerate() {
+                                                    for i in *lo..*hi {
+                                                        if coeffs_i16[base + i] != cpu_coeffs[base + i] {
+                                                            sb_diff[ch][b] += 1;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            tracing::info!(
+                                                target: "ghostframe::cdf53::diff",
+                                                tile_x = tile_x,
+                                                tile_y = tile_y,
+                                                "cdf53.diff.summary total_diffs={n_diff}/3072 per_ch_diff={:?} per_ch_match_swapped={:?}",
+                                                n_diff_per_ch,
+                                                n_match_swapped_per_ch,
+                                            );
+                                            tracing::info!(
+                                                target: "ghostframe::cdf53::diff",
+                                                tile_x = tile_x,
+                                                tile_y = tile_y,
+                                                "cdf53.diff.subbands (LL3 HL3 LH3 HH3 HL2 LH2 HH2 HL1 LH1 HH1): ch0={:?} ch1={:?} ch2={:?}",
+                                                sb_diff[0], sb_diff[1], sb_diff[2],
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                             let passes = crate::encoder::cdf53::encode_passes(&coeffs_i16);
                             let gen = self.scheduler.bump_generation(tile_x, tile_y);
                             // Diagnostic: one line per pass for the e2e log scan.

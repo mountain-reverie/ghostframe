@@ -44,30 +44,17 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>,
   let entry = tileWork[wg.x];
   let tile_idx = entry.tile_y * uniforms.cols + entry.tile_x;
 
-  // 1. Gen-bump detection.
+  // 1. Tile-gen store. The actual gen-change CLEAR is done by the host via
+  // device.queue.writeBuffer in Cdf53Pipeline.uploadBatch — that path is
+  // ordered before this compute pass's submit, so the buffer is guaranteed
+  // zero before any workgroup ORs bits. Doing the clear inside the shader
+  // had a cross-workgroup race (multiple WGs for the same tile in one
+  // batch would race their clear against each other's atomicOrs, losing
+  // bits — reproduced as sign-bit drops at HL2 cols 4/5 of ch=0).
+  // We still atomicStore tileGen here so the inverse shaders' early-exit
+  // gating sees the right value; idempotent across same-gen WGs.
   if (lid == 0u) {
-    let prev = atomicLoad(&tileGen[tile_idx]);
-    if (prev != entry.gen) {
-      atomicStore(&tileGen[tile_idx], entry.gen);
-      should_clear = 1u;
-    } else {
-      should_clear = 0u;
-    }
-  }
-  workgroupBarrier();
-
-  // 2. Conditional clear (gen bumped). Barrier is outside the if to keep it
-  // in uniform control flow — WGSL requires that. The barrier is a no-op
-  // when we didn't clear, but the cost is negligible.
-  if (should_clear != 0u) {
-    // coefficientBuffer: 1536 u32 per tile.
-    for (var i: u32 = lid; i < 1536u; i = i + 64u) {
-      atomicStore(&coefficientBuffer[tile_idx * 1536u + i], 0u);
-    }
-    // signBuffer: 96 u32 per tile.
-    for (var i: u32 = lid; i < 96u; i = i + 64u) {
-      atomicStore(&signBuffer[tile_idx * 96u + i], 0u);
-    }
+    atomicStore(&tileGen[tile_idx], entry.gen);
   }
   workgroupBarrier();
 

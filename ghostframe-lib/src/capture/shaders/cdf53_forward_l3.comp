@@ -52,41 +52,26 @@ void load_ll2(uint compact_slot, uint channel) {
 // Only invocation (local_x==0, local_y==row) performs the work.
 void row_lifting(uint row) {
     if (gl_LocalInvocationID.x == 0u && gl_LocalInvocationID.y == row) {
-        // Predict: x[2i+1] -= (x[2i] + x[2i+2]) >> 1
-        for (uint i = 1u; i < 8u; i += 2u) {
-            int left = scratch[row * 8u + (i - 1u)];
-            int right;
-            if (i + 1u < 8u) {
-                right = scratch[row * 8u + (i + 1u)];
-            } else {
-                right = scratch[row * 8u + (i - 1u)]; // mirror
-            }
-            scratch[row * 8u + i] -= (left + right) >> 1;
+        // Pull row into registers, lift in-place, write deinterleaved
+        // results back at the end (see L2 shader for rationale).
+        int buf[8];
+        for (uint i = 0u; i < 8u; i++) {
+            buf[i] = scratch[row * 8u + i];
         }
-        // Update: x[2i] += (x[2i-1] + x[2i+1] + 2) >> 2
+        for (uint i = 1u; i < 8u; i += 2u) {
+            int left = buf[i - 1u];
+            int right = (i + 1u < 8u) ? buf[i + 1u] : buf[i - 1u]; // mirror
+            buf[i] -= (left + right) >> 1;
+        }
         for (uint i = 0u; i < 8u; i += 2u) {
-            int left;
-            if (i == 0u) {
-                left = scratch[row * 8u + 1u]; // mirror
-            } else {
-                left = scratch[row * 8u + (i - 1u)];
-            }
-            int right;
-            if (i + 1u < 8u) {
-                right = scratch[row * 8u + (i + 1u)];
-            } else {
-                right = scratch[row * 8u + (i - 1u)]; // mirror
-            }
-            scratch[row * 8u + i] += (left + right + 2) >> 2;
+            int left = (i == 0u) ? buf[1] : buf[i - 1u];           // mirror
+            int right = (i + 1u < 8u) ? buf[i + 1u] : buf[i - 1u]; // mirror
+            buf[i] += (left + right + 2) >> 2;
         }
         // Deinterleave: [L0..L3 H0..H3]
-        int tmp[8];
         for (uint j = 0u; j < 4u; j++) {
-            tmp[j]     = scratch[row * 8u + 2u * j];
-            tmp[4u + j] = scratch[row * 8u + 2u * j + 1u];
-        }
-        for (uint j = 0u; j < 8u; j++) {
-            scratch[row * 8u + j] = tmp[j];
+            scratch[row * 8u + j]        = buf[2u * j];
+            scratch[row * 8u + (j + 4u)] = buf[2u * j + 1u];
         }
     }
     barrier();
@@ -96,41 +81,24 @@ void row_lifting(uint row) {
 // Only invocation (local_x==col, local_y==0) performs the work.
 void col_lifting(uint col) {
     if (gl_LocalInvocationID.y == 0u && gl_LocalInvocationID.x == col) {
-        // Predict
-        for (uint j = 1u; j < 8u; j += 2u) {
-            int up = scratch[(j - 1u) * 8u + col];
-            int down;
-            if (j + 1u < 8u) {
-                down = scratch[(j + 1u) * 8u + col];
-            } else {
-                down = scratch[(j - 1u) * 8u + col]; // mirror
-            }
-            scratch[j * 8u + col] -= (up + down) >> 1;
-        }
-        // Update
-        for (uint j = 0u; j < 8u; j += 2u) {
-            int up;
-            if (j == 0u) {
-                up = scratch[8u + col]; // mirror: x[-1] = x[1]
-            } else {
-                up = scratch[(j - 1u) * 8u + col];
-            }
-            int down;
-            if (j + 1u < 8u) {
-                down = scratch[(j + 1u) * 8u + col];
-            } else {
-                down = scratch[(j - 1u) * 8u + col]; // mirror
-            }
-            scratch[j * 8u + col] += (up + down + 2) >> 2;
-        }
-        // Deinterleave column
-        int tmp[8];
-        for (uint j = 0u; j < 4u; j++) {
-            tmp[j]     = scratch[(2u * j)       * 8u + col];
-            tmp[4u + j] = scratch[(2u * j + 1u) * 8u + col];
-        }
+        // Pull column into registers, lift, write deinterleaved back.
+        int buf[8];
         for (uint j = 0u; j < 8u; j++) {
-            scratch[j * 8u + col] = tmp[j];
+            buf[j] = scratch[j * 8u + col];
+        }
+        for (uint j = 1u; j < 8u; j += 2u) {
+            int up = buf[j - 1u];
+            int down = (j + 1u < 8u) ? buf[j + 1u] : buf[j - 1u]; // mirror
+            buf[j] -= (up + down) >> 1;
+        }
+        for (uint j = 0u; j < 8u; j += 2u) {
+            int up = (j == 0u) ? buf[1] : buf[j - 1u];           // mirror at start
+            int down = (j + 1u < 8u) ? buf[j + 1u] : buf[j - 1u]; // mirror
+            buf[j] += (up + down + 2) >> 2;
+        }
+        for (uint j = 0u; j < 4u; j++) {
+            scratch[j        * 8u + col] = buf[2u * j];
+            scratch[(j + 4u) * 8u + col] = buf[2u * j + 1u];
         }
     }
     barrier();

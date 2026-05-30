@@ -58,20 +58,33 @@ async function main() {
   }
   renderer.resize(0, 0);
 
+  // M3.3b diagnostic: a URL query param `cdf53watch=X,Y` activates the tile
+  // watcher BEFORE the datagram loop starts, so the initial cdf53 emission
+  // burst (most of the flow for a static gradient frame) is captured.
+  // Without this, set-watcher-via-hook misses the burst that happens between
+  // page load and the test's first evaluate.
+  const watchParam = url.searchParams.get('cdf53watch');
+  if (watchParam) {
+    const [wx, wy] = watchParam.split(',').map(s => Number(s.trim()));
+    if (Number.isFinite(wx) && Number.isFinite(wy)) {
+      renderer.cdf53Pipeline.setTileWatcher(wx, wy);
+      log(`Cdf53 tile watcher armed for (${wx},${wy})`);
+    }
+  }
+
   // M3.3b diagnostic: test-only hook to drive Cdf53 inverse with hand-supplied
   // coefficients (bypasses the integrate shader). Removed once the wavelet
   // math is verified.
   (window as any).__cdf53TestInverse = async (
     coefficientsI16: number[],  // length 3072 (3 channels × 1024 i16 each)
+    targetTileIdx: number = 0,  // optional, default tile 0 for backward compat
   ): Promise<number[]> => {
     const pipe = renderer.cdf53Pipeline;
     const device = renderer.device;
 
     // Split signed i16 coefficients into magnitudes + signs.
-    // Pack two i16-magnitude per u32 in coefficientBuffer slot for tile 0.
-    // signBuffer: bit i set if coefficientsI16[i] < 0, packed as u32 words.
-    const coefU32 = new Uint32Array(1536); // 3 channels × 512 u32 = 1536 u32
-    const signU32 = new Uint32Array(96);   // 3 channels × 32 u32 = 96 u32
+    const coefU32 = new Uint32Array(1536);
+    const signU32 = new Uint32Array(96);
     for (let ch = 0; ch < 3; ch++) {
       for (let i = 0; i < 1024; i++) {
         const c = coefficientsI16[ch * 1024 + i];
@@ -88,19 +101,21 @@ async function main() {
         }
       }
     }
-    // Write into tile 0 region of each buffer.
-    device.queue.writeBuffer(pipe.coefficientBuffer, 0, coefU32);
-    device.queue.writeBuffer(pipe.signBuffer, 0, signU32);
-    // Mark tile 0 as touched so the inverse early-return passes it through.
-    device.queue.writeBuffer(pipe.tileGenBuffer, 0, new Uint32Array([1]));
+    // Write into target tile region of each buffer.
+    device.queue.writeBuffer(pipe.coefficientBuffer, targetTileIdx * 6144, coefU32);
+    device.queue.writeBuffer(pipe.signBuffer, targetTileIdx * 384, signU32);
+    device.queue.writeBuffer(pipe.tileGenBuffer, targetTileIdx * 4, new Uint32Array([1]));
 
-    // Run just the inverse passes.
+    // Run inverse passes.
     const encoder = device.createCommandEncoder();
     pipe.encodeInverse(encoder);
     device.queue.submit([encoder.finish()]);
 
-    // Read back tile (0,0) pixels via __readPixelRect.
-    return await (window as any).__readPixelRect(0, 0, 32, 32);
+    // Read back the target tile's pixels via __readPixelRect.
+    const cols = Math.ceil(renderer.framebuffer.width / 32);
+    const tileX = targetTileIdx % cols;
+    const tileY = Math.floor(targetTileIdx / cols);
+    return await (window as any).__readPixelRect(tileX * 32, tileY * 32, 32, 32);
   };
 
   // M3.3b diagnostic: test-only hook to drive the Cdf53 integrate shader
@@ -191,6 +206,64 @@ async function main() {
     signStaging.unmap(); signStaging.destroy();
     genStaging.unmap(); genStaging.destroy();
     return { tileGen, coefficients: coefArr, signs: signArr };
+  };
+
+  // M3.3b diagnostic: per-tile JS-side upload watcher. Captures the bytes
+  // every uploadBatch hands off to the GPU for the watched (tileX, tileY),
+  // along with the (gen, passIdx) the renderer attributed to that entry.
+  // Used by `e2e_cdf53_tile_watcher` to verify the JS→GPU handoff is correct
+  // independent of the integrate shader's behavior.
+  (window as any).__cdf53SetTileWatcher = (tileX: number, tileY: number) => {
+    renderer.cdf53Pipeline.setTileWatcher(tileX, tileY);
+  };
+
+  // M3.3b queue-identity probe. Reports live state of renderer.cdf53Queue
+  // and the pipeline's totals, so we can confirm whether pushes and
+  // uploadBatch share the same array.
+  (window as any).__cdf53Probe = () => {
+    return {
+      cdf53QueueLengthNow: renderer.cdf53Queue.length,
+      uploadBatchCallsLifetime: renderer.cdf53Pipeline.uploadBatchCalls,
+      totalEntriesLifetime: renderer.cdf53Pipeline.totalEntries,
+      isQueueAnArray: Array.isArray(renderer.cdf53Queue),
+      pipelineCtorName: renderer.cdf53Pipeline.constructor.name,
+      // Spot-check: prove the same Cdf53Pipeline instance is bound through
+      // the renderer property accessor by storing a token and reading it back.
+      sameInstanceCheck: (() => {
+        (renderer.cdf53Pipeline as any).__token = 'probe-token-' + Date.now();
+        return (renderer.cdf53Pipeline as any).__token;
+      })(),
+      // Read the watcher state directly through renderer.cdf53Pipeline so we
+      // can tell if the watcher was reset somewhere after we set it.
+      tileWatcherXNow: (renderer.cdf53Pipeline as any).tileWatcherX,
+      tileWatcherYNow: (renderer.cdf53Pipeline as any).tileWatcherY,
+      uploadBatchWithWatcherNull: (renderer.cdf53Pipeline as any).uploadBatchWithWatcherNull,
+      uploadBatchWithWatcherSet: (renderer.cdf53Pipeline as any).uploadBatchWithWatcherSet,
+      entriesWhileWatcherNull: (renderer.cdf53Pipeline as any).entriesWhileWatcherNull,
+      entriesWhileWatcherSet: (renderer.cdf53Pipeline as any).entriesWhileWatcherSet,
+      seenTilesAddCalls: (renderer.cdf53Pipeline as any).seenTilesAddCalls,
+    };
+  };
+  (window as any).__cdf53GetTileWatcher = () => {
+    const pipe = renderer.cdf53Pipeline;
+    return {
+      captures: pipe.tileWatcherCaptures.map(c => ({
+        batchSize: c.batchSize,
+        entryIdx: c.entryIdx,
+        tileX: c.tileX,
+        tileY: c.tileY,
+        gen: c.gen,
+        passIdx: c.passIdx,
+        bitPlanesOffset: c.bitPlanesOffset,
+        bitPlanes: Array.from(c.bitPlanes),
+      })),
+      stats: {
+        uploadBatchCalls: pipe.uploadBatchCalls,
+        totalEntries: pipe.totalEntries,
+        distinctTilesSeen: pipe.seenTiles.size,
+        sampleTiles: Array.from(pipe.seenTiles).slice(0, 30),
+      },
+    };
   };
 
   // Wire all test/e2e diagnostic globals onto `window` via diagnostics.ts.
@@ -415,8 +488,13 @@ async function main() {
     } else if (asm.header.codec === Codec.PalRle) {
       renderer.palRleQueue.push({ tileX: tX, tileY: tY, payload });
     } else if (asm.header.codec === Codec.Cdf53) {
+      // M3.3b diagnostic counters: track every Cdf53 dispatch branch.
+      const w = window as any;
+      w.__cdf53DispatchSeen = (w.__cdf53DispatchSeen ?? 0) + 1;
       const r = prevalidateCdf53(payload, asm.header.generation, asm.header.pass);
       if (!r.ok) {
+        w.__cdf53PrevalidateFails = (w.__cdf53PrevalidateFails ?? 0) + 1;
+        w.__cdf53LastFailCode = r.errorCode;
         decodeErrorBatcher.report({
           codec: Codec.Cdf53,
           tileX: tX,
@@ -428,6 +506,7 @@ async function main() {
         r.entry.tileX = tX;
         r.entry.tileY = tY;
         renderer.cdf53Queue.push(r.entry);
+        w.__cdf53PushedToQueue = (w.__cdf53PushedToQueue ?? 0) + 1;
       }
     }
 

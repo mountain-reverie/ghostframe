@@ -35,6 +35,61 @@ export class Cdf53Pipeline {
 
   private maxTiles = 0;
   private framebufferView!: GPUTextureView;
+  // Per-tile last-seen gen, host-side. When a queue entry's gen differs from
+  // this, the host issues a writeBuffer that zeros that tile's coefficient
+  // and sign-buffer regions BEFORE the integrate dispatch. This replaces the
+  // intra-shader clear (which had a cross-workgroup race when multiple
+  // passes for the same tile shared a single batch).
+  private lastSeenGen: Uint32Array = new Uint32Array(0);
+  // Reusable zero buffers, sized at resize() to avoid per-clear allocation.
+  private coefZeroPerTile = new Uint8Array(0);
+  private signZeroPerTile = new Uint8Array(0);
+  private cols: number = 0;
+
+  // M3.3b diagnostic: per-tile capture. When (watcherX, watcherY) is set,
+  // every entry whose (tileX, tileY) matches gets snapshot-cloned into
+  // tileWatcherCaptures at uploadBatch time — i.e., the exact bytes the
+  // shader will OR-integrate. Separates JS-handoff correctness from
+  // downstream integrate-shader correctness.
+  private tileWatcherX: number | null = null;
+  private tileWatcherY: number | null = null;
+  tileWatcherCaptures: Array<{
+    batchSize: number;
+    entryIdx: number;
+    tileX: number;
+    tileY: number;
+    gen: number;
+    passIdx: number;
+    bitPlanesOffset: number;
+    bitPlanes: Uint8Array;
+  }> = [];
+  // Stats kept while a watcher is set. uploadBatchCalls counts every
+  // uploadBatch invocation (including zero-length ones); totalEntries is
+  // the sum of entries.length across them; seenTiles is the set of distinct
+  // (tileX, tileY) tuples observed, encoded as `${x},${y}` strings.
+  uploadBatchCalls = 0;
+  totalEntries = 0;
+  // Split: how many uploadBatch calls observed watcherX null vs set.
+  uploadBatchWithWatcherNull = 0;
+  uploadBatchWithWatcherSet = 0;
+  entriesWhileWatcherNull = 0;
+  entriesWhileWatcherSet = 0;
+  seenTilesAddCalls = 0;
+  seenTiles = new Set<string>();
+
+  setTileWatcher(tileX: number, tileY: number): void {
+    this.tileWatcherX = tileX;
+    this.tileWatcherY = tileY;
+    this.tileWatcherCaptures = [];
+    // Don't reset uploadBatchCalls/totalEntries — we want lifetime totals so
+    // we can see what happened BEFORE the watcher was set too.
+    this.seenTiles = new Set<string>();
+  }
+  clearTileWatcher(): void {
+    this.tileWatcherX = null;
+    this.tileWatcherY = null;
+    this.tileWatcherCaptures = [];
+  }
 
   private integratePipeline!: GPUComputePipeline;
   private integrateBindGroup!: GPUBindGroup;
@@ -86,7 +141,11 @@ export class Cdf53Pipeline {
     this.framebufferView = framebufferView;
     const colsBuf = new Uint32Array([frameCols, 0, 0, 0]);
     this.device.queue.writeBuffer(this.uniformsBuffer, 0, colsBuf);
+    this.cols = frameCols;
     if (maxTiles === this.maxTiles) return;
+    this.lastSeenGen = new Uint32Array(maxTiles);
+    this.coefZeroPerTile = new Uint8Array(6144);
+    this.signZeroPerTile = new Uint8Array(384);
     // Destroy old buffers if any.
     if (this.coefficientBuffer) this.coefficientBuffer.destroy();
     if (this.signBuffer) this.signBuffer.destroy();
@@ -194,6 +253,7 @@ export class Cdf53Pipeline {
     this.device.queue.writeBuffer(this.coefficientBuffer, 0, coefZeros);
     this.device.queue.writeBuffer(this.signBuffer, 0, signZeros);
     this.device.queue.writeBuffer(this.tileGenBuffer, 0, genZeros);
+    this.lastSeenGen.fill(0);
   }
 
   /** Returns the framebuffer view for binding by the L1 inverse shader. */
@@ -208,7 +268,24 @@ export class Cdf53Pipeline {
 
   // ---- Stubs filled by later tasks ----
   uploadBatch(entries: readonly PrevalidatedCdf53[]): number {
+    // M3.3b unconditional counters (not gated on watcher state). Used to
+    // determine whether `entries` is non-empty when uploadBatch is called.
+    this.uploadBatchCalls++;
+    this.totalEntries += entries.length;
+    if (this.tileWatcherX === null) {
+      this.uploadBatchWithWatcherNull++;
+      this.entriesWhileWatcherNull += entries.length;
+    } else {
+      this.uploadBatchWithWatcherSet++;
+      this.entriesWhileWatcherSet += entries.length;
+    }
     if (entries.length === 0) return 0;
+    if (this.tileWatcherX !== null) {
+      for (const e of entries) {
+        this.seenTilesAddCalls++;
+        this.seenTiles.add(`${e.tileX},${e.tileY}`);
+      }
+    }
     if (entries.length > this.maxTiles * 14) {
       throw new Error(
         `Cdf53 batch ${entries.length} exceeds capacity ${this.maxTiles * 14}`,
@@ -218,6 +295,22 @@ export class Cdf53Pipeline {
     const tileWork = new Uint32Array(entries.length * 5);
     // bitPlanes: 96 u32 = 384 bytes per entry, concatenated.
     const bitPlanes = new Uint8Array(entries.length * 384);
+    // Per-tile gen transitions: clear those tiles BEFORE the integrate pass
+    // sees them. writeBuffer is queued onto the device queue and ordered
+    // before any subsequent submit, so the integrate compute pass observes
+    // the zeroed state. Doing this avoids the cross-workgroup race the
+    // intra-shader clear had (HL2 cols 4/5 sign-bit loss for ch=0).
+    const clearedTiles = new Set<number>();
+    for (let i = 0; i < entries.length; i++) {
+      const e = entries[i];
+      const tileIdx = e.tileY * this.cols + e.tileX;
+      if (this.lastSeenGen[tileIdx] !== e.gen && !clearedTiles.has(tileIdx)) {
+        this.device.queue.writeBuffer(this.coefficientBuffer, tileIdx * 6144, this.coefZeroPerTile);
+        this.device.queue.writeBuffer(this.signBuffer, tileIdx * 384, this.signZeroPerTile);
+        this.lastSeenGen[tileIdx] = e.gen;
+        clearedTiles.add(tileIdx);
+      }
+    }
     for (let i = 0; i < entries.length; i++) {
       const e = entries[i];
       tileWork[i * 5 + 0] = e.tileX;
@@ -226,6 +319,22 @@ export class Cdf53Pipeline {
       tileWork[i * 5 + 3] = e.passIdx;
       tileWork[i * 5 + 4] = i * 96; // u32 offset = i * 96 u32 = i * 384 bytes
       bitPlanes.set(e.bitPlanes, i * 384);
+      if (
+        this.tileWatcherX !== null &&
+        e.tileX === this.tileWatcherX &&
+        e.tileY === this.tileWatcherY
+      ) {
+        this.tileWatcherCaptures.push({
+          batchSize: entries.length,
+          entryIdx: i,
+          tileX: e.tileX,
+          tileY: e.tileY,
+          gen: e.gen,
+          passIdx: e.passIdx,
+          bitPlanesOffset: i * 96,
+          bitPlanes: new Uint8Array(e.bitPlanes),
+        });
+      }
     }
     this.device.queue.writeBuffer(this.tileWorkBuffer, 0, tileWork);
     this.device.queue.writeBuffer(this.bitPlanesBuffer, 0, bitPlanes);

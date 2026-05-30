@@ -16,6 +16,13 @@ m3 = []
 # Exposes the deterministic loss-injection module outside of cfg(test).
 # Used by E2E integration tests that live in a separate crate.
 test-loss-injection = []
+# Cdf53 GPU-vs-CPU diagnostic instrumentation: GHOSTFRAME_CDF53_DIFF_TILE
+# one-shot diff log on the io_bridge encode path, GHOSTFRAME_CDF53_SKIP_L2_L3
+# / GHOSTFRAME_CDF53_SKIP_L3 env-var gates on the GPU forward pipeline, and
+# the CPU `forward_level1_only` / `forward_level2_only` reference helpers.
+# Off by default — production builds never pay the runtime env-var checks
+# or extra CPU forward overhead. Test-server Dockerfile flips this on.
+cdf53-diag = []
 
 [dependencies]
 quinn-proto = { workspace = true }

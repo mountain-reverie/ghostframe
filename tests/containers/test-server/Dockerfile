@@ -55,10 +55,12 @@ ENV CARGO_BUILD_JOBS=2
 ENV RUST_MIN_STACK=16777216
 # Enable the lib's `test-loss-injection` feature so e2e tests can drive
 # deterministic packet/ACK drops via GHOSTFRAME_{OUTBOUND,INBOUND}_LOSS_*
-# env vars. Production builds (separate Dockerfile or release pipeline)
-# do NOT enable this feature.
+# env vars. Also enable `cdf53-diag` so e2e tests can drive the GPU vs CPU
+# cdf53 forward diff log (GHOSTFRAME_CDF53_DIFF_TILE=X,Y) and the
+# GHOSTFRAME_CDF53_SKIP_L2_L3 / SKIP_L3 stage gates. Production builds
+# (separate Dockerfile or release pipeline) do NOT enable these features.
 RUN cargo build --release -p ghostframe-xdaemon -p ghostframe-test-pattern \
-    --features ghostframe-lib/test-loss-injection
+    --features ghostframe-lib/test-loss-injection,ghostframe-lib/cdf53-diag
 
 # Stage 2: Runtime image
 FROM ubuntu:24.04

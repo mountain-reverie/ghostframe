@@ -239,7 +239,17 @@ async fn setup_e2e_webgpu_gpu_with_env(
     test_pattern_args: &str,
     extra_env: &[(&str, &str)],
 ) -> Result<E2eSetup> {
-    setup_e2e_inner(test_pattern_args, extra_env, true, true).await
+    setup_e2e_inner_with_url_extra(test_pattern_args, extra_env, true, true, "").await
+}
+
+/// WebGPU + GPU + extra URL query-string suffix (e.g. "&cdf53watch=18,5").
+/// The suffix must start with `&` since base URL already has `?host=...`.
+async fn setup_e2e_webgpu_gpu_with_env_url(
+    test_pattern_args: &str,
+    extra_env: &[(&str, &str)],
+    url_query_extra: &str,
+) -> Result<E2eSetup> {
+    setup_e2e_inner_with_url_extra(test_pattern_args, extra_env, true, true, url_query_extra).await
 }
 
 async fn setup_e2e_inner(
@@ -247,6 +257,16 @@ async fn setup_e2e_inner(
     extra_env: &[(&str, &str)],
     gpu: bool,
     webgpu: bool,
+) -> Result<E2eSetup> {
+    setup_e2e_inner_with_url_extra(test_pattern_args, extra_env, gpu, webgpu, "").await
+}
+
+async fn setup_e2e_inner_with_url_extra(
+    test_pattern_args: &str,
+    extra_env: &[(&str, &str)],
+    gpu: bool,
+    webgpu: bool,
+    url_query_extra: &str,
 ) -> Result<E2eSetup> {
     helpers::cleanup_stale_xvfb_sockets();
     let hs_server_url = format!("http://{DOCKER_HOST_IP}:{HEADSCALE_HOST_PORT}");
@@ -381,11 +401,12 @@ async fn setup_e2e_inner(
     let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
     let page_url = format!(
-        "http://{}/index.html?host={}:{}&certHash={}",
+        "http://{}/index.html?host={}:{}&certHash={}{}",
         static_addr,
         forwarder.ip(),
         forwarder.port(),
         cert_hash,
+        url_query_extra,
     );
     println!("page_url: {page_url}");
     let page = browser.new_page(&page_url).await?;
@@ -2577,12 +2598,98 @@ async fn e2e_cdf53_integrate_correctness() -> Result<()> {
     Ok(())
 }
 
-/// M3.3b diagnostic: after the lossless_buildup test setup runs for 15 s,
-/// inspect tileGen + coefficientBuffer for a known *failing* tile and
-/// compare with what Rust's `cdf53::forward` produces for that tile's
-/// gradient pixels. Identifies whether integrate is receiving all 14
-/// passes per tile under real-world load.
+/// M3.3b diagnostic (#[ignore]'d; run on-demand with --ignored): dump GPU
+/// coefficient state for ALL tiles in column 18 (the original failing
+/// column in `e2e_cdf53_lossless_buildup`) and compare to CPU
+/// `forward(gradient_pixels)`. Kept in tree as a reusable diagnostic for
+/// any future "live integrate state diverges from CPU" regression.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "diagnostic-only: run on demand with --ignored"]
+async fn e2e_cdf53_live_tile_state_col18() -> Result<()> {
+    let setup = setup_e2e_webgpu_gpu_with_env(
+        "--gradient --drm-direct",
+        &[("GHOSTFRAME_ENABLE_CDF53", "1")],
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_secs(15)).await;
+    for tile_y in &[5u32, 10, 15, 20] {
+        let tile_x = 18u32;
+        let cols = 32u32;
+        let tile_idx = tile_y * cols + tile_x;
+        let js = format!("(async () => await window.__cdf53DumpTileState({tile_idx}))()");
+        let state: serde_json::Value = setup.page.evaluate(js.as_str()).await?.into_value()?;
+        let gpu_tile_gen = state["tileGen"].as_u64().unwrap() as u32;
+        let coef_u32: Vec<u32> = state["coefficients"].as_array().unwrap()
+            .iter().map(|v| v.as_u64().unwrap() as u32).collect();
+        let sign_u32: Vec<u32> = state["signs"].as_array().unwrap()
+            .iter().map(|v| v.as_u64().unwrap() as u32).collect();
+        let mut input_bgra = vec![0u8; 32 * 32 * 4];
+        for local_y in 0..32u32 {
+            for local_x in 0..32u32 {
+                let px = tile_x * 32 + local_x;
+                let py = tile_y * 32 + local_y;
+                let off = (local_y * 32 + local_x) as usize * 4;
+                input_bgra[off] = (px.wrapping_mul(3) & 0xFF) as u8;
+                input_bgra[off + 1] = (py.wrapping_mul(3) & 0xFF) as u8;
+                input_bgra[off + 2] = (px.wrapping_add(py).wrapping_mul(2) & 0xFF) as u8;
+                input_bgra[off + 3] = 0xFF;
+            }
+        }
+        let expected_coeffs = ghostframe_lib::encoder::cdf53::forward(&input_bgra);
+        let mut got_coeffs: Vec<i32> = Vec::with_capacity(3072);
+        for ch in 0..3 {
+            for i in 0..1024 {
+                let word_idx = ch * 512 + (i >> 1);
+                let mag_raw = if i & 1 == 0 {
+                    coef_u32[word_idx] & 0xFFFF
+                } else {
+                    (coef_u32[word_idx] >> 16) & 0xFFFF
+                };
+                let mag = mag_raw as i32;
+                let sign_word_idx = ch * 32 + (i >> 5);
+                let sign_bit = (sign_u32[sign_word_idx] >> (i & 31)) & 1;
+                got_coeffs.push(if sign_bit != 0 { -mag } else { mag });
+            }
+        }
+        let n_mismatch = (0..3072).filter(|&i| got_coeffs[i] != expected_coeffs[i] as i32).count();
+        eprintln!(
+            "tile (18, {tile_y}) idx={tile_idx} tileGen={gpu_tile_gen} mismatches={n_mismatch}/3072"
+        );
+        if n_mismatch > 0 && n_mismatch < 30 {
+            for i in 0..3072 {
+                if got_coeffs[i] != expected_coeffs[i] as i32 {
+                    let ch = i / 1024;
+                    let idx = i % 1024;
+                    let band = match idx {
+                        0..=15 => "LL3",
+                        16..=31 => "HL3",
+                        32..=47 => "LH3",
+                        48..=63 => "HH3",
+                        64..=127 => "HL2",
+                        128..=191 => "LH2",
+                        192..=255 => "HH2",
+                        256..=511 => "HL1",
+                        512..=767 => "LH1",
+                        _ => "HH1",
+                    };
+                    eprintln!(
+                        "  ch={} {band}[{}] gpu={} cpu={} diff={}",
+                        ch, idx, got_coeffs[i], expected_coeffs[i] as i32,
+                        got_coeffs[i] - expected_coeffs[i] as i32
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// M3.3b diagnostic (#[ignore]'d; run on-demand with --ignored): inspect
+/// tileGen + coefficientBuffer for tile (18,5) after a 15 s gradient run,
+/// compare with `cdf53::forward(gradient_pixels)`. Useful when investigating
+/// "live integrate state diverges from CPU forward" regressions.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "diagnostic-only: run on demand with --ignored"]
 async fn e2e_cdf53_live_tile_state() -> Result<()> {
     let setup = setup_e2e_webgpu_gpu_with_env(
         "--gradient --drm-direct",
@@ -2694,3 +2801,396 @@ async fn e2e_cdf53_live_tile_state() -> Result<()> {
     // Don't assert — this is a diagnostic. Always succeed so we get the eprintln output.
     Ok(())
 }
+
+/// M3.3b diagnostic: capture every (gen, passIdx, bitPlanes) bundle that
+/// `uploadBatch` hands to the GPU for tile (18, 5) over a 15 s gradient run,
+/// then compare each capture's bit-plane bytes against what `cdf53::forward`
+/// + `extract_bit_plane` produce for that tile's gradient pixels.
+///
+/// Outcomes:
+///   - All captured bit-planes match CPU reference → JS→GPU handoff is
+///     correct; the bug is in integrate-shader execution under live cross-
+///     frame load (hypotheses 1 or 3).
+///   - Any capture diverges → the bug is upstream of GPU: prevalidate,
+///     queue mutation, dispatch attribution (hypothesis 2 or 4).
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_cdf53_tile_watcher() -> Result<()> {
+    // Pass the watcher coordinate as a URL param so main.ts arms the watcher
+    // BEFORE the datagram loop starts. Setting it via window hook after setup
+    // returned was too late — the server front-loads the entire cdf53 burst
+    // in the first ~7 rAF ticks for a static gradient frame, so by the time
+    // the test's evaluate runs, the burst is already drained.
+    let setup = setup_e2e_webgpu_gpu_with_env_url(
+        "--gradient --drm-direct",
+        &[("GHOSTFRAME_ENABLE_CDF53", "1")],
+        "&cdf53watch=18,5",
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_secs(15)).await;
+
+    let raw: serde_json::Value = setup
+        .page
+        .evaluate("window.__cdf53GetTileWatcher()")
+        .await?
+        .into_value()?;
+    let stats = &raw["stats"];
+    eprintln!(
+        "STATS: uploadBatchCalls={}, totalEntries={}, distinctTilesSeen={}",
+        stats["uploadBatchCalls"], stats["totalEntries"], stats["distinctTilesSeen"]
+    );
+    eprintln!("SAMPLE TILES seen: {}", stats["sampleTiles"]);
+
+    // Cross-check: what codecs ARRIVED on the wire? If Codec::Cdf53 (6) is
+    // absent here, the server didn't emit cdf53 at all in this run — so
+    // zero uploadBatch entries is downstream of "server didn't send".
+    let codecs: Vec<u8> = setup
+        .page
+        .evaluate("window.__ghostframeRecordedCodecs || []")
+        .await?
+        .into_value()?;
+    let mut hist = std::collections::BTreeMap::new();
+    for c in &codecs { *hist.entry(*c).or_insert(0u32) += 1; }
+    eprintln!("WIRE CODEC HISTOGRAM (last N tiles recorded): {:?}", hist);
+
+    // What codecs arrived for tile (18,5) specifically? FIFO holds last
+    // 4096 tile events — if (18,5)'s 14 cdf53 emissions are in there, plus
+    // any other codecs that hit the same tile, we'll see them here.
+    let tile_codecs: serde_json::Value = setup
+        .page
+        .evaluate(
+            r#"
+            (() => {
+                const tiles = window.__ghostframeRecordedTiles || [];
+                const for_18_5 = tiles.filter(t => t.tileX === 18 && t.tileY === 5);
+                const codec_hist = {};
+                for (const t of for_18_5) {
+                    codec_hist[t.codec] = (codec_hist[t.codec] || 0) + 1;
+                }
+                return { count: for_18_5.length, codec_hist, first: for_18_5.slice(0, 3), last: for_18_5.slice(-3) };
+            })()
+            "#,
+        )
+        .await?
+        .into_value()?;
+    eprintln!("TILE (18,5) RECEIVED EVENTS: {:?}", tile_codecs);
+
+    // Dispatch-branch counters: how many cdf53 dispatches passed prevalidate
+    // vs failed?
+    let dispatch_stats: serde_json::Value = setup
+        .page
+        .evaluate(
+            r#"({
+                seen: window.__cdf53DispatchSeen ?? 0,
+                prevalidateFails: window.__cdf53PrevalidateFails ?? 0,
+                pushedToQueue: window.__cdf53PushedToQueue ?? 0,
+                lastFailCode: window.__cdf53LastFailCode ?? null,
+            })"#,
+        )
+        .await?
+        .into_value()?;
+    eprintln!("DISPATCH BRANCH: {:?}", dispatch_stats);
+
+    // Sanity: is the renderer's cdf53Queue actually receiving pushes? Read its
+    // current length and the pipeline's lifetime totals.
+    let live_state: serde_json::Value = setup
+        .page
+        .evaluate(
+            r#"({
+                cdf53QueueLengthNow: window.__ghostframeRenderer
+                    ? null  // window.__ghostframeRenderer doesn't expose the queue; use raw eval below
+                    : null,
+            })"#,
+        )
+        .await?
+        .into_value()?;
+    let _ = live_state;
+    // Probe directly via a hook we add below.
+    let probe: serde_json::Value = setup
+        .page
+        .evaluate("window.__cdf53Probe ? window.__cdf53Probe() : null")
+        .await?
+        .into_value()?;
+    eprintln!("CDF53 PROBE: {:?}", probe);
+
+    // Also tally cdf53.emit lines server-side to detect classifier behavior.
+    let logs = helpers::read_server_logs_stripped("ghostframe-server");
+    let cdf53_emit_count = logs.lines().filter(|l| l.contains("cdf53.emit")).count();
+    let cdf53_18_5_count = logs
+        .lines()
+        .filter(|l| l.contains("cdf53.emit") && l.contains("tile_x=18") && l.contains("tile_y=5"))
+        .count();
+    eprintln!(
+        "SERVER cdf53.emit lines: total={}, for tile (18,5)={}",
+        cdf53_emit_count, cdf53_18_5_count
+    );
+    let captures = raw["captures"].as_array().expect("captures is array");
+    eprintln!("TILE WATCHER: {} captures for tile (18,5)", captures.len());
+
+    // Compute CPU reference coefficients for tile (18, 5) of the gradient pattern.
+    let tile_x = 18u32;
+    let tile_y = 5u32;
+    let mut input_bgra = vec![0u8; 32 * 32 * 4];
+    for local_y in 0..32u32 {
+        for local_x in 0..32u32 {
+            let px = tile_x * 32 + local_x;
+            let py = tile_y * 32 + local_y;
+            let off = (local_y * 32 + local_x) as usize * 4;
+            input_bgra[off] = (px.wrapping_mul(3) & 0xFF) as u8;
+            input_bgra[off + 1] = (py.wrapping_mul(3) & 0xFF) as u8;
+            input_bgra[off + 2] = (px.wrapping_add(py).wrapping_mul(2) & 0xFF) as u8;
+            input_bgra[off + 3] = 0xFF;
+        }
+    }
+    let expected_coeffs: Vec<i16> = ghostframe_lib::encoder::cdf53::forward(&input_bgra);
+    assert_eq!(expected_coeffs.len(), 3072);
+
+    // Local reproduction of `extract_bit_plane` from cdf53.rs (private fn).
+    // Returns 128 bytes: bit i ↔ coefficient i in this 1024-coefficient channel.
+    fn expected_bit_plane(channel: &[i16], pass_idx: usize) -> Vec<u8> {
+        let mut out = vec![0u8; 128];
+        for (i, &coeff) in channel.iter().enumerate() {
+            let bit: u8 = if pass_idx == 0 {
+                (coeff < 0) as u8
+            } else {
+                let bit_pos = 13 - pass_idx;
+                let mag = coeff.unsigned_abs() as u32;
+                ((mag >> bit_pos) & 1) as u8
+            };
+            if bit != 0 {
+                out[i / 8] |= 1 << (i % 8);
+            }
+        }
+        out
+    }
+
+    let mut total_mismatches = 0usize;
+    let mut shown = 0usize;
+    let mut counted_per_pass = [0u32; 14];
+    for c in captures {
+        let gen = c["gen"].as_u64().unwrap() as u32;
+        let pass_idx = c["passIdx"].as_u64().unwrap() as usize;
+        let batch_size = c["batchSize"].as_u64().unwrap() as u32;
+        let entry_idx = c["entryIdx"].as_u64().unwrap() as u32;
+        let cap_tile_x = c["tileX"].as_u64().unwrap() as u32;
+        let cap_tile_y = c["tileY"].as_u64().unwrap() as u32;
+        let bp_offset = c["bitPlanesOffset"].as_u64().unwrap() as u32;
+        let bp: Vec<u8> = c["bitPlanes"]
+            .as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u8).collect();
+        if bp.len() != 384 {
+            panic!("capture has wrong bit-plane size {}", bp.len());
+        }
+        if cap_tile_x != tile_x || cap_tile_y != tile_y {
+            panic!(
+                "capture tile coords mismatch: capture says ({cap_tile_x},{cap_tile_y}), watcher targeted ({tile_x},{tile_y})"
+            );
+        }
+        if pass_idx < 14 {
+            counted_per_pass[pass_idx] += 1;
+        }
+        // Build expected 384-byte bit-plane: ch=0 (B), ch=1 (G), ch=2 (R).
+        let mut expected = Vec::with_capacity(384);
+        for ch in 0..3 {
+            let channel = &expected_coeffs[ch * 1024..(ch + 1) * 1024];
+            expected.extend_from_slice(&expected_bit_plane(channel, pass_idx));
+        }
+        if bp != expected {
+            total_mismatches += 1;
+            if shown < 8 {
+                // Find first-diff byte and its bit-pattern.
+                let mut first_diff = None;
+                for i in 0..384 {
+                    if bp[i] != expected[i] {
+                        first_diff = Some((i, bp[i], expected[i]));
+                        break;
+                    }
+                }
+                eprintln!(
+                    "MISMATCH gen={} pass={} batch={} entry={} bp_offset={} first_diff={:?}",
+                    gen, pass_idx, batch_size, entry_idx, bp_offset, first_diff
+                );
+                shown += 1;
+            }
+        }
+    }
+    eprintln!(
+        "PASS-INDEX HISTOGRAM (captures per pass_idx 0..13): {:?}",
+        counted_per_pass
+    );
+    eprintln!(
+        "TOTAL CAPTURES = {}, MISMATCHES = {}",
+        captures.len(),
+        total_mismatches
+    );
+    assert!(
+        !captures.is_empty(),
+        "watcher captured no entries — server didn't emit cdf53 for tile (18,5) or the watcher hook ran too late"
+    );
+    assert_eq!(
+        captures.len(),
+        14,
+        "expected exactly 14 captured passes for tile (18,5) (one per pass_idx 0..13), got {}",
+        captures.len()
+    );
+    for (p, &n) in counted_per_pass.iter().enumerate() {
+        assert_eq!(n, 1, "expected exactly 1 capture for pass_idx {p}, got {n}");
+    }
+    assert_eq!(
+        total_mismatches, 0,
+        "JS→GPU bit-plane handoff diverges from CPU `extract_bit_plane(forward(gradient))` — \
+         server, wire, or prevalidate broke (see eprintln above)"
+    );
+    Ok(())
+}
+
+/// M3.3b diagnostic: feed `cdf53::forward(gradient_pixels_for_tile_18_5)` into
+/// the client's __cdf53TestInverse hook (which writes to tile 0's slot) and
+/// verify the reconstructed pixels match the gradient byte-exact within ±1
+/// LSB. Bypass-integrate test (e2e_cdf53_bypass_integrate) uses fixture
+/// data; this checks a different coefficient pattern (the gradient at
+/// tile (18,5)) to catch inverse-shader bugs that only manifest for
+/// specific data values.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_cdf53_inverse_gradient_tile() -> Result<()> {
+    let setup = setup_e2e_webgpu_gpu("--gradient --drm-direct").await?;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Compute gradient pixels for tile (18, 5).
+    let tile_x = 18u32;
+    let tile_y = 5u32;
+    let mut input_bgra = vec![0u8; 32 * 32 * 4];
+    for local_y in 0..32u32 {
+        for local_x in 0..32u32 {
+            let px = tile_x * 32 + local_x;
+            let py = tile_y * 32 + local_y;
+            let off = (local_y * 32 + local_x) as usize * 4;
+            input_bgra[off]     = (px.wrapping_mul(3) & 0xFF) as u8;
+            input_bgra[off + 1] = (py.wrapping_mul(3) & 0xFF) as u8;
+            input_bgra[off + 2] = (px.wrapping_add(py).wrapping_mul(2) & 0xFF) as u8;
+            input_bgra[off + 3] = 0xFF;
+        }
+    }
+    let coeffs = ghostframe_lib::encoder::cdf53::forward(&input_bgra);
+    assert_eq!(coeffs.len(), 3072);
+
+    // Drive the inverse hook and read back the canvas tile.
+    let coeffs_json = serde_json::to_string(
+        &coeffs.iter().map(|&v| v as i32).collect::<Vec<_>>(),
+    )?;
+    // Drive the inverse for the ACTUAL tile (18, 5) slot — not tile 0.
+    // tile_idx = tile_y * cols. cols depends on the live framebuffer width.
+    let js = format!(
+        r#"(async () => {{
+            const coeffs = {coeffs_json};
+            const cols = Math.ceil(window.__ghostframeRenderer.texture.width / 32);
+            const tile_idx = 5 * cols + 18;
+            const px = await window.__cdf53TestInverse(coeffs, tile_idx);
+            return Array.from(px);
+        }})()"#
+    );
+    let got_rgba: Vec<u8> = setup
+        .page
+        .evaluate(js.as_str())
+        .await?
+        .into_value::<Vec<i64>>()?
+        .into_iter()
+        .map(|v| v as u8)
+        .collect();
+    assert_eq!(got_rgba.len(), 32 * 32 * 4);
+
+    // Compare. got_rgba is RGBA. input_bgra is BGRA.
+    let mut mismatches = Vec::new();
+    for i in 0..(32 * 32) {
+        let exp_b = input_bgra[i * 4]     as i32;
+        let exp_g = input_bgra[i * 4 + 1] as i32;
+        let exp_r = input_bgra[i * 4 + 2] as i32;
+        let got_r = got_rgba[i * 4]     as i32;
+        let got_g = got_rgba[i * 4 + 1] as i32;
+        let got_b = got_rgba[i * 4 + 2] as i32;
+        let dr = (got_r - exp_r).abs();
+        let dg = (got_g - exp_g).abs();
+        let db = (got_b - exp_b).abs();
+        if dr > 1 || dg > 1 || db > 1 {
+            if mismatches.len() < 20 {
+                let lx = i % 32;
+                let ly = i / 32;
+                mismatches.push(format!(
+                    "local ({lx},{ly}): exp BGR=({exp_b},{exp_g},{exp_r}) got=({got_b},{got_g},{got_r}) Δ=({db},{dg},{dr})"
+                ));
+            }
+        }
+    }
+    eprintln!("INVERSE-GRADIENT MISMATCHES (shown of {} total):", mismatches.len());
+    for m in &mismatches { eprintln!("  {m}"); }
+    assert!(
+        mismatches.is_empty(),
+        "inverse-on-gradient-coefficients diverges from gradient pixels (see eprintln above)"
+    );
+    Ok(())
+}
+
+/// M3.3b diagnostic: drive a 5 s gradient stream with both
+/// `GHOSTFRAME_ENABLE_CDF53=1` and `GHOSTFRAME_CDF53_DIFF_TILE=18,5` set on
+/// the server so io_bridge.rs's one-shot diagnostic emits side-by-side
+/// GPU vs CPU `cdf53::forward(tile_bgra)` coefficients for tile (18,5).
+/// Reads server logs and prints the `cdf53.diff` lines.
+///
+/// Outcomes:
+///   - n_diff > 0  → server-side GPU CDF 5/3 produces different coefficients
+///                  than CPU reference (hypothesis H5).
+///   - n_diff == 0 → server is consistent with CPU; the upstream bug seen
+///                  client-side must be elsewhere (re-investigate H4).
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_cdf53_server_gpu_vs_cpu_diff() -> Result<()> {
+    // Per env-var: when GHOSTFRAME_CDF53_VERIFY_L1_ONLY=1 in the test process,
+    // also set GHOSTFRAME_CDF53_SKIP_L2_L3=1 on the server so L1's LL1 output
+    // stays in coefficients[0..256] and the diagnostic compares L1 to CPU L1
+    // instead of full forward to CPU forward.
+    let verify_l1_only = std::env::var("GHOSTFRAME_CDF53_VERIFY_L1_ONLY").is_ok();
+    let verify_l2_only = std::env::var("GHOSTFRAME_CDF53_VERIFY_L2_ONLY").is_ok();
+    let mut env: Vec<(&str, &str)> = vec![
+        ("GHOSTFRAME_ENABLE_CDF53", "1"),
+        ("GHOSTFRAME_CDF53_DIFF_TILE", "18,5"),
+    ];
+    if verify_l1_only {
+        env.push(("GHOSTFRAME_CDF53_SKIP_L2_L3", "1"));
+    } else if verify_l2_only {
+        env.push(("GHOSTFRAME_CDF53_SKIP_L3", "1"));
+    }
+    let _setup = setup_e2e_webgpu_gpu_with_env(
+        "--gradient --drm-direct",
+        &env,
+    )
+    .await?;
+    // 5s is plenty: gradient is static and the server emits cdf53 once per
+    // gen-bump; the one-shot diff log fires on the next cdf53 batch.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let logs = helpers::read_server_logs_stripped("ghostframe-server");
+    let diff_lines: Vec<&str> = logs
+        .lines()
+        .filter(|l| l.contains("cdf53.diff"))
+        .collect();
+    eprintln!("SERVER cdf53.diff lines: {} total", diff_lines.len());
+    for l in &diff_lines {
+        eprintln!("  {l}");
+    }
+    // Pull out the summary's total_diffs count and assert byte-exact.
+    let summary_line = diff_lines
+        .iter()
+        .find(|l| l.contains("cdf53.diff.summary"))
+        .ok_or_else(|| anyhow::anyhow!(
+            "no cdf53.diff.summary line in server logs — diagnostic feature off, or tile (18,5) never went through Cdf53"
+        ))?;
+    let n_diff: u32 = summary_line
+        .find("total_diffs=")
+        .and_then(|i| summary_line[i + "total_diffs=".len()..].split('/').next())
+        .and_then(|n| n.parse().ok())
+        .ok_or_else(|| anyhow::anyhow!("could not parse total_diffs from: {summary_line}"))?;
+    assert_eq!(
+        n_diff, 0,
+        "server GPU CDF 5/3 forward diverges from CPU `forward(gradient)` for tile (18,5): \
+         {n_diff}/3072 coefficient mismatches. See `cdf53.diff` lines above for details."
+    );
+    Ok(())
+}
+

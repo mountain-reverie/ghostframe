@@ -100,6 +100,130 @@ pub fn forward(tile_bgra: &[u8]) -> Vec<i16> {
     output
 }
 
+/// M3.3b diagnostic: CPU CDF 5/3 forward, **level 1 only**. Returns
+/// 3072 i16 coefficients in the same per-channel layout as `forward`, but
+/// with only the level-1 decomposition applied (i.e., LL1 occupies
+/// indices [0..256] per channel; HL1/LH1/HH1 at [256..512], [512..768],
+/// [768..1024]). Used by the GPU vs CPU diff diagnostic to verify L1's
+/// output in isolation when GHOSTFRAME_CDF53_SKIP_L2_L3 is set.
+#[cfg(feature = "cdf53-diag")]
+pub fn forward_level1_only(tile_bgra: &[u8]) -> Vec<i16> {
+    assert_eq!(tile_bgra.len(), 32 * 32 * 4, "tile must be 32×32 BGRA");
+    let mut output = vec![0i16; CDF53_TOTAL_COEFFS];
+
+    for ch in 0..CDF53_CHANNELS {
+        let mut work = [[0i32; 32]; 32];
+        for y in 0..32 {
+            for x in 0..32 {
+                let idx = (y * 32 + x) * 4 + ch;
+                work[y][x] = tile_bgra[idx] as i32;
+            }
+        }
+
+        // One level of 2D decomposition (level 1: 32×32 → 16×16 LL1).
+        for y in 0..32 {
+            row_forward(&mut work[y], 32);
+        }
+        for x in 0..32 {
+            let mut column = [0i32; 32];
+            for y in 0..32 {
+                column[y] = work[y][x];
+            }
+            col_forward(&mut column, 32);
+            for y in 0..32 {
+                work[y][x] = column[y];
+            }
+        }
+
+        // After level 1:
+        //   work[0..16][0..16] = LL1
+        //   work[0..16][16..32] = HL1
+        //   work[16..32][0..16] = LH1
+        //   work[16..32][16..32] = HH1
+        let channel_offset = ch * CDF53_COEFFS_PER_CHANNEL;
+        let mut out_idx = channel_offset;
+        // LL1 row-major 16x16 at [0..256]
+        for y in 0..16 { for x in 0..16 { output[out_idx] = work[y][x] as i16; out_idx += 1; } }
+        // HL1 row-major 16x16 at [256..512]
+        for y in 0..16 { for x in 16..32 { output[out_idx] = work[y][x] as i16; out_idx += 1; } }
+        // LH1 row-major 16x16 at [512..768]
+        for y in 16..32 { for x in 0..16 { output[out_idx] = work[y][x] as i16; out_idx += 1; } }
+        // HH1 row-major 16x16 at [768..1024]
+        for y in 16..32 { for x in 16..32 { output[out_idx] = work[y][x] as i16; out_idx += 1; } }
+        assert_eq!(out_idx, channel_offset + CDF53_COEFFS_PER_CHANNEL);
+    }
+    output
+}
+
+/// M3.3b diagnostic: CPU CDF 5/3 forward, **levels 1 and 2 only**. Returns
+/// 3072 i16 coefficients in per-channel layout. After 2 levels the LL2
+/// (8×8) lives at indices [0..64], HL2/LH2/HH2 at [64..128]/[128..192]/
+/// [192..256], and HL1/LH1/HH1 at [256..512]/[512..768]/[768..1024]. Used by
+/// the GPU vs CPU diff diagnostic to verify L2's output in isolation when
+/// GHOSTFRAME_CDF53_SKIP_L3 is set.
+#[cfg(feature = "cdf53-diag")]
+pub fn forward_level2_only(tile_bgra: &[u8]) -> Vec<i16> {
+    assert_eq!(tile_bgra.len(), 32 * 32 * 4, "tile must be 32×32 BGRA");
+    let mut output = vec![0i16; CDF53_TOTAL_COEFFS];
+
+    for ch in 0..CDF53_CHANNELS {
+        let mut work = [[0i32; 32]; 32];
+        for y in 0..32 {
+            for x in 0..32 {
+                let idx = (y * 32 + x) * 4 + ch;
+                work[y][x] = tile_bgra[idx] as i32;
+            }
+        }
+
+        // Two levels of 2D decomposition (level 1: 32×32 → 16×16 LL1, then
+        // level 2: 16×16 LL1 → 8×8 LL2).
+        let mut size = 32;
+        for _level in 0..2 {
+            for y in 0..size {
+                row_forward(&mut work[y], size);
+            }
+            for x in 0..size {
+                let mut column = [0i32; 32];
+                for y in 0..size {
+                    column[y] = work[y][x];
+                }
+                col_forward(&mut column, size);
+                for y in 0..size {
+                    work[y][x] = column[y];
+                }
+            }
+            size /= 2;
+        }
+
+        // After level 2:
+        //   work[0..8][0..8] = LL2
+        //   work[0..8][8..16] = HL2
+        //   work[8..16][0..8] = LH2
+        //   work[8..16][8..16] = HH2
+        //   work[0..16][16..32] = HL1
+        //   work[16..32][0..16] = LH1
+        //   work[16..32][16..32] = HH1
+        let channel_offset = ch * CDF53_COEFFS_PER_CHANNEL;
+        let mut out_idx = channel_offset;
+        // LL2 [0..64]
+        for y in 0..8 { for x in 0..8 { output[out_idx] = work[y][x] as i16; out_idx += 1; } }
+        // HL2 [64..128]
+        for y in 0..8 { for x in 8..16 { output[out_idx] = work[y][x] as i16; out_idx += 1; } }
+        // LH2 [128..192]
+        for y in 8..16 { for x in 0..8 { output[out_idx] = work[y][x] as i16; out_idx += 1; } }
+        // HH2 [192..256]
+        for y in 8..16 { for x in 8..16 { output[out_idx] = work[y][x] as i16; out_idx += 1; } }
+        // HL1 [256..512]
+        for y in 0..16 { for x in 16..32 { output[out_idx] = work[y][x] as i16; out_idx += 1; } }
+        // LH1 [512..768]
+        for y in 16..32 { for x in 0..16 { output[out_idx] = work[y][x] as i16; out_idx += 1; } }
+        // HH1 [768..1024]
+        for y in 16..32 { for x in 16..32 { output[out_idx] = work[y][x] as i16; out_idx += 1; } }
+        assert_eq!(out_idx, channel_offset + CDF53_COEFFS_PER_CHANNEL);
+    }
+    output
+}
+
 /// CDF 5/3 lifting on a single row (or column) of length `n` (must be even).
 /// Operates in-place. Lifting steps:
 ///   1. predict: x[2i+1] -= (x[2i] + x[2i+2]) / 2          (handle boundary with mirror)
