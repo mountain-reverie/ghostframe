@@ -104,6 +104,13 @@ mod cost_tests;
 /// overwrites the field with the real id (or downgrades to `Skip` on
 /// allocation failure). See design Section 6.
 pub fn classify_tile(metrics: &TileMetrics, prev: &CodecState) -> CodecState {
+    // PixelPerfect early-out: the tile has been refined to lossless and is
+    // still idle. Skip emission. If the tile becomes dirty, the rules below
+    // override (PixelPerfect status was meaningful only while idle).
+    if matches!(prev, CodecState::PixelPerfect) && metrics.idle_frames > 0 {
+        return CodecState::Skip;
+    }
+
     // Rule 1: idle ⇒ Skip
     if metrics.idle_frames > 0 {
         return CodecState::Skip;

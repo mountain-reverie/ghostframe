@@ -215,6 +215,25 @@ fn medium_freq_h264_hysteresis_takes_precedence_over_lossless() {
     );
 }
 
+#[test]
+fn pixel_perfect_idle_returns_skip() {
+    let mut m = TileMetrics::default();
+    m.idle_frames = 100;
+    m.codec_state = CodecState::Skip; // codec_state is the PREVIOUS state, not the input
+    assert_eq!(classify_tile(&m, &CodecState::PixelPerfect), CodecState::Skip);
+}
+
+#[test]
+fn pixel_perfect_dirty_overridden_by_normal_rules() {
+    let mut m = TileMetrics::default();
+    m.idle_frames = 0; // dirty
+    m.change_freq_hz = 16.0;
+    m.change_magnitude = 0.5;
+    // Was PixelPerfect; now dirty + high-motion → H264.
+    let result = classify_tile(&m, &CodecState::PixelPerfect);
+    assert!(matches!(result, CodecState::H264 { .. }));
+}
+
 // ---- gate_codec_state tests ----
 
 #[test]
