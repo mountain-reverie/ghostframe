@@ -1640,6 +1640,7 @@ impl IoBridge {
                                     gen = gen,
                                     pass_idx = pass_idx,
                                     payload_size = payload.len(),
+                                    source = "dirty",
                                     "cdf53.emit"
                                 );
                             }
