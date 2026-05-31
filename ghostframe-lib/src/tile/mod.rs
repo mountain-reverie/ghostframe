@@ -118,6 +118,9 @@ pub use metrics_tracker::MetricsTracker;
 pub mod classifier;
 pub use classifier::{Classifier, CostModel};
 
+pub mod escalation;
+pub use escalation::detect_escalation_candidates;
+
 #[derive(Debug, Clone)]
 pub struct TileGrid {
     pub width: u32,

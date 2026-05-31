@@ -52,6 +52,12 @@
 
 
 
+/**
+ * Threshold matching the spec: tile must be idle for > IDLE_THRESHOLD frames
+ * before becoming eligible for escalation. 30 frames ≈ 500 ms at 60 fps.
+ */
+#define IDLE_THRESHOLD 30
+
 #define ACK_BATCH_MSG_TYPE 2
 
 #define MAX_ACK_ENTRIES_PER_BATCH 64
