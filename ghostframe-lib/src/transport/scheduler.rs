@@ -5,6 +5,8 @@
 //! fields are reserved for M3.3 progressive refinement.
 
 use crate::transport::protocol::Codec;
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -91,6 +93,17 @@ pub struct Scheduler {
     low_delivery_rounds: u32,
     /// Consecutive rounds with delivery rate at or above HIGH_DELIVERY threshold.
     high_delivery_rounds: u32,
+    /// Per-(tile, gen) count of refinement-queue passes that have transitioned
+    /// to `WorkState::Acked`. Used by `tile_fully_acked` to signal the
+    /// PixelPerfect transition without scanning the queue on each query.
+    /// Cleared for old gens on `bump_generation`/`bump_generation_collecting`.
+    cdf53_passes_acked: HashMap<(u8, u8, u8), u8>,
+    /// Tracks Cdf53 refinement passes currently in-flight (emitted by
+    /// `drain_refinement_pass_major` which removes entries from the queue).
+    /// Key: (tile_x, tile_y, gen, pass_idx). Allows `on_ack` to increment
+    /// `cdf53_passes_acked` even though the entry was removed from the queue
+    /// at emit time. Cleared per-tile on `bump_generation`.
+    cdf53_in_flight: HashSet<(u8, u8, u8, u8)>,
 }
 
 impl Scheduler {
@@ -107,6 +120,8 @@ impl Scheduler {
             delivery_window_acked: 0,
             low_delivery_rounds: 0,
             high_delivery_rounds: 0,
+            cdf53_passes_acked: HashMap::new(),
+            cdf53_in_flight: HashSet::new(),
         }
     }
 
@@ -116,6 +131,8 @@ impl Scheduler {
         self.generations = vec![0; (cols as usize) * (rows as usize)];
         self.priority_queue.clear();
         self.refinement_queue.clear();
+        self.cdf53_passes_acked.clear();
+        self.cdf53_in_flight.clear();
     }
 
     /// Drain all pending and in-flight work. Generations are preserved so
@@ -125,6 +142,13 @@ impl Scheduler {
     pub fn clear(&mut self) {
         self.priority_queue.clear();
         self.refinement_queue.clear();
+        // In-flight Cdf53 entries from the previous session will never be
+        // ACKed (the client is gone). Drop them to avoid leaks. Per-(tile,
+        // gen) ACK counters are kept for the same reason `generations` is
+        // kept — a late ACK on a stale (tile, gen) is a safe no-op (no
+        // queue entry to match), and the counter is harmless until the
+        // next bump_generation for that tile clears it.
+        self.cdf53_in_flight.clear();
     }
 
     pub fn set_rtt(&mut self, rtt: Duration) {
@@ -174,6 +198,11 @@ impl Scheduler {
                 work.state = WorkState::Superseded;
             }
         }
+        // Drop any per-(tile, gen) ACK counters for the old gen — they're
+        // no longer relevant once the gen advances.
+        self.cdf53_passes_acked.retain(|&(tx, ty, _g), _| !(tx == tile_x && ty == tile_y));
+        // Also drop in-flight tracking for this tile's old gen passes.
+        self.cdf53_in_flight.retain(|&(tx, ty, _g, _p)| !(tx == tile_x && ty == tile_y));
         new_gen
     }
 
@@ -227,7 +256,31 @@ impl Scheduler {
         }
         self.priority_queue.retain(|w| w.state != WorkState::Acked);
         self.refinement_queue.retain(|w| w.state != WorkState::Acked);
+        // Cdf53 refinement entries are removed from refinement_queue at
+        // emit time by drain_refinement_pass_major, so the queue-scan
+        // loop above never finds them. This in_flight bookkeeping is the
+        // SOLE source of truth for the Cdf53 ACK counter. Keeping it as
+        // the only increment site also prevents double-counting if a
+        // future change ever puts Cdf53 into the priority queue (which
+        // does NOT remove at emit — entries stay in the queue as
+        // InFlight until on_ack flips them to Acked + retain prunes).
+        if self.cdf53_in_flight.remove(&(tile_x, tile_y, generation, pass)) {
+            let counter = self.cdf53_passes_acked
+                .entry((tile_x, tile_y, generation))
+                .or_insert(0);
+            *counter = counter.saturating_add(1);
+        }
         resolved
+    }
+
+    /// Returns true iff all `max_passes` passes for the given (tile, gen)
+    /// have transitioned to `WorkState::Acked`. O(1) lookup. Used by
+    /// `IoBridge` to signal `CodecState::PixelPerfect` once a tile is
+    /// fully refined.
+    pub fn tile_fully_acked(&self, tile_x: u8, tile_y: u8, generation: u8, max_passes: u8) -> bool {
+        self.cdf53_passes_acked
+            .get(&(tile_x, tile_y, generation))
+            .map_or(false, |&c| c >= max_passes)
     }
 
     /// Like `bump_generation` but returns the work that was superseded so
@@ -306,6 +359,15 @@ impl Scheduler {
         let rtt = self.rtt;
         Self::drain_priority_queue(&mut self.priority_queue, priority_budget, rtt, &mut emitted);
         Self::drain_refinement_pass_major(&mut self.refinement_queue, refinement_budget, &mut emitted);
+
+        // Record newly-emitted Cdf53 refinement passes so `on_ack` can find
+        // them even though `drain_refinement_pass_major` removed them from the
+        // queue at emit time.
+        for w in &emitted {
+            if w.codec == Codec::Cdf53 {
+                self.cdf53_in_flight.insert((w.tile_x, w.tile_y, w.generation, w.pass_idx));
+            }
+        }
 
         self.delivery_window_emitted = self.delivery_window_emitted.saturating_add(emitted.len() as u32);
         self.maybe_adjust_refinement_fraction();
@@ -834,5 +896,74 @@ mod tests {
             .count();
         assert_eq!(superseded_count, 14,
             "expected all 14 refinement passes for the tile to be Superseded after bump_generation");
+    }
+
+    #[test]
+    fn tile_fully_acked_returns_true_after_all_passes_acked() {
+        let mut s = Scheduler::new(4, 4);
+        let passes: Vec<Vec<u8>> = (0..14).map(|i| vec![i as u8]).collect();
+        s.enqueue_refinement(2, 3, 1, passes);
+        // Drain all 14 to InFlight so on_ack can resolve them.
+        let _ = s.tick(usize::MAX);
+        assert!(!s.tile_fully_acked(2, 3, 1, 14));
+        for pass in 0..13u8 {
+            let _ = s.on_ack(2, 3, 1, pass);
+            assert!(
+                !s.tile_fully_acked(2, 3, 1, 14),
+                "should not be fully_acked at pass {pass}"
+            );
+        }
+        let _ = s.on_ack(2, 3, 1, 13);
+        assert!(s.tile_fully_acked(2, 3, 1, 14));
+    }
+
+    #[test]
+    fn tile_fully_acked_isolates_per_tile_and_gen() {
+        let mut s = Scheduler::new(4, 4);
+        let passes: Vec<Vec<u8>> = (0..14).map(|i| vec![i as u8]).collect();
+        s.enqueue_refinement(0, 0, 1, passes.clone());
+        s.enqueue_refinement(1, 0, 1, passes);
+        let _ = s.tick(usize::MAX);
+        for pass in 0..14u8 {
+            let _ = s.on_ack(0, 0, 1, pass);
+        }
+        assert!(s.tile_fully_acked(0, 0, 1, 14));
+        assert!(!s.tile_fully_acked(1, 0, 1, 14));
+        assert!(!s.tile_fully_acked(0, 0, 2, 14)); // different gen
+    }
+
+    #[test]
+    fn bump_generation_drops_old_gen_ack_counter() {
+        let mut s = Scheduler::new(4, 4);
+        let passes: Vec<Vec<u8>> = (0..14).map(|i| vec![i as u8]).collect();
+        s.enqueue_refinement(0, 0, 1, passes);
+        let _ = s.tick(usize::MAX);
+        for pass in 0..14u8 {
+            let _ = s.on_ack(0, 0, 1, pass);
+        }
+        assert!(s.tile_fully_acked(0, 0, 1, 14));
+        let _ = s.bump_generation(0, 0);
+        assert!(!s.tile_fully_acked(0, 0, 1, 14), "old gen counter should be dropped");
+        assert!(!s.tile_fully_acked(0, 0, 2, 14), "new gen has no acks yet");
+    }
+
+    #[test]
+    fn bump_generation_only_clears_target_tile() {
+        let mut s = Scheduler::new(4, 4);
+        let passes: Vec<Vec<u8>> = (0..14).map(|i| vec![i as u8]).collect();
+        s.enqueue_refinement(0, 0, 1, passes.clone());
+        s.enqueue_refinement(1, 1, 1, passes);
+        let _ = s.tick(usize::MAX);
+        for pass in 0..14u8 {
+            let _ = s.on_ack(0, 0, 1, pass);
+            let _ = s.on_ack(1, 1, 1, pass);
+        }
+        assert!(s.tile_fully_acked(0, 0, 1, 14));
+        assert!(s.tile_fully_acked(1, 1, 1, 14));
+
+        // Bump only (0, 0). Tile (1, 1)'s counter must survive.
+        let _ = s.bump_generation(0, 0);
+        assert!(!s.tile_fully_acked(0, 0, 1, 14), "target tile cleared");
+        assert!(s.tile_fully_acked(1, 1, 1, 14), "non-target tile preserved");
     }
 }
