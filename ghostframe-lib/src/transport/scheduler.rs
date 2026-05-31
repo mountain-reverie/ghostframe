@@ -491,6 +491,35 @@ impl Scheduler {
         self.refinement_bandwidth_fraction
     }
 
+    /// Diagnostic-only: return a snapshot of all refinement work that is
+    /// NOT yet `Acked` or `Superseded`. Each tuple = `(tile_x, tile_y,
+    /// generation, passes_remaining)`. Combines:
+    ///   - Pending entries still in `refinement_queue` (not yet emitted).
+    ///   - InFlight entries in `cdf53_in_flight` (emitted but no ACK yet —
+    ///     `drain_refinement_pass_major` removes them from the queue at
+    ///     emit time so they aren't visible there).
+    /// Used by `e2e_refinement_cancel` to assert old-gen work is fully
+    /// dropped after `bump_generation`.
+    #[cfg(feature = "cdf53-diag")]
+    pub fn pending_refinement_snapshot(&self) -> Vec<(u8, u8, u8, u8)> {
+        use std::collections::HashMap;
+        let mut counts: HashMap<(u8, u8, u8), u8> = HashMap::new();
+        // Source 1: Pending entries still in the refinement queue.
+        for w in self.refinement_queue.iter() {
+            if matches!(w.state, WorkState::Pending | WorkState::InFlight) {
+                let c = counts.entry((w.tile_x, w.tile_y, w.generation)).or_insert(0);
+                *c = c.saturating_add(1);
+            }
+        }
+        // Source 2: InFlight entries removed from the queue but tracked in
+        // cdf53_in_flight (key includes pass_idx — collapse to per-(tile, gen)).
+        for &(tx, ty, gen, _pass) in self.cdf53_in_flight.iter() {
+            let c = counts.entry((tx, ty, gen)).or_insert(0);
+            *c = c.saturating_add(1);
+        }
+        counts.into_iter().map(|((tx, ty, g), n)| (tx, ty, g, n)).collect()
+    }
+
     /// Enqueue all passes for a refinement tile. Each pass becomes one
     /// TileWork with pass_idx 0..passes.len()-1 and total_passes = passes.len().
     pub fn enqueue_refinement(
@@ -965,5 +994,43 @@ mod tests {
         let _ = s.bump_generation(0, 0);
         assert!(!s.tile_fully_acked(0, 0, 1, 14), "target tile cleared");
         assert!(s.tile_fully_acked(1, 1, 1, 14), "non-target tile preserved");
+    }
+
+    #[cfg(feature = "cdf53-diag")]
+    #[test]
+    fn pending_refinement_snapshot_lists_unacked_passes() {
+        let mut s = Scheduler::new(4, 4);
+        let passes: Vec<Vec<u8>> = (0..14).map(|i| vec![i as u8]).collect();
+        s.enqueue_refinement(2, 3, 1, passes);
+
+        // BEFORE any tick: all 14 are Pending in the refinement queue.
+        let snap = s.pending_refinement_snapshot();
+        let our: Vec<_> = snap.iter().filter(|e| e.0 == 2 && e.1 == 3).collect();
+        assert_eq!(our.len(), 1);
+        assert_eq!(our[0].2, 1);
+        assert_eq!(our[0].3, 14, "all 14 still pending");
+
+        // AFTER tick: all 14 moved to in-flight (drained from queue, tracked
+        // in cdf53_in_flight). Snapshot must still see them as 14.
+        let _ = s.tick(usize::MAX);
+        let snap = s.pending_refinement_snapshot();
+        let our: Vec<_> = snap.iter().filter(|e| e.0 == 2 && e.1 == 3).collect();
+        assert_eq!(our.len(), 1, "still one (tile, gen) entry");
+        assert_eq!(our[0].3, 14, "in-flight passes still count as pending refinement");
+
+        // After ACKing 10, snapshot drops to 4 (14 in-flight - 10 acked).
+        for pass in 0..10u8 {
+            let _ = s.on_ack(2, 3, 1, pass);
+        }
+        let snap = s.pending_refinement_snapshot();
+        let our: Vec<_> = snap.iter().filter(|e| e.0 == 2 && e.1 == 3).collect();
+        assert_eq!(our.len(), 1);
+        assert_eq!(our[0].3, 4);
+
+        // After bump_generation, all old-gen entries gone.
+        let _ = s.bump_generation(2, 3);
+        let snap = s.pending_refinement_snapshot();
+        let our: Vec<_> = snap.iter().filter(|e| e.0 == 2 && e.1 == 3 && e.2 == 1).collect();
+        assert!(our.is_empty(), "old gen entries dropped");
     }
 }
