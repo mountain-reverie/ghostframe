@@ -171,6 +171,10 @@ pub struct IoBridge {
     /// wire), preserving M3.2 behavior. Set to true by the operator to enable
     /// CDF 5/3 emission once Task 9 Phase B encoding is wired in.
     cdf53_enabled: bool,
+    /// M3.3c idle-escalation: flat tile indices from the most recent per-frame
+    /// sweep. Stashed here so Task 10's post-fence Phase B can read the list
+    /// and update `already_escalated_this_gen` after the GPU work returns.
+    cdf53_escalation_candidates_this_frame: Vec<u32>,
     /// GPU-accelerated dirty tracker (Vulkan compute SAD).
     gpu_frame_processor: Option<GpuFrameProcessor>,
     /// Full-frame H.264 encoder (VA-API zero-copy).
@@ -436,6 +440,7 @@ impl IoBridge {
                 .unwrap_or(0),
             fec_enable_threshold: FEC_ENABLE_THRESHOLD,
             fec_disable_threshold: FEC_DISABLE_THRESHOLD,
+            cdf53_escalation_candidates_this_frame: Vec::new(),
             cdf53_enabled,
             gpu_frame_processor,
             full_frame_encoder: None,
@@ -1082,6 +1087,32 @@ impl IoBridge {
         // Emit frame-dimensions datagram on first frame, on dimension change,
         // and N more times after any change to absorb datagram loss.
         self.emit_frame_dimensions(seq, frame.timestamp_us, frame.width, frame.height);
+
+        // Per-frame idle-escalation sweep. Computes the candidate list against
+        // the previous frame's tile metrics (the current frame's metrics are
+        // updated after the GPU work returns), then hands the list to the
+        // GpuFrameProcessor which records the forward dispatch in the same
+        // command buffer as the dirty-Cdf53 forward stages.
+        //
+        // Note: metrics_tracker.resize() happens after process_frame returns
+        // (below, around `self.metrics_tracker.resize(cols, rows)`). On the
+        // very first frame the tracker has cols=0, rows=0 (constructed via
+        // MetricsTracker::new(0, 0)), so detect_escalation_candidates iterates
+        // 0 tiles and returns empty — safe.
+        {
+            let caps = self.client_caps;
+            let candidates = if self.cdf53_enabled && caps.supports_cdf53 {
+                crate::tile::detect_escalation_candidates(
+                    &self.metrics_tracker,
+                    crate::capture::gpu_pipeline::MAX_ESCALATION_PER_FRAME,
+                )
+            } else {
+                Vec::new()
+            };
+            let processor = self.gpu_frame_processor.as_mut().unwrap();
+            processor.set_escalation_candidates(&candidates);
+            self.cdf53_escalation_candidates_this_frame = candidates;
+        }
 
         // GPU pipeline: Vulkan SAD dirty detection + NV12 conversion
         let processor = self.gpu_frame_processor.as_mut().unwrap();
@@ -2101,6 +2132,7 @@ impl IoBridge {
             fec_k: 0,
             fec_enable_threshold: FEC_ENABLE_THRESHOLD,
             fec_disable_threshold: FEC_DISABLE_THRESHOLD,
+            cdf53_escalation_candidates_this_frame: Vec::new(),
             cdf53_enabled: false,
             gpu_frame_processor: None,
             full_frame_encoder: None,
@@ -2150,6 +2182,7 @@ impl IoBridge {
             fec_k: 0,
             fec_enable_threshold: FEC_ENABLE_THRESHOLD,
             fec_disable_threshold: FEC_DISABLE_THRESHOLD,
+            cdf53_escalation_candidates_this_frame: Vec::new(),
             cdf53_enabled: false,
             gpu_frame_processor: None,
             full_frame_encoder: None,
@@ -3355,5 +3388,53 @@ mod tests {
         // Code 5 is log-only in M3.2b — delivered must remain set.
         assert!(bridge.palette_table.delivered.contains(5),
             "ERR_INDEX_OOB should not clear delivered bit (M3.2b leaves it as a future hook)");
+    }
+
+    /// Verify the io_bridge escalation-sweep logic in isolation:
+    /// `detect_escalation_candidates` is called against a hand-built tracker
+    /// and the results match the expected eligible indices.
+    ///
+    /// This mirrors exactly the sweep that `process_frame_gpu` will run on every
+    /// frame. The GPU dispatch path itself requires a Vulkan device and is
+    /// validated end-to-end by Task 13's e2e_progressive_refinement test.
+    #[tokio::test]
+    async fn escalation_sweep_returns_expected_candidates() {
+        use crate::tile::{CodecState, MetricsTracker};
+        use crate::tile::detect_escalation_candidates;
+        use crate::capture::gpu_pipeline::MAX_ESCALATION_PER_FRAME;
+
+        // Build a 4×4 tracker and make tiles (0,0), (1,0), (2,0) eligible:
+        // idle_frames > 30, lossy codec, not already escalated.
+        let mut tracker = MetricsTracker::new(4, 4);
+        for x in 0..3u32 {
+            let m = tracker.get_mut(x, 0);
+            m.idle_frames = 31;
+            m.codec_state = CodecState::Solid;
+        }
+        // Tile (3,0): idle but already escalated — must be excluded.
+        {
+            let m = tracker.get_mut(3, 0);
+            m.idle_frames = 31;
+            m.codec_state = CodecState::Solid;
+            m.already_escalated_this_gen = true;
+        }
+        // Remaining tiles (row 1-3): below threshold or Skip — excluded.
+
+        let candidates = detect_escalation_candidates(&tracker, MAX_ESCALATION_PER_FRAME);
+
+        // Flat row-major indices: (0,0)=0, (1,0)=1, (2,0)=2
+        assert_eq!(candidates, vec![0u32, 1, 2],
+            "sweep should return exactly the three eligible tiles in row-major order");
+
+        // Simulate what process_frame_gpu does: stash on IoBridge.
+        let mut bridge = make_bridge_for_test().await;
+        bridge.cdf53_escalation_candidates_this_frame = candidates.clone();
+        assert_eq!(bridge.cdf53_escalation_candidates_this_frame, vec![0u32, 1, 2],
+            "stashed candidates must match what the sweep returned");
+
+        // Verify k_max capping is respected by the sweep helper.
+        let capped = detect_escalation_candidates(&tracker, 2);
+        assert_eq!(capped, vec![0u32, 1],
+            "k_max=2 should cap the result to the first 2 candidates");
     }
 }

@@ -922,6 +922,7 @@ impl GpuFrameProcessor {
             last_width: 0,
             last_height: 0,
             force_all_dirty_remaining: 0,
+            staged_escalation_count: 0,
         })
     }
 }

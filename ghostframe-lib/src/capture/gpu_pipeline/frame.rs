@@ -156,6 +156,13 @@ impl GpuFrameProcessor {
         height: u32,
         stride: u32,
     ) -> Result<FrameAnalysis, Box<dyn std::error::Error>> {
+        // Capture the escalation count staged by set_escalation_candidates
+        // (called by io_bridge before this frame), then immediately reset it to 0
+        // so a caller that forgets set_escalation_candidates on the next frame
+        // does not replay the current frame's list.
+        let escalation_count_this_frame = self.staged_escalation_count;
+        self.staged_escalation_count = 0;
+
         let geom = FrameGeometry::from_dims(width, height);
 
         if geom.tile_count() > self.max_tiles {
@@ -187,7 +194,7 @@ impl GpuFrameProcessor {
         let current = self.import_dmabuf(fd, width, height, stride)?;
         // Result must always destroy `current` at end. Use a closure-style
         // cleanup by carrying it forward and explicitly destroying.
-        let result = self.process_frame_with_imported(&current, geom);
+        let result = self.process_frame_with_imported(&current, geom, escalation_count_this_frame);
         // Always clean up the imported DMA-BUF VkImage (transient).
         self.destroy_prev_frame(current);
         result
@@ -201,6 +208,7 @@ impl GpuFrameProcessor {
         &mut self,
         current: &PrevFrame,
         geom: FrameGeometry,
+        escalation_count: u32,
     ) -> Result<FrameAnalysis, Box<dyn std::error::Error>> {
         let FrameGeometry { width, height, cols, rows } = geom;
         let tile_count = geom.tile_count();
@@ -253,7 +261,7 @@ impl GpuFrameProcessor {
             // Run NV12 conversion + tile_analysis + snapshot copy in one cmd
             // buffer. The snapshot is what we will compare future frames
             // against.
-            self.run_first_frame_passes(current, snapshot.as_ref(), geom, nv12_layout)?;
+            self.run_first_frame_passes(current, snapshot.as_ref(), geom, nv12_layout, escalation_count)?;
 
             if let Some(mut snap) = snapshot {
                 snap.layout = vk::ImageLayout::GENERAL;
@@ -686,6 +694,40 @@ impl GpuFrameProcessor {
         );
 
         // ============================================================
+        // Stage 4d: cdf53_forward escalation (idle-escalation candidates)
+        // ============================================================
+        let _cdf53_escalation_ds_guards = if escalation_count > 0 {
+            let guards = self.run_cdf53_forward_escalation_stages(
+                cmd,
+                current.view,
+                cols,
+                rows,
+                escalation_count,
+            )?;
+            // L3 → HOST_READ barrier so Phase B can read after fence.
+            let buf_barrier_esc_host = vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.cdf53_escalation_coefficients_buffer)
+                .offset(0)
+                .size(vk::WHOLE_SIZE);
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[],
+                std::slice::from_ref(&buf_barrier_esc_host),
+                &[],
+            );
+            Some(guards)
+        } else {
+            None
+        };
+
+        // ============================================================
         // Stage 2a: palette_fold (intra-frame palette dedup)
         // ============================================================
 
@@ -1101,7 +1143,7 @@ impl GpuFrameProcessor {
         //    sad_ds_guard, nv12_ds_guard, analysis_ds_guard,
         //    palrle_compact_ds_guard, palrle_indirect_args_ds_guard,
         //    cdf53_compact_ds_guard, cdf53_indirect_args_ds_guard,
-        //    cdf53_forward_l1/l2/l3_ds_guard,
+        //    cdf53_forward_l1/l2/l3_ds_guard, _cdf53_escalation_ds_guards,
         //    palette_fold_ds_guard, palette_subset_fold_init_ds_guard,
         //    palette_subset_fold_ds_guard, and pal_rle_index_ds_guard are
         //    dropped explicitly before step 9 to
@@ -1121,6 +1163,7 @@ impl GpuFrameProcessor {
             &cdf53_forward_l1_ds_guard,
             &cdf53_forward_l2_ds_guard,
             &cdf53_forward_l3_ds_guard,
+            &_cdf53_escalation_ds_guards,
             &palette_fold_ds_guard,
             &palette_subset_fold_init_ds_guard,
             &palette_subset_fold_ds_guard,
@@ -1138,6 +1181,7 @@ impl GpuFrameProcessor {
         drop(cdf53_forward_l1_ds_guard);
         drop(cdf53_forward_l2_ds_guard);
         drop(cdf53_forward_l3_ds_guard);
+        drop(_cdf53_escalation_ds_guards);
         drop(palette_fold_ds_guard);
         drop(palette_subset_fold_init_ds_guard);
         drop(palette_subset_fold_ds_guard);
@@ -1194,6 +1238,7 @@ impl GpuFrameProcessor {
         snapshot: Option<&PrevFrame>,
         geom: FrameGeometry,
         nv12: Nv12OutputLayout,
+        escalation_count: u32,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let FrameGeometry { width, height, cols, rows } = geom;
         let Nv12OutputLayout {
@@ -1567,6 +1612,40 @@ impl GpuFrameProcessor {
             std::slice::from_ref(&buf_barrier_l3_host),
             &[],
         );
+
+        // ============================================================
+        // Stage 4d: cdf53_forward escalation (idle-escalation candidates)
+        // ============================================================
+        let _cdf53_escalation_ds_guards = if escalation_count > 0 {
+            let guards = self.run_cdf53_forward_escalation_stages(
+                cmd,
+                current.view,
+                cols,
+                rows,
+                escalation_count,
+            )?;
+            // L3 → HOST_READ barrier so Phase B can read after fence.
+            let buf_barrier_esc_host = vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.cdf53_escalation_coefficients_buffer)
+                .offset(0)
+                .size(vk::WHOLE_SIZE);
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[],
+                std::slice::from_ref(&buf_barrier_esc_host),
+                &[],
+            );
+            Some(guards)
+        } else {
+            None
+        };
 
         // ============================================================
         // Stage 2a: palette_fold (intra-frame palette dedup)
@@ -1952,6 +2031,7 @@ impl GpuFrameProcessor {
             &cdf53_forward_l1_ds_guard,
             &cdf53_forward_l2_ds_guard,
             &cdf53_forward_l3_ds_guard,
+            &_cdf53_escalation_ds_guards,
             &palette_fold_ds_guard,
             &palette_subset_fold_init_ds_guard,
             &palette_subset_fold_ds_guard,

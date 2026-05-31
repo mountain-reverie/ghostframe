@@ -473,6 +473,14 @@ pub struct GpuFrameProcessor {
     /// without committing a new baseline. Mirrors the CPU path's
     /// `force_dirty_frames` no-commit semantics.
     force_all_dirty_remaining: u32,
+
+    /// Staged count from the most recent `set_escalation_candidates` call.
+    /// Copied from the HOST_COHERENT pointer into a plain field so the
+    /// command-buffer recording paths can read it without a raw-pointer
+    /// deref mid-build. Reset to 0 at the start of each `process_frame_inner`
+    /// so a frame that skips `set_escalation_candidates` doesn't replay the
+    /// previous frame's list.
+    staged_escalation_count: u32,
 }
 
 struct NV12Buffer {
@@ -599,6 +607,25 @@ impl GpuFrameProcessor {
     ) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
         let analysis = self.process_frame(fd, width, height, stride)?;
         Ok(analysis.dirty_tiles)
+    }
+
+    /// Stage the per-frame idle-escalation candidate list. Must be called
+    /// before `process_frame` to take effect on the next frame.
+    ///
+    /// `candidates` is a slice of flat tile indices (row-major). The slice is
+    /// truncated to `MAX_ESCALATION_PER_FRAME` if longer. Writes are to
+    /// HOST_COHERENT buffers — visible to the GPU on the next submit without
+    /// an explicit flush.
+    pub fn set_escalation_candidates(&mut self, candidates: &[u32]) {
+        let n = candidates.len().min(MAX_ESCALATION_PER_FRAME);
+        // SAFETY: cdf53_escalation_list_ptr is a HOST_VISIBLE | HOST_COHERENT
+        // persistently-mapped pointer into a buffer of MAX_ESCALATION_PER_FRAME
+        // u32 entries, allocated in setup.rs. Writing `n` entries is within bounds.
+        unsafe {
+            std::ptr::copy_nonoverlapping(candidates.as_ptr(), self.cdf53_escalation_list_ptr, n);
+            *self.cdf53_escalation_count_ptr = n as u32;
+        }
+        self.staged_escalation_count = n as u32;
     }
 
     /// Invalidate the GPU SAD baseline by dropping `prev_image` and arming the
