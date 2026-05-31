@@ -1711,6 +1711,31 @@ impl IoBridge {
                     }
                 }
 
+                // ---- M3.3c: PixelPerfect transition sweep ----
+                // For every tile currently in CodecState::Cdf53, check if all
+                // its passes are now ACKed (scheduler.tile_fully_acked). If so,
+                // transition to PixelPerfect. Cost: O(num_tiles).
+                {
+                    let tile_count = (cols * rows) as usize;
+                    for idx in 0..tile_count {
+                        let tile_x = (idx as u32 % cols) as u8;
+                        let tile_y = (idx as u32 / cols) as u8;
+                        let max_passes = {
+                            let tm = self.metrics_tracker.get(tile_x as u32, tile_y as u32);
+                            match tm.codec_state {
+                                crate::tile::CodecState::Cdf53 { max_passes, .. } => max_passes,
+                                _ => continue,
+                            }
+                        };
+                        let gen = self.scheduler.generation_for(tile_x, tile_y);
+                        if self.scheduler.tile_fully_acked(tile_x, tile_y, gen, max_passes) {
+                            self.metrics_tracker
+                                .get_mut(tile_x as u32, tile_y as u32)
+                                .codec_state = crate::tile::CodecState::PixelPerfect;
+                        }
+                    }
+                }
+
                 self.dispatch_dirty_tiles_via_scheduler(
                     &dirty_xy,
                     &grid,
