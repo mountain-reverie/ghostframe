@@ -417,6 +417,13 @@ impl Scheduler {
         budget: usize,
         out: &mut Vec<TileWork>,
     ) {
+        // Drop terminal-state entries first. Mirrors drain_priority_queue.
+        // Without this, plain bump_generation (which only marks Superseded
+        // without retain) leaves stale Pending->Superseded entries that
+        // re-emit on the next tick with old gen values — corrupting the
+        // client integrator (which clears its tile state on gen change).
+        queue.retain(|w| !matches!(w.state, WorkState::Superseded | WorkState::Acked));
+
         let mut spent = 0usize;
         loop {
             let min_pass = match queue.iter().map(|w| w.pass_idx).min() {
@@ -1032,5 +1039,48 @@ mod tests {
         let snap = s.pending_refinement_snapshot();
         let our: Vec<_> = snap.iter().filter(|e| e.0 == 2 && e.1 == 3 && e.2 == 1).collect();
         assert!(our.is_empty(), "old gen entries dropped");
+    }
+
+    #[test]
+    fn drain_refinement_skips_superseded_after_bump() {
+        // Regression: drain_refinement_pass_major used to lack the
+        // Superseded/Acked retain that drain_priority_queue has, so plain
+        // bump_generation (which marks Superseded without retain) would let
+        // stale entries re-emit on the next tick with old gen — corrupting
+        // the client integrator. This locks the retain at the top of
+        // drain_refinement_pass_major.
+        let mut s = Scheduler::new(4, 4);
+
+        // Bump once so generations[(0,0)] = 1 (matching what io_bridge's
+        // Phase B does before enqueue_refinement). Then enqueue gen=1.
+        let gen1 = s.bump_generation(0, 0);
+        assert_eq!(gen1, 1);
+        let passes: Vec<Vec<u8>> = (0..14).map(|i| vec![i as u8]).collect();
+        s.enqueue_refinement(0, 0, gen1, passes.clone());
+
+        // Plain bump_generation again — marks all gen=1 Pending entries as
+        // Superseded but does NOT retain them out of the queue.
+        let gen2 = s.bump_generation(0, 0);
+        assert_eq!(gen2, 2);
+
+        // Enqueue gen=2 passes for the same tile.
+        s.enqueue_refinement(0, 0, gen2, passes);
+
+        // Tick: should ONLY emit gen=2 entries, not the Superseded gen=1.
+        let resolved = s.tick(usize::MAX);
+        let emitted_old_gen: Vec<_> = resolved
+            .iter()
+            .filter(|w| w.tile_x == 0 && w.tile_y == 0 && w.generation == gen1)
+            .collect();
+        assert!(
+            emitted_old_gen.is_empty(),
+            "Superseded gen=1 entries must not re-emit; got {} stale emissions",
+            emitted_old_gen.len(),
+        );
+        let emitted_new_gen: Vec<_> = resolved
+            .iter()
+            .filter(|w| w.tile_x == 0 && w.tile_y == 0 && w.generation == gen2)
+            .collect();
+        assert_eq!(emitted_new_gen.len(), 14, "all 14 new-gen passes emit");
     }
 }
