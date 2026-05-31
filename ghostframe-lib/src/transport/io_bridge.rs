@@ -615,6 +615,14 @@ impl IoBridge {
 
             let (gen, superseded) =
                 self.scheduler.bump_generation_collecting(tile_x as u8, tile_y as u8);
+            // New generation: tile is eligible for re-escalation.
+            // Guard with a bounds check to stay safe when metrics_tracker has
+            // not yet been sized (e.g. CpuRawOnly unit test path).
+            if tile_x < self.metrics_tracker.cols() && tile_y < self.metrics_tracker.rows() {
+                self.metrics_tracker
+                    .get_mut(tile_x as u32, tile_y as u32)
+                    .already_escalated_this_gen = false;
+            }
             for s in superseded {
                 if let Some(pid) = s.palette_id {
                     let pid_usize = pid as usize;
@@ -1619,6 +1627,10 @@ impl IoBridge {
                             }
                             let passes = crate::encoder::cdf53::encode_passes(&coeffs_i16);
                             let gen = self.scheduler.bump_generation(tile_x, tile_y);
+                            // New generation: tile is eligible for re-escalation.
+                            self.metrics_tracker
+                                .get_mut(tile_x as u32, tile_y as u32)
+                                .already_escalated_this_gen = false;
                             // Diagnostic: one line per pass for the e2e log scan.
                             for (pass_idx, payload) in passes.iter().enumerate() {
                                 tracing::info!(
@@ -1648,6 +1660,53 @@ impl IoBridge {
                                     max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
                                 };
                         }
+                    }
+                }
+
+                // ---- M3.3c: post-fence Phase B for escalation candidates ----
+                // Runs after the GPU fence (the existing fence covers all
+                // compute work in this command buffer, including the
+                // escalation forward dispatches recorded above). Reads
+                // escalation coefficients per-slot, encodes 14 passes,
+                // enqueues into the scheduler.
+                let escalation_candidates = std::mem::take(&mut self.cdf53_escalation_candidates_this_frame);
+                if !escalation_candidates.is_empty() {
+                    let gpu_coeffs_ptr = {
+                        let gpu = self.gpu_frame_processor.as_ref().unwrap();
+                        gpu.cdf53_escalation_coefficients_ptr
+                    };
+                    for (slot, &flat_tile_idx) in escalation_candidates.iter().enumerate() {
+                        let tile_x = (flat_tile_idx % cols) as u8;
+                        let tile_y = (flat_tile_idx / cols) as u8;
+                        let coeffs_i32 = unsafe {
+                            std::slice::from_raw_parts(
+                                gpu_coeffs_ptr.add(slot * crate::encoder::cdf53::CDF53_TOTAL_COEFFS),
+                                crate::encoder::cdf53::CDF53_TOTAL_COEFFS,
+                            )
+                        };
+                        let coeffs_i16: Vec<i16> = coeffs_i32.iter().map(|&v| v as i16).collect();
+                        let passes = crate::encoder::cdf53::encode_passes(&coeffs_i16);
+                        let gen = self.scheduler.bump_generation(tile_x, tile_y);
+                        for (pass_idx, payload) in passes.iter().enumerate() {
+                            tracing::info!(
+                                target: "ghostframe::cdf53",
+                                tile_x = tile_x,
+                                tile_y = tile_y,
+                                gen = gen,
+                                pass_idx = pass_idx,
+                                payload_size = payload.len(),
+                                source = "escalation",
+                                "cdf53.emit"
+                            );
+                        }
+                        self.scheduler.enqueue_refinement(tile_x, tile_y, gen, passes);
+
+                        let tm = self.metrics_tracker.get_mut(tile_x as u32, tile_y as u32);
+                        tm.codec_state = crate::tile::CodecState::Cdf53 {
+                            passes_sent: 0,
+                            max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
+                        };
+                        tm.already_escalated_this_gen = true;
                     }
                 }
 
