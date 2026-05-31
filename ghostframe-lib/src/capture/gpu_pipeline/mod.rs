@@ -610,7 +610,10 @@ impl GpuFrameProcessor {
     }
 
     /// Stage the per-frame idle-escalation candidate list. Must be called
-    /// before `process_frame` to take effect on the next frame.
+    /// before `process_frame` to take effect on the *current* frame
+    /// (`process_frame_inner` consumes `staged_escalation_count` at entry and
+    /// resets it to 0; the count fires the Stage 4d forward dispatch recorded
+    /// into that frame's command buffer).
     ///
     /// `candidates` is a slice of flat tile indices (row-major). The slice is
     /// truncated to `MAX_ESCALATION_PER_FRAME` if longer. Writes are to
