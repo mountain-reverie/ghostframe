@@ -40,12 +40,82 @@ pub fn run<C: Connection>(
     loop {
         let cycle_start = Instant::now();
 
-        // Static half: paint solid background once and idle.
-        conn.change_window_attributes(
-            root,
-            &ChangeWindowAttributesAux::new().background_pixel(STATIC_BG_PIXEL),
+        // Static half: three horizontal stripes that exercise different
+        // classifier rules. Repaints once per cycle, then sleeps.
+        //
+        //   STRIPE 1 (top third):    solid steel-blue (#204080)  → CodecState::Solid
+        //   STRIPE 2 (middle third): 8-color vertical bars       → CodecState::PalRle
+        //   STRIPE 3 (bottom third): diagonal RGB gradient       → CodecState::Cdf53
+        //
+        // Each stripe height is rounded down to a multiple of TILE_SIZE
+        // (BAND_H=32 px) so stripes line up on tile boundaries — no
+        // straddling tiles classify ambiguously.
+        let stripe_h = (height / 3 / BAND_H as u32) * BAND_H as u32;
+        let stripe1_y = 0i16;
+        let stripe2_y = stripe_h as i16;
+        let stripe3_y = (stripe_h * 2) as i16;
+        let stripe3_h = (height - stripe_h * 2) as u32;
+
+        // Stripe 1 — solid.
+        conn.change_gc(
+            gc,
+            &ChangeGCAux::default().foreground(STATIC_BG_PIXEL),
         )?;
-        conn.clear_area(false, root, 0, 0, 0, 0)?;
+        conn.poly_fill_rectangle(
+            root,
+            gc,
+            &[Rectangle { x: 0, y: stripe1_y, width: width as u16, height: stripe_h as u16 }],
+        )?;
+
+        // Stripe 2 — 8 vertical bars of distinct colors (≤16 colors → PalRle).
+        const PALRLE_COLORS: [u32; 8] = [
+            0x00_00_00_00, // black
+            0x00_FF_FF_FF, // white
+            0x00_FF_00_00, // red
+            0x00_00_FF_00, // green
+            0x00_00_00_FF, // blue
+            0x00_FF_FF_00, // yellow
+            0x00_FF_00_FF, // magenta
+            0x00_00_FF_FF, // cyan
+        ];
+        let bar_w = (width / PALRLE_COLORS.len() as u32) as u16;
+        for (i, color) in PALRLE_COLORS.iter().enumerate() {
+            conn.change_gc(gc, &ChangeGCAux::default().foreground(*color))?;
+            conn.poly_fill_rectangle(
+                root,
+                gc,
+                &[Rectangle {
+                    x: (i as u16 * bar_w) as i16,
+                    y: stripe2_y,
+                    width: bar_w,
+                    height: stripe_h as u16,
+                }],
+            )?;
+        }
+
+        // Stripe 3 — diagonal gradient (high-color → Cdf53). Per-row solid
+        // colors approximate the gradient cheaply via X11 (no put_image
+        // needed since exact per-pixel values aren't required for the test;
+        // the classifier just needs > 16 colors).
+        for row in 0..stripe3_h {
+            let py = stripe3_y as u32 + row;
+            let r = (py.wrapping_mul(3) & 0xFF) as u32;
+            let g = (py.wrapping_mul(5) & 0xFF) as u32;
+            let b = (py.wrapping_mul(7) & 0xFF) as u32;
+            let color = (r << 16) | (g << 8) | b;
+            conn.change_gc(gc, &ChangeGCAux::default().foreground(color))?;
+            conn.poly_fill_rectangle(
+                root,
+                gc,
+                &[Rectangle {
+                    x: 0,
+                    y: py as i16,
+                    width: width as u16,
+                    height: 1,
+                }],
+            )?;
+        }
+
         conn.flush()?;
 
         thread::sleep(half_cycle);
