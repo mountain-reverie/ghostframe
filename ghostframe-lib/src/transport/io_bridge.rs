@@ -1109,7 +1109,22 @@ impl IoBridge {
         // 0 tiles and returns empty — safe.
         {
             let caps = self.client_caps;
-            let candidates = if self.cdf53_enabled && caps.supports_cdf53 {
+            // Gate on self.frame_mode (the PREVIOUS frame's mode). Skipping
+            // escalation while the previous frame was H264 avoids ~5 ms of
+            // wasted GPU forward + 6 MB of HOST_COHERENT writes per frame:
+            // the post-fence Phase B that consumes the coefficients lives
+            // inside the FrameMode::TileCodec arm below, so under H264 the
+            // forward dispatch's output is silently dropped.
+            //
+            // One-frame-late on the H264->TileCodec transition: prev_mode is
+            // still H264 on the transition frame, so escalation fires on the
+            // SECOND TileCodec frame. Acceptable — refinement queries run
+            // every frame and there are plenty of cycles to escalate.
+            let frame_mode_eligible = matches!(self.frame_mode, crate::tile::FrameMode::TileCodec);
+            let candidates = if self.cdf53_enabled
+                && caps.supports_cdf53
+                && frame_mode_eligible
+            {
                 crate::tile::detect_escalation_candidates(
                     &self.metrics_tracker,
                     crate::capture::gpu_pipeline::MAX_ESCALATION_PER_FRAME,
@@ -1679,6 +1694,19 @@ impl IoBridge {
                     for (slot, &flat_tile_idx) in escalation_candidates.iter().enumerate() {
                         let tile_x = (flat_tile_idx % cols) as u8;
                         let tile_y = (flat_tile_idx / cols) as u8;
+                        // Skip tiles already promoted to Cdf53 by the dirty
+                        // Phase B above (same frame): the dirty path already
+                        // bumped, enqueued 14 passes, and reset
+                        // already_escalated_this_gen. Re-firing here would
+                        // bump again, supersede the just-enqueued passes,
+                        // emit 14 duplicate cdf53.emit lines, and waste a
+                        // GPU forward dispatch with the same coefficients.
+                        if matches!(
+                            self.metrics_tracker.get(tile_x as u32, tile_y as u32).codec_state,
+                            crate::tile::CodecState::Cdf53 { .. }
+                        ) {
+                            continue;
+                        }
                         let coeffs_i32 = unsafe {
                             std::slice::from_raw_parts(
                                 gpu_coeffs_ptr.add(slot * crate::encoder::cdf53::CDF53_TOTAL_COEFFS),
