@@ -115,6 +115,7 @@ pub fn tile_metrics() -> impl Strategy<Value = TileMetrics> {
             edge_density: EDGE_DENSITY_UNKNOWN,
             idle_frames: idle,
             codec_state: st,
+            already_escalated_this_gen: false,
         })
 }
 
@@ -135,5 +136,6 @@ pub fn tile_metrics_with_colors() -> impl Strategy<Value = TileMetrics> {
             edge_density: EDGE_DENSITY_UNKNOWN,
             idle_frames: idle,
             codec_state: st,
+            already_escalated_this_gen: false,
         })
 }

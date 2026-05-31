@@ -326,6 +326,7 @@ proptest! {
             unique_colors: UNIQUE_COLORS_UNKNOWN,
             edge_density: EDGE_DENSITY_UNKNOWN,
             codec_state: CodecState::Skip,
+            already_escalated_this_gen: false,
         };
         let next = classify_tile(&m, &prev);
         prop_assert!(!matches!(next, CodecState::H264 { .. }),
@@ -349,6 +350,7 @@ proptest! {
             unique_colors: uc,
             edge_density: EDGE_DENSITY_UNKNOWN,
             codec_state: CodecState::Skip,
+            already_escalated_this_gen: false,
         };
         let next = classify_tile(&m, &prev);
         prop_assert!(!matches!(next, CodecState::H264 { .. }),
@@ -382,6 +384,7 @@ proptest! {
             unique_colors: UNIQUE_COLORS_UNKNOWN,
             edge_density: EDGE_DENSITY_UNKNOWN,
             codec_state: CodecState::Skip,
+            already_escalated_this_gen: false,
         };
         let next = classify_tile(&m, &prev);
         prop_assert!(!matches!(next, CodecState::H264 { .. }),
@@ -405,6 +408,7 @@ proptest! {
             unique_colors: uc,
             edge_density: EDGE_DENSITY_UNKNOWN,
             codec_state: CodecState::Skip,
+            already_escalated_this_gen: false,
         };
         let next = classify_tile(&m, &prev);
         prop_assert!(!matches!(next, CodecState::H264 { .. }),
@@ -465,6 +469,7 @@ proptest! {
             unique_colors: 1,
             edge_density: EDGE_DENSITY_UNKNOWN,
             codec_state: CodecState::Skip,
+            already_escalated_this_gen: false,
         };
         let next = classify_tile(&m, &CodecState::Skip);
         prop_assert_eq!(next, CodecState::Solid);

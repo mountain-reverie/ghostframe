@@ -50,6 +50,14 @@ pub struct TileMetrics {
     /// next call to `classify_tile()` — the classifier reads it before
     /// overwriting it.
     pub codec_state: CodecState,
+
+    /// Has this tile been escalated to CDF 5/3 refinement during its current
+    /// generation? Set by `IoBridge`'s per-frame escalation sweep when it
+    /// enqueues refinement passes. Reset by `Scheduler::bump_generation`'s
+    /// callback (or equivalent path in io_bridge) whenever the generation
+    /// changes. Prevents the sweep from re-enqueueing the same tile every
+    /// frame after escalation while it's still idle.
+    pub already_escalated_this_gen: bool,
 }
 
 impl Default for TileMetrics {
@@ -61,6 +69,7 @@ impl Default for TileMetrics {
             edge_density: EDGE_DENSITY_UNKNOWN,
             idle_frames: 0,
             codec_state: CodecState::Skip,
+            already_escalated_this_gen: false,
         }
     }
 }
@@ -465,5 +474,11 @@ mod tests {
         // edge_density sentinel. Task 6 callers must avoid raw assert_eq! when
         // the sentinel may be in effect.
         assert_ne!(TileMetrics::default(), TileMetrics::default());
+    }
+
+    #[test]
+    fn tile_metrics_default_has_already_escalated_false() {
+        let m = TileMetrics::default();
+        assert!(!m.already_escalated_this_gen);
     }
 }

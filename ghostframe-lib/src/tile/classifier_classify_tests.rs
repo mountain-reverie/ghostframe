@@ -8,6 +8,7 @@ fn metrics(freq: f32, mag: f32, idle: u32, unique_colors: u16) -> TileMetrics {
         unique_colors,
         edge_density: super::super::EDGE_DENSITY_UNKNOWN,
         codec_state: CodecState::Skip,
+        already_escalated_this_gen: false,
     }
 }
 
