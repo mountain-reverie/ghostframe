@@ -378,7 +378,7 @@ impl GpuFrameProcessor {
         )?;
 
         // --- Descriptor pool ---
-        // 14 sets: SAD (2 STORAGE_IMAGE + 1 STORAGE_BUFFER)
+        // 17 sets: SAD (2 STORAGE_IMAGE + 1 STORAGE_BUFFER)
         //        + NV12 (1 STORAGE_IMAGE + 1 STORAGE_BUFFER)
         //        + Analysis (1 STORAGE_IMAGE + 1 STORAGE_BUFFER)
         //        + palrle_compact (4 STORAGE_BUFFER)
@@ -392,20 +392,24 @@ impl GpuFrameProcessor {
         //        + cdf53_forward_l1 (1 STORAGE_IMAGE + 2 STORAGE_BUFFER) ← Task 7
         //        + cdf53_forward_l2 (2 STORAGE_BUFFER)   ← Task 7
         //        + cdf53_forward_l3 (2 STORAGE_BUFFER)   ← Task 7
-        // Total: 7 STORAGE_IMAGE, 35 STORAGE_BUFFER, 14 max_sets.
+        //        + cdf53_forward_l1 (escalation) (1 STORAGE_IMAGE + 2 STORAGE_BUFFER) ← Task 8
+        //        + cdf53_forward_l2 (escalation) (2 STORAGE_BUFFER)  ← Task 8
+        //        + cdf53_forward_l3 (escalation) (2 STORAGE_BUFFER)  ← Task 8
+        // Total: 8 STORAGE_IMAGE, 41 STORAGE_BUFFER, 17 required sets.
+        // max_sets=20: +3 headroom for future pipeline stages (e.g. M3.3d+).
         let pool_sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_IMAGE,
-                descriptor_count: 7,
+                descriptor_count: 8,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: 35,
+                descriptor_count: 41,
             },
         ];
         let dp_ci = vk::DescriptorPoolCreateInfo::default()
             .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
-            .max_sets(14)
+            .max_sets(20)
             .pool_sizes(&pool_sizes);
         let descriptor_pool = device.create_descriptor_pool(&dp_ci, None)?;
 
