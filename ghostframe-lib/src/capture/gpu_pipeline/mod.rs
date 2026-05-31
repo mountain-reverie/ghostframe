@@ -48,6 +48,11 @@ const SAD_THRESHOLD: u32 = 64;
 /// Matches `tile::UNIQUE_COLORS_UNKNOWN` (u16::MAX = 65535) cast to u32.
 const UNIQUE_COLORS_UNKNOWN_SENTINEL: u32 = u16::MAX as u32;
 
+/// M3.3c escalation cap: maximum number of idle-escalation candidates the
+/// io_bridge will dispatch in a single frame. Bounds GPU memory for the
+/// dedicated escalation_coefficients_buffer (K × 3072 × 4 = 6 MB at K=512).
+pub const MAX_ESCALATION_PER_FRAME: usize = 512;
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -335,6 +340,26 @@ pub struct GpuFrameProcessor {
     // Each compact slot `c` occupies `3 * 1024` i32 entries at
     // offset `c * 3 * 1024`. Phase B reads and casts each i32 to i16.
     pub cdf53_coefficients_ptr: *const i32,
+
+    // M3.3c — idle-escalation second-dispatch resources. CPU writes the
+    // escalation list + count via host-coherent buffer; second invocation of
+    // the cdf53_forward_l{1,2,3} shaders reads them and writes coefficients
+    // into the dedicated escalation_coefficients_buffer. K = MAX_ESCALATION_PER_FRAME
+    // bounds the dispatch + the buffer sizes.
+    pub(crate) cdf53_escalation_list_buffer: vk::Buffer,
+    pub(crate) cdf53_escalation_list_memory: vk::DeviceMemory,
+    /// CPU writes tile-idx values via this pointer (host-coherent).
+    pub cdf53_escalation_list_ptr: *mut u32,
+
+    pub(crate) cdf53_escalation_count_buffer: vk::Buffer,
+    pub(crate) cdf53_escalation_count_memory: vk::DeviceMemory,
+    /// CPU writes per-frame escalation count via this pointer (host-coherent).
+    pub cdf53_escalation_count_ptr: *mut u32,
+
+    pub(crate) cdf53_escalation_coefficients_buffer: vk::Buffer,
+    pub(crate) cdf53_escalation_coefficients_memory: vk::DeviceMemory,
+    /// CPU reads escalation forward coefficients via this pointer post-fence.
+    pub cdf53_escalation_coefficients_ptr: *const i32,
 
     // Cdf53 forward L1 pipeline (Stage 4c-L1, added M3.3a Task 7)
     cdf53_forward_l1_shader_module: vk::ShaderModule,
@@ -763,6 +788,19 @@ impl Drop for GpuFrameProcessor {
             self.device.unmap_memory(self.cdf53_coefficients_memory);
             self.device.destroy_buffer(self.cdf53_coefficients_buffer, None);
             self.device.free_memory(self.cdf53_coefficients_memory, None);
+
+            // M3.3c escalation buffers
+            self.device.unmap_memory(self.cdf53_escalation_list_memory);
+            self.device.destroy_buffer(self.cdf53_escalation_list_buffer, None);
+            self.device.free_memory(self.cdf53_escalation_list_memory, None);
+
+            self.device.unmap_memory(self.cdf53_escalation_count_memory);
+            self.device.destroy_buffer(self.cdf53_escalation_count_buffer, None);
+            self.device.free_memory(self.cdf53_escalation_count_memory, None);
+
+            self.device.unmap_memory(self.cdf53_escalation_coefficients_memory);
+            self.device.destroy_buffer(self.cdf53_escalation_coefficients_buffer, None);
+            self.device.free_memory(self.cdf53_escalation_coefficients_memory, None);
 
             // Cdf53 forward L1 pipeline (Stage 4c-L1)
             self.device

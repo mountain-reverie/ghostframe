@@ -742,6 +742,60 @@ impl GpuFrameProcessor {
             )?;
         let cdf53_coefficients_ptr = cdf53_coefficients_ptr_mut as *const i32;
 
+        // --- M3.3c escalation list buffer ---
+        // K = MAX_ESCALATION_PER_FRAME u32 values. HOST_VISIBLE | HOST_COHERENT.
+        // CPU writes tile-idx candidates each frame before escalation dispatch.
+        let cdf53_escalation_list_size =
+            (crate::capture::gpu_pipeline::MAX_ESCALATION_PER_FRAME as vk::DeviceSize) * 4;
+        let (
+            cdf53_escalation_list_buffer,
+            cdf53_escalation_list_memory,
+            cdf53_escalation_list_ptr,
+        ) = alloc_host_buffer_mapped::<u32>(
+            &device,
+            &mem_props,
+            cdf53_escalation_list_size,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            "cdf53 escalation list buffer",
+        )?;
+
+        // --- M3.3c escalation count buffer ---
+        // 1 u32 (4 bytes). HOST_VISIBLE | HOST_COHERENT.
+        // CPU writes per-frame escalation count before dispatch.
+        let cdf53_escalation_count_size = 4_u64;
+        let (
+            cdf53_escalation_count_buffer,
+            cdf53_escalation_count_memory,
+            cdf53_escalation_count_ptr,
+        ) = alloc_host_buffer_mapped::<u32>(
+            &device,
+            &mem_props,
+            cdf53_escalation_count_size,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            "cdf53 escalation count buffer",
+        )?;
+
+        // --- M3.3c escalation coefficients buffer ---
+        // K * CDF53_TOTAL_COEFFS * size_of::<i32>() = 512 * 3072 * 4 = 6 MiB.
+        // HOST_VISIBLE | HOST_COHERENT, persistently mapped for post-fence readback.
+        // CPU reads escalation forward output after fence via *const i32 ptr.
+        let cdf53_escalation_coefficients_size =
+            (crate::capture::gpu_pipeline::MAX_ESCALATION_PER_FRAME as vk::DeviceSize)
+                * (crate::encoder::cdf53::CDF53_TOTAL_COEFFS as vk::DeviceSize)
+                * 4;
+        let (
+            cdf53_escalation_coefficients_buffer,
+            cdf53_escalation_coefficients_memory,
+            cdf53_escalation_coefficients_ptr_mut,
+        ) = alloc_host_buffer_mapped::<i32>(
+            &device,
+            &mem_props,
+            cdf53_escalation_coefficients_size,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            "cdf53 escalation coefficients buffer",
+        )?;
+        let cdf53_escalation_coefficients_ptr = cdf53_escalation_coefficients_ptr_mut as *const i32;
+
         Ok(Self {
             _entry: entry,
             instance,
@@ -794,6 +848,15 @@ impl GpuFrameProcessor {
             cdf53_coefficients_buffer,
             cdf53_coefficients_memory,
             cdf53_coefficients_ptr,
+            cdf53_escalation_list_buffer,
+            cdf53_escalation_list_memory,
+            cdf53_escalation_list_ptr,
+            cdf53_escalation_count_buffer,
+            cdf53_escalation_count_memory,
+            cdf53_escalation_count_ptr,
+            cdf53_escalation_coefficients_buffer,
+            cdf53_escalation_coefficients_memory,
+            cdf53_escalation_coefficients_ptr,
             cdf53_forward_l1_shader_module,
             cdf53_forward_l1_pipeline,
             cdf53_forward_l1_pipeline_layout,

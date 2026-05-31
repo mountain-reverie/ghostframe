@@ -4,6 +4,13 @@
 #include <stdlib.h>
 
 /**
+ * M3.3c escalation cap: maximum number of idle-escalation candidates the
+ * io_bridge will dispatch in a single frame. Bounds GPU memory for the
+ * dedicated escalation_coefficients_buffer (K × 3072 × 4 = 6 MB at K=512).
+ */
+#define MAX_ESCALATION_PER_FRAME 512
+
+/**
  * Number of progressive passes emitted per Cdf53 tile.
  * = 1 sign-bit-plane + 13 magnitude bit-planes covering worst-case
  * 14-bit signed coefficients after 3 levels of CDF 5/3 lifting on
