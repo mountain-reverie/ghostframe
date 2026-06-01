@@ -3,6 +3,7 @@ pub mod client_caps;
 pub mod decode_error;
 pub mod fec;
 pub mod feedback;
+pub mod fragment_coverage;
 pub mod ghostbridge;
 pub mod io_bridge;
 pub mod protocol;
