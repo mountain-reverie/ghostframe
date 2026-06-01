@@ -50,13 +50,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("CERT_HASH_SHA256={}", server.cert_hash());
 
     // Select capture backend: try DRM first, fall back to X11.
-    let backend = match drm_capture::capture_prime_fd() {
-        Ok((fd, geom)) => {
-            drop(fd);
+    let backend = match drm_capture::capture() {
+        Ok(result) => {
+            let (path_label, w, h) = match &result {
+                drm_capture::CaptureResult::Prime(_, g) => {
+                    ("zero-copy GPU path (PRIME DMA-BUF)", g.width, g.height)
+                }
+                drm_capture::CaptureResult::Pixels(_, g) => {
+                    ("CPU-mmap path (modesetting FB)", g.width, g.height)
+                }
+            };
+            drop(result);
             tracing::info!(
-                width = geom.width,
-                height = geom.height,
-                "DRM capture available (zero-copy GPU path)"
+                width = w,
+                height = h,
+                "DRM capture available ({})",
+                path_label
             );
             CaptureBackend::Drm
         }
@@ -99,8 +108,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         });
 
         let submission = match &backend {
-            CaptureBackend::Drm => match drm_capture::capture_prime_fd() {
-                Ok((dmabuf_fd, geom)) => {
+            CaptureBackend::Drm => match drm_capture::capture() {
+                Ok(drm_capture::CaptureResult::Prime(dmabuf_fd, geom)) => {
                     let timestamp_us = (frame_count * frame_interval.as_micros() as u64) as u32;
                     Some(FrameSubmission {
                         width: geom.width,
@@ -108,6 +117,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         stride: geom.stride,
                         pixels: Vec::new(),
                         dmabuf_fd: Some(dmabuf_fd),
+                        timestamp_us,
+                        damage_tiles: damage_tiles.clone(),
+                    })
+                }
+                Ok(drm_capture::CaptureResult::Pixels(pixels, geom)) => {
+                    let timestamp_us = (frame_count * frame_interval.as_micros() as u64) as u32;
+                    Some(FrameSubmission {
+                        width: geom.width,
+                        height: geom.height,
+                        stride: geom.stride,
+                        pixels,
+                        dmabuf_fd: None,
                         timestamp_us,
                         damage_tiles: damage_tiles.clone(),
                     })

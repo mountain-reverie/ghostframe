@@ -589,6 +589,22 @@ impl GpuFrameProcessor {
         unsafe { self.process_frame_inner(fd, width, height, stride) }
     }
 
+    /// CPU-pixels variant of [`process_frame`]: same SAD + NV12 + classifier
+    /// pipeline, but the current frame's BGRA pixels are uploaded from host
+    /// memory instead of imported via DMA-BUF.
+    ///
+    /// `stride` is the source row stride in bytes (must be >= width*4).
+    /// `pixels.len()` must be at least `stride * height`.
+    pub fn process_frame_from_pixels(
+        &mut self,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        stride: u32,
+    ) -> Result<FrameAnalysis, Box<dyn std::error::Error>> {
+        unsafe { self.process_frame_inner_from_pixels(pixels, width, height, stride) }
+    }
+
     /// Compare the DMA-BUF frame at `fd` against the previous frame.
     ///
     /// Returns flat tile indices of dirty tiles.  On the first call (no

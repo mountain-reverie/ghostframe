@@ -200,6 +200,49 @@ impl GpuFrameProcessor {
         result
     }
 
+    /// CPU-pixels variant of `process_frame_inner`: uploads BGRA pixels from
+    /// host memory into a transient HOST_VISIBLE LINEAR STORAGE VkImage and
+    /// runs the same SAD/NV12/classifier pipeline as the DMA-BUF path.
+    ///
+    /// Used by the `xdaemon`'s modesetting-FB capture path when DMA-BUF cross-
+    /// device import is unreliable (e.g. VKMS exporter → discrete-GPU importer).
+    pub(super) unsafe fn process_frame_inner_from_pixels(
+        &mut self,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        stride: u32,
+    ) -> Result<FrameAnalysis, Box<dyn std::error::Error>> {
+        let escalation_count_this_frame = self.staged_escalation_count;
+        self.staged_escalation_count = 0;
+
+        let geom = FrameGeometry::from_dims(width, height);
+
+        if geom.tile_count() > self.max_tiles {
+            return Err(format!(
+                "tile_count {} exceeds max_tiles {}",
+                geom.tile_count(),
+                self.max_tiles
+            )
+            .into());
+        }
+
+        if width != self.last_width || height != self.last_height {
+            if let Some(prev) = self.prev_image.take() {
+                self.destroy_prev_frame(prev);
+            }
+            self.last_width = width;
+            self.last_height = height;
+        }
+
+        self.ensure_nv12_buffer(width, height)?;
+
+        let current = self.import_pixels(pixels, width, height, stride)?;
+        let result = self.process_frame_with_imported(&current, geom, escalation_count_this_frame);
+        self.destroy_prev_frame(current);
+        result
+    }
+
     /// Run SAD + NV12 + snapshot-copy against an already-imported DMA-BUF
     /// VkImage. Splits out the destruction of `current` from
     /// [`process_frame_inner`] so the cleanup path is bullet-proof regardless
@@ -2148,6 +2191,142 @@ impl GpuFrameProcessor {
         self.device.destroy_image_view(frame.view, None);
         self.device.destroy_image(frame.image, None);
         self.device.free_memory(frame.memory, None);
+    }
+
+    /// Upload BGRA pixels from CPU memory into a HOST_VISIBLE LINEAR STORAGE
+    /// VkImage and return it as a `PrevFrame`. Mirrors `import_dmabuf` for the
+    /// non-zero-copy capture path used when DMA-BUF import is unreliable
+    /// (e.g. VKMS exporter → discrete-GPU importer: same-GPU + UMA works, but
+    /// cross-device produces stale/scrambled content).
+    ///
+    /// The result is a transient image: the caller passes it to
+    /// `process_frame_with_imported` and then calls `destroy_prev_frame`.
+    unsafe fn import_pixels(
+        &self,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        stride: u32,
+    ) -> Result<PrevFrame, Box<dyn std::error::Error>> {
+        let required = (stride as usize) * (height as usize);
+        if pixels.len() < required {
+            return Err(format!(
+                "import_pixels: pixels.len()={} < stride*height={}",
+                pixels.len(),
+                required
+            )
+            .into());
+        }
+
+        // Create LINEAR STORAGE image first so we can query its real row pitch.
+        let image_ci = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::B8G8R8A8_UNORM)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::LINEAR)
+            .usage(vk::ImageUsageFlags::STORAGE)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::PREINITIALIZED);
+        let image = self.device.create_image(&image_ci, None)?;
+
+        let mem_reqs = self.device.get_image_memory_requirements(image);
+        let mem_props = self
+            .instance
+            .get_physical_device_memory_properties(self.physical_device);
+
+        let mem_type = find_memory_type(
+            &mem_props,
+            mem_reqs.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )
+        .ok_or_else(|| {
+            // Image creation succeeded; release it before bubbling up.
+            self.device.destroy_image(image, None);
+            "no HOST_VISIBLE+HOST_COHERENT memory type for LINEAR STORAGE image"
+        })?;
+
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(mem_reqs.size)
+            .memory_type_index(mem_type);
+        let memory = match self.device.allocate_memory(&alloc_info, None) {
+            Ok(m) => m,
+            Err(e) => {
+                self.device.destroy_image(image, None);
+                return Err(e.into());
+            }
+        };
+        if let Err(e) = self.device.bind_image_memory(image, memory, 0) {
+            self.device.free_memory(memory, None);
+            self.device.destroy_image(image, None);
+            return Err(e.into());
+        }
+
+        // Query subresource layout so we can copy row-by-row at the GPU's
+        // expected row pitch (LINEAR images may pad rows for alignment).
+        let subresource = vk::ImageSubresource::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .mip_level(0)
+            .array_layer(0);
+        let sl = self.device.get_image_subresource_layout(image, subresource);
+        let gpu_row_pitch = sl.row_pitch as usize;
+        let gpu_offset = sl.offset as usize;
+
+        // Map and memcpy row-by-row.
+        let map_ptr = self
+            .device
+            .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())?
+            as *mut u8;
+        let src_row_pitch = stride as usize;
+        let copy_bytes_per_row = src_row_pitch.min(gpu_row_pitch);
+        for row in 0..(height as usize) {
+            let src = pixels.as_ptr().add(row * src_row_pitch);
+            let dst = map_ptr.add(gpu_offset + row * gpu_row_pitch);
+            std::ptr::copy_nonoverlapping(src, dst, copy_bytes_per_row);
+        }
+        self.device.unmap_memory(memory);
+
+        // Create VkImageView.
+        let view_ci = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(vk::Format::B8G8R8A8_UNORM)
+            .components(vk::ComponentMapping {
+                r: vk::ComponentSwizzle::IDENTITY,
+                g: vk::ComponentSwizzle::IDENTITY,
+                b: vk::ComponentSwizzle::IDENTITY,
+                a: vk::ComponentSwizzle::IDENTITY,
+            })
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        let view = match self.device.create_image_view(&view_ci, None) {
+            Ok(v) => v,
+            Err(e) => {
+                self.device.free_memory(memory, None);
+                self.device.destroy_image(image, None);
+                return Err(e.into());
+            }
+        };
+
+        Ok(PrevFrame {
+            image,
+            memory,
+            view,
+            layout: vk::ImageLayout::PREINITIALIZED,
+            width,
+            height,
+        })
     }
 
     /// Allocate an own (non-DMA-BUF, DEVICE_LOCAL) `B8G8R8A8_UNORM` image used

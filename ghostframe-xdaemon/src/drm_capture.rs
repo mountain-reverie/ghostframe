@@ -17,10 +17,20 @@
 //!
 //! 2. **Modesetting framebuffer path** (fallback for hardware without a
 //!    writeback connector).  Find the active CRTC, take the framebuffer
-//!    that's currently attached, and PRIME-export its backing buffer
-//!    directly.  Works on real hardware where the scanout BO is the FB
-//!    Xorg writes to, but unreliable on VKMS where Xorg's post-startup
-//!    writes don't propagate to the dumb buffer.
+//!    that's currently attached, **CPU-mmap the backing BO and copy its
+//!    pixels into a Vec<u8>** that callers feed into the CPU-classifier
+//!    upload path. We deliberately do NOT PRIME-export this BO for zero-
+//!    copy GPU import: cross-device dma-buf imports (e.g. VKMS card0 as
+//!    source, real GPU card1 as Vulkan consumer) suffer from a kernel-
+//!    level coherency gap on AMD discrete GPUs — the IOMMU mapping
+//!    resolves to memory that doesn't track CPU writes from foreign
+//!    producers (Xorg's dumb buffer mmap). The GPU compute reads back
+//!    stale or scrambled content depending on the barrier shape.
+//!    CPU-mmap + memcpy avoids this entirely: we read the BO exactly
+//!    where Xorg wrote, hand pixels to the lib's existing CPU upload
+//!    path, and let the Vulkan compute pipeline analyse from a staging
+//!    buffer it owns. Cost: ~1 memcpy of width × stride bytes per frame
+//!    (≈8 MB at 1920×1080 → ≈3 ms at 30 fps), well within budget.
 //!
 //! `capture_prime_fd()` keeps a thread-safe internal cache so the
 //! per-process probe and target-buffer allocation only happen once.
@@ -82,6 +92,19 @@ pub struct FbGeometry {
     pub stride: u32,
 }
 
+/// One frame's worth of pixel data, returned from `capture()`.
+///
+/// Two variants reflecting the two capture paths:
+///   - `Prime(fd, geom)`: zero-copy PRIME DMA-BUF export, suitable for
+///     Vulkan import. Returned by the writeback path.
+///   - `Pixels(bgra, geom)`: CPU-mmap'd BO copied into a Vec<u8> in BGRA
+///     order with stride `geom.stride`. Returned by the modesetting-FB
+///     path. Skips zero-copy intentionally — see module docs.
+pub enum CaptureResult {
+    Prime(OwnedFd, FbGeometry),
+    Pixels(Vec<u8>, FbGeometry),
+}
+
 /// Per-process state cached across captures: holds the open card, the
 /// active CRTC, and (optionally) the writeback target buffer + property
 /// handles needed to drive atomic commits.
@@ -112,8 +135,13 @@ static STATE: OnceLock<Option<Mutex<CaptureState>>> = OnceLock::new();
 
 /// Open the first available DRM card and prepare a capture path.
 ///
-/// Returns a snapshot of the active framebuffer as a PRIME DMA-BUF fd
-/// together with its geometry. Caller owns the fd.
+/// Returns a snapshot of the active framebuffer. Caller owns the
+/// returned data:
+///   - `CaptureResult::Prime(fd, geom)` for the writeback path (zero-
+///     copy DMA-BUF, ready for Vulkan import).
+///   - `CaptureResult::Pixels(bgra, geom)` for the modesetting-FB path
+///     (CPU-mmap'd copy in `BGRA` order, ready for the lib's CPU
+///     upload path).
 ///
 /// First call performs the probe (open card, look for writeback connector,
 /// allocate target buffer if applicable). Subsequent calls reuse the
@@ -122,7 +150,7 @@ static STATE: OnceLock<Option<Mutex<CaptureState>>> = OnceLock::new();
 /// Returns `Err` — not a panic — if no DRM card is available or
 /// initialisation fails, allowing callers like `main` to fall back to the
 /// X11 capture path.
-pub fn capture_prime_fd() -> std::io::Result<(OwnedFd, FbGeometry)> {
+pub fn capture() -> std::io::Result<CaptureResult> {
     let slot = STATE.get_or_init(|| match initialize_state() {
         Ok(state) => Some(Mutex::new(state)),
         Err(e) => {
@@ -140,18 +168,17 @@ pub fn capture_prime_fd() -> std::io::Result<(OwnedFd, FbGeometry)> {
     // Borrow the writeback option separately so the rest of the state
     // (card, crtc) can be passed to the helper.
     if state.writeback.is_some() {
-        // Re-borrow with an immutable view of the parts we need.
         let crtc = state.crtc;
-        // We need a mutable borrow of writeback inside the helper for
-        // map_dumb_buffer (which is called only on the dumb buffer; we
-        // don't actually mutate the field). Pass split refs.
         let card = &state.card;
         let wb = state.writeback.as_ref().unwrap();
-        return capture_via_writeback(card, crtc, wb);
+        let (fd, geom) = capture_via_writeback(card, crtc, wb)?;
+        return Ok(CaptureResult::Prime(fd, geom));
     }
 
-    // Fallback: legacy modesetting framebuffer path.
-    capture_via_modesetting_fb(&state.card, state.crtc)
+    // Modesetting framebuffer path: CPU-mmap the scanout BO + memcpy.
+    // See module docs for why we don't PRIME-export this case.
+    let (pixels, geom) = capture_via_modesetting_fb_cpu(&state.card, state.crtc)?;
+    Ok(CaptureResult::Pixels(pixels, geom))
 }
 
 fn initialize_state() -> std::io::Result<CaptureState> {
@@ -399,13 +426,13 @@ fn capture_via_writeback(
     ))
 }
 
-/// Legacy capture path: PRIME-export the framebuffer currently attached
-/// to the active CRTC. Works on hardware where the scanout BO is what's
-/// actually being written to.
-fn capture_via_modesetting_fb(
+/// Modesetting capture path: CPU-mmap the scanout BO + memcpy its
+/// pixels into a `Vec<u8>`. Returns BGRA pixels in `geom.stride` row
+/// order. See module docs for why we don't PRIME-export this case.
+fn capture_via_modesetting_fb_cpu(
     card: &Card,
     crtc: crtc::Handle,
-) -> std::io::Result<(OwnedFd, FbGeometry)> {
+) -> std::io::Result<(Vec<u8>, FbGeometry)> {
     let crtc_info = card.get_crtc(crtc)?;
     let fb_handle = crtc_info
         .framebuffer()
@@ -413,33 +440,100 @@ fn capture_via_modesetting_fb(
 
     // Try FB2 (drmModeGetFB2) first — handles GBM/multi-plane framebuffers
     // that the modern modesetting driver creates. Fall back to legacy FB1.
-    let (width, height, stride, prime_fd) = if let Ok(fb2) = card.get_planar_framebuffer(fb_handle)
-    {
-        let (w, h) = fb2.size();
-        let s = fb2.pitches()[0];
-        let buf_handle = fb2.buffers()[0]
-            .ok_or_else(|| std::io::Error::other("FB2 plane 0 has no buffer handle"))?;
-        let fd = card.buffer_to_prime_fd(buf_handle, 0)?;
-        (w, h, s, fd)
-    } else {
-        let fb_info = card.get_framebuffer(fb_handle)?;
-        let (w, h) = fb_info.size();
-        let s = fb_info.pitch();
-        let buf_handle = fb_info
-            .buffer()
-            .ok_or_else(|| std::io::Error::other("FB1 has no backing buffer handle"))?;
-        let fd = card.buffer_to_prime_fd(buf_handle, 0)?;
-        (w, h, s, fd)
+    let (width, height, stride, buf_handle) =
+        if let Ok(fb2) = card.get_planar_framebuffer(fb_handle) {
+            let (w, h) = fb2.size();
+            let s = fb2.pitches()[0];
+            let h0 = fb2.buffers()[0]
+                .ok_or_else(|| std::io::Error::other("FB2 plane 0 has no buffer handle"))?;
+            (w, h, s, h0)
+        } else {
+            let fb_info = card.get_framebuffer(fb_handle)?;
+            let (w, h) = fb_info.size();
+            let s = fb_info.pitch();
+            let h0 = fb_info
+                .buffer()
+                .ok_or_else(|| std::io::Error::other("FB1 has no backing buffer handle"))?;
+            (w, h, s, h0)
+        };
+
+    // mmap the GEM buffer for CPU read. We use the DRM "map dumb" ioctl
+    // path via PRIME export → mmap on the resulting fd, because the
+    // foreign-buffer (FB2-discovered) BO handle is opaque to us and may
+    // not be a dumb buffer — but PRIME-exporting it and then mmap'ing
+    // the resulting dma-buf fd always yields a CPU-readable view when
+    // the buffer is plain system memory (true for VKMS scanout BOs and
+    // for modesetting-driven dumb buffers on real hardware).
+    let prime_fd = card.buffer_to_prime_fd(buf_handle, 0)?;
+
+    let size = (stride as usize) * (height as usize);
+    let raw_fd = prime_fd.as_raw_fd();
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            raw_fd,
+            0,
+        )
     };
+    if ptr == libc::MAP_FAILED {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // DMA_BUF_IOCTL_SYNC(START_CPU_ACCESS | READ) triggers the dma-buf
+    // begin_cpu_access callback which flushes any CPU cache lines holding
+    // unposted writes from external producers (Xorg). On VKMS specifically
+    // this is the difference between reading stale init bytes and reading
+    // the freshly-painted content. Pair with END after the memcpy per the
+    // kernel contract.
+    sync_prime_fd(&prime_fd, /*end=*/ false);
+
+    // SAFETY: ptr is valid for `size` bytes (mmap success), read-only.
+    let pixels = unsafe { std::slice::from_raw_parts(ptr as *const u8, size) }.to_vec();
+
+    sync_prime_fd(&prime_fd, /*end=*/ true);
+
+    unsafe {
+        libc::munmap(ptr as *mut libc::c_void, size);
+    }
+    // prime_fd dropped here, closing the dma-buf reference.
 
     Ok((
-        prime_fd,
+        pixels,
         FbGeometry {
             width,
             height,
             stride,
         },
     ))
+}
+
+/// Issue a `DMA_BUF_IOCTL_SYNC` with the `READ` flag and the given
+/// start/end direction. Silently ignores errors — the sync is a best-
+/// effort cache flush; if the kernel doesn't support it on this fd we
+/// fall back to the CPU's own coherency (which on most x86 systems is
+/// good enough for plain system memory).
+fn sync_prime_fd(fd: &OwnedFd, end: bool) {
+    #[repr(C)]
+    struct DmaBufSync {
+        flags: u64,
+    }
+    // _IOW('b', 0, struct dma_buf_sync) = 0x40086200
+    const DMA_BUF_IOCTL_SYNC: libc::c_ulong = 0x40086200;
+    // Per include/uapi/linux/dma-buf.h:
+    //   READ  = 1 << 0,  WRITE = 2 << 0
+    //   START = 0 << 2,  END   = 1 << 2
+    const DMA_BUF_SYNC_READ: u64 = 1 << 0;
+    const DMA_BUF_SYNC_START: u64 = 0 << 2;
+    const DMA_BUF_SYNC_END: u64 = 1 << 2;
+
+    let direction = if end { DMA_BUF_SYNC_END } else { DMA_BUF_SYNC_START };
+    let mut req = DmaBufSync {
+        flags: direction | DMA_BUF_SYNC_READ,
+    };
+    let _ = unsafe { libc::ioctl(fd.as_raw_fd(), DMA_BUF_IOCTL_SYNC, &mut req) };
 }
 
 fn open_first_card() -> std::io::Result<Card> {

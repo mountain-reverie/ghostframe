@@ -495,7 +495,13 @@ impl IoBridge {
     /// DMA-BUF readback (out of scope for M3.2c). If you need a raw-BGRA dump on
     /// the GPU path, implement DMA-BUF readback in `process_frame_gpu` first.
     fn process_frame(&mut self, frame: FrameSubmission) {
-        if frame.dmabuf_fd.is_some() && self.gpu_frame_processor.is_some() {
+        // Route to the GPU classifier whenever a processor is available and
+        // we have *either* a DMA-BUF fd (zero-copy path) *or* CPU pixels
+        // (modesetting-FB fallback uploads them into a HOST_VISIBLE VkImage).
+        // Without this, CPU-pixel frames hit `process_frame_cpu` which emits
+        // every tile as `Codec::Raw` and never exercises the wavelet path.
+        let has_gpu_input = frame.dmabuf_fd.is_some() || !frame.pixels.is_empty();
+        if has_gpu_input && self.gpu_frame_processor.is_some() {
             self.process_frame_gpu(frame);
         } else {
             self.process_frame_cpu(frame);
@@ -1172,8 +1178,10 @@ impl IoBridge {
     /// GPU-accelerated full-frame pipeline: Vulkan compute dirty detection +
     /// VA-API VPP BGRA→NV12 conversion + H.264 encoding (true zero-copy).
     fn process_frame_gpu(&mut self, frame: FrameSubmission) {
-        let fd = frame.dmabuf_fd.as_ref().unwrap();
-        let raw_fd = fd.as_raw_fd();
+        // Either a DMA-BUF fd (zero-copy import) or CPU pixels (upload via
+        // HOST_VISIBLE staging image) must be present — the public dispatcher
+        // (`process_frame`) enforces that invariant.
+        let raw_fd = frame.dmabuf_fd.as_ref().map(|fd| fd.as_raw_fd());
 
         self.frame_seq = self.frame_seq.wrapping_add(1);
         let seq = self.frame_seq;
@@ -1231,17 +1239,27 @@ impl IoBridge {
             self.cdf53_escalation_candidates_this_frame = candidates;
         }
 
-        // GPU pipeline: Vulkan SAD dirty detection + NV12 conversion
+        // GPU pipeline: Vulkan SAD dirty detection + NV12 conversion.
+        // Dispatch to the DMA-BUF path if a fd was provided; otherwise upload
+        // the CPU pixel buffer via the HOST_VISIBLE staging-image variant.
         let processor = self.gpu_frame_processor.as_mut().unwrap();
-        let analysis =
-            match processor.process_frame(raw_fd, frame.width, frame.height, frame.stride) {
-                Ok(a) => a,
-                Err(e) => {
-                    tracing::warn!("GPU process_frame failed: {e}, falling back to CPU path");
-                    self.process_frame_cpu(frame);
-                    return;
-                }
-            };
+        let processor_result = match raw_fd {
+            Some(fd) => processor.process_frame(fd, frame.width, frame.height, frame.stride),
+            None => processor.process_frame_from_pixels(
+                &frame.pixels,
+                frame.width,
+                frame.height,
+                frame.stride,
+            ),
+        };
+        let analysis = match processor_result {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!("GPU process_frame failed: {e}, falling back to CPU path");
+                self.process_frame_cpu(frame);
+                return;
+            }
+        };
 
         tracing::debug!(
             seq,
