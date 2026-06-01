@@ -211,11 +211,23 @@ impl Scheduler {
     /// the coverage-ACK handler in `IoBridge::dispatch_ack_datagram` for
     /// each `FragmentCoverage` entry whose `codec == Codec::Cdf53`. Drives
     /// the PixelPerfect transition via `tile_fully_acked`.
+    ///
+    /// Also increments `delivery_window_acked` so the
+    /// `maybe_adjust_refinement_fraction` heuristic continues to see
+    /// successful Cdf53 delivery and can grow the refinement bandwidth
+    /// fraction. This replaces the increment that used to live inside
+    /// `on_ack` before its M3.3d deletion.
     pub fn record_cdf53_ack(&mut self, tile_x: u8, tile_y: u8, generation: u8) {
         let counter = self.cdf53_passes_acked
             .entry((tile_x, tile_y, generation))
             .or_insert(0);
         *counter = counter.saturating_add(1);
+        self.delivery_window_acked = self.delivery_window_acked.saturating_add(1);
+    }
+
+    #[cfg(test)]
+    pub fn delivery_window_acked_for_test(&self) -> u32 {
+        self.delivery_window_acked
     }
 
     /// Returns true iff all `max_passes` passes for the given (tile, gen)
@@ -842,5 +854,38 @@ mod tests {
             .filter(|w| w.tile_x == 0 && w.tile_y == 0 && w.generation == gen2)
             .collect();
         assert_eq!(emitted_new_gen.len(), 14, "all 14 new-gen passes emit");
+    }
+
+    #[test]
+    fn record_cdf53_ack_increments_delivery_window_counter() {
+        let mut s = Scheduler::new(4, 4);
+        for _ in 0..5 {
+            s.record_cdf53_ack(2, 3, 1);
+        }
+        assert_eq!(s.delivery_window_acked_for_test(), 5);
+    }
+
+    #[test]
+    fn refinement_fraction_restores_on_recovery() {
+        let mut sch = Scheduler::new(8, 8);
+        sch.refinement_bandwidth_fraction = 0.05;
+        // 11 rounds: round 0 sees rate=0 (acks arrive after tick, credited to
+        // next round). Rounds 1..=10 each see rate=1.0; after 10 consecutive
+        // high-delivery rounds the fraction doubles from 0.05 to 0.1, which
+        // is > 0.05.
+        for round in 0..11u8 {
+            for i in 0..5u8 {
+                sch.enqueue_refinement(i, 0, 0, vec![vec![round, i]; 14]);
+            }
+            let emitted = sch.tick(100_000);
+            for w in &emitted {
+                sch.record_cdf53_ack(w.tile_x, w.tile_y, w.generation);
+            }
+        }
+        assert!(
+            sch.current_refinement_fraction() > 0.05,
+            "expected fraction to recover above 0.05 after 11 healthy rounds; got {}",
+            sch.current_refinement_fraction()
+        );
     }
 }
