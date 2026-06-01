@@ -35,6 +35,7 @@ rcgen = { workspace = true }
 rayon = "1.10"
 web-transport-proto = { workspace = true }
 sha2 = { workspace = true }
+smallvec = "1"
 hex = { workspace = true }
 libc = { workspace = true }
 time = { workspace = true }
