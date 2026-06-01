@@ -3526,3 +3526,42 @@ fn parse_last_pending_snapshot(logs: &str) -> Vec<(u8, u8, u8, u8)> {
     }
     out
 }
+
+/// M3.3d telemetry regression: with per-tile-pass ACKs, a Solid-only test
+/// pattern (which never produces Cdf53 entries) should:
+///   - Still send ACK batches (the wire confirms datagram delivery)
+///   - NOT log any cdf53.pixelperfect lines (no Cdf53 traffic at all)
+///   - NOT log any "ack_miss" lines (the wasted-ACK pattern from M3.3c is gone)
+///
+/// Catches future regressions where the ACK pipeline accidentally
+/// re-introduces per-tile semantics for non-Cdf53 codecs.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_ack_telemetry_no_waste() -> Result<()> {
+    let _setup = setup_e2e_webgpu_gpu("--solid-per-tile --drm-direct").await?;
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    let logs = helpers::read_server_logs_stripped("ghostframe-server");
+
+    let ack_batches = logs.lines().filter(|l| l.contains("ack_batch_received")).count();
+    let pixelperfect = logs.lines().filter(|l| l.contains("cdf53.pixelperfect")).count();
+    let ack_miss = logs.lines().filter(|l| l.contains("ack_miss")).count();
+
+    eprintln!("ack_batch_received: {ack_batches}");
+    eprintln!("cdf53.pixelperfect: {pixelperfect}");
+    eprintln!("ack_miss: {ack_miss}");
+
+    assert!(
+        ack_batches > 0,
+        "no ack_batch_received lines — client AckBatcher is not sending"
+    );
+    assert_eq!(
+        pixelperfect, 0,
+        "Solid-only pattern produced unexpected Cdf53 PixelPerfect transitions"
+    );
+    assert_eq!(
+        ack_miss, 0,
+        "Solid-only ACKs produced misses — the wasted-ACK pattern regressed"
+    );
+
+    Ok(())
+}

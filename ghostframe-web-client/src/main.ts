@@ -647,12 +647,18 @@ async function main() {
     // that occurs when multiple single-fragment work items share the same
     // frame_seq. Re-set the TILE_DATAGRAM_FLAG bit because the line above
     // already masked it off for downstream logic.
-    ackBatcher.add({
-      frameSeq: dgramHdr.frameSeq | TILE_DATAGRAM_FLAG,
-      tileX: tileHdr.tileX,
-      tileY: tileHdr.tileY,
-      passIdx: tileHdr.pass,
-    });
+    //
+    // Skip the frame-dimensions sentinel (0xFF, 0xFF): it's emitted outside
+    // the scheduler and has no coverage entry on the server — ACKing it would
+    // always produce an ack_miss log.
+    if (tileHdr.tileX !== FRAME_DIMENSIONS_SENTINEL_X || tileHdr.tileY !== FRAME_DIMENSIONS_SENTINEL_Y) {
+      ackBatcher.add({
+        frameSeq: dgramHdr.frameSeq | TILE_DATAGRAM_FLAG,
+        tileX: tileHdr.tileX,
+        tileY: tileHdr.tileY,
+        passIdx: tileHdr.pass,
+      });
+    }
 
     if (dgramHdr.frameSeq > latestFrameSeq) {
       latestFrameSeq = dgramHdr.frameSeq;

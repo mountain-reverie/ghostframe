@@ -772,10 +772,10 @@ impl IoBridge {
         );
         if data[0] == crate::transport::ack::ACK_BATCH_MSG_TYPE {
             if let Ok(batch) = crate::transport::ack::AckBatch::decode(data) {
-                tracing::debug!(
+                tracing::info!(
                     target: "ghostframe::cdf53",
-                    count = batch.entries.len(),
-                    "ack_batch_decoded"
+                    entry_count = batch.entries.len(),
+                    "ack_batch_received"
                 );
                 for e in batch.entries {
                     // Key matches how coverage is recorded at emit time:
@@ -783,10 +783,17 @@ impl IoBridge {
                     let key = (e.frame_seq, e.tile_x, e.tile_y, e.pass_idx);
                     let coverage = match self.fragment_coverage.take(key) {
                         Some(c) => c,
-                        None => continue, // ACK arrived after LRU eviction or
-                                          // for a key we never recorded —
-                                          // either way, no per-tile bookkeeping
-                                          // to do.
+                        None => {
+                            tracing::debug!(
+                                target: "ghostframe::cdf53",
+                                frame_seq = e.frame_seq,
+                                tile_x = e.tile_x,
+                                tile_y = e.tile_y,
+                                pass_idx = e.pass_idx,
+                                "ack_miss"
+                            );
+                            continue;
+                        }
                     };
                     for entry in coverage {
                         match entry.codec {
