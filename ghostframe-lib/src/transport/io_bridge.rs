@@ -28,6 +28,7 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep_until, Instant as TokioInstant};
 
 use rayon::prelude::*;
+use smallvec::smallvec;
 
 use crate::capture::gpu_pipeline::GpuFrameProcessor;
 use crate::encoder::h264_vaapi::FullFrameEncoder;
@@ -712,6 +713,34 @@ impl IoBridge {
                 &work.payload,
                 max_frag,
             );
+            // Record fragment coverage. Sub-option (a) per spec: only the
+            // FINAL fragment carries the tile entry; intermediate fragments
+            // contribute nothing (client can't usefully process the tile
+            // until assembly completes anyway).
+            let frame_seq_with_flag = seq | TILE_DATAGRAM_FLAG;
+            let n = datagrams.len();
+            if n > 0 {
+                let palette_id = if work.codec == crate::transport::protocol::Codec::PalRle {
+                    // PalRle payload byte 1 is the persistent palette slot id
+                    // (byte 0 is the bundled-flag); guarded against malformed
+                    // payloads via .get().
+                    work.payload.get(1).copied()
+                } else {
+                    None
+                };
+                let coverage: crate::transport::fragment_coverage::CoverageList =
+                    smallvec![crate::transport::fragment_coverage::FragmentCoverage {
+                        tile_x: work.tile_x,
+                        tile_y: work.tile_y,
+                        generation: work.generation,
+                        pass_idx: work.pass_idx,
+                        codec: work.codec,
+                        palette_id,
+                    }];
+                let final_frag_idx = (n - 1) as u16;
+                self.fragment_coverage
+                    .record((frame_seq_with_flag, final_frag_idx), coverage);
+            }
             for dg in &datagrams {
                 self.send_to_all_sessions(dg);
             }
