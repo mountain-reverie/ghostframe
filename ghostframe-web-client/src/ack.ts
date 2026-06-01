@@ -1,21 +1,22 @@
-// Batched-ACK datagram sender. Buffers per-tile ACK entries; flushes on
-// either ≥64 entries OR ≥5 ms since the last flush. One unreliable
+// Batched-ACK datagram sender. Buffers per-datagram ACK entries; flushes
+// on either ≥64 entries OR ≥5 ms since the last flush. One unreliable
 // WebTransport datagram per flush.
 //
-// Wire format mirrors transport/ack.rs:
-//   [0]      message_type = 0x02
+// Wire format mirrors transport/ack.rs (M3.3d):
+//   [0]      message_type = 0x03
 //   [1]      count: u8 (1..=64)
-//   [2..]    count × 4 bytes: tile_x, tile_y, (gen<<4)|pass, reserved=0
+//   [2..]    count × 6 bytes:
+//              [0..4]  frame_seq: u32 little-endian
+//              [4..6]  frag_idx:  u16 little-endian
 
-export const ACK_BATCH_MSG_TYPE = 0x02;
+export const ACK_BATCH_MSG_TYPE = 0x03;
 export const MAX_ACK_ENTRIES = 64;
+export const ACK_ENTRY_SIZE = 6;
 export const FLUSH_INTERVAL_MS = 5;
 
 export interface AckEntry {
-  tileX: number;
-  tileY: number;
-  generation: number;
-  pass: number;
+  frameSeq: number;
+  fragIdx: number;
 }
 
 export class AckBatcher {
@@ -43,15 +44,15 @@ export class AckBatcher {
     if (this.entries.length === 0) return;
 
     const count = Math.min(this.entries.length, MAX_ACK_ENTRIES);
-    const buf = new Uint8Array(2 + count * 4);
+    const buf = new Uint8Array(2 + count * ACK_ENTRY_SIZE);
     buf[0] = ACK_BATCH_MSG_TYPE;
     buf[1] = count;
+    const view = new DataView(buf.buffer);
     for (let i = 0; i < count; i++) {
       const e = this.entries[i];
-      buf[2 + i * 4 + 0] = e.tileX & 0xFF;
-      buf[2 + i * 4 + 1] = e.tileY & 0xFF;
-      buf[2 + i * 4 + 2] = ((e.generation & 0x0F) << 4) | (e.pass & 0x0F);
-      buf[2 + i * 4 + 3] = 0;
+      const off = 2 + i * ACK_ENTRY_SIZE;
+      view.setUint32(off, e.frameSeq >>> 0, /* littleEndian */ true);
+      view.setUint16(off + 4, e.fragIdx & 0xFFFF, /* littleEndian */ true);
     }
     this.entries.splice(0, count);
     this.send(buf);
