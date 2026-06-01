@@ -181,6 +181,13 @@ pub struct IoBridge {
     full_frame_encoder: Option<FullFrameEncoder>,
     /// Recent frame fragments for NACK retransmission. Key: (frame_seq, frag_idx).
     recent_frame_fragments: HashMap<(u32, u16), Vec<u8>>,
+    /// Per-datagram coverage map: (frame_seq, frag_idx) -> tiles whose
+    /// payload was carried in that datagram. Populated at emit time;
+    /// consumed by dispatch_ack_datagram on incoming ACKs. LRU-bounded by
+    /// FRAGMENT_COVERAGE_CAPACITY. Independent of `recent_frame_fragments`
+    /// (different lifetime semantics: retransmit window is RTT-bounded;
+    /// coverage retention is until-ACKed-or-evicted).
+    fragment_coverage: crate::transport::fragment_coverage::FragmentCoverageMap,
     /// Last (width, height) the server emitted as a frame-dimensions datagram.
     /// `None` means we've never emitted dimensions (first frame upcoming).
     last_emitted_dimensions: Option<(u32, u32)>,
@@ -445,6 +452,9 @@ impl IoBridge {
             gpu_frame_processor,
             full_frame_encoder: None,
             recent_frame_fragments: HashMap::new(),
+            fragment_coverage: crate::transport::fragment_coverage::FragmentCoverageMap::new(
+                crate::transport::fragment_coverage::FRAGMENT_COVERAGE_CAPACITY,
+            ),
             last_emitted_dimensions: None,
             dimensions_retransmits_left: 0,
         })
@@ -2271,6 +2281,9 @@ impl IoBridge {
             gpu_frame_processor: None,
             full_frame_encoder: None,
             recent_frame_fragments: HashMap::new(),
+            fragment_coverage: crate::transport::fragment_coverage::FragmentCoverageMap::new(
+                crate::transport::fragment_coverage::FRAGMENT_COVERAGE_CAPACITY,
+            ),
             last_emitted_dimensions: None,
             dimensions_retransmits_left: 0,
         }
@@ -2321,6 +2334,9 @@ impl IoBridge {
             gpu_frame_processor: None,
             full_frame_encoder: None,
             recent_frame_fragments: HashMap::new(),
+            fragment_coverage: crate::transport::fragment_coverage::FragmentCoverageMap::new(
+                crate::transport::fragment_coverage::FRAGMENT_COVERAGE_CAPACITY,
+            ),
             last_emitted_dimensions: None,
             dimensions_retransmits_left: 0,
         }
