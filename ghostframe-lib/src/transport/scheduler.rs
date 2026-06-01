@@ -273,6 +273,17 @@ impl Scheduler {
         resolved
     }
 
+    /// Increment the per-(tile, generation) Cdf53 ACK counter. Called from
+    /// the coverage-ACK handler in `IoBridge::dispatch_ack_datagram` for
+    /// each `FragmentCoverage` entry whose `codec == Codec::Cdf53`. Drives
+    /// the PixelPerfect transition via `tile_fully_acked`.
+    pub fn record_cdf53_ack(&mut self, tile_x: u8, tile_y: u8, generation: u8) {
+        let counter = self.cdf53_passes_acked
+            .entry((tile_x, tile_y, generation))
+            .or_insert(0);
+        *counter = counter.saturating_add(1);
+    }
+
     /// Returns true iff all `max_passes` passes for the given (tile, gen)
     /// have transitioned to `WorkState::Acked`. O(1) lookup. Used by
     /// `IoBridge` to signal `CodecState::PixelPerfect` once a tile is
@@ -1001,6 +1012,27 @@ mod tests {
         let _ = s.bump_generation(0, 0);
         assert!(!s.tile_fully_acked(0, 0, 1, 14), "target tile cleared");
         assert!(s.tile_fully_acked(1, 1, 1, 14), "non-target tile preserved");
+    }
+
+    #[test]
+    fn record_cdf53_ack_increments_per_tile_gen_counter() {
+        let mut s = Scheduler::new(4, 4);
+        assert!(!s.tile_fully_acked(2, 3, 1, 14));
+        for _ in 0..14 {
+            s.record_cdf53_ack(2, 3, 1);
+        }
+        assert!(s.tile_fully_acked(2, 3, 1, 14));
+    }
+
+    #[test]
+    fn record_cdf53_ack_isolates_per_tile_and_gen() {
+        let mut s = Scheduler::new(4, 4);
+        for _ in 0..14 {
+            s.record_cdf53_ack(0, 0, 1);
+        }
+        assert!(s.tile_fully_acked(0, 0, 1, 14));
+        assert!(!s.tile_fully_acked(1, 0, 1, 14), "different tile");
+        assert!(!s.tile_fully_acked(0, 0, 2, 14), "different gen");
     }
 
     #[cfg(feature = "cdf53-diag")]
