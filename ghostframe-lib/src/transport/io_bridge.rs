@@ -764,28 +764,52 @@ impl IoBridge {
         if data[0] == crate::transport::ack::ACK_BATCH_MSG_TYPE {
             if let Ok(batch) = crate::transport::ack::AckBatch::decode(data) {
                 for e in batch.entries {
-                    let resolved = self.scheduler
-                        .on_ack(e.tile_x, e.tile_y, e.generation, e.pass);
-                    for r in resolved {
-                        if let Some(pid) = r.palette_id {
-                            let pid_usize = pid as usize;
-                            if !self.palette_table.delivered.contains(pid) {
-                                self.palette_table.delivered.insert(pid);
-                            }
-                            let cnt = self.palette_table.in_flight_carrying[pid_usize];
-                            self.palette_table.in_flight_carrying[pid_usize] = cnt.saturating_sub(1);
-                            if cnt == 0 {
-                                tracing::warn!(
-                                    target: "palrle.alloc",
-                                    palette_id = pid,
-                                    "in_flight_carrying underflow — enqueue/ack pairing bug",
+                    let key = (e.frame_seq, e.frag_idx);
+                    let coverage = match self.fragment_coverage.take(key) {
+                        Some(c) => c,
+                        None => continue, // ACK arrived after LRU eviction or
+                                          // for a key we never recorded —
+                                          // either way, no per-tile bookkeeping
+                                          // to do.
+                    };
+                    for entry in coverage {
+                        match entry.codec {
+                            crate::transport::protocol::Codec::Cdf53 => {
+                                self.scheduler.record_cdf53_ack(
+                                    entry.tile_x,
+                                    entry.tile_y,
+                                    entry.generation,
                                 );
                             }
-                            // Release the acquire from Phase A. ref_count > 0 means tile work
-                            // was in flight; on ACK we let the slot become FreeButCached.
-                            if self.palette_table.ref_count[pid_usize] > 0 {
-                                self.palette_table.release(pid);
+                            crate::transport::protocol::Codec::PalRle => {
+                                // Move the previously-on-ack PalRle palette
+                                // bookkeeping here. Mirrors what
+                                // Scheduler::on_ack used to do via the
+                                // ResolvedTileWork.palette_id channel.
+                                if let Some(pid) = entry.palette_id {
+                                    let pid_usize = pid as usize;
+                                    if !self.palette_table.delivered.contains(pid) {
+                                        self.palette_table.delivered.insert(pid);
+                                    }
+                                    let cnt = self.palette_table.in_flight_carrying[pid_usize];
+                                    self.palette_table.in_flight_carrying[pid_usize] =
+                                        cnt.saturating_sub(1);
+                                    if cnt == 0 {
+                                        tracing::warn!(
+                                            target: "palrle.alloc",
+                                            palette_id = pid,
+                                            "in_flight_carrying underflow — enqueue/ack pairing bug",
+                                        );
+                                    }
+                                    if self.palette_table.ref_count[pid_usize] > 0 {
+                                        self.palette_table.release(pid);
+                                    }
+                                }
                             }
+                            // Solid, Raw, H264, Bc1, Skip: no per-tile
+                            // delivery semantic. ACK is just "datagram
+                            // landed" telemetry; nothing to update.
+                            _ => {}
                         }
                     }
                 }
@@ -2724,53 +2748,76 @@ mod tests {
         }
     }
 
-    /// An inbound ACK_BATCH datagram routed through dispatch_ack_datagram
-    /// must mark the matching in-flight tile work as Acked.
-    #[tokio::test]
-    async fn dispatch_ack_datagram_clears_in_flight_work() {
-        use crate::transport::ack::{AckBatch, AckEntry};
-        use crate::transport::scheduler::TileWork;
-
+    /// An inbound ACK_BATCH datagram with a recorded coverage entry should
+    /// fire the per-codec delivery handler (Cdf53 → counter increment).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dispatch_ack_datagram_cdf53_increments_counter() {
         let (our_end, _peer) = UnixStream::pair().expect("pair");
         let server = QuicServer::new().expect("server");
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
         let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+        // Record coverage as if the server had just emitted a Cdf53 pass.
+        let cov: crate::transport::fragment_coverage::CoverageList = smallvec::smallvec![
+            crate::transport::fragment_coverage::FragmentCoverage {
+                tile_x: 7,
+                tile_y: 9,
+                generation: 1,
+                pass_idx: 0,
+                codec: crate::transport::protocol::Codec::Cdf53,
+                palette_id: None,
+            }
+        ];
+        bridge.fragment_coverage.record((100, 0), cov);
 
-        // Seed the scheduler with one InFlight item.
-        bridge.scheduler.resize(4, 4);
-        bridge
-            .scheduler
-            .enqueue(TileWork::raw_for_test(1, 2, 0, vec![1, 2, 3]));
-        let _ = bridge.scheduler.tick(usize::MAX); // promote to InFlight
-
-        let batch = AckBatch {
-            entries: vec![AckEntry {
-                tile_x: 1,
-                tile_y: 2,
-                generation: 0,
-                pass: 0,
+        let batch = crate::transport::ack::AckBatch {
+            entries: vec![crate::transport::ack::AckEntry {
+                frame_seq: 100,
+                frag_idx: 0,
             }],
         };
         bridge.dispatch_ack_datagram(&batch.encode());
 
-        // Next tick: nothing eligible — the Acked entry was dropped via retain.
-        let out = bridge.scheduler.tick(usize::MAX);
-        assert!(out.is_empty());
-        assert_eq!(bridge.scheduler.queue_len(), 0);
+        assert_eq!(
+            bridge.scheduler.cdf53_passes_acked_for_test(7, 9, 1),
+            1,
+            "Cdf53 counter incremented exactly once"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dispatch_ack_datagram_missing_coverage_is_noop() {
+        let (our_end, _peer) = UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("server");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+        let batch = crate::transport::ack::AckBatch {
+            entries: vec![crate::transport::ack::AckEntry {
+                frame_seq: 999,
+                frag_idx: 9,
+            }],
+        };
+        // Should not panic, should not modify any state.
+        bridge.dispatch_ack_datagram(&batch.encode());
+        assert_eq!(
+            bridge.scheduler.cdf53_passes_acked_for_test(0, 0, 0),
+            0,
+        );
     }
 
     /// dispatch_ack_datagram silently ignores datagrams whose first byte
     /// isn't ACK_BATCH_MSG_TYPE.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn dispatch_ack_datagram_ignores_unknown_msg_types() {
         let (our_end, _peer) = UnixStream::pair().expect("pair");
         let server = QuicServer::new().expect("server");
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
         let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
-        // Should not panic on empty/random/unknown payloads.
+        // Non-0x03 first byte → silently dropped.
+        bridge.dispatch_ack_datagram(&[0xFF, 0, 0, 0, 0, 0]);
+        bridge.dispatch_ack_datagram(&[0x01, 1, 0, 0]); // OLD FEEDBACK type; not us
+        // Empty.
         bridge.dispatch_ack_datagram(&[]);
-        bridge.dispatch_ack_datagram(&[0xFF, 0x00, 0x00]);
-        bridge.dispatch_ack_datagram(&[0x01, 0, 0]); // FEEDBACK_MSG_TYPE — unrelated
+        // No panic; nothing to assert beyond reaching this line.
     }
 
     /// dispatch_dirty_tiles_via_scheduler enqueues the right work in the
@@ -3294,24 +3341,26 @@ mod tests {
         bridge.palette_table.slot_state[7] = SlotState::Held;
         bridge.palette_table.in_flight_carrying[7] = 1;
 
-        // Enqueue a PalRle TileWork referencing palette 7.
-        bridge.scheduler.enqueue(crate::transport::scheduler::TileWork {
-            tile_x: 0,
-            tile_y: 0,
-            generation: 0,
-            pass_idx: 0,
-            total_passes: 1,
-            codec: crate::transport::protocol::Codec::PalRle,
-            payload: vec![0x01u8, 7, 1, 1, 2, 3, 255, 0xF0],
-            queued_at: std::time::Instant::now(),
-            last_sent_at: None,
-            state: crate::transport::scheduler::WorkState::Pending,
-        });
-        let _ = bridge.scheduler.tick(usize::MAX);
+        // Record coverage as if the server emitted a PalRle tile with palette_id=7.
+        let cov: crate::transport::fragment_coverage::CoverageList = smallvec::smallvec![
+            crate::transport::fragment_coverage::FragmentCoverage {
+                tile_x: 0,
+                tile_y: 0,
+                generation: 0,
+                pass_idx: 0,
+                codec: crate::transport::protocol::Codec::PalRle,
+                palette_id: Some(7),
+            }
+        ];
+        bridge.fragment_coverage.record((200, 0), cov);
 
-        // Build synthetic AckBatch wire: [0x02, count=1, tile_x=0, tile_y=0, (gen=0<<4)|pass=0, reserved=0]
-        let wire = vec![0x02u8, 1, 0, 0, 0, 0];
-        bridge.dispatch_ack_datagram(&wire);
+        let batch = crate::transport::ack::AckBatch {
+            entries: vec![crate::transport::ack::AckEntry {
+                frame_seq: 200,
+                frag_idx: 0,
+            }],
+        };
+        bridge.dispatch_ack_datagram(&batch.encode());
 
         assert!(bridge.palette_table.delivered.contains(7));
         assert_eq!(bridge.palette_table.in_flight_carrying[7], 0);
@@ -3334,18 +3383,26 @@ mod tests {
         bridge.palette_table.ref_count[5] = 1;
         bridge.palette_table.in_flight_carrying[5] = 1;
 
-        bridge.scheduler.enqueue(crate::transport::scheduler::TileWork {
-            tile_x: 0, tile_y: 0, generation: 0, pass_idx: 0, total_passes: 1,
-            codec: crate::transport::protocol::Codec::PalRle,
-            payload: vec![0x01u8, 5, 1, 1, 2, 3, 255, 0xF0],
-            queued_at: std::time::Instant::now(),
-            last_sent_at: None,
-            state: crate::transport::scheduler::WorkState::Pending,
-        });
-        let _ = bridge.scheduler.tick(usize::MAX);
+        // Record coverage as if the server emitted a PalRle tile with palette_id=5.
+        let cov: crate::transport::fragment_coverage::CoverageList = smallvec::smallvec![
+            crate::transport::fragment_coverage::FragmentCoverage {
+                tile_x: 0,
+                tile_y: 0,
+                generation: 0,
+                pass_idx: 0,
+                codec: crate::transport::protocol::Codec::PalRle,
+                palette_id: Some(5),
+            }
+        ];
+        bridge.fragment_coverage.record((201, 0), cov);
 
-        let wire = vec![0x02u8, 1, 0, 0, 0, 0];
-        bridge.dispatch_ack_datagram(&wire);
+        let batch = crate::transport::ack::AckBatch {
+            entries: vec![crate::transport::ack::AckEntry {
+                frame_seq: 201,
+                frag_idx: 0,
+            }],
+        };
+        bridge.dispatch_ack_datagram(&batch.encode());
 
         assert_eq!(bridge.palette_table.ref_count[5], 0, "ACK must release the Phase A acquire");
         assert_eq!(

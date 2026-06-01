@@ -184,6 +184,14 @@ impl Scheduler {
         self.priority_queue.iter().cloned().collect()
     }
 
+    #[cfg(test)]
+    pub fn cdf53_passes_acked_for_test(&self, tile_x: u8, tile_y: u8, generation: u8) -> u8 {
+        self.cdf53_passes_acked
+            .get(&(tile_x, tile_y, generation))
+            .copied()
+            .unwrap_or(0)
+    }
+
     pub fn bump_generation(&mut self, tile_x: u8, tile_y: u8) -> u8 {
         let idx = (tile_y as usize) * (self.cols as usize) + (tile_x as usize);
         let new_gen = (self.generations[idx] + 1) & 0x0F;
