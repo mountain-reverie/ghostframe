@@ -1838,15 +1838,8 @@ impl IoBridge {
                     }
                 }
 
-                #[cfg(feature = "cdf53-diag")]
-                if std::env::var("GHOSTFRAME_CDF53_DUMP_PENDING").is_ok() {
-                    let snap = self.scheduler.pending_refinement_snapshot();
-                    tracing::info!(
-                        target: "ghostframe::cdf53::diff",
-                        "cdf53.pending_snapshot {:?}",
-                        snap
-                    );
-                }
+                // FIXME(Task 10): pending_refinement_snapshot deleted; will be
+                // re-added with coverage-map-backed implementation.
 
                 self.dispatch_dirty_tiles_via_scheduler(
                     &dirty_xy,
