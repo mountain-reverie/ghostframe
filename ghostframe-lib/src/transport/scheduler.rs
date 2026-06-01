@@ -240,6 +240,46 @@ impl Scheduler {
             .map_or(false, |&c| c >= max_passes)
     }
 
+    /// Snapshot of (tile_x, tile_y, generation, passes_remaining) for
+    /// every Cdf53 tile with outstanding work. Sources:
+    ///   - `Pending`/`InFlight` entries in `refinement_queue`.
+    ///   - Outstanding `FragmentCoverage` entries with `codec == Cdf53`
+    ///     passed in via `coverage_snapshot` (caller-supplied because
+    ///     coverage lives on `IoBridge`, not `Scheduler`).
+    ///
+    /// Used by `e2e_refinement_cancel` to assert old-gen work is fully
+    /// dropped after `bump_generation`.
+    #[cfg(feature = "cdf53-diag")]
+    pub fn pending_refinement_snapshot(
+        &self,
+        coverage_snapshot: &[crate::transport::fragment_coverage::FragmentCoverage],
+    ) -> Vec<(u8, u8, u8, u8)> {
+        use std::collections::HashMap;
+        let mut counts: HashMap<(u8, u8, u8), u8> = HashMap::new();
+        // Source 1: Pending/InFlight entries still in the refinement queue.
+        for w in self.refinement_queue.iter() {
+            if matches!(w.state, WorkState::Pending | WorkState::InFlight) {
+                let c = counts.entry((w.tile_x, w.tile_y, w.generation)).or_insert(0);
+                *c = c.saturating_add(1);
+            }
+        }
+        // Source 2: outstanding Cdf53 coverage entries (emitted-but-not-ACKed
+        // and not yet evicted). Caller passes these in because they live on
+        // IoBridge.fragment_coverage, not on Scheduler.
+        for entry in coverage_snapshot {
+            if matches!(entry.codec, crate::transport::protocol::Codec::Cdf53) {
+                let c = counts
+                    .entry((entry.tile_x, entry.tile_y, entry.generation))
+                    .or_insert(0);
+                *c = c.saturating_add(1);
+            }
+        }
+        counts
+            .into_iter()
+            .map(|((tx, ty, g), n)| (tx, ty, g, n))
+            .collect()
+    }
+
     /// Like `bump_generation` but returns the work that was superseded so
     /// callers can update downstream state (e.g. `PaletteTable::in_flight_carrying`).
     ///
@@ -887,5 +927,44 @@ mod tests {
             "expected fraction to recover above 0.05 after 11 healthy rounds; got {}",
             sch.current_refinement_fraction()
         );
+    }
+
+    #[cfg(feature = "cdf53-diag")]
+    #[test]
+    fn pending_refinement_snapshot_reads_from_queue_and_coverage() {
+        let mut s = Scheduler::new(4, 4);
+        let passes: Vec<Vec<u8>> = (0..14).map(|i| vec![i as u8]).collect();
+        s.enqueue_refinement(2, 3, 1, passes);
+
+        // BEFORE any tick: all 14 are Pending in the refinement queue.
+        let snap = s.pending_refinement_snapshot(&[]);
+        let our: Vec<_> = snap.iter().filter(|e| e.0 == 2 && e.1 == 3).collect();
+        assert_eq!(our.len(), 1);
+        assert_eq!(our[0].2, 1);
+        assert_eq!(our[0].3, 14, "all 14 still pending in queue");
+
+        // After tick(): drain_refinement removes them from the queue. Without
+        // a coverage source, the snapshot is empty.
+        let _ = s.tick(usize::MAX);
+        let snap = s.pending_refinement_snapshot(&[]);
+        let our: Vec<_> = snap.iter().filter(|e| e.0 == 2 && e.1 == 3).collect();
+        assert!(our.is_empty(), "queue drained, no coverage source");
+
+        // With a coverage source (simulating 5 outstanding Cdf53 entries for
+        // tile (2,3) gen 1, passes 0..5), the snapshot picks them up.
+        let coverage: Vec<crate::transport::fragment_coverage::FragmentCoverage> = (0..5)
+            .map(|pass_idx| crate::transport::fragment_coverage::FragmentCoverage {
+                tile_x: 2,
+                tile_y: 3,
+                generation: 1,
+                pass_idx,
+                codec: crate::transport::protocol::Codec::Cdf53,
+                palette_id: None,
+            })
+            .collect();
+        let snap = s.pending_refinement_snapshot(&coverage);
+        let our: Vec<_> = snap.iter().filter(|e| e.0 == 2 && e.1 == 3).collect();
+        assert_eq!(our.len(), 1);
+        assert_eq!(our[0].3, 5, "5 outstanding coverage entries");
     }
 }

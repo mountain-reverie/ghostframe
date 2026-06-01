@@ -96,6 +96,17 @@ impl FragmentCoverageMap {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
+
+    /// Diagnostic snapshot of all live coverage entries. Used by
+    /// `Scheduler::pending_refinement_snapshot` to merge with the
+    /// refinement_queue view of in-flight work.
+    #[cfg(feature = "cdf53-diag")]
+    pub fn snapshot(&self) -> Vec<FragmentCoverage> {
+        self.entries
+            .values()
+            .flat_map(|list| list.iter().copied())
+            .collect()
+    }
 }
 
 #[cfg(test)]
