@@ -2487,6 +2487,21 @@ async fn e2e_cdf53_lossless_buildup() -> Result<()> {
         mismatches.is_empty(),
         "Cdf53 lossless mismatches: {mismatches:#?}"
     );
+
+    // M3.3d acceptance: gradient stays Cdf53 the whole 15s run with no
+    // motion phase to wipe the ACK counter, so EVERY tile in the gradient
+    // pattern should reach PixelPerfect.
+    let logs = helpers::read_server_logs_stripped("ghostframe-server");
+    let pp_count = logs
+        .lines()
+        .filter(|l| l.contains("cdf53.pixelperfect"))
+        .count();
+    eprintln!("PixelPerfect transitions observed: {pp_count}");
+    assert!(
+        pp_count > 0,
+        "no cdf53.pixelperfect log lines — refinement did not reach the \
+         lossless terminal state under ideal (no-motion) conditions"
+    );
     Ok(())
 }
 
@@ -3288,15 +3303,11 @@ async fn e2e_progressive_refinement() -> Result<()> {
     // typically complete within ~100 ms at 30 fps on a single static stripe,
     // so a brief settle after the first emit gives SSIM time to stabilize.
     //
-    // NOTE on the missing `cdf53.pixelperfect` signal: the WebGPU client
-    // currently has no per-pass ACK plumbing for refinement (no AckBatch
-    // sender wired to its Cdf53 receiver), so `tile_fully_acked` never
-    // returns true server-side and the PixelPerfect transition never fires
-    // in real e2e. The transition logic is unit-tested via direct on_ack
-    // calls (scheduler.rs:937+). Wiring client ACKs is tracked as a
-    // follow-up gap on the M3.3c memory; until it lands, this test
-    // validates client-receives-and-renders-refinement-to-near-lossless
-    // but does NOT validate the server-side "stop re-emitting" optimization.
+    // M3.3d: ACK plumbing is now wired end-to-end. The AckBatcher in the
+    // WebGPU client sends per-tile-pass ACKs on datagram receipt; the server
+    // dispatches them via dispatch_ack_datagram → record_cdf53_ack, and the
+    // PixelPerfect sweep fires once all 14 passes for a tile are ACKed.
+    // This test now also asserts pp_count > 0 (see end of test).
     tokio::time::sleep(Duration::from_secs(8)).await;
     let mut refinement_active = false;
     for _ in 0..40 {
@@ -3380,11 +3391,22 @@ async fn e2e_progressive_refinement() -> Result<()> {
          — client canvas is not stable, refinement may not have converged or motion phase intruded"
     );
 
-    // PixelPerfect transition coverage is unit-tested at the scheduler
-    // level (tile_fully_acked_returns_true_after_all_passes_acked et al.).
-    // E2E coverage is blocked on wiring client ACK sending — tracked as a
-    // follow-up gap. The `cdf53.pixelperfect` count in server logs will
-    // remain 0 today; that's expected.
+    // M3.3d: ACKs are now per-datagram + correctly drive scheduler counter
+    // increments, so PixelPerfect transitions fire. Assert at least one was
+    // observed during the sample window.
+    let logs = helpers::read_server_logs_stripped("ghostframe-server");
+    let pp_count = logs
+        .lines()
+        .filter(|l| l.contains("cdf53.pixelperfect"))
+        .count();
+    eprintln!("PixelPerfect transitions observed: {pp_count}");
+    assert!(
+        pp_count > 0,
+        "no cdf53.pixelperfect log lines observed — the M3.3d ACK pipeline \
+         is not driving tile_fully_acked to true. Check ACK datagram \
+         delivery, fragment_coverage population, and dispatch_ack_datagram \
+         routing."
+    );
     Ok(())
 }
 

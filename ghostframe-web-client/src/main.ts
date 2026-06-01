@@ -641,13 +641,17 @@ async function main() {
     lossTracker.onDatagram();
     stats.tileDatagrams++;
     const tileHdr = decodeTileHeader(view, DATAGRAM_HEADER_SIZE);
-    // M3.3d: ACK on RECEIPT, per-datagram. Server's fragment_coverage map
-    // is keyed by the on-wire frameSeq (with TILE_DATAGRAM_FLAG bit set,
-    // matching how the server recorded the coverage). Re-set the flag here
-    // because the line above already masked it off for downstream logic.
+    // M3.3d rev2: ACK on RECEIPT, per-tile-pass. Server's fragment_coverage
+    // map is keyed by (frameSeq, tile_x, tile_y, pass_idx) — unique per
+    // tile-pass emission within a frame, avoiding the frag_idx=0 collision
+    // that occurs when multiple single-fragment work items share the same
+    // frame_seq. Re-set the TILE_DATAGRAM_FLAG bit because the line above
+    // already masked it off for downstream logic.
     ackBatcher.add({
       frameSeq: dgramHdr.frameSeq | TILE_DATAGRAM_FLAG,
-      fragIdx: dgramHdr.fragIdx,
+      tileX: tileHdr.tileX,
+      tileY: tileHdr.tileY,
+      passIdx: tileHdr.pass,
     });
 
     if (dgramHdr.frameSeq > latestFrameSeq) {

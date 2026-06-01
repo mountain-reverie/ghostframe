@@ -65,9 +65,11 @@
  */
 #define IDLE_THRESHOLD 30
 
-#define ACK_BATCH_MSG_TYPE 2
+#define ACK_BATCH_MSG_TYPE 3
 
 #define MAX_ACK_ENTRIES_PER_BATCH 64
+
+#define ACK_ENTRY_SIZE 7
 
 #define HELLO_MSG_TYPE 3
 
@@ -101,6 +103,27 @@
 #define FEEDBACK_MSG_TYPE 1
 
 #define FEEDBACK_SIZE 22
+
+/**
+ * Inline capacity for the coverage list per key.
+ * Sized for typical bundled-PalRle and single-pass-Cdf53 cases without
+ * heap allocation.
+ */
+#define COVERAGE_INLINE_CAPACITY 8
+
+/**
+ * Coverage map capacity. Sized to hold all in-flight passes for a full
+ * 1920×1080 Cdf53 emission cycle with headroom: 2040 tiles × 14 passes ×
+ * 2 frames of RTT ≈ 57,120 entries. Round up to 60,000.
+ *
+ * At 5,000 the map evicts entries faster than ACKs arrive, causing
+ * `ack_entry_miss` on more than half of all ACK datagrams and permanently
+ * blocking `tile_fully_acked` from returning true.
+ *
+ * TODO(m3.3e): make this a function of `(cols × rows × max_passes × rtt_frames)`
+ * instead of a fixed const; at 4K @ 60 fps the worst case grows ~8× further.
+ */
+#define FRAGMENT_COVERAGE_CAPACITY 60000
 
 #define DATAGRAM_HEADER_SIZE 12
 

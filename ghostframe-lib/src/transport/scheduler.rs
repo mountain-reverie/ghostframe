@@ -240,6 +240,15 @@ impl Scheduler {
             .map_or(false, |&c| c >= max_passes)
     }
 
+    /// Non-test diagnostic accessor: returns the current ACK counter for
+    /// (tile_x, tile_y, generation). Used by the PixelPerfect sweep trace.
+    pub fn cdf53_passes_acked_count(&self, tile_x: u8, tile_y: u8, generation: u8) -> u8 {
+        self.cdf53_passes_acked
+            .get(&(tile_x, tile_y, generation))
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// Snapshot of (tile_x, tile_y, generation, passes_remaining) for
     /// every Cdf53 tile with outstanding work. Sources:
     ///   - `Pending`/`InFlight` entries in `refinement_queue`.

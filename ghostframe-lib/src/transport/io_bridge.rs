@@ -182,9 +182,9 @@ pub struct IoBridge {
     full_frame_encoder: Option<FullFrameEncoder>,
     /// Recent frame fragments for NACK retransmission. Key: (frame_seq, frag_idx).
     recent_frame_fragments: HashMap<(u32, u16), Vec<u8>>,
-    /// Per-datagram coverage map: (frame_seq, frag_idx) -> tiles whose
-    /// payload was carried in that datagram. Populated at emit time;
-    /// consumed by dispatch_ack_datagram on incoming ACKs. LRU-bounded by
+    /// Per-tile-pass coverage map: (frame_seq, tile_x, tile_y, pass_idx) ->
+    /// tile metadata for a work item. Populated at emit time; consumed by
+    /// dispatch_ack_datagram on incoming ACKs. LRU-bounded by
     /// FRAGMENT_COVERAGE_CAPACITY. Independent of `recent_frame_fragments`
     /// (different lifetime semantics: retransmit window is RTT-bounded;
     /// coverage retention is until-ACKed-or-evicted).
@@ -737,9 +737,12 @@ impl IoBridge {
                         codec: work.codec,
                         palette_id,
                     }];
-                let final_frag_idx = (n - 1) as u16;
-                self.fragment_coverage
-                    .record((frame_seq_with_flag, final_frag_idx), coverage);
+                // Key: (frame_seq, tile_x, tile_y, pass_idx) — unique per
+                // tile-pass emission within a frame. This avoids the collision
+                // that occurs with (frame_seq, frag_idx=0) when multiple
+                // single-fragment work items per frame all share frag_idx=0.
+                let key = (frame_seq_with_flag, work.tile_x, work.tile_y, work.pass_idx);
+                self.fragment_coverage.record(key, coverage);
             }
             for dg in &datagrams {
                 self.send_to_all_sessions(dg);
@@ -761,10 +764,23 @@ impl IoBridge {
         if data.is_empty() {
             return;
         }
+        tracing::debug!(
+            target: "ghostframe::cdf53",
+            first_byte = data[0],
+            len = data.len(),
+            "ack_datagram_received"
+        );
         if data[0] == crate::transport::ack::ACK_BATCH_MSG_TYPE {
             if let Ok(batch) = crate::transport::ack::AckBatch::decode(data) {
+                tracing::debug!(
+                    target: "ghostframe::cdf53",
+                    count = batch.entries.len(),
+                    "ack_batch_decoded"
+                );
                 for e in batch.entries {
-                    let key = (e.frame_seq, e.frag_idx);
+                    // Key matches how coverage is recorded at emit time:
+                    // (frame_seq, tile_x, tile_y, pass_idx).
+                    let key = (e.frame_seq, e.tile_x, e.tile_y, e.pass_idx);
                     let coverage = match self.fragment_coverage.take(key) {
                         Some(c) => c,
                         None => continue, // ACK arrived after LRU eviction or
@@ -775,6 +791,14 @@ impl IoBridge {
                     for entry in coverage {
                         match entry.codec {
                             crate::transport::protocol::Codec::Cdf53 => {
+                                tracing::debug!(
+                                    target: "ghostframe::cdf53",
+                                    tile_x = entry.tile_x,
+                                    tile_y = entry.tile_y,
+                                    gen = entry.generation,
+                                    pass_idx = entry.pass_idx,
+                                    "ack_cdf53_pass"
+                                );
                                 self.scheduler.record_cdf53_ack(
                                     entry.tile_x,
                                     entry.tile_y,
@@ -1353,6 +1377,62 @@ impl IoBridge {
         // Update frame mode for next frame's hysteresis reference.
         self.frame_mode = new_mode;
 
+        // ---- M3.3c: PixelPerfect transition sweep ----
+        // Runs every frame, unconditionally, before the dirty-tile early return.
+        // This ensures that ACKs arriving during static phases (where dirty_xy is
+        // empty and the function would otherwise return immediately) still drive
+        // the Cdf53 → PixelPerfect transition.
+        //
+        // Phase B (enqueue_refinement) runs inside the FrameMode::TileCodec arm
+        // BELOW, so on dirty frames the sweep runs before new Cdf53 work is
+        // enqueued. This is correct: after Phase B bumps the generation and clears
+        // the ACK counter, the new generation needs subsequent frames' ACKs to
+        // accumulate before tile_fully_acked returns true — so running the sweep
+        // here (before Phase B) vs. after Phase B yields no difference in practice.
+        {
+            let tile_count = (cols * rows) as usize;
+            let diag_frame = seq % 10 == 0;
+            for idx in 0..tile_count {
+                let tile_x = (idx as u32 % cols) as u8;
+                let tile_y = (idx as u32 / cols) as u8;
+                let max_passes = {
+                    let tm = self.metrics_tracker.get(tile_x as u32, tile_y as u32);
+                    match tm.codec_state {
+                        crate::tile::CodecState::Cdf53 { max_passes, .. } => max_passes,
+                        _ => continue,
+                    }
+                };
+                let gen = self.scheduler.generation_for(tile_x, tile_y);
+                let acked = self.scheduler.cdf53_passes_acked_count(tile_x, tile_y, gen);
+                if diag_frame {
+                    tracing::debug!(
+                        target: "ghostframe::cdf53",
+                        tile_x = tile_x,
+                        tile_y = tile_y,
+                        gen = gen,
+                        acked = acked,
+                        max_passes = max_passes,
+                        "cdf53.sweep_check"
+                    );
+                }
+                if self.scheduler.tile_fully_acked(tile_x, tile_y, gen, max_passes) {
+                    self.metrics_tracker
+                        .get_mut(tile_x as u32, tile_y as u32)
+                        .codec_state = crate::tile::CodecState::PixelPerfect;
+                    // Diagnostic: emit one info log line per transition so
+                    // e2e tests can verify the lossless terminal state was
+                    // reached without requiring the cdf53-diag feature gate.
+                    tracing::info!(
+                        target: "ghostframe::cdf53",
+                        tile_x = tile_x,
+                        tile_y = tile_y,
+                        gen = gen,
+                        "cdf53.pixelperfect"
+                    );
+                }
+            }
+        }
+
         // No dirty tiles → nothing to emit (regardless of mode). The classifier
         // already saw this frame above, so the exit-sustain counter advances.
         if dirty_xy.is_empty() {
@@ -1799,42 +1879,6 @@ impl IoBridge {
                             max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
                         };
                         tm.already_escalated_this_gen = true;
-                    }
-                }
-
-                // ---- M3.3c: PixelPerfect transition sweep ----
-                // For every tile currently in CodecState::Cdf53, check if all
-                // its passes are now ACKed (scheduler.tile_fully_acked). If so,
-                // transition to PixelPerfect. Cost: O(num_tiles).
-                {
-                    let tile_count = (cols * rows) as usize;
-                    for idx in 0..tile_count {
-                        let tile_x = (idx as u32 % cols) as u8;
-                        let tile_y = (idx as u32 / cols) as u8;
-                        let max_passes = {
-                            let tm = self.metrics_tracker.get(tile_x as u32, tile_y as u32);
-                            match tm.codec_state {
-                                crate::tile::CodecState::Cdf53 { max_passes, .. } => max_passes,
-                                _ => continue,
-                            }
-                        };
-                        let gen = self.scheduler.generation_for(tile_x, tile_y);
-                        if self.scheduler.tile_fully_acked(tile_x, tile_y, gen, max_passes) {
-                            self.metrics_tracker
-                                .get_mut(tile_x as u32, tile_y as u32)
-                                .codec_state = crate::tile::CodecState::PixelPerfect;
-                            // Diagnostic: emit one log line per transition so
-                            // e2e tests can verify the lossless terminal state
-                            // was reached without requiring the cdf53-diag
-                            // pending-snapshot feature gate.
-                            tracing::info!(
-                                target: "ghostframe::cdf53",
-                                tile_x = tile_x,
-                                tile_y = tile_y,
-                                gen = gen,
-                                "cdf53.pixelperfect"
-                            );
-                        }
                     }
                 }
 
@@ -2768,12 +2812,15 @@ mod tests {
                 palette_id: None,
             }
         ];
-        bridge.fragment_coverage.record((100, 0), cov);
+        // Key: (frame_seq=100, tile_x=7, tile_y=9, pass_idx=0)
+        bridge.fragment_coverage.record((100, 7, 9, 0), cov);
 
         let batch = crate::transport::ack::AckBatch {
             entries: vec![crate::transport::ack::AckEntry {
                 frame_seq: 100,
-                frag_idx: 0,
+                tile_x: 7,
+                tile_y: 9,
+                pass_idx: 0,
             }],
         };
         bridge.dispatch_ack_datagram(&batch.encode());
@@ -2794,7 +2841,9 @@ mod tests {
         let batch = crate::transport::ack::AckBatch {
             entries: vec![crate::transport::ack::AckEntry {
                 frame_seq: 999,
-                frag_idx: 9,
+                tile_x: 9,
+                tile_y: 5,
+                pass_idx: 3,
             }],
         };
         // Should not panic, should not modify any state.
@@ -3353,12 +3402,15 @@ mod tests {
                 palette_id: Some(7),
             }
         ];
-        bridge.fragment_coverage.record((200, 0), cov);
+        // Key: (frame_seq=200, tile_x=0, tile_y=0, pass_idx=0)
+        bridge.fragment_coverage.record((200, 0, 0, 0), cov);
 
         let batch = crate::transport::ack::AckBatch {
             entries: vec![crate::transport::ack::AckEntry {
                 frame_seq: 200,
-                frag_idx: 0,
+                tile_x: 0,
+                tile_y: 0,
+                pass_idx: 0,
             }],
         };
         bridge.dispatch_ack_datagram(&batch.encode());
@@ -3395,12 +3447,15 @@ mod tests {
                 palette_id: Some(5),
             }
         ];
-        bridge.fragment_coverage.record((201, 0), cov);
+        // Key: (frame_seq=201, tile_x=0, tile_y=0, pass_idx=0)
+        bridge.fragment_coverage.record((201, 0, 0, 0), cov);
 
         let batch = crate::transport::ack::AckBatch {
             entries: vec![crate::transport::ack::AckEntry {
                 frame_seq: 201,
-                frag_idx: 0,
+                tile_x: 0,
+                tile_y: 0,
+                pass_idx: 0,
             }],
         };
         bridge.dispatch_ack_datagram(&batch.encode());
