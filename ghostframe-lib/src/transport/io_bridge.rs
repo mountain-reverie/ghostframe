@@ -1760,6 +1760,17 @@ impl IoBridge {
                             self.metrics_tracker
                                 .get_mut(tile_x as u32, tile_y as u32)
                                 .codec_state = crate::tile::CodecState::PixelPerfect;
+                            // Diagnostic: emit one log line per transition so
+                            // e2e tests can verify the lossless terminal state
+                            // was reached without requiring the cdf53-diag
+                            // pending-snapshot feature gate.
+                            tracing::info!(
+                                target: "ghostframe::cdf53",
+                                tile_x = tile_x,
+                                tile_y = tile_y,
+                                gen = gen,
+                                "cdf53.pixelperfect"
+                            );
                         }
                     }
                 }
