@@ -60,10 +60,11 @@ interface RendererRef {
 // ---------------------------------------------------------------------------
 
 // Cap test-instrumentation recorder arrays to bound memory + CDP
-// serialisation cost in long-running tests. ~4 KiB worth of entries
-// is plenty for any e2e in the current suite; FIFO drop keeps the
-// most recent observations.
-export const MAX_RECORDED_ENTRIES = 4096;
+// serialisation cost in long-running tests. Sized for the busiest e2e
+// (e2e_cdf53_mixed_codecs at 1920x1080: ~80 dirty tiles × 30 fps × ~5 s
+// settle ≈ 12 000 records, plus headroom). FIFO drop keeps the most
+// recent observations when exceeded.
+export const MAX_RECORDED_ENTRIES = 32768;
 
 function fifoAppend<T>(arr: T[], item: T): void {
   arr.push(item);
