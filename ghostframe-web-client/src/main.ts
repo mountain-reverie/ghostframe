@@ -520,12 +520,6 @@ async function main() {
       statusEl.textContent = 'Receiving frames';
     }
 
-    ackBatcher.add({
-      tileX: tX,
-      tileY: tY,
-      generation: asm.header.generation,
-      pass: asm.header.pass,
-    });
   }
 
   // rAF loop — drains queues, flushes one frame per animation tick.
@@ -647,6 +641,14 @@ async function main() {
     lossTracker.onDatagram();
     stats.tileDatagrams++;
     const tileHdr = decodeTileHeader(view, DATAGRAM_HEADER_SIZE);
+    // M3.3d: ACK on RECEIPT, per-datagram. Server's fragment_coverage map
+    // is keyed by the on-wire frameSeq (with TILE_DATAGRAM_FLAG bit set,
+    // matching how the server recorded the coverage). Re-set the flag here
+    // because the line above already masked it off for downstream logic.
+    ackBatcher.add({
+      frameSeq: dgramHdr.frameSeq | TILE_DATAGRAM_FLAG,
+      fragIdx: dgramHdr.fragIdx,
+    });
 
     if (dgramHdr.frameSeq > latestFrameSeq) {
       latestFrameSeq = dgramHdr.frameSeq;
