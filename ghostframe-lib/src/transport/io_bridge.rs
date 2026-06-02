@@ -810,6 +810,19 @@ impl IoBridge {
                         }
                     };
                     for entry in coverage {
+                        // Mark the matching InFlight entry in
+                        // `priority_queue`/`refinement_queue` as Acked so
+                        // `drain_priority_queue` stops retrying it every
+                        // 2×RTT. The M3.3d `Scheduler::on_ack` deletion
+                        // (commit de37a83) dropped this transition; without
+                        // it Solid/Raw/Bc1/PalRle work stays InFlight
+                        // forever and the entire grid re-emits every frame.
+                        self.scheduler.mark_acked(
+                            entry.tile_x,
+                            entry.tile_y,
+                            entry.generation,
+                            entry.pass_idx,
+                        );
                         match entry.codec {
                             crate::transport::protocol::Codec::Cdf53 => {
                                 tracing::debug!(
@@ -851,9 +864,8 @@ impl IoBridge {
                                     }
                                 }
                             }
-                            // Solid, Raw, H264, Bc1, Skip: no per-tile
-                            // delivery semantic. ACK is just "datagram
-                            // landed" telemetry; nothing to update.
+                            // Solid, Raw, H264, Bc1, Skip: mark_acked above
+                            // is the only scheduler-state update needed.
                             _ => {}
                         }
                     }

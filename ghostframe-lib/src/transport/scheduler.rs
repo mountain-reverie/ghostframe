@@ -225,6 +225,41 @@ impl Scheduler {
         self.delivery_window_acked = self.delivery_window_acked.saturating_add(1);
     }
 
+    /// Mark the matching InFlight entry in `priority_queue` as `Acked` so the
+    /// next `drain_priority_queue` retain drops it. Must be called from
+    /// `IoBridge::dispatch_ack_datagram` for every coverage entry — without
+    /// this, `drain_priority_queue` keeps re-emitting InFlight items every
+    /// 2×RTT forever (the M3.3d `on_ack` deletion in commit de37a83 dropped
+    /// this transition for non-Cdf53 codecs, where the `record_cdf53_ack`
+    /// replacement only covers the PixelPerfect counter).
+    ///
+    /// Stale-generation, stale-pass, or already-resolved (Acked/Superseded)
+    /// entries are skipped silently — late ACKs after `bump_generation` or
+    /// duplicate per-fragment ACKs from a multi-fragment payload would
+    /// otherwise log spurious panics.
+    ///
+    /// Cdf53 refinement work lives in `refinement_queue` and is removed at
+    /// emit time by `drain_refinement_pass_major`, so it does not need this
+    /// transition — but scanning that queue too is harmless and keeps the
+    /// invariant uniform.
+    pub fn mark_acked(&mut self, tile_x: u8, tile_y: u8, generation: u8, pass_idx: u8) {
+        for work in self
+            .priority_queue
+            .iter_mut()
+            .chain(self.refinement_queue.iter_mut())
+        {
+            if work.tile_x == tile_x
+                && work.tile_y == tile_y
+                && work.generation == generation
+                && work.pass_idx == pass_idx
+                && work.state == WorkState::InFlight
+            {
+                work.state = WorkState::Acked;
+                return;
+            }
+        }
+    }
+
     #[cfg(test)]
     pub fn delivery_window_acked_for_test(&self) -> u32 {
         self.delivery_window_acked
@@ -651,6 +686,72 @@ mod tests {
         std::thread::sleep(Duration::from_millis(15));
         let third = s.tick(usize::MAX);
         assert_eq!(third.len(), 1, "InFlight work should retry after 2×RTT");
+    }
+
+    #[test]
+    fn mark_acked_stops_retry_for_non_cdf53_tile() {
+        // Regression for the M3.3d on_ack deletion: without a queue-state
+        // flip on ACK, Solid/Raw/Bc1/PalRle items in priority_queue stay
+        // InFlight and retry every 2×RTT forever.
+        let mut s = Scheduler::new(4, 4);
+        s.set_rtt(Duration::from_millis(5));
+        s.enqueue(TileWork::raw_for_test(0, 0, 0, vec![1]));
+        let first = s.tick(usize::MAX);
+        assert_eq!(first.len(), 1, "first tick emits");
+
+        // ACK arrives, marks the entry Acked.
+        s.mark_acked(0, 0, 0, 0);
+
+        std::thread::sleep(Duration::from_millis(15));
+        let after_rtt = s.tick(usize::MAX);
+        assert!(
+            after_rtt.is_empty(),
+            "Acked work must NOT retry after 2×RTT (priority_queue retain drops it)"
+        );
+    }
+
+    #[test]
+    fn mark_acked_stale_generation_is_noop() {
+        // After bump_generation, an old-gen ACK has nothing to mark; the
+        // current-gen InFlight entry must NOT be touched.
+        let mut s = Scheduler::new(4, 4);
+        s.set_rtt(Duration::from_millis(5));
+        s.enqueue(TileWork::raw_for_test(0, 0, 0, vec![1]));
+        let _ = s.tick(usize::MAX); // entry now InFlight at gen=0
+        let gen1 = s.bump_generation(0, 0);
+        assert_eq!(gen1, 1);
+        s.enqueue(TileWork::raw_for_test(0, 0, gen1, vec![2]));
+        let _ = s.tick(usize::MAX); // gen=1 entry now InFlight too
+
+        // Late ACK for gen=0 — must be silently ignored, not flip gen=1.
+        s.mark_acked(0, 0, 0, 0);
+
+        // Wait past retry threshold: gen=1 must still retry because no ACK
+        // landed for it.
+        std::thread::sleep(Duration::from_millis(15));
+        let retried = s.tick(usize::MAX);
+        assert_eq!(retried.len(), 1, "gen=1 still InFlight, retries");
+        assert_eq!(retried[0].generation, 1);
+    }
+
+    #[test]
+    fn mark_acked_duplicate_calls_are_noop() {
+        // Multi-fragment payloads make the client send N ACKs with the same
+        // (tile_x, tile_y, generation, pass_idx) key. The first call marks
+        // Acked; subsequent calls find no InFlight entry and must no-op.
+        let mut s = Scheduler::new(4, 4);
+        s.set_rtt(Duration::from_millis(5));
+        s.enqueue(TileWork::raw_for_test(0, 0, 0, vec![1]));
+        let _ = s.tick(usize::MAX);
+        s.mark_acked(0, 0, 0, 0);
+        s.mark_acked(0, 0, 0, 0); // duplicate
+        s.mark_acked(0, 0, 0, 0); // duplicate
+
+        // Enqueue a new gen-0 entry — it must NOT be confused with the
+        // already-Acked one; the new entry should be Pending and emitted.
+        s.enqueue(TileWork::raw_for_test(0, 0, 0, vec![2]));
+        let out = s.tick(usize::MAX);
+        assert_eq!(out.len(), 1, "new Pending entry emits");
     }
 
     #[test]
