@@ -24,7 +24,6 @@ anyhow = "1"
 axum = "0.7"
 tower-http = { version = "0.6", features = ["fs"] }
 futures = "0.3"
-url = "2"
 image-compare = "0.4"
 image = { version = "0.25", features = ["png"] }
 tracing = { workspace = true }
@@ -38,4 +37,5 @@ quinn-proto = { workspace = true }
 rustls = { workspace = true }
 rcgen = { workspace = true }
 time = { workspace = true }
+url = "2"
 web-transport-proto = { workspace = true }
