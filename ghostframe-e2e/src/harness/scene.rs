@@ -52,9 +52,13 @@ pub struct CodecHistogram {
 #[derive(Clone, Debug)]
 pub struct ClientDiagnosticRecord {
     pub frame_seq: u64,
-    pub first_recv_ns: f64,    // performance.now() — millisecond resolution
-    pub last_paint_ns: f64,
-    pub raf_ns: f64,
+    /// `performance.now()` at first-fragment arrival. DOMHighResTimeStamp,
+    /// millisecond resolution (sub-ms precision). Not directly comparable
+    /// to server-side `capture_done_ns`/`last_send_ns` (those are
+    /// CLOCK_MONOTONIC nanoseconds) — use intervals on each side.
+    pub first_recv_ms: f64,
+    pub last_paint_ms: f64,
+    pub raf_ms: f64,
 }
 
 #[derive(Clone, Debug)]

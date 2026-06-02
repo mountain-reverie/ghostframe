@@ -1,3 +1,10 @@
+// TRANSIENT DUPLICATE — DO NOT EDIT.
+// This file is a verbatim copy of ghostframe_e2e::harness::* sub-modules,
+// kept temporarily during the M3.5a refactor so the test binary keeps
+// compiling between Task 2 (library extraction) and Task 3 (delete this
+// file + switch tests to `use ghostframe_e2e::harness::*;`).
+// Any edits here should land in `src/harness/<module>.rs` instead.
+
 use std::net::SocketAddr;
 use std::os::unix::io::FromRawFd;
 use std::path::Path;

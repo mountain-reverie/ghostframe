@@ -23,8 +23,8 @@ pub use containers::{
     create_preauth_key, docker_run_in_container, read_cert_hash_from_logs, TestNode, NETWORK_NAME,
 };
 pub use scene::{
-    run_scene, ClientDiagnosticRecord, FrameMode, ProcSample, SceneResult, SceneSpec,
-    ServerTelemetryRecord,
+    run_scene, ClientDiagnosticRecord, CodecHistogram, FrameMode, ProcSample, SceneResult,
+    SceneSpec, ServerTelemetryRecord,
 };
 pub use transport::{start_forwarder, start_static_server};
 pub use weston::{parse_weston_xwayland_display, spawn_weston_headless, WestonGuard};
