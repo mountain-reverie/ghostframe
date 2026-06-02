@@ -30,6 +30,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 # Only used by tests/loopback_h3.rs (sans-IO QUIC/H3 test).

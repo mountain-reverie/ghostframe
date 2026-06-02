@@ -1495,6 +1495,7 @@ dependencies = [
  "ghostframe-test-pattern",
  "image",
  "image-compare",
+ "libc",
  "quinn-proto",
  "rcgen",
  "rustls",
