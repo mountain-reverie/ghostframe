@@ -79,6 +79,14 @@ struct Args {
     #[arg(long)]
     gradient: bool,
 
+    /// Fill the full screen by repeating a 32×32 fixture tile for one of the
+    /// six M3.5 Layer B content classes: solid, flat_ui, text, gradient,
+    /// photo, motion. Requires `--drm-direct`.
+    ///
+    /// Example: `--drm-direct --tile-pattern flat_ui`
+    #[arg(long, value_name = "CLASS")]
+    tile_pattern: Option<String>,
+
     /// (Ignored — kept for CLI compat.) Window width.
     #[arg(long, default_value = "640")]
     width: u16,
@@ -110,6 +118,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Cdf53 e2e tests. No X11 path; gradient is DRM-only.
     if args.drm_direct && args.gradient {
         return ghostframe_test_pattern::gradient::run(&args.drm_device);
+    }
+
+    // DRM-direct tile-pattern mode: full-screen ContentClass fixture tile
+    // repeated to cover the scanout. Drives M3.5 Layer B pure-scene benches.
+    if args.drm_direct {
+        if let Some(ref class_name) = args.tile_pattern {
+            return ghostframe_test_pattern::tile_pattern::run(
+                &args.drm_device,
+                class_name,
+            );
+        }
     }
 
     // DRM-direct text-grid mode: paint text glyphs directly to scanout,

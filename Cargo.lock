@@ -1462,7 +1462,6 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "ghostframe-lib",
- "ghostframe-test-pattern",
  "iai-callgrind",
  "lz4_flex",
 ]
@@ -1533,6 +1532,7 @@ dependencies = [
  "clap",
  "drm",
  "drm-ffi",
+ "ghostframe-bench",
  "libc",
  "x11rb",
 ]

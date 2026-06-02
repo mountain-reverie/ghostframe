@@ -24,7 +24,6 @@ m3 = ["ghostframe-lib/m3"]
 
 [dependencies]
 ghostframe-lib = { path = "../ghostframe-lib" }
-ghostframe-test-pattern = { path = "../ghostframe-test-pattern" }
 lz4_flex = "0.11"
 
 [dev-dependencies]
