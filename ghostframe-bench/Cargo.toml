@@ -25,6 +25,13 @@ m3 = ["ghostframe-lib/m3"]
 [dependencies]
 ghostframe-lib = { path = "../ghostframe-lib" }
 lz4_flex = "0.11"
+clap = { version = "4", features = ["derive"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "process", "time", "io-util"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 # Versions copied verbatim from ghostframe-lib/Cargo.toml.
@@ -32,8 +39,6 @@ criterion = { version = "0.5", features = ["html_reports"] }
 iai-callgrind = "0.14"
 dssim-core = "3"
 rgb = "0.8"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 
 [[bench]]
 name = "codec_latency"
@@ -50,3 +55,7 @@ harness = false
 [[bench]]
 name = "side_channel"
 harness = false
+
+[[bin]]
+name = "codec_report"
+path = "src/bin/codec_report/main.rs"

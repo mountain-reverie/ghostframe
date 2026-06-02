@@ -1472,6 +1472,8 @@ dependencies = [
 name = "ghostframe-bench"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "clap",
  "criterion",
  "dssim-core",
  "ghostframe-lib",
@@ -1480,6 +1482,9 @@ dependencies = [
  "rgb",
  "serde",
  "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
