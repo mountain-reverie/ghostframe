@@ -3560,3 +3560,5 @@ async fn e2e_ack_telemetry_no_waste() -> Result<()> {
 
     Ok(())
 }
+
+mod harness_smoke;
