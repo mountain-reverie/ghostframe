@@ -43,10 +43,24 @@ export interface DiagnosticsHandle {
     fbWidth: number; fbHeight: number;
     /** First byte of payload; only pushed when codec === PalRle (2). */
     palRleFlag?: number;
+    // M3.5 bench instrumentation — optional, default undefined.
+    // performance.now() values; DOMHighResTimeStamp, millisecond resolution.
+    /** performance.now() at first fragment receipt for this tile. */
+    firstRecvMsClient?: number;
+    /** performance.now() after putImageData/drawSolidTile returns. */
+    lastPaintMsClient?: number;
   }): void;
 
   /** Update the rAF tick counter on window. */
   recordRafTick(n: number): void;
+
+  // M3.5 bench instrumentation: called from rAF callback after a frame's
+  // last tile has been painted.
+  recordFramePainted(params: {
+    seq: number;
+    /** performance.now() inside the rAF callback. */
+    rafMsClient: number;
+  }): void;
 }
 
 /** Subset of the renderer the GPU read-back helpers need. */
@@ -266,6 +280,8 @@ export function initDiagnostics({
     payloadLen: number;
     fbWidth: number; fbHeight: number;
     palRleFlag?: number;
+    firstRecvMsClient?: number;
+    lastPaintMsClient?: number;
   }): void {
     if (typeof window === 'undefined') return;
     if (!window.__ghostframeRecordedCodecs) window.__ghostframeRecordedCodecs = [];
@@ -284,7 +300,19 @@ export function initDiagnostics({
       payloadLen: params.payloadLen,
       fbWidth: params.fbWidth,
       fbHeight: params.fbHeight,
+      firstRecvMsClient: params.firstRecvMsClient,
+      lastPaintMsClient: params.lastPaintMsClient,
     });
+  }
+
+  // ---- frame paint FIFO (M3.5 bench) -----------------------------------
+  const framePaints: Array<{ seq: number; rafMsClient: number }> = [];
+  if (typeof window !== 'undefined') {
+    (window as any).__ghostframe_framePaints = framePaints;
+  }
+
+  function recordFramePainted(params: { seq: number; rafMsClient: number }): void {
+    fifoAppend(framePaints, params);
   }
 
   function recordRafTick(n: number): void {
@@ -293,5 +321,5 @@ export function initDiagnostics({
     }
   }
 
-  return { stats, recordResize, recordTile, recordRafTick };
+  return { stats, recordResize, recordTile, recordRafTick, recordFramePainted };
 }

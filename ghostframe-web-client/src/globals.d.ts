@@ -35,7 +35,12 @@ interface Window {
     payloadLen: number;
     fbWidth: number;
     fbHeight: number;
+    // M3.5 bench instrumentation — optional fields.
+    firstRecvMsClient?: number;
+    lastPaintMsClient?: number;
   }> | undefined;
+  /** M3.5 bench: per-frame paint timestamps, keyed by frame seq. */
+  __ghostframe_framePaints: Array<{ seq: number; rafMsClient: number }> | undefined;
 
   // ----- GPU readback helpers (set at startup by diagnostics.ts) ---------------
   __readPixel(x: number, y: number): Promise<number[]>;
