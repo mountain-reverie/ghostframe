@@ -404,6 +404,17 @@ async function main() {
   let firstTileRendered = false;
   let frameDimensionsKnown = false;
 
+  // M3.5 bench: per-frame_seq earliest datagram-receive timestamp.
+  // Keyed by frameSeq (uint32); cleared after the corresponding frame is painted.
+  const firstRecvMs = new Map<number, number>();
+
+  // M3.5 bench: per-frame painted-tile counters + rAF trigger set.
+  // A frame enters pendingFramePaintRaf when latestFrameSeq advances past it by
+  // >= 2 (matching the stale-eviction threshold), i.e. when the server has moved
+  // on and we know all tiles that will arrive have arrived.
+  const paintedTilesPerFrame = new Map<number, number>();
+  const pendingFramePaintRaf = new Set<number>();
+
   /** Reassemble completed tile and route it to the renderer's per-codec queue. */
   function finishAssembly(asmKey: string, asm: TileAssembly) {
     assemblies.delete(asmKey);
@@ -468,16 +479,11 @@ async function main() {
     // Per-tile event log adds {tileX, tileY, codec, payloadLen, fbWidth, fbHeight}
     // so e2e_edge_tiles can correlate which tiles arrived against the framebuffer
     // dimensions at the moment they were queued (W5 diagnostic).
-    diag.recordTile({
-      seq: frameSeqFromKey,
-      tileX: tX,
-      tileY: tY,
-      codec: asm.header.codec,
-      payloadLen: payload.byteLength,
-      fbWidth: renderer.framebuffer.width,
-      fbHeight: renderer.framebuffer.height,
-      palRleFlag: asm.header.codec === Codec.PalRle ? payload[0] : undefined,
-    });
+    //
+    // M3.5 bench: capture firstRecv BEFORE routing to GPU queues and
+    // lastPaint AFTER, so the interval spans tile processing time.
+    const firstRecv = firstRecvMs.get(frameSeqFromKey);
+    // Route tile data into the appropriate renderer queue.
 
     if (asm.header.codec === Codec.Raw) {
       renderer.rawQueue.push({ tileX: tX, tileY: tY, bgra: payload });
@@ -510,6 +516,34 @@ async function main() {
       }
     }
 
+    // M3.5 bench: lastPaintMsClient — captured after tile data is handed to
+    // the GPU queue (the JS-side "paint" boundary; the actual GPU rasterisation
+    // happens on the next rAF tick in encodeAndPresentFrame).
+    const lastPaintMs = performance.now();
+
+    diag.recordTile({
+      seq: frameSeqFromKey,
+      tileX: tX,
+      tileY: tY,
+      codec: asm.header.codec,
+      payloadLen: payload.byteLength,
+      fbWidth: renderer.framebuffer.width,
+      fbHeight: renderer.framebuffer.height,
+      palRleFlag: asm.header.codec === Codec.PalRle ? payload[0] : undefined,
+      // M3.5 bench fields:
+      firstRecvMsClient: firstRecv,
+      lastPaintMsClient: lastPaintMs,
+    });
+
+    // M3.5 bench: track painted-tile count per frame. When latestFrameSeq
+    // advances past this frame by >= 2 (the stale-eviction threshold), the
+    // frame's entry is moved to pendingFramePaintRaf in the datagram loop so
+    // the next rAF tick can emit recordFramePainted.
+    paintedTilesPerFrame.set(
+      frameSeqFromKey,
+      (paintedTilesPerFrame.get(frameSeqFromKey) ?? 0) + 1,
+    );
+
     if (!firstTileRendered) {
       firstTileRendered = true;
       const sample = Array.from(payload.slice(0, 16))
@@ -527,6 +561,21 @@ async function main() {
   function tick() {
     __rafTicks++;
     diag.recordRafTick(__rafTicks);
+
+    // M3.5 bench: emit recordFramePainted for all frames whose last tile was
+    // received before this rAF tick. Uses performance.now() at rAF entry so
+    // all frames pending in this tick share the same rafMsClient timestamp.
+    if (pendingFramePaintRaf.size > 0) {
+      const rafMs = performance.now();
+      for (const seq of pendingFramePaintRaf) {
+        diag.recordFramePainted({ seq, rafMsClient: rafMs });
+        // Cleanup per-frame bench state.
+        firstRecvMs.delete(seq);
+        paintedTilesPerFrame.delete(seq);
+      }
+      pendingFramePaintRaf.clear();
+    }
+
     renderer.encodeAndPresentFrame((codec, tx, ty, code) => {
       decodeErrorBatcher.report({ codec, tileX: tx, tileY: ty, errorCode: code });
     });
@@ -660,6 +709,14 @@ async function main() {
       });
     }
 
+    // M3.5 bench: record the earliest receive timestamp per frame_seq.
+    // Captured here — before any fragment-assembly checks — so it reflects
+    // the true first-datagram-arrival time regardless of frag_idx ordering.
+    const nowMs = performance.now();
+    if (!firstRecvMs.has(dgramHdr.frameSeq)) {
+      firstRecvMs.set(dgramHdr.frameSeq, nowMs);
+    }
+
     if (dgramHdr.frameSeq > latestFrameSeq) {
       latestFrameSeq = dgramHdr.frameSeq;
     }
@@ -673,6 +730,13 @@ async function main() {
         }
         assemblies.delete(k);
         parityMap.delete(k);
+        // M3.5 bench: frame is now stale — mark for recordFramePainted on next
+        // rAF tick if we have any bench state for it (i.e. at least one tile
+        // was painted). Frames that never produced a painted tile (e.g.
+        // dropped entirely) are skipped to avoid spurious FIFO entries.
+        if (paintedTilesPerFrame.has(seq)) {
+          pendingFramePaintRaf.add(seq);
+        }
       }
     }
 
