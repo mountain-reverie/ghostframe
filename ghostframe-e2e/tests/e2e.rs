@@ -1,5 +1,4 @@
-#[path = "e2e/helpers.rs"]
-mod helpers;
+use ghostframe_e2e::harness as helpers;
 
 use std::net::SocketAddr;
 use std::time::Duration;
