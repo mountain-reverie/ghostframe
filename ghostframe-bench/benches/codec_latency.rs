@@ -221,6 +221,19 @@ fn bench_codec(c: &mut Criterion, encoder: &mut dyn BenchEncoder) {
     for class in ContentClass::ALL {
         let tile = class.tile();
         assert_eq!(tile.len(), TILE_BYTES);
+
+        // Record compressed size OUTSIDE the criterion timing loop.
+        #[cfg(any(feature = "gpu-bench", feature = "m3"))]
+        {
+            let encoded = encoder.encode(&tile);
+            side_channel::record_compressed_bytes(
+                encoder.name(),
+                class.name(),
+                encoder.lz4(),
+                encoded.len(),
+            );
+        }
+
         group.bench_with_input(BenchmarkId::from_parameter(class.name()), &tile, |b, t| {
             b.iter(|| black_box(encoder.encode(t)));
         });
@@ -271,6 +284,25 @@ fn run_codecs(c: &mut Criterion) {
         let mut cdf53_lz4 = Lz4Wrapper::new(Cdf53Encoder);
         bench_codec(c, &mut cdf53_lz4);
 
+        // SSIM + bytes-to-lossless for Cdf53 (full encode, all 9 passes).
+        for class in ContentClass::ALL {
+            let tile = class.tile();
+            let coeffs = ghostframe_lib::encoder::cdf53::forward(&tile);
+            let passes = ghostframe_lib::encoder::cdf53::encode_passes(&coeffs);
+            let pass_refs: Vec<&[u8]> = passes.iter().map(|p| &p[..]).collect();
+            let recovered_coeffs = ghostframe_lib::encoder::cdf53::decode_passes(&pass_refs);
+            let recovered_bgr = ghostframe_lib::encoder::cdf53::inverse(&recovered_coeffs);
+            // inverse() returns BGR (3 bytes/pixel); convert to BGRA for SSIM.
+            let mut recovered_bgra = Vec::with_capacity(32 * 32 * 4);
+            for chunk in recovered_bgr.chunks_exact(3) {
+                recovered_bgra.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 0xFF]);
+            }
+            let ssim = side_channel::compute_ssim(&tile, &recovered_bgra, 32, 32);
+            side_channel::record_ssim("cdf53", class.name(), None, ssim);
+            let bytes_per_pass: Vec<usize> = passes.iter().map(|p| p.len()).collect();
+            side_channel::record_bytes_to_lossless(class.name(), bytes_per_pass);
+        }
+
         // Cdf53PerPass: one bench group per K showing the K progression.
         for k in 1..=9u8 {
             let mut per_pass = Cdf53PerPassEncoder { passes_kept: k };
@@ -285,12 +317,34 @@ fn run_codecs(c: &mut Criterion) {
                 );
             }
             group.finish();
+
+            // SSIM for Cdf53PerPass at this K value, per class.
+            for class in ContentClass::ALL {
+                let tile = class.tile();
+                let coeffs = ghostframe_lib::encoder::cdf53::forward(&tile);
+                let all_passes = ghostframe_lib::encoder::cdf53::encode_passes(&coeffs);
+                let kept = (k as usize).min(all_passes.len());
+                let kept_refs: Vec<&[u8]> = all_passes[..kept].iter().map(|p| &p[..]).collect();
+                let recovered_coeffs = ghostframe_lib::encoder::cdf53::decode_passes(&kept_refs);
+                let recovered_bgr = ghostframe_lib::encoder::cdf53::inverse(&recovered_coeffs);
+                // inverse() returns BGR (3 bytes/pixel); convert to BGRA for SSIM.
+                let mut recovered_bgra = Vec::with_capacity(32 * 32 * 4);
+                for chunk in recovered_bgr.chunks_exact(3) {
+                    recovered_bgra.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 0xFF]);
+                }
+                let ssim = side_channel::compute_ssim(&tile, &recovered_bgra, 32, 32);
+                side_channel::record_ssim("cdf53_per_pass", class.name(), Some(k), ssim);
+            }
         }
     }
     #[cfg(not(feature = "gpu-bench"))]
     {
         let _ = c;
         eprintln!("codec_latency: built without --features gpu-bench, no codecs to bench");
+    }
+    #[cfg(any(feature = "gpu-bench", feature = "m3"))]
+    {
+        side_channel::flush().expect("side_channel flush");
     }
 }
 
