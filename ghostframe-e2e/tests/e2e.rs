@@ -2515,10 +2515,8 @@ async fn e2e_cdf53_bypass_integrate() -> Result<()> {
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Load the fixture's expected_coefficients (3072 i16) and pixels_bgra.
-    let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/cdf53_fixture.json");
     let fixture: serde_json::Value =
-        serde_json::from_reader(std::fs::File::open(&fixture_path)?)?;
+        serde_json::from_slice(helpers::fixtures::CDF53_FIXTURE_JSON)?;
     let coeffs: Vec<i32> = fixture["expected_coefficients"]
         .as_array().unwrap().iter().map(|v| v.as_i64().unwrap() as i32).collect();
     let pixels_bgra: Vec<u8> = fixture["pixels_bgra"]
@@ -2588,10 +2586,8 @@ async fn e2e_cdf53_integrate_correctness() -> Result<()> {
     let setup = setup_e2e_webgpu_gpu("--gradient --drm-direct").await?;
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/cdf53_fixture.json");
     let fixture: serde_json::Value =
-        serde_json::from_reader(std::fs::File::open(&fixture_path)?)?;
+        serde_json::from_slice(helpers::fixtures::CDF53_FIXTURE_JSON)?;
     let encoded_passes: Vec<Vec<u8>> = fixture["encoded_passes"]
         .as_array().unwrap().iter().map(|p| {
             p.as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u8).collect()
