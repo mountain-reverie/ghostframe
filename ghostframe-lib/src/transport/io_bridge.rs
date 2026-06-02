@@ -3094,7 +3094,7 @@ mod tests {
         let grid = crate::tile::TileGrid::new(64, 64);
         let dirty = vec![(0u32, 0u32), (1, 1)];
 
-        bridge.dispatch_dirty_tiles_via_scheduler(
+        let _ = bridge.dispatch_dirty_tiles_via_scheduler(
             &dirty,
             &grid,
             TileDispatchFrame {
@@ -3288,7 +3288,7 @@ mod tests {
         let grid = crate::tile::TileGrid::new(64, 64);
         let dirty = vec![(0u32, 0u32)];
 
-        bridge.dispatch_dirty_tiles_via_scheduler(
+        let _ = bridge.dispatch_dirty_tiles_via_scheduler(
             &dirty,
             &grid,
             TileDispatchFrame {
