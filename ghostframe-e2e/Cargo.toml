@@ -12,14 +12,11 @@ edition = "2021"
 path = "src/lib.rs"
 
 [dependencies]
-# Use ghostframe-lib with `test-loss-injection` enabled so the e2e tests'
+# Use ghostframe-lib with `test-loss-injection` enabled so the harness's
 # GHOSTFRAME_OUTBOUND_LOSS_* / GHOSTFRAME_INBOUND_LOSS_* env vars take effect.
 ghostframe-lib = { path = "../ghostframe-lib", features = ["test-loss-injection"] }
 ghostframe-test-pattern = { path = "../ghostframe-test-pattern" }
-
-[dev-dependencies]
-# Versions copied verbatim from ghostframe-lib/Cargo.toml's [dev-dependencies].
-tracing-subscriber = { workspace = true }
+# Harness library needs these at lib-build time (was dev-deps).
 testcontainers = "0.27"
 chromiumoxide = "0.9"
 serde_json = "1"
@@ -30,11 +27,13 @@ futures = "0.3"
 url = "2"
 image-compare = "0.4"
 image = { version = "0.25", features = ["png"] }
-# Async runtime + bytes for the integration tests themselves.
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
-# loopback_h3 integration test uses quinn-proto + rustls + rcgen + time +
-# web-transport-proto directly for the sans-IO QUIC/H3 harness. Test-only.
+
+[dev-dependencies]
+# Only used by tests/loopback_h3.rs (sans-IO QUIC/H3 test).
 quinn-proto = { workspace = true }
 rustls = { workspace = true }
 rcgen = { workspace = true }
