@@ -1,6 +1,9 @@
-//! Empty library — this crate exists to host benchmarks in `benches/`.
+//! ghostframe-bench — codec bench fixtures (`ContentClass::tile()`) and
+//! the home for criterion / iai-callgrind benches and the M3.5 Layer B
+//! `codec_report` binary.
 //!
-//! criterion and iai-callgrind live in this crate's `[dev-dependencies]` so
-//! that the lib's `cargo test --lib` doesn't have to compile them. See
-//! `docs/superpowers/specs/2026-05-20-workspace-test-crate-split-design.md`
-//! for the rationale.
+//! Fixtures live here (not under `benches/`) so they can also be
+//! consumed by `ghostframe-test-pattern` for the `--tile-pattern` full-
+//! frame scenes used by the Layer B bench.
+
+pub mod fixtures;

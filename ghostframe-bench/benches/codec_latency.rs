@@ -6,8 +6,7 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 
 #[cfg(any(feature = "gpu-bench", feature = "m3"))]
-#[path = "fixtures/mod.rs"]
-mod fixtures;
+use ghostframe_bench::fixtures;
 
 #[cfg(any(feature = "gpu-bench", feature = "m3"))]
 use fixtures::BenchEncoder;
