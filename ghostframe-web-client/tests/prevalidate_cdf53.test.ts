@@ -9,7 +9,7 @@ import {
   ERR_CDF53_TRUNCATED,
   ERR_CDF53_RLE_LENGTH,
 } from '../src/feedback.js';
-import fixture from '../../ghostframe-e2e/tests/fixtures/cdf53_fixture.json';
+import fixture from '../../ghostframe-e2e/src/harness/fixtures/cdf53_fixture.json';
 
 describe('rleDecode', () => {
   it('all-zero token decodes to 128 zero bytes', () => {
