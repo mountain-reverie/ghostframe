@@ -104,6 +104,23 @@ impl FragmentCoverageMap {
         Some(cov)
     }
 
+    /// Drop every coverage entry for the given (tile_x, tile_y) across all
+    /// frame_seq / pass_idx keys. Called from `IoBridge` alongside
+    /// `Scheduler::bump_generation*`: the bump marks queued work as
+    /// `Superseded`, so the already-emitted-but-not-yet-ACKed coverage for
+    /// the same tile must also be discarded. Otherwise those entries linger
+    /// until LRU eviction and `pending_refinement_snapshot` reports them as
+    /// in-flight Cdf53 work for a generation that no longer exists, breaking
+    /// the M3.3d refinement-cancel invariant.
+    ///
+    /// O(n) over both `entries` and `order` (n = current map size, bounded
+    /// by `capacity`). Called per dirty tile per frame in the emission path,
+    /// so a much-larger map would warrant a secondary tile-keyed index.
+    pub fn drop_for_tile(&mut self, tile_x: u8, tile_y: u8) {
+        self.entries.retain(|&(_, tx, ty, _), _| !(tx == tile_x && ty == tile_y));
+        self.order.retain(|&(_, tx, ty, _)| !(tx == tile_x && ty == tile_y));
+    }
+
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -190,6 +207,65 @@ mod tests {
         // declared and reasonable.
         assert!(FRAGMENT_COVERAGE_CAPACITY >= 1000);
         assert!(FRAGMENT_COVERAGE_CAPACITY <= 100_000);
+    }
+
+    #[test]
+    fn drop_for_tile_removes_matching_entries_only() {
+        let mut m = FragmentCoverageMap::new(16);
+        let make_cov = |tile_x: u8, tile_y: u8| -> CoverageList {
+            smallvec::smallvec![FragmentCoverage {
+                tile_x, tile_y, generation: 0, pass_idx: 0,
+                codec: Codec::Cdf53, palette_id: None,
+            }]
+        };
+        // Same tile (5,3) spread across two frames and two passes (4 entries).
+        m.record((100, 5, 3, 0), make_cov(5, 3));
+        m.record((100, 5, 3, 1), make_cov(5, 3));
+        m.record((101, 5, 3, 0), make_cov(5, 3));
+        m.record((101, 5, 3, 1), make_cov(5, 3));
+        // Neighbor tile (6,3) must survive.
+        m.record((100, 6, 3, 0), make_cov(6, 3));
+        // Same column, different row (5,4) must survive.
+        m.record((100, 5, 4, 0), make_cov(5, 4));
+        assert_eq!(m.len(), 6);
+
+        m.drop_for_tile(5, 3);
+
+        assert_eq!(m.len(), 2, "only (6,3) and (5,4) entries should remain");
+        assert!(m.take((100, 5, 3, 0)).is_none());
+        assert!(m.take((100, 5, 3, 1)).is_none());
+        assert!(m.take((101, 5, 3, 0)).is_none());
+        assert!(m.take((101, 5, 3, 1)).is_none());
+        assert!(m.take((100, 6, 3, 0)).is_some(), "neighbor (6,3) unaffected");
+        assert!(m.take((100, 5, 4, 0)).is_some(), "neighbor (5,4) unaffected");
+    }
+
+    #[test]
+    fn drop_for_tile_keeps_order_and_entries_consistent() {
+        // After drop_for_tile, the order queue must not contain dangling keys
+        // that the entries map has already discarded; otherwise the next LRU
+        // eviction would try to remove a key that isn't there.
+        let mut m = FragmentCoverageMap::new(3);
+        let dummy: CoverageList = smallvec::smallvec![];
+        m.record((0, 1, 1, 0), dummy.clone());
+        m.record((0, 2, 2, 0), dummy.clone());
+        m.record((0, 1, 1, 1), dummy.clone());
+        assert_eq!(m.len(), 3);
+
+        m.drop_for_tile(1, 1);
+        assert_eq!(m.len(), 1);
+
+        // Capacity should now accept two new entries without LRU-evicting
+        // the surviving (2,2) entry. If `order` still carried the dropped
+        // (1,1,*) keys, the next record() at capacity would pop a phantom
+        // key and the (2,2) entry would survive incorrectly OR an unrelated
+        // entry would be evicted.
+        m.record((0, 3, 3, 0), dummy.clone());
+        m.record((0, 4, 4, 0), dummy.clone());
+        assert_eq!(m.len(), 3);
+        assert!(m.take((0, 2, 2, 0)).is_some(), "(2,2) survived");
+        assert!(m.take((0, 3, 3, 0)).is_some());
+        assert!(m.take((0, 4, 4, 0)).is_some());
     }
 
     #[test]

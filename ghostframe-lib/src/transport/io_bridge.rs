@@ -632,6 +632,12 @@ impl IoBridge {
 
             let (gen, superseded) =
                 self.scheduler.bump_generation_collecting(tile_x as u8, tile_y as u8);
+            // Drop any in-flight coverage for the old generation. The bump
+            // marked queued work `Superseded`; the matching emitted-but-not-
+            // yet-ACKed coverage must be dropped in lockstep so
+            // `pending_refinement_snapshot` does not keep reporting the
+            // cancelled work as still pending until LRU eviction.
+            self.fragment_coverage.drop_for_tile(tile_x as u8, tile_y as u8);
             // New generation: tile is eligible for re-escalation.
             // Guard with a bounds check to stay safe when metrics_tracker has
             // not yet been sized (e.g. CpuRawOnly unit test path).
@@ -1836,6 +1842,10 @@ impl IoBridge {
                             }
                             let passes = crate::encoder::cdf53::encode_passes(&coeffs_i16);
                             let gen = self.scheduler.bump_generation(tile_x, tile_y);
+                            // Drop any in-flight coverage for the old generation
+                            // (see dispatch_dirty_tiles_via_scheduler for the
+                            // full rationale).
+                            self.fragment_coverage.drop_for_tile(tile_x, tile_y);
                             // New generation: tile is eligible for re-escalation.
                             self.metrics_tracker
                                 .get_mut(tile_x as u32, tile_y as u32)
@@ -1910,6 +1920,10 @@ impl IoBridge {
                         let coeffs_i16: Vec<i16> = coeffs_i32.iter().map(|&v| v as i16).collect();
                         let passes = crate::encoder::cdf53::encode_passes(&coeffs_i16);
                         let gen = self.scheduler.bump_generation(tile_x, tile_y);
+                        // Drop any in-flight coverage for the old generation
+                        // (see dispatch_dirty_tiles_via_scheduler for the
+                        // full rationale).
+                        self.fragment_coverage.drop_for_tile(tile_x, tile_y);
                         for (pass_idx, payload) in passes.iter().enumerate() {
                             tracing::info!(
                                 target: "ghostframe::cdf53",
