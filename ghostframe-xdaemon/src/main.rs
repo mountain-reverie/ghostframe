@@ -19,12 +19,24 @@ enum CaptureBackend {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "ghostframe=debug,info".into()),
-        )
-        .init();
+    let log_format = std::env::var("GHOSTFRAME_LOG_FORMAT")
+        .unwrap_or_else(|_| "text".into());
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "ghostframe=debug,info".into());
+
+    match log_format.as_str() {
+        "json" => {
+            tracing_subscriber::fmt()
+                .json()
+                .with_env_filter(env_filter)
+                .init();
+        }
+        _ => {
+            tracing_subscriber::fmt()
+                .with_env_filter(env_filter)
+                .init();
+        }
+    }
 
     let authkey = env::var("TS_AUTHKEY").expect("TS_AUTHKEY must be set");
     let hostname = env::var("TS_HOSTNAME").unwrap_or_else(|_| "ghostframe-server".into());
