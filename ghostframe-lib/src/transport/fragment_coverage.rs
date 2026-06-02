@@ -104,21 +104,41 @@ impl FragmentCoverageMap {
         Some(cov)
     }
 
-    /// Drop every coverage entry for the given (tile_x, tile_y) across all
-    /// frame_seq / pass_idx keys. Called from `IoBridge` alongside
-    /// `Scheduler::bump_generation*`: the bump marks queued work as
-    /// `Superseded`, so the already-emitted-but-not-yet-ACKed coverage for
-    /// the same tile must also be discarded. Otherwise those entries linger
-    /// until LRU eviction and `pending_refinement_snapshot` reports them as
-    /// in-flight Cdf53 work for a generation that no longer exists, breaking
-    /// the M3.3d refinement-cancel invariant.
+    /// Drop every **Cdf53** coverage entry for the given (tile_x, tile_y).
+    /// Called from `IoBridge` alongside `Scheduler::bump_generation*`: the
+    /// bump marks queued Cdf53 refinement work `Superseded`, so the
+    /// matching already-emitted-but-not-yet-ACKed Cdf53 coverage must be
+    /// discarded in lockstep. Otherwise those entries linger until LRU
+    /// eviction and `pending_refinement_snapshot` reports them as
+    /// in-flight Cdf53 work for a generation that no longer exists,
+    /// breaking the M3.3d refinement-cancel invariant.
+    ///
+    /// Non-Cdf53 coverage (Solid, PalRle, Bc1, Raw) is left in place:
+    /// the snapshot filters by `codec == Cdf53` so non-Cdf53 entries
+    /// cannot pollute it, and dropping them would break ACK-driven
+    /// side effects (PalRle `delivered`/`in_flight_carrying` bookkeeping,
+    /// `ack_miss` telemetry on motion-region Solid flips, etc.).
     ///
     /// O(n) over both `entries` and `order` (n = current map size, bounded
     /// by `capacity`). Called per dirty tile per frame in the emission path,
     /// so a much-larger map would warrant a secondary tile-keyed index.
-    pub fn drop_for_tile(&mut self, tile_x: u8, tile_y: u8) {
-        self.entries.retain(|&(_, tx, ty, _), _| !(tx == tile_x && ty == tile_y));
-        self.order.retain(|&(_, tx, ty, _)| !(tx == tile_x && ty == tile_y));
+    pub fn drop_cdf53_for_tile(&mut self, tile_x: u8, tile_y: u8) {
+        let mut dropped_keys: smallvec::SmallVec<[CoverageKey; 16]> = smallvec::SmallVec::new();
+        self.entries.retain(|&key, cov_list| {
+            let (_, tx, ty, _) = key;
+            let target = tx == tile_x
+                && ty == tile_y
+                && cov_list.iter().any(|c| c.codec == Codec::Cdf53);
+            if target {
+                dropped_keys.push(key);
+                false
+            } else {
+                true
+            }
+        });
+        if !dropped_keys.is_empty() {
+            self.order.retain(|k| !dropped_keys.contains(k));
+        }
     }
 
     #[cfg(test)]
@@ -210,28 +230,28 @@ mod tests {
     }
 
     #[test]
-    fn drop_for_tile_removes_matching_entries_only() {
+    fn drop_cdf53_for_tile_removes_matching_cdf53_entries_only() {
         let mut m = FragmentCoverageMap::new(16);
-        let make_cov = |tile_x: u8, tile_y: u8| -> CoverageList {
+        let make_cdf53 = |tile_x: u8, tile_y: u8| -> CoverageList {
             smallvec::smallvec![FragmentCoverage {
                 tile_x, tile_y, generation: 0, pass_idx: 0,
                 codec: Codec::Cdf53, palette_id: None,
             }]
         };
         // Same tile (5,3) spread across two frames and two passes (4 entries).
-        m.record((100, 5, 3, 0), make_cov(5, 3));
-        m.record((100, 5, 3, 1), make_cov(5, 3));
-        m.record((101, 5, 3, 0), make_cov(5, 3));
-        m.record((101, 5, 3, 1), make_cov(5, 3));
-        // Neighbor tile (6,3) must survive.
-        m.record((100, 6, 3, 0), make_cov(6, 3));
-        // Same column, different row (5,4) must survive.
-        m.record((100, 5, 4, 0), make_cov(5, 4));
+        m.record((100, 5, 3, 0), make_cdf53(5, 3));
+        m.record((100, 5, 3, 1), make_cdf53(5, 3));
+        m.record((101, 5, 3, 0), make_cdf53(5, 3));
+        m.record((101, 5, 3, 1), make_cdf53(5, 3));
+        // Neighbor tile (6,3) must survive (different tile).
+        m.record((100, 6, 3, 0), make_cdf53(6, 3));
+        // Same column, different row (5,4) must survive (different tile).
+        m.record((100, 5, 4, 0), make_cdf53(5, 4));
         assert_eq!(m.len(), 6);
 
-        m.drop_for_tile(5, 3);
+        m.drop_cdf53_for_tile(5, 3);
 
-        assert_eq!(m.len(), 2, "only (6,3) and (5,4) entries should remain");
+        assert_eq!(m.len(), 2, "only the (6,3) and (5,4) entries should remain");
         assert!(m.take((100, 5, 3, 0)).is_none());
         assert!(m.take((100, 5, 3, 1)).is_none());
         assert!(m.take((101, 5, 3, 0)).is_none());
@@ -241,18 +261,52 @@ mod tests {
     }
 
     #[test]
-    fn drop_for_tile_keeps_order_and_entries_consistent() {
-        // After drop_for_tile, the order queue must not contain dangling keys
-        // that the entries map has already discarded; otherwise the next LRU
-        // eviction would try to remove a key that isn't there.
+    fn drop_cdf53_for_tile_leaves_non_cdf53_coverage_alone() {
+        // Non-Cdf53 entries (Solid, PalRle, Bc1, Raw) for the same tile must
+        // survive: their ACK paths drive palette delivery, ack_miss telemetry
+        // and other bookkeeping that the snapshot fix has no business
+        // touching. Snapshot only filters by `codec == Cdf53` so leaving them
+        // in place cannot pollute it.
+        let mut m = FragmentCoverageMap::new(16);
+        let one = |codec: Codec, palette_id: Option<u8>| -> CoverageList {
+            smallvec::smallvec![FragmentCoverage {
+                tile_x: 4, tile_y: 4, generation: 0, pass_idx: 0,
+                codec, palette_id,
+            }]
+        };
+        m.record((10, 4, 4, 0), one(Codec::Solid, None));
+        m.record((11, 4, 4, 0), one(Codec::PalRle, Some(7)));
+        m.record((12, 4, 4, 0), one(Codec::Bc1, None));
+        m.record((13, 4, 4, 0), one(Codec::Raw, None));
+        m.record((14, 4, 4, 0), one(Codec::Cdf53, None));
+        assert_eq!(m.len(), 5);
+
+        m.drop_cdf53_for_tile(4, 4);
+
+        assert_eq!(m.len(), 4, "only the Cdf53 entry should be removed");
+        assert!(m.take((10, 4, 4, 0)).is_some(), "Solid survives");
+        assert!(m.take((11, 4, 4, 0)).is_some(), "PalRle survives");
+        assert!(m.take((12, 4, 4, 0)).is_some(), "Bc1 survives");
+        assert!(m.take((13, 4, 4, 0)).is_some(), "Raw survives");
+        assert!(m.take((14, 4, 4, 0)).is_none(), "Cdf53 dropped");
+    }
+
+    #[test]
+    fn drop_cdf53_for_tile_keeps_order_and_entries_consistent() {
+        // After drop_cdf53_for_tile, the order queue must not contain dangling
+        // keys that the entries map has already discarded; otherwise the next
+        // LRU eviction would try to remove a key that isn't there.
         let mut m = FragmentCoverageMap::new(3);
-        let dummy: CoverageList = smallvec::smallvec![];
-        m.record((0, 1, 1, 0), dummy.clone());
-        m.record((0, 2, 2, 0), dummy.clone());
-        m.record((0, 1, 1, 1), dummy.clone());
+        let cdf53: CoverageList = smallvec::smallvec![FragmentCoverage {
+            tile_x: 0, tile_y: 0, generation: 0, pass_idx: 0,
+            codec: Codec::Cdf53, palette_id: None,
+        }];
+        m.record((0, 1, 1, 0), cdf53.clone());
+        m.record((0, 2, 2, 0), cdf53.clone());
+        m.record((0, 1, 1, 1), cdf53.clone());
         assert_eq!(m.len(), 3);
 
-        m.drop_for_tile(1, 1);
+        m.drop_cdf53_for_tile(1, 1);
         assert_eq!(m.len(), 1);
 
         // Capacity should now accept two new entries without LRU-evicting
@@ -260,8 +314,8 @@ mod tests {
         // (1,1,*) keys, the next record() at capacity would pop a phantom
         // key and the (2,2) entry would survive incorrectly OR an unrelated
         // entry would be evicted.
-        m.record((0, 3, 3, 0), dummy.clone());
-        m.record((0, 4, 4, 0), dummy.clone());
+        m.record((0, 3, 3, 0), cdf53.clone());
+        m.record((0, 4, 4, 0), cdf53.clone());
         assert_eq!(m.len(), 3);
         assert!(m.take((0, 2, 2, 0)).is_some(), "(2,2) survived");
         assert!(m.take((0, 3, 3, 0)).is_some());
