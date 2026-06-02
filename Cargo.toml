@@ -34,7 +34,7 @@ thiserror = { version = "=2.0.18" }
 tracing = { version = "=0.1.44" }
 
 # tracing-subscriber 0.3.23 — latest stable 0.3.x
-tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "fmt", "json"] }
 
 # libc 0.2.185 — latest stable 0.2.x
 libc = { version = "=0.2.185" }

@@ -1049,6 +1049,15 @@ impl IoBridge {
         self.frame_seq = self.frame_seq.wrapping_add(1);
         let seq = self.frame_seq;
 
+        // M3.5 bench telemetry — CPU path is always tile codec.
+        tracing::info!(
+            target: "ghostframe::bench",
+            frame_seq = seq,
+            capture_done_ns = frame.capture_done_ns,
+            mode = "tile",
+            "frame.captured"
+        );
+
         // One-shot BGRA frame dump: write raw pixels to the path in
         // GHOSTFRAME_DUMP_FRAME, then clear the env-var so subsequent frames
         // are not re-dumped.
@@ -1401,6 +1410,23 @@ impl IoBridge {
 
         // Update frame mode for next frame's hysteresis reference.
         self.frame_mode = new_mode;
+
+        // M3.5 bench telemetry — emit after classifier picks the mode for this frame.
+        // target: "ghostframe::bench" lets the bench filter independently of the
+        // default ghostframe:: target.
+        {
+            let mode_str = match new_mode {
+                FrameMode::H264 => "h264",
+                FrameMode::TileCodec => "tile",
+            };
+            tracing::info!(
+                target: "ghostframe::bench",
+                frame_seq = seq,
+                capture_done_ns = frame.capture_done_ns,
+                mode = mode_str,
+                "frame.captured"
+            );
+        }
 
         // ---- M3.3c: PixelPerfect transition sweep ----
         // Runs every frame, unconditionally, before the dirty-tile early return.
@@ -2642,6 +2668,7 @@ mod tests {
             dmabuf_fd: None,
             timestamp_us: 1000,
             damage_tiles: None,
+            capture_done_ns: 0,
         };
         // No connected sessions, so datagrams go nowhere, but should not panic
         bridge.process_frame(frame);
@@ -2701,6 +2728,7 @@ mod tests {
             dmabuf_fd: None,
             timestamp_us: 0,
             damage_tiles: None,
+            capture_done_ns: 0,
         };
 
         bridge.process_frame(make_frame());
@@ -2734,6 +2762,7 @@ mod tests {
             dmabuf_fd: None,
             timestamp_us: 0,
             damage_tiles: None,
+            capture_done_ns: 0,
         };
         bridge.process_frame(frame);
         assert!(bridge.frame_seq > 0, "frame_seq must advance");
@@ -3753,5 +3782,81 @@ mod tests {
         let capped = detect_escalation_candidates(&tracker, 2);
         assert_eq!(capped, vec![0u32, 1],
             "k_max=2 should cap the result to the first 2 candidates");
+    }
+
+    /// Verify that `process_frame` emits a `frame.captured` tracing event with
+    /// the expected JSON fields when the ghostframe::bench target is active.
+    ///
+    /// Uses `tracing_subscriber`'s JSON formatter to capture log output and
+    /// asserts that `frame_seq`, `capture_done_ns`, and `message` appear.
+    #[tokio::test]
+    async fn frame_captured_event_format() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        #[derive(Default, Clone)]
+        struct CapturingWriter(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for CapturingWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingWriter {
+            type Writer = CapturingWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = CapturingWriter(Arc::clone(&buf));
+
+        // Install a JSON subscriber that only passes ghostframe::bench=info.
+        // `set_default` returns a guard; drop it at the end of the test.
+        let _g = tracing_subscriber::fmt()
+            .json()
+            .with_writer(writer)
+            .with_target(true)
+            .with_env_filter("ghostframe::bench=info")
+            .set_default();
+
+        // Build a bridge and submit a frame with a known seq + capture_done_ns.
+        let (our_end, _peer) = UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("server");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+
+        let frame = crate::server::FrameSubmission {
+            width: 32,
+            height: 32,
+            stride: 32 * 4,
+            pixels: vec![0u8; 32 * 32 * 4],
+            dmabuf_fd: None,
+            timestamp_us: 0,
+            damage_tiles: None,
+            capture_done_ns: 12345,
+        };
+        // frame_seq starts at 0; after process_frame it becomes 1.
+        bridge.process_frame(frame);
+
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("frame.captured"),
+            "expected 'frame.captured' in logs; got: {logs}"
+        );
+        assert!(
+            logs.contains("12345"),
+            "expected capture_done_ns=12345 in logs; got: {logs}"
+        );
+        // frame_seq is 1 after the first process_frame call.
+        assert!(
+            logs.contains("\"frame_seq\":1"),
+            "expected frame_seq:1 in logs; got: {logs}"
+        );
     }
 }

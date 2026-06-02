@@ -91,6 +91,7 @@ pub unsafe extern "C" fn gf_server_submit_frame(
         dmabuf_fd: None,
         timestamp_us,
         damage_tiles: None,
+        capture_done_ns: 0,
     };
 
     // Use the stored runtime to drive the async send.

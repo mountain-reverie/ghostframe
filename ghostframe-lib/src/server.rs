@@ -28,6 +28,12 @@ pub struct FrameSubmission {
     pub timestamp_us: u32,
     /// Optional damage hints as tile coordinates. If `None`, all tiles are checked.
     pub damage_tiles: Option<Vec<(u32, u32)>>,
+    /// Monotonic-clock timestamp (CLOCK_MONOTONIC nanoseconds) at the
+    /// moment capture finished. Used by M3.5 Layer B bench to compute
+    /// capture→send server-side latency interval.
+    /// Capture sites that lack a precise read timestamp set this to 0;
+    /// the bench filters records with capture_done_ns == 0.
+    pub capture_done_ns: u64,
 }
 
 // ── GhostframeServer ─────────────────────────────────────────────────────────
@@ -111,6 +117,7 @@ mod tests {
             dmabuf_fd: None,
             timestamp_us: 0,
             damage_tiles: None,
+            capture_done_ns: 0,
         };
         assert_eq!(sub.width, 1920);
         assert_eq!(sub.pixels.len(), 1920 * 1080 * 4);

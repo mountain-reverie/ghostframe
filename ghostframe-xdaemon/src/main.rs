@@ -53,10 +53,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let backend = match drm_capture::capture() {
         Ok(result) => {
             let (path_label, w, h) = match &result {
-                drm_capture::CaptureResult::Prime(_, g) => {
+                drm_capture::CaptureResult::Prime(_, g, _) => {
                     ("zero-copy GPU path (PRIME DMA-BUF)", g.width, g.height)
                 }
-                drm_capture::CaptureResult::Pixels(_, g) => {
+                drm_capture::CaptureResult::Pixels(_, g, _) => {
                     ("CPU-mmap path (modesetting FB)", g.width, g.height)
                 }
             };
@@ -109,7 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         let submission = match &backend {
             CaptureBackend::Drm => match drm_capture::capture() {
-                Ok(drm_capture::CaptureResult::Prime(dmabuf_fd, geom)) => {
+                Ok(drm_capture::CaptureResult::Prime(dmabuf_fd, geom, capture_done_ns)) => {
                     let timestamp_us = (frame_count * frame_interval.as_micros() as u64) as u32;
                     Some(FrameSubmission {
                         width: geom.width,
@@ -119,9 +119,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         dmabuf_fd: Some(dmabuf_fd),
                         timestamp_us,
                         damage_tiles: damage_tiles.clone(),
+                        capture_done_ns,
                     })
                 }
-                Ok(drm_capture::CaptureResult::Pixels(pixels, geom)) => {
+                Ok(drm_capture::CaptureResult::Pixels(pixels, geom, capture_done_ns)) => {
                     let timestamp_us = (frame_count * frame_interval.as_micros() as u64) as u32;
                     Some(FrameSubmission {
                         width: geom.width,
@@ -131,6 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         dmabuf_fd: None,
                         timestamp_us,
                         damage_tiles: damage_tiles.clone(),
+                        capture_done_ns,
                     })
                 }
                 Err(e) => {

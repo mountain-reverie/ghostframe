@@ -95,14 +95,17 @@ pub struct FbGeometry {
 /// One frame's worth of pixel data, returned from `capture()`.
 ///
 /// Two variants reflecting the two capture paths:
-///   - `Prime(fd, geom)`: zero-copy PRIME DMA-BUF export, suitable for
-///     Vulkan import. Returned by the writeback path.
-///   - `Pixels(bgra, geom)`: CPU-mmap'd BO copied into a Vec<u8> in BGRA
-///     order with stride `geom.stride`. Returned by the modesetting-FB
-///     path. Skips zero-copy intentionally — see module docs.
+///   - `Prime(fd, geom, capture_done_ns)`: zero-copy PRIME DMA-BUF export,
+///     suitable for Vulkan import. Returned by the writeback path.
+///     `capture_done_ns` is the CLOCK_MONOTONIC nanosecond timestamp recorded
+///     after the writeback fence signals (i.e., frame content is ready).
+///   - `Pixels(bgra, geom, capture_done_ns)`: CPU-mmap'd BO copied into a
+///     Vec<u8> in BGRA order with stride `geom.stride`. Returned by the
+///     modesetting-FB path. Skips zero-copy intentionally — see module docs.
+///     `capture_done_ns` is recorded after the DMA_BUF_SYNC + memcpy complete.
 pub enum CaptureResult {
-    Prime(OwnedFd, FbGeometry),
-    Pixels(Vec<u8>, FbGeometry),
+    Prime(OwnedFd, FbGeometry, u64),
+    Pixels(Vec<u8>, FbGeometry, u64),
 }
 
 /// Per-process state cached across captures: holds the open card, the
@@ -171,14 +174,14 @@ pub fn capture() -> std::io::Result<CaptureResult> {
         let crtc = state.crtc;
         let card = &state.card;
         let wb = state.writeback.as_ref().unwrap();
-        let (fd, geom) = capture_via_writeback(card, crtc, wb)?;
-        return Ok(CaptureResult::Prime(fd, geom));
+        let (fd, geom, capture_done_ns) = capture_via_writeback(card, crtc, wb)?;
+        return Ok(CaptureResult::Prime(fd, geom, capture_done_ns));
     }
 
     // Modesetting framebuffer path: CPU-mmap the scanout BO + memcpy.
     // See module docs for why we don't PRIME-export this case.
-    let (pixels, geom) = capture_via_modesetting_fb_cpu(&state.card, state.crtc)?;
-    Ok(CaptureResult::Pixels(pixels, geom))
+    let (pixels, geom, capture_done_ns) = capture_via_modesetting_fb_cpu(&state.card, state.crtc)?;
+    Ok(CaptureResult::Pixels(pixels, geom, capture_done_ns))
 }
 
 fn initialize_state() -> std::io::Result<CaptureState> {
@@ -379,11 +382,26 @@ fn test_writeback_commit(
     Ok(())
 }
 
+/// Read CLOCK_MONOTONIC and return the value as nanoseconds since the epoch.
+/// Used to timestamp capture completion for M3.5 bench telemetry.
+fn monotonic_now_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime is async-signal-safe and writes only to the
+    // caller-owned timespec. CLOCK_MONOTONIC is always available on Linux.
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+    }
+    (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
+}
+
 fn capture_via_writeback(
     card: &Card,
     crtc: crtc::Handle,
     wb: &WritebackState,
-) -> std::io::Result<(OwnedFd, FbGeometry)> {
+) -> std::io::Result<(OwnedFd, FbGeometry, u64)> {
     // Build the atomic commit: wire writeback connector to the active CRTC
     // and attach the target FB. WRITEBACK_OUT_FENCE_PTR carries a userspace
     // pointer the kernel will write the sync_file fd into.
@@ -412,6 +430,10 @@ fn capture_via_writeback(
     wait_fence(fence_fd.as_fd(), 1000)?;
     drop(fence_fd); // close the sync_file; we no longer need it
 
+    // Record capture completion timestamp after the fence signals — frame
+    // content is now stable in the writeback target buffer.
+    let capture_done_ns = monotonic_now_ns();
+
     // PRIME-export the GEM handle. The export creates a fresh fd referring
     // to the same DMA-BUF; the GEM handle stays alive for the next capture.
     let prime_fd = card.buffer_to_prime_fd(wb.target_buffer.handle(), 0)?;
@@ -423,16 +445,19 @@ fn capture_via_writeback(
             height: wb.height,
             stride: wb.stride,
         },
+        capture_done_ns,
     ))
 }
 
 /// Modesetting capture path: CPU-mmap the scanout BO + memcpy its
 /// pixels into a `Vec<u8>`. Returns BGRA pixels in `geom.stride` row
-/// order. See module docs for why we don't PRIME-export this case.
+/// order, plus a CLOCK_MONOTONIC nanosecond timestamp recorded after
+/// the DMA_BUF_SYNC + memcpy complete. See module docs for why we
+/// don't PRIME-export this case.
 fn capture_via_modesetting_fb_cpu(
     card: &Card,
     crtc: crtc::Handle,
-) -> std::io::Result<(Vec<u8>, FbGeometry)> {
+) -> std::io::Result<(Vec<u8>, FbGeometry, u64)> {
     let crtc_info = card.get_crtc(crtc)?;
     let fb_handle = crtc_info
         .framebuffer()
@@ -495,6 +520,10 @@ fn capture_via_modesetting_fb_cpu(
 
     sync_prime_fd(&prime_fd, /*end=*/ true);
 
+    // Record capture completion timestamp after the DMA_BUF_SYNC END +
+    // memcpy — pixel data is now stable in `pixels`.
+    let capture_done_ns = monotonic_now_ns();
+
     unsafe {
         libc::munmap(ptr as *mut libc::c_void, size);
     }
@@ -507,6 +536,7 @@ fn capture_via_modesetting_fb_cpu(
             height,
             stride,
         },
+        capture_done_ns,
     ))
 }
 

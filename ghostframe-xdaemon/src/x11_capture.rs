@@ -12,6 +12,20 @@ use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{ConnectionExt, ImageFormat};
 use x11rb::rust_connection::RustConnection;
 
+/// Read CLOCK_MONOTONIC and return the value as nanoseconds.
+fn monotonic_now_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime is async-signal-safe; CLOCK_MONOTONIC always
+    // available on Linux.
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+    }
+    (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
+}
+
 /// Captures frames from the X11 root window.
 pub struct X11Capture {
     conn: RustConnection,
@@ -58,6 +72,11 @@ impl X11Capture {
             .reply()
             .map_err(io::Error::other)?;
 
+        // Record capture completion after GetImage reply arrives; pixel data
+        // is now stable in reply.data. Approximate but sufficient for M3.5
+        // bench latency measurement on this degraded fallback path.
+        let capture_done_ns = monotonic_now_ns();
+
         let width = self.width as u32;
         let height = self.height as u32;
         let stride = width * 4; // 32-bit pixels = 4 bytes
@@ -70,6 +89,7 @@ impl X11Capture {
             dmabuf_fd: None,
             timestamp_us,
             damage_tiles: None,
+            capture_done_ns,
         })
     }
 }
