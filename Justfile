@@ -7,7 +7,13 @@ build-release:
 test-unit:
     cargo test --lib
 
-test-e2e:
+# The e2e harness serves ghostframe-web-client/dist/ over HTTP to Chromium.
+# A stale dist/ silently breaks tests (old ACK wire format → 0 PixelPerfect
+# transitions in lossless-buildup, etc.) so always rebuild before running.
+web-client-build:
+    cd ghostframe-web-client && npm install && npm run build
+
+test-e2e: web-client-build
     cargo test --test e2e
 
 containers-build:
