@@ -11,6 +11,10 @@ use ghostframe_bench::fixtures;
 #[cfg(any(feature = "gpu-bench", feature = "m3"))]
 use fixtures::BenchEncoder;
 
+#[cfg(any(feature = "gpu-bench", feature = "m3"))]
+#[path = "side_channel.rs"]
+mod side_channel;
+
 // ── H.264 (per-tile) ───────────────────────────────────────────────────────
 //
 // `H264VaapiEncoder` encodes a single 32×32 BGRA tile per call. The encoder
@@ -122,6 +126,80 @@ impl BenchEncoder for PalRleEncoder {
     }
 }
 
+// ── Solid encoder ────────────────────────────────────────────────────────────
+
+#[cfg(feature = "m3")]
+struct SolidEncoder;
+
+#[cfg(feature = "m3")]
+impl BenchEncoder for SolidEncoder {
+    fn name(&self) -> &'static str {
+        "solid"
+    }
+    fn encode(&mut self, tile_bgra: &[u8]) -> Vec<u8> {
+        use ghostframe_lib::encoder::solid::encode_solid;
+        // encode_solid returns [u8; 4] directly — the tile must be
+        // uniformly-colored for the result to be semantically valid, but
+        // the bench calls it on all content classes regardless (the
+        // Solid content class is the meaningful case).
+        encode_solid(tile_bgra).to_vec()
+    }
+}
+
+// ── CDF 5/3 encoder ──────────────────────────────────────────────────────────
+
+#[cfg(feature = "m3")]
+struct Cdf53Encoder;
+
+#[cfg(feature = "m3")]
+impl BenchEncoder for Cdf53Encoder {
+    fn name(&self) -> &'static str {
+        "cdf53"
+    }
+    fn encode(&mut self, tile_bgra: &[u8]) -> Vec<u8> {
+        use ghostframe_lib::encoder::cdf53;
+        let coeffs = cdf53::forward(tile_bgra);
+        let passes: Vec<Vec<u8>> = cdf53::encode_passes(&coeffs);
+        // Concatenate with a 2-byte LE length prefix per pass so the
+        // round-trip proptest in Task 15 can split them back.
+        let mut out: Vec<u8> =
+            Vec::with_capacity(passes.iter().map(|p| 2 + p.len()).sum());
+        for p in &passes {
+            assert!(p.len() <= u16::MAX as usize, "pass too large for u16 prefix");
+            out.extend_from_slice(&(p.len() as u16).to_le_bytes());
+            out.extend_from_slice(p);
+        }
+        out
+    }
+}
+
+// ── CDF 5/3 per-pass encoder ─────────────────────────────────────────────────
+
+#[cfg(feature = "m3")]
+struct Cdf53PerPassEncoder {
+    passes_kept: u8,
+}
+
+#[cfg(feature = "m3")]
+impl BenchEncoder for Cdf53PerPassEncoder {
+    fn name(&self) -> &'static str {
+        "cdf53_per_pass"
+    }
+    fn encode(&mut self, tile_bgra: &[u8]) -> Vec<u8> {
+        use ghostframe_lib::encoder::cdf53;
+        let coeffs = cdf53::forward(tile_bgra);
+        let all_passes: Vec<Vec<u8>> = cdf53::encode_passes(&coeffs);
+        let kept = (self.passes_kept as usize).min(all_passes.len());
+        let mut out: Vec<u8> =
+            Vec::with_capacity(all_passes[..kept].iter().map(|p| 2 + p.len()).sum());
+        for p in &all_passes[..kept] {
+            out.extend_from_slice(&(p.len() as u16).to_le_bytes());
+            out.extend_from_slice(p);
+        }
+        out
+    }
+}
+
 // ── Bench driver ────────────────────────────────────────────────────────────
 //
 // Note: Criterion samples each BenchmarkId across many iterations. Because
@@ -180,6 +258,34 @@ fn run_codecs(c: &mut Criterion) {
         let palrle_lz4 = PalRleEncoder::new();
         let mut wrapped = Lz4Wrapper::new(palrle_lz4);
         bench_codec(c, &mut wrapped);
+
+        // Solid bench
+        let mut solid = SolidEncoder;
+        bench_codec(c, &mut solid);
+        let mut solid_lz4 = Lz4Wrapper::new(SolidEncoder);
+        bench_codec(c, &mut solid_lz4);
+
+        // Cdf53 (full lossless encode) bench
+        let mut cdf53 = Cdf53Encoder;
+        bench_codec(c, &mut cdf53);
+        let mut cdf53_lz4 = Lz4Wrapper::new(Cdf53Encoder);
+        bench_codec(c, &mut cdf53_lz4);
+
+        // Cdf53PerPass: one bench group per K showing the K progression.
+        for k in 1..=9u8 {
+            let mut per_pass = Cdf53PerPassEncoder { passes_kept: k };
+            let mut group = c.benchmark_group(format!("cdf53_per_pass_k{}", k));
+            for class in ContentClass::ALL {
+                let tile = class.tile();
+                assert_eq!(tile.len(), TILE_BYTES);
+                group.bench_with_input(
+                    BenchmarkId::from_parameter(class.name()),
+                    &tile,
+                    |b, t| b.iter(|| black_box(per_pass.encode(t))),
+                );
+            }
+            group.finish();
+        }
     }
     #[cfg(not(feature = "gpu-bench"))]
     {
