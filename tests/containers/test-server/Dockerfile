@@ -38,7 +38,9 @@ COPY ghostframe-test-pattern/Cargo.toml ghostframe-test-pattern/Cargo.toml
 COPY ghostframe-e2e/Cargo.toml ghostframe-e2e/Cargo.toml
 COPY ghostframe-e2e/src/lib.rs ghostframe-e2e/src/lib.rs
 COPY ghostframe-bench/Cargo.toml ghostframe-bench/Cargo.toml
-COPY ghostframe-bench/src/lib.rs ghostframe-bench/src/lib.rs
+# Copy the full src/ tree, not just lib.rs: since the d404626 refactor the
+# library declares `pub mod fixtures;` which expects fixtures/ on disk.
+COPY ghostframe-bench/src/ ghostframe-bench/src/
 # Cargo.toml declares [[bench]] targets; the .rs files must exist for the
 # manifest to parse, even though they aren't compiled by `-p ghostframe-xdaemon`.
 COPY ghostframe-bench/benches/ ghostframe-bench/benches/
