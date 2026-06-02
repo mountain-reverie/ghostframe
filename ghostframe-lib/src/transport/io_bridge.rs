@@ -53,6 +53,48 @@ use crate::transport::webtransport::WebTransportServer;
 /// write a full datagram into this buffer in a single call.
 const QUIC_SCRATCH: usize = 2048;
 
+// ---------------------------------------------------------------------------
+// M3.5 bench telemetry: per-frame send-side stats
+// ---------------------------------------------------------------------------
+
+/// Per-codec send counters accumulated during a frame's tile dispatch.
+/// Counts tiles (not fragments): a multi-fragment Cdf53 tile increments
+/// `cdf53` by 1, regardless of the number of QUIC datagrams emitted.
+#[derive(Default, Clone, Copy)]
+struct CodecHistogram {
+    solid: u16,
+    palrle: u16,
+    cdf53: u16,
+    raw: u16,
+    h264: u8,
+}
+
+/// Accumulator filled during `dispatch_dirty_tiles_via_scheduler` (and the
+/// H264 branch of `process_frame_gpu`). Returned so callers can emit a single
+/// `frame.last_send` event after the last datagram is handed to QUIC.
+#[derive(Default)]
+pub(crate) struct FrameSendStats {
+    total_wire_bytes: u32,
+    tile_count: u16,
+    codec_histogram: CodecHistogram,
+}
+
+/// Read CLOCK_MONOTONIC and return nanoseconds since the epoch.
+/// Used for the `frame.last_send` telemetry event (and symmetric to the
+/// capture-side `capture_done_ns` populated by `xdaemon`).
+///
+/// # Safety
+/// `libc::clock_gettime` is async-signal-safe. The timespec struct is
+/// zero-initialised before the call and written atomically by the kernel.
+fn monotonic_now_ns() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: clock_gettime is async-signal-safe; ts is valid.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
+}
+
+// ---------------------------------------------------------------------------
+
 /// Write GPU-derived per-tile metrics into the tracker for the dirty tiles.
 ///
 /// Non-dirty tile entries in `tracker` are untouched. If a computed index
@@ -579,6 +621,10 @@ impl IoBridge {
     /// Shared scheduler dispatch: grid-sync → RTT update → bump+encode+enqueue
     /// per dirty tile → tick → fragment+send. Called by both `process_frame_cpu`
     /// and `process_frame_gpu`'s `FrameMode::TileCodec` branch.
+    ///
+    /// Returns a `FrameSendStats` accumulating wire bytes and codec counts for
+    /// all tiles sent this invocation. The caller uses this to emit
+    /// `frame.last_send` after the final datagram is handed to QUIC.
     pub(crate) fn dispatch_dirty_tiles_via_scheduler(
         &mut self,
         dirty: &[(u32, u32)],
@@ -587,7 +633,7 @@ impl IoBridge {
         max_frag: usize,
         policy: SchedulerEmissionPolicy,
         mut palrle_payloads: Option<&mut std::collections::HashMap<(u32, u32), Vec<u8>>>,
-    ) {
+    ) -> FrameSendStats {
         let TileDispatchFrame { pixels, stride, seq, timestamp_us } = frame;
         // Grid sync — keep scheduler in lockstep with the dirty-detection grid.
         if self.scheduler.cols() != grid.cols || self.scheduler.rows() != grid.rows {
@@ -713,6 +759,7 @@ impl IoBridge {
         }
 
         let drained = self.scheduler.tick(usize::MAX);
+        let mut stats = FrameSendStats::default();
         for work in drained {
             let datagrams = fragment_tile(
                 &TileFragmentInputs {
@@ -757,11 +804,44 @@ impl IoBridge {
                 // single-fragment work items per frame all share frag_idx=0.
                 let key = (frame_seq_with_flag, work.tile_x, work.tile_y, work.pass_idx);
                 self.fragment_coverage.record(key, coverage);
+
+                // M3.5 bench telemetry: accumulate per-tile stats.
+                // Count each (tile, pass) work item as one logical tile for
+                // the per-codec histogram. Accumulate all fragments' bytes.
+                // pass_idx == 0 is the first (and for non-Cdf53 codecs, only)
+                // pass; for Cdf53 multi-pass tiles each pass increments bytes
+                // but only pass_idx==0 increments tile_count.
+                if work.pass_idx == 0 {
+                    stats.tile_count = stats.tile_count.saturating_add(1);
+                    match work.codec {
+                        Codec::Solid => {
+                            stats.codec_histogram.solid =
+                                stats.codec_histogram.solid.saturating_add(1);
+                        }
+                        Codec::PalRle => {
+                            stats.codec_histogram.palrle =
+                                stats.codec_histogram.palrle.saturating_add(1);
+                        }
+                        Codec::Cdf53 => {
+                            stats.codec_histogram.cdf53 =
+                                stats.codec_histogram.cdf53.saturating_add(1);
+                        }
+                        Codec::Raw => {
+                            stats.codec_histogram.raw =
+                                stats.codec_histogram.raw.saturating_add(1);
+                        }
+                        _ => {}
+                    }
+                }
+                let tile_wire_bytes: u32 = datagrams.iter().map(|dg| dg.len() as u32).sum();
+                stats.total_wire_bytes =
+                    stats.total_wire_bytes.saturating_add(tile_wire_bytes);
             }
             for dg in &datagrams {
                 self.send_to_all_sessions(dg);
             }
         }
+        stats
     }
 
     /// Route a single inbound datagram into the appropriate handler.
@@ -1189,7 +1269,7 @@ impl IoBridge {
 
         // Route through the shared scheduler-dispatch helper. CPU path emits
         // Codec::Raw per M3.1 D1 (classifier sentinel-gated).
-        self.dispatch_dirty_tiles_via_scheduler(
+        let stats = self.dispatch_dirty_tiles_via_scheduler(
             &dirty_tiles,
             &grid,
             TileDispatchFrame {
@@ -1201,6 +1281,21 @@ impl IoBridge {
             max_frag,
             SchedulerEmissionPolicy::CpuRawOnly,
             None,
+        );
+
+        // M3.5 bench telemetry: timestamp of the last datagram handed to QUIC.
+        tracing::info!(
+            target: "ghostframe::bench",
+            frame_seq = seq,
+            last_send_ns = monotonic_now_ns(),
+            total_wire_bytes = stats.total_wire_bytes,
+            tile_count = stats.tile_count,
+            codec_solid = stats.codec_histogram.solid,
+            codec_palrle = stats.codec_histogram.palrle,
+            codec_cdf53 = stats.codec_histogram.cdf53,
+            codec_raw = stats.codec_histogram.raw,
+            codec_h264 = stats.codec_histogram.h264,
+            "frame.last_send"
         );
     }
 
@@ -1603,6 +1698,23 @@ impl IoBridge {
                             .insert((hdr.frame_seq, hdr.frag_idx), dg.clone());
                     }
                 }
+
+                // M3.5 bench telemetry: H264 frame completed — all fragments sent.
+                let h264_wire_bytes: u32 =
+                    datagrams.iter().map(|dg| dg.len() as u32).sum();
+                tracing::info!(
+                    target: "ghostframe::bench",
+                    frame_seq = seq,
+                    last_send_ns = monotonic_now_ns(),
+                    total_wire_bytes = h264_wire_bytes,
+                    tile_count = 0u16,
+                    codec_solid = 0u16,
+                    codec_palrle = 0u16,
+                    codec_cdf53 = 0u16,
+                    codec_raw = 0u16,
+                    codec_h264 = 1u8,
+                    "frame.last_send"
+                );
             }
             FrameMode::TileCodec => {
                 let max_frag = max_fragment_payload(max_dg_size);
@@ -1972,7 +2084,7 @@ impl IoBridge {
                     );
                 }
 
-                self.dispatch_dirty_tiles_via_scheduler(
+                let stats = self.dispatch_dirty_tiles_via_scheduler(
                     &dirty_xy,
                     &grid,
                     TileDispatchFrame {
@@ -1995,6 +2107,21 @@ impl IoBridge {
                     "palrle frame stats"
                 );
                 self.palette_table.stats_frame = Default::default();
+
+                // M3.5 bench telemetry: timestamp of the last datagram handed to QUIC.
+                tracing::info!(
+                    target: "ghostframe::bench",
+                    frame_seq = seq,
+                    last_send_ns = monotonic_now_ns(),
+                    total_wire_bytes = stats.total_wire_bytes,
+                    tile_count = stats.tile_count,
+                    codec_solid = stats.codec_histogram.solid,
+                    codec_palrle = stats.codec_histogram.palrle,
+                    codec_cdf53 = stats.codec_histogram.cdf53,
+                    codec_raw = stats.codec_histogram.raw,
+                    codec_h264 = stats.codec_histogram.h264,
+                    "frame.last_send"
+                );
             }
         }
     }
@@ -3885,6 +4012,137 @@ mod tests {
         assert!(
             logs.contains("\"frame_seq\":1"),
             "expected frame_seq:1 in logs; got: {logs}"
+        );
+    }
+
+    /// Verify that `dispatch_dirty_tiles_via_scheduler` returns non-zero
+    /// `FrameSendStats` for a dirty tile frame, and that the resulting
+    /// `frame.last_send` tracing event contains all required JSON fields with
+    /// expected values.
+    ///
+    /// Note: `process_frame` early-returns without sending if no QUIC session is
+    /// connected (no MTU to compute). We test the dispatch path directly via
+    /// `dispatch_dirty_tiles_via_scheduler` (pub(crate)), which lets us verify
+    /// both the returned stats and the emitted log event in the same test.
+    #[tokio::test]
+    async fn frame_last_send_event_format() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        #[derive(Default, Clone)]
+        struct CapturingWriter(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for CapturingWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingWriter {
+            type Writer = CapturingWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = CapturingWriter(Arc::clone(&buf));
+
+        // Install a JSON subscriber that only passes ghostframe::bench=info.
+        let _g = tracing_subscriber::fmt()
+            .json()
+            .with_writer(writer)
+            .with_target(true)
+            .with_env_filter("ghostframe::bench=info")
+            .set_default();
+
+        // Build a bridge and drive dispatch directly.
+        // `process_frame` early-returns when no QUIC sessions are connected
+        // (no MTU available). Calling dispatch_dirty_tiles_via_scheduler
+        // directly bypasses that guard and exercises the send-stats + event path.
+        let (our_end, _peer) = UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("server");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+
+        // Non-zero, non-uniform pixels: a 32×32 frame = 1 tile.
+        let mut pixels = vec![0u8; 32 * 32 * 4];
+        for px in pixels.chunks_exact_mut(4) {
+            px[0] = 128; px[1] = 64; px[2] = 32; px[3] = 255;
+        }
+        let grid = crate::tile::TileGrid::new(32, 32);
+        let dirty = vec![(0u32, 0u32)];
+        let seq: u32 = 1;
+
+        // Drive the dispatch. No QUIC sessions → send_to_all_sessions is a no-op,
+        // but the stats accumulator still counts the dispatched work.
+        let stats = bridge.dispatch_dirty_tiles_via_scheduler(
+            &dirty,
+            &grid,
+            TileDispatchFrame {
+                pixels: &pixels,
+                stride: 32 * 4,
+                seq,
+                timestamp_us: 0,
+            },
+            // A realistic max_frag: 1200 byte payload limit.
+            1200,
+            SchedulerEmissionPolicy::CpuRawOnly,
+            None,
+        );
+
+        // Stats should reflect 1 Raw tile dispatched.
+        assert_eq!(stats.tile_count, 1, "expected 1 tile in stats; got {}", stats.tile_count);
+        assert!(
+            stats.total_wire_bytes > 0,
+            "expected non-zero wire bytes; got {}",
+            stats.total_wire_bytes
+        );
+        assert_eq!(
+            stats.codec_histogram.raw, 1,
+            "expected codec_raw=1 for CpuRawOnly policy"
+        );
+
+        // Emit the frame.last_send event exactly as the production path does.
+        tracing::info!(
+            target: "ghostframe::bench",
+            frame_seq = seq,
+            last_send_ns = monotonic_now_ns(),
+            total_wire_bytes = stats.total_wire_bytes,
+            tile_count = stats.tile_count,
+            codec_solid = stats.codec_histogram.solid,
+            codec_palrle = stats.codec_histogram.palrle,
+            codec_cdf53 = stats.codec_histogram.cdf53,
+            codec_raw = stats.codec_histogram.raw,
+            codec_h264 = stats.codec_histogram.h264,
+            "frame.last_send"
+        );
+
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("frame.last_send"),
+            "expected 'frame.last_send' in logs; got: {logs}"
+        );
+        assert!(
+            logs.contains("\"frame_seq\":1"),
+            "expected frame_seq:1 in 'frame.last_send' log; got: {logs}"
+        );
+        // Verify tile_count and total_wire_bytes are non-zero.
+        assert!(
+            !logs.contains("\"tile_count\":0"),
+            "tile_count must be non-zero for a dirty frame; got: {logs}"
+        );
+        assert!(
+            !logs.contains("\"total_wire_bytes\":0"),
+            "total_wire_bytes must be non-zero for a dirty frame; got: {logs}"
+        );
+        // Verify last_send_ns is present (field exists in the JSON).
+        assert!(
+            logs.contains("last_send_ns"),
+            "expected 'last_send_ns' field in logs; got: {logs}"
         );
     }
 }
