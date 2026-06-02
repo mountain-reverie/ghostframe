@@ -15,7 +15,6 @@ path = "src/lib.rs"
 # Use ghostframe-lib with `test-loss-injection` enabled so the harness's
 # GHOSTFRAME_OUTBOUND_LOSS_* / GHOSTFRAME_INBOUND_LOSS_* env vars take effect.
 ghostframe-lib = { path = "../ghostframe-lib", features = ["test-loss-injection"] }
-ghostframe-test-pattern = { path = "../ghostframe-test-pattern" }
 # Harness library needs these at lib-build time (was dev-deps).
 testcontainers = "0.27"
 chromiumoxide = "0.9"
@@ -33,6 +32,8 @@ bytes = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+# Used by tests/e2e.rs test code only (not by the harness library).
+ghostframe-test-pattern = { path = "../ghostframe-test-pattern" }
 # Only used by tests/loopback_h3.rs (sans-IO QUIC/H3 test).
 quinn-proto = { workspace = true }
 rustls = { workspace = true }
