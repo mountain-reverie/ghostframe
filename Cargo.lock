@@ -1118,6 +1118,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dssim-core"
+version = "3.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3c601412450ff29a9258b2f85b18b38f658caf70fad1692f40ca863d86cb753"
+dependencies = [
+ "imgref",
+ "itertools 0.14.0",
+ "rayon",
+ "rgb",
+]
+
+[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1461,9 +1473,13 @@ name = "ghostframe-bench"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "dssim-core",
  "ghostframe-lib",
  "iai-callgrind",
  "lz4_flex",
+ "rgb",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3091,6 +3107,9 @@ name = "rgb"
 version = "0.8.53"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47b34b781b31e5d73e9fbc8689c70551fd1ade9a19e3e28cfec8580a79290cc4"
+dependencies = [
+ "bytemuck",
+]
 
 [[package]]
 name = "ring"
