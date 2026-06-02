@@ -660,6 +660,55 @@ mod tests_passes {
         }
     }
 
+    /// Asserts the bench's "forward → encode_passes → length-prefix concat →
+    /// split-by-prefix → decode_passes → inverse → byte-exact original" loop
+    /// holds across 1000 deterministic seeds. Guards against the length-prefix
+    /// layout in Cdf53Encoder diverging from decode_passes's expected input shape.
+    #[test]
+    fn bench_length_prefix_framing_round_trip() {
+        use proptest::prelude::*;
+
+        proptest!(ProptestConfig::with_cases(1000), |(seed in 0u64..1000)| {
+            // Build a deterministic 32×32 BGRA tile from the seed.
+            let mut tile = vec![0u8; 32 * 32 * 4];
+            let mut s = seed.wrapping_mul(0x9E3779B97F4A7C15);
+            for byte in tile.iter_mut() {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                *byte = (s >> 56) as u8;
+            }
+
+            // Forward + encode_passes + length-prefix concat (mirrors Cdf53Encoder
+            // in ghostframe-bench/benches/codec_latency.rs).
+            let coeffs = forward(&tile);
+            let passes: Vec<Vec<u8>> = encode_passes(&coeffs);
+            let mut concat: Vec<u8> = Vec::new();
+            for p in &passes {
+                concat.extend_from_slice(&(p.len() as u16).to_le_bytes());
+                concat.extend_from_slice(p);
+            }
+
+            // Split back via length prefix and decode.
+            let mut split_refs: Vec<&[u8]> = Vec::new();
+            let mut cur = 0usize;
+            while cur < concat.len() {
+                let len = u16::from_le_bytes(concat[cur..cur + 2].try_into().unwrap()) as usize;
+                cur += 2;
+                split_refs.push(&concat[cur..cur + len]);
+                cur += len;
+            }
+            prop_assert_eq!(split_refs.len(), passes.len());
+
+            let recovered_coeffs = decode_passes(&split_refs);
+            // inverse() returns BGR (3 bytes/pixel); compare channel-by-channel.
+            let recovered_pixels = inverse(&recovered_coeffs);
+            for (orig_px, rec_px) in tile.chunks_exact(4).zip(recovered_pixels.chunks_exact(3)) {
+                prop_assert_eq!(orig_px[0], rec_px[0], "B channel mismatch");
+                prop_assert_eq!(orig_px[1], rec_px[1], "G channel mismatch");
+                prop_assert_eq!(orig_px[2], rec_px[2], "R channel mismatch");
+            }
+        });
+    }
+
     /// Truncating passes (dropping bottom K bit-planes) yields a lossy
     /// approximation whose distance from the original is monotone non-decreasing
     /// in K. Verified via sum-of-squared-error (proxy for SSIM ordering).
