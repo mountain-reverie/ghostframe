@@ -3905,18 +3905,20 @@ mod tests {
         use crate::capture::gpu_pipeline::MAX_ESCALATION_PER_FRAME;
 
         // Build a 4×4 tracker and make tiles (0,0), (1,0), (2,0) eligible:
-        // idle_frames > 30, lossy codec, not already escalated.
+        // idle_frames > 30, lossy codec (H264 post-M3.5b L1 prune; Solid
+        // is no longer eligible because it's lossless within its predicate),
+        // not already escalated.
         let mut tracker = MetricsTracker::new(4, 4);
         for x in 0..3u32 {
             let m = tracker.get_mut(x, 0);
             m.idle_frames = 31;
-            m.codec_state = CodecState::Solid;
+            m.codec_state = CodecState::H264 { frames_in_h264: 5 };
         }
         // Tile (3,0): idle but already escalated — must be excluded.
         {
             let m = tracker.get_mut(3, 0);
             m.idle_frames = 31;
-            m.codec_state = CodecState::Solid;
+            m.codec_state = CodecState::H264 { frames_in_h264: 5 };
             m.already_escalated_this_gen = true;
         }
         // Remaining tiles (row 1-3): below threshold or Skip — excluded.
