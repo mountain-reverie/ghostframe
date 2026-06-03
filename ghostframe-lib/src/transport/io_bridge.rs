@@ -2238,6 +2238,10 @@ impl IoBridge {
             self.drain_app_events();
             self.server.drain_endpoint_events();
             self.drain_outbound().await?;
+
+            // M3.6a: sample QUIC path stats once per tick so the classifier's
+            // bandwidth estimate stays current. No-op when no connections.
+            self.sample_all_path_stats();
         }
     }
 
@@ -2712,6 +2716,46 @@ impl IoBridge {
         self.adaptation_context.last_update_seq =
             self.adaptation_context.last_update_seq.wrapping_add(1);
         self.classifier.set_adaptation_context(self.adaptation_context);
+    }
+
+    /// Compute `bytes_per_us` from a `(cwnd_bytes, smoothed_rtt_us)` snapshot,
+    /// mirror into `adaptation_context`, bump `last_update_seq`, push to
+    /// classifier. Pure function of the two inputs — exposed for unit tests
+    /// so `sample_all_path_stats` can stay thin. `rtt <= 0` is a no-op.
+    pub(crate) fn apply_path_stats_snapshot(&mut self, cwnd_bytes: u64, smoothed_rtt_us: f32) {
+        if smoothed_rtt_us <= 0.0 {
+            return;
+        }
+        let bytes_per_us = (cwnd_bytes as f32) / smoothed_rtt_us;
+        self.adaptation_context.bytes_per_us = bytes_per_us;
+        self.adaptation_context.smoothed_rtt_us = smoothed_rtt_us;
+        self.adaptation_context.last_update_seq =
+            self.adaptation_context.last_update_seq.wrapping_add(1);
+        self.classifier.set_adaptation_context(self.adaptation_context);
+    }
+
+    /// Read live `path_stats` from every active connection, convert RTT
+    /// (`Duration` → µs `f32`) and cwnd, and feed each to
+    /// `apply_path_stats_snapshot`. Called once per tick from `run()`.
+    /// With multiple connections, the last sampled snapshot wins — M3.6
+    /// production is single-client; multi-client is M4+ scope.
+    fn sample_all_path_stats(&mut self) {
+        // Collect first to satisfy the borrow checker: the immutable borrow of
+        // `self.server.connections` must end before `apply_path_stats_snapshot`
+        // takes `&mut self`.
+        let snapshots: Vec<(u64, f32)> = self
+            .server
+            .connections
+            .values()
+            .map(|conn| {
+                let stats = conn.stats();
+                let rtt_us = stats.path.rtt.as_secs_f32() * 1_000_000.0;
+                (stats.path.cwnd, rtt_us)
+            })
+            .collect();
+        for (cwnd, rtt_us) in snapshots {
+            self.apply_path_stats_snapshot(cwnd, rtt_us);
+        }
     }
 }
 
@@ -4209,5 +4253,25 @@ mod tests {
             logs.contains("last_send_ns"),
             "expected 'last_send_ns' field in logs; got: {logs}"
         );
+    }
+
+    #[tokio::test]
+    async fn sample_quic_path_stats_updates_bytes_per_us_and_rtt() {
+        let (our_end, _peer) = UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("server");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+        let initial_seq = bridge.adaptation_context.last_update_seq;
+        // Inject a path-stats snapshot manually (the wire to a real quinn
+        // Connection is exercised by integration tests, not this unit).
+        bridge.apply_path_stats_snapshot(
+            /* cwnd_bytes */ 60_000,
+            /* smoothed_rtt_us */ 12_000.0,
+        );
+        assert!(bridge.adaptation_context.last_update_seq > initial_seq);
+        assert!(bridge.adaptation_context.bytes_per_us > 0.0);
+        assert!((bridge.adaptation_context.smoothed_rtt_us - 12_000.0).abs() < 1e-6);
+        // cwnd / rtt = 60_000 bytes / 12_000 µs = 5.0 B/µs.
+        assert!((bridge.adaptation_context.bytes_per_us - 5.0).abs() < 0.01);
     }
 }
