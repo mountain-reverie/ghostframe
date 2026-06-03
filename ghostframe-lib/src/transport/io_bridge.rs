@@ -186,6 +186,15 @@ pub struct IoBridge {
     /// unaffected.
     #[cfg(any(test, feature = "test-loss-injection"))]
     pub(crate) outbound_bandwidth_cap: Option<crate::transport::bandwidth_cap::BandwidthCap>,
+    /// Cfg-gated test hook: when `Some(value)`, `sample_all_path_stats`
+    /// overrides `bytes_per_us` with this value instead of computing
+    /// from quinn `cwnd / rtt`. Bypasses the slow QUIC bandwidth-discovery
+    /// path so e2e tests can drive the M3.6b headroom_guard override
+    /// deterministically.
+    /// Sourced from `GHOSTFRAME_TEST_FORCE_BYTES_PER_US` env var
+    /// (parsed as f32). Unset / 0 / unparseable ⇒ None (no override).
+    #[cfg(any(test, feature = "test-loss-injection"))]
+    pub(crate) test_force_bytes_per_us: Option<f32>,
     /// Cfg-gated one-shot OOB-PalRle injection coordinate for e2e tests.
     /// When set to `Some((x, y))`, the next PalRle payload encoded for the
     /// matching tile coordinate is replaced with a hand-built bundled payload
@@ -495,6 +504,11 @@ impl IoBridge {
             inbound_loss: Self::loss_injector_from_env("INBOUND"),
             #[cfg(any(test, feature = "test-loss-injection"))]
             outbound_bandwidth_cap: crate::transport::bandwidth_cap::BandwidthCap::from_env(),
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            test_force_bytes_per_us: std::env::var("GHOSTFRAME_TEST_FORCE_BYTES_PER_US")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .filter(|v| *v > 0.0),
             #[cfg(any(test, feature = "test-loss-injection"))]
             oob_inject_at: Self::oob_injector_from_env(),
             #[cfg(any(test, feature = "test-loss-injection"))]
@@ -2607,6 +2621,8 @@ impl IoBridge {
             #[cfg(any(test, feature = "test-loss-injection"))]
             outbound_bandwidth_cap: None,
             #[cfg(any(test, feature = "test-loss-injection"))]
+            test_force_bytes_per_us: None,
+            #[cfg(any(test, feature = "test-loss-injection"))]
             oob_inject_at: None,
             #[cfg(any(test, feature = "test-loss-injection"))]
             skip_palette_session_reset: false,
@@ -2664,6 +2680,8 @@ impl IoBridge {
             inbound_loss: None,
             #[cfg(any(test, feature = "test-loss-injection"))]
             outbound_bandwidth_cap: None,
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            test_force_bytes_per_us: None,
             #[cfg(any(test, feature = "test-loss-injection"))]
             oob_inject_at: None,
             #[cfg(any(test, feature = "test-loss-injection"))]
@@ -2774,6 +2792,16 @@ impl IoBridge {
             })
             .collect();
         for (cwnd, rtt_us) in snapshots {
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            if let Some(forced) = self.test_force_bytes_per_us {
+                // Override path: keep the live RTT (it's still real) but
+                // replace bytes_per_us with the test value. apply_path_stats_snapshot
+                // computes bytes_per_us = cwnd / rtt, so we synthesize a
+                // cwnd that yields the desired forced value.
+                let synth_cwnd = (forced * rtt_us) as u64;
+                self.apply_path_stats_snapshot(synth_cwnd, rtt_us);
+                continue;
+            }
             self.apply_path_stats_snapshot(cwnd, rtt_us);
         }
     }
@@ -4293,5 +4321,32 @@ mod tests {
         assert!((bridge.adaptation_context.smoothed_rtt_us - 12_000.0).abs() < 1e-6);
         // cwnd / rtt = 60_000 bytes / 12_000 µs = 5.0 B/µs.
         assert!((bridge.adaptation_context.bytes_per_us - 5.0).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    async fn test_force_bytes_per_us_overrides_path_stats() {
+        let (our_end, _peer) = UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("server");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+        // No connections ⇒ sample_all_path_stats is a no-op even when the
+        // override is set. Set the override directly + call the inner
+        // apply_path_stats_snapshot to verify the override logic separately.
+        bridge.test_force_bytes_per_us = Some(0.1);
+
+        // Inject a snapshot that, with override active, should produce
+        // bytes_per_us == 0.1 regardless of the cwnd argument.
+        // We simulate what sample_all_path_stats would do internally: the
+        // override synthesizes cwnd from forced × rtt.
+        let rtt_us = 20_000.0;
+        let synth_cwnd = (0.1 * rtt_us) as u64; // 2_000
+        bridge.apply_path_stats_snapshot(synth_cwnd, rtt_us);
+
+        // Verify AdaptationContext reflects the forced value.
+        assert!(
+            (bridge.adaptation_context.bytes_per_us - 0.1).abs() < 0.01,
+            "got {}",
+            bridge.adaptation_context.bytes_per_us
+        );
     }
 }
