@@ -3038,8 +3038,8 @@ mod tests {
     //   - tests/e2e.rs::e2e_solid_color (Task 15) — full pipeline with client.
 
     /// `Classifier::reset` must zero hysteresis streaks, so a single busy
-    /// frame after reset can NOT promote to H264 (it needs `enter_sustain_frames`
-    /// consecutive busy frames). Without reset, a partial enter streak from a
+    /// frame after reset can NOT promote to H264 (it needs `enter_sustain_micros`
+    /// of dwell period). Without reset, a partial enter streak from a
     /// prior session would leak into the new session and trigger early promotion.
     #[test]
     fn classifier_reset_clears_streaks() {

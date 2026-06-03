@@ -15,7 +15,7 @@ fn solid_states(n: u32) -> Vec<CodecState> {
 /// starts at frame 0 (t=0). The switch fires when `frame_idx * frame_interval_us
 /// >= dwell_us`, i.e. `ceil(dwell_us / frame_interval_us)`.
 fn switch_frame(dwell_us: u64, frame_interval_us: u64) -> u32 {
-    ((dwell_us + frame_interval_us - 1) / frame_interval_us) as u32
+    dwell_us.div_ceil(frame_interval_us) as u32
 }
 
 #[test]

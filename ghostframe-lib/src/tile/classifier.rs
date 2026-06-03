@@ -300,6 +300,11 @@ pub struct Classifier {
     state: ClassifierHysteresis,
     adaptation_context: AdaptationContext,
     refinement_deficit_tiles: u32,
+    /// Reference instant used by `decide_frame_mode` to convert
+    /// monotonic time into µs for `decide_frame_mode_at`. Set in
+    /// `Default` to `Instant::now()` at Classifier construction.
+    /// Tests calling `decide_frame_mode_at` directly bypass this.
+    epoch: std::time::Instant,
 }
 
 impl Default for Classifier {
@@ -315,6 +320,7 @@ impl Default for Classifier {
             state: ClassifierHysteresis::default(),
             adaptation_context: AdaptationContext::default(),
             refinement_deficit_tiles: 0,
+            epoch: std::time::Instant::now(),
         }
     }
 }
@@ -470,7 +476,7 @@ impl Classifier {
     /// mode based on cost + sustained-motion fast-path with hysteresis.
     ///
     /// This is a thin wrapper around [`decide_frame_mode_at`] that reads the
-    /// current system time. Production code should call this method. Tests
+    /// current monotonic time. Production code should call this method. Tests
     /// that need deterministic timing should call `decide_frame_mode_at`
     /// directly with an explicit `now_us`.
     pub fn decide_frame_mode(
@@ -478,10 +484,10 @@ impl Classifier {
         tentative_states: &[CodecState],
         prev_mode: FrameMode,
     ) -> FrameMode {
-        let now_us = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_micros() as u64)
-            .unwrap_or(0);
+        // Monotonic source — `SystemTime` would skew under NTP and freeze
+        // hysteresis during the skew window. `Instant::elapsed` is
+        // guaranteed non-decreasing on every supported platform.
+        let now_us = self.epoch.elapsed().as_micros() as u64;
         self.decide_frame_mode_at(now_us, tentative_states, prev_mode)
     }
 }
