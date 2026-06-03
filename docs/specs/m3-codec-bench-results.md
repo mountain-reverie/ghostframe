@@ -234,3 +234,95 @@ Per Section 4 medians:
 ### M3.5b regression sweep result
 
 `e2e_mode_switch`, `e2e_progressive_refinement` (re-run 3× to confirm flake), `e2e_lossless_buildup`, `e2e_solid_color`, `e2e_h264_motion`, `e2e_multi_tile_grid` — **5 pass / 1 flake-retried-and-passed** on the M3.5b sweep. Post-midpoint-fix re-run of e2e_cdf53_lossless_buildup + e2e_cdf53_integrate_correctness + e2e_progressive_refinement: **3 pass on first run**.
+
+---
+
+## M3.6 Dynamic Policy
+
+**Commit:** `64c3343` (M3.6c bench plumbing — bandwidth/loss env vars host→container)
+**Bench run:** 4 caps × 7 scenes × 10 s each, real test-server container exercising the M3.6b policy code.
+
+The classifier from M3.6b takes 3 signals into a single `decide_frame_mode_at` call:
+1. **`bytes_per_us`** from QUIC `path_stats.cwnd / smoothed_rtt` (per-tick sample).
+2. **Smoothed `loss_rate`** averaged across the last 5 `ReceiverFeedback` windows (~500 ms).
+3. **`suspended`** flag debounced over the last 2 windows.
+
+It chooses between H264 full-frame and the per-tile codec via a refinement-deficit-biased cost comparison, with 3 hard-overrides bypassing hysteresis when any signal exceeds a threshold. Constants:
+
+- `REFINEMENT_BIAS_PER_TILE_US = 5.0`
+- `HEADROOM_MIN_BYTES_PER_US = 0.25` (≈ 2 Mbps)
+- `LOSS_OVERRIDE_THRESHOLD = 0.10` (10 %)
+
+### Bench operating points
+
+| Cap | bytes/sec | Inbound loss % | Real-life analogue |
+|---|---:|---:|---|
+| 1mbps_edge | 125_000 | 15 % | Mobile / satellite / heavily-congested |
+| 10mbps_dsl | 1_250_000 | 5 % | Typical DSL with light congestion |
+| 30mbps_cable | 3_750_000 | 1 % | Standard cable broadband |
+| 100mbps_lan | 12_500_000 | 0 % | LAN / fiber baseline |
+
+## 9. Mode dwell × bandwidth × scene (M3.6)
+
+| Scene | 100mbps_lan (H264s / Tiles / switches) | 10mbps_dsl (H264s / Tiles / switches) | 1mbps_edge (H264s / Tiles / switches) | 30mbps_cable (H264s / Tiles / switches) |
+|---|---|---|---|---|
+| `flat_ui` | 0.00 / 0.00 / 0 | 0.00 / 0.00 / 0 | 0.00 / 0.00 / 0 | 0.00 / 0.00 / 0 |
+| `gradient` | 0.00 / 0.00 / 0 | 0.00 / 0.00 / 0 | 0.00 / 0.00 / 0 | 0.00 / 0.00 / 0 |
+| `mode_switch` | 7.51 / 4.51 / 5 | 9.52 / 2.50 / 6 [thrash] | 8.01 / 4.01 / 5 | 7.51 / 4.51 / 5 |
+| `motion` | 0.00 / 0.00 / 0 | 0.00 / 0.00 / 0 | 0.00 / 0.00 / 0 | 0.00 / 0.00 / 0 |
+| `photo` | 0.00 / 0.00 / 0 | 0.00 / 0.00 / 0 | 0.00 / 0.00 / 0 | 0.00 / 0.00 / 0 |
+| `solid` | 0.00 / 0.00 / 0 | 0.00 / 0.00 / 0 | 0.00 / 0.00 / 0 | 0.00 / 0.00 / 0 |
+| `text` | 0.00 / 0.00 / 0 | 0.00 / 0.00 / 0 | 0.00 / 0.00 / 0 | 0.00 / 0.00 / 0 |
+
+## 10. Override-trigger frequency (M3.6)
+
+## 10. Override-trigger frequency × bandwidth (M3.6) Override-trigger frequency (M3.6)
+
+| Cap | cost_comparison | headroom_guard | loss_override | suspension | hysteresis_clamp |
+|---|---:|---:|---:|---:|---:|
+| 100mbps_lan | 5 | 0 | 0 | 0 | 7 |
+| 10mbps_dsl | 6 | 0 | 0 | 0 | 7 |
+| 1mbps_edge | 4 | 0 | 1 | 0 | 7 |
+| 30mbps_cable | 5 | 0 | 0 | 0 | 7 |
+
+
+### What the data says
+
+**Policy machinery is exercised end-to-end.** Every reason in `decide_inner` (`cost_comparison`, `loss_override`, `suspension`, `headroom_guard`, `hysteresis_clamp`) is reachable code; the bench observes the first two firing across the cap range and the fifth firing consistently.
+
+**`cost_comparison` (4-6 per cap)** comes from the `mode_switch` scene's alternating static/motion phases. The 10 mbps run shows 6 switches with `[thrash]` — the extra switch comes from the policy oscillating once when the cap-induced packet drops bias the cost comparison.
+
+**`loss_override` fires once at 1mbps_edge** (15 % loss). It fires once rather than continuously because `last_emitted_mode` debounces — once the classifier has emitted "H264 due to loss_override," repeated decisions matching the same mode don't re-emit. The single event confirms the smoothing window (5 × ~100 ms ReceiverFeedback) does cross the 0.10 threshold and the override fast-path executes.
+
+**`headroom_guard` never fires.** This is the measurement gap. The override checks `bytes_per_us < HEADROOM_MIN_BYTES_PER_US (0.25)`, but `bytes_per_us` is sourced from quinn-proto's `cwnd / rtt`. At every bench operating point — including 1 Mbps cap — QUIC's reported cwnd stays well above 2 Mbps because the cap drops datagrams at the WebTransport send call site, *after* quinn-proto has accepted them into its send buffer. quinn sees those bytes as "sent" and grows its cwnd accordingly; only retransmission timeouts would shrink it, and those don't accumulate fast enough in a 10 s scene to cross the threshold.
+
+**`hysteresis_clamp` is consistent at 7 per cap.** That's 7 × frame_capture intervals where the classifier was making a decision but neither entering nor exiting (still in the dwell window of the current mode). The flat consistency across all 4 caps validates that the wall-clock-based hysteresis (`enter_sustain_micros = 50_000`, `exit_sustain_micros = 500_000`) behaves identically regardless of bandwidth.
+
+### Tuning verdict
+
+Each constant evaluated against the data:
+
+#### `REFINEMENT_BIAS_PER_TILE_US` → keep at **5.0**
+
+Reasoning: the bias term feeds into the cost comparison such that `h264_cost += refinement_deficit_tiles × 5 µs`. To tune empirically we'd need to observe PixelPerfect convergence rates (transitions per scene) vs mode-switch counts under refinement-active conditions. The bench measures neither directly. The `mode_switch` `[thrash]` flag at 10mbps_dsl is the only weak signal — and it's 1 extra switch above the [thrash] threshold of 5, not statistically meaningful. No directional evidence for raising or lowering.
+
+#### `HEADROOM_MIN_BYTES_PER_US` → keep at **0.25** (≈ 2 Mbps)
+
+Reasoning: the threshold value was chosen as the floor below which per-tile codec emissions can't keep up with frame rate (a static 4×8 tile grid at 30 fps × 1.3 KB/tile/refinement ≈ 1.25 Mbps just for CDF53 refinement traffic; below 2 Mbps total link capacity nothing meaningful gets through). The bench can't drive QUIC `cwnd` low enough to test it — and re-instrumenting to inject a synthetic cwnd value would just verify the override mechanism (already proven by the M3.6b `e2e_headroom_guard_forces_h264` test). The constant is structural, not empirical.
+
+#### `LOSS_OVERRIDE_THRESHOLD` → keep at **0.10** (10 %)
+
+Reasoning: 10 % was chosen as the loss rate above which datagram-based reassembly + refinement become impractical (FEC parity tops out around 10-15 % recovery; beyond that retransmissions dominate). The bench fired the override once at 15 % loss, confirming the path works. To tune the threshold value itself, we'd need to run multiple loss rates near the threshold (e.g. 0.06, 0.08, 0.10, 0.12, 0.14) and observe thrashing vs degradation — a 5×7×4 = 140-run bench that's out of scope here.
+
+### Investments deferred to a future bench cycle
+
+What would unlock empirical constant tuning:
+
+1. **Drive QUIC `cwnd` directly via realistic network shaping** (host `tc qdisc` traffic control with bandwidth + delay + loss) instead of dropping at our own send call site. Then `cwnd` would actually shrink to reflect the link's real capacity and `headroom_guard` could be exercised.
+2. **Add a "PixelPerfect transitions per scene" metric to the harness**, parsed from `cdf53.pixelperfect` log lines. With this metric, `REFINEMENT_BIAS_PER_TILE_US` could be tuned to balance "fast convergence" vs "no mode thrash."
+3. **Run pure scenes with synthetic per-tile activity** so the classifier sees mode-switching pressure outside the `mode_switch` test pattern. Currently 6 of 7 scenes show all-zero dwell because they don't trigger any mode flips.
+4. **Loss-axis sub-matrix** (5 loss points × 1 bandwidth point) to surface the loss threshold's actual sensitivity curve. The current 1-loss-per-bw layout undersamples the threshold neighborhood.
+
+### M3.6c regression sweep
+
+See Task 28 commit for the full regression sweep results. The 3 M3.6 constants remain at their Task 6 initial values. The lib + e2e behavior is unchanged from the M3.6b-tagged state (the bench instrumentation only extends what we *observe*, not what the policy *does*).
