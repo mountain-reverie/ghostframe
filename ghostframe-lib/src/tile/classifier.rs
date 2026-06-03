@@ -254,6 +254,24 @@ pub fn gate_codec_state(
 #[path = "classifier_classify_tests.rs"]
 mod classify_tests;
 
+/// Per-tile bias added to the H264 comparand when refinement passes are
+/// outstanding. Pulls the cost comparison toward TileCodec when there's
+/// PixelPerfect work left to deliver and bandwidth headroom permits.
+/// Retuned in M3.6c from the bandwidth × scene matrix.
+pub const REFINEMENT_BIAS_PER_TILE_US: f32 = 5.0;
+
+/// Minimum bandwidth (bytes per µs) below which the classifier
+/// hard-overrides to H264 regardless of the cost comparison. 0.25 B/µs
+/// ≈ 2 Mbps — below this, individual tile-codec emissions can't keep up
+/// with frame-rate. Retuned in M3.6c.
+pub const HEADROOM_MIN_BYTES_PER_US: f32 = 0.25;
+
+/// Smoothed loss-rate threshold above which the classifier hard-overrides
+/// to H264. 10 % datagram loss makes per-tile reassembly + refinement
+/// unworkable; H264 full-frame's larger I-frame interval rides through
+/// better. Retuned in M3.6c.
+pub const LOSS_OVERRIDE_THRESHOLD: f32 = 0.10;
+
 /// Hysteresis state for `Classifier::decide_frame_mode`.
 #[derive(Debug, Clone, Copy, Default)]
 struct ClassifierHysteresis {
