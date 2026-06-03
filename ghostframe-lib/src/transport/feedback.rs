@@ -64,6 +64,17 @@ impl ReceiverFeedback {
         }
         self.datagrams_lost as f64 / total as f64
     }
+
+    /// Average of per-window `loss_rate()` across `history`. Returns `0.0`
+    /// for empty history. Caller is responsible for capping `history` at
+    /// the smoothing window length (M3.6 uses 5).
+    pub fn smoothed_loss_rate(history: &std::collections::VecDeque<Self>) -> f32 {
+        if history.is_empty() {
+            return 0.0;
+        }
+        let sum: f64 = history.iter().map(|fb| fb.loss_rate()).sum();
+        (sum / history.len() as f64) as f32
+    }
 }
 
 #[cfg(test)]
@@ -148,5 +159,31 @@ mod tests {
             suspension_detected: false,
         };
         assert_eq!(fb.loss_rate(), 0.0);
+    }
+
+    #[test]
+    fn smoothed_loss_rate_5_window_average() {
+        use std::collections::VecDeque;
+        let mut history: VecDeque<ReceiverFeedback> = VecDeque::new();
+        for lost in [0u32, 0, 200, 0, 0] {
+            history.push_back(ReceiverFeedback {
+                timestamp_ns: 0,
+                datagrams_received: 800,
+                datagrams_lost: lost,
+                datagrams_recovered_fec: 0,
+                suspension_detected: false,
+            });
+        }
+        let avg = ReceiverFeedback::smoothed_loss_rate(&history);
+        // Window 3: loss = 200 / (800 + 200) = 0.20. Others: 0.0.
+        // Mean: 0.20 / 5 = 0.04.
+        assert!((avg - 0.04).abs() < 1e-6, "got {avg}");
+    }
+
+    #[test]
+    fn smoothed_loss_rate_empty_history_is_zero() {
+        use std::collections::VecDeque;
+        let history: VecDeque<ReceiverFeedback> = VecDeque::new();
+        assert_eq!(ReceiverFeedback::smoothed_loss_rate(&history), 0.0);
     }
 }
