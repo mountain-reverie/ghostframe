@@ -293,6 +293,7 @@ pub struct Classifier {
     pub exit_sustain_frames: u32,      // default 30
     state: ClassifierHysteresis,
     adaptation_context: AdaptationContext,
+    refinement_deficit_tiles: u32,
 }
 
 impl Default for Classifier {
@@ -307,6 +308,7 @@ impl Default for Classifier {
             exit_sustain_frames: 30,
             state: ClassifierHysteresis::default(),
             adaptation_context: AdaptationContext::default(),
+            refinement_deficit_tiles: 0,
         }
     }
 }
@@ -340,6 +342,13 @@ impl Classifier {
     /// `set_adaptation_context`.
     pub fn adaptation_context(&self) -> AdaptationContext {
         self.adaptation_context
+    }
+
+    /// Number of tiles currently in `Cdf53 { passes_sent < max_passes }`.
+    /// Caller (io_bridge) updates this each frame from the per-tile state.
+    /// Used by M3.6b's refinement-deficit bias term in `decide_frame_mode`.
+    pub fn set_refinement_deficit_tiles(&mut self, count: u32) {
+        self.refinement_deficit_tiles = count;
     }
 
     /// Apply per-tile rules across all dirty tiles, then decide whole-frame
@@ -383,8 +392,11 @@ impl Classifier {
             .sum();
         let bytes_per_us = self.cost.bytes_per_us();
         let tile_codec_cost = non_h264_us + (all_tile_bytes as f32) / bytes_per_us;
-        let h264_cost =
-            self.cost.h264_frame_us + (self.cost.h264_frame_bytes as f32) / bytes_per_us;
+        let refinement_bias_us =
+            self.refinement_deficit_tiles as f32 * REFINEMENT_BIAS_PER_TILE_US;
+        let h264_cost = self.cost.h264_frame_us
+            + (self.cost.h264_frame_bytes as f32) / bytes_per_us
+            + refinement_bias_us;
 
         // Motion fast-path: count tentatively-H.264 tiles
         let h264_tile_count = tentative_states

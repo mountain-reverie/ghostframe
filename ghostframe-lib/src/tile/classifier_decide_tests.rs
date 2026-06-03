@@ -180,3 +180,61 @@ fn empty_tentative_in_tilecodec_stays_tilecodec() {
         );
     }
 }
+
+#[test]
+fn refinement_bias_promotes_tilecodec_under_headroom() {
+    use crate::tile::classifier::{AdaptationContext, Classifier, REFINEMENT_BIAS_PER_TILE_US};
+    use crate::tile::{CodecState, FrameMode};
+
+    // At 100 B/µs bandwidth, 40 Cdf53 tiles produce:
+    //   tile_codec_cost = 40 * 90.0 + 40 * 1300 / 100.0 = 3600 + 520 = 4120 µs
+    //   h264_cost (no bias) = 3000 + 12000/100 = 3120 µs
+    //   enter threshold (no bias) = 3120 * 1.3 = 4056 µs  → 4120 > 4056 → enters H264
+    //
+    //   With deficit=40 and REFINEMENT_BIAS_PER_TILE_US=5.0:
+    //   h264_cost (with bias) = 3120 + 40*5 = 3320 µs
+    //   enter threshold (with bias) = 3320 * 1.3 = 4316 µs → 4120 ≤ 4316 → stays TileCodec
+    //
+    // Plenty of bandwidth: 100 B/µs (≈ 800 Mbps).
+    let ctx = AdaptationContext {
+        bytes_per_us: 100.0,
+        smoothed_rtt_us: 5_000.0,
+        loss_rate: 0.0,
+        suspended: false,
+        last_update_seq: 1,
+    };
+    let tentative: Vec<CodecState> = (0..40)
+        .map(|_| CodecState::Cdf53 {
+            passes_sent: 3,
+            max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
+        })
+        .collect();
+
+    // With bias: even after enter_sustain_frames calls, cost_enter is false
+    // (tile_codec_cost ≤ h264_cost_biased * enter_factor), so TileCodec is held.
+    let mut c = Classifier::default();
+    c.set_adaptation_context(ctx);
+    c.set_refinement_deficit_tiles(40);
+    let mut mode = FrameMode::TileCodec;
+    for _ in 0..c.enter_sustain_frames {
+        mode = c.decide_frame_mode(&tentative, mode);
+    }
+    assert_eq!(mode, FrameMode::TileCodec, "bias should hold TileCodec");
+
+    // Without bias: tile_codec_cost > h264_cost * enter_factor → H264 after sustain.
+    let mut c2 = Classifier::default();
+    c2.set_adaptation_context(ctx);
+    c2.set_refinement_deficit_tiles(0);
+    let mut mode2 = FrameMode::TileCodec;
+    for _ in 0..c2.enter_sustain_frames {
+        mode2 = c2.decide_frame_mode(&tentative, mode2);
+    }
+    assert_eq!(
+        mode2,
+        FrameMode::H264,
+        "without deficit, cost comparison picks H264 (bias is zero)"
+    );
+
+    // Sanity: bias > 0 used.
+    assert!(REFINEMENT_BIAS_PER_TILE_US > 0.0);
+}
