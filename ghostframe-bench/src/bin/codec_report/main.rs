@@ -32,9 +32,21 @@ async fn main() -> anyhow::Result<()> {
                 "GHOSTFRAME_OUTBOUND_BANDWIDTH_CAP",
                 point.bytes_per_sec.to_string(),
             );
+            if point.loss_probability > 0.0 {
+                std::env::set_var(
+                    "GHOSTFRAME_INBOUND_LOSS_PROBABILITY",
+                    point.loss_probability.to_string(),
+                );
+                std::env::set_var("GHOSTFRAME_INBOUND_LOSS_SEED", "42");
+                std::env::set_var("GHOSTFRAME_INBOUND_LOSS_PREDICATE", "tile");
+            }
             for spec in &scenes {
                 let labeled_name = format!("{}/{}", point.label, spec.name);
-                tracing::info!(scene = %spec.name, bw = point.label, "running scene under bandwidth cap");
+                tracing::info!(
+                    scene = %spec.name, bw = point.label,
+                    loss = point.loss_probability,
+                    "running scene under bandwidth + loss"
+                );
                 let mut labeled_spec = spec.clone();
                 // SAFETY: SceneSpec.name is &'static str. To label with a
                 // dynamic prefix we leak the formatted string — it's a
@@ -43,6 +55,9 @@ async fn main() -> anyhow::Result<()> {
                 runner::run_one_scene(&labeled_spec, &mut state).await?;
             }
             std::env::remove_var("GHOSTFRAME_OUTBOUND_BANDWIDTH_CAP");
+            std::env::remove_var("GHOSTFRAME_INBOUND_LOSS_PROBABILITY");
+            std::env::remove_var("GHOSTFRAME_INBOUND_LOSS_SEED");
+            std::env::remove_var("GHOSTFRAME_INBOUND_LOSS_PREDICATE");
         }
     } else {
         for spec in &scenes {

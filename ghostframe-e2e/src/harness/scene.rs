@@ -186,24 +186,39 @@ async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioStack> {
     let test_pattern_str = spec.test_pattern_args.join(" ");
     let server_container_name = "ghostframe-server".to_string();
 
-    let server: ContainerAsync<GenericImage> =
-        GenericImage::new("ghostframe/test-server", "latest")
-            .with_container_name(&server_container_name)
-            .with_network(crate::harness::containers::NETWORK_NAME)
-            .with_env_var("TS_AUTHKEY", &server_key)
-            .with_env_var("TS_CONTROL_URL", "http://headscale:8080")
-            .with_env_var("RUST_LOG", "ghostframe=trace,debug")
-            .with_env_var("TEST_PATTERN", &test_pattern_str)
-            // Enable JSON log format so parse_server_telemetry can decode events.
-            .with_env_var("GHOSTFRAME_LOG_FORMAT", "json")
-            // GPU passthrough: bind /dev/dri + modesetting Xorg config + privileged.
-            .with_env_var("XORG_CONF", "/etc/X11/xorg-vkms.conf")
-            .with_mount(Mount::bind_mount("/dev/dri", "/dev/dri"))
-            .with_privileged(true)
-            .with_ready_conditions(vec![WaitFor::message_on_stdout("CERT_HASH_SHA256=")])
-            .with_startup_timeout(Duration::from_secs(120))
-            .start()
-            .await?;
+    // M3.6c: forward bench-set env vars into the container so
+    // GHOSTFRAME_OUTBOUND_BANDWIDTH_CAP + GHOSTFRAME_INBOUND_LOSS_*
+    // actually reach xdaemon. Without this, the env vars stay on
+    // the bench process and the container sees defaults.
+    let mut server_image = GenericImage::new("ghostframe/test-server", "latest")
+        .with_container_name(&server_container_name)
+        .with_network(crate::harness::containers::NETWORK_NAME)
+        .with_env_var("TS_AUTHKEY", &server_key)
+        .with_env_var("TS_CONTROL_URL", "http://headscale:8080")
+        .with_env_var("RUST_LOG", "ghostframe=trace,debug")
+        .with_env_var("TEST_PATTERN", &test_pattern_str)
+        // Enable JSON log format so parse_server_telemetry can decode events.
+        .with_env_var("GHOSTFRAME_LOG_FORMAT", "json")
+        // GPU passthrough: bind /dev/dri + modesetting Xorg config + privileged.
+        .with_env_var("XORG_CONF", "/etc/X11/xorg-vkms.conf")
+        .with_mount(Mount::bind_mount("/dev/dri", "/dev/dri"))
+        .with_privileged(true)
+        .with_ready_conditions(vec![WaitFor::message_on_stdout("CERT_HASH_SHA256=")])
+        .with_startup_timeout(Duration::from_secs(120));
+
+    // Forward 4 host env vars if set.
+    for var in [
+        "GHOSTFRAME_OUTBOUND_BANDWIDTH_CAP",
+        "GHOSTFRAME_INBOUND_LOSS_PROBABILITY",
+        "GHOSTFRAME_INBOUND_LOSS_SEED",
+        "GHOSTFRAME_INBOUND_LOSS_PREDICATE",
+    ] {
+        if let Ok(val) = std::env::var(var) {
+            server_image = server_image.with_env_var(var, val);
+        }
+    }
+
+    let server: ContainerAsync<GenericImage> = server_image.start().await?;
 
     let cert_hash =
         crate::harness::containers::read_cert_hash_from_logs(&server_container_name).await?;
