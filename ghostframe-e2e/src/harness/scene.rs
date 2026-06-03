@@ -68,6 +68,18 @@ pub struct ClientDiagnosticRecord {
 }
 
 #[derive(Clone, Debug)]
+pub struct ModeDecisionRecord {
+    /// Frame sequence number (0 if unset by the event).
+    pub frame_seq: u64,
+    /// The `reason` field from the classifier event.
+    /// One of: "cost_comparison", "headroom_guard", "loss_override",
+    /// "suspension", "hysteresis_clamp".
+    pub reason: String,
+    /// Destination mode of the transition ("H264" or "TileCodec").
+    pub to_mode: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct ProcSample {
     pub wall_ns: u64,
     pub utime_ticks: u64,
@@ -80,6 +92,7 @@ pub struct ProcSample {
 pub struct SceneResult {
     pub server_telemetry: Vec<ServerTelemetryRecord>,
     pub client_diagnostics: Vec<ClientDiagnosticRecord>,
+    pub mode_decisions: Vec<ModeDecisionRecord>,
     pub proc_samples: Vec<ProcSample>,
     pub wire_bytes_total: u64,
     pub error: Option<String>,
@@ -416,7 +429,7 @@ pub async fn run_scene(spec: &SceneSpec) -> Result<SceneResult> {
     // Collect server telemetry from the container's combined logs.
     let server_logs =
         crate::harness::cleanup::read_server_logs_stripped(&stack.server_container_name);
-    let server_telemetry = parse_server_telemetry(&server_logs);
+    let (server_telemetry, mode_decisions) = parse_server_telemetry(&server_logs);
 
     // Collect client diagnostics from Chromium via DevTools eval.
     let client_diagnostics = read_client_diagnostics(&stack.page).await?;
@@ -431,6 +444,7 @@ pub async fn run_scene(spec: &SceneSpec) -> Result<SceneResult> {
     Ok(SceneResult {
         server_telemetry,
         client_diagnostics,
+        mode_decisions,
         proc_samples: proc_samples_vec,
         wire_bytes_total,
         error: None,
@@ -560,13 +574,14 @@ async fn sample_proc_loop(
 // Helper: parse JSON server telemetry
 // ---------------------------------------------------------------------------
 
-fn parse_server_telemetry(stderr_lines: &str) -> Vec<ServerTelemetryRecord> {
+fn parse_server_telemetry(stderr_lines: &str) -> (Vec<ServerTelemetryRecord>, Vec<ModeDecisionRecord>) {
     use std::collections::BTreeMap;
 
     // frame_seq → (capture_done_ns, mode)
     let mut captures: BTreeMap<u64, (u64, String)> = BTreeMap::new();
     // frame_seq → (last_send_ns, total_wire_bytes, tile_count, CodecHistogram)
     let mut sends: BTreeMap<u64, (u64, u32, u16, CodecHistogram)> = BTreeMap::new();
+    let mut decisions: Vec<ModeDecisionRecord> = Vec::new();
 
     for line in stderr_lines.lines() {
         let v: serde_json::Value = match serde_json::from_str(line) {
@@ -642,11 +657,28 @@ fn parse_server_telemetry(stderr_lines: &str) -> Vec<ServerTelemetryRecord> {
                 };
                 sends.insert(frame_seq, (ts, total, tc, hist));
             }
+            "mode decision" => {
+                let reason = v
+                    .pointer("/fields/reason")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let to_mode = v
+                    .pointer("/fields/to")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let frame_seq = v
+                    .pointer("/fields/frame_seq")
+                    .and_then(|s| s.as_u64())
+                    .unwrap_or(0);
+                decisions.push(ModeDecisionRecord { frame_seq, reason, to_mode });
+            }
             _ => {}
         }
     }
 
-    captures
+    let records = captures
         .into_iter()
         .filter_map(|(seq, (cap_ns, mode))| {
             sends.get(&seq).map(|(send_ns, bytes, tc, hist)| {
@@ -661,7 +693,8 @@ fn parse_server_telemetry(stderr_lines: &str) -> Vec<ServerTelemetryRecord> {
                 }
             })
         })
-        .collect()
+        .collect();
+    (records, decisions)
 }
 
 // ---------------------------------------------------------------------------

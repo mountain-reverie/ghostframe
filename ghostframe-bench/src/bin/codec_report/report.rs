@@ -175,5 +175,189 @@ pub fn write(
     writeln!(f, "_TODO(M3.5b) — narrative + proposed L1/L2/L3 values per spec §M3.5b Step 2._")?;
     writeln!(f)?;
 
+    // ---- Section 9: M3.6 Dynamic Policy — mode dwell × bw × scene ----
+    writeln!(f, "## 9. Mode dwell × bandwidth × scene (M3.6)")?;
+    writeln!(f)?;
+    // When bandwidth-matrix wasn't run, scene keys are bare names
+    // ("solid", "flat_ui", ...). When it WAS run, scene keys are
+    // "<bw>/<scene>". Distinguish by checking for '/'.
+    let has_matrix = state.scenes.keys().any(|k| k.contains('/'));
+    if !has_matrix {
+        writeln!(f, "_Single-bandwidth run; matrix bench was not requested via `--bandwidth-matrix`._")?;
+        writeln!(f)?;
+        writeln!(f, "| Scene | H264 (s) | TileCodec (s) | Mode switches |")?;
+        writeln!(f, "|---|---:|---:|---:|")?;
+        for (name, summary) in &state.scenes {
+            writeln!(
+                f,
+                "| `{}` | {:.2} | {:.2} | {} |",
+                name,
+                summary.h264_dwell_us as f64 / 1e6,
+                summary.tile_dwell_us as f64 / 1e6,
+                summary.mode_switch_count,
+            )?;
+        }
+    } else {
+        // Matrix mode: group by scene-base, columns are bandwidth caps.
+        // Discover scene-bases and bw labels from the keys.
+        let mut scene_bases: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        let mut bw_labels: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for key in state.scenes.keys() {
+            if let Some((bw, scene)) = key.split_once('/') {
+                bw_labels.insert(bw);
+                scene_bases.insert(scene);
+            }
+        }
+        // Header row.
+        write!(f, "| Scene ")?;
+        for bw in &bw_labels {
+            write!(f, "| {} (H264s / Tiles / switches) ", bw)?;
+        }
+        writeln!(f, "|")?;
+        write!(f, "|---")?;
+        for _ in &bw_labels {
+            write!(f, "|---")?;
+        }
+        writeln!(f, "|")?;
+        // Body.
+        for scene in &scene_bases {
+            write!(f, "| `{}` ", scene)?;
+            for bw in &bw_labels {
+                let key = format!("{}/{}", bw, scene);
+                match state.scenes.get(&key) {
+                    Some(s) => {
+                        let thrash = if s.mode_switch_count > 5 { " [thrash]" } else { "" };
+                        write!(
+                            f,
+                            "| {:.2} / {:.2} / {}{} ",
+                            s.h264_dwell_us as f64 / 1e6,
+                            s.tile_dwell_us as f64 / 1e6,
+                            s.mode_switch_count,
+                            thrash,
+                        )?;
+                    }
+                    None => write!(f, "| _absent_ ")?,
+                }
+            }
+            writeln!(f, "|")?;
+        }
+    }
+    writeln!(f)?;
+
+    // ---- Section 10: Override-trigger frequency × bw ----
+    writeln!(f, "## 10. Override-trigger frequency (M3.6)")?;
+    writeln!(f)?;
+    if !has_matrix {
+        // Single-run: sum across scenes; one row.
+        let mut totals: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+        for s in state.scenes.values() {
+            for (k, v) in &s.mode_decision_counts {
+                *totals.entry(k.clone()).or_default() += v;
+            }
+        }
+        writeln!(f, "| Reason | Count |")?;
+        writeln!(f, "|---|---:|")?;
+        for reason in &["cost_comparison", "headroom_guard", "loss_override", "suspension", "hysteresis_clamp"] {
+            writeln!(f, "| `{}` | {} |", reason, totals.get(*reason).copied().unwrap_or(0))?;
+        }
+    } else {
+        // Matrix: rows are bandwidth caps; columns are reasons.
+        let mut by_bw: std::collections::BTreeMap<&str, std::collections::BTreeMap<String, u32>> =
+            std::collections::BTreeMap::new();
+        for (key, s) in &state.scenes {
+            if let Some((bw, _)) = key.split_once('/') {
+                let entry = by_bw.entry(bw).or_default();
+                for (k, v) in &s.mode_decision_counts {
+                    *entry.entry(k.clone()).or_default() += v;
+                }
+            }
+        }
+        writeln!(f, "| Cap | cost_comparison | headroom_guard | loss_override | suspension | hysteresis_clamp |")?;
+        writeln!(f, "|---|---:|---:|---:|---:|---:|")?;
+        for (bw, counts) in &by_bw {
+            let g = |k: &str| counts.get(k).copied().unwrap_or(0);
+            writeln!(
+                f,
+                "| {} | {} | {} | {} | {} | {} |",
+                bw,
+                g("cost_comparison"),
+                g("headroom_guard"),
+                g("loss_override"),
+                g("suspension"),
+                g("hysteresis_clamp"),
+            )?;
+        }
+    }
+    writeln!(f)?;
+
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::aggregate::{ReportState, SceneSummary};
+    use crate::cli::Cli;
+    use clap::Parser;
+
+    fn make_test_state(matrix: bool) -> ReportState {
+        let args = Cli::parse_from(["codec_report"]);
+        let mut state = ReportState::new(&args);
+        if matrix {
+            // Simulate bandwidth-matrix run with 2 bw caps × 2 scenes.
+            for bw in &["10Mbps", "30Mbps"] {
+                for scene in &["solid", "motion"] {
+                    let key = format!("{}/{}", bw, scene);
+                    let mut s = SceneSummary::default();
+                    s.h264_dwell_us = 1_500_000;
+                    s.tile_dwell_us = 2_000_000;
+                    s.mode_switch_count = if *bw == "10Mbps" { 7 } else { 1 };
+                    *s.mode_decision_counts.entry("cost_comparison".into()).or_default() += 3;
+                    *s.mode_decision_counts.entry("headroom_guard".into()).or_default() += 1;
+                    state.scenes.insert(key, s);
+                }
+            }
+        } else {
+            let mut s = SceneSummary::default();
+            s.h264_dwell_us = 3_000_000;
+            s.tile_dwell_us = 7_000_000;
+            s.mode_switch_count = 2;
+            *s.mode_decision_counts.entry("cost_comparison".into()).or_default() += 5;
+            state.scenes.insert("solid".into(), s);
+        }
+        state
+    }
+
+    #[test]
+    fn sections_9_10_single_bw() {
+        let state = make_test_state(false);
+        let tmp = std::env::temp_dir().join("report_test_single.md");
+        write(&tmp, &state, None).expect("write should succeed");
+        let text = std::fs::read_to_string(&tmp).expect("file exists");
+        assert!(text.contains("## 9. Mode dwell × bandwidth × scene"), "section 9 header");
+        assert!(text.contains("## 10. Override-trigger frequency"), "section 10 header");
+        assert!(text.contains("_Single-bandwidth run"), "single-bw note");
+        assert!(text.contains("H264 (s) | TileCodec (s) | Mode switches"), "table 9 headers");
+        assert!(text.contains("| Reason | Count |"), "table 10 headers");
+        // h264_dwell_us = 3_000_000 → 3.00 s
+        assert!(text.contains("3.00"), "h264 dwell seconds present");
+        // cost_comparison count = 5
+        assert!(text.contains("| `cost_comparison` | 5 |"), "cost_comparison count");
+    }
+
+    #[test]
+    fn sections_9_10_matrix_bw() {
+        let state = make_test_state(true);
+        let tmp = std::env::temp_dir().join("report_test_matrix.md");
+        write(&tmp, &state, None).expect("write should succeed");
+        let text = std::fs::read_to_string(&tmp).expect("file exists");
+        assert!(text.contains("## 9. Mode dwell × bandwidth × scene"), "section 9 header");
+        assert!(text.contains("## 10. Override-trigger frequency"), "section 10 header");
+        // matrix headers should NOT have single-bw note
+        assert!(!text.contains("_Single-bandwidth run"), "no single-bw note in matrix mode");
+        // 10Mbps / solid has mode_switch_count=7 > 5 → [thrash]
+        assert!(text.contains("[thrash]"), "[thrash] annotation present");
+        // Table 10 matrix: bw rows
+        assert!(text.contains("cost_comparison"), "cost_comparison column");
+    }
 }
