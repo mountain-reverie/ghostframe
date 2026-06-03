@@ -384,7 +384,9 @@ impl Classifier {
         let ctx = self.adaptation_context;
         let headroom_force_h264 =
             ctx.bytes_per_us > 0.0 && ctx.bytes_per_us < HEADROOM_MIN_BYTES_PER_US;
-        if headroom_force_h264 {
+        let loss_force_h264 = ctx.loss_rate > LOSS_OVERRIDE_THRESHOLD;
+        let suspension_force_h264 = ctx.suspended;
+        if headroom_force_h264 || loss_force_h264 || suspension_force_h264 {
             self.state = ClassifierHysteresis::default();
             return FrameMode::H264;
         }

@@ -260,3 +260,43 @@ fn headroom_guard_forces_h264_below_threshold() {
     let mode = c.decide_frame_mode(&tentative, FrameMode::TileCodec);
     assert_eq!(mode, FrameMode::H264, "headroom guard should override");
 }
+
+#[test]
+fn loss_override_forces_h264_above_threshold() {
+    use crate::tile::classifier::{AdaptationContext, Classifier, LOSS_OVERRIDE_THRESHOLD};
+    use crate::tile::{CodecState, FrameMode};
+    let mut c = Classifier::default();
+    let ctx = AdaptationContext {
+        bytes_per_us: 100.0,
+        smoothed_rtt_us: 5_000.0,
+        loss_rate: LOSS_OVERRIDE_THRESHOLD + 0.05,
+        suspended: false,
+        last_update_seq: 1,
+    };
+    c.set_adaptation_context(ctx);
+    let tentative = vec![CodecState::Solid];
+    assert_eq!(
+        c.decide_frame_mode(&tentative, FrameMode::TileCodec),
+        FrameMode::H264
+    );
+}
+
+#[test]
+fn suspension_override_forces_h264() {
+    use crate::tile::classifier::{AdaptationContext, Classifier};
+    use crate::tile::{CodecState, FrameMode};
+    let mut c = Classifier::default();
+    let ctx = AdaptationContext {
+        bytes_per_us: 100.0,
+        smoothed_rtt_us: 5_000.0,
+        loss_rate: 0.0,
+        suspended: true,
+        last_update_seq: 1,
+    };
+    c.set_adaptation_context(ctx);
+    let tentative = vec![CodecState::Solid];
+    assert_eq!(
+        c.decide_frame_mode(&tentative, FrameMode::TileCodec),
+        FrameMode::H264
+    );
+}
