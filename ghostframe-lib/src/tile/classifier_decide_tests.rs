@@ -382,3 +382,41 @@ fn hysteresis_micros_holds_dwell_across_frame_rate() {
         "frame-rate-independent dwell broken: 60fps switched at {us60}us, 30fps at {us30}us, diff {diff}us"
     );
 }
+
+#[test]
+fn mode_decision_event_emitted_only_on_transition() {
+    use crate::tile::classifier::{AdaptationContext, Classifier};
+    use crate::tile::{CodecState, FrameMode};
+
+    // This is mostly a behavioral / no-panic guard: tracing events are
+    // hard to capture without a subscriber. The functional check is that
+    // last_emitted_mode is correctly debounced.
+
+    let mut c = Classifier::default();
+    let ctx = AdaptationContext {
+        bytes_per_us: 100.0,
+        smoothed_rtt_us: 5_000.0,
+        loss_rate: 0.0,
+        suspended: false,
+        last_update_seq: 1,
+    };
+    c.set_adaptation_context(ctx);
+    let tentative = vec![CodecState::Solid];
+
+    // First call from default state: emits initial decision.
+    let m1 = c.decide_frame_mode_at(1_000, &tentative, FrameMode::TileCodec);
+    assert_eq!(c.last_emitted_mode(), Some(m1));
+
+    // Same conditions: no transition, no new emission, last stays the same.
+    let m2 = c.decide_frame_mode_at(2_000, &tentative, m1);
+    assert_eq!(m1, m2);
+    assert_eq!(c.last_emitted_mode(), Some(m2));
+
+    // Now force a transition via suspension override.
+    let mut ctx2 = ctx;
+    ctx2.suspended = true;
+    c.set_adaptation_context(ctx2);
+    let m3 = c.decide_frame_mode_at(3_000, &tentative, m2);
+    assert_eq!(m3, FrameMode::H264);
+    assert_eq!(c.last_emitted_mode(), Some(FrameMode::H264));
+}

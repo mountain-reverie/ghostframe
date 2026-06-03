@@ -300,6 +300,9 @@ pub struct Classifier {
     state: ClassifierHysteresis,
     adaptation_context: AdaptationContext,
     refinement_deficit_tiles: u32,
+    /// Last emitted mode (debounces the `mode.decision` event to fire
+    /// only on transitions). `None` before the first decision.
+    last_emitted_mode: Option<FrameMode>,
     /// Reference instant used by `decide_frame_mode` to convert
     /// monotonic time into µs for `decide_frame_mode_at`. Set in
     /// `Default` to `Instant::now()` at Classifier construction.
@@ -320,6 +323,7 @@ impl Default for Classifier {
             state: ClassifierHysteresis::default(),
             adaptation_context: AdaptationContext::default(),
             refinement_deficit_tiles: 0,
+            last_emitted_mode: None,
             epoch: std::time::Instant::now(),
         }
     }
@@ -389,6 +393,42 @@ impl Classifier {
         tentative_states: &[CodecState],
         prev_mode: FrameMode,
     ) -> FrameMode {
+        let (next_mode, reason) = self.decide_inner(now_us, tentative_states, prev_mode);
+        if self.last_emitted_mode != Some(next_mode) {
+            let ctx = self.adaptation_context;
+            tracing::info!(
+                event = "mode.decision",
+                from = ?prev_mode,
+                to = ?next_mode,
+                reason = reason,
+                bytes_per_us = ctx.bytes_per_us,
+                smoothed_rtt_us = ctx.smoothed_rtt_us,
+                loss_rate = ctx.loss_rate,
+                suspended = ctx.suspended,
+                refinement_deficit_tiles = self.refinement_deficit_tiles,
+                "mode decision"
+            );
+            self.last_emitted_mode = Some(next_mode);
+        }
+        next_mode
+    }
+
+    /// Returns the last `FrameMode` for which a `mode.decision` event
+    /// was emitted, or `None` if no decision has been made yet.
+    pub fn last_emitted_mode(&self) -> Option<FrameMode> {
+        self.last_emitted_mode
+    }
+
+    /// Pure decision logic returning `(mode, reason)`. Each branch
+    /// returns a static `&'static str` naming the cause:
+    /// "headroom_guard", "loss_override", "suspension", "cost_comparison",
+    /// or "hysteresis_clamp".
+    fn decide_inner(
+        &mut self,
+        now_us: u64,
+        tentative_states: &[CodecState],
+        prev_mode: FrameMode,
+    ) -> (FrameMode, &'static str) {
         // Hard overrides: bypass hysteresis entirely. This is the user-
         // visible "the link can't support tile-codec emission" signal —
         // dwell would just delay an inevitable degradation. Same applies
@@ -398,11 +438,19 @@ impl Classifier {
         let ctx = self.adaptation_context;
         let headroom_force_h264 =
             ctx.bytes_per_us > 0.0 && ctx.bytes_per_us < HEADROOM_MIN_BYTES_PER_US;
-        let loss_force_h264 = ctx.loss_rate > LOSS_OVERRIDE_THRESHOLD;
-        let suspension_force_h264 = ctx.suspended;
-        if headroom_force_h264 || loss_force_h264 || suspension_force_h264 {
+        if headroom_force_h264 {
             self.state = ClassifierHysteresis::default();
-            return FrameMode::H264;
+            return (FrameMode::H264, "headroom_guard");
+        }
+        let loss_force_h264 = ctx.loss_rate > LOSS_OVERRIDE_THRESHOLD;
+        if loss_force_h264 {
+            self.state = ClassifierHysteresis::default();
+            return (FrameMode::H264, "loss_override");
+        }
+        let suspension_force_h264 = ctx.suspended;
+        if suspension_force_h264 {
+            self.state = ClassifierHysteresis::default();
+            return (FrameMode::H264, "suspension");
         }
 
         // Cost path. H264-classified tiles are excluded from the per-tile µs
@@ -449,12 +497,12 @@ impl Classifier {
                     self.state.exit_started_us = None;
                     if now_us.saturating_sub(*started) >= self.enter_sustain_micros {
                         self.state.enter_started_us = None;
-                        return FrameMode::H264;
+                        return (FrameMode::H264, "cost_comparison");
                     }
                 } else {
                     self.state.enter_started_us = None;
                 }
-                FrameMode::TileCodec
+                (FrameMode::TileCodec, "hysteresis_clamp")
             }
             FrameMode::H264 => {
                 if exit_now {
@@ -462,12 +510,12 @@ impl Classifier {
                     self.state.enter_started_us = None;
                     if now_us.saturating_sub(*started) >= self.exit_sustain_micros {
                         self.state.exit_started_us = None;
-                        return FrameMode::TileCodec;
+                        return (FrameMode::TileCodec, "cost_comparison");
                     }
                 } else {
                     self.state.exit_started_us = None;
                 }
-                FrameMode::H264
+                (FrameMode::H264, "hysteresis_clamp")
             }
         }
     }
