@@ -13,3 +13,6 @@ pub mod webtransport;
 
 #[cfg(any(test, feature = "test-loss-injection"))]
 pub mod loss_injection;
+
+#[cfg(any(test, feature = "test-loss-injection"))]
+pub mod bandwidth_cap;
