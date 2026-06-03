@@ -238,3 +238,25 @@ fn refinement_bias_promotes_tilecodec_under_headroom() {
     // Sanity: bias > 0 used.
     assert!(REFINEMENT_BIAS_PER_TILE_US > 0.0);
 }
+
+#[test]
+fn headroom_guard_forces_h264_below_threshold() {
+    use crate::tile::classifier::{
+        AdaptationContext, Classifier, HEADROOM_MIN_BYTES_PER_US,
+    };
+    use crate::tile::{CodecState, FrameMode};
+    let mut c = Classifier::default();
+    // Below threshold: 0.1 B/µs (~ 800 kbps).
+    let ctx = AdaptationContext {
+        bytes_per_us: HEADROOM_MIN_BYTES_PER_US * 0.5,
+        smoothed_rtt_us: 50_000.0,
+        loss_rate: 0.0,
+        suspended: false,
+        last_update_seq: 1,
+    };
+    c.set_adaptation_context(ctx);
+    // Use a "would normally pick TileCodec" workload: 1 Solid tile.
+    let tentative = vec![CodecState::Solid];
+    let mode = c.decide_frame_mode(&tentative, FrameMode::TileCodec);
+    assert_eq!(mode, FrameMode::H264, "headroom guard should override");
+}

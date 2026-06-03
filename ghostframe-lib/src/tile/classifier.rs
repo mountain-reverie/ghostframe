@@ -375,6 +375,20 @@ impl Classifier {
         tentative_states: &[CodecState],
         prev_mode: FrameMode,
     ) -> FrameMode {
+        // Hard overrides: bypass hysteresis entirely. This is the user-
+        // visible "the link can't support tile-codec emission" signal —
+        // dwell would just delay an inevitable degradation. Same applies
+        // to loss-override and suspension-override added in Task 9. We
+        // accept the resulting mode-switch count uptick as the cost of
+        // fast recovery; M3.6c's Table 9 verifies it's not pathological.
+        let ctx = self.adaptation_context;
+        let headroom_force_h264 =
+            ctx.bytes_per_us > 0.0 && ctx.bytes_per_us < HEADROOM_MIN_BYTES_PER_US;
+        if headroom_force_h264 {
+            self.state = ClassifierHysteresis::default();
+            return FrameMode::H264;
+        }
+
         // Cost path. H264-classified tiles are excluded from the per-tile µs
         // sum because `estimated_tile_us(H264)` returns the full-frame VA-API
         // cost (`h264_frame_us`), which can't be summed per-tile coherently —
