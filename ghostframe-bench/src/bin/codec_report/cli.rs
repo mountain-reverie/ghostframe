@@ -29,6 +29,11 @@ pub struct Cli {
     /// If absent, Layer A columns in the report are populated with "N/A".
     #[arg(long, default_value = "target/criterion/m3-codec-side-channel.json")]
     pub reuse_criterion_json: PathBuf,
+
+    /// Run each scene at 3 bandwidth caps (10/30/100 Mbps) instead of
+    /// the single unconstrained default. M3.6c bench mode.
+    #[arg(long, default_value_t = false)]
+    pub bandwidth_matrix: bool,
 }
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
