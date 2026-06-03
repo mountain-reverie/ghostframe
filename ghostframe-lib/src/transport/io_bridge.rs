@@ -209,6 +209,16 @@ pub struct IoBridge {
     fec_enable_threshold: f64,
     /// Loss rate threshold to disable FEC (hysteresis).
     fec_disable_threshold: f64,
+    /// Live signal vector pushed to `classifier.set_adaptation_context()`
+    /// after every `dispatch_feedback_bytes` or `sample_quic_path_stats`.
+    /// M3.6a wires it; M3.6b's policy reads the non-bytes_per_us fields.
+    pub(crate) adaptation_context: crate::tile::classifier::AdaptationContext,
+    /// Sliding window of the last 5 `ReceiverFeedback` reports, used to
+    /// smooth `loss_rate` against single-window jitter.
+    pub(crate) feedback_history: std::collections::VecDeque<crate::transport::feedback::ReceiverFeedback>,
+    /// Last two windows' `suspension_detected` flag, OR'd into
+    /// `adaptation_context.suspended` to debounce single-window flaps.
+    pub(crate) recent_suspension_flags: [bool; 2],
     /// Server-side env flag: `GHOSTFRAME_ENABLE_CDF53`.
     /// When false (default), `gate_codec_state` downgrades Cdf53 → Bc1 (Raw on
     /// wire), preserving M3.2 behavior. Set to true by the operator to enable
@@ -238,16 +248,6 @@ pub struct IoBridge {
     /// message. Each dimension change resets this to N=10. While > 0, every
     /// frame re-emits the dimensions datagram; loss tolerance is 0.05^10 ≈ 1e-13.
     dimensions_retransmits_left: u8,
-    /// Live signal vector pushed to `classifier.set_adaptation_context()`
-    /// after every `dispatch_feedback_bytes` or `sample_quic_path_stats`.
-    /// M3.6a wires it; M3.6b's policy reads the non-bytes_per_us fields.
-    pub(crate) adaptation_context: crate::tile::classifier::AdaptationContext,
-    /// Sliding window of the last 5 `ReceiverFeedback` reports, used to
-    /// smooth `loss_rate` against single-window jitter.
-    pub(crate) feedback_history: std::collections::VecDeque<crate::transport::feedback::ReceiverFeedback>,
-    /// Last two windows' `suspension_detected` flag, OR'd into
-    /// `adaptation_context.suspended` to debounce single-window flaps.
-    pub(crate) recent_suspension_flags: [bool; 2],
 }
 
 /// Per-frame inputs passed into `dispatch_dirty_tiles_via_scheduler`.
@@ -500,6 +500,9 @@ impl IoBridge {
                 .unwrap_or(0),
             fec_enable_threshold: FEC_ENABLE_THRESHOLD,
             fec_disable_threshold: FEC_DISABLE_THRESHOLD,
+            adaptation_context: crate::tile::classifier::AdaptationContext::default(),
+            feedback_history: std::collections::VecDeque::with_capacity(5),
+            recent_suspension_flags: [false, false],
             cdf53_escalation_candidates_this_frame: Vec::new(),
             cdf53_enabled,
             gpu_frame_processor,
@@ -510,9 +513,6 @@ impl IoBridge {
             ),
             last_emitted_dimensions: None,
             dimensions_retransmits_left: 0,
-            adaptation_context: crate::tile::classifier::AdaptationContext::default(),
-            feedback_history: std::collections::VecDeque::with_capacity(5),
-            recent_suspension_flags: [false, false],
         })
     }
 
@@ -2594,6 +2594,9 @@ impl IoBridge {
             fec_k: 0,
             fec_enable_threshold: FEC_ENABLE_THRESHOLD,
             fec_disable_threshold: FEC_DISABLE_THRESHOLD,
+            adaptation_context: crate::tile::classifier::AdaptationContext::default(),
+            feedback_history: std::collections::VecDeque::with_capacity(5),
+            recent_suspension_flags: [false, false],
             cdf53_escalation_candidates_this_frame: Vec::new(),
             cdf53_enabled: false,
             gpu_frame_processor: None,
@@ -2604,9 +2607,6 @@ impl IoBridge {
             ),
             last_emitted_dimensions: None,
             dimensions_retransmits_left: 0,
-            adaptation_context: crate::tile::classifier::AdaptationContext::default(),
-            feedback_history: std::collections::VecDeque::with_capacity(5),
-            recent_suspension_flags: [false, false],
         }
     }
 
@@ -2650,6 +2650,9 @@ impl IoBridge {
             fec_k: 0,
             fec_enable_threshold: FEC_ENABLE_THRESHOLD,
             fec_disable_threshold: FEC_DISABLE_THRESHOLD,
+            adaptation_context: crate::tile::classifier::AdaptationContext::default(),
+            feedback_history: std::collections::VecDeque::with_capacity(5),
+            recent_suspension_flags: [false, false],
             cdf53_escalation_candidates_this_frame: Vec::new(),
             cdf53_enabled: false,
             gpu_frame_processor: None,
@@ -2660,9 +2663,6 @@ impl IoBridge {
             ),
             last_emitted_dimensions: None,
             dimensions_retransmits_left: 0,
-            adaptation_context: crate::tile::classifier::AdaptationContext::default(),
-            feedback_history: std::collections::VecDeque::with_capacity(5),
-            recent_suspension_flags: [false, false],
         }
     }
 
@@ -2923,6 +2923,7 @@ mod tests {
         fb.encode(&mut buf);
         bridge.dispatch_feedback_bytes(&buf);
         assert!(bridge.adaptation_context.last_update_seq > initial_seq);
+        // Single feedback in history: 200 / (800 + 200) = 0.20 — well above 0.
         assert!(bridge.adaptation_context.loss_rate > 0.0);
         assert!(bridge.adaptation_context.suspended);
     }
