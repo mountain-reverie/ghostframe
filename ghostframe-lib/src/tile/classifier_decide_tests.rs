@@ -10,19 +10,30 @@ fn solid_states(n: u32) -> Vec<CodecState> {
     vec![CodecState::Solid; n as usize]
 }
 
+/// Compute the frame index (0-based) at which a wall-clock dwell of `dwell_us`
+/// first elapses when frames arrive at `frame_interval_us` apart and the timer
+/// starts at frame 0 (t=0). The switch fires when `frame_idx * frame_interval_us
+/// >= dwell_us`, i.e. `ceil(dwell_us / frame_interval_us)`.
+fn switch_frame(dwell_us: u64, frame_interval_us: u64) -> u32 {
+    ((dwell_us + frame_interval_us - 1) / frame_interval_us) as u32
+}
+
 #[test]
 fn enters_h264_after_sustain_frames_via_motion_fastpath() {
     let mut c = Classifier::default();
     let states = h264_states(20); // 20 dirty tiles, all H264 → 100% > 20%, ≥ 8 absolute
-    for _ in 0..(c.enter_sustain_frames - 1) {
+    // enter_sustain_micros = 50_000 µs ≈ 3 frames at 60 fps (16_667 µs/frame).
+    // Frames 0..switch_frame-1 must return TileCodec; frame switch_frame returns H264.
+    let sw = switch_frame(c.enter_sustain_micros, 16_667); // 3
+    for frame in 0..sw {
         assert_eq!(
-            c.decide_frame_mode(&states, FrameMode::TileCodec),
+            c.decide_frame_mode_at((frame as u64) * 16_667, &states, FrameMode::TileCodec),
             FrameMode::TileCodec,
-            "should not enter before sustain elapsed",
+            "should not enter before sustain elapsed (frame {frame})",
         );
     }
     assert_eq!(
-        c.decide_frame_mode(&states, FrameMode::TileCodec),
+        c.decide_frame_mode_at((sw as u64) * 16_667, &states, FrameMode::TileCodec),
         FrameMode::H264
     );
 }
@@ -31,9 +42,10 @@ fn enters_h264_after_sustain_frames_via_motion_fastpath() {
 fn motion_fastpath_blocked_by_min_absolute_floor() {
     let mut c = Classifier::default();
     let states = h264_states(2); // only 2 H264 tiles — 100% but below floor of 8
-    for _ in 0..10 {
+    // Time can advance freely; floor means enter_now is always false → no switch.
+    for frame in 0..10u32 {
         assert_eq!(
-            c.decide_frame_mode(&states, FrameMode::TileCodec),
+            c.decide_frame_mode_at((frame as u64) * 16_667, &states, FrameMode::TileCodec),
             FrameMode::TileCodec,
             "min-absolute floor must prevent fast-path on tiny dirty sets",
         );
@@ -45,15 +57,21 @@ fn enter_streak_resets_on_quiet_frame() {
     let mut c = Classifier::default();
     let busy = h264_states(20);
     let quiet = solid_states(1);
-    // Build streak almost to threshold...
-    for _ in 0..(c.enter_sustain_frames - 1) {
-        c.decide_frame_mode(&busy, FrameMode::TileCodec);
+    // Build dwell to just before the switch point (sw-1 frames at 60 fps < dwell threshold).
+    // enter_sustain_micros = 50_000; switch_frame = 3.
+    let sw = switch_frame(c.enter_sustain_micros, 16_667); // 3
+    let mut t = 0u64;
+    for _ in 0..(sw - 1) {
+        c.decide_frame_mode_at(t, &busy, FrameMode::TileCodec);
+        t += 16_667;
     }
-    // ...then a quiet frame resets it.
-    c.decide_frame_mode(&quiet, FrameMode::TileCodec);
-    // First busy frame after reset should NOT promote us yet.
+    // A quiet frame resets the enter timer (enter_started_us becomes None).
+    c.decide_frame_mode_at(t, &quiet, FrameMode::TileCodec);
+    t += 16_667;
+    // First busy frame after reset: enter timer restarted at this t.
+    // now_us - started_us = 0 (same frame) < dwell → must still be TileCodec.
     assert_eq!(
-        c.decide_frame_mode(&busy, FrameMode::TileCodec),
+        c.decide_frame_mode_at(t, &busy, FrameMode::TileCodec),
         FrameMode::TileCodec
     );
 }
@@ -62,14 +80,17 @@ fn enter_streak_resets_on_quiet_frame() {
 fn exits_h264_after_sustain_frames_when_costs_drop() {
     let mut c = Classifier::default();
     let cheap = solid_states(2); // tile-codec cost trivial → < h264 * 0.6
-    for _ in 0..(c.exit_sustain_frames - 1) {
+    // exit_sustain_micros = 500_000 µs; switch_frame at 60 fps = ceil(500_000/16_667) = 30.
+    let sw = switch_frame(c.exit_sustain_micros, 16_667); // 30
+    for frame in 0..sw {
         assert_eq!(
-            c.decide_frame_mode(&cheap, FrameMode::H264),
-            FrameMode::H264
+            c.decide_frame_mode_at((frame as u64) * 16_667, &cheap, FrameMode::H264),
+            FrameMode::H264,
+            "should not exit before sustain elapsed (frame {frame})",
         );
     }
     assert_eq!(
-        c.decide_frame_mode(&cheap, FrameMode::H264),
+        c.decide_frame_mode_at((sw as u64) * 16_667, &cheap, FrameMode::H264),
         FrameMode::TileCodec
     );
 }
@@ -80,9 +101,10 @@ fn deadband_keeps_h264_mode_between_thresholds() {
     // Inflate exit_factor to make all our tile-codec costs land in the deadband.
     c.exit_factor = 0.0001;
     let states = h264_states(4); // some cost, but exit_factor makes exit unreachable
-    for _ in 0..50 {
+    // time can advance freely; exit_now is always false → stays H264.
+    for frame in 0..50u32 {
         assert_eq!(
-            c.decide_frame_mode(&states, FrameMode::H264),
+            c.decide_frame_mode_at((frame as u64) * 16_667, &states, FrameMode::H264),
             FrameMode::H264
         );
     }
@@ -90,7 +112,7 @@ fn deadband_keeps_h264_mode_between_thresholds() {
 
 #[test]
 fn enters_h264_after_sustain_frames_via_cost_path_only() {
-    // 200 Cdf53 tiles: cost = 200*50 µs + 200*1300 B/12.5 B/µs = 30_800 µs.
+    // 200 Cdf53 tiles: cost = 200*90 µs + 200*1300 B/12.5 B/µs = 18_000 + 20_800 = 38_800 µs.
     // > h264_cost (3960) × enter_factor (1.3) = 5148 → cost_enter = true.
     // h264_tile_count = 0 < motion_tile_min_absolute (8) → motion_enter = false.
     // This is the cost-only enter path — exercises a code branch the other
@@ -103,15 +125,17 @@ fn enters_h264_after_sustain_frames_via_cost_path_only() {
         };
         200
     ];
-    for _ in 0..(c.enter_sustain_frames - 1) {
+    // enter_sustain_micros = 50_000 µs; switch_frame at 60 fps = 3.
+    let sw = switch_frame(c.enter_sustain_micros, 16_667); // 3
+    for frame in 0..sw {
         assert_eq!(
-            c.decide_frame_mode(&states, FrameMode::TileCodec),
+            c.decide_frame_mode_at((frame as u64) * 16_667, &states, FrameMode::TileCodec),
             FrameMode::TileCodec,
-            "should not enter before sustain elapsed",
+            "should not enter before sustain elapsed (frame {frame})",
         );
     }
     assert_eq!(
-        c.decide_frame_mode(&states, FrameMode::TileCodec),
+        c.decide_frame_mode_at((sw as u64) * 16_667, &states, FrameMode::TileCodec),
         FrameMode::H264
     );
 }
@@ -120,25 +144,32 @@ fn enters_h264_after_sustain_frames_via_cost_path_only() {
 fn empty_tentative_in_h264_drives_exit_streak_to_completion() {
     let mut c = Classifier::default();
     // Pre-establish H264 mode by feeding enough enter-triggering frames.
+    // enter_sustain_micros = 50_000 µs; switch_frame at 60 fps = 3.
     let busy = h264_states(20);
-    for _ in 0..c.enter_sustain_frames {
-        c.decide_frame_mode(&busy, FrameMode::TileCodec);
+    let enter_sw = switch_frame(c.enter_sustain_micros, 16_667); // 3
+    let mut t = 0u64;
+    for _ in 0..=enter_sw {
+        c.decide_frame_mode_at(t, &busy, FrameMode::TileCodec);
+        t += 16_667;
     }
-    // Now classifier is "in" H264 — caller would have set self.frame_mode = H264.
+    // Now classifier has seen H264 mode — caller would have set self.frame_mode = H264.
 
     // Simulate frames with no dirty tiles (static content).
+    // exit_sustain_micros = 500_000 µs; switch_frame at 60 fps = 30.
     let empty: Vec<CodecState> = Vec::new();
-    for _ in 0..(c.exit_sustain_frames - 1) {
+    let exit_sw = switch_frame(c.exit_sustain_micros, 16_667); // 30
+    let exit_t0 = t;
+    for frame in 0..exit_sw {
         assert_eq!(
-            c.decide_frame_mode(&empty, FrameMode::H264),
+            c.decide_frame_mode_at(exit_t0 + (frame as u64) * 16_667, &empty, FrameMode::H264),
             FrameMode::H264,
-            "should not exit before sustain elapsed",
+            "should not exit before sustain elapsed (frame {frame})",
         );
     }
     assert_eq!(
-        c.decide_frame_mode(&empty, FrameMode::H264),
+        c.decide_frame_mode_at(exit_t0 + (exit_sw as u64) * 16_667, &empty, FrameMode::H264),
         FrameMode::TileCodec,
-        "empty dirty tiles for exit_sustain frames must flip H264 → TileCodec",
+        "empty dirty tiles for exit_sustain_micros must flip H264 → TileCodec",
     );
 }
 
@@ -147,23 +178,26 @@ fn motion_fastpath_at_min_absolute_boundary() {
     // n=7 (just below floor=8): must NOT trip even at 100% motion fraction.
     let mut c = Classifier::default();
     let n7 = h264_states(7);
-    for _ in 0..10 {
+    for frame in 0..10u32 {
         assert_eq!(
-            c.decide_frame_mode(&n7, FrameMode::TileCodec),
+            c.decide_frame_mode_at((frame as u64) * 16_667, &n7, FrameMode::TileCodec),
             FrameMode::TileCodec
         );
     }
     // n=8 (at floor): must trip after sustain.
+    // enter_sustain_micros = 50_000 µs; switch_frame at 60 fps = 3.
     let mut c = Classifier::default();
     let n8 = h264_states(8);
-    for _ in 0..(c.enter_sustain_frames - 1) {
+    let sw = switch_frame(c.enter_sustain_micros, 16_667); // 3
+    for frame in 0..sw {
         assert_eq!(
-            c.decide_frame_mode(&n8, FrameMode::TileCodec),
-            FrameMode::TileCodec
+            c.decide_frame_mode_at((frame as u64) * 16_667, &n8, FrameMode::TileCodec),
+            FrameMode::TileCodec,
+            "should not enter before sustain elapsed (frame {frame})",
         );
     }
     assert_eq!(
-        c.decide_frame_mode(&n8, FrameMode::TileCodec),
+        c.decide_frame_mode_at((sw as u64) * 16_667, &n8, FrameMode::TileCodec),
         FrameMode::H264
     );
 }
@@ -172,9 +206,9 @@ fn motion_fastpath_at_min_absolute_boundary() {
 fn empty_tentative_in_tilecodec_stays_tilecodec() {
     let mut c = Classifier::default();
     let empty: Vec<CodecState> = Vec::new();
-    for _ in 0..100 {
+    for frame in 0..100u32 {
         assert_eq!(
-            c.decide_frame_mode(&empty, FrameMode::TileCodec),
+            c.decide_frame_mode_at((frame as u64) * 16_667, &empty, FrameMode::TileCodec),
             FrameMode::TileCodec,
             "no input should never trigger H264 entry",
         );
@@ -210,24 +244,28 @@ fn refinement_bias_promotes_tilecodec_under_headroom() {
         })
         .collect();
 
-    // With bias: even after enter_sustain_frames calls, cost_enter is false
+    // With bias: even well past enter_sustain_micros, cost_enter is false
     // (tile_codec_cost ≤ h264_cost_biased * enter_factor), so TileCodec is held.
+    // Drive 10 frames (≈ 166_670 µs >> 50_000 µs dwell) to ensure no switch occurs.
     let mut c = Classifier::default();
     c.set_adaptation_context(ctx);
     c.set_refinement_deficit_tiles(40);
     let mut mode = FrameMode::TileCodec;
-    for _ in 0..c.enter_sustain_frames {
-        mode = c.decide_frame_mode(&tentative, mode);
+    for frame in 0..10u32 {
+        mode = c.decide_frame_mode_at((frame as u64) * 16_667, &tentative, mode);
     }
     assert_eq!(mode, FrameMode::TileCodec, "bias should hold TileCodec");
 
     // Without bias: tile_codec_cost > h264_cost * enter_factor → H264 after sustain.
+    // enter_sustain_micros = 50_000 µs; switch_frame at 60 fps = 3.
+    // Drive to frame switch_frame(50_000, 16_667) = 3 to confirm H264.
+    let sw = switch_frame(50_000, 16_667); // 3
     let mut c2 = Classifier::default();
     c2.set_adaptation_context(ctx);
     c2.set_refinement_deficit_tiles(0);
     let mut mode2 = FrameMode::TileCodec;
-    for _ in 0..c2.enter_sustain_frames {
-        mode2 = c2.decide_frame_mode(&tentative, mode2);
+    for frame in 0..=sw {
+        mode2 = c2.decide_frame_mode_at((frame as u64) * 16_667, &tentative, mode2);
     }
     assert_eq!(
         mode2,
@@ -298,5 +336,49 @@ fn suspension_override_forces_h264() {
     assert_eq!(
         c.decide_frame_mode(&tentative, FrameMode::TileCodec),
         FrameMode::H264
+    );
+}
+
+#[test]
+fn hysteresis_micros_holds_dwell_across_frame_rate() {
+    use crate::tile::classifier::Classifier;
+    use crate::tile::{CodecState, FrameMode};
+    // Construct a "force enter H264" workload: many tiles at high
+    // Cdf53 cost. Reuses the Task 7 calibration: 40 tiles at the default
+    // bandwidth pushes tile_codec_cost above enter_factor * h264_cost.
+    let make_tentative = || -> Vec<CodecState> {
+        let max_passes = crate::encoder::cdf53::CDF53_PASS_COUNT as u8;
+        (0..40).map(|_| CodecState::Cdf53 { passes_sent: 0, max_passes }).collect()
+    };
+
+    let mut c60 = Classifier::default();
+    let mut switch_at_60 = None;
+    for frame in 0..1000u32 {
+        let now_us = (frame as u64) * 16_667; // 60 fps
+        let mode = c60.decide_frame_mode_at(now_us, &make_tentative(), FrameMode::TileCodec);
+        if mode == FrameMode::H264 {
+            switch_at_60 = Some(now_us);
+            break;
+        }
+    }
+
+    let mut c30 = Classifier::default();
+    let mut switch_at_30 = None;
+    for frame in 0..1000u32 {
+        let now_us = (frame as u64) * 33_333; // 30 fps
+        let mode = c30.decide_frame_mode_at(now_us, &make_tentative(), FrameMode::TileCodec);
+        if mode == FrameMode::H264 {
+            switch_at_30 = Some(now_us);
+            break;
+        }
+    }
+
+    let us60 = switch_at_60.expect("60fps must eventually switch");
+    let us30 = switch_at_30.expect("30fps must eventually switch");
+    let diff = if us60 > us30 { us60 - us30 } else { us30 - us60 };
+    // Wall-clock dwell at 60fps and 30fps should match within one 30-fps frame.
+    assert!(
+        diff <= 33_333,
+        "frame-rate-independent dwell broken: 60fps switched at {us60}us, 30fps at {us30}us, diff {diff}us"
     );
 }

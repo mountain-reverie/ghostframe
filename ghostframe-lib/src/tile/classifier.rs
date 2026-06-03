@@ -272,13 +272,15 @@ pub const HEADROOM_MIN_BYTES_PER_US: f32 = 0.25;
 /// better. Retuned in M3.6c.
 pub const LOSS_OVERRIDE_THRESHOLD: f32 = 0.10;
 
-/// Hysteresis state for `Classifier::decide_frame_mode`.
+/// Hysteresis state for `Classifier::decide_frame_mode_at`.
 #[derive(Debug, Clone, Copy, Default)]
 struct ClassifierHysteresis {
-    /// Frames in a row the enter condition has held (cost OR motion fast-path).
-    enter_streak: u32,
-    /// Frames in a row the exit condition has held (cost-only).
-    exit_streak: u32,
+    /// Wall-clock µs at which the enter condition first started holding,
+    /// or `None` if it isn't holding now.
+    enter_started_us: Option<u64>,
+    /// Wall-clock µs at which the exit condition first started holding,
+    /// or `None` if it isn't holding now.
+    exit_started_us: Option<u64>,
 }
 
 /// Tunable decision parameters; defaults reflect the design doc M3.0 values.
@@ -289,8 +291,12 @@ pub struct Classifier {
     pub exit_factor: f32,              // default 0.6
     pub motion_tile_threshold: f32,    // default 0.20 (fraction of dirty tiles)
     pub motion_tile_min_absolute: u32, // default 8 (absolute floor)
-    pub enter_sustain_frames: u32,     // default 3
-    pub exit_sustain_frames: u32,      // default 30
+    /// Wall-clock µs the enter condition must hold before transitioning
+    /// to H264. Default 50_000 µs (≈ 3 frames at 60 fps).
+    pub enter_sustain_micros: u64,
+    /// Wall-clock µs the exit condition must hold before transitioning
+    /// back to TileCodec. Default 500_000 µs (≈ 30 frames at 60 fps).
+    pub exit_sustain_micros: u64,
     state: ClassifierHysteresis,
     adaptation_context: AdaptationContext,
     refinement_deficit_tiles: u32,
@@ -304,8 +310,8 @@ impl Default for Classifier {
             exit_factor: 0.6,
             motion_tile_threshold: 0.20,
             motion_tile_min_absolute: 8,
-            enter_sustain_frames: 3,
-            exit_sustain_frames: 30,
+            enter_sustain_micros: 50_000,
+            exit_sustain_micros: 500_000,
             state: ClassifierHysteresis::default(),
             adaptation_context: AdaptationContext::default(),
             refinement_deficit_tiles: 0,
@@ -352,13 +358,14 @@ impl Classifier {
     }
 
     /// Apply per-tile rules across all dirty tiles, then decide whole-frame
-    /// mode based on cost + sustained-motion fast-path with hysteresis.
+    /// mode based on cost + sustained-motion fast-path with wall-clock hysteresis.
     ///
-    /// `tentative_states` is the per-dirty-tile output of `classify_tile()`.
-    /// `prev_mode` is what the previous frame emitted.
+    /// `now_us` is the current wall-clock time in microseconds (monotonic or
+    /// system time). `tentative_states` is the per-dirty-tile output of
+    /// `classify_tile()`. `prev_mode` is what the previous frame emitted.
     ///
     /// Empty `tentative_states` is valid — it represents a frame with no dirty
-    /// tiles. In H264 mode, this contributes toward the exit-sustain counter
+    /// tiles. In H264 mode, this contributes toward the exit-sustain timer
     /// (cost is 0, below exit threshold).
     ///
     /// **M3.0 caveat:** `MetricsTracker::record_frame` doesn't populate
@@ -370,8 +377,9 @@ impl Classifier {
     /// Unit tests construct H264 tile states directly to exercise the
     /// fast-path; this stays exercised by tests until M3.1+ wires real
     /// magnitude.
-    pub fn decide_frame_mode(
+    pub fn decide_frame_mode_at(
         &mut self,
+        now_us: u64,
         tentative_states: &[CodecState],
         prev_mode: FrameMode,
     ) -> FrameMode {
@@ -431,31 +439,50 @@ impl Classifier {
         match prev_mode {
             FrameMode::TileCodec => {
                 if enter_now {
-                    self.state.enter_streak = self.state.enter_streak.saturating_add(1);
-                    self.state.exit_streak = 0;
-                    if self.state.enter_streak >= self.enter_sustain_frames {
-                        self.state.enter_streak = 0;
+                    let started = self.state.enter_started_us.get_or_insert(now_us);
+                    self.state.exit_started_us = None;
+                    if now_us.saturating_sub(*started) >= self.enter_sustain_micros {
+                        self.state.enter_started_us = None;
                         return FrameMode::H264;
                     }
                 } else {
-                    self.state.enter_streak = 0;
+                    self.state.enter_started_us = None;
                 }
                 FrameMode::TileCodec
             }
             FrameMode::H264 => {
                 if exit_now {
-                    self.state.exit_streak = self.state.exit_streak.saturating_add(1);
-                    self.state.enter_streak = 0;
-                    if self.state.exit_streak >= self.exit_sustain_frames {
-                        self.state.exit_streak = 0;
+                    let started = self.state.exit_started_us.get_or_insert(now_us);
+                    self.state.enter_started_us = None;
+                    if now_us.saturating_sub(*started) >= self.exit_sustain_micros {
+                        self.state.exit_started_us = None;
                         return FrameMode::TileCodec;
                     }
                 } else {
-                    self.state.exit_streak = 0;
+                    self.state.exit_started_us = None;
                 }
                 FrameMode::H264
             }
         }
+    }
+
+    /// Apply per-tile rules across all dirty tiles, then decide whole-frame
+    /// mode based on cost + sustained-motion fast-path with hysteresis.
+    ///
+    /// This is a thin wrapper around [`decide_frame_mode_at`] that reads the
+    /// current system time. Production code should call this method. Tests
+    /// that need deterministic timing should call `decide_frame_mode_at`
+    /// directly with an explicit `now_us`.
+    pub fn decide_frame_mode(
+        &mut self,
+        tentative_states: &[CodecState],
+        prev_mode: FrameMode,
+    ) -> FrameMode {
+        let now_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0);
+        self.decide_frame_mode_at(now_us, tentative_states, prev_mode)
     }
 }
 
