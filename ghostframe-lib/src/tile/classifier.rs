@@ -397,6 +397,7 @@ impl Classifier {
         if self.last_emitted_mode != Some(next_mode) {
             let ctx = self.adaptation_context;
             tracing::info!(
+                target: "ghostframe::bench",
                 event = "mode.decision",
                 from = ?prev_mode,
                 to = ?next_mode,
