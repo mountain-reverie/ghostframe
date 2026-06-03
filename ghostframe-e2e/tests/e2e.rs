@@ -2101,6 +2101,118 @@ async fn e2e_mode_switch() -> Result<()> {
     Ok(())
 }
 
+/// M3.6b: Sample `__ghostframeStats` for `duration` and return
+/// (final_tile_total, final_frame_total). Used by the override-trigger
+/// e2e tests to confirm the classifier landed in the expected mode.
+async fn sample_mode_dominance(
+    page: &chromiumoxide::Page,
+    duration: Duration,
+) -> Result<(u64, u64)> {
+    let start = tokio::time::Instant::now();
+    let mut last = (0u64, 0u64);
+    while tokio::time::Instant::now() - start < duration {
+        let v: serde_json::Value = page
+            .evaluate(
+                "(() => { const s = window.__ghostframeStats || {tileDatagrams:0, frameDatagrams:0}; return {t: s.tileDatagrams, f: s.frameDatagrams}; })()",
+            )
+            .await?
+            .into_value()?;
+        last = (v["t"].as_u64().unwrap_or(0), v["f"].as_u64().unwrap_or(0));
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    Ok(last)
+}
+
+/// M3.6b: With GHOSTFRAME_TEST_FORCE_BYTES_PER_US=0.1 (below the
+/// HEADROOM_MIN_BYTES_PER_US=0.25 threshold), the classifier's
+/// headroom_guard override must force H264 mode even for content
+/// the M3.5 cost comparison alone would assign to TileCodec.
+///
+/// Uses `--drm-direct --mode-switch-cycle 2` (alternating static/motion)
+/// so the classifier has a mix of content; the headroom_guard override
+/// forces H264 regardless of which half the classifier is currently in.
+#[tokio::test]
+async fn e2e_headroom_guard_forces_h264() -> Result<()> {
+    let setup = setup_e2e_webgpu_gpu_with_env(
+        "--drm-direct --mode-switch-cycle 2",
+        &[
+            ("GHOSTFRAME_ENABLE_CDF53", "1"),
+            ("GHOSTFRAME_TEST_FORCE_BYTES_PER_US", "0.1"),
+        ],
+    )
+    .await?;
+
+    // Wait for QUIC handshake + first sample_all_path_stats tick.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Sample for 5s.
+    let (tile_total, frame_total) = sample_mode_dominance(
+        &setup.page,
+        Duration::from_secs(5),
+    )
+    .await?;
+
+    eprintln!("M3.6b headroom: tile={tile_total} frame={frame_total}");
+
+    // headroom_guard forces H264 ⇒ frame datagrams must be substantial.
+    // Threshold mirrors e2e_mode_switch MIN_FRAME_COUNT_FOR_H264_PHASE=150
+    // scaled to the 5s window vs 3s. We do NOT assert frame > tile: with
+    // cdf53 enabled, refinement tile floods accumulate even while the
+    // classifier is in H264 mode (ratio assertions don't survive the tile
+    // burst from H264→TileCodec handoff invalidations).
+    assert!(
+        frame_total >= 250,
+        "headroom_guard override should drive H264 — \
+         observed frame_total={frame_total} (expected >= 250)"
+    );
+
+    Ok(())
+}
+
+/// M3.6b: With GHOSTFRAME_INBOUND_LOSS_PROBABILITY=0.15 (well above
+/// the LOSS_OVERRIDE_THRESHOLD=0.10), the classifier's loss_override
+/// must force H264 mode. Exercises the full pipeline:
+/// loss injection → ReceiverFeedback.loss_rate → AdaptationContext →
+/// loss_override → H264.
+#[tokio::test]
+async fn e2e_loss_override_forces_h264() -> Result<()> {
+    let setup = setup_e2e_webgpu_gpu_with_env(
+        "--drm-direct --mode-switch-cycle 2",
+        &[
+            ("GHOSTFRAME_ENABLE_CDF53", "1"),
+            ("GHOSTFRAME_INBOUND_LOSS_PROBABILITY", "0.15"),
+            ("GHOSTFRAME_INBOUND_LOSS_SEED", "42"),
+        ],
+    )
+    .await?;
+
+    // ReceiverFeedback is sent every 100ms; give 5-window smoothing
+    // time to settle above the override threshold.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let (tile_total, frame_total) = sample_mode_dominance(
+        &setup.page,
+        Duration::from_secs(5),
+    )
+    .await?;
+
+    eprintln!("M3.6b loss: tile={tile_total} frame={frame_total}");
+
+    // loss_override drives H264 ⇒ frame datagrams must be substantial.
+    // We do NOT assert frame > tile here: with cdf53 enabled, refinement
+    // tile floods accumulate even while the classifier is in H264 mode
+    // (same issue noted in e2e_mode_switch — ratio assertions don't survive
+    // the tile burst from H264→TileCodec handoff invalidations). The
+    // absolute frame count is the reliable signal.
+    assert!(
+        frame_total >= 250,
+        "loss_override should drive H264 — \
+         observed frame_total={frame_total} (expected >= 250)"
+    );
+
+    Ok(())
+}
+
 /// M3.1 Task 19: Server survives sustained 100% ACK drop without retry storm.
 ///
 /// `GHOSTFRAME_INBOUND_LOSS_PROBABILITY=1.0` + predicate `ack` drops every
