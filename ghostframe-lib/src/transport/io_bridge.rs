@@ -238,6 +238,16 @@ pub struct IoBridge {
     /// message. Each dimension change resets this to N=10. While > 0, every
     /// frame re-emits the dimensions datagram; loss tolerance is 0.05^10 ≈ 1e-13.
     dimensions_retransmits_left: u8,
+    /// Live signal vector pushed to `classifier.set_adaptation_context()`
+    /// after every `dispatch_feedback_bytes` or `sample_quic_path_stats`.
+    /// M3.6a wires it; M3.6b's policy reads the non-bytes_per_us fields.
+    pub(crate) adaptation_context: crate::tile::classifier::AdaptationContext,
+    /// Sliding window of the last 5 `ReceiverFeedback` reports, used to
+    /// smooth `loss_rate` against single-window jitter.
+    pub(crate) feedback_history: std::collections::VecDeque<crate::transport::feedback::ReceiverFeedback>,
+    /// Last two windows' `suspension_detected` flag, OR'd into
+    /// `adaptation_context.suspended` to debounce single-window flaps.
+    pub(crate) recent_suspension_flags: [bool; 2],
 }
 
 /// Per-frame inputs passed into `dispatch_dirty_tiles_via_scheduler`.
@@ -500,6 +510,9 @@ impl IoBridge {
             ),
             last_emitted_dimensions: None,
             dimensions_retransmits_left: 0,
+            adaptation_context: crate::tile::classifier::AdaptationContext::default(),
+            feedback_history: std::collections::VecDeque::with_capacity(5),
+            recent_suspension_flags: [false, false],
         })
     }
 
@@ -984,6 +997,7 @@ impl IoBridge {
                             "receiver feedback"
                         );
                         self.update_fec_from_feedback(&fb);
+                        self.ingest_feedback_for_adaptation(fb);
                     }
                     offset += FEEDBACK_SIZE;
                 }
@@ -2590,6 +2604,9 @@ impl IoBridge {
             ),
             last_emitted_dimensions: None,
             dimensions_retransmits_left: 0,
+            adaptation_context: crate::tile::classifier::AdaptationContext::default(),
+            feedback_history: std::collections::VecDeque::with_capacity(5),
+            recent_suspension_flags: [false, false],
         }
     }
 
@@ -2643,6 +2660,9 @@ impl IoBridge {
             ),
             last_emitted_dimensions: None,
             dimensions_retransmits_left: 0,
+            adaptation_context: crate::tile::classifier::AdaptationContext::default(),
+            feedback_history: std::collections::VecDeque::with_capacity(5),
+            recent_suspension_flags: [false, false],
         }
     }
 
@@ -2672,6 +2692,26 @@ impl IoBridge {
             self.fec_k = 0;
             tracing::info!(loss_rate = %format!("{:.2}%", loss * 100.0), "FEC disabled");
         }
+    }
+
+    /// Append `fb` to `feedback_history` (capped at 5), update suspension
+    /// debounce, recompute `adaptation_context.loss_rate` + `.suspended`,
+    /// then push the new context to the classifier. Called from
+    /// `dispatch_feedback_bytes`. Bumps `last_update_seq`.
+    fn ingest_feedback_for_adaptation(&mut self, fb: crate::transport::feedback::ReceiverFeedback) {
+        if self.feedback_history.len() >= 5 {
+            self.feedback_history.pop_front();
+        }
+        let suspended = fb.suspension_detected;
+        self.feedback_history.push_back(fb);
+        self.recent_suspension_flags = [self.recent_suspension_flags[1], suspended];
+        self.adaptation_context.loss_rate =
+            crate::transport::feedback::ReceiverFeedback::smoothed_loss_rate(&self.feedback_history);
+        self.adaptation_context.suspended =
+            self.recent_suspension_flags[0] || self.recent_suspension_flags[1];
+        self.adaptation_context.last_update_seq =
+            self.adaptation_context.last_update_seq.wrapping_add(1);
+        self.classifier.set_adaptation_context(self.adaptation_context);
     }
 }
 
@@ -2863,6 +2903,28 @@ mod tests {
         };
         bridge.update_fec_from_feedback(&fb_low);
         assert_eq!(bridge.fec_k, 0, "FEC should be disabled at 0.1% loss");
+    }
+
+    #[tokio::test]
+    async fn dispatch_feedback_updates_adaptation_context() {
+        let (our_end, _peer) = UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("server");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+        let initial_seq = bridge.adaptation_context.last_update_seq;
+        let fb = crate::transport::feedback::ReceiverFeedback {
+            timestamp_ns: 1_000_000,
+            datagrams_received: 800,
+            datagrams_lost: 200,
+            datagrams_recovered_fec: 0,
+            suspension_detected: true,
+        };
+        let mut buf = Vec::new();
+        fb.encode(&mut buf);
+        bridge.dispatch_feedback_bytes(&buf);
+        assert!(bridge.adaptation_context.last_update_seq > initial_seq);
+        assert!(bridge.adaptation_context.loss_rate > 0.0);
+        assert!(bridge.adaptation_context.suspended);
     }
 
     #[tokio::test]
