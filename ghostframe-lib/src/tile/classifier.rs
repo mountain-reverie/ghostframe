@@ -106,6 +106,29 @@ impl CostModel {
     }
 }
 
+/// Live signal vector consumed by `Classifier::decide_frame_mode`.
+///
+/// Populated by `IoBridge` from `ReceiverFeedback` + QUIC `path_stats`. All
+/// fields default to "no information" (`Default` = zeros / `false`). Defaults
+/// keep the M3.5-equivalent behavior when no context has been pushed yet.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AdaptationContext {
+    /// Smoothed throughput estimate, bytes per µs. Sourced from
+    /// `min(cwnd/rtt, recent_emit_bytes/window)`. `0.0` means "no estimate
+    /// yet" — `Classifier` falls back to its prior `bytes_per_us`.
+    pub bytes_per_us: f32,
+    /// Smoothed one-way RTT, µs. Sourced from QUIC `path_stats.rtt`.
+    pub smoothed_rtt_us: f32,
+    /// Smoothed datagram loss rate over the last 5 `ReceiverFeedback` windows.
+    pub loss_rate: f32,
+    /// Last `ReceiverFeedback`'s suspension flag, OR'd across the last 2
+    /// windows to debounce single-window flaps.
+    pub suspended: bool,
+    /// Monotonic counter incremented on each `set_adaptation_context` call.
+    /// Tests assert "classifier saw the new value before decision N".
+    pub last_update_seq: u32,
+}
+
 #[cfg(test)]
 #[path = "classifier_cost_tests.rs"]
 mod cost_tests;
@@ -251,6 +274,7 @@ pub struct Classifier {
     pub enter_sustain_frames: u32,     // default 3
     pub exit_sustain_frames: u32,      // default 30
     state: ClassifierHysteresis,
+    adaptation_context: AdaptationContext,
 }
 
 impl Default for Classifier {
@@ -264,6 +288,7 @@ impl Default for Classifier {
             enter_sustain_frames: 3,
             exit_sustain_frames: 30,
             state: ClassifierHysteresis::default(),
+            adaptation_context: AdaptationContext::default(),
         }
     }
 }
@@ -274,6 +299,29 @@ impl Classifier {
     /// streak counters don't influence the decision for the new client).
     pub fn reset(&mut self) {
         self.state = ClassifierHysteresis::default();
+    }
+
+    /// Push a live `AdaptationContext` from the transport layer.
+    ///
+    /// When `ctx.bytes_per_us > 0.0`, that value is mirrored to
+    /// `cost.bytes_per_us` so the existing M3.5 cost comparison
+    /// transparently uses it. Zero / negative `bytes_per_us` is treated as
+    /// "no estimate yet" and leaves the existing `cost.bytes_per_us`
+    /// unchanged.
+    ///
+    /// M3.6a wires every field but `decide_frame_mode` only consumes
+    /// `bytes_per_us`. M3.6b extends the consumer.
+    pub fn set_adaptation_context(&mut self, ctx: AdaptationContext) {
+        self.adaptation_context = ctx;
+        if ctx.bytes_per_us > 0.0 {
+            self.cost.set_bytes_per_us(ctx.bytes_per_us);
+        }
+    }
+
+    /// Snapshot of the most recent `AdaptationContext` pushed via
+    /// `set_adaptation_context`.
+    pub fn adaptation_context(&self) -> AdaptationContext {
+        self.adaptation_context
     }
 
     /// Apply per-tile rules across all dirty tiles, then decide whole-frame
