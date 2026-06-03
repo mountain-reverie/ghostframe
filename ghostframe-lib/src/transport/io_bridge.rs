@@ -180,6 +180,12 @@ pub struct IoBridge {
     /// Cfg-gated inbound-datagram loss injector for e2e tests.
     #[cfg(any(test, feature = "test-loss-injection"))]
     pub(crate) inbound_loss: Option<crate::transport::loss_injection::LossInjector>,
+    /// Cfg-gated outbound bandwidth cap for e2e tests / bench scenes.
+    /// `None` ⇒ no rate limiting (the `GHOSTFRAME_OUTBOUND_BANDWIDTH_CAP`
+    /// env var was unset at construction time). Production code path is
+    /// unaffected.
+    #[cfg(any(test, feature = "test-loss-injection"))]
+    pub(crate) outbound_bandwidth_cap: Option<crate::transport::bandwidth_cap::BandwidthCap>,
     /// Cfg-gated one-shot OOB-PalRle injection coordinate for e2e tests.
     /// When set to `Some((x, y))`, the next PalRle payload encoded for the
     /// matching tile coordinate is replaced with a hand-built bundled payload
@@ -488,6 +494,8 @@ impl IoBridge {
             #[cfg(any(test, feature = "test-loss-injection"))]
             inbound_loss: Self::loss_injector_from_env("INBOUND"),
             #[cfg(any(test, feature = "test-loss-injection"))]
+            outbound_bandwidth_cap: crate::transport::bandwidth_cap::BandwidthCap::from_env(),
+            #[cfg(any(test, feature = "test-loss-injection"))]
             oob_inject_at: Self::oob_injector_from_env(),
             #[cfg(any(test, feature = "test-loss-injection"))]
             skip_palette_session_reset: Self::skip_palette_session_reset_from_env(),
@@ -585,6 +593,12 @@ impl IoBridge {
 
     /// Send a datagram to all connected WebTransport sessions.
     fn send_to_all_sessions(&mut self, dg: &[u8]) {
+        #[cfg(any(test, feature = "test-loss-injection"))]
+        if let Some(cap) = self.outbound_bandwidth_cap.as_mut() {
+            if !cap.try_consume(dg.len()) {
+                return;
+            }
+        }
         #[cfg(any(test, feature = "test-loss-injection"))]
         if let Some(inj) = self.outbound_loss.as_mut() {
             if inj.should_drop(dg) {
@@ -2591,6 +2605,8 @@ impl IoBridge {
             #[cfg(any(test, feature = "test-loss-injection"))]
             inbound_loss: None,
             #[cfg(any(test, feature = "test-loss-injection"))]
+            outbound_bandwidth_cap: None,
+            #[cfg(any(test, feature = "test-loss-injection"))]
             oob_inject_at: None,
             #[cfg(any(test, feature = "test-loss-injection"))]
             skip_palette_session_reset: false,
@@ -2646,6 +2662,8 @@ impl IoBridge {
             outbound_loss: None,
             #[cfg(any(test, feature = "test-loss-injection"))]
             inbound_loss: None,
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            outbound_bandwidth_cap: None,
             #[cfg(any(test, feature = "test-loss-injection"))]
             oob_inject_at: None,
             #[cfg(any(test, feature = "test-loss-injection"))]
