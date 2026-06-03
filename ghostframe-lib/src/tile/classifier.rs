@@ -28,11 +28,38 @@ pub struct CostModel {
 
 impl Default for CostModel {
     fn default() -> Self {
+        // Per-codec µs values retuned from M3.5b bench measurements (see
+        // docs/specs/m3-codec-bench-results.md Section 4). The bench
+        // measures per-tile `encoder.encode()` cost via criterion; the
+        // values below are the median across the 6 content classes,
+        // rounded conservatively:
+        //
+        //   solid_us:    measured 0.015 µs (4-byte memcpy); use 0.05 for
+        //                3× headroom on slow runs
+        //   palrle_us:   measured 3-12 µs across feasible classes
+        //                (gradient/photo/motion return the empty-Vec fast
+        //                path at 0.1 µs because >16 colors); use 8.0 as a
+        //                conservative upper bound covering flat_ui's
+        //                11.7 µs worst case
+        //   cdf53_us:    measured 52-149 µs; use 90.0 as a robust median
+        //                (motion = 79, text = 73, flat_ui = 96, photo =
+        //                149)
+        //   bc1_us:      no measured data (BC1 isn't implemented; per
+        //                the M3.5b BC1-fate verdict the variant is being
+        //                removed). Kept here only until the Codec::Bc1
+        //                removal commit follows.
+        //   h264_frame_us: per-tile-H264 bench (~750 µs) measures the
+        //                dead-code path; the classifier's actual cost is
+        //                full-frame H264, not benched here, so the
+        //                3000 µs placeholder stays until M4 wires the
+        //                §6.5 estimator
+        //   h264_frame_bytes / bytes_per_us: unchanged — same §6.5
+        //                reasoning
         Self {
-            solid_us: 0.5,
-            palrle_us: 5.0,
+            solid_us: 0.05,
+            palrle_us: 8.0,
             bc1_us: 50.0,
-            cdf53_us: 50.0,
+            cdf53_us: 90.0,
             h264_frame_us: 3000.0,
             h264_frame_bytes: 12_000,
             bytes_per_us: 12.5,
