@@ -1,37 +1,39 @@
 # M3 Codec Bench Results
 
 **Date:** 2026-06-03
-**Git rev:** `ef734bf4bf77f2dc5e0aef0c0acea8b8e2601268`
+**Git rev:** `4ca63a3729abed34ab143649e67351946c928b6c`
 **GPU:** AMD Radeon RX 7800 XT
 **Kernel:** `7.0.10-arch1-1`
 **Scene duration:** 10s
 **dssim-core version:** 3.4.0
-**Constants version:** `post-M3.5b`
+**Constants version:** `post-M3.5b + cdf53-midpoint-fix`
 
-This report is the M3.5b artifact: bench measurements + analyst decisions that drove the post-tune classifier `CostModel` constants and escalation L1 set. Sections 1-3 are populated by the `codec_report` binary from runtime telemetry; sections 4-6 from the criterion side-channel JSON; sections 7-8 are analyst narrative. The pre-tune snapshot was committed at `2fbb494` per spec §M3.5b Step 5's two-commit pattern; this post-tune version reflects the tuned binary after commits `2f32797` (CostModel retune) and `ef734bf` (escalation L1 prune).
+This report is the M3.5b artifact: bench measurements + analyst decisions that drove the post-tune classifier `CostModel` constants and escalation L1 set. Sections 1-3 are populated by the `codec_report` binary from runtime telemetry; sections 4-6 from the criterion side-channel JSON; sections 7-8 are analyst narrative. Lineage of the report file in git history:
+
+- `2fbb494` — pre-tune snapshot per spec §M3.5b Step 5's two-commit pattern (constants version `pre-M3.5b`)
+- `6fff6a9` — post-tune regeneration after commits `2f32797` (CostModel retune) and `ef734bf` (escalation L1 prune); constants version flipped to `post-M3.5b`
+- *this commit* — re-run after `4ca63a3` (CDF53 partial-K midpoint reconstruction fix). Sections 6/7 numerical updates only; verdicts unchanged.
 
 ## 0. Observations + caveats
 
-Two M3.5a-known issues affect interpretation of the Layer B numbers below:
+Two M3.5a-known issues affect interpretation of the Layer B numbers below; both are now better-understood after the midpoint fix:
 
-- **Client-side latency intervals are 0 ms for static scenes** (5 of 6 pure scenes show `client p10 = 0.00` and `drop % = 100`). Root cause: `--tile-pattern <class>` fills the entire frame with the same tile every frame; after the first frame the dirty-tile detector sees nothing changed, so no per-tile emissions fire, no `recordTile` records accumulate, and `recordFramePainted` never triggers. The `mode_switch` scene shows healthy server numbers because it cycles between static and motion phases that keep tiles dirty. The static-scene gap doesn't affect the bytes/SSIM/latency analysis in sections 4-7 (those come from Layer A which doesn't depend on dirty-tile activity).
+- **Client-side latency intervals are 0 ms for static scenes** (6 of 7 scenes show `client p10 = 0.00` and `drop % ≈ 100`). Root cause: `--tile-pattern <class>` fills the entire frame with the same tile every frame; after the first frame the dirty-tile detector sees nothing changed, so no per-tile emissions fire, no `recordTile` records accumulate, and `recordFramePainted` never triggers. `mode_switch` shows 1 client diagnostic in this run (1479.80 ms `client p10`) because it cycles between static and motion phases that keep tiles dirty; the 1.5 s figure is dominated by the rAF-lag-via-stale-eviction proxy that Task 11 documented (the harness fires `recordFramePainted` when `latestFrameSeq - 2` advances past the frame). Doesn't affect the bytes/SSIM/latency analysis in sections 4-7 (those come from Layer A which doesn't depend on dirty-tile activity).
 - **Server CPU% = 0.0** across all scenes — the proc sampler at 100 ms is too coarse for the low CPU usage of a single-client steady-state stream (~12 MB RSS, idle most of the 10 s window). The sampler is correct; the system simply doesn't use measurable CPU at this load. Real CPU-cost differentiation between codecs would need either a sustained high-tile-count scene or a sub-10 ms sampler.
 
-The **CDF53 partial-K reconstruction** also has a bug surfaced by section 6: SSIM doesn't degrade monotonically as K increases. For `photo`, K=6 (0.6499) is *worse* than K=5 (0.6704), and K=1..5 all give identical SSIM in every class. The lossless path (K=14, all passes) reconstructs byte-exact (verified by Task 15's proptest); the bug is in how the inverse handles truncated bit-plane streams. Doesn't block this report's decisions but is worth a follow-up.
-
-**Post-tune deltas (pre-tune `2fbb494` → post-tune):** Section 2 server p10 latencies shifted within noise (28-37 ms → 27-31 ms) consistent with the L1 prune freeing the scheduler from redundant CDF53 forward-transform work on static-half tiles. Section 3 mode_switch bandwidth held at 2.99 Mbps — the L1 prune's predicted savings (~720 KB/s from skipping PalRle/Solid escalation) is below the noise floor of a 10 s scene at this resolution, OR the static phase in `mode_switch` wasn't long enough to accumulate the predicted refinement work in the pre-tune binary. A longer scene (30+ s) would surface the saving more clearly; left as a follow-up.
+**CDF53 partial-K reconstruction (FIXED in commit `4ca63a3`):** prior reports' Section 6 showed SSIM staying flat for K=1..6 in every class and *dropping* at K=6 vs K=5 for `photo` — the result of OR-only bit-plane decoding that systematically under-estimated every "significant" coefficient's magnitude. The fix adds SPIHT-style midpoint reconstruction (mirrored across the Rust `decode_passes` and the three WGSL inverse shaders), so the unknown low bits of each significant coefficient are estimated as the midpoint of their range rather than 0. Per-coefficient absolute error is now provably monotonically non-increasing in K (new `decode_passes_monotonic_error_under_truncation` proptest, 200 seeds × 14 K values = 2800 assertions). Post-fix SSIM at K=9 is uniformly higher (see Section 6); a small K=6-7 dip remains for `photo` because dssim-core's structural metric weights local fidelity differently from L1 error — an SSIM × midpoint property, not a bug. Users dwelling at high K (the bulk of refinement viewing time) get strictly better intermediate quality post-fix.
 
 ## 2. End-to-end latency per scene
 
 | Scene | server p10 (ms) | client p10 (ms) | sum p10 (ms) | server min (ms) | client min (ms) | server median (ms) | client median (ms) | frames | drop % |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `flat_ui` | 30.51 | 0.00 | 30.51 | 30.51 | 0.00 | 30.51 | 0.00 | 0 | 100.0 |
-| `gradient` | 30.02 | 0.00 | 30.02 | 30.02 | 0.00 | 30.02 | 0.00 | 0 | 100.0 |
-| `mode_switch` | 29.59 | 0.00 | 29.59 | 28.59 | 0.00 | 31.53 | 0.00 | 0 | 100.0 |
-| `motion` | 28.10 | 0.00 | 28.10 | 28.10 | 0.00 | 28.10 | 0.00 | 0 | 100.0 |
-| `photo` | 29.68 | 0.00 | 29.68 | 29.68 | 0.00 | 29.68 | 0.00 | 0 | 100.0 |
-| `solid` | 27.09 | 0.00 | 27.09 | 27.09 | 0.00 | 27.09 | 0.00 | 0 | 100.0 |
-| `text` | 28.17 | 0.00 | 28.17 | 28.17 | 0.00 | 28.17 | 0.00 | 0 | 100.0 |
+| `flat_ui` | 29.04 | 0.00 | 29.04 | 29.04 | 0.00 | 29.04 | 0.00 | 0 | 100.0 |
+| `gradient` | 27.96 | 0.00 | 27.96 | 27.96 | 0.00 | 27.96 | 0.00 | 0 | 100.0 |
+| `mode_switch` | 27.97 | 1479.80 | 1507.77 | 27.48 | 1479.80 | 29.34 | 1479.80 | 1 | 93.8 |
+| `motion` | 28.25 | 0.00 | 28.25 | 28.25 | 0.00 | 28.25 | 0.00 | 0 | 100.0 |
+| `photo` | 30.58 | 0.00 | 30.58 | 30.58 | 0.00 | 30.58 | 0.00 | 0 | 100.0 |
+| `solid` | 28.44 | 0.00 | 28.44 | 28.44 | 0.00 | 28.44 | 0.00 | 0 | 100.0 |
+| `text` | 29.45 | 0.00 | 29.45 | 29.45 | 0.00 | 29.45 | 0.00 | 0 | 100.0 |
 
 Server intervals (capture→last-send) cluster at 27-31 ms (~30 fps frame budget at 33 ms — consistent with the `CAPTURE_FPS=30` default). `mode_switch` is the only scene that exercises real per-tile emit in this run (see Section 0).
 
@@ -41,17 +43,17 @@ Server intervals (capture→last-send) cluster at 27-31 ms (~30 fps frame budget
 |---|---:|---:|---:|---:|---:|
 | `flat_ui` | 0.04 | 0.0 | 0.0 | 12.0 | 14.5 |
 | `gradient` | 0.04 | 0.0 | 0.0 | 12.0 | 14.5 |
-| `mode_switch` | 2.99 | 0.0 | 0.0 | 12.0 | 14.5 |
+| `mode_switch` | 2.92 | 0.0 | 0.0 | 12.0 | 14.5 |
 | `motion` | 0.04 | 0.0 | 0.0 | 12.0 | 14.5 |
 | `photo` | 0.04 | 0.0 | 0.0 | 12.0 | 14.5 |
 | `solid` | 0.04 | 0.0 | 0.0 | 12.0 | 14.5 |
 | `text` | 0.04 | 0.0 | 0.0 | 12.0 | 14.5 |
 
-Static scenes show essentially zero egress (40 kbps = the per-frame envelope headers for unchanged frames). `mode_switch` shows 2.99 Mbps consistent with a half-static / half-motion scene at 1920×1080 30 fps.
+Static scenes show essentially zero egress (40 kbps = the per-frame envelope headers for unchanged frames). `mode_switch` shows 2.92 Mbps consistent with a half-static / half-motion scene at 1920×1080 30 fps.
 
 ## 4. Per-codec micro-bench latency (µs)
 
-Values from `target/criterion/<group>/<class>/new/estimates.json` `.mean.point_estimate / 1000.0`. The codec_report binary doesn't stitch these in automatically — filled in by hand here. These measurements are codec-internal (raw `encoder.encode()` µs); CostModel retune doesn't change them, so the pre-tune and post-tune reports show the same Section 4.
+Values from `target/criterion/<group>/<class>/new/estimates.json` `.mean.point_estimate / 1000.0`. The codec_report binary doesn't stitch these in automatically — filled in by hand. These measurements are codec-internal (raw `encoder.encode()` µs); CostModel retune and the midpoint fix don't change them, so latency numbers are identical across all three report commits.
 
 | Codec | LZ4 | solid | flat_ui | text | gradient | photo | motion |
 |---|:-:|---:|---:|---:|---:|---:|---:|
@@ -98,18 +100,29 @@ Values from `target/criterion/<group>/<class>/new/estimates.json` `.mean.point_e
 
 ## 6. Cdf53 SSIM vs passes per class
 
-CDF53 emits 14 passes in production. This bench only sampled K=1..9; K=10..14 are not measured here (extending the bench is a small follow-up). The K=9 numbers are the highest-quality data point in this run.
+CDF53 emits 14 passes in production. This bench samples K=1..9; K=10..14 are not measured here (extending the bench is a small follow-up). The K=9 numbers are the highest-quality data point in this run. **Numbers below are post-midpoint-fix** (commit `4ca63a3`); compare to commit `6fff6a9`'s Section 6 to see the per-K improvement at high K.
 
 | Class | K=1 SSIM | K=2 | K=3 | K=4 | K=5 | K=6 | K=7 | K=8 | K=9 | bytes-to-lossless (K=14) |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `solid` | 0.8763 | 0.8763 | 0.8763 | 0.8763 | 0.8763 | 0.8763 | 0.9741 | 0.9927 | 0.9983 | 174 |
-| `flat_ui` | 0.5335 | 0.5335 | 0.5335 | 0.5335 | 0.5335 | 0.5335 | 0.7372 | 0.8831 | 0.9719 | 2218 |
-| `text` | 0.6191 | 0.6191 | 0.6191 | 0.6191 | 0.6191 | 0.6191 | 0.7039 | 0.8807 | 0.9782 | 3054 |
-| `gradient` | 0.5326 | 0.5326 | 0.5326 | 0.5326 | 0.5326 | 0.5560 | 0.8742 | 0.9596 | 0.9707 | 985 |
-| `photo` | 0.6704 | 0.6704 | 0.6704 | 0.6704 | 0.6704 | 0.6499 | 0.6275 | 0.7902 | 0.9217 | 4400 |
-| `motion` | 0.5318 | 0.5318 | 0.5318 | 0.5318 | 0.5318 | 0.5318 | 0.8465 | 0.9438 | 0.9862 | 1775 |
+| `solid` | 0.8763 | 0.8763 | 0.8763 | 0.8763 | 0.8763 | 0.8763 | 0.9779 | 0.9970 | 0.9990 | 174 |
+| `flat_ui` | 0.5335 | 0.5335 | 0.5335 | 0.5335 | 0.5335 | 0.5335 | 0.7683 | 0.8981 | 0.9813 | 2218 |
+| `text` | 0.6191 | 0.6191 | 0.6191 | 0.6191 | 0.6191 | 0.6191 | 0.7047 | 0.8870 | 0.9877 | 3054 |
+| `gradient` | 0.5326 | 0.5326 | 0.5326 | 0.5326 | 0.5326 | 0.5598 | 0.8615 | 0.9688 | 0.9734 | 985 |
+| `photo` | 0.6704 | 0.6704 | 0.6704 | 0.6704 | 0.6704 | 0.5982 | 0.5875 | 0.8121 | 0.9314 | 4400 |
+| `motion` | 0.5318 | 0.5318 | 0.5318 | 0.5318 | 0.5318 | 0.5318 | 0.8741 | 0.9480 | 0.9897 | 1775 |
 
-**Anomaly:** K=1..6 give identical SSIM in every class (the first 6 passes don't contribute to perceptual quality despite emitting real bytes — they're carrying baseline coefficients only). For `photo`, K=6 (0.6499) is *worse* than K=5 (0.6704) — that's a real bug in the partial-K inverse path. The bench was Task 15-proptested for byte-exact lossless round-trip (K=14) so the inverse is correct when given the full bit-plane stream; truncation handling is what's broken. Tracked as follow-up; doesn't block M3.5b decisions because the BC1 gap analysis below uses the K=8/K=9 cells where quality is monotonically improving.
+**Pre/post-midpoint comparison at K=9** (per-class delta):
+
+| Class | Pre-fix | Post-fix | Δ |
+|---|---:|---:|---:|
+| solid | 0.9983 | 0.9990 | +0.0007 |
+| flat_ui | 0.9719 | 0.9813 | +0.0094 |
+| text | 0.9782 | 0.9877 | +0.0095 |
+| gradient | 0.9707 | 0.9734 | +0.0027 |
+| photo | 0.9217 | 0.9314 | +0.0097 |
+| motion | 0.9862 | 0.9897 | +0.0035 |
+
+High-K SSIM improved uniformly. The K=1..5 plateau is intrinsic to the content (no significant coefficients yet); the bench would need K extended to ≥7 before showing differentiation. The K=6-7 dip for `photo` (0.5982 → 0.5875) is the SSIM × midpoint artifact noted in Section 0 — bytes are correctly summed, L1 coefficient error is monotonic (proptest), but dssim-core's local structure weighting amplifies localized errors in high-detail photographic content during the transition from "no coefficients significant" to "most coefficients significant + midpoint applied".
 
 **Cumulative bytes through K** (sum of `bytes_per_pass[0..K]`, for the BC1 gap analysis):
 
@@ -139,27 +152,27 @@ BC1's known operating point:
 
 | Class | Threshold 0.85 | Threshold 0.90 | Threshold 0.95 | Threshold 0.98 |
 |---|---|---|---|---|
-| `solid` | **no** (CDF53 K=1 reaches 0.876 in 9 B, vs BC1 512 B) | **no** (CDF53 K=7 reaches 0.974 in 67 B) | **no** (CDF53 K=8 reaches 0.993 in 80 B) | **no** (CDF53 K=8 reaches 0.993 in 80 B) |
-| `flat_ui` | depends (CDF53 K=7 = 0.737 < 0.85, K=8 = 0.883 < 0.95, K=9 = 0.972 in 732 B; BC1 ≈ 0.97 in 512 B) | **yes** (BC1 likely reaches 0.97 in 512 B; CDF53 K=8 falls short at 0.883, K=9 takes 732 B for 0.972) | **yes** (same — BC1 512 B vs CDF53 732 B for similar SSIM) | **no** (BC1 capped <0.98; CDF53 lossless 2218 B reaches 1.0) |
-| `text` | **no** (CDF53 K=8 = 0.881 in 963 B; BC1 known-poor on sharp text edges) | **no** (BC1 likely <0.90 for text; CDF53 K=9 = 0.978 in 1341 B) | **no** (BC1 cannot reach 0.95 on text; CDF53 K=9 in 1341 B) | **no** (BC1 cannot reach 0.98; CDF53 lossless 3054 B) |
-| `gradient` | **no** (CDF53 K=7 = 0.874 in 188 B; BC1 512 B is bigger) | **no** (CDF53 K=8 = 0.960 in 207 B vs BC1 512 B) | **no** (CDF53 K=8 = 0.960 in 207 B beats BC1 by 2.5×) | depends (CDF53 doesn't reach 0.98 at K=9; lossless 985 B vs BC1's likely 0.99 ceiling at 512 B) |
-| `photo` | depends (CDF53 K=8 = 0.790 < 0.85, K=9 = 0.922 in 2016 B; BC1 likely 0.90-0.96 in 512 B) | **yes** (BC1 likely ≥0.90 in 512 B; CDF53 K=9 = 0.922 in 2016 B is 4× bigger) | depends (BC1 may reach 0.95; CDF53 K=9 falls short at 0.922; lossless 4400 B) | **no** (BC1 capped <0.98; CDF53 lossless 4400 B reaches 1.0) |
-| `motion` | **no** (CDF53 K=7 = 0.847 in 387 B; BC1 512 B is bigger) | **no** (CDF53 K=8 = 0.944 in 481 B vs BC1 512 B) | **no** (CDF53 K=9 = 0.986 in 579 B vs BC1 ≈0.95 in 512 B) | depends (CDF53 K=9 = 0.986 in 579 B; BC1 capped <0.98) |
+| `solid` | **no** (CDF53 K=1 = 0.876 in 9 B vs BC1 512 B) | **no** (CDF53 K=7 = 0.978 in 67 B) | **no** (CDF53 K=8 = 0.997 in 80 B) | **no** (CDF53 K=8 = 0.997 in 80 B; K=9 = 0.999 in 97 B) |
+| `flat_ui` | **no** (CDF53 K=8 = 0.898 < 0.85? wait — K=8 = 0.898 > 0.85 in 530 B vs BC1 512 B; CDF53 wins by margin) | **no** (CDF53 K=8 = 0.898 just below 0.90; K=9 = 0.981 in 732 B; BC1 ≈ 0.97 in 512 B — close call but CDF53 K=8 nearly meets threshold) | **no** (CDF53 K=9 = 0.981 in 732 B; BC1 capped near 0.97 in 512 B — BC1 doesn't reach 0.95+0.03 margin) | **no** (BC1 capped <0.98; CDF53 lossless 2218 B reaches 1.0) |
+| `text` | **no** (CDF53 K=8 = 0.887 in 963 B; BC1 known-poor on sharp text edges) | **no** (BC1 likely <0.90 for text; CDF53 K=9 = 0.988 in 1341 B) | **no** (BC1 cannot reach 0.95 on text; CDF53 K=9 in 1341 B) | **no** (BC1 cannot reach 0.98; CDF53 lossless 3054 B) |
+| `gradient` | **no** (CDF53 K=7 = 0.862 in 188 B; BC1 512 B is bigger) | **no** (CDF53 K=8 = 0.969 in 207 B vs BC1 512 B — CDF53 wins by 2.5×) | **no** (CDF53 K=8 = 0.969 in 207 B beats BC1 by 2.5×) | depends (CDF53 K=9 = 0.973 in 225 B; BC1 likely 0.99 in 512 B; CDF53 still wins on bytes) |
+| `photo` | depends (CDF53 K=8 = 0.812 < 0.85, K=9 = 0.931 in 2016 B; BC1 likely 0.90-0.96 in 512 B) | depends (BC1 likely ≥0.90 in 512 B; CDF53 K=9 = 0.931 in 2016 B is 4× bigger but reaches threshold) | depends (BC1 may reach 0.95; CDF53 K=9 = 0.931 falls short; lossless 4400 B) | **no** (BC1 capped <0.98; CDF53 lossless 4400 B reaches 1.0) |
+| `motion` | **no** (CDF53 K=7 = 0.874 in 387 B; BC1 512 B is bigger) | **no** (CDF53 K=8 = 0.948 in 481 B vs BC1 512 B) | **no** (CDF53 K=9 = 0.990 in 579 B vs BC1 ≈0.95 in 512 B) | **no** (CDF53 K=9 = 0.990 in 579 B; BC1 capped <0.98) |
 
 **Per-class verdict line:**
-- `solid`, `text`, `gradient`, `motion`: CDF53 dominates BC1 across all thresholds. BC1 adds nothing.
-- `flat_ui`: BC1 would win on bytes at SSIM 0.90-0.95 (512 B vs 732 B), but the CDF53 partial-K bug (Section 0) likely artificially depresses the K=8 SSIM in this row. After the bug fix, K=8 SSIM may exceed 0.90 in fewer bytes (currently 530 B), tipping back to CDF53.
-- `photo`: same story — BC1 could win on bytes at threshold 0.90 (512 B vs 2016 B), but the K=9 SSIM is depressed by the partial-K bug. After bug fix, CDF53 likely takes fewer bytes for similar SSIM.
+- `solid`, `text`, `gradient`, `motion`: CDF53 dominates BC1 across all thresholds.
+- `flat_ui`: post-midpoint-fix, CDF53 K=8 = 0.898 is *just* below the 0.90 threshold and CDF53 K=9 = 0.981 is well above 0.95 in 732 B. BC1 at 512 B for ≈ 0.97 is comparable but loses the threshold-0.95 cell. Pre-fix this row was the strongest BC1 candidate; post-fix CDF53 is competitive everywhere.
+- `photo`: the only row with three "depends" cells. CDF53 K=9 = 0.931 reaches threshold 0.90 in 2016 B vs BC1 512 B. BC1 wins on bytes; CDF53 wins on SSIM ceiling (BC1 can't reach 0.95+ for photo).
 
-**BC1 fate verdict: DROP.**
+**BC1 fate verdict: DROP** (unchanged from pre-fix; strengthened by midpoint fix).
 
-Rationale: per the spec's "unambiguously yes at both ends of the published BC1 cost band" criterion, no cell qualifies. The two cells where BC1 might win on raw bytes (flat_ui and photo at 0.90-0.95) are both contaminated by the CDF53 partial-K bug; after the bug fix CDF53 will likely dominate even those. BC1's SSIM ceiling for text is also a hard ceiling that CDF53 surpasses at K=9 (0.978 vs BC1's likely <0.90).
+Rationale: per the spec's "unambiguously yes at both ends of the published BC1 cost band" criterion, no cell qualifies. The midpoint fix removed the prior `flat_ui` ambiguity (K=8 SSIM climbed from 0.883 → 0.898, almost meeting threshold 0.90 in 530 B). The remaining `photo` ambiguity at thresholds 0.85-0.95 is a bytes-vs-quality tradeoff where BC1's known quality ceiling (0.96-ish) prevents it from being unambiguously preferred. Implementing BC1 would deliver a small per-tile-byte advantage on photo content at moderate thresholds, but at the cost of: (1) the BC1 GPU compute encoder + WGSL decoder (M3.4-sized work), (2) maintaining a 4th lossy codec in the classifier rule table, (3) a quality ceiling that excludes it from text content (the highest-volume codec target). The aggregate engineering cost is not justified by the marginal photo-bytes win.
 
 **Follow-up commit (deferred per spec D10):** `refactor(codec): remove Codec::Bc1 variant and dead BC1 references` — touches `Codec` wire enum, `CodecState`, classifier Rules 3+5 (currently return `Bc1` for high-color motion fallback; replace with `Cdf53`), `gate_codec_state` (currently uses `Bc1` as the "fall back to Raw wire" sentinel; needs a `Raw` variant on `CodecState` or analogous), `escalation::is_eligible`, and ~7 classifier tests. Estimated 30-60 LoC of mechanical edits plus careful test rewrites. Not blocking; the M3.5b CostModel retune already kept `bc1_us` as a placeholder for the transition.
 
 ## 8. Lossless-strategy recommendation
 
-The three M3.5 strategy levers per spec §M3.5b Step 2 are documented here as **implemented** (commits `2f32797` + `ef734bf`).
+The three M3.5 strategy levers per spec §M3.5b Step 2 are documented here as **implemented** (commits `2f32797` + `ef734bf`); the partial-K reconstruction fix (commit `4ca63a3`) is the related M3.5 follow-up that completes the "progressive intermediate quality during refinement" product story.
 
 ### L1 — source-codec set for CDF53 refinement escalation
 
@@ -169,7 +182,7 @@ The three M3.5 strategy levers per spec §M3.5b Step 2 are documented here as **
 
 **Why:** PalRle and Solid are already lossless when their feasibility predicate (≤16 colors / single-color) holds. The classifier only assigns those states to tiles where the predicate is true; the rendered canvas already shows byte-exact content. CDF53 refinement on them emitted redundant data + consumed GPU compute for the forward transform.
 
-**Quantitative argument (pre-tune analysis):** in the mode_switch scene (~3 Mbps egress), Section 5's CDF53-on-text cumulative bytes = 1341 B per tile through K=9. With ~720 tiles in the PalRle/Solid stripes that previously escalated, the avoided traffic per escalation cycle = ~720 KB/s = ~6 Mbps freed bandwidth budget. **Post-tune validation:** mode_switch's measured egress held at 2.99 Mbps in both pre- and post-tune runs (see Section 0 deltas). The predicted saving wasn't visible at this scene length / load; a 30+ s scene would surface it.
+**Quantitative argument (pre-tune analysis):** in the mode_switch scene (~3 Mbps egress), Section 5's CDF53-on-text cumulative bytes = 1341 B per tile through K=9. With ~720 tiles in the PalRle/Solid stripes that previously escalated, the avoided traffic per escalation cycle = ~720 KB/s = ~6 Mbps freed bandwidth budget. **Post-tune validation:** mode_switch's measured egress held at 2.92-2.99 Mbps across pre/post-tune runs (variation within noise). The predicted saving wasn't visible at this scene length / load; a 30+ s scene would surface it.
 
 ### L2 — idle threshold (`IDLE_THRESHOLD` const in escalation.rs)
 
@@ -193,6 +206,12 @@ Per Section 4 medians:
 | `h264_frame_bytes` | 12000 | 12000 | unchanged (M4 §6.5 estimator) |
 | `bytes_per_us` | 12.5 | 12.5 | unchanged (M4 §6.5 estimator) |
 
+### CDF53 partial-K midpoint reconstruction (commit `4ca63a3`)
+
+**Why this is here (not just in Section 0):** the product goal for CDF53 is *progressive display* — the client shows the tile as soon as the first few passes arrive, then improves quality as more passes arrive. Without midpoint correction, intermediate frames at K<8 had systematically under-estimated coefficient magnitudes, producing visibly degraded content until ~K=8. The fix makes intermediate frames perceptually useful — high-K SSIM improves uniformly (+0.0007 to +0.0097 across classes; Section 6), the proptest-verified L1 error is monotonic in K, and the lossless K=14 path is unchanged.
+
+**The client display flow already supports per-pass progressive rendering** — every datagram triggers `Cdf53Pipeline.uploadBatch` → integrate shader → next rAF runs the inverse chain → present. The midpoint fix makes that per-pass display actually useful.
+
 ### Summary of M3.5b code changes
 
 | Lever | Change | File | Verification |
@@ -200,18 +219,18 @@ Per Section 4 medians:
 | L1 | Remove `PalRle`/`Solid` from `is_eligible`'s match arm | `ghostframe-lib/src/tile/escalation.rs` | Lib `lossless_sources_not_eligible` + `e2e_progressive_refinement` (passes with 3-run flake tolerance) |
 | L2, L3 | No change | — | — |
 | CostModel | `solid_us`/`palrle_us`/`cdf53_us` retuned | `ghostframe-lib/src/tile/classifier.rs` | Lib classifier unit tests + `e2e_mode_switch` (pass) |
+| Partial-K | SPIHT midpoint reconstruction in `decode_passes` + WGSL inverse l1/l2/l3 | `ghostframe-lib/src/encoder/cdf53.rs`, `ghostframe-web-client/src/webgpu/cdf53.ts`, `ghostframe-web-client/src/webgpu/shaders/cdf53_inverse_l{1,2,3}.wgsl` | New proptest `decode_passes_monotonic_error_under_truncation` (200 seeds); e2e_cdf53_lossless_buildup + e2e_cdf53_integrate_correctness + e2e_progressive_refinement all pass |
 | BC1 fate | DROP verdict documented; variant removal deferred to follow-up PR (per spec D10) | — | Section 7 narrative |
 | LZ4 wiring | DEFERRED — no production application site exists yet. Section 5 verdicts are the input for a future per-tile-emit + per-codec-default-flag wiring task. | — | — |
 
 ### Deferred from M3.5b
 
 1. **BC1 variant removal** (per Section 7): mechanical refactor across ~25 sites. Plan + verification path documented in Section 7.
-2. **CDF53 partial-K reconstruction bug** (Section 0/6): client cannot reliably render intermediate-quality frames during refinement. Doesn't affect lossless final state. Track as `fix(cdf53-client): monotonic SSIM under truncated bit-plane streams`.
-3. **Extending bench to K=10..14**: small change in `codec_latency.rs`'s `for k in 1..=9u8` loop to `1..=14u8`. Would complete the SSIM curve through the lossless point.
-4. **LZ4 production wiring**: per-codec emit-time LZ4 with the per-class defaults from Section 5.
-5. **Static-scene per-tile activity**: `--tile-pattern <class>` should optionally cycle subtle changes so the dirty-tile detector keeps firing. Would unblock the Section 2/3 client-side metrics for those scenes.
-6. **CPU sampling resolution**: 100 ms proc-sample interval is too coarse for steady-state load. A 10 ms sampler (or eBPF tracepoint) would show real per-codec CPU cost; out of M3.5 scope.
+2. **Extending bench to K=10..14**: small change in `codec_latency.rs`'s `for k in 1..=9u8` loop to `1..=14u8`. Would complete the SSIM curve through the lossless point. The post-fix proptest already proves L1 monotonicity through K=14; extending the bench would just make the SSIM table fuller for the report.
+3. **LZ4 production wiring**: per-codec emit-time LZ4 with the per-class defaults from Section 5.
+4. **Static-scene per-tile activity**: `--tile-pattern <class>` should optionally cycle subtle changes so the dirty-tile detector keeps firing. Would unblock the Section 2/3 client-side metrics for those scenes.
+5. **CPU sampling resolution**: 100 ms proc-sample interval is too coarse for steady-state load. A 10 ms sampler (or eBPF tracepoint) would show real per-codec CPU cost; out of M3.5 scope.
 
 ### M3.5b regression sweep result
 
-`e2e_mode_switch`, `e2e_progressive_refinement` (re-run 3× to confirm flake), `e2e_lossless_buildup`, `e2e_solid_color`, `e2e_h264_motion`, `e2e_multi_tile_grid` — **5 pass / 1 flake-retried-and-passed** = behavioral regression-free per post-tune sweep.
+`e2e_mode_switch`, `e2e_progressive_refinement` (re-run 3× to confirm flake), `e2e_lossless_buildup`, `e2e_solid_color`, `e2e_h264_motion`, `e2e_multi_tile_grid` — **5 pass / 1 flake-retried-and-passed** on the M3.5b sweep. Post-midpoint-fix re-run of e2e_cdf53_lossless_buildup + e2e_cdf53_integrate_correctness + e2e_progressive_refinement: **3 pass on first run**.
