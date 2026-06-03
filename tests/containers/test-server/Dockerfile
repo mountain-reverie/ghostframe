@@ -34,9 +34,11 @@ COPY ghostframe-lib/Cargo.toml ghostframe-lib/Cargo.toml
 COPY ghostframe-xdaemon/Cargo.toml ghostframe-xdaemon/Cargo.toml
 COPY ghostframe-test-pattern/Cargo.toml ghostframe-test-pattern/Cargo.toml
 # Workspace members not built here but required for cargo to resolve the
-# workspace manifest. Empty src/lib.rs stubs are enough.
+# workspace manifest.
 COPY ghostframe-e2e/Cargo.toml ghostframe-e2e/Cargo.toml
-COPY ghostframe-e2e/src/lib.rs ghostframe-e2e/src/lib.rs
+# Copy the full src/ tree, not just lib.rs: since the M3.5a refactor the
+# library declares `pub mod harness;` which expects harness/ on disk.
+COPY ghostframe-e2e/src/ ghostframe-e2e/src/
 COPY ghostframe-bench/Cargo.toml ghostframe-bench/Cargo.toml
 # Copy the full src/ tree, not just lib.rs: since the d404626 refactor the
 # library declares `pub mod fixtures;` which expects fixtures/ on disk.
