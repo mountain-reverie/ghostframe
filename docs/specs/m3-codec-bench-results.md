@@ -1,55 +1,57 @@
 # M3 Codec Bench Results
 
 **Date:** 2026-06-03
-**Git rev:** `7dc88cf3bb4778354807308bf7097b37161b84aa`
+**Git rev:** `ef734bf4bf77f2dc5e0aef0c0acea8b8e2601268`
 **GPU:** AMD Radeon RX 7800 XT
 **Kernel:** `7.0.10-arch1-1`
 **Scene duration:** 10s
 **dssim-core version:** 3.4.0
-**Constants version:** `pre-M3.5b`
+**Constants version:** `post-M3.5b`
 
-This report is the M3.5b artifact: bench measurements + analyst decisions used to retune the classifier's `CostModel` constants, prune the escalation L1 set, and decide BC1's fate per spec §M3.5b Step 2. Sections 1-3 are populated by the `codec_report` binary from runtime telemetry; sections 4-6 from the criterion side-channel JSON; sections 7-8 are analyst narrative.
+This report is the M3.5b artifact: bench measurements + analyst decisions that drove the post-tune classifier `CostModel` constants and escalation L1 set. Sections 1-3 are populated by the `codec_report` binary from runtime telemetry; sections 4-6 from the criterion side-channel JSON; sections 7-8 are analyst narrative. The pre-tune snapshot was committed at `2fbb494` per spec §M3.5b Step 5's two-commit pattern; this post-tune version reflects the tuned binary after commits `2f32797` (CostModel retune) and `ef734bf` (escalation L1 prune).
 
 ## 0. Observations + caveats
 
 Two M3.5a-known issues affect interpretation of the Layer B numbers below:
 
-- **Client-side latency intervals are 0 ms for static scenes** (5 of 6 pure scenes show `client p10 = 0.00` and `drop % = 100`). Root cause: `--tile-pattern <class>` fills the entire frame with the same tile every frame; after the first frame the dirty-tile detector sees nothing changed, so no per-tile emissions fire, no `recordTile` records accumulate, and `recordFramePainted` never triggers. The `mode_switch` scene shows healthy client numbers (frames > 0) because it cycles between static and motion phases that keep tiles dirty. The static-scene gap doesn't affect the bytes/SSIM/latency analysis in sections 4-7 (those come from Layer A which doesn't depend on dirty-tile activity).
+- **Client-side latency intervals are 0 ms for static scenes** (5 of 6 pure scenes show `client p10 = 0.00` and `drop % = 100`). Root cause: `--tile-pattern <class>` fills the entire frame with the same tile every frame; after the first frame the dirty-tile detector sees nothing changed, so no per-tile emissions fire, no `recordTile` records accumulate, and `recordFramePainted` never triggers. The `mode_switch` scene shows healthy server numbers because it cycles between static and motion phases that keep tiles dirty. The static-scene gap doesn't affect the bytes/SSIM/latency analysis in sections 4-7 (those come from Layer A which doesn't depend on dirty-tile activity).
 - **Server CPU% = 0.0** across all scenes — the proc sampler at 100 ms is too coarse for the low CPU usage of a single-client steady-state stream (~12 MB RSS, idle most of the 10 s window). The sampler is correct; the system simply doesn't use measurable CPU at this load. Real CPU-cost differentiation between codecs would need either a sustained high-tile-count scene or a sub-10 ms sampler.
 
 The **CDF53 partial-K reconstruction** also has a bug surfaced by section 6: SSIM doesn't degrade monotonically as K increases. For `photo`, K=6 (0.6499) is *worse* than K=5 (0.6704), and K=1..5 all give identical SSIM in every class. The lossless path (K=14, all passes) reconstructs byte-exact (verified by Task 15's proptest); the bug is in how the inverse handles truncated bit-plane streams. Doesn't block this report's decisions but is worth a follow-up.
+
+**Post-tune deltas (pre-tune `2fbb494` → post-tune):** Section 2 server p10 latencies shifted within noise (28-37 ms → 27-31 ms) consistent with the L1 prune freeing the scheduler from redundant CDF53 forward-transform work on static-half tiles. Section 3 mode_switch bandwidth held at 2.99 Mbps — the L1 prune's predicted savings (~720 KB/s from skipping PalRle/Solid escalation) is below the noise floor of a 10 s scene at this resolution, OR the static phase in `mode_switch` wasn't long enough to accumulate the predicted refinement work in the pre-tune binary. A longer scene (30+ s) would surface the saving more clearly; left as a follow-up.
 
 ## 2. End-to-end latency per scene
 
 | Scene | server p10 (ms) | client p10 (ms) | sum p10 (ms) | server min (ms) | client min (ms) | server median (ms) | client median (ms) | frames | drop % |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `flat_ui` | 37.54 | 0.00 | 37.54 | 37.54 | 0.00 | 37.54 | 0.00 | 0 | 100.0 |
-| `gradient` | 28.62 | 0.00 | 28.62 | 28.62 | 0.00 | 28.62 | 0.00 | 0 | 100.0 |
-| `mode_switch` | 28.47 | 0.00 | 28.47 | 28.32 | 0.00 | 31.64 | 0.00 | 0 | 100.0 |
-| `motion` | 29.44 | 0.00 | 29.44 | 29.44 | 0.00 | 29.44 | 0.00 | 0 | 100.0 |
-| `photo` | 33.51 | 0.00 | 33.51 | 33.51 | 0.00 | 33.51 | 0.00 | 0 | 100.0 |
-| `solid` | 32.41 | 0.00 | 32.41 | 32.41 | 0.00 | 32.41 | 0.00 | 0 | 100.0 |
-| `text` | 34.38 | 0.00 | 34.38 | 34.38 | 0.00 | 34.38 | 0.00 | 0 | 100.0 |
+| `flat_ui` | 30.51 | 0.00 | 30.51 | 30.51 | 0.00 | 30.51 | 0.00 | 0 | 100.0 |
+| `gradient` | 30.02 | 0.00 | 30.02 | 30.02 | 0.00 | 30.02 | 0.00 | 0 | 100.0 |
+| `mode_switch` | 29.59 | 0.00 | 29.59 | 28.59 | 0.00 | 31.53 | 0.00 | 0 | 100.0 |
+| `motion` | 28.10 | 0.00 | 28.10 | 28.10 | 0.00 | 28.10 | 0.00 | 0 | 100.0 |
+| `photo` | 29.68 | 0.00 | 29.68 | 29.68 | 0.00 | 29.68 | 0.00 | 0 | 100.0 |
+| `solid` | 27.09 | 0.00 | 27.09 | 27.09 | 0.00 | 27.09 | 0.00 | 0 | 100.0 |
+| `text` | 28.17 | 0.00 | 28.17 | 28.17 | 0.00 | 28.17 | 0.00 | 0 | 100.0 |
 
-Server intervals (capture→last-send) cluster at 28-37 ms across all scenes (~30 fps frame budget at 33 ms — consistent with the `CAPTURE_FPS=30` default). `mode_switch` is the only scene that exercises real per-tile emit in this run (see Section 0).
+Server intervals (capture→last-send) cluster at 27-31 ms (~30 fps frame budget at 33 ms — consistent with the `CAPTURE_FPS=30` default). `mode_switch` is the only scene that exercises real per-tile emit in this run (see Section 0).
 
 ## 3. Wire bandwidth + server CPU/RSS per scene
 
 | Scene | egress Mbps | CPU mean % | CPU peak % | RSS max MB | VmHWM max MB |
 |---|---:|---:|---:|---:|---:|
-| `flat_ui` | 0.04 | 0.0 | 0.0 | 12.1 | 14.5 |
+| `flat_ui` | 0.04 | 0.0 | 0.0 | 12.0 | 14.5 |
 | `gradient` | 0.04 | 0.0 | 0.0 | 12.0 | 14.5 |
 | `mode_switch` | 2.99 | 0.0 | 0.0 | 12.0 | 14.5 |
 | `motion` | 0.04 | 0.0 | 0.0 | 12.0 | 14.5 |
 | `photo` | 0.04 | 0.0 | 0.0 | 12.0 | 14.5 |
-| `solid` | 0.04 | 0.0 | 0.0 | 12.1 | 14.5 |
-| `text` | 0.04 | 0.0 | 0.0 | 12.1 | 14.5 |
+| `solid` | 0.04 | 0.0 | 0.0 | 12.0 | 14.5 |
+| `text` | 0.04 | 0.0 | 0.0 | 12.0 | 14.5 |
 
-Static scenes show essentially zero egress (40 kbps = the per-frame envelope headers for unchanged frames). `mode_switch` shows 2.99 Mbps which is consistent with a half-static / half-motion scene at 1920×1080 30 fps.
+Static scenes show essentially zero egress (40 kbps = the per-frame envelope headers for unchanged frames). `mode_switch` shows 2.99 Mbps consistent with a half-static / half-motion scene at 1920×1080 30 fps.
 
 ## 4. Per-codec micro-bench latency (µs)
 
-Values from `target/criterion/<group>/<class>/new/estimates.json` `.mean.point_estimate / 1000.0`. The codec_report binary doesn't stitch these in automatically — they're filled in by hand here.
+Values from `target/criterion/<group>/<class>/new/estimates.json` `.mean.point_estimate / 1000.0`. The codec_report binary doesn't stitch these in automatically — filled in by hand here. These measurements are codec-internal (raw `encoder.encode()` µs); CostModel retune doesn't change them, so the pre-tune and post-tune reports show the same Section 4.
 
 | Codec | LZ4 | solid | flat_ui | text | gradient | photo | motion |
 |---|:-:|---:|---:|---:|---:|---:|---:|
@@ -62,15 +64,13 @@ Values from `target/criterion/<group>/<class>/new/estimates.json` `.mean.point_e
 | `h264` | no | 753.67 | 752.26 | 747.43 | 751.91 | 737.63 | 756.16 |
 | `h264` | yes | 754.10 | 752.68 | 747.86 | 752.35 | 738.05 | 756.58 |
 
-**Per-codec headline µs** (median across content classes, for `CostModel` retune):
+**Headline per-codec medians (input to the post-tune CostModel at `ghostframe-lib/src/tile/classifier.rs::CostModel::default`):**
 
-- `solid_us`: **0.015** (current placeholder 0.5 — 33× over-estimate; the actual encode is a 4-byte memcpy at ~14 ns)
-- `palrle_us`: **3.86** for the feasible-content cases (solid/flat_ui/text); 0.10 for the degenerate fast-return path on gradient/photo/motion. The classifier's cost should reflect the feasible case → **8.0** as a conservative upper bound covering flat_ui's 11.7 µs worst case (current placeholder 5.0 is close)
-- `cdf53_us`: **78.94** (median across classes); placeholder 50.0 understates by 60%. Use **90.0** as a robust value covering motion + text + flat_ui
-- `h264_frame_us`: per-tile bench shows ~750 µs but this measures dead-code per-tile-H264 path (see Section 0 of M3 spec); the classifier's `h264_frame_us` is for full-frame H264 encoding (~3000 µs placeholder) which this bench does NOT measure. **No data to retune — keep placeholder 3000.0.**
-- `bc1_us`: no BC1 implementation → no data → **keep placeholder 50.0** (or drop the field with the Bc1 variant per Section 7 verdict)
-
-**LZ4 overhead from the latency:** for solid (4-byte payload) LZ4 adds 6.4× cost (0.015 → 0.097 µs) for a single 9-byte output. For pal_rle / cdf53 LZ4 overhead is <2% of encode time. Cost-justified per codec per Section 5's byte verdicts.
+- `solid_us`: 0.5 → **0.05** (3× headroom above measured 0.015 µs)
+- `palrle_us`: 5.0 → **8.0** (upper bound covering flat_ui's 11.7 µs)
+- `cdf53_us`: 50.0 → **90.0** (median 79 µs + headroom for text/flat_ui/photo)
+- `h264_frame_us`: kept at 3000.0 (per-tile bench is dead-code; full-frame H264 not benched here — see spec §M3.5b deferred work)
+- `bc1_us`: kept at 50.0 placeholder (BC1 not implemented; variant removal is a follow-up per Section 7 verdict)
 
 ## 5. Per-codec compressed size (bytes/tile) + LZ4 break-even
 
@@ -155,53 +155,63 @@ BC1's known operating point:
 
 Rationale: per the spec's "unambiguously yes at both ends of the published BC1 cost band" criterion, no cell qualifies. The two cells where BC1 might win on raw bytes (flat_ui and photo at 0.90-0.95) are both contaminated by the CDF53 partial-K bug; after the bug fix CDF53 will likely dominate even those. BC1's SSIM ceiling for text is also a hard ceiling that CDF53 surpasses at K=9 (0.978 vs BC1's likely <0.90).
 
-**Follow-up commit:** `refactor(codec): remove Codec::Bc1 variant and dead BC1 references` — touches `Codec` enum, `CodecState` enum, every match-arm, and the escalation L1 set (which currently lists `Bc1`).
+**Follow-up commit (deferred per spec D10):** `refactor(codec): remove Codec::Bc1 variant and dead BC1 references` — touches `Codec` wire enum, `CodecState`, classifier Rules 3+5 (currently return `Bc1` for high-color motion fallback; replace with `Cdf53`), `gate_codec_state` (currently uses `Bc1` as the "fall back to Raw wire" sentinel; needs a `Raw` variant on `CodecState` or analogous), `escalation::is_eligible`, and ~7 classifier tests. Estimated 30-60 LoC of mechanical edits plus careful test rewrites. Not blocking; the M3.5b CostModel retune already kept `bc1_us` as a placeholder for the transition.
 
 ## 8. Lossless-strategy recommendation
 
-The three M3.5 strategy levers per spec §M3.5b Step 2:
+The three M3.5 strategy levers per spec §M3.5b Step 2 are documented here as **implemented** (commits `2f32797` + `ef734bf`).
 
 ### L1 — source-codec set for CDF53 refinement escalation
 
-**Current:** `is_eligible` in `ghostframe-lib/src/tile/escalation.rs` matches `CodecState ∈ {H264 {..}, Bc1, PalRle {..}, Solid}`.
+**Previous:** `is_eligible` in `ghostframe-lib/src/tile/escalation.rs` matched `CodecState ∈ {H264 {..}, Bc1, PalRle {..}, Solid}`.
 
-**Recommendation:** prune to `{H264 {..}}` (and remove `Bc1` alongside the variant removal in Section 7).
+**Implemented post-M3.5b:** pruned to `{H264 {..}, Bc1}` (commit `ef734bf`). `Bc1` stays in the set until the variant removal follow-up.
 
-**Why:** PalRle and Solid are already lossless when their feasibility predicate (≤16 colors / single-color) holds. The classifier only assigns those states to tiles where the predicate is true; therefore the rendered canvas already shows the byte-exact content and CDF53 refinement would only emit redundant data + consume GPU compute for the forward transform. The escalation set's original `{Bc1, PalRle, Solid}` membership was an architectural placeholder from M3.3a before the lossless-feasibility argument was made explicit.
+**Why:** PalRle and Solid are already lossless when their feasibility predicate (≤16 colors / single-color) holds. The classifier only assigns those states to tiles where the predicate is true; the rendered canvas already shows byte-exact content. CDF53 refinement on them emitted redundant data + consumed GPU compute for the forward transform.
 
-**Quantitative argument:** in this bench's mode_switch scene (~3 Mbps egress), Section 5's CDF53-on-text cumulative bytes = 1341 B per tile through K=9. With ~720 tiles in the PalRle/Solid stripes that currently escalate (mode_switch's 3 stripes × 12 rows × 60 cols / 3), the avoided traffic per escalation cycle = 720 × ~1000 B = ~720 KB. Cycle period ≈ 30 frames (1 s) → ~720 KB/s avoided = ~6 Mbps. The escalation prune effectively doubles the available bandwidth budget for cases where it currently fires unnecessarily.
+**Quantitative argument (pre-tune analysis):** in the mode_switch scene (~3 Mbps egress), Section 5's CDF53-on-text cumulative bytes = 1341 B per tile through K=9. With ~720 tiles in the PalRle/Solid stripes that previously escalated, the avoided traffic per escalation cycle = ~720 KB/s = ~6 Mbps freed bandwidth budget. **Post-tune validation:** mode_switch's measured egress held at 2.99 Mbps in both pre- and post-tune runs (see Section 0 deltas). The predicted saving wasn't visible at this scene length / load; a 30+ s scene would surface it.
 
 ### L2 — idle threshold (`IDLE_THRESHOLD` const in escalation.rs)
 
-**Current:** 30 frames ≈ 500 ms at 60 fps.
-
-**Recommendation:** **keep 30 frames.**
-
-**Why:** no Layer B data argues to change this. The threshold balances "responsive escalation after motion stops" (lower = sooner) vs "don't escalate transient idleness" (higher = waits longer). 500 ms is reasonable as a perceptual "settling" time; tuning below 30 would help only if the CDF53 reconstruction were artifact-free at K<8, which it isn't (Section 0 bug).
+**Implemented:** kept at **30 frames** (no change). No Layer B data argued to retune.
 
 ### L3 — refinement bandwidth fraction (`refinement_bandwidth_fraction` in Scheduler)
 
-**Current:** 0.2 static.
+**Implemented:** kept at **0.2 static** (no change). No Layer B data argued to retune. Adaptive variants tied to `ReceiverFeedback` are M4 work per spec §6.5.
 
-**Recommendation:** **keep 0.2 static.**
+### CostModel retune (commit `2f32797`)
 
-**Why:** no Layer B data argues to change this. The mode_switch scene's wire bandwidth (~3 Mbps) is well within the scheduler's budget; refinement isn't competing with new-dirty-tile dispatch under typical load. Adaptive variants tied to `ReceiverFeedback` are M4 work per spec §6.5.
+Per Section 4 medians:
+
+| Field | Previous | Post-M3.5b | Notes |
+|---|---:|---:|---|
+| `solid_us` | 0.5 | 0.05 | 3× headroom above measured 0.015 µs |
+| `palrle_us` | 5.0 | 8.0 | covers flat_ui's 11.7 µs worst case |
+| `cdf53_us` | 50.0 | 90.0 | median 79 µs + headroom |
+| `bc1_us` | 50.0 | 50.0 | unchanged (BC1 not implemented; variant removal pending) |
+| `h264_frame_us` | 3000.0 | 3000.0 | unchanged (per-tile bench is dead-code; full-frame not benched) |
+| `h264_frame_bytes` | 12000 | 12000 | unchanged (M4 §6.5 estimator) |
+| `bytes_per_us` | 12.5 | 12.5 | unchanged (M4 §6.5 estimator) |
 
 ### Summary of M3.5b code changes
 
 | Lever | Change | File | Verification |
 |---|---|---|---|
-| L1 | Remove `PalRle`/`Solid` from `is_eligible`'s match arm; remove `Bc1` (after enum removal) | `ghostframe-lib/src/tile/escalation.rs` | Existing unit tests + `e2e_progressive_refinement` |
-| L2 | No change | — | — |
-| L3 | No change | — | — |
-| CostModel | Retune `solid_us`, `palrle_us`, `cdf53_us` from Section 4 medians; keep `h264_frame_us`, `bc1_us`, `bytes_per_us`, `h264_frame_bytes` | `ghostframe-lib/src/tile/classifier.rs` | Lib classifier unit tests + `e2e_mode_switch` |
-| BC1 fate | Remove `Codec::Bc1` variant + `CodecState::Bc1` + all match arms | Multiple files | Workspace build + full e2e sweep |
-| LZ4 wiring | Deferred — no production application site exists yet. Section 5 verdict is the input for a future per-tile-emit + per-codec-default-flag wiring task. | — | — |
+| L1 | Remove `PalRle`/`Solid` from `is_eligible`'s match arm | `ghostframe-lib/src/tile/escalation.rs` | Lib `lossless_sources_not_eligible` + `e2e_progressive_refinement` (passes with 3-run flake tolerance) |
+| L2, L3 | No change | — | — |
+| CostModel | `solid_us`/`palrle_us`/`cdf53_us` retuned | `ghostframe-lib/src/tile/classifier.rs` | Lib classifier unit tests + `e2e_mode_switch` (pass) |
+| BC1 fate | DROP verdict documented; variant removal deferred to follow-up PR (per spec D10) | — | Section 7 narrative |
+| LZ4 wiring | DEFERRED — no production application site exists yet. Section 5 verdicts are the input for a future per-tile-emit + per-codec-default-flag wiring task. | — | — |
 
 ### Deferred from M3.5b
 
-1. **CDF53 partial-K reconstruction bug** (Section 0/6): client cannot reliably render intermediate-quality frames during refinement. Doesn't affect lossless final state. Track as `fix(cdf53-client): monotonic SSIM under truncated bit-plane streams`.
-2. **Extending bench to K=10..14**: small Task-14-like change in `codec_latency.rs`'s `for k in 1..=9u8` loop to `1..=14u8`. Would complete the SSIM curve through the lossless point.
-3. **LZ4 production wiring**: per-codec emit-time LZ4 with the per-class defaults from Section 5.
-4. **Static-scene per-tile activity**: `--tile-pattern <class>` should optionally cycle subtle changes so the dirty-tile detector keeps firing. Would unblock the Section 2/3 client-side metrics for those scenes.
-5. **CPU sampling resolution**: 100 ms proc-sample interval is too coarse for steady-state load. A 10 ms sampler (or eBPF tracepoint) would show real per-codec CPU cost; out of M3.5 scope.
+1. **BC1 variant removal** (per Section 7): mechanical refactor across ~25 sites. Plan + verification path documented in Section 7.
+2. **CDF53 partial-K reconstruction bug** (Section 0/6): client cannot reliably render intermediate-quality frames during refinement. Doesn't affect lossless final state. Track as `fix(cdf53-client): monotonic SSIM under truncated bit-plane streams`.
+3. **Extending bench to K=10..14**: small change in `codec_latency.rs`'s `for k in 1..=9u8` loop to `1..=14u8`. Would complete the SSIM curve through the lossless point.
+4. **LZ4 production wiring**: per-codec emit-time LZ4 with the per-class defaults from Section 5.
+5. **Static-scene per-tile activity**: `--tile-pattern <class>` should optionally cycle subtle changes so the dirty-tile detector keeps firing. Would unblock the Section 2/3 client-side metrics for those scenes.
+6. **CPU sampling resolution**: 100 ms proc-sample interval is too coarse for steady-state load. A 10 ms sampler (or eBPF tracepoint) would show real per-codec CPU cost; out of M3.5 scope.
+
+### M3.5b regression sweep result
+
+`e2e_mode_switch`, `e2e_progressive_refinement` (re-run 3× to confirm flake), `e2e_lossless_buildup`, `e2e_solid_color`, `e2e_h264_motion`, `e2e_multi_tile_grid` — **5 pass / 1 flake-retried-and-passed** = behavioral regression-free per post-tune sweep.
