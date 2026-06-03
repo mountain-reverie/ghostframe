@@ -14,6 +14,15 @@ import inverseL1Pass2Wgsl from './shaders/cdf53_inverse_l1_pass2.wgsl?raw';
  * - signBuffer:        max_tiles × 3 × 1024 bits, packed as u32 words
  *                      ⇒ max_tiles × 96 u32 ⇒ max_tiles × 384 bytes.
  * - tileGenBuffer:     max_tiles × u32 (most-recently-seen generation per tile).
+ * - passesProcessedBuffer: max_tiles × u32 (highest-seen pass_idx + 1, per
+ *                      tile). Used by the inverse shaders' read_coeff
+ *                      midpoint-reconstruction: for K passes processed
+ *                      (1 ≤ K < 14), the unknown low magnitude bits of any
+ *                      significant coefficient are estimated as the midpoint
+ *                      of [0, 2^(14-K)) rather than 0. Halves expected
+ *                      reconstruction error per pass and makes the SSIM
+ *                      curve monotonic in K. Mirrors the Rust
+ *                      `cdf53::decode_passes` SPIHT-style correction.
  * - dirtyTilesBuffer:  max_tiles × u32 (tile indices visited this batch).
  * - dirtyTilesCount:   1 × u32 (atomic counter, reset each batch).
  *
@@ -24,6 +33,7 @@ export class Cdf53Pipeline {
   coefficientBuffer!: GPUBuffer;
   signBuffer!: GPUBuffer;
   tileGenBuffer!: GPUBuffer;
+  passesProcessedBuffer!: GPUBuffer;
   // Per-batch scratch.
   dirtyTilesBuffer!: GPUBuffer;
   dirtyTilesCount!: GPUBuffer;
@@ -44,6 +54,10 @@ export class Cdf53Pipeline {
   // Reusable zero buffers, sized at resize() to avoid per-clear allocation.
   private coefZeroPerTile = new Uint8Array(0);
   private signZeroPerTile = new Uint8Array(0);
+  // CPU-side mirror of passesProcessedBuffer. Updated in uploadBatch each
+  // time an entry arrives (max with passIdx + 1), then writeBuffer'd to the
+  // GPU before the integrate dispatch.
+  private passesProcessedCpu: Uint32Array = new Uint32Array(0);
   private cols: number = 0;
 
   // M3.3b diagnostic: per-tile capture. When (watcherX, watcherY) is set,
@@ -150,6 +164,7 @@ export class Cdf53Pipeline {
     if (this.coefficientBuffer) this.coefficientBuffer.destroy();
     if (this.signBuffer) this.signBuffer.destroy();
     if (this.tileGenBuffer) this.tileGenBuffer.destroy();
+    if (this.passesProcessedBuffer) this.passesProcessedBuffer.destroy();
     if (this.dirtyTilesBuffer) this.dirtyTilesBuffer.destroy();
     if (this.dirtyTilesCount) this.dirtyTilesCount.destroy();
     if (this.tileWorkBuffer) this.tileWorkBuffer.destroy();
@@ -168,6 +183,11 @@ export class Cdf53Pipeline {
       size: maxTiles * 4,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
     });
+    this.passesProcessedBuffer = this.device.createBuffer({
+      size: maxTiles * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+    });
+    this.passesProcessedCpu = new Uint32Array(maxTiles);
     this.dirtyTilesBuffer = this.device.createBuffer({
       size: Math.max(maxTiles, 1) * 4,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
@@ -212,6 +232,7 @@ export class Cdf53Pipeline {
         { binding: 1, resource: { buffer: this.signBuffer } },
         { binding: 2, resource: { buffer: this.tileGenBuffer } },  // was dirtyTilesBuffer
         { binding: 3, resource: { buffer: this.workAreaBuffer } },
+        { binding: 4, resource: { buffer: this.passesProcessedBuffer } },
       ],
     });
     this.inverseL2BindGroup = this.device.createBindGroup({
@@ -221,6 +242,7 @@ export class Cdf53Pipeline {
         { binding: 1, resource: { buffer: this.signBuffer } },
         { binding: 2, resource: { buffer: this.tileGenBuffer } },  // was dirtyTilesBuffer
         { binding: 3, resource: { buffer: this.workAreaBuffer } },
+        { binding: 4, resource: { buffer: this.passesProcessedBuffer } },
       ],
     });
     this.inverseL1BindGroup = this.device.createBindGroup({
@@ -230,6 +252,7 @@ export class Cdf53Pipeline {
         { binding: 1, resource: { buffer: this.signBuffer } },
         { binding: 2, resource: { buffer: this.tileGenBuffer } },  // was dirtyTilesBuffer
         { binding: 3, resource: { buffer: this.workAreaBuffer } },
+        { binding: 4, resource: { buffer: this.passesProcessedBuffer } },
       ],
     });
     this.inverseL1Pass2BindGroup = this.device.createBindGroup({
@@ -250,10 +273,13 @@ export class Cdf53Pipeline {
     const coefZeros = new Uint8Array(this.maxTiles * 6144);
     const signZeros = new Uint8Array(this.maxTiles * 384);
     const genZeros = new Uint8Array(this.maxTiles * 4);
+    const passesZeros = new Uint8Array(this.maxTiles * 4);
     this.device.queue.writeBuffer(this.coefficientBuffer, 0, coefZeros);
     this.device.queue.writeBuffer(this.signBuffer, 0, signZeros);
     this.device.queue.writeBuffer(this.tileGenBuffer, 0, genZeros);
+    this.device.queue.writeBuffer(this.passesProcessedBuffer, 0, passesZeros);
     this.lastSeenGen.fill(0);
+    this.passesProcessedCpu.fill(0);
   }
 
   /** Returns the framebuffer view for binding by the L1 inverse shader. */
@@ -301,15 +327,34 @@ export class Cdf53Pipeline {
     // the zeroed state. Doing this avoids the cross-workgroup race the
     // intra-shader clear had (HL2 cols 4/5 sign-bit loss for ch=0).
     const clearedTiles = new Set<number>();
+    const touchedTiles = new Set<number>();
     for (let i = 0; i < entries.length; i++) {
       const e = entries[i];
       const tileIdx = e.tileY * this.cols + e.tileX;
       if (this.lastSeenGen[tileIdx] !== e.gen && !clearedTiles.has(tileIdx)) {
         this.device.queue.writeBuffer(this.coefficientBuffer, tileIdx * 6144, this.coefZeroPerTile);
         this.device.queue.writeBuffer(this.signBuffer, tileIdx * 384, this.signZeroPerTile);
+        // Gen bump also resets pass-count tracking for the tile.
+        this.passesProcessedCpu[tileIdx] = 0;
         this.lastSeenGen[tileIdx] = e.gen;
         clearedTiles.add(tileIdx);
       }
+      // Track highest-seen pass index for the midpoint-reconstruction in
+      // the inverse shaders. Stores pass_idx + 1 so the GPU side reads
+      // "number of processed passes" (matches Rust decode_passes semantics).
+      const candidate = e.passIdx + 1;
+      if (candidate > this.passesProcessedCpu[tileIdx]) {
+        this.passesProcessedCpu[tileIdx] = candidate;
+      }
+      touchedTiles.add(tileIdx);
+    }
+    // Upload the (possibly sparse) passes-processed updates. For batch sizes
+    // that touch many tiles this is more efficient than writing the whole
+    // array; for small batches the per-tile writeBuffer overhead may be
+    // higher than a full upload — left as a future optimization.
+    for (const tileIdx of touchedTiles) {
+      const tmp = new Uint32Array([this.passesProcessedCpu[tileIdx]]);
+      this.device.queue.writeBuffer(this.passesProcessedBuffer, tileIdx * 4, tmp);
     }
     for (let i = 0; i < entries.length; i++) {
       const e = entries[i];

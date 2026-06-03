@@ -454,6 +454,17 @@ fn rle_decode(rle: &[u8]) -> Vec<u8> {
 /// Reassemble coefficients from N bit-plane passes (N ≤ CDF53_PASS_COUNT).
 /// Truncated K < CDF53_PASS_COUNT yields a lossy approximation; passing all
 /// CDF53_PASS_COUNT passes recovers the exact original coefficients.
+///
+/// **Midpoint reconstruction (SPIHT-style):** for K < CDF53_PASS_COUNT, the
+/// low (unknown) bits of every significant coefficient (those with at least
+/// one set magnitude bit) are reconstructed as the midpoint of the unknown
+/// range rather than 0. This halves the expected error per coefficient and
+/// makes the SSIM curve monotonic in K — without it, K=1..6 give identical
+/// reconstructions for content where the high magnitude bits don't trip,
+/// and the SSIM can actually go DOWN at intermediate K as some coefficients
+/// gain bits while others remain zeroed. Insignificant coefficients (no
+/// magnitude bits set in the processed passes) stay at 0 — we have no
+/// evidence they're non-zero yet.
 pub fn decode_passes(passes: &[&[u8]]) -> Vec<i16> {
     assert!(passes.len() <= CDF53_PASS_COUNT);
     let mut coefficients = vec![0i16; CDF53_TOTAL_COEFFS];
@@ -490,8 +501,27 @@ pub fn decode_passes(passes: &[&[u8]]) -> Vec<i16> {
         }
     }
 
+    // Midpoint correction. `passes.len()` includes the sign plane (pass 0)
+    // and any magnitude planes processed. Lowest known bit position =
+    // 13 - (passes.len() - 1) = 14 - passes.len(); unknown low bits =
+    // [0, 14 - passes.len()), i.e. (14 - passes.len()) bits of uncertainty.
+    // Midpoint of [0, 2^unknown) is 2^(unknown - 1). Skip when:
+    //   - passes.len() == 0 (degenerate)
+    //   - passes.len() >= CDF53_PASS_COUNT (no uncertainty left)
+    //   - passes.len() == 1 (only sign plane; no significant coeffs yet)
+    let midpoint: u32 = if passes.len() >= 2 && passes.len() < CDF53_PASS_COUNT {
+        let unknown_bits = CDF53_PASS_COUNT - passes.len(); // 1..=12
+        1u32 << (unknown_bits - 1)
+    } else {
+        0
+    };
+
     for i in 0..CDF53_TOTAL_COEFFS {
-        let mag = magnitudes[i].min(i16::MAX as u32) as i16;
+        let mut mag_u32 = magnitudes[i];
+        if mag_u32 != 0 && midpoint != 0 {
+            mag_u32 = mag_u32.saturating_add(midpoint);
+        }
+        let mag = mag_u32.min(i16::MAX as u32) as i16;
         coefficients[i] = if signs[i] { -mag } else { mag };
     }
 
@@ -664,6 +694,44 @@ mod tests_passes {
     /// split-by-prefix → decode_passes → inverse → byte-exact original" loop
     /// holds across 1000 deterministic seeds. Guards against the length-prefix
     /// layout in Cdf53Encoder diverging from decode_passes's expected input shape.
+    /// Monotonicity guarantee: as more passes are decoded, the sum of
+    /// absolute per-coefficient errors must be non-increasing. Without
+    /// midpoint reconstruction this fails (K=6 was *worse* than K=5 for
+    /// photo content in the M3.5b bench — see the pre-fix Section 6 of
+    /// docs/specs/m3-codec-bench-results.md). 200 deterministic seeds.
+    #[test]
+    fn decode_passes_monotonic_error_under_truncation() {
+        use proptest::prelude::*;
+        proptest!(ProptestConfig::with_cases(200), |(seed in 0u64..1000)| {
+            // Deterministic 32×32 BGRA tile.
+            let mut tile = vec![0u8; 32 * 32 * 4];
+            let mut s = seed.wrapping_mul(0x9E3779B97F4A7C15);
+            for byte in tile.iter_mut() {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                *byte = (s >> 56) as u8;
+            }
+            let true_coeffs = forward(&tile);
+            let passes = encode_passes(&true_coeffs);
+
+            let mut last_err: u64 = u64::MAX;
+            for k in 1..=passes.len() {
+                let pass_refs: Vec<&[u8]> = passes[..k].iter().map(|p| &p[..]).collect();
+                let recovered = decode_passes(&pass_refs);
+                let err: u64 = true_coeffs.iter()
+                    .zip(recovered.iter())
+                    .map(|(t, r)| ((*t as i64) - (*r as i64)).unsigned_abs())
+                    .sum();
+                prop_assert!(err <= last_err,
+                    "K={}: total absolute coefficient error {} > prior {} (regression)",
+                    k, err, last_err);
+                last_err = err;
+            }
+            // K = CDF53_PASS_COUNT: exact reconstruction (matches the existing
+            // forward_inverse_roundtrip_exact test at coefficient level).
+            prop_assert_eq!(last_err, 0);
+        });
+    }
+
     #[test]
     fn bench_length_prefix_framing_round_trip() {
         use proptest::prelude::*;

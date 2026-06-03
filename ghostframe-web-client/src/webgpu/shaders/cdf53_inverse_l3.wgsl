@@ -10,6 +10,7 @@
 @group(0) @binding(1) var<storage, read> signBuffer: array<u32>;
 @group(0) @binding(2) var<storage, read> tileGen: array<u32>;
 @group(0) @binding(3) var<storage, read_write> workArea: array<i32>;
+@group(0) @binding(4) var<storage, read> passesProcessed: array<u32>;
 
 fn unpack_i16(word: u32, lane: u32) -> i32 {
   // lane = 0 ⇒ low half, lane = 1 ⇒ high half. Sign-extend 16 → 32.
@@ -20,9 +21,22 @@ fn unpack_i16(word: u32, lane: u32) -> i32 {
 
 fn read_coeff(tile_idx: u32, ch: u32, i: u32) -> i32 {
   let word_idx = tile_idx * 1536u + ch * 512u + (i >> 1u);
-  let mag = unpack_i16(coefficientBuffer[word_idx], i & 1u);
+  let raw_mag = unpack_i16(coefficientBuffer[word_idx], i & 1u);
   let sign_word_idx = tile_idx * 96u + ch * 32u + (i >> 5u);
   let sign_bit = (signBuffer[sign_word_idx] >> (i & 31u)) & 1u;
+  // Midpoint reconstruction (SPIHT-style): for partial-K decode where
+  // K = passesProcessed[tile_idx] ∈ [2, 13], add 2^(13-K) to every
+  // significant coefficient (raw_mag != 0) to estimate the unknown low
+  // bits as the midpoint of their range. K < 2 means we only have signs
+  // (or nothing) — no significant coefficients yet. K >= 14 means
+  // lossless — no correction needed. Mirrors Rust `cdf53::decode_passes`.
+  var mag = raw_mag;
+  let passes = passesProcessed[tile_idx];
+  if (raw_mag != 0 && passes >= 2u && passes < 14u) {
+    let unknown_bits = 14u - passes;
+    let midpoint = i32(1u << (unknown_bits - 1u));
+    mag = raw_mag + midpoint;
+  }
   return select(mag, -mag, sign_bit != 0u);
 }
 
