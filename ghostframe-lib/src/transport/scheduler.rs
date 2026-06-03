@@ -152,6 +152,20 @@ impl Scheduler {
         self.priority_queue.len()
     }
 
+    /// Count of unique (tile_x, tile_y) coordinates with outstanding
+    /// refinement work — i.e. entries in `refinement_queue` whose state
+    /// is not `WorkState::Acked`. Consumed by M3.6b's classifier
+    /// refinement-deficit bias (see `tile/classifier.rs::REFINEMENT_BIAS_PER_TILE_US`).
+    pub fn refinement_deficit_tiles(&self) -> u32 {
+        let mut seen: std::collections::HashSet<(u8, u8)> = std::collections::HashSet::new();
+        for w in self.refinement_queue.iter() {
+            if w.state != WorkState::Acked {
+                seen.insert((w.tile_x, w.tile_y));
+            }
+        }
+        seen.len() as u32
+    }
+
     pub fn generation_for(&self, tile_x: u8, tile_y: u8) -> u8 {
         let idx = (tile_y as usize) * (self.cols as usize) + (tile_x as usize);
         self.generations.get(idx).copied().unwrap_or(0)
@@ -1037,6 +1051,47 @@ mod tests {
             "expected fraction to recover above 0.05 after 11 healthy rounds; got {}",
             sch.current_refinement_fraction()
         );
+    }
+
+    #[test]
+    fn refinement_deficit_tiles_counts_unique_pending_tiles() {
+        use crate::transport::protocol::Codec;
+        let mut s = Scheduler::new(4, 4);
+        // Empty refinement queue ⇒ zero deficit.
+        assert_eq!(s.refinement_deficit_tiles(), 0);
+
+        // Inject two refinement passes for tile (0,0) and one for (1,2).
+        // Both tiles count once each → deficit = 2.
+        for pass_idx in [0u8, 1u8] {
+            s.refinement_queue.push_back(TileWork {
+                tile_x: 0, tile_y: 0, generation: 0,
+                pass_idx, total_passes: 14,
+                codec: Codec::Cdf53,
+                payload: Vec::new(),
+                queued_at: std::time::Instant::now(),
+                last_sent_at: None,
+                state: WorkState::Pending,
+            });
+        }
+        s.refinement_queue.push_back(TileWork {
+            tile_x: 1, tile_y: 2, generation: 0,
+            pass_idx: 0, total_passes: 14,
+            codec: Codec::Cdf53,
+            payload: Vec::new(),
+            queued_at: std::time::Instant::now(),
+            last_sent_at: None,
+            state: WorkState::Pending,
+        });
+        assert_eq!(s.refinement_deficit_tiles(), 2);
+
+        // Marking one of (0,0)'s passes as Acked must not change the count
+        // (the other pass on (0,0) is still pending).
+        s.refinement_queue.front_mut().unwrap().state = WorkState::Acked;
+        assert_eq!(s.refinement_deficit_tiles(), 2);
+
+        // Marking BOTH (0,0) passes as Acked ⇒ only (1,2) outstanding ⇒ 1.
+        s.refinement_queue[1].state = WorkState::Acked;
+        assert_eq!(s.refinement_deficit_tiles(), 1);
     }
 
     #[cfg(feature = "cdf53-diag")]

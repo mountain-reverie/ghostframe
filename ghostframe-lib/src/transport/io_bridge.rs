@@ -1480,6 +1480,8 @@ impl IoBridge {
         let prev_mode = self.frame_mode;
 
         // Always evaluate mode — empty tentative drives the exit-sustain counter.
+        let deficit = self.scheduler.refinement_deficit_tiles();
+        self.classifier.set_refinement_deficit_tiles(deficit);
         let new_mode = self.classifier.decide_frame_mode(&tentative, prev_mode);
 
         // Persist tentative state back into per-tile metrics for dirty tiles only.
