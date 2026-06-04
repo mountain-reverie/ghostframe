@@ -300,6 +300,13 @@ pub struct Classifier {
     state: ClassifierHysteresis,
     adaptation_context: AdaptationContext,
     refinement_deficit_tiles: u32,
+    /// M3.7a env-var override: when `Some`, `decide_inner` uses this
+    /// instead of `REFINEMENT_BIAS_PER_TILE_US`. Populated from
+    /// `GHOSTFRAME_TEST_REFINEMENT_BIAS_US` in `Default::default()` under
+    /// `cfg(any(test, feature = "test-loss-injection"))`. `None` in
+    /// production builds (env var ignored).
+    #[cfg(any(test, feature = "test-loss-injection"))]
+    refinement_bias_us_override: Option<f32>,
     /// Last emitted mode (debounces the `mode.decision` event to fire
     /// only on transitions). `None` before the first decision.
     last_emitted_mode: Option<FrameMode>,
@@ -323,6 +330,11 @@ impl Default for Classifier {
             state: ClassifierHysteresis::default(),
             adaptation_context: AdaptationContext::default(),
             refinement_deficit_tiles: 0,
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            refinement_bias_us_override: std::env::var("GHOSTFRAME_TEST_REFINEMENT_BIAS_US")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .filter(|v| *v > 0.0),
             last_emitted_mode: None,
             epoch: std::time::Instant::now(),
         }
@@ -471,8 +483,13 @@ impl Classifier {
             .sum();
         let bytes_per_us = self.cost.bytes_per_us();
         let tile_codec_cost = non_h264_us + (all_tile_bytes as f32) / bytes_per_us;
-        let refinement_bias_us =
-            self.refinement_deficit_tiles as f32 * REFINEMENT_BIAS_PER_TILE_US;
+        let per_tile_bias = {
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            { self.refinement_bias_us_override.unwrap_or(REFINEMENT_BIAS_PER_TILE_US) }
+            #[cfg(not(any(test, feature = "test-loss-injection")))]
+            { REFINEMENT_BIAS_PER_TILE_US }
+        };
+        let refinement_bias_us = self.refinement_deficit_tiles as f32 * per_tile_bias;
         let h264_cost = self.cost.h264_frame_us
             + (self.cost.h264_frame_bytes as f32) / bytes_per_us
             + refinement_bias_us;

@@ -420,3 +420,65 @@ fn mode_decision_event_emitted_only_on_transition() {
     assert_eq!(m3, FrameMode::H264);
     assert_eq!(c.last_emitted_mode(), Some(FrameMode::H264));
 }
+
+#[test]
+fn env_var_override_refinement_bias_us() {
+    use crate::tile::classifier::{AdaptationContext, Classifier, REFINEMENT_BIAS_PER_TILE_US};
+    use crate::tile::{CodecState, FrameMode};
+
+    // Set the override to a value LARGE enough to flip a decision that would
+    // otherwise pick H264 by cost comparison.
+    std::env::set_var("GHOSTFRAME_TEST_REFINEMENT_BIAS_US", "1000.0");
+    let mut c = Classifier::default();
+    std::env::remove_var("GHOSTFRAME_TEST_REFINEMENT_BIAS_US");
+
+    let ctx = AdaptationContext {
+        bytes_per_us: 100.0,
+        smoothed_rtt_us: 5_000.0,
+        loss_rate: 0.0,
+        suspended: false,
+        last_update_seq: 1,
+    };
+    c.set_adaptation_context(ctx);
+    let max_passes = crate::encoder::cdf53::CDF53_PASS_COUNT as u8;
+    let tentative: Vec<CodecState> = (0..40)
+        .map(|_| CodecState::Cdf53 { passes_sent: 0, max_passes })
+        .collect();
+    c.set_refinement_deficit_tiles(40);
+
+    // With 1000.0 µs bias instead of the default 5.0, h264_cost grows
+    // by 40_000 µs, easily winning vs the per-tile cost. TileCodec stays.
+    let mode = c.decide_frame_mode(&tentative, FrameMode::TileCodec);
+    assert_eq!(mode, FrameMode::TileCodec);
+
+    // Sanity: default constant is still the production value.
+    assert_eq!(REFINEMENT_BIAS_PER_TILE_US, 5.0);
+}
+
+#[test]
+fn env_var_override_loss_override_threshold() {
+    use crate::tile::classifier::{AdaptationContext, Classifier, LOSS_OVERRIDE_THRESHOLD};
+    use crate::tile::{CodecState, FrameMode};
+
+    // Raise the threshold to 0.50 — well above the test ctx's 0.15.
+    std::env::set_var("GHOSTFRAME_TEST_LOSS_OVERRIDE_THRESHOLD", "0.50");
+    let mut c = Classifier::default();
+    std::env::remove_var("GHOSTFRAME_TEST_LOSS_OVERRIDE_THRESHOLD");
+
+    let ctx = AdaptationContext {
+        bytes_per_us: 100.0,
+        smoothed_rtt_us: 5_000.0,
+        loss_rate: 0.15,
+        suspended: false,
+        last_update_seq: 1,
+    };
+    c.set_adaptation_context(ctx);
+    let tentative = vec![CodecState::Solid];
+
+    // 0.15 < 0.50 ⇒ override should NOT fire (would fire at default 0.10).
+    assert_eq!(
+        c.decide_frame_mode(&tentative, FrameMode::TileCodec),
+        FrameMode::TileCodec
+    );
+    assert_eq!(LOSS_OVERRIDE_THRESHOLD, 0.10);
+}
