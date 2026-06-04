@@ -87,6 +87,12 @@ struct Args {
     #[arg(long, value_name = "CLASS")]
     tile_pattern: Option<String>,
 
+    /// M3.7a: shift the rendered tile_pattern by 1 px every N ms to
+    /// generate dirty events for the classifier under pure-scene
+    /// content. Requires --drm-direct and --tile-pattern.
+    #[arg(long)]
+    subtle_drift: Option<u64>,
+
     /// (Ignored — kept for CLI compat.) Window width.
     #[arg(long, default_value = "640")]
     width: u16,
@@ -122,8 +128,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // DRM-direct tile-pattern mode: full-screen ContentClass fixture tile
     // repeated to cover the scanout. Drives M3.5 Layer B pure-scene benches.
+    // With --subtle-drift <ms>, shifts the bitmap 1 px/X per tick to generate
+    // dirty events for the classifier (M3.7a bench).
     if args.drm_direct {
         if let Some(ref class_name) = args.tile_pattern {
+            if let Some(drift_ms) = args.subtle_drift {
+                return ghostframe_test_pattern::subtle_drift::run(
+                    &args.drm_device,
+                    class_name,
+                    drift_ms,
+                );
+            }
             return ghostframe_test_pattern::tile_pattern::run(
                 &args.drm_device,
                 class_name,
