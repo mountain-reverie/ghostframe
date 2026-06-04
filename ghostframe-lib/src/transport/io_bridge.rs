@@ -1066,6 +1066,7 @@ impl IoBridge {
         use crate::tile::CodecState;
 
         tracing::warn!(
+            target: "ghostframe::bench",
             codec = msg.codec,
             tile_x = msg.tile_x,
             tile_y = msg.tile_y,
