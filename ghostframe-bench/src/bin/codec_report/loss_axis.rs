@@ -19,6 +19,11 @@ pub const LOSS_VALUES: &[LossPoint] = &[
     LossPoint { label: "loss_15pct", probability: 0.15 },
 ];
 
-pub const DEFAULT_SCENE_NAME: &str = "mode_switch";
-pub const DEFAULT_TEST_PATTERN_ARGS: &[&str] = &["--mode-switch-cycle", "2"];
+/// 12-second halves match the bias_sweep default for consistency. The
+/// loss axis doesn't strictly need refinement convergence to fire (the
+/// loss_override path triggers independently), but longer scenes give
+/// more opportunities for the smoothed loss_rate to cross the threshold
+/// across different content phases.
+pub const DEFAULT_SCENE_NAME: &str = "mode_switch_12s";
+pub const DEFAULT_TEST_PATTERN_ARGS: &[&str] = &["--mode-switch-cycle", "12"];
 pub const DEFAULT_BANDWIDTH_BYTES_PER_SEC: u64 = 3_750_000; // 30 mbps_cable

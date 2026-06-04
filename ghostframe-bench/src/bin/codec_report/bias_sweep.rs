@@ -16,23 +16,24 @@ pub const BIAS_VALUES_US: &[BiasPoint] = &[
     BiasPoint { label: "bias_20us", value_us: 20.0 },
 ];
 
-/// Default scene + content. Uses `--solid-red --spinner` — a large
-/// static red background plus a small rotating spinner, same pattern
-/// as e2e_h264_motion. Borderline by design: mostly-static content
-/// with localized motion is exactly the regime where the bias term
-/// matters (the policy's cost comparison is close to the deadband,
-/// and bias decides whether the spinner's dirty events flip to H264
-/// or stay in TileCodec). Clear-cut content (full motion or fully
-/// static) wouldn't differentiate bias values.
+/// Default scene + content. Uses `--mode-switch-cycle 12` — same pattern
+/// as e2e_progressive_refinement, the only known scene config that
+/// reliably observes PixelPerfect transitions (720+ per 30 s scene in
+/// the canonical test). 12-second halves give refinement room to complete
+/// all 14 passes (~5-7 s at 30 fps with `refinement_bandwidth_fraction
+/// = 0.2`) WITHIN a static half, so the PixelPerfect outcome metric can
+/// actually fire. The 4-second cycle tried earlier (cycle = 4) ran the
+/// motion half before refinement converged, producing zero PixelPerfect.
+///
+/// Bench scene_duration should be ≥ 4× cycle (≥ 48 s) so multiple
+/// refinement-complete events accumulate per swept value.
 ///
 /// The `--subtle-drift` mode added in Task 5 stays in the test-pattern
-/// binary as ad-hoc tooling; this bench uses `--solid-red --spinner`
-/// because (a) it's a proven working pattern on the WebGPU client and
-/// (b) it produces the borderline content bias tuning needs.
-pub const DEFAULT_SCENE_NAME: &str = "spinner";
+/// binary as ad-hoc tooling; this bench uses mode_switch_cycle because
+/// it's the only proven content that reaches PixelPerfect under bench.
+pub const DEFAULT_SCENE_NAME: &str = "mode_switch_12s";
 pub const DEFAULT_TEST_PATTERN_ARGS: &[&str] = &[
-    "--solid-red",
-    "--spinner",
+    "--mode-switch-cycle", "12",
 ];
 pub const DEFAULT_BANDWIDTH_BYTES_PER_SEC: u64 = 1_250_000; // 10 mbps_dsl
 pub const DEFAULT_LOSS_PROBABILITY: f32 = 0.01; // 1% — mild realism

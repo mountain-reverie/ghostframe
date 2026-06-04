@@ -30,6 +30,14 @@ async fn main() -> anyhow::Result<()> {
     let mut state = aggregate::ReportState::new(&args);
     if args.bias_sweep {
         use ghostframe_e2e::harness::{FrameMode, SceneSpec};
+        // Required for CDF53 refinement to fire at all — without this
+        // env var the codec is disabled in xdaemon and the PixelPerfect
+        // outcome metric stays at zero regardless of bias value.
+        std::env::set_var("GHOSTFRAME_ENABLE_CDF53", "1");
+        // 30 fps gives the refinement loop enough ticks per second to
+        // complete all 14 passes for a tile within a 12-second static
+        // half (matches e2e_progressive_refinement which observes 720+).
+        std::env::set_var("CAPTURE_FPS", "30");
         for point in bias_sweep::BIAS_VALUES_US {
             std::env::set_var("GHOSTFRAME_TEST_REFINEMENT_BIAS_US", point.value_us.to_string());
             std::env::set_var(
@@ -62,8 +70,16 @@ async fn main() -> anyhow::Result<()> {
             std::env::remove_var("GHOSTFRAME_INBOUND_LOSS_SEED");
             std::env::remove_var("GHOSTFRAME_INBOUND_LOSS_PREDICATE");
         }
+        std::env::remove_var("GHOSTFRAME_ENABLE_CDF53");
+        std::env::remove_var("CAPTURE_FPS");
     } else if args.loss_axis {
         use ghostframe_e2e::harness::{FrameMode, SceneSpec};
+        // Required for CDF53 refinement (PixelPerfect column needs it).
+        // The threshold ITSELF stays at production default (0.10) across
+        // the sweep — we vary the inbound loss rate and observe where
+        // the default threshold starts firing loss_override.
+        std::env::set_var("GHOSTFRAME_ENABLE_CDF53", "1");
+        std::env::set_var("CAPTURE_FPS", "30");
         for point in loss_axis::LOSS_VALUES {
             std::env::set_var(
                 "GHOSTFRAME_OUTBOUND_BANDWIDTH_CAP",
@@ -89,6 +105,8 @@ async fn main() -> anyhow::Result<()> {
             std::env::remove_var("GHOSTFRAME_INBOUND_LOSS_SEED");
             std::env::remove_var("GHOSTFRAME_INBOUND_LOSS_PREDICATE");
         }
+        std::env::remove_var("GHOSTFRAME_ENABLE_CDF53");
+        std::env::remove_var("CAPTURE_FPS");
     } else if args.bandwidth_matrix {
         for point in bandwidth_matrix::BANDWIDTH_POINTS {
             std::env::set_var(

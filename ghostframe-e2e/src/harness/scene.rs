@@ -227,6 +227,29 @@ async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioStack> {
         "GHOSTFRAME_INBOUND_LOSS_PROBABILITY",
         "GHOSTFRAME_INBOUND_LOSS_SEED",
         "GHOSTFRAME_INBOUND_LOSS_PREDICATE",
+        // M3.7a: classifier env-var overrides — bench sweep modes set
+        // these per swept value; without forwarding they'd silently
+        // never reach xdaemon and every swept value would behave
+        // identically (the bug that produced near-identical mode_switch
+        // counts across bias_sweep / loss_axis runs in v4).
+        "GHOSTFRAME_TEST_REFINEMENT_BIAS_US",
+        "GHOSTFRAME_TEST_LOSS_OVERRIDE_THRESHOLD",
+        "GHOSTFRAME_TEST_HEADROOM_MIN_BPUS",
+        "GHOSTFRAME_TEST_FORCE_BYTES_PER_US",
+        // M3.6/M3.7: required for any CDF53 refinement work to fire at
+        // all. e2e_progressive_refinement sets this explicitly; bench
+        // sweeps that target refinement (PixelPerfect outcome metric)
+        // need it forwarded so the codec is actually enabled in the
+        // container's xdaemon.
+        "GHOSTFRAME_ENABLE_CDF53",
+        // M3.7b: tc qdisc shaping vars consumed by the entrypoint.
+        "SHAPE_BANDWIDTH_KBPS",
+        "SHAPE_DELAY_MS",
+        "SHAPE_LOSS_PCT",
+        // Capture frame rate — defaults to 2 fps which is too slow for
+        // the scheduler's refinement loop to make progress within bench
+        // scene-duration. e2e_progressive_refinement sets this to 30.
+        "CAPTURE_FPS",
     ] {
         if let Ok(val) = std::env::var(var) {
             server_image = server_image.with_env_var(var, val);
