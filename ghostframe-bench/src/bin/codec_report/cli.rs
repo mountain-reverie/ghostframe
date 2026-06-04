@@ -34,6 +34,16 @@ pub struct Cli {
     /// the single unconstrained default. M3.6c bench mode.
     #[arg(long, default_value_t = false)]
     pub bandwidth_matrix: bool,
+
+    /// M3.7a Tier 1: sweep REFINEMENT_BIAS_PER_TILE_US across 4 values
+    /// on a single scene + bandwidth point. Emits Table 11 in the report.
+    #[arg(long, default_value_t = false)]
+    pub bias_sweep: bool,
+
+    /// M3.7a Tier 1: sweep inbound loss rate across 6 values on a
+    /// single scene + bandwidth point. Emits Table 12.
+    #[arg(long, default_value_t = false)]
+    pub loss_axis: bool,
 }
 
 fn parse_duration(s: &str) -> Result<Duration, String> {

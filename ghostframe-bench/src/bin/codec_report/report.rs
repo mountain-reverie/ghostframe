@@ -3,7 +3,7 @@
 use std::io::Write;
 use std::path::Path;
 
-use crate::aggregate::ReportState;
+use crate::aggregate::{ReportState, SceneSummary};
 
 pub fn load_criterion(path: &Path) -> anyhow::Result<serde_json::Value> {
     let text = std::fs::read_to_string(path)?;
@@ -12,15 +12,10 @@ pub fn load_criterion(path: &Path) -> anyhow::Result<serde_json::Value> {
 }
 
 pub fn write(
-    path: &Path,
+    f: &mut dyn Write,
     state: &ReportState,
     criterion: Option<&serde_json::Value>,
 ) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut f = std::fs::File::create(path)?;
-
     // ---- Section 1: Preamble ----
     let git_rev = std::process::Command::new("git").args(["rev-parse", "HEAD"]).output()
         .ok().and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_default();
@@ -290,6 +285,85 @@ pub fn write(
     }
     writeln!(f)?;
 
+    // ---- Section 11: M3.7a Bias sweep ----
+    {
+        let mut rows: Vec<(&String, &SceneSummary)> = state
+            .scenes
+            .iter()
+            .filter(|(_, s)| s.sweep_axis_label.as_deref().map(|l| l.starts_with("bias_")).unwrap_or(false))
+            .collect();
+        rows.sort_by_key(|(name, _)| name.as_str());
+
+        if !rows.is_empty() {
+            writeln!(f, "## 11. Bias sweep (REFINEMENT_BIAS_PER_TILE_US) — M3.7a")?;
+            writeln!(f)?;
+            writeln!(f, "| Bias µs | PixelPerfect | Mode switches | Capture→paint p50 ms | Drop % |")?;
+            writeln!(f, "|---|---:|---:|---:|---:|")?;
+            for (_, s) in &rows {
+                let bias_label = s.sweep_axis_label.as_deref().unwrap_or("?");
+                let bias_us: f32 = bias_label
+                    .strip_prefix("bias_")
+                    .and_then(|s| s.strip_suffix("us"))
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.0);
+                writeln!(
+                    f,
+                    "| {:.1} | {} | {} | {:.2} | {:.1} |",
+                    bias_us,
+                    s.pixelperfect_count,
+                    s.mode_switch_count,
+                    s.client_interval_median_ms,
+                    s.drop_rate_percent,
+                )?;
+            }
+            writeln!(f)?;
+            writeln!(f, "_Verdict rule: pick the bias with highest PixelPerfect/switches ratio whose latency p50 isn't > 10% above the lowest-swept value._")?;
+            writeln!(f)?;
+        }
+    }
+
+    // ---- Section 12: M3.7a Loss axis ----
+    {
+        let mut rows: Vec<(&String, &SceneSummary)> = state
+            .scenes
+            .iter()
+            .filter(|(_, s)| s.sweep_axis_label.as_deref().map(|l| l.starts_with("loss_")).unwrap_or(false))
+            .collect();
+        rows.sort_by_key(|(name, _)| name.as_str());
+
+        if !rows.is_empty() {
+            writeln!(f, "## 12. Loss axis (LOSS_OVERRIDE_THRESHOLD) — M3.7a")?;
+            writeln!(f)?;
+            writeln!(f, "| Loss % | Decode errors | Override fires | Mode switches | PixelPerfect |")?;
+            writeln!(f, "|---:|---:|---:|---:|---:|")?;
+            for (_, s) in &rows {
+                let label = s.sweep_axis_label.as_deref().unwrap_or("?");
+                let loss_pct: u32 = label
+                    .strip_prefix("loss_")
+                    .and_then(|s| s.strip_suffix("pct"))
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                let override_count = s
+                    .mode_decision_counts
+                    .get("loss_override")
+                    .copied()
+                    .unwrap_or(0);
+                writeln!(
+                    f,
+                    "| {} | {} | {} | {} | {} |",
+                    loss_pct,
+                    s.decode_error_count,
+                    override_count,
+                    s.mode_switch_count,
+                    s.pixelperfect_count,
+                )?;
+            }
+            writeln!(f)?;
+            writeln!(f, "_Verdict rule: threshold goes at the loss rate where decode_error_count first jumps; if no jump, keep 0.10._")?;
+            writeln!(f)?;
+        }
+    }
+
     Ok(())
 }
 
@@ -331,9 +405,9 @@ mod tests {
     #[test]
     fn sections_9_10_single_bw() {
         let state = make_test_state(false);
-        let tmp = std::env::temp_dir().join("report_test_single.md");
-        write(&tmp, &state, None).expect("write should succeed");
-        let text = std::fs::read_to_string(&tmp).expect("file exists");
+        let mut buf = Vec::new();
+        write(&mut buf, &state, None).expect("write should succeed");
+        let text = String::from_utf8(buf).expect("valid utf8");
         assert!(text.contains("## 9. Mode dwell × bandwidth × scene"), "section 9 header");
         assert!(text.contains("## 10. Override-trigger frequency"), "section 10 header");
         assert!(text.contains("_Single-bandwidth run"), "single-bw note");
@@ -348,9 +422,9 @@ mod tests {
     #[test]
     fn sections_9_10_matrix_bw() {
         let state = make_test_state(true);
-        let tmp = std::env::temp_dir().join("report_test_matrix.md");
-        write(&tmp, &state, None).expect("write should succeed");
-        let text = std::fs::read_to_string(&tmp).expect("file exists");
+        let mut buf = Vec::new();
+        write(&mut buf, &state, None).expect("write should succeed");
+        let text = String::from_utf8(buf).expect("valid utf8");
         assert!(text.contains("## 9. Mode dwell × bandwidth × scene"), "section 9 header");
         assert!(text.contains("## 10. Override-trigger frequency"), "section 10 header");
         // matrix headers should NOT have single-bw note
@@ -359,5 +433,33 @@ mod tests {
         assert!(text.contains("[thrash]"), "[thrash] annotation present");
         // Table 10 matrix: bw rows
         assert!(text.contains("cost_comparison"), "cost_comparison column");
+    }
+
+    #[test]
+    fn write_emits_sections_11_and_12_when_sweep_labels_present() {
+        use std::collections::BTreeMap;
+        let args = Cli::parse_from(["codec_report"]);
+        let mut state = ReportState::new(&args);
+        // Inject one scene per sweep family.
+        let mut bias_summary = SceneSummary::default();
+        bias_summary.sweep_axis_label = Some("bias_10us".into());
+        bias_summary.pixelperfect_count = 42;
+        bias_summary.mode_switch_count = 3;
+        state.scenes.insert("bias_10us/text".into(), bias_summary);
+        let mut loss_summary = SceneSummary::default();
+        loss_summary.sweep_axis_label = Some("loss_5pct".into());
+        loss_summary.decode_error_count = 7;
+        let mut counts = BTreeMap::new();
+        counts.insert("loss_override".into(), 2);
+        loss_summary.mode_decision_counts = counts;
+        state.scenes.insert("loss_5pct/mode_switch".into(), loss_summary);
+
+        let mut buf = Vec::new();
+        write(&mut buf, &state, None).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("## 11. Bias sweep"), "section 11 header");
+        assert!(text.contains("## 12. Loss axis"), "section 12 header");
+        assert!(text.contains("| 10.0 |"), "bias row formatted");
+        assert!(text.contains("| 5 |"), "loss row formatted");
     }
 }
