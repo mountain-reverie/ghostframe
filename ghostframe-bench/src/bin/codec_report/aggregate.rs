@@ -39,6 +39,13 @@ pub struct SceneSummary {
     /// Keys: "cost_comparison", "headroom_guard", "loss_override",
     /// "suspension", "hysteresis_clamp".
     pub mode_decision_counts: std::collections::BTreeMap<String, u32>,
+
+    // M3.7a additions
+    pub pixelperfect_count: u32,
+    pub decode_error_count: u32,
+    /// When this scene was part of a M3.7 sweep, the label of the swept
+    /// value (e.g. "bias_10us" or "loss_5pct"). None for non-sweep runs.
+    pub sweep_axis_label: Option<String>,
 }
 
 impl ReportState {
@@ -131,6 +138,9 @@ impl ReportState {
             *mode_decision_counts.entry(d.reason.clone()).or_default() += 1;
         }
 
+        let pixelperfect_count = r.policy_metrics.pixelperfect_count;
+        let decode_error_count = r.policy_metrics.decode_error_count;
+
         self.scenes.insert(
             name.into(),
             SceneSummary {
@@ -152,6 +162,9 @@ impl ReportState {
                 tile_dwell_us,
                 mode_switch_count,
                 mode_decision_counts,
+                pixelperfect_count,
+                decode_error_count,
+                sweep_axis_label: None,
             },
         );
     }
