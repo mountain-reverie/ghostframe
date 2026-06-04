@@ -273,6 +273,14 @@ pub const HEADROOM_MIN_BYTES_PER_US: f32 = 0.25;
 pub const LOSS_OVERRIDE_THRESHOLD: f32 = 0.10;
 
 /// Hysteresis state for `Classifier::decide_frame_mode_at`.
+///
+/// Hybrid design: a transition requires BOTH a wall-clock dwell AND
+/// a streak of consecutive calls where the condition holds. The streak
+/// counter is preemption-immune (doesn't advance during pauses); the
+/// wall-clock dwell enforces frame-rate-independent timing at high FPS.
+/// Both must be satisfied to flip — fixes the 7e3e041 regression where
+/// docker scheduling pauses caused wall-clock-only dwell to spuriously
+/// elapse past the threshold despite few actual calls.
 #[derive(Debug, Clone, Copy, Default)]
 struct ClassifierHysteresis {
     /// Wall-clock µs at which the enter condition first started holding,
@@ -281,6 +289,11 @@ struct ClassifierHysteresis {
     /// Wall-clock µs at which the exit condition first started holding,
     /// or `None` if it isn't holding now.
     exit_started_us: Option<u64>,
+    /// Consecutive calls where the enter condition has held. Reset to 0
+    /// on the first call where enter_now=false.
+    enter_streak: u32,
+    /// Consecutive calls where the exit condition has held.
+    exit_streak: u32,
 }
 
 /// Tunable decision parameters; defaults reflect the design doc M3.0 values.
@@ -292,11 +305,19 @@ pub struct Classifier {
     pub motion_tile_threshold: f32,    // default 0.20 (fraction of dirty tiles)
     pub motion_tile_min_absolute: u32, // default 8 (absolute floor)
     /// Wall-clock µs the enter condition must hold before transitioning
-    /// to H264. Default 50_000 µs (≈ 3 frames at 60 fps).
+    /// to H264. Default 50_000 µs (≈ 3 frames at 60 fps). Hybrid: this
+    /// AND `enter_sustain_frames_min` must both be satisfied to flip.
     pub enter_sustain_micros: u64,
     /// Wall-clock µs the exit condition must hold before transitioning
     /// back to TileCodec. Default 500_000 µs (≈ 30 frames at 60 fps).
+    /// Hybrid: this AND `exit_sustain_frames_min` must both be satisfied.
     pub exit_sustain_micros: u64,
+    /// Minimum consecutive calls (frame-rate-independent floor) where
+    /// enter condition holds. Default 3. Required ALONGSIDE
+    /// `enter_sustain_micros` to flip — preemption-immune component.
+    pub enter_sustain_frames_min: u32,
+    /// Minimum consecutive calls where exit condition holds. Default 30.
+    pub exit_sustain_frames_min: u32,
     state: ClassifierHysteresis,
     adaptation_context: AdaptationContext,
     refinement_deficit_tiles: u32,
@@ -333,6 +354,8 @@ impl Default for Classifier {
             motion_tile_min_absolute: 8,
             enter_sustain_micros: 50_000,
             exit_sustain_micros: 500_000,
+            enter_sustain_frames_min: 3,
+            exit_sustain_frames_min: 30,
             state: ClassifierHysteresis::default(),
             adaptation_context: AdaptationContext::default(),
             refinement_deficit_tiles: 0,
@@ -525,30 +548,47 @@ impl Classifier {
         let enter_now = cost_enter || motion_enter;
         let exit_now = tile_codec_cost < h264_cost * self.exit_factor;
 
+        // Hybrid hysteresis: a transition requires BOTH the wall-clock
+        // dwell AND the consecutive-call streak. The streak is preemption-
+        // immune (no calls during a pause = no advance); the wall-clock
+        // floor prevents over-eager flips at high FPS. See 7e3e041
+        // regression in `feedback_classifier_hysteresis_micros_regression`.
         match prev_mode {
             FrameMode::TileCodec => {
                 if enter_now {
                     let started = self.state.enter_started_us.get_or_insert(now_us);
+                    self.state.enter_streak = self.state.enter_streak.saturating_add(1);
                     self.state.exit_started_us = None;
-                    if now_us.saturating_sub(*started) >= self.enter_sustain_micros {
+                    self.state.exit_streak = 0;
+                    let micros_elapsed = now_us.saturating_sub(*started) >= self.enter_sustain_micros;
+                    let frames_elapsed = self.state.enter_streak >= self.enter_sustain_frames_min;
+                    if micros_elapsed && frames_elapsed {
                         self.state.enter_started_us = None;
+                        self.state.enter_streak = 0;
                         return (FrameMode::H264, "cost_comparison");
                     }
                 } else {
                     self.state.enter_started_us = None;
+                    self.state.enter_streak = 0;
                 }
                 (FrameMode::TileCodec, "hysteresis_clamp")
             }
             FrameMode::H264 => {
                 if exit_now {
                     let started = self.state.exit_started_us.get_or_insert(now_us);
+                    self.state.exit_streak = self.state.exit_streak.saturating_add(1);
                     self.state.enter_started_us = None;
-                    if now_us.saturating_sub(*started) >= self.exit_sustain_micros {
+                    self.state.enter_streak = 0;
+                    let micros_elapsed = now_us.saturating_sub(*started) >= self.exit_sustain_micros;
+                    let frames_elapsed = self.state.exit_streak >= self.exit_sustain_frames_min;
+                    if micros_elapsed && frames_elapsed {
                         self.state.exit_started_us = None;
+                        self.state.exit_streak = 0;
                         return (FrameMode::TileCodec, "cost_comparison");
                     }
                 } else {
                     self.state.exit_started_us = None;
+                    self.state.exit_streak = 0;
                 }
                 (FrameMode::H264, "hysteresis_clamp")
             }
