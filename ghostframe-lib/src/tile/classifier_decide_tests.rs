@@ -426,12 +426,6 @@ fn env_var_override_refinement_bias_us() {
     use crate::tile::classifier::{AdaptationContext, Classifier, REFINEMENT_BIAS_PER_TILE_US};
     use crate::tile::{CodecState, FrameMode};
 
-    // Set the override to a value LARGE enough to flip a decision that would
-    // otherwise pick H264 by cost comparison.
-    std::env::set_var("GHOSTFRAME_TEST_REFINEMENT_BIAS_US", "1000.0");
-    let mut c = Classifier::default();
-    std::env::remove_var("GHOSTFRAME_TEST_REFINEMENT_BIAS_US");
-
     let ctx = AdaptationContext {
         bytes_per_us: 100.0,
         smoothed_rtt_us: 5_000.0,
@@ -439,19 +433,61 @@ fn env_var_override_refinement_bias_us() {
         suspended: false,
         last_update_seq: 1,
     };
-    c.set_adaptation_context(ctx);
     let max_passes = crate::encoder::cdf53::CDF53_PASS_COUNT as u8;
     let tentative: Vec<CodecState> = (0..40)
         .map(|_| CodecState::Cdf53 { passes_sent: 0, max_passes })
         .collect();
-    c.set_refinement_deficit_tiles(40);
 
-    // With 1000.0 µs bias instead of the default 5.0, h264_cost grows
-    // by 40_000 µs, easily winning vs the per-tile cost. TileCodec stays.
-    let mode = c.decide_frame_mode(&tentative, FrameMode::TileCodec);
-    assert_eq!(mode, FrameMode::TileCodec);
+    // Helper: drive decide_frame_mode_at for 200 ms simulated wall clock at
+    // 60 fps frame cadence, starting from TileCodec. Returns the final mode.
+    // `deficit` is the refinement_deficit_tiles count to set each frame.
+    let drive = |c: &mut Classifier, deficit: u32| -> FrameMode {
+        c.set_adaptation_context(ctx);
+        c.set_refinement_deficit_tiles(deficit);
+        let mut mode = FrameMode::TileCodec;
+        for frame in 0..12u32 {
+            let now_us = (frame as u64) * 16_667;
+            mode = c.decide_frame_mode_at(now_us, &tentative, mode);
+        }
+        mode
+    };
 
-    // Sanity: default constant is still the production value.
+    // Both cases use deficit=1. This is the critical parameter:
+    //
+    //   tile_codec_cost = 40*90 + 40*1300/100.0 = 3600 + 520 = 4120 µs
+    //   h264_base = 3000 + 12000/100.0 = 3120 µs
+    //
+    //   Default bias (5.0 µs/tile), deficit=1:
+    //     h264_cost = 3120 + 1*5.0 = 3125 µs
+    //     enter threshold = 3125 * 1.3 = 4062.5 µs
+    //     4120 > 4062.5 → cost_enter = true → H264 after dwell
+    //
+    //   Override (1000.0 µs/tile), deficit=1:
+    //     h264_cost = 3120 + 1*1000.0 = 4120 µs
+    //     enter threshold = 4120 * 1.3 = 5356 µs
+    //     4120 ≤ 5356 → cost_enter = false → TileCodec holds
+
+    // Case 1: no override. Default bias = 5.0 µs/tile, threshold = 4062 µs <
+    // tile_codec_cost (4120 µs) → cost_enter = true → H264 after enter dwell.
+    let mut c_default = Classifier::default();
+    assert_eq!(
+        drive(&mut c_default, 1),
+        FrameMode::H264,
+        "without override, default bias (5 µs × 1 tile = 5 µs) lets cost path flip to H264"
+    );
+
+    // Case 2: with override = 1000.0 µs/tile, threshold = 5356 µs >
+    // tile_codec_cost (4120 µs) → cost_enter = false → TileCodec across the dwell.
+    std::env::set_var("GHOSTFRAME_TEST_REFINEMENT_BIAS_US", "1000.0");
+    let mut c_override = Classifier::default();
+    std::env::remove_var("GHOSTFRAME_TEST_REFINEMENT_BIAS_US");
+    assert_eq!(
+        drive(&mut c_override, 1),
+        FrameMode::TileCodec,
+        "with override = 1000 µs/tile (1 tile), threshold 5356 µs > tile_codec_cost → TileCodec holds"
+    );
+
+    // Sanity: default constant unchanged.
     assert_eq!(REFINEMENT_BIAS_PER_TILE_US, 5.0);
 }
 
