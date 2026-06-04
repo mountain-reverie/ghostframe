@@ -307,6 +307,12 @@ pub struct Classifier {
     /// production builds (env var ignored).
     #[cfg(any(test, feature = "test-loss-injection"))]
     refinement_bias_us_override: Option<f32>,
+    /// M3.7a env-var override: when `Some`, `decide_inner` uses this
+    /// instead of `LOSS_OVERRIDE_THRESHOLD`. Populated from
+    /// `GHOSTFRAME_TEST_LOSS_OVERRIDE_THRESHOLD` in `Default::default()`
+    /// under `cfg(any(test, feature = "test-loss-injection"))`.
+    #[cfg(any(test, feature = "test-loss-injection"))]
+    loss_override_threshold_override: Option<f32>,
     /// Last emitted mode (debounces the `mode.decision` event to fire
     /// only on transitions). `None` before the first decision.
     last_emitted_mode: Option<FrameMode>,
@@ -335,6 +341,11 @@ impl Default for Classifier {
                 .ok()
                 .and_then(|s| s.parse::<f32>().ok())
                 .filter(|v| *v > 0.0),
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            loss_override_threshold_override: std::env::var("GHOSTFRAME_TEST_LOSS_OVERRIDE_THRESHOLD")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .filter(|v| *v > 0.0 && *v <= 1.0),
             last_emitted_mode: None,
             epoch: std::time::Instant::now(),
         }
@@ -455,7 +466,13 @@ impl Classifier {
             self.state = ClassifierHysteresis::default();
             return (FrameMode::H264, "headroom_guard");
         }
-        let loss_force_h264 = ctx.loss_rate > LOSS_OVERRIDE_THRESHOLD;
+        let loss_threshold = {
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            { self.loss_override_threshold_override.unwrap_or(LOSS_OVERRIDE_THRESHOLD) }
+            #[cfg(not(any(test, feature = "test-loss-injection")))]
+            { LOSS_OVERRIDE_THRESHOLD }
+        };
+        let loss_force_h264 = ctx.loss_rate > loss_threshold;
         if loss_force_h264 {
             self.state = ClassifierHysteresis::default();
             return (FrameMode::H264, "loss_override");
