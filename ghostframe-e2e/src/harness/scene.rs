@@ -79,6 +79,20 @@ pub struct ModeDecisionRecord {
     pub to_mode: String,
 }
 
+/// M3.7a counters parsed from `target: "ghostframe::bench"` log lines.
+/// PixelPerfect transitions and decode errors are sampled from the
+/// server's existing log emissions — no new instrumentation required.
+#[derive(Clone, Debug, Default)]
+pub struct ScenePolicyMetrics {
+    /// Count of `cdf53.pixelperfect` log lines observed during the scene.
+    /// Each line fires when all passes for one tile reach Acked state.
+    pub pixelperfect_count: u32,
+    /// Count of `client decode error` log lines observed during the scene.
+    /// Each line fires when the client reports a per-tile decode failure
+    /// via the DECODE_ERROR datagram (0x04).
+    pub decode_error_count: u32,
+}
+
 #[derive(Clone, Debug)]
 pub struct ProcSample {
     pub wall_ns: u64,
@@ -93,6 +107,7 @@ pub struct SceneResult {
     pub server_telemetry: Vec<ServerTelemetryRecord>,
     pub client_diagnostics: Vec<ClientDiagnosticRecord>,
     pub mode_decisions: Vec<ModeDecisionRecord>,
+    pub policy_metrics: ScenePolicyMetrics,
     pub proc_samples: Vec<ProcSample>,
     pub wire_bytes_total: u64,
     pub error: Option<String>,
@@ -444,7 +459,7 @@ pub async fn run_scene(spec: &SceneSpec) -> Result<SceneResult> {
     // Collect server telemetry from the container's combined logs.
     let server_logs =
         crate::harness::cleanup::read_server_logs_stripped(&stack.server_container_name);
-    let (server_telemetry, mode_decisions) = parse_server_telemetry(&server_logs);
+    let (server_telemetry, mode_decisions, policy_metrics) = parse_server_telemetry(&server_logs);
 
     // Collect client diagnostics from Chromium via DevTools eval.
     let client_diagnostics = read_client_diagnostics(&stack.page).await?;
@@ -460,6 +475,7 @@ pub async fn run_scene(spec: &SceneSpec) -> Result<SceneResult> {
         server_telemetry,
         client_diagnostics,
         mode_decisions,
+        policy_metrics,
         proc_samples: proc_samples_vec,
         wire_bytes_total,
         error: None,
@@ -589,7 +605,7 @@ async fn sample_proc_loop(
 // Helper: parse JSON server telemetry
 // ---------------------------------------------------------------------------
 
-fn parse_server_telemetry(stderr_lines: &str) -> (Vec<ServerTelemetryRecord>, Vec<ModeDecisionRecord>) {
+fn parse_server_telemetry(stderr_lines: &str) -> (Vec<ServerTelemetryRecord>, Vec<ModeDecisionRecord>, ScenePolicyMetrics) {
     use std::collections::BTreeMap;
 
     // frame_seq → (capture_done_ns, mode)
@@ -597,6 +613,7 @@ fn parse_server_telemetry(stderr_lines: &str) -> (Vec<ServerTelemetryRecord>, Ve
     // frame_seq → (last_send_ns, total_wire_bytes, tile_count, CodecHistogram)
     let mut sends: BTreeMap<u64, (u64, u32, u16, CodecHistogram)> = BTreeMap::new();
     let mut decisions: Vec<ModeDecisionRecord> = Vec::new();
+    let mut policy_metrics = ScenePolicyMetrics::default();
 
     for line in stderr_lines.lines() {
         let v: serde_json::Value = match serde_json::from_str(line) {
@@ -689,6 +706,12 @@ fn parse_server_telemetry(stderr_lines: &str) -> (Vec<ServerTelemetryRecord>, Ve
                     .unwrap_or(0);
                 decisions.push(ModeDecisionRecord { frame_seq, reason, to_mode });
             }
+            "cdf53.pixelperfect" => {
+                policy_metrics.pixelperfect_count = policy_metrics.pixelperfect_count.saturating_add(1);
+            }
+            "client decode error" => {
+                policy_metrics.decode_error_count = policy_metrics.decode_error_count.saturating_add(1);
+            }
             _ => {}
         }
     }
@@ -709,12 +732,32 @@ fn parse_server_telemetry(stderr_lines: &str) -> (Vec<ServerTelemetryRecord>, Ve
             })
         })
         .collect();
-    (records, decisions)
+    (records, decisions, policy_metrics)
 }
 
 // ---------------------------------------------------------------------------
 // Helper: read client diagnostics via Chromium DevTools
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_server_telemetry_counts_pixelperfect_and_decode_error() {
+        let json = r#"
+{"target":"ghostframe::bench","fields":{"message":"cdf53.pixelperfect","tile_x":1,"tile_y":2}}
+{"target":"ghostframe::bench","fields":{"message":"cdf53.pixelperfect","tile_x":3,"tile_y":4}}
+{"target":"ghostframe::bench","fields":{"message":"client decode error","tile_x":0,"tile_y":0,"error_code":1}}
+{"target":"ghostframe::bench","fields":{"message":"frame.captured","frame_seq":1,"capture_done_ns":0,"mode":"tile"}}
+"#.trim();
+        let (records, decisions, metrics) = parse_server_telemetry(json);
+        assert_eq!(metrics.pixelperfect_count, 2);
+        assert_eq!(metrics.decode_error_count, 1);
+        // Sanity: existing parsers still work alongside.
+        assert!(!records.is_empty() || decisions.is_empty()); // captured frame without send is dropped — just assert no panic
+    }
+}
 
 async fn read_client_diagnostics(
     page: &chromiumoxide::Page,
