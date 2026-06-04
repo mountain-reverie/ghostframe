@@ -1634,7 +1634,7 @@ impl IoBridge {
                     // e2e tests can verify the lossless terminal state was
                     // reached without requiring the cdf53-diag feature gate.
                     tracing::info!(
-                        target: "ghostframe::cdf53",
+                        target: "ghostframe::bench",
                         tile_x = tile_x,
                         tile_y = tile_y,
                         gen = gen,
