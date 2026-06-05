@@ -173,10 +173,11 @@ pub fn write(
     // ---- Section 9: M3.6 Dynamic Policy — mode dwell × bw × scene ----
     writeln!(f, "## 9. Mode dwell × bandwidth × scene (M3.6)")?;
     writeln!(f)?;
-    // When bandwidth-matrix wasn't run, scene keys are bare names
-    // ("solid", "flat_ui", ...). When it WAS run, scene keys are
-    // "<bw>/<scene>". Distinguish by checking for '/'.
-    let has_matrix = state.scenes.keys().any(|k| k.contains('/'));
+    // Bandwidth-matrix runs label scenes "<bw>/<scene>". Other sweep modes
+    // (shaping_matrix, headroom_sweep) also use '/' in scene names, so we
+    // can't infer matrix mode from key shape alone — gate explicitly on
+    // the CLI flag.
+    let has_matrix = state.args.bandwidth_matrix;
     if !has_matrix {
         writeln!(f, "_Single-bandwidth run; matrix bench was not requested via `--bandwidth-matrix`._")?;
         writeln!(f)?;
@@ -305,7 +306,7 @@ pub fn write(
                     .strip_prefix("bias_")
                     .and_then(|s| s.strip_suffix("us"))
                     .and_then(|s| s.parse().ok())
-                    .unwrap_or(0.0);
+                    .unwrap_or(f32::NAN); // surfaces label-format drift in the report
                 writeln!(
                     f,
                     "| {:.1} | {} | {} | {:.2} | {:.1} |",
@@ -342,7 +343,12 @@ pub fn write(
                     .strip_prefix("loss_")
                     .and_then(|s| s.strip_suffix("pct"))
                     .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
+                    .unwrap_or(u32::MAX); // surfaces label-format drift in the report
+                let loss_pct_cell = if loss_pct == u32::MAX {
+                    "PARSE_ERR".to_string()
+                } else {
+                    format!("{}", loss_pct)
+                };
                 let override_count = s
                     .mode_decision_counts
                     .get("loss_override")
@@ -351,7 +357,7 @@ pub fn write(
                 writeln!(
                     f,
                     "| {} | {} | {} | {} | {} |",
-                    loss_pct,
+                    loss_pct_cell,
                     s.decode_error_count,
                     override_count,
                     s.mode_switch_count,
@@ -415,7 +421,7 @@ pub fn write(
                 let hr_value: f32 = hr_label
                     .strip_prefix("headroom_")
                     .and_then(|s| s.parse().ok())
-                    .unwrap_or(0.0);
+                    .unwrap_or(f32::NAN); // surfaces label-format drift in the report
                 let headroom_fires = s
                     .mode_decision_counts
                     .get("headroom_guard")
@@ -448,7 +454,11 @@ mod tests {
     use clap::Parser;
 
     fn make_test_state(matrix: bool) -> ReportState {
-        let args = Cli::parse_from(["codec_report"]);
+        let mut argv = vec!["codec_report"];
+        if matrix {
+            argv.push("--bandwidth-matrix");
+        }
+        let args = Cli::parse_from(argv);
         let mut state = ReportState::new(&args);
         if matrix {
             // Simulate bandwidth-matrix run with 2 bw caps × 2 scenes.

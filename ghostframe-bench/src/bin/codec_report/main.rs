@@ -121,7 +121,9 @@ async fn main() -> anyhow::Result<()> {
                 initial_mode: FrameMode::TileCodec,
             };
             tracing::info!(bias_us = point.value_us, scene = bias_sweep::DEFAULT_SCENE_NAME, "bias-sweep run");
-            runner::run_one_scene(&spec, &mut state).await?;
+            if let Err(e) = runner::run_one_scene(&spec, &mut state).await {
+                tracing::warn!(bias_us = point.value_us, error = %e, "bias-sweep scene failed, continuing");
+            }
             if let Some(summary) = state.scenes.get_mut(&labeled_name) {
                 summary.sweep_axis_label = Some(point.label.to_string());
             }
@@ -157,7 +159,9 @@ async fn main() -> anyhow::Result<()> {
                 initial_mode: FrameMode::TileCodec,
             };
             tracing::info!(loss = point.probability, "loss-axis run");
-            runner::run_one_scene(&spec, &mut state).await?;
+            if let Err(e) = runner::run_one_scene(&spec, &mut state).await {
+                tracing::warn!(loss = point.probability, error = %e, "loss-axis scene failed, continuing");
+            }
             if let Some(summary) = state.scenes.get_mut(&labeled_name) {
                 summary.sweep_axis_label = Some(point.label.to_string());
             }
