@@ -329,7 +329,11 @@ async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioStack> {
             .await;
         if let Ok(v) = result {
             let status: String = v.into_value().unwrap_or_default();
-            if status.contains("Receiving frames") {
+            // Match e2e helper: accept "Connected" OR "Receiving frames".
+            // Under harsh shaping (1 Mbps + 300ms RTT + 15% loss) the client
+            // reaches "Connected" reliably but may not see a frame within 30s.
+            // The bench should still proceed and record whatever data arrives.
+            if status.contains("Connected") || status.contains("Receiving frames") {
                 break;
             }
             if tokio::time::Instant::now() >= deadline {

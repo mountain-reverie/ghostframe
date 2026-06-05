@@ -49,7 +49,9 @@ async fn main() -> anyhow::Result<()> {
                     initial_mode: FrameMode::TileCodec,
                 };
                 tracing::info!(headroom_bpus = hp.value_bpus, shape = shape.label, "headroom-sweep run");
-                runner::run_one_scene(&spec, &mut state).await?;
+                if let Err(e) = runner::run_one_scene(&spec, &mut state).await {
+                    tracing::warn!(headroom_bpus = hp.value_bpus, shape = shape.label, error = %e, "headroom-sweep scene failed, continuing");
+                }
                 if let Some(summary) = state.scenes.get_mut(&labeled_name) {
                     summary.sweep_axis_label = Some(format!("{}/{}", hp.label, shape.label));
                 }
@@ -74,7 +76,9 @@ async fn main() -> anyhow::Result<()> {
                 let mut labeled_spec = spec.clone();
                 labeled_spec.name = Box::leak(labeled_name.clone().into_boxed_str());
                 tracing::info!(scene = spec.name, shape = shape.label, "shaping-matrix run");
-                runner::run_one_scene(&labeled_spec, &mut state).await?;
+                if let Err(e) = runner::run_one_scene(&labeled_spec, &mut state).await {
+                    tracing::warn!(scene = spec.name, shape = shape.label, error = %e, "shaping-matrix scene failed, continuing");
+                }
                 if let Some(summary) = state.scenes.get_mut(&labeled_name) {
                     summary.sweep_axis_label = Some(format!("shape_{}", shape.label));
                 }
