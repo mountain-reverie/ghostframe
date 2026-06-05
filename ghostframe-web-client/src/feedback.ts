@@ -61,8 +61,7 @@ export class LossTracker {
 // Wire format (2 bytes):
 //   [0]  msg_type = 0x03
 //   [1]  capabilities : u8   bit 0 = supports indices_raw
-//                            bit 1 = supports cdf53
-//                            bits 2..7 reserved
+//                            bits 1..7 reserved
 // ---------------------------------------------------------------------------
 
 export const HELLO_MSG_TYPE = 0x03;
@@ -70,13 +69,11 @@ export const HELLO_SIZE = 2;
 
 export interface ClientCapabilities {
   indicesRawEnabled: boolean;
-  supportsCdf53: boolean;
 }
 
 export function encodeHello(caps: ClientCapabilities): Uint8Array {
   let capsByte = 0;
   if (caps.indicesRawEnabled) capsByte |= 0x01;
-  if (caps.supportsCdf53)     capsByte |= 0x02;
   return new Uint8Array([HELLO_MSG_TYPE, capsByte]);
 }
 

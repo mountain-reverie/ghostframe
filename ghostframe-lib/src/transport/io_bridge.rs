@@ -1364,7 +1364,7 @@ impl IoBridge {
             // SECOND TileCodec frame. Acceptable — refinement queries run
             // every frame and there are plenty of cycles to escalate.
             let frame_mode_eligible = matches!(self.frame_mode, crate::tile::FrameMode::TileCodec);
-            let candidates = if caps.supports_cdf53 && frame_mode_eligible {
+            let candidates = if frame_mode_eligible {
                 crate::tile::detect_escalation_candidates(
                     &self.metrics_tracker,
                     crate::capture::gpu_pipeline::MAX_ESCALATION_PER_FRAME,
@@ -1817,10 +1817,8 @@ impl IoBridge {
                 }
 
                 // Phase B — Cdf53 encode bit-plane passes for high-color tiles,
-                // enqueue into the scheduler's refinement queue. Gated on the
-                // client capability (caps.supports_cdf53, from HELLO) until
-                // Task 2 drops the bit entirely.
-                if caps.supports_cdf53 {
+                // enqueue into the scheduler's refinement queue.
+                {
                     // Extract raw pointers from the GPU processor up-front so that
                     // the immutable borrow of self.gpu_frame_processor ends before
                     // the mutable borrows of self.scheduler below.
