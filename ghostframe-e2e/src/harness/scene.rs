@@ -221,7 +221,14 @@ async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioStack> {
         .with_ready_conditions(vec![WaitFor::message_on_stdout("CERT_HASH_SHA256=")])
         .with_startup_timeout(Duration::from_secs(120));
 
-    // Forward 4 host env vars if set.
+    // CRITICAL: this list must stay in sync with the env vars set by the
+    // bench sweep dispatches in
+    // `ghostframe-bench/src/bin/codec_report/main.rs`. Adding a new env
+    // var to a sweep dispatch without adding it here causes the sweep
+    // to silently run with production defaults (no error). This is the
+    // exact bug that caused the M3.7a v4 "near-identical mode_switch
+    // counts" regression — bench was sweeping bias values but the
+    // overrides never reached the container.
     for var in [
         "GHOSTFRAME_OUTBOUND_BANDWIDTH_CAP",
         "GHOSTFRAME_INBOUND_LOSS_PROBABILITY",
@@ -497,6 +504,21 @@ pub async fn run_scene(spec: &SceneSpec) -> Result<SceneResult> {
         .sum();
 
     let proc_samples_vec = std::mem::take(&mut *proc_samples.lock().await);
+
+    // Sanity check: scene with zero server telemetry indicates the client
+    // never received frames (e.g. cert mismatch, DERP failure, or harsh
+    // shaping that didn't even allow a single capture). The wait-for-status
+    // loop is permissive (accepts "Connected" OR "Receiving frames") so
+    // such scenes pass setup but produce no data. Distinguish from
+    // legitimate-but-quiet scenes by checking server-side telemetry.
+    if server_telemetry.is_empty() {
+        tracing::warn!(
+            scene = spec.name,
+            "scene completed with zero server.frame.captured events — \
+             client may have stalled at Connected without receiving frames \
+             (cert/handshake/shaping issue?). Bench row will be all zeros."
+        );
+    }
 
     Ok(SceneResult {
         server_telemetry,

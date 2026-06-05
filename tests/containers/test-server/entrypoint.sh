@@ -25,7 +25,8 @@ if [[ -n "${SHAPE_BANDWIDTH_KBPS:-}" ]]; then
         if tc qdisc add dev eth0 parent 1:1 handle 10: tbf rate "${SHAPE_BANDWIDTH_KBPS}kbit" burst 32kbit latency 400ms 2>&1; then
             echo "entrypoint: tc shaping applied successfully"
         else
-            echo "entrypoint: WARNING — tbf qdisc add failed; netem still active"
+            echo "entrypoint: WARNING — tbf qdisc add failed; rolling back netem to run unshaped"
+            tc qdisc del dev eth0 root 2>&1 || true
         fi
     else
         echo "entrypoint: WARNING — tc shaping unavailable (netem add failed; container needs --privileged or NET_ADMIN cap)"
