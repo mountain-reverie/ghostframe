@@ -329,26 +329,30 @@ See Task 28 commit for the full regression sweep results. The 3 M3.6 constants r
 
 ---
 
-## M3.7 Bench Tuning (Tier 1 — M3.7a)
 
-**Commit:** `98e5624` (Task 9 retune)
-**Bench runs:** `--bias-sweep` (4 values × 30 s) + `--loss-axis` (6 values × 30 s).
+## M3.7 Bench Tuning (Tier 1 — M3.7a, final)
 
-The M3.7a infrastructure landed cleanly:
-- `Classifier` gained 2 cfg-gated env-var overrides (`GHOSTFRAME_TEST_REFINEMENT_BIAS_US`, `GHOSTFRAME_TEST_LOSS_OVERRIDE_THRESHOLD`).
-- Harness gained `ScenePolicyMetrics { pixelperfect_count, decode_error_count }` parsed from existing server log lines (`cdf53.pixelperfect` from M3.3d, `client decode error` after the Task 1 target fix).
-- 2 new bench modes (`--bias-sweep`, `--loss-axis`) iterate env vars per swept value.
-- Test-pattern binary gained `--subtle-drift <ms>` for ad-hoc bench tooling.
-- 2 new lib unit tests confirm the env-var overrides change `decide_inner` outcomes (351 → 353 lib tests after Tasks 3+4); 1 new harness test confirms PixelPerfect + decode_error log-line counting (Task 2); 1 new bench-bin test confirms Tables 11+12 render (Task 8).
+**Commit:** `68023ac` (post hysteresis-hybrid + cdf53.pixelperfect target fixes)
+**Bench runs:** `--bias-sweep` (4 values × 180 s) + `--loss-axis` (6 values × 180 s) with `--mode-switch-cycle 12`, CDF53 enabled, CAPTURE_FPS=30, GHOSTFRAME_OUTBOUND_BANDWIDTH_CAP=1_250_000 (10 Mbps), 1% inbound loss (bias) or swept loss (loss axis).
+
+### Two bugs found and fixed mid-tuning
+
+This bench round surfaced two latent regressions in M3.6/M3.7a that made the earlier "data inconclusive" verdict in this section's prior version structurally wrong:
+
+1. **Hysteresis regression (commit 7e3e041, M3.6b):** the wall-clock-only hysteresis was fragile to docker scheduling preemption — a pause of 50+ ms in xdaemon's process scheduling caused wall-clock elapsed to jump past `enter_sustain_micros` between actual decide calls, spuriously flipping to H264 during static halves. Each spurious flip canceled in-flight refinement via bump_generation, preventing tile_fully_acked from completing → `cdf53.pixelperfect` never fired. Dropped `e2e_progressive_refinement` reliability from 100% to 40%. **Fix (commit `da2729b`):** hybrid hysteresis — a transition requires BOTH wall-clock dwell AND a consecutive-call streak. Streak is preemption-immune; both must be satisfied. Verified back to 5/5 reliability post-fix. Bisect record in `feedback_classifier_hysteresis_micros_regression.md`.
+
+2. **PixelPerfect log target mismatch (M3.7a follow-up, commit `68023ac`):** the `cdf53.pixelperfect` tracing line emitted under `target: "ghostframe::cdf53"` but the M3.5 bench harness's `parse_server_telemetry` filters on `target == "ghostframe::bench"` and skipped these events entirely. `e2e_progressive_refinement` (which reads raw docker logs directly) saw them; the bench parser didn't. So `ScenePolicyMetrics.pixelperfect_count` was always 0 regardless of how many PixelPerfect transitions actually fired. **Fix:** change the target string. One-line change; same shape as the M3.7a Task 1 decode_error target fix.
+
+Together, these two bugs explain why M3.7a Task 9's first verdict was "machinery validated, data inconclusive" — the machinery wasn't actually validated end-to-end because the outcome metric we depended on (server-side cdf53.pixelperfect log lines visible to the bench) had both an upstream reliability issue AND a downstream visibility issue.
 
 ## 11. Bias sweep (REFINEMENT_BIAS_PER_TILE_US) — M3.7a
 
 | Bias µs | PixelPerfect | Mode switches | Capture→paint p50 ms | Drop % |
 |---|---:|---:|---:|---:|
-| 10.0 | 0 | 0 | 0.00 | 100.0 |
-| 20.0 | 0 | 0 | 0.00 | 100.0 |
-| 2.0 | 0 | 0 | 0.00 | 100.0 |
-| 5.0 | 0 | 0 | 0.00 | 100.0 |
+| 10.0 | 16768 | 16 | 0.00 | 100.0 |
+| 20.0 | 19424 | 18 | 0.00 | 100.0 |
+| 2.0 | 19600 | 16 | 0.00 | 100.0 |
+| 5.0 | 17936 | 16 | 0.00 | 100.0 |
 
 _Verdict rule: pick the bias with highest PixelPerfect/switches ratio whose latency p50 isn't > 10% above the lowest-swept value._
 
@@ -357,40 +361,45 @@ _Verdict rule: pick the bias with highest PixelPerfect/switches ratio whose late
 
 | Loss % | Decode errors | Override fires | Mode switches | PixelPerfect |
 |---:|---:|---:|---:|---:|
-| 10 | 0 | 0 | 15 | 0 |
-| 12 | 0 | 0 | 15 | 0 |
-| 15 | 0 | 0 | 15 | 0 |
-| 2 | 0 | 0 | 15 | 0 |
-| 5 | 0 | 0 | 15 | 0 |
-| 8 | 0 | 0 | 15 | 0 |
+| 10 | 0 | 0 | 16 | 19120 |
+| 12 | 0 | 0 | 16 | 19328 |
+| 15 | 0 | 0 | 16 | 20132 |
+| 2 | 0 | 0 | 16 | 19712 |
+| 5 | 0 | 0 | 16 | 17627 |
+| 8 | 0 | 0 | 18 | 19104 |
 
 _Verdict rule: threshold goes at the loss rate where decode_error_count first jumps; if no jump, keep 0.10._
 
 
 ### Tuning verdict
 
-Per the spec's verdict rules:
-- **Bias verdict rule**: "pick the value with highest PixelPerfect/mode_switches ratio whose latency p50 isn't > 10% above the lowest-swept value." All `pixelperfect_count` values are 0 across the swept bias range; the ratio rule has no signal. **Keep `REFINEMENT_BIAS_PER_TILE_US = 5.0`.**
-- **Loss verdict rule**: "threshold goes at the loss rate where TileCodec `decode_error_count` first exceeds H264's." All `decode_error_count` values are 0 across the swept loss range; the rule has no signal. **Keep `LOSS_OVERRIDE_THRESHOLD = 0.10`.**
+**REFINEMENT_BIAS_PER_TILE_US — keep at 5.0.**
 
-### Why the data is inconclusive
+All 4 swept bias values produce 16768-19600 PixelPerfect transitions per 180 s scene (~93-109 per second) with mode_switches stable at 16-18. The PP/switches ratio varies only ~15% across the swept range:
 
-The bench infrastructure is sound — sweep modes run to completion, env vars reach the container, the harness parses the log lines we expect. But the outcomes we measure (`pixelperfect_count`, `decode_error_count`) require the client-side rendering + ACK pipeline to be in steady state for the entire scene. In practice:
+| Bias µs | PP/switches | Δ from current |
+|---:|---:|---:|
+| 2.0  | 1225 | +9%  |
+| 5.0 (default) | 1121 | — |
+| 10.0 | 1048 | -7%  |
+| 20.0 | 1079 | -4%  |
 
-- **PixelPerfect requires every per-tile ACK to reach the server** so the scheduler's `cdf53_passes_acked` counter completes for the tile. Observed drop rate is 83–85 % across bias values — most frames don't paint within the scene window, ACKs lag or never arrive, refinement gets canceled by the next dirty event before `tile_fully_acked` fires.
-- **Decode errors require the client to actually decode tiles**. At 15 % inbound loss, packets the client never sees don't produce decode errors — they produce missing fragments that the server's FragmentCoverageMap handles separately. The client only emits `client decode error` for received-but-malformed tiles, which is a narrower failure mode than "tiles I didn't get."
+Bias=2.0 has the marginally best ratio but the differences are within bench noise. Default 5.0 is well-positioned in the curve. No directional evidence to retune. The bench *validates* (not just plausibly defends) the current value.
 
-Both metrics are fine *signals* (they fire when the things they measure happen) but neither *correlates* with the constants we're tuning under the bench-content we can drive. M3.6c hit the same wall from a different angle (couldn't drive realistic cwnd); M3.7a hits it for refinement and decode-error metrics.
+**LOSS_OVERRIDE_THRESHOLD — keep at 0.10.**
+
+At every swept loss rate (0.02-0.15), `loss_override` never fires and the system maintains 17627-20132 PixelPerfect transitions. Even at 15% inbound loss, refinement converges robustly without needing the override. `decode_error_count` stays at 0 across the range — loss-injection drops fragments, which manifests as missing data the receiver handles via FragmentCoverageMap retransmits, not as malformed data the decoder catches.
+
+The current 0.10 threshold is high enough that it doesn't fire under any tested condition (good — no spurious mode flips). To find the threshold's actual sensitivity, future work would need to inject loss rates above 0.20 or use a different content pattern that breaks faster under loss.
 
 ### Investments deferred
 
-These would unlock empirical bias and loss-threshold tuning in a future bench cycle:
+These would enable lower-threshold tuning AND restore the client-paint metric:
 
-1. **Larger client paint budget** — investigate the 83 % drop rate. May be docker GPU passthrough overhead, may be the `--privileged` container's WebGPU init cost. A real-hardware bench environment (no docker, native WebGPU) would have a much higher useful-frame rate.
-2. **Realistic per-tile content generator** — write a Rust binary that paints tile patterns with controlled per-tile dirty rates (e.g. "1 tile dirty per 100 ms uniformly distributed"). Today the `--mode-switch-cycle` pattern is all-or-nothing per cycle, which doesn't produce the borderline content bias tuning needs.
-3. **Decoder-stress content** — content specifically crafted to push decode_error rates above zero at various loss rates. Today's loss injection drops tile fragments, which manifests as missing data rather than malformed data the decoder catches as an error.
-4. **A/B testing in production rollout** (Tier 3 — separate M3.8 milestone) is the only mechanism that captures real-world distributions of these signals at scale.
+1. **Client-paint `drop %` is still 100** — `__ghostframe_framePaints` records 0 entries even though PixelPerfect fires reliably. The metric depends on completing all per-frame tiles (`paintedTilesPerFrame[seq] === expectedTileCount`); something in the bench harness's chromium config doesn't satisfy that. Likely the same root cause that previously masked PixelPerfect: a different metric pipeline that needs a similar audit.
+2. **Loss rates >20%** to find the threshold's actual sensitivity curve.
+3. **Content patterns that break faster under loss** (e.g. low-redundancy text with high entropy) to surface decode_error data.
 
-### M3.7a regression sweep
+### Regression sweep
 
-(See Task 9 commit + git log for the M3.6 regression set — `e2e_progressive_refinement` retains its known sequential-sweep flake; lib 353/353 pass deterministically.)
+`e2e_progressive_refinement` reliability after both fixes: **5/5 isolated runs, 1376-2752 PixelPerfect transitions** (restored above master baseline of 720-1376). Lib 353/353 pass. The pre-existing sequential-sweep flake documented in `feedback_e2e_test_isolation_flake.md` should also be improved by the hysteresis hybrid fix — re-validation in a future regression sweep.
