@@ -234,11 +234,6 @@ pub struct IoBridge {
     /// Last two windows' `suspension_detected` flag, OR'd into
     /// `adaptation_context.suspended` to debounce single-window flaps.
     pub(crate) recent_suspension_flags: [bool; 2],
-    /// Server-side env flag: `GHOSTFRAME_ENABLE_CDF53`.
-    /// When false (default), `gate_codec_state` downgrades Cdf53 → Bc1 (Raw on
-    /// wire), preserving M3.2 behavior. Set to true by the operator to enable
-    /// CDF 5/3 emission once Task 9 Phase B encoding is wired in.
-    cdf53_enabled: bool,
     /// M3.3c idle-escalation: flat tile indices from the most recent per-frame
     /// sweep. Stashed here so Task 10's post-fence Phase B can read the list
     /// and update `already_escalated_this_gen` after the GPU work returns.
@@ -471,13 +466,6 @@ impl IoBridge {
             tracing::info!("GPU dirty tracker initialized (Vulkan compute SAD)");
         }
 
-        let cdf53_enabled = std::env::var("GHOSTFRAME_ENABLE_CDF53")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        if cdf53_enabled {
-            tracing::info!("GHOSTFRAME_ENABLE_CDF53=1: Cdf53 codec enabled");
-        }
-
         // Warm rayon's global thread pool so the first PalRLE-heavy frame
         // doesn't pay thread-spin-up latency on the hot path (design Section 4).
         rayon::iter::IntoParallelIterator::into_par_iter(0..1u32)
@@ -526,7 +514,6 @@ impl IoBridge {
             feedback_history: std::collections::VecDeque::with_capacity(5),
             recent_suspension_flags: [false, false],
             cdf53_escalation_candidates_this_frame: Vec::new(),
-            cdf53_enabled,
             gpu_frame_processor,
             full_frame_encoder: None,
             recent_frame_fragments: HashMap::new(),
@@ -702,12 +689,7 @@ impl IoBridge {
             // invalidate the refinement passes Phase B just enqueued.
             if matches!(policy, SchedulerEmissionPolicy::GpuClassifierDriven) {
                 use crate::tile::CodecState;
-                let raw_codec_state = self.metrics_tracker.get(tile_x, tile_y).codec_state;
-                let codec_state = crate::tile::classifier::gate_codec_state(
-                    raw_codec_state,
-                    self.cdf53_enabled,
-                    self.client_caps.supports_cdf53,
-                );
+                let codec_state = self.metrics_tracker.get(tile_x, tile_y).codec_state;
                 if matches!(codec_state, CodecState::Cdf53 { .. }) {
                     // Gate open + Cdf53 retained → Phase B handles emission via
                     // the refinement queue (generation already bumped by Phase B).
@@ -753,17 +735,9 @@ impl IoBridge {
                 SchedulerEmissionPolicy::CpuRawOnly => (Codec::Raw, tile_data),
                 SchedulerEmissionPolicy::GpuClassifierDriven => {
                     use crate::tile::CodecState;
-                    let raw_codec_state = self.metrics_tracker.get(tile_x, tile_y).codec_state;
-                    // Apply the Cdf53 emission gate before deciding the wire codec.
                     // Cdf53 tiles were already skipped above (before bump_generation);
                     // only non-Cdf53 tiles reach this point.
-                    // When gates closed, gate_codec_state downgrades Cdf53 → Bc1,
-                    // and the existing _ => Raw fallback fires, preserving M3.2 behavior.
-                    let codec_state = crate::tile::classifier::gate_codec_state(
-                        raw_codec_state,
-                        self.cdf53_enabled,
-                        self.client_caps.supports_cdf53,
-                    );
+                    let codec_state = self.metrics_tracker.get(tile_x, tile_y).codec_state;
                     match codec_state {
                         CodecState::Solid => {
                             let solid = crate::encoder::solid::encode_solid(&tile_data);
@@ -1390,10 +1364,7 @@ impl IoBridge {
             // SECOND TileCodec frame. Acceptable — refinement queries run
             // every frame and there are plenty of cycles to escalate.
             let frame_mode_eligible = matches!(self.frame_mode, crate::tile::FrameMode::TileCodec);
-            let candidates = if self.cdf53_enabled
-                && caps.supports_cdf53
-                && frame_mode_eligible
-            {
+            let candidates = if caps.supports_cdf53 && frame_mode_eligible {
                 crate::tile::detect_escalation_candidates(
                     &self.metrics_tracker,
                     crate::capture::gpu_pipeline::MAX_ESCALATION_PER_FRAME,
@@ -1846,10 +1817,10 @@ impl IoBridge {
                 }
 
                 // Phase B — Cdf53 encode bit-plane passes for high-color tiles,
-                // enqueue into the scheduler's refinement queue. Gated on BOTH
-                // the server env flag (GHOSTFRAME_ENABLE_CDF53) AND the client
-                // capability (caps.supports_cdf53, from HELLO).
-                if self.cdf53_enabled && caps.supports_cdf53 {
+                // enqueue into the scheduler's refinement queue. Gated on the
+                // client capability (caps.supports_cdf53, from HELLO) until
+                // Task 2 drops the bit entirely.
+                if caps.supports_cdf53 {
                     // Extract raw pointers from the GPU processor up-front so that
                     // the immutable borrow of self.gpu_frame_processor ends before
                     // the mutable borrows of self.scheduler below.
@@ -2637,7 +2608,6 @@ impl IoBridge {
             feedback_history: std::collections::VecDeque::with_capacity(5),
             recent_suspension_flags: [false, false],
             cdf53_escalation_candidates_this_frame: Vec::new(),
-            cdf53_enabled: false,
             gpu_frame_processor: None,
             full_frame_encoder: None,
             recent_frame_fragments: HashMap::new(),
@@ -2697,7 +2667,6 @@ impl IoBridge {
             feedback_history: std::collections::VecDeque::with_capacity(5),
             recent_suspension_flags: [false, false],
             cdf53_escalation_candidates_this_frame: Vec::new(),
-            cdf53_enabled: false,
             gpu_frame_processor: None,
             full_frame_encoder: None,
             recent_frame_fragments: HashMap::new(),

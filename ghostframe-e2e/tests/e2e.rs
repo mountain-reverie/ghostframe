@@ -2510,28 +2510,6 @@ async fn e2e_cdf53_mixed_codecs() -> Result<()> {
     Ok(())
 }
 
-/// M3.3a regression check: without `GHOSTFRAME_ENABLE_CDF53`, the classifier
-/// falls back to Raw for high-color tiles (preserves M3.2 behavior).
-#[tokio::test(flavor = "multi_thread")]
-async fn e2e_cdf53_flag_off() -> Result<()> {
-    let setup = setup_e2e_webgpu_gpu("--gradient --drm-direct").await?;
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
-    let codec_list: Vec<u8> = setup
-        .page
-        .evaluate("window.__ghostframeRecordedCodecs || []")
-        .await?
-        .into_value()?;
-    assert!(
-        !codec_list.contains(&6u8),
-        "expected no Codec::Cdf53 (6) without GHOSTFRAME_ENABLE_CDF53; saw: {codec_list:?}"
-    );
-    assert!(
-        codec_list.contains(&5u8),
-        "expected Codec::Raw (5) fallback when Cdf53 disabled; saw: {codec_list:?}"
-    );
-    Ok(())
-}
 
 /// M3.3b anchor: with the env flag on and the client now decoding Cdf53,
 /// a `--gradient` pattern reaches lossless reconstruction after the full
