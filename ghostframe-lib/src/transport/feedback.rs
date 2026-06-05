@@ -68,6 +68,13 @@ impl ReceiverFeedback {
     /// Average of per-window `loss_rate()` across `history`. Returns `0.0`
     /// for empty history. Caller is responsible for capping `history` at
     /// the smoothing window length (M3.6 uses 5).
+    ///
+    /// **Weighting**: this is an UNWEIGHTED mean. A window with 100
+    /// datagrams contributes the same weight as a window with 10,000.
+    /// Acceptable for fixed-cadence 100ms feedback (M3.6 default) where
+    /// window sizes are roughly uniform. If feedback batching ever varies
+    /// window sizes significantly, switch to weighting by total datagrams
+    /// (`sum(lost) / sum(received + lost)`).
     pub fn smoothed_loss_rate(history: &std::collections::VecDeque<Self>) -> f32 {
         if history.is_empty() {
             return 0.0;

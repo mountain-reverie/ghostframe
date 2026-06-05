@@ -425,6 +425,11 @@ fn mode_decision_event_emitted_only_on_transition() {
 fn env_var_override_refinement_bias_us() {
     use crate::tile::classifier::{AdaptationContext, Classifier, REFINEMENT_BIAS_PER_TILE_US};
     use crate::tile::{CodecState, FrameMode};
+    // NB: this test mutates process env vars and races other lib tests that
+    // construct Classifier::default(). Run lib tests with --test-threads=1
+    // OR ensure no peer test in the suite constructs Classifier::default()
+    // mid-window. Documented as a known limitation; not making this test
+    // serial-only because cargo test's serialization story is awkward.
 
     let ctx = AdaptationContext {
         bytes_per_us: 100.0,
@@ -495,6 +500,11 @@ fn env_var_override_refinement_bias_us() {
 fn env_var_override_loss_override_threshold() {
     use crate::tile::classifier::{AdaptationContext, Classifier, LOSS_OVERRIDE_THRESHOLD};
     use crate::tile::{CodecState, FrameMode};
+    // NB: this test mutates process env vars and races other lib tests that
+    // construct Classifier::default(). Run lib tests with --test-threads=1
+    // OR ensure no peer test in the suite constructs Classifier::default()
+    // mid-window. Documented as a known limitation; not making this test
+    // serial-only because cargo test's serialization story is awkward.
 
     // Raise the threshold to 0.50 — well above the test ctx's 0.15.
     std::env::set_var("GHOSTFRAME_TEST_LOSS_OVERRIDE_THRESHOLD", "0.50");
@@ -523,6 +533,11 @@ fn env_var_override_loss_override_threshold() {
 fn env_var_override_headroom_min_bpus() {
     use crate::tile::classifier::{AdaptationContext, Classifier, HEADROOM_MIN_BYTES_PER_US};
     use crate::tile::{CodecState, FrameMode};
+    // NB: this test mutates process env vars and races other lib tests that
+    // construct Classifier::default(). Run lib tests with --test-threads=1
+    // OR ensure no peer test in the suite constructs Classifier::default()
+    // mid-window. Documented as a known limitation; not making this test
+    // serial-only because cargo test's serialization story is awkward.
 
     // Lower the threshold to 0.05 — well below the test ctx's 0.1.
     std::env::set_var("GHOSTFRAME_TEST_HEADROOM_MIN_BPUS", "0.05");
@@ -545,4 +560,90 @@ fn env_var_override_headroom_min_bpus() {
         FrameMode::TileCodec
     );
     assert_eq!(HEADROOM_MIN_BYTES_PER_US, 0.25);
+}
+
+/// Regression test for commit `7e3e041` (M3.6b hysteresis-micros refactor) +
+/// fix `da2729b` (hybrid). When wall-clock elapsed past `enter_sustain_micros`
+/// in a SINGLE call (e.g. docker scheduling preemption pause), the hybrid
+/// guard requires the streak counter to ALSO reach `enter_sustain_frames_min`
+/// before flipping. Pre-fix behavior: single big-jump call would spuriously
+/// flip to H264 during what should be a static half, canceling refinement.
+#[test]
+fn hybrid_hysteresis_wall_clock_jump_without_streak_does_not_flip() {
+    use crate::tile::classifier::{AdaptationContext, Classifier};
+    use crate::tile::{CodecState, FrameMode};
+
+    let mut c = Classifier::default();
+    let ctx = AdaptationContext {
+        bytes_per_us: 100.0,
+        smoothed_rtt_us: 5_000.0,
+        loss_rate: 0.0,
+        suspended: false,
+        last_update_seq: 1,
+    };
+    c.set_adaptation_context(ctx);
+
+    // Construct a workload that triggers enter_now=true (cost path picks H264).
+    let max_passes = crate::encoder::cdf53::CDF53_PASS_COUNT as u8;
+    let tentative: Vec<CodecState> = (0..200)
+        .map(|_| CodecState::Cdf53 { passes_sent: 0, max_passes })
+        .collect();
+
+    // Call 1: enter condition true, started=0, streak=1, elapsed=0.
+    let m1 = c.decide_frame_mode_at(0, &tentative, FrameMode::TileCodec);
+    assert_eq!(m1, FrameMode::TileCodec, "frame 1: streak=1 < 3, should stay");
+
+    // Call 2 simulates a docker preemption pause: now_us jumps 200ms past
+    // the 50ms enter_sustain_micros. Pre-fix code would have computed
+    // elapsed = 200_000 - 0 = 200_000 >= 50_000 and flipped. Hybrid: streak
+    // is only 2 < enter_sustain_frames_min (3), so we still stay.
+    let m2 = c.decide_frame_mode_at(200_000, &tentative, m1);
+    assert_eq!(
+        m2,
+        FrameMode::TileCodec,
+        "frame 2 after 200ms preemption-like jump: streak=2 < 3, must NOT flip \
+         despite wall-clock elapsed past threshold (this was the 7e3e041 regression)"
+    );
+
+    // Call 3: still enter_now, streak reaches 3, BOTH conditions satisfied.
+    let m3 = c.decide_frame_mode_at(250_000, &tentative, m2);
+    assert_eq!(
+        m3,
+        FrameMode::H264,
+        "frame 3: streak=3 + elapsed=250ms — both conditions satisfied, now flip"
+    );
+}
+
+/// Symmetric regression test for the exit dwell.
+#[test]
+fn hybrid_hysteresis_exit_wall_clock_jump_without_streak_does_not_flip() {
+    use crate::tile::classifier::{AdaptationContext, Classifier};
+    use crate::tile::{CodecState, FrameMode};
+
+    let mut c = Classifier::default();
+    let ctx = AdaptationContext {
+        bytes_per_us: 100.0,
+        smoothed_rtt_us: 5_000.0,
+        loss_rate: 0.0,
+        suspended: false,
+        last_update_seq: 1,
+    };
+    c.set_adaptation_context(ctx);
+
+    // Empty tentative → tile_codec_cost = 0 → exit_now = true (well below
+    // h264_cost * 0.6).
+    let tentative: Vec<CodecState> = Vec::new();
+
+    // Start in H264. Call 1: exit_now=true, started=0, streak=1.
+    let m1 = c.decide_frame_mode_at(0, &tentative, FrameMode::H264);
+    assert_eq!(m1, FrameMode::H264, "frame 1: streak=1 < 30, should stay");
+
+    // Simulate a 1-second preemption jump (>> 500ms exit_sustain_micros).
+    // Streak only reaches 2, far below exit_sustain_frames_min = 30.
+    let m2 = c.decide_frame_mode_at(1_000_000, &tentative, m1);
+    assert_eq!(
+        m2,
+        FrameMode::H264,
+        "frame 2 after 1s preemption-like jump: streak=2 < 30, must NOT flip"
+    );
 }
