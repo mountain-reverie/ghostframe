@@ -13,6 +13,25 @@ export DRM_DEVICE=${DRM_DEVICE:-/dev/dri/card0}
 export CAPTURE_FPS=${CAPTURE_FPS:-2}
 export DISPLAY=:99
 
+# M3.7b: apply tc qdisc shaping if SHAPE_* env vars set.
+# netem provides delay + loss; tbf provides bandwidth rate-limit.
+# Failures log warnings and continue without shaping (better than
+# crashing the bench; downstream detects via the resulting data shape).
+if [[ -n "${SHAPE_BANDWIDTH_KBPS:-}" ]]; then
+    DELAY_MS="${SHAPE_DELAY_MS:-0}"
+    LOSS_PCT="${SHAPE_LOSS_PCT:-0}"
+    echo "entrypoint: applying tc shaping — ${SHAPE_BANDWIDTH_KBPS}kbit, ${DELAY_MS}ms delay, ${LOSS_PCT}% loss"
+    if tc qdisc add dev eth0 root handle 1: netem delay "${DELAY_MS}ms" loss "${LOSS_PCT}%" 2>&1; then
+        if tc qdisc add dev eth0 parent 1:1 handle 10: tbf rate "${SHAPE_BANDWIDTH_KBPS}kbit" burst 32kbit latency 400ms 2>&1; then
+            echo "entrypoint: tc shaping applied successfully"
+        else
+            echo "entrypoint: WARNING — tbf qdisc add failed; netem still active"
+        fi
+    else
+        echo "entrypoint: WARNING — tc shaping unavailable (netem add failed; container needs --privileged or NET_ADMIN cap)"
+    fi
+fi
+
 # If TEST_PATTERN uses DRM-direct mode, skip Xorg entirely — test-pattern
 # will be the DRM master itself and ghostframe-xdaemon's drm_capture will
 # read the FB the test-pattern attaches.
