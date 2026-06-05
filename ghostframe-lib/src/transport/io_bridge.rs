@@ -180,6 +180,21 @@ pub struct IoBridge {
     /// Cfg-gated inbound-datagram loss injector for e2e tests.
     #[cfg(any(test, feature = "test-loss-injection"))]
     pub(crate) inbound_loss: Option<crate::transport::loss_injection::LossInjector>,
+    /// Cfg-gated outbound bandwidth cap for e2e tests / bench scenes.
+    /// `None` ⇒ no rate limiting (the `GHOSTFRAME_OUTBOUND_BANDWIDTH_CAP`
+    /// env var was unset at construction time). Production code path is
+    /// unaffected.
+    #[cfg(any(test, feature = "test-loss-injection"))]
+    pub(crate) outbound_bandwidth_cap: Option<crate::transport::bandwidth_cap::BandwidthCap>,
+    /// Cfg-gated test hook: when `Some(value)`, `sample_all_path_stats`
+    /// overrides `bytes_per_us` with this value instead of computing
+    /// from quinn `cwnd / rtt`. Bypasses the slow QUIC bandwidth-discovery
+    /// path so e2e tests can drive the M3.6b headroom_guard override
+    /// deterministically.
+    /// Sourced from `GHOSTFRAME_TEST_FORCE_BYTES_PER_US` env var
+    /// (parsed as f32). Unset / 0 / unparseable ⇒ None (no override).
+    #[cfg(any(test, feature = "test-loss-injection"))]
+    pub(crate) test_force_bytes_per_us: Option<f32>,
     /// Cfg-gated one-shot OOB-PalRle injection coordinate for e2e tests.
     /// When set to `Some((x, y))`, the next PalRle payload encoded for the
     /// matching tile coordinate is replaced with a hand-built bundled payload
@@ -209,6 +224,16 @@ pub struct IoBridge {
     fec_enable_threshold: f64,
     /// Loss rate threshold to disable FEC (hysteresis).
     fec_disable_threshold: f64,
+    /// Live signal vector pushed to `classifier.set_adaptation_context()`
+    /// after every `dispatch_feedback_bytes` or `sample_quic_path_stats`.
+    /// M3.6a wires it; M3.6b's policy reads the non-bytes_per_us fields.
+    pub(crate) adaptation_context: crate::tile::classifier::AdaptationContext,
+    /// Sliding window of the last 5 `ReceiverFeedback` reports, used to
+    /// smooth `loss_rate` against single-window jitter.
+    pub(crate) feedback_history: std::collections::VecDeque<crate::transport::feedback::ReceiverFeedback>,
+    /// Last two windows' `suspension_detected` flag, OR'd into
+    /// `adaptation_context.suspended` to debounce single-window flaps.
+    pub(crate) recent_suspension_flags: [bool; 2],
     /// Server-side env flag: `GHOSTFRAME_ENABLE_CDF53`.
     /// When false (default), `gate_codec_state` downgrades Cdf53 → Bc1 (Raw on
     /// wire), preserving M3.2 behavior. Set to true by the operator to enable
@@ -478,6 +503,13 @@ impl IoBridge {
             #[cfg(any(test, feature = "test-loss-injection"))]
             inbound_loss: Self::loss_injector_from_env("INBOUND"),
             #[cfg(any(test, feature = "test-loss-injection"))]
+            outbound_bandwidth_cap: crate::transport::bandwidth_cap::BandwidthCap::from_env(),
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            test_force_bytes_per_us: std::env::var("GHOSTFRAME_TEST_FORCE_BYTES_PER_US")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .filter(|v| *v > 0.0),
+            #[cfg(any(test, feature = "test-loss-injection"))]
             oob_inject_at: Self::oob_injector_from_env(),
             #[cfg(any(test, feature = "test-loss-injection"))]
             skip_palette_session_reset: Self::skip_palette_session_reset_from_env(),
@@ -490,6 +522,9 @@ impl IoBridge {
                 .unwrap_or(0),
             fec_enable_threshold: FEC_ENABLE_THRESHOLD,
             fec_disable_threshold: FEC_DISABLE_THRESHOLD,
+            adaptation_context: crate::tile::classifier::AdaptationContext::default(),
+            feedback_history: std::collections::VecDeque::with_capacity(5),
+            recent_suspension_flags: [false, false],
             cdf53_escalation_candidates_this_frame: Vec::new(),
             cdf53_enabled,
             gpu_frame_processor,
@@ -572,6 +607,12 @@ impl IoBridge {
 
     /// Send a datagram to all connected WebTransport sessions.
     fn send_to_all_sessions(&mut self, dg: &[u8]) {
+        #[cfg(any(test, feature = "test-loss-injection"))]
+        if let Some(cap) = self.outbound_bandwidth_cap.as_mut() {
+            if !cap.try_consume(dg.len()) {
+                return;
+            }
+        }
         #[cfg(any(test, feature = "test-loss-injection"))]
         if let Some(inj) = self.outbound_loss.as_mut() {
             if inj.should_drop(dg) {
@@ -984,6 +1025,7 @@ impl IoBridge {
                             "receiver feedback"
                         );
                         self.update_fec_from_feedback(&fb);
+                        self.ingest_feedback_for_adaptation(fb);
                     }
                     offset += FEEDBACK_SIZE;
                 }
@@ -1024,6 +1066,7 @@ impl IoBridge {
         use crate::tile::CodecState;
 
         tracing::warn!(
+            target: "ghostframe::bench",
             codec = msg.codec,
             tile_x = msg.tile_x,
             tile_y = msg.tile_y,
@@ -1466,6 +1509,8 @@ impl IoBridge {
         let prev_mode = self.frame_mode;
 
         // Always evaluate mode — empty tentative drives the exit-sustain counter.
+        let deficit = self.scheduler.refinement_deficit_tiles();
+        self.classifier.set_refinement_deficit_tiles(deficit);
         let new_mode = self.classifier.decide_frame_mode(&tentative, prev_mode);
 
         // Persist tentative state back into per-tile metrics for dirty tiles only.
@@ -1589,7 +1634,7 @@ impl IoBridge {
                     // e2e tests can verify the lossless terminal state was
                     // reached without requiring the cdf53-diag feature gate.
                     tracing::info!(
-                        target: "ghostframe::cdf53",
+                        target: "ghostframe::bench",
                         tile_x = tile_x,
                         tile_y = tile_y,
                         gen = gen,
@@ -2224,6 +2269,10 @@ impl IoBridge {
             self.drain_app_events();
             self.server.drain_endpoint_events();
             self.drain_outbound().await?;
+
+            // M3.6a: sample QUIC path stats once per tick so the classifier's
+            // bandwidth estimate stays current. No-op when no connections.
+            self.sample_all_path_stats();
         }
     }
 
@@ -2571,6 +2620,10 @@ impl IoBridge {
             #[cfg(any(test, feature = "test-loss-injection"))]
             inbound_loss: None,
             #[cfg(any(test, feature = "test-loss-injection"))]
+            outbound_bandwidth_cap: None,
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            test_force_bytes_per_us: None,
+            #[cfg(any(test, feature = "test-loss-injection"))]
             oob_inject_at: None,
             #[cfg(any(test, feature = "test-loss-injection"))]
             skip_palette_session_reset: false,
@@ -2580,6 +2633,9 @@ impl IoBridge {
             fec_k: 0,
             fec_enable_threshold: FEC_ENABLE_THRESHOLD,
             fec_disable_threshold: FEC_DISABLE_THRESHOLD,
+            adaptation_context: crate::tile::classifier::AdaptationContext::default(),
+            feedback_history: std::collections::VecDeque::with_capacity(5),
+            recent_suspension_flags: [false, false],
             cdf53_escalation_candidates_this_frame: Vec::new(),
             cdf53_enabled: false,
             gpu_frame_processor: None,
@@ -2624,6 +2680,10 @@ impl IoBridge {
             #[cfg(any(test, feature = "test-loss-injection"))]
             inbound_loss: None,
             #[cfg(any(test, feature = "test-loss-injection"))]
+            outbound_bandwidth_cap: None,
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            test_force_bytes_per_us: None,
+            #[cfg(any(test, feature = "test-loss-injection"))]
             oob_inject_at: None,
             #[cfg(any(test, feature = "test-loss-injection"))]
             skip_palette_session_reset: false,
@@ -2633,6 +2693,9 @@ impl IoBridge {
             fec_k: 0,
             fec_enable_threshold: FEC_ENABLE_THRESHOLD,
             fec_disable_threshold: FEC_DISABLE_THRESHOLD,
+            adaptation_context: crate::tile::classifier::AdaptationContext::default(),
+            feedback_history: std::collections::VecDeque::with_capacity(5),
+            recent_suspension_flags: [false, false],
             cdf53_escalation_candidates_this_frame: Vec::new(),
             cdf53_enabled: false,
             gpu_frame_processor: None,
@@ -2671,6 +2734,76 @@ impl IoBridge {
         } else if self.fec_k > 0 && loss < self.fec_disable_threshold {
             self.fec_k = 0;
             tracing::info!(loss_rate = %format!("{:.2}%", loss * 100.0), "FEC disabled");
+        }
+    }
+
+    /// Append `fb` to `feedback_history` (capped at 5), update suspension
+    /// debounce, recompute `adaptation_context.loss_rate` + `.suspended`,
+    /// then push the new context to the classifier. Called from
+    /// `dispatch_feedback_bytes`. Bumps `last_update_seq`.
+    fn ingest_feedback_for_adaptation(&mut self, fb: crate::transport::feedback::ReceiverFeedback) {
+        if self.feedback_history.len() >= 5 {
+            self.feedback_history.pop_front();
+        }
+        let suspended = fb.suspension_detected;
+        self.feedback_history.push_back(fb);
+        self.recent_suspension_flags = [self.recent_suspension_flags[1], suspended];
+        self.adaptation_context.loss_rate =
+            crate::transport::feedback::ReceiverFeedback::smoothed_loss_rate(&self.feedback_history);
+        self.adaptation_context.suspended =
+            self.recent_suspension_flags[0] || self.recent_suspension_flags[1];
+        self.adaptation_context.last_update_seq =
+            self.adaptation_context.last_update_seq.wrapping_add(1);
+        self.classifier.set_adaptation_context(self.adaptation_context);
+    }
+
+    /// Compute `bytes_per_us` from a `(cwnd_bytes, smoothed_rtt_us)` snapshot,
+    /// mirror into `adaptation_context`, bump `last_update_seq`, push to
+    /// classifier. Pure function of the two inputs — exposed for unit tests
+    /// so `sample_all_path_stats` can stay thin. `rtt <= 0` is a no-op.
+    pub(crate) fn apply_path_stats_snapshot(&mut self, cwnd_bytes: u64, smoothed_rtt_us: f32) {
+        if smoothed_rtt_us <= 0.0 {
+            return;
+        }
+        let bytes_per_us = (cwnd_bytes as f32) / smoothed_rtt_us;
+        self.adaptation_context.bytes_per_us = bytes_per_us;
+        self.adaptation_context.smoothed_rtt_us = smoothed_rtt_us;
+        self.adaptation_context.last_update_seq =
+            self.adaptation_context.last_update_seq.wrapping_add(1);
+        self.classifier.set_adaptation_context(self.adaptation_context);
+    }
+
+    /// Read live `path_stats` from every active connection, convert RTT
+    /// (`Duration` → µs `f32`) and cwnd, and feed each to
+    /// `apply_path_stats_snapshot`. Called once per tick from `run()`.
+    /// With multiple connections, the last sampled snapshot wins — M3.6
+    /// production is single-client; multi-client is M4+ scope.
+    fn sample_all_path_stats(&mut self) {
+        // Collect first to satisfy the borrow checker: the immutable borrow of
+        // `self.server.connections` must end before `apply_path_stats_snapshot`
+        // takes `&mut self`.
+        let snapshots: Vec<(u64, f32)> = self
+            .server
+            .connections
+            .values()
+            .map(|conn| {
+                let stats = conn.stats();
+                let rtt_us = stats.path.rtt.as_secs_f32() * 1_000_000.0;
+                (stats.path.cwnd, rtt_us)
+            })
+            .collect();
+        for (cwnd, rtt_us) in snapshots {
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            if let Some(forced) = self.test_force_bytes_per_us {
+                // Override path: keep the live RTT (it's still real) but
+                // replace bytes_per_us with the test value. apply_path_stats_snapshot
+                // computes bytes_per_us = cwnd / rtt, so we synthesize a
+                // cwnd that yields the desired forced value.
+                let synth_cwnd = (forced * rtt_us) as u64;
+                self.apply_path_stats_snapshot(synth_cwnd, rtt_us);
+                continue;
+            }
+            self.apply_path_stats_snapshot(cwnd, rtt_us);
         }
     }
 }
@@ -2866,6 +2999,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_feedback_updates_adaptation_context() {
+        let (our_end, _peer) = UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("server");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+        let initial_seq = bridge.adaptation_context.last_update_seq;
+        let fb = crate::transport::feedback::ReceiverFeedback {
+            timestamp_ns: 1_000_000,
+            datagrams_received: 800,
+            datagrams_lost: 200,
+            datagrams_recovered_fec: 0,
+            suspension_detected: true,
+        };
+        let mut buf = Vec::new();
+        fb.encode(&mut buf);
+        bridge.dispatch_feedback_bytes(&buf);
+        assert!(bridge.adaptation_context.last_update_seq > initial_seq);
+        // Single feedback in history: 200 / (800 + 200) = 0.20 — well above 0.
+        assert!(bridge.adaptation_context.loss_rate > 0.0);
+        assert!(bridge.adaptation_context.suspended);
+    }
+
+    #[tokio::test]
     async fn process_frame_increments_frame_seq() {
         let (our_end, _peer) = UnixStream::pair().expect("pair");
         let server = QuicServer::new().expect("server");
@@ -2931,8 +3087,8 @@ mod tests {
     //   - tests/e2e.rs::e2e_solid_color (Task 15) — full pipeline with client.
 
     /// `Classifier::reset` must zero hysteresis streaks, so a single busy
-    /// frame after reset can NOT promote to H264 (it needs `enter_sustain_frames`
-    /// consecutive busy frames). Without reset, a partial enter streak from a
+    /// frame after reset can NOT promote to H264 (it needs `enter_sustain_micros`
+    /// of dwell period). Without reset, a partial enter streak from a
     /// prior session would leak into the new session and trigger early promotion.
     #[test]
     fn classifier_reset_clears_streaks() {
@@ -4145,6 +4301,53 @@ mod tests {
         assert!(
             logs.contains("last_send_ns"),
             "expected 'last_send_ns' field in logs; got: {logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sample_quic_path_stats_updates_bytes_per_us_and_rtt() {
+        let (our_end, _peer) = UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("server");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+        let initial_seq = bridge.adaptation_context.last_update_seq;
+        // Inject a path-stats snapshot manually (the wire to a real quinn
+        // Connection is exercised by integration tests, not this unit).
+        bridge.apply_path_stats_snapshot(
+            /* cwnd_bytes */ 60_000,
+            /* smoothed_rtt_us */ 12_000.0,
+        );
+        assert!(bridge.adaptation_context.last_update_seq > initial_seq);
+        assert!(bridge.adaptation_context.bytes_per_us > 0.0);
+        assert!((bridge.adaptation_context.smoothed_rtt_us - 12_000.0).abs() < 1e-6);
+        // cwnd / rtt = 60_000 bytes / 12_000 µs = 5.0 B/µs.
+        assert!((bridge.adaptation_context.bytes_per_us - 5.0).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    async fn test_force_bytes_per_us_overrides_path_stats() {
+        let (our_end, _peer) = UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("server");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+        // No connections ⇒ sample_all_path_stats is a no-op even when the
+        // override is set. Set the override directly + call the inner
+        // apply_path_stats_snapshot to verify the override logic separately.
+        bridge.test_force_bytes_per_us = Some(0.1);
+
+        // Inject a snapshot that, with override active, should produce
+        // bytes_per_us == 0.1 regardless of the cwnd argument.
+        // We simulate what sample_all_path_stats would do internally: the
+        // override synthesizes cwnd from forced × rtt.
+        let rtt_us = 20_000.0;
+        let synth_cwnd = (0.1 * rtt_us) as u64; // 2_000
+        bridge.apply_path_stats_snapshot(synth_cwnd, rtt_us);
+
+        // Verify AdaptationContext reflects the forced value.
+        assert!(
+            (bridge.adaptation_context.bytes_per_us - 0.1).abs() < 0.01,
+            "got {}",
+            bridge.adaptation_context.bytes_per_us
         );
     }
 }

@@ -68,6 +68,32 @@ pub struct ClientDiagnosticRecord {
 }
 
 #[derive(Clone, Debug)]
+pub struct ModeDecisionRecord {
+    /// Frame sequence number (0 if unset by the event).
+    pub frame_seq: u64,
+    /// The `reason` field from the classifier event.
+    /// One of: "cost_comparison", "headroom_guard", "loss_override",
+    /// "suspension", "hysteresis_clamp".
+    pub reason: String,
+    /// Destination mode of the transition ("H264" or "TileCodec").
+    pub to_mode: String,
+}
+
+/// M3.7a counters parsed from `target: "ghostframe::bench"` log lines.
+/// PixelPerfect transitions and decode errors are sampled from the
+/// server's existing log emissions — no new instrumentation required.
+#[derive(Clone, Debug, Default)]
+pub struct ScenePolicyMetrics {
+    /// Count of `cdf53.pixelperfect` log lines observed during the scene.
+    /// Each line fires when all passes for one tile reach Acked state.
+    pub pixelperfect_count: u32,
+    /// Count of `client decode error` log lines observed during the scene.
+    /// Each line fires when the client reports a per-tile decode failure
+    /// via the DECODE_ERROR datagram (0x04).
+    pub decode_error_count: u32,
+}
+
+#[derive(Clone, Debug)]
 pub struct ProcSample {
     pub wall_ns: u64,
     pub utime_ticks: u64,
@@ -80,6 +106,8 @@ pub struct ProcSample {
 pub struct SceneResult {
     pub server_telemetry: Vec<ServerTelemetryRecord>,
     pub client_diagnostics: Vec<ClientDiagnosticRecord>,
+    pub mode_decisions: Vec<ModeDecisionRecord>,
+    pub policy_metrics: ScenePolicyMetrics,
     pub proc_samples: Vec<ProcSample>,
     pub wire_bytes_total: u64,
     pub error: Option<String>,
@@ -173,24 +201,69 @@ async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioStack> {
     let test_pattern_str = spec.test_pattern_args.join(" ");
     let server_container_name = "ghostframe-server".to_string();
 
-    let server: ContainerAsync<GenericImage> =
-        GenericImage::new("ghostframe/test-server", "latest")
-            .with_container_name(&server_container_name)
-            .with_network(crate::harness::containers::NETWORK_NAME)
-            .with_env_var("TS_AUTHKEY", &server_key)
-            .with_env_var("TS_CONTROL_URL", "http://headscale:8080")
-            .with_env_var("RUST_LOG", "ghostframe=trace,debug")
-            .with_env_var("TEST_PATTERN", &test_pattern_str)
-            // Enable JSON log format so parse_server_telemetry can decode events.
-            .with_env_var("GHOSTFRAME_LOG_FORMAT", "json")
-            // GPU passthrough: bind /dev/dri + modesetting Xorg config + privileged.
-            .with_env_var("XORG_CONF", "/etc/X11/xorg-vkms.conf")
-            .with_mount(Mount::bind_mount("/dev/dri", "/dev/dri"))
-            .with_privileged(true)
-            .with_ready_conditions(vec![WaitFor::message_on_stdout("CERT_HASH_SHA256=")])
-            .with_startup_timeout(Duration::from_secs(120))
-            .start()
-            .await?;
+    // M3.6c: forward bench-set env vars into the container so
+    // GHOSTFRAME_OUTBOUND_BANDWIDTH_CAP + GHOSTFRAME_INBOUND_LOSS_*
+    // actually reach xdaemon. Without this, the env vars stay on
+    // the bench process and the container sees defaults.
+    let mut server_image = GenericImage::new("ghostframe/test-server", "latest")
+        .with_container_name(&server_container_name)
+        .with_network(crate::harness::containers::NETWORK_NAME)
+        .with_env_var("TS_AUTHKEY", &server_key)
+        .with_env_var("TS_CONTROL_URL", "http://headscale:8080")
+        .with_env_var("RUST_LOG", "ghostframe=trace,debug")
+        .with_env_var("TEST_PATTERN", &test_pattern_str)
+        // Enable JSON log format so parse_server_telemetry can decode events.
+        .with_env_var("GHOSTFRAME_LOG_FORMAT", "json")
+        // GPU passthrough: bind /dev/dri + modesetting Xorg config + privileged.
+        .with_env_var("XORG_CONF", "/etc/X11/xorg-vkms.conf")
+        .with_mount(Mount::bind_mount("/dev/dri", "/dev/dri"))
+        .with_privileged(true)
+        .with_ready_conditions(vec![WaitFor::message_on_stdout("CERT_HASH_SHA256=")])
+        .with_startup_timeout(Duration::from_secs(120));
+
+    // CRITICAL: this list must stay in sync with the env vars set by the
+    // bench sweep dispatches in
+    // `ghostframe-bench/src/bin/codec_report/main.rs`. Adding a new env
+    // var to a sweep dispatch without adding it here causes the sweep
+    // to silently run with production defaults (no error). This is the
+    // exact bug that caused the M3.7a v4 "near-identical mode_switch
+    // counts" regression — bench was sweeping bias values but the
+    // overrides never reached the container.
+    for var in [
+        "GHOSTFRAME_OUTBOUND_BANDWIDTH_CAP",
+        "GHOSTFRAME_INBOUND_LOSS_PROBABILITY",
+        "GHOSTFRAME_INBOUND_LOSS_SEED",
+        "GHOSTFRAME_INBOUND_LOSS_PREDICATE",
+        // M3.7a: classifier env-var overrides — bench sweep modes set
+        // these per swept value; without forwarding they'd silently
+        // never reach xdaemon and every swept value would behave
+        // identically (the bug that produced near-identical mode_switch
+        // counts across bias_sweep / loss_axis runs in v4).
+        "GHOSTFRAME_TEST_REFINEMENT_BIAS_US",
+        "GHOSTFRAME_TEST_LOSS_OVERRIDE_THRESHOLD",
+        "GHOSTFRAME_TEST_HEADROOM_MIN_BPUS",
+        "GHOSTFRAME_TEST_FORCE_BYTES_PER_US",
+        // M3.6/M3.7: required for any CDF53 refinement work to fire at
+        // all. e2e_progressive_refinement sets this explicitly; bench
+        // sweeps that target refinement (PixelPerfect outcome metric)
+        // need it forwarded so the codec is actually enabled in the
+        // container's xdaemon.
+        "GHOSTFRAME_ENABLE_CDF53",
+        // M3.7b: tc qdisc shaping vars consumed by the entrypoint.
+        "SHAPE_BANDWIDTH_KBPS",
+        "SHAPE_DELAY_MS",
+        "SHAPE_LOSS_PCT",
+        // Capture frame rate — defaults to 2 fps which is too slow for
+        // the scheduler's refinement loop to make progress within bench
+        // scene-duration. e2e_progressive_refinement sets this to 30.
+        "CAPTURE_FPS",
+    ] {
+        if let Ok(val) = std::env::var(var) {
+            server_image = server_image.with_env_var(var, val);
+        }
+    }
+
+    let server: ContainerAsync<GenericImage> = server_image.start().await?;
 
     let cert_hash =
         crate::harness::containers::read_cert_hash_from_logs(&server_container_name).await?;
@@ -263,7 +336,11 @@ async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioStack> {
             .await;
         if let Ok(v) = result {
             let status: String = v.into_value().unwrap_or_default();
-            if status.contains("Receiving frames") {
+            // Match e2e helper: accept "Connected" OR "Receiving frames".
+            // Under harsh shaping (1 Mbps + 300ms RTT + 15% loss) the client
+            // reaches "Connected" reliably but may not see a frame within 30s.
+            // The bench should still proceed and record whatever data arrives.
+            if status.contains("Connected") || status.contains("Receiving frames") {
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
@@ -416,7 +493,7 @@ pub async fn run_scene(spec: &SceneSpec) -> Result<SceneResult> {
     // Collect server telemetry from the container's combined logs.
     let server_logs =
         crate::harness::cleanup::read_server_logs_stripped(&stack.server_container_name);
-    let server_telemetry = parse_server_telemetry(&server_logs);
+    let (server_telemetry, mode_decisions, policy_metrics) = parse_server_telemetry(&server_logs);
 
     // Collect client diagnostics from Chromium via DevTools eval.
     let client_diagnostics = read_client_diagnostics(&stack.page).await?;
@@ -428,9 +505,26 @@ pub async fn run_scene(spec: &SceneSpec) -> Result<SceneResult> {
 
     let proc_samples_vec = std::mem::take(&mut *proc_samples.lock().await);
 
+    // Sanity check: scene with zero server telemetry indicates the client
+    // never received frames (e.g. cert mismatch, DERP failure, or harsh
+    // shaping that didn't even allow a single capture). The wait-for-status
+    // loop is permissive (accepts "Connected" OR "Receiving frames") so
+    // such scenes pass setup but produce no data. Distinguish from
+    // legitimate-but-quiet scenes by checking server-side telemetry.
+    if server_telemetry.is_empty() {
+        tracing::warn!(
+            scene = spec.name,
+            "scene completed with zero server.frame.captured events — \
+             client may have stalled at Connected without receiving frames \
+             (cert/handshake/shaping issue?). Bench row will be all zeros."
+        );
+    }
+
     Ok(SceneResult {
         server_telemetry,
         client_diagnostics,
+        mode_decisions,
+        policy_metrics,
         proc_samples: proc_samples_vec,
         wire_bytes_total,
         error: None,
@@ -560,13 +654,15 @@ async fn sample_proc_loop(
 // Helper: parse JSON server telemetry
 // ---------------------------------------------------------------------------
 
-fn parse_server_telemetry(stderr_lines: &str) -> Vec<ServerTelemetryRecord> {
+fn parse_server_telemetry(stderr_lines: &str) -> (Vec<ServerTelemetryRecord>, Vec<ModeDecisionRecord>, ScenePolicyMetrics) {
     use std::collections::BTreeMap;
 
     // frame_seq → (capture_done_ns, mode)
     let mut captures: BTreeMap<u64, (u64, String)> = BTreeMap::new();
     // frame_seq → (last_send_ns, total_wire_bytes, tile_count, CodecHistogram)
     let mut sends: BTreeMap<u64, (u64, u32, u16, CodecHistogram)> = BTreeMap::new();
+    let mut decisions: Vec<ModeDecisionRecord> = Vec::new();
+    let mut policy_metrics = ScenePolicyMetrics::default();
 
     for line in stderr_lines.lines() {
         let v: serde_json::Value = match serde_json::from_str(line) {
@@ -642,11 +738,34 @@ fn parse_server_telemetry(stderr_lines: &str) -> Vec<ServerTelemetryRecord> {
                 };
                 sends.insert(frame_seq, (ts, total, tc, hist));
             }
+            "mode decision" => {
+                let reason = v
+                    .pointer("/fields/reason")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let to_mode = v
+                    .pointer("/fields/to")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let frame_seq = v
+                    .pointer("/fields/frame_seq")
+                    .and_then(|s| s.as_u64())
+                    .unwrap_or(0);
+                decisions.push(ModeDecisionRecord { frame_seq, reason, to_mode });
+            }
+            "cdf53.pixelperfect" => {
+                policy_metrics.pixelperfect_count = policy_metrics.pixelperfect_count.saturating_add(1);
+            }
+            "client decode error" => {
+                policy_metrics.decode_error_count = policy_metrics.decode_error_count.saturating_add(1);
+            }
             _ => {}
         }
     }
 
-    captures
+    let records = captures
         .into_iter()
         .filter_map(|(seq, (cap_ns, mode))| {
             sends.get(&seq).map(|(send_ns, bytes, tc, hist)| {
@@ -661,12 +780,33 @@ fn parse_server_telemetry(stderr_lines: &str) -> Vec<ServerTelemetryRecord> {
                 }
             })
         })
-        .collect()
+        .collect();
+    (records, decisions, policy_metrics)
 }
 
 // ---------------------------------------------------------------------------
 // Helper: read client diagnostics via Chromium DevTools
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_server_telemetry_counts_pixelperfect_and_decode_error() {
+        let json = r#"
+{"target":"ghostframe::bench","fields":{"message":"cdf53.pixelperfect","tile_x":1,"tile_y":2}}
+{"target":"ghostframe::bench","fields":{"message":"cdf53.pixelperfect","tile_x":3,"tile_y":4}}
+{"target":"ghostframe::bench","fields":{"message":"client decode error","tile_x":0,"tile_y":0,"error_code":1}}
+{"target":"ghostframe::bench","fields":{"message":"frame.captured","frame_seq":1,"capture_done_ns":0,"mode":"tile"}}
+"#.trim();
+        let (records, decisions, metrics) = parse_server_telemetry(json);
+        assert_eq!(metrics.pixelperfect_count, 2);
+        assert_eq!(metrics.decode_error_count, 1);
+        // Sanity: existing parsers still work alongside.
+        assert!(!records.is_empty() || decisions.is_empty()); // captured frame without send is dropped — just assert no panic
+    }
+}
 
 async fn read_client_diagnostics(
     page: &chromiumoxide::Page,

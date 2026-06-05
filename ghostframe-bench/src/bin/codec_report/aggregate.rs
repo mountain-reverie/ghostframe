@@ -27,6 +27,25 @@ pub struct SceneSummary {
     pub rss_max_mb: f64,
     pub vmhwm_max_mb: f64,
     pub codec_wire_bytes: BTreeMap<String, u64>,
+
+    // M3.6c additions
+    /// Total wall-clock µs spent in "h264" mode (sum across frames).
+    pub h264_dwell_us: u64,
+    /// Total wall-clock µs spent in "tile" mode.
+    pub tile_dwell_us: u64,
+    /// Count of `h264` ↔ `tile` mode flips in the server-telemetry timeline.
+    pub mode_switch_count: u32,
+    /// Count of mode.decision events per reason.
+    /// Keys: "cost_comparison", "headroom_guard", "loss_override",
+    /// "suspension", "hysteresis_clamp".
+    pub mode_decision_counts: std::collections::BTreeMap<String, u32>,
+
+    // M3.7a additions
+    pub pixelperfect_count: u32,
+    pub decode_error_count: u32,
+    /// When this scene was part of a M3.7 sweep, the label of the swept
+    /// value (e.g. "bias_10us" or "loss_5pct"). None for non-sweep runs.
+    pub sweep_axis_label: Option<String>,
 }
 
 impl ReportState {
@@ -87,6 +106,41 @@ impl ReportState {
                 bytes * hist.h264 as u64 / tile_total;
         }
 
+        // M3.6c: mode-dwell timeline.
+        // The server_telemetry list is ordered by frame_seq; consecutive
+        // entries' capture_done_ns gaps are the dwell intervals.
+        let mut h264_dwell_us: u64 = 0;
+        let mut tile_dwell_us: u64 = 0;
+        let mut mode_switch_count: u32 = 0;
+        let mut prev_ts: Option<u64> = None;
+        let mut prev_mode: Option<&str> = None;
+        for st in &r.server_telemetry {
+            let ts_us = st.capture_done_ns / 1_000;
+            if let (Some(pt), Some(pm)) = (prev_ts, prev_mode) {
+                let dwell = ts_us.saturating_sub(pt);
+                match pm {
+                    "h264" => h264_dwell_us += dwell,
+                    "tile" => tile_dwell_us += dwell,
+                    _ => {}
+                }
+                if pm != st.mode.as_str() {
+                    mode_switch_count += 1;
+                }
+            }
+            prev_ts = Some(ts_us);
+            prev_mode = Some(st.mode.as_str());
+        }
+
+        // M3.6c: mode.decision events per reason.
+        let mut mode_decision_counts: std::collections::BTreeMap<String, u32> =
+            std::collections::BTreeMap::new();
+        for d in &r.mode_decisions {
+            *mode_decision_counts.entry(d.reason.clone()).or_default() += 1;
+        }
+
+        let pixelperfect_count = r.policy_metrics.pixelperfect_count;
+        let decode_error_count = r.policy_metrics.decode_error_count;
+
         self.scenes.insert(
             name.into(),
             SceneSummary {
@@ -104,6 +158,13 @@ impl ReportState {
                 rss_max_mb: rss_max_kb as f64 / 1024.0,
                 vmhwm_max_mb: vmhwm_max_kb as f64 / 1024.0,
                 codec_wire_bytes: codec_bytes,
+                h264_dwell_us,
+                tile_dwell_us,
+                mode_switch_count,
+                mode_decision_counts,
+                pixelperfect_count,
+                decode_error_count,
+                sweep_axis_label: None,
             },
         );
     }

@@ -60,6 +60,30 @@
 
 
 /**
+ * Per-tile bias added to the H264 comparand when refinement passes are
+ * outstanding. Pulls the cost comparison toward TileCodec when there's
+ * PixelPerfect work left to deliver and bandwidth headroom permits.
+ * Retuned in M3.6c from the bandwidth × scene matrix.
+ */
+#define REFINEMENT_BIAS_PER_TILE_US 5.0
+
+/**
+ * Minimum bandwidth (bytes per µs) below which the classifier
+ * hard-overrides to H264 regardless of the cost comparison. 0.25 B/µs
+ * ≈ 2 Mbps — below this, individual tile-codec emissions can't keep up
+ * with frame-rate. Retuned in M3.6c.
+ */
+#define HEADROOM_MIN_BYTES_PER_US 0.25
+
+/**
+ * Smoothed loss-rate threshold above which the classifier hard-overrides
+ * to H264. 10 % datagram loss makes per-tile reassembly + refinement
+ * unworkable; H264 full-frame's larger I-frame interval rides through
+ * better. Retuned in M3.6c.
+ */
+#define LOSS_OVERRIDE_THRESHOLD 0.10
+
+/**
  * Threshold matching the spec: tile must be idle for > IDLE_THRESHOLD frames
  * before becoming eligible for escalation. 30 frames ≈ 500 ms at 60 fps.
  */

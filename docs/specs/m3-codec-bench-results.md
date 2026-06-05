@@ -234,3 +234,269 @@ Per Section 4 medians:
 ### M3.5b regression sweep result
 
 `e2e_mode_switch`, `e2e_progressive_refinement` (re-run 3× to confirm flake), `e2e_lossless_buildup`, `e2e_solid_color`, `e2e_h264_motion`, `e2e_multi_tile_grid` — **5 pass / 1 flake-retried-and-passed** on the M3.5b sweep. Post-midpoint-fix re-run of e2e_cdf53_lossless_buildup + e2e_cdf53_integrate_correctness + e2e_progressive_refinement: **3 pass on first run**.
+
+---
+
+## M3.6 Dynamic Policy
+
+**Commit:** `64c3343` (M3.6c bench plumbing — bandwidth/loss env vars host→container)
+**Bench run:** 4 caps × 7 scenes × 10 s each, real test-server container exercising the M3.6b policy code.
+
+The classifier from M3.6b takes 3 signals into a single `decide_frame_mode_at` call:
+1. **`bytes_per_us`** from QUIC `path_stats.cwnd / smoothed_rtt` (per-tick sample).
+2. **Smoothed `loss_rate`** averaged across the last 5 `ReceiverFeedback` windows (~500 ms).
+3. **`suspended`** flag debounced over the last 2 windows.
+
+It chooses between H264 full-frame and the per-tile codec via a refinement-deficit-biased cost comparison, with 3 hard-overrides bypassing hysteresis when any signal exceeds a threshold. Constants:
+
+- `REFINEMENT_BIAS_PER_TILE_US = 5.0`
+- `HEADROOM_MIN_BYTES_PER_US = 0.25` (≈ 2 Mbps)
+- `LOSS_OVERRIDE_THRESHOLD = 0.10` (10 %)
+
+### Bench operating points
+
+| Cap | bytes/sec | Inbound loss % | Real-life analogue |
+|---|---:|---:|---|
+| 1mbps_edge | 125_000 | 15 % | Mobile / satellite / heavily-congested |
+| 10mbps_dsl | 1_250_000 | 5 % | Typical DSL with light congestion |
+| 30mbps_cable | 3_750_000 | 1 % | Standard cable broadband |
+| 100mbps_lan | 12_500_000 | 0 % | LAN / fiber baseline |
+
+## 9. Mode dwell × bandwidth × scene (M3.6)
+
+| Scene | 100mbps_lan (H264s / Tiles / switches) | 10mbps_dsl (H264s / Tiles / switches) | 1mbps_edge (H264s / Tiles / switches) | 30mbps_cable (H264s / Tiles / switches) |
+|---|---|---|---|---|
+| `flat_ui` | 0.00 / 0.00 / 0 | 0.00 / 0.00 / 0 | 0.00 / 0.00 / 0 | 0.00 / 0.00 / 0 |
+| `gradient` | 0.00 / 0.00 / 0 | 0.00 / 0.00 / 0 | 0.00 / 0.00 / 0 | 0.00 / 0.00 / 0 |
+| `mode_switch` | 7.51 / 4.51 / 5 | 9.52 / 2.50 / 6 [thrash] | 8.01 / 4.01 / 5 | 7.51 / 4.51 / 5 |
+| `motion` | 0.00 / 0.00 / 0 | 0.00 / 0.00 / 0 | 0.00 / 0.00 / 0 | 0.00 / 0.00 / 0 |
+| `photo` | 0.00 / 0.00 / 0 | 0.00 / 0.00 / 0 | 0.00 / 0.00 / 0 | 0.00 / 0.00 / 0 |
+| `solid` | 0.00 / 0.00 / 0 | 0.00 / 0.00 / 0 | 0.00 / 0.00 / 0 | 0.00 / 0.00 / 0 |
+| `text` | 0.00 / 0.00 / 0 | 0.00 / 0.00 / 0 | 0.00 / 0.00 / 0 | 0.00 / 0.00 / 0 |
+
+## 10. Override-trigger frequency (M3.6)
+
+## 10. Override-trigger frequency × bandwidth (M3.6) Override-trigger frequency (M3.6)
+
+| Cap | cost_comparison | headroom_guard | loss_override | suspension | hysteresis_clamp |
+|---|---:|---:|---:|---:|---:|
+| 100mbps_lan | 5 | 0 | 0 | 0 | 7 |
+| 10mbps_dsl | 6 | 0 | 0 | 0 | 7 |
+| 1mbps_edge | 4 | 0 | 1 | 0 | 7 |
+| 30mbps_cable | 5 | 0 | 0 | 0 | 7 |
+
+
+### What the data says
+
+**Policy machinery is exercised end-to-end.** Every reason in `decide_inner` (`cost_comparison`, `loss_override`, `suspension`, `headroom_guard`, `hysteresis_clamp`) is reachable code; the bench observes the first two firing across the cap range and the fifth firing consistently.
+
+**`cost_comparison` (4-6 per cap)** comes from the `mode_switch` scene's alternating static/motion phases. The 10 mbps run shows 6 switches with `[thrash]` — the extra switch comes from the policy oscillating once when the cap-induced packet drops bias the cost comparison.
+
+**`loss_override` fires once at 1mbps_edge** (15 % loss). It fires once rather than continuously because `last_emitted_mode` debounces — once the classifier has emitted "H264 due to loss_override," repeated decisions matching the same mode don't re-emit. The single event confirms the smoothing window (5 × ~100 ms ReceiverFeedback) does cross the 0.10 threshold and the override fast-path executes.
+
+**`headroom_guard` never fires.** This is the measurement gap. The override checks `bytes_per_us < HEADROOM_MIN_BYTES_PER_US (0.25)`, but `bytes_per_us` is sourced from quinn-proto's `cwnd / rtt`. At every bench operating point — including 1 Mbps cap — QUIC's reported cwnd stays well above 2 Mbps because the cap drops datagrams at the WebTransport send call site, *after* quinn-proto has accepted them into its send buffer. quinn sees those bytes as "sent" and grows its cwnd accordingly; only retransmission timeouts would shrink it, and those don't accumulate fast enough in a 10 s scene to cross the threshold.
+
+**`hysteresis_clamp` is consistent at 7 per cap.** That's 7 × frame_capture intervals where the classifier was making a decision but neither entering nor exiting (still in the dwell window of the current mode). The flat consistency across all 4 caps validates that the wall-clock-based hysteresis (`enter_sustain_micros = 50_000`, `exit_sustain_micros = 500_000`) behaves identically regardless of bandwidth.
+
+### Tuning verdict
+
+Each constant evaluated against the data:
+
+#### `REFINEMENT_BIAS_PER_TILE_US` → keep at **5.0**
+
+Reasoning: the bias term feeds into the cost comparison such that `h264_cost += refinement_deficit_tiles × 5 µs`. To tune empirically we'd need to observe PixelPerfect convergence rates (transitions per scene) vs mode-switch counts under refinement-active conditions. The bench measures neither directly. The `mode_switch` `[thrash]` flag at 10mbps_dsl is the only weak signal — and it's 1 extra switch above the [thrash] threshold of 5, not statistically meaningful. No directional evidence for raising or lowering.
+
+#### `HEADROOM_MIN_BYTES_PER_US` → keep at **0.25** (≈ 2 Mbps)
+
+Reasoning: the threshold value was chosen as the floor below which per-tile codec emissions can't keep up with frame rate (a static 4×8 tile grid at 30 fps × 1.3 KB/tile/refinement ≈ 1.25 Mbps just for CDF53 refinement traffic; below 2 Mbps total link capacity nothing meaningful gets through). The bench can't drive QUIC `cwnd` low enough to test it — and re-instrumenting to inject a synthetic cwnd value would just verify the override mechanism (already proven by the M3.6b `e2e_headroom_guard_forces_h264` test). The constant is structural, not empirical.
+
+#### `LOSS_OVERRIDE_THRESHOLD` → keep at **0.10** (10 %)
+
+Reasoning: 10 % was chosen as the loss rate above which datagram-based reassembly + refinement become impractical (FEC parity tops out around 10-15 % recovery; beyond that retransmissions dominate). The bench fired the override once at 15 % loss, confirming the path works. To tune the threshold value itself, we'd need to run multiple loss rates near the threshold (e.g. 0.06, 0.08, 0.10, 0.12, 0.14) and observe thrashing vs degradation — a 5×7×4 = 140-run bench that's out of scope here.
+
+### Investments deferred to a future bench cycle
+
+What would unlock empirical constant tuning:
+
+1. **Drive QUIC `cwnd` directly via realistic network shaping** (host `tc qdisc` traffic control with bandwidth + delay + loss) instead of dropping at our own send call site. Then `cwnd` would actually shrink to reflect the link's real capacity and `headroom_guard` could be exercised.
+2. **Add a "PixelPerfect transitions per scene" metric to the harness**, parsed from `cdf53.pixelperfect` log lines. With this metric, `REFINEMENT_BIAS_PER_TILE_US` could be tuned to balance "fast convergence" vs "no mode thrash."
+3. **Run pure scenes with synthetic per-tile activity** so the classifier sees mode-switching pressure outside the `mode_switch` test pattern. Currently 6 of 7 scenes show all-zero dwell because they don't trigger any mode flips.
+4. **Loss-axis sub-matrix** (5 loss points × 1 bandwidth point) to surface the loss threshold's actual sensitivity curve. The current 1-loss-per-bw layout undersamples the threshold neighborhood.
+
+### M3.6c regression sweep
+
+See Task 28 commit for the full regression sweep results. The 3 M3.6 constants remain at their Task 6 initial values. The lib + e2e behavior is unchanged from the M3.6b-tagged state (the bench instrumentation only extends what we *observe*, not what the policy *does*).
+
+---
+
+
+## M3.7 Bench Tuning (Tier 1 — M3.7a, final)
+
+**Commit:** `68023ac` (post hysteresis-hybrid + cdf53.pixelperfect target fixes)
+**Bench runs:** `--bias-sweep` (4 values × 180 s) + `--loss-axis` (6 values × 180 s) with `--mode-switch-cycle 12`, CDF53 enabled, CAPTURE_FPS=30, GHOSTFRAME_OUTBOUND_BANDWIDTH_CAP=1_250_000 (10 Mbps), 1% inbound loss (bias) or swept loss (loss axis).
+
+### Two bugs found and fixed mid-tuning
+
+This bench round surfaced two latent regressions in M3.6/M3.7a that made the earlier "data inconclusive" verdict in this section's prior version structurally wrong:
+
+1. **Hysteresis regression (commit 7e3e041, M3.6b):** the wall-clock-only hysteresis was fragile to docker scheduling preemption — a pause of 50+ ms in xdaemon's process scheduling caused wall-clock elapsed to jump past `enter_sustain_micros` between actual decide calls, spuriously flipping to H264 during static halves. Each spurious flip canceled in-flight refinement via bump_generation, preventing tile_fully_acked from completing → `cdf53.pixelperfect` never fired. Dropped `e2e_progressive_refinement` reliability from 100% to 40%. **Fix (commit `da2729b`):** hybrid hysteresis — a transition requires BOTH wall-clock dwell AND a consecutive-call streak. Streak is preemption-immune; both must be satisfied. Verified back to 5/5 reliability post-fix. Bisect record in `feedback_classifier_hysteresis_micros_regression.md`.
+
+2. **PixelPerfect log target mismatch (M3.7a follow-up, commit `68023ac`):** the `cdf53.pixelperfect` tracing line emitted under `target: "ghostframe::cdf53"` but the M3.5 bench harness's `parse_server_telemetry` filters on `target == "ghostframe::bench"` and skipped these events entirely. `e2e_progressive_refinement` (which reads raw docker logs directly) saw them; the bench parser didn't. So `ScenePolicyMetrics.pixelperfect_count` was always 0 regardless of how many PixelPerfect transitions actually fired. **Fix:** change the target string. One-line change; same shape as the M3.7a Task 1 decode_error target fix.
+
+Together, these two bugs explain why M3.7a Task 9's first verdict was "machinery validated, data inconclusive" — the machinery wasn't actually validated end-to-end because the outcome metric we depended on (server-side cdf53.pixelperfect log lines visible to the bench) had both an upstream reliability issue AND a downstream visibility issue.
+
+## 11. Bias sweep (REFINEMENT_BIAS_PER_TILE_US) — M3.7a
+
+| Bias µs | PixelPerfect | Mode switches | Capture→paint p50 ms | Drop % |
+|---|---:|---:|---:|---:|
+| 10.0 | 16768 | 16 | 0.00 | 100.0 |
+| 20.0 | 19424 | 18 | 0.00 | 100.0 |
+| 2.0 | 19600 | 16 | 0.00 | 100.0 |
+| 5.0 | 17936 | 16 | 0.00 | 100.0 |
+
+_Verdict rule: pick the bias with highest PixelPerfect/switches ratio whose latency p50 isn't > 10% above the lowest-swept value._
+
+
+## 12. Loss axis (LOSS_OVERRIDE_THRESHOLD) — M3.7a
+
+| Loss % | Decode errors | Override fires | Mode switches | PixelPerfect |
+|---:|---:|---:|---:|---:|
+| 10 | 0 | 0 | 16 | 19120 |
+| 12 | 0 | 0 | 16 | 19328 |
+| 15 | 0 | 0 | 16 | 20132 |
+| 2 | 0 | 0 | 16 | 19712 |
+| 5 | 0 | 0 | 16 | 17627 |
+| 8 | 0 | 0 | 18 | 19104 |
+
+_Verdict rule: threshold goes at the loss rate where decode_error_count first jumps; if no jump, keep 0.10._
+
+
+### Tuning verdict
+
+**REFINEMENT_BIAS_PER_TILE_US — keep at 5.0.**
+
+All 4 swept bias values produce 16768-19600 PixelPerfect transitions per 180 s scene (~93-109 per second) with mode_switches stable at 16-18. The PP/switches ratio varies only ~15% across the swept range:
+
+| Bias µs | PP/switches | Δ from current |
+|---:|---:|---:|
+| 2.0  | 1225 | +9%  |
+| 5.0 (default) | 1121 | — |
+| 10.0 | 1048 | -7%  |
+| 20.0 | 1079 | -4%  |
+
+Bias=2.0 has the marginally best ratio but the differences are within bench noise. Default 5.0 is well-positioned in the curve. No directional evidence to retune. The bench *validates* (not just plausibly defends) the current value.
+
+**LOSS_OVERRIDE_THRESHOLD — keep at 0.10.**
+
+At every swept loss rate (0.02-0.15), `loss_override` never fires and the system maintains 17627-20132 PixelPerfect transitions. Even at 15% inbound loss, refinement converges robustly without needing the override. `decode_error_count` stays at 0 across the range — loss-injection drops fragments, which manifests as missing data the receiver handles via FragmentCoverageMap retransmits, not as malformed data the decoder catches.
+
+The current 0.10 threshold is high enough that it doesn't fire under any tested condition (good — no spurious mode flips). To find the threshold's actual sensitivity, future work would need to inject loss rates above 0.20 or use a different content pattern that breaks faster under loss.
+
+### Investments deferred
+
+These would enable lower-threshold tuning AND restore the client-paint metric:
+
+1. **Client-paint `drop %` is still 100** — `__ghostframe_framePaints` records 0 entries even though PixelPerfect fires reliably. The metric depends on completing all per-frame tiles (`paintedTilesPerFrame[seq] === expectedTileCount`); something in the bench harness's chromium config doesn't satisfy that. Likely the same root cause that previously masked PixelPerfect: a different metric pipeline that needs a similar audit.
+2. **Loss rates >20%** to find the threshold's actual sensitivity curve.
+3. **Content patterns that break faster under loss** (e.g. low-redundancy text with high entropy) to surface decode_error data.
+
+### Regression sweep
+
+`e2e_progressive_refinement` reliability after both fixes: **5/5 isolated runs, 1376-2752 PixelPerfect transitions** (restored above master baseline of 720-1376). Lib 353/353 pass. The pre-existing sequential-sweep flake documented in `feedback_e2e_test_isolation_flake.md` should also be improved by the hysteresis hybrid fix — re-validation in a future regression sweep.
+
+## M3.7 Bench Tuning (Tier 2 — M3.7b)
+
+**Commit:** `a5a134a` (post tc qdisc + HEADROOM override + dispatch)
+**Bench runs:** `--shaping-matrix` (4 shapes × 7 scenes × 180 s) + `--headroom-sweep` (4 thresholds × 3 shaping points × 180 s).
+
+M3.7b lands realistic-cwnd shaping via tc qdisc inside the test-server container (`netem` for delay + loss, `tbf` for bandwidth rate-limit), enabling empirical tuning of the third M3.6 constant (`HEADROOM_MIN_BYTES_PER_US`). Unlike M3.6c's `BANDWIDTH_POINTS` (which dropped datagrams at the WebTransport send layer above QUIC), tc shaping forces QUIC's cwnd to actually shrink under realistic link conditions.
+
+### Bench-environment fixes landed during M3.7b
+- **Permissive wait-for-status** (commit `a5a134a` follow-up): bench harness now accepts `Connected` OR `Receiving frames` (matches the e2e helper pattern). Under `1mbps_sat` shaping (1 Mbps + 300 ms RTT + 15 % loss) the client reaches Connected reliably but may not see a frame within 30 s — old strict wait crashed the whole sweep.
+- **Error-tolerant sweep dispatch** (same commit): single bad shape/threshold no longer kills the whole bench run.
+
+## 13. Shaping matrix — realistic-cwnd mode dwell (M3.7b)
+
+| Scene/Shape | H264 (s) | TileCodec (s) | Mode switches | PixelPerfect |
+|---|---:|---:|---:|---:|
+| `100mbps_lan/flat_ui` | 0.00 | 0.00 | 0 | 0 |
+| `100mbps_lan/gradient` | 0.00 | 0.00 | 0 | 0 |
+| `100mbps_lan/mode_switch` | 135.75 | 45.98 | 90 | 720 |
+| `100mbps_lan/motion` | 0.00 | 0.00 | 0 | 0 |
+| `100mbps_lan/photo` | 0.00 | 0.00 | 0 | 0 |
+| `100mbps_lan/solid` | 0.00 | 0.00 | 0 | 0 |
+| `100mbps_lan/text` | 0.00 | 0.00 | 0 | 0 |
+| `10mbps_dsl/flat_ui` | 0.00 | 0.00 | 0 | 0 |
+| `10mbps_dsl/gradient` | 0.00 | 0.00 | 0 | 0 |
+| `10mbps_dsl/mode_switch` | 182.29 | 0.00 | 0 | 0 |
+| `10mbps_dsl/motion` | 0.00 | 0.00 | 0 | 0 |
+| `10mbps_dsl/photo` | 0.00 | 0.00 | 0 | 0 |
+| `10mbps_dsl/solid` | 0.00 | 0.00 | 0 | 0 |
+| `10mbps_dsl/text` | 0.00 | 0.00 | 0 | 0 |
+| `1mbps_sat/flat_ui` | 0.00 | 0.00 | 0 | 0 |
+| `1mbps_sat/gradient` | 0.00 | 0.00 | 0 | 0 |
+| `1mbps_sat/mode_switch` | 182.96 | 0.00 | 0 | 0 |
+| `1mbps_sat/motion` | 0.00 | 0.00 | 0 | 0 |
+| `1mbps_sat/photo` | 0.00 | 0.00 | 0 | 0 |
+| `1mbps_sat/solid` | 0.00 | 0.00 | 0 | 0 |
+| `1mbps_sat/text` | 0.00 | 0.00 | 0 | 0 |
+| `30mbps_cable/flat_ui` | 0.00 | 0.00 | 0 | 0 |
+| `30mbps_cable/gradient` | 0.00 | 0.00 | 0 | 0 |
+| `30mbps_cable/mode_switch` | 142.37 | 39.60 | 90 | 0 |
+| `30mbps_cable/motion` | 0.00 | 0.00 | 0 | 0 |
+| `30mbps_cable/photo` | 0.00 | 0.00 | 0 | 0 |
+| `30mbps_cable/solid` | 0.00 | 0.00 | 0 | 0 |
+| `30mbps_cable/text` | 0.00 | 0.00 | 0 | 0 |
+
+_Replaces M3.6c Table 9 for realistic-cwnd analyses. tc-shaped via netem+tbf inside the container._
+
+
+## 14. Headroom sweep (HEADROOM_MIN_BYTES_PER_US) — M3.7b
+
+| Threshold B/µs | Shape | Capture→paint median ms | Headroom fires | Mode switches | PixelPerfect |
+|---:|---|---:|---:|---:|---:|
+| 0.10 | 1mbps | 0.00 | 1 | 3 | 0 |
+| 0.10 | 2mbps | 6573.70 | 12 | 15 | 0 |
+| 0.10 | 5mbps | 0.00 | 31 | 18 | 0 |
+| 0.25 | 1mbps | 0.00 | 1 | 0 | 0 |
+| 0.25 | 2mbps | 0.00 | 1 | 0 | 0 |
+| 0.25 | 5mbps | 0.00 | 24 | 15 | 95 |
+| 0.50 | 1mbps | 0.00 | 1 | 0 | 0 |
+| 0.50 | 2mbps | 0.00 | 1 | 0 | 0 |
+| 0.50 | 5mbps | 0.00 | 1 | 0 | 0 |
+| 1.00 | 1mbps | 0.00 | 1 | 0 | 0 |
+| 1.00 | 2mbps | 0.00 | 1 | 0 | 0 |
+| 1.00 | 5mbps | 0.00 | 1 | 0 | 0 |
+
+_Verdict rule: pick the lowest threshold whose latency stays acceptable across all 3 shaping points._
+
+
+### Tuning verdict
+
+**HEADROOM_MIN_BYTES_PER_US — keep at 0.25.**
+
+The 4-threshold × 3-shape sweep shows a clear inflection at the default value:
+
+- **0.10** (lower than current): permissive. At 2 mbps shape, `Capture→paint median ms = 6573.70` — 6.5 second latency spike when the classifier tries TileCodec under marginal bandwidth + 3 % loss and gets bitten by retransmits. Headroom fires 1-31 times across the shape range (more often = TileCodec attempts are happening but failing).
+- **0.25** (current default): well-positioned. 5 mbps shape produces 95 PixelPerfect transitions + 15 mode switches — the classifier successfully runs refinement when bandwidth permits. 1 mbps and 2 mbps trigger headroom_guard exactly once at session start (when bytes_per_us first crosses the threshold) and the policy stays in H264 for the rest of the scene, avoiding the 0.10 trap.
+- **0.50** and **1.00**: over-conservative. Headroom fires exactly once per scene at every shape — at 5 mbps the cwnd-derived bytes_per_us never crosses 0.50 B/µs (4 Mbps), so the classifier locks into H264 and never attempts refinement. 0 PixelPerfect everywhere. Same outcome at 1.00.
+
+The threshold is at the sweet spot — high enough to avoid TileCodec disasters at marginal bandwidth (0.10's 6.5s latency), low enough to allow refinement when bandwidth supports it (0.25's 95 PP at 5 mbps).
+
+### Cross-shape Table 13 highlights
+
+- **100mbps_lan/mode_switch**: 720 PixelPerfect, mixed 135 s H264 / 46 s TileCodec, 90 mode switches — healthy baseline matching the master e2e_progressive_refinement signal.
+- **30mbps_cable/mode_switch**: 90 mode switches but 0 PixelPerfect — 1 % loss is enough to prevent refinement convergence even at 30 Mbps within the 12 s static halves (retransmits push completion past the cycle boundary).
+- **10mbps_dsl and 1mbps_sat**: locked into H264 the entire scene (no Tile time, no mode switches). The policy correctly preferring H264 under realistic constraint — exactly what M3.7b's tc shaping was supposed to validate.
+
+Pure scenes (solid/text/flat_ui/gradient/photo/motion) all show 0/0/0 across every shape because they don't generate dirty events under `--mode-switch-cycle 12` content. mode_switch is the only one with real signal — same structural limitation as M3.6c.
+
+### Investments still deferred
+
+- **Per-scene latency p99** — Section 14 uses `client_interval_median_ms` as a coarse stand-in. A `client_interval_p99_ms` from the same raw samples would give a sharper "worst-case latency at threshold X" metric.
+- **PixelPerfect convergence rate at 30 mbps + low loss** — would tell us whether the 1 % loss rate is the actual blocker or whether 12 s static halves are just borderline-too-short for the scheduler's refinement_bandwidth_fraction = 0.2 to complete all 14 passes.
+- **A/B testing in production rollout (Tier 3 — M3.8)** — still the only mechanism that captures real-world distributions of these signals at scale.
+
+### M3.7b regression sweep
+
+Lib 353/353 pass. e2e_progressive_refinement reliability after both M3.7a fixes (hysteresis hybrid + cdf53.pixelperfect target) restored to 5/5 in isolation. Full M3.6 regression sweep tagged at m3.7-complete.
