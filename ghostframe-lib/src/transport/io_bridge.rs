@@ -691,7 +691,7 @@ impl IoBridge {
                 use crate::tile::CodecState;
                 let codec_state = self.metrics_tracker.get(tile_x, tile_y).codec_state;
                 if matches!(codec_state, CodecState::Cdf53 { .. }) {
-                    // Gate open + Cdf53 retained → Phase B handles emission via
+                    // Cdf53 state → Phase B handles emission via
                     // the refinement queue (generation already bumped by Phase B).
                     // Skip entirely: do NOT bump generation (would supersede Phase
                     // B's enqueued passes), do NOT enqueue to priority_queue.

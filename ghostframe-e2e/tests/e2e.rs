@@ -2435,8 +2435,8 @@ async fn e2e_webgpu_fallback_swiftshader() -> Result<()> {
     Ok(())
 }
 
-/// M3.3a: high-color content (`--gradient` test pattern) with
-/// `GHOSTFRAME_ENABLE_CDF53=1` → server emits `Codec::Cdf53 (6)` on the wire.
+/// M3.3a: high-color content (`--gradient` test pattern) — server emits
+/// `Codec::Cdf53 (6)` on the wire (CDF53 is now baseline-mandatory).
 /// Client side: M3.3a client cannot yet decode Cdf53; datagrams arrive and
 /// are dropped silently but recorded in `__ghostframeRecordedCodecs`.
 #[tokio::test(flavor = "multi_thread")]
@@ -3281,10 +3281,10 @@ async fn e2e_cdf53_inverse_gradient_tile() -> Result<()> {
     Ok(())
 }
 
-/// M3.3b diagnostic: drive a 5 s gradient stream with both
-/// `GHOSTFRAME_ENABLE_CDF53=1` and `GHOSTFRAME_CDF53_DIFF_TILE=18,5` set on
-/// the server so io_bridge.rs's one-shot diagnostic emits side-by-side
-/// GPU vs CPU `cdf53::forward(tile_bgra)` coefficients for tile (18,5).
+/// M3.3b diagnostic: drive a 5 s gradient stream with
+/// `GHOSTFRAME_CDF53_DIFF_TILE=18,5` set on the server so io_bridge.rs's
+/// one-shot diagnostic emits side-by-side GPU vs CPU
+/// `cdf53::forward(tile_bgra)` coefficients for tile (18,5).
 /// Reads server logs and prints the `cdf53.diff` lines.
 ///
 /// Outcomes:
