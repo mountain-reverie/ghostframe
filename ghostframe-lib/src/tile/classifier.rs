@@ -334,6 +334,11 @@ pub struct Classifier {
     /// under `cfg(any(test, feature = "test-loss-injection"))`.
     #[cfg(any(test, feature = "test-loss-injection"))]
     loss_override_threshold_override: Option<f32>,
+    /// M3.7b env-var override for HEADROOM_MIN_BYTES_PER_US. Populated
+    /// from `GHOSTFRAME_TEST_HEADROOM_MIN_BPUS` in `Default::default()`.
+    /// Cfg-gated under `test-loss-injection`.
+    #[cfg(any(test, feature = "test-loss-injection"))]
+    headroom_min_bpus_override: Option<f32>,
     /// Last emitted mode (debounces the `mode.decision` event to fire
     /// only on transitions). `None` before the first decision.
     last_emitted_mode: Option<FrameMode>,
@@ -369,6 +374,11 @@ impl Default for Classifier {
                 .ok()
                 .and_then(|s| s.parse::<f32>().ok())
                 .filter(|v| *v > 0.0 && *v <= 1.0),
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            headroom_min_bpus_override: std::env::var("GHOSTFRAME_TEST_HEADROOM_MIN_BPUS")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .filter(|v| *v > 0.0),
             last_emitted_mode: None,
             epoch: std::time::Instant::now(),
         }
@@ -483,8 +493,14 @@ impl Classifier {
         // accept the resulting mode-switch count uptick as the cost of
         // fast recovery; M3.6c's Table 9 verifies it's not pathological.
         let ctx = self.adaptation_context;
+        let headroom_threshold = {
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            { self.headroom_min_bpus_override.unwrap_or(HEADROOM_MIN_BYTES_PER_US) }
+            #[cfg(not(any(test, feature = "test-loss-injection")))]
+            { HEADROOM_MIN_BYTES_PER_US }
+        };
         let headroom_force_h264 =
-            ctx.bytes_per_us > 0.0 && ctx.bytes_per_us < HEADROOM_MIN_BYTES_PER_US;
+            ctx.bytes_per_us > 0.0 && ctx.bytes_per_us < headroom_threshold;
         if headroom_force_h264 {
             self.state = ClassifierHysteresis::default();
             return (FrameMode::H264, "headroom_guard");

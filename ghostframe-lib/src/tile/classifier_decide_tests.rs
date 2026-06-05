@@ -518,3 +518,31 @@ fn env_var_override_loss_override_threshold() {
     );
     assert_eq!(LOSS_OVERRIDE_THRESHOLD, 0.10);
 }
+
+#[test]
+fn env_var_override_headroom_min_bpus() {
+    use crate::tile::classifier::{AdaptationContext, Classifier, HEADROOM_MIN_BYTES_PER_US};
+    use crate::tile::{CodecState, FrameMode};
+
+    // Lower the threshold to 0.05 — well below the test ctx's 0.1.
+    std::env::set_var("GHOSTFRAME_TEST_HEADROOM_MIN_BPUS", "0.05");
+    let mut c = Classifier::default();
+    std::env::remove_var("GHOSTFRAME_TEST_HEADROOM_MIN_BPUS");
+
+    let ctx = AdaptationContext {
+        bytes_per_us: 0.1,
+        smoothed_rtt_us: 50_000.0,
+        loss_rate: 0.0,
+        suspended: false,
+        last_update_seq: 1,
+    };
+    c.set_adaptation_context(ctx);
+    let tentative = vec![CodecState::Solid];
+
+    // 0.1 > 0.05 ⇒ headroom override should NOT fire (would fire at default 0.25).
+    assert_eq!(
+        c.decide_frame_mode(&tentative, FrameMode::TileCodec),
+        FrameMode::TileCodec
+    );
+    assert_eq!(HEADROOM_MIN_BYTES_PER_US, 0.25);
+}
