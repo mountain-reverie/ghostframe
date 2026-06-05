@@ -7,6 +7,8 @@
 mod bandwidth_matrix;
 mod bias_sweep;
 mod loss_axis;
+mod shaping_matrix;
+mod headroom_sweep;
 mod cli;
 mod runner;
 mod aggregate;
@@ -28,7 +30,62 @@ async fn main() -> anyhow::Result<()> {
 
     let scenes = runner::resolve_scenes(&args.scenes, args.scene_duration);
     let mut state = aggregate::ReportState::new(&args);
-    if args.bias_sweep {
+    if args.headroom_sweep {
+        use ghostframe_e2e::harness::{FrameMode, SceneSpec};
+        // CDF53 + CAPTURE_FPS needed for PixelPerfect signal (see M3.7a note).
+        std::env::set_var("GHOSTFRAME_ENABLE_CDF53", "1");
+        std::env::set_var("CAPTURE_FPS", "30");
+        for shape in headroom_sweep::HEADROOM_SHAPING_POINTS {
+            std::env::set_var("SHAPE_BANDWIDTH_KBPS", shape.bandwidth_kbps.to_string());
+            std::env::set_var("SHAPE_DELAY_MS", shape.delay_ms.to_string());
+            std::env::set_var("SHAPE_LOSS_PCT", shape.loss_pct.to_string());
+            for hp in headroom_sweep::HEADROOM_VALUES_BPUS {
+                std::env::set_var("GHOSTFRAME_TEST_HEADROOM_MIN_BPUS", hp.value_bpus.to_string());
+                let labeled_name = format!("{}/{}", hp.label, shape.label);
+                let spec = SceneSpec {
+                    name: Box::leak(labeled_name.clone().into_boxed_str()),
+                    test_pattern_args: headroom_sweep::DEFAULT_TEST_PATTERN_ARGS.iter().map(|s| s.to_string()).collect(),
+                    duration: args.scene_duration,
+                    initial_mode: FrameMode::TileCodec,
+                };
+                tracing::info!(headroom_bpus = hp.value_bpus, shape = shape.label, "headroom-sweep run");
+                runner::run_one_scene(&spec, &mut state).await?;
+                if let Some(summary) = state.scenes.get_mut(&labeled_name) {
+                    summary.sweep_axis_label = Some(format!("{}/{}", hp.label, shape.label));
+                }
+                std::env::remove_var("GHOSTFRAME_TEST_HEADROOM_MIN_BPUS");
+            }
+            std::env::remove_var("SHAPE_BANDWIDTH_KBPS");
+            std::env::remove_var("SHAPE_DELAY_MS");
+            std::env::remove_var("SHAPE_LOSS_PCT");
+        }
+        std::env::remove_var("GHOSTFRAME_ENABLE_CDF53");
+        std::env::remove_var("CAPTURE_FPS");
+    } else if args.shaping_matrix {
+        std::env::set_var("GHOSTFRAME_ENABLE_CDF53", "1");
+        std::env::set_var("CAPTURE_FPS", "30");
+        let scenes = runner::resolve_scenes(&args.scenes, args.scene_duration);
+        for shape in shaping_matrix::SHAPING_POINTS {
+            std::env::set_var("SHAPE_BANDWIDTH_KBPS", shape.bandwidth_kbps.to_string());
+            std::env::set_var("SHAPE_DELAY_MS", shape.delay_ms.to_string());
+            std::env::set_var("SHAPE_LOSS_PCT", shape.loss_pct.to_string());
+            for spec in &scenes {
+                let labeled_name = format!("{}/{}", shape.label, spec.name);
+                let mut labeled_spec = spec.clone();
+                labeled_spec.name = Box::leak(labeled_name.clone().into_boxed_str());
+                tracing::info!(scene = spec.name, shape = shape.label, "shaping-matrix run");
+                runner::run_one_scene(&labeled_spec, &mut state).await?;
+                if let Some(summary) = state.scenes.get_mut(&labeled_name) {
+                    summary.sweep_axis_label = Some(format!("shape_{}", shape.label));
+                }
+            }
+            std::env::remove_var("SHAPE_BANDWIDTH_KBPS");
+            std::env::remove_var("SHAPE_DELAY_MS");
+            std::env::remove_var("SHAPE_LOSS_PCT");
+        }
+        std::env::remove_var("GHOSTFRAME_ENABLE_CDF53");
+        std::env::remove_var("CAPTURE_FPS");
+    } else if args.bias_sweep {
         use ghostframe_e2e::harness::{FrameMode, SceneSpec};
         // Required for CDF53 refinement to fire at all — without this
         // env var the codec is disabled in xdaemon and the PixelPerfect

@@ -364,6 +364,79 @@ pub fn write(
         }
     }
 
+    // ---- Section 13: M3.7b Shaping matrix (realistic-cwnd mode dwell) ----
+    {
+        let mut rows: Vec<(&String, &SceneSummary)> = state
+            .scenes
+            .iter()
+            .filter(|(_, s)| s.sweep_axis_label.as_deref().map(|l| l.starts_with("shape_")).unwrap_or(false))
+            .collect();
+        rows.sort_by_key(|(name, _)| name.clone());
+
+        if !rows.is_empty() {
+            writeln!(f, "## 13. Shaping matrix — realistic-cwnd mode dwell (M3.7b)")?;
+            writeln!(f)?;
+            writeln!(f, "| Scene/Shape | H264 (s) | TileCodec (s) | Mode switches | PixelPerfect |")?;
+            writeln!(f, "|---|---:|---:|---:|---:|")?;
+            for (name, s) in &rows {
+                writeln!(
+                    f,
+                    "| `{}` | {:.2} | {:.2} | {} | {} |",
+                    name,
+                    s.h264_dwell_us as f64 / 1e6,
+                    s.tile_dwell_us as f64 / 1e6,
+                    s.mode_switch_count,
+                    s.pixelperfect_count,
+                )?;
+            }
+            writeln!(f)?;
+            writeln!(f, "_Replaces M3.6c Table 9 for realistic-cwnd analyses. tc-shaped via netem+tbf inside the container._")?;
+            writeln!(f)?;
+        }
+    }
+
+    // ---- Section 14: M3.7b Headroom sweep (HEADROOM_MIN_BYTES_PER_US) ----
+    {
+        let mut rows: Vec<(&String, &SceneSummary)> = state
+            .scenes
+            .iter()
+            .filter(|(_, s)| s.sweep_axis_label.as_deref().map(|l| l.starts_with("headroom_")).unwrap_or(false))
+            .collect();
+        rows.sort_by_key(|(name, _)| name.clone());
+
+        if !rows.is_empty() {
+            writeln!(f, "## 14. Headroom sweep (HEADROOM_MIN_BYTES_PER_US) — M3.7b")?;
+            writeln!(f)?;
+            writeln!(f, "| Threshold B/µs | Shape | Capture→paint median ms | Headroom fires | Mode switches | PixelPerfect |")?;
+            writeln!(f, "|---:|---|---:|---:|---:|---:|")?;
+            for (_name, s) in &rows {
+                let label = s.sweep_axis_label.as_deref().unwrap_or("?");
+                let (hr_label, shape_label) = label.split_once('/').unwrap_or((label, ""));
+                let hr_value: f32 = hr_label
+                    .strip_prefix("headroom_")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.0);
+                let headroom_fires = s
+                    .mode_decision_counts
+                    .get("headroom_guard")
+                    .copied()
+                    .unwrap_or(0);
+                writeln!(
+                    f,
+                    "| {:.2} | {} | {:.2} | {} | {} | {} |",
+                    hr_value, shape_label,
+                    s.client_interval_median_ms,
+                    headroom_fires,
+                    s.mode_switch_count,
+                    s.pixelperfect_count,
+                )?;
+            }
+            writeln!(f)?;
+            writeln!(f, "_Verdict rule: pick the lowest threshold whose latency stays acceptable across all 3 shaping points._")?;
+            writeln!(f)?;
+        }
+    }
+
     Ok(())
 }
 
@@ -461,5 +534,48 @@ mod tests {
         assert!(text.contains("## 12. Loss axis"), "section 12 header");
         assert!(text.contains("| 10.0 |"), "bias row formatted");
         assert!(text.contains("| 5 |"), "loss row formatted");
+    }
+
+    #[test]
+    fn write_emits_sections_13_and_14_when_sweep_labels_present() {
+        use std::collections::BTreeMap;
+        let cli = crate::cli::Cli {
+            output: "/tmp/dummy.md".into(),
+            scene_duration: std::time::Duration::from_secs(1),
+            scenes: vec!["dummy".into()],
+            gpu_name: "test".into(),
+            reuse_criterion_json: "/tmp/dummy.json".into(),
+            bandwidth_matrix: false,
+            bias_sweep: false,
+            loss_axis: false,
+            shaping_matrix: false,
+            headroom_sweep: false,
+        };
+        let mut state = ReportState::new(&cli);
+        // Shaping matrix scene.
+        let mut shape_summary = SceneSummary::default();
+        shape_summary.sweep_axis_label = Some("shape_10mbps_dsl".into());
+        shape_summary.h264_dwell_us = 3_000_000;
+        shape_summary.tile_dwell_us = 7_000_000;
+        shape_summary.mode_switch_count = 5;
+        shape_summary.pixelperfect_count = 100;
+        state.scenes.insert("10mbps_dsl/text".into(), shape_summary);
+        // Headroom sweep scene.
+        let mut hr_summary = SceneSummary::default();
+        hr_summary.sweep_axis_label = Some("headroom_0.50/1mbps".into());
+        hr_summary.mode_switch_count = 8;
+        hr_summary.pixelperfect_count = 50;
+        let mut counts = BTreeMap::new();
+        counts.insert("headroom_guard".into(), 3);
+        hr_summary.mode_decision_counts = counts;
+        state.scenes.insert("headroom_0.50/1mbps".into(), hr_summary);
+
+        let mut buf = Vec::new();
+        write(&mut buf, &state, None).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("## 13. Shaping matrix"), "section 13 header");
+        assert!(text.contains("## 14. Headroom sweep"), "section 14 header");
+        assert!(text.contains("`10mbps_dsl/text`"), "shape row");
+        assert!(text.contains("| 0.50 |"), "headroom row threshold");
     }
 }

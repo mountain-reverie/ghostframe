@@ -44,6 +44,17 @@ pub struct Cli {
     /// single scene + bandwidth point. Emits Table 12.
     #[arg(long, default_value_t = false)]
     pub loss_axis: bool,
+
+    /// M3.7b Tier 2: run all scenes across the 4-point shaping matrix
+    /// (tc-driven realistic cwnd). Replaces --bandwidth-matrix for
+    /// realistic-cwnd analyses. Emits Table 13.
+    #[arg(long, default_value_t = false)]
+    pub shaping_matrix: bool,
+
+    /// M3.7b Tier 2: sweep HEADROOM_MIN_BYTES_PER_US across 4 values
+    /// × 3 shaping points. Emits Table 14.
+    #[arg(long, default_value_t = false)]
+    pub headroom_sweep: bool,
 }
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
