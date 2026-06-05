@@ -143,10 +143,10 @@ mod cost_tests;
 ///
 /// Hysteresis: when previous state is `H264`, the medium-frequency band
 /// (5-15 Hz) holds the tile in `H264 { frames_in_h264: n+1 }` rather than
-/// dropping to BC1 (Rule 4). Outside the medium-frequency band the rules
-/// apply normally — a tile that drops to low-freq (< 5 Hz) is re-classified
-/// fresh per Rules 6-8. (Per-tile hysteresis differs from the frame-mode
-/// hysteresis in `Classifier::decide_frame_mode`.)
+/// dropping to the Cdf53 fallback (Rule 4). Outside the medium-frequency band
+/// the rules apply normally — a tile that drops to low-freq (< 5 Hz) is
+/// re-classified fresh per Rules 6-8. (Per-tile hysteresis differs from the
+/// frame-mode hysteresis in `Classifier::decide_frame_mode`.)
 ///
 /// **Palette-id placeholder convention.** When this function returns
 /// `CodecState::PalRle { palette_id: 0 }`, the `0` is a feasibility
@@ -181,18 +181,21 @@ pub fn classify_tile(metrics: &TileMetrics, prev: &CodecState) -> CodecState {
         };
     }
 
-    // Rule 3: high freq AND low magnitude ⇒ PalRle if few colors known, else BC1
+    // Rule 3: high freq AND low magnitude ⇒ PalRle if few colors known, else Cdf53
     if freq > 15.0 && mag <= 0.3 {
         if uc_known && metrics.unique_colors <= 16 {
             return CodecState::PalRle { palette_id: 0 };
         }
-        return CodecState::Bc1;
+        return CodecState::Cdf53 {
+            passes_sent: 0,
+            max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
+        };
     }
 
     // Rule 4: medium freq AND currently H264 ⇒ stay H264 (per-tile hysteresis).
     // Rule 5 (medium freq AND not H264) prefers a lossless codec when color
     // info is known (mirrors Rule 3's structure for high-freq + low-mag),
-    // and falls back to Bc1 only when color info is unavailable.
+    // and falls back to Cdf53 refinement otherwise.
     if (5.0..=15.0).contains(&freq) {
         if let CodecState::H264 { frames_in_h264 } = prev {
             return CodecState::H264 {
@@ -205,7 +208,10 @@ pub fn classify_tile(metrics: &TileMetrics, prev: &CodecState) -> CodecState {
         if uc_known && metrics.unique_colors <= 16 {
             return CodecState::PalRle { palette_id: 0 };
         }
-        return CodecState::Bc1; // Rule 5 fallback
+        return CodecState::Cdf53 {
+            passes_sent: 0,
+            max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
+        }; // Rule 5 fallback
     }
 
     // Rule 6: single color ⇒ Solid

@@ -1,18 +1,16 @@
 //! Pure escalation-candidate detector for M3.3c idle-tile refinement.
 //!
 //! Identifies tiles that should escalate to CDF 5/3 refinement: tile is
-//! idle (idle_frames > 30), currently displayed via a *lossy* snapshot
-//! (codec_state ∈ {H264, Bc1}), and hasn't already been escalated this
-//! generation. Returns up to `k_max` tile-idx values in row-major order.
-//! No I/O, no GPU — unit-testable in isolation.
+//! idle (idle_frames > 30), currently displayed via a full-frame H264
+//! snapshot, and hasn't already been escalated this generation. Returns
+//! up to `k_max` tile-idx values in row-major order. No I/O, no GPU —
+//! unit-testable in isolation.
 //!
-//! **L1 prune (M3.5b, per docs/specs/m3-codec-bench-results.md §8):**
-//! `PalRle` and `Solid` were removed from the source-codec set. Those
-//! states are emitted only when the classifier's feasibility predicate
-//! holds (≤16 colors / single-color tile), in which case the rendered
-//! canvas already shows byte-exact content. Escalating them ran the
-//! CDF53 forward transform + scheduler queueing for zero perceptual
-//! gain — quantified at ~720 KB/s in the M3.5b mode_switch scene.
+//! **Source-codec set:** `{H264}` only. Earlier prunes:
+//! - M3.5b: removed `PalRle` and `Solid` (lossless within feasibility).
+//! - BC1 removal: removed `Bc1` (variant deleted; Rule 3/5 fallback
+//!   now produces `Cdf53` directly, which is in refinement and so
+//!   already excluded).
 
 use crate::tile::{CodecState, MetricsTracker, TileMetrics};
 
@@ -45,13 +43,11 @@ fn is_eligible(m: &TileMetrics) -> bool {
     if m.already_escalated_this_gen {
         return false;
     }
-    // L1 set post-M3.5b prune: only states that leave a lossy snapshot
-    // on the client canvas. PalRle (with feasible ≤16-color palette) and
-    // Solid (single-color) are already byte-exact — no refinement needed.
-    matches!(
-        m.codec_state,
-        CodecState::H264 { .. } | CodecState::Bc1,
-    )
+    // Post-BC1-removal: only full-frame H264 snapshots leave a lossy
+    // canvas that needs idle-escalation to Cdf53 refinement. PalRle and
+    // Solid are lossless within feasibility (pruned in M3.5b); Bc1
+    // is gone.
+    matches!(m.codec_state, CodecState::H264 { .. })
 }
 
 #[cfg(test)]
@@ -145,22 +141,16 @@ mod tests {
         assert_eq!(v, vec![0, 1, 2, 3, 4]);
     }
 
-    /// Post-M3.5b-prune source-codec set: H264 + Bc1 (Bc1 removal pending).
+    /// Post-BC1-removal source-codec set: H264 only. Cdf53 is excluded
+    /// because it's already in refinement; PalRle and Solid are already
+    /// lossless within feasibility (pruned in M3.5b).
     #[test]
-    fn both_remaining_lossy_sources_eligible() {
+    fn only_h264_is_eligible() {
         let mut t = make_tracker(2, 2);
-        let states = [
-            CodecState::H264 { frames_in_h264: 1 },
-            CodecState::Bc1,
-        ];
-        for (i, s) in states.iter().enumerate() {
-            let x = (i % 2) as u32;
-            let y = (i / 2) as u32;
-            let m = t.get_mut(x, y);
-            m.idle_frames = 100;
-            m.codec_state = *s;
-        }
+        let m = t.get_mut(0, 0);
+        m.idle_frames = 100;
+        m.codec_state = CodecState::H264 { frames_in_h264: 1 };
         let v = detect_escalation_candidates(&t, 100);
-        assert_eq!(v.len(), 2);
+        assert_eq!(v, vec![0]);
     }
 }

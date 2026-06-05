@@ -42,15 +42,29 @@ fn high_freq_low_magnitude_few_colors_picks_palrle() {
 }
 
 #[test]
-fn high_freq_low_magnitude_many_colors_picks_bc1() {
+fn high_freq_low_magnitude_many_colors_picks_cdf53() {
+    // Post-BC1-removal: Rule 3's high-color branch falls back to Cdf53
+    // refinement rather than the old Bc1-as-Raw wire emission.
     let m = metrics(60.0, 0.05, 0, 200);
-    assert_eq!(classify_tile(&m, &CodecState::Skip), CodecState::Bc1);
+    assert_eq!(
+        classify_tile(&m, &CodecState::Skip),
+        CodecState::Cdf53 {
+            passes_sent: 0,
+            max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
+        },
+    );
 }
 
 #[test]
-fn high_freq_low_magnitude_sentinel_unique_colors_picks_bc1() {
+fn high_freq_low_magnitude_sentinel_unique_colors_picks_cdf53() {
     let m = metrics(60.0, 0.05, 0, super::super::UNIQUE_COLORS_UNKNOWN);
-    assert_eq!(classify_tile(&m, &CodecState::Skip), CodecState::Bc1);
+    assert_eq!(
+        classify_tile(&m, &CodecState::Skip),
+        CodecState::Cdf53 {
+            passes_sent: 0,
+            max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
+        },
+    );
 }
 
 #[test]
@@ -61,9 +75,15 @@ fn medium_freq_holds_h264_via_hysteresis() {
 }
 
 #[test]
-fn medium_freq_no_prior_h264_picks_bc1() {
+fn medium_freq_no_prior_h264_picks_cdf53() {
     let m = metrics(8.0, 0.05, 0, super::super::UNIQUE_COLORS_UNKNOWN);
-    assert_eq!(classify_tile(&m, &CodecState::Skip), CodecState::Bc1);
+    assert_eq!(
+        classify_tile(&m, &CodecState::Skip),
+        CodecState::Cdf53 {
+            passes_sent: 0,
+            max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
+        },
+    );
 }
 
 #[test]
@@ -103,16 +123,28 @@ fn magnitude_at_threshold_routes_to_rule_3_not_rule_2() {
 #[test]
 fn freq_at_15_lands_in_rule_4_range() {
     // Rules 2/3 use freq > 15.0 (strict); Rule 4 uses 5.0..=15.0 (inclusive).
-    // freq = 15.0 must hit Rule 4 (BC1 with no prev H264), not Rules 2/3.
+    // freq = 15.0 must hit Rule 4 (Cdf53 fallback with no prev H264), not Rules 2/3.
     let m = metrics(15.0, 0.5, 0, super::super::UNIQUE_COLORS_UNKNOWN);
-    assert_eq!(classify_tile(&m, &CodecState::Skip), CodecState::Bc1);
+    assert_eq!(
+        classify_tile(&m, &CodecState::Skip),
+        CodecState::Cdf53 {
+            passes_sent: 0,
+            max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
+        },
+    );
 }
 
 #[test]
 fn freq_at_5_lands_in_rule_4_range() {
     // Lower bound of Rule 4 is inclusive — freq = 5.0 must hit Rule 4.
     let m = metrics(5.0, 0.05, 0, super::super::UNIQUE_COLORS_UNKNOWN);
-    assert_eq!(classify_tile(&m, &CodecState::Skip), CodecState::Bc1);
+    assert_eq!(
+        classify_tile(&m, &CodecState::Skip),
+        CodecState::Cdf53 {
+            passes_sent: 0,
+            max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
+        },
+    );
 }
 
 #[test]
@@ -171,35 +203,60 @@ fn cdf53_fallback_uses_cdf53_pass_count() {
 }
 
 #[test]
-fn medium_freq_with_single_color_prefers_solid_over_bc1() {
+fn medium_freq_with_single_color_prefers_solid_over_fallback() {
     // Rule 5 modification: medium freq + uc_known + 1 unique color ⇒ Solid,
-    // not Bc1. Mirrors Rule 3's structure for high-freq + low-mag.
+    // not the Cdf53 fallback. Mirrors Rule 3's structure for high-freq + low-mag.
     let m = metrics(6.0, 0.05, 0, 1);
-    assert_eq!(classify_tile(&m, &CodecState::Bc1), CodecState::Solid);
+    let prev = CodecState::Cdf53 {
+        passes_sent: 0,
+        max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
+    };
+    assert_eq!(classify_tile(&m, &prev), CodecState::Solid);
 }
 
 #[test]
-fn medium_freq_with_few_colors_prefers_palrle_over_bc1() {
+fn medium_freq_with_few_colors_prefers_palrle_over_fallback() {
     // Rule 5 modification: medium freq + uc_known + 2..16 unique colors ⇒ PalRle.
     let m = metrics(8.0, 0.10, 0, 8);
+    let prev = CodecState::Cdf53 {
+        passes_sent: 0,
+        max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
+    };
+    assert_eq!(classify_tile(&m, &prev), CodecState::PalRle { palette_id: 0 });
+}
+
+#[test]
+fn medium_freq_with_many_colors_falls_back_to_cdf53() {
+    // Rule 5 fallback: medium freq + uc_known + > 16 colors ⇒ Cdf53.
+    let m = metrics(6.0, 0.05, 0, 100);
+    let prev = CodecState::Cdf53 {
+        passes_sent: 0,
+        max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
+    };
     assert_eq!(
-        classify_tile(&m, &CodecState::Bc1),
-        CodecState::PalRle { palette_id: 0 }
+        classify_tile(&m, &prev),
+        CodecState::Cdf53 {
+            passes_sent: 0,
+            max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
+        },
     );
 }
 
 #[test]
-fn medium_freq_with_many_colors_still_falls_back_to_bc1() {
-    // Rule 5 fallback: medium freq + uc_known + > 16 colors ⇒ Bc1.
-    let m = metrics(6.0, 0.05, 0, 100);
-    assert_eq!(classify_tile(&m, &CodecState::Bc1), CodecState::Bc1);
-}
-
-#[test]
-fn medium_freq_unknown_colors_falls_back_to_bc1() {
-    // Rule 5 fallback: medium freq + unknown colors ⇒ Bc1.
+fn medium_freq_unknown_colors_falls_back_to_cdf53() {
+    // Rule 5 fallback: medium freq + unknown colors ⇒ Cdf53.
     let m = metrics(6.0, 0.05, 0, super::super::UNIQUE_COLORS_UNKNOWN);
-    assert_eq!(classify_tile(&m, &CodecState::Bc1), CodecState::Bc1);
+    let prev = CodecState::Cdf53 {
+        passes_sent: 0,
+        max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
+    };
+    assert_eq!(
+        classify_tile(&m, &prev),
+        CodecState::Cdf53 {
+            passes_sent: 0,
+            max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
+        },
+    );
 }
 
 #[test]
