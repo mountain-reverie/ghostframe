@@ -8,7 +8,7 @@
 use std::collections::VecDeque;
 
 /// Maximum colors in a PalRLE palette. Tiles with more unique colors fall
-/// through the classifier to BC1/Cdf53.
+/// through the classifier to Cdf53.
 pub const MAX_PALETTE_COUNT: usize = 16;
 
 /// Persistent palette table capacity.

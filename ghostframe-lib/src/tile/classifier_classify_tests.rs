@@ -116,7 +116,7 @@ fn magnitude_at_threshold_routes_to_rule_3_not_rule_2() {
     let next = classify_tile(&m, &CodecState::Skip);
     assert!(
         !matches!(next, CodecState::H264 { .. }),
-        "mag = 0.3 must fall through to Rule 3 (BC1/PalRle), got {next:?}"
+        "mag = 0.3 must fall through to Rule 3 (Cdf53/PalRle), got {next:?}"
     );
 }
 

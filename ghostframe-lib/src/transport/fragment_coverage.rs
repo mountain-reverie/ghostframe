@@ -113,7 +113,7 @@ impl FragmentCoverageMap {
     /// in-flight Cdf53 work for a generation that no longer exists,
     /// breaking the M3.3d refinement-cancel invariant.
     ///
-    /// Non-Cdf53 coverage (Solid, PalRle, Bc1, Raw) is left in place:
+    /// Non-Cdf53 coverage (Solid, PalRle, Raw) is left in place:
     /// the snapshot filters by `codec == Cdf53` so non-Cdf53 entries
     /// cannot pollute it, and dropping them would break ACK-driven
     /// side effects (PalRle `delivered`/`in_flight_carrying` bookkeeping,
@@ -262,7 +262,7 @@ mod tests {
 
     #[test]
     fn drop_cdf53_for_tile_leaves_non_cdf53_coverage_alone() {
-        // Non-Cdf53 entries (Solid, PalRle, Bc1, Raw) for the same tile must
+        // Non-Cdf53 entries (Solid, PalRle, Raw) for the same tile must
         // survive: their ACK paths drive palette delivery, ack_miss telemetry
         // and other bookkeeping that the snapshot fix has no business
         // touching. Snapshot only filters by `codec == Cdf53` so leaving them
@@ -276,17 +276,15 @@ mod tests {
         };
         m.record((10, 4, 4, 0), one(Codec::Solid, None));
         m.record((11, 4, 4, 0), one(Codec::PalRle, Some(7)));
-        m.record((12, 4, 4, 0), one(Codec::Bc1, None));
         m.record((13, 4, 4, 0), one(Codec::Raw, None));
         m.record((14, 4, 4, 0), one(Codec::Cdf53, None));
-        assert_eq!(m.len(), 5);
+        assert_eq!(m.len(), 4);
 
         m.drop_cdf53_for_tile(4, 4);
 
-        assert_eq!(m.len(), 4, "only the Cdf53 entry should be removed");
+        assert_eq!(m.len(), 3, "only the Cdf53 entry should be removed");
         assert!(m.take((10, 4, 4, 0)).is_some(), "Solid survives");
         assert!(m.take((11, 4, 4, 0)).is_some(), "PalRle survives");
-        assert!(m.take((12, 4, 4, 0)).is_some(), "Bc1 survives");
         assert!(m.take((13, 4, 4, 0)).is_some(), "Raw survives");
         assert!(m.take((14, 4, 4, 0)).is_none(), "Cdf53 dropped");
     }

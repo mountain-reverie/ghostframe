@@ -83,7 +83,6 @@ impl Default for TileMetrics {
 pub enum CodecState {
     Skip,
     H264 { frames_in_h264: u32 },
-    Bc1,
     /// PalRLE-classified tile.
     ///
     /// `palette_id` semantics depend on lifecycle position (design D8):

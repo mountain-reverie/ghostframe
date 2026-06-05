@@ -1,7 +1,7 @@
 use super::{BPP, TILE_BYTES, TILE_SIZE};
 
 /// 32×32 tile carrying a smooth diagonal gradient — the canonical input
-/// for BC1 / CDF 5/3 wavelet.
+/// for the CDF 5/3 wavelet codec.
 pub fn tile() -> Vec<u8> {
     let mut buf = vec![0u8; TILE_BYTES];
     for y in 0..TILE_SIZE {

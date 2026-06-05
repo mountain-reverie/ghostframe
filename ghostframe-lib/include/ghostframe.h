@@ -35,7 +35,7 @@
 
 /**
  * Maximum colors in a PalRLE palette. Tiles with more unique colors fall
- * through the classifier to BC1/Cdf53.
+ * through the classifier to Cdf53.
  */
 #define MAX_PALETTE_COUNT 16
 

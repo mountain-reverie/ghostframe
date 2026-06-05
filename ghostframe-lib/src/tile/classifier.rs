@@ -12,7 +12,6 @@ use super::{CodecState, FrameMode, TileMetrics, TILE_BYTES};
 pub struct CostModel {
     pub solid_us: f32,      // ~0.5  µs (4-byte memcpy)
     pub palrle_us: f32,     // ~5    µs (nibble-pack 1024 px)
-    pub bc1_us: f32,        // ~50   µs (Vulkan compute, dispatched)
     pub cdf53_us: f32,      // ~50   µs (Vulkan compute, dispatched)
     pub h264_frame_us: f32, // ~3000 µs (VA-API full-frame encode @ 1080p)
     /// Estimated bytes for a full-frame H.264 emission. Conservative default
@@ -44,10 +43,6 @@ impl Default for CostModel {
         //   cdf53_us:    measured 52-149 µs; use 90.0 as a robust median
         //                (motion = 79, text = 73, flat_ui = 96, photo =
         //                149)
-        //   bc1_us:      no measured data (BC1 isn't implemented; per
-        //                the M3.5b BC1-fate verdict the variant is being
-        //                removed). Kept here only until the Codec::Bc1
-        //                removal commit follows.
         //   h264_frame_us: per-tile-H264 bench (~750 µs) measures the
         //                dead-code path; the classifier's actual cost is
         //                full-frame H264, not benched here, so the
@@ -58,7 +53,6 @@ impl Default for CostModel {
         Self {
             solid_us: 0.05,
             palrle_us: 8.0,
-            bc1_us: 50.0,
             cdf53_us: 90.0,
             h264_frame_us: 3000.0,
             h264_frame_bytes: 12_000,
@@ -86,7 +80,6 @@ impl CostModel {
             CodecState::Skip => 0,
             CodecState::Solid => 4,
             CodecState::PalRle { .. } => 200, // §5.3: typical text 100–200 B; upper bound
-            CodecState::Bc1 => 512,
             CodecState::Cdf53 { .. } => 1300, // §4.4: 1.0–1.3 KB to lossless; upper bound
             CodecState::PixelPerfect => 0,
             CodecState::H264 { .. } => TILE_BYTES as u32, // upper bound; classified-as-H264 tile
@@ -99,7 +92,6 @@ impl CostModel {
             CodecState::Skip | CodecState::PixelPerfect => 0.0,
             CodecState::Solid => self.solid_us,
             CodecState::PalRle { .. } => self.palrle_us,
-            CodecState::Bc1 => self.bc1_us,
             CodecState::Cdf53 { .. } => self.cdf53_us,
             CodecState::H264 { .. } => self.h264_frame_us,
         }
@@ -230,7 +222,6 @@ pub fn classify_tile(metrics: &TileMetrics, prev: &CodecState) -> CodecState {
         max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
     }
 }
-
 
 #[cfg(test)]
 #[path = "classifier_classify_tests.rs"]

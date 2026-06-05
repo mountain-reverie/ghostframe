@@ -705,7 +705,7 @@ mod tests {
     #[test]
     fn mark_acked_stops_retry_for_non_cdf53_tile() {
         // Regression for the M3.3d on_ack deletion: without a queue-state
-        // flip on ACK, Solid/Raw/Bc1/PalRle items in priority_queue stay
+        // flip on ACK, Solid/Raw/PalRle items in priority_queue stay
         // InFlight and retry every 2×RTT forever.
         let mut s = Scheduler::new(4, 4);
         s.set_rtt(Duration::from_millis(5));

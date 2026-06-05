@@ -1,6 +1,6 @@
 //! Encode latency per codec × content class.
 //!
-//! Pre-M3, only H.264 is real. Future codecs (PalRle, BC1, CDF53, Solid)
+//! Pre-M3, only H.264 is real. Future codecs (PalRle, CDF53, Solid)
 //! plug in by adding a new `BenchEncoder` impl below.
 
 use criterion::{criterion_group, criterion_main, Criterion};

@@ -910,7 +910,7 @@ impl IoBridge {
                         // `drain_priority_queue` stops retrying it every
                         // 2×RTT. The M3.3d `Scheduler::on_ack` deletion
                         // (commit de37a83) dropped this transition; without
-                        // it Solid/Raw/Bc1/PalRle work stays InFlight
+                        // it Solid/Raw/PalRle work stays InFlight
                         // forever and the entire grid re-emits every frame.
                         self.scheduler.mark_acked(
                             entry.tile_x,
@@ -959,7 +959,7 @@ impl IoBridge {
                                     }
                                 }
                             }
-                            // Solid, Raw, H264, Bc1, Skip: mark_acked above
+                            // Solid, Raw, H264, Skip: mark_acked above
                             // is the only scheduler-state update needed.
                             _ => {}
                         }
@@ -2009,10 +2009,8 @@ impl IoBridge {
                             // correctly identify this tile as Cdf53 and skip the
                             // priority-queue enqueue (which would otherwise supersede
                             // the refinement passes just enqueued above).
-                            // The CPU may have classified this tile as Bc1 (e.g. on the
-                            // first frame when freq is medium and Rule 5 fires), but
-                            // the GPU compact list and coefficient buffer are authoritative
-                            // for Cdf53 emission.
+                            // The CPU classifier produces Cdf53 via Rule 5; the GPU compact
+                            // list and coefficient buffer are authoritative for Cdf53 emission.
                             self.metrics_tracker
                                 .get_mut(tile_x as u32, tile_y as u32)
                                 .codec_state = crate::tile::CodecState::Cdf53 {
