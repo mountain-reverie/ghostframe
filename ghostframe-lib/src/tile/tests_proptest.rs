@@ -368,7 +368,7 @@ proptest! {
     }
 
     /// C5 — high-frequency low-magnitude (cursor blink) never enters H.264.
-    /// Rule 3 routes these to PalRle or BC1 unconditionally.
+    /// Rule 3 routes these to PalRle or Cdf53 unconditionally.
     /// Varies freq across `(15.0, 120.0]` and mag across `[0.0, 0.3]` so the
     /// entire low-magnitude sub-band of Rule 3 is swept.
     #[test]
@@ -393,7 +393,7 @@ proptest! {
     }
 
     /// C5b — same invariant as C5 but with concrete unique_colors so the
-    /// PalRle branch of Rule 3 participates alongside the BC1 fallback.
+    /// PalRle branch of Rule 3 participates alongside the Cdf53 fallback.
     #[test]
     fn c5_cursor_blink_pattern_never_h264_concrete_colors(
         freq in 15.001f32..=120.0,

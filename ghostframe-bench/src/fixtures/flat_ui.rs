@@ -2,7 +2,7 @@ use super::{BPP, TILE_BYTES, TILE_SIZE};
 
 /// 32×32 tile drawn with 16 fixed BGRA palette entries — representative of
 /// flat UI elements (toolbars, list rows). Uses a low-entropy block layout
-/// so palettised RLE both has something realistic to compress.
+/// so palettised RLE has something realistic to compress.
 pub fn tile() -> Vec<u8> {
     let palette: [[u8; 4]; 16] = [
         [0x1E, 0x1E, 0x1E, 0xFF],

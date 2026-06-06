@@ -2009,7 +2009,7 @@ impl IoBridge {
                             // correctly identify this tile as Cdf53 and skip the
                             // priority-queue enqueue (which would otherwise supersede
                             // the refinement passes just enqueued above).
-                            // The CPU classifier produces Cdf53 via Rule 5; the GPU compact
+                            // The CPU classifier produces Cdf53 (via Rules 3/5/8); the GPU compact
                             // list and coefficient buffer are authoritative for Cdf53 emission.
                             self.metrics_tracker
                                 .get_mut(tile_x as u32, tile_y as u32)

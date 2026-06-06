@@ -158,10 +158,10 @@ pub fn write(
     }
     writeln!(f)?;
 
-    // ---- Section 7: BC1 gap matrix ----
-    writeln!(f, "## 7. BC1 gap matrix")?;
+    // ---- Section 7: BC1 removed ----
+    writeln!(f, "## 7. BC1 (removed)")?;
     writeln!(f)?;
-    writeln!(f, "_TODO(M3.5b) — auto-computed from Section 6's Cdf53 curve vs BC1's published cost band. See spec §M3.5b Step 2._")?;
+    writeln!(f, "_BC1 was dropped after M3.5b's gap analysis showed CDF53 dominating across all measured cells. See `docs/specs/m3-codec-bench-results.md` §7 for the historical analysis; this section is retained only so report numbering stays stable._")?;
     writeln!(f)?;
 
     // ---- Section 8: Lossless-strategy recommendation ----

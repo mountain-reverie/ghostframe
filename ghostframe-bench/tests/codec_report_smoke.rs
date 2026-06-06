@@ -29,7 +29,7 @@ fn codec_report_smoke() {
     assert!(text.contains("## 4. Per-codec micro-bench"), "section 4 header missing");
     assert!(text.contains("## 5. Per-codec compressed size"), "section 5 header missing");
     assert!(text.contains("## 6. Cdf53 SSIM vs passes"), "section 6 header missing");
-    assert!(text.contains("## 7. BC1 gap matrix"), "section 7 header missing");
+    assert!(text.contains("## 7. BC1 (removed)"), "section 7 header missing");
     assert!(text.contains("## 8. Lossless-strategy recommendation"), "section 8 header missing");
     assert!(text.contains("## 9. Mode dwell × bandwidth × scene"), "section 9 header missing");
     assert!(text.contains("## 10. Override-trigger frequency"), "section 10 header missing");

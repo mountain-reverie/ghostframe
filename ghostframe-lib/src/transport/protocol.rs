@@ -47,7 +47,7 @@ pub enum Codec {
     Skip = 0,
     H264 = 1,
     PalRle = 2,
-    Bc1 = 3,
+    // 3 reserved (formerly Bc1; removed after M3.5b bench DROP verdict).
     Solid = 4,
     Raw = 5,
     Cdf53 = 6,
@@ -59,7 +59,7 @@ impl Codec {
             0 => Ok(Codec::Skip),
             1 => Ok(Codec::H264),
             2 => Ok(Codec::PalRle),
-            3 => Ok(Codec::Bc1),
+            // 3 reserved (formerly Bc1); falls to UnknownCodec.
             4 => Ok(Codec::Solid),
             5 => Ok(Codec::Raw),
             6 => Ok(Codec::Cdf53),
