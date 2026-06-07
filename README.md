@@ -163,7 +163,7 @@ issue first.
 
 Every PR is expected to:
 
-- pass `just lint` and `just fmt-check`,
+- pass `just lint`, `just fmt-check`, and the checks described in [docs/ci.md](docs/ci.md),
 - pass `just test-unit`, and
 - pass `just test-e2e` if it touches anything that the e2e harness covers
   (capture, encoders, protocol, web client).

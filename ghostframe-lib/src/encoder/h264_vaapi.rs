@@ -77,8 +77,7 @@ unsafe fn mmap_bgra_frame(
         let plane = bgra_frame.data_mut(0);
         let src_bytes = std::slice::from_raw_parts(ptr as *const u8, buf_size);
         for y in 0..height as usize {
-            let src_row =
-                &src_bytes[y * stride as usize..y * stride as usize + width as usize * 4];
+            let src_row = &src_bytes[y * stride as usize..y * stride as usize + width as usize * 4];
             let dst_off = y * frame_stride;
             plane[dst_off..dst_off + width as usize * 4].copy_from_slice(src_row);
         }
@@ -176,13 +175,14 @@ impl H264VaapiEncoder {
             let hw_device_ctx = vaapi_device::create_hw_device_ctx(VAAPI_DEVICE)?;
 
             // 2. Create HW frames context at the requested resolution.
-            let hw_frames_ctx = match vaapi_device::create_hw_frames_ctx(hw_device_ctx, enc_w, enc_h, 10) {
-                Ok(ctx) => ctx,
-                Err(e) => {
-                    ffi::av_buffer_unref(&mut { hw_device_ctx });
-                    return Err(e);
-                }
-            };
+            let hw_frames_ctx =
+                match vaapi_device::create_hw_frames_ctx(hw_device_ctx, enc_w, enc_h, 10) {
+                    Ok(ctx) => ctx,
+                    Err(e) => {
+                        ffi::av_buffer_unref(&mut { hw_device_ctx });
+                        return Err(e);
+                    }
+                };
 
             // 3. Set up the encoder context.
             let mut ctx = codec::context::Context::new_with_codec(enc_codec)
@@ -362,7 +362,8 @@ impl H264VaapiEncoder {
                 .hw_frames_ctx
                 .as_ref()
                 .expect("use_vaapi but no hw_frames_ctx");
-            let mut hw_frame = unsafe { vaapi_device::upload_to_hw_surface(hw_frames_ref.0, &nv12_frame)? };
+            let mut hw_frame =
+                unsafe { vaapi_device::upload_to_hw_surface(hw_frames_ref.0, &nv12_frame)? };
             hw_frame.set_pts(nv12_frame.pts());
             self.encoder.send_frame(&hw_frame)?;
         } else {
@@ -729,8 +730,7 @@ impl FullFrameEncoder {
                     .as_ref()
                     .expect("use_vaapi but no hw_frames_ctx");
 
-                let mut hw_frame =
-                    vaapi_device::upload_to_hw_surface(hw_frames_ref.0, &sw_frame)?;
+                let mut hw_frame = vaapi_device::upload_to_hw_surface(hw_frames_ref.0, &sw_frame)?;
                 hw_frame.set_pts(Some(pts));
 
                 if force_idr {
@@ -818,7 +818,14 @@ impl FullFrameEncoder {
         const DRM_FORMAT_XRGB8888: u32 = 0x34325258;
         const DRM_FORMAT_MOD_INVALID: u64 = 0x00ffffffffffffff;
 
-        let &DmabufFrameInputs { fd, width, height, stride, pts, force_idr } = input;
+        let &DmabufFrameInputs {
+            fd,
+            width,
+            height,
+            stride,
+            pts,
+            force_idr,
+        } = input;
         let buf_size = (height as usize) * (stride as usize);
 
         // Build the DRM frame descriptor. Box keeps it stable in memory.
@@ -884,7 +891,14 @@ impl FullFrameEncoder {
         enc_w: u32,
         enc_h: u32,
     ) -> Result<frame::Video, ffmpeg::Error> {
-        let &DmabufFrameInputs { fd, width, height, stride, pts, force_idr } = input;
+        let &DmabufFrameInputs {
+            fd,
+            width,
+            height,
+            stride,
+            pts,
+            force_idr,
+        } = input;
 
         let bgra_frame = mmap_bgra_frame(fd, width, height, stride)?;
 
@@ -919,7 +933,14 @@ impl FullFrameEncoder {
         &mut self,
         input: &DmabufFrameInputs,
     ) -> Result<Option<FullFrameEncoded>, ffmpeg::Error> {
-        let &DmabufFrameInputs { fd, width, height, stride, pts, force_idr } = input;
+        let &DmabufFrameInputs {
+            fd,
+            width,
+            height,
+            stride,
+            pts,
+            force_idr,
+        } = input;
 
         unsafe {
             let bgra_frame = mmap_bgra_frame(fd, width, height, stride)?;

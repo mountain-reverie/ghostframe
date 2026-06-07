@@ -40,9 +40,8 @@ impl BandwidthCap {
         let now = Instant::now();
         let elapsed_s = now.duration_since(self.last_refill).as_secs_f64();
         self.last_refill = now;
-        self.tokens_bytes =
-            (self.tokens_bytes + elapsed_s * self.bytes_per_sec as f64)
-                .min(self.bytes_per_sec as f64);
+        self.tokens_bytes = (self.tokens_bytes + elapsed_s * self.bytes_per_sec as f64)
+            .min(self.bytes_per_sec as f64);
         if self.tokens_bytes >= bytes as f64 {
             self.tokens_bytes -= bytes as f64;
             true

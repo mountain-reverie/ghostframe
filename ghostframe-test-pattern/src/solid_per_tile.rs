@@ -154,24 +154,54 @@ pub fn run(card_path: &str) -> Result<(), Box<dyn std::error::Error>> {
         let br_x = width.saturating_sub(corner);
         let br_y = height.saturating_sub(corner);
 
-        fill_rect(bytes, pitch, width, height, tl_x, tl_y, corner, corner, RED_PIXEL);
-        fill_rect(
-            bytes, pitch, width, height, tr_x, tr_y, corner, corner, GREEN_PIXEL,
-        );
-        fill_rect(bytes, pitch, width, height, bl_x, bl_y, corner, corner, BLUE_PIXEL);
-        fill_rect(
+        let mut fb = Framebuffer {
             bytes,
             pitch,
             width,
             height,
-            br_x,
-            br_y,
-            corner,
-            corner,
+        };
+        fill_rect(
+            &mut fb,
+            Rect {
+                x: tl_x,
+                y: tl_y,
+                w: corner,
+                h: corner,
+            },
+            RED_PIXEL,
+        );
+        fill_rect(
+            &mut fb,
+            Rect {
+                x: tr_x,
+                y: tr_y,
+                w: corner,
+                h: corner,
+            },
+            GREEN_PIXEL,
+        );
+        fill_rect(
+            &mut fb,
+            Rect {
+                x: bl_x,
+                y: bl_y,
+                w: corner,
+                h: corner,
+            },
+            BLUE_PIXEL,
+        );
+        fill_rect(
+            &mut fb,
+            Rect {
+                x: br_x,
+                y: br_y,
+                w: corner,
+                h: corner,
+            },
             YELLOW_PIXEL,
         );
 
-        msync_buffer(bytes);
+        msync_buffer(fb.bytes);
         // `map` drops here.
     }
 
@@ -199,56 +229,67 @@ pub fn run(card_path: &str) -> Result<(), Box<dyn std::error::Error>> {
             // docs/superpowers/specs/2026-05-17-decode-error-thin-uncached-design.md.
             const FLIP_RED: u32 = 0x00FF_0000;
             const FLIP_BLUE: u32 = 0x0000_00FF;
-            let pixel = if (start.elapsed().as_millis() / 33) % 2 == 0 {
+            let pixel = if (start.elapsed().as_millis() / 33).is_multiple_of(2) {
                 FLIP_RED
             } else {
                 FLIP_BLUE
             };
 
-            fill_rect(
+            let mut fb = Framebuffer {
                 bytes,
                 pitch,
                 width,
                 height,
-                motion_x,
-                motion_y,
-                motion_size,
-                motion_size,
+            };
+            fill_rect(
+                &mut fb,
+                Rect {
+                    x: motion_x,
+                    y: motion_y,
+                    w: motion_size,
+                    h: motion_size,
+                },
                 pixel,
             );
 
-            msync_buffer(bytes);
+            msync_buffer(fb.bytes);
         }
         thread::sleep(MOTION_TICK);
     }
 }
 
-/// Fill a rectangle inside `bytes` with the packed-XRGB pixel value `pixel`.
-/// Clips the rectangle to the scanout dimensions; no-op if it lies entirely
-/// outside.
-fn fill_rect(
-    bytes: &mut [u8],
+/// Framebuffer descriptor passed to [`fill_rect`].
+struct Framebuffer<'a> {
+    bytes: &'a mut [u8],
     pitch: usize,
     width: u32,
     height: u32,
-    rx: u32,
-    ry: u32,
-    rw: u32,
-    rh: u32,
-    pixel: u32,
-) {
-    let x0 = rx.min(width);
-    let y0 = ry.min(height);
-    let x1 = rx.saturating_add(rw).min(width);
-    let y1 = ry.saturating_add(rh).min(height);
+}
+
+/// Axis-aligned rectangle (origin + size in pixels).
+struct Rect {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+}
+
+/// Fill a rectangle inside the framebuffer with the packed-XRGB pixel value
+/// `pixel`. Clips the rectangle to the scanout dimensions; no-op if it lies
+/// entirely outside.
+fn fill_rect(fb: &mut Framebuffer<'_>, rect: Rect, pixel: u32) {
+    let x0 = rect.x.min(fb.width);
+    let y0 = rect.y.min(fb.height);
+    let x1 = rect.x.saturating_add(rect.w).min(fb.width);
+    let y1 = rect.y.saturating_add(rect.h).min(fb.height);
     if x0 >= x1 || y0 >= y1 {
         return;
     }
     let pixel_bytes = pixel.to_le_bytes();
     for y in y0..y1 {
-        let row_start = (y as usize) * pitch + (x0 as usize) * 4;
+        let row_start = (y as usize) * fb.pitch + (x0 as usize) * 4;
         let row_end = row_start + ((x1 - x0) as usize) * 4;
-        let row = &mut bytes[row_start..row_end];
+        let row = &mut fb.bytes[row_start..row_end];
         for chunk in row.chunks_exact_mut(4) {
             chunk.copy_from_slice(&pixel_bytes);
         }

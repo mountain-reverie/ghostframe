@@ -28,8 +28,7 @@ pub fn run<C: Connection>(
 
         for _frame in 0..frames_per_region {
             // Paint a 64×64 region at (100, 100) using a 4-color tile pattern.
-            for q in 0..4 {
-                let (r, g, b) = palette[q];
+            for (q, &(r, g, b)) in palette.iter().enumerate() {
                 let pixel = ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
                 conn.change_gc(gc, &ChangeGCAux::new().foreground(pixel))?;
                 let dx = (q % 2) as i16;

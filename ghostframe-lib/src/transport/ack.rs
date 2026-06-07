@@ -86,13 +86,17 @@ impl AckBatch {
         let mut entries = Vec::with_capacity(count as usize);
         for i in 0..(count as usize) {
             let off = 2 + i * ACK_ENTRY_SIZE;
-            let frame_seq = u32::from_le_bytes([
-                data[off], data[off + 1], data[off + 2], data[off + 3],
-            ]);
+            let frame_seq =
+                u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
             let tile_x = data[off + 4];
             let tile_y = data[off + 5];
             let pass_idx = data[off + 6];
-            entries.push(AckEntry { frame_seq, tile_x, tile_y, pass_idx });
+            entries.push(AckEntry {
+                frame_seq,
+                tile_x,
+                tile_y,
+                pass_idx,
+            });
         }
         Ok(AckBatch { entries })
     }
@@ -105,7 +109,12 @@ mod tests {
     #[test]
     fn batch_roundtrip_single_entry() {
         let batch = AckBatch {
-            entries: vec![AckEntry { frame_seq: 0x1234_5678, tile_x: 3, tile_y: 7, pass_idx: 13 }],
+            entries: vec![AckEntry {
+                frame_seq: 0x1234_5678,
+                tile_x: 3,
+                tile_y: 7,
+                pass_idx: 13,
+            }],
         };
         let bytes = batch.encode();
         assert_eq!(bytes[0], ACK_BATCH_MSG_TYPE, "msg type = 0x03");
@@ -122,7 +131,12 @@ mod tests {
     #[test]
     fn batch_at_max_capacity_fits_under_mtu() {
         let entries: Vec<_> = (0..MAX_ACK_ENTRIES_PER_BATCH)
-            .map(|i| AckEntry { frame_seq: i as u32, tile_x: 0, tile_y: 0, pass_idx: 0 })
+            .map(|i| AckEntry {
+                frame_seq: i as u32,
+                tile_x: 0,
+                tile_y: 0,
+                pass_idx: 0,
+            })
             .collect();
         let batch = AckBatch { entries };
         let bytes = batch.encode();

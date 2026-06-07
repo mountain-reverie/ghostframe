@@ -46,21 +46,27 @@ unsafe fn create_solid_memfd(width: u32, height: u32, b: u8, g: u8, r: u8) -> Ra
     fd
 }
 
-/// Create a memfd with one tile region changed to a different color.
-unsafe fn create_changed_memfd(
+/// Color in BGRA layout (alpha is always 255).
+struct BgraColor {
+    b: u8,
+    g: u8,
+    r: u8,
+}
+
+/// Parameters for [`create_changed_memfd`].
+struct ChangedMemfdParams {
     width: u32,
     height: u32,
-    base_b: u8,
-    base_g: u8,
-    base_r: u8,
+    base: BgraColor,
     change_tile_x: u32,
     change_tile_y: u32,
-    change_b: u8,
-    change_g: u8,
-    change_r: u8,
-) -> RawFd {
-    let stride = width * 4;
-    let size = (stride * height) as usize;
+    change: BgraColor,
+}
+
+/// Create a memfd with one tile region changed to a different color.
+unsafe fn create_changed_memfd(p: ChangedMemfdParams) -> RawFd {
+    let stride = p.width * 4;
+    let size = (stride * p.height) as usize;
     let name = std::ffi::CString::new("gpu-test-frame").unwrap();
     let fd = libc::memfd_create(name.as_ptr(), 0);
     assert!(fd >= 0);
@@ -77,20 +83,20 @@ unsafe fn create_changed_memfd(
     let slice = std::slice::from_raw_parts_mut(ptr as *mut u8, size);
     // Fill base color
     for pixel in slice.chunks_exact_mut(4) {
-        pixel[0] = base_b;
-        pixel[1] = base_g;
-        pixel[2] = base_r;
+        pixel[0] = p.base.b;
+        pixel[1] = p.base.g;
+        pixel[2] = p.base.r;
         pixel[3] = 255;
     }
     // Change the target tile region (tiles are 32x32 pixels)
-    let tile_px = change_tile_x * 32;
-    let tile_py = change_tile_y * 32;
-    for y in tile_py..std::cmp::min(tile_py + 32, height) {
-        for x in tile_px..std::cmp::min(tile_px + 32, width) {
+    let tile_px = p.change_tile_x * 32;
+    let tile_py = p.change_tile_y * 32;
+    for y in tile_py..std::cmp::min(tile_py + 32, p.height) {
+        for x in tile_px..std::cmp::min(tile_px + 32, p.width) {
             let off = (y * stride + x * 4) as usize;
-            slice[off] = change_b;
-            slice[off + 1] = change_g;
-            slice[off + 2] = change_r;
+            slice[off] = p.change.b;
+            slice[off + 1] = p.change.g;
+            slice[off + 2] = p.change.r;
             slice[off + 3] = 255;
         }
     }
@@ -160,11 +166,14 @@ fn gpu_pipeline_dirty_detection() {
         );
 
         // Frame 3: tile (1,0) changed to red — only that tile should be dirty
-        let fd3 = create_changed_memfd(
-            width, height, 255, 0, 0, // base: blue
-            1, 0, // tile (col=1, row=0)
-            0, 0, 255, // change: red (B=0, G=0, R=255 in BGRA)
-        );
+        let fd3 = create_changed_memfd(ChangedMemfdParams {
+            width,
+            height,
+            base: BgraColor { b: 255, g: 0, r: 0 }, // blue
+            change_tile_x: 1,
+            change_tile_y: 0,
+            change: BgraColor { b: 0, g: 0, r: 255 }, // red (B=0, G=0, R=255 in BGRA)
+        });
         let third = match tracker.diff(fd3, width, height, stride) {
             Ok(v) => v,
             Err(e) => {
@@ -374,11 +383,18 @@ fn gpu_pipeline_end_to_end() {
         libc::close(fd1);
 
         // 6. Third frame: change one tile → process_frame detects change → encode
-        let fd2 = create_changed_memfd(
-            width, height, 255, 255, 0, // base: cyan
-            2, 2, // tile (col=2, row=2)
-            0, 0, 255, // change: red (BGRA)
-        );
+        let fd2 = create_changed_memfd(ChangedMemfdParams {
+            width,
+            height,
+            base: BgraColor {
+                b: 255,
+                g: 255,
+                r: 0,
+            }, // cyan
+            change_tile_x: 2,
+            change_tile_y: 2,
+            change: BgraColor { b: 0, g: 0, r: 255 }, // red (BGRA)
+        });
 
         let analysis3 = match processor.process_frame(fd2, width, height, stride) {
             Ok(a) => a,

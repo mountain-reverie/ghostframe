@@ -61,20 +61,20 @@ pub struct SamplePair {
 ///                    body-below glyph-px (0,1) is bg (row1=0b001100).
 pub const SAMPLES: &[SamplePair] = &[
     SamplePair {
-        ink: (ORIGIN_X + 1, ORIGIN_Y + 0),
-        bg: (ORIGIN_X + 0, ORIGIN_Y + 0),
+        ink: (ORIGIN_X + 1, ORIGIN_Y),
+        bg: (ORIGIN_X, ORIGIN_Y),
     },
     SamplePair {
-        ink: (ORIGIN_X + 7 * GLYPH_W + 2, ORIGIN_Y + 0),
-        bg: (ORIGIN_X + 7 * GLYPH_W + 0, ORIGIN_Y + 0),
+        ink: (ORIGIN_X + 7 * GLYPH_W + 2, ORIGIN_Y),
+        bg: ((ORIGIN_X + 7 * GLYPH_W), ORIGIN_Y),
     },
     SamplePair {
-        ink: (ORIGIN_X + 14 * GLYPH_W + 1, ORIGIN_Y + 0),
-        bg: (ORIGIN_X + 14 * GLYPH_W + 0, ORIGIN_Y + 1),
+        ink: (ORIGIN_X + 14 * GLYPH_W + 1, ORIGIN_Y),
+        bg: ((ORIGIN_X + 14 * GLYPH_W), ORIGIN_Y + 1),
     },
     SamplePair {
-        ink: (ORIGIN_X + 20 * GLYPH_W + 1, ORIGIN_Y + 0),
-        bg: (ORIGIN_X + 20 * GLYPH_W + 0, ORIGIN_Y + 1),
+        ink: (ORIGIN_X + 20 * GLYPH_W + 1, ORIGIN_Y),
+        bg: ((ORIGIN_X + 20 * GLYPH_W), ORIGIN_Y + 1),
     },
 ];
 

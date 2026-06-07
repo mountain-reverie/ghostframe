@@ -55,7 +55,10 @@ fn release_drops_to_free_but_cached_at_zero() {
     t.release(3);
     assert_eq!(t.slot_state[3], SlotState::FreeButCached);
     assert_eq!(t.ref_count[3], 0);
-    assert!(t.free_lru.contains(&3), "release at ref_count=0 must push id to free_lru");
+    assert!(
+        t.free_lru.contains(&3),
+        "release at ref_count=0 must push id to free_lru"
+    );
 }
 
 #[test]
@@ -72,7 +75,10 @@ fn acquire_removes_id_from_free_lru() {
     t.free_lru.push_back(20);
     // Re-acquire slot 10; it must leave free_lru while 20 stays.
     t.acquire(10);
-    assert!(!t.free_lru.contains(&10), "acquired slot must be removed from free_lru");
+    assert!(
+        !t.free_lru.contains(&10),
+        "acquired slot must be removed from free_lru"
+    );
     assert!(t.free_lru.contains(&20), "other free slot must remain");
     assert_eq!(t.slot_state[10], SlotState::Held);
     assert_eq!(t.ref_count[10], 1);
@@ -113,7 +119,10 @@ fn overwrite_eligible_requires_zero_ref_count() {
     t.entries[2] = Some(p);
     t.slot_state[2] = SlotState::Held;
     t.ref_count[2] = 1;
-    assert!(!t.overwrite_eligible(2), "ref_count > 0 must block overwrite");
+    assert!(
+        !t.overwrite_eligible(2),
+        "ref_count > 0 must block overwrite"
+    );
 }
 
 #[test]
@@ -260,14 +269,18 @@ fn acquire_or_allocate_uses_empty_slot_when_no_match_no_eligible() {
 fn acquire_or_allocate_uses_empty_slots_before_evicting_cached() {
     let mut t = PaletteTable::new();
     let p_red = {
-        let mut p = PaletteEntry::default();
-        p.count = 1;
+        let mut p = PaletteEntry {
+            count: 1,
+            ..Default::default()
+        };
         p.colors[0] = [0, 0, 0xFF, 0xFF];
         p
     };
     let p_blue = {
-        let mut p = PaletteEntry::default();
-        p.count = 1;
+        let mut p = PaletteEntry {
+            count: 1,
+            ..Default::default()
+        };
         p.colors[0] = [0xFF, 0, 0, 0xFF];
         p
     };
@@ -275,8 +288,8 @@ fn acquire_or_allocate_uses_empty_slots_before_evicting_cached() {
     // Frame 1: red. Lands in empty slot 0.
     let id_red = t.acquire_or_allocate(&p_red).expect("alloc red");
     assert_eq!(id_red, 0);
-    t.release(id_red);                  // end-of-frame release
-    t.delivered.insert(id_red);         // simulate ACK arrival
+    t.release(id_red); // end-of-frame release
+    t.delivered.insert(id_red); // simulate ACK arrival
 
     // Frame 2: blue. MUST land in empty slot 1, NOT overwrite slot 0.
     // (This is the regression we're testing — pre-fix, find_eligible_free_slot
@@ -347,7 +360,12 @@ fn on_session_reset_preserve_delivered_keeps_bit() {
     // Allocate and "deliver" a palette.
     let p = PaletteEntry {
         count: 2,
-        colors: { let mut c = [[0u8; 4]; 16]; c[0] = [0xFF, 0, 0, 0xFF]; c[1] = [0, 0, 0xFF, 0xFF]; c },
+        colors: {
+            let mut c = [[0u8; 4]; 16];
+            c[0] = [0xFF, 0, 0, 0xFF];
+            c[1] = [0, 0, 0xFF, 0xFF];
+            c
+        },
     };
     let id = t.acquire_or_allocate(&p).unwrap();
     t.delivered.insert(id);
@@ -357,14 +375,19 @@ fn on_session_reset_preserve_delivered_keeps_bit() {
 
     // preserve_delivered=true: delivered bit stays, other per-session state still resets.
     t.on_session_reset(true);
-    assert!(t.delivered.contains(id),
-        "preserve_delivered=true must keep the delivered bit set");
-    assert_eq!(t.in_flight_carrying[id as usize], 0,
-        "in_flight_carrying still resets");
-    assert_eq!(t.ref_count[id as usize], 0,
-        "ref_count still resets");
-    assert!(t.entries[id as usize].is_some(),
-        "palette bytes preserved (warm cache)");
+    assert!(
+        t.delivered.contains(id),
+        "preserve_delivered=true must keep the delivered bit set"
+    );
+    assert_eq!(
+        t.in_flight_carrying[id as usize], 0,
+        "in_flight_carrying still resets"
+    );
+    assert_eq!(t.ref_count[id as usize], 0, "ref_count still resets");
+    assert!(
+        t.entries[id as usize].is_some(),
+        "palette bytes preserved (warm cache)"
+    );
 }
 
 #[test]
@@ -459,7 +482,7 @@ fn rle_pair_pattern_correct_offsets() {
     indices.extend(vec![0u8; 1024 - 5]);
     let packed = make_indices_4bit(&indices);
     let rle = encode_pal_rle_indices(&packed);
-    assert_eq!(rle[0], (0 << 4) | 2, "run of 3 zeros = len 3 → encoded 2");
+    assert_eq!(rle[0], 2, "run of 3 zeros = len 3 → encoded 2");
     assert_eq!(rle[1], (1 << 4) | 1, "run of 2 ones  = len 2 → encoded 1");
 }
 
@@ -531,32 +554,26 @@ fn decode_rejects_index_out_of_range() {
     // when the cached palette only has 2 entries.
     let palette = make_palette(&[[1, 2, 3, 255], [4, 5, 6, 255]]);
     let mut payload = vec![0x00u8, 0]; // thin, id=0
-    // 1024 indices = 1024 pixels worth. (idx=3, run=0) covers 1 pixel. Need 1023 more.
-    payload.push((3 << 4) | 0);
-    payload.push((0 << 4) | 15); // run of 16
-    for _ in 0..((1024 - 1 - 16) / 16) {
-        payload.push((0 << 4) | 15);
-    }
-    // Remainder: (1024 - 1 - 16 - (62*16)) = 1024 - 1 - 16 - 992 = 15
-    payload.push((0 << 4) | 14);
+                                       // 1024 indices = 1024 pixels worth. (idx=3, run=0) covers 1 pixel. Need 1023 more.
+    payload.push(3 << 4);
+    let run_count = (1024 - 1 - 16) / 16;
+    payload.extend(std::iter::repeat_n(15u8, 1 + run_count)); // first run + remaining runs
+                                                              // Remainder: (1024 - 1 - 16 - (62*16)) = 1024 - 1 - 16 - 992 = 15
+    payload.push(14);
     let err = decode_pal_rle(&payload, Some(&palette)).unwrap_err();
     assert!(matches!(err, PalRleDecodeError::IndexOutOfRange { .. }));
 }
 
 #[test]
 fn encode_decode_roundtrip_exact_pixels() {
-    let palette = make_palette(&[
-        [10, 20, 30, 255],
-        [40, 50, 60, 255],
-        [70, 80, 90, 255],
-    ]);
+    let palette = make_palette(&[[10, 20, 30, 255], [40, 50, 60, 255], [70, 80, 90, 255]]);
     // 1024 pixels with arbitrary palette indices.
     let indices: Vec<u8> = (0..1024).map(|i| (i % 3) as u8).collect();
     let packed = make_indices_4bit(&indices);
     let payload = encode_pal_rle_payload(&packed, &palette, 11, true);
     let result = decode_pal_rle(&payload, None).unwrap();
-    for pixel in 0..1024 {
-        let expected = palette.colors[indices[pixel] as usize];
+    for (pixel, &idx) in indices.iter().enumerate() {
+        let expected = palette.colors[idx as usize];
         let off = pixel * 4;
         assert_eq!(&result.pixels[off..off + 4], &expected, "pixel {}", pixel);
     }
@@ -566,15 +583,16 @@ use proptest::prelude::*;
 
 fn arb_palette() -> impl Strategy<Value = PaletteEntry> {
     (1u8..=16).prop_flat_map(|count| {
-        prop::collection::vec(any::<[u8; 4]>(), count as usize..=count as usize)
-            .prop_map(move |cols| {
+        prop::collection::vec(any::<[u8; 4]>(), count as usize..=count as usize).prop_map(
+            move |cols| {
                 let mut p = PaletteEntry::default();
                 for (i, c) in cols.iter().enumerate() {
                     p.colors[i] = *c;
                 }
                 p.count = count;
                 p
-            })
+            },
+        )
     })
 }
 
@@ -593,7 +611,10 @@ fn arb_indices_against(count: u8) -> impl Strategy<Value = [u8; 512]> {
 #[test]
 fn force_rebundle_clears_delivered_bit() {
     let mut t = PaletteTable::new();
-    let pal = PaletteEntry { count: 1, colors: [[10, 20, 30, 255]; 16] };
+    let pal = PaletteEntry {
+        count: 1,
+        colors: [[10, 20, 30, 255]; 16],
+    };
     // Force a slot to delivered state.
     t.write_bytes(5, &pal);
     t.delivered.insert(5);
@@ -601,8 +622,10 @@ fn force_rebundle_clears_delivered_bit() {
 
     t.force_rebundle(5);
 
-    assert!(!t.delivered.contains(5),
-        "force_rebundle must clear the delivered bit so the next emission re-bundles");
+    assert!(
+        !t.delivered.contains(5),
+        "force_rebundle must clear the delivered bit so the next emission re-bundles"
+    );
     // The palette content stays put — we only cleared the delivered flag.
     assert_eq!(t.entries[5].as_ref().unwrap().count, 1);
     assert_eq!(t.entries[5].as_ref().unwrap().colors[0], [10, 20, 30, 255]);
@@ -628,11 +651,18 @@ fn indices_raw_payload_layout_thin() {
         *b = (i as u8).wrapping_mul(3);
     }
     let payload = encode_pal_rle_payload_indices_raw(&packed, 42);
-    assert_eq!(payload.len(), 514, "[flags=1][palette_id=1][indices=512] = 514 bytes");
+    assert_eq!(
+        payload.len(),
+        514,
+        "[flags=1][palette_id=1][indices=512] = 514 bytes"
+    );
     assert_eq!(payload[0], 0x02, "flags bit 1 set, bit 0 clear");
     assert_eq!(payload[1], 42, "palette_id");
-    assert_eq!(&payload[2..], &packed[..],
-        "indices block must be verbatim copy of packed_indices");
+    assert_eq!(
+        &payload[2..],
+        &packed[..],
+        "indices block must be verbatim copy of packed_indices"
+    );
 }
 
 proptest! {

@@ -88,12 +88,16 @@ pub fn codec_state() -> impl Strategy<Value = CodecState> {
         any::<u32>().prop_map(|f| CodecState::H264 { frames_in_h264: f }),
         any::<u8>().prop_map(|p| CodecState::PalRle { palette_id: p }),
         Just(CodecState::Solid),
-        (any::<u8>(), 1u8..=crate::encoder::cdf53::CDF53_PASS_COUNT as u8).prop_map(|(s, m)| {
-            CodecState::Cdf53 {
-                passes_sent: s.min(m),
-                max_passes: m,
-            }
-        }),
+        (
+            any::<u8>(),
+            1u8..=crate::encoder::cdf53::CDF53_PASS_COUNT as u8
+        )
+            .prop_map(|(s, m)| {
+                CodecState::Cdf53 {
+                    passes_sent: s.min(m),
+                    max_passes: m,
+                }
+            }),
         Just(CodecState::PixelPerfect),
     ]
 }

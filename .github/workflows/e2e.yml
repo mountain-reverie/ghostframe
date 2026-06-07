@@ -1,0 +1,215 @@
+name: e2e
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read  # required to read web-client-dist artifact from ci.yml
+
+jobs:
+  loopback-h3:
+    name: loopback-h3
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/workflows/_setup-system-deps
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: e2e
+      - run: cargo test --test loopback_h3
+
+  harness-smoke:
+    name: harness-smoke
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/workflows/_setup-system-deps
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: e2e
+      - run: cargo test --test harness_smoke
+
+  e2e:
+    name: e2e
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/workflows/_setup-system-deps
+        with:
+          e2e-runtime: 'true'
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: e2e
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: ghostframe-web-client/package-lock.json
+
+      - name: Download web-client dist from ci.yml
+        uses: actions/download-artifact@v4
+        with:
+          name: web-client-dist
+          path: ghostframe-web-client/dist/
+          # Look in the same workflow run; falls back to building locally
+          # if the artifact isn't available (e.g. ci.yml failed early).
+          github-token: ${{ github.token }}
+          run-id: ${{ github.run_id }}
+        continue-on-error: true
+
+      - name: Fallback web-client build if artifact missing
+        if: hashFiles('ghostframe-web-client/dist/**') == ''
+        working-directory: ghostframe-web-client
+        run: |
+          echo "web-client-dist artifact not found, building locally"
+          npm ci
+          npm run build
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build host-side release binaries (for containers-build)
+        run: |
+          cargo build --release \
+            -p ghostframe-xdaemon \
+            -p ghostframe-test-pattern
+
+      - name: Build test-headscale image
+        uses: docker/build-push-action@v5
+        with:
+          context: tests/containers/headscale/
+          file: tests/containers/headscale/Dockerfile
+          tags: ghostframe/test-headscale:latest
+          load: true
+          cache-from: type=gha,scope=test-headscale
+          cache-to: type=gha,mode=max,scope=test-headscale
+
+      - name: Build test-server image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: tests/containers/test-server/Dockerfile
+          tags: ghostframe/test-server:latest
+          load: true
+          cache-from: type=gha,scope=test-server
+          cache-to: type=gha,mode=max,scope=test-server
+
+      - name: Build skip arguments from ci/skip-list.txt
+        id: skip-args
+        run: |
+          args=""
+          while IFS= read -r name; do
+            # Strip leading/trailing whitespace
+            name="${name#"${name%%[![:space:]]*}"}"
+            name="${name%"${name##*[![:space:]]}"}"
+            [[ -z "$name" || "$name" =~ ^# ]] && continue
+            args="$args --skip $name"
+          done < ci/skip-list.txt
+          echo "args=$args" >> "$GITHUB_OUTPUT"
+
+      - name: Point /usr/bin/chromium at Google Chrome (for H.264 + WebCodecs)
+        run: |
+          # The GH-runner /usr/bin/chromium is an open-source Chromium build
+          # without proprietary H.264 codec or WebCodecs API. Google Chrome
+          # always has both. Repoint the symlink so the harness's hardcoded
+          # /usr/bin/chromium picks up Chrome without any code change.
+          if [ ! -x /usr/bin/google-chrome-stable ] && [ ! -x /opt/google/chrome/chrome ]; then
+            echo "google-chrome-stable not pre-installed; installing from Google apt repo"
+            curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
+              | sudo gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg
+            echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" \
+              | sudo tee /etc/apt/sources.list.d/google-chrome.list >/dev/null
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends google-chrome-stable
+          fi
+          chrome_path=$(command -v google-chrome-stable || echo /opt/google/chrome/chrome)
+          sudo ln -sf "$chrome_path" /usr/bin/chromium
+          /usr/bin/chromium --version
+
+      - name: Probe Chromium (version + binary path)
+        run: |
+          mkdir -p /tmp/ghostframe-probe
+          log=/tmp/ghostframe-probe/chromium-binary.log
+          {
+            echo "=== which chromium ==="
+            which chromium || which chromium-browser || echo "no chromium in PATH"
+            echo
+            echo "=== /usr/bin/chromium --version ==="
+            /usr/bin/chromium --version 2>&1 || echo "/usr/bin/chromium missing"
+            echo
+            echo "=== ls -la /usr/bin/chromium* ==="
+            ls -la /usr/bin/chromium* 2>&1 || true
+            echo
+            echo "=== readlink -f /usr/bin/chromium ==="
+            readlink -f /usr/bin/chromium 2>&1 || true
+          } 2>&1 | tee "$log"
+
+      - name: Probe Chromium codec support (via chromiumoxide)
+        run: |
+          set -o pipefail
+          cargo test --test chromium_probe -- --nocapture 2>&1 \
+            | tee /tmp/ghostframe-probe/chromium-codecs.log
+
+      - name: Run e2e tests (VKMS-gated subset skipped)
+        run: |
+          set -o pipefail
+          cargo test --test e2e -- \
+            --test-threads=1 \
+            ${{ steps.skip-args.outputs.args }} \
+            2>&1 | tee /tmp/ghostframe-cargo-test.log
+
+      - name: Capture container logs on failure
+        if: failure()
+        run: |
+          mkdir -p /tmp/ci-artifacts
+          docker ps -a > /tmp/ci-artifacts/docker-ps.txt 2>&1 || true
+          docker events --since 30m --until 0s > /tmp/ci-artifacts/docker-events.txt 2>&1 || true
+          # docker inspect any container that still exists matching ghostframe/headscale names
+          for c in ghostframe-server headscale; do
+            if docker inspect "$c" >/dev/null 2>&1; then
+              docker logs "$c" > "/tmp/ci-artifacts/${c}.stdout.log" 2>"/tmp/ci-artifacts/${c}.stderr.log" || true
+            fi
+          done
+          # Also enumerate any container whose name matches our images, in case
+          # testcontainers used a random name (testcontainers Rust prefixes with the image name).
+          for cid in $(docker ps -a -q --filter ancestor=ghostframe/test-server 2>/dev/null); do
+            docker logs "$cid" > "/tmp/ci-artifacts/by-image-server-${cid}.stdout.log" 2>"/tmp/ci-artifacts/by-image-server-${cid}.stderr.log" || true
+          done
+          for cid in $(docker ps -a -q --filter ancestor=ghostframe/test-headscale 2>/dev/null); do
+            docker logs "$cid" > "/tmp/ci-artifacts/by-image-headscale-${cid}.stdout.log" 2>"/tmp/ci-artifacts/by-image-headscale-${cid}.stderr.log" || true
+          done
+
+      - name: Upload diagnostic artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-failure-logs
+          path: |
+            /tmp/ci-artifacts/
+            /tmp/ghostframe-*
+          retention-days: 7
+          if-no-files-found: ignore

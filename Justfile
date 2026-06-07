@@ -22,10 +22,31 @@ containers-build:
     docker build -t ghostframe/test-headscale -f tests/containers/headscale/Dockerfile tests/containers/headscale/
 
 lint:
-    cargo clippy -- -D warnings
+    cargo clippy --workspace --all-targets -- -D warnings
 
 fmt-check:
-    cargo fmt -- --check
+    cargo fmt --all -- --check
 
 fmt:
-    cargo fmt
+    cargo fmt --all
+
+# Run the fast CI tier (everything in .github/workflows/ci.yml) locally,
+# in the same order. Does NOT run e2e — use `just test-e2e` for that.
+ci-local:
+    @echo "=== fmt-check ==="
+    just fmt-check
+    @echo "=== clippy ==="
+    cargo clippy --workspace --all-targets -- -D warnings
+    @echo "=== unit tests ==="
+    cargo test --workspace --lib
+    @echo "=== release build ==="
+    cargo build --workspace --release --exclude ghostframe-e2e
+    @echo "=== web client build ==="
+    just web-client-build
+    cd ghostframe-web-client && npx tsc --noEmit
+    @echo "=== cbindgen header up-to-date ==="
+    cargo check -p ghostframe-lib
+    git diff --exit-code ghostframe-lib/include/ghostframe.h
+    @echo "=== go vet + build ==="
+    cd ghostbridge && go vet ./... && go build ./...
+    @echo "=== ci-local passed ==="

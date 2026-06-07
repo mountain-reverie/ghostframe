@@ -181,9 +181,7 @@ impl FrameAnalysis {
         // PALETTE_HASH_SLOTS entries are the entire allocated hash-table
         // buffer, owned by GpuFrameProcessor and stable until the next
         // process_frame call.
-        unsafe {
-            std::slice::from_raw_parts(self.frame_palette_set, PALETTE_HASH_SLOTS)
-        }
+        unsafe { std::slice::from_raw_parts(self.frame_palette_set, PALETTE_HASH_SLOTS) }
     }
 
     pub fn per_tile_frame_palette_id_slice(&self) -> &[u8] {
@@ -325,7 +323,6 @@ pub struct GpuFrameProcessor {
     cdf53_dispatch_args_memory: vk::DeviceMemory,
     // No CPU pointer — HOST_VISIBLE only for simple alloc; read by GPU via
     // vkCmdDispatchIndirect. Written once per frame by cdf53_indirect_args shader.
-
     cdf53_indirect_args_shader_module: vk::ShaderModule,
     cdf53_indirect_args_pipeline: vk::Pipeline,
     cdf53_indirect_args_pipeline_layout: vk::PipelineLayout,
@@ -710,7 +707,8 @@ impl Drop for GpuFrameProcessor {
             self.device.unmap_memory(self.palrle_compact_list_memory);
             self.device
                 .destroy_buffer(self.palrle_compact_list_buffer, None);
-            self.device.free_memory(self.palrle_compact_list_memory, None);
+            self.device
+                .free_memory(self.palrle_compact_list_memory, None);
 
             // PalRLE compact count buffer
             self.device.unmap_memory(self.palrle_compact_count_memory);
@@ -726,7 +724,8 @@ impl Drop for GpuFrameProcessor {
                 .free_memory(self.palrle_indirect_args_memory, None);
 
             // palette_fold buffers
-            self.device.unmap_memory(self.per_tile_frame_palette_id_memory);
+            self.device
+                .unmap_memory(self.per_tile_frame_palette_id_memory);
             self.device
                 .destroy_buffer(self.per_tile_frame_palette_id_buffer, None);
             self.device
@@ -745,8 +744,7 @@ impl Drop for GpuFrameProcessor {
             self.device.unmap_memory(self.frame_palette_set_memory);
             self.device
                 .destroy_buffer(self.frame_palette_set_buffer, None);
-            self.device
-                .free_memory(self.frame_palette_set_memory, None);
+            self.device.free_memory(self.frame_palette_set_memory, None);
 
             self.device
                 .destroy_descriptor_pool(self.descriptor_pool, None);
@@ -782,10 +780,8 @@ impl Drop for GpuFrameProcessor {
                 .destroy_pipeline(self.palrle_compact_pipeline, None);
             self.device
                 .destroy_pipeline_layout(self.palrle_compact_pipeline_layout, None);
-            self.device.destroy_descriptor_set_layout(
-                self.palrle_compact_descriptor_set_layout,
-                None,
-            );
+            self.device
+                .destroy_descriptor_set_layout(self.palrle_compact_descriptor_set_layout, None);
             self.device
                 .destroy_shader_module(self.palrle_compact_shader_module, None);
 
@@ -807,16 +803,16 @@ impl Drop for GpuFrameProcessor {
                 .destroy_pipeline(self.cdf53_compact_pipeline, None);
             self.device
                 .destroy_pipeline_layout(self.cdf53_compact_pipeline_layout, None);
-            self.device.destroy_descriptor_set_layout(
-                self.cdf53_compact_descriptor_set_layout,
-                None,
-            );
+            self.device
+                .destroy_descriptor_set_layout(self.cdf53_compact_descriptor_set_layout, None);
             self.device
                 .destroy_shader_module(self.cdf53_compact_shader_module, None);
 
             // Cdf53 indirect-args buffer (Stage 4b)
-            self.device.destroy_buffer(self.cdf53_dispatch_args_buffer, None);
-            self.device.free_memory(self.cdf53_dispatch_args_memory, None);
+            self.device
+                .destroy_buffer(self.cdf53_dispatch_args_buffer, None);
+            self.device
+                .free_memory(self.cdf53_dispatch_args_memory, None);
 
             // Cdf53 indirect-args pipeline (Stage 4b)
             self.device
@@ -832,31 +828,38 @@ impl Drop for GpuFrameProcessor {
 
             // Cdf53 coefficient buffer (Stage 4c)
             self.device.unmap_memory(self.cdf53_coefficients_memory);
-            self.device.destroy_buffer(self.cdf53_coefficients_buffer, None);
-            self.device.free_memory(self.cdf53_coefficients_memory, None);
+            self.device
+                .destroy_buffer(self.cdf53_coefficients_buffer, None);
+            self.device
+                .free_memory(self.cdf53_coefficients_memory, None);
 
             // M3.3c escalation buffers
             self.device.unmap_memory(self.cdf53_escalation_list_memory);
-            self.device.destroy_buffer(self.cdf53_escalation_list_buffer, None);
-            self.device.free_memory(self.cdf53_escalation_list_memory, None);
+            self.device
+                .destroy_buffer(self.cdf53_escalation_list_buffer, None);
+            self.device
+                .free_memory(self.cdf53_escalation_list_memory, None);
 
             self.device.unmap_memory(self.cdf53_escalation_count_memory);
-            self.device.destroy_buffer(self.cdf53_escalation_count_buffer, None);
-            self.device.free_memory(self.cdf53_escalation_count_memory, None);
+            self.device
+                .destroy_buffer(self.cdf53_escalation_count_buffer, None);
+            self.device
+                .free_memory(self.cdf53_escalation_count_memory, None);
 
-            self.device.unmap_memory(self.cdf53_escalation_coefficients_memory);
-            self.device.destroy_buffer(self.cdf53_escalation_coefficients_buffer, None);
-            self.device.free_memory(self.cdf53_escalation_coefficients_memory, None);
+            self.device
+                .unmap_memory(self.cdf53_escalation_coefficients_memory);
+            self.device
+                .destroy_buffer(self.cdf53_escalation_coefficients_buffer, None);
+            self.device
+                .free_memory(self.cdf53_escalation_coefficients_memory, None);
 
             // Cdf53 forward L1 pipeline (Stage 4c-L1)
             self.device
                 .destroy_pipeline(self.cdf53_forward_l1_pipeline, None);
             self.device
                 .destroy_pipeline_layout(self.cdf53_forward_l1_pipeline_layout, None);
-            self.device.destroy_descriptor_set_layout(
-                self.cdf53_forward_l1_descriptor_set_layout,
-                None,
-            );
+            self.device
+                .destroy_descriptor_set_layout(self.cdf53_forward_l1_descriptor_set_layout, None);
             self.device
                 .destroy_shader_module(self.cdf53_forward_l1_shader_module, None);
 
@@ -865,10 +868,8 @@ impl Drop for GpuFrameProcessor {
                 .destroy_pipeline(self.cdf53_forward_l2_pipeline, None);
             self.device
                 .destroy_pipeline_layout(self.cdf53_forward_l2_pipeline_layout, None);
-            self.device.destroy_descriptor_set_layout(
-                self.cdf53_forward_l2_descriptor_set_layout,
-                None,
-            );
+            self.device
+                .destroy_descriptor_set_layout(self.cdf53_forward_l2_descriptor_set_layout, None);
             self.device
                 .destroy_shader_module(self.cdf53_forward_l2_shader_module, None);
 
@@ -877,10 +878,8 @@ impl Drop for GpuFrameProcessor {
                 .destroy_pipeline(self.cdf53_forward_l3_pipeline, None);
             self.device
                 .destroy_pipeline_layout(self.cdf53_forward_l3_pipeline_layout, None);
-            self.device.destroy_descriptor_set_layout(
-                self.cdf53_forward_l3_descriptor_set_layout,
-                None,
-            );
+            self.device
+                .destroy_descriptor_set_layout(self.cdf53_forward_l3_descriptor_set_layout, None);
             self.device
                 .destroy_shader_module(self.cdf53_forward_l3_shader_module, None);
 
@@ -901,10 +900,8 @@ impl Drop for GpuFrameProcessor {
                 .destroy_pipeline(self.palette_fold_pipeline, None);
             self.device
                 .destroy_pipeline_layout(self.palette_fold_pipeline_layout, None);
-            self.device.destroy_descriptor_set_layout(
-                self.palette_fold_descriptor_set_layout,
-                None,
-            );
+            self.device
+                .destroy_descriptor_set_layout(self.palette_fold_descriptor_set_layout, None);
             self.device
                 .destroy_shader_module(self.palette_fold_shader_module, None);
 
@@ -942,10 +939,8 @@ impl Drop for GpuFrameProcessor {
                 .destroy_pipeline(self.pal_rle_index_pipeline, None);
             self.device
                 .destroy_pipeline_layout(self.pal_rle_index_pipeline_layout, None);
-            self.device.destroy_descriptor_set_layout(
-                self.pal_rle_index_descriptor_set_layout,
-                None,
-            );
+            self.device
+                .destroy_descriptor_set_layout(self.pal_rle_index_descriptor_set_layout, None);
             self.device
                 .destroy_shader_module(self.pal_rle_index_shader_module, None);
 
@@ -961,8 +956,8 @@ impl Drop for GpuFrameProcessor {
     }
 }
 
-mod setup;
 mod frame;
+mod setup;
 
 #[cfg(test)]
 mod tests;

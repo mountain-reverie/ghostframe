@@ -253,7 +253,12 @@ impl GpuFrameProcessor {
         geom: FrameGeometry,
         escalation_count: u32,
     ) -> Result<FrameAnalysis, Box<dyn std::error::Error>> {
-        let FrameGeometry { width, height, cols, rows } = geom;
+        let FrameGeometry {
+            width,
+            height,
+            cols,
+            rows,
+        } = geom;
         let tile_count = geom.tile_count();
         let nv12 = self.nv12_buffer.as_ref().unwrap();
         let nv12_layout = Nv12OutputLayout::from_buffer(nv12);
@@ -304,7 +309,13 @@ impl GpuFrameProcessor {
             // Run NV12 conversion + tile_analysis + snapshot copy in one cmd
             // buffer. The snapshot is what we will compare future frames
             // against.
-            self.run_first_frame_passes(current, snapshot.as_ref(), geom, nv12_layout, escalation_count)?;
+            self.run_first_frame_passes(
+                current,
+                snapshot.as_ref(),
+                geom,
+                nv12_layout,
+                escalation_count,
+            )?;
 
             if let Some(mut snap) = snapshot {
                 snap.layout = vk::ImageLayout::GENERAL;
@@ -419,13 +430,8 @@ impl GpuFrameProcessor {
 
         // 2. SAD dispatch
         let sad_push: [u32; 3] = [width, height, cols];
-        let sad_ds_guard = self.run_sad_stage(
-            cmd,
-            current.view,
-            prev_view,
-            &sad_push,
-            (cols, rows, 1),
-        )?;
+        let sad_ds_guard =
+            self.run_sad_stage(cmd, current.view, prev_view, &sad_push, (cols, rows, 1))?;
 
         // 3. No barrier needed between SAD and NV12 dispatches:
         //    - both read `current.image` (read-after-read is hazard-free),
@@ -453,12 +459,8 @@ impl GpuFrameProcessor {
         // current_frame read-only and write to disjoint buffers; the final
         // HOST-readback barrier covers all three output buffers.
         let analysis_push: [u32; 3] = [width, height, cols];
-        let analysis_ds_guard = self.run_analysis_stage(
-            cmd,
-            current.view,
-            &analysis_push,
-            (cols, rows, 1),
-        )?;
+        let analysis_ds_guard =
+            self.run_analysis_stage(cmd, current.view, &analysis_push, (cols, rows, 1))?;
 
         // Inter-dispatch barrier: SAD + tile_analysis writes must be visible to Stage 1.5a reads.
         let buf_barrier_inputs = [
@@ -515,11 +517,8 @@ impl GpuFrameProcessor {
         // Stage 1.5a: palrle_compact dispatch.
         // tile_idx = gl_WorkGroupID.x; bound check `tile_idx < cols * rows` is in the shader.
         let palrle_compact_push: [u32; 3] = [cols, rows, SAD_THRESHOLD];
-        let palrle_compact_ds_guard = self.run_palrle_compact_stage(
-            cmd,
-            &palrle_compact_push,
-            (cols * rows, 1, 1),
-        )?;
+        let palrle_compact_ds_guard =
+            self.run_palrle_compact_stage(cmd, &palrle_compact_push, (cols * rows, 1, 1))?;
 
         // Barrier between Stage 1.5a and 1.5b: shader write → shader read on count.
         let buf_barrier_count = vk::BufferMemoryBarrier::default()
@@ -546,9 +545,7 @@ impl GpuFrameProcessor {
         // Barrier for future stages (Task 11+) to consume indirect args.
         let buf_barrier_args = vk::BufferMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(
-                vk::AccessFlags::INDIRECT_COMMAND_READ | vk::AccessFlags::SHADER_READ,
-            )
+            .dst_access_mask(vk::AccessFlags::INDIRECT_COMMAND_READ | vk::AccessFlags::SHADER_READ)
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .buffer(self.palrle_indirect_args_buffer)
@@ -589,11 +586,8 @@ impl GpuFrameProcessor {
         );
         let cdf53_compact_push: [u32; 4] =
             [cols, rows, SAD_THRESHOLD, UNIQUE_COLORS_UNKNOWN_SENTINEL];
-        let cdf53_compact_ds_guard = self.run_cdf53_compact_stage(
-            cmd,
-            &cdf53_compact_push,
-            (cols * rows, 1, 1),
-        )?;
+        let cdf53_compact_ds_guard =
+            self.run_cdf53_compact_stage(cmd, &cdf53_compact_push, (cols * rows, 1, 1))?;
         // Barrier between Stage 4a and 4b: shader write → shader read on count.
         let buf_barrier_cdf53_count = vk::BufferMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
@@ -620,9 +614,7 @@ impl GpuFrameProcessor {
         // for Stage 4c (cdf53_forward, Task 7) via vkCmdDispatchIndirect.
         let buf_barrier_cdf53_args = vk::BufferMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(
-                vk::AccessFlags::INDIRECT_COMMAND_READ | vk::AccessFlags::SHADER_READ,
-            )
+            .dst_access_mask(vk::AccessFlags::INDIRECT_COMMAND_READ | vk::AccessFlags::SHADER_READ)
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .buffer(self.cdf53_dispatch_args_buffer)
@@ -666,12 +658,8 @@ impl GpuFrameProcessor {
         // ============================================================
 
         // Stage 4c-L1: 32×32 BGRA tile → 4 × 16×16 subbands.
-        let cdf53_forward_l1_ds_guard = self.run_cdf53_forward_l1_stage(
-            cmd,
-            current.view,
-            cols,
-            rows,
-        )?;
+        let cdf53_forward_l1_ds_guard =
+            self.run_cdf53_forward_l1_stage(cmd, current.view, cols, rows)?;
 
         // Barrier L1 → L2: coefficient writes from L1 must be visible to L2.
         let buf_barrier_l1_to_l2 = vk::BufferMemoryBarrier::default()
@@ -787,8 +775,13 @@ impl GpuFrameProcessor {
             .cmd_fill_buffer(cmd, self.frame_palette_count_buffer, 0, 4, 0);
         self.device
             .cmd_fill_buffer(cmd, self.hash_table_buffer, 0, PALETTE_SLOT_U32_BYTES, 0);
-        self.device
-            .cmd_fill_buffer(cmd, self.per_tile_frame_palette_id_buffer, 0, pal_id_bytes, 0);
+        self.device.cmd_fill_buffer(
+            cmd,
+            self.per_tile_frame_palette_id_buffer,
+            0,
+            pal_id_bytes,
+            0,
+        );
 
         // Barrier: zero-fills + compact_list write must be visible to Stage 2a.
         // srcStageMask covers TRANSFER (zero-fills) and COMPUTE_SHADER (compact_list write).
@@ -954,11 +947,8 @@ impl GpuFrameProcessor {
         // All five inputs are correctly visible at COMPUTE_SHADER stage by
         // Vulkan execution-dependency rules.
         let pal_rle_index_push: [u32; 1] = [cols];
-        let pal_rle_index_ds_guard = self.run_pal_rle_index_stage(
-            cmd,
-            current.view,
-            &pal_rle_index_push,
-        )?;
+        let pal_rle_index_ds_guard =
+            self.run_pal_rle_index_stage(cmd, current.view, &pal_rle_index_push)?;
 
         // 5a. Snapshot copy: current (DMA-BUF) → prev_image (owned). This
         // makes prev_image a true point-in-time snapshot of THIS frame for
@@ -1283,7 +1273,12 @@ impl GpuFrameProcessor {
         nv12: Nv12OutputLayout,
         escalation_count: u32,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let FrameGeometry { width, height, cols, rows } = geom;
+        let FrameGeometry {
+            width,
+            height,
+            cols,
+            rows,
+        } = geom;
         let Nv12OutputLayout {
             buffer: nv12_buffer,
             y_stride: nv12_y_stride,
@@ -1360,12 +1355,8 @@ impl GpuFrameProcessor {
         // the subsequent-frames branch comment at the SAD/NV12/Analysis
         // dispatch trio.
         let analysis_push: [u32; 3] = [width, height, cols];
-        let analysis_ds_guard = self.run_analysis_stage(
-            cmd,
-            current.view,
-            &analysis_push,
-            (cols, rows, 1),
-        )?;
+        let analysis_ds_guard =
+            self.run_analysis_stage(cmd, current.view, &analysis_push, (cols, rows, 1))?;
 
         // ============================================================
         // Stages 1.5–3: PalRle compact, indirect args, palette fold,
@@ -1437,11 +1428,8 @@ impl GpuFrameProcessor {
         // Stage 1.5a: palrle_compact dispatch.
         // tile_idx = gl_WorkGroupID.x; bound check `tile_idx < cols * rows` is in the shader.
         let palrle_compact_push: [u32; 3] = [cols, rows, SAD_THRESHOLD];
-        let palrle_compact_ds_guard = self.run_palrle_compact_stage(
-            cmd,
-            &palrle_compact_push,
-            (cols * rows, 1, 1),
-        )?;
+        let palrle_compact_ds_guard =
+            self.run_palrle_compact_stage(cmd, &palrle_compact_push, (cols * rows, 1, 1))?;
 
         // Barrier between Stage 1.5a and 1.5b: shader write → shader read on count.
         let buf_barrier_count = vk::BufferMemoryBarrier::default()
@@ -1468,9 +1456,7 @@ impl GpuFrameProcessor {
         // Barrier for future stages to consume indirect args.
         let buf_barrier_args = vk::BufferMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(
-                vk::AccessFlags::INDIRECT_COMMAND_READ | vk::AccessFlags::SHADER_READ,
-            )
+            .dst_access_mask(vk::AccessFlags::INDIRECT_COMMAND_READ | vk::AccessFlags::SHADER_READ)
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .buffer(self.palrle_indirect_args_buffer)
@@ -1508,11 +1494,8 @@ impl GpuFrameProcessor {
         );
         let cdf53_compact_push: [u32; 4] =
             [cols, rows, SAD_THRESHOLD, UNIQUE_COLORS_UNKNOWN_SENTINEL];
-        let cdf53_compact_ds_guard = self.run_cdf53_compact_stage(
-            cmd,
-            &cdf53_compact_push,
-            (cols * rows, 1, 1),
-        )?;
+        let cdf53_compact_ds_guard =
+            self.run_cdf53_compact_stage(cmd, &cdf53_compact_push, (cols * rows, 1, 1))?;
         // Barrier between Stage 4a and 4b: shader write → shader read on count
         // (first-frame path).
         let buf_barrier_cdf53_count = vk::BufferMemoryBarrier::default()
@@ -1540,9 +1523,7 @@ impl GpuFrameProcessor {
         // for Stage 4c (cdf53_forward, Task 7) via vkCmdDispatchIndirect.
         let buf_barrier_cdf53_args = vk::BufferMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(
-                vk::AccessFlags::INDIRECT_COMMAND_READ | vk::AccessFlags::SHADER_READ,
-            )
+            .dst_access_mask(vk::AccessFlags::INDIRECT_COMMAND_READ | vk::AccessFlags::SHADER_READ)
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .buffer(self.cdf53_dispatch_args_buffer)
@@ -1586,12 +1567,8 @@ impl GpuFrameProcessor {
         // ============================================================
 
         // Stage 4c-L1: 32×32 BGRA tile → 4 × 16×16 subbands.
-        let cdf53_forward_l1_ds_guard = self.run_cdf53_forward_l1_stage(
-            cmd,
-            current.view,
-            cols,
-            rows,
-        )?;
+        let cdf53_forward_l1_ds_guard =
+            self.run_cdf53_forward_l1_stage(cmd, current.view, cols, rows)?;
 
         // Barrier L1 → L2
         let buf_barrier_l1_to_l2 = vk::BufferMemoryBarrier::default()
@@ -1700,8 +1677,13 @@ impl GpuFrameProcessor {
             .cmd_fill_buffer(cmd, self.frame_palette_count_buffer, 0, 4, 0);
         self.device
             .cmd_fill_buffer(cmd, self.hash_table_buffer, 0, PALETTE_SLOT_U32_BYTES, 0);
-        self.device
-            .cmd_fill_buffer(cmd, self.per_tile_frame_palette_id_buffer, 0, pal_id_bytes, 0);
+        self.device.cmd_fill_buffer(
+            cmd,
+            self.per_tile_frame_palette_id_buffer,
+            0,
+            pal_id_bytes,
+            0,
+        );
 
         // Barrier: zero-fills + compact_list write must be visible to Stage 2a.
         let stage_2a_input_barriers = [
@@ -1849,11 +1831,8 @@ impl GpuFrameProcessor {
         // Stage 3: pal_rle_index
         // ============================================================
         let pal_rle_index_push: [u32; 1] = [cols];
-        let pal_rle_index_ds_guard = self.run_pal_rle_index_stage(
-            cmd,
-            current.view,
-            &pal_rle_index_push,
-        )?;
+        let pal_rle_index_ds_guard =
+            self.run_pal_rle_index_stage(cmd, current.view, &pal_rle_index_push)?;
 
         // Snapshot copy: current (GENERAL) → snapshot (TRANSFER_DST_OPTIMAL).
         // Inside this `Some` arm the `PrevFrame` is always freshly allocated
@@ -2087,7 +2066,6 @@ impl GpuFrameProcessor {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // DMA-BUF import helpers
 // ---------------------------------------------------------------------------
@@ -2279,10 +2257,10 @@ impl GpuFrameProcessor {
         let gpu_offset = sl.offset as usize;
 
         // Map and memcpy row-by-row.
-        let map_ptr = self
-            .device
-            .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())?
-            as *mut u8;
+        let map_ptr =
+            self.device
+                .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())?
+                as *mut u8;
         let src_row_pitch = stride as usize;
         let copy_bytes_per_row = src_row_pitch.min(gpu_row_pitch);
         for row in 0..(height as usize) {
@@ -2740,7 +2718,9 @@ impl GpuFrameProcessor {
         let guard = ScopedDescriptorSets {
             device: &self.device,
             pool: self.descriptor_pool,
-            sets: self.device.allocate_descriptor_sets(&palrle_compact_ds_alloc)?,
+            sets: self
+                .device
+                .allocate_descriptor_sets(&palrle_compact_ds_alloc)?,
         };
         let palrle_compact_ds = guard.sets[0];
 
@@ -2787,7 +2767,8 @@ impl GpuFrameProcessor {
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(&palrle_compact_count_info),
         ];
-        self.device.update_descriptor_sets(&palrle_compact_writes, &[]);
+        self.device
+            .update_descriptor_sets(&palrle_compact_writes, &[]);
 
         // Bind + push + dispatch.
         self.device.cmd_bind_pipeline(
@@ -2840,7 +2821,9 @@ impl GpuFrameProcessor {
         let guard = ScopedDescriptorSets {
             device: &self.device,
             pool: self.descriptor_pool,
-            sets: self.device.allocate_descriptor_sets(&cdf53_compact_ds_alloc)?,
+            sets: self
+                .device
+                .allocate_descriptor_sets(&cdf53_compact_ds_alloc)?,
         };
         let cdf53_compact_ds = guard.sets[0];
 
@@ -2887,7 +2870,8 @@ impl GpuFrameProcessor {
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(&cdf53_count_info),
         ];
-        self.device.update_descriptor_sets(&cdf53_compact_writes, &[]);
+        self.device
+            .update_descriptor_sets(&cdf53_compact_writes, &[]);
 
         // Bind + push + dispatch.
         self.device.cmd_bind_pipeline(
@@ -2952,7 +2936,9 @@ impl GpuFrameProcessor {
         let guard = ScopedDescriptorSets {
             device: &self.device,
             pool: self.descriptor_pool,
-            sets: self.device.allocate_descriptor_sets(&palrle_indirect_args_ds_alloc)?,
+            sets: self
+                .device
+                .allocate_descriptor_sets(&palrle_indirect_args_ds_alloc)?,
         };
         let palrle_indirect_args_ds = guard.sets[0];
 
@@ -3119,7 +3105,9 @@ impl GpuFrameProcessor {
         let guard = ScopedDescriptorSets {
             device: &self.device,
             pool: self.descriptor_pool,
-            sets: self.device.allocate_descriptor_sets(&palette_fold_ds_alloc)?,
+            sets: self
+                .device
+                .allocate_descriptor_sets(&palette_fold_ds_alloc)?,
         };
         let palette_fold_ds = guard.sets[0];
 
@@ -3186,7 +3174,8 @@ impl GpuFrameProcessor {
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(&palette_fold_per_tile_info),
         ];
-        self.device.update_descriptor_sets(&palette_fold_writes, &[]);
+        self.device
+            .update_descriptor_sets(&palette_fold_writes, &[]);
 
         // Bind + indirect dispatch. No push constants for this stage.
         self.device.cmd_bind_pipeline(
@@ -3236,14 +3225,17 @@ impl GpuFrameProcessor {
     ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
         // Allocate one descriptor set from the pool. The returned guard frees
         // it on drop, ensuring the bounded pool doesn't leak on early-exit.
-        let palette_subset_fold_init_set_layouts = [self.palette_subset_fold_init_descriptor_set_layout];
+        let palette_subset_fold_init_set_layouts =
+            [self.palette_subset_fold_init_descriptor_set_layout];
         let palette_subset_fold_init_ds_alloc = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
             .set_layouts(&palette_subset_fold_init_set_layouts);
         let guard = ScopedDescriptorSets {
             device: &self.device,
             pool: self.descriptor_pool,
-            sets: self.device.allocate_descriptor_sets(&palette_subset_fold_init_ds_alloc)?,
+            sets: self
+                .device
+                .allocate_descriptor_sets(&palette_subset_fold_init_ds_alloc)?,
         };
         let palette_subset_fold_init_ds = guard.sets[0];
 
@@ -3275,7 +3267,8 @@ impl GpuFrameProcessor {
             &[palette_subset_fold_init_ds],
             &[],
         );
-        self.device.cmd_dispatch(cmd, workgroups.0, workgroups.1, workgroups.2);
+        self.device
+            .cmd_dispatch(cmd, workgroups.0, workgroups.1, workgroups.2);
 
         Ok(guard)
     }
@@ -3310,7 +3303,9 @@ impl GpuFrameProcessor {
         let guard = ScopedDescriptorSets {
             device: &self.device,
             pool: self.descriptor_pool,
-            sets: self.device.allocate_descriptor_sets(&palette_subset_fold_ds_alloc)?,
+            sets: self
+                .device
+                .allocate_descriptor_sets(&palette_subset_fold_ds_alloc)?,
         };
         let palette_subset_fold_ds = guard.sets[0];
 
@@ -3354,7 +3349,8 @@ impl GpuFrameProcessor {
             &[palette_subset_fold_ds],
             &[],
         );
-        self.device.cmd_dispatch(cmd, PALETTE_HASH_SLOTS as u32, 1, 1);
+        self.device
+            .cmd_dispatch(cmd, PALETTE_HASH_SLOTS as u32, 1, 1);
 
         Ok(guard)
     }
@@ -3397,7 +3393,9 @@ impl GpuFrameProcessor {
         let guard = ScopedDescriptorSets {
             device: &self.device,
             pool: self.descriptor_pool,
-            sets: self.device.allocate_descriptor_sets(&pal_rle_index_ds_alloc)?,
+            sets: self
+                .device
+                .allocate_descriptor_sets(&pal_rle_index_ds_alloc)?,
         };
         let pal_rle_index_ds = guard.sets[0];
 
@@ -3463,7 +3461,8 @@ impl GpuFrameProcessor {
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(&pal_rle_index_out_info),
         ];
-        self.device.update_descriptor_sets(&pal_rle_index_writes, &[]);
+        self.device
+            .update_descriptor_sets(&pal_rle_index_writes, &[]);
 
         // Bind + push + indirect dispatch.
         self.device.cmd_bind_pipeline(

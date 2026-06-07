@@ -343,10 +343,12 @@ impl Default for Classifier {
                 .and_then(|s| s.parse::<f32>().ok())
                 .filter(|v| *v > 0.0),
             #[cfg(any(test, feature = "test-loss-injection"))]
-            loss_override_threshold_override: std::env::var("GHOSTFRAME_TEST_LOSS_OVERRIDE_THRESHOLD")
-                .ok()
-                .and_then(|s| s.parse::<f32>().ok())
-                .filter(|v| *v > 0.0 && *v <= 1.0),
+            loss_override_threshold_override: std::env::var(
+                "GHOSTFRAME_TEST_LOSS_OVERRIDE_THRESHOLD",
+            )
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .filter(|v| *v > 0.0 && *v <= 1.0),
             #[cfg(any(test, feature = "test-loss-injection"))]
             headroom_min_bpus_override: std::env::var("GHOSTFRAME_TEST_HEADROOM_MIN_BPUS")
                 .ok()
@@ -468,21 +470,30 @@ impl Classifier {
         let ctx = self.adaptation_context;
         let headroom_threshold = {
             #[cfg(any(test, feature = "test-loss-injection"))]
-            { self.headroom_min_bpus_override.unwrap_or(HEADROOM_MIN_BYTES_PER_US) }
+            {
+                self.headroom_min_bpus_override
+                    .unwrap_or(HEADROOM_MIN_BYTES_PER_US)
+            }
             #[cfg(not(any(test, feature = "test-loss-injection")))]
-            { HEADROOM_MIN_BYTES_PER_US }
+            {
+                HEADROOM_MIN_BYTES_PER_US
+            }
         };
-        let headroom_force_h264 =
-            ctx.bytes_per_us > 0.0 && ctx.bytes_per_us < headroom_threshold;
+        let headroom_force_h264 = ctx.bytes_per_us > 0.0 && ctx.bytes_per_us < headroom_threshold;
         if headroom_force_h264 {
             self.state = ClassifierHysteresis::default();
             return (FrameMode::H264, "headroom_guard");
         }
         let loss_threshold = {
             #[cfg(any(test, feature = "test-loss-injection"))]
-            { self.loss_override_threshold_override.unwrap_or(LOSS_OVERRIDE_THRESHOLD) }
+            {
+                self.loss_override_threshold_override
+                    .unwrap_or(LOSS_OVERRIDE_THRESHOLD)
+            }
             #[cfg(not(any(test, feature = "test-loss-injection")))]
-            { LOSS_OVERRIDE_THRESHOLD }
+            {
+                LOSS_OVERRIDE_THRESHOLD
+            }
         };
         let loss_force_h264 = ctx.loss_rate > loss_threshold;
         if loss_force_h264 {
@@ -514,9 +525,14 @@ impl Classifier {
         let tile_codec_cost = non_h264_us + (all_tile_bytes as f32) / bytes_per_us;
         let per_tile_bias = {
             #[cfg(any(test, feature = "test-loss-injection"))]
-            { self.refinement_bias_us_override.unwrap_or(REFINEMENT_BIAS_PER_TILE_US) }
+            {
+                self.refinement_bias_us_override
+                    .unwrap_or(REFINEMENT_BIAS_PER_TILE_US)
+            }
             #[cfg(not(any(test, feature = "test-loss-injection")))]
-            { REFINEMENT_BIAS_PER_TILE_US }
+            {
+                REFINEMENT_BIAS_PER_TILE_US
+            }
         };
         let refinement_bias_us = self.refinement_deficit_tiles as f32 * per_tile_bias;
         let h264_cost = self.cost.h264_frame_us
@@ -549,7 +565,8 @@ impl Classifier {
                     self.state.enter_streak = self.state.enter_streak.saturating_add(1);
                     self.state.exit_started_us = None;
                     self.state.exit_streak = 0;
-                    let micros_elapsed = now_us.saturating_sub(*started) >= self.enter_sustain_micros;
+                    let micros_elapsed =
+                        now_us.saturating_sub(*started) >= self.enter_sustain_micros;
                     let frames_elapsed = self.state.enter_streak >= self.enter_sustain_frames_min;
                     if micros_elapsed && frames_elapsed {
                         self.state.enter_started_us = None;
@@ -568,7 +585,8 @@ impl Classifier {
                     self.state.exit_streak = self.state.exit_streak.saturating_add(1);
                     self.state.enter_started_us = None;
                     self.state.enter_streak = 0;
-                    let micros_elapsed = now_us.saturating_sub(*started) >= self.exit_sustain_micros;
+                    let micros_elapsed =
+                        now_us.saturating_sub(*started) >= self.exit_sustain_micros;
                     let frames_elapsed = self.state.exit_streak >= self.exit_sustain_frames_min;
                     if micros_elapsed && frames_elapsed {
                         self.state.exit_started_us = None;

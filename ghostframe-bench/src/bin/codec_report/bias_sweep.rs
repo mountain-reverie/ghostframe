@@ -10,10 +10,22 @@ pub struct BiasPoint {
 }
 
 pub const BIAS_VALUES_US: &[BiasPoint] = &[
-    BiasPoint { label: "bias_2us",  value_us:  2.0 },
-    BiasPoint { label: "bias_5us",  value_us:  5.0 },  // current default
-    BiasPoint { label: "bias_10us", value_us: 10.0 },
-    BiasPoint { label: "bias_20us", value_us: 20.0 },
+    BiasPoint {
+        label: "bias_2us",
+        value_us: 2.0,
+    },
+    BiasPoint {
+        label: "bias_5us",
+        value_us: 5.0,
+    }, // current default
+    BiasPoint {
+        label: "bias_10us",
+        value_us: 10.0,
+    },
+    BiasPoint {
+        label: "bias_20us",
+        value_us: 20.0,
+    },
 ];
 
 /// Default scene + content. Uses `--mode-switch-cycle 12` — same pattern
@@ -32,8 +44,6 @@ pub const BIAS_VALUES_US: &[BiasPoint] = &[
 /// binary as ad-hoc tooling; this bench uses mode_switch_cycle because
 /// it's the only proven content that reaches PixelPerfect under bench.
 pub const DEFAULT_SCENE_NAME: &str = "mode_switch_12s";
-pub const DEFAULT_TEST_PATTERN_ARGS: &[&str] = &[
-    "--mode-switch-cycle", "12",
-];
+pub const DEFAULT_TEST_PATTERN_ARGS: &[&str] = &["--mode-switch-cycle", "12"];
 pub const DEFAULT_BANDWIDTH_BYTES_PER_SEC: u64 = 1_250_000; // 10 mbps_dsl
 pub const DEFAULT_LOSS_PROBABILITY: f32 = 0.01; // 1% — mild realism

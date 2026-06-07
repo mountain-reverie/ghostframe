@@ -8,8 +8,8 @@
 use std::ffi::CString;
 use std::ptr;
 
-use ffmpeg_next as ffmpeg;
 use ffmpeg::frame;
+use ffmpeg_next as ffmpeg;
 use ffmpeg_sys_next as ffi;
 
 /// Default VA-API render device path.

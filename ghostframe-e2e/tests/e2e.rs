@@ -117,7 +117,10 @@ async fn e2e_quic_ping_pong_over_tailscale() -> Result<()> {
             // backend means there's no visible window anywhere.
             .with_head()
             .env("DISPLAY", _xvfb.display.clone())
-            .env("XDG_RUNTIME_DIR", _xvfb.runtime_dir().to_string_lossy().to_string())
+            .env(
+                "XDG_RUNTIME_DIR",
+                _xvfb.runtime_dir().to_string_lossy().to_string(),
+            )
             // `Vulkan` + `--use-vulkan` selects the system Mesa Vulkan
             // adapter (RADV / amdgpu on this host) for WebGPU. With
             // XWayland's DRI3, Mesa Vulkan presentation works, so Dawn
@@ -193,25 +196,6 @@ struct E2eSetup {
     /// server is killed.
     _xvfb: Option<helpers::WestonGuard>,
     page: chromiumoxide::Page,
-}
-
-async fn setup_e2e(test_pattern_args: &str) -> Result<E2eSetup> {
-    setup_e2e_inner(test_pattern_args, &[], false, false).await
-}
-
-async fn setup_e2e_with_env(
-    test_pattern_args: &str,
-    extra_env: &[(&str, &str)],
-) -> Result<E2eSetup> {
-    setup_e2e_inner(test_pattern_args, extra_env, false, false).await
-}
-
-/// Variant of `setup_e2e` that bind-mounts the host's `/dev/dri` into the
-/// container and runs privileged so `xdaemon`'s DRM capture can use VKMS
-/// (host must have `vkms` module loaded with `enable_writeback=1`). The
-/// container's Xorg switches to the modesetting driver via `XORG_CONF`.
-async fn setup_e2e_gpu(test_pattern_args: &str) -> Result<E2eSetup> {
-    setup_e2e_inner(test_pattern_args, &[], true, false).await
 }
 
 /// Configures Chromium with WebGPU enabled. Uses real GPU passthrough
@@ -516,7 +500,10 @@ async fn e2e_raw_frame_round_trip() -> Result<()> {
             .user_data_dir(&chrome_profile)
             .with_head()
             .env("DISPLAY", _xvfb.display.clone())
-            .env("XDG_RUNTIME_DIR", _xvfb.runtime_dir().to_string_lossy().to_string())
+            .env(
+                "XDG_RUNTIME_DIR",
+                _xvfb.runtime_dir().to_string_lossy().to_string(),
+            )
             // See setup_e2e_inner: real Vulkan via XWayland-provided DRI3.
             .arg(("enable-features", "Vulkan,WebGPU"))
             .arg("use-vulkan")
@@ -673,7 +660,10 @@ async fn e2e_solid_color() -> Result<()> {
     let found = scan.get("found").and_then(|v| v.as_bool()).unwrap_or(false);
     if !found {
         // Diagnostic: sample a few pixels to understand what the canvas contains
-        if let Ok(v) = setup.page.evaluate(r#"
+        if let Ok(v) = setup
+            .page
+            .evaluate(
+                r#"
             (async () => {
                 const pts = [[16,16],[160,240],[320,240],[480,240]];
                 const results = [];
@@ -683,7 +673,10 @@ async fn e2e_solid_color() -> Result<()> {
                 }
                 return results.join(' ');
             })()
-        "#).await {
+        "#,
+            )
+            .await
+        {
             let diag: String = v.into_value().unwrap_or_default();
             println!("pixel diag: {diag}");
         }
@@ -700,15 +693,19 @@ async fn e2e_solid_color() -> Result<()> {
             let log_content: String = v.into_value().unwrap_or_default();
             println!("page log: {log_content}");
         }
-        if let Ok(v) = setup.page.evaluate(
-            "JSON.stringify(window.__ghostframeStats)"
-        ).await {
+        if let Ok(v) = setup
+            .page
+            .evaluate("JSON.stringify(window.__ghostframeStats)")
+            .await
+        {
             let stats: String = v.into_value().unwrap_or_default();
             println!("frame stats: {stats}");
         }
-        if let Ok(v) = setup.page.evaluate(
-            "JSON.stringify({rafTicks: window.__ghostframeRafTicks||0})"
-        ).await {
+        if let Ok(v) = setup
+            .page
+            .evaluate("JSON.stringify({rafTicks: window.__ghostframeRafTicks||0})")
+            .await
+        {
             let counters: String = v.into_value().unwrap_or_default();
             println!("counters: {counters}");
         }
@@ -768,8 +765,10 @@ async fn e2e_h264_ssim_golden() -> Result<()> {
     // the first few key frames to settle.
     tokio::time::sleep(Duration::from_secs(5)).await;
     let captured = helpers::screenshot_canvas(&setup.page).await?;
-    let golden_path =
-        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/e2e/golden/h264_solid_red_t5s.png");
+    let golden_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/e2e/golden/h264_solid_red_t5s.png"
+    );
     helpers::assert_ssim_against_golden(&captured, golden_path, 0.85)
 }
 
@@ -874,8 +873,7 @@ async fn e2e_palrle_5pct_loss() -> Result<()> {
         bx = pair.bg.0,
         by = pair.bg.1,
     );
-    let probe: serde_json::Value =
-        setup.page.evaluate(probe_js.as_str()).await?.into_value()?;
+    let probe: serde_json::Value = setup.page.evaluate(probe_js.as_str()).await?.into_value()?;
     let ink_lum = luminance(&probe["ink"]);
     let bg_lum = luminance(&probe["bg"]);
     assert!(
@@ -940,7 +938,10 @@ async fn e2e_solid_per_tile_pixels() -> Result<()> {
             got,
             s.expected_rgba.to_vec(),
             "corner ({}, {}) mismatch: got {:?}, expected {:?}",
-            s.x, s.y, got, s.expected_rgba
+            s.x,
+            s.y,
+            got,
+            s.expected_rgba
         );
     }
 
@@ -987,7 +988,10 @@ async fn e2e_palrle_exact_pixels() -> Result<()> {
             got,
             sample.expected_rgba.to_vec(),
             "pixel ({}, {}) mismatch: got {:?}, expected {:?}",
-            sample.x, sample.y, got, sample.expected_rgba
+            sample.x,
+            sample.y,
+            got,
+            sample.expected_rgba
         );
     }
 
@@ -1087,11 +1091,12 @@ async fn e2e_palrle_session_reset() -> Result<()> {
             }};
         }})()
         "#,
-        ix = pair.ink.0, iy = pair.ink.1,
-        bx = pair.bg.0,  by = pair.bg.1,
+        ix = pair.ink.0,
+        iy = pair.ink.1,
+        bx = pair.bg.0,
+        by = pair.bg.1,
     );
-    let baseline: serde_json::Value =
-        setup.page.evaluate(probe_js.as_str()).await?.into_value()?;
+    let baseline: serde_json::Value = setup.page.evaluate(probe_js.as_str()).await?.into_value()?;
     let baseline_ink_lum = luminance(&baseline["ink"]);
     let baseline_bg_lum = luminance(&baseline["bg"]);
     assert!(
@@ -1109,8 +1114,7 @@ async fn e2e_palrle_session_reset() -> Result<()> {
     tokio::time::sleep(Duration::from_secs(4)).await;
 
     // Phase 3: assert post-reset legibility.
-    let post: serde_json::Value =
-        setup.page.evaluate(probe_js.as_str()).await?.into_value()?;
+    let post: serde_json::Value = setup.page.evaluate(probe_js.as_str()).await?.into_value()?;
     let post_ink_lum = luminance(&post["ink"]);
     let post_bg_lum = luminance(&post["bg"]);
     assert!(
@@ -1260,7 +1264,8 @@ async fn e2e_edge_tiles() -> Result<()> {
     // ignored by drm_capture — defeats the purpose of the odd-resolution
     // test.
     let setup =
-        setup_e2e_webgpu_with_env("--solid-red", &[("XORG_CONF", "/etc/X11/xorg-odd.conf")]).await?;
+        setup_e2e_webgpu_with_env("--solid-red", &[("XORG_CONF", "/etc/X11/xorg-odd.conf")])
+            .await?;
 
     // Wait for frames
     tokio::time::sleep(Duration::from_secs(6)).await;
@@ -1280,7 +1285,10 @@ async fn e2e_edge_tiles() -> Result<()> {
         })()
     "#;
     let diag: serde_json::Value = setup.page.evaluate(diag_js).await?.into_value()?;
-    eprintln!("e2e_edge_tiles diagnostic: {}", serde_json::to_string_pretty(&diag).unwrap());
+    eprintln!(
+        "e2e_edge_tiles diagnostic: {}",
+        serde_json::to_string_pretty(&diag).unwrap()
+    );
 
     let tiles: serde_json::Value = setup
         .page
@@ -1524,8 +1532,7 @@ async fn e2e_palette_eviction() -> Result<()> {
             return { r: sample[0], g: sample[1], b: sample[2] };
         })()
     "#;
-    let sample: serde_json::Value =
-        setup.page.evaluate(probe_js).await?.into_value()?;
+    let sample: serde_json::Value = setup.page.evaluate(probe_js).await?.into_value()?;
     let r = sample["r"].as_f64().unwrap_or(0.0);
     let g = sample["g"].as_f64().unwrap_or(0.0);
     let b = sample["b"].as_f64().unwrap_or(0.0);
@@ -1759,7 +1766,8 @@ async fn e2e_resolution_change() -> Result<()> {
     // Phase A: 1024×768 — server starts in this mode (first entry in
     // xorg-multi.conf's Modes list).
     let setup =
-        setup_e2e_webgpu_with_env("--solid-red", &[("XORG_CONF", "/etc/X11/xorg-multi.conf")]).await?;
+        setup_e2e_webgpu_with_env("--solid-red", &[("XORG_CONF", "/etc/X11/xorg-multi.conf")])
+            .await?;
 
     // Wait for QUIC slow-start + initial frames.
     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -1993,13 +2001,12 @@ async fn e2e_mode_switch() -> Result<()> {
     // invalidated by the H264 → TileCodec mode-flip handoff producing
     // visible tile bursts during motion phases.
     const MIN_FRAME_COUNT_FOR_H264_PHASE: i64 = 150;
-    let is_h264_active_phase = |(_t, f): &(i64, i64)| -> bool {
-        *f >= MIN_FRAME_COUNT_FOR_H264_PHASE
-    };
+    let is_h264_active_phase =
+        |(_t, f): &(i64, i64)| -> bool { *f >= MIN_FRAME_COUNT_FOR_H264_PHASE };
     let h264_active_phases: Vec<usize> = phases
         .iter()
         .enumerate()
-        .filter(|(_, p)| is_h264_active_phase(*p))
+        .filter(|(_, p)| is_h264_active_phase(p))
         .map(|(i, _)| i)
         .collect();
 
@@ -2021,9 +2028,13 @@ async fn e2e_mode_switch() -> Result<()> {
     // frames that trail into the early-static window. Empirically motion
     // phases produce 400-500 frame datagrams, static phases 0-120.
     let label_phase = |(_t, f): &(i64, i64)| -> &'static str {
-        if *f >= 250 { "F" }
-        else if *f < 200 { "T" }
-        else { "M" }
+        if *f >= 250 {
+            "F"
+        } else if *f < 200 {
+            "T"
+        } else {
+            "M"
+        }
     };
     let phase_labels: Vec<&'static str> = phases.iter().map(label_phase).collect();
     let mut frame_to_tile_flips = 0usize;
@@ -2148,11 +2159,8 @@ async fn e2e_headroom_guard_forces_h264() -> Result<()> {
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Sample for 5s.
-    let (tile_total, frame_total) = sample_mode_dominance(
-        &setup.page,
-        Duration::from_secs(5),
-    )
-    .await?;
+    let (tile_total, frame_total) =
+        sample_mode_dominance(&setup.page, Duration::from_secs(5)).await?;
 
     eprintln!("M3.6b headroom: tile={tile_total} frame={frame_total}");
 
@@ -2192,11 +2200,8 @@ async fn e2e_loss_override_forces_h264() -> Result<()> {
     // time to settle above the override threshold.
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    let (tile_total, frame_total) = sample_mode_dominance(
-        &setup.page,
-        Duration::from_secs(5),
-    )
-    .await?;
+    let (tile_total, frame_total) =
+        sample_mode_dominance(&setup.page, Duration::from_secs(5)).await?;
 
     eprintln!("M3.6b loss: tile={tile_total} frame={frame_total}");
 
@@ -2260,7 +2265,6 @@ async fn e2e_ack_loss() -> Result<()> {
     assert!(found, "canvas blank under 100% ACK drop — recovery broken");
     Ok(())
 }
-
 
 /// M3.2b/B2: HELLO + caps + wire-level indices_raw emission.
 ///
@@ -2456,7 +2460,10 @@ async fn e2e_cdf53_gradient_emission() -> Result<()> {
         .evaluate("window.__ghostframeRecordedCodecs || []")
         .await?
         .into_value()?;
-    let cdf53_count = codec_list.iter().filter(|&&c| c == Codec::Cdf53 as u8).count();
+    let cdf53_count = codec_list
+        .iter()
+        .filter(|&&c| c == Codec::Cdf53 as u8)
+        .count();
     let non_cdf53_tile_count = codec_list
         .iter()
         .filter(|&&c| c != Codec::Cdf53 as u8 && c != Codec::Skip as u8)
@@ -2486,11 +2493,8 @@ async fn e2e_cdf53_gradient_emission() -> Result<()> {
 /// Verify codec mixing with Cdf53 in the set.
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_cdf53_mixed_codecs() -> Result<()> {
-    let setup = setup_e2e_webgpu_gpu_with_env(
-        "--mixed",
-        &[("GHOSTFRAME_ENABLE_CDF53", "1")],
-    )
-    .await?;
+    let setup =
+        setup_e2e_webgpu_gpu_with_env("--mixed", &[("GHOSTFRAME_ENABLE_CDF53", "1")]).await?;
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     let codec_list: Vec<u8> = setup
@@ -2515,7 +2519,6 @@ async fn e2e_cdf53_mixed_codecs() -> Result<()> {
     );
     Ok(())
 }
-
 
 /// M3.3b anchor: with the env flag on and the client now decoding Cdf53,
 /// a `--gradient` pattern reaches lossless reconstruction after the full
@@ -2553,11 +2556,7 @@ async fn e2e_cdf53_lossless_buildup() -> Result<()> {
         return samples;
     })()
     "#;
-    let samples: Vec<serde_json::Value> = setup
-        .page
-        .evaluate(probe_js)
-        .await?
-        .into_value()?;
+    let samples: Vec<serde_json::Value> = setup.page.evaluate(probe_js).await?.into_value()?;
 
     let mut mismatches = Vec::new();
     for s in &samples {
@@ -2611,12 +2610,19 @@ async fn e2e_cdf53_bypass_integrate() -> Result<()> {
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Load the fixture's expected_coefficients (3072 i16) and pixels_bgra.
-    let fixture: serde_json::Value =
-        serde_json::from_slice(helpers::fixtures::CDF53_FIXTURE_JSON)?;
+    let fixture: serde_json::Value = serde_json::from_slice(helpers::fixtures::CDF53_FIXTURE_JSON)?;
     let coeffs: Vec<i32> = fixture["expected_coefficients"]
-        .as_array().unwrap().iter().map(|v| v.as_i64().unwrap() as i32).collect();
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_i64().unwrap() as i32)
+        .collect();
     let pixels_bgra: Vec<u8> = fixture["pixels_bgra"]
-        .as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u8).collect();
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u8)
+        .collect();
     assert_eq!(coeffs.len(), 3072);
     assert_eq!(pixels_bgra.len(), 4096);
 
@@ -2644,27 +2650,30 @@ async fn e2e_cdf53_bypass_integrate() -> Result<()> {
     // Compare per-pixel BGR (skip alpha). got_rgba is r,g,b,a; pixels_bgra is b,g,r,a.
     let mut mismatches = Vec::new();
     for i in 0..(32 * 32) {
-        let exp_b = pixels_bgra[i * 4 + 0] as i32;
+        let exp_b = pixels_bgra[i * 4] as i32;
         let exp_g = pixels_bgra[i * 4 + 1] as i32;
         let exp_r = pixels_bgra[i * 4 + 2] as i32;
-        let got_r = got_rgba[i * 4 + 0] as i32;
+        let got_r = got_rgba[i * 4] as i32;
         let got_g = got_rgba[i * 4 + 1] as i32;
         let got_b = got_rgba[i * 4 + 2] as i32;
         let dr = (got_r - exp_r).abs();
         let dg = (got_g - exp_g).abs();
         let db = (got_b - exp_b).abs();
-        if dr > 1 || dg > 1 || db > 1 {
-            if mismatches.len() < 20 {
-                let x = i % 32;
-                let y = i / 32;
-                mismatches.push(format!(
+        if (dr > 1 || dg > 1 || db > 1) && mismatches.len() < 20 {
+            let x = i % 32;
+            let y = i / 32;
+            mismatches.push(format!(
                     "px ({x},{y}): exp BGR ({exp_b},{exp_g},{exp_r}) got ({got_b},{got_g},{got_r}) Δ ({db},{dg},{dr})"
                 ));
-            }
         }
     }
-    eprintln!("BYPASS-INTEGRATE MISMATCHES ({} shown of total):", mismatches.len());
-    for m in &mismatches { eprintln!("  {m}"); }
+    eprintln!(
+        "BYPASS-INTEGRATE MISMATCHES ({} shown of total):",
+        mismatches.len()
+    );
+    for m in &mismatches {
+        eprintln!("  {m}");
+    }
     assert!(
         mismatches.is_empty(),
         "GPU inverse output differs from fixture — bug is in the inverse shaders, not integrate"
@@ -2682,21 +2691,35 @@ async fn e2e_cdf53_integrate_correctness() -> Result<()> {
     let setup = setup_e2e_webgpu_gpu("--gradient --drm-direct").await?;
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    let fixture: serde_json::Value =
-        serde_json::from_slice(helpers::fixtures::CDF53_FIXTURE_JSON)?;
+    let fixture: serde_json::Value = serde_json::from_slice(helpers::fixtures::CDF53_FIXTURE_JSON)?;
     let encoded_passes: Vec<Vec<u8>> = fixture["encoded_passes"]
-        .as_array().unwrap().iter().map(|p| {
-            p.as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u8).collect()
-        }).collect();
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            p.as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as u8)
+                .collect()
+        })
+        .collect();
     let expected_coeffs: Vec<i32> = fixture["expected_coefficients"]
-        .as_array().unwrap().iter().map(|v| v.as_i64().unwrap() as i32).collect();
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_i64().unwrap() as i32)
+        .collect();
     assert_eq!(encoded_passes.len(), 14);
     assert_eq!(expected_coeffs.len(), 3072);
 
     // Drive the hook with all 14 passes (each as a number[]).
-    let passes_js = serde_json::to_string(&encoded_passes
-        .iter().map(|p| p.iter().map(|b| *b as u64).collect::<Vec<_>>())
-        .collect::<Vec<_>>())?;
+    let passes_js = serde_json::to_string(
+        &encoded_passes
+            .iter()
+            .map(|p| p.iter().map(|b| *b as u64).collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+    )?;
     let js = format!(
         r#"
         (async () => {{
@@ -2707,10 +2730,18 @@ async fn e2e_cdf53_integrate_correctness() -> Result<()> {
         "#
     );
     let result: serde_json::Value = setup.page.evaluate(js.as_str()).await?.into_value()?;
-    let coef_u32: Vec<u32> = result["coefficients"].as_array().unwrap()
-        .iter().map(|v| v.as_u64().unwrap() as u32).collect();
-    let sign_u32: Vec<u32> = result["signs"].as_array().unwrap()
-        .iter().map(|v| v.as_u64().unwrap() as u32).collect();
+    let coef_u32: Vec<u32> = result["coefficients"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect();
+    let sign_u32: Vec<u32> = result["signs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect();
     assert_eq!(coef_u32.len(), 1536);
     assert_eq!(sign_u32.len(), 96);
 
@@ -2739,17 +2770,24 @@ async fn e2e_cdf53_integrate_correctness() -> Result<()> {
     // Compare against fixture.expected_coefficients (which are also i32 cast from i16).
     let mut mismatches = Vec::new();
     for i in 0..3072 {
-        if got_coeffs[i] != expected_coeffs[i] {
-            if mismatches.len() < 30 {
-                mismatches.push(format!(
-                    "coeff[{}] (ch={}, idx={}): expected {}, got {}",
-                    i, i / 1024, i % 1024, expected_coeffs[i], got_coeffs[i]
-                ));
-            }
+        if got_coeffs[i] != expected_coeffs[i] && mismatches.len() < 30 {
+            mismatches.push(format!(
+                "coeff[{}] (ch={}, idx={}): expected {}, got {}",
+                i,
+                i / 1024,
+                i % 1024,
+                expected_coeffs[i],
+                got_coeffs[i]
+            ));
         }
     }
-    eprintln!("INTEGRATE MISMATCHES: {} total, first 30 shown:", mismatches.len());
-    for m in &mismatches { eprintln!("  {m}"); }
+    eprintln!(
+        "INTEGRATE MISMATCHES: {} total, first 30 shown:",
+        mismatches.len()
+    );
+    for m in &mismatches {
+        eprintln!("  {m}");
+    }
     assert!(
         mismatches.is_empty(),
         "GPU integrate output diverges from fixture.expected_coefficients (see eprintln above)"
@@ -2778,10 +2816,18 @@ async fn e2e_cdf53_live_tile_state_col18() -> Result<()> {
         let js = format!("(async () => await window.__cdf53DumpTileState({tile_idx}))()");
         let state: serde_json::Value = setup.page.evaluate(js.as_str()).await?.into_value()?;
         let gpu_tile_gen = state["tileGen"].as_u64().unwrap() as u32;
-        let coef_u32: Vec<u32> = state["coefficients"].as_array().unwrap()
-            .iter().map(|v| v.as_u64().unwrap() as u32).collect();
-        let sign_u32: Vec<u32> = state["signs"].as_array().unwrap()
-            .iter().map(|v| v.as_u64().unwrap() as u32).collect();
+        let coef_u32: Vec<u32> = state["coefficients"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u32)
+            .collect();
+        let sign_u32: Vec<u32> = state["signs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u32)
+            .collect();
         let mut input_bgra = vec![0u8; 32 * 32 * 4];
         for local_y in 0..32u32 {
             for local_x in 0..32u32 {
@@ -2810,7 +2856,9 @@ async fn e2e_cdf53_live_tile_state_col18() -> Result<()> {
                 got_coeffs.push(if sign_bit != 0 { -mag } else { mag });
             }
         }
-        let n_mismatch = (0..3072).filter(|&i| got_coeffs[i] != expected_coeffs[i] as i32).count();
+        let n_mismatch = (0..3072)
+            .filter(|&i| got_coeffs[i] != expected_coeffs[i] as i32)
+            .count();
         eprintln!(
             "tile (18, {tile_y}) idx={tile_idx} tileGen={gpu_tile_gen} mismatches={n_mismatch}/3072"
         );
@@ -2833,7 +2881,10 @@ async fn e2e_cdf53_live_tile_state_col18() -> Result<()> {
                     };
                     eprintln!(
                         "  ch={} {band}[{}] gpu={} cpu={} diff={}",
-                        ch, idx, got_coeffs[i], expected_coeffs[i] as i32,
+                        ch,
+                        idx,
+                        got_coeffs[i],
+                        expected_coeffs[i] as i32,
                         got_coeffs[i] - expected_coeffs[i] as i32
                     );
                 }
@@ -2867,10 +2918,18 @@ async fn e2e_cdf53_live_tile_state() -> Result<()> {
     let js = format!("(async () => await window.__cdf53DumpTileState({tile_idx}))()");
     let state: serde_json::Value = setup.page.evaluate(js.as_str()).await?.into_value()?;
     let gpu_tile_gen = state["tileGen"].as_u64().unwrap() as u32;
-    let coef_u32: Vec<u32> = state["coefficients"].as_array().unwrap()
-        .iter().map(|v| v.as_u64().unwrap() as u32).collect();
-    let sign_u32: Vec<u32> = state["signs"].as_array().unwrap()
-        .iter().map(|v| v.as_u64().unwrap() as u32).collect();
+    let coef_u32: Vec<u32> = state["coefficients"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect();
+    let sign_u32: Vec<u32> = state["signs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect();
 
     // Reconstruct the tile's input pixels from the gradient formula.
     // For each pixel (x, y) within the 32×32 tile at (tile_x*32, tile_y*32):
@@ -2882,7 +2941,7 @@ async fn e2e_cdf53_live_tile_state() -> Result<()> {
             let px = tile_x * 32 + local_x;
             let py = tile_y * 32 + local_y;
             let off = (local_y * 32 + local_x) as usize * 4;
-            input_bgra[off + 0] = (px.wrapping_mul(3) & 0xFF) as u8;
+            input_bgra[off] = (px.wrapping_mul(3) & 0xFF) as u8;
             input_bgra[off + 1] = (py.wrapping_mul(3) & 0xFF) as u8;
             input_bgra[off + 2] = (px.wrapping_add(py).wrapping_mul(2) & 0xFF) as u8;
             input_bgra[off + 3] = 0xFF;
@@ -2914,28 +2973,38 @@ async fn e2e_cdf53_live_tile_state() -> Result<()> {
 
     let mut mismatches = Vec::new();
     for i in 0..3072 {
-        if got_coeffs[i] != expected_coeffs[i] as i32 {
-            if mismatches.len() < 30 {
-                mismatches.push(format!(
-                    "coeff[{i}] (ch={} idx={}): expected {}, got {}, diff {}",
-                    i / 1024, i % 1024,
-                    expected_coeffs[i] as i32, got_coeffs[i],
-                    got_coeffs[i] - expected_coeffs[i] as i32,
-                ));
-            }
+        if got_coeffs[i] != expected_coeffs[i] as i32 && mismatches.len() < 30 {
+            mismatches.push(format!(
+                "coeff[{i}] (ch={} idx={}): expected {}, got {}, diff {}",
+                i / 1024,
+                i % 1024,
+                expected_coeffs[i] as i32,
+                got_coeffs[i],
+                got_coeffs[i] - expected_coeffs[i] as i32,
+            ));
         }
     }
     eprintln!("MISMATCHES: {} of 3072 (first 30 shown):", mismatches.len());
-    for m in &mismatches { eprintln!("  {m}"); }
+    for m in &mismatches {
+        eprintln!("  {m}");
+    }
 
     if mismatches.is_empty() {
         eprintln!("INTEGRATE LIVE: this tile's coefficients match Rust forward — bug is in inverse OR rendering path");
     } else {
-        let n_bit_errors: usize = mismatches.iter().filter(|m| m.contains(" diff ") && {
-            // crude check: difference is a small power of 2 → likely single-bit miss
-            true
-        }).count();
-        eprintln!("INTEGRATE LIVE: {} coefficients differ from CPU reference", mismatches.len());
+        let n_bit_errors: usize = mismatches
+            .iter()
+            .filter(|m| {
+                m.contains(" diff ") && {
+                    // crude check: difference is a small power of 2 → likely single-bit miss
+                    true
+                }
+            })
+            .count();
+        eprintln!(
+            "INTEGRATE LIVE: {} coefficients differ from CPU reference",
+            mismatches.len()
+        );
         let _ = n_bit_errors;
     }
     // Dump server-side cdf53.emit lines for tile (18, 5).
@@ -2948,11 +3017,24 @@ async fn e2e_cdf53_live_tile_state() -> Result<()> {
     let mut gens_observed: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
         std::collections::BTreeMap::new();
     for l in &target_tile_lines {
-        let gen = l.split("gen=").nth(1).and_then(|s| s.split_whitespace().next()).unwrap_or("?").to_string();
-        let pass = l.split("pass_idx=").nth(1).and_then(|s| s.split_whitespace().next()).unwrap_or("?").to_string();
+        let gen = l
+            .split("gen=")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .unwrap_or("?")
+            .to_string();
+        let pass = l
+            .split("pass_idx=")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .unwrap_or("?")
+            .to_string();
         gens_observed.entry(gen).or_default().insert(pass);
     }
-    eprintln!("SERVER emissions for tile (18,5): {} lines total", target_tile_lines.len());
+    eprintln!(
+        "SERVER emissions for tile (18,5): {} lines total",
+        target_tile_lines.len()
+    );
     for (gen, passes) in &gens_observed {
         eprintln!("  gen={} → {} passes: {:?}", gen, passes.len(), passes);
     }
@@ -3008,7 +3090,9 @@ async fn e2e_cdf53_tile_watcher() -> Result<()> {
         .await?
         .into_value()?;
     let mut hist = std::collections::BTreeMap::new();
-    for c in &codecs { *hist.entry(*c).or_insert(0u32) += 1; }
+    for c in &codecs {
+        *hist.entry(*c).or_insert(0u32) += 1;
+    }
     eprintln!("WIRE CODEC HISTOGRAM (last N tiles recorded): {:?}", hist);
 
     // What codecs arrived for tile (18,5) specifically? FIFO holds last
@@ -3134,7 +3218,11 @@ async fn e2e_cdf53_tile_watcher() -> Result<()> {
         let cap_tile_y = c["tileY"].as_u64().unwrap() as u32;
         let bp_offset = c["bitPlanesOffset"].as_u64().unwrap() as u32;
         let bp: Vec<u8> = c["bitPlanes"]
-            .as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u8).collect();
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u8)
+            .collect();
         if bp.len() != 384 {
             panic!("capture has wrong bit-plane size {}", bp.len());
         }
@@ -3222,7 +3310,7 @@ async fn e2e_cdf53_inverse_gradient_tile() -> Result<()> {
             let px = tile_x * 32 + local_x;
             let py = tile_y * 32 + local_y;
             let off = (local_y * 32 + local_x) as usize * 4;
-            input_bgra[off]     = (px.wrapping_mul(3) & 0xFF) as u8;
+            input_bgra[off] = (px.wrapping_mul(3) & 0xFF) as u8;
             input_bgra[off + 1] = (py.wrapping_mul(3) & 0xFF) as u8;
             input_bgra[off + 2] = (px.wrapping_add(py).wrapping_mul(2) & 0xFF) as u8;
             input_bgra[off + 3] = 0xFF;
@@ -3232,9 +3320,7 @@ async fn e2e_cdf53_inverse_gradient_tile() -> Result<()> {
     assert_eq!(coeffs.len(), 3072);
 
     // Drive the inverse hook and read back the canvas tile.
-    let coeffs_json = serde_json::to_string(
-        &coeffs.iter().map(|&v| v as i32).collect::<Vec<_>>(),
-    )?;
+    let coeffs_json = serde_json::to_string(&coeffs.iter().map(|&v| v as i32).collect::<Vec<_>>())?;
     // Drive the inverse for the ACTUAL tile (18, 5) slot — not tile 0.
     // tile_idx = tile_y * cols. cols depends on the live framebuffer width.
     let js = format!(
@@ -3259,27 +3345,30 @@ async fn e2e_cdf53_inverse_gradient_tile() -> Result<()> {
     // Compare. got_rgba is RGBA. input_bgra is BGRA.
     let mut mismatches = Vec::new();
     for i in 0..(32 * 32) {
-        let exp_b = input_bgra[i * 4]     as i32;
+        let exp_b = input_bgra[i * 4] as i32;
         let exp_g = input_bgra[i * 4 + 1] as i32;
         let exp_r = input_bgra[i * 4 + 2] as i32;
-        let got_r = got_rgba[i * 4]     as i32;
+        let got_r = got_rgba[i * 4] as i32;
         let got_g = got_rgba[i * 4 + 1] as i32;
         let got_b = got_rgba[i * 4 + 2] as i32;
         let dr = (got_r - exp_r).abs();
         let dg = (got_g - exp_g).abs();
         let db = (got_b - exp_b).abs();
-        if dr > 1 || dg > 1 || db > 1 {
-            if mismatches.len() < 20 {
-                let lx = i % 32;
-                let ly = i / 32;
-                mismatches.push(format!(
+        if (dr > 1 || dg > 1 || db > 1) && mismatches.len() < 20 {
+            let lx = i % 32;
+            let ly = i / 32;
+            mismatches.push(format!(
                     "local ({lx},{ly}): exp BGR=({exp_b},{exp_g},{exp_r}) got=({got_b},{got_g},{got_r}) Δ=({db},{dg},{dr})"
                 ));
-            }
         }
     }
-    eprintln!("INVERSE-GRADIENT MISMATCHES (shown of {} total):", mismatches.len());
-    for m in &mismatches { eprintln!("  {m}"); }
+    eprintln!(
+        "INVERSE-GRADIENT MISMATCHES (shown of {} total):",
+        mismatches.len()
+    );
+    for m in &mismatches {
+        eprintln!("  {m}");
+    }
     assert!(
         mismatches.is_empty(),
         "inverse-on-gradient-coefficients diverges from gradient pixels (see eprintln above)"
@@ -3315,20 +3404,13 @@ async fn e2e_cdf53_server_gpu_vs_cpu_diff() -> Result<()> {
     } else if verify_l2_only {
         env.push(("GHOSTFRAME_CDF53_SKIP_L3", "1"));
     }
-    let _setup = setup_e2e_webgpu_gpu_with_env(
-        "--gradient --drm-direct",
-        &env,
-    )
-    .await?;
+    let _setup = setup_e2e_webgpu_gpu_with_env("--gradient --drm-direct", &env).await?;
     // 5s is plenty: gradient is static and the server emits cdf53 once per
     // gen-bump; the one-shot diff log fires on the next cdf53 batch.
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     let logs = helpers::read_server_logs_stripped("ghostframe-server");
-    let diff_lines: Vec<&str> = logs
-        .lines()
-        .filter(|l| l.contains("cdf53.diff"))
-        .collect();
+    let diff_lines: Vec<&str> = logs.lines().filter(|l| l.contains("cdf53.diff")).collect();
     eprintln!("SERVER cdf53.diff lines: {} total", diff_lines.len());
     for l in &diff_lines {
         eprintln!("  {l}");
@@ -3379,10 +3461,7 @@ async fn e2e_cdf53_server_gpu_vs_cpu_diff() -> Result<()> {
 async fn e2e_progressive_refinement() -> Result<()> {
     let setup = setup_e2e_webgpu_gpu_with_env(
         "--mode-switch-cycle 12",
-        &[
-            ("GHOSTFRAME_ENABLE_CDF53", "1"),
-            ("CAPTURE_FPS", "30"),
-        ],
+        &[("GHOSTFRAME_ENABLE_CDF53", "1"), ("CAPTURE_FPS", "30")],
     )
     .await?;
 
@@ -3548,16 +3627,20 @@ async fn e2e_refinement_cancel() -> Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    eprintln!("BEFORE flip: {} (tile,gen) entries with pending refinement",
-              snap_before.len());
+    eprintln!(
+        "BEFORE flip: {} (tile,gen) entries with pending refinement",
+        snap_before.len()
+    );
 
     // Wait > 1 full cycle so motion-phase bump_generation is guaranteed in
     // between the two samples (cycle = 6s; 7s buffer).
     tokio::time::sleep(Duration::from_secs(7)).await;
     let logs_after = helpers::read_server_logs_stripped("ghostframe-server");
     let snap_after = parse_last_pending_snapshot(&logs_after);
-    eprintln!("AFTER flip: {} (tile,gen) entries with pending refinement",
-              snap_after.len());
+    eprintln!(
+        "AFTER flip: {} (tile,gen) entries with pending refinement",
+        snap_after.len()
+    );
 
     // For every (tile, gen) that had pending passes BEFORE the flip:
     //   assert that same (tile, gen) is NOT in snap_after.
@@ -3565,16 +3648,19 @@ async fn e2e_refinement_cancel() -> Result<()> {
     let mut cancelled = 0usize;
     let mut leaked = Vec::new();
     for entry in &snap_before {
-        let same_gen_after = snap_after.iter().find(|e| {
-            e.0 == entry.0 && e.1 == entry.1 && e.2 == entry.2
-        });
+        let same_gen_after = snap_after
+            .iter()
+            .find(|e| e.0 == entry.0 && e.1 == entry.1 && e.2 == entry.2);
         if let Some(_still_pending) = same_gen_after {
             leaked.push(*entry);
         } else {
             cancelled += 1;
         }
     }
-    eprintln!("Cancelled (tile, gen) pairs: {cancelled}; leaked: {:?}", leaked);
+    eprintln!(
+        "Cancelled (tile, gen) pairs: {cancelled}; leaked: {:?}",
+        leaked
+    );
 
     assert!(
         !snap_before.is_empty(),
@@ -3593,26 +3679,33 @@ async fn e2e_refinement_cancel() -> Result<()> {
 /// (tile_x, tile_y, gen, passes_remaining) tuples. Returns empty Vec if
 /// no such line is present in the log slice.
 fn parse_last_pending_snapshot(logs: &str) -> Vec<(u8, u8, u8, u8)> {
-    let line = logs
-        .lines()
-        .filter(|l| l.contains("cdf53.pending_snapshot"))
-        .last();
+    let line = logs.lines().rfind(|l| l.contains("cdf53.pending_snapshot"));
     let Some(line) = line else { return Vec::new() };
     // Format: "... cdf53.pending_snapshot [(tx, ty, g, n), (tx, ty, g, n), ...]"
-    let open = match line.find('[') { Some(i) => i, None => return Vec::new() };
-    let close = match line.rfind(']') { Some(i) => i, None => return Vec::new() };
+    let open = match line.find('[') {
+        Some(i) => i,
+        None => return Vec::new(),
+    };
+    let close = match line.rfind(']') {
+        Some(i) => i,
+        None => return Vec::new(),
+    };
     let body = &line[open + 1..close];
     let mut out = Vec::new();
     for tup in body.split("),") {
         let cleaned = tup.trim().trim_matches(|c| c == '(' || c == ')');
         let parts: Vec<&str> = cleaned.split(',').map(|s| s.trim()).collect();
-        if parts.len() != 4 { continue }
+        if parts.len() != 4 {
+            continue;
+        }
         let (Ok(tx), Ok(ty), Ok(g), Ok(n)) = (
             parts[0].parse::<u8>(),
             parts[1].parse::<u8>(),
             parts[2].parse::<u8>(),
             parts[3].parse::<u8>(),
-        ) else { continue };
+        ) else {
+            continue;
+        };
         out.push((tx, ty, g, n));
     }
     out
@@ -3633,8 +3726,14 @@ async fn e2e_ack_telemetry_no_waste() -> Result<()> {
 
     let logs = helpers::read_server_logs_stripped("ghostframe-server");
 
-    let ack_batches = logs.lines().filter(|l| l.contains("ack_batch_received")).count();
-    let pixelperfect = logs.lines().filter(|l| l.contains("cdf53.pixelperfect")).count();
+    let ack_batches = logs
+        .lines()
+        .filter(|l| l.contains("ack_batch_received"))
+        .count();
+    let pixelperfect = logs
+        .lines()
+        .filter(|l| l.contains("cdf53.pixelperfect"))
+        .count();
     let ack_miss = logs.lines().filter(|l| l.contains("ack_miss")).count();
 
     eprintln!("ack_batch_received: {ack_batches}");

@@ -20,10 +20,7 @@ pub const IDLE_THRESHOLD: u32 = 30;
 
 /// Returns up to `k_max` tile indices (`y * cols + x`) eligible for
 /// idle-escalation, in row-major order. See module docs for eligibility.
-pub fn detect_escalation_candidates(
-    metrics: &MetricsTracker,
-    k_max: usize,
-) -> Vec<u32> {
+pub fn detect_escalation_candidates(metrics: &MetricsTracker, k_max: usize) -> Vec<u32> {
     let mut out = Vec::new();
     for (idx, m) in metrics.metrics().iter().enumerate() {
         if out.len() >= k_max {
@@ -87,7 +84,10 @@ mod tests {
         let mut t = make_tracker(2, 2);
         let m = t.get_mut(0, 0);
         m.idle_frames = 100;
-        m.codec_state = CodecState::Cdf53 { passes_sent: 0, max_passes: 14 };
+        m.codec_state = CodecState::Cdf53 {
+            passes_sent: 0,
+            max_passes: 14,
+        };
         assert!(detect_escalation_candidates(&t, 100).is_empty());
     }
 
@@ -111,8 +111,10 @@ mod tests {
         let solid = t.get_mut(1, 0);
         solid.idle_frames = 100;
         solid.codec_state = CodecState::Solid;
-        assert!(detect_escalation_candidates(&t, 100).is_empty(),
-            "PalRle and Solid are lossless within feasibility — must NOT escalate");
+        assert!(
+            detect_escalation_candidates(&t, 100).is_empty(),
+            "PalRle and Solid are lossless within feasibility — must NOT escalate"
+        );
     }
 
     #[test]

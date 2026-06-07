@@ -142,7 +142,7 @@ impl PaletteTable {
     /// - `delivered[id] == true` (client has rendered using these bytes)
     /// - `in_flight_carrying[id] == 0` AND `delivered[id] == false`
     ///   (bytes never reached the wire)
-    /// Combined with the always-required `ref_count == 0` precondition.
+    ///   Combined with the always-required `ref_count == 0` precondition.
     pub fn overwrite_eligible(&self, id: u8) -> bool {
         if self.ref_count[id as usize] != 0 {
             return false;
@@ -153,7 +153,9 @@ impl PaletteTable {
     /// Replace the slot's bytes and reset the per-slot tracking state.
     /// Caller must have verified `overwrite_eligible` (debug assert here).
     pub fn write_bytes(&mut self, id: u8, palette: &PaletteEntry) {
-        debug_assert!(self.overwrite_eligible(id) || self.slot_state[id as usize] == SlotState::Empty);
+        debug_assert!(
+            self.overwrite_eligible(id) || self.slot_state[id as usize] == SlotState::Empty
+        );
         self.entries[id as usize] = Some(*palette);
         self.slot_state[id as usize] = SlotState::Held;
         self.ref_count[id as usize] = 0;
@@ -178,14 +180,13 @@ impl PaletteTable {
     /// become eligible later when their in-flight ACK arrives.
     pub fn find_eligible_free_slot(&self) -> Option<u8> {
         // We walk in age order without mutating self — find first hit.
-        for &id in &self.free_lru {
-            if self.slot_state[id as usize] == SlotState::FreeButCached
-                && self.overwrite_eligible(id)
-            {
-                return Some(id);
-            }
-        }
-        None
+        self.free_lru
+            .iter()
+            .find(|&&id| {
+                self.slot_state[id as usize] == SlotState::FreeButCached
+                    && self.overwrite_eligible(id)
+            })
+            .copied()
     }
 
     /// Per-design D3 single-client invariant: on new connection accept,
@@ -308,10 +309,7 @@ pub fn encode_pal_rle_payload(
 /// This is the "thin equivalent" of the bundled/thin paths but skips the
 /// nibble-RLE encoding step entirely. The client must support `indices_raw`
 /// (advertised via HELLO bit 0) for the server to emit this variant.
-pub fn encode_pal_rle_payload_indices_raw(
-    packed_indices: &[u8; 512],
-    palette_id: u8,
-) -> Vec<u8> {
+pub fn encode_pal_rle_payload_indices_raw(packed_indices: &[u8; 512], palette_id: u8) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::with_capacity(514);
     out.push(0x02); // flags: bit 1 = indices_raw, bit 0 = not bundled
     out.push(palette_id);
@@ -359,8 +357,10 @@ pub fn decode_pal_rle(
             return Err(PalRleDecodeError::PaletteCountOutOfRange(count));
         }
         needed(count as usize * 4, cursor)?;
-        let mut p = PaletteEntry::default();
-        p.count = count;
+        let mut p = PaletteEntry {
+            count,
+            ..Default::default()
+        };
         for i in 0..count as usize {
             p.colors[i].copy_from_slice(&payload[cursor..cursor + 4]);
             cursor += 4;
@@ -421,7 +421,11 @@ pub fn decode_pal_rle(
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum PalRleDecodeError {
     #[error("payload too short: needed {needed} bytes at offset {offset}, got {got}")]
-    Truncated { needed: usize, offset: usize, got: usize },
+    Truncated {
+        needed: usize,
+        offset: usize,
+        got: usize,
+    },
 
     #[error("thin payload references uncached palette id {0}")]
     UncachedPalette(u8),

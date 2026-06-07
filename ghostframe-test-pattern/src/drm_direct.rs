@@ -153,7 +153,7 @@ pub(crate) fn setup_dumb_scanout(
             Err(_) => continue,
         };
         let possible = res.filter_crtcs(enc_info.possible_crtcs());
-        for c in possible {
+        if let Some(c) = possible.into_iter().next() {
             chosen_crtc = Some(c);
             break 'outer;
         }

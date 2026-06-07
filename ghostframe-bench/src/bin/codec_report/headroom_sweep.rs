@@ -13,10 +13,22 @@ pub struct HeadroomPoint {
 }
 
 pub const HEADROOM_VALUES_BPUS: &[HeadroomPoint] = &[
-    HeadroomPoint { label: "headroom_0.10", value_bpus: 0.10 },
-    HeadroomPoint { label: "headroom_0.25", value_bpus: 0.25 }, // current default
-    HeadroomPoint { label: "headroom_0.50", value_bpus: 0.50 },
-    HeadroomPoint { label: "headroom_1.00", value_bpus: 1.00 },
+    HeadroomPoint {
+        label: "headroom_0.10",
+        value_bpus: 0.10,
+    },
+    HeadroomPoint {
+        label: "headroom_0.25",
+        value_bpus: 0.25,
+    }, // current default
+    HeadroomPoint {
+        label: "headroom_0.50",
+        value_bpus: 0.50,
+    },
+    HeadroomPoint {
+        label: "headroom_1.00",
+        value_bpus: 1.00,
+    },
 ];
 
 pub struct HeadroomShapingPoint {
@@ -27,10 +39,27 @@ pub struct HeadroomShapingPoint {
 }
 
 pub const HEADROOM_SHAPING_POINTS: &[HeadroomShapingPoint] = &[
-    HeadroomShapingPoint { label: "1mbps", bandwidth_kbps: 1_000, delay_ms: 100, loss_pct: 5 },
-    HeadroomShapingPoint { label: "2mbps", bandwidth_kbps: 2_000, delay_ms:  80, loss_pct: 3 },
-    HeadroomShapingPoint { label: "5mbps", bandwidth_kbps: 5_000, delay_ms:  40, loss_pct: 1 },
+    HeadroomShapingPoint {
+        label: "1mbps",
+        bandwidth_kbps: 1_000,
+        delay_ms: 100,
+        loss_pct: 5,
+    },
+    HeadroomShapingPoint {
+        label: "2mbps",
+        bandwidth_kbps: 2_000,
+        delay_ms: 80,
+        loss_pct: 3,
+    },
+    HeadroomShapingPoint {
+        label: "5mbps",
+        bandwidth_kbps: 5_000,
+        delay_ms: 40,
+        loss_pct: 1,
+    },
 ];
 
+// Kept symmetric with the loss_axis and bias_sweep modules even when not directly referenced.
+#[allow(dead_code)]
 pub const DEFAULT_SCENE_NAME: &str = "mode_switch_12s";
 pub const DEFAULT_TEST_PATTERN_ARGS: &[&str] = &["--mode-switch-cycle", "12"];

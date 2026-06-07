@@ -82,7 +82,9 @@ impl Default for TileMetrics {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodecState {
     Skip,
-    H264 { frames_in_h264: u32 },
+    H264 {
+        frames_in_h264: u32,
+    },
     /// PalRLE-classified tile.
     ///
     /// `palette_id` semantics depend on lifecycle position (design D8):
@@ -96,9 +98,14 @@ pub enum CodecState {
     /// The boundary is clear in code: Phase A is the only thing that
     /// overwrites this field. Other code paths that read `CodecState::PalRle`
     /// outside the Phase-A boundary should treat `palette_id` as the real id.
-    PalRle { palette_id: u8 },
+    PalRle {
+        palette_id: u8,
+    },
     Solid,
-    Cdf53 { passes_sent: u8, max_passes: u8 },
+    Cdf53 {
+        passes_sent: u8,
+        max_passes: u8,
+    },
     PixelPerfect,
 }
 

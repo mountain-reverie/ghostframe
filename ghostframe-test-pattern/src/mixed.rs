@@ -176,9 +176,9 @@ fn paint_gradient<C: Connection>(
         while bx < r.w {
             let cx = bx / block;
             let cy = by / block;
-            let red = ((cx * 3) & 0xFF) as u32;
-            let grn = ((cy * 3) & 0xFF) as u32;
-            let blu = (((cx + cy) * 2) & 0xFF) as u32;
+            let red = (cx * 3) & 0xFF;
+            let grn = (cy * 3) & 0xFF;
+            let blu = ((cx + cy) * 2) & 0xFF;
             let pixel = (red << 16) | (grn << 8) | blu;
             conn.change_gc(gc, &ChangeGCAux::new().foreground(pixel))?;
             conn.poly_fill_rectangle(

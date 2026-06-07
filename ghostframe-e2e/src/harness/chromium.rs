@@ -35,9 +35,7 @@ pub fn assert_ssim_against_golden(
         if let Some(parent) = std::path::Path::new(golden_path).parent() {
             std::fs::create_dir_all(parent).context("create golden parent dir")?;
         }
-        captured
-            .save(golden_path)
-            .context("write blessed golden")?;
+        captured.save(golden_path).context("write blessed golden")?;
         eprintln!("BLESSED golden: {}", golden_path);
         return Ok(());
     }
@@ -52,8 +50,8 @@ pub fn assert_ssim_against_golden(
             golden_path,
         ));
     }
-    let score = image_compare::rgba_hybrid_compare(captured, &golden)
-        .context("ssim compare failed")?;
+    let score =
+        image_compare::rgba_hybrid_compare(captured, &golden).context("ssim compare failed")?;
     if score.score < threshold {
         return Err(anyhow!(
             "SSIM {:.4} < threshold {:.4} against {}",

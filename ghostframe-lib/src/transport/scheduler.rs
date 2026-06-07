@@ -199,7 +199,11 @@ impl Scheduler {
         self.generations[idx] = new_gen;
         // Any queued work for this tile is now stale; mark Superseded so the
         // next tick drops it. Acked entries don't matter (already done).
-        for work in self.priority_queue.iter_mut().chain(self.refinement_queue.iter_mut()) {
+        for work in self
+            .priority_queue
+            .iter_mut()
+            .chain(self.refinement_queue.iter_mut())
+        {
             if work.tile_x == tile_x
                 && work.tile_y == tile_y
                 && !matches!(work.state, WorkState::Superseded | WorkState::Acked)
@@ -209,7 +213,8 @@ impl Scheduler {
         }
         // Drop any per-(tile, gen) ACK counters for the old gen — they're
         // no longer relevant once the gen advances.
-        self.cdf53_passes_acked.retain(|&(tx, ty, _g), _| !(tx == tile_x && ty == tile_y));
+        self.cdf53_passes_acked
+            .retain(|&(tx, ty, _g), _| !(tx == tile_x && ty == tile_y));
         new_gen
     }
 
@@ -232,7 +237,8 @@ impl Scheduler {
     /// fraction. This replaces the increment that used to live inside
     /// `on_ack` before its M3.3d deletion.
     pub fn record_cdf53_ack(&mut self, tile_x: u8, tile_y: u8, generation: u8) {
-        let counter = self.cdf53_passes_acked
+        let counter = self
+            .cdf53_passes_acked
             .entry((tile_x, tile_y, generation))
             .or_insert(0);
         *counter = counter.saturating_add(1);
@@ -286,7 +292,7 @@ impl Scheduler {
     pub fn tile_fully_acked(&self, tile_x: u8, tile_y: u8, generation: u8, max_passes: u8) -> bool {
         self.cdf53_passes_acked
             .get(&(tile_x, tile_y, generation))
-            .map_or(false, |&c| c >= max_passes)
+            .is_some_and(|&c| c >= max_passes)
     }
 
     /// Non-test diagnostic accessor: returns the current ACK counter for
@@ -317,7 +323,9 @@ impl Scheduler {
         // Source 1: Pending/InFlight entries still in the refinement queue.
         for w in self.refinement_queue.iter() {
             if matches!(w.state, WorkState::Pending | WorkState::InFlight) {
-                let c = counts.entry((w.tile_x, w.tile_y, w.generation)).or_insert(0);
+                let c = counts
+                    .entry((w.tile_x, w.tile_y, w.generation))
+                    .or_insert(0);
                 *c = c.saturating_add(1);
             }
         }
@@ -346,11 +354,17 @@ impl Scheduler {
     /// `Superseded` or `Acked` state. If that guard ever changes, this
     /// function's safety needs re-verification.
     #[must_use = "ResolvedTileWork is needed by IoBridge to update palette delivery state on supersession"]
-    pub fn bump_generation_collecting(&mut self, tile_x: u8, tile_y: u8)
-        -> (u8, Vec<ResolvedTileWork>)
-    {
+    pub fn bump_generation_collecting(
+        &mut self,
+        tile_x: u8,
+        tile_y: u8,
+    ) -> (u8, Vec<ResolvedTileWork>) {
         let mut resolved: Vec<ResolvedTileWork> = Vec::new();
-        for entry in self.priority_queue.iter_mut().chain(self.refinement_queue.iter_mut()) {
+        for entry in self
+            .priority_queue
+            .iter_mut()
+            .chain(self.refinement_queue.iter_mut())
+        {
             if entry.tile_x == tile_x
                 && entry.tile_y == tile_y
                 && entry.state != WorkState::Acked
@@ -379,8 +393,10 @@ impl Scheduler {
             }
         }
         let new_gen = self.bump_generation(tile_x, tile_y);
-        self.priority_queue.retain(|w| w.state != WorkState::Superseded);
-        self.refinement_queue.retain(|w| w.state != WorkState::Superseded);
+        self.priority_queue
+            .retain(|w| w.state != WorkState::Superseded);
+        self.refinement_queue
+            .retain(|w| w.state != WorkState::Superseded);
         (new_gen, resolved)
     }
 
@@ -413,9 +429,15 @@ impl Scheduler {
         let mut emitted = Vec::new();
         let rtt = self.rtt;
         Self::drain_priority_queue(&mut self.priority_queue, priority_budget, rtt, &mut emitted);
-        Self::drain_refinement_pass_major(&mut self.refinement_queue, refinement_budget, &mut emitted);
+        Self::drain_refinement_pass_major(
+            &mut self.refinement_queue,
+            refinement_budget,
+            &mut emitted,
+        );
 
-        self.delivery_window_emitted = self.delivery_window_emitted.saturating_add(emitted.len() as u32);
+        self.delivery_window_emitted = self
+            .delivery_window_emitted
+            .saturating_add(emitted.len() as u32);
         self.maybe_adjust_refinement_fraction();
 
         emitted
@@ -471,11 +493,7 @@ impl Scheduler {
         queue.retain(|w| !matches!(w.state, WorkState::Superseded | WorkState::Acked));
 
         let mut spent = 0usize;
-        loop {
-            let min_pass = match queue.iter().map(|w| w.pass_idx).min() {
-                Some(p) => p,
-                None => break,
-            };
+        while let Some(min_pass) = queue.iter().map(|w| w.pass_idx).min() {
             let mut still_at_this_pass = false;
             let mut idx = 0;
             while idx < queue.len() {
@@ -494,7 +512,9 @@ impl Scheduler {
                     idx += 1;
                 }
             }
-            if !still_at_this_pass { break; }
+            if !still_at_this_pass {
+                break;
+            }
         }
     }
 
@@ -546,13 +566,7 @@ impl Scheduler {
 
     /// Enqueue all passes for a refinement tile. Each pass becomes one
     /// TileWork with pass_idx 0..passes.len()-1 and total_passes = passes.len().
-    pub fn enqueue_refinement(
-        &mut self,
-        tile_x: u8,
-        tile_y: u8,
-        gen: u8,
-        passes: Vec<Vec<u8>>,
-    ) {
+    pub fn enqueue_refinement(&mut self, tile_x: u8, tile_y: u8, gen: u8, passes: Vec<Vec<u8>>) {
         let total = passes.len() as u8;
         for (pass_idx, payload) in passes.into_iter().enumerate() {
             self.refinement_queue.push_back(TileWork {
@@ -810,8 +824,11 @@ mod tests {
         use crate::transport::protocol::Codec;
         let mut s = Scheduler::new(2, 2);
         s.enqueue(TileWork {
-            tile_x: 1, tile_y: 0,
-            generation: 0, pass_idx: 0, total_passes: 1,
+            tile_x: 1,
+            tile_y: 0,
+            generation: 0,
+            pass_idx: 0,
+            total_passes: 1,
             codec: Codec::PalRle,
             payload: vec![0x01u8, 9, 0, 0, 0, 0],
             queued_at: std::time::Instant::now(),
@@ -843,17 +860,27 @@ mod tests {
         let mut emitted: Vec<(u8, u8, u8)> = Vec::new();
         for _ in 0..8 {
             let mut got = sch.tick(3);
-            assert!(!got.is_empty(), "tick should emit work while queue is non-empty");
+            assert!(
+                !got.is_empty(),
+                "tick should emit work while queue is non-empty"
+            );
             for w in got.drain(..) {
                 emitted.push((w.tile_x, w.tile_y, w.pass_idx));
             }
         }
-        assert_eq!(emitted, vec![
-            (0,0,0), (1,0,0),
-            (0,0,1), (1,0,1),
-            (0,0,2), (1,0,2),
-            (0,0,3), (1,0,3),
-        ]);
+        assert_eq!(
+            emitted,
+            vec![
+                (0, 0, 0),
+                (1, 0, 0),
+                (0, 0, 1),
+                (1, 0, 1),
+                (0, 0, 2),
+                (1, 0, 2),
+                (0, 0, 3),
+                (1, 0, 3),
+            ]
+        );
     }
 
     #[test]
@@ -874,8 +901,11 @@ mod tests {
         for _ in 0..10 {
             let _ = sch.tick(250);
         }
-        assert!((sch.current_refinement_fraction() - 0.1).abs() < 1e-6,
-            "expected 0.1 after one halving; got {}", sch.current_refinement_fraction());
+        assert!(
+            (sch.current_refinement_fraction() - 0.1).abs() < 1e-6,
+            "expected 0.1 after one halving; got {}",
+            sch.current_refinement_fraction()
+        );
     }
 
     #[test]
@@ -885,8 +915,11 @@ mod tests {
             sch.enqueue_refinement(i, 0, 0, vec![vec![0u8; 100]; 14]);
         }
         let emitted = sch.tick(1000);
-        assert!(emitted.len() >= 10,
-            "expected ≥10 refinement passes when priority empty; got {}", emitted.len());
+        assert!(
+            emitted.len() >= 10,
+            "expected ≥10 refinement passes when priority empty; got {}",
+            emitted.len()
+        );
     }
 
     #[test]
@@ -895,11 +928,15 @@ mod tests {
         sch.enqueue_refinement(3, 4, 0, vec![vec![0u8; 50]; 14]);
         assert_eq!(sch.refinement_queue.len(), 14);
         let _new_gen = sch.bump_generation(3, 4);
-        let superseded_count = sch.refinement_queue.iter()
+        let superseded_count = sch
+            .refinement_queue
+            .iter()
             .filter(|w| w.state == WorkState::Superseded)
             .count();
-        assert_eq!(superseded_count, 14,
-            "expected all 14 refinement passes for the tile to be Superseded after bump_generation");
+        assert_eq!(
+            superseded_count, 14,
+            "expected all 14 refinement passes for the tile to be Superseded after bump_generation"
+        );
     }
 
     #[test]
@@ -936,7 +973,10 @@ mod tests {
         }
         assert!(s.tile_fully_acked(0, 0, 1, 14));
         let _ = s.bump_generation(0, 0);
-        assert!(!s.tile_fully_acked(0, 0, 1, 14), "old gen counter should be dropped");
+        assert!(
+            !s.tile_fully_acked(0, 0, 1, 14),
+            "old gen counter should be dropped"
+        );
         assert!(!s.tile_fully_acked(0, 0, 2, 14), "new gen has no acks yet");
     }
 
@@ -1064,8 +1104,11 @@ mod tests {
         // Both tiles count once each → deficit = 2.
         for pass_idx in [0u8, 1u8] {
             s.refinement_queue.push_back(TileWork {
-                tile_x: 0, tile_y: 0, generation: 0,
-                pass_idx, total_passes: 14,
+                tile_x: 0,
+                tile_y: 0,
+                generation: 0,
+                pass_idx,
+                total_passes: 14,
                 codec: Codec::Cdf53,
                 payload: Vec::new(),
                 queued_at: std::time::Instant::now(),
@@ -1074,8 +1117,11 @@ mod tests {
             });
         }
         s.refinement_queue.push_back(TileWork {
-            tile_x: 1, tile_y: 2, generation: 0,
-            pass_idx: 0, total_passes: 14,
+            tile_x: 1,
+            tile_y: 2,
+            generation: 0,
+            pass_idx: 0,
+            total_passes: 14,
             codec: Codec::Cdf53,
             payload: Vec::new(),
             queued_at: std::time::Instant::now(),
@@ -1118,14 +1164,16 @@ mod tests {
         // With a coverage source (simulating 5 outstanding Cdf53 entries for
         // tile (2,3) gen 1, passes 0..5), the snapshot picks them up.
         let coverage: Vec<crate::transport::fragment_coverage::FragmentCoverage> = (0..5)
-            .map(|pass_idx| crate::transport::fragment_coverage::FragmentCoverage {
-                tile_x: 2,
-                tile_y: 3,
-                generation: 1,
-                pass_idx,
-                codec: crate::transport::protocol::Codec::Cdf53,
-                palette_id: None,
-            })
+            .map(
+                |pass_idx| crate::transport::fragment_coverage::FragmentCoverage {
+                    tile_x: 2,
+                    tile_y: 3,
+                    generation: 1,
+                    pass_idx,
+                    codec: crate::transport::protocol::Codec::Cdf53,
+                    palette_id: None,
+                },
+            )
             .collect();
         let snap = s.pending_refinement_snapshot(&coverage);
         let our: Vec<_> = snap.iter().filter(|e| e.0 == 2 && e.1 == 3).collect();

@@ -11,16 +11,18 @@ pub fn read_server_logs_stripped(container_name: &str) -> String {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
-    raw.chars().fold((String::new(), false), |(mut acc, in_esc), c| {
-        if in_esc {
-            (acc, c != 'm')
-        } else if c == '\x1b' {
-            (acc, true)
-        } else {
-            acc.push(c);
-            (acc, false)
-        }
-    }).0
+    raw.chars()
+        .fold((String::new(), false), |(mut acc, in_esc), c| {
+            if in_esc {
+                (acc, c != 'm')
+            } else if c == '\x1b' {
+                (acc, true)
+            } else {
+                acc.push(c);
+                (acc, false)
+            }
+        })
+        .0
 }
 
 /// Pre-test hygiene: remove stale `/tmp/.X11-unix/X<N>` socket files and
@@ -53,10 +55,12 @@ pub fn cleanup_stale_xvfb_sockets() {
             }
             match UnixStream::connect(&socket) {
                 Ok(_) => continue, // live X server bound; keep
-                Err(e) if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
-                ) => {
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                    ) =>
+                {
                     let _ = std::fs::remove_file(&socket);
                     let _ = std::fs::remove_file(&lock);
                     removed += 1;
@@ -72,10 +76,16 @@ pub fn cleanup_stale_xvfb_sockets() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             let pid_str = if let Some(rest) = name.strip_prefix("ghostframe-weston-") {
-                rest.split('-').next().or(Some(rest.trim_end_matches(".log")))
-            } else { None };
+                rest.split('-')
+                    .next()
+                    .or(Some(rest.trim_end_matches(".log")))
+            } else {
+                None
+            };
             let Some(pid_str) = pid_str else { continue };
-            let Ok(pid) = pid_str.parse::<u32>() else { continue };
+            let Ok(pid) = pid_str.parse::<u32>() else {
+                continue;
+            };
             if Path::new(&format!("/proc/{pid}")).exists() {
                 continue;
             }

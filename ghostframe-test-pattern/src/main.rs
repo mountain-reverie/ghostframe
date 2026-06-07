@@ -139,10 +139,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     drift_ms,
                 );
             }
-            return ghostframe_test_pattern::tile_pattern::run(
-                &args.drm_device,
-                class_name,
-            );
+            return ghostframe_test_pattern::tile_pattern::run(&args.drm_device, class_name);
         }
     }
 

@@ -75,8 +75,7 @@ pub fn spawn_weston_headless() -> Result<WestonGuard> {
     // compositor or earlier test runs that leaked sockets.
     let socket_name = format!("ghostframe-wl-{pid}");
     let log_path = std::env::temp_dir().join(format!("ghostframe-weston-{pid}.log"));
-    let log_file = std::fs::File::create(&log_path)
-        .context("creating weston log file")?;
+    let log_file = std::fs::File::create(&log_path).context("creating weston log file")?;
     let log_stderr = log_file.try_clone().context("cloning weston log fd")?;
 
     // The headless backend renders offscreen but still drives Mesa GBM,

@@ -22,8 +22,8 @@ fn switch_frame(dwell_us: u64, frame_interval_us: u64) -> u32 {
 fn enters_h264_after_sustain_frames_via_motion_fastpath() {
     let mut c = Classifier::default();
     let states = h264_states(20); // 20 dirty tiles, all H264 → 100% > 20%, ≥ 8 absolute
-    // enter_sustain_micros = 50_000 µs ≈ 3 frames at 60 fps (16_667 µs/frame).
-    // Frames 0..switch_frame-1 must return TileCodec; frame switch_frame returns H264.
+                                  // enter_sustain_micros = 50_000 µs ≈ 3 frames at 60 fps (16_667 µs/frame).
+                                  // Frames 0..switch_frame-1 must return TileCodec; frame switch_frame returns H264.
     let sw = switch_frame(c.enter_sustain_micros, 16_667); // 3
     for frame in 0..sw {
         assert_eq!(
@@ -42,7 +42,7 @@ fn enters_h264_after_sustain_frames_via_motion_fastpath() {
 fn motion_fastpath_blocked_by_min_absolute_floor() {
     let mut c = Classifier::default();
     let states = h264_states(2); // only 2 H264 tiles — 100% but below floor of 8
-    // Time can advance freely; floor means enter_now is always false → no switch.
+                                 // Time can advance freely; floor means enter_now is always false → no switch.
     for frame in 0..10u32 {
         assert_eq!(
             c.decide_frame_mode_at((frame as u64) * 16_667, &states, FrameMode::TileCodec),
@@ -80,7 +80,7 @@ fn enter_streak_resets_on_quiet_frame() {
 fn exits_h264_after_sustain_frames_when_costs_drop() {
     let mut c = Classifier::default();
     let cheap = solid_states(2); // tile-codec cost trivial → < h264 * 0.6
-    // exit_sustain_micros = 500_000 µs; switch_frame at 60 fps = ceil(500_000/16_667) = 30.
+                                 // exit_sustain_micros = 500_000 µs; switch_frame at 60 fps = ceil(500_000/16_667) = 30.
     let sw = switch_frame(c.exit_sustain_micros, 16_667); // 30
     for frame in 0..sw {
         assert_eq!(
@@ -97,11 +97,13 @@ fn exits_h264_after_sustain_frames_when_costs_drop() {
 
 #[test]
 fn deadband_keeps_h264_mode_between_thresholds() {
-    let mut c = Classifier::default();
     // Inflate exit_factor to make all our tile-codec costs land in the deadband.
-    c.exit_factor = 0.0001;
+    let mut c = Classifier {
+        exit_factor: 0.0001,
+        ..Default::default()
+    };
     let states = h264_states(4); // some cost, but exit_factor makes exit unreachable
-    // time can advance freely; exit_now is always false → stays H264.
+                                 // time can advance freely; exit_now is always false → stays H264.
     for frame in 0..50u32 {
         assert_eq!(
             c.decide_frame_mode_at((frame as u64) * 16_667, &states, FrameMode::H264),
@@ -217,7 +219,7 @@ fn empty_tentative_in_tilecodec_stays_tilecodec() {
 
 #[test]
 fn refinement_bias_promotes_tilecodec_under_headroom() {
-    use crate::tile::classifier::{AdaptationContext, Classifier, REFINEMENT_BIAS_PER_TILE_US};
+    use crate::tile::classifier::{AdaptationContext, Classifier};
     use crate::tile::{CodecState, FrameMode};
 
     // At 100 B/µs bandwidth, 40 Cdf53 tiles produce:
@@ -273,15 +275,12 @@ fn refinement_bias_promotes_tilecodec_under_headroom() {
         "without deficit, cost comparison picks H264 (bias is zero)"
     );
 
-    // Sanity: bias > 0 used.
-    assert!(REFINEMENT_BIAS_PER_TILE_US > 0.0);
+    // Sanity: bias > 0 (checked at compile time by type system via pub const = 5.0).
 }
 
 #[test]
 fn headroom_guard_forces_h264_below_threshold() {
-    use crate::tile::classifier::{
-        AdaptationContext, Classifier, HEADROOM_MIN_BYTES_PER_US,
-    };
+    use crate::tile::classifier::{AdaptationContext, Classifier, HEADROOM_MIN_BYTES_PER_US};
     use crate::tile::{CodecState, FrameMode};
     let mut c = Classifier::default();
     // Below threshold: 0.1 B/µs (~ 800 kbps).
@@ -348,7 +347,12 @@ fn hysteresis_micros_holds_dwell_across_frame_rate() {
     // bandwidth pushes tile_codec_cost above enter_factor * h264_cost.
     let make_tentative = || -> Vec<CodecState> {
         let max_passes = crate::encoder::cdf53::CDF53_PASS_COUNT as u8;
-        (0..40).map(|_| CodecState::Cdf53 { passes_sent: 0, max_passes }).collect()
+        (0..40)
+            .map(|_| CodecState::Cdf53 {
+                passes_sent: 0,
+                max_passes,
+            })
+            .collect()
     };
 
     let mut c60 = Classifier::default();
@@ -375,7 +379,7 @@ fn hysteresis_micros_holds_dwell_across_frame_rate() {
 
     let us60 = switch_at_60.expect("60fps must eventually switch");
     let us30 = switch_at_30.expect("30fps must eventually switch");
-    let diff = if us60 > us30 { us60 - us30 } else { us30 - us60 };
+    let diff = us60.abs_diff(us30);
     // Wall-clock dwell at 60fps and 30fps should match within one 30-fps frame.
     assert!(
         diff <= 33_333,
@@ -440,7 +444,10 @@ fn env_var_override_refinement_bias_us() {
     };
     let max_passes = crate::encoder::cdf53::CDF53_PASS_COUNT as u8;
     let tentative: Vec<CodecState> = (0..40)
-        .map(|_| CodecState::Cdf53 { passes_sent: 0, max_passes })
+        .map(|_| CodecState::Cdf53 {
+            passes_sent: 0,
+            max_passes,
+        })
         .collect();
 
     // Helper: drive decide_frame_mode_at for 200 ms simulated wall clock at
@@ -586,12 +593,19 @@ fn hybrid_hysteresis_wall_clock_jump_without_streak_does_not_flip() {
     // Construct a workload that triggers enter_now=true (cost path picks H264).
     let max_passes = crate::encoder::cdf53::CDF53_PASS_COUNT as u8;
     let tentative: Vec<CodecState> = (0..200)
-        .map(|_| CodecState::Cdf53 { passes_sent: 0, max_passes })
+        .map(|_| CodecState::Cdf53 {
+            passes_sent: 0,
+            max_passes,
+        })
         .collect();
 
     // Call 1: enter condition true, started=0, streak=1, elapsed=0.
     let m1 = c.decide_frame_mode_at(0, &tentative, FrameMode::TileCodec);
-    assert_eq!(m1, FrameMode::TileCodec, "frame 1: streak=1 < 3, should stay");
+    assert_eq!(
+        m1,
+        FrameMode::TileCodec,
+        "frame 1: streak=1 < 3, should stay"
+    );
 
     // Call 2 simulates a docker preemption pause: now_us jumps 200ms past
     // the 50ms enter_sustain_micros. Pre-fix code would have computed

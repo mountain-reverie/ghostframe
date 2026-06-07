@@ -120,7 +120,10 @@ impl BenchEncoder for PalRleEncoder {
             indices[byte] |= (idx & 0x0F) << shift;
         }
 
-        let id = self.palette_table.acquire_or_allocate(&palette).unwrap_or(0);
+        let id = self
+            .palette_table
+            .acquire_or_allocate(&palette)
+            .unwrap_or(0);
         let bundled = !self.palette_table.delivered.contains(id);
         encode_pal_rle_payload(&indices, &palette, id, bundled)
     }
@@ -162,10 +165,12 @@ impl BenchEncoder for Cdf53Encoder {
         let passes: Vec<Vec<u8>> = cdf53::encode_passes(&coeffs);
         // Concatenate with a 2-byte LE length prefix per pass so the
         // round-trip proptest in Task 15 can split them back.
-        let mut out: Vec<u8> =
-            Vec::with_capacity(passes.iter().map(|p| 2 + p.len()).sum());
+        let mut out: Vec<u8> = Vec::with_capacity(passes.iter().map(|p| 2 + p.len()).sum());
         for p in &passes {
-            assert!(p.len() <= u16::MAX as usize, "pass too large for u16 prefix");
+            assert!(
+                p.len() <= u16::MAX as usize,
+                "pass too large for u16 prefix"
+            );
             out.extend_from_slice(&(p.len() as u16).to_le_bytes());
             out.extend_from_slice(p);
         }
@@ -310,11 +315,9 @@ fn run_codecs(c: &mut Criterion) {
             for class in ContentClass::ALL {
                 let tile = class.tile();
                 assert_eq!(tile.len(), TILE_BYTES);
-                group.bench_with_input(
-                    BenchmarkId::from_parameter(class.name()),
-                    &tile,
-                    |b, t| b.iter(|| black_box(per_pass.encode(t))),
-                );
+                group.bench_with_input(BenchmarkId::from_parameter(class.name()), &tile, |b, t| {
+                    b.iter(|| black_box(per_pass.encode(t)))
+                });
             }
             group.finish();
 
