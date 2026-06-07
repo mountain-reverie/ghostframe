@@ -59,16 +59,12 @@ async fn chromium_codec_probe() -> Result<()> {
 </body></html>
 "##;
 
-    let (mut browser, mut handler) = Browser::launch(
-        BrowserConfig::builder()
-            .chrome_executable("/usr/bin/chromium")
-            .arg("--no-sandbox")
-            .arg("--headless=new")
-            .arg("--disable-gpu")
-            .build()
-            .unwrap(),
-    )
-    .await?;
+    let mut builder = BrowserConfig::builder()
+        .chrome_executable("/usr/bin/chromium")
+        .no_sandbox()
+        .arg("disable-gpu");
+    builder = builder.new_headless_mode();
+    let (mut browser, mut handler) = Browser::launch(builder.build().unwrap()).await?;
 
     let handle = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
