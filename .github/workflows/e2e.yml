@@ -52,6 +52,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: ./.github/workflows/_setup-system-deps
+        with:
+          e2e-runtime: 'true'
 
       - uses: actions/setup-go@v5
         with:

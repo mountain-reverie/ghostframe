@@ -1,12 +1,21 @@
 name: Setup ghostframe system dependencies
 description: >
   Installs the apt packages required to build ghostframe on a runner
-  (clang, ffmpeg dev libs, x264, X11/DRM dev headers) plus the runtime
-  packages the e2e harness needs on the host itself (weston compositor,
-  XWayland, mesa GL/Vulkan drivers for weston's GL renderer). Reused by
-  e2e.yml and nightly.yml so the package list lives in one place.
-  Production runtime libs for the test-server live inside its Docker
-  image and are not installed here.
+  (clang, ffmpeg dev libs, x264, X11/DRM dev headers). When the
+  `e2e-runtime` input is `true`, also installs the runtime packages
+  the e2e harness needs on the host itself (weston compositor,
+  XWayland, mesa GL DRI driver for weston's GL renderer, mesa Vulkan
+  ICDs for the Chromium SwiftShader fallback). The Vulkan ICDs are
+  deliberately NOT installed for non-e2e jobs, because llvmpipe is
+  not a faithful substitute for the real GPU in the gpu_pipeline lib
+  tests — those tests rely on adapter-construction failure to
+  self-skip, and a software ICD silently flips that skip off.
+
+inputs:
+  e2e-runtime:
+    description: Install the e2e harness runtime packages (weston, mesa, vulkan ICDs).
+    required: false
+    default: 'false'
 
 runs:
   using: composite
@@ -15,7 +24,7 @@ runs:
       shell: bash
       run: sudo apt-get update -qq
 
-    - name: install build + e2e-harness runtime deps
+    - name: install build deps
       shell: bash
       run: |
         sudo apt-get install -y --no-install-recommends \
@@ -32,7 +41,13 @@ runs:
           libx11-dev \
           libxext-dev \
           libxdamage-dev \
-          libdrm-dev \
+          libdrm-dev
+
+    - name: install e2e-harness runtime deps
+      if: ${{ inputs.e2e-runtime == 'true' }}
+      shell: bash
+      run: |
+        sudo apt-get install -y --no-install-recommends \
           weston \
           xwayland \
           libgl1-mesa-dri \
