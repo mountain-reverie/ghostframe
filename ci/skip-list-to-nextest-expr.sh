@@ -15,7 +15,11 @@
 
 set -euo pipefail
 
-SKIP_FILE="${1:-ci/skip-list.txt}"
+# Default to the skip list next to this script so the helper works regardless
+# of the caller's cwd (the workflow always calls it from repo root, but
+# resolving relative to the script keeps that invariant explicit).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SKIP_FILE="${1:-${SCRIPT_DIR}/skip-list.txt}"
 
 if [[ ! -r "$SKIP_FILE" ]]; then
     echo "error: cannot read $SKIP_FILE" >&2
