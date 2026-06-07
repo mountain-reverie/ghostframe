@@ -47,10 +47,9 @@ pub enum Codec {
     Skip = 0,
     H264 = 1,
     PalRle = 2,
-    // 3 reserved (formerly Bc1; removed after M3.5b bench DROP verdict).
-    Solid = 4,
-    Raw = 5,
-    Cdf53 = 6,
+    Solid = 3,
+    Raw = 4,
+    Cdf53 = 5,
 }
 
 impl Codec {
@@ -59,10 +58,9 @@ impl Codec {
             0 => Ok(Codec::Skip),
             1 => Ok(Codec::H264),
             2 => Ok(Codec::PalRle),
-            // 3 reserved (formerly Bc1); falls to UnknownCodec.
-            4 => Ok(Codec::Solid),
-            5 => Ok(Codec::Raw),
-            6 => Ok(Codec::Cdf53),
+            3 => Ok(Codec::Solid),
+            4 => Ok(Codec::Raw),
+            5 => Ok(Codec::Cdf53),
             other => Err(ProtocolError::UnknownCodec(other)),
         }
     }
@@ -618,7 +616,7 @@ mod tests {
 
     #[test]
     fn tile_header_codec_lz4_packing() {
-        // Raw=5, lz4=true → packed byte = (5 << 1) | 1 = 11
+        // Raw=4, lz4=true → packed byte = (4 << 1) | 1 = 9
         let th = TileHeader {
             tile_x: 0,
             tile_y: 0,
@@ -630,7 +628,7 @@ mod tests {
         };
         let mut buf = Vec::new();
         th.encode(&mut buf);
-        assert_eq!(buf[2], 11u8);
+        assert_eq!(buf[2], 9u8);
 
         let decoded = TileHeader::decode(&buf).unwrap();
         assert_eq!(decoded.codec, Codec::Raw);

@@ -1,4 +1,5 @@
 use ghostframe_e2e::harness as helpers;
+use ghostframe_lib::transport::protocol::Codec;
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -901,15 +902,16 @@ async fn e2e_solid_per_tile_pixels() -> Result<()> {
     // doesn't fall back to whole-frame H.264.
     tokio::time::sleep(Duration::from_secs(5)).await;
 
-    // Sanity: Codec::Solid (wire enum = 4) must appear on the wire.
+    // Sanity: Codec::Solid (wire enum = 3) must appear on the wire.
     let codecs: Vec<u8> = setup
         .page
         .evaluate("window.__ghostframeRecordedCodecs || []")
         .await?
         .into_value()?;
     assert!(
-        codecs.contains(&4u8),
-        "expected Codec::Solid (4) on the wire; saw codecs: {:?}",
+        codecs.contains(&(Codec::Solid as u8)),
+        "expected Codec::Solid ({}) on the wire; saw codecs: {:?}",
+        Codec::Solid as u8,
         codecs
     );
 
@@ -2436,7 +2438,7 @@ async fn e2e_webgpu_fallback_swiftshader() -> Result<()> {
 }
 
 /// M3.3a: high-color content (`--gradient` test pattern) — server emits
-/// `Codec::Cdf53 (6)` on the wire (CDF53 is now baseline-mandatory).
+/// `Codec::Cdf53 (5)` on the wire (CDF53 is now baseline-mandatory).
 /// Client side: M3.3a client cannot yet decode Cdf53; datagrams arrive and
 /// are dropped silently but recorded in `__ghostframeRecordedCodecs`.
 #[tokio::test(flavor = "multi_thread")]
@@ -2454,14 +2456,15 @@ async fn e2e_cdf53_gradient_emission() -> Result<()> {
         .evaluate("window.__ghostframeRecordedCodecs || []")
         .await?
         .into_value()?;
-    let cdf53_count = codec_list.iter().filter(|&&c| c == 6).count();
+    let cdf53_count = codec_list.iter().filter(|&&c| c == Codec::Cdf53 as u8).count();
     let non_cdf53_tile_count = codec_list
         .iter()
-        .filter(|&&c| c != 6 && c != 0 /* Skip not counted */)
+        .filter(|&&c| c != Codec::Cdf53 as u8 && c != Codec::Skip as u8)
         .count();
     assert!(
         cdf53_count > 0,
-        "expected Codec::Cdf53 (6) on wire; saw codecs: {codec_list:?}"
+        "expected Codec::Cdf53 ({}) on wire; saw codecs: {codec_list:?}",
+        Codec::Cdf53 as u8
     );
     assert!(
         cdf53_count > non_cdf53_tile_count * 5,
@@ -2496,16 +2499,19 @@ async fn e2e_cdf53_mixed_codecs() -> Result<()> {
         .await?
         .into_value()?;
     assert!(
-        codec_list.contains(&4u8),
-        "expected Codec::Solid (4) for solid region; saw: {codec_list:?}"
+        codec_list.contains(&(Codec::Solid as u8)),
+        "expected Codec::Solid ({}) for solid region; saw: {codec_list:?}",
+        Codec::Solid as u8
     );
     assert!(
-        codec_list.contains(&2u8),
-        "expected Codec::PalRle (2) for text region; saw: {codec_list:?}"
+        codec_list.contains(&(Codec::PalRle as u8)),
+        "expected Codec::PalRle ({}) for text region; saw: {codec_list:?}",
+        Codec::PalRle as u8
     );
     assert!(
-        codec_list.contains(&6u8),
-        "expected Codec::Cdf53 (6) for gradient region; saw: {codec_list:?}"
+        codec_list.contains(&(Codec::Cdf53 as u8)),
+        "expected Codec::Cdf53 ({}) for gradient region; saw: {codec_list:?}",
+        Codec::Cdf53 as u8
     );
     Ok(())
 }
@@ -2993,7 +2999,7 @@ async fn e2e_cdf53_tile_watcher() -> Result<()> {
     );
     eprintln!("SAMPLE TILES seen: {}", stats["sampleTiles"]);
 
-    // Cross-check: what codecs ARRIVED on the wire? If Codec::Cdf53 (6) is
+    // Cross-check: what codecs ARRIVED on the wire? If Codec::Cdf53 (5) is
     // absent here, the server didn't emit cdf53 at all in this run — so
     // zero uploadBatch entries is downstream of "server didn't send".
     let codecs: Vec<u8> = setup

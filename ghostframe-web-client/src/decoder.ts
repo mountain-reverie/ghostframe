@@ -13,9 +13,8 @@ export const TILE_SIZE = 32;
 export const FRAME_DIMENSIONS_SENTINEL_X = 0xFF;
 export const FRAME_DIMENSIONS_SENTINEL_Y = 0xFF;
 
-// Wire byte 3 reserved (formerly Bc1; removed after M3.5b bench DROP verdict).
 export const enum Codec {
-  Skip = 0, H264 = 1, PalRle = 2, Solid = 4, Raw = 5, Cdf53 = 6,
+  Skip = 0, H264 = 1, PalRle = 2, Solid = 3, Raw = 4, Cdf53 = 5,
 }
 
 export interface DatagramHeader {

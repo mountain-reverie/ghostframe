@@ -13,7 +13,7 @@ test-unit:
 web-client-build:
     cd ghostframe-web-client && npm install && npm run build
 
-test-e2e: web-client-build
+test-e2e: web-client-build containers-build
     cargo test --test e2e
 
 containers-build:
