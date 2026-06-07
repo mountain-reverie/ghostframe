@@ -1,0 +1,121 @@
+name: nightly
+
+on:
+  schedule:
+    - cron: '0 3 * * *'  # 03:00 UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write  # to open/comment on the nightly-failure issue
+
+jobs:
+  e2e-sweep:
+    name: e2e-sweep
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    outputs:
+      conclusion: ${{ steps.run-tests.outcome }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/workflows/_setup-system-deps
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build web client
+        working-directory: ghostframe-web-client
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build host-side release binaries
+        run: |
+          cargo build --release \
+            -p ghostframe-xdaemon \
+            -p ghostframe-test-pattern
+
+      - name: Build test-headscale image
+        run: |
+          docker build \
+            -t ghostframe/test-headscale:latest \
+            tests/containers/headscale/
+
+      - name: Build test-server image
+        run: |
+          docker build \
+            -t ghostframe/test-server:latest \
+            -f tests/containers/test-server/Dockerfile \
+            .
+
+      - name: Run e2e sweep with nextest retries
+        id: run-tests
+        run: |
+          expr="$(./ci/skip-list-to-nextest-expr.sh)"
+          echo "Filter expression: $expr"
+          cargo nextest run \
+            --test e2e \
+            --no-fail-fast \
+            --retries 2 \
+            --test-threads 1 \
+            -E "$expr"
+
+      - name: Upload nextest report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-nextest-report
+          path: target/nextest/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  report-failure:
+    name: report-failure
+    needs: e2e-sweep
+    if: failure() || needs.e2e-sweep.outputs.conclusion == 'failure'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Open or comment on nightly-failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="Nightly e2e sweep failed"
+          # Find an existing open issue with the same title.
+          existing="$(gh issue list \
+            --label nightly-failure \
+            --state open \
+            --search "$title in:title" \
+            --json number \
+            --jq '.[0].number // empty')"
+          body="Nightly run failed.
+
+          Run: $RUN_URL
+          Commit: ${{ github.sha }}
+          Triggered by: ${{ github.event_name }}"
+          if [[ -n "$existing" ]]; then
+            echo "Commenting on existing issue #$existing"
+            gh issue comment "$existing" --body "$body"
+          else
+            echo "Opening new issue"
+            gh issue create \
+              --title "$title" \
+              --label nightly-failure \
+              --body "$body"
+          fi
