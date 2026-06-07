@@ -2,19 +2,26 @@
 //! and queries its codec support via the MediaCapabilities and WebCodecs
 //! APIs. Prints results to stderr.
 //!
+//! Runs the probe TWICE so the CI log captures both modes:
+//!   1. headless=new (the simpler `--headless=new` Ozone backend)
+//!   2. weston + xwayland + Vulkan (matches what the harness's
+//!      `setup_e2e_webgpu*` configurations actually use — non-headless,
+//!      with an X display backed by Weston + XWayland and Vulkan/WebGPU
+//!      enabled). This is the configuration where the failing H.264 tests
+//!      actually run, so this is the one whose WebCodecs answer matters.
+//!
 //! Intentionally NOT `#[ignore]`'d: the e2e workflow runs this as its own
-//! cargo invocation before the main e2e suite so the CI log records
-//! what codecs the runner's Chromium actually supports. Run locally with:
-//!     cargo test --test chromium_probe -- --nocapture
+//! cargo invocation before the main e2e suite so the CI log records what
+//! codecs the runner's Chromium actually supports in each mode. Run
+//! locally with: `cargo test --test chromium_probe -- --nocapture`.
 
 use anyhow::Result;
 use chromiumoxide::{Browser, BrowserConfig};
 use futures::StreamExt;
+use ghostframe_e2e::harness::spawn_weston_headless;
 use std::time::Duration;
 
-#[tokio::test]
-async fn chromium_codec_probe() -> Result<()> {
-    let probe_html = r##"
+const PROBE_HTML: &str = r##"
 <!doctype html>
 <html><head><title>chromium-codec-probe</title></head>
 <body>
@@ -35,9 +42,9 @@ async fn chromium_codec_probe() -> Result<()> {
         video: {contentType: p.codecs, width: 1280, height: 720,
                 bitrate: 1000000, framerate: 30}
       });
-      out.push(`${p.label}: supported=${r.supported} smooth=${r.smooth} pe=${r.powerEfficient}`);
+      out.push(`MediaCapabilities ${p.label}: supported=${r.supported} smooth=${r.smooth} pe=${r.powerEfficient}`);
     } catch (e) {
-      out.push(`${p.label}: ERROR ${e}`);
+      out.push(`MediaCapabilities ${p.label}: ERROR ${e}`);
     }
   }
   if (typeof VideoDecoder !== "undefined") {
@@ -50,8 +57,9 @@ async fn chromium_codec_probe() -> Result<()> {
       }
     }
   } else {
-    out.push("WebCodecs VideoDecoder: not exposed");
+    out.push("WebCodecs VideoDecoder: NOT EXPOSED on globalThis");
   }
+  out.push(`userAgent: ${navigator.userAgent}`);
   document.body.dataset.probeResult = out.join("\n");
   document.title = "DONE";
 })();
@@ -59,26 +67,24 @@ async fn chromium_codec_probe() -> Result<()> {
 </body></html>
 "##;
 
-    let mut builder = BrowserConfig::builder()
-        .chrome_executable("/usr/bin/chromium")
-        .no_sandbox()
-        .arg("disable-gpu");
-    builder = builder.new_headless_mode();
-    let (mut browser, mut handler) = Browser::launch(builder.build().unwrap()).await?;
-
+async fn run_probe(label: &str, builder: BrowserConfig) -> Result<()> {
+    eprintln!();
+    eprintln!("=== Chromium probe: {label} ===");
+    let (mut browser, mut handler) = Browser::launch(builder).await?;
     let handle = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
     let data_url = format!(
         "data:text/html;base64,{}",
-        base64_encode(probe_html.as_bytes())
+        base64_encode(PROBE_HTML.as_bytes())
     );
-
     let page = browser.new_page(data_url.as_str()).await?;
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let result: String = loop {
         if std::time::Instant::now() > deadline {
-            anyhow::bail!("probe timed out waiting for document.title=DONE");
+            let _ = browser.close().await;
+            let _ = handle.await;
+            anyhow::bail!("probe '{label}' timed out waiting for document.title=DONE");
         }
         let title: String = page
             .evaluate("document.title")
@@ -94,15 +100,64 @@ async fn chromium_codec_probe() -> Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     };
-
-    eprintln!("=== Chromium codec probe results ===");
     for line in result.lines() {
         eprintln!("  {line}");
     }
-    eprintln!("=== end probe results ===");
+    eprintln!("=== end probe: {label} ===");
 
     let _ = browser.close().await;
     let _ = handle.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn chromium_codec_probe() -> Result<()> {
+    // Mode 1: --headless=new (Ozone headless backend, no display server)
+    {
+        let mut builder = BrowserConfig::builder()
+            .chrome_executable("/usr/bin/chromium")
+            .no_sandbox()
+            .arg("disable-gpu");
+        builder = builder.new_headless_mode();
+        if let Err(e) = run_probe(
+            "headless=new (no display, no GPU)",
+            builder.build().unwrap(),
+        )
+        .await
+        {
+            eprintln!("  headless probe error: {e}");
+        }
+    }
+
+    // Mode 2: with_head + Weston + XWayland + Vulkan/WebGPU
+    // This matches `setup_e2e_webgpu*` in tests/e2e.rs. Whatever WebCodecs
+    // answers in THIS mode is what the failing H.264 tests actually see.
+    {
+        let weston = spawn_weston_headless()?;
+        let builder = BrowserConfig::builder()
+            .chrome_executable("/usr/bin/chromium")
+            .no_sandbox()
+            .with_head()
+            .env("DISPLAY", weston.display.clone())
+            .env(
+                "XDG_RUNTIME_DIR",
+                weston.runtime_dir().to_string_lossy().to_string(),
+            )
+            .arg(("enable-features", "Vulkan,WebGPU"))
+            .arg("use-vulkan")
+            .arg("ozone-platform=x11")
+            .arg("enable-unsafe-webgpu")
+            .arg("ignore-gpu-blocklist");
+        if let Err(e) = run_probe(
+            "with_head + weston/xwayland + Vulkan/WebGPU (harness mode)",
+            builder.build().unwrap(),
+        )
+        .await
+        {
+            eprintln!("  weston/webgpu probe error: {e}");
+        }
+        drop(weston);
+    }
     Ok(())
 }
 
