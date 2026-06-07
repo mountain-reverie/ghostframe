@@ -467,7 +467,7 @@ pub fn write(
                     .unwrap_or(false)
             })
             .collect();
-        rows.sort_by(|(a, _), (b, _)| a.cmp(b));
+        rows.sort_by_key(|(a, _)| *a);
 
         if !rows.is_empty() {
             writeln!(
@@ -509,7 +509,7 @@ pub fn write(
                     .unwrap_or(false)
             })
             .collect();
-        rows.sort_by(|(a, _), (b, _)| a.cmp(b));
+        rows.sort_by_key(|(a, _)| *a);
 
         if !rows.is_empty() {
             writeln!(
