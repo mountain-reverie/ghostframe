@@ -308,7 +308,11 @@ fn frame_palette_entry_raw_has_expected_layout() {
     let base = &zero as *const _ as usize;
     assert_eq!(&zero.count as *const _ as usize - base, 0, "count offset");
     assert_eq!(&zero._pad as *const _ as usize - base, 4, "_pad offset");
-    assert_eq!(&zero.colors as *const _ as usize - base, 16, "colors offset");
+    assert_eq!(
+        &zero.colors as *const _ as usize - base,
+        16,
+        "colors offset"
+    );
 }
 
 #[test]
@@ -445,8 +449,7 @@ fn process_frame_tile_analysis_checkerboard() {
         let make_fd = |name_suffix: &str| -> std::os::unix::io::RawFd {
             let size = (stride * height) as usize;
             let name =
-                std::ffi::CString::new(format!("ghost-test-checkerboard-{}", name_suffix))
-                    .unwrap();
+                std::ffi::CString::new(format!("ghost-test-checkerboard-{}", name_suffix)).unwrap();
             let fd = libc::memfd_create(name.as_ptr(), 0);
             assert!(fd >= 0);
             libc::ftruncate(fd, size as i64);
@@ -666,8 +669,7 @@ fn process_frame_tile_analysis_frame_edge_denominator() {
     unsafe {
         let make_fd = |name_suffix: &str| -> std::os::unix::io::RawFd {
             let size = (stride * height) as usize;
-            let name =
-                std::ffi::CString::new(format!("ghost-test-edge-{}", name_suffix)).unwrap();
+            let name = std::ffi::CString::new(format!("ghost-test-edge-{}", name_suffix)).unwrap();
             let fd = libc::memfd_create(name.as_ptr(), 0);
             assert!(fd >= 0);
             libc::ftruncate(fd, size as i64);
@@ -828,8 +830,8 @@ fn process_frame_tile_analysis_multi_tile_independence() {
 
         let make_fd = |name_suffix: &str| -> std::os::unix::io::RawFd {
             let size = (stride * height) as usize;
-            let name = std::ffi::CString::new(format!("ghost-test-multitile-{}", name_suffix))
-                .unwrap();
+            let name =
+                std::ffi::CString::new(format!("ghost-test-multitile-{}", name_suffix)).unwrap();
             let fd = libc::memfd_create(name.as_ptr(), 0);
             assert!(fd >= 0);
             libc::ftruncate(fd, size as i64);
@@ -944,14 +946,13 @@ fn tile_analysis_colors_are_canonical_sorted() {
 
     unsafe {
         // BGRA byte order: [B, G, R, A]
-        let red:   [u8; 4] = [0, 0, 255, 255];
+        let red: [u8; 4] = [0, 0, 255, 255];
         let green: [u8; 4] = [0, 255, 0, 255];
-        let blue:  [u8; 4] = [255, 0, 0, 255];
+        let blue: [u8; 4] = [255, 0, 0, 255];
 
         let make_fd = |name_suffix: &str, fill: bool| -> std::os::unix::io::RawFd {
             let size = (stride * height) as usize;
-            let name = std::ffi::CString::new(format!("ghost-sort-test-{}", name_suffix))
-                .unwrap();
+            let name = std::ffi::CString::new(format!("ghost-sort-test-{}", name_suffix)).unwrap();
             let fd = libc::memfd_create(name.as_ptr(), 0);
             assert!(fd >= 0);
             libc::ftruncate(fd, size as i64);
@@ -974,10 +975,22 @@ fn tile_analysis_colors_are_canonical_sorted() {
                 for y in 0..32u32 {
                     for x in 0..32u32 {
                         // Tile 0: red(x<11) | green(x<22) | blue(rest).
-                        let c = if x < 11 { red } else if x < 22 { green } else { blue };
+                        let c = if x < 11 {
+                            red
+                        } else if x < 22 {
+                            green
+                        } else {
+                            blue
+                        };
                         put(x, y, c);
                         // Tile 1 (x+32): blue(x<11) | red(x<22) | green(rest).
-                        let c2 = if x < 11 { blue } else if x < 22 { red } else { green };
+                        let c2 = if x < 11 {
+                            blue
+                        } else if x < 22 {
+                            red
+                        } else {
+                            green
+                        };
                         put(x + 32, y, c2);
                     }
                 }
@@ -1025,15 +1038,27 @@ fn tile_analysis_colors_are_canonical_sorted() {
         //   blue  (B=255,G=0,R=0,A=255) = 0xFF00_00FF
         //   green (B=0,G=255,R=0,A=255) = 0xFF00_FF00
         //   red   (B=0,G=0,R=255,A=255) = 0xFFFF_0000
-        let blue_p:  u32 = 0xFF00_00FF;
+        let blue_p: u32 = 0xFF00_00FF;
         let green_p: u32 = 0xFF00_FF00;
-        let red_p:   u32 = 0xFFFF_0000;
+        let red_p: u32 = 0xFFFF_0000;
 
         for (tile_i, entry) in slice.iter().enumerate() {
             assert_eq!(entry.count, 3, "tile {}: expected count 3", tile_i);
-            assert_eq!(entry.colors[0], blue_p,  "tile {}: slot 0 should be blue",  tile_i);
-            assert_eq!(entry.colors[1], green_p, "tile {}: slot 1 should be green", tile_i);
-            assert_eq!(entry.colors[2], red_p,   "tile {}: slot 2 should be red",   tile_i);
+            assert_eq!(
+                entry.colors[0], blue_p,
+                "tile {}: slot 0 should be blue",
+                tile_i
+            );
+            assert_eq!(
+                entry.colors[1], green_p,
+                "tile {}: slot 1 should be green",
+                tile_i
+            );
+            assert_eq!(
+                entry.colors[2], red_p,
+                "tile {}: slot 2 should be red",
+                tile_i
+            );
         }
     }
 }
@@ -1147,8 +1172,12 @@ fn process_frame_returns_palrle_compact_list_for_text_tiles() {
             for x in 64..96u32 {
                 let off = ((y * stride) + x * 4) as usize;
                 let local_x = (x - 64) as u8;
-                frame[off..off + 4]
-                    .copy_from_slice(&[local_x, y as u8, local_x.wrapping_add(y as u8), 255]);
+                frame[off..off + 4].copy_from_slice(&[
+                    local_x,
+                    y as u8,
+                    local_x.wrapping_add(y as u8),
+                    255,
+                ]);
             }
         }
 
@@ -1158,7 +1187,9 @@ fn process_frame_returns_palrle_compact_list_for_text_tiles() {
             Ok(a) => a,
             Err(e) => {
                 libc::close(fd_real);
-                eprintln!("Skipping palrle compact test second frame (memfd not a real DMA-BUF): {e}");
+                eprintln!(
+                    "Skipping palrle compact test second frame (memfd not a real DMA-BUF): {e}"
+                );
                 return;
             }
         };
@@ -1273,7 +1304,7 @@ fn process_frame_dedups_identical_palettes_within_frame() {
                 for x in 0..32u32 {
                     let off = ((y * stride) + (tile_x * 32 + x) * 4) as usize;
                     let c = if (x + y) % 2 == 0 {
-                        [0u8, 0, 0, 255]     // black BGRA
+                        [0u8, 0, 0, 255] // black BGRA
                     } else {
                         [255u8, 255, 255, 255] // white BGRA
                     };
@@ -1387,8 +1418,8 @@ fn process_frame_folds_subset_palette() {
                     let off = ((y * stride) + x * 4) as usize;
                     let c: [u8; 4] = match (x + y * 32) % 3 {
                         0 => [0, 0, 0, 255],       // black BGRA
-                        1 => [255, 255, 255, 255],  // white BGRA
-                        _ => [128, 128, 128, 255],  // grey BGRA
+                        1 => [255, 255, 255, 255], // white BGRA
+                        _ => [128, 128, 128, 255], // grey BGRA
                     };
                     frame[off..off + 4].copy_from_slice(&c);
                 }
@@ -1399,9 +1430,9 @@ fn process_frame_folds_subset_palette() {
                     let off = ((y * stride) + x * 4) as usize;
                     let c: [u8; 4] = match (x + y * 32) % 4 {
                         0 => [0, 0, 0, 255],       // black BGRA
-                        1 => [255, 255, 255, 255],  // white BGRA
-                        2 => [128, 128, 128, 255],  // grey BGRA
-                        _ => [255, 0, 0, 255],      // blue BGRA (B=255,G=0,R=0)
+                        1 => [255, 255, 255, 255], // white BGRA
+                        2 => [128, 128, 128, 255], // grey BGRA
+                        _ => [255, 0, 0, 255],     // blue BGRA (B=255,G=0,R=0)
                     };
                     frame[off..off + 4].copy_from_slice(&c);
                 }
@@ -1411,9 +1442,7 @@ fn process_frame_folds_subset_palette() {
             Ok(a) => a,
             Err(e) => {
                 libc::close(fd_real);
-                eprintln!(
-                    "Skipping subset-fold second frame (memfd not a real DMA-BUF): {e}"
-                );
+                eprintln!("Skipping subset-fold second frame (memfd not a real DMA-BUF): {e}");
                 return;
             }
         };
@@ -1445,21 +1474,24 @@ fn process_frame_folds_subset_palette() {
         // Determine which compact slot is the subset vs the superset via
         // palette count. Workgroup execution order is non-deterministic.
         let palettes = analysis.frame_palette_set_slice();
-        let (subset_id, superset_id) = if palettes[id0 as usize].count < palettes[id1 as usize].count {
-            (id0, id1)
-        } else {
-            (id1, id0)
-        };
+        let (subset_id, superset_id) =
+            if palettes[id0 as usize].count < palettes[id1 as usize].count {
+                (id0, id1)
+            } else {
+                (id1, id0)
+            };
 
         let resolved_for_subset = folded[subset_id as usize] & 0xFFu32;
         assert_eq!(
             resolved_for_subset as u8, superset_id,
-            "subset palette {} should fold into superset {}", subset_id, superset_id
+            "subset palette {} should fold into superset {}",
+            subset_id, superset_id
         );
         let resolved_for_superset = folded[superset_id as usize] & 0xFFu32;
         assert_eq!(
             resolved_for_superset as u8, superset_id,
-            "superset palette {} should stay self-referential", superset_id
+            "superset palette {} should stay self-referential",
+            superset_id
         );
     }
 }
@@ -1535,7 +1567,7 @@ fn process_frame_emits_correct_indices_for_two_color_tile() {
                 for x in 0..width {
                     let off = ((y * stride) + x * 4) as usize;
                     let c: [u8; 4] = if y < 16 {
-                        [0, 0, 0, 255]     // BGRA black
+                        [0, 0, 0, 255] // BGRA black
                     } else {
                         [255, 255, 255, 255] // BGRA white
                     };
@@ -1567,7 +1599,11 @@ fn process_frame_emits_correct_indices_for_two_color_tile() {
         );
 
         let indices = analysis.index_buffer_slice_for(0);
-        assert_eq!(indices.len(), 512, "index_buffer_slice_for must return 512 bytes");
+        assert_eq!(
+            indices.len(),
+            512,
+            "index_buffer_slice_for must return 512 bytes"
+        );
 
         // 32×32 = 1024 pixels total, packed 2 per byte (low nibble first).
         // Top half: pixels 0..511 → all black → index 0 → both nibbles 0.
@@ -1578,28 +1614,36 @@ fn process_frame_emits_correct_indices_for_two_color_tile() {
             let low = indices[byte_idx] & 0x0F;
             let high = (indices[byte_idx] >> 4) & 0x0F;
             assert_eq!(
-                low, 0,
+                low,
+                0,
                 "byte {} low nibble: pixel {} should be index 0 (black)",
-                byte_idx, byte_idx * 2
+                byte_idx,
+                byte_idx * 2
             );
             assert_eq!(
-                high, 0,
+                high,
+                0,
                 "byte {} high nibble: pixel {} should be index 0 (black)",
-                byte_idx, byte_idx * 2 + 1
+                byte_idx,
+                byte_idx * 2 + 1
             );
         }
         for byte_idx in 256..512usize {
             let low = indices[byte_idx] & 0x0F;
             let high = (indices[byte_idx] >> 4) & 0x0F;
             assert_eq!(
-                low, 1,
+                low,
+                1,
                 "byte {} low nibble: pixel {} should be index 1 (white)",
-                byte_idx, byte_idx * 2
+                byte_idx,
+                byte_idx * 2
             );
             assert_eq!(
-                high, 1,
+                high,
+                1,
                 "byte {} high nibble: pixel {} should be index 1 (white)",
-                byte_idx, byte_idx * 2 + 1
+                byte_idx,
+                byte_idx * 2 + 1
             );
         }
     }
@@ -1636,12 +1680,18 @@ fn invalidate_baseline_drops_prev_image_and_sets_counter() {
             }
         }
     }
-    assert!(processor.prev_image.is_some(), "diff should populate prev_image");
+    assert!(
+        processor.prev_image.is_some(),
+        "diff should populate prev_image"
+    );
 
     // The API under test.
     processor.invalidate_baseline(20);
 
-    assert!(processor.prev_image.is_none(), "invalidate_baseline must drop prev_image");
+    assert!(
+        processor.prev_image.is_none(),
+        "invalidate_baseline must drop prev_image"
+    );
     assert_eq!(processor.force_all_dirty_remaining, 20);
 }
 
@@ -1674,7 +1724,10 @@ fn invalidate_baseline_cushion_keeps_all_dirty_and_prev_image_none() {
         };
         libc::close(fd);
         assert_eq!(dirty.len() as u32, tile_count, "first frame: all dirty");
-        assert!(processor.prev_image.is_some(), "first frame populates prev_image");
+        assert!(
+            processor.prev_image.is_some(),
+            "first frame populates prev_image"
+        );
 
         // Sanity: second identical frame produces 0 dirty.
         let fd = make_memfd(width, height, pixel);
@@ -1722,7 +1775,11 @@ fn invalidate_baseline_cushion_keeps_all_dirty_and_prev_image_none() {
         let fd = make_memfd(width, height, pixel);
         let dirty = processor.diff(fd, width, height, stride).unwrap();
         libc::close(fd);
-        assert_eq!(dirty.len(), 0, "normal SAD resumed: 0 dirty for unchanged content");
+        assert_eq!(
+            dirty.len(),
+            0,
+            "normal SAD resumed: 0 dirty for unchanged content"
+        );
     }
 }
 
@@ -1748,12 +1805,12 @@ fn cdf53_compact_filters_high_color_tiles_only() {
             let in_gradient = (x < 32) && (y < 32);
             if in_gradient {
                 // Dense gradient: up to 32*32 = 1024 unique colors — well above 16.
-                pixels[off]     = (x * 3) as u8;
+                pixels[off] = (x * 3) as u8;
                 pixels[off + 1] = (y * 3) as u8;
                 pixels[off + 2] = (x + y) as u8;
             } else {
                 // Solid blue — 1 unique color per tile.
-                pixels[off]     = 0;
+                pixels[off] = 0;
                 pixels[off + 1] = 0;
                 pixels[off + 2] = 0xFF;
             }
@@ -1779,9 +1836,8 @@ fn cdf53_compact_filters_high_color_tiles_only() {
         count, 1,
         "expected exactly 1 high-color tile in compact list; got {count}"
     );
-    let list = unsafe {
-        std::slice::from_raw_parts(processor.cdf53_compact_list_ptr, count as usize)
-    };
+    let list =
+        unsafe { std::slice::from_raw_parts(processor.cdf53_compact_list_ptr, count as usize) };
     assert_eq!(
         list[0], 0,
         "expected tile index 0 (top-left gradient); got {}",
@@ -1812,12 +1868,12 @@ fn cdf53_forward_gpu_matches_cpu_reference() {
             let off = ((y * stride) + x * 4) as usize;
             if x < 32 && y < 32 {
                 // High-color gradient tile — will be classified Cdf53.
-                pixels[off]     = (x * 3 % 256) as u8;     // B
-                pixels[off + 1] = (y * 3 % 256) as u8;     // G
-                pixels[off + 2] = ((x + y) % 256) as u8;   // R
+                pixels[off] = (x * 3 % 256) as u8; // B
+                pixels[off + 1] = (y * 3 % 256) as u8; // G
+                pixels[off + 2] = ((x + y) % 256) as u8; // R
             } else {
                 // Solid blue on other tiles — PalRLE or Solid, not Cdf53.
-                pixels[off]     = 0xFF;
+                pixels[off] = 0xFF;
                 pixels[off + 1] = 0;
                 pixels[off + 2] = 0;
             }
@@ -1860,10 +1916,8 @@ fn cdf53_forward_gpu_matches_cpu_reference() {
     // Read GPU coefficients for compact slot 0.
     // The coefficient buffer stores i32 per coefficient; Phase B casts to i16.
     let gpu_coeffs: Vec<i16> = unsafe {
-        let raw = std::slice::from_raw_parts(
-            processor.cdf53_coefficients_ptr,
-            cdf53::CDF53_TOTAL_COEFFS,
-        );
+        let raw =
+            std::slice::from_raw_parts(processor.cdf53_coefficients_ptr, cdf53::CDF53_TOTAL_COEFFS);
         raw.iter().map(|&v| v as i16).collect()
     };
 

@@ -559,7 +559,11 @@ fn sync_prime_fd(fd: &OwnedFd, end: bool) {
     const DMA_BUF_SYNC_START: u64 = 0 << 2;
     const DMA_BUF_SYNC_END: u64 = 1 << 2;
 
-    let direction = if end { DMA_BUF_SYNC_END } else { DMA_BUF_SYNC_START };
+    let direction = if end {
+        DMA_BUF_SYNC_END
+    } else {
+        DMA_BUF_SYNC_START
+    };
     let mut req = DmaBufSync {
         flags: direction | DMA_BUF_SYNC_READ,
     };

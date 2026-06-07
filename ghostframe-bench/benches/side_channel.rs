@@ -53,12 +53,16 @@ fn slot() -> &'static Mutex<SideChannel> {
 }
 
 pub fn record_compressed_bytes(codec: &str, class: &str, lz4: bool, bytes: usize) {
-    slot().lock().unwrap().compressed_bytes.push(CompressedBytesEntry {
-        codec: codec.into(),
-        class: class.into(),
-        lz4,
-        bytes,
-    });
+    slot()
+        .lock()
+        .unwrap()
+        .compressed_bytes
+        .push(CompressedBytesEntry {
+            codec: codec.into(),
+            class: class.into(),
+            lz4,
+            bytes,
+        });
 }
 
 pub fn record_ssim(codec: &str, class: &str, passes_kept: Option<u8>, ssim: f64) {
@@ -72,12 +76,16 @@ pub fn record_ssim(codec: &str, class: &str, passes_kept: Option<u8>, ssim: f64)
 
 pub fn record_bytes_to_lossless(class: &str, bytes_per_pass: Vec<usize>) {
     let total: usize = bytes_per_pass.iter().sum();
-    slot().lock().unwrap().bytes_to_lossless.push(BytesToLosslessEntry {
-        codec: "cdf53".into(),
-        class: class.into(),
-        bytes_per_pass,
-        bytes_total: total,
-    });
+    slot()
+        .lock()
+        .unwrap()
+        .bytes_to_lossless
+        .push(BytesToLosslessEntry {
+            codec: "cdf53".into(),
+            class: class.into(),
+            bytes_per_pass,
+            bytes_total: total,
+        });
 }
 
 /// Flush the side channel to JSON. Called from `criterion_main!`-adjacent
@@ -103,7 +111,12 @@ pub fn compute_ssim(original_bgra: &[u8], reconstructed_bgra: &[u8], w: u32, h: 
     // Convert BGRA bytes to rgb::RGBA<u8> (R, G, B, A order).
     let to_rgba = |bgra: &[u8]| -> Vec<rgb::RGBA<u8>> {
         bgra.chunks_exact(4)
-            .map(|c| rgb::RGBA { r: c[2], g: c[1], b: c[0], a: c[3] })
+            .map(|c| rgb::RGBA {
+                r: c[2],
+                g: c[1],
+                b: c[0],
+                a: c[3],
+            })
             .collect()
     };
 

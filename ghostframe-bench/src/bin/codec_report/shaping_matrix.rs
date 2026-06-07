@@ -16,11 +16,31 @@ pub struct ShapingPoint {
 pub const SHAPING_POINTS: &[ShapingPoint] = &[
     // 1 Mbps satellite / heavily-congested. 300 ms RTT + 15% loss is
     // worst-realistic; QUIC cwnd should settle below the headroom floor.
-    ShapingPoint { label: "1mbps_sat",    bandwidth_kbps:   1_000, delay_ms: 300, loss_pct: 15 },
+    ShapingPoint {
+        label: "1mbps_sat",
+        bandwidth_kbps: 1_000,
+        delay_ms: 300,
+        loss_pct: 15,
+    },
     // 10 Mbps DSL with cable-grade latency.
-    ShapingPoint { label: "10mbps_dsl",   bandwidth_kbps:  10_000, delay_ms:  50, loss_pct:  5 },
+    ShapingPoint {
+        label: "10mbps_dsl",
+        bandwidth_kbps: 10_000,
+        delay_ms: 50,
+        loss_pct: 5,
+    },
     // 30 Mbps standard cable.
-    ShapingPoint { label: "30mbps_cable", bandwidth_kbps:  30_000, delay_ms:  20, loss_pct:  1 },
+    ShapingPoint {
+        label: "30mbps_cable",
+        bandwidth_kbps: 30_000,
+        delay_ms: 20,
+        loss_pct: 1,
+    },
     // 100 Mbps LAN — clean baseline.
-    ShapingPoint { label: "100mbps_lan",  bandwidth_kbps: 100_000, delay_ms:   5, loss_pct:  0 },
+    ShapingPoint {
+        label: "100mbps_lan",
+        bandwidth_kbps: 100_000,
+        delay_ms: 5,
+        loss_pct: 0,
+    },
 ];

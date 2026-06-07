@@ -282,8 +282,7 @@ fn request_keyframe_forces_idr_outside_gop_boundary() {
     // PTS 0 is automatically a keyframe; consume it.
     let nv12_size = (width * height * 3 / 2) as usize;
     let nv12 = vec![128u8; nv12_size];
-    let _ =
-        encoder.encode_nv12_buffer(nv12.as_ptr(), width, height, width, width, width * height);
+    let _ = encoder.encode_nv12_buffer(nv12.as_ptr(), width, height, width, width, width * height);
     // PTS 1 normally would NOT be a keyframe (FULL_FRAME_GOP = 11). Request one,
     // then drain frames until a packet emerges — the encoder may buffer the first
     // few PTS values before emitting the IDR. The first emitted packet must be a
@@ -292,14 +291,9 @@ fn request_keyframe_forces_idr_outside_gop_boundary() {
     let mut keyframe_observed = false;
     let mut keyframe_pts = None;
     for pts in 1..=4 {
-        if let Ok(Some(out)) = encoder.encode_nv12_buffer(
-            nv12.as_ptr(),
-            width,
-            height,
-            width,
-            width,
-            width * height,
-        ) {
+        if let Ok(Some(out)) =
+            encoder.encode_nv12_buffer(nv12.as_ptr(), width, height, width, width, width * height)
+        {
             assert!(out.is_keyframe,
                 "first packet after request_keyframe() must be IDR (got P-frame at drain pts={pts})");
             keyframe_observed = true;
@@ -318,14 +312,9 @@ fn request_keyframe_forces_idr_outside_gop_boundary() {
     let start_pts = keyframe_pts.unwrap() + 1;
     let mut saw_p_frame = false;
     for _pts in start_pts..(start_pts + 5).min(10) {
-        if let Ok(Some(out)) = encoder.encode_nv12_buffer(
-            nv12.as_ptr(),
-            width,
-            height,
-            width,
-            width,
-            width * height,
-        ) {
+        if let Ok(Some(out)) =
+            encoder.encode_nv12_buffer(nv12.as_ptr(), width, height, width, width, width * height)
+        {
             if !out.is_keyframe {
                 saw_p_frame = true;
                 break;

@@ -154,11 +154,23 @@ pub fn run(card_path: &str) -> Result<(), Box<dyn std::error::Error>> {
         let br_x = width.saturating_sub(corner);
         let br_y = height.saturating_sub(corner);
 
-        fill_rect(bytes, pitch, width, height, tl_x, tl_y, corner, corner, RED_PIXEL);
         fill_rect(
-            bytes, pitch, width, height, tr_x, tr_y, corner, corner, GREEN_PIXEL,
+            bytes, pitch, width, height, tl_x, tl_y, corner, corner, RED_PIXEL,
         );
-        fill_rect(bytes, pitch, width, height, bl_x, bl_y, corner, corner, BLUE_PIXEL);
+        fill_rect(
+            bytes,
+            pitch,
+            width,
+            height,
+            tr_x,
+            tr_y,
+            corner,
+            corner,
+            GREEN_PIXEL,
+        );
+        fill_rect(
+            bytes, pitch, width, height, bl_x, bl_y, corner, corner, BLUE_PIXEL,
+        );
         fill_rect(
             bytes,
             pitch,

@@ -36,7 +36,13 @@ pub fn run(
             .map_dumb_buffer(&mut scanout.db)
             .map_err(|e| format!("map_dumb_buffer: {e}"))?;
         let bytes = map.as_mut();
-        tile_pattern::fill_with_tile_pattern(class_name, scanout.mode_w, scanout.mode_h, pitch, bytes);
+        tile_pattern::fill_with_tile_pattern(
+            class_name,
+            scanout.mode_w,
+            scanout.mode_h,
+            pitch,
+            bytes,
+        );
         msync_buffer(bytes);
     }
 

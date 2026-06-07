@@ -269,8 +269,7 @@ async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioStack> {
         crate::harness::containers::read_cert_hash_from_logs(&server_container_name).await?;
 
     // Resolve xdaemon's host-visible PID for /proc sampling.
-    let xdaemon_host_pid =
-        resolve_xdaemon_host_pid(&server_container_name).await;
+    let xdaemon_host_pid = resolve_xdaemon_host_pid(&server_container_name).await;
 
     // --- TestNode + forwarder ---
     let client_control_url = format!("http://127.0.0.1:{HEADSCALE_HOST_PORT}");
@@ -330,9 +329,7 @@ async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioStack> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let result = page
-            .evaluate(
-                "(document.getElementById('status') || {textContent: '<null>'}).textContent",
-            )
+            .evaluate("(document.getElementById('status') || {textContent: '<null>'}).textContent")
             .await;
         if let Ok(v) = result {
             let status: String = v.into_value().unwrap_or_default();
@@ -452,9 +449,7 @@ async fn resolve_xdaemon_host_pid(container_name: &str) -> Option<u32> {
     // Fallback: if NSpid scan failed (kernel < 4.1 or single-level ns),
     // try reading through the container's /proc directly.
     // /proc/<root_host_pid>/root/proc/<inner_pid>/status is the container's view.
-    let container_proc_stat = format!(
-        "/proc/{root_host_pid}/root/proc/{inner_pid}/status"
-    );
+    let container_proc_stat = format!("/proc/{root_host_pid}/root/proc/{inner_pid}/status");
     if std::path::Path::new(&container_proc_stat).exists() {
         // We can't get the host PID from here without NSpid, so we just
         // return None and let the sampler use container-path reads.
@@ -475,8 +470,7 @@ pub async fn run_scene(spec: &SceneSpec) -> Result<SceneResult> {
     let stack = launch_scenario_stack(spec).await?;
 
     // Start ProcSampler tokio task.
-    let proc_samples: Arc<AsyncMutex<Vec<ProcSample>>> =
-        Arc::new(AsyncMutex::new(Vec::new()));
+    let proc_samples: Arc<AsyncMutex<Vec<ProcSample>>> = Arc::new(AsyncMutex::new(Vec::new()));
     let proc_handle = tokio::spawn(sample_proc_loop(
         stack.xdaemon_host_pid,
         stack.server_container_name.clone(),
@@ -604,15 +598,11 @@ async fn sample_proc_loop(
                 .output()
                 .await;
             let stat = match stat_out {
-                Ok(o) if o.status.success() => {
-                    String::from_utf8_lossy(&o.stdout).to_string()
-                }
+                Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
                 _ => break,
             };
             let status = match status_out {
-                Ok(o) if o.status.success() => {
-                    String::from_utf8_lossy(&o.stdout).to_string()
-                }
+                Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
                 _ => break,
             };
             if stat.trim().is_empty() {
@@ -654,7 +644,13 @@ async fn sample_proc_loop(
 // Helper: parse JSON server telemetry
 // ---------------------------------------------------------------------------
 
-fn parse_server_telemetry(stderr_lines: &str) -> (Vec<ServerTelemetryRecord>, Vec<ModeDecisionRecord>, ScenePolicyMetrics) {
+fn parse_server_telemetry(
+    stderr_lines: &str,
+) -> (
+    Vec<ServerTelemetryRecord>,
+    Vec<ModeDecisionRecord>,
+    ScenePolicyMetrics,
+) {
     use std::collections::BTreeMap;
 
     // frame_seq → (capture_done_ns, mode)
@@ -675,10 +671,7 @@ fn parse_server_telemetry(stderr_lines: &str) -> (Vec<ServerTelemetryRecord>, Ve
             .pointer("/fields/message")
             .and_then(|m| m.as_str())
             .unwrap_or("");
-        let target = v
-            .pointer("/target")
-            .and_then(|t| t.as_str())
-            .unwrap_or("");
+        let target = v.pointer("/target").and_then(|t| t.as_str()).unwrap_or("");
         if target != "ghostframe::bench" {
             continue;
         }
@@ -753,13 +746,19 @@ fn parse_server_telemetry(stderr_lines: &str) -> (Vec<ServerTelemetryRecord>, Ve
                     .pointer("/fields/frame_seq")
                     .and_then(|s| s.as_u64())
                     .unwrap_or(0);
-                decisions.push(ModeDecisionRecord { frame_seq, reason, to_mode });
+                decisions.push(ModeDecisionRecord {
+                    frame_seq,
+                    reason,
+                    to_mode,
+                });
             }
             "cdf53.pixelperfect" => {
-                policy_metrics.pixelperfect_count = policy_metrics.pixelperfect_count.saturating_add(1);
+                policy_metrics.pixelperfect_count =
+                    policy_metrics.pixelperfect_count.saturating_add(1);
             }
             "client decode error" => {
-                policy_metrics.decode_error_count = policy_metrics.decode_error_count.saturating_add(1);
+                policy_metrics.decode_error_count =
+                    policy_metrics.decode_error_count.saturating_add(1);
             }
             _ => {}
         }
@@ -768,8 +767,9 @@ fn parse_server_telemetry(stderr_lines: &str) -> (Vec<ServerTelemetryRecord>, Ve
     let records = captures
         .into_iter()
         .filter_map(|(seq, (cap_ns, mode))| {
-            sends.get(&seq).map(|(send_ns, bytes, tc, hist)| {
-                ServerTelemetryRecord {
+            sends
+                .get(&seq)
+                .map(|(send_ns, bytes, tc, hist)| ServerTelemetryRecord {
                     frame_seq: seq,
                     capture_done_ns: cap_ns,
                     last_send_ns: *send_ns,
@@ -777,8 +777,7 @@ fn parse_server_telemetry(stderr_lines: &str) -> (Vec<ServerTelemetryRecord>, Ve
                     tile_count: *tc,
                     mode,
                     codec_histogram: hist.clone(),
-                }
-            })
+                })
         })
         .collect();
     (records, decisions, policy_metrics)
@@ -826,10 +825,10 @@ async fn read_client_diagnostics(
         .into_value()
         .context("into_value paints_json")?;
 
-    let tiles: Vec<serde_json::Value> = serde_json::from_str(&tiles_json)
-        .context("parse __ghostframeRecordedTiles JSON")?;
-    let paints: Vec<serde_json::Value> = serde_json::from_str(&paints_json)
-        .context("parse __ghostframe_framePaints JSON")?;
+    let tiles: Vec<serde_json::Value> =
+        serde_json::from_str(&tiles_json).context("parse __ghostframeRecordedTiles JSON")?;
+    let paints: Vec<serde_json::Value> =
+        serde_json::from_str(&paints_json).context("parse __ghostframe_framePaints JSON")?;
 
     // Build per-frame-seq min(firstRecvMsClient) and max(lastPaintMsClient).
     let mut first_recv_by_seq: BTreeMap<u64, f64> = BTreeMap::new();

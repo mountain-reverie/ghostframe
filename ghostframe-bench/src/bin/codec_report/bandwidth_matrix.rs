@@ -19,12 +19,28 @@ pub const BANDWIDTH_POINTS: &[BandwidthPoint] = &[
     // (0.25 B/µs ≈ 2 Mbps). Combined with 15% loss this is the
     // worst-realistic case where both headroom_guard and loss_override
     // are expected to fire.
-    BandwidthPoint { label: "1mbps_edge",    bytes_per_sec:    125_000, loss_probability: 0.15 },
+    BandwidthPoint {
+        label: "1mbps_edge",
+        bytes_per_sec: 125_000,
+        loss_probability: 0.15,
+    },
     // 10 Mbps DSL with mild loss — above headroom floor but tight enough
     // to stress refinement bandwidth allocation.
-    BandwidthPoint { label: "10mbps_dsl",    bytes_per_sec:  1_250_000, loss_probability: 0.05 },
+    BandwidthPoint {
+        label: "10mbps_dsl",
+        bytes_per_sec: 1_250_000,
+        loss_probability: 0.05,
+    },
     // 30 Mbps cable with token loss — comfortable for TileCodec.
-    BandwidthPoint { label: "30mbps_cable",  bytes_per_sec:  3_750_000, loss_probability: 0.01 },
+    BandwidthPoint {
+        label: "30mbps_cable",
+        bytes_per_sec: 3_750_000,
+        loss_probability: 0.01,
+    },
     // 100 Mbps LAN clean — pure cost_comparison baseline.
-    BandwidthPoint { label: "100mbps_lan",   bytes_per_sec: 12_500_000, loss_probability: 0.0  },
+    BandwidthPoint {
+        label: "100mbps_lan",
+        bytes_per_sec: 12_500_000,
+        loss_probability: 0.0,
+    },
 ];

@@ -50,15 +50,22 @@ pub struct SceneSummary {
 
 impl ReportState {
     pub fn new(args: &Cli) -> Self {
-        Self { args: args.clone(), scenes: BTreeMap::new() }
+        Self {
+            args: args.clone(),
+            scenes: BTreeMap::new(),
+        }
     }
 
     pub fn record_scene(&mut self, name: &str, r: &SceneResult) {
-        let server_intervals_ns: Vec<u64> = r.server_telemetry.iter()
+        let server_intervals_ns: Vec<u64> = r
+            .server_telemetry
+            .iter()
             .filter(|st| st.capture_done_ns > 0 && st.last_send_ns >= st.capture_done_ns)
             .map(|st| st.last_send_ns - st.capture_done_ns)
             .collect();
-        let client_intervals_ms: Vec<f64> = r.client_diagnostics.iter()
+        let client_intervals_ms: Vec<f64> = r
+            .client_diagnostics
+            .iter()
             .filter(|cd| cd.first_recv_ms > 0.0 && cd.raf_ms >= cd.first_recv_ms)
             .map(|cd| cd.raf_ms - cd.first_recv_ms)
             .collect();
@@ -74,7 +81,11 @@ impl ReportState {
         // CPU%: total ticks delta over scene duration windows.
         let clock_tick = {
             let raw = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-            if raw > 0 { raw as f64 } else { 100.0 }
+            if raw > 0 {
+                raw as f64
+            } else {
+                100.0
+            }
         };
         let (cpu_mean, cpu_peak) = compute_cpu(&r.proc_samples, clock_tick);
         let rss_max_kb = r.proc_samples.iter().map(|s| s.rss_kb).max().unwrap_or(0);
@@ -88,8 +99,8 @@ impl ReportState {
         let mut codec_bytes: BTreeMap<String, u64> = BTreeMap::new();
         for st in &r.server_telemetry {
             let hist = &st.codec_histogram;
-            let tile_total = (hist.solid + hist.palrle + hist.cdf53 + hist.raw) as u64
-                + hist.h264 as u64;
+            let tile_total =
+                (hist.solid + hist.palrle + hist.cdf53 + hist.raw) as u64 + hist.h264 as u64;
             if tile_total == 0 {
                 continue;
             }
@@ -100,10 +111,8 @@ impl ReportState {
                 bytes * hist.palrle as u64 / tile_total;
             *codec_bytes.entry("cdf53".into()).or_default() +=
                 bytes * hist.cdf53 as u64 / tile_total;
-            *codec_bytes.entry("raw".into()).or_default() +=
-                bytes * hist.raw as u64 / tile_total;
-            *codec_bytes.entry("h264".into()).or_default() +=
-                bytes * hist.h264 as u64 / tile_total;
+            *codec_bytes.entry("raw".into()).or_default() += bytes * hist.raw as u64 / tile_total;
+            *codec_bytes.entry("h264".into()).or_default() += bytes * hist.h264 as u64 / tile_total;
         }
 
         // M3.6c: mode-dwell timeline.
@@ -190,10 +199,7 @@ fn percentile_f64(v: &[f64], pct: f64) -> f64 {
     s[idx.min(s.len() - 1)]
 }
 
-fn compute_cpu(
-    samples: &[ghostframe_e2e::harness::ProcSample],
-    clk_tck: f64,
-) -> (f64, f64) {
+fn compute_cpu(samples: &[ghostframe_e2e::harness::ProcSample], clk_tck: f64) -> (f64, f64) {
     if samples.len() < 2 {
         return (0.0, 0.0);
     }

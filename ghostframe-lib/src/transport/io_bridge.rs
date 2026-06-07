@@ -87,7 +87,10 @@ pub(crate) struct FrameSendStats {
 /// `libc::clock_gettime` is async-signal-safe. The timespec struct is
 /// zero-initialised before the call and written atomically by the kernel.
 fn monotonic_now_ns() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     // SAFETY: clock_gettime is async-signal-safe; ts is valid.
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
@@ -230,7 +233,8 @@ pub struct IoBridge {
     pub(crate) adaptation_context: crate::tile::classifier::AdaptationContext,
     /// Sliding window of the last 5 `ReceiverFeedback` reports, used to
     /// smooth `loss_rate` against single-window jitter.
-    pub(crate) feedback_history: std::collections::VecDeque<crate::transport::feedback::ReceiverFeedback>,
+    pub(crate) feedback_history:
+        std::collections::VecDeque<crate::transport::feedback::ReceiverFeedback>,
     /// Last two windows' `suspension_detected` flag, OR'd into
     /// `adaptation_context.suspended` to debounce single-window flaps.
     pub(crate) recent_suspension_flags: [bool; 2],
@@ -468,8 +472,7 @@ impl IoBridge {
 
         // Warm rayon's global thread pool so the first PalRLE-heavy frame
         // doesn't pay thread-spin-up latency on the hot path (design Section 4).
-        rayon::iter::IntoParallelIterator::into_par_iter(0..1u32)
-            .for_each(|_| {});
+        rayon::iter::IntoParallelIterator::into_par_iter(0..1u32).for_each(|_| {});
 
         Ok(Self {
             _handle: Some(handle),
@@ -622,13 +625,7 @@ impl IoBridge {
     /// whenever dimensions change, retransmitting `FRAME_DIMENSIONS_RETRANSMITS`
     /// additional times to absorb datagram loss. Called by both
     /// `process_frame_cpu` and `process_frame_gpu`.
-    fn emit_frame_dimensions(
-        &mut self,
-        seq: u32,
-        timestamp_us: u32,
-        width: u32,
-        height: u32,
-    ) {
+    fn emit_frame_dimensions(&mut self, seq: u32, timestamp_us: u32, width: u32, height: u32) {
         let dims_changed = self.last_emitted_dimensions != Some((width, height));
         if dims_changed {
             self.dimensions_retransmits_left = FRAME_DIMENSIONS_RETRANSMITS;
@@ -662,7 +659,12 @@ impl IoBridge {
         policy: SchedulerEmissionPolicy,
         mut palrle_payloads: Option<&mut std::collections::HashMap<(u32, u32), Vec<u8>>>,
     ) -> FrameSendStats {
-        let TileDispatchFrame { pixels, stride, seq, timestamp_us } = frame;
+        let TileDispatchFrame {
+            pixels,
+            stride,
+            seq,
+            timestamp_us,
+        } = frame;
         // Grid sync — keep scheduler in lockstep with the dirty-detection grid.
         if self.scheduler.cols() != grid.cols || self.scheduler.rows() != grid.rows {
             self.scheduler.resize(grid.cols, grid.rows);
@@ -699,8 +701,9 @@ impl IoBridge {
                 }
             }
 
-            let (gen, superseded) =
-                self.scheduler.bump_generation_collecting(tile_x as u8, tile_y as u8);
+            let (gen, superseded) = self
+                .scheduler
+                .bump_generation_collecting(tile_x as u8, tile_y as u8);
             // Drop any in-flight Cdf53 coverage for this tile. The bump
             // marked the matching refinement-queue work `Superseded`; the
             // already-emitted-but-not-yet-ACKed Cdf53 coverage must be
@@ -708,7 +711,8 @@ impl IoBridge {
             // not keep reporting the cancelled passes as still pending until
             // LRU eviction. Non-Cdf53 coverage is preserved — see
             // `FragmentCoverageMap::drop_cdf53_for_tile` docs.
-            self.fragment_coverage.drop_cdf53_for_tile(tile_x as u8, tile_y as u8);
+            self.fragment_coverage
+                .drop_cdf53_for_tile(tile_x as u8, tile_y as u8);
             // New generation: tile is eligible for re-escalation.
             // Guard with a bounds check to stay safe when metrics_tracker has
             // not yet been sized (e.g. CpuRawOnly unit test path).
@@ -842,15 +846,13 @@ impl IoBridge {
                                 stats.codec_histogram.cdf53.saturating_add(1);
                         }
                         Codec::Raw => {
-                            stats.codec_histogram.raw =
-                                stats.codec_histogram.raw.saturating_add(1);
+                            stats.codec_histogram.raw = stats.codec_histogram.raw.saturating_add(1);
                         }
                         _ => {}
                     }
                 }
                 let tile_wire_bytes: u32 = datagrams.iter().map(|dg| dg.len() as u32).sum();
-                stats.total_wire_bytes =
-                    stats.total_wire_bytes.saturating_add(tile_wire_bytes);
+                stats.total_wire_bytes = stats.total_wire_bytes.saturating_add(tile_wire_bytes);
             }
             for dg in &datagrams {
                 self.send_to_all_sessions(dg);
@@ -981,7 +983,9 @@ impl IoBridge {
     /// Future message types must extend this dispatcher.
     pub(crate) fn dispatch_feedback_bytes(&mut self, data: &[u8]) {
         use crate::transport::client_caps::{HelloMsg, HELLO_MSG_TYPE, HELLO_SIZE};
-        use crate::transport::decode_error::{DecodeErrorMsg, DECODE_ERROR_MSG_TYPE, DECODE_ERROR_SIZE};
+        use crate::transport::decode_error::{
+            DecodeErrorMsg, DECODE_ERROR_MSG_TYPE, DECODE_ERROR_SIZE,
+        };
         use crate::transport::feedback::{FEEDBACK_MSG_TYPE, FEEDBACK_SIZE};
 
         let mut offset = 0;
@@ -989,7 +993,9 @@ impl IoBridge {
             let msg_type = data[offset];
             match msg_type {
                 FEEDBACK_MSG_TYPE => {
-                    if offset + FEEDBACK_SIZE > data.len() { break; }
+                    if offset + FEEDBACK_SIZE > data.len() {
+                        break;
+                    }
                     if let Some(fb) = ReceiverFeedback::decode(&data[offset..]) {
                         tracing::debug!(
                             received = fb.datagrams_received,
@@ -1004,14 +1010,18 @@ impl IoBridge {
                     offset += FEEDBACK_SIZE;
                 }
                 HELLO_MSG_TYPE => {
-                    if offset + HELLO_SIZE > data.len() { break; }
+                    if offset + HELLO_SIZE > data.len() {
+                        break;
+                    }
                     if let Some(msg) = HelloMsg::decode(&data[offset..]) {
                         self.apply_hello(msg);
                     }
                     offset += HELLO_SIZE;
                 }
                 DECODE_ERROR_MSG_TYPE => {
-                    if offset + DECODE_ERROR_SIZE > data.len() { break; }
+                    if offset + DECODE_ERROR_SIZE > data.len() {
+                        break;
+                    }
                     if let Some(msg) = DecodeErrorMsg::decode(&data[offset..]) {
                         self.handle_decode_error(msg);
                     }
@@ -1036,8 +1046,8 @@ impl IoBridge {
         &mut self,
         msg: crate::transport::decode_error::DecodeErrorMsg,
     ) {
-        use crate::transport::decode_error::ERR_THIN_UNCACHED_PALETTE;
         use crate::tile::CodecState;
+        use crate::transport::decode_error::ERR_THIN_UNCACHED_PALETTE;
 
         tracing::warn!(
             target: "ghostframe::bench",
@@ -1051,7 +1061,9 @@ impl IoBridge {
         if msg.error_code == ERR_THIN_UNCACHED_PALETTE {
             // Recover which palette_id was last emitted for this tile by
             // consulting metrics_tracker.codec_state.
-            let m = self.metrics_tracker.get(msg.tile_x as u32, msg.tile_y as u32);
+            let m = self
+                .metrics_tracker
+                .get(msg.tile_x as u32, msg.tile_y as u32);
             if let CodecState::PalRle { palette_id } = m.codec_state {
                 self.palette_table.force_rebundle(palette_id);
                 tracing::info!(
@@ -1072,9 +1084,15 @@ impl IoBridge {
     /// no-ops on a fresh server but break test setups that capture frames
     /// before the client connects.
     fn maybe_fire_session_reset(&mut self, handle: ConnectionHandle) {
-        let Some(wt) = self.wt_sessions.get(&handle) else { return; };
-        if !wt.is_connected() { return; }
-        if !self.session_resets_fired.insert(handle) { return; }
+        let Some(wt) = self.wt_sessions.get(&handle) else {
+            return;
+        };
+        if !wt.is_connected() {
+            return;
+        }
+        if !self.session_resets_fired.insert(handle) {
+            return;
+        }
         if self.has_seen_prior_session {
             self.fire_session_reset(handle);
         }
@@ -1597,7 +1615,10 @@ impl IoBridge {
                         "cdf53.sweep_check"
                     );
                 }
-                if self.scheduler.tile_fully_acked(tile_x, tile_y, gen, max_passes) {
+                if self
+                    .scheduler
+                    .tile_fully_acked(tile_x, tile_y, gen, max_passes)
+                {
                     self.metrics_tracker
                         .get_mut(tile_x as u32, tile_y as u32)
                         .codec_state = crate::tile::CodecState::PixelPerfect;
@@ -1716,8 +1737,7 @@ impl IoBridge {
                 }
 
                 // M3.5 bench telemetry: H264 frame completed — all fragments sent.
-                let h264_wire_bytes: u32 =
-                    datagrams.iter().map(|dg| dg.len() as u32).sum();
+                let h264_wire_bytes: u32 = datagrams.iter().map(|dg| dg.len() as u32).sum();
                 tracing::info!(
                     target: "ghostframe::bench",
                     frame_seq = seq,
@@ -1838,10 +1858,7 @@ impl IoBridge {
                     let cdf53_count = unsafe { *cdf53_compact_count_ptr };
                     if cdf53_count > 0 {
                         let cdf53_list = unsafe {
-                            std::slice::from_raw_parts(
-                                cdf53_compact_list_ptr,
-                                cdf53_count as usize,
-                            )
+                            std::slice::from_raw_parts(cdf53_compact_list_ptr, cdf53_count as usize)
                         };
                         for (slot, &flat_tile_idx) in cdf53_list.iter().enumerate() {
                             let tile_x = (flat_tile_idx % cols) as u8;
@@ -1879,15 +1896,19 @@ impl IoBridge {
                                             );
                                             // Pick CPU reference based on which dispatches were skipped:
                                             // SKIP_L2_L3 → L1-only; SKIP_L3 → L2-only; otherwise full.
-                                            let skip_l2_l3 = std::env::var(
-                                                "GHOSTFRAME_CDF53_SKIP_L2_L3",
-                                            )
-                                            .is_ok();
-                                            let skip_l3 = std::env::var("GHOSTFRAME_CDF53_SKIP_L3").is_ok();
+                                            let skip_l2_l3 =
+                                                std::env::var("GHOSTFRAME_CDF53_SKIP_L2_L3")
+                                                    .is_ok();
+                                            let skip_l3 =
+                                                std::env::var("GHOSTFRAME_CDF53_SKIP_L3").is_ok();
                                             let cpu_coeffs = if skip_l2_l3 {
-                                                crate::encoder::cdf53::forward_level1_only(&tile_bgra)
+                                                crate::encoder::cdf53::forward_level1_only(
+                                                    &tile_bgra,
+                                                )
                                             } else if skip_l3 {
-                                                crate::encoder::cdf53::forward_level2_only(&tile_bgra)
+                                                crate::encoder::cdf53::forward_level2_only(
+                                                    &tile_bgra,
+                                                )
                                             } else {
                                                 crate::encoder::cdf53::forward(&tile_bgra)
                                             };
@@ -1902,7 +1923,8 @@ impl IoBridge {
                                             let cpu_coeffs_swapped =
                                                 crate::encoder::cdf53::forward(&tile_swapped);
                                             // Sample tile pixels (first 8 BGRA px).
-                                            let bgra_head: Vec<u8> = tile_bgra.iter().take(32).copied().collect();
+                                            let bgra_head: Vec<u8> =
+                                                tile_bgra.iter().take(32).copied().collect();
                                             tracing::info!(
                                                 target: "ghostframe::cdf53::diff",
                                                 tile_x = tile_x,
@@ -1947,15 +1969,25 @@ impl IoBridge {
                                             // are within each channel's 1024-coefficient block.
                                             let mut sb_diff = [[0usize; 10]; 3];
                                             let band_ranges = [
-                                                (0, 16), (16, 32), (32, 48), (48, 64),
-                                                (64, 128), (128, 192), (192, 256),
-                                                (256, 512), (512, 768), (768, 1024),
+                                                (0, 16),
+                                                (16, 32),
+                                                (32, 48),
+                                                (48, 64),
+                                                (64, 128),
+                                                (128, 192),
+                                                (192, 256),
+                                                (256, 512),
+                                                (512, 768),
+                                                (768, 1024),
                                             ];
                                             for ch in 0..3 {
                                                 let base = ch * 1024;
-                                                for (b, (lo, hi)) in band_ranges.iter().enumerate() {
+                                                for (b, (lo, hi)) in band_ranges.iter().enumerate()
+                                                {
                                                     for i in *lo..*hi {
-                                                        if coeffs_i16[base + i] != cpu_coeffs[base + i] {
+                                                        if coeffs_i16[base + i]
+                                                            != cpu_coeffs[base + i]
+                                                        {
                                                             sb_diff[ch][b] += 1;
                                                         }
                                                     }
@@ -2003,7 +2035,8 @@ impl IoBridge {
                                     "cdf53.emit"
                                 );
                             }
-                            self.scheduler.enqueue_refinement(tile_x, tile_y, gen, passes);
+                            self.scheduler
+                                .enqueue_refinement(tile_x, tile_y, gen, passes);
                             // Override the CPU classifier's codec_state so that
                             // dispatch_dirty_tiles_via_scheduler's pre-check can
                             // correctly identify this tile as Cdf53 and skip the
@@ -2014,9 +2047,9 @@ impl IoBridge {
                             self.metrics_tracker
                                 .get_mut(tile_x as u32, tile_y as u32)
                                 .codec_state = crate::tile::CodecState::Cdf53 {
-                                    passes_sent: 0,
-                                    max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
-                                };
+                                passes_sent: 0,
+                                max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
+                            };
                         }
                     }
                 }
@@ -2027,7 +2060,8 @@ impl IoBridge {
                 // escalation forward dispatches recorded above). Reads
                 // escalation coefficients per-slot, encodes 14 passes,
                 // enqueues into the scheduler.
-                let escalation_candidates = std::mem::take(&mut self.cdf53_escalation_candidates_this_frame);
+                let escalation_candidates =
+                    std::mem::take(&mut self.cdf53_escalation_candidates_this_frame);
                 if !escalation_candidates.is_empty() {
                     let gpu_coeffs_ptr = {
                         let gpu = self.gpu_frame_processor.as_ref().unwrap();
@@ -2044,14 +2078,17 @@ impl IoBridge {
                         // emit 14 duplicate cdf53.emit lines, and waste a
                         // GPU forward dispatch with the same coefficients.
                         if matches!(
-                            self.metrics_tracker.get(tile_x as u32, tile_y as u32).codec_state,
+                            self.metrics_tracker
+                                .get(tile_x as u32, tile_y as u32)
+                                .codec_state,
                             crate::tile::CodecState::Cdf53 { .. }
                         ) {
                             continue;
                         }
                         let coeffs_i32 = unsafe {
                             std::slice::from_raw_parts(
-                                gpu_coeffs_ptr.add(slot * crate::encoder::cdf53::CDF53_TOTAL_COEFFS),
+                                gpu_coeffs_ptr
+                                    .add(slot * crate::encoder::cdf53::CDF53_TOTAL_COEFFS),
                                 crate::encoder::cdf53::CDF53_TOTAL_COEFFS,
                             )
                         };
@@ -2074,7 +2111,8 @@ impl IoBridge {
                                 "cdf53.emit"
                             );
                         }
-                        self.scheduler.enqueue_refinement(tile_x, tile_y, gen, passes);
+                        self.scheduler
+                            .enqueue_refinement(tile_x, tile_y, gen, passes);
 
                         let tm = self.metrics_tracker.get_mut(tile_x as u32, tile_y as u32);
                         tm.codec_state = crate::tile::CodecState::Cdf53 {
@@ -2564,8 +2602,7 @@ impl IoBridge {
     pub(crate) fn new_with_stream_for_test(stream: TokioUnixStream, server: QuicServer) -> Self {
         // Warm rayon's global thread pool so the first PalRLE-heavy frame
         // doesn't pay thread-spin-up latency on the hot path (design Section 4).
-        rayon::iter::IntoParallelIterator::into_par_iter(0..1u32)
-            .for_each(|_| {});
+        rayon::iter::IntoParallelIterator::into_par_iter(0..1u32).for_each(|_| {});
 
         IoBridge {
             _handle: None,
@@ -2623,8 +2660,7 @@ impl IoBridge {
     ) -> Self {
         // Warm rayon's global thread pool so the first PalRLE-heavy frame
         // doesn't pay thread-spin-up latency on the hot path (design Section 4).
-        rayon::iter::IntoParallelIterator::into_par_iter(0..1u32)
-            .for_each(|_| {});
+        rayon::iter::IntoParallelIterator::into_par_iter(0..1u32).for_each(|_| {});
 
         IoBridge {
             _handle: None,
@@ -2714,12 +2750,15 @@ impl IoBridge {
         self.feedback_history.push_back(fb);
         self.recent_suspension_flags = [self.recent_suspension_flags[1], suspended];
         self.adaptation_context.loss_rate =
-            crate::transport::feedback::ReceiverFeedback::smoothed_loss_rate(&self.feedback_history);
+            crate::transport::feedback::ReceiverFeedback::smoothed_loss_rate(
+                &self.feedback_history,
+            );
         self.adaptation_context.suspended =
             self.recent_suspension_flags[0] || self.recent_suspension_flags[1];
         self.adaptation_context.last_update_seq =
             self.adaptation_context.last_update_seq.wrapping_add(1);
-        self.classifier.set_adaptation_context(self.adaptation_context);
+        self.classifier
+            .set_adaptation_context(self.adaptation_context);
     }
 
     /// Compute `bytes_per_us` from a `(cwnd_bytes, smoothed_rtt_us)` snapshot,
@@ -2735,7 +2774,8 @@ impl IoBridge {
         self.adaptation_context.smoothed_rtt_us = smoothed_rtt_us;
         self.adaptation_context.last_update_seq =
             self.adaptation_context.last_update_seq.wrapping_add(1);
-        self.classifier.set_adaptation_context(self.adaptation_context);
+        self.classifier
+            .set_adaptation_context(self.adaptation_context);
     }
 
     /// Read live `path_stats` from every active connection, convert RTT
@@ -2826,7 +2866,12 @@ mod tests {
     async fn apply_hello_enables_indices_raw() {
         use crate::transport::client_caps::{ClientCapabilities, HelloMsg};
         let mut bridge = make_bridge_for_test().await;
-        let msg = HelloMsg { caps: ClientCapabilities { indices_raw_enabled: true, ..Default::default() } };
+        let msg = HelloMsg {
+            caps: ClientCapabilities {
+                indices_raw_enabled: true,
+                ..Default::default()
+            },
+        };
         bridge.apply_hello(msg);
         assert!(bridge.current_client_caps().indices_raw_enabled);
     }
@@ -3132,16 +3177,15 @@ mod tests {
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
         let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
         // Record coverage as if the server had just emitted a Cdf53 pass.
-        let cov: crate::transport::fragment_coverage::CoverageList = smallvec::smallvec![
-            crate::transport::fragment_coverage::FragmentCoverage {
+        let cov: crate::transport::fragment_coverage::CoverageList =
+            smallvec::smallvec![crate::transport::fragment_coverage::FragmentCoverage {
                 tile_x: 7,
                 tile_y: 9,
                 generation: 1,
                 pass_idx: 0,
                 codec: crate::transport::protocol::Codec::Cdf53,
                 palette_id: None,
-            }
-        ];
+            }];
         // Key: (frame_seq=100, tile_x=7, tile_y=9, pass_idx=0)
         bridge.fragment_coverage.record((100, 7, 9, 0), cov);
 
@@ -3178,10 +3222,7 @@ mod tests {
         };
         // Should not panic, should not modify any state.
         bridge.dispatch_ack_datagram(&batch.encode());
-        assert_eq!(
-            bridge.scheduler.cdf53_passes_acked_for_test(0, 0, 0),
-            0,
-        );
+        assert_eq!(bridge.scheduler.cdf53_passes_acked_for_test(0, 0, 0), 0,);
     }
 
     /// dispatch_ack_datagram silently ignores datagrams whose first byte
@@ -3195,7 +3236,7 @@ mod tests {
         // Non-0x03 first byte → silently dropped.
         bridge.dispatch_ack_datagram(&[0xFF, 0, 0, 0, 0, 0]);
         bridge.dispatch_ack_datagram(&[0x01, 1, 0, 0]); // OLD FEEDBACK type; not us
-        // Empty.
+                                                        // Empty.
         bridge.dispatch_ack_datagram(&[]);
         // No panic; nothing to assert beyond reaching this line.
     }
@@ -3287,8 +3328,11 @@ mod tests {
         let prev = std::env::var("GHOSTFRAME_INJECT_OOB_PALRLE").ok();
         std::env::set_var("GHOSTFRAME_INJECT_OOB_PALRLE", "5,7");
         let inj = IoBridge::oob_injector_from_env();
-        if let Some(p) = prev { std::env::set_var("GHOSTFRAME_INJECT_OOB_PALRLE", p); }
-        else { std::env::remove_var("GHOSTFRAME_INJECT_OOB_PALRLE"); }
+        if let Some(p) = prev {
+            std::env::set_var("GHOSTFRAME_INJECT_OOB_PALRLE", p);
+        } else {
+            std::env::remove_var("GHOSTFRAME_INJECT_OOB_PALRLE");
+        }
         assert_eq!(inj, Some((5u32, 7u32)));
     }
 
@@ -3306,7 +3350,9 @@ mod tests {
         bridge.palette_table.delivered.insert(7);
 
         let handle_a = ConnectionHandle(0);
-        bridge.wt_sessions.insert(handle_a, WebTransportServer::default());
+        bridge
+            .wt_sessions
+            .insert(handle_a, WebTransportServer::default());
 
         // Pre-connected → no fire.
         bridge.maybe_fire_session_reset(handle_a);
@@ -3341,7 +3387,9 @@ mod tests {
 
         // RECONNECT (new handle_b): reset body fires now (has_seen_prior_session=true).
         let handle_b = ConnectionHandle(1);
-        bridge.wt_sessions.insert(handle_b, WebTransportServer::default());
+        bridge
+            .wt_sessions
+            .insert(handle_b, WebTransportServer::default());
         bridge
             .wt_sessions
             .get_mut(&handle_b)
@@ -3377,7 +3425,10 @@ mod tests {
 
         // Default (unset) is false.
         std::env::remove_var("GHOSTFRAME_SKIP_PALETTE_SESSION_RESET");
-        assert!(!IoBridge::skip_palette_session_reset_from_env(), "unset must yield false");
+        assert!(
+            !IoBridge::skip_palette_session_reset_from_env(),
+            "unset must yield false"
+        );
     }
 
     #[test]
@@ -3722,16 +3773,15 @@ mod tests {
         bridge.palette_table.in_flight_carrying[7] = 1;
 
         // Record coverage as if the server emitted a PalRle tile with palette_id=7.
-        let cov: crate::transport::fragment_coverage::CoverageList = smallvec::smallvec![
-            crate::transport::fragment_coverage::FragmentCoverage {
+        let cov: crate::transport::fragment_coverage::CoverageList =
+            smallvec::smallvec![crate::transport::fragment_coverage::FragmentCoverage {
                 tile_x: 0,
                 tile_y: 0,
                 generation: 0,
                 pass_idx: 0,
                 codec: crate::transport::protocol::Codec::PalRle,
                 palette_id: Some(7),
-            }
-        ];
+            }];
         // Key: (frame_seq=200, tile_x=0, tile_y=0, pass_idx=0)
         bridge.fragment_coverage.record((200, 0, 0, 0), cov);
 
@@ -3767,16 +3817,15 @@ mod tests {
         bridge.palette_table.in_flight_carrying[5] = 1;
 
         // Record coverage as if the server emitted a PalRle tile with palette_id=5.
-        let cov: crate::transport::fragment_coverage::CoverageList = smallvec::smallvec![
-            crate::transport::fragment_coverage::FragmentCoverage {
+        let cov: crate::transport::fragment_coverage::CoverageList =
+            smallvec::smallvec![crate::transport::fragment_coverage::FragmentCoverage {
                 tile_x: 0,
                 tile_y: 0,
                 generation: 0,
                 pass_idx: 0,
                 codec: crate::transport::protocol::Codec::PalRle,
                 palette_id: Some(5),
-            }
-        ];
+            }];
         // Key: (frame_seq=201, tile_x=0, tile_y=0, pass_idx=0)
         bridge.fragment_coverage.record((201, 0, 0, 0), cov);
 
@@ -3790,7 +3839,10 @@ mod tests {
         };
         bridge.dispatch_ack_datagram(&batch.encode());
 
-        assert_eq!(bridge.palette_table.ref_count[5], 0, "ACK must release the Phase A acquire");
+        assert_eq!(
+            bridge.palette_table.ref_count[5], 0,
+            "ACK must release the Phase A acquire"
+        );
         assert_eq!(
             bridge.palette_table.slot_state[5],
             SlotState::FreeButCached,
@@ -3858,7 +3910,10 @@ mod tests {
         let prep = PalRleTileWorkPrep {
             tile_xy: (0, 0),
             indices: [0xAB; 512],
-            palette: PaletteEntry { count: 2, colors: [[0xFF, 0, 0, 0xFF]; 16] },
+            palette: PaletteEntry {
+                count: 2,
+                colors: [[0xFF, 0, 0, 0xFF]; 16],
+            },
             palette_id: 9,
             bundled: false, // thin path
         };
@@ -3879,7 +3934,10 @@ mod tests {
         let prep = PalRleTileWorkPrep {
             tile_xy: (5, 7),
             indices: [0x00; 512], // all-same index → max-compressible RLE
-            palette: PaletteEntry { count: 1, colors: [[0xFF, 0, 0, 0xFF]; 16] },
+            palette: PaletteEntry {
+                count: 1,
+                colors: [[0xFF, 0, 0, 0xFF]; 16],
+            },
             palette_id: 3,
             bundled: false, // thin path
         };
@@ -3891,7 +3949,10 @@ mod tests {
         let payload = &map[&(5, 7)];
         assert_eq!(payload[0], 0x00, "thin flag (bit 0 clear, bit 1 clear)");
         assert_eq!(payload[1], 3, "palette_id");
-        assert!(payload.len() < 514, "RLE compresses single-index tile far below 514");
+        assert!(
+            payload.len() < 514,
+            "RLE compresses single-index tile far below 514"
+        );
     }
 
     #[test]
@@ -3900,7 +3961,10 @@ mod tests {
         let prep = PalRleTileWorkPrep {
             tile_xy: (1, 1),
             indices: [0x00; 512],
-            palette: PaletteEntry { count: 1, colors: [[0xFF, 0, 0, 0xFF]; 16] },
+            palette: PaletteEntry {
+                count: 1,
+                colors: [[0xFF, 0, 0, 0xFF]; 16],
+            },
             palette_id: 12,
             bundled: true,
         };
@@ -3916,10 +3980,10 @@ mod tests {
 
     #[tokio::test]
     async fn feedback_stream_parses_hello_then_feedback_then_decode_error() {
+        use crate::encoder::pal_rle::PaletteEntry;
         use crate::transport::client_caps::{ClientCapabilities, HelloMsg};
         use crate::transport::decode_error::{DecodeErrorMsg, ERR_THIN_UNCACHED_PALETTE};
         use crate::transport::feedback::ReceiverFeedback;
-        use crate::encoder::pal_rle::PaletteEntry;
 
         let mut bridge = make_bridge_for_test().await;
 
@@ -3927,7 +3991,10 @@ mod tests {
         // path can find a palette to clear. The metrics_tracker also needs
         // to record that tile (3, 4) is currently rendering palette_id=7
         // for handle_decode_error to locate it.
-        let pal = PaletteEntry { count: 1, colors: [[10, 20, 30, 255]; 16] };
+        let pal = PaletteEntry {
+            count: 1,
+            colors: [[10, 20, 30, 255]; 16],
+        };
         bridge.palette_table.write_bytes(7, &pal);
         bridge.palette_table.delivered.insert(7);
         bridge.metrics_tracker.resize(8, 8);
@@ -3935,13 +4002,24 @@ mod tests {
             crate::tile::CodecState::PalRle { palette_id: 7 };
 
         // Concatenated stream: HELLO (2 B) + FEEDBACK (22 B) + DECODE_ERROR (5 B) = 29 bytes
-        let hello = HelloMsg { caps: ClientCapabilities { indices_raw_enabled: true, ..Default::default() } };
+        let hello = HelloMsg {
+            caps: ClientCapabilities {
+                indices_raw_enabled: true,
+                ..Default::default()
+            },
+        };
         let fb = ReceiverFeedback {
-            timestamp_ns: 0, datagrams_received: 0, datagrams_lost: 0,
-            datagrams_recovered_fec: 0, suspension_detected: false,
+            timestamp_ns: 0,
+            datagrams_received: 0,
+            datagrams_lost: 0,
+            datagrams_recovered_fec: 0,
+            suspension_detected: false,
         };
         let err = DecodeErrorMsg {
-            codec: 2, tile_x: 3, tile_y: 4, error_code: ERR_THIN_UNCACHED_PALETTE,
+            codec: 2,
+            tile_x: 3,
+            tile_y: 4,
+            error_code: ERR_THIN_UNCACHED_PALETTE,
         };
 
         let mut buf = Vec::new();
@@ -3953,26 +4031,33 @@ mod tests {
         bridge.dispatch_feedback_bytes(&buf);
 
         // HELLO applied:
-        assert!(bridge.current_client_caps().indices_raw_enabled,
-            "HELLO message must apply caps");
+        assert!(
+            bridge.current_client_caps().indices_raw_enabled,
+            "HELLO message must apply caps"
+        );
 
         // DECODE_ERROR with code 3 cleared the delivered bit (via force_rebundle):
-        assert!(!bridge.palette_table.delivered.contains(7),
-            "ERR_THIN_UNCACHED_PALETTE must clear delivered bit via force_rebundle");
+        assert!(
+            !bridge.palette_table.delivered.contains(7),
+            "ERR_THIN_UNCACHED_PALETTE must clear delivered bit via force_rebundle"
+        );
     }
 
     #[tokio::test]
     async fn decode_error_3_triggers_force_rebundle() {
-        use crate::transport::decode_error::{DecodeErrorMsg, ERR_THIN_UNCACHED_PALETTE};
-        use crate::tile::CodecState;
         use crate::encoder::pal_rle::PaletteEntry;
+        use crate::tile::CodecState;
+        use crate::transport::decode_error::{DecodeErrorMsg, ERR_THIN_UNCACHED_PALETTE};
 
         let mut bridge = make_bridge_for_test().await;
 
         // Set up state: palette_table slot 5 is in the "delivered" state so the
         // next emission for that palette would be thin. metrics_tracker records
         // that tile (3, 4) is currently rendering palette_id=5.
-        let pal = PaletteEntry { count: 1, colors: [[10, 20, 30, 255]; 16] };
+        let pal = PaletteEntry {
+            count: 1,
+            colors: [[10, 20, 30, 255]; 16],
+        };
         bridge.palette_table.write_bytes(5, &pal);
         bridge.palette_table.delivered.insert(5);
         bridge.metrics_tracker.resize(8, 8);
@@ -3980,36 +4065,49 @@ mod tests {
 
         // Simulate client reporting thin-uncached for that tile.
         let msg = DecodeErrorMsg {
-            codec: 2, tile_x: 3, tile_y: 4, error_code: ERR_THIN_UNCACHED_PALETTE,
+            codec: 2,
+            tile_x: 3,
+            tile_y: 4,
+            error_code: ERR_THIN_UNCACHED_PALETTE,
         };
         bridge.handle_decode_error(msg);
 
         // delivered bit must be cleared so the next emission rebundles.
-        assert!(!bridge.palette_table.delivered.contains(5),
-            "force_rebundle should clear the delivered bit for palette_id=5");
+        assert!(
+            !bridge.palette_table.delivered.contains(5),
+            "force_rebundle should clear the delivered bit for palette_id=5"
+        );
     }
 
     #[tokio::test]
     async fn decode_error_other_codes_no_op_on_palette_table() {
-        use crate::transport::decode_error::{DecodeErrorMsg, ERR_INDEX_OOB};
-        use crate::tile::CodecState;
         use crate::encoder::pal_rle::PaletteEntry;
+        use crate::tile::CodecState;
+        use crate::transport::decode_error::{DecodeErrorMsg, ERR_INDEX_OOB};
 
         let mut bridge = make_bridge_for_test().await;
-        let pal = PaletteEntry { count: 1, colors: [[10, 20, 30, 255]; 16] };
+        let pal = PaletteEntry {
+            count: 1,
+            colors: [[10, 20, 30, 255]; 16],
+        };
         bridge.palette_table.write_bytes(5, &pal);
         bridge.palette_table.delivered.insert(5);
         bridge.metrics_tracker.resize(8, 8);
         bridge.metrics_tracker.get_mut(3, 4).codec_state = CodecState::PalRle { palette_id: 5 };
 
         let msg = DecodeErrorMsg {
-            codec: 2, tile_x: 3, tile_y: 4, error_code: ERR_INDEX_OOB,
+            codec: 2,
+            tile_x: 3,
+            tile_y: 4,
+            error_code: ERR_INDEX_OOB,
         };
         bridge.handle_decode_error(msg);
 
         // Code 5 is log-only in M3.2b — delivered must remain set.
-        assert!(bridge.palette_table.delivered.contains(5),
-            "ERR_INDEX_OOB should not clear delivered bit (M3.2b leaves it as a future hook)");
+        assert!(
+            bridge.palette_table.delivered.contains(5),
+            "ERR_INDEX_OOB should not clear delivered bit (M3.2b leaves it as a future hook)"
+        );
     }
 
     /// Verify the io_bridge escalation-sweep logic in isolation:
@@ -4021,9 +4119,9 @@ mod tests {
     /// validated end-to-end by Task 13's e2e_progressive_refinement test.
     #[tokio::test]
     async fn escalation_sweep_returns_expected_candidates() {
-        use crate::tile::{CodecState, MetricsTracker};
-        use crate::tile::detect_escalation_candidates;
         use crate::capture::gpu_pipeline::MAX_ESCALATION_PER_FRAME;
+        use crate::tile::detect_escalation_candidates;
+        use crate::tile::{CodecState, MetricsTracker};
 
         // Build a 4×4 tracker and make tiles (0,0), (1,0), (2,0) eligible:
         // idle_frames > 30, lossy codec (H264 post-M3.5b L1 prune; Solid
@@ -4047,19 +4145,28 @@ mod tests {
         let candidates = detect_escalation_candidates(&tracker, MAX_ESCALATION_PER_FRAME);
 
         // Flat row-major indices: (0,0)=0, (1,0)=1, (2,0)=2
-        assert_eq!(candidates, vec![0u32, 1, 2],
-            "sweep should return exactly the three eligible tiles in row-major order");
+        assert_eq!(
+            candidates,
+            vec![0u32, 1, 2],
+            "sweep should return exactly the three eligible tiles in row-major order"
+        );
 
         // Simulate what process_frame_gpu does: stash on IoBridge.
         let mut bridge = make_bridge_for_test().await;
         bridge.cdf53_escalation_candidates_this_frame = candidates.clone();
-        assert_eq!(bridge.cdf53_escalation_candidates_this_frame, vec![0u32, 1, 2],
-            "stashed candidates must match what the sweep returned");
+        assert_eq!(
+            bridge.cdf53_escalation_candidates_this_frame,
+            vec![0u32, 1, 2],
+            "stashed candidates must match what the sweep returned"
+        );
 
         // Verify k_max capping is respected by the sweep helper.
         let capped = detect_escalation_candidates(&tracker, 2);
-        assert_eq!(capped, vec![0u32, 1],
-            "k_max=2 should cap the result to the first 2 candidates");
+        assert_eq!(
+            capped,
+            vec![0u32, 1],
+            "k_max=2 should cap the result to the first 2 candidates"
+        );
     }
 
     /// Verify that `process_frame` emits a `frame.captured` tracing event with
@@ -4194,7 +4301,10 @@ mod tests {
         // Non-zero, non-uniform pixels: a 32×32 frame = 1 tile.
         let mut pixels = vec![0u8; 32 * 32 * 4];
         for px in pixels.chunks_exact_mut(4) {
-            px[0] = 128; px[1] = 64; px[2] = 32; px[3] = 255;
+            px[0] = 128;
+            px[1] = 64;
+            px[2] = 32;
+            px[3] = 255;
         }
         let grid = crate::tile::TileGrid::new(32, 32);
         let dirty = vec![(0u32, 0u32)];
@@ -4218,7 +4328,11 @@ mod tests {
         );
 
         // Stats should reflect 1 Raw tile dispatched.
-        assert_eq!(stats.tile_count, 1, "expected 1 tile in stats; got {}", stats.tile_count);
+        assert_eq!(
+            stats.tile_count, 1,
+            "expected 1 tile in stats; got {}",
+            stats.tile_count
+        );
         assert!(
             stats.total_wire_bytes > 0,
             "expected non-zero wire bytes; got {}",
@@ -4279,8 +4393,7 @@ mod tests {
         // Inject a path-stats snapshot manually (the wire to a real quinn
         // Connection is exercised by integration tests, not this unit).
         bridge.apply_path_stats_snapshot(
-            /* cwnd_bytes */ 60_000,
-            /* smoothed_rtt_us */ 12_000.0,
+            /* cwnd_bytes */ 60_000, /* smoothed_rtt_us */ 12_000.0,
         );
         assert!(bridge.adaptation_context.last_update_seq > initial_seq);
         assert!(bridge.adaptation_context.bytes_per_us > 0.0);

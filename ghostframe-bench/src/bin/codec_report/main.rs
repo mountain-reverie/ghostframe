@@ -4,15 +4,15 @@
 //!
 //! Spec: docs/superpowers/specs/2026-06-01-m3.5-bench-publication-design.md.
 
+mod aggregate;
 mod bandwidth_matrix;
 mod bias_sweep;
-mod loss_axis;
-mod shaping_matrix;
-mod headroom_sweep;
 mod cli;
-mod runner;
-mod aggregate;
+mod headroom_sweep;
+mod loss_axis;
 mod report;
+mod runner;
+mod shaping_matrix;
 
 use clap::Parser;
 
@@ -40,15 +40,25 @@ async fn main() -> anyhow::Result<()> {
             std::env::set_var("SHAPE_DELAY_MS", shape.delay_ms.to_string());
             std::env::set_var("SHAPE_LOSS_PCT", shape.loss_pct.to_string());
             for hp in headroom_sweep::HEADROOM_VALUES_BPUS {
-                std::env::set_var("GHOSTFRAME_TEST_HEADROOM_MIN_BPUS", hp.value_bpus.to_string());
+                std::env::set_var(
+                    "GHOSTFRAME_TEST_HEADROOM_MIN_BPUS",
+                    hp.value_bpus.to_string(),
+                );
                 let labeled_name = format!("{}/{}", hp.label, shape.label);
                 let spec = SceneSpec {
                     name: Box::leak(labeled_name.clone().into_boxed_str()),
-                    test_pattern_args: headroom_sweep::DEFAULT_TEST_PATTERN_ARGS.iter().map(|s| s.to_string()).collect(),
+                    test_pattern_args: headroom_sweep::DEFAULT_TEST_PATTERN_ARGS
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
                     duration: args.scene_duration,
                     initial_mode: FrameMode::TileCodec,
                 };
-                tracing::info!(headroom_bpus = hp.value_bpus, shape = shape.label, "headroom-sweep run");
+                tracing::info!(
+                    headroom_bpus = hp.value_bpus,
+                    shape = shape.label,
+                    "headroom-sweep run"
+                );
                 if let Err(e) = runner::run_one_scene(&spec, &mut state).await {
                     tracing::warn!(headroom_bpus = hp.value_bpus, shape = shape.label, error = %e, "headroom-sweep scene failed, continuing");
                 }
@@ -100,7 +110,10 @@ async fn main() -> anyhow::Result<()> {
         // half (matches e2e_progressive_refinement which observes 720+).
         std::env::set_var("CAPTURE_FPS", "30");
         for point in bias_sweep::BIAS_VALUES_US {
-            std::env::set_var("GHOSTFRAME_TEST_REFINEMENT_BIAS_US", point.value_us.to_string());
+            std::env::set_var(
+                "GHOSTFRAME_TEST_REFINEMENT_BIAS_US",
+                point.value_us.to_string(),
+            );
             std::env::set_var(
                 "GHOSTFRAME_OUTBOUND_BANDWIDTH_CAP",
                 bias_sweep::DEFAULT_BANDWIDTH_BYTES_PER_SEC.to_string(),
@@ -116,11 +129,18 @@ async fn main() -> anyhow::Result<()> {
             let labeled_name = format!("{}/{}", point.label, bias_sweep::DEFAULT_SCENE_NAME);
             let spec = SceneSpec {
                 name: Box::leak(labeled_name.clone().into_boxed_str()),
-                test_pattern_args: bias_sweep::DEFAULT_TEST_PATTERN_ARGS.iter().map(|s| s.to_string()).collect(),
+                test_pattern_args: bias_sweep::DEFAULT_TEST_PATTERN_ARGS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
                 duration: args.scene_duration,
                 initial_mode: FrameMode::TileCodec,
             };
-            tracing::info!(bias_us = point.value_us, scene = bias_sweep::DEFAULT_SCENE_NAME, "bias-sweep run");
+            tracing::info!(
+                bias_us = point.value_us,
+                scene = bias_sweep::DEFAULT_SCENE_NAME,
+                "bias-sweep run"
+            );
             if let Err(e) = runner::run_one_scene(&spec, &mut state).await {
                 tracing::warn!(bias_us = point.value_us, error = %e, "bias-sweep scene failed, continuing");
             }
@@ -148,13 +168,19 @@ async fn main() -> anyhow::Result<()> {
                 "GHOSTFRAME_OUTBOUND_BANDWIDTH_CAP",
                 loss_axis::DEFAULT_BANDWIDTH_BYTES_PER_SEC.to_string(),
             );
-            std::env::set_var("GHOSTFRAME_INBOUND_LOSS_PROBABILITY", point.probability.to_string());
+            std::env::set_var(
+                "GHOSTFRAME_INBOUND_LOSS_PROBABILITY",
+                point.probability.to_string(),
+            );
             std::env::set_var("GHOSTFRAME_INBOUND_LOSS_SEED", "42");
             std::env::set_var("GHOSTFRAME_INBOUND_LOSS_PREDICATE", "tile");
             let labeled_name = format!("{}/{}", point.label, loss_axis::DEFAULT_SCENE_NAME);
             let spec = SceneSpec {
                 name: Box::leak(labeled_name.clone().into_boxed_str()),
-                test_pattern_args: loss_axis::DEFAULT_TEST_PATTERN_ARGS.iter().map(|s| s.to_string()).collect(),
+                test_pattern_args: loss_axis::DEFAULT_TEST_PATTERN_ARGS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
                 duration: args.scene_duration,
                 initial_mode: FrameMode::TileCodec,
             };

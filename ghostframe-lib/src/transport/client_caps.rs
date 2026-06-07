@@ -38,7 +38,9 @@ impl HelloMsg {
     pub fn encode(&self, buf: &mut Vec<u8>) {
         buf.push(HELLO_MSG_TYPE);
         let mut caps_byte = 0u8;
-        if self.caps.indices_raw_enabled { caps_byte |= 0x01; }
+        if self.caps.indices_raw_enabled {
+            caps_byte |= 0x01;
+        }
         buf.push(caps_byte);
     }
 }
@@ -80,11 +82,14 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        let msg = HelloMsg { caps: ClientCapabilities { indices_raw_enabled: true } };
+        let msg = HelloMsg {
+            caps: ClientCapabilities {
+                indices_raw_enabled: true,
+            },
+        };
         let mut buf = Vec::new();
         msg.encode(&mut buf);
         assert_eq!(buf, vec![HELLO_MSG_TYPE, 0x01]);
         assert_eq!(HelloMsg::decode(&buf), Some(msg));
     }
-
 }

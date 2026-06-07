@@ -126,9 +126,8 @@ impl FragmentCoverageMap {
         let mut dropped_keys: smallvec::SmallVec<[CoverageKey; 16]> = smallvec::SmallVec::new();
         self.entries.retain(|&key, cov_list| {
             let (_, tx, ty, _) = key;
-            let target = tx == tile_x
-                && ty == tile_y
-                && cov_list.iter().any(|c| c.codec == Codec::Cdf53);
+            let target =
+                tx == tile_x && ty == tile_y && cov_list.iter().any(|c| c.codec == Codec::Cdf53);
             if target {
                 dropped_keys.push(key);
                 false
@@ -197,8 +196,12 @@ mod tests {
     fn map_records_and_takes() {
         let mut m = FragmentCoverageMap::new(16);
         let cov: CoverageList = smallvec::smallvec![FragmentCoverage {
-            tile_x: 1, tile_y: 2, generation: 0, pass_idx: 0,
-            codec: Codec::Solid, palette_id: None,
+            tile_x: 1,
+            tile_y: 2,
+            generation: 0,
+            pass_idx: 0,
+            codec: Codec::Solid,
+            palette_id: None,
         }];
         // key: (frame_seq=100, tile_x=1, tile_y=2, pass_idx=0)
         m.record((100, 1, 2, 0), cov.clone());
@@ -234,8 +237,12 @@ mod tests {
         let mut m = FragmentCoverageMap::new(16);
         let make_cdf53 = |tile_x: u8, tile_y: u8| -> CoverageList {
             smallvec::smallvec![FragmentCoverage {
-                tile_x, tile_y, generation: 0, pass_idx: 0,
-                codec: Codec::Cdf53, palette_id: None,
+                tile_x,
+                tile_y,
+                generation: 0,
+                pass_idx: 0,
+                codec: Codec::Cdf53,
+                palette_id: None,
             }]
         };
         // Same tile (5,3) spread across two frames and two passes (4 entries).
@@ -256,8 +263,14 @@ mod tests {
         assert!(m.take((100, 5, 3, 1)).is_none());
         assert!(m.take((101, 5, 3, 0)).is_none());
         assert!(m.take((101, 5, 3, 1)).is_none());
-        assert!(m.take((100, 6, 3, 0)).is_some(), "neighbor (6,3) unaffected");
-        assert!(m.take((100, 5, 4, 0)).is_some(), "neighbor (5,4) unaffected");
+        assert!(
+            m.take((100, 6, 3, 0)).is_some(),
+            "neighbor (6,3) unaffected"
+        );
+        assert!(
+            m.take((100, 5, 4, 0)).is_some(),
+            "neighbor (5,4) unaffected"
+        );
     }
 
     #[test]
@@ -270,8 +283,12 @@ mod tests {
         let mut m = FragmentCoverageMap::new(16);
         let one = |codec: Codec, palette_id: Option<u8>| -> CoverageList {
             smallvec::smallvec![FragmentCoverage {
-                tile_x: 4, tile_y: 4, generation: 0, pass_idx: 0,
-                codec, palette_id,
+                tile_x: 4,
+                tile_y: 4,
+                generation: 0,
+                pass_idx: 0,
+                codec,
+                palette_id,
             }]
         };
         m.record((10, 4, 4, 0), one(Codec::Solid, None));
@@ -296,8 +313,12 @@ mod tests {
         // LRU eviction would try to remove a key that isn't there.
         let mut m = FragmentCoverageMap::new(3);
         let cdf53: CoverageList = smallvec::smallvec![FragmentCoverage {
-            tile_x: 0, tile_y: 0, generation: 0, pass_idx: 0,
-            codec: Codec::Cdf53, palette_id: None,
+            tile_x: 0,
+            tile_y: 0,
+            generation: 0,
+            pass_idx: 0,
+            codec: Codec::Cdf53,
+            palette_id: None,
         }];
         m.record((0, 1, 1, 0), cdf53.clone());
         m.record((0, 2, 2, 0), cdf53.clone());
@@ -325,8 +346,12 @@ mod tests {
         let mut m = FragmentCoverageMap::new(16);
         let make_cov = |pass_idx: u8| -> CoverageList {
             smallvec::smallvec![FragmentCoverage {
-                tile_x: 5, tile_y: 3, generation: 1, pass_idx,
-                codec: Codec::Cdf53, palette_id: None,
+                tile_x: 5,
+                tile_y: 3,
+                generation: 1,
+                pass_idx,
+                codec: Codec::Cdf53,
+                palette_id: None,
             }]
         };
         // Record all 14 passes of tile (5,3) in frame 42 — no collision.

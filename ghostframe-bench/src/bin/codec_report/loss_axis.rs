@@ -11,12 +11,30 @@ pub struct LossPoint {
 }
 
 pub const LOSS_VALUES: &[LossPoint] = &[
-    LossPoint { label: "loss_2pct",  probability: 0.02 },
-    LossPoint { label: "loss_5pct",  probability: 0.05 },
-    LossPoint { label: "loss_8pct",  probability: 0.08 },
-    LossPoint { label: "loss_10pct", probability: 0.10 }, // current threshold
-    LossPoint { label: "loss_12pct", probability: 0.12 },
-    LossPoint { label: "loss_15pct", probability: 0.15 },
+    LossPoint {
+        label: "loss_2pct",
+        probability: 0.02,
+    },
+    LossPoint {
+        label: "loss_5pct",
+        probability: 0.05,
+    },
+    LossPoint {
+        label: "loss_8pct",
+        probability: 0.08,
+    },
+    LossPoint {
+        label: "loss_10pct",
+        probability: 0.10,
+    }, // current threshold
+    LossPoint {
+        label: "loss_12pct",
+        probability: 0.12,
+    },
+    LossPoint {
+        label: "loss_15pct",
+        probability: 0.15,
+    },
 ];
 
 /// 12-second halves match the bias_sweep default for consistency. The

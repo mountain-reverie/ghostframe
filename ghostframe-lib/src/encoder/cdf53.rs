@@ -82,18 +82,68 @@ pub fn forward(tile_bgra: &[u8]) -> Vec<i16> {
         let mut out_idx = channel_offset;
 
         // LL3, HL3, LH3, HH3 (4×4 each → 16 each)
-        for y in 0..4 { for x in 0..4 { output[out_idx] = work[y][x] as i16; out_idx += 1; } }       // LL3
-        for y in 0..4 { for x in 4..8 { output[out_idx] = work[y][x] as i16; out_idx += 1; } }       // HL3
-        for y in 4..8 { for x in 0..4 { output[out_idx] = work[y][x] as i16; out_idx += 1; } }       // LH3
-        for y in 4..8 { for x in 4..8 { output[out_idx] = work[y][x] as i16; out_idx += 1; } }       // HH3
-        // HL2, LH2, HH2 (8×8 each → 64 each)
-        for y in 0..8  { for x in 8..16  { output[out_idx] = work[y][x] as i16; out_idx += 1; } }    // HL2
-        for y in 8..16 { for x in 0..8   { output[out_idx] = work[y][x] as i16; out_idx += 1; } }    // LH2
-        for y in 8..16 { for x in 8..16  { output[out_idx] = work[y][x] as i16; out_idx += 1; } }    // HH2
-        // HL1, LH1, HH1 (16×16 each → 256 each)
-        for y in 0..16  { for x in 16..32 { output[out_idx] = work[y][x] as i16; out_idx += 1; } }   // HL1
-        for y in 16..32 { for x in 0..16  { output[out_idx] = work[y][x] as i16; out_idx += 1; } }   // LH1
-        for y in 16..32 { for x in 16..32 { output[out_idx] = work[y][x] as i16; out_idx += 1; } }   // HH1
+        for y in 0..4 {
+            for x in 0..4 {
+                output[out_idx] = work[y][x] as i16;
+                out_idx += 1;
+            }
+        } // LL3
+        for y in 0..4 {
+            for x in 4..8 {
+                output[out_idx] = work[y][x] as i16;
+                out_idx += 1;
+            }
+        } // HL3
+        for y in 4..8 {
+            for x in 0..4 {
+                output[out_idx] = work[y][x] as i16;
+                out_idx += 1;
+            }
+        } // LH3
+        for y in 4..8 {
+            for x in 4..8 {
+                output[out_idx] = work[y][x] as i16;
+                out_idx += 1;
+            }
+        } // HH3
+          // HL2, LH2, HH2 (8×8 each → 64 each)
+        for y in 0..8 {
+            for x in 8..16 {
+                output[out_idx] = work[y][x] as i16;
+                out_idx += 1;
+            }
+        } // HL2
+        for y in 8..16 {
+            for x in 0..8 {
+                output[out_idx] = work[y][x] as i16;
+                out_idx += 1;
+            }
+        } // LH2
+        for y in 8..16 {
+            for x in 8..16 {
+                output[out_idx] = work[y][x] as i16;
+                out_idx += 1;
+            }
+        } // HH2
+          // HL1, LH1, HH1 (16×16 each → 256 each)
+        for y in 0..16 {
+            for x in 16..32 {
+                output[out_idx] = work[y][x] as i16;
+                out_idx += 1;
+            }
+        } // HL1
+        for y in 16..32 {
+            for x in 0..16 {
+                output[out_idx] = work[y][x] as i16;
+                out_idx += 1;
+            }
+        } // LH1
+        for y in 16..32 {
+            for x in 16..32 {
+                output[out_idx] = work[y][x] as i16;
+                out_idx += 1;
+            }
+        } // HH1
         assert_eq!(out_idx, channel_offset + CDF53_COEFFS_PER_CHANNEL);
     }
 
@@ -143,13 +193,33 @@ pub fn forward_level1_only(tile_bgra: &[u8]) -> Vec<i16> {
         let channel_offset = ch * CDF53_COEFFS_PER_CHANNEL;
         let mut out_idx = channel_offset;
         // LL1 row-major 16x16 at [0..256]
-        for y in 0..16 { for x in 0..16 { output[out_idx] = work[y][x] as i16; out_idx += 1; } }
+        for y in 0..16 {
+            for x in 0..16 {
+                output[out_idx] = work[y][x] as i16;
+                out_idx += 1;
+            }
+        }
         // HL1 row-major 16x16 at [256..512]
-        for y in 0..16 { for x in 16..32 { output[out_idx] = work[y][x] as i16; out_idx += 1; } }
+        for y in 0..16 {
+            for x in 16..32 {
+                output[out_idx] = work[y][x] as i16;
+                out_idx += 1;
+            }
+        }
         // LH1 row-major 16x16 at [512..768]
-        for y in 16..32 { for x in 0..16 { output[out_idx] = work[y][x] as i16; out_idx += 1; } }
+        for y in 16..32 {
+            for x in 0..16 {
+                output[out_idx] = work[y][x] as i16;
+                out_idx += 1;
+            }
+        }
         // HH1 row-major 16x16 at [768..1024]
-        for y in 16..32 { for x in 16..32 { output[out_idx] = work[y][x] as i16; out_idx += 1; } }
+        for y in 16..32 {
+            for x in 16..32 {
+                output[out_idx] = work[y][x] as i16;
+                out_idx += 1;
+            }
+        }
         assert_eq!(out_idx, channel_offset + CDF53_COEFFS_PER_CHANNEL);
     }
     output
@@ -206,19 +276,54 @@ pub fn forward_level2_only(tile_bgra: &[u8]) -> Vec<i16> {
         let channel_offset = ch * CDF53_COEFFS_PER_CHANNEL;
         let mut out_idx = channel_offset;
         // LL2 [0..64]
-        for y in 0..8 { for x in 0..8 { output[out_idx] = work[y][x] as i16; out_idx += 1; } }
+        for y in 0..8 {
+            for x in 0..8 {
+                output[out_idx] = work[y][x] as i16;
+                out_idx += 1;
+            }
+        }
         // HL2 [64..128]
-        for y in 0..8 { for x in 8..16 { output[out_idx] = work[y][x] as i16; out_idx += 1; } }
+        for y in 0..8 {
+            for x in 8..16 {
+                output[out_idx] = work[y][x] as i16;
+                out_idx += 1;
+            }
+        }
         // LH2 [128..192]
-        for y in 8..16 { for x in 0..8 { output[out_idx] = work[y][x] as i16; out_idx += 1; } }
+        for y in 8..16 {
+            for x in 0..8 {
+                output[out_idx] = work[y][x] as i16;
+                out_idx += 1;
+            }
+        }
         // HH2 [192..256]
-        for y in 8..16 { for x in 8..16 { output[out_idx] = work[y][x] as i16; out_idx += 1; } }
+        for y in 8..16 {
+            for x in 8..16 {
+                output[out_idx] = work[y][x] as i16;
+                out_idx += 1;
+            }
+        }
         // HL1 [256..512]
-        for y in 0..16 { for x in 16..32 { output[out_idx] = work[y][x] as i16; out_idx += 1; } }
+        for y in 0..16 {
+            for x in 16..32 {
+                output[out_idx] = work[y][x] as i16;
+                out_idx += 1;
+            }
+        }
         // LH1 [512..768]
-        for y in 16..32 { for x in 0..16 { output[out_idx] = work[y][x] as i16; out_idx += 1; } }
+        for y in 16..32 {
+            for x in 0..16 {
+                output[out_idx] = work[y][x] as i16;
+                out_idx += 1;
+            }
+        }
         // HH1 [768..1024]
-        for y in 16..32 { for x in 16..32 { output[out_idx] = work[y][x] as i16; out_idx += 1; } }
+        for y in 16..32 {
+            for x in 16..32 {
+                output[out_idx] = work[y][x] as i16;
+                out_idx += 1;
+            }
+        }
         assert_eq!(out_idx, channel_offset + CDF53_COEFFS_PER_CHANNEL);
     }
     output
@@ -239,8 +344,8 @@ fn row_forward(buf: &mut [i32], n: usize) {
     }
     // Update step (even indices become low-pass).
     for i in (0..n).step_by(2) {
-        let left = if i == 0 { buf[1] } else { buf[i - 1] };       // mirror
-        let right = if i + 1 < n { buf[i + 1] } else { buf[i - 1] };// mirror
+        let left = if i == 0 { buf[1] } else { buf[i - 1] }; // mirror
+        let right = if i + 1 < n { buf[i + 1] } else { buf[i - 1] }; // mirror
         buf[i] += (left + right + 2) >> 2;
     }
     // Deinterleave: L L L L H H H H
@@ -270,16 +375,66 @@ pub fn inverse(coefficients: &[i16]) -> Vec<u8> {
         let channel_offset = ch * CDF53_COEFFS_PER_CHANNEL;
         let mut in_idx = channel_offset;
 
-        for y in 0..4 { for x in 0..4 { work[y][x] = coefficients[in_idx] as i32; in_idx += 1; } }       // LL3
-        for y in 0..4 { for x in 4..8 { work[y][x] = coefficients[in_idx] as i32; in_idx += 1; } }       // HL3
-        for y in 4..8 { for x in 0..4 { work[y][x] = coefficients[in_idx] as i32; in_idx += 1; } }       // LH3
-        for y in 4..8 { for x in 4..8 { work[y][x] = coefficients[in_idx] as i32; in_idx += 1; } }       // HH3
-        for y in 0..8  { for x in 8..16  { work[y][x] = coefficients[in_idx] as i32; in_idx += 1; } }
-        for y in 8..16 { for x in 0..8   { work[y][x] = coefficients[in_idx] as i32; in_idx += 1; } }
-        for y in 8..16 { for x in 8..16  { work[y][x] = coefficients[in_idx] as i32; in_idx += 1; } }
-        for y in 0..16  { for x in 16..32 { work[y][x] = coefficients[in_idx] as i32; in_idx += 1; } }
-        for y in 16..32 { for x in 0..16  { work[y][x] = coefficients[in_idx] as i32; in_idx += 1; } }
-        for y in 16..32 { for x in 16..32 { work[y][x] = coefficients[in_idx] as i32; in_idx += 1; } }
+        for y in 0..4 {
+            for x in 0..4 {
+                work[y][x] = coefficients[in_idx] as i32;
+                in_idx += 1;
+            }
+        } // LL3
+        for y in 0..4 {
+            for x in 4..8 {
+                work[y][x] = coefficients[in_idx] as i32;
+                in_idx += 1;
+            }
+        } // HL3
+        for y in 4..8 {
+            for x in 0..4 {
+                work[y][x] = coefficients[in_idx] as i32;
+                in_idx += 1;
+            }
+        } // LH3
+        for y in 4..8 {
+            for x in 4..8 {
+                work[y][x] = coefficients[in_idx] as i32;
+                in_idx += 1;
+            }
+        } // HH3
+        for y in 0..8 {
+            for x in 8..16 {
+                work[y][x] = coefficients[in_idx] as i32;
+                in_idx += 1;
+            }
+        }
+        for y in 8..16 {
+            for x in 0..8 {
+                work[y][x] = coefficients[in_idx] as i32;
+                in_idx += 1;
+            }
+        }
+        for y in 8..16 {
+            for x in 8..16 {
+                work[y][x] = coefficients[in_idx] as i32;
+                in_idx += 1;
+            }
+        }
+        for y in 0..16 {
+            for x in 16..32 {
+                work[y][x] = coefficients[in_idx] as i32;
+                in_idx += 1;
+            }
+        }
+        for y in 16..32 {
+            for x in 0..16 {
+                work[y][x] = coefficients[in_idx] as i32;
+                in_idx += 1;
+            }
+        }
+        for y in 16..32 {
+            for x in 16..32 {
+                work[y][x] = coefficients[in_idx] as i32;
+                in_idx += 1;
+            }
+        }
         assert_eq!(in_idx, channel_offset + CDF53_COEFFS_PER_CHANNEL);
 
         // 3 levels of 2D inverse decomposition.
@@ -477,10 +632,14 @@ pub fn decode_passes(passes: &[&[u8]]) -> Vec<i16> {
         // Parse the per-pass payload (3 channels of RLE-encoded bit-planes).
         let mut offset = 0;
         for ch in 0..CDF53_CHANNELS {
-            if offset + 2 > payload.len() { return coefficients; } // malformed; bail
+            if offset + 2 > payload.len() {
+                return coefficients;
+            } // malformed; bail
             let len = ((payload[offset] as u16) << 8) | (payload[offset + 1] as u16);
             offset += 2;
-            if offset + len as usize > payload.len() { return coefficients; }
+            if offset + len as usize > payload.len() {
+                return coefficients;
+            }
             let rle = &payload[offset..offset + len as usize];
             offset += len as usize;
             let bit_plane = rle_decode(rle);
@@ -600,29 +759,40 @@ mod fixture {
         json.push_str(&format!("  \"seed\": \"0xCDF5_3B\",\n"));
         json.push_str(&format!("  \"tile_size\": 32,\n"));
         json.push_str(&format!("  \"channels\": 3,\n"));
-        json.push_str(&format!("  \"coefficients_per_channel\": {},\n", CDF53_COEFFS_PER_CHANNEL));
+        json.push_str(&format!(
+            "  \"coefficients_per_channel\": {},\n",
+            CDF53_COEFFS_PER_CHANNEL
+        ));
         json.push_str(&format!("  \"pass_count\": {},\n", CDF53_PASS_COUNT));
         // pixels (BGRA, 4096 bytes)
         json.push_str("  \"pixels_bgra\": [");
         for (i, b) in pixels.iter().enumerate() {
-            if i > 0 { json.push(','); }
+            if i > 0 {
+                json.push(',');
+            }
             json.push_str(&b.to_string());
         }
         json.push_str("],\n");
         // expected_coefficients (3072 i16 values, decimal)
         json.push_str("  \"expected_coefficients\": [");
         for (i, c) in coefficients.iter().enumerate() {
-            if i > 0 { json.push(','); }
+            if i > 0 {
+                json.push(',');
+            }
             json.push_str(&c.to_string());
         }
         json.push_str("],\n");
         // encoded_passes (14 entries, each is the raw RLE-encoded payload bytes)
         json.push_str("  \"encoded_passes\": [\n");
         for (i, pass) in passes.iter().enumerate() {
-            if i > 0 { json.push_str(",\n"); }
+            if i > 0 {
+                json.push_str(",\n");
+            }
             json.push_str("    [");
             for (j, b) in pass.iter().enumerate() {
-                if j > 0 { json.push(','); }
+                if j > 0 {
+                    json.push(',');
+                }
                 json.push_str(&b.to_string());
             }
             json.push(']');
@@ -631,13 +801,19 @@ mod fixture {
         // bit_planes_per_pass (14 passes × 3 channels × 128 bytes each, pre-RLE)
         json.push_str("  \"bit_planes_per_pass\": [\n");
         for (i, pass) in bit_planes_per_pass.iter().enumerate() {
-            if i > 0 { json.push_str(",\n"); }
+            if i > 0 {
+                json.push_str(",\n");
+            }
             json.push_str("    [\n");
             for (j, ch) in pass.iter().enumerate() {
-                if j > 0 { json.push_str(",\n"); }
+                if j > 0 {
+                    json.push_str(",\n");
+                }
                 json.push_str("      [");
                 for (k, b) in ch.iter().enumerate() {
-                    if k > 0 { json.push(','); }
+                    if k > 0 {
+                        json.push(',');
+                    }
                     json.push_str(&b.to_string());
                 }
                 json.push(']');
@@ -649,10 +825,10 @@ mod fixture {
 
         // Resolve workspace root via CARGO_MANIFEST_DIR.
         let path: PathBuf = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent().expect("workspace root")
+            .parent()
+            .expect("workspace root")
             .join("ghostframe-e2e/tests/fixtures/cdf53_fixture.json");
-        std::fs::create_dir_all(path.parent().unwrap())
-            .expect("create fixtures dir");
+        std::fs::create_dir_all(path.parent().unwrap()).expect("create fixtures dir");
         std::fs::write(&path, json).expect("write fixture");
         eprintln!("wrote fixture: {}", path.display());
     }
@@ -670,8 +846,10 @@ mod tests_passes {
         assert_eq!(passes.len(), CDF53_PASS_COUNT);
         let pass_refs: Vec<&[u8]> = passes.iter().map(|p| p.as_slice()).collect();
         let recovered = decode_passes(&pass_refs);
-        assert_eq!(recovered, coefficients,
-            "encode_passes → decode_passes should recover coefficients exactly");
+        assert_eq!(
+            recovered, coefficients,
+            "encode_passes → decode_passes should recover coefficients exactly"
+        );
     }
 
     #[test]
@@ -682,7 +860,11 @@ mod tests_passes {
             for b in data.iter_mut() {
                 rng = rng.wrapping_mul(48271).wrapping_add(1);
                 // Bias toward zeros (75% zero) to exercise zero runs.
-                *b = if (rng >> 24) < 64 { (rng >> 16) as u8 } else { 0 };
+                *b = if (rng >> 24) < 64 {
+                    (rng >> 16) as u8
+                } else {
+                    0
+                };
             }
             let encoded = rle_encode(&data);
             let decoded = rle_decode(&encoded);
@@ -793,20 +975,28 @@ mod tests_passes {
             let recovered_coeffs = decode_passes(&pass_refs);
             let recovered_pixels = inverse(&recovered_coeffs);
             let mut error: u64 = 0;
-            for (orig_px, rec_px) in original.chunks_exact(4).zip(recovered_pixels.chunks_exact(3)) {
+            for (orig_px, rec_px) in original
+                .chunks_exact(4)
+                .zip(recovered_pixels.chunks_exact(3))
+            {
                 for ch in 0..3 {
                     let d = orig_px[ch] as i32 - rec_px[ch] as i32;
                     error += (d * d) as u64;
                 }
             }
             if let Some(prev) = prev_error {
-                assert!(error >= prev,
-                    "error monotonicity violated: k={k} error={error} < prev_error={prev}");
+                assert!(
+                    error >= prev,
+                    "error monotonicity violated: k={k} error={error} < prev_error={prev}"
+                );
             }
             prev_error = Some(error);
             // At full passes (k=14), error must be zero.
             if k == CDF53_PASS_COUNT {
-                assert_eq!(error, 0, "k={k} (all passes) should yield zero error; got {error}");
+                assert_eq!(
+                    error, 0,
+                    "k={k} (all passes) should yield zero error; got {error}"
+                );
             }
         }
     }

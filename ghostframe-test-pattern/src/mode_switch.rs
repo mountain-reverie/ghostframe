@@ -57,14 +57,16 @@ pub fn run<C: Connection>(
         let stripe3_h = (height - stripe_h * 2) as u32;
 
         // Stripe 1 — solid.
-        conn.change_gc(
-            gc,
-            &ChangeGCAux::default().foreground(STATIC_BG_PIXEL),
-        )?;
+        conn.change_gc(gc, &ChangeGCAux::default().foreground(STATIC_BG_PIXEL))?;
         conn.poly_fill_rectangle(
             root,
             gc,
-            &[Rectangle { x: 0, y: stripe1_y, width: width as u16, height: stripe_h as u16 }],
+            &[Rectangle {
+                x: 0,
+                y: stripe1_y,
+                width: width as u16,
+                height: stripe_h as u16,
+            }],
         )?;
 
         // Stripe 2 — 8 vertical bars of distinct colors (≤16 colors → PalRle).

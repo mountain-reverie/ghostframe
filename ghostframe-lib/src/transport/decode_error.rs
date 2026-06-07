@@ -67,7 +67,9 @@ mod tests {
 
     #[test]
     fn decode_basic() {
-        let m = DecodeErrorMsg::decode(&[DECODE_ERROR_MSG_TYPE, 2, 7, 13, ERR_THIN_UNCACHED_PALETTE]).unwrap();
+        let m =
+            DecodeErrorMsg::decode(&[DECODE_ERROR_MSG_TYPE, 2, 7, 13, ERR_THIN_UNCACHED_PALETTE])
+                .unwrap();
         assert_eq!(m.codec, 2);
         assert_eq!(m.tile_x, 7);
         assert_eq!(m.tile_y, 13);
@@ -87,7 +89,12 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        let m = DecodeErrorMsg { codec: 2, tile_x: 30, tile_y: 60, error_code: ERR_INDEX_OOB };
+        let m = DecodeErrorMsg {
+            codec: 2,
+            tile_x: 30,
+            tile_y: 60,
+            error_code: ERR_INDEX_OOB,
+        };
         let mut buf = Vec::new();
         m.encode(&mut buf);
         assert_eq!(buf, vec![DECODE_ERROR_MSG_TYPE, 2, 30, 60, ERR_INDEX_OOB]);

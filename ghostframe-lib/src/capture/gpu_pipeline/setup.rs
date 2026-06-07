@@ -8,7 +8,9 @@
 use ash::vk;
 use std::ffi::CStr;
 
-use super::super::pipeline_builder::{self, alloc_host_buffer, alloc_host_buffer_mapped, BindingSpec};
+use super::super::pipeline_builder::{
+    self, alloc_host_buffer, alloc_host_buffer_mapped, BindingSpec,
+};
 use super::*;
 
 impl GpuFrameProcessor {
@@ -230,8 +232,9 @@ impl GpuFrameProcessor {
 
         // --- PalRLE indirect-args shader module ---
         let palrle_indirect_args_spv = include_bytes!("../shaders/palrle_indirect_args.spv");
-        let palrle_indirect_args_spv_words =
-            ash::util::read_spv(&mut std::io::Cursor::new(palrle_indirect_args_spv.as_slice()))?;
+        let palrle_indirect_args_spv_words = ash::util::read_spv(&mut std::io::Cursor::new(
+            palrle_indirect_args_spv.as_slice(),
+        ))?;
         let palrle_indirect_args_shader_ci =
             vk::ShaderModuleCreateInfo::default().code(&palrle_indirect_args_spv_words);
         let palrle_indirect_args_shader_module =
@@ -529,8 +532,9 @@ impl GpuFrameProcessor {
 
         // --- Cdf53 indirect-args shader module (Stage 4b) ---
         let cdf53_indirect_args_spv = include_bytes!("../shaders/cdf53_indirect_args.spv");
-        let cdf53_indirect_args_spv_words =
-            ash::util::read_spv(&mut std::io::Cursor::new(cdf53_indirect_args_spv.as_slice()))?;
+        let cdf53_indirect_args_spv_words = ash::util::read_spv(&mut std::io::Cursor::new(
+            cdf53_indirect_args_spv.as_slice(),
+        ))?;
         let cdf53_indirect_args_shader_ci =
             vk::ShaderModuleCreateInfo::default().code(&cdf53_indirect_args_spv_words);
         let cdf53_indirect_args_shader_module =
@@ -718,14 +722,13 @@ impl GpuFrameProcessor {
         // HOST_VISIBLE | HOST_COHERENT, STORAGE_BUFFER, persistently mapped.
         let index_buffer_size =
             ((max_tiles as vk::DeviceSize) * PER_TILE_INDEX_BYTES).max(PER_TILE_INDEX_BYTES);
-        let (index_buffer, index_buffer_memory, index_buffer_ptr) =
-            alloc_host_buffer_mapped::<u8>(
-                &device,
-                &mem_props,
-                index_buffer_size,
-                vk::BufferUsageFlags::STORAGE_BUFFER,
-                "index buffer",
-            )?;
+        let (index_buffer, index_buffer_memory, index_buffer_ptr) = alloc_host_buffer_mapped::<u8>(
+            &device,
+            &mem_props,
+            index_buffer_size,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            "index buffer",
+        )?;
 
         // --- Cdf53 coefficient buffer (Stage 4c) ---
         // max_tiles * 3 channels * 1024 i32 = max_tiles * 12 KiB.
@@ -751,17 +754,14 @@ impl GpuFrameProcessor {
         // CPU writes tile-idx candidates each frame before escalation dispatch.
         let cdf53_escalation_list_size =
             (crate::capture::gpu_pipeline::MAX_ESCALATION_PER_FRAME as vk::DeviceSize) * 4;
-        let (
-            cdf53_escalation_list_buffer,
-            cdf53_escalation_list_memory,
-            cdf53_escalation_list_ptr,
-        ) = alloc_host_buffer_mapped::<u32>(
-            &device,
-            &mem_props,
-            cdf53_escalation_list_size,
-            vk::BufferUsageFlags::STORAGE_BUFFER,
-            "cdf53 escalation list buffer",
-        )?;
+        let (cdf53_escalation_list_buffer, cdf53_escalation_list_memory, cdf53_escalation_list_ptr) =
+            alloc_host_buffer_mapped::<u32>(
+                &device,
+                &mem_props,
+                cdf53_escalation_list_size,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                "cdf53 escalation list buffer",
+            )?;
 
         // --- M3.3c escalation count buffer ---
         // 1 u32 (4 bytes). HOST_VISIBLE | HOST_COHERENT.
