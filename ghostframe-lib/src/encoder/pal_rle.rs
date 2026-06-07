@@ -180,8 +180,13 @@ impl PaletteTable {
     /// become eligible later when their in-flight ACK arrives.
     pub fn find_eligible_free_slot(&self) -> Option<u8> {
         // We walk in age order without mutating self — find first hit.
-        self.free_lru.iter().find(|&&id| self.slot_state[id as usize] == SlotState::FreeButCached
-                && self.overwrite_eligible(id)).copied()
+        self.free_lru
+            .iter()
+            .find(|&&id| {
+                self.slot_state[id as usize] == SlotState::FreeButCached
+                    && self.overwrite_eligible(id)
+            })
+            .copied()
     }
 
     /// Per-design D3 single-client invariant: on new connection accept,
@@ -352,7 +357,10 @@ pub fn decode_pal_rle(
             return Err(PalRleDecodeError::PaletteCountOutOfRange(count));
         }
         needed(count as usize * 4, cursor)?;
-        let mut p = PaletteEntry { count, ..Default::default() };
+        let mut p = PaletteEntry {
+            count,
+            ..Default::default()
+        };
         for i in 0..count as usize {
             p.colors[i].copy_from_slice(&payload[cursor..cursor + 4]);
             cursor += 4;

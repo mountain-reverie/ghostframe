@@ -1826,6 +1826,7 @@ impl IoBridge {
                 // is actually in this frame's preps — otherwise the hook
                 // would be silently spent on the first PalRle frame whose
                 // preps happen to exclude the injection target.
+                #[cfg(any(test, feature = "test-loss-injection"))]
                 let inject_will_fire = inject
                     .map(|xy| preps.iter().any(|p| p.tile_xy == xy))
                     .unwrap_or(false);
@@ -2473,7 +2474,10 @@ impl IoBridge {
             }
             let effective = (folded_into[pal_id_local as usize] & 0xFF) as usize;
             let raw = &frame_palette_set[effective];
-            let mut palette = PaletteEntry { count: raw.count as u8, ..Default::default() };
+            let mut palette = PaletteEntry {
+                count: raw.count as u8,
+                ..Default::default()
+            };
             for i in 0..palette.count as usize {
                 let v = raw.colors[i];
                 palette.colors[i] = [
@@ -4173,7 +4177,7 @@ mod tests {
     #[tokio::test]
     async fn frame_captured_event_format() {
         use std::sync::{Arc, Mutex};
-        
+
         use tracing_subscriber::util::SubscriberInitExt;
 
         #[derive(Default, Clone)]
@@ -4253,7 +4257,7 @@ mod tests {
     #[tokio::test]
     async fn frame_last_send_event_format() {
         use std::sync::{Arc, Mutex};
-        
+
         use tracing_subscriber::util::SubscriberInitExt;
 
         #[derive(Default, Clone)]

@@ -269,12 +269,18 @@ fn acquire_or_allocate_uses_empty_slot_when_no_match_no_eligible() {
 fn acquire_or_allocate_uses_empty_slots_before_evicting_cached() {
     let mut t = PaletteTable::new();
     let p_red = {
-        let mut p = PaletteEntry { count: 1, ..Default::default() };
+        let mut p = PaletteEntry {
+            count: 1,
+            ..Default::default()
+        };
         p.colors[0] = [0, 0, 0xFF, 0xFF];
         p
     };
     let p_blue = {
-        let mut p = PaletteEntry { count: 1, ..Default::default() };
+        let mut p = PaletteEntry {
+            count: 1,
+            ..Default::default()
+        };
         p.colors[0] = [0xFF, 0, 0, 0xFF];
         p
     };
@@ -552,7 +558,7 @@ fn decode_rejects_index_out_of_range() {
     payload.push(3 << 4);
     let run_count = (1024 - 1 - 16) / 16;
     payload.extend(std::iter::repeat_n(15u8, 1 + run_count)); // first run + remaining runs
-    // Remainder: (1024 - 1 - 16 - (62*16)) = 1024 - 1 - 16 - 992 = 15
+                                                              // Remainder: (1024 - 1 - 16 - (62*16)) = 1024 - 1 - 16 - 992 = 15
     payload.push(14);
     let err = decode_pal_rle(&payload, Some(&palette)).unwrap_err();
     assert!(matches!(err, PalRleDecodeError::IndexOutOfRange { .. }));

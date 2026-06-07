@@ -98,7 +98,10 @@ fn exits_h264_after_sustain_frames_when_costs_drop() {
 #[test]
 fn deadband_keeps_h264_mode_between_thresholds() {
     // Inflate exit_factor to make all our tile-codec costs land in the deadband.
-    let mut c = Classifier { exit_factor: 0.0001, ..Default::default() };
+    let mut c = Classifier {
+        exit_factor: 0.0001,
+        ..Default::default()
+    };
     let states = h264_states(4); // some cost, but exit_factor makes exit unreachable
                                  // time can advance freely; exit_now is always false → stays H264.
     for frame in 0..50u32 {

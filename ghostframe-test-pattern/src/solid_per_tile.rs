@@ -154,11 +154,52 @@ pub fn run(card_path: &str) -> Result<(), Box<dyn std::error::Error>> {
         let br_x = width.saturating_sub(corner);
         let br_y = height.saturating_sub(corner);
 
-        let mut fb = Framebuffer { bytes, pitch, width, height };
-        fill_rect(&mut fb, Rect { x: tl_x, y: tl_y, w: corner, h: corner }, RED_PIXEL);
-        fill_rect(&mut fb, Rect { x: tr_x, y: tr_y, w: corner, h: corner }, GREEN_PIXEL);
-        fill_rect(&mut fb, Rect { x: bl_x, y: bl_y, w: corner, h: corner }, BLUE_PIXEL);
-        fill_rect(&mut fb, Rect { x: br_x, y: br_y, w: corner, h: corner }, YELLOW_PIXEL);
+        let mut fb = Framebuffer {
+            bytes,
+            pitch,
+            width,
+            height,
+        };
+        fill_rect(
+            &mut fb,
+            Rect {
+                x: tl_x,
+                y: tl_y,
+                w: corner,
+                h: corner,
+            },
+            RED_PIXEL,
+        );
+        fill_rect(
+            &mut fb,
+            Rect {
+                x: tr_x,
+                y: tr_y,
+                w: corner,
+                h: corner,
+            },
+            GREEN_PIXEL,
+        );
+        fill_rect(
+            &mut fb,
+            Rect {
+                x: bl_x,
+                y: bl_y,
+                w: corner,
+                h: corner,
+            },
+            BLUE_PIXEL,
+        );
+        fill_rect(
+            &mut fb,
+            Rect {
+                x: br_x,
+                y: br_y,
+                w: corner,
+                h: corner,
+            },
+            YELLOW_PIXEL,
+        );
 
         msync_buffer(fb.bytes);
         // `map` drops here.
@@ -194,10 +235,20 @@ pub fn run(card_path: &str) -> Result<(), Box<dyn std::error::Error>> {
                 FLIP_BLUE
             };
 
-            let mut fb = Framebuffer { bytes, pitch, width, height };
+            let mut fb = Framebuffer {
+                bytes,
+                pitch,
+                width,
+                height,
+            };
             fill_rect(
                 &mut fb,
-                Rect { x: motion_x, y: motion_y, w: motion_size, h: motion_size },
+                Rect {
+                    x: motion_x,
+                    y: motion_y,
+                    w: motion_size,
+                    h: motion_size,
+                },
                 pixel,
             );
 

@@ -2659,14 +2659,13 @@ async fn e2e_cdf53_bypass_integrate() -> Result<()> {
         let dr = (got_r - exp_r).abs();
         let dg = (got_g - exp_g).abs();
         let db = (got_b - exp_b).abs();
-        if (dr > 1 || dg > 1 || db > 1)
-            && mismatches.len() < 20 {
-                let x = i % 32;
-                let y = i / 32;
-                mismatches.push(format!(
+        if (dr > 1 || dg > 1 || db > 1) && mismatches.len() < 20 {
+            let x = i % 32;
+            let y = i / 32;
+            mismatches.push(format!(
                     "px ({x},{y}): exp BGR ({exp_b},{exp_g},{exp_r}) got ({got_b},{got_g},{got_r}) Δ ({db},{dg},{dr})"
                 ));
-            }
+        }
     }
     eprintln!(
         "BYPASS-INTEGRATE MISMATCHES ({} shown of total):",
@@ -2771,17 +2770,16 @@ async fn e2e_cdf53_integrate_correctness() -> Result<()> {
     // Compare against fixture.expected_coefficients (which are also i32 cast from i16).
     let mut mismatches = Vec::new();
     for i in 0..3072 {
-        if got_coeffs[i] != expected_coeffs[i]
-            && mismatches.len() < 30 {
-                mismatches.push(format!(
-                    "coeff[{}] (ch={}, idx={}): expected {}, got {}",
-                    i,
-                    i / 1024,
-                    i % 1024,
-                    expected_coeffs[i],
-                    got_coeffs[i]
-                ));
-            }
+        if got_coeffs[i] != expected_coeffs[i] && mismatches.len() < 30 {
+            mismatches.push(format!(
+                "coeff[{}] (ch={}, idx={}): expected {}, got {}",
+                i,
+                i / 1024,
+                i % 1024,
+                expected_coeffs[i],
+                got_coeffs[i]
+            ));
+        }
     }
     eprintln!(
         "INTEGRATE MISMATCHES: {} total, first 30 shown:",
@@ -2975,17 +2973,16 @@ async fn e2e_cdf53_live_tile_state() -> Result<()> {
 
     let mut mismatches = Vec::new();
     for i in 0..3072 {
-        if got_coeffs[i] != expected_coeffs[i] as i32
-            && mismatches.len() < 30 {
-                mismatches.push(format!(
-                    "coeff[{i}] (ch={} idx={}): expected {}, got {}, diff {}",
-                    i / 1024,
-                    i % 1024,
-                    expected_coeffs[i] as i32,
-                    got_coeffs[i],
-                    got_coeffs[i] - expected_coeffs[i] as i32,
-                ));
-            }
+        if got_coeffs[i] != expected_coeffs[i] as i32 && mismatches.len() < 30 {
+            mismatches.push(format!(
+                "coeff[{i}] (ch={} idx={}): expected {}, got {}, diff {}",
+                i / 1024,
+                i % 1024,
+                expected_coeffs[i] as i32,
+                got_coeffs[i],
+                got_coeffs[i] - expected_coeffs[i] as i32,
+            ));
+        }
     }
     eprintln!("MISMATCHES: {} of 3072 (first 30 shown):", mismatches.len());
     for m in &mismatches {
@@ -3357,14 +3354,13 @@ async fn e2e_cdf53_inverse_gradient_tile() -> Result<()> {
         let dr = (got_r - exp_r).abs();
         let dg = (got_g - exp_g).abs();
         let db = (got_b - exp_b).abs();
-        if (dr > 1 || dg > 1 || db > 1)
-            && mismatches.len() < 20 {
-                let lx = i % 32;
-                let ly = i / 32;
-                mismatches.push(format!(
+        if (dr > 1 || dg > 1 || db > 1) && mismatches.len() < 20 {
+            let lx = i % 32;
+            let ly = i / 32;
+            mismatches.push(format!(
                     "local ({lx},{ly}): exp BGR=({exp_b},{exp_g},{exp_r}) got=({got_b},{got_g},{got_r}) Δ=({db},{dg},{dr})"
                 ));
-            }
+        }
     }
     eprintln!(
         "INVERSE-GRADIENT MISMATCHES (shown of {} total):",
@@ -3683,9 +3679,7 @@ async fn e2e_refinement_cancel() -> Result<()> {
 /// (tile_x, tile_y, gen, passes_remaining) tuples. Returns empty Vec if
 /// no such line is present in the log slice.
 fn parse_last_pending_snapshot(logs: &str) -> Vec<(u8, u8, u8, u8)> {
-    let line = logs
-        .lines()
-        .rfind(|l| l.contains("cdf53.pending_snapshot"));
+    let line = logs.lines().rfind(|l| l.contains("cdf53.pending_snapshot"));
     let Some(line) = line else { return Vec::new() };
     // Format: "... cdf53.pending_snapshot [(tx, ty, g, n), (tx, ty, g, n), ...]"
     let open = match line.find('[') {

@@ -169,10 +169,10 @@ fn gpu_pipeline_dirty_detection() {
         let fd3 = create_changed_memfd(ChangedMemfdParams {
             width,
             height,
-            base: BgraColor { b: 255, g: 0, r: 0 },   // blue
+            base: BgraColor { b: 255, g: 0, r: 0 }, // blue
             change_tile_x: 1,
             change_tile_y: 0,
-            change: BgraColor { b: 0, g: 0, r: 255 },  // red (B=0, G=0, R=255 in BGRA)
+            change: BgraColor { b: 0, g: 0, r: 255 }, // red (B=0, G=0, R=255 in BGRA)
         });
         let third = match tracker.diff(fd3, width, height, stride) {
             Ok(v) => v,
@@ -386,7 +386,11 @@ fn gpu_pipeline_end_to_end() {
         let fd2 = create_changed_memfd(ChangedMemfdParams {
             width,
             height,
-            base: BgraColor { b: 255, g: 255, r: 0 }, // cyan
+            base: BgraColor {
+                b: 255,
+                g: 255,
+                r: 0,
+            }, // cyan
             change_tile_x: 2,
             change_tile_y: 2,
             change: BgraColor { b: 0, g: 0, r: 255 }, // red (BGRA)
