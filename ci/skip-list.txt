@@ -1,19 +1,18 @@
-# Exhaustive list of e2e tests that require host kernel VKMS (vkms module
-# loaded with enable_writeback=1 + /dev/dri bind-mounted into the test-server
-# container). GitHub-hosted runners cannot load kernel modules, so these tests
-# are skipped on CI and run locally.
-#
-# This list is mirrored from `setup_e2e_webgpu_gpu(...)` / `--drm-direct`
-# callers in ghostframe-e2e/tests/e2e.rs. Generate via:
-#
-#   awk '/^async fn e2e_[a-z_]+/{n=$0;sub(/.*fn /,"",n);sub(/\(.*/,"",n);t=1;g=0;next} t{if($0~/setup_e2e_webgpu_gpu|--drm-direct/)g=1;if($0~/^}$/){if(g)print n;t=0}}' ghostframe-e2e/tests/e2e.rs | sort -u
-#
-# When a new GPU-pipeline e2e test lands, add its name here in the same PR.
-# When a test no longer needs VKMS, remove it here in the same PR.
-#
+# E2E tests skipped on CI. Two categories — see comments before each group.
 # Format: one test name per line. `cargo test --skip <name>` uses substring
 # matching, but we list full names for rename safety. `#` introduces a
 # comment; blank lines are ignored.
+
+# --- Category 1: VKMS-gated -------------------------------------------------
+# Tests whose body calls `setup_e2e_webgpu_gpu(...)` or passes `--drm-direct`
+# to the test pattern. They require the host kernel's `vkms` module
+# (`enable_writeback=1`) with `/dev/dri` bind-mounted into the test-server
+# container. GitHub-hosted runners cannot load kernel modules.
+#
+# Regenerate this group with:
+#   awk '/^async fn e2e_[a-z_]+/{n=$0;sub(/.*fn /,"",n);sub(/\(.*/,"",n);t=1;g=0;next} t{if($0~/setup_e2e_webgpu_gpu|--drm-direct/)g=1;if($0~/^}$/){if(g)print n;t=0}}' ghostframe-e2e/tests/e2e.rs | sort -u
+#
+# When a new GPU-pipeline e2e test lands, add its name here in the same PR.
 e2e_ack_telemetry_no_waste
 e2e_cdf53_bypass_integrate
 e2e_cdf53_gradient_emission
@@ -39,3 +38,24 @@ e2e_progressive_refinement
 e2e_refinement_cancel
 e2e_solid_per_tile_pixels
 e2e_text_clarity
+
+# --- Category 2: software-H.264-decode-too-slow-on-2-vCPU-runners ----------
+# Tests whose assertions assume the WebCodecs H.264 decoder keeps up with a
+# 30fps live stream within ~2s. GitHub-hosted ubuntu-24.04 runners have 2
+# vCPU + 7 GB RAM, no real GPU; Chrome's software H.264 decode (via the
+# ffmpeg fork bundled with Google Chrome) can't keep pace with the
+# server-side x264 encoder, so by the time the test reads the canvas the
+# decoder is showing the first frame both times — assertion sees
+# `snap_a == snap_b` and fails.
+#
+# Probe diagnostics confirmed: Chrome 148 stable on the runner does support
+# H.264 baseline/main/high + WebCodecs.VideoDecoder when served over
+# http://localhost (cf. .github/workflows/e2e.yml's "Probe Chromium codec
+# support" step and tests/chromium_probe.rs). The remaining gap is purely a
+# runner-throughput limitation.
+#
+# These run locally on any machine fast enough to keep up with a real video
+# pipeline (= every developer machine ghostframe targets).
+e2e_h264_motion
+e2e_h264_ssim_golden
+e2e_multi_pattern

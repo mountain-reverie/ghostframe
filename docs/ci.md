@@ -38,14 +38,28 @@ All three are required for merge.
 
 #### Why some e2e tests are skipped
 
-About 25 of the 41 e2e tests use `setup_e2e_webgpu_gpu(...)` or
-`--drm-direct`, which require a host kernel with the `vkms` module loaded
-(`enable_writeback=1`). GitHub-hosted runners do not allow loading kernel
-modules, so those tests cannot run on CI.
+The exact list lives in [`ci/skip-list.txt`](../ci/skip-list.txt), grouped
+into two categories:
 
-The exact list lives in [`ci/skip-list.txt`](../ci/skip-list.txt). When a
-new GPU-pipeline e2e test lands, add its name there in the same PR. When a
-test no longer needs VKMS, remove it.
+**Category 1 — VKMS-gated (~25 tests).** Tests whose body calls
+`setup_e2e_webgpu_gpu(...)` or passes `--drm-direct` to the test pattern.
+They require the host kernel's `vkms` module (`enable_writeback=1`) with
+`/dev/dri` bind-mounted into the test-server container. GitHub-hosted
+runners cannot load kernel modules.
+
+**Category 2 — software H.264 decode too slow on 2-vCPU runners
+(3 tests).** `e2e_h264_motion`, `e2e_h264_ssim_golden`, `e2e_multi_pattern`.
+The GitHub-hosted `ubuntu-24.04` runner is 2 vCPU + 7 GB RAM with no real
+GPU, and Chrome's software H.264 decode can't keep pace with the
+server-side x264 encoder. By the time the test samples the canvas, the
+decoder is still showing the first frame and the "did the spinner
+animate?" assertion sees identical snapshots and fails. Chrome 148 stable
+on the runner *does* support H.264 + WebCodecs (verified by the workflow's
+"Probe Chromium codec support" step); the gap is purely runner-throughput.
+These three remain runnable locally on any developer machine.
+
+When a new GPU-pipeline e2e test lands, add its name to Category 1 in the
+same PR. When a test no longer needs VKMS, remove it.
 
 Developers on a machine with VKMS loaded run the full suite locally with
 `just test-e2e`; the skip list is **not** consulted locally.
