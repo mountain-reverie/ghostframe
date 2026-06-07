@@ -18,7 +18,7 @@
 use anyhow::Result;
 use chromiumoxide::{Browser, BrowserConfig};
 use futures::StreamExt;
-use ghostframe_e2e::harness::spawn_weston_headless;
+use ghostframe_e2e::harness::{spawn_weston_headless, start_static_server};
 use std::time::Duration;
 
 const PROBE_HTML: &str = r##"
@@ -67,17 +67,14 @@ const PROBE_HTML: &str = r##"
 </body></html>
 "##;
 
-async fn run_probe(label: &str, builder: BrowserConfig) -> Result<()> {
+async fn run_probe(label: &str, builder: BrowserConfig, page_url: &str) -> Result<()> {
     eprintln!();
     eprintln!("=== Chromium probe: {label} ===");
+    eprintln!("  page_url: {page_url}");
     let (mut browser, mut handler) = Browser::launch(builder).await?;
     let handle = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
-    let data_url = format!(
-        "data:text/html;base64,{}",
-        base64_encode(PROBE_HTML.as_bytes())
-    );
-    let page = browser.new_page(data_url.as_str()).await?;
+    let page = browser.new_page(page_url).await?;
 
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let result: String = loop {
@@ -112,7 +109,28 @@ async fn run_probe(label: &str, builder: BrowserConfig) -> Result<()> {
 
 #[tokio::test]
 async fn chromium_codec_probe() -> Result<()> {
-    // Mode 1: --headless=new (Ozone headless backend, no display server)
+    // Stand up a tiny static HTTP server serving the probe HTML. Loading
+    // via http://127.0.0.1:PORT/index.html gives a real (non-opaque)
+    // origin — WebCodecs is gated on a secure context, and data: URLs
+    // have opaque origins that historically disable it.
+    let tmpdir = std::env::temp_dir().join(format!(
+        "ghostframe-probe-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos()
+    ));
+    std::fs::create_dir_all(&tmpdir)?;
+    std::fs::write(tmpdir.join("index.html"), PROBE_HTML)?;
+    let static_addr = start_static_server(&tmpdir).await?;
+    let http_url = format!("http://{}/index.html", static_addr);
+    let data_url = format!(
+        "data:text/html;base64,{}",
+        base64_encode(PROBE_HTML.as_bytes())
+    );
+
+    // Mode 1: --headless=new + data: URL (worst case — opaque origin, no display)
     {
         let mut builder = BrowserConfig::builder()
             .chrome_executable("/usr/bin/chromium")
@@ -120,18 +138,38 @@ async fn chromium_codec_probe() -> Result<()> {
             .arg("disable-gpu");
         builder = builder.new_headless_mode();
         if let Err(e) = run_probe(
-            "headless=new (no display, no GPU)",
+            "headless=new + data: URL",
             builder.build().unwrap(),
+            data_url.as_str(),
         )
         .await
         {
-            eprintln!("  headless probe error: {e}");
+            eprintln!("  headless+data probe error: {e}");
         }
     }
 
-    // Mode 2: with_head + Weston + XWayland + Vulkan/WebGPU
-    // This matches `setup_e2e_webgpu*` in tests/e2e.rs. Whatever WebCodecs
-    // answers in THIS mode is what the failing H.264 tests actually see.
+    // Mode 2: --headless=new + http://localhost — same headless mode but a
+    // real origin. Isolates "is the failure about origin?" from "is it
+    // about the headless backend?".
+    {
+        let mut builder = BrowserConfig::builder()
+            .chrome_executable("/usr/bin/chromium")
+            .no_sandbox()
+            .arg("disable-gpu");
+        builder = builder.new_headless_mode();
+        if let Err(e) = run_probe(
+            "headless=new + http://localhost",
+            builder.build().unwrap(),
+            http_url.as_str(),
+        )
+        .await
+        {
+            eprintln!("  headless+http probe error: {e}");
+        }
+    }
+
+    // Mode 3: harness mode (with_head + Weston + Vulkan/WebGPU) + http://localhost
+    // This is what the failing H.264 tests actually see.
     {
         let weston = spawn_weston_headless()?;
         let builder = BrowserConfig::builder()
@@ -149,15 +187,48 @@ async fn chromium_codec_probe() -> Result<()> {
             .arg("enable-unsafe-webgpu")
             .arg("ignore-gpu-blocklist");
         if let Err(e) = run_probe(
-            "with_head + weston/xwayland + Vulkan/WebGPU (harness mode)",
+            "harness mode (weston + http://localhost)",
             builder.build().unwrap(),
+            http_url.as_str(),
         )
         .await
         {
-            eprintln!("  weston/webgpu probe error: {e}");
+            eprintln!("  weston+http probe error: {e}");
         }
         drop(weston);
     }
+
+    // Mode 4: harness mode + explicit --enable-blink-features=WebCodecs in
+    // case Chrome's stable default has WebCodecs gated on a runtime flag.
+    {
+        let weston = spawn_weston_headless()?;
+        let builder = BrowserConfig::builder()
+            .chrome_executable("/usr/bin/chromium")
+            .no_sandbox()
+            .with_head()
+            .env("DISPLAY", weston.display.clone())
+            .env(
+                "XDG_RUNTIME_DIR",
+                weston.runtime_dir().to_string_lossy().to_string(),
+            )
+            .arg(("enable-features", "Vulkan,WebGPU,WebCodecs"))
+            .arg("enable-blink-features=WebCodecs")
+            .arg("use-vulkan")
+            .arg("ozone-platform=x11")
+            .arg("enable-unsafe-webgpu")
+            .arg("ignore-gpu-blocklist");
+        if let Err(e) = run_probe(
+            "harness mode + enable-blink-features=WebCodecs",
+            builder.build().unwrap(),
+            http_url.as_str(),
+        )
+        .await
+        {
+            eprintln!("  weston+http+webcodecs-flag probe error: {e}");
+        }
+        drop(weston);
+    }
+
     Ok(())
 }
 
