@@ -59,5 +59,7 @@ pub const HEADROOM_SHAPING_POINTS: &[HeadroomShapingPoint] = &[
     },
 ];
 
+// Kept symmetric with the loss_axis and bias_sweep modules even when not directly referenced.
+#[allow(dead_code)]
 pub const DEFAULT_SCENE_NAME: &str = "mode_switch_12s";
 pub const DEFAULT_TEST_PATTERN_ARGS: &[&str] = &["--mode-switch-cycle", "12"];

@@ -26,6 +26,8 @@ pub struct SceneSummary {
     pub cpu_peak_percent: f64,
     pub rss_max_mb: f64,
     pub vmhwm_max_mb: f64,
+    // Populated for downstream JSON readers; never read internally.
+    #[allow(dead_code)]
     pub codec_wire_bytes: BTreeMap<String, u64>,
 
     // M3.6c additions

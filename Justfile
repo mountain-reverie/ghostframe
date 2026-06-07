@@ -22,7 +22,7 @@ containers-build:
     docker build -t ghostframe/test-headscale -f tests/containers/headscale/Dockerfile tests/containers/headscale/
 
 lint:
-    cargo clippy -- -D warnings
+    cargo clippy --workspace --all-targets -- -D warnings
 
 fmt-check:
     cargo fmt --all -- --check
