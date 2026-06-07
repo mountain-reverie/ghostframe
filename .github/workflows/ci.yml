@@ -1,0 +1,132 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/workflows/_setup-system-deps
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-fast
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  unit:
+    name: unit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/workflows/_setup-system-deps
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-fast
+      - run: cargo test --workspace --lib
+
+  build-release:
+    name: build-release
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/workflows/_setup-system-deps
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-release
+      - run: cargo build --workspace --release --exclude ghostframe-e2e
+
+  web-client:
+    name: web-client
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: ghostframe-web-client/package-lock.json
+      - name: install + build
+        working-directory: ghostframe-web-client
+        run: |
+          npm ci
+          npm run build
+          npx tsc --noEmit
+      - name: upload dist artifact for e2e.yml
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-client-dist
+          path: ghostframe-web-client/dist/
+          retention-days: 7
+          if-no-files-found: error
+
+  cbindgen-check:
+    name: cbindgen-check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/workflows/_setup-system-deps
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-fast
+      - name: regenerate header via build.rs
+        run: cargo check -p ghostframe-lib
+      - name: verify committed header is up to date
+        run: |
+          if ! git diff --exit-code ghostframe-lib/include/ghostframe.h; then
+            echo "::error::ghostframe-lib/include/ghostframe.h is out of date."
+            echo "Run 'cargo check -p ghostframe-lib' locally and commit the regenerated header."
+            exit 1
+          fi
+
+  go-vet:
+    name: go-vet
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache-dependency-path: ghostbridge/go.sum
+      - working-directory: ghostbridge
+        run: |
+          go vet ./...
+          go build ./...
