@@ -131,6 +131,25 @@ jobs:
           done < ci/skip-list.txt
           echo "args=$args" >> "$GITHUB_OUTPUT"
 
+      - name: Point /usr/bin/chromium at Google Chrome (for H.264 + WebCodecs)
+        run: |
+          # The GH-runner /usr/bin/chromium is an open-source Chromium build
+          # without proprietary H.264 codec or WebCodecs API. Google Chrome
+          # always has both. Repoint the symlink so the harness's hardcoded
+          # /usr/bin/chromium picks up Chrome without any code change.
+          if [ ! -x /usr/bin/google-chrome-stable ] && [ ! -x /opt/google/chrome/chrome ]; then
+            echo "google-chrome-stable not pre-installed; installing from Google apt repo"
+            curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
+              | sudo gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg
+            echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" \
+              | sudo tee /etc/apt/sources.list.d/google-chrome.list >/dev/null
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends google-chrome-stable
+          fi
+          chrome_path=$(command -v google-chrome-stable || echo /opt/google/chrome/chrome)
+          sudo ln -sf "$chrome_path" /usr/bin/chromium
+          /usr/bin/chromium --version
+
       - name: Probe Chromium (version + binary path)
         run: |
           mkdir -p /tmp/ghostframe-probe
@@ -147,9 +166,6 @@ jobs:
             echo
             echo "=== readlink -f /usr/bin/chromium ==="
             readlink -f /usr/bin/chromium 2>&1 || true
-            echo
-            echo "=== apt policy chromium ==="
-            apt-cache policy chromium 2>&1 || true
           } 2>&1 | tee "$log"
 
       - name: Probe Chromium codec support (via chromiumoxide)
