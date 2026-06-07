@@ -1,0 +1,33 @@
+name: Setup ghostframe system dependencies
+description: >
+  Installs the apt packages required to build ghostframe on a runner
+  (clang, ffmpeg dev libs, x264, X11 dev headers, DRM dev headers).
+  Reused by e2e.yml and nightly.yml so the package list lives in one
+  place. Production runtime libs live inside the test-server Docker
+  image and are not installed here.
+
+runs:
+  using: composite
+  steps:
+    - name: apt-get update
+      shell: bash
+      run: sudo apt-get update -qq
+
+    - name: install build deps
+      shell: bash
+      run: |
+        sudo apt-get install -y --no-install-recommends \
+          build-essential \
+          pkg-config \
+          clang \
+          libclang-dev \
+          libavcodec-dev \
+          libavformat-dev \
+          libavutil-dev \
+          libswscale-dev \
+          libavdevice-dev \
+          libx264-dev \
+          libx11-dev \
+          libxext-dev \
+          libxdamage-dev \
+          libdrm-dev
