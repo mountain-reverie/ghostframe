@@ -131,10 +131,10 @@ jobs:
           done < ci/skip-list.txt
           echo "args=$args" >> "$GITHUB_OUTPUT"
 
-      - name: Probe Chromium (version + H.264 support)
+      - name: Probe Chromium (version + binary path)
         run: |
           mkdir -p /tmp/ghostframe-probe
-          log=/tmp/ghostframe-probe/chromium.log
+          log=/tmp/ghostframe-probe/chromium-binary.log
           {
             echo "=== which chromium ==="
             which chromium || which chromium-browser || echo "no chromium in PATH"
@@ -145,60 +145,18 @@ jobs:
             echo "=== ls -la /usr/bin/chromium* ==="
             ls -la /usr/bin/chromium* 2>&1 || true
             echo
+            echo "=== readlink -f /usr/bin/chromium ==="
+            readlink -f /usr/bin/chromium 2>&1 || true
+            echo
             echo "=== apt policy chromium ==="
             apt-cache policy chromium 2>&1 || true
-            echo
-            echo "=== H.264 decode probe via MediaCapabilities ==="
-            tmphtml=$(mktemp --suffix=.html)
-            cat > "$tmphtml" <<'HTML'
-          <!doctype html><html><head><title>probe</title></head><body>
-          <script>
-          (async () => {
-            const probes = [
-              {label:"H264 baseline 720p", codecs:'video/mp4; codecs="avc1.42E01E"'},
-              {label:"H264 main 720p",     codecs:'video/mp4; codecs="avc1.4D401E"'},
-              {label:"H264 high 720p",     codecs:'video/mp4; codecs="avc1.640028"'},
-              {label:"VP8",                codecs:'video/webm; codecs="vp8"'},
-              {label:"VP9",                codecs:'video/webm; codecs="vp09.00.10.08"'},
-            ];
-            const out = [];
-            for (const p of probes) {
-              try {
-                const r = await navigator.mediaCapabilities.decodingInfo({
-                  type: "file",
-                  video: {contentType: p.codecs, width: 1280, height: 720, bitrate: 1000000, framerate: 30}
-                });
-                out.push(`${p.label}: supported=${r.supported} smooth=${r.smooth} powerEfficient=${r.powerEfficient}`);
-              } catch (e) {
-                out.push(`${p.label}: ERROR ${e}`);
-              }
-            }
-            // Also probe WebCodecs.VideoDecoder.isConfigSupported for H.264
-            if (typeof VideoDecoder !== "undefined") {
-              try {
-                const r = await VideoDecoder.isConfigSupported({codec: "avc1.42E01E"});
-                out.push(`WebCodecs VideoDecoder avc1.42E01E: ${JSON.stringify(r)}`);
-              } catch (e) {
-                out.push(`WebCodecs VideoDecoder: ERROR ${e}`);
-              }
-            } else {
-              out.push("WebCodecs VideoDecoder: not exposed");
-            }
-            document.title = "PROBE_RESULT:" + out.join(" | ");
-          })();
-          </script>
-          </body></html>
-          HTML
-            /usr/bin/chromium \
-              --headless=new \
-              --no-sandbox \
-              --disable-gpu \
-              --virtual-time-budget=5000 \
-              --dump-dom \
-              --enable-features=Vulkan \
-              "file://$tmphtml" 2>&1 | grep -oE 'PROBE_RESULT:[^<]*' || echo "probe: no PROBE_RESULT marker found"
-            rm -f "$tmphtml"
           } 2>&1 | tee "$log"
+
+      - name: Probe Chromium codec support (via chromiumoxide)
+        run: |
+          set -o pipefail
+          cargo test --test chromium_probe -- --nocapture 2>&1 \
+            | tee /tmp/ghostframe-probe/chromium-codecs.log
 
       - name: Run e2e tests (VKMS-gated subset skipped)
         run: |
