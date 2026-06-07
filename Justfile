@@ -25,10 +25,10 @@ lint:
     cargo clippy -- -D warnings
 
 fmt-check:
-    cargo fmt -- --check
+    cargo fmt --all -- --check
 
 fmt:
-    cargo fmt
+    cargo fmt --all
 
 # Run the fast CI tier (everything in .github/workflows/ci.yml) locally,
 # in the same order. Does NOT run e2e — use `just test-e2e` for that.
