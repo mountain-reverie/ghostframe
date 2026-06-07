@@ -1,9 +1,11 @@
 name: Setup ghostframe system dependencies
 description: >
   Installs the apt packages required to build ghostframe on a runner
-  (clang, ffmpeg dev libs, x264, X11 dev headers, DRM dev headers).
-  Reused by e2e.yml and nightly.yml so the package list lives in one
-  place. Production runtime libs live inside the test-server Docker
+  (clang, ffmpeg dev libs, x264, X11/DRM dev headers) plus the runtime
+  packages the e2e harness needs on the host itself (weston compositor,
+  XWayland, mesa GL/Vulkan drivers for weston's GL renderer). Reused by
+  e2e.yml and nightly.yml so the package list lives in one place.
+  Production runtime libs for the test-server live inside its Docker
   image and are not installed here.
 
 runs:
@@ -13,7 +15,7 @@ runs:
       shell: bash
       run: sudo apt-get update -qq
 
-    - name: install build deps
+    - name: install build + e2e-harness runtime deps
       shell: bash
       run: |
         sudo apt-get install -y --no-install-recommends \
@@ -30,4 +32,9 @@ runs:
           libx11-dev \
           libxext-dev \
           libxdamage-dev \
-          libdrm-dev
+          libdrm-dev \
+          weston \
+          xwayland \
+          libgl1-mesa-dri \
+          mesa-vulkan-drivers \
+          libegl1
