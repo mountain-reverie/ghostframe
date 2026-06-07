@@ -131,21 +131,102 @@ jobs:
           done < ci/skip-list.txt
           echo "args=$args" >> "$GITHUB_OUTPUT"
 
+      - name: Probe Chromium (version + H.264 support)
+        run: |
+          mkdir -p /tmp/ghostframe-probe
+          log=/tmp/ghostframe-probe/chromium.log
+          {
+            echo "=== which chromium ==="
+            which chromium || which chromium-browser || echo "no chromium in PATH"
+            echo
+            echo "=== /usr/bin/chromium --version ==="
+            /usr/bin/chromium --version 2>&1 || echo "/usr/bin/chromium missing"
+            echo
+            echo "=== ls -la /usr/bin/chromium* ==="
+            ls -la /usr/bin/chromium* 2>&1 || true
+            echo
+            echo "=== apt policy chromium ==="
+            apt-cache policy chromium 2>&1 || true
+            echo
+            echo "=== H.264 decode probe via MediaCapabilities ==="
+            tmphtml=$(mktemp --suffix=.html)
+            cat > "$tmphtml" <<'HTML'
+          <!doctype html><html><head><title>probe</title></head><body>
+          <script>
+          (async () => {
+            const probes = [
+              {label:"H264 baseline 720p", codecs:'video/mp4; codecs="avc1.42E01E"'},
+              {label:"H264 main 720p",     codecs:'video/mp4; codecs="avc1.4D401E"'},
+              {label:"H264 high 720p",     codecs:'video/mp4; codecs="avc1.640028"'},
+              {label:"VP8",                codecs:'video/webm; codecs="vp8"'},
+              {label:"VP9",                codecs:'video/webm; codecs="vp09.00.10.08"'},
+            ];
+            const out = [];
+            for (const p of probes) {
+              try {
+                const r = await navigator.mediaCapabilities.decodingInfo({
+                  type: "file",
+                  video: {contentType: p.codecs, width: 1280, height: 720, bitrate: 1000000, framerate: 30}
+                });
+                out.push(`${p.label}: supported=${r.supported} smooth=${r.smooth} powerEfficient=${r.powerEfficient}`);
+              } catch (e) {
+                out.push(`${p.label}: ERROR ${e}`);
+              }
+            }
+            // Also probe WebCodecs.VideoDecoder.isConfigSupported for H.264
+            if (typeof VideoDecoder !== "undefined") {
+              try {
+                const r = await VideoDecoder.isConfigSupported({codec: "avc1.42E01E"});
+                out.push(`WebCodecs VideoDecoder avc1.42E01E: ${JSON.stringify(r)}`);
+              } catch (e) {
+                out.push(`WebCodecs VideoDecoder: ERROR ${e}`);
+              }
+            } else {
+              out.push("WebCodecs VideoDecoder: not exposed");
+            }
+            document.title = "PROBE_RESULT:" + out.join(" | ");
+          })();
+          </script>
+          </body></html>
+          HTML
+            /usr/bin/chromium \
+              --headless=new \
+              --no-sandbox \
+              --disable-gpu \
+              --virtual-time-budget=5000 \
+              --dump-dom \
+              --enable-features=Vulkan \
+              "file://$tmphtml" 2>&1 | grep -oE 'PROBE_RESULT:[^<]*' || echo "probe: no PROBE_RESULT marker found"
+            rm -f "$tmphtml"
+          } 2>&1 | tee "$log"
+
       - name: Run e2e tests (VKMS-gated subset skipped)
         run: |
+          set -o pipefail
           cargo test --test e2e -- \
             --test-threads=1 \
-            ${{ steps.skip-args.outputs.args }}
+            ${{ steps.skip-args.outputs.args }} \
+            2>&1 | tee /tmp/ghostframe-cargo-test.log
 
       - name: Capture container logs on failure
         if: failure()
         run: |
           mkdir -p /tmp/ci-artifacts
           docker ps -a > /tmp/ci-artifacts/docker-ps.txt 2>&1 || true
+          docker events --since 30m --until 0s > /tmp/ci-artifacts/docker-events.txt 2>&1 || true
+          # docker inspect any container that still exists matching ghostframe/headscale names
           for c in ghostframe-server headscale; do
             if docker inspect "$c" >/dev/null 2>&1; then
               docker logs "$c" > "/tmp/ci-artifacts/${c}.stdout.log" 2>"/tmp/ci-artifacts/${c}.stderr.log" || true
             fi
+          done
+          # Also enumerate any container whose name matches our images, in case
+          # testcontainers used a random name (testcontainers Rust prefixes with the image name).
+          for cid in $(docker ps -a -q --filter ancestor=ghostframe/test-server 2>/dev/null); do
+            docker logs "$cid" > "/tmp/ci-artifacts/by-image-server-${cid}.stdout.log" 2>"/tmp/ci-artifacts/by-image-server-${cid}.stderr.log" || true
+          done
+          for cid in $(docker ps -a -q --filter ancestor=ghostframe/test-headscale 2>/dev/null); do
+            docker logs "$cid" > "/tmp/ci-artifacts/by-image-headscale-${cid}.stdout.log" 2>"/tmp/ci-artifacts/by-image-headscale-${cid}.stderr.log" || true
           done
 
       - name: Upload diagnostic artifacts on failure
