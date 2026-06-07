@@ -54,7 +54,7 @@ pub fn run<C: Connection>(
         let stripe1_y = 0i16;
         let stripe2_y = stripe_h as i16;
         let stripe3_y = (stripe_h * 2) as i16;
-        let stripe3_h = (height - stripe_h * 2) as u32;
+        let stripe3_h = height - stripe_h * 2;
 
         // Stripe 1 — solid.
         conn.change_gc(gc, &ChangeGCAux::default().foreground(STATIC_BG_PIXEL))?;
@@ -101,9 +101,9 @@ pub fn run<C: Connection>(
         // the classifier just needs > 16 colors).
         for row in 0..stripe3_h {
             let py = stripe3_y as u32 + row;
-            let r = (py.wrapping_mul(3) & 0xFF) as u32;
-            let g = (py.wrapping_mul(5) & 0xFF) as u32;
-            let b = (py.wrapping_mul(7) & 0xFF) as u32;
+            let r = py.wrapping_mul(3) & 0xFF;
+            let g = py.wrapping_mul(5) & 0xFF;
+            let b = py.wrapping_mul(7) & 0xFF;
             let color = (r << 16) | (g << 8) | b;
             conn.change_gc(gc, &ChangeGCAux::default().foreground(color))?;
             conn.poly_fill_rectangle(

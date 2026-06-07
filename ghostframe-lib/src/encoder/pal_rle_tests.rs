@@ -269,14 +269,12 @@ fn acquire_or_allocate_uses_empty_slot_when_no_match_no_eligible() {
 fn acquire_or_allocate_uses_empty_slots_before_evicting_cached() {
     let mut t = PaletteTable::new();
     let p_red = {
-        let mut p = PaletteEntry::default();
-        p.count = 1;
+        let mut p = PaletteEntry { count: 1, ..Default::default() };
         p.colors[0] = [0, 0, 0xFF, 0xFF];
         p
     };
     let p_blue = {
-        let mut p = PaletteEntry::default();
-        p.count = 1;
+        let mut p = PaletteEntry { count: 1, ..Default::default() };
         p.colors[0] = [0xFF, 0, 0, 0xFF];
         p
     };
@@ -478,7 +476,7 @@ fn rle_pair_pattern_correct_offsets() {
     indices.extend(vec![0u8; 1024 - 5]);
     let packed = make_indices_4bit(&indices);
     let rle = encode_pal_rle_indices(&packed);
-    assert_eq!(rle[0], (0 << 4) | 2, "run of 3 zeros = len 3 → encoded 2");
+    assert_eq!(rle[0], 2, "run of 3 zeros = len 3 → encoded 2");
     assert_eq!(rle[1], (1 << 4) | 1, "run of 2 ones  = len 2 → encoded 1");
 }
 
@@ -551,13 +549,11 @@ fn decode_rejects_index_out_of_range() {
     let palette = make_palette(&[[1, 2, 3, 255], [4, 5, 6, 255]]);
     let mut payload = vec![0x00u8, 0]; // thin, id=0
                                        // 1024 indices = 1024 pixels worth. (idx=3, run=0) covers 1 pixel. Need 1023 more.
-    payload.push((3 << 4) | 0);
-    payload.push((0 << 4) | 15); // run of 16
-    for _ in 0..((1024 - 1 - 16) / 16) {
-        payload.push((0 << 4) | 15);
-    }
+    payload.push(3 << 4);
+    let run_count = (1024 - 1 - 16) / 16;
+    payload.extend(std::iter::repeat_n(15u8, 1 + run_count)); // first run + remaining runs
     // Remainder: (1024 - 1 - 16 - (62*16)) = 1024 - 1 - 16 - 992 = 15
-    payload.push((0 << 4) | 14);
+    payload.push(14);
     let err = decode_pal_rle(&payload, Some(&palette)).unwrap_err();
     assert!(matches!(err, PalRleDecodeError::IndexOutOfRange { .. }));
 }
@@ -570,8 +566,8 @@ fn encode_decode_roundtrip_exact_pixels() {
     let packed = make_indices_4bit(&indices);
     let payload = encode_pal_rle_payload(&packed, &palette, 11, true);
     let result = decode_pal_rle(&payload, None).unwrap();
-    for pixel in 0..1024 {
-        let expected = palette.colors[indices[pixel] as usize];
+    for (pixel, &idx) in indices.iter().enumerate() {
+        let expected = palette.colors[idx as usize];
         let off = pixel * 4;
         assert_eq!(&result.pixels[off..off + 4], &expected, "pixel {}", pixel);
     }

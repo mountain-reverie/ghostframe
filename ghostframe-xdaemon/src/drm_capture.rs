@@ -170,10 +170,9 @@ pub fn capture() -> std::io::Result<CaptureResult> {
 
     // Borrow the writeback option separately so the rest of the state
     // (card, crtc) can be passed to the helper.
-    if state.writeback.is_some() {
+    if let Some(wb) = &state.writeback {
         let crtc = state.crtc;
         let card = &state.card;
-        let wb = state.writeback.as_ref().unwrap();
         let (fd, geom, capture_done_ns) = capture_via_writeback(card, crtc, wb)?;
         return Ok(CaptureResult::Prime(fd, geom, capture_done_ns));
     }
@@ -525,7 +524,7 @@ fn capture_via_modesetting_fb_cpu(
     let capture_done_ns = monotonic_now_ns();
 
     unsafe {
-        libc::munmap(ptr as *mut libc::c_void, size);
+        libc::munmap(ptr, size);
     }
     // prime_fd dropped here, closing the dma-buf reference.
 

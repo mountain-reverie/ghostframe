@@ -142,7 +142,7 @@ impl PaletteTable {
     /// - `delivered[id] == true` (client has rendered using these bytes)
     /// - `in_flight_carrying[id] == 0` AND `delivered[id] == false`
     ///   (bytes never reached the wire)
-    /// Combined with the always-required `ref_count == 0` precondition.
+    ///   Combined with the always-required `ref_count == 0` precondition.
     pub fn overwrite_eligible(&self, id: u8) -> bool {
         if self.ref_count[id as usize] != 0 {
             return false;
@@ -180,14 +180,8 @@ impl PaletteTable {
     /// become eligible later when their in-flight ACK arrives.
     pub fn find_eligible_free_slot(&self) -> Option<u8> {
         // We walk in age order without mutating self — find first hit.
-        for &id in &self.free_lru {
-            if self.slot_state[id as usize] == SlotState::FreeButCached
-                && self.overwrite_eligible(id)
-            {
-                return Some(id);
-            }
-        }
-        None
+        self.free_lru.iter().find(|&&id| self.slot_state[id as usize] == SlotState::FreeButCached
+                && self.overwrite_eligible(id)).copied()
     }
 
     /// Per-design D3 single-client invariant: on new connection accept,
@@ -358,8 +352,7 @@ pub fn decode_pal_rle(
             return Err(PalRleDecodeError::PaletteCountOutOfRange(count));
         }
         needed(count as usize * 4, cursor)?;
-        let mut p = PaletteEntry::default();
-        p.count = count;
+        let mut p = PaletteEntry { count, ..Default::default() };
         for i in 0..count as usize {
             p.colors[i].copy_from_slice(&payload[cursor..cursor + 4]);
             cursor += 4;

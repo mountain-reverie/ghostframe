@@ -152,7 +152,7 @@ mod tests {
         let (g_start, g_len, xor_data) = decode_parity_payload(pp0).unwrap();
         assert_eq!(g_start, 0);
         assert_eq!(g_len, 4);
-        let expected_xor0 = 0u8 ^ 10 ^ 20 ^ 30;
+        let expected_xor0 = 10 ^ 20 ^ 30;
         assert_eq!(xor_data, &[expected_xor0]);
 
         // Group 1: frags 4..7 → group_start=4, group_len=4

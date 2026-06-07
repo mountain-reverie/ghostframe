@@ -166,7 +166,7 @@ struct ScenarioStack {
 
 /// Spin up the full Docker + headscale + ghostframe-server + static web-client
 /// + Chromium browser stack for one scene. Returns a `ScenarioStack` whose
-/// drop tears everything down.
+///   drop tears everything down.
 ///
 /// Mirrors `setup_e2e_inner_with_url_extra` in `tests/e2e.rs` but is
 /// self-contained inside the library so `codec_report` can call it without
@@ -783,30 +783,6 @@ fn parse_server_telemetry(
     (records, decisions, policy_metrics)
 }
 
-// ---------------------------------------------------------------------------
-// Helper: read client diagnostics via Chromium DevTools
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_server_telemetry_counts_pixelperfect_and_decode_error() {
-        let json = r#"
-{"target":"ghostframe::bench","fields":{"message":"cdf53.pixelperfect","tile_x":1,"tile_y":2}}
-{"target":"ghostframe::bench","fields":{"message":"cdf53.pixelperfect","tile_x":3,"tile_y":4}}
-{"target":"ghostframe::bench","fields":{"message":"client decode error","tile_x":0,"tile_y":0,"error_code":1}}
-{"target":"ghostframe::bench","fields":{"message":"frame.captured","frame_seq":1,"capture_done_ns":0,"mode":"tile"}}
-"#.trim();
-        let (records, decisions, metrics) = parse_server_telemetry(json);
-        assert_eq!(metrics.pixelperfect_count, 2);
-        assert_eq!(metrics.decode_error_count, 1);
-        // Sanity: existing parsers still work alongside.
-        assert!(!records.is_empty() || decisions.is_empty()); // captured frame without send is dropped — just assert no panic
-    }
-}
-
 async fn read_client_diagnostics(
     page: &chromiumoxide::Page,
 ) -> Result<Vec<ClientDiagnosticRecord>> {
@@ -867,4 +843,28 @@ async fn read_client_diagnostics(
         });
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Helper: read client diagnostics via Chromium DevTools
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_server_telemetry_counts_pixelperfect_and_decode_error() {
+        let json = r#"
+{"target":"ghostframe::bench","fields":{"message":"cdf53.pixelperfect","tile_x":1,"tile_y":2}}
+{"target":"ghostframe::bench","fields":{"message":"cdf53.pixelperfect","tile_x":3,"tile_y":4}}
+{"target":"ghostframe::bench","fields":{"message":"client decode error","tile_x":0,"tile_y":0,"error_code":1}}
+{"target":"ghostframe::bench","fields":{"message":"frame.captured","frame_seq":1,"capture_done_ns":0,"mode":"tile"}}
+"#.trim();
+        let (records, decisions, metrics) = parse_server_telemetry(json);
+        assert_eq!(metrics.pixelperfect_count, 2);
+        assert_eq!(metrics.decode_error_count, 1);
+        // Sanity: existing parsers still work alongside.
+        assert!(!records.is_empty() || decisions.is_empty()); // captured frame without send is dropped — just assert no panic
+    }
 }

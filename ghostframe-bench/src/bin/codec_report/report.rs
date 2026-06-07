@@ -467,7 +467,7 @@ pub fn write(
                     .unwrap_or(false)
             })
             .collect();
-        rows.sort_by_key(|(name, _)| name.clone());
+        rows.sort_by(|(a, _), (b, _)| a.cmp(b));
 
         if !rows.is_empty() {
             writeln!(
@@ -509,7 +509,7 @@ pub fn write(
                     .unwrap_or(false)
             })
             .collect();
-        rows.sort_by_key(|(name, _)| name.clone());
+        rows.sort_by(|(a, _), (b, _)| a.cmp(b));
 
         if !rows.is_empty() {
             writeln!(
@@ -570,10 +570,12 @@ mod tests {
             for bw in &["10Mbps", "30Mbps"] {
                 for scene in &["solid", "motion"] {
                     let key = format!("{}/{}", bw, scene);
-                    let mut s = SceneSummary::default();
-                    s.h264_dwell_us = 1_500_000;
-                    s.tile_dwell_us = 2_000_000;
-                    s.mode_switch_count = if *bw == "10Mbps" { 7 } else { 1 };
+                    let mut s = SceneSummary {
+                        h264_dwell_us: 1_500_000,
+                        tile_dwell_us: 2_000_000,
+                        mode_switch_count: if *bw == "10Mbps" { 7 } else { 1 },
+                        ..Default::default()
+                    };
                     *s.mode_decision_counts
                         .entry("cost_comparison".into())
                         .or_default() += 3;
@@ -584,10 +586,12 @@ mod tests {
                 }
             }
         } else {
-            let mut s = SceneSummary::default();
-            s.h264_dwell_us = 3_000_000;
-            s.tile_dwell_us = 7_000_000;
-            s.mode_switch_count = 2;
+            let mut s = SceneSummary {
+                h264_dwell_us: 3_000_000,
+                tile_dwell_us: 7_000_000,
+                mode_switch_count: 2,
+                ..Default::default()
+            };
             *s.mode_decision_counts
                 .entry("cost_comparison".into())
                 .or_default() += 5;
@@ -656,14 +660,18 @@ mod tests {
         let args = Cli::parse_from(["codec_report"]);
         let mut state = ReportState::new(&args);
         // Inject one scene per sweep family.
-        let mut bias_summary = SceneSummary::default();
-        bias_summary.sweep_axis_label = Some("bias_10us".into());
-        bias_summary.pixelperfect_count = 42;
-        bias_summary.mode_switch_count = 3;
+        let bias_summary = SceneSummary {
+            sweep_axis_label: Some("bias_10us".into()),
+            pixelperfect_count: 42,
+            mode_switch_count: 3,
+            ..Default::default()
+        };
         state.scenes.insert("bias_10us/text".into(), bias_summary);
-        let mut loss_summary = SceneSummary::default();
-        loss_summary.sweep_axis_label = Some("loss_5pct".into());
-        loss_summary.decode_error_count = 7;
+        let mut loss_summary = SceneSummary {
+            sweep_axis_label: Some("loss_5pct".into()),
+            decode_error_count: 7,
+            ..Default::default()
+        };
         let mut counts = BTreeMap::new();
         counts.insert("loss_override".into(), 2);
         loss_summary.mode_decision_counts = counts;
@@ -697,21 +705,25 @@ mod tests {
         };
         let mut state = ReportState::new(&cli);
         // Shaping matrix scene.
-        let mut shape_summary = SceneSummary::default();
-        shape_summary.sweep_axis_label = Some("shape_10mbps_dsl".into());
-        shape_summary.h264_dwell_us = 3_000_000;
-        shape_summary.tile_dwell_us = 7_000_000;
-        shape_summary.mode_switch_count = 5;
-        shape_summary.pixelperfect_count = 100;
+        let shape_summary = SceneSummary {
+            sweep_axis_label: Some("shape_10mbps_dsl".into()),
+            h264_dwell_us: 3_000_000,
+            tile_dwell_us: 7_000_000,
+            mode_switch_count: 5,
+            pixelperfect_count: 100,
+            ..Default::default()
+        };
         state.scenes.insert("10mbps_dsl/text".into(), shape_summary);
         // Headroom sweep scene.
-        let mut hr_summary = SceneSummary::default();
-        hr_summary.sweep_axis_label = Some("headroom_0.50/1mbps".into());
-        hr_summary.mode_switch_count = 8;
-        hr_summary.pixelperfect_count = 50;
         let mut counts = BTreeMap::new();
         counts.insert("headroom_guard".into(), 3);
-        hr_summary.mode_decision_counts = counts;
+        let hr_summary = SceneSummary {
+            sweep_axis_label: Some("headroom_0.50/1mbps".into()),
+            mode_switch_count: 8,
+            pixelperfect_count: 50,
+            mode_decision_counts: counts,
+            ..Default::default()
+        };
         state
             .scenes
             .insert("headroom_0.50/1mbps".into(), hr_summary);

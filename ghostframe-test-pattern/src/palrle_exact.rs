@@ -76,17 +76,17 @@ pub fn samples() -> Vec<ExactSample> {
     vec![
         // Checkerboard — (px+py)%2 == 0 → A.
         ExactSample {
-            x: cx + 0,
-            y: cy + 0,
+            x: cx,
+            y: cy,
             expected_rgba: RGBA_RED,
         }, // (0,0) even → A
         ExactSample {
             x: cx + 1,
-            y: cy + 0,
+            y: cy,
             expected_rgba: RGBA_BLUE,
         }, // (1,0) odd  → B
         ExactSample {
-            x: cx + 0,
+            x: cx,
             y: cy + 1,
             expected_rgba: RGBA_BLUE,
         }, // (0,1) odd  → B
@@ -97,18 +97,18 @@ pub fn samples() -> Vec<ExactSample> {
         }, // (1,1) even → A
         // Horizontal stripes — py%2 == 0 → A.
         ExactSample {
-            x: hx + 0,
-            y: hy + 0,
+            x: hx,
+            y: hy,
             expected_rgba: RGBA_RED,
         }, // row 0 → A
         ExactSample {
-            x: hx + 0,
+            x: hx,
             y: hy + 1,
             expected_rgba: RGBA_BLUE,
         }, // row 1 → B
         ExactSample {
             x: hx + 31,
-            y: hy + 0,
+            y: hy,
             expected_rgba: RGBA_RED,
         }, // row 0 right end → A
         ExactSample {
@@ -118,17 +118,17 @@ pub fn samples() -> Vec<ExactSample> {
         }, // row 1 right end → B
         // Vertical stripes — px%2 == 0 → A.
         ExactSample {
-            x: vx + 0,
-            y: vy + 0,
+            x: vx,
+            y: vy,
             expected_rgba: RGBA_RED,
         }, // col 0 → A
         ExactSample {
             x: vx + 1,
-            y: vy + 0,
+            y: vy,
             expected_rgba: RGBA_BLUE,
         }, // col 1 → B
         ExactSample {
-            x: vx + 0,
+            x: vx,
             y: vy + 31,
             expected_rgba: RGBA_RED,
         }, // col 0 bottom → A
@@ -139,22 +139,22 @@ pub fn samples() -> Vec<ExactSample> {
         }, // col 1 bottom → B
         // 2×2 blocks — (px/2 + py/2)%2 == 0 → A.
         ExactSample {
-            x: bx + 0,
-            y: by + 0,
+            x: bx,
+            y: by,
             expected_rgba: RGBA_RED,
         }, // block (0,0) → A
         ExactSample {
             x: bx + 1,
-            y: by + 0,
+            y: by,
             expected_rgba: RGBA_RED,
         }, // still block (0,0) → A
         ExactSample {
             x: bx + 2,
-            y: by + 0,
+            y: by,
             expected_rgba: RGBA_BLUE,
         }, // block (1,0) → B
         ExactSample {
-            x: bx + 0,
+            x: bx,
             y: by + 2,
             expected_rgba: RGBA_BLUE,
         }, // block (0,1) → B

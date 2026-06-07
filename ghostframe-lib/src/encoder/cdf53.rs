@@ -7,6 +7,9 @@
 //!   - M3.3b's WGSL inverse compute shader is ported from this reference
 //!     (NOT compiled to WASM — WebGPU compute is the deployed path).
 
+// Wavelet quadrant packing reads more naturally with indexed loops.
+#![allow(clippy::needless_range_loop)]
+
 /// Number of progressive passes emitted per Cdf53 tile.
 /// = 1 sign-bit-plane + 13 magnitude bit-planes covering worst-case
 /// 14-bit signed coefficients after 3 levels of CDF 5/3 lifting on
@@ -333,8 +336,9 @@ pub fn forward_level2_only(tile_bgra: &[u8]) -> Vec<i16> {
 /// Operates in-place. Lifting steps:
 ///   1. predict: x[2i+1] -= (x[2i] + x[2i+2]) / 2          (handle boundary with mirror)
 ///   2. update : x[2i]   += (x[2i-1] + x[2i+1] + 2) / 4   (mirror at boundaries)
-/// After lifting, even indices hold low-pass (L) and odd indices hold high-pass (H).
-/// We then re-arrange to [L_0..L_{n/2-1}, H_0..H_{n/2-1}] (deinterleave).
+///
+///   After lifting, even indices hold low-pass (L) and odd indices hold high-pass (H).
+///   We then re-arrange to [L_0..L_{n/2-1}, H_0..H_{n/2-1}] (deinterleave).
 fn row_forward(buf: &mut [i32], n: usize) {
     // Predict step (odd indices become high-pass).
     for i in (1..n).step_by(2) {
@@ -551,10 +555,11 @@ fn extract_bit_plane(channel: &[i16], pass_idx: usize) -> Vec<u8> {
 /// Run-length encode a byte buffer. Token format:
 ///   - 0x00..=0x7E: literal data byte.
 ///   - 0x7F: two-byte literal escape — next byte is the actual literal (used
-///           when literal would be ≥ 0x80 which would otherwise collide with
-///           the zero-run encoding).
+///     when literal would be ≥ 0x80 which would otherwise collide with
+///     the zero-run encoding).
 ///   - 0x80..=0xFF: zero run of (token & 0x7F) + 1 bytes (1..=128 zeros).
-/// Optimized for sparse bit-planes where most bytes are zero.
+///
+///   Optimized for sparse bit-planes where most bytes are zero.
 fn rle_encode(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -596,7 +601,7 @@ fn rle_decode(rle: &[u8]) -> Vec<u8> {
         } else if token & 0x80 != 0 {
             // Zero run.
             let run_len = (token & 0x7F) as usize + 1;
-            out.extend(std::iter::repeat(0u8).take(run_len));
+            out.extend(std::iter::repeat_n(0u8, run_len));
             i += 1;
         } else {
             out.push(token);
@@ -737,7 +742,7 @@ mod fixture {
     #[test]
     #[ignore = "fixture writer — run explicitly when the codec changes"]
     fn write_reference_fixture() {
-        let pixels = super::tests::make_test_tile(0xCDF5_3B);
+        let pixels = super::tests::make_test_tile(0x00CD_F53B);
         let coefficients = forward(&pixels);
         let passes = encode_passes(&coefficients);
 
@@ -756,9 +761,9 @@ mod fixture {
 
         let mut json = String::new();
         json.push_str("{\n");
-        json.push_str(&format!("  \"seed\": \"0xCDF5_3B\",\n"));
-        json.push_str(&format!("  \"tile_size\": 32,\n"));
-        json.push_str(&format!("  \"channels\": 3,\n"));
+        json.push_str("  \"seed\": \"0xCDF5_3B\",\n");
+        json.push_str("  \"tile_size\": 32,\n");
+        json.push_str("  \"channels\": 3,\n");
         json.push_str(&format!(
             "  \"coefficients_per_channel\": {},\n",
             CDF53_COEFFS_PER_CHANNEL

@@ -304,7 +304,7 @@ impl IoBridge {
     /// (where `<DIR>` is either `OUTBOUND` or `INBOUND`):
     /// - `GHOSTFRAME_<DIR>_LOSS_PROBABILITY` — f32 in [0.0, 1.0], default 0.0
     /// - `GHOSTFRAME_<DIR>_LOSS_PREDICATE` — one of `all` / `tile` / `ack`,
-    ///    default `all`.
+    ///   default `all`.
     /// - `GHOSTFRAME_<DIR>_LOSS_SEED` — u64, default 0.
     #[cfg(any(test, feature = "test-loss-injection"))]
     fn loss_injector_from_env(
@@ -718,7 +718,7 @@ impl IoBridge {
             // not yet been sized (e.g. CpuRawOnly unit test path).
             if tile_x < self.metrics_tracker.cols() && tile_y < self.metrics_tracker.rows() {
                 self.metrics_tracker
-                    .get_mut(tile_x as u32, tile_y as u32)
+                    .get_mut(tile_x, tile_y)
                     .already_escalated_this_gen = false;
             }
             for s in superseded {
@@ -1369,7 +1369,7 @@ impl IoBridge {
         // MetricsTracker::new(0, 0)), so detect_escalation_candidates iterates
         // 0 tiles and returns empty — safe.
         {
-            let caps = self.client_caps;
+            let _caps = self.client_caps;
             // Gate on self.frame_mode (the PREVIOUS frame's mode). Skipping
             // escalation while the previous frame was H264 avoids ~5 ms of
             // wasted GPU forward + 6 MB of HOST_COHERENT writes per frame:
@@ -1591,7 +1591,7 @@ impl IoBridge {
         // here (before Phase B) vs. after Phase B yields no difference in practice.
         {
             let tile_count = (cols * rows) as usize;
-            let diag_frame = seq % 10 == 0;
+            let diag_frame = seq.is_multiple_of(10);
             for idx in 0..tile_count {
                 let tile_x = (idx as u32 % cols) as u8;
                 let tile_y = (idx as u32 / cols) as u8;
@@ -2473,8 +2473,7 @@ impl IoBridge {
             }
             let effective = (folded_into[pal_id_local as usize] & 0xFF) as usize;
             let raw = &frame_palette_set[effective];
-            let mut palette = PaletteEntry::default();
-            palette.count = raw.count as u8;
+            let mut palette = PaletteEntry { count: raw.count as u8, ..Default::default() };
             for i in 0..palette.count as usize {
                 let v = raw.colors[i];
                 palette.colors[i] = [
@@ -2519,6 +2518,8 @@ impl IoBridge {
     /// Legacy entry point — equivalent to `phase_b_encode_payloads_with_caps`
     /// with default (no-capabilities) client. Kept for callers that haven't
     /// threaded capabilities through yet.
+    // Kept as a thin wrapper for tests that exercise the no-caps path; production calls phase_b_encode_payloads_with_caps directly.
+    #[allow(dead_code)]
     pub(crate) fn phase_b_encode_payloads(
         preps: &[PalRleTileWorkPrep],
     ) -> std::collections::HashMap<(u32, u32), Vec<u8>> {
@@ -2580,7 +2581,7 @@ impl IoBridge {
                         // (color_idx=2 >= count=1), writing error_code=5.
                         let mut p_inj = Vec::with_capacity(7 + 64);
                         p_inj.extend_from_slice(&[0x01u8, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xFF]);
-                        p_inj.extend(std::iter::repeat(0x2Fu8).take(64));
+                        p_inj.extend(std::iter::repeat_n(0x2Fu8, 64));
                         payload = p_inj;
                         tracing::info!(
                             target: "palrle.wire",
@@ -2869,7 +2870,6 @@ mod tests {
         let msg = HelloMsg {
             caps: ClientCapabilities {
                 indices_raw_enabled: true,
-                ..Default::default()
             },
         };
         bridge.apply_hello(msg);
@@ -3601,7 +3601,7 @@ mod tests {
         let compact_list = vec![0u32];
         let per_tile_id = vec![0u8];
         // folded_into[0] = default-self = ((255-1)<<8) | 0
-        let folded_into = vec![((255u32 - 1) << 8) | 0u32; 256];
+        let folded_into = vec![(255u32 - 1) << 8; 256];
 
         // Build a frame_palette_set with slot 0 populated (count=1, color BGRA[10,20,30,255]).
         let mut frame_palette_set = vec![
@@ -3658,7 +3658,7 @@ mod tests {
 
         let compact_list = vec![0u32];
         let per_tile_id = vec![0u8];
-        let folded_into = vec![((255u32 - 1) << 8) | 0u32; 256];
+        let folded_into = vec![(255u32 - 1) << 8; 256];
         let mut frame_palette_set = vec![
             crate::capture::gpu_pipeline::FramePaletteEntryRaw {
                 count: 0,
@@ -3919,7 +3919,6 @@ mod tests {
         };
         let caps = crate::transport::client_caps::ClientCapabilities {
             indices_raw_enabled: true,
-            ..Default::default()
         };
         let map = IoBridge::phase_b_encode_payloads_with_caps(&[prep], &caps, None);
         let payload = &map[&(0, 0)];
@@ -3943,7 +3942,6 @@ mod tests {
         };
         let caps = crate::transport::client_caps::ClientCapabilities {
             indices_raw_enabled: false,
-            ..Default::default()
         };
         let map = IoBridge::phase_b_encode_payloads_with_caps(&[prep], &caps, None);
         let payload = &map[&(5, 7)];
@@ -3970,7 +3968,6 @@ mod tests {
         };
         let caps = crate::transport::client_caps::ClientCapabilities {
             indices_raw_enabled: true,
-            ..Default::default()
         };
         let map = IoBridge::phase_b_encode_payloads_with_caps(&[prep], &caps, None);
         let payload = &map[&(1, 1)];
@@ -4005,7 +4002,6 @@ mod tests {
         let hello = HelloMsg {
             caps: ClientCapabilities {
                 indices_raw_enabled: true,
-                ..Default::default()
             },
         };
         let fb = ReceiverFeedback {
@@ -4177,7 +4173,7 @@ mod tests {
     #[tokio::test]
     async fn frame_captured_event_format() {
         use std::sync::{Arc, Mutex};
-        use tracing_subscriber::layer::SubscriberExt;
+        
         use tracing_subscriber::util::SubscriberInitExt;
 
         #[derive(Default, Clone)]
@@ -4257,7 +4253,7 @@ mod tests {
     #[tokio::test]
     async fn frame_last_send_event_format() {
         use std::sync::{Arc, Mutex};
-        use tracing_subscriber::layer::SubscriberExt;
+        
         use tracing_subscriber::util::SubscriberInitExt;
 
         #[derive(Default, Clone)]

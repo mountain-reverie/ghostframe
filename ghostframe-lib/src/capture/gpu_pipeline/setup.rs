@@ -635,7 +635,7 @@ impl GpuFrameProcessor {
         // --- per_tile_frame_palette_id buffer ---
         // (max_tiles + 3) / 4 * 4 bytes (round up to u32 alignment).
         // HOST_VISIBLE | HOST_COHERENT | TRANSFER_DST, STORAGE_BUFFER.
-        let per_tile_id_size = (((max_tiles + 3) / 4 * 4) as vk::DeviceSize).max(4);
+        let per_tile_id_size = ((max_tiles.div_ceil(4) * 4) as vk::DeviceSize).max(4);
         let (
             per_tile_frame_palette_id_buffer,
             per_tile_frame_palette_id_memory,

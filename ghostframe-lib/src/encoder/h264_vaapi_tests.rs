@@ -262,7 +262,7 @@ fn full_frame_keyframe_interval() {
     if keyframe_pts.len() >= 2 {
         let interval = keyframe_pts[1] - keyframe_pts[0];
         assert!(
-            interval >= 9 && interval <= 13,
+            (9..=13).contains(&interval),
             "keyframe interval should be ~11 frames, got {interval}"
         );
     }

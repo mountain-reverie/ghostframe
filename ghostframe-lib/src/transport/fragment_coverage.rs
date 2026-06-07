@@ -76,10 +76,10 @@ impl FragmentCoverageMap {
     /// Record coverage for a newly-emitted tile-pass work item. If the map is
     /// at capacity, evict the oldest entry.
     pub fn record(&mut self, key: CoverageKey, coverage: CoverageList) {
-        if self.entries.contains_key(&key) {
+        if let std::collections::hash_map::Entry::Occupied(mut e) = self.entries.entry(key) {
             // Same key re-emitted (e.g., NACK retransmit path) — overwrite
             // in place, do NOT re-queue (preserves insertion order).
-            self.entries.insert(key, coverage);
+            e.insert(coverage);
             return;
         }
         if self.entries.len() >= self.capacity {
@@ -143,6 +143,11 @@ impl FragmentCoverageMap {
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     /// Diagnostic snapshot of all live coverage entries. Used by
@@ -228,8 +233,8 @@ mod tests {
     fn map_take_marks_entry_recent_uses_default_capacity_const() {
         // FRAGMENT_COVERAGE_CAPACITY is the production knob; make sure it's
         // declared and reasonable.
-        assert!(FRAGMENT_COVERAGE_CAPACITY >= 1000);
-        assert!(FRAGMENT_COVERAGE_CAPACITY <= 100_000);
+        const { assert!(FRAGMENT_COVERAGE_CAPACITY >= 1000) };
+        const { assert!(FRAGMENT_COVERAGE_CAPACITY <= 100_000) };
     }
 
     #[test]

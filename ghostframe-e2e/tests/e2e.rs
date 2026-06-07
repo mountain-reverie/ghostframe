@@ -198,25 +198,6 @@ struct E2eSetup {
     page: chromiumoxide::Page,
 }
 
-async fn setup_e2e(test_pattern_args: &str) -> Result<E2eSetup> {
-    setup_e2e_inner(test_pattern_args, &[], false, false).await
-}
-
-async fn setup_e2e_with_env(
-    test_pattern_args: &str,
-    extra_env: &[(&str, &str)],
-) -> Result<E2eSetup> {
-    setup_e2e_inner(test_pattern_args, extra_env, false, false).await
-}
-
-/// Variant of `setup_e2e` that bind-mounts the host's `/dev/dri` into the
-/// container and runs privileged so `xdaemon`'s DRM capture can use VKMS
-/// (host must have `vkms` module loaded with `enable_writeback=1`). The
-/// container's Xorg switches to the modesetting driver via `XORG_CONF`.
-async fn setup_e2e_gpu(test_pattern_args: &str) -> Result<E2eSetup> {
-    setup_e2e_inner(test_pattern_args, &[], true, false).await
-}
-
 /// Configures Chromium with WebGPU enabled. Uses real GPU passthrough
 /// when /dev/dri/renderD128 exists on the host; falls back to SwiftShader
 /// (CPU WebGPU) otherwise.
@@ -2025,7 +2006,7 @@ async fn e2e_mode_switch() -> Result<()> {
     let h264_active_phases: Vec<usize> = phases
         .iter()
         .enumerate()
-        .filter(|(_, p)| is_h264_active_phase(*p))
+        .filter(|(_, p)| is_h264_active_phase(p))
         .map(|(i, _)| i)
         .collect();
 
@@ -2669,24 +2650,23 @@ async fn e2e_cdf53_bypass_integrate() -> Result<()> {
     // Compare per-pixel BGR (skip alpha). got_rgba is r,g,b,a; pixels_bgra is b,g,r,a.
     let mut mismatches = Vec::new();
     for i in 0..(32 * 32) {
-        let exp_b = pixels_bgra[i * 4 + 0] as i32;
+        let exp_b = pixels_bgra[i * 4] as i32;
         let exp_g = pixels_bgra[i * 4 + 1] as i32;
         let exp_r = pixels_bgra[i * 4 + 2] as i32;
-        let got_r = got_rgba[i * 4 + 0] as i32;
+        let got_r = got_rgba[i * 4] as i32;
         let got_g = got_rgba[i * 4 + 1] as i32;
         let got_b = got_rgba[i * 4 + 2] as i32;
         let dr = (got_r - exp_r).abs();
         let dg = (got_g - exp_g).abs();
         let db = (got_b - exp_b).abs();
-        if dr > 1 || dg > 1 || db > 1 {
-            if mismatches.len() < 20 {
+        if (dr > 1 || dg > 1 || db > 1)
+            && mismatches.len() < 20 {
                 let x = i % 32;
                 let y = i / 32;
                 mismatches.push(format!(
                     "px ({x},{y}): exp BGR ({exp_b},{exp_g},{exp_r}) got ({got_b},{got_g},{got_r}) Δ ({db},{dg},{dr})"
                 ));
             }
-        }
     }
     eprintln!(
         "BYPASS-INTEGRATE MISMATCHES ({} shown of total):",
@@ -2791,8 +2771,8 @@ async fn e2e_cdf53_integrate_correctness() -> Result<()> {
     // Compare against fixture.expected_coefficients (which are also i32 cast from i16).
     let mut mismatches = Vec::new();
     for i in 0..3072 {
-        if got_coeffs[i] != expected_coeffs[i] {
-            if mismatches.len() < 30 {
+        if got_coeffs[i] != expected_coeffs[i]
+            && mismatches.len() < 30 {
                 mismatches.push(format!(
                     "coeff[{}] (ch={}, idx={}): expected {}, got {}",
                     i,
@@ -2802,7 +2782,6 @@ async fn e2e_cdf53_integrate_correctness() -> Result<()> {
                     got_coeffs[i]
                 ));
             }
-        }
     }
     eprintln!(
         "INTEGRATE MISMATCHES: {} total, first 30 shown:",
@@ -2964,7 +2943,7 @@ async fn e2e_cdf53_live_tile_state() -> Result<()> {
             let px = tile_x * 32 + local_x;
             let py = tile_y * 32 + local_y;
             let off = (local_y * 32 + local_x) as usize * 4;
-            input_bgra[off + 0] = (px.wrapping_mul(3) & 0xFF) as u8;
+            input_bgra[off] = (px.wrapping_mul(3) & 0xFF) as u8;
             input_bgra[off + 1] = (py.wrapping_mul(3) & 0xFF) as u8;
             input_bgra[off + 2] = (px.wrapping_add(py).wrapping_mul(2) & 0xFF) as u8;
             input_bgra[off + 3] = 0xFF;
@@ -2996,8 +2975,8 @@ async fn e2e_cdf53_live_tile_state() -> Result<()> {
 
     let mut mismatches = Vec::new();
     for i in 0..3072 {
-        if got_coeffs[i] != expected_coeffs[i] as i32 {
-            if mismatches.len() < 30 {
+        if got_coeffs[i] != expected_coeffs[i] as i32
+            && mismatches.len() < 30 {
                 mismatches.push(format!(
                     "coeff[{i}] (ch={} idx={}): expected {}, got {}, diff {}",
                     i / 1024,
@@ -3007,7 +2986,6 @@ async fn e2e_cdf53_live_tile_state() -> Result<()> {
                     got_coeffs[i] - expected_coeffs[i] as i32,
                 ));
             }
-        }
     }
     eprintln!("MISMATCHES: {} of 3072 (first 30 shown):", mismatches.len());
     for m in &mismatches {
@@ -3379,15 +3357,14 @@ async fn e2e_cdf53_inverse_gradient_tile() -> Result<()> {
         let dr = (got_r - exp_r).abs();
         let dg = (got_g - exp_g).abs();
         let db = (got_b - exp_b).abs();
-        if dr > 1 || dg > 1 || db > 1 {
-            if mismatches.len() < 20 {
+        if (dr > 1 || dg > 1 || db > 1)
+            && mismatches.len() < 20 {
                 let lx = i % 32;
                 let ly = i / 32;
                 mismatches.push(format!(
                     "local ({lx},{ly}): exp BGR=({exp_b},{exp_g},{exp_r}) got=({got_b},{got_g},{got_r}) Δ=({db},{dg},{dr})"
                 ));
             }
-        }
     }
     eprintln!(
         "INVERSE-GRADIENT MISMATCHES (shown of {} total):",
@@ -3708,8 +3685,7 @@ async fn e2e_refinement_cancel() -> Result<()> {
 fn parse_last_pending_snapshot(logs: &str) -> Vec<(u8, u8, u8, u8)> {
     let line = logs
         .lines()
-        .filter(|l| l.contains("cdf53.pending_snapshot"))
-        .last();
+        .rfind(|l| l.contains("cdf53.pending_snapshot"));
     let Some(line) = line else { return Vec::new() };
     // Format: "... cdf53.pending_snapshot [(tx, ty, g, n), (tx, ty, g, n), ...]"
     let open = match line.find('[') {

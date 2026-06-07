@@ -656,7 +656,7 @@ fn process_frame_tile_analysis_frame_edge_denominator() {
     let width = 40u32;
     let height = 40u32;
     let stride = width * 4;
-    let cols = 2u32;
+    let _cols = 2u32; // 40px / 32px/tile = 2 tiles per row; used in index comment
 
     let mut processor = match GpuFrameProcessor::new(256) {
         Ok(t) => t,
@@ -728,8 +728,8 @@ fn process_frame_tile_analysis_frame_edge_denominator() {
         let slice = analysis.tile_analysis_slice();
         assert_eq!(analysis.tile_analysis_len, 4, "40x40 → 2x2 tile grid");
 
-        // Tile (1,0): row 0, col 1 of a `cols`-wide grid.
-        let tile_10_idx = (0 * cols + 1) as usize;
+        // Tile (1,0): row 0, col 1 of a `cols`-wide grid; index = 0*cols + 1 = 1.
+        let tile_10_idx = 1_usize;
         let edge_tile = &slice[tile_10_idx];
         assert_eq!(edge_tile.count, 2, "tile (1,0) has red + green");
         // With proper denominator=256: density ≈ (~3 * 1000) / 256 ≈ 11
@@ -1610,9 +1610,9 @@ fn process_frame_emits_correct_indices_for_two_color_tile() {
         // Bottom half: pixels 512..1023 → all white → index 1 → both nibbles 1.
         // Bytes 0..=255 correspond to pixel pairs 0..=511 → index 0.
         // Bytes 256..=511 correspond to pixel pairs 512..=1023 → index 1.
-        for byte_idx in 0..256usize {
-            let low = indices[byte_idx] & 0x0F;
-            let high = (indices[byte_idx] >> 4) & 0x0F;
+        for (byte_idx, &val) in indices[0..256].iter().enumerate() {
+            let low = val & 0x0F;
+            let high = (val >> 4) & 0x0F;
             assert_eq!(
                 low,
                 0,
@@ -1628,9 +1628,10 @@ fn process_frame_emits_correct_indices_for_two_color_tile() {
                 byte_idx * 2 + 1
             );
         }
-        for byte_idx in 256..512usize {
-            let low = indices[byte_idx] & 0x0F;
-            let high = (indices[byte_idx] >> 4) & 0x0F;
+        for (i, &val) in indices[256..512].iter().enumerate() {
+            let byte_idx = i + 256;
+            let low = val & 0x0F;
+            let high = (val >> 4) & 0x0F;
             assert_eq!(
                 low,
                 1,

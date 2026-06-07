@@ -292,7 +292,7 @@ impl Scheduler {
     pub fn tile_fully_acked(&self, tile_x: u8, tile_y: u8, generation: u8, max_passes: u8) -> bool {
         self.cdf53_passes_acked
             .get(&(tile_x, tile_y, generation))
-            .map_or(false, |&c| c >= max_passes)
+            .is_some_and(|&c| c >= max_passes)
     }
 
     /// Non-test diagnostic accessor: returns the current ACK counter for
@@ -493,11 +493,7 @@ impl Scheduler {
         queue.retain(|w| !matches!(w.state, WorkState::Superseded | WorkState::Acked));
 
         let mut spent = 0usize;
-        loop {
-            let min_pass = match queue.iter().map(|w| w.pass_idx).min() {
-                Some(p) => p,
-                None => break,
-            };
+        while let Some(min_pass) = queue.iter().map(|w| w.pass_idx).min() {
             let mut still_at_this_pass = false;
             let mut idx = 0;
             while idx < queue.len() {

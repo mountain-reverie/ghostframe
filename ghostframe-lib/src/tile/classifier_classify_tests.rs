@@ -277,9 +277,11 @@ fn medium_freq_h264_hysteresis_takes_precedence_over_lossless() {
 
 #[test]
 fn pixel_perfect_idle_returns_skip() {
-    let mut m = TileMetrics::default();
-    m.idle_frames = 100;
-    m.codec_state = CodecState::Skip; // codec_state is the PREVIOUS state, not the input
+    let m = TileMetrics {
+        idle_frames: 100,
+        codec_state: CodecState::Skip, // codec_state is the PREVIOUS state, not the input
+        ..Default::default()
+    };
     assert_eq!(
         classify_tile(&m, &CodecState::PixelPerfect),
         CodecState::Skip
@@ -288,10 +290,12 @@ fn pixel_perfect_idle_returns_skip() {
 
 #[test]
 fn pixel_perfect_dirty_overridden_by_normal_rules() {
-    let mut m = TileMetrics::default();
-    m.idle_frames = 0; // dirty
-    m.change_freq_hz = 16.0;
-    m.change_magnitude = 0.5;
+    let m = TileMetrics {
+        idle_frames: 0, // dirty
+        change_freq_hz: 16.0,
+        change_magnitude: 0.5,
+        ..Default::default()
+    };
     // Was PixelPerfect; now dirty + high-motion → H264.
     let result = classify_tile(&m, &CodecState::PixelPerfect);
     assert!(matches!(result, CodecState::H264 { .. }));
