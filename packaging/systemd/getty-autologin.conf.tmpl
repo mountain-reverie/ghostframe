@@ -1,0 +1,7 @@
+# Installed by packaging/install.sh as
+# /etc/systemd/system/getty@tty1.service.d/99-ghostframe-autologin.conf
+# (the 99- prefix ensures we win against any existing autologin drop-in.)
+
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty -o '-p -- \\u' --autologin __USER__ --noclear %I $TERM

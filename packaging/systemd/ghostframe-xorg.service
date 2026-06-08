@@ -1,0 +1,12 @@
+[Unit]
+Description=Ghostframe headless Xorg server on :1
+Before=ghostframe-wm.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/Xorg :1 -config /etc/X11/ghostframe-headless.conf -noreset -nolisten tcp vt7
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=ghostframe.target
