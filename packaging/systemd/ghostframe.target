@@ -1,0 +1,7 @@
+[Unit]
+Description=Ghostframe headless desktop session
+Requires=ghostframe-xdaemon.service
+After=ghostframe-xdaemon.service
+
+[Install]
+WantedBy=default.target

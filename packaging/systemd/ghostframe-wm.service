@@ -1,0 +1,15 @@
+[Unit]
+Description=Ghostframe window manager (enlightenment)
+Requires=ghostframe-xorg.service
+After=ghostframe-xorg.service
+
+[Service]
+Type=simple
+Environment=DISPLAY=:1
+# To use a different WM, replace this line. See DEVELOPERS.md "WM alternatives".
+ExecStart=/usr/bin/enlightenment_start
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=ghostframe.target

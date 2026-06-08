@@ -1,0 +1,16 @@
+[Unit]
+Description=Ghostframe capture + transport daemon
+Requires=ghostframe-wm.service
+After=ghostframe-wm.service
+
+[Service]
+Type=simple
+Environment=DISPLAY=:1
+Environment=TS_HOSTNAME=%H-ghostframe
+Environment=TS_STATE_DIR=%h/.local/share/ghostframe/ts-state
+ExecStart=/usr/local/bin/ghostframe-xdaemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=ghostframe.target
