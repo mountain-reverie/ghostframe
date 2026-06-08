@@ -22,7 +22,6 @@ enum CaptureBackend {
 /// login. tsnet writes `tailscaled.state` after the first successful join; we
 /// use its presence as the "has been --init'd" proxy. If this returns false,
 /// the daemon needs a TS_AUTHKEY (either via env or via `--init`).
-#[allow(dead_code)] // wired up in Task 5 (--init flag)
 fn state_dir_seeded(state_dir: &Path) -> bool {
     state_dir.join("tailscaled.state").exists()
 }
@@ -45,9 +44,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
-    let authkey = env::var("TS_AUTHKEY").expect("TS_AUTHKEY must be set");
+    let init_mode = env::args().any(|a| a == "--init");
+
     let hostname = env::var("TS_HOSTNAME").unwrap_or_else(|_| "ghostframe-server".into());
     let state_dir = env::var("TS_STATE_DIR").unwrap_or_else(|_| "/tmp/ghostframe-ts".into());
+    let state_dir_path = std::path::PathBuf::from(&state_dir);
+    let seeded = state_dir_seeded(&state_dir_path);
+
+    let authkey = match (init_mode, env::var("TS_AUTHKEY").ok(), seeded) {
+        (true, Some(k), _) if !k.is_empty() => k,
+        (true, _, _) => {
+            eprintln!("error: --init requires TS_AUTHKEY to be set and non-empty");
+            std::process::exit(2);
+        }
+        (false, Some(k), _) if !k.is_empty() => k,
+        (false, _, true) => String::new(),
+        (false, _, false) => {
+            eprintln!(
+                "error: TS_AUTHKEY not set and state dir {state_dir:?} has not been initialised.\n\
+                 Run once with TS_AUTHKEY set and the --init flag to seed the state dir, e.g.\n\
+                 \n\
+                 \tTS_AUTHKEY=tskey-auth-... TS_STATE_DIR={state_dir:?} ghostframe-xdaemon --init\n\
+                 \n\
+                 (packaging/install.sh does this for you during setup.)"
+            );
+            std::process::exit(2);
+        }
+    };
     let control_url = env::var("TS_CONTROL_URL").unwrap_or_default();
     let capture_fps: u64 = env::var("CAPTURE_FPS")
         .unwrap_or_else(|_| "30".into())
@@ -67,6 +90,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Machine-parseable line for the E2E test harness. Use println! (stdout)
     // rather than tracing so the format stays stable regardless of log config.
     println!("CERT_HASH_SHA256={}", server.cert_hash());
+
+    if init_mode {
+        tracing::info!(
+            state_dir = %state_dir_path.display(),
+            "tsnet state dir seeded successfully; exiting (--init)"
+        );
+        return Ok(());
+    }
 
     // Select capture backend: try DRM first, fall back to X11.
     let backend = match drm_capture::capture() {
