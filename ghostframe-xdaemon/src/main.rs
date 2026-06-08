@@ -3,6 +3,7 @@ mod x11_capture;
 mod xdamage;
 
 use std::env;
+use std::path::Path;
 use std::time::Duration;
 
 use ghostframe_lib::{FrameSubmission, GhostbridgeConfig, GhostframeServer};
@@ -15,6 +16,15 @@ enum CaptureBackend {
     X11 {
         capture: Box<x11_capture::X11Capture>,
     },
+}
+
+/// Returns true if the tsnet state directory has been seeded with a successful
+/// login. tsnet writes `tailscaled.state` after the first successful join; we
+/// use its presence as the "has been --init'd" proxy. If this returns false,
+/// the daemon needs a TS_AUTHKEY (either via env or via `--init`).
+#[allow(dead_code)] // wired up in Task 5 (--init flag)
+fn state_dir_seeded(state_dir: &Path) -> bool {
+    state_dir.join("tailscaled.state").exists()
 }
 
 #[tokio::main]
@@ -184,4 +194,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn temp_dir() -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "ghostframe-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    #[test]
+    fn state_dir_seeded_returns_false_for_empty_dir() {
+        let d = temp_dir();
+        assert!(!state_dir_seeded(&d));
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn state_dir_seeded_returns_false_for_missing_dir() {
+        let d = temp_dir().join("does-not-exist");
+        assert!(!state_dir_seeded(&d));
+    }
+
+    #[test]
+    fn state_dir_seeded_returns_true_when_tailscaled_state_present() {
+        let d = temp_dir();
+        fs::write(d.join("tailscaled.state"), b"{}").unwrap();
+        assert!(state_dir_seeded(&d));
+        fs::remove_dir_all(&d).ok();
+    }
 }
