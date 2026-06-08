@@ -123,7 +123,7 @@ done
 
 drop_dst="$drop_dir/99-ghostframe-autologin.conf"
 info "install: $drop_dst"
-sed "s/__USER__/$target_user/g" "$pkg_dir/systemd/getty-autologin.conf.tmpl" \
+sed "s|__USER__|$target_user|g" "$pkg_dir/systemd/getty-autologin.conf.tmpl" \
   | install -m 0644 -o root -g root /dev/stdin "$drop_dst"
 
 # 7. Tsnet seed.
@@ -157,12 +157,19 @@ info "enabling ghostframe.target for user $target_user..."
 # The target user's --user manager may not be running. Use `--global` to
 # enable for the user, then their next login starts it. Equivalent to running
 # `systemctl --user enable` inside that user's session.
-sudo -u "$target_user" \
-  XDG_RUNTIME_DIR="/run/user/$user_uid" \
-  systemctl --user enable ghostframe.target 2>/dev/null \
-  || sudo -u "$target_user" \
-       env XDG_RUNTIME_DIR="/run/user/$user_uid" \
-       systemctl --user --no-block enable ghostframe.target
+{
+  sudo -u "$target_user" \
+    XDG_RUNTIME_DIR="/run/user/$user_uid" \
+    systemctl --user enable ghostframe.target 2>/dev/null \
+    || sudo -u "$target_user" \
+         env XDG_RUNTIME_DIR="/run/user/$user_uid" \
+         systemctl --user --no-block enable ghostframe.target
+} || {
+  info "warn: 'systemctl --user enable ghostframe.target' failed for user $target_user."
+  info "      The target should still autostart on first boot via WantedBy=default.target,"
+  info "      but if it does not, run after logging in as that user:"
+  info "          systemctl --user enable ghostframe.target"
+}
 
 info "enabling getty@tty1..."
 systemctl enable getty@tty1.service
