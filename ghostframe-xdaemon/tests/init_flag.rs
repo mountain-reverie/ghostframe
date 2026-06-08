@@ -36,8 +36,7 @@ fn errors_when_no_authkey_and_empty_state_dir() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "stderr was: {stderr}");
     assert!(
-        stderr.contains("TS_AUTHKEY not set")
-            && stderr.contains("--init"),
+        stderr.contains("TS_AUTHKEY not set") && stderr.contains("--init"),
         "stderr should explain --init: {stderr}"
     );
     std::fs::remove_dir_all(&state).ok();
