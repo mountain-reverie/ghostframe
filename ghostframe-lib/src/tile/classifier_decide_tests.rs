@@ -569,6 +569,79 @@ fn env_var_override_headroom_min_bpus() {
     assert_eq!(HEADROOM_MIN_BYTES_PER_US, 0.25);
 }
 
+/// `GHOSTFRAME_TEST_FORCE_FRAME_MODE=h264` pins the classifier to H264
+/// regardless of cost or hysteresis. Used by e2e tests that need to
+/// isolate the H.264 full-frame path end-to-end without depending on the
+/// M3.6 dynamic mode-switch policy firing on its own.
+#[test]
+fn env_var_force_frame_mode_h264_pins_classifier() {
+    use crate::tile::classifier::Classifier;
+    use crate::tile::{CodecState, FrameMode};
+
+    std::env::set_var("GHOSTFRAME_TEST_FORCE_FRAME_MODE", "h264");
+    let mut c = Classifier::default();
+    std::env::remove_var("GHOSTFRAME_TEST_FORCE_FRAME_MODE");
+
+    // A 100% Solid tentative state with no adaptation signals would
+    // normally stay in TileCodec; with the override it must flip to H264
+    // immediately, on frame 0, and stay there.
+    let tentative = vec![CodecState::Solid; 4];
+    for frame in 0..5u32 {
+        assert_eq!(
+            c.decide_frame_mode_at((frame as u64) * 16_667, &tentative, FrameMode::TileCodec),
+            FrameMode::H264,
+            "force-mode override must pin H264 even from TileCodec prev",
+        );
+    }
+}
+
+#[test]
+fn env_var_force_frame_mode_tile_pins_classifier() {
+    use crate::tile::classifier::{AdaptationContext, Classifier};
+    use crate::tile::{CodecState, FrameMode};
+
+    std::env::set_var("GHOSTFRAME_TEST_FORCE_FRAME_MODE", "tile");
+    let mut c = Classifier::default();
+    std::env::remove_var("GHOSTFRAME_TEST_FORCE_FRAME_MODE");
+
+    // Build a context that would normally trip the suspension hard-override
+    // to H264. The force-mode override is tested above all hard overrides
+    // and must win.
+    let ctx = AdaptationContext {
+        bytes_per_us: 0.0,
+        smoothed_rtt_us: 50_000.0,
+        loss_rate: 0.0,
+        suspended: true,
+        last_update_seq: 1,
+    };
+    c.set_adaptation_context(ctx);
+
+    let tentative = vec![CodecState::Solid];
+    assert_eq!(
+        c.decide_frame_mode(&tentative, FrameMode::H264),
+        FrameMode::TileCodec,
+        "force-mode=tile must win over suspension hard-override"
+    );
+}
+
+#[test]
+fn env_var_force_frame_mode_unknown_value_ignored() {
+    use crate::tile::classifier::Classifier;
+    use crate::tile::{CodecState, FrameMode};
+
+    std::env::set_var("GHOSTFRAME_TEST_FORCE_FRAME_MODE", "bogus");
+    let mut c = Classifier::default();
+    std::env::remove_var("GHOSTFRAME_TEST_FORCE_FRAME_MODE");
+
+    // Unknown value parses to None ⇒ classifier behaves normally.
+    // With 100% Solid and default ctx, it stays in TileCodec.
+    let tentative = vec![CodecState::Solid; 4];
+    assert_eq!(
+        c.decide_frame_mode_at(0, &tentative, FrameMode::TileCodec),
+        FrameMode::TileCodec,
+    );
+}
+
 /// Regression test for commit `7e3e041` (M3.6b hysteresis-micros refactor) +
 /// fix `da2729b` (hybrid). When wall-clock elapsed past `enter_sustain_micros`
 /// in a SINGLE call (e.g. docker scheduling preemption pause), the hybrid

@@ -312,6 +312,15 @@ pub struct Classifier {
     /// Cfg-gated under `test-loss-injection`.
     #[cfg(any(test, feature = "test-loss-injection"))]
     headroom_min_bpus_override: Option<f32>,
+    /// Test-only pin: when `Some`, `decide_inner` returns this mode every
+    /// frame, bypassing all hysteresis, hard overrides, and cost paths.
+    /// Lets tests isolate end-to-end behaviour of a specific codec path
+    /// (e.g. H.264 colorspace) without depending on the M3.6 mode-switch
+    /// policy firing on its own. Populated from
+    /// `GHOSTFRAME_TEST_FORCE_FRAME_MODE` in `Default::default()` —
+    /// accepts `"h264"` or `"tile"`. `None` in production builds.
+    #[cfg(any(test, feature = "test-loss-injection"))]
+    force_frame_mode_override: Option<FrameMode>,
     /// Last emitted mode (debounces the `mode.decision` event to fire
     /// only on transitions). `None` before the first decision.
     last_emitted_mode: Option<FrameMode>,
@@ -354,6 +363,14 @@ impl Default for Classifier {
                 .ok()
                 .and_then(|s| s.parse::<f32>().ok())
                 .filter(|v| *v > 0.0),
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            force_frame_mode_override: std::env::var("GHOSTFRAME_TEST_FORCE_FRAME_MODE")
+                .ok()
+                .and_then(|s| match s.as_str() {
+                    "h264" | "H264" => Some(FrameMode::H264),
+                    "tile" | "TileCodec" | "tilecodec" => Some(FrameMode::TileCodec),
+                    _ => None,
+                }),
             last_emitted_mode: None,
             epoch: std::time::Instant::now(),
         }
@@ -461,6 +478,14 @@ impl Classifier {
         tentative_states: &[CodecState],
         prev_mode: FrameMode,
     ) -> (FrameMode, &'static str) {
+        // Test-only pin: when GHOSTFRAME_TEST_FORCE_FRAME_MODE is set,
+        // return that mode every call without running the cost model or
+        // hysteresis. Lets tests isolate one codec path end-to-end.
+        #[cfg(any(test, feature = "test-loss-injection"))]
+        if let Some(forced) = self.force_frame_mode_override {
+            self.state = ClassifierHysteresis::default();
+            return (forced, "test_force");
+        }
         // Hard overrides: bypass hysteresis entirely. This is the user-
         // visible "the link can't support tile-codec emission" signal —
         // dwell would just delay an inevitable degradation. Same applies
