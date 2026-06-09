@@ -758,6 +758,69 @@ async fn e2e_solid_color() -> Result<()> {
 /// edge of observed scores). Lower further if it flakes again, but a
 /// drop below ~0.80 would suggest a real codec regression rather than
 /// just frame-timing jitter.
+/// Pins the server's frame-mode classifier to H.264 (via
+/// `GHOSTFRAME_TEST_FORCE_FRAME_MODE=h264`) and checks the rendered
+/// pixels are RED. Isolates the H.264 full-frame end-to-end path
+/// (BGRA → libx264 → wire → WebCodecs → fragment shader) from the
+/// M3.6 dynamic mode-switch policy — bypasses cost, hysteresis, and
+/// all hard overrides, so this test only fails if the H.264 colorspace
+/// pipeline itself is broken.
+///
+/// Failure mode this test catches: R↔B swap somewhere between the
+/// libx264 encoder, the H.264 SPS colorspace VUI, and the WebCodecs
+/// decoder's RGB-conversion matrix.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_h264_forced_solid_red() -> Result<()> {
+    let setup = setup_e2e_webgpu_gpu_with_env(
+        "--solid-red",
+        &[("GHOSTFRAME_TEST_FORCE_FRAME_MODE", "h264")],
+    )
+    .await?;
+
+    // 5 s: covers QUIC slow-start, libx264 GOP startup, and at least
+    // a few decoded H.264 frames landing in the framebuffer.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Sample a 5×5 grid across the entire framebuffer. Every sample must be
+    // RED (allowing slack for H.264 lossy compression on chroma). Reading
+    // via __readPixelRect avoids the per-readPixel async race between
+    // sample-loop iterations.
+    let scan_js = r#"
+        (async () => {
+            const fbW = window.__ghostframeRenderer?.texture?.width || 640;
+            const fbH = window.__ghostframeRenderer?.texture?.height || 480;
+            const data = await window.__readPixelRect(0, 0, fbW, fbH);
+            const xs = [0, Math.floor(fbW * 0.25), Math.floor(fbW * 0.5),
+                        Math.floor(fbW * 0.75), fbW - 1];
+            const ys = [0, Math.floor(fbH * 0.25), Math.floor(fbH * 0.5),
+                        Math.floor(fbH * 0.75), fbH - 1];
+            let red = 0, blue = 0, other = 0;
+            const samples = [];
+            for (const y of ys) for (const x of xs) {
+                const off = (y * fbW + x) * 4;
+                const r = data[off], g = data[off+1], b = data[off+2];
+                samples.push({x, y, r, g, b});
+                if (r > 150 && g < 100 && b < 100) red++;
+                else if (b > 150 && r < 100 && g < 100) blue++;
+                else other++;
+            }
+            return { red, blue, other, samples, fbW, fbH };
+        })()
+    "#;
+    let scan: serde_json::Value = setup.page.evaluate(scan_js).await?.into_value()?;
+    let red = scan["red"].as_u64().unwrap_or(0);
+    let blue = scan["blue"].as_u64().unwrap_or(0);
+    let other = scan["other"].as_u64().unwrap_or(0);
+    assert!(
+        red >= 20,
+        "H.264 solid-red rendered as red={red}/25, blue={blue}, other={other}. \
+         Blue dominance indicates R↔B swap in the H.264 path (e.g. bgra_to_nv12 \
+         shader reading wrong logical channels). Scan: {}",
+        serde_json::to_string(&scan).unwrap_or_default(),
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_h264_ssim_golden() -> Result<()> {
     let setup = setup_e2e_webgpu("--solid-red").await?;

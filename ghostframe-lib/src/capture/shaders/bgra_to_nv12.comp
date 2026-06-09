@@ -35,10 +35,17 @@ void main() {
     if (px >= width || py >= height) return;
 
     vec4 bgra = imageLoad(bgra_input, ivec2(px, py));
-    // B8G8R8A8 maps to .r=B, .g=G, .b=R, .a=A
-    float R = bgra.b;
+    // imageLoad on a storage image returns channel components by their
+    // logical name regardless of the underlying memory format. For a
+    // B8G8R8A8_UNORM image bound as `rgba8`, .r returns the R channel
+    // (third byte in memory), .b returns the B channel (first byte).
+    // The legacy comment here claimed the opposite, which routed red
+    // input through the blue YUV coefficients, producing the documented
+    // H.264 frame-mode R↔B-swap bug. Same convention as
+    // `cdf53_forward_l1.comp`.
+    float R = bgra.r;
     float G = bgra.g;
-    float B = bgra.r;
+    float B = bgra.b;
 
     // BT.601 full range
     float Y_f = 0.299 * R + 0.587 * G + 0.114 * B;
