@@ -78,7 +78,7 @@ async fn e2e_quic_ping_pong_over_tailscale() -> Result<()> {
     // on the host where headscale is mapped to localhost:HEADSCALE_HOST_PORT.
     let client_control_url = format!("http://127.0.0.1:{HEADSCALE_HOST_PORT}");
     let test_node = helpers::TestNode::join(client_key, client_control_url).await?;
-    let upstream = test_node.dial("ghostframe-server:4443")?;
+    let upstream = test_node.dial("ghostframe-server:443")?;
     let forwarder = helpers::start_forwarder("127.0.0.1:0", upstream).await?;
 
     // Serve ghostframe-web-client/dist over http://127.0.0.1:<port>.
@@ -301,7 +301,7 @@ async fn setup_e2e_inner_with_url_extra(
 
     let client_control_url = format!("http://127.0.0.1:{HEADSCALE_HOST_PORT}");
     let test_node = helpers::TestNode::join(client_key, client_control_url).await?;
-    let upstream = test_node.dial("ghostframe-server:4443")?;
+    let upstream = test_node.dial("ghostframe-server:443")?;
     let forwarder = helpers::start_forwarder("127.0.0.1:0", upstream).await?;
 
     let dist_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -472,7 +472,7 @@ async fn e2e_raw_frame_round_trip() -> Result<()> {
 
     let client_control_url = format!("http://127.0.0.1:{HEADSCALE_HOST_PORT}");
     let test_node = helpers::TestNode::join(client_key, client_control_url).await?;
-    let upstream = test_node.dial("ghostframe-server:4443")?;
+    let upstream = test_node.dial("ghostframe-server:443")?;
     let forwarder = helpers::start_forwarder("127.0.0.1:0", upstream).await?;
 
     let dist_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

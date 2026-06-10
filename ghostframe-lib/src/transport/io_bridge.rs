@@ -422,7 +422,7 @@ impl IoBridge {
     }
 
     /// Create a new `IoBridge` by connecting to ghostbridge and opening a UDP
-    /// listener on `listen_addr` (e.g. `":4443"`).
+    /// listener on `listen_addr` (e.g. `":443"`).
     pub async fn new(
         ghostbridge_config: &GhostbridgeConfig,
         listen_addr: &str,
@@ -2613,7 +2613,7 @@ impl IoBridge {
             _handle: None,
             stream,
             server,
-            local_addr: "0.0.0.0:4443".parse().unwrap(),
+            local_addr: "0.0.0.0:443".parse().unwrap(),
             wt_sessions: HashMap::new(),
             session_resets_fired: HashSet::new(),
             has_seen_prior_session: false,
@@ -2671,7 +2671,7 @@ impl IoBridge {
             _handle: None,
             stream,
             server,
-            local_addr: "0.0.0.0:4443".parse().unwrap(),
+            local_addr: "0.0.0.0:443".parse().unwrap(),
             wt_sessions: HashMap::new(),
             session_resets_fired: HashSet::new(),
             has_seen_prior_session: false,
@@ -2944,9 +2944,9 @@ mod tests {
 
     #[test]
     fn parse_listen_port_accepts_bare_port() {
-        assert_eq!(parse_listen_port(":4443").unwrap(), 4443);
-        assert_eq!(parse_listen_port("0.0.0.0:4443").unwrap(), 4443);
-        assert_eq!(parse_listen_port("[::]:4443").unwrap(), 4443);
+        assert_eq!(parse_listen_port(":443").unwrap(), 443);
+        assert_eq!(parse_listen_port("0.0.0.0:443").unwrap(), 443);
+        assert_eq!(parse_listen_port("[::]:443").unwrap(), 443);
     }
 
     #[test]

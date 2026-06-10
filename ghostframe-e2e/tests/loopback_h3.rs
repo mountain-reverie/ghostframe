@@ -374,7 +374,7 @@ fn loopback_h3_handshake() {
     let client_ep = Endpoint::new(Arc::new(EndpointConfig::default()), None, false, None);
 
     // -- Addresses --
-    let server_addr = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 4443);
+    let server_addr = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 443);
     let client_addr = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 5000);
 
     let now = Instant::now();

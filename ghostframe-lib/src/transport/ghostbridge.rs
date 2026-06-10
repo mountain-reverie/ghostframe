@@ -92,7 +92,7 @@ impl GhostbridgeHandle {
         Ok(())
     }
 
-    /// Listen for incoming UDP packets on `addr` (e.g. `":4443"`).
+    /// Listen for incoming UDP packets on `addr` (e.g. `":443"`).
     /// Returns an owned non-blocking socketpair fd wrapped as [`UdpPacketConn`].
     pub fn listen_udp(&self, addr: &str) -> Result<UdpPacketConn, GhostbridgeError> {
         let c_addr = CString::new(addr)?;
@@ -256,14 +256,14 @@ mod tests {
 
     #[test]
     fn roundtrip_ipv4() {
-        roundtrip(b"hello world", "100.64.0.2:4443");
+        roundtrip(b"hello world", "100.64.0.2:443");
     }
 
     #[test]
     fn roundtrip_ipv6() {
         // Tailscale allocates IPv6 ULAs in fd7a::/48; this regression-guards
         // the colon-bracketing path in parse_frame_rest.
-        roundtrip(b"ipv6 datagram", "[fd7a:115c:a1e0::2]:4443");
+        roundtrip(b"ipv6 datagram", "[fd7a:115c:a1e0::2]:443");
     }
 
     #[test]

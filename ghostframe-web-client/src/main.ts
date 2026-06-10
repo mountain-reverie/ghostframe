@@ -37,7 +37,7 @@ function hexToBuffer(hex: string): ArrayBuffer {
 
 async function main() {
   const url = new URL(window.location.href);
-  const serverHost = url.searchParams.get('host') ?? 'ghostframe-server:4443';
+  const serverHost = url.searchParams.get('host') ?? 'ghostframe-server:443';
   const certHash = url.searchParams.get('certHash') ?? '';
 
   const wtUrl = `https://${serverHost}/`;

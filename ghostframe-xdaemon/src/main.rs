@@ -85,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
 
     tracing::info!("Connecting to Tailscale...");
-    let server = GhostframeServer::new(config, ":4443").await?;
+    let server = GhostframeServer::new(config, ":443").await?;
 
     // Machine-parseable line for the E2E test harness. Use println! (stdout)
     // rather than tracing so the format stays stable regardless of log config.

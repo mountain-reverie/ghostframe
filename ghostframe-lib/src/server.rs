@@ -54,7 +54,7 @@ impl GhostframeServer {
     /// Create a new server.
     ///
     /// - Connects to ghostbridge using `config`.
-    /// - Binds the QUIC/WebTransport listener on `listen_addr` (e.g. `":4443"`).
+    /// - Binds the QUIC/WebTransport listener on `listen_addr` (e.g. `":443"`).
     /// - Spawns the `IoBridge` event loop as a background tokio task.
     /// - Returns a `GhostframeServer` with a frame submission channel
     ///   (capacity 2).

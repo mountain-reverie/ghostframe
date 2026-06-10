@@ -52,7 +52,7 @@ pub unsafe extern "C" fn gf_server_new(
         Err(_) => return std::ptr::null_mut(),
     };
 
-    match rt.block_on(GhostframeServer::new(config, ":4443")) {
+    match rt.block_on(GhostframeServer::new(config, ":443")) {
         Ok(server) => Box::into_raw(Box::new(FfiHandle { server, _rt: rt })),
         Err(e) => {
             eprintln!("gf_server_new failed: {e}");

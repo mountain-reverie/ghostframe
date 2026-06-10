@@ -275,7 +275,7 @@ async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioStack> {
     let client_control_url = format!("http://127.0.0.1:{HEADSCALE_HOST_PORT}");
     let test_node =
         crate::harness::containers::TestNode::join(client_key, client_control_url).await?;
-    let upstream = test_node.dial("ghostframe-server:4443")?;
+    let upstream = test_node.dial("ghostframe-server:443")?;
     let forwarder = crate::harness::transport::start_forwarder("127.0.0.1:0", upstream).await?;
 
     // --- Static web-client ---
