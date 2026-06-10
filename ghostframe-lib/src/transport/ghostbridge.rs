@@ -34,6 +34,7 @@ extern "C" {
     fn gbridge_dial_udp(sd: c_int, remote_addr: *const c_char, fd_out: *mut c_int) -> c_int;
     fn gbridge_close(sd: c_int) -> c_int;
     fn gbridge_getips(sd: c_int, buf: *mut c_char, buf_len: usize) -> c_int;
+    fn gbridge_start_web_server(sd: c_int, cert_hash_hex: *const c_char) -> c_int;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -48,6 +49,25 @@ pub enum GhostbridgeError {
     Io(#[from] io::Error),
     #[error("invalid frame: {0}")]
     Frame(&'static str),
+}
+
+pub(crate) const WEB_STATUS_OK: c_int = 0;
+#[allow(dead_code)]
+pub(crate) const WEB_STATUS_INVALID_HANDLE: c_int = -1;
+pub(crate) const WEB_STATUS_INVALID_ARG: c_int = -20;
+pub(crate) const WEB_STATUS_HTTPS_CERTS_DISABLED: c_int = -21;
+pub(crate) const WEB_STATUS_LISTEN_FAILED: c_int = -22;
+
+#[derive(Debug, thiserror::Error)]
+pub enum WebServerError {
+    #[error("tailnet has no HTTPS-eligible domains; enable HTTPS at https://login.tailscale.com/admin/dns")]
+    HttpsCertsDisabled,
+    #[error("ghostbridge web listener bind failed")]
+    ListenFailed,
+    #[error("invalid argument passed to gbridge_start_web_server")]
+    InvalidArg,
+    #[error("ghostbridge web server returned unexpected rc={0}")]
+    Other(c_int),
 }
 
 pub struct GhostbridgeConfig {
@@ -133,6 +153,30 @@ impl GhostbridgeHandle {
             .split(',')
             .map(|s| s.parse().map_err(|_| GhostbridgeError::Frame("invalid IP")))
             .collect()
+    }
+
+    /// Start the embedded HTTPS web server on tsnet `:443` plus a `:80`
+    /// → `:443` redirect listener.
+    ///
+    /// `cert_hash_hex` must be the lowercase-hex SHA-256 of the
+    /// WebTransport server cert; it is exposed at `/config.json` so the
+    /// browser can construct `new WebTransport(..., {serverCertificateHashes})`.
+    ///
+    /// Returns a typed error for the two cases callers must surface to
+    /// the user differently:
+    /// - [`WebServerError::HttpsCertsDisabled`] — tailnet admin needs to
+    ///   enable HTTPS Certificates.
+    /// - [`WebServerError::ListenFailed`] — port bind / cert load failed.
+    pub fn start_web_server(&self, cert_hash_hex: &str) -> Result<(), WebServerError> {
+        let c_hash = CString::new(cert_hash_hex).map_err(|_| WebServerError::InvalidArg)?;
+        let rc = unsafe { gbridge_start_web_server(self.sd, c_hash.as_ptr()) };
+        match rc {
+            WEB_STATUS_OK => Ok(()),
+            WEB_STATUS_HTTPS_CERTS_DISABLED => Err(WebServerError::HttpsCertsDisabled),
+            WEB_STATUS_LISTEN_FAILED => Err(WebServerError::ListenFailed),
+            WEB_STATUS_INVALID_ARG => Err(WebServerError::InvalidArg),
+            other => Err(WebServerError::Other(other)),
+        }
     }
 }
 
@@ -277,5 +321,17 @@ mod tests {
         let rest = [1, 2, 3, 4];
         let err = parse_frame_rest(&rest, 10).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn web_status_codes_are_distinct() {
+        // Sanity check the status-code constants match ghostbridge/main.go.
+        // If ghostbridge renumbers, this test fails loudly instead of the
+        // Rust caller silently treating "HTTPS certs disabled" as success.
+        assert_eq!(super::WEB_STATUS_OK, 0);
+        assert_eq!(super::WEB_STATUS_INVALID_HANDLE, -1);
+        assert_eq!(super::WEB_STATUS_INVALID_ARG, -20);
+        assert_eq!(super::WEB_STATUS_HTTPS_CERTS_DISABLED, -21);
+        assert_eq!(super::WEB_STATUS_LISTEN_FAILED, -22);
     }
 }
