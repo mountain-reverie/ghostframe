@@ -6,7 +6,7 @@ pub mod tile;
 pub mod transport;
 
 pub use server::{FrameSubmission, GhostframeServer};
-pub use transport::ghostbridge::{GhostbridgeConfig, GhostbridgeError};
+pub use transport::ghostbridge::{GhostbridgeConfig, GhostbridgeError, WebServerError};
 pub use transport::io_bridge::IoBridge;
 
 /// Framing primitives re-exported for the E2E test harness.
