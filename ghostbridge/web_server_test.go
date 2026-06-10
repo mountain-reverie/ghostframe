@@ -53,3 +53,28 @@ func TestServeConfigJSON(t *testing.T) {
 		t.Fatalf("GET /config.json: body %q, want %q", string(body), want)
 	}
 }
+
+func TestRedirectHandler(t *testing.T) {
+	h := newRedirectHandler()
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	client := &http.Client{
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	resp, err := client.Get(srv.URL + "/some/path?q=1")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 301 {
+		t.Fatalf("status %d, want 301", resp.StatusCode)
+	}
+	loc := resp.Header.Get("Location")
+	if !strings.HasPrefix(loc, "https://") {
+		t.Fatalf("Location %q does not start with https://", loc)
+	}
+	if !strings.HasSuffix(loc, "/some/path?q=1") {
+		t.Fatalf("Location %q does not preserve path+query", loc)
+	}
+}
