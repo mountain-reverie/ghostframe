@@ -186,17 +186,23 @@ func gbridge_dial_tcp(sd C.int32_t, cRemote *C.char, fdOut *C.int32_t) C.gbridge
 // spawnTcpBridge copies bytes bidirectionally between a tsnet TCP
 // connection and the Go-side socketpair fd. Mirrors spawnPacketBridge
 // but without the per-packet framing — TCP is a byte stream.
+//
+// Both directions defer closing BOTH endpoints. Closing one half of a
+// socketpair (or the tsnet net.Conn) unblocks the other goroutine's
+// blocking io.Copy with EOF / EPIPE, so the surviving goroutine exits
+// promptly and runs its own defers (idempotent Close()). Without
+// symmetric closes, a remote-initiated close on conn would leave goFile
+// open and the Rust-side forwarder would hang on read forever.
 func spawnTcpBridge(conn net.Conn, goFd int) {
 	goFile := os.NewFile(uintptr(goFd), "gbridge-tcp-goside")
-	// goFile is blocking (we only set O_NONBLOCK on the C side); io.Copy
-	// blocks the goroutine on read until the peer closes, which is
-	// exactly the lifecycle we want.
 	go func() {
 		defer goFile.Close()
 		defer conn.Close()
 		_, _ = io.Copy(conn, goFile)
 	}()
 	go func() {
+		defer goFile.Close()
+		defer conn.Close()
 		_, _ = io.Copy(goFile, conn)
 	}()
 }
