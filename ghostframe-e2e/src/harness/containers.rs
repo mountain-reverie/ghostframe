@@ -1,9 +1,7 @@
 use std::process::Stdio;
-use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use ghostframe_lib::transport::ghostbridge::{GhostbridgeConfig, GhostbridgeHandle, UdpPacketConn};
-use tokio::io::{AsyncBufReadExt, BufReader};
 
 pub const NETWORK_NAME: &str = "ghostframe-e2e";
 
@@ -77,30 +75,6 @@ pub async fn create_preauth_key(container_name: &str, user: &str) -> Result<Stri
                 String::from_utf8_lossy(&out.stdout)
             )
         })
-}
-
-/// Tail `docker logs -f <container>` until a line starting with
-/// `CERT_HASH_SHA256=` is seen; returns the hash hex string. Timeout: 60s.
-pub async fn read_cert_hash_from_logs(container_name: &str) -> Result<String> {
-    let mut child = tokio::process::Command::new("docker")
-        .args(["logs", "-f", container_name])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let stdout = child.stdout.take().unwrap();
-    let mut lines = BufReader::new(stdout).lines();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let line = tokio::time::timeout(remaining, lines.next_line()).await??;
-        let Some(line) = line else { break };
-        if let Some(rest) = line.strip_prefix("CERT_HASH_SHA256=") {
-            let hash = rest.trim().to_string();
-            child.kill().await.ok();
-            return Ok(hash);
-        }
-    }
-    Err(anyhow!("cert hash not seen in container logs within 60s"))
 }
 
 /// A tsnet node running inside the test process. Joins the test headscale
