@@ -177,11 +177,12 @@ systemctl enable getty@tty1.service
 info ""
 info "installation complete."
 if [[ "$seeded" -eq 1 ]]; then
-  info "Reboot the machine. On a phone or laptop on your tailnet, open:"
-  info "  http://<your-relay-host>:8000/?host=<this-hostname>-ghostframe.<tailnet>.ts.net:4443&certHash=<hash>"
+  info "Reboot the machine. Then, on any tailnet device, open:"
+  info "  https://$(hostname)-ghostframe.<tailnet>.ts.net/"
   info ""
-  info "The certHash is printed on stdout at first boot. After reboot, retrieve it with:"
-  info "  journalctl --user -u ghostframe-xdaemon -b | grep CERT_HASH_SHA256"
+  info "If the URL fails to load, enable HTTPS Certificates in your tailnet at"
+  info "  https://login.tailscale.com/admin/dns"
+  info "and refresh."
 else
   info "Run the --init command above, then reboot."
 fi
