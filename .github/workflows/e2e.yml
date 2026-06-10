@@ -71,6 +71,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The in-container cargo build of ghostframe-xdaemon + e2e deps
+      # produces ~5 GB of release artefacts. With the runner's default
+      # ~14 GB free disk, docker image export runs out of space at the
+      # final layer. Strip preinstalled toolchains we don't need (Android
+      # SDK, .NET, Haskell, Boost) — frees ~30 GB.
+      - name: Free disk space on the runner
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: false
+
       - uses: ./.github/workflows/_setup-system-deps
         with:
           e2e-runtime: 'true'
