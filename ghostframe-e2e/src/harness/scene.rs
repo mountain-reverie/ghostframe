@@ -336,7 +336,7 @@ async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioStack> {
 
     // Use localhost (not 127.0.0.1) so the URL matches the SAN that
     // looks most natural; both SANs are in the cert anyway.
-    let page_url = format!("https://localhost:{}/", forwarder.port());
+    let page_url = format!("https://127.0.0.1:{}/", forwarder.port());
     let page = browser.new_page(&page_url).await?;
 
     // Wait for "Receiving frames" before returning — ensures the stack is live.
