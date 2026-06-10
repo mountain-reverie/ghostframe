@@ -58,6 +58,8 @@ async fn e2e_quic_ping_pong_over_tailscale() -> Result<()> {
     let server_key = helpers::create_preauth_key("headscale", "ghostframe").await?;
     let client_key = helpers::create_preauth_key("headscale", "ghostframe").await?;
 
+    let e2e_cert = helpers::e2e_certs::generate(&["localhost", "127.0.0.1"])?;
+
     let _server: ContainerAsync<GenericImage> =
         GenericImage::new("ghostframe/test-server", "latest")
             .with_container_name("ghostframe-server")
@@ -65,32 +67,33 @@ async fn e2e_quic_ping_pong_over_tailscale() -> Result<()> {
             .with_env_var("TS_AUTHKEY", &server_key)
             .with_env_var("TS_CONTROL_URL", "http://headscale:8080")
             .with_env_var("RUST_LOG", "ghostframe=trace,debug")
-            .with_ready_conditions(vec![WaitFor::message_on_stdout("CERT_HASH_SHA256=")])
+            .with_env_var("GHOSTFRAME_WEB_TLS_CERT_PEM", &e2e_cert.cert_pem)
+            .with_env_var("GHOSTFRAME_WEB_TLS_KEY_PEM", &e2e_cert.key_pem)
+            .with_ready_conditions(vec![WaitFor::message_on_stderr(
+                "ghostbridge web server listening on :80 + :443",
+            )])
             .with_startup_timeout(Duration::from_secs(120))
             .start()
             .await?;
-
-    let cert_hash = helpers::read_cert_hash_from_logs("ghostframe-server").await?;
 
     // The test tsnet node runs on the host and connects to headscale via the
     // fixed host-mapped port.  DERP relay also uses this same URL.
     // Use 127.0.0.1 for the test client's control URL — the tsnet client runs
     // on the host where headscale is mapped to localhost:HEADSCALE_HOST_PORT.
     let client_control_url = format!("http://127.0.0.1:{HEADSCALE_HOST_PORT}");
-    let test_node = helpers::TestNode::join(client_key, client_control_url).await?;
+    let test_node = std::sync::Arc::new(
+        helpers::TestNode::join(client_key, client_control_url).await?,
+    );
     let upstream = test_node.dial("ghostframe-server:443")?;
     let forwarder = helpers::start_forwarder("127.0.0.1:0", upstream).await?;
 
-    // Serve ghostframe-web-client/dist over http://127.0.0.1:<port>.
-    // Must be HTTP on a loopback address so Chromium treats it as a secure
-    // context; WebTransport is not allowed from file:// origins.
-    // CARGO_MANIFEST_DIR is the ghostframe-lib package dir; go up one level
-    // to reach the workspace root where ghostframe-web-client lives.
-    let dist_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("workspace root")
-        .join("ghostframe-web-client/dist");
-    let static_addr = helpers::start_static_server(dist_dir).await?;
+    let tcp_bind = format!("127.0.0.1:{}", forwarder.port());
+    let _tcp_forwarder = helpers::start_tcp_forwarder(
+        &tcp_bind,
+        test_node.clone(),
+        "ghostframe-server:443".to_string(),
+    )
+    .await?;
 
     // Spawn a private Weston compositor (headless backend + XWayland) so
     // Chromium's GPU process can talk to Mesa Vulkan via real DRI3 — Xvfb
@@ -134,19 +137,14 @@ async fn e2e_quic_ping_pong_over_tailscale() -> Result<()> {
             .arg("ozone-platform=x11")
             .arg("enable-unsafe-webgpu")
             .arg("ignore-gpu-blocklist")
+            .arg(("ignore-certificate-errors-spki-list", e2e_cert.spki_b64.as_str()))
             .build()
             .unwrap(),
     )
     .await?;
     let _handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
-    let page_url = format!(
-        "http://{}/index.html?host={}:{}&certHash={}",
-        static_addr,
-        forwarder.ip(),
-        forwarder.port(),
-        cert_hash,
-    );
+    let page_url = format!("https://localhost:{}/", forwarder.port());
 
     println!("page_url: {page_url}");
     let page = browser.new_page(&page_url).await?;
@@ -189,8 +187,9 @@ struct E2eSetup {
     _server: ContainerAsync<GenericImage>,
     _browser: Browser,
     _handler_task: tokio::task::JoinHandle<()>,
-    _test_node: helpers::TestNode,
+    _test_node: std::sync::Arc<helpers::TestNode>,
     _forwarder: SocketAddr,
+    _tcp_forwarder: SocketAddr,
     /// Private Weston compositor (headless backend + XWayland) for WebGPU
     /// runs. Dropped after the browser so Chrome detaches before the X
     /// server is killed.
@@ -271,13 +270,17 @@ async fn setup_e2e_inner_with_url_extra(
     let server_key = helpers::create_preauth_key("headscale", "ghostframe").await?;
     let client_key = helpers::create_preauth_key("headscale", "ghostframe").await?;
 
+    let e2e_cert = helpers::e2e_certs::generate(&["localhost", "127.0.0.1"])?;
+
     let mut server_image = GenericImage::new("ghostframe/test-server", "latest")
         .with_container_name("ghostframe-server")
         .with_network(helpers::NETWORK_NAME)
         .with_env_var("TS_AUTHKEY", &server_key)
         .with_env_var("TS_CONTROL_URL", "http://headscale:8080")
         .with_env_var("RUST_LOG", "ghostframe=trace,debug")
-        .with_env_var("TEST_PATTERN", test_pattern_args);
+        .with_env_var("TEST_PATTERN", test_pattern_args)
+        .with_env_var("GHOSTFRAME_WEB_TLS_CERT_PEM", &e2e_cert.cert_pem)
+        .with_env_var("GHOSTFRAME_WEB_TLS_KEY_PEM", &e2e_cert.key_pem);
     if gpu {
         // GPU-path defaults (overridable via extra_env): use the modesetting
         // Xorg config that targets VKMS card0, bind-mount host DRM nodes,
@@ -292,23 +295,27 @@ async fn setup_e2e_inner_with_url_extra(
         server_image = server_image.with_env_var(*k, *v);
     }
     let server: ContainerAsync<GenericImage> = server_image
-        .with_ready_conditions(vec![WaitFor::message_on_stdout("CERT_HASH_SHA256=")])
+        .with_ready_conditions(vec![WaitFor::message_on_stderr(
+            "ghostbridge web server listening on :80 + :443",
+        )])
         .with_startup_timeout(Duration::from_secs(120))
         .start()
         .await?;
 
-    let cert_hash = helpers::read_cert_hash_from_logs("ghostframe-server").await?;
-
     let client_control_url = format!("http://127.0.0.1:{HEADSCALE_HOST_PORT}");
-    let test_node = helpers::TestNode::join(client_key, client_control_url).await?;
+    let test_node = std::sync::Arc::new(
+        helpers::TestNode::join(client_key, client_control_url).await?,
+    );
     let upstream = test_node.dial("ghostframe-server:443")?;
     let forwarder = helpers::start_forwarder("127.0.0.1:0", upstream).await?;
 
-    let dist_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("workspace root")
-        .join("ghostframe-web-client/dist");
-    let static_addr = helpers::start_static_server(dist_dir).await?;
+    let tcp_bind = format!("127.0.0.1:{}", forwarder.port());
+    let _tcp_forwarder = helpers::start_tcp_forwarder(
+        &tcp_bind,
+        test_node.clone(),
+        "ghostframe-server:443".to_string(),
+    )
+    .await?;
 
     // Build chromium args. When `webgpu == true`, enable WebGPU; pick the
     // GPU passthrough path if /dev/dri/renderD128 is host-available, else
@@ -376,22 +383,25 @@ async fn setup_e2e_inner_with_url_extra(
             .arg("use-vulkan")
             .arg("ozone-platform=x11")
             .arg("enable-unsafe-webgpu")
-            .arg("ignore-gpu-blocklist");
+            .arg("ignore-gpu-blocklist")
+            .arg(("ignore-certificate-errors-spki-list", e2e_cert.spki_b64.as_str()));
         let _ = force_swiftshader; // kept for future opt-in; current default selects real GPU.
     } else {
-        builder = builder.new_headless_mode();
+        builder = builder
+            .new_headless_mode()
+            .arg(("ignore-certificate-errors-spki-list", e2e_cert.spki_b64.as_str()));
     }
     let (browser, mut handler) = Browser::launch(builder.build().unwrap()).await?;
     let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
-    let page_url = format!(
-        "http://{}/index.html?host={}:{}&certHash={}{}",
-        static_addr,
-        forwarder.ip(),
-        forwarder.port(),
-        cert_hash,
-        url_query_extra,
-    );
+    let page_url = if url_query_extra.is_empty() {
+        format!("https://localhost:{}/", forwarder.port())
+    } else {
+        // url_query_extra is conventionally "&key=value" (designed to chain
+        // onto an existing query string). Replace the leading '&' with '?'.
+        let suffix = url_query_extra.strip_prefix('&').unwrap_or(url_query_extra);
+        format!("https://localhost:{}/?{}", forwarder.port(), suffix)
+    };
     println!("page_url: {page_url}");
     let page = browser.new_page(&page_url).await?;
 
@@ -426,6 +436,7 @@ async fn setup_e2e_inner_with_url_extra(
         _handler_task: handler_task,
         _test_node: test_node,
         _forwarder: forwarder,
+        _tcp_forwarder,
         _xvfb: xvfb,
         page,
     })
@@ -456,6 +467,8 @@ async fn e2e_raw_frame_round_trip() -> Result<()> {
     let server_key = helpers::create_preauth_key("headscale", "ghostframe").await?;
     let client_key = helpers::create_preauth_key("headscale", "ghostframe").await?;
 
+    let e2e_cert = helpers::e2e_certs::generate(&["localhost", "127.0.0.1"])?;
+
     let _server: ContainerAsync<GenericImage> =
         GenericImage::new("ghostframe/test-server", "latest")
             .with_container_name("ghostframe-server")
@@ -463,23 +476,29 @@ async fn e2e_raw_frame_round_trip() -> Result<()> {
             .with_env_var("TS_AUTHKEY", &server_key)
             .with_env_var("TS_CONTROL_URL", "http://headscale:8080")
             .with_env_var("RUST_LOG", "ghostframe=trace,debug")
-            .with_ready_conditions(vec![WaitFor::message_on_stdout("CERT_HASH_SHA256=")])
+            .with_env_var("GHOSTFRAME_WEB_TLS_CERT_PEM", &e2e_cert.cert_pem)
+            .with_env_var("GHOSTFRAME_WEB_TLS_KEY_PEM", &e2e_cert.key_pem)
+            .with_ready_conditions(vec![WaitFor::message_on_stderr(
+                "ghostbridge web server listening on :80 + :443",
+            )])
             .with_startup_timeout(Duration::from_secs(120))
             .start()
             .await?;
 
-    let cert_hash = helpers::read_cert_hash_from_logs("ghostframe-server").await?;
-
     let client_control_url = format!("http://127.0.0.1:{HEADSCALE_HOST_PORT}");
-    let test_node = helpers::TestNode::join(client_key, client_control_url).await?;
+    let test_node = std::sync::Arc::new(
+        helpers::TestNode::join(client_key, client_control_url).await?,
+    );
     let upstream = test_node.dial("ghostframe-server:443")?;
     let forwarder = helpers::start_forwarder("127.0.0.1:0", upstream).await?;
 
-    let dist_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("workspace root")
-        .join("ghostframe-web-client/dist");
-    let static_addr = helpers::start_static_server(dist_dir).await?;
+    let tcp_bind = format!("127.0.0.1:{}", forwarder.port());
+    let _tcp_forwarder = helpers::start_tcp_forwarder(
+        &tcp_bind,
+        test_node.clone(),
+        "ghostframe-server:443".to_string(),
+    )
+    .await?;
 
     // Spawn a private Weston (headless + XWayland) so Chromium's GPU process
     // can reach Mesa Vulkan via DRI3. See the long comment in
@@ -510,19 +529,14 @@ async fn e2e_raw_frame_round_trip() -> Result<()> {
             .arg("ozone-platform=x11")
             .arg("enable-unsafe-webgpu")
             .arg("ignore-gpu-blocklist")
+            .arg(("ignore-certificate-errors-spki-list", e2e_cert.spki_b64.as_str()))
             .build()
             .unwrap(),
     )
     .await?;
     let _handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
-    let page_url = format!(
-        "http://{}/index.html?host={}:{}&certHash={}",
-        static_addr,
-        forwarder.ip(),
-        forwarder.port(),
-        cert_hash,
-    );
+    let page_url = format!("https://localhost:{}/", forwarder.port());
     println!("page_url: {page_url}");
     let page = browser.new_page(&page_url).await?;
 
