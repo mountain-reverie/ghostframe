@@ -61,6 +61,9 @@ func TestServeConfigJSON(t *testing.T) {
 	if strings.TrimSpace(string(body)) != want {
 		t.Fatalf("GET /config.json: body %q, want %q", string(body), want)
 	}
+	if hsts := resp.Header.Get("Strict-Transport-Security"); !strings.Contains(hsts, "max-age=") {
+		t.Fatalf("GET /config.json: HSTS header %q missing max-age=", hsts)
+	}
 }
 
 func TestRedirectHandler(t *testing.T) {
