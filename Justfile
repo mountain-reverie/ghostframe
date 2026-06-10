@@ -1,19 +1,20 @@
-build:
+build: build-web
     cargo build
 
-build-release:
+build-release: build-web
     cargo build --release
 
 test-unit:
     cargo test --lib
 
-# The e2e harness serves ghostframe-web-client/dist/ over HTTP to Chromium.
-# A stale dist/ silently breaks tests (old ACK wire format → 0 PixelPerfect
-# transitions in lossless-buildup, etc.) so always rebuild before running.
-web-client-build:
+# Run from a clean checkout: builds the web client SPA (vite) into
+# ghostframe-web-client/dist/, which ghostbridge //go:embeds at compile
+# time. A stale or missing dist/ now fails the ghostbridge build with a
+# clear message rather than silently embedding nothing.
+build-web:
     cd ghostframe-web-client && npm install && npm run build
 
-test-e2e: web-client-build containers-build
+test-e2e: build-web containers-build
     cargo test --test e2e
 
 containers-build:
@@ -39,11 +40,11 @@ ci-local:
     cargo clippy --workspace --all-targets -- -D warnings
     @echo "=== unit tests ==="
     cargo test --workspace --lib
+    @echo "=== web client build ==="
+    just build-web
+    cd ghostframe-web-client && npx tsc --noEmit
     @echo "=== release build ==="
     cargo build --workspace --release --exclude ghostframe-e2e
-    @echo "=== web client build ==="
-    just web-client-build
-    cd ghostframe-web-client && npx tsc --noEmit
     @echo "=== cbindgen header up-to-date ==="
     cargo check -p ghostframe-lib
     git diff --exit-code ghostframe-lib/include/ghostframe.h
