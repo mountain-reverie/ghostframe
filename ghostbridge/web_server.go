@@ -35,3 +35,13 @@ func newWebMux(certHashHex string) *http.ServeMux {
 	mux.Handle("/", http.FileServer(http.FS(distFS())))
 	return mux
 }
+
+// newRedirectHandler returns an HTTP handler that 301-redirects every
+// request to the same host:path on https://. Used for the tsnet :80
+// listener so users can paste the bare-hostname URL.
+func newRedirectHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		target := "https://" + r.Host + r.URL.RequestURI()
+		http.Redirect(w, r, target, http.StatusMovedPermanently)
+	})
+}
