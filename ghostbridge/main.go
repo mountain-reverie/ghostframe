@@ -196,8 +196,26 @@ func gbridge_start_web_server(sd C.int32_t, cCertHashHex *C.char) C.gbridge_stat
 		log.Printf("ghostbridge: gbridge_start_web_server: certHash length %d, want 64", len(certHash))
 		return gbridgeWebStatusInvalidArg
 	}
-	// Listener wiring lands in the next task pair; this scaffold returns
-	// OK so the Rust binding can land independently of the TLS plumbing.
+
+	staticCert, err := loadStaticCertFromEnv()
+	if err != nil {
+		log.Printf("ghostbridge: gbridge_start_web_server: static cert env vars set but invalid: %v", err)
+		return gbridgeWebStatusInvalidArg
+	}
+
+	if staticCert == nil {
+		// Production: HTTPS Certs must be enabled in the tailnet.
+		if domains := h.server.CertDomains(); len(domains) == 0 {
+			log.Printf("ghostbridge: gbridge_start_web_server: tailnet has no HTTPS-eligible domains")
+			log.Printf("ghostbridge:   enable HTTPS at https://login.tailscale.com/admin/dns")
+			return gbridgeWebStatusHTTPSCertsDisabled
+		}
+	}
+
+	if err := startWebListeners(context.Background(), h.server, certHash, staticCert); err != nil {
+		log.Printf("ghostbridge: gbridge_start_web_server: listener bind failed: %v", err)
+		return gbridgeWebStatusListenFailed
+	}
 	return gbridgeWebStatusOK
 }
 
