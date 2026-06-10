@@ -547,6 +547,15 @@ impl IoBridge {
         &self.server.cert_info().sha256_hex
     }
 
+    /// Borrow the GhostbridgeHandle for callers that need to issue out-of-band
+    /// FFI calls (e.g., starting the embedded web server on tsnet :80 + :443
+    /// after the QUIC cert hash is known). Returns `None` when the IoBridge
+    /// was constructed via the test-only path that has no real ghostbridge
+    /// connection.
+    pub fn ghostbridge(&self) -> Option<&crate::transport::ghostbridge::GhostbridgeHandle> {
+        self._handle.as_ref()
+    }
+
     /// Fragment a captured frame and send the resulting datagrams to all
     /// connected WebTransport sessions.
     /// Maximum bytes for the WebTransport VarInt session-ID prefix.

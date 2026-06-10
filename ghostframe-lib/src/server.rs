@@ -67,6 +67,17 @@ impl GhostframeServer {
         let mut bridge = IoBridge::new_with_frames(&config, listen_addr, frame_rx).await?;
         let cert_hash = bridge.cert_hash_sha256().to_owned();
 
+        // Start the tsnet :443 (HTTPS) + :80 (redirect) listeners. Failures
+        // are fatal: a misconfigured tailnet or a port bind error means the
+        // first-connection URL will not work. Surface them at startup
+        // rather than at user-connect time.
+        //
+        // `ghostbridge()` returns None only on the test-only IoBridge path
+        // (no real tsnet node); production callers always have a handle.
+        if let Some(bridge_handle) = bridge.ghostbridge() {
+            bridge_handle.start_web_server(&cert_hash)?;
+        }
+
         let io_task = tokio::spawn(async move {
             if let Err(e) = bridge.run().await {
                 tracing::error!(error = %e, "IoBridge event loop exited with error");
