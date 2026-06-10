@@ -225,12 +225,10 @@ async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioStack> {
         .with_env_var("GHOSTFRAME_WEB_TLS_KEY_PEM", &e2e_cert.key_pem)
         .with_mount(Mount::bind_mount("/dev/dri", "/dev/dri"))
         .with_privileged(true)
-        // Readiness probe: emitted by io_bridge after QuicServer::new
-        // (just before start_web_server runs). If start_web_server fails,
-        // the container is still up and the test sees Chrome's actual
-        // connection error rather than an opaque "container startup
-        // timeout" — much easier to diagnose.
-        .with_ready_conditions(vec![WaitFor::message_on_stderr(
+        // Readiness probe: emitted by io_bridge after QuicServer::new.
+        // tracing-subscriber's default writer is stdout (not stderr —
+        // contrary to first instinct), so the probe must match stdout.
+        .with_ready_conditions(vec![WaitFor::message_on_stdout(
             "QUIC server ready",
         )])
         .with_startup_timeout(Duration::from_secs(120));

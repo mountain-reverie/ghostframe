@@ -69,7 +69,7 @@ async fn e2e_quic_ping_pong_over_tailscale() -> Result<()> {
             .with_env_var("RUST_LOG", "ghostframe=trace,debug")
             .with_env_var("GHOSTFRAME_WEB_TLS_CERT_PEM", &e2e_cert.cert_pem)
             .with_env_var("GHOSTFRAME_WEB_TLS_KEY_PEM", &e2e_cert.key_pem)
-            .with_ready_conditions(vec![WaitFor::message_on_stderr(
+            .with_ready_conditions(vec![WaitFor::message_on_stdout(
                 "QUIC server ready",
             )])
             .with_startup_timeout(Duration::from_secs(120))
@@ -297,8 +297,8 @@ async fn setup_e2e_inner_with_url_extra(
         server_image = server_image.with_env_var(*k, *v);
     }
     let server: ContainerAsync<GenericImage> = server_image
-        .with_ready_conditions(vec![WaitFor::message_on_stderr(
-            "ghostbridge web server listening on :80 + :443",
+        .with_ready_conditions(vec![WaitFor::message_on_stdout(
+            "QUIC server ready",
         )])
         .with_startup_timeout(Duration::from_secs(120))
         .start()
@@ -483,7 +483,7 @@ async fn e2e_raw_frame_round_trip() -> Result<()> {
             .with_env_var("RUST_LOG", "ghostframe=trace,debug")
             .with_env_var("GHOSTFRAME_WEB_TLS_CERT_PEM", &e2e_cert.cert_pem)
             .with_env_var("GHOSTFRAME_WEB_TLS_KEY_PEM", &e2e_cert.key_pem)
-            .with_ready_conditions(vec![WaitFor::message_on_stderr(
+            .with_ready_conditions(vec![WaitFor::message_on_stdout(
                 "QUIC server ready",
             )])
             .with_startup_timeout(Duration::from_secs(120))
