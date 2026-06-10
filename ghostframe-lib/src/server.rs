@@ -76,6 +76,11 @@ impl GhostframeServer {
         // (no real tsnet node); production callers always have a handle.
         if let Some(bridge_handle) = bridge.ghostbridge() {
             bridge_handle.start_web_server(&cert_hash)?;
+            // Stable readiness signal: emitted only after the :80 + :443
+            // listeners are bound on tsnet. The e2e harness greps for this
+            // line; production operators see it as confirmation the daemon
+            // is reachable.
+            tracing::info!("ghostbridge web server listening on :80 + :443");
         }
 
         let io_task = tokio::spawn(async move {
