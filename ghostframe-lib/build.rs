@@ -36,6 +36,12 @@ fn main() {
     // catches new .go files, go.sum updates, and the Makefile.
     println!("cargo:rerun-if-changed={}", ghostbridge_dir.display());
 
+    // The SPA tree lives outside ghostbridge/ and is rsync'd in by the
+    // Makefile. Without this rerun-if-changed, edits to the web client
+    // won't trigger a re-link.
+    let web_dist = PathBuf::from(&manifest_dir).join("../ghostframe-web-client/dist");
+    println!("cargo:rerun-if-changed={}", web_dist.display());
+
     // Generate a C header with cbindgen. Non-fatal while ghostframe-lib has
     // no `pub extern "C"` exports — it becomes fatal once M1 starts exporting
     // real symbols; at that point a parse error here should fail the build.
