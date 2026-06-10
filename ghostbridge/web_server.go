@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"time"
 
 	"tailscale.com/tsnet"
 )
@@ -30,9 +31,15 @@ func distFS() fs.FS {
 	return sub
 }
 
+// hstsHeader is the value of Strict-Transport-Security set on every
+// HTTPS response. One-year max-age locks browsers onto HTTPS for the
+// daemon's tailnet hostname; includeSubDomains is harmless because the
+// daemon is the only thing serving on this name.
+const hstsHeader = "max-age=31536000; includeSubDomains"
+
 // newWebMux builds the HTTP handler mux for the embedded SPA + config.
 // certHashHex is the lowercase-hex SHA-256 of the WebTransport server cert.
-func newWebMux(certHashHex string) *http.ServeMux {
+func newWebMux(certHashHex string) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/config.json", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -42,7 +49,11 @@ func newWebMux(certHashHex string) *http.ServeMux {
 		}{CertHash: certHashHex})
 	})
 	mux.Handle("/", http.FileServer(http.FS(distFS())))
-	return mux
+	// Wrap so every HTTPS response carries HSTS.
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Strict-Transport-Security", hstsHeader)
+		mux.ServeHTTP(w, r)
+	})
 }
 
 // newRedirectHandler returns an HTTP handler that 301-redirects every
@@ -118,16 +129,33 @@ func startWebListeners(
 		return err
 	}
 
-	mux := newWebMux(certHashHex)
+	// Explicit *http.Server with timeouts. http.Serve's bare default leaves
+	// every timeout at zero, exposing the daemon to Slowloris-style stalls
+	// from a misbehaving tailnet peer. The values are conservative for a
+	// small static-asset + JSON server.
+	tlsServer := &http.Server{
+		Handler:           newWebMux(certHashHex),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	redirServer := &http.Server{
+		Handler:           newRedirectHandler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       10 * time.Second,
+	}
 	go func() {
-		err := http.Serve(tlsLn, mux)
-		if !errors.Is(err, net.ErrClosed) {
+		err := tlsServer.Serve(tlsLn)
+		if !errors.Is(err, net.ErrClosed) && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("ghostbridge: :443 serve exited: %v", err)
 		}
 	}()
 	go func() {
-		err := http.Serve(redirLn, newRedirectHandler())
-		if !errors.Is(err, net.ErrClosed) {
+		err := redirServer.Serve(redirLn)
+		if !errors.Is(err, net.ErrClosed) && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("ghostbridge: :80 serve exited: %v", err)
 		}
 	}()
