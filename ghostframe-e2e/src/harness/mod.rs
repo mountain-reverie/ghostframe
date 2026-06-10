@@ -10,6 +10,7 @@
 pub mod chromium;
 pub mod cleanup;
 pub mod containers;
+pub mod e2e_certs;
 pub mod fixtures;
 pub mod scene;
 pub mod transport;
