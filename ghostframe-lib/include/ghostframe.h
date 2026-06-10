@@ -241,3 +241,5 @@ extern int gbridge_dial_udp(int sd, const char *remote_addr, int *fd_out);
 extern int gbridge_close(int sd);
 
 extern int gbridge_getips(int sd, char *buf, uintptr_t buf_len);
+
+extern int gbridge_start_web_server(int sd, const char *cert_hash_hex);
