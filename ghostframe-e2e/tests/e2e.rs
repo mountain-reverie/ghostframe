@@ -146,7 +146,7 @@ async fn e2e_quic_ping_pong_over_tailscale() -> Result<()> {
     .await?;
     let _handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
-    let page_url = format!("https://localhost:{}/", forwarder.port());
+    let page_url = format!("https://127.0.0.1:{}/", forwarder.port());
 
     println!("page_url: {page_url}");
     let page = browser.new_page(&page_url).await?;
@@ -400,12 +400,12 @@ async fn setup_e2e_inner_with_url_extra(
     let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
     let page_url = if url_query_extra.is_empty() {
-        format!("https://localhost:{}/", forwarder.port())
+        format!("https://127.0.0.1:{}/", forwarder.port())
     } else {
         // url_query_extra is conventionally "&key=value" (designed to chain
         // onto an existing query string). Replace the leading '&' with '?'.
         let suffix = url_query_extra.strip_prefix('&').unwrap_or(url_query_extra);
-        format!("https://localhost:{}/?{}", forwarder.port(), suffix)
+        format!("https://127.0.0.1:{}/?{}", forwarder.port(), suffix)
     };
     println!("page_url: {page_url}");
     let page = browser.new_page(&page_url).await?;
@@ -543,7 +543,7 @@ async fn e2e_raw_frame_round_trip() -> Result<()> {
     .await?;
     let _handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
-    let page_url = format!("https://localhost:{}/", forwarder.port());
+    let page_url = format!("https://127.0.0.1:{}/", forwarder.port());
     println!("page_url: {page_url}");
     let page = browser.new_page(&page_url).await?;
 
