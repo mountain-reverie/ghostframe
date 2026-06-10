@@ -64,11 +64,12 @@ the host on your tailnet. The install script will prompt for it.
 ## Install
 
 ```bash
-# 1. Clone and build from source.
+# 1. Clone and build from source. `just build` runs the web client SPA
+#    build first (vite) so ghostbridge can //go:embed it before the
+#    daemon links.
 git clone https://github.com/mountain-reverie/ghostframe.git
 cd ghostframe
-cargo build --release -p ghostframe-xdaemon
-(cd ghostframe-web-client && npm install && npm run build)
+just build-release
 
 # 2. Run the installer as root, targeting the user that should own the
 #    headless session.
@@ -84,31 +85,22 @@ and `ghostframe-xdaemon` joins the tailnet and starts capturing.
 
 ## First connection
 
-On any device on the same tailnet (phone, laptop, another machine):
+On any device on the same tailnet, open
 
-1. Find this host's tailnet name and the daemon's TLS cert hash. SSH into
-   the host as the configured user and run:
+```
+https://<hostname>-ghostframe.<tailnet>.ts.net/
+```
 
-   ```bash
-   journalctl --user -u ghostframe-xdaemon -b | grep CERT_HASH_SHA256
-   ```
+in Chrome / Chromium / Edge. `<hostname>` is your machine's hostname
+(the installer registers it as `<hostname>-ghostframe`); `<tailnet>` is
+your tailnet's MagicDNS suffix.
 
-   That prints a line like `CERT_HASH_SHA256=<64-hex>`.
-
-2. Serve the web client on the host (or any other tailnet device):
-
-   ```bash
-   cd ghostframe/ghostframe-web-client/dist
-   python3 -m http.server 8000 --bind 127.0.0.1
-   ```
-
-3. Open in Chrome / Chromium / Edge:
-
-   ```
-   http://127.0.0.1:8000/?host=<hostname>-ghostframe.<tailnet>.ts.net:4443&certHash=<64-hex>
-   ```
-
-You should see the Enlightenment desktop streaming into your browser.
+The daemon serves the web client and its WebTransport cert hash
+directly, so no manual setup is required on the client device. The
+page uses a Tailscale-issued Let's Encrypt certificate — make sure
+**HTTPS Certificates** are enabled at
+<https://login.tailscale.com/admin/dns> before connecting for the
+first time.
 
 ## More
 
