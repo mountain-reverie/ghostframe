@@ -160,6 +160,47 @@ func gbridge_dial_udp(sd C.int32_t, cRemote *C.char, fdOut *C.int32_t) C.gbridge
 	return 0
 }
 
+//export gbridge_dial_tcp
+func gbridge_dial_tcp(sd C.int32_t, cRemote *C.char, fdOut *C.int32_t) C.gbridge_status {
+	h := lookup(int32(sd))
+	if h == nil {
+		return -1
+	}
+	remote := C.GoString(cRemote)
+	log.Printf("ghostbridge: dialing tcp %q", remote)
+	netConn, err := h.server.Dial(context.Background(), "tcp", remote)
+	if err != nil {
+		log.Printf("ghostbridge: dial tcp %q failed: %v", remote, err)
+		return -3
+	}
+	goFd, cFd, err := makeSocketpair()
+	if err != nil {
+		netConn.Close()
+		return -4
+	}
+	spawnTcpBridge(netConn, goFd)
+	*fdOut = C.int32_t(cFd)
+	return 0
+}
+
+// spawnTcpBridge copies bytes bidirectionally between a tsnet TCP
+// connection and the Go-side socketpair fd. Mirrors spawnPacketBridge
+// but without the per-packet framing — TCP is a byte stream.
+func spawnTcpBridge(conn net.Conn, goFd int) {
+	goFile := os.NewFile(uintptr(goFd), "gbridge-tcp-goside")
+	// goFile is blocking (we only set O_NONBLOCK on the C side); io.Copy
+	// blocks the goroutine on read until the peer closes, which is
+	// exactly the lifecycle we want.
+	go func() {
+		defer goFile.Close()
+		defer conn.Close()
+		_, _ = io.Copy(conn, goFile)
+	}()
+	go func() {
+		_, _ = io.Copy(goFile, conn)
+	}()
+}
+
 //export gbridge_close
 func gbridge_close(sd C.int32_t) C.gbridge_status {
 	serversMu.Lock()
