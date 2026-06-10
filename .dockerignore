@@ -2,7 +2,13 @@ target/
 .worktrees/
 .git/
 node_modules/
+# Exclude the SPA source + node_modules but allow the prebuilt dist/
+# through. ghostbridge //go:embeds dist at compile time inside the
+# container, and the host or CI is responsible for `npm run build`
+# ahead of `docker build`.
 ghostframe-web-client/
+!ghostframe-web-client/dist
+!ghostframe-web-client/dist/**
 ghostbridge/libghostbridge.a
 ghostbridge/libghostbridge.h
 docs/
