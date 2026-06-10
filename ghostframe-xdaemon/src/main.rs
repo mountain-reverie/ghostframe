@@ -85,7 +85,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
 
     tracing::info!("Connecting to Tailscale...");
-    let server = GhostframeServer::new(config, ":443").await?;
+    let server = match GhostframeServer::new(config, ":443").await {
+        Ok(s) => s,
+        Err(e) => {
+            if let Some(ws) = e.downcast_ref::<ghostframe_lib::WebServerError>() {
+                if matches!(ws, ghostframe_lib::WebServerError::HttpsCertsDisabled) {
+                    tracing::error!(
+                        "HTTPS Certificates are not enabled for this tailnet. \
+                         Enable them at https://login.tailscale.com/admin/dns and restart."
+                    );
+                    std::process::exit(2);
+                }
+            }
+            return Err(e);
+        }
+    };
 
     // Machine-parseable line for the E2E test harness. Use println! (stdout)
     // rather than tracing so the format stays stable regardless of log config.
