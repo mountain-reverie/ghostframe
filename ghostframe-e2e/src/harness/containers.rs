@@ -125,6 +125,10 @@ impl TestNode {
     pub fn dial(&self, remote: &str) -> Result<UdpPacketConn> {
         Ok(self.handle.dial_udp(remote)?)
     }
+
+    pub fn dial_tcp(&self, remote: &str) -> Result<std::os::unix::net::UnixStream> {
+        Ok(self.handle.dial_tcp(remote)?)
+    }
 }
 
 /// Run `docker exec [-e <env>...] <container> <args...>` against an

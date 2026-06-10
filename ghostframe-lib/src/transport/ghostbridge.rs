@@ -35,6 +35,7 @@ extern "C" {
     fn gbridge_close(sd: c_int) -> c_int;
     fn gbridge_getips(sd: c_int, buf: *mut c_char, buf_len: usize) -> c_int;
     fn gbridge_start_web_server(sd: c_int, cert_hash_hex: *const c_char) -> c_int;
+    fn gbridge_dial_tcp(sd: c_int, remote_addr: *const c_char, fd_out: *mut c_int) -> c_int;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -138,6 +139,25 @@ impl GhostbridgeHandle {
             return Err(GhostbridgeError::Ffi("gbridge_dial_udp", rc));
         }
         Ok(UdpPacketConn::from_raw_fd(fd))
+    }
+
+    /// Dial a TCP address over the tailnet. Returns a Unix-domain
+    /// stream endpoint of the Go-side socketpair that bridges to the
+    /// remote TCP connection. `tokio::io::copy_bidirectional` over the
+    /// returned `UnixStream` is the typical consumer (used by the E2E
+    /// harness's start_tcp_forwarder).
+    pub fn dial_tcp(&self, remote: &str) -> Result<std::os::unix::net::UnixStream, GhostbridgeError> {
+        let c_remote = CString::new(remote)?;
+        let mut fd: c_int = -1;
+        let rc = unsafe { gbridge_dial_tcp(self.sd, c_remote.as_ptr(), &mut fd) };
+        if rc < 0 {
+            return Err(GhostbridgeError::Ffi("gbridge_dial_tcp", rc));
+        }
+        // Safety: fd is freshly returned, owned by this caller. O_NONBLOCK
+        // already set on the Go side.
+        Ok(unsafe {
+            <std::os::unix::net::UnixStream as std::os::unix::io::FromRawFd>::from_raw_fd(fd)
+        })
     }
 
     pub fn get_ips(&self) -> Result<Vec<IpAddr>, GhostbridgeError> {

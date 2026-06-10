@@ -27,5 +27,5 @@ pub use scene::{
     run_scene, ClientDiagnosticRecord, CodecHistogram, FrameMode, ProcSample, SceneResult,
     SceneSpec, ServerTelemetryRecord,
 };
-pub use transport::{start_forwarder, start_static_server};
+pub use transport::{start_forwarder, start_static_server, start_tcp_forwarder};
 pub use weston::{parse_weston_xwayland_display, spawn_weston_headless, WestonGuard};
