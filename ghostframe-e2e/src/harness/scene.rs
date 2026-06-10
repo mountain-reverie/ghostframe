@@ -225,7 +225,9 @@ async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioStack> {
         .with_env_var("GHOSTFRAME_WEB_TLS_KEY_PEM", &e2e_cert.key_pem)
         .with_mount(Mount::bind_mount("/dev/dri", "/dev/dri"))
         .with_privileged(true)
-        .with_ready_conditions(vec![WaitFor::message_on_stderr("QUIC server ready")])
+        .with_ready_conditions(vec![WaitFor::message_on_stderr(
+            "ghostbridge web server listening on :80 + :443",
+        )])
         .with_startup_timeout(Duration::from_secs(120));
 
     // CRITICAL: this list must stay in sync with the env vars set by the
