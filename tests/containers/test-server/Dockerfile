@@ -53,6 +53,17 @@ COPY ghostframe-lib/ ghostframe-lib/
 COPY ghostframe-xdaemon/ ghostframe-xdaemon/
 COPY ghostframe-test-pattern/ ghostframe-test-pattern/
 
+# ghostbridge //go:embeds ghostframe-web-client/dist/ at compile time.
+# The Makefile rsyncs from here into ghostbridge/dist/ before `go build`
+# runs (via ghostframe-lib's build.rs → make archive). The dist tree
+# must be prebuilt on the host (CI's web-client job or `npm run build`);
+# this Dockerfile does not install Node.
+COPY ghostframe-web-client/dist/ ghostframe-web-client/dist/
+
+# rsync is required by ghostbridge/Makefile's sync-dist target.
+RUN apt-get update && apt-get install -y --no-install-recommends rsync \
+    && rm -rf /var/lib/apt/lists/*
+
 ENV CARGO_BUILD_JOBS=2
 # ffmpeg-next overflows rustc's default 8 MiB stack on this codebase; bump
 # to 16 MiB (the value rustc itself suggests when it crashes).
