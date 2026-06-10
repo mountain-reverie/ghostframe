@@ -70,7 +70,7 @@ async fn e2e_quic_ping_pong_over_tailscale() -> Result<()> {
             .with_env_var("GHOSTFRAME_WEB_TLS_CERT_PEM", &e2e_cert.cert_pem)
             .with_env_var("GHOSTFRAME_WEB_TLS_KEY_PEM", &e2e_cert.key_pem)
             .with_ready_conditions(vec![WaitFor::message_on_stderr(
-                "ghostbridge web server listening on :80 + :443",
+                "QUIC server ready",
             )])
             .with_startup_timeout(Duration::from_secs(120))
             .start()
@@ -484,7 +484,7 @@ async fn e2e_raw_frame_round_trip() -> Result<()> {
             .with_env_var("GHOSTFRAME_WEB_TLS_CERT_PEM", &e2e_cert.cert_pem)
             .with_env_var("GHOSTFRAME_WEB_TLS_KEY_PEM", &e2e_cert.key_pem)
             .with_ready_conditions(vec![WaitFor::message_on_stderr(
-                "ghostbridge web server listening on :80 + :443",
+                "QUIC server ready",
             )])
             .with_startup_timeout(Duration::from_secs(120))
             .start()
