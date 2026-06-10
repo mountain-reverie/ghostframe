@@ -196,10 +196,8 @@ func gbridge_start_web_server(sd C.int32_t, cCertHashHex *C.char) C.gbridge_stat
 		log.Printf("ghostbridge: gbridge_start_web_server: certHash length %d, want 64", len(certHash))
 		return gbridgeWebStatusInvalidArg
 	}
-	// Listener wiring lands in Task 7; this scaffold returns OK so the
-	// Rust binding can land independently of the TLS plumbing.
-	_ = h
-	_ = newWebMux(certHash)
+	// Listener wiring lands in the next task pair; this scaffold returns
+	// OK so the Rust binding can land independently of the TLS plumbing.
 	return gbridgeWebStatusOK
 }
 
