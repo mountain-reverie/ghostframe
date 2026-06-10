@@ -210,29 +210,6 @@ jobs:
           cargo test --test chromium_probe -- --nocapture 2>&1 \
             | tee /tmp/ghostframe-probe/chromium-codecs.log
 
-      # testcontainers removes containers on Drop, so the failure-capture
-      # step at the bottom of this job can't `docker logs` them after the
-      # fact. Spin up a background watcher that streams logs from every
-      # ghostframe-server container Docker creates during the test run.
-      - name: Start background container log streamer
-        run: |
-          mkdir -p /tmp/ci-artifacts/streamed-logs
-          nohup bash -c '
-            seen=""
-            while true; do
-              for cid in $(docker ps -aq --filter "name=ghostframe-server" 2>/dev/null); do
-                if [[ "$seen" != *"$cid"* ]]; then
-                  seen="$seen $cid"
-                  (docker logs --follow "$cid" \
-                    > "/tmp/ci-artifacts/streamed-logs/${cid}.stdout.log" \
-                    2> "/tmp/ci-artifacts/streamed-logs/${cid}.stderr.log") &
-                fi
-              done
-              sleep 1
-            done
-          ' > /tmp/ci-artifacts/streamer.log 2>&1 &
-          echo "streamer PID $!"
-
       - name: Run e2e tests (VKMS-gated subset skipped)
         run: |
           set -o pipefail
