@@ -283,8 +283,7 @@ async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioStack> {
         crate::harness::containers::TestNode::join(client_key, client_control_url).await?,
     );
     let udp_upstream = test_node.dial("ghostframe-server:443")?;
-    let forwarder =
-        crate::harness::transport::start_forwarder("127.0.0.1:0", udp_upstream).await?;
+    let forwarder = crate::harness::transport::start_forwarder("127.0.0.1:0", udp_upstream).await?;
 
     // TCP forwarder shares the loopback port number with the UDP forwarder
     // (TCP and UDP are independent transports). Chrome's WebTransport
@@ -324,7 +323,10 @@ async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioStack> {
         .arg("ozone-platform=x11")
         .arg("enable-unsafe-webgpu")
         .arg("ignore-gpu-blocklist")
-        .arg(("ignore-certificate-errors-spki-list", e2e_cert.spki_b64.as_str()));
+        .arg((
+            "ignore-certificate-errors-spki-list",
+            e2e_cert.spki_b64.as_str(),
+        ));
 
     let (browser, mut handler) = Browser::launch(builder.build().unwrap()).await?;
     let browser_handle = tokio::spawn(async move { while handler.next().await.is_some() {} });

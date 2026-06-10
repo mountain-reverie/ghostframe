@@ -86,7 +86,9 @@ pub async fn start_tcp_forwarder(
 
     tokio::spawn(async move {
         loop {
-            let Ok((mut downstream, _)) = listener.accept().await else { return };
+            let Ok((mut downstream, _)) = listener.accept().await else {
+                return;
+            };
             let test_node = test_node.clone();
             let remote = remote.clone();
             tokio::spawn(async move {
@@ -97,8 +99,12 @@ pub async fn start_tcp_forwarder(
                         return;
                     }
                 };
-                if upstream_std.set_nonblocking(true).is_err() { return }
-                let Ok(mut upstream) = tokio::net::UnixStream::from_std(upstream_std) else { return };
+                if upstream_std.set_nonblocking(true).is_err() {
+                    return;
+                }
+                let Ok(mut upstream) = tokio::net::UnixStream::from_std(upstream_std) else {
+                    return;
+                };
                 let _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await;
             });
         }

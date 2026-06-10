@@ -17,9 +17,8 @@ pub struct E2eCert {
 }
 
 pub fn generate(sans: &[&str]) -> anyhow::Result<E2eCert> {
-    let mut params = rcgen::CertificateParams::new(
-        sans.iter().map(|s| s.to_string()).collect::<Vec<_>>()
-    )?;
+    let mut params =
+        rcgen::CertificateParams::new(sans.iter().map(|s| s.to_string()).collect::<Vec<_>>())?;
     let now = time::OffsetDateTime::now_utc();
     params.not_before = now;
     params.not_after = now + time::Duration::days(13);
@@ -33,10 +32,14 @@ pub fn generate(sans: &[&str]) -> anyhow::Result<E2eCert> {
     // cert. rcgen's PublicKeyData trait provides subject_public_key_info()
     // which returns the SPKI DER bytes (algorithm + bit-string).
     let spki_der = key_pair.subject_public_key_info();
-    let spki_b64 = base64::engine::general_purpose::STANDARD_NO_PAD
-        .encode(Sha256::digest(&spki_der));
+    let spki_b64 =
+        base64::engine::general_purpose::STANDARD_NO_PAD.encode(Sha256::digest(&spki_der));
 
-    Ok(E2eCert { cert_pem, key_pem, spki_b64 })
+    Ok(E2eCert {
+        cert_pem,
+        key_pem,
+        spki_b64,
+    })
 }
 
 #[cfg(test)]
@@ -49,7 +52,8 @@ mod tests {
         assert!(c.cert_pem.starts_with("-----BEGIN CERTIFICATE-----"));
         assert!(c.key_pem.contains("PRIVATE KEY"));
         let spki = base64::engine::general_purpose::STANDARD_NO_PAD
-            .decode(&c.spki_b64).expect("base64");
+            .decode(&c.spki_b64)
+            .expect("base64");
         assert_eq!(spki.len(), 32, "SHA-256 is 32 bytes");
     }
 }

@@ -81,9 +81,8 @@ async fn e2e_quic_ping_pong_over_tailscale() -> Result<()> {
     // Use 127.0.0.1 for the test client's control URL — the tsnet client runs
     // on the host where headscale is mapped to localhost:HEADSCALE_HOST_PORT.
     let client_control_url = format!("http://127.0.0.1:{HEADSCALE_HOST_PORT}");
-    let test_node = std::sync::Arc::new(
-        helpers::TestNode::join(client_key, client_control_url).await?,
-    );
+    let test_node =
+        std::sync::Arc::new(helpers::TestNode::join(client_key, client_control_url).await?);
     let upstream = test_node.dial("ghostframe-server:443")?;
     let forwarder = helpers::start_forwarder("127.0.0.1:0", upstream).await?;
 
@@ -137,7 +136,10 @@ async fn e2e_quic_ping_pong_over_tailscale() -> Result<()> {
             .arg("ozone-platform=x11")
             .arg("enable-unsafe-webgpu")
             .arg("ignore-gpu-blocklist")
-            .arg(("ignore-certificate-errors-spki-list", e2e_cert.spki_b64.as_str()))
+            .arg((
+                "ignore-certificate-errors-spki-list",
+                e2e_cert.spki_b64.as_str(),
+            ))
             .build()
             .unwrap(),
     )
@@ -303,9 +305,8 @@ async fn setup_e2e_inner_with_url_extra(
         .await?;
 
     let client_control_url = format!("http://127.0.0.1:{HEADSCALE_HOST_PORT}");
-    let test_node = std::sync::Arc::new(
-        helpers::TestNode::join(client_key, client_control_url).await?,
-    );
+    let test_node =
+        std::sync::Arc::new(helpers::TestNode::join(client_key, client_control_url).await?);
     let upstream = test_node.dial("ghostframe-server:443")?;
     let forwarder = helpers::start_forwarder("127.0.0.1:0", upstream).await?;
 
@@ -384,12 +385,16 @@ async fn setup_e2e_inner_with_url_extra(
             .arg("ozone-platform=x11")
             .arg("enable-unsafe-webgpu")
             .arg("ignore-gpu-blocklist")
-            .arg(("ignore-certificate-errors-spki-list", e2e_cert.spki_b64.as_str()));
+            .arg((
+                "ignore-certificate-errors-spki-list",
+                e2e_cert.spki_b64.as_str(),
+            ));
         let _ = force_swiftshader; // kept for future opt-in; current default selects real GPU.
     } else {
-        builder = builder
-            .new_headless_mode()
-            .arg(("ignore-certificate-errors-spki-list", e2e_cert.spki_b64.as_str()));
+        builder = builder.new_headless_mode().arg((
+            "ignore-certificate-errors-spki-list",
+            e2e_cert.spki_b64.as_str(),
+        ));
     }
     let (browser, mut handler) = Browser::launch(builder.build().unwrap()).await?;
     let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
@@ -486,9 +491,8 @@ async fn e2e_raw_frame_round_trip() -> Result<()> {
             .await?;
 
     let client_control_url = format!("http://127.0.0.1:{HEADSCALE_HOST_PORT}");
-    let test_node = std::sync::Arc::new(
-        helpers::TestNode::join(client_key, client_control_url).await?,
-    );
+    let test_node =
+        std::sync::Arc::new(helpers::TestNode::join(client_key, client_control_url).await?);
     let upstream = test_node.dial("ghostframe-server:443")?;
     let forwarder = helpers::start_forwarder("127.0.0.1:0", upstream).await?;
 
@@ -529,7 +533,10 @@ async fn e2e_raw_frame_round_trip() -> Result<()> {
             .arg("ozone-platform=x11")
             .arg("enable-unsafe-webgpu")
             .arg("ignore-gpu-blocklist")
-            .arg(("ignore-certificate-errors-spki-list", e2e_cert.spki_b64.as_str()))
+            .arg((
+                "ignore-certificate-errors-spki-list",
+                e2e_cert.spki_b64.as_str(),
+            ))
             .build()
             .unwrap(),
     )

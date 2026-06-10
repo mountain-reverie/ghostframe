@@ -146,7 +146,10 @@ impl GhostbridgeHandle {
     /// remote TCP connection. `tokio::io::copy_bidirectional` over the
     /// returned `UnixStream` is the typical consumer (used by the E2E
     /// harness's start_tcp_forwarder).
-    pub fn dial_tcp(&self, remote: &str) -> Result<std::os::unix::net::UnixStream, GhostbridgeError> {
+    pub fn dial_tcp(
+        &self,
+        remote: &str,
+    ) -> Result<std::os::unix::net::UnixStream, GhostbridgeError> {
         let c_remote = CString::new(remote)?;
         let mut fd: c_int = -1;
         let rc = unsafe { gbridge_dial_tcp(self.sd, c_remote.as_ptr(), &mut fd) };
