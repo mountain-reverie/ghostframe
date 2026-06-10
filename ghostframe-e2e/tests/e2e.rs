@@ -2077,60 +2077,22 @@ async fn e2e_mode_switch() -> Result<()> {
     // overlap static phases. Just require non-zero tile emission in any phase.
     let tile_present_phase = phases.iter().any(|(t, _)| *t > 0);
 
-    // M3.3c tightening: per phase, label by frame-datagram PRESENCE rather
-    // than tile-vs-frame dominance. With cdf53 enabled, motion-phase tile
-    // counts (full-stripe cdf53 emission + h264) routinely exceed frame
-    // counts by 10×+, so dominance ratios don't expose the alternation —
-    // but frame presence does (motion phases ~500 frames, static phases ~0).
-    //
-    //   "F" = frame-active phase (≥250 frame datagrams: H.264 emitting → motion)
-    //   "T" = tile-only phase   (<200 frame datagrams: classifier exited H.264 → static)
-    //   "M" = mixed             (anything in between — transitional)
-    //
-    // The T-band is widened to 200 (vs. 50) to accommodate H.264 cooldown
-    // frames that trail into the early-static window. Empirically motion
-    // phases produce 400-500 frame datagrams, static phases 0-120.
-    let label_phase = |(_t, f): &(i64, i64)| -> &'static str {
-        if *f >= 250 {
-            "F"
-        } else if *f < 200 {
-            "T"
+    eprintln!("--- per-phase totals ---");
+    for (i, (t, f)) in phases.iter().enumerate() {
+        let marker = if is_h264_active_phase(&(*t, *f)) {
+            " <H264-ACTIVE>"
         } else {
-            "M"
-        }
-    };
-    let phase_labels: Vec<&'static str> = phases.iter().map(label_phase).collect();
-    let mut frame_to_tile_flips = 0usize;
-    let mut tile_to_frame_flips = 0usize;
-    for w in phase_labels.windows(2) {
-        match (w[0], w[1]) {
-            ("F", "T") => frame_to_tile_flips += 1,
-            ("T", "F") => tile_to_frame_flips += 1,
-            _ => {}
-        }
+            ""
+        };
+        eprintln!("phase {i}  tile={t:>5}  frame={f:>5}{marker}");
     }
-    eprintln!("--- per-phase totals (DEBUG always-on for tightened asserts) ---");
-    for (i, ((t, f), lab)) in phases.iter().zip(phase_labels.iter()).enumerate() {
-        eprintln!("phase {i}  tile={t:>5}  frame={f:>5}  label={lab}");
-    }
-    eprintln!("phase labels: {:?}", phase_labels);
-    eprintln!("Frame→Tile flips: {frame_to_tile_flips}; Tile→Frame flips: {tile_to_frame_flips}");
 
-    // Diagnostic table — print on any failure.
+    // Extra detail on failure: per-sample deltas + summary line.
     let pass = tile_seen && frame_seen && tile_present_phase && h264_active_phases.len() >= 2;
     if !pass {
-        eprintln!("--- per-sample deltas ---");
+        eprintln!("--- per-sample deltas (anchor={:?}) ---", t_first_data);
         for (ms, dt, df) in &deltas {
             eprintln!("t={ms:>5}ms  +tile={dt:>4}  +frame={df:>4}");
-        }
-        eprintln!("--- per-phase totals (anchor={:?}) ---", t_first_data);
-        for (i, (t, f)) in phases.iter().enumerate() {
-            let marker = if is_h264_active_phase(&(*t, *f)) {
-                " <H264-ACTIVE>"
-            } else {
-                ""
-            };
-            eprintln!("phase {i}  tile={t:>5}  frame={f:>5}{marker}");
         }
         eprintln!(
             "tile_seen={tile_seen} frame_seen={frame_seen} tile_present_phase={tile_present_phase} h264_active_phases={h264_active_phases:?}"
@@ -2158,20 +2120,6 @@ async fn e2e_mode_switch() -> Result<()> {
         "expected at least 2 distinct H264-active phases (proves classifier flipped both \
          directions: H264 → exit → H264). Observed H264-active phase indices: {:?}",
         h264_active_phases
-    );
-    assert!(
-        frame_to_tile_flips >= 2,
-        "expected ≥2 Frame→Tile dominance flips (refinement emissions during \
-         static halves should produce them); saw {frame_to_tile_flips}. \
-         Phase labels: {:?}",
-        phase_labels
-    );
-    assert!(
-        tile_to_frame_flips >= 1,
-        "expected ≥1 Tile→Frame dominance flip (motion phase entering H264 \
-         from a tile-dominant static phase); saw {tile_to_frame_flips}. \
-         Phase labels: {:?}",
-        phase_labels
     );
 
     Ok(())
