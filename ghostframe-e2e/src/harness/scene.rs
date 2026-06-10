@@ -140,13 +140,13 @@ struct ScenarioStack {
     _browser: Browser,
     /// CDP event-loop task.
     _browser_handle: tokio::task::JoinHandle<()>,
-    /// TestNode + forwarder kept alive.
-    _test_node: crate::harness::containers::TestNode,
-    /// Bound address of the loopback forwarder (not used after setup, but
-    /// kept alive so the socket isn't dropped).
+    /// TestNode + forwarders kept alive.
+    _test_node: std::sync::Arc<crate::harness::containers::TestNode>,
+    /// Bound address of the loopback UDP forwarder (not used after setup,
+    /// but kept alive so the socket isn't dropped).
     _forwarder: std::net::SocketAddr,
-    /// Static web-client server (axum task running as long as addr is live).
-    _static_addr: std::net::SocketAddr,
+    /// TCP forwarder handle (kept alive so the listener isn't dropped).
+    _tcp_forwarder: std::net::SocketAddr,
     /// Weston compositor guard (must outlive `_browser`).
     _xvfb: crate::harness::weston::WestonGuard,
     /// The open browser page pointed at the web client.
@@ -201,6 +201,8 @@ async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioStack> {
     let test_pattern_str = spec.test_pattern_args.join(" ");
     let server_container_name = "ghostframe-server".to_string();
 
+    let e2e_cert = crate::harness::e2e_certs::generate(&["localhost", "127.0.0.1"])?;
+
     // M3.6c: forward bench-set env vars into the container so
     // GHOSTFRAME_OUTBOUND_BANDWIDTH_CAP + GHOSTFRAME_INBOUND_LOSS_*
     // actually reach xdaemon. Without this, the env vars stay on
@@ -216,9 +218,14 @@ async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioStack> {
         .with_env_var("GHOSTFRAME_LOG_FORMAT", "json")
         // GPU passthrough: bind /dev/dri + modesetting Xorg config + privileged.
         .with_env_var("XORG_CONF", "/etc/X11/xorg-vkms.conf")
+        // E2E-only: substitute static TLS cert for tsnet's LE provisioning
+        // (headscale-backed e2e cannot reach Let's Encrypt). ghostbridge
+        // also skips the CertDomains() fail-fast when these are set.
+        .with_env_var("GHOSTFRAME_WEB_TLS_CERT_PEM", &e2e_cert.cert_pem)
+        .with_env_var("GHOSTFRAME_WEB_TLS_KEY_PEM", &e2e_cert.key_pem)
         .with_mount(Mount::bind_mount("/dev/dri", "/dev/dri"))
         .with_privileged(true)
-        .with_ready_conditions(vec![WaitFor::message_on_stdout("CERT_HASH_SHA256=")])
+        .with_ready_conditions(vec![WaitFor::message_on_stderr("QUIC server ready")])
         .with_startup_timeout(Duration::from_secs(120));
 
     // CRITICAL: this list must stay in sync with the env vars set by the
@@ -265,25 +272,28 @@ async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioStack> {
 
     let server: ContainerAsync<GenericImage> = server_image.start().await?;
 
-    let cert_hash =
-        crate::harness::containers::read_cert_hash_from_logs(&server_container_name).await?;
-
     // Resolve xdaemon's host-visible PID for /proc sampling.
     let xdaemon_host_pid = resolve_xdaemon_host_pid(&server_container_name).await;
 
-    // --- TestNode + forwarder ---
+    // --- TestNode + forwarders ---
     let client_control_url = format!("http://127.0.0.1:{HEADSCALE_HOST_PORT}");
-    let test_node =
-        crate::harness::containers::TestNode::join(client_key, client_control_url).await?;
-    let upstream = test_node.dial("ghostframe-server:443")?;
-    let forwarder = crate::harness::transport::start_forwarder("127.0.0.1:0", upstream).await?;
+    let test_node = std::sync::Arc::new(
+        crate::harness::containers::TestNode::join(client_key, client_control_url).await?,
+    );
+    let udp_upstream = test_node.dial("ghostframe-server:443")?;
+    let forwarder =
+        crate::harness::transport::start_forwarder("127.0.0.1:0", udp_upstream).await?;
 
-    // --- Static web-client ---
-    let dist_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("workspace root")
-        .join("ghostframe-web-client/dist");
-    let static_addr = crate::harness::transport::start_static_server(dist_dir).await?;
+    // TCP forwarder shares the loopback port number with the UDP forwarder
+    // (TCP and UDP are independent transports). Chrome's WebTransport
+    // connection lands on the same `host:port` as the HTTPS page load.
+    let tcp_bind = format!("127.0.0.1:{}", forwarder.port());
+    let tcp_forwarder = crate::harness::transport::start_tcp_forwarder(
+        &tcp_bind,
+        test_node.clone(),
+        "ghostframe-server:443".to_string(),
+    )
+    .await?;
 
     // --- Weston headless compositor + XWayland ---
     let xvfb = crate::harness::weston::spawn_weston_headless()?;
@@ -311,18 +321,15 @@ async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioStack> {
         .arg("use-vulkan")
         .arg("ozone-platform=x11")
         .arg("enable-unsafe-webgpu")
-        .arg("ignore-gpu-blocklist");
+        .arg("ignore-gpu-blocklist")
+        .arg(("ignore-certificate-errors-spki-list", e2e_cert.spki_b64.as_str()));
 
     let (browser, mut handler) = Browser::launch(builder.build().unwrap()).await?;
     let browser_handle = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
-    let page_url = format!(
-        "http://{}/index.html?host={}:{}&certHash={}",
-        static_addr,
-        forwarder.ip(),
-        forwarder.port(),
-        cert_hash,
-    );
+    // Use localhost (not 127.0.0.1) so the URL matches the SAN that
+    // looks most natural; both SANs are in the cert anyway.
+    let page_url = format!("https://localhost:{}/", forwarder.port());
     let page = browser.new_page(&page_url).await?;
 
     // Wait for "Receiving frames" before returning — ensures the stack is live.
@@ -362,7 +369,7 @@ async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioStack> {
         _browser_handle: browser_handle,
         _test_node: test_node,
         _forwarder: forwarder,
-        _static_addr: static_addr,
+        _tcp_forwarder: tcp_forwarder,
         _xvfb: xvfb,
         page,
         server_container_name,
