@@ -52,6 +52,10 @@ pub enum GhostbridgeError {
 }
 
 pub(crate) const WEB_STATUS_OK: c_int = 0;
+/// Returned by ghostbridge when the session descriptor is unknown. The Rust
+/// caller cannot produce a bad handle (it always comes from `connect`), so
+/// this constant is only here to document the wire ABI — `start_web_server`
+/// routes it through `WebServerError::Other` if it ever surfaces.
 #[allow(dead_code)]
 pub(crate) const WEB_STATUS_INVALID_HANDLE: c_int = -1;
 pub(crate) const WEB_STATUS_INVALID_ARG: c_int = -20;
