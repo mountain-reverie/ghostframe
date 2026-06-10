@@ -178,5 +178,10 @@ jobs:
           npm run build
       - working-directory: ghostbridge
         run: |
+          # Populate ghostbridge/dist/ (//go:embed source). Cargo-driven
+          # jobs hit this via build.rs → make archive, but go vet runs
+          # directly and would otherwise fail with `pattern all:dist:
+          # no matching files found`.
+          make sync-dist
           go vet ./...
           go build ./...
