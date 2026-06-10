@@ -101,10 +101,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     };
 
-    // Machine-parseable line for the E2E test harness. Use println! (stdout)
-    // rather than tracing so the format stays stable regardless of log config.
-    println!("CERT_HASH_SHA256={}", server.cert_hash());
-
     if init_mode {
         tracing::info!(
             state_dir = %state_dir_path.display(),
