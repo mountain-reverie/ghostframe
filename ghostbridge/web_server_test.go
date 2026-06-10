@@ -23,7 +23,11 @@ func TestServeIndex(t *testing.T) {
 	}
 	body, _ := io.ReadAll(resp.Body)
 	if !strings.Contains(string(body), "<html") {
-		t.Fatalf("GET /: body %q does not look like HTML", string(body[:min(80, len(body))]))
+		preview := body
+		if len(preview) > 80 {
+			preview = preview[:80]
+		}
+		t.Fatalf("GET /: body %q does not look like HTML", string(preview))
 	}
 }
 
@@ -49,5 +53,3 @@ func TestServeConfigJSON(t *testing.T) {
 		t.Fatalf("GET /config.json: body %q, want %q", string(body), want)
 	}
 }
-
-func min(a, b int) int { if a < b { return a } ; return b }
