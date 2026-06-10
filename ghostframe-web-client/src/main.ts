@@ -13,6 +13,7 @@ import { DecodeErrorBatcher } from './decode_error_batcher';
 import { AckBatcher } from './ack';
 import { initDiagnostics } from './diagnostics.js';
 import { prevalidateCdf53 } from './prevalidate_cdf53.js';
+import { bootstrap } from './bootstrap.js';
 
 const statusEl = document.getElementById('status')!;
 const logEl = document.getElementById('log')!;
@@ -27,22 +28,10 @@ function log(msg: string) {
   }
 }
 
-function hexToBuffer(hex: string): ArrayBuffer {
-  const bytes = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < hex.length; i += 2) {
-    bytes[i / 2] = parseInt(hex.substr(i, 2), 16);
-  }
-  return bytes.buffer;
-}
-
 async function main() {
   const url = new URL(window.location.href);
-  const serverHost = url.searchParams.get('host') ?? 'ghostframe-server:443';
-  const certHash = url.searchParams.get('certHash') ?? '';
 
-  const wtUrl = `https://${serverHost}/`;
-
-  log(`Connecting to ${wtUrl}...`);
+  log(`Connecting to ${window.location.origin}...`);
 
   // WebGPU init — fatal if unavailable per design D2.
   let renderer: WebGpuRenderer;
@@ -276,14 +265,7 @@ async function main() {
   });
   const stats = diag.stats;
 
-  let transport: WebTransport;
-  if (certHash) {
-    transport = new WebTransport(wtUrl, {
-      serverCertificateHashes: [{ algorithm: 'sha-256', value: hexToBuffer(certHash) }],
-    });
-  } else {
-    transport = new WebTransport(wtUrl);
-  }
+  const { transport } = await bootstrap();
 
   // Captured here so onSessionReset can clear them. setInterval keeps firing
   // even after its enclosing stream closes; without explicit clearInterval
