@@ -228,9 +228,7 @@ async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioStack> {
         // Readiness probe: emitted by io_bridge after QuicServer::new.
         // tracing-subscriber's default writer is stdout (not stderr —
         // contrary to first instinct), so the probe must match stdout.
-        .with_ready_conditions(vec![WaitFor::message_on_stdout(
-            "QUIC server ready",
-        )])
+        .with_ready_conditions(vec![WaitFor::message_on_stdout("QUIC server ready")])
         .with_startup_timeout(Duration::from_secs(120));
 
     // CRITICAL: this list must stay in sync with the env vars set by the
