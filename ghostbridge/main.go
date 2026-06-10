@@ -175,6 +175,34 @@ func gbridge_close(sd C.int32_t) C.gbridge_status {
 	return 0
 }
 
+// Status codes for the web server start path. Negative-numbered to match
+// the existing convention used by gbridge_new / gbridge_up / etc.
+const (
+	gbridgeWebStatusOK                 = 0
+	gbridgeWebStatusInvalidHandle      = -1
+	gbridgeWebStatusInvalidArg         = -20
+	gbridgeWebStatusHTTPSCertsDisabled = -21
+	gbridgeWebStatusListenFailed       = -22
+)
+
+//export gbridge_start_web_server
+func gbridge_start_web_server(sd C.int32_t, cCertHashHex *C.char) C.gbridge_status {
+	h := lookup(int32(sd))
+	if h == nil {
+		return gbridgeWebStatusInvalidHandle
+	}
+	certHash := C.GoString(cCertHashHex)
+	if len(certHash) != 64 {
+		log.Printf("ghostbridge: gbridge_start_web_server: certHash length %d, want 64", len(certHash))
+		return gbridgeWebStatusInvalidArg
+	}
+	// Listener wiring lands in Task 7; this scaffold returns OK so the
+	// Rust binding can land independently of the TLS plumbing.
+	_ = h
+	_ = newWebMux(certHash)
+	return gbridgeWebStatusOK
+}
+
 //export gbridge_getips
 func gbridge_getips(sd C.int32_t, cBuf *C.char, cBufLen C.size_t) C.gbridge_status {
 	h := lookup(int32(sd))
