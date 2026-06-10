@@ -6,6 +6,15 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
+	"time"
 )
 
 func TestServeIndex(t *testing.T) {
@@ -76,5 +85,66 @@ func TestRedirectHandler(t *testing.T) {
 	}
 	if !strings.HasSuffix(loc, "/some/path?q=1") {
 		t.Fatalf("Location %q does not preserve path+query", loc)
+	}
+}
+
+// selfSignedPEM generates a throwaway ECDSA self-signed cert/key pair for tests.
+func selfSignedPEM(t *testing.T) (certPEM, keyPEM string) {
+	t.Helper()
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("ecdsa.GenerateKey: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "test"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatalf("x509.CreateCertificate: %v", err)
+	}
+	certPEM = string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+	keyDER, err := x509.MarshalECPrivateKey(priv)
+	if err != nil {
+		t.Fatalf("MarshalECPrivateKey: %v", err)
+	}
+	keyPEM = string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}))
+	return certPEM, keyPEM
+}
+
+func TestLoadStaticCertFromEnv_NeitherSet(t *testing.T) {
+	t.Setenv("GHOSTFRAME_WEB_TLS_CERT_PEM", "")
+	t.Setenv("GHOSTFRAME_WEB_TLS_KEY_PEM", "")
+	cert, err := loadStaticCertFromEnv()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cert != nil {
+		t.Fatal("expected nil cert when env vars are unset")
+	}
+}
+
+func TestLoadStaticCertFromEnv_ExactlyOneSet(t *testing.T) {
+	certPEM, _ := selfSignedPEM(t)
+	t.Setenv("GHOSTFRAME_WEB_TLS_CERT_PEM", certPEM)
+	t.Setenv("GHOSTFRAME_WEB_TLS_KEY_PEM", "")
+	_, err := loadStaticCertFromEnv()
+	if err == nil {
+		t.Fatal("expected error when only CERT_PEM is set")
+	}
+}
+
+func TestLoadStaticCertFromEnv_BothSet(t *testing.T) {
+	certPEM, keyPEM := selfSignedPEM(t)
+	t.Setenv("GHOSTFRAME_WEB_TLS_CERT_PEM", certPEM)
+	t.Setenv("GHOSTFRAME_WEB_TLS_KEY_PEM", keyPEM)
+	cert, err := loadStaticCertFromEnv()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cert == nil {
+		t.Fatal("expected non-nil cert when both env vars are set")
 	}
 }
