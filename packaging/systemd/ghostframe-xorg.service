@@ -14,7 +14,11 @@ Type=simple
 # vt9: tty1-6 are gettys, tty7 is the host's display manager (lightdm/sddm/gdm)
 # on most desktops. Picking a high VT avoids the open() collision; DontVTSwitch
 # is already set in /etc/X11/ghostframe-headless.conf so we never take focus.
-ExecStart=/usr/bin/Xorg :1 -config /etc/X11/ghostframe-headless.conf -noreset -nolisten tcp vt9
+#
+# -config: bare filename, not absolute path. Xorg refuses absolute -config
+# paths when running with elevated privileges (Xwrapper's needs_root_rights=yes)
+# and only resolves bare names against /etc/X11/ and the standard config dirs.
+ExecStart=/usr/bin/Xorg :1 -config ghostframe-headless.conf -noreset -nolisten tcp vt9
 Restart=on-failure
 RestartSec=2
 SyslogIdentifier=ghostframe-xorg
