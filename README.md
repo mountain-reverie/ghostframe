@@ -83,6 +83,31 @@ After reboot, the configured user is automatically logged in on `tty1`,
 Xorg comes up on display `:1`, Enlightenment starts inside that session,
 and `ghostframe-xdaemon` joins the tailnet and starts capturing.
 
+## Update
+
+To pick up a new version, rebuild from source and re-run the installer
+with `--force` so the binary and Xorg config are overwritten in place.
+The tsnet state dir is preserved (step 6 of `install.sh` self-skips when
+it's already seeded), so you do not need to re-paste your auth key.
+
+```bash
+# 1. Pull and rebuild.
+cd ghostframe
+git pull
+just build-release
+
+# 2. Reinstall over the existing files.
+sudo ./packaging/install.sh <username> --force
+
+# 3. Restart the session so Xorg and the daemon pick up the new binary.
+#    A reboot also works.
+sudo -u <username> XDG_RUNTIME_DIR=/run/user/$(id -u <username>) \
+    systemctl --user restart ghostframe.target
+```
+
+Restarting `ghostframe.target` tears down Xorg, which will drop any
+active browser sessions — they auto-reconnect once the daemon is back.
+
 ## First connection
 
 On any device on the same tailnet, open
