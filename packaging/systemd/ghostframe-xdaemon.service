@@ -2,15 +2,24 @@
 Description=Ghostframe capture + transport daemon
 Requires=ghostframe-wm.service
 After=ghostframe-wm.service
+# Restart with wm (transitively with xorg via wm's PartOf=). Keeps the capture
+# pipeline pointed at a live X server across restarts.
+PartOf=ghostframe-wm.service
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
 Type=simple
 Environment=DISPLAY=:1
 Environment=TS_HOSTNAME=%H-ghostframe
 Environment=TS_STATE_DIR=%h/.local/share/ghostframe/ts-state
+# X11 readiness is gated inside the daemon (wait_for_x11 in main.rs): the
+# daemon blocks on x11rb::connect for up to 10s before bringing up tsnet,
+# and exits with a clear journal message on timeout.
 ExecStart=/usr/local/bin/ghostframe-xdaemon
 Restart=on-failure
 RestartSec=2
+SyslogIdentifier=ghostframe-xdaemon
 
 [Install]
 WantedBy=ghostframe.target

@@ -2,14 +2,28 @@
 Description=Ghostframe window manager (enlightenment)
 Requires=ghostframe-xorg.service
 After=ghostframe-xorg.service
+# Restart in lockstep with xorg. Without PartOf=, wm keeps trying to talk to a
+# dead X server while xorg flap-restarts independently — two desynced restart
+# loops fighting each other.
+PartOf=ghostframe-xorg.service
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
 Type=simple
 Environment=DISPLAY=:1
 # To use a different WM, replace this line. See DEVELOPERS.md "WM alternatives".
 ExecStart=/usr/bin/enlightenment_start
+# enlightenment_start is a watchdog launcher that forks the real `enlightenment`
+# binary and re-execs on crash. Default KillMode=control-group cannot reap the
+# forked child cleanly (cgroup-kill returns EPERM under cgroupv2 delegation),
+# leaving 'Unit process X remains running after unit stopped' on every restart.
+# mixed = SIGTERM the main PID directly, then SIGKILL the cgroup after timeout.
+KillMode=mixed
+TimeoutStopSec=5
 Restart=on-failure
 RestartSec=2
+SyslogIdentifier=ghostframe-wm
 
 [Install]
 WantedBy=ghostframe.target

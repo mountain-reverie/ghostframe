@@ -1,12 +1,23 @@
 [Unit]
 Description=Ghostframe headless Xorg server on :1
 Before=ghostframe-wm.service
+# Surface real failures fast: after 3 failed starts within 60s the service
+# stays in 'failed' state instead of restart-looping ~100 times before
+# tripping systemd's built-in burst guard. Without this a permanent failure
+# (missing Xwrapper policy, missing amdgpu virtual_display, etc.) hides
+# under ~3 minutes of flapping.
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/Xorg :1 -config /etc/X11/ghostframe-headless.conf -noreset -nolisten tcp vt7
+# vt9: tty1-6 are gettys, tty7 is the host's display manager (lightdm/sddm/gdm)
+# on most desktops. Picking a high VT avoids the open() collision; DontVTSwitch
+# is already set in /etc/X11/ghostframe-headless.conf so we never take focus.
+ExecStart=/usr/bin/Xorg :1 -config /etc/X11/ghostframe-headless.conf -noreset -nolisten tcp vt9
 Restart=on-failure
 RestartSec=2
+SyslogIdentifier=ghostframe-xorg
 
 [Install]
 WantedBy=ghostframe.target

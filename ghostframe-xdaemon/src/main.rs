@@ -4,7 +4,7 @@ mod xdamage;
 
 use std::env;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ghostframe_lib::{FrameSubmission, GhostbridgeConfig, GhostframeServer};
 
@@ -24,6 +24,41 @@ enum CaptureBackend {
 /// the daemon needs a TS_AUTHKEY (either via env or via `--init`).
 fn state_dir_seeded(state_dir: &Path) -> bool {
     state_dir.join("tailscaled.state").exists()
+}
+
+/// Block until `$DISPLAY` accepts an X11 connection, or the timeout expires.
+///
+/// systemd's `After=ghostframe-wm.service` only guarantees enlightenment_start
+/// was launched, not that Xorg finished initialising. Without this gate the
+/// daemon would happily bring up tsnet (a ~5s operation) against a missing or
+/// crashed X server, and the only symptom downstream would be "no frames" —
+/// the actual failure (Xwrapper denial, vt conflict, etc.) lives only in
+/// ghostframe-xorg.service's journal.
+fn wait_for_x11(timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    let mut attempt: u32 = 0;
+    let last_err = loop {
+        attempt += 1;
+        let err = match x11rb::connect(None) {
+            Ok(_) => {
+                if attempt > 1 {
+                    tracing::info!(attempts = attempt, "X11 display ready");
+                }
+                return Ok(());
+            }
+            Err(e) => e.to_string(),
+        };
+        if Instant::now() >= deadline {
+            break err;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    let display = env::var("DISPLAY").unwrap_or_else(|_| "(unset)".into());
+    Err(format!(
+        "X11 display {display} not ready after {:?} ({attempt} attempt(s)); \
+         last error: {last_err}",
+        timeout
+    ))
 }
 
 #[tokio::main]
@@ -83,6 +118,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         state_dir,
         control_url,
     };
+
+    // Skip in --init mode: that path only seeds the tsnet state and exits
+    // without capturing anything, and install.sh runs --init before X is up.
+    if !init_mode {
+        if let Err(msg) = wait_for_x11(Duration::from_secs(10)) {
+            tracing::error!(
+                "{msg}\nCheck the upstream service: \
+                 `systemctl --user status ghostframe-xorg.service`"
+            );
+            std::process::exit(2);
+        }
+    }
 
     tracing::info!("Connecting to Tailscale...");
     let server = match GhostframeServer::new(config, ":443").await {

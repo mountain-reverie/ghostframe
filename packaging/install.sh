@@ -9,13 +9,18 @@
 #   1. Verifies required binaries are on the host (Xorg, amdgpu, enlightenment).
 #   2. Installs /usr/local/bin/ghostframe-xdaemon from ./target/release/.
 #   3. Installs /etc/X11/ghostframe-headless.conf from packaging/.
-#   4. Installs ~user/.config/systemd/user/{ghostframe*.{service,target}}
-#   5. Installs /etc/systemd/system/getty@tty1.service.d/99-ghostframe-autologin.conf
-#   6. (Interactive only) prompts for TS_AUTHKEY and seeds the tsnet state dir.
-#   7. Enables ghostframe.target (user) and getty@tty1 (system).
+#   4. Ensures /etc/X11/Xwrapper.config lets non-console users launch X.
+#      Writes the file only when absent. If it exists, the file is left
+#      untouched and any missing keys are reported for manual merge.
+#   5. Installs ~user/.config/systemd/user/{ghostframe*.{service,target}}
+#   6. Installs /etc/systemd/system/getty@tty1.service.d/99-ghostframe-autologin.conf
+#   7. (Interactive only) prompts for TS_AUTHKEY and seeds the tsnet state dir.
+#   8. Enables ghostframe.target (user) and getty@tty1 (system).
 #
-# Re-running is idempotent except for step 6, which is skipped if the state dir
+# Re-running is idempotent except for step 7, which is skipped if the state dir
 # is already populated. Pass --force to overwrite the binary and xorg.conf.
+# --force does NOT modify a pre-existing /etc/X11/Xwrapper.config — that file
+# is shared with the host and is left alone unconditionally.
 
 set -euo pipefail
 
@@ -25,7 +30,7 @@ info() { printf 'install.sh: %s\n' "$*"; }
 for arg in "$@"; do
   case "$arg" in
     --help|-h)
-      sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
   esac
@@ -90,14 +95,63 @@ else
   install -D -m 0644 -o root -g root "$pkg_dir/xorg-headless-amdgpu.conf" "$xorg_dst"
 fi
 
-# 4. State dir.
+# 4. Xwrapper policy.
+#
+# Xorg.wrap's default policy is 'console-only': it refuses to launch X for a
+# user that is not currently logged in on a console VT. ghostframe runs Xorg
+# from a systemd --user service, so the target user is never a console user
+# and every start attempt fails with:
+#     /usr/lib/Xorg.wrap: Only console users are allowed to run the X server
+# We need:
+#   allowed_users=anybody     — permit non-console users.
+#   needs_root_rights=yes     — the amdgpu Xorg config in step 3 needs DRM
+#                               master + root, which Xorg.wrap drops by default
+#                               once allowed_users=anybody is set.
+xwrap_dst="/etc/X11/Xwrapper.config"
+xwrap_required=("allowed_users=anybody" "needs_root_rights=yes")
+xwrap_has_key() {
+  # $1 = file, $2 = "key=value"
+  local key="${2%%=*}" val="${2#*=}"
+  grep -Eq "^[[:space:]]*${key}[[:space:]]*=[[:space:]]*${val}[[:space:]]*(#.*)?$" "$1"
+}
+if [[ ! -e "$xwrap_dst" ]]; then
+  info "install: $xwrap_dst (allow non-console users to launch X)"
+  install -D -m 0644 -o root -g root /dev/stdin "$xwrap_dst" <<EOF
+# Installed by ghostframe packaging/install.sh.
+#
+# ghostframe runs Xorg from a systemd --user service. Without these settings
+# Xorg.wrap refuses to start X for any non-console user and the headless
+# session restart-loops until ghostframe.target collapses.
+${xwrap_required[0]}
+${xwrap_required[1]}
+EOF
+else
+  xwrap_missing=()
+  for line in "${xwrap_required[@]}"; do
+    xwrap_has_key "$xwrap_dst" "$line" || xwrap_missing+=("$line")
+  done
+  if [[ ${#xwrap_missing[@]} -eq 0 ]]; then
+    info "ok: $xwrap_dst already permits non-console users — skip"
+  else
+    info "warn: $xwrap_dst exists but is missing ghostframe-required setting(s)."
+    info "      install.sh will NOT modify a pre-existing Xwrapper.config."
+    info "      Without these, Xorg.wrap refuses to launch X for $target_user and"
+    info "      ghostframe-xorg.service will restart-loop until the target collapses."
+    info "      Add the following line(s) manually, then re-run this script:"
+    for line in "${xwrap_missing[@]}"; do
+      info "          $line"
+    done
+  fi
+fi
+
+# 5. State dir.
 state_dir="$user_home/.local/share/ghostframe/ts-state"
 if [[ ! -d "$state_dir" ]]; then
   info "create: $state_dir"
   install -d -m 0700 -o "$user_uid" -g "$user_gid" "$state_dir"
 fi
 
-# 5. User units.
+# 6. User units.
 user_units_dir="$user_home/.config/systemd/user"
 install -d -m 0755 -o "$user_uid" -g "$user_gid" "$user_units_dir"
 for u in ghostframe.target ghostframe-xorg.service ghostframe-wm.service ghostframe-xdaemon.service; do
@@ -105,7 +159,7 @@ for u in ghostframe.target ghostframe-xorg.service ghostframe-wm.service ghostfr
   install -m 0644 -o "$user_uid" -g "$user_gid" "$pkg_dir/systemd/$u" "$user_units_dir/$u"
 done
 
-# 6. getty autologin drop-in.
+# 7. getty autologin drop-in.
 drop_dir="/etc/systemd/system/getty@tty1.service.d"
 install -d -m 0755 "$drop_dir"
 
@@ -126,7 +180,7 @@ info "install: $drop_dst"
 sed "s|__USER__|$target_user|g" "$pkg_dir/systemd/getty-autologin.conf.tmpl" \
   | install -m 0644 -o root -g root /dev/stdin "$drop_dst"
 
-# 7. Tsnet seed.
+# 8. Tsnet seed.
 seeded=0
 if [[ -f "$state_dir/tailscaled.state" ]]; then
   info "tsnet state dir already seeded — skipping --init"
@@ -149,7 +203,7 @@ else
   info "  sudo -u $target_user TS_AUTHKEY=<your-key> TS_STATE_DIR=$state_dir $installed_bin --init"
 fi
 
-# 8. Enable.
+# 9. Enable.
 info "systemctl daemon-reload"
 systemctl daemon-reload
 
