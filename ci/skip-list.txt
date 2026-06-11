@@ -25,6 +25,7 @@ e2e_cdf53_mixed_codecs
 e2e_cdf53_server_gpu_vs_cpu_diff
 e2e_cdf53_tile_watcher
 e2e_decode_error_thin_uncached
+e2e_h264_forced_solid_red
 e2e_headroom_guard_forces_h264
 e2e_indices_raw_handshake
 e2e_loss_override_forces_h264
