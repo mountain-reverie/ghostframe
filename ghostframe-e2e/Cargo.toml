@@ -27,6 +27,7 @@ futures = "0.3"
 image-compare = "0.4"
 image = { version = "0.25", features = ["png"] }
 rcgen = "0.14"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 sha2 = "0.10"
 base64 = "0.22"
 async-trait = "0.1"
