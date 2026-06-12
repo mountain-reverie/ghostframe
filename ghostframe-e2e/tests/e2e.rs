@@ -842,7 +842,12 @@ async fn e2e_h264_ssim_golden() -> Result<()> {
     // Allow time for: page load, WebGPU init, H.264 codec startup, and
     // the first few key frames to settle.
     tokio::time::sleep(Duration::from_secs(5)).await;
-    let captured = helpers::screenshot_canvas(&setup.page).await?;
+    let png = setup.page.screenshot(
+        chromiumoxide::page::ScreenshotParams::builder()
+            .format(chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat::Png)
+            .build(),
+    ).await?;
+    let captured = helpers::decode_screenshot(&png)?;
     let golden_path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/e2e/golden/h264_solid_red_t5s.png"
@@ -3542,7 +3547,12 @@ async fn e2e_progressive_refinement() -> Result<()> {
     let mut snapshot_times: Vec<u64> = Vec::new();
     for _ in 0..4 {
         let elapsed_ms = (tokio::time::Instant::now() - static_start).as_millis() as u64;
-        snapshots.push(helpers::screenshot_canvas(&setup.page).await?);
+        let png = setup.page.screenshot(
+            chromiumoxide::page::ScreenshotParams::builder()
+                .format(chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat::Png)
+                .build(),
+        ).await?;
+        snapshots.push(helpers::decode_screenshot(&png)?);
         snapshot_times.push(elapsed_ms);
         tokio::time::sleep(Duration::from_millis(400)).await;
     }

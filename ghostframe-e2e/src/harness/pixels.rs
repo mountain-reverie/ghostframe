@@ -1,20 +1,9 @@
 use anyhow::{anyhow, Context, Result};
 
-/// Capture the page's canvas as a PNG (via chromiumoxide's `screenshot`
-/// helper, which wraps CDP `Page.captureScreenshot`) and return it as an
-/// `image::RgbaImage`. Used by the SSIM golden tests.
-pub async fn screenshot_canvas(page: &chromiumoxide::Page) -> Result<image::RgbaImage> {
-    use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
-    use chromiumoxide::page::ScreenshotParams;
-
-    let params = ScreenshotParams::builder()
-        .format(CaptureScreenshotFormat::Png)
-        .build();
-    let png_bytes = page
-        .screenshot(params)
-        .await
-        .context("page.screenshot failed")?;
-    let img = image::load_from_memory(&png_bytes)
+/// Decode a PNG byte stream (from either `BrowserSession::screenshot` impl)
+/// into an `image::RgbaImage` for SSIM comparison.
+pub fn decode_screenshot(png_bytes: &[u8]) -> Result<image::RgbaImage> {
+    let img = image::load_from_memory(png_bytes)
         .context("decode screenshot PNG")?
         .to_rgba8();
     Ok(img)
@@ -23,9 +12,8 @@ pub async fn screenshot_canvas(page: &chromiumoxide::Page) -> Result<image::Rgba
 /// Compare a captured `RgbaImage` against a checked-in golden PNG on disk.
 ///
 /// Bless mode: setting `GHOSTFRAME_BLESS_GOLDENS=1` writes the captured
-/// image to `golden_path` (creating the parent directory if needed) and
-/// returns `Ok(())`. Normal mode: loads the golden, computes hybrid SSIM
-/// via `image-compare::rgba_hybrid_compare`, and fails if score < threshold.
+/// image to `golden_path` and returns `Ok(())`. Normal mode computes hybrid
+/// SSIM via `image-compare::rgba_hybrid_compare` and fails if score < threshold.
 pub fn assert_ssim_against_golden(
     captured: &image::RgbaImage,
     golden_path: &str,
