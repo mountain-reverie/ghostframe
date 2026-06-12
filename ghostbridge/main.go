@@ -79,6 +79,13 @@ func gbridge_new(cHostname, cAuthkey, cStateDir, cControlURL *C.char, sdOut *C.i
 		Hostname: hostname,
 		AuthKey:  authkey,
 		Dir:      stateDir,
+		// Route tsnet's internal logger to log.Printf so cert-provisioning
+		// failures (ACME DNS-01 errors, LocalAPI cert-fetch timeouts, etc.)
+		// surface in the daemon's journal instead of being swallowed.
+		// Without this, an SSL handshake failure on :443 is silent from the
+		// operator's perspective and looks like a daemon bug rather than a
+		// tailnet/cert provisioning issue.
+		Logf: log.Printf,
 	}
 	if controlURL != "" {
 		s.ControlURL = controlURL
@@ -252,11 +259,17 @@ func gbridge_start_web_server(sd C.int32_t, cCertHashHex *C.char) C.gbridge_stat
 
 	if staticCert == nil {
 		// Production: HTTPS Certs must be enabled in the tailnet.
-		if domains := h.server.CertDomains(); len(domains) == 0 {
+		domains := h.server.CertDomains()
+		if len(domains) == 0 {
 			log.Printf("ghostbridge: gbridge_start_web_server: tailnet has no HTTPS-eligible domains")
 			log.Printf("ghostbridge:   enable HTTPS at https://login.tailscale.com/admin/dns")
 			return gbridgeWebStatusHTTPSCertsDisabled
 		}
+		// Log the exact FQDN(s) tsnet thinks it can serve via LE so the operator
+		// can compare with whatever URL the browser is hitting. A mismatch (e.g.
+		// browser uses a stale tailnet domain) presents as 'internal_error' from
+		// the TLS server because GetCertificate has nothing to return for that SNI.
+		log.Printf("ghostbridge: HTTPS-eligible cert domains: %v", domains)
 	}
 
 	if err := startWebListeners(context.Background(), h.server, certHash, staticCert); err != nil {
