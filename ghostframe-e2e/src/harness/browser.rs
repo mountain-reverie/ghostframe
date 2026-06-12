@@ -195,9 +195,9 @@ impl FirefoxLaunch {
 }
 
 pub struct FirefoxSession {
-    // Geckodriver + fantoccini client added in Tasks 7-8. For now only the
-    // profile dir lives in the struct so it's drop-cleaned at end of test.
     _profile_dir: tempfile::TempDir,
+    _geckodriver: tokio::process::Child,
+    client: fantoccini::Client,
 }
 
 impl FirefoxSession {
@@ -336,5 +336,82 @@ user_pref("marionette.port", 0);
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
+    }
+
+    /// Construct a `FirefoxSession`: build a profile, install the TLS cert,
+    /// pick a free port, spawn geckodriver, wait for it to be ready, then
+    /// connect fantoccini.
+    pub async fn new(cfg: FirefoxLaunch) -> Result<Self> {
+        let profile_dir = Self::build_profile()?;
+        Self::install_cert(profile_dir.path(), &cfg.cert_pem)?;
+        let port = Self::pick_free_port()?;
+        let mut child = Self::spawn_geckodriver(
+            port,
+            &cfg.firefox_bin,
+            &cfg.display,
+            &cfg.xdg_runtime_dir,
+        )?;
+        if let Err(e) = Self::wait_for_geckodriver(port, std::time::Duration::from_secs(10)).await {
+            // best-effort kill so a half-up geckodriver doesn't leak past the failure
+            let _ = child.kill().await;
+            return Err(e);
+        }
+        let caps = serde_json::json!({
+            "moz:firefoxOptions": {
+                "binary": cfg.firefox_bin.to_string_lossy(),
+                "args": ["-profile", profile_dir.path().to_string_lossy()],
+            },
+            "acceptInsecureCerts": true,
+        });
+        let cap_map: serde_json::Map<String, serde_json::Value> = caps
+            .as_object()
+            .ok_or_else(|| anyhow!("FirefoxSession::new: capabilities JSON is not an object"))?
+            .clone();
+        let client = fantoccini::ClientBuilder::native()
+            .capabilities(cap_map)
+            .connect(&format!("http://127.0.0.1:{port}"))
+            .await
+            .context("fantoccini connect to geckodriver")?;
+        Ok(Self {
+            _profile_dir: profile_dir,
+            _geckodriver: child,
+            client,
+        })
+    }
+}
+
+#[async_trait]
+impl BrowserSession for FirefoxSession {
+    async fn new_page(&mut self, url: &str) -> Result<()> {
+        self.client.goto(url).await.context("fantoccini goto")?;
+        Ok(())
+    }
+
+    async fn evaluate<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        script: &str,
+    ) -> Result<T> {
+        // WebDriver's execute_script requires an explicit `return`. The
+        // chromiumoxide impl accepts expressions and IIFEs directly. To
+        // stay compatible with the existing test scripts (most of which
+        // are IIFEs evaluating to a value), wrap the script in a shim
+        // that awaits the expression and returns it.
+        let wrapped = format!("return (async () => ({script}))();");
+        let v = self
+            .client
+            .execute(&wrapped, vec![])
+            .await
+            .context("fantoccini execute_script")?;
+        serde_json::from_value(v).context("deserialize execute_script result")
+    }
+
+    async fn screenshot(&mut self) -> Result<Vec<u8>> {
+        self.client.screenshot().await.context("fantoccini screenshot")
+    }
+
+    async fn close(self) -> Result<()> {
+        let _ = self.client.close().await;
+        // _geckodriver has kill_on_drop so Drop tidies the child process.
+        Ok(())
     }
 }
