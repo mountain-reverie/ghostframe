@@ -265,4 +265,76 @@ user_pref("marionette.port", 0);
         std::fs::remove_file(&cert_path).ok();
         Ok(())
     }
+
+    /// Bind a localhost listener on port 0, read the assigned port, drop
+    /// the listener. Race window between drop and geckodriver bind is
+    /// acceptable for e2e — kernel won't recycle in that window under
+    /// normal load.
+    pub(crate) fn pick_free_port() -> Result<u16> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .context("bind 127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        drop(listener);
+        Ok(port)
+    }
+
+    /// Spawn `geckodriver --port <port> --binary <firefox_bin>` as a tokio
+    /// child process. stdout/stderr are inherited so the geckodriver log
+    /// appears in test output under `cargo test --nocapture`. The child has
+    /// `kill_on_drop` set so unexpected panics don't leak the driver.
+    ///
+    /// Hard-fails if `geckodriver` isn't on PATH — silently skipped tests
+    /// are the failure mode this whole iteration cycle just experienced.
+    pub(crate) fn spawn_geckodriver(
+        port: u16,
+        firefox_bin: &std::path::Path,
+        display: &str,
+        xdg_runtime_dir: &str,
+    ) -> Result<tokio::process::Child> {
+        if which::which("geckodriver").is_err() {
+            return Err(anyhow!(
+                "FirefoxSession::new: geckodriver is required for the Firefox e2e path — \
+                 install from https://github.com/mozilla/geckodriver/releases and retry, \
+                 or skip the Firefox tests with --skip _firefox"
+            ));
+        }
+        let child = tokio::process::Command::new("geckodriver")
+            .arg("--port").arg(port.to_string())
+            .arg("--binary").arg(firefox_bin)
+            .env("DISPLAY", display)
+            .env("XDG_RUNTIME_DIR", xdg_runtime_dir)
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .context("spawn geckodriver")?;
+        Ok(child)
+    }
+
+    /// Poll `http://127.0.0.1:<port>/status` until geckodriver reports
+    /// `value.ready: true`, or `timeout` elapses. WebDriver's `/status`
+    /// is a GET that returns `{ value: { ready: bool, message: str } }`.
+    pub(crate) async fn wait_for_geckodriver(
+        port: u16,
+        timeout: std::time::Duration,
+    ) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let url = format!("http://127.0.0.1:{port}/status");
+        loop {
+            if let Ok(resp) = reqwest::get(&url).await {
+                if let Ok(v) = resp.json::<serde_json::Value>().await {
+                    if v.pointer("/value/ready").and_then(|x| x.as_bool()) == Some(true) {
+                        return Ok(());
+                    }
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "geckodriver did not become ready within {:?} (port {port})",
+                    timeout
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
 }
