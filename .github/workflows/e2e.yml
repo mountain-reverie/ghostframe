@@ -186,6 +186,21 @@ jobs:
           sudo ln -sf "$chrome_path" /usr/bin/chromium
           /usr/bin/chromium --version
 
+      - name: Install Firefox + geckodriver + certutil for Firefox e2e path
+        run: |
+          sudo apt-get install -y --no-install-recommends firefox-esr libnss3-tools
+          curl -fL https://github.com/mozilla/geckodriver/releases/download/v0.36.0/geckodriver-v0.36.0-linux64.tar.gz \
+            | sudo tar -xz -C /usr/local/bin geckodriver
+          # Verify
+          command -v firefox-esr  && firefox-esr --version
+          command -v geckodriver  && geckodriver --version
+          command -v certutil
+          # FirefoxLaunch::default_firefox_bin() looks for /usr/bin/firefox by
+          # default. firefox-esr puts the binary at /usr/bin/firefox-esr, so
+          # symlink it where the harness expects it.
+          sudo ln -sf "$(command -v firefox-esr)" /usr/bin/firefox
+          /usr/bin/firefox --version
+
       - name: Probe Chromium (version + binary path)
         run: |
           mkdir -p /tmp/ghostframe-probe
