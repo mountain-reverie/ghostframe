@@ -71,6 +71,23 @@ for b in "${need_bins[@]}"; do
   command -v "$b" >/dev/null 2>&1 || die "missing '$b' on PATH — install it and retry"
 done
 
+# Group membership: 'video' for KMS framebuffer + DRI, 'render' for
+# render-node ioctls. Without these, ghostframe-xdaemon's DRM capture path
+# can't open /dev/dri/* and silently falls back to X11 GetImage — which is
+# the CPU-copy slow path responsible for ~25% CPU at 30fps idle.
+for grp in video render; do
+  if ! getent group "$grp" >/dev/null 2>&1; then
+    info "warn: group '$grp' does not exist on this host — skipping (DRM capture may fall back to X11)"
+    continue
+  fi
+  if id -nG "$target_user" | tr ' ' '\n' | grep -qx "$grp"; then
+    info "ok: $target_user already in group '$grp'"
+  else
+    info "usermod: adding $target_user to group '$grp'"
+    usermod -aG "$grp" "$target_user"
+  fi
+done
+
 built_bin="$repo_root/target/release/ghostframe-xdaemon"
 installed_bin="/usr/local/bin/ghostframe-xdaemon"
 [[ -x "$built_bin" || -x "$installed_bin" ]] || \

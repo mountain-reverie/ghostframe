@@ -17,6 +17,8 @@ use std::io;
 use std::net::SocketAddr;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::BytesMut;
@@ -262,6 +264,17 @@ pub struct IoBridge {
     /// message. Each dimension change resets this to N=10. While > 0, every
     /// frame re-emits the dimensions datagram; loss tolerance is 0.05^10 ≈ 1e-13.
     dimensions_retransmits_left: u8,
+    /// Count of `wt_sessions` entries whose handshake is currently up,
+    /// shared with `GhostframeServer` so the capture loop in xdaemon can skip
+    /// capture work when no consumer exists. Refreshed inside
+    /// `compute_max_datagram_size` and in the run loop after handling events.
+    /// `Relaxed` ordering is sufficient: a stale read costs at most one extra
+    /// frame captured (or one skipped) — no correctness implications.
+    connected_session_count: Arc<AtomicUsize>,
+    /// `true` while no `wt_sessions` entry is connected. Flips on transitions
+    /// so we can emit a single info-level log on each enter/leave instead of
+    /// once per dropped frame. Initial `true` (we start with zero sessions).
+    was_idle: bool,
 }
 
 /// Per-frame inputs passed into `dispatch_dirty_tiles_via_scheduler`.
@@ -525,6 +538,8 @@ impl IoBridge {
             ),
             last_emitted_dimensions: None,
             dimensions_retransmits_left: 0,
+            connected_session_count: Arc::new(AtomicUsize::new(0)),
+            was_idle: true,
         })
     }
 
@@ -545,6 +560,14 @@ impl IoBridge {
     /// Return the SHA-256 hex fingerprint of the server's self-signed cert.
     pub fn cert_hash_sha256(&self) -> &str {
         &self.server.cert_info().sha256_hex
+    }
+
+    /// Hand out a shared handle to the connected-session counter so the capture
+    /// loop (running on a different task) can skip the GetImage/DRM scrape when
+    /// no consumer is attached. Updated by `compute_max_datagram_size` and the
+    /// run loop. See struct field doc for ordering semantics.
+    pub fn connected_session_count_handle(&self) -> Arc<AtomicUsize> {
+        self.connected_session_count.clone()
     }
 
     /// Borrow the GhostbridgeHandle for callers that need to issue out-of-band
@@ -585,12 +608,20 @@ impl IoBridge {
     }
 
     /// Compute the maximum datagram size from the smallest connected session.
+    ///
+    /// Side effect: refreshes `connected_session_count` (the atomic the capture
+    /// loop polls to decide whether to even scrape a frame) and emits a single
+    /// info-level log on each idle↔active transition. Without that gate the
+    /// per-frame "no connected sessions" line would fire 30×/sec and bury the
+    /// rest of the journal at the default debug filter.
     fn compute_max_datagram_size(&mut self) -> Option<usize> {
         let mut min_size: Option<usize> = None;
+        let mut connected = 0usize;
         for (handle, wt) in &self.wt_sessions {
             if !wt.is_connected() {
                 continue;
             }
+            connected += 1;
             if let Some(conn) = self.server.connections.get_mut(handle) {
                 if let Some(sz) = conn.datagrams().max_size() {
                     let usable = sz.saturating_sub(Self::WT_VARINT_OVERHEAD);
@@ -600,6 +631,22 @@ impl IoBridge {
                     });
                 }
             }
+        }
+        self.connected_session_count
+            .store(connected, Ordering::Relaxed);
+        let now_idle = connected == 0;
+        if now_idle != self.was_idle {
+            if now_idle {
+                tracing::info!(
+                    "all clients disconnected; capture loop will sleep until a client returns"
+                );
+            } else {
+                tracing::info!(
+                    connected,
+                    "client connected; resuming frame delivery"
+                );
+            }
+            self.was_idle = now_idle;
         }
         min_size.filter(|&sz| sz > 0)
     }
@@ -1357,7 +1404,7 @@ impl IoBridge {
         let max_dg_size = match self.compute_max_datagram_size() {
             Some(sz) => sz,
             None => {
-                tracing::debug!(seq, "process_frame_gpu: no connected sessions, dropping");
+                tracing::trace!(seq, "process_frame_gpu: no connected sessions, dropping");
                 return;
             }
         };
@@ -2429,8 +2476,37 @@ impl IoBridge {
                     self.session_resets_fired.remove(&handle);
                 }
 
+                Event::HandshakeDataReady => {
+                    // First moment TLS hands us the client's ClientHello data —
+                    // critical diagnostic for "browser fails to connect" reports:
+                    // SNI tells us what hostname the browser thinks it's talking
+                    // to (must match a cert SAN, even with serverCertificateHashes
+                    // pinning), and ALPN confirms h3 negotiation.
+                    if let Some(conn) = self.server.connections.get(&handle) {
+                        if let Some(hd) = conn.crypto_session().handshake_data() {
+                            if let Ok(hd) = hd.downcast::<
+                                quinn_proto::crypto::rustls::HandshakeData,
+                            >() {
+                                let sni =
+                                    hd.server_name.as_deref().unwrap_or("(none)");
+                                let alpn = hd
+                                    .protocol
+                                    .as_deref()
+                                    .map(|p| String::from_utf8_lossy(p).into_owned())
+                                    .unwrap_or_else(|| "(none)".into());
+                                tracing::info!(
+                                    ?handle,
+                                    sni,
+                                    alpn,
+                                    "TLS handshake data: client SNI and ALPN"
+                                );
+                            }
+                        }
+                    }
+                }
+
                 _ => {
-                    // HandshakeDataReady, DatagramsUnblocked, etc. — no action needed.
+                    // DatagramsUnblocked, etc. — no action needed.
                 }
             }
         }
@@ -2663,6 +2739,8 @@ impl IoBridge {
             ),
             last_emitted_dimensions: None,
             dimensions_retransmits_left: 0,
+            connected_session_count: Arc::new(AtomicUsize::new(0)),
+            was_idle: true,
         }
     }
 
@@ -2721,6 +2799,8 @@ impl IoBridge {
             ),
             last_emitted_dimensions: None,
             dimensions_retransmits_left: 0,
+            connected_session_count: Arc::new(AtomicUsize::new(0)),
+            was_idle: true,
         }
     }
 

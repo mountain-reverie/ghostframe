@@ -196,9 +196,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::info!("Server ready, entering capture loop");
 
     let frame_interval = Duration::from_micros(1_000_000 / capture_fps);
+    // Sleep granularity while idle. 500 ms keeps the daemon responsive (≤ that
+    // much delay before the first frame after a client connects) without
+    // burning ~25% CPU on X11 GetImage scrapes nobody consumes.
+    let idle_poll_interval = Duration::from_millis(500);
     let mut frame_count = 0u64;
+    // Tracks whether the loop is currently in idle (no-client) mode, so we
+    // emit a single info log on each idle↔active flip instead of every
+    // iteration. The IoBridge logs the corresponding event on its side; this
+    // log shows the capture loop's view (X11 GetImage suspended/resumed).
+    let mut was_idle = true;
 
     loop {
+        // Skip the capture scrape entirely when nobody is connected. Without
+        // this gate, X11 GetImage copies a full 1920x1080 framebuffer through
+        // the X server every 33 ms regardless of demand.
+        if server.connected_session_count() == 0 {
+            if !was_idle {
+                tracing::info!("no client connected; capture loop entering idle poll");
+                was_idle = true;
+            }
+            tokio::time::sleep(idle_poll_interval).await;
+            continue;
+        }
+        if was_idle {
+            tracing::info!("client connected; capture loop resuming");
+            was_idle = false;
+        }
+
         let capture_start = std::time::Instant::now();
 
         // XDamage drain: Some(non-empty) = only check these tiles, None = check all.
