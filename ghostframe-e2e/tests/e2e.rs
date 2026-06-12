@@ -328,6 +328,14 @@ async fn setup_e2e_webgpu_gpu_with_env_firefox(
     setup_e2e_firefox_inner(test_pattern_args, extra_env, true, true).await
 }
 
+/// Firefox sibling of `setup_e2e_webgpu_with_env` (no GPU, webgpu=true, extra env vars).
+async fn setup_e2e_webgpu_with_env_firefox(
+    test_pattern_args: &str,
+    extra_env: &[(&str, &str)],
+) -> Result<E2eFirefoxSetup> {
+    setup_e2e_firefox_inner(test_pattern_args, extra_env, false, true).await
+}
+
 async fn setup_e2e_firefox_inner(
     test_pattern_args: &str,
     extra_env: &[(&str, &str)],
@@ -1305,17 +1313,9 @@ async fn e2e_codec_transition() -> Result<()> {
 // clips `writeRawTile`'s extent to fb bounds. Full Phase-1
 // diagnostic trail kept in-tree for future debugging — see
 // `docs/superpowers/specs/2026-05-17-edge-tiles-diagnose-fix-design.md`.
-#[tokio::test]
-async fn e2e_edge_tiles() -> Result<()> {
-    // Use the non-GPU path so xorg-odd.conf's dummy driver at 700×500 is
-    // the actual capture source. With gpu=true the container's bind-mounted
-    // VKMS DRM device dominates (1024×768) and Xorg's dummy framebuffer is
-    // ignored by drm_capture — defeats the purpose of the odd-resolution
-    // test.
-    let setup =
-        setup_e2e_webgpu_with_env("--solid-red", &[("XORG_CONF", "/etc/X11/xorg-odd.conf")])
-            .await?;
-
+//
+// Shared body for `e2e_edge_tiles_chromium` and `e2e_edge_tiles_firefox`.
+async fn e2e_edge_tiles_body<B: helpers::BrowserSession>(browser: &mut B) -> Result<()> {
     // Wait for frames
     tokio::time::sleep(Duration::from_secs(6)).await;
 
@@ -1333,22 +1333,18 @@ async fn e2e_edge_tiles() -> Result<()> {
             return out;
         })()
     "#;
-    let diag: serde_json::Value = setup.page().evaluate(diag_js).await?.into_value()?;
+    let diag: serde_json::Value = browser.evaluate(diag_js).await?;
     eprintln!(
         "e2e_edge_tiles diagnostic: {}",
         serde_json::to_string_pretty(&diag).unwrap()
     );
 
-    let tiles: serde_json::Value = setup
-        .page()
+    let tiles: serde_json::Value = browser
         .evaluate("window.__ghostframeRecordedTiles || []")
-        .await?
-        .into_value()?;
-    let resizes: serde_json::Value = setup
-        .page()
+        .await?;
+    let resizes: serde_json::Value = browser
         .evaluate("window.__ghostframeRecordedResizes || []")
-        .await?
-        .into_value()?;
+        .await?;
     eprintln!(
         "e2e_edge_tiles tiles: {}",
         serde_json::to_string_pretty(&tiles).unwrap()
@@ -1385,7 +1381,7 @@ async fn e2e_edge_tiles() -> Result<()> {
         })()
     "#;
 
-    let result: serde_json::Value = setup.page().evaluate(edge_js).await?.into_value()?;
+    let result: serde_json::Value = browser.evaluate(edge_js).await?;
 
     // Check center renders red (baseline)
     let center = &result["center"];
@@ -1423,6 +1419,31 @@ async fn e2e_edge_tiles() -> Result<()> {
     );
 
     Ok(())
+}
+
+#[tokio::test]
+async fn e2e_edge_tiles_chromium() -> Result<()> {
+    // Use the non-GPU path so xorg-odd.conf's dummy driver at 700×500 is
+    // the actual capture source. With gpu=true the container's bind-mounted
+    // VKMS DRM device dominates (1024×768) and Xorg's dummy framebuffer is
+    // ignored by drm_capture — defeats the purpose of the odd-resolution
+    // test.
+    let mut setup =
+        setup_e2e_webgpu_with_env("--solid-red", &[("XORG_CONF", "/etc/X11/xorg-odd.conf")])
+            .await?;
+    e2e_edge_tiles_body(&mut setup.browser).await?;
+    setup.browser.close().await
+}
+
+#[tokio::test]
+async fn e2e_edge_tiles_firefox() -> Result<()> {
+    let mut setup = setup_e2e_webgpu_with_env_firefox(
+        "--solid-red",
+        &[("XORG_CONF", "/etc/X11/xorg-odd.conf")],
+    )
+    .await?;
+    e2e_edge_tiles_body(&mut setup.browser).await?;
+    setup.browser.close().await
 }
 
 /// M2: Verify multiple tiles across the grid render correctly.
