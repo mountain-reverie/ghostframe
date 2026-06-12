@@ -137,6 +137,17 @@ impl ChromiumSession {
 
 #[async_trait]
 impl BrowserSession for ChromiumSession {
+    /// Open a fresh CDP tab and replace `self.page`. NOTE: this is a
+    /// subtle semantic asymmetry with `FirefoxSession::new_page` (which
+    /// navigates the *current* tab via WebDriver `goto`). Both reach the
+    /// requested URL, but CDP `new_page` allocates a new tab while
+    /// WebDriver `goto` reuses the existing one. Currently affects only
+    /// `e2e_palrle_session_reset`, whose body uses `new_page(page_url)`
+    /// in place of CDP-specific `Page.reload()` — both reach the same
+    /// `on_session_reset` server path, so the assertion holds on both.
+    /// If a future test depends on `Page.reload()`'s specific
+    /// cache-invalidation semantics, add a `reload()` method to the
+    /// trait rather than relying on this asymmetric `new_page`.
     async fn new_page(&mut self, url: &str) -> Result<()> {
         let page = self.browser.new_page(url).await.context("new_page")?;
         self.page = Some(page);
