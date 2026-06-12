@@ -90,6 +90,25 @@ func loadStaticCertFromEnv() (*tls.Certificate, error) {
 	return &cert, nil
 }
 
+// loggingListener wraps a net.Listener so that every Accept (TCP-level —
+// before any TLS handshake) is visible in the journal. Without this, a
+// browser that reaches the :443 socket but fails inside Go's TLS handshake
+// (e.g. cert provisioning returns an error and Go sends 'internal_error')
+// is indistinguishable from a browser that never connected at all.
+type loggingListener struct {
+	net.Listener
+	label string
+}
+
+func (l *loggingListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("ghostbridge: %s accept from %s", l.label, c.RemoteAddr())
+	return c, nil
+}
+
 // startWebListeners brings up the :80 (redirect) and :443 (TLS) listeners
 // on the given tsnet.Server. In production mode (staticCert == nil) it
 // uses tsnet's LE-backed ListenTLS; in e2e mode it uses a plain Listen
@@ -133,8 +152,15 @@ func startWebListeners(
 	// every timeout at zero, exposing the daemon to Slowloris-style stalls
 	// from a misbehaving tailnet peer. The values are conservative for a
 	// small static-asset + JSON server.
+	//
+	// ErrorLog: route http.Server's diagnostic output (including the
+	// "TLS handshake error from X: Y" line that's the most direct signal
+	// of a cert-provisioning failure) into our journal with a prefix so
+	// it's easy to spot when triaging connection failures.
+	tlsErrLog := log.New(log.Writer(), "ghostbridge: :443 http: ", log.LstdFlags)
 	tlsServer := &http.Server{
 		Handler:           newWebMux(certHashHex),
+		ErrorLog:          tlsErrLog,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -146,6 +172,13 @@ func startWebListeners(
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       10 * time.Second,
+	}
+	// Wrap the production TLS listener so TCP accepts are visible. (Skip the
+	// wrap on staticCert mode — the e2e harness already has its own logging
+	// and the extra Accept log would just add noise.)
+	if staticCert == nil {
+		tlsLn = &loggingListener{Listener: tlsLn, label: ":443"}
+		redirLn = &loggingListener{Listener: redirLn, label: ":80"}
 	}
 	go func() {
 		err := tlsServer.Serve(tlsLn)
