@@ -2517,6 +2517,9 @@ async fn e2e_cdf53_mixed_codecs() -> Result<()> {
     Ok(())
 }
 
+/// Shared body for `e2e_cdf53_lossless_buildup_chromium` and
+/// `e2e_cdf53_lossless_buildup_firefox`.
+///
 /// M3.3b anchor: with the env flag on and the client now decoding Cdf53,
 /// a `--gradient` pattern reaches lossless reconstruction after the full
 /// 14-pass build-up. We sample 16 pixels from the gradient region and
@@ -2526,13 +2529,9 @@ async fn e2e_cdf53_mixed_codecs() -> Result<()> {
 /// the deterministic diagonal RGB ramp `B = (x*3)&0xFF, G = (y*3)&0xFF,
 /// R = ((x+y)*2)&0xFF`. After 8s the H264 burst has handed off to
 /// TileCodec and every tile has received all 14 Cdf53 passes.
-#[tokio::test(flavor = "multi_thread")]
-async fn e2e_cdf53_lossless_buildup() -> Result<()> {
-    let setup = setup_e2e_webgpu_gpu_with_env(
-        "--gradient --drm-direct",
-        &[("GHOSTFRAME_ENABLE_CDF53", "1")],
-    )
-    .await?;
+async fn e2e_cdf53_lossless_buildup_body<B: helpers::BrowserSession>(
+    browser: &mut B,
+) -> Result<()> {
     tokio::time::sleep(Duration::from_secs(15)).await;
 
     // 16 sample points spread across the framebuffer. The gradient formula
@@ -2553,7 +2552,7 @@ async fn e2e_cdf53_lossless_buildup() -> Result<()> {
         return samples;
     })()
     "#;
-    let samples: Vec<serde_json::Value> = setup.page().evaluate(probe_js).await?.into_value()?;
+    let samples: Vec<serde_json::Value> = browser.evaluate(probe_js).await?;
 
     let mut mismatches = Vec::new();
     for s in &samples {
@@ -2594,6 +2593,28 @@ async fn e2e_cdf53_lossless_buildup() -> Result<()> {
          lossless terminal state under ideal (no-motion) conditions"
     );
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_cdf53_lossless_buildup_chromium() -> Result<()> {
+    let mut setup = setup_e2e_webgpu_gpu_with_env(
+        "--gradient --drm-direct",
+        &[("GHOSTFRAME_ENABLE_CDF53", "1")],
+    )
+    .await?;
+    e2e_cdf53_lossless_buildup_body(&mut setup.browser).await?;
+    setup.browser.close().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_cdf53_lossless_buildup_firefox() -> Result<()> {
+    let mut setup = setup_e2e_webgpu_gpu_with_env_firefox(
+        "--gradient --drm-direct",
+        &[("GHOSTFRAME_ENABLE_CDF53", "1")],
+    )
+    .await?;
+    e2e_cdf53_lossless_buildup_body(&mut setup.browser).await?;
+    setup.browser.close().await
 }
 
 /// Diagnostic for the wavelet inverse: drive the GPU inverse directly with
