@@ -315,6 +315,11 @@ async fn setup_e2e_webgpu_firefox(test_pattern_args: &str) -> Result<E2eFirefoxS
     setup_e2e_firefox_inner(test_pattern_args, &[], false, true).await
 }
 
+/// Firefox sibling of `setup_e2e_webgpu_gpu` (GPU passthrough, no extra env).
+async fn setup_e2e_webgpu_gpu_firefox(test_pattern_args: &str) -> Result<E2eFirefoxSetup> {
+    setup_e2e_firefox_inner(test_pattern_args, &[], true, true).await
+}
+
 /// Firefox sibling of `setup_e2e_webgpu_gpu_with_env` (GPU + env vars).
 async fn setup_e2e_webgpu_gpu_with_env_firefox(
     test_pattern_args: &str,
@@ -1074,6 +1079,9 @@ async fn e2e_palrle_oob_index() -> Result<()> {
     Ok(())
 }
 
+/// Shared body for `e2e_palrle_session_reset_chromium` and
+/// `e2e_palrle_session_reset_firefox`.
+///
 /// Force a client reconnect mid-stream; verify the H264 → TileCodec
 /// mode-flip handoff repaints the canvas with lossless content
 /// post-reset.
@@ -1091,11 +1099,16 @@ async fn e2e_palrle_oob_index() -> Result<()> {
 /// at ~1s, lossless repaint over the next ~250ms).
 ///
 /// Spec: docs/superpowers/specs/2026-05-25-h264-tilecodec-handoff-design.md
-#[tokio::test(flavor = "multi_thread")]
-async fn e2e_palrle_session_reset() -> Result<()> {
+///
+/// `page_url` is passed so that the session-reset is triggered by
+/// navigating to the same URL again (equivalent to a page reload for
+/// the purposes of the on_session_reset path — no CDP-specific reload
+/// semantics needed here).
+async fn e2e_palrle_session_reset_body<B: helpers::BrowserSession>(
+    browser: &mut B,
+    page_url: &str,
+) -> Result<()> {
     use ghostframe_test_pattern::text_grid::SAMPLES;
-
-    let setup = setup_e2e_webgpu_gpu("--text-grid --drm-direct").await?;
 
     // Phase 1: let the initial connection settle and render text.
     tokio::time::sleep(Duration::from_secs(4)).await;
@@ -1118,7 +1131,7 @@ async fn e2e_palrle_session_reset() -> Result<()> {
         bx = pair.bg.0,
         by = pair.bg.1,
     );
-    let baseline: serde_json::Value = setup.page().evaluate(probe_js.as_str()).await?.into_value()?;
+    let baseline: serde_json::Value = browser.evaluate(probe_js.as_str()).await?;
     let baseline_ink_lum = luminance(&baseline["ink"]);
     let baseline_bg_lum = luminance(&baseline["bg"]);
     assert!(
@@ -1126,17 +1139,17 @@ async fn e2e_palrle_session_reset() -> Result<()> {
         "baseline text not legible — pre-reset assertion failed"
     );
 
-    // Phase 2: force a reconnect by reloading the page.
+    // Phase 2: force a reconnect by navigating to the same URL.
     // The server's on_session_reset will clear delivered/ref_count/in_flight
     // but preserve slot bytes (warm cache). Subsequent emissions will
     // re-bundle palettes (delivered=false) until ACKed.
-    setup.page().reload().await?;
+    browser.new_page(page_url).await?;
 
     // Allow the new session to settle + re-render.
     tokio::time::sleep(Duration::from_secs(4)).await;
 
     // Phase 3: assert post-reset legibility.
-    let post: serde_json::Value = setup.page().evaluate(probe_js.as_str()).await?.into_value()?;
+    let post: serde_json::Value = browser.evaluate(probe_js.as_str()).await?;
     let post_ink_lum = luminance(&post["ink"]);
     let post_bg_lum = luminance(&post["bg"]);
     assert!(
@@ -1145,11 +1158,9 @@ async fn e2e_palrle_session_reset() -> Result<()> {
     );
 
     // Protocol-layer: post-reset codec stream should include PalRle.
-    let codec_list: Vec<u8> = setup
-        .page()
+    let codec_list: Vec<u8> = browser
         .evaluate("window.__ghostframeRecordedCodecs || []")
-        .await?
-        .into_value()?;
+        .await?;
     assert!(
         codec_list.contains(&2u8),
         "e2e_palrle_session_reset: expected Codec::PalRle (2) post-reset; saw codecs: {:?}",
@@ -1157,6 +1168,22 @@ async fn e2e_palrle_session_reset() -> Result<()> {
     );
 
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_palrle_session_reset_chromium() -> Result<()> {
+    let mut setup = setup_e2e_webgpu_gpu("--text-grid --drm-direct").await?;
+    let page_url = setup.server.page_url.clone();
+    e2e_palrle_session_reset_body(&mut setup.browser, &page_url).await?;
+    setup.browser.close().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_palrle_session_reset_firefox() -> Result<()> {
+    let mut setup = setup_e2e_webgpu_gpu_firefox("--text-grid --drm-direct").await?;
+    let page_url = setup.server.page_url.clone();
+    e2e_palrle_session_reset_body(&mut setup.browser, &page_url).await?;
+    setup.browser.close().await
 }
 
 /// M2: Static content produces stable canvas (skip codec / no-change detection).
