@@ -1588,10 +1588,9 @@ async fn e2e_text_clarity() -> Result<()> {
 /// Exercise palette-table reuse-and-overwrite under sequential churn.
 /// 300 distinct 4-color palettes are drawn one at a time; the server's
 /// 256-slot table must reuse via overwrite-eligible (delivered=true) slots.
-#[tokio::test]
-async fn e2e_palette_eviction() -> Result<()> {
-    let setup = setup_e2e_webgpu_gpu("--palette-churn 300").await?;
-
+//
+// Shared body for `e2e_palette_eviction_chromium` and `e2e_palette_eviction_firefox`.
+async fn e2e_palette_eviction_body<B: helpers::BrowserSession>(browser: &mut B) -> Result<()> {
     // ~8s for the pattern to play out at ~5 frames per region × 300.
     tokio::time::sleep(Duration::from_secs(8)).await;
 
@@ -1602,7 +1601,7 @@ async fn e2e_palette_eviction() -> Result<()> {
             return { r: sample[0], g: sample[1], b: sample[2] };
         })()
     "#;
-    let sample: serde_json::Value = setup.page().evaluate(probe_js).await?.into_value()?;
+    let sample: serde_json::Value = browser.evaluate(probe_js).await?;
     let r = sample["r"].as_f64().unwrap_or(0.0);
     let g = sample["g"].as_f64().unwrap_or(0.0);
     let b = sample["b"].as_f64().unwrap_or(0.0);
@@ -1612,11 +1611,9 @@ async fn e2e_palette_eviction() -> Result<()> {
     );
 
     // Protocol-layer: PalRle codec should appear on the wire repeatedly.
-    let codec_list: Vec<u8> = setup
-        .page()
+    let codec_list: Vec<u8> = browser
         .evaluate("window.__ghostframeRecordedCodecs || []")
-        .await?
-        .into_value()?;
+        .await?;
     let palrle_count = codec_list.iter().filter(|&&c| c == 2).count();
     assert!(
         palrle_count >= 10,
@@ -1626,6 +1623,20 @@ async fn e2e_palette_eviction() -> Result<()> {
     );
 
     Ok(())
+}
+
+#[tokio::test]
+async fn e2e_palette_eviction_chromium() -> Result<()> {
+    let mut setup = setup_e2e_webgpu_gpu("--palette-churn 300").await?;
+    e2e_palette_eviction_body(&mut setup.browser).await?;
+    setup.browser.close().await
+}
+
+#[tokio::test]
+async fn e2e_palette_eviction_firefox() -> Result<()> {
+    let mut setup = setup_e2e_webgpu_gpu_firefox("--palette-churn 300").await?;
+    e2e_palette_eviction_body(&mut setup.browser).await?;
+    setup.browser.close().await
 }
 
 fn luminance(c: &serde_json::Value) -> f64 {
