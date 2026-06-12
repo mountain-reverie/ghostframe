@@ -1,4 +1,5 @@
 import presentBlitWgsl from './shaders/present_blit.wgsl?raw';
+import { createLabeledShaderModule } from './shader_module';
 
 export class Framebuffer {
   texture!: GPUTexture;
@@ -20,14 +21,18 @@ export class Framebuffer {
       addressModeU: 'clamp-to-edge',
       addressModeV: 'clamp-to-edge',
     });
+    // Same WGSL source for both stages — share the module so we only get
+    // one compilation-info log per pipeline (and so the diagnostic name is
+    // unambiguous).
+    const blitModule = createLabeledShaderModule(device, 'present_blit', presentBlitWgsl);
     this.blitPipeline = device.createRenderPipeline({
       layout: 'auto',
       vertex: {
-        module: device.createShaderModule({ code: presentBlitWgsl }),
+        module: blitModule,
         entryPoint: 'vs_main',
       },
       fragment: {
-        module: device.createShaderModule({ code: presentBlitWgsl }),
+        module: blitModule,
         entryPoint: 'fs_main',
         targets: [{ format: this.presentFormat }],
       },

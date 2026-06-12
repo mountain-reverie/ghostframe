@@ -4,6 +4,7 @@ import inverseL3Wgsl from './shaders/cdf53_inverse_l3.wgsl?raw';
 import inverseL2Wgsl from './shaders/cdf53_inverse_l2.wgsl?raw';
 import inverseL1Wgsl from './shaders/cdf53_inverse_l1.wgsl?raw';
 import inverseL1Pass2Wgsl from './shaders/cdf53_inverse_l1_pass2.wgsl?raw';
+import { createLabeledShaderModule } from './shader_module';
 
 /**
  * Per-tile persistent state for client-side Cdf53 decode.
@@ -125,25 +126,37 @@ export class Cdf53Pipeline {
     this.integratePipeline = device.createComputePipeline({
       layout: 'auto',
       compute: {
-        module: device.createShaderModule({ code: integrateWgsl }),
+        module: createLabeledShaderModule(device, 'cdf53_integrate', integrateWgsl),
         entryPoint: 'main',
       },
     });
     this.inverseL3Pipeline = device.createComputePipeline({
       layout: 'auto',
-      compute: { module: device.createShaderModule({ code: inverseL3Wgsl }), entryPoint: 'main' },
+      compute: {
+        module: createLabeledShaderModule(device, 'cdf53_inverse_l3', inverseL3Wgsl),
+        entryPoint: 'main',
+      },
     });
     this.inverseL2Pipeline = device.createComputePipeline({
       layout: 'auto',
-      compute: { module: device.createShaderModule({ code: inverseL2Wgsl }), entryPoint: 'main' },
+      compute: {
+        module: createLabeledShaderModule(device, 'cdf53_inverse_l2', inverseL2Wgsl),
+        entryPoint: 'main',
+      },
     });
     this.inverseL1Pipeline = device.createComputePipeline({
       layout: 'auto',
-      compute: { module: device.createShaderModule({ code: inverseL1Wgsl }), entryPoint: 'main' },
+      compute: {
+        module: createLabeledShaderModule(device, 'cdf53_inverse_l1', inverseL1Wgsl),
+        entryPoint: 'main',
+      },
     });
     this.inverseL1Pass2Pipeline = device.createComputePipeline({
       layout: 'auto',
-      compute: { module: device.createShaderModule({ code: inverseL1Pass2Wgsl }), entryPoint: 'main' },
+      compute: {
+        module: createLabeledShaderModule(device, 'cdf53_inverse_l1_pass2', inverseL1Pass2Wgsl),
+        entryPoint: 'main',
+      },
     });
   }
 

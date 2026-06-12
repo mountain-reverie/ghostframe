@@ -1,5 +1,6 @@
 import palrleWgsl from './shaders/palrle_decode.wgsl?raw';
 import type { PalRleEntry } from '../prevalidate.js';
+import { createLabeledShaderModule } from './shader_module';
 
 export class PalRlePipeline {
   private pipeline: GPUComputePipeline;
@@ -18,7 +19,7 @@ export class PalRlePipeline {
       size: 16 * 1024, // 256 × 16 × u32
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
-    const module = device.createShaderModule({ code: palrleWgsl });
+    const module = createLabeledShaderModule(device, 'palrle_decode', palrleWgsl);
     this.pipeline = device.createComputePipeline({
       layout: 'auto',
       compute: { module, entryPoint: 'main' },

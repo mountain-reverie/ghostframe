@@ -16,6 +16,7 @@
  */
 
 import debugGradientWgsl from './webgpu/shaders/debug_gradient.wgsl?raw';
+import { createLabeledShaderModule } from './webgpu/shader_module';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -217,7 +218,7 @@ export function initDiagnostics({
         return { ok: false, mismatches: [{ x: -1, y: -1, got: [], want: [] }] };
       }
       // Build the debug compute pipeline (fresh per call — cheap, debug-only).
-      const module = device.createShaderModule({ code: debugGradientWgsl });
+      const module = createLabeledShaderModule(device, 'debug_gradient', debugGradientWgsl);
       const pipeline = device.createComputePipeline({
         layout: 'auto',
         compute: { module, entryPoint: 'debug_gradient' },

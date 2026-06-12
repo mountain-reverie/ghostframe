@@ -1,4 +1,5 @@
 import solidWgsl from './shaders/solid.wgsl?raw';
+import { createLabeledShaderModule } from './shader_module';
 
 export interface SolidTile {
   tileX: number;
@@ -19,7 +20,7 @@ export class SolidPipeline {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
-    const module = device.createShaderModule({ code: solidWgsl });
+    const module = createLabeledShaderModule(device, 'solid', solidWgsl);
     this.pipeline = device.createRenderPipeline({
       layout: 'auto',
       vertex: {

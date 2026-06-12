@@ -1,4 +1,5 @@
 import h264Wgsl from './shaders/h264_blit.wgsl?raw';
+import { createLabeledShaderModule } from './shader_module';
 
 export class H264Pipeline {
   private pipeline: GPURenderPipeline;
@@ -11,7 +12,7 @@ export class H264Pipeline {
       addressModeU: 'clamp-to-edge',
       addressModeV: 'clamp-to-edge',
     });
-    const module = device.createShaderModule({ code: h264Wgsl });
+    const module = createLabeledShaderModule(device, 'h264_blit', h264Wgsl);
     this.pipeline = device.createRenderPipeline({
       layout: 'auto',
       vertex: { module, entryPoint: 'vs_main' },
