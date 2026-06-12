@@ -28,6 +28,9 @@ image = { version = "0.25", features = ["png"] }
 rcgen = "0.14"
 sha2 = "0.10"
 base64 = "0.22"
+async-trait = "0.1"
+fantoccini = "0.21"
+tempfile = "3"
 time = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
