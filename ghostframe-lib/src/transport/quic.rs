@@ -143,7 +143,11 @@ impl QuicServer {
             Some(DatagramEvent::NewConnection(incoming)) => {
                 match self.endpoint.accept(incoming, now, buf, None) {
                     Ok((handle, conn)) => {
-                        tracing::debug!(?handle, %remote, "new QUIC connection accepted");
+                        // INFO (not debug) so connection attempts are visible at
+                        // the default tracing filter — without this, a failed
+                        // browser handshake (cert SAN mismatch, ALPN denial,
+                        // etc.) is silent from the operator's perspective.
+                        tracing::info!(?handle, %remote, "new QUIC connection accepted");
                         self.connections.insert(handle, conn);
                         None
                     }

@@ -4,6 +4,8 @@
 //! `submit_frame` channel for pushing captured frames into the pipeline.
 
 use std::os::unix::io::OwnedFd;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::transport::ghostbridge::GhostbridgeConfig;
@@ -47,6 +49,10 @@ pub struct FrameSubmission {
 pub struct GhostframeServer {
     frame_tx: mpsc::Sender<FrameSubmission>,
     cert_hash: String,
+    /// Shared with the `IoBridge` event loop; non-zero means at least one
+    /// WebTransport session is currently connected. Polled by the capture loop
+    /// to avoid scraping frames nobody will consume.
+    connected_session_count: Arc<AtomicUsize>,
     _io_task: tokio::task::JoinHandle<()>,
 }
 
@@ -66,6 +72,7 @@ impl GhostframeServer {
 
         let mut bridge = IoBridge::new_with_frames(&config, listen_addr, frame_rx).await?;
         let cert_hash = bridge.cert_hash_sha256().to_owned();
+        let connected_session_count = bridge.connected_session_count_handle();
 
         // Start the tsnet :443 (HTTPS) + :80 (redirect) listeners. Failures
         // are fatal: a misconfigured tailnet or a port bind error means the
@@ -92,8 +99,19 @@ impl GhostframeServer {
         Ok(Self {
             frame_tx,
             cert_hash,
+            connected_session_count,
             _io_task: io_task,
         })
+    }
+
+    /// Number of WebTransport sessions currently connected to the server.
+    ///
+    /// `0` means the capture loop can safely skip capture work — nobody will
+    /// consume the frame. Refreshed by the `IoBridge` event loop on every
+    /// frame and on connect/disconnect events. `Relaxed` ordering: a stale
+    /// read costs at most one extra frame captured.
+    pub fn connected_session_count(&self) -> usize {
+        self.connected_session_count.load(Ordering::Relaxed)
     }
 
     /// Submit a frame to the pipeline.
