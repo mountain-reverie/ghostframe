@@ -7,6 +7,7 @@
 //! See `docs/superpowers/specs/2026-06-01-m3.5-bench-publication-design.md`
 //! for the API contract.
 
+pub mod browser;
 pub mod chromium;
 pub mod cleanup;
 pub mod containers;
@@ -18,6 +19,7 @@ pub mod weston;
 
 // Flat re-exports so callers can `use ghostframe_e2e::harness::*;` and
 // get the legacy `tests/e2e/helpers.rs` flat API.
+pub use browser::BrowserSession;
 pub use chromium::{assert_ssim_against_golden, screenshot_canvas};
 pub use cleanup::{cleanup_stale_xvfb_sockets, read_server_logs_stripped};
 pub use containers::{create_preauth_key, docker_run_in_container, TestNode, NETWORK_NAME};
