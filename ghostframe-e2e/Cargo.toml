@@ -32,6 +32,7 @@ base64 = "0.22"
 async-trait = "0.1"
 fantoccini = "0.21"
 tempfile = "3"
+which = "6"
 time = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
