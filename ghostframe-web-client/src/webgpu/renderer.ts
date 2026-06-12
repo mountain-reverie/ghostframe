@@ -23,7 +23,20 @@ export interface RawQueued {
 export class WebGpuRenderer {
   framebuffer: Framebuffer;
   solidPipeline: SolidPipeline;
-  h264Pipeline: H264Pipeline;
+  /**
+   * `null` while we haven't probed yet, or permanently if the browser
+   * doesn't expose `texture_external` (Firefox WebGPU as of 2026 lacks
+   * the TEXTURE_EXTERNAL capability needed by h264_blit.wgsl). Any
+   * H.264 VideoFrames received while this is null are dropped on the
+   * draw path with a one-shot warning.
+   */
+  h264Pipeline: H264Pipeline | null = null;
+  /** Set once the probe completes (success or failure). */
+  private h264Probed = false;
+  /** Set true if the probe definitively determined H.264 is unsupported. */
+  private h264Unsupported = false;
+  /** Whether we've already warned about dropped H.264 frames. */
+  private h264DropWarned = false;
   palrlePipeline: PalRlePipeline;
   cdf53Pipeline: Cdf53Pipeline;
 
@@ -44,19 +57,60 @@ export class WebGpuRenderer {
   ) {
     this.framebuffer = new Framebuffer(gpu.device, gpu.presentFormat);
     this.solidPipeline = new SolidPipeline(gpu.device);
-    this.h264Pipeline = new H264Pipeline(gpu.device);
     this.palrlePipeline = new PalRlePipeline(gpu.device);
     this.cdf53Pipeline = new Cdf53Pipeline(gpu.device);
   }
 
   static async create(canvas: HTMLCanvasElement): Promise<WebGpuRenderer> {
     const gpu = await initWebGpu(canvas);
-    return new WebGpuRenderer(gpu, canvas);
+    const renderer = new WebGpuRenderer(gpu, canvas);
+    await renderer.probeH264();
+    return renderer;
+  }
+
+  /**
+   * Build the H264Pipeline inside a `validation` error scope so a shader
+   * compilation failure (e.g. Firefox missing TEXTURE_EXTERNAL capability)
+   * is caught and reported without poisoning the rest of the device's
+   * error scope. If the probe fails, h264Pipeline stays null and the
+   * draw path silently skips H.264 frames — the rest of the codec suite
+   * (solid / palrle / cdf53 / raw / present_blit) is unaffected.
+   */
+  private async probeH264(): Promise<void> {
+    this.gpu.device.pushErrorScope('validation');
+    let pipeline: H264Pipeline | null = null;
+    try {
+      pipeline = new H264Pipeline(this.gpu.device);
+    } catch (e) {
+      console.warn('[renderer] H264Pipeline construction threw:', e);
+    }
+    const err = await this.gpu.device.popErrorScope();
+    if (err === null && pipeline !== null) {
+      this.h264Pipeline = pipeline;
+      console.info('[renderer] H264 pipeline available');
+    } else {
+      this.h264Unsupported = true;
+      const reason = err ? err.message : 'pipeline constructor returned no value';
+      console.warn(
+        `[renderer] H264 pipeline unsupported on this browser; H.264 frames will be dropped. Reason: ${reason}`,
+      );
+    }
+    this.h264Probed = true;
   }
 
   get device(): GPUDevice { return this.gpu.device; }
   get context(): GPUCanvasContext { return this.gpu.context; }
   get presentFormat(): GPUTextureFormat { return this.gpu.presentFormat; }
+  /**
+   * Whether the H.264 render pipeline compiled successfully at probe
+   * time. Future work: surface this via the HELLO capability bits so the
+   * server can elect not to send H.264 frames to clients that can't
+   * decode them. For now the daemon may still send H.264 and the client
+   * drops them on the floor with a one-shot warning.
+   */
+  get h264Supported(): boolean {
+    return this.h264Pipeline !== null;
+  }
 
   resize(width: number, height: number): void {
     // Zero dimensions are a no-op: we can't create valid GPU textures with 0×0
@@ -217,7 +271,17 @@ export class WebGpuRenderer {
     this.cdf53Queue.length = 0;
 
     // ---- Step 8: Solid + H264 render pass on framebuffer ----
-    if (solidCount > 0 || this.h264Queue.length > 0) {
+    // Drop queued H.264 frames if the browser doesn't support the
+    // h264_blit shader (probed at startup). Warn once so the operator
+    // sees why the stream looks frozen on Firefox.
+    const drawH264 = this.h264Pipeline !== null;
+    if (!drawH264 && this.h264Queue.length > 0 && !this.h264DropWarned) {
+      console.warn(
+        `[renderer] dropping ${this.h264Queue.length} H.264 frame(s) — pipeline unsupported on this browser`,
+      );
+      this.h264DropWarned = true;
+    }
+    if (solidCount > 0 || (drawH264 && this.h264Queue.length > 0)) {
       const pass = encoder.beginRenderPass({
         colorAttachments: [{
           view: this.framebuffer.view,
@@ -226,14 +290,17 @@ export class WebGpuRenderer {
         }],
       });
       this.solidPipeline.draw(pass, solidCount);
-      for (const frame of this.h264Queue) {
-        this.h264Pipeline.drawFullFrame(pass, frame, this.framebuffer.width, this.framebuffer.height);
+      if (drawH264) {
+        for (const frame of this.h264Queue) {
+          this.h264Pipeline!.drawFullFrame(pass, frame, this.framebuffer.width, this.framebuffer.height);
+        }
       }
       pass.end();
     }
-    const h264Count = this.h264Queue.length;
+    const h264Count = drawH264 ? this.h264Queue.length : 0;
     // Stage the VideoFrames for next-tick cleanup; the importExternalTexture
-    // references are scoped to this submit.
+    // references are scoped to this submit. (Still need to close dropped
+    // frames so they don't leak GPU memory in the WebCodecs decoder.)
     this.videoFramesToClose.push(...this.h264Queue);
     this.h264Queue.length = 0;
 
