@@ -2001,14 +2001,10 @@ async fn e2e_multi_pattern() -> Result<()> {
 /// ratio-based assertion no longer cleanly identifies H.264 mode. The
 /// absolute-frame-count threshold (≥ 150 H.264 datagrams) directly measures
 /// "classifier was in H.264 mode this phase" without relying on tile counts.
-#[tokio::test]
-async fn e2e_mode_switch() -> Result<()> {
-    let setup = setup_e2e_webgpu_gpu_with_env(
-        "--drm-direct --mode-switch-cycle 3",
-        &[("GHOSTFRAME_ENABLE_CDF53", "1")],
-    )
-    .await?;
-
+///
+/// Generic over `BrowserSession` so a Firefox variant could be added in the
+/// future (see `e2e_mode_switch_chromium` for the H.264-exclusion rationale).
+async fn e2e_mode_switch_body<B: helpers::BrowserSession>(browser: &mut B) -> Result<()> {
     // 20 seconds: covers three full 6-second cycles plus startup settle.
     // The shorter 14s window occasionally hits a startup race where most
     // sampling lands on static halves and frame_seen flakes false.
@@ -2018,13 +2014,11 @@ async fn e2e_mode_switch() -> Result<()> {
     let mut samples: Vec<(u64, u64, u64)> = Vec::new(); // (elapsed_ms, tile, frame)
 
     while tokio::time::Instant::now() - started < total {
-        let v: serde_json::Value = setup
-            .page()
+        let v: serde_json::Value = browser
             .evaluate(
                 "(() => { const s = window.__ghostframeStats || {tileDatagrams:0, frameDatagrams:0}; return {t: s.tileDatagrams, f: s.frameDatagrams}; })()",
             )
-            .await?
-            .into_value()?;
+            .await?;
         let elapsed_ms = (tokio::time::Instant::now() - started).as_millis() as u64;
         let tile = v["t"].as_u64().unwrap_or(0);
         let frame = v["f"].as_u64().unwrap_or(0);
@@ -2141,6 +2135,23 @@ async fn e2e_mode_switch() -> Result<()> {
     );
 
     Ok(())
+}
+
+// Chromium-only: this scenario transitions through H.264 mode, which Firefox
+// cannot render (TEXTURE_EXTERNAL capability missing). The body is generic
+// over BrowserSession so a Firefox variant *could* be added once the HELLO
+// h264Supported bit is plumbed and the server is gated against selecting
+// H.264 for Firefox clients — but until then, asserting on H.264-mode
+// telemetry would always fail on Firefox.
+#[tokio::test]
+async fn e2e_mode_switch_chromium() -> Result<()> {
+    let mut setup = setup_e2e_webgpu_gpu_with_env(
+        "--drm-direct --mode-switch-cycle 3",
+        &[("GHOSTFRAME_ENABLE_CDF53", "1")],
+    )
+    .await?;
+    e2e_mode_switch_body(&mut setup.browser).await?;
+    setup.browser.close().await
 }
 
 /// M3.6b: Sample `__ghostframeStats` for `duration` and return
