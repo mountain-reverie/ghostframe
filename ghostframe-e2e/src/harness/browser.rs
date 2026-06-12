@@ -168,3 +168,101 @@ impl BrowserSession for ChromiumSession {
         Ok(())
     }
 }
+
+// ---------------------------------------------------------------------------
+// Firefox (WebDriver via fantoccini + geckodriver)
+// ---------------------------------------------------------------------------
+
+use std::path::PathBuf;
+
+/// Launch parameters for Firefox. SPKI isn't used (certutil installs the
+/// cert into the profile NSS DB instead).
+pub struct FirefoxLaunch {
+    pub display: String,
+    pub xdg_runtime_dir: String,
+    pub cert_pem: String,
+    pub firefox_bin: PathBuf,
+}
+
+impl FirefoxLaunch {
+    /// Pick the Firefox binary the e2e harness should run. Env-var override
+    /// `GHOSTFRAME_E2E_FIREFOX_BIN` wins; otherwise `/usr/bin/firefox`.
+    pub fn default_firefox_bin() -> PathBuf {
+        std::env::var("GHOSTFRAME_E2E_FIREFOX_BIN")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/usr/bin/firefox"))
+    }
+}
+
+pub struct FirefoxSession {
+    // Geckodriver + fantoccini client added in Tasks 7-8. For now only the
+    // profile dir lives in the struct so it's drop-cleaned at end of test.
+    _profile_dir: tempfile::TempDir,
+}
+
+impl FirefoxSession {
+    /// Build a fresh profile directory + user.js with the prefs that the
+    /// e2e harness needs (WebGPU on, HTTPS-only off). Returns the owned
+    /// TempDir so the caller can pass its path to certutil and geckodriver.
+    pub(crate) fn build_profile() -> Result<tempfile::TempDir> {
+        let dir = tempfile::Builder::new()
+            .prefix("ghostframe-fx-")
+            .tempdir()
+            .context("create Firefox profile tempdir")?;
+        // Note: dom.security.https_only_mode = false because the harness
+        // serves a static cert via tsnet's normally-LE-backed path; HTTPS-only
+        // mode would warn-block before we get a chance to navigate.
+        // marionette.port = 0 lets geckodriver pick its own (we only care
+        // about the WebDriver port which we pass explicitly).
+        let user_js = r#"user_pref("dom.webgpu.enabled", true);
+user_pref("network.webtransport.enabled", true);
+user_pref("dom.security.https_only_mode", false);
+user_pref("marionette.port", 0);
+"#;
+        std::fs::write(dir.path().join("user.js"), user_js)
+            .context("write user.js")?;
+        Ok(dir)
+    }
+
+    /// Run `certutil -A` to import `cert_pem` into the profile's NSS DB so
+    /// Firefox trusts the static e2e cert.
+    ///
+    /// Hard-fails if `certutil` isn't on PATH — silently skipped tests are
+    /// the failure mode this whole iteration cycle just experienced.
+    /// Empty `cert_pem` is treated as a no-op (smoke-test path, Task 8).
+    pub(crate) fn install_cert(
+        profile_dir: &std::path::Path,
+        cert_pem: &str,
+    ) -> Result<()> {
+        if cert_pem.is_empty() {
+            return Ok(());
+        }
+        if which::which("certutil").is_err() {
+            return Err(anyhow!(
+                "FirefoxSession::new: certutil(1) is required for the Firefox e2e path — \
+                 install nss-tools (Debian) / nss (Arch) / nss-tools (Fedora) and retry, \
+                 or skip the Firefox tests with --skip _firefox"
+            ));
+        }
+        let cert_path = profile_dir.join("import.pem");
+        std::fs::write(&cert_path, cert_pem).context("write import.pem")?;
+        let out = std::process::Command::new("certutil")
+            .arg("-A")
+            .arg("-n").arg("ghostframe-e2e")
+            .arg("-t").arg("C,,")
+            .arg("-i").arg(&cert_path)
+            .arg("-d").arg(format!("sql:{}", profile_dir.display()))
+            .output()
+            .context("spawn certutil")?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "certutil -A failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr),
+            ));
+        }
+        // Remove the imported PEM so it's not lying around in the profile dir.
+        std::fs::remove_file(&cert_path).ok();
+        Ok(())
+    }
+}
