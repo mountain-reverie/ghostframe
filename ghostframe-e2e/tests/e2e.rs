@@ -315,6 +315,14 @@ async fn setup_e2e_webgpu_firefox(test_pattern_args: &str) -> Result<E2eFirefoxS
     setup_e2e_firefox_inner(test_pattern_args, &[], false, true).await
 }
 
+/// Firefox sibling of `setup_e2e_webgpu_gpu_with_env` (GPU + env vars).
+async fn setup_e2e_webgpu_gpu_with_env_firefox(
+    test_pattern_args: &str,
+    extra_env: &[(&str, &str)],
+) -> Result<E2eFirefoxSetup> {
+    setup_e2e_firefox_inner(test_pattern_args, extra_env, true, true).await
+}
+
 async fn setup_e2e_firefox_inner(
     test_pattern_args: &str,
     extra_env: &[(&str, &str)],
@@ -813,35 +821,25 @@ async fn e2e_solid_color_5pct_loss() -> Result<()> {
     Ok(())
 }
 
+/// Shared body for `e2e_palrle_5pct_loss_chromium` and `e2e_palrle_5pct_loss_firefox`.
+///
 /// Drop 5% of bundled PalRle datagrams and verify the text-grid still
-/// renders correctly via 2×RTT retransmissions.
+/// renders correctly via 2×RTT retransmissions. Generic over any
+/// `BrowserSession` impl so the same logic runs in both browser paths.
 // M3.2c: Xorg-on-VKMS + modesetting-FB capture emits Codec::Raw for text
 // content; classifier never sees PalRle-feasible unique_colors. Defective
 // from inception (gpu=false original setup) and not fixed by the gpu=true
 // migration. Re-enable once M3.2c repairs the test-pattern capture path.
-#[tokio::test(flavor = "multi_thread")]
-async fn e2e_palrle_5pct_loss() -> Result<()> {
+async fn e2e_palrle_5pct_loss_body<B: helpers::BrowserSession>(browser: &mut B) -> Result<()> {
     use ghostframe_test_pattern::text_grid::SAMPLES;
-
-    let setup = setup_e2e_webgpu_gpu_with_env(
-        "--text-grid --drm-direct",
-        &[
-            ("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "0.05"),
-            ("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE", "palrle_bundled"),
-            ("GHOSTFRAME_OUTBOUND_LOSS_SEED", "42"),
-        ],
-    )
-    .await?;
 
     // ~7s — enough for QUIC slow-start + 2×RTT retransmits to settle.
     tokio::time::sleep(Duration::from_secs(7)).await;
 
     // Sanity: PalRle codec should appear in the recorded codec stream.
-    let codec_list: Vec<u8> = setup
-        .page()
+    let codec_list: Vec<u8> = browser
         .evaluate("window.__ghostframeRecordedCodecs || []")
-        .await?
-        .into_value()?;
+        .await?;
     assert!(
         codec_list.contains(&2u8),
         "e2e_palrle_5pct_loss: expected Codec::PalRle (2) on the wire; saw codecs: {:?}",
@@ -867,7 +865,7 @@ async fn e2e_palrle_5pct_loss() -> Result<()> {
         bx = pair.bg.0,
         by = pair.bg.1,
     );
-    let probe: serde_json::Value = setup.page().evaluate(probe_js.as_str()).await?.into_value()?;
+    let probe: serde_json::Value = browser.evaluate(probe_js.as_str()).await?;
     let ink_lum = luminance(&probe["ink"]);
     let bg_lum = luminance(&probe["bg"]);
     assert!(
@@ -876,6 +874,36 @@ async fn e2e_palrle_5pct_loss() -> Result<()> {
     );
 
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_palrle_5pct_loss_chromium() -> Result<()> {
+    let mut setup = setup_e2e_webgpu_gpu_with_env(
+        "--text-grid --drm-direct",
+        &[
+            ("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "0.05"),
+            ("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE", "palrle_bundled"),
+            ("GHOSTFRAME_OUTBOUND_LOSS_SEED", "42"),
+        ],
+    )
+    .await?;
+    e2e_palrle_5pct_loss_body(&mut setup.browser).await?;
+    setup.browser.close().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_palrle_5pct_loss_firefox() -> Result<()> {
+    let mut setup = setup_e2e_webgpu_gpu_with_env_firefox(
+        "--text-grid --drm-direct",
+        &[
+            ("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "0.05"),
+            ("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE", "palrle_bundled"),
+            ("GHOSTFRAME_OUTBOUND_LOSS_SEED", "42"),
+        ],
+    )
+    .await?;
+    e2e_palrle_5pct_loss_body(&mut setup.browser).await?;
+    setup.browser.close().await
 }
 
 /// W3/B3 — Verify the Solid WGSL render pipeline produces correct
