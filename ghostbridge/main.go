@@ -28,15 +28,28 @@ import (
 func init() {
 	// TS_DEBUG_USE_DERP_HTTP=1 makes the tailscale DERP client connect to the
 	// DERP relay server using HTTP instead of HTTPS. This is required when
-	// using headscale's embedded DERP without TLS (http:// server_url).
-	// We use envknob.Setenv so that the already-registered envknob pointer
-	// gets updated — plain os.Setenv is too late because tailscale packages
-	// register their env knobs at package-init time.
-	if os.Getenv("TS_DEBUG_USE_DERP_HTTP") == "" {
-		log.Printf("ghostbridge: init: setting TS_DEBUG_USE_DERP_HTTP=1 via envknob")
+	// using headscale's embedded DERP without TLS (http:// server_url) — i.e.
+	// the e2e harness — but it breaks the public Tailscale network, whose
+	// DERP relays only accept HTTPS. Forcing it on unconditionally caused
+	// every production node to silently time out on all DERP regions,
+	// leaving WireGuard with no relay path and browser HTTPS connections
+	// stalling out as NS_ERROR_NET_INTERRUPT.
+	//
+	// Heuristic: a non-empty TS_CONTROL_URL means the operator is pointing
+	// us at a custom control plane (headscale). An empty TS_CONTROL_URL
+	// means we're joining the public Tailscale network and must use HTTPS
+	// DERP.
+	//
+	// envknob.Setenv is required (not plain os.Setenv) because tailscale
+	// packages register their env knobs at package-init time; the
+	// already-registered pointer needs to be updated.
+	if explicit := os.Getenv("TS_DEBUG_USE_DERP_HTTP"); explicit != "" {
+		log.Printf("ghostbridge: init: TS_DEBUG_USE_DERP_HTTP already set to %q", explicit)
+	} else if os.Getenv("TS_CONTROL_URL") != "" {
+		log.Printf("ghostbridge: init: TS_CONTROL_URL is set, opting into TS_DEBUG_USE_DERP_HTTP=1 (headscale path)")
 		envknob.Setenv("TS_DEBUG_USE_DERP_HTTP", "1")
 	} else {
-		log.Printf("ghostbridge: init: TS_DEBUG_USE_DERP_HTTP already set to %q", os.Getenv("TS_DEBUG_USE_DERP_HTTP"))
+		log.Printf("ghostbridge: init: production path (public Tailscale) — leaving TS_DEBUG_USE_DERP_HTTP unset for HTTPS DERP")
 	}
 
 	// Disable netns socket marking (SO_MARK / SO_BINDTODEVICE).
