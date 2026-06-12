@@ -196,6 +196,14 @@ impl E2eSetup {
     }
 }
 
+/// Firefox equivalent of `E2eSetup`. Holds the same server-side state but
+/// drives the browser through geckodriver / fantoccini instead of CDP.
+struct E2eFirefoxSetup {
+    #[allow(dead_code)]
+    server: helpers::E2eServerSetup,
+    browser: helpers::FirefoxSession,
+}
+
 /// Configures Chromium with WebGPU enabled. Uses real GPU passthrough
 /// when /dev/dri/renderD128 exists on the host; falls back to SwiftShader
 /// (CPU WebGPU) otherwise.
@@ -297,6 +305,43 @@ async fn setup_e2e_inner_with_url_extra(
     helpers::wait_for_frames(&mut browser, Duration::from_secs(30)).await?;
 
     Ok(E2eSetup { server, browser })
+}
+
+/// Firefox equivalent of `setup_e2e_webgpu`. Builds the same server stack
+/// (containers + tsnet + forwarders + Weston) and launches Firefox via
+/// `FirefoxSession` instead of Chromium. The test body sees a
+/// `helpers::BrowserSession` either way.
+async fn setup_e2e_webgpu_firefox(test_pattern_args: &str) -> Result<E2eFirefoxSetup> {
+    setup_e2e_firefox_inner(test_pattern_args, &[], false, true).await
+}
+
+async fn setup_e2e_firefox_inner(
+    test_pattern_args: &str,
+    extra_env: &[(&str, &str)],
+    gpu: bool,
+    webgpu: bool,
+) -> Result<E2eFirefoxSetup> {
+    let server = helpers::setup_e2e_server(helpers::E2eServerSpec {
+        test_pattern_args,
+        extra_env,
+        gpu,
+        webgpu,
+        url_query_extra: "",
+    })
+    .await?;
+    let xvfb = server.xvfb.as_ref().ok_or_else(|| {
+        anyhow!("setup_e2e_firefox_inner: webgpu==true required (Weston display)")
+    })?;
+    let cfg = helpers::FirefoxLaunch {
+        display: xvfb.display.clone(),
+        xdg_runtime_dir: xvfb.runtime_dir().to_string_lossy().to_string(),
+        cert_pem: server.e2e_cert.cert_pem.clone(),
+        firefox_bin: helpers::FirefoxLaunch::default_firefox_bin(),
+    };
+    let mut browser = helpers::FirefoxSession::new(cfg).await?;
+    browser.new_page(&server.page_url).await?;
+    helpers::wait_for_frames(&mut browser, std::time::Duration::from_secs(30)).await?;
+    Ok(E2eFirefoxSetup { server, browser })
 }
 
 /// M1: Verify that captured pixels appear correctly in the browser.
@@ -494,21 +539,12 @@ async fn e2e_readpixel_correctness() -> Result<()> {
     Ok(())
 }
 
-/// M2: Solid red renders correctly through H.264 pipeline (color fidelity).
+/// Shared body for `e2e_solid_color_chromium` and `e2e_solid_color_firefox`.
 ///
-/// M3.1: This test also exercises the new Scheduler-routed tile-codec
-/// emission path — every dirty tile flows through
-/// `Scheduler::enqueue → tick → fragment_tile`.
-///
-/// Pre-M3.2: GPU `tile_analysis.comp` now populates real `unique_colors`
-/// from live content on the GPU path, so the classifier's Solid rule
-/// (`unique_colors == 1`) fires end-to-end without `force_codec_state_for_test`.
-/// The CPU path still emits `Codec::Raw` since `process_frame_cpu` keeps the
-/// sentinel (no GPU compute available there).
-#[tokio::test]
-async fn e2e_solid_color() -> Result<()> {
-    let setup = setup_e2e_webgpu("--solid-red").await?;
-
+/// Waits for frames, scans for a red pixel with H.264-tolerant thresholds,
+/// and emits rich diagnostic output on failure. Generic over any
+/// `BrowserSession` impl so the same logic runs in both browser paths.
+async fn e2e_solid_color_body<B: helpers::BrowserSession>(browser: &mut B) -> Result<()> {
     // Wait for frames to accumulate and QUIC congestion window to open
     tokio::time::sleep(Duration::from_secs(5)).await;
 
@@ -527,96 +563,115 @@ async fn e2e_solid_color() -> Result<()> {
         })()
     "#;
 
-    let scan: serde_json::Value = setup.page().evaluate(scan_js).await?.into_value()?;
+    let scan: serde_json::Value = browser.evaluate(scan_js).await?;
     let found = scan.get("found").and_then(|v| v.as_bool()).unwrap_or(false);
     if !found {
-        // Diagnostic: sample a few pixels to understand what the canvas contains
-        if let Ok(v) = setup
-            .page()
-            .evaluate(
-                r#"
-            (async () => {
-                const pts = [[16,16],[160,240],[320,240],[480,240]];
-                const results = [];
-                for (const [x,y] of pts) {
-                    const p = await window.__readPixel(x,y);
-                    results.push(`(${x},${y})=[${p.join(',')}]`);
-                }
-                return results.join(' ');
-            })()
-        "#,
+        // Diagnostic block: best-effort probes, errors silently ignored —
+        // these only run on failure so we want as much info as we can grab.
+        if let Ok(diag) = browser
+            .evaluate::<String>(
+                r#"(async () => {
+                    const pts = [[16,16],[160,240],[320,240],[480,240]];
+                    const results = [];
+                    for (const [x,y] of pts) {
+                        const p = await window.__readPixel(x,y);
+                        results.push(`(${x},${y})=[${p.join(',')}]`);
+                    }
+                    return results.join(' ');
+                })()"#,
             )
             .await
         {
-            let diag: String = v.into_value().unwrap_or_default();
             println!("pixel diag: {diag}");
         }
-        // Check canvas size, page log, and stats
-        if let Ok(v) = setup.page().evaluate(
-            "document.getElementById('canvas')?.width + 'x' + document.getElementById('canvas')?.height"
-        ).await {
-            let csz: String = v.into_value().unwrap_or_default();
+        if let Ok(csz) = browser
+            .evaluate::<String>(
+                "document.getElementById('canvas')?.width + 'x' + document.getElementById('canvas')?.height",
+            )
+            .await
+        {
             println!("canvas size: {csz}");
         }
-        if let Ok(v) = setup.page().evaluate(
-            "Array.from(document.getElementById('log')?.querySelectorAll('div') || []).map(d => d.textContent).join('|')"
-        ).await {
-            let log_content: String = v.into_value().unwrap_or_default();
+        if let Ok(log_content) = browser
+            .evaluate::<String>(
+                "Array.from(document.getElementById('log')?.querySelectorAll('div') || []).map(d => d.textContent).join('|')",
+            )
+            .await
+        {
             println!("page log: {log_content}");
         }
-        if let Ok(v) = setup
-            .page()
-            .evaluate("JSON.stringify(window.__ghostframeStats)")
+        if let Ok(stats) = browser
+            .evaluate::<String>("JSON.stringify(window.__ghostframeStats)")
             .await
         {
-            let stats: String = v.into_value().unwrap_or_default();
             println!("frame stats: {stats}");
         }
-        if let Ok(v) = setup
-            .page()
-            .evaluate("JSON.stringify({rafTicks: window.__ghostframeRafTicks||0})")
+        if let Ok(counters) = browser
+            .evaluate::<String>("JSON.stringify({rafTicks: window.__ghostframeRafTicks||0})")
             .await
         {
-            let counters: String = v.into_value().unwrap_or_default();
             println!("counters: {counters}");
         }
-        // Read the ACTUAL framebuffer texture using GPU staging readback
-        if let Ok(v) = setup.page().evaluate(r#"
-            (async () => {
-                try {
-                    const ref_ = window.__ghostframeRenderer;
-                    if (!ref_) return 'renderer_not_exposed';
-                    const { device, texture } = ref_;
-                    if (!device || !texture) return `renderer_missing device=${!!device} texture=${!!texture}`;
-                    const staging = device.createBuffer({
-                        size: 256,
-                        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-                    });
-                    const enc = device.createCommandEncoder();
-                    enc.copyTextureToBuffer(
-                        { texture, origin: {x:0,y:0} },
-                        { buffer: staging, bytesPerRow: 256 },
-                        [1, 1]
-                    );
-                    device.queue.submit([enc.finish()]);
-                    await staging.mapAsync(GPUMapMode.READ);
-                    const view = new Uint8Array(staging.getMappedRange(0, 4));
-                    const px = Array.from(view);
-                    staging.unmap();
-                    return `fb_pixel_00: [${px}] texW=${texture.width} texH=${texture.height}`;
-                } catch(e) { return `fb_readback_err: ${e}`; }
-            })()
-        "#).await {
-            let fb_rb: String = v.into_value().unwrap_or_default();
+        // GPU framebuffer readback (best-effort)
+        if let Ok(fb_rb) = browser
+            .evaluate::<String>(
+                r#"(async () => {
+                    try {
+                        const ref_ = window.__ghostframeRenderer;
+                        if (!ref_) return 'renderer_not_exposed';
+                        const { device, texture } = ref_;
+                        if (!device || !texture) return `renderer_missing device=${!!device} texture=${!!texture}`;
+                        const staging = device.createBuffer({
+                            size: 256,
+                            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+                        });
+                        const enc = device.createCommandEncoder();
+                        enc.copyTextureToBuffer(
+                            { texture, origin: {x:0,y:0} },
+                            { buffer: staging, bytesPerRow: 256 },
+                            [1, 1]
+                        );
+                        device.queue.submit([enc.finish()]);
+                        await staging.mapAsync(GPUMapMode.READ);
+                        const view = new Uint8Array(staging.getMappedRange(0, 4));
+                        const px = Array.from(view);
+                        staging.unmap();
+                        return `fb_pixel_00: [${px}] texW=${texture.width} texH=${texture.height}`;
+                    } catch(e) { return `fb_readback_err: ${e}`; }
+                })()"#,
+            )
+            .await
+        {
             println!("framebuffer px: {fb_rb}");
         }
     }
-    assert!(
-        found,
-        "no red pixel found on canvas — H.264 pipeline failed"
-    );
-
+    assert!(found, "no red pixel found on canvas — H.264 pipeline failed");
     Ok(())
+}
+
+/// M2: Solid red renders correctly through H.264 pipeline (color fidelity).
+///
+/// M3.1: This test also exercises the new Scheduler-routed tile-codec
+/// emission path — every dirty tile flows through
+/// `Scheduler::enqueue → tick → fragment_tile`.
+///
+/// Pre-M3.2: GPU `tile_analysis.comp` now populates real `unique_colors`
+/// from live content on the GPU path, so the classifier's Solid rule
+/// (`unique_colors == 1`) fires end-to-end without `force_codec_state_for_test`.
+/// The CPU path still emits `Codec::Raw` since `process_frame_cpu` keeps the
+/// sentinel (no GPU compute available there).
+#[tokio::test]
+async fn e2e_solid_color_chromium() -> Result<()> {
+    let mut setup = setup_e2e_webgpu("--solid-red").await?;
+    e2e_solid_color_body(&mut setup.browser).await?;
+    setup.browser.close().await
+}
+
+#[tokio::test]
+async fn e2e_solid_color_firefox() -> Result<()> {
+    let mut setup = setup_e2e_webgpu_firefox("--solid-red").await?;
+    e2e_solid_color_body(&mut setup.browser).await?;
+    setup.browser.close().await
 }
 
 /// W4 (M3.2c) — Verify the H.264 render pipeline produces output
