@@ -37,3 +37,100 @@ pub trait BrowserSession: Send {
     /// exit. Best-effort cleanup also runs in `Drop`.
     async fn close(self) -> Result<()>;
 }
+
+// ---------------------------------------------------------------------------
+// Chromium (CDP via chromiumoxide)
+// ---------------------------------------------------------------------------
+
+use anyhow::{anyhow, Context};
+use chromiumoxide::browser::{Browser, BrowserConfig};
+use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
+use chromiumoxide::page::ScreenshotParams;
+use futures::StreamExt;
+
+/// Launch parameters for Chromium. Mirrors the args the existing
+/// `scene.rs` uses; lifted here so the trait impl owns them.
+pub struct ChromiumLaunch {
+    pub display: String,
+    pub xdg_runtime_dir: String,
+    pub spki_b64: String,
+    pub user_data_dir: std::path::PathBuf,
+}
+
+pub struct ChromiumSession {
+    browser: Browser,
+    /// Consumes CDP event stream; aborted on close.
+    _handler: tokio::task::JoinHandle<()>,
+    page: Option<chromiumoxide::Page>,
+}
+
+impl ChromiumSession {
+    pub async fn new(cfg: ChromiumLaunch) -> Result<Self> {
+        let builder = BrowserConfig::builder()
+            .chrome_executable("/usr/bin/chromium")
+            .no_sandbox()
+            .user_data_dir(&cfg.user_data_dir)
+            .with_head()
+            .env("DISPLAY", cfg.display)
+            .env("XDG_RUNTIME_DIR", cfg.xdg_runtime_dir)
+            .arg(("enable-features", "Vulkan,WebGPU"))
+            .arg("use-vulkan")
+            .arg("ozone-platform=x11")
+            .arg("enable-unsafe-webgpu")
+            .arg("ignore-gpu-blocklist")
+            .arg((
+                "ignore-certificate-errors-spki-list",
+                cfg.spki_b64.as_str(),
+            ));
+        let (browser, mut handler) = Browser::launch(builder.build().map_err(|e| anyhow!(e))?)
+            .await
+            .context("chromiumoxide Browser::launch failed")?;
+        let handler = tokio::spawn(async move { while handler.next().await.is_some() {} });
+        Ok(Self {
+            browser,
+            _handler: handler,
+            page: None,
+        })
+    }
+
+    /// Escape hatch used by the transitional `E2eSetup` shim while older
+    /// tests still poke `setup.page().evaluate(...)` directly. Removed once
+    /// every test is converted to the trait (Task 9 onward).
+    pub fn page(&self) -> Option<&chromiumoxide::Page> {
+        self.page.as_ref()
+    }
+}
+
+#[async_trait]
+impl BrowserSession for ChromiumSession {
+    async fn new_page(&mut self, url: &str) -> Result<()> {
+        let page = self.browser.new_page(url).await.context("new_page")?;
+        self.page = Some(page);
+        Ok(())
+    }
+
+    async fn evaluate<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        script: &str,
+    ) -> Result<T> {
+        let page = self.page.as_ref().ok_or_else(|| anyhow!("no active page"))?;
+        let v = page.evaluate(script).await.context("evaluate")?;
+        v.into_value::<T>().context("deserialize evaluate result")
+    }
+
+    async fn screenshot(&mut self) -> Result<Vec<u8>> {
+        let page = self.page.as_ref().ok_or_else(|| anyhow!("no active page"))?;
+        let params = ScreenshotParams::builder()
+            .format(CaptureScreenshotFormat::Png)
+            .build();
+        page.screenshot(params).await.context("screenshot")
+    }
+
+    async fn close(mut self) -> Result<()> {
+        if let Some(page) = self.page.take() {
+            let _ = page.close().await;
+        }
+        let _ = self.browser.close().await;
+        Ok(())
+    }
+}
