@@ -1,4 +1,5 @@
 use ghostframe_e2e::harness as helpers;
+use ghostframe_e2e::harness::BrowserSession as _;
 use ghostframe_lib::transport::protocol::Codec;
 
 use std::net::SocketAddr;
@@ -183,18 +184,16 @@ async fn e2e_quic_ping_pong_over_tailscale() -> Result<()> {
 /// returns the Page for assertions. Caller is responsible for keeping the
 /// returned handles alive (dropping them tears down containers/browser).
 struct E2eSetup {
-    _headscale: ContainerAsync<GenericImage>,
-    _server: ContainerAsync<GenericImage>,
-    _browser: Browser,
-    _handler_task: tokio::task::JoinHandle<()>,
-    _test_node: std::sync::Arc<helpers::TestNode>,
-    _forwarder: SocketAddr,
-    _tcp_forwarder: SocketAddr,
-    /// Private Weston compositor (headless backend + XWayland) for WebGPU
-    /// runs. Dropped after the browser so Chrome detaches before the X
-    /// server is killed.
-    _xvfb: Option<helpers::WestonGuard>,
-    page: chromiumoxide::Page,
+    server: helpers::E2eServerSetup,
+    browser: helpers::ChromiumSession,
+}
+
+impl E2eSetup {
+    fn page(&self) -> &chromiumoxide::Page {
+        self.browser
+            .page()
+            .expect("E2eSetup: browser has no active page")
+    }
 }
 
 /// Configures Chromium with WebGPU enabled. Uses real GPU passthrough
@@ -251,87 +250,19 @@ async fn setup_e2e_inner_with_url_extra(
     webgpu: bool,
     url_query_extra: &str,
 ) -> Result<E2eSetup> {
-    helpers::cleanup_stale_xvfb_sockets();
-    let hs_server_url = format!("http://{DOCKER_HOST_IP}:{HEADSCALE_HOST_PORT}");
+    use ghostframe_e2e::harness::browser::{ChromiumDisplayMode, ChromiumLaunch};
 
-    let headscale: ContainerAsync<GenericImage> =
-        GenericImage::new("ghostframe/test-headscale", "latest")
-            .with_mapped_port(HEADSCALE_HOST_PORT, 8080.tcp())
-            .with_container_name("headscale")
-            .with_network(helpers::NETWORK_NAME)
-            .with_env_var("HS_SERVER_URL", &hs_server_url)
-            .with_ready_conditions(vec![WaitFor::message_on_stderr(
-                "listening and serving HTTP",
-            )])
-            .with_startup_timeout(Duration::from_secs(120))
-            .start()
-            .await?;
+    let spec = helpers::E2eServerSpec {
+        test_pattern_args,
+        extra_env,
+        gpu,
+        webgpu,
+        url_query_extra,
+    };
+    let server = helpers::setup_e2e_server(spec).await?;
 
-    let server_key = helpers::create_preauth_key("headscale", "ghostframe").await?;
-    let client_key = helpers::create_preauth_key("headscale", "ghostframe").await?;
-
-    let e2e_cert = helpers::e2e_certs::generate(&["localhost", "127.0.0.1"])?;
-
-    let mut server_image = GenericImage::new("ghostframe/test-server", "latest")
-        .with_container_name("ghostframe-server")
-        .with_network(helpers::NETWORK_NAME)
-        .with_env_var("TS_AUTHKEY", &server_key)
-        .with_env_var("TS_CONTROL_URL", "http://headscale:8080")
-        .with_env_var("RUST_LOG", "ghostframe=trace,debug")
-        .with_env_var("TEST_PATTERN", test_pattern_args)
-        .with_env_var("GHOSTFRAME_WEB_TLS_CERT_PEM", &e2e_cert.cert_pem)
-        .with_env_var("GHOSTFRAME_WEB_TLS_KEY_PEM", &e2e_cert.key_pem);
-    if gpu {
-        // GPU-path defaults (overridable via extra_env): use the modesetting
-        // Xorg config that targets VKMS card0, bind-mount host DRM nodes,
-        // and run privileged so xdaemon can drive VKMS.
-        server_image = server_image.with_env_var("XORG_CONF", "/etc/X11/xorg-vkms.conf");
-        server_image = server_image.with_mount(Mount::bind_mount("/dev/dri", "/dev/dri"));
-        server_image = server_image.with_privileged(true);
-    }
-    // extra_env applied LAST so tests can override defaults like XORG_CONF
-    // (e.g. e2e_edge_tiles overrides to xorg-odd.conf for the 700×500 mode).
-    for (k, v) in extra_env {
-        server_image = server_image.with_env_var(*k, *v);
-    }
-    let server: ContainerAsync<GenericImage> = server_image
-        .with_ready_conditions(vec![WaitFor::message_on_stdout("QUIC server ready")])
-        .with_startup_timeout(Duration::from_secs(120))
-        .start()
-        .await?;
-
-    let client_control_url = format!("http://127.0.0.1:{HEADSCALE_HOST_PORT}");
-    let test_node =
-        std::sync::Arc::new(helpers::TestNode::join(client_key, client_control_url).await?);
-    let upstream = test_node.dial("ghostframe-server:443")?;
-    let forwarder = helpers::start_forwarder("127.0.0.1:0", upstream).await?;
-
-    let tcp_bind = format!("127.0.0.1:{}", forwarder.port());
-    let _tcp_forwarder = helpers::start_tcp_forwarder(
-        &tcp_bind,
-        test_node.clone(),
-        "ghostframe-server:443".to_string(),
-    )
-    .await?;
-
-    // Build chromium args. When `webgpu == true`, enable WebGPU; pick the
-    // GPU passthrough path if /dev/dri/renderD128 is host-available, else
-    // fall back to SwiftShader.
-    //
-    // IMPORTANT: `--headless=new` (chromiumoxide's `new_headless_mode()`) uses
-    // Chromium's Ozone headless backend which doesn't support WebGPU adapters —
-    // `requestAdapter()` always returns null.  When WebGPU is required we must
-    // use `HeadlessMode::False` (no --headless flag) and route Chromium through
-    // the host X server (`DISPLAY=:0`).  The E2E machine always has a live X
-    // session (LightDM on :0) so this is safe for both CI and dev machines.
-    let force_swiftshader = std::env::var("GHOSTFRAME_E2E_FORCE_SWIFTSHADER")
-        .map(|v| v == "1")
-        .unwrap_or(false);
     // Use a per-test-run temporary profile directory so successive Chrome
     // launches don't share — or corrupt — each other's profile state.
-    // chromiumoxide defaults to /tmp/chromiumoxide-runner (shared across all
-    // tests) which causes "Opening in existing browser session" failures and
-    // stale SingletonLock files after abnormal exits.
     let chrome_profile_dir = std::env::temp_dir().join(format!(
         "chromiumoxide-{}-{}",
         std::process::id(),
@@ -340,107 +271,32 @@ async fn setup_e2e_inner_with_url_extra(
             .unwrap_or_default()
             .subsec_nanos()
     ));
-    let mut builder = BrowserConfig::builder()
-        .chrome_executable("/usr/bin/chromium")
-        .no_sandbox()
-        .user_data_dir(&chrome_profile_dir);
-    // When `webgpu == true`, Chromium needs a DRI3-capable display so its
-    // GPU process can talk to Mesa Vulkan (RADV / amdgpu) — Xvfb has no DRI3
-    // and used to force Dawn onto SwiftShader. We now spawn a private Weston
-    // compositor in its headless backend with XWayland enabled; the
-    // XWayland-provided X display has DRI3 backed by GBM on the real GPU.
-    let xvfb = if webgpu {
-        let guard = helpers::spawn_weston_headless()?;
-        builder = builder
-            .with_head()
-            .env("DISPLAY", guard.display.clone())
-            .env(
-                "XDG_RUNTIME_DIR",
-                guard.runtime_dir().to_string_lossy().to_string(),
-            );
-        Some(guard)
-    } else {
-        None
+
+    // IMPORTANT: `--headless=new` (chromiumoxide's `new_headless_mode()`) uses
+    // Chromium's Ozone headless backend which doesn't support WebGPU adapters —
+    // `requestAdapter()` always returns null.  When WebGPU is required we must
+    // use Headed mode and route Chromium through the Weston XWayland display.
+    let mode = match &server.xvfb {
+        Some(guard) => ChromiumDisplayMode::Headed {
+            display: guard.display.clone(),
+            xdg_runtime_dir: guard.runtime_dir().to_string_lossy().into_owned(),
+            enable_webgpu: true,
+        },
+        None => ChromiumDisplayMode::HeadlessNew,
     };
-    if webgpu {
-        // With XWayland's DRI3 backing, Mesa Vulkan presentation works, so
-        // we can ask Chromium to select the real Vulkan adapter for WebGPU.
-        // The Wayland ozone platform is incompatible with `--use-vulkan` in
-        // Chromium 147+ (`WaylandSurfaceFactory: '--ozone-platform=wayland'
-        // is not compatible with Vulkan`), so we attach to XWayland via
-        // `--ozone-platform=x11` instead — invisible to the user because
-        // Weston is in its headless backend.
-        //
-        // chromiumoxide's ArgsBuilder merges tuple-form args into the same
-        // HashMap entry that DEFAULT_ARGS uses (`enable-features`), giving a
-        // single combined `--enable-features=...,Vulkan,WebGPU` flag.
-        // Chrome 147+ only honours the first occurrence of each flag.
-        builder = builder
-            .arg(("enable-features", "Vulkan,WebGPU"))
-            .arg("use-vulkan")
-            .arg("ozone-platform=x11")
-            .arg("enable-unsafe-webgpu")
-            .arg("ignore-gpu-blocklist")
-            .arg((
-                "ignore-certificate-errors-spki-list",
-                e2e_cert.spki_b64.as_str(),
-            ));
-        let _ = force_swiftshader; // kept for future opt-in; current default selects real GPU.
-    } else {
-        builder = builder.new_headless_mode().arg((
-            "ignore-certificate-errors-spki-list",
-            e2e_cert.spki_b64.as_str(),
-        ));
-    }
-    let (browser, mut handler) = Browser::launch(builder.build().unwrap()).await?;
-    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
-    let page_url = if url_query_extra.is_empty() {
-        format!("https://127.0.0.1:{}/", forwarder.port())
-    } else {
-        // url_query_extra is conventionally "&key=value" (designed to chain
-        // onto an existing query string). Replace the leading '&' with '?'.
-        let suffix = url_query_extra.strip_prefix('&').unwrap_or(url_query_extra);
-        format!("https://127.0.0.1:{}/?{}", forwarder.port(), suffix)
+    let launch = ChromiumLaunch {
+        mode,
+        spki_b64: server.e2e_cert.spki_b64.clone(),
+        user_data_dir: chrome_profile_dir,
     };
-    println!("page_url: {page_url}");
-    let page = browser.new_page(&page_url).await?;
 
-    // Wait for "Receiving frames" status
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        let result = page
-            .evaluate("(document.getElementById('status') || {textContent: '<null>'}).textContent")
-            .await;
-        if let Ok(v) = result {
-            let status: String = v.into_value().unwrap_or_default();
-            if status.contains("Receiving frames") {
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                let content = page.content().await.unwrap_or_default();
-                println!("page content:\n{content}");
-                panic!("timed out waiting for frame rendering. last status: {status}");
-            }
-        } else if tokio::time::Instant::now() >= deadline {
-            let content = page.content().await.unwrap_or_default();
-            println!("page content:\n{content}");
-            panic!("timed out waiting for frame rendering");
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    let mut browser = helpers::ChromiumSession::new(launch).await?;
+    println!("page_url: {}", server.page_url);
+    browser.new_page(&server.page_url).await?;
+    helpers::wait_for_frames(&mut browser, Duration::from_secs(30)).await?;
 
-    Ok(E2eSetup {
-        _headscale: headscale,
-        _server: server,
-        _browser: browser,
-        _handler_task: handler_task,
-        _test_node: test_node,
-        _forwarder: forwarder,
-        _tcp_forwarder,
-        _xvfb: xvfb,
-        page,
-    })
+    Ok(E2eSetup { server, browser })
 }
 
 /// M1: Verify that captured pixels appear correctly in the browser.
@@ -623,7 +479,7 @@ async fn e2e_readpixel_correctness() -> Result<()> {
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     let result: serde_json::Value = setup
-        .page
+        .page()
         .evaluate("window.__readGradientGolden()")
         .await?
         .into_value()?;
@@ -671,12 +527,12 @@ async fn e2e_solid_color() -> Result<()> {
         })()
     "#;
 
-    let scan: serde_json::Value = setup.page.evaluate(scan_js).await?.into_value()?;
+    let scan: serde_json::Value = setup.page().evaluate(scan_js).await?.into_value()?;
     let found = scan.get("found").and_then(|v| v.as_bool()).unwrap_or(false);
     if !found {
         // Diagnostic: sample a few pixels to understand what the canvas contains
         if let Ok(v) = setup
-            .page
+            .page()
             .evaluate(
                 r#"
             (async () => {
@@ -696,20 +552,20 @@ async fn e2e_solid_color() -> Result<()> {
             println!("pixel diag: {diag}");
         }
         // Check canvas size, page log, and stats
-        if let Ok(v) = setup.page.evaluate(
+        if let Ok(v) = setup.page().evaluate(
             "document.getElementById('canvas')?.width + 'x' + document.getElementById('canvas')?.height"
         ).await {
             let csz: String = v.into_value().unwrap_or_default();
             println!("canvas size: {csz}");
         }
-        if let Ok(v) = setup.page.evaluate(
+        if let Ok(v) = setup.page().evaluate(
             "Array.from(document.getElementById('log')?.querySelectorAll('div') || []).map(d => d.textContent).join('|')"
         ).await {
             let log_content: String = v.into_value().unwrap_or_default();
             println!("page log: {log_content}");
         }
         if let Ok(v) = setup
-            .page
+            .page()
             .evaluate("JSON.stringify(window.__ghostframeStats)")
             .await
         {
@@ -717,7 +573,7 @@ async fn e2e_solid_color() -> Result<()> {
             println!("frame stats: {stats}");
         }
         if let Ok(v) = setup
-            .page
+            .page()
             .evaluate("JSON.stringify({rafTicks: window.__ghostframeRafTicks||0})")
             .await
         {
@@ -725,7 +581,7 @@ async fn e2e_solid_color() -> Result<()> {
             println!("counters: {counters}");
         }
         // Read the ACTUAL framebuffer texture using GPU staging readback
-        if let Ok(v) = setup.page.evaluate(r#"
+        if let Ok(v) = setup.page().evaluate(r#"
             (async () => {
                 try {
                     const ref_ = window.__ghostframeRenderer;
@@ -822,7 +678,7 @@ async fn e2e_h264_forced_solid_red() -> Result<()> {
             return { red, blue, other, samples, fbW, fbH };
         })()
     "#;
-    let scan: serde_json::Value = setup.page.evaluate(scan_js).await?.into_value()?;
+    let scan: serde_json::Value = setup.page().evaluate(scan_js).await?.into_value()?;
     let red = scan["red"].as_u64().unwrap_or(0);
     let blue = scan["blue"].as_u64().unwrap_or(0);
     let other = scan["other"].as_u64().unwrap_or(0);
@@ -842,7 +698,7 @@ async fn e2e_h264_ssim_golden() -> Result<()> {
     // Allow time for: page load, WebGPU init, H.264 codec startup, and
     // the first few key frames to settle.
     tokio::time::sleep(Duration::from_secs(5)).await;
-    let png = setup.page.screenshot(
+    let png = setup.page().screenshot(
         chromiumoxide::page::ScreenshotParams::builder()
             .format(chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat::Png)
             .build(),
@@ -893,7 +749,7 @@ async fn e2e_solid_color_5pct_loss() -> Result<()> {
             return { found: false };
         })()
     "#;
-    let scan: serde_json::Value = setup.page.evaluate(scan_js).await?.into_value()?;
+    let scan: serde_json::Value = setup.page().evaluate(scan_js).await?.into_value()?;
     let found = scan.get("found").and_then(|v| v.as_bool()).unwrap_or(false);
     assert!(
         found,
@@ -927,7 +783,7 @@ async fn e2e_palrle_5pct_loss() -> Result<()> {
 
     // Sanity: PalRle codec should appear in the recorded codec stream.
     let codec_list: Vec<u8> = setup
-        .page
+        .page()
         .evaluate("window.__ghostframeRecordedCodecs || []")
         .await?
         .into_value()?;
@@ -956,7 +812,7 @@ async fn e2e_palrle_5pct_loss() -> Result<()> {
         bx = pair.bg.0,
         by = pair.bg.1,
     );
-    let probe: serde_json::Value = setup.page.evaluate(probe_js.as_str()).await?.into_value()?;
+    let probe: serde_json::Value = setup.page().evaluate(probe_js.as_str()).await?.into_value()?;
     let ink_lum = luminance(&probe["ink"]);
     let bg_lum = luminance(&probe["bg"]);
     assert!(
@@ -985,7 +841,7 @@ async fn e2e_solid_per_tile_pixels() -> Result<()> {
 
     // Sanity: Codec::Solid (wire enum = 3) must appear on the wire.
     let codecs: Vec<u8> = setup
-        .page
+        .page()
         .evaluate("window.__ghostframeRecordedCodecs || []")
         .await?
         .into_value()?;
@@ -1000,7 +856,7 @@ async fn e2e_solid_per_tile_pixels() -> Result<()> {
     // tiles relative to the scanout resolution, which depends on the
     // first DRM connector mode VKMS reports (varies between hosts).
     let dims: (u32, u32) = setup
-        .page
+        .page()
         .evaluate(
             "(() => { const c = document.querySelector('canvas'); return [c.width, c.height]; })()",
         )
@@ -1016,7 +872,7 @@ async fn e2e_solid_per_tile_pixels() -> Result<()> {
 
     for s in samples(width, height) {
         let probe_js = format!("window.__readPixel({}, {})", s.x, s.y);
-        let got: Vec<u8> = setup.page.evaluate(probe_js.as_str()).await?.into_value()?;
+        let got: Vec<u8> = setup.page().evaluate(probe_js.as_str()).await?.into_value()?;
         assert_eq!(
             got,
             s.expected_rgba.to_vec(),
@@ -1053,7 +909,7 @@ async fn e2e_palrle_exact_pixels() -> Result<()> {
 
     // Sanity: PalRle codec (wire enum 2) must appear on the wire.
     let codecs: Vec<u8> = setup
-        .page
+        .page()
         .evaluate("window.__ghostframeRecordedCodecs || []")
         .await?
         .into_value()?;
@@ -1066,7 +922,7 @@ async fn e2e_palrle_exact_pixels() -> Result<()> {
     // Exact-pixel assertions across all four test tiles.
     for sample in samples() {
         let probe = format!("window.__readPixel({}, {})", sample.x, sample.y);
-        let got: Vec<u8> = setup.page.evaluate(probe.as_str()).await?.into_value()?;
+        let got: Vec<u8> = setup.page().evaluate(probe.as_str()).await?.into_value()?;
         assert_eq!(
             got,
             sample.expected_rgba.to_vec(),
@@ -1179,7 +1035,7 @@ async fn e2e_palrle_session_reset() -> Result<()> {
         bx = pair.bg.0,
         by = pair.bg.1,
     );
-    let baseline: serde_json::Value = setup.page.evaluate(probe_js.as_str()).await?.into_value()?;
+    let baseline: serde_json::Value = setup.page().evaluate(probe_js.as_str()).await?.into_value()?;
     let baseline_ink_lum = luminance(&baseline["ink"]);
     let baseline_bg_lum = luminance(&baseline["bg"]);
     assert!(
@@ -1191,13 +1047,13 @@ async fn e2e_palrle_session_reset() -> Result<()> {
     // The server's on_session_reset will clear delivered/ref_count/in_flight
     // but preserve slot bytes (warm cache). Subsequent emissions will
     // re-bundle palettes (delivered=false) until ACKed.
-    setup.page.reload().await?;
+    setup.page().reload().await?;
 
     // Allow the new session to settle + re-render.
     tokio::time::sleep(Duration::from_secs(4)).await;
 
     // Phase 3: assert post-reset legibility.
-    let post: serde_json::Value = setup.page.evaluate(probe_js.as_str()).await?.into_value()?;
+    let post: serde_json::Value = setup.page().evaluate(probe_js.as_str()).await?.into_value()?;
     let post_ink_lum = luminance(&post["ink"]);
     let post_bg_lum = luminance(&post["bg"]);
     assert!(
@@ -1207,7 +1063,7 @@ async fn e2e_palrle_session_reset() -> Result<()> {
 
     // Protocol-layer: post-reset codec stream should include PalRle.
     let codec_list: Vec<u8> = setup
-        .page
+        .page()
         .evaluate("window.__ghostframeRecordedCodecs || []")
         .await?
         .into_value()?;
@@ -1242,9 +1098,9 @@ async fn e2e_tile_skip() -> Result<()> {
         })()
     "#;
 
-    let snap_a: i64 = setup.page.evaluate(snapshot_js).await?.into_value()?;
+    let snap_a: i64 = setup.page().evaluate(snapshot_js).await?.into_value()?;
     tokio::time::sleep(Duration::from_secs(2)).await;
-    let snap_b: i64 = setup.page.evaluate(snapshot_js).await?.into_value()?;
+    let snap_b: i64 = setup.page().evaluate(snapshot_js).await?.into_value()?;
 
     assert_eq!(
         snap_a, snap_b,
@@ -1274,9 +1130,9 @@ async fn e2e_h264_motion() -> Result<()> {
         })()
     "#;
 
-    let snap_a: i64 = setup.page.evaluate(sample_js).await?.into_value()?;
+    let snap_a: i64 = setup.page().evaluate(sample_js).await?.into_value()?;
     tokio::time::sleep(Duration::from_secs(2)).await;
-    let snap_b: i64 = setup.page.evaluate(sample_js).await?.into_value()?;
+    let snap_b: i64 = setup.page().evaluate(sample_js).await?.into_value()?;
 
     assert_ne!(
         snap_a, snap_b,
@@ -1310,9 +1166,9 @@ async fn e2e_codec_transition() -> Result<()> {
         })()
     "#;
 
-    let snap_a: i64 = setup.page.evaluate(static_js).await?.into_value()?;
+    let snap_a: i64 = setup.page().evaluate(static_js).await?.into_value()?;
     tokio::time::sleep(Duration::from_secs(2)).await;
-    let snap_b: i64 = setup.page.evaluate(static_js).await?.into_value()?;
+    let snap_b: i64 = setup.page().evaluate(static_js).await?.into_value()?;
 
     assert_eq!(
         snap_a, snap_b,
@@ -1367,19 +1223,19 @@ async fn e2e_edge_tiles() -> Result<()> {
             return out;
         })()
     "#;
-    let diag: serde_json::Value = setup.page.evaluate(diag_js).await?.into_value()?;
+    let diag: serde_json::Value = setup.page().evaluate(diag_js).await?.into_value()?;
     eprintln!(
         "e2e_edge_tiles diagnostic: {}",
         serde_json::to_string_pretty(&diag).unwrap()
     );
 
     let tiles: serde_json::Value = setup
-        .page
+        .page()
         .evaluate("window.__ghostframeRecordedTiles || []")
         .await?
         .into_value()?;
     let resizes: serde_json::Value = setup
-        .page
+        .page()
         .evaluate("window.__ghostframeRecordedResizes || []")
         .await?
         .into_value()?;
@@ -1419,7 +1275,7 @@ async fn e2e_edge_tiles() -> Result<()> {
         })()
     "#;
 
-    let result: serde_json::Value = setup.page.evaluate(edge_js).await?.into_value()?;
+    let result: serde_json::Value = setup.page().evaluate(edge_js).await?.into_value()?;
 
     // Check center renders red (baseline)
     let center = &result["center"];
@@ -1495,7 +1351,7 @@ async fn e2e_multi_tile_grid() -> Result<()> {
         })()
     "#;
 
-    let result: serde_json::Value = setup.page.evaluate(grid_js).await?.into_value()?;
+    let result: serde_json::Value = setup.page().evaluate(grid_js).await?.into_value()?;
     let red_count = result["redCount"].as_u64().unwrap_or(0);
     let total = result["total"].as_u64().unwrap_or(9);
 
@@ -1543,7 +1399,7 @@ async fn e2e_text_clarity() -> Result<()> {
             by = pair.bg.1,
         );
         let probe: serde_json::Value =
-            setup.page.evaluate(probe_js.as_str()).await?.into_value()?;
+            setup.page().evaluate(probe_js.as_str()).await?.into_value()?;
 
         let ink_lum = luminance(&probe["ink"]);
         let bg_lum = luminance(&probe["bg"]);
@@ -1572,16 +1428,16 @@ async fn e2e_text_clarity() -> Result<()> {
             return h;
         })()
     "#;
-    let h1: i64 = setup.page.evaluate(hash_js).await?.into_value()?;
+    let h1: i64 = setup.page().evaluate(hash_js).await?.into_value()?;
     tokio::time::sleep(Duration::from_secs(2)).await;
-    let h2: i64 = setup.page.evaluate(hash_js).await?.into_value()?;
+    let h2: i64 = setup.page().evaluate(hash_js).await?.into_value()?;
     assert_eq!(h1, h2, "text canvas drifted between snapshots");
 
     // ── (c) Protocol-layer: at least one tile must have been transmitted as PalRle.
     // The text-grid pattern has many uniform-colour glyph backgrounds and
     // limited-palette glyph runs that the classifier should pick PalRle for.
     let codec_list: Vec<u8> = setup
-        .page
+        .page()
         .evaluate("window.__ghostframeRecordedCodecs || []")
         .await?
         .into_value()?;
@@ -1615,7 +1471,7 @@ async fn e2e_palette_eviction() -> Result<()> {
             return { r: sample[0], g: sample[1], b: sample[2] };
         })()
     "#;
-    let sample: serde_json::Value = setup.page.evaluate(probe_js).await?.into_value()?;
+    let sample: serde_json::Value = setup.page().evaluate(probe_js).await?.into_value()?;
     let r = sample["r"].as_f64().unwrap_or(0.0);
     let g = sample["g"].as_f64().unwrap_or(0.0);
     let b = sample["b"].as_f64().unwrap_or(0.0);
@@ -1626,7 +1482,7 @@ async fn e2e_palette_eviction() -> Result<()> {
 
     // Protocol-layer: PalRle codec should appear on the wire repeatedly.
     let codec_list: Vec<u8> = setup
-        .page
+        .page()
         .evaluate("window.__ghostframeRecordedCodecs || []")
         .await?
         .into_value()?;
@@ -1827,7 +1683,7 @@ async fn e2e_fec_parity_enabled() -> Result<()> {
         })()
     "#;
 
-    let scan: serde_json::Value = setup.page.evaluate(scan_js).await?.into_value()?;
+    let scan: serde_json::Value = setup.page().evaluate(scan_js).await?.into_value()?;
     let found = scan.get("found").and_then(|v| v.as_bool()).unwrap_or(false);
     assert!(
         found,
@@ -1857,7 +1713,7 @@ async fn e2e_resolution_change() -> Result<()> {
 
     // Assert: canvas is 1024×768 and a center pixel is red.
     let dims_a: (u32, u32) = setup
-        .page
+        .page()
         .evaluate(
             r#"
             (() => {
@@ -1871,7 +1727,7 @@ async fn e2e_resolution_change() -> Result<()> {
     assert_eq!(dims_a, (1024, 768), "phase A: canvas dimensions");
 
     let red_a: bool = setup
-        .page
+        .page()
         .evaluate(
             r#"
             (async () => {
@@ -1914,7 +1770,7 @@ async fn e2e_resolution_change() -> Result<()> {
     tokio::time::sleep(Duration::from_secs(8)).await;
 
     let dims_b: (u32, u32) = setup
-        .page
+        .page()
         .evaluate(
             r#"
             (() => {
@@ -1932,7 +1788,7 @@ async fn e2e_resolution_change() -> Result<()> {
     );
 
     let red_b: bool = setup
-        .page
+        .page()
         .evaluate(
             r#"
             (async () => {
@@ -1962,10 +1818,10 @@ async fn e2e_multi_pattern() -> Result<()> {
     // spinner frames to land.
     tokio::time::sleep(SETTLE).await;
 
-    assert_region_rendered(&setup.page, region("solid"), RegionCheck::SolidRed).await?;
-    assert_region_rendered(&setup.page, region("text"), RegionCheck::Legible).await?;
-    assert_region_rendered(&setup.page, region("gradient"), RegionCheck::SmoothGradient).await?;
-    assert_region_rendered(&setup.page, region("spinner"), RegionCheck::Changing).await?;
+    assert_region_rendered(setup.page(), region("solid"), RegionCheck::SolidRed).await?;
+    assert_region_rendered(setup.page(), region("text"), RegionCheck::Legible).await?;
+    assert_region_rendered(setup.page(), region("gradient"), RegionCheck::SmoothGradient).await?;
+    assert_region_rendered(setup.page(), region("spinner"), RegionCheck::Changing).await?;
 
     // TODO(M3): once the classifier ships, also assert that each region's
     //           tiles are encoded with `region.expected_codec`. Will require
@@ -2021,7 +1877,7 @@ async fn e2e_mode_switch() -> Result<()> {
 
     while tokio::time::Instant::now() - started < total {
         let v: serde_json::Value = setup
-            .page
+            .page()
             .evaluate(
                 "(() => { const s = window.__ghostframeStats || {tileDatagrams:0, frameDatagrams:0}; return {t: s.tileDatagrams, f: s.frameDatagrams}; })()",
             )
@@ -2191,7 +2047,7 @@ async fn e2e_headroom_guard_forces_h264() -> Result<()> {
 
     // Sample for 5s.
     let (tile_total, frame_total) =
-        sample_mode_dominance(&setup.page, Duration::from_secs(5)).await?;
+        sample_mode_dominance(setup.page(), Duration::from_secs(5)).await?;
 
     eprintln!("M3.6b headroom: tile={tile_total} frame={frame_total}");
 
@@ -2232,7 +2088,7 @@ async fn e2e_loss_override_forces_h264() -> Result<()> {
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     let (tile_total, frame_total) =
-        sample_mode_dominance(&setup.page, Duration::from_secs(5)).await?;
+        sample_mode_dominance(setup.page(), Duration::from_secs(5)).await?;
 
     eprintln!("M3.6b loss: tile={tile_total} frame={frame_total}");
 
@@ -2292,7 +2148,7 @@ async fn e2e_ack_loss() -> Result<()> {
             return false;
         })()
     "#;
-    let found: bool = setup.page.evaluate(scan_js).await?.into_value()?;
+    let found: bool = setup.page().evaluate(scan_js).await?.into_value()?;
     assert!(found, "canvas blank under 100% ACK drop — recovery broken");
     Ok(())
 }
@@ -2340,7 +2196,7 @@ async fn e2e_indices_raw_handshake() -> Result<()> {
     // Assertion 3 (B2): at least one PalRle wire payload had the
     // indices_raw flag (bit 1) set.
     let flags: Vec<u8> = setup
-        .page
+        .page()
         .evaluate("window.__ghostframeRecordedFlags || []")
         .await?
         .into_value()?;
@@ -2389,7 +2245,7 @@ async fn e2e_decode_error_thin_uncached() -> Result<()> {
     // handler runs maybe_fire_session_reset → has_seen_prior_session is
     // now true → fire_session_reset runs → because the env-var hook is
     // active, palette_table.delivered is PRESERVED.
-    setup.page.reload().await?;
+    setup.page().reload().await?;
 
     // Wait for session 2 to actually establish before timing-budgeting
     // the natural-flow phase 3. We watch for the SECOND "HELLO received"
@@ -2463,7 +2319,7 @@ async fn e2e_webgpu_fallback_swiftshader() -> Result<()> {
             return { found: false };
         })()
     "#;
-    let scan: serde_json::Value = setup.page.evaluate(scan_js).await?.into_value()?;
+    let scan: serde_json::Value = setup.page().evaluate(scan_js).await?.into_value()?;
     let found = scan.get("found").and_then(|v| v.as_bool()).unwrap_or(false);
     assert!(
         found,
@@ -2487,7 +2343,7 @@ async fn e2e_cdf53_gradient_emission() -> Result<()> {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     let codec_list: Vec<u8> = setup
-        .page
+        .page()
         .evaluate("window.__ghostframeRecordedCodecs || []")
         .await?
         .into_value()?;
@@ -2529,7 +2385,7 @@ async fn e2e_cdf53_mixed_codecs() -> Result<()> {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     let codec_list: Vec<u8> = setup
-        .page
+        .page()
         .evaluate("window.__ghostframeRecordedCodecs || []")
         .await?
         .into_value()?;
@@ -2587,7 +2443,7 @@ async fn e2e_cdf53_lossless_buildup() -> Result<()> {
         return samples;
     })()
     "#;
-    let samples: Vec<serde_json::Value> = setup.page.evaluate(probe_js).await?.into_value()?;
+    let samples: Vec<serde_json::Value> = setup.page().evaluate(probe_js).await?.into_value()?;
 
     let mut mismatches = Vec::new();
     for s in &samples {
@@ -2669,7 +2525,7 @@ async fn e2e_cdf53_bypass_integrate() -> Result<()> {
         "#
     );
     let got_rgba: Vec<u8> = setup
-        .page
+        .page()
         .evaluate(js.as_str())
         .await?
         .into_value::<Vec<i64>>()?
@@ -2760,7 +2616,7 @@ async fn e2e_cdf53_integrate_correctness() -> Result<()> {
         }})()
         "#
     );
-    let result: serde_json::Value = setup.page.evaluate(js.as_str()).await?.into_value()?;
+    let result: serde_json::Value = setup.page().evaluate(js.as_str()).await?.into_value()?;
     let coef_u32: Vec<u32> = result["coefficients"]
         .as_array()
         .unwrap()
@@ -2845,7 +2701,7 @@ async fn e2e_cdf53_live_tile_state_col18() -> Result<()> {
         let cols = 32u32;
         let tile_idx = tile_y * cols + tile_x;
         let js = format!("(async () => await window.__cdf53DumpTileState({tile_idx}))()");
-        let state: serde_json::Value = setup.page.evaluate(js.as_str()).await?.into_value()?;
+        let state: serde_json::Value = setup.page().evaluate(js.as_str()).await?.into_value()?;
         let gpu_tile_gen = state["tileGen"].as_u64().unwrap() as u32;
         let coef_u32: Vec<u32> = state["coefficients"]
             .as_array()
@@ -2947,7 +2803,7 @@ async fn e2e_cdf53_live_tile_state() -> Result<()> {
 
     // Dump GPU state.
     let js = format!("(async () => await window.__cdf53DumpTileState({tile_idx}))()");
-    let state: serde_json::Value = setup.page.evaluate(js.as_str()).await?.into_value()?;
+    let state: serde_json::Value = setup.page().evaluate(js.as_str()).await?.into_value()?;
     let gpu_tile_gen = state["tileGen"].as_u64().unwrap() as u32;
     let coef_u32: Vec<u32> = state["coefficients"]
         .as_array()
@@ -3101,7 +2957,7 @@ async fn e2e_cdf53_tile_watcher() -> Result<()> {
     tokio::time::sleep(Duration::from_secs(15)).await;
 
     let raw: serde_json::Value = setup
-        .page
+        .page()
         .evaluate("window.__cdf53GetTileWatcher()")
         .await?
         .into_value()?;
@@ -3116,7 +2972,7 @@ async fn e2e_cdf53_tile_watcher() -> Result<()> {
     // absent here, the server didn't emit cdf53 at all in this run — so
     // zero uploadBatch entries is downstream of "server didn't send".
     let codecs: Vec<u8> = setup
-        .page
+        .page()
         .evaluate("window.__ghostframeRecordedCodecs || []")
         .await?
         .into_value()?;
@@ -3130,7 +2986,7 @@ async fn e2e_cdf53_tile_watcher() -> Result<()> {
     // 4096 tile events — if (18,5)'s 14 cdf53 emissions are in there, plus
     // any other codecs that hit the same tile, we'll see them here.
     let tile_codecs: serde_json::Value = setup
-        .page
+        .page()
         .evaluate(
             r#"
             (() => {
@@ -3151,7 +3007,7 @@ async fn e2e_cdf53_tile_watcher() -> Result<()> {
     // Dispatch-branch counters: how many cdf53 dispatches passed prevalidate
     // vs failed?
     let dispatch_stats: serde_json::Value = setup
-        .page
+        .page()
         .evaluate(
             r#"({
                 seen: window.__cdf53DispatchSeen ?? 0,
@@ -3167,7 +3023,7 @@ async fn e2e_cdf53_tile_watcher() -> Result<()> {
     // Sanity: is the renderer's cdf53Queue actually receiving pushes? Read its
     // current length and the pipeline's lifetime totals.
     let live_state: serde_json::Value = setup
-        .page
+        .page()
         .evaluate(
             r#"({
                 cdf53QueueLengthNow: window.__ghostframeRenderer
@@ -3180,7 +3036,7 @@ async fn e2e_cdf53_tile_watcher() -> Result<()> {
     let _ = live_state;
     // Probe directly via a hook we add below.
     let probe: serde_json::Value = setup
-        .page
+        .page()
         .evaluate("window.__cdf53Probe ? window.__cdf53Probe() : null")
         .await?
         .into_value()?;
@@ -3364,7 +3220,7 @@ async fn e2e_cdf53_inverse_gradient_tile() -> Result<()> {
         }})()"#
     );
     let got_rgba: Vec<u8> = setup
-        .page
+        .page()
         .evaluate(js.as_str())
         .await?
         .into_value::<Vec<i64>>()?
@@ -3547,7 +3403,7 @@ async fn e2e_progressive_refinement() -> Result<()> {
     let mut snapshot_times: Vec<u64> = Vec::new();
     for _ in 0..4 {
         let elapsed_ms = (tokio::time::Instant::now() - static_start).as_millis() as u64;
-        let png = setup.page.screenshot(
+        let png = setup.page().screenshot(
             chromiumoxide::page::ScreenshotParams::builder()
                 .format(chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat::Png)
                 .build(),

@@ -48,11 +48,22 @@ use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
 use chromiumoxide::page::ScreenshotParams;
 use futures::StreamExt;
 
+/// Display backend the browser attaches to.
+pub enum ChromiumDisplayMode {
+    /// WebGPU mode: real X11 display via Weston/XWayland (Vulkan + WebGPU).
+    Headed {
+        display: String,
+        xdg_runtime_dir: String,
+        enable_webgpu: bool,
+    },
+    /// Headless mode (chromiumoxide's `new_headless_mode()`). No WebGPU.
+    HeadlessNew,
+}
+
 /// Launch parameters for Chromium. Mirrors the args the existing
 /// `scene.rs` uses; lifted here so the trait impl owns them.
 pub struct ChromiumLaunch {
-    pub display: String,
-    pub xdg_runtime_dir: String,
+    pub mode: ChromiumDisplayMode,
     pub spki_b64: String,
     pub user_data_dir: std::path::PathBuf,
 }
@@ -66,22 +77,45 @@ pub struct ChromiumSession {
 
 impl ChromiumSession {
     pub async fn new(cfg: ChromiumLaunch) -> Result<Self> {
-        let builder = BrowserConfig::builder()
+        let base = BrowserConfig::builder()
             .chrome_executable("/usr/bin/chromium")
             .no_sandbox()
-            .user_data_dir(&cfg.user_data_dir)
-            .with_head()
-            .env("DISPLAY", cfg.display)
-            .env("XDG_RUNTIME_DIR", cfg.xdg_runtime_dir)
-            .arg(("enable-features", "Vulkan,WebGPU"))
-            .arg("use-vulkan")
-            .arg("ozone-platform=x11")
-            .arg("enable-unsafe-webgpu")
-            .arg("ignore-gpu-blocklist")
-            .arg((
-                "ignore-certificate-errors-spki-list",
-                cfg.spki_b64.as_str(),
-            ));
+            .user_data_dir(&cfg.user_data_dir);
+
+        let builder = match cfg.mode {
+            ChromiumDisplayMode::Headed {
+                display,
+                xdg_runtime_dir,
+                enable_webgpu,
+            } => {
+                let mut b = base
+                    .with_head()
+                    .env("DISPLAY", display)
+                    .env("XDG_RUNTIME_DIR", xdg_runtime_dir);
+                if enable_webgpu {
+                    // With XWayland's DRI3 backing, Mesa Vulkan presentation works.
+                    // The Wayland ozone platform is incompatible with `--use-vulkan`
+                    // in Chromium 147+, so attach via `--ozone-platform=x11` instead.
+                    b = b
+                        .arg(("enable-features", "Vulkan,WebGPU"))
+                        .arg("use-vulkan")
+                        .arg("ozone-platform=x11")
+                        .arg("enable-unsafe-webgpu")
+                        .arg("ignore-gpu-blocklist");
+                }
+                b.arg((
+                    "ignore-certificate-errors-spki-list",
+                    cfg.spki_b64.as_str(),
+                ))
+            }
+            ChromiumDisplayMode::HeadlessNew => base
+                .new_headless_mode()
+                .arg((
+                    "ignore-certificate-errors-spki-list",
+                    cfg.spki_b64.as_str(),
+                )),
+        };
+
         let (browser, mut handler) = Browser::launch(builder.build().map_err(|e| anyhow!(e))?)
             .await
             .context("chromiumoxide Browser::launch failed")?;
