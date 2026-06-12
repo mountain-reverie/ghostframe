@@ -51,3 +51,16 @@ ci-local:
     @echo "=== go vet + build ==="
     cd ghostbridge && go vet ./... && go build ./...
     @echo "=== ci-local passed ==="
+
+firefox-bin := env_var_or_default('GHOSTFRAME_E2E_FIREFOX_BIN', '/usr/bin/firefox')
+
+# Verify host has what the Firefox e2e path needs.
+e2e-firefox-doctor:
+    @command -v {{firefox-bin}} >/dev/null || { echo "missing: {{firefox-bin}}"; exit 1; }
+    @command -v geckodriver >/dev/null || { echo "missing: geckodriver"; exit 1; }
+    @command -v certutil >/dev/null || { echo "missing: certutil (install nss-tools / nss / libnss3-tools)"; exit 1; }
+    @echo "firefox-e2e prereqs OK"
+
+# Run only the Firefox slice of the e2e suite.
+e2e-firefox: containers-build
+    cargo test --test e2e -- _firefox
