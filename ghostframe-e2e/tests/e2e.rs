@@ -3475,14 +3475,9 @@ async fn e2e_cdf53_server_gpu_vs_cpu_diff() -> Result<()> {
 /// inside a static phase once refinement has reached its terminal state.
 /// Sampling SSIM from that moment captures the steady-state lossless
 /// frame and is robust to cycle alignment.
-#[tokio::test(flavor = "multi_thread")]
-async fn e2e_progressive_refinement() -> Result<()> {
-    let setup = setup_e2e_webgpu_gpu_with_env(
-        "--mode-switch-cycle 12",
-        &[("GHOSTFRAME_ENABLE_CDF53", "1"), ("CAPTURE_FPS", "30")],
-    )
-    .await?;
-
+async fn e2e_progressive_refinement_body<B: helpers::BrowserSession>(
+    browser: &mut B,
+) -> Result<()> {
     // The t-pattern cycles run on container wall-clock (started at container
     // init, several seconds before setup() returns). Rather than try to align
     // a fixed sleep to a known cycle moment, baseline-settle 8 s then poll
@@ -3534,11 +3529,7 @@ async fn e2e_progressive_refinement() -> Result<()> {
     let mut snapshot_times: Vec<u64> = Vec::new();
     for _ in 0..4 {
         let elapsed_ms = (tokio::time::Instant::now() - static_start).as_millis() as u64;
-        let png = setup.page().screenshot(
-            chromiumoxide::page::ScreenshotParams::builder()
-                .format(chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat::Png)
-                .build(),
-        ).await?;
+        let png = browser.screenshot().await?;
         snapshots.push(helpers::decode_screenshot(&png)?);
         snapshot_times.push(elapsed_ms);
         tokio::time::sleep(Duration::from_millis(400)).await;
@@ -3601,6 +3592,28 @@ async fn e2e_progressive_refinement() -> Result<()> {
          routing."
     );
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_progressive_refinement_chromium() -> Result<()> {
+    let mut setup = setup_e2e_webgpu_gpu_with_env(
+        "--mode-switch-cycle 12",
+        &[("GHOSTFRAME_ENABLE_CDF53", "1"), ("CAPTURE_FPS", "30")],
+    )
+    .await?;
+    e2e_progressive_refinement_body(&mut setup.browser).await?;
+    setup.browser.close().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_progressive_refinement_firefox() -> Result<()> {
+    let mut setup = setup_e2e_webgpu_gpu_with_env_firefox(
+        "--mode-switch-cycle 12",
+        &[("GHOSTFRAME_ENABLE_CDF53", "1"), ("CAPTURE_FPS", "30")],
+    )
+    .await?;
+    e2e_progressive_refinement_body(&mut setup.browser).await?;
+    setup.browser.close().await
 }
 
 /// M3.3 acceptance gate: a tile content change during refinement (via the
