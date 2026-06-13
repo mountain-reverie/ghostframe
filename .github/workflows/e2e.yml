@@ -188,18 +188,21 @@ jobs:
 
       - name: Install Firefox + geckodriver + certutil for Firefox e2e path
         run: |
-          sudo apt-get install -y --no-install-recommends firefox-esr libnss3-tools
+          # Ubuntu 24.04 has dropped firefox-esr from its apt repos in favour
+          # of the snap (which doesn't run cleanly in CI). Download Mozilla's
+          # ESR tarball directly — same approach as geckodriver below.
+          sudo apt-get install -y --no-install-recommends libnss3-tools \
+            libdbus-glib-1-2 libxt6 libgtk-3-0 libasound2t64
+          curl -fL -o /tmp/firefox.tar.xz \
+            "https://download.mozilla.org/?product=firefox-esr-latest-ssl&os=linux64&lang=en-US"
+          sudo tar -xJf /tmp/firefox.tar.xz -C /opt/
+          sudo ln -sf /opt/firefox/firefox /usr/bin/firefox
           curl -fL https://github.com/mozilla/geckodriver/releases/download/v0.36.0/geckodriver-v0.36.0-linux64.tar.gz \
             | sudo tar -xz -C /usr/local/bin geckodriver
           # Verify
-          command -v firefox-esr  && firefox-esr --version
+          /usr/bin/firefox --version
           command -v geckodriver  && geckodriver --version
           command -v certutil
-          # FirefoxLaunch::default_firefox_bin() looks for /usr/bin/firefox by
-          # default. firefox-esr puts the binary at /usr/bin/firefox-esr, so
-          # symlink it where the harness expects it.
-          sudo ln -sf "$(command -v firefox-esr)" /usr/bin/firefox
-          /usr/bin/firefox --version
 
       - name: Probe Chromium (version + binary path)
         run: |
