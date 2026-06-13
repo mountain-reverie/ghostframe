@@ -2,13 +2,12 @@ use ghostframe_e2e::harness as helpers;
 use ghostframe_e2e::harness::BrowserSession as _;
 use ghostframe_lib::transport::protocol::Codec;
 
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use chromiumoxide::{Browser, BrowserConfig};
 use futures::StreamExt;
-use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
+use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::{runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt};
 
 /// Fixed host port for headscale.  Using a fixed port lets us construct the
@@ -666,7 +665,10 @@ async fn e2e_solid_color_body<B: helpers::BrowserSession>(browser: &mut B) -> Re
             println!("framebuffer px: {fb_rb}");
         }
     }
-    assert!(found, "no red pixel found on canvas — H.264 pipeline failed");
+    assert!(
+        found,
+        "no red pixel found on canvas — H.264 pipeline failed"
+    );
     Ok(())
 }
 
@@ -774,11 +776,14 @@ async fn e2e_h264_ssim_golden() -> Result<()> {
     // Allow time for: page load, WebGPU init, H.264 codec startup, and
     // the first few key frames to settle.
     tokio::time::sleep(Duration::from_secs(5)).await;
-    let png = setup.page().screenshot(
-        chromiumoxide::page::ScreenshotParams::builder()
-            .format(chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat::Png)
-            .build(),
-    ).await?;
+    let png = setup
+        .page()
+        .screenshot(
+            chromiumoxide::page::ScreenshotParams::builder()
+                .format(chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat::Png)
+                .build(),
+        )
+        .await?;
     let captured = helpers::decode_screenshot(&png)?;
     let golden_path = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -968,7 +973,11 @@ async fn e2e_solid_per_tile_pixels() -> Result<()> {
 
     for s in samples(width, height) {
         let probe_js = format!("window.__readPixel({}, {})", s.x, s.y);
-        let got: Vec<u8> = setup.page().evaluate(probe_js.as_str()).await?.into_value()?;
+        let got: Vec<u8> = setup
+            .page()
+            .evaluate(probe_js.as_str())
+            .await?
+            .into_value()?;
         assert_eq!(
             got,
             s.expected_rgba.to_vec(),
@@ -1529,8 +1538,11 @@ async fn e2e_text_clarity() -> Result<()> {
             bx = pair.bg.0,
             by = pair.bg.1,
         );
-        let probe: serde_json::Value =
-            setup.page().evaluate(probe_js.as_str()).await?.into_value()?;
+        let probe: serde_json::Value = setup
+            .page()
+            .evaluate(probe_js.as_str())
+            .await?
+            .into_value()?;
 
         let ink_lum = luminance(&probe["ink"]);
         let bg_lum = luminance(&probe["bg"]);
@@ -1962,7 +1974,12 @@ async fn e2e_multi_pattern() -> Result<()> {
 
     assert_region_rendered(setup.page(), region("solid"), RegionCheck::SolidRed).await?;
     assert_region_rendered(setup.page(), region("text"), RegionCheck::Legible).await?;
-    assert_region_rendered(setup.page(), region("gradient"), RegionCheck::SmoothGradient).await?;
+    assert_region_rendered(
+        setup.page(),
+        region("gradient"),
+        RegionCheck::SmoothGradient,
+    )
+    .await?;
     assert_region_rendered(setup.page(), region("spinner"), RegionCheck::Changing).await?;
 
     // TODO(M3): once the classifier ships, also assert that each region's

@@ -24,10 +24,7 @@ pub trait BrowserSession: Send {
     /// `T`. Use `T = serde_json::Value` for ad-hoc shapes; `T = ()` for
     /// fire-and-forget. The script should be a single expression or an
     /// IIFE that returns a JSON-serialisable value.
-    async fn evaluate<T: DeserializeOwned + Send + 'static>(
-        &mut self,
-        script: &str,
-    ) -> Result<T>;
+    async fn evaluate<T: DeserializeOwned + Send + 'static>(&mut self, script: &str) -> Result<T>;
 
     /// PNG bytes of the current page's viewport. Both backends return
     /// PNG (not JPEG) so SSIM thresholds in `pixels.rs` stay comparable.
@@ -103,17 +100,11 @@ impl ChromiumSession {
                         .arg("enable-unsafe-webgpu")
                         .arg("ignore-gpu-blocklist");
                 }
-                b.arg((
-                    "ignore-certificate-errors-spki-list",
-                    cfg.spki_b64.as_str(),
-                ))
+                b.arg(("ignore-certificate-errors-spki-list", cfg.spki_b64.as_str()))
             }
             ChromiumDisplayMode::HeadlessNew => base
                 .new_headless_mode()
-                .arg((
-                    "ignore-certificate-errors-spki-list",
-                    cfg.spki_b64.as_str(),
-                )),
+                .arg(("ignore-certificate-errors-spki-list", cfg.spki_b64.as_str())),
         };
 
         let (browser, mut handler) = Browser::launch(builder.build().map_err(|e| anyhow!(e))?)
@@ -154,17 +145,20 @@ impl BrowserSession for ChromiumSession {
         Ok(())
     }
 
-    async fn evaluate<T: DeserializeOwned + Send + 'static>(
-        &mut self,
-        script: &str,
-    ) -> Result<T> {
-        let page = self.page.as_ref().ok_or_else(|| anyhow!("no active page"))?;
+    async fn evaluate<T: DeserializeOwned + Send + 'static>(&mut self, script: &str) -> Result<T> {
+        let page = self
+            .page
+            .as_ref()
+            .ok_or_else(|| anyhow!("no active page"))?;
         let v = page.evaluate(script).await.context("evaluate")?;
         v.into_value::<T>().context("deserialize evaluate result")
     }
 
     async fn screenshot(&mut self) -> Result<Vec<u8>> {
-        let page = self.page.as_ref().ok_or_else(|| anyhow!("no active page"))?;
+        let page = self
+            .page
+            .as_ref()
+            .ok_or_else(|| anyhow!("no active page"))?;
         let params = ScreenshotParams::builder()
             .format(CaptureScreenshotFormat::Png)
             .build();
@@ -230,8 +224,7 @@ user_pref("network.webtransport.enabled", true);
 user_pref("dom.security.https_only_mode", false);
 user_pref("marionette.port", 0);
 "#;
-        std::fs::write(dir.path().join("user.js"), user_js)
-            .context("write user.js")?;
+        std::fs::write(dir.path().join("user.js"), user_js).context("write user.js")?;
         Ok(dir)
     }
 
@@ -241,10 +234,7 @@ user_pref("marionette.port", 0);
     /// Hard-fails if `certutil` isn't on PATH — silently skipped tests are
     /// the failure mode this whole iteration cycle just experienced.
     /// Empty `cert_pem` is treated as a no-op (smoke-test path, Task 8).
-    pub(crate) fn install_cert(
-        profile_dir: &std::path::Path,
-        cert_pem: &str,
-    ) -> Result<()> {
+    pub(crate) fn install_cert(profile_dir: &std::path::Path, cert_pem: &str) -> Result<()> {
         if cert_pem.is_empty() {
             return Ok(());
         }
@@ -259,10 +249,14 @@ user_pref("marionette.port", 0);
         std::fs::write(&cert_path, cert_pem).context("write import.pem")?;
         let out = std::process::Command::new("certutil")
             .arg("-A")
-            .arg("-n").arg("ghostframe-e2e")
-            .arg("-t").arg("C,,")
-            .arg("-i").arg(&cert_path)
-            .arg("-d").arg(format!("sql:{}", profile_dir.display()))
+            .arg("-n")
+            .arg("ghostframe-e2e")
+            .arg("-t")
+            .arg("C,,")
+            .arg("-i")
+            .arg(&cert_path)
+            .arg("-d")
+            .arg(format!("sql:{}", profile_dir.display()))
             .output()
             .context("spawn certutil")?;
         if !out.status.success() {
@@ -282,8 +276,7 @@ user_pref("marionette.port", 0);
     /// acceptable for e2e — kernel won't recycle in that window under
     /// normal load.
     pub(crate) fn pick_free_port() -> Result<u16> {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")
-            .context("bind 127.0.0.1:0")?;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").context("bind 127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
         drop(listener);
         Ok(port)
@@ -310,8 +303,10 @@ user_pref("marionette.port", 0);
             ));
         }
         let child = tokio::process::Command::new("geckodriver")
-            .arg("--port").arg(port.to_string())
-            .arg("--binary").arg(firefox_bin)
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--binary")
+            .arg(firefox_bin)
             .env("DISPLAY", display)
             .env("XDG_RUNTIME_DIR", xdg_runtime_dir)
             .stdout(std::process::Stdio::inherit())
@@ -356,12 +351,8 @@ user_pref("marionette.port", 0);
         let profile_dir = Self::build_profile()?;
         Self::install_cert(profile_dir.path(), &cfg.cert_pem)?;
         let port = Self::pick_free_port()?;
-        let mut child = Self::spawn_geckodriver(
-            port,
-            &cfg.firefox_bin,
-            &cfg.display,
-            &cfg.xdg_runtime_dir,
-        )?;
+        let mut child =
+            Self::spawn_geckodriver(port, &cfg.firefox_bin, &cfg.display, &cfg.xdg_runtime_dir)?;
         if let Err(e) = Self::wait_for_geckodriver(port, std::time::Duration::from_secs(10)).await {
             // best-effort kill so a half-up geckodriver doesn't leak past the failure
             let _ = child.kill().await;
@@ -378,7 +369,12 @@ user_pref("marionette.port", 0);
             .as_object()
             .ok_or_else(|| anyhow!("FirefoxSession::new: capabilities JSON is not an object"))?
             .clone();
-        let client = fantoccini::ClientBuilder::native()
+        // rustls() (not native()) — fantoccini's native-tls feature pulls
+        // openssl-sys into the workspace and breaks the test-server Docker
+        // build whose base image has no libssl-dev. The rustls builder is
+        // gated on the rustls-tls feature in this crate's Cargo.toml.
+        let client = fantoccini::ClientBuilder::rustls()
+            .context("fantoccini rustls connector init")?
             .capabilities(cap_map)
             .connect(&format!("http://127.0.0.1:{port}"))
             .await
@@ -398,10 +394,7 @@ impl BrowserSession for FirefoxSession {
         Ok(())
     }
 
-    async fn evaluate<T: DeserializeOwned + Send + 'static>(
-        &mut self,
-        script: &str,
-    ) -> Result<T> {
+    async fn evaluate<T: DeserializeOwned + Send + 'static>(&mut self, script: &str) -> Result<T> {
         // WebDriver's execute_script requires an explicit `return`. The
         // chromiumoxide impl accepts expressions and IIFEs directly. To
         // stay compatible with the existing test scripts (most of which
@@ -417,7 +410,10 @@ impl BrowserSession for FirefoxSession {
     }
 
     async fn screenshot(&mut self) -> Result<Vec<u8>> {
-        self.client.screenshot().await.context("fantoccini screenshot")
+        self.client
+            .screenshot()
+            .await
+            .context("fantoccini screenshot")
     }
 
     async fn close(self) -> Result<()> {

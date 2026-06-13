@@ -32,6 +32,9 @@ async fn firefox_session_smoke() {
         .expect("evaluate");
     assert_eq!(h1, "hi");
     let png = s.screenshot().await.expect("screenshot");
-    assert!(png.len() > 100, "screenshot returned suspiciously few bytes");
+    assert!(
+        png.len() > 100,
+        "screenshot returned suspiciously few bytes"
+    );
     s.close().await.expect("close");
 }
