@@ -151,9 +151,18 @@ pub async fn setup_e2e_server(spec: E2eServerSpec<'_>) -> Result<E2eServerSetup>
 }
 
 /// Poll `document.getElementById('status').textContent` until it contains
-/// "Connected" or "Receiving frames", or `timeout` elapses. Generic over any
+/// "Receiving frames", or `timeout` elapses. Generic over any
 /// `BrowserSession` impl so Chromium and Firefox tests share the readiness
 /// gate.
+///
+/// IMPORTANT: this is the STRICT criterion the inline loop in
+/// `setup_e2e_inner_with_url_extra` had on master. The page sets status to
+/// "Connected!" as soon as the WebTransport CONNECT succeeds, *before* the
+/// first datagram arrives — returning on "Connected" would let tests
+/// proceed before any frame is actually rendered (every red-pixel scan would
+/// then read a default 300x150 canvas and fail). scene.rs's bench loop
+/// accepts both because under harsh shaping the first frame may take
+/// >30 s; the bench is a different consumer with its own inline wait.
 pub async fn wait_for_frames<B: crate::harness::browser::BrowserSession>(
     browser: &mut B,
     timeout: Duration,
@@ -166,7 +175,7 @@ pub async fn wait_for_frames<B: crate::harness::browser::BrowserSession>(
             )
             .await
             .unwrap_or_default();
-        if status.contains("Connected") || status.contains("Receiving frames") {
+        if status.contains("Receiving frames") {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
