@@ -40,12 +40,14 @@ tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
 libc = { workspace = true }
+# Reached from FirefoxSession::new to install the rustls 0.23 crypto provider
+# (ring) before fantoccini's hyper-rustls runs its first TLS handshake.
+rustls = { workspace = true }
 
 [dev-dependencies]
 # Used by tests/e2e.rs test code only (not by the harness library).
 ghostframe-test-pattern = { path = "../ghostframe-test-pattern" }
 # Only used by tests/loopback_h3.rs (sans-IO QUIC/H3 test).
 quinn-proto = { workspace = true }
-rustls = { workspace = true }
 url = "2"
 web-transport-proto = { workspace = true }

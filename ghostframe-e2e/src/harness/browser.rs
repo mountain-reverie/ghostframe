@@ -344,10 +344,27 @@ user_pref("marionette.port", 0);
         }
     }
 
+    /// Install the rustls default crypto provider exactly once per process.
+    /// fantoccini's `rustls-tls` feature pulls `hyper-rustls`, which is built
+    /// against `rustls 0.23` — that version requires an explicit
+    /// `CryptoProvider` to be registered before any TLS handshake. Without
+    /// this the first FirefoxSession::new panics with
+    /// "Could not automatically determine the process-level CryptoProvider".
+    fn install_rustls_provider_once() {
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            // Ignore the Err — if a provider was already installed (e.g. by
+            // a peer crate in the workspace) we just keep that one.
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+    }
+
     /// Construct a `FirefoxSession`: build a profile, install the TLS cert,
     /// pick a free port, spawn geckodriver, wait for it to be ready, then
     /// connect fantoccini.
     pub async fn new(cfg: FirefoxLaunch) -> Result<Self> {
+        Self::install_rustls_provider_once();
         let profile_dir = Self::build_profile()?;
         Self::install_cert(profile_dir.path(), &cfg.cert_pem)?;
         let port = Self::pick_free_port()?;
