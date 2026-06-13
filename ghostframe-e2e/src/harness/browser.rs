@@ -412,18 +412,36 @@ impl BrowserSession for FirefoxSession {
     }
 
     async fn evaluate<T: DeserializeOwned + Send + 'static>(&mut self, script: &str) -> Result<T> {
-        // WebDriver's execute_script requires an explicit `return`. The
-        // chromiumoxide impl accepts expressions and IIFEs directly. To
-        // stay compatible with the existing test scripts (most of which
-        // are IIFEs evaluating to a value), wrap the script in a shim
-        // that awaits the expression and returns it.
-        let wrapped = format!("return (async () => ({script}))();");
+        // Use Execute Async Script (W3C WebDriver §17.4) — `executeScript`
+        // does NOT await returned Promises before serializing (unlike CDP's
+        // Page.evaluate), so wrapping a returning-Promise IIFE in a sync
+        // executeScript yields a `{}` Promise object that marionette can't
+        // decode ("Failed to decode response from marionette"). Every
+        // ghostframe e2e script is either an IIFE returning a value, an
+        // async IIFE returning a Promise, or a synchronous expression.
+        // `Promise.resolve(...).then(cb, err)` covers all three: the sync
+        // case wraps the value in a resolved Promise and the async case
+        // chains the existing Promise. Errors get sent back with an
+        // `__err` marker so deserialization sees a structured failure
+        // instead of timing out.
+        let wrapped = format!(
+            "const __cb = arguments[arguments.length - 1];\n\
+             (async () => {{\n\
+                 try {{ return await ({script}); }}\n\
+                 catch (e) {{ return {{ __err: String(e && e.stack || e) }}; }}\n\
+             }})().then(__cb);"
+        );
         let v = self
             .client
-            .execute(&wrapped, vec![])
+            .execute_async(&wrapped, vec![])
             .await
-            .context("fantoccini execute_script")?;
-        serde_json::from_value(v).context("deserialize execute_script result")
+            .context("fantoccini execute_async")?;
+        if let Some(obj) = v.as_object() {
+            if let Some(err) = obj.get("__err").and_then(|x| x.as_str()) {
+                return Err(anyhow!("script threw: {err}"));
+            }
+        }
+        serde_json::from_value(v).context("deserialize execute_async result")
     }
 
     async fn screenshot(&mut self) -> Result<Vec<u8>> {
