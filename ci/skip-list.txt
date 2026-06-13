@@ -60,3 +60,24 @@ e2e_text_clarity
 e2e_h264_motion
 e2e_h264_ssim_golden
 e2e_multi_pattern
+
+# --- Category 3: Firefox software-WebGPU mapAsync too slow on 2-vCPU runners
+# Firefox tests whose bodies repeatedly call `await window.__readPixel(x, y)`
+# in pixel-scan loops. Each call does a `GPUBuffer.mapAsync()` staging
+# readback; on Firefox Nightly's software WebGPU backend (no real GPU on
+# GitHub-hosted runners) each readback costs ~100 ms — easily exceeding
+# marionette's script timeout for the 15×20 = 300-iteration scans, and
+# leaving the page stuck at status="Connected" because the SolidPipeline /
+# tile-renderer never produces a frame quickly enough to flip
+# `firstTileRendered`.
+#
+# The corresponding `_chromium` variants pass — Chrome's `--use-vulkan`
+# (even on llvmpipe fallback) is materially faster than Firefox's WebGPU
+# CPU backend at the staging-readback path.
+#
+# These will unblock once either: (a) CI gains GPU passthrough for the
+# Firefox-host process; (b) Firefox's software WebGPU mapAsync becomes
+# competitive; or (c) we wire `__readPixelRect` into these test bodies to
+# replace per-pixel readbacks with one staging-buffer copy per scan.
+e2e_solid_color_firefox
+e2e_edge_tiles_firefox
