@@ -188,14 +188,20 @@ jobs:
 
       - name: Install Firefox + geckodriver + certutil for Firefox e2e path
         run: |
-          # Ubuntu 24.04 has dropped firefox-esr from its apt repos in favour
-          # of the snap (which doesn't run cleanly in CI). Download Mozilla's
-          # ESR tarball directly — same approach as geckodriver below.
+          # Firefox Nightly (NOT ESR). ESR is currently on 128 — WebGPU
+          # shipped in 141 and is hard-gated off in older builds with
+          # "WebGPU is not yet available in Release or late Beta builds.",
+          # which would make every Firefox-side e2e test fail at the
+          # WebGPU init step. Stable also lags Nightly on some Linux
+          # WebGPU prefs. Nightly is regenerated daily; the e2e suite
+          # is rebuilt on every PR anyway, so we trade tarball freshness
+          # for capability availability.
           sudo apt-get install -y --no-install-recommends libnss3-tools \
             libdbus-glib-1-2 libxt6 libgtk-3-0 libasound2t64
           curl -fL -o /tmp/firefox.tar.xz \
-            "https://download.mozilla.org/?product=firefox-esr-latest-ssl&os=linux64&lang=en-US"
+            "https://download.mozilla.org/?product=firefox-nightly-latest-ssl&os=linux64&lang=en-US"
           sudo tar -xJf /tmp/firefox.tar.xz -C /opt/
+          # Nightly tarball extracts to /opt/firefox/ (same dir name).
           sudo ln -sf /opt/firefox/firefox /usr/bin/firefox
           curl -fL https://github.com/mozilla/geckodriver/releases/download/v0.36.0/geckodriver-v0.36.0-linux64.tar.gz \
             | sudo tar -xz -C /usr/local/bin geckodriver
