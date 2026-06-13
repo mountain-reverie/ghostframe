@@ -607,31 +607,23 @@ impl IoBridge {
         }
     }
 
-    /// Compute the maximum datagram size from the smallest connected session.
+    /// Refresh the `connected_session_count` atomic the capture loop polls
+    /// to decide whether to scrape a frame. Counts only WT sessions whose H3
+    /// handshake has completed (`wt.is_connected()`). Emits a single
+    /// info-level log on each idle↔active transition.
     ///
-    /// Side effect: refreshes `connected_session_count` (the atomic the capture
-    /// loop polls to decide whether to even scrape a frame) and emits a single
-    /// info-level log on each idle↔active transition. Without that gate the
-    /// per-frame "no connected sessions" line would fire 30×/sec and bury the
-    /// rest of the journal at the default debug filter.
-    fn compute_max_datagram_size(&mut self) -> Option<usize> {
-        let mut min_size: Option<usize> = None;
-        let mut connected = 0usize;
-        for (handle, wt) in &self.wt_sessions {
-            if !wt.is_connected() {
-                continue;
-            }
-            connected += 1;
-            if let Some(conn) = self.server.connections.get_mut(handle) {
-                if let Some(sz) = conn.datagrams().max_size() {
-                    let usable = sz.saturating_sub(Self::WT_VARINT_OVERHEAD);
-                    min_size = Some(match min_size {
-                        Some(prev) => prev.min(usable),
-                        None => usable,
-                    });
-                }
-            }
-        }
+    /// Called from `compute_max_datagram_size` (so the count is fresh every
+    /// frame submission) AND from the run-loop's event drain (so a freshly
+    /// established session unblocks xdaemon's gate even before the first
+    /// frame is submitted — without this hook, no frame ever flows because
+    /// the gate stays at 0 until a frame submission updates it, which can't
+    /// happen until the gate opens. Classic bootstrap deadlock).
+    fn refresh_connected_session_count(&mut self) {
+        let connected = self
+            .wt_sessions
+            .values()
+            .filter(|wt| wt.is_connected())
+            .count();
         self.connected_session_count
             .store(connected, Ordering::Relaxed);
         let now_idle = connected == 0;
@@ -644,6 +636,29 @@ impl IoBridge {
                 tracing::info!(connected, "client connected; resuming frame delivery");
             }
             self.was_idle = now_idle;
+        }
+    }
+
+    /// Compute the maximum datagram size from the smallest connected session.
+    ///
+    /// Side effect: calls `refresh_connected_session_count` so the capture
+    /// gate's atomic stays current per frame.
+    fn compute_max_datagram_size(&mut self) -> Option<usize> {
+        self.refresh_connected_session_count();
+        let mut min_size: Option<usize> = None;
+        for (handle, wt) in &self.wt_sessions {
+            if !wt.is_connected() {
+                continue;
+            }
+            if let Some(conn) = self.server.connections.get_mut(handle) {
+                if let Some(sz) = conn.datagrams().max_size() {
+                    let usable = sz.saturating_sub(Self::WT_VARINT_OVERHEAD);
+                    min_size = Some(match min_size {
+                        Some(prev) => prev.min(usable),
+                        None => usable,
+                    });
+                }
+            }
         }
         min_size.filter(|&sz| sz > 0)
     }
@@ -2516,6 +2531,13 @@ impl IoBridge {
         for data in &feedback_data {
             self.dispatch_feedback_bytes(data);
         }
+
+        // Bootstrap-deadlock guard: refresh the connected-session count so a
+        // freshly established WT session unblocks xdaemon's capture gate
+        // BEFORE any frame submission (without this, the gate would stay at
+        // 0 until a frame triggered `compute_max_datagram_size`, which can't
+        // happen because the gate suppresses frames).
+        self.refresh_connected_session_count();
     }
 
     /// Phase A: serially walk the GPU's compact list, map each tile's
