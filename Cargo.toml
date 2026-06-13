@@ -13,16 +13,16 @@ members = [
 quinn-proto = { version = "=0.11.14", default-features = false, features = ["rustls"] }
 
 # rustls 0.23.38 — latest stable 0.23.x; requires explicit feature for ring or aws-lc-rs
-rustls = { version = "=0.23.38", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "=0.23.40", default-features = false, features = ["ring", "std", "tls12"] }
 
 # rcgen 0.14.7 — latest; NOTE: field renamed key_pair -> signing_key in 0.14.x
-rcgen = { version = "=0.14.7", default-features = false, features = ["crypto", "ring"] }
+rcgen = { version = "=0.14.8", default-features = false, features = ["crypto", "ring"] }
 
 # web-transport-proto 0.6.0 — latest; provides Settings/ConnectRequest/ConnectResponse
 web-transport-proto = { version = "=0.6.0" }
 
 # tokio 1.52.0 — latest stable 1.x as of 2026-04-15
-tokio = { version = "=1.52.0", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "process"] }
+tokio = { version = "=1.52.3", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "process"] }
 
 # bytes 1.11.1 — latest stable 1.x
 bytes = { version = "=1.11.1" }
@@ -37,10 +37,10 @@ tracing = { version = "=0.1.44" }
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "fmt", "json"] }
 
 # libc 0.2.185 — latest stable 0.2.x
-libc = { version = "=0.2.185" }
+libc = { version = "=0.2.186" }
 
 # cbindgen 0.29.2 — latest stable 0.x
-cbindgen = { version = "=0.29.2" }
+cbindgen = { version = "=0.29.4" }
 
 # sha2 0.10.9 — pinned to 0.10.x to avoid duplicate-version conflicts with
 # other RustCrypto crates in the rustls/quinn tree (0.11.x is a major bump).
