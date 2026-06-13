@@ -641,10 +641,7 @@ impl IoBridge {
                     "all clients disconnected; capture loop will sleep until a client returns"
                 );
             } else {
-                tracing::info!(
-                    connected,
-                    "client connected; resuming frame delivery"
-                );
+                tracing::info!(connected, "client connected; resuming frame delivery");
             }
             self.was_idle = now_idle;
         }
@@ -2484,11 +2481,10 @@ impl IoBridge {
                     // pinning), and ALPN confirms h3 negotiation.
                     if let Some(conn) = self.server.connections.get(&handle) {
                         if let Some(hd) = conn.crypto_session().handshake_data() {
-                            if let Ok(hd) = hd.downcast::<
-                                quinn_proto::crypto::rustls::HandshakeData,
-                            >() {
-                                let sni =
-                                    hd.server_name.as_deref().unwrap_or("(none)");
+                            if let Ok(hd) =
+                                hd.downcast::<quinn_proto::crypto::rustls::HandshakeData>()
+                            {
+                                let sni = hd.server_name.as_deref().unwrap_or("(none)");
                                 let alpn = hd
                                     .protocol
                                     .as_deref()

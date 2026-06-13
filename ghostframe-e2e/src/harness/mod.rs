@@ -21,10 +21,10 @@ pub mod weston;
 // Flat re-exports so callers can `use ghostframe_e2e::harness::*;` and
 // get the legacy `tests/e2e/helpers.rs` flat API.
 pub use browser::{BrowserSession, ChromiumSession, FirefoxLaunch, FirefoxSession};
-pub use e2e_setup::{setup_e2e_server, wait_for_frames, E2eServerSetup, E2eServerSpec};
-pub use pixels::{assert_ssim_against_golden, decode_screenshot};
 pub use cleanup::{cleanup_stale_xvfb_sockets, read_server_logs_stripped};
 pub use containers::{create_preauth_key, docker_run_in_container, TestNode, NETWORK_NAME};
+pub use e2e_setup::{setup_e2e_server, wait_for_frames, E2eServerSetup, E2eServerSpec};
+pub use pixels::{assert_ssim_against_golden, decode_screenshot};
 pub use scene::{
     run_scene, ClientDiagnosticRecord, CodecHistogram, FrameMode, ProcSample, SceneResult,
     SceneSpec, ServerTelemetryRecord,
