@@ -396,6 +396,23 @@ user_pref("marionette.port", 0);
             .connect(&format!("http://127.0.0.1:{port}"))
             .await
             .context("fantoccini connect to geckodriver")?;
+
+        // Bump the script timeout from marionette's 30 s default. The
+        // pixel-scan tests (e2e_solid_color_body, e2e_edge_tiles_body) loop
+        // `await window.__readPixel(x, y)` 300+ times, and each
+        // GPU-staging-buffer mapAsync on Firefox Nightly's software WebGPU
+        // takes ~100 ms in CI — easily exceeding 30 s. When marionette
+        // times out, geckodriver surfaces it as "Failed to decode response
+        // from marionette" rather than a clean timeout error, which is
+        // both opaque and easy to misdiagnose.
+        let _ = client
+            .update_timeouts(fantoccini::wd::TimeoutConfiguration::new(
+                Some(std::time::Duration::from_secs(120)), // script
+                Some(std::time::Duration::from_secs(60)),  // page_load
+                Some(std::time::Duration::from_secs(0)),   // implicit
+            ))
+            .await;
+
         Ok(Self {
             _profile_dir: profile_dir,
             _geckodriver: child,
