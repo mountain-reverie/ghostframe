@@ -33,6 +33,7 @@ impl XTestInjector {
     /// present. Errors if no DISPLAY or XTEST is missing — the caller
     /// (xdaemon's main) logs and continues with no injector.
     pub fn new() -> Result<Self> {
+        let display_env = std::env::var("DISPLAY").unwrap_or_else(|_| "<unset>".to_string());
         let (conn, screen_num) =
             x11rb::connect(None).map_err(|e| anyhow!("x11rb::connect: {e}"))?;
         let root = conn.setup().roots[screen_num].root;
@@ -46,6 +47,13 @@ impl XTestInjector {
         if !ext.present {
             return Err(anyhow!("XTEST extension not present on this Xorg build"));
         }
+
+        tracing::info!(
+            display = %display_env,
+            screen = screen_num,
+            root = root,
+            "XTestInjector connected"
+        );
 
         Ok(Self {
             conn,
@@ -98,20 +106,43 @@ impl XTestInjector {
     }
 }
 
-impl InputInjector for XTestInjector {
-    fn pointer_move(&self, x: i16, y: i16) {
-        if let Ok(cookie) = self.conn.xtest_fake_input(
-            x11rb::protocol::xproto::MOTION_NOTIFY_EVENT,
-            0,
+impl XTestInjector {
+    /// Fire one `xtest_fake_input` request and flush. Logs any X11 error
+    /// at warn level — silent swallowing made input bugs invisible.
+    fn fake_input(&self, kind: &'static str, event: u8, detail: u8, x: i16, y: i16) {
+        match self.conn.xtest_fake_input(
+            event,
+            detail,
             x11rb::CURRENT_TIME,
             self.root,
             x,
             y,
             0,
         ) {
-            let _ = cookie.check();
-            let _ = self.conn.flush();
+            Ok(cookie) => {
+                if let Err(e) = cookie.check() {
+                    tracing::warn!(kind, event, detail, error = %e, "xtest_fake_input X11 error");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(kind, event, detail, error = %e, "xtest_fake_input send failed");
+            }
         }
+        if let Err(e) = self.conn.flush() {
+            tracing::warn!(kind, error = %e, "x11 flush failed");
+        }
+    }
+}
+
+impl InputInjector for XTestInjector {
+    fn pointer_move(&self, x: i16, y: i16) {
+        self.fake_input(
+            "pointer_move",
+            x11rb::protocol::xproto::MOTION_NOTIFY_EVENT,
+            0,
+            x,
+            y,
+        );
     }
 
     fn pointer_button(&self, x: i16, y: i16, button: u8, down: bool) {
@@ -123,18 +154,7 @@ impl InputInjector for XTestInjector {
         } else {
             x11rb::protocol::xproto::BUTTON_RELEASE_EVENT
         };
-        if let Ok(cookie) = self.conn.xtest_fake_input(
-            event,
-            button,
-            x11rb::CURRENT_TIME,
-            self.root,
-            x,
-            y,
-            0,
-        ) {
-            let _ = cookie.check();
-            let _ = self.conn.flush();
-        }
+        self.fake_input("pointer_button", event, button, x, y);
     }
 
     fn wheel(&self, dx: i16, dy: i16) {
@@ -142,26 +162,21 @@ impl InputInjector for XTestInjector {
         // one press+release pair per tick.
         let click_pair = |button: u8, count: u16| {
             for _ in 0..count {
-                let _ = self.conn.xtest_fake_input(
+                self.fake_input(
+                    "wheel_press",
                     x11rb::protocol::xproto::BUTTON_PRESS_EVENT,
                     button,
-                    x11rb::CURRENT_TIME,
-                    self.root,
-                    0,
                     0,
                     0,
                 );
-                let _ = self.conn.xtest_fake_input(
+                self.fake_input(
+                    "wheel_release",
                     x11rb::protocol::xproto::BUTTON_RELEASE_EVENT,
                     button,
-                    x11rb::CURRENT_TIME,
-                    self.root,
-                    0,
                     0,
                     0,
                 );
             }
-            let _ = self.conn.flush();
         };
         if dy < 0 {
             click_pair(4, dy.unsigned_abs());
@@ -188,17 +203,6 @@ impl InputInjector for XTestInjector {
         } else {
             x11rb::protocol::xproto::KEY_RELEASE_EVENT
         };
-        if let Ok(cookie) = self.conn.xtest_fake_input(
-            event,
-            keycode,
-            x11rb::CURRENT_TIME,
-            self.root,
-            0,
-            0,
-            0,
-        ) {
-            let _ = cookie.check();
-            let _ = self.conn.flush();
-        }
+        self.fake_input("key", event, keycode, 0, 0);
     }
 }
