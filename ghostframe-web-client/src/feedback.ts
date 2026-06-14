@@ -61,7 +61,13 @@ export class LossTracker {
 // Wire format (2 bytes):
 //   [0]  msg_type = 0x03
 //   [1]  capabilities : u8   bit 0 = supports indices_raw
-//                            bits 1..7 reserved
+//                            bit 1 = supports H.264 render path (set when the
+//                                    client's WebGPU implementation exposes
+//                                    the texture_external WGSL capability;
+//                                    Firefox WebGPU sends this bit CLEAR so
+//                                    the server stays in TileCodec mode and
+//                                    never emits unplayable H.264 frames)
+//                            bits 2..7 reserved (must be 0)
 // ---------------------------------------------------------------------------
 
 export const HELLO_MSG_TYPE = 0x03;
@@ -69,11 +75,13 @@ export const HELLO_SIZE = 2;
 
 export interface ClientCapabilities {
   indicesRawEnabled: boolean;
+  supportsH264: boolean;
 }
 
 export function encodeHello(caps: ClientCapabilities): Uint8Array {
   let capsByte = 0;
   if (caps.indicesRawEnabled) capsByte |= 0x01;
+  if (caps.supportsH264) capsByte |= 0x02;
   return new Uint8Array([HELLO_MSG_TYPE, capsByte]);
 }
 

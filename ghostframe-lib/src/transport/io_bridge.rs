@@ -2831,8 +2831,18 @@ impl IoBridge {
     /// Update capabilities from a parsed HELLO message.
     pub(crate) fn apply_hello(&mut self, msg: crate::transport::client_caps::HelloMsg) {
         self.client_caps = msg.caps;
+        // Mirror the H.264 capability into the adaptation context so the
+        // classifier's hard override sees it on the very next decision —
+        // without this push, the classifier would still think the client
+        // supports H.264 until the next path-stats / feedback ingest.
+        self.adaptation_context.supports_h264 = msg.caps.supports_h264;
+        self.adaptation_context.last_update_seq =
+            self.adaptation_context.last_update_seq.wrapping_add(1);
+        self.classifier
+            .set_adaptation_context(self.adaptation_context);
         tracing::info!(
             indices_raw = msg.caps.indices_raw_enabled,
+            supports_h264 = msg.caps.supports_h264,
             "HELLO received, client capabilities updated"
         );
     }
@@ -2981,10 +2991,40 @@ mod tests {
         let msg = HelloMsg {
             caps: ClientCapabilities {
                 indices_raw_enabled: true,
+                supports_h264: false,
             },
         };
         bridge.apply_hello(msg);
         assert!(bridge.current_client_caps().indices_raw_enabled);
+    }
+
+    #[tokio::test]
+    async fn apply_hello_propagates_h264_capability_to_classifier() {
+        // Bit 1 of the HELLO byte must flow through to the classifier's
+        // AdaptationContext so the next decide_frame_mode() can see it.
+        // This is what keeps a Firefox client from getting a stale
+        // (h264-allowed) classifier state between session-open and the
+        // arrival of its HELLO.
+        use crate::transport::client_caps::{ClientCapabilities, HelloMsg};
+        let mut bridge = make_bridge_for_test().await;
+
+        bridge.apply_hello(HelloMsg {
+            caps: ClientCapabilities {
+                indices_raw_enabled: false,
+                supports_h264: false,
+            },
+        });
+        assert!(!bridge.current_client_caps().supports_h264);
+        assert!(!bridge.classifier.adaptation_context().supports_h264);
+
+        bridge.apply_hello(HelloMsg {
+            caps: ClientCapabilities {
+                indices_raw_enabled: false,
+                supports_h264: true,
+            },
+        });
+        assert!(bridge.current_client_caps().supports_h264);
+        assert!(bridge.classifier.adaptation_context().supports_h264);
     }
 
     /// Verify that `IoBridge::run` returns `Ok(())` when the peer end of the
@@ -4030,6 +4070,7 @@ mod tests {
         };
         let caps = crate::transport::client_caps::ClientCapabilities {
             indices_raw_enabled: true,
+            supports_h264: false,
         };
         let map = IoBridge::phase_b_encode_payloads_with_caps(&[prep], &caps, None);
         let payload = &map[&(0, 0)];
@@ -4053,6 +4094,7 @@ mod tests {
         };
         let caps = crate::transport::client_caps::ClientCapabilities {
             indices_raw_enabled: false,
+            supports_h264: false,
         };
         let map = IoBridge::phase_b_encode_payloads_with_caps(&[prep], &caps, None);
         let payload = &map[&(5, 7)];
@@ -4079,6 +4121,7 @@ mod tests {
         };
         let caps = crate::transport::client_caps::ClientCapabilities {
             indices_raw_enabled: true,
+            supports_h264: false,
         };
         let map = IoBridge::phase_b_encode_payloads_with_caps(&[prep], &caps, None);
         let payload = &map[&(1, 1)];
@@ -4113,6 +4156,7 @@ mod tests {
         let hello = HelloMsg {
             caps: ClientCapabilities {
                 indices_raw_enabled: true,
+                supports_h264: false,
             },
         };
         let fb = ReceiverFeedback {

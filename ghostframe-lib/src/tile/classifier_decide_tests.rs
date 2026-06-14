@@ -233,6 +233,7 @@ fn refinement_bias_promotes_tilecodec_under_headroom() {
     //
     // Plenty of bandwidth: 100 B/µs (≈ 800 Mbps).
     let ctx = AdaptationContext {
+        supports_h264: true,
         bytes_per_us: 100.0,
         smoothed_rtt_us: 5_000.0,
         loss_rate: 0.0,
@@ -285,6 +286,7 @@ fn headroom_guard_forces_h264_below_threshold() {
     let mut c = Classifier::default();
     // Below threshold: 0.1 B/µs (~ 800 kbps).
     let ctx = AdaptationContext {
+        supports_h264: true,
         bytes_per_us: HEADROOM_MIN_BYTES_PER_US * 0.5,
         smoothed_rtt_us: 50_000.0,
         loss_rate: 0.0,
@@ -304,6 +306,7 @@ fn loss_override_forces_h264_above_threshold() {
     use crate::tile::{CodecState, FrameMode};
     let mut c = Classifier::default();
     let ctx = AdaptationContext {
+        supports_h264: true,
         bytes_per_us: 100.0,
         smoothed_rtt_us: 5_000.0,
         loss_rate: LOSS_OVERRIDE_THRESHOLD + 0.05,
@@ -324,6 +327,7 @@ fn suspension_override_forces_h264() {
     use crate::tile::{CodecState, FrameMode};
     let mut c = Classifier::default();
     let ctx = AdaptationContext {
+        supports_h264: true,
         bytes_per_us: 100.0,
         smoothed_rtt_us: 5_000.0,
         loss_rate: 0.0,
@@ -398,6 +402,7 @@ fn mode_decision_event_emitted_only_on_transition() {
 
     let mut c = Classifier::default();
     let ctx = AdaptationContext {
+        supports_h264: true,
         bytes_per_us: 100.0,
         smoothed_rtt_us: 5_000.0,
         loss_rate: 0.0,
@@ -436,6 +441,7 @@ fn env_var_override_refinement_bias_us() {
     // serial-only because cargo test's serialization story is awkward.
 
     let ctx = AdaptationContext {
+        supports_h264: true,
         bytes_per_us: 100.0,
         smoothed_rtt_us: 5_000.0,
         loss_rate: 0.0,
@@ -519,6 +525,7 @@ fn env_var_override_loss_override_threshold() {
     std::env::remove_var("GHOSTFRAME_TEST_LOSS_OVERRIDE_THRESHOLD");
 
     let ctx = AdaptationContext {
+        supports_h264: true,
         bytes_per_us: 100.0,
         smoothed_rtt_us: 5_000.0,
         loss_rate: 0.15,
@@ -552,6 +559,7 @@ fn env_var_override_headroom_min_bpus() {
     std::env::remove_var("GHOSTFRAME_TEST_HEADROOM_MIN_BPUS");
 
     let ctx = AdaptationContext {
+        supports_h264: true,
         bytes_per_us: 0.1,
         smoothed_rtt_us: 50_000.0,
         loss_rate: 0.0,
@@ -608,6 +616,7 @@ fn env_var_force_frame_mode_tile_pins_classifier() {
     // to H264. The force-mode override is tested above all hard overrides
     // and must win.
     let ctx = AdaptationContext {
+        supports_h264: true,
         bytes_per_us: 0.0,
         smoothed_rtt_us: 50_000.0,
         loss_rate: 0.0,
@@ -655,6 +664,7 @@ fn hybrid_hysteresis_wall_clock_jump_without_streak_does_not_flip() {
 
     let mut c = Classifier::default();
     let ctx = AdaptationContext {
+        supports_h264: true,
         bytes_per_us: 100.0,
         smoothed_rtt_us: 5_000.0,
         loss_rate: 0.0,
@@ -709,6 +719,7 @@ fn hybrid_hysteresis_exit_wall_clock_jump_without_streak_does_not_flip() {
 
     let mut c = Classifier::default();
     let ctx = AdaptationContext {
+        supports_h264: true,
         bytes_per_us: 100.0,
         smoothed_rtt_us: 5_000.0,
         loss_rate: 0.0,
@@ -733,4 +744,72 @@ fn hybrid_hysteresis_exit_wall_clock_jump_without_streak_does_not_flip() {
         FrameMode::H264,
         "frame 2 after 1s preemption-like jump: streak=2 < 30, must NOT flip"
     );
+}
+
+#[test]
+fn h264_unsupported_forces_tile_codec_even_with_low_headroom() {
+    // Even in the "headroom_guard would force H.264" zone, a Firefox-style
+    // client (`supports_h264 == false`) must end up in TileCodec because
+    // H.264 frames would be silently dropped on the renderer side.
+    let mut c = Classifier::default();
+    let ctx = AdaptationContext {
+        supports_h264: false,
+        bytes_per_us: HEADROOM_MIN_BYTES_PER_US * 0.5, // below threshold
+        smoothed_rtt_us: 50_000.0,
+        loss_rate: 0.0,
+        suspended: false,
+        last_update_seq: 1,
+    };
+    c.set_adaptation_context(ctx);
+
+    let tentative = vec![CodecState::Solid];
+    let mode = c.decide_frame_mode(&tentative, FrameMode::TileCodec);
+    assert_eq!(
+        mode,
+        FrameMode::TileCodec,
+        "h264_unsupported override should beat headroom_guard"
+    );
+}
+
+#[test]
+fn h264_unsupported_forces_tile_codec_even_with_high_loss() {
+    // Symmetric coverage: loss_override would normally force H.264 here,
+    // but supports_h264=false must win.
+    let mut c = Classifier::default();
+    let ctx = AdaptationContext {
+        supports_h264: false,
+        bytes_per_us: 100.0,
+        smoothed_rtt_us: 5_000.0,
+        loss_rate: 0.50, // way past loss threshold
+        suspended: false,
+        last_update_seq: 1,
+    };
+    c.set_adaptation_context(ctx);
+    let tentative = vec![CodecState::Solid];
+    let mode = c.decide_frame_mode(&tentative, FrameMode::TileCodec);
+    assert_eq!(
+        mode,
+        FrameMode::TileCodec,
+        "h264_unsupported override should beat loss_override"
+    );
+}
+
+#[test]
+fn h264_unsupported_forces_tile_codec_when_previously_in_h264() {
+    // Coming from a previous-mode of H264 (a stale decision before HELLO
+    // arrived), the override must drop straight back to TileCodec on the
+    // next decision.
+    let mut c = Classifier::default();
+    let ctx = AdaptationContext {
+        supports_h264: false,
+        bytes_per_us: 100.0,
+        smoothed_rtt_us: 5_000.0,
+        loss_rate: 0.0,
+        suspended: false,
+        last_update_seq: 1,
+    };
+    c.set_adaptation_context(ctx);
+    let tentative = vec![CodecState::Solid];
+    let mode = c.decide_frame_mode(&tentative, FrameMode::H264);
+    assert_eq!(mode, FrameMode::TileCodec);
 }

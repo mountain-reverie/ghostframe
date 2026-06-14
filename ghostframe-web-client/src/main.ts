@@ -324,10 +324,21 @@ async function main() {
     }
   })();
 
-  // Emit HELLO immediately. We hard-require WebGPU, so indicesRawEnabled is unconditional.
+  // Emit HELLO immediately. We hard-require WebGPU, so indicesRawEnabled is
+  // unconditional. supportsH264 reflects the result of the renderer's startup
+  // probe (probeH264 in webgpu/renderer.ts): true on Chrome/Chromium where
+  // texture_external + WebCodecs are available, false on Firefox where Naga
+  // currently rejects the h264_blit shader for lack of TEXTURE_EXTERNAL
+  // capability. The server uses this to gate FrameMode::H264 selection so
+  // Firefox never receives unplayable H.264 frames.
   if (feedbackWriter) {
     try {
-      await feedbackWriter.write(encodeHello({ indicesRawEnabled: true }));
+      await feedbackWriter.write(
+        encodeHello({
+          indicesRawEnabled: true,
+          supportsH264: renderer.h264Supported,
+        }),
+      );
     } catch (e) {
       console.warn('HELLO write failed:', e);
     }
