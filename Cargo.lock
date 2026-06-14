@@ -1661,6 +1661,7 @@ dependencies = [
 name = "ghostframe-xdaemon"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "drm",
  "ghostframe-lib",
  "libc",
