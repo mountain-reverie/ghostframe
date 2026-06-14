@@ -149,6 +149,13 @@
  */
 #define FRAGMENT_COVERAGE_CAPACITY 60000
 
+/**
+ * Top-level feedback message type for input events. Routed by the first
+ * byte in `IoBridge::dispatch_feedback_bytes`. Sub-kind byte at offset 1
+ * selects the specific event (see `decode_input_msg`).
+ */
+#define INPUT_MSG_TYPE 5
+
 #define DATAGRAM_HEADER_SIZE 12
 
 #define TILE_HEADER_SIZE 8

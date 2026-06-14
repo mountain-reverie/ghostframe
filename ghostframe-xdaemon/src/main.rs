@@ -132,7 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     tracing::info!("Connecting to Tailscale...");
-    let server = match GhostframeServer::new(config, ":443").await {
+    let server = match GhostframeServer::new(config, ":443", None).await {
         Ok(s) => s,
         Err(e) => {
             if let Some(ws) = e.downcast_ref::<ghostframe_lib::WebServerError>() {
