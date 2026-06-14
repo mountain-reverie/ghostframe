@@ -1,4 +1,5 @@
 mod drm_capture;
+mod input_inject;
 mod x11_capture;
 mod xdamage;
 
