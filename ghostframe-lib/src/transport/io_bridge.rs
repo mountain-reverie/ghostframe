@@ -1107,6 +1107,8 @@ impl IoBridge {
                     use crate::transport::input_inject::{apply_input, decode_input_msg};
                     match decode_input_msg(&data[offset..]) {
                         Some((msg, consumed)) => {
+                            let injected = self.input_injector.is_some();
+                            tracing::debug!(?msg, injected, "input event dispatched");
                             if let Some(injector) = self.input_injector.as_ref() {
                                 apply_input(injector.as_ref(), &msg);
                             }
