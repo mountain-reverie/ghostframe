@@ -8,23 +8,23 @@ import {
 } from '../src/feedback.js';
 
 describe('encodeHello', () => {
-  it('encodes indices_raw=true to [0x03, 0x01]', () => {
-    const bytes = encodeHello({ indicesRawEnabled: true, supportsCdf53: false });
+  it('encodes indices_raw=true to [HELLO_MSG_TYPE, 0x01]', () => {
+    const bytes = encodeHello({ indicesRawEnabled: true, supportsH264: false });
     expect(bytes).toEqual(new Uint8Array([HELLO_MSG_TYPE, 0x01]));
   });
 
-  it('encodes indices_raw=false to [0x03, 0x00]', () => {
-    const bytes = encodeHello({ indicesRawEnabled: false, supportsCdf53: false });
+  it('encodes nothing-set to [HELLO_MSG_TYPE, 0x00]', () => {
+    const bytes = encodeHello({ indicesRawEnabled: false, supportsH264: false });
     expect(bytes).toEqual(new Uint8Array([HELLO_MSG_TYPE, 0x00]));
   });
 
-  it('encodes supportsCdf53=true to [HELLO_MSG_TYPE, 0x02]', () => {
-    const bytes = encodeHello({ indicesRawEnabled: false, supportsCdf53: true });
+  it('encodes supportsH264=true to [HELLO_MSG_TYPE, 0x02]', () => {
+    const bytes = encodeHello({ indicesRawEnabled: false, supportsH264: true });
     expect(bytes).toEqual(new Uint8Array([HELLO_MSG_TYPE, 0x02]));
   });
 
-  it('encodes both caps to [HELLO_MSG_TYPE, 0x03]', () => {
-    const bytes = encodeHello({ indicesRawEnabled: true, supportsCdf53: true });
+  it('encodes both caps set to [HELLO_MSG_TYPE, 0x03]', () => {
+    const bytes = encodeHello({ indicesRawEnabled: true, supportsH264: true });
     expect(bytes).toEqual(new Uint8Array([HELLO_MSG_TYPE, 0x03]));
   });
 });

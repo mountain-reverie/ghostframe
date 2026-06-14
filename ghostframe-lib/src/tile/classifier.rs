@@ -100,10 +100,15 @@ impl CostModel {
 
 /// Live signal vector consumed by `Classifier::decide_frame_mode`.
 ///
-/// Populated by `IoBridge` from `ReceiverFeedback` + QUIC `path_stats`. All
-/// fields default to "no information" (`Default` = zeros / `false`). Defaults
-/// keep the M3.5-equivalent behavior when no context has been pushed yet.
-#[derive(Debug, Clone, Copy, Default)]
+/// Populated by `IoBridge` from `ReceiverFeedback` + QUIC `path_stats` +
+/// `ClientCapabilities` (the last from HELLO). Network fields default to
+/// "no information" (zeros / `false`); `supports_h264` defaults to `true`
+/// because (a) most tests construct `AdaptationContext` directly and don't
+/// care about the H.264 capability and (b) the conservative default lives
+/// on the `ClientCapabilities` side — `IoBridge` only flips this field to
+/// `true` after seeing a HELLO with bit 1 set. Test ergonomics + real
+/// behaviour stay aligned.
+#[derive(Debug, Clone, Copy)]
 pub struct AdaptationContext {
     /// Smoothed throughput estimate, bytes per µs. Sourced from
     /// `min(cwnd/rtt, recent_emit_bytes/window)`. `0.0` means "no estimate
@@ -119,6 +124,26 @@ pub struct AdaptationContext {
     /// Monotonic counter incremented on each `set_adaptation_context` call.
     /// Tests assert "classifier saw the new value before decision N".
     pub last_update_seq: u32,
+    /// Mirrors `ClientCapabilities::supports_h264`. When `false`, the
+    /// classifier never selects `FrameMode::H264` regardless of network
+    /// conditions: a Firefox client (no `texture_external` WGSL capability)
+    /// silently drops H.264 frames, so falling back to H.264 under load
+    /// would produce a frozen stream instead of degraded-but-viewable
+    /// tile-codec output.
+    pub supports_h264: bool,
+}
+
+impl Default for AdaptationContext {
+    fn default() -> Self {
+        Self {
+            bytes_per_us: 0.0,
+            smoothed_rtt_us: 0.0,
+            loss_rate: 0.0,
+            suspended: false,
+            last_update_seq: 0,
+            supports_h264: true,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -493,6 +518,17 @@ impl Classifier {
         // accept the resulting mode-switch count uptick as the cost of
         // fast recovery; M3.6c's Table 9 verifies it's not pathological.
         let ctx = self.adaptation_context;
+
+        // Client-capability override (HELLO bit 1, `supports_h264`).
+        // Evaluated BEFORE the network-driven H.264 forces because none of
+        // them — headroom_guard, loss_override, suspension — are useful
+        // when the client physically cannot decode H.264. The Firefox path
+        // (WebGPU without texture_external) lands here.
+        if !ctx.supports_h264 {
+            self.state = ClassifierHysteresis::default();
+            return (FrameMode::TileCodec, "h264_unsupported");
+        }
+
         let headroom_threshold = {
             #[cfg(any(test, feature = "test-loss-injection"))]
             {

@@ -23,6 +23,7 @@ fn adaptation_context_overrides_static_bytes_per_us() {
     let mut c = Classifier::default();
     let initial = c.cost.bytes_per_us();
     let ctx = AdaptationContext {
+        supports_h264: true,
         bytes_per_us: initial * 2.0,
         smoothed_rtt_us: 18_500.0,
         loss_rate: 0.0,
@@ -40,6 +41,7 @@ fn adaptation_context_with_zero_bytes_per_us_preserves_cost() {
     let mut c = Classifier::default();
     let initial = c.cost.bytes_per_us();
     let ctx = AdaptationContext {
+        supports_h264: true,
         bytes_per_us: 0.0,
         smoothed_rtt_us: 18_500.0,
         loss_rate: 0.0,
