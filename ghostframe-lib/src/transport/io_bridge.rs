@@ -275,6 +275,12 @@ pub struct IoBridge {
     /// so we can emit a single info-level log on each enter/leave instead of
     /// once per dropped frame. Initial `true` (we start with zero sessions).
     was_idle: bool,
+    /// Production-only handle for browser-driven input injection (see
+    /// `transport::input_inject`). `None` on the test paths whose
+    /// `IoBridge` constructor doesn't take an injector — the
+    /// `INPUT_MSG_TYPE` dispatch arm silently skips messages when this
+    /// is `None`.
+    pub(crate) input_injector: Option<std::sync::Arc<dyn crate::transport::input_inject::InputInjector>>,
 }
 
 /// Per-frame inputs passed into `dispatch_dirty_tiles_via_scheduler`.
@@ -540,6 +546,7 @@ impl IoBridge {
             dimensions_retransmits_left: 0,
             connected_session_count: Arc::new(AtomicUsize::new(0)),
             was_idle: true,
+            input_injector: None,
         })
     }
 
@@ -1045,6 +1052,7 @@ impl IoBridge {
     /// - `0x01` FEEDBACK_MSG_TYPE  (22 bytes)  — `ReceiverFeedback`
     /// - `0x03` HELLO_MSG_TYPE     (2 bytes)   — capability advertisement
     /// - `0x04` DECODE_ERROR_MSG_TYPE (5 bytes) — per-tile decode failure
+    /// - `0x05` INPUT_MSG_TYPE     (variable) — pointer/wheel/key event
     ///
     /// Unknown message types abort parsing of the rest of the buffer
     /// (we can't safely advance past an unknown variable-length message).
@@ -1094,6 +1102,28 @@ impl IoBridge {
                         self.handle_decode_error(msg);
                     }
                     offset += DECODE_ERROR_SIZE;
+                }
+                crate::transport::input_inject::INPUT_MSG_TYPE => {
+                    use crate::transport::input_inject::{apply_input, decode_input_msg};
+                    match decode_input_msg(&data[offset..]) {
+                        Some((msg, consumed)) => {
+                            if let Some(injector) = self.input_injector.as_ref() {
+                                apply_input(injector.as_ref(), &msg);
+                            }
+                            offset += consumed;
+                        }
+                        None => {
+                            // Variable-length and we can't know the size of
+                            // an unrecognized sub-kind. Bail on this chunk;
+                            // the next stream-read will start fresh.
+                            tracing::debug!(
+                                offset,
+                                remaining = data.len() - offset,
+                                "input_msg decode failed; abandoning chunk"
+                            );
+                            break;
+                        }
+                    }
                 }
                 unknown => {
                     tracing::warn!(
@@ -2759,6 +2789,7 @@ impl IoBridge {
             dimensions_retransmits_left: 0,
             connected_session_count: Arc::new(AtomicUsize::new(0)),
             was_idle: true,
+            input_injector: None,
         }
     }
 
@@ -2819,6 +2850,7 @@ impl IoBridge {
             dimensions_retransmits_left: 0,
             connected_session_count: Arc::new(AtomicUsize::new(0)),
             was_idle: true,
+            input_injector: None,
         }
     }
 
@@ -4578,5 +4610,39 @@ mod tests {
             "got {}",
             bridge.adaptation_context.bytes_per_us
         );
+    }
+
+    #[tokio::test]
+    async fn dispatch_feedback_bytes_routes_input_to_injector() {
+        use crate::transport::input_inject::InputInjector;
+        use std::sync::{Arc, Mutex};
+
+        struct CountingInjector {
+            moves: Mutex<Vec<(i16, i16)>>,
+        }
+        impl InputInjector for CountingInjector {
+            fn pointer_move(&self, x: i16, y: i16) {
+                self.moves.lock().unwrap().push((x, y));
+            }
+            fn pointer_button(&self, _: i16, _: i16, _: u8, _: bool) {}
+            fn wheel(&self, _: i16, _: i16) {}
+            fn key(&self, _: u32, _: bool) {}
+        }
+
+        let injector = Arc::new(CountingInjector { moves: Mutex::new(Vec::new()) });
+        let mut bridge = make_bridge_for_test().await;
+        bridge.input_injector = Some(injector.clone() as Arc<dyn InputInjector>);
+
+        // pointer-move (0x05 0x01 x=100 y=200) — 100 = 0x0064, 200 = 0x00c8
+        bridge.dispatch_feedback_bytes(&[0x05, 0x01, 0x00, 0x64, 0x00, 0xc8]);
+
+        assert_eq!(injector.moves.lock().unwrap().clone(), vec![(100, 200)]);
+    }
+
+    #[tokio::test]
+    async fn dispatch_feedback_bytes_silently_skips_input_when_no_injector() {
+        // input_injector is None on the test bridge — must not panic.
+        let mut bridge = make_bridge_for_test().await;
+        bridge.dispatch_feedback_bytes(&[0x05, 0x01, 0x00, 0x64, 0x00, 0xc8]);
     }
 }
