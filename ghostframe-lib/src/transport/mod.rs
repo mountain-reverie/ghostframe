@@ -5,6 +5,7 @@ pub mod fec;
 pub mod feedback;
 pub mod fragment_coverage;
 pub mod ghostbridge;
+pub mod input_inject;
 pub mod io_bridge;
 pub mod protocol;
 pub mod quic;
