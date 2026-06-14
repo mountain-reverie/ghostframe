@@ -132,8 +132,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
+    // X server is up; safe to open the XTest injector connection. If the
+    // XTEST extension isn't compiled into this xorg-server build, log
+    // and continue — frames still stream, just no input.
+    let input_injector: Option<
+        std::sync::Arc<dyn ghostframe_lib::transport::input_inject::InputInjector>,
+    > = if !init_mode {
+        match input_inject::XTestInjector::new() {
+            Ok(inj) => {
+                tracing::info!("XTest input injector ready");
+                Some(std::sync::Arc::new(inj))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "XTest injector unavailable; input forwarding disabled"
+                );
+                None
+            }
+        }
+    } else {
+        // --init mode exits before serving traffic; no point opening
+        // the injector connection.
+        None
+    };
+
     tracing::info!("Connecting to Tailscale...");
-    let server = match GhostframeServer::new(config, ":443", None).await {
+    let server = match GhostframeServer::new(config, ":443", input_injector).await {
         Ok(s) => s,
         Err(e) => {
             if let Some(ws) = e.downcast_ref::<ghostframe_lib::WebServerError>() {
