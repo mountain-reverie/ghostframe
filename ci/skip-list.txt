@@ -81,3 +81,13 @@ e2e_multi_pattern
 # replace per-pixel readbacks with one staging-buffer copy per scan.
 e2e_solid_color_firefox
 e2e_edge_tiles_firefox
+
+# --- Category 4: Firefox WebGPU page-startup is flaky on 2-vCPU runners ----
+# Firefox tests whose bodies are NOT pixel-scan heavy (Category 3) but still
+# fail on the GH-runner because Firefox Nightly's software WebGPU init
+# sometimes drops the marionette WebDriver connection during page-startup
+# with `webdriver returned error: Failed to decode response from marionette`,
+# typically while the test is still inside `wait_for_frames`. The matching
+# `_chromium` variant covers the actual assertion; the Firefox variant runs
+# locally on dev boxes where a real GPU is present.
+e2e_input_forwarding_firefox
