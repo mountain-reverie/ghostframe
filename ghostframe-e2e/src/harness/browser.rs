@@ -14,6 +14,42 @@ use serde::de::DeserializeOwned;
 ///
 /// Implementors are responsible for their own lifecycle (browser launch
 /// in `new(...)`, cleanup in `close(...)` and `Drop`).
+/// Kind of pointer event to dispatch via `dispatch_pointer_event`.
+#[derive(Debug, Clone, Copy)]
+pub enum PointerEventKind {
+    Move,
+    Down,
+    Up,
+    Leave,
+}
+
+impl PointerEventKind {
+    fn as_dom_type(self) -> &'static str {
+        match self {
+            PointerEventKind::Move => "pointermove",
+            PointerEventKind::Down => "pointerdown",
+            PointerEventKind::Up => "pointerup",
+            PointerEventKind::Leave => "pointerleave",
+        }
+    }
+}
+
+/// Kind of keyboard event to dispatch via `dispatch_keyboard_event`.
+#[derive(Debug, Clone, Copy)]
+pub enum KeyEventKind {
+    Down,
+    Up,
+}
+
+impl KeyEventKind {
+    fn as_dom_type(self) -> &'static str {
+        match self {
+            KeyEventKind::Down => "keydown",
+            KeyEventKind::Up => "keyup",
+        }
+    }
+}
+
 #[async_trait]
 pub trait BrowserSession: Send {
     /// Navigate the active page to `url`. Subsequent `evaluate` /
@@ -33,6 +69,124 @@ pub trait BrowserSession: Send {
     /// Orderly shutdown: close the browser, wait for the driver to
     /// exit. Best-effort cleanup also runs in `Drop`.
     async fn close(self) -> Result<()>;
+
+    /// Dispatch a synthetic `PointerEvent` on the element matched by
+    /// `selector` at element-local coords `(x, y)`. `button` is the DOM
+    /// button index (0=left, 1=middle, 2=right). Ignored for `Move` /
+    /// `Leave`.
+    ///
+    /// Synthetic events have `isTrusted=false`. The web-client's
+    /// `attachInputCapture` listeners do not gate on `isTrusted`, so
+    /// they fire and round-trip the input through our wire encoder
+    /// exactly as a real user click would.
+    async fn dispatch_pointer_event(
+        &mut self,
+        selector: &str,
+        kind: PointerEventKind,
+        x: i32,
+        y: i32,
+        button: u8,
+    ) -> Result<()> {
+        let script = build_pointer_dispatch_js(selector, kind, x, y, button);
+        let ok: bool = self.evaluate(&script).await?;
+        if !ok {
+            return Err(anyhow::anyhow!(
+                "dispatch_pointer_event: element {selector:?} not found"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Dispatch a synthetic `WheelEvent` on the element matched by
+    /// `selector` at element-local coords `(x, y)`. `dx`/`dy` go on
+    /// `deltaX`/`deltaY` directly.
+    async fn dispatch_wheel_event(
+        &mut self,
+        selector: &str,
+        x: i32,
+        y: i32,
+        dx: i32,
+        dy: i32,
+    ) -> Result<()> {
+        let script = build_wheel_dispatch_js(selector, x, y, dx, dy);
+        let ok: bool = self.evaluate(&script).await?;
+        if !ok {
+            return Err(anyhow::anyhow!(
+                "dispatch_wheel_event: element {selector:?} not found"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Dispatch a synthetic `KeyboardEvent` on the element matched by
+    /// `selector`. `key` is the DOM `KeyboardEvent.key` string
+    /// ("Enter", "ArrowUp", "a", etc.) — what `keymap.ts` parses.
+    async fn dispatch_keyboard_event(
+        &mut self,
+        selector: &str,
+        kind: KeyEventKind,
+        key: &str,
+    ) -> Result<()> {
+        let script = build_keyboard_dispatch_js(selector, kind, key);
+        let ok: bool = self.evaluate(&script).await?;
+        if !ok {
+            return Err(anyhow::anyhow!(
+                "dispatch_keyboard_event: element {selector:?} not found"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Encode `s` as a JS string literal — safe to interpolate inline.
+fn js_string(s: &str) -> String {
+    serde_json::to_string(s).expect("string is always JSON-serializable")
+}
+
+fn build_pointer_dispatch_js(
+    selector: &str,
+    kind: PointerEventKind,
+    x: i32,
+    y: i32,
+    button: u8,
+) -> String {
+    let dom_type = kind.as_dom_type();
+    // `buttons` is the bitmask of buttons CURRENTLY held. For pointerdown
+    // we set the bit for `button`; for everything else we leave it 0.
+    let buttons: u32 = match kind {
+        PointerEventKind::Down => 1u32 << button,
+        _ => 0,
+    };
+    format!(
+        "(() => {{\n  const el = document.querySelector({sel});\n  if (!el) return false;\n  const rect = el.getBoundingClientRect();\n  el.dispatchEvent(new PointerEvent({ty}, {{\n    clientX: rect.left + {x},\n    clientY: rect.top + {y},\n    button: {button},\n    buttons: {buttons},\n    isPrimary: true,\n    bubbles: true,\n  }}));\n  return true;\n}})()",
+        sel = js_string(selector),
+        ty = js_string(dom_type),
+        x = x,
+        y = y,
+        button = button,
+        buttons = buttons,
+    )
+}
+
+fn build_wheel_dispatch_js(selector: &str, x: i32, y: i32, dx: i32, dy: i32) -> String {
+    format!(
+        "(() => {{\n  const el = document.querySelector({sel});\n  if (!el) return false;\n  const rect = el.getBoundingClientRect();\n  el.dispatchEvent(new WheelEvent('wheel', {{\n    clientX: rect.left + {x},\n    clientY: rect.top + {y},\n    deltaX: {dx},\n    deltaY: {dy},\n    bubbles: true,\n  }}));\n  return true;\n}})()",
+        sel = js_string(selector),
+        x = x,
+        y = y,
+        dx = dx,
+        dy = dy,
+    )
+}
+
+fn build_keyboard_dispatch_js(selector: &str, kind: KeyEventKind, key: &str) -> String {
+    let dom_type = kind.as_dom_type();
+    format!(
+        "(() => {{\n  const el = document.querySelector({sel});\n  if (!el) return false;\n  el.dispatchEvent(new KeyboardEvent({ty}, {{\n    key: {key},\n    bubbles: true,\n  }}));\n  return true;\n}})()",
+        sel = js_string(selector),
+        ty = js_string(dom_type),
+        key = js_string(key),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -474,3 +628,152 @@ impl BrowserSession for FirefoxSession {
         Ok(())
     }
 }
+
+// ---------------------------------------------------------------------------
+// Input dispatch smoke runner (shared between firefox_smoke and chromium_smoke)
+// ---------------------------------------------------------------------------
+
+/// Self-contained smoke that verifies the four input-dispatch trait
+/// methods land synthetic DOM events on a target element with the
+/// expected fields. The page records every received event into
+/// `window.__events`; we read it back via `evaluate` and assert.
+///
+/// Backend-agnostic — both `ChromiumSession` and `FirefoxSession` go
+/// through the same default-impl path that wraps `evaluate(...)`.
+pub async fn run_input_dispatch_smoke<S: BrowserSession>(session: &mut S) -> Result<()> {
+    // 400×300 canvas, listeners on every event type we dispatch. The
+    // event log holds `{type, x, y, button, deltaX, deltaY, key}` per
+    // event — fields irrelevant to a given type are 0/empty.
+    let page_html = r##"<!doctype html>
+<html><head><meta charset="utf-8"></head><body style="margin:0">
+<canvas id="c" tabindex="0" width="400" height="300" style="background:#000"></canvas>
+<script>
+window.__events = [];
+const c = document.getElementById('c');
+const r0 = c.getBoundingClientRect();
+for (const t of ['pointermove','pointerdown','pointerup','pointerleave','wheel','keydown','keyup']) {
+  c.addEventListener(t, (e) => {
+    const r = c.getBoundingClientRect();
+    window.__events.push({
+      type: e.type,
+      x: Math.round((e.clientX || 0) - r.left),
+      y: Math.round((e.clientY || 0) - r.top),
+      button: e.button == null ? -1 : e.button,
+      deltaX: e.deltaX || 0,
+      deltaY: e.deltaY || 0,
+      key: e.key || '',
+    });
+  });
+}
+</script></body></html>"##;
+    let data_url = format!(
+        "data:text/html;base64,{}",
+        BASE64_STANDARD.encode(page_html.as_bytes())
+    );
+    session.new_page(&data_url).await.context("new_page")?;
+
+    session
+        .dispatch_pointer_event("#c", PointerEventKind::Move, 100, 50, 0)
+        .await
+        .context("dispatch pointermove")?;
+    session
+        .dispatch_pointer_event("#c", PointerEventKind::Down, 100, 50, 0)
+        .await
+        .context("dispatch pointerdown")?;
+    session
+        .dispatch_pointer_event("#c", PointerEventKind::Up, 100, 50, 0)
+        .await
+        .context("dispatch pointerup")?;
+    session
+        .dispatch_wheel_event("#c", 200, 100, 0, 1)
+        .await
+        .context("dispatch wheel")?;
+    session
+        .dispatch_keyboard_event("#c", KeyEventKind::Down, "Enter")
+        .await
+        .context("dispatch keydown Enter")?;
+    session
+        .dispatch_keyboard_event("#c", KeyEventKind::Up, "Enter")
+        .await
+        .context("dispatch keyup Enter")?;
+    session
+        .dispatch_pointer_event("#c", PointerEventKind::Leave, 0, 0, 0)
+        .await
+        .context("dispatch pointerleave")?;
+
+    // Read the log back as JSON. Using `JSON.stringify` keeps the
+    // payload a single string — sidesteps backend differences in how
+    // arrays-of-objects round-trip through the WebDriver/CDP layers.
+    let log_json: String = session
+        .evaluate("JSON.stringify(window.__events)")
+        .await
+        .context("read window.__events")?;
+    let events: Vec<serde_json::Value> =
+        serde_json::from_str(&log_json).context("parse __events JSON")?;
+
+    if events.len() != 7 {
+        return Err(anyhow::anyhow!(
+            "expected 7 events, got {}: {}",
+            events.len(),
+            log_json
+        ));
+    }
+
+    let check = |i: usize, ty: &str, want_x: i64, want_y: i64| -> Result<()> {
+        let e = &events[i];
+        let got_ty = e.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let got_x = e.get("x").and_then(|v| v.as_i64()).unwrap_or(-1);
+        let got_y = e.get("y").and_then(|v| v.as_i64()).unwrap_or(-1);
+        if got_ty != ty || got_x != want_x || got_y != want_y {
+            return Err(anyhow::anyhow!(
+                "event[{i}]: want type={ty} x={want_x} y={want_y}, got type={got_ty} x={got_x} y={got_y}"
+            ));
+        }
+        Ok(())
+    };
+    check(0, "pointermove", 100, 50)?;
+    check(1, "pointerdown", 100, 50)?;
+    check(2, "pointerup", 100, 50)?;
+    // Wheel deltas live on a different field; verify type + deltas.
+    {
+        let e = &events[3];
+        if e.get("type").and_then(|v| v.as_str()) != Some("wheel") {
+            return Err(anyhow::anyhow!("event[3] type: {e:?}"));
+        }
+        let dy = e.get("deltaY").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        if (dy - 1.0).abs() > 1e-6 {
+            return Err(anyhow::anyhow!("event[3] deltaY: got {dy}"));
+        }
+    }
+    // Keyboard: verify type + key string. (xy on synthetic KeyboardEvent
+    // is implementation-defined, so we don't pin it.)
+    {
+        let e = &events[4];
+        if e.get("type").and_then(|v| v.as_str()) != Some("keydown") {
+            return Err(anyhow::anyhow!("event[4] type: {e:?}"));
+        }
+        if e.get("key").and_then(|v| v.as_str()) != Some("Enter") {
+            return Err(anyhow::anyhow!("event[4] key: {e:?}"));
+        }
+    }
+    {
+        let e = &events[5];
+        if e.get("type").and_then(|v| v.as_str()) != Some("keyup") {
+            return Err(anyhow::anyhow!("event[5] type: {e:?}"));
+        }
+    }
+    {
+        let e = &events[6];
+        if e.get("type").and_then(|v| v.as_str()) != Some("pointerleave") {
+            return Err(anyhow::anyhow!("event[6] type: {e:?}"));
+        }
+    }
+
+    Ok(())
+}
+
+// data:base64 encoding — pulled in via base64 crate since it's already
+// in the workspace tree (chromium_probe.rs uses a hand-rolled version,
+// but for new code prefer the crate).
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
