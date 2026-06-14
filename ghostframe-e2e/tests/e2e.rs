@@ -3852,4 +3852,114 @@ async fn e2e_ack_telemetry_no_waste() -> Result<()> {
     Ok(())
 }
 
+/// End-to-end input forwarding: browser dispatches synthetic DOM events
+/// on the canvas → wire.ts encodes → WebTransport bidi feedback stream
+/// → server reassembles + decodes → IoBridge dispatches to the XTest
+/// injector. Asserts on `input event dispatched` tracing lines from the
+/// server so coverage doesn't depend on a desktop side-channel.
+///
+/// Verifies:
+///   - pointer move + button down + button up (DOM button 0 → X11 button 1)
+///   - wheel tick
+///   - keydown + keyup with key="Enter" → X11 keysym 0xff0d (65293)
+///   - pointerleave → PointerMove { x: -1, y: -1 } sentinel
+///   - reassembly of the 8-byte PointerButton across QUIC stream reads
+///     (the bug `fix(io_bridge): reassemble feedback-stream messages
+///     split across reads` closed — if the accumulator regresses, the
+///     button events go missing from the logs)
+async fn e2e_input_forwarding_body<B: helpers::BrowserSession>(browser: &mut B) -> Result<()> {
+    use ghostframe_e2e::harness::browser::{KeyEventKind, PointerEventKind};
+
+    // Frames are already flowing by the time setup returned; give the
+    // feedback writer + attachInputCapture a moment to finish wiring.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    browser
+        .dispatch_pointer_event("#canvas", PointerEventKind::Move, 100, 50, 0)
+        .await?;
+    browser
+        .dispatch_pointer_event("#canvas", PointerEventKind::Down, 100, 50, 0)
+        .await?;
+    browser
+        .dispatch_pointer_event("#canvas", PointerEventKind::Up, 100, 50, 0)
+        .await?;
+    browser
+        .dispatch_wheel_event("#canvas", 200, 100, 0, 1)
+        .await?;
+    browser
+        .dispatch_keyboard_event("#canvas", KeyEventKind::Down, "Enter")
+        .await?;
+    browser
+        .dispatch_keyboard_event("#canvas", KeyEventKind::Up, "Enter")
+        .await?;
+    browser
+        .dispatch_pointer_event("#canvas", PointerEventKind::Leave, 0, 0, 0)
+        .await?;
+
+    // Time for: RAF coalesce tick (~16ms) → WebTransport bidi write →
+    // server stream read → dispatch_feedback_bytes → tracing flush.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let logs = helpers::read_server_logs_stripped("ghostframe-server");
+    let dispatched: Vec<&str> = logs
+        .lines()
+        .filter(|l| l.contains("input event dispatched"))
+        .collect();
+
+    if dispatched.is_empty() {
+        return Err(anyhow!(
+            "no 'input event dispatched' lines in server logs — input forwarding wire path is broken.\n\
+             Last 80 server log lines:\n{}",
+            logs.lines()
+                .rev()
+                .take(80)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+    }
+
+    let joined = dispatched.join("\n");
+    let want_substrings: &[(&str, &str)] = &[
+        ("PointerMove", "PointerMove"),
+        ("PointerButton down=true", "button: 1, down: true"),
+        ("PointerButton down=false", "button: 1, down: false"),
+        ("Wheel dy=1", "Wheel { dx: 0, dy: 1 }"),
+        ("KeyDown Enter (0xff0d)", "KeyDown { keysym: 65293 }"),
+        ("KeyUp Enter (0xff0d)", "KeyUp { keysym: 65293 }"),
+        ("PointerMove leave sentinel", "PointerMove { x: -1, y: -1 }"),
+    ];
+    let mut missing = Vec::new();
+    for (label, needle) in want_substrings {
+        if !joined.contains(needle) {
+            missing.push(*label);
+        }
+    }
+    if !missing.is_empty() {
+        return Err(anyhow!(
+            "missing expected events ({}); dispatched lines:\n{}",
+            missing.join(", "),
+            joined,
+        ));
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn e2e_input_forwarding_chromium() -> Result<()> {
+    let mut setup = setup_e2e_webgpu("--solid-red").await?;
+    e2e_input_forwarding_body(&mut setup.browser).await?;
+    setup.browser.close().await
+}
+
+#[tokio::test]
+async fn e2e_input_forwarding_firefox() -> Result<()> {
+    let mut setup = setup_e2e_webgpu_firefox("--solid-red").await?;
+    e2e_input_forwarding_body(&mut setup.browser).await?;
+    setup.browser.close().await
+}
+
 mod harness_smoke;
