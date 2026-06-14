@@ -21,11 +21,26 @@ const SUB_KEY_UP: u8 = 0x05;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputMsg {
-    PointerMove { x: i16, y: i16 },
-    PointerButton { x: i16, y: i16, button: u8, down: bool },
-    Wheel { dx: i16, dy: i16 },
-    KeyDown { keysym: u32 },
-    KeyUp { keysym: u32 },
+    PointerMove {
+        x: i16,
+        y: i16,
+    },
+    PointerButton {
+        x: i16,
+        y: i16,
+        button: u8,
+        down: bool,
+    },
+    Wheel {
+        dx: i16,
+        dy: i16,
+    },
+    KeyDown {
+        keysym: u32,
+    },
+    KeyUp {
+        keysym: u32,
+    },
 }
 
 /// Abstract handle the I/O layer uses to inject events into a windowing
@@ -66,10 +81,7 @@ pub fn decode_input_msg(data: &[u8]) -> Option<(InputMsg, usize)> {
             let y = i16::from_be_bytes([data[4], data[5]]);
             let button = data[6];
             let down = data[7] != 0;
-            Some((
-                InputMsg::PointerButton { x, y, button, down },
-                8,
-            ))
+            Some((InputMsg::PointerButton { x, y, button, down }, 8))
         }
         SUB_WHEEL => {
             if data.len() < 6 {
@@ -83,16 +95,14 @@ pub fn decode_input_msg(data: &[u8]) -> Option<(InputMsg, usize)> {
             if data.len() < 6 {
                 return None;
             }
-            let keysym =
-                u32::from_be_bytes([data[2], data[3], data[4], data[5]]);
+            let keysym = u32::from_be_bytes([data[2], data[3], data[4], data[5]]);
             Some((InputMsg::KeyDown { keysym }, 6))
         }
         SUB_KEY_UP => {
             if data.len() < 6 {
                 return None;
             }
-            let keysym =
-                u32::from_be_bytes([data[2], data[3], data[4], data[5]]);
+            let keysym = u32::from_be_bytes([data[2], data[3], data[4], data[5]]);
             Some((InputMsg::KeyUp { keysym }, 6))
         }
         _ => None,
@@ -133,7 +143,12 @@ mod tests {
         assert_eq!(consumed, 8);
         assert_eq!(
             msg,
-            InputMsg::PointerButton { x: 5, y: 10, button: 1, down: true }
+            InputMsg::PointerButton {
+                x: 5,
+                y: 10,
+                button: 1,
+                down: true
+            }
         );
     }
 
@@ -143,7 +158,12 @@ mod tests {
         let (msg, _) = decode_input_msg(&bytes).unwrap();
         assert_eq!(
             msg,
-            InputMsg::PointerButton { x: 5, y: 10, button: 3, down: false }
+            InputMsg::PointerButton {
+                x: 5,
+                y: 10,
+                button: 3,
+                down: false
+            }
         );
     }
 
@@ -207,7 +227,9 @@ mod tests {
     }
     impl MockInjector {
         fn new() -> Self {
-            Self { calls: std::sync::Mutex::new(Vec::new()) }
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
         }
         fn calls(&self) -> Vec<MockCall> {
             self.calls.lock().unwrap().clone()
@@ -243,12 +265,14 @@ mod tests {
         let m = MockInjector::new();
         apply_input(
             &m,
-            &InputMsg::PointerButton { x: 1, y: 2, button: 3, down: true },
+            &InputMsg::PointerButton {
+                x: 1,
+                y: 2,
+                button: 3,
+                down: true,
+            },
         );
-        assert_eq!(
-            m.calls(),
-            vec![MockCall::PointerButton(1, 2, 3, true)]
-        );
+        assert_eq!(m.calls(), vec![MockCall::PointerButton(1, 2, 3, true)]);
     }
 
     #[test]

@@ -280,7 +280,8 @@ pub struct IoBridge {
     /// `IoBridge` constructor doesn't take an injector — the
     /// `INPUT_MSG_TYPE` dispatch arm silently skips messages when this
     /// is `None`.
-    pub(crate) input_injector: Option<std::sync::Arc<dyn crate::transport::input_inject::InputInjector>>,
+    pub(crate) input_injector:
+        Option<std::sync::Arc<dyn crate::transport::input_inject::InputInjector>>,
     /// Accumulator for partial feedback-stream messages. QUIC stream reads
     /// can split a single browser-side write into multiple chunks; we
     /// buffer them here and only consume complete messages, leaving any
@@ -1136,10 +1137,7 @@ impl IoBridge {
                         _ => 0,
                     };
                     if required == 0 {
-                        tracing::warn!(
-                            sub_kind,
-                            "unknown INPUT sub-kind; clearing feedback buf"
-                        );
+                        tracing::warn!(sub_kind, "unknown INPUT sub-kind; clearing feedback buf");
                         discard_tail = true;
                         break;
                     }
@@ -4677,7 +4675,9 @@ mod tests {
             fn key(&self, _: u32, _: bool) {}
         }
 
-        let injector = Arc::new(CountingInjector { moves: Mutex::new(Vec::new()) });
+        let injector = Arc::new(CountingInjector {
+            moves: Mutex::new(Vec::new()),
+        });
         let mut bridge = make_bridge_for_test().await;
         bridge.input_injector = Some(injector.clone() as Arc<dyn InputInjector>);
 
@@ -4714,7 +4714,9 @@ mod tests {
             fn key(&self, _: u32, _: bool) {}
         }
 
-        let injector = Arc::new(CountingInjector { buttons: Mutex::new(Vec::new()) });
+        let injector = Arc::new(CountingInjector {
+            buttons: Mutex::new(Vec::new()),
+        });
         let mut bridge = make_bridge_for_test().await;
         bridge.input_injector = Some(injector.clone() as Arc<dyn InputInjector>);
 
@@ -4752,7 +4754,9 @@ mod tests {
             fn key(&self, _: u32, _: bool) {}
         }
 
-        let injector = Arc::new(CountingInjector { moves: Mutex::new(Vec::new()) });
+        let injector = Arc::new(CountingInjector {
+            moves: Mutex::new(Vec::new()),
+        });
         let mut bridge = make_bridge_for_test().await;
         bridge.input_injector = Some(injector.clone() as Arc<dyn InputInjector>);
 

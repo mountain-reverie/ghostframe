@@ -67,9 +67,7 @@ impl GhostframeServer {
     pub async fn new(
         config: GhostbridgeConfig,
         listen_addr: &str,
-        input_injector: Option<
-            Arc<dyn crate::transport::input_inject::InputInjector>,
-        >,
+        input_injector: Option<Arc<dyn crate::transport::input_inject::InputInjector>>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let (frame_tx, frame_rx) = mpsc::channel::<FrameSubmission>(2);
 

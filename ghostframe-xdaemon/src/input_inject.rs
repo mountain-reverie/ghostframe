@@ -110,15 +110,10 @@ impl XTestInjector {
     /// Fire one `xtest_fake_input` request and flush. Logs any X11 error
     /// at warn level — silent swallowing made input bugs invisible.
     fn fake_input(&self, kind: &'static str, event: u8, detail: u8, x: i16, y: i16) {
-        match self.conn.xtest_fake_input(
-            event,
-            detail,
-            x11rb::CURRENT_TIME,
-            self.root,
-            x,
-            y,
-            0,
-        ) {
+        match self
+            .conn
+            .xtest_fake_input(event, detail, x11rb::CURRENT_TIME, self.root, x, y, 0)
+        {
             Ok(cookie) => {
                 if let Err(e) = cookie.check() {
                     tracing::warn!(kind, event, detail, error = %e, "xtest_fake_input X11 error");
