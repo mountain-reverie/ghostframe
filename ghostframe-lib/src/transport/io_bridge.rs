@@ -281,6 +281,13 @@ pub struct IoBridge {
     /// `INPUT_MSG_TYPE` dispatch arm silently skips messages when this
     /// is `None`.
     pub(crate) input_injector: Option<std::sync::Arc<dyn crate::transport::input_inject::InputInjector>>,
+    /// Accumulator for partial feedback-stream messages. QUIC stream reads
+    /// can split a single browser-side write into multiple chunks; we
+    /// buffer them here and only consume complete messages, leaving any
+    /// trailing partial in place for the next call. Cleared on garbage
+    /// (unknown msg_type or unknown INPUT sub-kind) so a corrupt byte
+    /// can't wedge the dispatcher forever.
+    feedback_recv_buf: Vec<u8>,
 }
 
 /// Per-frame inputs passed into `dispatch_dirty_tiles_via_scheduler`.
@@ -547,6 +554,7 @@ impl IoBridge {
             connected_session_count: Arc::new(AtomicUsize::new(0)),
             was_idle: true,
             input_injector: None,
+            feedback_recv_buf: Vec::new(),
         })
     }
 
@@ -1064,15 +1072,25 @@ impl IoBridge {
         };
         use crate::transport::feedback::{FEEDBACK_MSG_TYPE, FEEDBACK_SIZE};
 
+        // Append the new chunk to our accumulator. QUIC stream reads can
+        // split a single browser-side write across multiple deliveries
+        // (e.g. an 8-byte PointerButton arriving as 6 + 2 bytes), so we
+        // can't dispatch directly off `data` — we need to walk a
+        // contiguous view that includes any leftover tail from the
+        // previous call.
+        self.feedback_recv_buf.extend_from_slice(data);
+        let buf = std::mem::take(&mut self.feedback_recv_buf);
         let mut offset = 0;
-        while offset < data.len() {
-            let msg_type = data[offset];
+        let mut discard_tail = false;
+
+        while offset < buf.len() {
+            let msg_type = buf[offset];
             match msg_type {
                 FEEDBACK_MSG_TYPE => {
-                    if offset + FEEDBACK_SIZE > data.len() {
+                    if buf.len() - offset < FEEDBACK_SIZE {
                         break;
                     }
-                    if let Some(fb) = ReceiverFeedback::decode(&data[offset..]) {
+                    if let Some(fb) = ReceiverFeedback::decode(&buf[offset..]) {
                         tracing::debug!(
                             received = fb.datagrams_received,
                             lost = fb.datagrams_lost,
@@ -1086,45 +1104,63 @@ impl IoBridge {
                     offset += FEEDBACK_SIZE;
                 }
                 HELLO_MSG_TYPE => {
-                    if offset + HELLO_SIZE > data.len() {
+                    if buf.len() - offset < HELLO_SIZE {
                         break;
                     }
-                    if let Some(msg) = HelloMsg::decode(&data[offset..]) {
+                    if let Some(msg) = HelloMsg::decode(&buf[offset..]) {
                         self.apply_hello(msg);
                     }
                     offset += HELLO_SIZE;
                 }
                 DECODE_ERROR_MSG_TYPE => {
-                    if offset + DECODE_ERROR_SIZE > data.len() {
+                    if buf.len() - offset < DECODE_ERROR_SIZE {
                         break;
                     }
-                    if let Some(msg) = DecodeErrorMsg::decode(&data[offset..]) {
+                    if let Some(msg) = DecodeErrorMsg::decode(&buf[offset..]) {
                         self.handle_decode_error(msg);
                     }
                     offset += DECODE_ERROR_SIZE;
                 }
                 crate::transport::input_inject::INPUT_MSG_TYPE => {
                     use crate::transport::input_inject::{apply_input, decode_input_msg};
-                    match decode_input_msg(&data[offset..]) {
-                        Some((msg, consumed)) => {
-                            let injected = self.input_injector.is_some();
-                            tracing::debug!(?msg, injected, "input event dispatched");
-                            if let Some(injector) = self.input_injector.as_ref() {
-                                apply_input(injector.as_ref(), &msg);
-                            }
-                            offset += consumed;
+                    // Need at least the kind byte to know the message size.
+                    if buf.len() - offset < 2 {
+                        break;
+                    }
+                    let sub_kind = buf[offset + 1];
+                    let required = match sub_kind {
+                        // PointerMove / Wheel / KeyDown / KeyUp: 6 bytes
+                        0x01 | 0x03 | 0x04 | 0x05 => 6,
+                        // PointerButton: 8 bytes
+                        0x02 => 8,
+                        _ => 0,
+                    };
+                    if required == 0 {
+                        tracing::warn!(
+                            sub_kind,
+                            "unknown INPUT sub-kind; clearing feedback buf"
+                        );
+                        discard_tail = true;
+                        break;
+                    }
+                    if buf.len() - offset < required {
+                        // Tail is a complete header + partial payload; keep
+                        // it and wait for the next stream-read to extend.
+                        break;
+                    }
+                    if let Some((msg, consumed)) = decode_input_msg(&buf[offset..]) {
+                        let injected = self.input_injector.is_some();
+                        tracing::debug!(?msg, injected, "input event dispatched");
+                        if let Some(injector) = self.input_injector.as_ref() {
+                            apply_input(injector.as_ref(), &msg);
                         }
-                        None => {
-                            // Variable-length and we can't know the size of
-                            // an unrecognized sub-kind. Bail on this chunk;
-                            // the next stream-read will start fresh.
-                            tracing::debug!(
-                                offset,
-                                remaining = data.len() - offset,
-                                "input_msg decode failed; abandoning chunk"
-                            );
-                            break;
-                        }
+                        offset += consumed;
+                    } else {
+                        // Pre-check guarantees this branch is unreachable;
+                        // belt-and-braces in case decode_input_msg evolves.
+                        tracing::warn!(sub_kind, "decode_input_msg failed after size check");
+                        discard_tail = true;
+                        break;
                     }
                 }
                 unknown => {
@@ -1132,9 +1168,17 @@ impl IoBridge {
                         msg_type = unknown,
                         "unknown feedback-stream message type; dropping rest of buffer"
                     );
+                    discard_tail = true;
                     break;
                 }
             }
+        }
+
+        // Retain any unconsumed tail for next call (partial-message case).
+        // Garbage paths (`discard_tail = true`) intentionally drop the tail
+        // so a corrupt byte doesn't wedge the dispatcher.
+        if !discard_tail && offset < buf.len() {
+            self.feedback_recv_buf.extend_from_slice(&buf[offset..]);
         }
     }
 
@@ -2792,6 +2836,7 @@ impl IoBridge {
             connected_session_count: Arc::new(AtomicUsize::new(0)),
             was_idle: true,
             input_injector: None,
+            feedback_recv_buf: Vec::new(),
         }
     }
 
@@ -2853,6 +2898,7 @@ impl IoBridge {
             connected_session_count: Arc::new(AtomicUsize::new(0)),
             was_idle: true,
             input_injector: None,
+            feedback_recv_buf: Vec::new(),
         }
     }
 
@@ -4646,5 +4692,72 @@ mod tests {
         // input_injector is None on the test bridge — must not panic.
         let mut bridge = make_bridge_for_test().await;
         bridge.dispatch_feedback_bytes(&[0x05, 0x01, 0x00, 0x64, 0x00, 0xc8]);
+    }
+
+    #[tokio::test]
+    async fn dispatch_feedback_bytes_reassembles_split_input_message() {
+        // Regression: QUIC stream reads can split an 8-byte PointerButton
+        // across two deliveries. The dispatcher must accumulate them and
+        // emit the event once the message is complete.
+        use crate::transport::input_inject::InputInjector;
+        use std::sync::{Arc, Mutex};
+
+        struct CountingInjector {
+            buttons: Mutex<Vec<(i16, i16, u8, bool)>>,
+        }
+        impl InputInjector for CountingInjector {
+            fn pointer_move(&self, _: i16, _: i16) {}
+            fn pointer_button(&self, x: i16, y: i16, button: u8, down: bool) {
+                self.buttons.lock().unwrap().push((x, y, button, down));
+            }
+            fn wheel(&self, _: i16, _: i16) {}
+            fn key(&self, _: u32, _: bool) {}
+        }
+
+        let injector = Arc::new(CountingInjector { buttons: Mutex::new(Vec::new()) });
+        let mut bridge = make_bridge_for_test().await;
+        bridge.input_injector = Some(injector.clone() as Arc<dyn InputInjector>);
+
+        // PointerButton x=100 y=200 button=1 down=true → 8 bytes total:
+        //   [0x05, 0x02, 0x00, 0x64, 0x00, 0xc8, 0x01, 0x01]
+        // Deliver as 6 + 2 — the exact split observed on the wire.
+        bridge.dispatch_feedback_bytes(&[0x05, 0x02, 0x00, 0x64, 0x00, 0xc8]);
+        assert!(
+            injector.buttons.lock().unwrap().is_empty(),
+            "first half must not dispatch — message is incomplete"
+        );
+        bridge.dispatch_feedback_bytes(&[0x01, 0x01]);
+        assert_eq!(
+            injector.buttons.lock().unwrap().clone(),
+            vec![(100, 200, 1, true)]
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_feedback_bytes_clears_buf_on_unknown_msg_type() {
+        // A truly unknown msg_type must drop the rest of the buffer; a
+        // valid PointerMove after that must dispatch normally.
+        use crate::transport::input_inject::InputInjector;
+        use std::sync::{Arc, Mutex};
+
+        struct CountingInjector {
+            moves: Mutex<Vec<(i16, i16)>>,
+        }
+        impl InputInjector for CountingInjector {
+            fn pointer_move(&self, x: i16, y: i16) {
+                self.moves.lock().unwrap().push((x, y));
+            }
+            fn pointer_button(&self, _: i16, _: i16, _: u8, _: bool) {}
+            fn wheel(&self, _: i16, _: i16) {}
+            fn key(&self, _: u32, _: bool) {}
+        }
+
+        let injector = Arc::new(CountingInjector { moves: Mutex::new(Vec::new()) });
+        let mut bridge = make_bridge_for_test().await;
+        bridge.input_injector = Some(injector.clone() as Arc<dyn InputInjector>);
+
+        bridge.dispatch_feedback_bytes(&[0xff, 0xaa, 0xbb]);
+        bridge.dispatch_feedback_bytes(&[0x05, 0x01, 0x00, 0x0a, 0x00, 0x14]);
+        assert_eq!(injector.moves.lock().unwrap().clone(), vec![(10, 20)]);
     }
 }
