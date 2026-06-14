@@ -99,6 +99,21 @@ pub fn decode_input_msg(data: &[u8]) -> Option<(InputMsg, usize)> {
     }
 }
 
+/// Routes an `InputMsg` to the matching `InputInjector` trait method.
+/// Kept separate from `decode_input_msg` so the parser and the
+/// dispatcher can be tested independently.
+pub fn apply_input(injector: &dyn InputInjector, msg: &InputMsg) {
+    match *msg {
+        InputMsg::PointerMove { x, y } => injector.pointer_move(x, y),
+        InputMsg::PointerButton { x, y, button, down } => {
+            injector.pointer_button(x, y, button, down)
+        }
+        InputMsg::Wheel { dx, dy } => injector.wheel(dx, dy),
+        InputMsg::KeyDown { keysym } => injector.key(keysym, true),
+        InputMsg::KeyUp { keysym } => injector.key(keysym, false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,5 +190,85 @@ mod tests {
         assert_eq!(decode_input_msg(&[0x05, 0x01, 0, 0]), None);
         assert_eq!(decode_input_msg(&[]), None);
         assert_eq!(decode_input_msg(&[0x05]), None);
+    }
+
+    /// Records every trait call as a typed event. Used to verify that
+    /// `apply_input` routes each `InputMsg` variant to the right method
+    /// with the right arguments.
+    struct MockInjector {
+        calls: std::sync::Mutex<Vec<MockCall>>,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum MockCall {
+        PointerMove(i16, i16),
+        PointerButton(i16, i16, u8, bool),
+        Wheel(i16, i16),
+        Key(u32, bool),
+    }
+    impl MockInjector {
+        fn new() -> Self {
+            Self { calls: std::sync::Mutex::new(Vec::new()) }
+        }
+        fn calls(&self) -> Vec<MockCall> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+    impl InputInjector for MockInjector {
+        fn pointer_move(&self, x: i16, y: i16) {
+            self.calls.lock().unwrap().push(MockCall::PointerMove(x, y));
+        }
+        fn pointer_button(&self, x: i16, y: i16, button: u8, down: bool) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(MockCall::PointerButton(x, y, button, down));
+        }
+        fn wheel(&self, dx: i16, dy: i16) {
+            self.calls.lock().unwrap().push(MockCall::Wheel(dx, dy));
+        }
+        fn key(&self, keysym: u32, down: bool) {
+            self.calls.lock().unwrap().push(MockCall::Key(keysym, down));
+        }
+    }
+
+    #[test]
+    fn apply_pointer_move_calls_pointer_move() {
+        let m = MockInjector::new();
+        apply_input(&m, &InputMsg::PointerMove { x: 17, y: 42 });
+        assert_eq!(m.calls(), vec![MockCall::PointerMove(17, 42)]);
+    }
+
+    #[test]
+    fn apply_pointer_button_calls_pointer_button() {
+        let m = MockInjector::new();
+        apply_input(
+            &m,
+            &InputMsg::PointerButton { x: 1, y: 2, button: 3, down: true },
+        );
+        assert_eq!(
+            m.calls(),
+            vec![MockCall::PointerButton(1, 2, 3, true)]
+        );
+    }
+
+    #[test]
+    fn apply_wheel_calls_wheel() {
+        let m = MockInjector::new();
+        apply_input(&m, &InputMsg::Wheel { dx: 0, dy: -3 });
+        assert_eq!(m.calls(), vec![MockCall::Wheel(0, -3)]);
+    }
+
+    #[test]
+    fn apply_key_down_calls_key_with_down_true() {
+        let m = MockInjector::new();
+        apply_input(&m, &InputMsg::KeyDown { keysym: 0xff0d });
+        assert_eq!(m.calls(), vec![MockCall::Key(0xff0d, true)]);
+    }
+
+    #[test]
+    fn apply_key_up_calls_key_with_down_false() {
+        let m = MockInjector::new();
+        apply_input(&m, &InputMsg::KeyUp { keysym: 0xff0d });
+        assert_eq!(m.calls(), vec![MockCall::Key(0xff0d, false)]);
     }
 }
