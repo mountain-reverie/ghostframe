@@ -67,10 +67,14 @@ impl GhostframeServer {
     pub async fn new(
         config: GhostbridgeConfig,
         listen_addr: &str,
+        input_injector: Option<
+            Arc<dyn crate::transport::input_inject::InputInjector>,
+        >,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let (frame_tx, frame_rx) = mpsc::channel::<FrameSubmission>(2);
 
         let mut bridge = IoBridge::new_with_frames(&config, listen_addr, frame_rx).await?;
+        bridge.input_injector = input_injector;
         let cert_hash = bridge.cert_hash_sha256().to_owned();
         let connected_session_count = bridge.connected_session_count_handle();
 
