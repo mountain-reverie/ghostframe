@@ -9,6 +9,7 @@ import { WebGpuRenderer } from './webgpu/renderer.js';
 import { WebGpuUnavailableError } from './webgpu/init.js';
 import { ParityRecovery } from './fec';
 import { LossTracker, encodeHello } from './feedback';
+import { attachInputCapture } from './input/wire';
 import { DecodeErrorBatcher } from './decode_error_batcher';
 import { AckBatcher } from './ack';
 import { initDiagnostics } from './diagnostics.js';
@@ -342,6 +343,17 @@ async function main() {
     } catch (e) {
       console.warn('HELLO write failed:', e);
     }
+  }
+
+  // Browser → server input forwarding. Hooks pointer / wheel / keyboard
+  // on the canvas and routes events through the same feedback writer the
+  // HELLO above just used. See docs/superpowers/specs/2026-06-13-
+  // input-forwarding-design.md.
+  if (feedbackWriter) {
+    attachInputCapture(canvasEl, feedbackWriter, () => ({
+      width: renderer.framebuffer.width,
+      height: renderer.framebuffer.height,
+    }));
   }
 
   // Decode-error writer can throw once when the feedback stream closes
