@@ -6,6 +6,7 @@
 //! without the Firefox path can still run the rest of the suite.
 
 use ghostframe_e2e::harness::browser::{BrowserSession, FirefoxLaunch, FirefoxSession};
+use ghostframe_e2e::harness::run_input_dispatch_smoke;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn firefox_session_smoke() {
@@ -36,5 +37,26 @@ async fn firefox_session_smoke() {
         png.len() > 100,
         "screenshot returned suspiciously few bytes"
     );
+    s.close().await.expect("close");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn firefox_input_dispatch_smoke() {
+    for tool in ["firefox", "geckodriver", "certutil"] {
+        if which::which(tool).is_err() {
+            eprintln!("SKIP firefox_input_dispatch_smoke: {tool} not on PATH");
+            return;
+        }
+    }
+    let cfg = FirefoxLaunch {
+        display: std::env::var("DISPLAY").unwrap_or_default(),
+        xdg_runtime_dir: std::env::var("XDG_RUNTIME_DIR").unwrap_or_default(),
+        cert_pem: String::new(),
+        firefox_bin: FirefoxLaunch::default_firefox_bin(),
+    };
+    let mut s = FirefoxSession::new(cfg).await.expect("FirefoxSession::new");
+    run_input_dispatch_smoke(&mut s)
+        .await
+        .expect("run_input_dispatch_smoke");
     s.close().await.expect("close");
 }
