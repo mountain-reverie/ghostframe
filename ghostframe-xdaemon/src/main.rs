@@ -193,7 +193,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .ok()
         .filter(|v| !v.is_empty() && v != "0")
         .is_some();
-    let backend = if force_x11 {
+    let mut backend = if force_x11 {
         tracing::info!("GHOSTFRAME_X11_CAPTURE_ONLY set; skipping DRM probe");
         let capture = x11_capture::X11Capture::new()?;
         CaptureBackend::X11 {
@@ -283,7 +283,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         });
 
-        let submission = match &backend {
+        let submission = match &mut backend {
             CaptureBackend::Drm => match drm_capture::capture() {
                 Ok(drm_capture::CaptureResult::Prime(dmabuf_fd, geom, capture_done_ns)) => {
                     let timestamp_us = (frame_count * frame_interval.as_micros() as u64) as u32;
