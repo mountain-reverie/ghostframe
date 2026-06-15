@@ -20,34 +20,34 @@
 //!
 //! 1. **Query the COMPOSITE extension.** If absent, capture from root
 //!    (legacy / Xvfb behaviour) and warn.
-//! 2. **Try `RedirectSubwindows(root, Automatic)`.** No compositor is
-//!    running — the X server now composes children into root for us, so
-//!    capture from root. This is the desired path when the user hasn't
-//!    started an external compositor.
-//! 3. **`BadAccess` from step 2** means another compositor (the WM)
-//!    already redirected. Fall back to `GetOverlayWindow(root)` and
-//!    capture from the **composite overlay window** — the per-screen
-//!    window the X server creates above all redirected children for
-//!    compositors to render into. Most XRender-based compositors (E20
-//!    default, picom legacy) draw their final blend here, so `GetImage`
-//!    on it returns what's visible to the user. GL-backed compositors
-//!    that render directly to the framebuffer via DRI3 may leave the
-//!    overlay pixmap empty — that case is documented in the journal as
-//!    a warn-level hint to disable the WM compositor.
+//! 2. **`GetOverlayWindow(root)`** — when COMPOSITE is present, capture
+//!    from the composite overlay window: the per-screen window above
+//!    all redirected children that compositors render into. XRender-
+//!    based compositors (E20 default, picom-legacy) blit the final
+//!    composite here, so `GetImage` returns the visible desktop.
+//!    GL-backed compositors that bypass XRender and write straight to
+//!    the framebuffer via DRI3 may leave the overlay pixmap empty — we
+//!    log a warn-level hint to disable the WM compositor or switch to
+//!    a non-compositing WM in that case.
 //!
-//! The redirect/overlay handle is held for the lifetime of the
-//! `X11Capture` so the X server doesn't reclaim it.
+//! We deliberately do NOT call `RedirectSubwindows(root, Automatic)`
+//! ourselves. The systemd dependency chain (`ghostframe-wm.service`
+//! before `ghostframe-xdaemon.service`) doesn't actually guarantee the
+//! WM's compositor has claimed its redirect yet — "service started"
+//! just means the binary launched. We can race and win the redirect;
+//! the WM then gets `BadAccess` when it tries to set `Manual` and its
+//! compositor silently fails to start, leaving the desktop visually
+//! broken even though our capture briefly looks correct. Always
+//! deferring to the overlay window keeps the WM's compositor alive and
+//! gives us the same composited output the WM produces for its own
+//! drawing target.
 
 use std::io;
 
 use ghostframe_lib::FrameSubmission;
 use x11rb::connection::Connection;
-use x11rb::errors::ReplyError;
-use x11rb::protocol::composite::{
-    ConnectionExt as CompositeExt, Redirect as CompositeRedirect,
-};
+use x11rb::protocol::composite::ConnectionExt as CompositeExt;
 use x11rb::protocol::xproto::{ConnectionExt, ImageFormat};
-use x11rb::protocol::ErrorKind;
 use x11rb::rust_connection::RustConnection;
 
 /// Read CLOCK_MONOTONIC and return the value as nanoseconds.
@@ -67,14 +67,11 @@ fn monotonic_now_ns() -> u64 {
 /// How `X11Capture` is sourcing pixels — recorded for diagnosability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaptureSource {
-    /// We called `RedirectSubwindows(root, Automatic)` ourselves; the X
-    /// server composites children into root, and `GetImage(root)`
-    /// returns the full composited desktop.
-    RootRedirected,
-    /// Another client holds the redirect (a WM compositor). We read the
-    /// composite overlay window, which compositors typically render to.
+    /// We're reading the composite overlay window — the per-screen
+    /// window that XRender-based WM compositors render their final
+    /// blend into.
     Overlay,
-    /// Composite extension is unavailable. `GetImage(root)` returns
+    /// COMPOSITE extension unavailable. `GetImage(root)` returns
     /// whatever's painted into the root pixmap — the bare desktop
     /// background without window contents on most modern WMs.
     Root,
@@ -132,7 +129,6 @@ impl X11Capture {
     #[allow(dead_code)]
     pub fn source(&self) -> &'static str {
         match self.source {
-            CaptureSource::RootRedirected => "root-redirected",
             CaptureSource::Overlay => "overlay",
             CaptureSource::Root => "root",
         }
@@ -203,55 +199,22 @@ fn pick_capture_target(conn: &RustConnection, root: u32) -> (u32, CaptureSource)
         return (root, CaptureSource::Root);
     }
 
-    // Step 2: Try to be the compositor ourselves. CompositeRedirectAutomatic
-    // makes the server composite children into root for us so GetImage(root)
-    // returns the full desktop. Only one client can hold a redirect; if a
-    // WM compositor is already running this fails with BadAccess and we
-    // fall through to the overlay path.
-    //
-    // The send-vs-check split: composite_redirect_subwindows() returns a
-    // VoidCookie (or ConnectionError if the request couldn't be sent at
-    // all). cookie.check() blocks for the server's reply and surfaces
-    // protocol-level errors (BadAccess, BadWindow, …) as a ReplyError —
-    // these two error types are not interconvertible in x11rb 0.13, so
-    // we match each separately rather than chaining .and_then.
-    let send_result = conn.composite_redirect_subwindows(root, CompositeRedirect::AUTOMATIC);
-    match send_result {
-        Ok(cookie) => match cookie.check() {
-            Ok(()) => {
-                tracing::info!(
-                    "CompositeRedirectAutomatic acquired on root; capturing composited root"
-                );
-                return (root, CaptureSource::RootRedirected);
-            }
-            Err(ReplyError::X11Error(err)) if err.error_kind == ErrorKind::Access => {
-                tracing::info!(
-                    "CompositeRedirectAutomatic denied (existing compositor); trying overlay window"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "CompositeRedirectSubwindows reply error; trying overlay window"
-                );
-            }
-        },
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "CompositeRedirectSubwindows send failed; trying overlay window"
-            );
-        }
-    }
-
-    // Step 3: A compositor is active. Read its overlay window — the
-    // per-screen window X servers create above all redirected children
-    // for compositors to render into. XRender-based compositors (E20
-    // default, picom-legacy) blit the final composite here, so GetImage
-    // on it shows the visible desktop. GL-only compositors that render
-    // directly to the framebuffer via DRI3 may leave it empty; that
-    // case is unsalvageable without a GL/DRI3 readback path and is
+    // Step 2: Read the composite overlay window — the per-screen window
+    // X servers create above all redirected children for compositors to
+    // render into. XRender-based compositors (E20 default, picom-legacy)
+    // blit the final composite here, so GetImage on it shows the
+    // visible desktop. GL-only compositors that bypass XRender and
+    // write directly to the framebuffer via DRI3 may leave it empty;
+    // that case is unsalvageable without a GL/DRI3 readback path and is
     // documented as a `disable compositor` hint at warn level.
+    //
+    // We do NOT attempt CompositeRedirectAutomatic ourselves: only one
+    // client may hold an Automatic redirect on a given parent's
+    // subwindows, and if we win the race against the WM compositor's
+    // Manual redirect (the systemd ordering only guarantees the binary
+    // launched, not that it grabbed the redirect), the WM's compositor
+    // gets BadAccess and silently fails to start, leaving the desktop
+    // visually broken.
     let overlay_send = conn.composite_get_overlay_window(root);
     match overlay_send {
         Ok(cookie) => match cookie.reply() {
