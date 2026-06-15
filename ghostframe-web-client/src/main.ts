@@ -490,17 +490,25 @@ async function main() {
     const firstRecv = firstRecvMs.get(frameSeqFromKey);
     // Route tile data into the appropriate renderer queue.
 
+    // Diagnostic counters: every tile increments by codec so the periodic
+    // status log can see at a glance whether we're receiving content.
+    const w = window as any;
+    w.__tileCounts = w.__tileCounts ?? { raw: 0, solid: 0, palrle: 0, cdf53: 0, h264: 0, other: 0 };
+    w.__lastTileSeq = frameSeqFromKey;
     if (asm.header.codec === Codec.Raw) {
+      w.__tileCounts.raw++;
       renderer.rawQueue.push({ tileX: tX, tileY: tY, bgra: payload });
     } else if (asm.header.codec === Codec.Solid) {
+      w.__tileCounts.solid++;
       if (payload.byteLength === 4) {
         renderer.solidQueue.push({ tileX: tX, tileY: tY, bgra: payload });
       }
     } else if (asm.header.codec === Codec.PalRle) {
+      w.__tileCounts.palrle++;
       renderer.palRleQueue.push({ tileX: tX, tileY: tY, payload });
     } else if (asm.header.codec === Codec.Cdf53) {
+      w.__tileCounts.cdf53++;
       // M3.3b diagnostic counters: track every Cdf53 dispatch branch.
-      const w = window as any;
       w.__cdf53DispatchSeen = (w.__cdf53DispatchSeen ?? 0) + 1;
       const r = prevalidateCdf53(payload, asm.header.generation, asm.header.pass);
       if (!r.ok) {
@@ -563,6 +571,11 @@ async function main() {
 
   // rAF loop — drains queues, flushes one frame per animation tick.
   let __rafTicks = 0;
+  // Periodic diagnostic: every ~2 seconds dump tile + queue + framebuffer
+  // counters to the page log. Lets us see at a glance whether tiles are
+  // arriving, queueing, draining, and the framebuffer is sized.
+  let __lastStatsMs = 0;
+  let __lastDrainCounts = { raw: 0, solid: 0, palrle: 0, cdf53: 0, h264: 0 };
   function tick() {
     __rafTicks++;
     diag.recordRafTick(__rafTicks);
@@ -581,9 +594,58 @@ async function main() {
       pendingFramePaintRaf.clear();
     }
 
+    // Snapshot queue depths BEFORE drain so we can log how much each rAF
+    // actually consumed.
+    const beforeDrain = {
+      raw: renderer.rawQueue.length,
+      solid: renderer.solidQueue.length,
+      palrle: renderer.palRleQueue.length,
+      cdf53: renderer.cdf53Queue.length,
+      h264: renderer.h264Queue.length,
+    };
+
     renderer.encodeAndPresentFrame((codec, tx, ty, code) => {
       decodeErrorBatcher.report({ codec, tileX: tx, tileY: ty, errorCode: code });
     });
+
+    // Track drained counts (queue clearing = drained this tick).
+    const w = window as any;
+    w.__rafDrainTotals = w.__rafDrainTotals ?? { raw: 0, solid: 0, palrle: 0, cdf53: 0, h264: 0 };
+    w.__rafDrainTotals.raw += beforeDrain.raw;
+    w.__rafDrainTotals.solid += beforeDrain.solid;
+    w.__rafDrainTotals.palrle += beforeDrain.palrle;
+    w.__rafDrainTotals.cdf53 += beforeDrain.cdf53;
+    w.__rafDrainTotals.h264 += beforeDrain.h264;
+    w.__rafTicks = __rafTicks;
+
+    // Once every ~2 s, log a one-liner summary so the page log shows what's
+    // happening without needing devtools. Useful when investigating "canvas
+    // is black but tiles seem to be arriving" failure modes.
+    const nowMs = performance.now();
+    if (nowMs - __lastStatsMs > 2000) {
+      __lastStatsMs = nowMs;
+      const counts = w.__tileCounts ?? { raw: 0, solid: 0, palrle: 0, cdf53: 0, h264: 0, other: 0 };
+      const drained = w.__rafDrainTotals;
+      const drainDelta = {
+        raw: drained.raw - __lastDrainCounts.raw,
+        solid: drained.solid - __lastDrainCounts.solid,
+        palrle: drained.palrle - __lastDrainCounts.palrle,
+        cdf53: drained.cdf53 - __lastDrainCounts.cdf53,
+        h264: drained.h264 - __lastDrainCounts.h264,
+      };
+      __lastDrainCounts = { ...drained };
+      const fb = renderer.framebuffer;
+      const cdf53Fails = w.__cdf53PrevalidateFails ?? 0;
+      const cdf53Last = w.__cdf53LastFailCode ?? '-';
+      log(
+        `stats: rx{r:${counts.raw} s:${counts.solid} p:${counts.palrle} c:${counts.cdf53} h:${counts.h264}} ` +
+        `Δdrain{r:${drainDelta.raw} s:${drainDelta.solid} p:${drainDelta.palrle} c:${drainDelta.cdf53} h:${drainDelta.h264}} ` +
+        `fb:${fb.width}x${fb.height} ` +
+        `cdf53fails:${cdf53Fails}(last=${cdf53Last}) ` +
+        `raf:${__rafTicks} lastSeq:${w.__lastTileSeq ?? '-'}`
+      );
+    }
+
     requestAnimationFrame(tick);
   }
   requestAnimationFrame(tick);
