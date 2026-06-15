@@ -115,6 +115,16 @@ pub struct X11Capture {
     /// avoid spamming the journal at 30 fps. Lazily flipped on first
     /// non-linear modifier; never reset.
     dri3_disabled_for_modifier: AtomicBool,
+    /// One-shot flag: log the first successful DRI3 capture's pixmap
+    /// metadata at info level so operators (and bug reports) can verify
+    /// modifier, format, stride, and dimensions match expectations
+    /// without needing RUST_LOG=trace.
+    dri3_first_success_logged: AtomicBool,
+    /// One-shot flag: log the first DRI3 per-frame failure at warn
+    /// level, then drop subsequent failures to debug. Without this,
+    /// silent fallback to GetImage at 30 fps appears as success in
+    /// info-level logs while every frame is actually broken.
+    dri3_first_failure_logged: AtomicBool,
 }
 
 impl X11Capture {
@@ -144,6 +154,8 @@ impl X11Capture {
             height,
             source,
             dri3_disabled_for_modifier: AtomicBool::new(false),
+            dri3_first_success_logged: AtomicBool::new(false),
+            dri3_first_failure_logged: AtomicBool::new(false),
         })
     }
 
@@ -171,11 +183,23 @@ impl X11Capture {
             match self.try_capture_dri3(timestamp_us) {
                 Ok(submission) => return Ok(submission),
                 Err(e) => {
-                    // Per-frame DRI3 errors are unusual but recoverable;
-                    // trace and fall through to GetImage so the pipeline
-                    // keeps running. Modifier-unsupported is the only
-                    // case that latches off permanently (handled inside).
-                    tracing::trace!(error = %e, "DRI3 capture failed; falling back to GetImage for this frame");
+                    // First failure → warn so it's visible at the default
+                    // log level. Subsequent failures → debug. Without
+                    // this, the dri3-vs-getimage fallback is invisible
+                    // and looks like a "succeeding" pipeline producing
+                    // empty frames.
+                    if !self
+                        .dri3_first_failure_logged
+                        .swap(true, Ordering::Relaxed)
+                    {
+                        tracing::warn!(
+                            error = %e,
+                            "first DRI3 capture failed; falling back to GetImage. \
+                             Subsequent DRI3 failures will log at debug."
+                        );
+                    } else {
+                        tracing::debug!(error = %e, "DRI3 capture failed; falling back to GetImage");
+                    }
                 }
             }
         }
@@ -192,11 +216,15 @@ impl X11Capture {
         // a single cached name would race the swap and we'd capture an
         // already-recycled buffer.
         let pixmap_id = self.conn.generate_id().map_err(io::Error::other)?;
+        // check() the NameWindowPixmap so a BadDrawable / BadMatch
+        // surfaces immediately instead of cascading into an opaque
+        // BuffersFromPixmap error. One extra round-trip per frame is
+        // the right trade for diagnosability.
         self.conn
             .composite_name_window_pixmap(self.capture_window, pixmap_id)
-            .map_err(io::Error::other)?;
-        // No check() — saves a round-trip. If the call failed the next
-        // BuffersFromPixmap will surface BadDrawable and we fall back.
+            .map_err(io::Error::other)?
+            .check()
+            .map_err(|e| io::Error::other(format!("composite_name_window_pixmap: {e}")))?;
 
         let buffers_cookie = match self.conn.dri3_buffers_from_pixmap(pixmap_id) {
             Ok(c) => c,
@@ -264,6 +292,25 @@ impl X11Capture {
         });
         let width = reply.width as u32;
         let height = reply.height as u32;
+
+        // First-success diagnostic: log the dma-buf metadata so an
+        // operator can verify we got what we expected (stride matches
+        // width × 4, depth = 24, bpp = 32, modifier LINEAR/INVALID).
+        // Once-per-process at info level — no perf cost in the hot path.
+        if !self
+            .dri3_first_success_logged
+            .swap(true, Ordering::Relaxed)
+        {
+            tracing::info!(
+                width,
+                height,
+                stride,
+                depth = reply.depth,
+                bpp = reply.bpp,
+                modifier = format!("0x{:016x}", reply.modifier),
+                "first DRI3 capture succeeded; subsequent frames will not log per-frame"
+            );
+        }
 
         Ok(FrameSubmission {
             width,
