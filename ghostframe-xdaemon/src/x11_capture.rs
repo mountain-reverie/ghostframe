@@ -142,10 +142,40 @@ impl X11Capture {
 
     /// Capture a single frame.
     pub fn capture(&mut self, timestamp_us: u32) -> io::Result<FrameSubmission> {
-        match self.strategy {
-            Strategy::PerWindowComposite => self.capture_composite(timestamp_us),
-            Strategy::RootGetImage => self.capture_root(timestamp_us),
+        let frame = match self.strategy {
+            Strategy::PerWindowComposite => self.capture_composite(timestamp_us)?,
+            Strategy::RootGetImage => self.capture_root(timestamp_us)?,
+        };
+        // One-shot diagnostic: dump the first captured frame to the path
+        // in `GHOSTFRAME_DUMP_FIRST_FRAME` so we can byte-compare against
+        // `xwd -root` / `import -window root`. Unset on first call so
+        // subsequent frames are not re-dumped. Only fires on the CPU
+        // path (pixels.len() > 0); the DMA-BUF path would write 0 bytes.
+        if !frame.pixels.is_empty() {
+            if let Ok(path) = std::env::var("GHOSTFRAME_DUMP_FIRST_FRAME") {
+                let header = format!(
+                    "ghostframe-bgra width={} height={} stride={}\n",
+                    frame.width, frame.height, frame.stride
+                );
+                let _ = std::fs::write(
+                    format!("{path}.meta"),
+                    header.as_bytes(),
+                );
+                let _ = std::fs::write(&path, &frame.pixels);
+                std::env::remove_var("GHOSTFRAME_DUMP_FIRST_FRAME");
+                tracing::info!(
+                    path = %path,
+                    width = frame.width,
+                    height = frame.height,
+                    bytes = frame.pixels.len(),
+                    "GHOSTFRAME_DUMP_FIRST_FRAME: dumped raw BGRA to disk; \
+                     compare with `xwd -root` / `import -window root` to \
+                     verify whether XGetImage(root) is returning the visible \
+                     desktop or stale/empty content"
+                );
+            }
         }
+        Ok(frame)
     }
 
     /// Per-window composite path.
@@ -351,7 +381,23 @@ impl X11Capture {
 }
 
 /// Pick a strategy by probing COMPOSITE + `_NET_WM_CM_S0`.
+///
+/// `GHOSTFRAME_FORCE_ROOT_GET_IMAGE=1` is a diagnostic escape hatch:
+/// always use the plain GetImage(root) path regardless of compositor
+/// presence. Lets operators reproduce exactly what `xwd -root` /
+/// `import -window root` do, to verify whether their compositor's
+/// rendering is reachable via the legacy path.
 fn pick_strategy(conn: &RustConnection, root: u32) -> Strategy {
+    if std::env::var("GHOSTFRAME_FORCE_ROOT_GET_IMAGE")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false)
+    {
+        tracing::info!(
+            "GHOSTFRAME_FORCE_ROOT_GET_IMAGE set; bypassing compositor probe and \
+             using plain GetImage(root) — same call `import -window root` makes"
+        );
+        return Strategy::RootGetImage;
+    }
     let composite_present = match conn.query_extension(b"Composite") {
         Ok(c) => c.reply().map(|r| r.present).unwrap_or(false),
         Err(_) => false,
