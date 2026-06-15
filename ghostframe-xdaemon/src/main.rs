@@ -182,32 +182,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Ok(());
     }
 
-    // Select capture backend: try DRM first, fall back to X11.
-    let backend = match drm_capture::capture() {
-        Ok(result) => {
-            let (path_label, w, h) = match &result {
-                drm_capture::CaptureResult::Prime(_, g, _) => {
-                    ("zero-copy GPU path (PRIME DMA-BUF)", g.width, g.height)
-                }
-                drm_capture::CaptureResult::Pixels(_, g, _) => {
-                    ("CPU-mmap path (modesetting FB)", g.width, g.height)
-                }
-            };
-            drop(result);
-            tracing::info!(
-                width = w,
-                height = h,
-                "DRM capture available ({})",
-                path_label
-            );
-            CaptureBackend::Drm
+    // Select capture backend. Default: try DRM first, fall back to X11. With
+    // GHOSTFRAME_X11_CAPTURE_ONLY=1, skip the DRM probe entirely — the
+    // modesetting-FB fallback inside `drm_capture::capture()` would read
+    // /dev/dri/card0's active scanout (the host's real display) rather than
+    // the guest Xorg on :1, producing solid-black or host-screen captures
+    // for the guest-mode install. See packaging/systemd/
+    // ghostframe-xdaemon.service which sets the env var by default.
+    let force_x11 = std::env::var("GHOSTFRAME_X11_CAPTURE_ONLY")
+        .ok()
+        .filter(|v| !v.is_empty() && v != "0")
+        .is_some();
+    let backend = if force_x11 {
+        tracing::info!("GHOSTFRAME_X11_CAPTURE_ONLY set; skipping DRM probe");
+        let capture = x11_capture::X11Capture::new()?;
+        CaptureBackend::X11 {
+            capture: Box::new(capture),
         }
-        Err(e) => {
-            tracing::warn!("DRM capture unavailable: {e}");
-            tracing::info!("Falling back to X11 capture");
-            let capture = x11_capture::X11Capture::new()?;
-            CaptureBackend::X11 {
-                capture: Box::new(capture),
+    } else {
+        match drm_capture::capture() {
+            Ok(result) => {
+                let (path_label, w, h) = match &result {
+                    drm_capture::CaptureResult::Prime(_, g, _) => {
+                        ("zero-copy GPU path (PRIME DMA-BUF)", g.width, g.height)
+                    }
+                    drm_capture::CaptureResult::Pixels(_, g, _) => {
+                        ("CPU-mmap path (modesetting FB)", g.width, g.height)
+                    }
+                };
+                drop(result);
+                tracing::info!(
+                    width = w,
+                    height = h,
+                    "DRM capture available ({})",
+                    path_label
+                );
+                CaptureBackend::Drm
+            }
+            Err(e) => {
+                tracing::warn!("DRM capture unavailable: {e}");
+                tracing::info!("Falling back to X11 capture");
+                let capture = x11_capture::X11Capture::new()?;
+                CaptureBackend::X11 {
+                    capture: Box::new(capture),
+                }
             }
         }
     };

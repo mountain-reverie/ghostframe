@@ -13,6 +13,16 @@ Type=simple
 Environment=DISPLAY=:1
 Environment=TS_HOSTNAME=%H-ghostframe
 Environment=TS_STATE_DIR=%h/.local/share/ghostframe/ts-state
+# Guest-mode install: skip DRM probe. The DRM modesetting-FB fallback
+# inside drm_capture::capture() reads /dev/dri/card0's active scanout
+# (= host's real display) instead of the guest Xorg on DISPLAY=:1, so
+# the captured framebuffer never matches what the guest WM is painting.
+# The writeback-connector DRM path can't escape this either while Xorg
+# holds master on the same card (see drm_capture.rs's "DRM master
+# conflicts" section). X11 GetImage against :1 reads the right pixels.
+# Unset this on truly headless deployments (no X server, xdaemon is the
+# sole DRM client) to re-enable the zero-copy DRM path.
+Environment=GHOSTFRAME_X11_CAPTURE_ONLY=1
 # X11 readiness is gated inside the daemon (wait_for_x11 in main.rs): the
 # daemon blocks on x11rb::connect for up to 10s before bringing up tsnet,
 # and exits with a clear journal message on timeout.
