@@ -644,6 +644,44 @@ async function main() {
         `cdf53fails:${cdf53Fails}(last=${cdf53Last}) ` +
         `raf:${__rafTicks} lastSeq:${w.__lastTileSeq ?? '-'}`
       );
+
+      // Framebuffer readback: once per stats tick, sample 4 known-position
+      // pixels and log them. Settles the "is the framebuffer texture
+      // actually written or is the blit broken" question.
+      //
+      //   (16,16)      = top-left background
+      //   (960, 540)   = dead center (likely wizard for our test)
+      //   (768, 992)   = first-tile area (24,31)*32
+      //   (1900,1060)  = bottom-right corner
+      //
+      // Stays async — we kick off the GPU mapAsync and let the result land
+      // in the next log line. Failing readback (no renderer wired up,
+      // OOB coords) logs the exception so it's visible.
+      const readPixel = (window as any).__readPixel as
+        | ((x: number, y: number) => Promise<number[]>)
+        | undefined;
+      if (readPixel && fb.width > 0 && fb.height > 0) {
+        const xs = [16, 960, 768, 1900];
+        const ys = [16, 540, 992, 1060];
+        Promise.all(
+          xs.map((x, i) =>
+            readPixel(Math.min(x, fb.width - 1), Math.min(ys[i], fb.height - 1)),
+          ),
+        )
+          .then(samples => {
+            const fmt = (px: number[]) =>
+              `[${px[0]},${px[1]},${px[2]},${px[3]}]`;
+            log(
+              `fb-pixels: tl(16,16)=${fmt(samples[0])} ` +
+              `ctr(960,540)=${fmt(samples[1])} ` +
+              `tile(768,992)=${fmt(samples[2])} ` +
+              `br(1900,1060)=${fmt(samples[3])}`,
+            );
+          })
+          .catch(err => {
+            log(`fb-pixels readback failed: ${err}`);
+          });
+      }
     }
 
     requestAnimationFrame(tick);
