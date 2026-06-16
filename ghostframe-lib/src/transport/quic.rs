@@ -88,9 +88,22 @@ impl QuicServer {
         // `datagram_receive_buffer_size` takes `Option<usize>`.
         transport_config.datagram_receive_buffer_size(Some(65536));
         // `datagram_send_buffer_size` takes `usize` (not Option) in quinn-proto 0.11.
-        // Sized for a full raw-codec frame: 20 tiles × ~55 fragments × 1200 bytes ≈ 1.3 MB.
-        // With drop=true on send, a too-small buffer silently discards tiles.
-        transport_config.datagram_send_buffer_size(2 * 1024 * 1024);
+        //
+        // Sized for the worst-case first-frame cdf53 burst: 2040 dirty tiles ×
+        // 14 progressive passes × ~500 B mean payload ≈ 14 MB. The previous
+        // 2 MB cap was set for a raw-codec frame and pre-dated the cdf53
+        // refinement queue, so cdf53 emissions saturated the buffer at
+        // session start and the tail of the burst was rejected (visible as
+        // a ~70 % drop in tiles reaching the client even after we flipped
+        // quinn-proto's silent-drop-oldest behaviour off in `send_datagram`).
+        //
+        // 16 MB worth of pending datagrams is well below any realistic
+        // memory ceiling, the cost is only paid when emission outruns
+        // drain, and it buys us enough headroom to absorb the entire first
+        // frame's cdf53 burst until cwnd ramps. A proper rate-paced
+        // scheduler is the longer-term fix — this just gets cdf53
+        // first-frame quality usable in the meantime.
+        transport_config.datagram_send_buffer_size(16 * 1024 * 1024);
 
         // --- 6. ServerConfig ---
         let mut server_config = ServerConfig::with_crypto(Arc::new(quic_tls));
