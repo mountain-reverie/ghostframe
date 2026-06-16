@@ -56,6 +56,45 @@ use crate::transport::webtransport::WebTransportServer;
 const QUIC_SCRATCH: usize = 2048;
 
 // ---------------------------------------------------------------------------
+// Scheduler tick budgeting (A + B-light)
+// ---------------------------------------------------------------------------
+// `dispatch_dirty_tiles_via_scheduler` used to call `scheduler.tick(usize::MAX)`,
+// asking the scheduler to drain *everything* and handing the entire dirty
+// burst to QUIC in one go. With a first-frame cdf53 emission that runs
+// ~14 MB (2040 tiles × 14 progressive passes × ~500 B mean), this
+// catastrophically overran the datagram_send_buffer, with quinn either
+// silently overwriting older queued datagrams (drop=true, pre-81e4954) or
+// returning Blocked errors that dropped tiles on the floor (drop=false,
+// post-81e4954).
+//
+// The scheduler already accepts a per-tick byte budget and explicitly
+// keeps un-drained work in its queues for the next tick (see
+// `drain_priority_queue` / `drain_refinement_pass_major`). We just have
+// to use it. The budget tracks the measured QUIC bandwidth — feed-forward
+// (A) — and modulates down on observed send errors — feedback (B-light).
+//
+// Frame interval: hard-coded for 30 FPS capture (the daemon default).
+// At higher capture rates we'd budget conservatively (cap each tick to
+// the 30-FPS slice), which is fine — un-drained work carries across.
+const SCHEDULER_TICK_INTERVAL_US: f64 = 33_333.0;
+// Leave 10 % headroom in the budget so we don't push right up to quinn's
+// drain rate every tick (ACKs, feedback, NACK retransmits still need
+// wire). Cheap enough.
+const SCHEDULER_TICK_BUDGET_FRACTION: f64 = 0.90;
+// Safety floor for the first frames before `adaptation_context.bytes_per_us`
+// has been populated from path stats. 256 KB × 30 FPS = 7.5 MB/s — well
+// under any realistic tailnet path so we won't hammer a slow link, but
+// big enough that the visible-content first frame still lands quickly.
+const SCHEDULER_TICK_BUDGET_FLOOR_BYTES: usize = 256 * 1024;
+// AIMD constants. Halving on error is conservative; 10 % ramp-up
+// per clean frame recovers a 16× drop in ~30 frames (1 second at 30 FPS).
+// Floor at 5 % so a sustained-loss link can't pin us to "send nothing".
+const SCHEDULER_BUDGET_BACKOFF: f64 = 0.5;
+const SCHEDULER_BUDGET_RAMP: f64 = 1.1;
+const SCHEDULER_BUDGET_MULT_MIN: f64 = 0.05;
+const SCHEDULER_BUDGET_MULT_MAX: f64 = 1.0;
+
+// ---------------------------------------------------------------------------
 // M3.5 bench telemetry: per-frame send-side stats
 // ---------------------------------------------------------------------------
 
@@ -302,6 +341,15 @@ pub struct IoBridge {
     /// counter but log at `debug` to avoid 30 Hz warn-spam under
     /// sustained backpressure.
     datagram_send_err_first_logged: bool,
+    /// AIMD multiplier on the per-tick scheduler budget. Initialised to
+    /// 1.0; halved (down to `BUDGET_MIN_MULTIPLIER`) whenever a dispatch
+    /// pass observes ≥1 `send_datagram` error (proof our budget exceeded
+    /// quinn's actual drain); ramped back up by `BUDGET_RAMP_FACTOR` on
+    /// every error-free dispatch (capped at 1.0). Classic TCP-style
+    /// additive-increase / multiplicative-decrease, but applied to the
+    /// scheduler budget rather than the cwnd. Lives on the bridge so it
+    /// survives across `process_frame_gpu` invocations.
+    tick_budget_multiplier: f64,
 }
 
 /// Per-frame inputs passed into `dispatch_dirty_tiles_via_scheduler`.
@@ -571,6 +619,7 @@ impl IoBridge {
             feedback_recv_buf: Vec::new(),
             datagram_send_errs: 0,
             datagram_send_err_first_logged: false,
+            tick_budget_multiplier: 1.0,
         })
     }
 
@@ -889,7 +938,32 @@ impl IoBridge {
             });
         }
 
-        let drained = self.scheduler.tick(usize::MAX);
+        // ---- A + B-light: feedback-modulated rate pacing ----
+        //
+        // (A, feedforward) Per-tick budget = measured QUIC bandwidth
+        // (bytes/µs from path stats) × 33 ms frame interval × headroom.
+        // The scheduler retains un-drained work in its queues, so a
+        // 14 MB first-frame burst naturally spreads across ~70 frames
+        // at typical tailnet speeds rather than dumping in one go.
+        //
+        // (B-light, feedback) `tick_budget_multiplier` shrinks on every
+        // dispatch that observes a send_datagram Err (proof our
+        // bytes_per_us estimate is too generous for quinn's actual drain)
+        // and ramps back up on every error-free dispatch. Classic AIMD.
+        //
+        // CpuRawOnly tests bypass this with `usize::MAX` so unit fixtures
+        // that pre-seed tiles still drain in one tick.
+        let pre_dispatch_send_errs = self.datagram_send_errs;
+        let base_budget_bytes = (((self.adaptation_context.bytes_per_us as f64)
+            * SCHEDULER_TICK_INTERVAL_US
+            * SCHEDULER_TICK_BUDGET_FRACTION) as usize)
+            .max(SCHEDULER_TICK_BUDGET_FLOOR_BYTES);
+        let tick_budget_bytes = match policy {
+            SchedulerEmissionPolicy::CpuRawOnly => usize::MAX,
+            _ => ((base_budget_bytes as f64) * self.tick_budget_multiplier) as usize,
+        };
+        let drained = self.scheduler.tick(tick_budget_bytes);
+        let drained_count = drained.len();
         let mut stats = FrameSendStats::default();
         for work in drained {
             let datagrams = fragment_tile(
@@ -970,6 +1044,36 @@ impl IoBridge {
                 self.send_to_all_sessions(dg);
             }
         }
+
+        // ---- AIMD feedback: shrink the multiplier on any send error,
+        //      ramp back up on a clean dispatch. CpuRawOnly bypasses the
+        //      tracking — it ran with unbudgeted `usize::MAX` and unit
+        //      fixtures don't go through real QUIC paths anyway.
+        if !matches!(policy, SchedulerEmissionPolicy::CpuRawOnly) {
+            let errs_this_dispatch =
+                self.datagram_send_errs.saturating_sub(pre_dispatch_send_errs);
+            let mult_before = self.tick_budget_multiplier;
+            if errs_this_dispatch > 0 {
+                self.tick_budget_multiplier =
+                    (self.tick_budget_multiplier * SCHEDULER_BUDGET_BACKOFF)
+                        .max(SCHEDULER_BUDGET_MULT_MIN);
+            } else {
+                self.tick_budget_multiplier =
+                    (self.tick_budget_multiplier * SCHEDULER_BUDGET_RAMP)
+                        .min(SCHEDULER_BUDGET_MULT_MAX);
+            }
+            tracing::debug!(
+                drained_count = drained_count,
+                tick_budget_bytes = tick_budget_bytes,
+                base_budget_bytes = base_budget_bytes,
+                bytes_per_us = self.adaptation_context.bytes_per_us,
+                errs_this_dispatch = errs_this_dispatch,
+                multiplier_before = mult_before,
+                multiplier_after = self.tick_budget_multiplier,
+                "scheduler.tick AIMD"
+            );
+        }
+
         stats
     }
 
@@ -2899,6 +3003,7 @@ impl IoBridge {
             feedback_recv_buf: Vec::new(),
             datagram_send_errs: 0,
             datagram_send_err_first_logged: false,
+            tick_budget_multiplier: 1.0,
         }
     }
 
@@ -2963,6 +3068,7 @@ impl IoBridge {
             feedback_recv_buf: Vec::new(),
             datagram_send_errs: 0,
             datagram_send_err_first_logged: false,
+            tick_budget_multiplier: 1.0,
         }
     }
 
