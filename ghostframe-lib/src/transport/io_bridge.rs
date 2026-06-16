@@ -350,6 +350,32 @@ pub struct IoBridge {
     /// scheduler budget rather than the cwnd. Lives on the bridge so it
     /// survives across `process_frame_gpu` invocations.
     tick_budget_multiplier: f64,
+    /// Continuation state for the in-flight frame's scheduler tick.
+    /// Populated at the end of `dispatch_dirty_tiles_via_scheduler` and
+    /// consumed by the `Event::DatagramsUnblocked` handler so that as
+    /// soon as quinn drains its send buffer we top it back up from the
+    /// scheduler queues — without waiting for the next 33 ms capture
+    /// tick. This is the "pull-driven" pacing piece on top of A+B-light:
+    /// rather than running the full per-frame budget in one shot at
+    /// frame-receive time, we hand quinn one chunk and let its
+    /// completion event tell us when there's room for more. The
+    /// `remaining_budget_bytes` field is the per-frame budget minus what
+    /// we've already drained, so we never overshoot the AIMD-adjusted
+    /// frame budget across all continuation invocations.
+    scheduler_continuation: Option<SchedulerContinuation>,
+}
+
+/// State the `Event::DatagramsUnblocked` handler needs to resume the
+/// in-flight frame's scheduler drain. `seq` / `timestamp_us` /
+/// `max_frag` come from the most recent `dispatch_dirty_tiles_via_scheduler`
+/// call; re-emitted refinement work gets tagged with the current frame's
+/// identity even though the underlying TileWork was queued earlier.
+#[derive(Debug, Clone, Copy)]
+struct SchedulerContinuation {
+    seq: u32,
+    timestamp_us: u32,
+    max_frag: usize,
+    remaining_budget_bytes: usize,
 }
 
 /// Per-frame inputs passed into `dispatch_dirty_tiles_via_scheduler`.
@@ -620,6 +646,7 @@ impl IoBridge {
             datagram_send_errs: 0,
             datagram_send_err_first_logged: false,
             tick_budget_multiplier: 1.0,
+            scheduler_continuation: None,
         })
     }
 
@@ -962,9 +989,81 @@ impl IoBridge {
             SchedulerEmissionPolicy::CpuRawOnly => usize::MAX,
             _ => ((base_budget_bytes as f64) * self.tick_budget_multiplier) as usize,
         };
-        let drained = self.scheduler.tick(tick_budget_bytes);
+        let (stats, drained_bytes, drained_count) =
+            self.drain_scheduler_into_quinn(seq, timestamp_us, max_frag, tick_budget_bytes);
+        // Cache the continuation context so `Event::DatagramsUnblocked`
+        // can resume draining the same logical frame without waiting for
+        // the next 33 ms capture tick. CpuRawOnly drains to completion
+        // in one shot under `usize::MAX`; no continuation needed.
+        if !matches!(policy, SchedulerEmissionPolicy::CpuRawOnly) {
+            let remaining = tick_budget_bytes.saturating_sub(drained_bytes);
+            self.scheduler_continuation = if remaining > 0 {
+                Some(SchedulerContinuation {
+                    seq,
+                    timestamp_us,
+                    max_frag,
+                    remaining_budget_bytes: remaining,
+                })
+            } else {
+                None
+            };
+        }
+        // ---- AIMD feedback: shrink the multiplier on any send error,
+        //      ramp back up on a clean dispatch. CpuRawOnly bypasses the
+        //      tracking — it ran with unbudgeted `usize::MAX` and unit
+        //      fixtures don't go through real QUIC paths anyway.
+        if !matches!(policy, SchedulerEmissionPolicy::CpuRawOnly) {
+            let errs_this_dispatch =
+                self.datagram_send_errs.saturating_sub(pre_dispatch_send_errs);
+            let mult_before = self.tick_budget_multiplier;
+            if errs_this_dispatch > 0 {
+                self.tick_budget_multiplier =
+                    (self.tick_budget_multiplier * SCHEDULER_BUDGET_BACKOFF)
+                        .max(SCHEDULER_BUDGET_MULT_MIN);
+            } else {
+                self.tick_budget_multiplier =
+                    (self.tick_budget_multiplier * SCHEDULER_BUDGET_RAMP)
+                        .min(SCHEDULER_BUDGET_MULT_MAX);
+            }
+            tracing::debug!(
+                drained_count = drained_count,
+                tick_budget_bytes = tick_budget_bytes,
+                base_budget_bytes = base_budget_bytes,
+                bytes_per_us = self.adaptation_context.bytes_per_us,
+                errs_this_dispatch = errs_this_dispatch,
+                multiplier_before = mult_before,
+                multiplier_after = self.tick_budget_multiplier,
+                "scheduler.tick AIMD"
+            );
+        }
+
+        stats
+    }
+
+    /// Drain the scheduler up to `budget_bytes`, fragment+send each
+    /// returned `TileWork`, and return the per-codec / wire-byte stats
+    /// alongside the total bytes drained and the number of TileWork
+    /// items emitted. Shared between the per-frame dispatch entry point
+    /// (`dispatch_dirty_tiles_via_scheduler`) and the
+    /// `Event::DatagramsUnblocked` continuation handler — both want the
+    /// same pull-from-scheduler / fragment / record-coverage / send
+    /// loop, the only difference being the budget they pass in.
+    ///
+    /// `seq` / `timestamp_us` tag the outbound fragments with the
+    /// *current* logical frame's identity; refinement work queued under
+    /// an earlier frame still gets tagged with the current `seq` (which
+    /// is what the client expects from a continuous stream).
+    fn drain_scheduler_into_quinn(
+        &mut self,
+        seq: u32,
+        timestamp_us: u32,
+        max_frag: usize,
+        budget_bytes: usize,
+    ) -> (FrameSendStats, usize, usize) {
+        let drained = self.scheduler.tick(budget_bytes);
         let drained_count = drained.len();
         let mut stats = FrameSendStats::default();
+        let mut total_wire_bytes_sent: usize = 0;
         for work in drained {
             let datagrams = fragment_tile(
                 &TileFragmentInputs {
@@ -1003,19 +1102,8 @@ impl IoBridge {
                         codec: work.codec,
                         palette_id,
                     }];
-                // Key: (frame_seq, tile_x, tile_y, pass_idx) — unique per
-                // tile-pass emission within a frame. This avoids the collision
-                // that occurs with (frame_seq, frag_idx=0) when multiple
-                // single-fragment work items per frame all share frag_idx=0.
                 let key = (frame_seq_with_flag, work.tile_x, work.tile_y, work.pass_idx);
                 self.fragment_coverage.record(key, coverage);
-
-                // M3.5 bench telemetry: accumulate per-tile stats.
-                // Count each (tile, pass) work item as one logical tile for
-                // the per-codec histogram. Accumulate all fragments' bytes.
-                // pass_idx == 0 is the first (and for non-Cdf53 codecs, only)
-                // pass; for Cdf53 multi-pass tiles each pass increments bytes
-                // but only pass_idx==0 increments tile_count.
                 if work.pass_idx == 0 {
                     stats.tile_count = stats.tile_count.saturating_add(1);
                     match work.codec {
@@ -1039,42 +1127,74 @@ impl IoBridge {
                 }
                 let tile_wire_bytes: u32 = datagrams.iter().map(|dg| dg.len() as u32).sum();
                 stats.total_wire_bytes = stats.total_wire_bytes.saturating_add(tile_wire_bytes);
+                total_wire_bytes_sent =
+                    total_wire_bytes_sent.saturating_add(tile_wire_bytes as usize);
             }
             for dg in &datagrams {
                 self.send_to_all_sessions(dg);
             }
         }
+        (stats, total_wire_bytes_sent, drained_count)
+    }
 
-        // ---- AIMD feedback: shrink the multiplier on any send error,
-        //      ramp back up on a clean dispatch. CpuRawOnly bypasses the
-        //      tracking — it ran with unbudgeted `usize::MAX` and unit
-        //      fixtures don't go through real QUIC paths anyway.
-        if !matches!(policy, SchedulerEmissionPolicy::CpuRawOnly) {
-            let errs_this_dispatch =
-                self.datagram_send_errs.saturating_sub(pre_dispatch_send_errs);
-            let mult_before = self.tick_budget_multiplier;
-            if errs_this_dispatch > 0 {
-                self.tick_budget_multiplier =
-                    (self.tick_budget_multiplier * SCHEDULER_BUDGET_BACKOFF)
-                        .max(SCHEDULER_BUDGET_MULT_MIN);
-            } else {
-                self.tick_budget_multiplier =
-                    (self.tick_budget_multiplier * SCHEDULER_BUDGET_RAMP)
-                        .min(SCHEDULER_BUDGET_MULT_MAX);
-            }
-            tracing::debug!(
-                drained_count = drained_count,
-                tick_budget_bytes = tick_budget_bytes,
-                base_budget_bytes = base_budget_bytes,
-                bytes_per_us = self.adaptation_context.bytes_per_us,
-                errs_this_dispatch = errs_this_dispatch,
-                multiplier_before = mult_before,
-                multiplier_after = self.tick_budget_multiplier,
-                "scheduler.tick AIMD"
-            );
+    /// Resume the in-flight frame's scheduler drain. Called from the
+    /// `Event::DatagramsUnblocked` event handler — quinn just transmitted
+    /// the datagrams it had buffered and there's room for more. Pulls
+    /// from the scheduler queues up to whatever's left of the current
+    /// frame's AIMD-adjusted budget, fragments and sends, then either
+    /// keeps the continuation alive with the new remaining budget or
+    /// clears it once the per-frame budget is fully spent.
+    ///
+    /// Cheap when nothing is queued (scheduler.tick returns empty), so
+    /// no harm in firing it on every Unblocked event regardless of
+    /// what was just unblocked.
+    fn resume_scheduler_continuation(&mut self) {
+        let ctx = match self.scheduler_continuation {
+            Some(c) => c,
+            None => return,
+        };
+        if ctx.remaining_budget_bytes == 0 {
+            self.scheduler_continuation = None;
+            return;
         }
-
-        stats
+        let pre_send_errs = self.datagram_send_errs;
+        let (_stats, drained_bytes, drained_count) = self.drain_scheduler_into_quinn(
+            ctx.seq,
+            ctx.timestamp_us,
+            ctx.max_frag,
+            ctx.remaining_budget_bytes,
+        );
+        let errs_this_continuation =
+            self.datagram_send_errs.saturating_sub(pre_send_errs);
+        let new_remaining = ctx
+            .remaining_budget_bytes
+            .saturating_sub(drained_bytes);
+        if errs_this_continuation > 0 {
+            // Same AIMD halving the per-frame dispatch applies — a
+            // Blocked during continuation also proves our estimate was
+            // too generous.
+            self.tick_budget_multiplier =
+                (self.tick_budget_multiplier * SCHEDULER_BUDGET_BACKOFF)
+                    .max(SCHEDULER_BUDGET_MULT_MIN);
+        }
+        tracing::debug!(
+            seq = ctx.seq,
+            drained_count = drained_count,
+            drained_bytes = drained_bytes,
+            errs = errs_this_continuation,
+            remaining_before = ctx.remaining_budget_bytes,
+            remaining_after = new_remaining,
+            multiplier = self.tick_budget_multiplier,
+            "DatagramsUnblocked → scheduler continuation"
+        );
+        self.scheduler_continuation = if new_remaining > 0 && drained_count > 0 {
+            Some(SchedulerContinuation {
+                remaining_budget_bytes: new_remaining,
+                ..ctx
+            })
+        } else {
+            None
+        };
     }
 
     /// Route a single inbound datagram into the appropriate handler.
@@ -2756,8 +2876,19 @@ impl IoBridge {
                     }
                 }
 
+                Event::DatagramsUnblocked => {
+                    // quinn just drained its send buffer to the wire —
+                    // top it back up from the scheduler queues without
+                    // waiting for the next 33 ms capture tick. This is
+                    // the pull-driven pacing piece: scheduler.tick runs
+                    // when quinn signals it has room, not when the
+                    // next frame arrives.
+                    self.resume_scheduler_continuation();
+                }
+
                 _ => {
-                    // DatagramsUnblocked, etc. — no action needed.
+                    // Everything else (DatagramsReceived handled above,
+                    // etc.) — no action needed.
                 }
             }
         }
@@ -3004,6 +3135,7 @@ impl IoBridge {
             datagram_send_errs: 0,
             datagram_send_err_first_logged: false,
             tick_budget_multiplier: 1.0,
+            scheduler_continuation: None,
         }
     }
 
@@ -3069,6 +3201,7 @@ impl IoBridge {
             datagram_send_errs: 0,
             datagram_send_err_first_logged: false,
             tick_budget_multiplier: 1.0,
+            scheduler_continuation: None,
         }
     }
 
