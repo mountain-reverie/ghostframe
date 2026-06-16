@@ -1934,3 +1934,235 @@ fn cdf53_forward_gpu_matches_cpu_reference() {
         }
     }
 }
+
+/// Same coefficient-equivalence assertion as
+/// `cdf53_forward_gpu_matches_cpu_reference`, but drives the GPU pipeline
+/// via `process_frame_from_pixels` (the CPU-upload path that goes through
+/// `import_pixels`) instead of `process_frame` (the DMA-BUF path).
+///
+/// **Why this exists separately:** the live X11-on-AMD deployment runs
+/// the daemon with `GHOSTFRAME_X11_CAPTURE_ONLY=1`, which routes
+/// `FrameSubmission.pixels` (a `Vec<u8>` of BGRA bytes from XGetImage)
+/// straight into `process_frame_from_pixels`. None of the previous
+/// gradient/lossless e2e tests exercise that path — they all use
+/// `--drm-direct` which goes through the DMA-BUF import. A symptom seen
+/// in the field (canvas pitch-black despite the X-side capture having
+/// the correct pixels and the encoder firing) matched the shape of an
+/// `import_pixels` upload silently filling the staging image with
+/// zeros, which the existing tests would not catch.
+///
+/// Test acts as a regression net: if the BGRA bytes ever stop reaching
+/// the encoder's input image correctly (e.g. wrong memory type for the
+/// host-coherent mapping, row-pitch mismatch, missing layout transition),
+/// the GPU coefficients diverge from the CPU reference and the test
+/// fails loudly here instead of going dark on a remote install.
+#[test]
+fn cdf53_forward_from_pixels_matches_cpu_reference() {
+    use crate::encoder::cdf53;
+
+    let mut processor = match GpuFrameProcessor::new(256) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "Skipping cdf53_forward_from_pixels equivalence test (no Vulkan?): {e}"
+            );
+            return;
+        }
+    };
+
+    // Identical 64×64 frame layout to the DMA-BUF sibling: tile (0,0) is a
+    // high-color gradient (classifier → Cdf53), other tiles are solid blue.
+    let width = 64u32;
+    let height = 64u32;
+    let stride = width * 4;
+    let mut pixels = vec![0u8; (stride * height) as usize];
+    for y in 0..height {
+        for x in 0..width {
+            let off = ((y * stride) + x * 4) as usize;
+            if x < 32 && y < 32 {
+                pixels[off] = (x * 3 % 256) as u8; // B
+                pixels[off + 1] = (y * 3 % 256) as u8; // G
+                pixels[off + 2] = ((x + y) % 256) as u8; // R
+            } else {
+                pixels[off] = 0xFF;
+                pixels[off + 1] = 0;
+                pixels[off + 2] = 0;
+            }
+            pixels[off + 3] = 0xFF;
+        }
+    }
+
+    // CPU reference for tile (0,0).
+    let mut tile_bgra = vec![0u8; 32 * 32 * 4];
+    for ty in 0..32usize {
+        for tx in 0..32usize {
+            let src = (ty * stride as usize) + tx * 4;
+            let dst = (ty * 32 + tx) * 4;
+            tile_bgra[dst..dst + 4].copy_from_slice(&pixels[src..src + 4]);
+        }
+    }
+    let cpu_coefficients = cdf53::forward(&tile_bgra);
+
+    // Run GPU pipeline via the CPU-upload path. `process_frame_from_pixels`
+    // calls `import_pixels` under the hood — this is the exact code path
+    // exercised by an X11-capture-only deployment.
+    match processor.process_frame_from_pixels(&pixels, width, height, stride) {
+        Ok(_) => {}
+        Err(e) => panic!(
+            "process_frame_from_pixels failed: {e} \
+             (this is the bug we're trying to catch — should NOT silently \
+             skip; if Vulkan was unavailable, processor creation above \
+             would already have returned)"
+        ),
+    }
+
+    let compact_count = unsafe { *processor.cdf53_compact_count_ptr };
+    assert!(
+        compact_count > 0,
+        "cdf53_compact_count=0 — the gradient tile was not classified as \
+         Cdf53. Most common cause: the staging image's pixels look like \
+         constant content to the classifier (i.e. `import_pixels` \
+         delivered zeros). On the DMA-BUF sibling this skips the test; \
+         here it MUST fail, because uploading the same gradient via the \
+         CPU path should produce the same classification."
+    );
+
+    let gpu_coeffs: Vec<i16> = unsafe {
+        let raw = std::slice::from_raw_parts(
+            processor.cdf53_coefficients_ptr,
+            cdf53::CDF53_TOTAL_COEFFS,
+        );
+        raw.iter().map(|&v| v as i16).collect()
+    };
+
+    // First-failure diagnostic: report up to 10 mismatches with their
+    // positions so a regression yields actionable output, not just the
+    // first divergence. Crucial because an `import_pixels` bug typically
+    // produces ALL-coefficients-wrong, and seeing a few examples makes
+    // the failure mode obvious (e.g. all coeffs = the DC term of zeros
+    // → upload delivered all-black).
+    let mut mismatches = Vec::new();
+    for (i, (&gpu, &cpu)) in gpu_coeffs.iter().zip(cpu_coefficients.iter()).enumerate() {
+        if gpu != cpu {
+            let channel = i / cdf53::CDF53_COEFFS_PER_CHANNEL;
+            let in_channel = i % cdf53::CDF53_COEFFS_PER_CHANNEL;
+            mismatches.push(format!(
+                "coeff[{i}] (channel={channel}, idx_in_channel={in_channel}): \
+                 GPU={gpu} vs CPU={cpu}"
+            ));
+            if mismatches.len() >= 10 {
+                break;
+            }
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "GPU coefficients (via process_frame_from_pixels) diverge from \
+         CPU reference. First {} mismatch(es):\n  {}",
+        mismatches.len(),
+        mismatches.join("\n  ")
+    );
+}
+
+/// Live-deployment scaling of `cdf53_forward_from_pixels_matches_cpu_reference`:
+/// runs the CPU-upload path at 1920×1080 with max_tiles=2040, the actual
+/// frame shape the X11-capture daemon sends. Catches bugs that only
+/// manifest at production scale — e.g. row-pitch padding mismatches
+/// the small test doesn't exercise, max_tiles-dependent staging-image
+/// layouts, AMD's compute alignment requirements at large extents.
+///
+/// Puts the gradient (the only thing the classifier scores as Cdf53)
+/// at tile (0, 0); the rest of the frame is solid blue, dominated by
+/// PalRle/Solid classification. We still read back coefficients for
+/// the gradient tile via the compact list and compare to the CPU
+/// reference exactly.
+#[test]
+fn cdf53_forward_from_pixels_live_dims_matches_cpu_reference() {
+    use crate::encoder::cdf53;
+
+    // 2040 = ⌈1920/32⌉ × ⌈1080/32⌉ — what the live processor is built with.
+    let mut processor = match GpuFrameProcessor::new(2040) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "Skipping cdf53_forward_from_pixels_live_dims test (no Vulkan?): {e}"
+            );
+            return;
+        }
+    };
+
+    let width = 1920u32;
+    let height = 1080u32;
+    let stride = width * 4;
+    // 8 294 400 bytes — same shape as the X11 capture's BGRA payload on
+    // the live install (verified against `/tmp/dump.bgra`'s file size).
+    let mut pixels = vec![0u8; (stride * height) as usize];
+    for y in 0..height {
+        for x in 0..width {
+            let off = ((y * stride) + x * 4) as usize;
+            if x < 32 && y < 32 {
+                pixels[off] = (x * 3 % 256) as u8;
+                pixels[off + 1] = (y * 3 % 256) as u8;
+                pixels[off + 2] = ((x + y) % 256) as u8;
+            } else {
+                pixels[off] = 0xFF;
+                pixels[off + 1] = 0;
+                pixels[off + 2] = 0;
+            }
+            pixels[off + 3] = 0xFF;
+        }
+    }
+
+    let mut tile_bgra = vec![0u8; 32 * 32 * 4];
+    for ty in 0..32usize {
+        for tx in 0..32usize {
+            let src = (ty * stride as usize) + tx * 4;
+            let dst = (ty * 32 + tx) * 4;
+            tile_bgra[dst..dst + 4].copy_from_slice(&pixels[src..src + 4]);
+        }
+    }
+    let cpu_coefficients = cdf53::forward(&tile_bgra);
+
+    match processor.process_frame_from_pixels(&pixels, width, height, stride) {
+        Ok(_) => {}
+        Err(e) => panic!("process_frame_from_pixels failed at live dims: {e}"),
+    }
+
+    let compact_count = unsafe { *processor.cdf53_compact_count_ptr };
+    assert!(
+        compact_count > 0,
+        "cdf53_compact_count=0 at 1920×1080 — the gradient tile at (0,0) \
+         was not classified as Cdf53. Probable cause: import_pixels at \
+         the live-deployment row-pitch left the staging image zeroed."
+    );
+
+    let gpu_coeffs: Vec<i16> = unsafe {
+        let raw = std::slice::from_raw_parts(
+            processor.cdf53_coefficients_ptr,
+            cdf53::CDF53_TOTAL_COEFFS,
+        );
+        raw.iter().map(|&v| v as i16).collect()
+    };
+
+    let mut mismatches = Vec::new();
+    for (i, (&gpu, &cpu)) in gpu_coeffs.iter().zip(cpu_coefficients.iter()).enumerate() {
+        if gpu != cpu {
+            let channel = i / cdf53::CDF53_COEFFS_PER_CHANNEL;
+            let in_channel = i % cdf53::CDF53_COEFFS_PER_CHANNEL;
+            mismatches.push(format!(
+                "coeff[{i}] (channel={channel}, idx_in_channel={in_channel}): \
+                 GPU={gpu} vs CPU={cpu}"
+            ));
+            if mismatches.len() >= 10 {
+                break;
+            }
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "GPU coefficients at 1920×1080 diverge from CPU reference. First \
+         {} mismatch(es):\n  {}",
+        mismatches.len(),
+        mismatches.join("\n  ")
+    );
+}
