@@ -93,6 +93,16 @@ const SCHEDULER_BUDGET_BACKOFF: f64 = 0.5;
 const SCHEDULER_BUDGET_RAMP: f64 = 1.1;
 const SCHEDULER_BUDGET_MULT_MIN: f64 = 0.05;
 const SCHEDULER_BUDGET_MULT_MAX: f64 = 1.0;
+// Fraction of quinn's reported `send_buffer_space()` we're willing to
+// commit per tick. The remaining 20 % is headroom for per-fragment
+// wire overhead (WT quarter-stream-id VarInt + tile-fragment header,
+// 30–60 B per datagram) that the scheduler's payload-bytes budget
+// can't see, so the actual on-wire footprint always exceeds the
+// scheduler's accounting. Without this margin a tick that just fits
+// in the payload budget still risks `SendDatagramError::Blocked` on
+// the overhead bytes — and Blocked silently drops refinement work
+// the scheduler already popped from its queue.
+const QUINN_SEND_BUFFER_SAFETY_FRACTION: f64 = 0.80;
 
 // ---------------------------------------------------------------------------
 // M3.5 bench telemetry: per-frame send-side stats
@@ -809,6 +819,45 @@ impl IoBridge {
         }
     }
 
+    /// Minimum `send_buffer_space()` across every currently-connected
+    /// WebTransport session, or `usize::MAX` if no session is connected.
+    ///
+    /// Every datagram we emit goes to **every** connected client, so
+    /// the slowest queue determines how much we can drain without
+    /// `quinn-proto` returning `SendDatagramError::Blocked` —
+    /// at which point the work has already been popped from
+    /// `scheduler.refinement_queue` and is irrecoverably lost.
+    ///
+    /// The no-connected-session fallback is `usize::MAX` (uncapped)
+    /// rather than `0`. Production never reaches this code with zero
+    /// connected sessions — `process_frame_gpu` early-returns when
+    /// `compute_max_datagram_size` returns `None`. Unit tests that
+    /// drive `dispatch_dirty_tiles_via_scheduler` directly without a
+    /// live quinn connection rely on the unlimited path so the
+    /// scheduler's `tick` still runs.
+    ///
+    /// Called from `dispatch_dirty_tiles_via_scheduler` to clamp the
+    /// per-tick AIMD budget down to what quinn can actually accept.
+    fn min_session_send_buffer_space(&mut self) -> usize {
+        let mut min_space: Option<usize> = None;
+        let handles: Vec<quinn_proto::ConnectionHandle> = self
+            .wt_sessions
+            .iter()
+            .filter(|(_, wt)| wt.is_connected())
+            .map(|(h, _)| *h)
+            .collect();
+        for handle in handles {
+            if let Some(conn) = self.server.connections.get_mut(&handle) {
+                let space = conn.datagrams().send_buffer_space();
+                min_space = Some(match min_space {
+                    Some(m) => m.min(space),
+                    None => space,
+                });
+            }
+        }
+        min_space.unwrap_or(usize::MAX)
+    }
+
     /// Emit the frame-dimensions datagram on the first frame of each session and
     /// whenever dimensions change, retransmitting `FRAME_DIMENSIONS_RETRANSMITS`
     /// additional times to absorb datagram loss. Called by both
@@ -987,7 +1036,33 @@ impl IoBridge {
             .max(SCHEDULER_TICK_BUDGET_FLOOR_BYTES);
         let tick_budget_bytes = match policy {
             SchedulerEmissionPolicy::CpuRawOnly => usize::MAX,
-            _ => ((base_budget_bytes as f64) * self.tick_budget_multiplier) as usize,
+            _ => {
+                // Clamp the AIMD-derived budget to what `quinn-proto` can
+                // actually accept right now. `scheduler.tick` is
+                // destructive on the refinement queue (popped work is
+                // removed, not marked `InFlight`), and `send_datagram`
+                // returning `Err(Blocked)` discards the already-popped
+                // TileWork irrecoverably. Pre-checking
+                // `send_buffer_space()` — the only thing that triggers
+                // quinn's Blocked (`outgoing_total + data.len() >
+                // datagram_send_buffer_size` in
+                // quinn-proto/datagrams.rs) — prevents the scheduler
+                // from popping more than quinn can absorb in this tick.
+                // Anything left over stays in `refinement_queue` for
+                // the next `DatagramsUnblocked` continuation or the next
+                // 33 ms capture tick.
+                //
+                // The 80 % safety fraction
+                // (`QUINN_SEND_BUFFER_SAFETY_FRACTION`) leaves headroom
+                // for per-fragment wire overhead (WT quarter-stream-id
+                // VarInt + tile-fragment header, ~30–60 B per datagram)
+                // that `scheduler.tick` accounts as payload bytes only.
+                let aimd_budget =
+                    ((base_budget_bytes as f64) * self.tick_budget_multiplier) as usize;
+                let quinn_space = self.min_session_send_buffer_space();
+                let quinn_cap = ((quinn_space as f64) * QUINN_SEND_BUFFER_SAFETY_FRACTION) as usize;
+                aimd_budget.min(quinn_cap)
+            }
         };
         let (stats, drained_bytes, drained_count) =
             self.drain_scheduler_into_quinn(seq, timestamp_us, max_frag, tick_budget_bytes);
@@ -1167,11 +1242,23 @@ impl IoBridge {
             self.scheduler_continuation = None;
             return;
         }
+        // Mirror the dispatch-side clamp: never pop more from the
+        // scheduler than quinn can absorb (see the long comment in
+        // `dispatch_dirty_tiles_via_scheduler` for the Blocked-drops-
+        // refinement-work rationale).
+        let quinn_space = self.min_session_send_buffer_space();
+        let quinn_cap = ((quinn_space as f64) * QUINN_SEND_BUFFER_SAFETY_FRACTION) as usize;
+        let effective_budget = ctx.remaining_budget_bytes.min(quinn_cap);
+        if effective_budget == 0 {
+            // Quinn is still full. Keep the continuation alive so the
+            // next `DatagramsUnblocked` event fires this path again.
+            return;
+        }
         let (_stats, drained_bytes, drained_count) = self.drain_scheduler_into_quinn(
             ctx.seq,
             ctx.timestamp_us,
             ctx.max_frag,
-            ctx.remaining_budget_bytes,
+            effective_budget,
         );
         let new_remaining = ctx
             .remaining_budget_bytes
