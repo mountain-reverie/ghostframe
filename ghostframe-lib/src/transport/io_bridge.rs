@@ -2277,6 +2277,20 @@ impl IoBridge {
                     );
                 }
 
+                // Diagnostic: pre-dispatch announce. Logs at INFO at the top
+                // of the dispatch so we can see whether execution reaches here
+                // independent of whether the existing `frame.last_send` ends
+                // up firing.
+                tracing::info!(
+                    target: "ghostframe::diag",
+                    frame_seq = seq,
+                    dirty_tiles = dirty_xy.len(),
+                    priority_queue_len = self.scheduler.queue_len(),
+                    refinement_deficit_tiles = self.scheduler.refinement_deficit_tiles(),
+                    max_frag = max_frag,
+                    "process_frame_gpu: about to dispatch"
+                );
+
                 let stats = self.dispatch_dirty_tiles_via_scheduler(
                     &dirty_xy,
                     &grid,
@@ -2289,6 +2303,25 @@ impl IoBridge {
                     max_frag,
                     SchedulerEmissionPolicy::GpuClassifierDriven,
                     Some(&mut palrle_payloads),
+                );
+
+                // Diagnostic: post-dispatch summary. If THIS fires but
+                // frame.last_send below does not, something in the palrle
+                // stats log block is silencing execution. If neither fires,
+                // dispatch_dirty_tiles_via_scheduler is panicking/returning
+                // through an unwind.
+                tracing::info!(
+                    target: "ghostframe::diag",
+                    frame_seq = seq,
+                    dispatched_tiles = stats.tile_count,
+                    wire_bytes = stats.total_wire_bytes,
+                    codec_solid = stats.codec_histogram.solid,
+                    codec_palrle = stats.codec_histogram.palrle,
+                    codec_cdf53 = stats.codec_histogram.cdf53,
+                    codec_raw = stats.codec_histogram.raw,
+                    codec_h264 = stats.codec_histogram.h264,
+                    refinement_deficit_after = self.scheduler.refinement_deficit_tiles(),
+                    "process_frame_gpu: dispatch returned"
                 );
 
                 // Frame stats — emit per design Section 4.
