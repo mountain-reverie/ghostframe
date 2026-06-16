@@ -294,7 +294,17 @@ impl WebTransportServer {
             .encode(&mut buf);
         buf.extend_from_slice(payload);
 
-        conn.datagrams().send(Bytes::from(buf), true)
+        // `drop: false` — when the QUIC send buffer is full, return
+        // SendDatagramError::Blocked back to the caller instead of
+        // silently dropping the OLDEST queued datagram to make room
+        // (quinn-proto datagrams.rs `if drop { while … pop_front() }`).
+        // Silent drop made server-side packet loss from slow-start cwnd
+        // and tile-burst emission invisible — receiver-side `loss_rate`
+        // doesn't include datagrams that never left the host. With
+        // `false`, the caller (`send_to_all_sessions`) sees Err(Blocked),
+        // counts it, and surfaces it via the per-frame
+        // `dispatch returned` log.
+        conn.datagrams().send(Bytes::from(buf), false)
     }
 
     /// Drain all queued feedback data received on non-session bidi streams.
