@@ -289,6 +289,19 @@ pub struct IoBridge {
     /// (unknown msg_type or unknown INPUT sub-kind) so a corrupt byte
     /// can't wedge the dispatcher forever.
     feedback_recv_buf: Vec<u8>,
+    /// Lifetime counter of `send_datagram` Errs (Blocked / TooLarge /
+    /// Disabled / UnsupportedByPeer). The Blocked case fires whenever the
+    /// QUIC send buffer is full — at session start while cwnd is small,
+    /// or any time tile-burst emission outruns drain. Without surfacing
+    /// these, server-side packet loss from QUIC backpressure is silent:
+    /// the receiver-side `loss_rate` doesn't include datagrams that
+    /// never left the host.
+    datagram_send_errs: u64,
+    /// Whether we've already logged a `warn!` for the first send-datagram
+    /// error of the process's life. Subsequent errors increment the
+    /// counter but log at `debug` to avoid 30 Hz warn-spam under
+    /// sustained backpressure.
+    datagram_send_err_first_logged: bool,
 }
 
 /// Per-frame inputs passed into `dispatch_dirty_tiles_via_scheduler`.
@@ -556,6 +569,8 @@ impl IoBridge {
             was_idle: true,
             input_injector: None,
             feedback_recv_buf: Vec::new(),
+            datagram_send_errs: 0,
+            datagram_send_err_first_logged: false,
         })
     }
 
@@ -699,7 +714,20 @@ impl IoBridge {
             }
             if let Some(conn) = self.server.connections.get_mut(handle) {
                 if let Err(e) = wt.send_datagram(conn, dg) {
-                    tracing::trace!(?handle, error = ?e, "datagram send failed");
+                    self.datagram_send_errs = self.datagram_send_errs.saturating_add(1);
+                    if !self.datagram_send_err_first_logged {
+                        self.datagram_send_err_first_logged = true;
+                        tracing::warn!(
+                            ?handle,
+                            error = ?e,
+                            payload_len = dg.len(),
+                            "first send_datagram Err — QUIC backpressure or limit; \
+                             subsequent send failures will log at debug and a running \
+                             total appears in the per-frame `dispatch returned` log"
+                        );
+                    } else {
+                        tracing::debug!(?handle, error = ?e, "datagram send failed");
+                    }
                 }
             }
         }
@@ -2321,6 +2349,7 @@ impl IoBridge {
                     codec_raw = stats.codec_histogram.raw,
                     codec_h264 = stats.codec_histogram.h264,
                     refinement_deficit_after = self.scheduler.refinement_deficit_tiles(),
+                    send_datagram_errs_total = self.datagram_send_errs,
                     "process_frame_gpu: dispatch returned"
                 );
 
@@ -2868,6 +2897,8 @@ impl IoBridge {
             was_idle: true,
             input_injector: None,
             feedback_recv_buf: Vec::new(),
+            datagram_send_errs: 0,
+            datagram_send_err_first_logged: false,
         }
     }
 
@@ -2930,6 +2961,8 @@ impl IoBridge {
             was_idle: true,
             input_injector: None,
             feedback_recv_buf: Vec::new(),
+            datagram_send_errs: 0,
+            datagram_send_err_first_logged: false,
         }
     }
 
