@@ -2277,12 +2277,13 @@ impl IoBridge {
                     );
                 }
 
-                // Diagnostic: pre-dispatch announce. Logs at INFO at the top
-                // of the dispatch so we can see whether execution reaches here
-                // independent of whether the existing `frame.last_send` ends
-                // up firing.
+                // Diagnostic: pre-dispatch announce. Uses the module default
+                // target so we ride the same env_filter rule the existing
+                // "dirty tile detection complete" debug log lives under —
+                // the `ghostframe::diag` target wasn't appearing in journal
+                // under the daemon's default `ghostframe=debug,info` filter
+                // for reasons that don't matter for this diagnostic.
                 tracing::info!(
-                    target: "ghostframe::diag",
                     frame_seq = seq,
                     dirty_tiles = dirty_xy.len(),
                     priority_queue_len = self.scheduler.queue_len(),
@@ -2311,7 +2312,6 @@ impl IoBridge {
                 // dispatch_dirty_tiles_via_scheduler is panicking/returning
                 // through an unwind.
                 tracing::info!(
-                    target: "ghostframe::diag",
                     frame_seq = seq,
                     dispatched_tiles = stats.tile_count,
                     wire_bytes = stats.total_wire_bytes,
