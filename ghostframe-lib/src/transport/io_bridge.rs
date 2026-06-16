@@ -1145,6 +1145,16 @@ impl IoBridge {
     /// keeps the continuation alive with the new remaining budget or
     /// clears it once the per-frame budget is fully spent.
     ///
+    /// AIMD is deliberately NOT adjusted here. A burst of Unblocked
+    /// events at session start (slow-start cwnd ramp) used to collapse
+    /// the multiplier to its floor (0.05) within one frame because each
+    /// continuation halved on its own observed errors. With AIMD pinned
+    /// to the per-frame dispatch boundary, the multiplier reflects the
+    /// frame's *cumulative* error rate (direct drain + every continuation
+    /// triggered before the next frame) via the
+    /// `pre_dispatch_send_errs → datagram_send_errs` delta — exactly
+    /// once per frame instead of once per quinn event.
+    ///
     /// Cheap when nothing is queued (scheduler.tick returns empty), so
     /// no harm in firing it on every Unblocked event regardless of
     /// what was just unblocked.
@@ -1157,37 +1167,32 @@ impl IoBridge {
             self.scheduler_continuation = None;
             return;
         }
-        let pre_send_errs = self.datagram_send_errs;
         let (_stats, drained_bytes, drained_count) = self.drain_scheduler_into_quinn(
             ctx.seq,
             ctx.timestamp_us,
             ctx.max_frag,
             ctx.remaining_budget_bytes,
         );
-        let errs_this_continuation =
-            self.datagram_send_errs.saturating_sub(pre_send_errs);
         let new_remaining = ctx
             .remaining_budget_bytes
             .saturating_sub(drained_bytes);
-        if errs_this_continuation > 0 {
-            // Same AIMD halving the per-frame dispatch applies — a
-            // Blocked during continuation also proves our estimate was
-            // too generous.
-            self.tick_budget_multiplier =
-                (self.tick_budget_multiplier * SCHEDULER_BUDGET_BACKOFF)
-                    .max(SCHEDULER_BUDGET_MULT_MIN);
-        }
         tracing::debug!(
             seq = ctx.seq,
             drained_count = drained_count,
             drained_bytes = drained_bytes,
-            errs = errs_this_continuation,
             remaining_before = ctx.remaining_budget_bytes,
             remaining_after = new_remaining,
-            multiplier = self.tick_budget_multiplier,
             "DatagramsUnblocked → scheduler continuation"
         );
-        self.scheduler_continuation = if new_remaining > 0 && drained_count > 0 {
+        // Clear the continuation when the budget is exhausted. We also
+        // clear when drained_count == 0 AND drained_bytes == 0 (the
+        // scheduler genuinely had nothing more to drain); a subsequent
+        // dispatch will repopulate with fresh state. Don't clear on
+        // drained_count==0 alone — a refinement-queue item whose payload
+        // exceeds the remaining budget makes scheduler.tick return
+        // empty even though work remains, and clearing would lose the
+        // continuation hook for that next Unblocked event.
+        self.scheduler_continuation = if new_remaining > 0 && drained_bytes > 0 {
             Some(SchedulerContinuation {
                 remaining_budget_bytes: new_remaining,
                 ..ctx
@@ -2030,14 +2035,20 @@ impl IoBridge {
             }
         }
 
-        // No dirty tiles → nothing to emit (regardless of mode). The classifier
-        // already saw this frame above, so the exit-sustain counter advances.
-        if dirty_xy.is_empty() {
-            return;
-        }
-
+        // Early-return on empty dirty is mode-specific:
+        //  - H264: no new frame to encode, nothing to emit. Bail.
+        //  - TileCodec: the scheduler's refinement queue may still hold
+        //    un-drained pass-N work from earlier dirty frames (cdf53's
+        //    first-frame paint emits 14 progressive passes per tile that
+        //    pace out over many frames under the A+B-light budget). We
+        //    must keep calling `dispatch_dirty_tiles_via_scheduler` to
+        //    drain it — even when there's no new dirty work — or the
+        //    queue stagnates and the wizard never finishes refining.
         match new_mode {
             FrameMode::H264 => {
+                if dirty_xy.is_empty() {
+                    return;
+                }
                 // Lazily initialize full-frame encoder
                 let needs_init = match &self.full_frame_encoder {
                     Some(enc) => enc.width() != frame.width || enc.height() != frame.height,
