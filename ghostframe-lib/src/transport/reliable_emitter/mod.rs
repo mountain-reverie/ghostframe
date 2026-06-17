@@ -1,6 +1,7 @@
 //! Reliable Tile Emitter — see docs/superpowers/specs/2026-06-17-reliable-tile-emitter-design.md
 
 pub mod cache;
+pub mod emission_queue;
 pub mod parity;
 pub mod traits;
 pub mod wire_seq;
