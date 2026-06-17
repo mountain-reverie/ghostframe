@@ -44,6 +44,9 @@ pub enum ProtocolError {
 
     #[error("unknown envelope discriminator byte: {0:#04x}")]
     UnknownEnvelope(u8),
+
+    #[error("invalid length field: count would exceed the protocol maximum")]
+    InvalidLength,
 }
 
 // ---------------------------------------------------------------------------
@@ -668,6 +671,113 @@ impl TileParityEnvelope {
 }
 
 // ---------------------------------------------------------------------------
+// TILE_NACK envelope (0x05)
+//
+// Wire format (spec §5.3):
+//   [0]       discriminator: u8  (= TILE_NACK_ENVELOPE = 0x05)
+//   [1]       count:         u8  (number of entries, ≤ TILE_NACK_MAX_ENTRIES)
+//   [2..]     count × NackEntry, each 8 bytes:
+//             [0..4] frame_seq u32 LE | [4] tile_x | [5] tile_y |
+//             [6] pass_idx | [7] frag_idx
+//
+// `frame_seq` is LE on the wire to match the ACK envelope's existing
+// convention.
+// ---------------------------------------------------------------------------
+
+/// Envelope discriminator byte for the per-fragment NACK datagram
+/// (client → server).
+pub const TILE_NACK_ENVELOPE: u8 = 0x05;
+
+/// Size on the wire of a single NACK entry.
+pub const TILE_NACK_ENTRY_SIZE: usize = 8;
+
+/// Maximum number of NACK entries per datagram. Mirrors the ACK envelope's
+/// cap so a NackBatcher can use the same chunking pattern.
+pub const TILE_NACK_MAX_ENTRIES: usize = 64;
+
+/// One missing fragment reported by the client.
+///
+/// `frame_seq` is encoded LE on the wire to match the ACK envelope's
+/// existing convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TileNackEntry {
+    pub frame_seq: u32,
+    pub tile_x: u8,
+    pub tile_y: u8,
+    pub pass_idx: u8,
+    pub frag_idx: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TileNackEnvelope {
+    pub entries: Vec<TileNackEntry>,
+}
+
+impl TileNackEnvelope {
+    /// Encode all entries (panics in debug if `entries.len() > 64`; use
+    /// `encode_clamped` when the source list may be longer).
+    pub fn encode(&self, buf: &mut Vec<u8>) {
+        debug_assert!(self.entries.len() <= TILE_NACK_MAX_ENTRIES);
+        Self::write(buf, &self.entries);
+    }
+
+    /// Encode at most `TILE_NACK_MAX_ENTRIES` entries; returns the number
+    /// actually written.
+    pub fn encode_clamped(&self, buf: &mut Vec<u8>) -> usize {
+        let n = self.entries.len().min(TILE_NACK_MAX_ENTRIES);
+        Self::write(buf, &self.entries[..n]);
+        n
+    }
+
+    fn write(buf: &mut Vec<u8>, entries: &[TileNackEntry]) {
+        buf.push(TILE_NACK_ENVELOPE);
+        buf.push(entries.len() as u8);
+        for e in entries {
+            buf.extend_from_slice(&e.frame_seq.to_le_bytes());
+            buf.push(e.tile_x);
+            buf.push(e.tile_y);
+            buf.push(e.pass_idx);
+            buf.push(e.frag_idx);
+        }
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self, ProtocolError> {
+        if data.len() < 2 {
+            return Err(ProtocolError::TooShort {
+                expected: 2,
+                got: data.len(),
+            });
+        }
+        if data[0] != TILE_NACK_ENVELOPE {
+            return Err(ProtocolError::UnknownEnvelope(data[0]));
+        }
+        let count = data[1] as usize;
+        if count > TILE_NACK_MAX_ENTRIES {
+            return Err(ProtocolError::InvalidLength);
+        }
+        let expected = 2 + count * TILE_NACK_ENTRY_SIZE;
+        if data.len() < expected {
+            return Err(ProtocolError::TooShort {
+                expected,
+                got: data.len(),
+            });
+        }
+        let mut entries = Vec::with_capacity(count);
+        for i in 0..count {
+            let off = 2 + i * TILE_NACK_ENTRY_SIZE;
+            entries.push(TileNackEntry {
+                frame_seq: u32::from_le_bytes(data[off..off + 4].try_into().unwrap()),
+                tile_x: data[off + 4],
+                tile_y: data[off + 5],
+                pass_idx: data[off + 6],
+                frag_idx: data[off + 7],
+            });
+        }
+        Ok(Self { entries })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1212,5 +1322,33 @@ mod tests {
         buf[0] = TILE_PARITY_ENVELOPE;
         // still too short for header
         assert!(TileParityEnvelope::decode(&buf[..3]).is_err());
+    }
+
+    #[test]
+    fn tile_nack_envelope_roundtrip() {
+        let entries = vec![
+            TileNackEntry { frame_seq: 100, tile_x: 5, tile_y: 7, pass_idx: 3, frag_idx: 1 },
+            TileNackEntry { frame_seq: 100, tile_x: 5, tile_y: 7, pass_idx: 4, frag_idx: 0 },
+        ];
+        let env = TileNackEnvelope { entries: entries.clone() };
+        let mut buf = Vec::new();
+        env.encode(&mut buf);
+        assert_eq!(buf[0], TILE_NACK_ENVELOPE);
+        assert_eq!(buf[1], 2);
+        let parsed = TileNackEnvelope::decode(&buf).expect("decode");
+        assert_eq!(parsed.entries, entries);
+    }
+
+    #[test]
+    fn tile_nack_envelope_caps_at_64_entries() {
+        let entries: Vec<_> = (0..70)
+            .map(|i| TileNackEntry { frame_seq: i, tile_x: 0, tile_y: 0, pass_idx: 0, frag_idx: 0 })
+            .collect();
+        let env = TileNackEnvelope { entries };
+        let mut buf = Vec::new();
+        let written = env.encode_clamped(&mut buf);
+        assert_eq!(written, 64, "encode_clamped writes at most 64 entries");
+        let parsed = TileNackEnvelope::decode(&buf).unwrap();
+        assert_eq!(parsed.entries.len(), 64);
     }
 }
