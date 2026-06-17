@@ -1,4 +1,4 @@
-export const DATAGRAM_HEADER_SIZE = 12;
+export const DATAGRAM_HEADER_SIZE = 16;
 export const TILE_HEADER_SIZE = 8;
 export const TILE_SIZE = 32;
 
@@ -21,6 +21,13 @@ export interface DatagramHeader {
   frameSeq: number;
   fragIdx: number;
   fragTotal: number;
+  /**
+   * Per-QUIC-session monotonic FEC group key, assigned at server emit time.
+   * 0 means "not yet stamped" by the emitter (e.g. on synthetic test wire);
+   * production tile datagrams always carry a non-zero value. u32 wrap is
+   * benign because the dedupe window is short.
+   */
+  wireSeq: number;
   timestampUs: number;
 }
 
@@ -39,7 +46,8 @@ export function decodeDatagramHeader(view: DataView, offset: number): DatagramHe
     frameSeq: view.getUint32(offset, false),      // big-endian
     fragIdx: view.getUint16(offset + 4, false),
     fragTotal: view.getUint16(offset + 6, false),
-    timestampUs: view.getUint32(offset + 8, false),
+    wireSeq: view.getUint32(offset + 8, false),
+    timestampUs: view.getUint32(offset + 12, false),
   };
 }
 

@@ -161,6 +161,14 @@
 #define TILE_HEADER_SIZE 8
 
 /**
+ * Sentinel `wire_seq` value meaning "not yet stamped by the emitter".
+ * Used at construction sites (`fragment_tile`, `build_parity_datagrams`)
+ * to make the convention named and greppable. The `ReliableTileEmitter`
+ * overwrites this with a real per-session monotonic value at submit time.
+ */
+#define UNSTAMPED_WIRE_SEQ 0
+
+/**
  * Sentinel tile coordinates marking a control message that carries the
  * current frame dimensions rather than pixel data. Tile coords are `u8`;
  * 0xFF (255) is structurally impossible at any sensible resolution

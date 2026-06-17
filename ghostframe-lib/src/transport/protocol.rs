@@ -24,6 +24,12 @@ pub const PONG_PAYLOAD: &[u8; 4] = b"pong";
 pub const DATAGRAM_HEADER_SIZE: usize = 16;
 pub const TILE_HEADER_SIZE: usize = 8;
 
+/// Sentinel `wire_seq` value meaning "not yet stamped by the emitter".
+/// Used at construction sites (`fragment_tile`, `build_parity_datagrams`)
+/// to make the convention named and greppable. The `ReliableTileEmitter`
+/// overwrites this with a real per-session monotonic value at submit time.
+pub const UNSTAMPED_WIRE_SEQ: u32 = 0;
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -80,9 +86,26 @@ pub struct DatagramHeader {
     pub frame_seq: u32,
     pub frag_idx: u16,
     pub frag_total: u16,
-    /// Per-session monotonic FEC group key. Assigned by `ReliableTileEmitter`
-    /// at emission time. Same `wire_seq` is reused on retransmits so the
-    /// client deduplicates on it.
+    /// FEC group key, used by the client to deduplicate retransmits and
+    /// correlate parity datagrams to their source group.
+    ///
+    /// Scope: per QUIC session lifetime — restarts at 0 (or any value the
+    /// emitter chooses to begin with) on every fresh session. Within a
+    /// session it is monotonic: each *new* tile-pass emission gets the
+    /// next value; retransmits of the same fragment reuse the original
+    /// `wire_seq` so the client can drop duplicates.
+    ///
+    /// Convention: `0` means "not yet stamped". All call sites that build
+    /// a header before the emitter sees it (`fragment_tile`,
+    /// `build_parity_datagrams`) initialize `wire_seq = 0`; the
+    /// `ReliableTileEmitter` overwrites the field at submit time before
+    /// the datagram hits the wire. A `0` observed on the wire therefore
+    /// indicates either a bug in the emitter or a synthetic test datagram.
+    ///
+    /// Wrap behavior: `u32` wrap is benign because the client dedupe
+    /// window is much shorter than 2^32 emissions — by the time
+    /// `wire_seq` wraps, the previous occupant of any given value has
+    /// long left the in-flight set.
     pub wire_seq: u32,
     pub timestamp_us: u32,
 }
@@ -222,7 +245,8 @@ pub fn fragment_tile(
                 frame_seq: inputs.frame_seq,
                 frag_idx: idx as u16,
                 frag_total,
-                wire_seq: 0,
+                // Emitter stamps the real value at submit time.
+                wire_seq: UNSTAMPED_WIRE_SEQ,
                 timestamp_us: inputs.timestamp_us,
             };
             let th = TileHeader {
@@ -287,7 +311,8 @@ pub fn build_parity_datagrams(
                 frame_seq,
                 frag_idx: frag_total + parity_idx as u16,
                 frag_total,
-                wire_seq: 0,
+                // Emitter stamps the real value at submit time.
+                wire_seq: UNSTAMPED_WIRE_SEQ,
                 timestamp_us,
             };
             let th = TileHeader {
@@ -998,6 +1023,11 @@ mod tests {
 
     #[test]
     fn datagram_header_includes_wire_seq() {
+        // Header must be 16 bytes (was 12 before wire_seq was added). This
+        // assert catches accidental shrinkage just as well as growth.
+        assert_eq!(DATAGRAM_HEADER_SIZE, 16, "header changed size");
+
+        // Mid-range value: catches the obvious encode/decode mistakes.
         let h = DatagramHeader {
             frame_seq: TILE_DATAGRAM_FLAG | 42,
             frag_idx: 1,
@@ -1008,11 +1038,45 @@ mod tests {
         let mut buf = Vec::new();
         h.encode(&mut buf);
         assert_eq!(buf.len(), DATAGRAM_HEADER_SIZE);
-        assert_eq!(DATAGRAM_HEADER_SIZE, 16, "header grew from 12 to 16 bytes");
         let parsed = DatagramHeader::decode(&buf).expect("decode");
         assert_eq!(parsed.wire_seq, 0xDEADBEEF);
         assert_eq!(parsed.timestamp_us, 1_000_000);
         assert_eq!(parsed.frame_seq, TILE_DATAGRAM_FLAG | 42);
+
+        // wire_seq = 0 (the "not yet stamped" sentinel) round-trips exactly.
+        // If `wire_seq` and `timestamp_us` were swapped at offset 8/12 this
+        // would still pass — so the next case nails the offsets down.
+        let h_zero = DatagramHeader {
+            frame_seq: 0,
+            frag_idx: 0,
+            frag_total: 1,
+            wire_seq: 0,
+            timestamp_us: 7,
+        };
+        let mut buf_zero = Vec::new();
+        h_zero.encode(&mut buf_zero);
+        let parsed_zero = DatagramHeader::decode(&buf_zero).expect("decode");
+        assert_eq!(parsed_zero.wire_seq, 0);
+        assert_eq!(parsed_zero.timestamp_us, 7);
+        // Verify offsets: wire_seq lives at bytes 8..12, timestamp_us at 12..16.
+        // With wire_seq=0 and timestamp_us=7 these slices must differ; an
+        // off-by-two encode would smear the 7 into the wire_seq slot.
+        assert_eq!(&buf_zero[8..12], &[0, 0, 0, 0]);
+        assert_eq!(&buf_zero[12..16], &[0, 0, 0, 7]);
+
+        // wire_seq = u32::MAX (the wrap-edge value) round-trips exactly.
+        let h_max = DatagramHeader {
+            frame_seq: 1,
+            frag_idx: 0,
+            frag_total: 1,
+            wire_seq: u32::MAX,
+            timestamp_us: u32::MAX,
+        };
+        let mut buf_max = Vec::new();
+        h_max.encode(&mut buf_max);
+        let parsed_max = DatagramHeader::decode(&buf_max).expect("decode");
+        assert_eq!(parsed_max.wire_seq, u32::MAX);
+        assert_eq!(parsed_max.timestamp_us, u32::MAX);
     }
 
     #[test]

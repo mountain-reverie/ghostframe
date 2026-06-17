@@ -45,7 +45,8 @@ use crate::transport::ghostbridge::{
 use crate::transport::protocol::{
     build_frame_parity_datagram, fragment_frame, fragment_tile, max_fragment_payload,
     max_frame_fragment_payload, Codec, FrameHeader, NackMessage, TileFragmentInputs,
-    FRAME_HEADER_SIZE, PING_PAYLOAD, PONG_PAYLOAD, TILE_DATAGRAM_FLAG,
+    DATAGRAM_HEADER_SIZE, FRAME_HEADER_SIZE, PING_PAYLOAD, PONG_PAYLOAD, TILE_DATAGRAM_FLAG,
+    TILE_HEADER_SIZE,
 };
 use crate::transport::quic::QuicServer;
 use crate::transport::webtransport::WebTransportServer;
@@ -541,20 +542,24 @@ impl IoBridge {
         }
         // PalRle tile datagrams: tile datagram flag set, codec field = PalRle (2),
         // payload byte 0 has bundle flag set (0x01).
-        // Wire layout: [DatagramHeader 16][TileHeader 8][payload].
-        // TileHeader byte [2] (wire index 18) = (codec << 1) | lz4.
+        // Wire layout: [DatagramHeader DATAGRAM_HEADER_SIZE][TileHeader TILE_HEADER_SIZE][payload].
+        // TileHeader byte [2] (wire index DATAGRAM_HEADER_SIZE + 2) = (codec << 1) | lz4.
+        // First payload byte is at DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE.
+        const CODEC_BYTE: usize = DATAGRAM_HEADER_SIZE + 2;
+        const PAYLOAD_START: usize = DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE;
+        const MIN_BUNDLE_LEN: usize = PAYLOAD_START + 1;
         fn predicate_palrle_bundled(dg: &[u8]) -> bool {
-            dg.len() >= 25
+            dg.len() >= MIN_BUNDLE_LEN
                 && (dg[0] & 0x80) != 0
-                && (dg[18] >> 1) == (crate::transport::protocol::Codec::PalRle as u8)
-                && (dg[24] & 0x01) != 0
+                && (dg[CODEC_BYTE] >> 1) == (crate::transport::protocol::Codec::PalRle as u8)
+                && (dg[PAYLOAD_START] & 0x01) != 0
         }
         // Inverse: PalRle tile datagrams without the bundle flag.
         fn predicate_palrle_thin(dg: &[u8]) -> bool {
-            dg.len() >= 25
+            dg.len() >= MIN_BUNDLE_LEN
                 && (dg[0] & 0x80) != 0
-                && (dg[18] >> 1) == (crate::transport::protocol::Codec::PalRle as u8)
-                && (dg[24] & 0x01) == 0
+                && (dg[CODEC_BYTE] >> 1) == (crate::transport::protocol::Codec::PalRle as u8)
+                && (dg[PAYLOAD_START] & 0x01) == 0
         }
 
         let predicate: crate::transport::loss_injection::DropPredicate =
@@ -4720,14 +4725,22 @@ mod tests {
         );
     }
 
+    // Wire-offset constants for the synthetic datagrams used in the
+    // loss-injection predicate tests below. Keeping these named (rather than
+    // hard-coded 18/24/25) means future header-size changes surface as a
+    // single edit here instead of silently shifting predicate bytes.
+    const CODEC_BYTE_OFFSET: usize = DATAGRAM_HEADER_SIZE + 2;
+    const PAYLOAD_START_OFFSET: usize = DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE;
+    const PALRLE_MIN_WIRE_LEN: usize = PAYLOAD_START_OFFSET + 1;
+
     #[test]
     fn palrle_bundled_predicate_matches_bundled_datagram() {
         // Synthetic wire: tile datagram, codec=PalRle, flags byte with bundle bit.
-        // Wire layout: [DatagramHeader 16][TileHeader 8][payload].
-        let mut wire = vec![0u8; 25];
+        // Wire layout: [DatagramHeader DATAGRAM_HEADER_SIZE][TileHeader TILE_HEADER_SIZE][payload].
+        let mut wire = vec![0u8; PALRLE_MIN_WIRE_LEN];
         wire[0] = 0x80; // tile datagram flag
-        wire[18] = (crate::transport::protocol::Codec::PalRle as u8) << 1;
-        wire[24] = 0x01; // bundled
+        wire[CODEC_BYTE_OFFSET] = (crate::transport::protocol::Codec::PalRle as u8) << 1;
+        wire[PAYLOAD_START_OFFSET] = 0x01; // bundled
         std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "1.0");
         std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE", "palrle_bundled");
         std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_SEED", "1");
@@ -4740,10 +4753,10 @@ mod tests {
 
     #[test]
     fn palrle_bundled_predicate_rejects_thin_datagram() {
-        let mut wire = vec![0u8; 25];
+        let mut wire = vec![0u8; PALRLE_MIN_WIRE_LEN];
         wire[0] = 0x80;
-        wire[18] = (crate::transport::protocol::Codec::PalRle as u8) << 1;
-        wire[24] = 0x00; // thin
+        wire[CODEC_BYTE_OFFSET] = (crate::transport::protocol::Codec::PalRle as u8) << 1;
+        wire[PAYLOAD_START_OFFSET] = 0x00; // thin
         std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "1.0");
         std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE", "palrle_bundled");
         std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_SEED", "1");
@@ -4756,16 +4769,16 @@ mod tests {
 
     #[test]
     fn palrle_thin_predicate_matches_thin_only() {
-        let mut wire = vec![0u8; 25];
+        let mut wire = vec![0u8; PALRLE_MIN_WIRE_LEN];
         wire[0] = 0x80;
-        wire[18] = (crate::transport::protocol::Codec::PalRle as u8) << 1;
-        wire[24] = 0x00;
+        wire[CODEC_BYTE_OFFSET] = (crate::transport::protocol::Codec::PalRle as u8) << 1;
+        wire[PAYLOAD_START_OFFSET] = 0x00;
         std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "1.0");
         std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE", "palrle_thin");
         std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_SEED", "1");
         let mut inj = IoBridge::loss_injector_from_env("OUTBOUND").unwrap();
         assert!(inj.should_drop(&wire));
-        wire[24] = 0x01;
+        wire[PAYLOAD_START_OFFSET] = 0x01;
         // Re-create inj since it consumed RNG state; or just check the predicate behavior:
         // (the predicate is the only filter at proba=1.0, so should_drop is purely predicate-driven)
         let mut inj2 = IoBridge::loss_injector_from_env("OUTBOUND").unwrap();
