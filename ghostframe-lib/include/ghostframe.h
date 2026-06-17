@@ -218,6 +218,22 @@
  */
 #define TILE_NACK_MAX_ENTRIES 64
 
+#define FEC_GROUP_SIZE_K 10
+
+#define FEC_PARITY_PER_GROUP_R 1
+
+#define PARITY_INTERLEAVE_OFFSET (uint32_t)(2 * FEC_GROUP_SIZE_K)
+
+#define END_OF_STREAM_PARITY_FLUSH_MS 5
+
+#define MAX_RETRANSMITS 4
+
+#define BASE_RTO_MS 50
+
+#define RTO_BACKOFF_FACTOR 2
+
+#define CACHE_CAPACITY 8192
+
 /**
  * Bundles a `GhostframeServer` with the tokio `Runtime` that owns its
  * background tasks.  Drop order matters: the server (and its spawned
