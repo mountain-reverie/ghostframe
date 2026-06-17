@@ -3,6 +3,7 @@
 pub mod cache;
 pub mod emission_queue;
 pub mod parity;
+pub mod rto;
 pub mod traits;
 pub mod wire_seq;
 
