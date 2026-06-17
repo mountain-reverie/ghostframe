@@ -778,6 +778,37 @@ impl TileNackEnvelope {
 }
 
 // ---------------------------------------------------------------------------
+// Inbound classification
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboundKind {
+    Empty,
+    Unknown,
+    Hello,         // 0x01
+    AckBatchV1,    // 0x02 (deprecated, still routed)
+    AckBatch,      // 0x03
+    TileParity,    // 0x04
+    TileNack,      // 0x05
+    FrameFragment, // first byte 0x10..=0x7F
+    TileFragment,  // first byte 0x80..=0xFF (TILE_DATAGRAM_FLAG bit set)
+}
+
+pub fn classify_inbound(data: &[u8]) -> InboundKind {
+    let Some(&first) = data.first() else { return InboundKind::Empty };
+    match first {
+        0x01 => InboundKind::Hello,
+        0x02 => InboundKind::AckBatchV1,
+        0x03 => InboundKind::AckBatch,
+        TILE_PARITY_ENVELOPE => InboundKind::TileParity,
+        TILE_NACK_ENVELOPE => InboundKind::TileNack,
+        b if b < 0x10 => InboundKind::Unknown,
+        b if b < 0x80 => InboundKind::FrameFragment,
+        _ => InboundKind::TileFragment,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1350,5 +1381,25 @@ mod tests {
         assert_eq!(written, 64, "encode_clamped writes at most 64 entries");
         let parsed = TileNackEnvelope::decode(&buf).unwrap();
         assert_eq!(parsed.entries.len(), 64);
+    }
+
+    #[test]
+    fn classify_envelope_routes_by_first_byte() {
+        // Tile fragment: bit 31 of frame_seq set
+        let mut tile_dg = vec![0u8; DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE];
+        tile_dg[0] = 0x80;  // TILE_DATAGRAM_FLAG high byte
+        assert_eq!(classify_inbound(&tile_dg), InboundKind::TileFragment);
+
+        // Frame fragment: bit 31 clear
+        let mut frame_dg = vec![0u8; FRAME_HEADER_SIZE];
+        frame_dg[0] = 0x10;
+        assert_eq!(classify_inbound(&frame_dg), InboundKind::FrameFragment);
+
+        // Envelopes
+        assert_eq!(classify_inbound(&[0x03]), InboundKind::AckBatch);
+        assert_eq!(classify_inbound(&[TILE_PARITY_ENVELOPE]), InboundKind::TileParity);
+        assert_eq!(classify_inbound(&[TILE_NACK_ENVELOPE]), InboundKind::TileNack);
+        assert_eq!(classify_inbound(&[0x09]), InboundKind::Unknown);
+        assert_eq!(classify_inbound(&[]), InboundKind::Empty);
     }
 }
