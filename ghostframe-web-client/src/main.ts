@@ -603,12 +603,9 @@ async function main() {
   // arriving, queueing, draining, and the framebuffer is sized.
   let __lastStatsMs = 0;
   let __lastDrainCounts = { raw: 0, solid: 0, palrle: 0, cdf53: 0, h264: 0 };
-  // Idle-suppression state: the last `stats:` line content + how long
-  // we've been idle since something changed. Heartbeat every 30 s of
-  // idle. See the comment block at the periodic emit site.
+  // Idle suppression: skip emission when the snapshot is identical to
+  // the last one. No heartbeat; silence means nothing changed.
   let __lastStatsLineKey = '';
-  let __idleSinceMs: number | null = null;
-  let __lastIdleHeartbeatMs = 0;
   function tick() {
     __rafTicks++;
     diag.recordRafTick(__rafTicks);
@@ -651,15 +648,12 @@ async function main() {
     w.__rafDrainTotals.h264 += beforeDrain.h264;
     w.__rafTicks = __rafTicks;
 
-    // Once every ~2 s, log a one-liner summary so the page log shows what's
-    // happening without needing devtools. Useful when investigating "canvas
-    // is black but tiles seem to be arriving" failure modes.
-    //
-    // Idle suppression: when the rx + drain + lastSeq snapshot is
-    // byte-for-byte identical to the last logged one, skip the line
-    // and tick an "idle" counter. Every 30 s of idle, emit a single
-    // "idle, no change for Ns" heartbeat so the loop liveness is still
-    // visible without flooding the log with identical snapshots.
+    // Once every ~2 s, log a one-liner summary so the page log shows
+    // what's happening without needing devtools. Useful when
+    // investigating "canvas is black but tiles seem to be arriving"
+    // failure modes. Identical snapshots are dropped entirely — no
+    // heartbeat, no liveness ping; if nothing's moving, the log stays
+    // silent.
     const nowMs = performance.now();
     if (nowMs - __lastStatsMs > 2000) {
       __lastStatsMs = nowMs;
@@ -722,40 +716,31 @@ async function main() {
       const lineKey =
         `r:${counts.raw}|s:${counts.solid}|p:${counts.palrle}|c:${counts.cdf53}|h:${counts.h264}|` +
         `seq:${w.__lastTileSeq ?? '-'}|cov:${cdf53Refined}/${cdf53Partial}/${cdf53Tiles}|hist:${histCompact}`;
-      if (lineKey === __lastStatsLineKey) {
-        // Nothing material moved since the last emission. Track idle
-        // time and emit a single heartbeat every 30 s so the loop is
-        // visible.
-        if (__idleSinceMs === null) __idleSinceMs = nowMs;
-        if (nowMs - __lastIdleHeartbeatMs > 30000) {
-          __lastIdleHeartbeatMs = nowMs;
-          const idleSec = Math.round((nowMs - (__idleSinceMs ?? nowMs)) / 1000);
-          log(`(idle, no rx / drain / coverage change for ${idleSec}s; raf=${__rafTicks} lastSeq:${w.__lastTileSeq ?? '-'})`);
-        }
-      } else {
+      const statsChanged = lineKey !== __lastStatsLineKey;
+      if (statsChanged) {
         __lastStatsLineKey = lineKey;
-        __idleSinceMs = null;
-        __lastIdleHeartbeatMs = nowMs;
         log(statsLine);
         log(coverageLine);
       }
 
-      // Framebuffer readback: once per stats tick, sample 4 known-position
-      // pixels and log them. Settles the "is the framebuffer texture
-      // actually written or is the blit broken" question.
+      // Framebuffer readback: sample 4 known-position pixels and log
+      // them. Settles the "is the framebuffer texture actually written
+      // or is the blit broken" question.
       //
       //   (16,16)      = top-left background
       //   (960, 540)   = dead center (likely wizard for our test)
       //   (768, 992)   = first-tile area (24,31)*32
       //   (1900,1060)  = bottom-right corner
       //
-      // Stays async — we kick off the GPU mapAsync and let the result land
-      // in the next log line. Failing readback (no renderer wired up,
-      // OOB coords) logs the exception so it's visible.
+      // Stays async — we kick off the GPU mapAsync and let the result
+      // land in the next log line. Skipped when the stats line is
+      // suppressed (nothing's moving → framebuffer is the same →
+      // readback would produce identical output we'd then suppress
+      // anyway, and the GPU mapAsync isn't free).
       const readPixel = (window as any).__readPixel as
         | ((x: number, y: number) => Promise<number[]>)
         | undefined;
-      if (readPixel && fb.width > 0 && fb.height > 0) {
+      if (statsChanged && readPixel && fb.width > 0 && fb.height > 0) {
         const xs = [16, 960, 768, 1900];
         const ys = [16, 540, 992, 1060];
         Promise.all(
