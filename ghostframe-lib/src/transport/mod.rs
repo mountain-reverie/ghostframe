@@ -9,6 +9,7 @@ pub mod input_inject;
 pub mod io_bridge;
 pub mod protocol;
 pub mod quic;
+pub mod reliable_emitter;
 pub mod scheduler;
 pub mod webtransport;
 
