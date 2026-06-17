@@ -3,9 +3,7 @@
 //! group's first source — so the parity is well-separated from its
 //! sources in the kernel UDP write window.
 
-use crate::transport::reliable_emitter::{
-    PARITY_INTERLEAVE_OFFSET, END_OF_STREAM_PARITY_FLUSH_MS,
-};
+use crate::transport::reliable_emitter::END_OF_STREAM_PARITY_FLUSH_MS;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
 use std::time::{Duration, Instant};
@@ -86,6 +84,7 @@ impl EmissionQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::reliable_emitter::PARITY_INTERLEAVE_OFFSET;
 
     fn epoch() -> Instant {
         // A fixed Instant we can deterministically compare against.
@@ -98,8 +97,8 @@ mod tests {
         let t = epoch();
         q.push_source(vec![1]);
         q.push_source(vec![2]);
-        matches!(q.pop(2, t), Some(Emission::Source(_)));
-        matches!(q.pop(2, t), Some(Emission::Source(_)));
+        assert!(matches!(q.pop(2, t), Some(Emission::Source(_))));
+        assert!(matches!(q.pop(2, t), Some(Emission::Source(_))));
         assert!(q.pop(2, t).is_none());
     }
 
@@ -111,12 +110,12 @@ mod tests {
         q.schedule_parity(PARITY_INTERLEAVE_OFFSET, vec![0xAA]);  // emit after wire_seq 20
         // next_wire_seq = 1 (allocator about to hand out 1): parity not yet
         let e = q.pop(1, t).unwrap();
-        matches!(e, Emission::Source(_));
-        // Still no parity at next=5
-        assert!(matches!(q.pop(5, t), None | Some(Emission::Source(_))));
+        assert!(matches!(e, Emission::Source(_)));
+        // Still no parity at next=5 — queue is now empty (source already popped above)
+        assert!(q.pop(5, t).is_none());
         // At next=20 the parity becomes ready
         let e = q.pop(20, t).unwrap();
-        matches!(e, Emission::Parity(b) if b == vec![0xAA]);
+        assert!(matches!(e, Emission::Parity(b) if b == vec![0xAA]));
     }
 
     #[test]
@@ -129,7 +128,7 @@ mod tests {
         // Advance time past flush window
         let t1 = t0 + Duration::from_millis(END_OF_STREAM_PARITY_FLUSH_MS + 1);
         let e = q.pop(0, t1).expect("flushed");
-        matches!(e, Emission::Parity(_));
+        assert!(matches!(e, Emission::Parity(_)));
         assert!(q.is_empty());
     }
 }
