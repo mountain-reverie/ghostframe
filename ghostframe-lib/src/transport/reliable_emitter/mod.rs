@@ -2,10 +2,13 @@
 
 pub mod cache;
 pub mod emission_queue;
+pub mod emitter;
 pub mod parity;
 pub mod rto;
 pub mod traits;
 pub mod wire_seq;
+
+pub use emitter::ReliableTileEmitter;
 
 /// Logical identity of a tile-pass — the unit ACKed, NACKed, RTO'd, and
 /// cancelled by bump_generation. Matches M3.3d's ACK key bit-for-bit.
