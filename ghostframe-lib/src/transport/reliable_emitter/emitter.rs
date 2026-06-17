@@ -91,6 +91,20 @@ impl ReliableTileEmitter {
         self.stats.source_emitted += 1;
     }
 
+    /// Ingest a batch of ACKs from the client. For each key, remove the
+    /// corresponding cache entry. A hit (entry was live) bumps `ack_hit`; a
+    /// miss (already evicted/cancelled) bumps `ack_miss`. Idempotent: late
+    /// ACKs are silent.
+    pub fn on_ack(&mut self, keys: &[EmitKey]) {
+        for key in keys {
+            if self.cache.remove(key).is_some() {
+                self.stats.ack_hit += 1;
+            } else {
+                self.stats.ack_miss += 1;
+            }
+        }
+    }
+
     /// Drain emissions to a sender until the queue is empty.
     pub fn drain<S: DatagramSender>(&mut self, sender: &mut S, now: Instant) {
         let next = self.alloc.peek();
@@ -178,5 +192,28 @@ mod tests {
         // The parity datagram starts with TILE_PARITY_ENVELOPE (0x04)
         let parities: Vec<&Vec<u8>> = sender.sent.iter().filter(|b| b[0] == 0x04).collect();
         assert_eq!(parities.len(), 1);
+    }
+
+    #[test]
+    fn on_ack_removes_cache_entry_and_bumps_ack_hit() {
+        let mut e = ReliableTileEmitter::new();
+        let mut sender = CollectSender::default();
+        let now = Instant::now();
+        let key = EmitKey::new(1, 0, 0, 0);
+        e.submit_one(key, fake_source(1, 0, 0), now);
+        e.drain(&mut sender, now);
+        assert!(e.cache.get(&key).is_some());
+        e.on_ack(&[key]);
+        assert!(e.cache.get(&key).is_none());
+        assert_eq!(e.stats.ack_hit, 1);
+        assert_eq!(e.stats.ack_miss, 0);
+    }
+
+    #[test]
+    fn on_ack_for_unknown_key_bumps_ack_miss() {
+        let mut e = ReliableTileEmitter::new();
+        e.on_ack(&[EmitKey::new(99, 0, 0, 0)]);
+        assert_eq!(e.stats.ack_miss, 1);
+        assert_eq!(e.stats.ack_hit, 0);
     }
 }
