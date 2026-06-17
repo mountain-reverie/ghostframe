@@ -1,13 +1,14 @@
 //! Central facade that ties cache, emission queue, allocator, group
 //! builder, and RTO wheel into one struct. Per-session.
 
+use crate::transport::protocol::TileParityEnvelope;
 use crate::transport::reliable_emitter::cache::{CacheEntry, RetransmitCache};
 use crate::transport::reliable_emitter::emission_queue::{Emission, EmissionQueue};
 use crate::transport::reliable_emitter::parity::GroupBuilder;
 use crate::transport::reliable_emitter::rto::{rto_for_attempt, RtoTimerWheel};
 use crate::transport::reliable_emitter::traits::DatagramSender;
 use crate::transport::reliable_emitter::wire_seq::WireSeqAllocator;
-use crate::transport::reliable_emitter::{EmitKey, FEC_GROUP_SIZE_K};
+use crate::transport::reliable_emitter::{EmitKey, FEC_GROUP_SIZE_K, PARITY_INTERLEAVE_OFFSET};
 use bytes::Bytes;
 use smallvec::smallvec;
 use std::time::{Duration, Instant};
@@ -56,11 +57,11 @@ impl ReliableTileEmitter {
     /// wire_seq).
     pub fn submit_one(&mut self, key: EmitKey, source_datagram_bytes: Bytes, now: Instant) {
         let wire_seq = self.alloc.allocate();
-        // Stamp wire_seq into the source bytes' DatagramHeader at offset 8..12 BE.
         let mut bytes = source_datagram_bytes.to_vec();
         if bytes.len() >= 12 {
             bytes[8..12].copy_from_slice(&wire_seq.to_be_bytes());
         }
+        // Cache & RTO.
         let entry = CacheEntry {
             fragments: smallvec![Bytes::from(bytes.clone())],
             wire_seqs: smallvec![wire_seq],
@@ -71,6 +72,21 @@ impl ReliableTileEmitter {
         };
         self.cache.insert(key, entry);
         self.rto.schedule(key, now + rto_for_attempt(self.smoothed_rtt, 0));
+        // Feed group builder; on K-th source build & schedule parity envelope.
+        if let Some(result) = self.group.add(wire_seq, &bytes) {
+            let envelope = TileParityEnvelope {
+                group_first_wire_seq: result.group_first_wire_seq,
+                k: result.k,
+                parity_idx: 0,
+                group_first_payload_len: result.first_len,
+                parity_payload: result.parity,
+            };
+            let mut env_bytes = Vec::new();
+            envelope.encode(&mut env_bytes);
+            let emit_after = result.group_first_wire_seq.wrapping_add(PARITY_INTERLEAVE_OFFSET);
+            self.queue.schedule_parity(emit_after, env_bytes);
+        }
+        // Enqueue the source itself.
         self.queue.push_source(bytes);
         self.stats.source_emitted += 1;
     }
@@ -138,5 +154,29 @@ mod tests {
         let ws1 = u32::from_be_bytes(s1[8..12].try_into().unwrap());
         assert_eq!(ws0, 0);
         assert_eq!(ws1, 1);
+    }
+
+    #[test]
+    fn submit_k_sources_emits_one_parity_after_offset() {
+        use crate::transport::reliable_emitter::FEC_GROUP_SIZE_K;
+        let mut e = ReliableTileEmitter::new();
+        let mut sender = CollectSender::default();
+        let now = Instant::now();
+        // Submit K sources for group 0, then K sources for group 1 (so the
+        // offset-interleaved parity for group 0 is reachable).
+        for i in 0..(FEC_GROUP_SIZE_K as u32 * 2) {
+            e.submit_one(EmitKey::new(i, 0, 0, 0), fake_source(i, 0, 0), now);
+        }
+        // Drain past wire_seq 20 by submitting one more source so allocator's
+        // peek advances.
+        e.submit_one(EmitKey::new(99, 0, 0, 0), fake_source(99, 0, 0), now);
+        e.drain(&mut sender, now);
+        // At least one parity datagram should have been emitted
+        assert_eq!(e.stats.parity_emitted, 1, "exactly one parity for first K sources");
+        // Total emitted: 2K+1 source + 1 parity
+        assert_eq!(sender.sent.len(), (FEC_GROUP_SIZE_K as u32 * 2 + 1 + 1) as usize);
+        // The parity datagram starts with TILE_PARITY_ENVELOPE (0x04)
+        let parities: Vec<&Vec<u8>> = sender.sent.iter().filter(|b| b[0] == 0x04).collect();
+        assert_eq!(parities.len(), 1);
     }
 }
