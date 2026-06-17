@@ -603,6 +603,12 @@ async function main() {
   // arriving, queueing, draining, and the framebuffer is sized.
   let __lastStatsMs = 0;
   let __lastDrainCounts = { raw: 0, solid: 0, palrle: 0, cdf53: 0, h264: 0 };
+  // Idle-suppression state: the last `stats:` line content + how long
+  // we've been idle since something changed. Heartbeat every 30 s of
+  // idle. See the comment block at the periodic emit site.
+  let __lastStatsLineKey = '';
+  let __idleSinceMs: number | null = null;
+  let __lastIdleHeartbeatMs = 0;
   function tick() {
     __rafTicks++;
     diag.recordRafTick(__rafTicks);
@@ -648,6 +654,12 @@ async function main() {
     // Once every ~2 s, log a one-liner summary so the page log shows what's
     // happening without needing devtools. Useful when investigating "canvas
     // is black but tiles seem to be arriving" failure modes.
+    //
+    // Idle suppression: when the rx + drain + lastSeq snapshot is
+    // byte-for-byte identical to the last logged one, skip the line
+    // and tick an "idle" counter. Every 30 s of idle, emit a single
+    // "idle, no change for Ns" heartbeat so the loop liveness is still
+    // visible without flooding the log with identical snapshots.
     const nowMs = performance.now();
     if (nowMs - __lastStatsMs > 2000) {
       __lastStatsMs = nowMs;
@@ -694,17 +706,39 @@ async function main() {
         .map((n, i) => (n > 0 ? `${i}:${n}` : ''))
         .filter(Boolean)
         .join(' ');
-      log(
+      // Compose the line + an identity key for idle suppression. The
+      // key excludes `raf:` (which always changes) and the cdf53fails
+      // counter (also bookkeeping that creeps) — we suppress only when
+      // nothing the user cares about has actually moved.
+      const statsLine =
         `stats: rx{r:${counts.raw} s:${counts.solid} p:${counts.palrle} c:${counts.cdf53} h:${counts.h264}} ` +
         `Δdrain{r:${drainDelta.raw} s:${drainDelta.solid} p:${drainDelta.palrle} c:${drainDelta.cdf53} h:${drainDelta.h264}} ` +
         `fb:${fb.width}x${fb.height} ` +
         `cdf53fails:${cdf53Fails}(last=${cdf53Last}) ` +
-        `raf:${__rafTicks} lastSeq:${w.__lastTileSeq ?? '-'}`
-      );
-      log(
+        `raf:${__rafTicks} lastSeq:${w.__lastTileSeq ?? '-'}`;
+      const coverageLine =
         `cdf53-coverage: tiles=${cdf53Tiles} refined=${cdf53Refined}/14p partial=${cdf53Partial} ` +
-        `pass-hist{${histCompact}}`
-      );
+        `pass-hist{${histCompact}}`;
+      const lineKey =
+        `r:${counts.raw}|s:${counts.solid}|p:${counts.palrle}|c:${counts.cdf53}|h:${counts.h264}|` +
+        `seq:${w.__lastTileSeq ?? '-'}|cov:${cdf53Refined}/${cdf53Partial}/${cdf53Tiles}|hist:${histCompact}`;
+      if (lineKey === __lastStatsLineKey) {
+        // Nothing material moved since the last emission. Track idle
+        // time and emit a single heartbeat every 30 s so the loop is
+        // visible.
+        if (__idleSinceMs === null) __idleSinceMs = nowMs;
+        if (nowMs - __lastIdleHeartbeatMs > 30000) {
+          __lastIdleHeartbeatMs = nowMs;
+          const idleSec = Math.round((nowMs - (__idleSinceMs ?? nowMs)) / 1000);
+          log(`(idle, no rx / drain / coverage change for ${idleSec}s; raf=${__rafTicks} lastSeq:${w.__lastTileSeq ?? '-'})`);
+        }
+      } else {
+        __lastStatsLineKey = lineKey;
+        __idleSinceMs = null;
+        __lastIdleHeartbeatMs = nowMs;
+        log(statsLine);
+        log(coverageLine);
+      }
 
       // Framebuffer readback: once per stats tick, sample 4 known-position
       // pixels and log them. Settles the "is the framebuffer texture

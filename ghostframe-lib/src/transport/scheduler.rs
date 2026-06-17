@@ -166,6 +166,16 @@ impl Scheduler {
         seen.len() as u32
     }
 
+    /// Total number of entries currently in the refinement queue,
+    /// including ones marked `WorkState::Superseded` that will be
+    /// retain-dropped on the next tick. Diagnostic accessor for the
+    /// io_bridge cumulative log — pairs with `bump_count_accumulator`
+    /// to show "how many bumps just happened" vs "how deep is the
+    /// resulting queue".
+    pub fn refinement_queue_len(&self) -> usize {
+        self.refinement_queue.len()
+    }
+
     pub fn generation_for(&self, tile_x: u8, tile_y: u8) -> u8 {
         let idx = (tile_y as usize) * (self.cols as usize) + (tile_x as usize);
         self.generations.get(idx).copied().unwrap_or(0)

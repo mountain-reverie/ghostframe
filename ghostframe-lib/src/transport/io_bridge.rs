@@ -397,6 +397,37 @@ pub struct IoBridge {
     /// breaking the 16-color PalRle threshold per 32×32 tile, or is the
     /// classifier sending tiles to Cdf53 that should have been PalRle?".
     color_histogram_accumulator: UniqueColorHistogram,
+    /// Per-frame bump counts, reset on every `cumulative emit` log.
+    /// Drives the "did the server keep bumping generations after the
+    /// initial burst?" question that the client's
+    /// `cdf53-coverage: refined=0/14p` distribution surfaced — repeated
+    /// `bump_generation` mid-refinement supersedes the prior
+    /// generation's pending passes (`drain_*` queues `retain` Superseded
+    /// entries on the next tick), so a tile that keeps getting marked
+    /// dirty never finishes any single generation's 14-pass burst.
+    /// Counters are total (across all tiles), separated by emission path
+    /// so we can correlate with the scheduler-emission-policy site
+    /// (`dispatch_dirty_tiles_via_scheduler` line 1007: priority-queue
+    /// path, non-cdf53 codecs only; Phase B dirty-cdf53 line 2630;
+    /// Phase B escalation line 2711).
+    bump_count_accumulator: BumpCountAccumulator,
+}
+
+/// Per-cumulative-log bump counters. Reset on log emission.
+#[derive(Default, Clone, Copy)]
+struct BumpCountAccumulator {
+    /// `bump_generation_collecting` in `dispatch_dirty_tiles_via_scheduler`
+    /// (priority-queue path, Solid/PalRle/Raw — Cdf53 tiles are skipped
+    /// before reaching this site).
+    priority_path: u32,
+    /// `bump_generation` in dirty-cdf53 Phase B
+    /// (`process_frame_gpu` line 2630). One per cdf53-classified dirty
+    /// tile per frame.
+    cdf53_dirty_path: u32,
+    /// `bump_generation` in escalation Phase B
+    /// (`process_frame_gpu` line 2711). One per
+    /// idle-escalation-promoted tile per frame.
+    cdf53_escalation_path: u32,
 }
 
 /// Cumulative count of datagrams the server has handed to
@@ -721,6 +752,7 @@ impl IoBridge {
             cumulative_datagrams_emitted: CumulativeEmitCounters::default(),
             last_cumulative_emit_log_frame: 0,
             color_histogram_accumulator: UniqueColorHistogram::default(),
+            bump_count_accumulator: BumpCountAccumulator::default(),
         })
     }
 
@@ -1005,6 +1037,8 @@ impl IoBridge {
             let (gen, superseded) = self
                 .scheduler
                 .bump_generation_collecting(tile_x as u8, tile_y as u8);
+            self.bump_count_accumulator.priority_path =
+                self.bump_count_accumulator.priority_path.saturating_add(1);
             // Drop any in-flight Cdf53 coverage for this tile. The bump
             // marked the matching refinement-queue work `Superseded`; the
             // already-emitted-but-not-yet-ACKed Cdf53 coverage must be
@@ -2628,6 +2662,8 @@ impl IoBridge {
                             }
                             let passes = crate::encoder::cdf53::encode_passes(&coeffs_i16);
                             let gen = self.scheduler.bump_generation(tile_x, tile_y);
+                            self.bump_count_accumulator.cdf53_dirty_path =
+                                self.bump_count_accumulator.cdf53_dirty_path.saturating_add(1);
                             // Drop any in-flight Cdf53 coverage for the old
                             // generation (see dispatch_dirty_tiles_via_scheduler
                             // for the full rationale).
@@ -2709,6 +2745,10 @@ impl IoBridge {
                         let coeffs_i16: Vec<i16> = coeffs_i32.iter().map(|&v| v as i16).collect();
                         let passes = crate::encoder::cdf53::encode_passes(&coeffs_i16);
                         let gen = self.scheduler.bump_generation(tile_x, tile_y);
+                        self.bump_count_accumulator.cdf53_escalation_path = self
+                            .bump_count_accumulator
+                            .cdf53_escalation_path
+                            .saturating_add(1);
                         // Drop any in-flight Cdf53 coverage for the old
                         // generation (see dispatch_dirty_tiles_via_scheduler
                         // for the full rationale).
@@ -2828,6 +2868,25 @@ impl IoBridge {
                         send_datagram_errs_total = self.datagram_send_errs,
                         "cumulative emit (datagrams handed to quinn since startup, per codec)"
                     );
+
+                    // Per-window bump counts. Each bump_generation supersedes
+                    // the prior gen's still-Pending refinement passes. If
+                    // these stay non-zero after the initial burst, repeated
+                    // bumping explains the client-side "no tile reaches 14
+                    // passes" plateau — the refinement queue empties to
+                    // ALL Superseded entries before any single gen's
+                    // 14-pass burst finishes draining.
+                    let b = self.bump_count_accumulator;
+                    let refinement_queue_len = self.scheduler.refinement_queue_len();
+                    tracing::info!(
+                        frame_seq = seq,
+                        bumps_priority_path = b.priority_path,
+                        bumps_cdf53_dirty_path = b.cdf53_dirty_path,
+                        bumps_cdf53_escalation_path = b.cdf53_escalation_path,
+                        refinement_queue_len = refinement_queue_len,
+                        "bump counts (since last cumulative log) + scheduler refinement queue depth"
+                    );
+                    self.bump_count_accumulator = BumpCountAccumulator::default();
 
                     if Self::diagnose_color_histogram_from_env() {
                         let h = self.color_histogram_accumulator;
@@ -3408,6 +3467,7 @@ impl IoBridge {
             cumulative_datagrams_emitted: CumulativeEmitCounters::default(),
             last_cumulative_emit_log_frame: 0,
             color_histogram_accumulator: UniqueColorHistogram::default(),
+            bump_count_accumulator: BumpCountAccumulator::default(),
         }
     }
 
@@ -3477,6 +3537,7 @@ impl IoBridge {
             cumulative_datagrams_emitted: CumulativeEmitCounters::default(),
             last_cumulative_emit_log_frame: 0,
             color_histogram_accumulator: UniqueColorHistogram::default(),
+            bump_count_accumulator: BumpCountAccumulator::default(),
         }
     }
 
