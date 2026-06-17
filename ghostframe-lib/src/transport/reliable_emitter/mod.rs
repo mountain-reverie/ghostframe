@@ -1,6 +1,7 @@
 //! Reliable Tile Emitter — see docs/superpowers/specs/2026-06-17-reliable-tile-emitter-design.md
 
 pub mod traits;
+pub mod wire_seq;
 
 // ---- Knob constants (spec §9) ----
 pub const FEC_GROUP_SIZE_K: usize = 10;
