@@ -103,6 +103,11 @@ const SCHEDULER_BUDGET_MULT_MAX: f64 = 1.0;
 // the overhead bytes — and Blocked silently drops refinement work
 // the scheduler already popped from its queue.
 const QUINN_SEND_BUFFER_SAFETY_FRACTION: f64 = 0.80;
+// Period (in frames) between cumulative-emit log lines. 60 frames ≈ 2 s
+// at the daemon's 30 fps capture rate, which is the same cadence as
+// the client's periodic `stats:` log — so the two lines line up
+// naturally for side-by-side delta inspection.
+const CUMULATIVE_EMIT_LOG_INTERVAL_FRAMES: u32 = 60;
 
 // ---------------------------------------------------------------------------
 // M3.5 bench telemetry: per-frame send-side stats
@@ -373,6 +378,49 @@ pub struct IoBridge {
     /// we've already drained, so we never overshoot the AIMD-adjusted
     /// frame budget across all continuation invocations.
     scheduler_continuation: Option<SchedulerContinuation>,
+    /// Lifetime counters of datagrams handed to `send_datagram` per codec.
+    /// Counted post-fragmentation, regardless of send success — the
+    /// `datagram_send_errs` counter above tracks the failure subset. The
+    /// purpose is to give us a server-side number directly comparable to
+    /// the client's cumulative `rx{r:.. s:.. p:.. c:.. h:..}` stats so we
+    /// can tell whether un-rendered tiles are server-side (never emitted),
+    /// quinn-side (Blocked → counted in `datagram_send_errs`), or
+    /// wire-side (emitted minus errs > client rx).
+    cumulative_datagrams_emitted: CumulativeEmitCounters,
+    /// Last frame seq at which we logged the cumulative-emit counters.
+    /// Used to throttle the periodic `cumulative emit` log to once per
+    /// `CUMULATIVE_EMIT_LOG_INTERVAL_FRAMES` frames (≈ 2 s at 30 fps).
+    last_cumulative_emit_log_frame: u32,
+    /// Per-frame unique-color histogram accumulator, gated by
+    /// `GHOSTFRAME_DIAGNOSE_COLOR_HIST=1`. Buckets dirty-tile
+    /// `unique_colors` values to answer "is the background really
+    /// breaking the 16-color PalRle threshold per 32×32 tile, or is the
+    /// classifier sending tiles to Cdf53 that should have been PalRle?".
+    color_histogram_accumulator: UniqueColorHistogram,
+}
+
+/// Cumulative count of datagrams the server has handed to
+/// `wt.send_datagram(...)`, keyed by source codec. Per-codec rather than
+/// total so we can correlate with the per-codec client `rx` counters.
+#[derive(Default, Clone, Copy)]
+struct CumulativeEmitCounters {
+    raw: u64,
+    solid: u64,
+    palrle: u64,
+    cdf53: u64,
+    h264: u64,
+}
+
+/// Unique-color histogram over dirty tiles for one frame, reset on every
+/// log emission. Buckets mirror the classifier's decision boundaries:
+/// 1 → Solid eligible, 2–16 → PalRle eligible, 17 → Cdf53 (overflow).
+#[derive(Default, Clone, Copy)]
+struct UniqueColorHistogram {
+    bucket_1: u32,
+    bucket_2_4: u32,
+    bucket_5_16: u32,
+    bucket_overflow: u32,
+    bucket_unknown: u32,
 }
 
 /// State the `Event::DatagramsUnblocked` handler needs to resume the
@@ -545,6 +593,19 @@ impl IoBridge {
         )
     }
 
+    /// Returns `true` when `GHOSTFRAME_DIAGNOSE_COLOR_HIST` is set to
+    /// `"1"` or `"true"`. Enables the per-cumulative-log unique-colors
+    /// histogram dump. Used to verify the "is the background really
+    /// > 16 colors per 32×32 tile, or are we misclassifying low-color
+    /// regions to Cdf53?" question raised in the evangeline screenshot
+    /// debug session.
+    fn diagnose_color_histogram_from_env() -> bool {
+        matches!(
+            std::env::var("GHOSTFRAME_DIAGNOSE_COLOR_HIST").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    }
+
     /// Create a new `IoBridge` by connecting to ghostbridge and opening a UDP
     /// listener on `listen_addr` (e.g. `":443"`).
     pub async fn new(
@@ -657,6 +718,9 @@ impl IoBridge {
             datagram_send_err_first_logged: false,
             tick_budget_multiplier: 1.0,
             scheduler_continuation: None,
+            cumulative_datagrams_emitted: CumulativeEmitCounters::default(),
+            last_cumulative_emit_log_frame: 0,
+            color_histogram_accumulator: UniqueColorHistogram::default(),
         })
     }
 
@@ -1204,6 +1268,32 @@ impl IoBridge {
                 stats.total_wire_bytes = stats.total_wire_bytes.saturating_add(tile_wire_bytes);
                 total_wire_bytes_sent =
                     total_wire_bytes_sent.saturating_add(tile_wire_bytes as usize);
+            }
+            // Cumulative per-codec emit counter — bumped once per
+            // datagram fragment so the cadence matches the client's
+            // per-datagram `rx{...}` accounting. Counted before send so
+            // the "emitted - send_errs" subtraction reflects actual
+            // wire-attempts; loss between emit and client is then
+            // `(emitted - send_errs) - client.rx`.
+            let n_dg = datagrams.len() as u64;
+            match work.codec {
+                Codec::Solid => {
+                    self.cumulative_datagrams_emitted.solid =
+                        self.cumulative_datagrams_emitted.solid.saturating_add(n_dg);
+                }
+                Codec::PalRle => {
+                    self.cumulative_datagrams_emitted.palrle =
+                        self.cumulative_datagrams_emitted.palrle.saturating_add(n_dg);
+                }
+                Codec::Cdf53 => {
+                    self.cumulative_datagrams_emitted.cdf53 =
+                        self.cumulative_datagrams_emitted.cdf53.saturating_add(n_dg);
+                }
+                Codec::Raw => {
+                    self.cumulative_datagrams_emitted.raw =
+                        self.cumulative_datagrams_emitted.raw.saturating_add(n_dg);
+                }
+                _ => {}
             }
             for dg in &datagrams {
                 self.send_to_all_sessions(dg);
@@ -1993,6 +2083,32 @@ impl IoBridge {
             self.metrics_tracker.get_mut(tx, ty).codec_state = tentative[i];
         }
 
+        // Accumulate the per-dirty-tile unique-color histogram. Cheap
+        // (one u32 increment per tile, no allocation), so always-on; the
+        // log emission is gated by the env var, and the accumulator is
+        // reset there. See `diagnose_color_histogram_from_env` for the
+        // motivation (verify the "is the textured background really
+        // > 16 colors per 32×32 tile?" hypothesis).
+        for &(tx, ty) in &dirty_xy {
+            let uc = self.metrics_tracker.get(tx, ty).unique_colors;
+            if uc == crate::tile::UNIQUE_COLORS_UNKNOWN {
+                self.color_histogram_accumulator.bucket_unknown =
+                    self.color_histogram_accumulator.bucket_unknown.saturating_add(1);
+            } else if uc == 1 {
+                self.color_histogram_accumulator.bucket_1 =
+                    self.color_histogram_accumulator.bucket_1.saturating_add(1);
+            } else if uc <= 4 {
+                self.color_histogram_accumulator.bucket_2_4 =
+                    self.color_histogram_accumulator.bucket_2_4.saturating_add(1);
+            } else if uc <= 16 {
+                self.color_histogram_accumulator.bucket_5_16 =
+                    self.color_histogram_accumulator.bucket_5_16.saturating_add(1);
+            } else {
+                self.color_histogram_accumulator.bucket_overflow =
+                    self.color_histogram_accumulator.bucket_overflow.saturating_add(1);
+            }
+        }
+
         // Per-tile diagnostic tracing: emit one log line per dirty tile when
         // GHOSTFRAME_DIAGNOSE_TILES=1 (or =true).  Parseable by downstream awk.
         if Self::diagnose_tiles_from_env() {
@@ -2192,6 +2308,11 @@ impl IoBridge {
                     &encoded.payload,
                     max_frame_fragment_payload(max_dg_size),
                 );
+
+                self.cumulative_datagrams_emitted.h264 = self
+                    .cumulative_datagrams_emitted
+                    .h264
+                    .saturating_add(datagrams.len() as u64);
 
                 for dg in &datagrams {
                     self.send_to_all_sessions(dg);
@@ -2674,6 +2795,56 @@ impl IoBridge {
                     send_datagram_errs_total = self.datagram_send_errs,
                     "process_frame_gpu: dispatch returned"
                 );
+
+                // ---- Cumulative emit + color-histogram diagnostics ----
+                //
+                // Throttled to once per `CUMULATIVE_EMIT_LOG_INTERVAL_FRAMES`
+                // (~2 s at 30 fps) so the line lines up with the client's
+                // periodic `stats:` log. The numbers are directly comparable
+                // to the client's `rx{r:.. s:.. p:.. c:.. h:..}` totals:
+                //   - if (emitted - send_errs) == client.rx for every codec,
+                //     the wire is clean — any missing tile is server-side
+                //     (never emitted because the scheduler queue was empty
+                //     or the classifier picked a different codec for it).
+                //   - if (emitted - send_errs) >  client.rx, the gap is
+                //     UDP-level packet loss between the server's
+                //     `wt.send_datagram(...)` and the browser's
+                //     WebTransport reader.
+                //   - if send_errs > 0, we have QUIC backpressure — the new
+                //     buffer-space cap (commit 66486b1) should keep this at
+                //     0 in steady state, so any non-zero value is a regression.
+                if seq.wrapping_sub(self.last_cumulative_emit_log_frame)
+                    >= CUMULATIVE_EMIT_LOG_INTERVAL_FRAMES
+                {
+                    self.last_cumulative_emit_log_frame = seq;
+                    let c = self.cumulative_datagrams_emitted;
+                    tracing::info!(
+                        frame_seq = seq,
+                        emitted_solid = c.solid,
+                        emitted_palrle = c.palrle,
+                        emitted_cdf53 = c.cdf53,
+                        emitted_raw = c.raw,
+                        emitted_h264 = c.h264,
+                        send_datagram_errs_total = self.datagram_send_errs,
+                        "cumulative emit (datagrams handed to quinn since startup, per codec)"
+                    );
+
+                    if Self::diagnose_color_histogram_from_env() {
+                        let h = self.color_histogram_accumulator;
+                        tracing::info!(
+                            frame_seq = seq,
+                            colors_1 = h.bucket_1,
+                            colors_2_to_4 = h.bucket_2_4,
+                            colors_5_to_16 = h.bucket_5_16,
+                            colors_overflow_17plus = h.bucket_overflow,
+                            colors_unknown_sentinel = h.bucket_unknown,
+                            "unique-colors histogram over dirty tiles \
+                             since last cumulative log (1=Solid eligible, \
+                             2..16=PalRle eligible, 17=Cdf53 forced)"
+                        );
+                        self.color_histogram_accumulator = UniqueColorHistogram::default();
+                    }
+                }
 
                 // Frame stats — emit per design Section 4.
                 tracing::debug!(
@@ -3234,6 +3405,9 @@ impl IoBridge {
             datagram_send_err_first_logged: false,
             tick_budget_multiplier: 1.0,
             scheduler_continuation: None,
+            cumulative_datagrams_emitted: CumulativeEmitCounters::default(),
+            last_cumulative_emit_log_frame: 0,
+            color_histogram_accumulator: UniqueColorHistogram::default(),
         }
     }
 
@@ -3300,6 +3474,9 @@ impl IoBridge {
             datagram_send_err_first_logged: false,
             tick_budget_multiplier: 1.0,
             scheduler_continuation: None,
+            cumulative_datagrams_emitted: CumulativeEmitCounters::default(),
+            last_cumulative_emit_log_frame: 0,
+            color_histogram_accumulator: UniqueColorHistogram::default(),
         }
     }
 

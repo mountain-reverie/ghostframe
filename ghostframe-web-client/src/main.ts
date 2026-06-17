@@ -510,6 +510,33 @@ async function main() {
       w.__tileCounts.cdf53++;
       // M3.3b diagnostic counters: track every Cdf53 dispatch branch.
       w.__cdf53DispatchSeen = (w.__cdf53DispatchSeen ?? 0) + 1;
+
+      // Per-(tileX, tileY, generation) pass-coverage bookkeeping.
+      // Records the bitmask of received pass indices (0..13) so the
+      // periodic stats log can split the cdf53 tile set into
+      // "fully refined" (all 14 passes seen) and "partial" (1..13
+      // passes seen) buckets. Each tile owns its current generation
+      // entry; on bump the prior entry is replaced (the only valid
+      // refinement bits are for the most recent generation, per the
+      // server-side `bump_generation` + `drop_cdf53_for_tile`
+      // contract). Keyed by `tx<<8 | ty` so the Map is keyed by a
+      // plain number rather than a string for cheaper lookup; the
+      // value is `{ generation, passMask }` where passMask bit i ==
+      // pass i received.
+      const cdf53Coverage: Map<number, { generation: number; passMask: number }> =
+        (w.__cdf53Coverage ??= new Map());
+      const tileKey = (tX << 8) | tY;
+      const gen = asm.header.generation;
+      const passIdx = asm.header.pass;
+      const existing = cdf53Coverage.get(tileKey);
+      if (!existing || existing.generation !== gen) {
+        // First pass for this (tile, generation) — replaces any prior
+        // partial state from the previous generation.
+        cdf53Coverage.set(tileKey, { generation: gen, passMask: 1 << passIdx });
+      } else {
+        existing.passMask |= 1 << passIdx;
+      }
+
       const r = prevalidateCdf53(payload, asm.header.generation, asm.header.pass);
       if (!r.ok) {
         w.__cdf53PrevalidateFails = (w.__cdf53PrevalidateFails ?? 0) + 1;
@@ -637,12 +664,46 @@ async function main() {
       const fb = renderer.framebuffer;
       const cdf53Fails = w.__cdf53PrevalidateFails ?? 0;
       const cdf53Last = w.__cdf53LastFailCode ?? '-';
+
+      // cdf53 per-tile coverage summary. `refined` = tiles that have
+      // received all 14 passes for their current generation; `partial`
+      // = tiles with 1..13 passes; `missing` is implicit (never seen,
+      // not tracked). Use popcount on a 14-bit mask (passes 0..13).
+      // The histogram exposes the *distribution* of pass counts so we
+      // can tell e.g. "most are stuck at 8" (LL3 + a few bit-planes)
+      // vs "most are at 14 but a handful missing one or two passes".
+      const cdf53Cov = (w.__cdf53Coverage ?? new Map<number, { generation: number; passMask: number }>()) as Map<number, { generation: number; passMask: number }>;
+      let cdf53Refined = 0;
+      let cdf53Partial = 0;
+      const cdf53PassHist = new Array(15).fill(0); // bucket index = passes received (0..14)
+      const FULL_MASK_14 = (1 << 14) - 1;
+      for (const v of cdf53Cov.values()) {
+        // Mask off bits >= 14 in case of header corruption.
+        const mask = v.passMask & FULL_MASK_14;
+        let bits = mask;
+        bits = bits - ((bits >> 1) & 0x5555);
+        bits = (bits & 0x3333) + ((bits >> 2) & 0x3333);
+        bits = (bits + (bits >> 4)) & 0x0f0f;
+        const popcount = ((bits * 0x0101) >> 8) & 0xff;
+        cdf53PassHist[popcount] = (cdf53PassHist[popcount] ?? 0) + 1;
+        if (popcount === 14) cdf53Refined++;
+        else if (popcount > 0) cdf53Partial++;
+      }
+      const cdf53Tiles = cdf53Cov.size;
+      const histCompact = cdf53PassHist
+        .map((n, i) => (n > 0 ? `${i}:${n}` : ''))
+        .filter(Boolean)
+        .join(' ');
       log(
         `stats: rx{r:${counts.raw} s:${counts.solid} p:${counts.palrle} c:${counts.cdf53} h:${counts.h264}} ` +
         `Δdrain{r:${drainDelta.raw} s:${drainDelta.solid} p:${drainDelta.palrle} c:${drainDelta.cdf53} h:${drainDelta.h264}} ` +
         `fb:${fb.width}x${fb.height} ` +
         `cdf53fails:${cdf53Fails}(last=${cdf53Last}) ` +
         `raf:${__rafTicks} lastSeq:${w.__lastTileSeq ?? '-'}`
+      );
+      log(
+        `cdf53-coverage: tiles=${cdf53Tiles} refined=${cdf53Refined}/14p partial=${cdf53Partial} ` +
+        `pass-hist{${histCompact}}`
       );
 
       // Framebuffer readback: once per stats tick, sample 4 known-position
