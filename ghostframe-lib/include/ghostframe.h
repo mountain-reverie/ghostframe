@@ -192,6 +192,33 @@
 #define NACK_SIZE 6
 
 /**
+ * Envelope discriminator byte for the tile-FEC parity datagram.
+ */
+#define TILE_PARITY_ENVELOPE 4
+
+/**
+ * Size of the fixed-length header preceding `parity_payload`.
+ */
+#define TILE_PARITY_HEADER_SIZE ((((1 + 4) + 1) + 1) + 2)
+
+/**
+ * Envelope discriminator byte for the per-fragment NACK datagram
+ * (client → server).
+ */
+#define TILE_NACK_ENVELOPE 5
+
+/**
+ * Size on the wire of a single NACK entry.
+ */
+#define TILE_NACK_ENTRY_SIZE 8
+
+/**
+ * Maximum number of NACK entries per datagram. Mirrors the ACK envelope's
+ * cap so a NackBatcher can use the same chunking pattern.
+ */
+#define TILE_NACK_MAX_ENTRIES 64
+
+/**
  * Bundles a `GhostframeServer` with the tokio `Runtime` that owns its
  * background tasks.  Drop order matters: the server (and its spawned
  * IoBridge task) must be dropped *before* the runtime shuts down.
