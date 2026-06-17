@@ -27,6 +27,7 @@ fn datagram_header_encode_decode() {
         frame_seq: 1024,
         frag_idx: 3,
         frag_total: 8,
+        wire_seq: 0,
         timestamp_us: 16_666,
     };
     let mut buf = Vec::with_capacity(DATAGRAM_HEADER_SIZE);

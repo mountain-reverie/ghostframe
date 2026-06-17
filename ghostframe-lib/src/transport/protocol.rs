@@ -2,7 +2,7 @@
 //!
 //! Each QUIC datagram carries one fragment of one tile:
 //! ```text
-//! [DatagramHeader: 12 bytes][TileHeader: 8 bytes][payload: variable]
+//! [DatagramHeader: 16 bytes][TileHeader: 8 bytes][payload: variable]
 //! ```
 //! The receiver reassembles fragments keyed on `(frame_seq, tile_x, tile_y)`.
 //!
@@ -21,7 +21,7 @@ pub const PONG_PAYLOAD: &[u8; 4] = b"pong";
 // Header size constants
 // ---------------------------------------------------------------------------
 
-pub const DATAGRAM_HEADER_SIZE: usize = 12;
+pub const DATAGRAM_HEADER_SIZE: usize = 16;
 pub const TILE_HEADER_SIZE: usize = 8;
 
 // ---------------------------------------------------------------------------
@@ -67,11 +67,12 @@ impl Codec {
 }
 
 // ---------------------------------------------------------------------------
-// DatagramHeader (12 bytes)
-//   [0..4]  frame_seq:     u32 BE
-//   [4..6]  frag_idx:      u16 BE
-//   [6..8]  frag_total:    u16 BE
-//   [8..12] timestamp_us:  u32 BE
+// DatagramHeader (16 bytes)
+//   [0..4]   frame_seq:     u32 BE
+//   [4..6]   frag_idx:      u16 BE
+//   [6..8]   frag_total:    u16 BE
+//   [8..12]  wire_seq:      u32 BE
+//   [12..16] timestamp_us:  u32 BE
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +80,10 @@ pub struct DatagramHeader {
     pub frame_seq: u32,
     pub frag_idx: u16,
     pub frag_total: u16,
+    /// Per-session monotonic FEC group key. Assigned by `ReliableTileEmitter`
+    /// at emission time. Same `wire_seq` is reused on retransmits so the
+    /// client deduplicates on it.
+    pub wire_seq: u32,
     pub timestamp_us: u32,
 }
 
@@ -87,6 +92,7 @@ impl DatagramHeader {
         buf.extend_from_slice(&self.frame_seq.to_be_bytes());
         buf.extend_from_slice(&self.frag_idx.to_be_bytes());
         buf.extend_from_slice(&self.frag_total.to_be_bytes());
+        buf.extend_from_slice(&self.wire_seq.to_be_bytes());
         buf.extend_from_slice(&self.timestamp_us.to_be_bytes());
     }
 
@@ -101,7 +107,8 @@ impl DatagramHeader {
             frame_seq: u32::from_be_bytes(data[0..4].try_into().unwrap()),
             frag_idx: u16::from_be_bytes(data[4..6].try_into().unwrap()),
             frag_total: u16::from_be_bytes(data[6..8].try_into().unwrap()),
-            timestamp_us: u32::from_be_bytes(data[8..12].try_into().unwrap()),
+            wire_seq: u32::from_be_bytes(data[8..12].try_into().unwrap()),
+            timestamp_us: u32::from_be_bytes(data[12..16].try_into().unwrap()),
         })
     }
 
@@ -215,6 +222,7 @@ pub fn fragment_tile(
                 frame_seq: inputs.frame_seq,
                 frag_idx: idx as u16,
                 frag_total,
+                wire_seq: 0,
                 timestamp_us: inputs.timestamp_us,
             };
             let th = TileHeader {
@@ -279,6 +287,7 @@ pub fn build_parity_datagrams(
                 frame_seq,
                 frag_idx: frag_total + parity_idx as u16,
                 frag_total,
+                wire_seq: 0,
                 timestamp_us,
             };
             let th = TileHeader {
@@ -325,7 +334,7 @@ pub const FRAME_DIMENSIONS_SENTINEL_Y: u8 = 0xFF;
 /// Format: standard tile datagram with `(tile_x, tile_y) = (0xFF, 0xFF)`,
 /// `codec = Codec::Skip`, and an 8-byte payload `[width: u32 BE][height: u32 BE]`.
 ///
-/// Always fits in a single datagram (8-byte payload, 28-byte total).
+/// Always fits in a single datagram (8-byte payload, 32-byte total).
 pub fn build_frame_dimensions_datagram(
     frame_seq: u32,
     timestamp_us: u32,
@@ -574,6 +583,7 @@ mod tests {
             frame_seq: 0xDEAD_BEEF,
             frag_idx: 3,
             frag_total: 7,
+            wire_seq: 0xCAFE_F00D,
             timestamp_us: 123_456_789,
         };
         let mut buf = Vec::new();
@@ -585,13 +595,13 @@ mod tests {
 
     #[test]
     fn datagram_header_decode_short_input() {
-        let short = vec![0u8; 11];
+        let short = vec![0u8; 15];
         let result = DatagramHeader::decode(&short);
         assert_eq!(
             result,
             Err(ProtocolError::TooShort {
                 expected: DATAGRAM_HEADER_SIZE,
-                got: 11
+                got: 15
             })
         );
     }
@@ -798,6 +808,7 @@ mod tests {
             frame_seq: 1,
             frag_idx: 2,
             frag_total: 8,
+            wire_seq: 0,
             timestamp_us: 0,
         };
         assert!(!source.is_parity());
@@ -807,6 +818,7 @@ mod tests {
             frame_seq: 1,
             frag_idx: 8,
             frag_total: 8,
+            wire_seq: 0,
             timestamp_us: 0,
         };
         assert!(parity.is_parity());
@@ -910,6 +922,7 @@ mod tests {
             frame_seq: TILE_DATAGRAM_FLAG | 42,
             frag_idx: 0,
             frag_total: 1,
+            wire_seq: 0,
             timestamp_us: 0,
         };
         let mut tile_buf = Vec::new();
@@ -984,12 +997,31 @@ mod tests {
     }
 
     #[test]
+    fn datagram_header_includes_wire_seq() {
+        let h = DatagramHeader {
+            frame_seq: TILE_DATAGRAM_FLAG | 42,
+            frag_idx: 1,
+            frag_total: 3,
+            wire_seq: 0xDEADBEEF,
+            timestamp_us: 1_000_000,
+        };
+        let mut buf = Vec::new();
+        h.encode(&mut buf);
+        assert_eq!(buf.len(), DATAGRAM_HEADER_SIZE);
+        assert_eq!(DATAGRAM_HEADER_SIZE, 16, "header grew from 12 to 16 bytes");
+        let parsed = DatagramHeader::decode(&buf).expect("decode");
+        assert_eq!(parsed.wire_seq, 0xDEADBEEF);
+        assert_eq!(parsed.timestamp_us, 1_000_000);
+        assert_eq!(parsed.frame_seq, TILE_DATAGRAM_FLAG | 42);
+    }
+
+    #[test]
     fn frame_dimensions_datagram_roundtrip() {
         let dg = build_frame_dimensions_datagram(
             /*frame_seq*/ 42, /*ts*/ 1000, /*width*/ 1920, /*height*/ 1080,
         );
-        // Total: 12 (DatagramHeader) + 8 (TileHeader) + 8 (payload) = 28 bytes.
-        assert_eq!(dg.len(), 28);
+        // Total: 16 (DatagramHeader) + 8 (TileHeader) + 8 (payload) = 32 bytes.
+        assert_eq!(dg.len(), 32);
 
         let (dh, th, payload) = decode_tile_datagram(&dg).expect("decode failed");
         // Tile-datagram flag must be set in frame_seq.
