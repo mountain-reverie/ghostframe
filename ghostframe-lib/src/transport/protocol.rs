@@ -41,6 +41,9 @@ pub enum ProtocolError {
 
     #[error("unknown codec byte: {0}")]
     UnknownCodec(u8),
+
+    #[error("unknown envelope discriminator byte: {0:#04x}")]
+    UnknownEnvelope(u8),
 }
 
 // ---------------------------------------------------------------------------
@@ -595,6 +598,76 @@ impl NackMessage {
 }
 
 // ---------------------------------------------------------------------------
+// TILE_PARITY envelope (0x04)
+//
+// Wire format (spec §5.2):
+//   [0]       discriminator:              u8  (= TILE_PARITY_ENVELOPE = 0x04)
+//   [1..5]    group_first_wire_seq:       u32 BE
+//   [5]       k:                          u8  (number of source datagrams covered)
+//   [6]       parity_idx:                 u8  (0-indexed within group's R parities)
+//   [7..9]    group_first_payload_len:    u16 BE
+//   [9..]     parity_payload                  (XOR of K sources, left-padded)
+// ---------------------------------------------------------------------------
+
+/// Envelope discriminator byte for the tile-FEC parity datagram.
+pub const TILE_PARITY_ENVELOPE: u8 = 0x04;
+
+/// Header of a parity datagram (envelope `0x04`). Covers K source datagrams
+/// starting at `group_first_wire_seq`. The `parity_payload` is the XOR of
+/// the K sources' full byte buffers, left-padded to the longest source's
+/// length.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TileParityEnvelope {
+    pub group_first_wire_seq: u32,
+    pub k: u8,
+    /// Index of this parity within the group's R parities. v1 always emits
+    /// R=1 parity per group, so `parity_idx` is always 0.
+    pub parity_idx: u8,
+    /// Length of the first source datagram in the group, used by the
+    /// decoder to extract a recovered payload of the right size.
+    pub group_first_payload_len: u16,
+    pub parity_payload: Vec<u8>,
+}
+
+/// Size of the fixed-length header preceding `parity_payload`.
+pub const TILE_PARITY_HEADER_SIZE: usize = 1 + 4 + 1 + 1 + 2; // = 9
+
+impl TileParityEnvelope {
+    pub fn encode(&self, buf: &mut Vec<u8>) {
+        buf.push(TILE_PARITY_ENVELOPE);
+        buf.extend_from_slice(&self.group_first_wire_seq.to_be_bytes());
+        buf.push(self.k);
+        buf.push(self.parity_idx);
+        buf.extend_from_slice(&self.group_first_payload_len.to_be_bytes());
+        buf.extend_from_slice(&self.parity_payload);
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self, ProtocolError> {
+        if data.len() < TILE_PARITY_HEADER_SIZE {
+            return Err(ProtocolError::TooShort {
+                expected: TILE_PARITY_HEADER_SIZE,
+                got: data.len(),
+            });
+        }
+        if data[0] != TILE_PARITY_ENVELOPE {
+            return Err(ProtocolError::UnknownEnvelope(data[0]));
+        }
+        let group_first_wire_seq = u32::from_be_bytes(data[1..5].try_into().unwrap());
+        let k = data[5];
+        let parity_idx = data[6];
+        let group_first_payload_len = u16::from_be_bytes(data[7..9].try_into().unwrap());
+        let parity_payload = data[TILE_PARITY_HEADER_SIZE..].to_vec();
+        Ok(Self {
+            group_first_wire_seq,
+            k,
+            parity_idx,
+            group_first_payload_len,
+            parity_payload,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1109,5 +1182,35 @@ mod tests {
         let h = u32::from_be_bytes(payload[4..8].try_into().unwrap());
         assert_eq!(w, 1920);
         assert_eq!(h, 1080);
+    }
+
+    #[test]
+    fn tile_parity_envelope_roundtrip() {
+        let parity_payload = vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
+        let envelope = TileParityEnvelope {
+            group_first_wire_seq: 1000,
+            k: 10,
+            parity_idx: 0,
+            group_first_payload_len: 512,
+            parity_payload: parity_payload.clone(),
+        };
+        let mut buf = Vec::new();
+        envelope.encode(&mut buf);
+        assert_eq!(buf[0], TILE_PARITY_ENVELOPE);
+        let parsed = TileParityEnvelope::decode(&buf).expect("decode");
+        assert_eq!(parsed.group_first_wire_seq, 1000);
+        assert_eq!(parsed.k, 10);
+        assert_eq!(parsed.parity_idx, 0);
+        assert_eq!(parsed.group_first_payload_len, 512);
+        assert_eq!(parsed.parity_payload, parity_payload);
+    }
+
+    #[test]
+    fn tile_parity_envelope_rejects_wrong_discriminator() {
+        let mut buf = vec![0x99, 0, 0, 0, 0, 10, 0, 0, 0];
+        assert!(TileParityEnvelope::decode(&buf).is_err());
+        buf[0] = TILE_PARITY_ENVELOPE;
+        // still too short for header
+        assert!(TileParityEnvelope::decode(&buf[..3]).is_err());
     }
 }
