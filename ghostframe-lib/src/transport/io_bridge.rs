@@ -3025,6 +3025,7 @@ impl IoBridge {
                 {
                     self.last_cumulative_emit_log_frame = seq;
                     let c = self.cumulative_datagrams_emitted;
+                    let es = self.reliable_emitter.stats;
                     tracing::info!(
                         frame_seq = seq,
                         emitted_solid = c.solid,
@@ -3033,6 +3034,12 @@ impl IoBridge {
                         emitted_raw = c.raw,
                         emitted_h264 = c.h264,
                         send_datagram_errs_total = self.datagram_send_errs,
+                        fec_parity_emitted = es.parity_emitted,
+                        rto_fired = es.rto_fired,
+                        rto_max_retransmits_reached = es.rto_max_retransmits_reached,
+                        nack_received = es.nack_hit + es.nack_miss,
+                        cache_lru_eviction = self.reliable_emitter.cache.stats.lru_eviction,
+                        retransmit_attempts_total = es.retransmit_attempts_total,
                         "cumulative emit (datagrams handed to quinn since startup, per codec)"
                     );
 
