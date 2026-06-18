@@ -72,6 +72,12 @@ export interface TileAssembly {
   header: TileHeader;
   fragments: (Uint8Array | null)[];
   received: number;
+  /** NACK key derived from the assembly's source identifiers. */
+  emitKey: { frameSeq: number; tileX: number; tileY: number; passIdx: number };
+  /** performance.now() of the first fragment received; does not reset. */
+  partialSince: number;
+  /** Dedup set so the rAF timeout scan NACKs each missing fragment only once. */
+  nackedFragIdxs: Set<number>;
 }
 
 // ---------------------------------------------------------------------------

@@ -12,6 +12,7 @@ import { LossTracker, encodeHello } from './feedback';
 import { attachInputCapture } from './input/wire';
 import { DecodeErrorBatcher } from './decode_error_batcher';
 import { AckBatcher } from './ack';
+import { NackBatcher } from './nack.js';
 import { initDiagnostics } from './diagnostics.js';
 import { prevalidateCdf53 } from './prevalidate_cdf53.js';
 import { bootstrap } from './bootstrap.js';
@@ -404,6 +405,12 @@ async function main() {
     });
   });
 
+  // Reliable-tile-emitter NACK sender — reuses the same datagrams writer.
+  // Fire-and-forget; rejection from a closed stream is benign at this point.
+  const nackBatcher = new NackBatcher((buf) => {
+    ackWriter.write(buf).catch(() => {});
+  });
+
   const assemblies = new Map<string, TileAssembly>();
   let latestFrameSeq = 0;
   let firstTileRendered = false;
@@ -596,6 +603,24 @@ async function main() {
 
   }
 
+  // Reliable-tile-emitter: NACK any fragment still missing this long after
+  // the assembly's first fragment arrived. Dedup-set on the assembly prevents
+  // re-NACKing the same frag_idx on every subsequent rAF tick.
+  const ASSEMBLY_TIMEOUT_MS = 30;
+
+  function scanForAssemblyTimeouts(now: number, partialAssemblies: Iterable<TileAssembly>) {
+    for (const asm of partialAssemblies) {
+      if (asm.received >= asm.fragments.length) continue;
+      if (now - asm.partialSince < ASSEMBLY_TIMEOUT_MS) continue;
+      for (let i = 0; i < asm.fragments.length; i++) {
+        if (asm.fragments[i] === null && !asm.nackedFragIdxs.has(i)) {
+          nackBatcher.add(asm.emitKey, i);
+          asm.nackedFragIdxs.add(i);
+        }
+      }
+    }
+  }
+
   // rAF loop — drains queues, flushes one frame per animation tick.
   let __rafTicks = 0;
   // Periodic diagnostic: every ~2 seconds dump tile + queue + framebuffer
@@ -609,6 +634,10 @@ async function main() {
   function tick() {
     __rafTicks++;
     diag.recordRafTick(__rafTicks);
+
+    // Reliable-tile-emitter: scan partial assemblies for fragment timeouts
+    // and feed missing frag_idxs into the NackBatcher.
+    scanForAssemblyTimeouts(performance.now(), assemblies.values());
 
     // M3.5 bench: emit recordFramePainted for all frames whose last tile was
     // received before this rAF tick. Uses performance.now() at rAF entry so
@@ -983,6 +1012,16 @@ async function main() {
         header: tileHdr,
         fragments: new Array(dgramHdr.fragTotal).fill(null),
         received: 0,
+        // Server's fragment_coverage map is keyed with TILE_DATAGRAM_FLAG set;
+        // mirror the ACK convention above so NACK lookups hit the same entry.
+        emitKey: {
+          frameSeq: dgramHdr.frameSeq | TILE_DATAGRAM_FLAG,
+          tileX: tileHdr.tileX,
+          tileY: tileHdr.tileY,
+          passIdx: tileHdr.pass,
+        },
+        partialSince: performance.now(),
+        nackedFragIdxs: new Set<number>(),
       };
       assemblies.set(key, asm);
     }
