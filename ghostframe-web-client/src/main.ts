@@ -405,9 +405,22 @@ async function main() {
     });
   });
 
+  // Reliable-tile-emitter FEC + NACK counters — surfaced via the periodic
+  // `fec-coverage` log line (sibling to `cdf53-coverage`) for side-by-side
+  // wire-loss inspection. `parityRx` / `recovered` / `parityUnrecoverable`
+  // stay at 0 until ParityDecoder is wired into the dispatch path; see the
+  // ParityDecoder module in parity_decoder.ts (Task 21).
+  let fecRecovered = 0;
+  let fecParityRx = 0;
+  let fecParityUnrecoverable = 0;
+  let nackSent = 0;
+
   // Reliable-tile-emitter NACK sender — reuses the same datagrams writer.
   // Fire-and-forget; rejection from a closed stream is benign at this point.
+  // The wrapper increments `nackSent` by the entry-count in the envelope
+  // header (buf[1]) before forwarding to the writer.
   const nackBatcher = new NackBatcher((buf) => {
+    if (buf.length >= 2) nackSent += buf[1];
     ackWriter.write(buf).catch(() => {});
   });
 
@@ -742,14 +755,27 @@ async function main() {
       const coverageLine =
         `cdf53-coverage: tiles=${cdf53Tiles} refined=${cdf53Refined}/14p partial=${cdf53Partial} ` +
         `pass-hist{${histCompact}}`;
+      // Reliable-tile-emitter coverage: FEC recoveries + parity / NACK traffic.
+      // Pairs with the server's reliability counters (Task 35) for side-by-side
+      // wire-loss inspection. `parity_rx` / `recovered` / `parity_unrecoverable`
+      // stay at 0 until ParityDecoder (parity_decoder.ts, Task 21) is wired
+      // into the dispatch path; `nack_sent` is live (counted at the
+      // NackBatcher sender wrapper above).
+      const fecCoverageLine =
+        `fec-coverage: recovered=${fecRecovered} ` +
+        `parity_rx=${fecParityRx} ` +
+        `parity_unrecoverable=${fecParityUnrecoverable} ` +
+        `nack_sent=${nackSent}`;
       const lineKey =
         `r:${counts.raw}|s:${counts.solid}|p:${counts.palrle}|c:${counts.cdf53}|h:${counts.h264}|` +
-        `seq:${w.__lastTileSeq ?? '-'}|cov:${cdf53Refined}/${cdf53Partial}/${cdf53Tiles}|hist:${histCompact}`;
+        `seq:${w.__lastTileSeq ?? '-'}|cov:${cdf53Refined}/${cdf53Partial}/${cdf53Tiles}|hist:${histCompact}|` +
+        `fec:${fecRecovered}/${fecParityRx}/${fecParityUnrecoverable}/${nackSent}`;
       const statsChanged = lineKey !== __lastStatsLineKey;
       if (statsChanged) {
         __lastStatsLineKey = lineKey;
         log(statsLine);
         log(coverageLine);
+        log(fecCoverageLine);
       }
 
       // Framebuffer readback: sample 4 known-position pixels and log
