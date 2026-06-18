@@ -11,6 +11,9 @@ pub mod wire_seq;
 #[cfg(test)]
 mod sim;
 
+#[cfg(test)]
+mod proptest_invariants;
+
 pub use emitter::ReliableTileEmitter;
 
 /// Logical identity of a tile-pass — the unit ACKed, NACKed, RTO'd, and
