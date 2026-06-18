@@ -1526,6 +1526,25 @@ impl IoBridge {
                     entry_count = batch.entries.len(),
                     "ack_batch_received"
                 );
+                // Route every ACKed key into the reliable-tile emitter as
+                // well — it owns the retransmit cache + RTO heap and needs
+                // to drop the matching CacheEntry so `tick` stops re-firing
+                // it. Runs alongside the legacy scheduler/coverage path
+                // below; Task 28 will retire the legacy bookkeeping once
+                // the emitter is the sole source of truth.
+                let emit_keys: Vec<crate::transport::reliable_emitter::EmitKey> = batch
+                    .entries
+                    .iter()
+                    .map(|e| {
+                        crate::transport::reliable_emitter::EmitKey::new(
+                            e.frame_seq,
+                            e.tile_x,
+                            e.tile_y,
+                            e.pass_idx,
+                        )
+                    })
+                    .collect();
+                self.reliable_emitter.on_ack(&emit_keys);
                 for e in batch.entries {
                     // Key matches how coverage is recorded at emit time:
                     // (frame_seq, tile_x, tile_y, pass_idx).
@@ -4302,6 +4321,35 @@ mod tests {
         nack_env.encode(&mut buf);
         bridge.dispatch_tile_nack_datagram(&buf);
         assert_eq!(bridge.reliable_emitter.stats.nack_hit, 1);
+    }
+
+    /// An inbound ACK_BATCH (0x03) envelope routes each entry into
+    /// `reliable_emitter.on_ack` (in addition to the existing scheduler /
+    /// fragment-coverage paths). A hit drops the matching cache entry and
+    /// bumps `ack_hit`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ack_routes_through_emitter_dropping_cache() {
+        let (our_end, _peer) = UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("server");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+        let key = crate::transport::reliable_emitter::EmitKey::new(1, 0, 0, 0);
+        bridge.reliable_emitter.submit_one(
+            key,
+            bytes::Bytes::from(vec![0u8; 25]),
+            std::time::Instant::now(),
+        );
+        let ack_env = crate::transport::ack::AckBatch {
+            entries: vec![crate::transport::ack::AckEntry {
+                frame_seq: 1,
+                tile_x: 0,
+                tile_y: 0,
+                pass_idx: 0,
+            }],
+        };
+        bridge.dispatch_ack_datagram(&ack_env.encode());
+        assert_eq!(bridge.reliable_emitter.stats.ack_hit, 1);
+        assert!(bridge.reliable_emitter.cache.get(&key).is_none());
     }
 
     /// dispatch_dirty_tiles_via_scheduler enqueues the right work in the
