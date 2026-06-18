@@ -2,8 +2,10 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   ACK_BATCH_MSG_TYPE,
   ACK_ENTRY_SIZE,
+  ACK_OVERLAP_COUNT,
   AckBatcher,
   MAX_ACK_ENTRIES,
+  parseAckEnvelopeForTest,
 } from '../src/ack';
 
 describe('AckBatcher wire format', () => {
@@ -68,5 +70,58 @@ describe('AckBatcher wire format', () => {
     const b = new AckBatcher((dg) => sent.push(dg));
     b.flush();
     expect(sent).toHaveLength(0);
+  });
+});
+
+describe('AckBatcher overlap', () => {
+  it('appends up to ACK_OVERLAP_COUNT prior entries to each batch', () => {
+    const sent: Uint8Array[] = [];
+    const batcher = new AckBatcher((buf) => sent.push(buf));
+    // First batch: 5 fresh entries.
+    for (let i = 0; i < 5; i++) {
+      batcher.add({ frameSeq: i, tileX: 0, tileY: 0, passIdx: 0 });
+    }
+    batcher.flush();
+    expect(sent).toHaveLength(1);
+    expect(parseAckEnvelopeForTest(sent[0]).length).toBe(5);
+    // Second batch: 3 fresh entries, expect 3 + overlap from previous.
+    for (let i = 5; i < 8; i++) {
+      batcher.add({ frameSeq: i, tileX: 0, tileY: 0, passIdx: 0 });
+    }
+    batcher.flush();
+    expect(sent).toHaveLength(2);
+    const expectedOverlap = Math.min(5, ACK_OVERLAP_COUNT);
+    expect(parseAckEnvelopeForTest(sent[1]).length).toBe(3 + expectedOverlap);
+  });
+
+  it('caps overlap at ACK_OVERLAP_COUNT after many batches', () => {
+    const sent: Uint8Array[] = [];
+    const batcher = new AckBatcher((buf) => sent.push(buf));
+    // Push 20 entries across several flushes.
+    for (let i = 0; i < 20; i++) {
+      batcher.add({ frameSeq: i, tileX: 0, tileY: 0, passIdx: 0 });
+      batcher.flush();
+    }
+    // Final fresh batch.
+    batcher.add({ frameSeq: 100, tileX: 1, tileY: 2, passIdx: 3 });
+    batcher.flush();
+    const last = parseAckEnvelopeForTest(sent[sent.length - 1]);
+    // 1 fresh + ACK_OVERLAP_COUNT overlap.
+    expect(last.length).toBe(1 + ACK_OVERLAP_COUNT);
+    // First entry is the fresh one.
+    expect(last[0]).toEqual({ frameSeq: 100, tileX: 1, tileY: 2, passIdx: 3 });
+    // Trailing overlap is the LAST ACK_OVERLAP_COUNT fresh entries from prior batches.
+    for (let k = 0; k < ACK_OVERLAP_COUNT; k++) {
+      const expectedFrameSeq = 20 - ACK_OVERLAP_COUNT + k;
+      expect(last[1 + k].frameSeq).toBe(expectedFrameSeq);
+    }
+  });
+
+  it('emits no overlap on the very first batch', () => {
+    const sent: Uint8Array[] = [];
+    const batcher = new AckBatcher((buf) => sent.push(buf));
+    batcher.add({ frameSeq: 42, tileX: 1, tileY: 2, passIdx: 3 });
+    batcher.flush();
+    expect(parseAckEnvelopeForTest(sent[0]).length).toBe(1);
   });
 });
