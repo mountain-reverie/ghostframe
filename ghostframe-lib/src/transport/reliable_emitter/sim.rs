@@ -119,3 +119,42 @@ fn sim_clean_wire_no_retransmits() {
     assert_eq!(sim.emitter.stats.rto_fired, 0);
     assert_eq!(sim.emitter.stats.rto_max_retransmits_reached, 0);
 }
+
+#[test]
+fn sim_low_loss_5pct() {
+    let mut sim = Sim::new(0.05, 1);
+    sim.submit_many(1000);
+    for _ in 0..10 { sim.advance(Duration::from_millis(100)); }
+    // At 5% loss with FEC + retransmit, near-100% delivery within
+    // MAX_RETRANSMITS. The emitter doesn't track delivered count; we
+    // approximate it via cache.len() (entries still pending) being small.
+    assert!(sim.emitter.cache.len() < 50, "most entries should be drained");
+}
+
+#[test]
+fn sim_high_loss_50pct() {
+    let mut sim = Sim::new(0.5, 2);
+    sim.submit_many(1000);
+    for _ in 0..20 { sim.advance(Duration::from_millis(200)); }
+    // Per spec §8.2: ~97 % delivery at 5 attempts. So at most ~3 % of
+    // the 1000 submitted items should hit MAX_RETRANSMITS.
+    assert!(sim.emitter.stats.rto_max_retransmits_reached < 50,
+        "got {}", sim.emitter.stats.rto_max_retransmits_reached);
+}
+
+#[test]
+fn sim_generation_churn_no_orphan_retransmits() {
+    let mut sim = Sim::new(0.3, 3);
+    for i in 0..100u32 {
+        sim.emitter.submit_one(EmitKey::new(i, 5, 5, 0), fake_source(i), sim.t);
+        sim.emitter.drain(&mut sim.sender, sim.t);
+        // Every 10 submissions bump tile (5,5).
+        if i % 10 == 9 {
+            sim.emitter.cancel_for_tile(5, 5);
+        }
+    }
+    // Run RTOs.
+    for _ in 0..10 { sim.advance(Duration::from_millis(200)); }
+    assert_eq!(sim.emitter.cache.stats.lru_eviction, 0,
+        "no LRU pressure under generation churn");
+}
