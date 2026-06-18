@@ -2807,10 +2807,11 @@ impl IoBridge {
                             let gen = self.scheduler.bump_generation(tile_x, tile_y);
                             self.bump_count_accumulator.cdf53_dirty_path =
                                 self.bump_count_accumulator.cdf53_dirty_path.saturating_add(1);
-                            // Drop any in-flight Cdf53 coverage for the old
-                            // generation (see dispatch_dirty_tiles_via_scheduler
-                            // for the full rationale).
-                            self.fragment_coverage.drop_cdf53_for_tile(tile_x, tile_y);
+                            // (Old generation Cdf53 in-flight coverage is now
+                            // dropped via the `reliable_emitter.cancel_for_tile`
+                            // call above; the fragment_coverage drop here
+                            // became redundant when Task 25 paired emitter
+                            // cancellation with every bump_generation site.)
                             // New generation: tile is eligible for re-escalation.
                             self.metrics_tracker
                                 .get_mut(tile_x as u32, tile_y as u32)
@@ -2896,10 +2897,11 @@ impl IoBridge {
                             .bump_count_accumulator
                             .cdf53_escalation_path
                             .saturating_add(1);
-                        // Drop any in-flight Cdf53 coverage for the old
-                        // generation (see dispatch_dirty_tiles_via_scheduler
-                        // for the full rationale).
-                        self.fragment_coverage.drop_cdf53_for_tile(tile_x, tile_y);
+                        // (Old generation Cdf53 in-flight coverage is now
+                        // dropped via the `reliable_emitter.cancel_for_tile`
+                        // call above; the fragment_coverage drop here
+                        // became redundant when Task 25 paired emitter
+                        // cancellation with every bump_generation site.)
                         for (pass_idx, payload) in passes.iter().enumerate() {
                             tracing::info!(
                                 target: "ghostframe::cdf53",
@@ -2926,8 +2928,13 @@ impl IoBridge {
 
                 #[cfg(feature = "cdf53-diag")]
                 if std::env::var("GHOSTFRAME_CDF53_DUMP_PENDING").is_ok() {
-                    let cov_snap = self.fragment_coverage.snapshot();
-                    let snap = self.scheduler.pending_refinement_snapshot(&cov_snap);
+                    // The retransmit-cache role of fragment_coverage moved to
+                    // ReliableTileEmitter (Tasks 25-27); pass an empty slice
+                    // here so the snapshot only reflects scheduler-side queue
+                    // state. The metadata-sidecar role of fragment_coverage
+                    // is being retired in a follow-up task (see
+                    // fragment_coverage.rs module-level doc).
+                    let snap = self.scheduler.pending_refinement_snapshot(&[]);
                     tracing::info!(
                         target: "ghostframe::cdf53::diff",
                         "cdf53.pending_snapshot {:?}",

@@ -10,6 +10,30 @@
 //!
 //! See `docs/superpowers/specs/2026-06-01-m3.3d-datagram-level-ack-design.md`
 //! for the design rationale.
+//!
+//! ## DEFERRED RETIREMENT
+//!
+//! Tasks 25-27 migrated the per-emission *retransmit cache* role of this
+//! module to `ReliableTileEmitter::RetransmitCache`. What remains here is
+//! the per-(frame_seq, tile, pass) **metadata sidecar** that
+//! `dispatch_ack_datagram` consumes on ACK: each entry carries
+//! `(codec, palette_id, generation)` which drive
+//! `scheduler.mark_acked`, `scheduler.record_cdf53_ack`,
+//! `palette_table.delivered`, and `palette_table.release` /
+//! `in_flight_carrying`.
+//!
+//! `CacheEntry` in the emitter only stores raw fragment bytes — it has
+//! no equivalent sidecar today. Full retirement therefore requires:
+//!   1. Widen `CacheEntry` with `codec: Codec`, `palette_id: Option<u8>`,
+//!      `generation: u8`.
+//!   2. Plumb those fields through `submit_one` / `submit_batch` from
+//!      every caller in `drain_scheduler_into_quinn`.
+//!   3. Have `dispatch_ack_datagram` consume the metadata from
+//!      `RetransmitCache::remove(&key)` instead of `fragment_coverage.take()`.
+//!   4. Delete this module + its callers.
+//!
+//! Tracked as a follow-up to Task 28 in the implementation plan; see
+//! `docs/superpowers/plans/2026-06-17-reliable-tile-emitter-plan.md`.
 
 use smallvec::SmallVec;
 
