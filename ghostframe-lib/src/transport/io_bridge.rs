@@ -1610,6 +1610,40 @@ impl IoBridge {
         // Other discriminators: silently ignore. Forward-compatible.
     }
 
+    /// Route an inbound TILE_NACK envelope (discriminator `0x05`) into the
+    /// reliable-tile emitter's `on_nack`. The wire-level NACK entry carries
+    /// `(frame_seq, tile_x, tile_y, pass_idx, frag_idx)`; the first four
+    /// reconstruct the `EmitKey` that uniquely identifies the cached
+    /// fragment(s) for one tile-pass, and `frag_idx` selects which fragment
+    /// inside that key to re-emit. Malformed envelopes are silently dropped
+    /// (forward-compatible, mirrors `dispatch_ack_datagram`).
+    pub(crate) fn dispatch_tile_nack_datagram(&mut self, data: &[u8]) {
+        #[cfg(any(test, feature = "test-loss-injection"))]
+        if let Some(inj) = self.inbound_loss.as_mut() {
+            if inj.should_drop(data) {
+                return;
+            }
+        }
+        use crate::transport::protocol::TileNackEnvelope;
+        let Ok(env) = TileNackEnvelope::decode(data) else { return; };
+        let entries: Vec<(crate::transport::reliable_emitter::EmitKey, u8)> = env
+            .entries
+            .into_iter()
+            .map(|e| {
+                (
+                    crate::transport::reliable_emitter::EmitKey::new(
+                        e.frame_seq,
+                        e.tile_x,
+                        e.tile_y,
+                        e.pass_idx,
+                    ),
+                    e.frag_idx,
+                )
+            })
+            .collect();
+        self.reliable_emitter.on_nack(&entries);
+    }
+
     /// Parse a concatenated FEEDBACK-stream byte buffer, dispatching by
     /// message-type byte. Supports:
     /// - `0x01` FEEDBACK_MSG_TYPE  (22 bytes)  — `ReceiverFeedback`
@@ -3273,7 +3307,21 @@ impl IoBridge {
                         }
                     }
                     for dg in to_dispatch {
-                        self.dispatch_ack_datagram(&dg);
+                        // Route by discriminator. AckBatch (0x02/0x03) goes
+                        // through the legacy ACK handler; TileNack (0x05)
+                        // routes into the reliable-tile emitter. Other
+                        // kinds (Hello, parity, frame/tile fragments) are
+                        // not currently dispatched on the inbound server
+                        // path and fall through to the no-op leg, which
+                        // matches pre-NACK behavior.
+                        match crate::transport::protocol::classify_inbound(&dg) {
+                            crate::transport::protocol::InboundKind::TileNack => {
+                                self.dispatch_tile_nack_datagram(&dg);
+                            }
+                            _ => {
+                                self.dispatch_ack_datagram(&dg);
+                            }
+                        }
                     }
                 }
 
@@ -4222,6 +4270,38 @@ mod tests {
                                                         // Empty.
         bridge.dispatch_ack_datagram(&[]);
         // No panic; nothing to assert beyond reaching this line.
+    }
+
+    /// An inbound TILE_NACK (0x05) envelope routes each entry into
+    /// `reliable_emitter.on_nack`, registering a hit when the cache holds
+    /// the matching EmitKey.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tile_nack_routes_to_emitter() {
+        let (our_end, _peer) = UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("server");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+        // Pre-seed the emitter cache with one entry so on_nack has something
+        // to look up.
+        let key = crate::transport::reliable_emitter::EmitKey::new(1, 0, 0, 0);
+        bridge.reliable_emitter.submit_one(
+            key,
+            bytes::Bytes::from(vec![0u8; 25]),
+            std::time::Instant::now(),
+        );
+        let nack_env = crate::transport::protocol::TileNackEnvelope {
+            entries: vec![crate::transport::protocol::TileNackEntry {
+                frame_seq: 1,
+                tile_x: 0,
+                tile_y: 0,
+                pass_idx: 0,
+                frag_idx: 0,
+            }],
+        };
+        let mut buf = Vec::new();
+        nack_env.encode(&mut buf);
+        bridge.dispatch_tile_nack_datagram(&buf);
+        assert_eq!(bridge.reliable_emitter.stats.nack_hit, 1);
     }
 
     /// dispatch_dirty_tiles_via_scheduler enqueues the right work in the
