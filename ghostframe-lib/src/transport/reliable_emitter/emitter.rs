@@ -8,7 +8,7 @@ use crate::transport::reliable_emitter::parity::GroupBuilder;
 use crate::transport::reliable_emitter::rto::{rto_for_attempt, RtoTimerWheel};
 use crate::transport::reliable_emitter::traits::DatagramSender;
 use crate::transport::reliable_emitter::wire_seq::WireSeqAllocator;
-use crate::transport::reliable_emitter::{EmitKey, FEC_GROUP_SIZE_K, PARITY_INTERLEAVE_OFFSET};
+use crate::transport::reliable_emitter::{EmitKey, FEC_GROUP_SIZE_K, MAX_RETRANSMITS, PARITY_INTERLEAVE_OFFSET};
 use bytes::Bytes;
 use smallvec::smallvec;
 use std::time::{Duration, Instant};
@@ -102,6 +102,40 @@ impl ReliableTileEmitter {
             } else {
                 self.stats.ack_miss += 1;
             }
+        }
+    }
+
+    /// Drain due RTO entries. For each due key, validate against the live
+    /// cache (silently skip stale entries — already ACKed or cancelled). If
+    /// the entry hasn't hit MAX_RETRANSMITS, bump `attempts`, re-enqueue every
+    /// cached fragment via the EmissionQueue with the same wire_seqs (so client
+    /// dedup keys remain stable), and reschedule a new RTO deadline. At
+    /// MAX_RETRANSMITS, retire — drop the cache entry and bump
+    /// `rto_max_retransmits_reached`.
+    pub fn tick(&mut self, now: Instant) {
+        while let Some(key) = self.rto.pop_due(now) {
+            let Some(entry) = self.cache.get_mut(&key) else {
+                // Already ACKed or cancelled — stale heap entry; skip silently.
+                continue;
+            };
+            if entry.attempts >= MAX_RETRANSMITS {
+                // Retire — drop from cache.
+                self.cache.remove(&key);
+                self.stats.rto_max_retransmits_reached += 1;
+                continue;
+            }
+            // Bump attempts, re-enqueue every cached fragment, reschedule RTO.
+            entry.attempts += 1;
+            entry.last_sent_at = now;
+            let new_rto = rto_for_attempt(self.smoothed_rtt, entry.attempts);
+            entry.rto_deadline = now + new_rto;
+            let frags: Vec<Vec<u8>> = entry.fragments.iter().map(|b| b.to_vec()).collect();
+            for bytes in frags {
+                self.queue.push_source(bytes);
+            }
+            self.rto.schedule(key, now + new_rto);
+            self.stats.rto_fired += 1;
+            self.stats.retransmit_attempts_total += 1;
         }
     }
 
@@ -215,5 +249,67 @@ mod tests {
         e.on_ack(&[EmitKey::new(99, 0, 0, 0)]);
         assert_eq!(e.stats.ack_miss, 1);
         assert_eq!(e.stats.ack_hit, 0);
+    }
+
+    #[test]
+    fn tick_retransmits_when_rto_expires() {
+        let mut e = ReliableTileEmitter::new();
+        let mut sender = CollectSender::default();
+        let t0 = Instant::now();
+        let key = EmitKey::new(1, 0, 0, 0);
+        e.submit_one(key, fake_source(1, 0, 0), t0);
+        e.drain(&mut sender, t0);
+        assert_eq!(sender.sent.len(), 1);
+        let entry_first_sent = e.cache.get(&key).unwrap().first_sent_at;
+        // Advance past RTO; tick should retransmit.
+        let t1 = t0 + Duration::from_millis(60);
+        e.tick(t1);
+        e.drain(&mut sender, t1);
+        assert_eq!(sender.sent.len(), 2);
+        let entry = e.cache.get(&key).unwrap();
+        assert_eq!(entry.attempts, 1);
+        assert!(entry.last_sent_at > entry_first_sent);
+        assert_eq!(e.stats.rto_fired, 1);
+        assert_eq!(e.stats.retransmit_attempts_total, 1);
+    }
+
+    #[test]
+    fn tick_stops_at_max_retransmits() {
+        let mut e = ReliableTileEmitter::new();
+        let mut sender = CollectSender::default();
+        let t0 = Instant::now();
+        let key = EmitKey::new(1, 0, 0, 0);
+        e.submit_one(key, fake_source(1, 0, 0), t0);
+        e.drain(&mut sender, t0);
+        let mut tn = t0;
+        for _ in 0..MAX_RETRANSMITS {
+            tn += Duration::from_millis(500);
+            e.tick(tn);
+            e.drain(&mut sender, tn);
+        }
+        // After MAX_RETRANSMITS retries: 1 original + MAX_RETRANSMITS = 5 total
+        assert_eq!(sender.sent.len(), 1 + MAX_RETRANSMITS as usize);
+        // One more tick after the budget — nothing more emitted.
+        tn += Duration::from_millis(500);
+        e.tick(tn);
+        e.drain(&mut sender, tn);
+        assert_eq!(sender.sent.len(), 1 + MAX_RETRANSMITS as usize);
+        assert_eq!(e.stats.rto_max_retransmits_reached, 1);
+    }
+
+    #[test]
+    fn tick_skips_already_acked_entries() {
+        let mut e = ReliableTileEmitter::new();
+        let mut sender = CollectSender::default();
+        let t0 = Instant::now();
+        let key = EmitKey::new(1, 0, 0, 0);
+        e.submit_one(key, fake_source(1, 0, 0), t0);
+        e.drain(&mut sender, t0);
+        e.on_ack(&[key]);
+        let t1 = t0 + Duration::from_millis(60);
+        e.tick(t1);
+        e.drain(&mut sender, t1);
+        assert_eq!(sender.sent.len(), 1, "no retransmit after ACK");
+        assert_eq!(e.stats.rto_fired, 0);
     }
 }
