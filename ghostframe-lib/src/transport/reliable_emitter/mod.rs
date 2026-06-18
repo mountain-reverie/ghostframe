@@ -8,6 +8,9 @@ pub mod rto;
 pub mod traits;
 pub mod wire_seq;
 
+#[cfg(test)]
+mod sim;
+
 pub use emitter::ReliableTileEmitter;
 
 /// Logical identity of a tile-pass — the unit ACKed, NACKed, RTO'd, and
