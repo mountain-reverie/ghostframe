@@ -447,10 +447,12 @@ pub struct IoBridge {
     /// `drain_scheduler_into_quinn` via `submit_batch`; drained to the
     /// wire via the `IoBridgeSenderAdapter` trait impl wrapping
     /// `send_to_all_sessions`. Cancellation on bump_generation is wired
-    /// through `scheduler.set_cancel_callback` in
-    /// `register_emitter_cancel_callback`. Task 28 will retire the
-    /// legacy `fragment_coverage` path that currently coexists with
-    /// the new emitter pipeline.
+    /// by direct paired `cancel_for_tile` calls at every
+    /// `scheduler.bump_generation*` site (see
+    /// `dispatch_dirty_tiles_via_scheduler`, dirty-cdf53 Phase B, and
+    /// escalation Phase B). Task 28 will retire the legacy
+    /// `fragment_coverage` path that currently coexists with the new
+    /// emitter pipeline.
     pub(crate) reliable_emitter:
         crate::transport::reliable_emitter::ReliableTileEmitter,
 }
@@ -736,7 +738,7 @@ impl IoBridge {
         // doesn't pay thread-spin-up latency on the hot path (design Section 4).
         rayon::iter::IntoParallelIterator::into_par_iter(0..1u32).for_each(|_| {});
 
-        let mut bridge = Self {
+        let bridge = Self {
             _handle: Some(handle),
             stream,
             server,
@@ -802,7 +804,6 @@ impl IoBridge {
             reliable_emitter:
                 crate::transport::reliable_emitter::ReliableTileEmitter::new(),
         };
-        bridge.register_emitter_cancel_callback();
         Ok(bridge)
     }
 
@@ -818,56 +819,6 @@ impl IoBridge {
         let mut bridge = Self::new(ghostbridge_config, listen_addr).await?;
         bridge.frame_rx = Some(frame_rx);
         Ok(bridge)
-    }
-
-    /// Wire scheduler supersession into the reliable emitter so that
-    /// retransmit/cache state is dropped in lock-step with
-    /// `bump_generation` / `bump_generation_collecting`. Called once
-    /// from every IoBridge constructor after the struct is built.
-    ///
-    /// SAFETY: the closure captures a raw pointer to
-    /// `self.reliable_emitter`. The pointer is valid for as long as
-    /// `self` is — and the scheduler lives strictly inside the same
-    /// struct, so the closure can never outlive its target. The
-    /// closure is invoked only from `&mut self` methods on `IoBridge`
-    /// (via `scheduler.bump_generation*`), so there is no concurrent
-    /// access to the emitter while the callback runs. The pointer is
-    /// never stored elsewhere and never shared across threads.
-    fn register_emitter_cancel_callback(&mut self) {
-        // The scheduler's `CancelCallback` is `Box<dyn FnMut + Send>`.
-        // Raw pointers are not `Send` by default, so we wrap the
-        // pointer in a `Send`-asserting newtype and route the cancel
-        // call through a method on the wrapper. The method-call form
-        // forces the closure to capture the whole `EmitterPtr` value
-        // (which is `Send`) rather than narrowing the capture to the
-        // inner `*mut` field — Rust 2021 disjoint-closure-captures
-        // would otherwise expose the non-`Send` raw pointer directly.
-        //
-        // The `Send` impl on `EmitterPtr` is justified by the same
-        // single-threaded invariant documented on
-        // `register_emitter_cancel_callback`: the IoBridge runs on a
-        // dedicated tokio task, the scheduler lives inside the same
-        // struct, and the closure is only fired from `&mut self`
-        // methods on the bridge. Nothing races on the emitter through
-        // this pointer.
-        struct EmitterPtr(*mut crate::transport::reliable_emitter::ReliableTileEmitter);
-        impl EmitterPtr {
-            // Force whole-struct capture: closure body calls this
-            // method on `self` rather than touching the `*mut` field
-            // directly.
-            fn cancel(&self, x: u8, y: u8) {
-                // SAFETY: see register_emitter_cancel_callback doc.
-                unsafe { (*self.0).cancel_for_tile(x, y) }
-            }
-        }
-        // SAFETY: see method doc — single-threaded access invariant.
-        unsafe impl Send for EmitterPtr {}
-        let emitter = EmitterPtr(
-            &mut self.reliable_emitter as *mut _,
-        );
-        self.scheduler.set_cancel_callback(Box::new(move |x, y| {
-            emitter.cancel(x, y);
-        }));
     }
 
     /// Return the SHA-256 hex fingerprint of the server's self-signed cert.
@@ -1134,6 +1085,13 @@ impl IoBridge {
                 }
             }
 
+            // Drop retransmit/cache state in the reliable emitter in lock-step
+            // with scheduler supersession. Paired with every bump_generation*
+            // call (replaces the Task 20 set_cancel_callback machinery, which
+            // captured a raw pointer to self.reliable_emitter that dangled when
+            // the bridge was moved out of `new`).
+            self.reliable_emitter
+                .cancel_for_tile(tile_x as u8, tile_y as u8);
             let (gen, superseded) = self
                 .scheduler
                 .bump_generation_collecting(tile_x as u8, tile_y as u8);
@@ -2789,6 +2747,10 @@ impl IoBridge {
                                 }
                             }
                             let passes = crate::encoder::cdf53::encode_passes(&coeffs_i16);
+                            // Drop emitter retransmit state in lock-step (see
+                            // dispatch_dirty_tiles_via_scheduler for the
+                            // dangling-pointer rationale).
+                            self.reliable_emitter.cancel_for_tile(tile_x, tile_y);
                             let gen = self.scheduler.bump_generation(tile_x, tile_y);
                             self.bump_count_accumulator.cdf53_dirty_path =
                                 self.bump_count_accumulator.cdf53_dirty_path.saturating_add(1);
@@ -2872,6 +2834,10 @@ impl IoBridge {
                         };
                         let coeffs_i16: Vec<i16> = coeffs_i32.iter().map(|&v| v as i16).collect();
                         let passes = crate::encoder::cdf53::encode_passes(&coeffs_i16);
+                        // Drop emitter retransmit state in lock-step (see
+                        // dispatch_dirty_tiles_via_scheduler for the
+                        // dangling-pointer rationale).
+                        self.reliable_emitter.cancel_for_tile(tile_x, tile_y);
                         let gen = self.scheduler.bump_generation(tile_x, tile_y);
                         self.bump_count_accumulator.cdf53_escalation_path = self
                             .bump_count_accumulator
@@ -3552,7 +3518,7 @@ impl IoBridge {
         // doesn't pay thread-spin-up latency on the hot path (design Section 4).
         rayon::iter::IntoParallelIterator::into_par_iter(0..1u32).for_each(|_| {});
 
-        let mut bridge = IoBridge {
+        let bridge = IoBridge {
             _handle: None,
             stream,
             server,
@@ -3612,7 +3578,6 @@ impl IoBridge {
             reliable_emitter:
                 crate::transport::reliable_emitter::ReliableTileEmitter::new(),
         };
-        bridge.register_emitter_cancel_callback();
         bridge
     }
 
@@ -3626,7 +3591,7 @@ impl IoBridge {
         // doesn't pay thread-spin-up latency on the hot path (design Section 4).
         rayon::iter::IntoParallelIterator::into_par_iter(0..1u32).for_each(|_| {});
 
-        let mut bridge = IoBridge {
+        let bridge = IoBridge {
             _handle: None,
             stream,
             server,
@@ -3686,7 +3651,6 @@ impl IoBridge {
             reliable_emitter:
                 crate::transport::reliable_emitter::ReliableTileEmitter::new(),
         };
-        bridge.register_emitter_cancel_callback();
         bridge
     }
 

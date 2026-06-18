@@ -67,15 +67,6 @@ impl TileWork {
     }
 }
 
-/// Callback fired from `bump_generation*` to propagate supersession to
-/// downstream layers (e.g. `ReliableTileEmitter::cancel_for_tile`).
-///
-/// `Send` is required because `IoBridge` — which owns the Scheduler — runs
-/// inside `tokio::spawn`, so every captured value in the future must be
-/// `Send` even though the Scheduler is single-threaded in practice. Use
-/// `Arc<Mutex<...>>` (not `Rc<RefCell<...>>`) for shared mutable state.
-pub type CancelCallback = Box<dyn FnMut(u8, u8) + Send>;
-
 pub struct Scheduler {
     cols: u32,
     rows: u32,
@@ -105,11 +96,6 @@ pub struct Scheduler {
     /// PixelPerfect transition without scanning the queue on each query.
     /// Cleared for old gens on `bump_generation`/`bump_generation_collecting`.
     cdf53_passes_acked: HashMap<(u8, u8, u8), u8>,
-    /// Optional cancellation hook invoked at the top of `bump_generation` and
-    /// `bump_generation_collecting`. Registered by IoBridge to route into
-    /// `ReliableTileEmitter::cancel_for_tile` so retransmit state is dropped
-    /// in lock-step with scheduler supersession. `None` in default tests.
-    cancel_callback: Option<CancelCallback>,
 }
 
 impl Scheduler {
@@ -127,22 +113,6 @@ impl Scheduler {
             low_delivery_rounds: 0,
             high_delivery_rounds: 0,
             cdf53_passes_acked: HashMap::new(),
-            cancel_callback: None,
-        }
-    }
-
-    /// Register a single-threaded cancellation hook. Replaces any previously
-    /// registered callback. See `CancelCallback` for the threading contract.
-    pub fn set_cancel_callback(&mut self, cb: CancelCallback) {
-        self.cancel_callback = Some(cb);
-    }
-
-    /// Invoke the registered cancellation callback, if any. Called from the
-    /// top of `bump_generation` and `bump_generation_collecting` so downstream
-    /// layers learn about supersession before the queue is mutated.
-    fn fire_cancel(&mut self, tile_x: u8, tile_y: u8) {
-        if let Some(cb) = self.cancel_callback.as_mut() {
-            cb(tile_x, tile_y);
         }
     }
 
@@ -234,7 +204,6 @@ impl Scheduler {
     }
 
     pub fn bump_generation(&mut self, tile_x: u8, tile_y: u8) -> u8 {
-        self.fire_cancel(tile_x, tile_y);
         let idx = (tile_y as usize) * (self.cols as usize) + (tile_x as usize);
         let new_gen = (self.generations[idx] + 1) & 0x0F;
         self.generations[idx] = new_gen;
@@ -400,7 +369,6 @@ impl Scheduler {
         tile_x: u8,
         tile_y: u8,
     ) -> (u8, Vec<ResolvedTileWork>) {
-        self.fire_cancel(tile_x, tile_y);
         let mut resolved: Vec<ResolvedTileWork> = Vec::new();
         for entry in self
             .priority_queue
@@ -1223,19 +1191,4 @@ mod tests {
         assert_eq!(our[0].3, 5, "5 outstanding coverage entries");
     }
 
-    #[test]
-    fn cancel_pending_for_tile_fires_registered_callback() {
-        use std::sync::{Arc, Mutex};
-        let mut s = Scheduler::new(8, 8);
-        // `Arc<Mutex<_>>` (not `Rc<RefCell<_>>`) because `CancelCallback`
-        // requires `Send` — the Scheduler is owned by `IoBridge`, which is
-        // run inside `tokio::spawn`.
-        let log: Arc<Mutex<Vec<(u8, u8)>>> = Arc::new(Mutex::new(Vec::new()));
-        let log_clone = log.clone();
-        s.set_cancel_callback(Box::new(move |x, y| {
-            log_clone.lock().unwrap().push((x, y));
-        }));
-        let _ = s.bump_generation(3, 4);
-        assert_eq!(log.lock().unwrap().as_slice(), &[(3, 4)]);
-    }
 }
