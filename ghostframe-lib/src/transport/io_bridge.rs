@@ -56,6 +56,36 @@ use crate::transport::webtransport::WebTransportServer;
 /// write a full datagram into this buffer in a single call.
 const QUIC_SCRATCH: usize = 2048;
 
+/// `DatagramSender` impl that forwards every emit to
+/// `IoBridge::send_to_all_sessions` via a raw pointer.
+///
+/// SAFETY: This adapter is constructed inside `&mut self` methods on
+/// `IoBridge` (`drain_scheduler_into_quinn`, `process_frame_gpu`) and
+/// lives only for the duration of the enclosing call. The pointer
+/// targets the same `IoBridge` whose `&mut self` borrow created it, and
+/// `ReliableTileEmitter::drain` is single-threaded — there is no
+/// re-entrant or concurrent access to the bridge while the adapter is
+/// live. The pointer is never stored, never shared across threads, and
+/// never outlives the stack frame.
+///
+/// The raw-pointer pattern is the cleanest way to thread
+/// `send_to_all_sessions` (which needs `&mut self`) into
+/// `emitter.drain` while the emitter itself is already borrowed
+/// `&mut self.reliable_emitter`.
+struct IoBridgeSenderAdapter {
+    bridge: *mut IoBridge,
+}
+
+impl crate::transport::reliable_emitter::traits::DatagramSender
+    for IoBridgeSenderAdapter
+{
+    fn send(&mut self, dg: &[u8]) {
+        // SAFETY: see struct doc — the pointer is valid for the duration
+        // of the surrounding `&mut self` call on `IoBridge`.
+        unsafe { (*self.bridge).send_to_all_sessions(dg) }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Scheduler tick budgeting (A + B-light)
 // ---------------------------------------------------------------------------
@@ -412,6 +442,17 @@ pub struct IoBridge {
     /// path, non-cdf53 codecs only; Phase B dirty-cdf53 line 2630;
     /// Phase B escalation line 2711).
     bump_count_accumulator: BumpCountAccumulator,
+    /// Reliable tile emitter — owns wire_seq allocation, retransmit
+    /// caching, FEC parity scheduling, and RTO bookkeeping. Fed by
+    /// `drain_scheduler_into_quinn` via `submit_batch`; drained to the
+    /// wire via the `IoBridgeSenderAdapter` trait impl wrapping
+    /// `send_to_all_sessions`. Cancellation on bump_generation is wired
+    /// through `scheduler.set_cancel_callback` in
+    /// `register_emitter_cancel_callback`. Task 28 will retire the
+    /// legacy `fragment_coverage` path that currently coexists with
+    /// the new emitter pipeline.
+    pub(crate) reliable_emitter:
+        crate::transport::reliable_emitter::ReliableTileEmitter,
 }
 
 /// Per-cumulative-log bump counters. Reset on log emission.
@@ -695,7 +736,7 @@ impl IoBridge {
         // doesn't pay thread-spin-up latency on the hot path (design Section 4).
         rayon::iter::IntoParallelIterator::into_par_iter(0..1u32).for_each(|_| {});
 
-        Ok(Self {
+        let mut bridge = Self {
             _handle: Some(handle),
             stream,
             server,
@@ -758,7 +799,11 @@ impl IoBridge {
             last_cumulative_emit_log_frame: 0,
             color_histogram_accumulator: UniqueColorHistogram::default(),
             bump_count_accumulator: BumpCountAccumulator::default(),
-        })
+            reliable_emitter:
+                crate::transport::reliable_emitter::ReliableTileEmitter::new(),
+        };
+        bridge.register_emitter_cancel_callback();
+        Ok(bridge)
     }
 
     /// Create a new `IoBridge` wired to an inbound frame channel.
@@ -773,6 +818,56 @@ impl IoBridge {
         let mut bridge = Self::new(ghostbridge_config, listen_addr).await?;
         bridge.frame_rx = Some(frame_rx);
         Ok(bridge)
+    }
+
+    /// Wire scheduler supersession into the reliable emitter so that
+    /// retransmit/cache state is dropped in lock-step with
+    /// `bump_generation` / `bump_generation_collecting`. Called once
+    /// from every IoBridge constructor after the struct is built.
+    ///
+    /// SAFETY: the closure captures a raw pointer to
+    /// `self.reliable_emitter`. The pointer is valid for as long as
+    /// `self` is — and the scheduler lives strictly inside the same
+    /// struct, so the closure can never outlive its target. The
+    /// closure is invoked only from `&mut self` methods on `IoBridge`
+    /// (via `scheduler.bump_generation*`), so there is no concurrent
+    /// access to the emitter while the callback runs. The pointer is
+    /// never stored elsewhere and never shared across threads.
+    fn register_emitter_cancel_callback(&mut self) {
+        // The scheduler's `CancelCallback` is `Box<dyn FnMut + Send>`.
+        // Raw pointers are not `Send` by default, so we wrap the
+        // pointer in a `Send`-asserting newtype and route the cancel
+        // call through a method on the wrapper. The method-call form
+        // forces the closure to capture the whole `EmitterPtr` value
+        // (which is `Send`) rather than narrowing the capture to the
+        // inner `*mut` field — Rust 2021 disjoint-closure-captures
+        // would otherwise expose the non-`Send` raw pointer directly.
+        //
+        // The `Send` impl on `EmitterPtr` is justified by the same
+        // single-threaded invariant documented on
+        // `register_emitter_cancel_callback`: the IoBridge runs on a
+        // dedicated tokio task, the scheduler lives inside the same
+        // struct, and the closure is only fired from `&mut self`
+        // methods on the bridge. Nothing races on the emitter through
+        // this pointer.
+        struct EmitterPtr(*mut crate::transport::reliable_emitter::ReliableTileEmitter);
+        impl EmitterPtr {
+            // Force whole-struct capture: closure body calls this
+            // method on `self` rather than touching the `*mut` field
+            // directly.
+            fn cancel(&self, x: u8, y: u8) {
+                // SAFETY: see register_emitter_cancel_callback doc.
+                unsafe { (*self.0).cancel_for_tile(x, y) }
+            }
+        }
+        // SAFETY: see method doc — single-threaded access invariant.
+        unsafe impl Send for EmitterPtr {}
+        let emitter = EmitterPtr(
+            &mut self.reliable_emitter as *mut _,
+        );
+        self.scheduler.set_cancel_callback(Box::new(move |x, y| {
+            emitter.cancel(x, y);
+        }));
     }
 
     /// Return the SHA-256 hex fingerprint of the server's self-signed cert.
@@ -1242,10 +1337,21 @@ impl IoBridge {
         let drained_count = drained.len();
         let mut stats = FrameSendStats::default();
         let mut total_wire_bytes_sent: usize = 0;
+        let now = Instant::now();
+        // Build per-fragment (EmitKey, Bytes) items for the reliable
+        // emitter. The emitter stamps wire_seq into bytes[8..12], caches
+        // for retransmit, schedules RTO, and queues parity per FEC group.
+        // The actual wire write happens in `reliable_emitter.drain(&mut
+        // adapter, now)` below.
+        let frame_seq_with_flag = seq | TILE_DATAGRAM_FLAG;
+        let mut items: Vec<(
+            crate::transport::reliable_emitter::EmitKey,
+            bytes::Bytes,
+        )> = Vec::with_capacity(drained.len());
         for work in drained {
             let datagrams = fragment_tile(
                 &TileFragmentInputs {
-                    frame_seq: seq | TILE_DATAGRAM_FLAG,
+                    frame_seq: frame_seq_with_flag,
                     tile_x: work.tile_x,
                     tile_y: work.tile_y,
                     codec: work.codec,
@@ -1256,11 +1362,12 @@ impl IoBridge {
                 &work.payload,
                 max_frag,
             );
-            // Record fragment coverage. Sub-option (a) per spec: only the
-            // FINAL fragment carries the tile entry; intermediate fragments
-            // contribute nothing (client can't usefully process the tile
-            // until assembly completes anyway).
-            let frame_seq_with_flag = seq | TILE_DATAGRAM_FLAG;
+            // Record fragment coverage (legacy path — retained alongside
+            // the new emitter pipeline for Task 25; Task 28 deletes).
+            // Sub-option (a) per spec: only the FINAL fragment carries
+            // the tile entry; intermediate fragments contribute nothing
+            // (client can't usefully process the tile until assembly
+            // completes anyway).
             let n = datagrams.len();
             if n > 0 {
                 let palette_id = if work.codec == crate::transport::protocol::Codec::PalRle {
@@ -1334,10 +1441,26 @@ impl IoBridge {
                 }
                 _ => {}
             }
-            for dg in &datagrams {
-                self.send_to_all_sessions(dg);
+            // Hand every fragment to the reliable emitter under the
+            // same EmitKey (the per-tile-pass identity used by ACK/NACK).
+            let key = crate::transport::reliable_emitter::EmitKey::new(
+                seq,
+                work.tile_x,
+                work.tile_y,
+                work.pass_idx,
+            );
+            for dg in datagrams {
+                items.push((key, bytes::Bytes::from(dg)));
             }
         }
+        // Submit the batch (stamps wire_seq, caches, schedules RTO + parity).
+        self.reliable_emitter.submit_batch(items, now);
+        // Drain everything queued to the wire via the adapter. The
+        // adapter routes each datagram to `send_to_all_sessions` — the
+        // same wire path as before this refactor.
+        let bridge_ptr: *mut IoBridge = self as *mut IoBridge;
+        let mut adapter = IoBridgeSenderAdapter { bridge: bridge_ptr };
+        self.reliable_emitter.drain(&mut adapter, now);
         (stats, total_wire_bytes_sent, drained_count)
     }
 
@@ -2822,6 +2945,19 @@ impl IoBridge {
                     Some(&mut palrle_payloads),
                 );
 
+                // Per-frame RTO sweep: fire any cached retransmits whose
+                // RTO deadline has elapsed, then drain the resulting
+                // queue (source + parity) to the wire. Cheap when nothing
+                // is due (no cache hits, no parity ready).
+                {
+                    let tick_now = Instant::now();
+                    self.reliable_emitter.tick(tick_now);
+                    let bridge_ptr: *mut IoBridge = self as *mut IoBridge;
+                    let mut adapter =
+                        IoBridgeSenderAdapter { bridge: bridge_ptr };
+                    self.reliable_emitter.drain(&mut adapter, tick_now);
+                }
+
                 // Diagnostic: post-dispatch summary. If THIS fires but
                 // frame.last_send below does not, something in the palrle
                 // stats log block is silencing execution. If neither fires,
@@ -3416,7 +3552,7 @@ impl IoBridge {
         // doesn't pay thread-spin-up latency on the hot path (design Section 4).
         rayon::iter::IntoParallelIterator::into_par_iter(0..1u32).for_each(|_| {});
 
-        IoBridge {
+        let mut bridge = IoBridge {
             _handle: None,
             stream,
             server,
@@ -3473,7 +3609,11 @@ impl IoBridge {
             last_cumulative_emit_log_frame: 0,
             color_histogram_accumulator: UniqueColorHistogram::default(),
             bump_count_accumulator: BumpCountAccumulator::default(),
-        }
+            reliable_emitter:
+                crate::transport::reliable_emitter::ReliableTileEmitter::new(),
+        };
+        bridge.register_emitter_cancel_callback();
+        bridge
     }
 
     #[cfg(test)]
@@ -3486,7 +3626,7 @@ impl IoBridge {
         // doesn't pay thread-spin-up latency on the hot path (design Section 4).
         rayon::iter::IntoParallelIterator::into_par_iter(0..1u32).for_each(|_| {});
 
-        IoBridge {
+        let mut bridge = IoBridge {
             _handle: None,
             stream,
             server,
@@ -3543,7 +3683,11 @@ impl IoBridge {
             last_cumulative_emit_log_frame: 0,
             color_histogram_accumulator: UniqueColorHistogram::default(),
             bump_count_accumulator: BumpCountAccumulator::default(),
-        }
+            reliable_emitter:
+                crate::transport::reliable_emitter::ReliableTileEmitter::new(),
+        };
+        bridge.register_emitter_cancel_callback();
+        bridge
     }
 
     /// Return the capabilities most recently advertised by the client via HELLO.
