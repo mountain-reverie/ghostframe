@@ -139,6 +139,49 @@ impl ReliableTileEmitter {
         }
     }
 
+    /// Ingest a batch of NACKs from the client. For each (key, frag_idx):
+    /// - Cache miss → bump `nack_miss` and continue.
+    /// - `attempts >= MAX_RETRANSMITS` → silently skip (budget exhausted).
+    /// - Out-of-range frag_idx → silently skip.
+    /// - Otherwise re-emit just that one fragment via the queue, bump
+    ///   `attempts`, advance `last_sent_at`, bump `nack_hit` and
+    ///   `retransmit_attempts_total`.
+    ///
+    /// The RTO heap entry for this key stays in place; `tick` will see
+    /// the bumped `attempts` and either re-fire (acceptable) or retire
+    /// at MAX_RETRANSMITS. No active heap removal is required.
+    pub fn on_nack(&mut self, entries: &[(EmitKey, u8)]) {
+        for &(key, frag_idx) in entries {
+            let now = self.smoothed_rtt_clock_now();
+            let Some(entry) = self.cache.get_mut(&key) else {
+                self.stats.nack_miss += 1;
+                continue;
+            };
+            if entry.attempts >= MAX_RETRANSMITS {
+                continue;
+            }
+            let Some(frag) = entry.fragments.get(frag_idx as usize) else {
+                continue;
+            };
+            let bytes = frag.to_vec();
+            entry.attempts += 1;
+            entry.last_sent_at = now;
+            // Release the entry borrow before touching self.queue / self.stats.
+            let _ = entry;
+            self.queue.push_source(bytes);
+            self.stats.nack_hit += 1;
+            self.stats.retransmit_attempts_total += 1;
+        }
+    }
+
+    /// Internal helper — captures the current time so on_nack's caller
+    /// doesn't have to pass an Instant. Task 22 wires a real Clock through
+    /// the emitter constructor; this stub keeps the signature stable until
+    /// then.
+    fn smoothed_rtt_clock_now(&self) -> Instant {
+        Instant::now()
+    }
+
     /// Drain emissions to a sender until the queue is empty.
     pub fn drain<S: DatagramSender>(&mut self, sender: &mut S, now: Instant) {
         let next = self.alloc.peek();
@@ -311,5 +354,45 @@ mod tests {
         e.drain(&mut sender, t1);
         assert_eq!(sender.sent.len(), 1, "no retransmit after ACK");
         assert_eq!(e.stats.rto_fired, 0);
+    }
+
+    #[test]
+    fn on_nack_reemits_specific_fragment_only() {
+        let mut e = ReliableTileEmitter::new();
+        let mut sender = CollectSender::default();
+        let t0 = Instant::now();
+        let key = EmitKey::new(1, 0, 0, 0);
+        e.submit_one(key, fake_source(1, 0, 0), t0);
+        e.drain(&mut sender, t0);
+        assert_eq!(sender.sent.len(), 1);
+        // NACK for frag_idx=0 (the only one)
+        e.on_nack(&[(key, 0u8)]);
+        e.drain(&mut sender, t0);
+        assert_eq!(sender.sent.len(), 2);
+        assert_eq!(e.stats.nack_hit, 1);
+        assert_eq!(e.cache.get(&key).unwrap().attempts, 1);
+    }
+
+    #[test]
+    fn on_nack_for_unknown_key_bumps_nack_miss() {
+        let mut e = ReliableTileEmitter::new();
+        e.on_nack(&[(EmitKey::new(99, 0, 0, 0), 0u8)]);
+        assert_eq!(e.stats.nack_miss, 1);
+    }
+
+    #[test]
+    fn on_nack_respects_max_retransmits() {
+        let mut e = ReliableTileEmitter::new();
+        let mut sender = CollectSender::default();
+        let t0 = Instant::now();
+        let key = EmitKey::new(1, 0, 0, 0);
+        e.submit_one(key, fake_source(1, 0, 0), t0);
+        e.drain(&mut sender, t0);
+        for _ in 0..(MAX_RETRANSMITS as usize + 2) {
+            e.on_nack(&[(key, 0u8)]);
+            e.drain(&mut sender, t0);
+        }
+        // 1 original + MAX_RETRANSMITS re-emits — extras are silently capped.
+        assert_eq!(sender.sent.len(), 1 + MAX_RETRANSMITS as usize);
     }
 }
