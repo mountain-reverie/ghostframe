@@ -91,6 +91,12 @@ impl ReliableTileEmitter {
         self.stats.source_emitted += 1;
     }
 
+    pub fn submit_batch(&mut self, items: Vec<(EmitKey, Bytes)>, now: Instant) {
+        for (key, bytes) in items {
+            self.submit_one(key, bytes, now);
+        }
+    }
+
     /// Ingest a batch of ACKs from the client. For each key, remove the
     /// corresponding cache entry. A hit (entry was live) bumps `ack_hit`; a
     /// miss (already evicted/cancelled) bumps `ack_miss`. Idempotent: late
@@ -423,5 +429,19 @@ mod tests {
         }
         // 1 original + MAX_RETRANSMITS re-emits — extras are silently capped.
         assert_eq!(sender.sent.len(), 1 + MAX_RETRANSMITS as usize);
+    }
+
+    #[test]
+    fn submit_batch_processes_all_items() {
+        let mut e = ReliableTileEmitter::new();
+        let mut sender = CollectSender::default();
+        let now = Instant::now();
+        let items: Vec<(EmitKey, Bytes)> = (0..5)
+            .map(|i| (EmitKey::new(i, 0, 0, 0), fake_source(i, 0, 0)))
+            .collect();
+        e.submit_batch(items, now);
+        e.drain(&mut sender, now);
+        assert_eq!(sender.sent.len(), 5);
+        assert_eq!(e.stats.source_emitted, 5);
     }
 }
