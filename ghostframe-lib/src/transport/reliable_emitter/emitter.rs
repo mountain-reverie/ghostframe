@@ -174,6 +174,12 @@ impl ReliableTileEmitter {
         }
     }
 
+    pub fn cancel_for_tile(&mut self, tile_x: u8, tile_y: u8) {
+        self.cache.cancel_for_tile(tile_x, tile_y);
+        // RTO heap entries are left in place; validation-on-pop in tick() will
+        // drop them when the cache lookup misses.
+    }
+
     /// Internal helper — captures the current time so on_nack's caller
     /// doesn't have to pass an Instant. Task 22 wires a real Clock through
     /// the emitter constructor; this stub keeps the signature stable until
@@ -378,6 +384,29 @@ mod tests {
         let mut e = ReliableTileEmitter::new();
         e.on_nack(&[(EmitKey::new(99, 0, 0, 0), 0u8)]);
         assert_eq!(e.stats.nack_miss, 1);
+    }
+
+    #[test]
+    fn cancel_for_tile_clears_all_gens_and_blocks_retransmit() {
+        let mut e = ReliableTileEmitter::new();
+        let mut sender = CollectSender::default();
+        let t0 = Instant::now();
+        let k1 = EmitKey::new(1, 5, 5, 0);
+        let k2 = EmitKey::new(2, 5, 5, 1);
+        let k3 = EmitKey::new(1, 5, 6, 0);  // different tile
+        e.submit_one(k1, fake_source(1, 0, 0), t0);
+        e.submit_one(k2, fake_source(2, 0, 0), t0);
+        e.submit_one(k3, fake_source(3, 0, 0), t0);
+        e.drain(&mut sender, t0);
+        e.cancel_for_tile(5, 5);
+        assert!(e.cache.get(&k1).is_none());
+        assert!(e.cache.get(&k2).is_none());
+        assert!(e.cache.get(&k3).is_some());
+        // Tick past RTO — no retransmit for cancelled, retransmit for k3.
+        let t1 = t0 + Duration::from_millis(60);
+        e.tick(t1);
+        e.drain(&mut sender, t1);
+        assert_eq!(sender.sent.len(), 4, "3 initial + 1 retransmit for k3 only");
     }
 
     #[test]
