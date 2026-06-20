@@ -49,18 +49,18 @@ use crate::drm_direct::{msync_buffer, setup_dumb_scanout};
 /// channel; canvas `alphaMode: 'opaque'` masks that visually, but exact-pixel
 /// assertions must expect alpha=0x00 to match what the production shader
 /// actually writes (no alpha-force in the Solid/PalRle pipelines).
-const BG_PIXEL: u32 = 0x0014_1414;
+pub const BG_PIXEL: u32 = 0x0014_1414;
 
 /// Corner colours, packed XRGB8888 little-endian.
-const RED_PIXEL: u32 = 0x00FF_0000;
-const GREEN_PIXEL: u32 = 0x0000_FF00;
-const BLUE_PIXEL: u32 = 0x0000_00FF;
-const YELLOW_PIXEL: u32 = 0x00FF_FF00;
+pub const RED_PIXEL: u32 = 0x00FF_0000;
+pub const GREEN_PIXEL: u32 = 0x0000_FF00;
+pub const BLUE_PIXEL: u32 = 0x0000_00FF;
+pub const YELLOW_PIXEL: u32 = 0x00FF_FF00;
 
 /// Side length of each corner tile (matches `ghostframe-lib::tile::TILE_SIZE`).
-const CORNER_SIZE: u32 = 32;
+pub const CORNER_SIZE: u32 = 32;
 /// Side length of the central motion region.
-const MOTION_SIZE: u32 = 64;
+pub const MOTION_SIZE: u32 = 64;
 /// Motion-region repaint cadence. MUST stay below capture-frame interval so
 /// every captured frame sees fresh bytes in the central tiles — see the
 /// note in `drm_direct.rs` for the same constant.
