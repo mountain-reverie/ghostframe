@@ -8,6 +8,7 @@ import {
 import { WebGpuRenderer } from './webgpu/renderer.js';
 import { WebGpuUnavailableError } from './webgpu/init.js';
 import { ParityRecovery } from './fec';
+import { ParityDecoder, parseParityEnvelope, TILE_PARITY_ENVELOPE } from './parity_decoder.js';
 import { LossTracker, encodeHello } from './feedback';
 import { attachInputCapture } from './input/wire';
 import { DecodeErrorBatcher } from './decode_error_batcher';
@@ -407,13 +408,19 @@ async function main() {
 
   // Reliable-tile-emitter FEC + NACK counters — surfaced via the periodic
   // `fec-coverage` log line (sibling to `cdf53-coverage`) for side-by-side
-  // wire-loss inspection. `parityRx` / `recovered` / `parityUnrecoverable`
-  // stay at 0 until ParityDecoder is wired into the dispatch path; see the
-  // ParityDecoder module in parity_decoder.ts (Task 21).
+  // wire-loss inspection. The counters move once the ParityDecoder dispatch
+  // branches below route 0x04 envelopes and record source datagrams.
   let fecRecovered = 0;
   let fecParityRx = 0;
   let fecParityUnrecoverable = 0;
   let nackSent = 0;
+
+  // ParityDecoder window: server emits one parity per K=10 source group with
+  // +2K interleave offset, so the decoder needs to hold at least the in-flight
+  // source datagrams covering 4 × K groups to allow late-source recovery once
+  // the offset parity arrives. See parity_decoder.ts (Task 21) and the
+  // server-side TileParityEnvelope emitter (Task 35).
+  const parityDecoder = new ParityDecoder(40);
 
   // Reliable-tile-emitter NACK sender — reuses the same datagrams writer.
   // Fire-and-forget; rejection from a closed stream is benign at this point.
@@ -823,6 +830,171 @@ async function main() {
   }
   requestAnimationFrame(tick);
 
+  /**
+   * Process a tile-level source datagram (header + tile-header + payload).
+   * Extracted into a helper so that XOR-recovered datagrams from the
+   * ParityDecoder go through the exact same path as real wire arrivals —
+   * the assembler, codec dispatch, and ACK batcher see them indistinguishably.
+   * `bytes` is the full datagram including DatagramHeader at offset 0.
+   */
+  function handleSourceTileDatagram(bytes: Uint8Array) {
+    if (bytes.byteLength < DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE) return;
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+
+    const dgramHdr = decodeDatagramHeader(view, 0);
+    dgramHdr.frameSeq = dgramHdr.frameSeq & ~TILE_DATAGRAM_FLAG;
+    lossTracker.onDatagram();
+    stats.tileDatagrams++;
+    const tileHdr = decodeTileHeader(view, DATAGRAM_HEADER_SIZE);
+    // M3.3d rev2: ACK on RECEIPT, per-tile-pass. Server's fragment_coverage
+    // map is keyed by (frameSeq, tile_x, tile_y, pass_idx) — unique per
+    // tile-pass emission within a frame, avoiding the frag_idx=0 collision
+    // that occurs when multiple single-fragment work items share the same
+    // frame_seq. Re-set the TILE_DATAGRAM_FLAG bit because the line above
+    // already masked it off for downstream logic.
+    //
+    // Skip the frame-dimensions sentinel (0xFF, 0xFF): it's emitted outside
+    // the scheduler and has no coverage entry on the server — ACKing it would
+    // always produce an ack_miss log.
+    if (tileHdr.tileX !== FRAME_DIMENSIONS_SENTINEL_X || tileHdr.tileY !== FRAME_DIMENSIONS_SENTINEL_Y) {
+      ackBatcher.add({
+        frameSeq: dgramHdr.frameSeq | TILE_DATAGRAM_FLAG,
+        tileX: tileHdr.tileX,
+        tileY: tileHdr.tileY,
+        passIdx: tileHdr.pass,
+      });
+    }
+
+    // M3.5 bench: record the earliest receive timestamp per frame_seq.
+    // Captured here — before any fragment-assembly checks — so it reflects
+    // the true first-datagram-arrival time regardless of frag_idx ordering.
+    const nowMs = performance.now();
+    if (!firstRecvMs.has(dgramHdr.frameSeq)) {
+      firstRecvMs.set(dgramHdr.frameSeq, nowMs);
+    }
+
+    if (dgramHdr.frameSeq > latestFrameSeq) {
+      latestFrameSeq = dgramHdr.frameSeq;
+    }
+
+    const staleThreshold = latestFrameSeq - 2;
+    for (const [k, asm] of assemblies) {
+      const seq = parseInt(k.split(':')[0], 10);
+      if (seq < staleThreshold) {
+        if (asm.received < asm.fragments.length) {
+          lossTracker.onStaleTile(asm.fragments.length, asm.received);
+        }
+        assemblies.delete(k);
+        parityMap.delete(k);
+        // M3.5 bench: frame is now stale — mark for recordFramePainted on next
+        // rAF tick if we have any bench state for it (i.e. at least one tile
+        // was painted). Frames that never produced a painted tile (e.g.
+        // dropped entirely) are skipped to avoid spurious FIFO entries.
+        if (paintedTilesPerFrame.has(seq)) {
+          pendingFramePaintRaf.add(seq);
+        }
+      }
+    }
+
+    // Parity datagram (legacy fragment-level FEC inside a single tile assembly,
+    // distinct from the 0x04 TileParityEnvelope routed via ParityDecoder above).
+    if (dgramHdr.fragIdx >= dgramHdr.fragTotal) {
+      const pKey = tileKey(dgramHdr.frameSeq, tileHdr.tileX, tileHdr.tileY);
+      let pr = parityMap.get(pKey);
+      if (!pr) {
+        pr = new ParityRecovery();
+        parityMap.set(pKey, pr);
+      }
+      const payloadOffset = DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE;
+      const parityPayload = new Uint8Array(
+        bytes.buffer, bytes.byteOffset + payloadOffset, bytes.byteLength - payloadOffset
+      );
+      pr.addParity(parityPayload);
+
+      const asmKey = tileKey(dgramHdr.frameSeq, tileHdr.tileX, tileHdr.tileY);
+      const pendingAsm = assemblies.get(asmKey);
+      if (pendingAsm && pendingAsm.received === dgramHdr.fragTotal - 1) {
+        const missingIdx = pendingAsm.fragments.findIndex(f => f === null);
+        if (missingIdx >= 0) {
+          const recovered = pr.tryRecover(missingIdx, pendingAsm.fragments);
+          if (recovered) {
+            pendingAsm.fragments[missingIdx] = recovered;
+            pendingAsm.received++;
+            lossTracker.onFecRecovery();
+            finishAssembly(asmKey, pendingAsm);
+          }
+        }
+      }
+      return;
+    }
+
+    if (tileHdr.tileX === FRAME_DIMENSIONS_SENTINEL_X && tileHdr.tileY === FRAME_DIMENSIONS_SENTINEL_Y) {
+      const payloadStart = DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE;
+      const payloadBytes = bytes.byteLength - payloadStart;
+      if (payloadBytes >= 8) {
+        const dimView = new DataView(bytes.buffer, bytes.byteOffset + payloadStart, 8);
+        const w = dimView.getUint32(0, false);
+        const h = dimView.getUint32(4, false);
+        renderer.resize(w, h);
+        frameDimensionsKnown = true;
+      }
+      return;
+    }
+
+    if (tileHdr.codec === Codec.Skip) {
+      return;
+    }
+
+    const key = tileKey(dgramHdr.frameSeq, tileHdr.tileX, tileHdr.tileY);
+    const payloadOffset = DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE;
+    const fragData = new Uint8Array(bytes.buffer, bytes.byteOffset + payloadOffset, bytes.byteLength - payloadOffset);
+
+    let asm = assemblies.get(key);
+    if (!asm) {
+      asm = {
+        header: tileHdr,
+        fragments: new Array(dgramHdr.fragTotal).fill(null),
+        received: 0,
+        // Server's fragment_coverage map is keyed with TILE_DATAGRAM_FLAG set;
+        // mirror the ACK convention above so NACK lookups hit the same entry.
+        emitKey: {
+          frameSeq: dgramHdr.frameSeq | TILE_DATAGRAM_FLAG,
+          tileX: tileHdr.tileX,
+          tileY: tileHdr.tileY,
+          passIdx: tileHdr.pass,
+        },
+        partialSince: performance.now(),
+        nackedFragIdxs: new Set<number>(),
+      };
+      assemblies.set(key, asm);
+    }
+
+    if (asm.fragments[dgramHdr.fragIdx] === null) {
+      asm.fragments[dgramHdr.fragIdx] = fragData.slice();
+      asm.received += 1;
+    }
+
+    if (asm.received === dgramHdr.fragTotal - 1) {
+      const pKey = tileKey(dgramHdr.frameSeq, tileHdr.tileX, tileHdr.tileY);
+      const pr = parityMap.get(pKey);
+      if (pr) {
+        const missingIdx = asm.fragments.findIndex(f => f === null);
+        if (missingIdx >= 0) {
+          const recovered = pr.tryRecover(missingIdx, asm.fragments);
+          if (recovered) {
+            asm.fragments[missingIdx] = recovered;
+            asm.received++;
+            lossTracker.onFecRecovery();
+          }
+        }
+      }
+    }
+
+    if (asm.received === dgramHdr.fragTotal) {
+      finishAssembly(key, asm);
+    }
+  }
+
   // Receive datagrams.
   const reader = transport.datagrams.readable.getReader();
   while (true) {
@@ -830,6 +1002,28 @@ async function main() {
     if (done) break;
 
     if (!value || value.byteLength === 0) continue;
+
+    // Reliable-tile-emitter: TILE_PARITY (0x04) envelope. Routed before the
+    // ping/pong < 20 byte guard because the discriminator is unambiguous and
+    // an empty-group parity could in principle be small. ParityDecoder.
+    // receiveParity returns a fully-formed source datagram if it can XOR-
+    // recover a single missing source from a buffered K=10 group; we route
+    // that recovered datagram through handleSourceTileDatagram so the
+    // assembler + dispatch see it indistinguishably from a real wire arrival.
+    if (value[0] === TILE_PARITY_ENVELOPE) {
+      fecParityRx++;
+      try {
+        const parityHeader = parseParityEnvelope(value);
+        const recovered = parityDecoder.receiveParity(parityHeader);
+        if (recovered !== null) {
+          fecRecovered++;
+          handleSourceTileDatagram(recovered);
+        }
+      } catch {
+        fecParityUnrecoverable++;
+      }
+      continue;
+    }
 
     // Backward compat: small text datagrams (ping/pong).
     if (value.byteLength < 20) {
@@ -925,157 +1119,25 @@ async function main() {
     }
 
     // --- Tile-level datagram processing ---
-    const dgramHdr = decodeDatagramHeader(view, 0);
-    dgramHdr.frameSeq = dgramHdr.frameSeq & ~TILE_DATAGRAM_FLAG;
-    lossTracker.onDatagram();
-    stats.tileDatagrams++;
-    const tileHdr = decodeTileHeader(view, DATAGRAM_HEADER_SIZE);
-    // M3.3d rev2: ACK on RECEIPT, per-tile-pass. Server's fragment_coverage
-    // map is keyed by (frameSeq, tile_x, tile_y, pass_idx) — unique per
-    // tile-pass emission within a frame, avoiding the frag_idx=0 collision
-    // that occurs when multiple single-fragment work items share the same
-    // frame_seq. Re-set the TILE_DATAGRAM_FLAG bit because the line above
-    // already masked it off for downstream logic.
     //
-    // Skip the frame-dimensions sentinel (0xFF, 0xFF): it's emitted outside
-    // the scheduler and has no coverage entry on the server — ACKing it would
-    // always produce an ack_miss log.
-    if (tileHdr.tileX !== FRAME_DIMENSIONS_SENTINEL_X || tileHdr.tileY !== FRAME_DIMENSIONS_SENTINEL_Y) {
-      ackBatcher.add({
-        frameSeq: dgramHdr.frameSeq | TILE_DATAGRAM_FLAG,
-        tileX: tileHdr.tileX,
-        tileY: tileHdr.tileY,
-        passIdx: tileHdr.pass,
-      });
+    // Feed every source datagram into the ParityDecoder's window so a
+    // subsequently-arriving parity envelope can XOR-recover any of the K=10
+    // sources in its group. recordSource also probes pending parities — if a
+    // delayed source arrival completes a buffered group, the recovered source
+    // datagram is replayed through handleSourceTileDatagram.
+    // wire_seq lives at offset 8..12 BE of the DatagramHeader (Task 1).
+    const wireSeq = view.getUint32(8, false);
+    // Defensive copy: ParityDecoder retains the buffer in its window for
+    // future XOR ops, and the WebTransport reader may reuse `value`'s
+    // backing buffer for the next datagram.
+    const sourceCopy = value.slice();
+    const replayed = parityDecoder.recordSource(wireSeq, sourceCopy);
+    if (replayed !== null) {
+      fecRecovered++;
+      handleSourceTileDatagram(replayed);
     }
 
-    // M3.5 bench: record the earliest receive timestamp per frame_seq.
-    // Captured here — before any fragment-assembly checks — so it reflects
-    // the true first-datagram-arrival time regardless of frag_idx ordering.
-    const nowMs = performance.now();
-    if (!firstRecvMs.has(dgramHdr.frameSeq)) {
-      firstRecvMs.set(dgramHdr.frameSeq, nowMs);
-    }
-
-    if (dgramHdr.frameSeq > latestFrameSeq) {
-      latestFrameSeq = dgramHdr.frameSeq;
-    }
-
-    const staleThreshold = latestFrameSeq - 2;
-    for (const [k, asm] of assemblies) {
-      const seq = parseInt(k.split(':')[0], 10);
-      if (seq < staleThreshold) {
-        if (asm.received < asm.fragments.length) {
-          lossTracker.onStaleTile(asm.fragments.length, asm.received);
-        }
-        assemblies.delete(k);
-        parityMap.delete(k);
-        // M3.5 bench: frame is now stale — mark for recordFramePainted on next
-        // rAF tick if we have any bench state for it (i.e. at least one tile
-        // was painted). Frames that never produced a painted tile (e.g.
-        // dropped entirely) are skipped to avoid spurious FIFO entries.
-        if (paintedTilesPerFrame.has(seq)) {
-          pendingFramePaintRaf.add(seq);
-        }
-      }
-    }
-
-    // Parity datagram.
-    if (dgramHdr.fragIdx >= dgramHdr.fragTotal) {
-      const pKey = tileKey(dgramHdr.frameSeq, tileHdr.tileX, tileHdr.tileY);
-      let pr = parityMap.get(pKey);
-      if (!pr) {
-        pr = new ParityRecovery();
-        parityMap.set(pKey, pr);
-      }
-      const payloadOffset = DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE;
-      const parityPayload = new Uint8Array(
-        value.buffer, value.byteOffset + payloadOffset, value.byteLength - payloadOffset
-      );
-      pr.addParity(parityPayload);
-
-      const asmKey = tileKey(dgramHdr.frameSeq, tileHdr.tileX, tileHdr.tileY);
-      const pendingAsm = assemblies.get(asmKey);
-      if (pendingAsm && pendingAsm.received === dgramHdr.fragTotal - 1) {
-        const missingIdx = pendingAsm.fragments.findIndex(f => f === null);
-        if (missingIdx >= 0) {
-          const recovered = pr.tryRecover(missingIdx, pendingAsm.fragments);
-          if (recovered) {
-            pendingAsm.fragments[missingIdx] = recovered;
-            pendingAsm.received++;
-            lossTracker.onFecRecovery();
-            finishAssembly(asmKey, pendingAsm);
-          }
-        }
-      }
-      continue;
-    }
-
-    if (tileHdr.tileX === FRAME_DIMENSIONS_SENTINEL_X && tileHdr.tileY === FRAME_DIMENSIONS_SENTINEL_Y) {
-      const payloadStart = DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE;
-      const payloadBytes = value.byteLength - payloadStart;
-      if (payloadBytes >= 8) {
-        const dimView = new DataView(value.buffer, value.byteOffset + payloadStart, 8);
-        const w = dimView.getUint32(0, false);
-        const h = dimView.getUint32(4, false);
-        renderer.resize(w, h);
-        frameDimensionsKnown = true;
-      }
-      continue;
-    }
-
-    if (tileHdr.codec === Codec.Skip) {
-      continue;
-    }
-
-    const key = tileKey(dgramHdr.frameSeq, tileHdr.tileX, tileHdr.tileY);
-    const payloadOffset = DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE;
-    const fragData = new Uint8Array(value.buffer, value.byteOffset + payloadOffset, value.byteLength - payloadOffset);
-
-    let asm = assemblies.get(key);
-    if (!asm) {
-      asm = {
-        header: tileHdr,
-        fragments: new Array(dgramHdr.fragTotal).fill(null),
-        received: 0,
-        // Server's fragment_coverage map is keyed with TILE_DATAGRAM_FLAG set;
-        // mirror the ACK convention above so NACK lookups hit the same entry.
-        emitKey: {
-          frameSeq: dgramHdr.frameSeq | TILE_DATAGRAM_FLAG,
-          tileX: tileHdr.tileX,
-          tileY: tileHdr.tileY,
-          passIdx: tileHdr.pass,
-        },
-        partialSince: performance.now(),
-        nackedFragIdxs: new Set<number>(),
-      };
-      assemblies.set(key, asm);
-    }
-
-    if (asm.fragments[dgramHdr.fragIdx] === null) {
-      asm.fragments[dgramHdr.fragIdx] = fragData.slice();
-      asm.received += 1;
-    }
-
-    if (asm.received === dgramHdr.fragTotal - 1) {
-      const pKey = tileKey(dgramHdr.frameSeq, tileHdr.tileX, tileHdr.tileY);
-      const pr = parityMap.get(pKey);
-      if (pr) {
-        const missingIdx = asm.fragments.findIndex(f => f === null);
-        if (missingIdx >= 0) {
-          const recovered = pr.tryRecover(missingIdx, asm.fragments);
-          if (recovered) {
-            asm.fragments[missingIdx] = recovered;
-            asm.received++;
-            lossTracker.onFecRecovery();
-          }
-        }
-      }
-    }
-
-    if (asm.received === dgramHdr.fragTotal) {
-      finishAssembly(key, asm);
-    }
+    handleSourceTileDatagram(value);
   }
 }
 
