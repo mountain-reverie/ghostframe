@@ -40,7 +40,17 @@ pub const END_OF_STREAM_PARITY_FLUSH_MS: u64 = 5;
 pub const MAX_RETRANSMITS: u8 = 4;
 pub const BASE_RTO_MS: u64 = 50;
 pub const RTO_BACKOFF_FACTOR: u32 = 2;
-pub const CACHE_CAPACITY: usize = 8192;
+// Sized for the first-paint burst: at 1920×1080 with 32×32 tiles the
+// worst case is ~2040 dirty tiles × 14 cdf53 passes ≈ 28 K tile-passes
+// submitted before any ACK can return. The original 8 K cap was a guess
+// that fit a typical *post-paint* working set but undersized the burst —
+// at 48 % wire loss on evangeline the LRU evicted ~16 K entries before
+// they could retry, so half the first-paint burst saw exactly one
+// emission attempt with no retransmit coverage. Bumped to 32 K so the
+// whole first paint stays cached through MAX_RETRANSMITS=4 retries.
+// Memory cost: ~500 B/entry × 32 K = ~16 MB per session, well below
+// any realistic ceiling.
+pub const CACHE_CAPACITY: usize = 32768;
 
 #[cfg(test)]
 mod tests {
