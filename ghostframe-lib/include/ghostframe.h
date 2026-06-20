@@ -232,7 +232,7 @@
 
 #define RTO_BACKOFF_FACTOR 2
 
-#define CACHE_CAPACITY 8192
+#define CACHE_CAPACITY 32768
 
 /**
  * Bundles a `GhostframeServer` with the tokio `Runtime` that owns its
