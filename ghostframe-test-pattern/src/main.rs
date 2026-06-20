@@ -79,6 +79,13 @@ struct Args {
     #[arg(long)]
     gradient: bool,
 
+    /// Paint a static codec-mixed test frame (Solid left third / PalRle
+    /// middle third / Cdf53 right third) for the lossless-golden whole-
+    /// frame strict pixel-compare e2e test. Combine with `--drm-direct`.
+    /// Drives `e2e_lossless_golden_png`.
+    #[arg(long)]
+    lossless_golden: bool,
+
     /// Fill the full screen by repeating a 32×32 fixture tile for one of the
     /// six M3.5 Layer B content classes: solid, flat_ui, text, gradient,
     /// photo, motion. Requires `--drm-direct`.
@@ -124,6 +131,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Cdf53 e2e tests. No X11 path; gradient is DRM-only.
     if args.drm_direct && args.gradient {
         return ghostframe_test_pattern::gradient::run(&args.drm_device);
+    }
+
+    // DRM-direct lossless-golden mode: static codec-mixed frame
+    // (Solid + PalRle + Cdf53 regions) for whole-frame strict pixel
+    // compare. Drives `e2e_lossless_golden_png`.
+    if args.drm_direct && args.lossless_golden {
+        return ghostframe_test_pattern::lossless_golden::run(&args.drm_device);
     }
 
     // DRM-direct tile-pattern mode: full-screen ContentClass fixture tile
