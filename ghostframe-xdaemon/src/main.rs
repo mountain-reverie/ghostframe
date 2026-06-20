@@ -122,7 +122,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Skip in --init mode: that path only seeds the tsnet state and exits
     // without capturing anything, and install.sh runs --init before X is up.
-    if !init_mode {
+    //
+    // Also skip when GHOSTFRAME_NO_X11_WAIT is set — the DRM-direct e2e
+    // path runs ghostframe-test-pattern as the DRM master with no Xorg
+    // anywhere in the container, so blocking on a non-existent display :99
+    // would just time out after 10 s and abort startup. The DRM-direct
+    // entrypoint sets this env var; production never does.
+    let skip_x11_wait = std::env::var("GHOSTFRAME_NO_X11_WAIT")
+        .ok()
+        .filter(|v| !v.is_empty() && v != "0")
+        .is_some();
+    if !init_mode && !skip_x11_wait {
         if let Err(msg) = wait_for_x11(Duration::from_secs(10)) {
             tracing::error!(
                 "{msg}\nCheck the upstream service: \

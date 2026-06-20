@@ -44,6 +44,11 @@ if [[ "${TEST_PATTERN:-}" == *--drm-direct* ]]; then
     # during motion phases. Caller can override via CAPTURE_FPS_DRM_DIRECT
     # for ad-hoc experiments.
     export CAPTURE_FPS=${CAPTURE_FPS_DRM_DIRECT:-30}
+    # No Xorg in the container — tell ghostframe-xdaemon to skip its
+    # `wait_for_x11` gate, which would otherwise block on display :99
+    # for 10 s and abort startup. Added when wait_for_x11 was introduced
+    # (commit 73c26a4) and silently broke every drm-direct e2e.
+    export GHOSTFRAME_NO_X11_WAIT=1
     ghostframe-test-pattern ${TEST_PATTERN} &
     sleep 1
     exec /usr/local/bin/ghostframe-xdaemon
