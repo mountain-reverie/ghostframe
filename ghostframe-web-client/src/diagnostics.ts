@@ -196,32 +196,71 @@ export function initDiagnostics({
     };
   }
 
-  // ---- __readFullFrame -----------------------------------------------------
-  // Whole-framebuffer GPU readback for pixel-perfect lossless validation in
-  // the e2e suite. Returns {width, height, rgba} where rgba is a
-  // width*height*4 byte array with row padding stripped. Mirrors
-  // __readPixelRect's bytesPerRow=Math.ceil(w*4/256)*256 staging-buffer
-  // pattern but always reads the entire texture and returns a typed
-  // Uint8Array (cheaper to ship across CDP than a plain number[]).
+  // ---- __setExpectedFrame / __compareFullFrame -----------------------------
+  // Chunk-and-seed-then-poll comparator. The expected frame buffer
+  // (width*height*4 bytes — multi-MB at 1024x768+) is too large to ship
+  // in a single CDP eval expression: Chromium/CDP's request handling
+  // stalls past ~1-2 MB of JS source, hitting the chromiumoxide 30 s
+  // request timeout. So the caller pushes the base64-encoded expected
+  // buffer in small chunks via __appendExpectedFrameChunk (each call
+  // ships <256 KB), then calls __finalizeExpectedFrame to atomically
+  // swap the assembled buffer in. The poll loop then calls
+  // __compareFullFrame() with no args.
   //
-  // Used by e2e_lossless_golden_png to poll the framebuffer until every
-  // sample byte matches the test-pattern source, dumping a diff PNG on
-  // 30 s timeout.
+  // __compareFullFrame GPU-reads the live framebuffer and walks it
+  // against the seeded expected buffer entirely in JS, returning a tiny
+  // summary (match / mismatchCount / first mismatch coords). It does
+  // NOT ship the framebuffer bytes across CDP.
+  //
+  // When the framebuffer isn't yet sized to the expected buffer
+  // (renderer not configured yet, or sizes don't match), returns
+  // { ready: false } so the caller keeps polling.
+  let cachedExpected: Uint8Array | null = null;
+  let pendingChunks: string[] = [];
   if (typeof window !== 'undefined') {
-    window.__readFullFrame = async (): Promise<{
+    window.__resetExpectedFrame = (): void => {
+      pendingChunks = [];
+      cachedExpected = null;
+    };
+    window.__appendExpectedFrameChunk = (chunkB64: string): { chunks: number } => {
+      pendingChunks.push(chunkB64);
+      return { chunks: pendingChunks.length };
+    };
+    window.__finalizeExpectedFrame = (): { length: number } => {
+      const joined = pendingChunks.join('');
+      pendingChunks = [];
+      cachedExpected = base64ToUint8Array(joined);
+      return { length: cachedExpected.length };
+    };
+    // Backwards-compat single-shot path; only safe for small buffers.
+    window.__setExpectedFrame = (expectedB64: string): { length: number } => {
+      cachedExpected = base64ToUint8Array(expectedB64);
+      return { length: cachedExpected.length };
+    };
+    window.__compareFullFrame = async (): Promise<{
+      ready: boolean;
       width: number;
       height: number;
-      rgba: number[];
+      match: boolean;
+      mismatchCount: number;
+      firstX?: number;
+      firstY?: number;
+      gotRGBA?: [number, number, number, number];
+      wantRGBA?: [number, number, number, number];
     }> => {
       const ref = getRenderer();
       if (!ref) {
-        return { width: 0, height: 0, rgba: [] };
+        return { ready: false, width: 0, height: 0, match: false, mismatchCount: 0 };
       }
       const { device, texture } = ref;
       const w = texture.width;
       const h = texture.height;
       if (w === 0 || h === 0) {
-        return { width: w, height: h, rgba: [] };
+        return { ready: false, width: w, height: h, match: false, mismatchCount: 0 };
+      }
+      const expected = cachedExpected;
+      if (!expected || expected.length !== w * h * 4) {
+        return { ready: false, width: w, height: h, match: false, mismatchCount: 0 };
       }
       // WebGPU requires bytesPerRow to be a multiple of 256.
       const bytesPerRow = Math.ceil(w * 4 / 256) * 256;
@@ -238,19 +277,41 @@ export function initDiagnostics({
       device.queue.submit([enc.finish()]);
       await staging.mapAsync(GPUMapMode.READ);
       const raw = new Uint8Array(staging.getMappedRange());
-      // Strip row padding so the result is exactly w*h*4 bytes.
       const rowBytes = w * 4;
-      const result: number[] = new Array(rowBytes * h);
+      let mismatchCount = 0;
+      let firstX = -1;
+      let firstY = -1;
+      let gotRGBA: [number, number, number, number] | undefined;
+      let wantRGBA: [number, number, number, number] | undefined;
       for (let row = 0; row < h; row++) {
         const srcOff = row * bytesPerRow;
         const dstOff = row * rowBytes;
-        for (let col = 0; col < rowBytes; col++) {
-          result[dstOff + col] = raw[srcOff + col];
+        for (let i = 0; i < rowBytes; i += 4) {
+          const g0 = raw[srcOff + i],     g1 = raw[srcOff + i + 1],
+                g2 = raw[srcOff + i + 2], g3 = raw[srcOff + i + 3];
+          const e0 = expected[dstOff + i],     e1 = expected[dstOff + i + 1],
+                e2 = expected[dstOff + i + 2], e3 = expected[dstOff + i + 3];
+          if (g0 !== e0 || g1 !== e1 || g2 !== e2 || g3 !== e3) {
+            if (firstX < 0) {
+              firstX = (i >> 2);
+              firstY = row;
+              gotRGBA = [g0, g1, g2, g3];
+              wantRGBA = [e0, e1, e2, e3];
+            }
+            mismatchCount += 4;
+          }
         }
       }
       staging.unmap();
       staging.destroy();
-      return { width: w, height: h, rgba: result };
+      return {
+        ready: true,
+        width: w,
+        height: h,
+        match: mismatchCount === 0,
+        mismatchCount,
+        ...(firstX >= 0 ? { firstX, firstY, gotRGBA, wantRGBA } : {}),
+      };
     };
   }
 
@@ -411,4 +472,18 @@ export function initDiagnostics({
   }
 
   return { stats, recordResize, recordTile, recordRafTick, recordFramePainted };
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// Inline base64 → Uint8Array decoder used by __compareFullFrame. Kept module-
+// local so the production bundle doesn't pull in an extra dep just for the
+// e2e comparator path.
+function base64ToUint8Array(b64: string): Uint8Array {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
 }

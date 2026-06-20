@@ -49,8 +49,47 @@ interface Window {
     ok: boolean;
     mismatches: Array<{ x: number; y: number; got: number[]; want: number[] }>;
   }>;
-  /** Full-framebuffer GPU readback. rgba length is width*height*4 (no row padding). */
-  __readFullFrame(): Promise<{ width: number; height: number; rgba: number[] }>;
+  /**
+   * Reset any pending expected-frame chunks and clear the cached buffer.
+   * Call before kicking off a new __appendExpectedFrameChunk sequence.
+   */
+  __resetExpectedFrame(): void;
+  /**
+   * Append one base64 chunk of the expected RGBA buffer. Multi-MB
+   * buffers must be chunked because Chromium / CDP stalls on very large
+   * eval expressions. Returns the running chunk count.
+   */
+  __appendExpectedFrameChunk(chunkB64: string): { chunks: number };
+  /**
+   * Concatenate the appended chunks, base64-decode, and swap the result
+   * in as the comparator's expected buffer. Returns the decoded length
+   * for sanity-checking against width*height*4.
+   */
+  __finalizeExpectedFrame(): { length: number };
+  /**
+   * Seed the expected RGBA buffer used by __compareFullFrame in a single
+   * shot. Only safe for small buffers — prefer the chunked
+   * __append / __finalize path for full-frame buffers.
+   */
+  __setExpectedFrame(expectedB64: string): { length: number };
+  /**
+   * Compare the live framebuffer to the buffer previously seeded via
+   * __setExpectedFrame. Returns a small summary suitable for
+   * high-frequency polling; the framebuffer bytes never cross CDP. The
+   * failure-path PNG artifact is captured Playwright-style via CDP
+   * Page.captureScreenshot.
+   */
+  __compareFullFrame(): Promise<{
+    ready: boolean;
+    width: number;
+    height: number;
+    match: boolean;
+    mismatchCount: number;
+    firstX?: number;
+    firstY?: number;
+    gotRGBA?: [number, number, number, number];
+    wantRGBA?: [number, number, number, number];
+  }>;
 
   // ----- cdf53 coverage map (populated by main.ts datagram loop) -------------
   /** Per-tile pass-coverage Map keyed by (tileX<<8 | tileY). */

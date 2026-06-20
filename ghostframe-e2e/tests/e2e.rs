@@ -4026,55 +4026,89 @@ async fn e2e_lossless_golden_png() -> Result<()> {
         width, height, b_left, b_right
     );
 
+    // Seed the expected RGBA buffer into the page in small chunks. A
+    // single eval expression carrying the full multi-MB base64 string
+    // (~4.2 MB for 1024x768) stalls Chromium's CDP request handling
+    // hard enough to hit chromiumoxide's 30 s request timeout —
+    // confirmed empirically on this branch. Chunking to ~192 KB
+    // (base64) per call keeps each CDP request snappy.
+    use base64::Engine;
+    let expected_b64 = base64::engine::general_purpose::STANDARD.encode(&expected);
+    // 196_608 chars of base64 → 147_456 bytes per chunk; well under
+    // any plausible CDP request-size threshold.
+    const CHUNK_SIZE: usize = 196_608;
+    setup
+        .page()
+        .evaluate("window.__resetExpectedFrame()")
+        .await?;
+    let mut chunk_count = 0u32;
+    for chunk in expected_b64.as_bytes().chunks(CHUNK_SIZE) {
+        let s = std::str::from_utf8(chunk)
+            .expect("base64 is ASCII; chunk boundaries can't split a code point");
+        setup
+            .page()
+            .evaluate(format!("window.__appendExpectedFrameChunk({:?})", s))
+            .await?;
+        chunk_count += 1;
+    }
+    let seed_result: serde_json::Value = setup
+        .page()
+        .evaluate("window.__finalizeExpectedFrame()")
+        .await?
+        .into_value()?;
+    let seeded_len = seed_result["length"].as_u64().unwrap_or(0);
+    assert_eq!(
+        seeded_len as usize,
+        expected.len(),
+        "e2e_lossless_golden_png: __finalizeExpectedFrame returned length \
+         {seeded_len} after {chunk_count} chunks, expected {}",
+        expected.len()
+    );
+
     // 30 s convergence deadline. Polled every 250 ms.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    // (x, y, got_rgba, expected_rgba, bytes_checked, bytes_mismatched, iter)
-    let mut last_mismatch: Option<(u32, u32, [u8; 4], [u8; 4], u64, u64, u64)> = None;
-    let mut last_full_rgba: Vec<u8> = Vec::new();
+    let mut last_summary: serde_json::Value = serde_json::json!({});
     let mut iters = 0u32;
     loop {
         iters += 1;
         if std::time::Instant::now() > deadline {
-            // Dump artifacts and fail.
+            // FAILURE PATH. The hot loop verdict was driven by the
+            // JS-side __compareFullFrame() so `last_summary` already
+            // carries firstX/firstY/gotRGBA/wantRGBA for triage. For
+            // the visual artifact we Playwright-style screenshot the
+            // canvas via CDP Page.captureScreenshot — the PNG travels
+            // as native binary in the CDP response, never as a multi-
+            // megabyte JSON number[] (which is what was timing the WS
+            // request out at 4 Hz when we polled __readFullFrame).
             let cdf53_cov: serde_json::Value = setup
                 .page()
                 .evaluate("window.__getCdf53Coverage()")
                 .await?
                 .into_value()?;
+
             let artifacts_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("target")
                 .join("e2e-artifacts");
             let _ = std::fs::create_dir_all(&artifacts_dir);
 
-            // Diff: red where pixel mismatches, transparent on matches.
-            // The alpha byte stored by the server is 0x00, so the
-            // expected.png + got.png look identical to a human eye
-            // under canvas alphaMode='opaque', but the byte compare is
-            // still strict.
-            let mut diff_buf = vec![0u8; (width * height * 4) as usize];
-            if last_full_rgba.len() == expected.len() {
-                for off in (0..expected.len()).step_by(4) {
-                    let got = &last_full_rgba[off..off + 4];
-                    let want = &expected[off..off + 4];
-                    if got != want {
-                        diff_buf[off] = 0xFF;
-                        diff_buf[off + 3] = 0xFF;
-                    }
-                }
-            }
-
             let got_path = artifacts_dir.join("e2e_lossless_golden_png_got.png");
             let expected_path = artifacts_dir.join("e2e_lossless_golden_png_expected.png");
-            let diff_path = artifacts_dir.join("e2e_lossless_golden_png_diff.png");
-            if last_full_rgba.len() == expected.len() {
-                let _ = image::save_buffer(
+
+            let screenshot_status = match setup
+                .page()
+                .save_screenshot(
+                    chromiumoxide::page::ScreenshotParams::builder()
+                        .format(
+                            chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat::Png,
+                        )
+                        .build(),
                     &got_path,
-                    &last_full_rgba,
-                    width,
-                    height,
-                    image::ColorType::Rgba8,
-                );
-            }
+                )
+                .await
+            {
+                Ok(_) => format!("got.png saved via CDP screenshot ({got_path:?})"),
+                Err(e) => format!("CDP screenshot failed: {e}"),
+            };
             let _ = image::save_buffer(
                 &expected_path,
                 &expected,
@@ -4082,81 +4116,33 @@ async fn e2e_lossless_golden_png() -> Result<()> {
                 height,
                 image::ColorType::Rgba8,
             );
-            let _ = image::save_buffer(
-                &diff_path,
-                &diff_buf,
-                width,
-                height,
-                image::ColorType::Rgba8,
-            );
 
             return Err(anyhow!(
                 "e2e_lossless_golden_png: did not converge within 30 s after {iters} polls. \
-                 last mismatch: {last_mismatch:?}. cdf53 coverage = {cdf53_cov}. \
-                 Artifacts: {got_path:?}, {expected_path:?}, {diff_path:?}"
+                 last summary: {last_summary}. cdf53 coverage = {cdf53_cov}. \
+                 {screenshot_status}. expected: {expected_path:?}"
             ));
         }
 
-        // Read the full framebuffer once per poll iteration.
-        let frame: serde_json::Value = setup
+        // Single CDP round-trip per poll. The JS-side comparator walks
+        // every pixel and ships back only a summary (a few hundred
+        // bytes), so we avoid the multi-megabyte JSON serialization
+        // that blew the WS request timeout when polling __readFullFrame
+        // at 4 Hz. The expected buffer was seeded once before the loop
+        // via __setExpectedFrame.
+        let summary: serde_json::Value = setup
             .page()
-            .evaluate("window.__readFullFrame()")
+            .evaluate("window.__compareFullFrame()")
             .await?
             .into_value()?;
-        let fb_w = frame["width"].as_u64().unwrap_or(0) as u32;
-        let fb_h = frame["height"].as_u64().unwrap_or(0) as u32;
-        if fb_w != width || fb_h != height {
-            // Renderer not ready yet — keep polling.
+        if !summary["ready"].as_bool().unwrap_or(false) {
+            // Renderer not yet sized to the test pattern; keep polling.
+            last_summary = summary;
             tokio::time::sleep(Duration::from_millis(250)).await;
             continue;
         }
-        let rgba_arr = frame["rgba"]
-            .as_array()
-            .ok_or_else(|| anyhow!("rgba field missing"))?;
-        if rgba_arr.len() != (fb_w * fb_h * 4) as usize {
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            continue;
-        }
-        let rgba: Vec<u8> = rgba_arr
-            .iter()
-            .map(|v| v.as_u64().unwrap_or(0) as u8)
-            .collect();
-        last_full_rgba = rgba.clone();
-
-        // Walk every pixel of the whole frame and find the first
-        // mismatch (if any). All ~2 040 tiles matter for pass/fail.
-        let mut mismatch: Option<(u32, u32, [u8; 4], [u8; 4])> = None;
-        let mut total_bytes_mismatched: u64 = 0;
-        let total_bytes_checked: u64 = expected.len() as u64;
-        for y in 0..fb_h {
-            for x in 0..fb_w {
-                let off = ((y * fb_w + x) * 4) as usize;
-                let got_pix = [rgba[off], rgba[off + 1], rgba[off + 2], rgba[off + 3]];
-                let want_pix = [
-                    expected[off],
-                    expected[off + 1],
-                    expected[off + 2],
-                    expected[off + 3],
-                ];
-                if got_pix != want_pix {
-                    total_bytes_mismatched += 4;
-                    if mismatch.is_none() {
-                        mismatch = Some((x, y, got_pix, want_pix));
-                    }
-                }
-            }
-        }
-
-        if let Some((x, y, got, want)) = mismatch {
-            last_mismatch = Some((
-                x,
-                y,
-                got,
-                want,
-                total_bytes_checked,
-                total_bytes_mismatched,
-                iters as u64,
-            ));
+        last_summary = summary.clone();
+        if !summary["match"].as_bool().unwrap_or(false) {
             tokio::time::sleep(Duration::from_millis(250)).await;
             continue;
         }
