@@ -3962,39 +3962,37 @@ async fn e2e_input_forwarding_firefox() -> Result<()> {
     setup.browser.close().await
 }
 
-/// Strict pixel-perfect lossless convergence test.
+/// Strict whole-frame pixel-perfect lossless convergence test.
 ///
 /// Closes a gap the existing e2e suite misses: every other pixel test
 /// runs with the classifier's H.264 forced-start active at session
 /// entry, so any cdf53 tile-pass lost on the wire is masked by H.264's
 /// independent FEC + parity + NACK path. This test sets
 /// `GHOSTFRAME_FORCE_TILECODEC=1` to bypass the H.264 force, then polls
-/// the full framebuffer until the four `--solid-per-tile` corner tiles
-/// match their expected RGBA exactly across every pixel of every corner
-/// tile (not just one sample point per corner).
+/// the full framebuffer until **every** pixel matches the static
+/// `--lossless-golden` test-pattern source bytes, generated server- and
+/// client-side from the same `lossless_golden::frame_rgba()` function.
 ///
-/// Convergence policy is strict: the test fails after 30 s with
-/// `got.png` + `expected.png` + `diff.png` in `target/e2e-artifacts/`
-/// if any byte in the four 32×32 corner regions ever fails to match. The
-/// central 64×64 motion region is excluded from the compare (it cycles
-/// every 16 ms by design so any single readback would race the next
-/// repaint). The background bytes outside the corners + motion region
-/// are also excluded — they're painted once by the test-pattern but the
-/// classifier may pick Solid or Cdf53 for those tiles depending on
-/// timing, and unique-color = 1 will dominate so they're not the
-/// regression target.
+/// Convergence policy is strict whole-frame: the test fails after 30 s
+/// with `got.png` + `expected.png` + `diff.png` in `target/e2e-artifacts/`
+/// if any byte fails to match anywhere in the frame. The pattern is
+/// fully static — there is no motion region to exclude.
 ///
-/// Regression target: the cdf53 first-paint burst on the corner tiles.
-/// Under wire loss (real or LRU-evicted-before-retry), the corner pixels
-/// will diverge from the expected solid colour. With M3.3d datagram-
-/// level ACK + the M3.5 ReliableTileEmitter feature/branch, every lost
+/// Regression target: the cdf53 first-paint burst on the right third of
+/// the frame (>16 unique colors per tile → classifier picks Cdf53). Also
+/// catches PalRle (middle third) and Solid (left third) first-paint loss.
+/// Under wire loss (real or LRU-evicted-before-retry), the affected
+/// pixels diverge from the expected colour. With M3.3d datagram-level
+/// ACK + the M3.5 ReliableTileEmitter feature/branch, every lost
 /// tile-pass should be retried until acknowledged.
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_lossless_golden_png() -> Result<()> {
-    use ghostframe_test_pattern::solid_per_tile::{samples, CORNER_SIZE};
+    use ghostframe_test_pattern::lossless_golden::{
+        frame_rgba, region_boundary_palrle_cdf53, region_boundary_solid_palrle,
+    };
 
     let setup = setup_e2e_webgpu_gpu_with_env(
-        "--solid-per-tile --drm-direct",
+        "--lossless-golden --drm-direct",
         &[("GHOSTFRAME_FORCE_TILECODEC", "1")],
     )
     .await?;
@@ -4010,32 +4008,27 @@ async fn e2e_lossless_golden_png() -> Result<()> {
     let (width, height) = dims;
     assert!(
         width >= 128 && height >= 128,
-        "canvas too small for corner-tile compare: {}x{}",
+        "canvas too small for whole-frame compare: {}x{}",
         width,
         height
     );
 
-    // Expected RGBA per corner. Stored as a single-pixel value that the
-    // entire 32×32 corner tile must read back as.
-    let corners = samples(width, height);
+    // Generate the canonical expected frame from the same pure function
+    // the test-pattern server painted from. Byte-byte identical by
+    // construction.
+    let expected: Vec<u8> = frame_rgba(width, height);
+    assert_eq!(expected.len(), (width * height * 4) as usize);
 
-    // Compute corner-tile rectangle [(x0, y0, w, h, expected_rgba), …].
-    // samples() centres the read at (16, 16) inside each corner so the
-    // tile origin is `sample_x − 16` / `sample_y − 16` aligned to the
-    // 32-aligned grid the test-pattern paints into.
-    let corner_rects: Vec<(u32, u32, u32, u32, [u8; 4])> = corners
-        .iter()
-        .map(|s| {
-            let x0 = s.x.saturating_sub(16);
-            let y0 = s.y.saturating_sub(16);
-            let w = CORNER_SIZE.min(width.saturating_sub(x0));
-            let h = CORNER_SIZE.min(height.saturating_sub(y0));
-            (x0, y0, w, h, s.expected_rgba)
-        })
-        .collect();
+    let b_left = region_boundary_solid_palrle(width);
+    let b_right = region_boundary_palrle_cdf53(width);
+    eprintln!(
+        "e2e_lossless_golden_png: canvas {}x{}, regions Solid<{}<PalRle<{}<Cdf53",
+        width, height, b_left, b_right
+    );
 
     // 30 s convergence deadline. Polled every 250 ms.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    // (x, y, got_rgba, expected_rgba, bytes_checked, bytes_mismatched, iter)
     let mut last_mismatch: Option<(u32, u32, [u8; 4], [u8; 4], u64, u64, u64)> = None;
     let mut last_full_rgba: Vec<u8> = Vec::new();
     let mut iters = 0u32;
@@ -4053,38 +4046,19 @@ async fn e2e_lossless_golden_png() -> Result<()> {
                 .join("e2e-artifacts");
             let _ = std::fs::create_dir_all(&artifacts_dir);
 
-            // Build expected image: corners = expected colour, everything
-            // else = transparent so the diff visualisation is clear.
-            let mut expected_buf = vec![0u8; (width * height * 4) as usize];
-            for (x0, y0, w, h, rgba) in &corner_rects {
-                for yy in 0..*h {
-                    for xx in 0..*w {
-                        let px = (x0 + xx) as usize;
-                        let py = (y0 + yy) as usize;
-                        let off = (py * width as usize + px) * 4;
-                        expected_buf[off] = rgba[0];
-                        expected_buf[off + 1] = rgba[1];
-                        expected_buf[off + 2] = rgba[2];
-                        expected_buf[off + 3] = rgba[3];
-                    }
-                }
-            }
-            // Build diff: red where corner-pixel mismatches, transparent
-            // outside corners + on matches.
+            // Diff: red where pixel mismatches, transparent on matches.
+            // The alpha byte stored by the server is 0x00, so the
+            // expected.png + got.png look identical to a human eye
+            // under canvas alphaMode='opaque', but the byte compare is
+            // still strict.
             let mut diff_buf = vec![0u8; (width * height * 4) as usize];
-            if !last_full_rgba.is_empty() && last_full_rgba.len() == expected_buf.len() {
-                for (x0, y0, w, h, rgba) in &corner_rects {
-                    for yy in 0..*h {
-                        for xx in 0..*w {
-                            let px = (x0 + xx) as usize;
-                            let py = (y0 + yy) as usize;
-                            let off = (py * width as usize + px) * 4;
-                            let got = &last_full_rgba[off..off + 4];
-                            if got != rgba {
-                                diff_buf[off] = 0xFF;
-                                diff_buf[off + 3] = 0xFF;
-                            }
-                        }
+            if last_full_rgba.len() == expected.len() {
+                for off in (0..expected.len()).step_by(4) {
+                    let got = &last_full_rgba[off..off + 4];
+                    let want = &expected[off..off + 4];
+                    if got != want {
+                        diff_buf[off] = 0xFF;
+                        diff_buf[off + 3] = 0xFF;
                     }
                 }
             }
@@ -4092,7 +4066,7 @@ async fn e2e_lossless_golden_png() -> Result<()> {
             let got_path = artifacts_dir.join("e2e_lossless_golden_png_got.png");
             let expected_path = artifacts_dir.join("e2e_lossless_golden_png_expected.png");
             let diff_path = artifacts_dir.join("e2e_lossless_golden_png_diff.png");
-            if !last_full_rgba.is_empty() && last_full_rgba.len() == expected_buf.len() {
+            if last_full_rgba.len() == expected.len() {
                 let _ = image::save_buffer(
                     &got_path,
                     &last_full_rgba,
@@ -4103,7 +4077,7 @@ async fn e2e_lossless_golden_png() -> Result<()> {
             }
             let _ = image::save_buffer(
                 &expected_path,
-                &expected_buf,
+                &expected,
                 width,
                 height,
                 image::ColorType::Rgba8,
@@ -4136,7 +4110,9 @@ async fn e2e_lossless_golden_png() -> Result<()> {
             tokio::time::sleep(Duration::from_millis(250)).await;
             continue;
         }
-        let rgba_arr = frame["rgba"].as_array().ok_or_else(|| anyhow!("rgba field missing"))?;
+        let rgba_arr = frame["rgba"]
+            .as_array()
+            .ok_or_else(|| anyhow!("rgba field missing"))?;
         if rgba_arr.len() != (fb_w * fb_h * 4) as usize {
             tokio::time::sleep(Duration::from_millis(250)).await;
             continue;
@@ -4147,29 +4123,31 @@ async fn e2e_lossless_golden_png() -> Result<()> {
             .collect();
         last_full_rgba = rgba.clone();
 
-        // Walk every byte of every corner tile and find the first mismatch.
-        let mut mismatch: Option<(u32, u32, [u8; 4], [u8; 4], u64, u64, u64)> = None;
-        let mut total_bytes_checked: u64 = 0;
+        // Walk every pixel of the whole frame and find the first
+        // mismatch (if any). All ~2 040 tiles matter for pass/fail.
+        let mut mismatch: Option<(u32, u32, [u8; 4], [u8; 4])> = None;
         let mut total_bytes_mismatched: u64 = 0;
-        for (x0, y0, w, h, expected_rgba) in &corner_rects {
-            for yy in 0..*h {
-                for xx in 0..*w {
-                    let px = x0 + xx;
-                    let py = y0 + yy;
-                    let off = ((py * fb_w + px) * 4) as usize;
-                    let got_pix = [rgba[off], rgba[off + 1], rgba[off + 2], rgba[off + 3]];
-                    total_bytes_checked += 4;
-                    if got_pix != *expected_rgba {
-                        total_bytes_mismatched += 4;
-                        if mismatch.is_none() {
-                            mismatch = Some((px, py, got_pix, *expected_rgba, 0, 0, 0));
-                        }
+        let total_bytes_checked: u64 = expected.len() as u64;
+        for y in 0..fb_h {
+            for x in 0..fb_w {
+                let off = ((y * fb_w + x) * 4) as usize;
+                let got_pix = [rgba[off], rgba[off + 1], rgba[off + 2], rgba[off + 3]];
+                let want_pix = [
+                    expected[off],
+                    expected[off + 1],
+                    expected[off + 2],
+                    expected[off + 3],
+                ];
+                if got_pix != want_pix {
+                    total_bytes_mismatched += 4;
+                    if mismatch.is_none() {
+                        mismatch = Some((x, y, got_pix, want_pix));
                     }
                 }
             }
         }
 
-        if let Some((x, y, got, want, _, _, _)) = mismatch {
+        if let Some((x, y, got, want)) = mismatch {
             last_mismatch = Some((
                 x,
                 y,
@@ -4183,12 +4161,13 @@ async fn e2e_lossless_golden_png() -> Result<()> {
             continue;
         }
 
-        // Match across all corner bytes. Belt-and-suspenders: verify the
-        // cdf53 path actually ran (refined > 0). If the classifier override
-        // failed to apply, the corners would still match (Solid pixels are
-        // trivial) but `__getCdf53Coverage()` would return all zeros — and
-        // we'd have validated nothing about the lossless tile path. The
-        // assert catches that regression.
+        // Whole-frame match. Belt-and-suspenders: verify the cdf53
+        // path actually ran (refined + partial + total > 0). If the
+        // classifier override failed to apply, the right third would
+        // come through via H.264 instead and `__getCdf53Coverage()`
+        // would return all zeros — and we'd have validated nothing
+        // about the lossless cdf53 path. The assert catches that
+        // regression.
         let cdf53_cov: serde_json::Value = setup
             .page()
             .evaluate("window.__getCdf53Coverage()")
@@ -4199,11 +4178,11 @@ async fn e2e_lossless_golden_png() -> Result<()> {
         let total = cdf53_cov["total"].as_u64().unwrap_or(0);
         assert!(
             refined + partial + total > 0,
-            "e2e_lossless_golden_png: corners matched but cdf53 coverage is 0 \
+            "e2e_lossless_golden_png: whole frame matched but cdf53 coverage is 0 \
              (refined={refined}, partial={partial}, total={total}) — \
              GHOSTFRAME_FORCE_TILECODEC=1 may not have taken effect, so the \
-             test validated only the Solid path and the lossless cdf53 \
-             regression target was not exercised."
+             test validated only the Solid/PalRle paths and the lossless \
+             cdf53 regression target was not exercised."
         );
 
         eprintln!(
