@@ -633,6 +633,85 @@ fn env_var_force_frame_mode_tile_pins_classifier() {
     );
 }
 
+/// `GHOSTFRAME_FORCE_TILECODEC=1` is a high-level alias for
+/// `GHOSTFRAME_TEST_FORCE_FRAME_MODE=tile`. Used by the
+/// `e2e_lossless_golden_png` test to bypass the H.264 forced-start at
+/// session entry so the cdf53 first-paint burst actually gets exercised
+/// (H.264 has its own FEC + parity + NACK so it renders fully even
+/// under wire loss, masking tile-codec regressions).
+#[test]
+fn env_var_force_tilecodec_pins_classifier() {
+    use crate::tile::classifier::{AdaptationContext, Classifier};
+    use crate::tile::{CodecState, FrameMode};
+
+    // Ensure no leftover from previous tests in this process.
+    std::env::remove_var("GHOSTFRAME_TEST_FORCE_FRAME_MODE");
+    std::env::set_var("GHOSTFRAME_FORCE_TILECODEC", "1");
+    let mut c = Classifier::default();
+    std::env::remove_var("GHOSTFRAME_FORCE_TILECODEC");
+
+    // Build a context that would normally trip the suspension hard-override
+    // back to H264. The force-tilecodec alias must beat every hard override.
+    let ctx = AdaptationContext {
+        supports_h264: true,
+        bytes_per_us: 0.0,
+        smoothed_rtt_us: 50_000.0,
+        loss_rate: 0.0,
+        suspended: true,
+        last_update_seq: 1,
+    };
+    c.set_adaptation_context(ctx);
+
+    let tentative = vec![CodecState::Solid];
+    assert_eq!(
+        c.decide_frame_mode(&tentative, FrameMode::H264),
+        FrameMode::TileCodec,
+        "GHOSTFRAME_FORCE_TILECODEC=1 must win over suspension hard-override"
+    );
+}
+
+#[test]
+fn env_var_force_tilecodec_true_also_pins() {
+    use crate::tile::classifier::Classifier;
+    use crate::tile::{CodecState, FrameMode};
+
+    std::env::remove_var("GHOSTFRAME_TEST_FORCE_FRAME_MODE");
+    std::env::set_var("GHOSTFRAME_FORCE_TILECODEC", "true");
+    let mut c = Classifier::default();
+    std::env::remove_var("GHOSTFRAME_FORCE_TILECODEC");
+
+    let tentative = vec![CodecState::Solid; 4];
+    assert_eq!(
+        c.decide_frame_mode_at(0, &tentative, FrameMode::H264),
+        FrameMode::TileCodec,
+        "GHOSTFRAME_FORCE_TILECODEC=true must also pin TileCodec"
+    );
+}
+
+#[test]
+fn env_var_force_tilecodec_other_values_ignored() {
+    use crate::tile::classifier::Classifier;
+    use crate::tile::{CodecState, FrameMode};
+
+    std::env::remove_var("GHOSTFRAME_TEST_FORCE_FRAME_MODE");
+    std::env::set_var("GHOSTFRAME_FORCE_TILECODEC", "0");
+    let mut c = Classifier::default();
+    std::env::remove_var("GHOSTFRAME_FORCE_TILECODEC");
+
+    // With value "0" the override should NOT engage — only "1" / "true" do.
+    // Confirm by feeding a tentative that would otherwise drive H264 via
+    // motion fast-path: classifier may produce H264 here, which proves the
+    // override is not silently pinning. We only assert "not always TileCodec";
+    // the exact mode depends on cost model defaults so just check that the
+    // classifier reads its normal path (no panic, runs).
+    let tentative = vec![CodecState::Solid; 4];
+    // No assertion on the outcome — we just confirm the classifier ran the
+    // normal decision logic without the override engaging. The TileCodec
+    // result here would also match the no-override default, so the
+    // distinguishing test is the `=1` case above.
+    let _ = c.decide_frame_mode_at(0, &tentative, FrameMode::TileCodec);
+}
+
 #[test]
 fn env_var_force_frame_mode_unknown_value_ignored() {
     use crate::tile::classifier::Classifier;

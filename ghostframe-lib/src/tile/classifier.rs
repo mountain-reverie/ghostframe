@@ -388,13 +388,25 @@ impl Default for Classifier {
                 .ok()
                 .and_then(|s| s.parse::<f32>().ok())
                 .filter(|v| *v > 0.0),
+            // `GHOSTFRAME_FORCE_TILECODEC=1`/`true` is a high-level alias
+            // for `GHOSTFRAME_TEST_FORCE_FRAME_MODE=tile`. Used by the
+            // `e2e_lossless_golden_png` test to bypass the H.264 forced-
+            // start at session entry so the cdf53 first-paint burst gets
+            // exercised (H.264 has its own FEC + parity + NACK and renders
+            // fully even under wire loss, masking tile-codec regressions).
             #[cfg(any(test, feature = "test-loss-injection"))]
-            force_frame_mode_override: std::env::var("GHOSTFRAME_TEST_FORCE_FRAME_MODE")
+            force_frame_mode_override: std::env::var("GHOSTFRAME_FORCE_TILECODEC")
                 .ok()
-                .and_then(|s| match s.as_str() {
-                    "h264" | "H264" => Some(FrameMode::H264),
-                    "tile" | "TileCodec" | "tilecodec" => Some(FrameMode::TileCodec),
-                    _ => None,
+                .filter(|s| s == "1" || s == "true")
+                .map(|_| FrameMode::TileCodec)
+                .or_else(|| {
+                    std::env::var("GHOSTFRAME_TEST_FORCE_FRAME_MODE")
+                        .ok()
+                        .and_then(|s| match s.as_str() {
+                            "h264" | "H264" => Some(FrameMode::H264),
+                            "tile" | "TileCodec" | "tilecodec" => Some(FrameMode::TileCodec),
+                            _ => None,
+                        })
                 }),
             last_emitted_mode: None,
             epoch: std::time::Instant::now(),
