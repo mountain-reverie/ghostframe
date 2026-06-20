@@ -49,4 +49,12 @@ interface Window {
     ok: boolean;
     mismatches: Array<{ x: number; y: number; got: number[]; want: number[] }>;
   }>;
+  /** Full-framebuffer GPU readback. rgba length is width*height*4 (no row padding). */
+  __readFullFrame(): Promise<{ width: number; height: number; rgba: number[] }>;
+
+  // ----- cdf53 coverage map (populated by main.ts datagram loop) -------------
+  /** Per-tile pass-coverage Map keyed by (tileX<<8 | tileY). */
+  __cdf53Coverage: Map<number, { generation: number; passMask: number }> | undefined;
+  /** Coverage counts derived from __cdf53Coverage. */
+  __getCdf53Coverage(): { refined: number; partial: number; total: number };
 }

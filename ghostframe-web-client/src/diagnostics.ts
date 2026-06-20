@@ -196,6 +196,94 @@ export function initDiagnostics({
     };
   }
 
+  // ---- __readFullFrame -----------------------------------------------------
+  // Whole-framebuffer GPU readback for pixel-perfect lossless validation in
+  // the e2e suite. Returns {width, height, rgba} where rgba is a
+  // width*height*4 byte array with row padding stripped. Mirrors
+  // __readPixelRect's bytesPerRow=Math.ceil(w*4/256)*256 staging-buffer
+  // pattern but always reads the entire texture and returns a typed
+  // Uint8Array (cheaper to ship across CDP than a plain number[]).
+  //
+  // Used by e2e_lossless_golden_png to poll the framebuffer until every
+  // sample byte matches the test-pattern source, dumping a diff PNG on
+  // 30 s timeout.
+  if (typeof window !== 'undefined') {
+    window.__readFullFrame = async (): Promise<{
+      width: number;
+      height: number;
+      rgba: number[];
+    }> => {
+      const ref = getRenderer();
+      if (!ref) {
+        return { width: 0, height: 0, rgba: [] };
+      }
+      const { device, texture } = ref;
+      const w = texture.width;
+      const h = texture.height;
+      if (w === 0 || h === 0) {
+        return { width: w, height: h, rgba: [] };
+      }
+      // WebGPU requires bytesPerRow to be a multiple of 256.
+      const bytesPerRow = Math.ceil(w * 4 / 256) * 256;
+      const staging = device.createBuffer({
+        size: bytesPerRow * h,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      });
+      const enc = device.createCommandEncoder();
+      enc.copyTextureToBuffer(
+        { texture, origin: { x: 0, y: 0 } },
+        { buffer: staging, bytesPerRow },
+        [w, h],
+      );
+      device.queue.submit([enc.finish()]);
+      await staging.mapAsync(GPUMapMode.READ);
+      const raw = new Uint8Array(staging.getMappedRange());
+      // Strip row padding so the result is exactly w*h*4 bytes.
+      const rowBytes = w * 4;
+      const result: number[] = new Array(rowBytes * h);
+      for (let row = 0; row < h; row++) {
+        const srcOff = row * bytesPerRow;
+        const dstOff = row * rowBytes;
+        for (let col = 0; col < rowBytes; col++) {
+          result[dstOff + col] = raw[srcOff + col];
+        }
+      }
+      staging.unmap();
+      staging.destroy();
+      return { width: w, height: h, rgba: result };
+    };
+  }
+
+  // ---- __getCdf53Coverage --------------------------------------------------
+  // Read coverage counts from the same `__cdf53Coverage` Map used by the
+  // periodic stats log. Returns:
+  //   refined  — tiles where all 14 cdf53 passes (passMask == 0x3FFF) have
+  //              been received for the current generation.
+  //   partial  — tiles with 1..13 passes seen (some but not all).
+  //   total    — Map size (every tile that has ever received a cdf53 pass).
+  //
+  // Used by the lossless test as a fast "did the cdf53 path even fire?"
+  // sanity check before the slower full-framebuffer compare.
+  if (typeof window !== 'undefined') {
+    window.__getCdf53Coverage = (): {
+      refined: number;
+      partial: number;
+      total: number;
+    } => {
+      const cov = window.__cdf53Coverage;
+      if (!cov) return { refined: 0, partial: 0, total: 0 };
+      const FULL_MASK = (1 << 14) - 1;
+      let refined = 0;
+      let partial = 0;
+      for (const v of cov.values()) {
+        const mask = v.passMask & FULL_MASK;
+        if (mask === FULL_MASK) refined++;
+        else if (mask !== 0) partial++;
+      }
+      return { refined, partial, total: cov.size };
+    };
+  }
+
   // ---- __readGradientGolden ------------------------------------------------
   // Debug-only: dispatch a compute pipeline that writes a known gradient
   // (r=x&255, g=y&255, b=0, a=255) to the framebuffer, then read back via
