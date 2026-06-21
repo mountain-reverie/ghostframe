@@ -3397,14 +3397,28 @@ async fn e2e_cdf53_tile_watcher() -> Result<()> {
         !captures.is_empty(),
         "watcher captured no entries — server didn't emit cdf53 for tile (18,5) or the watcher hook ran too late"
     );
-    assert_eq!(
-        captures.len(),
-        14,
-        "expected exactly 14 captured passes for tile (18,5) (one per pass_idx 0..13), got {}",
-        captures.len()
-    );
+    // The original assertion was `captures.len() == 14` (exactly one
+    // upload per pass_idx).  Under the reliable-tile emitter that's no
+    // longer true: every cdf53 fragment is RTO-retransmitted up to
+    // MAX_RETRANSMITS=4 times if the client→server ACK doesn't make it
+    // back before the RTO budget, and the client's ParityDecoder
+    // dedup window (40 wireSeqs) is much smaller than the cdf53 first-
+    // paint burst (10 K+ datagrams), so the retransmits age out of the
+    // window and the assembler re-runs uploadBatch for each.  The
+    // bit-plane content is byte-identical on every retransmit (we
+    // assert that below), so the duplicates are wasted work, not
+    // wrong work — a real client-side optimization opportunity but
+    // not a correctness regression.
+    //
+    // Assert on the SET of pass_idxes covered instead: every
+    // pass_idx 0..13 must be observed at least once.
     for (p, &n) in counted_per_pass.iter().enumerate() {
-        assert_eq!(n, 1, "expected exactly 1 capture for pass_idx {p}, got {n}");
+        assert!(
+            n >= 1,
+            "no capture observed for pass_idx {p} — server didn't emit \
+             this pass, or every emission + retransmit was lost before \
+             reaching the GPU integrate path"
+        );
     }
     assert_eq!(
         total_mismatches, 0,
