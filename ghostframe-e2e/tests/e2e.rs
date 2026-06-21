@@ -4026,44 +4026,18 @@ async fn e2e_lossless_golden_png() -> Result<()> {
         width, height, b_left, b_right
     );
 
-    // Seed the expected RGBA buffer into the page in small chunks. A
-    // single eval expression carrying the full multi-MB base64 string
-    // (~4.2 MB for 1024x768) stalls Chromium's CDP request handling
-    // hard enough to hit chromiumoxide's 30 s request timeout —
-    // confirmed empirically on this branch. Chunking to ~192 KB
-    // (base64) per call keeps each CDP request snappy.
-    use base64::Engine;
-    let expected_b64 = base64::engine::general_purpose::STANDARD.encode(&expected);
-    // 196_608 chars of base64 → 147_456 bytes per chunk; well under
-    // any plausible CDP request-size threshold.
-    const CHUNK_SIZE: usize = 196_608;
-    setup
-        .page()
-        .evaluate("window.__resetExpectedFrame()")
-        .await?;
-    let mut chunk_count = 0u32;
-    for chunk in expected_b64.as_bytes().chunks(CHUNK_SIZE) {
-        let s = std::str::from_utf8(chunk)
-            .expect("base64 is ASCII; chunk boundaries can't split a code point");
-        setup
-            .page()
-            .evaluate(format!("window.__appendExpectedFrameChunk({:?})", s))
-            .await?;
-        chunk_count += 1;
-    }
-    let seed_result: serde_json::Value = setup
-        .page()
-        .evaluate("window.__finalizeExpectedFrame()")
-        .await?
-        .into_value()?;
-    let seeded_len = seed_result["length"].as_u64().unwrap_or(0);
-    assert_eq!(
-        seeded_len as usize,
-        expected.len(),
-        "e2e_lossless_golden_png: __finalizeExpectedFrame returned length \
-         {seeded_len} after {chunk_count} chunks, expected {}",
-        expected.len()
-    );
+    // No expected-buffer transfer: the web client computes its own
+    // canonical expected RGBA via lossless_golden.ts (a TS port of the
+    // same deterministic function the test-pattern server paints
+    // from). Shipping the multi-MB buffer either way over CDP — single
+    // eval or chunked — stalled CDP under the live datagram-paint
+    // load: the JS main thread couldn't drain CDP requests fast enough
+    // and even trivial evaluate() calls hit chromiumoxide's 30 s
+    // request budget.
+    //
+    // `expected` stays on the Rust side as an independent oracle for
+    // the failure-path expected.png artifact, so the JS port is held
+    // honest by anyone diffing the saved artifacts.
 
     // 30 s convergence deadline. Polled every 250 ms.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -4124,15 +4098,14 @@ async fn e2e_lossless_golden_png() -> Result<()> {
             ));
         }
 
-        // Single CDP round-trip per poll. The JS-side comparator walks
+        // Single CDP round-trip per poll. The web client computes the
+        // expected buffer itself (lossless_golden.ts mirrors
+        // ghostframe-test-pattern's frame_rgba); the comparator walks
         // every pixel and ships back only a summary (a few hundred
-        // bytes), so we avoid the multi-megabyte JSON serialization
-        // that blew the WS request timeout when polling __readFullFrame
-        // at 4 Hz. The expected buffer was seeded once before the loop
-        // via __setExpectedFrame.
+        // bytes). No expected-buffer transfer is needed.
         let summary: serde_json::Value = setup
             .page()
-            .evaluate("window.__compareFullFrame()")
+            .evaluate("window.__compareLosslessGolden()")
             .await?
             .into_value()?;
         if !summary["ready"].as_bool().unwrap_or(false) {

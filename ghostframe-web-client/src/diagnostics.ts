@@ -17,6 +17,7 @@
 
 import debugGradientWgsl from './webgpu/shaders/debug_gradient.wgsl?raw';
 import { createLabeledShaderModule } from './webgpu/shader_module';
+import { frameRgba as losslessGoldenFrameRgba } from './lossless_golden';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -196,48 +197,29 @@ export function initDiagnostics({
     };
   }
 
-  // ---- __setExpectedFrame / __compareFullFrame -----------------------------
-  // Chunk-and-seed-then-poll comparator. The expected frame buffer
-  // (width*height*4 bytes — multi-MB at 1024x768+) is too large to ship
-  // in a single CDP eval expression: Chromium/CDP's request handling
-  // stalls past ~1-2 MB of JS source, hitting the chromiumoxide 30 s
-  // request timeout. So the caller pushes the base64-encoded expected
-  // buffer in small chunks via __appendExpectedFrameChunk (each call
-  // ships <256 KB), then calls __finalizeExpectedFrame to atomically
-  // swap the assembled buffer in. The poll loop then calls
-  // __compareFullFrame() with no args.
+  // ---- __compareLosslessGolden ---------------------------------------------
+  // Whole-frame pixel-perfect comparator for the e2e_lossless_golden_png
+  // test. The expected buffer is computed in-browser via the TypeScript
+  // port of lossless_golden.rs (frameRgba is a pure function of canvas
+  // dimensions, so both implementations agree byte-for-byte).
   //
-  // __compareFullFrame GPU-reads the live framebuffer and walks it
-  // against the seeded expected buffer entirely in JS, returning a tiny
-  // summary (match / mismatchCount / first mismatch coords). It does
-  // NOT ship the framebuffer bytes across CDP.
+  // Why no buffer transfer? Shipping ~3-8 MB of RGBA over CDP either
+  // way (single eval or chunked) stalled CDP under the live datagram
+  // paint load: the JS main thread couldn't drain CDP requests fast
+  // enough, and even a trivial window.__reset...() call timed out
+  // against chromiumoxide's 30 s request budget. Computing the
+  // expected buffer in the browser sidesteps the transport entirely.
   //
-  // When the framebuffer isn't yet sized to the expected buffer
-  // (renderer not configured yet, or sizes don't match), returns
-  // { ready: false } so the caller keeps polling.
+  // GPU-reads the live framebuffer, walks every pixel JS-side, and
+  // returns only a tiny summary (~few hundred bytes) — small enough
+  // that the poll loop is robust even under sustained CDP contention.
+  //
+  // Returns { ready: false } when the renderer isn't configured yet.
   let cachedExpected: Uint8Array | null = null;
-  let pendingChunks: string[] = [];
+  let cachedExpectedW = 0;
+  let cachedExpectedH = 0;
   if (typeof window !== 'undefined') {
-    window.__resetExpectedFrame = (): void => {
-      pendingChunks = [];
-      cachedExpected = null;
-    };
-    window.__appendExpectedFrameChunk = (chunkB64: string): { chunks: number } => {
-      pendingChunks.push(chunkB64);
-      return { chunks: pendingChunks.length };
-    };
-    window.__finalizeExpectedFrame = (): { length: number } => {
-      const joined = pendingChunks.join('');
-      pendingChunks = [];
-      cachedExpected = base64ToUint8Array(joined);
-      return { length: cachedExpected.length };
-    };
-    // Backwards-compat single-shot path; only safe for small buffers.
-    window.__setExpectedFrame = (expectedB64: string): { length: number } => {
-      cachedExpected = base64ToUint8Array(expectedB64);
-      return { length: cachedExpected.length };
-    };
-    window.__compareFullFrame = async (): Promise<{
+    window.__compareLosslessGolden = async (): Promise<{
       ready: boolean;
       width: number;
       height: number;
@@ -258,10 +240,20 @@ export function initDiagnostics({
       if (w === 0 || h === 0) {
         return { ready: false, width: w, height: h, match: false, mismatchCount: 0 };
       }
-      const expected = cachedExpected;
-      if (!expected || expected.length !== w * h * 4) {
-        return { ready: false, width: w, height: h, match: false, mismatchCount: 0 };
+      // Compute the canonical expected buffer once per (w, h) — the
+      // pure function from lossless_golden.ts mirrors the Rust
+      // frame_rgba implementation. Canvas dimensions don't change
+      // during the test, so a single dimensions-keyed cache is enough.
+      if (
+        cachedExpected === null ||
+        cachedExpectedW !== w ||
+        cachedExpectedH !== h
+      ) {
+        cachedExpected = losslessGoldenFrameRgba(w, h);
+        cachedExpectedW = w;
+        cachedExpectedH = h;
       }
+      const expected = cachedExpected;
       // WebGPU requires bytesPerRow to be a multiple of 256.
       const bytesPerRow = Math.ceil(w * 4 / 256) * 256;
       const staging = device.createBuffer({
@@ -472,18 +464,4 @@ export function initDiagnostics({
   }
 
   return { stats, recordResize, recordTile, recordRafTick, recordFramePainted };
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-// Inline base64 → Uint8Array decoder used by __compareFullFrame. Kept module-
-// local so the production bundle doesn't pull in an extra dep just for the
-// e2e comparator path.
-function base64ToUint8Array(b64: string): Uint8Array {
-  const bin = atob(b64);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
 }
