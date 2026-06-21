@@ -896,12 +896,16 @@ async fn e2e_palrle_5pct_loss_body<B: helpers::BrowserSession>(browser: &mut B) 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_palrle_5pct_loss_chromium() -> Result<()> {
+    // CAPTURE_FPS_DRM_DIRECT=2: keep CDP responsive.  5% loss with
+    // text-grid (mostly static) still exercises the retransmit path
+    // at 2 fps; the test asserts on log lines, not per-frame timing.
     let mut setup = setup_e2e_webgpu_gpu_with_env(
         "--text-grid --drm-direct",
         &[
             ("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "0.05"),
             ("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE", "palrle_bundled"),
             ("GHOSTFRAME_OUTBOUND_LOSS_SEED", "42"),
+            ("CAPTURE_FPS_DRM_DIRECT", "2"),
         ],
     )
     .await?;
@@ -933,7 +937,16 @@ async fn e2e_palrle_5pct_loss_firefox() -> Result<()> {
 async fn e2e_solid_per_tile_pixels() -> Result<()> {
     use ghostframe_test_pattern::solid_per_tile::samples;
 
-    let setup = setup_e2e_webgpu_gpu("--solid-per-tile --drm-direct").await?;
+    // CAPTURE_FPS_DRM_DIRECT=2: keep the JS main thread idle enough that
+    // CDP Runtime.evaluate returns within chromiumoxide's 30 s budget.
+    // The entrypoint default is 30 fps which saturates Chrome's renderer
+    // and makes the per-sample __readPixel evals time out.  This test
+    // only needs enough captures to settle the 4 corner tiles, not 30 fps.
+    let setup = setup_e2e_webgpu_gpu_with_env(
+        "--solid-per-tile --drm-direct",
+        &[("CAPTURE_FPS_DRM_DIRECT", "2")],
+    )
+    .await?;
     // Allow page load → WebGPU init → first frame capture → palette/solid
     // emission → render. The corners get one bundled Solid frame each;
     // the motion region keeps the codec pipeline engaged so the classifier
@@ -1007,7 +1020,14 @@ async fn e2e_solid_per_tile_pixels() -> Result<()> {
 async fn e2e_palrle_exact_pixels() -> Result<()> {
     use ghostframe_test_pattern::palrle_exact::samples;
 
-    let setup = setup_e2e_webgpu_gpu("--palrle-exact --drm-direct").await?;
+    // CAPTURE_FPS_DRM_DIRECT=2: see e2e_solid_per_tile_pixels for the
+    // rationale.  The static four-tile checkerboard pattern only needs
+    // a couple of captures to settle; 30 fps saturates CDP.
+    let setup = setup_e2e_webgpu_gpu_with_env(
+        "--palrle-exact --drm-direct",
+        &[("CAPTURE_FPS_DRM_DIRECT", "2")],
+    )
+    .await?;
     // 5s covers QUIC slow-start + first-frame H.264 phase + classifier
     // transition to PalRle for the four 2-color test tiles.
     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -1189,7 +1209,13 @@ async fn e2e_palrle_session_reset_body<B: helpers::BrowserSession>(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_palrle_session_reset_chromium() -> Result<()> {
-    let mut setup = setup_e2e_webgpu_gpu("--text-grid --drm-direct").await?;
+    // CAPTURE_FPS_DRM_DIRECT=2: keep CDP responsive across the
+    // page.reload + post-reset codec evals.
+    let mut setup = setup_e2e_webgpu_gpu_with_env(
+        "--text-grid --drm-direct",
+        &[("CAPTURE_FPS_DRM_DIRECT", "2")],
+    )
+    .await?;
     let page_url = setup.server.page_url.clone();
     e2e_palrle_session_reset_body(&mut setup.browser, &page_url).await?;
     setup.browser.close().await
@@ -1515,7 +1541,14 @@ async fn e2e_multi_tile_grid() -> Result<()> {
 async fn e2e_text_clarity() -> Result<()> {
     use ghostframe_test_pattern::text_grid::SAMPLES;
 
-    let setup = setup_e2e_webgpu_gpu("--text-grid --drm-direct").await?;
+    // CAPTURE_FPS_DRM_DIRECT=2: see e2e_solid_per_tile_pixels for the
+    // rationale.  Static text grid converges in a few captures; 30 fps
+    // saturates CDP and the per-pair contrast evals time out.
+    let setup = setup_e2e_webgpu_gpu_with_env(
+        "--text-grid --drm-direct",
+        &[("CAPTURE_FPS_DRM_DIRECT", "2")],
+    )
+    .await?;
 
     // Allow QUIC slow-start + a couple of frames so every glyph tile arrives.
     tokio::time::sleep(Duration::from_secs(6)).await;
@@ -2343,7 +2376,15 @@ async fn e2e_ack_loss() -> Result<()> {
 /// frames for the same palette emit thin+indices_raw (flags=0x02).
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_indices_raw_handshake() -> Result<()> {
-    let setup = setup_e2e_webgpu_gpu("--solid-per-tile --drm-direct").await?;
+    // CAPTURE_FPS_DRM_DIRECT=2: see e2e_solid_per_tile_pixels for the
+    // rationale.  HELLO handshake + first PalRle emission only needs a
+    // handful of frames; 30 fps saturates CDP and the later evals time
+    // out.
+    let setup = setup_e2e_webgpu_gpu_with_env(
+        "--solid-per-tile --drm-direct",
+        &[("CAPTURE_FPS_DRM_DIRECT", "2")],
+    )
+    .await?;
 
     // Allow time for: page load → WebGPU init → WebTransport.ready →
     // HELLO write → server parse → first PalRle bundled emission →
@@ -2401,9 +2442,15 @@ async fn e2e_indices_raw_handshake() -> Result<()> {
 /// force_rebundle.
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_decode_error_thin_uncached() -> Result<()> {
+    // CAPTURE_FPS_DRM_DIRECT=2: keep CDP responsive across the
+    // page.reload + session-reset assertions; the underlying behavior
+    // doesn't depend on capture rate.
     let setup = setup_e2e_webgpu_gpu_with_env(
         "--solid-per-tile --drm-direct",
-        &[("GHOSTFRAME_SKIP_PALETTE_SESSION_RESET", "1")],
+        &[
+            ("GHOSTFRAME_SKIP_PALETTE_SESSION_RESET", "1"),
+            ("CAPTURE_FPS_DRM_DIRECT", "2"),
+        ],
     )
     .await?;
     // Phase 1: let session 1 deliver and ACK both 2-color-flip palettes.
