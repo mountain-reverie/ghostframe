@@ -1401,8 +1401,17 @@ impl IoBridge {
             }
             // Hand every fragment to the reliable emitter under the
             // same EmitKey (the per-tile-pass identity used by ACK/NACK).
+            // Use `frame_seq_with_flag` (= seq | TILE_DATAGRAM_FLAG) so
+            // the cache key matches the wire frame_seq embedded in the
+            // datagram header — that's what the client echoes back in
+            // every ACK/NACK entry, and what `fragment_coverage` already
+            // uses one line up.  Indexing the cache by raw `seq` made
+            // every ACK lookup miss, so every entry sat in the cache
+            // until RTO fired MAX_RETRANSMITS times and the entry
+            // retired, which presents as PixelPerfect-never-fires on
+            // an otherwise idle gradient.
             let key = crate::transport::reliable_emitter::EmitKey::new(
-                seq,
+                frame_seq_with_flag,
                 work.tile_x,
                 work.tile_y,
                 work.pass_idx,
