@@ -2442,15 +2442,19 @@ async fn e2e_indices_raw_handshake() -> Result<()> {
 /// force_rebundle.
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_decode_error_thin_uncached() -> Result<()> {
-    // CAPTURE_FPS_DRM_DIRECT=2: keep CDP responsive across the
-    // page.reload + session-reset assertions; the underlying behavior
-    // doesn't depend on capture rate.
+    // Don't lower CAPTURE_FPS_DRM_DIRECT here: the test depends on
+    // the central 64×64 motion region cycling fast enough that the
+    // classifier picks PalRle for the moving tiles.  At 2 fps the
+    // animation doesn't update often enough for the classifier to
+    // observe the 2-color flip — no PalRle is emitted at all,
+    // delivered/thin/decode-error machinery never gets exercised,
+    // and the test fails for the wrong reason.  The test does only
+    // ~10 evaluate() calls in total (small sleep windows), so the
+    // CDP-saturation problem the bulk-fix targeted doesn't apply
+    // here.
     let setup = setup_e2e_webgpu_gpu_with_env(
         "--solid-per-tile --drm-direct",
-        &[
-            ("GHOSTFRAME_SKIP_PALETTE_SESSION_RESET", "1"),
-            ("CAPTURE_FPS_DRM_DIRECT", "2"),
-        ],
+        &[("GHOSTFRAME_SKIP_PALETTE_SESSION_RESET", "1")],
     )
     .await?;
     // Phase 1: let session 1 deliver and ACK both 2-color-flip palettes.
