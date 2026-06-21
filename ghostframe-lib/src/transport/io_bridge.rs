@@ -1633,9 +1633,33 @@ impl IoBridge {
                         }
                     }
                 }
+            } else {
+                // The first byte already said `ACK_BATCH_MSG_TYPE` so a
+                // decode failure here is a real protocol-level disagreement
+                // (count out of range, truncated payload, etc.) rather than
+                // a stray new message type. Surface it loudly — the
+                // overlap-batch-rejection bug (commit message of this fix)
+                // hid for weeks because the legacy code silently dropped
+                // these, so every overlap-bearing batch was discarded
+                // without any signal that ACK throughput had collapsed.
+                tracing::warn!(
+                    target: "ghostframe::cdf53",
+                    first_byte = data[0],
+                    len = data.len(),
+                    "ack_batch_decode_failed"
+                );
             }
+        } else {
+            // Unknown first byte — possibly a future protocol message
+            // type. Forward-compat: log at debug so it's discoverable
+            // under verbose tracing but doesn't spam normal operation.
+            tracing::debug!(
+                target: "ghostframe::cdf53",
+                first_byte = data[0],
+                len = data.len(),
+                "ack_datagram_unknown_first_byte"
+            );
         }
-        // Other discriminators: silently ignore. Forward-compatible.
     }
 
     /// Route an inbound TILE_NACK envelope (discriminator `0x05`) into the
@@ -3047,6 +3071,8 @@ impl IoBridge {
                         rto_fired = es.rto_fired,
                         rto_max_retransmits_reached = es.rto_max_retransmits_reached,
                         nack_received = es.nack_hit + es.nack_miss,
+                        ack_hit = es.ack_hit,
+                        ack_miss = es.ack_miss,
                         cache_lru_eviction = self.reliable_emitter.cache.stats.lru_eviction,
                         retransmit_attempts_total = es.retransmit_attempts_total,
                         "cumulative emit (datagrams handed to quinn since startup, per codec)"

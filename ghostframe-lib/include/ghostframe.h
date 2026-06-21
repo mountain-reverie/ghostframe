@@ -91,7 +91,25 @@
 
 #define ACK_BATCH_MSG_TYPE 3
 
-#define MAX_ACK_ENTRIES_PER_BATCH 64
+/**
+ * Maximum number of *fresh* entries the client packs into one batch
+ * before flushing (mirrors `MAX_ACK_ENTRIES` in ack.ts). Used for the
+ * roundtrip-size tests; the wire-acceptance cap is below.
+ */
+#define MAX_FRESH_ENTRIES_PER_BATCH 64
+
+/**
+ * Trailing overlap count the client appends to each batch (mirrors
+ * `ACK_OVERLAP_COUNT` in ack.ts). A single dropped ACK batch
+ * therefore needs ACK_OVERLAP_COUNT + 1 consecutive drops to lose
+ * any entry.
+ */
+#define ACK_OVERLAP_COUNT 8
+
+/**
+ * Wire-acceptance cap for one ACK batch: fresh + overlap.
+ */
+#define MAX_ACK_ENTRIES_PER_BATCH (MAX_FRESH_ENTRIES_PER_BATCH + ACK_OVERLAP_COUNT)
 
 #define ACK_ENTRY_SIZE 7
 

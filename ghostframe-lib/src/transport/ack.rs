@@ -3,13 +3,20 @@
 //! Wire format:
 //! ```text
 //! [0]      message_type = 0x03
-//! [1]      count: u8 (1..=64)
+//! [1]      count: u8 (1..=72)
 //! [2..]    count × 7 bytes:
 //!             [0..4]  frame_seq: u32 little-endian
 //!             [4]     tile_x: u8
 //!             [5]     tile_y: u8
 //!             [6]     pass_idx: u8
 //! ```
+//!
+//! Max count is 72 — `MAX_FRESH_ENTRIES_PER_BATCH (64)` + the
+//! client-side `ACK_OVERLAP_COUNT (8)` trailing entries that each
+//! batch carries from the previous one as resilience against a single
+//! ACK-batch loss. The server MUST accept anything up to that combined
+//! limit or the overlap mechanism collapses (overlap-bearing batches
+//! get rejected, every retransmit floods MAX_RETRANSMITS without ACK).
 //!
 //! Each entry acknowledges receipt of the tile-pass payload identified by
 //! `(frame_seq, tile_x, tile_y, pass_idx)`. Server uses its
@@ -28,7 +35,18 @@
 //! `AckDecodeError::WrongMsgType(0x02)` rather than silently mis-parsing.
 
 pub const ACK_BATCH_MSG_TYPE: u8 = 0x03;
-pub const MAX_ACK_ENTRIES_PER_BATCH: usize = 64;
+/// Maximum number of *fresh* entries the client packs into one batch
+/// before flushing (mirrors `MAX_ACK_ENTRIES` in ack.ts). Used for the
+/// roundtrip-size tests; the wire-acceptance cap is below.
+pub const MAX_FRESH_ENTRIES_PER_BATCH: usize = 64;
+/// Trailing overlap count the client appends to each batch (mirrors
+/// `ACK_OVERLAP_COUNT` in ack.ts). A single dropped ACK batch
+/// therefore needs ACK_OVERLAP_COUNT + 1 consecutive drops to lose
+/// any entry.
+pub const ACK_OVERLAP_COUNT: usize = 8;
+/// Wire-acceptance cap for one ACK batch: fresh + overlap.
+pub const MAX_ACK_ENTRIES_PER_BATCH: usize =
+    MAX_FRESH_ENTRIES_PER_BATCH + ACK_OVERLAP_COUNT;
 pub const ACK_ENTRY_SIZE: usize = 7;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -37,7 +55,7 @@ pub enum AckDecodeError {
     TooShort(usize),
     #[error("wrong message type: expected 0x03, got 0x{0:02x}")]
     WrongMsgType(u8),
-    #[error("invalid entry count: {0} (must be 1..=64)")]
+    #[error("invalid entry count: {0} (must be 1..=72)")]
     InvalidCount(u8),
 }
 
