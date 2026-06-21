@@ -3071,8 +3071,12 @@ impl IoBridge {
                         rto_fired = es.rto_fired,
                         rto_max_retransmits_reached = es.rto_max_retransmits_reached,
                         nack_received = es.nack_hit + es.nack_miss,
-                        ack_hit = es.ack_hit,
-                        ack_miss = es.ack_miss,
+                        // `emitter_` prefix so `e2e_ack_telemetry_no_waste`'s
+                        // `ack_miss` log-line filter doesn't false-match this
+                        // structured field — the test counts per-ACK debug
+                        // events, not the aggregate counter.
+                        emitter_ack_hits = es.ack_hit,
+                        emitter_ack_misses = es.ack_miss,
                         cache_lru_eviction = self.reliable_emitter.cache.stats.lru_eviction,
                         retransmit_attempts_total = es.retransmit_attempts_total,
                         "cumulative emit (datagrams handed to quinn since startup, per codec)"
