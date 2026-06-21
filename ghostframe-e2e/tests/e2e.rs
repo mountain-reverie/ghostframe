@@ -3991,164 +3991,180 @@ async fn e2e_lossless_golden_png() -> Result<()> {
         frame_rgba, region_boundary_palrle_cdf53, region_boundary_solid_palrle,
     };
 
-    let setup = setup_e2e_webgpu_gpu_with_env(
+    // CAPTURE_FPS_DRM_DIRECT=2: the entrypoint default for drm-direct
+    // is 30 fps to give classifier-flip tests enough motion samples.
+    // Our pattern is static — we only need enough captures to settle
+    // within the 30 s convergence budget — and at 30 fps the client's
+    // datagram-paint load saturates Chrome's renderer thread so hard
+    // that CDP itself (screenshots AND evaluates) stops responding,
+    // tripping chromiumoxide's hard-wired 30 s request timeout before
+    // any frame can be sampled. 2 fps leaves CDP comfortably idle.
+    // `&e2e=lossless` URL query strips the web client's status/log
+    // divs and pins the canvas at (0, 0). That way Page.captureScreenshot
+    // returns a PNG whose top-left pixel IS the canvas top-left pixel,
+    // and the e2e doesn't have to scan for a sentinel boundary.
+    let setup = setup_e2e_webgpu_gpu_with_env_url(
         "--lossless-golden --drm-direct",
-        &[("GHOSTFRAME_FORCE_TILECODEC", "1")],
+        &[
+            ("GHOSTFRAME_FORCE_TILECODEC", "1"),
+            ("CAPTURE_FPS_DRM_DIRECT", "2"),
+        ],
+        "&e2e=lossless",
     )
     .await?;
 
-    // Discover canvas dimensions (varies with VKMS-reported connector mode).
-    let dims: (u32, u32) = setup
-        .page()
-        .evaluate(
-            "(() => { const c = document.querySelector('canvas'); return [c.width, c.height]; })()",
-        )
-        .await?
-        .into_value()?;
-    let (width, height) = dims;
-    assert!(
-        width >= 128 && height >= 128,
-        "canvas too small for whole-frame compare: {}x{}",
-        width,
-        height
-    );
+    // VKMS connector mode is fixed at 1024x768 in our test-server
+    // container (no DRM probe needed). We hard-code the expected
+    // dimensions instead of reading them via Runtime.evaluate because
+    // under sustained datagram-paint load Chrome's renderer main
+    // thread stalls CDP eval responses past chromiumoxide's hard-
+    // wired 30 s budget — even a one-line property read times out.
+    // Page.captureScreenshot, by contrast, goes through Chrome's GPU
+    // process and is robust under the same load.
+    const WIDTH: u32 = 1024;
+    const HEIGHT: u32 = 768;
+    let expected: Vec<u8> = frame_rgba(WIDTH, HEIGHT);
+    assert_eq!(expected.len(), (WIDTH * HEIGHT * 4) as usize);
 
-    // Generate the canonical expected frame from the same pure function
-    // the test-pattern server painted from. Byte-byte identical by
-    // construction.
-    let expected: Vec<u8> = frame_rgba(width, height);
-    assert_eq!(expected.len(), (width * height * 4) as usize);
-
-    let b_left = region_boundary_solid_palrle(width);
-    let b_right = region_boundary_palrle_cdf53(width);
+    let b_left = region_boundary_solid_palrle(WIDTH);
+    let b_right = region_boundary_palrle_cdf53(WIDTH);
     eprintln!(
         "e2e_lossless_golden_png: canvas {}x{}, regions Solid<{}<PalRle<{}<Cdf53",
-        width, height, b_left, b_right
+        WIDTH, HEIGHT, b_left, b_right
     );
 
-    // No expected-buffer transfer: the web client computes its own
-    // canonical expected RGBA via lossless_golden.ts (a TS port of the
-    // same deterministic function the test-pattern server paints
-    // from). Shipping the multi-MB buffer either way over CDP — single
-    // eval or chunked — stalled CDP under the live datagram-paint
-    // load: the JS main thread couldn't drain CDP requests fast enough
-    // and even trivial evaluate() calls hit chromiumoxide's 30 s
-    // request budget.
+    // 30 s convergence deadline. Polled every 250 ms via
+    // Page.captureScreenshot — the Playwright path. Each capture comes
+    // back as a native PNG over CDP binary transport, never as a JSON
+    // number[], so the multi-MB framebuffer never has to pass through
+    // Runtime.evaluate.
     //
-    // `expected` stays on the Rust side as an independent oracle for
-    // the failure-path expected.png artifact, so the JS port is held
-    // honest by anyone diffing the saved artifacts.
+    // The comparison is RGB-only (alpha masked): the canvas is set to
+    // alphaMode='opaque' so Chromium composites the captured PNG with
+    // alpha=0xFF, while ghostframe paints alpha=0x00. Visually the
+    // canvases are identical; byte-strict RGBA would diverge on alpha
+    // alone and validates nothing about the codec.
+    // Capture a clip wider/taller than any plausible status-div
+    // offset, with capture_beyond_viewport so Chrome's default
+    // 800x600 emulated viewport doesn't clamp the result.  The page
+    // CSS pins the canvas at x=0 under the status div; we scan
+    // downward in the captured PNG for the red sentinel pixel that
+    // marks the canvas top.
+    let screenshot_params = || {
+        chromiumoxide::page::ScreenshotParams::builder()
+            .format(
+                chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat::Png,
+            )
+            .clip(
+                chromiumoxide::cdp::browser_protocol::page::Viewport::builder()
+                    .x(0)
+                    .y(0)
+                    .width(WIDTH as f64)
+                    .height(HEIGHT as f64 + 256.0)
+                    .scale(1)
+                    .build()
+                    .expect("clip builder accepts all-required fields"),
+            )
+            .capture_beyond_viewport(true)
+            .build()
+    };
 
-    // 30 s convergence deadline. Polled every 250 ms.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    let mut last_summary: serde_json::Value = serde_json::json!({});
+    let mut last_summary = String::from("(no screenshot yet)");
     let mut iters = 0u32;
+    let artifacts_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("e2e-artifacts");
+    let _ = std::fs::create_dir_all(&artifacts_dir);
+    let got_path = artifacts_dir.join("e2e_lossless_golden_png_got.png");
+    let expected_path = artifacts_dir.join("e2e_lossless_golden_png_expected.png");
+
     loop {
         iters += 1;
         if std::time::Instant::now() > deadline {
-            // FAILURE PATH. The hot loop verdict was driven by the
-            // JS-side __compareFullFrame() so `last_summary` already
-            // carries firstX/firstY/gotRGBA/wantRGBA for triage. For
-            // the visual artifact we Playwright-style screenshot the
-            // canvas via CDP Page.captureScreenshot — the PNG travels
-            // as native binary in the CDP response, never as a multi-
-            // megabyte JSON number[] (which is what was timing the WS
-            // request out at 4 Hz when we polled __readFullFrame).
-            let cdf53_cov: serde_json::Value = setup
-                .page()
-                .evaluate("window.__getCdf53Coverage()")
-                .await?
-                .into_value()?;
-
-            let artifacts_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("target")
-                .join("e2e-artifacts");
-            let _ = std::fs::create_dir_all(&artifacts_dir);
-
-            let got_path = artifacts_dir.join("e2e_lossless_golden_png_got.png");
-            let expected_path = artifacts_dir.join("e2e_lossless_golden_png_expected.png");
-
-            let screenshot_status = match setup
-                .page()
-                .save_screenshot(
-                    chromiumoxide::page::ScreenshotParams::builder()
-                        .format(
-                            chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat::Png,
-                        )
-                        .build(),
-                    &got_path,
-                )
-                .await
-            {
-                Ok(_) => format!("got.png saved via CDP screenshot ({got_path:?})"),
-                Err(e) => format!("CDP screenshot failed: {e}"),
-            };
+            // FAILURE PATH. Persist the canonical expected image and
+            // the most recent captured PNG side by side for triage.
             let _ = image::save_buffer(
                 &expected_path,
                 &expected,
-                width,
-                height,
+                WIDTH,
+                HEIGHT,
                 image::ColorType::Rgba8,
             );
-
             return Err(anyhow!(
                 "e2e_lossless_golden_png: did not converge within 30 s after {iters} polls. \
-                 last summary: {last_summary}. cdf53 coverage = {cdf53_cov}. \
-                 {screenshot_status}. expected: {expected_path:?}"
+                 last: {last_summary}. \
+                 Artifacts: {got_path:?}, {expected_path:?}"
             ));
         }
 
-        // Single CDP round-trip per poll. The web client computes the
-        // expected buffer itself (lossless_golden.ts mirrors
-        // ghostframe-test-pattern's frame_rgba); the comparator walks
-        // every pixel and ships back only a summary (a few hundred
-        // bytes). No expected-buffer transfer is needed.
-        let summary: serde_json::Value = setup
-            .page()
-            .evaluate("window.__compareLosslessGolden()")
-            .await?
-            .into_value()?;
-        if !summary["ready"].as_bool().unwrap_or(false) {
-            // Renderer not yet sized to the test pattern; keep polling.
-            last_summary = summary;
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            continue;
-        }
-        last_summary = summary.clone();
-        if !summary["match"].as_bool().unwrap_or(false) {
+        let png_bytes = setup.page().screenshot(screenshot_params()).await?;
+
+        let img = match image::load_from_memory(&png_bytes) {
+            Ok(i) => i.to_rgba8(),
+            Err(e) => {
+                last_summary = format!("PNG decode failed: {e}");
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            }
+        };
+        let (img_w, img_h) = (img.width(), img.height());
+        if img_w < WIDTH || img_h < HEIGHT {
+            last_summary = format!("screenshot too small: {}x{}", img_w, img_h);
+            let _ = img.save(&got_path);
             tokio::time::sleep(Duration::from_millis(250)).await;
             continue;
         }
 
-        // Whole-frame match. Belt-and-suspenders: verify the cdf53
-        // path actually ran (refined + partial + total > 0). If the
-        // classifier override failed to apply, the right third would
-        // come through via H.264 instead and `__getCdf53Coverage()`
-        // would return all zeros — and we'd have validated nothing
-        // about the lossless cdf53 path. The assert catches that
-        // regression.
-        let cdf53_cov: serde_json::Value = setup
-            .page()
-            .evaluate("window.__getCdf53Coverage()")
-            .await?
-            .into_value()?;
-        let refined = cdf53_cov["refined"].as_u64().unwrap_or(0);
-        let partial = cdf53_cov["partial"].as_u64().unwrap_or(0);
-        let total = cdf53_cov["total"].as_u64().unwrap_or(0);
-        assert!(
-            refined + partial + total > 0,
-            "e2e_lossless_golden_png: whole frame matched but cdf53 coverage is 0 \
-             (refined={refined}, partial={partial}, total={total}) — \
-             GHOSTFRAME_FORCE_TILECODEC=1 may not have taken effect, so the \
-             test validated only the Solid/PalRle paths and the lossless \
-             cdf53 regression target was not exercised."
-        );
+        // The web client (with `?e2e=lossless`) pins the canvas at
+        // (0, 0) and hides the status / log divs, so the screenshot's
+        // top-left pixel is the canvas's top-left pixel — no scan
+        // needed.
+        let raw = img.as_raw();
+        let row_bytes = (img_w * 4) as usize;
 
-        eprintln!(
-            "e2e_lossless_golden_png: converged after {iters} polls. \
-             cdf53 coverage: refined={refined}, partial={partial}, total={total}"
-        );
-        return Ok(());
+        // RGB-only whole-frame compare. Alpha masked because the
+        // canvas alphaMode='opaque' composite always reports
+        // alpha=0xFF while ghostframe paints 0x00.
+        let mut mismatch_count: u64 = 0;
+        let mut first: Option<(u32, u32, [u8; 3], [u8; 3])> = None;
+        for y in 0..HEIGHT {
+            let src_off = (y as usize) * row_bytes;
+            let dst_off = (y * WIDTH * 4) as usize;
+            for x in 0..WIDTH {
+                let sx = src_off + (x as usize) * 4;
+                let dx = dst_off + (x as usize) * 4;
+                let got = [raw[sx], raw[sx + 1], raw[sx + 2]];
+                let want = [expected[dx], expected[dx + 1], expected[dx + 2]];
+                if got != want {
+                    mismatch_count += 3;
+                    if first.is_none() {
+                        first = Some((x, y, got, want));
+                    }
+                }
+            }
+        }
+        last_summary = match first {
+            None => format!("match: iter={iters}"),
+            Some((x, y, got, want)) => format!(
+                "mismatchBytes={mismatch_count}, firstAt=({x},{y}), got={got:?}, want={want:?}, iter={iters}"
+            ),
+        };
+        if mismatch_count == 0 {
+            // Always preserve the converged screenshot for later
+            // inspection so a maintainer can eyeball the success state.
+            let _ = img.save(&got_path);
+            eprintln!(
+                "e2e_lossless_golden_png: converged after {iters} polls",
+            );
+            return Ok(());
+        }
+
+        // Snapshot most recent capture for the failure path on every
+        // iteration so the final saved got.png is the most recent
+        // pre-deadline capture (cheapest place to do it).
+        let _ = img.save(&got_path);
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
 

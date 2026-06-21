@@ -34,6 +34,18 @@ function log(msg: string) {
 async function main() {
   const url = new URL(window.location.href);
 
+  // ?e2e=lossless: strip page chrome so a CDP Page.captureScreenshot
+  // captures only the canvas, top-left aligned. Used by the lossless-
+  // golden e2e to drop the canvas-top-finder heuristic. Status and log
+  // divs are still wired up internally; we only hide them visually.
+  if (url.searchParams.get('e2e') === 'lossless') {
+    statusEl.style.display = 'none';
+    logEl.style.display = 'none';
+    canvasEl.style.position = 'fixed';
+    canvasEl.style.top = '0';
+    canvasEl.style.left = '0';
+  }
+
   log(`Connecting to ${window.location.origin}...`);
 
   // WebGPU init — fatal if unavailable per design D2.
