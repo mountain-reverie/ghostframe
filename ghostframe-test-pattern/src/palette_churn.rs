@@ -18,6 +18,15 @@ pub fn run<C: Connection>(
     let frames_per_region = 5;
     let frame_delay = std::time::Duration::from_millis(16);
 
+    // Optional per-iter diagnostic — gated on env var so e2e log output
+    // stays quiet by default but can be enabled when chasing a regression.
+    // Set GHOSTFRAME_PALCHURN_TRACE=1 to surface per-iter progress + a
+    // "completed" marker on clean loop exit.
+    let trace_enabled = std::env::var("GHOSTFRAME_PALCHURN_TRACE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .is_some();
+
     for n in 0..count {
         let palette = [
             ((n.wrapping_mul(17) & 0xFF) as u8, 0, 0),
@@ -25,6 +34,15 @@ pub fn run<C: Connection>(
             (0, 0, (n.wrapping_mul(53) & 0xFF) as u8),
             (255, 255, 255),
         ];
+        // [PALCHURN-DIAG] iteration heartbeat — every iter so we can
+        // tell from container logs whether the pattern process is alive
+        // and how far through `count` it got before any X11 error.
+        if trace_enabled {
+            eprintln!(
+                "[PALCHURN] iter={n} palette=[({},0,0),(0,{},0),(0,0,{}),(255,255,255)]",
+                palette[0].0, palette[1].1, palette[2].2
+            );
+        }
 
         for _frame in 0..frames_per_region {
             // Paint a 64×64 region at (100, 100) using a 4-color tile pattern.
@@ -62,6 +80,11 @@ pub fn run<C: Connection>(
         )?;
         conn.flush()?;
         std::thread::sleep(frame_delay);
+    }
+
+    // [PALCHURN-DIAG] log clean completion (loop exited normally).
+    if trace_enabled {
+        eprintln!("[PALCHURN] completed {count} iterations cleanly");
     }
 
     // Final region stays visible — the test sample-reads pixels here.

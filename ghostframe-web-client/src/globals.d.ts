@@ -75,4 +75,41 @@ interface Window {
   __cdf53Coverage: Map<number, { generation: number; passMask: number }> | undefined;
   /** Coverage counts derived from __cdf53Coverage. */
   __getCdf53Coverage(): { refined: number; partial: number; total: number };
+
+  // ----- [H2-DIAG] client-side palette atlas writes -------------------------
+  /** Per-call record of palrlePipeline.upsertPalette(); FIFO-capped. */
+  __h2_clientPaletteWrites: Array<{
+    /** palette slot id (0..255). */
+    id: number;
+    /** byteLength of the bgra buffer the client uploaded. */
+    len: number;
+    /** FNV-1a fingerprint of the bgra bytes; matches server-side fp. */
+    fp: string;
+    /** First 4 bytes of bgra as hex (the first colour). */
+    c0: string;
+    /** performance.now() at the call. */
+    ts: number;
+  }> | undefined;
+
+  // ----- [H5-DIAG] per-tile push log to detect OOO arrivals -----------------
+  /**
+   * Every finishAssembly() that routes a tile to a renderer queue pushes
+   * one entry. Used to detect "older Solid(BLACK) arrives after newer
+   * PalRle for the same tile" — that pattern proves an out-of-order
+   * delivery wipes the PalRle in the same rAF.
+   */
+  __h5_tilePushLog: Array<{
+    /** frameSeq (without TILE_DATAGRAM_FLAG). */
+    seq: number;
+    /** tile column. */
+    tx: number;
+    /** tile row. */
+    ty: number;
+    /** TileHeader.codec value (1=Solid, 2=PalRle, 5=Cdf53, etc.). */
+    codec: number;
+    /** For Solid: first 4 BGRA bytes as hex; '' for other codecs. */
+    c0: string;
+    /** performance.now() at queue push. */
+    ts: number;
+  }> | undefined;
 }

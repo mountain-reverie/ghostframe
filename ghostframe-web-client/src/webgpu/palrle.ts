@@ -73,6 +73,34 @@ export class PalRlePipeline {
       paletteId * 64, // 16 u32 = 64 bytes per palette slot
       bgra.buffer, bgra.byteOffset, bgra.byteLength,
     );
+    // [H2-DIAG] mirror every atlas write into a test-readable global so the
+    // e2e test can dump it post-run and compare against the server's
+    // write_bytes log to detect (id, palette) drift.
+    if (typeof window !== 'undefined') {
+      const count = (bgra.byteLength >>> 2);
+      let h = 0x811c9dc5 | 0;
+      // Match the server's fingerprint construction: count<<24 seed, then
+      // FNV-1a-ish mixing over (count * 4) BGRA bytes. Keep in sync with
+      // palette_fingerprint() in ghostframe-lib/src/encoder/pal_rle.rs.
+      let acc = (count & 0xff) << 24;
+      for (let i = 0; i < bgra.byteLength; i++) {
+        acc = Math.imul(acc, 0x01000193) + bgra[i];
+        acc = acc | 0;
+      }
+      const fpHex = (acc >>> 0).toString(16).padStart(8, '0');
+      const c0 = bgra.length >= 4
+        ? Array.from(bgra.slice(0, 4)).map(b => b.toString(16).padStart(2, '0')).join('')
+        : '';
+      if (!window.__h2_clientPaletteWrites) window.__h2_clientPaletteWrites = [];
+      const buf = window.__h2_clientPaletteWrites;
+      buf.push({ id: paletteId, len: bgra.byteLength, fp: fpHex, c0, ts: performance.now() });
+      // Keep matched to the server-side FIFO cap (MAX_RECORDED_ENTRIES).
+      if (buf.length > 32768) buf.shift();
+      // Silence the unused-h warning — the mixed-int dance above is the
+      // important part; the seeded `h` is kept for parity with the spec but
+      // not exposed.
+      void h;
+    }
   }
 
   /** Pack tile_work + indices for a batch of PalRle entries; upload to GPU. */

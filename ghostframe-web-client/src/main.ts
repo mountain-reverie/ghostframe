@@ -534,6 +534,34 @@ async function main() {
     const w = window as any;
     w.__tileCounts = w.__tileCounts ?? { raw: 0, solid: 0, palrle: 0, cdf53: 0, h264: 0, other: 0 };
     w.__lastTileSeq = frameSeqFromKey;
+    // [H5-DIAG] log every tile push with frame_seq + codec. Used by the
+    // e2e test to detect OOO arrivals (e.g. Solid(BLACK) for an older
+    // frame_seq arriving after PalRle for a newer one — same rAF wipes
+    // the PalRle output).
+    if (!w.__h5_tilePushLog) w.__h5_tilePushLog = [];
+    const h5Buf = w.__h5_tilePushLog as Array<{seq:number,tx:number,ty:number,codec:number,c0:string,ts:number}>;
+    // Capture the first up-to-8 payload bytes for any codec. For PalRle
+    // bundled this is [flags=1, palette_id, count, c0_b, c0_g, c0_r, c0_a, ...].
+    // For PalRle thin: [flags=0, palette_id, rle0, rle1, ...]. For Solid:
+    // [b, g, r, a]. The c0 string lets the e2e dump infer which palette
+    // slot a PalRle painted from, without instrumenting the renderer.
+    const h5c0 = (() => {
+      const len = payload?.byteLength ?? -1;
+      if (len <= 0) return `LEN=${len}`;
+      const n = Math.min(len, 8);
+      let s = '';
+      for (let i = 0; i < n; i++) s += payload[i].toString(16).padStart(2, '0');
+      return s;
+    })();
+    h5Buf.push({
+      seq: frameSeqFromKey,
+      tx: tX,
+      ty: tY,
+      codec: asm.header.codec,
+      c0: h5c0,
+      ts: performance.now(),
+    });
+    if (h5Buf.length > 32768) h5Buf.shift();
     if (asm.header.codec === Codec.Raw) {
       w.__tileCounts.raw++;
       renderer.rawQueue.push({ tileX: tX, tileY: tY, bgra: payload });
