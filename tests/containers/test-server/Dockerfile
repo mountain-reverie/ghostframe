@@ -2,7 +2,7 @@
 # match the runtime environment exactly.
 FROM ubuntu:24.04 AS builder
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update -o Acquire::AllowInsecureRepositories=true && apt-get install -y --allow-unauthenticated --no-install-recommends \
     build-essential \
     ca-certificates \
     curl \
@@ -61,7 +61,7 @@ COPY ghostframe-test-pattern/ ghostframe-test-pattern/
 COPY ghostframe-web-client/dist/ ghostframe-web-client/dist/
 
 # rsync is required by ghostbridge/Makefile's sync-dist target.
-RUN apt-get update && apt-get install -y --no-install-recommends rsync \
+RUN apt-get update -o Acquire::AllowInsecureRepositories=true && apt-get install -y --allow-unauthenticated --no-install-recommends rsync \
     && rm -rf /var/lib/apt/lists/*
 
 ENV CARGO_BUILD_JOBS=2
@@ -80,7 +80,7 @@ RUN cargo build --release -p ghostframe-xdaemon -p ghostframe-test-pattern \
 # Stage 2: Runtime image
 FROM ubuntu:24.04
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update -o Acquire::AllowInsecureRepositories=true && apt-get install -y --allow-unauthenticated --no-install-recommends \
     ca-certificates \
     curl \
     iproute2 \
