@@ -200,6 +200,17 @@ pub fn classify_tile(metrics: &TileMetrics, prev: &CodecState) -> CodecState {
 
     // Rule 3: high freq AND low magnitude ⇒ PalRle if few colors known, else Cdf53
     if freq > 15.0 && mag <= 0.3 {
+        // Single-colour tiles (e.g. an X11 wipe-to-black) must take the
+        // Solid path even under high-freq churn — otherwise we waste a
+        // persistent PaletteTable slot on a count=1 palette that the
+        // server then keeps matching against (via find_matching) for
+        // every subsequent same-content capture, pinning affected tiles
+        // to that all-black palette via thin/indices_raw emissions until
+        // a new bundled palette evicts it. Mirrors the Rule 4 / Rule 6
+        // single-colour guard.
+        if uc_known && metrics.unique_colors <= 1 {
+            return CodecState::Solid;
+        }
         if uc_known && metrics.unique_colors <= 16 {
             return CodecState::PalRle { palette_id: 0 };
         }
