@@ -314,6 +314,43 @@ impl Scheduler {
             .unwrap_or(0)
     }
 
+    /// Filter the caller-provided `(tile, gen, max_passes)` tuples down to
+    /// those whose acked count is strictly less than `max_passes`. Used by
+    /// `IoBridge`'s stuck-tile resweep — the scheduler doesn't know which
+    /// tiles are still in Cdf53 codec state (that's in `metrics_tracker`),
+    /// so the caller passes the candidate set in. Return shape is the bare
+    /// `(tile_x, tile_y)` pair since callers re-derive `gen` / `max_passes`
+    /// from the tile's metrics row.
+    pub fn cdf53_unacked_tiles_for_gen(
+        &self,
+        candidates: &[((u8, u8), u8, u8)],
+    ) -> Vec<(u8, u8)> {
+        candidates
+            .iter()
+            .filter_map(|&((tx, ty), gen, max_passes)| {
+                let acked = self
+                    .cdf53_passes_acked
+                    .get(&(tx, ty, gen))
+                    .copied()
+                    .unwrap_or(0);
+                (acked < max_passes).then_some((tx, ty))
+            })
+            .collect()
+    }
+
+    /// Number of (tile, gen) entries currently in `refinement_queue` whose
+    /// (tile_x, tile_y) match the argument and state is not Acked /
+    /// Superseded. The resweep skips tiles whose passes are still queued —
+    /// they're not stuck, just unsent. O(queue) — cheap because queue is
+    /// pruned every drain cycle.
+    pub fn refinement_queue_holds_tile(&self, tile_x: u8, tile_y: u8) -> bool {
+        self.refinement_queue.iter().any(|w| {
+            w.tile_x == tile_x
+                && w.tile_y == tile_y
+                && !matches!(w.state, WorkState::Acked | WorkState::Superseded)
+        })
+    }
+
     /// Snapshot of (tile_x, tile_y, generation, passes_remaining) for
     /// every Cdf53 tile with outstanding work. Sources:
     ///   - `Pending`/`InFlight` entries in `refinement_queue`.
@@ -1189,6 +1226,24 @@ mod tests {
         let our: Vec<_> = snap.iter().filter(|e| e.0 == 2 && e.1 == 3).collect();
         assert_eq!(our.len(), 1);
         assert_eq!(our[0].3, 5, "5 outstanding coverage entries");
+    }
+
+    #[test]
+    fn cdf53_unacked_tiles_for_gen_lists_under_target() {
+        let mut s = Scheduler::new(4, 4);
+        // (0,0, gen=1): 3 of 14 acked → unacked.
+        for _ in 0..3 { s.record_cdf53_ack(0, 0, 1); }
+        // (1,0, gen=1): all 14 acked → not in result.
+        for _ in 0..14 { s.record_cdf53_ack(1, 0, 1); }
+        // (2,0, gen=1): no acks → unacked.
+        let _ = s.cdf53_passes_acked_count(2, 0, 1);
+        let mut out = s.cdf53_unacked_tiles_for_gen(&[
+            ((0u8, 0u8), 1u8, 14u8),
+            ((1u8, 0u8), 1u8, 14u8),
+            ((2u8, 0u8), 1u8, 14u8),
+        ]);
+        out.sort();
+        assert_eq!(out, vec![(0u8, 0u8), (2u8, 0u8)]);
     }
 
 }
