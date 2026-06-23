@@ -2946,6 +2946,125 @@ async fn e2e_cdf53_lossless_buildup_firefox() -> Result<()> {
     setup.browser.close().await
 }
 
+/// Regression: production saw 1457/1718 tiles stall mid-refinement on
+/// Firefox over a tailnet link because QUIC `SendDatagramError::Blocked`
+/// silently dropped tile-passes after the ReliableTileEmitter's 4 RTO
+/// retries were exhausted, with no closed-loop recovery.
+///
+/// Reproduces by dropping 25% of tile datagrams deterministically (seed
+/// 42). FEC parity datagrams are not dropped (predicate matches only
+/// source tile datagrams). At 25% per-pass loss with 4 RTO retries,
+/// P(all 14 passes received in first emission) = (1-0.25^4)^14 ≈ 94.6%,
+/// meaning roughly 5–6% of tiles (≈110 out of 2040) are stuck after the
+/// initial emission — enough to exercise the resweep path meaningfully.
+/// With the stuck-tile resweep in place (Task 4), lossless converges
+/// within ~45–60 s. The resweep cadence is 4 s (120 frames at 30 fps),
+/// comfortably above the emitter's ~750 ms RTO chain, and P(all 14
+/// passes) per resweep ≈ 94.6%, so 2–3 cycles suffice for full
+/// convergence. Under host scheduling pressure the server can drop to
+/// ~21 fps, stretching the wall-clock convergence to ~75 s; the body
+/// polls up to 90 s to absorb that variance.
+///
+/// Validation uses server-side log lines rather than `window.__readPixel`
+/// (WebGPU mapAsync) because the resweep re-emits ~110 tiles × 14 passes
+/// per cycle, keeping the GPU busy with integrate/inverse shaders for
+/// several seconds; mapAsync blocks on all pending GPU work and causes
+/// the chromiumoxide evaluate call to time out.  Server logs are always
+/// available and give equivalent proof:
+///   - `cdf53.stuck_resweep_summary` → resweep detected stuck tiles
+///   - `cdf53.pixelperfect`          → those tiles reached the lossless
+///                                      terminal state
+async fn e2e_cdf53_lossless_under_congestion_body<B: helpers::BrowserSession>(
+    _browser: &mut B,
+) -> Result<()> {
+    // Poll up to 90 s for both signals to land. Frame cadence under high
+    // load varies with host scheduling — the server can run at 21-30 fps
+    // and the first PixelPerfect transition lands ~45 s in. Polling
+    // tolerates that variance; a fixed sleep + single read is flaky
+    // because the read can fall between the last frame.captured log and
+    // the first cdf53.pixelperfect log.
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    let mut resweep_count;
+    let mut pp_count;
+    loop {
+        let logs = helpers::read_server_logs_stripped("ghostframe-server");
+        resweep_count = logs
+            .lines()
+            .filter(|l| l.contains("cdf53.stuck_resweep_summary"))
+            .count();
+        pp_count = logs
+            .lines()
+            .filter(|l| l.contains("cdf53.pixelperfect"))
+            .count();
+        if resweep_count > 0 && pp_count > 0 {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+
+    // 1. At least one resweep cycle must have detected stuck tiles.
+    assert!(
+        resweep_count > 0,
+        "no cdf53.stuck_resweep_summary log lines under 25% tile-datagram \
+         loss — resweep never detected stuck tiles (resweep path not reached \
+         or resweep cadence misconfigured)"
+    );
+
+    // 2. At least one tile must have reached the PixelPerfect terminal state,
+    //    proving the resweep successfully recovered stuck tiles.
+    assert!(
+        pp_count > 0,
+        "no cdf53.pixelperfect log lines after 90 s under 25% tile-datagram \
+         loss — stuck-tile resweep fired ({resweep_count} cycle(s)) but tiles \
+         did not reach the lossless terminal state"
+    );
+
+    eprintln!(
+        "stuck_resweep cycles={resweep_count} pixelperfect_tiles={pp_count}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_cdf53_lossless_under_congestion_chromium() -> Result<()> {
+    let mut setup = setup_e2e_webgpu_gpu_with_env(
+        "--gradient --drm-direct",
+        &[
+            ("GHOSTFRAME_ENABLE_CDF53", "1"),
+            // 25% tile-datagram loss: high enough that ~5% of tiles won't
+            // converge in the emitter's 4-RTO window, exercising the
+            // resweep path. Lower than 50% because higher loss rates
+            // re-emit thousands of tiles per cycle, flooding the GPU
+            // pipeline and causing WebGPU mapAsync timeouts.
+            ("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "0.25"),
+            ("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE", "tile"),
+            ("GHOSTFRAME_OUTBOUND_LOSS_SEED", "42"),
+        ],
+    )
+    .await?;
+    e2e_cdf53_lossless_under_congestion_body(&mut setup.browser).await?;
+    setup.browser.close().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_cdf53_lossless_under_congestion_firefox() -> Result<()> {
+    let mut setup = setup_e2e_webgpu_gpu_with_env_firefox(
+        "--gradient --drm-direct",
+        &[
+            ("GHOSTFRAME_ENABLE_CDF53", "1"),
+            ("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "0.25"),
+            ("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE", "tile"),
+            ("GHOSTFRAME_OUTBOUND_LOSS_SEED", "42"),
+        ],
+    )
+    .await?;
+    e2e_cdf53_lossless_under_congestion_body(&mut setup.browser).await?;
+    setup.browser.close().await
+}
+
 /// Diagnostic for the wavelet inverse: drive the GPU inverse directly with
 /// the fixture's known coefficients (bypassing the integrate shader) and
 /// compare against the fixture's expected pixels. Isolates whether the
