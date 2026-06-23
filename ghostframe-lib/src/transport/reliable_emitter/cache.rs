@@ -84,6 +84,15 @@ impl RetransmitCache {
             self.entries.remove(k);
         }
     }
+
+    /// Returns true iff at least one cache entry matches `(tile_x, tile_y)`
+    /// across any frame_seq / pass_idx. Used by io_bridge's stuck-tile
+    /// resweep to skip tiles the emitter is still actively retransmitting.
+    pub fn has_entries_for_tile(&self, tile_x: u8, tile_y: u8) -> bool {
+        self.entries
+            .keys()
+            .any(|k| k.tile_x == tile_x && k.tile_y == tile_y)
+    }
 }
 
 #[cfg(test)]
@@ -141,5 +150,18 @@ mod tests {
         c.insert(EmitKey::new(99999, 0, 0, 0), mk_entry(now));
         assert_eq!(c.stats.lru_eviction, 1);
         assert_eq!(c.len(), CACHE_CAPACITY);
+    }
+
+    #[test]
+    fn has_entries_for_tile_reflects_live_entries_only() {
+        let now = Instant::now();
+        let mut c = RetransmitCache::new();
+        let k = EmitKey { frame_seq: 7, tile_x: 3, tile_y: 4, pass_idx: 0 };
+        assert!(!c.has_entries_for_tile(3, 4));
+        c.insert(k, mk_entry(now));
+        assert!(c.has_entries_for_tile(3, 4));
+        assert!(!c.has_entries_for_tile(3, 5));
+        c.remove(&k);
+        assert!(!c.has_entries_for_tile(3, 4));
     }
 }

@@ -209,6 +209,10 @@ impl ReliableTileEmitter {
         // drop them when the cache lookup misses.
     }
 
+    pub fn has_cache_entries_for_tile(&self, tile_x: u8, tile_y: u8) -> bool {
+        self.cache.has_entries_for_tile(tile_x, tile_y)
+    }
+
     /// Internal helper — captures the current time so on_nack's caller
     /// doesn't have to pass an Instant. Task 22 wires a real Clock through
     /// the emitter constructor; this stub keeps the signature stable until
