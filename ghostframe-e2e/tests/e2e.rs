@@ -4,6 +4,26 @@ use ghostframe_lib::transport::protocol::Codec;
 
 use std::time::Duration;
 
+/// Per-test diagnostic dump gate.  When `GHOSTFRAME_E2E_DIAG` is set in
+/// the environment the e2e suite surfaces H2 client logs, H5 push logs,
+/// server-side log tails and capture-PNG copy status via stderr; when
+/// unset (the default) the suite stays quiet so passing tests don't
+/// drown the operator in dumps.
+fn e2e_diag_enabled() -> bool {
+    std::env::var("GHOSTFRAME_E2E_DIAG")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .is_some()
+}
+
+macro_rules! e2e_diag {
+    ($($t:tt)*) => {
+        if crate::e2e_diag_enabled() {
+            eprintln!($($t)*);
+        }
+    };
+}
+
 use anyhow::{anyhow, Context, Result};
 use chromiumoxide::{Browser, BrowserConfig};
 use futures::StreamExt;
@@ -1189,6 +1209,18 @@ async fn e2e_palrle_session_reset_body<B: helpers::BrowserSession>(
     let post: serde_json::Value = browser.evaluate(probe_js.as_str()).await?;
     let post_ink_lum = luminance(&post["ink"]);
     let post_bg_lum = luminance(&post["bg"]);
+
+    // [H2-DIAG] dump the client-side palette-atlas write log so failures
+    // include the data we need to confirm/refute H2.  Gated on
+    // GHOSTFRAME_E2E_DIAG to keep green-CI runs quiet.
+    if e2e_diag_enabled() {
+        let h2_dump: String = browser
+            .evaluate("JSON.stringify((window.__h2_clientPaletteWrites || []).slice(-200))")
+            .await
+            .unwrap_or_else(|_| "[]".to_string());
+        e2e_diag!("[H2-CLIENT-DUMP palrle_session_reset] {h2_dump}");
+    }
+
     assert!(
         post_ink_lum - post_bg_lum > 80.0,
         "post-reset text not legible — warm-cache re-bundling broken (ink={post_ink_lum:.0}, bg={post_bg_lum:.0})"
@@ -1639,17 +1671,174 @@ async fn e2e_palette_eviction_body<B: helpers::BrowserSession>(browser: &mut B) 
     // ~8s for the pattern to play out at ~5 frames per region × 300.
     tokio::time::sleep(Duration::from_secs(8)).await;
 
-    // Sample the final palette region — should display content (not all-black).
+    // Sample the final palette region.  At the test-server's default 2 fps
+    // capture rate, the framebuffer state can lag the X11 root by 0..500 ms,
+    // and ~17% of captures land on the test pattern's wipe-to-black phase.
+    // Reading a single pixel at a fixed time is fragile to both effects.
+    // Poll repeatedly over up to 1.2 s (≥ 1 test-pattern iteration cycle) and
+    // keep the brightest sample so the assertion sees content regardless of
+    // wipe-phase alignment.
     let probe_js = r#"
         (async () => {
             const sample = await window.__readPixel(108, 108);
             return { r: sample[0], g: sample[1], b: sample[2] };
         })()
     "#;
-    let sample: serde_json::Value = browser.evaluate(probe_js).await?;
-    let r = sample["r"].as_f64().unwrap_or(0.0);
-    let g = sample["g"].as_f64().unwrap_or(0.0);
-    let b = sample["b"].as_f64().unwrap_or(0.0);
+    let mut best_r = 0.0_f64;
+    let mut best_g = 0.0_f64;
+    let mut best_b = 0.0_f64;
+    let poll_deadline = std::time::Instant::now() + Duration::from_millis(1200);
+    while std::time::Instant::now() < poll_deadline {
+        let sample: serde_json::Value = browser.evaluate(probe_js).await?;
+        let r = sample["r"].as_f64().unwrap_or(0.0);
+        let g = sample["g"].as_f64().unwrap_or(0.0);
+        let b = sample["b"].as_f64().unwrap_or(0.0);
+        if r + g + b > best_r + best_g + best_b {
+            best_r = r;
+            best_g = g;
+            best_b = b;
+        }
+        if best_r + best_g + best_b > 30.0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let r = best_r;
+    let g = best_g;
+    let b = best_b;
+
+    // All diag dumps (H2 client write log, H5 per-tile push log, H1/H2/H3
+    // server-side log filter, capture PNGs) are gated on
+    // GHOSTFRAME_E2E_DIAG so green CI runs stay quiet but the operator
+    // can re-run with the env var to surface the data needed to diagnose
+    // a regression.
+    if e2e_diag_enabled() {
+        let h2_dump: String = browser
+            .evaluate("JSON.stringify((window.__h2_clientPaletteWrites || []).slice(-200))")
+            .await
+            .unwrap_or_else(|_| "[]".to_string());
+        e2e_diag!("[H2-CLIENT-DUMP palette_eviction] {h2_dump}");
+
+        let h5_dump: String = browser
+            .evaluate(
+                r#"JSON.stringify(((window.__h5_tilePushLog || []).filter(e => (e.tx === 3 || e.tx === 4) && (e.ty === 3 || e.ty === 4))).slice(-200))"#,
+            )
+            .await
+            .unwrap_or_else(|_| "[]".to_string());
+        e2e_diag!("[H5-PUSH-DUMP palette_eviction] {h5_dump}");
+    }
+
+    if e2e_diag_enabled() {
+        // Per-frame_seq SUMMARY across ALL tiles so we can see whether
+        // the server kept emitting for other tiles while the region
+        // tiles went silent.
+        let summary_dump: String = browser
+            .evaluate(
+                r#"JSON.stringify((() => {
+                    const log = window.__h5_tilePushLog || [];
+                    const bySeq = new Map();
+                    for (const e of log) {
+                        if (!bySeq.has(e.seq)) bySeq.set(e.seq, { count: 0, maxTs: 0, codecs: new Set() });
+                        const s = bySeq.get(e.seq);
+                        s.count++;
+                        s.maxTs = Math.max(s.maxTs, e.ts);
+                        s.codecs.add(e.codec);
+                    }
+                    return Array.from(bySeq.entries()).map(([seq, s]) => ({ seq, count: s.count, maxTs: s.maxTs, codecs: Array.from(s.codecs) })).sort((a,b) => a.seq - b.seq);
+                })())"#,
+            )
+            .await
+            .unwrap_or_else(|_| "[]".to_string());
+        e2e_diag!("[H5-SEQ-SUMMARY palette_eviction] {summary_dump}");
+
+        // Sample tileDatagrams at 200 ms intervals over 1 s — confirms
+        // whether datagrams keep flowing or the count flatlines.
+        let mut stats_series: Vec<(u64, u64)> = Vec::new();
+        for i in 0..6 {
+            let dump: String = browser
+                .evaluate("JSON.stringify(window.__ghostframeStats || {})")
+                .await
+                .unwrap_or_else(|_| "{}".to_string());
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let parsed: serde_json::Value = serde_json::from_str(&dump).unwrap_or_default();
+            let td = parsed.get("tileDatagrams").and_then(|v| v.as_u64()).unwrap_or(0);
+            stats_series.push((now_ms, td));
+            if i < 5 {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+        e2e_diag!("[H5-STATS-SERIES palette_eviction] {stats_series:?}");
+
+        // Filtered xdaemon-format log lines (tracing-style timestamps +
+        // our [CAP]/[BRIDGE]/"Server ready"/"capture-dump" markers).
+        let srv_logs_full = helpers::read_server_logs_stripped("ghostframe-server");
+        let xd_lines: Vec<&str> = srv_logs_full
+            .lines()
+            .filter(|l| {
+                l.starts_with("2026-")
+                    || l.contains("Server ready")
+                    || l.contains("QUIC server ready")
+                    || l.contains("capture-dump")
+                    || l.contains("[CAP")
+                    || l.contains("[BRIDGE")
+                    || l.contains("capture loop")
+            })
+            .collect();
+        e2e_diag!(
+            "[XD-LOG-FILTERED palette_eviction] {} xdaemon-format lines:",
+            xd_lines.len()
+        );
+        let xd_show: &[&str] = if xd_lines.len() > 300 {
+            &xd_lines[xd_lines.len() - 300..]
+        } else {
+            &xd_lines[..]
+        };
+        for l in xd_show {
+            e2e_diag!("{l}");
+        }
+
+        // [H1/H2/H3-DIAG] server H-tag tracing lines.
+        let mut h_lines: Vec<&str> = srv_logs_full
+            .lines()
+            .filter(|l| l.contains("[H1-SRV]") || l.contains("[H2-SRV]") || l.contains("[H3-SRV]"))
+            .collect();
+        let total_h = h_lines.len();
+        if h_lines.len() > 400 {
+            h_lines = h_lines.split_off(h_lines.len() - 400);
+        }
+        e2e_diag!(
+            "[H-SRV-DUMP palette_eviction] {} H-tag lines (showing last {}):",
+            total_h,
+            h_lines.len()
+        );
+        for l in &h_lines {
+            e2e_diag!("{l}");
+        }
+
+        // Extract captured PNGs (only meaningful when the daemon ran
+        // with GHOSTFRAME_CAPTURE_DUMP_DIR set — gated separately).
+        let _ = std::fs::create_dir_all("/tmp/host-captures");
+        let _ = std::fs::remove_dir_all("/tmp/host-captures/captures");
+        let cp = std::process::Command::new("docker")
+            .args(["cp", "ghostframe-server:/tmp/captures", "/tmp/host-captures"])
+            .output();
+        match cp {
+            Ok(o) if o.status.success() => {
+                e2e_diag!("[CAPTURE-PNGS palette_eviction] copied to /tmp/host-captures/captures/");
+            }
+            Ok(o) => e2e_diag!(
+                "[CAPTURE-PNGS palette_eviction] docker cp status={}: {} {}",
+                o.status,
+                String::from_utf8_lossy(&o.stderr).trim(),
+                String::from_utf8_lossy(&o.stdout).trim(),
+            ),
+            Err(e) => e2e_diag!("[CAPTURE-PNGS palette_eviction] docker cp spawn err: {e}"),
+        }
+    }
+
     assert!(
         r + g + b > 30.0,
         "final palette region should be visible after churn (rgb=({r},{g},{b}))"
@@ -1672,9 +1861,21 @@ async fn e2e_palette_eviction_body<B: helpers::BrowserSession>(browser: &mut B) 
 
 #[tokio::test]
 async fn e2e_palette_eviction_chromium() -> Result<()> {
-    let mut setup = setup_e2e_webgpu_gpu("--palette-churn 300").await?;
-    e2e_palette_eviction_body(&mut setup.browser).await?;
-    setup.browser.close().await
+    // Count bumped from 300 → 5000 so the X11 paint loop CANNOT complete
+    // during the test's wait window (300 × 96 ms = 28.8 s ≈ test duration,
+    // causing the pattern process to exit on its last wipe-to-black and
+    // leaving X11 black when the test samples).  At 5000 × 96 ms ≈ 8 min
+    // we're guaranteed to be mid-iteration regardless of test latency.
+    let mut setup = setup_e2e_webgpu_gpu_with_env(
+        "--palette-churn 5000",
+        &[("GHOSTFRAME_CAPTURE_DUMP_DIR", "/tmp/captures")],
+    )
+    .await?;
+    let test_result = e2e_palette_eviction_body(&mut setup.browser).await;
+    // PNG extraction is handled inside the body (gated on
+    // GHOSTFRAME_E2E_DIAG) so it runs before any panic from the assert.
+    setup.browser.close().await?;
+    test_result
 }
 
 #[tokio::test]
@@ -2491,6 +2692,23 @@ async fn e2e_decode_error_thin_uncached() -> Result<()> {
     // empty shadow → DECODE_ERROR → server logs + force_rebundle. 6s
     // covers handle_decode_error round-trip from the second HELLO.
     tokio::time::sleep(Duration::from_secs(6)).await;
+
+    // [H2-DIAG] dump the client-side palette-atlas write log before any
+    // assertion so a failure surfaces the data we need to confirm/refute H2.
+    // Gated on GHOSTFRAME_E2E_DIAG.
+    if e2e_diag_enabled() {
+        match setup
+            .page()
+            .evaluate("JSON.stringify((window.__h2_clientPaletteWrites || []).slice(-200))")
+            .await
+        {
+            Ok(v) => match v.into_value::<String>() {
+                Ok(s) => e2e_diag!("[H2-CLIENT-DUMP decode_error_thin_uncached] {s}"),
+                Err(e) => e2e_diag!("[H2-CLIENT-DUMP decode_error_thin_uncached] decode err: {e}"),
+            },
+            Err(e) => e2e_diag!("[H2-CLIENT-DUMP decode_error_thin_uncached] evaluate err: {e}"),
+        }
+    }
 
     let logs = helpers::read_server_logs_stripped("ghostframe-server");
     assert!(
