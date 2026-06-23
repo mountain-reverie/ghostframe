@@ -12,3 +12,7 @@ tracing-subscriber = { workspace = true }
 drm = "0.14"
 libc = { workspace = true }
 x11rb = { version = "0.13", features = ["damage", "xtest", "composite", "dri3", "xfixes"] }
+# Optional capture-dump diagnostic: write each captured frame to a PNG on
+# disk when GHOSTFRAME_CAPTURE_DUMP_DIR is set. Default-features off keeps
+# the dependency tree small (PNG encoder only).
+image = { version = "0.25", default-features = false, features = ["png"] }

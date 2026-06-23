@@ -1671,6 +1671,7 @@ dependencies = [
  "anyhow",
  "drm",
  "ghostframe-lib",
+ "image",
  "libc",
  "tokio",
  "tracing",

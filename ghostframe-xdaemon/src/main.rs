@@ -261,7 +261,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // log shows the capture loop's view (X11 GetImage suspended/resumed).
     let mut was_idle = true;
 
+    // Optional capture-dump diagnostic: when set, write each captured frame
+    // as a PNG to this directory (filename: frame_<count>.png). Useful for
+    // visually verifying the server's view of the desktop alongside trace
+    // logs.  Disabled when the env var is absent.
+    let capture_dump_dir = env::var("GHOSTFRAME_CAPTURE_DUMP_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from);
+    if let Some(dir) = &capture_dump_dir {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            tracing::warn!(?dir, error = %e, "could not create capture-dump dir; PNG dump disabled");
+        } else {
+            tracing::info!(?dir, "capture-dump enabled — writing frame PNGs");
+        }
+    }
+
+    // Heartbeat cadence — emit one debug line every Nth iteration so we can
+    // tell from logs whether the capture loop is alive, blocked on
+    // submit_frame (= IoBridge backpressure), or has exited.
+    let heartbeat_every: u64 = env::var("GHOSTFRAME_CAPTURE_HEARTBEAT_EVERY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+
     loop {
+        let loop_iter_start = std::time::Instant::now();
         // Skip the capture scrape entirely when nobody is connected. Without
         // this gate, X11 GetImage copies a full 1920x1080 framebuffer through
         // the X server every 33 ms regardless of demand.
@@ -341,26 +366,123 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         };
 
+        let capture_done = std::time::Instant::now();
+        let capture_us = capture_done.duration_since(capture_start).as_micros() as u64;
+
         if let Some(frame) = submission {
-            if let Err(e) = server.submit_frame(frame).await {
-                tracing::warn!("frame submission failed: {e}");
+            let frame_w = frame.width;
+            let frame_h = frame.height;
+            let frame_stride = frame.stride;
+            let frame_has_dmabuf = frame.dmabuf_fd.is_some();
+            let frame_pixels_len = frame.pixels.len();
+
+            // Optional PNG dump of the captured frame so we can SEE what the
+            // daemon is feeding into the encoder pipeline (gated on
+            // GHOSTFRAME_CAPTURE_DUMP_DIR).  Runs BEFORE submit so we still
+            // get a file even if submit blocks/fails.
+            if let Some(dump_dir) = &capture_dump_dir {
+                if !frame.pixels.is_empty() {
+                    dump_frame_as_png(dump_dir, frame_count, &frame);
+                }
+            }
+
+            let submit_start = std::time::Instant::now();
+            let submit_res = server.submit_frame(frame).await;
+            let submit_us = submit_start.elapsed().as_micros() as u64;
+            if let Err(e) = submit_res {
+                tracing::warn!(
+                    frames = frame_count,
+                    "submit_frame returned Err — channel closed, capture loop exiting: {e}"
+                );
                 break;
             }
             frame_count += 1;
             if frame_count == 1 {
                 tracing::info!("first frame submitted");
-            } else if frame_count.is_multiple_of(300) {
+            } else if frame_count.is_multiple_of(30) {
+                // Bumped from 300 → 30 so e2e runs (~10-20s wall) see at
+                // least one milestone.  Stays infrequent enough not to
+                // dominate prod logs.
                 tracing::info!(frames = frame_count, "capture running");
             }
+            // Per-iter heartbeat — trace level so prod and the default e2e
+            // log volume stay quiet (RUST_LOG defaults `ghostframe=debug,info`
+            // and the e2e harness sets `ghostframe=trace,debug` which still
+            // hits trace for ghostframe targets when explicitly debugging).
+            // Captures the four timing components separately so we can spot
+            // exactly which one stalls when the daemon goes silent.
+            if frame_count.is_multiple_of(heartbeat_every) {
+                tracing::trace!(
+                    target: "ghostframe::xdaemon::capture",
+                    frames = frame_count,
+                    w = frame_w,
+                    h = frame_h,
+                    stride = frame_stride,
+                    has_dmabuf = frame_has_dmabuf,
+                    pixels_len = frame_pixels_len,
+                    capture_us = capture_us,
+                    submit_us = submit_us,
+                    "[CAP] iter done"
+                );
+            }
+        } else {
+            tracing::trace!(
+                target: "ghostframe::xdaemon::capture",
+                frames = frame_count,
+                capture_us = capture_us,
+                "[CAP] capture returned None (no submission this iter)"
+            );
         }
 
-        let elapsed = capture_start.elapsed();
+        let elapsed = loop_iter_start.elapsed();
         if elapsed < frame_interval {
             tokio::time::sleep(frame_interval - elapsed).await;
         }
     }
 
+    tracing::warn!(frames = frame_count, "capture loop exited");
     Ok(())
+}
+
+/// Write a captured BGRA frame to `<dir>/frame_<count>.png`.  Best-effort:
+/// logs and continues on any error so a failed dump never disturbs the live
+/// capture path.  Gated by `GHOSTFRAME_CAPTURE_DUMP_DIR` env var.
+fn dump_frame_as_png(
+    dump_dir: &std::path::Path,
+    count: u64,
+    frame: &ghostframe_lib::server::FrameSubmission,
+) {
+    let path = dump_dir.join(format!("frame_{count:05}.png"));
+    let w = frame.width;
+    let h = frame.height;
+    let stride = frame.stride as usize;
+    let bgra = &frame.pixels;
+    // Allocate tightly-packed RGBA8 (image crate accepts no stride param).
+    let row_bytes = (w as usize).saturating_mul(4);
+    if stride == 0 || bgra.len() < (h as usize).saturating_mul(stride.max(row_bytes)) {
+        tracing::warn!(?path, w, h, stride, len = bgra.len(), "pixel buffer too small for frame dims; skipping PNG dump");
+        return;
+    }
+    let mut rgba = vec![0u8; (h as usize).saturating_mul(row_bytes)];
+    for y in 0..h as usize {
+        let src_off = y.saturating_mul(stride);
+        let dst_off = y.saturating_mul(row_bytes);
+        for x in 0..w as usize {
+            let s = src_off + x * 4;
+            let d = dst_off + x * 4;
+            // Wire format is BGRA; PNG expects RGBA. Swap B↔R and force
+            // alpha=255 so the dump renders opaque even when X11's X-channel
+            // happens to be zero.
+            rgba[d] = bgra[s + 2];
+            rgba[d + 1] = bgra[s + 1];
+            rgba[d + 2] = bgra[s];
+            rgba[d + 3] = 0xff;
+        }
+    }
+    match image::save_buffer(&path, &rgba, w, h, image::ColorType::Rgba8) {
+        Ok(()) => tracing::debug!(target: "ghostframe::xdaemon::capture", ?path, count, "[CAP-PNG] wrote frame"),
+        Err(e) => tracing::warn!(?path, error = %e, "failed to write capture PNG"),
+    }
 }
 
 #[cfg(test)]
