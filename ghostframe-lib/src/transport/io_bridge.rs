@@ -864,11 +864,33 @@ impl IoBridge {
         // Without this, CPU-pixel frames hit `process_frame_cpu` which emits
         // every tile as `Codec::Raw` and never exercises the wavelet path.
         let has_gpu_input = frame.dmabuf_fd.is_some() || !frame.pixels.is_empty();
+        let path = if has_gpu_input && self.gpu_frame_processor.is_some() {
+            "gpu"
+        } else {
+            "cpu"
+        };
+        let t0 = Instant::now();
+        tracing::trace!(
+            target: "ghostframe::io_bridge::diag",
+            w = frame.width,
+            h = frame.height,
+            has_dmabuf = frame.dmabuf_fd.is_some(),
+            pixels_len = frame.pixels.len(),
+            path,
+            "[BRIDGE] process_frame ENTER"
+        );
         if has_gpu_input && self.gpu_frame_processor.is_some() {
             self.process_frame_gpu(frame);
         } else {
             self.process_frame_cpu(frame);
         }
+        let dt_us = t0.elapsed().as_micros() as u64;
+        tracing::trace!(
+            target: "ghostframe::io_bridge::diag",
+            dt_us,
+            path,
+            "[BRIDGE] process_frame EXIT"
+        );
     }
 
     /// Refresh the `connected_session_count` atomic the capture loop polls
@@ -3183,6 +3205,13 @@ impl IoBridge {
     /// Run the event loop until the ghostbridge fd is closed (EOF).
     pub async fn run(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut header = [0u8; 8];
+        // [BRIDGE-DIAG] per-select-arm counters so a periodic heartbeat
+        // shows whether the loop is alive and which arm dominates.
+        let mut diag_iters: u64 = 0;
+        let mut diag_timeout_arm: u64 = 0;
+        let mut diag_frame_arm: u64 = 0;
+        let mut diag_inbound_arm: u64 = 0;
+        let mut diag_last_heartbeat = Instant::now();
 
         loop {
             // Build a timer future that fires at the earliest QUIC timeout, or
@@ -3198,6 +3227,7 @@ impl IoBridge {
 
                 // 1. Earliest QUIC timeout fired.
                 _ = sleep_fut => {
+                    diag_timeout_arm += 1;
                     self.server.handle_timeout(Instant::now());
                 }
 
@@ -3208,13 +3238,17 @@ impl IoBridge {
                         None => std::future::pending().await,
                     }
                 } => {
+                    diag_frame_arm += 1;
                     if let Some(frame) = frame {
                         self.process_frame(frame);
+                    } else {
+                        tracing::warn!("frame_rx closed; capture upstream dropped");
                     }
                 }
 
                 // 3. Inbound framed UDP packet from ghostbridge.
                 read_res = self.stream.read_exact(&mut header) => {
+                    diag_inbound_arm += 1;
                     match read_res {
                         Ok(_) => {
                             if let Err(e) = self.process_inbound(&header).await {
@@ -3248,6 +3282,22 @@ impl IoBridge {
             // M3.6a: sample QUIC path stats once per tick so the classifier's
             // bandwidth estimate stays current. No-op when no connections.
             self.sample_all_path_stats();
+
+            // [BRIDGE-DIAG] heartbeat every 2s of wall time so we can tell
+            // from the log whether the loop is making progress when the
+            // emit pipeline goes silent.
+            diag_iters += 1;
+            if diag_last_heartbeat.elapsed() >= std::time::Duration::from_secs(2) {
+                tracing::trace!(
+                    target: "ghostframe::io_bridge::diag",
+                    iters = diag_iters,
+                    timeout = diag_timeout_arm,
+                    frame = diag_frame_arm,
+                    inbound = diag_inbound_arm,
+                    "[BRIDGE-HB] select-arm counts (since start)"
+                );
+                diag_last_heartbeat = Instant::now();
+            }
         }
     }
 

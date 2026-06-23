@@ -136,6 +136,29 @@ impl ReliableTileEmitter {
             let new_rto = rto_for_attempt(self.smoothed_rtt, entry.attempts);
             entry.rto_deadline = now + new_rto;
             let frags: Vec<Vec<u8>> = entry.fragments.iter().map(|b| b.to_vec()).collect();
+            // [H3-DIAG] log every actual retransmit. Captures the EmitKey
+            // routing tuple + a fingerprint of the first fragment so a
+            // stale-bundle replay (e.g. a PalRle bundled payload whose slot
+            // id has since been reassigned to a different palette) shows
+            // up as: same (tile_x, tile_y) replayed across many frame_seqs
+            // with the same fingerprint, while the live palette has moved on.
+            let attempts = entry.attempts;
+            let frag_count = frags.len();
+            let (fp, codec_byte, palette_id_byte, flags_byte) = first_fragment_fp(&frags);
+            tracing::trace!(
+                target: "emitter.h3",
+                frame_seq = key.frame_seq,
+                tile_x = key.tile_x,
+                tile_y = key.tile_y,
+                pass_idx = key.pass_idx,
+                attempts = attempts,
+                frag_count = frag_count,
+                codec = codec_byte,
+                palrle_flags = flags_byte,
+                palette_id = palette_id_byte,
+                fp = format_args!("{:08x}", fp),
+                "[H3-SRV] retransmit"
+            );
             for bytes in frags {
                 self.queue.push_source(bytes);
             }
@@ -207,6 +230,33 @@ impl ReliableTileEmitter {
             }
         }
     }
+}
+
+/// [H3-DIAG] FNV-1a fingerprint of the first fragment's bytes, plus the
+/// peeked codec / palrle-flags / palette_id bytes from a tile datagram
+/// layout: 16-byte DatagramHeader + 8-byte TileHeader + payload.
+///
+/// Returns (fp, codec_byte, palette_id_byte, palrle_flags_byte). For
+/// non-PalRle codecs the palette_id / flags bytes are meaningless but
+/// still surfaced to keep the log shape stable.
+fn first_fragment_fp(frags: &[Vec<u8>]) -> (u32, u8, u8, u8) {
+    let Some(f) = frags.first() else {
+        return (0, 0xFF, 0xFF, 0xFF);
+    };
+    // FNV-1a over the whole fragment except the timestamp field at [12..16]
+    // (which the io_bridge stamps lazily and we don't want to compare).
+    let mut h: u32 = 0x811c_9dc5;
+    for (i, &b) in f.iter().enumerate() {
+        if (12..16).contains(&i) { continue; }
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    // TileHeader.codec lives at [18] as (codec << 1) | lz4.
+    let codec_byte = f.get(18).copied().map(|b| b >> 1).unwrap_or(0xFF);
+    // PalRle payload starts at [24]: [24]=flags, [25]=palette_id.
+    let flags_byte = f.get(24).copied().unwrap_or(0xFF);
+    let pid_byte = f.get(25).copied().unwrap_or(0xFF);
+    (h, codec_byte, pid_byte, flags_byte)
 }
 
 #[cfg(test)]

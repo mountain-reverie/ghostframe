@@ -156,6 +156,23 @@ impl PaletteTable {
         debug_assert!(
             self.overwrite_eligible(id) || self.slot_state[id as usize] == SlotState::Empty
         );
+        // [H2-DIAG] log every slot rewrite so we can compare against the
+        // client's upsertPalette sequence and detect server/client drift.
+        let prev_fp = self.entries[id as usize]
+            .as_ref()
+            .map(palette_fingerprint)
+            .unwrap_or(0);
+        let new_fp = palette_fingerprint(palette);
+        let c0 = palette.colors.first().copied().unwrap_or([0; 4]);
+        tracing::trace!(
+            target: "palrle.h2",
+            id = id,
+            count = palette.count,
+            prev_fp = format_args!("{:08x}", prev_fp),
+            new_fp = format_args!("{:08x}", new_fp),
+            c0 = format_args!("{:02x}{:02x}{:02x}{:02x}", c0[0], c0[1], c0[2], c0[3]),
+            "[H2-SRV] write_bytes"
+        );
         self.entries[id as usize] = Some(*palette);
         self.slot_state[id as usize] = SlotState::Held;
         self.ref_count[id as usize] = 0;
@@ -294,13 +311,56 @@ pub fn encode_pal_rle_payload(
     out.push(if bundled { 0x01 } else { 0x00 }); // flags
     out.push(palette_id);
     if bundled {
+        // [H1-DIAG] detect bundled payloads where every colour has BGR=000
+        // (the "all-black palette" symptom of an empty/stale buffer being
+        // shipped). Also log every bundled emission for cross-correlation
+        // with the client's upsertPalette and the server's write_bytes log.
+        let count = palette.count as usize;
+        let bgr_zero_n = palette.colors[..count]
+            .iter()
+            .filter(|c| c[0] == 0 && c[1] == 0 && c[2] == 0)
+            .count();
+        let c0 = palette.colors.first().copied().unwrap_or([0; 4]);
+        let fp = palette_fingerprint(palette);
+        if count > 0 && bgr_zero_n == count {
+            tracing::warn!(
+                target: "palrle.h1",
+                palette_id = palette_id,
+                count = palette.count,
+                fp = format_args!("{:08x}", fp),
+                "[H1-SRV] bundled payload with all-zero BGR colours — H1 hit"
+            );
+        } else {
+            tracing::trace!(
+                target: "palrle.h1",
+                palette_id = palette_id,
+                count = palette.count,
+                bgr_zero_n = bgr_zero_n,
+                fp = format_args!("{:08x}", fp),
+                c0 = format_args!("{:02x}{:02x}{:02x}{:02x}", c0[0], c0[1], c0[2], c0[3]),
+                "[H1-SRV] bundled emit"
+            );
+        }
         out.push(palette.count);
-        for i in 0..palette.count as usize {
+        for i in 0..count {
             out.extend_from_slice(&palette.colors[i]);
         }
     }
     out.extend(encode_pal_rle_indices(packed_indices));
     out
+}
+
+/// Cheap 32-bit fingerprint of a palette's first 8 BGRA colour bytes.
+/// Stable across server/client so we can match log lines.
+fn palette_fingerprint(p: &PaletteEntry) -> u32 {
+    let mut acc: u32 = (p.count as u32) << 24;
+    let count = p.count as usize;
+    for i in 0..count {
+        for b in 0..4 {
+            acc = acc.wrapping_mul(0x01000193).wrapping_add(p.colors[i][b] as u32);
+        }
+    }
+    acc
 }
 
 /// Build the M3.2b `indices_raw` PalRLE wire payload: flags (bit 1) +
