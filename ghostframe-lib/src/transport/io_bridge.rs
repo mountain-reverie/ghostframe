@@ -2496,6 +2496,9 @@ impl IoBridge {
         {
             let tile_count = (cols * rows) as usize;
             let diag_frame = seq.is_multiple_of(10);
+            let mut sweep_acked_total: u32 = 0;
+            let mut sweep_max_passes_total: u32 = 0;
+            let mut sweep_tile_count: u32 = 0;
             for idx in 0..tile_count {
                 let tile_x = (idx as u32 % cols) as u8;
                 let tile_y = (idx as u32 / cols) as u8;
@@ -2508,17 +2511,10 @@ impl IoBridge {
                 };
                 let gen = self.scheduler.generation_for(tile_x, tile_y);
                 let acked = self.scheduler.cdf53_passes_acked_count(tile_x, tile_y, gen);
-                if diag_frame {
-                    tracing::debug!(
-                        target: "ghostframe::cdf53",
-                        tile_x = tile_x,
-                        tile_y = tile_y,
-                        gen = gen,
-                        acked = acked,
-                        max_passes = max_passes,
-                        "cdf53.sweep_check"
-                    );
-                }
+                sweep_acked_total = sweep_acked_total.saturating_add(acked as u32);
+                sweep_max_passes_total =
+                    sweep_max_passes_total.saturating_add(max_passes as u32);
+                sweep_tile_count = sweep_tile_count.saturating_add(1);
                 if self
                     .scheduler
                     .tile_fully_acked(tile_x, tile_y, gen, max_passes)
@@ -2537,6 +2533,19 @@ impl IoBridge {
                         "cdf53.pixelperfect"
                     );
                 }
+            }
+            // One per-sweep summary in place of the previous ~1.7 k per-tile
+            // DEBUG trace lines. Keeps the per-sweep ACK-progress signal
+            // that e2e / journal inspection uses, at <0.1% of the log
+            // volume.
+            if diag_frame && sweep_tile_count > 0 {
+                tracing::debug!(
+                    target: "ghostframe::cdf53",
+                    cdf53_tiles = sweep_tile_count,
+                    acked_total = sweep_acked_total,
+                    max_passes_total = sweep_max_passes_total,
+                    "cdf53.sweep_summary"
+                );
             }
         }
 
