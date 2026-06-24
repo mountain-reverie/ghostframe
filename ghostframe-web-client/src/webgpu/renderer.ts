@@ -7,6 +7,7 @@ import { Cdf53Pipeline } from './cdf53.js';
 import { PaletteShadow } from '../palette_shadow.js';
 import { prevalidatePalRle, PalRleVariant, type PalRleEntry } from '../prevalidate.js';
 import type { PrevalidatedCdf53 } from '../prevalidate_cdf53.js';
+import { shouldSkipEncodePresent } from './idle_skip.js';
 
 export interface PalRleQueued {
   tileX: number;
@@ -45,6 +46,19 @@ export class WebGpuRenderer {
   rawQueue: RawQueued[] = [];
   h264Queue: VideoFrame[] = [];
   cdf53Queue: PrevalidatedCdf53[] = [];
+
+  // Bug B: idle-skip. Set true whenever the renderer mutates state that
+  // affects the next presented frame (queue uploads, raw tile writes,
+  // session reset). Cleared after a real GPU submit. When false AND all
+  // queues are empty, encodeAndPresentFrame returns without touching the
+  // GPU.
+  private framebufferDirty: boolean = false;
+
+  // Test/diag instrumentation: increments on every real device.queue.submit
+  // call. Wired to window.__gpuSubmitCount in encodeAndPresentFrame so the
+  // page log can show a sliding submit rate next to the existing raf:N
+  // counter. An idle page should grow raf without growing submit.
+  public submitCount: number = 0;
 
   paletteShadow = new PaletteShadow();
   private errorsReadbackInFlight = false;
@@ -209,6 +223,35 @@ export class WebGpuRenderer {
     this.device.queue.writeBuffer(this.palrlePipeline.paletteAtlas, 0, zeros);
     this.paletteShadow.clear();
     this.cdf53Pipeline.clearAllState();
+    // Session reset wipes the framebuffer texture (caller is expected to
+    // resize / repaint); flag dirty so the next encodeAndPresentFrame
+    // actually does the present blit instead of skipping.
+    this.framebufferDirty = true;
+  }
+
+  pushPalRle(entry: PalRleQueued): void {
+    this.palRleQueue.push(entry);
+    this.framebufferDirty = true;
+  }
+
+  pushSolid(entry: SolidTile): void {
+    this.solidQueue.push(entry);
+    this.framebufferDirty = true;
+  }
+
+  pushRaw(entry: RawQueued): void {
+    this.rawQueue.push(entry);
+    this.framebufferDirty = true;
+  }
+
+  pushCdf53(entry: PrevalidatedCdf53): void {
+    this.cdf53Queue.push(entry);
+    this.framebufferDirty = true;
+  }
+
+  pushH264(frame: VideoFrame): void {
+    this.h264Queue.push(frame);
+    this.framebufferDirty = true;
   }
 
   /**
@@ -226,6 +269,25 @@ export class WebGpuRenderer {
     }
     // Expose framebuffer for test instrumentation (__readPixel / __readPixelRect).
     window.__ghostframeRenderer = { device: this.gpu.device, texture: this.framebuffer.texture };
+    // Bug B: idle-skip — when no queue has work AND nothing has
+    // mutated the framebuffer since the last submit AND no errors
+    // readback is mid-flight, the GPU pipeline would produce the same
+    // swapchain contents we already showed. Skip the whole thing so
+    // the RAF loop doesn't burn ~10 ms of GPU work per tick on idle
+    // sessions.
+    if (
+      shouldSkipEncodePresent({
+        rawQueueLen: this.rawQueue.length,
+        solidQueueLen: this.solidQueue.length,
+        palRleQueueLen: this.palRleQueue.length,
+        cdf53QueueLen: this.cdf53Queue.length,
+        h264QueueLen: this.h264Queue.length,
+        framebufferDirty: this.framebufferDirty,
+        errorsReadbackInFlight: this.errorsReadbackInFlight,
+      })
+    ) {
+      return { palrle: 0, solid: 0, raw: 0, h264: 0, cdf53: 0 };
+    }
     // ---- Steps 1-2: Drain palette updates + pre-validate PalRle batch ----
     const palRleEntries: PalRleEntry[] = [];
     for (const q of this.palRleQueue) {
@@ -313,6 +375,9 @@ export class WebGpuRenderer {
 
     // ---- Step 11: submit ----
     this.device.queue.submit([encoder.finish()]);
+    this.submitCount++;
+    this.framebufferDirty = false;
+    (window as unknown as { __gpuSubmitCount?: number }).__gpuSubmitCount = this.submitCount;
 
     // ---- Step 12: zero errors for next tick ----
     if (palRleCount > 0) {

@@ -564,15 +564,15 @@ async function main() {
     if (h5Buf.length > 32768) h5Buf.shift();
     if (asm.header.codec === Codec.Raw) {
       w.__tileCounts.raw++;
-      renderer.rawQueue.push({ tileX: tX, tileY: tY, bgra: payload });
+      renderer.pushRaw({ tileX: tX, tileY: tY, bgra: payload });
     } else if (asm.header.codec === Codec.Solid) {
       w.__tileCounts.solid++;
       if (payload.byteLength === 4) {
-        renderer.solidQueue.push({ tileX: tX, tileY: tY, bgra: payload });
+        renderer.pushSolid({ tileX: tX, tileY: tY, bgra: payload });
       }
     } else if (asm.header.codec === Codec.PalRle) {
       w.__tileCounts.palrle++;
-      renderer.palRleQueue.push({ tileX: tX, tileY: tY, payload });
+      renderer.pushPalRle({ tileX: tX, tileY: tY, payload });
     } else if (asm.header.codec === Codec.Cdf53) {
       w.__tileCounts.cdf53++;
       // M3.3b diagnostic counters: track every Cdf53 dispatch branch.
@@ -618,7 +618,7 @@ async function main() {
         // Caller-fills tileX/tileY (prevalidate left them at 0).
         r.entry.tileX = tX;
         r.entry.tileY = tY;
-        renderer.cdf53Queue.push(r.entry);
+        renderer.pushCdf53(r.entry);
         w.__cdf53PushedToQueue = (w.__cdf53PushedToQueue ?? 0) + 1;
       }
     }
@@ -798,7 +798,7 @@ async function main() {
         `Δdrain{r:${drainDelta.raw} s:${drainDelta.solid} p:${drainDelta.palrle} c:${drainDelta.cdf53} h:${drainDelta.h264}} ` +
         `fb:${fb.width}x${fb.height} ` +
         `cdf53fails:${cdf53Fails}(last=${cdf53Last}) ` +
-        `raf:${__rafTicks} lastSeq:${w.__lastTileSeq ?? '-'}`;
+        `raf:${__rafTicks} submit:${(window as unknown as { __gpuSubmitCount?: number }).__gpuSubmitCount ?? 0} lastSeq:${w.__lastTileSeq ?? '-'}`;
       const coverageLine =
         `cdf53-coverage: tiles=${cdf53Tiles} refined=${cdf53Refined}/14p partial=${cdf53Partial} ` +
         `pass-hist{${histCompact}}`;
@@ -1142,7 +1142,7 @@ async function main() {
 
         if (!fullFrameDecoder) {
           fullFrameDecoder = new FullFrameDecoder((frame: VideoFrame) => {
-            renderer.h264Queue.push(frame);
+            renderer.pushH264(frame);
           }, 1920, 1080);
         }
 
