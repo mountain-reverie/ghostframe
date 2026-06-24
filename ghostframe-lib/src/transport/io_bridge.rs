@@ -139,6 +139,22 @@ const QUINN_SEND_BUFFER_SAFETY_FRACTION: f64 = 0.80;
 // the client's periodic `stats:` log — so the two lines line up
 // naturally for side-by-side delta inspection.
 const CUMULATIVE_EMIT_LOG_INTERVAL_FRAMES: u32 = 60;
+// Per-tile grace period after a resweep bump: at 30 fps capture this is
+// ~10 s. Long enough for the freshly-enqueued 14 passes to drain,
+// survive up-to-4 RTO retries, and have their ACKs accumulate at the
+// scheduler. Short enough that a truly stuck tile (e.g. high churn loss
+// rate) is re-attempted within ~10 s.
+const RESWEEP_GRACE_FRAMES: u32 = 300;
+// Don't run the stuck-tile resweep before this frame_seq. At 30 fps that's
+// ~20 s — long enough that the first-paint burst has had time to drain
+// through quinn's send buffer, survive any Blocked-induced RTO retries,
+// and accumulate ACKs naturally. Without this gate, the resweep at frame
+// 120 (~4 s) misidentifies in-progress tiles as stuck (cache evicted by
+// Blocked, counter < max_passes) and prematurely bumps their generation
+// — wiping ACK progress and preventing PixelPerfect transitions inside
+// short-running tests. Production sessions have minutes of operation
+// before sustained congestion matters, so a 20 s warmup is invisible.
+const RESWEEP_WARMUP_FRAMES: u32 = 600;
 
 // ---------------------------------------------------------------------------
 // M3.5 bench telemetry: per-frame send-side stats
@@ -329,6 +345,28 @@ pub struct IoBridge {
     /// sweep. Stashed here so Task 10's post-fence Phase B can read the list
     /// and update `already_escalated_this_gen` after the GPU work returns.
     cdf53_escalation_candidates_this_frame: Vec<u32>,
+    /// Flat tile indices (`y * cols + x`) for tiles whose Cdf53 refinement
+    /// stalled — emitter cache empty, refinement_queue empty, but
+    /// `cdf53_passes_acked < max_passes`. Populated by the periodic
+    /// resweep (every 30 frames) below the existing PixelPerfect sweep.
+    /// Phase A reads + drains this buffer and records the subset that was
+    /// merged into the GPU escalation dispatch in
+    /// `cdf53_stuck_resweep_in_escalation_this_frame`.
+    cdf53_stuck_resweep_candidates_this_frame: Vec<u32>,
+    /// Subset of `cdf53_stuck_resweep_candidates_this_frame` that was
+    /// actually merged into the Phase A GPU forward dispatch (and therefore
+    /// has valid GPU coefficients in the escalation buffer). Populated at
+    /// Phase A time; consumed by post-fence Phase B to bypass the
+    /// `codec_state == Cdf53` skip for these candidates.
+    cdf53_stuck_resweep_in_escalation_this_frame: Vec<u32>,
+    /// Per-tile grace deadline: for each `(tile_x, tile_y)` that was
+    /// re-emitted via the resweep, the frame_seq at which the tile is
+    /// once again eligible for resweep. Prevents re-bumping the
+    /// generation (and wiping the per-(tile, gen) ACK counter) before
+    /// the just-re-emitted passes have had time to drain through the
+    /// emitter retries + FEC + ACK round trip. Default grace is 10 s
+    /// at 30 fps; see `RESWEEP_GRACE_FRAMES`.
+    cdf53_resweep_grace_until_frame: std::collections::HashMap<(u8, u8), u32>,
     /// GPU-accelerated dirty tracker (Vulkan compute SAD).
     gpu_frame_processor: Option<GpuFrameProcessor>,
     /// Full-frame H.264 encoder (VA-API zero-copy).
@@ -472,6 +510,12 @@ struct BumpCountAccumulator {
     /// (`process_frame_gpu` line 2711). One per
     /// idle-escalation-promoted tile per frame.
     cdf53_escalation_path: u32,
+    /// Cumulative count of stuck-tile resweep bumps emitted to the
+    /// scheduler, for the per-`CUMULATIVE_EMIT_LOG_INTERVAL_FRAMES`
+    /// `bump counts` log line. Pairs with `cdf53_dirty_path` /
+    /// `cdf53_escalation_path` so an operator sees which path drove
+    /// each gen bump.
+    cdf53_stuck_resweep_path: u32,
 }
 
 /// Cumulative count of datagrams the server has handed to
@@ -781,6 +825,9 @@ impl IoBridge {
             feedback_history: std::collections::VecDeque::with_capacity(5),
             recent_suspension_flags: [false, false],
             cdf53_escalation_candidates_this_frame: Vec::new(),
+            cdf53_stuck_resweep_candidates_this_frame: Vec::new(),
+            cdf53_stuck_resweep_in_escalation_this_frame: Vec::new(),
+            cdf53_resweep_grace_until_frame: std::collections::HashMap::new(),
             gpu_frame_processor,
             full_frame_encoder: None,
             recent_frame_fragments: HashMap::new(),
@@ -2186,7 +2233,7 @@ impl IoBridge {
             // SECOND TileCodec frame. Acceptable — refinement queries run
             // every frame and there are plenty of cycles to escalate.
             let frame_mode_eligible = matches!(self.frame_mode, crate::tile::FrameMode::TileCodec);
-            let candidates = if frame_mode_eligible {
+            let mut candidates = if frame_mode_eligible {
                 crate::tile::detect_escalation_candidates(
                     &self.metrics_tracker,
                     crate::capture::gpu_pipeline::MAX_ESCALATION_PER_FRAME,
@@ -2194,6 +2241,33 @@ impl IoBridge {
             } else {
                 Vec::new()
             };
+            // Bug A: include stuck-tile resweep candidates in the
+            // Phase A GPU forward dispatch so their coefficients land
+            // in the same buffer the escalation Phase B reads from.
+            // Drain the resweep buffer so the periodic sweep can
+            // repopulate it on the next multiple-of-30 frame.
+            let resweep_pending = std::mem::take(
+                &mut self.cdf53_stuck_resweep_candidates_this_frame,
+            );
+            let existing: std::collections::HashSet<u32> =
+                candidates.iter().copied().collect();
+            let mut resweep_in_dispatch: Vec<u32> = Vec::new();
+            for idx in resweep_pending {
+                if candidates.len() >= crate::capture::gpu_pipeline::MAX_ESCALATION_PER_FRAME {
+                    // GPU buffer is full; can't dispatch more this frame.
+                    // Any remaining resweep candidates will be picked up on
+                    // the next resweep tick.
+                    break;
+                }
+                if !existing.contains(&idx) {
+                    candidates.push(idx);
+                    resweep_in_dispatch.push(idx);
+                }
+                // If it's already in candidates (e.g. also a normal
+                // escalation candidate), it will be processed by Phase B
+                // under the normal path; no need to track it here.
+            }
+            self.cdf53_stuck_resweep_in_escalation_this_frame = resweep_in_dispatch;
             let processor = self.gpu_frame_processor.as_mut().unwrap();
             processor.set_escalation_candidates(&candidates);
             self.cdf53_escalation_candidates_this_frame = candidates;
@@ -2463,6 +2537,82 @@ impl IoBridge {
                         "cdf53.pixelperfect"
                     );
                 }
+            }
+        }
+
+        // ---- Bug A resweep: rescue tiles whose Cdf53 refinement stalled ----
+        // A tile is "stuck" when:
+        //   - codec_state is Cdf53 { max_passes }
+        //   - cdf53_passes_acked < max_passes (not yet PixelPerfect)
+        //   - the scheduler refinement_queue holds no Pending/InFlight
+        //     entry for this tile (nothing left to drain)
+        //   - the ReliableTileEmitter cache holds no entry for this tile
+        //     (RTO retries exhausted; no future retransmit will fire)
+        //
+        // Cadence: once every 4 s (at 30 fps capture). This is comfortably
+        // longer than the emitter's worst-case RTO chain (50+100+200+400 ms
+        // = 750 ms for 4 retries), so we never declare a tile "stuck" while
+        // the emitter is still retrying it. Shorter intervals create
+        // sustained re-emission backpressure that starves the client's
+        // WebGPU pipeline under high-loss conditions.
+        if seq >= RESWEEP_WARMUP_FRAMES && seq.is_multiple_of(120) {
+            let tile_count = (cols * rows) as usize;
+            let mut candidates: Vec<((u8, u8), u8, u8)> = Vec::new();
+            for idx in 0..tile_count {
+                let tile_x = (idx as u32 % cols) as u8;
+                let tile_y = (idx as u32 / cols) as u8;
+                let max_passes = {
+                    let tm = self.metrics_tracker.get(tile_x as u32, tile_y as u32);
+                    match tm.codec_state {
+                        crate::tile::CodecState::Cdf53 { max_passes, .. } => max_passes,
+                        _ => continue,
+                    }
+                };
+                let gen = self.scheduler.generation_for(tile_x, tile_y);
+                candidates.push(((tile_x, tile_y), gen, max_passes));
+            }
+            let unacked = self.scheduler.cdf53_unacked_tiles_for_gen(&candidates);
+            let mut resweep_candidate_count: u32 = 0;
+            for (tile_x, tile_y) in unacked {
+                if self.scheduler.refinement_queue_holds_tile(tile_x, tile_y) {
+                    continue;
+                }
+                if self
+                    .reliable_emitter
+                    .has_cache_entries_for_tile(tile_x, tile_y)
+                {
+                    continue;
+                }
+                // Grace: don't re-bump a tile whose previous resweep
+                // bump is still within the ACK round-trip window. The
+                // ACK counter is wiped by bump_generation; bumping
+                // again before ACKs arrive perpetually resets progress.
+                let grace_until = self
+                    .cdf53_resweep_grace_until_frame
+                    .get(&(tile_x, tile_y))
+                    .copied()
+                    .unwrap_or(0);
+                if seq < grace_until {
+                    continue;
+                }
+                let flat_idx = (tile_y as u32) * cols + (tile_x as u32);
+                self.cdf53_stuck_resweep_candidates_this_frame.push(flat_idx);
+                resweep_candidate_count += 1;
+                tracing::trace!(
+                    target: "ghostframe::cdf53",
+                    tile_x = tile_x,
+                    tile_y = tile_y,
+                    gen = self.scheduler.generation_for(tile_x, tile_y),
+                    "cdf53.stuck_resweep_candidate"
+                );
+            }
+            if resweep_candidate_count > 0 {
+                tracing::info!(
+                    target: "ghostframe::cdf53",
+                    frame_seq = seq,
+                    resweep_candidate_count = resweep_candidate_count,
+                    "cdf53.stuck_resweep_summary"
+                );
             }
         }
 
@@ -2909,6 +3059,23 @@ impl IoBridge {
                 // escalation forward dispatches recorded above). Reads
                 // escalation coefficients per-slot, encodes 14 passes,
                 // enqueues into the scheduler.
+
+                // ---- Bug A: drain stuck-tile resweep candidates ----
+                // Same shape as escalation Phase B, but the codec_state ==
+                // Cdf53 guard is intentionally removed for these: stuck
+                // tiles are *already* in Cdf53 state and we want exactly
+                // that path. Coefficients for resweep idxs land in the
+                // same GPU buffer because Phase A above merged them into
+                // the escalation dispatch list (`set_escalation_candidates`
+                // was called with these indices included). The in-escalation
+                // list was recorded at Phase A time; the periodic resweep
+                // buffer (`cdf53_stuck_resweep_candidates_this_frame`) may
+                // have been repopulated since then (if this is a multiple-
+                // of-30 frame) and must NOT be drained here.
+                let stuck_resweep_set: std::collections::HashSet<u32> =
+                    std::mem::take(&mut self.cdf53_stuck_resweep_in_escalation_this_frame)
+                        .into_iter()
+                        .collect();
                 let escalation_candidates =
                     std::mem::take(&mut self.cdf53_escalation_candidates_this_frame);
                 if !escalation_candidates.is_empty() {
@@ -2926,12 +3093,19 @@ impl IoBridge {
                         // bump again, supersede the just-enqueued passes,
                         // emit 14 duplicate cdf53.emit lines, and waste a
                         // GPU forward dispatch with the same coefficients.
-                        if matches!(
-                            self.metrics_tracker
-                                .get(tile_x as u32, tile_y as u32)
-                                .codec_state,
-                            crate::tile::CodecState::Cdf53 { .. }
-                        ) {
+                        // Skip Cdf53 tiles UNLESS this candidate was
+                        // pushed by the stuck-tile resweep, in which
+                        // case "already Cdf53" is the *expected* state
+                        // and the goal is precisely to bump and re-emit.
+                        let is_stuck_resweep = stuck_resweep_set.contains(&flat_tile_idx);
+                        if !is_stuck_resweep
+                            && matches!(
+                                self.metrics_tracker
+                                    .get(tile_x as u32, tile_y as u32)
+                                    .codec_state,
+                                crate::tile::CodecState::Cdf53 { .. }
+                            )
+                        {
                             continue;
                         }
                         let coeffs_i32 = unsafe {
@@ -2952,6 +3126,15 @@ impl IoBridge {
                             .bump_count_accumulator
                             .cdf53_escalation_path
                             .saturating_add(1);
+                        if is_stuck_resweep {
+                            self.bump_count_accumulator.cdf53_stuck_resweep_path =
+                                self.bump_count_accumulator.cdf53_stuck_resweep_path.saturating_add(1);
+                            // Stamp grace so the next resweep sweep skips
+                            // this tile until ACKs from the just-enqueued
+                            // 14 passes have had time to land.
+                            self.cdf53_resweep_grace_until_frame
+                                .insert((tile_x, tile_y), seq.saturating_add(RESWEEP_GRACE_FRAMES));
+                        }
                         // (Old generation Cdf53 in-flight coverage is now
                         // dropped via the `reliable_emitter.cancel_for_tile`
                         // call above; the fragment_coverage drop here
@@ -2965,7 +3148,7 @@ impl IoBridge {
                                 gen = gen,
                                 pass_idx = pass_idx,
                                 payload_size = payload.len(),
-                                source = "escalation",
+                                source = if is_stuck_resweep { "stuck_resweep" } else { "escalation" },
                                 "cdf53.emit"
                             );
                         }
@@ -3118,6 +3301,7 @@ impl IoBridge {
                         bumps_priority_path = b.priority_path,
                         bumps_cdf53_dirty_path = b.cdf53_dirty_path,
                         bumps_cdf53_escalation_path = b.cdf53_escalation_path,
+                        bumps_cdf53_stuck_resweep_path = b.cdf53_stuck_resweep_path,
                         refinement_queue_len = refinement_queue_len,
                         "bump counts (since last cumulative log) + scheduler refinement queue depth"
                     );
@@ -3725,6 +3909,9 @@ impl IoBridge {
             feedback_history: std::collections::VecDeque::with_capacity(5),
             recent_suspension_flags: [false, false],
             cdf53_escalation_candidates_this_frame: Vec::new(),
+            cdf53_stuck_resweep_candidates_this_frame: Vec::new(),
+            cdf53_stuck_resweep_in_escalation_this_frame: Vec::new(),
+            cdf53_resweep_grace_until_frame: std::collections::HashMap::new(),
             gpu_frame_processor: None,
             full_frame_encoder: None,
             recent_frame_fragments: HashMap::new(),
@@ -3798,6 +3985,9 @@ impl IoBridge {
             feedback_history: std::collections::VecDeque::with_capacity(5),
             recent_suspension_flags: [false, false],
             cdf53_escalation_candidates_this_frame: Vec::new(),
+            cdf53_stuck_resweep_candidates_this_frame: Vec::new(),
+            cdf53_stuck_resweep_in_escalation_this_frame: Vec::new(),
+            cdf53_resweep_grace_until_frame: std::collections::HashMap::new(),
             gpu_frame_processor: None,
             full_frame_encoder: None,
             recent_frame_fragments: HashMap::new(),
