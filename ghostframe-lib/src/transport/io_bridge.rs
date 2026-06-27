@@ -140,6 +140,20 @@ const QUINN_SEND_BUFFER_SAFETY_FRACTION: f64 = 0.80;
 // naturally for side-by-side delta inspection.
 const CUMULATIVE_EMIT_LOG_INTERVAL_FRAMES: u32 = 60;
 
+// Maximum number of RTO-driven retransmits the ReliableTileEmitter is
+// allowed to fire per `tick()` call. Sized to comfortably fit in quinn's
+// `datagram_send_buffer` so a tick never overruns it. When more entries
+// are due than this cap, the un-popped ones stay in the RTO heap and
+// are picked up either by the next per-frame tick or by the
+// `Event::DatagramsUnblocked` continuation — quinn signals available
+// buffer space, we pop the next batch. Without this cap, sustained
+// loss fills the cache with thousands of pending passes; one `tick()`
+// floods quinn with retransmits, most are rejected with
+// `SendDatagramError::Blocked`, the cache never drains, and the link
+// settles into a self-sustained storm (~1.4 M retransmits / 3 minutes
+// observed in production with no cap).
+const RTO_RETRANSMITS_PER_TICK: usize = 64;
+
 // ---------------------------------------------------------------------------
 // M3.5 bench telemetry: per-frame send-side stats
 // ---------------------------------------------------------------------------
@@ -3042,7 +3056,7 @@ impl IoBridge {
                 // is due (no cache hits, no parity ready).
                 {
                     let tick_now = Instant::now();
-                    self.reliable_emitter.tick(tick_now);
+                    self.reliable_emitter.tick(tick_now, RTO_RETRANSMITS_PER_TICK);
                     let bridge_ptr: *mut IoBridge = self as *mut IoBridge;
                     let mut adapter =
                         IoBridgeSenderAdapter { bridge: bridge_ptr };
@@ -3111,6 +3125,12 @@ impl IoBridge {
                         emitter_ack_misses = es.ack_miss,
                         cache_lru_eviction = self.reliable_emitter.cache.stats.lru_eviction,
                         retransmit_attempts_total = es.retransmit_attempts_total,
+                        // Per-window snapshot of un-ACKed tile-passes still in
+                        // the emitter cache awaiting RTO retry. Steady-state
+                        // ~0 when the link is healthy; persistent >0 means
+                        // the long-tail un-deliverable passes that the
+                        // client should be NACKing.
+                        cache_pending_entries = self.reliable_emitter.pending_cache_entries(),
                         "cumulative emit (datagrams handed to quinn since startup, per codec)"
                     );
 
@@ -3391,6 +3411,39 @@ impl IoBridge {
             match event {
                 Event::Connected => {
                     // New connection fully established — start the H3 handshake.
+                    //
+                    // Single-client cleanup: drop any wt_sessions left over from
+                    // a prior QUIC connection and clear the emitter cache. The
+                    // server is designed for one viewer at a time; on page
+                    // reload the browser opens a fresh QUIC connection
+                    // (different ConnectionHandle) without closing the old one
+                    // cleanly via `Event::ConnectionLost` (quinn only emits
+                    // that on idle timeout or transport error, not on graceful
+                    // WT close). Without this prune, the stale session stays
+                    // marked `is_connected()=true` forever, every emitted
+                    // datagram is fanned out to its dead handle (consuming
+                    // quinn buffer and generating Blocked errors), and the
+                    // emitter's cache inherits thousands of un-ACKable pending
+                    // entries from the old session that flood the link until
+                    // RTO eventually times out the old QUIC connection.
+                    let stale: Vec<ConnectionHandle> = self
+                        .wt_sessions
+                        .keys()
+                        .copied()
+                        .filter(|h| *h != handle)
+                        .collect();
+                    if !stale.is_empty() {
+                        tracing::info!(
+                            new_handle = ?handle,
+                            stale_count = stale.len(),
+                            "new QUIC connection — pruning stale wt_sessions and clearing emitter cache"
+                        );
+                        for h in &stale {
+                            self.wt_sessions.remove(h);
+                            self.session_resets_fired.remove(h);
+                        }
+                        self.reliable_emitter.clear_cache();
+                    }
                     let wt = self.wt_sessions.entry(handle).or_default();
                     if let Some(conn) = self.server.connections.get_mut(&handle) {
                         wt.on_new_connection(conn);
@@ -3507,6 +3560,22 @@ impl IoBridge {
                     // when quinn signals it has room, not when the
                     // next frame arrives.
                     self.resume_scheduler_continuation();
+                    // Also fire the next batch of RTO-due retransmits.
+                    // tick() is rate-limited to RTO_RETRANSMITS_PER_TICK
+                    // entries so quinn's just-freed buffer absorbs them
+                    // without re-Blocking. drain() flushes the resulting
+                    // emission queue (source + parity) to the wire.
+                    // Without this, the emitter would have to wait for
+                    // the next 33 ms capture tick to push pending
+                    // retransmits, adding up to ~33 ms latency to every
+                    // recovered pass under sustained load.
+                    let tick_now = Instant::now();
+                    self.reliable_emitter
+                        .tick(tick_now, RTO_RETRANSMITS_PER_TICK);
+                    let bridge_ptr: *mut IoBridge = self as *mut IoBridge;
+                    let mut adapter =
+                        IoBridgeSenderAdapter { bridge: bridge_ptr };
+                    self.reliable_emitter.drain(&mut adapter, tick_now);
                 }
 
                 _ => {

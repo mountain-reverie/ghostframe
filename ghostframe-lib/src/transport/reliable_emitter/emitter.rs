@@ -111,16 +111,33 @@ impl ReliableTileEmitter {
         }
     }
 
-    /// Drain due RTO entries. For each due key, validate against the live
-    /// cache (silently skip stale entries — already ACKed or cancelled).
-    /// Bump `attempts` (used only for RTO backoff selection), re-enqueue
-    /// every cached fragment via the EmissionQueue with the same
-    /// wire_seqs (so client dedup keys remain stable), and reschedule a
-    /// new RTO deadline using `rto_for_attempt`. Never retires — the
-    /// entry stays in the cache until ACKed, cancelled via
-    /// `cancel_for_tile`, or the session ends via `clear_cache`.
-    pub fn tick(&mut self, now: Instant) {
-        while let Some(key) = self.rto.pop_due(now) {
+    /// Drain up to `max_retransmits` due RTO entries. For each due key,
+    /// validate against the live cache (silently skip stale entries —
+    /// already ACKed or cancelled). Bump `attempts` (used only for RTO
+    /// backoff selection), re-enqueue every cached fragment via the
+    /// EmissionQueue with the same wire_seqs (so client dedup keys
+    /// remain stable), and reschedule a new RTO deadline using
+    /// `rto_for_attempt`. Never retires — the entry stays in the cache
+    /// until ACKed, cancelled via `cancel_for_tile`, or the session
+    /// ends via `clear_cache`.
+    ///
+    /// Rate-limit rationale: when many entries are simultaneously due
+    /// (typical when sustained loss has filled the cache with thousands
+    /// of pending passes), firing them all in one `tick()` call hands
+    /// quinn far more datagrams than its `datagram_send_buffer` can
+    /// absorb, generating `SendDatagramError::Blocked` on the rejected
+    /// ones (they're silently dropped from the wire — the cache still
+    /// has the entry, so RTO will fire it again, perpetuating a storm
+    /// where the link can never settle). Capping at a small number per
+    /// call converts that storm into orderly drip-feed: heap entries
+    /// not popped this tick stay due, and the next call pops the next
+    /// batch. Pairs with the `Event::DatagramsUnblocked` continuation
+    /// in `IoBridge::run` which calls this again whenever quinn frees
+    /// up datagram-buffer space.
+    pub fn tick(&mut self, now: Instant, max_retransmits: usize) {
+        let mut count = 0;
+        while count < max_retransmits {
+            let Some(key) = self.rto.pop_due(now) else { break; };
             let Some(entry) = self.cache.get_mut(&key) else {
                 // Already ACKed or cancelled — stale heap entry; skip silently.
                 continue;
@@ -160,7 +177,15 @@ impl ReliableTileEmitter {
             self.rto.schedule(key, now + new_rto);
             self.stats.rto_fired += 1;
             self.stats.retransmit_attempts_total += 1;
+            count += 1;
         }
+    }
+
+    /// Number of cache entries currently held — i.e. unACKed tile-passes
+    /// awaiting either an ACK, a `cancel_for_tile`, or session end.
+    /// Diagnostic accessor for the cumulative-emit log.
+    pub fn pending_cache_entries(&self) -> usize {
+        self.cache.len()
     }
 
     /// Ingest a batch of NACKs from the client. For each (key, frag_idx):
@@ -371,7 +396,7 @@ mod tests {
         let entry_first_sent = e.cache.get(&key).unwrap().first_sent_at;
         // Advance past RTO; tick should retransmit.
         let t1 = t0 + Duration::from_millis(60);
-        e.tick(t1);
+        e.tick(t1, usize::MAX);
         e.drain(&mut sender, t1);
         assert_eq!(sender.sent.len(), 2);
         let entry = e.cache.get(&key).unwrap();
@@ -395,7 +420,7 @@ mod tests {
         let mut tn = t0;
         for _ in 0..10 {
             tn += Duration::from_millis(500);
-            e.tick(tn);
+            e.tick(tn, usize::MAX);
             e.drain(&mut sender, tn);
         }
         // Entry must still be in the cache — no retirement.
@@ -414,7 +439,7 @@ mod tests {
         e.drain(&mut sender, t0);
         e.on_ack(&[key]);
         let t1 = t0 + Duration::from_millis(60);
-        e.tick(t1);
+        e.tick(t1, usize::MAX);
         e.drain(&mut sender, t1);
         assert_eq!(sender.sent.len(), 1, "no retransmit after ACK");
         assert_eq!(e.stats.rto_fired, 0);
@@ -462,7 +487,7 @@ mod tests {
         assert!(e.cache.get(&k3).is_some());
         // Tick past RTO — no retransmit for cancelled, retransmit for k3.
         let t1 = t0 + Duration::from_millis(60);
-        e.tick(t1);
+        e.tick(t1, usize::MAX);
         e.drain(&mut sender, t1);
         assert_eq!(sender.sent.len(), 4, "3 initial + 1 retransmit for k3 only");
     }
@@ -527,7 +552,7 @@ mod tests {
         let mut t = now;
         for _ in 0..30 {
             t += std::time::Duration::from_secs(5);
-            e.tick(t);
+            e.tick(t, usize::MAX);
             e.drain(&mut Sink(&mut sink), t);
         }
         // Entry must still be live in the cache.
@@ -541,5 +566,61 @@ mod tests {
             !e.has_cache_entries_for_tile(0, 0),
             "ACK must remove the entry from the cache"
         );
+    }
+
+    #[test]
+    fn tick_respects_max_retransmits_budget() {
+        // Submit 1000 entries with distinct EmitKeys (so each gets its own
+        // RTO heap entry). Advance time past all their initial RTOs.
+        // tick(t, budget) must fire at most `budget` retransmits per call,
+        // leaving the rest still due in the heap for the next call.
+        let mut e = ReliableTileEmitter::new();
+        let now = Instant::now();
+        for i in 0..1000u32 {
+            let k = EmitKey::new(i, 0, 0, 0);
+            e.submit_one(k, bytes::Bytes::from(vec![0u8; 16]), now);
+        }
+        // Drain the initial 1000 submissions.
+        struct Sink<'a>(&'a mut Vec<Vec<u8>>);
+        impl<'a> crate::transport::reliable_emitter::traits::DatagramSender for Sink<'a> {
+            fn send(&mut self, dg: &[u8]) {
+                self.0.push(dg.to_vec());
+            }
+        }
+        let mut sink: Vec<Vec<u8>> = Vec::new();
+        e.drain(&mut Sink(&mut sink), now);
+        sink.clear();
+
+        // Advance past the first RTO deadline of every entry.
+        let t1 = now + std::time::Duration::from_secs(1);
+
+        // First tick with budget=64: must fire exactly 64.
+        let before = e.stats.rto_fired;
+        e.tick(t1, 64);
+        e.drain(&mut Sink(&mut sink), t1);
+        assert_eq!(
+            e.stats.rto_fired - before,
+            64,
+            "first tick must fire exactly the budget"
+        );
+        assert_eq!(sink.len(), 64, "exactly 64 retransmits drained to wire");
+
+        // Second tick at same instant: another 64 should fire (936 still due).
+        sink.clear();
+        let before = e.stats.rto_fired;
+        e.tick(t1, 64);
+        e.drain(&mut Sink(&mut sink), t1);
+        assert_eq!(e.stats.rto_fired - before, 64, "second tick fires another batch");
+        assert_eq!(sink.len(), 64);
+
+        // After many ticks at budget=64, all 1000 entries should be popped
+        // (each pop reschedules its RTO into the future, so subsequent ticks
+        // at t1 yield None). 1000 / 64 ≈ 16 ticks needed.
+        for _ in 0..20 {
+            e.tick(t1, 64);
+        }
+        // All 1000 entries' next RTOs are in the future — heap has nothing due.
+        // pending_cache_entries reflects un-ACKed work, still 1000.
+        assert_eq!(e.pending_cache_entries(), 1000);
     }
 }
