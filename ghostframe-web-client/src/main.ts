@@ -590,7 +590,7 @@ async function main() {
       // plain number rather than a string for cheaper lookup; the
       // value is `{ generation, passMask }` where passMask bit i ==
       // pass i received.
-      const cdf53Coverage: Map<number, { generation: number; frameSeq: number; passMask: number; lastChangeMs: number }> =
+      const cdf53Coverage: Map<number, { generation: number; frameSeq: number; passMask: number; nackedMask: number; lastChangeMs: number }> =
         (w.__cdf53Coverage ??= new Map());
       const tileKey = (tX << 8) | tY;
       const gen = asm.header.generation;
@@ -600,20 +600,22 @@ async function main() {
       if (!existing || existing.generation !== gen) {
         // First pass for this (tile, generation) — replaces any prior
         // partial state from the previous generation. Track frameSeq so
-        // the periodic pass-NACK sweep below can address the right
-        // cache entry on the server (the server's emitter cache is
-        // keyed by (frameSeq, tile, pass)).
+        // the pass-NACK paths can address the right cache entry on the
+        // server (the server's emitter cache is keyed by (frameSeq,
+        // tile, pass)). nackedMask starts empty; gap detection below
+        // marks bits in it as we NACK them.
         cdf53Coverage.set(tileKey, {
           generation: gen,
           frameSeq: frameSeqFromKey,
           passMask: 1 << passIdx,
+          nackedMask: 0,
           lastChangeMs: nowMs,
         });
       } else {
         // Only update lastChangeMs when the bitmap ACTUALLY changes —
         // duplicate-pass arrivals (FEC recovery firing same pass after
         // RTO already delivered it) shouldn't reset the stuck-tile
-        // timer. The NACK fallback needs "no new BIT for N ms", not
+        // timer. The tail fallback needs "no new BIT for N ms", not
         // "no new ARRIVAL for N ms".
         const before = existing.passMask;
         existing.passMask |= 1 << passIdx;
@@ -622,19 +624,22 @@ async function main() {
           // Gap detection: server emits passes 0→13 in pass-major order;
           // if we just set bit N but any bit M<N is still unset, M was
           // either lost on the wire OR is in-flight reordering behind
-          // this datagram. Queue a NACK; the debounced flush below
-          // re-checks the bitmap before sending so a M that arrives in
-          // the debounce window cancels itself out. This recovers the
-          // common case (mid-sequence loss) at one RTT instead of
-          // waiting for the slow tail-fallback.
+          // this datagram. NACK each missing M ONCE per generation
+          // (tracked by nackedMask) — the server's on_nack handler will
+          // either deliver or fail; either way, repeating the NACK on
+          // every subsequent pass arrival just floods the upstream with
+          // duplicates the server has to discard as nack_miss. The
+          // tail-fallback sweep below catches the rare case where a
+          // NACK + its retransmit are both lost.
           const sentinel = (1 << passIdx) - 1; // bits 0..passIdx-1
-          const missingBelow = sentinel & ~existing.passMask;
+          const missingBelow = sentinel & ~existing.passMask & ~existing.nackedMask;
           if (missingBelow !== 0) {
             for (let p = 0; p < passIdx; p++) {
               if ((missingBelow & (1 << p)) !== 0) {
                 queuePassNack(frameSeqFromKey, tX, tY, p);
               }
             }
+            existing.nackedMask |= missingBelow;
           }
         }
         // Refresh frame_seq: the most recent emission of this tile is
@@ -762,7 +767,7 @@ async function main() {
     nackFlushTimer = null;
     if (pendingNacks.size === 0) return;
     const cov = (window as any).__cdf53Coverage as
-      | Map<number, { generation: number; frameSeq: number; passMask: number; lastChangeMs: number }>
+      | Map<number, { generation: number; frameSeq: number; passMask: number; nackedMask: number; lastChangeMs: number }>
       | undefined;
     for (const entry of pendingNacks.values()) {
       // Re-check the live bitmap right before sending. A pass that
@@ -804,16 +809,22 @@ async function main() {
     // and feed missing frag_idxs into the NackBatcher.
     scanForAssemblyTimeouts(performance.now(), assemblies.values());
 
-    // Tail-fallback sweep: catch tiles where the FINAL pass is lost
-    // (gap detection can't see it because no higher pass arrives).
-    // Fires every TAIL_SWEEP_INTERVAL_MS at most; only NACKs tiles
+    // Tail-fallback sweep: catch tiles where:
+    //   (a) the FINAL pass is lost — gap detection can't see it because
+    //       no higher pass arrives, OR
+    //   (b) a previously-NACKed pass + its retransmit were both lost —
+    //       gap detection has already marked it in nackedMask so it
+    //       won't re-fire from arrivals.
+    // Fires every TAIL_SWEEP_INTERVAL_MS at most; only acts on tiles
     // whose bitmap hasn't gained a new bit in TAIL_FALLBACK_MS AND
-    // is incomplete.
+    // are still incomplete. Re-NACKs everything missing AND clears
+    // nackedMask for those bits so gap detection can fire again if a
+    // higher pass arrives later (after a long stall).
     const tickNowMs = performance.now();
     if (tickNowMs - __lastTailSweepMs > TAIL_SWEEP_INTERVAL_MS) {
       __lastTailSweepMs = tickNowMs;
       const cov = (window as any).__cdf53Coverage as
-        | Map<number, { generation: number; frameSeq: number; passMask: number; lastChangeMs: number }>
+        | Map<number, { generation: number; frameSeq: number; passMask: number; nackedMask: number; lastChangeMs: number }>
         | undefined;
       if (cov) {
         for (const [tileKey, v] of cov.entries()) {
@@ -821,11 +832,15 @@ async function main() {
           if (tickNowMs - v.lastChangeMs < TAIL_FALLBACK_MS) continue;
           const tileX = (tileKey >> 8) & 0xFF;
           const tileY = tileKey & 0xFF;
+          const missing = ~v.passMask & FULL_PASS_MASK;
           for (let p = 0; p < 14; p++) {
-            if ((v.passMask & (1 << p)) === 0) {
+            if ((missing & (1 << p)) !== 0) {
               queuePassNack(v.frameSeq, tileX, tileY, p);
             }
           }
+          // Clear nackedMask for the missing bits so gap detection can
+          // fire again if normal arrivals resume after this stall.
+          v.nackedMask &= ~missing;
           // Reset the change timer so we don't re-NACK on the very next
           // sweep — give the server a TAIL_FALLBACK_MS window to respond.
           // Real progress will overwrite this via the coverage-update
@@ -903,7 +918,7 @@ async function main() {
       // The histogram exposes the *distribution* of pass counts so we
       // can tell e.g. "most are stuck at 8" (LL3 + a few bit-planes)
       // vs "most are at 14 but a handful missing one or two passes".
-      const cdf53Cov = (w.__cdf53Coverage ?? new Map<number, { generation: number; frameSeq: number; passMask: number; lastChangeMs: number }>()) as Map<number, { generation: number; frameSeq: number; passMask: number; lastChangeMs: number }>;
+      const cdf53Cov = (w.__cdf53Coverage ?? new Map<number, { generation: number; frameSeq: number; passMask: number; nackedMask: number; lastChangeMs: number }>()) as Map<number, { generation: number; frameSeq: number; passMask: number; nackedMask: number; lastChangeMs: number }>;
       let cdf53Refined = 0;
       let cdf53Partial = 0;
       const cdf53PassHist = new Array(15).fill(0); // bucket index = passes received (0..14)
