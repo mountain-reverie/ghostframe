@@ -200,6 +200,14 @@ impl ReliableTileEmitter {
         // drop them when the cache lookup misses.
     }
 
+    /// Drop every cached entry. Called from `IoBridge::Event::ConnectionLost`
+    /// — see `RetransmitCache::clear` doc.
+    pub fn clear_cache(&mut self) {
+        self.cache.clear();
+        // RTO heap entries will validate against the empty cache on pop
+        // and silently skip; no need to flush the heap.
+    }
+
     pub fn has_cache_entries_for_tile(&self, tile_x: u8, tile_y: u8) -> bool {
         self.cache.has_entries_for_tile(tile_x, tile_y)
     }

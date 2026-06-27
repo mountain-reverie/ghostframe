@@ -1,5 +1,6 @@
 //! Per-session retransmit cache. Holds emitted fragments by EmitKey for
-//! re-emission on RTO / NACK. Bounded by LRU.
+//! re-emission on RTO / NACK. Unbounded — entries live until ACKed,
+//! superseded via `cancel_for_tile`, or the session ends via `clear`.
 
 use crate::transport::reliable_emitter::{EmitKey, CACHE_CAPACITY};
 use bytes::Bytes;
@@ -42,15 +43,18 @@ impl RetransmitCache {
     pub fn len(&self) -> usize { self.entries.len() }
     pub fn is_empty(&self) -> bool { self.entries.is_empty() }
 
-    /// Insert a fresh entry. If the cache is at capacity, evicts the LRU
-    /// entry and bumps `stats.lru_eviction`.
+    /// Insert a fresh entry. Cache has no upper bound — entries live
+    /// until ACKed (`remove`), the tile is superseded
+    /// (`cancel_for_tile`), or the session ends (`clear`). This is the
+    /// delivery-guarantee invariant: an un-ACKed tile-pass is never
+    /// silently dropped. Memory is bounded in practice by the number of
+    /// in-flight unacked passes — typically a few thousand under normal
+    /// conditions, up to ~50 K (~25 MB at 500 B per pass) during a
+    /// 1920×1080 first-paint burst over a high-RTT link.
     pub fn insert(&mut self, key: EmitKey, entry: CacheEntry) {
-        if self.entries.len() >= CACHE_CAPACITY {
-            if let Some((evicted, _)) = self.lru.pop_lru() {
-                self.entries.remove(&evicted);
-                self.stats.lru_eviction = self.stats.lru_eviction.saturating_add(1);
-            }
-        }
+        // LRU is retained for compatibility with the public `stats.lru_eviction`
+        // field (still useful for spotting genuine ACK-failure cliffs in
+        // the future) but never triggers eviction now.
         self.lru.put(key, ());
         self.entries.insert(key, entry);
     }
@@ -83,6 +87,16 @@ impl RetransmitCache {
             self.lru.pop(k);
             self.entries.remove(k);
         }
+    }
+
+    /// Drop every cached entry. Invoked from `IoBridge::Event::ConnectionLost`
+    /// — when the WebTransport session ends, the un-ACKed passes are no
+    /// longer deliverable and must not occupy memory or fire spurious
+    /// retransmits for the next-connecting client.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        // LruCache has no clear(); rebuild it.
+        self.lru = LruCache::new(NonZeroUsize::new(CACHE_CAPACITY).unwrap());
     }
 
     /// Returns true iff at least one cache entry matches `(tile_x, tile_y)`
@@ -140,19 +154,6 @@ mod tests {
     }
 
     #[test]
-    fn lru_eviction_bumps_stat_when_at_capacity() {
-        let mut c = RetransmitCache::new();
-        let now = Instant::now();
-        for i in 0..(CACHE_CAPACITY as u32) {
-            c.insert(EmitKey::new(i, 0, 0, 0), mk_entry(now));
-        }
-        assert_eq!(c.stats.lru_eviction, 0);
-        c.insert(EmitKey::new(99999, 0, 0, 0), mk_entry(now));
-        assert_eq!(c.stats.lru_eviction, 1);
-        assert_eq!(c.len(), CACHE_CAPACITY);
-    }
-
-    #[test]
     fn has_entries_for_tile_reflects_live_entries_only() {
         let now = Instant::now();
         let mut c = RetransmitCache::new();
@@ -163,5 +164,39 @@ mod tests {
         assert!(!c.has_entries_for_tile(3, 5));
         c.remove(&k);
         assert!(!c.has_entries_for_tile(3, 4));
+    }
+
+    #[test]
+    fn cache_grows_past_capacity_without_eviction() {
+        let now = Instant::now();
+        let mut c = RetransmitCache::new();
+        // Insert 2× CACHE_CAPACITY entries — none should be evicted.
+        let target = CACHE_CAPACITY * 2;
+        for i in 0..(target as u32) {
+            let k = EmitKey { frame_seq: i, tile_x: 0, tile_y: 0, pass_idx: 0 };
+            c.insert(k, mk_entry(now));
+        }
+        assert_eq!(c.len(), target);
+        assert_eq!(
+            c.stats.lru_eviction, 0,
+            "no LRU eviction — entries stay until cancel/clear"
+        );
+        // The very first inserted entry must still be present.
+        let first = EmitKey { frame_seq: 0, tile_x: 0, tile_y: 0, pass_idx: 0 };
+        assert!(c.get(&first).is_some());
+    }
+
+    #[test]
+    fn clear_drops_all_entries() {
+        let now = Instant::now();
+        let mut c = RetransmitCache::new();
+        for i in 0..100u32 {
+            let k = EmitKey { frame_seq: i, tile_x: 0, tile_y: 0, pass_idx: 0 };
+            c.insert(k, mk_entry(now));
+        }
+        assert_eq!(c.len(), 100);
+        c.clear();
+        assert_eq!(c.len(), 0);
+        assert!(c.is_empty());
     }
 }
