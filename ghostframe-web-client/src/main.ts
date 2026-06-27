@@ -590,18 +590,32 @@ async function main() {
       // plain number rather than a string for cheaper lookup; the
       // value is `{ generation, passMask }` where passMask bit i ==
       // pass i received.
-      const cdf53Coverage: Map<number, { generation: number; passMask: number }> =
+      const cdf53Coverage: Map<number, { generation: number; frameSeq: number; passMask: number; lastUpdateMs: number }> =
         (w.__cdf53Coverage ??= new Map());
       const tileKey = (tX << 8) | tY;
       const gen = asm.header.generation;
       const passIdx = asm.header.pass;
+      const nowMs = performance.now();
       const existing = cdf53Coverage.get(tileKey);
       if (!existing || existing.generation !== gen) {
         // First pass for this (tile, generation) — replaces any prior
-        // partial state from the previous generation.
-        cdf53Coverage.set(tileKey, { generation: gen, passMask: 1 << passIdx });
+        // partial state from the previous generation. Track frameSeq so
+        // the periodic pass-NACK sweep below can address the right
+        // cache entry on the server (the server's emitter cache is
+        // keyed by (frameSeq, tile, pass)).
+        cdf53Coverage.set(tileKey, {
+          generation: gen,
+          frameSeq: frameSeqFromKey,
+          passMask: 1 << passIdx,
+          lastUpdateMs: nowMs,
+        });
       } else {
         existing.passMask |= 1 << passIdx;
+        existing.lastUpdateMs = nowMs;
+        // Refresh frame_seq: the most recent emission of this tile is
+        // what the server's cache currently holds for any still-missing
+        // passes.
+        existing.frameSeq = frameSeqFromKey;
       }
 
       const r = prevalidateCdf53(payload, asm.header.generation, asm.header.pass);
@@ -691,6 +705,19 @@ async function main() {
   // Idle suppression: skip emission when the snapshot is identical to
   // the last one. No heartbeat; silence means nothing changed.
   let __lastStatsLineKey = '';
+  // Pass-level NACK sweep: every NACK_SWEEP_INTERVAL_MS, scan
+  // __cdf53Coverage for tiles that have been partial (passMask < 0x3FFF)
+  // for >= NACK_THRESHOLD_MS with no new passes arriving — those are
+  // "tail" passes the server emitted once and never successfully
+  // retransmitted (typically because they hit a series of unlucky
+  // wire drops at the long-RTO end of the emitter's backoff). For each
+  // such tile, NACK the missing pass_idxs. The server's on_nack
+  // handler re-emits the specific cached fragment immediately, much
+  // faster than waiting for the next RTO tick at the 5 s cap.
+  const NACK_SWEEP_INTERVAL_MS = 2000;
+  const NACK_THRESHOLD_MS = 3000;
+  const FULL_PASS_MASK = (1 << 14) - 1;
+  let __lastNackSweepMs = 0;
   function tick() {
     __rafTicks++;
     diag.recordRafTick(__rafTicks);
@@ -698,6 +725,41 @@ async function main() {
     // Reliable-tile-emitter: scan partial assemblies for fragment timeouts
     // and feed missing frag_idxs into the NackBatcher.
     scanForAssemblyTimeouts(performance.now(), assemblies.values());
+
+    // Pass-level NACK sweep — see constant declarations above.
+    const tickNowMs = performance.now();
+    if (tickNowMs - __lastNackSweepMs > NACK_SWEEP_INTERVAL_MS) {
+      __lastNackSweepMs = tickNowMs;
+      const cov = (window as any).__cdf53Coverage as
+        | Map<number, { generation: number; frameSeq: number; passMask: number; lastUpdateMs: number }>
+        | undefined;
+      if (cov) {
+        for (const [tileKey, v] of cov.entries()) {
+          if (v.passMask === FULL_PASS_MASK) continue;
+          if (tickNowMs - v.lastUpdateMs < NACK_THRESHOLD_MS) continue;
+          const tileX = (tileKey >> 8) & 0xFF;
+          const tileY = tileKey & 0xFF;
+          // Identify missing pass_idxs and NACK each. frag_idx=0 because
+          // every CDF53 pass is a single fragment (the wavelet bands are
+          // packed by the encoder; there is no fragment-level split for
+          // pass-encoded data on the wire).
+          for (let p = 0; p < 14; p++) {
+            if ((v.passMask & (1 << p)) === 0) {
+              nackBatcher.add(
+                { frameSeq: v.frameSeq, tileX, tileY, passIdx: p },
+                0,
+              );
+            }
+          }
+          // Reset the timer so we don't spam — wait another
+          // NACK_THRESHOLD_MS before re-NACKing if the server still
+          // hasn't delivered. The lastUpdateMs bump will normally be
+          // overwritten when a pass arrives; manually bumping it here
+          // gives the server time to respond.
+          v.lastUpdateMs = tickNowMs;
+        }
+      }
+    }
 
     // M3.5 bench: emit recordFramePainted for all frames whose last tile was
     // received before this rAF tick. Uses performance.now() at rAF entry so
@@ -767,7 +829,7 @@ async function main() {
       // The histogram exposes the *distribution* of pass counts so we
       // can tell e.g. "most are stuck at 8" (LL3 + a few bit-planes)
       // vs "most are at 14 but a handful missing one or two passes".
-      const cdf53Cov = (w.__cdf53Coverage ?? new Map<number, { generation: number; passMask: number }>()) as Map<number, { generation: number; passMask: number }>;
+      const cdf53Cov = (w.__cdf53Coverage ?? new Map<number, { generation: number; frameSeq: number; passMask: number; lastUpdateMs: number }>()) as Map<number, { generation: number; frameSeq: number; passMask: number; lastUpdateMs: number }>;
       let cdf53Refined = 0;
       let cdf53Partial = 0;
       const cdf53PassHist = new Array(15).fill(0); // bucket index = passes received (0..14)

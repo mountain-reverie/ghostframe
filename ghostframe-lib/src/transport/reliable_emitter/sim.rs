@@ -103,7 +103,7 @@ impl Sim {
     }
     fn advance(&mut self, dt: Duration) {
         self.t += dt;
-        self.emitter.tick(self.t);
+        self.emitter.tick(self.t, usize::MAX);
         self.emitter.drain(&mut self.sender, self.t);
         self.ack_delivered();
     }
