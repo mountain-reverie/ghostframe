@@ -1622,6 +1622,7 @@ impl IoBridge {
                                     entry.tile_x,
                                     entry.tile_y,
                                     entry.generation,
+                                    entry.pass_idx,
                                 );
                             }
                             crate::transport::protocol::Codec::PalRle => {

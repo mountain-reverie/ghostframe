@@ -91,11 +91,14 @@ pub struct Scheduler {
     low_delivery_rounds: u32,
     /// Consecutive rounds with delivery rate at or above HIGH_DELIVERY threshold.
     high_delivery_rounds: u32,
-    /// Per-(tile, gen) count of refinement-queue passes that have transitioned
-    /// to `WorkState::Acked`. Used by `tile_fully_acked` to signal the
-    /// PixelPerfect transition without scanning the queue on each query.
-    /// Cleared for old gens on `bump_generation`/`bump_generation_collecting`.
-    cdf53_passes_acked: HashMap<(u8, u8, u8), u8>,
+    /// Per-(tile_x, tile_y, generation) bitmap of received ACK pass_idxs.
+    /// Bit `i` set means pass `i` has been ACKed at least once. Duplicate
+    /// ACKs (e.g. from the AckBatcher overlap window where each batch
+    /// re-sends the last few ACKs) are idempotent: `bitmap |= 1 << pass`
+    /// is a no-op on a set bit. The previous u8 counter could be inflated
+    /// past `max_passes` by overlap, falsely satisfying tile_fully_acked
+    /// without all distinct passes having been delivered.
+    cdf53_passes_acked: HashMap<(u8, u8, u8), u16>,
 }
 
 impl Scheduler {
@@ -199,7 +202,7 @@ impl Scheduler {
     pub fn cdf53_passes_acked_for_test(&self, tile_x: u8, tile_y: u8, generation: u8) -> u8 {
         self.cdf53_passes_acked
             .get(&(tile_x, tile_y, generation))
-            .copied()
+            .map(|&bitmap| bitmap.count_ones() as u8)
             .unwrap_or(0)
     }
 
@@ -246,13 +249,27 @@ impl Scheduler {
     /// successful Cdf53 delivery and can grow the refinement bandwidth
     /// fraction. This replaces the increment that used to live inside
     /// `on_ack` before its M3.3d deletion.
-    pub fn record_cdf53_ack(&mut self, tile_x: u8, tile_y: u8, generation: u8) {
-        let counter = self
+    pub fn record_cdf53_ack(&mut self, tile_x: u8, tile_y: u8, generation: u8, pass_idx: u8) {
+        // CDF53_PASS_COUNT is 14; any pass_idx ≥ 16 is corruption (wire
+        // bit-flip in the ACK envelope, or an upstream encoder bug). Fail
+        // loudly in debug builds; in release the modulo-mask ensures a
+        // corrupted ACK aliases onto a real bit rather than overflowing
+        // the shift — better than a silent UB, still a bug we'd want to
+        // catch.
+        debug_assert!(pass_idx < 16, "pass_idx {pass_idx} out of bitmap range");
+        let bitmap = self
             .cdf53_passes_acked
             .entry((tile_x, tile_y, generation))
             .or_insert(0);
-        *counter = counter.saturating_add(1);
-        self.delivery_window_acked = self.delivery_window_acked.saturating_add(1);
+        let bit = 1u16 << (pass_idx & 0x0F);
+        let was_set = (*bitmap & bit) != 0;
+        *bitmap |= bit;
+        // Only count newly-acked passes toward the AIMD delivery window —
+        // duplicates don't reflect new wire delivery and would distort the
+        // bandwidth-budget heuristic if counted.
+        if !was_set {
+            self.delivery_window_acked = self.delivery_window_acked.saturating_add(1);
+        }
     }
 
     /// Mark the matching InFlight entry in `priority_queue` as `Acked` so the
@@ -300,17 +317,23 @@ impl Scheduler {
     /// `IoBridge` to signal `CodecState::PixelPerfect` once a tile is
     /// fully refined.
     pub fn tile_fully_acked(&self, tile_x: u8, tile_y: u8, generation: u8, max_passes: u8) -> bool {
+        let needed: u16 = if max_passes >= 16 {
+            0xFFFF
+        } else {
+            (1u16 << max_passes) - 1
+        };
         self.cdf53_passes_acked
             .get(&(tile_x, tile_y, generation))
-            .is_some_and(|&c| c >= max_passes)
+            .is_some_and(|&bitmap| (bitmap & needed) == needed)
     }
 
-    /// Non-test diagnostic accessor: returns the current ACK counter for
-    /// (tile_x, tile_y, generation). Used by the PixelPerfect sweep trace.
+    /// Returns the number of **distinct** pass_idxs ACKed for this
+    /// (tile, gen). Diagnostic accessor; PixelPerfect transition uses
+    /// `tile_fully_acked` instead.
     pub fn cdf53_passes_acked_count(&self, tile_x: u8, tile_y: u8, generation: u8) -> u8 {
         self.cdf53_passes_acked
             .get(&(tile_x, tile_y, generation))
-            .copied()
+            .map(|&bitmap| bitmap.count_ones() as u8)
             .unwrap_or(0)
     }
 
@@ -331,7 +354,7 @@ impl Scheduler {
                 let acked = self
                     .cdf53_passes_acked
                     .get(&(tx, ty, gen))
-                    .copied()
+                    .map(|&bitmap| bitmap.count_ones() as u8)
                     .unwrap_or(0);
                 (acked < max_passes).then_some((tx, ty))
             })
@@ -990,22 +1013,22 @@ mod tests {
     fn tile_fully_acked_returns_true_after_all_passes_acked() {
         let mut s = Scheduler::new(4, 4);
         assert!(!s.tile_fully_acked(2, 3, 1, 14));
-        for _pass in 0..13u8 {
-            s.record_cdf53_ack(2, 3, 1);
+        for pass in 0..13u8 {
+            s.record_cdf53_ack(2, 3, 1, pass);
             assert!(
                 !s.tile_fully_acked(2, 3, 1, 14),
                 "should not be fully_acked before all 14 acks"
             );
         }
-        s.record_cdf53_ack(2, 3, 1);
+        s.record_cdf53_ack(2, 3, 1, 13);
         assert!(s.tile_fully_acked(2, 3, 1, 14));
     }
 
     #[test]
     fn tile_fully_acked_isolates_per_tile_and_gen() {
         let mut s = Scheduler::new(4, 4);
-        for _pass in 0..14u8 {
-            s.record_cdf53_ack(0, 0, 1);
+        for pass in 0..14u8 {
+            s.record_cdf53_ack(0, 0, 1, pass);
         }
         assert!(s.tile_fully_acked(0, 0, 1, 14));
         assert!(!s.tile_fully_acked(1, 0, 1, 14));
@@ -1015,8 +1038,8 @@ mod tests {
     #[test]
     fn bump_generation_drops_old_gen_ack_counter() {
         let mut s = Scheduler::new(4, 4);
-        for _pass in 0..14u8 {
-            s.record_cdf53_ack(0, 0, 1);
+        for pass in 0..14u8 {
+            s.record_cdf53_ack(0, 0, 1, pass);
         }
         assert!(s.tile_fully_acked(0, 0, 1, 14));
         let _ = s.bump_generation(0, 0);
@@ -1030,9 +1053,9 @@ mod tests {
     #[test]
     fn bump_generation_only_clears_target_tile() {
         let mut s = Scheduler::new(4, 4);
-        for _pass in 0..14u8 {
-            s.record_cdf53_ack(0, 0, 1);
-            s.record_cdf53_ack(1, 1, 1);
+        for pass in 0..14u8 {
+            s.record_cdf53_ack(0, 0, 1, pass);
+            s.record_cdf53_ack(1, 1, 1, pass);
         }
         assert!(s.tile_fully_acked(0, 0, 1, 14));
         assert!(s.tile_fully_acked(1, 1, 1, 14));
@@ -1047,8 +1070,8 @@ mod tests {
     fn record_cdf53_ack_increments_per_tile_gen_counter() {
         let mut s = Scheduler::new(4, 4);
         assert!(!s.tile_fully_acked(2, 3, 1, 14));
-        for _ in 0..14 {
-            s.record_cdf53_ack(2, 3, 1);
+        for p in 0..14u8 {
+            s.record_cdf53_ack(2, 3, 1, p);
         }
         assert!(s.tile_fully_acked(2, 3, 1, 14));
     }
@@ -1056,8 +1079,8 @@ mod tests {
     #[test]
     fn record_cdf53_ack_isolates_per_tile_and_gen() {
         let mut s = Scheduler::new(4, 4);
-        for _ in 0..14 {
-            s.record_cdf53_ack(0, 0, 1);
+        for p in 0..14u8 {
+            s.record_cdf53_ack(0, 0, 1, p);
         }
         assert!(s.tile_fully_acked(0, 0, 1, 14));
         assert!(!s.tile_fully_acked(1, 0, 1, 14), "different tile");
@@ -1110,8 +1133,8 @@ mod tests {
     #[test]
     fn record_cdf53_ack_increments_delivery_window_counter() {
         let mut s = Scheduler::new(4, 4);
-        for _ in 0..5 {
-            s.record_cdf53_ack(2, 3, 1);
+        for p in 0..5u8 {
+            s.record_cdf53_ack(2, 3, 1, p);
         }
         assert_eq!(s.delivery_window_acked_for_test(), 5);
     }
@@ -1124,13 +1147,19 @@ mod tests {
         // next round). Rounds 1..=10 each see rate=1.0; after 10 consecutive
         // high-delivery rounds the fraction doubles from 0.05 to 0.1, which
         // is > 0.05.
+        //
+        // Each round bumps generation for all 5 tiles so that duplicate-pass
+        // bitmaps reset and every round's ACKs are counted as new delivery
+        // events by the AIMD heuristic (matching the production pattern where
+        // refinement restarts after every frame-content change).
         for round in 0..11u8 {
             for i in 0..5u8 {
-                sch.enqueue_refinement(i, 0, 0, vec![vec![round, i]; 14]);
+                let gen = sch.bump_generation(i, 0);
+                sch.enqueue_refinement(i, 0, gen, vec![vec![round, i]; 14]);
             }
             let emitted = sch.tick(100_000);
             for w in &emitted {
-                sch.record_cdf53_ack(w.tile_x, w.tile_y, w.generation);
+                sch.record_cdf53_ack(w.tile_x, w.tile_y, w.generation, w.pass_idx);
             }
         }
         assert!(
@@ -1232,9 +1261,9 @@ mod tests {
     fn cdf53_unacked_tiles_for_gen_lists_under_target() {
         let mut s = Scheduler::new(4, 4);
         // (0,0, gen=1): 3 of 14 acked → unacked.
-        for _ in 0..3 { s.record_cdf53_ack(0, 0, 1); }
+        for p in 0..3u8 { s.record_cdf53_ack(0, 0, 1, p); }
         // (1,0, gen=1): all 14 acked → not in result.
-        for _ in 0..14 { s.record_cdf53_ack(1, 0, 1); }
+        for p in 0..14u8 { s.record_cdf53_ack(1, 0, 1, p); }
         // (2,0, gen=1): no acks → unacked.
         let _ = s.cdf53_passes_acked_count(2, 0, 1);
         let mut out = s.cdf53_unacked_tiles_for_gen(&[
@@ -1244,6 +1273,45 @@ mod tests {
         ]);
         out.sort();
         assert_eq!(out, vec![(0u8, 0u8), (2u8, 0u8)]);
+    }
+
+    #[test]
+    fn record_cdf53_ack_is_idempotent_per_pass_idx() {
+        let mut s = Scheduler::new(4, 4);
+        // ACK pass 3 of (2,3, gen=1) eleven times — should not satisfy
+        // tile_fully_acked(.., max_passes=14). Pre-fix this would have
+        // counted 11 and remained under threshold, but a 4×PASS dupe
+        // (4*4=16) would falsely pass; with the bitmap, no number of
+        // dupes of a single pass_idx can fool it.
+        for _ in 0..11 {
+            s.record_cdf53_ack(2, 3, 1, 3);
+        }
+        assert!(
+            !s.tile_fully_acked(2, 3, 1, 14),
+            "duplicate ACKs of the same pass_idx must not satisfy tile_fully_acked"
+        );
+        // Now ACK every distinct pass_idx 0..14 exactly once.
+        for p in 0..14u8 {
+            s.record_cdf53_ack(2, 3, 1, p);
+        }
+        assert!(
+            s.tile_fully_acked(2, 3, 1, 14),
+            "all 14 distinct pass_idxs ACKed → tile_fully_acked"
+        );
+        // Different gen: same tile, no ACKs yet.
+        assert!(!s.tile_fully_acked(2, 3, 2, 14));
+    }
+
+    #[test]
+    fn cdf53_passes_acked_count_returns_popcount() {
+        let mut s = Scheduler::new(4, 4);
+        s.record_cdf53_ack(1, 1, 0, 0);
+        s.record_cdf53_ack(1, 1, 0, 5);
+        s.record_cdf53_ack(1, 1, 0, 13);
+        // Dupes of an already-set bit don't increment.
+        s.record_cdf53_ack(1, 1, 0, 0);
+        s.record_cdf53_ack(1, 1, 0, 5);
+        assert_eq!(s.cdf53_passes_acked_count(1, 1, 0), 3);
     }
 
 }
