@@ -4569,3 +4569,109 @@ async fn e2e_lossless_golden_png() -> Result<()> {
 }
 
 mod harness_smoke;
+
+/// CPU-only round-trip on real captured desktop content.
+///
+/// Loads `fixtures/real_capture.png` (1920×1080 RGB screenshot of a live
+/// ghostframe X session — UI chrome + text + gradients + AA edges),
+/// tiles it into 32×32 BGRA tiles, and for each tile runs the full
+/// server-side codec chain:
+///     forward(bgra)             — wavelet transform (CPU reference)
+///     encode_passes(coeffs)     — 14 progressive bit-plane passes
+///     decode_passes(&passes)    — bit-plane reassembly
+///     inverse(coeffs)           — wavelet reconstruction
+///
+/// then byte-compares the recovered BGR pixels against the source BGR.
+/// No browser, no GPU, no wire — pure CPU. If this passes, the codec
+/// math itself is lossless on real content; any visual "blur" the
+/// operator perceives at refined=N/14p originates outside the codec
+/// (capture path, color profile, display compositor, perceptual
+/// comparison against an absent ground truth).
+///
+/// Failure mode: prints which tile diverged and the first few pixel
+/// differences. Reproducing the failure requires only the fixture PNG
+/// — no live X session, no test-server container.
+#[test]
+fn e2e_cdf53_real_capture_roundtrip_exact() {
+    let img = image::load_from_memory(helpers::fixtures::REAL_CAPTURE_PNG)
+        .expect("PNG decodes")
+        .to_rgb8();
+    let width = img.width();
+    let height = img.height();
+    // Tile-align by truncating to the largest 32-multiple — partial-tile
+    // edge rows/cols use a separate server-side path that's outside
+    // this test's scope (we only test the inner 32×32 codec contract).
+    let cols = width / 32;
+    let rows = height / 32;
+    let mut total_tiles = 0;
+    let mut tile_mismatches = 0;
+    let mut first_failures: Vec<String> = Vec::new();
+    for tile_y in 0..rows {
+        for tile_x in 0..cols {
+            total_tiles += 1;
+            // Build the 32×32 BGRA tile (alpha = 0xFF, will be discarded
+            // by forward but the input format demands it).
+            let mut tile_bgra = vec![0u8; 32 * 32 * 4];
+            for py in 0..32u32 {
+                for px in 0..32u32 {
+                    let src_x = tile_x * 32 + px;
+                    let src_y = tile_y * 32 + py;
+                    let p = img.get_pixel(src_x, src_y);
+                    let dst = ((py * 32 + px) * 4) as usize;
+                    tile_bgra[dst] = p[2]; // B
+                    tile_bgra[dst + 1] = p[1]; // G
+                    tile_bgra[dst + 2] = p[0]; // R
+                    tile_bgra[dst + 3] = 0xFF;
+                }
+            }
+            // Forward → encode → decode → inverse round-trip.
+            let coeffs = ghostframe_lib::encoder::cdf53::forward(&tile_bgra);
+            let passes = ghostframe_lib::encoder::cdf53::encode_passes(&coeffs);
+            let pass_refs: Vec<&[u8]> = passes.iter().map(|p| p.as_slice()).collect();
+            let decoded = ghostframe_lib::encoder::cdf53::decode_passes(&pass_refs);
+            let recovered_bgr = ghostframe_lib::encoder::cdf53::inverse(&decoded);
+            // Compare recovered BGR to source BGR (the forward strips
+            // alpha; the inverse never produces alpha).
+            let mut tile_diffs = 0;
+            for py in 0..32usize {
+                for px in 0..32usize {
+                    let src_off = (py * 32 + px) * 4;
+                    let dst_off = (py * 32 + px) * 3;
+                    let src_b = tile_bgra[src_off];
+                    let src_g = tile_bgra[src_off + 1];
+                    let src_r = tile_bgra[src_off + 2];
+                    let got_b = recovered_bgr[dst_off];
+                    let got_g = recovered_bgr[dst_off + 1];
+                    let got_r = recovered_bgr[dst_off + 2];
+                    if src_b != got_b || src_g != got_g || src_r != got_r {
+                        tile_diffs += 1;
+                        if first_failures.len() < 10 {
+                            first_failures.push(format!(
+                                "tile ({},{}) px ({},{}): src BGR ({},{},{}) → got ({},{},{})",
+                                tile_x, tile_y, px, py,
+                                src_b, src_g, src_r,
+                                got_b, got_g, got_r
+                            ));
+                        }
+                    }
+                }
+            }
+            if tile_diffs > 0 {
+                tile_mismatches += 1;
+            }
+        }
+    }
+    eprintln!(
+        "CDF53 real-capture round-trip: {} tiles total, {} tiles with mismatches",
+        total_tiles, tile_mismatches
+    );
+    for f in &first_failures {
+        eprintln!("  {f}");
+    }
+    assert_eq!(
+        tile_mismatches, 0,
+        "CDF53 forward→encode→decode→inverse round-trip is not byte-exact on real capture content; \
+         see eprintln above for the first {} divergences",
+        first_failures.len()
+    );
+}
