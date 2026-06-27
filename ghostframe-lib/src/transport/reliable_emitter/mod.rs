@@ -37,7 +37,6 @@ pub const FEC_GROUP_SIZE_K: usize = 10;
 pub const FEC_PARITY_PER_GROUP_R: usize = 1;
 pub const PARITY_INTERLEAVE_OFFSET: u32 = (2 * FEC_GROUP_SIZE_K) as u32;
 pub const END_OF_STREAM_PARITY_FLUSH_MS: u64 = 5;
-pub const MAX_RETRANSMITS: u8 = 4;
 pub const BASE_RTO_MS: u64 = 50;
 pub const RTO_BACKOFF_FACTOR: u32 = 2;
 // Sized for the first-paint burst: at 1920×1080 with 32×32 tiles the
@@ -47,7 +46,7 @@ pub const RTO_BACKOFF_FACTOR: u32 = 2;
 // at 48 % wire loss on evangeline the LRU evicted ~16 K entries before
 // they could retry, so half the first-paint burst saw exactly one
 // emission attempt with no retransmit coverage. Bumped to 32 K so the
-// whole first paint stays cached through MAX_RETRANSMITS=4 retries.
+// whole first-paint burst stays cached for indefinite retransmits.
 // Memory cost: ~500 B/entry × 32 K = ~16 MB per session, well below
 // any realistic ceiling.
 pub const CACHE_CAPACITY: usize = 32768;
@@ -60,7 +59,6 @@ mod tests {
         assert!(FEC_GROUP_SIZE_K >= 2);
         assert!(FEC_PARITY_PER_GROUP_R >= 1);
         assert_eq!(PARITY_INTERLEAVE_OFFSET, 20);
-        assert!(MAX_RETRANSMITS >= 1 && MAX_RETRANSMITS <= 8);
         assert!(BASE_RTO_MS >= 25 && BASE_RTO_MS <= 200);
         assert!(CACHE_CAPACITY.is_power_of_two() || CACHE_CAPACITY >= 1024);
     }

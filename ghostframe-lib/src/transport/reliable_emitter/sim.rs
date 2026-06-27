@@ -125,8 +125,8 @@ fn sim_low_loss_5pct() {
     let mut sim = Sim::new(0.05, 1);
     sim.submit_many(1000);
     for _ in 0..10 { sim.advance(Duration::from_millis(100)); }
-    // At 5% loss with FEC + retransmit, near-100% delivery within
-    // MAX_RETRANSMITS. The emitter doesn't track delivered count; we
+    // At 5% loss with FEC + retransmit, near-100% delivery within a
+    // few RTO windows. The emitter doesn't track delivered count; we
     // approximate it via cache.len() (entries still pending) being small.
     assert!(sim.emitter.cache.len() < 50, "most entries should be drained");
 }
@@ -136,9 +136,8 @@ fn sim_high_loss_50pct() {
     let mut sim = Sim::new(0.5, 2);
     sim.submit_many(1000);
     for _ in 0..20 { sim.advance(Duration::from_millis(200)); }
-    // Per spec §8.2: ~97 % delivery at 5 attempts. So at most ~3 % of
-    // the 1000 submitted items should hit MAX_RETRANSMITS.
-    assert!(sim.emitter.stats.rto_max_retransmits_reached < 50,
+    // Retirement was removed — rto_max_retransmits_reached must stay 0.
+    assert_eq!(sim.emitter.stats.rto_max_retransmits_reached, 0,
         "got {}", sim.emitter.stats.rto_max_retransmits_reached);
 }
 

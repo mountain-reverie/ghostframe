@@ -60,16 +60,26 @@ impl RtoTimerWheel {
     }
 }
 
+/// Maximum RTO backoff. Beyond this, retries fire every `RTO_BACKOFF_MAX`
+/// indefinitely. Picked so a single un-delivered tile-pass under sustained
+/// loss still retries 12 times per minute — fast enough that recovery is
+/// perceptible to the user, slow enough to not flood the link.
+pub const RTO_BACKOFF_MAX: Duration = Duration::from_secs(5);
+
 /// Compute the RTO for a given attempt number (0 = first transmission's
-/// RTO; 1, 2, 3 = backoff for subsequent retries).
+/// RTO; 1, 2, ... = backoff for subsequent retries).
 ///
-/// Returns `base * 2^attempts` where `base ∈ [25ms, BASE_RTO_MS=50ms]`
-/// derived from smoothed RTT.
+/// Returns `min(base * 2^attempts, RTO_BACKOFF_MAX)` where
+/// `base ∈ [25ms, BASE_RTO_MS=50ms]` derived from smoothed RTT.
+/// Once the cap is reached, steady-state retries fire every 5 s.
 pub fn rto_for_attempt(smoothed_rtt: Duration, attempts: u8) -> Duration {
     let base = (smoothed_rtt * 2).max(Duration::from_millis(25));
     let base = base.min(Duration::from_millis(BASE_RTO_MS));
-    let shift = attempts.min(3) as u32;
-    base * RTO_BACKOFF_FACTOR.pow(shift)
+    let shift = attempts.min(8) as u32;
+    let backoff = base
+        .checked_mul(RTO_BACKOFF_FACTOR.pow(shift))
+        .unwrap_or(RTO_BACKOFF_MAX);
+    backoff.min(RTO_BACKOFF_MAX)
 }
 
 #[cfg(test)]
@@ -101,10 +111,20 @@ mod tests {
     }
 
     #[test]
-    fn rto_backoff_caps_at_attempt_3() {
-        let r3 = rto_for_attempt(Duration::from_millis(100), 3);
-        let r99 = rto_for_attempt(Duration::from_millis(100), 99);
-        assert_eq!(r3, r99);
+    fn rto_backoff_caps_at_5_seconds() {
+        // attempt 99 must never exceed 5 s.
+        let r = rto_for_attempt(Duration::from_millis(100), 99);
+        assert_eq!(r, Duration::from_secs(5));
+        // intermediate attempts still double until the cap.
+        let r4 = rto_for_attempt(Duration::from_millis(100), 4);
+        assert_eq!(r4, Duration::from_millis(800));
+        let r5 = rto_for_attempt(Duration::from_millis(100), 5);
+        assert_eq!(r5, Duration::from_millis(1600));
+        let r6 = rto_for_attempt(Duration::from_millis(100), 6);
+        assert_eq!(r6, Duration::from_millis(3200));
+        // attempt 7 would compute 6400ms, but cap is 5000ms.
+        let r7 = rto_for_attempt(Duration::from_millis(100), 7);
+        assert_eq!(r7, Duration::from_secs(5));
     }
 
     #[test]

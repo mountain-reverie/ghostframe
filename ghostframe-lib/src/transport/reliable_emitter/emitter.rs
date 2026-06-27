@@ -8,7 +8,7 @@ use crate::transport::reliable_emitter::parity::GroupBuilder;
 use crate::transport::reliable_emitter::rto::{rto_for_attempt, RtoTimerWheel};
 use crate::transport::reliable_emitter::traits::DatagramSender;
 use crate::transport::reliable_emitter::wire_seq::WireSeqAllocator;
-use crate::transport::reliable_emitter::{EmitKey, FEC_GROUP_SIZE_K, MAX_RETRANSMITS, PARITY_INTERLEAVE_OFFSET};
+use crate::transport::reliable_emitter::{EmitKey, FEC_GROUP_SIZE_K, PARITY_INTERLEAVE_OFFSET};
 use bytes::Bytes;
 use smallvec::smallvec;
 use std::time::{Duration, Instant};
@@ -112,24 +112,19 @@ impl ReliableTileEmitter {
     }
 
     /// Drain due RTO entries. For each due key, validate against the live
-    /// cache (silently skip stale entries — already ACKed or cancelled). If
-    /// the entry hasn't hit MAX_RETRANSMITS, bump `attempts`, re-enqueue every
-    /// cached fragment via the EmissionQueue with the same wire_seqs (so client
-    /// dedup keys remain stable), and reschedule a new RTO deadline. At
-    /// MAX_RETRANSMITS, retire — drop the cache entry and bump
-    /// `rto_max_retransmits_reached`.
+    /// cache (silently skip stale entries — already ACKed or cancelled).
+    /// Bump `attempts` (used only for RTO backoff selection), re-enqueue
+    /// every cached fragment via the EmissionQueue with the same
+    /// wire_seqs (so client dedup keys remain stable), and reschedule a
+    /// new RTO deadline using `rto_for_attempt`. Never retires — the
+    /// entry stays in the cache until ACKed, cancelled via
+    /// `cancel_for_tile`, or the session ends via `clear_cache`.
     pub fn tick(&mut self, now: Instant) {
         while let Some(key) = self.rto.pop_due(now) {
             let Some(entry) = self.cache.get_mut(&key) else {
                 // Already ACKed or cancelled — stale heap entry; skip silently.
                 continue;
             };
-            if entry.attempts >= MAX_RETRANSMITS {
-                // Retire — drop from cache.
-                self.cache.remove(&key);
-                self.stats.rto_max_retransmits_reached += 1;
-                continue;
-            }
             // Bump attempts, re-enqueue every cached fragment, reschedule RTO.
             entry.attempts += 1;
             entry.last_sent_at = now;
@@ -170,15 +165,14 @@ impl ReliableTileEmitter {
 
     /// Ingest a batch of NACKs from the client. For each (key, frag_idx):
     /// - Cache miss → bump `nack_miss` and continue.
-    /// - `attempts >= MAX_RETRANSMITS` → silently skip (budget exhausted).
     /// - Out-of-range frag_idx → silently skip.
     /// - Otherwise re-emit just that one fragment via the queue, bump
     ///   `attempts`, advance `last_sent_at`, bump `nack_hit` and
     ///   `retransmit_attempts_total`.
     ///
     /// The RTO heap entry for this key stays in place; `tick` will see
-    /// the bumped `attempts` and either re-fire (acceptable) or retire
-    /// at MAX_RETRANSMITS. No active heap removal is required.
+    /// the bumped `attempts` and re-fire with the capped backoff. No
+    /// active heap removal is required.
     pub fn on_nack(&mut self, entries: &[(EmitKey, u8)]) {
         for &(key, frag_idx) in entries {
             let now = self.smoothed_rtt_clock_now();
@@ -186,9 +180,6 @@ impl ReliableTileEmitter {
                 self.stats.nack_miss += 1;
                 continue;
             };
-            if entry.attempts >= MAX_RETRANSMITS {
-                continue;
-            }
             let Some(frag) = entry.fragments.get(frag_idx as usize) else {
                 continue;
             };
@@ -383,7 +374,10 @@ mod tests {
     }
 
     #[test]
-    fn tick_stops_at_max_retransmits() {
+    fn tick_keeps_retransmitting_after_many_attempts() {
+        // Retirement was removed: the emitter keeps firing RTO retransmits
+        // indefinitely until ACKed or cancelled. Verify that after N ticks
+        // the entry is still present and rto_max_retransmits_reached stays 0.
         let mut e = ReliableTileEmitter::new();
         let mut sender = CollectSender::default();
         let t0 = Instant::now();
@@ -391,19 +385,15 @@ mod tests {
         e.submit_one(key, fake_source(1, 0, 0), t0);
         e.drain(&mut sender, t0);
         let mut tn = t0;
-        for _ in 0..MAX_RETRANSMITS {
+        for _ in 0..10 {
             tn += Duration::from_millis(500);
             e.tick(tn);
             e.drain(&mut sender, tn);
         }
-        // After MAX_RETRANSMITS retries: 1 original + MAX_RETRANSMITS = 5 total
-        assert_eq!(sender.sent.len(), 1 + MAX_RETRANSMITS as usize);
-        // One more tick after the budget — nothing more emitted.
-        tn += Duration::from_millis(500);
-        e.tick(tn);
-        e.drain(&mut sender, tn);
-        assert_eq!(sender.sent.len(), 1 + MAX_RETRANSMITS as usize);
-        assert_eq!(e.stats.rto_max_retransmits_reached, 1);
+        // Entry must still be in the cache — no retirement.
+        assert!(e.cache.get(&key).is_some(), "entry must not be retired");
+        // rto_max_retransmits_reached stays 0 since we never retire.
+        assert_eq!(e.stats.rto_max_retransmits_reached, 0);
     }
 
     #[test]
@@ -470,19 +460,25 @@ mod tests {
     }
 
     #[test]
-    fn on_nack_respects_max_retransmits() {
+    fn on_nack_re_emits_without_budget_cap() {
+        // Retirement and NACK budget cap were removed: every NACK produces a
+        // re-emission as long as the cache entry is live.
         let mut e = ReliableTileEmitter::new();
         let mut sender = CollectSender::default();
         let t0 = Instant::now();
         let key = EmitKey::new(1, 0, 0, 0);
         e.submit_one(key, fake_source(1, 0, 0), t0);
         e.drain(&mut sender, t0);
-        for _ in 0..(MAX_RETRANSMITS as usize + 2) {
+        let nacks = 10usize;
+        for _ in 0..nacks {
             e.on_nack(&[(key, 0u8)]);
             e.drain(&mut sender, t0);
         }
-        // 1 original + MAX_RETRANSMITS re-emits — extras are silently capped.
-        assert_eq!(sender.sent.len(), 1 + MAX_RETRANSMITS as usize);
+        // 1 original + nacks re-emits — all NACKs produce emissions now.
+        assert_eq!(sender.sent.len(), 1 + nacks);
+        assert_eq!(e.stats.nack_hit, nacks as u64);
+        // Entry is still live.
+        assert!(e.cache.get(&key).is_some());
     }
 
     #[test]
@@ -497,5 +493,45 @@ mod tests {
         e.drain(&mut sender, now);
         assert_eq!(sender.sent.len(), 5);
         assert_eq!(e.stats.source_emitted, 5);
+    }
+
+    #[test]
+    fn tick_keeps_retrying_indefinitely_until_acked() {
+        let mut e = ReliableTileEmitter::new();
+        let key = EmitKey::new(1, 0, 0, 0);
+        let now = Instant::now();
+        e.submit_one(key, bytes::Bytes::from(vec![0u8; 16]), now);
+        // Drain the initial emission so the queue is empty.
+        let mut sink: Vec<Vec<u8>> = Vec::new();
+        struct Sink<'a>(&'a mut Vec<Vec<u8>>);
+        impl<'a> crate::transport::reliable_emitter::traits::DatagramSender for Sink<'a> {
+            fn send(&mut self, dg: &[u8]) {
+                self.0.push(dg.to_vec());
+            }
+        }
+        e.drain(&mut Sink(&mut sink), now);
+        let initial_sends = sink.len();
+        assert!(initial_sends >= 1, "initial submit produced at least one send");
+
+        // Advance time well past the old MAX_RETRANSMITS retirement window
+        // and tick many times. Every tick should keep the entry alive (no
+        // retirement) and continue scheduling retransmits.
+        let mut t = now;
+        for _ in 0..30 {
+            t += std::time::Duration::from_secs(5);
+            e.tick(t);
+            e.drain(&mut Sink(&mut sink), t);
+        }
+        // Entry must still be live in the cache.
+        assert!(
+            e.has_cache_entries_for_tile(0, 0),
+            "cache entry must survive arbitrarily many RTO firings (no retirement)"
+        );
+        // ACK the entry — cache entry must disappear.
+        e.on_ack(&[key]);
+        assert!(
+            !e.has_cache_entries_for_tile(0, 0),
+            "ACK must remove the entry from the cache"
+        );
     }
 }
