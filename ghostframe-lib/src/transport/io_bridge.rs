@@ -3461,6 +3461,14 @@ impl IoBridge {
                     tracing::info!(?handle, %reason, "connection lost");
                     self.wt_sessions.remove(&handle);
                     self.session_resets_fired.remove(&handle);
+                    // Delivery-guarantee invariant: when the session ends,
+                    // un-ACKed tile-passes are no longer deliverable and
+                    // must not occupy memory or fire spurious retransmits
+                    // for the next client. ReliableTileEmitter is shared
+                    // across sessions; the current design has one client
+                    // at a time. If we ever support concurrent multi-client
+                    // sessions, this clear should become per-session.
+                    self.reliable_emitter.clear_cache();
                 }
 
                 Event::HandshakeDataReady => {
