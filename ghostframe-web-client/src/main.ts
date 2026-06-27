@@ -743,10 +743,20 @@ async function main() {
           // every CDF53 pass is a single fragment (the wavelet bands are
           // packed by the encoder; there is no fragment-level split for
           // pass-encoded data on the wire).
+          //
+          // The server's emitter cache is keyed by the on-wire frame_seq
+          // (= server_seq | TILE_DATAGRAM_FLAG). The client-side
+          // `__cdf53Coverage.frameSeq` field stores the STRIPPED seq
+          // because the datagram decoder masks the flag off for
+          // downstream logic. Re-apply the flag here so the cache lookup
+          // hits — without this every NACK would `nack_miss` and the
+          // server's on_nack handler would re-emit nothing. Same fix
+          // pattern as the ACK path above.
+          const flaggedFrameSeq = v.frameSeq | TILE_DATAGRAM_FLAG;
           for (let p = 0; p < 14; p++) {
             if ((v.passMask & (1 << p)) === 0) {
               nackBatcher.add(
-                { frameSeq: v.frameSeq, tileX, tileY, passIdx: p },
+                { frameSeq: flaggedFrameSeq, tileX, tileY, passIdx: p },
                 0,
               );
             }
