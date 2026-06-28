@@ -4435,6 +4435,7 @@ mod tests {
                 tile_x: 7,
                 tile_y: 9,
                 pass_idx: 0,
+                arrival_time_ms_lo16: 0,
             }],
         };
         bridge.dispatch_ack_datagram(&batch.encode());
@@ -4458,6 +4459,7 @@ mod tests {
                 tile_x: 9,
                 tile_y: 5,
                 pass_idx: 3,
+                arrival_time_ms_lo16: 0,
             }],
         };
         // Should not panic, should not modify any state.
@@ -4535,6 +4537,7 @@ mod tests {
                 tile_x: 0,
                 tile_y: 0,
                 pass_idx: 0,
+                arrival_time_ms_lo16: 0,
             }],
         };
         bridge.dispatch_ack_datagram(&ack_env.encode());
@@ -5092,6 +5095,7 @@ mod tests {
                 tile_x: 0,
                 tile_y: 0,
                 pass_idx: 0,
+                arrival_time_ms_lo16: 0,
             }],
         };
         bridge.dispatch_ack_datagram(&batch.encode());
@@ -5136,6 +5140,7 @@ mod tests {
                 tile_x: 0,
                 tile_y: 0,
                 pass_idx: 0,
+                arrival_time_ms_lo16: 0,
             }],
         };
         bridge.dispatch_ack_datagram(&batch.encode());

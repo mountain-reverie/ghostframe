@@ -2,13 +2,14 @@
 //!
 //! Wire format:
 //! ```text
-//! [0]      message_type = 0x03
+//! [0]      message_type = 0x04
 //! [1]      count: u8 (1..=72)
-//! [2..]    count × 7 bytes:
+//! [2..]    count × 9 bytes:
 //!             [0..4]  frame_seq: u32 little-endian
 //!             [4]     tile_x: u8
 //!             [5]     tile_y: u8
 //!             [6]     pass_idx: u8
+//!             [7..9]  arrival_time_ms_lo16: u16 little-endian
 //! ```
 //!
 //! Max count is 72 — `MAX_FRESH_ENTRIES_PER_BATCH (64)` + the
@@ -34,7 +35,12 @@
 //! stale dev binary mid-rollout fails loud with
 //! `AckDecodeError::WrongMsgType(0x02)` rather than silently mis-parsing.
 
-pub const ACK_BATCH_MSG_TYPE: u8 = 0x03;
+/// ACK envelope wire-format version. Bumped 0x03 → 0x04 in 2026-06-27
+/// to add a 2-byte per-entry receiver-arrival-time field (low 16 bits
+/// of wall-clock milliseconds) used by the server's bandwidth-estimator
+/// hook. Old (0x03) clients/servers are not wire-compatible with new —
+/// both sides ship in lockstep.
+pub const ACK_BATCH_MSG_TYPE: u8 = 0x04;
 /// Maximum number of *fresh* entries the client packs into one batch
 /// before flushing (mirrors `MAX_ACK_ENTRIES` in ack.ts). Used for the
 /// roundtrip-size tests; the wire-acceptance cap is below.
@@ -47,13 +53,13 @@ pub const ACK_OVERLAP_COUNT: usize = 8;
 /// Wire-acceptance cap for one ACK batch: fresh + overlap.
 pub const MAX_ACK_ENTRIES_PER_BATCH: usize =
     MAX_FRESH_ENTRIES_PER_BATCH + ACK_OVERLAP_COUNT;
-pub const ACK_ENTRY_SIZE: usize = 7;
+pub const ACK_ENTRY_SIZE: usize = 9;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum AckDecodeError {
     #[error("ack batch too short ({0} bytes)")]
     TooShort(usize),
-    #[error("wrong message type: expected 0x03, got 0x{0:02x}")]
+    #[error("wrong message type: expected 0x04, got 0x{0:02x}")]
     WrongMsgType(u8),
     #[error("invalid entry count: {0} (must be 1..=72)")]
     InvalidCount(u8),
@@ -65,6 +71,11 @@ pub struct AckEntry {
     pub tile_x: u8,
     pub tile_y: u8,
     pub pass_idx: u8,
+    /// Low 16 bits of the client's wall-clock millisecond receive time
+    /// for this pass. 65.5 s wrap; absolute clock skew doesn't matter
+    /// because the BWE consumer looks at *relative* arrival differences
+    /// between packets in the same envelope.
+    pub arrival_time_ms_lo16: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +93,10 @@ impl AckBatch {
             out.push(e.tile_x);
             out.push(e.tile_y);
             out.push(e.pass_idx);
+            // Bytes [7..9]: arrival_time_ms_lo16, little-endian to match
+            // the rest of the entry's little-endian fields.
+            out.push((e.arrival_time_ms_lo16 & 0xFF) as u8);
+            out.push(((e.arrival_time_ms_lo16 >> 8) & 0xFF) as u8);
         }
         out
     }
@@ -109,11 +124,14 @@ impl AckBatch {
             let tile_x = data[off + 4];
             let tile_y = data[off + 5];
             let pass_idx = data[off + 6];
+            let arrival_time_ms_lo16 =
+                (data[off + 7] as u16) | ((data[off + 8] as u16) << 8);
             entries.push(AckEntry {
                 frame_seq,
                 tile_x,
                 tile_y,
                 pass_idx,
+                arrival_time_ms_lo16,
             });
         }
         Ok(AckBatch { entries })
@@ -132,11 +150,12 @@ mod tests {
                 tile_x: 3,
                 tile_y: 7,
                 pass_idx: 13,
+                arrival_time_ms_lo16: 0,
             }],
         };
         let bytes = batch.encode();
-        assert_eq!(bytes[0], ACK_BATCH_MSG_TYPE, "msg type = 0x03");
-        assert_eq!(bytes[0], 0x03);
+        assert_eq!(bytes[0], ACK_BATCH_MSG_TYPE, "msg type = 0x04");
+        assert_eq!(bytes[0], 0x04);
         assert_eq!(bytes[1], 1, "count = 1");
         assert_eq!(bytes[2..6], [0x78, 0x56, 0x34, 0x12], "frame_seq LE");
         assert_eq!(bytes[6], 3, "tile_x");
@@ -154,6 +173,7 @@ mod tests {
                 tile_x: 0,
                 tile_y: 0,
                 pass_idx: 0,
+                arrival_time_ms_lo16: 0,
             })
             .collect();
         let batch = AckBatch { entries };
@@ -182,12 +202,42 @@ mod tests {
 
     #[test]
     fn decode_rejects_truncated_entry_payload() {
-        // header says count=2 (needs 14+2 bytes), only 7 bytes of entry data
+        // header says count=2 (needs 20 bytes), only 9 bytes of entry data
         let mut data = vec![ACK_BATCH_MSG_TYPE, 2];
-        data.extend_from_slice(&[0u8; 7]);
+        data.extend_from_slice(&[0u8; 9]);
         assert!(matches!(
             AckBatch::decode(&data),
             Err(AckDecodeError::TooShort(_))
         ));
+    }
+
+    #[test]
+    fn ack_envelope_v4_carries_arrival_time() {
+        let entries = vec![
+            AckEntry {
+                frame_seq: 0x1234_5678,
+                tile_x: 7,
+                tile_y: 9,
+                pass_idx: 3,
+                arrival_time_ms_lo16: 0xABCD,
+            },
+            AckEntry {
+                frame_seq: 0x9999_AAAA,
+                tile_x: 1,
+                tile_y: 2,
+                pass_idx: 13,
+                arrival_time_ms_lo16: 0x0010,
+            },
+        ];
+        let batch = AckBatch { entries: entries.clone() };
+        let bytes = batch.encode();
+        // 2 header bytes + 2 entries × 9 bytes = 20 bytes
+        assert_eq!(bytes.len(), 20);
+        assert_eq!(bytes[0], ACK_BATCH_MSG_TYPE);
+        assert_eq!(bytes[0], 0x04, "msg_type bumped to 0x04");
+        assert_eq!(bytes[1], 2);
+
+        let decoded = AckBatch::decode(&bytes).expect("round-trip");
+        assert_eq!(decoded.entries, entries);
     }
 }
