@@ -16,6 +16,7 @@ import { AckBatcher } from './ack';
 import { NackBatcher } from './nack.js';
 import { initDiagnostics } from './diagnostics.js';
 import { prevalidateCdf53 } from './prevalidate_cdf53.js';
+import { applyCdf53Arrival, type Cdf53CoverageEntry } from './cdf53_coverage.js';
 import { bootstrap } from './bootstrap.js';
 
 const statusEl = document.getElementById('status')!;
@@ -590,70 +591,19 @@ async function main() {
       // plain number rather than a string for cheaper lookup; the
       // value is `{ generation, passMask }` where passMask bit i ==
       // pass i received.
-      const cdf53Coverage: Map<number, { generation: number; frameSeq: number; passMask: number; nackedMask: number; lastChangeMs: number }> =
+      const cdf53Coverage: Map<number, Cdf53CoverageEntry> =
         (w.__cdf53Coverage ??= new Map());
       const tileKey = (tX << 8) | tY;
-      const gen = asm.header.generation;
       const passIdx = asm.header.pass;
       const nowMs = performance.now();
-      const existing = cdf53Coverage.get(tileKey);
-      if (!existing || existing.generation !== gen) {
-        // First pass for this (tile, generation) — replaces any prior
-        // partial state from the previous generation. Track frameSeq so
-        // the pass-NACK paths can address the right cache entry on the
-        // server (the server's emitter cache is keyed by (frameSeq,
-        // tile, pass)). nackedMask starts empty; gap detection below
-        // marks bits in it as we NACK them.
-        cdf53Coverage.set(tileKey, {
-          generation: gen,
-          frameSeq: frameSeqFromKey,
-          passMask: 1 << passIdx,
-          nackedMask: 0,
-          lastChangeMs: nowMs,
-        });
-      } else {
-        // Only update lastChangeMs when the bitmap ACTUALLY changes —
-        // duplicate-pass arrivals (FEC recovery firing same pass after
-        // RTO already delivered it) shouldn't reset the stuck-tile
-        // timer. The tail fallback needs "no new BIT for N ms", not
-        // "no new ARRIVAL for N ms".
-        const before = existing.passMask;
-        existing.passMask |= 1 << passIdx;
-        if (existing.passMask !== before) {
-          existing.lastChangeMs = nowMs;
-          // Gap detection: server emits passes 0→13 in pass-major order;
-          // if we just set bit N but any bit M<N is still unset, M was
-          // either lost on the wire OR is in-flight reordering behind
-          // this datagram. NACK each missing M ONCE per generation
-          // (tracked by nackedMask) — the server's on_nack handler will
-          // either deliver or fail; either way, repeating the NACK on
-          // every subsequent pass arrival just floods the upstream with
-          // duplicates the server has to discard as nack_miss. The
-          // tail-fallback sweep below catches the rare case where a
-          // NACK + its retransmit are both lost.
-          const sentinel = (1 << passIdx) - 1; // bits 0..passIdx-1
-          const missingBelow = sentinel & ~existing.passMask & ~existing.nackedMask;
-          if (missingBelow !== 0) {
-            for (let p = 0; p < passIdx; p++) {
-              if ((missingBelow & (1 << p)) !== 0) {
-                queuePassNack(frameSeqFromKey, tX, tY, p);
-              }
-            }
-            existing.nackedMask |= missingBelow;
-          }
-        }
-        // Refresh frame_seq: the most recent emission of this tile is
-        // what the server's cache currently holds for any still-missing
-        // passes.
-        existing.frameSeq = frameSeqFromKey;
-      }
 
       // Per-tier byte attribution for BWE-side observability (Phase 1
-      // Task 6). Counts every received CDF53 pass datagram payload;
-      // matches the server's per-tier emit counters at coarse window
-      // resolution. The exact match doesn't have to be byte-perfect —
-      // we're computing per-second rates for an order-of-magnitude
-      // BWE estimate, not for accounting.
+      // Task 6). Counts every received CDF53 pass datagram payload —
+      // including prevalidation-failed ones; matches the server's
+      // per-tier emit counters at coarse window resolution. The exact
+      // match doesn't have to be byte-perfect — we're computing
+      // per-second rates for an order-of-magnitude BWE estimate, not
+      // for accounting.
       if (passIdx <= 3) {
         bytesRecvCritical += payload.byteLength;
       } else {
@@ -661,6 +611,24 @@ async function main() {
       }
 
       const r = prevalidateCdf53(payload, asm.header.generation, asm.header.pass);
+
+      // Coverage update + NACK decision is shared between the success
+      // and failure paths (Phase 1.5-A). Pure logic lives in
+      // `applyCdf53Arrival`; this caller wires the resulting NACK list
+      // to `queuePassNack` and the per-failure diagnostic counters.
+      const update = applyCdf53Arrival(
+        cdf53Coverage.get(tileKey),
+        asm.header.generation,
+        passIdx,
+        frameSeqFromKey,
+        nowMs,
+        r.ok,
+      );
+      cdf53Coverage.set(tileKey, update.entry);
+      for (const p of update.nackPasses) {
+        queuePassNack(frameSeqFromKey, tX, tY, p);
+      }
+
       if (!r.ok) {
         w.__cdf53PrevalidateFails = (w.__cdf53PrevalidateFails ?? 0) + 1;
         w.__cdf53LastFailCode = r.errorCode;
@@ -788,7 +756,7 @@ async function main() {
     nackFlushTimer = null;
     if (pendingNacks.size === 0) return;
     const cov = (window as any).__cdf53Coverage as
-      | Map<number, { generation: number; frameSeq: number; passMask: number; nackedMask: number; lastChangeMs: number }>
+      | Map<number, Cdf53CoverageEntry>
       | undefined;
     for (const entry of pendingNacks.values()) {
       // Re-check the live bitmap right before sending. A pass that
@@ -845,7 +813,7 @@ async function main() {
     if (tickNowMs - __lastTailSweepMs > TAIL_SWEEP_INTERVAL_MS) {
       __lastTailSweepMs = tickNowMs;
       const cov = (window as any).__cdf53Coverage as
-        | Map<number, { generation: number; frameSeq: number; passMask: number; nackedMask: number; lastChangeMs: number }>
+        | Map<number, Cdf53CoverageEntry>
         | undefined;
       if (cov) {
         for (const [tileKey, v] of cov.entries()) {
@@ -940,7 +908,7 @@ async function main() {
       // The histogram exposes the *distribution* of pass counts so we
       // can tell e.g. "most are stuck at 8" (LL3 + a few bit-planes)
       // vs "most are at 14 but a handful missing one or two passes".
-      const cdf53Cov = (w.__cdf53Coverage ?? new Map<number, { generation: number; frameSeq: number; passMask: number; nackedMask: number; lastChangeMs: number }>()) as Map<number, { generation: number; frameSeq: number; passMask: number; nackedMask: number; lastChangeMs: number }>;
+      const cdf53Cov = (w.__cdf53Coverage ?? new Map<number, Cdf53CoverageEntry>()) as Map<number, Cdf53CoverageEntry>;
       let cdf53Refined = 0;
       let cdf53Partial = 0;
       const cdf53PassHist = new Array(15).fill(0); // bucket index = passes received (0..14)
