@@ -154,6 +154,28 @@ const CUMULATIVE_EMIT_LOG_INTERVAL_FRAMES: u32 = 60;
 // observed in production with no cap).
 const RTO_RETRANSMITS_PER_TICK: usize = 64;
 
+/// Visual-importance tier of a CDF53 pass.
+/// - Critical: passes 0-3 — LL3 sub-band + first 3 bit-planes. Carry
+///   most of the perceived image quality. NACKed aggressively, given
+///   priority in the pacer.
+/// - Refinement: passes 4-13 — higher-frequency detail. NACKed
+///   conservatively, lower priority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PassTier {
+    Critical,
+    Refinement,
+}
+
+fn pass_tier(pass_idx: u8) -> PassTier {
+    if pass_idx <= 3 { PassTier::Critical } else { PassTier::Refinement }
+}
+
+/// Maximum number of pending BweSample entries the per-tick drain
+/// will hold between drains. Sized to comfortably exceed one tick's
+/// worth of ACK throughput on a 1920×1080 first-paint burst
+/// (~24K passes, ACK batches of ~64 entries → ~376 batches).
+const BWE_SAMPLES_BUFFER_CAPACITY: usize = 4096;
+
 // ---------------------------------------------------------------------------
 // M3.5 bench telemetry: per-frame send-side stats
 // ---------------------------------------------------------------------------
@@ -469,6 +491,34 @@ pub struct IoBridge {
     /// emitter pipeline.
     pub(crate) reliable_emitter:
         crate::transport::reliable_emitter::ReliableTileEmitter,
+    /// Rolling buffer of one-way-delay samples derived from ACK
+    /// envelopes (Phase 1 Task 5). Drained periodically into the Bwe
+    /// estimator (Task 8) and into per-tier latency histograms (Task
+    /// 6). Bounded by `BWE_SAMPLES_BUFFER_CAPACITY`; under high ACK
+    /// load excess samples are dropped (the consumer doesn't need
+    /// every single sample for a useful estimate).
+    bwe_samples_buffer: Vec<BweSample>,
+}
+
+/// One-way-delay sample observed at ACK time. Used as input to the
+/// per-tier latency histograms and the str0m::bwe estimator (wired
+/// in Phase 1 Task 8). All timestamps are u16 wall-clock-ms wrapped;
+/// the consumer looks at *relative* deltas, so clock skew is fine.
+#[derive(Debug, Clone, Copy)]
+struct BweSample {
+    tier: PassTier,
+    /// Low 16 bits of the server's emit time in ms (derived from the
+    /// μs-resolution timestamp_us stamped in the cached datagram).
+    server_emit_ms_lo16: u16,
+    /// Low 16 bits of the client's receive time in ms, echoed back via
+    /// the ACK envelope's `arrival_time_ms_lo16`.
+    client_arrival_ms_lo16: u16,
+    /// Modular u16 subtraction of arrival - emit. *Delta-of-deltas* input
+    /// to delay-gradient estimation; the absolute value is meaningless
+    /// because of clock skew.
+    owd_ms_lo16: u16,
+    /// Wall-clock instant when the ACK arrived (for periodic-drain timing).
+    received_at: std::time::Instant,
 }
 
 /// Per-cumulative-log bump counters. Reset on log emission.
@@ -817,6 +867,7 @@ impl IoBridge {
             bump_count_accumulator: BumpCountAccumulator::default(),
             reliable_emitter:
                 crate::transport::reliable_emitter::ReliableTileEmitter::new(),
+            bwe_samples_buffer: Vec::with_capacity(BWE_SAMPLES_BUFFER_CAPACITY),
         };
         Ok(bridge)
     }
@@ -1577,6 +1628,16 @@ impl IoBridge {
                 // it. Runs alongside the legacy scheduler/coverage path
                 // below; Task 28 will retire the legacy bookkeeping once
                 // the emitter is the sole source of truth.
+                //
+                // Phase 1 Task 5: we ALSO extract OWD samples here, before
+                // on_ack removes the cache entries. The cache lookup below
+                // recovers the server's stamped emit time (μs, u32 BE at
+                // bytes [12..16]) and pairs it with the client's echoed
+                // arrival_time_ms_lo16. Both are u16 wall-clock-ms wrapped;
+                // the BWE consumer uses relative deltas only, so clock skew
+                // is acceptable. Cache misses are silent (already ACKed by
+                // an overlapping batch, or RTO-evicted).
+                let now_for_samples = std::time::Instant::now();
                 let emit_keys: Vec<crate::transport::reliable_emitter::EmitKey> = batch
                     .entries
                     .iter()
@@ -1589,6 +1650,36 @@ impl IoBridge {
                         )
                     })
                     .collect();
+                // Extract BweSamples while the cache entries are still live.
+                for (emit_key, e) in emit_keys.iter().zip(batch.entries.iter()) {
+                    if self.bwe_samples_buffer.len() < BWE_SAMPLES_BUFFER_CAPACITY {
+                        let server_emit_ms_lo16 = self
+                            .reliable_emitter
+                            .cache
+                            .get(emit_key)
+                            .and_then(|entry| entry.fragments.first())
+                            .filter(|frag| frag.len() >= 16)
+                            .map(|frag| {
+                                let ts_be: [u8; 4] = frag[12..16].try_into().unwrap();
+                                // u32 μs → u16 ms low-16: divide by 1000 to
+                                // convert μs→ms, then wrap to u16. Matches the
+                                // wire shape of arrival_time_ms_lo16.
+                                (u32::from_be_bytes(ts_be) / 1000) as u16
+                            });
+                        if let Some(emit_lo16) = server_emit_ms_lo16 {
+                            let arrival_lo16 = e.arrival_time_ms_lo16;
+                            let tier = pass_tier(e.pass_idx);
+                            let owd_ms_lo16 = arrival_lo16.wrapping_sub(emit_lo16);
+                            self.bwe_samples_buffer.push(BweSample {
+                                tier,
+                                server_emit_ms_lo16: emit_lo16,
+                                client_arrival_ms_lo16: arrival_lo16,
+                                owd_ms_lo16,
+                                received_at: now_for_samples,
+                            });
+                        }
+                    }
+                }
                 self.reliable_emitter.on_ack(&emit_keys);
                 for e in batch.entries {
                     // Key matches how coverage is recorded at emit time:
@@ -3834,6 +3925,7 @@ impl IoBridge {
             bump_count_accumulator: BumpCountAccumulator::default(),
             reliable_emitter:
                 crate::transport::reliable_emitter::ReliableTileEmitter::new(),
+            bwe_samples_buffer: Vec::with_capacity(BWE_SAMPLES_BUFFER_CAPACITY),
         };
         bridge
     }
@@ -3907,6 +3999,7 @@ impl IoBridge {
             bump_count_accumulator: BumpCountAccumulator::default(),
             reliable_emitter:
                 crate::transport::reliable_emitter::ReliableTileEmitter::new(),
+            bwe_samples_buffer: Vec::with_capacity(BWE_SAMPLES_BUFFER_CAPACITY),
         };
         bridge
     }
