@@ -648,6 +648,18 @@ async function main() {
         existing.frameSeq = frameSeqFromKey;
       }
 
+      // Per-tier byte attribution for BWE-side observability (Phase 1
+      // Task 6). Counts every received CDF53 pass datagram payload;
+      // matches the server's per-tier emit counters at coarse window
+      // resolution. The exact match doesn't have to be byte-perfect —
+      // we're computing per-second rates for an order-of-magnitude
+      // BWE estimate, not for accounting.
+      if (passIdx <= 3) {
+        bytesRecvCritical += payload.byteLength;
+      } else {
+        bytesRecvRefinement += payload.byteLength;
+      }
+
       const r = prevalidateCdf53(payload, asm.header.generation, asm.header.pass);
       if (!r.ok) {
         w.__cdf53PrevalidateFails = (w.__cdf53PrevalidateFails ?? 0) + 1;
@@ -724,6 +736,15 @@ async function main() {
       }
     }
   }
+
+  // Per-tier recv counters (passes 0-3 critical vs 4-13 refinement).
+  // Updated in the per-pass receive path below; reported in the periodic
+  // stats line (Phase 1 Task 10). Bytes-since-startup; the periodic
+  // logger derives per-window rates from snapshot deltas.
+  let bytesRecvCritical = 0;
+  let bytesRecvRefinement = 0;
+  let bytesRecvCriticalSnapshot = 0;
+  let bytesRecvRefinementSnapshot = 0;
 
   // rAF loop — drains queues, flushes one frame per animation tick.
   let __rafTicks = 0;

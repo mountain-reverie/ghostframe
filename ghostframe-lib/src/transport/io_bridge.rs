@@ -498,6 +498,22 @@ pub struct IoBridge {
     /// load excess samples are dropped (the consumer doesn't need
     /// every single sample for a useful estimate).
     bwe_samples_buffer: Vec<BweSample>,
+    /// Cumulative bytes of CDF53 critical-tier (passes 0-3) datagrams
+    /// emitted since startup. Counts every successful emit including
+    /// retransmits, because the BWE-side rate computation should reflect
+    /// actual wire utilization. Reset never; the per-second logger
+    /// derives rates from the snapshot delta.
+    bytes_emitted_critical: u64,
+    /// Cumulative bytes of CDF53 refinement-tier (passes 4-13) datagrams
+    /// emitted since startup. Same semantics as `bytes_emitted_critical`.
+    bytes_emitted_refinement: u64,
+    /// Snapshot of (critical, refinement) byte counters at the previous
+    /// periodic-log tick, used to derive per-window rates without
+    /// polluting the cumulative counters.
+    bytes_emitted_snapshot: (u64, u64),
+    /// Wall-clock instant of the previous periodic-log tick. None until
+    /// the first log fires.
+    bwe_log_last_at: Option<std::time::Instant>,
 }
 
 /// One-way-delay sample observed at ACK time. Used as input to the
@@ -868,6 +884,10 @@ impl IoBridge {
             reliable_emitter:
                 crate::transport::reliable_emitter::ReliableTileEmitter::new(),
             bwe_samples_buffer: Vec::with_capacity(BWE_SAMPLES_BUFFER_CAPACITY),
+            bytes_emitted_critical: 0,
+            bytes_emitted_refinement: 0,
+            bytes_emitted_snapshot: (0, 0),
+            bwe_log_last_at: None,
         };
         Ok(bridge)
     }
@@ -1414,6 +1434,10 @@ impl IoBridge {
             // (client can't usefully process the tile until assembly
             // completes anyway).
             let n = datagrams.len();
+            // Declared outside the `if n > 0` block so that the per-tier
+            // byte counters below (Phase 1 Task 6) can read it after the
+            // block closes.
+            let mut tile_wire_bytes_total: u32 = 0;
             if n > 0 {
                 let palette_id = if work.codec == crate::transport::protocol::Codec::PalRle {
                     // PalRle payload byte 1 is the persistent palette slot id
@@ -1456,6 +1480,7 @@ impl IoBridge {
                     }
                 }
                 let tile_wire_bytes: u32 = datagrams.iter().map(|dg| dg.len() as u32).sum();
+                tile_wire_bytes_total = tile_wire_bytes;
                 stats.total_wire_bytes = stats.total_wire_bytes.saturating_add(tile_wire_bytes);
                 total_wire_bytes_sent =
                     total_wire_bytes_sent.saturating_add(tile_wire_bytes as usize);
@@ -1479,6 +1504,23 @@ impl IoBridge {
                 Codec::Cdf53 => {
                     self.cumulative_datagrams_emitted.cdf53 =
                         self.cumulative_datagrams_emitted.cdf53.saturating_add(n_dg);
+                    // Per-tier byte attribution (Phase 1 Task 6). Uses the
+                    // real total wire bytes summed from each datagram fragment
+                    // (headers included), set in `tile_wire_bytes_total` above.
+                    // Counts every successful emit including retransmits so the
+                    // BWE consumer's rate computation reflects actual wire
+                    // utilization, not initial-emit accounting.
+                    let bytes_this_tile = tile_wire_bytes_total as u64;
+                    match pass_tier(work.pass_idx) {
+                        PassTier::Critical => {
+                            self.bytes_emitted_critical =
+                                self.bytes_emitted_critical.saturating_add(bytes_this_tile);
+                        }
+                        PassTier::Refinement => {
+                            self.bytes_emitted_refinement =
+                                self.bytes_emitted_refinement.saturating_add(bytes_this_tile);
+                        }
+                    }
                 }
                 Codec::Raw => {
                     self.cumulative_datagrams_emitted.raw =
@@ -3926,6 +3968,10 @@ impl IoBridge {
             reliable_emitter:
                 crate::transport::reliable_emitter::ReliableTileEmitter::new(),
             bwe_samples_buffer: Vec::with_capacity(BWE_SAMPLES_BUFFER_CAPACITY),
+            bytes_emitted_critical: 0,
+            bytes_emitted_refinement: 0,
+            bytes_emitted_snapshot: (0, 0),
+            bwe_log_last_at: None,
         };
         bridge
     }
@@ -4000,6 +4046,10 @@ impl IoBridge {
             reliable_emitter:
                 crate::transport::reliable_emitter::ReliableTileEmitter::new(),
             bwe_samples_buffer: Vec::with_capacity(BWE_SAMPLES_BUFFER_CAPACITY),
+            bytes_emitted_critical: 0,
+            bytes_emitted_refinement: 0,
+            bytes_emitted_snapshot: (0, 0),
+            bwe_log_last_at: None,
         };
         bridge
     }
