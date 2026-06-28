@@ -638,6 +638,54 @@ async function main() {
           tileY: tY,
           errorCode: r.errorCode,
         });
+        // Phase 1.5-C: dump the raw bytes of the first MAX_CDF53_FAIL_DUMPS
+        // prevalidation failures so we can inspect the wire-format
+        // corruption that causes ERR_CDF53_TRUNCATED / ERR_CDF53_RLE_LENGTH.
+        // Each entry: (frameSeq, tileX, tileY, passIdx, gen, errorCode,
+        // payloadLen, hex bytes). Stored on `window.__cdf53FailDumps` so
+        // it's accessible from devtools without instrumenting the renderer.
+        const MAX_CDF53_FAIL_DUMPS = 32;
+        const dumps = (w.__cdf53FailDumps ??= [] as Array<{
+          frameSeq: number;
+          tileX: number;
+          tileY: number;
+          passIdx: number;
+          gen: number;
+          errorCode: number;
+          payloadLen: number;
+          hex: string;
+        }>);
+        if (dumps.length < MAX_CDF53_FAIL_DUMPS) {
+          // Hex-encode up to first 256 bytes — enough to inspect the
+          // 6-byte BGR length prefix triple + payload start, where
+          // truncation / RLE-length errors occur. Bounded to keep the
+          // window object small (a 16-entry dump caps at ~16 KB).
+          const len = Math.min(payload.byteLength, 256);
+          let hex = '';
+          for (let i = 0; i < len; i++) {
+            hex += payload[i].toString(16).padStart(2, '0');
+            if (i < len - 1) hex += ' ';
+          }
+          dumps.push({
+            frameSeq: frameSeqFromKey,
+            tileX: tX,
+            tileY: tY,
+            passIdx: asm.header.pass,
+            gen: asm.header.generation,
+            errorCode: r.errorCode,
+            payloadLen: payload.byteLength,
+            hex,
+          });
+          // Log the first few to console for visibility without devtools
+          // inspection. Useful in production for quick triage.
+          if (dumps.length <= 4) {
+            log(
+              `cdf53.fail#${dumps.length} seq=${frameSeqFromKey} ` +
+              `tile=(${tX},${tY}) pass=${asm.header.pass} gen=${asm.header.generation} ` +
+              `err=${r.errorCode} len=${payload.byteLength} hex=${hex.slice(0, 96)}${hex.length > 96 ? '…' : ''}`
+            );
+          }
+        }
       } else {
         // Caller-fills tileX/tileY (prevalidate left them at 0).
         r.entry.tileX = tX;
