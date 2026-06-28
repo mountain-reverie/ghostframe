@@ -498,6 +498,11 @@ pub struct IoBridge {
     /// load excess samples are dropped (the consumer doesn't need
     /// every single sample for a useful estimate).
     bwe_samples_buffer: Vec<BweSample>,
+    /// Bandwidth-estimator wrapper. Phase 1: runs in PASSIVE mode — we
+    /// feed it ACK arrivals and read its estimate for the periodic log,
+    /// but the estimate doesn't drive emission yet. Phase 2 will plug
+    /// `bwe.snapshot().bitrate_bps` into the pacer.
+    bwe: crate::transport::bwe::BweWrapper,
     /// Cumulative bytes of CDF53 critical-tier (passes 0-3) datagrams
     /// emitted since startup. Counts every successful emit including
     /// retransmits, because the BWE-side rate computation should reflect
@@ -884,6 +889,9 @@ impl IoBridge {
             reliable_emitter:
                 crate::transport::reliable_emitter::ReliableTileEmitter::new(),
             bwe_samples_buffer: Vec::with_capacity(BWE_SAMPLES_BUFFER_CAPACITY),
+            bwe: crate::transport::bwe::BweWrapper::new(
+                crate::transport::bwe::BweWrapper::INITIAL_BPS,
+            ),
             bytes_emitted_critical: 0,
             bytes_emitted_refinement: 0,
             bytes_emitted_snapshot: (0, 0),
@@ -3446,6 +3454,27 @@ impl IoBridge {
             // bandwidth estimate stays current. No-op when no connections.
             self.sample_all_path_stats();
 
+            // Phase 1 Task 8: drain accumulated BWE samples (populated by
+            // the ACK-receive path in Task 5) into the estimator. Cheap
+            // on empty. The wire_seq we feed is a Phase 1 placeholder
+            // (composed from emit/arrival timestamps); Phase 2 will plumb
+            // the real cache-entry wire_seq through `BweSample` if the
+            // estimator backend needs strict packet-sequence identity.
+            if !self.bwe_samples_buffer.is_empty() {
+                use crate::transport::bwe::AckArrival;
+                let records: Vec<AckArrival> = self
+                    .bwe_samples_buffer
+                    .drain(..)
+                    .map(|s| AckArrival {
+                        wire_seq: ((s.server_emit_ms_lo16 as u32) << 16)
+                            | (s.client_arrival_ms_lo16 as u32),
+                        server_emit_ms_lo16: s.server_emit_ms_lo16,
+                        client_arrival_ms_lo16: s.client_arrival_ms_lo16,
+                    })
+                    .collect();
+                self.bwe.update(&records, std::time::Instant::now());
+            }
+
             // [BRIDGE-DIAG] heartbeat every 2s of wall time so we can tell
             // from the log whether the loop is making progress when the
             // emit pipeline goes silent.
@@ -3968,6 +3997,9 @@ impl IoBridge {
             reliable_emitter:
                 crate::transport::reliable_emitter::ReliableTileEmitter::new(),
             bwe_samples_buffer: Vec::with_capacity(BWE_SAMPLES_BUFFER_CAPACITY),
+            bwe: crate::transport::bwe::BweWrapper::new(
+                crate::transport::bwe::BweWrapper::INITIAL_BPS,
+            ),
             bytes_emitted_critical: 0,
             bytes_emitted_refinement: 0,
             bytes_emitted_snapshot: (0, 0),
@@ -4046,6 +4078,9 @@ impl IoBridge {
             reliable_emitter:
                 crate::transport::reliable_emitter::ReliableTileEmitter::new(),
             bwe_samples_buffer: Vec::with_capacity(BWE_SAMPLES_BUFFER_CAPACITY),
+            bwe: crate::transport::bwe::BweWrapper::new(
+                crate::transport::bwe::BweWrapper::INITIAL_BPS,
+            ),
             bytes_emitted_critical: 0,
             bytes_emitted_refinement: 0,
             bytes_emitted_snapshot: (0, 0),
