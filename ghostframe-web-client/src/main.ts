@@ -644,6 +644,21 @@ async function main() {
         r.entry.tileY = tY;
         renderer.pushCdf53(r.entry);
         w.__cdf53PushedToQueue = (w.__cdf53PushedToQueue ?? 0) + 1;
+        // Phase 1.5-A v2: deferred CDF53 ACK. Fires only after the pass
+        // bytes successfully prevalidate (deterministic — runs entirely
+        // on bytes already in hand, no GPU round-trip). Server's
+        // `record_cdf53_ack` then marks this pass delivered, gating
+        // `tile_fully_acked` honestly. A failed-prevalidation pass
+        // produces NO ACK — the server's retransmit cache retains the
+        // entry for RTO retry, and Phase 1.5-B's stranded escalation
+        // can observe `acked < max_passes` as the true client view.
+        ackBatcher.add({
+          frameSeq: frameSeqFromKey | TILE_DATAGRAM_FLAG,
+          tileX: tX,
+          tileY: tY,
+          passIdx: asm.header.pass,
+          arrivalTimeMsLo16: (performance.now() & 0xFFFF) | 0,
+        });
       }
     }
 
@@ -1053,17 +1068,33 @@ async function main() {
     // the scheduler and has no coverage entry on the server — ACKing it would
     // always produce an ack_miss log.
     if (tileHdr.tileX !== FRAME_DIMENSIONS_SENTINEL_X || tileHdr.tileY !== FRAME_DIMENSIONS_SENTINEL_Y) {
-      ackBatcher.add({
-        frameSeq: dgramHdr.frameSeq | TILE_DATAGRAM_FLAG,
-        tileX: tileHdr.tileX,
-        tileY: tileHdr.tileY,
-        passIdx: tileHdr.pass,
-        // Low 16 bits of performance.now() in milliseconds — wall-clock
-        // monotonic-from-page-load, 65.5 s wrap. The server's BWE consumer
-        // only looks at relative arrival differences between passes in the
-        // same envelope, so anchor-point + clock skew are irrelevant.
-        arrivalTimeMsLo16: (performance.now() & 0xFFFF) | 0,
-      });
+      // Phase 1.5-A v2: CDF53 ACKs DEFER to the per-pass-completion path
+      // (after `prevalidateCdf53` succeeds). Without that gate, a pass
+      // whose RLE-encoded bytes are corrupted (`ERR_CDF53_TRUNCATED` /
+      // `ERR_CDF53_RLE_LENGTH`) still triggers an ACK on receipt — the
+      // server's `record_cdf53_ack` then marks the pass as delivered,
+      // `tile_fully_acked` transitions the tile to `PixelPerfect`, and
+      // the retransmit cache is emptied. The client is left with a
+      // permanently broken tile and no recovery mechanism on the
+      // server's side (stranded escalation can't fire because the
+      // server thinks every pass is acked).
+      //
+      // Non-Cdf53 codecs (Solid / PalRle / Raw / H264) don't have a
+      // post-assembly prevalidation failure mode, so the legacy
+      // ACK-on-receive remains correct for them.
+      if (tileHdr.codec !== Codec.Cdf53) {
+        ackBatcher.add({
+          frameSeq: dgramHdr.frameSeq | TILE_DATAGRAM_FLAG,
+          tileX: tileHdr.tileX,
+          tileY: tileHdr.tileY,
+          passIdx: tileHdr.pass,
+          // Low 16 bits of performance.now() in milliseconds — wall-clock
+          // monotonic-from-page-load, 65.5 s wrap. The server's BWE consumer
+          // only looks at relative arrival differences between passes in the
+          // same envelope, so anchor-point + clock skew are irrelevant.
+          arrivalTimeMsLo16: (performance.now() & 0xFFFF) | 0,
+        });
+      }
     }
 
     // M3.5 bench: record the earliest receive timestamp per frame_seq.
