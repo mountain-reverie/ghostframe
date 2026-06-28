@@ -1053,7 +1053,11 @@ async function main() {
         tileX: tileHdr.tileX,
         tileY: tileHdr.tileY,
         passIdx: tileHdr.pass,
-        arrivalTimeMsLo16: 0, // Phase 1 Task 4 will populate from performance.now()
+        // Low 16 bits of performance.now() in milliseconds — wall-clock
+        // monotonic-from-page-load, 65.5 s wrap. The server's BWE consumer
+        // only looks at relative arrival differences between passes in the
+        // same envelope, so anchor-point + clock skew are irrelevant.
+        arrivalTimeMsLo16: (performance.now() & 0xFFFF) | 0,
       });
     }
 
