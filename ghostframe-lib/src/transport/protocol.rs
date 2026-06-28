@@ -113,6 +113,19 @@ pub struct DatagramHeader {
     /// `wire_seq` wraps, the previous occupant of any given value has
     /// long left the in-flight set.
     pub wire_seq: u32,
+    /// **For frame (full-image H.264) datagrams:** capture time of the
+    /// originating frame in microseconds, propagated from xdaemon. Used for
+    /// end-to-end latency bench metrics.
+    ///
+    /// **For tile datagrams (`TILE_DATAGRAM_FLAG` set in `frame_seq`):**
+    /// SERVER EMIT TIME in microseconds (wall-clock, u32 wrap window
+    /// ≈ 71 min). Stamped at the wire-write site in
+    /// `reliable_emitter::ReliableTileEmitter::{submit_one,tick}`. Used by
+    /// the client's per-tier latency tracking AND echoed back to the server
+    /// via the ACK envelope's `arrival_time_ms_lo16` for the GCC
+    /// delay-gradient estimator. Semantics changed in 2026-06-27 — was
+    /// previously frame capture time for tile datagrams too, which was
+    /// useless for inter-datagram timing.
     pub timestamp_us: u32,
 }
 

@@ -61,6 +61,15 @@ impl ReliableTileEmitter {
         if bytes.len() >= 12 {
             bytes[8..12].copy_from_slice(&wire_seq.to_be_bytes());
         }
+        // Stamp server emit time (wall-clock μs, u32 wrap) into the
+        // DatagramHeader.timestamp_us field at [12..16] for tile datagrams
+        // (which set TILE_DATAGRAM_FLAG = 0x80 in byte 0). Used by the
+        // client's per-tier latency tracking and echoed back via the ACK
+        // envelope for the BWE delay-gradient input.
+        if bytes.len() >= 16 && (bytes[0] & 0x80) != 0 {
+            let emit_us = wall_clock_emit_us();
+            bytes[12..16].copy_from_slice(&emit_us.to_be_bytes());
+        }
         // Cache & RTO.
         let entry = CacheEntry {
             fragments: smallvec![Bytes::from(bytes.clone())],
@@ -171,7 +180,14 @@ impl ReliableTileEmitter {
                 fp = format_args!("{:08x}", fp),
                 "[H3-SRV] retransmit"
             );
-            for bytes in frags {
+            for mut bytes in frags {
+                // Re-stamp emit time on retransmit so the BWE consumer sees
+                // the actual on-wire moment, not the original send. Tile
+                // datagrams only (top bit of byte 0 set).
+                if bytes.len() >= 16 && (bytes[0] & 0x80) != 0 {
+                    let emit_us = wall_clock_emit_us();
+                    bytes[12..16].copy_from_slice(&emit_us.to_be_bytes());
+                }
                 self.queue.push_source(bytes);
             }
             self.rto.schedule(key, now + new_rto);
@@ -258,6 +274,18 @@ impl ReliableTileEmitter {
             }
         }
     }
+}
+
+/// Returns the current wall-clock microseconds, truncated to a u32 (≈ 71
+/// minute wrap). Used to stamp `DatagramHeader.timestamp_us` on tile
+/// datagrams. Clock skew between server and client is irrelevant — the BWE
+/// consumer only looks at *deltas* between packets in the same batch.
+fn wall_clock_emit_us() -> u32 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as u32)
+        .unwrap_or(0)
 }
 
 /// [H3-DIAG] FNV-1a fingerprint of the first fragment's bytes, plus the
