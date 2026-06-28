@@ -337,6 +337,34 @@ impl Scheduler {
             .unwrap_or(0)
     }
 
+    /// Bitmap of UNACKED passes for `(tile, gen)`. Bit i set means pass
+    /// `i` has not been acked. Bits 14..=15 are always 0 (CDF53 has 14
+    /// passes). Returns `0xFFFF & ((1 << max_passes) - 1)` when no ack
+    /// entry exists (every pass is unacked); returns 0 when every pass
+    /// in `0..max_passes` has been acked. Used by `IoBridge`'s Phase 1.5-B
+    /// stranded-tile escalation to re-enqueue only the missing passes
+    /// at the existing generation (no `bump_generation`, preserving
+    /// the client's already-delivered passes for this tile).
+    pub fn cdf53_unacked_pass_mask(
+        &self,
+        tile_x: u8,
+        tile_y: u8,
+        generation: u8,
+        max_passes: u8,
+    ) -> u16 {
+        let full: u16 = if max_passes >= 16 {
+            0xFFFF
+        } else {
+            (1u16 << max_passes) - 1
+        };
+        let acked = self
+            .cdf53_passes_acked
+            .get(&(tile_x, tile_y, generation))
+            .copied()
+            .unwrap_or(0);
+        full & !acked
+    }
+
     /// Filter the caller-provided `(tile, gen, max_passes)` tuples down to
     /// those whose acked count is strictly less than `max_passes`. Used by
     /// `IoBridge`'s stuck-tile resweep — the scheduler doesn't know which
@@ -645,6 +673,51 @@ impl Scheduler {
                 generation: gen,
                 pass_idx: pass_idx as u8,
                 total_passes: total,
+                codec: Codec::Cdf53,
+                payload,
+                queued_at: Instant::now(),
+                last_sent_at: None,
+                state: WorkState::Pending,
+            });
+        }
+    }
+
+    /// Phase 1.5-B stranded-recovery enqueue: take a subset of CDF53 passes
+    /// (specified by `pass_mask`, bit `i` set ⇒ payload `i` of the subset)
+    /// and enqueue each at its true absolute pass index. `payloads` must
+    /// contain exactly `pass_mask.count_ones()` entries, in ascending
+    /// bit-position order.
+    ///
+    /// `total_passes` is set to 14 (the full CDF53 pass count) so the
+    /// client's coverage bookkeeping still treats the (tile, gen) as a
+    /// 14-pass progressive emission, not as a fresh series of N short
+    /// emissions. The caller's mask preserves the partial-bitmap state
+    /// the client already built up for this generation.
+    pub fn enqueue_refinement_subset(
+        &mut self,
+        tile_x: u8,
+        tile_y: u8,
+        gen: u8,
+        pass_mask: u16,
+        payloads: Vec<Vec<u8>>,
+    ) {
+        debug_assert_eq!(
+            pass_mask.count_ones() as usize,
+            payloads.len(),
+            "pass_mask popcount must match payloads length"
+        );
+        let mut iter = payloads.into_iter();
+        for pass_idx in 0..16u8 {
+            if (pass_mask & (1u16 << pass_idx)) == 0 {
+                continue;
+            }
+            let Some(payload) = iter.next() else { break };
+            self.refinement_queue.push_back(TileWork {
+                tile_x,
+                tile_y,
+                generation: gen,
+                pass_idx,
+                total_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
                 codec: Codec::Cdf53,
                 payload,
                 queued_at: Instant::now(),
@@ -1314,4 +1387,86 @@ mod tests {
         assert_eq!(s.cdf53_passes_acked_count(1, 1, 0), 3);
     }
 
+    #[test]
+    fn cdf53_unacked_pass_mask_with_no_entry_is_all_unacked() {
+        let s = Scheduler::new(4, 4);
+        // No record_cdf53_ack call → every pass is unacked. For
+        // max_passes=14 the mask is 0x3FFF (bits 0..13 set).
+        assert_eq!(s.cdf53_unacked_pass_mask(0, 0, 1, 14), 0x3FFF);
+    }
+
+    #[test]
+    fn cdf53_unacked_pass_mask_with_full_acks_returns_zero() {
+        let mut s = Scheduler::new(4, 4);
+        for p in 0..14u8 {
+            s.record_cdf53_ack(0, 0, 1, p);
+        }
+        assert_eq!(s.cdf53_unacked_pass_mask(0, 0, 1, 14), 0);
+    }
+
+    #[test]
+    fn cdf53_unacked_pass_mask_partial_acks_returns_complement() {
+        let mut s = Scheduler::new(4, 4);
+        // ACK passes 0, 4, 7 → unacked = {1,2,3,5,6,8,9,10,11,12,13}.
+        s.record_cdf53_ack(2, 3, 0, 0);
+        s.record_cdf53_ack(2, 3, 0, 4);
+        s.record_cdf53_ack(2, 3, 0, 7);
+        let acked_bits = (1u16 << 0) | (1u16 << 4) | (1u16 << 7);
+        let full = (1u16 << 14) - 1;
+        let expected = full & !acked_bits;
+        assert_eq!(s.cdf53_unacked_pass_mask(2, 3, 0, 14), expected);
+    }
+
+    #[test]
+    fn cdf53_unacked_pass_mask_other_gens_dont_leak() {
+        let mut s = Scheduler::new(4, 4);
+        // ACK every pass for gen=1, query gen=2 — should be all unacked.
+        for p in 0..14u8 {
+            s.record_cdf53_ack(0, 0, 1, p);
+        }
+        assert_eq!(s.cdf53_unacked_pass_mask(0, 0, 2, 14), 0x3FFF);
+    }
+
+    #[test]
+    fn enqueue_refinement_subset_assigns_correct_pass_idxs() {
+        let mut s = Scheduler::new(4, 4);
+        // Subset: passes 2, 5, 9 (3 entries in mask). Caller passes
+        // 3 payloads in ascending bit-position order.
+        let mask = (1u16 << 2) | (1u16 << 5) | (1u16 << 9);
+        s.enqueue_refinement_subset(
+            /*tx*/ 3,
+            /*ty*/ 1,
+            /*gen*/ 4,
+            mask,
+            vec![vec![0xAA], vec![0xBB], vec![0xCC]],
+        );
+        // Walk refinement_queue and verify pass_idx mapping.
+        let entries: Vec<_> = s
+            .refinement_queue
+            .iter()
+            .map(|w| (w.pass_idx, w.payload.clone(), w.generation, w.total_passes))
+            .collect();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0], (2u8, vec![0xAAu8], 4u8, 14u8));
+        assert_eq!(entries[1], (5u8, vec![0xBBu8], 4u8, 14u8));
+        assert_eq!(entries[2], (9u8, vec![0xCCu8], 4u8, 14u8));
+    }
+
+    #[test]
+    fn enqueue_refinement_subset_empty_mask_is_noop() {
+        let mut s = Scheduler::new(2, 2);
+        s.enqueue_refinement_subset(0, 0, 1, 0, vec![]);
+        assert_eq!(s.refinement_queue.len(), 0);
+    }
+
+    #[test]
+    fn enqueue_refinement_subset_single_pass() {
+        let mut s = Scheduler::new(2, 2);
+        s.enqueue_refinement_subset(1, 1, 2, 1u16 << 7, vec![vec![0xDE, 0xAD]]);
+        assert_eq!(s.refinement_queue.len(), 1);
+        let w = &s.refinement_queue[0];
+        assert_eq!(w.pass_idx, 7);
+        assert_eq!(w.payload, vec![0xDE, 0xAD]);
+        assert_eq!(w.total_passes, 14);
+    }
 }
