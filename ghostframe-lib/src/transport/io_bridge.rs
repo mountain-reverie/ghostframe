@@ -365,6 +365,18 @@ pub struct IoBridge {
     /// sweep. Stashed here so Task 10's post-fence Phase B can read the list
     /// and update `already_escalated_this_gen` after the GPU work returns.
     cdf53_escalation_candidates_this_frame: Vec<u32>,
+    /// Phase 1.5-B stranded-CDF53 recovery: flat tile indices of tiles in
+    /// `CodecState::Cdf53` whose ACK bitmap (`Scheduler::cdf53_unacked_pass_mask`)
+    /// shows passes still unacked AND the retransmit cache holds no
+    /// entries for them (RTO has nothing to fire — cache must have been
+    /// drained by `cancel_for_tile` or `clear`, since with Phase 1.5-A v2
+    /// the client only ACKs successfully-prevalidated passes).
+    /// Detected per-frame just before `set_escalation_candidates`, fed
+    /// into the same GPU coefficient pipeline, and dispatched by Phase B
+    /// as the "stranded" branch (re-enqueue only the unacked passes at
+    /// the EXISTING generation — no `bump_generation`, no
+    /// `cancel_for_tile`).
+    cdf53_stranded_candidates_this_frame: Vec<u32>,
     /// GPU-accelerated dirty tracker (Vulkan compute SAD).
     gpu_frame_processor: Option<GpuFrameProcessor>,
     /// Full-frame H.264 encoder (VA-API zero-copy).
@@ -866,6 +878,7 @@ impl IoBridge {
             feedback_history: std::collections::VecDeque::with_capacity(5),
             recent_suspension_flags: [false, false],
             cdf53_escalation_candidates_this_frame: Vec::new(),
+            cdf53_stranded_candidates_this_frame: Vec::new(),
             gpu_frame_processor,
             full_frame_encoder: None,
             recent_frame_fragments: HashMap::new(),
@@ -2342,7 +2355,7 @@ impl IoBridge {
             // SECOND TileCodec frame. Acceptable — refinement queries run
             // every frame and there are plenty of cycles to escalate.
             let frame_mode_eligible = matches!(self.frame_mode, crate::tile::FrameMode::TileCodec);
-            let candidates = if frame_mode_eligible {
+            let h264_candidates = if frame_mode_eligible {
                 crate::tile::detect_escalation_candidates(
                     &self.metrics_tracker,
                     crate::capture::gpu_pipeline::MAX_ESCALATION_PER_FRAME,
@@ -2350,9 +2363,71 @@ impl IoBridge {
             } else {
                 Vec::new()
             };
+            // Phase 1.5-B: detect stranded CDF53 tiles whose retransmit
+            // cache has drained but the client hasn't ACKed every pass.
+            // These need re-emission at the EXISTING generation (no
+            // bump). Dispatched by Phase B based on `codec_state ==
+            // Cdf53`. Inlined here (not in escalation.rs) to avoid a
+            // tile/ → transport/ layering dependency: the eligibility
+            // check needs the scheduler's per-(tile, gen) ACK bitmap
+            // and the reliable_emitter's cache occupancy, both
+            // transport-layer state.
+            let stranded_candidates = if frame_mode_eligible {
+                let remaining = crate::capture::gpu_pipeline::MAX_ESCALATION_PER_FRAME
+                    .saturating_sub(h264_candidates.len());
+                let mut out = Vec::new();
+                let cols = self.metrics_tracker.cols();
+                for (idx, m) in self.metrics_tracker.metrics().iter().enumerate() {
+                    if out.len() >= remaining {
+                        break;
+                    }
+                    if m.idle_frames <= crate::tile::escalation::IDLE_THRESHOLD {
+                        continue;
+                    }
+                    let max_passes = match m.codec_state {
+                        crate::tile::CodecState::Cdf53 { max_passes, .. } => max_passes,
+                        _ => continue,
+                    };
+                    // NOTE: TileMetrics.passes_sent is dead state in the
+                    // current codebase — it's initialized to 0 at every
+                    // Cdf53 transition (io_bridge.rs:3139, 3291;
+                    // classifier.rs:218/240/257) and never incremented.
+                    // So the original gate `passes_sent == max_passes`
+                    // never fired. Use the live `reliable_emitter` cache
+                    // + scheduler ACK bitmap as the source of truth.
+                    let tile_x = (idx as u32 % cols) as u8;
+                    let tile_y = (idx as u32 / cols) as u8;
+                    // RTO still has cached entries → it's pumping
+                    // retransmits, not stranded. Stranded == cache
+                    // drained but client hasn't ACKed everything.
+                    if self.reliable_emitter.has_cache_entries_for_tile(tile_x, tile_y) {
+                        continue;
+                    }
+                    let gen = self.scheduler.generation_for(tile_x, tile_y);
+                    let unacked = self.scheduler.cdf53_unacked_pass_mask(
+                        tile_x, tile_y, gen, max_passes,
+                    );
+                    if unacked == 0 {
+                        continue;
+                    }
+                    out.push(idx as u32);
+                }
+                out
+            } else {
+                Vec::new()
+            };
+            // Merge: stranded first (more time-sensitive — client has
+            // been waiting > 30 frames), then H264 escalation.
+            let mut candidates = Vec::with_capacity(
+                stranded_candidates.len() + h264_candidates.len(),
+            );
+            candidates.extend(&stranded_candidates);
+            candidates.extend(&h264_candidates);
+            candidates.truncate(crate::capture::gpu_pipeline::MAX_ESCALATION_PER_FRAME);
             let processor = self.gpu_frame_processor.as_mut().unwrap();
             processor.set_escalation_candidates(&candidates);
             self.cdf53_escalation_candidates_this_frame = candidates;
+            self.cdf53_stranded_candidates_this_frame = stranded_candidates;
         }
 
         // GPU pipeline: Vulkan SAD dirty detection + NV12 conversion.
@@ -3068,14 +3143,28 @@ impl IoBridge {
                     }
                 }
 
-                // ---- M3.3c: post-fence Phase B for escalation candidates ----
+                // ---- M3.3c + Phase 1.5-B: post-fence Phase B for escalation candidates ----
                 // Runs after the GPU fence (the existing fence covers all
                 // compute work in this command buffer, including the
                 // escalation forward dispatches recorded above). Reads
                 // escalation coefficients per-slot, encodes 14 passes,
                 // enqueues into the scheduler.
+                //
+                // Two flavors live in the same merged list (stranded first,
+                // then H264):
+                //  - Stranded (Phase 1.5-B): tiles already in Cdf53 state
+                //    whose retransmit cache drained but the client never
+                //    ACKed every pass. Re-emit ONLY the unacked passes at
+                //    the EXISTING generation (no `cancel_for_tile`, no
+                //    `bump_generation`) so the client's already-delivered
+                //    passes don't get discarded by a fresh-gen reset.
+                //  - H264 (M3.3c): tiles in H264 state being promoted to
+                //    Cdf53 for the first time on this generation.
                 let escalation_candidates =
                     std::mem::take(&mut self.cdf53_escalation_candidates_this_frame);
+                let stranded_candidates =
+                    std::mem::take(&mut self.cdf53_stranded_candidates_this_frame);
+                let stranded_count = stranded_candidates.len();
                 if !escalation_candidates.is_empty() {
                     let gpu_coeffs_ptr = {
                         let gpu = self.gpu_frame_processor.as_ref().unwrap();
@@ -3084,20 +3173,21 @@ impl IoBridge {
                     for (slot, &flat_tile_idx) in escalation_candidates.iter().enumerate() {
                         let tile_x = (flat_tile_idx % cols) as u8;
                         let tile_y = (flat_tile_idx / cols) as u8;
-                        // Skip tiles already promoted to Cdf53 by the dirty
-                        // Phase B above (same frame): the dirty path already
-                        // bumped, enqueued 14 passes, and reset
-                        // already_escalated_this_gen. Re-firing here would
-                        // bump again, supersede the just-enqueued passes,
-                        // emit 14 duplicate cdf53.emit lines, and waste a
-                        // GPU forward dispatch with the same coefficients.
-                        if matches!(
-                            self.metrics_tracker
-                                .get(tile_x as u32, tile_y as u32)
-                                .codec_state,
-                            crate::tile::CodecState::Cdf53 { .. }
-                        ) {
-                            continue;
+                        let is_stranded = slot < stranded_count;
+                        let codec_state = self
+                            .metrics_tracker
+                            .get(tile_x as u32, tile_y as u32)
+                            .codec_state;
+                        if !is_stranded {
+                            // H264-escalation slot: skip if the dirty path
+                            // already promoted this tile to Cdf53 in this
+                            // SAME frame. Re-firing would bump again,
+                            // supersede the just-enqueued passes, emit 14
+                            // duplicate cdf53.emit lines, and waste a GPU
+                            // forward dispatch with the same coefficients.
+                            if matches!(codec_state, crate::tile::CodecState::Cdf53 { .. }) {
+                                continue;
+                            }
                         }
                         let coeffs_i32 = unsafe {
                             std::slice::from_raw_parts(
@@ -3108,6 +3198,65 @@ impl IoBridge {
                         };
                         let coeffs_i16: Vec<i16> = coeffs_i32.iter().map(|&v| v as i16).collect();
                         let passes = crate::encoder::cdf53::encode_passes(&coeffs_i16);
+                        if is_stranded {
+                            // Phase 1.5-B stranded path: re-enqueue ONLY
+                            // the unacked passes at the existing
+                            // generation. The retransmit cache for this
+                            // tile is empty (detection gate), so
+                            // enqueueing creates fresh cache entries; RTO
+                            // / NACK handle subsequent losses. No
+                            // `cancel_for_tile` (no entries to cancel),
+                            // no `bump_generation` (preserves the
+                            // client's partial bitmap for already-acked
+                            // passes).
+                            let max_passes = match codec_state {
+                                crate::tile::CodecState::Cdf53 { max_passes, .. } => max_passes,
+                                _ => continue, // Should not happen — detection enforced.
+                            };
+                            let gen = self.scheduler.generation_for(tile_x, tile_y);
+                            let unacked = self.scheduler.cdf53_unacked_pass_mask(
+                                tile_x, tile_y, gen, max_passes,
+                            );
+                            if unacked == 0 {
+                                continue; // Race: client ACKed everything between detect and dispatch.
+                            }
+                            let only_unacked: Vec<Vec<u8>> = passes
+                                .into_iter()
+                                .enumerate()
+                                .filter_map(|(pass_idx, p)| {
+                                    if (unacked & (1u16 << pass_idx)) != 0 {
+                                        Some(p)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            for (slot_pass_idx, payload) in only_unacked.iter().enumerate() {
+                                // Map slot_pass_idx back to the absolute
+                                // pass_idx (the bitmap had the unacked
+                                // bits in order, so the Nth retained
+                                // pass corresponds to the Nth set bit).
+                                let _ = slot_pass_idx; // payload index, not used in log.
+                                tracing::info!(
+                                    target: "ghostframe::cdf53",
+                                    tile_x = tile_x,
+                                    tile_y = tile_y,
+                                    gen = gen,
+                                    unacked_mask = unacked,
+                                    payload_size = payload.len(),
+                                    source = "stranded",
+                                    "cdf53.emit"
+                                );
+                            }
+                            // Use the index-preserving variant so the
+                            // scheduler enqueues the correct pass_idx
+                            // for each retained payload (not 0..N).
+                            self.scheduler.enqueue_refinement_subset(
+                                tile_x, tile_y, gen, unacked, only_unacked,
+                            );
+                            continue;
+                        }
+                        // H264 escalation path (existing).
                         // Drop emitter retransmit state in lock-step (see
                         // dispatch_dirty_tiles_via_scheduler for the
                         // dangling-pointer rationale).
@@ -4025,6 +4174,7 @@ impl IoBridge {
             feedback_history: std::collections::VecDeque::with_capacity(5),
             recent_suspension_flags: [false, false],
             cdf53_escalation_candidates_this_frame: Vec::new(),
+            cdf53_stranded_candidates_this_frame: Vec::new(),
             gpu_frame_processor: None,
             full_frame_encoder: None,
             recent_frame_fragments: HashMap::new(),
@@ -4106,6 +4256,7 @@ impl IoBridge {
             feedback_history: std::collections::VecDeque::with_capacity(5),
             recent_suspension_flags: [false, false],
             cdf53_escalation_candidates_this_frame: Vec::new(),
+            cdf53_stranded_candidates_this_frame: Vec::new(),
             gpu_frame_processor: None,
             full_frame_encoder: None,
             recent_frame_fragments: HashMap::new(),
