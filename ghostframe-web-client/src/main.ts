@@ -1179,7 +1179,7 @@ async function main() {
     // Parity datagram (legacy fragment-level FEC inside a single tile assembly,
     // distinct from the 0x04 TileParityEnvelope routed via ParityDecoder above).
     if (dgramHdr.fragIdx >= dgramHdr.fragTotal) {
-      const pKey = tileKey(dgramHdr.frameSeq, tileHdr.tileX, tileHdr.tileY);
+      const pKey = tileKey(dgramHdr.frameSeq, tileHdr.tileX, tileHdr.tileY, tileHdr.pass);
       let pr = parityMap.get(pKey);
       if (!pr) {
         pr = new ParityRecovery();
@@ -1191,7 +1191,7 @@ async function main() {
       );
       pr.addParity(parityPayload);
 
-      const asmKey = tileKey(dgramHdr.frameSeq, tileHdr.tileX, tileHdr.tileY);
+      const asmKey = tileKey(dgramHdr.frameSeq, tileHdr.tileX, tileHdr.tileY, tileHdr.pass);
       const pendingAsm = assemblies.get(asmKey);
       if (pendingAsm && pendingAsm.received === dgramHdr.fragTotal - 1) {
         const missingIdx = pendingAsm.fragments.findIndex(f => f === null);
@@ -1225,7 +1225,7 @@ async function main() {
       return;
     }
 
-    const key = tileKey(dgramHdr.frameSeq, tileHdr.tileX, tileHdr.tileY);
+    const key = tileKey(dgramHdr.frameSeq, tileHdr.tileX, tileHdr.tileY, tileHdr.pass);
     const payloadOffset = DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE;
     const fragData = new Uint8Array(bytes.buffer, bytes.byteOffset + payloadOffset, bytes.byteLength - payloadOffset);
 
@@ -1255,7 +1255,7 @@ async function main() {
     }
 
     if (asm.received === dgramHdr.fragTotal - 1) {
-      const pKey = tileKey(dgramHdr.frameSeq, tileHdr.tileX, tileHdr.tileY);
+      const pKey = tileKey(dgramHdr.frameSeq, tileHdr.tileX, tileHdr.tileY, tileHdr.pass);
       const pr = parityMap.get(pKey);
       if (pr) {
         const missingIdx = asm.fragments.findIndex(f => f === null);

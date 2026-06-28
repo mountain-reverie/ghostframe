@@ -64,8 +64,21 @@ export function decodeTileHeader(view: DataView, offset: number): TileHeader {
   };
 }
 
-export function tileKey(frameSeq: number, tileX: number, tileY: number): string {
-  return `${frameSeq}:${tileX}:${tileY}`;
+/**
+ * Per-tile-pass assembly / parity-map key. Includes `passIdx` because the
+ * server emits all 14 CDF53 passes for a single dirty re-encode under
+ * the SAME wire `frame_seq` — distinguished only by the tile header's
+ * `pass` field. Keying without passIdx caused different-pass fragments
+ * to collide in the same assembly bucket: whichever frag_idx slot
+ * landed first won, and `finishAssembly` returned a Frankenstein
+ * payload mixing bytes from multiple passes. That mismatch surfaced as
+ * ERR_CDF53_TRUNCATED / ERR_CDF53_RLE_LENGTH on prevalidation.
+ *
+ * The frameSeq still comes first in the string so the stale-assembly
+ * eviction sweep (which `parseInt(k.split(':')[0], 10)`s) keeps working.
+ */
+export function tileKey(frameSeq: number, tileX: number, tileY: number, passIdx: number): string {
+  return `${frameSeq}:${tileX}:${tileY}:${passIdx}`;
 }
 
 export interface TileAssembly {
