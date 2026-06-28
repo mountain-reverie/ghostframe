@@ -1053,6 +1053,7 @@ async function main() {
         tileX: tileHdr.tileX,
         tileY: tileHdr.tileY,
         passIdx: tileHdr.pass,
+        arrivalTimeMsLo16: 0, // Phase 1 Task 4 will populate from performance.now()
       });
     }
 

@@ -2,22 +2,29 @@
 // on either ≥64 entries OR ≥5 ms since the last flush. One unreliable
 // WebTransport datagram per flush.
 //
-// Wire format mirrors transport/ack.rs (M3.3d rev2):
-//   [0]      message_type = 0x03
+// Wire format mirrors transport/ack.rs (Phase 1 Task 2 / v0x04):
+//   [0]      message_type = 0x04
 //   [1]      count: u8 (1..=64)
-//   [2..]    count × 7 bytes:
+//   [2..]    count × 9 bytes:
 //              [0..4]  frame_seq: u32 little-endian
 //              [4]     tile_x: u8
 //              [5]     tile_y: u8
 //              [6]     pass_idx: u8
+//              [7..9]  arrival_time_ms_lo16: u16 little-endian
 //
 // Key change from M3.3d initial: use (frame_seq, tile_x, tile_y, pass_idx)
 // instead of (frame_seq, frag_idx) to avoid collisions when multiple
 // single-fragment work items per frame all share frag_idx=0.
 
-export const ACK_BATCH_MSG_TYPE = 0x03;
+/**
+ * ACK envelope wire-format version. Bumped 0x03 → 0x04 in 2026-06-27 to add a
+ * 2-byte per-entry arrival-time field used by the server's bandwidth estimator.
+ * Old (0x03) and new (0x04) envelopes are not wire-compatible — server and
+ * client ship in lockstep.
+ */
+export const ACK_BATCH_MSG_TYPE = 0x04;
 export const MAX_ACK_ENTRIES = 64;
-export const ACK_ENTRY_SIZE = 7;
+export const ACK_ENTRY_SIZE = 9;
 export const FLUSH_INTERVAL_MS = 5;
 
 // How many of the most recent FRESH ACK entries to repeat as a tail on
@@ -31,6 +38,12 @@ export interface AckEntry {
   tileX: number;
   tileY: number;
   passIdx: number;
+  /**
+   * Low 16 bits of the client's wall-clock millisecond receive time for this
+   * pass. 65.5 s wrap window. The server's BWE consumer looks at *relative*
+   * arrival differences, not absolute time, so clock skew is irrelevant.
+   */
+  arrivalTimeMsLo16: number;
 }
 
 export class AckBatcher {
@@ -73,6 +86,8 @@ export class AckBatcher {
       buf[off + 4] = e.tileX & 0xFF;
       buf[off + 5] = e.tileY & 0xFF;
       buf[off + 6] = e.passIdx & 0xFF;
+      // Bytes [+7..+9]: arrivalTimeMsLo16, little-endian.
+      view.setUint16(off + 7, e.arrivalTimeMsLo16 & 0xFFFF, true);
     }
     for (let i = 0; i < overlap.length; i++) {
       const e = overlap[i];
@@ -81,6 +96,8 @@ export class AckBatcher {
       buf[off + 4] = e.tileX & 0xFF;
       buf[off + 5] = e.tileY & 0xFF;
       buf[off + 6] = e.passIdx & 0xFF;
+      // Bytes [+7..+9]: arrivalTimeMsLo16, little-endian.
+      view.setUint16(off + 7, e.arrivalTimeMsLo16 & 0xFFFF, true);
     }
     this.entries.splice(0, freshCount);
     this.send(buf);
@@ -121,6 +138,7 @@ export function parseAckEnvelopeForTest(buf: Uint8Array): AckEntry[] {
       tileX: buf[off + 4],
       tileY: buf[off + 5],
       passIdx: buf[off + 6],
+      arrivalTimeMsLo16: view.getUint16(off + 7, /* littleEndian */ true),
     });
   }
   return out;
