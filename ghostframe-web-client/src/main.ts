@@ -917,6 +917,7 @@ async function main() {
     // silent.
     const nowMs = performance.now();
     if (nowMs - __lastStatsMs > 2000) {
+      const prevStatsMs = __lastStatsMs;
       __lastStatsMs = nowMs;
       const counts = w.__tileCounts ?? { raw: 0, solid: 0, palrle: 0, cdf53: 0, h264: 0, other: 0 };
       const drained = w.__rafDrainTotals;
@@ -985,16 +986,31 @@ async function main() {
         `parity_rx=${fecParityRx} ` +
         `parity_unrecoverable=${fecParityUnrecoverable} ` +
         `nack_sent=${nackSent}`;
+      // Phase 1 Task 10: per-tier (passes 0-3 critical vs 4-13 refinement)
+      // receive rates over the last stats window, computed from the byte
+      // counters added in Task 6. The dt is the existing window duration
+      // (already captured by __lastStatsMs); fall back to 1 to avoid
+      // division by zero on the very first tick.
+      const dtMs = Math.max(1, nowMs - prevStatsMs);
+      const bpsCrit = Math.floor(((bytesRecvCritical - bytesRecvCriticalSnapshot) * 8 * 1000) / dtMs);
+      const bpsRefn = Math.floor(((bytesRecvRefinement - bytesRecvRefinementSnapshot) * 8 * 1000) / dtMs);
+      bytesRecvCriticalSnapshot = bytesRecvCritical;
+      bytesRecvRefinementSnapshot = bytesRecvRefinement;
+      const bweTierLine =
+        `bwe-tier: bps_critical=${bpsCrit} bps_refinement=${bpsRefn} ` +
+        `bytes_critical=${bytesRecvCritical} bytes_refinement=${bytesRecvRefinement}`;
       const lineKey =
         `r:${counts.raw}|s:${counts.solid}|p:${counts.palrle}|c:${counts.cdf53}|h:${counts.h264}|` +
         `seq:${w.__lastTileSeq ?? '-'}|cov:${cdf53Refined}/${cdf53Partial}/${cdf53Tiles}|hist:${histCompact}|` +
-        `fec:${fecRecovered}/${fecParityRx}/${fecParityUnrecoverable}/${nackSent}`;
+        `fec:${fecRecovered}/${fecParityRx}/${fecParityUnrecoverable}/${nackSent}|` +
+        `bwe:${bytesRecvCritical}/${bytesRecvRefinement}`;
       const statsChanged = lineKey !== __lastStatsLineKey;
       if (statsChanged) {
         __lastStatsLineKey = lineKey;
         log(statsLine);
         log(coverageLine);
         log(fecCoverageLine);
+        log(bweTierLine);
       }
 
       // Framebuffer readback: sample 4 known-position pixels and log
