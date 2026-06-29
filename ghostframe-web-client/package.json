@@ -16,7 +16,7 @@
     "@types/node": "^26.5.1",
     "@webgpu/types": "^0.1.40",
     "typescript": "^5.5",
-    "vite": "^6.0",
+    "vite": "^8.1",
     "vitest": "^2.0"
   }
 }
