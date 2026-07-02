@@ -4,10 +4,12 @@ pub mod cdf53_coverage;
 pub mod cdf53_prevalidate;
 pub mod cdf53_tile_state;
 pub mod decode_error_batcher;
+pub mod fragment_parity;
 pub mod loss_tracker;
 pub mod nack_batcher;
 pub mod pal_rle_decode;
 pub mod palette_shadow;
+pub mod parity_decoder;
 pub use cdf53_coverage::CoverageEntry;
 pub use event::{DecodeErrorCode, Event, PollOutput, TileKey};
 
