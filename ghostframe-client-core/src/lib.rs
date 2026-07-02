@@ -1,5 +1,6 @@
 mod event;
 pub mod ack_batcher;
+pub mod nack_batcher;
 pub use event::{DecodeErrorCode, Event, PollOutput, TileKey};
 
 use std::collections::VecDeque;
