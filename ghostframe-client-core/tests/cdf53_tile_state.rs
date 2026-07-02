@@ -45,6 +45,29 @@ fn fourteen_passes_reconstruct_exactly() {
 }
 
 #[test]
+fn mid_k_seven_passes_match_decode_passes_oracle() {
+    let tile = make_tile();
+    let coeffs = cdf53::forward(&tile);
+    let passes = cdf53::encode_passes(&coeffs);
+
+    // Integrate exactly K=7 passes (0..7) through Cdf53TileState.
+    let mut st = Cdf53TileState::new();
+    let mut last = Vec::new();
+    for (i, p) in passes.iter().take(7).enumerate() {
+        let pre = prevalidate_cdf53(p, 1, i as u8).unwrap();
+        last = st.integrate(0, 0, &pre);
+    }
+
+    // Payload-based oracle: decode_passes over the first 7 raw encoded
+    // passes, then inverse() + BGR->RGBA, matching integrate()'s mapping.
+    let pass_refs: Vec<&[u8]> = passes.iter().take(7).map(|p| p.as_slice()).collect();
+    let oracle_coeffs = cdf53::decode_passes(&pass_refs);
+    let oracle_bgr = cdf53::inverse(&oracle_coeffs);
+
+    assert_rgba_matches_bgr(&last, &oracle_bgr);
+}
+
+#[test]
 fn generation_bump_discards_stale_planes() {
     let tile = make_tile();
     let coeffs = cdf53::forward(&tile);
