@@ -1080,7 +1080,7 @@ mod tests {
 
     #[test]
     fn fragment_tile_with_parity_roundtrip() {
-        use crate::transport::fec;
+        use crate::fec;
 
         let payload: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
         let max_frag = 1200;
