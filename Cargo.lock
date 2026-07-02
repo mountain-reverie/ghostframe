@@ -1630,6 +1630,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ghostframe-client-core"
+version = "0.1.0"
+dependencies = [
+ "ghostframe-protocol",
+ "proptest",
+ "smallvec",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "ghostframe-e2e"
 version = "0.1.0"
 dependencies = [
