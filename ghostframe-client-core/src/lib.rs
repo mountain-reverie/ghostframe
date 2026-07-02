@@ -3,6 +3,8 @@ pub mod ack_batcher;
 pub mod decode_error_batcher;
 pub mod loss_tracker;
 pub mod nack_batcher;
+pub mod pal_rle_decode;
+pub mod palette_shadow;
 pub use event::{DecodeErrorCode, Event, PollOutput, TileKey};
 
 use std::collections::VecDeque;
