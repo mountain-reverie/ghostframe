@@ -22,7 +22,7 @@ proptest! {
         // maximum length with leading zeros.
         let max_len = sources.iter().map(|s| s.len()).max().unwrap();
         let expected_pad = max_len - sources[0].len();
-        let expected: Vec<u8> = std::iter::repeat(0).take(expected_pad).chain(sources[0].iter().copied()).collect();
+        let expected: Vec<u8> = std::iter::repeat_n(0, expected_pad).chain(sources[0].iter().copied()).collect();
         prop_assert_eq!(recovered, expected);
     }
 

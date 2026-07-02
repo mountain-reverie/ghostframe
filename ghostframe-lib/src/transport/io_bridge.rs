@@ -538,6 +538,12 @@ pub struct IoBridge {
 /// per-tier latency histograms and the str0m::bwe estimator (wired
 /// in Phase 1 Task 8). All timestamps are u16 wall-clock-ms wrapped;
 /// the consumer looks at *relative* deltas, so clock skew is fine.
+///
+/// `tier`, `owd_ms_lo16`, and `received_at` are staged for the Phase 2
+/// controller that will consume them (per-tier delay-gradient input).
+/// Kept in the struct so the layout is stable across the Phase 1 → 2
+/// handoff; suppress dead_code until then.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 struct BweSample {
     tier: PassTier,
@@ -774,8 +780,8 @@ impl IoBridge {
     /// `"1"` or `"true"`. Enables the per-cumulative-log unique-colors
     /// histogram dump. Used to verify the "is the background really
     /// > 16 colors per 32×32 tile, or are we misclassifying low-color
-    /// regions to Cdf53?" question raised in the evangeline screenshot
-    /// debug session.
+    /// > regions to Cdf53?" question raised in the evangeline screenshot
+    /// > debug session.
     fn diagnose_color_histogram_from_env() -> bool {
         matches!(
             std::env::var("GHOSTFRAME_DIAGNOSE_COLOR_HIST").as_deref(),
@@ -4146,7 +4152,7 @@ impl IoBridge {
         // doesn't pay thread-spin-up latency on the hot path (design Section 4).
         rayon::iter::IntoParallelIterator::into_par_iter(0..1u32).for_each(|_| {});
 
-        let bridge = IoBridge {
+        IoBridge {
             _handle: None,
             stream,
             server,
@@ -4213,8 +4219,7 @@ impl IoBridge {
             bytes_emitted_refinement: 0,
             bytes_emitted_snapshot: (0, 0),
             bwe_log_last_at: None,
-        };
-        bridge
+        }
     }
 
     #[cfg(test)]
@@ -4227,7 +4232,7 @@ impl IoBridge {
         // doesn't pay thread-spin-up latency on the hot path (design Section 4).
         rayon::iter::IntoParallelIterator::into_par_iter(0..1u32).for_each(|_| {});
 
-        let bridge = IoBridge {
+        IoBridge {
             _handle: None,
             stream,
             server,
@@ -4294,8 +4299,7 @@ impl IoBridge {
             bytes_emitted_refinement: 0,
             bytes_emitted_snapshot: (0, 0),
             bwe_log_last_at: None,
-        };
-        bridge
+        }
     }
 
     /// Return the capabilities most recently advertised by the client via HELLO.

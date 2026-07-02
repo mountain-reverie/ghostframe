@@ -18,12 +18,12 @@
 //! within one region:
 //!
 //!   * Left third       — every tile is a single colour (unique_colors=1)
-//!                        → classifier picks `CodecState::Solid`.
+//!     → classifier picks `CodecState::Solid`.
 //!   * Middle third     — every tile draws from a 4-colour sub-palette
-//!                        (unique_colors ∈ [2,16])
-//!                        → classifier picks `CodecState::PalRle`.
+//!     (unique_colors ∈ [2,16])
+//!     → classifier picks `CodecState::PalRle`.
 //!   * Right third      — high-entropy gradient (unique_colors > 16)
-//!                        → classifier picks `CodecState::Cdf53`.
+//!     → classifier picks `CodecState::Cdf53`.
 //!
 //! The point is *codec coverage*, not visual appeal. As long as every
 //! tile is classified into the intended codec and the bytes are

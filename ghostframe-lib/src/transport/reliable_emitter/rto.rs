@@ -29,6 +29,12 @@ pub struct RtoTimerWheel {
     heap: BinaryHeap<Reverse<RtoEntry>>,
 }
 
+impl Default for RtoTimerWheel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RtoTimerWheel {
     pub fn new() -> Self {
         Self {
@@ -44,9 +50,7 @@ impl RtoTimerWheel {
     /// is yet due. Callers re-validate the returned key against the live
     /// cache before retransmitting.
     pub fn pop_due(&mut self, now: Instant) -> Option<EmitKey> {
-        let Some(Reverse(top)) = self.heap.peek() else {
-            return None;
-        };
+        let Reverse(top) = self.heap.peek()?;
         if top.deadline > now {
             return None;
         }

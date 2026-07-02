@@ -61,11 +61,13 @@ mod tests {
     use super::*;
     #[test]
     fn knob_invariants() {
-        assert!(FEC_GROUP_SIZE_K >= 2);
-        assert!(FEC_PARITY_PER_GROUP_R >= 1);
-        assert_eq!(PARITY_INTERLEAVE_OFFSET, 20);
-        assert!(BASE_RTO_MS >= 25 && BASE_RTO_MS <= 200);
-        assert!(CACHE_CAPACITY.is_power_of_two() || CACHE_CAPACITY >= 1024);
+        const {
+            assert!(FEC_GROUP_SIZE_K >= 2);
+            assert!(FEC_PARITY_PER_GROUP_R >= 1);
+            assert!(PARITY_INTERLEAVE_OFFSET == 20);
+            assert!(BASE_RTO_MS >= 25 && BASE_RTO_MS <= 200);
+            assert!(CACHE_CAPACITY.is_power_of_two() || CACHE_CAPACITY >= 1024);
+        }
     }
 
     #[test]

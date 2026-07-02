@@ -36,6 +36,12 @@ pub struct EmitterStats {
     pub retransmit_attempts_total: u64,
 }
 
+impl Default for ReliableTileEmitter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ReliableTileEmitter {
     pub fn new() -> Self {
         Self {

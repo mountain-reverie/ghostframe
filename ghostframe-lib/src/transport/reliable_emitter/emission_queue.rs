@@ -24,6 +24,12 @@ pub struct EmissionQueue {
     end_of_stream_idle_since: Option<Instant>,
 }
 
+impl Default for EmissionQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EmissionQueue {
     pub fn new() -> Self {
         Self {

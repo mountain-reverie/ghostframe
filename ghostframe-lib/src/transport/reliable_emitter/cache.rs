@@ -31,6 +31,12 @@ pub struct CacheStats {
     pub lru_eviction: u64,
 }
 
+impl Default for RetransmitCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RetransmitCache {
     pub fn new() -> Self {
         Self {
