@@ -1635,6 +1635,8 @@ version = "0.1.0"
 dependencies = [
  "ghostframe-protocol",
  "proptest",
+ "serde",
+ "serde_json",
  "smallvec",
  "thiserror 1.0.69",
 ]
