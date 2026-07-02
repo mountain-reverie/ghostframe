@@ -40,8 +40,12 @@ impl RetransmitCache {
         }
     }
 
-    pub fn len(&self) -> usize { self.entries.len() }
-    pub fn is_empty(&self) -> bool { self.entries.is_empty() }
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 
     /// Insert a fresh entry. Cache has no upper bound — entries live
     /// until ACKed (`remove`), the tile is superseded
@@ -157,7 +161,12 @@ mod tests {
     fn has_entries_for_tile_reflects_live_entries_only() {
         let now = Instant::now();
         let mut c = RetransmitCache::new();
-        let k = EmitKey { frame_seq: 7, tile_x: 3, tile_y: 4, pass_idx: 0 };
+        let k = EmitKey {
+            frame_seq: 7,
+            tile_x: 3,
+            tile_y: 4,
+            pass_idx: 0,
+        };
         assert!(!c.has_entries_for_tile(3, 4));
         c.insert(k, mk_entry(now));
         assert!(c.has_entries_for_tile(3, 4));
@@ -173,7 +182,12 @@ mod tests {
         // Insert 2× CACHE_CAPACITY entries — none should be evicted.
         let target = CACHE_CAPACITY * 2;
         for i in 0..(target as u32) {
-            let k = EmitKey { frame_seq: i, tile_x: 0, tile_y: 0, pass_idx: 0 };
+            let k = EmitKey {
+                frame_seq: i,
+                tile_x: 0,
+                tile_y: 0,
+                pass_idx: 0,
+            };
             c.insert(k, mk_entry(now));
         }
         assert_eq!(c.len(), target);
@@ -182,7 +196,12 @@ mod tests {
             "no LRU eviction — entries stay until cancel/clear"
         );
         // The very first inserted entry must still be present.
-        let first = EmitKey { frame_seq: 0, tile_x: 0, tile_y: 0, pass_idx: 0 };
+        let first = EmitKey {
+            frame_seq: 0,
+            tile_x: 0,
+            tile_y: 0,
+            pass_idx: 0,
+        };
         assert!(c.get(&first).is_some());
     }
 
@@ -191,7 +210,12 @@ mod tests {
         let now = Instant::now();
         let mut c = RetransmitCache::new();
         for i in 0..100u32 {
-            let k = EmitKey { frame_seq: i, tile_x: 0, tile_y: 0, pass_idx: 0 };
+            let k = EmitKey {
+                frame_seq: i,
+                tile_x: 0,
+                tile_y: 0,
+                pass_idx: 0,
+            };
             c.insert(k, mk_entry(now));
         }
         assert_eq!(c.len(), 100);

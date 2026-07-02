@@ -372,10 +372,7 @@ impl Scheduler {
     /// so the caller passes the candidate set in. Return shape is the bare
     /// `(tile_x, tile_y)` pair since callers re-derive `gen` / `max_passes`
     /// from the tile's metrics row.
-    pub fn cdf53_unacked_tiles_for_gen(
-        &self,
-        candidates: &[((u8, u8), u8, u8)],
-    ) -> Vec<(u8, u8)> {
+    pub fn cdf53_unacked_tiles_for_gen(&self, candidates: &[((u8, u8), u8, u8)]) -> Vec<(u8, u8)> {
         candidates
             .iter()
             .filter_map(|&((tx, ty), gen, max_passes)| {
@@ -1334,9 +1331,13 @@ mod tests {
     fn cdf53_unacked_tiles_for_gen_lists_under_target() {
         let mut s = Scheduler::new(4, 4);
         // (0,0, gen=1): 3 of 14 acked → unacked.
-        for p in 0..3u8 { s.record_cdf53_ack(0, 0, 1, p); }
+        for p in 0..3u8 {
+            s.record_cdf53_ack(0, 0, 1, p);
+        }
         // (1,0, gen=1): all 14 acked → not in result.
-        for p in 0..14u8 { s.record_cdf53_ack(1, 0, 1, p); }
+        for p in 0..14u8 {
+            s.record_cdf53_ack(1, 0, 1, p);
+        }
         // (2,0, gen=1): no acks → unacked.
         let _ = s.cdf53_passes_acked_count(2, 0, 1);
         let mut out = s.cdf53_unacked_tiles_for_gen(&[

@@ -31,7 +31,9 @@ pub struct RtoTimerWheel {
 
 impl RtoTimerWheel {
     pub fn new() -> Self {
-        Self { heap: BinaryHeap::new() }
+        Self {
+            heap: BinaryHeap::new(),
+        }
     }
 
     pub fn schedule(&mut self, key: EmitKey, deadline: Instant) {

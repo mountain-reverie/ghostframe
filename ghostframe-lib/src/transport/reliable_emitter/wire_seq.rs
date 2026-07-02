@@ -6,8 +6,12 @@ pub struct WireSeqAllocator {
 }
 
 impl WireSeqAllocator {
-    pub fn new() -> Self { Self { next: 0 } }
-    pub fn peek(&self) -> u32 { self.next }
+    pub fn new() -> Self {
+        Self { next: 0 }
+    }
+    pub fn peek(&self) -> u32 {
+        self.next
+    }
     pub fn allocate(&mut self) -> u32 {
         let v = self.next;
         self.next = self.next.wrapping_add(1);

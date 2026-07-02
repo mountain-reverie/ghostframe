@@ -808,7 +808,9 @@ pub enum InboundKind {
 }
 
 pub fn classify_inbound(data: &[u8]) -> InboundKind {
-    let Some(&first) = data.first() else { return InboundKind::Empty };
+    let Some(&first) = data.first() else {
+        return InboundKind::Empty;
+    };
     match first {
         0x01 => InboundKind::Hello,
         0x02 => InboundKind::AckBatchV1,
@@ -1371,10 +1373,24 @@ mod tests {
     #[test]
     fn tile_nack_envelope_roundtrip() {
         let entries = vec![
-            TileNackEntry { frame_seq: 100, tile_x: 5, tile_y: 7, pass_idx: 3, frag_idx: 1 },
-            TileNackEntry { frame_seq: 100, tile_x: 5, tile_y: 7, pass_idx: 4, frag_idx: 0 },
+            TileNackEntry {
+                frame_seq: 100,
+                tile_x: 5,
+                tile_y: 7,
+                pass_idx: 3,
+                frag_idx: 1,
+            },
+            TileNackEntry {
+                frame_seq: 100,
+                tile_x: 5,
+                tile_y: 7,
+                pass_idx: 4,
+                frag_idx: 0,
+            },
         ];
-        let env = TileNackEnvelope { entries: entries.clone() };
+        let env = TileNackEnvelope {
+            entries: entries.clone(),
+        };
         let mut buf = Vec::new();
         env.encode(&mut buf);
         assert_eq!(buf[0], TILE_NACK_ENVELOPE);
@@ -1386,7 +1402,13 @@ mod tests {
     #[test]
     fn tile_nack_envelope_caps_at_64_entries() {
         let entries: Vec<_> = (0..70)
-            .map(|i| TileNackEntry { frame_seq: i, tile_x: 0, tile_y: 0, pass_idx: 0, frag_idx: 0 })
+            .map(|i| TileNackEntry {
+                frame_seq: i,
+                tile_x: 0,
+                tile_y: 0,
+                pass_idx: 0,
+                frag_idx: 0,
+            })
             .collect();
         let env = TileNackEnvelope { entries };
         let mut buf = Vec::new();
@@ -1400,7 +1422,7 @@ mod tests {
     fn classify_envelope_routes_by_first_byte() {
         // Tile fragment: bit 31 of frame_seq set
         let mut tile_dg = vec![0u8; DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE];
-        tile_dg[0] = 0x80;  // TILE_DATAGRAM_FLAG high byte
+        tile_dg[0] = 0x80; // TILE_DATAGRAM_FLAG high byte
         assert_eq!(classify_inbound(&tile_dg), InboundKind::TileFragment);
 
         // Frame fragment: bit 31 clear
@@ -1410,8 +1432,14 @@ mod tests {
 
         // Envelopes
         assert_eq!(classify_inbound(&[0x03]), InboundKind::AckBatch);
-        assert_eq!(classify_inbound(&[TILE_PARITY_ENVELOPE]), InboundKind::TileParity);
-        assert_eq!(classify_inbound(&[TILE_NACK_ENVELOPE]), InboundKind::TileNack);
+        assert_eq!(
+            classify_inbound(&[TILE_PARITY_ENVELOPE]),
+            InboundKind::TileParity
+        );
+        assert_eq!(
+            classify_inbound(&[TILE_NACK_ENVELOPE]),
+            InboundKind::TileNack
+        );
         assert_eq!(classify_inbound(&[0x09]), InboundKind::Unknown);
         assert_eq!(classify_inbound(&[]), InboundKind::Empty);
     }

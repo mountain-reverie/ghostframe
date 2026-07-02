@@ -49,7 +49,9 @@ impl ReliableTileEmitter {
         }
     }
 
-    pub fn set_smoothed_rtt(&mut self, rtt: Duration) { self.smoothed_rtt = rtt; }
+    pub fn set_smoothed_rtt(&mut self, rtt: Duration) {
+        self.smoothed_rtt = rtt;
+    }
 
     /// Submit one tile-pass with a single payload buffer. The buffer is
     /// the body of the source datagram *minus* the DatagramHeader bytes
@@ -80,7 +82,8 @@ impl ReliableTileEmitter {
             rto_deadline: now + rto_for_attempt(self.smoothed_rtt, 0),
         };
         self.cache.insert(key, entry);
-        self.rto.schedule(key, now + rto_for_attempt(self.smoothed_rtt, 0));
+        self.rto
+            .schedule(key, now + rto_for_attempt(self.smoothed_rtt, 0));
         // Feed group builder; on K-th source build & schedule parity envelope.
         if let Some(result) = self.group.add(wire_seq, &bytes) {
             let envelope = TileParityEnvelope {
@@ -92,7 +95,9 @@ impl ReliableTileEmitter {
             };
             let mut env_bytes = Vec::new();
             envelope.encode(&mut env_bytes);
-            let emit_after = result.group_first_wire_seq.wrapping_add(PARITY_INTERLEAVE_OFFSET);
+            let emit_after = result
+                .group_first_wire_seq
+                .wrapping_add(PARITY_INTERLEAVE_OFFSET);
             self.queue.schedule_parity(emit_after, env_bytes);
         }
         // Enqueue the source itself.
@@ -146,7 +151,9 @@ impl ReliableTileEmitter {
     pub fn tick(&mut self, now: Instant, max_retransmits: usize) {
         let mut count = 0;
         while count < max_retransmits {
-            let Some(key) = self.rto.pop_due(now) else { break; };
+            let Some(key) = self.rto.pop_due(now) else {
+                break;
+            };
             let Some(entry) = self.cache.get_mut(&key) else {
                 // Already ACKed or cancelled — stale heap entry; skip silently.
                 continue;
@@ -303,7 +310,9 @@ fn first_fragment_fp(frags: &[Vec<u8>]) -> (u32, u8, u8, u8) {
     // (which the io_bridge stamps lazily and we don't want to compare).
     let mut h: u32 = 0x811c_9dc5;
     for (i, &b) in f.iter().enumerate() {
-        if (12..16).contains(&i) { continue; }
+        if (12..16).contains(&i) {
+            continue;
+        }
         h ^= b as u32;
         h = h.wrapping_mul(0x0100_0193);
     }
@@ -329,8 +338,11 @@ mod tests {
         v[4..6].copy_from_slice(&frag_idx.to_be_bytes());
         v[6..8].copy_from_slice(&1u16.to_be_bytes());
         // wire_seq at 8..12 left as 0 — emitter will overwrite
-        v[12..16].copy_from_slice(&0u32.to_be_bytes());  // timestamp
-        v[16] = 0; v[17] = 0; v[18] = 0; v[19] = 0; // tile/codec/etc
+        v[12..16].copy_from_slice(&0u32.to_be_bytes()); // timestamp
+        v[16] = 0;
+        v[17] = 0;
+        v[18] = 0;
+        v[19] = 0; // tile/codec/etc
         v[20..24].copy_from_slice(&1u32.to_be_bytes()); // payload_len
         v[24] = payload;
         Bytes::from(v)
@@ -381,9 +393,15 @@ mod tests {
         e.submit_one(EmitKey::new(99, 0, 0, 0), fake_source(99, 0, 0), now);
         e.drain(&mut sender, now);
         // At least one parity datagram should have been emitted
-        assert_eq!(e.stats.parity_emitted, 1, "exactly one parity for first K sources");
+        assert_eq!(
+            e.stats.parity_emitted, 1,
+            "exactly one parity for first K sources"
+        );
         // Total emitted: 2K+1 source + 1 parity
-        assert_eq!(sender.sent.len(), (FEC_GROUP_SIZE_K as u32 * 2 + 1 + 1) as usize);
+        assert_eq!(
+            sender.sent.len(),
+            (FEC_GROUP_SIZE_K as u32 * 2 + 1 + 1) as usize
+        );
         // The parity datagram starts with TILE_PARITY_ENVELOPE (0x04)
         let parities: Vec<&Vec<u8>> = sender.sent.iter().filter(|b| b[0] == 0x04).collect();
         assert_eq!(parities.len(), 1);
@@ -504,7 +522,7 @@ mod tests {
         let t0 = Instant::now();
         let k1 = EmitKey::new(1, 5, 5, 0);
         let k2 = EmitKey::new(2, 5, 5, 1);
-        let k3 = EmitKey::new(1, 5, 6, 0);  // different tile
+        let k3 = EmitKey::new(1, 5, 6, 0); // different tile
         e.submit_one(k1, fake_source(1, 0, 0), t0);
         e.submit_one(k2, fake_source(2, 0, 0), t0);
         e.submit_one(k3, fake_source(3, 0, 0), t0);
@@ -572,7 +590,10 @@ mod tests {
         }
         e.drain(&mut Sink(&mut sink), now);
         let initial_sends = sink.len();
-        assert!(initial_sends >= 1, "initial submit produced at least one send");
+        assert!(
+            initial_sends >= 1,
+            "initial submit produced at least one send"
+        );
 
         // Advance time well past the old MAX_RETRANSMITS retirement window
         // and tick many times. Every tick should keep the entry alive (no
@@ -638,7 +659,11 @@ mod tests {
         let before = e.stats.rto_fired;
         e.tick(t1, 64);
         e.drain(&mut Sink(&mut sink), t1);
-        assert_eq!(e.stats.rto_fired - before, 64, "second tick fires another batch");
+        assert_eq!(
+            e.stats.rto_fired - before,
+            64,
+            "second tick fires another batch"
+        );
         assert_eq!(sink.len(), 64);
 
         // After many ticks at budget=64, all 1000 entries should be popped

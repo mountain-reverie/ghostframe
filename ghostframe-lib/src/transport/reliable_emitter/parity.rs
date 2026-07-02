@@ -91,8 +91,8 @@ mod tests {
 
     #[test]
     fn xor_left_pads_shorter_slices() {
-        let a = vec![0xFF];                  // length 1
-        let b = vec![0x11, 0x22, 0x33];      // length 3
+        let a = vec![0xFF]; // length 1
+        let b = vec![0x11, 0x22, 0x33]; // length 3
         let parity = xor_payloads(&[&a, &b]);
         assert_eq!(parity.len(), 3);
         // Logical bytes: [00 00 FF] XOR [11 22 33] = [11 22 CC]
@@ -128,7 +128,13 @@ mod group_tests {
             assert!(g.add(0, &[i as u8]).is_none(), "no fire before K");
         }
         let result = g.add(0, &[99]);
-        let Some(GroupResult { group_first_wire_seq, k, parity, first_len }) = result else {
+        let Some(GroupResult {
+            group_first_wire_seq,
+            k,
+            parity,
+            first_len,
+        }) = result
+        else {
             panic!("expected fire");
         };
         assert_eq!(k as usize, FEC_GROUP_SIZE_K);

@@ -89,7 +89,14 @@
  */
 #define IDLE_THRESHOLD 30
 
-#define ACK_BATCH_MSG_TYPE 3
+/**
+ * ACK envelope wire-format version. Bumped 0x03 → 0x04 in 2026-06-27
+ * to add a 2-byte per-entry receiver-arrival-time field (low 16 bits
+ * of wall-clock milliseconds) used by the server's bandwidth-estimator
+ * hook. Old (0x03) clients/servers are not wire-compatible with new —
+ * both sides ship in lockstep.
+ */
+#define ACK_BATCH_MSG_TYPE 4
 
 /**
  * Maximum number of *fresh* entries the client packs into one batch
@@ -111,7 +118,13 @@
  */
 #define MAX_ACK_ENTRIES_PER_BATCH (MAX_FRESH_ENTRIES_PER_BATCH + ACK_OVERLAP_COUNT)
 
-#define ACK_ENTRY_SIZE 7
+#define ACK_ENTRY_SIZE 9
+
+/**
+ * Initial bitrate seed. Sized for a typical broadband first-paint
+ * burst (2 Mbps); the estimator will adapt within a few hundred ms.
+ */
+#define BweWrapper_INITIAL_BPS 2000000
 
 #define HELLO_MSG_TYPE 3
 

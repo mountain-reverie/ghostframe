@@ -293,7 +293,8 @@ mod tests {
             for tx in 0..tiles_x {
                 let n = count_unique_in_tile(&f, W, tx * TILE_SIZE, ty * TILE_SIZE);
                 assert_eq!(
-                    n, 1,
+                    n,
+                    1,
                     "Solid tile ({}, {}) at px ({}, {}) has {} unique colours \
                      — classifier would NOT pick CodecState::Solid",
                     tx,

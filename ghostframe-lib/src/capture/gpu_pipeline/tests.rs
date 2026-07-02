@@ -1963,9 +1963,7 @@ fn cdf53_forward_from_pixels_matches_cpu_reference() {
     let mut processor = match GpuFrameProcessor::new(256) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!(
-                "Skipping cdf53_forward_from_pixels equivalence test (no Vulkan?): {e}"
-            );
+            eprintln!("Skipping cdf53_forward_from_pixels equivalence test (no Vulkan?): {e}");
             return;
         }
     };
@@ -2028,10 +2026,8 @@ fn cdf53_forward_from_pixels_matches_cpu_reference() {
     );
 
     let gpu_coeffs: Vec<i16> = unsafe {
-        let raw = std::slice::from_raw_parts(
-            processor.cdf53_coefficients_ptr,
-            cdf53::CDF53_TOTAL_COEFFS,
-        );
+        let raw =
+            std::slice::from_raw_parts(processor.cdf53_coefficients_ptr, cdf53::CDF53_TOTAL_COEFFS);
         raw.iter().map(|&v| v as i16).collect()
     };
 
@@ -2084,9 +2080,7 @@ fn cdf53_forward_from_pixels_live_dims_matches_cpu_reference() {
     let mut processor = match GpuFrameProcessor::new(2040) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!(
-                "Skipping cdf53_forward_from_pixels_live_dims test (no Vulkan?): {e}"
-            );
+            eprintln!("Skipping cdf53_forward_from_pixels_live_dims test (no Vulkan?): {e}");
             return;
         }
     };
@@ -2137,10 +2131,8 @@ fn cdf53_forward_from_pixels_live_dims_matches_cpu_reference() {
     );
 
     let gpu_coeffs: Vec<i16> = unsafe {
-        let raw = std::slice::from_raw_parts(
-            processor.cdf53_coefficients_ptr,
-            cdf53::CDF53_TOTAL_COEFFS,
-        );
+        let raw =
+            std::slice::from_raw_parts(processor.cdf53_coefficients_ptr, cdf53::CDF53_TOTAL_COEFFS);
         raw.iter().map(|&v| v as i16).collect()
     };
 

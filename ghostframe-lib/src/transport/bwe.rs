@@ -145,7 +145,10 @@ impl BweWrapper {
         let elapsed = now.saturating_duration_since(self.window.start);
         if elapsed >= WINDOW {
             self.flush_window(elapsed);
-            self.window = Window { start: now, count: 0 };
+            self.window = Window {
+                start: now,
+                count: 0,
+            };
         }
 
         self.snapshot()
@@ -213,8 +216,16 @@ mod tests {
     fn update_counts_records_seen() {
         let mut bwe = BweWrapper::new(BweWrapper::INITIAL_BPS);
         let records = vec![
-            AckArrival { wire_seq: 1, server_emit_ms_lo16: 100, client_arrival_ms_lo16: 110 },
-            AckArrival { wire_seq: 2, server_emit_ms_lo16: 120, client_arrival_ms_lo16: 135 },
+            AckArrival {
+                wire_seq: 1,
+                server_emit_ms_lo16: 100,
+                client_arrival_ms_lo16: 110,
+            },
+            AckArrival {
+                wire_seq: 2,
+                server_emit_ms_lo16: 120,
+                client_arrival_ms_lo16: 135,
+            },
         ];
         let snap = bwe.update(&records, Instant::now());
         assert_eq!(snap.samples_seen, 2);

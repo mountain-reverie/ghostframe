@@ -112,12 +112,7 @@ impl X11Capture {
         let height = screen.height_in_pixels;
 
         let strategy = pick_strategy(&conn, root);
-        tracing::info!(
-            width,
-            height,
-            ?strategy,
-            "X11 capture connected to display"
-        );
+        tracing::info!(width, height, ?strategy, "X11 capture connected to display");
 
         let buf_size = (width as usize) * (height as usize) * 4;
         Ok(Self {
@@ -157,10 +152,7 @@ impl X11Capture {
                     "ghostframe-bgra width={} height={} stride={}\n",
                     frame.width, frame.height, frame.stride
                 );
-                let _ = std::fs::write(
-                    format!("{path}.meta"),
-                    header.as_bytes(),
-                );
+                let _ = std::fs::write(format!("{path}.meta"), header.as_bytes());
                 let _ = std::fs::write(&path, &frame.pixels);
                 std::env::remove_var("GHOSTFRAME_DUMP_FIRST_FRAME");
                 tracing::info!(
@@ -445,9 +437,7 @@ fn pick_strategy(conn: &RustConnection, root: u32) -> Strategy {
         Err(_) => 0,
     };
     if cm_owner == 0 {
-        tracing::info!(
-            "no compositor owns _NET_WM_CM_S0; capturing root pixmap directly"
-        );
+        tracing::info!("no compositor owns _NET_WM_CM_S0; capturing root pixmap directly");
         return Strategy::RootGetImage;
     }
 
@@ -476,13 +466,7 @@ struct BlitRect {
 /// Source layout: contiguous BGRA rows, stride = `rect.src_w * 4`. Treats
 /// the window as fully opaque (no per-pixel alpha blending) — opacity
 /// support is a follow-up.
-fn blit_window(
-    target: &mut [u8],
-    target_w: i32,
-    target_h: i32,
-    src: &[u8],
-    rect: BlitRect,
-) {
+fn blit_window(target: &mut [u8], target_w: i32, target_h: i32, src: &[u8], rect: BlitRect) {
     let BlitRect {
         dst_x,
         dst_y,
@@ -694,4 +678,3 @@ mod tests {
         }
     }
 }
-

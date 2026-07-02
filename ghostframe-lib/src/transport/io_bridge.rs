@@ -76,9 +76,7 @@ struct IoBridgeSenderAdapter {
     bridge: *mut IoBridge,
 }
 
-impl crate::transport::reliable_emitter::traits::DatagramSender
-    for IoBridgeSenderAdapter
-{
+impl crate::transport::reliable_emitter::traits::DatagramSender for IoBridgeSenderAdapter {
     fn send(&mut self, dg: &[u8]) {
         // SAFETY: see struct doc — the pointer is valid for the duration
         // of the surrounding `&mut self` call on `IoBridge`.
@@ -167,7 +165,11 @@ enum PassTier {
 }
 
 fn pass_tier(pass_idx: u8) -> PassTier {
-    if pass_idx <= 3 { PassTier::Critical } else { PassTier::Refinement }
+    if pass_idx <= 3 {
+        PassTier::Critical
+    } else {
+        PassTier::Refinement
+    }
 }
 
 /// Maximum number of pending BweSample entries the per-tick drain
@@ -501,8 +503,7 @@ pub struct IoBridge {
     /// escalation Phase B). Task 28 will retire the legacy
     /// `fragment_coverage` path that currently coexists with the new
     /// emitter pipeline.
-    pub(crate) reliable_emitter:
-        crate::transport::reliable_emitter::ReliableTileEmitter,
+    pub(crate) reliable_emitter: crate::transport::reliable_emitter::ReliableTileEmitter,
     /// Rolling buffer of one-way-delay samples derived from ACK
     /// envelopes (Phase 1 Task 5). Drained periodically into the Bwe
     /// estimator (Task 8) and into per-tier latency histograms (Task
@@ -899,8 +900,7 @@ impl IoBridge {
             last_cumulative_emit_log_frame: 0,
             color_histogram_accumulator: UniqueColorHistogram::default(),
             bump_count_accumulator: BumpCountAccumulator::default(),
-            reliable_emitter:
-                crate::transport::reliable_emitter::ReliableTileEmitter::new(),
+            reliable_emitter: crate::transport::reliable_emitter::ReliableTileEmitter::new(),
             bwe_samples_buffer: Vec::with_capacity(BWE_SAMPLES_BUFFER_CAPACITY),
             bwe: crate::transport::bwe::BweWrapper::new(
                 crate::transport::bwe::BweWrapper::INITIAL_BPS,
@@ -1372,17 +1372,17 @@ impl IoBridge {
         //      tracking — it ran with unbudgeted `usize::MAX` and unit
         //      fixtures don't go through real QUIC paths anyway.
         if !matches!(policy, SchedulerEmissionPolicy::CpuRawOnly) {
-            let errs_this_dispatch =
-                self.datagram_send_errs.saturating_sub(pre_dispatch_send_errs);
+            let errs_this_dispatch = self
+                .datagram_send_errs
+                .saturating_sub(pre_dispatch_send_errs);
             let mult_before = self.tick_budget_multiplier;
             if errs_this_dispatch > 0 {
-                self.tick_budget_multiplier =
-                    (self.tick_budget_multiplier * SCHEDULER_BUDGET_BACKOFF)
-                        .max(SCHEDULER_BUDGET_MULT_MIN);
+                self.tick_budget_multiplier = (self.tick_budget_multiplier
+                    * SCHEDULER_BUDGET_BACKOFF)
+                    .max(SCHEDULER_BUDGET_MULT_MIN);
             } else {
-                self.tick_budget_multiplier =
-                    (self.tick_budget_multiplier * SCHEDULER_BUDGET_RAMP)
-                        .min(SCHEDULER_BUDGET_MULT_MAX);
+                self.tick_budget_multiplier = (self.tick_budget_multiplier * SCHEDULER_BUDGET_RAMP)
+                    .min(SCHEDULER_BUDGET_MULT_MAX);
             }
             tracing::debug!(
                 drained_count = drained_count,
@@ -1430,10 +1430,8 @@ impl IoBridge {
         // The actual wire write happens in `reliable_emitter.drain(&mut
         // adapter, now)` below.
         let frame_seq_with_flag = seq | TILE_DATAGRAM_FLAG;
-        let mut items: Vec<(
-            crate::transport::reliable_emitter::EmitKey,
-            bytes::Bytes,
-        )> = Vec::with_capacity(drained.len());
+        let mut items: Vec<(crate::transport::reliable_emitter::EmitKey, bytes::Bytes)> =
+            Vec::with_capacity(drained.len());
         for work in drained {
             let datagrams = fragment_tile(
                 &TileFragmentInputs {
@@ -1519,8 +1517,10 @@ impl IoBridge {
                         self.cumulative_datagrams_emitted.solid.saturating_add(n_dg);
                 }
                 Codec::PalRle => {
-                    self.cumulative_datagrams_emitted.palrle =
-                        self.cumulative_datagrams_emitted.palrle.saturating_add(n_dg);
+                    self.cumulative_datagrams_emitted.palrle = self
+                        .cumulative_datagrams_emitted
+                        .palrle
+                        .saturating_add(n_dg);
                 }
                 Codec::Cdf53 => {
                     self.cumulative_datagrams_emitted.cdf53 =
@@ -1538,8 +1538,9 @@ impl IoBridge {
                                 self.bytes_emitted_critical.saturating_add(bytes_this_tile);
                         }
                         PassTier::Refinement => {
-                            self.bytes_emitted_refinement =
-                                self.bytes_emitted_refinement.saturating_add(bytes_this_tile);
+                            self.bytes_emitted_refinement = self
+                                .bytes_emitted_refinement
+                                .saturating_add(bytes_this_tile);
                         }
                     }
                 }
@@ -1629,9 +1630,7 @@ impl IoBridge {
             ctx.max_frag,
             effective_budget,
         );
-        let new_remaining = ctx
-            .remaining_budget_bytes
-            .saturating_sub(drained_bytes);
+        let new_remaining = ctx.remaining_budget_bytes.saturating_sub(drained_bytes);
         tracing::debug!(
             seq = ctx.seq,
             drained_count = drained_count,
@@ -1868,7 +1867,9 @@ impl IoBridge {
             }
         }
         use crate::transport::protocol::TileNackEnvelope;
-        let Ok(env) = TileNackEnvelope::decode(data) else { return; };
+        let Ok(env) = TileNackEnvelope::decode(data) else {
+            return;
+        };
         let entries: Vec<(crate::transport::reliable_emitter::EmitKey, u8)> = env
             .entries
             .into_iter()
@@ -2400,13 +2401,16 @@ impl IoBridge {
                     // RTO still has cached entries → it's pumping
                     // retransmits, not stranded. Stranded == cache
                     // drained but client hasn't ACKed everything.
-                    if self.reliable_emitter.has_cache_entries_for_tile(tile_x, tile_y) {
+                    if self
+                        .reliable_emitter
+                        .has_cache_entries_for_tile(tile_x, tile_y)
+                    {
                         continue;
                     }
                     let gen = self.scheduler.generation_for(tile_x, tile_y);
-                    let unacked = self.scheduler.cdf53_unacked_pass_mask(
-                        tile_x, tile_y, gen, max_passes,
-                    );
+                    let unacked = self
+                        .scheduler
+                        .cdf53_unacked_pass_mask(tile_x, tile_y, gen, max_passes);
                     if unacked == 0 {
                         continue;
                     }
@@ -2418,9 +2422,8 @@ impl IoBridge {
             };
             // Merge: stranded first (more time-sensitive — client has
             // been waiting > 30 frames), then H264 escalation.
-            let mut candidates = Vec::with_capacity(
-                stranded_candidates.len() + h264_candidates.len(),
-            );
+            let mut candidates =
+                Vec::with_capacity(stranded_candidates.len() + h264_candidates.len());
             candidates.extend(&stranded_candidates);
             candidates.extend(&h264_candidates);
             candidates.truncate(crate::capture::gpu_pipeline::MAX_ESCALATION_PER_FRAME);
@@ -2551,20 +2554,28 @@ impl IoBridge {
         for &(tx, ty) in &dirty_xy {
             let uc = self.metrics_tracker.get(tx, ty).unique_colors;
             if uc == crate::tile::UNIQUE_COLORS_UNKNOWN {
-                self.color_histogram_accumulator.bucket_unknown =
-                    self.color_histogram_accumulator.bucket_unknown.saturating_add(1);
+                self.color_histogram_accumulator.bucket_unknown = self
+                    .color_histogram_accumulator
+                    .bucket_unknown
+                    .saturating_add(1);
             } else if uc == 1 {
                 self.color_histogram_accumulator.bucket_1 =
                     self.color_histogram_accumulator.bucket_1.saturating_add(1);
             } else if uc <= 4 {
-                self.color_histogram_accumulator.bucket_2_4 =
-                    self.color_histogram_accumulator.bucket_2_4.saturating_add(1);
+                self.color_histogram_accumulator.bucket_2_4 = self
+                    .color_histogram_accumulator
+                    .bucket_2_4
+                    .saturating_add(1);
             } else if uc <= 16 {
-                self.color_histogram_accumulator.bucket_5_16 =
-                    self.color_histogram_accumulator.bucket_5_16.saturating_add(1);
+                self.color_histogram_accumulator.bucket_5_16 = self
+                    .color_histogram_accumulator
+                    .bucket_5_16
+                    .saturating_add(1);
             } else {
-                self.color_histogram_accumulator.bucket_overflow =
-                    self.color_histogram_accumulator.bucket_overflow.saturating_add(1);
+                self.color_histogram_accumulator.bucket_overflow = self
+                    .color_histogram_accumulator
+                    .bucket_overflow
+                    .saturating_add(1);
             }
         }
 
@@ -2669,8 +2680,7 @@ impl IoBridge {
                 let gen = self.scheduler.generation_for(tile_x, tile_y);
                 let acked = self.scheduler.cdf53_passes_acked_count(tile_x, tile_y, gen);
                 sweep_acked_total = sweep_acked_total.saturating_add(acked as u32);
-                sweep_max_passes_total =
-                    sweep_max_passes_total.saturating_add(max_passes as u32);
+                sweep_max_passes_total = sweep_max_passes_total.saturating_add(max_passes as u32);
                 sweep_tile_count = sweep_tile_count.saturating_add(1);
                 if self
                     .scheduler
@@ -3100,8 +3110,10 @@ impl IoBridge {
                             // dangling-pointer rationale).
                             self.reliable_emitter.cancel_for_tile(tile_x, tile_y);
                             let gen = self.scheduler.bump_generation(tile_x, tile_y);
-                            self.bump_count_accumulator.cdf53_dirty_path =
-                                self.bump_count_accumulator.cdf53_dirty_path.saturating_add(1);
+                            self.bump_count_accumulator.cdf53_dirty_path = self
+                                .bump_count_accumulator
+                                .cdf53_dirty_path
+                                .saturating_add(1);
                             // (Old generation Cdf53 in-flight coverage is now
                             // dropped via the `reliable_emitter.cancel_for_tile`
                             // call above; the fragment_coverage drop here
@@ -3214,9 +3226,9 @@ impl IoBridge {
                                 _ => continue, // Should not happen — detection enforced.
                             };
                             let gen = self.scheduler.generation_for(tile_x, tile_y);
-                            let unacked = self.scheduler.cdf53_unacked_pass_mask(
-                                tile_x, tile_y, gen, max_passes,
-                            );
+                            let unacked = self
+                                .scheduler
+                                .cdf53_unacked_pass_mask(tile_x, tile_y, gen, max_passes);
                             if unacked == 0 {
                                 continue; // Race: client ACKed everything between detect and dispatch.
                             }
@@ -3252,7 +3264,11 @@ impl IoBridge {
                             // scheduler enqueues the correct pass_idx
                             // for each retained payload (not 0..N).
                             self.scheduler.enqueue_refinement_subset(
-                                tile_x, tile_y, gen, unacked, only_unacked,
+                                tile_x,
+                                tile_y,
+                                gen,
+                                unacked,
+                                only_unacked,
                             );
                             continue;
                         }
@@ -3346,10 +3362,10 @@ impl IoBridge {
                 // is due (no cache hits, no parity ready).
                 {
                     let tick_now = Instant::now();
-                    self.reliable_emitter.tick(tick_now, RTO_RETRANSMITS_PER_TICK);
+                    self.reliable_emitter
+                        .tick(tick_now, RTO_RETRANSMITS_PER_TICK);
                     let bridge_ptr: *mut IoBridge = self as *mut IoBridge;
-                    let mut adapter =
-                        IoBridgeSenderAdapter { bridge: bridge_ptr };
+                    let mut adapter = IoBridgeSenderAdapter { bridge: bridge_ptr };
                     self.reliable_emitter.drain(&mut adapter, tick_now);
                 }
 
@@ -3483,22 +3499,16 @@ impl IoBridge {
                         Some(p) => now.duration_since(p).as_millis().max(1) as u64,
                         None => 1000,
                     };
-                    let bps_crit = (self
-                        .bytes_emitted_critical
-                        .saturating_sub(prev_crit))
+                    let bps_crit = (self.bytes_emitted_critical.saturating_sub(prev_crit))
                         .saturating_mul(8)
                         .saturating_mul(1000)
                         / dt_ms;
-                    let bps_refn = (self
-                        .bytes_emitted_refinement
-                        .saturating_sub(prev_refn))
+                    let bps_refn = (self.bytes_emitted_refinement.saturating_sub(prev_refn))
                         .saturating_mul(8)
                         .saturating_mul(1000)
                         / dt_ms;
-                    self.bytes_emitted_snapshot = (
-                        self.bytes_emitted_critical,
-                        self.bytes_emitted_refinement,
-                    );
+                    self.bytes_emitted_snapshot =
+                        (self.bytes_emitted_critical, self.bytes_emitted_refinement);
                     tracing::info!(
                         target: "ghostframe::bwe",
                         bwe_estimate_bps = bwe_snap.bitrate_bps,
@@ -3935,8 +3945,7 @@ impl IoBridge {
                     self.reliable_emitter
                         .tick(tick_now, RTO_RETRANSMITS_PER_TICK);
                     let bridge_ptr: *mut IoBridge = self as *mut IoBridge;
-                    let mut adapter =
-                        IoBridgeSenderAdapter { bridge: bridge_ptr };
+                    let mut adapter = IoBridgeSenderAdapter { bridge: bridge_ptr };
                     self.reliable_emitter.drain(&mut adapter, tick_now);
                 }
 
@@ -4195,8 +4204,7 @@ impl IoBridge {
             last_cumulative_emit_log_frame: 0,
             color_histogram_accumulator: UniqueColorHistogram::default(),
             bump_count_accumulator: BumpCountAccumulator::default(),
-            reliable_emitter:
-                crate::transport::reliable_emitter::ReliableTileEmitter::new(),
+            reliable_emitter: crate::transport::reliable_emitter::ReliableTileEmitter::new(),
             bwe_samples_buffer: Vec::with_capacity(BWE_SAMPLES_BUFFER_CAPACITY),
             bwe: crate::transport::bwe::BweWrapper::new(
                 crate::transport::bwe::BweWrapper::INITIAL_BPS,
@@ -4277,8 +4285,7 @@ impl IoBridge {
             last_cumulative_emit_log_frame: 0,
             color_histogram_accumulator: UniqueColorHistogram::default(),
             bump_count_accumulator: BumpCountAccumulator::default(),
-            reliable_emitter:
-                crate::transport::reliable_emitter::ReliableTileEmitter::new(),
+            reliable_emitter: crate::transport::reliable_emitter::ReliableTileEmitter::new(),
             bwe_samples_buffer: Vec::with_capacity(BWE_SAMPLES_BUFFER_CAPACITY),
             bwe: crate::transport::bwe::BweWrapper::new(
                 crate::transport::bwe::BweWrapper::INITIAL_BPS,

@@ -21,7 +21,9 @@ pub trait Clock {
 pub struct SystemClock;
 
 impl Clock for SystemClock {
-    fn now(&self) -> Instant { Instant::now() }
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
 }
 
 #[cfg(test)]
@@ -35,7 +37,9 @@ pub mod testing {
         pub sent: Vec<Vec<u8>>,
     }
     impl DatagramSender for CollectSender {
-        fn send(&mut self, dg: &[u8]) { self.sent.push(dg.to_vec()); }
+        fn send(&mut self, dg: &[u8]) {
+            self.sent.push(dg.to_vec());
+        }
     }
 
     #[derive(Clone)]
@@ -43,10 +47,18 @@ pub mod testing {
         now: Rc<RefCell<Instant>>,
     }
     impl MockClock {
-        pub fn new(start: Instant) -> Self { Self { now: Rc::new(RefCell::new(start)) } }
-        pub fn advance(&self, dt: std::time::Duration) { *self.now.borrow_mut() += dt; }
+        pub fn new(start: Instant) -> Self {
+            Self {
+                now: Rc::new(RefCell::new(start)),
+            }
+        }
+        pub fn advance(&self, dt: std::time::Duration) {
+            *self.now.borrow_mut() += dt;
+        }
     }
     impl Clock for MockClock {
-        fn now(&self) -> Instant { *self.now.borrow() }
+        fn now(&self) -> Instant {
+            *self.now.borrow()
+        }
     }
 }

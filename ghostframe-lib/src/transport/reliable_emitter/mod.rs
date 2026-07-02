@@ -28,7 +28,12 @@ pub struct EmitKey {
 
 impl EmitKey {
     pub fn new(frame_seq: u32, tile_x: u8, tile_y: u8, pass_idx: u8) -> Self {
-        Self { frame_seq, tile_x, tile_y, pass_idx }
+        Self {
+            frame_seq,
+            tile_x,
+            tile_y,
+            pass_idx,
+        }
     }
 }
 
@@ -67,9 +72,24 @@ mod tests {
     fn emit_key_hashable_and_ordered() {
         use std::collections::HashMap;
         let mut m = HashMap::new();
-        let k1 = EmitKey { frame_seq: 1, tile_x: 2, tile_y: 3, pass_idx: 4 };
-        let k2 = EmitKey { frame_seq: 1, tile_x: 2, tile_y: 3, pass_idx: 4 };
-        let k3 = EmitKey { frame_seq: 1, tile_x: 2, tile_y: 3, pass_idx: 5 };
+        let k1 = EmitKey {
+            frame_seq: 1,
+            tile_x: 2,
+            tile_y: 3,
+            pass_idx: 4,
+        };
+        let k2 = EmitKey {
+            frame_seq: 1,
+            tile_x: 2,
+            tile_y: 3,
+            pass_idx: 4,
+        };
+        let k3 = EmitKey {
+            frame_seq: 1,
+            tile_x: 2,
+            tile_y: 3,
+            pass_idx: 5,
+        };
         m.insert(k1, "a");
         assert_eq!(m.get(&k2), Some(&"a"));
         assert!(!m.contains_key(&k3));

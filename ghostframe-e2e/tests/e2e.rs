@@ -1764,7 +1764,10 @@ async fn e2e_palette_eviction_body<B: helpers::BrowserSession>(browser: &mut B) 
                 .unwrap_or_default()
                 .as_millis() as u64;
             let parsed: serde_json::Value = serde_json::from_str(&dump).unwrap_or_default();
-            let td = parsed.get("tileDatagrams").and_then(|v| v.as_u64()).unwrap_or(0);
+            let td = parsed
+                .get("tileDatagrams")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
             stats_series.push((now_ms, td));
             if i < 5 {
                 tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1823,7 +1826,11 @@ async fn e2e_palette_eviction_body<B: helpers::BrowserSession>(browser: &mut B) 
         let _ = std::fs::create_dir_all("/tmp/host-captures");
         let _ = std::fs::remove_dir_all("/tmp/host-captures/captures");
         let cp = std::process::Command::new("docker")
-            .args(["cp", "ghostframe-server:/tmp/captures", "/tmp/host-captures"])
+            .args([
+                "cp",
+                "ghostframe-server:/tmp/captures",
+                "/tmp/host-captures",
+            ])
             .output();
         match cp {
             Ok(o) if o.status.success() => {
@@ -4452,9 +4459,7 @@ async fn e2e_lossless_golden_png() -> Result<()> {
     // marks the canvas top.
     let screenshot_params = || {
         chromiumoxide::page::ScreenshotParams::builder()
-            .format(
-                chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat::Png,
-            )
+            .format(chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat::Png)
             .clip(
                 chromiumoxide::cdp::browser_protocol::page::Viewport::builder()
                     .x(0)
@@ -4554,9 +4559,7 @@ async fn e2e_lossless_golden_png() -> Result<()> {
             // Always preserve the converged screenshot for later
             // inspection so a maintainer can eyeball the success state.
             let _ = img.save(&got_path);
-            eprintln!(
-                "e2e_lossless_golden_png: converged after {iters} polls",
-            );
+            eprintln!("e2e_lossless_golden_png: converged after {iters} polls",);
             return Ok(());
         }
 
@@ -4648,9 +4651,7 @@ fn e2e_cdf53_real_capture_roundtrip_exact() {
                         if first_failures.len() < 10 {
                             first_failures.push(format!(
                                 "tile ({},{}) px ({},{}): src BGR ({},{},{}) → got ({},{},{})",
-                                tile_x, tile_y, px, py,
-                                src_b, src_g, src_r,
-                                got_b, got_g, got_r
+                                tile_x, tile_y, px, py, src_b, src_g, src_r, got_b, got_g, got_r
                             ));
                         }
                     }

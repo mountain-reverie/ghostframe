@@ -357,7 +357,9 @@ fn palette_fingerprint(p: &PaletteEntry) -> u32 {
     let count = p.count as usize;
     for i in 0..count {
         for b in 0..4 {
-            acc = acc.wrapping_mul(0x01000193).wrapping_add(p.colors[i][b] as u32);
+            acc = acc
+                .wrapping_mul(0x01000193)
+                .wrapping_add(p.colors[i][b] as u32);
         }
     }
     acc

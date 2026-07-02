@@ -460,7 +460,14 @@ fn dump_frame_as_png(
     // Allocate tightly-packed RGBA8 (image crate accepts no stride param).
     let row_bytes = (w as usize).saturating_mul(4);
     if stride == 0 || bgra.len() < (h as usize).saturating_mul(stride.max(row_bytes)) {
-        tracing::warn!(?path, w, h, stride, len = bgra.len(), "pixel buffer too small for frame dims; skipping PNG dump");
+        tracing::warn!(
+            ?path,
+            w,
+            h,
+            stride,
+            len = bgra.len(),
+            "pixel buffer too small for frame dims; skipping PNG dump"
+        );
         return;
     }
     let mut rgba = vec![0u8; (h as usize).saturating_mul(row_bytes)];
@@ -480,7 +487,9 @@ fn dump_frame_as_png(
         }
     }
     match image::save_buffer(&path, &rgba, w, h, image::ColorType::Rgba8) {
-        Ok(()) => tracing::debug!(target: "ghostframe::xdaemon::capture", ?path, count, "[CAP-PNG] wrote frame"),
+        Ok(()) => {
+            tracing::debug!(target: "ghostframe::xdaemon::capture", ?path, count, "[CAP-PNG] wrote frame")
+        }
         Err(e) => tracing::warn!(?path, error = %e, "failed to write capture PNG"),
     }
 }

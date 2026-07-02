@@ -51,8 +51,7 @@ pub const MAX_FRESH_ENTRIES_PER_BATCH: usize = 64;
 /// any entry.
 pub const ACK_OVERLAP_COUNT: usize = 8;
 /// Wire-acceptance cap for one ACK batch: fresh + overlap.
-pub const MAX_ACK_ENTRIES_PER_BATCH: usize =
-    MAX_FRESH_ENTRIES_PER_BATCH + ACK_OVERLAP_COUNT;
+pub const MAX_ACK_ENTRIES_PER_BATCH: usize = MAX_FRESH_ENTRIES_PER_BATCH + ACK_OVERLAP_COUNT;
 pub const ACK_ENTRY_SIZE: usize = 9;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -124,8 +123,7 @@ impl AckBatch {
             let tile_x = data[off + 4];
             let tile_y = data[off + 5];
             let pass_idx = data[off + 6];
-            let arrival_time_ms_lo16 =
-                (data[off + 7] as u16) | ((data[off + 8] as u16) << 8);
+            let arrival_time_ms_lo16 = (data[off + 7] as u16) | ((data[off + 8] as u16) << 8);
             entries.push(AckEntry {
                 frame_seq,
                 tile_x,
@@ -229,7 +227,9 @@ mod tests {
                 arrival_time_ms_lo16: 0x0010,
             },
         ];
-        let batch = AckBatch { entries: entries.clone() };
+        let batch = AckBatch {
+            entries: entries.clone(),
+        };
         let bytes = batch.encode();
         // 2 header bytes + 2 entries × 9 bytes = 20 bytes
         assert_eq!(bytes.len(), 20);
