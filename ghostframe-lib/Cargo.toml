@@ -61,5 +61,5 @@ anyhow = "1"
 futures = "0.3"
 url = "2"
 proptest = "1"
-lz4_flex = "0.11"
+lz4_flex = "0.13"
 ghostframe-test-pattern = { path = "../ghostframe-test-pattern" }
