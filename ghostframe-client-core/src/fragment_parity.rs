@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 
 use crate::event::TileKey;
+use crate::ordered_map::OrderedMap;
 
 pub const PARITY_HEADER_SIZE: usize = 3;
 
@@ -54,8 +55,12 @@ pub fn recover_fragment(received_payloads: &[Vec<u8>], xor_data: &[u8]) -> Vec<u
 
 #[derive(Default)]
 pub struct FragmentParity {
-    /// Parity info keyed by (tile key, group_start).
-    parities: HashMap<TileKey, HashMap<u16, ParityInfo>>,
+    /// Parity info keyed by (tile key, group_start). The inner map is
+    /// insertion-ordered (not `HashMap`) to match the TS reference's
+    /// `Map<number, ParityInfo>` in `ParityRecovery`: `try_recover` below
+    /// iterates groups in insertion order and returns the first one that
+    /// is recoverable, so the order must be deterministic.
+    parities: HashMap<TileKey, OrderedMap<u16, ParityInfo>>,
 }
 
 impl FragmentParity {
@@ -67,10 +72,12 @@ impl FragmentParity {
 
     pub fn store(&mut self, key: TileKey, parity_payload: &[u8]) {
         if let Some(info) = decode_parity_payload(parity_payload) {
+            // Matches JS `Map.set` on an existing key: updates the value in
+            // place, keeping its original insertion position.
             self.parities
                 .entry(key)
                 .or_default()
-                .insert(info.group_start, info);
+                .set(info.group_start, info);
         }
     }
 
@@ -82,9 +89,10 @@ impl FragmentParity {
         fragments: &[Option<Vec<u8>>],
     ) -> Option<(usize, Vec<u8>)> {
         let group_map = self.parities.get(&key)?;
-        // Try every group that has stored parity info; find one with
-        // exactly one missing fragment among `fragments`.
-        for (&group_start_u16, parity) in group_map.iter() {
+        // Try every group that has stored parity info, in insertion order;
+        // return the FIRST one with exactly one missing fragment among
+        // `fragments` (matches TS `Map` iteration order).
+        for &(group_start_u16, ref parity) in group_map.iter() {
             let group_start = group_start_u16 as usize;
             let group_end = std::cmp::min(group_start + parity.group_len as usize, fragments.len());
             let mut received: Vec<Vec<u8>> = Vec::new();
@@ -115,6 +123,12 @@ impl FragmentParity {
 
     /// Try to recover a specific fragment index using its k=4 group,
     /// mirroring `ParityRecovery.tryRecover(missingIdx, fragments, k)`.
+    ///
+    /// Unlike [`try_recover`](Self::try_recover) this looks up the exact
+    /// group for `missing_idx` (keyed lookup, no ambiguity from iteration
+    /// order). Not yet called from production code — currently unused
+    /// until `ClientCore` wires up index-targeted recovery.
+    #[allow(dead_code)]
     pub fn try_recover_idx(
         &self,
         key: TileKey,
