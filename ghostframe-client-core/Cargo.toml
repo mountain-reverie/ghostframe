@@ -1,0 +1,12 @@
+[package]
+name = "ghostframe-client-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ghostframe-protocol = { path = "../ghostframe-protocol" }
+thiserror = "1"
+smallvec = "1"
+
+[dev-dependencies]
+proptest = "1"

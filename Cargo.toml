@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "ghostframe-protocol",
+    "ghostframe-client-core",
     "ghostframe-lib",
     "ghostframe-xdaemon",
     "ghostframe-test-pattern",
