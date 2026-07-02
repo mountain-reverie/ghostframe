@@ -585,7 +585,7 @@ fn rle_encode(data: &[u8]) -> Vec<u8> {
     out
 }
 
-fn rle_decode(rle: &[u8]) -> Vec<u8> {
+pub fn rle_decode(rle: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < rle.len() {
@@ -723,6 +723,13 @@ mod tests {
             assert_eq!(orig_px[1], rec_px[1], "G channel mismatch");
             assert_eq!(orig_px[2], rec_px[2], "R channel mismatch");
         }
+    }
+
+    #[test]
+    fn rle_decode_is_public_and_decodes_zero_run() {
+        // 0x80|127 = 0xFF → 128 zeros (matches web-client prevalidate_cdf53 contract)
+        let out = rle_decode(&[0xFFu8]);
+        assert_eq!(out, vec![0u8; 128]);
     }
 }
 

@@ -22,7 +22,7 @@ test-loss-injection = []
 # the CPU `forward_level1_only` / `forward_level2_only` reference helpers.
 # Off by default — production builds never pay the runtime env-var checks
 # or extra CPU forward overhead. Test-server Dockerfile flips this on.
-cdf53-diag = []
+cdf53-diag = ["ghostframe-protocol/cdf53-diag"]
 
 [dependencies]
 ghostframe-protocol = { path = "../ghostframe-protocol" }

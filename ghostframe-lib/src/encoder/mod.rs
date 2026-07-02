@@ -1,12 +1,13 @@
 //! Tile encoding: converts raw BGRA tile data into compressed payloads.
 
-pub mod cdf53;
 pub mod h264_vaapi;
-pub mod pal_rle;
-pub mod solid;
 
 mod nal_parser;
 mod vaapi_device;
+
+pub use ghostframe_protocol::codec::cdf53;
+pub use ghostframe_protocol::codec::pal_rle;
+pub use ghostframe_protocol::codec::solid;
 
 use crate::transport::protocol::Codec;
 

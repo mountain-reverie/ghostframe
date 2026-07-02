@@ -1705,8 +1705,10 @@ name = "ghostframe-protocol"
 version = "0.1.0"
 dependencies = [
  "lz4_flex",
+ "proptest",
  "smallvec",
  "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]
