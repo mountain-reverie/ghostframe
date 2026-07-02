@@ -38,7 +38,7 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 # Versions copied verbatim from ghostframe-lib/Cargo.toml.
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 iai-callgrind = "0.14"
 dssim-core = "3"
 rgb = "0.8"
