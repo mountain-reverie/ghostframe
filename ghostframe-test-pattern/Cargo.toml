@@ -14,7 +14,7 @@ path = "src/main.rs"
 [dependencies]
 x11rb = "0.13"
 clap = { version = "4", features = ["derive"] }
-drm = "0.14"
+drm = "0.15"
 drm-ffi = "0.9"
 libc = "0.2"
 ghostframe-bench = { path = "../ghostframe-bench" }
