@@ -20,7 +20,6 @@ use ghostframe_protocol::ack::AckEntry;
 use crate::cdf53_coverage::apply_cdf53_arrival;
 use crate::cdf53_prevalidate::prevalidate_cdf53;
 use crate::event::{Event, PollOutput, TileKey};
-use crate::nack_batcher::NackEntry;
 use crate::pal_rle_decode::decode_pal_rle_tile;
 use crate::{Assembly, ClientCore};
 
@@ -57,8 +56,9 @@ impl ClientCore {
             return events;
         }
 
-        // 3. Not a tile datagram -> frame path (Task 12, out of scope).
+        // 3. Not a tile datagram -> H.264 full-frame reassembly path.
         if !is_tile_datagram(bytes) {
+            self.handle_frame_datagram(bytes, now_us, &mut events);
             return events;
         }
 
@@ -184,7 +184,7 @@ impl ClientCore {
         let asm = self
             .assemblies
             .entry(key)
-            .or_insert_with(|| Assembly::new(&th, frame_seq, dh.frag_total));
+            .or_insert_with(|| Assembly::new(&th, frame_seq, dh.frag_total, now_us));
         let fi = dh.frag_idx as usize;
         if fi < asm.fragments.len() && asm.fragments[fi].is_none() {
             asm.fragments[fi] = Some(payload.to_vec());
@@ -324,18 +324,14 @@ impl ClientCore {
                     apply_cdf53_arrival(prev, asm.generation, asm.pass, frame_seq, now_us, ok);
                 self.cdf53_coverage.insert((tx, ty), outcome.entry);
                 for p in outcome.nack_passes {
-                    // Coverage NACKs carry frag_idx = 0 (main.ts:830-838,
-                    // `nackBatcher.add(entry, 0)`).
-                    let entry = NackEntry {
-                        frame_seq: frame_seq | TILE_DATAGRAM_FLAG,
-                        tile_x: tx,
-                        tile_y: ty,
-                        pass_idx: p,
-                        frag_idx: 0,
-                    };
-                    if let Some(dg) = self.nack_batcher.add(entry, now_us) {
-                        self.outbox.push_back(PollOutput::Datagram(dg));
-                    }
+                    // Coverage NACKs are routed through the debounced
+                    // pending-NACK queue (main.ts `queuePassNack`,
+                    // ~618-629), not straight to the NACK batcher: the
+                    // debounce flush re-checks live coverage right before
+                    // sending, in case the pass arrived validly in the
+                    // meantime. Dispatch itself carries frag_idx = 0
+                    // (main.ts:830-838).
+                    self.queue_pass_nack(frame_seq, tx, ty, p, now_us);
                 }
 
                 match result {
