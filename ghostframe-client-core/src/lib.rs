@@ -1,5 +1,7 @@
 mod event;
 pub mod ack_batcher;
+pub mod decode_error_batcher;
+pub mod loss_tracker;
 pub mod nack_batcher;
 pub use event::{DecodeErrorCode, Event, PollOutput, TileKey};
 
