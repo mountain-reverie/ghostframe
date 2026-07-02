@@ -35,3 +35,28 @@ fn clear_removes_everything() {
     assert!(!s.has(7));
     assert!(!s.has(13));
 }
+
+#[test]
+fn ignores_out_of_range_count_zero() {
+    let mut s = PaletteShadow::new();
+    s.put(5, 0);
+    assert!(!s.has(5));
+}
+
+#[test]
+fn ignores_out_of_range_count_too_large() {
+    let mut s = PaletteShadow::new();
+    s.put(5, 17);
+    assert!(!s.has(5));
+}
+
+#[test]
+fn preserves_existing_value_when_ignoring_invalid_count() {
+    let mut s = PaletteShadow::new();
+    s.put(5, 8);
+    assert_eq!(s.count(5), 8);
+    s.put(5, 0);
+    assert_eq!(s.count(5), 8);
+    s.put(5, 17);
+    assert_eq!(s.count(5), 8);
+}
