@@ -1,6 +1,6 @@
 # Stage 1: Build ghostframe binaries inside the container so shared libraries
 # match the runtime environment exactly.
-FROM ubuntu:24.04 AS builder
+FROM ubuntu:26.04 AS builder
 
 RUN apt-get update -o Acquire::AllowInsecureRepositories=true && apt-get install -y --allow-unauthenticated --no-install-recommends \
     build-essential \
@@ -78,7 +78,7 @@ RUN cargo build --release -p ghostframe-xdaemon -p ghostframe-test-pattern \
     --features ghostframe-lib/test-loss-injection,ghostframe-lib/cdf53-diag
 
 # Stage 2: Runtime image
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 
 RUN apt-get update -o Acquire::AllowInsecureRepositories=true && apt-get install -y --allow-unauthenticated --no-install-recommends \
     ca-certificates \
