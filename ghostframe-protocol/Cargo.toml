@@ -3,9 +3,14 @@ name = "ghostframe-protocol"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+cdf53-diag = []
+
 [dependencies]
 thiserror = "1"
 smallvec = "1"
+tracing = { workspace = true }
 
 [dev-dependencies]
 lz4_flex = "0.11"
+proptest = "1"
