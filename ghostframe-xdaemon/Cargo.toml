@@ -9,7 +9,7 @@ ghostframe-lib = { path = "../ghostframe-lib" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-drm = "0.14"
+drm = "0.15"
 libc = { workspace = true }
 x11rb = { version = "0.13", features = ["damage", "xtest", "composite", "dri3", "xfixes"] }
 # Optional capture-dump diagnostic: write each captured frame to a PNG on
