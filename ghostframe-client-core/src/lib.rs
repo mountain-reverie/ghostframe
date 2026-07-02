@@ -1,4 +1,5 @@
 mod event;
+mod ordered_map;
 pub mod ack_batcher;
 pub mod cdf53_coverage;
 pub mod cdf53_prevalidate;

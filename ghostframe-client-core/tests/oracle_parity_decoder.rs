@@ -146,6 +146,43 @@ fn replays_buffered_parity_when_missing_source_finally_arrives() {
     assert_eq!(recovered, Some(sources[(FEC_K - 1) as usize].clone()));
 }
 
+#[test]
+fn recovers_first_inserted_pending_parity_when_multiple_become_recoverable() {
+    // Pins order-dependence: `pending_parities` must be insertion-ordered
+    // (matching the TS `Map`), and `record_source` must probe it in
+    // insertion order, returning the FIRST recoverable entry — even when a
+    // later-inserted entry is also recoverable.
+    let mut decoder = ParityDecoder::new(64);
+
+    // Group A (inserted FIRST): k=2, covers wire_seq {100, 101}. Neither is
+    // present yet, so this is buffered (missing_count == 2).
+    let group_a = TileParityEnvelope {
+        group_first_wire_seq: 100,
+        k: 2,
+        parity_idx: 0,
+        group_first_payload_len: 2,
+        parity_payload: vec![0xAA, 0xAA],
+    };
+    assert_eq!(decoder.receive_parity(&group_a), None);
+
+    // Group B (inserted SECOND): k=2, covers wire_seq {99, 100}. Neither is
+    // present yet either, so this is also buffered.
+    let group_b = TileParityEnvelope {
+        group_first_wire_seq: 99,
+        k: 2,
+        parity_idx: 0,
+        group_first_payload_len: 2,
+        parity_payload: vec![0x00, 0x00],
+    };
+    assert_eq!(decoder.receive_parity(&group_b), None);
+
+    // Recording wire_seq 100 leaves group A missing only 101 (count=1) and
+    // group B missing only 99 (count=1) — BOTH become recoverable.
+    // Insertion order (group A first) must win.
+    let recovered = decoder.record_source(100, &[0x00, 0x00]);
+    assert_eq!(recovered, Some(vec![0xAA, 0xAA]));
+}
+
 // ---------------------------------------------------------------------------
 // Legacy fragment FEC (fec.ts) — no dedicated vitest file exists upstream,
 // so these tests are derived directly from the fec.ts contract:
@@ -246,4 +283,50 @@ fn fragment_parity_remove_clears_stored_groups() {
     let fragments: Vec<Option<Vec<u8>>> =
         vec![Some(vec![1]), None, Some(vec![3]), Some(vec![4])];
     assert!(fp.try_recover(key(), &fragments).is_none());
+}
+
+#[test]
+fn fragment_parity_recovers_first_inserted_group_when_multiple_ambiguous() {
+    // Pins order-dependence: the per-tile group map must be
+    // insertion-ordered (matching the TS `Map<number, ParityInfo>` in
+    // `ParityRecovery`), and `try_recover` must scan groups in insertion
+    // order, returning the FIRST group with exactly one missing fragment —
+    // even when a later-inserted group is *also* recoverable.
+    let frags: Vec<Vec<u8>> = vec![vec![1], vec![2], vec![3], vec![4], vec![5], vec![6], vec![7], vec![8]];
+
+    // Group at group_start=0 (inserted FIRST), missing index 1. The parity
+    // xor_data covers ALL fragments in the group (it is generated before
+    // any loss, from the sender's full fragment set).
+    let mut xor0 = vec![0u8];
+    for f in &frags[0..4] {
+        xor0[0] ^= f[0];
+    }
+
+    // Group at group_start=4 (inserted SECOND), missing index 5 — also
+    // recoverable given the fragments below.
+    let mut xor4 = vec![0u8];
+    for f in &frags[4..8] {
+        xor4[0] ^= f[0];
+    }
+
+    let mut fp = FragmentParity::new();
+    fp.store(key(), &parity_payload(0, 4, &xor0));
+    fp.store(key(), &parity_payload(4, 4, &xor4));
+
+    let fragments: Vec<Option<Vec<u8>>> = vec![
+        Some(frags[0].clone()),
+        None, // missing index 1 (group 0)
+        Some(frags[2].clone()),
+        Some(frags[3].clone()),
+        Some(frags[4].clone()),
+        None, // missing index 5 (group 4) — also recoverable
+        Some(frags[6].clone()),
+        Some(frags[7].clone()),
+    ];
+
+    // Both group 0 and group 4 are independently recoverable; the
+    // first-inserted group (group_start=0, missing idx=1) must win.
+    let (idx, recovered) = fp.try_recover(key(), &fragments).expect("should recover");
+    assert_eq!(idx, 1);
+    assert_eq!(recovered, frags[1]);
 }

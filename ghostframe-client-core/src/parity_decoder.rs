@@ -7,9 +7,11 @@
 //! later source arrives it may unlock a buffered parity, recovering the
 //! still-missing source datagram.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use ghostframe_protocol::protocol::TileParityEnvelope;
+
+use crate::ordered_map::OrderedMap;
 
 /// XOR `src` into `out`, right-aligned (i.e. matching trailing bytes).
 ///
@@ -25,8 +27,12 @@ fn xor_into(out: &mut [u8], src: &[u8]) {
 
 pub struct ParityDecoder {
     window: HashMap<u32, Vec<u8>>,
-    order: Vec<u32>,
-    pending_parities: HashMap<u32, TileParityEnvelope>,
+    order: VecDeque<u32>,
+    // Insertion-ordered (not `HashMap`) to match the TS reference's
+    // `Map<number, ParityHeader>`: recovery probing below iterates in
+    // insertion order and returns the *first* recoverable entry, so the
+    // iteration order must be deterministic and match the TS `Map`.
+    pending_parities: OrderedMap<u32, TileParityEnvelope>,
     window_capacity: usize,
 }
 
@@ -34,8 +40,8 @@ impl ParityDecoder {
     pub fn new(window_capacity: usize) -> Self {
         ParityDecoder {
             window: HashMap::new(),
-            order: Vec::new(),
-            pending_parities: HashMap::new(),
+            order: VecDeque::new(),
+            pending_parities: OrderedMap::new(),
             window_capacity,
         }
     }
@@ -50,19 +56,22 @@ impl ParityDecoder {
     pub fn record_source(&mut self, wire_seq: u32, bytes: &[u8]) -> Option<Vec<u8>> {
         if !self.window.contains_key(&wire_seq) {
             self.window.insert(wire_seq, bytes.to_vec());
-            self.order.push(wire_seq);
+            self.order.push_back(wire_seq);
             while self.window.len() > self.window_capacity {
-                if self.order.is_empty() {
-                    break;
+                match self.order.pop_front() {
+                    Some(oldest) => {
+                        self.window.remove(&oldest);
+                    }
+                    None => break,
                 }
-                let oldest = self.order.remove(0);
-                self.window.remove(&oldest);
             }
         }
 
         // Probe pending parities that *might* now be recoverable, in
-        // insertion order (matches JS Map iteration order).
-        let keys: Vec<u32> = self.pending_parities.keys().copied().collect();
+        // insertion order (matches JS Map iteration order). Returns the
+        // FIRST recoverable entry, so order matters when multiple entries
+        // are recoverable.
+        let keys: Vec<u32> = self.pending_parities.iter().map(|(k, _)| *k).collect();
         for gfws in keys {
             if let Some(parity) = self.pending_parities.get(&gfws).cloned() {
                 if let Some(result) = self.try_recover(&parity) {
@@ -77,8 +86,10 @@ impl ParityDecoder {
     pub fn receive_parity(&mut self, env: &TileParityEnvelope) -> Option<Vec<u8>> {
         let result = self.try_recover(env);
         if result.is_none() {
+            // Matches JS `Map.set` on an existing key: updates the value in
+            // place, keeping its original insertion position.
             self.pending_parities
-                .insert(env.group_first_wire_seq, env.clone());
+                .set(env.group_first_wire_seq, env.clone());
         }
         result
     }
