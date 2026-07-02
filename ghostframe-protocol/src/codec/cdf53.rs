@@ -627,31 +627,70 @@ pub fn rle_decode(rle: &[u8]) -> Vec<u8> {
 /// evidence they're non-zero yet.
 pub fn decode_passes(passes: &[&[u8]]) -> Vec<i16> {
     assert!(passes.len() <= CDF53_PASS_COUNT);
+    let zeroed = || vec![0i16; CDF53_TOTAL_COEFFS];
+
+    // Parse each per-pass payload (3 channels of RLE-encoded bit-planes) into
+    // a decoded, contiguous 384-byte bit-plane (128 bytes/channel × 3
+    // channels), bailing out (returning zeroed coefficients, matching the
+    // legacy behavior) on malformed input.
+    let mut decoded_planes: Vec<Vec<u8>> = Vec::with_capacity(passes.len());
+    for payload in passes {
+        let mut plane = vec![0u8; CDF53_CHANNELS * (CDF53_COEFFS_PER_CHANNEL / 8)];
+        let mut offset = 0;
+        for ch in 0..CDF53_CHANNELS {
+            if offset + 2 > payload.len() {
+                return zeroed();
+            } // malformed; bail
+            let len = ((payload[offset] as u16) << 8) | (payload[offset + 1] as u16);
+            offset += 2;
+            if offset + len as usize > payload.len() {
+                return zeroed();
+            }
+            let rle = &payload[offset..offset + len as usize];
+            offset += len as usize;
+            let bit_plane = rle_decode(rle);
+            let plane_offset = ch * (CDF53_COEFFS_PER_CHANNEL / 8);
+            let copy_len = bit_plane.len().min(CDF53_COEFFS_PER_CHANNEL / 8);
+            plane[plane_offset..plane_offset + copy_len].copy_from_slice(&bit_plane[..copy_len]);
+        }
+        decoded_planes.push(plane);
+    }
+
+    let plane_refs: Vec<&[u8]> = decoded_planes.iter().map(|p| p.as_slice()).collect();
+    decode_planes(&plane_refs)
+}
+
+/// Reassemble coefficients from N already-RLE-decoded bit-plane buffers
+/// (N ≤ CDF53_PASS_COUNT), each a contiguous 384-byte buffer (128 bytes per
+/// channel × 3 channels, B/G/R order). `planes[0]` is the sign plane;
+/// `planes[1..]` are magnitude planes (bit 12 down to bit 0). Callers must
+/// supply a contiguous prefix starting at pass 0 — a gap is not supported.
+///
+/// **Midpoint reconstruction (SPIHT-style):** for K < CDF53_PASS_COUNT, the
+/// low (unknown) bits of every significant coefficient (those with at least
+/// one set magnitude bit) are reconstructed as the midpoint of the unknown
+/// range rather than 0. This halves the expected error per coefficient and
+/// makes the SSIM curve monotonic in K — without it, K=1..6 give identical
+/// reconstructions for content where the high magnitude bits don't trip,
+/// and the SSIM can actually go DOWN at intermediate K as some coefficients
+/// gain bits while others remain zeroed. Insignificant coefficients (no
+/// magnitude bits set in the processed passes) stay at 0 — we have no
+/// evidence they're non-zero yet.
+pub fn decode_planes(planes: &[&[u8]]) -> Vec<i16> {
+    let k = planes.len();
+    assert!(k <= CDF53_PASS_COUNT);
     let mut coefficients = vec![0i16; CDF53_TOTAL_COEFFS];
     // Magnitude accumulation: u32 magnitude per coefficient.
     let mut magnitudes = vec![0u32; CDF53_TOTAL_COEFFS];
     // Sign tracking: separate from magnitude until final assembly.
     let mut signs = vec![false; CDF53_TOTAL_COEFFS];
 
-    for (pass_idx, payload) in passes.iter().enumerate() {
-        // Parse the per-pass payload (3 channels of RLE-encoded bit-planes).
-        let mut offset = 0;
+    for (pass_idx, plane) in planes.iter().enumerate() {
         for ch in 0..CDF53_CHANNELS {
-            if offset + 2 > payload.len() {
-                return coefficients;
-            } // malformed; bail
-            let len = ((payload[offset] as u16) << 8) | (payload[offset + 1] as u16);
-            offset += 2;
-            if offset + len as usize > payload.len() {
-                return coefficients;
-            }
-            let rle = &payload[offset..offset + len as usize];
-            offset += len as usize;
-            let bit_plane = rle_decode(rle);
             let channel_offset = ch * CDF53_COEFFS_PER_CHANNEL;
-
+            let plane_offset = ch * (CDF53_COEFFS_PER_CHANNEL / 8);
             for i in 0..CDF53_COEFFS_PER_CHANNEL {
-                let byte = bit_plane.get(i / 8).copied().unwrap_or(0);
+                let byte = plane.get(plane_offset + i / 8).copied().unwrap_or(0);
                 let bit = (byte >> (i % 8)) & 1;
                 if bit != 0 {
                     if pass_idx == 0 {
@@ -665,16 +704,16 @@ pub fn decode_passes(passes: &[&[u8]]) -> Vec<i16> {
         }
     }
 
-    // Midpoint correction. `passes.len()` includes the sign plane (pass 0)
-    // and any magnitude planes processed. Lowest known bit position =
-    // 13 - (passes.len() - 1) = 14 - passes.len(); unknown low bits =
-    // [0, 14 - passes.len()), i.e. (14 - passes.len()) bits of uncertainty.
-    // Midpoint of [0, 2^unknown) is 2^(unknown - 1). Skip when:
-    //   - passes.len() == 0 (degenerate)
-    //   - passes.len() >= CDF53_PASS_COUNT (no uncertainty left)
-    //   - passes.len() == 1 (only sign plane; no significant coeffs yet)
-    let midpoint: u32 = if passes.len() >= 2 && passes.len() < CDF53_PASS_COUNT {
-        let unknown_bits = CDF53_PASS_COUNT - passes.len(); // 1..=12
+    // Midpoint correction. `k` includes the sign plane (pass 0) and any
+    // magnitude planes processed. Lowest known bit position =
+    // 13 - (k - 1) = 14 - k; unknown low bits = [0, 14 - k), i.e.
+    // (14 - k) bits of uncertainty. Midpoint of [0, 2^unknown) is
+    // 2^(unknown - 1). Skip when:
+    //   - k == 0 (degenerate)
+    //   - k >= CDF53_PASS_COUNT (no uncertainty left)
+    //   - k == 1 (only sign plane; no significant coeffs yet)
+    let midpoint: u32 = if k >= 2 && k < CDF53_PASS_COUNT {
+        let unknown_bits = CDF53_PASS_COUNT - k; // 1..=12
         1u32 << (unknown_bits - 1)
     } else {
         0

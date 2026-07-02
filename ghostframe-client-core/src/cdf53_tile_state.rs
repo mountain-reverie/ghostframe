@@ -5,28 +5,16 @@
 //!
 //! `codec::cdf53::decode_passes` accepts `&[&[u8]]` of *raw RLE-encoded pass
 //! payloads* (each with the `[u16 BE len][rle]` × 3-channel framing) and
-//! internally RLE-decodes them before accumulating sign/magnitude bits.
+//! internally RLE-decodes them before delegating to
+//! `codec::cdf53::decode_planes` for the sign/magnitude accumulation.
 //! `PrevalidatedCdf53` (Task 8), however, already stores *decoded* 384-byte
-//! bit-planes (RLE already stripped, split into 3×128-byte B/G/R planes).
-//!
-//! Rather than keep a second, redundant copy of the raw payload bytes
-//! alongside the decoded planes (or re-RLE-encode the decoded planes just to
-//! satisfy `decode_passes`'s signature), this module reimplements the same
-//! sign/magnitude accumulation + SPIHT midpoint-reconstruction algorithm
-//! directly over decoded bit-planes in [`reconstruct_coefficients`]. This is
-//! the simplest correct option: it operates on the data we actually have
-//! (already-decoded planes), needs no extra storage, and is a small,
-//! self-contained mirror of `decode_passes`'s core loop (RLE decoding
-//! removed since our input is already decoded).
+//! bit-planes (RLE already stripped, split into 3×128-byte B/G/R planes), so
+//! this module calls `decode_planes` directly with those buffers rather than
+//! re-RLE-encoding them just to satisfy `decode_passes`'s signature.
 
 use crate::cdf53_prevalidate::PrevalidatedCdf53;
-use ghostframe_protocol::codec::cdf53::{
-    inverse, CDF53_CHANNELS, CDF53_COEFFS_PER_CHANNEL, CDF53_PASS_COUNT, CDF53_TOTAL_COEFFS,
-};
+use ghostframe_protocol::codec::cdf53::{decode_planes, inverse, CDF53_PASS_COUNT};
 use std::collections::HashMap;
-
-/// Per-channel bit-plane byte size = 1024 bits / 8 = 128 bytes.
-const BIT_PLANE_BYTES_PER_CHANNEL: usize = CDF53_COEFFS_PER_CHANNEL / 8;
 
 #[derive(Clone)]
 struct TileEntry {
@@ -89,7 +77,11 @@ impl Cdf53TileState {
             prefix_len += 1;
         }
 
-        let coefficients = reconstruct_coefficients(&tile.planes[..prefix_len]);
+        let plane_refs: Vec<&[u8]> = tile.planes[..prefix_len]
+            .iter()
+            .map(|p| p.as_deref().expect("contiguous prefix"))
+            .collect();
+        let coefficients = decode_planes(&plane_refs);
         let bgr = inverse(&coefficients);
 
         let mut rgba = vec![0u8; 1024 * 4];
@@ -114,57 +106,3 @@ impl Default for Cdf53TileState {
     }
 }
 
-/// Reassemble coefficients from a contiguous prefix of decoded bit-planes
-/// (index 0 = sign plane, 1..13 = magnitude planes bit 12 down to bit 0).
-/// Mirrors `codec::cdf53::decode_passes`'s accumulation + SPIHT midpoint
-/// correction, operating on already-decoded planes instead of RLE payloads.
-fn reconstruct_coefficients(planes: &[Option<Vec<u8>>]) -> Vec<i16> {
-    let k = planes.len();
-    let mut coefficients = vec![0i16; CDF53_TOTAL_COEFFS];
-    let mut magnitudes = vec![0u32; CDF53_TOTAL_COEFFS];
-    let mut signs = vec![false; CDF53_TOTAL_COEFFS];
-
-    for (pass_idx, plane_opt) in planes.iter().enumerate() {
-        let plane = match plane_opt {
-            Some(p) => p,
-            None => break, // contiguous prefix guarantees this shouldn't happen
-        };
-        for ch in 0..CDF53_CHANNELS {
-            let channel_offset = ch * CDF53_COEFFS_PER_CHANNEL;
-            let plane_offset = ch * BIT_PLANE_BYTES_PER_CHANNEL;
-            for i in 0..CDF53_COEFFS_PER_CHANNEL {
-                let byte = plane[plane_offset + i / 8];
-                let bit = (byte >> (i % 8)) & 1;
-                if bit != 0 {
-                    if pass_idx == 0 {
-                        signs[channel_offset + i] = true;
-                    } else {
-                        let bit_pos = 13 - pass_idx;
-                        magnitudes[channel_offset + i] |= 1u32 << bit_pos;
-                    }
-                }
-            }
-        }
-    }
-
-    // Same midpoint reconstruction rule as decode_passes: unknown low bits
-    // of significant coefficients are set to the midpoint of the unknown
-    // range rather than 0, for K in [2, CDF53_PASS_COUNT).
-    let midpoint: u32 = if k >= 2 && k < CDF53_PASS_COUNT {
-        let unknown_bits = CDF53_PASS_COUNT - k;
-        1u32 << (unknown_bits - 1)
-    } else {
-        0
-    };
-
-    for i in 0..CDF53_TOTAL_COEFFS {
-        let mut mag_u32 = magnitudes[i];
-        if mag_u32 != 0 && midpoint != 0 {
-            mag_u32 = mag_u32.saturating_add(midpoint);
-        }
-        let mag = mag_u32.min(i16::MAX as u32) as i16;
-        coefficients[i] = if signs[i] { -mag } else { mag };
-    }
-
-    coefficients
-}
