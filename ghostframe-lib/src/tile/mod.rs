@@ -1,6 +1,4 @@
-pub const TILE_SIZE: u32 = 32;
-pub const BPP: u32 = 4;
-pub const TILE_BYTES: usize = (TILE_SIZE * TILE_SIZE * BPP) as usize;
+pub use ghostframe_protocol::tile::{TILE_SIZE, BPP, TILE_BYTES};
 
 /// Sentinel value for `TileMetrics::unique_colors` indicating the GPU compute
 /// estimator has not run yet (M3.0 always uses this — backing lands in M3.3).
