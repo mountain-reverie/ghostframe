@@ -2,6 +2,7 @@ mod event;
 pub mod ack_batcher;
 pub mod cdf53_coverage;
 pub mod cdf53_prevalidate;
+pub mod cdf53_tile_state;
 pub mod decode_error_batcher;
 pub mod loss_tracker;
 pub mod nack_batcher;
