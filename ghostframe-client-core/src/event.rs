@@ -25,7 +25,10 @@ pub enum DecodeErrorCode {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
-    /// Fully decoded 32x32 RGBA tile (4096 bytes, RGBA byte order).
+    /// Fully decoded 32x32 RGBA tile, RGBA byte order. For
+    /// `Codec::Solid`/`PalRle`/`Cdf53` this is always 4096 bytes (32*32*4);
+    /// for `Codec::Raw` the length is payload-proportional (<= 4096, a
+    /// multiple of 4), mirroring the TS renderer contract.
     TileReady {
         frame_seq: u32,
         tile_x: u8,

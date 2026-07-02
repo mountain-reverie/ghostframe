@@ -96,6 +96,53 @@ fn assembly_timeout_nacks_missing_fragments_once() {
 }
 
 #[test]
+fn assembly_timeout_scan_deadline_retires_once_fully_nacked() {
+    let mut core = test_core();
+    let dgs = tile_datagrams(1, 0, 0, Codec::Raw, 0, &vec![7u8; 4096], 1200); // 4 frags
+    assert_eq!(dgs.len(), 4);
+    core.handle_datagram(&dgs[0], 0);
+
+    // Advance past the 30ms scan deadline: the scan NACKs all 3 missing
+    // fragments, so every entry in `nacked_frag_idxs` now covers every
+    // still-missing fragment index.
+    let deadline = core.poll_timeout().unwrap();
+    let now = deadline.max(31_000);
+    core.on_timeout(now);
+    let nack = drain_datagrams(&mut core)
+        .into_iter()
+        .find(|d| d[0] == 0x05)
+        .expect("nack sent");
+    assert_eq!(nack[1], 3);
+
+    // Regression: a fully-NACKed assembly must stop arming the assembly
+    // scan deadline in `poll_timeout`. Before the fix, `partial_since_us +
+    // 30ms` (already in the past relative to `now`) stayed the min-fold
+    // forever, so a "sleep until poll_timeout" driver would busy-loop.
+    let next = core.poll_timeout().unwrap();
+    assert!(
+        next > now,
+        "poll_timeout must not return a deadline <= now once every missing \
+         fragment has been NACKed (got {next}, now was {now})"
+    );
+}
+
+#[test]
+fn on_timeout_clamps_feedback_burst_after_large_clock_gap() {
+    let mut core = test_core();
+    // Simulate a huge clock gap: on_timeout is next called 10s late, i.e.
+    // 100 missed 100ms feedback intervals.
+    core.on_timeout(10_000_000);
+    let msgs = drain_stream(&mut core);
+    let feedback_msgs: Vec<&Vec<u8>> = msgs.iter().filter(|m| m[0] == 0x01).collect();
+    assert_eq!(
+        feedback_msgs.len(),
+        1,
+        "expected exactly one feedback message, not a burst of missed intervals"
+    );
+    assert_eq!(feedback_msgs[0].len(), 22);
+}
+
+#[test]
 fn feedback_emitted_every_100ms() {
     let mut core = test_core();
     core.on_timeout(100_000);
