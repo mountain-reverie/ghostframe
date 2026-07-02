@@ -157,14 +157,10 @@ impl ClientCore {
 
         // Construct the Hello message [0x03, caps]
         // bit0 = indices_raw_enabled, bit1 = supports_h264
-        let mut caps = 0u8;
-        if config.indices_raw_enabled {
-            caps |= 0x01;
-        }
-        if config.supports_h264 {
-            caps |= 0x02;
-        }
-        core.outbox.push_back(PollOutput::Stream(vec![0x03, caps]));
+        core.outbox.push_back(PollOutput::Stream(loss_tracker::encode_hello(
+            config.indices_raw_enabled,
+            config.supports_h264,
+        )));
 
         core
     }
@@ -204,6 +200,17 @@ impl ClientCore {
         self.assemblies
             .values()
             .filter(|a| a.received < a.fragments.len())
+            .filter(|a| {
+                // If every still-missing fragment has already been NACKed by
+                // a prior scan, this assembly has nothing left to contribute
+                // to the scan deadline; leaving it in the min-fold would pin
+                // poll_timeout at a perpetually-past instant (a host "sleep
+                // until poll_timeout" driver would busy-loop).
+                a.fragments
+                    .iter()
+                    .enumerate()
+                    .any(|(i, f)| f.is_none() && !a.nacked_frag_idxs.contains(&i))
+            })
             .map(|a| a.partial_since_us + ASSEMBLY_TIMEOUT_US)
             .min()
     }
@@ -399,10 +406,10 @@ impl ClientCore {
         }
         self.scan_assembly_timeouts(now_us);
         self.tail_sweep(now_us);
-        while now_us >= self.next_feedback_us {
-            let msg = self.loss_tracker.encode_feedback(self.next_feedback_us);
+        if now_us >= self.next_feedback_us {
+            let msg = self.loss_tracker.encode_feedback(now_us);
             self.outbox.push_back(PollOutput::Stream(msg));
-            self.next_feedback_us += FEEDBACK_INTERVAL_US;
+            self.next_feedback_us = now_us + FEEDBACK_INTERVAL_US;
         }
         Vec::new()
     }
