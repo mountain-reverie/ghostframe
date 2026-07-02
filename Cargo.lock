@@ -1676,6 +1676,7 @@ dependencies = [
  "ffmpeg-next",
  "ffmpeg-sys-next",
  "futures",
+ "ghostframe-protocol",
  "ghostframe-test-pattern",
  "hex",
  "libc",
@@ -1697,6 +1698,15 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "web-transport-proto",
+]
+
+[[package]]
+name = "ghostframe-protocol"
+version = "0.1.0"
+dependencies = [
+ "lz4_flex",
+ "smallvec",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
