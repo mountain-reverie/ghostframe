@@ -8,6 +8,7 @@ pub mod cdf53_prevalidate;
 pub mod cdf53_tile_state;
 pub mod decode_error_batcher;
 pub mod fragment_parity;
+pub mod input;
 pub mod loss_tracker;
 pub mod nack_batcher;
 pub mod pal_rle_decode;
