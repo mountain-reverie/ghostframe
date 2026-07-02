@@ -66,6 +66,12 @@ fn stamp_wire_seq(datagram: &mut [u8], wire_seq: u32) {
     datagram[8..12].copy_from_slice(&wire_seq.to_be_bytes());
 }
 
+// Tests that don't call `stamp_wire_seq` deliver datagrams with
+// `wire_seq == UNSTAMPED_WIRE_SEQ == 0` for every fragment, which the
+// wire-sequence parity window (`ParityDecoder`) treats as repeated
+// duplicates of "sequence 0" rather than distinct entries; this is
+// intentional here since those tests aren't exercising FEC/parity recovery.
+
 /// One tile's role in the synthetic test frame.
 #[derive(Clone, Copy)]
 enum TileKind {

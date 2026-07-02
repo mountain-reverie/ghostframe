@@ -108,8 +108,9 @@ fn out_of_order_arrival_uses_only_contiguous_prefix() {
     let result_before_pass0 = st.integrate(0, 0, &pre1);
 
     let mut fresh = Cdf53TileState::new();
-    // Zero passes held → reconstruct_coefficients on empty slice → all
-    // coefficients 0 → inverse() of all-zero coefficients.
+    // Zero passes held → `integrate` has no contiguous prefix to draw
+    // coefficients from → all coefficients 0 → inverse() of all-zero
+    // coefficients.
     let zero_coeffs = vec![0i16; cdf53::CDF53_TOTAL_COEFFS];
     let expected_zero_bgr = cdf53::inverse(&zero_coeffs);
     assert_rgba_matches_bgr(&result_before_pass0, &expected_zero_bgr);

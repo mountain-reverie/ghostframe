@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 ghostframe-protocol = { path = "../ghostframe-protocol" }
-thiserror = "1"
+thiserror = { workspace = true }
 smallvec = "1"
 
 [dev-dependencies]

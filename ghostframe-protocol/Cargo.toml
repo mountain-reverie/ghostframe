@@ -7,7 +7,7 @@ edition = "2021"
 cdf53-diag = []
 
 [dependencies]
-thiserror = "1"
+thiserror = { workspace = true }
 smallvec = "1"
 tracing = { workspace = true }
 

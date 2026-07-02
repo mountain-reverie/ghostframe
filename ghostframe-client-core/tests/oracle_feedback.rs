@@ -22,15 +22,6 @@ fn hello_both_caps() {
 }
 
 #[test]
-fn decode_error_is_five_bytes_encoding() {
-    // Byte-exact wire check for DECODE_ERROR (mirrors feedback.test.ts
-    // "encodes a thin-uncached-palette error" and "emits exactly 5 bytes").
-    let bytes: Vec<u8> = vec![0x04, 2, 7, 13, 3];
-    assert_eq!(bytes.len(), 5);
-    assert_eq!(bytes, vec![0x04, 2, 7, 13, 3]);
-}
-
-#[test]
 fn loss_tracker_round_trip() {
     let mut t = LossTracker::new();
     t.on_datagram(1_000);

@@ -1638,7 +1638,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -1719,7 +1719,7 @@ dependencies = [
  "lz4_flex",
  "proptest",
  "smallvec",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tracing",
 ]
 
