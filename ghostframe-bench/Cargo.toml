@@ -26,7 +26,7 @@ m3 = ["ghostframe-lib/m3"]
 ghostframe-lib = { path = "../ghostframe-lib" }
 ghostframe-e2e = { path = "../ghostframe-e2e" }
 libc = { workspace = true }
-lz4_flex = "0.11"
+lz4_flex = "0.13"
 clap = { version = "4", features = ["derive"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "process", "time", "io-util"] }
 serde = { version = "1", features = ["derive"] }
