@@ -6,3 +6,4 @@
 [parse]
 parse_deps = true
 include = ["ghostframe-protocol"]
+extra_bindings = ["ghostframe-protocol"]
