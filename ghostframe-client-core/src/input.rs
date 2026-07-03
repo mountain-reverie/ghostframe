@@ -10,7 +10,6 @@
 // Spec: docs/superpowers/specs/2026-06-13-input-forwarding-design.md
 // Ported from ghostframe-web-client/src/input/encode.ts and keymap.ts
 
-
 pub const INPUT_MSG_TYPE: u8 = 0x05;
 
 /// Encode a pointer-move event: [0x05, 0x01, x:i16 BE, y:i16 BE]
@@ -156,7 +155,7 @@ pub fn key_to_keysym(key: &str) -> Option<u32> {
     // Single character: Unicode → X11 keysym.
     if key.chars().count() == 1 {
         let cp = key.chars().next().unwrap() as u32;
-        if cp >= 0x20 && cp <= 0xff {
+        if (0x20..=0xff).contains(&cp) {
             return Some(cp);
         }
         return Some(cp | 0x01000000);

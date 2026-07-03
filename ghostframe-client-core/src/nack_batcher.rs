@@ -4,7 +4,7 @@
 //! instead of using `setTimeout`/wall clock, so the caller (ClientCore) drives
 //! the deadline via `poll_timeout`/`on_timeout`.
 
-use ghostframe_protocol::protocol::{TileNackEnvelope, TileNackEntry};
+use ghostframe_protocol::protocol::{TileNackEntry, TileNackEnvelope};
 
 /// Flush deadline: 5ms in microseconds after the first entry of a pending
 /// batch is queued (mirrors `NACK_BATCH_FLUSH_MS` in nack.ts).

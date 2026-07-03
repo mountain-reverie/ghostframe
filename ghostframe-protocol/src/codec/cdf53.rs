@@ -712,7 +712,7 @@ pub fn decode_planes(planes: &[&[u8]]) -> Vec<i16> {
     //   - k == 0 (degenerate)
     //   - k >= CDF53_PASS_COUNT (no uncertainty left)
     //   - k == 1 (only sign plane; no significant coeffs yet)
-    let midpoint: u32 = if k >= 2 && k < CDF53_PASS_COUNT {
+    let midpoint: u32 = if (2..CDF53_PASS_COUNT).contains(&k) {
         let unknown_bits = CDF53_PASS_COUNT - k; // 1..=12
         1u32 << (unknown_bits - 1)
     } else {

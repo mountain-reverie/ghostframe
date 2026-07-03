@@ -34,6 +34,7 @@ fn test_core() -> ClientCore {
     core
 }
 
+#[allow(clippy::too_many_arguments)]
 fn tile_datagrams(
     frame_seq: u32,
     x: u8,
@@ -75,9 +76,9 @@ fn stamp_wire_seq(datagram: &mut [u8], wire_seq: u32) {
 /// One tile's role in the synthetic test frame.
 #[derive(Clone, Copy)]
 enum TileKind {
-    Solid([u8; 4]),        // BGRA fill color
-    PalRle,                 // deterministic 4-color pattern, keyed by tile index
-    Cdf53,                   // horizontal BGR gradient, keyed by tile index
+    Solid([u8; 4]), // BGRA fill color
+    PalRle,         // deterministic 4-color pattern, keyed by tile index
+    Cdf53,          // horizontal BGR gradient, keyed by tile index
 }
 
 /// Build the BGRA pixel buffer for one 32x32 tile of the synthetic frame,
@@ -183,12 +184,7 @@ fn expected_rgba(kind: TileKind, tx: u8, ty: u8) -> Vec<u8> {
 
 /// Build the fragmented wire datagrams for one tile. For Cdf53, returns one
 /// group of fragments *per pass* (14 groups); for other codecs, one group.
-fn encode_tile_datagrams(
-    kind: TileKind,
-    frame_seq: u32,
-    tx: u8,
-    ty: u8,
-) -> Vec<Vec<Vec<u8>>> {
+fn encode_tile_datagrams(kind: TileKind, frame_seq: u32, tx: u8, ty: u8) -> Vec<Vec<Vec<u8>>> {
     let bgra = tile_bgra(kind, tx, ty);
     match kind {
         TileKind::Solid(_) => {
@@ -223,10 +219,10 @@ fn encode_tile_datagrams(
             let mut packed = [0u8; 512];
             for y in 0..TILE_DIM {
                 for x in 0..TILE_DIM {
-                    let q = ((x / 16) + (y / 16) * 2) % 4 as usize;
+                    let q = ((x / 16) + (y / 16) * 2) % 4_usize;
                     let pixel_idx = y * TILE_DIM + x;
                     let byte_idx = pixel_idx / 2;
-                    if pixel_idx % 2 == 0 {
+                    if pixel_idx.is_multiple_of(2) {
                         packed[byte_idx] = (packed[byte_idx] & 0xF0) | (q as u8);
                     } else {
                         packed[byte_idx] = (packed[byte_idx] & 0x0F) | ((q as u8) << 4);
@@ -234,7 +230,8 @@ fn encode_tile_datagrams(
                 }
             }
             let palette_id = ((tx as u16 * 3 + ty as u16) % 256) as u8;
-            let payload = encode_pal_rle_payload(&packed, &entry, palette_id, /* bundled */ true);
+            let payload =
+                encode_pal_rle_payload(&packed, &entry, palette_id, /* bundled */ true);
             vec![tile_datagrams(
                 frame_seq,
                 tx,
@@ -276,7 +273,7 @@ const FRAME_H: usize = ROWS as usize * TILE_DIM;
 
 fn tile_kind_for(tx: u8, ty: u8) -> TileKind {
     if tx < 2 {
-        TileKind::Solid([(tx * 40 + ty * 5) as u8, 0x80, 0x40, 0xFF])
+        TileKind::Solid([tx * 40 + ty * 5, 0x80, 0x40, 0xFF])
     } else if tx < 5 {
         TileKind::PalRle
     } else {
@@ -337,18 +334,19 @@ fn solid_palrle_cdf53_full_frame_converges_pixel_exact() {
     }
 
     let mut last_ready: HashMap<(u8, u8), Vec<u8>> = HashMap::new();
-    let mut t = 0u64;
-    for dg in &all_datagrams {
-        let evs = core.handle_datagram(dg, t);
+    for (t, dg) in all_datagrams.iter().enumerate() {
+        let evs = core.handle_datagram(dg, t as u64);
         for e in evs {
             if let Event::TileReady {
-                tile_x, tile_y, rgba, ..
+                tile_x,
+                tile_y,
+                rgba,
+                ..
             } = e
             {
                 last_ready.insert((tile_x, tile_y), rgba);
             }
         }
-        t += 1;
     }
 
     assert_eq!(
@@ -362,7 +360,8 @@ fn solid_palrle_cdf53_full_frame_converges_pixel_exact() {
             .get(&(tx, ty))
             .unwrap_or_else(|| panic!("missing TileReady for ({tx},{ty})"));
         assert_eq!(
-            got, &expected,
+            got,
+            &expected,
             "tile ({tx},{ty}) pixel mismatch (codec {:?})",
             tile_kind_for(tx, ty)
         );
@@ -408,7 +407,10 @@ fn loss_with_nack_replay_converges() {
         let tile_x = dg[16];
         let tile_y = dg[17];
         let pass_idx = dg[19] & 0x0F;
-        by_key.insert((frame_seq_raw, tile_x, tile_y, pass_idx, frag_idx), dg.clone());
+        by_key.insert(
+            (frame_seq_raw, tile_x, tile_y, pass_idx, frag_idx),
+            dg.clone(),
+        );
     }
 
     let mut last_ready: HashMap<(u8, u8), Vec<u8>> = HashMap::new();
@@ -422,7 +424,10 @@ fn loss_with_nack_replay_converges() {
         let evs = core.handle_datagram(dg, t);
         for e in evs {
             if let Event::TileReady {
-                tile_x, tile_y, rgba, ..
+                tile_x,
+                tile_y,
+                rgba,
+                ..
             } = e
             {
                 last_ready.insert((tile_x, tile_y), rgba);
@@ -470,7 +475,10 @@ fn loss_with_nack_replay_converges() {
             let evs = core.handle_datagram(dg, t);
             for e in evs {
                 if let Event::TileReady {
-                    tile_x, tile_y, rgba, ..
+                    tile_x,
+                    tile_y,
+                    rgba,
+                    ..
                 } = e
                 {
                     last_ready.insert((tile_x, tile_y), rgba);
@@ -480,7 +488,10 @@ fn loss_with_nack_replay_converges() {
         }
         t += 1;
     }
-    assert!(replayed > 0, "expected to replay at least one NACKed fragment");
+    assert!(
+        replayed > 0,
+        "expected to replay at least one NACKed fragment"
+    );
 
     // Re-deliver every remaining not-yet-delivered dropped fragment too
     // (mirrors what a real server would eventually do via further NACK
@@ -491,7 +502,10 @@ fn loss_with_nack_replay_converges() {
             let evs = core.handle_datagram(dg, t);
             for e in evs {
                 if let Event::TileReady {
-                    tile_x, tile_y, rgba, ..
+                    tile_x,
+                    tile_y,
+                    rgba,
+                    ..
                 } = e
                 {
                     last_ready.insert((tile_x, tile_y), rgba);
@@ -506,7 +520,10 @@ fn loss_with_nack_replay_converges() {
         let got = last_ready
             .get(&(tx, ty))
             .unwrap_or_else(|| panic!("missing TileReady for ({tx},{ty}) after replay"));
-        assert_eq!(got, &expected, "tile ({tx},{ty}) mismatch after NACK replay");
+        assert_eq!(
+            got, &expected,
+            "tile ({tx},{ty}) mismatch after NACK replay"
+        );
     }
 }
 
@@ -572,7 +589,10 @@ fn parity_group_recovers_without_retransmit() {
         let evs = core.handle_datagram(dg, t);
         for e in evs {
             if let Event::TileReady {
-                tile_x, tile_y, rgba, ..
+                tile_x,
+                tile_y,
+                rgba,
+                ..
             } = e
             {
                 last_ready.insert((tile_x, tile_y), rgba);
@@ -583,7 +603,10 @@ fn parity_group_recovers_without_retransmit() {
     let evs = core.handle_datagram(&parity_bytes, t);
     for e in evs {
         if let Event::TileReady {
-            tile_x, tile_y, rgba, ..
+            tile_x,
+            tile_y,
+            rgba,
+            ..
         } = e
         {
             last_ready.insert((tile_x, tile_y), rgba);
@@ -591,12 +614,19 @@ fn parity_group_recovers_without_retransmit() {
     }
     t += 1;
 
-    assert_eq!(last_ready.len(), coords.len(), "expected all 10 tiles ready");
+    assert_eq!(
+        last_ready.len(),
+        coords.len(),
+        "expected all 10 tiles ready"
+    );
     for (i, &(tx, ty)) in coords.iter().enumerate() {
         let got = last_ready
             .get(&(tx, ty))
             .unwrap_or_else(|| panic!("missing TileReady for tile {i} ({tx},{ty})"));
-        assert_eq!(got, &expecteds[i], "tile {i} ({tx},{ty}) pixel mismatch after FEC recovery");
+        assert_eq!(
+            got, &expecteds[i],
+            "tile {i} ({tx},{ty}) pixel mismatch after FEC recovery"
+        );
     }
 
     // Trigger periodic feedback and inspect datagrams_recovered_fec.
@@ -687,7 +717,7 @@ impl SplitMix64 {
 
 #[test]
 fn duplicated_and_reordered_delivery_is_idempotent() {
-    const SEED: u64 = 0xC0FFEE_1234_5678;
+    const SEED: u64 = 0x00C0_FFEE_1234_5678;
     eprintln!("duplicated_and_reordered_delivery_is_idempotent seed = {SEED:#018x}");
 
     let frame_seq = 4u32;
@@ -710,7 +740,10 @@ fn duplicated_and_reordered_delivery_is_idempotent() {
         let evs = baseline_core.handle_datagram(dg, i as u64);
         for e in evs {
             if let Event::TileReady {
-                tile_x, tile_y, rgba, ..
+                tile_x,
+                tile_y,
+                rgba,
+                ..
             } = e
             {
                 baseline_ready.insert((tile_x, tile_y), rgba);
@@ -737,7 +770,10 @@ fn duplicated_and_reordered_delivery_is_idempotent() {
         let evs = core.handle_datagram(dg, i as u64);
         for e in evs {
             if let Event::TileReady {
-                tile_x, tile_y, rgba, ..
+                tile_x,
+                tile_y,
+                rgba,
+                ..
             } = e
             {
                 ready_count += 1;

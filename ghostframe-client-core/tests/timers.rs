@@ -178,7 +178,10 @@ fn tail_sweep_renacks_stalled_cdf53_tile_after_1500ms() {
         .into_iter()
         .filter(|d| d[0] == 0x05)
         .collect();
-    assert!(!nacks.is_empty(), "expected re-NACK datagram(s) after tail sweep");
+    assert!(
+        !nacks.is_empty(),
+        "expected re-NACK datagram(s) after tail sweep"
+    );
     // Total NACK entry count across all datagrams should cover passes 1..13
     // (13 entries).
     let total: u32 = nacks.iter().map(|d| d[1] as u32).sum();
@@ -241,5 +244,8 @@ fn coverage_nack_debounce_sends_pass_that_never_arrives() {
         .into_iter()
         .filter(|d| d[0] == 0x05)
         .collect();
-    assert!(!nacks.is_empty(), "expected NACK for pass 1 which never arrived");
+    assert!(
+        !nacks.is_empty(),
+        "expected NACK for pass 1 which never arrived"
+    );
 }

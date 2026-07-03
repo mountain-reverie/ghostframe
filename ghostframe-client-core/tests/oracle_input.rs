@@ -1,6 +1,5 @@
 /// Oracle tests ported from ghostframe-web-client/tests/input.test.ts
 /// All byte sequences and keysym mappings are exact replicas of the vitest tests.
-
 use ghostframe_client_core::input::{
     encode_key_down, encode_key_up, encode_pointer_button, encode_pointer_move, encode_wheel,
     key_to_keysym, INPUT_MSG_TYPE,

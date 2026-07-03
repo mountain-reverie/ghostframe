@@ -43,7 +43,10 @@ pub fn decode_parity_payload(payload: &[u8]) -> Option<ParityInfo> {
 pub fn recover_fragment(received_payloads: &[Vec<u8>], xor_data: &[u8]) -> Vec<u8> {
     let max_len = xor_data.len();
     let mut out = vec![0u8; max_len];
-    for buf in received_payloads.iter().chain(std::iter::once(&xor_data.to_vec())) {
+    for buf in received_payloads
+        .iter()
+        .chain(std::iter::once(&xor_data.to_vec()))
+    {
         for (i, b) in buf.iter().enumerate() {
             if i < max_len {
                 out[i] ^= b;
@@ -99,8 +102,13 @@ impl FragmentParity {
             let mut missing_count = 0usize;
             let mut missing_idx = None;
             let mut ok = true;
-            for i in group_start..group_end {
-                match &fragments[i] {
+            for (i, frag) in fragments
+                .iter()
+                .enumerate()
+                .take(group_end)
+                .skip(group_start)
+            {
+                match frag {
                     None => {
                         missing_count += 1;
                         missing_idx = Some(i);
@@ -143,8 +151,8 @@ impl FragmentParity {
         let group_end = std::cmp::min(group_start + parity.group_len as usize, fragments.len());
         let mut received: Vec<Vec<u8>> = Vec::new();
         let mut missing_count = 0usize;
-        for i in group_start..group_end {
-            match &fragments[i] {
+        for frag in fragments.iter().take(group_end).skip(group_start) {
+            match frag {
                 None => {
                     missing_count += 1;
                     if missing_count > 1 {

@@ -17,7 +17,9 @@ pub struct OrderedMap<K, V> {
 
 impl<K: PartialEq, V> Default for OrderedMap<K, V> {
     fn default() -> Self {
-        OrderedMap { entries: Vec::new() }
+        OrderedMap {
+            entries: Vec::new(),
+        }
     }
 }
 
@@ -31,7 +33,10 @@ impl<K: PartialEq, V> OrderedMap<K, V> {
     }
 
     pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
-        self.entries.iter_mut().find(|(k, _)| k == key).map(|(_, v)| v)
+        self.entries
+            .iter_mut()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v)
     }
 
     /// Insert or update `key` -> `value`. If `key` already exists, its

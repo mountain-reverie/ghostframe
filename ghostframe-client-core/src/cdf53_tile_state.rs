@@ -16,22 +16,12 @@ use crate::cdf53_prevalidate::PrevalidatedCdf53;
 use ghostframe_protocol::codec::cdf53::{decode_planes, inverse, CDF53_PASS_COUNT};
 use std::collections::HashMap;
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct TileEntry {
     generation: u8,
     generation_set: bool,
     /// Decoded 384-byte bit-planes (B,G,R × 128 bytes), one slot per pass.
     planes: [Option<Vec<u8>>; CDF53_PASS_COUNT],
-}
-
-impl Default for TileEntry {
-    fn default() -> Self {
-        TileEntry {
-            generation: 0,
-            generation_set: false,
-            planes: Default::default(),
-        }
-    }
 }
 
 /// Per-(tile_x, tile_y) CDF53 progressive-pass accumulator.
@@ -105,4 +95,3 @@ impl Default for Cdf53TileState {
         Self::new()
     }
 }
-
