@@ -54,8 +54,8 @@ impl ParityDecoder {
     /// Returns the recovered source datagram if one buffered parity group
     /// became recoverable.
     pub fn record_source(&mut self, wire_seq: u32, bytes: &[u8]) -> Option<Vec<u8>> {
-        if !self.window.contains_key(&wire_seq) {
-            self.window.insert(wire_seq, bytes.to_vec());
+        if let std::collections::hash_map::Entry::Vacant(e) = self.window.entry(wire_seq) {
+            e.insert(bytes.to_vec());
             self.order.push_back(wire_seq);
             while self.window.len() > self.window_capacity {
                 match self.order.pop_front() {

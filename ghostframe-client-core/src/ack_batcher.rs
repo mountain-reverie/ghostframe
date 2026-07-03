@@ -6,7 +6,9 @@
 
 use std::collections::VecDeque;
 
-use ghostframe_protocol::ack::{AckBatch, AckEntry, ACK_OVERLAP_COUNT, MAX_FRESH_ENTRIES_PER_BATCH};
+use ghostframe_protocol::ack::{
+    AckBatch, AckEntry, ACK_OVERLAP_COUNT, MAX_FRESH_ENTRIES_PER_BATCH,
+};
 
 /// Flush deadline: 5ms in microseconds after the first entry of a pending
 /// batch is queued (mirrors `FLUSH_INTERVAL_MS` in ack.ts).

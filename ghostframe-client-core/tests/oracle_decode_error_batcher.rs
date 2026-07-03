@@ -13,8 +13,7 @@ fn emits_the_first_error() {
 fn drops_a_duplicate_within_1000ms() {
     let mut b = DecodeErrorBatcher::new();
     let mut emitted = 0;
-    if b
-        .report(Codec::PalRle, 3, 4, DecodeErrorCode::ThinUncachedPalette, 0)
+    if b.report(Codec::PalRle, 3, 4, DecodeErrorCode::ThinUncachedPalette, 0)
         .is_some()
     {
         emitted += 1;
@@ -37,8 +36,7 @@ fn drops_a_duplicate_within_1000ms() {
 fn allows_same_key_after_1000ms_window() {
     let mut b = DecodeErrorBatcher::new();
     let mut emitted = 0;
-    if b
-        .report(Codec::PalRle, 3, 4, DecodeErrorCode::ThinUncachedPalette, 0)
+    if b.report(Codec::PalRle, 3, 4, DecodeErrorCode::ThinUncachedPalette, 0)
         .is_some()
     {
         emitted += 1;
@@ -62,8 +60,7 @@ fn allows_distinct_keys_inside_window() {
     let mut b = DecodeErrorBatcher::new();
     let mut emitted = 0;
     for i in 0..10u8 {
-        if b
-            .report(Codec::PalRle, i, 4, DecodeErrorCode::ThinUncachedPalette, 0)
+        if b.report(Codec::PalRle, i, 4, DecodeErrorCode::ThinUncachedPalette, 0)
             .is_some()
         {
             emitted += 1;
@@ -77,8 +74,7 @@ fn drops_above_global_cap_of_32() {
     let mut b = DecodeErrorBatcher::new();
     let mut emitted = 0;
     for i in 0..40u8 {
-        if b
-            .report(Codec::PalRle, i, 0, DecodeErrorCode::ThinUncachedPalette, 0)
+        if b.report(Codec::PalRle, i, 0, DecodeErrorCode::ThinUncachedPalette, 0)
             .is_some()
         {
             emitted += 1;
@@ -92,8 +88,7 @@ fn replenishes_global_cap_after_1000ms_window() {
     let mut b = DecodeErrorBatcher::new();
     let mut emitted = 0;
     for i in 0..40u8 {
-        if b
-            .report(Codec::PalRle, i, 0, DecodeErrorCode::ThinUncachedPalette, 0)
+        if b.report(Codec::PalRle, i, 0, DecodeErrorCode::ThinUncachedPalette, 0)
             .is_some()
         {
             emitted += 1;
@@ -118,8 +113,13 @@ fn replenishes_global_cap_after_1000ms_window() {
 fn decode_error_is_five_bytes() {
     let mut b = DecodeErrorBatcher::new();
     let m = b
-        .report(Codec::PalRle, 7, 13, DecodeErrorCode::ThinUncachedPalette, 0)
+        .report(
+            Codec::PalRle,
+            7,
+            13,
+            DecodeErrorCode::ThinUncachedPalette,
+            0,
+        )
         .unwrap();
     assert_eq!(m, vec![0x04, 2, 7, 13, 3]);
 }
-

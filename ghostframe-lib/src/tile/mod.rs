@@ -1,4 +1,4 @@
-pub use ghostframe_protocol::tile::{TILE_SIZE, BPP, TILE_BYTES};
+pub use ghostframe_protocol::tile::{BPP, TILE_BYTES, TILE_SIZE};
 
 /// Sentinel value for `TileMetrics::unique_colors` indicating the GPU compute
 /// estimator has not run yet (M3.0 always uses this — backing lands in M3.3).

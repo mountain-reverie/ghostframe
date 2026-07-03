@@ -75,8 +75,8 @@ fn generation_bump_discards_stale_planes() {
 
     let mut st = Cdf53TileState::new();
     // Integrate passes 0..3 at generation 1.
-    for i in 0..4usize {
-        let pre = prevalidate_cdf53(&passes[i], 1, i as u8).unwrap();
+    for (i, pass) in passes.iter().enumerate().take(4) {
+        let pre = prevalidate_cdf53(pass, 1, i as u8).unwrap();
         st.integrate(0, 0, &pre);
     }
 

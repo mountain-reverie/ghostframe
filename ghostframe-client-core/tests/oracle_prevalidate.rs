@@ -1,7 +1,9 @@
 //! Port of `ghostframe-web-client/tests/prevalidate.test.ts` (11 cases),
 //! plus one RGBA pixel test for `decode_pal_rle_tile`.
 
-use ghostframe_client_core::pal_rle_decode::{decode_pal_rle_tile, prevalidate_pal_rle, PalRleVariant};
+use ghostframe_client_core::pal_rle_decode::{
+    decode_pal_rle_tile, prevalidate_pal_rle, PalRleVariant,
+};
 use ghostframe_client_core::palette_shadow::PaletteShadow;
 use ghostframe_client_core::DecodeErrorCode;
 
@@ -74,7 +76,7 @@ fn reports_indices_raw_too_short() {
     shadow.put(5, 1);
     let payload = {
         let mut v = vec![0x02u8, 5];
-        v.extend(std::iter::repeat(0u8).take(500)); // 502 bytes, not 514
+        v.extend(std::iter::repeat_n(0u8, 500)); // 502 bytes, not 514
         v
     };
     let r = prevalidate_pal_rle(&payload, &shadow);
@@ -113,8 +115,8 @@ fn indices_raw_passes_512_bytes_verbatim() {
     let mut shadow = PaletteShadow::new();
     shadow.put(9, 8);
     let mut indices = vec![0u8; 512];
-    for i in 0..512 {
-        indices[i] = (i as u8) & 0x77;
+    for (i, slot) in indices.iter_mut().enumerate() {
+        *slot = (i as u8) & 0x77;
     }
     let v = prevalidate_pal_rle(&indices_raw_payload(9, &indices), &shadow).unwrap();
     assert_eq!(v.variant, PalRleVariant::IndicesRaw);
@@ -141,7 +143,7 @@ fn alternating_index_sequence_packs_correctly() {
     let mut rle = Vec::with_capacity(1024);
     for i in 0..1024u32 {
         let idx = (i & 1) as u8;
-        rle.push((idx << 4) | 0);
+        rle.push(idx << 4);
     }
     let v = prevalidate_pal_rle(&bundled_payload(3, 2, &rle), &shadow).unwrap();
     for i in 0..512 {
@@ -160,8 +162,8 @@ fn decode_pal_rle_tile_bundled_two_color_pixel0_matches_palette_color0_swizzled(
     let mut payload = vec![0x01u8, 5, 2];
     payload.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]); // color 0 BGRA
     payload.extend_from_slice(&[0x55, 0x66, 0x77, 0x88]); // color 1 BGRA
-    // All 1024 pixels index 0.
-    payload.extend(std::iter::repeat(0x0Fu8).take(64));
+                                                          // All 1024 pixels index 0.
+    payload.extend(std::iter::repeat_n(0x0Fu8, 64));
 
     let rgba = decode_pal_rle_tile(&payload, &mut shadow, &mut palettes).unwrap();
     assert_eq!(rgba.len(), 4096);

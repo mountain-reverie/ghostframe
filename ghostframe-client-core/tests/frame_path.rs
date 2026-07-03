@@ -61,13 +61,20 @@ fn h264_parity_fragments_are_dropped_not_counted() {
     parity[4] = 0x00;
     parity[5] = 0x02; // frag_idx = 2 == frag_total (2) -> parity, must be skipped
     let evs = core.handle_datagram(&parity, 0);
-    assert!(evs.is_empty(), "parity fragment must not be counted or emit events");
+    assert!(
+        evs.is_empty(),
+        "parity fragment must not be counted or emit events"
+    );
 
     // Now deliver both real fragments; frame should still complete cleanly.
     let mut evs = core.handle_datagram(&dgs[0], 0);
     evs.extend(core.handle_datagram(&dgs[1], 0));
     match &evs[..] {
-        [Event::NeedsH264 { frame_seq: 3, payload: p, .. }] => {
+        [Event::NeedsH264 {
+            frame_seq: 3,
+            payload: p,
+            ..
+        }] => {
             assert_eq!(p, &payload);
         }
         other => panic!("unexpected events: {other:?}"),
@@ -94,7 +101,10 @@ fn h264_stale_frame_dropped_after_eviction_window() {
     // Frame 1's remaining fragment now arrives late; frame is stale
     // (1 < latest(4) - 2 = 2), dropped before insertion, so no event.
     let evs = core.handle_datagram(&f1[1], 0);
-    assert!(evs.is_empty(), "stale frame-1 fragment must be dropped: {evs:?}");
+    assert!(
+        evs.is_empty(),
+        "stale frame-1 fragment must be dropped: {evs:?}"
+    );
 }
 
 #[test]

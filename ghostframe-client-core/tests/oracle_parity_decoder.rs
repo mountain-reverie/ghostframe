@@ -18,7 +18,7 @@ fn fake_source(wire_seq: u32, payload: u8) -> Vec<u8> {
     buf[6..8].copy_from_slice(&1u16.to_be_bytes()); // frag_total
     buf[8..12].copy_from_slice(&wire_seq.to_be_bytes()); // wire_seq
     buf[12..16].copy_from_slice(&0u32.to_be_bytes()); // timestamp_us
-    // tile header bytes 16..23 left as 0
+                                                      // tile header bytes 16..23 left as 0
     buf[24] = payload;
     buf
 }
@@ -280,8 +280,7 @@ fn fragment_parity_remove_clears_stored_groups() {
     fp.store(key(), &parity_payload(0, 4, &[0xFF]));
     fp.remove(&key());
 
-    let fragments: Vec<Option<Vec<u8>>> =
-        vec![Some(vec![1]), None, Some(vec![3]), Some(vec![4])];
+    let fragments: Vec<Option<Vec<u8>>> = vec![Some(vec![1]), None, Some(vec![3]), Some(vec![4])];
     assert!(fp.try_recover(key(), &fragments).is_none());
 }
 
@@ -292,7 +291,16 @@ fn fragment_parity_recovers_first_inserted_group_when_multiple_ambiguous() {
     // `ParityRecovery`), and `try_recover` must scan groups in insertion
     // order, returning the FIRST group with exactly one missing fragment —
     // even when a later-inserted group is *also* recoverable.
-    let frags: Vec<Vec<u8>> = vec![vec![1], vec![2], vec![3], vec![4], vec![5], vec![6], vec![7], vec![8]];
+    let frags: Vec<Vec<u8>> = vec![
+        vec![1],
+        vec![2],
+        vec![3],
+        vec![4],
+        vec![5],
+        vec![6],
+        vec![7],
+        vec![8],
+    ];
 
     // Group at group_start=0 (inserted FIRST), missing index 1. The parity
     // xor_data covers ALL fragments in the group (it is generated before

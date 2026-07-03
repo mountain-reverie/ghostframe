@@ -86,7 +86,8 @@ pub fn prevalidate_pal_rle(
         count = shadow.count(palette_id);
     }
 
-    let indices = expand_rle_to_indices(&payload[cursor..]).ok_or(DecodeErrorCode::PayloadTooShort)?;
+    let indices =
+        expand_rle_to_indices(&payload[cursor..]).ok_or(DecodeErrorCode::PayloadTooShort)?;
 
     Ok(PrevalidatedPalRle {
         variant: if bundled {

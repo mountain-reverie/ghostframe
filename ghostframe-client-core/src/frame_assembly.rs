@@ -26,7 +26,12 @@ pub(crate) struct FrameAssembly {
 impl ClientCore {
     /// Feed one non-tile datagram through the H.264 frame-reassembly path
     /// (`main.ts` ~1326-1399). Malformed datagrams are dropped silently.
-    pub(crate) fn handle_frame_datagram(&mut self, bytes: &[u8], _now_us: u64, events: &mut Vec<Event>) {
+    pub(crate) fn handle_frame_datagram(
+        &mut self,
+        bytes: &[u8],
+        _now_us: u64,
+        events: &mut Vec<Event>,
+    ) {
         let (fh, payload) = match decode_frame_datagram(bytes) {
             Ok(x) => x,
             Err(_) => return,
@@ -84,10 +89,8 @@ impl ClientCore {
                 None => return,
             };
             let mut out = Vec::new();
-            for frag in &asm.fragments {
-                if let Some(b) = frag {
-                    out.extend_from_slice(b);
-                }
+            for b in asm.fragments.iter().flatten() {
+                out.extend_from_slice(b);
             }
             events.push(Event::NeedsH264 {
                 frame_seq: asm.header.frame_seq,

@@ -10,12 +10,12 @@
 //! All header decodes are fallible and short-circuit; all indexing goes
 //! through `get`/bounds checks; no `unwrap` touches attacker-controlled data.
 
-use ghostframe_protocol::protocol::{
-    decode_tile_datagram, is_tile_datagram, Codec, TileParityEnvelope,
-    DATAGRAM_HEADER_SIZE, FRAME_DIMENSIONS_SENTINEL_X, FRAME_DIMENSIONS_SENTINEL_Y,
-    TILE_DATAGRAM_FLAG, TILE_HEADER_SIZE, TILE_PARITY_ENVELOPE,
-};
 use ghostframe_protocol::ack::AckEntry;
+use ghostframe_protocol::protocol::{
+    decode_tile_datagram, is_tile_datagram, Codec, TileParityEnvelope, DATAGRAM_HEADER_SIZE,
+    FRAME_DIMENSIONS_SENTINEL_X, FRAME_DIMENSIONS_SENTINEL_Y, TILE_DATAGRAM_FLAG, TILE_HEADER_SIZE,
+    TILE_PARITY_ENVELOPE,
+};
 
 use crate::cdf53_coverage::apply_cdf53_arrival;
 use crate::cdf53_prevalidate::prevalidate_cdf53;
@@ -141,9 +141,7 @@ impl ClientCore {
             let want_recover = self
                 .assemblies
                 .get(&key)
-                .map(|asm| {
-                    !asm.fragments.is_empty() && asm.received + 1 == asm.fragments.len()
-                })
+                .map(|asm| !asm.fragments.is_empty() && asm.received + 1 == asm.fragments.len())
                 .unwrap_or(false);
             if want_recover {
                 let frags = &self.assemblies[&key].fragments;
@@ -229,10 +227,8 @@ impl ClientCore {
         self.fragment_parity.remove(&key);
 
         let mut payload = Vec::new();
-        for frag in &asm.fragments {
-            if let Some(b) = frag {
-                payload.extend_from_slice(b);
-            }
+        for b in asm.fragments.iter().flatten() {
+            payload.extend_from_slice(b);
         }
 
         let tx = asm.tile_x;
@@ -291,7 +287,7 @@ impl ClientCore {
                 }
             }
             Codec::PalRle => {
-                match decode_pal_rle_tile(&payload, &mut self.palette_shadow, &mut *self.palettes) {
+                match decode_pal_rle_tile(&payload, &mut self.palette_shadow, &mut self.palettes) {
                     Ok(rgba) => events.push(Event::TileReady {
                         frame_seq,
                         tile_x: tx,

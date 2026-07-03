@@ -1,19 +1,19 @@
-mod event;
-mod frame_assembly;
-mod ordered_map;
-mod reassembly;
 pub mod ack_batcher;
 pub mod cdf53_coverage;
 pub mod cdf53_prevalidate;
 pub mod cdf53_tile_state;
 pub mod decode_error_batcher;
+mod event;
 pub mod fragment_parity;
+mod frame_assembly;
 pub mod input;
 pub mod loss_tracker;
 pub mod nack_batcher;
+mod ordered_map;
 pub mod pal_rle_decode;
 pub mod palette_shadow;
 pub mod parity_decoder;
+mod reassembly;
 pub use cdf53_coverage::CoverageEntry;
 pub use event::{DecodeErrorCode, Event, PollOutput, TileKey};
 
@@ -157,10 +157,11 @@ impl ClientCore {
 
         // Construct the Hello message [0x03, caps]
         // bit0 = indices_raw_enabled, bit1 = supports_h264
-        core.outbox.push_back(PollOutput::Stream(loss_tracker::encode_hello(
-            config.indices_raw_enabled,
-            config.supports_h264,
-        )));
+        core.outbox
+            .push_back(PollOutput::Stream(loss_tracker::encode_hello(
+                config.indices_raw_enabled,
+                config.supports_h264,
+            )));
 
         core
     }
