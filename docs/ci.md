@@ -144,3 +144,17 @@ gh api \
 disables the "require branches to be up to date" rule that would force a
 re-run of CI on every parallel merge — see the design spec for why we keep
 this off.)
+
+## Local pre-commit gate
+
+The repo ships a git pre-commit hook that refuses commits failing
+`cargo fmt --all -- --check` or `cargo clippy -p <changed crates> --all-targets -- -D warnings`
+(the same checks CI's `fmt`/`clippy` jobs run). Crates that don't build on
+your machine (e.g. `ghostframe-lib` without ffmpeg dev headers) are skipped
+with a warning and left to CI. Enable it once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+Bypass in an emergency with `git commit --no-verify` — CI will still block the PR.
