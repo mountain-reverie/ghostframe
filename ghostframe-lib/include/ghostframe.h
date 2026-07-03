@@ -11,46 +11,6 @@
 #define MAX_ESCALATION_PER_FRAME 512
 
 /**
- * Number of progressive passes emitted per Cdf53 tile.
- * = 1 sign-bit-plane + 13 magnitude bit-planes covering worst-case
- * 14-bit signed coefficients after 3 levels of CDF 5/3 lifting on
- * 8-bit input.
- */
-#define CDF53_PASS_COUNT 14
-
-/**
- * Per-tile coefficient count per channel: 1024 (32×32 tile).
- */
-#define CDF53_COEFFS_PER_CHANNEL 1024
-
-/**
- * Number of color channels encoded: BGR (alpha dropped, always 0xFF).
- */
-#define CDF53_CHANNELS 3
-
-/**
- * Total coefficients per tile = 3072.
- */
-#define CDF53_TOTAL_COEFFS (CDF53_CHANNELS * CDF53_COEFFS_PER_CHANNEL)
-
-/**
- * Maximum colors in a PalRLE palette. Tiles with more unique colors fall
- * through the classifier to Cdf53.
- */
-#define MAX_PALETTE_COUNT 16
-
-/**
- * Persistent palette table capacity.
- */
-#define PALETTE_TABLE_SLOTS 256
-
-#define TILE_SIZE 32
-
-#define BPP 4
-
-#define TILE_BYTES (uintptr_t)((TILE_SIZE * TILE_SIZE) * BPP)
-
-/**
  * Sentinel value for `TileMetrics::unique_colors` indicating the GPU compute
  * estimator has not run yet (M3.0 always uses this — backing lands in M3.3).
  * Classifier rules consulting `unique_colors` treat the sentinel as "unknown".
@@ -90,6 +50,76 @@
 #define IDLE_THRESHOLD 30
 
 /**
+ * Initial bitrate seed. Sized for a typical broadband first-paint
+ * burst (2 Mbps); the estimator will adapt within a few hundred ms.
+ */
+#define BweWrapper_INITIAL_BPS 2000000
+
+#define HELLO_MSG_TYPE 3
+
+#define HELLO_SIZE 2
+
+#define DECODE_ERROR_MSG_TYPE 4
+
+#define DECODE_ERROR_SIZE 5
+
+#define ERR_PAYLOAD_TOO_SHORT 1
+
+#define ERR_COUNT_OUT_OF_RANGE 2
+
+#define ERR_THIN_UNCACHED_PALETTE 3
+
+#define ERR_BUNDLED_TRUNCATED 4
+
+#define ERR_INDEX_OOB 5
+
+#define ERR_RLE_OVERSHOOT 6
+
+#define ERR_RLE_UNDERSHOOT 7
+
+/**
+ * Inline capacity for the coverage list per key.
+ * Sized for typical bundled-PalRle and single-pass-Cdf53 cases without
+ * heap allocation.
+ */
+#define COVERAGE_INLINE_CAPACITY 8
+
+/**
+ * Coverage map capacity. Sized to hold all in-flight passes for a full
+ * 1920×1080 Cdf53 emission cycle with headroom: 2040 tiles × 14 passes ×
+ * 2 frames of RTT ≈ 57,120 entries. Round up to 60,000.
+ *
+ * At 5,000 the map evicts entries faster than ACKs arrive, causing
+ * `ack_entry_miss` on more than half of all ACK datagrams and permanently
+ * blocking `tile_fully_acked` from returning true.
+ *
+ * TODO(m3.3e): make this a function of `(cols × rows × max_passes × rtt_frames)`
+ * instead of a fixed const; at 4K @ 60 fps the worst case grows ~8× further.
+ */
+#define FRAGMENT_COVERAGE_CAPACITY 60000
+
+/**
+ * Top-level feedback message type for input events. Routed by the first
+ * byte in `IoBridge::dispatch_feedback_bytes`. Sub-kind byte at offset 1
+ * selects the specific event (see `decode_input_msg`).
+ */
+#define INPUT_MSG_TYPE 5
+
+#define FEC_GROUP_SIZE_K 10
+
+#define FEC_PARITY_PER_GROUP_R 1
+
+#define PARITY_INTERLEAVE_OFFSET (uint32_t)(2 * FEC_GROUP_SIZE_K)
+
+#define END_OF_STREAM_PARITY_FLUSH_MS 5
+
+#define BASE_RTO_MS 50
+
+#define RTO_BACKOFF_FACTOR 2
+
+#define CACHE_CAPACITY 32768
+
+/**
  * ACK envelope wire-format version. Bumped 0x03 → 0x04 in 2026-06-27
  * to add a 2-byte per-entry receiver-arrival-time field (low 16 bits
  * of wall-clock milliseconds) used by the server's bandwidth-estimator
@@ -121,32 +151,38 @@
 #define ACK_ENTRY_SIZE 9
 
 /**
- * Initial bitrate seed. Sized for a typical broadband first-paint
- * burst (2 Mbps); the estimator will adapt within a few hundred ms.
+ * Number of progressive passes emitted per Cdf53 tile.
+ * = 1 sign-bit-plane + 13 magnitude bit-planes covering worst-case
+ * 14-bit signed coefficients after 3 levels of CDF 5/3 lifting on
+ * 8-bit input.
  */
-#define BweWrapper_INITIAL_BPS 2000000
+#define CDF53_PASS_COUNT 14
 
-#define HELLO_MSG_TYPE 3
+/**
+ * Per-tile coefficient count per channel: 1024 (32×32 tile).
+ */
+#define CDF53_COEFFS_PER_CHANNEL 1024
 
-#define HELLO_SIZE 2
+/**
+ * Number of color channels encoded: BGR (alpha dropped, always 0xFF).
+ */
+#define CDF53_CHANNELS 3
 
-#define DECODE_ERROR_MSG_TYPE 4
+/**
+ * Total coefficients per tile = 3072.
+ */
+#define CDF53_TOTAL_COEFFS (CDF53_CHANNELS * CDF53_COEFFS_PER_CHANNEL)
 
-#define DECODE_ERROR_SIZE 5
+/**
+ * Maximum colors in a PalRLE palette. Tiles with more unique colors fall
+ * through the classifier to Cdf53.
+ */
+#define MAX_PALETTE_COUNT 16
 
-#define ERR_PAYLOAD_TOO_SHORT 1
-
-#define ERR_COUNT_OUT_OF_RANGE 2
-
-#define ERR_THIN_UNCACHED_PALETTE 3
-
-#define ERR_BUNDLED_TRUNCATED 4
-
-#define ERR_INDEX_OOB 5
-
-#define ERR_RLE_OVERSHOOT 6
-
-#define ERR_RLE_UNDERSHOOT 7
+/**
+ * Persistent palette table capacity.
+ */
+#define PALETTE_TABLE_SLOTS 256
 
 /**
  * Size of the parity packet header in bytes:
@@ -158,34 +194,6 @@
 #define FEEDBACK_MSG_TYPE 1
 
 #define FEEDBACK_SIZE 22
-
-/**
- * Inline capacity for the coverage list per key.
- * Sized for typical bundled-PalRle and single-pass-Cdf53 cases without
- * heap allocation.
- */
-#define COVERAGE_INLINE_CAPACITY 8
-
-/**
- * Coverage map capacity. Sized to hold all in-flight passes for a full
- * 1920×1080 Cdf53 emission cycle with headroom: 2040 tiles × 14 passes ×
- * 2 frames of RTT ≈ 57,120 entries. Round up to 60,000.
- *
- * At 5,000 the map evicts entries faster than ACKs arrive, causing
- * `ack_entry_miss` on more than half of all ACK datagrams and permanently
- * blocking `tile_fully_acked` from returning true.
- *
- * TODO(m3.3e): make this a function of `(cols × rows × max_passes × rtt_frames)`
- * instead of a fixed const; at 4K @ 60 fps the worst case grows ~8× further.
- */
-#define FRAGMENT_COVERAGE_CAPACITY 60000
-
-/**
- * Top-level feedback message type for input events. Routed by the first
- * byte in `IoBridge::dispatch_feedback_bytes`. Sub-kind byte at offset 1
- * selects the specific event (see `decode_input_msg`).
- */
-#define INPUT_MSG_TYPE 5
 
 #define DATAGRAM_HEADER_SIZE 16
 
@@ -249,19 +257,11 @@
  */
 #define TILE_NACK_MAX_ENTRIES 64
 
-#define FEC_GROUP_SIZE_K 10
+#define TILE_SIZE 32
 
-#define FEC_PARITY_PER_GROUP_R 1
+#define BPP 4
 
-#define PARITY_INTERLEAVE_OFFSET (uint32_t)(2 * FEC_GROUP_SIZE_K)
-
-#define END_OF_STREAM_PARITY_FLUSH_MS 5
-
-#define BASE_RTO_MS 50
-
-#define RTO_BACKOFF_FACTOR 2
-
-#define CACHE_CAPACITY 32768
+#define TILE_BYTES (uintptr_t)((TILE_SIZE * TILE_SIZE) * BPP)
 
 /**
  * Bundles a `GhostframeServer` with the tokio `Runtime` that owns its
