@@ -1,0 +1,8 @@
+# cbindgen configuration for ghostframe.h generation (driven by build.rs).
+#
+# The wire-format constants (TILE_*, ACK_*, CDF53_*, …) moved into the
+# `ghostframe-protocol` crate; parse it too so those #defines stay in the
+# exported header exactly as before the extraction.
+[parse]
+parse_deps = true
+include = ["ghostframe-protocol"]
