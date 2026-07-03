@@ -33,6 +33,11 @@ COPY Cargo.toml Cargo.lock ./
 COPY ghostframe-lib/Cargo.toml ghostframe-lib/Cargo.toml
 COPY ghostframe-xdaemon/Cargo.toml ghostframe-xdaemon/Cargo.toml
 COPY ghostframe-test-pattern/Cargo.toml ghostframe-test-pattern/Cargo.toml
+# ghostframe-lib depends on ghostframe-protocol, so its full source is needed.
+COPY ghostframe-protocol/ ghostframe-protocol/
+# Workspace member not built here; Cargo.toml + src/ satisfy manifest resolution.
+COPY ghostframe-client-core/Cargo.toml ghostframe-client-core/Cargo.toml
+COPY ghostframe-client-core/src/ ghostframe-client-core/src/
 # Workspace members not built here but required for cargo to resolve the
 # workspace manifest.
 COPY ghostframe-e2e/Cargo.toml ghostframe-e2e/Cargo.toml
