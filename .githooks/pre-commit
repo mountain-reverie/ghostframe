@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Pre-commit gate: rustfmt + clippy must pass before anything is committed.
+# Enable once per clone:   git config core.hooksPath .githooks
+# Emergency bypass:        git commit --no-verify   (CI will still catch it)
+set -euo pipefail
+
+export PATH="$HOME/.cargo/bin:$PATH"
+
+if ! command -v cargo >/dev/null; then
+    echo "pre-commit: cargo not found; refusing to guess. Bypass with --no-verify." >&2
+    exit 1
+fi
+
+# --- rustfmt (fast, no compilation) -----------------------------------------
+if ! cargo fmt --all -- --check >/dev/null 2>&1; then
+    echo "pre-commit: rustfmt check failed. Run:  cargo fmt --all" >&2
+    cargo fmt --all -- --check 2>&1 | grep "^Diff in" | head -10 >&2 || true
+    exit 1
+fi
+
+# --- clippy on the crates whose files are staged ----------------------------
+# Scoped per-crate so machines that cannot build every workspace member
+# (e.g. missing ffmpeg dev headers for ghostframe-lib) can still commit
+# changes to the crates they CAN build. CI runs the full workspace sweep.
+mapfile -t crates < <(
+    git diff --cached --name-only --diff-filter=ACMR -- '*.rs' 'Cargo.toml' '*/Cargo.toml' \
+    | while read -r f; do
+        d=$(dirname "$f")
+        while [ "$d" != "." ] && [ ! -f "$d/Cargo.toml" ]; do d=$(dirname "$d"); done
+        [ -f "$d/Cargo.toml" ] && grep -m1 '^name' "$d/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/'
+    done | sort -u
+)
+
+for crate in "${crates[@]:-}"; do
+    [ -z "$crate" ] && continue
+    echo "pre-commit: clippy -p $crate" >&2
+    if ! cargo clippy -p "$crate" --all-targets -- -D warnings >/dev/null 2>&1; then
+        # Distinguish lint failures from crates this machine cannot build at
+        # all (e.g. ghostframe-lib without ffmpeg dev headers): if plain
+        # `cargo check` also fails, it is an environment problem — defer the
+        # lint gate to CI instead of blocking unrelated commits.
+        if cargo check -p "$crate" --all-targets >/dev/null 2>&1; then
+            echo "pre-commit: clippy failed for $crate. Run:" >&2
+            echo "  cargo clippy -p $crate --all-targets -- -D warnings" >&2
+            exit 1
+        else
+            echo "pre-commit: $crate does not build on this machine (environment); leaving its clippy check to CI." >&2
+        fi
+    fi
+done
+
+exit 0

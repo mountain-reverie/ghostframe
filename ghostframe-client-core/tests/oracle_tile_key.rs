@@ -45,7 +45,8 @@ fn keys_with_same_coords_but_different_frame_seq_stay_distinct() {
 fn two_passes_for_same_tile_in_same_frame_seq_own_separate_buckets() {
     // Models the cross-pass collision regression: pass 0 and pass 1 of
     // the same tile both have multi-fragment payloads and interleave.
-    let mut map: HashMap<TileKey, (Vec<Option<Vec<u8>>>, usize)> = HashMap::new();
+    type Bucket = (Vec<Option<Vec<u8>>>, usize);
+    let mut map: HashMap<TileKey, Bucket> = HashMap::new();
     let frame_seq = 0x1234;
     let (tx, ty) = (10u8, 30u8);
 

@@ -31,7 +31,9 @@ impl LossTracker {
     /// `suspension_detected` if the gap since the previous datagram exceeds
     /// 100 ms.
     pub fn on_datagram(&mut self, now_us: u64) {
-        if self.last_datagram_us > 0 && now_us.saturating_sub(self.last_datagram_us) > SUSPENSION_GAP_US {
+        if self.last_datagram_us > 0
+            && now_us.saturating_sub(self.last_datagram_us) > SUSPENSION_GAP_US
+        {
             self.suspension = true;
         }
         self.last_datagram_us = now_us;
