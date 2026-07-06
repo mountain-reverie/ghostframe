@@ -11,7 +11,7 @@
   },
   "dependencies": {},
   "devDependencies": {
-    "@webgpu/types": "^0.1.40",
+    "@webgpu/types": "^0.1.71",
     "typescript": "^5.5",
     "vite": "^6.0",
     "vitest": "^2.0"
