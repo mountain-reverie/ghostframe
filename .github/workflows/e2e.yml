@@ -18,12 +18,12 @@ jobs:
     name: loopback-h3
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/workflows/_setup-system-deps
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: '1.25'
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: '20'
           cache: npm
@@ -43,12 +43,12 @@ jobs:
     name: harness-smoke
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/workflows/_setup-system-deps
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: '1.25'
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: '20'
           cache: npm
@@ -69,7 +69,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The in-container cargo build of ghostframe-xdaemon + e2e deps
       # produces ~5 GB of release artefacts. With the runner's default
@@ -91,7 +91,7 @@ jobs:
         with:
           e2e-runtime: 'true'
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: '1.25'
 
@@ -101,14 +101,14 @@ jobs:
         with:
           shared-key: e2e
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: '20'
           cache: npm
           cache-dependency-path: ghostframe-web-client/package-lock.json
 
       - name: Download web-client dist from ci.yml
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: web-client-dist
           path: ghostframe-web-client/dist/
@@ -126,7 +126,7 @@ jobs:
           npm ci
           npm run build
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - name: Build host-side release binaries (for containers-build)
         run: |
@@ -135,7 +135,7 @@ jobs:
             -p ghostframe-test-pattern
 
       - name: Build test-headscale image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: tests/containers/headscale/
           file: tests/containers/headscale/Dockerfile
@@ -145,7 +145,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=test-headscale
 
       - name: Build test-server image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: tests/containers/test-server/Dockerfile
@@ -265,7 +265,7 @@ jobs:
 
       - name: Upload diagnostic artifacts on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-failure-logs
           path: |
