@@ -1,6 +1,6 @@
 FROM busybox:latest AS busybox
 
-FROM headscale/headscale:0.28.0
+FROM headscale/headscale:v0.29.2
 
 # Copy busybox shell so we can run the entrypoint script.
 COPY --from=busybox /bin/sh /bin/sh
