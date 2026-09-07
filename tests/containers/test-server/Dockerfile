@@ -29,7 +29,9 @@ RUN cargo install cbindgen
 
 WORKDIR /build
 # Copy workspace files for dependency caching
-COPY Cargo.toml Cargo.lock ./
+# rust-toolchain.toml pins the compiler; copy it before any cargo invocation
+# so the image builds with the same rustc as CI and local dev.
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY ghostframe-lib/Cargo.toml ghostframe-lib/Cargo.toml
 COPY ghostframe-xdaemon/Cargo.toml ghostframe-xdaemon/Cargo.toml
 COPY ghostframe-test-pattern/Cargo.toml ghostframe-test-pattern/Cargo.toml
