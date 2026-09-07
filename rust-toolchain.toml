@@ -1,0 +1,19 @@
+# Pinned toolchain — CI and local dev must run the same rustc and clippy.
+#
+# The workflows use `dtolnay/rust-toolchain@stable`, which floats: a new stable
+# release can fail `cargo clippy -- -D warnings` on code nobody touched. That
+# is what happened on 2026-09-07 — stable moved 1.96.1 -> 1.98.1 and the new
+# `clippy::chunks_exact_to_as_chunks` lint errored on ~45 pre-existing
+# `chunks_exact(N)` call sites across the workspace.
+#
+# 1.96.1 is the last version the workspace was verified green on (PR #29,
+# 2026-07-03). rustup honours this file over the toolchain the workflows
+# install, so it pins CI, the test-server container, and local builds alike.
+#
+# Bumping is a deliberate PR: raise the channel, run
+# `cargo clippy --workspace --all-targets -- -D warnings`, fix what the new
+# stable's lints report.
+[toolchain]
+channel = "1.96.1"
+components = ["clippy", "rustfmt"]
+targets = ["wasm32-unknown-unknown"]

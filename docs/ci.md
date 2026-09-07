@@ -145,6 +145,27 @@ disables the "require branches to be up to date" rule that would force a
 re-run of CI on every parallel merge — see the design spec for why we keep
 this off.)
 
+## Toolchain
+
+The compiler is pinned in [`rust-toolchain.toml`](../rust-toolchain.toml)
+(currently **1.96.1**). rustup honours that file over whatever
+`dtolnay/rust-toolchain@stable` installs, so CI, the test-server container,
+and your local checkout all build and lint with the same rustc.
+
+This exists because `clippy -- -D warnings` on a floating stable turns every
+new lint into a build failure on code nobody touched: on 2026-09-07 stable
+moved 1.96.1 → 1.98.1 and `clippy::chunks_exact_to_as_chunks` errored on ~45
+pre-existing `chunks_exact(N)` call sites across the workspace.
+
+Bumping is its own PR, never a drive-by:
+
+```bash
+# edit rust-toolchain.toml, then
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+and fix whatever the new stable reports.
+
 ## Local pre-commit gate
 
 The repo ships a git pre-commit hook that refuses commits failing
