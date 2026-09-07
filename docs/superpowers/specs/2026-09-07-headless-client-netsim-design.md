@@ -60,7 +60,7 @@ embedders, present and future:
 |---|---|---|
 | D1 | Impair at the ghostbridge socketpair boundary, not at a UDP socket | That is exactly where tsnet sits in production, so the harness substitutes for the network without the server knowing. Honours the tsnet constraint. |
 | D2 | Virtual time via `tokio::time::pause()` | Repeatable BWE experiments and millisecond-fast scenes, without restructuring `IoBridge`'s 6,244-line event loop. |
-| D3 | Inject pre-encoded tiles; no CPU classification | `process_frame_cpu` emits every tile as `Codec::Raw` and never exercises the wavelet path, so a GPU-less run of the real classify path is not possible today. Injection covers the transport layer — which is what BWE needs — with an honest boundary. |
+| D3 | Inject pre-encoded `TileWork` at `Scheduler::enqueue`; no CPU classification | `process_frame_cpu` emits every tile as `Codec::Raw` and never exercises the wavelet path, so a GPU-less run of the real classify path is not possible today. Injecting below classification covers the transport layer — which is what BWE needs — with an honest boundary. |
 | D4 | Browser e2e tier is retained, not replaced | Two independent client implementations (TypeScript and Rust) exercising the same server is additional path validation. The browserless suite is additive coverage. |
 | D5 | `ghostframe-client-net` is a real crate, not test code | A tsnet-backed native client later swaps the byte pump and reuses everything else. |
 
@@ -68,7 +68,7 @@ embedders, present and future:
 
 ```
    scene script
-        │  mpsc::Sender<FrameSubmission>
+        │  pre-encoded TileWork, injected at Scheduler::enqueue
         ▼
  ┌──────────────────────────┐                    ┌────────────────────────┐
  │  IoBridge (real)         │   UnixStream::pair │ ghostframe-client-net  │
@@ -90,11 +90,16 @@ and delivers it to the other.
 Sans-IO QUIC + WebTransport client session wrapping `ClientCore`:
 
 ```rust
-handle_udp(&[u8], from: SocketAddr, now_us: u64) -> Vec<Event>
-poll_transmit() -> Option<(Vec<u8>, SocketAddr)>
+handle_udp(&[u8], from: SocketAddr, now_us: u64)
+poll_transmit() -> Option<UdpOut>
 poll_timeout() -> Option<u64>
 on_timeout(now_us)
+take_events() -> Vec<ClientNetEvent>
 ```
+
+Events accumulate rather than being returned from `handle_udp`, so a caller
+cannot miss the ones a fired timer produces; `take_events` is the single drain
+point.
 
 Owns: the quinn-proto client endpoint and connection, the HTTP/3 SETTINGS +
 `CONNECT` WebTransport handshake (`web-transport-proto`), datagram and
@@ -136,10 +141,10 @@ logs it; a failure replays exactly.
 
 ### `ghostframe-e2e/src/harness/browserless.rs`
 
-Scene driver: builds the pair, spawns `IoBridge` on the paused runtime, feeds
-`FrameSubmission`s through the existing `mpsc` channel, pumps the netsim, drives
-`ghostframe-client-net`, and collects the client framebuffer, event stream, and
-server telemetry.
+Scene driver: builds the pair, spawns `IoBridge` on the paused runtime, sends
+each frame's pre-encoded `TileWork` batch down the injection channel, pumps the
+netsim, drives `ghostframe-client-net`, and collects the client framebuffer,
+event stream, and server telemetry.
 
 ## Clock model
 
@@ -170,10 +175,16 @@ BrowserlessScene {
 ```
 
 `FrameScript` tiles are encoded up front with `ghostframe-protocol`'s CPU
-`solid` / `pal_rle` / `cdf53` codecs and submitted through the real frame path,
-so the scheduler, reliable emitter, FEC, pacer, and ACK/NACK machinery all run
-unmodified. Palette-table state for PalRLE scenes is supplied by the scene
-script, since the GPU path normally owns it.
+`solid` / `pal_rle` / `cdf53` codecs into `TileWork` items and injected at
+`Scheduler::enqueue` through a feature-gated channel on `IoBridge`. They cannot
+travel through `FrameSubmission`: that path carries raw BGRA and, without a GPU,
+re-encodes everything as `Codec::Raw`. Injecting at the scheduler means the
+reliable emitter, FEC, pacer, fragmentation, and ACK/NACK machinery all run
+unmodified — only capture and classification are bypassed.
+
+Injected PalRLE tiles use **bundled** payloads, carrying their palette inline,
+so no server-side palette-table state is required. Thin (cached-palette) PalRLE
+injection is deferred.
 
 ## Assertion classes
 
