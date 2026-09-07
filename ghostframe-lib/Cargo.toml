@@ -16,6 +16,9 @@ m3 = []
 # Exposes the deterministic loss-injection module outside of cfg(test).
 # Used by E2E integration tests that live in a separate crate.
 test-loss-injection = []
+# Exposes the socketpair constructors and the tile-injection channel outside
+# of cfg(test), for the browserless e2e harness in ghostframe-e2e.
+browserless-harness = []
 # Cdf53 GPU-vs-CPU diagnostic instrumentation: GHOSTFRAME_CDF53_DIFF_TILE
 # one-shot diff log on the io_bridge encode path, GHOSTFRAME_CDF53_SKIP_L2_L3
 # / GHOSTFRAME_CDF53_SKIP_L3 env-var gates on the GPU forward pipeline, and

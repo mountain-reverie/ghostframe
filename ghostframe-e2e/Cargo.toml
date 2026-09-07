@@ -14,7 +14,7 @@ path = "src/lib.rs"
 [dependencies]
 # Use ghostframe-lib with `test-loss-injection` enabled so the harness's
 # GHOSTFRAME_OUTBOUND_LOSS_* / GHOSTFRAME_INBOUND_LOSS_* env vars take effect.
-ghostframe-lib = { path = "../ghostframe-lib", features = ["test-loss-injection"] }
+ghostframe-lib = { path = "../ghostframe-lib", features = ["test-loss-injection", "browserless-harness"] }
 # Harness library needs these at lib-build time (was dev-deps).
 testcontainers = "0.27"
 chromiumoxide = "0.9"
