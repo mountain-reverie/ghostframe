@@ -193,7 +193,7 @@ impl Scheduler {
         self.priority_queue.push_back(work);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "browserless-harness"))]
     pub fn peek_for_test(&self) -> Vec<TileWork> {
         self.priority_queue.iter().cloned().collect()
     }
