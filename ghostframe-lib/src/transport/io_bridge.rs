@@ -1494,18 +1494,22 @@ impl IoBridge {
                 }
             };
 
-            self.scheduler.enqueue(TileWork {
-                tile_x: tile_x as u8,
-                tile_y: tile_y as u8,
-                generation: gen,
-                pass_idx: 0,
-                total_passes: 1,
-                codec,
-                payload,
-                queued_at: now_std(),
-                last_sent_at: None,
-                state: WorkState::Pending,
-            });
+            let now = now_std();
+            self.scheduler.enqueue_at(
+                TileWork {
+                    tile_x: tile_x as u8,
+                    tile_y: tile_y as u8,
+                    generation: gen,
+                    pass_idx: 0,
+                    total_passes: 1,
+                    codec,
+                    payload,
+                    queued_at: now,
+                    last_sent_at: None,
+                    state: WorkState::Pending,
+                },
+                now,
+            );
         }
 
         // ---- A + B-light: feedback-modulated rate pacing ----
@@ -1627,11 +1631,11 @@ impl IoBridge {
         max_frag: usize,
         budget_bytes: usize,
     ) -> (FrameSendStats, usize, usize) {
-        let drained = self.scheduler.tick(budget_bytes);
+        let now = now_std();
+        let drained = self.scheduler.tick_at(budget_bytes, now);
         let drained_count = drained.len();
         let mut stats = FrameSendStats::default();
         let mut total_wire_bytes_sent: usize = 0;
-        let now = now_std();
         // Build per-fragment (EmitKey, Bytes) items for the reliable
         // emitter. The emitter stamps wire_seq into bytes[8..12], caches
         // for retransmit, schedules RTO, and queues parity per FEC group.
@@ -1845,7 +1849,7 @@ impl IoBridge {
                 first_out_of_grid.get_or_insert((work.tile_x, work.tile_y));
                 continue;
             }
-            self.scheduler.enqueue(work);
+            self.scheduler.enqueue_at(work, now_std());
             enqueued_count += 1;
         }
         if let Some((tile_x, tile_y)) = first_out_of_grid {
@@ -3491,8 +3495,13 @@ impl IoBridge {
                                     "cdf53.emit"
                                 );
                             }
-                            self.scheduler
-                                .enqueue_refinement(tile_x, tile_y, gen, passes);
+                            self.scheduler.enqueue_refinement_at(
+                                tile_x,
+                                tile_y,
+                                gen,
+                                passes,
+                                now_std(),
+                            );
                             // Override the CPU classifier's codec_state so that
                             // dispatch_dirty_tiles_via_scheduler's pre-check can
                             // correctly identify this tile as Cdf53 and skip the
@@ -3618,12 +3627,13 @@ impl IoBridge {
                             // Use the index-preserving variant so the
                             // scheduler enqueues the correct pass_idx
                             // for each retained payload (not 0..N).
-                            self.scheduler.enqueue_refinement_subset(
+                            self.scheduler.enqueue_refinement_subset_at(
                                 tile_x,
                                 tile_y,
                                 gen,
                                 unacked,
                                 only_unacked,
+                                now_std(),
                             );
                             continue;
                         }
@@ -3654,8 +3664,13 @@ impl IoBridge {
                                 "cdf53.emit"
                             );
                         }
-                        self.scheduler
-                            .enqueue_refinement(tile_x, tile_y, gen, passes);
+                        self.scheduler.enqueue_refinement_at(
+                            tile_x,
+                            tile_y,
+                            gen,
+                            passes,
+                            now_std(),
+                        );
 
                         let tm = self.metrics_tracker.get_mut(tile_x as u32, tile_y as u32);
                         tm.codec_state = crate::tile::CodecState::Cdf53 {
