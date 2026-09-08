@@ -361,6 +361,97 @@ git add -A && git commit -m "feat(io_bridge): tile-injection channel feeding the
 
 ---
 
+### Task 3a: `Scheduler` takes the caller's clock
+
+Found during Task 2's review. `Scheduler::tick(budget_bytes)` (`scheduler.rs:510`)
+takes no `now` and reads `Instant::now()` internally at `scheduler.rs:190`
+(`enqueue`, which also overwrites the `queued_at` the caller just set), `:547`
+(`drain_priority_queue`), `:601` (`drain_refinement_pass_major`), and `:720`
+(`enqueue_refinement_subset`).
+
+Under a paused clock that leaves the retry gate at `scheduler.rs:556-559`
+(`now.duration_since(last_sent_at) >= 2 * rtt`) wall-frozen, so **the
+retransmit layer never fires in a virtual scenario**. Task 16's convergence
+and no-starvation scenes would silently assert against a scheduler that never
+retries — passing or failing for reasons unrelated to what they claim to test.
+
+**Files:** Modify `ghostframe-lib/src/transport/scheduler.rs` (signature + 4
+internal reads), `ghostframe-lib/src/transport/io_bridge.rs` (call sites).
+
+- [ ] **Step 1: Write the failing test** in `scheduler.rs`'s `mod tests`:
+
+```rust
+#[test]
+fn inflight_work_becomes_retryable_after_two_rtts_of_injected_time() {
+    let mut s = Scheduler::new(4, 4);
+    s.set_rtt(Duration::from_millis(50));
+    let t0 = Instant::now();
+    s.enqueue_at(TileWork { /* ... Pending, tile (0,0) ... */ }, t0);
+    // Drain once so the item goes InFlight.
+    let _ = s.tick_at(usize::MAX, t0);
+    assert!(s.tick_at(usize::MAX, t0).is_empty(), "must not retry immediately");
+    // 2 x RTT later it is eligible again, with no wall-clock time having passed.
+    let later = t0 + Duration::from_millis(100);
+    assert!(!s.tick_at(usize::MAX, later).is_empty(), "must retry after 2xRTT");
+}
+```
+
+Adjust the constructor calls to the real `TileWork` shape (all fields are
+public; see `scheduler.rs:37-48`).
+
+- [ ] **Step 2: Run to verify it fails** — `cargo test -p ghostframe-lib --lib inflight_work_becomes_retryable` → FAIL, `tick_at`/`enqueue_at` not found.
+
+- [ ] **Step 3: Thread the clock through.** Add `now: Instant` parameters —
+`tick_at(&mut self, budget_bytes: usize, now: Instant)` and
+`enqueue_at(&mut self, work: TileWork, now: Instant)` — and have the four
+internal `Instant::now()` reads use the passed value. Keep `tick`/`enqueue` as
+thin wrappers that pass `Instant::now()` so non-harness callers are unchanged,
+or update all callers and delete them; state which you chose and why.
+`io_bridge.rs` call sites pass `now_std()`.
+
+- [ ] **Step 4: Run** — the new test passes; `cargo test -p ghostframe-lib --lib` unchanged otherwise.
+
+- [ ] **Step 5: Commit** — `git commit -m "refactor(scheduler): accept the caller's clock so retries work under virtual time"`
+
+---
+
+### Task 3b: emitter OWD stamps follow the injected clock
+
+`ReliableTileEmitter::wall_clock_emit_us()` (`reliable_emitter/emitter.rs:296`)
+reads `SystemTime::now()` and re-stamps on every retransmit (`emitter.rs:201`).
+Those stamps become `server_emit_ms_lo16` in the datagram header; the client
+echoes an arrival stamp, and `io_bridge.rs:1755` computes
+`owd_ms_lo16 = arrival_lo16.wrapping_sub(emit_lo16)`.
+
+In the harness the client's arrival stamp is virtual, so that subtraction mixes
+a virtual millisecond with a wall one. Task 2 made the BWE *window* virtual but
+left its *inputs* wall. Also seed `BweWrapper::new`'s `window.start`
+(`bwe.rs:123`) from the injected clock rather than `Instant::now()`.
+
+**Blocks:** every OWD- or goodput-based assertion, i.e. assertion class 3 in
+Task 16. Do this before writing those scenes, not after they produce numbers
+nobody can interpret.
+
+**Files:** Modify `ghostframe-lib/src/transport/reliable_emitter/emitter.rs`,
+`ghostframe-lib/src/transport/bwe.rs`, callers in `io_bridge.rs`.
+
+- [ ] **Step 1: Write the failing test** — under `#[tokio::test(start_paused = true)]`,
+submit a tile pass, `tokio::time::advance(Duration::from_millis(250))`, submit
+another, and assert the two emit stamps differ by ~250 ms. With `SystemTime::now()`
+they differ by microseconds.
+
+- [ ] **Step 2: Run to verify it fails.**
+
+- [ ] **Step 3:** Take the emit stamp from the `now` already passed to
+`submit_one`/`submit_batch`/`drain` rather than reading the system clock, and
+seed the BWE window from the caller's clock.
+
+- [ ] **Step 4: Run** — new test passes, `cargo test -p ghostframe-lib --lib` otherwise unchanged.
+
+- [ ] **Step 5: Commit** — `git commit -m "fix(emitter): stamp OWD samples from the injected clock"`
+
+---
+
 # Phase B — `ghostframe-client-net`
 
 ### Task 4: Crate skeleton and public types

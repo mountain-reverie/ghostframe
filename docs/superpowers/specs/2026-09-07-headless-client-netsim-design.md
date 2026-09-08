@@ -155,10 +155,17 @@ goes idle, so scenes cost their event count, not their duration.
 `IoBridge` already sleeps on `sleep_until(TokioInstant::from_std(deadline))`,
 but computes deadlines from `std::time::Instant::now()` in 15 places. Those
 calls convert to `tokio::time::Instant::now()` so the server reads the same
-virtual clock; `from_std` conversions go away with them. Nothing below
-`IoBridge` needs changing — `ReliableTileEmitter::{submit_one, submit_batch,
-tick, drain}`, the scheduler, and the BWE all already take `now` as a
-parameter.
+virtual clock; `from_std` conversions go away with them.
+
+`ReliableTileEmitter::{submit_one, submit_batch, tick, drain}` and the BWE
+already take `now` as a parameter, so they follow automatically. Three other
+time sources do **not**, and each is its own task (3a-3c below): the
+`Scheduler` reads `Instant::now()` internally, the `Classifier`'s hysteresis
+dwell reads a wall-clock epoch, and the emitter stamps outbound OWD samples
+with `SystemTime::now()`. Until those are converted the harness runs on a
+hybrid clock, which is worse than an honestly wall-clock one: the retransmit
+gate never fires, and mode-switch dwell becomes a function of host CPU
+speed.
 
 Netsim delivery delays are scheduled as tokio timers, so auto-advance jumps
 directly to them.
