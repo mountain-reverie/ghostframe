@@ -689,10 +689,17 @@ impl Classifier {
     /// Apply per-tile rules across all dirty tiles, then decide whole-frame
     /// mode based on cost + sustained-motion fast-path with hysteresis.
     ///
-    /// This is a thin wrapper around [`decide_frame_mode_at`] that reads the
-    /// current monotonic time. Production code should call this method. Tests
-    /// that need deterministic timing should call `decide_frame_mode_at`
-    /// directly with an explicit `now_us`.
+    /// This is a thin wrapper around [`decide_frame_mode_at`] that reads
+    /// `self.epoch`'s wall-clock elapsed time. `IoBridge` (the only
+    /// production caller as of the browserless-harness work) calls
+    /// `decide_frame_mode_at` directly with a `now_us` derived from its own
+    /// `now_std()` epoch instead, so that frame-mode hysteresis tracks
+    /// tokio's (possibly paused) clock rather than this struct's own
+    /// `Instant::now()`-seeded one. This wrapper is kept only for callers
+    /// that don't care about deterministic/virtual timing (currently just
+    /// unit tests in this file and `classifier_decide_tests.rs`) — anything
+    /// that needs to run under `tokio::time::pause()` must call
+    /// `decide_frame_mode_at` directly with an explicit `now_us`.
     pub fn decide_frame_mode(
         &mut self,
         tentative_states: &[CodecState],
@@ -701,6 +708,16 @@ impl Classifier {
         // Monotonic source — `SystemTime` would skew under NTP and freeze
         // hysteresis during the skew window. `Instant::elapsed` is
         // guaranteed non-decreasing on every supported platform.
+        //
+        // Deliberately wall-clock, not virtual: this wrapper exists for
+        // callers that never run under `tokio::time::pause()` (see doc
+        // comment above), so reading `self.epoch`'s real elapsed time here
+        // is correct and intentional, not the bug `clippy::disallowed_methods`
+        // usually catches in this codebase.
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "decide_frame_mode() is the non-harness wrapper by design (see doc comment) -- its callers never run under tokio::time::pause(), so self.epoch here is always a real wall-clock Instant and .elapsed() is safe"
+        )]
         let now_us = self.epoch.elapsed().as_micros() as u64;
         self.decide_frame_mode_at(now_us, tentative_states, prev_mode)
     }

@@ -1,0 +1,7 @@
+# Workspace-wide clippy configuration. See CI: .github/workflows/ci.yml
+# runs `cargo clippy --workspace --all-targets -- -D warnings`, so anything
+# listed here is a hard build failure, not just a local nag.
+
+disallowed-methods = [
+    { path = "std::time::Instant::elapsed", reason = "Instant::elapsed() reads the REAL wall clock internally, even when called on an Instant that was produced from tokio's (possibly paused/virtual) clock via now_std(). Against a virtual-clock-derived Instant this silently saturates to 0ns forever instead of erroring, which is exactly the shape of two defects already found in ghostframe-lib/src/transport/io_bridge.rs. Compute durations with `a.duration_since(b)` / `a.saturating_duration_since(b)` against a same-clock reference instead. Sites that deliberately measure real CPU/wall-clock cost (and are not exposed to tokio::time::pause()) may silence this with `#[allow(clippy::disallowed_methods, reason = \"...\")]` and a justification specific to that call site." },
+]
