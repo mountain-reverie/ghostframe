@@ -613,6 +613,11 @@ pub struct IoBridge {
     /// Wall-clock instant of the previous periodic-log tick. None until
     /// the first log fires.
     bwe_log_last_at: Option<std::time::Instant>,
+    /// Diagnostic logging / one-shot dump toggles, parsed once at
+    /// construction from the `LibConfig` the caller supplied. Ungated in
+    /// every build — see `DiagnosticsConfig::from_lookup`'s doc comment for
+    /// why these are live production toggles rather than test-only knobs.
+    diagnostics: crate::config::DiagnosticsConfig,
 }
 
 /// One-way-delay sample observed at ACK time. Used as input to the
@@ -733,9 +738,18 @@ pub(crate) struct PalRleTileWorkPrep {
 impl IoBridge {
     /// Create a new `IoBridge` by connecting to ghostbridge and opening a UDP
     /// listener on `listen_addr` (e.g. `":443"`).
+    ///
+    /// `lib_config` supplies every `GHOSTFRAME_*`-derived setting the bridge
+    /// needs (transport fault-injection/pacing/FEC knobs, diagnostics
+    /// toggles); the caller is expected to build it once via
+    /// `crate::config::LibConfig::from_env()` at the executable boundary.
+    /// Taken by value (not `&LibConfig`) because `TransportConfig` carries
+    /// `LossInjector`s that must never be cloned — see `TransportConfig`'s
+    /// doc comment.
     pub async fn new(
         ghostbridge_config: &GhostbridgeConfig,
         listen_addr: &str,
+        lib_config: crate::config::LibConfig,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let handle = GhostbridgeHandle::connect(ghostbridge_config)?;
         handle.up()?;
@@ -784,13 +798,6 @@ impl IoBridge {
         // doesn't pay thread-spin-up latency on the hot path (design Section 4).
         rayon::iter::IntoParallelIterator::into_par_iter(0..1u32).for_each(|_| {});
 
-        // `TransportConfig::from_env()` reads `GHOSTFRAME_*` directly.
-        // `IoBridge` hasn't been rewired onto `LibConfig` yet (that's a
-        // separate follow-up task) — this is a thin, temporary bridge onto
-        // the parsing now centralized in `crate::config`.
-        #[cfg(any(test, feature = "test-loss-injection"))]
-        let transport_config = crate::config::TransportConfig::from_env();
-
         let bridge = Self {
             _handle: Some(handle),
             stream,
@@ -809,35 +816,27 @@ impl IoBridge {
             frame_mode: crate::tile::FrameMode::TileCodec,
             scheduler: crate::transport::scheduler::Scheduler::new(0, 0),
             #[cfg(any(test, feature = "test-loss-injection"))]
-            outbound_loss: transport_config.outbound_loss,
+            outbound_loss: lib_config.transport.outbound_loss,
             #[cfg(any(test, feature = "test-loss-injection"))]
-            inbound_loss: transport_config.inbound_loss,
+            inbound_loss: lib_config.transport.inbound_loss,
             #[cfg(any(test, feature = "test-loss-injection"))]
-            outbound_bandwidth_cap: transport_config
+            outbound_bandwidth_cap: lib_config
+                .transport
                 .outbound_bandwidth_cap_bps
                 .map(crate::transport::bandwidth_cap::BandwidthCap::new),
             #[cfg(any(test, feature = "test-loss-injection"))]
-            test_force_bytes_per_us: transport_config.test_force_bytes_per_us,
+            test_force_bytes_per_us: lib_config.transport.test_force_bytes_per_us,
             #[cfg(any(test, feature = "test-loss-injection"))]
-            oob_inject_at: transport_config.oob_inject_at,
+            oob_inject_at: lib_config.transport.oob_inject_at,
             #[cfg(any(test, feature = "test-loss-injection"))]
-            skip_palette_session_reset: transport_config.skip_palette_session_reset,
+            skip_palette_session_reset: lib_config.transport.skip_palette_session_reset,
             force_dirty_frames: 0,
             palette_table: crate::encoder::pal_rle::PaletteTable::new(),
             client_caps: crate::transport::client_caps::ClientCapabilities::default(),
-            // Deliberately *not* routed through `transport_config` even though
-            // `TransportConfig::from_lookup` now also parses `GHOSTFRAME_FEC_K`
-            // (`crate::config::TransportConfig::fec_k`'s doc comment): unlike
-            // the fields above, this read has never been `#[cfg(any(test,
-            // feature = "test-loss-injection"))]`-gated here, so it stays a
-            // literal read to preserve that in every build, including a
-            // genuine production build with neither `cfg(test)` nor the
-            // `test-loss-injection` feature (where `TransportConfig::from_env`
-            // would otherwise silently return `Self::default()`).
-            fec_k: std::env::var("GHOSTFRAME_FEC_K")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(0),
+            // `fec_k` parses unconditionally in every build (see
+            // `TransportConfig::from_lookup`'s doc comment), so this reads
+            // straight from the config with no `#[cfg]` needed.
+            fec_k: lib_config.transport.fec_k.unwrap_or(0),
             fec_enable_threshold: FEC_ENABLE_THRESHOLD,
             fec_disable_threshold: FEC_DISABLE_THRESHOLD,
             adaptation_context: crate::tile::classifier::AdaptationContext::default(),
@@ -877,6 +876,7 @@ impl IoBridge {
             bytes_emitted_refinement: 0,
             bytes_emitted_snapshot: (0, 0),
             bwe_log_last_at: None,
+            diagnostics: lib_config.diagnostics,
         };
         Ok(bridge)
     }
@@ -889,8 +889,9 @@ impl IoBridge {
         ghostbridge_config: &GhostbridgeConfig,
         listen_addr: &str,
         frame_rx: mpsc::Receiver<FrameSubmission>,
+        lib_config: crate::config::LibConfig,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let mut bridge = Self::new(ghostbridge_config, listen_addr).await?;
+        let mut bridge = Self::new(ghostbridge_config, listen_addr, lib_config).await?;
         bridge.frame_rx = Some(frame_rx);
         Ok(bridge)
     }
@@ -2690,7 +2691,7 @@ impl IoBridge {
         // GPU pipeline diagnostic: one line per frame showing the state of
         // every output buffer FrameAnalysis exposes. Drives W1 root-cause
         // investigation when unique_colors stays at UNIQUE_COLORS_UNKNOWN.
-        if crate::config::DiagnosticsConfig::from_env().diagnose_gpu_pipeline {
+        if self.diagnostics.diagnose_gpu_pipeline {
             let ta_slice = analysis.tile_analysis_slice();
             let first_nonzero = ta_slice
                 .iter()
@@ -2818,7 +2819,7 @@ impl IoBridge {
 
         // Per-tile diagnostic tracing: emit one log line per dirty tile when
         // GHOSTFRAME_DIAGNOSE_TILES=1 (or =true).  Parseable by downstream awk.
-        if crate::config::DiagnosticsConfig::from_env().diagnose_tiles {
+        if self.diagnostics.diagnose_tiles {
             for &(tx, ty) in &dirty_xy {
                 let m = self.metrics_tracker.get(tx, ty);
                 tracing::info!(
@@ -3700,7 +3701,7 @@ impl IoBridge {
                     );
                     self.bump_count_accumulator = BumpCountAccumulator::default();
 
-                    if crate::config::DiagnosticsConfig::from_env().diagnose_color_hist {
+                    if self.diagnostics.diagnose_color_hist {
                         let h = self.color_histogram_accumulator;
                         tracing::info!(
                             frame_seq = seq,
@@ -4406,8 +4407,28 @@ impl IoBridge {
     /// `_handle` is `None` and no `gbridge_close` is called on Drop.
     /// Available under `cfg(test)` or the `browserless-harness` feature; never
     /// in a production build.
+    ///
+    /// Defaults to `LibConfig::default()` — every transport/diagnostics
+    /// knob production-inert — so existing call sites are unaffected. Tests
+    /// that need a specific config should call
+    /// `new_with_lib_config_for_test` instead.
     #[cfg(any(test, feature = "browserless-harness"))]
     pub fn new_with_stream_for_test(stream: TokioUnixStream, server: QuicServer) -> Self {
+        Self::new_with_lib_config_for_test(stream, server, crate::config::LibConfig::default())
+    }
+
+    /// Test-only constructor taking a full `LibConfig`, for tests that need
+    /// to set specific transport/diagnostics knobs without touching the
+    /// process environment. `new_with_stream_for_test` is this with
+    /// `LibConfig::default()`.
+    /// Available under `cfg(test)` or the `browserless-harness` feature; never
+    /// in a production build.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub fn new_with_lib_config_for_test(
+        stream: TokioUnixStream,
+        server: QuicServer,
+        lib_config: crate::config::LibConfig,
+    ) -> Self {
         // Warm rayon's global thread pool so the first PalRLE-heavy frame
         // doesn't pay thread-spin-up latency on the hot path (design Section 4).
         rayon::iter::IntoParallelIterator::into_par_iter(0..1u32).for_each(|_| {});
@@ -4430,21 +4451,24 @@ impl IoBridge {
             frame_mode: crate::tile::FrameMode::TileCodec,
             scheduler: crate::transport::scheduler::Scheduler::new(0, 0),
             #[cfg(any(test, feature = "test-loss-injection"))]
-            outbound_loss: None,
+            outbound_loss: lib_config.transport.outbound_loss,
             #[cfg(any(test, feature = "test-loss-injection"))]
-            inbound_loss: None,
+            inbound_loss: lib_config.transport.inbound_loss,
             #[cfg(any(test, feature = "test-loss-injection"))]
-            outbound_bandwidth_cap: None,
+            outbound_bandwidth_cap: lib_config
+                .transport
+                .outbound_bandwidth_cap_bps
+                .map(crate::transport::bandwidth_cap::BandwidthCap::new),
             #[cfg(any(test, feature = "test-loss-injection"))]
-            test_force_bytes_per_us: None,
+            test_force_bytes_per_us: lib_config.transport.test_force_bytes_per_us,
             #[cfg(any(test, feature = "test-loss-injection"))]
-            oob_inject_at: None,
+            oob_inject_at: lib_config.transport.oob_inject_at,
             #[cfg(any(test, feature = "test-loss-injection"))]
-            skip_palette_session_reset: false,
+            skip_palette_session_reset: lib_config.transport.skip_palette_session_reset,
             force_dirty_frames: 0,
             palette_table: crate::encoder::pal_rle::PaletteTable::new(),
             client_caps: crate::transport::client_caps::ClientCapabilities::default(),
-            fec_k: 0,
+            fec_k: lib_config.transport.fec_k.unwrap_or(0),
             fec_enable_threshold: FEC_ENABLE_THRESHOLD,
             fec_disable_threshold: FEC_DISABLE_THRESHOLD,
             adaptation_context: crate::tile::classifier::AdaptationContext::default(),
@@ -4484,6 +4508,7 @@ impl IoBridge {
             bytes_emitted_refinement: 0,
             bytes_emitted_snapshot: (0, 0),
             bwe_log_last_at: None,
+            diagnostics: lib_config.diagnostics,
         }
     }
 
@@ -4731,6 +4756,29 @@ mod tests {
         let (our_end, _peer) = UnixStream::pair().expect("UnixStream::pair failed");
         let server = QuicServer::new().expect("QuicServer::new failed");
         IoBridge::new_with_stream_for_test(our_end, server)
+    }
+
+    /// `IoBridge::new_with_lib_config_for_test` must take its transport
+    /// settings from the supplied `LibConfig`, not the process environment.
+    /// This is the whole point of threading config through the bridge:
+    /// process-global env reads at construction time were what made tests
+    /// race each other under parallel `cargo test` execution.
+    #[tokio::test]
+    async fn io_bridge_takes_injection_settings_from_config() {
+        let (ours, _peer) = tokio::net::UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("QuicServer::new");
+        let cfg = crate::config::LibConfig {
+            transport: crate::config::TransportConfig {
+                skip_palette_session_reset: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let bridge = IoBridge::new_with_lib_config_for_test(ours, server, cfg);
+        assert!(
+            bridge.skip_palette_session_reset,
+            "config value must reach the bridge without touching the environment"
+        );
     }
 
     #[tokio::test]
@@ -5265,12 +5313,12 @@ mod tests {
     async fn maybe_fire_session_reset_skips_first_connect_fires_on_reconnect() {
         // `fire_session_reset` reads `self.skip_palette_session_reset`, a
         // plain struct field set once at construction time (here,
-        // `new_with_stream_for_test` hardcodes it `false`) — not a live env
-        // read, so this test does not race
+        // `new_with_stream_for_test` defaults it via `LibConfig::default()`,
+        // i.e. `false`) — not a live env read, so this test does not race
         // `config::tests::transport_config_parses_skip_palette_session_reset`.
-        // Still under `lock_env()`: other tests in this module mutate env
-        // vars this suite's other tests read.
-        let _env = crate::test_env::lock_env();
+        // No `lock_env()` needed: nothing left in this module's test suite
+        // mutates process env (Task 4 moved every such test into
+        // `config.rs` alongside the `from_lookup` parsing it covers).
         use crate::transport::quic::QuicServer;
         use crate::transport::webtransport::WebTransportServer;
         use quinn_proto::ConnectionHandle;

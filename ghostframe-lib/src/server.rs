@@ -71,7 +71,18 @@ impl GhostframeServer {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let (frame_tx, frame_rx) = mpsc::channel::<FrameSubmission>(2);
 
-        let mut bridge = IoBridge::new_with_frames(&config, listen_addr, frame_rx).await?;
+        // `LibConfig::from_env()` is the executable boundary: `IoBridge`
+        // itself never reads the process environment. Wiring a caller-
+        // supplied `LibConfig` through `GhostframeServer::new`'s own
+        // signature (so `ffi.rs` / `xdaemon` control it) is a separate,
+        // larger follow-up — this keeps today's behavior identical.
+        let mut bridge = IoBridge::new_with_frames(
+            &config,
+            listen_addr,
+            frame_rx,
+            crate::config::LibConfig::from_env(),
+        )
+        .await?;
         bridge.input_injector = input_injector;
         let cert_hash = bridge.cert_hash_sha256().to_owned();
         let connected_session_count = bridge.connected_session_count_handle();
