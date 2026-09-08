@@ -2,6 +2,8 @@ pub mod capture;
 pub mod encoder;
 pub mod ffi;
 pub mod server;
+#[cfg(test)]
+mod test_env;
 pub mod tile;
 pub mod transport;
 

@@ -69,12 +69,14 @@ mod tests {
 
     #[test]
     fn from_env_returns_none_when_unset() {
+        let _env = crate::test_env::lock_env();
         std::env::remove_var("GHOSTFRAME_OUTBOUND_BANDWIDTH_CAP");
         assert!(BandwidthCap::from_env().is_none());
     }
 
     #[test]
     fn from_env_parses_value() {
+        let _env = crate::test_env::lock_env();
         std::env::set_var("GHOSTFRAME_OUTBOUND_BANDWIDTH_CAP", "1250000");
         let cap = BandwidthCap::from_env().expect("set");
         assert_eq!(cap.bytes_per_sec, 1_250_000);
