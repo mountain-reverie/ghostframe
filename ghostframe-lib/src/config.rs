@@ -134,37 +134,56 @@ impl TransportConfig {
     /// environment lookup; tests use a map so they never touch process-global
     /// state. Keeping the parsing here means the crate reads the process
     /// environment in exactly one place.
-    #[cfg(any(test, feature = "test-loss-injection"))]
+    ///
+    /// Unlike `ClassifierConfig::from_lookup`, this function itself is
+    /// **not** gated behind `cfg(any(test, feature = "test-loss-injection"))`:
+    /// `fec_k` (`GHOSTFRAME_FEC_K`) has never been gated at its former
+    /// `io_bridge` read site, so a genuine production build honours it
+    /// today. Gating the whole function the way `ClassifierConfig` does
+    /// would silently stop that. Instead, the `#[cfg]` sits on the
+    /// individual field initialisers below — the two `LossInjector` fields
+    /// (whose type only exists under the feature) and the four others that
+    /// were gated at their old `io_bridge` sites, mirroring the shape of
+    /// `IoBridge`'s own struct literal. `fec_k` is the only field that
+    /// parses unconditionally.
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
         Self {
+            #[cfg(any(test, feature = "test-loss-injection"))]
             outbound_loss: loss_injector_from_lookup("OUTBOUND", &get),
+            #[cfg(any(test, feature = "test-loss-injection"))]
             inbound_loss: loss_injector_from_lookup("INBOUND", &get),
+            #[cfg(any(test, feature = "test-loss-injection"))]
             outbound_bandwidth_cap_bps: get("GHOSTFRAME_OUTBOUND_BANDWIDTH_CAP")
                 .and_then(|s| s.parse::<u64>().ok())
                 .filter(|v| *v != 0),
+            #[cfg(not(any(test, feature = "test-loss-injection")))]
+            outbound_bandwidth_cap_bps: None,
+            #[cfg(any(test, feature = "test-loss-injection"))]
             oob_inject_at: oob_inject_at_from_lookup(&get),
+            #[cfg(not(any(test, feature = "test-loss-injection")))]
+            oob_inject_at: None,
+            #[cfg(any(test, feature = "test-loss-injection"))]
             skip_palette_session_reset: matches!(
                 get("GHOSTFRAME_SKIP_PALETTE_SESSION_RESET").as_deref(),
                 Some("1") | Some("true")
             ),
+            #[cfg(not(any(test, feature = "test-loss-injection")))]
+            skip_palette_session_reset: false,
+            #[cfg(any(test, feature = "test-loss-injection"))]
             test_force_bytes_per_us: get("GHOSTFRAME_TEST_FORCE_BYTES_PER_US")
                 .and_then(|s| s.parse::<f32>().ok())
                 .filter(|v| *v > 0.0),
+            #[cfg(not(any(test, feature = "test-loss-injection")))]
+            test_force_bytes_per_us: None,
             fec_k: get("GHOSTFRAME_FEC_K").and_then(|v| v.parse::<usize>().ok()),
         }
     }
 
-    /// Parse environment variables into a transport configuration.
-    #[cfg(any(test, feature = "test-loss-injection"))]
+    /// Parse environment variables into a transport configuration. Reads the
+    /// real environment in every build — see `from_lookup`'s doc comment for
+    /// why this (unlike `ClassifierConfig::from_env`) is not gated.
     pub fn from_env() -> Self {
         Self::from_lookup(|k| std::env::var(k).ok())
-    }
-
-    /// Production builds without `test-loss-injection` ignore the environment
-    /// entirely, exactly as today: the reads are not compiled.
-    #[cfg(not(any(test, feature = "test-loss-injection")))]
-    pub fn from_env() -> Self {
-        Self::default()
     }
 }
 
@@ -325,6 +344,20 @@ pub struct LibConfig {
     pub classifier: ClassifierConfig,
     pub transport: TransportConfig,
     pub diagnostics: DiagnosticsConfig,
+}
+
+impl LibConfig {
+    /// Parse all three sub-configs from the real environment. Intended for
+    /// use at the executable boundary only (e.g. `GhostframeServer::new`'s
+    /// callers) — everything downstream of that should take a `LibConfig`
+    /// by value rather than calling this again.
+    pub fn from_env() -> Self {
+        Self {
+            classifier: ClassifierConfig::from_env(),
+            transport: TransportConfig::from_env(),
+            diagnostics: DiagnosticsConfig::from_env(),
+        }
+    }
 }
 
 #[cfg(test)]
