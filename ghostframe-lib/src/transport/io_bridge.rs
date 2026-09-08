@@ -310,6 +310,22 @@ const FEC_DISABLE_THRESHOLD: f64 = 0.002;
 /// is 0.05^10 ≈ 9.7e-14.
 const FRAME_DIMENSIONS_RETRANSMITS: u8 = 10;
 
+/// One scene frame's worth of pre-encoded tile work, injected by the
+/// browserless harness in place of capture + classification.
+///
+/// Carries frame identity because enqueueing alone emits nothing: the arm
+/// must also call `drain_scheduler_into_quinn`, which tags outbound
+/// fragments with `seq` / `timestamp_us`.
+#[derive(Debug, Clone)]
+pub struct InjectedFrame {
+    pub seq: u32,
+    pub timestamp_us: u32,
+    /// Byte budget for this drain. `usize::MAX` means unpaced — in wave 1
+    /// the netsim's token bucket does the real capping.
+    pub budget_bytes: usize,
+    pub work: Vec<crate::transport::scheduler::TileWork>,
+}
+
 pub struct IoBridge {
     /// Keep the ghostbridge handle alive so the socketpair fd stays open.
     /// `None` only in the test-only constructor, which builds directly from a
@@ -345,6 +361,9 @@ pub struct IoBridge {
     has_seen_prior_session: bool,
     /// Inbound channel of captured frames to be fragmented and sent as datagrams.
     frame_rx: Option<mpsc::Receiver<FrameSubmission>>,
+    /// Pre-encoded tile work injected by the browserless harness, bypassing
+    /// capture and classification. `None` in production.
+    inject_rx: Option<mpsc::Receiver<InjectedFrame>>,
     /// Monotonically increasing frame sequence number (wrapping).
     frame_seq: u32,
     /// Per-tile dirty detection.
@@ -914,6 +933,7 @@ impl IoBridge {
             session_resets_fired: HashSet::new(),
             has_seen_prior_session: false,
             frame_rx: None,
+            inject_rx: None,
             frame_seq: 0,
             dirty_tracker: DirtyTracker::new(0, 0),
             metrics_tracker: crate::tile::MetricsTracker::new(0, 0),
@@ -1659,6 +1679,67 @@ impl IoBridge {
         let mut adapter = IoBridgeSenderAdapter { bridge: bridge_ptr };
         self.reliable_emitter.drain(&mut adapter, now);
         (stats, total_wire_bytes_sent, drained_count)
+    }
+
+    /// Enqueue an injected frame's tile work into the scheduler, then
+    /// attempt to drain it to the wire. Used by both the `run()` select
+    /// arm and the `drain_injection_for_test` test accessor, so the two
+    /// paths cannot drift apart.
+    ///
+    /// Enqueuing alone would leave the work sitting in the scheduler
+    /// forever: `drain_scheduler_into_quinn` is the only thing that turns
+    /// queued `TileWork` into datagrams (see its two production callers,
+    /// `dispatch_dirty_tiles_via_scheduler` and the `DatagramsUnblocked`
+    /// continuation). If there's no connected session yet,
+    /// `compute_max_datagram_size` returns `None` and the drain is
+    /// skipped — the work stays queued for the next opportunity.
+    fn apply_injected_frame(&mut self, inj: InjectedFrame) {
+        // The scheduler grid is normally sized by the real capture path
+        // (`dispatch_dirty_tiles_via_scheduler`, keyed off the frame's
+        // actual dimensions via `TileGrid`). Injected work bypasses that
+        // path entirely, so on a bridge that only ever receives injected
+        // frames the scheduler is still at its construction-time (0, 0)
+        // and `Scheduler::enqueue`'s bounds `debug_assert` would fire for
+        // any real tile coordinate. Grow the grid to fit the widest/
+        // tallest tile referenced by this batch before enqueuing.
+        // `Scheduler::resize` clears the queue, so this only runs when
+        // the current grid is too small — not on every injected frame.
+        let needed_cols = inj
+            .work
+            .iter()
+            .map(|w| w.tile_x as u32 + 1)
+            .max()
+            .unwrap_or(0);
+        let needed_rows = inj
+            .work
+            .iter()
+            .map(|w| w.tile_y as u32 + 1)
+            .max()
+            .unwrap_or(0);
+        if needed_cols > self.scheduler.cols() || needed_rows > self.scheduler.rows() {
+            let cols = needed_cols.max(self.scheduler.cols());
+            let rows = needed_rows.max(self.scheduler.rows());
+            self.scheduler.resize(cols, rows);
+        }
+        for work in inj.work {
+            self.scheduler.enqueue(work);
+        }
+        if let Some(max_frag) = self.compute_max_datagram_size() {
+            let _ = self.drain_scheduler_into_quinn(
+                inj.seq,
+                inj.timestamp_us,
+                max_frag,
+                inj.budget_bytes,
+            );
+        }
+        // Mirror the frame path's post-dispatch RTO sweep so injected
+        // scenes exercise retransmission the same way real frames do.
+        let tick_now = now_std();
+        self.reliable_emitter
+            .tick(tick_now, RTO_RETRANSMITS_PER_TICK);
+        let bridge_ptr: *mut IoBridge = self as *mut IoBridge;
+        let mut adapter = IoBridgeSenderAdapter { bridge: bridge_ptr };
+        self.reliable_emitter.drain(&mut adapter, tick_now);
     }
 
     /// Resume the in-flight frame's scheduler drain. Called from the
@@ -3717,6 +3798,25 @@ impl IoBridge {
                     }
                 }
 
+                // 2b. Pre-encoded tile work injected by the browserless
+                // harness, in place of capture + classification. `None` in
+                // production (the field is always present so this branch
+                // needs no `cfg`; a `None` receiver just costs a pending
+                // future).
+                injected = async {
+                    match self.inject_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match injected {
+                        Some(inj) => self.apply_injected_frame(inj),
+                        None => {
+                            self.inject_rx = None;
+                        }
+                    }
+                }
+
                 // 3. Inbound framed UDP packet from ghostbridge.
                 read_res = self.stream.read_exact(&mut header) => {
                     diag_inbound_arm += 1;
@@ -4254,6 +4354,7 @@ impl IoBridge {
             session_resets_fired: HashSet::new(),
             has_seen_prior_session: false,
             frame_rx: None,
+            inject_rx: None,
             frame_seq: 0,
             dirty_tracker: DirtyTracker::new(0, 0),
             metrics_tracker: crate::tile::MetricsTracker::new(0, 0),
@@ -4330,6 +4431,45 @@ impl IoBridge {
         let mut bridge = Self::new_with_stream_for_test(stream, server);
         bridge.frame_rx = Some(frame_rx);
         bridge
+    }
+
+    /// Injection-carrying variant of the test constructor, accepting a
+    /// pre-built stream, server, and injected-tile-work channel. Delegates
+    /// to `new_with_stream_for_test` and adds tile-injection support for the
+    /// browserless harness.
+    /// Available under `cfg(test)` or the `browserless-harness` feature; never
+    /// in a production build.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub fn new_with_injection_for_test(
+        stream: TokioUnixStream,
+        server: QuicServer,
+        inject_rx: mpsc::Receiver<InjectedFrame>,
+    ) -> Self {
+        let mut bridge = Self::new_with_stream_for_test(stream, server);
+        bridge.inject_rx = Some(inject_rx);
+        bridge
+    }
+
+    /// Drive exactly one injected frame: enqueue its work, then attempt the
+    /// drain. Returns the number of items enqueued; 0 if the channel is empty
+    /// or absent.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub async fn drain_injection_for_test(&mut self) -> usize {
+        let inj = match self.inject_rx.as_mut() {
+            Some(rx) => match rx.recv().await {
+                Some(f) => f,
+                None => return 0,
+            },
+            None => return 0,
+        };
+        let n = inj.work.len();
+        self.apply_injected_frame(inj);
+        n
+    }
+
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub fn scheduler_peek_for_test(&self) -> Vec<crate::transport::scheduler::TileWork> {
+        self.scheduler.peek_for_test()
     }
 
     /// Return the capabilities most recently advertised by the client via HELLO.
@@ -6581,5 +6721,49 @@ mod tests {
             snap2.bitrate_bps,
             crate::transport::bwe::BweWrapper::INITIAL_BPS,
         );
+    }
+
+    /// Task 3: the tile-injection channel must enqueue injected work into
+    /// the scheduler and attempt a drain. With no connected WebTransport
+    /// session, `compute_max_datagram_size()` returns `None`, so the drain
+    /// is skipped and the work stays queued — this test pins the enqueue +
+    /// graceful no-session path. End-to-end emission over a real connection
+    /// is asserted by the harness in Task 15.
+    #[tokio::test(start_paused = true)]
+    async fn injected_work_is_enqueued_and_drain_is_attempted() {
+        use crate::transport::protocol::Codec;
+        use crate::transport::scheduler::{TileWork, WorkState};
+
+        let (ours, _peer) = tokio::net::UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("QuicServer::new");
+        let (tx, rx) = mpsc::channel(8);
+        let mut bridge = IoBridge::new_with_injection_for_test(ours, server, rx);
+
+        tx.send(InjectedFrame {
+            seq: 1,
+            timestamp_us: 0,
+            budget_bytes: usize::MAX,
+            work: vec![TileWork {
+                tile_x: 1,
+                tile_y: 2,
+                generation: 0,
+                pass_idx: 0,
+                total_passes: 1,
+                codec: Codec::Solid,
+                payload: vec![10, 20, 30, 255],
+                queued_at: super::now_std(),
+                last_sent_at: None,
+                state: WorkState::Pending,
+            }],
+        })
+        .await
+        .expect("send injection");
+
+        bridge.drain_injection_for_test().await;
+
+        let queued = bridge.scheduler_peek_for_test();
+        assert_eq!(queued.len(), 1, "one work item must be queued");
+        assert_eq!((queued[0].tile_x, queued[0].tile_y), (1, 2));
+        assert_eq!(queued[0].codec, Codec::Solid);
     }
 }
