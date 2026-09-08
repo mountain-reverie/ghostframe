@@ -1,7 +1,30 @@
 use super::*;
 
+/// Serialises the VA-API tests against each other.
+///
+/// Each test in this module builds an `H264VaapiEncoder`, which allocates
+/// VA-API surfaces from DRM objects. Running five of them concurrently (plus
+/// the rest of a ~360-test suite competing for CPU) makes surface allocation
+/// fail intermittently with `Failed to create surface from DRM object: 2
+/// (resource allocation failed)`, surfacing as a bogus
+/// `assert!(!encoded.payload.is_empty())` panic. Measured before this lock:
+/// ~50% failure across full-suite runs, 100% pass in isolation.
+///
+/// The lock is only held while a test is actually using the encoder, so the
+/// rest of the suite still runs in parallel. Poisoning is ignored: a panic in
+/// one VA-API test must not cascade into spurious failures in the others,
+/// which would obscure the real failure.
+static VAAPI_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_vaapi() -> std::sync::MutexGuard<'static, ()> {
+    VAAPI_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[test]
 fn encode_solid_red_tile() {
+    let _vaapi = lock_vaapi();
     let _ = tracing_subscriber::fmt::try_init();
 
     let mut encoder = match H264VaapiEncoder::new() {
@@ -61,6 +84,7 @@ fn encode_solid_red_tile() {
 
 #[test]
 fn encode_multiple_frames_produces_smaller_p_frames() {
+    let _vaapi = lock_vaapi();
     let _ = tracing_subscriber::fmt::try_init();
 
     let mut encoder = match H264VaapiEncoder::new() {
@@ -146,6 +170,7 @@ fn make_bgra_memfd(width: u32, height: u32, fill_fn: impl Fn(usize) -> [u8; 4]) 
 
 #[test]
 fn full_frame_encode_from_memfd() {
+    let _vaapi = lock_vaapi();
     let _ = tracing_subscriber::fmt::try_init();
 
     let width: u32 = 640;
@@ -213,6 +238,7 @@ fn full_frame_encode_from_memfd() {
 
 #[test]
 fn full_frame_keyframe_interval() {
+    let _vaapi = lock_vaapi();
     let _ = tracing_subscriber::fmt::try_init();
 
     let width: u32 = 128;
@@ -270,6 +296,7 @@ fn full_frame_keyframe_interval() {
 
 #[test]
 fn request_keyframe_forces_idr_outside_gop_boundary() {
+    let _vaapi = lock_vaapi();
     let width = 320;
     let height = 240;
     let mut encoder = match FullFrameEncoder::new(width, height) {
