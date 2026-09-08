@@ -20,6 +20,13 @@ pub struct ReliableTileEmitter {
     pub(crate) group: GroupBuilder,
     pub(crate) rto: RtoTimerWheel,
     pub(crate) smoothed_rtt: Duration,
+    /// Reference instant this emitter was constructed with. Tile-datagram
+    /// emit stamps (`DatagramHeader.timestamp_us`) are measured as
+    /// `now.duration_since(time_base)` rather than the wall clock, so they
+    /// track whatever clock the caller's `now: Instant` comes from —
+    /// `now_std()` in production (which tracks tokio's clock, paused or
+    /// not), a bare `Instant::now()` in unit tests. See `emit_us` below.
+    pub(crate) time_base: Instant,
     pub stats: EmitterStats,
 }
 
@@ -36,14 +43,13 @@ pub struct EmitterStats {
     pub retransmit_attempts_total: u64,
 }
 
-impl Default for ReliableTileEmitter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl ReliableTileEmitter {
-    pub fn new() -> Self {
+    /// `now` becomes `time_base` — the reference instant every subsequent
+    /// emit stamp is measured against (see `emit_us`). Callers should pass
+    /// the same clock source they'll later pass to `submit_one` / `tick` /
+    /// etc. (`now_std()` in production) so the stamps stay self-consistent
+    /// under a paused tokio clock.
+    pub fn new(now: Instant) -> Self {
         Self {
             cache: RetransmitCache::new(),
             alloc: WireSeqAllocator::new(),
@@ -51,6 +57,7 @@ impl ReliableTileEmitter {
             group: GroupBuilder::new(FEC_GROUP_SIZE_K),
             rto: RtoTimerWheel::new(),
             smoothed_rtt: Duration::from_millis(20),
+            time_base: now,
             stats: EmitterStats::default(),
         }
     }
@@ -69,13 +76,13 @@ impl ReliableTileEmitter {
         if bytes.len() >= 12 {
             bytes[8..12].copy_from_slice(&wire_seq.to_be_bytes());
         }
-        // Stamp server emit time (wall-clock μs, u32 wrap) into the
+        // Stamp server emit time (clock-relative μs, u32 wrap) into the
         // DatagramHeader.timestamp_us field at [12..16] for tile datagrams
         // (which set TILE_DATAGRAM_FLAG = 0x80 in byte 0). Used by the
         // client's per-tier latency tracking and echoed back via the ACK
         // envelope for the BWE delay-gradient input.
         if bytes.len() >= 16 && (bytes[0] & 0x80) != 0 {
-            let emit_us = wall_clock_emit_us();
+            let emit_us = self.emit_us(now);
             bytes[12..16].copy_from_slice(&emit_us.to_be_bytes());
         }
         // Cache & RTO.
@@ -198,7 +205,7 @@ impl ReliableTileEmitter {
                 // the actual on-wire moment, not the original send. Tile
                 // datagrams only (top bit of byte 0 set).
                 if bytes.len() >= 16 && (bytes[0] & 0x80) != 0 {
-                    let emit_us = wall_clock_emit_us();
+                    let emit_us = self.emit_us(now);
                     bytes[12..16].copy_from_slice(&emit_us.to_be_bytes());
                 }
                 self.queue.push_source(bytes);
@@ -266,6 +273,25 @@ impl ReliableTileEmitter {
         self.cache.has_entries_for_tile(tile_x, tile_y)
     }
 
+    /// Returns `now` measured against `time_base` (the instant this
+    /// emitter was constructed with), truncated to a u32 microsecond
+    /// counter (≈71 minute wrap). Used to stamp
+    /// `DatagramHeader.timestamp_us` on tile datagrams.
+    ///
+    /// Deliberately *not* UNIX-epoch-based: clock skew between server and
+    /// client is irrelevant here — the BWE consumer (`io_bridge.rs`'s OWD
+    /// computation) only looks at deltas between packets in the same
+    /// batch, computed as `arrival_lo16.wrapping_sub(emit_lo16)` on the
+    /// client's own independently-stamped arrival clock. So the stamp only
+    /// needs to advance consistently with whatever clock `now` comes from
+    /// — `now_std()` (tokio's clock, paused-aware) in production, a bare
+    /// `Instant::now()` in unit tests that don't care about virtual time.
+    /// `duration_since` saturates to zero rather than panicking if `now`
+    /// somehow precedes `time_base`.
+    fn emit_us(&self, now: Instant) -> u32 {
+        now.duration_since(self.time_base).as_micros() as u32
+    }
+
     /// Internal helper — captures the current time so on_nack's caller
     /// doesn't have to pass an Instant. Task 22 wires a real Clock through
     /// the emitter constructor; this stub keeps the signature stable until
@@ -287,18 +313,6 @@ impl ReliableTileEmitter {
             }
         }
     }
-}
-
-/// Returns the current wall-clock microseconds, truncated to a u32 (≈ 71
-/// minute wrap). Used to stamp `DatagramHeader.timestamp_us` on tile
-/// datagrams. Clock skew between server and client is irrelevant — the BWE
-/// consumer only looks at *deltas* between packets in the same batch.
-fn wall_clock_emit_us() -> u32 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as u32)
-        .unwrap_or(0)
 }
 
 /// [H3-DIAG] FNV-1a fingerprint of the first fragment's bytes, plus the
@@ -356,7 +370,7 @@ mod tests {
 
     #[test]
     fn submit_one_then_drain_emits_one_source() {
-        let mut e = ReliableTileEmitter::new();
+        let mut e = ReliableTileEmitter::new(Instant::now());
         let mut sender = CollectSender::default();
         let now = Instant::now();
         let key = EmitKey::new(1, 0, 0, 0);
@@ -369,7 +383,7 @@ mod tests {
 
     #[test]
     fn submit_one_stamps_wire_seq_into_datagram_bytes() {
-        let mut e = ReliableTileEmitter::new();
+        let mut e = ReliableTileEmitter::new(Instant::now());
         let mut sender = CollectSender::default();
         let now = Instant::now();
         e.submit_one(EmitKey::new(1, 0, 0, 0), fake_source(1, 0, 0), now);
@@ -386,7 +400,7 @@ mod tests {
     #[test]
     fn submit_k_sources_emits_one_parity_after_offset() {
         use crate::transport::reliable_emitter::FEC_GROUP_SIZE_K;
-        let mut e = ReliableTileEmitter::new();
+        let mut e = ReliableTileEmitter::new(Instant::now());
         let mut sender = CollectSender::default();
         let now = Instant::now();
         // Submit K sources for group 0, then K sources for group 1 (so the
@@ -415,7 +429,7 @@ mod tests {
 
     #[test]
     fn on_ack_removes_cache_entry_and_bumps_ack_hit() {
-        let mut e = ReliableTileEmitter::new();
+        let mut e = ReliableTileEmitter::new(Instant::now());
         let mut sender = CollectSender::default();
         let now = Instant::now();
         let key = EmitKey::new(1, 0, 0, 0);
@@ -430,7 +444,7 @@ mod tests {
 
     #[test]
     fn on_ack_for_unknown_key_bumps_ack_miss() {
-        let mut e = ReliableTileEmitter::new();
+        let mut e = ReliableTileEmitter::new(Instant::now());
         e.on_ack(&[EmitKey::new(99, 0, 0, 0)]);
         assert_eq!(e.stats.ack_miss, 1);
         assert_eq!(e.stats.ack_hit, 0);
@@ -438,7 +452,7 @@ mod tests {
 
     #[test]
     fn tick_retransmits_when_rto_expires() {
-        let mut e = ReliableTileEmitter::new();
+        let mut e = ReliableTileEmitter::new(Instant::now());
         let mut sender = CollectSender::default();
         let t0 = Instant::now();
         let key = EmitKey::new(1, 0, 0, 0);
@@ -463,7 +477,7 @@ mod tests {
         // Retirement was removed: the emitter keeps firing RTO retransmits
         // indefinitely until ACKed or cancelled. Verify that after N ticks
         // the entry is still present and rto_max_retransmits_reached stays 0.
-        let mut e = ReliableTileEmitter::new();
+        let mut e = ReliableTileEmitter::new(Instant::now());
         let mut sender = CollectSender::default();
         let t0 = Instant::now();
         let key = EmitKey::new(1, 0, 0, 0);
@@ -483,7 +497,7 @@ mod tests {
 
     #[test]
     fn tick_skips_already_acked_entries() {
-        let mut e = ReliableTileEmitter::new();
+        let mut e = ReliableTileEmitter::new(Instant::now());
         let mut sender = CollectSender::default();
         let t0 = Instant::now();
         let key = EmitKey::new(1, 0, 0, 0);
@@ -499,7 +513,7 @@ mod tests {
 
     #[test]
     fn on_nack_reemits_specific_fragment_only() {
-        let mut e = ReliableTileEmitter::new();
+        let mut e = ReliableTileEmitter::new(Instant::now());
         let mut sender = CollectSender::default();
         let t0 = Instant::now();
         let key = EmitKey::new(1, 0, 0, 0);
@@ -516,14 +530,14 @@ mod tests {
 
     #[test]
     fn on_nack_for_unknown_key_bumps_nack_miss() {
-        let mut e = ReliableTileEmitter::new();
+        let mut e = ReliableTileEmitter::new(Instant::now());
         e.on_nack(&[(EmitKey::new(99, 0, 0, 0), 0u8)]);
         assert_eq!(e.stats.nack_miss, 1);
     }
 
     #[test]
     fn cancel_for_tile_clears_all_gens_and_blocks_retransmit() {
-        let mut e = ReliableTileEmitter::new();
+        let mut e = ReliableTileEmitter::new(Instant::now());
         let mut sender = CollectSender::default();
         let t0 = Instant::now();
         let k1 = EmitKey::new(1, 5, 5, 0);
@@ -548,7 +562,7 @@ mod tests {
     fn on_nack_re_emits_without_budget_cap() {
         // Retirement and NACK budget cap were removed: every NACK produces a
         // re-emission as long as the cache entry is live.
-        let mut e = ReliableTileEmitter::new();
+        let mut e = ReliableTileEmitter::new(Instant::now());
         let mut sender = CollectSender::default();
         let t0 = Instant::now();
         let key = EmitKey::new(1, 0, 0, 0);
@@ -568,7 +582,7 @@ mod tests {
 
     #[test]
     fn submit_batch_processes_all_items() {
-        let mut e = ReliableTileEmitter::new();
+        let mut e = ReliableTileEmitter::new(Instant::now());
         let mut sender = CollectSender::default();
         let now = Instant::now();
         let items: Vec<(EmitKey, Bytes)> = (0..5)
@@ -582,7 +596,7 @@ mod tests {
 
     #[test]
     fn tick_keeps_retrying_indefinitely_until_acked() {
-        let mut e = ReliableTileEmitter::new();
+        let mut e = ReliableTileEmitter::new(Instant::now());
         let key = EmitKey::new(1, 0, 0, 0);
         let now = Instant::now();
         e.submit_one(key, bytes::Bytes::from(vec![0u8; 16]), now);
@@ -629,7 +643,7 @@ mod tests {
         // RTO heap entry). Advance time past all their initial RTOs.
         // tick(t, budget) must fire at most `budget` retransmits per call,
         // leaving the rest still due in the heap for the next call.
-        let mut e = ReliableTileEmitter::new();
+        let mut e = ReliableTileEmitter::new(Instant::now());
         let now = Instant::now();
         for i in 0..1000u32 {
             let k = EmitKey::new(i, 0, 0, 0);
@@ -681,5 +695,55 @@ mod tests {
         // All 1000 entries' next RTOs are in the future — heap has nothing due.
         // pending_cache_entries reflects un-ACKed work, still 1000.
         assert_eq!(e.pending_cache_entries(), 1000);
+    }
+
+    /// Regression test for the emitter's OWD-stamp clock bug: `submit_one`
+    /// stamped `DatagramHeader.timestamp_us` from `SystemTime::now()` (the
+    /// real wall clock) rather than from the caller's `now: Instant`, which
+    /// in production is `now_std()` — tokio's clock, paused-aware under the
+    /// browserless harness. Under a paused runtime real wall-clock time
+    /// barely moves while `tokio::time::advance` fast-forwards the virtual
+    /// clock, so two tile passes submitted 250ms apart on the virtual clock
+    /// would carry emit stamps only microseconds apart — corrupting the
+    /// deltas the BWE consumer (`io_bridge.rs`'s `owd_ms_lo16` computation)
+    /// depends on.
+    ///
+    /// This test submits one tile pass, advances tokio's paused clock by
+    /// 250ms, submits a second, and asserts the two stamped
+    /// `timestamp_us` values differ by ~250ms. Verified by hand that this
+    /// discriminates: temporarily reverting `emit_us` to read
+    /// `SystemTime::now()` directly (bypassing `time_base`/`now`) makes the
+    /// assertion below fail with a delta of a few hundred microseconds
+    /// instead of ~250ms — reproducing the exact symptom this commit fixes.
+    #[tokio::test(start_paused = true)]
+    async fn emit_stamp_tracks_virtual_clock_not_wall_clock() {
+        let base = crate::transport::io_bridge::now_std();
+        let mut e = ReliableTileEmitter::new(base);
+        let mut sender = CollectSender::default();
+
+        let now0 = crate::transport::io_bridge::now_std();
+        e.submit_one(EmitKey::new(1, 0, 0, 0), fake_source(1, 0, 0), now0);
+        e.drain(&mut sender, now0);
+
+        // Real wall-clock time spent on the next few lines is on the order
+        // of microseconds; the paused clock jumps forward 250ms regardless.
+        tokio::time::advance(Duration::from_millis(250)).await;
+
+        let now1 = crate::transport::io_bridge::now_std();
+        e.submit_one(EmitKey::new(2, 0, 0, 0), fake_source(2, 0, 0), now1);
+        e.drain(&mut sender, now1);
+
+        assert_eq!(sender.sent.len(), 2);
+        let ts0 = u32::from_be_bytes(sender.sent[0][12..16].try_into().unwrap());
+        let ts1 = u32::from_be_bytes(sender.sent[1][12..16].try_into().unwrap());
+        let delta = Duration::from_micros(ts1.wrapping_sub(ts0) as u64);
+        assert!(
+            delta >= Duration::from_millis(240) && delta <= Duration::from_millis(260),
+            "expected the two emit stamps to differ by ~250ms of virtual \
+             time, got {:?} (ts0={ts0} ts1={ts1}) -- if this fails, the \
+             emitter's timestamp_us stamp has regressed back to reading \
+             the wall clock instead of the caller's `now: Instant`",
+            delta,
+        );
     }
 }

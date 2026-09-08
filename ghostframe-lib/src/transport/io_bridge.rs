@@ -990,7 +990,9 @@ impl IoBridge {
             last_cumulative_emit_log_frame: 0,
             color_histogram_accumulator: UniqueColorHistogram::default(),
             bump_count_accumulator: BumpCountAccumulator::default(),
-            reliable_emitter: crate::transport::reliable_emitter::ReliableTileEmitter::new(),
+            reliable_emitter: crate::transport::reliable_emitter::ReliableTileEmitter::new(
+                now_std(),
+            ),
             bwe_samples_buffer: Vec::with_capacity(BWE_SAMPLES_BUFFER_CAPACITY),
             bwe: crate::transport::bwe::BweWrapper::new(
                 crate::transport::bwe::BweWrapper::INITIAL_BPS,
@@ -4594,7 +4596,9 @@ impl IoBridge {
             last_cumulative_emit_log_frame: 0,
             color_histogram_accumulator: UniqueColorHistogram::default(),
             bump_count_accumulator: BumpCountAccumulator::default(),
-            reliable_emitter: crate::transport::reliable_emitter::ReliableTileEmitter::new(),
+            reliable_emitter: crate::transport::reliable_emitter::ReliableTileEmitter::new(
+                now_std(),
+            ),
             bwe_samples_buffer: Vec::with_capacity(BWE_SAMPLES_BUFFER_CAPACITY),
             bwe: crate::transport::bwe::BweWrapper::new(
                 crate::transport::bwe::BweWrapper::INITIAL_BPS,
