@@ -1700,28 +1700,36 @@ impl IoBridge {
         // path entirely, so on a bridge that only ever receives injected
         // frames the scheduler is still at its construction-time (0, 0)
         // and `Scheduler::enqueue`'s bounds `debug_assert` would fire for
-        // any real tile coordinate. Grow the grid to fit the widest/
-        // tallest tile referenced by this batch before enqueuing.
-        // `Scheduler::resize` clears the queue, so this only runs when
-        // the current grid is too small — not on every injected frame.
-        let needed_cols = inj
-            .work
-            .iter()
-            .map(|w| w.tile_x as u32 + 1)
-            .max()
-            .unwrap_or(0);
-        let needed_rows = inj
-            .work
-            .iter()
-            .map(|w| w.tile_y as u32 + 1)
-            .max()
-            .unwrap_or(0);
-        if needed_cols > self.scheduler.cols() || needed_rows > self.scheduler.rows() {
-            let cols = needed_cols.max(self.scheduler.cols());
-            let rows = needed_rows.max(self.scheduler.rows());
-            self.scheduler.resize(cols, rows);
-        }
+        // any real tile coordinate. `new_with_injection_for_test` sizes
+        // the grid once, up front, from the scene's known dimensions.
+        //
+        // Never resize here: `Scheduler::resize` clears the priority
+        // queue, the refinement queue, and every CDF53 pass-ACK record,
+        // so growing the grid mid-scene would silently discard in-flight
+        // work — e.g. a multi-frame scene that rewrites tile (0,0) across
+        // several frames would have its queued/refinement/ACK state wiped
+        // the moment a later frame first touches a tile outside the
+        // original bounding box. That failure mode is invisible at the
+        // call site: tiles simply never converge, with no error anywhere.
+        // Coordinates outside the fixed grid are a harness-author bug —
+        // surface them loudly instead of growing around them.
+        let cols = self.scheduler.cols();
+        let rows = self.scheduler.rows();
         for work in inj.work {
+            if work.tile_x as u32 >= cols || work.tile_y as u32 >= rows {
+                tracing::error!(
+                    tile_x = work.tile_x,
+                    tile_y = work.tile_y,
+                    grid_cols = cols,
+                    grid_rows = rows,
+                    "apply_injected_frame: tile coordinate outside the \
+                     scheduler grid fixed at construction — skipping. \
+                     Pass the scene's true grid_cols/grid_rows to \
+                     new_with_injection_for_test instead of relying on \
+                     growth-on-demand."
+                );
+                continue;
+            }
             self.scheduler.enqueue(work);
         }
         if let Some(max_frag) = self.compute_max_datagram_size() {
@@ -4439,13 +4447,20 @@ impl IoBridge {
     /// browserless harness.
     /// Available under `cfg(test)` or the `browserless-harness` feature; never
     /// in a production build.
+    /// `grid_cols`/`grid_rows` size the scheduler once, up front, from the
+    /// scene's known dimensions — mirroring how the real capture path sizes
+    /// it from the frame's `TileGrid` in `dispatch_dirty_tiles_via_scheduler`.
+    /// See `apply_injected_frame` for why this must not change mid-scene.
     #[cfg(any(test, feature = "browserless-harness"))]
     pub fn new_with_injection_for_test(
         stream: TokioUnixStream,
         server: QuicServer,
         inject_rx: mpsc::Receiver<InjectedFrame>,
+        grid_cols: u32,
+        grid_rows: u32,
     ) -> Self {
         let mut bridge = Self::new_with_stream_for_test(stream, server);
+        bridge.scheduler.resize(grid_cols, grid_rows);
         bridge.inject_rx = Some(inject_rx);
         bridge
     }
@@ -6737,7 +6752,7 @@ mod tests {
         let (ours, _peer) = tokio::net::UnixStream::pair().expect("pair");
         let server = QuicServer::new().expect("QuicServer::new");
         let (tx, rx) = mpsc::channel(8);
-        let mut bridge = IoBridge::new_with_injection_for_test(ours, server, rx);
+        let mut bridge = IoBridge::new_with_injection_for_test(ours, server, rx, 4, 4);
 
         tx.send(InjectedFrame {
             seq: 1,
@@ -6765,5 +6780,121 @@ mod tests {
         assert_eq!(queued.len(), 1, "one work item must be queued");
         assert_eq!((queued[0].tile_x, queued[0].tile_y), (1, 2));
         assert_eq!(queued[0].codec, Codec::Solid);
+    }
+
+    /// Regression test for the growth-on-demand hazard: a bounding-box
+    /// resize on every injected batch would call `Scheduler::resize` when
+    /// a later frame's tiles exceed the current grid, and `resize` clears
+    /// the priority queue — silently discarding any earlier frame's still-
+    /// queued work. The grid is now sized once at construction, so a
+    /// second injected frame touching a coordinate within that fixed grid
+    /// must never disturb the first frame's queued entry.
+    #[tokio::test(start_paused = true)]
+    async fn second_injected_frame_does_not_clear_first_frames_queued_work() {
+        use crate::transport::protocol::Codec;
+        use crate::transport::scheduler::{TileWork, WorkState};
+
+        let (ours, _peer) = tokio::net::UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("QuicServer::new");
+        let (tx, rx) = mpsc::channel(8);
+        // Grid sized for the whole scene (4x4) up front, not derived from
+        // either individual frame's tiles.
+        let mut bridge = IoBridge::new_with_injection_for_test(ours, server, rx, 4, 4);
+
+        let make_work = |tile_x: u8, tile_y: u8| TileWork {
+            tile_x,
+            tile_y,
+            generation: 0,
+            pass_idx: 0,
+            total_passes: 1,
+            codec: Codec::Solid,
+            payload: vec![10, 20, 30, 255],
+            queued_at: super::now_std(),
+            last_sent_at: None,
+            state: WorkState::Pending,
+        };
+
+        // Frame 1: tile (0, 0).
+        tx.send(InjectedFrame {
+            seq: 1,
+            timestamp_us: 0,
+            budget_bytes: usize::MAX,
+            work: vec![make_work(0, 0)],
+        })
+        .await
+        .expect("send injection 1");
+        bridge.drain_injection_for_test().await;
+
+        // Frame 2: tile (3, 3) — outside the old bounding-box-derived 1x1
+        // grid, but well within the fixed 4x4 grid.
+        tx.send(InjectedFrame {
+            seq: 2,
+            timestamp_us: 0,
+            budget_bytes: usize::MAX,
+            work: vec![make_work(3, 3)],
+        })
+        .await
+        .expect("send injection 2");
+        bridge.drain_injection_for_test().await;
+
+        let queued = bridge.scheduler_peek_for_test();
+        let coords: Vec<(u8, u8)> = queued.iter().map(|w| (w.tile_x, w.tile_y)).collect();
+        assert!(
+            coords.contains(&(0, 0)),
+            "frame 1's tile (0,0) must survive frame 2's injection; queued = {coords:?}"
+        );
+        assert!(
+            coords.contains(&(3, 3)),
+            "frame 2's tile (3,3) must be queued; queued = {coords:?}"
+        );
+        assert_eq!(
+            queued.len(),
+            2,
+            "both frames' work must be queued together; queued = {coords:?}"
+        );
+    }
+
+    /// A tile coordinate outside the fixed grid must be skipped (logged,
+    /// not enqueued, not panicked) rather than silently growing the grid
+    /// or crashing the `run()`-loop path.
+    #[tokio::test(start_paused = true)]
+    async fn out_of_grid_tile_is_skipped_not_enqueued() {
+        use crate::transport::protocol::Codec;
+        use crate::transport::scheduler::{TileWork, WorkState};
+
+        let (ours, _peer) = tokio::net::UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("QuicServer::new");
+        let (tx, rx) = mpsc::channel(8);
+        // Fixed 2x2 grid; tile (5, 5) is out of bounds.
+        let mut bridge = IoBridge::new_with_injection_for_test(ours, server, rx, 2, 2);
+
+        tx.send(InjectedFrame {
+            seq: 1,
+            timestamp_us: 0,
+            budget_bytes: usize::MAX,
+            work: vec![TileWork {
+                tile_x: 5,
+                tile_y: 5,
+                generation: 0,
+                pass_idx: 0,
+                total_passes: 1,
+                codec: Codec::Solid,
+                payload: vec![10, 20, 30, 255],
+                queued_at: super::now_std(),
+                last_sent_at: None,
+                state: WorkState::Pending,
+            }],
+        })
+        .await
+        .expect("send injection");
+
+        // Must not panic.
+        bridge.drain_injection_for_test().await;
+
+        let queued = bridge.scheduler_peek_for_test();
+        assert!(
+            queued.is_empty(),
+            "out-of-grid tile must be skipped, not enqueued; queued = {queued:?}"
+        );
     }
 }
