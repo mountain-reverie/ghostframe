@@ -444,10 +444,12 @@ git commit -m "feat(io_bridge): tile-injection channel that enqueues and drains"
 ### Task 3a: `Scheduler` takes the caller's clock
 
 Found during Task 2's review. `Scheduler::tick(budget_bytes)` (`scheduler.rs:510`)
-takes no `now` and reads `Instant::now()` internally at `scheduler.rs:190`
-(`enqueue`, which also overwrites the `queued_at` the caller just set), `:547`
-(`drain_priority_queue`), `:601` (`drain_refinement_pass_major`), and `:720`
-(`enqueue_refinement_subset`).
+takes no `now` and reads `Instant::now()` internally at **five** production
+sites (verified 2026-09-07): `scheduler.rs:190` (`enqueue`, which also
+overwrites the `queued_at` the caller just set), `:547` (`drain_priority_queue`),
+`:601` (`drain_refinement_pass_major`), `:675` (`enqueue_refinement`), and
+`:720` (`enqueue_refinement_subset`). Do not trust that count either — grep and
+report what you find, splitting production from `mod tests`.
 
 Under a paused clock that leaves the retry gate at `scheduler.rs:556-559`
 (`now.duration_since(last_sent_at) >= 2 * rtt`) wall-frozen, so **the
