@@ -1233,42 +1233,81 @@ impl IoBridge {
         min_space.unwrap_or(usize::MAX)
     }
 
-    /// Clamp an injected-scene drain budget to what quinn can actually
-    /// absorb right now, the same `quinn_cap` computation
-    /// `dispatch_dirty_tiles_via_scheduler` applies to its AIMD-derived
-    /// budget (see the long comment on `tick_budget_bytes` there, and the
-    /// module-level history at `:145-152`): a `scheduler.tick(usize::MAX)`
-    /// drain against a large first-frame CDF53 burst once catastrophically
-    /// overran `datagram_send_buffer`, with quinn either silently
-    /// overwriting queued datagrams or returning `Blocked` and dropping the
-    /// already-popped `TileWork` on the floor. `drain_refinement_pass_major`
-    /// uses `queue.remove(idx)` (not `InFlight` retention), so an
-    /// over-popped refinement pass has no scheduler-side retry — only the
-    /// emitter's bounded RTO.
+    /// Clamp a drain budget to what quinn can actually absorb right now:
+    /// `min_session_send_buffer_space()` scaled by
+    /// `QUINN_SEND_BUFFER_SAFETY_FRACTION`, then `.min()`-ed against the
+    /// caller-supplied budget. This one computation backs all three of the
+    /// module's scheduler-drain budget sites — `dispatch_dirty_tiles_via_scheduler`'s
+    /// AIMD-derived `tick_budget_bytes` (see the long comment on that
+    /// variable, and the module-level history at `:145-152`),
+    /// `resume_scheduler_continuation`'s per-continuation `effective_budget`,
+    /// and `apply_injected_frame`'s injected-scene budget — because a
+    /// `scheduler.tick(usize::MAX)` drain against a large first-frame CDF53
+    /// burst once catastrophically overran `datagram_send_buffer`, with
+    /// quinn either silently overwriting queued datagrams or returning
+    /// `Blocked` and dropping the already-popped `TileWork` on the floor.
+    /// `drain_refinement_pass_major` uses `queue.remove(idx)` (not
+    /// `InFlight` retention), so an over-popped refinement pass has no
+    /// scheduler-side retry — only the emitter's bounded RTO.
     ///
     /// `apply_injected_frame`'s only caller (the browserless harness) passes
-    /// `budget_bytes: usize::MAX` — wave 1 relies entirely on the netsim's
-    /// token bucket for pacing, and that bucket is consumed inside
+    /// `budget: usize::MAX` — wave 1 relies entirely on the netsim's token
+    /// bucket for pacing, and that bucket is consumed inside
     /// `send_to_all_sessions`, i.e. *below* quinn's `datagram_send_buffer`.
     /// It shapes what reaches the socket but cannot stop the scheduler from
     /// over-popping into quinn. Without this clamp, the injected path would
     /// reproduce the `:145-152` bug on every drain.
     ///
-    /// Deliberately does NOT apply `tick_budget_multiplier` (AIMD) — that
-    /// feedback loop is not exercised on the injected path.
+    /// Callers remain responsible for anything beyond the raw quinn-capacity
+    /// clamp: `dispatch_dirty_tiles_via_scheduler` applies
+    /// `tick_budget_multiplier` (AIMD) to its budget *before* calling this,
+    /// and `apply_injected_frame` deliberately does not — that feedback loop
+    /// is not exercised on the injected path.
     ///
-    /// Factored out of `apply_injected_frame` (rather than inlined) so unit
-    /// tests can pin this arithmetic directly: `apply_injected_frame`'s own
-    /// call site sits behind `compute_max_datagram_size()`, which requires a
-    /// live, post-handshake `quinn_proto::Connection` to ever return `Some`
-    /// — exactly the machinery the browserless harness (Task 15) exists to
+    /// A plain method (rather than inlined at each site) so unit tests can
+    /// pin this arithmetic directly: `apply_injected_frame`'s own call site
+    /// sits behind `compute_max_datagram_size()`, which requires a live,
+    /// post-handshake `quinn_proto::Connection` to ever return `Some` —
+    /// exactly the machinery the browserless harness (Task 15) exists to
     /// provide, and out of scope to fabricate here (see the doc comment on
     /// `injected_work_is_enqueued_and_drain_is_attempted` below for the same
     /// call).
-    fn clamp_injected_budget(&mut self, budget_bytes: usize) -> usize {
+    fn clamp_to_quinn_capacity(&mut self, budget: usize) -> usize {
         let quinn_space = self.min_session_send_buffer_space();
         let quinn_cap = ((quinn_space as f64) * QUINN_SEND_BUFFER_SAFETY_FRACTION) as usize;
-        budget_bytes.min(quinn_cap)
+        budget.min(quinn_cap)
+    }
+
+    /// Fire any cached retransmits whose RTO deadline has elapsed, then
+    /// drain the resulting emission queue (source + parity) to the wire.
+    /// `tick()` is rate-limited to `RTO_RETRANSMITS_PER_TICK` entries per
+    /// call so a burst of due retransmits can't re-Block quinn's just-freed
+    /// buffer; `drain()` flushes whatever that produced. Cheap when nothing
+    /// is due (no cache hits, no parity ready), so it is safe to call
+    /// unconditionally from every place a drain just happened or quinn
+    /// signaled room: the post-dispatch path in `process_frame_gpu`, the
+    /// `Event::DatagramsUnblocked` handler, and `apply_injected_frame`'s
+    /// post-drain mirror of the same behavior for injected scenes.
+    ///
+    /// Builds a raw `*mut IoBridge` to hand to `IoBridgeSenderAdapter` so
+    /// `reliable_emitter.drain` can route emitted datagrams back through
+    /// `send_to_all_sessions` while `self.reliable_emitter` is itself
+    /// borrowed. This aliases a `&mut IoBridge` over a live
+    /// `&mut self.reliable_emitter` borrow, which is Stacked-Borrows-unsound
+    /// in the abstract — pre-existing in this codebase and not fixed here.
+    /// It is sound in practice because `send_to_all_sessions` only touches
+    /// `wt_sessions`, `server`, and `datagram_send_errs`, and never touches
+    /// `reliable_emitter`, so the two "overlapping" borrows never actually
+    /// alias the same field. Confining the pointer construction to this one
+    /// method (instead of the three call sites that used to each build
+    /// their own) keeps that invariant auditable in a single place.
+    fn sweep_rto_retransmits(&mut self) {
+        let tick_now = now_std();
+        self.reliable_emitter
+            .tick(tick_now, RTO_RETRANSMITS_PER_TICK);
+        let bridge_ptr: *mut IoBridge = self as *mut IoBridge;
+        let mut adapter = IoBridgeSenderAdapter { bridge: bridge_ptr };
+        self.reliable_emitter.drain(&mut adapter, tick_now);
     }
 
     /// Build the continuation an injected drain should leave behind, given
@@ -1514,9 +1553,7 @@ impl IoBridge {
                 // that `scheduler.tick` accounts as payload bytes only.
                 let aimd_budget =
                     ((base_budget_bytes as f64) * self.tick_budget_multiplier) as usize;
-                let quinn_space = self.min_session_send_buffer_space();
-                let quinn_cap = ((quinn_space as f64) * QUINN_SEND_BUFFER_SAFETY_FRACTION) as usize;
-                aimd_budget.min(quinn_cap)
+                self.clamp_to_quinn_capacity(aimd_budget)
             }
         };
         let (stats, drained_bytes, drained_count) =
@@ -1826,6 +1863,20 @@ impl IoBridge {
                  growth-on-demand."
             );
         }
+        // This gate is load-bearing for dimensions, not just for the
+        // drain: `emit_frame_dimensions` below only runs inside it. With
+        // no session connected yet, `compute_max_datagram_size()` returns
+        // `None` and the whole block — including `emit_frame_dimensions`
+        // — is skipped for that frame. Emitting dimensions unconditionally
+        // here would burn all of `FRAME_DIMENSIONS_RETRANSMITS` into the
+        // void with nobody connected to receive them; by the time a client
+        // does connect, `dims_changed` in `emit_frame_dimensions` is false
+        // (the dimensions haven't changed since the burned attempts) and
+        // the retransmit counter is already exhausted, so the new client
+        // would never learn the grid size. `fire_session_reset` re-arming
+        // `dimensions_retransmits_left` (`:2468`) is what actually covers
+        // reconnects — this gate just has to not waste the budget before
+        // there is anyone to receive it.
         if let Some(max_frag) = self.compute_max_datagram_size() {
             // Tell the client the canvas / tile-grid size before draining
             // any tile work, mirroring process_frame_cpu (:2388) and
@@ -1849,9 +1900,9 @@ impl IoBridge {
             );
 
             // Never pop more from the scheduler than quinn can absorb right
-            // now — see `clamp_injected_budget`'s doc comment for why this
+            // now — see `clamp_to_quinn_capacity`'s doc comment for why this
             // is mandatory rather than defensive.
-            let budget_bytes = self.clamp_injected_budget(inj.budget_bytes);
+            let budget_bytes = self.clamp_to_quinn_capacity(inj.budget_bytes);
             let (_, drained_bytes, _) =
                 self.drain_scheduler_into_quinn(inj.seq, inj.timestamp_us, max_frag, budget_bytes);
             // Mirror dispatch_dirty_tiles_via_scheduler's post-drain
@@ -1873,12 +1924,7 @@ impl IoBridge {
         }
         // Mirror the frame path's post-dispatch RTO sweep so injected
         // scenes exercise retransmission the same way real frames do.
-        let tick_now = now_std();
-        self.reliable_emitter
-            .tick(tick_now, RTO_RETRANSMITS_PER_TICK);
-        let bridge_ptr: *mut IoBridge = self as *mut IoBridge;
-        let mut adapter = IoBridgeSenderAdapter { bridge: bridge_ptr };
-        self.reliable_emitter.drain(&mut adapter, tick_now);
+        self.sweep_rto_retransmits();
         enqueued_count
     }
 
@@ -1916,9 +1962,7 @@ impl IoBridge {
         // scheduler than quinn can absorb (see the long comment in
         // `dispatch_dirty_tiles_via_scheduler` for the Blocked-drops-
         // refinement-work rationale).
-        let quinn_space = self.min_session_send_buffer_space();
-        let quinn_cap = ((quinn_space as f64) * QUINN_SEND_BUFFER_SAFETY_FRACTION) as usize;
-        let effective_budget = ctx.remaining_budget_bytes.min(quinn_cap);
+        let effective_budget = self.clamp_to_quinn_capacity(ctx.remaining_budget_bytes);
         if effective_budget == 0 {
             // Quinn is still full. Keep the continuation alive so the
             // next `DatagramsUnblocked` event fires this path again.
@@ -3671,14 +3715,7 @@ impl IoBridge {
                 // RTO deadline has elapsed, then drain the resulting
                 // queue (source + parity) to the wire. Cheap when nothing
                 // is due (no cache hits, no parity ready).
-                {
-                    let tick_now = now_std();
-                    self.reliable_emitter
-                        .tick(tick_now, RTO_RETRANSMITS_PER_TICK);
-                    let bridge_ptr: *mut IoBridge = self as *mut IoBridge;
-                    let mut adapter = IoBridgeSenderAdapter { bridge: bridge_ptr };
-                    self.reliable_emitter.drain(&mut adapter, tick_now);
-                }
+                self.sweep_rto_retransmits();
 
                 // Diagnostic: post-dispatch summary. If THIS fires but
                 // frame.last_send below does not, something in the palrle
@@ -4280,12 +4317,7 @@ impl IoBridge {
                     // the next 33 ms capture tick to push pending
                     // retransmits, adding up to ~33 ms latency to every
                     // recovered pass under sustained load.
-                    let tick_now = now_std();
-                    self.reliable_emitter
-                        .tick(tick_now, RTO_RETRANSMITS_PER_TICK);
-                    let bridge_ptr: *mut IoBridge = self as *mut IoBridge;
-                    let mut adapter = IoBridgeSenderAdapter { bridge: bridge_ptr };
-                    self.reliable_emitter.drain(&mut adapter, tick_now);
+                    self.sweep_rto_retransmits();
                 }
 
                 _ => {
@@ -6906,11 +6938,11 @@ mod tests {
     /// Regression test for the injected-path over-pop bug: `apply_injected_frame`
     /// must clamp its drain budget to what quinn can absorb, the same way
     /// `dispatch_dirty_tiles_via_scheduler` clamps its AIMD budget (see the
-    /// `:145-152` module history and `clamp_injected_budget`'s doc comment).
+    /// `:145-152` module history and `clamp_to_quinn_capacity`'s doc comment).
     ///
-    /// This exercises the real `clamp_injected_budget` method directly rather
-    /// than through `apply_injected_frame`/`drain_injection_for_test`: that
-    /// call site sits behind `compute_max_datagram_size()`, which only
+    /// This exercises the real `clamp_to_quinn_capacity` method directly
+    /// rather than through `apply_injected_frame`/`drain_injection_for_test`:
+    /// that call site sits behind `compute_max_datagram_size()`, which only
     /// returns `Some` once a real, post-handshake `quinn_proto::Connection`
     /// exists — precisely the machinery the browserless harness (Task 15) is
     /// responsible for providing (see `injected_work_is_enqueued_and_drain_is_attempted`
@@ -6920,14 +6952,18 @@ mod tests {
     ///
     /// What this DOES prove: with zero connected sessions,
     /// `min_session_send_buffer_space()` — the only thing
-    /// `clamp_injected_budget` consults — falls back to `usize::MAX`
+    /// `clamp_to_quinn_capacity` consults — falls back to `usize::MAX`
     /// (documented, existing behavior), and the clamp still strictly bounds
     /// a `usize::MAX` caller-supplied budget rather than passing it through
-    /// unchanged. If `clamp_injected_budget` ever degenerated into a no-op
+    /// unchanged. If `clamp_to_quinn_capacity` ever degenerated into a no-op
     /// (e.g. someone "simplifies" away the `.min()`), this test catches it
-    /// even though no live session is involved.
+    /// even though no live session is involved. It also guards the three-way
+    /// merge of the (formerly triplicated) `quinn_cap` computation: any of
+    /// the three call sites regressing back to its own inline copy would
+    /// still pass here, but a real behavior change to the shared method
+    /// would be caught by every one of its callers at once.
     #[tokio::test(start_paused = true)]
-    async fn clamp_injected_budget_bounds_a_usize_max_request() {
+    async fn clamp_to_quinn_capacity_bounds_a_usize_max_request() {
         let (ours, _peer) = tokio::net::UnixStream::pair().expect("pair");
         let server = QuicServer::new().expect("QuicServer::new");
         let (_tx, rx) = mpsc::channel(8);
@@ -6938,10 +6974,10 @@ mod tests {
         let quinn_space = bridge.min_session_send_buffer_space();
         assert_eq!(quinn_space, usize::MAX);
 
-        let clamped = bridge.clamp_injected_budget(usize::MAX);
+        let clamped = bridge.clamp_to_quinn_capacity(usize::MAX);
         assert!(
             clamped < usize::MAX,
-            "clamp_injected_budget(usize::MAX) must strictly bound the \
+            "clamp_to_quinn_capacity(usize::MAX) must strictly bound the \
              request even in the no-sessions fallback case; got {clamped}, \
              which means the harness's usize::MAX budget would reach \
              drain_scheduler_into_quinn unclamped exactly like the \
@@ -6965,7 +7001,7 @@ mod tests {
     /// itself: that call site sits behind `compute_max_datagram_size()`,
     /// which requires a live, post-handshake `quinn_proto::Connection` —
     /// Task 15's browserless-harness responsibility (see the doc comment on
-    /// `clamp_injected_budget_bounds_a_usize_max_request` above for the same
+    /// `clamp_to_quinn_capacity_bounds_a_usize_max_request` above for the same
     /// constraint). `last_emitted_dimensions` is the only place this is
     /// observable without one.
     #[tokio::test(start_paused = true)]
@@ -7047,7 +7083,7 @@ mod tests {
     /// `compute_max_datagram_size()`, which requires a live,
     /// post-handshake `quinn_proto::Connection` (Task 15's
     /// browserless-harness responsibility — see the doc comment on
-    /// `clamp_injected_budget_bounds_a_usize_max_request` above for the
+    /// `clamp_to_quinn_capacity_bounds_a_usize_max_request` above for the
     /// same constraint). `resume_scheduler_continuation` itself has no such
     /// gate — it only consults `min_session_send_buffer_space()`, which
     /// gracefully falls back to `usize::MAX` with no sessions connected —
