@@ -1,0 +1,782 @@
+{
+  "compressed_bytes": [
+    {
+      "codec": "h264",
+      "class": "solid",
+      "lz4": false,
+      "bytes": 35
+    },
+    {
+      "codec": "h264",
+      "class": "flat_ui",
+      "lz4": false,
+      "bytes": 25
+    },
+    {
+      "codec": "h264",
+      "class": "text",
+      "lz4": false,
+      "bytes": 29
+    },
+    {
+      "codec": "h264",
+      "class": "gradient",
+      "lz4": false,
+      "bytes": 41
+    },
+    {
+      "codec": "h264",
+      "class": "photo",
+      "lz4": false,
+      "bytes": 32
+    },
+    {
+      "codec": "h264",
+      "class": "motion",
+      "lz4": false,
+      "bytes": 47
+    },
+    {
+      "codec": "h264",
+      "class": "solid",
+      "lz4": true,
+      "bytes": 41
+    },
+    {
+      "codec": "h264",
+      "class": "flat_ui",
+      "lz4": true,
+      "bytes": 31
+    },
+    {
+      "codec": "h264",
+      "class": "text",
+      "lz4": true,
+      "bytes": 35
+    },
+    {
+      "codec": "h264",
+      "class": "gradient",
+      "lz4": true,
+      "bytes": 47
+    },
+    {
+      "codec": "h264",
+      "class": "photo",
+      "lz4": true,
+      "bytes": 38
+    },
+    {
+      "codec": "h264",
+      "class": "motion",
+      "lz4": true,
+      "bytes": 53
+    },
+    {
+      "codec": "pal_rle",
+      "class": "solid",
+      "lz4": false,
+      "bytes": 71
+    },
+    {
+      "codec": "pal_rle",
+      "class": "flat_ui",
+      "lz4": false,
+      "bytes": 323
+    },
+    {
+      "codec": "pal_rle",
+      "class": "text",
+      "lz4": false,
+      "bytes": 295
+    },
+    {
+      "codec": "pal_rle",
+      "class": "gradient",
+      "lz4": false,
+      "bytes": 0
+    },
+    {
+      "codec": "pal_rle",
+      "class": "photo",
+      "lz4": false,
+      "bytes": 0
+    },
+    {
+      "codec": "pal_rle",
+      "class": "motion",
+      "lz4": false,
+      "bytes": 0
+    },
+    {
+      "codec": "pal_rle",
+      "class": "solid",
+      "lz4": true,
+      "bytes": 23
+    },
+    {
+      "codec": "pal_rle",
+      "class": "flat_ui",
+      "lz4": true,
+      "bytes": 123
+    },
+    {
+      "codec": "pal_rle",
+      "class": "text",
+      "lz4": true,
+      "bytes": 64
+    },
+    {
+      "codec": "pal_rle",
+      "class": "gradient",
+      "lz4": true,
+      "bytes": 5
+    },
+    {
+      "codec": "pal_rle",
+      "class": "photo",
+      "lz4": true,
+      "bytes": 5
+    },
+    {
+      "codec": "pal_rle",
+      "class": "motion",
+      "lz4": true,
+      "bytes": 5
+    },
+    {
+      "codec": "solid",
+      "class": "solid",
+      "lz4": false,
+      "bytes": 4
+    },
+    {
+      "codec": "solid",
+      "class": "flat_ui",
+      "lz4": false,
+      "bytes": 4
+    },
+    {
+      "codec": "solid",
+      "class": "text",
+      "lz4": false,
+      "bytes": 4
+    },
+    {
+      "codec": "solid",
+      "class": "gradient",
+      "lz4": false,
+      "bytes": 4
+    },
+    {
+      "codec": "solid",
+      "class": "photo",
+      "lz4": false,
+      "bytes": 4
+    },
+    {
+      "codec": "solid",
+      "class": "motion",
+      "lz4": false,
+      "bytes": 4
+    },
+    {
+      "codec": "solid",
+      "class": "solid",
+      "lz4": true,
+      "bytes": 9
+    },
+    {
+      "codec": "solid",
+      "class": "flat_ui",
+      "lz4": true,
+      "bytes": 9
+    },
+    {
+      "codec": "solid",
+      "class": "text",
+      "lz4": true,
+      "bytes": 9
+    },
+    {
+      "codec": "solid",
+      "class": "gradient",
+      "lz4": true,
+      "bytes": 9
+    },
+    {
+      "codec": "solid",
+      "class": "photo",
+      "lz4": true,
+      "bytes": 9
+    },
+    {
+      "codec": "solid",
+      "class": "motion",
+      "lz4": true,
+      "bytes": 9
+    },
+    {
+      "codec": "cdf53",
+      "class": "solid",
+      "lz4": false,
+      "bytes": 202
+    },
+    {
+      "codec": "cdf53",
+      "class": "flat_ui",
+      "lz4": false,
+      "bytes": 2246
+    },
+    {
+      "codec": "cdf53",
+      "class": "text",
+      "lz4": false,
+      "bytes": 3082
+    },
+    {
+      "codec": "cdf53",
+      "class": "gradient",
+      "lz4": false,
+      "bytes": 1013
+    },
+    {
+      "codec": "cdf53",
+      "class": "photo",
+      "lz4": false,
+      "bytes": 4428
+    },
+    {
+      "codec": "cdf53",
+      "class": "motion",
+      "lz4": false,
+      "bytes": 1803
+    },
+    {
+      "codec": "cdf53",
+      "class": "solid",
+      "lz4": true,
+      "bytes": 73
+    },
+    {
+      "codec": "cdf53",
+      "class": "flat_ui",
+      "lz4": true,
+      "bytes": 1871
+    },
+    {
+      "codec": "cdf53",
+      "class": "text",
+      "lz4": true,
+      "bytes": 692
+    },
+    {
+      "codec": "cdf53",
+      "class": "gradient",
+      "lz4": true,
+      "bytes": 564
+    },
+    {
+      "codec": "cdf53",
+      "class": "photo",
+      "lz4": true,
+      "bytes": 3819
+    },
+    {
+      "codec": "cdf53",
+      "class": "motion",
+      "lz4": true,
+      "bytes": 1458
+    }
+  ],
+  "ssim": [
+    {
+      "codec": "cdf53",
+      "class": "solid",
+      "passes_kept": null,
+      "ssim": 1.0
+    },
+    {
+      "codec": "cdf53",
+      "class": "flat_ui",
+      "passes_kept": null,
+      "ssim": 1.0
+    },
+    {
+      "codec": "cdf53",
+      "class": "text",
+      "passes_kept": null,
+      "ssim": 1.0
+    },
+    {
+      "codec": "cdf53",
+      "class": "gradient",
+      "passes_kept": null,
+      "ssim": 1.0
+    },
+    {
+      "codec": "cdf53",
+      "class": "photo",
+      "passes_kept": null,
+      "ssim": 1.0
+    },
+    {
+      "codec": "cdf53",
+      "class": "motion",
+      "passes_kept": null,
+      "ssim": 1.0
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "solid",
+      "passes_kept": 1,
+      "ssim": 0.8762731345227448
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "flat_ui",
+      "passes_kept": 1,
+      "ssim": 0.5335134401368489
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "text",
+      "passes_kept": 1,
+      "ssim": 0.6191377657549854
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "gradient",
+      "passes_kept": 1,
+      "ssim": 0.5326412933851608
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "photo",
+      "passes_kept": 1,
+      "ssim": 0.6704468831055702
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "motion",
+      "passes_kept": 1,
+      "ssim": 0.5318202657799523
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "solid",
+      "passes_kept": 2,
+      "ssim": 0.8762731345227448
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "flat_ui",
+      "passes_kept": 2,
+      "ssim": 0.5335134401368489
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "text",
+      "passes_kept": 2,
+      "ssim": 0.6191377657549854
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "gradient",
+      "passes_kept": 2,
+      "ssim": 0.5326412933851608
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "photo",
+      "passes_kept": 2,
+      "ssim": 0.6704468831055702
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "motion",
+      "passes_kept": 2,
+      "ssim": 0.5318202657799523
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "solid",
+      "passes_kept": 3,
+      "ssim": 0.8762731345227448
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "flat_ui",
+      "passes_kept": 3,
+      "ssim": 0.5335134401368489
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "text",
+      "passes_kept": 3,
+      "ssim": 0.6191377657549854
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "gradient",
+      "passes_kept": 3,
+      "ssim": 0.5326412933851608
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "photo",
+      "passes_kept": 3,
+      "ssim": 0.6704468831055702
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "motion",
+      "passes_kept": 3,
+      "ssim": 0.5318202657799523
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "solid",
+      "passes_kept": 4,
+      "ssim": 0.8762731345227448
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "flat_ui",
+      "passes_kept": 4,
+      "ssim": 0.5335134401368489
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "text",
+      "passes_kept": 4,
+      "ssim": 0.6191377657549854
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "gradient",
+      "passes_kept": 4,
+      "ssim": 0.5326412933851608
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "photo",
+      "passes_kept": 4,
+      "ssim": 0.6704468831055702
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "motion",
+      "passes_kept": 4,
+      "ssim": 0.5318202657799523
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "solid",
+      "passes_kept": 5,
+      "ssim": 0.8762731345227448
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "flat_ui",
+      "passes_kept": 5,
+      "ssim": 0.5335134401368489
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "text",
+      "passes_kept": 5,
+      "ssim": 0.6191377657549854
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "gradient",
+      "passes_kept": 5,
+      "ssim": 0.5326412933851608
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "photo",
+      "passes_kept": 5,
+      "ssim": 0.6704468831055702
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "motion",
+      "passes_kept": 5,
+      "ssim": 0.5318202657799523
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "solid",
+      "passes_kept": 6,
+      "ssim": 0.8762731345227448
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "flat_ui",
+      "passes_kept": 6,
+      "ssim": 0.5335134401368489
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "text",
+      "passes_kept": 6,
+      "ssim": 0.6191377657549854
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "gradient",
+      "passes_kept": 6,
+      "ssim": 0.5597903381238185
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "photo",
+      "passes_kept": 6,
+      "ssim": 0.5981556367721197
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "motion",
+      "passes_kept": 6,
+      "ssim": 0.5318202657799523
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "solid",
+      "passes_kept": 7,
+      "ssim": 0.9778881683107101
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "flat_ui",
+      "passes_kept": 7,
+      "ssim": 0.7683079061842447
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "text",
+      "passes_kept": 7,
+      "ssim": 0.7047155757107585
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "gradient",
+      "passes_kept": 7,
+      "ssim": 0.8614683342652963
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "photo",
+      "passes_kept": 7,
+      "ssim": 0.5875053616507004
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "motion",
+      "passes_kept": 7,
+      "ssim": 0.8740597381124106
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "solid",
+      "passes_kept": 8,
+      "ssim": 0.9970284674001586
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "flat_ui",
+      "passes_kept": 8,
+      "ssim": 0.8981279913939937
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "text",
+      "passes_kept": 8,
+      "ssim": 0.8869654408707214
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "gradient",
+      "passes_kept": 8,
+      "ssim": 0.9688188909713663
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "photo",
+      "passes_kept": 8,
+      "ssim": 0.812052178617013
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "motion",
+      "passes_kept": 8,
+      "ssim": 0.9480180391324649
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "solid",
+      "passes_kept": 9,
+      "ssim": 0.998953645816691
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "flat_ui",
+      "passes_kept": 9,
+      "ssim": 0.9813188990868019
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "text",
+      "passes_kept": 9,
+      "ssim": 0.9877172082101091
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "gradient",
+      "passes_kept": 9,
+      "ssim": 0.9734129297974674
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "photo",
+      "passes_kept": 9,
+      "ssim": 0.9314474795546435
+    },
+    {
+      "codec": "cdf53_per_pass",
+      "class": "motion",
+      "passes_kept": 9,
+      "ssim": 0.9897406330026646
+    }
+  ],
+  "bytes_to_lossless": [
+    {
+      "codec": "cdf53",
+      "class": "solid",
+      "bytes_per_pass": [
+        9,
+        9,
+        9,
+        9,
+        9,
+        9,
+        13,
+        13,
+        17,
+        17,
+        13,
+        13,
+        17,
+        17
+      ],
+      "bytes_total": 174
+    },
+    {
+      "codec": "cdf53",
+      "class": "flat_ui",
+      "bytes_per_pass": [
+        316,
+        9,
+        9,
+        9,
+        9,
+        9,
+        35,
+        134,
+        202,
+        212,
+        309,
+        289,
+        333,
+        343
+      ],
+      "bytes_total": 2218
+    },
+    {
+      "codec": "cdf53",
+      "class": "text",
+      "bytes_per_pass": [
+        399,
+        9,
+        9,
+        9,
+        9,
+        9,
+        156,
+        363,
+        378,
+        432,
+        348,
+        333,
+        273,
+        327
+      ],
+      "bytes_total": 3054
+    },
+    {
+      "codec": "cdf53",
+      "class": "gradient",
+      "bytes_per_pass": [
+        128,
+        9,
+        9,
+        9,
+        9,
+        10,
+        15,
+        19,
+        18,
+        30,
+        63,
+        147,
+        113,
+        406
+      ],
+      "bytes_total": 985
+    },
+    {
+      "codec": "cdf53",
+      "class": "photo",
+      "bytes_per_pass": [
+        546,
+        9,
+        9,
+        9,
+        9,
+        58,
+        346,
+        515,
+        507,
+        512,
+        471,
+        458,
+        478,
+        473
+      ],
+      "bytes_total": 4400
+    },
+    {
+      "codec": "cdf53",
+      "class": "motion",
+      "bytes_per_pass": [
+        278,
+        9,
+        9,
+        9,
+        9,
+        9,
+        34,
+        94,
+        128,
+        170,
+        284,
+        285,
+        257,
+        200
+      ],
+      "bytes_total": 1775
+    }
+  ]
+}
