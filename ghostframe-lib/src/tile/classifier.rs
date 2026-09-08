@@ -332,19 +332,19 @@ pub struct Classifier {
     refinement_deficit_tiles: u32,
     /// M3.7a env-var override: when `Some`, `decide_inner` uses this
     /// instead of `REFINEMENT_BIAS_PER_TILE_US`. Populated from
-    /// `GHOSTFRAME_TEST_REFINEMENT_BIAS_US` in `Default::default()` under
+    /// `ClassifierConfig` in `Classifier::new` under
     /// `cfg(any(test, feature = "test-loss-injection"))`. `None` in
-    /// production builds (env var ignored).
+    /// production builds.
     #[cfg(any(test, feature = "test-loss-injection"))]
     refinement_bias_us_override: Option<f32>,
     /// M3.7a env-var override: when `Some`, `decide_inner` uses this
     /// instead of `LOSS_OVERRIDE_THRESHOLD`. Populated from
-    /// `GHOSTFRAME_TEST_LOSS_OVERRIDE_THRESHOLD` in `Default::default()`
+    /// `ClassifierConfig` in `Classifier::new`
     /// under `cfg(any(test, feature = "test-loss-injection"))`.
     #[cfg(any(test, feature = "test-loss-injection"))]
     loss_override_threshold_override: Option<f32>,
     /// M3.7b env-var override for HEADROOM_MIN_BYTES_PER_US. Populated
-    /// from `GHOSTFRAME_TEST_HEADROOM_MIN_BPUS` in `Default::default()`.
+    /// from `ClassifierConfig` in `Classifier::new`.
     /// Cfg-gated under `test-loss-injection`.
     #[cfg(any(test, feature = "test-loss-injection"))]
     headroom_min_bpus_override: Option<f32>,
@@ -353,7 +353,7 @@ pub struct Classifier {
     /// Lets tests isolate end-to-end behaviour of a specific codec path
     /// (e.g. H.264 colorspace) without depending on the M3.6 mode-switch
     /// policy firing on its own. Populated from
-    /// `GHOSTFRAME_TEST_FORCE_FRAME_MODE` in `Default::default()` —
+    /// `ClassifierConfig` in `Classifier::new` —
     /// accepts `"h264"` or `"tile"`. `None` in production builds.
     #[cfg(any(test, feature = "test-loss-injection"))]
     force_frame_mode_override: Option<FrameMode>,
@@ -373,9 +373,17 @@ impl Classifier {
     /// callers (including tests) no longer need `crate::test_env::lock_env()`
     /// to avoid racing other threads' `std::env::set_var` calls.
     pub fn new(config: crate::config::ClassifierConfig) -> Self {
-        // Referenced unconditionally so production builds (without `test`
-        // or `test-loss-injection`, where none of the fields below read
-        // from it) don't warn on an unused parameter.
+        // Production builds compile none of the override assignments below, so
+        // every field of `config` is discarded. That is correct only while
+        // ClassifierConfig holds test-only knobs; assert it, so adding a
+        // production-relevant field here fails loudly in debug rather than
+        // being silently ignored in release.
+        #[cfg(not(any(test, feature = "test-loss-injection")))]
+        debug_assert_eq!(
+            config,
+            crate::config::ClassifierConfig::default(),
+            "ClassifierConfig gained a field that production silently ignores"
+        );
         let _ = &config;
         Self {
             cost: CostModel::default(),
