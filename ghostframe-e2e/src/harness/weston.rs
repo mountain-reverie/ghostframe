@@ -64,7 +64,7 @@ pub fn spawn_weston_headless() -> Result<WestonGuard> {
     let pid = std::process::id();
     #[allow(
         clippy::disallowed_methods,
-        reason = "not a duration measurement -- Instant::now().elapsed() is used here purely to mix a few bits of near-zero nanosecond jitter into the runtime-dir name alongside the pid; this harness process never runs under tokio::time::pause(), so there is no virtual clock to accidentally read instead"
+        reason = "not a duration measurement -- Instant::now().elapsed() mixes a few bits of near-zero nanosecond jitter into the runtime-dir name alongside the pid. Safe because the base is a fresh std::time::Instant::now(), never a now_std() value, so both ends read the same clock regardless of whether some other test in this crate has tokio time paused"
     )]
     let runtime_dir = std::env::temp_dir().join(format!(
         "ghostframe-weston-{}-{}",

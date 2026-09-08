@@ -716,7 +716,7 @@ impl Classifier {
         // usually catches in this codebase.
         #[allow(
             clippy::disallowed_methods,
-            reason = "decide_frame_mode() is the non-harness wrapper by design (see doc comment) -- its callers never run under tokio::time::pause(), so self.epoch here is always a real wall-clock Instant and .elapsed() is safe"
+            reason = "self.epoch is stamped with a real std::time::Instant at construction, never from now_std(), so .elapsed() compares wall against wall and cannot saturate. Callers may run under tokio::time::pause() -- io_bridge's negative-control test does so deliberately -- but that is exactly the stale-dwell behaviour this wrapper is being contrasted against there. Production reads the bridge clock via decide_frame_mode_at()"
         )]
         let now_us = self.epoch.elapsed().as_micros() as u64;
         self.decide_frame_mode_at(now_us, tentative_states, prev_mode)

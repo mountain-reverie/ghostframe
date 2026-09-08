@@ -53,9 +53,10 @@ use crate::transport::webtransport::WebTransportServer;
 // ---------------------------------------------------------------------------
 // Clock discipline
 // ---------------------------------------------------------------------------
-// This file has exactly three deliberate exceptions to "always call
+// This file has exactly two deliberate exceptions to "always call
 // now_std()", each measuring something that must keep moving even while the
-// browserless harness has tokio's clock paused:
+// browserless harness has tokio's clock paused. Everything else in the server
+// loop goes through now_std():
 //
 //   1. The `process_frame` duration probe (`t0`/`dt_us`, ~line 1000 below) --
 //      measures real CPU cost of encode work, not protocol/deadline time.
@@ -63,7 +64,6 @@ use crate::transport::webtransport::WebTransportServer;
 //      is paired *offline*, after the fact, with xdaemon's `capture_done_ns`
 //      timestamp from a separate process. Neither process shares the other's
 //      tokio runtime, so there is no virtual clock to route through here.
-//   3. Everything else in the server loop uses `now_std()`.
 //
 // Any new timing probe you add should be `now_std()` unless it is
 // measuring real wall/CPU time for something outside tokio's control (in
