@@ -11,9 +11,14 @@ async fn io_bridge_constructs_from_a_socketpair() {
     let (ours, _peer) = UnixStream::pair().expect("UnixStream::pair");
     let server = QuicServer::new().expect("QuicServer::new");
     let bridge = IoBridge::new_with_stream_for_test(ours, server);
-    assert_eq!(
-        bridge.cert_hash_sha256().len(),
-        64,
-        "cert hash must be 64 hex chars"
+
+    // The assertion that matters is structural: this crate can link and call
+    // the constructor at all under `browserless-harness`. Real scene coverage
+    // arrives with the harness in a later task.
+    let hash = bridge.cert_hash_sha256();
+    assert_eq!(hash.len(), 64, "cert hash must be 64 hex chars");
+    assert!(
+        hash.chars().all(|c| c.is_ascii_hexdigit()),
+        "cert hash must be hex, got {hash:?}"
     );
 }
