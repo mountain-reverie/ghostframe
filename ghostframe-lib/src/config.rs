@@ -25,7 +25,7 @@ pub struct ClassifierConfig {
 }
 
 /// Transport-layer knobs: fault injection, pacing overrides, FEC.
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct TransportConfig {
     // `loss_injection` is itself a `#[cfg(any(test, feature =
     // "test-loss-injection"))]` module (`transport/mod.rs:17`), so these two
@@ -65,7 +65,7 @@ pub struct DiagnosticsConfig {
     // now would imply a wiring that does not exist.
 }
 
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct LibConfig {
     pub classifier: ClassifierConfig,
     pub transport: TransportConfig,
