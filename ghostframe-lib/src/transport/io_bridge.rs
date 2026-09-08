@@ -1233,6 +1233,44 @@ impl IoBridge {
         min_space.unwrap_or(usize::MAX)
     }
 
+    /// Clamp an injected-scene drain budget to what quinn can actually
+    /// absorb right now, the same `quinn_cap` computation
+    /// `dispatch_dirty_tiles_via_scheduler` applies to its AIMD-derived
+    /// budget (see the long comment on `tick_budget_bytes` there, and the
+    /// module-level history at `:145-152`): a `scheduler.tick(usize::MAX)`
+    /// drain against a large first-frame CDF53 burst once catastrophically
+    /// overran `datagram_send_buffer`, with quinn either silently
+    /// overwriting queued datagrams or returning `Blocked` and dropping the
+    /// already-popped `TileWork` on the floor. `drain_refinement_pass_major`
+    /// uses `queue.remove(idx)` (not `InFlight` retention), so an
+    /// over-popped refinement pass has no scheduler-side retry — only the
+    /// emitter's bounded RTO.
+    ///
+    /// `apply_injected_frame`'s only caller (the browserless harness) passes
+    /// `budget_bytes: usize::MAX` — wave 1 relies entirely on the netsim's
+    /// token bucket for pacing, and that bucket is consumed inside
+    /// `send_to_all_sessions`, i.e. *below* quinn's `datagram_send_buffer`.
+    /// It shapes what reaches the socket but cannot stop the scheduler from
+    /// over-popping into quinn. Without this clamp, the injected path would
+    /// reproduce the `:145-152` bug on every drain.
+    ///
+    /// Deliberately does NOT apply `tick_budget_multiplier` (AIMD) — that
+    /// feedback loop is not exercised on the injected path.
+    ///
+    /// Factored out of `apply_injected_frame` (rather than inlined) so unit
+    /// tests can pin this arithmetic directly: `apply_injected_frame`'s own
+    /// call site sits behind `compute_max_datagram_size()`, which requires a
+    /// live, post-handshake `quinn_proto::Connection` to ever return `Some`
+    /// — exactly the machinery the browserless harness (Task 15) exists to
+    /// provide, and out of scope to fabricate here (see the doc comment on
+    /// `injected_work_is_enqueued_and_drain_is_attempted` below for the same
+    /// call).
+    fn clamp_injected_budget(&mut self, budget_bytes: usize) -> usize {
+        let quinn_space = self.min_session_send_buffer_space();
+        let quinn_cap = ((quinn_space as f64) * QUINN_SEND_BUFFER_SAFETY_FRACTION) as usize;
+        budget_bytes.min(quinn_cap)
+    }
+
     /// Emit the frame-dimensions datagram on the first frame of each session and
     /// whenever dimensions change, retransmitting `FRAME_DIMENSIONS_RETRANSMITS`
     /// additional times to absorb datagram loss. Called by both
@@ -1733,11 +1771,15 @@ impl IoBridge {
             self.scheduler.enqueue(work);
         }
         if let Some(max_frag) = self.compute_max_datagram_size() {
+            // Never pop more from the scheduler than quinn can absorb right
+            // now — see `clamp_injected_budget`'s doc comment for why this
+            // is mandatory rather than defensive.
+            let budget_bytes = self.clamp_injected_budget(inj.budget_bytes);
             let _ = self.drain_scheduler_into_quinn(
                 inj.seq,
                 inj.timestamp_us,
                 max_frag,
-                inj.budget_bytes,
+                budget_bytes,
             );
         }
         // Mirror the frame path's post-dispatch RTO sweep so injected
@@ -6736,6 +6778,55 @@ mod tests {
             snap2.bitrate_bps,
             crate::transport::bwe::BweWrapper::INITIAL_BPS,
         );
+    }
+
+    /// Regression test for the injected-path over-pop bug: `apply_injected_frame`
+    /// must clamp its drain budget to what quinn can absorb, the same way
+    /// `dispatch_dirty_tiles_via_scheduler` clamps its AIMD budget (see the
+    /// `:145-152` module history and `clamp_injected_budget`'s doc comment).
+    ///
+    /// This exercises the real `clamp_injected_budget` method directly rather
+    /// than through `apply_injected_frame`/`drain_injection_for_test`: that
+    /// call site sits behind `compute_max_datagram_size()`, which only
+    /// returns `Some` once a real, post-handshake `quinn_proto::Connection`
+    /// exists — precisely the machinery the browserless harness (Task 15) is
+    /// responsible for providing (see `injected_work_is_enqueued_and_drain_is_attempted`
+    /// just below for the same constraint on the enqueue/drain path).
+    /// Building a bespoke in-process QUIC+WebTransport handshake fixture
+    /// here would be scope creep well beyond these three divergence fixes.
+    ///
+    /// What this DOES prove: with zero connected sessions,
+    /// `min_session_send_buffer_space()` — the only thing
+    /// `clamp_injected_budget` consults — falls back to `usize::MAX`
+    /// (documented, existing behavior), and the clamp still strictly bounds
+    /// a `usize::MAX` caller-supplied budget rather than passing it through
+    /// unchanged. If `clamp_injected_budget` ever degenerated into a no-op
+    /// (e.g. someone "simplifies" away the `.min()`), this test catches it
+    /// even though no live session is involved.
+    #[tokio::test(start_paused = true)]
+    async fn clamp_injected_budget_bounds_a_usize_max_request() {
+        let (ours, _peer) = tokio::net::UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("QuicServer::new");
+        let (_tx, rx) = mpsc::channel(8);
+        let mut bridge = IoBridge::new_with_injection_for_test(ours, server, rx, 4, 4);
+
+        // No connected sessions -> min_session_send_buffer_space() falls
+        // back to usize::MAX (see its doc comment).
+        let quinn_space = bridge.min_session_send_buffer_space();
+        assert_eq!(quinn_space, usize::MAX);
+
+        let clamped = bridge.clamp_injected_budget(usize::MAX);
+        assert!(
+            clamped < usize::MAX,
+            "clamp_injected_budget(usize::MAX) must strictly bound the \
+             request even in the no-sessions fallback case; got {clamped}, \
+             which means the harness's usize::MAX budget would reach \
+             drain_scheduler_into_quinn unclamped exactly like the \
+             historical bug at :145-152"
+        );
+        // Pin the exact formula: quinn_space scaled by the safety fraction.
+        let expected = ((quinn_space as f64) * QUINN_SEND_BUFFER_SAFETY_FRACTION) as usize;
+        assert_eq!(clamped, expected);
     }
 
     /// Task 3: the tile-injection channel must enqueue injected work into
