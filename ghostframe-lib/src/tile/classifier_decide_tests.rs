@@ -432,6 +432,7 @@ fn mode_decision_event_emitted_only_on_transition() {
 
 #[test]
 fn env_var_override_refinement_bias_us() {
+    let _env = crate::test_env::lock_env();
     use crate::tile::classifier::{AdaptationContext, Classifier, REFINEMENT_BIAS_PER_TILE_US};
     use crate::tile::{CodecState, FrameMode};
     // NB: this test mutates process env vars and races other lib tests that
@@ -511,6 +512,7 @@ fn env_var_override_refinement_bias_us() {
 
 #[test]
 fn env_var_override_loss_override_threshold() {
+    let _env = crate::test_env::lock_env();
     use crate::tile::classifier::{AdaptationContext, Classifier, LOSS_OVERRIDE_THRESHOLD};
     use crate::tile::{CodecState, FrameMode};
     // NB: this test mutates process env vars and races other lib tests that
@@ -545,6 +547,7 @@ fn env_var_override_loss_override_threshold() {
 
 #[test]
 fn env_var_override_headroom_min_bpus() {
+    let _env = crate::test_env::lock_env();
     use crate::tile::classifier::{AdaptationContext, Classifier, HEADROOM_MIN_BYTES_PER_US};
     use crate::tile::{CodecState, FrameMode};
     // NB: this test mutates process env vars and races other lib tests that
@@ -583,6 +586,7 @@ fn env_var_override_headroom_min_bpus() {
 /// M3.6 dynamic mode-switch policy firing on its own.
 #[test]
 fn env_var_force_frame_mode_h264_pins_classifier() {
+    let _env = crate::test_env::lock_env();
     use crate::tile::classifier::Classifier;
     use crate::tile::{CodecState, FrameMode};
 
@@ -605,6 +609,7 @@ fn env_var_force_frame_mode_h264_pins_classifier() {
 
 #[test]
 fn env_var_force_frame_mode_tile_pins_classifier() {
+    let _env = crate::test_env::lock_env();
     use crate::tile::classifier::{AdaptationContext, Classifier};
     use crate::tile::{CodecState, FrameMode};
 
@@ -641,6 +646,7 @@ fn env_var_force_frame_mode_tile_pins_classifier() {
 /// under wire loss, masking tile-codec regressions).
 #[test]
 fn env_var_force_tilecodec_pins_classifier() {
+    let _env = crate::test_env::lock_env();
     use crate::tile::classifier::{AdaptationContext, Classifier};
     use crate::tile::{CodecState, FrameMode};
 
@@ -672,6 +678,7 @@ fn env_var_force_tilecodec_pins_classifier() {
 
 #[test]
 fn env_var_force_tilecodec_true_also_pins() {
+    let _env = crate::test_env::lock_env();
     use crate::tile::classifier::Classifier;
     use crate::tile::{CodecState, FrameMode};
 
@@ -690,6 +697,7 @@ fn env_var_force_tilecodec_true_also_pins() {
 
 #[test]
 fn env_var_force_tilecodec_other_values_ignored() {
+    let _env = crate::test_env::lock_env();
     use crate::tile::classifier::Classifier;
     use crate::tile::{CodecState, FrameMode};
 
@@ -714,6 +722,7 @@ fn env_var_force_tilecodec_other_values_ignored() {
 
 #[test]
 fn env_var_force_frame_mode_unknown_value_ignored() {
+    let _env = crate::test_env::lock_env();
     use crate::tile::classifier::Classifier;
     use crate::tile::{CodecState, FrameMode};
 

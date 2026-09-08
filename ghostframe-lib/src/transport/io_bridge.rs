@@ -5364,6 +5364,7 @@ mod tests {
 
     #[test]
     fn loss_injector_from_env_parses_probability_and_predicate() {
+        let _env = crate::test_env::lock_env();
         // Use std::env carefully: serial within this test.
         std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "0.5");
         std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE", "tile");
@@ -5391,6 +5392,7 @@ mod tests {
 
     #[test]
     fn loss_injector_from_env_returns_none_when_unset() {
+        let _env = crate::test_env::lock_env();
         // Ensure no leftover from prior tests.
         std::env::remove_var("GHOSTFRAME_INBOUND_LOSS_PROBABILITY");
         assert!(IoBridge::loss_injector_from_env("INBOUND").is_none());
@@ -5399,6 +5401,7 @@ mod tests {
     #[cfg(any(test, feature = "test-loss-injection"))]
     #[test]
     fn oob_injector_from_env_parses() {
+        let _env = crate::test_env::lock_env();
         // Saved/restored to avoid leaking into sibling tests that run in the
         // same process (cargo test default uses threads but env-var leak is a
         // common test fragility — guard explicitly).
@@ -5415,6 +5418,12 @@ mod tests {
 
     #[tokio::test]
     async fn maybe_fire_session_reset_skips_first_connect_fires_on_reconnect() {
+        // Doesn't set/read a GHOSTFRAME_* var directly, but `fire_session_reset`
+        // (called transitively via `maybe_fire_session_reset`) reads
+        // GHOSTFRAME_SKIP_PALETTE_SESSION_RESET internally, and this test's
+        // reconnect assertion assumes it's unset. It races
+        // `skip_palette_session_reset_from_env_parses`, which sets it to "1".
+        let _env = crate::test_env::lock_env();
         use crate::transport::quic::QuicServer;
         use crate::transport::webtransport::WebTransportServer;
         use quinn_proto::ConnectionHandle;
@@ -5490,6 +5499,7 @@ mod tests {
     #[cfg(any(test, feature = "test-loss-injection"))]
     #[test]
     fn skip_palette_session_reset_from_env_parses() {
+        let _env = crate::test_env::lock_env();
         let prev = std::env::var("GHOSTFRAME_SKIP_PALETTE_SESSION_RESET").ok();
         std::env::set_var("GHOSTFRAME_SKIP_PALETTE_SESSION_RESET", "1");
         let got = IoBridge::skip_palette_session_reset_from_env();
@@ -5510,6 +5520,7 @@ mod tests {
 
     #[test]
     fn diagnose_tiles_env_var_parses() {
+        let _env = crate::test_env::lock_env();
         std::env::set_var("GHOSTFRAME_DIAGNOSE_TILES", "1");
         let on = IoBridge::diagnose_tiles_from_env();
         std::env::remove_var("GHOSTFRAME_DIAGNOSE_TILES");
@@ -5939,6 +5950,7 @@ mod tests {
 
     #[test]
     fn palrle_bundled_predicate_matches_bundled_datagram() {
+        let _env = crate::test_env::lock_env();
         // Synthetic wire: tile datagram, codec=PalRle, flags byte with bundle bit.
         // Wire layout: [DatagramHeader DATAGRAM_HEADER_SIZE][TileHeader TILE_HEADER_SIZE][payload].
         let mut wire = vec![0u8; PALRLE_MIN_WIRE_LEN];
@@ -5957,6 +5969,7 @@ mod tests {
 
     #[test]
     fn palrle_bundled_predicate_rejects_thin_datagram() {
+        let _env = crate::test_env::lock_env();
         let mut wire = vec![0u8; PALRLE_MIN_WIRE_LEN];
         wire[0] = 0x80;
         wire[CODEC_BYTE_OFFSET] = (crate::transport::protocol::Codec::PalRle as u8) << 1;
@@ -5973,6 +5986,7 @@ mod tests {
 
     #[test]
     fn palrle_thin_predicate_matches_thin_only() {
+        let _env = crate::test_env::lock_env();
         let mut wire = vec![0u8; PALRLE_MIN_WIRE_LEN];
         wire[0] = 0x80;
         wire[CODEC_BYTE_OFFSET] = (crate::transport::protocol::Codec::PalRle as u8) << 1;
