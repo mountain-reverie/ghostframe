@@ -164,6 +164,12 @@ mod tests {
         );
         std::env::remove_var("GHOSTFRAME_TEST_FORCE_FRAME_MODE");
         assert_eq!(ClassifierConfig::from_env().force_frame_mode, None);
+        std::env::set_var("GHOSTFRAME_TEST_FORCE_FRAME_MODE", "bogus");
+        assert_eq!(
+            ClassifierConfig::from_env().force_frame_mode, None,
+            "an unrecognised value must be ignored, not guessed at"
+        );
+        std::env::remove_var("GHOSTFRAME_TEST_FORCE_FRAME_MODE");
     }
 
     #[test]
