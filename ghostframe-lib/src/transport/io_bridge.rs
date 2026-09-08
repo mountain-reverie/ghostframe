@@ -44,8 +44,7 @@ use crate::transport::ghostbridge::{
 use crate::transport::protocol::{
     build_frame_parity_datagram, fragment_frame, fragment_tile, max_fragment_payload,
     max_frame_fragment_payload, Codec, FrameHeader, NackMessage, TileFragmentInputs,
-    DATAGRAM_HEADER_SIZE, FRAME_HEADER_SIZE, PING_PAYLOAD, PONG_PAYLOAD, TILE_DATAGRAM_FLAG,
-    TILE_HEADER_SIZE,
+    FRAME_HEADER_SIZE, PING_PAYLOAD, PONG_PAYLOAD, TILE_DATAGRAM_FLAG,
 };
 use crate::transport::quic::QuicServer;
 use crate::transport::webtransport::WebTransportServer;
