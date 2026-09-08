@@ -530,6 +530,12 @@ git commit -m "refactor(io_bridge): diagnostics from config; dump path is owned 
 **Files:**
 - Modify: `ghostframe-lib/src/server.rs`, `ghostframe-lib/src/ffi.rs`, `ghostframe-xdaemon/src/main.rs`
 
+Also convert the two remaining `Classifier::default()` call sites in
+`ghostframe-lib/src/tile/classifier_cost_tests.rs` to
+`Classifier::new(ClassifierConfig::default())` — they were outside the file scope
+of the earlier conversion and are the last tests still picking up ambient
+configuration.
+
 - [ ] **Step 1: Thread `LibConfig` through `GhostframeServer::new`**
 
 Its signature today is `GhostframeServer::new(config: GhostbridgeConfig, listen_addr, input_injector)` — called from `ghostframe-xdaemon/src/main.rs:171` and `ghostframe-lib/src/ffi.rs:55`. Add a `lib_config: LibConfig` parameter and pass its slices down to `IoBridge`.
@@ -607,17 +613,26 @@ git commit -m "test: retire the env lock now that only config parsing reads env"
 - [ ] **Step 1: Verify the invariant holds locally**
 
 ```bash
-grep -rn 'env::var' ghostframe-lib/src --include='*.rs' | grep -v '^ghostframe-lib/src/config.rs'
+grep -rn 'env::var' ghostframe-lib/src --include='*.rs' \
+  | grep -v '^ghostframe-lib/src/config.rs' \
+  | grep -vE ':[0-9]+: *(//|///|//!)'
 ```
 
-Expected: no output. If anything matches, that read was missed — convert it before proceeding, or report it if converting is out of scope.
+Expected: no output. The second filter drops comment lines: an earlier version of this
+check matched prose, which pressured an implementer into rewording doc comments to
+satisfy it. A guard that makes people write worse comments is worse than no guard.
 
 - [ ] **Step 2: Add the check to the `clippy` job**
 
 ```yaml
       - name: ghostframe-lib reads env only in config.rs
         run: |
-          if grep -rn 'env::var' ghostframe-lib/src --include='*.rs' | grep -v '^ghostframe-lib/src/config.rs'; then
+          # Comment lines are excluded deliberately: the guard constrains code,
+          # not prose. Matching comments would push authors to stop naming
+          # `env::var` in documentation, which is the opposite of useful.
+          if grep -rn 'env::var' ghostframe-lib/src --include='*.rs' \
+               | grep -v '^ghostframe-lib/src/config.rs' \
+               | grep -vE ':[0-9]+: *(//|///|//!)'; then
             echo "::error::ghostframe-lib must read std::env only in config.rs"
             exit 1
           fi
