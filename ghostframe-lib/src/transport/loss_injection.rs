@@ -31,7 +31,11 @@ impl SplitMix {
     }
 }
 
-#[derive(Debug, Clone)]
+/// Not `Clone`: it carries a `SplitMix` PRNG by value, so cloning it would
+/// replay the *same* drop sequence from the point of the clone rather than
+/// producing an independent one. Two injectors that need independent
+/// sequences should each be built with `new()` and a distinct seed instead.
+#[derive(Debug)]
 pub struct LossInjector {
     drop_probability: f32,
     predicate: DropPredicate,

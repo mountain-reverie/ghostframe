@@ -8,23 +8,36 @@
 //!
 //! Variable names and parsing are frozen: the e2e suite drives the
 //! containerised daemon through these exact names.
+//!
+//! ## Adding a variable
+//!
+//! 1. Add a field to the relevant `*Config` struct (or a new one), with a
+//!    doc comment naming its environment variable and accepted range.
+//! 2. Parse it in that config's `from_lookup` (or `from_env`, for configs
+//!    that have not yet been converted).
+//! 3. Thread it through the constructor of whatever it configures.
+//! 4. Never read `std::env` at the consumption site — that reintroduces the
+//!    process-global race this module exists to remove.
 
 use crate::tile::FrameMode;
 
-/// Knobs the frame-mode classifier reads. All `None`/default means production
-/// behaviour.
-///
-/// All fields carry test-only tuning knobs. A production-relevant tunable
-/// would need wiring in `Classifier::new` and other codepaths that does
-/// not yet exist.
+/// Test-only tuning knobs for the frame-mode classifier. All `None`/default
+/// means production behaviour: a production-relevant tunable would need
+/// wiring in `Classifier::new` and other codepaths that does not yet exist.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ClassifierConfig {
     /// Pins the frame mode. Fed by `GHOSTFRAME_TEST_FORCE_FRAME_MODE`, or by
     /// `GHOSTFRAME_FORCE_TILECODEC=1|true` as a high-level alias for
     /// `TileCodec`.
     pub force_frame_mode: Option<FrameMode>,
+    /// Overrides `REFINEMENT_BIAS_PER_TILE_US`. Fed by
+    /// `GHOSTFRAME_TEST_REFINEMENT_BIAS_US`; accepts any value `> 0.0`.
     pub refinement_bias_us: Option<f32>,
+    /// Overrides `HEADROOM_MIN_BYTES_PER_US`. Fed by
+    /// `GHOSTFRAME_TEST_HEADROOM_MIN_BPUS`; accepts any value `> 0.0`.
     pub headroom_min_bpus: Option<f32>,
+    /// Overrides `LOSS_OVERRIDE_THRESHOLD`. Fed by
+    /// `GHOSTFRAME_TEST_LOSS_OVERRIDE_THRESHOLD`; accepts `(0.0, 1.0]`.
     pub loss_override_threshold: Option<f32>,
 }
 
@@ -79,7 +92,12 @@ impl ClassifierConfig {
 }
 
 /// Transport-layer knobs: fault injection, pacing overrides, FEC.
-#[derive(Debug, Clone, Default)]
+///
+/// Deliberately not `Clone`: `outbound_loss`/`inbound_loss` carry a
+/// `LossInjector`, whose PRNG state a clone would duplicate rather than
+/// fork, producing bit-identical "independent" loss sequences. See
+/// `LossInjector`'s doc comment.
+#[derive(Debug, Default)]
 pub struct TransportConfig {
     // `loss_injection` is itself a `#[cfg(any(test, feature =
     // "test-loss-injection"))]` module (`transport/mod.rs:17`), so these two
@@ -119,7 +137,9 @@ pub struct DiagnosticsConfig {
     // now would imply a wiring that does not exist.
 }
 
-#[derive(Debug, Clone, Default)]
+/// Not `Clone`: `transport` carries `TransportConfig`, which is not `Clone`
+/// (see its doc comment).
+#[derive(Debug, Default)]
 pub struct LibConfig {
     pub classifier: ClassifierConfig,
     pub transport: TransportConfig,
@@ -148,6 +168,8 @@ mod tests {
         assert!(!cfg.diagnostics.diagnose_gpu_pipeline);
         assert!(!cfg.diagnostics.diagnose_color_hist);
         assert!(cfg.diagnostics.dump_frame_path.is_none());
+        assert!(cfg.diagnostics.cdf53_diff_tile.is_none());
+        assert!(!cfg.diagnostics.cdf53_dump_pending);
     }
 
     /// Build a lookup closure over a small fixture, the way `from_env` builds
@@ -159,30 +181,19 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        move |key: &str| {
-            pairs
-                .iter()
-                .find(|(k, _)| k == key)
-                .map(|(_, v)| v.clone())
-        }
+        move |key: &str| pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
     }
 
     #[test]
     fn classifier_config_parses_force_frame_mode() {
         assert_eq!(
-            ClassifierConfig::from_lookup(lookup(&[(
-                "GHOSTFRAME_TEST_FORCE_FRAME_MODE",
-                "h264"
-            )]))
-            .force_frame_mode,
+            ClassifierConfig::from_lookup(lookup(&[("GHOSTFRAME_TEST_FORCE_FRAME_MODE", "h264")]))
+                .force_frame_mode,
             Some(FrameMode::H264)
         );
         assert_eq!(
-            ClassifierConfig::from_lookup(lookup(&[(
-                "GHOSTFRAME_TEST_FORCE_FRAME_MODE",
-                "tile"
-            )]))
-            .force_frame_mode,
+            ClassifierConfig::from_lookup(lookup(&[("GHOSTFRAME_TEST_FORCE_FRAME_MODE", "tile")]))
+                .force_frame_mode,
             Some(FrameMode::TileCodec)
         );
         assert_eq!(
@@ -190,11 +201,8 @@ mod tests {
             None
         );
         assert_eq!(
-            ClassifierConfig::from_lookup(lookup(&[(
-                "GHOSTFRAME_TEST_FORCE_FRAME_MODE",
-                "bogus"
-            )]))
-            .force_frame_mode,
+            ClassifierConfig::from_lookup(lookup(&[("GHOSTFRAME_TEST_FORCE_FRAME_MODE", "bogus")]))
+                .force_frame_mode,
             None,
             "an unrecognised value must be ignored, not guessed at"
         );
