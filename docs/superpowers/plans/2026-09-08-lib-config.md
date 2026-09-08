@@ -541,6 +541,25 @@ git commit -m "refactor(io_bridge): take transport settings from TransportConfig
 
 - [ ] **Step 2: Run to verify it fails.**
 
+**Scope, re-verified after Tasks 4-5 (which already wired the three
+`diagnose_*` fields).** Six env reads remain in the crate outside `config.rs`:
+
+| Site | Variable | This task? |
+|---|---|---|
+| `io_bridge.rs:2407` | `GHOSTFRAME_DUMP_FRAME` | yes |
+| `io_bridge.rs:3215` | `GHOSTFRAME_CDF53_DIFF_TILE` (`cdf53-diag`) | yes |
+| `io_bridge.rs:3564` | `GHOSTFRAME_CDF53_DUMP_PENDING` (`cdf53-diag`) | yes |
+| `io_bridge.rs:3230,3233` | `GHOSTFRAME_CDF53_SKIP_L2_L3` / `_L3` | **yes — add the two fields after all** |
+| `gpu_pipeline/frame.rs:3682,3778-3779` | same two variables | no — deferred |
+
+Task 1 deliberately omitted `cdf53_skip_l2_l3` / `cdf53_skip_l3` from
+`DiagnosticsConfig` because the reads were thought to live only in the Vulkan
+dispatch path. Two of them are in `io_bridge.rs`, which this task is converting
+anyway — so add both fields and wire those two sites. That leaves
+`gpu_pipeline/frame.rs` as the *only* file outside `config.rs` reading env,
+which makes Task 9's guard a clean file-level exemption instead of a
+line-level one.
+
 - [ ] **Step 3: Implement**
 
 `GHOSTFRAME_DUMP_FRAME` is currently read *and then cleared with `remove_var`* to make the dump one-shot — the environment is being used as mutable state. Replace that with an owned `Option<String>` on the bridge and a `take_dump_frame_path(&mut self) -> Option<String>` that `Option::take`s it. Wire `diagnose_tiles`, `diagnose_gpu_pipeline`, `diagnose_color_hist`, `cdf53_diff_tile`, and `cdf53_dump_pending` from the config at the same time.
