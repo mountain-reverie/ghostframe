@@ -455,6 +455,16 @@ git commit -m "feat(config): TransportConfig::from_env; BandwidthCap takes a rat
 
 - [ ] **Step 3: Implement**
 
+**Move the loss injectors out of the config; do not clone them.** `LossInjector`
+now derives `Clone` (so `LibConfig` can be `Debug`/`Clone`), and its `rng:
+SplitMix { state: u64 }` means a clone replays the *same* drop sequence rather
+than an independent one. Before that derive existed, `should_drop(&mut self)`
+made two live injectors a compile error; now it is one `.clone()` away. If
+per-session bridges were ever built by cloning one `LibConfig`, every session
+would get bit-identical loss — a loss-injection harness that lies. Take them
+with `Option::take` on a `&mut TransportConfig`, or move the whole config in by
+value. Do not `.clone()` a `TransportConfig` that carries injectors.
+
 `IoBridge::new` gains a `transport: TransportConfig` parameter, and the struct literal at `io_bridge.rs:945-958` takes its values from it instead of calling the `*_from_env` helpers. The five constructors — `new`, `new_with_frames`, `new_with_stream_for_test`, `new_with_frames_for_test`, `new_with_injection_for_test` — all thread it through; the `*_for_test` ones default to `LibConfig::default()` unless given one, so existing test call sites do not change. Add **one** `new_with_lib_config_for_test(stream, server, LibConfig)` — Task 6 reuses it rather than adding a second config constructor.
 
 - [ ] **Step 4: Convert the remaining locked `io_bridge.rs` tests** to build a `TransportConfig` instead of setting env vars, dropping their `lock_env()` guards. Same rule: assertions must not change.
