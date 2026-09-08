@@ -689,7 +689,7 @@ struct UniqueColorHistogram {
 /// `max_frag` come from the most recent `dispatch_dirty_tiles_via_scheduler`
 /// call; re-emitted refinement work gets tagged with the current frame's
 /// identity even though the underlying TileWork was queued earlier.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct SchedulerContinuation {
     seq: u32,
     timestamp_us: u32,
@@ -1271,6 +1271,40 @@ impl IoBridge {
         budget_bytes.min(quinn_cap)
     }
 
+    /// Build the continuation an injected drain should leave behind, given
+    /// the (already-clamped) budget it drained against and how many bytes
+    /// actually went out. Mirrors the continuation bookkeeping at the end of
+    /// `dispatch_dirty_tiles_via_scheduler` (`:1452-1468`): `None` once the
+    /// budget is fully spent, otherwise `Some` carrying the injected frame's
+    /// own identity (`seq`/`timestamp_us`/`max_frag`) and the leftover
+    /// budget, so `Event::DatagramsUnblocked` -> `resume_scheduler_continuation`
+    /// can top the drain back up without waiting for the next injected
+    /// frame.
+    ///
+    /// A free function (no `&self`) so it is directly unit-testable: unlike
+    /// its call site in `apply_injected_frame` (behind
+    /// `compute_max_datagram_size()`, which needs a live post-handshake
+    /// session), this is pure arithmetic over its arguments.
+    fn injected_continuation_after_drain(
+        seq: u32,
+        timestamp_us: u32,
+        max_frag: usize,
+        budget_bytes: usize,
+        drained_bytes: usize,
+    ) -> Option<SchedulerContinuation> {
+        let remaining = budget_bytes.saturating_sub(drained_bytes);
+        if remaining > 0 {
+            Some(SchedulerContinuation {
+                seq,
+                timestamp_us,
+                max_frag,
+                remaining_budget_bytes: remaining,
+            })
+        } else {
+            None
+        }
+    }
+
     /// Emit the frame-dimensions datagram on the first frame of each session and
     /// whenever dimensions change, retransmitting `FRAME_DIMENSIONS_RETRANSMITS`
     /// additional times to absorb datagram loss. Called by both
@@ -1796,11 +1830,23 @@ impl IoBridge {
             // now — see `clamp_injected_budget`'s doc comment for why this
             // is mandatory rather than defensive.
             let budget_bytes = self.clamp_injected_budget(inj.budget_bytes);
-            let _ = self.drain_scheduler_into_quinn(
+            let (_, drained_bytes, _) =
+                self.drain_scheduler_into_quinn(inj.seq, inj.timestamp_us, max_frag, budget_bytes);
+            // Mirror dispatch_dirty_tiles_via_scheduler's post-drain
+            // continuation bookkeeping (:1452-1468) so a budget-limited
+            // injected drain resumes on the next Event::DatagramsUnblocked
+            // instead of waiting for the *next injected frame* — which,
+            // given Commit 1's clamp makes budget-limited drains the normal
+            // case rather than the exception, would otherwise strand
+            // refinement work indefinitely once a scene stops injecting new
+            // frames (resume_scheduler_continuation returns immediately on
+            // `None`, :1774-1778).
+            self.scheduler_continuation = Self::injected_continuation_after_drain(
                 inj.seq,
                 inj.timestamp_us,
                 max_frag,
                 budget_bytes,
+                drained_bytes,
             );
         }
         // Mirror the frame path's post-dispatch RTO sweep so injected
@@ -6893,6 +6939,126 @@ mod tests {
             Some((160, 96)),
             "dimensions must be derived from the fixed grid × TILE_SIZE"
         );
+    }
+
+    /// Pins `injected_continuation_after_drain`'s arithmetic: a drain that
+    /// didn't spend the whole clamped budget must leave a continuation
+    /// behind carrying exactly the leftover.
+    #[test]
+    fn injected_continuation_after_drain_carries_the_remaining_budget() {
+        let cont = IoBridge::injected_continuation_after_drain(7, 123, 1200, 5000, 2000);
+        assert_eq!(
+            cont,
+            Some(SchedulerContinuation {
+                seq: 7,
+                timestamp_us: 123,
+                max_frag: 1200,
+                remaining_budget_bytes: 3000,
+            })
+        );
+    }
+
+    /// A drain that spent the entire clamped budget (or, defensively, more
+    /// than it — `saturating_sub` must not wrap) must clear the
+    /// continuation rather than leave a zero/garbage entry behind.
+    #[test]
+    fn injected_continuation_after_drain_clears_once_the_budget_is_spent() {
+        assert_eq!(
+            IoBridge::injected_continuation_after_drain(7, 123, 1200, 5000, 5000),
+            None
+        );
+        assert_eq!(
+            IoBridge::injected_continuation_after_drain(7, 123, 1200, 5000, 6000),
+            None,
+            "drained_bytes > budget_bytes must saturate, not wrap/panic"
+        );
+    }
+
+    /// Regression test for the stranded-continuation divergence: once
+    /// Commit 1's clamp makes budget-limited injected drains the normal
+    /// case rather than the exception, work that survives a clamped drain
+    /// must resume on the next `Event::DatagramsUnblocked` instead of
+    /// waiting for the *next injected frame* — which may never arrive once
+    /// a scene has finished injecting.
+    ///
+    /// This drives the real, unmodified `resume_scheduler_continuation`
+    /// consumer (`:1774`, wired from `Event::DatagramsUnblocked` at
+    /// `:4139`) against a continuation shaped exactly like the one
+    /// `apply_injected_frame` now builds via `injected_continuation_after_drain`
+    /// (pinned separately above) — proving the two ends are wired together
+    /// correctly. It does not drive `apply_injected_frame`'s own
+    /// continuation-setting call site directly: that sits behind
+    /// `compute_max_datagram_size()`, which requires a live,
+    /// post-handshake `quinn_proto::Connection` (Task 15's
+    /// browserless-harness responsibility — see the doc comment on
+    /// `clamp_injected_budget_bounds_a_usize_max_request` above for the
+    /// same constraint). `resume_scheduler_continuation` itself has no such
+    /// gate — it only consults `min_session_send_buffer_space()`, which
+    /// gracefully falls back to `usize::MAX` with no sessions connected —
+    /// so unlike the other two divergences, this half IS reachable without
+    /// a live session.
+    #[tokio::test(start_paused = true)]
+    async fn resume_scheduler_continuation_drains_stranded_injected_work() {
+        use crate::transport::protocol::Codec;
+        use crate::transport::scheduler::{TileWork, WorkState};
+
+        let (ours, _peer) = tokio::net::UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("QuicServer::new");
+        let (_tx, rx) = mpsc::channel(8);
+        let mut bridge = IoBridge::new_with_injection_for_test(ours, server, rx, 4, 4);
+
+        // Queue work directly, simulating tile work an injected frame
+        // enqueued but a budget-limited drain did not reach.
+        for (tile_x, tile_y) in [(0u8, 0u8), (1, 0)] {
+            bridge.scheduler.enqueue(TileWork {
+                tile_x,
+                tile_y,
+                generation: 0,
+                pass_idx: 0,
+                total_passes: 1,
+                codec: Codec::Solid,
+                payload: vec![10, 20, 30, 255],
+                queued_at: super::now_std(),
+                last_sent_at: None,
+                state: WorkState::Pending,
+            });
+        }
+        assert_eq!(
+            bridge.scheduler_peek_for_test().len(),
+            2,
+            "both tiles queued"
+        );
+
+        // A continuation shaped exactly like the one apply_injected_frame's
+        // Commit 3 code builds: plenty of remaining budget, as if the prior
+        // drain had been clamped to 0 bytes.
+        bridge.scheduler_continuation =
+            IoBridge::injected_continuation_after_drain(7, 123, 1200, 1_000_000, 0);
+        assert!(
+            bridge.scheduler_continuation.is_some(),
+            "a fully-unconsumed budget must leave a continuation behind"
+        );
+
+        bridge.resume_scheduler_continuation();
+
+        // `drain_priority_queue` marks popped work `InFlight` and retains it
+        // in the queue (for potential RTO retry) rather than removing it —
+        // so "drained" is observed as a state transition, not queue
+        // shrinkage. Both tiles must have flipped from `Pending` to
+        // `InFlight`, proving `scheduler.tick` actually ran inside
+        // `resume_scheduler_continuation`'s call to
+        // `drain_scheduler_into_quinn` -- no live session needed, since
+        // `min_session_send_buffer_space()` falls back to `usize::MAX` with
+        // none connected.
+        let states = bridge.scheduler.queue_states_for_test();
+        assert_eq!(states.len(), 2, "both tiles remain in the priority queue");
+        for (tile_x, tile_y, state) in &states {
+            assert_eq!(
+                *state,
+                WorkState::InFlight,
+                "tile ({tile_x}, {tile_y}) must have been drained (Pending -> InFlight)"
+            );
+        }
     }
 
     /// Task 3: the tile-injection channel must enqueue injected work into
