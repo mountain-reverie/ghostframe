@@ -732,145 +732,6 @@ pub(crate) struct PalRleTileWorkPrep {
 }
 
 impl IoBridge {
-    /// Build a `LossInjector` from environment variables. Returns `None` if
-    /// the relevant probability is 0 or env vars aren't set. Recognized env vars
-    /// (where `<DIR>` is either `OUTBOUND` or `INBOUND`):
-    /// - `GHOSTFRAME_<DIR>_LOSS_PROBABILITY` — f32 in [0.0, 1.0], default 0.0
-    /// - `GHOSTFRAME_<DIR>_LOSS_PREDICATE` — one of `all` / `tile` / `ack`,
-    ///   default `all`.
-    /// - `GHOSTFRAME_<DIR>_LOSS_SEED` — u64, default 0.
-    #[cfg(any(test, feature = "test-loss-injection"))]
-    fn loss_injector_from_env(
-        direction: &str,
-    ) -> Option<crate::transport::loss_injection::LossInjector> {
-        let prob_var = format!("GHOSTFRAME_{direction}_LOSS_PROBABILITY");
-        let pred_var = format!("GHOSTFRAME_{direction}_LOSS_PREDICATE");
-        let seed_var = format!("GHOSTFRAME_{direction}_LOSS_SEED");
-
-        let prob: f32 = std::env::var(&prob_var)
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0.0);
-        if prob <= 0.0 {
-            return None;
-        }
-
-        // Predicate: function pointer that classifies an outbound/inbound
-        // datagram by its first byte. Selected by the *_LOSS_PREDICATE env var.
-        fn predicate_all(_: &[u8]) -> bool {
-            true
-        }
-        // Tile datagrams set bit 31 of frame_seq (TILE_DATAGRAM_FLAG = 0x80000000),
-        // which is the high bit of byte [0] in big-endian wire order.
-        fn predicate_tile(dg: &[u8]) -> bool {
-            !dg.is_empty() && (dg[0] & 0x80) != 0
-        }
-        // ACK_BATCH_MSG_TYPE = 0x02 (see transport/ack.rs).
-        fn predicate_ack(dg: &[u8]) -> bool {
-            dg.first().copied() == Some(crate::transport::ack::ACK_BATCH_MSG_TYPE)
-        }
-        // PalRle tile datagrams: tile datagram flag set, codec field = PalRle (2),
-        // payload byte 0 has bundle flag set (0x01).
-        // Wire layout: [DatagramHeader DATAGRAM_HEADER_SIZE][TileHeader TILE_HEADER_SIZE][payload].
-        // TileHeader byte [2] (wire index DATAGRAM_HEADER_SIZE + 2) = (codec << 1) | lz4.
-        // First payload byte is at DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE.
-        const CODEC_BYTE: usize = DATAGRAM_HEADER_SIZE + 2;
-        const PAYLOAD_START: usize = DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE;
-        const MIN_BUNDLE_LEN: usize = PAYLOAD_START + 1;
-        fn predicate_palrle_bundled(dg: &[u8]) -> bool {
-            dg.len() >= MIN_BUNDLE_LEN
-                && (dg[0] & 0x80) != 0
-                && (dg[CODEC_BYTE] >> 1) == (crate::transport::protocol::Codec::PalRle as u8)
-                && (dg[PAYLOAD_START] & 0x01) != 0
-        }
-        // Inverse: PalRle tile datagrams without the bundle flag.
-        fn predicate_palrle_thin(dg: &[u8]) -> bool {
-            dg.len() >= MIN_BUNDLE_LEN
-                && (dg[0] & 0x80) != 0
-                && (dg[CODEC_BYTE] >> 1) == (crate::transport::protocol::Codec::PalRle as u8)
-                && (dg[PAYLOAD_START] & 0x01) == 0
-        }
-
-        let predicate: crate::transport::loss_injection::DropPredicate =
-            match std::env::var(&pred_var).as_deref() {
-                Ok("tile") => predicate_tile,
-                Ok("ack") => predicate_ack,
-                Ok("palrle_bundled") => predicate_palrle_bundled,
-                Ok("palrle_thin") => predicate_palrle_thin,
-                _ => predicate_all,
-            };
-        let seed: u64 = std::env::var(&seed_var)
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-
-        tracing::info!(
-            direction,
-            prob,
-            "test-loss-injection: installed LossInjector"
-        );
-        Some(crate::transport::loss_injection::LossInjector::new(
-            prob, predicate, seed,
-        ))
-    }
-
-    /// Parse `GHOSTFRAME_INJECT_OOB_PALRLE` as `"x,y"` (two u32 separated by a
-    /// comma). Returns `None` when the env var is unset or unparseable. The
-    /// resulting coordinate is stored on `IoBridge` and consumed (set to `None`)
-    /// the first time the matching tile is encoded.
-    #[cfg(any(test, feature = "test-loss-injection"))]
-    fn oob_injector_from_env() -> Option<(u32, u32)> {
-        let raw = std::env::var("GHOSTFRAME_INJECT_OOB_PALRLE").ok()?;
-        let mut parts = raw.split(',');
-        let x = parts.next()?.parse::<u32>().ok()?;
-        let y = parts.next()?.parse::<u32>().ok()?;
-        Some((x, y))
-    }
-
-    /// Cfg-gated test hook: parse `GHOSTFRAME_SKIP_PALETTE_SESSION_RESET`.
-    /// When `"1"` or `"true"`, the new-session handler will preserve the
-    /// `palette_table.delivered` bitset across the session reset (other
-    /// per-session state still resets normally). Drives the e2e for the
-    /// ERR_THIN_UNCACHED_PALETTE round-trip — see
-    /// `docs/superpowers/specs/2026-05-17-decode-error-thin-uncached-design.md`.
-    #[cfg(any(test, feature = "test-loss-injection"))]
-    fn skip_palette_session_reset_from_env() -> bool {
-        matches!(
-            std::env::var("GHOSTFRAME_SKIP_PALETTE_SESSION_RESET").as_deref(),
-            Ok("1") | Ok("true")
-        )
-    }
-
-    /// Returns `true` when `GHOSTFRAME_DIAGNOSE_TILES` is set to `"1"` or `"true"`.
-    fn diagnose_tiles_from_env() -> bool {
-        matches!(
-            std::env::var("GHOSTFRAME_DIAGNOSE_TILES").as_deref(),
-            Ok("1") | Ok("true")
-        )
-    }
-
-    /// Returns `true` when `GHOSTFRAME_DIAGNOSE_GPU_PIPELINE` is set.
-    /// Enables one-line-per-frame logging of FrameAnalysis output buffer state.
-    fn diagnose_gpu_pipeline_from_env() -> bool {
-        matches!(
-            std::env::var("GHOSTFRAME_DIAGNOSE_GPU_PIPELINE").as_deref(),
-            Ok("1") | Ok("true")
-        )
-    }
-
-    /// Returns `true` when `GHOSTFRAME_DIAGNOSE_COLOR_HIST` is set to
-    /// `"1"` or `"true"`. Enables the per-cumulative-log unique-colors
-    /// histogram dump. Used to verify the "is the background really
-    /// > 16 colors per 32×32 tile, or are we misclassifying low-color
-    /// > regions to Cdf53?" question raised in the evangeline screenshot
-    /// > debug session.
-    fn diagnose_color_histogram_from_env() -> bool {
-        matches!(
-            std::env::var("GHOSTFRAME_DIAGNOSE_COLOR_HIST").as_deref(),
-            Ok("1") | Ok("true")
-        )
-    }
-
     /// Create a new `IoBridge` by connecting to ghostbridge and opening a UDP
     /// listener on `listen_addr` (e.g. `":443"`).
     pub async fn new(
@@ -924,6 +785,13 @@ impl IoBridge {
         // doesn't pay thread-spin-up latency on the hot path (design Section 4).
         rayon::iter::IntoParallelIterator::into_par_iter(0..1u32).for_each(|_| {});
 
+        // `TransportConfig::from_env()` reads `GHOSTFRAME_*` directly.
+        // `IoBridge` hasn't been rewired onto `LibConfig` yet (that's a
+        // separate follow-up task) — this is a thin, temporary bridge onto
+        // the parsing now centralized in `crate::config`.
+        #[cfg(any(test, feature = "test-loss-injection"))]
+        let transport_config = crate::config::TransportConfig::from_env();
+
         let bridge = Self {
             _handle: Some(handle),
             stream,
@@ -942,23 +810,31 @@ impl IoBridge {
             frame_mode: crate::tile::FrameMode::TileCodec,
             scheduler: crate::transport::scheduler::Scheduler::new(0, 0),
             #[cfg(any(test, feature = "test-loss-injection"))]
-            outbound_loss: Self::loss_injector_from_env("OUTBOUND"),
+            outbound_loss: transport_config.outbound_loss,
             #[cfg(any(test, feature = "test-loss-injection"))]
-            inbound_loss: Self::loss_injector_from_env("INBOUND"),
+            inbound_loss: transport_config.inbound_loss,
             #[cfg(any(test, feature = "test-loss-injection"))]
-            outbound_bandwidth_cap: crate::transport::bandwidth_cap::BandwidthCap::from_env(),
+            outbound_bandwidth_cap: transport_config
+                .outbound_bandwidth_cap_bps
+                .map(crate::transport::bandwidth_cap::BandwidthCap::new),
             #[cfg(any(test, feature = "test-loss-injection"))]
-            test_force_bytes_per_us: std::env::var("GHOSTFRAME_TEST_FORCE_BYTES_PER_US")
-                .ok()
-                .and_then(|s| s.parse::<f32>().ok())
-                .filter(|v| *v > 0.0),
+            test_force_bytes_per_us: transport_config.test_force_bytes_per_us,
             #[cfg(any(test, feature = "test-loss-injection"))]
-            oob_inject_at: Self::oob_injector_from_env(),
+            oob_inject_at: transport_config.oob_inject_at,
             #[cfg(any(test, feature = "test-loss-injection"))]
-            skip_palette_session_reset: Self::skip_palette_session_reset_from_env(),
+            skip_palette_session_reset: transport_config.skip_palette_session_reset,
             force_dirty_frames: 0,
             palette_table: crate::encoder::pal_rle::PaletteTable::new(),
             client_caps: crate::transport::client_caps::ClientCapabilities::default(),
+            // Deliberately *not* routed through `transport_config` even though
+            // `TransportConfig::from_lookup` now also parses `GHOSTFRAME_FEC_K`
+            // (`crate::config::TransportConfig::fec_k`'s doc comment): unlike
+            // the fields above, this read has never been `#[cfg(any(test,
+            // feature = "test-loss-injection"))]`-gated here, so it stays a
+            // literal read to preserve that in every build, including a
+            // genuine production build with neither `cfg(test)` nor the
+            // `test-loss-injection` feature (where `TransportConfig::from_env`
+            // would otherwise silently return `Self::default()`).
             fec_k: std::env::var("GHOSTFRAME_FEC_K")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
@@ -2815,7 +2691,7 @@ impl IoBridge {
         // GPU pipeline diagnostic: one line per frame showing the state of
         // every output buffer FrameAnalysis exposes. Drives W1 root-cause
         // investigation when unique_colors stays at UNIQUE_COLORS_UNKNOWN.
-        if Self::diagnose_gpu_pipeline_from_env() {
+        if crate::config::DiagnosticsConfig::from_env().diagnose_gpu_pipeline {
             let ta_slice = analysis.tile_analysis_slice();
             let first_nonzero = ta_slice
                 .iter()
@@ -2910,8 +2786,8 @@ impl IoBridge {
         // Accumulate the per-dirty-tile unique-color histogram. Cheap
         // (one u32 increment per tile, no allocation), so always-on; the
         // log emission is gated by the env var, and the accumulator is
-        // reset there. See `diagnose_color_histogram_from_env` for the
-        // motivation (verify the "is the textured background really
+        // reset there. See `DiagnosticsConfig::from_lookup`'s doc comment for
+        // the motivation (verify the "is the textured background really
         // > 16 colors per 32×32 tile?" hypothesis).
         for &(tx, ty) in &dirty_xy {
             let uc = self.metrics_tracker.get(tx, ty).unique_colors;
@@ -2943,7 +2819,7 @@ impl IoBridge {
 
         // Per-tile diagnostic tracing: emit one log line per dirty tile when
         // GHOSTFRAME_DIAGNOSE_TILES=1 (or =true).  Parseable by downstream awk.
-        if Self::diagnose_tiles_from_env() {
+        if crate::config::DiagnosticsConfig::from_env().diagnose_tiles {
             for &(tx, ty) in &dirty_xy {
                 let m = self.metrics_tracker.get(tx, ty);
                 tracing::info!(
@@ -3825,7 +3701,7 @@ impl IoBridge {
                     );
                     self.bump_count_accumulator = BumpCountAccumulator::default();
 
-                    if Self::diagnose_color_histogram_from_env() {
+                    if crate::config::DiagnosticsConfig::from_env().diagnose_color_hist {
                         let h = self.color_histogram_accumulator;
                         tracing::info!(
                             frame_seq = seq,
@@ -5377,73 +5253,24 @@ mod tests {
         }
     }
 
-    // NOTE: the two tests below use std::env::set_var / remove_var which is
-    // inherently order-sensitive in concurrent test runs.  Must run with
-    // --test-threads=1 to avoid races with other tests that don't touch these
-    // env vars.  The project convention (reference_testing.md) already requires
-    // --test-threads=1 for the lib test suite.
-
-    #[test]
-    fn loss_injector_from_env_parses_probability_and_predicate() {
-        let _env = crate::test_env::lock_env();
-        // Use std::env carefully: serial within this test.
-        std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "0.5");
-        std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE", "tile");
-        std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_SEED", "42");
-        let inj =
-            IoBridge::loss_injector_from_env("OUTBOUND").expect("probability > 0 must yield Some");
-        // Force two calls for determinism — same seed = same outcome.
-        let mut inj2 = IoBridge::loss_injector_from_env("OUTBOUND").unwrap();
-        let mut inj_copy = inj;
-        // Tile-datagram first byte (high bit set) → predicate matches → may drop.
-        let tile_dg = [0x80u8, 0, 0, 1];
-        // ACK datagram first byte (0x02) → predicate doesn't match → never drops.
-        let ack_dg = [0x02u8, 0, 0, 0];
-        assert!(
-            !inj_copy.should_drop(&ack_dg),
-            "tile predicate filters ack out"
-        );
-        assert!(!inj2.should_drop(&ack_dg));
-        // Tile path may or may not drop on a given call; just exercise it.
-        let _ = inj_copy.should_drop(&tile_dg);
-        std::env::remove_var("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY");
-        std::env::remove_var("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE");
-        std::env::remove_var("GHOSTFRAME_OUTBOUND_LOSS_SEED");
-    }
-
-    #[test]
-    fn loss_injector_from_env_returns_none_when_unset() {
-        let _env = crate::test_env::lock_env();
-        // Ensure no leftover from prior tests.
-        std::env::remove_var("GHOSTFRAME_INBOUND_LOSS_PROBABILITY");
-        assert!(IoBridge::loss_injector_from_env("INBOUND").is_none());
-    }
-
-    #[cfg(any(test, feature = "test-loss-injection"))]
-    #[test]
-    fn oob_injector_from_env_parses() {
-        let _env = crate::test_env::lock_env();
-        // Saved/restored to avoid leaking into sibling tests that run in the
-        // same process (cargo test default uses threads but env-var leak is a
-        // common test fragility — guard explicitly).
-        let prev = std::env::var("GHOSTFRAME_INJECT_OOB_PALRLE").ok();
-        std::env::set_var("GHOSTFRAME_INJECT_OOB_PALRLE", "5,7");
-        let inj = IoBridge::oob_injector_from_env();
-        if let Some(p) = prev {
-            std::env::set_var("GHOSTFRAME_INJECT_OOB_PALRLE", p);
-        } else {
-            std::env::remove_var("GHOSTFRAME_INJECT_OOB_PALRLE");
-        }
-        assert_eq!(inj, Some((5u32, 7u32)));
-    }
+    // Former home of `loss_injector_from_env_parses_probability_and_predicate`,
+    // `loss_injector_from_env_returns_none_when_unset`, and
+    // `oob_injector_from_env_parses`: moved to `config.rs` alongside
+    // `TransportConfig::from_lookup`, the code they now test (see
+    // `transport_config_parses_loss_probability_and_predicate`,
+    // `transport_config_loss_injector_none_when_unset`, and
+    // `transport_config_parses_oob_inject_at`). They no longer need
+    // `lock_env()`: `from_lookup` never touches process env.
 
     #[tokio::test]
     async fn maybe_fire_session_reset_skips_first_connect_fires_on_reconnect() {
-        // Doesn't set/read a GHOSTFRAME_* var directly, but `fire_session_reset`
-        // (called transitively via `maybe_fire_session_reset`) reads
-        // GHOSTFRAME_SKIP_PALETTE_SESSION_RESET internally, and this test's
-        // reconnect assertion assumes it's unset. It races
-        // `skip_palette_session_reset_from_env_parses`, which sets it to "1".
+        // `fire_session_reset` reads `self.skip_palette_session_reset`, a
+        // plain struct field set once at construction time (here,
+        // `new_with_stream_for_test` hardcodes it `false`) — not a live env
+        // read, so this test does not race
+        // `config::tests::transport_config_parses_skip_palette_session_reset`.
+        // Still under `lock_env()`: other tests in this module mutate env
+        // vars this suite's other tests read.
         let _env = crate::test_env::lock_env();
         use crate::transport::quic::QuicServer;
         use crate::transport::webtransport::WebTransportServer;
@@ -5517,39 +5344,11 @@ mod tests {
         );
     }
 
-    #[cfg(any(test, feature = "test-loss-injection"))]
-    #[test]
-    fn skip_palette_session_reset_from_env_parses() {
-        let _env = crate::test_env::lock_env();
-        let prev = std::env::var("GHOSTFRAME_SKIP_PALETTE_SESSION_RESET").ok();
-        std::env::set_var("GHOSTFRAME_SKIP_PALETTE_SESSION_RESET", "1");
-        let got = IoBridge::skip_palette_session_reset_from_env();
-        if let Some(p) = prev {
-            std::env::set_var("GHOSTFRAME_SKIP_PALETTE_SESSION_RESET", p);
-        } else {
-            std::env::remove_var("GHOSTFRAME_SKIP_PALETTE_SESSION_RESET");
-        }
-        assert!(got, "env=1 must yield true");
-
-        // Default (unset) is false.
-        std::env::remove_var("GHOSTFRAME_SKIP_PALETTE_SESSION_RESET");
-        assert!(
-            !IoBridge::skip_palette_session_reset_from_env(),
-            "unset must yield false"
-        );
-    }
-
-    #[test]
-    fn diagnose_tiles_env_var_parses() {
-        let _env = crate::test_env::lock_env();
-        std::env::set_var("GHOSTFRAME_DIAGNOSE_TILES", "1");
-        let on = IoBridge::diagnose_tiles_from_env();
-        std::env::remove_var("GHOSTFRAME_DIAGNOSE_TILES");
-        assert!(on);
-
-        let off = IoBridge::diagnose_tiles_from_env();
-        assert!(!off);
-    }
+    // Former home of `skip_palette_session_reset_from_env_parses`: moved to
+    // `config::tests::transport_config_parses_skip_palette_session_reset`.
+    //
+    // Former home of `diagnose_tiles_env_var_parses`: moved to
+    // `config::tests::diagnostics_config_parses_diagnose_tiles`.
 
     /// dispatch_dirty_tiles_via_scheduler emits Solid bytes when the GPU policy
     /// reads CodecState::Solid for a tile.
@@ -5961,71 +5760,19 @@ mod tests {
         );
     }
 
-    // Wire-offset constants for the synthetic datagrams used in the
-    // loss-injection predicate tests below. Keeping these named (rather than
-    // hard-coded 18/24/25) means future header-size changes surface as a
-    // single edit here instead of silently shifting predicate bytes.
-    const CODEC_BYTE_OFFSET: usize = DATAGRAM_HEADER_SIZE + 2;
-    const PAYLOAD_START_OFFSET: usize = DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE;
-    const PALRLE_MIN_WIRE_LEN: usize = PAYLOAD_START_OFFSET + 1;
-
-    #[test]
-    fn palrle_bundled_predicate_matches_bundled_datagram() {
-        let _env = crate::test_env::lock_env();
-        // Synthetic wire: tile datagram, codec=PalRle, flags byte with bundle bit.
-        // Wire layout: [DatagramHeader DATAGRAM_HEADER_SIZE][TileHeader TILE_HEADER_SIZE][payload].
-        let mut wire = vec![0u8; PALRLE_MIN_WIRE_LEN];
-        wire[0] = 0x80; // tile datagram flag
-        wire[CODEC_BYTE_OFFSET] = (crate::transport::protocol::Codec::PalRle as u8) << 1;
-        wire[PAYLOAD_START_OFFSET] = 0x01; // bundled
-        std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "1.0");
-        std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE", "palrle_bundled");
-        std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_SEED", "1");
-        let mut inj = IoBridge::loss_injector_from_env("OUTBOUND").unwrap();
-        assert!(inj.should_drop(&wire));
-        std::env::remove_var("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY");
-        std::env::remove_var("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE");
-        std::env::remove_var("GHOSTFRAME_OUTBOUND_LOSS_SEED");
-    }
-
-    #[test]
-    fn palrle_bundled_predicate_rejects_thin_datagram() {
-        let _env = crate::test_env::lock_env();
-        let mut wire = vec![0u8; PALRLE_MIN_WIRE_LEN];
-        wire[0] = 0x80;
-        wire[CODEC_BYTE_OFFSET] = (crate::transport::protocol::Codec::PalRle as u8) << 1;
-        wire[PAYLOAD_START_OFFSET] = 0x00; // thin
-        std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "1.0");
-        std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE", "palrle_bundled");
-        std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_SEED", "1");
-        let mut inj = IoBridge::loss_injector_from_env("OUTBOUND").unwrap();
-        assert!(!inj.should_drop(&wire));
-        std::env::remove_var("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY");
-        std::env::remove_var("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE");
-        std::env::remove_var("GHOSTFRAME_OUTBOUND_LOSS_SEED");
-    }
-
-    #[test]
-    fn palrle_thin_predicate_matches_thin_only() {
-        let _env = crate::test_env::lock_env();
-        let mut wire = vec![0u8; PALRLE_MIN_WIRE_LEN];
-        wire[0] = 0x80;
-        wire[CODEC_BYTE_OFFSET] = (crate::transport::protocol::Codec::PalRle as u8) << 1;
-        wire[PAYLOAD_START_OFFSET] = 0x00;
-        std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "1.0");
-        std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE", "palrle_thin");
-        std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_SEED", "1");
-        let mut inj = IoBridge::loss_injector_from_env("OUTBOUND").unwrap();
-        assert!(inj.should_drop(&wire));
-        wire[PAYLOAD_START_OFFSET] = 0x01;
-        // Re-create inj since it consumed RNG state; or just check the predicate behavior:
-        // (the predicate is the only filter at proba=1.0, so should_drop is purely predicate-driven)
-        let mut inj2 = IoBridge::loss_injector_from_env("OUTBOUND").unwrap();
-        assert!(!inj2.should_drop(&wire));
-        std::env::remove_var("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY");
-        std::env::remove_var("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE");
-        std::env::remove_var("GHOSTFRAME_OUTBOUND_LOSS_SEED");
-    }
+    // Former home of the loss-injection predicate tests
+    // (`palrle_bundled_predicate_matches_bundled_datagram`,
+    // `palrle_bundled_predicate_rejects_thin_datagram`,
+    // `palrle_thin_predicate_matches_thin_only`): moved to `config.rs`
+    // alongside `TransportConfig::from_lookup` / `loss_injector_from_lookup`
+    // (see `transport_config_palrle_bundled_predicate_matches_bundled` and
+    // friends), which now owns the predicate table they exercise. Moving
+    // them turns this file's `DATAGRAM_HEADER_SIZE`/`TILE_HEADER_SIZE`
+    // import fully unused (previously only used by the code that moved here
+    // in the first place) — see the "Critical constraints" note on not
+    // fixing that pre-existing unused-import warning at `io_bridge.rs:47-48`;
+    // it is a known, accepted consequence of this move, not something to
+    // patch around by keeping tests here artificially.
 
     #[test]
     fn phase_b_emits_indices_raw_when_caps_enabled_and_thin() {

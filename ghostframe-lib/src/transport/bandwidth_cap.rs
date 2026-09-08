@@ -1,8 +1,8 @@
 //! Token-bucket bandwidth cap for tests + bench scenarios.
 //!
-//! Mirrors the `loss_injection` env-var pattern: `GHOSTFRAME_OUTBOUND_BANDWIDTH_CAP`
-//! sets bytes-per-second; absent or zero = no cap (defaults to `u64::MAX`).
-//! Production code path is unaffected when the env var is unset.
+//! `GHOSTFRAME_OUTBOUND_BANDWIDTH_CAP` sets bytes-per-second; absent or zero
+//! = no cap. Parsing lives in `crate::config::TransportConfig` (see its
+//! `outbound_bandwidth_cap_bps` field) — this type only carries the rate.
 
 use std::time::Instant;
 
@@ -19,18 +19,6 @@ impl BandwidthCap {
             bytes_per_sec,
             tokens_bytes: bytes_per_sec as f64,
             last_refill: Instant::now(),
-        }
-    }
-
-    pub fn from_env() -> Option<Self> {
-        let cap: u64 = std::env::var("GHOSTFRAME_OUTBOUND_BANDWIDTH_CAP")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        if cap == 0 {
-            None
-        } else {
-            Some(Self::new(cap))
         }
     }
 
@@ -67,19 +55,14 @@ mod tests {
         assert!(cap.try_consume(5_000)); // ~6_000 tokens refilled
     }
 
+    // Env-var parsing (`GHOSTFRAME_OUTBOUND_BANDWIDTH_CAP`) moved to
+    // `crate::config::TransportConfig::from_lookup`; its tests live there.
+    // `new` no longer touches the environment, so no shared-environment-lock
+    // guard is needed here.
     #[test]
-    fn from_env_returns_none_when_unset() {
-        let _env = crate::test_env::lock_env();
-        std::env::remove_var("GHOSTFRAME_OUTBOUND_BANDWIDTH_CAP");
-        assert!(BandwidthCap::from_env().is_none());
-    }
-
-    #[test]
-    fn from_env_parses_value() {
-        let _env = crate::test_env::lock_env();
-        std::env::set_var("GHOSTFRAME_OUTBOUND_BANDWIDTH_CAP", "1250000");
-        let cap = BandwidthCap::from_env().expect("set");
+    fn new_stores_the_configured_rate() {
+        let cap = BandwidthCap::new(1_250_000);
         assert_eq!(cap.bytes_per_sec, 1_250_000);
-        std::env::remove_var("GHOSTFRAME_OUTBOUND_BANDWIDTH_CAP");
+        assert_eq!(cap.tokens_bytes, 1_250_000.0, "bucket starts full");
     }
 }

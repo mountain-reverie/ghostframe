@@ -116,16 +116,157 @@ pub struct TransportConfig {
     /// `(frame_seq, tile_index)` at which to inject an out-of-range PalRLE
     /// index, from `GHOSTFRAME_INJECT_OOB_PALRLE`.
     pub oob_inject_at: Option<(u32, u32)>,
+    /// From `GHOSTFRAME_SKIP_PALETTE_SESSION_RESET=1|true`. See
+    /// `IoBridge::maybe_fire_session_reset`'s doc comment.
     pub skip_palette_session_reset: bool,
+    /// Overrides `sample_all_path_stats`'s `bytes_per_us`. From
+    /// `GHOSTFRAME_TEST_FORCE_BYTES_PER_US`; accepts any value `> 0.0`.
     pub test_force_bytes_per_us: Option<f32>,
+    /// FEC parity group size. From `GHOSTFRAME_FEC_K`; `None` ⇒ `IoBridge`
+    /// defaults to `0` (disabled) at the consumption site, exactly as
+    /// today. Forces FEC on for e2e testing — production toggles it
+    /// automatically from receiver feedback loss rate instead.
     pub fec_k: Option<usize>,
+}
+
+impl TransportConfig {
+    /// Parse from an arbitrary lookup. `from_env` is this with a real
+    /// environment lookup; tests use a map so they never touch process-global
+    /// state. Keeping the parsing here means the crate reads the process
+    /// environment in exactly one place.
+    #[cfg(any(test, feature = "test-loss-injection"))]
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
+        Self {
+            outbound_loss: loss_injector_from_lookup("OUTBOUND", &get),
+            inbound_loss: loss_injector_from_lookup("INBOUND", &get),
+            outbound_bandwidth_cap_bps: get("GHOSTFRAME_OUTBOUND_BANDWIDTH_CAP")
+                .and_then(|s| s.parse::<u64>().ok())
+                .filter(|v| *v != 0),
+            oob_inject_at: oob_inject_at_from_lookup(&get),
+            skip_palette_session_reset: matches!(
+                get("GHOSTFRAME_SKIP_PALETTE_SESSION_RESET").as_deref(),
+                Some("1") | Some("true")
+            ),
+            test_force_bytes_per_us: get("GHOSTFRAME_TEST_FORCE_BYTES_PER_US")
+                .and_then(|s| s.parse::<f32>().ok())
+                .filter(|v| *v > 0.0),
+            fec_k: get("GHOSTFRAME_FEC_K").and_then(|v| v.parse::<usize>().ok()),
+        }
+    }
+
+    /// Parse environment variables into a transport configuration.
+    #[cfg(any(test, feature = "test-loss-injection"))]
+    pub fn from_env() -> Self {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+
+    /// Production builds without `test-loss-injection` ignore the environment
+    /// entirely, exactly as today: the reads are not compiled.
+    #[cfg(not(any(test, feature = "test-loss-injection")))]
+    pub fn from_env() -> Self {
+        Self::default()
+    }
+}
+
+/// Build a `LossInjector` for one direction (`"OUTBOUND"` or `"INBOUND"`)
+/// from a lookup. Returns `None` if the relevant probability is `0` or the
+/// env var isn't set. Recognized env vars (`<DIR>` is `OUTBOUND`/`INBOUND`):
+/// - `GHOSTFRAME_<DIR>_LOSS_PROBABILITY` — f32 in `[0.0, 1.0]`, default `0.0`
+/// - `GHOSTFRAME_<DIR>_LOSS_PREDICATE` — one of `all` / `tile` / `ack` /
+///   `palrle_bundled` / `palrle_thin`, default `all`.
+/// - `GHOSTFRAME_<DIR>_LOSS_SEED` — u64, default `0`.
+#[cfg(any(test, feature = "test-loss-injection"))]
+fn loss_injector_from_lookup(
+    direction: &str,
+    get: &impl Fn(&str) -> Option<String>,
+) -> Option<crate::transport::loss_injection::LossInjector> {
+    let prob_var = format!("GHOSTFRAME_{direction}_LOSS_PROBABILITY");
+    let pred_var = format!("GHOSTFRAME_{direction}_LOSS_PREDICATE");
+    let seed_var = format!("GHOSTFRAME_{direction}_LOSS_SEED");
+
+    let prob: f32 = get(&prob_var).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    if prob <= 0.0 {
+        return None;
+    }
+
+    // Predicate: function pointer that classifies an outbound/inbound
+    // datagram by its first byte. Selected by the *_LOSS_PREDICATE env var.
+    fn predicate_all(_: &[u8]) -> bool {
+        true
+    }
+    // Tile datagrams set bit 31 of frame_seq (TILE_DATAGRAM_FLAG = 0x80000000),
+    // which is the high bit of byte [0] in big-endian wire order.
+    fn predicate_tile(dg: &[u8]) -> bool {
+        !dg.is_empty() && (dg[0] & 0x80) != 0
+    }
+    // ACK_BATCH_MSG_TYPE = 0x02 (see transport/ack.rs).
+    fn predicate_ack(dg: &[u8]) -> bool {
+        dg.first().copied() == Some(crate::transport::ack::ACK_BATCH_MSG_TYPE)
+    }
+    // PalRle tile datagrams: tile datagram flag set, codec field = PalRle (2),
+    // payload byte 0 has bundle flag set (0x01).
+    // Wire layout: [DatagramHeader DATAGRAM_HEADER_SIZE][TileHeader TILE_HEADER_SIZE][payload].
+    // TileHeader byte [2] (wire index DATAGRAM_HEADER_SIZE + 2) = (codec << 1) | lz4.
+    // First payload byte is at DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE.
+    const CODEC_BYTE: usize = crate::transport::protocol::DATAGRAM_HEADER_SIZE + 2;
+    const PAYLOAD_START: usize = crate::transport::protocol::DATAGRAM_HEADER_SIZE
+        + crate::transport::protocol::TILE_HEADER_SIZE;
+    const MIN_BUNDLE_LEN: usize = PAYLOAD_START + 1;
+    fn predicate_palrle_bundled(dg: &[u8]) -> bool {
+        dg.len() >= MIN_BUNDLE_LEN
+            && (dg[0] & 0x80) != 0
+            && (dg[CODEC_BYTE] >> 1) == (crate::transport::protocol::Codec::PalRle as u8)
+            && (dg[PAYLOAD_START] & 0x01) != 0
+    }
+    // Inverse: PalRle tile datagrams without the bundle flag.
+    fn predicate_palrle_thin(dg: &[u8]) -> bool {
+        dg.len() >= MIN_BUNDLE_LEN
+            && (dg[0] & 0x80) != 0
+            && (dg[CODEC_BYTE] >> 1) == (crate::transport::protocol::Codec::PalRle as u8)
+            && (dg[PAYLOAD_START] & 0x01) == 0
+    }
+
+    let predicate: crate::transport::loss_injection::DropPredicate = match get(&pred_var).as_deref()
+    {
+        Some("tile") => predicate_tile,
+        Some("ack") => predicate_ack,
+        Some("palrle_bundled") => predicate_palrle_bundled,
+        Some("palrle_thin") => predicate_palrle_thin,
+        _ => predicate_all,
+    };
+    let seed: u64 = get(&seed_var).and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    tracing::info!(
+        direction,
+        prob,
+        "test-loss-injection: installed LossInjector"
+    );
+    Some(crate::transport::loss_injection::LossInjector::new(
+        prob, predicate, seed,
+    ))
+}
+
+/// Parse `GHOSTFRAME_INJECT_OOB_PALRLE` as `"x,y"` (two u32 separated by a
+/// comma). Returns `None` when the env var is unset or unparseable. The
+/// resulting coordinate is stored on `IoBridge` and consumed (set to `None`)
+/// the first time the matching tile is encoded.
+#[cfg(any(test, feature = "test-loss-injection"))]
+fn oob_inject_at_from_lookup(get: &impl Fn(&str) -> Option<String>) -> Option<(u32, u32)> {
+    let raw = get("GHOSTFRAME_INJECT_OOB_PALRLE")?;
+    let mut parts = raw.split(',');
+    let x = parts.next()?.parse::<u32>().ok()?;
+    let y = parts.next()?.parse::<u32>().ok()?;
+    Some((x, y))
 }
 
 /// Diagnostic logging and one-shot dumps.
 #[derive(Debug, Clone, Default)]
 pub struct DiagnosticsConfig {
+    /// From `GHOSTFRAME_DIAGNOSE_TILES=1|true`.
     pub diagnose_tiles: bool,
+    /// From `GHOSTFRAME_DIAGNOSE_GPU_PIPELINE=1|true`.
     pub diagnose_gpu_pipeline: bool,
+    /// From `GHOSTFRAME_DIAGNOSE_COLOR_HIST=1|true`.
     pub diagnose_color_hist: bool,
     /// Path for the one-shot raw-BGRA frame dump. Consumed once, then cleared
     /// by the bridge — this replaces the current read-then-`remove_var`.
@@ -135,6 +276,46 @@ pub struct DiagnosticsConfig {
     // Deliberately no `cdf53_skip_l2_l3` / `cdf53_skip_l3`: those two reads
     // live in the Vulkan dispatch path and are deferred. Adding unused fields
     // now would imply a wiring that does not exist.
+}
+
+impl DiagnosticsConfig {
+    /// Parse from an arbitrary lookup. Unlike `ClassifierConfig` /
+    /// `TransportConfig`, this is **not** gated behind `cfg(any(test,
+    /// feature = "test-loss-injection"))`: the three `io_bridge.rs` helpers
+    /// this replaces (`diagnose_tiles_from_env`, `diagnose_gpu_pipeline_from_env`,
+    /// `diagnose_color_histogram_from_env`) were themselves compiled and read
+    /// unconditionally in every build, because these are live production
+    /// diagnostics toggles (an operator can flip them on a running
+    /// deployment), not test-only knobs. Gating this function the same way
+    /// as the other two configs would silently stop honouring these
+    /// variables in production — so it doesn't.
+    ///
+    /// Only the three boolean toggles above are parsed here; `dump_frame_path`
+    /// / `cdf53_diff_tile` / `cdf53_dump_pending` stay unwired (deferred, see
+    /// struct doc comment) — `from_lookup` leaves them at `Default`.
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
+        Self {
+            diagnose_tiles: matches!(
+                get("GHOSTFRAME_DIAGNOSE_TILES").as_deref(),
+                Some("1") | Some("true")
+            ),
+            diagnose_gpu_pipeline: matches!(
+                get("GHOSTFRAME_DIAGNOSE_GPU_PIPELINE").as_deref(),
+                Some("1") | Some("true")
+            ),
+            diagnose_color_hist: matches!(
+                get("GHOSTFRAME_DIAGNOSE_COLOR_HIST").as_deref(),
+                Some("1") | Some("true")
+            ),
+            ..Self::default()
+        }
+    }
+
+    /// Parse environment variables into a diagnostics configuration. Reads
+    /// the real environment in every build — see `from_lookup`'s doc comment.
+    pub fn from_env() -> Self {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
 }
 
 /// Not `Clone`: `transport` carries `TransportConfig`, which is not `Clone`
@@ -255,8 +436,9 @@ mod tests {
     }
 
     /// `from_env` is a thin wrapper around `from_lookup` over the real
-    /// environment; this is its only coverage, so it is the one remaining
-    /// test in this module that touches process-global state.
+    /// environment; this is its only coverage for `ClassifierConfig`. It and
+    /// its `TransportConfig` / `DiagnosticsConfig` counterparts further down
+    /// are the only tests in this module that touch process-global state.
     #[test]
     fn from_env_reads_the_real_environment() {
         let _env = crate::test_env::lock_env();
@@ -266,5 +448,246 @@ mod tests {
             Some(FrameMode::H264)
         );
         std::env::remove_var("GHOSTFRAME_TEST_FORCE_FRAME_MODE");
+    }
+
+    // -----------------------------------------------------------------
+    // TransportConfig
+    // -----------------------------------------------------------------
+    //
+    // Formerly `IoBridge::loss_injector_from_env` / `oob_injector_from_env` /
+    // `skip_palette_session_reset_from_env` and their tests (including the
+    // three PalRLE bundled/thin predicate-selection tests) in
+    // `transport::io_bridge`'s test module (moved here with the code they
+    // test; `lock_env()` guards dropped since `from_lookup` never touches
+    // process env).
+    //
+    // Moving the predicate tests leaves `io_bridge.rs`'s
+    // `DATAGRAM_HEADER_SIZE`/`TILE_HEADER_SIZE` import with no remaining
+    // user at all (that import already went unused in a plain production
+    // build before this move — see the "Critical constraints" note not to
+    // fix the pre-existing warning at `io_bridge.rs:47-48` — and this move
+    // is what generalizes that to every build config). That's an accepted,
+    // known consequence of relocating this logic, not something to route
+    // around by leaving otherwise-misplaced tests behind.
+
+    const CODEC_BYTE_OFFSET: usize = crate::transport::protocol::DATAGRAM_HEADER_SIZE + 2;
+    const PAYLOAD_START_OFFSET: usize = crate::transport::protocol::DATAGRAM_HEADER_SIZE
+        + crate::transport::protocol::TILE_HEADER_SIZE;
+    const PALRLE_MIN_WIRE_LEN: usize = PAYLOAD_START_OFFSET + 1;
+
+    #[test]
+    fn transport_config_parses_loss_probability_and_predicate() {
+        let cfg = TransportConfig::from_lookup(lookup(&[
+            ("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "0.5"),
+            ("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE", "tile"),
+            ("GHOSTFRAME_OUTBOUND_LOSS_SEED", "42"),
+        ]));
+        let mut inj = cfg.outbound_loss.expect("probability > 0 must yield Some");
+        // Tile-datagram first byte (high bit set) → predicate matches → may drop.
+        let tile_dg = [0x80u8, 0, 0, 1];
+        // ACK datagram first byte (0x02) → predicate doesn't match → never drops.
+        let ack_dg = [0x02u8, 0, 0, 0];
+        assert!(!inj.should_drop(&ack_dg), "tile predicate filters ack out");
+        // Tile path may or may not drop on a given call; just exercise it.
+        let _ = inj.should_drop(&tile_dg);
+        // inbound_loss must be untouched by OUTBOUND-only fixture entries.
+        assert!(cfg.inbound_loss.is_none());
+    }
+
+    #[test]
+    fn transport_config_loss_injector_none_when_unset() {
+        assert!(TransportConfig::from_lookup(lookup(&[]))
+            .inbound_loss
+            .is_none());
+    }
+
+    #[test]
+    fn transport_config_parses_oob_inject_at() {
+        assert_eq!(
+            TransportConfig::from_lookup(lookup(&[("GHOSTFRAME_INJECT_OOB_PALRLE", "5,7")]))
+                .oob_inject_at,
+            Some((5u32, 7u32))
+        );
+        assert_eq!(
+            TransportConfig::from_lookup(lookup(&[])).oob_inject_at,
+            None
+        );
+    }
+
+    #[test]
+    fn transport_config_parses_skip_palette_session_reset() {
+        assert!(
+            TransportConfig::from_lookup(lookup(&[("GHOSTFRAME_SKIP_PALETTE_SESSION_RESET", "1")]))
+                .skip_palette_session_reset,
+            "env=1 must yield true"
+        );
+        assert!(
+            !TransportConfig::from_lookup(lookup(&[])).skip_palette_session_reset,
+            "unset must yield false"
+        );
+    }
+
+    #[test]
+    fn transport_config_parses_test_force_bytes_per_us() {
+        assert_eq!(
+            TransportConfig::from_lookup(lookup(&[("GHOSTFRAME_TEST_FORCE_BYTES_PER_US", "12.5")]))
+                .test_force_bytes_per_us,
+            Some(12.5)
+        );
+        // Non-positive values are filtered, not passed through.
+        assert_eq!(
+            TransportConfig::from_lookup(lookup(&[("GHOSTFRAME_TEST_FORCE_BYTES_PER_US", "0")]))
+                .test_force_bytes_per_us,
+            None
+        );
+    }
+
+    #[test]
+    fn transport_config_parses_fec_k() {
+        assert_eq!(
+            TransportConfig::from_lookup(lookup(&[("GHOSTFRAME_FEC_K", "4")])).fec_k,
+            Some(4)
+        );
+        assert_eq!(TransportConfig::from_lookup(lookup(&[])).fec_k, None);
+    }
+
+    #[test]
+    fn transport_config_parses_outbound_bandwidth_cap_bps() {
+        assert_eq!(
+            TransportConfig::from_lookup(lookup(&[(
+                "GHOSTFRAME_OUTBOUND_BANDWIDTH_CAP",
+                "1250000"
+            )]))
+            .outbound_bandwidth_cap_bps,
+            Some(1_250_000)
+        );
+        // Unset or zero both mean "no cap".
+        assert_eq!(
+            TransportConfig::from_lookup(lookup(&[])).outbound_bandwidth_cap_bps,
+            None
+        );
+        assert_eq!(
+            TransportConfig::from_lookup(lookup(&[("GHOSTFRAME_OUTBOUND_BANDWIDTH_CAP", "0")]))
+                .outbound_bandwidth_cap_bps,
+            None
+        );
+    }
+
+    /// Formerly `palrle_bundled_predicate_matches_bundled_datagram` in
+    /// `transport::io_bridge`.
+    #[test]
+    fn transport_config_palrle_bundled_predicate_matches_bundled() {
+        let mut wire = vec![0u8; PALRLE_MIN_WIRE_LEN];
+        wire[0] = 0x80; // tile datagram flag
+        wire[CODEC_BYTE_OFFSET] = (crate::transport::protocol::Codec::PalRle as u8) << 1;
+        wire[PAYLOAD_START_OFFSET] = 0x01; // bundled
+        let mut inj = TransportConfig::from_lookup(lookup(&[
+            ("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "1.0"),
+            ("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE", "palrle_bundled"),
+            ("GHOSTFRAME_OUTBOUND_LOSS_SEED", "1"),
+        ]))
+        .outbound_loss
+        .unwrap();
+        assert!(inj.should_drop(&wire));
+    }
+
+    /// Formerly `palrle_bundled_predicate_rejects_thin_datagram` in
+    /// `transport::io_bridge`.
+    #[test]
+    fn transport_config_palrle_bundled_predicate_rejects_thin() {
+        let mut wire = vec![0u8; PALRLE_MIN_WIRE_LEN];
+        wire[0] = 0x80;
+        wire[CODEC_BYTE_OFFSET] = (crate::transport::protocol::Codec::PalRle as u8) << 1;
+        wire[PAYLOAD_START_OFFSET] = 0x00; // thin
+        let mut inj = TransportConfig::from_lookup(lookup(&[
+            ("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "1.0"),
+            ("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE", "palrle_bundled"),
+            ("GHOSTFRAME_OUTBOUND_LOSS_SEED", "1"),
+        ]))
+        .outbound_loss
+        .unwrap();
+        assert!(!inj.should_drop(&wire));
+    }
+
+    /// Formerly `palrle_thin_predicate_matches_thin_only` in
+    /// `transport::io_bridge`.
+    #[test]
+    fn transport_config_palrle_thin_predicate_matches_thin_only() {
+        let mut wire = vec![0u8; PALRLE_MIN_WIRE_LEN];
+        wire[0] = 0x80;
+        wire[CODEC_BYTE_OFFSET] = (crate::transport::protocol::Codec::PalRle as u8) << 1;
+        wire[PAYLOAD_START_OFFSET] = 0x00;
+        let fixture = lookup(&[
+            ("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "1.0"),
+            ("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE", "palrle_thin"),
+            ("GHOSTFRAME_OUTBOUND_LOSS_SEED", "1"),
+        ]);
+        let mut inj = TransportConfig::from_lookup(fixture).outbound_loss.unwrap();
+        assert!(inj.should_drop(&wire));
+
+        wire[PAYLOAD_START_OFFSET] = 0x01;
+        // Re-create inj since it consumed RNG state; the predicate is the
+        // only filter at proba=1.0, so should_drop is purely predicate-driven.
+        let fixture2 = lookup(&[
+            ("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "1.0"),
+            ("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE", "palrle_thin"),
+            ("GHOSTFRAME_OUTBOUND_LOSS_SEED", "1"),
+        ]);
+        let mut inj2 = TransportConfig::from_lookup(fixture2)
+            .outbound_loss
+            .unwrap();
+        assert!(!inj2.should_drop(&wire));
+    }
+
+    /// `from_env` is a thin wrapper around `from_lookup` over the real
+    /// environment.
+    #[test]
+    fn transport_config_from_env_reads_the_real_environment() {
+        let _env = crate::test_env::lock_env();
+        std::env::set_var("GHOSTFRAME_FEC_K", "7");
+        assert_eq!(TransportConfig::from_env().fec_k, Some(7));
+        std::env::remove_var("GHOSTFRAME_FEC_K");
+    }
+
+    // -----------------------------------------------------------------
+    // DiagnosticsConfig
+    // -----------------------------------------------------------------
+    //
+    // Formerly `IoBridge::diagnose_tiles_from_env` and its test in
+    // `transport::io_bridge`'s test module.
+
+    #[test]
+    fn diagnostics_config_parses_diagnose_tiles() {
+        assert!(
+            DiagnosticsConfig::from_lookup(lookup(&[("GHOSTFRAME_DIAGNOSE_TILES", "1")]))
+                .diagnose_tiles
+        );
+        assert!(!DiagnosticsConfig::from_lookup(lookup(&[])).diagnose_tiles);
+    }
+
+    #[test]
+    fn diagnostics_config_parses_gpu_pipeline_and_color_hist() {
+        assert!(
+            DiagnosticsConfig::from_lookup(lookup(&[("GHOSTFRAME_DIAGNOSE_GPU_PIPELINE", "true")]))
+                .diagnose_gpu_pipeline
+        );
+        assert!(
+            DiagnosticsConfig::from_lookup(lookup(&[("GHOSTFRAME_DIAGNOSE_COLOR_HIST", "1")]))
+                .diagnose_color_hist
+        );
+        let empty = DiagnosticsConfig::from_lookup(lookup(&[]));
+        assert!(!empty.diagnose_gpu_pipeline);
+        assert!(!empty.diagnose_color_hist);
+    }
+
+    /// `from_env` is a thin wrapper around `from_lookup` over the real
+    /// environment, and (unlike `ClassifierConfig`/`TransportConfig`) always
+    /// reads it, even in production builds — see `from_lookup`'s doc comment.
+    #[test]
+    fn diagnostics_config_from_env_reads_the_real_environment() {
+        let _env = crate::test_env::lock_env();
+        std::env::set_var("GHOSTFRAME_DIAGNOSE_TILES", "1");
+        assert!(DiagnosticsConfig::from_env().diagnose_tiles);
+        std::env::remove_var("GHOSTFRAME_DIAGNOSE_TILES");
     }
 }
