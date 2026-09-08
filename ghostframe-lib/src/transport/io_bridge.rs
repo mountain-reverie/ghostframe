@@ -1771,6 +1771,27 @@ impl IoBridge {
             self.scheduler.enqueue(work);
         }
         if let Some(max_frag) = self.compute_max_datagram_size() {
+            // Tell the client the canvas / tile-grid size before draining
+            // any tile work, mirroring process_frame_cpu (:2388) and
+            // process_frame_gpu (:2500) — the injected path bypasses capture
+            // entirely, so nothing else on this path would ever emit frame
+            // dimensions, and a browserless client would receive tile
+            // datagrams for a grid it was never told the size of.
+            // `emit_frame_dimensions` only re-arms its retransmit counter
+            // when (width, height) actually changes (`last_emitted_dimensions`,
+            // :1241-1245), so calling it on every injected frame is safe even
+            // though the harness's grid is fixed for the bridge's lifetime.
+            // Width/height come from the scheduler grid fixed at construction
+            // (`cols`/`rows` above) scaled by the same `crate::tile::TILE_SIZE`
+            // (32px) edge the real capture path derives its grid from
+            // (`tile::mod.rs`'s `TileGrid::new`).
+            self.emit_frame_dimensions(
+                inj.seq,
+                inj.timestamp_us,
+                cols * crate::tile::TILE_SIZE,
+                rows * crate::tile::TILE_SIZE,
+            );
+
             // Never pop more from the scheduler than quinn can absorb right
             // now — see `clamp_injected_budget`'s doc comment for why this
             // is mandatory rather than defensive.
@@ -6827,6 +6848,51 @@ mod tests {
         // Pin the exact formula: quinn_space scaled by the safety fraction.
         let expected = ((quinn_space as f64) * QUINN_SEND_BUFFER_SAFETY_FRACTION) as usize;
         assert_eq!(clamped, expected);
+    }
+
+    /// Regression test for the missing-dimensions divergence: a browserless
+    /// client driven purely by injected scenes must still learn the
+    /// canvas/tile-grid size, or every tile datagram it receives is for a
+    /// grid it was never told about.
+    ///
+    /// This calls the real, unmodified `emit_frame_dimensions` production
+    /// method (shared with `process_frame_cpu`/`process_frame_gpu`) with the
+    /// exact width/height expression `apply_injected_frame` now feeds it —
+    /// `scheduler.cols()/rows()` (the grid fixed at construction) scaled by
+    /// `crate::tile::TILE_SIZE`. It does not drive `apply_injected_frame`
+    /// itself: that call site sits behind `compute_max_datagram_size()`,
+    /// which requires a live, post-handshake `quinn_proto::Connection` —
+    /// Task 15's browserless-harness responsibility (see the doc comment on
+    /// `clamp_injected_budget_bounds_a_usize_max_request` above for the same
+    /// constraint). `last_emitted_dimensions` is the only place this is
+    /// observable without one.
+    #[tokio::test(start_paused = true)]
+    async fn injected_frame_dimensions_derive_from_the_fixed_grid() {
+        let (ours, _peer) = tokio::net::UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("QuicServer::new");
+        let (_tx, rx) = mpsc::channel(8);
+        // 5x3 grid of 32px tiles -> 160x96 px.
+        let mut bridge = IoBridge::new_with_injection_for_test(ours, server, rx, 5, 3);
+
+        assert_eq!(
+            bridge.last_emitted_dimensions, None,
+            "no dimensions message has been emitted yet"
+        );
+
+        let cols = bridge.scheduler.cols();
+        let rows = bridge.scheduler.rows();
+        bridge.emit_frame_dimensions(
+            1,
+            0,
+            cols * crate::tile::TILE_SIZE,
+            rows * crate::tile::TILE_SIZE,
+        );
+
+        assert_eq!(
+            bridge.last_emitted_dimensions,
+            Some((160, 96)),
+            "dimensions must be derived from the fixed grid × TILE_SIZE"
+        );
     }
 
     /// Task 3: the tile-injection channel must enqueue injected work into
