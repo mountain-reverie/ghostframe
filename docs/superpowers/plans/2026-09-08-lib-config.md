@@ -354,13 +354,24 @@ git commit -m "refactor(classifier): take overrides from ClassifierConfig"
 - Modify: `ghostframe-lib/src/config.rs`
 - Modify: `ghostframe-lib/src/transport/io_bridge.rs` (move the helpers out)
 
+**Follow the `from_lookup` pattern.** `ClassifierConfig` now parses via
+`from_lookup(get: impl Fn(&str) -> Option<String>)`, with `from_env()` as a thin
+`Self::from_lookup(|k| std::env::var(k).ok())`. `TransportConfig` must do the
+same: the parsing is testable with no process environment, and `std::env::var`
+stays on exactly one line in the crate — which is what makes Task 9's CI guard
+meaningful. `config.rs`'s test module already has a `lookup(&[(&str, &str)])`
+fixture helper (`config.rs:179`); reuse it rather than writing another.
+
+The tests below are therefore written against `from_lookup`, not `from_env`, and
+take **no** `lock_env()` guard.
+
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
     #[test]
     fn transport_config_parses_loss_injectors() {
-        let _env = crate::test_env::lock_env();
-        std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "0.25");
+        let cfg = TransportConfig::from_lookup(lookup(&[
+            ("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "0.25"),
         std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE", "tile");
         std::env::set_var("GHOSTFRAME_OUTBOUND_LOSS_SEED", "42");
         let cfg = TransportConfig::from_env();
