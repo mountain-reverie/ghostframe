@@ -4146,6 +4146,8 @@ impl IoBridge {
     /// Test-only constructor that accepts a pre-built stream and server,
     /// bypassing the real ghostbridge connection. No tsnet node is held, so
     /// `_handle` is `None` and no `gbridge_close` is called on Drop.
+    /// Available under `cfg(test)` or the `browserless-harness` feature; never
+    /// in a production build.
     #[cfg(any(test, feature = "browserless-harness"))]
     pub fn new_with_stream_for_test(stream: TokioUnixStream, server: QuicServer) -> Self {
         // Warm rayon's global thread pool so the first PalRLE-heavy frame
