@@ -10,6 +10,7 @@
 pub type DropPredicate = fn(&[u8]) -> bool;
 
 /// Splitmix64-style PRNG. Tiny, deterministic, zero dependencies.
+#[derive(Debug, Clone)]
 struct SplitMix {
     state: u64,
 }
@@ -30,6 +31,7 @@ impl SplitMix {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct LossInjector {
     drop_probability: f32,
     predicate: DropPredicate,
