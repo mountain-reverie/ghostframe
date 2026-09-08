@@ -278,6 +278,19 @@ fn oob_inject_at_from_lookup(get: &impl Fn(&str) -> Option<String>) -> Option<(u
     Some((x, y))
 }
 
+/// Parse `GHOSTFRAME_CDF53_DIFF_TILE` as `"x,y"` (two u32 separated by a
+/// comma, whitespace around each number trimmed). Returns `None` when the
+/// env var is unset or unparseable. Mirrors the former inline parsing at
+/// `io_bridge.rs:3215-3218`.
+#[cfg(feature = "cdf53-diag")]
+fn cdf53_diff_tile_from_lookup(get: &impl Fn(&str) -> Option<String>) -> Option<(u32, u32)> {
+    let spec = get("GHOSTFRAME_CDF53_DIFF_TILE")?;
+    let (sx, sy) = spec.split_once(',')?;
+    let x = sx.trim().parse::<u32>().ok()?;
+    let y = sy.trim().parse::<u32>().ok()?;
+    Some((x, y))
+}
+
 /// Diagnostic logging and one-shot dumps.
 #[derive(Debug, Clone, Default)]
 pub struct DiagnosticsConfig {
@@ -287,14 +300,29 @@ pub struct DiagnosticsConfig {
     pub diagnose_gpu_pipeline: bool,
     /// From `GHOSTFRAME_DIAGNOSE_COLOR_HIST=1|true`.
     pub diagnose_color_hist: bool,
-    /// Path for the one-shot raw-BGRA frame dump. Consumed once, then cleared
-    /// by the bridge — this replaces the current read-then-`remove_var`.
+    /// Path for the one-shot raw-BGRA frame dump, from `GHOSTFRAME_DUMP_FRAME`.
+    /// Consumed once via `IoBridge::take_dump_frame_path`, which `Option::take`s
+    /// it — this replaces the former read-then-`remove_var` one-shot pattern.
     pub dump_frame_path: Option<String>,
+    /// Tile coordinates for the M3.3b GPU-vs-CPU CDF53 diff diagnostic, from
+    /// `GHOSTFRAME_CDF53_DIFF_TILE="x,y"`. Only consumed under the
+    /// `cdf53-diag` feature.
     pub cdf53_diff_tile: Option<(u32, u32)>,
+    /// From `GHOSTFRAME_CDF53_DUMP_PENDING`; presence, not value, is the
+    /// signal (`.is_ok()` semantics, as with the two fields below). Only
+    /// consumed under the `cdf53-diag` feature.
     pub cdf53_dump_pending: bool,
-    // Deliberately no `cdf53_skip_l2_l3` / `cdf53_skip_l3`: those two reads
-    // live in the Vulkan dispatch path and are deferred. Adding unused fields
-    // now would imply a wiring that does not exist.
+    /// From `GHOSTFRAME_CDF53_SKIP_L2_L3`. Presence, not value, is the
+    /// signal: the former `io_bridge.rs` read site used `.is_ok()`, so any
+    /// set value (including empty) means `true`. Only consumed under the
+    /// `cdf53-diag` feature.
+    pub cdf53_skip_l2_l3: bool,
+    /// True if `GHOSTFRAME_CDF53_SKIP_L3` **or** `GHOSTFRAME_CDF53_SKIP_L2_L3`
+    /// is set: the former call site treated skip-L2-and-L3 as implying
+    /// skip-L3 too (`io_bridge.rs:3232-3233`). The OR is resolved here in
+    /// `from_lookup` so the call site just reads the field, keeping
+    /// `from_lookup` the only place that reasons about the raw env vars.
+    pub cdf53_skip_l3: bool,
 }
 
 impl DiagnosticsConfig {
@@ -309,9 +337,13 @@ impl DiagnosticsConfig {
     /// as the other two configs would silently stop honouring these
     /// variables in production — so it doesn't.
     ///
-    /// Only the three boolean toggles above are parsed here; `dump_frame_path`
-    /// / `cdf53_diff_tile` / `cdf53_dump_pending` stay unwired (deferred, see
-    /// struct doc comment) — `from_lookup` leaves them at `Default`.
+    /// `dump_frame_path` parses unconditionally: the former `io_bridge.rs`
+    /// site (`GHOSTFRAME_DUMP_FRAME`) was ungated, a live production
+    /// one-shot dump, not a test-only knob. `cdf53_diff_tile` /
+    /// `cdf53_dump_pending` / `cdf53_skip_l2_l3` / `cdf53_skip_l3` only
+    /// parse under the `cdf53-diag` feature, mirroring the `#[cfg]` that
+    /// gates their `io_bridge.rs` call sites; a build without the feature
+    /// leaves them at `Default`.
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
         Self {
             diagnose_tiles: matches!(
@@ -326,7 +358,30 @@ impl DiagnosticsConfig {
                 get("GHOSTFRAME_DIAGNOSE_COLOR_HIST").as_deref(),
                 Some("1") | Some("true")
             ),
-            ..Self::default()
+            dump_frame_path: get("GHOSTFRAME_DUMP_FRAME"),
+            #[cfg(feature = "cdf53-diag")]
+            cdf53_diff_tile: cdf53_diff_tile_from_lookup(&get),
+            #[cfg(not(feature = "cdf53-diag"))]
+            cdf53_diff_tile: None,
+            #[cfg(feature = "cdf53-diag")]
+            cdf53_dump_pending: get("GHOSTFRAME_CDF53_DUMP_PENDING").is_some(),
+            #[cfg(not(feature = "cdf53-diag"))]
+            cdf53_dump_pending: false,
+            // `.is_some()`, not a value comparison: the former
+            // `io_bridge.rs` sites used `std::env::var(..).is_ok()`, so mere
+            // presence (even `""`) means true. `cdf53_skip_l3` is true if
+            // *either* SKIP_L3 or SKIP_L2_L3 is set — the former call site
+            // treated skip-L2-and-L3 as implying skip-L3
+            // (`io_bridge.rs:3232-3233`). Both quirks are preserved as-is.
+            #[cfg(feature = "cdf53-diag")]
+            cdf53_skip_l2_l3: get("GHOSTFRAME_CDF53_SKIP_L2_L3").is_some(),
+            #[cfg(not(feature = "cdf53-diag"))]
+            cdf53_skip_l2_l3: false,
+            #[cfg(feature = "cdf53-diag")]
+            cdf53_skip_l3: get("GHOSTFRAME_CDF53_SKIP_L3").is_some()
+                || get("GHOSTFRAME_CDF53_SKIP_L2_L3").is_some(),
+            #[cfg(not(feature = "cdf53-diag"))]
+            cdf53_skip_l3: false,
         }
     }
 
@@ -384,6 +439,8 @@ mod tests {
         assert!(cfg.diagnostics.dump_frame_path.is_none());
         assert!(cfg.diagnostics.cdf53_diff_tile.is_none());
         assert!(!cfg.diagnostics.cdf53_dump_pending);
+        assert!(!cfg.diagnostics.cdf53_skip_l2_l3);
+        assert!(!cfg.diagnostics.cdf53_skip_l3);
     }
 
     /// Build a lookup closure over a small fixture, the way `from_env` builds
@@ -722,5 +779,76 @@ mod tests {
         std::env::set_var("GHOSTFRAME_DIAGNOSE_TILES", "1");
         assert!(DiagnosticsConfig::from_env().diagnose_tiles);
         std::env::remove_var("GHOSTFRAME_DIAGNOSE_TILES");
+    }
+
+    /// `dump_frame_path` parses unconditionally (no `cdf53-diag` gate) —
+    /// see `from_lookup`'s doc comment.
+    #[test]
+    fn diagnostics_config_parses_dump_frame_path() {
+        assert_eq!(
+            DiagnosticsConfig::from_lookup(lookup(&[("GHOSTFRAME_DUMP_FRAME", "/tmp/frame.bgra")]))
+                .dump_frame_path,
+            Some("/tmp/frame.bgra".to_string())
+        );
+        assert_eq!(
+            DiagnosticsConfig::from_lookup(lookup(&[])).dump_frame_path,
+            None
+        );
+    }
+
+    #[cfg(feature = "cdf53-diag")]
+    #[test]
+    fn diagnostics_config_parses_cdf53_diff_tile() {
+        assert_eq!(
+            DiagnosticsConfig::from_lookup(lookup(&[("GHOSTFRAME_CDF53_DIFF_TILE", "5,7")]))
+                .cdf53_diff_tile,
+            Some((5u32, 7u32))
+        );
+        // Whitespace around each number is trimmed.
+        assert_eq!(
+            DiagnosticsConfig::from_lookup(lookup(&[("GHOSTFRAME_CDF53_DIFF_TILE", " 5 , 7 ")]))
+                .cdf53_diff_tile,
+            Some((5u32, 7u32))
+        );
+        assert_eq!(
+            DiagnosticsConfig::from_lookup(lookup(&[])).cdf53_diff_tile,
+            None
+        );
+        assert_eq!(
+            DiagnosticsConfig::from_lookup(lookup(&[("GHOSTFRAME_CDF53_DIFF_TILE", "bogus")]))
+                .cdf53_diff_tile,
+            None
+        );
+    }
+
+    #[cfg(feature = "cdf53-diag")]
+    #[test]
+    fn diagnostics_config_parses_cdf53_dump_pending_and_skip_gates() {
+        // Presence, not value, is the signal — `.is_ok()` semantics.
+        assert!(
+            DiagnosticsConfig::from_lookup(lookup(&[("GHOSTFRAME_CDF53_DUMP_PENDING", "")]))
+                .cdf53_dump_pending
+        );
+        assert!(!DiagnosticsConfig::from_lookup(lookup(&[])).cdf53_dump_pending);
+
+        assert!(
+            DiagnosticsConfig::from_lookup(lookup(&[("GHOSTFRAME_CDF53_SKIP_L2_L3", "")]))
+                .cdf53_skip_l2_l3
+        );
+        assert!(!DiagnosticsConfig::from_lookup(lookup(&[])).cdf53_skip_l2_l3);
+
+        // cdf53_skip_l3 is true if EITHER GHOSTFRAME_CDF53_SKIP_L3 or
+        // GHOSTFRAME_CDF53_SKIP_L2_L3 is set — preserved quirk from the
+        // former io_bridge.rs call site.
+        assert!(
+            DiagnosticsConfig::from_lookup(lookup(&[("GHOSTFRAME_CDF53_SKIP_L3", "")]))
+                .cdf53_skip_l3
+        );
+        assert!(
+            DiagnosticsConfig::from_lookup(lookup(&[("GHOSTFRAME_CDF53_SKIP_L2_L3", "")]))
+                .cdf53_skip_l3,
+            "SKIP_L2_L3 alone must also imply skip_l3"
+        );
+        assert!(!DiagnosticsConfig::from_lookup(lookup(&[])).cdf53_skip_l3);
     }
 }
