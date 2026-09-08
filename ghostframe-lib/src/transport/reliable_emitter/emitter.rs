@@ -234,9 +234,16 @@ impl ReliableTileEmitter {
     /// The RTO heap entry for this key stays in place; `tick` will see
     /// the bumped `attempts` and re-fire with the capped backoff. No
     /// active heap removal is required.
-    pub fn on_nack(&mut self, entries: &[(EmitKey, u8)]) {
+    ///
+    /// `now` is a single timestamp for the whole batch (not resampled per
+    /// entry) — a batch of NACKs arrived together, so one clock read is
+    /// both cheaper and more correct than drifting `last_sent_at` across
+    /// entries by however long the loop body takes. Callers should pass
+    /// the same clock source used for `submit_one` / `tick` (`now_std()`
+    /// in production) so `last_sent_at` stays comparable against those
+    /// other stamps under a paused tokio clock.
+    pub fn on_nack(&mut self, entries: &[(EmitKey, u8)], now: Instant) {
         for &(key, frag_idx) in entries {
-            let now = self.smoothed_rtt_clock_now();
             let Some(entry) = self.cache.get_mut(&key) else {
                 self.stats.nack_miss += 1;
                 continue;
@@ -290,14 +297,6 @@ impl ReliableTileEmitter {
     /// somehow precedes `time_base`.
     fn emit_us(&self, now: Instant) -> u32 {
         now.duration_since(self.time_base).as_micros() as u32
-    }
-
-    /// Internal helper — captures the current time so on_nack's caller
-    /// doesn't have to pass an Instant. Task 22 wires a real Clock through
-    /// the emitter constructor; this stub keeps the signature stable until
-    /// then.
-    fn smoothed_rtt_clock_now(&self) -> Instant {
-        Instant::now()
     }
 
     /// Drain emissions to a sender until the queue is empty.
@@ -521,7 +520,7 @@ mod tests {
         e.drain(&mut sender, t0);
         assert_eq!(sender.sent.len(), 1);
         // NACK for frag_idx=0 (the only one)
-        e.on_nack(&[(key, 0u8)]);
+        e.on_nack(&[(key, 0u8)], t0);
         e.drain(&mut sender, t0);
         assert_eq!(sender.sent.len(), 2);
         assert_eq!(e.stats.nack_hit, 1);
@@ -531,7 +530,7 @@ mod tests {
     #[test]
     fn on_nack_for_unknown_key_bumps_nack_miss() {
         let mut e = ReliableTileEmitter::new(Instant::now());
-        e.on_nack(&[(EmitKey::new(99, 0, 0, 0), 0u8)]);
+        e.on_nack(&[(EmitKey::new(99, 0, 0, 0), 0u8)], Instant::now());
         assert_eq!(e.stats.nack_miss, 1);
     }
 
@@ -570,7 +569,7 @@ mod tests {
         e.drain(&mut sender, t0);
         let nacks = 10usize;
         for _ in 0..nacks {
-            e.on_nack(&[(key, 0u8)]);
+            e.on_nack(&[(key, 0u8)], t0);
             e.drain(&mut sender, t0);
         }
         // 1 original + nacks re-emits — all NACKs produce emissions now.
@@ -743,6 +742,56 @@ mod tests {
              time, got {:?} (ts0={ts0} ts1={ts1}) -- if this fails, the \
              emitter's timestamp_us stamp has regressed back to reading \
              the wall clock instead of the caller's `now: Instant`",
+            delta,
+        );
+    }
+
+    /// Regression test for the `on_nack` mixed-clock hazard: `on_nack` used
+    /// to stamp `last_sent_at` via a private `smoothed_rtt_clock_now()`
+    /// stub that read the real wall clock (`Instant::now()`) instead of a
+    /// caller-supplied `now`, while every other cache timestamp
+    /// (`first_sent_at`/`last_sent_at` from `submit_one`/`tick`) already
+    /// tracked `now_std()` — tokio's clock, paused-aware under the
+    /// browserless harness. Under a paused runtime that produced exactly
+    /// the defect this branch has already hit twice: `duration_since`
+    /// between a wall-clock stamp and a virtual-clock stamp saturates
+    /// silently to zero rather than failing loudly.
+    ///
+    /// This test submits one tile pass, advances tokio's paused clock by
+    /// 5 minutes (real wall-clock time spent executing the intervening
+    /// lines is microseconds), delivers a NACK for it, and asserts
+    /// `last_sent_at` landed at the *virtual* timestamp — reachable only
+    /// if `on_nack` reads its `now` argument rather than the wall clock.
+    /// Verified by hand that this discriminates: temporarily reverting
+    /// `on_nack` to stamp `entry.last_sent_at` from a bare `Instant::now()`
+    /// (bypassing the `now` parameter) makes the assertion below fail,
+    /// landing `last_sent_at` a few microseconds after `t0` instead of
+    /// ~300s after it.
+    #[tokio::test(start_paused = true)]
+    async fn on_nack_stamps_last_sent_at_from_virtual_clock_not_wall_clock() {
+        let t0 = crate::transport::io_bridge::now_std();
+        let mut e = ReliableTileEmitter::new(t0);
+        let mut sender = CollectSender::default();
+        let key = EmitKey::new(1, 0, 0, 0);
+        e.submit_one(key, fake_source(1, 0, 0), t0);
+        e.drain(&mut sender, t0);
+
+        // Real wall-clock time spent on the next few lines is on the order
+        // of microseconds; the paused clock jumps forward 5 minutes
+        // regardless.
+        tokio::time::advance(Duration::from_secs(300)).await;
+
+        let now1 = crate::transport::io_bridge::now_std();
+        e.on_nack(&[(key, 0u8)], now1);
+
+        let last_sent_at = e.cache.get(&key).unwrap().last_sent_at;
+        let delta = last_sent_at.duration_since(t0);
+        assert!(
+            delta >= Duration::from_secs(299) && delta <= Duration::from_secs(301),
+            "expected on_nack to stamp last_sent_at from the caller's \
+             virtual `now`, ~300s after t0, got {:?} -- if this fails, \
+             on_nack has regressed back to reading the wall clock instead \
+             of its `now` argument",
             delta,
         );
     }
