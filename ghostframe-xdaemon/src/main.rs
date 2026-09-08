@@ -167,8 +167,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None
     };
 
+    let lib_config = ghostframe_lib::config::LibConfig::from_env();
+    tracing::info!(?lib_config, "effective LibConfig");
+
     tracing::info!("Connecting to Tailscale...");
-    let server = match GhostframeServer::new(config, ":443", input_injector).await {
+    let server = match GhostframeServer::new(config, ":443", lib_config, input_injector).await {
         Ok(s) => s,
         Err(e) => {
             if let Some(ws) = e.downcast_ref::<ghostframe_lib::WebServerError>() {

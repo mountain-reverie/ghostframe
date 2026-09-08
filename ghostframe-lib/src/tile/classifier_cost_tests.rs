@@ -19,8 +19,9 @@ fn skip_and_pixel_perfect_cost_zero() {
 
 #[test]
 fn adaptation_context_overrides_static_bytes_per_us() {
+    use crate::config::ClassifierConfig;
     use crate::tile::classifier::{AdaptationContext, Classifier};
-    let mut c = Classifier::default();
+    let mut c = Classifier::new(ClassifierConfig::default());
     let initial = c.cost.bytes_per_us();
     let ctx = AdaptationContext {
         supports_h264: true,
@@ -37,8 +38,9 @@ fn adaptation_context_overrides_static_bytes_per_us() {
 
 #[test]
 fn adaptation_context_with_zero_bytes_per_us_preserves_cost() {
+    use crate::config::ClassifierConfig;
     use crate::tile::classifier::{AdaptationContext, Classifier};
-    let mut c = Classifier::default();
+    let mut c = Classifier::new(ClassifierConfig::default());
     let initial = c.cost.bytes_per_us();
     let ctx = AdaptationContext {
         supports_h264: true,
