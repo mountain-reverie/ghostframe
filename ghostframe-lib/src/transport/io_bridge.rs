@@ -1795,23 +1795,36 @@ impl IoBridge {
         let cols = self.scheduler.cols();
         let rows = self.scheduler.rows();
         let mut enqueued_count = 0usize;
+        // Accumulate out-of-grid tiles instead of logging per-tile: a
+        // mis-sized harness grid injects whole frames of out-of-grid work
+        // at scene rate (e.g. 60 tiles/frame x 30 fps), and a five-line
+        // `error!` per tile would bury the one summary line that actually
+        // matters under ~1800 identical records per second.
+        let mut out_of_grid_skipped = 0usize;
+        let mut first_out_of_grid: Option<(u8, u8)> = None;
         for work in inj.work {
             if work.tile_x as u32 >= cols || work.tile_y as u32 >= rows {
-                tracing::error!(
-                    tile_x = work.tile_x,
-                    tile_y = work.tile_y,
-                    grid_cols = cols,
-                    grid_rows = rows,
-                    "apply_injected_frame: tile coordinate outside the \
-                     scheduler grid fixed at construction — skipping. \
-                     Pass the scene's true grid_cols/grid_rows to \
-                     new_with_injection_for_test instead of relying on \
-                     growth-on-demand."
-                );
+                out_of_grid_skipped += 1;
+                first_out_of_grid.get_or_insert((work.tile_x, work.tile_y));
                 continue;
             }
             self.scheduler.enqueue(work);
             enqueued_count += 1;
+        }
+        if let Some((tile_x, tile_y)) = first_out_of_grid {
+            tracing::error!(
+                skipped = out_of_grid_skipped,
+                first_tile_x = tile_x,
+                first_tile_y = tile_y,
+                grid_cols = cols,
+                grid_rows = rows,
+                "apply_injected_frame: tile coordinate(s) outside the \
+                 scheduler grid fixed at construction — skipped (first \
+                 offender shown, `skipped` is the count for this frame). \
+                 Pass the scene's true grid_cols/grid_rows to \
+                 new_with_injection_for_test instead of relying on \
+                 growth-on-demand."
+            );
         }
         if let Some(max_frag) = self.compute_max_datagram_size() {
             // Tell the client the canvas / tile-grid size before draining
