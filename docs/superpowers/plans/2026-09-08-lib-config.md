@@ -118,8 +118,19 @@ pub struct ClassifierConfig {
 /// Transport-layer knobs: fault injection, pacing overrides, FEC.
 #[derive(Debug, Clone, Default)]
 pub struct TransportConfig {
+    // `loss_injection` is itself a `#[cfg(any(test, feature =
+    // "test-loss-injection"))]` module (`transport/mod.rs:17`), so these two
+    // fields carry the same gate — the type does not exist otherwise. This
+    // mirrors `IoBridge`'s own fields at `io_bridge.rs:388,397`. Unit tests are
+    // unaffected: `any(test, ..)` means the fields exist under `cargo test`.
+    #[cfg(any(test, feature = "test-loss-injection"))]
     pub outbound_loss: Option<crate::transport::loss_injection::LossInjector>,
+    #[cfg(any(test, feature = "test-loss-injection"))]
     pub inbound_loss: Option<crate::transport::loss_injection::LossInjector>,
+    /// Rate in bytes/sec. Deliberately a plain `u64` rather than a
+    /// `BandwidthCap` (also a gated module): the config carries data, and
+    /// `IoBridge` constructs the gated type from it. That keeps this field
+    /// ungated.
     pub outbound_bandwidth_cap_bps: Option<u64>,
     /// `(frame_seq, tile_index)` at which to inject an out-of-range PalRLE
     /// index, from `GHOSTFRAME_INJECT_OOB_PALRLE`.
@@ -156,7 +167,11 @@ pub struct LibConfig {
 
 Add `pub mod config;` to `ghostframe-lib/src/lib.rs`, alphabetically (between `capture` and `encoder`).
 
-Check the real types before writing: `FrameMode`'s path, `LossInjector`'s path, and whether `test_force_bytes_per_us` is `f64` or another type at `io_bridge.rs:951`. **If any differs from the sketch, follow the code and report it.** `TransportConfig` cannot derive `PartialEq` if `LossInjector` does not — check, and drop the derive rather than adding one to `LossInjector`.
+`FrameMode` lives at `ghostframe-lib/src/tile/mod.rs:114`; import it as `crate::tile::FrameMode`.
+
+Check the remaining types before writing: `LossInjector`'s exact path, and whether `test_force_bytes_per_us` is `f64` or another type at `io_bridge.rs:951`. **If any differs from the sketch, follow the code and report it.** `TransportConfig` cannot derive `PartialEq` if `LossInjector` does not — check, and drop the derive rather than adding one to `LossInjector`.
+
+Because two `TransportConfig` fields are `cfg`-gated, the Task 1 test asserting them compiles only under `cfg(test)` — which is where it lives, so this is fine, but do not "simplify" by removing the gates.
 
 - [ ] **Step 4: Run to verify it passes**
 
