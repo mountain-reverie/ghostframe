@@ -367,6 +367,20 @@ pub struct Classifier {
     epoch: std::time::Instant,
 }
 
+/// Production-inert defaults, with **no** environment read: equivalent to
+/// `Classifier::new(ClassifierConfig::default())`.
+///
+/// The env-reading version of this impl was the last ambient-configuration
+/// path in the library — every override now arrives explicitly through
+/// `ClassifierConfig`, sourced from `LibConfig::from_env()` at the executable
+/// boundary. Kept because tests use `Classifier { ..Default::default() }`
+/// struct-update syntax.
+impl Default for Classifier {
+    fn default() -> Self {
+        Self::new(crate::config::ClassifierConfig::default())
+    }
+}
+
 impl Classifier {
     /// Build a classifier from an explicit configuration. Overrides come
     /// from `config` rather than from process-global environment reads, so
@@ -409,12 +423,6 @@ impl Classifier {
             last_emitted_mode: None,
             epoch: std::time::Instant::now(),
         }
-    }
-}
-
-impl Default for Classifier {
-    fn default() -> Self {
-        Self::new(crate::config::ClassifierConfig::from_env())
     }
 }
 
