@@ -991,7 +991,13 @@ impl IoBridge {
         } else {
             "cpu"
         };
-        let t0 = now_std();
+        // Deliberately the real wall clock, not `now_std()`: this measures
+        // how long the CPU actually spent inside `process_frame` (encode
+        // work), not protocol/deadline time. A virtual-clock timestamp would
+        // not advance while the CPU is busy, so it would report ~0us under
+        // the paused-clock browserless harness just like the bug this
+        // replaces did.
+        let t0 = std::time::Instant::now();
         tracing::trace!(
             target: "ghostframe::io_bridge::diag",
             w = frame.width,
