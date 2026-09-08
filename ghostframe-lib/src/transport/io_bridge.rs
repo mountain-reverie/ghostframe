@@ -4224,84 +4224,20 @@ impl IoBridge {
         }
     }
 
+    /// Frame-carrying variant of the test constructor, accepting a pre-built
+    /// stream, server, and frame channel. Delegates to `new_with_stream_for_test`
+    /// and adds frame injection support.
+    /// Available under `cfg(test)` or the `browserless-harness` feature; never
+    /// in a production build.
     #[cfg(any(test, feature = "browserless-harness"))]
     pub fn new_with_frames_for_test(
         stream: TokioUnixStream,
         server: QuicServer,
         frame_rx: mpsc::Receiver<FrameSubmission>,
     ) -> Self {
-        // Warm rayon's global thread pool so the first PalRLE-heavy frame
-        // doesn't pay thread-spin-up latency on the hot path (design Section 4).
-        rayon::iter::IntoParallelIterator::into_par_iter(0..1u32).for_each(|_| {});
-
-        IoBridge {
-            _handle: None,
-            stream,
-            server,
-            local_addr: "0.0.0.0:443".parse().unwrap(),
-            wt_sessions: HashMap::new(),
-            session_resets_fired: HashSet::new(),
-            has_seen_prior_session: false,
-            frame_rx: Some(frame_rx),
-            frame_seq: 0,
-            dirty_tracker: DirtyTracker::new(0, 0),
-            metrics_tracker: crate::tile::MetricsTracker::new(0, 0),
-            classifier: crate::tile::Classifier::default(),
-            frame_mode: crate::tile::FrameMode::TileCodec,
-            scheduler: crate::transport::scheduler::Scheduler::new(0, 0),
-            #[cfg(any(test, feature = "test-loss-injection"))]
-            outbound_loss: None,
-            #[cfg(any(test, feature = "test-loss-injection"))]
-            inbound_loss: None,
-            #[cfg(any(test, feature = "test-loss-injection"))]
-            outbound_bandwidth_cap: None,
-            #[cfg(any(test, feature = "test-loss-injection"))]
-            test_force_bytes_per_us: None,
-            #[cfg(any(test, feature = "test-loss-injection"))]
-            oob_inject_at: None,
-            #[cfg(any(test, feature = "test-loss-injection"))]
-            skip_palette_session_reset: false,
-            force_dirty_frames: 0,
-            palette_table: crate::encoder::pal_rle::PaletteTable::new(),
-            client_caps: crate::transport::client_caps::ClientCapabilities::default(),
-            fec_k: 0,
-            fec_enable_threshold: FEC_ENABLE_THRESHOLD,
-            fec_disable_threshold: FEC_DISABLE_THRESHOLD,
-            adaptation_context: crate::tile::classifier::AdaptationContext::default(),
-            feedback_history: std::collections::VecDeque::with_capacity(5),
-            recent_suspension_flags: [false, false],
-            cdf53_escalation_candidates_this_frame: Vec::new(),
-            cdf53_stranded_candidates_this_frame: Vec::new(),
-            gpu_frame_processor: None,
-            full_frame_encoder: None,
-            recent_frame_fragments: HashMap::new(),
-            fragment_coverage: crate::transport::fragment_coverage::FragmentCoverageMap::new(
-                crate::transport::fragment_coverage::FRAGMENT_COVERAGE_CAPACITY,
-            ),
-            last_emitted_dimensions: None,
-            dimensions_retransmits_left: 0,
-            connected_session_count: Arc::new(AtomicUsize::new(0)),
-            was_idle: true,
-            input_injector: None,
-            feedback_recv_buf: Vec::new(),
-            datagram_send_errs: 0,
-            datagram_send_err_first_logged: false,
-            tick_budget_multiplier: 1.0,
-            scheduler_continuation: None,
-            cumulative_datagrams_emitted: CumulativeEmitCounters::default(),
-            last_cumulative_emit_log_frame: 0,
-            color_histogram_accumulator: UniqueColorHistogram::default(),
-            bump_count_accumulator: BumpCountAccumulator::default(),
-            reliable_emitter: crate::transport::reliable_emitter::ReliableTileEmitter::new(),
-            bwe_samples_buffer: Vec::with_capacity(BWE_SAMPLES_BUFFER_CAPACITY),
-            bwe: crate::transport::bwe::BweWrapper::new(
-                crate::transport::bwe::BweWrapper::INITIAL_BPS,
-            ),
-            bytes_emitted_critical: 0,
-            bytes_emitted_refinement: 0,
-            bytes_emitted_snapshot: (0, 0),
-            bwe_log_last_at: None,
-        }
+        let mut bridge = Self::new_with_stream_for_test(stream, server);
+        bridge.frame_rx = Some(frame_rx);
+        bridge
     }
 
     /// Return the capabilities most recently advertised by the client via HELLO.
