@@ -1,4 +1,5 @@
 pub mod capture;
+pub mod config;
 pub mod encoder;
 pub mod ffi;
 pub mod server;
