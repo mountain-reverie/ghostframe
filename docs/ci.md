@@ -31,10 +31,13 @@ Runs on every pull request and every push to `master`. Three jobs:
 | Job | What it runs |
 |---|---|
 | `loopback-h3` | `cargo test --test loopback_h3` (sans-IO QUIC/H3) |
+| `browserless` | `cargo test --test browserless` (in-process server + headless client over the netsim) |
 | `harness-smoke` | `cargo test --test harness_smoke` |
 | `e2e` | full `cargo test --test e2e` suite minus the VKMS-gated subset |
 
-All three are required for merge.
+All four are required for merge. `browserless` needs no Docker, GPU, or
+kernel modules — it runs the real server against a headless Rust client in
+one process — so it stays cheap as the suite grows.
 
 #### Why some e2e tests are skipped
 
