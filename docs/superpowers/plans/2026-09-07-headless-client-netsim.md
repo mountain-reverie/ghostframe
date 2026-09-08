@@ -224,19 +224,40 @@ git add -A && git commit -m "refactor(io_bridge): source every deadline from tok
 
 ### Task 3: Tile-injection channel into the scheduler
 
-The harness supplies pre-encoded tiles, because `process_frame_cpu` emits everything as `Codec::Raw`. Injecting at `Scheduler::enqueue` means the reliable emitter, FEC, pacer, fragmentation, and ACK/NACK paths all run unmodified.
+The harness supplies pre-encoded tiles, because `process_frame_cpu` emits
+everything as `Codec::Raw`.
 
-The field is always present (a `None` receiver costs a pending future); only the constructor that populates it is feature-gated, so `tokio::select!` needs no `cfg` on its branches.
+**Verified against the code before writing this task, and the obvious design is
+wrong:** enqueueing into `Scheduler` is necessary but *not sufficient*. The only
+thing that turns queued `TileWork` into datagrams is
+`IoBridge::drain_scheduler_into_quinn(seq, timestamp_us, max_frag, budget_bytes)`
+(`io_bridge.rs:1494`), which pulls from the scheduler, calls `fragment_tile`,
+submits to the reliable emitter (cache + RTO + FEC parity), and drains to the
+wire. It has exactly two callers: `dispatch_dirty_tiles_via_scheduler`
+(`:1431`, the frame path) and the `DatagramsUnblocked` continuation (`:1706`).
+**There is no periodic pacing tick that drains the scheduler on its own.**
+
+So an injection arm that only enqueues would leave the work sitting in the
+queue forever, and Task 15 would debug an empty framebuffer. The arm must
+enqueue *and* drive a drain, which is why the injected message carries frame
+identity rather than being a bare `Vec<TileWork>`.
+
+Everything below the drain — fragmentation, FEC parity, RTO, ACK/NACK — then
+runs unmodified, which is the actual "for free" part.
+
+The field is always present (a `None` receiver costs a pending future); only the
+constructor that populates it is feature-gated, so `tokio::select!` needs no
+`cfg` on its branches.
 
 **Files:**
-- Modify: `ghostframe-lib/src/transport/io_bridge.rs` (struct field, constructors, select arm)
+- Modify: `ghostframe-lib/src/transport/io_bridge.rs` (struct field, constructors, select arm, one new public type)
 - Test: `ghostframe-lib/src/transport/io_bridge.rs` (`mod tests`)
 
 - [ ] **Step 1: Write the failing test**
 
 ```rust
 #[tokio::test(start_paused = true)]
-async fn injected_tile_work_reaches_the_scheduler() {
+async fn injected_work_is_enqueued_and_drain_is_attempted() {
     use crate::transport::protocol::Codec;
     use crate::transport::scheduler::{TileWork, WorkState};
 
@@ -245,23 +266,35 @@ async fn injected_tile_work_reaches_the_scheduler() {
     let (tx, rx) = mpsc::channel(8);
     let mut bridge = IoBridge::new_with_injection_for_test(ours, server, rx);
 
-    tx.send(vec![TileWork {
-        tile_x: 1,
-        tile_y: 2,
-        generation: 0,
-        pass_idx: 0,
-        total_passes: 1,
-        codec: Codec::Solid,
-        payload: vec![10, 20, 30, 255],
-        queued_at: super::now_std(),
-        last_sent_at: None,
-        state: WorkState::Pending,
-    }])
+    tx.send(InjectedFrame {
+        seq: 1,
+        timestamp_us: 0,
+        budget_bytes: usize::MAX,
+        work: vec![TileWork {
+            tile_x: 1,
+            tile_y: 2,
+            generation: 0,
+            pass_idx: 0,
+            total_passes: 1,
+            codec: Codec::Solid,
+            payload: vec![10, 20, 30, 255],
+            queued_at: super::now_std(),
+            last_sent_at: None,
+            state: WorkState::Pending,
+        }],
+    })
     .await
     .expect("send injection");
 
+    // Drives one injection message: enqueue, then attempt the drain.
     bridge.drain_injection_for_test().await;
 
+    // With no connected WebTransport session, `compute_max_datagram_size()`
+    // returns None, so the drain is skipped and the work stays queued. That
+    // is the correct behaviour here: this test pins the enqueue + graceful
+    // no-session path. End-to-end emission over a real connection is
+    // asserted by the harness in Task 15, which is the first point a live
+    // session exists.
     let queued = bridge.scheduler_peek_for_test();
     assert_eq!(queued.len(), 1, "one work item must be queued");
     assert_eq!((queued[0].tile_x, queued[0].tile_y), (1, 2));
@@ -271,20 +304,38 @@ async fn injected_tile_work_reaches_the_scheduler() {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test -p ghostframe-lib --lib injected_tile_work`
-Expected: FAIL — `new_with_injection_for_test` not found.
+Run: `cargo test -p ghostframe-lib --lib injected_work_is_enqueued`
+Expected: FAIL — `InjectedFrame` and `new_with_injection_for_test` not found.
 
 - [ ] **Step 3: Implement the channel**
 
-Add the field to `struct IoBridge` (near `frame_rx`):
+Add the message type near the other public transport types in `io_bridge.rs`:
+
+```rust
+/// One scene frame's worth of pre-encoded tile work, injected by the
+/// browserless harness in place of capture + classification.
+///
+/// Carries frame identity because enqueueing alone emits nothing: the arm
+/// must also call `drain_scheduler_into_quinn`, which tags outbound
+/// fragments with `seq` / `timestamp_us`.
+#[derive(Debug, Clone)]
+pub struct InjectedFrame {
+    pub seq: u32,
+    pub timestamp_us: u32,
+    /// Byte budget for this drain. `usize::MAX` means unpaced — in wave 1
+    /// the netsim's token bucket does the real capping.
+    pub budget_bytes: usize,
+    pub work: Vec<crate::transport::scheduler::TileWork>,
+}
+```
+
+Add the field to `struct IoBridge` (near `frame_rx`), initialised to `None` in every existing constructor:
 
 ```rust
 /// Pre-encoded tile work injected by the browserless harness, bypassing
 /// capture and classification. `None` in production.
-inject_rx: Option<mpsc::Receiver<Vec<crate::transport::scheduler::TileWork>>>,
+inject_rx: Option<mpsc::Receiver<InjectedFrame>>,
 ```
-
-Initialise it to `None` in every existing constructor.
 
 Add the constructor and the two test accessors:
 
@@ -293,28 +344,27 @@ Add the constructor and the two test accessors:
 pub fn new_with_injection_for_test(
     stream: TokioUnixStream,
     server: QuicServer,
-    inject_rx: mpsc::Receiver<Vec<crate::transport::scheduler::TileWork>>,
+    inject_rx: mpsc::Receiver<InjectedFrame>,
 ) -> Self {
     let mut bridge = Self::new_with_stream_for_test(stream, server);
     bridge.inject_rx = Some(inject_rx);
     bridge
 }
 
-/// Drain one batch of injected work into the scheduler. Returns the number
-/// of items enqueued; 0 if the channel is empty or absent.
+/// Drive exactly one injected frame: enqueue its work, then attempt the
+/// drain. Returns the number of items enqueued; 0 if the channel is empty
+/// or absent.
 #[cfg(any(test, feature = "browserless-harness"))]
 pub async fn drain_injection_for_test(&mut self) -> usize {
-    let batch = match self.inject_rx.as_mut() {
+    let inj = match self.inject_rx.as_mut() {
         Some(rx) => match rx.recv().await {
-            Some(b) => b,
+            Some(f) => f,
             None => return 0,
         },
         None => return 0,
     };
-    let n = batch.len();
-    for work in batch {
-        self.scheduler.enqueue(work);
-    }
+    let n = inj.work.len();
+    self.apply_injected_frame(inj);
     n
 }
 
@@ -324,23 +374,50 @@ pub fn scheduler_peek_for_test(&self) -> Vec<crate::transport::scheduler::TileWo
 }
 ```
 
-`Scheduler::peek_for_test` is `#[cfg(test)]` today (`scheduler.rs:197`); widen it to `#[cfg(any(test, feature = "browserless-harness"))]` as well.
-
-Add the select arm in `IoBridge::run`'s `tokio::select!`, alongside the `frame_rx` arm:
+Factor the body into one helper so the select arm and the test accessor cannot
+drift apart — this is the same duplication trap Task 1 had to undo:
 
 ```rust
-batch = async {
+fn apply_injected_frame(&mut self, inj: InjectedFrame) {
+    for work in inj.work {
+        self.scheduler.enqueue(work);
+    }
+    // Nothing reaches the wire without this: see the two existing callers
+    // of drain_scheduler_into_quinn at :1431 and :1706.
+    if let Some(max_frag) = self.compute_max_datagram_size() {
+        let _ = self.drain_scheduler_into_quinn(
+            inj.seq,
+            inj.timestamp_us,
+            max_frag,
+            inj.budget_bytes,
+        );
+    }
+    // Mirror the frame path's post-dispatch RTO sweep (`io_bridge.rs:3450-3462`)
+    // so injected scenes exercise retransmission the same way real frames do.
+    let tick_now = now_std();
+    self.reliable_emitter
+        .tick(tick_now, RTO_RETRANSMITS_PER_TICK);
+    let bridge_ptr: *mut IoBridge = self as *mut IoBridge;
+    let mut adapter = IoBridgeSenderAdapter { bridge: bridge_ptr };
+    self.reliable_emitter.drain(&mut adapter, tick_now);
+}
+```
+
+`Scheduler::peek_for_test` is `#[cfg(test)]` today (`scheduler.rs:197`); widen it
+to `#[cfg(any(test, feature = "browserless-harness"))]` as well.
+
+Add the select arm in `IoBridge::run`'s `tokio::select!`, alongside the
+`frame_rx` arm:
+
+```rust
+injected = async {
     match self.inject_rx.as_mut() {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
     }
 } => {
-    match batch {
-        Some(items) => {
-            for work in items {
-                self.scheduler.enqueue(work);
-            }
-        }
+    match injected {
+        Some(inj) => self.apply_injected_frame(inj),
         None => {
             self.inject_rx = None;
         }
@@ -350,16 +427,19 @@ batch = async {
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `cargo test -p ghostframe-lib --lib injected_tile_work`
+Run: `cargo test -p ghostframe-lib --lib injected_work_is_enqueued`
 Expected: PASS.
+
+Then the full suite, unchanged otherwise: `cargo test -p ghostframe-lib --lib`.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add -A && git commit -m "feat(io_bridge): tile-injection channel feeding the scheduler directly"
+git commit -m "feat(io_bridge): tile-injection channel that enqueues and drains"
 ```
 
 ---
+
 
 ### Task 3a: `Scheduler` takes the caller's clock
 
@@ -930,7 +1010,7 @@ impl ClientEndpoint {
     }
 
     /// Drain queued connection events and transmits. Narrowed from
-    /// `TestEndpoint::drive_outgoing` (`loopback_h3.rs:130-175`): there is
+    /// `TestEndpoint::drive_outgoing` (`loopback_h3.rs:131-175`): there is
     /// exactly one connection, so the outer `for (ch, conn)` loop collapses.
     pub(crate) fn drive(&mut self, now: Instant) {
         let buf_size = self.endpoint.config().get_max_udp_payload_size() as usize;
@@ -975,7 +1055,7 @@ impl ClientEndpoint {
 }
 ```
 
-Copy `split_transmit` verbatim from `loopback_h3.rs:205-235`.
+Copy `split_transmit` verbatim from `loopback_h3.rs:209-240` (the whole free function below `TestEndpoint`).
 
 Time conversion: `ClientNet` stores a `base: Instant` captured in `new()` and converts injected microseconds with `base + Duration::from_micros(now_us)`, so the crate stays driven by injected time while quinn-proto gets the `Instant` it requires.
 
