@@ -1850,6 +1850,11 @@ Wiring, in order:
 3. `SocketPairPump::new(peer)` on the other end, with a `NetSim` per direction (independent RNG streams: seed and `seed ^ 0xA5A5_A5A5_A5A5_A5A5`).
 4. `ClientNet::new` with the server's pinned cert hash; `connect`; pump until `SessionReady`.
 5. Send each `FrameScript`'s encoded `TileWork` batch on the injection channel, one frame per 16 ms of virtual time.
+
+   Keep injecting rather than relying on one frame's continuation to drain a
+   large scene: with a `usize::MAX` budget the continuation carries a *stale*
+   quinn snapshot (~0.8 x 16 MB, `quic.rs:106`) that only shrinks across
+   resumes and is refreshed only by the next injection.
 6. Loop: move datagrams through the netsim honouring each `Verdict` (a `Deliver { at_us }` in the future is queued and released when virtual time reaches it), call `client.on_timeout` when `poll_timeout` is due, and advance the clock with `tokio::time::advance` to the earliest of the next delivery, the next client timeout, and the next frame.
 7. Stop at `scene.duration`; return the collected state.
 
