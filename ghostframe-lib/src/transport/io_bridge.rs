@@ -308,6 +308,14 @@ pub struct IoBridge {
     metrics_tracker: crate::tile::MetricsTracker,
     /// Cost-aware frame-mode + per-tile classifier.
     classifier: crate::tile::Classifier,
+    /// Reference instant (sourced from `now_std()`, so it tracks tokio's
+    /// clock) that `decide_frame_mode_at`'s `now_us` is measured from. The
+    /// classifier itself must stay clock-agnostic — it only ever sees a
+    /// caller-supplied `now_us` — so this is where the bridge's own paused-
+    /// clock discipline gets threaded through to the frame-mode hysteresis
+    /// dwell timers (`enter_sustain_micros` / `exit_sustain_micros`).
+    /// Stamped once at construction; never reset.
+    epoch: std::time::Instant,
     /// Last-emitted frame mode (carried across frames for hysteresis).
     frame_mode: crate::tile::FrameMode,
     /// Round-robin tile-work scheduler shared by both CPU and GPU emission paths.
@@ -865,6 +873,7 @@ impl IoBridge {
             dirty_tracker: DirtyTracker::new(0, 0),
             metrics_tracker: crate::tile::MetricsTracker::new(0, 0),
             classifier: crate::tile::Classifier::default(),
+            epoch: now_std(),
             frame_mode: crate::tile::FrameMode::TileCodec,
             scheduler: crate::transport::scheduler::Scheduler::new(0, 0),
             #[cfg(any(test, feature = "test-loss-injection"))]
@@ -2559,7 +2568,18 @@ impl IoBridge {
         // Always evaluate mode — empty tentative drives the exit-sustain counter.
         let deficit = self.scheduler.refinement_deficit_tiles();
         self.classifier.set_refinement_deficit_tiles(deficit);
-        let new_mode = self.classifier.decide_frame_mode(&tentative, prev_mode);
+        // `decide_frame_mode` (no `_at`) reads `Classifier`'s own
+        // `Instant::now()`-seeded epoch via `.elapsed()` — a 14th time
+        // source invisible to this file, and one that saturates to 0 (or
+        // drifts independently of frame counts) under the browserless
+        // harness's paused clock. Route the dwell timers through the
+        // bridge's own `now_std()` epoch instead, so `enter_sustain_micros`
+        // / `exit_sustain_micros` advance with virtual time exactly like
+        // every other deadline in this file.
+        let now_us = now_std().duration_since(self.epoch).as_micros() as u64;
+        let new_mode = self
+            .classifier
+            .decide_frame_mode_at(now_us, &tentative, prev_mode);
 
         // Persist tentative state back into per-tile metrics for dirty tiles only.
         for (i, &(tx, ty)) in dirty_xy.iter().enumerate() {
@@ -4189,6 +4209,7 @@ impl IoBridge {
             dirty_tracker: DirtyTracker::new(0, 0),
             metrics_tracker: crate::tile::MetricsTracker::new(0, 0),
             classifier: crate::tile::Classifier::default(),
+            epoch: now_std(),
             frame_mode: crate::tile::FrameMode::TileCodec,
             scheduler: crate::transport::scheduler::Scheduler::new(0, 0),
             #[cfg(any(test, feature = "test-loss-injection"))]
@@ -6218,6 +6239,89 @@ mod tests {
             t1.duration_since(t0) >= std::time::Duration::from_secs(5),
             "now_std must advance with the paused clock, got {:?}",
             t1.duration_since(t0)
+        );
+    }
+
+    /// Regression test for the classifier clock bug: the frame-mode call
+    /// site in `process_frame_gpu` fed `Classifier::decide_frame_mode`,
+    /// which reads `self.epoch.elapsed()` off an `Instant::now()`-seeded
+    /// field private to `Classifier` — a 14th time source invisible to a
+    /// grep of this file, and one that reads the real wall clock
+    /// regardless of `tokio::time::pause()`. The fix routes the same
+    /// dwell computation through `IoBridge::epoch` (stamped from
+    /// `now_std()`) and calls `decide_frame_mode_at` with an explicit
+    /// `now_us`, exactly mirroring every other deadline in this file.
+    ///
+    /// **Why this test doesn't drive `process_frame_gpu` itself:** the
+    /// call site only runs once `compute_max_datagram_size()` sees a
+    /// connected session backed by a real `quinn_proto::Connection` in
+    /// `self.server.connections` — that requires a completed QUIC +
+    /// WebTransport handshake, which is exactly the machinery the
+    /// browserless harness (a later task) exists to provide. Building a
+    /// bespoke in-process handshake fixture here would be scope creep well
+    /// beyond the epoch plumbing this commit is about. Instead, this test
+    /// exercises the *exact expression* the call site now uses —
+    /// `now_std().duration_since(self.epoch).as_micros() as u64` fed to
+    /// `decide_frame_mode_at` — against the bridge's real, private `epoch`
+    /// and `classifier` fields, and proves discrimination by running the
+    /// old broken API (`decide_frame_mode`, still public for non-harness
+    /// callers) through the identical loop: it must NOT observe the same
+    /// dwell, because real wall-clock time barely moves while
+    /// `tokio::time::advance` fast-forwards the virtual clock.
+    ///
+    /// Verified by hand that this discriminates: temporarily changing the
+    /// "fixed" loop below to call `fixed.decide_frame_mode(&[],
+    /// FrameMode::H264)` (dropping the bridge-epoch `now_us`) makes the
+    /// first assertion fail, reproducing the exact symptom this commit
+    /// fixes — mode never leaves H264 under a paused runtime regardless
+    /// of how much virtual time passes.
+    #[tokio::test(start_paused = true)]
+    async fn frame_mode_exit_dwell_tracks_virtual_time_via_bridge_epoch() {
+        use crate::tile::{Classifier, FrameMode};
+
+        let bridge = make_bridge_for_test().await;
+        let epoch = bridge.epoch;
+
+        // Fixed path: same `Classifier` state the bridge owns, driven with
+        // the same `now_us` expression the `process_frame_gpu` call site
+        // uses. Empty `tentative_states` under `FrameMode::H264` drives the
+        // exit-sustain timer (cost is 0, below `exit_factor * h264_cost`).
+        // 30 calls satisfies `exit_sustain_frames_min`; spacing them 20ms
+        // apart in virtual time crosses `exit_sustain_micros` (500_000us)
+        // by the last call.
+        let mut fixed = bridge.classifier.clone();
+        let mut fixed_mode = FrameMode::H264;
+        for _ in 0..30 {
+            let now_us = super::now_std().duration_since(epoch).as_micros() as u64;
+            fixed_mode = fixed.decide_frame_mode_at(now_us, &[], FrameMode::H264);
+            tokio::time::advance(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            fixed_mode,
+            FrameMode::TileCodec,
+            "bridge-epoch-derived now_us must cross exit_sustain_micros as \
+             tokio's virtual clock advances"
+        );
+
+        // Broken path: identical loop shape, but through the old
+        // `decide_frame_mode()` API that reads Classifier's own
+        // wall-clock epoch. `tokio::time::advance` does not consume real
+        // wall-clock time, so this must NEVER observe the dwell — this is
+        // the exact bug Commit 1 fixes at the `process_frame_gpu` call
+        // site.
+        let mut broken = Classifier::default();
+        let mut broken_mode = FrameMode::H264;
+        for _ in 0..30 {
+            broken_mode = broken.decide_frame_mode(&[], FrameMode::H264);
+            tokio::time::advance(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            broken_mode,
+            FrameMode::H264,
+            "decide_frame_mode's wall-clock epoch must NOT observe the \
+             dwell under a paused runtime -- if this fails, the paused-\
+             clock harness's assumptions about tokio::time::advance no \
+             longer hold and this test needs re-deriving"
         );
     }
 
