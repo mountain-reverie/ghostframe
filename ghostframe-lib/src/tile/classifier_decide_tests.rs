@@ -690,50 +690,6 @@ fn env_var_force_tilecodec_true_also_pins() {
 }
 
 #[test]
-fn env_var_force_tilecodec_other_values_ignored() {
-    let _env = crate::test_env::lock_env();
-    use crate::tile::classifier::Classifier;
-    use crate::tile::{CodecState, FrameMode};
-
-    std::env::remove_var("GHOSTFRAME_TEST_FORCE_FRAME_MODE");
-    std::env::set_var("GHOSTFRAME_FORCE_TILECODEC", "0");
-    let mut c = Classifier::default();
-    std::env::remove_var("GHOSTFRAME_FORCE_TILECODEC");
-
-    // With value "0" the override should NOT engage — only "1" / "true" do.
-    // Confirm by feeding a tentative that would otherwise drive H264 via
-    // motion fast-path: classifier may produce H264 here, which proves the
-    // override is not silently pinning. We only assert "not always TileCodec";
-    // the exact mode depends on cost model defaults so just check that the
-    // classifier reads its normal path (no panic, runs).
-    let tentative = vec![CodecState::Solid; 4];
-    // No assertion on the outcome — we just confirm the classifier ran the
-    // normal decision logic without the override engaging. The TileCodec
-    // result here would also match the no-override default, so the
-    // distinguishing test is the `=1` case above.
-    let _ = c.decide_frame_mode_at(0, &tentative, FrameMode::TileCodec);
-}
-
-#[test]
-fn env_var_force_frame_mode_unknown_value_ignored() {
-    let _env = crate::test_env::lock_env();
-    use crate::tile::classifier::Classifier;
-    use crate::tile::{CodecState, FrameMode};
-
-    std::env::set_var("GHOSTFRAME_TEST_FORCE_FRAME_MODE", "bogus");
-    let mut c = Classifier::default();
-    std::env::remove_var("GHOSTFRAME_TEST_FORCE_FRAME_MODE");
-
-    // Unknown value parses to None ⇒ classifier behaves normally.
-    // With 100% Solid and default ctx, it stays in TileCodec.
-    let tentative = vec![CodecState::Solid; 4];
-    assert_eq!(
-        c.decide_frame_mode_at(0, &tentative, FrameMode::TileCodec),
-        FrameMode::TileCodec,
-    );
-}
-
-#[test]
 fn classifier_takes_its_overrides_from_config_not_env() {
     // No env mutation, and therefore no lock: the whole point of the refactor.
     use crate::config::ClassifierConfig;
