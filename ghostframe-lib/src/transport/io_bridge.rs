@@ -1765,7 +1765,14 @@ impl IoBridge {
     /// continuation). If there's no connected session yet,
     /// `compute_max_datagram_size` returns `None` and the drain is
     /// skipped — the work stays queued for the next opportunity.
-    fn apply_injected_frame(&mut self, inj: InjectedFrame) {
+    ///
+    /// Returns the number of tiles actually enqueued into the scheduler.
+    /// This is NOT the number of tiles submitted in `inj.work`: tiles
+    /// outside the fixed grid are skipped by the bounds check below, so
+    /// the two counts diverge whenever a harness scene mis-sizes its
+    /// grid. Callers that need to know work was dropped (as opposed to
+    /// merely queued) must use this return value, not `inj.work.len()`.
+    fn apply_injected_frame(&mut self, inj: InjectedFrame) -> usize {
         // The scheduler grid is normally sized by the real capture path
         // (`dispatch_dirty_tiles_via_scheduler`, keyed off the frame's
         // actual dimensions via `TileGrid`). Injected work bypasses that
@@ -1787,6 +1794,7 @@ impl IoBridge {
         // surface them loudly instead of growing around them.
         let cols = self.scheduler.cols();
         let rows = self.scheduler.rows();
+        let mut enqueued_count = 0usize;
         for work in inj.work {
             if work.tile_x as u32 >= cols || work.tile_y as u32 >= rows {
                 tracing::error!(
@@ -1803,6 +1811,7 @@ impl IoBridge {
                 continue;
             }
             self.scheduler.enqueue(work);
+            enqueued_count += 1;
         }
         if let Some(max_frag) = self.compute_max_datagram_size() {
             // Tell the client the canvas / tile-grid size before draining
@@ -1857,6 +1866,7 @@ impl IoBridge {
         let bridge_ptr: *mut IoBridge = self as *mut IoBridge;
         let mut adapter = IoBridgeSenderAdapter { bridge: bridge_ptr };
         self.reliable_emitter.drain(&mut adapter, tick_now);
+        enqueued_count
     }
 
     /// Resume the in-flight frame's scheduler drain. Called from the
@@ -3927,7 +3937,9 @@ impl IoBridge {
                     }
                 } => {
                     match injected {
-                        Some(inj) => self.apply_injected_frame(inj),
+                        Some(inj) => {
+                            self.apply_injected_frame(inj);
+                        }
                         None => {
                             self.inject_rx = None;
                         }
@@ -4575,8 +4587,23 @@ impl IoBridge {
     }
 
     /// Drive exactly one injected frame: enqueue its work, then attempt the
-    /// drain. Returns the number of items enqueued; 0 if the channel is empty
-    /// or absent.
+    /// drain. Returns the number of items `apply_injected_frame` actually
+    /// enqueued into the scheduler — NOT the number of items submitted in
+    /// the batch. Tiles outside the fixed grid are skipped and excluded
+    /// from the count (see `apply_injected_frame`'s grid-bounds check), so
+    /// a harness asserting on this value gets an accurate signal that work
+    /// was dropped instead of a false "all delivered".
+    ///
+    /// This awaits the next message on `inject_rx`: on an open channel
+    /// with nothing queued yet, the call blocks until a frame arrives (or
+    /// the sender drops the channel) — it does **not** time out on its
+    /// own. Under `tokio::time::pause()` (the reason the
+    /// `browserless-harness` feature exists) that means a scene which
+    /// never sends another frame hangs here indefinitely rather than
+    /// returning 0. Returns 0 only when the channel is closed or was
+    /// never set up (`inject_rx.is_none()`). Callers that want to poll
+    /// "is a frame ready right now" instead of blocking should use
+    /// `try_drain_injection_for_test`.
     #[cfg(any(test, feature = "browserless-harness"))]
     pub async fn drain_injection_for_test(&mut self) -> usize {
         let inj = match self.inject_rx.as_mut() {
@@ -4586,9 +4613,25 @@ impl IoBridge {
             },
             None => return 0,
         };
-        let n = inj.work.len();
-        self.apply_injected_frame(inj);
-        n
+        self.apply_injected_frame(inj)
+    }
+
+    /// Non-blocking counterpart to `drain_injection_for_test`. If a frame
+    /// is already queued on `inject_rx`, drains and applies it exactly
+    /// like the blocking version and returns the number of items
+    /// enqueued (same submitted-vs-enqueued distinction applies). If
+    /// nothing is queued right now — or the channel is closed or was
+    /// never set up — returns 0 immediately instead of waiting.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub fn try_drain_injection_for_test(&mut self) -> usize {
+        let inj = match self.inject_rx.as_mut() {
+            Some(rx) => match rx.try_recv() {
+                Ok(f) => f,
+                Err(_) => return 0,
+            },
+            None => return 0,
+        };
+        self.apply_injected_frame(inj)
     }
 
     #[cfg(any(test, feature = "browserless-harness"))]
@@ -7219,5 +7262,58 @@ mod tests {
             queued.is_empty(),
             "out-of-grid tile must be skipped, not enqueued; queued = {queued:?}"
         );
+    }
+
+    /// Regression for the `drain_injection_for_test` contract bug: it must
+    /// report the number of items actually enqueued by
+    /// `apply_injected_frame`, not the number of items submitted in the
+    /// batch. A batch with one in-grid and one out-of-grid tile must
+    /// return 1, not 2 — the previous implementation returned
+    /// `inj.work.len()` and would tell a harness that dropped work had
+    /// been delivered.
+    #[tokio::test(start_paused = true)]
+    async fn drain_injection_for_test_returns_enqueued_not_submitted_count() {
+        use crate::transport::protocol::Codec;
+        use crate::transport::scheduler::{TileWork, WorkState};
+
+        let (ours, _peer) = tokio::net::UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("QuicServer::new");
+        let (tx, rx) = mpsc::channel(8);
+        // Fixed 2x2 grid; tile (5, 5) is out of bounds, tile (0, 0) is not.
+        let mut bridge = IoBridge::new_with_injection_for_test(ours, server, rx, 2, 2);
+
+        let make_work = |tile_x: u8, tile_y: u8| TileWork {
+            tile_x,
+            tile_y,
+            generation: 0,
+            pass_idx: 0,
+            total_passes: 1,
+            codec: Codec::Solid,
+            payload: vec![10, 20, 30, 255],
+            queued_at: super::now_std(),
+            last_sent_at: None,
+            state: WorkState::Pending,
+        };
+
+        tx.send(InjectedFrame {
+            seq: 1,
+            timestamp_us: 0,
+            budget_bytes: usize::MAX,
+            work: vec![make_work(0, 0), make_work(5, 5)],
+        })
+        .await
+        .expect("send injection");
+
+        let enqueued = bridge.drain_injection_for_test().await;
+        assert_eq!(
+            enqueued, 1,
+            "one in-grid + one out-of-grid tile submitted; only the \
+             in-grid tile was actually enqueued, so the return value must \
+             be 1, not the submitted count of 2"
+        );
+
+        let queued = bridge.scheduler_peek_for_test();
+        assert_eq!(queued.len(), 1, "only the in-grid tile is queued");
+        assert_eq!((queued[0].tile_x, queued[0].tile_y), (0, 0));
     }
 }
