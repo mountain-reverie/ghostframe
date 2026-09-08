@@ -13,6 +13,10 @@ use crate::tile::FrameMode;
 
 /// Knobs the frame-mode classifier reads. All `None`/default means production
 /// behaviour.
+///
+/// All fields carry test-only tuning knobs. A production-relevant tunable
+/// would need wiring in `Classifier::new` and other codepaths that does
+/// not yet exist.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ClassifierConfig {
     /// Pins the frame mode. Fed by `GHOSTFRAME_TEST_FORCE_FRAME_MODE`, or by
