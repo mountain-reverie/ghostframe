@@ -50,6 +50,28 @@ use crate::transport::protocol::{
 use crate::transport::quic::QuicServer;
 use crate::transport::webtransport::WebTransportServer;
 
+// ---------------------------------------------------------------------------
+// Clock discipline
+// ---------------------------------------------------------------------------
+// This file has exactly three deliberate exceptions to "always call
+// now_std()", each measuring something that must keep moving even while the
+// browserless harness has tokio's clock paused:
+//
+//   1. The `process_frame` duration probe (`t0`/`dt_us`, ~line 1000 below) --
+//      measures real CPU cost of encode work, not protocol/deadline time.
+//   2. `monotonic_now_ns()` (below) -- reads `CLOCK_MONOTONIC` directly and
+//      is paired *offline*, after the fact, with xdaemon's `capture_done_ns`
+//      timestamp from a separate process. Neither process shares the other's
+//      tokio runtime, so there is no virtual clock to route through here.
+//   3. Everything else in the server loop uses `now_std()`.
+//
+// Any new timing probe you add should be `now_std()` unless it is
+// measuring real wall/CPU time for something outside tokio's control (in
+// which case: name it here too, and gate the `.elapsed()` call behind
+// `#[allow(clippy::disallowed_methods, reason = "...")]` with a
+// site-specific justification -- see clippy.toml at the workspace root).
+// ---------------------------------------------------------------------------
+
 /// Current time as a `std::time::Instant`, sourced from tokio's clock.
 ///
 /// Every deadline the bridge computes flows from here, so
@@ -57,6 +79,11 @@ use crate::transport::webtransport::WebTransportServer;
 /// harness advances virtual time and a 60-second scene costs its event count,
 /// not its duration. In production tokio's clock is the system clock, so this
 /// is exactly `Instant::now()`.
+///
+/// **Never call `.elapsed()` or `Instant::now() - x` on a value from here**
+/// — both read the wall clock and saturate to `0ns` against a virtual
+/// instant. Compute durations with `now_std().duration_since(earlier)`
+/// instead, where `earlier` also came from `now_std()`.
 pub(crate) fn now_std() -> std::time::Instant {
     tokio::time::Instant::now().into_std()
 }
@@ -1021,6 +1048,10 @@ impl IoBridge {
         } else {
             self.process_frame_cpu(frame);
         }
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "t0 above is deliberately std::time::Instant::now(), not now_std() -- this probe measures real CPU time spent inside process_frame(), which must keep advancing even while the harness's virtual clock is paused"
+        )]
         let dt_us = t0.elapsed().as_micros() as u64;
         tracing::trace!(
             target: "ghostframe::io_bridge::diag",

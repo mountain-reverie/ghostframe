@@ -229,6 +229,10 @@ pub fn run(card_path: &str) -> Result<(), Box<dyn std::error::Error>> {
             // docs/superpowers/specs/2026-05-17-decode-error-thin-uncached-design.md.
             const FLIP_RED: u32 = 0x00FF_0000;
             const FLIP_BLUE: u32 = 0x0000_00FF;
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "ghostframe-test-pattern does not depend on tokio at all -- this is a plain synchronous DRM scanout loop painting at a real 33ms wall-clock cadence, so there is no virtual clock for `start` to have come from"
+            )]
             let pixel = if (start.elapsed().as_millis() / 33).is_multiple_of(2) {
                 FLIP_RED
             } else {

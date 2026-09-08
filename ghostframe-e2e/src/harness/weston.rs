@@ -62,6 +62,10 @@ pub fn spawn_weston_headless() -> Result<WestonGuard> {
     use std::os::unix::fs::PermissionsExt;
 
     let pid = std::process::id();
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "not a duration measurement -- Instant::now().elapsed() is used here purely to mix a few bits of near-zero nanosecond jitter into the runtime-dir name alongside the pid; this harness process never runs under tokio::time::pause(), so there is no virtual clock to accidentally read instead"
+    )]
     let runtime_dir = std::env::temp_dir().join(format!(
         "ghostframe-weston-{}-{}",
         pid,

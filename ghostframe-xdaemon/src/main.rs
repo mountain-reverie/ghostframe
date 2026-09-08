@@ -388,6 +388,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
             let submit_start = std::time::Instant::now();
             let submit_res = server.submit_frame(frame).await;
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "xdaemon is a standalone capture-loop process with its own tokio runtime, never driven by the browserless harness's paused clock -- submit_us is real wall-clock latency telemetry for how long submit_frame() actually took"
+            )]
             let submit_us = submit_start.elapsed().as_micros() as u64;
             if let Err(e) = submit_res {
                 tracing::warn!(
@@ -434,6 +438,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             );
         }
 
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "xdaemon paces real screen capture against real wall-clock frame_interval on its own tokio runtime (not the browserless harness's paused one) -- this elapsed time directly controls how long tokio::time::sleep below actually sleeps"
+        )]
         let elapsed = loop_iter_start.elapsed();
         if elapsed < frame_interval {
             tokio::time::sleep(frame_interval - elapsed).await;
