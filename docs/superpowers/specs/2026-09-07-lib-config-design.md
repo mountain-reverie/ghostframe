@@ -117,8 +117,14 @@ loss-injector descriptors), `outbound_bandwidth_cap`, `test_force_bytes_per_us`,
 `inject_oob_palrle`, `skip_palette_session_reset`.
 
 **`DiagnosticsConfig`** — `diagnose_tiles`, `diagnose_gpu_pipeline`,
-`diagnose_color_hist`, `dump_frame`, `cdf53_diff_tile`, `cdf53_dump_pending`,
-`cdf53_skip_l2_l3`, `cdf53_skip_l3`.
+`diagnose_color_hist`, `dump_frame`, `cdf53_diff_tile`, `cdf53_dump_pending`.
+
+The two `cdf53_skip_*` reads in the Vulkan dispatch path are **deferred**:
+they sit behind the `cdf53-diag` feature that production builds do not enable,
+no test sets them, and they race nothing, while threading config into the GPU
+pipeline is a materially larger change than the rest of this work. They keep
+reading env for now, which means the "only `config.rs` reads env" CI guard must
+either exempt that file or wait for them.
 
 Fields whose variables are feature-gated today keep that gating on the parsing
 side; the *fields* always exist so unit tests can set them regardless of
