@@ -2236,7 +2236,7 @@ impl IoBridge {
                 )
             })
             .collect();
-        self.reliable_emitter.on_nack(&entries);
+        self.reliable_emitter.on_nack(&entries, now_std());
     }
 
     /// Parse a concatenated FEEDBACK-stream byte buffer, dispatching by
