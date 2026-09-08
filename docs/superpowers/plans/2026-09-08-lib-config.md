@@ -466,7 +466,27 @@ git commit -m "feat(config): TransportConfig::from_env; BandwidthCap takes a rat
 
 - [ ] **Step 3: Implement**
 
-**Move the loss injectors out of the config; do not clone them.** `LossInjector`
+**First, ungate `TransportConfig`'s parsing.** Task 4 gave it the same
+`#[cfg(any(test, feature = "test-loss-injection"))]` treatment as
+`ClassifierConfig`, with a `cfg(not(...))` arm returning `Self::default()`. That
+is right for `ClassifierConfig`, whose fields are *all* test-only knobs. It is
+wrong here: `fec_k` (`GHOSTFRAME_FEC_K`) has never been gated at its `io_bridge`
+read site, so a genuine production build honours it today. Routing it through a
+gated `from_env` would silently stop that — a behaviour change smuggled in by a
+refactor, and one no unit test would catch since `cfg(test)` implies the gate.
+
+So: make `from_lookup` and `from_env` **ungated**, and put the `#[cfg]` on the
+individual field initialisers instead — the two `LossInjector` fields (whose
+type only exists under the feature) and the four others that are gated at their
+`io_bridge` sites. `IoBridge`'s own struct literal already uses exactly this
+shape, so follow it. `fec_k` then parses in every build and Task 4's temporary
+literal read in `io_bridge.rs` (around `:837`, with its explanatory comment) can
+be deleted.
+
+Verify the outcome by building **both** configurations and checking that
+`GHOSTFRAME_FEC_K` is still honoured with default features.
+
+**Then move the loss injectors out of the config; do not clone them.** `LossInjector`
 now derives `Clone` (so `LibConfig` can be `Debug`/`Clone`), and its `rng:
 SplitMix { state: u64 }` means a clone replays the *same* drop sequence rather
 than an independent one. Before that derive existed, `should_drop(&mut self)`
