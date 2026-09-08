@@ -6281,4 +6281,147 @@ mod tests {
             BweWrapper::INITIAL_BPS,
         );
     }
+
+    /// Production-wiring counterpart to `bwe_window_flushes_on_virtual_time`.
+    ///
+    /// That test proves `BweWrapper::update` behaves correctly when fed
+    /// `now_std()` timestamps by hand, but it constructs a bare `BweWrapper`
+    /// and calls `update()` itself — `IoBridge` is never instantiated. It
+    /// would keep passing even if the two production call sites that
+    /// actually feed the estimator were reverted to a bare
+    /// `std::time::Instant::now()`: the `now_for_samples` stamp in
+    /// `dispatch_ack_datagram` (used for each `BweSample`'s `received_at`)
+    /// and the `self.bwe.update(&records, now_std())` drain inside `run()`.
+    ///
+    /// This test drives the real wiring instead: it seeds the
+    /// retransmit-cache exactly as real emitted tile passes would, feeds an
+    /// ACK batch through the production `dispatch_ack_datagram` entry point
+    /// (the same one real inbound ACK_BATCH datagrams reach), then runs the
+    /// bridge's actual `run()` event loop for one iteration so the buffered
+    /// samples drain through the real `self.bwe.update(&records,
+    /// now_std())` call — never `BweWrapper::update` directly. It advances
+    /// tokio's *virtual* clock between two such rounds (mirroring the
+    /// shape of `bwe_window_flushes_on_virtual_time`: 50 acks — the wire
+    /// format caps one batch at 72 entries — then 50 more 250ms of
+    /// virtual time later) and asserts the EWMA estimate
+    /// actually moves off its seed — only possible if both call sites read
+    /// virtual, not wall, time.
+    #[tokio::test(start_paused = true)]
+    async fn bwe_estimate_advances_through_bridge_production_wiring() {
+        use crate::transport::ack::{AckBatch, AckEntry};
+        use crate::transport::reliable_emitter::EmitKey;
+        use tokio::io::AsyncWriteExt;
+
+        let (our_end, mut peer) = UnixStream::pair().expect("UnixStream::pair failed");
+        let server = QuicServer::new().expect("QuicServer::new failed");
+        let mut bridge = IoBridge::new_with_stream_for_test(our_end, server);
+
+        // A malformed-but-well-framed inbound "packet": short enough that
+        // `process_inbound` rejects it immediately with "frame too short"
+        // (same shape as `run_survives_malformed_frame`), so it costs
+        // nothing but still drives one full pass through the event loop's
+        // body — including the post-select drain section that owns the
+        // BWE call site.
+        const BOGUS_FRAME: [u8; 8] = [0, 0, 0, 4, 0, 0, 0, 0];
+
+        // Seed `count` retransmit-cache entries (frame_seq starting at
+        // `frame_seq_start`) with a plausible emit timestamp, feed a
+        // matching ACK batch through the real `dispatch_ack_datagram`
+        // entry point (populating `bwe_samples_buffer` exactly as a real
+        // inbound ACK would), then run one iteration of the bridge's real
+        // `run()` loop so the buffer drains through the production
+        // `self.bwe.update(&records, now_std())` call.
+        async fn feed_one_ack_round(
+            bridge: &mut IoBridge,
+            peer: &mut UnixStream,
+            frame_seq_start: u32,
+            count: u32,
+        ) {
+            let mut entries = Vec::with_capacity(count as usize);
+            for i in 0..count {
+                let frame_seq = frame_seq_start + i;
+                let key = EmitKey::new(frame_seq, 1, 2, 0);
+                // fragments[0][12..16] big-endian = server emit time, µs.
+                let mut frag = vec![0u8; 20];
+                frag[12..16].copy_from_slice(&1_000_000u32.to_be_bytes());
+                bridge.reliable_emitter.submit_one(
+                    key,
+                    bytes::Bytes::from(frag),
+                    std::time::Instant::now(),
+                );
+                entries.push(AckEntry {
+                    frame_seq,
+                    tile_x: 1,
+                    tile_y: 2,
+                    pass_idx: 0,
+                    arrival_time_ms_lo16: 1_500,
+                });
+            }
+            let batch = AckBatch { entries };
+            // Real production entry point for inbound ACK_BATCH datagrams.
+            bridge.dispatch_ack_datagram(&batch.encode());
+
+            peer.write_all(&BOGUS_FRAME)
+                .await
+                .expect("peer write failed");
+            peer.flush().await.ok();
+
+            // Race the bridge's real event loop against a bounded number of
+            // yields. `run()` processes the one queued inbound frame (which
+            // errors out harmlessly), falls through the always-drain
+            // section — where the real `bwe_samples_buffer` drain and
+            // `self.bwe.update(&records, now_std())` call live — and then
+            // blocks again at the top-level `select!` waiting for the next
+            // event. The yield branch wins once that happens, so `run()`'s
+            // future is dropped and `bridge` is ours again afterward.
+            tokio::select! {
+                biased;
+                result = bridge.run() => {
+                    panic!("run() exited unexpectedly: {result:?}");
+                }
+                _ = async {
+                    for _ in 0..64 {
+                        tokio::task::yield_now().await;
+                    }
+                } => {}
+            }
+        }
+
+        // Round 1: 50 acks (the wire format caps one batch at
+        // MAX_ACK_ENTRIES_PER_BATCH = 72), comfortably above the
+        // estimator's MIN_SAMPLES_FOR_ESTIMATE gate, but no time has
+        // passed in the window yet, so the estimate must still sit at the
+        // initial seed.
+        feed_one_ack_round(&mut bridge, &mut peer, 0, 50).await;
+        let snap1 = bridge.bwe.snapshot();
+        assert_eq!(snap1.samples_seen, 50);
+        assert_eq!(
+            snap1.bitrate_bps,
+            crate::transport::bwe::BweWrapper::INITIAL_BPS,
+            "estimate must not move before the window elapses"
+        );
+
+        // Advance the *virtual* clock past the estimator's 200ms window.
+        // Real wall-clock time spent doing this is on the order of
+        // microseconds.
+        tokio::time::advance(std::time::Duration::from_millis(250)).await;
+
+        // Round 2: another 50 acks, stamped with the now-advanced virtual
+        // clock via the *same* production call sites. If either site reads
+        // wall-clock time instead, `elapsed` in `BweWrapper::update` never
+        // crosses the 200ms window under this paused runtime and the
+        // estimate stays pinned at the seed forever.
+        feed_one_ack_round(&mut bridge, &mut peer, 1_000, 50).await;
+        let snap2 = bridge.bwe.snapshot();
+        assert!(
+            snap2.bitrate_bps > crate::transport::bwe::BweWrapper::INITIAL_BPS,
+            "estimate {} should exceed the seed {} once the window flushes \
+             under virtual time via the bridge's real event loop — if this \
+             fails, the production BWE clock wiring in \
+             `dispatch_ack_datagram` or `run()` has regressed back to \
+             wall-clock time under a paused runtime",
+            snap2.bitrate_bps,
+            crate::transport::bwe::BweWrapper::INITIAL_BPS,
+        );
+    }
 }
