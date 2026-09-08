@@ -432,14 +432,9 @@ fn mode_decision_event_emitted_only_on_transition() {
 
 #[test]
 fn env_var_override_refinement_bias_us() {
-    let _env = crate::test_env::lock_env();
+    use crate::config::ClassifierConfig;
     use crate::tile::classifier::{AdaptationContext, Classifier, REFINEMENT_BIAS_PER_TILE_US};
     use crate::tile::{CodecState, FrameMode};
-    // NB: this test mutates process env vars and races other lib tests that
-    // construct Classifier::default(). Run lib tests with --test-threads=1
-    // OR ensure no peer test in the suite constructs Classifier::default()
-    // mid-window. Documented as a known limitation; not making this test
-    // serial-only because cargo test's serialization story is awkward.
 
     let ctx = AdaptationContext {
         supports_h264: true,
@@ -488,7 +483,7 @@ fn env_var_override_refinement_bias_us() {
 
     // Case 1: no override. Default bias = 5.0 µs/tile, threshold = 4062 µs <
     // tile_codec_cost (4120 µs) → cost_enter = true → H264 after enter dwell.
-    let mut c_default = Classifier::default();
+    let mut c_default = Classifier::new(ClassifierConfig::default());
     assert_eq!(
         drive(&mut c_default, 1),
         FrameMode::H264,
@@ -497,9 +492,10 @@ fn env_var_override_refinement_bias_us() {
 
     // Case 2: with override = 1000.0 µs/tile, threshold = 5356 µs >
     // tile_codec_cost (4120 µs) → cost_enter = false → TileCodec across the dwell.
-    std::env::set_var("GHOSTFRAME_TEST_REFINEMENT_BIAS_US", "1000.0");
-    let mut c_override = Classifier::default();
-    std::env::remove_var("GHOSTFRAME_TEST_REFINEMENT_BIAS_US");
+    let mut c_override = Classifier::new(ClassifierConfig {
+        refinement_bias_us: Some(1000.0),
+        ..Default::default()
+    });
     assert_eq!(
         drive(&mut c_override, 1),
         FrameMode::TileCodec,
@@ -512,19 +508,15 @@ fn env_var_override_refinement_bias_us() {
 
 #[test]
 fn env_var_override_loss_override_threshold() {
-    let _env = crate::test_env::lock_env();
+    use crate::config::ClassifierConfig;
     use crate::tile::classifier::{AdaptationContext, Classifier, LOSS_OVERRIDE_THRESHOLD};
     use crate::tile::{CodecState, FrameMode};
-    // NB: this test mutates process env vars and races other lib tests that
-    // construct Classifier::default(). Run lib tests with --test-threads=1
-    // OR ensure no peer test in the suite constructs Classifier::default()
-    // mid-window. Documented as a known limitation; not making this test
-    // serial-only because cargo test's serialization story is awkward.
 
     // Raise the threshold to 0.50 — well above the test ctx's 0.15.
-    std::env::set_var("GHOSTFRAME_TEST_LOSS_OVERRIDE_THRESHOLD", "0.50");
-    let mut c = Classifier::default();
-    std::env::remove_var("GHOSTFRAME_TEST_LOSS_OVERRIDE_THRESHOLD");
+    let mut c = Classifier::new(ClassifierConfig {
+        loss_override_threshold: Some(0.50),
+        ..Default::default()
+    });
 
     let ctx = AdaptationContext {
         supports_h264: true,
@@ -547,19 +539,15 @@ fn env_var_override_loss_override_threshold() {
 
 #[test]
 fn env_var_override_headroom_min_bpus() {
-    let _env = crate::test_env::lock_env();
+    use crate::config::ClassifierConfig;
     use crate::tile::classifier::{AdaptationContext, Classifier, HEADROOM_MIN_BYTES_PER_US};
     use crate::tile::{CodecState, FrameMode};
-    // NB: this test mutates process env vars and races other lib tests that
-    // construct Classifier::default(). Run lib tests with --test-threads=1
-    // OR ensure no peer test in the suite constructs Classifier::default()
-    // mid-window. Documented as a known limitation; not making this test
-    // serial-only because cargo test's serialization story is awkward.
 
     // Lower the threshold to 0.05 — well below the test ctx's 0.1.
-    std::env::set_var("GHOSTFRAME_TEST_HEADROOM_MIN_BPUS", "0.05");
-    let mut c = Classifier::default();
-    std::env::remove_var("GHOSTFRAME_TEST_HEADROOM_MIN_BPUS");
+    let mut c = Classifier::new(ClassifierConfig {
+        headroom_min_bpus: Some(0.05),
+        ..Default::default()
+    });
 
     let ctx = AdaptationContext {
         supports_h264: true,
@@ -586,13 +574,14 @@ fn env_var_override_headroom_min_bpus() {
 /// M3.6 dynamic mode-switch policy firing on its own.
 #[test]
 fn env_var_force_frame_mode_h264_pins_classifier() {
-    let _env = crate::test_env::lock_env();
+    use crate::config::ClassifierConfig;
     use crate::tile::classifier::Classifier;
     use crate::tile::{CodecState, FrameMode};
 
-    std::env::set_var("GHOSTFRAME_TEST_FORCE_FRAME_MODE", "h264");
-    let mut c = Classifier::default();
-    std::env::remove_var("GHOSTFRAME_TEST_FORCE_FRAME_MODE");
+    let mut c = Classifier::new(ClassifierConfig {
+        force_frame_mode: Some(FrameMode::H264),
+        ..Default::default()
+    });
 
     // A 100% Solid tentative state with no adaptation signals would
     // normally stay in TileCodec; with the override it must flip to H264
@@ -609,13 +598,14 @@ fn env_var_force_frame_mode_h264_pins_classifier() {
 
 #[test]
 fn env_var_force_frame_mode_tile_pins_classifier() {
-    let _env = crate::test_env::lock_env();
+    use crate::config::ClassifierConfig;
     use crate::tile::classifier::{AdaptationContext, Classifier};
     use crate::tile::{CodecState, FrameMode};
 
-    std::env::set_var("GHOSTFRAME_TEST_FORCE_FRAME_MODE", "tile");
-    let mut c = Classifier::default();
-    std::env::remove_var("GHOSTFRAME_TEST_FORCE_FRAME_MODE");
+    let mut c = Classifier::new(ClassifierConfig {
+        force_frame_mode: Some(FrameMode::TileCodec),
+        ..Default::default()
+    });
 
     // Build a context that would normally trip the suspension hard-override
     // to H264. The force-mode override is tested above all hard overrides
@@ -646,15 +636,17 @@ fn env_var_force_frame_mode_tile_pins_classifier() {
 /// under wire loss, masking tile-codec regressions).
 #[test]
 fn env_var_force_tilecodec_pins_classifier() {
-    let _env = crate::test_env::lock_env();
+    use crate::config::ClassifierConfig;
     use crate::tile::classifier::{AdaptationContext, Classifier};
     use crate::tile::{CodecState, FrameMode};
 
-    // Ensure no leftover from previous tests in this process.
-    std::env::remove_var("GHOSTFRAME_TEST_FORCE_FRAME_MODE");
-    std::env::set_var("GHOSTFRAME_FORCE_TILECODEC", "1");
-    let mut c = Classifier::default();
-    std::env::remove_var("GHOSTFRAME_FORCE_TILECODEC");
+    // `GHOSTFRAME_FORCE_TILECODEC=1` collapses to this same override in
+    // `ClassifierConfig::from_env` — the alias distinction does not exist
+    // in the config itself, by design.
+    let mut c = Classifier::new(ClassifierConfig {
+        force_frame_mode: Some(FrameMode::TileCodec),
+        ..Default::default()
+    });
 
     // Build a context that would normally trip the suspension hard-override
     // back to H264. The force-tilecodec alias must beat every hard override.
@@ -678,14 +670,16 @@ fn env_var_force_tilecodec_pins_classifier() {
 
 #[test]
 fn env_var_force_tilecodec_true_also_pins() {
-    let _env = crate::test_env::lock_env();
+    use crate::config::ClassifierConfig;
     use crate::tile::classifier::Classifier;
     use crate::tile::{CodecState, FrameMode};
 
-    std::env::remove_var("GHOSTFRAME_TEST_FORCE_FRAME_MODE");
-    std::env::set_var("GHOSTFRAME_FORCE_TILECODEC", "true");
-    let mut c = Classifier::default();
-    std::env::remove_var("GHOSTFRAME_FORCE_TILECODEC");
+    // `GHOSTFRAME_FORCE_TILECODEC=true` collapses to the same override as
+    // `=1` in `ClassifierConfig::from_env`.
+    let mut c = Classifier::new(ClassifierConfig {
+        force_frame_mode: Some(FrameMode::TileCodec),
+        ..Default::default()
+    });
 
     let tentative = vec![CodecState::Solid; 4];
     assert_eq!(
@@ -737,6 +731,22 @@ fn env_var_force_frame_mode_unknown_value_ignored() {
         c.decide_frame_mode_at(0, &tentative, FrameMode::TileCodec),
         FrameMode::TileCodec,
     );
+}
+
+#[test]
+fn classifier_takes_its_overrides_from_config_not_env() {
+    // No env mutation, and therefore no lock: the whole point of the refactor.
+    use crate::config::ClassifierConfig;
+    use crate::tile::classifier::Classifier;
+    use crate::tile::FrameMode;
+
+    let cfg = ClassifierConfig {
+        force_frame_mode: Some(FrameMode::H264),
+        ..Default::default()
+    };
+    let mut classifier = Classifier::new(cfg);
+    let mode = classifier.decide_frame_mode_at(0, &[], FrameMode::TileCodec);
+    assert_eq!(mode, FrameMode::H264, "config override must pin the mode");
 }
 
 /// Regression test for commit `7e3e041` (M3.6b hysteresis-micros refactor) +
