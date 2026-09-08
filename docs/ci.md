@@ -26,7 +26,7 @@ To run the whole fast tier locally in one shot: `just ci-local`.
 
 ### `e2e.yml` — end-to-end tier
 
-Runs on every pull request and every push to `master`. Three jobs:
+Runs on every pull request and every push to `master`. Four jobs:
 
 | Job | What it runs |
 |---|---|
@@ -136,6 +136,7 @@ gh api \
   -F required_status_checks[contexts][]='cbindgen-check' \
   -F required_status_checks[contexts][]='go-vet' \
   -F required_status_checks[contexts][]='loopback-h3' \
+  -F required_status_checks[contexts][]='browserless' \
   -F required_status_checks[contexts][]='harness-smoke' \
   -F required_status_checks[contexts][]='e2e' \
   -F enforce_admins=false \
