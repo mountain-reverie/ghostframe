@@ -20,17 +20,20 @@ known residual remains: `Classifier::default()` reads the same variables and is
 constructed by nearly every test in two files, so the lock does not cover every
 path that could observe a concurrent write.
 
-Reading configuration from the environment is also wrong in a second way:
-`TEST_FORCE_FRAME_MODE`, `TEST_REFINEMENT_BIAS_US`, `TEST_HEADROOM_MIN_BPUS`,
-and `TEST_LOSS_OVERRIDE_THRESHOLD` are parsed in every build, so a stray
-variable can steer encoder behaviour in a production daemon.
+A correction to an earlier draft of this spec: the `TEST_*` variables are
+**already** feature-gated. All five reads — four in `classifier.rs` (`:385`,
+`:390`, `:397`, `:408`) and `TEST_FORCE_BYTES_PER_US` in `io_bridge.rs:950` —
+sit behind `#[cfg(any(test, feature = "test-loss-injection"))]`, so a production
+build does not compile them and cannot be steered by a stray variable. That
+property is correct today and this work must preserve it, not introduce it.
 
 ## Goals
 
 - One place in the library where `std::env` is read, at the executable boundary.
 - Tests configure behaviour by constructing values, not by mutating process
   state — making the race structurally impossible rather than locked out.
-- Test-only tuning knobs unavailable to a production build.
+- Test-only tuning knobs remain unavailable to a production build (already true;
+  must survive the refactor).
 - No change to the environment-variable names or their meaning.
 
 ## Non-goals
@@ -66,7 +69,7 @@ passes today must pass unchanged afterwards.
 | D1 | Scope: library-internal reads only | Fixes every known race and gives the library one config type, at roughly half the total surface, so it lands in one reviewable pass. xdaemon's deployment variables stay where they are. |
 | D2 | Explicit constructor threading | No ambient state anywhere in the library, so races become impossible rather than locked out, and `test_env.rs` can be deleted. A `OnceLock` would keep the race; a thread-local would break across the tokio runtime's threads. |
 | D3 | Per-subsystem config slices, composed into a root | `classifier.rs` should not see loss-injection knobs. Each type takes only what it uses. |
-| D4 | `TEST_*` parsed only under `test-loss-injection` | A production daemon should not be steerable by a stray variable. Matches how `INJECT_OOB_PALRLE` and `SKIP_PALETTE_SESSION_RESET` are already gated, and the test-server image already enables the feature. |
+| D4 | Preserve the existing `test-loss-injection` gating on `TEST_*` parsing | Already the case at all five read sites; `from_env()` must keep the same `#[cfg]` so a production daemon stays unsteerable. The *fields* exist unconditionally so unit tests can set them regardless of features — only parsing is gated. |
 | D5 | `Default` == production behaviour | Tests write `ClassifierConfig { force_frame_mode: Some(..), ..Default::default() }` and get today's production semantics for everything they do not mention. |
 
 ## Architecture
