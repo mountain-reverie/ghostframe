@@ -109,7 +109,7 @@ pub struct DiagnosticsConfig {
     /// Path for the one-shot raw-BGRA frame dump. Consumed once, then cleared
     /// by the bridge — this replaces the current read-then-`remove_var`.
     pub dump_frame_path: Option<String>,
-    pub cdf53_diff_tile: Option<(u8, u8)>,
+    pub cdf53_diff_tile: Option<(u32, u32)>,
     pub cdf53_dump_pending: bool,
     // Deliberately no `cdf53_skip_l2_l3` / `cdf53_skip_l3`: those two reads
     // live in the Vulkan dispatch path and are deferred. Adding unused fields
