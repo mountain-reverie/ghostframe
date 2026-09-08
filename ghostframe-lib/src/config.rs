@@ -24,6 +24,57 @@ pub struct ClassifierConfig {
     pub loss_override_threshold: Option<f32>,
 }
 
+impl ClassifierConfig {
+    /// Parse environment variables into a classifier configuration.
+    ///
+    /// Env-var parsing is the one place this crate still touches process-global
+    /// state, so tests that call this should take the shared lock via
+    /// `crate::test_env::lock_env()`.
+    #[cfg(any(test, feature = "test-loss-injection"))]
+    pub fn from_env() -> Self {
+        Self {
+            refinement_bias_us: std::env::var("GHOSTFRAME_TEST_REFINEMENT_BIAS_US")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .filter(|v| *v > 0.0),
+            loss_override_threshold: std::env::var("GHOSTFRAME_TEST_LOSS_OVERRIDE_THRESHOLD")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .filter(|v| *v > 0.0 && *v <= 1.0),
+            headroom_min_bpus: std::env::var("GHOSTFRAME_TEST_HEADROOM_MIN_BPUS")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .filter(|v| *v > 0.0),
+            // `GHOSTFRAME_FORCE_TILECODEC=1`/`true` is a high-level alias
+            // for `GHOSTFRAME_TEST_FORCE_FRAME_MODE=tile`. Used by the
+            // `e2e_lossless_golden_png` test to bypass the H.264 forced-
+            // start at session entry so the cdf53 first-paint burst gets
+            // exercised (H.264 has its own FEC + parity + NACK and renders
+            // fully even under wire loss, masking tile-codec regressions).
+            force_frame_mode: std::env::var("GHOSTFRAME_FORCE_TILECODEC")
+                .ok()
+                .filter(|s| s == "1" || s == "true")
+                .map(|_| FrameMode::TileCodec)
+                .or_else(|| {
+                    std::env::var("GHOSTFRAME_TEST_FORCE_FRAME_MODE")
+                        .ok()
+                        .and_then(|s| match s.as_str() {
+                            "h264" | "H264" => Some(FrameMode::H264),
+                            "tile" | "TileCodec" | "tilecodec" => Some(FrameMode::TileCodec),
+                            _ => None,
+                        })
+                }),
+        }
+    }
+
+    /// Production builds without `test-loss-injection` ignore the environment
+    /// entirely, exactly as today: the reads are not compiled.
+    #[cfg(not(any(test, feature = "test-loss-injection")))]
+    pub fn from_env() -> Self {
+        Self::default()
+    }
+}
+
 /// Transport-layer knobs: fault injection, pacing overrides, FEC.
 #[derive(Debug, Clone, Default)]
 pub struct TransportConfig {
@@ -94,5 +145,60 @@ mod tests {
         assert!(!cfg.diagnostics.diagnose_gpu_pipeline);
         assert!(!cfg.diagnostics.diagnose_color_hist);
         assert!(cfg.diagnostics.dump_frame_path.is_none());
+    }
+
+    /// Env-var parsing is the one place this crate still touches process-global
+    /// state, so these tests take the shared lock until it is removed.
+    #[test]
+    fn classifier_config_parses_force_frame_mode() {
+        let _env = crate::test_env::lock_env();
+        std::env::set_var("GHOSTFRAME_TEST_FORCE_FRAME_MODE", "h264");
+        assert_eq!(
+            ClassifierConfig::from_env().force_frame_mode,
+            Some(FrameMode::H264)
+        );
+        std::env::set_var("GHOSTFRAME_TEST_FORCE_FRAME_MODE", "tile");
+        assert_eq!(
+            ClassifierConfig::from_env().force_frame_mode,
+            Some(FrameMode::TileCodec)
+        );
+        std::env::remove_var("GHOSTFRAME_TEST_FORCE_FRAME_MODE");
+        assert_eq!(ClassifierConfig::from_env().force_frame_mode, None);
+    }
+
+    #[test]
+    fn force_tilecodec_is_an_alias_for_tile_mode() {
+        let _env = crate::test_env::lock_env();
+        std::env::set_var("GHOSTFRAME_FORCE_TILECODEC", "1");
+        assert_eq!(
+            ClassifierConfig::from_env().force_frame_mode,
+            Some(FrameMode::TileCodec)
+        );
+        std::env::set_var("GHOSTFRAME_FORCE_TILECODEC", "true");
+        assert_eq!(
+            ClassifierConfig::from_env().force_frame_mode,
+            Some(FrameMode::TileCodec)
+        );
+        // Any other value is ignored, not an error.
+        std::env::set_var("GHOSTFRAME_FORCE_TILECODEC", "0");
+        assert_eq!(ClassifierConfig::from_env().force_frame_mode, None);
+        std::env::remove_var("GHOSTFRAME_FORCE_TILECODEC");
+    }
+
+    #[test]
+    fn classifier_config_filters_out_of_range_values() {
+        let _env = crate::test_env::lock_env();
+        // loss_override_threshold accepts (0.0, 1.0]; bias and headroom accept > 0.0
+        std::env::set_var("GHOSTFRAME_TEST_LOSS_OVERRIDE_THRESHOLD", "1.5");
+        assert_eq!(ClassifierConfig::from_env().loss_override_threshold, None);
+        std::env::set_var("GHOSTFRAME_TEST_LOSS_OVERRIDE_THRESHOLD", "0.5");
+        assert_eq!(
+            ClassifierConfig::from_env().loss_override_threshold,
+            Some(0.5)
+        );
+        std::env::set_var("GHOSTFRAME_TEST_HEADROOM_MIN_BPUS", "-1");
+        assert_eq!(ClassifierConfig::from_env().headroom_min_bpus, None);
+        std::env::remove_var("GHOSTFRAME_TEST_LOSS_OVERRIDE_THRESHOLD");
+        std::env::remove_var("GHOSTFRAME_TEST_HEADROOM_MIN_BPUS");
     }
 }
