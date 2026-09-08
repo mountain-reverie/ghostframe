@@ -19,7 +19,6 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 
 use bytes::BytesMut;
 use quinn_proto::{ConnectionHandle, Event, StreamEvent};
@@ -50,6 +49,17 @@ use crate::transport::protocol::{
 };
 use crate::transport::quic::QuicServer;
 use crate::transport::webtransport::WebTransportServer;
+
+/// Current time as a `std::time::Instant`, sourced from tokio's clock.
+///
+/// Every deadline the bridge computes flows from here, so
+/// `tokio::time::pause()` controls the whole server loop: the browserless
+/// harness advances virtual time and a 60-second scene costs its event count,
+/// not its duration. In production tokio's clock is the system clock, so this
+/// is exactly `Instant::now()`.
+pub(crate) fn now_std() -> std::time::Instant {
+    tokio::time::Instant::now().into_std()
+}
 
 /// Scratch buffer size for quinn-proto's `endpoint.handle` / `conn.poll_transmit`.
 /// Sized above a 1500-byte MTU with headroom for ECN/padding; quinn-proto may
@@ -981,7 +991,7 @@ impl IoBridge {
         } else {
             "cpu"
         };
-        let t0 = Instant::now();
+        let t0 = now_std();
         tracing::trace!(
             target: "ghostframe::io_bridge::diag",
             w = frame.width,
@@ -1199,7 +1209,6 @@ impl IoBridge {
         self.scheduler.set_rtt(rtt);
 
         use crate::transport::scheduler::{TileWork, WorkState};
-        use std::time::Instant;
 
         for &(tile_x, tile_y) in dirty {
             // For GpuClassifierDriven, check whether this tile is handled by
@@ -1298,7 +1307,7 @@ impl IoBridge {
                 total_passes: 1,
                 codec,
                 payload,
-                queued_at: Instant::now(),
+                queued_at: now_std(),
                 last_sent_at: None,
                 state: WorkState::Pending,
             });
@@ -1429,7 +1438,7 @@ impl IoBridge {
         let drained_count = drained.len();
         let mut stats = FrameSendStats::default();
         let mut total_wire_bytes_sent: usize = 0;
-        let now = Instant::now();
+        let now = now_std();
         // Build per-fragment (EmitKey, Bytes) items for the reliable
         // emitter. The emitter stamps wire_seq into bytes[8..12], caches
         // for retransmit, schedules RTO, and queues parity per FEC group.
@@ -3367,7 +3376,7 @@ impl IoBridge {
                 // queue (source + parity) to the wire. Cheap when nothing
                 // is due (no cache hits, no parity ready).
                 {
-                    let tick_now = Instant::now();
+                    let tick_now = now_std();
                     self.reliable_emitter
                         .tick(tick_now, RTO_RETRANSMITS_PER_TICK);
                     let bridge_ptr: *mut IoBridge = self as *mut IoBridge;
@@ -3489,7 +3498,7 @@ impl IoBridge {
                 // the cumulative byte counters added in Task 6). All
                 // values are observability — Phase 1 doesn't drive
                 // emission from any of this.
-                let now = Instant::now();
+                let now = now_std();
                 let bwe_log_due = self
                     .bwe_log_last_at
                     .is_none_or(|last| now.duration_since(last).as_millis() >= 1000);
@@ -3598,7 +3607,7 @@ impl IoBridge {
         let mut diag_timeout_arm: u64 = 0;
         let mut diag_frame_arm: u64 = 0;
         let mut diag_inbound_arm: u64 = 0;
-        let mut diag_last_heartbeat = Instant::now();
+        let mut diag_last_heartbeat = now_std();
 
         loop {
             // Build a timer future that fires at the earliest QUIC timeout, or
@@ -3615,7 +3624,7 @@ impl IoBridge {
                 // 1. Earliest QUIC timeout fired.
                 _ = sleep_fut => {
                     diag_timeout_arm += 1;
-                    self.server.handle_timeout(Instant::now());
+                    self.server.handle_timeout(now_std());
                 }
 
                 // 2. Frame submission from capture thread.
@@ -3704,7 +3713,7 @@ impl IoBridge {
                     inbound = diag_inbound_arm,
                     "[BRIDGE-HB] select-arm counts (since start)"
                 );
-                diag_last_heartbeat = Instant::now();
+                diag_last_heartbeat = now_std();
             }
         }
     }
@@ -3735,7 +3744,7 @@ impl IoBridge {
 
         tracing::trace!(remote = %packet.addr, payload_len, "processing inbound datagram");
         if let Some(transmit) = self.server.handle_datagram(
-            Instant::now(),
+            now_std(),
             packet.addr,
             Some(self.local_addr.ip()),
             None, // ECN not available from ghostbridge framing
@@ -3753,7 +3762,7 @@ impl IoBridge {
 
     /// Write all pending outbound QUIC transmits back to ghostbridge.
     async fn drain_outbound(&mut self) -> io::Result<()> {
-        let now = Instant::now();
+        let now = now_std();
         let mut buf: Vec<u8> = Vec::with_capacity(QUIC_SCRATCH);
 
         loop {
@@ -3947,7 +3956,7 @@ impl IoBridge {
                     // the next 33 ms capture tick to push pending
                     // retransmits, adding up to ~33 ms latency to every
                     // recovered pass under sustained load.
-                    let tick_now = Instant::now();
+                    let tick_now = now_std();
                     self.reliable_emitter
                         .tick(tick_now, RTO_RETRANSMITS_PER_TICK);
                     let bridge_ptr: *mut IoBridge = self as *mut IoBridge;
@@ -6178,5 +6187,24 @@ mod tests {
         bridge.dispatch_feedback_bytes(&[0xff, 0xaa, 0xbb]);
         bridge.dispatch_feedback_bytes(&[0x05, 0x01, 0x00, 0x0a, 0x00, 0x14]);
         assert_eq!(injector.moves.lock().unwrap().clone(), vec![(10, 20)]);
+    }
+
+    #[test]
+    fn now_std_works_outside_a_runtime() {
+        let t0 = super::now_std();
+        let t1 = super::now_std();
+        assert!(t1 >= t0, "now_std must be monotonic outside a runtime");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn now_std_follows_the_virtual_clock() {
+        let t0 = super::now_std();
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        let t1 = super::now_std();
+        assert!(
+            t1.duration_since(t0) >= std::time::Duration::from_secs(5),
+            "now_std must advance with the paused clock, got {:?}",
+            t1.duration_since(t0)
+        );
     }
 }
