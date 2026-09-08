@@ -83,15 +83,16 @@ struct Sim {
 impl Sim {
     fn new(loss_p: f64, seed: u64) -> Self {
         let delivered = Rc::new(RefCell::new(Vec::new()));
+        let t = Instant::now();
         Self {
-            emitter: ReliableTileEmitter::new(),
+            emitter: ReliableTileEmitter::new(t),
             sender: LossSender {
                 delivered: delivered.clone(),
                 rng: DetRng::new(seed),
                 p: loss_p,
             },
             delivered,
-            t: Instant::now(),
+            t,
         }
     }
     /// Drain freshly-delivered datagrams from the loss sender and feed
