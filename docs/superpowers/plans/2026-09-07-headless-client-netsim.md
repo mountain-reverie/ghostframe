@@ -1838,7 +1838,15 @@ pub async fn run_browserless(scene: BrowserlessScene) -> anyhow::Result<Browserl
 Wiring, in order:
 
 1. `UnixStream::pair()`; `QuicServer::new()`; `mpsc::channel` for injection.
-2. `IoBridge::new_with_injection_for_test(ours, server, inject_rx)`; run it with `LocalSet::spawn_local` so it works whether or not `IoBridge` is `Send`.
+2. `IoBridge::new_with_injection_for_test(ours, server, inject_rx, grid_cols, grid_rows)`; run it with `LocalSet::spawn_local` so it works whether or not `IoBridge` is `Send`.
+
+   The grid dimensions come from the scene, once, and must cover every tile
+   any `FrameScript` references. They are a constructor argument rather than
+   being inferred per frame because `Scheduler::resize` clears the priority
+   queue, the refinement queue, and all CDF53 pass-ACK records — growing the
+   grid mid-scene would silently discard in-flight work, and the symptom
+   would be "tiles never converged" with no visible cause. A tile outside the
+   grid is skipped with a `tracing::error!` naming the coordinate.
 3. `SocketPairPump::new(peer)` on the other end, with a `NetSim` per direction (independent RNG streams: seed and `seed ^ 0xA5A5_A5A5_A5A5_A5A5`).
 4. `ClientNet::new` with the server's pinned cert hash; `connect`; pump until `SessionReady`.
 5. Send each `FrameScript`'s encoded `TileWork` batch on the injection channel, one frame per 16 ms of virtual time.
