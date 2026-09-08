@@ -303,13 +303,15 @@ fn classifier_takes_its_overrides_from_config_not_env() {
         force_frame_mode: Some(FrameMode::H264),
         ..Default::default()
     };
-    let classifier = Classifier::new(cfg);
-    let (mode, _reason) = classifier.decide_frame_mode_at(0, &[], FrameMode::TileCodec);
+    let mut classifier = Classifier::new(cfg);
+    let mode = classifier.decide_frame_mode_at(0, &[], FrameMode::TileCodec);
     assert_eq!(mode, FrameMode::H264, "config override must pin the mode");
 }
 ```
 
-Check `decide_frame_mode_at`'s real signature at `classifier.rs:486` and match it.
+Signature verified at `classifier.rs:486`:
+`pub fn decide_frame_mode_at(&mut self, now_us: u64, tentative_states: &[CodecState], prev_mode: FrameMode) -> FrameMode`
+— it takes `&mut self` and returns a bare `FrameMode`, not a `(mode, reason)` tuple.
 
 - [ ] **Step 2: Run to verify it fails** — `Classifier::new` not found.
 
