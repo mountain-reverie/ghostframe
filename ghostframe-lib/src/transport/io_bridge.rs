@@ -3706,11 +3706,18 @@ impl IoBridge {
                 self.bwe.update(&records, now_std());
             }
 
-            // [BRIDGE-DIAG] heartbeat every 2s of wall time so we can tell
-            // from the log whether the loop is making progress when the
-            // emit pipeline goes silent.
+            // [BRIDGE-DIAG] heartbeat every 2s of virtual time (tokio's
+            // clock, which is the wall clock in production but follows
+            // `tokio::time::pause()` under the browserless harness) so we
+            // can tell from the log whether the loop is making progress
+            // when the emit pipeline goes silent. Comparing via
+            // `now_std().duration_since(..)` rather than `.elapsed()`
+            // matters here: `Instant::elapsed()` always reads the real
+            // wall clock internally, so under a paused runtime it would
+            // never see the stamp catch up and this heartbeat would go
+            // silent forever.
             diag_iters += 1;
-            if diag_last_heartbeat.elapsed() >= std::time::Duration::from_secs(2) {
+            if now_std().duration_since(diag_last_heartbeat) >= std::time::Duration::from_secs(2) {
                 tracing::trace!(
                     target: "ghostframe::io_bridge::diag",
                     iters = diag_iters,
