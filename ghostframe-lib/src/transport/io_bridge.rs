@@ -5116,7 +5116,7 @@ mod tests {
     #[test]
     fn classifier_reset_clears_streaks() {
         use crate::tile::{Classifier, CodecState, FrameMode};
-        let mut c = Classifier::default();
+        let mut c = Classifier::new(crate::config::ClassifierConfig::default());
         let busy: Vec<CodecState> = (0..20)
             .map(|i| CodecState::H264 { frames_in_h264: i })
             .collect();
@@ -6724,7 +6724,7 @@ mod tests {
         // wall-clock time, so this must NEVER observe the dwell — this is
         // the exact bug Commit 1 fixes at the `process_frame_gpu` call
         // site.
-        let mut broken = Classifier::default();
+        let mut broken = Classifier::new(crate::config::ClassifierConfig::default());
         let mut broken_mode = FrameMode::H264;
         for _ in 0..30 {
             broken_mode = broken.decide_frame_mode(&[], FrameMode::H264);
