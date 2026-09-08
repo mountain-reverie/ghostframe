@@ -188,6 +188,11 @@ impl Scheduler {
     /// callers (and the bulk of this module's own tests) use this; the
     /// browserless harness calls `enqueue_at` directly with tokio's
     /// (possibly paused) clock.
+    /// Test-only: every production caller passes an explicit clock via the
+    /// `_at` variant, so this wall-clock path is gated out of production and
+    /// out of the browserless harness. Under `tokio::time::pause()` a wall
+    /// clock does not advance, which would silently freeze the retry gate.
+    #[cfg(test)]
     pub fn enqueue(&mut self, work: TileWork) {
         self.enqueue_at(work, Instant::now());
     }
@@ -526,6 +531,11 @@ impl Scheduler {
     ///
     /// Thin wrapper over `tick_at` using the wall clock; see that method
     /// for the harness-facing variant that takes an explicit `now`.
+    /// Test-only: every production caller passes an explicit clock via the
+    /// `_at` variant, so this wall-clock path is gated out of production and
+    /// out of the browserless harness. Under `tokio::time::pause()` a wall
+    /// clock does not advance, which would silently freeze the retry gate.
+    #[cfg(test)]
     pub fn tick(&mut self, budget_bytes: usize) -> Vec<TileWork> {
         self.tick_at(budget_bytes, Instant::now())
     }
@@ -700,6 +710,11 @@ impl Scheduler {
     /// TileWork with pass_idx 0..passes.len()-1 and total_passes = passes.len().
     ///
     /// Thin wrapper over `enqueue_refinement_at` using the wall clock.
+    /// Test-only: every production caller passes an explicit clock via the
+    /// `_at` variant, so this wall-clock path is gated out of production and
+    /// out of the browserless harness. Under `tokio::time::pause()` a wall
+    /// clock does not advance, which would silently freeze the retry gate.
+    #[cfg(test)]
     pub fn enqueue_refinement(&mut self, tile_x: u8, tile_y: u8, gen: u8, passes: Vec<Vec<u8>>) {
         self.enqueue_refinement_at(tile_x, tile_y, gen, passes, Instant::now());
     }
@@ -744,6 +759,11 @@ impl Scheduler {
     /// the client already built up for this generation.
     ///
     /// Thin wrapper over `enqueue_refinement_subset_at` using the wall clock.
+    /// Test-only: every production caller passes an explicit clock via the
+    /// `_at` variant, so this wall-clock path is gated out of production and
+    /// out of the browserless harness. Under `tokio::time::pause()` a wall
+    /// clock does not advance, which would silently freeze the retry gate.
+    #[cfg(test)]
     pub fn enqueue_refinement_subset(
         &mut self,
         tile_x: u8,
