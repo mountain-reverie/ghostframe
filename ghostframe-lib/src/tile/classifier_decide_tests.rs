@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::ClassifierConfig;
 
 fn h264_states(n: u32) -> Vec<CodecState> {
     (0..n)
@@ -20,7 +21,7 @@ fn switch_frame(dwell_us: u64, frame_interval_us: u64) -> u32 {
 
 #[test]
 fn enters_h264_after_sustain_frames_via_motion_fastpath() {
-    let mut c = Classifier::default();
+    let mut c = Classifier::new(ClassifierConfig::default());
     let states = h264_states(20); // 20 dirty tiles, all H264 → 100% > 20%, ≥ 8 absolute
                                   // enter_sustain_micros = 50_000 µs ≈ 3 frames at 60 fps (16_667 µs/frame).
                                   // Frames 0..switch_frame-1 must return TileCodec; frame switch_frame returns H264.
@@ -40,7 +41,7 @@ fn enters_h264_after_sustain_frames_via_motion_fastpath() {
 
 #[test]
 fn motion_fastpath_blocked_by_min_absolute_floor() {
-    let mut c = Classifier::default();
+    let mut c = Classifier::new(ClassifierConfig::default());
     let states = h264_states(2); // only 2 H264 tiles — 100% but below floor of 8
                                  // Time can advance freely; floor means enter_now is always false → no switch.
     for frame in 0..10u32 {
@@ -54,7 +55,7 @@ fn motion_fastpath_blocked_by_min_absolute_floor() {
 
 #[test]
 fn enter_streak_resets_on_quiet_frame() {
-    let mut c = Classifier::default();
+    let mut c = Classifier::new(ClassifierConfig::default());
     let busy = h264_states(20);
     let quiet = solid_states(1);
     // Build dwell to just before the switch point (sw-1 frames at 60 fps < dwell threshold).
@@ -78,7 +79,7 @@ fn enter_streak_resets_on_quiet_frame() {
 
 #[test]
 fn exits_h264_after_sustain_frames_when_costs_drop() {
-    let mut c = Classifier::default();
+    let mut c = Classifier::new(ClassifierConfig::default());
     let cheap = solid_states(2); // tile-codec cost trivial → < h264 * 0.6
                                  // exit_sustain_micros = 500_000 µs; switch_frame at 60 fps = ceil(500_000/16_667) = 30.
     let sw = switch_frame(c.exit_sustain_micros, 16_667); // 30
@@ -119,7 +120,7 @@ fn enters_h264_after_sustain_frames_via_cost_path_only() {
     // h264_tile_count = 0 < motion_tile_min_absolute (8) → motion_enter = false.
     // This is the cost-only enter path — exercises a code branch the other
     // enter-path tests don't reach (they hit motion_enter simultaneously).
-    let mut c = Classifier::default();
+    let mut c = Classifier::new(ClassifierConfig::default());
     let states = vec![
         CodecState::Cdf53 {
             passes_sent: 0,
@@ -144,7 +145,7 @@ fn enters_h264_after_sustain_frames_via_cost_path_only() {
 
 #[test]
 fn empty_tentative_in_h264_drives_exit_streak_to_completion() {
-    let mut c = Classifier::default();
+    let mut c = Classifier::new(ClassifierConfig::default());
     // Pre-establish H264 mode by feeding enough enter-triggering frames.
     // enter_sustain_micros = 50_000 µs; switch_frame at 60 fps = 3.
     let busy = h264_states(20);
@@ -178,7 +179,7 @@ fn empty_tentative_in_h264_drives_exit_streak_to_completion() {
 #[test]
 fn motion_fastpath_at_min_absolute_boundary() {
     // n=7 (just below floor=8): must NOT trip even at 100% motion fraction.
-    let mut c = Classifier::default();
+    let mut c = Classifier::new(ClassifierConfig::default());
     let n7 = h264_states(7);
     for frame in 0..10u32 {
         assert_eq!(
@@ -188,7 +189,7 @@ fn motion_fastpath_at_min_absolute_boundary() {
     }
     // n=8 (at floor): must trip after sustain.
     // enter_sustain_micros = 50_000 µs; switch_frame at 60 fps = 3.
-    let mut c = Classifier::default();
+    let mut c = Classifier::new(ClassifierConfig::default());
     let n8 = h264_states(8);
     let sw = switch_frame(c.enter_sustain_micros, 16_667); // 3
     for frame in 0..sw {
@@ -206,7 +207,7 @@ fn motion_fastpath_at_min_absolute_boundary() {
 
 #[test]
 fn empty_tentative_in_tilecodec_stays_tilecodec() {
-    let mut c = Classifier::default();
+    let mut c = Classifier::new(ClassifierConfig::default());
     let empty: Vec<CodecState> = Vec::new();
     for frame in 0..100u32 {
         assert_eq!(
@@ -250,7 +251,7 @@ fn refinement_bias_promotes_tilecodec_under_headroom() {
     // With bias: even well past enter_sustain_micros, cost_enter is false
     // (tile_codec_cost ≤ h264_cost_biased * enter_factor), so TileCodec is held.
     // Drive 10 frames (≈ 166_670 µs >> 50_000 µs dwell) to ensure no switch occurs.
-    let mut c = Classifier::default();
+    let mut c = Classifier::new(ClassifierConfig::default());
     c.set_adaptation_context(ctx);
     c.set_refinement_deficit_tiles(40);
     let mut mode = FrameMode::TileCodec;
@@ -263,7 +264,7 @@ fn refinement_bias_promotes_tilecodec_under_headroom() {
     // enter_sustain_micros = 50_000 µs; switch_frame at 60 fps = 3.
     // Drive to frame switch_frame(50_000, 16_667) = 3 to confirm H264.
     let sw = switch_frame(50_000, 16_667); // 3
-    let mut c2 = Classifier::default();
+    let mut c2 = Classifier::new(ClassifierConfig::default());
     c2.set_adaptation_context(ctx);
     c2.set_refinement_deficit_tiles(0);
     let mut mode2 = FrameMode::TileCodec;
@@ -283,7 +284,7 @@ fn refinement_bias_promotes_tilecodec_under_headroom() {
 fn headroom_guard_forces_h264_below_threshold() {
     use crate::tile::classifier::{AdaptationContext, Classifier, HEADROOM_MIN_BYTES_PER_US};
     use crate::tile::{CodecState, FrameMode};
-    let mut c = Classifier::default();
+    let mut c = Classifier::new(ClassifierConfig::default());
     // Below threshold: 0.1 B/µs (~ 800 kbps).
     let ctx = AdaptationContext {
         supports_h264: true,
@@ -304,7 +305,7 @@ fn headroom_guard_forces_h264_below_threshold() {
 fn loss_override_forces_h264_above_threshold() {
     use crate::tile::classifier::{AdaptationContext, Classifier, LOSS_OVERRIDE_THRESHOLD};
     use crate::tile::{CodecState, FrameMode};
-    let mut c = Classifier::default();
+    let mut c = Classifier::new(ClassifierConfig::default());
     let ctx = AdaptationContext {
         supports_h264: true,
         bytes_per_us: 100.0,
@@ -325,7 +326,7 @@ fn loss_override_forces_h264_above_threshold() {
 fn suspension_override_forces_h264() {
     use crate::tile::classifier::{AdaptationContext, Classifier};
     use crate::tile::{CodecState, FrameMode};
-    let mut c = Classifier::default();
+    let mut c = Classifier::new(ClassifierConfig::default());
     let ctx = AdaptationContext {
         supports_h264: true,
         bytes_per_us: 100.0,
@@ -359,7 +360,7 @@ fn hysteresis_micros_holds_dwell_across_frame_rate() {
             .collect()
     };
 
-    let mut c60 = Classifier::default();
+    let mut c60 = Classifier::new(ClassifierConfig::default());
     let mut switch_at_60 = None;
     for frame in 0..1000u32 {
         let now_us = (frame as u64) * 16_667; // 60 fps
@@ -370,7 +371,7 @@ fn hysteresis_micros_holds_dwell_across_frame_rate() {
         }
     }
 
-    let mut c30 = Classifier::default();
+    let mut c30 = Classifier::new(ClassifierConfig::default());
     let mut switch_at_30 = None;
     for frame in 0..1000u32 {
         let now_us = (frame as u64) * 33_333; // 30 fps
@@ -400,7 +401,7 @@ fn mode_decision_event_emitted_only_on_transition() {
     // hard to capture without a subscriber. The functional check is that
     // last_emitted_mode is correctly debounced.
 
-    let mut c = Classifier::default();
+    let mut c = Classifier::new(ClassifierConfig::default());
     let ctx = AdaptationContext {
         supports_h264: true,
         bytes_per_us: 100.0,
@@ -716,7 +717,7 @@ fn hybrid_hysteresis_wall_clock_jump_without_streak_does_not_flip() {
     use crate::tile::classifier::{AdaptationContext, Classifier};
     use crate::tile::{CodecState, FrameMode};
 
-    let mut c = Classifier::default();
+    let mut c = Classifier::new(ClassifierConfig::default());
     let ctx = AdaptationContext {
         supports_h264: true,
         bytes_per_us: 100.0,
@@ -771,7 +772,7 @@ fn hybrid_hysteresis_exit_wall_clock_jump_without_streak_does_not_flip() {
     use crate::tile::classifier::{AdaptationContext, Classifier};
     use crate::tile::{CodecState, FrameMode};
 
-    let mut c = Classifier::default();
+    let mut c = Classifier::new(ClassifierConfig::default());
     let ctx = AdaptationContext {
         supports_h264: true,
         bytes_per_us: 100.0,
@@ -805,7 +806,7 @@ fn h264_unsupported_forces_tile_codec_even_with_low_headroom() {
     // Even in the "headroom_guard would force H.264" zone, a Firefox-style
     // client (`supports_h264 == false`) must end up in TileCodec because
     // H.264 frames would be silently dropped on the renderer side.
-    let mut c = Classifier::default();
+    let mut c = Classifier::new(ClassifierConfig::default());
     let ctx = AdaptationContext {
         supports_h264: false,
         bytes_per_us: HEADROOM_MIN_BYTES_PER_US * 0.5, // below threshold
@@ -829,7 +830,7 @@ fn h264_unsupported_forces_tile_codec_even_with_low_headroom() {
 fn h264_unsupported_forces_tile_codec_even_with_high_loss() {
     // Symmetric coverage: loss_override would normally force H.264 here,
     // but supports_h264=false must win.
-    let mut c = Classifier::default();
+    let mut c = Classifier::new(ClassifierConfig::default());
     let ctx = AdaptationContext {
         supports_h264: false,
         bytes_per_us: 100.0,
@@ -853,7 +854,7 @@ fn h264_unsupported_forces_tile_codec_when_previously_in_h264() {
     // Coming from a previous-mode of H264 (a stale decision before HELLO
     // arrived), the override must drop straight back to TileCodec on the
     // next decision.
-    let mut c = Classifier::default();
+    let mut c = Classifier::new(ClassifierConfig::default());
     let ctx = AdaptationContext {
         supports_h264: false,
         bytes_per_us: 100.0,
