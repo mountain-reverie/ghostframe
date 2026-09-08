@@ -1714,7 +1714,7 @@ impl IoBridge {
                 // the BWE consumer uses relative deltas only, so clock skew
                 // is acceptable. Cache misses are silent (already ACKed by
                 // an overlapping batch, or RTO-evicted).
-                let now_for_samples = std::time::Instant::now();
+                let now_for_samples = now_std();
                 let emit_keys: Vec<crate::transport::reliable_emitter::EmitKey> = batch
                     .entries
                     .iter()
@@ -3697,7 +3697,7 @@ impl IoBridge {
                         client_arrival_ms_lo16: s.client_arrival_ms_lo16,
                     })
                     .collect();
-                self.bwe.update(&records, std::time::Instant::now());
+                self.bwe.update(&records, now_std());
             }
 
             // [BRIDGE-DIAG] heartbeat every 2s of wall time so we can tell
@@ -6205,6 +6205,67 @@ mod tests {
             t1.duration_since(t0) >= std::time::Duration::from_secs(5),
             "now_std must advance with the paused clock, got {:?}",
             t1.duration_since(t0)
+        );
+    }
+
+    /// Regression test for the BWE clock bug: `IoBridge` fed `self.bwe.update`
+    /// (and the OWD sample timestamps it depends on) with a bare
+    /// `std::time::Instant::now()` instead of `now_std()`. Under a paused
+    /// tokio runtime real wall-clock time barely moves while the loop's
+    /// virtual clock jumps forward, so `Bwe`'s 200 ms window never sees
+    /// `elapsed >= WINDOW` and silently never flushes.
+    ///
+    /// This test drives `BweWrapper::update` exactly the way the bridge
+    /// does — timestamps sourced from `now_std()` — and proves the window
+    /// actually flushes once virtual time crosses the window boundary via
+    /// `tokio::time::advance`, by observing the EWMA estimate move off its
+    /// initial seed (mirrors `bwe::tests::estimate_adapts_upward_with_high_arrival_rate`,
+    /// but over the paused/virtual clock instead of real wall time).
+    #[tokio::test(start_paused = true)]
+    async fn bwe_window_flushes_on_virtual_time() {
+        use crate::transport::bwe::{AckArrival, BweWrapper};
+
+        let mut bwe = BweWrapper::new(BweWrapper::INITIAL_BPS);
+
+        // A generous batch of records: comfortably above the estimator's
+        // MIN_SAMPLES_FOR_ESTIMATE gate and enough to push the observed
+        // delivery rate well above the 2 Mbps seed once the window flushes.
+        let records: Vec<AckArrival> = (0u32..100)
+            .map(|i| AckArrival {
+                wire_seq: i,
+                server_emit_ms_lo16: (i * 5) as u16,
+                client_arrival_ms_lo16: (i * 5 + 10) as u16,
+            })
+            .collect();
+
+        // First feed: samples accumulate, but no time has passed in the
+        // window yet, so the estimate must still sit at the initial seed.
+        let snap1 = bwe.update(&records, super::now_std());
+        assert_eq!(snap1.samples_seen, 100);
+        assert_eq!(
+            snap1.bitrate_bps,
+            BweWrapper::INITIAL_BPS,
+            "estimate must not move before the window elapses"
+        );
+
+        // Advance the *virtual* clock past the estimator's 200 ms window.
+        // Real wall-clock time spent doing this is on the order of
+        // microseconds — the whole point of the paused-clock harness.
+        tokio::time::advance(std::time::Duration::from_millis(250)).await;
+
+        // Second feed, stamped with the now-advanced virtual clock. If the
+        // bridge (or the estimator's caller) reads virtual time here, the
+        // window sees elapsed >= WINDOW and flushes, moving the EWMA
+        // estimate up (100 acks over ~0.25 s at the estimator's per-ack
+        // payload assumption is tens of Mbps, far above the 2 Mbps seed).
+        let snap2 = bwe.update(&records, super::now_std());
+        assert!(
+            snap2.bitrate_bps > BweWrapper::INITIAL_BPS,
+            "estimate {} should exceed the seed {} once the window flushes \
+             under virtual time — if this fails, the BWE clock source has \
+             regressed back to wall-clock time under a paused runtime",
+            snap2.bitrate_bps,
+            BweWrapper::INITIAL_BPS,
         );
     }
 }
