@@ -111,7 +111,17 @@ impl BweWrapper {
     /// burst (2 Mbps); the estimator will adapt within a few hundred ms.
     pub const INITIAL_BPS: u64 = 2_000_000;
 
-    pub fn new(initial_bps: u64) -> Self {
+    /// `now` seeds the initial window's `start`. Callers should pass the
+    /// same clock source they'll later pass to `update` (`now_std()` in
+    /// production) — seeding from a bare `Instant::now()` instead would mix
+    /// one wall-clock stamp into an estimator whose every other input is
+    /// the caller's (possibly virtual, paused-tokio) clock. Benign in
+    /// practice since the wall clock only ever runs ahead of a freshly-
+    /// paused virtual clock (the first window just over-reports elapsed
+    /// time rather than under-reporting it), but there's no reason to
+    /// leave a real wall-clock read inside the one estimator this
+    /// paused-clock harness exists to unblock.
+    pub fn new(initial_bps: u64, now: Instant) -> Self {
         // Compute the EWMA decay factor for one WINDOW period.
         let window_secs = WINDOW.as_secs_f64();
         let alpha = (-std::f64::consts::LN_2 / (EWMA_HALF_LIFE_SECS / window_secs)).exp();
@@ -120,7 +130,7 @@ impl BweWrapper {
             estimate_bps: initial_bps as f64,
             alpha,
             window: Window {
-                start: Instant::now(),
+                start: now,
                 count: 0,
             },
             samples_seen: 0,
@@ -198,7 +208,7 @@ mod tests {
 
     #[test]
     fn snapshot_starts_near_initial_bps() {
-        let bwe = BweWrapper::new(BweWrapper::INITIAL_BPS);
+        let bwe = BweWrapper::new(BweWrapper::INITIAL_BPS, Instant::now());
         let snap = bwe.snapshot();
         // The initial seed should be reflected as the estimate. Use a
         // loose tolerance because the EWMA may adjust slightly.
@@ -214,7 +224,7 @@ mod tests {
 
     #[test]
     fn update_counts_records_seen() {
-        let mut bwe = BweWrapper::new(BweWrapper::INITIAL_BPS);
+        let mut bwe = BweWrapper::new(BweWrapper::INITIAL_BPS, Instant::now());
         let records = vec![
             AckArrival {
                 wire_seq: 1,
@@ -233,7 +243,8 @@ mod tests {
 
     #[test]
     fn estimate_adapts_upward_with_high_arrival_rate() {
-        let mut bwe = BweWrapper::new(BweWrapper::INITIAL_BPS);
+        let now = Instant::now();
+        let mut bwe = BweWrapper::new(BweWrapper::INITIAL_BPS, now);
 
         // Simulate 100 records arriving in the first window.
         let records: Vec<AckArrival> = (0u32..100)
@@ -246,7 +257,6 @@ mod tests {
 
         // First call — samples accumulate in window but elapsed < WINDOW,
         // so estimate stays at seed.
-        let now = Instant::now();
         let snap1 = bwe.update(&records, now);
         assert_eq!(snap1.samples_seen, 100);
 

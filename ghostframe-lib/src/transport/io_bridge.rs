@@ -996,6 +996,7 @@ impl IoBridge {
             bwe_samples_buffer: Vec::with_capacity(BWE_SAMPLES_BUFFER_CAPACITY),
             bwe: crate::transport::bwe::BweWrapper::new(
                 crate::transport::bwe::BweWrapper::INITIAL_BPS,
+                now_std(),
             ),
             bytes_emitted_critical: 0,
             bytes_emitted_refinement: 0,
@@ -4602,6 +4603,7 @@ impl IoBridge {
             bwe_samples_buffer: Vec::with_capacity(BWE_SAMPLES_BUFFER_CAPACITY),
             bwe: crate::transport::bwe::BweWrapper::new(
                 crate::transport::bwe::BweWrapper::INITIAL_BPS,
+                now_std(),
             ),
             bytes_emitted_critical: 0,
             bytes_emitted_refinement: 0,
@@ -6776,7 +6778,7 @@ mod tests {
     async fn bwe_window_flushes_on_virtual_time() {
         use crate::transport::bwe::{AckArrival, BweWrapper};
 
-        let mut bwe = BweWrapper::new(BweWrapper::INITIAL_BPS);
+        let mut bwe = BweWrapper::new(BweWrapper::INITIAL_BPS, now_std());
 
         // A generous batch of records: comfortably above the estimator's
         // MIN_SAMPLES_FOR_ESTIMATE gate and enough to push the observed
