@@ -29,24 +29,20 @@ pub struct ClassifierConfig {
 }
 
 impl ClassifierConfig {
-    /// Parse environment variables into a classifier configuration.
-    ///
-    /// Env-var parsing is the one place this crate still touches process-global
-    /// state, so tests that call this should take the shared lock via
-    /// `crate::test_env::lock_env()`.
+    /// Parse from an arbitrary lookup. `from_env` is this with a real
+    /// environment lookup; tests use a map so they never touch process-global
+    /// state. Keeping the parsing here means the crate reads the process
+    /// environment in exactly one place.
     #[cfg(any(test, feature = "test-loss-injection"))]
-    pub fn from_env() -> Self {
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
         Self {
-            refinement_bias_us: std::env::var("GHOSTFRAME_TEST_REFINEMENT_BIAS_US")
-                .ok()
+            refinement_bias_us: get("GHOSTFRAME_TEST_REFINEMENT_BIAS_US")
                 .and_then(|s| s.parse::<f32>().ok())
                 .filter(|v| *v > 0.0),
-            loss_override_threshold: std::env::var("GHOSTFRAME_TEST_LOSS_OVERRIDE_THRESHOLD")
-                .ok()
+            loss_override_threshold: get("GHOSTFRAME_TEST_LOSS_OVERRIDE_THRESHOLD")
                 .and_then(|s| s.parse::<f32>().ok())
                 .filter(|v| *v > 0.0 && *v <= 1.0),
-            headroom_min_bpus: std::env::var("GHOSTFRAME_TEST_HEADROOM_MIN_BPUS")
-                .ok()
+            headroom_min_bpus: get("GHOSTFRAME_TEST_HEADROOM_MIN_BPUS")
                 .and_then(|s| s.parse::<f32>().ok())
                 .filter(|v| *v > 0.0),
             // `GHOSTFRAME_FORCE_TILECODEC=1`/`true` is a high-level alias
@@ -55,20 +51,23 @@ impl ClassifierConfig {
             // start at session entry so the cdf53 first-paint burst gets
             // exercised (H.264 has its own FEC + parity + NACK and renders
             // fully even under wire loss, masking tile-codec regressions).
-            force_frame_mode: std::env::var("GHOSTFRAME_FORCE_TILECODEC")
-                .ok()
+            force_frame_mode: get("GHOSTFRAME_FORCE_TILECODEC")
                 .filter(|s| s == "1" || s == "true")
                 .map(|_| FrameMode::TileCodec)
                 .or_else(|| {
-                    std::env::var("GHOSTFRAME_TEST_FORCE_FRAME_MODE")
-                        .ok()
-                        .and_then(|s| match s.as_str() {
-                            "h264" | "H264" => Some(FrameMode::H264),
-                            "tile" | "TileCodec" | "tilecodec" => Some(FrameMode::TileCodec),
-                            _ => None,
-                        })
+                    get("GHOSTFRAME_TEST_FORCE_FRAME_MODE").and_then(|s| match s.as_str() {
+                        "h264" | "H264" => Some(FrameMode::H264),
+                        "tile" | "TileCodec" | "tilecodec" => Some(FrameMode::TileCodec),
+                        _ => None,
+                    })
                 }),
         }
+    }
+
+    /// Parse environment variables into a classifier configuration.
+    #[cfg(any(test, feature = "test-loss-injection"))]
+    pub fn from_env() -> Self {
+        Self::from_lookup(|k| std::env::var(k).ok())
     }
 
     /// Production builds without `test-loss-injection` ignore the environment
@@ -151,64 +150,113 @@ mod tests {
         assert!(cfg.diagnostics.dump_frame_path.is_none());
     }
 
-    /// Env-var parsing is the one place this crate still touches process-global
-    /// state, so these tests take the shared lock until it is removed.
+    /// Build a lookup closure over a small fixture, the way `from_env` builds
+    /// one over the real environment. Tests use this instead of mutating
+    /// process env, so they need no shared-environment-lock guard and cannot
+    /// race other tests' `std::env::set_var` calls.
+    fn lookup(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let pairs: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |key: &str| {
+            pairs
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+        }
+    }
+
     #[test]
     fn classifier_config_parses_force_frame_mode() {
+        assert_eq!(
+            ClassifierConfig::from_lookup(lookup(&[(
+                "GHOSTFRAME_TEST_FORCE_FRAME_MODE",
+                "h264"
+            )]))
+            .force_frame_mode,
+            Some(FrameMode::H264)
+        );
+        assert_eq!(
+            ClassifierConfig::from_lookup(lookup(&[(
+                "GHOSTFRAME_TEST_FORCE_FRAME_MODE",
+                "tile"
+            )]))
+            .force_frame_mode,
+            Some(FrameMode::TileCodec)
+        );
+        assert_eq!(
+            ClassifierConfig::from_lookup(lookup(&[])).force_frame_mode,
+            None
+        );
+        assert_eq!(
+            ClassifierConfig::from_lookup(lookup(&[(
+                "GHOSTFRAME_TEST_FORCE_FRAME_MODE",
+                "bogus"
+            )]))
+            .force_frame_mode,
+            None,
+            "an unrecognised value must be ignored, not guessed at"
+        );
+    }
+
+    #[test]
+    fn force_tilecodec_is_an_alias_for_tile_mode() {
+        assert_eq!(
+            ClassifierConfig::from_lookup(lookup(&[("GHOSTFRAME_FORCE_TILECODEC", "1")]))
+                .force_frame_mode,
+            Some(FrameMode::TileCodec)
+        );
+        assert_eq!(
+            ClassifierConfig::from_lookup(lookup(&[("GHOSTFRAME_FORCE_TILECODEC", "true")]))
+                .force_frame_mode,
+            Some(FrameMode::TileCodec)
+        );
+        // Any other value is ignored, not an error.
+        assert_eq!(
+            ClassifierConfig::from_lookup(lookup(&[("GHOSTFRAME_FORCE_TILECODEC", "0")]))
+                .force_frame_mode,
+            None
+        );
+    }
+
+    #[test]
+    fn classifier_config_filters_out_of_range_values() {
+        // loss_override_threshold accepts (0.0, 1.0]; bias and headroom accept > 0.0
+        assert_eq!(
+            ClassifierConfig::from_lookup(lookup(&[(
+                "GHOSTFRAME_TEST_LOSS_OVERRIDE_THRESHOLD",
+                "1.5"
+            )]))
+            .loss_override_threshold,
+            None
+        );
+        assert_eq!(
+            ClassifierConfig::from_lookup(lookup(&[(
+                "GHOSTFRAME_TEST_LOSS_OVERRIDE_THRESHOLD",
+                "0.5"
+            )]))
+            .loss_override_threshold,
+            Some(0.5)
+        );
+        assert_eq!(
+            ClassifierConfig::from_lookup(lookup(&[("GHOSTFRAME_TEST_HEADROOM_MIN_BPUS", "-1")]))
+                .headroom_min_bpus,
+            None
+        );
+    }
+
+    /// `from_env` is a thin wrapper around `from_lookup` over the real
+    /// environment; this is its only coverage, so it is the one remaining
+    /// test in this module that touches process-global state.
+    #[test]
+    fn from_env_reads_the_real_environment() {
         let _env = crate::test_env::lock_env();
         std::env::set_var("GHOSTFRAME_TEST_FORCE_FRAME_MODE", "h264");
         assert_eq!(
             ClassifierConfig::from_env().force_frame_mode,
             Some(FrameMode::H264)
         );
-        std::env::set_var("GHOSTFRAME_TEST_FORCE_FRAME_MODE", "tile");
-        assert_eq!(
-            ClassifierConfig::from_env().force_frame_mode,
-            Some(FrameMode::TileCodec)
-        );
         std::env::remove_var("GHOSTFRAME_TEST_FORCE_FRAME_MODE");
-        assert_eq!(ClassifierConfig::from_env().force_frame_mode, None);
-        std::env::set_var("GHOSTFRAME_TEST_FORCE_FRAME_MODE", "bogus");
-        assert_eq!(
-            ClassifierConfig::from_env().force_frame_mode, None,
-            "an unrecognised value must be ignored, not guessed at"
-        );
-        std::env::remove_var("GHOSTFRAME_TEST_FORCE_FRAME_MODE");
-    }
-
-    #[test]
-    fn force_tilecodec_is_an_alias_for_tile_mode() {
-        let _env = crate::test_env::lock_env();
-        std::env::set_var("GHOSTFRAME_FORCE_TILECODEC", "1");
-        assert_eq!(
-            ClassifierConfig::from_env().force_frame_mode,
-            Some(FrameMode::TileCodec)
-        );
-        std::env::set_var("GHOSTFRAME_FORCE_TILECODEC", "true");
-        assert_eq!(
-            ClassifierConfig::from_env().force_frame_mode,
-            Some(FrameMode::TileCodec)
-        );
-        // Any other value is ignored, not an error.
-        std::env::set_var("GHOSTFRAME_FORCE_TILECODEC", "0");
-        assert_eq!(ClassifierConfig::from_env().force_frame_mode, None);
-        std::env::remove_var("GHOSTFRAME_FORCE_TILECODEC");
-    }
-
-    #[test]
-    fn classifier_config_filters_out_of_range_values() {
-        let _env = crate::test_env::lock_env();
-        // loss_override_threshold accepts (0.0, 1.0]; bias and headroom accept > 0.0
-        std::env::set_var("GHOSTFRAME_TEST_LOSS_OVERRIDE_THRESHOLD", "1.5");
-        assert_eq!(ClassifierConfig::from_env().loss_override_threshold, None);
-        std::env::set_var("GHOSTFRAME_TEST_LOSS_OVERRIDE_THRESHOLD", "0.5");
-        assert_eq!(
-            ClassifierConfig::from_env().loss_override_threshold,
-            Some(0.5)
-        );
-        std::env::set_var("GHOSTFRAME_TEST_HEADROOM_MIN_BPUS", "-1");
-        assert_eq!(ClassifierConfig::from_env().headroom_min_bpus, None);
-        std::env::remove_var("GHOSTFRAME_TEST_LOSS_OVERRIDE_THRESHOLD");
-        std::env::remove_var("GHOSTFRAME_TEST_HEADROOM_MIN_BPUS");
     }
 }
