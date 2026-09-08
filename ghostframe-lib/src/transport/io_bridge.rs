@@ -84,7 +84,25 @@ use crate::transport::webtransport::WebTransportServer;
 /// — both read the wall clock and saturate to `0ns` against a virtual
 /// instant. Compute durations with `now_std().duration_since(earlier)`
 /// instead, where `earlier` also came from `now_std()`.
+///
+/// `pub` under `cfg(test)` / `browserless-harness` (mirroring
+/// `new_with_stream_for_test`) so the harness in `ghostframe-e2e` can stamp
+/// its own timestamps on tokio's clock; `pub(crate)` otherwise, since
+/// production code only ever needs this from within the crate.
+#[cfg(any(test, feature = "browserless-harness"))]
+pub fn now_std() -> std::time::Instant {
+    now_std_impl()
+}
+
+/// See the `pub` variant's doc comment above (the two are cfg-gated
+/// alternatives of the same function, not a public/private pair with
+/// different behavior).
+#[cfg(not(any(test, feature = "browserless-harness")))]
 pub(crate) fn now_std() -> std::time::Instant {
+    now_std_impl()
+}
+
+fn now_std_impl() -> std::time::Instant {
     tokio::time::Instant::now().into_std()
 }
 
@@ -6422,11 +6440,18 @@ mod tests {
     /// That test proves `BweWrapper::update` behaves correctly when fed
     /// `now_std()` timestamps by hand, but it constructs a bare `BweWrapper`
     /// and calls `update()` itself — `IoBridge` is never instantiated. It
-    /// would keep passing even if the two production call sites that
-    /// actually feed the estimator were reverted to a bare
-    /// `std::time::Instant::now()`: the `now_for_samples` stamp in
-    /// `dispatch_ack_datagram` (used for each `BweSample`'s `received_at`)
-    /// and the `self.bwe.update(&records, now_std())` drain inside `run()`.
+    /// would keep passing even if the ONE production call site that
+    /// actually feeds the estimator's clock — `self.bwe.update(&records,
+    /// now_std())` in the drain inside `run()` — were reverted to a bare
+    /// `std::time::Instant::now()`.
+    ///
+    /// (`dispatch_ack_datagram` also stamps a `now_for_samples = now_std()`
+    /// for each `BweSample`'s `received_at` field, but `received_at` is
+    /// `#[allow(dead_code)]` and staged for a Phase 2 consumer — the drain
+    /// this test exercises only reads `server_emit_ms_lo16` /
+    /// `client_arrival_ms_lo16` off each sample, so `now_for_samples` is
+    /// NOT load-bearing for what this test actually proves. Don't cite it
+    /// as a second discriminating site.)
     ///
     /// This test drives the real wiring instead: it seeds the
     /// retransmit-cache exactly as real emitted tile passes would, feeds an
@@ -6438,9 +6463,9 @@ mod tests {
     /// tokio's *virtual* clock between two such rounds (mirroring the
     /// shape of `bwe_window_flushes_on_virtual_time`: 50 acks — the wire
     /// format caps one batch at 72 entries — then 50 more 250ms of
-    /// virtual time later) and asserts the EWMA estimate
-    /// actually moves off its seed — only possible if both call sites read
-    /// virtual, not wall, time.
+    /// virtual time later) and asserts the EWMA estimate actually moves off
+    /// its seed — only possible if the drain's `self.bwe.update(...)` call
+    /// reads virtual, not wall, time.
     #[tokio::test(start_paused = true)]
     async fn bwe_estimate_advances_through_bridge_production_wiring() {
         use crate::transport::ack::{AckBatch, AckEntry};
@@ -6479,11 +6504,9 @@ mod tests {
                 // fragments[0][12..16] big-endian = server emit time, µs.
                 let mut frag = vec![0u8; 20];
                 frag[12..16].copy_from_slice(&1_000_000u32.to_be_bytes());
-                bridge.reliable_emitter.submit_one(
-                    key,
-                    bytes::Bytes::from(frag),
-                    std::time::Instant::now(),
-                );
+                bridge
+                    .reliable_emitter
+                    .submit_one(key, bytes::Bytes::from(frag), super::now_std());
                 entries.push(AckEntry {
                     frame_seq,
                     tile_x: 1,

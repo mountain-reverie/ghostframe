@@ -18,8 +18,11 @@ m3 = []
 test-loss-injection = []
 # Exposes the IoBridge socketpair constructors outside of cfg(test), for the
 # browserless e2e harness in ghostframe-e2e. Will also gate the tile-injection
-# channel once that lands.
-browserless-harness = []
+# channel once that lands. Pulls in tokio's `test-util` feature (`pause()` /
+# `advance()`) explicitly -- the harness runs the real IoBridge event loop
+# under a paused tokio clock, and that's a real dependency of this feature,
+# not an incidental side effect of some other feature enabling it.
+browserless-harness = ["tokio/test-util"]
 # Cdf53 GPU-vs-CPU diagnostic instrumentation: GHOSTFRAME_CDF53_DIFF_TILE
 # one-shot diff log on the io_bridge encode path, GHOSTFRAME_CDF53_SKIP_L2_L3
 # / GHOSTFRAME_CDF53_SKIP_L3 env-var gates on the GPU forward pipeline, and
