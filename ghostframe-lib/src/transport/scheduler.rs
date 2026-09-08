@@ -184,10 +184,26 @@ impl Scheduler {
         self.generations.get(idx).copied().unwrap_or(0)
     }
 
-    pub fn enqueue(&mut self, mut work: TileWork) {
+    /// Thin wrapper over `enqueue_at` using the wall clock. Non-harness
+    /// callers (and the bulk of this module's own tests) use this; the
+    /// browserless harness calls `enqueue_at` directly with tokio's
+    /// (possibly paused) clock.
+    pub fn enqueue(&mut self, work: TileWork) {
+        self.enqueue_at(work, Instant::now());
+    }
+
+    /// Same as `enqueue`, but takes the caller's `now` instead of reading
+    /// `Instant::now()` internally. This is what makes retry timing work
+    /// under a paused/virtual tokio clock: the `queued_at` overwrite below
+    /// stamps whatever time the caller is actually operating on.
+    ///
+    /// Note: this overwrites `work.queued_at` with `now`, discarding
+    /// whatever the caller set on the `TileWork` — that's pre-existing
+    /// behavior, not a bug introduced here.
+    pub fn enqueue_at(&mut self, mut work: TileWork, now: Instant) {
         debug_assert!((work.tile_x as u32) < self.cols, "tile_x out of bounds");
         debug_assert!((work.tile_y as u32) < self.rows, "tile_y out of bounds");
-        work.queued_at = Instant::now();
+        work.queued_at = now;
         work.last_sent_at = None;
         work.state = WorkState::Pending;
         self.priority_queue.push_back(work);
@@ -507,7 +523,20 @@ impl Scheduler {
     /// - Refinement queue is drained in pass-major order under a hard budget cap.
     ///
     /// Pass `usize::MAX` to disable budgeting (M3.1 call sites do this).
+    ///
+    /// Thin wrapper over `tick_at` using the wall clock; see that method
+    /// for the harness-facing variant that takes an explicit `now`.
     pub fn tick(&mut self, budget_bytes: usize) -> Vec<TileWork> {
+        self.tick_at(budget_bytes, Instant::now())
+    }
+
+    /// Same as `tick`, but takes the caller's `now` instead of reading
+    /// `Instant::now()` internally, so the 2xRTT retry gate in
+    /// `drain_priority_queue` (and the refinement `last_sent_at` stamp in
+    /// `drain_refinement_pass_major`) advance on tokio's clock rather than
+    /// the wall clock. This is what makes retransmission observable under
+    /// `tokio::time::pause()` in the browserless harness.
+    pub fn tick_at(&mut self, budget_bytes: usize, now: Instant) -> Vec<TileWork> {
         let fraction = self.refinement_bandwidth_fraction;
         let mut refinement_budget = (budget_bytes as f32 * fraction) as usize;
         let mut priority_budget = budget_bytes.saturating_sub(refinement_budget);
@@ -523,10 +552,17 @@ impl Scheduler {
 
         let mut emitted = Vec::new();
         let rtt = self.rtt;
-        Self::drain_priority_queue(&mut self.priority_queue, priority_budget, rtt, &mut emitted);
+        Self::drain_priority_queue(
+            &mut self.priority_queue,
+            priority_budget,
+            rtt,
+            now,
+            &mut emitted,
+        );
         Self::drain_refinement_pass_major(
             &mut self.refinement_queue,
             refinement_budget,
+            now,
             &mut emitted,
         );
 
@@ -542,9 +578,9 @@ impl Scheduler {
         queue: &mut VecDeque<TileWork>,
         budget: usize,
         rtt: Duration,
+        now: Instant,
         out: &mut Vec<TileWork>,
     ) {
-        let now = Instant::now();
         let retry_after = 2 * rtt;
 
         // Drop terminal-state entries first.
@@ -578,6 +614,7 @@ impl Scheduler {
     fn drain_refinement_pass_major(
         queue: &mut VecDeque<TileWork>,
         budget: usize,
+        now: Instant,
         out: &mut Vec<TileWork>,
     ) {
         // Drop terminal-state entries first. Mirrors drain_priority_queue.
@@ -598,7 +635,7 @@ impl Scheduler {
                         return;
                     }
                     let mut work = queue.remove(idx).unwrap();
-                    work.last_sent_at = Some(Instant::now());
+                    work.last_sent_at = Some(now);
                     work.state = WorkState::InFlight;
                     spent += cost;
                     out.push(work);
@@ -661,7 +698,22 @@ impl Scheduler {
 
     /// Enqueue all passes for a refinement tile. Each pass becomes one
     /// TileWork with pass_idx 0..passes.len()-1 and total_passes = passes.len().
+    ///
+    /// Thin wrapper over `enqueue_refinement_at` using the wall clock.
     pub fn enqueue_refinement(&mut self, tile_x: u8, tile_y: u8, gen: u8, passes: Vec<Vec<u8>>) {
+        self.enqueue_refinement_at(tile_x, tile_y, gen, passes, Instant::now());
+    }
+
+    /// Same as `enqueue_refinement`, but takes the caller's `now` instead
+    /// of reading `Instant::now()` internally.
+    pub fn enqueue_refinement_at(
+        &mut self,
+        tile_x: u8,
+        tile_y: u8,
+        gen: u8,
+        passes: Vec<Vec<u8>>,
+        now: Instant,
+    ) {
         let total = passes.len() as u8;
         for (pass_idx, payload) in passes.into_iter().enumerate() {
             self.refinement_queue.push_back(TileWork {
@@ -672,7 +724,7 @@ impl Scheduler {
                 total_passes: total,
                 codec: Codec::Cdf53,
                 payload,
-                queued_at: Instant::now(),
+                queued_at: now,
                 last_sent_at: None,
                 state: WorkState::Pending,
             });
@@ -690,6 +742,8 @@ impl Scheduler {
     /// 14-pass progressive emission, not as a fresh series of N short
     /// emissions. The caller's mask preserves the partial-bitmap state
     /// the client already built up for this generation.
+    ///
+    /// Thin wrapper over `enqueue_refinement_subset_at` using the wall clock.
     pub fn enqueue_refinement_subset(
         &mut self,
         tile_x: u8,
@@ -697,6 +751,21 @@ impl Scheduler {
         gen: u8,
         pass_mask: u16,
         payloads: Vec<Vec<u8>>,
+    ) {
+        self.enqueue_refinement_subset_at(tile_x, tile_y, gen, pass_mask, payloads, Instant::now());
+    }
+
+    /// Same as `enqueue_refinement_subset`, but takes the caller's `now`
+    /// instead of reading `Instant::now()` internally.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_refinement_subset_at(
+        &mut self,
+        tile_x: u8,
+        tile_y: u8,
+        gen: u8,
+        pass_mask: u16,
+        payloads: Vec<Vec<u8>>,
+        now: Instant,
     ) {
         debug_assert_eq!(
             pass_mask.count_ones() as usize,
@@ -717,7 +786,7 @@ impl Scheduler {
                 total_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
                 codec: Codec::Cdf53,
                 payload,
-                queued_at: Instant::now(),
+                queued_at: now,
                 last_sent_at: None,
                 state: WorkState::Pending,
             });
@@ -854,6 +923,36 @@ mod tests {
         std::thread::sleep(Duration::from_millis(15));
         let third = s.tick(usize::MAX);
         assert_eq!(third.len(), 1, "InFlight work should retry after 2×RTT");
+    }
+
+    #[test]
+    fn inflight_work_becomes_retryable_after_two_rtts_of_injected_time() {
+        // Companion to `tick_retries_inflight_after_2x_rtt`, but drives the
+        // 2xRTT gate entirely through injected `Instant` values instead of
+        // `std::thread::sleep`. Under `tokio::time::pause()` in the
+        // browserless harness, no wall-clock time ever passes, so if
+        // `tick_at`/`enqueue_at` silently fell back to `Instant::now()`
+        // internally, this would fail even though the wall-clock sibling
+        // test above keeps passing.
+        let mut s = Scheduler::new(4, 4);
+        s.set_rtt(Duration::from_millis(50));
+        let t0 = Instant::now();
+        s.enqueue_at(TileWork::raw_for_test(0, 0, 0, vec![1, 2, 3]), t0);
+
+        // Drain once so the item goes InFlight.
+        let first = s.tick_at(usize::MAX, t0);
+        assert_eq!(first.len(), 1, "the pending item must drain once");
+        assert!(
+            s.tick_at(usize::MAX, t0).is_empty(),
+            "must not retry immediately"
+        );
+
+        // 2 x RTT later it is eligible again, with no wall-clock time having passed.
+        let later = t0 + Duration::from_millis(100);
+        assert!(
+            !s.tick_at(usize::MAX, later).is_empty(),
+            "must retry after 2xRTT of injected time"
+        );
     }
 
     #[test]
