@@ -78,10 +78,19 @@ impl ClientEndpoint {
         {
             None => {}
             Some(DatagramEvent::NewConnection(_incoming)) => {
-                unreachable!(
+                // Unreachable today: quinn-proto only produces this when a
+                // ServerConfig is installed, and `new()` passes `None`. Loud in
+                // debug so a future change that installs one is caught at once;
+                // dropped rather than panicking in release, because this is the
+                // datagram path of a crate that becomes the native client, and
+                // `ClientCore`'s contract next door is that hostile input never
+                // panics. An inbound packet must not be able to kill the client.
+                debug_assert!(
+                    false,
                     "client-only ClientEndpoint received DatagramEvent::NewConnection; \
                      no ServerConfig is installed, so quinn-proto should never produce this"
                 );
+                tracing::error!("ignoring unexpected NewConnection on a client-only endpoint");
             }
             Some(DatagramEvent::ConnectionEvent(ch, event)) => {
                 if self.conn.as_ref().is_some_and(|(c, _)| *c == ch) {
