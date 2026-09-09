@@ -1649,6 +1649,7 @@ dependencies = [
  "ghostframe-client-core",
  "ghostframe-lib",
  "ghostframe-protocol",
+ "hex",
  "proptest",
  "quinn-proto",
  "rcgen",
@@ -1657,6 +1658,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "url",
+ "web-time",
  "web-transport-proto",
 ]
 
