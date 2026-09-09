@@ -15,6 +15,7 @@ pub mod e2e_setup;
 pub mod fixtures;
 pub mod pixels;
 pub mod scene;
+pub mod scene_tiles;
 pub mod transport;
 pub mod weston;
 
