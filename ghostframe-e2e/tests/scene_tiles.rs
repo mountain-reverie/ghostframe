@@ -198,3 +198,39 @@ fn pal_rle_panics_over_the_palette_limit() {
         0,
     );
 }
+
+/// Guards the `now_std()` stamping in `encode_tile`.
+///
+/// The plan for this task said to fill `queued_at` with `Instant::now()`.
+/// That reads the wall clock, while every later netsim task runs under
+/// `#[tokio::test(start_paused = true)]` on tokio's virtual clock. The two
+/// do not merely disagree — `Instant::duration_since` *saturates to zero*
+/// rather than erroring, so a wall-clock `queued_at` produces silently
+/// wrong retry and staleness timing that no assertion downstream would
+/// catch.
+///
+/// Advancing the virtual clock an hour separates the two: `now_std()`
+/// follows it, `Instant::now()` does not.
+#[tokio::test(start_paused = true)]
+async fn queued_at_is_stamped_from_the_virtual_clock() {
+    use ghostframe_lib::transport::io_bridge::now_std;
+    use std::time::Duration;
+
+    tokio::time::advance(Duration::from_secs(3600)).await;
+
+    let work = encode_tile(
+        &TileSpec::Solid {
+            bgra: [1, 2, 3, 255],
+        },
+        0,
+        0,
+        0,
+    );
+    let skew = now_std().duration_since(work[0].queued_at);
+    assert!(
+        skew < Duration::from_millis(10),
+        "queued_at must be stamped from the virtual clock, but it lags \
+         now_std() by {skew:?} — it was almost certainly taken from \
+         std::time::Instant::now()"
+    );
+}
