@@ -34,14 +34,17 @@ pub struct NetSim {
     profile: NetProfile,
     rng: DetRng,
 
-    // Gilbert-Elliott state.
-    #[allow(dead_code)]
+    // State for impairments this task does not yet apply. `decide` currently
+    // implements only the independent-loss roll; the Gilbert-Elliott burst
+    // state is read once burst loss lands, and the token-bucket pair once the
+    // bandwidth cap does. Kept rather than added later so the struct's shape
+    // is settled — but the suppressions below should disappear as each lands,
+    // and a leftover one means an impairment silently never got wired up.
+    #[allow(dead_code, reason = "read once burst loss is implemented")]
     in_burst: bool,
-
-    // Token bucket state for bandwidth cap.
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "read once the token-bucket cap is implemented")]
     tokens: f64,
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "read once the token-bucket cap is implemented")]
     last_refill_us: u64,
 
     /// The seed used to construct this simulator; logged in test diagnostics.
