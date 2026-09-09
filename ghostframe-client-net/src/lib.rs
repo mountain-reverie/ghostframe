@@ -6,6 +6,7 @@
 //! tests it is the netsim.
 
 mod event;
+pub mod tls;
 
 pub use event::{ClientNetError, ClientNetEvent, UdpOut};
 
