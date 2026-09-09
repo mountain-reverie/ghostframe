@@ -138,11 +138,15 @@ fn corruption_fires_at_roughly_the_configured_rate_and_bit_index_in_range() {
 
 #[test]
 fn fixed_seed_full_profile_is_bit_for_bit_reproducible() {
-    // Regression test: this is what protects every recorded seed in every
-    // future failure report. If the rng draw order ever changes, this test
-    // will still pass (it compares two fresh runs against each other, not
-    // against a hardcoded golden value) — its job is only to catch runs
-    // that are non-deterministic given identical inputs.
+    // Regression test protecting every recorded seed in every future failure
+    // report. It makes two assertions with distinct jobs, and both are needed:
+    //
+    //  - run() == run() catches non-determinism given identical inputs, but
+    //    cannot catch a changed draw order (`decide` is a pure function of
+    //    seed, profile and inputs, so two runs in one build always agree).
+    //  - the GOLDEN_DIGEST comparison below is the one that catches a changed
+    //    rng algorithm or draw order, by pinning the values this profile
+    //    produced when the constant was recorded.
     fn run() -> Vec<Verdict> {
         let profile = NetProfile {
             loss: 0.05,
