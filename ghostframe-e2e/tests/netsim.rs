@@ -262,3 +262,65 @@ fn delivered_rate_tracks_the_cap_across_a_step_down() {
         "post-step rate {bps_after} must track 250 kB/s"
     );
 }
+
+#[test]
+fn adding_a_cap_does_not_shift_the_rng_draw_sequence() {
+    // The cap must be applied *after* every rng draw, never as an early
+    // return. If a bandwidth drop short-circuited ahead of the draws, a
+    // profile merely having a cap would consume a different number of rng
+    // values and desynchronise the stream — silently invalidating every
+    // seed recorded in a past failure report.
+    //
+    // The golden test cannot catch that: its profile is uncapped, so the
+    // bucket never bites there. This one runs the same seed and the same
+    // impairment profile twice, differing *only* in the cap, and asserts the
+    // surviving verdicts are positionally identical to the uncapped run.
+    // Under a correct implementation the cap can subtract deliveries but can
+    // never alter one, because it draws nothing.
+    fn run(cap: CapTimeline) -> Vec<Verdict> {
+        let profile = NetProfile {
+            loss: 0.05,
+            burst_enter: 0.02,
+            burst_exit: 0.30,
+            burst_loss: 0.50,
+            duplicate: 0.05,
+            corrupt: 0.05,
+            delay_us: 10_000,
+            jitter_us: 2_000,
+            reorder_us: 500,
+            cap,
+        };
+        let mut sim = NetSim::new(profile, 1234);
+        (0..500).map(|i| sim.decide(1200, 500 * i as u64)).collect()
+    }
+
+    let uncapped = run(CapTimeline::unlimited());
+    let capped = run(CapTimeline::constant(400_000));
+
+    let mut converted_to_drop = 0;
+    for (i, (u, c)) in uncapped.iter().zip(capped.iter()).enumerate() {
+        if u == c {
+            continue;
+        }
+        match (u, c) {
+            // The cap may drop a datagram the uncapped link delivered...
+            (_, Verdict::Drop) => converted_to_drop += 1,
+            // ...or afford one copy of a duplicate but not both, keeping the
+            // original's arrival time untouched.
+            (Verdict::Duplicate { at_us: uat, .. }, Verdict::Deliver { at_us: cat })
+                if uat == cat => {}
+            _ => panic!(
+                "verdict {i} changed in a way the cap cannot explain: \
+                 uncapped {u:?} vs capped {c:?} — the draw order moved"
+            ),
+        }
+    }
+
+    // Guard against the assertion above passing vacuously: if the cap never
+    // bit, the two runs would be identical and prove nothing.
+    assert!(
+        converted_to_drop > 50,
+        "cap only converted {converted_to_drop} verdicts to Drop; it must \
+         actually bite for this test to mean anything"
+    );
+}
