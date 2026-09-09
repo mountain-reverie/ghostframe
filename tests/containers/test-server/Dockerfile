@@ -40,6 +40,10 @@ COPY ghostframe-protocol/ ghostframe-protocol/
 # Workspace member not built here; Cargo.toml + src/ satisfy manifest resolution.
 COPY ghostframe-client-core/Cargo.toml ghostframe-client-core/Cargo.toml
 COPY ghostframe-client-core/src/ ghostframe-client-core/src/
+# Same again for ghostframe-client-net: not built here, but a workspace member,
+# so cargo refuses to resolve the manifest without it.
+COPY ghostframe-client-net/Cargo.toml ghostframe-client-net/Cargo.toml
+COPY ghostframe-client-net/src/ ghostframe-client-net/src/
 # Workspace members not built here but required for cargo to resolve the
 # workspace manifest.
 COPY ghostframe-e2e/Cargo.toml ghostframe-e2e/Cargo.toml
