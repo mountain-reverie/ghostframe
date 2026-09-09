@@ -22,6 +22,7 @@ use crate::event::ClientNetError;
 
 /// Result of attempting to advance the handshake by reading the session
 /// stream.
+#[derive(Debug)]
 pub(crate) enum ConnectOutcome {
     /// Not enough bytes yet to decode a full `ConnectResponse`; call again
     /// once more data has arrived.
@@ -124,7 +125,14 @@ impl WebTransportHandshake {
             Ok(bytes) => self.response_buf.extend_from_slice(&bytes),
             Err(e) => return ConnectOutcome::Rejected(format!("stream read: {e}")),
         }
+        self.try_decode_response()
+    }
 
+    /// Attempt to decode a `ConnectResponse` from whatever has accumulated so
+    /// far. Split out from `on_readable` so the fragmentation behaviour is
+    /// testable without fabricating a live `quinn_proto::Connection` — see
+    /// `response_split_across_arbitrary_chunks_still_decodes`.
+    pub(crate) fn try_decode_response(&mut self) -> ConnectOutcome {
         let mut slice: &[u8] = &self.response_buf;
         match ConnectResponse::decode(&mut slice) {
             Ok(resp) => {
@@ -173,4 +181,64 @@ fn drain_stream(conn: &mut Connection, sid: StreamId) -> Result<Vec<u8>, String>
     }
     let _ = chunks.finalize();
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use web_transport_proto::ConnectResponse;
+
+    /// The response must survive arriving in arbitrarily small pieces.
+    ///
+    /// A QUIC STREAM frame boundary has nothing to do with an HTTP/3 frame
+    /// boundary, so a single read handing over only part of the response is
+    /// the normal case once the netsim starts fragmenting and delaying
+    /// delivery on purpose. Feeding the encoded bytes one at a time is the
+    /// worst case: every prefix but the last must report `Pending`, and the
+    /// final byte must flip it to `Accepted`.
+    #[test]
+    fn response_split_across_arbitrary_chunks_still_decodes() {
+        let mut encoded = bytes::BytesMut::new();
+        ConnectResponse::OK.encode(&mut encoded).expect("encode");
+        assert!(
+            encoded.len() > 1,
+            "a one-byte response would not test anything"
+        );
+
+        let mut hs = WebTransportHandshake::new();
+        for (i, byte) in encoded.iter().enumerate() {
+            hs.response_buf.extend_from_slice(&[*byte]);
+            let outcome = hs.try_decode_response();
+            if i + 1 < encoded.len() {
+                assert!(
+                    matches!(outcome, ConnectOutcome::Pending),
+                    "byte {} of {}: a partial response must be Pending, got {:?}",
+                    i + 1,
+                    encoded.len(),
+                    outcome
+                );
+            } else {
+                assert!(
+                    matches!(outcome, ConnectOutcome::Accepted),
+                    "the final byte must complete the handshake, got {outcome:?}"
+                );
+            }
+        }
+    }
+
+    /// A well-formed non-200 response is a rejection, not a stall.
+    #[test]
+    fn non_200_response_is_rejected_not_pending() {
+        let mut encoded = bytes::BytesMut::new();
+        ConnectResponse::new(web_transport_proto::http::StatusCode::FORBIDDEN)
+            .encode(&mut encoded)
+            .expect("encode");
+
+        let mut hs = WebTransportHandshake::new();
+        hs.response_buf.extend_from_slice(&encoded);
+        assert!(matches!(
+            hs.try_decode_response(),
+            ConnectOutcome::Rejected(_)
+        ));
+    }
 }
