@@ -8,6 +8,7 @@
 mod clock;
 mod endpoint;
 mod event;
+mod handshake;
 pub mod tls;
 
 use std::net::SocketAddr;
@@ -19,6 +20,7 @@ use quinn_proto::TransportConfig;
 
 use clock::Instant;
 use endpoint::ClientEndpoint;
+use handshake::{ConnectOutcome, WebTransportHandshake};
 
 pub use event::{ClientNetError, ClientNetEvent, UdpOut};
 
@@ -36,6 +38,7 @@ pub struct ClientNet {
     config: ClientNetConfig,
     connected: bool,
     endpoint: ClientEndpoint,
+    handshake: WebTransportHandshake,
     events: Vec<ClientNetEvent>,
     /// Wall-clock anchor captured once at construction. Every other piece of
     /// timing in this crate is injected microseconds (`now_us`); this is the
@@ -67,6 +70,7 @@ impl ClientNet {
             config,
             connected: false,
             endpoint: ClientEndpoint::new(),
+            handshake: WebTransportHandshake::new(),
             events: Vec::new(),
             base: Instant::now(),
         })
@@ -129,8 +133,11 @@ impl ClientNet {
 
     /// Poll `quinn_proto::Event`s off the active connection and translate
     /// the ones this crate currently understands into `ClientNetEvent`s.
-    /// Stream and datagram events are WebTransport's concern (Task 7) and
-    /// are left unhandled here.
+    ///
+    /// `Connected` kicks off the WebTransport handshake (opens the SETTINGS
+    /// and CONNECT streams); `Stream(StreamEvent::Readable)` on the session
+    /// stream drives it forward until the CONNECT response decodes.
+    /// Datagram events are Task 8's concern and are left unhandled here.
     fn drain_connection_events(&mut self) {
         let Some(conn) = self.endpoint.connection() else {
             return;
@@ -140,6 +147,24 @@ impl ClientNet {
                 quinn_proto::Event::Connected => {
                     self.connected = true;
                     self.events.push(ClientNetEvent::Connected);
+                    if let Err(e) = self.handshake.start(conn, &self.config.server_name) {
+                        self.events.push(ClientNetEvent::ConnectionLost {
+                            reason: e.to_string(),
+                        });
+                    }
+                }
+                quinn_proto::Event::Stream(quinn_proto::StreamEvent::Readable { id }) => {
+                    if self.handshake.session_stream() == Some(id) {
+                        match self.handshake.on_readable(conn, id) {
+                            ConnectOutcome::Pending => {}
+                            ConnectOutcome::Accepted => {
+                                self.events.push(ClientNetEvent::SessionReady);
+                            }
+                            ConnectOutcome::Rejected(reason) => {
+                                self.events.push(ClientNetEvent::ConnectionLost { reason });
+                            }
+                        }
+                    }
                 }
                 quinn_proto::Event::ConnectionLost { reason } => {
                     self.connected = false;
