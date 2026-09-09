@@ -5,9 +5,11 @@
 //! with the same seed.
 
 pub mod profile;
+pub mod pump;
 pub mod rng;
 
 pub use profile::{CapTimeline, NetProfile};
+pub use pump::SocketPairPump;
 pub use rng::DetRng;
 
 /// The fate of a single datagram as determined by the network simulator.
