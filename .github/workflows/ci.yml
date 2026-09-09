@@ -49,6 +49,23 @@ jobs:
         with:
           shared-key: ci-fast
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: ghostframe-lib reads env only in config.rs
+        run: |
+          # Comment lines are excluded deliberately: the guard constrains code,
+          # not prose. Matching comments would push authors to stop naming
+          # `env::var` in documentation, which is the opposite of useful.
+          #
+          # gpu_pipeline/frame.rs is exempt: its three cdf53-diag reads sit in
+          # the Vulkan dispatch path, where threading config through is a much
+          # larger change. They are feature-gated and race nothing; tracked as
+          # deferred work in docs/superpowers/plans/2026-09-08-lib-config.md.
+          if grep -rn 'env::var' ghostframe-lib/src --include='*.rs' \
+               | grep -v '^ghostframe-lib/src/config.rs' \
+               | grep -v '^ghostframe-lib/src/capture/gpu_pipeline/frame.rs' \
+               | grep -vE ':[0-9]+: *(//|///|//!)'; then
+            echo "::error::ghostframe-lib must read std::env only in config.rs"
+            exit 1
+          fi
 
   unit:
     name: unit
