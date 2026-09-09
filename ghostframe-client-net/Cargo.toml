@@ -15,7 +15,17 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 url = "2"
 
+# Mirrors quinn-proto's own wasm-vs-native `Instant` switch (see
+# src/clock.rs): quinn-proto's public methods are monomorphized against
+# `web_time::Instant` on wasm32-unknown-unknown, so we need the same
+# `Instant` type to call them. Pinned to the version quinn-proto 0.11.14
+# itself resolves to (see Cargo.lock) so we can't drift into a mismatched
+# `web-time` release.
+[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
+web-time = "=1.1.0"
+
 [dev-dependencies]
 ghostframe-lib = { path = "../ghostframe-lib" }
 rcgen = { workspace = true }
 proptest = "1"
+hex = { workspace = true }
