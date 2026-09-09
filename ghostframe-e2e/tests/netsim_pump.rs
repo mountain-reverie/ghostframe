@@ -17,6 +17,11 @@ async fn pump_round_trips_a_framed_datagram() {
 
     let frame = encode_frame(b"hello", &addr);
     ours.write_all(&frame).await.expect("write");
+    // Close the write half after writing. Every test here does this so that a
+    // framing regression fails fast with UnexpectedEof: with the write half
+    // left open, a desynced `read_exact` blocks forever, turning a clean test
+    // failure into a CI job timeout with no diagnostic.
+    ours.shutdown().await.expect("shutdown");
 
     let got = pump.recv().await.expect("recv");
     assert_eq!(got.payload, b"hello");
@@ -43,6 +48,7 @@ async fn pump_recv_handles_two_back_to_back_frames() {
     both.extend_from_slice(&frame1);
     both.extend_from_slice(&frame2);
     ours.write_all(&both).await.expect("write");
+    ours.shutdown().await.expect("shutdown");
 
     let got1 = pump.recv().await.expect("recv frame1");
     assert_eq!(got1.payload, b"first-payload");
@@ -82,6 +88,7 @@ async fn pump_recv_rejects_absurd_total_len_without_allocating() {
     header.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
     header.extend_from_slice(&0u32.to_be_bytes());
     ours.write_all(&header).await.expect("write header");
+    ours.shutdown().await.expect("shutdown");
 
     let err = pump.recv().await.expect_err("must reject absurd total_len");
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
@@ -100,6 +107,7 @@ async fn pump_recv_accepts_a_legitimate_large_frame() {
 
     let frame = encode_frame(&payload, &addr);
     ours.write_all(&frame).await.expect("write");
+    ours.shutdown().await.expect("shutdown");
 
     let got = pump.recv().await.expect("recv large frame");
     assert_eq!(got.payload, payload);
