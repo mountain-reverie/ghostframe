@@ -1,6 +1,6 @@
 //! Tests for the netsim module: RNG determinism and loss rate accuracy.
 
-use ghostframe_e2e::netsim::{DetRng, NetProfile, NetSim, Verdict};
+use ghostframe_e2e::netsim::{CapTimeline, DetRng, NetProfile, NetSim, Verdict};
 
 #[test]
 fn identical_seeds_produce_identical_streams() {
@@ -226,4 +226,39 @@ fn digest(verdicts: &[Verdict]) -> u64 {
         }
     }
     acc
+}
+
+#[test]
+fn delivered_rate_tracks_the_cap_across_a_step_down() {
+    let profile = NetProfile {
+        cap: CapTimeline::step(1_000_000, 500_000, 250_000), // 1 MB/s, then 250 kB/s at t=0.5s
+        ..NetProfile::perfect()
+    };
+    let mut sim = NetSim::new(profile, 11);
+
+    // Offer 1200-byte datagrams every 500 µs for one second.
+    let mut delivered_before = 0usize;
+    let mut delivered_after = 0usize;
+    let mut now_us = 0u64;
+    while now_us < 1_000_000 {
+        if !matches!(sim.decide(1200, now_us), Verdict::Drop) {
+            if now_us < 500_000 {
+                delivered_before += 1200;
+            } else {
+                delivered_after += 1200;
+            }
+        }
+        now_us += 500;
+    }
+
+    let bps_before = delivered_before as f64 * 2.0; // half a second
+    let bps_after = delivered_after as f64 * 2.0;
+    assert!(
+        (bps_before - 1_000_000.0).abs() < 150_000.0,
+        "pre-step rate {bps_before} must track 1 MB/s"
+    );
+    assert!(
+        (bps_after - 250_000.0).abs() < 50_000.0,
+        "post-step rate {bps_after} must track 250 kB/s"
+    );
 }
