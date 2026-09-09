@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use ghostframe_client_core::{ClientConfig, ClientCore, PollOutput};
-use quinn_proto::TransportConfig;
+use quinn_proto::{Dir, StreamId, TransportConfig};
 use web_transport_proto::VarInt;
 
 use clock::Instant;
@@ -46,10 +46,22 @@ pub struct ClientNet {
     /// the session is live is never mistaken for tile traffic.
     session_ready: bool,
     /// `PollOutput::Stream` payloads (Hello, ReceiverFeedback, DecodeError)
-    /// drained from `core` before a feedback stream exists to carry them.
-    /// The next task opens that stream and flushes this; until then the
-    /// Hello queued by `ClientCore::new` would otherwise be lost.
+    /// drained from `core` before the feedback stream exists to carry them
+    /// (i.e. before `SessionReady`, which is when `feedback_stream` is
+    /// opened). The Hello queued by `ClientCore::new` is the only payload
+    /// that can accumulate here in practice — everything else `core`
+    /// produces is itself triggered by post-session traffic — but the
+    /// buffer stays generic so any output racing the stream-open is still
+    /// carried rather than dropped.
     pending_stream_out: Vec<Vec<u8>>,
+    /// Bidirectional stream carrying every `PollOutput::Stream` payload
+    /// (Hello, ReceiverFeedback, DecodeError) to the server. Opened once,
+    /// right after `SessionReady`: the server routes data arriving on any
+    /// bidi stream other than the session stream to its feedback queue
+    /// (`WebTransportServer::try_decode_connect`,
+    /// `webtransport.rs:362-372`), so no further handshake is needed on
+    /// this stream — the first write is itself the signal.
+    feedback_stream: Option<StreamId>,
     endpoint: ClientEndpoint,
     handshake: WebTransportHandshake,
     /// Sans-IO tile reassembly/decode state machine. Datagram payloads
@@ -98,6 +110,7 @@ impl ClientNet {
             connected: false,
             session_ready: false,
             pending_stream_out: Vec::new(),
+            feedback_stream: None,
             endpoint: ClientEndpoint::new(),
             handshake: WebTransportHandshake::new(),
             core,
@@ -255,15 +268,16 @@ impl ClientNet {
         // here — it made server-side loss invisible to the receiver's
         // `loss_rate`).
         //
-        // `PollOutput::Stream` (Hello, ReceiverFeedback, DecodeError — sent
-        // on a bidirectional feedback stream on the real client) has no
-        // transport yet; that is the next task. It must still be drained,
-        // because leaving it queued would block every `Datagram` output
-        // behind it in the same `VecDeque` — but it is moved into
-        // `pending_stream_out`, not discarded. `ClientCore::new` queues the
-        // Hello (carrying the client's caps) at construction, so dropping
-        // outputs here would lose it before a feedback stream ever exists
-        // and the server would never learn what this client supports.
+        // `PollOutput::Stream` (Hello, ReceiverFeedback, DecodeError) is
+        // held in `pending_stream_out` rather than written immediately: it
+        // must still be drained here, because leaving it queued in `core`
+        // would block every `Datagram` output behind it in the same
+        // `VecDeque`, but the feedback stream this crate writes it to may
+        // not be open yet (it opens on `SessionReady`, below). `ClientCore::
+        // new` queues the Hello (carrying the client's caps) at
+        // construction, so dropping outputs here would lose it before a
+        // feedback stream ever exists and the server would never learn what
+        // this client supports.
         //
         // This is inlined here (rather than split into a `&mut self`
         // helper method) because `conn` already holds a live borrow of
@@ -288,9 +302,33 @@ impl ClientNet {
                             }
                         }
                         PollOutput::Stream(bytes) => {
-                            // Held for the feedback stream the next task adds.
                             self.pending_stream_out.push(bytes);
                         }
+                    }
+                }
+            }
+
+            // Open the feedback stream the first time the session is ready
+            // (i.e. once, ever, per connection) so the server has something
+            // other than the session stream to route non-session bidi data
+            // to (see `feedback_stream`'s doc comment). Opening it here,
+            // after the `poll_transmit` drain above, means the very first
+            // write on it — on the same call that flips `session_ready` —
+            // can already include the Hello that's been waiting in
+            // `pending_stream_out` since construction.
+            if self.feedback_stream.is_none() {
+                match conn.streams().open(Dir::Bi) {
+                    Some(sid) => self.feedback_stream = Some(sid),
+                    None => tracing::warn!(
+                        "stream limit reached opening the feedback stream; \
+                         Hello/ReceiverFeedback/DecodeError will queue until one frees up"
+                    ),
+                }
+            }
+            if let Some(sid) = self.feedback_stream {
+                for bytes in self.pending_stream_out.drain(..) {
+                    if let Err(e) = conn.send_stream(sid).write(&bytes) {
+                        tracing::warn!(error = ?e, "feedback stream write failed");
                     }
                 }
             }
