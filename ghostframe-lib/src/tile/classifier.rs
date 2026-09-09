@@ -384,7 +384,7 @@ impl Default for Classifier {
 impl Classifier {
     /// Build a classifier from an explicit configuration. Overrides come
     /// from `config` rather than from process-global environment reads, so
-    /// callers (including tests) no longer need `crate::test_env::lock_env()`
+    /// callers (including tests) no longer need an environment lock
     /// to avoid racing other threads' `std::env::set_var` calls.
     pub fn new(config: crate::config::ClassifierConfig) -> Self {
         // Production builds compile none of the override assignments below, so

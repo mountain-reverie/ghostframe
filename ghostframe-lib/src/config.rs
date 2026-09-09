@@ -419,6 +419,27 @@ impl LibConfig {
 mod tests {
     use super::*;
 
+    /// Serialises the three tests below that read the *real* process
+    /// environment.
+    ///
+    /// `cargo test` runs tests as threads in one process, so `set_var` /
+    /// `remove_var` mutate state shared by all of them. Every other test in
+    /// this file parses via `from_lookup` with a fixture and needs no lock;
+    /// only the thin `from_env` wrappers touch the environment, and they would
+    /// clobber each other without this.
+    ///
+    /// This used to live in `crate::test_env` and guard twenty tests across
+    /// three modules. Threading `LibConfig` through constructors removed the
+    /// need for all but these three, so it moved here with them.
+    /// Poisoning is ignored: a panic in one of these must not cascade into
+    /// spurious failures in the others and obscure the real cause.
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn defaults_are_production_inert() {
         let cfg = LibConfig::default();
@@ -531,7 +552,7 @@ mod tests {
     /// are the only tests in this module that touch process-global state.
     #[test]
     fn from_env_reads_the_real_environment() {
-        let _env = crate::test_env::lock_env();
+        let _env = lock_env();
         std::env::set_var("GHOSTFRAME_TEST_FORCE_FRAME_MODE", "h264");
         assert_eq!(
             ClassifierConfig::from_env().force_frame_mode,
@@ -733,7 +754,7 @@ mod tests {
     /// environment.
     #[test]
     fn transport_config_from_env_reads_the_real_environment() {
-        let _env = crate::test_env::lock_env();
+        let _env = lock_env();
         std::env::set_var("GHOSTFRAME_FEC_K", "7");
         assert_eq!(TransportConfig::from_env().fec_k, Some(7));
         std::env::remove_var("GHOSTFRAME_FEC_K");
@@ -775,7 +796,7 @@ mod tests {
     /// reads it, even in production builds — see `from_lookup`'s doc comment.
     #[test]
     fn diagnostics_config_from_env_reads_the_real_environment() {
-        let _env = crate::test_env::lock_env();
+        let _env = lock_env();
         std::env::set_var("GHOSTFRAME_DIAGNOSE_TILES", "1");
         assert!(DiagnosticsConfig::from_env().diagnose_tiles);
         std::env::remove_var("GHOSTFRAME_DIAGNOSE_TILES");
