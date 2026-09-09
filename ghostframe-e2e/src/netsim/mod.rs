@@ -36,13 +36,9 @@ pub struct NetSim {
     /// (high-loss) state. Advanced once per `decide` call.
     in_burst: bool,
 
-    // Token-bucket state for the bandwidth cap. Not yet read: the cap lands
-    // in Task 12. Kept here now so the struct's shape is settled — the
-    // suppressions below should disappear once Task 12 wires them up, and a
-    // leftover one after that would mean the cap silently never got applied.
-    #[allow(dead_code, reason = "read once the token-bucket cap is implemented")]
+    /// Token-bucket state for the bandwidth cap: bytes currently available
+    /// to spend, and the time of the last refill.
     tokens: f64,
-    #[allow(dead_code, reason = "read once the token-bucket cap is implemented")]
     last_refill_us: u64,
 
     /// The seed used to construct this simulator; logged in test diagnostics.
@@ -65,8 +61,9 @@ impl NetSim {
     /// Decide the fate of one datagram of `len` bytes offered at `now_us`.
     ///
     /// Applies, in order: Gilbert-Elliott burst-state advance, loss, delay +
-    /// jitter, reorder, duplication, and corruption. The token-bucket
-    /// bandwidth cap (Task 12) is not yet applied here.
+    /// jitter, reorder, duplication, corruption, and finally the
+    /// token-bucket bandwidth cap, which can convert any of the above
+    /// outcomes into a drop.
     ///
     /// # RNG draw order
     ///
@@ -89,7 +86,26 @@ impl NetSim {
     ///    fire, since `Verdict` has no combined variant). These two are the
     ///    only outcome-dependent draws: their values are meaningless unless
     ///    the corresponding roll succeeded.
+    ///
+    /// The token-bucket bandwidth cap draws nothing: refill and spend are
+    /// pure arithmetic on `tokens`/`last_refill_us`, so the cap is applied
+    /// last, after every draw above, and a profile merely *having* a cap
+    /// (or not) never shifts what any draw above produces.
     pub fn decide(&mut self, len: usize, now_us: u64) -> Verdict {
+        // Token-bucket refill. No rng involved, so where this runs relative
+        // to the draws below cannot affect the rng stream; it lives up front
+        // for readability. An unlimited cap (bps == u64::MAX) short-circuits
+        // entirely, skipping f64 arithmetic on an effectively-infinite rate
+        // and keeping the uncapped path bit-identical to a build with no
+        // bucket at all.
+        let bps = self.profile.cap.bps_at(now_us);
+        if bps != u64::MAX {
+            let elapsed_s = now_us.saturating_sub(self.last_refill_us) as f64 / 1_000_000.0;
+            let burst_capacity = bps as f64 / 10.0; // 100 ms of buffering
+            self.tokens = (self.tokens + elapsed_s * bps as f64).min(burst_capacity);
+        }
+        self.last_refill_us = now_us;
+
         // 1. Advance Gilbert-Elliott burst state.
         if self.in_burst {
             if self.rng.bernoulli(self.profile.burst_exit) {
@@ -106,6 +122,10 @@ impl NetSim {
             self.profile.loss
         };
         if self.rng.bernoulli(loss_p) {
+            // Chosen: a loss-dropped datagram does NOT spend bucket tokens.
+            // It models a link-level error (bad radio, corrupted frame)
+            // rather than congestion at our own shaper, so it never reached
+            // the point where it would have occupied capped capacity.
             return Verdict::Drop;
         }
 
@@ -126,28 +146,60 @@ impl NetSim {
         let want_duplicate = self.rng.bernoulli(self.profile.duplicate);
         let want_corrupt = self.rng.bernoulli(self.profile.corrupt);
 
-        if want_duplicate {
+        let verdict = if want_duplicate {
             // 7. Duplicate offset: the duplicate arrives at or after the
             // original, within a small independent window.
             let dup_frac = self.rng.next_f64();
             let dup_window_us = self.profile.jitter_us.max(1_000) as f64;
             let dup_offset = (dup_frac * dup_window_us) as u64;
-            return Verdict::Duplicate {
+            Verdict::Duplicate {
                 at_us,
                 dup_at_us: at_us + dup_offset,
-            };
-        }
-
-        if want_corrupt {
+            }
+        } else if want_corrupt {
             // 7. Corrupt bit index, uniform over the datagram's bits.
             let bit_frac = self.rng.next_f64();
             let bit_count = len.saturating_mul(8);
             let bit_index =
                 ((bit_frac * bit_count as f64) as usize).min(bit_count.saturating_sub(1));
-            return Verdict::Corrupt { at_us, bit_index };
-        }
+            Verdict::Corrupt { at_us, bit_index }
+        } else {
+            Verdict::Deliver { at_us }
+        };
 
-        Verdict::Deliver { at_us }
+        // Token-bucket bandwidth cap: applied last, after every rng draw
+        // above, so the cap's presence never shifts the draw sequence (see
+        // "RNG draw order"). An unlimited cap lets every verdict through
+        // unchanged.
+        if bps == u64::MAX {
+            return verdict;
+        }
+        match verdict {
+            Verdict::Duplicate { at_us, dup_at_us } => {
+                let full_cost = 2.0 * len as f64;
+                if self.tokens >= full_cost {
+                    self.tokens -= full_cost;
+                    Verdict::Duplicate { at_us, dup_at_us }
+                } else if self.tokens >= len as f64 {
+                    // Can't afford both copies but can afford one: downgrade
+                    // to a single delivery rather than dropping a datagram
+                    // we could otherwise have sent.
+                    self.tokens -= len as f64;
+                    Verdict::Deliver { at_us }
+                } else {
+                    Verdict::Drop
+                }
+            }
+            other => {
+                let cost = len as f64;
+                if self.tokens >= cost {
+                    self.tokens -= cost;
+                    other
+                } else {
+                    Verdict::Drop
+                }
+            }
+        }
     }
 }
 
