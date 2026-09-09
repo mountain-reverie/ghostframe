@@ -174,6 +174,73 @@ impl ClientNet {
         self.drain_connection_events(now_us);
     }
 
+    /// Earliest deadline (µs) at which `on_timeout` must be called: the min
+    /// of `core`'s deadline (ACK/NACK batching, tail sweep, periodic
+    /// feedback — see `ClientCore::poll_timeout`) and the QUIC connection's
+    /// own timer (loss detection, PTO, keep-alive — see
+    /// `ClientEndpoint::next_wakeup`).
+    ///
+    /// `core`'s half is armed for the lifetime of the struct (its tail-sweep
+    /// and feedback deadlines are always scheduled — see `ClientCore::new`),
+    /// so this only returns `None` before `connect` has ever produced a
+    /// connection to arm the QUIC half — which cannot happen, because `core`
+    /// alone already guarantees `Some`. It is still expressed as a proper
+    /// min over two `Option`s, rather than unwrapping `core`'s side and
+    /// assuming it's always the smaller one, so nothing here relies on
+    /// `core`'s "never `None`" contract holding forever.
+    pub fn poll_timeout(&self) -> Option<u64> {
+        let core_deadline = self.core.poll_timeout();
+        let quic_deadline = self
+            .endpoint
+            .next_wakeup()
+            .map(|t| t.saturating_duration_since(self.base).as_micros() as u64);
+        match (core_deadline, quic_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
+
+    /// Fire whichever of `core`'s timer and the QUIC connection's own timer
+    /// is actually due at `now_us`, then drain whatever either produced.
+    ///
+    /// The QUIC side goes through `ClientEndpoint::drive_outgoing`, which
+    /// itself only calls `Connection::handle_timeout` when its stored
+    /// deadline is `<= now` — the same gating `next_wakeup`/`poll_timeout`
+    /// expose above — so it is safe to call unconditionally here rather than
+    /// re-checking the deadline first. `core`'s side is checked explicitly
+    /// against `ClientCore::poll_timeout` before calling `ClientCore::
+    /// on_timeout`, to mirror that same "only when due" contract (though
+    /// `on_timeout` re-checks each individual batcher/timer deadline
+    /// internally, so calling it a little early would be harmless, not
+    /// wrong).
+    ///
+    /// `ClientCore::on_timeout` returns `Vec<Event>` (currently always
+    /// empty — `on_timeout`'s own doc comment notes `handle_datagram` is the
+    /// sole source of render events today) which must still be surfaced
+    /// rather than discarded, in case a future `core` revision starts
+    /// producing timer-driven events; `drain_connection_events` at the end
+    /// picks up everything either timer queued onto `core`'s outbox (e.g.
+    /// periodic `ReceiverFeedback`) and writes it out over the QUIC
+    /// connection / feedback stream.
+    pub fn on_timeout(&mut self, now_us: u64) {
+        let now = self.instant(now_us);
+        self.endpoint.drive_outgoing(now);
+
+        if self
+            .core
+            .poll_timeout()
+            .is_some_and(|deadline| now_us >= deadline)
+        {
+            for e in self.core.on_timeout(now_us) {
+                self.events.push(ClientNetEvent::Core(e));
+            }
+        }
+
+        self.drain_connection_events(now_us);
+    }
+
     /// Poll `quinn_proto::Event`s off the active connection and translate
     /// the ones this crate currently understands into `ClientNetEvent`s.
     ///

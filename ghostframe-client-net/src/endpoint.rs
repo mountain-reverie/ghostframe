@@ -156,14 +156,10 @@ impl ClientEndpoint {
 
     /// Earliest deadline this endpoint needs to be woken at, independent of
     /// any inbound datagram — mirrors `QuicServer::next_timeout`
-    /// (`ghostframe-lib/src/transport/quic.rs`). Not wired into `ClientNet`'s
-    /// public API yet: today `drive_outgoing` only fires a due timeout when
-    /// it is invoked from `handle_udp`, which is sufficient for the
-    /// handshake this task drives to completion. A production I/O bridge
-    /// that must retransmit without waiting on the peer will need to poll
-    /// this and call back in on expiry, the same way the pump in
-    /// `tests/handshake.rs` does for the server side.
-    #[allow(dead_code)]
+    /// (`ghostframe-lib/src/transport/quic.rs`). Backs `ClientNet::
+    /// poll_timeout`, which mins this against `ClientCore::poll_timeout` so
+    /// the embedder's byte pump knows when to call `ClientNet::on_timeout`
+    /// even with no inbound datagram to drive `handle_udp`.
     pub(crate) fn next_wakeup(&self) -> Option<Instant> {
         self.timeout
     }
