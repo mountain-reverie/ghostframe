@@ -1,4 +1,23 @@
 //! Certificate pinning, mirroring the browser's `serverCertificateHashes`.
+//!
+//! **What is checked:** the end-entity certificate's DER must hash to exactly
+//! the pinned SHA-256, and the TLS 1.2/1.3 handshake signatures are verified
+//! for real, by delegating to the ring provider. That second part is the
+//! security-meaningful difference from an "accept any certificate" verifier,
+//! which asserts signature validity without checking it.
+//!
+//! **What is deliberately not checked:** the certificate chain, the server
+//! name, and the validity window. Under pinning the certificate *is* the
+//! identity, so a CA chain and an SNI match add nothing — this is the same
+//! model the browser uses for `serverCertificateHashes`.
+//!
+//! **One deviation from the browser, worth knowing before this crate becomes
+//! the native client:** Chrome additionally requires the pinned certificate's
+//! validity window to be under 14 days, and refuses an expired one. This
+//! verifier ignores `now` entirely, so it would accept an expired certificate
+//! the browser would reject. The server issues 13-day certs
+//! (`ghostframe-lib/src/transport/quic.rs:55`), so the two agree in practice
+//! today; they would diverge for a client left running across an expiry.
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
