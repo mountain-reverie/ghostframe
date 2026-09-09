@@ -139,9 +139,28 @@ impl FrameBuffer {
             return Ok(());
         }
 
-        // Decode/validate first, before any staleness bookkeeping: a
-        // malformed payload always errors, regardless of whether its
-        // generation happens to be stale.
+        // Staleness is decided BEFORE decoding, and the order matters:
+        // `decode_pal_rle_tile` writes any bundled palette upsert into
+        // `self.palettes` / `self.palette_shadow` as a side effect. Decoding
+        // a stale payload would therefore let a superseded generation's
+        // palette overwrite the live one for that slot, silently corrupting
+        // every later tile that references it without bundling — and netsim
+        // exists to reorder and duplicate exactly this traffic.
+        //
+        // The cost is that a payload which is both malformed and stale
+        // returns Ok(()) rather than Err: it is dropped unexamined, which is
+        // what a real client would do with a datagram it has already
+        // superseded.
+        let accepted = match self.tiles.get_mut(&(tile_x, tile_y)) {
+            None => true,
+            Some(entry) => entry.tracker.accept(generation),
+        };
+
+        if !accepted {
+            self.stale_generation_tiles += 1;
+            return Ok(());
+        }
+
         let decoded = match codec {
             Codec::Solid => {
                 let bgra = decode_solid(payload).map_err(|_| DecodeErrorCode::PayloadTooShort)?;
@@ -155,16 +174,6 @@ impl FrameBuffer {
             Codec::Cdf53 => Decoded::Cdf53Pass(prevalidate_cdf53(payload, generation, pass_idx)?),
             Codec::Skip | Codec::H264 | Codec::Raw => unreachable!("handled above"),
         };
-
-        let accepted = match self.tiles.get_mut(&(tile_x, tile_y)) {
-            None => true,
-            Some(entry) => entry.tracker.accept(generation),
-        };
-
-        if !accepted {
-            self.stale_generation_tiles += 1;
-            return Ok(());
-        }
 
         let rgba = match decoded {
             Decoded::Rgba(v) => v,

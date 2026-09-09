@@ -206,3 +206,69 @@ fn out_of_scope_codecs_are_accepted_but_not_stored() {
         "out-of-scope codec must not create a tile entry"
     );
 }
+
+/// A stale payload must be dropped **before** it is decoded.
+///
+/// `decode_pal_rle_tile` writes any bundled palette upsert into the buffer's
+/// palette table as a side effect. If staleness were decided after decoding,
+/// a late datagram from a superseded generation would overwrite the live
+/// palette for its slot while its pixels were discarded — corrupting every
+/// later tile that references that slot without bundling its own copy.
+/// netsim reorders and duplicates datagrams by design, so this is traffic
+/// the harness will actually produce.
+///
+/// The other tests here cannot catch it: they only ever observe the tile the
+/// stale payload targeted, and that tile is correct either way. The damage
+/// shows up on a *different* tile, later.
+#[test]
+fn a_stale_payload_does_not_corrupt_the_palette_table() {
+    use ghostframe_protocol::codec::pal_rle::{encode_pal_rle_payload, PaletteEntry};
+
+    const SLOT: u8 = 5;
+    let colour_a = [10u8, 20, 30, 255];
+    let colour_b = [90u8, 80, 70, 255];
+
+    // All indices 0, so a tile is uniformly palette entry 0 — whichever
+    // colour currently occupies that slot.
+    let packed = [0u8; 512];
+
+    let entry_for = |c: [u8; 4]| {
+        let mut colors = [[0u8; 4]; 16];
+        colors[0] = c;
+        PaletteEntry { colors, count: 1 }
+    };
+
+    let bundled_a = encode_pal_rle_payload(&packed, &entry_for(colour_a), SLOT, true);
+    let bundled_b = encode_pal_rle_payload(&packed, &entry_for(colour_b), SLOT, true);
+    // Non-bundled: carries no palette, so it resolves against whatever the
+    // buffer currently holds in SLOT. This is the probe.
+    let unbundled = encode_pal_rle_payload(&packed, &entry_for(colour_a), SLOT, false);
+
+    let mut fb = FrameBuffer::new();
+    fb.apply(0, 0, 0, Codec::PalRle, 0, &bundled_a)
+        .expect("gen 0");
+    fb.apply(0, 0, 1, Codec::PalRle, 0, &bundled_b)
+        .expect("gen 1");
+
+    // Late datagram from the superseded generation 0.
+    fb.apply(0, 0, 0, Codec::PalRle, 0, &bundled_a)
+        .expect("stale gen 0");
+    assert_eq!(
+        fb.stale_generation_tiles(),
+        1,
+        "the late payload must count as stale"
+    );
+
+    // A different tile, current generation, resolving against SLOT.
+    fb.apply(1, 0, 1, Codec::PalRle, 0, &unbundled)
+        .expect("probe tile");
+
+    let probe = fb.tile_rgba(1, 0).expect("probe tile stored");
+    let expected_rgba = [colour_b[2], colour_b[1], colour_b[0], 255];
+    assert_eq!(
+        &probe[0..4],
+        &expected_rgba,
+        "SLOT must still hold generation 1's palette; if it holds the stale \
+         generation 0 palette, the stale payload was decoded before being dropped"
+    );
+}
