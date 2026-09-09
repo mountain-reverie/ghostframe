@@ -20,7 +20,6 @@ pub struct ClientNetConfig {
 }
 
 pub struct ClientNet {
-    #[allow(dead_code)]
     config: ClientNetConfig,
     connected: bool,
 }
