@@ -17,11 +17,9 @@ pub enum Verdict {
     Deliver { at_us: u64 },
 
     /// Deliver the datagram at `at_us`, and send a duplicate at `dup_at_us`.
-    /// Tasks 11-12 implement duplication and reordering.
     Duplicate { at_us: u64, dup_at_us: u64 },
 
     /// Deliver the datagram at `at_us` with bit `bit_index` flipped.
-    /// Tasks 11-12 implement corruption.
     Corrupt { at_us: u64, bit_index: usize },
 
     /// Drop the datagram entirely.
@@ -34,14 +32,14 @@ pub struct NetSim {
     profile: NetProfile,
     rng: DetRng,
 
-    // State for impairments this task does not yet apply. `decide` currently
-    // implements only the independent-loss roll; the Gilbert-Elliott burst
-    // state is read once burst loss lands, and the token-bucket pair once the
-    // bandwidth cap does. Kept rather than added later so the struct's shape
-    // is settled — but the suppressions below should disappear as each lands,
-    // and a leftover one means an impairment silently never got wired up.
-    #[allow(dead_code, reason = "read once burst loss is implemented")]
+    /// Gilbert-Elliott burst state: true while the link is in the bad
+    /// (high-loss) state. Advanced once per `decide` call.
     in_burst: bool,
+
+    // Token-bucket state for the bandwidth cap. Not yet read: the cap lands
+    // in Task 12. Kept here now so the struct's shape is settled — the
+    // suppressions below should disappear once Task 12 wires them up, and a
+    // leftover one after that would mean the cap silently never got applied.
     #[allow(dead_code, reason = "read once the token-bucket cap is implemented")]
     tokens: f64,
     #[allow(dead_code, reason = "read once the token-bucket cap is implemented")]
@@ -66,23 +64,90 @@ impl NetSim {
 
     /// Decide the fate of one datagram of `len` bytes offered at `now_us`.
     ///
-    /// This task implements the loss roll and the immediate-delivery path.
+    /// Applies, in order: Gilbert-Elliott burst-state advance, loss, delay +
+    /// jitter, reorder, duplication, and corruption. The token-bucket
+    /// bandwidth cap (Task 12) is not yet applied here.
     ///
-    /// Tasks 11 and 12 extend this with:
-    /// - Gilbert-Elliott burst state transitions and burst loss
-    /// - Jitter (random delay within the profile window)
-    /// - Reordering (buffering and out-of-order delivery)
-    /// - Duplication (second delivery at random offset)
-    /// - Corruption (single bit flip at random position)
-    /// - Token bucket bandwidth cap (refill and consume tokens)
-    pub fn decide(&mut self, _len: usize, now_us: u64) -> Verdict {
-        // Roll independent loss.
-        if self.rng.bernoulli(self.profile.loss) {
+    /// # RNG draw order
+    ///
+    /// The sequence of draws below is a fixed part of every seed's
+    /// reproduction recipe: reordering, adding, or removing a draw changes
+    /// the stream every later call sees, invalidating every previously
+    /// recorded seed. Per call, in order:
+    ///
+    /// 1. Burst-state transition roll (always drawn).
+    /// 2. Loss roll, using the just-updated burst state (always drawn; a
+    ///    drop returns immediately, so no further draws happen this call).
+    /// 3. Jitter fraction (always drawn, even when `jitter_us == 0` — a
+    ///    profile field being zero must not shift what a later step draws).
+    /// 4. Reorder fraction (always drawn, even when `reorder_us == 0`, for
+    ///    the same reason).
+    /// 5. Duplicate roll (always drawn).
+    /// 6. Corrupt roll (always drawn).
+    /// 7. Duplicate-offset draw, *only* if step 5 fired, or corrupt-bit-index
+    ///    draw, *only* if step 6 fired (duplicate takes precedence if both
+    ///    fire, since `Verdict` has no combined variant). These two are the
+    ///    only outcome-dependent draws: their values are meaningless unless
+    ///    the corresponding roll succeeded.
+    pub fn decide(&mut self, len: usize, now_us: u64) -> Verdict {
+        // 1. Advance Gilbert-Elliott burst state.
+        if self.in_burst {
+            if self.rng.bernoulli(self.profile.burst_exit) {
+                self.in_burst = false;
+            }
+        } else if self.rng.bernoulli(self.profile.burst_enter) {
+            self.in_burst = true;
+        }
+
+        // 2. Loss roll, using the updated burst state.
+        let loss_p = if self.in_burst {
+            self.profile.burst_loss
+        } else {
+            self.profile.loss
+        };
+        if self.rng.bernoulli(loss_p) {
             return Verdict::Drop;
         }
 
-        // Deliver immediately (Tasks 11-12 add delay/jitter).
-        Verdict::Deliver { at_us: now_us }
+        // 3. Delay + jitter: at_us = now_us + delay_us + jitter, jitter
+        // uniform in [-jitter_us, +jitter_us], clamped so at_us >= now_us.
+        let jitter_frac = self.rng.next_f64(); // [0, 1)
+        let jitter = ((jitter_frac * 2.0 - 1.0) * self.profile.jitter_us as f64).round() as i64;
+        let delayed = now_us as i128 + self.profile.delay_us as i128 + jitter as i128;
+        let mut at_us = delayed.max(now_us as i128) as u64;
+
+        // 4. Reorder: add a uniform [0, reorder_us) offset, letting a later
+        // datagram overtake an earlier one.
+        let reorder_frac = self.rng.next_f64(); // [0, 1)
+        let reorder_offset = (reorder_frac * self.profile.reorder_us as f64) as u64;
+        at_us += reorder_offset;
+
+        // 5 & 6. Duplicate / corrupt rolls (both always drawn).
+        let want_duplicate = self.rng.bernoulli(self.profile.duplicate);
+        let want_corrupt = self.rng.bernoulli(self.profile.corrupt);
+
+        if want_duplicate {
+            // 7. Duplicate offset: the duplicate arrives at or after the
+            // original, within a small independent window.
+            let dup_frac = self.rng.next_f64();
+            let dup_window_us = self.profile.jitter_us.max(1_000) as f64;
+            let dup_offset = (dup_frac * dup_window_us) as u64;
+            return Verdict::Duplicate {
+                at_us,
+                dup_at_us: at_us + dup_offset,
+            };
+        }
+
+        if want_corrupt {
+            // 7. Corrupt bit index, uniform over the datagram's bits.
+            let bit_frac = self.rng.next_f64();
+            let bit_count = len.saturating_mul(8);
+            let bit_index =
+                ((bit_frac * bit_count as f64) as usize).min(bit_count.saturating_sub(1));
+            return Verdict::Corrupt { at_us, bit_index };
+        }
+
+        Verdict::Deliver { at_us }
     }
 }
 
