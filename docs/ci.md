@@ -13,7 +13,7 @@ Runs on every pull request and every push to `master`. Seven parallel jobs:
 | Job | What it runs | Local equivalent |
 |---|---|---|
 | `fmt` | `cargo fmt --all -- --check` | `just fmt-check` |
-| `clippy` | `cargo clippy --workspace --all-targets -- -D warnings` | `just lint` |
+| `clippy` | `cargo clippy --workspace --all-targets -- -D warnings`, plus a grep asserting `ghostframe-lib` reads `std::env` only in `config.rs` | `just lint` |
 | `unit` | `cargo test --workspace --lib` | `just test-unit` |
 | `build-release` | `cargo build --workspace --release --exclude ghostframe-e2e` | `cargo build --release` |
 | `web-client` | `npm ci && npm run build && npx tsc --noEmit` | `just web-client-build` |
