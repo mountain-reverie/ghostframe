@@ -6,3 +6,4 @@
 //! `ghostframe-bench`. See `docs/superpowers/specs/2026-06-01-m3.5-bench-publication-design.md`.
 
 pub mod harness;
+pub mod netsim;
