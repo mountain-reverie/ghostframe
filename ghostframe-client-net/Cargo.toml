@@ -1,0 +1,21 @@
+[package]
+name = "ghostframe-client-net"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ghostframe-protocol = { path = "../ghostframe-protocol" }
+ghostframe-client-core = { path = "../ghostframe-client-core" }
+quinn-proto = { workspace = true }
+rustls = { workspace = true }
+web-transport-proto = { workspace = true }
+bytes = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+url = "2"
+
+[dev-dependencies]
+ghostframe-lib = { path = "../ghostframe-lib" }
+rcgen = { workspace = true }
+proptest = "1"

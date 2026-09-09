@@ -1642,6 +1642,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "ghostframe-client-net"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "ghostframe-client-core",
+ "ghostframe-lib",
+ "ghostframe-protocol",
+ "proptest",
+ "quinn-proto",
+ "rcgen",
+ "rustls",
+ "sha2",
+ "thiserror 2.0.18",
+ "tracing",
+ "url",
+ "web-transport-proto",
+]
+
+[[package]]
 name = "ghostframe-e2e"
 version = "0.1.0"
 dependencies = [
