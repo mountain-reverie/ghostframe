@@ -13,6 +13,7 @@ pub mod containers;
 pub mod e2e_certs;
 pub mod e2e_setup;
 pub mod fixtures;
+pub mod framebuffer;
 pub mod pixels;
 pub mod scene;
 pub mod scene_tiles;
