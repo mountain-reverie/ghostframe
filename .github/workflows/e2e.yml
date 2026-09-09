@@ -211,6 +211,26 @@ jobs:
           sudo ln -sf "$chrome_path" /usr/bin/chromium
           /usr/bin/chromium --version
 
+      - name: Firefox Nightly cache key (one build per UTC day)
+        id: ff-key
+        run: echo "day=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Firefox Nightly + geckodriver
+        id: ff-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            /tmp/firefox.tar.xz
+            /tmp/geckodriver.tar.gz
+          # Exact key = today's Nightly. `restore-keys` falls back to the most
+          # recent earlier day, which is what makes a Mozilla outage survivable:
+          # a stale Nightly still runs the suite. Without the fallback, an
+          # upstream 500 fails an otherwise-green PR (observed 2026-09-09 on #46:
+          # `curl: (22) ... error: 500` then `tar: Child returned status 1`).
+          key: firefox-nightly-geckodriver-0.36.0-${{ steps.ff-key.outputs.day }}
+          restore-keys: |
+            firefox-nightly-geckodriver-0.36.0-
+
       - name: Install Firefox + geckodriver + certutil for Firefox e2e path
         run: |
           # Firefox Nightly (NOT ESR). ESR is currently on 128 — WebGPU
@@ -221,15 +241,40 @@ jobs:
           # WebGPU prefs. Nightly is regenerated daily; the e2e suite
           # is rebuilt on every PR anyway, so we trade tarball freshness
           # for capability availability.
+          set -euo pipefail
           sudo apt-get install -y --no-install-recommends libnss3-tools \
             libdbus-glib-1-2 libxt6 libgtk-3-0 libasound2t64
-          curl -fL -o /tmp/firefox.tar.xz \
-            "https://download.mozilla.org/?product=firefox-nightly-latest-ssl&os=linux64&lang=en-US"
+
+          FF_URL="https://download.mozilla.org/?product=firefox-nightly-latest-ssl&os=linux64&lang=en-US"
+          if [ "${{ steps.ff-cache.outputs.cache-hit }}" = "true" ]; then
+            echo "Using today's cached Firefox Nightly."
+          elif [ -s /tmp/firefox.tar.xz ]; then
+            # A previous day's tarball was restored. Try to refresh it, but keep
+            # the stale one if Mozilla is unhealthy — an older Nightly still has
+            # WebGPU, which is the only reason we track Nightly at all.
+            if curl --retry 5 --retry-all-errors --retry-delay 5 -fL \
+                 -o /tmp/firefox.tar.xz.new "$FF_URL"; then
+              mv /tmp/firefox.tar.xz.new /tmp/firefox.tar.xz
+            else
+              echo "::warning::Firefox Nightly download failed; falling back to the cached build from an earlier day"
+              rm -f /tmp/firefox.tar.xz.new
+            fi
+          else
+            # Nothing cached: a failure here is genuinely fatal.
+            curl --retry 5 --retry-all-errors --retry-delay 5 -fL \
+              -o /tmp/firefox.tar.xz "$FF_URL"
+          fi
+
+          if [ ! -s /tmp/geckodriver.tar.gz ]; then
+            curl --retry 5 --retry-all-errors --retry-delay 5 -fL \
+              -o /tmp/geckodriver.tar.gz \
+              https://github.com/mozilla/geckodriver/releases/download/v0.36.0/geckodriver-v0.36.0-linux64.tar.gz
+          fi
+
           sudo tar -xJf /tmp/firefox.tar.xz -C /opt/
           # Nightly tarball extracts to /opt/firefox/ (same dir name).
           sudo ln -sf /opt/firefox/firefox /usr/bin/firefox
-          curl -fL https://github.com/mozilla/geckodriver/releases/download/v0.36.0/geckodriver-v0.36.0-linux64.tar.gz \
-            | sudo tar -xz -C /usr/local/bin geckodriver
+          sudo tar -xzf /tmp/geckodriver.tar.gz -C /usr/local/bin geckodriver
           # Verify
           /usr/bin/firefox --version
           command -v geckodriver  && geckodriver --version
