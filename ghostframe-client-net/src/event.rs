@@ -28,4 +28,6 @@ pub enum ClientNetError {
     Tls(String),
     #[error("connect failed: {0}")]
     Connect(String),
+    #[error("WebTransport handshake failed: {0}")]
+    Handshake(String),
 }
