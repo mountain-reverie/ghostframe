@@ -132,12 +132,20 @@ async fn a_single_solid_tile_arrives_on_a_perfect_link() {
     assert_eq!(result.stale_generation_tiles, 0);
 }
 
-/// Proves frames after the first are actually injected, and that the
-/// per-tile generation counter genuinely advances: a two-frame scene
-/// rewrites tile (0,0) with a different color in frame 2, and only frame
-/// 2's color must survive. `a_single_solid_tile_arrives_on_a_perfect_link`
-/// alone would pass even if the injection loop only ever sent frame 0 —
-/// this is the test that would catch that.
+/// Proves frames after the first are actually injected: a two-frame scene
+/// rewrites tile (0,0) with a different color in frame 2, and only frame 2's
+/// color must survive. `a_single_solid_tile_arrives_on_a_perfect_link` alone
+/// would pass even if the injection loop only ever sent frame 0 — this is
+/// the test that catches that.
+///
+/// Note what this does NOT prove. Pinning the per-tile generation counter to
+/// a constant leaves every test in this file green, so nothing here is
+/// load-bearing on the generation advancing. Solid tiles are self-contained
+/// single payloads, so a stale generation cannot change their pixels.
+/// Generation only becomes observable with a multi-pass codec, where
+/// `Cdf53TileState` must discard the previous generation's accumulated
+/// planes instead of blending them — a Cdf53 multi-frame scene (task 16) is
+/// what will pin that down.
 #[tokio::test(start_paused = true)]
 async fn a_second_frame_overwrites_the_first_frames_tile() {
     let scene = BrowserlessScene {
@@ -176,8 +184,7 @@ async fn a_second_frame_overwrites_the_first_frames_tile() {
         &px[0..4],
         &[100, 150, 200, 255],
         "frame 2's color (BGRA [200,150,100,255] -> RGBA) must be what the \
-         client ends up rendering, proving frame 2 was actually injected \
-         and its generation advanced past frame 1's"
+         client ends up rendering, proving frame 2 was actually injected"
     );
     assert_eq!(result.stale_generation_tiles, 0);
 }
