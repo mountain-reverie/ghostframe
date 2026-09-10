@@ -656,6 +656,16 @@ impl BweWrapper {
 
 Update the module doc comment at the top of `bwe/mod.rs`: the existing text explains why str0m could not be used and that a "lightweight EWMA" stands in for Phase 1. Replace that explanation with the current position — str0m's GoogCC is still `pub(crate)` in 0.23.1, so the standalone `goog_cc` crate is used instead — and delete the "swap the internals for a richer estimator" sentence, which is now done.
 
+Two comments elsewhere assert things that stop being true at this task. Both
+must be corrected here, or they will tell the next reader the opposite of
+reality:
+
+- `bwe/mod.rs` still says "str0m is still listed as a Cargo dependency so that
+  `str0m::bwe::Bitrate` ...". str0m was removed in Task 1.
+- `io_bridge.rs:623-624` describes `BweSample` as input to "the str0m::bwe
+  estimator (wired in Phase 1 Task 8)". Replace `str0m::bwe` with `goog_cc`
+  and drop the stale task reference.
+
 - [ ] **Step 4: Run and watch it pass**
 
 Run: `cargo test -p ghostframe-lib --lib`
@@ -664,7 +674,7 @@ Expected: PASS. Any EWMA-specific test that no longer compiles should be **delet
 - [ ] **Step 5: Commit**
 
 ```bash
-git add ghostframe-lib/src/transport/bwe/mod.rs
+git add ghostframe-lib/src/transport/bwe/mod.rs ghostframe-lib/src/transport/io_bridge.rs
 git commit -m "feat(bwe): back the estimator seam with GoogCC instead of the EWMA"
 ```
 
