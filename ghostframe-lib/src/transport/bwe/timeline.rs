@@ -18,10 +18,13 @@ const PERIOD: i64 = 65_536;
 
 /// Per-series unwrapper. One instance per timestamp series — the emit series
 /// and the arrival series come from different clocks and must NOT share one.
+/// State is kept unclamped (may be negative) so that a backward step near the
+/// anchor does not corrupt subsequent deltas; only the returned value is floored
+/// at zero.
 #[allow(dead_code)]
 #[derive(Debug, Default)]
 pub(crate) struct Lo16Timeline {
-    last: Option<u64>,
+    last: Option<i64>,
 }
 
 impl Lo16Timeline {
@@ -31,20 +34,20 @@ impl Lo16Timeline {
         let Some(last) = self.last else {
             // Anchor on the first value so early timestamps stay small and
             // readable in logs.
-            self.last = Some(lo16 as u64);
+            self.last = Some(lo16 as i64);
             return lo16 as u64;
         };
 
-        let base = (last as i64) & !(PERIOD - 1);
+        let base = last & !(PERIOD - 1);
         let mut candidate = base | (lo16 as i64);
         // Choose the wrap-period offset landing nearest `last`.
-        if candidate - (last as i64) > HALF_PERIOD {
+        if candidate - last > HALF_PERIOD {
             candidate -= PERIOD;
-        } else if (last as i64) - candidate > HALF_PERIOD {
+        } else if last - candidate > HALF_PERIOD {
             candidate += PERIOD;
         }
         let value = candidate.max(0) as u64;
-        self.last = Some(value);
+        self.last = Some(candidate);
         value
     }
 }
@@ -114,5 +117,24 @@ mod tests {
         assert_eq!(t.unwrap_ms(2_000), 2_000);
         // 58 s forward is read as 7.5 s backward, then clamped at zero.
         assert_eq!(t.unwrap_ms(60_000), 0);
+    }
+
+    /// The zero floor applies to the returned value only; the timeline must
+    /// remember the true (possibly negative) position. Storing the floored
+    /// value silently moves the reference point, which changes how a later
+    /// sample near the half-period boundary is disambiguated.
+    #[test]
+    fn the_zero_floor_does_not_corrupt_stored_state() {
+        let mut t = Lo16Timeline::default();
+        assert_eq!(t.unwrap_ms(100), 100);
+        // 136 ms before the anchor: floors to 0 on the way out, but the
+        // timeline must remember -36.
+        assert_eq!(t.unwrap_ms(65_500), 0);
+        // Near the half-period boundary measured from -36: the nearest
+        // candidate is -32_786 (32_750 earlier), which floors to 0. Had the
+        // floored 0 been stored instead, the nearest candidate would be
+        // +32_750 and this would return 32_750 — a 32-second phantom jump
+        // forward.
+        assert_eq!(t.unwrap_ms(32_750), 0);
     }
 }
