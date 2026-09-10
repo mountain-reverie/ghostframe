@@ -58,6 +58,10 @@ pub struct AckArrival {
     pub server_emit_ms_lo16: u16,
     /// Low 16 bits of the client's arrival time in ms.
     pub client_arrival_ms_lo16: u16,
+    /// Wire size of the acknowledged datagram in bytes, summed over its
+    /// fragments. GoogCC derives delivery rate from bytes; without this the
+    /// controller sees arrivals but no volume and cannot form an estimate.
+    pub size_bytes: u32,
 }
 
 /// Public observability snapshot returned by `BweWrapper::snapshot()`.
@@ -227,11 +231,13 @@ mod tests {
                 wire_seq: 1,
                 server_emit_ms_lo16: 100,
                 client_arrival_ms_lo16: 110,
+                size_bytes: 1200,
             },
             AckArrival {
                 wire_seq: 2,
                 server_emit_ms_lo16: 120,
                 client_arrival_ms_lo16: 135,
+                size_bytes: 1200,
             },
         ];
         let snap = bwe.update(&records, Instant::now());
@@ -249,6 +255,7 @@ mod tests {
                 wire_seq: i,
                 server_emit_ms_lo16: (i * 5) as u16,
                 client_arrival_ms_lo16: (i * 5 + 10) as u16,
+                size_bytes: 1200,
             })
             .collect();
 
@@ -295,5 +302,18 @@ mod tests {
                 feedback_only: false,
             },
         );
+    }
+
+    /// GoogCC derives rate from bytes, so a sample without a size cannot
+    /// contribute to an estimate. This pins the field onto the seam.
+    #[test]
+    fn ack_arrival_carries_packet_size() {
+        let a = AckArrival {
+            wire_seq: 1,
+            server_emit_ms_lo16: 10,
+            client_arrival_ms_lo16: 25,
+            size_bytes: 1200,
+        };
+        assert_eq!(a.size_bytes, 1200);
     }
 }
