@@ -56,3 +56,43 @@ async fn bytes_actually_cross_the_socketpair() {
         "seed 2: NetProfile::perfect() drops nothing"
     );
 }
+
+/// Proves the netsim is genuinely in the datagram path.
+///
+/// The two tests above run on `NetProfile::perfect()`, where every verdict
+/// is `Deliver` — so removing the netsim from the loop entirely would not
+/// change their result. Only a profile that actually drops packets can
+/// distinguish "routed through the simulator" from "handed straight over".
+///
+/// QUIC retransmits, so the session must still establish despite the loss;
+/// asserting both halves means neither a bypassed simulator (no drops) nor
+/// a broken retransmit path (no session) can pass.
+#[tokio::test(start_paused = true)]
+async fn a_lossy_link_still_establishes_and_records_drops() {
+    let scene = BrowserlessScene {
+        seed: 7,
+        frames: vec![],
+        net: NetProfile {
+            loss: 0.10,
+            ..NetProfile::perfect()
+        },
+        duration: Duration::from_secs(5),
+        grid_cols: 4,
+        grid_rows: 4,
+    };
+
+    let result = run_browserless(scene).await.expect("scene ran");
+
+    assert!(
+        result.bytes_dropped > 0,
+        "seed 7: a 10% loss profile must drop something; 0 dropped bytes \
+         means the netsim is not in the datagram path at all"
+    );
+    assert!(
+        result.events.contains(&ClientNetEvent::SessionReady),
+        "seed 7: the session must still establish across a lossy link — \
+         QUIC retransmits (dropped {} bytes, delivered {})",
+        result.bytes_dropped,
+        result.bytes_delivered
+    );
+}
