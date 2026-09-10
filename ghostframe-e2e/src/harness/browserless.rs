@@ -62,6 +62,22 @@ use crate::netsim::{NetProfile, NetSim, SocketPairPump, Verdict};
 /// this value meaning "one frame at 60fps" precisely.
 const FRAME_SPACING_US: u64 = 16_000;
 
+/// Spacing between post-injection heartbeat ticks (see `drive_session`'s
+/// doc comment on why heartbeats exist at all). Deliberately much coarser
+/// than `FRAME_SPACING_US`: the sole purpose of a heartbeat is to reach
+/// `IoBridge::apply_injected_frame`'s unconditional `sweep_rto_retransmits`
+/// call often enough that a cached, unacked fragment's RTO deadline (floor
+/// 25ms, see `reliable_emitter::rto::rto_for_attempt`) gets checked well
+/// before `scene.duration` runs out — not to reproduce a particular real
+/// capture framerate. Ticking at `FRAME_SPACING_US` (16ms) would work too,
+/// but multiplies the outer event loop's iteration count by
+/// `scene.duration / FRAME_SPACING_US` for the entire remainder of every
+/// scene once its declared frames run out, which measurably pushed
+/// longer-duration scenes toward `drive_session`'s `MAX_ITERS` bail-out.
+/// 100ms comfortably clears the RTO floor with room for multiple backoff
+/// attempts, while keeping that iteration multiplier small.
+const HEARTBEAT_SPACING_US: u64 = 100_000;
+
 /// One scene frame's worth of declared tile content, keyed by `(tile_x,
 /// tile_y)`.
 pub struct FrameScript {
@@ -260,9 +276,15 @@ async fn drive_session(
     let mut session_ready = false;
     let mut next_frame_idx: usize = 0;
     // Set once the session is ready and the scene has at least one frame;
-    // `Some(t)` means "frame `next_frame_idx` is due at virtual time `t`
-    // (us since `base`)".
+    // `Some(t)` means "the next scheduled injection (a real scene frame, or
+    // once those run out, a heartbeat — see below) is due at virtual time
+    // `t` (us since `base`)".
     let mut next_inject_at_us: Option<u64> = None;
+    // `seq` for heartbeat `InjectedFrame`s sent after `scene.frames` is
+    // exhausted (see below). Starts at `scene.frames.len()`, one past the
+    // highest `seq` any real scene frame uses, so a heartbeat can never
+    // collide with a real frame's wire `frame_seq`.
+    let mut heartbeat_seq: u32 = scene.frames.len() as u32;
 
     // Two independent bounds so a stuck scene fails loudly instead of
     // hanging: `MAX_ITERS` guards against a pathological loop that somehow
@@ -339,14 +361,59 @@ async fn drive_session(
 
         if session_ready {
             if let Some(due_at) = next_inject_at_us {
-                if next_frame_idx < scene.frames.len() && now_us(base) >= due_at {
-                    inject_frame(scene, next_frame_idx, &mut generations, inject_tx)
-                        .await
-                        .map_err(|e| {
-                            anyhow!("seed {seed}: frame {next_frame_idx} injection failed: {e}")
-                        })?;
-                    next_frame_idx += 1;
-                    next_inject_at_us = Some(due_at + FRAME_SPACING_US);
+                if now_us(base) >= due_at {
+                    let spacing_us;
+                    if next_frame_idx < scene.frames.len() {
+                        inject_frame(scene, next_frame_idx, &mut generations, inject_tx)
+                            .await
+                            .map_err(|e| {
+                                anyhow!("seed {seed}: frame {next_frame_idx} injection failed: {e}")
+                            })?;
+                        next_frame_idx += 1;
+                        spacing_us = FRAME_SPACING_US;
+                    } else {
+                        // `scene.frames` is exhausted, but `scene.duration`
+                        // may still have plenty of virtual time left, and a
+                        // datagram dropped on its one and only send attempt
+                        // needs *something* to keep giving it a chance to
+                        // land. `IoBridge::sweep_rto_retransmits` (the
+                        // server-side RTO wheel that actually resends a
+                        // dropped, unacked tile datagram) is only ever
+                        // called from three places: a real capture frame's
+                        // post-dispatch path, `apply_injected_frame`'s own
+                        // post-drain mirror of that, and the
+                        // `Event::DatagramsUnblocked` handler — see that
+                        // function's doc comment. In production the first
+                        // of those fires unconditionally on a fixed timer
+                        // for as long as a client stays connected (the
+                        // capture loop free-runs regardless of screen
+                        // dirtiness), so the RTO wheel is always getting
+                        // swept somewhere. This harness has no such
+                        // free-running capture loop: once `scene.frames`
+                        // runs out, nothing would otherwise ever call
+                        // `apply_injected_frame` again, and `DatagramsUnblocked`
+                        // does not fire on its own absent a previously
+                        // blocked send. Sending an empty-work `InjectedFrame`
+                        // on the coarser `HEARTBEAT_SPACING_US` cadence (see
+                        // its doc comment for why heartbeats don't reuse
+                        // `FRAME_SPACING_US`) has no tile content to
+                        // enqueue, but still reaches
+                        // `apply_injected_frame`'s unconditional
+                        // `sweep_rto_retransmits()` call — this is the
+                        // harness's substitute for "a client stays
+                        // connected and capture keeps ticking", not a new
+                        // behavior IoBridge doesn't already have.
+                        inject_heartbeat(heartbeat_seq, inject_tx)
+                            .await
+                            .map_err(|e| {
+                                anyhow!(
+                                    "seed {seed}: heartbeat {heartbeat_seq} injection failed: {e}"
+                                )
+                            })?;
+                        heartbeat_seq += 1;
+                        spacing_us = HEARTBEAT_SPACING_US;
+                    }
+                    next_inject_at_us = Some(due_at + spacing_us);
                 }
             }
         }
@@ -371,10 +438,14 @@ async fn drive_session(
             wake_at = wake_at.min(base + Duration::from_micros(d));
         }
         if session_ready {
+            // Unconditional once `session_ready`: unlike the injection
+            // branch above, waking up for the next due time applies
+            // whether that next injection is a real scene frame or a
+            // heartbeat (see above) — heartbeats keep being scheduled for
+            // the rest of `scene.duration`, not just until `scene.frames`
+            // runs out.
             if let Some(due_at) = next_inject_at_us {
-                if next_frame_idx < scene.frames.len() {
-                    wake_at = wake_at.min(base + Duration::from_micros(due_at));
-                }
+                wake_at = wake_at.min(base + Duration::from_micros(due_at));
             }
         }
 
@@ -467,6 +538,34 @@ async fn inject_frame(
         .send(frame)
         .await
         .map_err(|e| anyhow!("seed {seed}: inject_tx send failed at frame {frame_idx}: {e}"))
+}
+
+/// Send an empty-work `InjectedFrame` — no tiles, nothing new to encode —
+/// purely to reach `IoBridge::apply_injected_frame`'s unconditional
+/// post-drain `sweep_rto_retransmits()` call. See the doc comment at the
+/// `drive_session` call site for why this is needed once `scene.frames` is
+/// exhausted but `scene.duration` still has virtual time left: without
+/// something to keep calling into `IoBridge`, a datagram dropped on its one
+/// and only send attempt is never retried, since nothing else in this
+/// harness (no free-running capture loop, unlike production) would ever
+/// call `apply_injected_frame` again.
+///
+/// `seq` must be distinct from every real scene frame's `seq` (the caller
+/// guarantees this by starting `heartbeat_seq` at `scene.frames.len()`) —
+/// otherwise this would collide with a real frame's wire `frame_seq` in
+/// `IoBridge`'s per-tile-pass ACK/NACK/coverage bookkeeping, which is keyed
+/// by `frame_seq`.
+async fn inject_heartbeat(seq: u32, inject_tx: &mpsc::Sender<InjectedFrame>) -> anyhow::Result<()> {
+    let frame = InjectedFrame {
+        seq,
+        timestamp_us: (seq as u64 * FRAME_SPACING_US) as u32,
+        budget_bytes: usize::MAX,
+        work: Vec::new(),
+    };
+    inject_tx
+        .send(frame)
+        .await
+        .map_err(|e| anyhow!("heartbeat {seq}: inject_tx send failed: {e}"))
 }
 
 /// Current virtual time, in microseconds since `base`.
