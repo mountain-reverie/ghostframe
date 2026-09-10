@@ -46,7 +46,7 @@ rayon = "1.10"
 # pub(crate) and cannot be constructed without an Rtc session (verified against
 # both 0.21 and 0.23.1), which is why this is a separate crate rather than
 # str0m. See docs/superpowers/specs/2026-09-10-bwe-pacing-design.md.
-goog_cc = "0.1.4"
+goog_cc = "=0.1.4"
 web-transport-proto = { workspace = true }
 sha2 = { workspace = true }
 smallvec = "1"
