@@ -63,6 +63,10 @@ jobs:
         with:
           shared-key: e2e
       - run: cargo test --test browserless
+      # client-net's own tests live here rather than in client-core.yml:
+      # its dev-dependencies reach ghostframe-lib, which needs the ffmpeg dev
+      # libraries only this workflow installs.
+      - run: cargo test -p ghostframe-client-net
       # The netsim harness suites. These live in separate integration test
       # targets, so neither `cargo test --workspace --lib` (lib targets only)
       # nor the named `--test` invocations above reach them — they were not
