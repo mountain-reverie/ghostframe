@@ -63,6 +63,21 @@ jobs:
         with:
           shared-key: e2e
       - run: cargo test --test browserless
+      # The netsim harness suites. These live in separate integration test
+      # targets, so neither `cargo test --workspace --lib` (lib targets only)
+      # nor the named `--test` invocations above reach them — they were not
+      # run by CI at all until this job listed them explicitly.
+      #
+      # --test-threads=1 is deliberate. `browserless_runner`'s scenes each
+      # spawn a tokio runtime, a LocalSet and an IoBridge task; run in
+      # parallel they contend, and because the harness's virtual clock does
+      # not control how far the bridge task progresses between polls, the
+      # datagram ordering reaching the netsim shifts run to run. That made
+      # `superseded_generations_never_render` fail roughly 1 run in 10 under
+      # the default parallel harness, and 0 of 12 serially. See
+      # `ghostframe-e2e/src/netsim/mod.rs` on which layer is reproducible.
+      - run: cargo test --test netsim --test netsim_pump --test scene_tiles --test framebuffer
+      - run: cargo test --test browserless_runner -- --test-threads=1
 
   harness-smoke:
     name: harness-smoke

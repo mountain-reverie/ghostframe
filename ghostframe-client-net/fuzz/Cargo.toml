@@ -13,9 +13,24 @@ libfuzzer-sys = "0.4"
 [dependencies.ghostframe-client-net]
 path = ".."
 
+# The tile decoders live in client-core, but they are part of the same client
+# stack and share this one fuzz crate rather than standing up a second.
+[dependencies.ghostframe-client-core]
+path = "../../ghostframe-client-core"
+
+[dependencies.ghostframe-protocol]
+path = "../../ghostframe-protocol"
+
 [[bin]]
 name = "handle_udp"
 path = "fuzz_targets/handle_udp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_tile_payload"
+path = "fuzz_targets/decode_tile_payload.rs"
 test = false
 doc = false
 bench = false
