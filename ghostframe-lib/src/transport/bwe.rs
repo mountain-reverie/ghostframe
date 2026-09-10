@@ -26,11 +26,6 @@
 
 use std::time::{Duration, Instant};
 
-// `str0m::bwe::Bitrate` is the public bitrate newtype from str0m-proto.
-// We import it so callers can convert between our u64 bps and str0m's type.
-#[allow(unused_imports)]
-pub use str0m::bwe::Bitrate as Str0mBitrate;
-
 // ── EWMA parameters ─────────────────────────────────────────────────────────
 
 /// The half-life of the EWMA: after this many seconds without new samples the
@@ -272,10 +267,31 @@ mod tests {
         );
     }
 
+    /// Guards the import paths. goog_cc's published docs reference
+    /// `goog_cc::api::*`, which is a private module; the real re-exports are
+    /// at the crate root. This test fails to compile if that changes.
     #[test]
-    fn str0m_bitrate_type_accessible() {
-        // Smoke-test that we can construct a str0m Bitrate from our bps value.
-        let br = Str0mBitrate::bps(BweWrapper::INITIAL_BPS);
-        assert_eq!(br.as_u64(), BweWrapper::INITIAL_BPS);
+    fn googcc_constructs_standalone() {
+        use goog_cc::network_control::NetworkControllerConfig;
+        use goog_cc::transport::TargetRateConstraints;
+        use goog_cc::units::{DataRate, Timestamp};
+        use goog_cc::{GoogCcConfig, GoogCcNetworkController};
+
+        let t0 = Timestamp::from_millis(1_000);
+        let cfg = NetworkControllerConfig {
+            constraints: TargetRateConstraints {
+                at_time: t0,
+                min_data_rate: Some(DataRate::from_kilobits_per_sec(100)),
+                max_data_rate: Some(DataRate::from_kilobits_per_sec(50_000)),
+                starting_rate: Some(DataRate::from_kilobits_per_sec(1_000)),
+            },
+            ..Default::default()
+        };
+        let _ctl = GoogCcNetworkController::new(
+            cfg,
+            GoogCcConfig {
+                feedback_only: false,
+            },
+        );
     }
 }
