@@ -80,7 +80,7 @@ In `ghostframe-lib/Cargo.toml`, under `[dependencies]`, next to the existing `st
 # delay-gradient + loss-based bandwidth estimate. str0m's own GoogCC port is
 # pub(crate) and cannot be constructed without an Rtc session (checked against
 # 0.21 and 0.23.1), which is why this is a separate dependency.
-goog_cc = "0.1.4"
+goog_cc = "=0.1.4"
 ```
 
 - [ ] **Step 4: Run it and watch it pass**
@@ -459,14 +459,19 @@ pub(crate) struct GoogCcDriver {
 impl GoogCcDriver {
     pub(crate) fn new(initial_bps: u64, now: Instant) -> Self {
         let at_time = Timestamp::from_millis(0);
-        let mut cfg = NetworkControllerConfig::default();
-        cfg.constraints = TargetRateConstraints {
-            at_time,
-            min_data_rate: Some(DataRate::from_bits_per_sec(MIN_BPS)),
-            max_data_rate: Some(DataRate::from_bits_per_sec(MAX_BPS)),
-            starting_rate: Some(DataRate::from_bits_per_sec(
-                (initial_bps as i64).clamp(MIN_BPS, MAX_BPS),
-            )),
+        // Struct literal, not `default()` then field assignment: the latter
+        // trips `clippy::field_reassign_with_default`, and CI runs clippy
+        // with `-D warnings`.
+        let cfg = NetworkControllerConfig {
+            constraints: TargetRateConstraints {
+                at_time,
+                min_data_rate: Some(DataRate::from_bits_per_sec(MIN_BPS)),
+                max_data_rate: Some(DataRate::from_bits_per_sec(MAX_BPS)),
+                starting_rate: Some(DataRate::from_bits_per_sec(
+                    (initial_bps as i64).clamp(MIN_BPS, MAX_BPS),
+                )),
+            },
+            ..Default::default()
         };
         Self {
             ctl: GoogCcNetworkController::new(cfg, GoogCcConfig { feedback_only: false }),
