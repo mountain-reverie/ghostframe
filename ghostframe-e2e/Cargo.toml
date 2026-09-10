@@ -22,6 +22,12 @@ ghostframe-protocol = { path = "../ghostframe-protocol" }
 # decode + accumulation (was a dev-dep; framebuffer.rs is in the library,
 # not just tests).
 ghostframe-client-core = { path = "../ghostframe-client-core" }
+# Used directly by src/harness/browserless.rs to drive a real ClientNet
+# session over the socketpair pump.
+ghostframe-client-net = { path = "../ghostframe-client-net" }
+# Used directly by src/harness/browserless.rs to decode the server's
+# cert hash for ClientNetConfig::server_cert_sha256.
+hex = { workspace = true }
 # Harness library needs these at lib-build time (was dev-deps).
 testcontainers = "0.27"
 chromiumoxide = "0.9"

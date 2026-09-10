@@ -8,6 +8,7 @@
 //! for the API contract.
 
 pub mod browser;
+pub mod browserless;
 pub mod cleanup;
 pub mod containers;
 pub mod e2e_certs;
