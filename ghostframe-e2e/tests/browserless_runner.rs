@@ -1,14 +1,18 @@
-//! Task 15a: transport bring-up for the browserless netsim scene runner.
+//! Task 15a/15b: the browserless netsim scene runner.
 //!
-//! Proves a real `IoBridge` and a real `ClientNet` can establish a
+//! Task 15a proved a real `IoBridge` and a real `ClientNet` can establish a
 //! WebTransport session across a Unix socketpair, routed through the
-//! netsim, under tokio's virtual clock. No tile injection, no frame
-//! scripts, no framebuffer assembly — that is task 15b.
+//! netsim, under tokio's virtual clock (tests 1-3 below). Task 15b adds
+//! tile injection and framebuffer assembly (tests 4-5): frames declared on
+//! `BrowserlessScene::frames` are encoded and sent to a real `IoBridge`,
+//! decoded by a real `ClientNet`, and the resulting `Event::TileReady`
+//! pixels land in `BrowserlessResult.framebuffer`.
 
 use std::time::Duration;
 
 use ghostframe_client_net::ClientNetEvent;
-use ghostframe_e2e::harness::browserless::{run_browserless, BrowserlessScene};
+use ghostframe_e2e::harness::browserless::{run_browserless, BrowserlessScene, FrameScript};
+use ghostframe_e2e::harness::scene_tiles::TileSpec;
 use ghostframe_e2e::netsim::NetProfile;
 
 #[tokio::test(start_paused = true)]
@@ -95,4 +99,85 @@ async fn a_lossy_link_still_establishes_and_records_drops() {
         result.bytes_dropped,
         result.bytes_delivered
     );
+}
+
+/// The plan's acceptance test: a single Solid tile, injected once the
+/// session is ready, arrives at the client and decodes to the right BGRA
+/// -> RGBA swizzle.
+#[tokio::test(start_paused = true)]
+async fn a_single_solid_tile_arrives_on_a_perfect_link() {
+    let scene = BrowserlessScene {
+        seed: 1,
+        frames: vec![FrameScript {
+            tiles: vec![(
+                (0, 0),
+                TileSpec::Solid {
+                    bgra: [10, 20, 30, 255],
+                },
+            )],
+        }],
+        net: NetProfile::perfect(),
+        duration: Duration::from_millis(500),
+        grid_cols: 4,
+        grid_rows: 4,
+    };
+
+    let result = run_browserless(scene).await.expect("scene ran");
+
+    let px = result
+        .framebuffer
+        .tile_rgba(0, 0)
+        .expect("tile (0,0) decoded");
+    assert_eq!(&px[0..4], &[30, 20, 10, 255], "BGRA -> RGBA swizzle");
+    assert_eq!(result.stale_generation_tiles, 0);
+}
+
+/// Proves frames after the first are actually injected, and that the
+/// per-tile generation counter genuinely advances: a two-frame scene
+/// rewrites tile (0,0) with a different color in frame 2, and only frame
+/// 2's color must survive. `a_single_solid_tile_arrives_on_a_perfect_link`
+/// alone would pass even if the injection loop only ever sent frame 0 —
+/// this is the test that would catch that.
+#[tokio::test(start_paused = true)]
+async fn a_second_frame_overwrites_the_first_frames_tile() {
+    let scene = BrowserlessScene {
+        seed: 3,
+        frames: vec![
+            FrameScript {
+                tiles: vec![(
+                    (0, 0),
+                    TileSpec::Solid {
+                        bgra: [10, 20, 30, 255],
+                    },
+                )],
+            },
+            FrameScript {
+                tiles: vec![(
+                    (0, 0),
+                    TileSpec::Solid {
+                        bgra: [200, 150, 100, 255],
+                    },
+                )],
+            },
+        ],
+        net: NetProfile::perfect(),
+        duration: Duration::from_millis(500),
+        grid_cols: 4,
+        grid_rows: 4,
+    };
+
+    let result = run_browserless(scene).await.expect("scene ran");
+
+    let px = result
+        .framebuffer
+        .tile_rgba(0, 0)
+        .expect("tile (0,0) decoded");
+    assert_eq!(
+        &px[0..4],
+        &[100, 150, 200, 255],
+        "frame 2's color (BGRA [200,150,100,255] -> RGBA) must be what the \
+         client ends up rendering, proving frame 2 was actually injected \
+         and its generation advanced past frame 1's"
+    );
+    assert_eq!(result.stale_generation_tiles, 0);
 }
