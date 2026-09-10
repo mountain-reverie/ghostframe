@@ -1756,6 +1756,31 @@ impl IoBridge {
         // matters under ~1800 identical records per second.
         let mut out_of_grid_skipped = 0usize;
         let mut first_out_of_grid: Option<(u8, u8)> = None;
+
+        // Newer content for a tile must invalidate whatever is still queued
+        // for it, exactly as the capture path's `bump_generation` does. Skip
+        // this and two versions of the same tile sit in the queue at once;
+        // whichever drains later is rendered last, and since
+        // `drain_scheduler_into_quinn` stamps every tile it drains with the
+        // *draining* frame's seq rather than the enqueuing frame's, the older
+        // content can arrive labelled newer and win.
+        //
+        // Done once per distinct tile before the enqueue loop, not per work
+        // item: a Cdf53 tile contributes 14 pass items for the same
+        // coordinate, and superseding per item would drop this very frame's
+        // earlier passes.
+        let mut superseded: Vec<(u8, u8)> = Vec::new();
+        for work in &inj.work {
+            if work.tile_x as u32 >= cols || work.tile_y as u32 >= rows {
+                continue;
+            }
+            let coord = (work.tile_x, work.tile_y);
+            if !superseded.contains(&coord) {
+                self.scheduler.supersede_pending_for_tile(coord.0, coord.1);
+                superseded.push(coord);
+            }
+        }
+
         for work in inj.work {
             if work.tile_x as u32 >= cols || work.tile_y as u32 >= rows {
                 out_of_grid_skipped += 1;
@@ -4930,6 +4955,66 @@ mod tests {
         // drive a ~4 GiB allocation.
         let e = validate_frame_header(0xFFFF_FFFF, 0).expect_err("absurd total_len");
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// Re-injecting a tile must supersede whatever is still queued for it,
+    /// mirroring the capture path's `bump_generation`.
+    ///
+    /// Without this, two versions of the same tile sit in the queue at once
+    /// and whichever drains later is rendered last. That inverts content
+    /// order because `drain_scheduler_into_quinn` stamps every tile it drains
+    /// with the *draining* frame's seq, not the enqueuing frame's — so the
+    /// older content can arrive labelled newer and win.
+    #[tokio::test]
+    async fn injected_frame_supersedes_prior_work_for_the_same_tile() {
+        use crate::transport::scheduler::{TileWork, WorkState};
+
+        let (our_end, _peer) = UnixStream::pair().expect("UnixStream::pair failed");
+        let server = QuicServer::new().expect("QuicServer::new failed");
+        let (_tx, rx) = mpsc::channel::<InjectedFrame>(4);
+        let mut bridge = IoBridge::new_with_injection_for_test(our_end, server, rx, 4, 4);
+
+        let work_for = |generation: u8, payload: Vec<u8>| TileWork {
+            tile_x: 0,
+            tile_y: 0,
+            generation,
+            pass_idx: 0,
+            total_passes: 1,
+            codec: crate::transport::protocol::Codec::Solid,
+            payload,
+            queued_at: now_std(),
+            last_sent_at: None,
+            state: WorkState::Pending,
+        };
+
+        let frame_of = |seq: u32, work: TileWork| InjectedFrame {
+            seq,
+            timestamp_us: seq * 16_000,
+            budget_bytes: usize::MAX,
+            work: vec![work],
+        };
+
+        // No session is connected, so the drain budget clamps to zero and
+        // nothing leaves the queue — which is what lets us observe the
+        // supersede directly.
+        bridge.apply_injected_frame(frame_of(0, work_for(0, vec![1, 2, 3, 255])));
+        bridge.apply_injected_frame(frame_of(1, work_for(1, vec![9, 9, 9, 255])));
+
+        let live: Vec<_> = bridge
+            .scheduler
+            .queue_states_for_test()
+            .into_iter()
+            .filter(|(x, y, state)| {
+                *x == 0 && *y == 0 && !matches!(state, WorkState::Superseded | WorkState::Acked)
+            })
+            .collect();
+
+        assert_eq!(
+            live.len(),
+            1,
+            "exactly one live entry must remain for tile (0,0) after re-injection, \
+             found {live:?}"
+        );
     }
 
     /// A malformed frame must be logged and swallowed without killing the
