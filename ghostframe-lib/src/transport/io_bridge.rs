@@ -39,7 +39,7 @@ use crate::transport::fec;
 use crate::transport::fec::fec_group_size;
 use crate::transport::feedback::ReceiverFeedback;
 use crate::transport::ghostbridge::{
-    encode_frame, parse_frame_rest, GhostbridgeConfig, GhostbridgeHandle,
+    encode_frame, parse_frame_rest, GhostbridgeConfig, GhostbridgeHandle, MAX_FRAME_LEN,
 };
 use crate::transport::protocol::{
     build_frame_parity_datagram, fragment_frame, fragment_tile, max_fragment_payload,
@@ -733,6 +733,40 @@ pub(crate) struct PalRleTileWorkPrep {
     pub palette: crate::encoder::pal_rle::PaletteEntry,
     pub palette_id: u8,
     pub bundled: bool,
+}
+
+/// Validate a frame header and return how many bytes follow it.
+///
+/// Split out of `process_inbound` so the bounds can be tested directly:
+/// driving them through `run()` cannot distinguish a rejected frame from an
+/// accepted one, because either way the read that follows ends in
+/// `UnexpectedEof` once the peer closes and the loop swallows it identically.
+///
+/// `total_len` counts the 8-byte header itself, so the remainder is
+/// `total_len - 8`.
+fn validate_frame_header(total_len: usize, payload_len: usize) -> io::Result<usize> {
+    // Minimum valid frame: header (8) + payload + port (2) + NUL (1) = 11.
+    if total_len < 8 + payload_len + 3 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame too short",
+        ));
+    }
+
+    // ...and an upper bound, because the check above only rejects frames that
+    // are too *small*. Without it a corrupt `total_len` drives a ~4 GiB
+    // allocation and then a `read_exact` for bytes that never arrive, wedging
+    // the bridge task. See `MAX_FRAME_LEN`.
+    if total_len > MAX_FRAME_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("frame total_len {total_len} exceeds MAX_FRAME_LEN {MAX_FRAME_LEN}"),
+        ));
+    }
+
+    total_len
+        .checked_sub(8)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "frame total_len underflow"))
 }
 
 impl IoBridge {
@@ -3970,17 +4004,7 @@ impl IoBridge {
         let total_len = u32::from_be_bytes(header[0..4].try_into().unwrap()) as usize;
         let payload_len = u32::from_be_bytes(header[4..8].try_into().unwrap()) as usize;
 
-        // Minimum valid frame: header (8) + payload + port (2) + NUL (1) = 11.
-        if total_len < 8 + payload_len + 3 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "frame too short",
-            ));
-        }
-
-        let rest_len = total_len.checked_sub(8).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "frame total_len underflow")
-        })?;
+        let rest_len = validate_frame_header(total_len, payload_len)?;
         let mut rest = vec![0u8; rest_len];
         self.stream.read_exact(&mut rest).await?;
 
@@ -4870,6 +4894,42 @@ mod tests {
             Ok(Err(join_err)) => panic!("task panicked: {join_err}"),
             Err(_) => panic!("run() did not return within timeout"),
         }
+    }
+
+    /// `validate_frame_header` bounds, tested directly.
+    ///
+    /// These cannot be driven through `run()`: whether a frame is rejected or
+    /// accepted, the read that follows ends in `UnexpectedEof` once the peer
+    /// closes, and the event loop swallows both identically — so a `run()`
+    /// level test passes with the bounds removed entirely. (Verified: it did.)
+    #[test]
+    fn validate_frame_header_bounds() {
+        // A legitimate small frame: 8 header + 4 payload + 2 port + "1.2.3.4\0".
+        let ok = validate_frame_header(8 + 4 + 2 + 8, 4).expect("valid frame");
+        assert_eq!(ok, 4 + 2 + 8, "remainder excludes the 8-byte header");
+
+        // Exactly at the minimum: header + 0 payload + port + NUL.
+        assert!(validate_frame_header(11, 0).is_ok());
+
+        // One byte under the minimum.
+        let e = validate_frame_header(10, 0).expect_err("too short must be rejected");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+
+        // Declared payload larger than the frame that carries it.
+        assert!(validate_frame_header(20, 100).is_err());
+
+        // Exactly at the upper bound is still accepted...
+        assert!(validate_frame_header(MAX_FRAME_LEN, 0).is_ok());
+
+        // ...one byte over is not. Without this bound the caller allocates
+        // `total_len - 8` bytes and then awaits them forever.
+        let e = validate_frame_header(MAX_FRAME_LEN + 1, 0).expect_err("over bound");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+
+        // The hostile case: passes the too-short check trivially, and would
+        // drive a ~4 GiB allocation.
+        let e = validate_frame_header(0xFFFF_FFFF, 0).expect_err("absurd total_len");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
     }
 
     /// A malformed frame must be logged and swallowed without killing the

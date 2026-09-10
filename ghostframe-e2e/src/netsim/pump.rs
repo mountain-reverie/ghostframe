@@ -12,21 +12,13 @@
 //! `ghostframe_lib::transport::ghostbridge` rather than reimplementing the
 //! framing — those are `pub` specifically so this harness can share them.
 
-use ghostframe_lib::transport::ghostbridge::{encode_frame, parse_frame_rest, UdpPacket};
+use ghostframe_lib::transport::ghostbridge::{
+    encode_frame, parse_frame_rest, UdpPacket, MAX_FRAME_LEN,
+};
 use std::io;
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-
-/// A UDP datagram cannot exceed 65535 bytes; the frame adds an 8-byte
-/// header, a 2-byte port and a NUL-terminated host string. This bound is
-/// deliberately generous — its job is only to stop a corrupted or fuzzed
-/// `total_len` from driving a multi-gigabyte allocation before
-/// `read_exact` blocks forever waiting for bytes that will never arrive.
-/// Production's `process_inbound` has no equivalent bound because it only
-/// ever reads from ghostbridge; this pump is fed adversarial input by the
-/// netsim fuzz target.
-const MAX_FRAME_LEN: usize = 72 * 1024;
 
 /// Moves framed UDP datagrams across a `tokio::net::UnixStream`, mirroring
 /// the framing the production `io_bridge::run` reader speaks
@@ -49,14 +41,14 @@ impl SocketPairPump {
     /// `total_len` includes its own 8-byte header, so the remainder is
     /// `total_len - 8`, not `total_len`.
     ///
-    /// Unlike `process_inbound`, this also rejects a `total_len` above
+    /// Like `process_inbound`, this rejects a `total_len` above
     /// [`MAX_FRAME_LEN`] before allocating the remainder buffer: the
     /// too-short check alone only rejects frames that are too *small*, so a
     /// corrupted or fuzzed `total_len` would otherwise drive a
     /// multi-gigabyte allocation and then hang in `read_exact` waiting for
-    /// bytes that will never arrive. Production has no equivalent bound
-    /// because it only ever reads from ghostbridge; this pump is exercised
-    /// by the netsim fuzz target with adversarial input.
+    /// bytes that will never arrive. Both sides share [`MAX_FRAME_LEN`],
+    /// defined next to the framing functions, so the harness and the
+    /// production reader cannot drift apart on what a legal frame is.
     pub async fn recv(&mut self) -> io::Result<UdpPacket> {
         let mut header = [0u8; 8];
         self.stream.read_exact(&mut header).await?;
