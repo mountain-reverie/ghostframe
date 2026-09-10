@@ -12,6 +12,35 @@
 //! RGBA expansion, since `ghostframe_protocol::codec::solid::decode_solid`
 //! only extracts the 4 raw bytes and leaves tiling to the caller.
 //!
+//! ## Two ingest paths, for two different sources (task 15b)
+//!
+//! `FrameBuffer` has two ways to receive a tile, and they are NOT
+//! duplicates of each other — a future reader must not try to "unify"
+//! them, because the two staleness fields they key off have genuinely
+//! different ordering properties:
+//!
+//! - [`FrameBuffer::apply`] ingests a **raw wire payload** and decodes it
+//!   itself (Solid/PalRle/Cdf53). It exists to build expected tiles from
+//!   `TileSpec`s and to unit-test this module's own decode/swizzle logic
+//!   directly, without a real `ClientNet`. Its staleness is on the 4-bit
+//!   `generation` wire field, which wraps at 16 and has no well-defined
+//!   `<` ordering — see the "Staleness policy" section below for the
+//!   bitmask-based scheme this forces.
+//! - [`FrameBuffer::apply_tile_ready`] ingests **already-decoded RGBA**,
+//!   as surfaced by a real `ghostframe_client_core`/`ClientNet` session
+//!   (`Event::TileReady`). This is what a browserless scene run
+//!   (`BrowserlessResult`) actually drives, since the client core decodes
+//!   tiles internally and the harness never sees payloads or codecs on
+//!   the receive side. Its staleness is on `frame_seq`, a `u32` that is
+//!   monotonically increasing across a scene — so unlike `generation`,
+//!   plain `<` is a correct staleness test here, and no bitmask is
+//!   needed.
+//!
+//! These are two layers with two mechanisms, not one duplicated in two
+//! places: `apply` proves the decode logic is correct in isolation;
+//! `apply_tile_ready` records what a real client actually rendered. A
+//! scene run only ever uses one of the two.
+//!
 //! ## Staleness policy (this module's decision, not client-core's)
 //!
 //! `generation` is a 4-bit field (0..=15) that wraps, and nothing in this
@@ -87,7 +116,12 @@ impl GenerationTracker {
 
 struct TileEntry {
     rgba: Vec<u8>,
-    tracker: GenerationTracker,
+    /// Populated only by `apply` (raw wire payload path). `None` for a
+    /// tile that has only ever been touched by `apply_tile_ready`.
+    tracker: Option<GenerationTracker>,
+    /// Populated only by `apply_tile_ready` (decoded-RGBA path). `None`
+    /// for a tile that has only ever been touched by `apply`.
+    highest_frame_seq: Option<u32>,
 }
 
 /// The result of decoding one payload, before staleness has been decided.
@@ -108,6 +142,11 @@ pub struct FrameBuffer {
     palettes: Box<[[[u8; 4]; 16]; 256]>,
     cdf53_state: Cdf53TileState,
     stale_generation_tiles: u32,
+    /// Staleness counter for the `apply_tile_ready` ingest path. Kept
+    /// separate from `stale_generation_tiles` (the `apply` path's
+    /// counter) since the two staleness definitions are unrelated — see
+    /// the module docs.
+    stale_frame_tiles: u32,
 }
 
 impl FrameBuffer {
@@ -118,6 +157,7 @@ impl FrameBuffer {
             palettes: Box::new([[[0u8; 4]; 16]; 256]),
             cdf53_state: Cdf53TileState::new(),
             stale_generation_tiles: 0,
+            stale_frame_tiles: 0,
         }
     }
 
@@ -153,7 +193,13 @@ impl FrameBuffer {
         // superseded.
         let accepted = match self.tiles.get_mut(&(tile_x, tile_y)) {
             None => true,
-            Some(entry) => entry.tracker.accept(generation),
+            // A tile already present from `apply_tile_ready` but never
+            // touched by `apply` has no tracker yet: treat this as the
+            // first `apply`-path arrival for it, not a staleness check.
+            Some(entry) => match entry.tracker.as_mut() {
+                Some(tracker) => tracker.accept(generation),
+                None => true,
+            },
         };
 
         if !accepted {
@@ -182,13 +228,56 @@ impl FrameBuffer {
 
         self.tiles
             .entry((tile_x, tile_y))
-            .and_modify(|e| e.rgba = rgba.clone())
+            .and_modify(|e| {
+                e.rgba = rgba.clone();
+                if e.tracker.is_none() {
+                    e.tracker = Some(GenerationTracker::new(generation));
+                }
+            })
             .or_insert_with(|| TileEntry {
                 rgba,
-                tracker: GenerationTracker::new(generation),
+                tracker: Some(GenerationTracker::new(generation)),
+                highest_frame_seq: None,
             });
 
         Ok(())
+    }
+
+    /// Ingest a tile as actually decoded by a real `ClientNet`/client-core
+    /// session (`ghostframe_client_core::Event::TileReady`). See the
+    /// module docs for why this is a distinct ingest path from `apply`,
+    /// with its own staleness definition.
+    ///
+    /// `frame_seq` is monotonically increasing across a scene, so unlike
+    /// `generation` a plain `<` comparison is a correct staleness test
+    /// here: a `TileReady` whose `frame_seq` is strictly less than the
+    /// highest one already stored for this tile is stale — the counter
+    /// returned by `stale_frame_tiles()` is bumped and the stored pixels
+    /// are left untouched. An equal or greater `frame_seq` always applies
+    /// (this covers a tile re-arriving for the same frame, e.g. a later
+    /// Cdf53 refinement pass folded into the same `frame_seq`).
+    pub fn apply_tile_ready(&mut self, frame_seq: u32, tile_x: u8, tile_y: u8, rgba: Vec<u8>) {
+        match self.tiles.get_mut(&(tile_x, tile_y)) {
+            None => {
+                self.tiles.insert(
+                    (tile_x, tile_y),
+                    TileEntry {
+                        rgba,
+                        tracker: None,
+                        highest_frame_seq: Some(frame_seq),
+                    },
+                );
+            }
+            Some(entry) => {
+                let stale = matches!(entry.highest_frame_seq, Some(highest) if frame_seq < highest);
+                if stale {
+                    self.stale_frame_tiles += 1;
+                    return;
+                }
+                entry.rgba = rgba;
+                entry.highest_frame_seq = Some(frame_seq);
+            }
+        }
     }
 
     /// The 4096-byte RGBA contents of a tile, if it has received anything.
@@ -198,6 +287,13 @@ impl FrameBuffer {
 
     pub fn stale_generation_tiles(&self) -> u32 {
         self.stale_generation_tiles
+    }
+
+    /// Staleness counter for the `apply_tile_ready` ingest path (see its
+    /// doc comment). This is the counter `BrowserlessResult` actually
+    /// uses, since a scene run only ever calls `apply_tile_ready`.
+    pub fn stale_frame_tiles(&self) -> u32 {
+        self.stale_frame_tiles
     }
 }
 

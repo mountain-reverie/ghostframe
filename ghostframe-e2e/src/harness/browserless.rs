@@ -1,4 +1,4 @@
-//! Task 15a: browserless netsim scene runner — transport bring-up only.
+//! Task 15a/15b: browserless netsim scene runner.
 //!
 //! Wires together a real `IoBridge` and a real `ghostframe_client_net::ClientNet`
 //! across a `tokio::net::UnixStream` socketpair, with every datagram routed
@@ -8,11 +8,15 @@
 //! `IoBridge` event loop, the same `ClientNet` sans-IO state machine that
 //! production uses, just without tsnet or a browser.
 //!
-//! **Scope**: this module does NOT do tile injection, frame scripts, or
-//! framebuffer assembly. `BrowserlessScene::frames` is accepted but unused
-//! — see the `TODO(task-15b)` below for what will consume it. The public
-//! types are shaped so that work slots in without changing this module's
-//! wiring.
+//! Once the session reaches `SessionReady`, `run_browserless` drains
+//! `BrowserlessScene::frames` in order, encoding each `FrameScript`'s tiles
+//! with `scene_tiles::encode_tile` and sending them to `IoBridge` as
+//! `InjectedFrame`s over the injection channel `new_with_injection_for_test`
+//! already wires up. The client core decodes tiles internally — the runner
+//! never sees payloads or codecs on the receive side, only
+//! `Event::TileReady`'s already-decoded RGBA, which is fed into
+//! `FrameBuffer::apply_tile_ready` (see that module's docs for why this is
+//! a separate ingest path from `FrameBuffer::apply`).
 //!
 //! ## Wiring
 //!
@@ -34,6 +38,7 @@
 //! scheduling off the same clock keeps both sides of the socketpair on one
 //! consistent timeline under `#[tokio::test(start_paused = true)]`.
 
+use std::collections::HashMap;
 use std::net::{Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
@@ -42,21 +47,23 @@ use tokio::sync::mpsc;
 use tokio::task::LocalSet;
 use tokio::time::Instant as TokioInstant;
 
+use ghostframe_client_core::Event as CoreEvent;
 use ghostframe_client_net::{ClientNet, ClientNetConfig, ClientNetEvent};
 use ghostframe_lib::transport::io_bridge::{InjectedFrame, IoBridge};
 use ghostframe_lib::transport::quic::QuicServer;
 
 use crate::harness::framebuffer::FrameBuffer;
-use crate::harness::scene_tiles::TileSpec;
+use crate::harness::scene_tiles::{encode_tile, TileSpec};
 use crate::netsim::{NetProfile, NetSim, SocketPairPump, Verdict};
+
+/// Two virtual milliseconds' worth of frame spacing between injected
+/// frames, matching a 62.5 fps scene-authoring cadence. Chosen simply to
+/// be a small, deterministic, non-zero gap — nothing downstream depends on
+/// this value meaning "one frame at 60fps" precisely.
+const FRAME_SPACING_US: u64 = 16_000;
 
 /// One scene frame's worth of declared tile content, keyed by `(tile_x,
 /// tile_y)`.
-///
-/// TODO(task-15b): this is unused by `run_browserless` today. Task 15b
-/// will drain `BrowserlessScene::frames` through `scene_tiles::encode_tile`
-/// into `InjectedFrame`s and send them over the `inject_tx` channel this
-/// module already keeps alive.
 pub struct FrameScript {
     pub tiles: Vec<((u8, u8), TileSpec)>,
 }
@@ -65,8 +72,9 @@ pub struct FrameScript {
 /// session, no browser, no tsnet, driven under tokio's virtual clock.
 pub struct BrowserlessScene {
     pub seed: u64,
-    /// TODO(task-15b): accepted but not yet consumed. See `FrameScript`'s
-    /// doc comment for what will drain this.
+    /// Drained in order once the session reaches `SessionReady`, one
+    /// `FrameScript` every `FRAME_SPACING_US` of virtual time. See the
+    /// module docs.
     pub frames: Vec<FrameScript>,
     pub net: NetProfile,
     pub duration: Duration,
@@ -87,8 +95,11 @@ pub struct BrowserlessResult {
     pub events: Vec<ClientNetEvent>,
     pub bytes_delivered: u64,
     pub bytes_dropped: u64,
-    /// Read from `FrameBuffer::stale_generation_tiles()` — this module does
-    /// not maintain a second staleness definition.
+    /// Read from `FrameBuffer::stale_frame_tiles()` — a scene run only
+    /// ever ingests via `FrameBuffer::apply_tile_ready` (real decoded
+    /// `TileReady` events), never `FrameBuffer::apply`, so the `frame_seq`
+    /// staleness counter is the one that means something here. This
+    /// module does not maintain a second staleness definition of its own.
     pub stale_generation_tiles: u32,
     pub seed: u64,
 }
@@ -135,13 +146,9 @@ async fn run_inner(scene: BrowserlessScene) -> anyhow::Result<BrowserlessResult>
     hex::decode_to_slice(&server.cert_info().sha256_hex, &mut server_cert_sha256)
         .map_err(|e| anyhow!("seed {seed}: cert hash hex decode failed: {e}"))?;
 
-    // TODO(task-15b): `inject_tx` will carry `FrameScript`-derived
-    // `InjectedFrame`s once tile injection lands. For now nothing is ever
-    // sent on it; it is only kept alive (as `_inject_tx`) so the channel
-    // does not close under `IoBridge`, which would surface as a spurious
-    // `inject_rx = None` inside `IoBridge::run`'s select loop.
+    // `inject_tx` carries `FrameScript`-derived `InjectedFrame`s to
+    // `IoBridge`, once the session is ready — see `drive_session`.
     let (inject_tx, inject_rx) = mpsc::channel::<InjectedFrame>(8);
-    let _inject_tx = inject_tx;
 
     let mut bridge = IoBridge::new_with_injection_for_test(
         ours,
@@ -168,7 +175,18 @@ async fn run_inner(scene: BrowserlessScene) -> anyhow::Result<BrowserlessResult>
         supports_h264: false,
     };
 
-    let outcome = drive_handshake(cfg, &mut pump, client_addr, server_addr, base, &scene).await;
+    let mut framebuffer = FrameBuffer::new();
+    let outcome = drive_session(
+        cfg,
+        &mut pump,
+        client_addr,
+        server_addr,
+        base,
+        &scene,
+        &inject_tx,
+        &mut framebuffer,
+    )
+    .await;
 
     // Always abort, on every exit path — the bridge task must not outlive
     // this function, and `outcome` may be an `Err`.
@@ -176,8 +194,7 @@ async fn run_inner(scene: BrowserlessScene) -> anyhow::Result<BrowserlessResult>
 
     let (events, bytes_delivered, bytes_dropped) = outcome?;
 
-    let framebuffer = FrameBuffer::new();
-    let stale_generation_tiles = framebuffer.stale_generation_tiles();
+    let stale_generation_tiles = framebuffer.stale_frame_tiles();
 
     Ok(BrowserlessResult {
         framebuffer,
@@ -189,18 +206,33 @@ async fn run_inner(scene: BrowserlessScene) -> anyhow::Result<BrowserlessResult>
     })
 }
 
-/// Drive the client<->server handshake to `SessionReady` (or fail loudly),
-/// routing every datagram through a seeded `NetSim` per direction.
+/// Drive the client<->server session to `SessionReady` and then, if the
+/// scene declares any `frames`, inject them in order at `FRAME_SPACING_US`
+/// intervals of virtual time — routing every datagram through a seeded
+/// `NetSim` per direction throughout, and feeding every decoded
+/// `Event::TileReady` into `framebuffer`.
+///
+/// A scene with no frames returns the instant `SessionReady` is observed,
+/// exactly as task 15a's handshake-only behavior did. A scene with frames
+/// keeps running the same event loop — sending injected frames on schedule
+/// and draining inbound datagrams/events — until `scene.duration` elapses,
+/// since that is the scene's only declared time budget and there is no
+/// other natural "done" signal (a `TileReady` for the last tile the scene
+/// touched does not by itself mean every in-flight retransmission has
+/// settled).
 ///
 /// Returns the accumulated client events, bytes delivered, and bytes
 /// dropped across both directions.
-async fn drive_handshake(
+#[allow(clippy::too_many_arguments)]
+async fn drive_session(
     cfg: ClientNetConfig,
     pump: &mut SocketPairPump,
     client_addr: SocketAddr,
     server_addr: SocketAddr,
     base: TokioInstant,
     scene: &BrowserlessScene,
+    inject_tx: &mpsc::Sender<InjectedFrame>,
+    framebuffer: &mut FrameBuffer,
 ) -> anyhow::Result<(Vec<ClientNetEvent>, u64, u64)> {
     let seed = scene.seed;
 
@@ -220,7 +252,19 @@ async fn drive_handshake(
     let mut bytes_delivered: u64 = 0;
     let mut bytes_dropped: u64 = 0;
 
-    // Two independent bounds so a stuck handshake fails loudly instead of
+    // Per-tile generation counters for injected frames: a coordinate's
+    // generation is the number of times it has previously appeared in an
+    // earlier `FrameScript`, wrapping mod 16 (the wire field is 4 bits) —
+    // see `inject_frame`.
+    let mut generations: HashMap<(u8, u8), u8> = HashMap::new();
+    let mut session_ready = false;
+    let mut next_frame_idx: usize = 0;
+    // Set once the session is ready and the scene has at least one frame;
+    // `Some(t)` means "frame `next_frame_idx` is due at virtual time `t`
+    // (us since `base`)".
+    let mut next_inject_at_us: Option<u64> = None;
+
+    // Two independent bounds so a stuck scene fails loudly instead of
     // hanging: `MAX_ITERS` guards against a pathological loop that somehow
     // keeps making "progress" without advancing virtual time, and
     // `overall_deadline` guards virtual time itself (derived from
@@ -233,11 +277,17 @@ async fn drive_handshake(
         iter += 1;
         if iter > MAX_ITERS {
             bail!(
-                "seed {seed}: handshake did not reach SessionReady within {MAX_ITERS} \
-                 iterations; last events observed: {events:?}"
+                "seed {seed}: scene did not finish within {MAX_ITERS} iterations; \
+                 last events observed: {events:?}"
             );
         }
         if TokioInstant::now() >= overall_deadline {
+            if session_ready {
+                // Normal termination: the scene's declared time budget is
+                // spent. This is expected once frames have been injected,
+                // not a failure.
+                break;
+            }
             bail!(
                 "seed {seed}: scene duration {:?} elapsed after {iter} iterations without \
                  SessionReady; last events observed: {events:?}",
@@ -263,9 +313,42 @@ async fn drive_handshake(
             .map_err(|e| anyhow!("seed {seed}: pump send failed at iteration {iter}: {e}"))?;
         }
 
-        events.extend(client.take_events());
-        if events.contains(&ClientNetEvent::SessionReady) {
-            break;
+        let new_events = client.take_events();
+        for ev in &new_events {
+            if let ClientNetEvent::Core(CoreEvent::TileReady {
+                frame_seq,
+                tile_x,
+                tile_y,
+                rgba,
+            }) = ev
+            {
+                framebuffer.apply_tile_ready(*frame_seq, *tile_x, *tile_y, rgba.clone());
+            }
+        }
+        events.extend(new_events);
+
+        if !session_ready && events.contains(&ClientNetEvent::SessionReady) {
+            session_ready = true;
+            if scene.frames.is_empty() {
+                // Nothing to inject: preserve task 15a's exact behavior of
+                // returning the instant the session is ready.
+                break;
+            }
+            next_inject_at_us = Some(now_us(base));
+        }
+
+        if session_ready {
+            if let Some(due_at) = next_inject_at_us {
+                if next_frame_idx < scene.frames.len() && now_us(base) >= due_at {
+                    inject_frame(scene, next_frame_idx, &mut generations, inject_tx)
+                        .await
+                        .map_err(|e| {
+                            anyhow!("seed {seed}: frame {next_frame_idx} injection failed: {e}")
+                        })?;
+                    next_frame_idx += 1;
+                    next_inject_at_us = Some(due_at + FRAME_SPACING_US);
+                }
+            }
         }
 
         // Fire an already-due ClientNet timeout without waiting on
@@ -277,16 +360,23 @@ async fn drive_handshake(
             }
         }
 
-        // Wait for the next inbound frame from IoBridge, or the earliest
-        // deadline (ClientNet's own timer, capped by the scene's overall
-        // deadline), whichever comes first. Capping by `overall_deadline`
-        // guarantees this select cannot itself hang past the scene's
-        // budget even if ClientNet never arms a timer and IoBridge never
-        // responds.
-        let wake_at = match client.poll_timeout() {
-            Some(d) => (base + Duration::from_micros(d)).min(overall_deadline),
-            None => overall_deadline,
-        };
+        // Wait for the next inbound frame from IoBridge, the earliest
+        // deadline (ClientNet's own timer or the next scheduled
+        // injection), or the scene's overall deadline — whichever comes
+        // first. Capping by `overall_deadline` guarantees this select
+        // cannot itself hang past the scene's budget even if nothing else
+        // ever wakes it.
+        let mut wake_at = overall_deadline;
+        if let Some(d) = client.poll_timeout() {
+            wake_at = wake_at.min(base + Duration::from_micros(d));
+        }
+        if session_ready {
+            if let Some(due_at) = next_inject_at_us {
+                if next_frame_idx < scene.frames.len() {
+                    wake_at = wake_at.min(base + Duration::from_micros(due_at));
+                }
+            }
+        }
 
         tokio::select! {
             biased;
@@ -317,6 +407,66 @@ async fn drive_handshake(
     }
 
     Ok((events, bytes_delivered, bytes_dropped))
+}
+
+/// Encode and inject one `FrameScript`'s tiles as an `InjectedFrame`.
+///
+/// `generations` tracks, per tile coordinate, the generation to use next —
+/// incremented (wrapping mod 16, since `generation` is a 4-bit wire field)
+/// every time that specific coordinate is encoded, so a tile re-declared
+/// across up to 16 frames gets a genuinely advancing generation. A scene
+/// that rewrites any single tile coordinate more than 16 times will wrap
+/// and reuse a generation value; no scene in this harness does that today.
+///
+/// A tile coordinate outside the scene's fixed `grid_cols`/`grid_rows` is a
+/// scene-authoring bug, not a runtime condition to route around: the grid
+/// is sized once at construction (see `BrowserlessScene::grid_cols`'s doc
+/// comment on why `Scheduler::resize` is never called mid-scene), so this
+/// fails loudly naming the offending coordinate instead of silently
+/// dropping the tile the way `IoBridge::apply_injected_frame` does for a
+/// mis-sized harness grid.
+async fn inject_frame(
+    scene: &BrowserlessScene,
+    frame_idx: usize,
+    generations: &mut HashMap<(u8, u8), u8>,
+    inject_tx: &mpsc::Sender<InjectedFrame>,
+) -> anyhow::Result<()> {
+    let seed = scene.seed;
+    let script = &scene.frames[frame_idx];
+    let mut work = Vec::new();
+
+    for ((tile_x, tile_y), spec) in &script.tiles {
+        if (*tile_x as u32) >= scene.grid_cols || (*tile_y as u32) >= scene.grid_rows {
+            bail!(
+                "seed {seed}: scene frame {frame_idx} declares tile ({tile_x}, {tile_y}) \
+                 outside the {}x{} grid",
+                scene.grid_cols,
+                scene.grid_rows
+            );
+        }
+
+        let counter = generations.entry((*tile_x, *tile_y)).or_insert(0u8);
+        let generation = *counter;
+        *counter = (*counter + 1) % 16;
+
+        work.extend(encode_tile(spec, *tile_x, *tile_y, generation));
+    }
+
+    let frame = InjectedFrame {
+        seq: frame_idx as u32,
+        timestamp_us: (frame_idx as u64 * FRAME_SPACING_US) as u32,
+        // Unpaced: the netsim's token bucket does the real capping, and
+        // `IoBridge` clamps to quinn's actual send capacity
+        // (`clamp_to_quinn_capacity`, io_bridge.rs:1154) so this cannot
+        // overrun quinn's send buffer.
+        budget_bytes: usize::MAX,
+        work,
+    };
+
+    inject_tx
+        .send(frame)
+        .await
+        .map_err(|e| anyhow!("seed {seed}: inject_tx send failed at frame {frame_idx}: {e}"))
 }
 
 /// Current virtual time, in microseconds since `base`.

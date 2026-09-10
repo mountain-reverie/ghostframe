@@ -272,3 +272,46 @@ fn a_stale_payload_does_not_corrupt_the_palette_table() {
          generation 0 palette, the stale payload was decoded before being dropped"
     );
 }
+
+/// `apply_tile_ready` staleness is on `frame_seq`, a monotonically
+/// increasing `u32` — unlike `apply`'s 4-bit `generation`, a plain `<`
+/// comparison is correct here. A scene run cannot force reordering
+/// deterministically, so this is exercised directly against the unit under
+/// test instead of through `run_browserless`.
+#[test]
+fn apply_tile_ready_drops_a_strictly_older_frame_seq_and_keeps_the_newer_pixels() {
+    let mut fb = FrameBuffer::new();
+
+    let frame5 = vec![5u8; 4096];
+    let frame3 = vec![3u8; 4096];
+    let frame6 = vec![6u8; 4096];
+
+    fb.apply_tile_ready(5, 0, 0, frame5.clone());
+    assert_eq!(fb.stale_frame_tiles(), 0);
+    assert_eq!(fb.tile_rgba(0, 0), Some(frame5.as_slice()));
+
+    // Late/reordered arrival: frame_seq 3 < highest seen (5) — must be
+    // dropped, not overwrite the stored pixels.
+    fb.apply_tile_ready(3, 0, 0, frame3);
+    assert_eq!(
+        fb.stale_frame_tiles(),
+        1,
+        "frame_seq 3 arriving after frame_seq 5 must count as stale"
+    );
+    assert_eq!(
+        fb.tile_rgba(0, 0),
+        Some(frame5.as_slice()),
+        "the stale frame_seq 3 payload must not have overwritten frame 5's pixels"
+    );
+
+    // A genuinely newer frame_seq must still apply, and must NOT be
+    // counted as stale — this is what proves the counter isn't just
+    // "always stale".
+    fb.apply_tile_ready(6, 0, 0, frame6.clone());
+    assert_eq!(
+        fb.stale_frame_tiles(),
+        1,
+        "frame_seq 6 is newer than the stored frame_seq 5 and must not count as stale"
+    );
+    assert_eq!(fb.tile_rgba(0, 0), Some(frame6.as_slice()));
+}
