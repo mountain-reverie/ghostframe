@@ -9,5 +9,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with: { targets: wasm32-unknown-unknown }
-      - run: cargo test -p ghostframe-protocol -p ghostframe-client-core -p ghostframe-client-net
+      # ghostframe-client-net is deliberately NOT tested here: its
+      # dev-dependencies reach ghostframe-lib (for QuicServer in the test
+      # helpers), which needs the ffmpeg dev libraries this deliberately
+      # lightweight workflow does not install. Its tests run in e2e.yml's
+      # browserless job, which does install them. The wasm build below still
+      # covers it, and does not build dev-dependencies.
+      - run: cargo test -p ghostframe-protocol -p ghostframe-client-core
       - run: cargo build -p ghostframe-protocol -p ghostframe-client-core -p ghostframe-client-net --target wasm32-unknown-unknown
