@@ -356,6 +356,143 @@ git commit -m "feat(bwe): carry acknowledged datagram size through to the estima
 
 ---
 
+### Task 3b: Take the emit time from `last_sent_at`, not the cached bytes
+
+Found in review of Task 3. Blocks Task 4, because the driver consumes this field.
+
+**The bug.** `BweSample.server_emit_ms_lo16` is parsed out of the *cached*
+datagram bytes (`entry.fragments.first()`, bytes 12..16). On retransmit,
+`ReliableEmitter::tick` (`reliable_emitter/emitter.rs:179-212`) copies the
+fragments, re-stamps **the copies**, and sends those — the cached `Bytes` keep
+their original stamp. The BWE consumer reads the cache, so for any tile-pass
+that hit an RTO the emit time is the *first* send and the measured one-way
+delay swallows the entire backoff.
+
+That code even carries the comment "Re-stamp emit time on retransmit so the
+BWE consumer sees the actual on-wire moment, not the original send". The
+intent is right; it re-stamps the wrong copy for that purpose. The EWMA
+ignored one-way delay entirely, so this has never mattered — a delay-gradient
+controller reads those as hundreds of milliseconds of phantom congestion,
+under loss, which is exactly when it matters most.
+
+**The fix.** `CacheEntry` already tracks `last_sent_at: Instant`
+(`reliable_emitter/cache.rs:18`) — the actual on-wire moment, updated on every
+retransmit. Use it instead of parsing bytes.
+
+This also removes a whole class of problem: the emit series stops being a
+16-bit wrapped wire value and becomes full-precision server-side monotonic
+time. Only the *arrival* series still needs `Lo16Timeline`, because that one
+genuinely crosses the wire from the client's clock.
+
+**Files:**
+- Modify: `ghostframe-lib/src/transport/io_bridge.rs` (`BweSample`, its construction, the `AckArrival` drain)
+- Modify: `ghostframe-lib/src/transport/bwe/mod.rs` (`AckArrival`)
+
+- [ ] **Step 1: Write the failing test**
+
+Add to `mod tests` in `ghostframe-lib/src/transport/bwe/mod.rs`:
+
+```rust
+    /// The emit time must be server-side monotonic microseconds, not a
+    /// 16-bit wrapped wire value. A retransmitted datagram keeps its original
+    /// stamp in the cache, so reading bytes would report the first send and
+    /// bury the RTO backoff inside the measured one-way delay.
+    #[test]
+    fn ack_arrival_emit_time_is_monotonic_micros() {
+        let a = AckArrival {
+            wire_seq: 1,
+            server_emit_us: 5_000_000,
+            client_arrival_ms_lo16: 25,
+            size_bytes: 1200,
+        };
+        assert_eq!(a.server_emit_us, 5_000_000);
+    }
+```
+
+- [ ] **Step 2: Run it, confirm it fails**
+
+Run: `cargo test -p ghostframe-lib --lib ack_arrival_emit_time_is_monotonic_micros`
+Expected: FAIL — no field `server_emit_us`.
+
+- [ ] **Step 3: Replace the field on both structs**
+
+In `bwe/mod.rs`, replace `pub server_emit_ms_lo16: u16` on `AckArrival` with:
+
+```rust
+    /// Server-side send time in microseconds since the bridge's epoch, taken
+    /// from the retransmit cache's `last_sent_at`, so a retransmitted pass
+    /// reports when it actually went out rather than when it first did.
+    /// Monotonic and full-precision — unlike the arrival series, this never
+    /// crosses the wire, so it needs no unwrapping.
+    pub server_emit_us: u64,
+```
+
+In `io_bridge.rs`, replace `server_emit_ms_lo16: u16` on `BweSample` with
+`server_emit_us: u64`, carrying the same doc comment.
+
+- [ ] **Step 4: Take the value from the cache entry**
+
+At the construction site, replace the whole `server_emit_ms_lo16` binding (the
+`and_then(|entry| entry.fragments.first()).filter(...).map(...)` chain reading
+bytes 12..16) with:
+
+```rust
+                        let server_emit_us = cache_entry.map(|entry| {
+                            entry
+                                .last_sent_at
+                                .saturating_duration_since(self.bwe_epoch)
+                                .as_micros() as u64
+                        });
+```
+
+`self.bwe_epoch` is a new `std::time::Instant` field on `IoBridge`, set to
+`now_std()` in every constructor. It exists so the microsecond value is a small
+number rather than an unbounded instant-since-boot; GoogCC only uses deltas, so
+the epoch choice is arbitrary as long as it is stable for the session.
+
+Keep the `if let Some(...)` gate that follows — it is what drops the sample on
+a cache miss. Rename its binding accordingly and pass `server_emit_us` into
+the `BweSample` literal.
+
+`owd_ms_lo16` was derived from the old u16 pair. It is only used for the
+existing per-tier latency histograms, so keep it working by computing it from
+the new field: `((server_emit_us / 1000) & 0xFFFF) as u16` subtracted from
+`arrival_lo16` with `wrapping_sub`, exactly as before.
+
+- [ ] **Step 5: Thread it through the drain**
+
+In the `.map(|s| AckArrival { .. })` closure, replace `server_emit_ms_lo16:
+s.server_emit_ms_lo16` with `server_emit_us: s.server_emit_us`.
+
+- [ ] **Step 6: Verify**
+
+Run: `cargo test -p ghostframe-lib --lib`
+Expected: PASS. Pre-existing tests constructing `AckArrival` or `BweSample`
+literals need their field updated; change only the field, never an assertion.
+
+- [ ] **Step 7: Prove the retransmit case is actually fixed**
+
+A unit test cannot reach this. Add a temporary log at the construction site
+printing `attempts` (from `cache_entry`) alongside the computed
+`server_emit_us`, run a lossy browserless scene:
+
+```bash
+cargo test -p ghostframe-e2e --test browserless_runner a_lossy_link -- --test-threads=1 --nocapture 2>&1 | grep -m10 EMIT
+```
+
+Confirm that samples with `attempts > 1` report an emit time close to the ACK
+arrival rather than hundreds of milliseconds behind it. Remove the logging and
+confirm `git diff` shows it gone. Report the observed values.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add ghostframe-lib/src/transport/bwe/mod.rs ghostframe-lib/src/transport/io_bridge.rs
+git commit -m "fix(bwe): take emit time from last_sent_at so retransmits report their real send"
+```
+
+---
+
 ### Task 4: The GoogCC driver
 
 **Files:**
@@ -446,10 +583,9 @@ const MAX_BPS: i64 = 200_000_000;
 
 pub(crate) struct GoogCcDriver {
     ctl: GoogCcNetworkController,
-    /// Separate unwrappers: the emit series is the server's clock and the
-    /// arrival series is the client's. Sharing one would interleave two
-    /// unrelated clocks and corrupt both.
-    emit_time: Lo16Timeline,
+    /// Only the arrival series needs unwrapping: it crosses the wire as 16
+    /// bits of the client's clock. The emit series is server-side monotonic
+    /// microseconds (Task 3b) and is used directly.
     arrival_time: Lo16Timeline,
     base: Instant,
     estimate_bps: u64,
@@ -475,7 +611,6 @@ impl GoogCcDriver {
         };
         Self {
             ctl: GoogCcNetworkController::new(cfg, GoogCcConfig { feedback_only: false }),
-            emit_time: Lo16Timeline::default(),
             arrival_time: Lo16Timeline::default(),
             base: now,
             estimate_bps: initial_bps,
@@ -492,7 +627,10 @@ impl GoogCcDriver {
         let feedback_time = self.to_timestamp(now);
         let mut packet_feedbacks = Vec::with_capacity(records.len());
         for r in records {
-            let send_ms = self.emit_time.unwrap_ms(r.server_emit_ms_lo16);
+            // Emit time is already monotonic server-side microseconds (Task
+            // 3b) and needs no unwrapping. Only the arrival series crosses
+            // the wire as a 16-bit value.
+            let send_ms = (r.server_emit_us / 1000) as u64;
             let recv_ms = self.arrival_time.unwrap_ms(r.client_arrival_ms_lo16);
             let sent = SentPacket {
                 send_time: Timestamp::from_millis(send_ms as i64),
@@ -675,6 +813,34 @@ reality:
 
 Run: `cargo test -p ghostframe-lib --lib`
 Expected: PASS. Any EWMA-specific test that no longer compiles should be **deleted, not adapted** — those tests assert properties of an estimator that no longer exists, and rewriting them to pass against GoogCC would produce tests that assert nothing.
+
+- [ ] **Step 4b: Clear the debt the review flagged**
+
+Four small items, all from the Task 2/3 review. None is optional — each is a
+thing that is currently true only by accident, or a comment that will lie once
+this task lands.
+
+1. `timeline.rs` carries `#[allow(dead_code)]` on `Lo16Timeline` and its
+   members, needed while nothing consumed it. The driver consumes it now, so
+   **delete every one** — left in place they would hide a genuinely dead helper
+   later.
+2. At the `BweSample` construction site in `io_bridge.rs`, replace the
+   `cache_entry.map(...)` / `if let Some(..)` pair with an early
+   `let Some(entry) = cache_entry else { continue; };`. The sample is currently
+   dropped on a cache miss only because two independent `Option` chains happen
+   to agree; making it structural means a later fallback on one of them cannot
+   silently start feeding the controller zero-byte packets.
+3. In `bwe/mod.rs`, the test `estimate_adapts_upward_with_high_arrival_rate`
+   has a comment computing "100 packets x 32 768 bits ~ 16.4 Mbps" from the old
+   count-based estimator. With real bytes it is 100 x 1200 B x 8 / 0.2 s =
+   4.8 Mbps. The assertion still holds; fix the arithmetic in the comment so it
+   stops describing an estimator that no longer exists.
+4. `size_bytes` is datagram payload only — it excludes UDP/IP framing, roughly
+   48 bytes per packet on IPv6, so the estimate runs ~4% low on full-size
+   datagrams. Do **not** add a correction factor here. Add one sentence to the
+   `size_bytes` doc comment recording the omission, so Stage 2 can decide
+   deliberately whether to configure a per-packet overhead the way libwebrtc
+   does.
 
 - [ ] **Step 5: Commit**
 
