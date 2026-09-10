@@ -72,14 +72,19 @@ jobs:
       # nor the named `--test` invocations above reach them — they were not
       # run by CI at all until this job listed them explicitly.
       #
-      # --test-threads=1 is deliberate. `browserless_runner`'s scenes each
-      # spawn a tokio runtime, a LocalSet and an IoBridge task; run in
-      # parallel they contend, and because the harness's virtual clock does
-      # not control how far the bridge task progresses between polls, the
-      # datagram ordering reaching the netsim shifts run to run. That made
-      # `superseded_generations_never_render` fail roughly 1 run in 10 under
-      # the default parallel harness, and 0 of 12 serially. See
-      # `ghostframe-e2e/src/netsim/mod.rs` on which layer is reproducible.
+      # --test-threads=1 is belt-and-braces, not a workaround for a known
+      # bug. `superseded_generations_never_render` used to fail ~1 run in 10
+      # here; the root cause was `apply_injected_frame` not superseding a
+      # tile's queued work on re-injection, and that is fixed (0 of 15
+      # parallel runs failed afterwards, guarded by
+      # `injected_frame_supersedes_prior_work_for_the_same_tile`).
+      #
+      # Serial execution stays because these scenes each spawn a tokio
+      # runtime, a LocalSet and an IoBridge task, and the harness is
+      # genuinely not reproducible run to run — see
+      # `ghostframe-e2e/src/netsim/mod.rs` for which layer is deterministic
+      # and which is not. Running them serially keeps that variance from
+      # compounding across nine concurrent scenes.
       - run: cargo test --test netsim --test netsim_pump --test scene_tiles --test framebuffer
       - run: cargo test --test browserless_runner -- --test-threads=1
 

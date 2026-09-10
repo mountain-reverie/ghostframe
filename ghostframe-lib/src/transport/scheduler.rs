@@ -227,12 +227,14 @@ impl Scheduler {
             .unwrap_or(0)
     }
 
-    pub fn bump_generation(&mut self, tile_x: u8, tile_y: u8) -> u8 {
-        let idx = (tile_y as usize) * (self.cols as usize) + (tile_x as usize);
-        let new_gen = (self.generations[idx] + 1) & 0x0F;
-        self.generations[idx] = new_gen;
-        // Any queued work for this tile is now stale; mark Superseded so the
-        // next tick drops it. Acked entries don't matter (already done).
+    /// Mark every queued entry for `(tile_x, tile_y)` as `Superseded` so the
+    /// next tick drops it, without touching the generation counter.
+    ///
+    /// Newer content for a tile must invalidate older queued content, or the
+    /// older version can drain *after* the newer one and be rendered last.
+    /// `bump_generation` does this as part of the capture path; the injected
+    /// path calls it directly, since it supplies its own generations.
+    pub fn supersede_pending_for_tile(&mut self, tile_x: u8, tile_y: u8) {
         for work in self
             .priority_queue
             .iter_mut()
@@ -245,6 +247,15 @@ impl Scheduler {
                 work.state = WorkState::Superseded;
             }
         }
+    }
+
+    pub fn bump_generation(&mut self, tile_x: u8, tile_y: u8) -> u8 {
+        let idx = (tile_y as usize) * (self.cols as usize) + (tile_x as usize);
+        let new_gen = (self.generations[idx] + 1) & 0x0F;
+        self.generations[idx] = new_gen;
+        // Any queued work for this tile is now stale; mark Superseded so the
+        // next tick drops it. Acked entries don't matter (already done).
+        self.supersede_pending_for_tile(tile_x, tile_y);
         // Drop any per-(tile, gen) ACK counters for the old gen — they're
         // no longer relevant once the gen advances.
         self.cdf53_passes_acked
