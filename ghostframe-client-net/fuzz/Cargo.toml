@@ -1,0 +1,23 @@
+[package]
+name = "ghostframe-client-net-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.ghostframe-client-net]
+path = ".."
+
+[[bin]]
+name = "handle_udp"
+path = "fuzz_targets/handle_udp.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
