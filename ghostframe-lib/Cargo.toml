@@ -41,13 +41,12 @@ tracing = { workspace = true }
 rustls = { workspace = true }
 rcgen = { workspace = true }
 rayon = "1.10"
-# str0m is a Rust Sans-IO WebRTC implementation. We use only its
-# `bwe` (Bandwidth Estimator) module — a production port of libwebrtc's
-# Google Congestion Control (GoogCC). Construct standalone via
-# `Bwe::new(initial_bitrate)`; no Rtc session needed. See
-# docs/superpowers/specs/2026-06-27-protocol-redesign-design.md
-# for the selection rationale.
-str0m = { version = "0.21", default-features = false }
+# Standalone Rust port of libwebrtc's Google Congestion Control, used for the
+# delay-gradient + loss-based bandwidth estimate. str0m's own GoogCC port is
+# pub(crate) and cannot be constructed without an Rtc session (verified against
+# both 0.21 and 0.23.1), which is why this is a separate crate rather than
+# str0m. See docs/superpowers/specs/2026-09-10-bwe-pacing-design.md.
+goog_cc = "0.1.4"
 web-transport-proto = { workspace = true }
 sha2 = { workspace = true }
 smallvec = "1"
