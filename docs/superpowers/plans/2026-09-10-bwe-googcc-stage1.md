@@ -1234,6 +1234,39 @@ git commit -m "ci: run the tier-1 bandwidth-estimator bench"
 - A scene asserts the estimate is plausible against the netsim's own cap.
 - Emission behaviour is unchanged — no pacer work in this stage.
 
+## Carried to Stage 2: the loss scenes never retransmit
+
+Found while verifying Task 3b. Instrumenting the ACK sample path across
+`cdf53_converges_to_lossless_under_10pct_loss` (10% loss) and
+`every_cdf53_pass_eventually_lands` (5% loss, 20 s) produced 238 samples, and
+**every one reported `attempts = 0`**. `attempts` is initialised to 0 on cache
+insert and incremented only in `ReliableEmitter::tick`'s RTO path
+(`reliable_emitter/emitter.rs:175`), so no RTO retransmit reaches the ACK
+observation path in any current browserless scene.
+
+The likely cause is FEC: parity absorbs isolated single-datagram losses at
+these rates before an RTO or NACK-driven retransmit ever fires.
+
+Two consequences.
+
+Task 3b's fix cannot be empirically demonstrated with the scenes we have. It
+is correct by construction — it reads the same `last_sent_at` that `tick` and
+`on_nack` already maintain — but "correct by construction" is what the *bug*
+was too: the code it replaces carried a comment asserting it re-stamped for
+the BWE consumer, and it did not.
+
+More importantly, **Stage 2's priority design assumes retransmits exist**. Two
+of its six queues are retransmit queues (P0 for passes 0-3, P5 for passes
+4-13), and P0-outranks-everything is the central claim. With zero scene
+coverage of the retransmit path, none of that would be exercised by the
+netsim suite.
+
+Stage 2 must therefore begin by making retransmits observable: either a scene
+with loss high enough to defeat FEC, or one that lowers `fec_k` through
+`TransportConfig` (`GHOSTFRAME_FEC_K` already exists as a knob;
+`BrowserlessScene` does not expose it yet). Assert `attempts > 1` is actually
+reached before asserting anything about retransmit priority.
+
 ## Explicitly out of scope
 
 Pacer restructure, priority queues, probe clusters, and `PacingMode` are Stage 2. Do not add them here, and do not add the `TransportConfig` flag yet: with the controller only observing, there is nothing to switch between, and a flag that selects between two identical behaviours is worse than no flag.
