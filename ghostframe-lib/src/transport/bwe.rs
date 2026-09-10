@@ -26,6 +26,8 @@
 
 use std::time::{Duration, Instant};
 
+mod timeline;
+
 // ── EWMA parameters ─────────────────────────────────────────────────────────
 
 /// The half-life of the EWMA: after this many seconds without new samples the
