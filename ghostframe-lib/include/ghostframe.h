@@ -99,6 +99,24 @@
 #define FRAGMENT_COVERAGE_CAPACITY 60000
 
 /**
+ * Upper bound on a frame's declared `total_len`, enforced before allocating
+ * the remainder buffer.
+ *
+ * The `total_len < 8 + payload_len + 3` check that readers already perform
+ * only rejects frames that are too *small*. A `total_len` of `0xFFFF_FFFF`
+ * sails past it and drives a ~4 GiB `vec![0u8; rest_len]`, after which
+ * `read_exact` blocks forever waiting for bytes that never arrive — the
+ * task wedges rather than erroring.
+ *
+ * A UDP datagram cannot exceed 65535 bytes, and [`encode_frame`] adds an
+ * 8-byte header, a 2-byte port and a NUL-terminated host string (an IP
+ * literal, so well under 64 bytes). 72 KiB is comfortably above any frame
+ * ghostbridge can legitimately produce while keeping a corrupt length field
+ * from turning into an unbounded allocation.
+ */
+#define MAX_FRAME_LEN (72 * 1024)
+
+/**
  * Top-level feedback message type for input events. Routed by the first
  * byte in `IoBridge::dispatch_feedback_bytes`. Sub-kind byte at offset 1
  * selects the specific event (see `decode_input_msg`).
