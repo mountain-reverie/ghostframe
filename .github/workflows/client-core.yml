@@ -9,5 +9,5 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with: { targets: wasm32-unknown-unknown }
-      - run: cargo test -p ghostframe-protocol -p ghostframe-client-core
-      - run: cargo build -p ghostframe-protocol -p ghostframe-client-core --target wasm32-unknown-unknown
+      - run: cargo test -p ghostframe-protocol -p ghostframe-client-core -p ghostframe-client-net
+      - run: cargo build -p ghostframe-protocol -p ghostframe-client-core -p ghostframe-client-net --target wasm32-unknown-unknown

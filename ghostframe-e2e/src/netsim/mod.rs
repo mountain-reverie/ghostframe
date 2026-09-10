@@ -1,8 +1,27 @@
 //! Network impairment simulator: deterministic loss, delay, corruption, and bandwidth modeling.
 //!
-//! This module provides a seeded, reproducible network simulator for e2e testing.
-//! Every test carries a seed; every failure can be replayed exactly by rerunning
-//! with the same seed.
+//! This module provides a seeded network simulator for e2e testing. Determinism
+//! holds at the `NetSim`/`decide` layer only: for a fixed seed, the sequence of
+//! rng draws and the verdict computed from each is exactly reproducible bit for
+//! bit (see `fixed_seed_full_profile_is_bit_for_bit_reproducible` and its
+//! `GOLDEN_DIGEST`), which is what the `NetSim` unit tests rely on.
+//!
+//! It does **not** hold for browserless scenes end to end. `run_browserless`
+//! spawns `IoBridge::run` as a concurrent task on a `LocalSet`, and under
+//! `tokio::time::pause()` the clock is virtual but *how far that task
+//! progresses between the driver's polls* is decided by real (non-seeded) task
+//! scheduling. That shifts the order and timing in which datagrams arrive at
+//! the netsim from run to run, which changes which rng draws land on which
+//! datagram even though the rng sequence itself is unchanged. Two identical
+//! scenes (same seed, same binary, same process) have been observed to yield
+//! different delivered/dropped byte counts, e.g. `(215794, 104743)` vs.
+//! `(181462, 95299)` (measured 2026-09-10) — so a scene failure cannot be
+//! replayed exactly by rerunning with the same seed.
+//!
+//! Consequences for scene assertions: prefer checking exact rendered pixels
+//! (deterministic given what was actually delivered) over raw byte/datagram
+//! counters, and when a byte-count assertion is unavoidable give it
+//! order-of-magnitude margins rather than tight bounds.
 
 pub mod profile;
 pub mod pump;
