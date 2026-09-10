@@ -643,6 +643,8 @@ struct BweSample {
     /// to delay-gradient estimation; the absolute value is meaningless
     /// because of clock skew.
     owd_ms_lo16: u16,
+    /// Wire size of this datagram in bytes, summed over its fragments.
+    size_bytes: u32,
     /// Wall-clock instant when the ACK arrived (for periodic-drain timing).
     received_at: std::time::Instant,
 }
@@ -2001,10 +2003,13 @@ impl IoBridge {
                 // Extract BweSamples while the cache entries are still live.
                 for (emit_key, e) in emit_keys.iter().zip(batch.entries.iter()) {
                     if self.bwe_samples_buffer.len() < BWE_SAMPLES_BUFFER_CAPACITY {
-                        let server_emit_ms_lo16 = self
-                            .reliable_emitter
-                            .cache
-                            .get(emit_key)
+                        let cache_entry = self.reliable_emitter.cache.get(emit_key);
+                        let size_bytes: u32 = cache_entry
+                            .map(|entry| {
+                                entry.fragments.iter().map(|f| f.len() as u32).sum::<u32>()
+                            })
+                            .unwrap_or(0);
+                        let server_emit_ms_lo16 = cache_entry
                             .and_then(|entry| entry.fragments.first())
                             .filter(|frag| frag.len() >= 16)
                             .map(|frag| {
@@ -2023,6 +2028,7 @@ impl IoBridge {
                                 server_emit_ms_lo16: emit_lo16,
                                 client_arrival_ms_lo16: arrival_lo16,
                                 owd_ms_lo16,
+                                size_bytes,
                                 received_at: now_for_samples,
                             });
                         }
@@ -3994,6 +4000,7 @@ impl IoBridge {
                             | (s.client_arrival_ms_lo16 as u32),
                         server_emit_ms_lo16: s.server_emit_ms_lo16,
                         client_arrival_ms_lo16: s.client_arrival_ms_lo16,
+                        size_bytes: s.size_bytes,
                     })
                     .collect();
                 self.bwe.update(&records, now_std());
@@ -6746,6 +6753,7 @@ mod tests {
                 wire_seq: i,
                 server_emit_ms_lo16: (i * 5) as u16,
                 client_arrival_ms_lo16: (i * 5 + 10) as u16,
+                size_bytes: 1200,
             })
             .collect();
 
