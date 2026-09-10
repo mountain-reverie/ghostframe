@@ -54,8 +54,12 @@ pub struct AckArrival {
     /// per-sample identifier. Phase 2 will replace it with the actual
     /// wire_seq from the cache entry once plumbed through `BweSample`.
     pub wire_seq: u32,
-    /// Low 16 bits of the server's emit time in ms.
-    pub server_emit_ms_lo16: u16,
+    /// Server-side send time in microseconds since the bridge's BWE epoch,
+    /// taken from the retransmit cache's `last_sent_at`, so a retransmitted
+    /// pass reports when it actually went out rather than when it first did.
+    /// Monotonic and full-precision — unlike the arrival series this never
+    /// crosses the wire, so it needs no unwrapping.
+    pub server_emit_us: u64,
     /// Low 16 bits of the client's arrival time in ms.
     pub client_arrival_ms_lo16: u16,
     /// Wire size of the acknowledged datagram in bytes, summed over its
@@ -229,13 +233,13 @@ mod tests {
         let records = vec![
             AckArrival {
                 wire_seq: 1,
-                server_emit_ms_lo16: 100,
+                server_emit_us: 100,
                 client_arrival_ms_lo16: 110,
                 size_bytes: 1200,
             },
             AckArrival {
                 wire_seq: 2,
-                server_emit_ms_lo16: 120,
+                server_emit_us: 120,
                 client_arrival_ms_lo16: 135,
                 size_bytes: 1200,
             },
@@ -253,7 +257,7 @@ mod tests {
         let records: Vec<AckArrival> = (0u32..100)
             .map(|i| AckArrival {
                 wire_seq: i,
-                server_emit_ms_lo16: (i * 5) as u16,
+                server_emit_us: (i * 5) as u64,
                 client_arrival_ms_lo16: (i * 5 + 10) as u16,
                 size_bytes: 1200,
             })
@@ -310,10 +314,25 @@ mod tests {
     fn ack_arrival_carries_packet_size() {
         let a = AckArrival {
             wire_seq: 1,
-            server_emit_ms_lo16: 10,
+            server_emit_us: 10,
             client_arrival_ms_lo16: 25,
             size_bytes: 1200,
         };
         assert_eq!(a.size_bytes, 1200);
+    }
+
+    /// The emit time must be server-side monotonic microseconds, not a
+    /// 16-bit wrapped wire value. A retransmitted datagram keeps its original
+    /// stamp in the cache, so reading bytes would report the first send and
+    /// bury the RTO backoff inside the measured one-way delay.
+    #[test]
+    fn ack_arrival_emit_time_is_monotonic_micros() {
+        let a = AckArrival {
+            wire_seq: 1,
+            server_emit_us: 5_000_000,
+            client_arrival_ms_lo16: 25,
+            size_bytes: 1200,
+        };
+        assert_eq!(a.server_emit_us, 5_000_000);
     }
 }

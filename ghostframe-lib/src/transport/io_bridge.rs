@@ -379,6 +379,9 @@ pub struct IoBridge {
     /// dwell timers (`enter_sustain_micros` / `exit_sustain_micros`).
     /// Stamped once at construction; never reset.
     epoch: std::time::Instant,
+    /// Reference instant for `BweSample::server_emit_us`. Arbitrary but
+    /// stable for the session — the estimator uses deltas only.
+    bwe_epoch: std::time::Instant,
     /// Last-emitted frame mode (carried across frames for hysteresis).
     frame_mode: crate::tile::FrameMode,
     /// Round-robin tile-work scheduler shared by both CPU and GPU emission paths.
@@ -633,9 +636,12 @@ pub struct IoBridge {
 #[derive(Debug, Clone, Copy)]
 struct BweSample {
     tier: PassTier,
-    /// Low 16 bits of the server's emit time in ms (derived from the
-    /// μs-resolution timestamp_us stamped in the cached datagram).
-    server_emit_ms_lo16: u16,
+    /// Server-side send time in microseconds since the bridge's BWE epoch,
+    /// taken from the retransmit cache's `last_sent_at`, so a retransmitted
+    /// pass reports when it actually went out rather than when it first did.
+    /// Monotonic and full-precision — unlike the arrival series this never
+    /// crosses the wire, so it needs no unwrapping.
+    server_emit_us: u64,
     /// Low 16 bits of the client's receive time in ms, echoed back via
     /// the ACK envelope's `arrival_time_ms_lo16`.
     client_arrival_ms_lo16: u16,
@@ -849,6 +855,7 @@ impl IoBridge {
             metrics_tracker: crate::tile::MetricsTracker::new(0, 0),
             classifier: crate::tile::Classifier::new(lib_config.classifier),
             epoch: now_std(),
+            bwe_epoch: now_std(),
             frame_mode: crate::tile::FrameMode::TileCodec,
             scheduler: crate::transport::scheduler::Scheduler::new(0, 0),
             #[cfg(any(test, feature = "test-loss-injection"))]
@@ -1981,12 +1988,17 @@ impl IoBridge {
                 //
                 // Phase 1 Task 5: we ALSO extract OWD samples here, before
                 // on_ack removes the cache entries. The cache lookup below
-                // recovers the server's stamped emit time (μs, u32 BE at
-                // bytes [12..16]) and pairs it with the client's echoed
-                // arrival_time_ms_lo16. Both are u16 wall-clock-ms wrapped;
-                // the BWE consumer uses relative deltas only, so clock skew
-                // is acceptable. Cache misses are silent (already ACKed by
-                // an overlapping batch, or RTO-evicted).
+                // recovers the server's emit time from `CacheEntry::last_sent_at`
+                // (monotonic µs since `self.bwe_epoch`) and pairs it with the
+                // client's echoed arrival_time_ms_lo16 (u16 wall-clock-ms
+                // wrapped). Reading `last_sent_at` rather than the stamp
+                // baked into the cached datagram bytes matters on retransmit:
+                // `ReliableEmitter::tick` re-stamps the *copy* it re-sends but
+                // updates `last_sent_at` on the cache entry itself, so this is
+                // the only place that reflects the actual on-wire moment for a
+                // retransmitted pass. The BWE consumer uses relative deltas
+                // only, so clock skew is acceptable. Cache misses are silent
+                // (already ACKed by an overlapping batch, or RTO-evicted).
                 let now_for_samples = now_std();
                 let emit_keys: Vec<crate::transport::reliable_emitter::EmitKey> = batch
                     .entries
@@ -2009,23 +2021,20 @@ impl IoBridge {
                                 entry.fragments.iter().map(|f| f.len() as u32).sum::<u32>()
                             })
                             .unwrap_or(0);
-                        let server_emit_ms_lo16 = cache_entry
-                            .and_then(|entry| entry.fragments.first())
-                            .filter(|frag| frag.len() >= 16)
-                            .map(|frag| {
-                                let ts_be: [u8; 4] = frag[12..16].try_into().unwrap();
-                                // u32 μs → u16 ms low-16: divide by 1000 to
-                                // convert μs→ms, then wrap to u16. Matches the
-                                // wire shape of arrival_time_ms_lo16.
-                                (u32::from_be_bytes(ts_be) / 1000) as u16
-                            });
-                        if let Some(emit_lo16) = server_emit_ms_lo16 {
+                        let server_emit_us = cache_entry.map(|entry| {
+                            entry
+                                .last_sent_at
+                                .saturating_duration_since(self.bwe_epoch)
+                                .as_micros() as u64
+                        });
+                        if let Some(server_emit_us) = server_emit_us {
                             let arrival_lo16 = e.arrival_time_ms_lo16;
                             let tier = pass_tier(e.pass_idx);
+                            let emit_lo16 = ((server_emit_us / 1000) & 0xFFFF) as u16;
                             let owd_ms_lo16 = arrival_lo16.wrapping_sub(emit_lo16);
                             self.bwe_samples_buffer.push(BweSample {
                                 tier,
-                                server_emit_ms_lo16: emit_lo16,
+                                server_emit_us,
                                 client_arrival_ms_lo16: arrival_lo16,
                                 owd_ms_lo16,
                                 size_bytes,
@@ -3996,9 +4005,9 @@ impl IoBridge {
                     .bwe_samples_buffer
                     .drain(..)
                     .map(|s| AckArrival {
-                        wire_seq: ((s.server_emit_ms_lo16 as u32) << 16)
+                        wire_seq: (((s.server_emit_us / 1000) as u32) << 16)
                             | (s.client_arrival_ms_lo16 as u32),
-                        server_emit_ms_lo16: s.server_emit_ms_lo16,
+                        server_emit_us: s.server_emit_us,
                         client_arrival_ms_lo16: s.client_arrival_ms_lo16,
                         size_bytes: s.size_bytes,
                     })
@@ -4496,6 +4505,7 @@ impl IoBridge {
             metrics_tracker: crate::tile::MetricsTracker::new(0, 0),
             classifier: crate::tile::Classifier::new(lib_config.classifier),
             epoch: now_std(),
+            bwe_epoch: now_std(),
             frame_mode: crate::tile::FrameMode::TileCodec,
             scheduler: crate::transport::scheduler::Scheduler::new(0, 0),
             #[cfg(any(test, feature = "test-loss-injection"))]
@@ -6751,7 +6761,7 @@ mod tests {
         let records: Vec<AckArrival> = (0u32..100)
             .map(|i| AckArrival {
                 wire_seq: i,
-                server_emit_ms_lo16: (i * 5) as u16,
+                server_emit_us: (i * 5) as u64,
                 client_arrival_ms_lo16: (i * 5 + 10) as u16,
                 size_bytes: 1200,
             })
@@ -6801,7 +6811,7 @@ mod tests {
     /// (`dispatch_ack_datagram` also stamps a `now_for_samples = now_std()`
     /// for each `BweSample`'s `received_at` field, but `received_at` is
     /// `#[allow(dead_code)]` and staged for a Phase 2 consumer — the drain
-    /// this test exercises only reads `server_emit_ms_lo16` /
+    /// this test exercises only reads `server_emit_us` /
     /// `client_arrival_ms_lo16` off each sample, so `now_for_samples` is
     /// NOT load-bearing for what this test actually proves. Don't cite it
     /// as a second discriminating site.)
@@ -6854,7 +6864,10 @@ mod tests {
             for i in 0..count {
                 let frame_seq = frame_seq_start + i;
                 let key = EmitKey::new(frame_seq, 1, 2, 0);
-                // fragments[0][12..16] big-endian = server emit time, µs.
+                // The emit time now comes from `CacheEntry::last_sent_at`
+                // (stamped by `submit_one` below), not from the datagram
+                // bytes — this fixed [12..16] payload is just filler so the
+                // fragment is long enough to look like a real tile datagram.
                 let mut frag = vec![0u8; 20];
                 frag[12..16].copy_from_slice(&1_000_000u32.to_be_bytes());
                 bridge
