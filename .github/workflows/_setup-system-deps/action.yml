@@ -22,7 +22,22 @@ runs:
   steps:
     - name: apt-get update
       shell: bash
-      run: sudo apt-get update -qq
+      run: |
+        # Retries cover transient proxy and network hiccups.
+        #
+        # The fallback covers a third-party repo serving a broken index. The
+        # runner image ships Google's Chrome apt source, which nothing here
+        # installs from, and on 2026-09-09 it served a "Hash Sum mismatch"
+        # that failed clippy, unit, build-release and cbindgen-check on
+        # master before a single package was installed or a test ran.
+        #
+        # Continuing is safe because every package this action installs comes
+        # from the Ubuntu archive, and `apt-get install` below is the real
+        # gate: if an index we actually need is missing, it fails loudly and
+        # names the package. Swallowing update errors cannot turn a missing
+        # dependency into a silent pass.
+        sudo apt-get update -qq -o Acquire::Retries=3 || \
+          echo "::warning::apt-get update reported errors; continuing (apt-get install will fail if a needed index is missing)"
 
     - name: install build deps
       shell: bash
