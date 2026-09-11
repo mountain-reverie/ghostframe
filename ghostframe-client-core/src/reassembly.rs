@@ -20,7 +20,7 @@ use ghostframe_protocol::protocol::{
 use crate::cdf53_coverage::apply_cdf53_arrival;
 use crate::cdf53_prevalidate::prevalidate_cdf53;
 use crate::event::{Event, PollOutput, TileKey};
-use crate::pal_rle_decode::decode_pal_rle_tile;
+use crate::pal_rle_decode::{decode_pal_rle_tile, prevalidate_pal_rle};
 use crate::{Assembly, ClientCore, TileDelivery};
 
 /// Minimum bytes that carry a full tile header stack.
@@ -304,6 +304,59 @@ impl ClientCore {
                         tile_y: ty,
                         rgba,
                     });
+                }
+            }
+            Codec::PalRle if self.tile_delivery == TileDelivery::Payload => {
+                match prevalidate_pal_rle(&payload, &self.palette_shadow) {
+                    Ok(validated) => {
+                        // Apply the upsert exactly as decode_pal_rle_tile does.
+                        // It is protocol state, and palrle_decode.wgsl decodes
+                        // against this table — skipping it leaves the shader on
+                        // a stale palette, which shows as wrong colours.
+                        if let Some(upsert) = &validated.palette_upsert {
+                            let slot = &mut self.palettes[validated.palette_id as usize];
+                            let mut reported = Vec::with_capacity(validated.count as usize);
+                            for i in 0..validated.count as usize {
+                                let bgra = [
+                                    upsert[i * 4],
+                                    upsert[i * 4 + 1],
+                                    upsert[i * 4 + 2],
+                                    upsert[i * 4 + 3],
+                                ];
+                                slot[i] = bgra;
+                                reported.push(bgra);
+                            }
+                            self.palette_shadow
+                                .put(validated.palette_id, validated.count);
+                            events.push(Event::PaletteUpdated {
+                                palette_id: validated.palette_id,
+                                colors: reported,
+                            });
+                        }
+                        events.push(Event::TilePayload {
+                            frame_seq,
+                            tile_x: tx,
+                            tile_y: ty,
+                            pass_idx: asm.pass,
+                            generation: asm.generation,
+                            codec: Codec::PalRle,
+                            payload,
+                        });
+                    }
+                    Err(code) => {
+                        if let Some(msg) =
+                            self.decode_error_batcher
+                                .report(Codec::PalRle, tx, ty, code, now_us)
+                        {
+                            self.outbox.push_back(PollOutput::Stream(msg));
+                        }
+                        events.push(Event::DecodeError {
+                            codec: Codec::PalRle,
+                            tile_x: tx,
+                            tile_y: ty,
+                            code,
+                        });
+                    }
                 }
             }
             Codec::PalRle => {
