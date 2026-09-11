@@ -143,14 +143,21 @@ The suites split three ways:
 
 - *Retarget then delete*: `ack`, `nack`, `cdf53_coverage`,
   `decode_error_batcher`, `feedback`, `palette_shadow`, `parity_decoder`,
-  `prevalidate`, `prevalidate_cdf53`, `tile_key`, `solid_pack`.
-- *Untouched*: `bootstrap`, `diagnostics`, `renderer_idle_skip`, `sanity` —
-  their subjects survive the cutover.
+  `prevalidate`, `prevalidate_cdf53`.
+- *Untouched*: `bootstrap`, `diagnostics`, `renderer_idle_skip`, `sanity`,
+  `solid_pack` — their subjects survive the cutover. (`solid_pack` imports
+  nothing from `src/`; it replicates `src/webgpu/solid.ts`'s packing formula
+  inline, so its subject is the GPU path, which is a non-goal.)
 - *Split or reconsider*: `input` (capture is platform and stays; encoding is
   `client-core::input` and moves) and `lossless_golden` (not protocol at all —
   a TS mirror of `ghostframe-test-pattern`'s generator, asserted byte-equal to
   Rust; deleting it by exporting the generator from wasm is adjacent scope,
-  noted rather than absorbed).
+  noted rather than absorbed). `tile_key` asserts a *string* key shape
+  (`'51966:17:23:5'`) produced by `decoder.ts`; Rust's `TileKey` is a
+  `#[derive(Hash, Eq)]` struct whose `pass_idx` field makes the cross-pass
+  collision impossible by construction. There is no shim to retarget onto — it
+  becomes a behavioural test driving `handle_datagram` with two passes under
+  one `frame_seq`.
 
 **Impedance mismatch, expected.** The TS suites are callback-and-fake-timer
 shaped (`new NackBatcher(buf => sent.push(buf))`, `vi.useFakeTimers()`); the
