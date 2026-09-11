@@ -411,14 +411,34 @@ impl ClientCore {
 
                 match result {
                     Ok(pre) => {
-                        let rgba = self.cdf53_tile_state.integrate(tx, ty, &pre);
-                        events.push(Event::TileReady {
-                            frame_seq,
-                            tile_x: tx,
-                            tile_y: ty,
-                            rgba,
-                        });
+                        match self.tile_delivery {
+                            TileDelivery::Decoded => {
+                                let rgba = self.cdf53_tile_state.integrate(tx, ty, &pre);
+                                events.push(Event::TileReady {
+                                    frame_seq,
+                                    tile_x: tx,
+                                    tile_y: ty,
+                                    rgba,
+                                });
+                            }
+                            TileDelivery::Payload => {
+                                // No CPU accumulation: cdf53_integrate.wgsl
+                                // accumulates passes in GPU buffers, keyed by
+                                // its own tile-generation buffer.
+                                events.push(Event::TilePayload {
+                                    frame_seq,
+                                    tile_x: tx,
+                                    tile_y: ty,
+                                    pass_idx: asm.pass,
+                                    generation: asm.generation,
+                                    codec: Codec::Cdf53,
+                                    payload,
+                                });
+                            }
+                        }
                         // Deferred ACK — fires only after prevalidation success.
+                        // Deliberately outside the match: it is protocol, not
+                        // decoding, and must happen in both modes.
                         let entry = AckEntry {
                             frame_seq: frame_seq | TILE_DATAGRAM_FLAG,
                             tile_x: tx,
