@@ -418,6 +418,48 @@ async fn every_cdf53_pass_eventually_lands() {
     }
 }
 
+/// The estimator has an independently known right answer here: the netsim's
+/// own token bucket. Nothing else in the suite checks the estimate against a
+/// target that was not derived from the estimator itself.
+#[tokio::test(start_paused = true)]
+async fn bwe_estimate_tracks_the_netsim_cap() {
+    let scene = BrowserlessScene {
+        seed: 0xB4E,
+        frames: busy_frames(8),
+        net: NetProfile {
+            cap: CapTimeline::constant(1_000_000),
+            ..NetProfile::perfect()
+        },
+        duration: Duration::from_secs(6),
+        grid_cols: 4,
+        grid_rows: 4,
+    };
+    let result = run_browserless(scene).await.expect("scene ran");
+
+    assert!(
+        result.bwe_estimate_bps > 0,
+        "seed 0xB4E: no bandwidth estimate was produced at all"
+    );
+    // Deliberately wide: the harness is not seed-reproducible, so this asserts
+    // the estimate is in the right order of magnitude for a 1 MB/s (8 Mbit/s)
+    // cap, not a precise value.
+    assert!(
+        (200_000..=80_000_000).contains(&result.bwe_estimate_bps),
+        "seed 0xB4E: estimate {} bps is not plausible for an 8 Mbit/s cap",
+        result.bwe_estimate_bps
+    );
+
+    // Emit and arrival timestamps must share a clock epoch. A non-zero count
+    // here is the signature of the bug that panicked the bridge task when a
+    // client-epoch value was read as an RTT.
+    assert_eq!(
+        result.implausible_rtt_samples, 0,
+        "seed 0xB4E: {} samples had an implausible derived RTT — emit and \
+         arrival timestamps are probably not on the same clock",
+        result.implausible_rtt_samples
+    );
+}
+
 /// A 32x32 BGRA gradient tile, so Cdf53 passes carry real, distinct
 /// bit-plane content rather than a uniform tile's near-identical passes.
 /// Matches `tests/framebuffer.rs`'s `gradient_bgra` pixel-for-pixel.

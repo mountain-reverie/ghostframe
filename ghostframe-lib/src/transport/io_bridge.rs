@@ -600,6 +600,21 @@ pub struct IoBridge {
     /// but the estimate doesn't drive emission yet. Phase 2 will plug
     /// `bwe.snapshot().bitrate_bps` into the pacer.
     bwe: crate::transport::bwe::BweWrapper,
+    /// Shared cell the browserless harness reads the final `BweSnapshot`
+    /// from, after aborting the `run()` task.
+    ///
+    /// `run()` owns `self` for its whole lifetime once `spawn_local`d, so a
+    /// plain `&self` accessor (`bwe_snapshot`, below) is unreachable from
+    /// the harness once the bridge has been moved into the task — there is
+    /// no way to call back into a value a spawned task owns. This cell is
+    /// the workaround: the harness clones the `Arc` via
+    /// `bwe_publish_handle()` *before* moving `bridge` into `spawn_local`,
+    /// `run()`'s loop republishes into it on every iteration (see the
+    /// `sample_all_path_stats`/BWE-drain block), and the harness reads the
+    /// clone after `bridge_handle.abort()`. Cfg-gated identically to
+    /// `bwe_snapshot` since both exist for the same caller.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    bwe_publish: std::sync::Arc<std::sync::Mutex<crate::transport::bwe::BweSnapshot>>,
     /// Cumulative bytes of CDF53 critical-tier (passes 0-3) datagrams
     /// emitted since startup. Counts every successful emit including
     /// retransmits, because the BWE-side rate computation should reflect
@@ -915,6 +930,20 @@ impl IoBridge {
                 crate::transport::bwe::BweWrapper::INITIAL_BPS,
                 now_std(),
             ),
+            // Throwaway estimator solely to obtain the same starting
+            // `BweSnapshot` (`bwe.snapshot()` right above is unavailable
+            // here — `self` doesn't exist yet inside this literal). Cheap:
+            // `BweWrapper::new` just seeds a GoogCC controller's initial
+            // state, and this field only exists under `cfg(test)` /
+            // `browserless-harness` anyway.
+            #[cfg(any(test, feature = "browserless-harness"))]
+            bwe_publish: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::transport::bwe::BweWrapper::new(
+                    crate::transport::bwe::BweWrapper::INITIAL_BPS,
+                    now_std(),
+                )
+                .snapshot(),
+            )),
             bytes_emitted_critical: 0,
             bytes_emitted_refinement: 0,
             bytes_emitted_snapshot: (0, 0),
@@ -4021,6 +4050,18 @@ impl IoBridge {
                 self.bwe.update(&records, now_std());
             }
 
+            // Republish into `bwe_publish` every iteration, not only when
+            // `bwe_samples_buffer` had something to drain: the browserless
+            // harness reads this after `bridge_handle.abort()`, at a point
+            // in virtual time it does not control relative to this loop, so
+            // the cell must always hold *a* current snapshot rather than
+            // only being current on iterations that happened to update the
+            // estimate. See `bwe_publish`'s doc comment.
+            #[cfg(any(test, feature = "browserless-harness"))]
+            {
+                *self.bwe_publish.lock().unwrap() = self.bwe.snapshot();
+            }
+
             // [BRIDGE-DIAG] heartbeat every 2s of virtual time (tokio's
             // clock, which is the wall clock in production but follows
             // `tokio::time::pause()` under the browserless harness) so we
@@ -4568,6 +4609,20 @@ impl IoBridge {
                 crate::transport::bwe::BweWrapper::INITIAL_BPS,
                 now_std(),
             ),
+            // Throwaway estimator solely to obtain the same starting
+            // `BweSnapshot` (`bwe.snapshot()` right above is unavailable
+            // here — `self` doesn't exist yet inside this literal). Cheap:
+            // `BweWrapper::new` just seeds a GoogCC controller's initial
+            // state, and this field only exists under `cfg(test)` /
+            // `browserless-harness` anyway.
+            #[cfg(any(test, feature = "browserless-harness"))]
+            bwe_publish: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::transport::bwe::BweWrapper::new(
+                    crate::transport::bwe::BweWrapper::INITIAL_BPS,
+                    now_std(),
+                )
+                .snapshot(),
+            )),
             bytes_emitted_critical: 0,
             bytes_emitted_refinement: 0,
             bytes_emitted_snapshot: (0, 0),
@@ -4614,6 +4669,30 @@ impl IoBridge {
         bridge.scheduler.resize(grid_cols, grid_rows);
         bridge.inject_rx = Some(inject_rx);
         bridge
+    }
+
+    /// Snapshot of the bandwidth estimator, for the browserless harness.
+    ///
+    /// Gated the same way as `now_std`: the harness needs to assert on the
+    /// estimate, production has no reason to reach in.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub fn bwe_snapshot(&self) -> crate::transport::bwe::BweSnapshot {
+        self.bwe.snapshot()
+    }
+
+    /// Clone of the `Arc` behind `bwe_publish`, for a caller that is about
+    /// to move `self` into a `spawn_local`d task (as the browserless
+    /// harness does with `IoBridge::run`) and needs a way to read the BWE
+    /// estimate back out afterwards. See `bwe_publish`'s doc comment on the
+    /// ownership problem this solves: `bwe_snapshot()` above takes `&self`,
+    /// which is unreachable once the bridge is owned by a spawned task.
+    /// Call this *before* the move; read the clone's contents *after*
+    /// aborting the task.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub fn bwe_publish_handle(
+        &self,
+    ) -> std::sync::Arc<std::sync::Mutex<crate::transport::bwe::BweSnapshot>> {
+        self.bwe_publish.clone()
     }
 
     /// Drive exactly one injected frame: enqueue its work, then attempt the
