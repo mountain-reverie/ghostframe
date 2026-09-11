@@ -4,9 +4,11 @@
   "private": true,
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "build": "npm run build:wasm && tsc && vite build",
+    "build:wasm": "wasm-pack build ../ghostframe-client-wasm --target web --out-dir ../ghostframe-web-client/pkg-web",
+    "build:wasm:node": "wasm-pack build ../ghostframe-client-wasm --target nodejs --out-dir ../ghostframe-web-client/pkg-node",
     "preview": "vite preview",
-    "test": "vitest run",
+    "test": "npm run build:wasm:node && vitest run",
     "test:watch": "vitest"
   },
   "dependencies": {},
