@@ -6,6 +6,7 @@ fn new_core_emits_hello_on_stream_then_nothing() {
         ClientConfig {
             indices_raw_enabled: true,
             supports_h264: true,
+            ..Default::default()
         },
         0,
     );
@@ -23,6 +24,7 @@ fn empty_datagram_is_ignored() {
         ClientConfig {
             indices_raw_enabled: false,
             supports_h264: false,
+            ..Default::default()
         },
         0,
     );

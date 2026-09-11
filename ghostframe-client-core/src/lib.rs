@@ -62,10 +62,30 @@ pub(crate) struct PendingNack {
     pub pass_idx: u8,
 }
 
-#[derive(Debug, Clone, Copy)]
+/// Whether the core decodes tiles to pixels, or stops after validation and
+/// hands the payload up.
+///
+/// The browser decodes on the GPU (`ghostframe-web-client/src/webgpu/`, ten
+/// WGSL compute shaders), so it wants validated payloads, not RGBA. Native
+/// and headless consumers want pixels. One core, two consumers — not two
+/// implementations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TileDelivery {
+    /// Decode to RGBA and emit `Event::TileReady`. The default, because it is
+    /// what every existing consumer expects.
+    #[default]
+    Decoded,
+    /// Stop after reassembly, parity recovery, prevalidation and generation
+    /// checks; emit the undecoded bytes instead.
+    Payload,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
 pub struct ClientConfig {
     pub indices_raw_enabled: bool,
     pub supports_h264: bool,
+    /// See [`TileDelivery`]. Defaults to `Decoded`.
+    pub tile_delivery: TileDelivery,
 }
 
 /// One in-progress tile-pass assembly (fragments keyed by `TileKey`).
