@@ -12,7 +12,7 @@ use ghostframe_protocol::ack::{
 
 /// Flush deadline: 5ms in microseconds after the first entry of a pending
 /// batch is queued (mirrors `FLUSH_INTERVAL_MS` in ack.ts).
-const FLUSH_INTERVAL_US: u64 = 5_000;
+pub const FLUSH_INTERVAL_US: u64 = 5_000;
 
 /// How many recent fresh entries to retain for overlap purposes (4x
 /// ACK_OVERLAP_COUNT, mirroring `maxRecent` in ack.ts).
