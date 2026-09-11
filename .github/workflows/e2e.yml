@@ -20,9 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/workflows/_setup-system-deps
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.25'
+      - uses: ./.github/workflows/_setup-go
       - uses: ./.github/workflows/_build-web-client
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -36,9 +34,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/workflows/_setup-system-deps
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.25'
+      - uses: ./.github/workflows/_setup-go
       - uses: ./.github/workflows/_build-web-client
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -76,9 +72,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/workflows/_setup-system-deps
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.25'
+      - uses: ./.github/workflows/_setup-go
       - uses: ./.github/workflows/_build-web-client
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -113,9 +107,7 @@ jobs:
         with:
           e2e-runtime: 'true'
 
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.25'
+      - uses: ./.github/workflows/_setup-go
 
       - uses: dtolnay/rust-toolchain@stable
 
