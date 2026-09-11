@@ -9,11 +9,14 @@
 use ghostframe_client_core::{
     ack_batcher::AckBatcher,
     decode_error_batcher::DecodeErrorBatcher,
+    loss_tracker::LossTracker,
     nack_batcher::{NackBatcher, NackEntry},
+    palette_shadow::PaletteShadow,
+    parity_decoder::ParityDecoder,
     DecodeErrorCode,
 };
 use ghostframe_protocol::ack::{AckBatch, AckEntry};
-use ghostframe_protocol::protocol::Codec;
+use ghostframe_protocol::protocol::{Codec, TileParityEnvelope};
 use wasm_bindgen::prelude::*;
 
 use crate::boundary::WasmAckEntry;
@@ -212,6 +215,132 @@ impl WasmDecodeErrorBatcher {
 }
 
 impl Default for WasmDecodeErrorBatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[wasm_bindgen]
+pub struct WasmPaletteShadow {
+    inner: PaletteShadow,
+}
+
+#[wasm_bindgen]
+impl WasmPaletteShadow {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> WasmPaletteShadow {
+        WasmPaletteShadow {
+            inner: PaletteShadow::new(),
+        }
+    }
+
+    pub fn has(&self, id: u8) -> bool {
+        self.inner.has(id)
+    }
+
+    pub fn count(&self, id: u8) -> u8 {
+        self.inner.count(id)
+    }
+
+    pub fn put(&mut self, id: u8, count: u8) {
+        self.inner.put(id, count)
+    }
+
+    pub fn clear(&mut self) {
+        self.inner.clear()
+    }
+}
+
+impl Default for WasmPaletteShadow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Rust-only accessor; a later task's `prevalidatePalRle` export needs the
+/// wrapped shadow. Deliberately not `#[wasm_bindgen]`.
+#[allow(dead_code)]
+impl WasmPaletteShadow {
+    pub(crate) fn inner_ref(&self) -> &PaletteShadow {
+        &self.inner
+    }
+}
+
+#[wasm_bindgen]
+pub struct WasmParityDecoder {
+    inner: ParityDecoder,
+}
+
+#[wasm_bindgen]
+impl WasmParityDecoder {
+    #[wasm_bindgen(constructor)]
+    pub fn new(window_capacity: usize) -> WasmParityDecoder {
+        WasmParityDecoder {
+            inner: ParityDecoder::new(window_capacity),
+        }
+    }
+
+    #[wasm_bindgen(js_name = hasSource)]
+    pub fn has_source(&self, wire_seq: u32) -> bool {
+        self.inner.has_source(wire_seq)
+    }
+
+    /// Returns a recovered source datagram if this arrival unlocked a
+    /// buffered parity, otherwise `undefined`.
+    #[wasm_bindgen(js_name = recordSource)]
+    pub fn record_source(&mut self, wire_seq: u32, bytes: &[u8]) -> Option<Vec<u8>> {
+        self.inner.record_source(wire_seq, bytes)
+    }
+
+    /// Takes the raw envelope bytes and parses internally, mirroring the TS
+    /// suite's `parseParityEnvelope` + `receiveParity` pairing.
+    ///
+    /// Returns `undefined` both for a malformed envelope and for a
+    /// well-formed one that recovers nothing — the suite distinguishes those
+    /// by also asserting on `hasSource`.
+    #[wasm_bindgen(js_name = receiveParity)]
+    pub fn receive_parity(&mut self, envelope_bytes: &[u8]) -> Option<Vec<u8>> {
+        let env = TileParityEnvelope::decode(envelope_bytes).ok()?;
+        self.inner.receive_parity(&env)
+    }
+}
+
+#[wasm_bindgen]
+pub struct WasmLossTracker {
+    inner: LossTracker,
+}
+
+#[wasm_bindgen]
+impl WasmLossTracker {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> WasmLossTracker {
+        WasmLossTracker {
+            inner: LossTracker::new(),
+        }
+    }
+
+    #[wasm_bindgen(js_name = onDatagram)]
+    pub fn on_datagram(&mut self, now_us: u64) {
+        self.inner.on_datagram(now_us)
+    }
+
+    #[wasm_bindgen(js_name = onStaleTile)]
+    pub fn on_stale_tile(&mut self, expected: usize, received: usize) {
+        self.inner.on_stale_tile(expected, received)
+    }
+
+    #[wasm_bindgen(js_name = onFecRecovery)]
+    pub fn on_fec_recovery(&mut self) {
+        self.inner.on_fec_recovery()
+    }
+
+    #[wasm_bindgen(js_name = encodeFeedback)]
+    pub fn encode_feedback(&mut self, now_us: u64) -> Vec<u8> {
+        self.inner.encode_feedback(now_us)
+    }
+}
+
+impl Default for WasmLossTracker {
     fn default() -> Self {
         Self::new()
     }
