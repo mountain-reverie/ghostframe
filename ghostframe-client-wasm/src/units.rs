@@ -177,6 +177,13 @@ impl WasmNackBatcher {
     pub fn on_timeout(&mut self, now_us: u64) -> Option<Vec<u8>> {
         self.inner.on_timeout(now_us)
     }
+
+    /// Flushes pending entries immediately, bypassing the deadline.
+    /// `undefined` when nothing is queued. Mirrors `WasmAckBatcher::flush`
+    /// and the TS `flushNow`.
+    pub fn flush(&mut self) -> Option<Vec<u8>> {
+        self.inner.flush()
+    }
 }
 
 impl Default for WasmNackBatcher {
