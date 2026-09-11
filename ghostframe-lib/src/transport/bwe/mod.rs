@@ -218,8 +218,8 @@ mod tests {
             let batch: Vec<AckArrival> = (0..12u32)
                 .map(|i| {
                     let emit_us = ((step * 20 + i) as u64) * 1_000;
-                    // One-way delay grows 1 ms per step. Volume is constant.
-                    let arrival_ms = emit_us / 1_000 + 15 + step as u64;
+                    // One-way delay grows 10 ms per step. Volume is constant.
+                    let arrival_ms = emit_us / 1_000 + 15 + (step as u64) * 10;
                     AckArrival {
                         wire_seq: step * 12 + i,
                         server_emit_us: emit_us,
@@ -239,6 +239,42 @@ mod tests {
         assert!(
             last < 4_000_000,
             "estimate {last} never fell despite steadily rising one-way delay"
+        );
+    }
+
+    /// Control for `wrapper_backs_off_on_rising_delay`. Same shape, flat
+    /// delay: the estimate must RISE above the seed. Without this, a driver
+    /// that simply decays toward zero would satisfy the back-off test.
+    #[test]
+    fn wrapper_rises_on_a_clean_link() {
+        let t0 = std::time::Instant::now();
+        let mut w = BweWrapper::new(4_000_000, t0);
+
+        let mut last = w.snapshot().bitrate_bps;
+        for step in 0..400u32 {
+            let batch: Vec<AckArrival> = (0..12u32)
+                .map(|i| {
+                    let emit_us = ((step * 20 + i) as u64) * 1_000;
+                    let arrival_ms = emit_us / 1_000 + 15;
+                    AckArrival {
+                        wire_seq: step * 12 + i,
+                        server_emit_us: emit_us,
+                        client_arrival_ms_lo16: (arrival_ms & 0xFFFF) as u16,
+                        size_bytes: 1200,
+                    }
+                })
+                .collect();
+            last = w
+                .update(
+                    &batch,
+                    t0 + std::time::Duration::from_millis(20 * step as u64),
+                )
+                .bitrate_bps;
+        }
+
+        assert!(
+            last > 4_000_000,
+            "estimate {last} did not rise on a clean link with constant delay"
         );
     }
 }

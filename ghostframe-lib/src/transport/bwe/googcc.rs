@@ -23,7 +23,7 @@ const MIN_BPS: i64 = 200_000;
 const MAX_BPS: i64 = 200_000_000;
 
 pub(crate) struct GoogCcDriver {
-    ctl: GoogCcNetworkController,
+    ctl: SendCtl,
     /// Only the arrival series needs unwrapping: it crosses the wire as 16
     /// bits of the client's clock. `server_emit_us` is already monotonic
     /// server-side microseconds and is used directly.
@@ -33,18 +33,30 @@ pub(crate) struct GoogCcDriver {
     samples_seen: u64,
 }
 
-// SAFETY: `GoogCcNetworkController` (goog_cc 0.1.4) is `!Send` only because
-// its private `acknowledged_bitrate_estimator` field is typed
-// `Box<dyn AcknowledgedBitrateEstimatorInterface>` without a `+ Send` bound,
-// which erases the auto trait regardless of the boxed value. Every
-// implementor the crate ever constructs there (`AcknowledgedBitrateEstimator`,
-// `RobustThroughputEstimator`) is plain data — no `Rc`, no interior
-// mutability, no raw pointers, no thread-locals anywhere in goog_cc 0.1.4 —
-// so the underlying value is actually `Send`. `GoogCcDriver` is always
-// owned exclusively (moved wholesale into `IoBridge`, which itself is moved
-// into a single `tokio::spawn`ed task) and never shared across threads, so
-// asserting `Send` here does not admit a data race.
-unsafe impl Send for GoogCcDriver {}
+/// Newtype carrying the `Send` assertion, so it covers exactly the one type
+/// that needs it and `GoogCcDriver` derives `Send` normally. A future field
+/// on the driver that is not `Send` will then be a compile error rather than
+/// silently covered.
+struct SendCtl(GoogCcNetworkController);
+
+// SAFETY: `GoogCcNetworkController` is `!Send` only because it boxes
+// `dyn AcknowledgedBitrateEstimatorInterface` without a `+ Send` bound. That
+// trait is private to goog_cc (`lib.rs` has a private `use`, not `pub use`),
+// the field is assigned at exactly two sites and both are
+// `AcknowledgedBitrateEstimator::create`, and no public API accepts a boxed
+// estimator — so no foreign, non-`Send` implementor can reach it. The crate
+// has one dependency (`tracing`), zero `unsafe`, and no `Rc`, `RefCell`,
+// `Cell`, `UnsafeCell`, raw pointers, `thread_local` or `static mut` anywhere
+// in its source. The contents are uniquely owned plain data.
+//
+// This is a `Send` claim, not a `Sync` one: the value is moved between
+// threads when the multi-threaded tokio runtime migrates the bridge task,
+// and never shared. `Send` is exactly what that requires.
+//
+// The audit is pinned to one version by `goog_cc = "=0.1.4"` in Cargo.toml —
+// a semver-compatible 0.1.5 could add an `Rc` field with no compile error and
+// silently invalidate this.
+unsafe impl Send for SendCtl {}
 
 impl GoogCcDriver {
     pub(crate) fn new(initial_bps: u64, now: Instant) -> Self {
@@ -61,7 +73,7 @@ impl GoogCcDriver {
             ..Default::default()
         };
         Self {
-            ctl: GoogCcNetworkController::new(
+            ctl: SendCtl(GoogCcNetworkController::new(
                 cfg,
                 GoogCcConfig {
                     // We only ever feed `TransportPacketsFeedback` — there is
@@ -74,7 +86,7 @@ impl GoogCcDriver {
                     // of the estimator.
                     feedback_only: true,
                 },
-            ),
+            )),
             arrival_time: Lo16Timeline::default(),
             base: now,
             estimate_bps: initial_bps,
@@ -96,30 +108,53 @@ impl GoogCcDriver {
         // (acks can't arrive before the send that produced them), but a
         // batch's individual per-packet send stamps can still range a few
         // ms past the caller's sampled `now` — so floor feedback_time at the
-        // batch's own latest send/receive timestamp.
+        // batch's own latest send timestamp.
+        //
+        // Deliberately `send_ms` only — NOT `recv_ms`. `send_ms` is derived
+        // from `server_emit_us`, measured from the server's `bwe_epoch`.
+        // `recv_ms` is derived from `client_arrival_ms_lo16`, which in the
+        // browser is `performance.now() & 0xFFFF` — a page-navigation epoch
+        // wrapping every 65.5s — passed through `Lo16Timeline`, which
+        // anchors on whatever it first sees. The offset between the two
+        // epochs is arbitrary in [0, 65.5s) and `max()` across them is
+        // meaningless: when the client series runs ahead, flooring on it
+        // drags `feedback_time` into the client's epoch while `send_time`
+        // stays in the server's, so goog_cc computes `feedback_rtt` as the
+        // epoch offset instead of a real RTT. That trips `RttBasedBackoff`'s
+        // 3s limit continuously, drives `LinkCapacityTracker::capacity_estimate_bps`
+        // negative, and panics inside `DataRate::from_bits_per_sec_float`'s
+        // `value >= 0.0` assertion. Everything else in the controller
+        // consumes `receive_time` only as recv-minus-recv differences, so
+        // the client epoch cancels naturally without needing to be floored
+        // against anything here.
         let mut feedback_time = self.to_timestamp(now);
+        // Safe to initialize from the first record's send_ms: `records` was
+        // checked non-empty above.
+        let mut send_ms_max = (records[0].server_emit_us / 1_000) as i64;
         let mut packet_feedbacks = Vec::with_capacity(records.len());
         for r in records {
             let send_ms = (r.server_emit_us / 1_000) as i64;
             let recv_ms = self.arrival_time.unwrap_ms(r.client_arrival_ms_lo16) as i64;
-            feedback_time = feedback_time.max(Timestamp::from_millis(send_ms.max(recv_ms)));
+            send_ms_max = send_ms_max.max(send_ms);
             let sent = SentPacket {
                 send_time: Timestamp::from_millis(send_ms),
                 size: DataSize::from_bytes(r.size_bytes as i64),
                 ..Default::default()
             };
             // The controller must see the send before the acknowledgement.
-            self.ctl.on_sent_packet(sent);
+            self.ctl.0.on_sent_packet(sent);
             packet_feedbacks.push(PacketResult {
                 sent_packet: sent,
                 receive_time: Timestamp::from_millis(recv_ms),
                 ..Default::default()
             });
         }
+        feedback_time = feedback_time.max(Timestamp::from_millis(send_ms_max));
         self.samples_seen += records.len() as u64;
 
         let upd = self
             .ctl
+            .0
             .on_transport_packets_feedback(TransportPacketsFeedback {
                 feedback_time,
                 data_in_flight: DataSize::from_bytes(0),
@@ -128,7 +163,7 @@ impl GoogCcDriver {
             });
         self.absorb(upd);
 
-        let upd = self.ctl.on_process_interval(ProcessInterval {
+        let upd = self.ctl.0.on_process_interval(ProcessInterval {
             at_time: feedback_time,
             ..Default::default()
         });
@@ -146,16 +181,25 @@ impl GoogCcDriver {
 
     fn absorb(&mut self, upd: NetworkControlUpdate) {
         if let Some(t) = upd.target_rate {
-            // `stable_target_rate` (not the raw `target_rate`) is what real
-            // WebRTC senders feed to the encoder: it is clamped by the
-            // controller's `LinkCapacityTracker`, which ratchets down
-            // immediately on a delay-based decrease but only climbs back
-            // slowly (a ~10 s time constant) as the acknowledged rate
-            // confirms real capacity. `target_rate` recovers from a brief
-            // overuse almost immediately via ordinary AIMD probing, so it
-            // does not hold a conservative estimate the way `size_bytes`-only
-            // callers (the pacer, later) need.
-            let bps = t.stable_target_rate.bps();
+            // `target_rate` (not `stable_target_rate`) is the value this
+            // wrapper reports. `stable_target_rate` is
+            // `min(link_capacity_estimate, pushback_target_rate)`, where the
+            // capacity tracker starts near the acknowledged rate and climbs
+            // back only slowly (a ~10 s time constant) after a delay-based
+            // decrease — on a clean, already-settled link it under-reads
+            // `target_rate` by roughly 2.5x. That field is libwebrtc's
+            // *encoder* hint, chosen for resolution stability, not a value
+            // any caller here consumes: this wrapper has no encoder-rate
+            // caller and the pacer is driven by
+            // `NetworkControlUpdate::pacer_config`, which goog_cc computes
+            // independently.
+            //
+            // `target_rate` is the controller's actual bandwidth estimate —
+            // the delay-based/loss-based AIMD result — and is what Stage 2's
+            // pacer should be validated against once it's wired up (it
+            // should consume `upd.pacer_config` directly rather than
+            // deriving a rate from this field).
+            let bps = t.target_rate.bps();
             if bps > 0 {
                 self.estimate_bps = bps as u64;
             }
@@ -209,5 +253,45 @@ mod tests {
             "estimate never moved off the starting rate — the controller's \
              updates are not being absorbed"
         );
+    }
+
+    /// The client's arrival clock is a completely independent epoch — in the
+    /// browser it is `performance.now() & 0xFFFF`, anchored at page load. The
+    /// driver must be immune to that offset. Flooring `feedback_time` with a
+    /// client-epoch value instead makes goog_cc read the offset as an RTT,
+    /// trips its 3 s RttBasedBackoff, drives the link-capacity estimate
+    /// negative, and panics inside the bridge task.
+    #[test]
+    fn an_independently_epoched_client_clock_does_not_panic() {
+        for offset_ms in [0u64, 3_000, 10_000, 40_000] {
+            let t0 = Instant::now();
+            let mut d = GoogCcDriver::new(4_000_000, t0);
+            for step in 0..400u32 {
+                let batch: Vec<AckArrival> = (0..12u32)
+                    .map(|i| {
+                        let emit_us = ((step * 20 + i) as u64) * 1_000;
+                        // Constant 15 ms one-way delay; only the epoch differs.
+                        let arrival_ms = emit_us / 1_000 + 15 + offset_ms;
+                        AckArrival {
+                            wire_seq: step * 12 + i,
+                            server_emit_us: emit_us,
+                            client_arrival_ms_lo16: (arrival_ms & 0xFFFF) as u16,
+                            size_bytes: 1200,
+                        }
+                    })
+                    .collect();
+                d.update(&batch, t0 + Duration::from_millis(20 * step as u64));
+            }
+            let bps = d.snapshot().bitrate_bps;
+            assert!(bps > 0, "offset {offset_ms} ms produced no estimate");
+        }
+    }
+
+    /// `GoogCcDriver` must stay `Send`: `IoBridge` is spawned with
+    /// `tokio::spawn` on the multi-threaded runtime.
+    #[test]
+    fn driver_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<GoogCcDriver>();
     }
 }
