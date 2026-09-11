@@ -21,7 +21,7 @@ use crate::cdf53_coverage::apply_cdf53_arrival;
 use crate::cdf53_prevalidate::prevalidate_cdf53;
 use crate::event::{Event, PollOutput, TileKey};
 use crate::pal_rle_decode::decode_pal_rle_tile;
-use crate::{Assembly, ClientCore};
+use crate::{Assembly, ClientCore, TileDelivery};
 
 /// Minimum bytes that carry a full tile header stack.
 const TILE_MIN: usize = DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE; // 24
@@ -243,6 +243,26 @@ impl ClientCore {
                 let height = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
                 events.push(Event::FrameDimensions { width, height });
             }
+            return;
+        }
+
+        // Payload mode stops here for the codecs whose decode is purely pixel
+        // expansion. Raw and Solid carry no protocol state, so there is
+        // nothing to update before handing the bytes up. PalRle and Cdf53 do
+        // (palette upserts, pass coverage and ACKs), so they are handled
+        // inside the match instead.
+        if self.tile_delivery == TileDelivery::Payload
+            && matches!(asm.codec, Codec::Raw | Codec::Solid)
+        {
+            events.push(Event::TilePayload {
+                frame_seq,
+                tile_x: tx,
+                tile_y: ty,
+                pass_idx: asm.pass,
+                generation: asm.generation,
+                codec: asm.codec,
+                payload,
+            });
             return;
         }
 
