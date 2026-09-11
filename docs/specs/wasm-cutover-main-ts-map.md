@@ -156,7 +156,7 @@ evaluates. The count is exactly 21 total (10 `main.ts` + 11
 | `__cdf53GetTileWatcher` | Reads `renderer.cdf53Pipeline.tileWatcherCaptures`/stats (main.ts:252-272) | **GPU-side, not protocol.** Untouched. | `e2e_cdf53_tile_watcher` | **Hard-gated.** `captures.is_empty()`, per-pass-idx coverage (`n >= 1` for all 14), and `total_mismatches == 0` are real `assert!`/`assert_eq!` calls. |
 | `__cdf53TestIntegrate` | Test-only hook: hand-builds RLE passes, calls **TS** `prevalidateCdf53` (from `prevalidate_cdf53.ts`) to validate them, then drives `pipe.uploadBatch` + `pipe.encodeIntegrate` directly (main.ts:131-178) | **Mostly GPU-side** (writes/reads GPU buffers directly, bypassing the wire entirely) **but has a live dependency on the TS prevalidate function that Phase 4b deletes.** Must be repointed at the wasm free function `prevalidateCdf53(payload, generation, pass_idx)` (`.d.ts:226`), not left calling into an orphaned module. | `e2e_cdf53_integrate_correctness` | **Hard-gated** (`assert_eq!` on returned coefficient/sign arrays and mismatch counts). |
 | `__cdf53TestInverse` | Test-only hook: writes hand-supplied coefficients straight into GPU buffers, runs the inverse shader, reads back pixels (main.ts:83-124) | **Pure GPU-side**, no protocol dependency at all — no TS protocol function is called anywhere in this hook. Untouched. | `e2e_cdf53_bypass_integrate`, `e2e_cdf53_inverse_gradient_tile` | **Hard-gated** in both (`assert_eq!(got_rgba.len(), ...)` plus a pixel-match `assert!`). |
-| `__h5_tilePushLog` | `finishAssembly`, one entry per tile of any codec, on every arrival (main.ts:542-565) | From `TilePayload`/`TileReady`/`DecodeError` events — but see Part 4, the `c0` hex field's semantics change for Raw/Solid. | `e2e_palette_eviction_chromium`, `e2e_palette_eviction_firefox` (via `e2e_palette_eviction_body`) | **Diagnostic only** — the entire read is inside `if e2e_diag_enabled()`, output goes to `e2e_diag!`/`eprintln!`, gated behind `GHOSTFRAME_E2E_DIAG`. No `assert` touches it. |
+| `__h5_tilePushLog` | `finishAssembly`, one entry per tile of any codec, on every arrival (main.ts:542-565) | From `TilePayload`/`DecodeError` events. (`TileReady` does not occur under `Payload` delivery — see Part 4.) | `e2e_palette_eviction_chromium`, `e2e_palette_eviction_firefox` (via `e2e_palette_eviction_body`) | **Diagnostic only** — the entire read is inside `if e2e_diag_enabled()`, output goes to `e2e_diag!`/`eprintln!`, gated behind `GHOSTFRAME_E2E_DIAG`. No `assert` touches it. |
 
 **Net count: 3 of the ten are unambiguously GPU-side** (`__cdf53Probe`,
 `__cdf53DumpTileState`, `__cdf53GetTileWatcher`) and need no wiring at all —
@@ -186,28 +186,44 @@ regression.
 
 ## Part 4: surprises
 
-1. **`TileReady` is not dead code under `tile_delivery_payload = true`.**
-   The plan's Task 3 dispatcher sketch marks the `TileReady` case
-   `/* should not occur under Payload delivery */`. That's only true for
-   `PalRle` and `Cdf53` — `reassembly.rs`'s match arms gate *only* those two
-   codecs on `self.tile_delivery == TileDelivery::Payload`
-   (`reassembly.rs:309`, `:392`). `Codec::Raw` (line 270) and `Codec::Solid`
-   (line 288) are **not** gated at all — they always emit `TileReady`,
-   in both delivery modes. So in the browser, every Raw and Solid tile
-   still arrives as `TileReady`, and the dispatcher must actually route it,
-   not treat it as an assertion-worthy impossibility.
+1. **`TileReady` under `Payload` delivery — corrected.**
+   An earlier draft of this document claimed `Raw` and `Solid` still emit
+   `TileReady` in `Payload` mode, on the grounds that their match arms
+   (`reassembly.rs:270`, `:288`) carry no `tile_delivery` guard. That reading
+   missed the **early return above the match**:
 
-   This also changes the payload shape crossing the boundary for those two
-   codecs: `TileReady.rgba` is a **pre-converted, fixed 4096-byte RGBA
-   buffer** (BGRA→RGBA swizzled for Raw, solid-color-expanded to the full
-   32×32 tile for Solid — done in Rust, `reassembly.rs:270-307`). Today
-   `renderer.pushRaw`/`renderer.pushSolid` take the *original wire payload*
-   (variable-length BGRA for Raw, a 4-byte BGRA quad for Solid) and do that
-   conversion themselves downstream. Task 2/3 needs to either add renderer
-   entry points that accept pre-expanded RGBA tiles, or accept that the
-   GPU-side contract for Raw/Solid is changing shape, not just source. This
-   is a bigger wiring change than the plan's dispatcher sketch implies and
-   should be called out explicitly when Task 3 is reviewed.
+   ```rust
+   // reassembly.rs:254
+   if self.tile_delivery == TileDelivery::Payload
+       && matches!(asm.codec, Codec::Raw | Codec::Solid)
+   {
+       events.push(Event::TilePayload { /* ... */ payload });
+       return;
+   }
+   ```
+
+   Those match arms are reachable only in `Decoded` mode. Under `Payload`,
+   `Raw` and `Solid` emit `TilePayload` carrying the **original wire bytes,
+   unswizzled** — not a pre-converted RGBA buffer.
+
+   `ghostframe-client-core/tests/tile_delivery.rs` asserts this directly:
+
+   ```rust
+   assert!(!events.iter().any(|e| matches!(e, Event::TileReady { .. })),
+           "Payload mode must not emit TileReady");
+   ```
+
+   and `raw_in_payload_mode_passes_bytes_through` asserts
+   `payload == bgra` — "payload must be the wire bytes, unswizzled".
+
+   **So the plan's dispatcher sketch was right**, and the GPU-side contract
+   for `Raw`/`Solid` does *not* change: `renderer.pushRaw`/`pushSolid` keep
+   receiving the same wire payload they receive today. `TileReady` should not
+   occur in the browser, and a dispatcher that treats it as unexpected is
+   correct.
+
+   Recorded rather than silently deleted because the mis-reading is an easy
+   one to repeat: the guard clause sits 16 lines above the arms it governs.
 
 2. **`__cdf53DispatchSeen`'s source is two events summed, not one.**
    The plan's own risk table (`## The 21 globals`) lists its post-cutover
