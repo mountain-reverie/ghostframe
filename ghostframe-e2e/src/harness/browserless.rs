@@ -118,6 +118,12 @@ pub struct BrowserlessResult {
     /// module does not maintain a second staleness definition of its own.
     pub stale_generation_tiles: u32,
     pub seed: u64,
+    /// Server-side bandwidth estimate at the end of the scene, bits per
+    /// second. Zero if the controller never produced one.
+    pub bwe_estimate_bps: u64,
+    /// Count of derived RTTs implausible against quinn's measured path RTT.
+    /// Non-zero means emit and arrival timestamps are not on one clock.
+    pub implausible_rtt_samples: u64,
 }
 
 /// The address the harness uses to identify the client, baked into every
@@ -173,6 +179,17 @@ async fn run_inner(scene: BrowserlessScene) -> anyhow::Result<BrowserlessResult>
         scene.grid_cols,
         scene.grid_rows,
     );
+    // `bridge` is moved wholesale into the spawned task below, so a plain
+    // `&self` accessor on it (`IoBridge::bwe_snapshot`) is unreachable from
+    // this function afterwards — there is no way to call back into a value
+    // a spawned task owns. Clone the `Arc` behind `IoBridge::bwe_publish`
+    // *before* the move; `run()`'s loop republishes into it on every
+    // iteration, and this function reads the clone's contents after
+    // `bridge_handle.abort()`. See `bwe_publish`'s doc comment in
+    // `io_bridge.rs` for the full picture — this is option (a) from that
+    // comment, chosen because it doesn't disturb the existing `spawn_local`
+    // + abort shape the bring-up tests already depend on.
+    let bwe_cell = bridge.bwe_publish_handle();
     // `IoBridge::run` is an infinite event loop that only returns on EOF or
     // error; it must be aborted explicitly (see below) rather than awaited.
     let bridge_handle = tokio::task::spawn_local(async move {
@@ -205,12 +222,16 @@ async fn run_inner(scene: BrowserlessScene) -> anyhow::Result<BrowserlessResult>
     .await;
 
     // Always abort, on every exit path — the bridge task must not outlive
-    // this function, and `outcome` may be an `Err`.
+    // this function, and `outcome` may be an `Err`. The last snapshot
+    // `run()`'s loop published into `bwe_cell` before this abort is
+    // therefore a final snapshot, not a live running read — there is no
+    // point after the abort where `run()` could publish again.
     bridge_handle.abort();
 
     let (events, bytes_delivered, bytes_dropped) = outcome?;
 
     let stale_generation_tiles = framebuffer.stale_frame_tiles();
+    let bwe_snapshot = *bwe_cell.lock().expect("bwe_publish mutex poisoned");
 
     Ok(BrowserlessResult {
         framebuffer,
@@ -219,6 +240,8 @@ async fn run_inner(scene: BrowserlessScene) -> anyhow::Result<BrowserlessResult>
         bytes_dropped,
         stale_generation_tiles,
         seed,
+        bwe_estimate_bps: bwe_snapshot.bitrate_bps,
+        implausible_rtt_samples: bwe_snapshot.implausible_rtt_samples,
     })
 }
 
