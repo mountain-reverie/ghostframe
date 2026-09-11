@@ -44,6 +44,9 @@ COPY ghostframe-client-core/src/ ghostframe-client-core/src/
 # so cargo refuses to resolve the manifest without it.
 COPY ghostframe-client-net/Cargo.toml ghostframe-client-net/Cargo.toml
 COPY ghostframe-client-net/src/ ghostframe-client-net/src/
+COPY ghostframe-client-wasm/Cargo.toml ghostframe-client-wasm/Cargo.toml
+COPY ghostframe-client-wasm/src/ ghostframe-client-wasm/src/
+COPY ghostframe-client-wasm/build.rs ghostframe-client-wasm/build.rs
 # Workspace members not built here but required for cargo to resolve the
 # workspace manifest.
 COPY ghostframe-e2e/Cargo.toml ghostframe-e2e/Cargo.toml

@@ -4,6 +4,7 @@ members = [
     "ghostframe-protocol",
     "ghostframe-client-core",
     "ghostframe-client-net",
+    "ghostframe-client-wasm",
     "ghostframe-lib",
     "ghostframe-xdaemon",
     "ghostframe-test-pattern",
