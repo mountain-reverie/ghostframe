@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { PaletteShadow } from '../src/palette_shadow.js';
+import { WasmPaletteShadow as PaletteShadow } from '../pkg-node/ghostframe_client_wasm.js';
 
 describe('PaletteShadow', () => {
   it('starts empty', () => {
