@@ -13,6 +13,7 @@ fn test_core() -> ClientCore {
         ClientConfig {
             indices_raw_enabled: true,
             supports_h264: true,
+            ..Default::default()
         },
         0,
     );
