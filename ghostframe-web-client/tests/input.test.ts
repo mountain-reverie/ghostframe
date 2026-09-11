@@ -1,57 +1,58 @@
 import { describe, it, expect } from 'vitest';
-import { keyboardEventToKeysym } from '../src/input/keymap.js';
-
-function ev(key: string): KeyboardEvent {
-  return { key } as unknown as KeyboardEvent;
-}
-
-describe('keyboardEventToKeysym', () => {
-  it('returns null for dead keys', () => {
-    expect(keyboardEventToKeysym(ev('Dead'))).toBeNull();
-    expect(keyboardEventToKeysym(ev('Unidentified'))).toBeNull();
-  });
-
-  it('maps Enter to XK_Return (0xff0d)', () => {
-    expect(keyboardEventToKeysym(ev('Enter'))).toBe(0xff0d);
-  });
-
-  it('maps ArrowUp to XK_Up (0xff52)', () => {
-    expect(keyboardEventToKeysym(ev('ArrowUp'))).toBe(0xff52);
-  });
-
-  it('maps F1 to XK_F1 (0xffbe)', () => {
-    expect(keyboardEventToKeysym(ev('F1'))).toBe(0xffbe);
-  });
-
-  it("maps printable 'a' to 0x61", () => {
-    expect(keyboardEventToKeysym(ev('a'))).toBe(0x61);
-  });
-
-  it("maps Latin-1 'ñ' to 0xf1", () => {
-    expect(keyboardEventToKeysym(ev('ñ'))).toBe(0xf1);
-  });
-
-  it("maps higher BMP '中' to 0x01000000 | codepoint", () => {
-    expect(keyboardEventToKeysym(ev('中'))).toBe(0x01000000 | 0x4e2d);
-  });
-
-  it('returns null for unknown multi-char names', () => {
-    expect(keyboardEventToKeysym(ev('NotARealKey'))).toBeNull();
-  });
-
-  it('handles space (KeyboardEvent.key = " ")', () => {
-    expect(keyboardEventToKeysym(ev(' '))).toBe(0x20);
-  });
-});
-
 import {
+  keyToKeysym,
   encodePointerMove,
   encodePointerButton,
   encodeWheel,
   encodeKeyDown,
   encodeKeyUp,
-  INPUT_MSG_TYPE,
-} from '../src/input/encode.js';
+  inputMsgType,
+} from '../pkg-node/ghostframe_client_wasm.js';
+
+// keyboardEventToKeysym was `key_to_keysym(event.key)` plus a `.key`
+// extraction from the DOM event; the extraction is capture-side plumbing
+// (attachInputCapture, untouched by this retarget) and not exercised here.
+// The local `ev()` fake-KeyboardEvent helper is gone -- keyToKeysym takes
+// the string directly. `toBeNull()` -> `toBeUndefined()` throughout: Rust's
+// `Option::None` crosses the wasm boundary as `undefined`, not `null`.
+describe('keyToKeysym', () => {
+  it('returns undefined for dead keys', () => {
+    expect(keyToKeysym('Dead')).toBeUndefined();
+    expect(keyToKeysym('Unidentified')).toBeUndefined();
+  });
+
+  it('maps Enter to XK_Return (0xff0d)', () => {
+    expect(keyToKeysym('Enter')).toBe(0xff0d);
+  });
+
+  it('maps ArrowUp to XK_Up (0xff52)', () => {
+    expect(keyToKeysym('ArrowUp')).toBe(0xff52);
+  });
+
+  it('maps F1 to XK_F1 (0xffbe)', () => {
+    expect(keyToKeysym('F1')).toBe(0xffbe);
+  });
+
+  it("maps printable 'a' to 0x61", () => {
+    expect(keyToKeysym('a')).toBe(0x61);
+  });
+
+  it("maps Latin-1 'ñ' to 0xf1", () => {
+    expect(keyToKeysym('ñ')).toBe(0xf1);
+  });
+
+  it("maps higher BMP '中' to 0x01000000 | codepoint", () => {
+    expect(keyToKeysym('中')).toBe(0x01000000 | 0x4e2d);
+  });
+
+  it('returns undefined for unknown multi-char names', () => {
+    expect(keyToKeysym('NotARealKey')).toBeUndefined();
+  });
+
+  it('handles space (KeyboardEvent.key = " ")', () => {
+    expect(keyToKeysym(' ')).toBe(0x20);
+  });
+});
 
 describe('encodeInput*', () => {
   it('encodePointerMove writes [0x05, 0x01, x:i16, y:i16] (6 bytes)', () => {
@@ -90,6 +91,6 @@ describe('encodeInput*', () => {
   });
 
   it('INPUT_MSG_TYPE is 0x05', () => {
-    expect(INPUT_MSG_TYPE).toBe(0x05);
+    expect(inputMsgType()).toBe(0x05);
   });
 });

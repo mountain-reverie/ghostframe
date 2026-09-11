@@ -10,6 +10,8 @@
 // Spec: docs/superpowers/specs/2026-06-13-input-forwarding-design.md
 // Ported from ghostframe-web-client/src/input/encode.ts and keymap.ts
 
+/// Input event message type. Wire layouts are documented at the top of
+/// this module; every encoder below emits this as byte 0.
 pub const INPUT_MSG_TYPE: u8 = 0x05;
 
 /// Encode a pointer-move event: [0x05, 0x01, x:i16 BE, y:i16 BE]

@@ -9,6 +9,7 @@
 use ghostframe_client_core::{
     ack_batcher::FLUSH_INTERVAL_US as ACK_FLUSH_INTERVAL_US,
     decode_error_batcher::{DECODE_ERROR_MSG_TYPE, DECODE_ERROR_SIZE},
+    input::INPUT_MSG_TYPE,
     loss_tracker::{HELLO_MSG_TYPE, HELLO_SIZE},
     nack_batcher::{FLUSH_INTERVAL_US as NACK_FLUSH_INTERVAL_US, NACK_BATCH_MAX},
 };
@@ -74,6 +75,7 @@ export_const!(
     TILE_PARITY_ENVELOPE
 );
 
+export_const!("inputMsgType", input_msg_type, u8, INPUT_MSG_TYPE);
 export_const!("helloMsgType", hello_msg_type, u8, HELLO_MSG_TYPE);
 export_const!("helloSize", hello_size, usize, HELLO_SIZE);
 export_const!(
