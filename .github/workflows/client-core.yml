@@ -16,4 +16,33 @@ jobs:
       # browserless job, which does install them. The wasm build below still
       # covers it, and does not build dev-dependencies.
       - run: cargo test -p ghostframe-protocol -p ghostframe-client-core
-      - run: cargo build -p ghostframe-protocol -p ghostframe-client-core -p ghostframe-client-net --target wasm32-unknown-unknown
+      - run: cargo build -p ghostframe-protocol -p ghostframe-client-core -p ghostframe-client-net -p ghostframe-client-wasm --target wasm32-unknown-unknown
+
+  wasm-module:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: wasm32-unknown-unknown }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: ghostframe-web-client/package-lock.json
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --version 0.15.0 --locked
+      - name: Install web client deps
+        working-directory: ghostframe-web-client
+        run: npm ci
+      # npm test builds pkg-node (build:wasm:node) and gates the protocol
+      # staleness stamp, the wasm smoke test, and all pre-existing suites
+      # together.
+      - name: Build wasm and run the vitest suites
+        working-directory: ghostframe-web-client
+        run: npm test
+      # npm test only exercises the nodejs wasm-pack target. The browser
+      # bundle (what the SPA actually ships) uses the web target instead,
+      # so without this step a break there would surface only at cutover.
+      - name: Build the browser-target wasm
+        working-directory: ghostframe-web-client
+        run: npm run build:wasm

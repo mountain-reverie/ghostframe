@@ -18,6 +18,12 @@ description: >
 runs:
   using: composite
   steps:
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: wasm32-unknown-unknown
+    - name: Install wasm-pack
+      shell: bash
+      run: cargo install wasm-pack --version 0.15.0 --locked
     - uses: actions/setup-node@v4
       with:
         node-version: '20'
