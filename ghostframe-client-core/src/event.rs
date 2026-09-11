@@ -52,6 +52,27 @@ pub enum Event {
         tile_y: u8,
         code: DecodeErrorCode,
     },
+    /// A reassembled, parity-recovered, prevalidated, generation-checked tile
+    /// pass — but NOT decoded. Emitted instead of `TileReady` when
+    /// `TileDelivery::Payload` is configured, so a GPU decoder can take it.
+    TilePayload {
+        frame_seq: u32,
+        tile_x: u8,
+        tile_y: u8,
+        pass_idx: u8,
+        generation: u8,
+        codec: Codec,
+        payload: Vec<u8>,
+    },
+    /// A palette slot changed. Only emitted under `TileDelivery::Payload`:
+    /// under `Decoded` the core applies the palette itself and the consumer
+    /// never needs to see it.
+    ///
+    /// Colours are BGRA, matching the wire and the palette table.
+    PaletteUpdated {
+        palette_id: u8,
+        colors: Vec<[u8; 4]>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
