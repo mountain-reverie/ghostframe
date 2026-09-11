@@ -10,7 +10,7 @@ use ghostframe_client_core::{
     ack_batcher::AckBatcher,
     cdf53_coverage::{self, CoverageEntry},
     cdf53_prevalidate,
-    decode_error_batcher::DecodeErrorBatcher,
+    decode_error_batcher::{DecodeErrorBatcher, DECODE_ERROR_MSG_TYPE},
     loss_tracker::LossTracker,
     nack_batcher::{NackBatcher, NackEntry},
     pal_rle_decode,
@@ -19,11 +19,12 @@ use ghostframe_client_core::{
     DecodeErrorCode,
 };
 use ghostframe_protocol::ack::{AckBatch, AckEntry};
-use ghostframe_protocol::protocol::{Codec, TileParityEnvelope};
+use ghostframe_protocol::protocol::{Codec, TileNackEnvelope, TileParityEnvelope};
 use wasm_bindgen::prelude::*;
 
 use crate::boundary::{
-    WasmAckEntry, WasmArrivalOutcome, WasmPrevalidatedCdf53, WasmPrevalidatedPalRle,
+    WasmAckEntry, WasmArrivalOutcome, WasmNackEntry, WasmParityEnvelope, WasmPrevalidatedCdf53,
+    WasmPrevalidatedPalRle,
 };
 
 // `Option<Vec<u8>>` crosses the boundary as `Uint8Array | undefined`, so the
@@ -403,4 +404,77 @@ pub fn apply_cdf53_arrival(
         prevalidation_ok,
     ));
     serde_wasm_bindgen::to_value(&out).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// Decodes a NACK envelope into flat entries; `undefined` if malformed.
+#[wasm_bindgen(js_name = parseNackEnvelope)]
+pub fn parse_nack_envelope(bytes: &[u8]) -> Result<JsValue, JsValue> {
+    let entries: Option<Vec<WasmNackEntry>> = TileNackEnvelope::decode(bytes)
+        .ok()
+        .map(|env| env.entries.iter().map(WasmNackEntry::from).collect());
+    serde_wasm_bindgen::to_value(&entries).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// Decodes a parity envelope; `undefined` if malformed.
+#[wasm_bindgen(js_name = parseParityEnvelope)]
+pub fn parse_parity_envelope(bytes: &[u8]) -> Result<JsValue, JsValue> {
+    let env: Option<WasmParityEnvelope> = TileParityEnvelope::decode(bytes)
+        .ok()
+        .as_ref()
+        .map(WasmParityEnvelope::from);
+    serde_wasm_bindgen::to_value(&env).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// Builds a parity envelope — the counterpart of the TS
+/// `encodeParityEnvelopeForTest`. `parity_decoder.test.ts` constructs
+/// envelopes to feed the decoder, so this is required, not a convenience.
+#[wasm_bindgen(js_name = encodeParityEnvelope)]
+pub fn encode_parity_envelope(
+    group_first_wire_seq: u32,
+    k: u8,
+    parity_idx: u8,
+    group_first_payload_len: u16,
+    parity_payload: &[u8],
+) -> Vec<u8> {
+    let env = TileParityEnvelope {
+        group_first_wire_seq,
+        k,
+        parity_idx,
+        group_first_payload_len,
+        parity_payload: parity_payload.to_vec(),
+    };
+    let mut out = Vec::new();
+    env.encode(&mut out);
+    out
+}
+
+/// `[HELLO_MSG_TYPE, caps]`; caps bit0 = indices_raw, bit1 = supports_h264.
+#[wasm_bindgen(js_name = encodeHello)]
+pub fn encode_hello(indices_raw: bool, supports_h264: bool) -> Vec<u8> {
+    ghostframe_client_core::loss_tracker::encode_hello(indices_raw, supports_h264)
+}
+
+/// `[DECODE_ERROR_MSG_TYPE, codec, tile_x, tile_y, code]`, unbatched and
+/// unconditional — the rate-limited path is `WasmDecodeErrorBatcher::report`.
+///
+/// Returns `undefined` for an unrecognised `codec` or `code` discriminant
+/// rather than panicking; these are wire-derived values.
+#[wasm_bindgen(js_name = encodeDecodeError)]
+pub fn encode_decode_error(codec: u8, tile_x: u8, tile_y: u8, code: u8) -> Option<Vec<u8>> {
+    let codec = codec_from_u8(codec)?;
+    let code = decode_error_code_from_u8(code)?;
+    Some(vec![
+        DECODE_ERROR_MSG_TYPE,
+        codec as u8,
+        tile_x,
+        tile_y,
+        code as u8,
+    ])
+}
+
+/// CDF53 run-length decode, for `prevalidate_cdf53.test.ts`'s direct
+/// `rleDecode` cases.
+#[wasm_bindgen(js_name = rleDecode)]
+pub fn rle_decode(rle: &[u8]) -> Vec<u8> {
+    ghostframe_protocol::codec::cdf53::rle_decode(rle)
 }
