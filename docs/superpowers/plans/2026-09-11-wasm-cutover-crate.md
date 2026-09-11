@@ -1213,10 +1213,12 @@ the two converters at the top of `units.rs`:
 ```rust
 /// `None` for an unrecognised discriminant. Callers return `undefined`
 /// rather than panicking: a panic aborts the whole wasm module.
+///
+/// `Codec::from_u8` (ghostframe-protocol/src/protocol.rs:68) returns
+/// `Result<Codec, ProtocolError>`; the error carries no information the
+/// caller acts on, so it is discarded here.
 fn codec_from_u8(v: u8) -> Option<Codec> {
-    // Read the discriminants from `ghostframe-protocol::protocol::Codec`
-    // and enumerate them here; do not `transmute`.
-    Codec::from_u8(v)
+    Codec::from_u8(v).ok()
 }
 
 fn decode_error_code_from_u8(v: u8) -> Option<DecodeErrorCode> {
@@ -1237,12 +1239,12 @@ fn decode_error_code_from_u8(v: u8) -> Option<DecodeErrorCode> {
 }
 ```
 
-> `Codec::from_u8` may not exist. Check
-> `ghostframe-protocol/src/protocol.rs` first: if there is no such
-> constructor, write the same explicit `match` used for `DecodeErrorCode`,
-> enumerating the `Codec` discriminants. **Do not use `std::mem::transmute`**
-> — an out-of-range discriminant would be instant UB on a value that comes
-> from the wire.
+> `Codec::from_u8` is confirmed to exist at
+> `ghostframe-protocol/src/protocol.rs:68`, covering discriminants 0..=5
+> (`Skip`, `H264`, `PalRle`, `Solid`, `Raw`, `Cdf53`). `DecodeErrorCode` has
+> no equivalent, hence the explicit `match` above. **Do not use
+> `std::mem::transmute` for either** — an out-of-range discriminant would be
+> instant UB on a value that came from the wire.
 
 Extend the import at the top of the file accordingly:
 
