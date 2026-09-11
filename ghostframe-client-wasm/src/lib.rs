@@ -24,7 +24,7 @@ pub mod units;
 /// from. See `build.rs`; asserted against the workspace by
 /// `tests/wasm_smoke.test.ts` so a stale `dist/` fails instead of silently
 /// serving yesterday's protocol.
-pub const PROTOCOL_STAMP: &str = "unstamped";
+pub const PROTOCOL_STAMP: &str = env!("GHOSTFRAME_PROTOCOL_STAMP");
 
 /// Installs the panic hook. Idempotent; call once at module load.
 #[wasm_bindgen(start)]
