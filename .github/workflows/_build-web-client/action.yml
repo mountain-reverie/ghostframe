@@ -1,0 +1,31 @@
+name: Build the ghostframe web client
+description: >
+  Builds the web client SPA into ghostframe-web-client/dist/. ghostbridge
+  //go:embeds that directory at compile time, so every job that builds or
+  runs a ghostframe binary needs it present.
+
+  This exists because the same node-setup-and-build pair was previously
+  inlined at eight separate sites across ci.yml and e2e.yml. The wasm cutover
+  adds a Rust toolchain and wasm-pack to this build; doing that eight times
+  would be eight chances to miss one, and a missed site ships a dist/ whose
+  wasm is absent or stale — which fails at runtime, not at build time.
+
+  Three further sites deliberately do NOT use this action, because each does
+  something extra that collapsing would silently drop: ci.yml also runs a
+  type-check and uploads the dist artifact, e2e.yml has a conditional
+  artifact fallback, and nightly.yml builds without the npm cache.
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: npm
+        cache-dependency-path: ghostframe-web-client/package-lock.json
+    - name: build web client SPA (ghostbridge //go:embeds it)
+      shell: bash
+      working-directory: ghostframe-web-client
+      run: |
+        npm ci
+        npm run build
