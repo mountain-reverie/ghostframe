@@ -783,11 +783,23 @@ Expected, all unchanged from before this plan: lib 390, bwe_bench 3, netsim 9, n
 
 - [ ] **Step 2: Mutation-check the default**
 
-Temporarily change `TileDelivery`'s `#[default]` from `Decoded` to `Payload` and re-run `cargo test -p ghostframe-e2e --test framebuffer` and `--test browserless_runner -- --test-threads=1`.
+Temporarily change `TileDelivery`'s `#[default]` from `Decoded` to `Payload`
+and re-run **`cargo test -p ghostframe-e2e --test browserless_runner --
+--test-threads=1`**.
 
-Expected: **failures**. `FrameBuffer` consumes `TileReady.rgba`, so a flipped default must break it loudly.
+Expected: **failures**. `ghostframe-client-net/src/lib.rs:102-106` builds its
+`ClientConfig` with `..Default::default()`, so the flipped default reaches the
+`ClientCore` inside `ClientNet`; the scenes then receive `TilePayload` instead
+of `TileReady` and their pixel assertions fail.
 
-If they still pass, the default is not actually reaching those consumers and `TileDelivery` is decorative — stop and report. Restore the `#[default]` and confirm green again.
+**Do not expect `--test framebuffer` to fail.** It never constructs a
+`ClientCore` — it drives `FrameBuffer` directly — so the default cannot reach
+it. Task 3 recorded that baseline: under a flipped default, `framebuffer`
+passed 9/9. It should still pass now, and that is correct, not a gap.
+
+If `browserless_runner` still passes, the default is not reaching its consumer
+and `TileDelivery` is decorative — stop and report. Restore the `#[default]`
+and confirm green again.
 
 - [ ] **Step 3: Commit nothing, report**
 
