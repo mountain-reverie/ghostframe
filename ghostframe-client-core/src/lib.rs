@@ -149,6 +149,8 @@ pub struct ClientCore {
     pub(crate) next_tail_sweep_us: u64,
     /// Next `now_us` at which periodic feedback is emitted (always armed).
     pub(crate) next_feedback_us: u64,
+    /// See [`TileDelivery`]. Set once at construction from `ClientConfig`.
+    pub(crate) tile_delivery: TileDelivery,
 }
 
 impl ClientCore {
@@ -173,6 +175,7 @@ impl ClientCore {
             pending_nack_deadline_us: None,
             next_tail_sweep_us: now_us + TAIL_SWEEP_INTERVAL_US,
             next_feedback_us: now_us + FEEDBACK_INTERVAL_US,
+            tile_delivery: config.tile_delivery,
         };
 
         // Construct the Hello message [0x03, caps]
