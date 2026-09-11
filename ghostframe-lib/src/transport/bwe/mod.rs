@@ -1,48 +1,25 @@
-//! Thin bandwidth-estimator wrapper for Phase 1 observability.
+//! Bandwidth-estimator wrapper backed by a real GoogCC controller.
 //!
 //! # Design note — why not `str0m::bwe::Bwe`?
 //!
-//! str0m 0.21 does expose a standalone `bwe_::Bwe` struct (a full GoogCC port)
+//! str0m does expose a standalone `bwe_::Bwe` struct (a full GoogCC port)
 //! internally, but it is declared `pub(crate)` and is NOT accessible from
-//! outside the crate. The only public `str0m::bwe` items are:
+//! outside the crate (checked against 0.21 and 0.23.1). The only public
+//! `str0m::bwe` items are:
 //!   - `Bitrate` — the bitrate newtype (re-exported from `str0m-proto`)
 //!   - `Bwe<'a>` — a borrowed wrapper around an `Rtc` session
 //!   - `BweKind`  — an event enum
 //!
 //! Constructing a standalone GCC estimator without an `Rtc` session is not
-//! possible with the public API of str0m 0.21.
-//!
-//! For Phase 1 (observability only) we implement a lightweight EWMA delivery-
-//! rate estimator ourselves. It has the same external interface (`AckArrival`
-//! in, `BweSnapshot` out) that the rest of the protocol-redesign plan depends
-//! on. When Phase 2 wires the estimate into the pacer we can swap the internals
-//! for a richer estimator (e.g. str0m-proto's forthcoming standalone API, or
-//! a vendored GCC) without changing any call-sites.
-//!
-//! str0m is still listed as a Cargo dependency so that `str0m::bwe::Bitrate`
-//! is available for future use and to keep the upgrade path obvious.
+//! possible with str0m's public API. The standalone `goog_cc` crate backs
+//! this wrapper instead — see `googcc::GoogCcDriver`.
 //!
 //! See `docs/superpowers/specs/2026-06-27-protocol-redesign-design.md`.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 mod googcc;
 mod timeline;
-
-// ── EWMA parameters ─────────────────────────────────────────────────────────
-
-/// The half-life of the EWMA: after this many seconds without new samples the
-/// weight of old observations has decayed to ~50 %.
-const EWMA_HALF_LIFE_SECS: f64 = 0.5;
-
-/// Minimum number of samples in a window before we emit an estimate. Below
-/// this threshold we return the initial seed.
-const MIN_SAMPLES_FOR_ESTIMATE: u64 = 3;
-
-/// Window length. We bucket arriving samples into this window and compute a
-/// delivery rate from the bytes and time span observed. The EWMA then
-/// smooths successive window estimates.
-const WINDOW: Duration = Duration::from_millis(200);
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -66,6 +43,9 @@ pub struct AckArrival {
     /// Wire size of the acknowledged datagram in bytes, summed over its
     /// fragments. GoogCC derives delivery rate from bytes; without this the
     /// controller sees arrivals but no volume and cannot form an estimate.
+    /// This is datagram payload only and excludes UDP/IP framing (~48 bytes
+    /// per packet on IPv6), so the estimate runs a few percent low on
+    /// full-size datagrams — no correction factor is applied here.
     pub size_bytes: u32,
 }
 
@@ -78,38 +58,15 @@ pub struct BweSnapshot {
     pub samples_seen: u64,
 }
 
-// ── Internal window accumulator ───────────────────────────────────────────────
-
-/// State for the current accumulation window.
-struct Window {
-    /// Wall-clock start of this window.
-    start: Instant,
-    /// Number of ACK samples received in this window.
-    count: u32,
-}
-
 // ── BweWrapper ────────────────────────────────────────────────────────────────
 
-/// Bandwidth estimator wrapper.
-///
-/// Implements a simple EWMA over per-window delivery-rate observations
-/// derived from the one-way-delay (OWD) gradient in ACK records.
-///
-/// The `AckArrival` records carry 16-bit wrapped millisecond timestamps from
-/// both sides. We use the *count* of ACKs in each 200 ms window together with
-/// the initial seed to produce a conservative delivery-rate estimate. For
-/// Phase 1 (logging/observability) this is sufficient; Phase 2 will replace
-/// this with a proper GCC or SCReAM implementation.
+/// Bandwidth estimator wrapper. Delegates to a real `GoogCcDriver`
+/// (`googcc::GoogCcDriver`), a standalone port of libwebrtc's GoogCC
+/// congestion controller. Kept as a thin seam so the two `io_bridge`
+/// call sites (`AckArrival` in, `BweSnapshot` out) never need to change
+/// regardless of what backs the estimate.
 pub struct BweWrapper {
-    /// Current smoothed estimate, bits per second.
-    estimate_bps: f64,
-    /// EWMA decay coefficient per `WINDOW` period:
-    ///   α = exp(−ln(2) / (HALF_LIFE / WINDOW))
-    alpha: f64,
-    /// Current accumulation window.
-    window: Window,
-    /// Total samples fed in since construction.
-    samples_seen: u64,
+    driver: googcc::GoogCcDriver,
 }
 
 impl BweWrapper {
@@ -117,7 +74,7 @@ impl BweWrapper {
     /// burst (2 Mbps); the estimator will adapt within a few hundred ms.
     pub const INITIAL_BPS: u64 = 2_000_000;
 
-    /// `now` seeds the initial window's `start`. Callers should pass the
+    /// `now` seeds the controller's clock base. Callers should pass the
     /// same clock source they'll later pass to `update` (`now_std()` in
     /// production) — seeding from a bare `Instant::now()` instead would mix
     /// one wall-clock stamp into an estimator whose every other input is
@@ -128,18 +85,8 @@ impl BweWrapper {
     /// leave a real wall-clock read inside the one estimator this
     /// paused-clock harness exists to unblock.
     pub fn new(initial_bps: u64, now: Instant) -> Self {
-        // Compute the EWMA decay factor for one WINDOW period.
-        let window_secs = WINDOW.as_secs_f64();
-        let alpha = (-std::f64::consts::LN_2 / (EWMA_HALF_LIFE_SECS / window_secs)).exp();
-
         Self {
-            estimate_bps: initial_bps as f64,
-            alpha,
-            window: Window {
-                start: now,
-                count: 0,
-            },
-            samples_seen: 0,
+            driver: googcc::GoogCcDriver::new(initial_bps, now),
         }
     }
 
@@ -150,59 +97,12 @@ impl BweWrapper {
     ///
     /// Returns the updated `BweSnapshot`.
     pub fn update(&mut self, records: &[AckArrival], now: Instant) -> BweSnapshot {
-        if records.is_empty() {
-            return self.snapshot();
-        }
-
-        self.samples_seen = self.samples_seen.saturating_add(records.len() as u64);
-        self.window.count = self.window.count.saturating_add(records.len() as u32);
-
-        // Flush the window if it has expired.
-        let elapsed = now.saturating_duration_since(self.window.start);
-        if elapsed >= WINDOW {
-            self.flush_window(elapsed);
-            self.window = Window {
-                start: now,
-                count: 0,
-            };
-        }
-
-        self.snapshot()
+        self.driver.update(records, now)
     }
 
     /// Return the current observability snapshot without advancing the estimator.
     pub fn snapshot(&self) -> BweSnapshot {
-        BweSnapshot {
-            bitrate_bps: self.estimate_bps.max(0.0).round() as u64,
-            samples_seen: self.samples_seen,
-        }
-    }
-
-    // ── Private ───────────────────────────────────────────────────────────────
-
-    /// Flush the accumulated window into the EWMA.
-    ///
-    /// We derive a "delivery rate" for the window as:
-    ///   rate_bps = (count * AVG_ACK_PAYLOAD_BITS) / elapsed_secs
-    ///
-    /// where `AVG_ACK_PAYLOAD_BITS` is a conservative per-tile payload
-    /// estimate. This is intentionally rough for Phase 1 — the estimate
-    /// serves logging only, not pacing.
-    fn flush_window(&mut self, elapsed: Duration) {
-        if self.window.count == 0 || self.samples_seen < MIN_SAMPLES_FOR_ESTIMATE {
-            return;
-        }
-
-        // Each ACK record corresponds to one tile pass datagram. A tile pass
-        // datagram for our typical 64 × 64 tile at PalRLE is ~1–4 kB; CDF53
-        // passes range 256 B – 8 kB. Use 4 kB = 32 768 bits as a mid estimate.
-        const AVG_ACK_PAYLOAD_BITS: f64 = 4096.0 * 8.0;
-
-        let elapsed_secs = elapsed.as_secs_f64().max(1e-6);
-        let window_rate_bps = (self.window.count as f64 * AVG_ACK_PAYLOAD_BITS) / elapsed_secs;
-
-        // EWMA update: new = α * old + (1 − α) * observation
-        self.estimate_bps = self.alpha * self.estimate_bps + (1.0 - self.alpha) * window_rate_bps;
+        self.driver.snapshot()
     }
 }
 
@@ -216,8 +116,8 @@ mod tests {
     fn snapshot_starts_near_initial_bps() {
         let bwe = BweWrapper::new(BweWrapper::INITIAL_BPS, Instant::now());
         let snap = bwe.snapshot();
-        // The initial seed should be reflected as the estimate. Use a
-        // loose tolerance because the EWMA may adjust slightly.
+        // The initial seed should be reflected as the estimate before any
+        // update. Loose tolerance in case the controller clamps the seed.
         assert!(
             snap.bitrate_bps >= BweWrapper::INITIAL_BPS / 2
                 && snap.bitrate_bps <= BweWrapper::INITIAL_BPS * 2,
@@ -247,38 +147,6 @@ mod tests {
         ];
         let snap = bwe.update(&records, Instant::now());
         assert_eq!(snap.samples_seen, 2);
-    }
-
-    #[test]
-    fn estimate_adapts_upward_with_high_arrival_rate() {
-        let now = Instant::now();
-        let mut bwe = BweWrapper::new(BweWrapper::INITIAL_BPS, now);
-
-        // Simulate 100 records arriving in the first window.
-        let records: Vec<AckArrival> = (0u32..100)
-            .map(|i| AckArrival {
-                wire_seq: i,
-                server_emit_us: (i * 5) as u64,
-                client_arrival_ms_lo16: (i * 5 + 10) as u16,
-                size_bytes: 1200,
-            })
-            .collect();
-
-        // First call — samples accumulate in window but elapsed < WINDOW,
-        // so estimate stays at seed.
-        let snap1 = bwe.update(&records, now);
-        assert_eq!(snap1.samples_seen, 100);
-
-        // Second call after WINDOW has elapsed — window flushes and EWMA
-        // updates. With 100 packets × 32 768 bits / 0.2 s ≈ 16.4 Mbps
-        // observation the estimate should rise above the 2 Mbps seed.
-        let snap2 = bwe.update(&records, now + WINDOW + Duration::from_millis(1));
-        assert!(
-            snap2.bitrate_bps > BweWrapper::INITIAL_BPS,
-            "estimate {} should be above seed {} after high arrival rate",
-            snap2.bitrate_bps,
-            BweWrapper::INITIAL_BPS,
-        );
     }
 
     /// Guards the import paths. goog_cc's published docs reference
@@ -335,5 +203,42 @@ mod tests {
             size_bytes: 1200,
         };
         assert_eq!(a.server_emit_us, 5_000_000);
+    }
+
+    /// The seam must be backed by GoogCC, not the EWMA. Rising one-way delay
+    /// at constant volume is the signal only a delay-gradient controller
+    /// reacts to: a delivery-rate estimator sees steady bytes and holds.
+    #[test]
+    fn wrapper_backs_off_on_rising_delay() {
+        let t0 = std::time::Instant::now();
+        let mut w = BweWrapper::new(4_000_000, t0);
+
+        let mut last = w.snapshot().bitrate_bps;
+        for step in 0..400u32 {
+            let batch: Vec<AckArrival> = (0..12u32)
+                .map(|i| {
+                    let emit_us = ((step * 20 + i) as u64) * 1_000;
+                    // One-way delay grows 1 ms per step. Volume is constant.
+                    let arrival_ms = emit_us / 1_000 + 15 + step as u64;
+                    AckArrival {
+                        wire_seq: step * 12 + i,
+                        server_emit_us: emit_us,
+                        client_arrival_ms_lo16: (arrival_ms & 0xFFFF) as u16,
+                        size_bytes: 1200,
+                    }
+                })
+                .collect();
+            last = w
+                .update(
+                    &batch,
+                    t0 + std::time::Duration::from_millis(20 * step as u64),
+                )
+                .bitrate_bps;
+        }
+
+        assert!(
+            last < 4_000_000,
+            "estimate {last} never fell despite steadily rising one-way delay"
+        );
     }
 }

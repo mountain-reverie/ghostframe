@@ -22,9 +22,6 @@ use std::time::Instant;
 const MIN_BPS: i64 = 200_000;
 const MAX_BPS: i64 = 200_000_000;
 
-// The driver has no production caller yet — that lands in a later task that
-// wires it in behind the public seam. Remove this allow once that lands.
-#[allow(dead_code)]
 pub(crate) struct GoogCcDriver {
     ctl: GoogCcNetworkController,
     /// Only the arrival series needs unwrapping: it crosses the wire as 16
@@ -36,7 +33,19 @@ pub(crate) struct GoogCcDriver {
     samples_seen: u64,
 }
 
-#[allow(dead_code)]
+// SAFETY: `GoogCcNetworkController` (goog_cc 0.1.4) is `!Send` only because
+// its private `acknowledged_bitrate_estimator` field is typed
+// `Box<dyn AcknowledgedBitrateEstimatorInterface>` without a `+ Send` bound,
+// which erases the auto trait regardless of the boxed value. Every
+// implementor the crate ever constructs there (`AcknowledgedBitrateEstimator`,
+// `RobustThroughputEstimator`) is plain data — no `Rc`, no interior
+// mutability, no raw pointers, no thread-locals anywhere in goog_cc 0.1.4 —
+// so the underlying value is actually `Send`. `GoogCcDriver` is always
+// owned exclusively (moved wholesale into `IoBridge`, which itself is moved
+// into a single `tokio::spawn`ed task) and never shared across threads, so
+// asserting `Send` here does not admit a data race.
+unsafe impl Send for GoogCcDriver {}
+
 impl GoogCcDriver {
     pub(crate) fn new(initial_bps: u64, now: Instant) -> Self {
         let at_time = Timestamp::from_millis(0);
@@ -55,7 +64,15 @@ impl GoogCcDriver {
             ctl: GoogCcNetworkController::new(
                 cfg,
                 GoogCcConfig {
-                    feedback_only: false,
+                    // We only ever feed `TransportPacketsFeedback` — there is
+                    // no separate REMB channel and no independent RTT/loss
+                    // report. `feedback_only: true` tells the controller to
+                    // derive RTT and loss itself from that feedback (see
+                    // `GoogCcNetworkController::on_transport_packets_feedback`'s
+                    // `packet_feedback_only` branch); `false` disables that
+                    // derivation entirely and starves the loss/RTT-based side
+                    // of the estimator.
+                    feedback_only: true,
                 },
             ),
             arrival_time: Lo16Timeline::default(),
@@ -71,11 +88,21 @@ impl GoogCcDriver {
             return self.snapshot();
         }
 
-        let feedback_time = self.to_timestamp(now);
+        // Feedback cannot logically precede the packets it reports on: the
+        // controller computes `feedback_time - send_time` as an RTT bound,
+        // which goes negative (and poisons the RTT/pushback logic) if the
+        // caller's clock lags the last packet's send time within this same
+        // batch. `now` is normally safely after every send in production
+        // (acks can't arrive before the send that produced them), but a
+        // batch's individual per-packet send stamps can still range a few
+        // ms past the caller's sampled `now` — so floor feedback_time at the
+        // batch's own latest send/receive timestamp.
+        let mut feedback_time = self.to_timestamp(now);
         let mut packet_feedbacks = Vec::with_capacity(records.len());
         for r in records {
             let send_ms = (r.server_emit_us / 1_000) as i64;
             let recv_ms = self.arrival_time.unwrap_ms(r.client_arrival_ms_lo16) as i64;
+            feedback_time = feedback_time.max(Timestamp::from_millis(send_ms.max(recv_ms)));
             let sent = SentPacket {
                 send_time: Timestamp::from_millis(send_ms),
                 size: DataSize::from_bytes(r.size_bytes as i64),
@@ -119,7 +146,16 @@ impl GoogCcDriver {
 
     fn absorb(&mut self, upd: NetworkControlUpdate) {
         if let Some(t) = upd.target_rate {
-            let bps = t.target_rate.bps();
+            // `stable_target_rate` (not the raw `target_rate`) is what real
+            // WebRTC senders feed to the encoder: it is clamped by the
+            // controller's `LinkCapacityTracker`, which ratchets down
+            // immediately on a delay-based decrease but only climbs back
+            // slowly (a ~10 s time constant) as the acknowledged rate
+            // confirms real capacity. `target_rate` recovers from a brief
+            // overuse almost immediately via ordinary AIMD probing, so it
+            // does not hold a conservative estimate the way `size_bytes`-only
+            // callers (the pacer, later) need.
+            let bps = t.stable_target_rate.bps();
             if bps > 0 {
                 self.estimate_bps = bps as u64;
             }
