@@ -8,9 +8,12 @@
 
 use ghostframe_client_core::{
     ack_batcher::AckBatcher,
+    cdf53_coverage::{self, CoverageEntry},
+    cdf53_prevalidate,
     decode_error_batcher::DecodeErrorBatcher,
     loss_tracker::LossTracker,
     nack_batcher::{NackBatcher, NackEntry},
+    pal_rle_decode,
     palette_shadow::PaletteShadow,
     parity_decoder::ParityDecoder,
     DecodeErrorCode,
@@ -19,7 +22,9 @@ use ghostframe_protocol::ack::{AckBatch, AckEntry};
 use ghostframe_protocol::protocol::{Codec, TileParityEnvelope};
 use wasm_bindgen::prelude::*;
 
-use crate::boundary::WasmAckEntry;
+use crate::boundary::{
+    WasmAckEntry, WasmArrivalOutcome, WasmPrevalidatedCdf53, WasmPrevalidatedPalRle,
+};
 
 // `Option<Vec<u8>>` crosses the boundary as `Uint8Array | undefined`, so the
 // batchers' natural return type needs no adaptation.
@@ -257,9 +262,8 @@ impl Default for WasmPaletteShadow {
     }
 }
 
-/// Rust-only accessor; a later task's `prevalidatePalRle` export needs the
-/// wrapped shadow. Deliberately not `#[wasm_bindgen]`.
-#[allow(dead_code)]
+/// Rust-only accessor used by `prevalidatePalRle`. Deliberately not
+/// `#[wasm_bindgen]`.
 impl WasmPaletteShadow {
     pub(crate) fn inner_ref(&self) -> &PaletteShadow {
         &self.inner
@@ -344,4 +348,59 @@ impl Default for WasmLossTracker {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Validates and expands a PalRLE payload. Updates nothing — neither the
+/// shadow nor any palette table — matching `prevalidatePalRle` in
+/// `prevalidate.ts`.
+#[wasm_bindgen(js_name = prevalidatePalRle)]
+pub fn prevalidate_pal_rle(payload: &[u8], shadow: &WasmPaletteShadow) -> Result<JsValue, JsValue> {
+    let out = WasmPrevalidatedPalRle::from(pal_rle_decode::prevalidate_pal_rle(
+        payload,
+        shadow.inner_ref(),
+    ));
+    serde_wasm_bindgen::to_value(&out).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+#[wasm_bindgen(js_name = prevalidateCdf53)]
+pub fn prevalidate_cdf53(payload: &[u8], generation: u8, pass_idx: u8) -> Result<JsValue, JsValue> {
+    let out = WasmPrevalidatedCdf53::from(cdf53_prevalidate::prevalidate_cdf53(
+        payload, generation, pass_idx,
+    ));
+    serde_wasm_bindgen::to_value(&out).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// `prev` is the previous coverage entry, or `undefined` for a first
+/// arrival. Passing the entry back in each call keeps this a pure function,
+/// matching the TS `applyCdf53Arrival(prev, ...)` shape.
+#[wasm_bindgen(js_name = applyCdf53Arrival)]
+#[allow(clippy::too_many_arguments)]
+pub fn apply_cdf53_arrival(
+    prev_generation: Option<u8>,
+    prev_frame_seq: u32,
+    prev_pass_mask: u16,
+    prev_nacked_mask: u16,
+    prev_last_change_us: u64,
+    generation: u8,
+    pass_idx: u8,
+    frame_seq: u32,
+    now_us: u64,
+    prevalidation_ok: bool,
+) -> Result<JsValue, JsValue> {
+    let prev = prev_generation.map(|g| CoverageEntry {
+        generation: g,
+        frame_seq: prev_frame_seq,
+        pass_mask: prev_pass_mask,
+        nacked_mask: prev_nacked_mask,
+        last_change_us: prev_last_change_us,
+    });
+    let out = WasmArrivalOutcome::from(cdf53_coverage::apply_cdf53_arrival(
+        prev,
+        generation,
+        pass_idx,
+        frame_seq,
+        now_us,
+        prevalidation_ok,
+    ));
+    serde_wasm_bindgen::to_value(&out).map_err(|e| JsValue::from_str(&e.to_string()))
 }

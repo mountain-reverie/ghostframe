@@ -8,7 +8,12 @@
 //! Serialised with `#[serde(tag = "kind")]`, so JS sees plain objects like
 //! `{ kind: 'TilePayload', tile_x: 3, payload: Uint8Array }`.
 
-use ghostframe_client_core::{Event, PollOutput};
+use ghostframe_client_core::{
+    cdf53_coverage::{ArrivalOutcome, CoverageEntry},
+    cdf53_prevalidate::PrevalidatedCdf53,
+    pal_rle_decode::{PalRleVariant, PrevalidatedPalRle},
+    Event, PollOutput,
+};
 use ghostframe_protocol::ack::AckEntry;
 use serde::Serialize;
 
@@ -156,6 +161,128 @@ impl From<&AckEntry> for WasmAckEntry {
             tile_y: e.tile_y,
             pass_idx: e.pass_idx,
             arrival_time_ms_lo16: e.arrival_time_ms_lo16,
+        }
+    }
+}
+
+/// A prevalidation outcome. `ok: false` carries the `DecodeErrorCode`
+/// discriminant in `code`; `ok: true` carries the payload. Modelled as one
+/// struct rather than a tagged enum so the suites can write
+/// `expect(r.ok).toBe(false); expect(r.code).toBe(3)` without narrowing.
+#[derive(Debug, Serialize)]
+pub struct WasmPrevalidatedPalRle {
+    pub ok: bool,
+    pub code: u8,
+    /// 0 = Bundled, 1 = Thin, 2 = IndicesRaw.
+    pub variant: u8,
+    pub palette_id: u8,
+    pub count: u8,
+    /// 512 bytes, 2 pixels/byte, low nibble first. Empty when `ok` is false.
+    pub indices: Vec<u8>,
+    /// `count * 4` BGRA bytes for Bundled; empty otherwise.
+    pub palette_upsert: Vec<u8>,
+    /// Distinguishes "Bundled with an empty upsert" from "not Bundled".
+    pub has_palette_upsert: bool,
+}
+
+impl From<Result<PrevalidatedPalRle, ghostframe_client_core::DecodeErrorCode>>
+    for WasmPrevalidatedPalRle
+{
+    fn from(r: Result<PrevalidatedPalRle, ghostframe_client_core::DecodeErrorCode>) -> Self {
+        match r {
+            Ok(p) => WasmPrevalidatedPalRle {
+                ok: true,
+                code: 0,
+                variant: match p.variant {
+                    PalRleVariant::Bundled => 0,
+                    PalRleVariant::Thin => 1,
+                    PalRleVariant::IndicesRaw => 2,
+                },
+                palette_id: p.palette_id,
+                count: p.count,
+                indices: p.indices,
+                has_palette_upsert: p.palette_upsert.is_some(),
+                palette_upsert: p.palette_upsert.unwrap_or_default(),
+            },
+            Err(code) => WasmPrevalidatedPalRle {
+                ok: false,
+                code: code as u8,
+                variant: 0,
+                palette_id: 0,
+                count: 0,
+                indices: Vec::new(),
+                palette_upsert: Vec::new(),
+                has_palette_upsert: false,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct WasmPrevalidatedCdf53 {
+    pub ok: bool,
+    pub code: u8,
+    pub generation: u8,
+    pub pass_idx: u8,
+    /// 384 bytes = 3 channels x 128, packed B, G, R. Empty when `ok` is false.
+    pub bit_planes: Vec<u8>,
+}
+
+impl From<Result<PrevalidatedCdf53, ghostframe_client_core::DecodeErrorCode>>
+    for WasmPrevalidatedCdf53
+{
+    fn from(r: Result<PrevalidatedCdf53, ghostframe_client_core::DecodeErrorCode>) -> Self {
+        match r {
+            Ok(p) => WasmPrevalidatedCdf53 {
+                ok: true,
+                code: 0,
+                generation: p.generation,
+                pass_idx: p.pass_idx,
+                bit_planes: p.bit_planes,
+            },
+            Err(code) => WasmPrevalidatedCdf53 {
+                ok: false,
+                code: code as u8,
+                generation: 0,
+                pass_idx: 0,
+                bit_planes: Vec::new(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct WasmCoverageEntry {
+    pub generation: u8,
+    pub frame_seq: u32,
+    pub pass_mask: u16,
+    pub nacked_mask: u16,
+    pub last_change_us: u64,
+}
+
+impl From<CoverageEntry> for WasmCoverageEntry {
+    fn from(e: CoverageEntry) -> Self {
+        WasmCoverageEntry {
+            generation: e.generation,
+            frame_seq: e.frame_seq,
+            pass_mask: e.pass_mask,
+            nacked_mask: e.nacked_mask,
+            last_change_us: e.last_change_us,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct WasmArrivalOutcome {
+    pub entry: WasmCoverageEntry,
+    pub nack_passes: Vec<u8>,
+}
+
+impl From<ArrivalOutcome> for WasmArrivalOutcome {
+    fn from(o: ArrivalOutcome) -> Self {
+        WasmArrivalOutcome {
+            entry: o.entry.into(),
+            nack_passes: o.nack_passes,
         }
     }
 }
