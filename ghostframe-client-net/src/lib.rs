@@ -102,6 +102,7 @@ impl ClientNet {
             ClientConfig {
                 indices_raw_enabled: config.indices_raw_enabled,
                 supports_h264: config.supports_h264,
+                ..Default::default()
             },
             now_us,
         );
