@@ -54,7 +54,21 @@ integration tests included, so — unlike `ghostframe-lib`, where CI names
 
 - [ ] **Step 1: Read what you are replacing**
 
-Every one of the eleven sites is this pair of steps:
+The eleven `npm run build` sites are **not** identical. Verified 2026-09-11:
+
+| site | shape |
+|---|---|
+| `ci.yml` 44, 88, 116, 165, 198 | plain |
+| `e2e.yml` 35, 60, 109 | plain |
+| `ci.yml` 137 | plain **plus** `npx tsc --noEmit`, and uploads the `web-client-dist` artifact |
+| `e2e.yml` 176 | conditional fallback inside a download-artifact block |
+| `nightly.yml` 46 | no adjacent `setup-node`, no npm cache |
+
+**This task consolidates the eight plain sites only.** The three variants are
+left exactly as they are and are addressed separately — collapsing them would
+silently drop a type-check, an artifact upload, or a conditional.
+
+Each of the eight plain sites is this pair of steps:
 
 ```yaml
       - uses: actions/setup-node@v4
@@ -69,7 +83,7 @@ Every one of the eleven sites is this pair of steps:
           npm run build
 ```
 
-Confirm that with `grep -n -B6 "npm run build" .github/workflows/ci.yml`. If a site differs from the above, **stop and report it** — a site with different inputs cannot be replaced by a single action without losing something.
+Confirm with `grep -n -B9 "npm run build" .github/workflows/ci.yml`. If one of the eight listed as plain turns out to differ, **stop and report it** rather than adapting the action to cover it.
 
 - [ ] **Step 2: Create the action**
 
@@ -81,7 +95,10 @@ description: >
   runs a ghostframe binary needs it present.
 
   This exists because the same node-setup-and-build pair was previously
-  inlined at eleven separate sites across ci.yml, e2e.yml and nightly.yml.
+  inlined at eight separate sites across ci.yml and e2e.yml. Three further
+  sites differ (an extra type-check plus artifact upload in ci.yml, a
+  conditional artifact fallback in e2e.yml, and a cacheless build in
+  nightly.yml) and deliberately do NOT use this action.
   The wasm cutover adds a Rust toolchain and wasm-pack to this build; doing
   that eleven times would be eleven chances to miss one, and a missed site
   ships a dist/ whose wasm is absent or stale — which fails at runtime, not
@@ -136,18 +153,25 @@ git commit -m "ci: add a composite action for the web-client build"
 
 ---
 
-### Task 2: Migrate the remaining ten sites
+### Task 2: Migrate the remaining seven plain sites
 
 **Files:**
 - Modify: `.github/workflows/ci.yml` (remaining sites), `.github/workflows/e2e.yml`, `.github/workflows/nightly.yml`
 
-- [ ] **Step 1: Find every remaining site**
+- [ ] **Step 1: Find every remaining plain site**
 
 ```bash
 grep -rn "npm run build" .github/workflows/
 ```
 
-Expected: ten remaining — five in `ci.yml`, four in `e2e.yml`, one in `nightly.yml`.
+Expected: ten remaining, of which **seven are plain** and must be migrated —
+four in `ci.yml` (lines near 88, 116, 165, 198) and three in `e2e.yml` (near
+35, 60, 109).
+
+**Do NOT touch these three:**
+- `ci.yml` ~137 — also runs `npx tsc --noEmit` and uploads the artifact
+- `e2e.yml` ~176 — a conditional fallback inside a download-artifact block
+- `nightly.yml` ~46 — no adjacent `setup-node`, no npm cache
 
 - [ ] **Step 2: Replace each**
 
@@ -157,15 +181,15 @@ For each, delete the `actions/setup-node@v4` step *and* the `build web client SP
       - uses: ./.github/workflows/_build-web-client
 ```
 
-Take care in `e2e.yml`: some jobs use `actions/setup-node` for reasons **other** than the web client build. Only remove a `setup-node` step that is immediately followed by the web-client build step. If you find a `setup-node` with no build step after it, leave it and report it.
+Take care in `e2e.yml`: only remove a `setup-node` step that is immediately followed by the web-client build step. The `setup-node` at ~153 belongs to the artifact-fallback block and must stay.
 
 - [ ] **Step 3: Verify**
 
 ```bash
-grep -rn "npm run build" .github/workflows/ | grep -v _build-web-client
+grep -rn "npm run build" .github/workflows/
 ```
 
-Expected: no output — every site now goes through the action.
+Expected: exactly **three** remaining — the three documented variants, untouched.
 
 ```bash
 python3 -c "
@@ -181,7 +205,7 @@ Expected: `OK`.
 grep -c "_build-web-client" .github/workflows/ci.yml .github/workflows/e2e.yml .github/workflows/nightly.yml
 ```
 
-Expected: 6, 4, 1 — eleven total.
+Expected: 5, 3, 0 — eight total, matching the eight plain sites.
 
 - [ ] **Step 4: Commit**
 
@@ -768,6 +792,35 @@ This task produces no commit. Report the numbers and both mutation outcomes.
 - `TileDelivery::Payload` emits `TilePayload` for all four tile codecs, plus `PaletteUpdated` for bundled PalRle.
 - `TileDelivery::Decoded` is the default and demonstrably unchanged.
 - No browser code has been touched.
+
+## Two CI findings, recorded not fixed
+
+Both surfaced while classifying the build sites. Neither is in this plan's
+scope; both want a decision.
+
+**The cross-workflow artifact download never works.** `ci.yml` uploads
+`web-client-dist`; `e2e.yml` downloads it with
+`run-id: ${{ github.run_id }}`. But `github.run_id` is *e2e.yml's own* run,
+and the artifact belongs to a **different workflow's** run, so the download
+finds nothing. `continue-on-error: true` hides the failure and the fallback
+build runs instead.
+
+Confirmed on a completed run: the step `Fallback web-client build if artifact
+missing` reports conclusion **`success`**, not `skipped` — meaning
+`hashFiles('ghostframe-web-client/dist/**') == ''` was true and the local
+build ran. Every e2e run rebuilds the web client despite the optimisation.
+
+Fixing it properly means either a cross-workflow artifact lookup by branch and
+workflow name, or merging the producing job into `e2e.yml`. Worth doing —
+it is a whole npm install and build per e2e run — but it is a CI
+restructuring, not part of the wasm groundwork.
+
+**`npx tsc --noEmit` at `ci.yml` ~137 is redundant.** `npm run build` is
+`tsc && vite build` (`ghostframe-web-client/package.json:7`), and the extra
+invocation uses the same `tsconfig.json`, so it re-checks exactly what the
+build already checked. `--noEmit` changes output, not checking. Removing it
+would let that site use the composite action like the other eight. Left alone
+here because deleting a type-check is a behaviour change, not a refactor.
 
 ## Explicitly out of scope
 
