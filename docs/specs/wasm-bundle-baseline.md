@@ -102,3 +102,53 @@ number is not comparable to this baseline.
 
 These are uncompressed-transfer byte counts from a local build, not a
 measurement of real load time over a network.
+
+## Size reduction attempts, 2026-09-11
+
+Measured before concluding the regression is fixed-cost. None of these are
+applied; they are recorded so step 4 does not repeat the investigation.
+
+| Configuration | raw | gzip | vs. baseline (gzip) |
+|---|---:|---:|---:|
+| Baseline (as committed) | 129,994 | 52,642 | — |
+| `wasm-opt = ['-Oz']` metadata | 129,655 | 52,713 | +0.1% |
+| `[profile.release]` `opt-level="z"`, `lto`, `codegen-units=1`, `panic="abort"`, `strip` | 125,268 | 44,481 | −15.5% |
+
+**`-Oz` buys nothing.** wasm-pack already runs `wasm-opt` by default and it is
+doing its job; the remaining size is in the emitted code, not in missed
+peephole optimisation.
+
+**The size-optimised cargo profile buys ~15% gzip but breaks the build.** Under
+that profile `wasm-opt` fails outright:
+
+```
+[wasm-validator error in function 661] unexpected false:
+Bulk memory operations require bulk memory [--enable-bulk-memory]
+Fatal: error validating input
+Error: failed to execute `wasm-opt`: exited with exit status: 1
+```
+
+The profile makes rustc emit bulk-memory instructions that the `wasm-opt`
+wasm-pack pins does not accept without `--enable-bulk-memory`. wasm-pack
+leaves the un-opt'd artefact behind and **still exits 0**, so the 44,481 figure
+above is un-`wasm-opt`'d output, not a validly optimised build. Anyone
+retrying this must check for that error rather than trusting the byte count —
+a smaller file here means the optimiser was skipped, not that it worked
+better.
+
+That profile is also workspace-global, so it would apply to the native server
+and xdaemon builds too. A per-package override (`[profile.release.package.
+ghostframe-client-wasm]`) can carry `opt-level` but not `lto` or `panic`,
+which are profile-global — so the ~15% is not separable from a
+workspace-wide change even if the `wasm-opt` failure were resolved.
+
+**Conclusion.** The best measured figure is 44.5 KB gzip against 26.7 KB for
+the entire current bundle — still 1.66x, from a build whose optimiser did not
+run. The regression is not an artefact of missing compiler flags, and the
+decision to proceed should be made on the drift-elimination argument rather
+than on an expectation that the size gap closes.
+
+Untried, if size later becomes blocking: dropping `serde`/`serde-wasm-bindgen`
+in favour of hand-written `JsValue` construction, and dropping
+`console_error_panic_hook` (which pulls in formatting machinery). Both trade
+boundary ergonomics and debuggability for bytes; neither was measured.
