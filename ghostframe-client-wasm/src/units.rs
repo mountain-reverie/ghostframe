@@ -108,9 +108,14 @@ impl Default for WasmAckBatcher {
 
 /// Decodes an ACK envelope — the replacement for the TS suite's
 /// `parseAckEnvelopeForTest`. Returns an array of entries with named fields,
-/// or `null` on a malformed envelope. A malformed envelope is a **value**,
-/// not an exception, so a suite can assert rejection without
-/// `expect(...).toThrow`.
+/// or `undefined` on a malformed envelope — `serde_wasm_bindgen` maps
+/// `Option::None` to `undefined`, matching every other export here.
+///
+/// The TS `parseAckEnvelopeForTest` it replaces *throws* instead. Returning
+/// a value is deliberate: it lets a suite assert rejection without
+/// `expect(...).toThrow`. No existing test depends on either behaviour —
+/// every TS call site passes a well-formed envelope the batcher just
+/// produced, so the malformed path is currently unexercised.
 #[wasm_bindgen(js_name = parseAckEnvelope)]
 pub fn parse_ack_envelope(bytes: &[u8]) -> Result<JsValue, JsValue> {
     let entries: Option<Vec<WasmAckEntry>> = AckBatch::decode(bytes)
