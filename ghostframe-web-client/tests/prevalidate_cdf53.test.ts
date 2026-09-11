@@ -1,15 +1,12 @@
 import { describe, it, expect } from 'vitest';
-import { rleDecode } from '../src/prevalidate_cdf53.js';
-import {
-  prevalidateCdf53,
-  type PrevalidatedCdf53,
-} from '../src/prevalidate_cdf53.js';
-import {
+import { rleDecode, prevalidateCdf53, errorCodes } from '../pkg-node/ghostframe_client_wasm.js';
+import fixture from '../../ghostframe-e2e/src/harness/fixtures/cdf53_fixture.json';
+
+const {
   ERR_CDF53_BAD_PASS,
   ERR_CDF53_TRUNCATED,
   ERR_CDF53_RLE_LENGTH,
-} from '../src/feedback.js';
-import fixture from '../../ghostframe-e2e/src/harness/fixtures/cdf53_fixture.json';
+} = errorCodes();
 
 describe('rleDecode', () => {
   it('all-zero token decodes to 128 zero bytes', () => {
@@ -69,14 +66,15 @@ describe('prevalidateCdf53', () => {
       const r = prevalidateCdf53(payload, /*gen*/ 1, passIdx);
       expect(r.ok).toBe(true);
       if (!r.ok) return; // narrowing for TS
-      expect(r.entry.tileX).toBe(0); // caller-supplied; we don't pass it here, default 0
-      expect(r.entry.gen).toBe(1);
-      expect(r.entry.passIdx).toBe(passIdx);
-      expect(r.entry.bitPlanes.length).toBe(384);
+      // tileX is not part of the wasm result — the header-derived value is
+      // stamped by the caller, not by prevalidation. Nothing to assert here.
+      expect(r.generation).toBe(1);
+      expect(r.pass_idx).toBe(passIdx);
+      expect(r.bit_planes.length).toBe(384);
       for (let ch = 0; ch < 3; ch++) {
         const expected = fixture.bit_planes_per_pass[passIdx][ch];
         for (let i = 0; i < 128; i++) {
-          expect(r.entry.bitPlanes[ch * 128 + i]).toBe(expected[i]);
+          expect(r.bit_planes[ch * 128 + i]).toBe(expected[i]);
         }
       }
     }
@@ -86,7 +84,7 @@ describe('prevalidateCdf53', () => {
     const r = prevalidateCdf53(new Uint8Array([0, 1, 0xFF]), 0, 14);
     expect(r.ok).toBe(false);
     if (r.ok) return;
-    expect(r.errorCode).toBe(ERR_CDF53_BAD_PASS);
+    expect(r.code).toBe(ERR_CDF53_BAD_PASS);
   });
 
   it('rejects truncated section header with ERR_CDF53_TRUNCATED', () => {
@@ -94,7 +92,7 @@ describe('prevalidateCdf53', () => {
     const r = prevalidateCdf53(new Uint8Array([0]), 0, 0);
     expect(r.ok).toBe(false);
     if (r.ok) return;
-    expect(r.errorCode).toBe(ERR_CDF53_TRUNCATED);
+    expect(r.code).toBe(ERR_CDF53_TRUNCATED);
   });
 
   it('rejects RLE that decodes to wrong byte count with ERR_CDF53_RLE_LENGTH', () => {
@@ -102,6 +100,6 @@ describe('prevalidateCdf53', () => {
     const r = prevalidateCdf53(new Uint8Array([0, 1, 0x05]), 0, 0);
     expect(r.ok).toBe(false);
     if (r.ok) return;
-    expect(r.errorCode).toBe(ERR_CDF53_RLE_LENGTH);
+    expect(r.code).toBe(ERR_CDF53_RLE_LENGTH);
   });
 });
