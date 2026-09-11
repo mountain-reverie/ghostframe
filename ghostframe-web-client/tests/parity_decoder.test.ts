@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { ParityDecoder, parseParityEnvelope, encodeParityEnvelopeForTest } from '../src/parity_decoder.js';
+import { WasmParityDecoder, encodeParityEnvelope } from '../pkg-node/ghostframe_client_wasm.js';
 
 const FEC_K = 10;
 
@@ -29,58 +29,43 @@ function xorBytes(...slices: Uint8Array[]): Uint8Array {
 
 describe('ParityDecoder', () => {
   it('recovers a single missing source from K-1 + parity', () => {
-    const decoder = new ParityDecoder(FEC_K * 4);
+    const decoder = new WasmParityDecoder(FEC_K * 4);
     const sources = Array.from({ length: FEC_K }, (_, i) => fakeSource(i, i));
     const parity = xorBytes(...sources);
     // Feed K-1 sources (skip index 5)
     for (let i = 0; i < FEC_K; i++) {
       if (i !== 5) decoder.recordSource(i, sources[i]);
     }
-    const envelope = encodeParityEnvelopeForTest({
-      groupFirstWireSeq: 0,
-      k: FEC_K,
-      parityIdx: 0,
-      groupFirstPayloadLen: sources[0].length,
-      parityPayload: parity,
-    });
-    const recovered = decoder.receiveParity(parseParityEnvelope(envelope));
+    const envelope = encodeParityEnvelope(0, FEC_K, 0, sources[0].length, parity);
+    const recovered = decoder.receiveParity(envelope);
     expect(recovered).not.toBeNull();
     expect(recovered).toEqual(sources[5]);
   });
 
   it('returns null when multiple sources are missing', () => {
-    const decoder = new ParityDecoder(FEC_K * 4);
+    const decoder = new WasmParityDecoder(FEC_K * 4);
     const sources = Array.from({ length: FEC_K }, (_, i) => fakeSource(i, i));
     const parity = xorBytes(...sources);
     // Feed K-2 sources
     for (let i = 0; i < FEC_K - 2; i++) decoder.recordSource(i, sources[i]);
-    const envelope = encodeParityEnvelopeForTest({
-      groupFirstWireSeq: 0,
-      k: FEC_K,
-      parityIdx: 0,
-      groupFirstPayloadLen: sources[0].length,
-      parityPayload: parity,
-    });
-    const recovered = decoder.receiveParity(parseParityEnvelope(envelope));
-    expect(recovered).toBeNull();
+    const envelope = encodeParityEnvelope(0, FEC_K, 0, sources[0].length, parity);
+    const recovered = decoder.receiveParity(envelope);
+    expect(recovered).toBeUndefined();
   });
 
   it('returns null when no sources are missing', () => {
-    const decoder = new ParityDecoder(FEC_K * 4);
+    const decoder = new WasmParityDecoder(FEC_K * 4);
     const sources = Array.from({ length: FEC_K }, (_, i) => fakeSource(i, i));
     const parity = xorBytes(...sources);
     for (let i = 0; i < FEC_K; i++) decoder.recordSource(i, sources[i]);
-    const recovered = decoder.receiveParity(parseParityEnvelope(
-      encodeParityEnvelopeForTest({
-        groupFirstWireSeq: 0, k: FEC_K, parityIdx: 0,
-        groupFirstPayloadLen: sources[0].length, parityPayload: parity,
-      })
-    ));
-    expect(recovered).toBeNull();
+    const recovered = decoder.receiveParity(
+      encodeParityEnvelope(0, FEC_K, 0, sources[0].length, parity),
+    );
+    expect(recovered).toBeUndefined();
   });
 
   it('evicts oldest sources when window full', () => {
-    const decoder = new ParityDecoder(4);
+    const decoder = new WasmParityDecoder(4);
     decoder.recordSource(0, new Uint8Array([1]));
     decoder.recordSource(1, new Uint8Array([2]));
     decoder.recordSource(2, new Uint8Array([3]));
@@ -91,17 +76,14 @@ describe('ParityDecoder', () => {
   });
 
   it('replays buffered parity when missing source finally arrives', () => {
-    const decoder = new ParityDecoder(FEC_K * 4);
+    const decoder = new WasmParityDecoder(FEC_K * 4);
     const sources = Array.from({ length: FEC_K }, (_, i) => fakeSource(i, i));
     const parity = xorBytes(...sources);
     // Feed K-2 sources, leaving indices K-2 and K-1 BOTH missing.
     for (let i = 0; i < FEC_K - 2; i++) decoder.recordSource(i, sources[i]);
-    const parityEnvelope = parseParityEnvelope(encodeParityEnvelopeForTest({
-      groupFirstWireSeq: 0, k: FEC_K, parityIdx: 0,
-      groupFirstPayloadLen: sources[0].length, parityPayload: parity,
-    }));
-    // Parity arrives with 2 missing — buffer, return null.
-    expect(decoder.receiveParity(parityEnvelope)).toBeNull();
+    const parityEnvelope = encodeParityEnvelope(0, FEC_K, 0, sources[0].length, parity);
+    // Parity arrives with 2 missing — buffer, return undefined.
+    expect(decoder.receiveParity(parityEnvelope)).toBeUndefined();
     // Add source K-2 — now only K-1 is missing. The buffered parity replays
     // and recovers sources[K-1].
     const recovered = decoder.recordSource(FEC_K - 2, sources[FEC_K - 2]);
