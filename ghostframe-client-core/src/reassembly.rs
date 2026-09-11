@@ -323,6 +323,12 @@ impl ClientCore {
                                     upsert[i * 4 + 2],
                                     upsert[i * 4 + 3],
                                 ];
+                                // Unlike palette_shadow.put below, nothing in
+                                // payload mode ever reads self.palettes back —
+                                // only decode_pal_rle_tile does, and payload
+                                // mode never calls it. Kept so both modes
+                                // leave identical state; the colours reach the
+                                // GPU via the PaletteUpdated event instead.
                                 slot[i] = bgra;
                                 reported.push(bgra);
                             }

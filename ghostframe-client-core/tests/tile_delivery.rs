@@ -232,6 +232,73 @@ fn palrle_in_payload_mode_applies_and_reports_the_palette() {
     );
 }
 
+/// Proves the palette is really *stored*, not merely announced.
+///
+/// `palrle_in_payload_mode_applies_and_reports_the_palette` checks that
+/// `PaletteUpdated` is emitted, and a mutation check showed it still passes
+/// when the state writes are deleted — an emitted event with no stored
+/// palette would leave `palrle_decode.wgsl` decoding against a stale table,
+/// which shows as wrong colours rather than an error.
+///
+/// A thin (non-bundled) payload carries no palette and prevalidates only if
+/// `shadow.has(palette_id)`, so feeding one after the bundled tile is what
+/// distinguishes "stored" from "announced".
+#[test]
+fn payload_mode_really_stores_the_palette_not_just_reports_it() {
+    use ghostframe_protocol::codec::pal_rle::{encode_pal_rle_payload, PaletteEntry};
+
+    let mut colors = [[0u8; 4]; 16];
+    colors[0] = [10, 20, 30, 255];
+    colors[1] = [40, 50, 60, 255];
+    let entry = PaletteEntry { colors, count: 2 };
+    let packed = [0u8; 512];
+
+    let mut core = core_with(TileDelivery::Payload);
+
+    // Tile 1: bundled, installs slot 5.
+    let bundled = encode_pal_rle_payload(&packed, &entry, 5, true);
+    let mut events = Vec::new();
+    for dg in tile_datagrams(1, 0, 0, Codec::PalRle, 0, &bundled, 1200) {
+        events.extend(core.handle_datagram(&dg, 0));
+    }
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::PaletteUpdated { palette_id: 5, .. })),
+        "tile 1 should have installed slot 5, got {events:?}"
+    );
+
+    // Tile 2: thin, carries no palette — prevalidates only against the stored
+    // shadow.
+    let thin = encode_pal_rle_payload(&packed, &entry, 5, false);
+    let mut events2 = Vec::new();
+    for dg in tile_datagrams(2, 1, 0, Codec::PalRle, 0, &thin, 1200) {
+        events2.extend(core.handle_datagram(&dg, 0));
+    }
+
+    assert!(
+        !events2.iter().any(|e| matches!(
+            e,
+            Event::DecodeError {
+                code: ghostframe_client_core::DecodeErrorCode::ThinUncachedPalette,
+                ..
+            }
+        )),
+        "thin tile was rejected as uncached — the bundled tile announced the \
+         palette but did not store it, got {events2:?}"
+    );
+    assert!(
+        events2.iter().any(|e| matches!(
+            e,
+            Event::TilePayload {
+                codec: Codec::PalRle,
+                ..
+            }
+        )),
+        "thin tile should have produced a payload, got {events2:?}"
+    );
+}
+
 /// The Decoded path must be untouched. Same input, pixels out, and the first
 /// pixel resolves through palette entry 0.
 #[test]
