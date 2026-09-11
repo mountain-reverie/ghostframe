@@ -15,6 +15,7 @@ use ghostframe_client_core::{
     Event, PollOutput,
 };
 use ghostframe_protocol::ack::AckEntry;
+use ghostframe_protocol::protocol::{TileNackEntry, TileParityEnvelope};
 use serde::Serialize;
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -268,6 +269,50 @@ impl From<CoverageEntry> for WasmCoverageEntry {
             pass_mask: e.pass_mask,
             nacked_mask: e.nacked_mask,
             last_change_us: e.last_change_us,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct WasmNackEntry {
+    pub frame_seq: u32,
+    pub tile_x: u8,
+    pub tile_y: u8,
+    pub pass_idx: u8,
+    pub frag_idx: u8,
+}
+
+impl From<&TileNackEntry> for WasmNackEntry {
+    fn from(e: &TileNackEntry) -> Self {
+        WasmNackEntry {
+            frame_seq: e.frame_seq,
+            tile_x: e.tile_x,
+            tile_y: e.tile_y,
+            pass_idx: e.pass_idx,
+            frag_idx: e.frag_idx,
+        }
+    }
+}
+
+/// Parity envelope header. `parity_payload` is included because
+/// `parity_decoder.test.ts` round-trips envelopes it built itself.
+#[derive(Debug, Serialize, PartialEq)]
+pub struct WasmParityEnvelope {
+    pub group_first_wire_seq: u32,
+    pub k: u8,
+    pub parity_idx: u8,
+    pub group_first_payload_len: u16,
+    pub parity_payload: Vec<u8>,
+}
+
+impl From<&TileParityEnvelope> for WasmParityEnvelope {
+    fn from(e: &TileParityEnvelope) -> Self {
+        WasmParityEnvelope {
+            group_first_wire_seq: e.group_first_wire_seq,
+            k: e.k,
+            parity_idx: e.parity_idx,
+            group_first_payload_len: e.group_first_payload_len,
+            parity_payload: e.parity_payload.clone(),
         }
     }
 }
