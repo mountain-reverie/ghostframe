@@ -19,6 +19,17 @@ const WINDOW_US: u64 = 1_000_000;
 /// Global cap on emissions per rolling window (mirrors `GLOBAL_CAP`).
 const GLOBAL_CAP: usize = 32;
 
+/// Decode-error report, sent on the feedback stream. Wire layout
+/// `[DECODE_ERROR_MSG_TYPE, codec, tile_x, tile_y, code]`.
+///
+/// Shares the value 0x04 with `ACK_BATCH_MSG_TYPE`, which is unambiguous
+/// only because the two travel on different channels: ACK batches are
+/// datagrams, decode errors are stream messages. Do not merge them.
+pub const DECODE_ERROR_MSG_TYPE: u8 = 0x04;
+
+/// Encoded length of a decode-error report.
+pub const DECODE_ERROR_SIZE: usize = 5;
+
 pub struct DecodeErrorBatcher {
     /// (codec, tile_x, tile_y) -> last-emit timestamp (µs).
     per_key: HashMap<(u8, u8, u8), u64>,
@@ -67,7 +78,13 @@ impl DecodeErrorBatcher {
         self.per_key.insert(key, now_us);
         self.recent_emits.push_back(now_us);
 
-        Some(vec![0x04, codec_byte, tile_x, tile_y, code as u8])
+        Some(vec![
+            DECODE_ERROR_MSG_TYPE,
+            codec_byte,
+            tile_x,
+            tile_y,
+            code as u8,
+        ])
     }
 }
 

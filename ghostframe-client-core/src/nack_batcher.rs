@@ -8,10 +8,10 @@ use ghostframe_protocol::protocol::{TileNackEntry, TileNackEnvelope};
 
 /// Flush deadline: 5ms in microseconds after the first entry of a pending
 /// batch is queued (mirrors `NACK_BATCH_FLUSH_MS` in nack.ts).
-const FLUSH_INTERVAL_US: u64 = 5_000;
+pub const FLUSH_INTERVAL_US: u64 = 5_000;
 
 /// Maximum entries per NACK batch.
-const NACK_BATCH_MAX: usize = 64;
+pub const NACK_BATCH_MAX: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NackEntry {

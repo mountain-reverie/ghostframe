@@ -8,6 +8,14 @@ use ghostframe_protocol::feedback::ReceiverFeedback;
 /// feedback.ts `onDatagram`).
 const SUSPENSION_GAP_US: u64 = 100_000;
 
+/// Client capability announcement, sent once on the feedback stream at
+/// construction. Wire layout `[HELLO_MSG_TYPE, caps]`, where caps bit0 =
+/// indices_raw_enabled and bit1 = supports_h264.
+pub const HELLO_MSG_TYPE: u8 = 0x03;
+
+/// Encoded length of a Hello message.
+pub const HELLO_SIZE: usize = 2;
+
 pub struct LossTracker {
     received: u32,
     lost: u32,
@@ -90,5 +98,5 @@ pub fn encode_hello(indices_raw: bool, supports_h264: bool) -> Vec<u8> {
     if supports_h264 {
         caps |= 0x02;
     }
-    vec![0x03, caps]
+    vec![HELLO_MSG_TYPE, caps]
 }
