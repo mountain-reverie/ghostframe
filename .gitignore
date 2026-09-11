@@ -10,6 +10,10 @@ tmux-client-*.log
 node_modules/
 ghostframe-web-client/dist/
 
+# wasm-pack build artefacts
+ghostframe-client-wasm/pkg-node/
+ghostframe-client-wasm/pkg-web/
+
 # Editor / OS cruft
 .vscode/
 .idea/
