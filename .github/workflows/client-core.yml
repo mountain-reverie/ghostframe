@@ -29,7 +29,14 @@ jobs:
           node-version: '20'
           cache: npm
           cache-dependency-path: ghostframe-web-client/package-lock.json
+      - name: Cache wasm-pack
+        id: cache-wasm-pack
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/wasm-pack
+          key: wasm-pack-0.15.0-${{ runner.os }}
       - name: Install wasm-pack
+        if: steps.cache-wasm-pack.outputs.cache-hit != 'true'
         run: cargo install wasm-pack --version 0.15.0 --locked
       - name: Install web client deps
         working-directory: ghostframe-web-client

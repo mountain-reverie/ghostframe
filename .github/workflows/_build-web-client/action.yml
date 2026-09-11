@@ -21,7 +21,17 @@ runs:
     - uses: dtolnay/rust-toolchain@stable
       with:
         targets: wasm32-unknown-unknown
+    # Cached because this action runs in eight jobs; building wasm-pack from
+    # source in each is minutes of CI per push for a binary that changes only
+    # when the pinned version does.
+    - name: Cache wasm-pack
+      id: cache-wasm-pack
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/bin/wasm-pack
+        key: wasm-pack-0.15.0-${{ runner.os }}
     - name: Install wasm-pack
+      if: steps.cache-wasm-pack.outputs.cache-hit != 'true'
       shell: bash
       run: cargo install wasm-pack --version 0.15.0 --locked
     - uses: actions/setup-node@v4
