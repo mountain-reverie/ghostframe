@@ -1,0 +1,46 @@
+name: Set up Go and pre-warm ghostbridge modules
+description: >
+  Installs Go and downloads ghostbridge's module dependencies with retries.
+
+  ghostframe-lib's build.rs shells out to `make -C ghostbridge archive`, which
+  runs `go build`. Go does not retry module downloads, so a transient
+  proxy.golang.org error fails the whole job — observed twice in three days,
+  both times as an HTTP/2 INTERNAL_ERROR mid-stream.
+
+  This action mitigates the risk in two layers:
+
+  1. Caching (first line of defence): Module downloads are cached, keyed on
+     go.sum. A cache hit avoids proxy.golang.org entirely, making transient
+     fetch failures impossible.
+
+  2. Retry loop (fallback for cold cache): When the cache misses, go mod
+     download is retried up to 3 times, turning a transient mid-stream error
+     into a retry rather than a failed build.
+
+  GOPROXY is `proxy.golang.org,direct`, but `direct` only engages on a 404,
+  not a mid-stream error, so retries are necessary when caching does not help.
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-go@v5
+      with:
+        go-version: '1.25'
+        # Cache ghostbridge's module downloads, keyed on go.sum. Previously
+        # set on one job only. A cache hit avoids proxy.golang.org entirely,
+        # which is the cleanest defence against the transient fetch failures
+        # the retry loop below exists to survive.
+        cache-dependency-path: ghostbridge/go.sum
+    - name: pre-warm ghostbridge Go modules (retrying)
+      shell: bash
+      working-directory: ghostbridge
+      run: |
+        for attempt in 1 2 3; do
+          if go mod download; then
+            exit 0
+          fi
+          echo "::warning::go mod download failed (attempt ${attempt}/3); retrying"
+          sleep $(( attempt * 5 ))
+        done
+        echo "::error::go mod download failed after 3 attempts"
+        exit 1
