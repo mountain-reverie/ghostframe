@@ -13,10 +13,16 @@ use std::path::{Path, PathBuf};
 /// Directories that define protocol behaviour, relative to the workspace root.
 const STAMPED_DIRS: &[&str] = &["ghostframe-client-core/src", "ghostframe-protocol/src"];
 
+/// FNV-1a 64-bit prime, 2^40 + 2^8 + 0xb3. Grouped in fours from the right
+/// so a wrong digit count is visible: an extra zero here still compiles and
+/// still produces a stable-looking hash, but one that diverges from the JS
+/// twin only in the high bits.
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
 fn fnv1a(bytes: &[u8], mut hash: u64) -> u64 {
     for b in bytes {
         hash ^= *b as u64;
-        hash = hash.wrapping_mul(0x100_0000_01b3);
+        hash = hash.wrapping_mul(FNV_PRIME);
     }
     hash
 }
