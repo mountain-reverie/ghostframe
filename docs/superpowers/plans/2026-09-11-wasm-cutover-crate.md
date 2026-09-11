@@ -2033,6 +2033,25 @@ git commit -m "docs: baseline web bundle size before the wasm cutover"
 - [ ] Both `--target web` and `--target nodejs` build in CI.
 - [ ] Nothing under `ghostframe-web-client/src/` was modified.
 
+## Carried forward to step 3b
+
+**`tests/` is not typechecked.** `ghostframe-web-client/tsconfig.json` has
+`"include": ["src"]`, so `tsc --noEmit` never looks at the suites; vitest
+transpiles them without typechecking. This is pre-existing — all 18 suites
+are in that position — but it interacts badly with the wasm boundary.
+
+`u64` crosses as `BigInt`: the generated `.d.ts` types every `now_us`
+parameter as `bigint`, and `pollTimeout()` returns `bigint | undefined`.
+Passing `0` where `0n` is required **throws at runtime** rather than
+coercing. With eleven suites to retarget, each with many time-injected call
+sites, that is a large surface of failures that `tsc` would catch statically
+and currently will not.
+
+Recommended for step 3b: add `tests` to `include` (or give the suites their
+own `tsconfig.test.json`) and run `tsc --noEmit` over them in CI. Expect it
+to surface pre-existing type errors in the untouched suites first — budget
+for that, and do not let it block the retarget.
+
 ## What this plan deliberately does not do
 
 - Touch `main.ts` or any TS protocol module. That is step 4.
