@@ -9,6 +9,7 @@
 //! `{ kind: 'TilePayload', tile_x: 3, payload: Uint8Array }`.
 
 use ghostframe_client_core::{Event, PollOutput};
+use ghostframe_protocol::ack::AckEntry;
 use serde::Serialize;
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -134,6 +135,27 @@ impl From<PollOutput> for WasmPollOutput {
         match out {
             PollOutput::Datagram(bytes) => WasmPollOutput::Datagram { bytes },
             PollOutput::Stream(bytes) => WasmPollOutput::Stream { bytes },
+        }
+    }
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct WasmAckEntry {
+    pub frame_seq: u32,
+    pub tile_x: u8,
+    pub tile_y: u8,
+    pub pass_idx: u8,
+    pub arrival_time_ms_lo16: u16,
+}
+
+impl From<&AckEntry> for WasmAckEntry {
+    fn from(e: &AckEntry) -> Self {
+        WasmAckEntry {
+            frame_seq: e.frame_seq,
+            tile_x: e.tile_x,
+            tile_y: e.tile_y,
+            pass_idx: e.pass_idx,
+            arrival_time_ms_lo16: e.arrival_time_ms_lo16,
         }
     }
 }
