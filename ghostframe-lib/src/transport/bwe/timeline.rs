@@ -11,9 +11,7 @@
 /// a wrap rather than a genuine jump — the standard sequence-space
 /// disambiguation. Correct as long as consecutive samples are less than ~32 s
 /// apart, and ACK batches arrive far more often than that.
-#[allow(dead_code)]
 const HALF_PERIOD: i64 = 32_768;
-#[allow(dead_code)]
 const PERIOD: i64 = 65_536;
 
 /// Per-series unwrapper. One instance per timestamp series — the emit series
@@ -21,7 +19,6 @@ const PERIOD: i64 = 65_536;
 /// State is kept unclamped (may be negative) so that a backward step near the
 /// anchor does not corrupt subsequent deltas; only the returned value is floored
 /// at zero.
-#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub(crate) struct Lo16Timeline {
     last: Option<i64>,
@@ -29,7 +26,6 @@ pub(crate) struct Lo16Timeline {
 
 impl Lo16Timeline {
     /// Map the next 16-bit sample onto the monotonic timeline.
-    #[allow(dead_code)]
     pub(crate) fn unwrap_ms(&mut self, lo16: u16) -> u64 {
         let Some(last) = self.last else {
             // Anchor on the first value so early timestamps stay small and
