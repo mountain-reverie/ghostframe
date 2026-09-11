@@ -110,6 +110,8 @@ jobs:
       - uses: ./.github/workflows/_setup-go
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -131,6 +133,10 @@ jobs:
           github-token: ${{ github.token }}
           run-id: ${{ github.run_id }}
         continue-on-error: true
+
+      - name: Install wasm-pack (only needed for the fallback build below)
+        if: hashFiles('ghostframe-web-client/dist/**') == ''
+        run: cargo install wasm-pack --version 0.15.0 --locked
 
       - name: Fallback web-client build if artifact missing
         if: hashFiles('ghostframe-web-client/dist/**') == ''
