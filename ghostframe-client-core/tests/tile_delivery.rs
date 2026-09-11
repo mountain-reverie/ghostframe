@@ -182,3 +182,85 @@ fn raw_in_payload_mode_passes_bytes_through() {
     assert_eq!(got.len(), 1, "got {events:?}");
     assert_eq!(got[0], bgra, "payload must be the wire bytes, unswizzled");
 }
+
+/// Payload mode must still apply the bundled palette upsert — protocol state,
+/// not decoding — and must surface it so the GPU can upload the table.
+/// Dropping the upsert leaves the shader decoding against a stale palette,
+/// which shows as wrong colours rather than an error.
+#[test]
+fn palrle_in_payload_mode_applies_and_reports_the_palette() {
+    use ghostframe_protocol::codec::pal_rle::{encode_pal_rle_payload, PaletteEntry};
+
+    let mut colors = [[0u8; 4]; 16];
+    colors[0] = [10, 20, 30, 255];
+    colors[1] = [40, 50, 60, 255];
+    let entry = PaletteEntry { colors, count: 2 };
+    let packed = [0u8; 512];
+    let bundled = encode_pal_rle_payload(&packed, &entry, 5, true);
+
+    let events = drive_one_tile(TileDelivery::Payload, Codec::PalRle, &bundled);
+
+    let updated: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::PaletteUpdated { palette_id, colors } => Some((*palette_id, colors.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        updated.len(),
+        1,
+        "expected one PaletteUpdated, got {events:?}"
+    );
+    assert_eq!(updated[0].0, 5);
+    assert_eq!(updated[0].1[0], [10, 20, 30, 255]);
+    assert_eq!(updated[0].1[1], [40, 50, 60, 255]);
+
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::TilePayload {
+                codec: Codec::PalRle,
+                ..
+            }
+        )),
+        "the tile payload itself must still be emitted, got {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(e, Event::TileReady { .. })),
+        "Payload mode must not emit TileReady"
+    );
+}
+
+/// The Decoded path must be untouched. Same input, pixels out, and the first
+/// pixel resolves through palette entry 0.
+#[test]
+fn palrle_in_decoded_mode_is_unchanged() {
+    use ghostframe_protocol::codec::pal_rle::{encode_pal_rle_payload, PaletteEntry};
+
+    let mut colors = [[0u8; 4]; 16];
+    colors[0] = [10, 20, 30, 255];
+    colors[1] = [40, 50, 60, 255];
+    let entry = PaletteEntry { colors, count: 2 };
+    let packed = [0u8; 512];
+    let bundled = encode_pal_rle_payload(&packed, &entry, 5, true);
+
+    let events = drive_one_tile(TileDelivery::Decoded, Codec::PalRle, &bundled);
+    let ready: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::TileReady { rgba, .. } => Some(rgba.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ready.len(), 1, "got {events:?}");
+    assert_eq!(ready[0].len(), 4096);
+    // All indices are 0 -> palette entry 0, BGRA 10,20,30 -> RGBA 30,20,10.
+    assert_eq!(&ready[0][0..4], &[30, 20, 10, 255]);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::PaletteUpdated { .. })),
+        "Decoded mode applies the palette itself; the consumer never needs to see it"
+    );
+}
