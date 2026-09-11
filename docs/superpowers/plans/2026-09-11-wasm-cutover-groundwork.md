@@ -277,7 +277,16 @@ and add to `ClientConfig`:
     pub tile_delivery: TileDelivery,
 ```
 
-Derive `Default` on `ClientConfig` (`#[derive(Debug, Clone, Default)]` — check what it already derives and add `Default` to the list).
+Add `Default` to `ClientConfig`'s existing derives. It is currently
+`#[derive(Debug, Clone, Copy)]`, so it becomes
+`#[derive(Debug, Clone, Copy, Default)]` — **keep `Copy`**. Dropping it would
+break every call site that passes a `ClientConfig` by value, and `TileDelivery`
+derives `Copy` precisely so the containing struct can stay `Copy`.
+
+There are 9 `ClientConfig { .. }` literals across the workspace
+(`grep -rn "ClientConfig {" --include=*.rs . | grep -v ./target`). Each needs
+the new field or `..Default::default()`. Change only the literals, never an
+assertion.
 
 - [ ] **Step 4: Run it, confirm it passes**
 
