@@ -851,82 +851,102 @@ git commit -m "feat(bwe): back the estimator seam with GoogCC instead of the EWM
 
 ---
 
-### Task 6: Feed quinn's RTT to the controller
+### Task 6: Use quinn's RTT as a sanity bound, not as a controller input
 
-GoogCC's loss-based stage uses RTT. It is already read for the scheduler at `io_bridge.rs:1314`.
+**Rewritten after the Task 5 review.** The original task fed
+`on_round_trip_time_update`. That call is a no-op for us, twice over:
+`GoogCcNetworkController` ignores it whenever `packet_feedback_only` is set
+(which it now is), and it *separately* ignores any update with
+`msg.smoothed == true`, which the original snippet passed. The original test
+asserted only `samples_seen == 0`, which passes against a completely empty
+implementation — it could not have detected either discard.
+
+`packet_feedback_only = true` is correct and is a genuine fix: with it the
+controller derives RTT and loss from the feedback we already send
+(`goog_cc_network_control.rs:752-790`). With it `false`, those stages were
+never updated at all, because the driver never calls the explicit-report
+entry points.
+
+It also wants a different RTT from quinn's. GoogCC's consumers want the
+*feedback* RTT — send to feedback-about-that-send, including the receiver's
+ACK batching delay — because that is what bounds reaction speed. quinn's path
+RTT deliberately excludes exactly that.
+
+So quinn's RTT is not an input. It is an independent second opinion, and that
+makes it useful for catching the class of bug that already bit us once: the
+Task 5 review found a reachable panic caused by the driver reading a
+client-epoch value as an RTT. A sanity bound would have caught it.
 
 **Files:**
-- Modify: `ghostframe-lib/src/transport/bwe/mod.rs`, `ghostframe-lib/src/transport/bwe/googcc.rs`, `ghostframe-lib/src/transport/io_bridge.rs`
+- Modify: `ghostframe-lib/src/transport/bwe/googcc.rs`, `ghostframe-lib/src/transport/io_bridge.rs`
 
 - [ ] **Step 1: Write the failing test**
 
-Add to `mod tests` in `bwe/mod.rs`:
-
 ```rust
-    /// RTT updates must be accepted without disturbing the sample count —
-    /// they inform the controller, they are not delivery samples.
+    /// A derived RTT far above the measured path RTT means the timestamps
+    /// being differenced do not share an epoch. That is not a slow link, it
+    /// is a bug — and it is how a client-epoch value read as an RTT slipped
+    /// through once already.
     #[test]
-    fn rtt_update_does_not_count_as_a_sample() {
-        let t0 = std::time::Instant::now();
-        let mut w = BweWrapper::new(1_000_000, t0);
-        w.on_rtt(std::time::Duration::from_millis(40), t0);
-        assert_eq!(w.snapshot().samples_seen, 0);
+    fn an_implausible_derived_rtt_is_counted() {
+        let t0 = Instant::now();
+        let mut d = GoogCcDriver::new(4_000_000, t0);
+        d.note_path_rtt(Duration::from_millis(20));
+        // 30 s of apparent one-way delay against a 20 ms path RTT.
+        d.observe_derived_rtt(Duration::from_secs(30));
+        assert_eq!(d.snapshot().implausible_rtt_samples, 1);
+
+        // A plausible one must not count.
+        d.observe_derived_rtt(Duration::from_millis(25));
+        assert_eq!(d.snapshot().implausible_rtt_samples, 1);
     }
 ```
 
-- [ ] **Step 2: Run it and watch it fail**
-
-Run: `cargo test -p ghostframe-lib --lib rtt_update_does_not_count_as_a_sample`
-Expected: FAIL — `no method named 'on_rtt' found`.
+- [ ] **Step 2: Run it, confirm it fails** — no such methods or field.
 
 - [ ] **Step 3: Implement**
 
-In `googcc.rs`, add to `impl GoogCcDriver`:
+Add to `GoogCcDriver`: `path_rtt: Option<Duration>` and
+`implausible_rtt_samples: u64`; add `implausible_rtt_samples: u64` to
+`BweSnapshot`.
 
 ```rust
-    /// Feed a fresh RTT measurement. Does not count as a delivery sample.
-    pub(crate) fn on_rtt(&mut self, rtt: std::time::Duration, now: Instant) {
-        let at_time = self.to_timestamp(now);
-        let upd = self
-            .ctl
-            .on_round_trip_time_update(goog_cc::transport::RoundTripTimeUpdate {
-                at_time,
-                round_trip_time: goog_cc::units::TimeDelta::from_millis(
-                    rtt.as_millis().min(i64::MAX as u128) as i64,
-                ),
-                smoothed: true,
-            });
-        self.absorb(upd);
+    /// Record quinn's measured path RTT. Not fed to the controller — see the
+    /// module doc on why the feedback RTT is the one GoogCC wants — but kept
+    /// as the reference for `observe_derived_rtt`.
+    pub(crate) fn note_path_rtt(&mut self, rtt: Duration) {
+        self.path_rtt = Some(rtt);
+    }
+
+    /// Compare a derived one-way delay against the measured path RTT. Ten
+    /// times the path RTT plus a second of slack is far outside anything a
+    /// real link produces, so exceeding it means the two timestamps being
+    /// differenced are not on the same clock.
+    pub(crate) fn observe_derived_rtt(&mut self, derived: Duration) {
+        let Some(path) = self.path_rtt else { return };
+        if derived > path * 10 + Duration::from_secs(1) {
+            self.implausible_rtt_samples += 1;
+            tracing::warn!(
+                derived_ms = derived.as_millis() as u64,
+                path_rtt_ms = path.as_millis() as u64,
+                "derived RTT implausible against measured path RTT —                  check that emit and arrival timestamps share an epoch"
+            );
+        }
     }
 ```
 
-Add the matching delegation in `bwe/mod.rs`:
+Call `observe_derived_rtt` once per batch inside `update`, with
+`Duration::from_millis((recv_ms - send_ms).max(0) as u64)` for the last record.
+
+- [ ] **Step 4: Run it, confirm it passes.**
+
+- [ ] **Step 5: Wire the path RTT in**
+
+In `io_bridge.rs`, where the sample buffer drains into `self.bwe.update(...)`,
+first call `self.bwe.note_path_rtt(rtt)` using the same accessor the scheduler
+uses at `io_bridge.rs:1310`:
 
 ```rust
-    pub fn on_rtt(&mut self, rtt: std::time::Duration, now: Instant) {
-        self.driver.on_rtt(rtt, now);
-    }
-```
-
-If `RoundTripTimeUpdate`'s field names differ from the above, read them from
-`~/.cargo/registry/src/*/goog_cc-0.1.4/src/api/transport/network_types.rs` and
-use the real ones — do not guess.
-
-- [ ] **Step 4: Run and watch it pass**
-
-Run: `cargo test -p ghostframe-lib --lib rtt_update_does_not_count_as_a_sample`
-Expected: PASS.
-
-- [ ] **Step 5: Wire it in production**
-
-In `io_bridge.rs`, at the site that already drains `bwe_samples_buffer` into
-`self.bwe.update(&records, now_std())`, immediately before that call add:
-
-```rust
-                // Feed the controller the path RTT quinn already tracks. Cheap
-                // and only on ACK batches, so no extra polling. Mirrors the
-                // accessor the scheduler already uses (io_bridge.rs:1310):
-                // `connections` is a field, not a method.
                 if let Some(rtt) = self
                     .server
                     .connections
@@ -934,26 +954,15 @@ In `io_bridge.rs`, at the site that already drains `bwe_samples_buffer` into
                     .map(|c| c.stats().path.rtt)
                     .min()
                 {
-                    self.bwe.on_rtt(rtt, now_std());
+                    self.bwe.note_path_rtt(rtt);
                 }
 ```
 
-`.min()` across sessions matches what the scheduler does — the tightest path is
-the one worth pacing against.
+`connections` is a field, not a method. `.min()` matches the scheduler: the
+tightest path is the one worth pacing against.
 
-- [ ] **Step 6: Verify**
-
-Run: `cargo test -p ghostframe-lib --lib`
-Expected: PASS.
-
-- [ ] **Step 7: Commit**
-
-```bash
-git add ghostframe-lib/src/transport/bwe/mod.rs ghostframe-lib/src/transport/bwe/googcc.rs ghostframe-lib/src/transport/io_bridge.rs
-git commit -m "feat(bwe): feed quinn path RTT into the controller"
-```
-
----
+- [ ] **Step 6: Verify and commit** — full lib suite, clippy, fmt, and
+`browserless_runner` unchanged at 9.
 
 ### Task 7: Tier-1 deterministic controller bench
 
