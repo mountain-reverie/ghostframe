@@ -66,7 +66,12 @@ describe('prevalidateCdf53', () => {
       const r = prevalidateCdf53(payload, /*gen*/ 1, passIdx);
       expect(r.ok).toBe(true);
       if (!r.ok) return; // narrowing for TS
-      // tileX is not part of the wasm result — the header-derived value is
+      // The TS result carried a `tileX` that prevalidateCdf53 never set —
+      // its own comment read "caller-supplied; we don't pass it here,
+      // default 0" — and the suite asserted it was 0. Rust's
+      // PrevalidatedCdf53 has no such field: prevalidation does not know the
+      // tile coordinates, the caller stamps them. The assertion is dropped
+      // because its subject does not exist, not because it failed.
       // stamped by the caller, not by prevalidation. Nothing to assert here.
       expect(r.generation).toBe(1);
       expect(r.pass_idx).toBe(passIdx);
