@@ -25,6 +25,7 @@ pub enum WasmEvent {
         frame_seq: u32,
         tile_x: u8,
         tile_y: u8,
+        #[serde(with = "serde_bytes")]
         rgba: Vec<u8>,
     },
     TilePayload {
@@ -36,6 +37,7 @@ pub enum WasmEvent {
         /// `Codec` discriminant; `Codec` lives in `ghostframe-protocol` and
         /// is not `Serialize`, so it crosses as its `repr(u8)` value.
         codec: u8,
+        #[serde(with = "serde_bytes")]
         payload: Vec<u8>,
     },
     PaletteUpdated {
@@ -50,6 +52,7 @@ pub enum WasmEvent {
         frame_seq: u32,
         timestamp_us: u32,
         is_keyframe: bool,
+        #[serde(with = "serde_bytes")]
         payload: Vec<u8>,
     },
     DecodeError {
@@ -132,8 +135,14 @@ impl From<&Event> for WasmEvent {
 #[derive(Debug, Serialize, PartialEq)]
 #[serde(tag = "kind")]
 pub enum WasmPollOutput {
-    Datagram { bytes: Vec<u8> },
-    Stream { bytes: Vec<u8> },
+    Datagram {
+        #[serde(with = "serde_bytes")]
+        bytes: Vec<u8>,
+    },
+    Stream {
+        #[serde(with = "serde_bytes")]
+        bytes: Vec<u8>,
+    },
 }
 
 impl From<PollOutput> for WasmPollOutput {
@@ -179,8 +188,10 @@ pub struct WasmPrevalidatedPalRle {
     pub palette_id: u8,
     pub count: u8,
     /// 512 bytes, 2 pixels/byte, low nibble first. Empty when `ok` is false.
+    #[serde(with = "serde_bytes")]
     pub indices: Vec<u8>,
     /// `count * 4` BGRA bytes for Bundled; empty otherwise.
+    #[serde(with = "serde_bytes")]
     pub palette_upsert: Vec<u8>,
     /// Distinguishes "Bundled with an empty upsert" from "not Bundled".
     pub has_palette_upsert: bool,
@@ -226,6 +237,7 @@ pub struct WasmPrevalidatedCdf53 {
     pub generation: u8,
     pub pass_idx: u8,
     /// 384 bytes = 3 channels x 128, packed B, G, R. Empty when `ok` is false.
+    #[serde(with = "serde_bytes")]
     pub bit_planes: Vec<u8>,
 }
 
@@ -302,6 +314,7 @@ pub struct WasmParityEnvelope {
     pub k: u8,
     pub parity_idx: u8,
     pub group_first_payload_len: u16,
+    #[serde(with = "serde_bytes")]
     pub parity_payload: Vec<u8>,
 }
 

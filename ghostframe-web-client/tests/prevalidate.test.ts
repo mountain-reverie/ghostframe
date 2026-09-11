@@ -124,12 +124,7 @@ describe('prevalidatePalRle: success paths', () => {
     if (r.ok) {
       expect(r.variant).toBe(PalRleVariant.IndicesRaw);
       expect(r.palette_id).toBe(9);
-      // r.indices crosses the wasm boundary as a plain Array (serde_wasm_bindgen
-      // has no serde_bytes annotation on WasmPrevalidatedPalRle::indices), not a
-      // Uint8Array, so a raw toEqual against the Uint8Array fixture fails on
-      // constructor identity even though every byte matches. Array.from(...)
-      // on both sides compares values only — representation, not behaviour.
-      expect(Array.from(r.indices)).toEqual(Array.from(indices));
+      expect(r.indices).toEqual(indices);
     }
   });
 
