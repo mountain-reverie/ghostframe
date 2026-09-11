@@ -67,16 +67,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.25'
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: npm
-          cache-dependency-path: ghostframe-web-client/package-lock.json
-      - name: build web client SPA (ghostbridge //go:embeds it)
-        working-directory: ghostframe-web-client
-        run: |
-          npm ci
-          npm run build
+      - uses: ./.github/workflows/_build-web-client
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -95,16 +86,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.25'
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: npm
-          cache-dependency-path: ghostframe-web-client/package-lock.json
-      - name: build web client SPA (ghostbridge //go:embeds it)
-        working-directory: ghostframe-web-client
-        run: |
-          npm ci
-          npm run build
+      - uses: ./.github/workflows/_build-web-client
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -144,16 +126,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.25'
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: npm
-          cache-dependency-path: ghostframe-web-client/package-lock.json
-      - name: build web client SPA (ghostbridge //go:embeds it)
-        working-directory: ghostframe-web-client
-        run: |
-          npm ci
-          npm run build
+      - uses: ./.github/workflows/_build-web-client
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -177,16 +150,7 @@ jobs:
         with:
           go-version: '1.25'
           cache-dependency-path: ghostbridge/go.sum
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: npm
-          cache-dependency-path: ghostframe-web-client/package-lock.json
-      - name: build web client SPA (ghostbridge //go:embeds it)
-        working-directory: ghostframe-web-client
-        run: |
-          npm ci
-          npm run build
+      - uses: ./.github/workflows/_build-web-client
       - working-directory: ghostbridge
         run: |
           # Populate ghostbridge/dist/ (//go:embed source). Cargo-driven
