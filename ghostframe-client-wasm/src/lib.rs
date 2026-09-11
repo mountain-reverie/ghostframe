@@ -16,6 +16,7 @@
 use wasm_bindgen::prelude::*;
 
 pub mod boundary;
+pub mod constants;
 pub mod core;
 pub mod input;
 pub mod units;
