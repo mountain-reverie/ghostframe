@@ -1,6 +1,6 @@
 //! Tests for the tile-delivery mode switch and the payload events.
 
-use ghostframe_client_core::{ClientConfig, ClientCore, TileDelivery};
+use ghostframe_client_core::{ClientConfig, ClientCore, PollOutput, TileDelivery};
 use ghostframe_protocol::protocol::{fragment_tile, Codec, TileFragmentInputs, TILE_DATAGRAM_FLAG};
 
 fn core_with(delivery: TileDelivery) -> ClientCore {
@@ -52,6 +52,47 @@ fn drive_one_tile(delivery: TileDelivery, codec: Codec, payload: &[u8]) -> Vec<E
         events.extend(core.handle_datagram(dg, 0));
     }
     events
+}
+
+/// Like `drive_one_tile`, but also drains everything the core queued to send.
+/// The Cdf53 deferred ACK is a `PollOutput`, not an `Event`, so a test that
+/// only inspects events cannot see whether it fired.
+///
+/// A single ACK entry does not flush `AckBatcher` immediately — it only
+/// flushes at `MAX_FRESH_ENTRIES_PER_BATCH` entries or 5ms after the first
+/// queued entry (`FLUSH_INTERVAL_US`), same as every other codec's
+/// on-receipt ACK. So this advances time past that debounce window with
+/// `on_timeout` before draining `poll_transmit`, well short of the 100ms
+/// periodic-feedback interval so no unrelated output sneaks in.
+fn drive_one_tile_with_outputs(
+    delivery: TileDelivery,
+    codec: Codec,
+    payload: &[u8],
+) -> (Vec<Event>, Vec<PollOutput>) {
+    let mut core = core_with(delivery);
+    let mut events = Vec::new();
+    for dg in tile_datagrams(1, 0, 0, codec, 0, payload, 1200) {
+        events.extend(core.handle_datagram(&dg, 0));
+    }
+    core.on_timeout(10_000);
+    let mut outputs = Vec::new();
+    while let Some(o) = core.poll_transmit(0) {
+        outputs.push(o);
+    }
+    (events, outputs)
+}
+
+/// One valid Cdf53 pass-0 payload over a gradient tile.
+fn cdf53_pass0_payload() -> Vec<u8> {
+    let mut bgra = Vec::with_capacity(32 * 32 * 4);
+    for y in 0..32u32 {
+        for x in 0..32u32 {
+            bgra.extend_from_slice(&[(x * 8) as u8, (y * 8) as u8, ((x + y) * 4) as u8, 255]);
+        }
+    }
+    let coeffs = ghostframe_protocol::codec::cdf53::forward(&bgra);
+    let passes = ghostframe_protocol::codec::cdf53::encode_passes(&coeffs);
+    passes.into_iter().next().expect("at least one pass")
 }
 
 /// The default must be the behaviour every current consumer already relies
@@ -329,5 +370,59 @@ fn palrle_in_decoded_mode_is_unchanged() {
             .iter()
             .any(|e| matches!(e, Event::PaletteUpdated { .. })),
         "Decoded mode applies the palette itself; the consumer never needs to see it"
+    );
+}
+
+/// Payload mode must keep every protocol side effect of a Cdf53 pass —
+/// prevalidation, coverage, and the deferred ACK — and drop only the CPU
+/// accumulation, which the GPU does instead in cdf53_integrate.wgsl.
+///
+/// The ACK is the one worth guarding hardest: without it the server
+/// retransmits this pass indefinitely and nothing client-side looks wrong.
+#[test]
+fn cdf53_in_payload_mode_keeps_the_ack_and_skips_integrate() {
+    let pass0 = cdf53_pass0_payload();
+    let (events, outputs) =
+        drive_one_tile_with_outputs(TileDelivery::Payload, Codec::Cdf53, &pass0);
+
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::TilePayload {
+                codec: Codec::Cdf53,
+                ..
+            }
+        )),
+        "expected a Cdf53 TilePayload, got {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(e, Event::TileReady { .. })),
+        "Payload mode must not emit TileReady, got {events:?}"
+    );
+    assert!(
+        !outputs.is_empty(),
+        "the deferred ACK must still be produced — without it the server \
+         retransmits this pass indefinitely"
+    );
+}
+
+/// The Decoded path is unchanged: pixels out, and the ACK still fires.
+#[test]
+fn cdf53_in_decoded_mode_is_unchanged() {
+    let pass0 = cdf53_pass0_payload();
+    let (events, outputs) =
+        drive_one_tile_with_outputs(TileDelivery::Decoded, Codec::Cdf53, &pass0);
+
+    let ready: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::TileReady { rgba, .. } => Some(rgba.len()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ready, vec![4096], "got {events:?}");
+    assert!(
+        !outputs.is_empty(),
+        "the deferred ACK must fire in Decoded mode too"
     );
 }
