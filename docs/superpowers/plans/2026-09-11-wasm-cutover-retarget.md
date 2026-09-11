@@ -735,7 +735,7 @@ repeated nine times:
 |---|---|---:|---|
 | 5 | `palette_shadow` | 34 | No timers, no encoding. Establishes the pattern. |
 | 6 | `nack` | 49 | Fake timers → `NackHarness.advanceMs`. Needs the nested reshape from Task 4. |
-| 7 | `feedback` | 51 | Pure encoders: `encodeHello`, `encodeDecodeError`, constants. |
+| 7 | `feedback` | 51 | Pure encoders plus constants. **Call-shape differs:** the TS `encodeHello` takes an object (`{indicesRawEnabled, supportsH264}`), the export takes positional bools — adapt at the call site, the assertion is unchanged. `encodeDecodeError` returns `Option` (`undefined` for an out-of-range discriminant) where the TS masked with `& 0xFF` and always returned bytes; verified this suite never passes an out-of-range value, so it is not exercised. If you add such a case, that divergence has to be resolved first. |
 | 8 | `decode_error_batcher` | 78 | Rate limiting. Imports `ERR_THIN_UNCACHED_PALETTE` from `errorCodes()`. |
 | 9 | `prevalidate_cdf53` | 107 | Also imports a JSON fixture from `ghostframe-e2e/src/harness/fixtures/`. **Leave that import alone** — it is cross-crate test data, not protocol code. |
 | 10 | `parity_decoder` | 111 | Builds envelopes via `encodeParityEnvelope`. Its `receiveParity` takes raw bytes now, collapsing the TS parse-then-pass pairing. |
