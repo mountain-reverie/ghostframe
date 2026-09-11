@@ -66,6 +66,9 @@ export class NackHarness {
   /** Replaces `vi.advanceTimersByTime(ms)`. */
   advanceMs(ms: number): void { this.collect(this.inner.onTimeout(this.clock.advanceMs(ms))); }
 
+  /** Replaces the TS `flushNow()` — immediate, bypassing the deadline. */
+  flush(): void { this.collect(this.inner.flush()); }
+
   private collect(out: Uint8Array | undefined): void {
     if (out !== undefined) this.sent.push(out);
   }
