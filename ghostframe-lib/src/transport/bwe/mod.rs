@@ -26,6 +26,7 @@
 
 use std::time::{Duration, Instant};
 
+mod googcc;
 mod timeline;
 
 // ── EWMA parameters ─────────────────────────────────────────────────────────
