@@ -418,11 +418,20 @@ async fn every_cdf53_pass_eventually_lands() {
     }
 }
 
-/// The estimator has an independently known right answer here: the netsim's
-/// own token bucket. Nothing else in the suite checks the estimate against a
-/// target that was not derived from the estimator itself.
+/// End-to-end proof that the production ACK path feeds the estimator, and
+/// that emit and arrival timestamps share a clock epoch.
+///
+/// Deliberately does NOT assert convergence toward the netsim's cap. The
+/// scene injects `busy_frames(8)` within ~128 ms and then runs on heartbeats,
+/// so there is no sustained delivery for the controller to measure: it
+/// consumes ~1800 samples in a burst and the estimate moves under 2% off its
+/// seed. Convergence is covered by `ghostframe-lib/tests/bwe_bench.rs`, which
+/// drives continuous traffic and reaches 3.03 Mbit/s on a 3 Mbit/s link.
+///
+/// What this test uniquely covers is the wiring and the clocks — neither of
+/// which the bench can reach, because the bench synthesises its own samples.
 #[tokio::test(start_paused = true)]
-async fn bwe_estimate_tracks_the_netsim_cap() {
+async fn bwe_estimator_is_fed_and_epoch_consistent() {
     let scene = BrowserlessScene {
         seed: 0xB4E,
         frames: busy_frames(8),
@@ -436,6 +445,16 @@ async fn bwe_estimate_tracks_the_netsim_cap() {
     };
     let result = run_browserless(scene).await.expect("scene ran");
 
+    // The estimate alone proves nothing: an estimator that received no
+    // samples at all still reports its seed, and the seed sits inside the
+    // plausible range asserted below. This is the assertion that shows the
+    // production ACK path actually fed the controller during the scene.
+    assert!(
+        result.bwe_samples_seen > 0,
+        "seed 0xB4E: the estimator consumed {} ACK-arrival samples — the \
+         production path did not reach it",
+        result.bwe_samples_seen
+    );
     assert!(
         result.bwe_estimate_bps > 0,
         "seed 0xB4E: no bandwidth estimate was produced at all"

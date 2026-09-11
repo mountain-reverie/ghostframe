@@ -124,6 +124,10 @@ pub struct BrowserlessResult {
     /// Count of derived RTTs implausible against quinn's measured path RTT.
     /// Non-zero means emit and arrival timestamps are not on one clock.
     pub implausible_rtt_samples: u64,
+    /// ACK-arrival samples the estimator actually consumed during the scene.
+    /// Zero means the production path never delivered any, which the estimate
+    /// alone cannot reveal — an unfed estimator simply reports its seed.
+    pub bwe_samples_seen: u64,
 }
 
 /// The address the harness uses to identify the client, baked into every
@@ -242,6 +246,7 @@ async fn run_inner(scene: BrowserlessScene) -> anyhow::Result<BrowserlessResult>
         seed,
         bwe_estimate_bps: bwe_snapshot.bitrate_bps,
         implausible_rtt_samples: bwe_snapshot.implausible_rtt_samples,
+        bwe_samples_seen: bwe_snapshot.samples_seen,
     })
 }
 
