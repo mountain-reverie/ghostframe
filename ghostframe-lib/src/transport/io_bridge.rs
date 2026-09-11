@@ -4007,6 +4007,17 @@ impl IoBridge {
                         size_bytes: s.size_bytes,
                     })
                     .collect();
+                // quinn already measures path RTT for the scheduler; reuse it
+                // as the reference for the estimator's plausibility check.
+                if let Some(rtt) = self
+                    .server
+                    .connections
+                    .values()
+                    .map(|c| c.stats().path.rtt)
+                    .min()
+                {
+                    self.bwe.note_path_rtt(rtt);
+                }
                 self.bwe.update(&records, now_std());
             }
 
