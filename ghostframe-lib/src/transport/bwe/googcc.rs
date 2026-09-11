@@ -14,7 +14,7 @@ use goog_cc::transport::{
 };
 use goog_cc::units::{DataRate, DataSize, Timestamp};
 use goog_cc::{GoogCcConfig, GoogCcNetworkController};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Floor and ceiling handed to the controller. The floor keeps a badly
 /// congested link usable rather than collapsing to nothing; the ceiling stops
@@ -31,6 +31,10 @@ pub(crate) struct GoogCcDriver {
     base: Instant,
     estimate_bps: u64,
     samples_seen: u64,
+    /// quinn's measured path RTT, used only as a plausibility bound on the
+    /// derived RTT — never fed to the controller. See `note_path_rtt`.
+    path_rtt: Option<Duration>,
+    implausible_rtt_samples: u64,
 }
 
 /// Newtype carrying the `Send` assertion, so it covers exactly the one type
@@ -91,6 +95,34 @@ impl GoogCcDriver {
             base: now,
             estimate_bps: initial_bps,
             samples_seen: 0,
+            path_rtt: None,
+            implausible_rtt_samples: 0,
+        }
+    }
+
+    /// Record quinn's measured path RTT. Deliberately NOT fed to the
+    /// controller: with `packet_feedback_only` set, GoogCC derives its own
+    /// RTT from the feedback we send, and that is the value it wants — it
+    /// includes the receiver's ACK batching delay, which bounds reaction
+    /// speed, while quinn's path RTT excludes exactly that.
+    pub(crate) fn note_path_rtt(&mut self, rtt: Duration) {
+        self.path_rtt = Some(rtt);
+    }
+
+    /// Compare a derived one-way delay against the measured path RTT. Ten
+    /// times the path RTT plus a second of slack is far outside anything a
+    /// real link produces, so exceeding it means the two timestamps being
+    /// differenced are not on the same clock.
+    pub(crate) fn observe_derived_rtt(&mut self, derived: Duration) {
+        let Some(path) = self.path_rtt else { return };
+        if derived > path * 10 + Duration::from_secs(1) {
+            self.implausible_rtt_samples += 1;
+            tracing::warn!(
+                derived_ms = derived.as_millis() as u64,
+                path_rtt_ms = path.as_millis() as u64,
+                "derived RTT implausible against measured path RTT — check \
+                 that emit and arrival timestamps share an epoch"
+            );
         }
     }
 
@@ -132,10 +164,12 @@ impl GoogCcDriver {
         // checked non-empty above.
         let mut send_ms_max = (records[0].server_emit_us / 1_000) as i64;
         let mut packet_feedbacks = Vec::with_capacity(records.len());
+        let mut last_derived = Duration::ZERO;
         for r in records {
             let send_ms = (r.server_emit_us / 1_000) as i64;
             let recv_ms = self.arrival_time.unwrap_ms(r.client_arrival_ms_lo16) as i64;
             send_ms_max = send_ms_max.max(send_ms);
+            last_derived = Duration::from_millis((recv_ms - send_ms).max(0) as u64);
             let sent = SentPacket {
                 send_time: Timestamp::from_millis(send_ms),
                 size: DataSize::from_bytes(r.size_bytes as i64),
@@ -151,6 +185,7 @@ impl GoogCcDriver {
         }
         feedback_time = feedback_time.max(Timestamp::from_millis(send_ms_max));
         self.samples_seen += records.len() as u64;
+        self.observe_derived_rtt(last_derived);
 
         let upd = self
             .ctl
@@ -176,6 +211,7 @@ impl GoogCcDriver {
         BweSnapshot {
             bitrate_bps: self.estimate_bps,
             samples_seen: self.samples_seen,
+            implausible_rtt_samples: self.implausible_rtt_samples,
         }
     }
 
@@ -293,5 +329,34 @@ mod tests {
     fn driver_is_send() {
         fn assert_send<T: Send>() {}
         assert_send::<GoogCcDriver>();
+    }
+
+    /// A derived RTT far above the measured path RTT means the timestamps
+    /// being differenced do not share an epoch. That is not a slow link, it
+    /// is a bug — and it is how a client-epoch value read as an RTT slipped
+    /// through once already.
+    #[test]
+    fn an_implausible_derived_rtt_is_counted() {
+        let t0 = Instant::now();
+        let mut d = GoogCcDriver::new(4_000_000, t0);
+        d.note_path_rtt(Duration::from_millis(20));
+        // 30 s of apparent one-way delay against a 20 ms path RTT.
+        d.observe_derived_rtt(Duration::from_secs(30));
+        assert_eq!(d.snapshot().implausible_rtt_samples, 1);
+
+        // A plausible one must not count.
+        d.observe_derived_rtt(Duration::from_millis(25));
+        assert_eq!(d.snapshot().implausible_rtt_samples, 1);
+    }
+
+    /// Without a reference RTT there is nothing to compare against, so
+    /// nothing may be flagged — otherwise every session would warn before
+    /// quinn reports its first measurement.
+    #[test]
+    fn no_path_rtt_means_nothing_is_flagged() {
+        let t0 = Instant::now();
+        let mut d = GoogCcDriver::new(4_000_000, t0);
+        d.observe_derived_rtt(Duration::from_secs(30));
+        assert_eq!(d.snapshot().implausible_rtt_samples, 0);
     }
 }

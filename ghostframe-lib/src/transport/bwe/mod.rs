@@ -16,7 +16,7 @@
 //!
 //! See `docs/superpowers/specs/2026-06-27-protocol-redesign-design.md`.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 mod googcc;
 mod timeline;
@@ -56,6 +56,12 @@ pub struct BweSnapshot {
     pub bitrate_bps: u64,
     /// Total ACK-arrival samples fed into the estimator since startup.
     pub samples_seen: u64,
+    /// Count of derived-RTT samples that landed far outside the plausible
+    /// range for quinn's measured path RTT (see `GoogCcDriver::note_path_rtt`
+    /// / `observe_derived_rtt`). Non-zero means the emit and arrival
+    /// timestamps being differenced likely do not share an epoch — a real
+    /// bug, not a slow link. Zero whenever no path RTT has been supplied yet.
+    pub implausible_rtt_samples: u64,
 }
 
 // ── BweWrapper ────────────────────────────────────────────────────────────────
@@ -103,6 +109,12 @@ impl BweWrapper {
     /// Return the current observability snapshot without advancing the estimator.
     pub fn snapshot(&self) -> BweSnapshot {
         self.driver.snapshot()
+    }
+
+    /// Record quinn's measured path RTT as an independent plausibility bound
+    /// on the estimator's derived RTT. See `GoogCcDriver::note_path_rtt`.
+    pub fn note_path_rtt(&mut self, rtt: Duration) {
+        self.driver.note_path_rtt(rtt);
     }
 }
 
