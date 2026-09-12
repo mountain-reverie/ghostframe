@@ -226,6 +226,56 @@ fn pass_tier(pass_idx: u8) -> PassTier {
     }
 }
 
+/// Upper bound (ms, exclusive) of each of the first 7 `TierLatencyStats`
+/// buckets; the 8th bucket is the open-ended "500ms+" tail. Fixed rather
+/// than adaptive: this is a baseline-measurement tool (BWE Stage 2.0), not
+/// a tuned production percentile estimator, and tail latency is exactly
+/// what pacing (Stage 2) is meant to shrink — a mean alone can stay flat
+/// while p95 moves, or hide a regression.
+const LATENCY_BUCKET_BOUNDS_MS: [u64; 7] = [5, 10, 20, 50, 100, 200, 500];
+
+/// Per-tier ACK round-trip latency accumulator (BWE Stage 2.0 baseline
+/// measurement). Populated at the `bwe_samples_buffer` drain site in
+/// `run()` from `received_at - server_emit_us` — both timestamps are on
+/// the server's own monotonic clock, so this is an emit-to-ACK-receipt
+/// round trip, not a one-way delay. See that call site's comment for why
+/// `client_arrival_ms_lo16` (the client-clock field) is not used here.
+///
+/// Cumulative since bridge construction, mirroring `bytes_emitted_critical`
+/// / `bytes_emitted_refinement` — never reset, so the periodic log's values
+/// are always "since startup" and a browserless harness reader gets a
+/// complete-scene total regardless of when it samples.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TierLatencyStats {
+    pub count: u64,
+    pub sum_us: u64,
+    pub max_us: u64,
+    /// Counts for buckets `0-5, 5-10, 10-20, 20-50, 50-100, 100-200,
+    /// 200-500, 500+` ms, in that order. See `LATENCY_BUCKET_BOUNDS_MS`.
+    pub buckets: [u64; 8],
+}
+
+impl TierLatencyStats {
+    fn record(&mut self, latency_us: u64) {
+        self.count += 1;
+        self.sum_us = self.sum_us.saturating_add(latency_us);
+        self.max_us = self.max_us.max(latency_us);
+        let latency_ms = latency_us / 1000;
+        let bucket = LATENCY_BUCKET_BOUNDS_MS
+            .iter()
+            .position(|&bound| latency_ms < bound)
+            .unwrap_or(LATENCY_BUCKET_BOUNDS_MS.len());
+        self.buckets[bucket] += 1;
+    }
+
+    /// Mean latency in microseconds, or 0 on an empty accumulator (rather
+    /// than dividing by zero) — matching the "zero is a valid, checkable
+    /// reading" convention the rest of this module's stats use.
+    pub fn mean_us(&self) -> u64 {
+        self.sum_us.checked_div(self.count).unwrap_or(0)
+    }
+}
+
 /// Maximum number of pending BweSample entries the per-tick drain
 /// will hold between drains. Sized to comfortably exceed one tick's
 /// worth of ACK throughput on a 1920×1080 first-paint burst
@@ -590,8 +640,8 @@ pub struct IoBridge {
     pub(crate) reliable_emitter: crate::transport::reliable_emitter::ReliableTileEmitter,
     /// Rolling buffer of one-way-delay samples derived from ACK
     /// envelopes (Phase 1 Task 5). Drained periodically into the Bwe
-    /// estimator (Task 8) and into per-tier latency histograms (Task
-    /// 6). Bounded by `BWE_SAMPLES_BUFFER_CAPACITY`; under high ACK
+    /// estimator (Task 8) and into per-tier `TierLatencyStats` (BWE Stage
+    /// 2.0). Bounded by `BWE_SAMPLES_BUFFER_CAPACITY`; under high ACK
     /// load excess samples are dropped (the consumer doesn't need
     /// every single sample for a useful estimate).
     bwe_samples_buffer: Vec<BweSample>,
@@ -632,6 +682,13 @@ pub struct IoBridge {
     #[cfg(any(test, feature = "browserless-harness"))]
     emitter_stats_publish:
         std::sync::Arc<std::sync::Mutex<crate::transport::reliable_emitter::emitter::EmitterStats>>,
+    /// Shared cell the browserless harness reads the final per-tier ACK
+    /// latency stats from, after aborting the `run()` task. `(critical,
+    /// refinement)`. Same cell/republish/read-after-abort pattern as
+    /// `bwe_publish` and `emitter_stats_publish` above, and for the
+    /// identical ownership reason — see `bwe_publish`'s doc comment.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    latency_stats_publish: std::sync::Arc<std::sync::Mutex<(TierLatencyStats, TierLatencyStats)>>,
     /// Cumulative bytes of CDF53 critical-tier (passes 0-3) datagrams
     /// emitted since startup. Counts every successful emit including
     /// retransmits, because the BWE-side rate computation should reflect
@@ -641,6 +698,13 @@ pub struct IoBridge {
     /// Cumulative bytes of CDF53 refinement-tier (passes 4-13) datagrams
     /// emitted since startup. Same semantics as `bytes_emitted_critical`.
     bytes_emitted_refinement: u64,
+    /// Per-tier ACK round-trip latency stats (BWE Stage 2.0 baseline
+    /// measurement). See `TierLatencyStats`'s doc comment for the exact
+    /// latency expression and the drain site in `run()` for where it's
+    /// computed.
+    critical_latency_stats: TierLatencyStats,
+    /// Same as `critical_latency_stats`, for `PassTier::Refinement`.
+    refinement_latency_stats: TierLatencyStats,
     /// Snapshot of (critical, refinement) byte counters at the previous
     /// periodic-log tick, used to derive per-window rates without
     /// polluting the cumulative counters.
@@ -660,10 +724,11 @@ pub struct IoBridge {
 /// are u16 wall-clock-ms wrapped; the consumer looks at *relative* deltas,
 /// so clock skew is fine.
 ///
-/// `tier`, `owd_ms_lo16`, and `received_at` are staged for the Phase 2
-/// controller that will consume them (per-tier delay-gradient input).
-/// Kept in the struct so the layout is stable across the Phase 1 → 2
-/// handoff; suppress dead_code until then.
+/// `tier` and `received_at` are consumed at the drain site (`run()`) to
+/// accumulate `TierLatencyStats` (BWE Stage 2.0). `owd_ms_lo16` is still
+/// staged for the Phase 2 controller's delay-gradient input and not read
+/// anywhere yet; kept in the struct so the layout is stable across the
+/// Phase 1 → 2 handoff, hence the remaining `allow(dead_code)`.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 struct BweSample {
@@ -969,8 +1034,17 @@ impl IoBridge {
             emitter_stats_publish: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::transport::reliable_emitter::emitter::EmitterStats::default(),
             )),
+            // Same cfg-gate and reasoning again, for the per-tier latency
+            // stats — see `latency_stats_publish`'s doc comment.
+            #[cfg(any(test, feature = "browserless-harness"))]
+            latency_stats_publish: std::sync::Arc::new(std::sync::Mutex::new((
+                TierLatencyStats::default(),
+                TierLatencyStats::default(),
+            ))),
             bytes_emitted_critical: 0,
             bytes_emitted_refinement: 0,
+            critical_latency_stats: TierLatencyStats::default(),
+            refinement_latency_stats: TierLatencyStats::default(),
             bytes_emitted_snapshot: (0, 0),
             bwe_log_last_at: None,
             diagnostics: lib_config.diagnostics,
@@ -3794,6 +3868,20 @@ impl IoBridge {
                         // the long-tail un-deliverable passes that the
                         // client should be NACKing.
                         cache_pending_entries = self.reliable_emitter.pending_cache_entries(),
+                        // BWE Stage 2.0: per-tier ACK round-trip latency
+                        // (emit -> ACK receipt, server clock only — see
+                        // `TierLatencyStats`'s doc comment). Cumulative
+                        // since startup, same semantics as the byte
+                        // counters above. This is the baseline the pacer
+                        // (Stage 2) is measured against: pass 0-3 latency
+                        // should drop without pass 4-13 throughput
+                        // regressing.
+                        critical_latency_count = self.critical_latency_stats.count,
+                        critical_latency_mean_us = self.critical_latency_stats.mean_us(),
+                        critical_latency_max_us = self.critical_latency_stats.max_us,
+                        refinement_latency_count = self.refinement_latency_stats.count,
+                        refinement_latency_mean_us = self.refinement_latency_stats.mean_us(),
+                        refinement_latency_max_us = self.refinement_latency_stats.max_us,
                         "cumulative emit (datagrams handed to quinn since startup, per codec)"
                     );
 
@@ -4050,17 +4138,39 @@ impl IoBridge {
             // estimator backend needs strict packet-sequence identity.
             if !self.bwe_samples_buffer.is_empty() {
                 use crate::transport::bwe::AckArrival;
-                let records: Vec<AckArrival> = self
-                    .bwe_samples_buffer
-                    .drain(..)
-                    .map(|s| AckArrival {
+                let mut records: Vec<AckArrival> =
+                    Vec::with_capacity(self.bwe_samples_buffer.len());
+                // BWE Stage 2.0: accumulate per-tier ACK round-trip latency
+                // while draining, instead of discarding `tier` and
+                // `received_at` in a bare `.map()`. Both `received_at` and
+                // `server_emit_us` are on the *server's* monotonic clock
+                // (`self.bwe_epoch`), so this is an emit-to-ACK-receipt
+                // round trip, not a one-way delay — deliberately: pacing
+                // (Stage 2) reduces queueing delay for critical passes, and
+                // this round trip is what surfaces that. Do NOT substitute
+                // `client_arrival_ms_lo16` here — it's on the client's clock
+                // with an unknown epoch, which is exactly what
+                // `implausible_rtt_samples` (Stage 1) exists to detect.
+                for s in self.bwe_samples_buffer.drain(..) {
+                    let elapsed_since_epoch_us = s
+                        .received_at
+                        .saturating_duration_since(self.bwe_epoch)
+                        .as_micros() as u64;
+                    let ack_latency_us = elapsed_since_epoch_us.saturating_sub(s.server_emit_us);
+                    match s.tier {
+                        PassTier::Critical => self.critical_latency_stats.record(ack_latency_us),
+                        PassTier::Refinement => {
+                            self.refinement_latency_stats.record(ack_latency_us)
+                        }
+                    }
+                    records.push(AckArrival {
                         wire_seq: (((s.server_emit_us / 1000) as u32) << 16)
                             | (s.client_arrival_ms_lo16 as u32),
                         server_emit_us: s.server_emit_us,
                         client_arrival_ms_lo16: s.client_arrival_ms_lo16,
                         size_bytes: s.size_bytes,
-                    })
-                    .collect();
+                    });
+                }
                 // quinn already measures path RTT for the scheduler; reuse it
                 // as the reference for the estimator's plausibility check.
                 if let Some(rtt) = self
@@ -4086,6 +4196,8 @@ impl IoBridge {
             {
                 *self.bwe_publish.lock().unwrap() = self.bwe.snapshot();
                 *self.emitter_stats_publish.lock().unwrap() = self.reliable_emitter.stats;
+                *self.latency_stats_publish.lock().unwrap() =
+                    (self.critical_latency_stats, self.refinement_latency_stats);
             }
 
             // [BRIDGE-DIAG] heartbeat every 2s of virtual time (tokio's
@@ -4657,8 +4769,17 @@ impl IoBridge {
             emitter_stats_publish: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::transport::reliable_emitter::emitter::EmitterStats::default(),
             )),
+            // Same cfg-gate and reasoning again, for the per-tier latency
+            // stats — see `latency_stats_publish`'s doc comment.
+            #[cfg(any(test, feature = "browserless-harness"))]
+            latency_stats_publish: std::sync::Arc::new(std::sync::Mutex::new((
+                TierLatencyStats::default(),
+                TierLatencyStats::default(),
+            ))),
             bytes_emitted_critical: 0,
             bytes_emitted_refinement: 0,
+            critical_latency_stats: TierLatencyStats::default(),
+            refinement_latency_stats: TierLatencyStats::default(),
             bytes_emitted_snapshot: (0, 0),
             bwe_log_last_at: None,
             diagnostics: lib_config.diagnostics,
@@ -4741,6 +4862,20 @@ impl IoBridge {
     ) -> std::sync::Arc<std::sync::Mutex<crate::transport::reliable_emitter::emitter::EmitterStats>>
     {
         self.emitter_stats_publish.clone()
+    }
+
+    /// Clone of the `Arc` behind `latency_stats_publish` — `(critical,
+    /// refinement)` — for a caller that is about to move `self` into a
+    /// `spawn_local`'d task and needs a way to read the per-tier ACK
+    /// latency stats back out afterwards. Same ownership problem and fix
+    /// as `bwe_publish_handle` / `emitter_stats_publish_handle`. Call this
+    /// *before* the move; read the clone's contents *after* aborting the
+    /// task.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub fn latency_stats_publish_handle(
+        &self,
+    ) -> std::sync::Arc<std::sync::Mutex<(TierLatencyStats, TierLatencyStats)>> {
+        self.latency_stats_publish.clone()
     }
 
     /// Drive exactly one injected frame: enqueue its work, then attempt the
