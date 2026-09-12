@@ -143,6 +143,51 @@ pools all 30 runs rather than trusting any single batch, and why Stage 2's
 comparison should also pool multiple runs rather than compare one
 before-run to one after-run.
 
+
+## Use the within-run ratio, not the absolute latency
+
+The absolute numbers above swing too widely to hold Stage 2 to. Across the
+three batches the pooled critical mean moved 39.3 -> 114.9 ms, a **2.92x**
+range, driven entirely by which runs happened to hit a heavy tail. A pacer
+that genuinely improved critical latency by 30% could easily land inside that
+noise, and one that regressed it could easily look like an improvement.
+
+The **critical / refinement ratio within the same run** does not have that
+problem:
+
+| Batch | Critical mean | Refinement mean | Ratio |
+|---|---:|---:|---:|
+| 1 | 39.3 ms | 39.5 ms | 0.995 |
+| 2 | 114.9 ms | 115.3 ms | 0.997 |
+| 3 | 39.8 ms | 40.7 ms | 0.978 |
+
+| Metric | Spread across batches |
+|---|---|
+| Absolute critical mean | 39.3-114.9 ms (**2.92x**) |
+| Critical / refinement ratio | 0.978-0.997 (**1.019x**) |
+
+Both tiers ride the same link, the same loss draws and the same queue in any
+given run, so pairing them cancels almost all of the run-to-run variance —
+the ratio is roughly 150x more stable than either absolute value.
+
+It also states the goal directly. Stage 2's pacer exists to make passes 0-3
+arrive *sooner than* passes 4-13; the ratio measures exactly that, whereas an
+absolute figure measures it tangled up with whatever the link was doing.
+
+**Recommended Stage 2 acceptance criterion**
+
+- **Baseline: ratio = 0.99 (0.978-0.997).** Effectively 1.0 — no
+  prioritisation, as expected.
+- **Pass: ratio drops materially below 1.0**, reproducibly across batches,
+  with the tail (100-500+ ms buckets) shifting in critical's favour.
+- **Guard:** refinement throughput must not regress. The ratio alone can be
+  improved the wrong way — by making refinement *worse* rather than critical
+  *better* — so it must be read alongside `bytes_emitted_refinement` and the
+  existing `every_cdf53_pass_eventually_lands` starvation scene. **A falling
+  ratio with flat critical latency is a regression wearing a success.**
+
+Report absolute numbers too, for the record. Just do not gate on them.
+
 ## What this does NOT show
 
 - This is not a one-way delay measurement — see "What is being measured"
