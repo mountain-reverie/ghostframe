@@ -172,10 +172,24 @@ survive only on order-of-magnitude margins. Existing scenes become regression
 guards: `every_cdf53_pass_eventually_lands` for starvation,
 `cdf53_converges_to_lossless_under_10pct_loss` for a pacer that stalls.
 
-**Baseline first.** Phase 1's per-tier tracking already reports pass 0-3 vs
-4-13 latency. The deliverable — "pass 0-3 latency drops measurably without
-sacrificing pass 4-13 throughput" — needs a recorded before-number or it is
-unfalsifiable.
+**Baseline first — and the instrumentation does not exist yet.**
+
+This section previously claimed "Phase 1's per-tier tracking already reports
+pass 0-3 vs 4-13 latency". That is wrong, verified against the tree at
+`9508b56`. Phase 1 tracks per-tier **bytes** — `bytes_emitted_critical` and
+`bytes_emitted_refinement` in `io_bridge.rs` — and `PassTier` classifies
+passes 0-3 as `Critical`, 4-13 as `Refinement`. Nothing measures *latency*.
+The only references to per-tier latency histograms are doc comments naming
+them as a future task (`io_bridge.rs:593`, `:642`).
+
+So the deliverable — "pass 0-3 latency drops measurably without sacrificing
+pass 4-13 throughput" — is currently unfalsifiable, exactly as this section
+warns. Stage 2 therefore acquires a prerequisite ahead of any pacer work:
+
+**Stage 2.0 — measure, then record.** Add per-tier pass-completion latency to
+the existing telemetry, and record the pre-pacing baseline. Without it the
+acceptance criterion cannot be evaluated, and a pacer that made pass 0-3
+latency *worse* would look indistinguishable from one that helped.
 
 ## Sequencing
 
@@ -190,8 +204,13 @@ unchanged and the flag from D6 is not yet load-bearing. Acceptance: the bench
 asserts ramp and back-off, and `bwe_estimate_bps` tracks the netsim's own token
 bucket in a scene — an independently known ground truth.
 
+**Stage 2.0 — measurable first.** Per-tier pass-completion latency
+instrumentation plus a recorded baseline. See "Baseline first" above: the
+instrumentation this spec assumed exists does not.
+
 **Stage 2 — the controller is in charge.** Pacer restructure, probe mode, and
-`PacingMode::Paced` driving release. Acceptance: the existing convergence and
+`PacingMode::Paced` driving release. (`PacingMode` does not exist in the tree
+yet; Stage 2 introduces it.) Acceptance: the existing convergence and
 starvation scenes stay green, and pass 0-3 latency improves against the Stage 1
 baseline.
 
