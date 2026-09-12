@@ -1,6 +1,16 @@
 import palrleWgsl from './shaders/palrle_decode.wgsl?raw';
-import type { PalRleEntry } from '../prevalidate.js';
 import { createLabeledShaderModule } from './shader_module';
+
+/** A prevalidated PalRLE tile, ready for the GPU. Produced by the core,
+ *  not derived here — the renderer no longer prevalidates. */
+export interface PalRleTile {
+  tileX: number;
+  tileY: number;
+  paletteId: number;
+  count: number;
+  /** 512 bytes: two 4-bit indices per byte, low nibble first. */
+  indices: Uint8Array;
+}
 
 export class PalRlePipeline {
   private pipeline: GPUComputePipeline;
@@ -104,7 +114,7 @@ export class PalRlePipeline {
   }
 
   /** Pack tile_work + indices for a batch of PalRle entries; upload to GPU. */
-  uploadBatch(entries: readonly PalRleEntry[]): number {
+  uploadBatch(entries: readonly PalRleTile[]): number {
     if (entries.length === 0) return 0;
     if (entries.length > this.maxTiles) {
       throw new Error(`PalRle batch ${entries.length} exceeds maxTiles ${this.maxTiles}`);

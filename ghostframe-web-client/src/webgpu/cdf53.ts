@@ -1,10 +1,19 @@
-import type { PrevalidatedCdf53 } from '../prevalidate_cdf53.js';
 import integrateWgsl from './shaders/cdf53_integrate.wgsl?raw';
 import inverseL3Wgsl from './shaders/cdf53_inverse_l3.wgsl?raw';
 import inverseL2Wgsl from './shaders/cdf53_inverse_l2.wgsl?raw';
 import inverseL1Wgsl from './shaders/cdf53_inverse_l1.wgsl?raw';
 import inverseL1Pass2Wgsl from './shaders/cdf53_inverse_l1_pass2.wgsl?raw';
 import { createLabeledShaderModule } from './shader_module';
+
+/** A prevalidated Cdf53 tile pass, ready for the GPU. Produced by the core
+ *  (`reassembly.rs`'s `prevalidate_cdf53`), not derived here. */
+export interface PrevalidatedCdf53 {
+  tileX: number;
+  tileY: number;
+  gen: number;     // 0..15
+  passIdx: number; // 0..13
+  bitPlanes: Uint8Array; // 384 = 128 × 3 (B, G, R)
+}
 
 /**
  * Per-tile persistent state for client-side Cdf53 decode.
