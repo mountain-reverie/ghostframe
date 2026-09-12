@@ -1,7 +1,6 @@
 import { Codec, FullFrameDecoder } from './decoder.js';
 import { WebGpuRenderer } from './webgpu/renderer.js';
 import { WebGpuUnavailableError } from './webgpu/init.js';
-import { LossTracker } from './feedback';
 import { attachInputCapture } from './input/wire';
 import { DecodeErrorBatcher } from './decode_error_batcher';
 import { initDiagnostics } from './diagnostics.js';
@@ -292,19 +291,10 @@ async function main() {
 
   const { transport } = await bootstrap();
 
-  // Captured here so onSessionReset can clear them. setInterval keeps firing
-  // even after its enclosing stream closes; without explicit clearInterval
-  // every reconnect would leak a dead interval handler + its closure state.
-  let feedbackInterval: ReturnType<typeof setInterval> | null = null;
-
   function onSessionReset() {
-    // Stop the periodic feedback writer so it doesn't try to write to a
-    // closed stream after teardown. Cleared first because it's the only
-    // active timer.
-    if (feedbackInterval !== null) {
-      clearInterval(feedbackInterval);
-      feedbackInterval = null;
-    }
+    // The periodic feedback writer this used to clear is gone: the core
+    // emits ReceiverFeedback from on_timeout, driven by tick()'s rAF loop,
+    // which stops on its own when the session tears down. No timer to clear.
 
     // Drain videoFramesToClose and clear the h264Queue FIRST so that the
     // fullFrameDecoder.close() call below doesn't hit a double-close hazard
@@ -333,8 +323,6 @@ async function main() {
   await transport.ready;
   log('Connected!');
   statusEl.textContent = 'Connected';
-
-  const lossTracker = new LossTracker();
 
   // Open the feedback bidi stream. Used for: HELLO (one-shot at connect),
   // ReceiverFeedback (periodic), and DECODE_ERROR (rate-limited, on demand).
@@ -448,18 +436,17 @@ async function main() {
     }
   });
 
-  if (feedbackWriter) {
-    feedbackInterval = setInterval(async () => {
-      try {
-        const msg = lossTracker.encodeFeedback();
-        await feedbackWriter.write(msg);
-      } catch {
-        // Stream closed — stop reporting. onSessionReset clears the
-        // interval, but a race between the close event and the next tick
-        // can fire this branch once before the clear takes effect.
-      }
-    }, 100);
-  }
+  // Receiver feedback is emitted by the core, not from here. ClientCore::
+  // on_timeout queues a ReceiverFeedback Stream output on its own interval
+  // (FEEDBACK_INTERVAL_US), and tick()'s core.onTimeout + drainTransmit
+  // carries it to the wire.
+  //
+  // The TS setInterval that used to live here has been removed. It survived
+  // 4a and kept firing every 100ms, but nothing fed its LossTracker any more
+  // — onDatagram/onStaleTile/onFecRecovery all went with the receive-loop
+  // rewrite — so it was sending the server an all-zeros loss report
+  // alongside the core's real one. Feedback drives server-side rate
+  // adaptation rather than pixels, so the e2e suite could not see it.
 
   // Full-frame decoder state.
   let fullFrameDecoder: FullFrameDecoder | null = null;
