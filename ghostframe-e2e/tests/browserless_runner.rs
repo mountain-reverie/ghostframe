@@ -581,6 +581,84 @@ async fn retransmits_fire_under_loss_but_not_on_a_perfect_link() {
     );
 }
 
+/// BWE Stage 2.0 baseline measurement: per-tier (`Critical` = CDF53 passes
+/// 0-3, `Refinement` = passes 4-13) ACK round-trip latency, recorded in
+/// `docs/specs/bwe-tier-latency-baseline.md`. This is the pre-pacer number
+/// Stage 2's pacer restructure has to beat — see that doc and
+/// `docs/superpowers/specs/2026-09-10-bwe-pacing-design.md`'s "Baseline
+/// first" section.
+///
+/// Reuses the exact scene shape from
+/// `retransmits_fire_under_loss_but_not_on_a_perfect_link` (`busy_frames(2)`,
+/// 4x4 grid, 10% loss, 10s duration) — that scene's doc comment records why
+/// `busy_frames(2)` is the smallest traffic volume that reliably generates
+/// retransmit-worthy concurrent load without occasionally hitting
+/// `drive_session`'s `MAX_ITERS` bail-out (`busy_frames(8)` hangs 15-30% of
+/// runs; `busy_frames(2)` was 40/40 clean across two batches).
+///
+/// `#[ignore]`d: this is a measurement tool for humans reading stdout, not
+/// a pass/fail regression gate — every run "passes" as long as the scene
+/// completes, regardless of the numbers it prints. Run explicitly:
+///
+/// ```text
+/// cargo test -p ghostframe-e2e --test browserless_runner \
+///   bwe_tier_latency_baseline -- --ignored --nocapture --test-threads=1
+/// ```
+#[tokio::test(start_paused = true)]
+#[ignore]
+async fn bwe_tier_latency_baseline() {
+    // `busy_frames(2)` is the smallest traffic volume the neighbouring
+    // `retransmits_fire_under_loss_but_not_on_a_perfect_link` doc comment
+    // measured as reliable (40/40 clean in that batch), but the harness is
+    // not seed-reproducible (`feedback_browserless_not_seed_reproducible`)
+    // and `drive_session`'s MAX_ITERS budget exhaustion is a known,
+    // healthy-scene outcome under `start_paused` (see that panic message) —
+    // it recurred here too, just less often than at `busy_frames(8)`. A
+    // budget-exhausted attempt is skipped and retried with the next seed
+    // rather than failing the whole measurement run.
+    const TARGET_SUCCESSFUL_RUNS: u64 = 10;
+    const MAX_ATTEMPTS: u64 = 30;
+    let mut successes = 0u64;
+    for i in 0..MAX_ATTEMPTS {
+        if successes >= TARGET_SUCCESSFUL_RUNS {
+            break;
+        }
+        let seed = 0xB17E_0000_u64.wrapping_add(i);
+        let scene = BrowserlessScene {
+            seed,
+            frames: busy_frames(2),
+            net: NetProfile {
+                loss: 0.10,
+                ..NetProfile::perfect()
+            },
+            duration: Duration::from_secs(10),
+            grid_cols: 4,
+            grid_rows: 4,
+        };
+        let r = match run_browserless(scene).await {
+            Ok(r) => r,
+            Err(e) => {
+                println!("seed={seed:#010x} SKIPPED (harness bail, not a measurement): {e}");
+                continue;
+            }
+        };
+        successes += 1;
+        println!(
+            "seed={seed:#010x} critical: count={:>5} mean_us={:>7} max_us={:>7} buckets={:?} \
+             | refinement: count={:>5} mean_us={:>7} max_us={:>7} buckets={:?}",
+            r.critical_latency_count,
+            r.critical_latency_mean_us,
+            r.critical_latency_max_us,
+            r.critical_latency_buckets,
+            r.refinement_latency_count,
+            r.refinement_latency_mean_us,
+            r.refinement_latency_max_us,
+            r.refinement_latency_buckets,
+        );
+    }
+    println!("{successes}/{TARGET_SUCCESSFUL_RUNS} target runs completed");
+}
+
 /// A 32x32 BGRA gradient tile, so Cdf53 passes carry real, distinct
 /// bit-plane content rather than a uniform tile's near-identical passes.
 /// Matches `tests/framebuffer.rs`'s `gradient_bgra` pixel-for-pixel.
