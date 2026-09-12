@@ -301,10 +301,17 @@ where upsert-before-thin ordering is load-bearing and only the CI-only e2e
 suite would catch a mistake. Not a trade worth making inside the irreversible
 step.
 
-**Delete (7):** `ack.ts`, `nack.ts`, `fec.ts`, `parity_decoder.ts`,
-`feedback.ts`, `cdf53_coverage.ts`, `decode_error_batcher.ts`.
+**Delete (6):** `ack.ts`, `nack.ts`, `fec.ts`, `parity_decoder.ts`,
+`cdf53_coverage.ts`, `decode_error_batcher.ts`.
 
-**Keep (3 + 1):** `prevalidate.ts`, `prevalidate_cdf53.ts`,
+**`feedback.ts` cannot go either** — found when checking references.
+`prevalidate.ts` and `prevalidate_cdf53.ts`, both kept for the renderer,
+import their `ERR_*` constants from it. Splitting those constants into a new
+module to salvage one deletion is not worth the churn; `feedback.ts` joins the
+kept set. Its other 18 exports (`encodeHello`, `LossTracker`, the `HELLO_*`
+and `FEEDBACK_*` constants) become dead but harmless.
+
+**Keep (4 + 1):** `feedback.ts`, `prevalidate.ts`, `prevalidate_cdf53.ts`,
 `palette_shadow.ts` — renderer dependencies. And `decoder.ts` **whole**: it
 holds both `Codec` (a `const enum` at :16, used by the new dispatcher) and
 `FullFrameDecoder` (:136, platform glue). The earlier plan's split of that
