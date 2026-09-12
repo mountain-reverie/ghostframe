@@ -479,6 +479,108 @@ async fn bwe_estimator_is_fed_and_epoch_consistent() {
     );
 }
 
+/// BWE Stage 2 prereq: proves the server's `ReliableTileEmitter` retransmit
+/// path (`EmitterStats::retransmit_attempts_total`) is actually reachable
+/// from a browserless scene at all. A prior investigation found 238 BWE
+/// samples across every scene in this file with `attempts_total` stuck at
+/// zero — FEC (K=10 XOR groups, one parity) was absorbing every loss before
+/// a NACK, or an RTO, was ever needed. BWE Stage 2 adds two retransmit
+/// priority queues on top of this path, so it needs at least one scene
+/// that genuinely drives it before it can build on it.
+///
+/// FEC only fails when >=2 of a K=10 group's members are lost, so this
+/// needs enough concurrent in-flight traffic that groups actually fill and
+/// losses land two-deep inside one. `cdf53_converges_to_lossless_under_10pct_loss`'s
+/// single tile (1 tile, 14 passes/frame) doesn't generate enough concurrent
+/// groups to hit that at all: measured `retransmit_attempts_total == 0`
+/// deterministically (checked twice) for a single `Cdf53` frame on the
+/// full 4x4 grid too (16 tiles, 224 passes) — apparently enough redundancy
+/// elsewhere in the emit path that independent 10% loss over one frame's
+/// worth of traffic never leaves 2 losses in the same FEC group.
+///
+/// `busy_frames(N)` (multiple sequential frames, each rewriting the whole
+/// 4x4 grid with fresh `Cdf53` content — see its doc comment) supplies the
+/// extra concurrent traffic needed, but **N matters a lot** and this was
+/// not obvious up front:
+/// - `busy_frames(8)`, `duration: 15s`, no cap: forces retransmits (900-1150
+///   `retransmit_attempts_total` observed) but **occasionally hangs** —
+///   roughly 15-30% of runs across several batches of 15-20 hit
+///   `drive_session`'s `MAX_ITERS` (5000) bail-out entirely, apparently a
+///   burst-pileup interaction between generation-bumping (each of the 8
+///   frames supersedes the last one's still-in-flight retransmits) and the
+///   uncapped simultaneous 16-tile injection. A 2 MB/s cap on top did not
+///   fix it (throughput never got near 2 MB/s, so the cap never actually
+///   engaged). Not used here — an occasionally-hanging test is worse than
+///   a narrower one that doesn't.
+/// - `busy_frames(4)`: same hang, lower but still real rate (~15% across a
+///   20-run batch).
+/// - `busy_frames(2)`, `duration: 10s`, no cap: the value used below.
+///   40/40 runs across two batches completed normally (no hang), typically
+///   in ~320-350 loop iterations (comfortably under the 5000 budget) and
+///   ~1.5s wall-clock each. This is the smallest `busy_frames(N)` that
+///   reliably clears the single-frame "FEC absorbs everything" floor.
+///
+/// The `NetProfile::perfect()` control on the same scene shape is what
+/// makes the lossy-run assertion non-vacuous: without it, an unfed or
+/// miswired counter, or a scene that retransmits unconditionally regardless
+/// of the network, would pass the lossy assertion too. Zero here every run
+/// (structurally expected: no drops means no unrecoverable FEC group, no
+/// coverage gap, no unacked cache entry for RTO to fire on) is the
+/// contrast that proves the lossy run's non-zero count means what it
+/// claims.
+#[tokio::test(start_paused = true)]
+async fn retransmits_fire_under_loss_but_not_on_a_perfect_link() {
+    async fn run_at(net: NetProfile, seed: u64) -> (u64, u64, u64, u64) {
+        let scene = BrowserlessScene {
+            seed,
+            frames: busy_frames(2),
+            net,
+            duration: Duration::from_secs(10),
+            grid_cols: 4,
+            grid_rows: 4,
+        };
+        let r = run_browserless(scene).await.expect("scene ran");
+        (
+            r.retransmit_attempts_total,
+            r.nack_hit,
+            r.rto_fired,
+            r.bytes_dropped,
+        )
+    }
+
+    // 20 runs measured: `retransmit_attempts_total` landed at 85 or 86 every
+    // time (`nack_hit` either 10 or 0, `rto_fired` making up the rest) —
+    // remarkably tight for a harness whose seed doesn't fully determine its
+    // random draws (see `feedback_browserless_not_seed_reproducible`).
+    // Asserting `> 0` rather than pinning the exact count regardless, since
+    // that note says the exact value isn't guaranteed to stay this stable.
+    let (lossy_attempts, lossy_nack_hit, lossy_rto_fired, lossy_dropped) = run_at(
+        NetProfile {
+            loss: 0.10,
+            ..NetProfile::perfect()
+        },
+        0xDEAD,
+    )
+    .await;
+    assert!(
+        lossy_attempts > 0,
+        "seed 0xDEAD: 10% loss over a busy 4x4 grid must force at least one \
+         retransmit (RTO- or NACK-driven) — zero here means the reliable \
+         emitter's retransmit path was never reached, not that the link \
+         was quiet (nack_hit={lossy_nack_hit} rto_fired={lossy_rto_fired} \
+         bytes_dropped={lossy_dropped})"
+    );
+
+    let (perfect_attempts, _, _, perfect_dropped) = run_at(NetProfile::perfect(), 0xBEEF).await;
+    assert_eq!(
+        perfect_attempts, 0,
+        "seed 0xBEEF: NetProfile::perfect() drops nothing (bytes_dropped={perfect_dropped}), \
+         so nothing should ever need retransmitting; a non-zero count here \
+         would mean this scene retransmits regardless of the network, which \
+         would make the assertion above vacuous"
+    );
+}
+
 /// A 32x32 BGRA gradient tile, so Cdf53 passes carry real, distinct
 /// bit-plane content rather than a uniform tile's near-identical passes.
 /// Matches `tests/framebuffer.rs`'s `gradient_bgra` pixel-for-pixel.
