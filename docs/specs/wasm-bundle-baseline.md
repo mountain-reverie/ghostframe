@@ -152,3 +152,54 @@ Untried, if size later becomes blocking: dropping `serde`/`serde-wasm-bindgen`
 in favour of hand-written `JsValue` construction, and dropping
 `console_error_panic_hook` (which pulls in formatting machinery). Both trade
 boundary ergonomics and debuggability for bytes; neither was measured.
+
+## Post-cutover measurement, 2026-09-11 (Phase 4b Task 8)
+
+**Git rev:** `3b32e70` **Branch:** `feat/wasm-cutover-delete`
+
+Re-run using the exact commands in "How to re-measure" above, from
+`ghostframe-web-client/` with `pkg-web`, `pkg-node` and `dist` deleted first
+for a from-scratch build. `main.ts` now drives `WasmClientCore` exclusively
+(Phase 4a) and the six dead TS protocol modules are deleted (Task 6); `npx
+vite build` and `npm run build` now produce the same output, per this doc's
+own note that they converge once the TS protocol layer is gone.
+
+### Full production build (`npm run build`) — the number to compare against §1
+
+| Asset | Raw bytes | Gzip bytes |
+|---|---:|---:|
+| `dist/index.html` | 556 | 364 |
+| `dist/assets/index-D-gPETmI.js` | 87,111 | 25,521 |
+| `dist/assets/ghostframe_client_wasm_bg-DYGTbRBw.wasm` | 137,289 | 55,547 |
+| **Total** | **224,956** | **81,432** |
+
+### Wasm module on its own (`npm run build:wasm`), for comparison to §2
+
+| Asset | Raw bytes | Gzip bytes |
+|---|---:|---:|
+| `pkg-web/ghostframe_client_wasm_bg.wasm` | 137,289 | 55,538 |
+| `pkg-web/ghostframe_client_wasm.js` (glue) | 38,048 | 7,050 |
+| **Total** | **175,337** | **62,588** |
+
+### Comparison to the pre-cutover baseline (§1)
+
+| | Pre-cutover (TS only) | Post-cutover (wasm wired, TS deleted) | Delta |
+|---|---:|---:|---:|
+| Raw total | 91,667 | 224,956 | +133,289 (2.45x) |
+| Gzip total | 27,091 | 81,432 | +54,341 (3.01x) |
+
+The regression is real and roughly matches the order of magnitude flagged
+before this work started (that estimate — 52.6 KB gzip of wasm against 26.7
+KB for the entire old bundle — was itself measured off an earlier, more
+minimal build of the crate). The `.wasm` binary's gzip size grew from 52,642
+bytes (§2 baseline) to 55,547/55,538 bytes here, consistent with 4a having
+moved real protocol logic (the reassembly, ACK/NACK, prevalidation and
+feedback state machines) into the crate rather than just scaffolding.
+
+One number moved the other way: the JS bundle itself (`index-*.js`) shrank
+slightly, from 91,111/26,725 bytes (raw/gzip) pre-cutover to 87,111/25,521
+bytes post-cutover — deleting ~1,147 lines of TS protocol code outweighed
+adding the wasm-bindgen glue import and event-dispatch wiring in `main.ts`.
+
+This is a record, not a gate, per the top of this document. No size
+assertion is added.
