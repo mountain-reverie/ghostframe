@@ -742,24 +742,6 @@ async function main() {
   const paintedTilesPerFrame = new Map<number, number>();
   const pendingFramePaintRaf = new Set<number>();
 
-  // Reliable-tile-emitter: NACK any fragment still missing this long after
-  // the assembly's first fragment arrived. Dedup-set on the assembly prevents
-  // re-NACKing the same frag_idx on every subsequent rAF tick.
-  const ASSEMBLY_TIMEOUT_MS = 30;
-
-  function scanForAssemblyTimeouts(now: number, partialAssemblies: Iterable<TileAssembly>) {
-    for (const asm of partialAssemblies) {
-      if (asm.received >= asm.fragments.length) continue;
-      if (now - asm.partialSince < ASSEMBLY_TIMEOUT_MS) continue;
-      for (let i = 0; i < asm.fragments.length; i++) {
-        if (asm.fragments[i] === null && !asm.nackedFragIdxs.has(i)) {
-          nackBatcher.add(asm.emitKey, i);
-          asm.nackedFragIdxs.add(i);
-        }
-      }
-    }
-  }
-
   // Per-tier recv counters (passes 0-3 critical vs 4-13 refinement).
   // Updated in the per-pass receive path below; reported in the periodic
   // stats line (Phase 1 Task 10). Bytes-since-startup; the periodic
