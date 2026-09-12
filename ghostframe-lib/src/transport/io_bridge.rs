@@ -615,6 +615,23 @@ pub struct IoBridge {
     /// `bwe_snapshot` since both exist for the same caller.
     #[cfg(any(test, feature = "browserless-harness"))]
     bwe_publish: std::sync::Arc<std::sync::Mutex<crate::transport::bwe::BweSnapshot>>,
+    /// Shared cell the browserless harness reads the final
+    /// `reliable_emitter::EmitterStats` from, after aborting the `run()`
+    /// task. Parallel to `bwe_publish` above and for the identical reason:
+    /// `run()` owns `self` for its whole lifetime once `spawn_local`'d, so
+    /// a plain `&self` accessor is unreachable from the harness once the
+    /// bridge has moved into the task. The harness clones the `Arc` via
+    /// `emitter_stats_publish_handle()` *before* moving `bridge` into
+    /// `spawn_local`, `run()` republishes into it every iteration, and the
+    /// harness reads the clone after `abort()`.
+    ///
+    /// Kept as a separate cell rather than folded into `BweSnapshot`:
+    /// retransmit/NACK/RTO counts are a reliability-layer concept, not a
+    /// bandwidth-estimator concept, and conflating the two would make
+    /// "the BWE snapshot" mean two unrelated things.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    emitter_stats_publish:
+        std::sync::Arc<std::sync::Mutex<crate::transport::reliable_emitter::emitter::EmitterStats>>,
     /// Cumulative bytes of CDF53 critical-tier (passes 0-3) datagrams
     /// emitted since startup. Counts every successful emit including
     /// retransmits, because the BWE-side rate computation should reflect
@@ -943,6 +960,14 @@ impl IoBridge {
                     now_std(),
                 )
                 .snapshot(),
+            )),
+            // Same cfg-gate and same reasoning as `bwe_publish` above; seeded
+            // with `EmitterStats::default()` since there's no throwaway
+            // instance needed here (unlike the BWE estimator, default stats
+            // are simply all-zero).
+            #[cfg(any(test, feature = "browserless-harness"))]
+            emitter_stats_publish: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::transport::reliable_emitter::emitter::EmitterStats::default(),
             )),
             bytes_emitted_critical: 0,
             bytes_emitted_refinement: 0,
@@ -4060,6 +4085,7 @@ impl IoBridge {
             #[cfg(any(test, feature = "browserless-harness"))]
             {
                 *self.bwe_publish.lock().unwrap() = self.bwe.snapshot();
+                *self.emitter_stats_publish.lock().unwrap() = self.reliable_emitter.stats;
             }
 
             // [BRIDGE-DIAG] heartbeat every 2s of virtual time (tokio's
@@ -4623,6 +4649,14 @@ impl IoBridge {
                 )
                 .snapshot(),
             )),
+            // Same cfg-gate and same reasoning as `bwe_publish` above; seeded
+            // with `EmitterStats::default()` since there's no throwaway
+            // instance needed here (unlike the BWE estimator, default stats
+            // are simply all-zero).
+            #[cfg(any(test, feature = "browserless-harness"))]
+            emitter_stats_publish: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::transport::reliable_emitter::emitter::EmitterStats::default(),
+            )),
             bytes_emitted_critical: 0,
             bytes_emitted_refinement: 0,
             bytes_emitted_snapshot: (0, 0),
@@ -4693,6 +4727,20 @@ impl IoBridge {
         &self,
     ) -> std::sync::Arc<std::sync::Mutex<crate::transport::bwe::BweSnapshot>> {
         self.bwe_publish.clone()
+    }
+
+    /// Clone of the `Arc` behind `emitter_stats_publish`, for a caller that
+    /// is about to move `self` into a `spawn_local`'d task and needs a way
+    /// to read the reliable-emitter counters back out afterwards. See
+    /// `emitter_stats_publish`'s doc comment — same ownership problem as
+    /// `bwe_publish_handle`, same fix. Call this *before* the move; read
+    /// the clone's contents *after* aborting the task.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub fn emitter_stats_publish_handle(
+        &self,
+    ) -> std::sync::Arc<std::sync::Mutex<crate::transport::reliable_emitter::emitter::EmitterStats>>
+    {
+        self.emitter_stats_publish.clone()
     }
 
     /// Drive exactly one injected frame: enqueue its work, then attempt the

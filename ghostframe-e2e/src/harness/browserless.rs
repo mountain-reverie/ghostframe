@@ -128,6 +128,32 @@ pub struct BrowserlessResult {
     /// Zero means the production path never delivered any, which the estimate
     /// alone cannot reveal — an unfed estimator simply reports its seed.
     pub bwe_samples_seen: u64,
+    /// Total retransmit attempts the server's `ReliableTileEmitter` made
+    /// (RTO-driven + NACK-driven combined), read from
+    /// `IoBridge::emitter_stats_publish_handle()` after the bridge task is
+    /// aborted — same cell/republish/read-after-abort pattern as
+    /// `bwe_estimate_bps` above (see that field's construction site for the
+    /// mechanics). A scene asserting this is non-zero is claiming the
+    /// retransmit path was actually exercised; **zero is ambiguous** — it
+    /// means either "no loss needed a retransmit" (a genuinely quiet path,
+    /// e.g. FEC absorbed every loss) or "the emitter was never fed at all".
+    /// Cross-check against `bytes_delivered`/`nack_hit`/`nack_miss` before
+    /// treating a zero as proof of a quiet path.
+    pub retransmit_attempts_total: u64,
+    /// NACKs the emitter matched against a still-cached fragment and
+    /// actually retransmitted. Zero alongside a non-zero
+    /// `retransmit_attempts_total` means every retransmit in this scene was
+    /// RTO-driven rather than NACK-driven.
+    pub nack_hit: u64,
+    /// NACKs the emitter received for a fragment no longer in its
+    /// retransmit cache (already ack'd, evicted, or never sent under that
+    /// key). Non-zero is not itself a bug, but a large count relative to
+    /// `nack_hit` suggests the client is NACKing stale state.
+    pub nack_miss: u64,
+    /// Count of RTO deadlines that fired (the emitter's own retransmit
+    /// timer, independent of any client NACK). Zero does not imply the
+    /// path was unfed — a scene can retransmit purely via `nack_hit`.
+    pub rto_fired: u64,
 }
 
 /// The address the harness uses to identify the client, baked into every
@@ -194,6 +220,9 @@ async fn run_inner(scene: BrowserlessScene) -> anyhow::Result<BrowserlessResult>
     // comment, chosen because it doesn't disturb the existing `spawn_local`
     // + abort shape the bring-up tests already depend on.
     let bwe_cell = bridge.bwe_publish_handle();
+    // Same reasoning, same pattern, for the reliable emitter's retransmit
+    // counters — see `emitter_stats_publish`'s doc comment in `io_bridge.rs`.
+    let emitter_stats_cell = bridge.emitter_stats_publish_handle();
     // `IoBridge::run` is an infinite event loop that only returns on EOF or
     // error; it must be aborted explicitly (see below) rather than awaited.
     let bridge_handle = tokio::task::spawn_local(async move {
@@ -236,6 +265,9 @@ async fn run_inner(scene: BrowserlessScene) -> anyhow::Result<BrowserlessResult>
 
     let stale_generation_tiles = framebuffer.stale_frame_tiles();
     let bwe_snapshot = *bwe_cell.lock().expect("bwe_publish mutex poisoned");
+    let emitter_stats = *emitter_stats_cell
+        .lock()
+        .expect("emitter_stats_publish mutex poisoned");
 
     Ok(BrowserlessResult {
         framebuffer,
@@ -247,6 +279,10 @@ async fn run_inner(scene: BrowserlessScene) -> anyhow::Result<BrowserlessResult>
         bwe_estimate_bps: bwe_snapshot.bitrate_bps,
         implausible_rtt_samples: bwe_snapshot.implausible_rtt_samples,
         bwe_samples_seen: bwe_snapshot.samples_seen,
+        retransmit_attempts_total: emitter_stats.retransmit_attempts_total,
+        nack_hit: emitter_stats.nack_hit,
+        nack_miss: emitter_stats.nack_miss,
+        rto_fired: emitter_stats.rto_fired,
     })
 }
 
