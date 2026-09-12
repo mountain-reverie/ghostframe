@@ -351,10 +351,20 @@ async fn drive_session(
     let mut heartbeat_seq: u32 = scene.frames.len() as u32;
 
     // Two independent bounds so a stuck scene fails loudly instead of
-    // hanging: `MAX_ITERS` guards against a pathological loop that somehow
-    // keeps making "progress" without advancing virtual time, and
-    // `overall_deadline` guards virtual time itself (derived from
-    // `scene.duration`, the only time budget the scene declares).
+    // hanging: `MAX_ITERS` guards the loop, and `overall_deadline` guards
+    // virtual time itself (derived from `scene.duration`, the only time
+    // budget the scene declares).
+    //
+    // `MAX_ITERS` is reached by two very different situations, and the bail
+    // message distinguishes them because they were once confused for each
+    // other. The rare one is a genuine pathological loop making "progress"
+    // without advancing virtual time. The common one is simply a scene busy
+    // enough that 5,000 iterations cover only a few virtual seconds: under
+    // `start_paused`, tokio advances the clock only when every task goes
+    // idle, so traffic volume and virtual-time throughput trade off directly.
+    // A 4x4 Cdf53 grid over 8 frames at 10% loss lands around 3,700 events
+    // and ~2-5 virtual seconds per 5,000 iterations — i.e. it exhausts this
+    // budget while perfectly healthy.
     const MAX_ITERS: usize = 5_000;
     let overall_deadline = base + scene.duration;
     let mut iter: usize = 0;
@@ -364,7 +374,22 @@ async fn drive_session(
         if iter > MAX_ITERS {
             bail!(
                 "seed {seed}: scene did not finish within {MAX_ITERS} iterations; \
-                 last events observed: {events:?}"
+                 progress: virtual_elapsed={}us of {}us, events={}, \
+                 frames_injected={next_frame_idx}/{}, session_ready={session_ready}, \
+                 bytes_delivered={bytes_delivered}, bytes_dropped={bytes_dropped}.\n\
+                 \n\
+                 If session_ready is true and frames_injected is complete and bytes \
+                 are still flowing, this is NOT a stall — it is the iteration budget \
+                 running out before the virtual-time budget. Under `start_paused` \
+                 tokio advances the clock only when every task goes idle, so a \
+                 high-traffic scene spends many iterations per virtual microsecond \
+                 and can burn {MAX_ITERS} iterations in a few virtual seconds. Lower \
+                 the scene's traffic (fewer frames or a smaller grid) or raise \
+                 MAX_ITERS; do not go looking for a deadlock.",
+                now_us(base),
+                (overall_deadline - base).as_micros(),
+                events.len(),
+                scene.frames.len(),
             );
         }
         if TokioInstant::now() >= overall_deadline {
