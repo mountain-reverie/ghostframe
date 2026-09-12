@@ -9,7 +9,7 @@
     "build:wasm:node": "wasm-pack build ../ghostframe-client-wasm --target nodejs --out-dir ../ghostframe-web-client/pkg-node",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.test.json",
-    "test": "npm run build:wasm:node && npm run typecheck && vitest run",
+    "test": "npm run build:wasm:node && npm run build:wasm && npm run typecheck && vitest run",
     "test:watch": "vitest"
   },
   "devDependencies": {
