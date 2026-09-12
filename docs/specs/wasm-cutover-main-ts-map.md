@@ -285,3 +285,27 @@ regression.
 - `pkg-node/ghostframe_client_wasm.d.ts` was rebuilt via
   `npm run build:wasm:node` before being read, per the plan's instruction to
   verify rather than trust.
+
+## Known inefficiency: CDF53 is prevalidated twice
+
+Under `TileDelivery::Payload`, `reassembly.rs:392` calls `prevalidate_cdf53`
+to drive coverage bookkeeping, the NACK decision and the deferred ACK — then
+emits `TilePayload` carrying the **raw wire payload**, discarding the
+prevalidated `bit_planes` it just computed (`reassembly.rs:424-437`).
+
+`renderer.pushCdf53` needs those bit planes, so `main.ts` must call the
+standalone `prevalidateCdf53` export and RLE-decode the same 3 × 128-byte
+planes a second time, per pass, per tile.
+
+**This plan accepts the double decode.** The alternative — having
+`TilePayload` carry `bit_planes` for `Cdf53` — changes what the `payload`
+field means per codec, and redesigning the event contract during the one
+irreversible step of this migration is the wrong trade. The standalone export
+is already proven: `prevalidate_cdf53.test.ts` was retargeted at it and every
+assertion held.
+
+It is a performance question, not a correctness one, and it is bounded: the
+work is an RLE expansion of 384 bytes, in wasm, on tiles that actually receive
+CDF53 passes. Worth measuring before optimising — and worth measuring
+alongside the bundle regression already recorded in
+`wasm-bundle-baseline.md`, since both land in the same step.
