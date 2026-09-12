@@ -276,25 +276,57 @@ Same rule that governed step 3b. A pixel assertion that fails is reporting a rea
 
 **Only after 4a is merged and CI is green.**
 
-### Task 6: Delete the TypeScript protocol layer
+### Task 6: Delete the TypeScript protocol layer — seven of ten modules
 
-**Files:** Delete `ghostframe-web-client/src/{ack,nack,fec,parity_decoder,feedback,prevalidate,prevalidate_cdf53,cdf53_coverage,decode_error_batcher,palette_shadow}.ts`
+**Scope narrowed after a finding in Task 3.** `src/webgpu/` — an explicit spec
+non-goal — imports three of the ten modules, two of them as **runtime values**:
 
-`decoder.ts` is **not** deleted wholesale: lines 1–134 are wire-format decode that goes, but `FullFrameDecoder` (136–185) wraps the browser's `VideoDecoder`/`VideoFrame` and is platform glue that stays. Split it.
+```
+webgpu/renderer.ts:7   import { PaletteShadow } from '../palette_shadow.js';
+webgpu/renderer.ts:8   import { prevalidatePalRle, PalRleVariant, type PalRleEntry } from '../prevalidate.js';
+webgpu/renderer.ts:9   import type { PrevalidatedCdf53 } from '../prevalidate_cdf53.js';
+webgpu/cdf53.ts:1      import type { PrevalidatedCdf53 } from '../prevalidate_cdf53.js';
+webgpu/palrle.ts:2     import type { PalRleEntry } from '../prevalidate.js';
+```
 
-- [ ] **Step 1: Confirm each is unreferenced**
+The renderer keeps its **own** `paletteShadow` (`renderer.ts:63`) and
+prevalidates PalRLE itself at drain time (`:294`), applying bundled upserts
+before thin entries in the same rAF (`:303`). Deleting those modules would
+require editing `src/webgpu/`.
+
+**Decision: delete the seven that are safe; keep three for the renderer.**
+The alternative — rewiring the renderer to consume wasm-prevalidated entries —
+is architecturally better but moves prevalidation out of the drain-time batch,
+where upsert-before-thin ordering is load-bearing and only the CI-only e2e
+suite would catch a mistake. Not a trade worth making inside the irreversible
+step.
+
+**Delete (7):** `ack.ts`, `nack.ts`, `fec.ts`, `parity_decoder.ts`,
+`feedback.ts`, `cdf53_coverage.ts`, `decode_error_batcher.ts`.
+
+**Keep (3 + 1):** `prevalidate.ts`, `prevalidate_cdf53.ts`,
+`palette_shadow.ts` — renderer dependencies. And `decoder.ts` **whole**: it
+holds both `Codec` (a `const enum` at :16, used by the new dispatcher) and
+`FullFrameDecoder` (:136, platform glue). The earlier plan's split of that
+file is unnecessary.
+
+**Accepted residue:** PalRLE is prevalidated twice and palette state lives in
+two places. That is partial drift surviving the migration, and it is now a
+scoped follow-up rather than a surprise. Record it in the map doc.
+
+- [ ] **Step 1: Confirm each of the seven is unreferenced**
 
 ```bash
 cd /home/cedric/work/ghostframe/ghostframe-web-client
-for m in ack nack fec parity_decoder feedback prevalidate prevalidate_cdf53 \
-         cdf53_coverage decode_error_batcher palette_shadow; do
-  printf "%-24s %s\n" "$m" "$(grep -rl "from '.*$m'" src/ tests/ | tr '\n' ' ')"
+for m in ack nack fec parity_decoder feedback cdf53_coverage decode_error_batcher; do
+  printf "%-24s %s\n" "$m" "$(grep -rl "from '.*/$m'" src/ tests/ | tr '\n' ' ')"
 done
 ```
 
-Anything still referenced from `src/` means the rewiring missed a call site. **Stop and fix that**, do not delete a module that is still in use.
+Anything still referenced from `src/` means Task 3 missed a call site.
+**Stop and fix that** — do not delete a module still in use.
 
-- [ ] **Step 2: Delete, build, commit**
+- [ ] **Step 2: Delete, build, test, commit**
 
 ```bash
 npm run build && npm test
