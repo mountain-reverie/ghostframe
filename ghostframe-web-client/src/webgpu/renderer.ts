@@ -2,18 +2,9 @@ import { initWebGpu, type WebGpuInitResult } from './init.js';
 import { Framebuffer } from './framebuffer.js';
 import { SolidPipeline, type SolidTile } from './solid.js';
 import { H264Pipeline } from './h264.js';
-import { PalRlePipeline } from './palrle.js';
-import { Cdf53Pipeline } from './cdf53.js';
-import { PaletteShadow } from '../palette_shadow.js';
-import { prevalidatePalRle, PalRleVariant, type PalRleEntry } from '../prevalidate.js';
-import type { PrevalidatedCdf53 } from '../prevalidate_cdf53.js';
+import { PalRlePipeline, type PalRleTile } from './palrle.js';
+import { Cdf53Pipeline, type PrevalidatedCdf53 } from './cdf53.js';
 import { shouldSkipEncodePresent } from './idle_skip.js';
-
-export interface PalRleQueued {
-  tileX: number;
-  tileY: number;
-  payload: Uint8Array;
-}
 
 export interface RawQueued {
   tileX: number;
@@ -41,7 +32,7 @@ export class WebGpuRenderer {
   palrlePipeline: PalRlePipeline;
   cdf53Pipeline: Cdf53Pipeline;
 
-  palRleQueue: PalRleQueued[] = [];
+  palRleQueue: PalRleTile[] = [];
   solidQueue: SolidTile[] = [];
   rawQueue: RawQueued[] = [];
   h264Queue: VideoFrame[] = [];
@@ -60,7 +51,6 @@ export class WebGpuRenderer {
   // counter. An idle page should grow raf without growing submit.
   public submitCount: number = 0;
 
-  paletteShadow = new PaletteShadow();
   private errorsReadbackInFlight = false;
   // Held until next tick so they aren't closed before drawing.
   private videoFramesToClose: VideoFrame[] = [];
@@ -221,7 +211,6 @@ export class WebGpuRenderer {
 
     const zeros = new Uint8Array(16 * 1024);
     this.device.queue.writeBuffer(this.palrlePipeline.paletteAtlas, 0, zeros);
-    this.paletteShadow.clear();
     this.cdf53Pipeline.clearAllState();
     // Session reset wipes the framebuffer texture (caller is expected to
     // resize / repaint); flag dirty so the next encodeAndPresentFrame
@@ -229,7 +218,7 @@ export class WebGpuRenderer {
     this.framebufferDirty = true;
   }
 
-  pushPalRle(entry: PalRleQueued): void {
+  pushPalRle(entry: PalRleTile): void {
     this.palRleQueue.push(entry);
     this.framebufferDirty = true;
   }
@@ -288,23 +277,14 @@ export class WebGpuRenderer {
     ) {
       return { palrle: 0, solid: 0, raw: 0, h264: 0, cdf53: 0 };
     }
-    // ---- Steps 1-2: Drain palette updates + pre-validate PalRle batch ----
-    const palRleEntries: PalRleEntry[] = [];
-    for (const q of this.palRleQueue) {
-      const r = prevalidatePalRle(q.payload, this.paletteShadow, q.tileX, q.tileY);
-      if (!r.ok) {
-        onDecodeError(2 /* Codec.PalRle */, q.tileX, q.tileY, r.errorCode);
-        continue;
-      }
-      // Bundled upserts palette to the atlas immediately so subsequent
-      // thin/indices_raw entries in the same rAF see the palette.
-      if (r.entry.variant === PalRleVariant.Bundled && r.entry.paletteUpsert) {
-        this.palrlePipeline.upsertPalette(r.entry.paletteId, r.entry.paletteUpsert);
-        this.paletteShadow.put(r.entry.paletteId, r.entry.count);
-      }
-      palRleEntries.push(r.entry);
-    }
-    this.palRleQueue.length = 0;
+    // ---- Steps 1-2: move the prevalidated PalRle batch into the frame ----
+    // The core prevalidates in wire order and emits `Event::PaletteUpdated`
+    // ahead of the `TilePayload` it belongs to; `main.ts` applies each
+    // upsert on arrival, strictly before this drain. No re-validation and
+    // no palette upsert happen here anymore — see the design doc's "Why
+    // the drain-time ordering constraint dissolves".
+    const palRleEntries: PalRleTile[] = this.palRleQueue;
+    this.palRleQueue = [];
 
     // ---- Step 3: pack Solid instances ----
     const solidCount = this.solidPipeline.packAndUpload(this.solidQueue);
