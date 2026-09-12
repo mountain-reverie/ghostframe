@@ -15,7 +15,7 @@ pub mod palette_shadow;
 pub mod parity_decoder;
 mod reassembly;
 pub use cdf53_coverage::CoverageEntry;
-pub use event::{DecodeErrorCode, Event, PollOutput, TileKey};
+pub use event::{DecodeErrorCode, Event, PollOutput, TileData, TileKey};
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
