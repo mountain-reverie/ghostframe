@@ -18,7 +18,16 @@ import { initDiagnostics } from './diagnostics.js';
 import { prevalidateCdf53 } from './prevalidate_cdf53.js';
 import { applyCdf53Arrival, type Cdf53CoverageEntry } from './cdf53_coverage.js';
 import { bootstrap } from './bootstrap.js';
-import init, { WasmClientCore, tileNackEnvelope } from '../pkg-web/ghostframe_client_wasm.js';
+import init, {
+  WasmClientCore,
+  tileNackEnvelope,
+  // Aliased: the TS `prevalidateCdf53` import above (from prevalidate_cdf53.js)
+  // stays in scope because the now-orphaned `finishAssembly` still calls it.
+  // This is the standalone wasm export the live TilePayload/Cdf53 dispatch
+  // path uses instead — see the map doc's "CDF53 is prevalidated twice"
+  // section for why a second prevalidation call is required here at all.
+  prevalidateCdf53 as prevalidateCdf53Wasm,
+} from '../pkg-web/ghostframe_client_wasm.js';
 
 /** Microsecond clock for every `now_us` parameter WasmClientCore expects. */
 const nowUs = (): bigint => BigInt(Math.round(performance.now() * 1000));
@@ -477,14 +486,27 @@ async function main() {
     });
   });
 
-  // Reliable-tile-emitter FEC counters — surfaced via the periodic
-  // `fec-coverage` log line (sibling to `cdf53-coverage`) for side-by-side
-  // wire-loss inspection. The counters move once the ParityDecoder dispatch
-  // branches below route 0x04 envelopes and record source datagrams.
-  // (`nackSent` is declared earlier now — fed by drainTransmit.)
-  let fecRecovered = 0;
-  let fecParityRx = 0;
-  let fecParityUnrecoverable = 0;
+  // Reliable-tile-emitter FEC counters — RETIRED, not live.
+  //
+  // These used to be fed by the TS parity branch removed from the receive
+  // loop (0x04 TILE_PARITY_ENVELOPE dispatch + ParityDecoder.recordSource).
+  // Parity recovery is now internal to `WasmClientCore::handle_datagram`
+  // (ghostframe-client-core/src/reassembly.rs) and does not report itself
+  // as an event — a recovered source datagram is just folded back into
+  // reassembly with no `Event` marking that it happened. There is no
+  // `WasmEvent` variant to re-derive per-datagram parity-rx / recovered /
+  // unrecoverable counts from (see docs/specs/wasm-cutover-main-ts-map.md
+  // Part 2's event list — nothing there carries this).
+  //
+  // Left frozen at 0 these would misread as "no packet loss recovered" on
+  // a session that in fact recovered plenty internally. The `fec-coverage`
+  // log line below prints them as an explicit "n/a" instead, so a reader
+  // can tell "not measured" from "measured zero" — the same distinction
+  // the FEC-counter section of this task's brief calls out. This is a
+  // real observability loss versus pre-cutover: `nack_sent` (tile-level,
+  // still fed by drainTransmit below) remains the only wire-loss signal
+  // visible in this log line post-cutover.
+  const FEC_COUNTER_NOT_MEASURED = 'n/a(wasm-internal)';
 
   // ParityDecoder window: server emits one parity per K=10 source group with
   // +2K interleave offset, so the decoder needs to hold at least the in-flight
@@ -506,6 +528,197 @@ async function main() {
   let latestFrameSeq = 0;
   let firstTileRendered = false;
   let frameDimensionsKnown = false;
+
+  // Serde mirror of `ghostframe-client-wasm/src/boundary.rs`'s `WasmEvent`,
+  // confirmed against the generated source and recorded in
+  // docs/specs/wasm-cutover-main-ts-map.md Part 2. `handleDatagram` and
+  // `onTimeout` return `any` in the .d.ts (serde_wasm_bindgen erases the
+  // type at the boundary); this is the real shape crossing it.
+  type WasmEvent =
+    | { kind: 'TileReady'; frame_seq: number; tile_x: number; tile_y: number; rgba: Uint8Array }
+    | {
+        kind: 'TilePayload';
+        frame_seq: number;
+        tile_x: number;
+        tile_y: number;
+        pass_idx: number;
+        generation: number;
+        /** `Codec` repr(u8) discriminant: Skip=0, H264=1, PalRle=2, Solid=3, Raw=4, Cdf53=5. */
+        codec: number;
+        payload: Uint8Array;
+      }
+    | { kind: 'PaletteUpdated'; palette_id: number; colors: [number, number, number, number][] }
+    | { kind: 'FrameDimensions'; width: number; height: number }
+    | {
+        kind: 'NeedsH264';
+        frame_seq: number;
+        timestamp_us: number;
+        is_keyframe: boolean;
+        payload: Uint8Array;
+      }
+    | { kind: 'DecodeError'; codec: number; tile_x: number; tile_y: number; code: number };
+
+  // Flat mirror of `WasmPrevalidatedCdf53` (units.rs), the shape returned by
+  // the standalone `prevalidateCdf53Wasm` free function. Field names differ
+  // from the TS `PrevalidatedCdf53` (prevalidate_cdf53.ts) that
+  // `renderer.pushCdf53` expects — adapted at the call site below rather
+  // than touching the renderer.
+  type WasmPrevalidatedCdf53Result = {
+    ok: boolean;
+    code: number;
+    generation: number;
+    pass_idx: number;
+    bit_planes: Uint8Array;
+  };
+
+  /**
+   * Renders one event out of `core.handleDatagram`/`core.onTimeout`.
+   *
+   * `TileReady` should never occur: this client always constructs the core
+   * with `tile_delivery_payload = true`, and
+   * `ghostframe-client-core/tests/tile_delivery.rs` asserts "Payload mode
+   * must not emit TileReady". No rendering path is built for it — a build
+   * for real would silently mask a wrong core configuration.
+   *
+   * `DecodeError` only reaches counters here as a placeholder — the ten
+   * at-risk protocol-derived `window.__*` globals (including the two
+   * Cdf53-fail counters this event would otherwise feed) are wired and
+   * proven live in a later task; wiring them here would race that work.
+   */
+  function handleEvent(ev: WasmEvent): void {
+    switch (ev.kind) {
+      case 'TileReady': {
+        console.error(
+          'Unexpected TileReady event: core was constructed with ' +
+          'tile_delivery_payload=true, so Payload-mode reassembly should ' +
+          'never emit this. No rendering path exists for it.',
+          ev,
+        );
+        break;
+      }
+
+      case 'TilePayload': {
+        switch (ev.codec) {
+          case Codec.Raw:
+            renderer.pushRaw({ tileX: ev.tile_x, tileY: ev.tile_y, bgra: ev.payload });
+            break;
+          case Codec.Solid:
+            // main.ts only ever painted Solid when the payload was exactly
+            // 4B — preserved from the old finishAssembly guard.
+            if (ev.payload.byteLength === 4) {
+              renderer.pushSolid({ tileX: ev.tile_x, tileY: ev.tile_y, bgra: ev.payload });
+            }
+            break;
+          case Codec.PalRle:
+            renderer.pushPalRle({ tileX: ev.tile_x, tileY: ev.tile_y, payload: ev.payload });
+            break;
+          case Codec.Cdf53: {
+            // Known double decode (accepted — see the map doc's final
+            // section): the core already prevalidated this payload once,
+            // internally, to drive coverage/NACK/ACK bookkeeping, then
+            // handed back the raw wire payload rather than the bit planes
+            // it discarded. `renderer.pushCdf53` needs those bit planes, so
+            // they're recomputed here via the standalone wasm export.
+            const r = prevalidateCdf53Wasm(
+              ev.payload,
+              ev.generation,
+              ev.pass_idx,
+            ) as WasmPrevalidatedCdf53Result;
+            if (r.ok) {
+              renderer.pushCdf53({
+                tileX: ev.tile_x,
+                tileY: ev.tile_y,
+                gen: r.generation,
+                passIdx: r.pass_idx,
+                bitPlanes: r.bit_planes,
+              });
+            } else {
+              // The core already validated this exact payload successfully
+              // before emitting TilePayload at all — a failure here means
+              // the standalone export and the core's internal prevalidation
+              // have diverged. That's a real bug, not a wire-loss event.
+              console.error(
+                `prevalidateCdf53Wasm disagreed with the core's own ` +
+                `prevalidation for tile (${ev.tile_x},${ev.tile_y}) ` +
+                `gen=${ev.generation} pass=${ev.pass_idx}: code=${r.code}`,
+              );
+            }
+            break;
+          }
+          default:
+            console.error(`TilePayload with unrecognised codec ${ev.codec}`, ev);
+        }
+
+        if (!firstTileRendered) {
+          firstTileRendered = true;
+          const sample = Array.from(ev.payload.slice(0, 16))
+            .map(b => b.toString(16).padStart(2, '0'))
+            .join(' ');
+          log(`First tile: (${ev.tile_x},${ev.tile_y}) ${ev.payload.byteLength}B`);
+          log(`First bytes: ${sample}`);
+          statusEl.textContent = 'Receiving frames';
+        }
+        break;
+      }
+
+      case 'PaletteUpdated': {
+        // Not optional: palrle_decode.wgsl decodes against this table, and
+        // the shadow driving prevalidation now lives in wasm. Skipping this
+        // wiring wouldn't error — it would render wrong colours, the
+        // hardest failure mode to trace back to a missing event handler.
+        //
+        // Same upload path `webgpu/renderer.ts`'s own drain-time
+        // `prevalidatePalRle` call already uses for a Bundled entry
+        // (renderer.ts: `this.palrlePipeline.upsertPalette(...)`) — so this
+        // reaches the exact atlas buffer + `__h2_clientPaletteWrites` log
+        // the pre-cutover TS path wrote to, not a parallel copy.
+        //
+        // `colors` is `Vec<[u8;4]>` in BGRA order (event.rs: "Colours are
+        // BGRA, matching the wire and the palette table") — flatten to the
+        // packed Uint8Array `upsertPalette` expects.
+        const bgra = new Uint8Array(ev.colors.length * 4);
+        ev.colors.forEach((c, i) => bgra.set(c, i * 4));
+        renderer.palrlePipeline.upsertPalette(ev.palette_id, bgra);
+        break;
+      }
+
+      case 'FrameDimensions': {
+        const oldW = renderer.framebuffer.width;
+        const oldH = renderer.framebuffer.height;
+        renderer.resize(ev.width, ev.height);
+        // `seq` is diagnostic-only (fifo-logged to
+        // window.__ghostframeRecordedResizes, never asserted on — see the
+        // map doc). Unlike the old sentinel-tile path, this event carries
+        // no frame_seq to attribute the resize to; 0 is a placeholder.
+        diag.recordResize({ seq: 0, oldW, oldH, newW: ev.width, newH: ev.height, trigger: 'sentinel' });
+        frameDimensionsKnown = true;
+        break;
+      }
+
+      case 'NeedsH264': {
+        if (!fullFrameDecoder) {
+          fullFrameDecoder = new FullFrameDecoder((frame: VideoFrame) => {
+            renderer.pushH264(frame);
+          }, 1920, 1080);
+        }
+        fullFrameDecoder.decode(ev.payload, ev.is_keyframe);
+
+        if (!firstTileRendered) {
+          firstTileRendered = true;
+          log(`First full frame: ${ev.payload.byteLength}B ${ev.is_keyframe ? '(keyframe)' : ''}`);
+          statusEl.textContent = 'Receiving frames';
+        }
+        break;
+      }
+
+      case 'DecodeError': {
+        // Counters land in a later task (see the doc comment above
+        // handleEvent). Reachable now so the switch is exhaustive and the
+        // event isn't silently swallowed.
+        break;
+      }
+    }
+  }
 
   // M3.5 bench: per-frame_seq earliest datagram-receive timestamp.
   // Keyed by frameSeq (uint32); cleared after the corresponding frame is painted.
@@ -915,50 +1128,15 @@ async function main() {
     __rafTicks++;
     diag.recordRafTick(__rafTicks);
 
-    // Reliable-tile-emitter: scan partial assemblies for fragment timeouts
-    // and feed missing frag_idxs into the NackBatcher.
-    scanForAssemblyTimeouts(performance.now(), assemblies.values());
-
-    // Tail-fallback sweep: catch tiles where:
-    //   (a) the FINAL pass is lost — gap detection can't see it because
-    //       no higher pass arrives, OR
-    //   (b) a previously-NACKed pass + its retransmit were both lost —
-    //       gap detection has already marked it in nackedMask so it
-    //       won't re-fire from arrivals.
-    // Fires every TAIL_SWEEP_INTERVAL_MS at most; only acts on tiles
-    // whose bitmap hasn't gained a new bit in TAIL_FALLBACK_MS AND
-    // are still incomplete. Re-NACKs everything missing AND clears
-    // nackedMask for those bits so gap detection can fire again if a
-    // higher pass arrives later (after a long stall).
-    const tickNowMs = performance.now();
-    if (tickNowMs - __lastTailSweepMs > TAIL_SWEEP_INTERVAL_MS) {
-      __lastTailSweepMs = tickNowMs;
-      const cov = (window as any).__cdf53Coverage as
-        | Map<number, Cdf53CoverageEntry>
-        | undefined;
-      if (cov) {
-        for (const [tileKey, v] of cov.entries()) {
-          if (v.passMask === FULL_PASS_MASK) continue;
-          if (tickNowMs - v.lastChangeMs < TAIL_FALLBACK_MS) continue;
-          const tileX = (tileKey >> 8) & 0xFF;
-          const tileY = tileKey & 0xFF;
-          const missing = ~v.passMask & FULL_PASS_MASK;
-          for (let p = 0; p < 14; p++) {
-            if ((missing & (1 << p)) !== 0) {
-              queuePassNack(v.frameSeq, tileX, tileY, p);
-            }
-          }
-          // Clear nackedMask for the missing bits so gap detection can
-          // fire again if normal arrivals resume after this stall.
-          v.nackedMask &= ~missing;
-          // Reset the change timer so we don't re-NACK on the very next
-          // sweep — give the server a TAIL_FALLBACK_MS window to respond.
-          // Real progress will overwrite this via the coverage-update
-          // path on the next pass arrival.
-          v.lastChangeMs = tickNowMs;
-        }
-      }
-    }
+    // Assembly-timeout NACKs, the tail-fallback sweep, and the periodic
+    // feedback/ACK/NACK flush deadlines are now internal to
+    // `ClientCore::on_timeout` (ghostframe-client-core/src/lib.rs) — a
+    // byte-for-byte port of the scan/sweep this replaced, per the map doc.
+    // `drainTransmit` is async; `tick()` is not (it's the rAF callback), so
+    // this is a floating promise rather than an awaited call — deliberate,
+    // logged rather than left an unhandled rejection.
+    for (const ev of core.onTimeout(nowUs())) handleEvent(ev);
+    drainTransmit().catch((e) => console.warn('tick(): drainTransmit failed', e));
 
     // M3.5 bench: emit recordFramePainted for all frames whose last tile was
     // received before this rAF tick. Uses performance.now() at rAF entry so
@@ -1067,13 +1245,13 @@ async function main() {
       // Reliable-tile-emitter coverage: FEC recoveries + parity / NACK traffic.
       // Pairs with the server's reliability counters (Task 35) for side-by-side
       // wire-loss inspection. `parity_rx` / `recovered` / `parity_unrecoverable`
-      // stay at 0 until ParityDecoder (parity_decoder.ts, Task 21) is wired
-      // into the dispatch path; `nack_sent` is live (counted at the
-      // NackBatcher sender wrapper above).
+      // print an explicit "not measured" sentinel — see FEC_COUNTER_NOT_MEASURED's
+      // definition for why these can no longer be fed post-cutover; `nack_sent`
+      // stays live (fed by drainTransmit inspecting the core's own NACK output).
       const fecCoverageLine =
-        `fec-coverage: recovered=${fecRecovered} ` +
-        `parity_rx=${fecParityRx} ` +
-        `parity_unrecoverable=${fecParityUnrecoverable} ` +
+        `fec-coverage: recovered=${FEC_COUNTER_NOT_MEASURED} ` +
+        `parity_rx=${FEC_COUNTER_NOT_MEASURED} ` +
+        `parity_unrecoverable=${FEC_COUNTER_NOT_MEASURED} ` +
         `nack_sent=${nackSent}`;
       // Phase 1 Task 10: per-tier (passes 0-3 critical vs 4-13 refinement)
       // receive rates over the last stats window, computed from the byte
@@ -1091,7 +1269,10 @@ async function main() {
       const lineKey =
         `r:${counts.raw}|s:${counts.solid}|p:${counts.palrle}|c:${counts.cdf53}|h:${counts.h264}|` +
         `seq:${w.__lastTileSeq ?? '-'}|cov:${cdf53Refined}/${cdf53Partial}/${cdf53Tiles}|hist:${histCompact}|` +
-        `fec:${fecRecovered}/${fecParityRx}/${fecParityUnrecoverable}/${nackSent}|` +
+        // Retired counters dropped from the dedup key entirely (see
+        // FEC_COUNTER_NOT_MEASURED) — they're constant now, so keeping them
+        // here would only ever contribute a no-op comparison.
+        `fec:${nackSent}|` +
         `bwe:${bytesRecvCritical}/${bytesRecvRefinement}`;
       const statsChanged = lineKey !== __lastStatsLineKey;
       if (statsChanged) {
@@ -1333,7 +1514,13 @@ async function main() {
     }
   }
 
-  // Receive datagrams.
+  // Receive datagrams. Parity envelopes, ping/pong text, frame-level H.264
+  // reassembly and tile-level reassembly all used to be hand-routed here;
+  // the wasm core now owns parity recovery and reassembly for both, so the
+  // loop reduces to a length guard, the ping/pong backward-compat carve-out
+  // (which predates the tile protocol and the core has no concept of it —
+  // it must run before handleDatagram ever sees the bytes), and rendering
+  // whatever events come back.
   const reader = transport.datagrams.readable.getReader();
   while (true) {
     const { value, done } = await reader.read();
@@ -1341,29 +1528,9 @@ async function main() {
 
     if (!value || value.byteLength === 0) continue;
 
-    // Reliable-tile-emitter: TILE_PARITY (0x04) envelope. Routed before the
-    // ping/pong < 20 byte guard because the discriminator is unambiguous and
-    // an empty-group parity could in principle be small. ParityDecoder.
-    // receiveParity returns a fully-formed source datagram if it can XOR-
-    // recover a single missing source from a buffered K=10 group; we route
-    // that recovered datagram through handleSourceTileDatagram so the
-    // assembler + dispatch see it indistinguishably from a real wire arrival.
-    if (value[0] === TILE_PARITY_ENVELOPE) {
-      fecParityRx++;
-      try {
-        const parityHeader = parseParityEnvelope(value);
-        const recovered = parityDecoder.receiveParity(parityHeader);
-        if (recovered !== null) {
-          fecRecovered++;
-          handleSourceTileDatagram(recovered);
-        }
-      } catch {
-        fecParityUnrecoverable++;
-      }
-      continue;
-    }
-
-    // Backward compat: small text datagrams (ping/pong).
+    // Backward compat: small text datagrams (ping/pong). NOT protocol —
+    // this predates the tile protocol and the core has no concept of it,
+    // so it must be handled before handleDatagram ever sees the bytes.
     if (value.byteLength < 20) {
       const text = new TextDecoder().decode(value);
       log(`Received: ${text} (${value.byteLength} bytes)`);
@@ -1374,108 +1541,8 @@ async function main() {
       continue;
     }
 
-    if (value.byteLength < DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE) {
-      log(`Datagram too short: ${value.byteLength} bytes`);
-      continue;
-    }
-
-    const view = new DataView(value.buffer, value.byteOffset, value.byteLength);
-
-    if (!isTileDatagram(view, 0)) {
-      // Frame-level datagram.
-      if (value.byteLength < FRAME_HEADER_SIZE) continue;
-
-      const frameHdr = decodeFrameHeader(view, 0);
-      lossTracker.onDatagram();
-      stats.frameDatagrams++;
-
-      if (frameHdr.frameSeq < latestFullFrameSeq - 2) continue;
-      if (frameHdr.frameSeq > latestFullFrameSeq) {
-        latestFullFrameSeq = frameHdr.frameSeq;
-      }
-
-      for (const [k, asm] of frameAssemblies) {
-        const seq = parseInt(k.split(':')[1], 10);
-        if (seq < latestFullFrameSeq - 2) {
-          if (asm.received < asm.fragments.length) {
-            lossTracker.onStaleTile(asm.fragments.length, asm.received);
-          }
-          frameAssemblies.delete(k);
-        }
-      }
-
-      if (frameHdr.fragIdx >= frameHdr.fragTotal) continue;
-
-      const fKey = frameKey(frameHdr.frameSeq);
-      const payloadOffset = FRAME_HEADER_SIZE;
-      const fragData = new Uint8Array(
-        value.buffer, value.byteOffset + payloadOffset,
-        value.byteLength - payloadOffset,
-      );
-
-      let asm = frameAssemblies.get(fKey);
-      if (!asm) {
-        asm = {
-          header: frameHdr,
-          fragments: new Array(frameHdr.fragTotal).fill(null),
-          received: 0,
-        };
-        frameAssemblies.set(fKey, asm);
-      }
-
-      if (asm.fragments[frameHdr.fragIdx] === null) {
-        asm.fragments[frameHdr.fragIdx] = fragData.slice();
-        asm.received += 1;
-      }
-
-      if (asm.received === frameHdr.fragTotal) {
-        frameAssemblies.delete(fKey);
-
-        const totalLen = asm.fragments.reduce((acc, f) => acc + (f ? f.byteLength : 0), 0);
-        const payload = new Uint8Array(totalLen);
-        let off = 0;
-        for (const frag of asm.fragments) {
-          if (frag) { payload.set(frag, off); off += frag.byteLength; }
-        }
-
-        if (!fullFrameDecoder) {
-          fullFrameDecoder = new FullFrameDecoder((frame: VideoFrame) => {
-            renderer.pushH264(frame);
-          }, 1920, 1080);
-        }
-
-        fullFrameDecoder.decode(payload, asm.header.isKeyframe);
-
-        if (!firstTileRendered) {
-          firstTileRendered = true;
-          log(`First full frame: ${payload.byteLength}B ${asm.header.isKeyframe ? '(keyframe)' : ''}`);
-          statusEl.textContent = 'Receiving frames';
-        }
-      }
-
-      continue;
-    }
-
-    // --- Tile-level datagram processing ---
-    //
-    // Feed every source datagram into the ParityDecoder's window so a
-    // subsequently-arriving parity envelope can XOR-recover any of the K=10
-    // sources in its group. recordSource also probes pending parities — if a
-    // delayed source arrival completes a buffered group, the recovered source
-    // datagram is replayed through handleSourceTileDatagram.
-    // wire_seq lives at offset 8..12 BE of the DatagramHeader (Task 1).
-    const wireSeq = view.getUint32(8, false);
-    // Defensive copy: ParityDecoder retains the buffer in its window for
-    // future XOR ops, and the WebTransport reader may reuse `value`'s
-    // backing buffer for the next datagram.
-    const sourceCopy = value.slice();
-    const replayed = parityDecoder.recordSource(wireSeq, sourceCopy);
-    if (replayed !== null) {
-      fecRecovered++;
-      handleSourceTileDatagram(replayed);
-    }
-
-    handleSourceTileDatagram(value);
+    for (const ev of core.handleDatagram(value, nowUs()) as WasmEvent[]) handleEvent(ev);
+    await drainTransmit();
   }
 }
 
@@ -1483,3 +1550,4 @@ main().catch((e) => {
   log(`Error: ${e.message}`);
   statusEl.textContent = `Error: ${e.message}`;
 });
+
