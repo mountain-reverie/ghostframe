@@ -18,9 +18,11 @@ import { initDiagnostics } from './diagnostics.js';
 import { prevalidateCdf53 } from './prevalidate_cdf53.js';
 import { applyCdf53Arrival, type Cdf53CoverageEntry } from './cdf53_coverage.js';
 import { bootstrap } from './bootstrap.js';
+import { recordProtocolEvent, type Cdf53ErrorCodes } from './cdf53_globals.js';
 import init, {
   WasmClientCore,
   tileNackEnvelope,
+  errorCodes,
   // Aliased: the TS `prevalidateCdf53` import above (from prevalidate_cdf53.js)
   // stays in scope because the now-orphaned `finishAssembly` still calls it.
   // This is the standalone wasm export the live TilePayload/Cdf53 dispatch
@@ -389,6 +391,12 @@ async function main() {
   // and hand back RGBA instead — wrong, and it would look like it worked.
   const core = new WasmClientCore(true, renderer.h264Supported, true, nowUs());
 
+  // The three CDF53 `DecodeErrorCode` discriminants, read from the wasm
+  // export rather than hardcoded 8/9/10 — a drifting discriminant should
+  // break `recordProtocolEvent`'s classification loudly, not silently stop
+  // matching. See docs/specs/wasm-cutover-main-ts-map.md Part 3.
+  const cdf53ErrorCodes = errorCodes() as unknown as Cdf53ErrorCodes;
+
   type WasmPollOutput = { kind: 'Datagram' | 'Stream'; bytes: Uint8Array };
 
   /** Drain every pending outbound buffer, routing it to the right wire. */
@@ -580,12 +588,15 @@ async function main() {
    * must not emit TileReady". No rendering path is built for it — a build
    * for real would silently mask a wrong core configuration.
    *
-   * `DecodeError` only reaches counters here as a placeholder — the ten
-   * at-risk protocol-derived `window.__*` globals (including the two
-   * Cdf53-fail counters this event would otherwise feed) are wired and
-   * proven live in a later task; wiring them here would race that work.
+   * The five protocol-derived `window.__*` test globals
+   * (docs/specs/wasm-cutover-main-ts-map.md Part 3) are re-derived from
+   * every event here via `recordProtocolEvent`, in `cdf53_globals.ts` — the
+   * same function a Node driver calls in
+   * `tests/cdf53_globals.test.ts` against `pkg-node`, so the logic that
+   * updates them is never duplicated.
    */
   function handleEvent(ev: WasmEvent): void {
+    recordProtocolEvent(window as any, ev as any, Codec.Cdf53, cdf53ErrorCodes, performance.now());
     switch (ev.kind) {
       case 'TileReady': {
         console.error(

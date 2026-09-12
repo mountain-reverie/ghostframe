@@ -22,64 +22,9 @@
 //     directly in Rust, no string parsing involved)
 import { describe, it, expect } from 'vitest';
 import * as wasm from '../pkg-node/ghostframe_client_wasm.js';
+import { fragmentTile } from './helpers/wasm.js';
 
-const TILE_DATAGRAM_FLAG = 0x80000000;
 const RAW_CODEC = 4; // ghostframe_protocol::protocol::Codec::Raw
-
-function u32be(n: number): number[] {
-  return [(n >>> 24) & 0xff, (n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff];
-}
-function u16be(n: number): number[] {
-  return [(n >>> 8) & 0xff, n & 0xff];
-}
-
-/**
- * Builds tile-datagram fragments matching `ghostframe_protocol::protocol`'s
- * `fragment_tile` wire layout exactly:
- *   [DatagramHeader 16B: frame_seq|frag_idx|frag_total|wire_seq|timestamp_us]
- *   [TileHeader 8B: tile_x|tile_y|(codec<<1|lz4)|(generation<<4|pass)|payload_len]
- *   [payload chunk]
- * `wire_seq` is UNSTAMPED_WIRE_SEQ (0); `timestamp_us` is 0 — neither is
- * read by the reassembly path these tests exercise.
- */
-function fragmentTile(
-  frameSeq: number,
-  tileX: number,
-  tileY: number,
-  codec: number,
-  generation: number,
-  pass: number,
-  payload: Uint8Array,
-  maxFragmentPayload: number,
-): Uint8Array[] {
-  const chunks: Uint8Array[] = [];
-  if (payload.length === 0) {
-    chunks.push(new Uint8Array(0));
-  } else {
-    for (let i = 0; i < payload.length; i += maxFragmentPayload) {
-      chunks.push(payload.slice(i, i + maxFragmentPayload));
-    }
-  }
-  const fragTotal = chunks.length;
-  return chunks.map((chunk, idx) => {
-    const header = new Uint8Array([
-      ...u32be(frameSeq | TILE_DATAGRAM_FLAG),
-      ...u16be(idx),
-      ...u16be(fragTotal),
-      ...u32be(0), // wire_seq (UNSTAMPED_WIRE_SEQ)
-      ...u32be(0), // timestamp_us
-      tileX,
-      tileY,
-      (codec << 1) | 0, // lz4 = false
-      ((generation & 0x0f) << 4) | (pass & 0x0f),
-      ...u32be(payload.length),
-    ]);
-    const out = new Uint8Array(header.length + chunk.length);
-    out.set(header, 0);
-    out.set(chunk, header.length);
-    return out;
-  });
-}
 
 /** BGRA payload -> the RGBA bytes `Codec::Raw` decode produces (swizzle,
  * alpha passed through), matching `finish_assembly`'s `Codec::Raw` arm. */
