@@ -404,6 +404,153 @@ fn payload_mode_really_stores_the_palette_not_just_reports_it() {
     );
 }
 
+/// Pins the design's sharpest risk directly: `renderer.ts` used to guarantee
+/// a Bundled palette upsert landed before any thin tile referencing it by
+/// upserting mid-drain-loop. That loop is gone. The replacement claim is that
+/// `ClientCore` prevalidates in wire order and emits `PaletteUpdated` before
+/// the `TilePayload` it belongs to, so `main.ts` applies the palette on
+/// arrival — strictly before the rAF drain that used to do the ordering.
+///
+/// A thin tile against an unknown palette fails with `ThinUncachedPalette`,
+/// so the thin tile here producing a `TilePayload` (assertion b) is the
+/// load-bearing check: it proves the shadow was updated in time. It fails
+/// loudly if ordering regresses, which is exactly what a colour error would
+/// not do. Assertion (a) additionally pins that `PaletteUpdated` precedes the
+/// `TilePayload` in the emitted sequence, not merely that both occurred.
+///
+/// See `palette_then_thin_reversed_order_fails_with_thin_uncached_palette`
+/// for the other half of the pin: this test alone would also pass if
+/// ordering did not matter at all, so that companion test proves the
+/// opposite order genuinely fails.
+#[test]
+fn bundled_palette_precedes_thin_tile_payload_in_event_order() {
+    use ghostframe_protocol::codec::pal_rle::{encode_pal_rle_payload, PaletteEntry};
+
+    let mut colors = [[0u8; 4]; 16];
+    colors[0] = [10, 20, 30, 255];
+    colors[1] = [40, 50, 60, 255];
+    let entry = PaletteEntry { colors, count: 2 };
+    let packed = [0u8; 512];
+
+    let mut core = core_with(TileDelivery::Payload);
+    let mut events = Vec::new();
+
+    // Wire order: Bundled tile establishing palette 5 first...
+    let bundled = encode_pal_rle_payload(&packed, &entry, 5, true);
+    for dg in tile_datagrams(1, 0, 0, Codec::PalRle, 0, &bundled, 1200) {
+        events.extend(core.handle_datagram(&dg, 0));
+    }
+
+    // ...then a thin tile referencing palette 5, carrying no colours of its
+    // own.
+    let thin = encode_pal_rle_payload(&packed, &entry, 5, false);
+    for dg in tile_datagrams(2, 1, 0, Codec::PalRle, 0, &thin, 1200) {
+        events.extend(core.handle_datagram(&dg, 0));
+    }
+
+    let palette_updated_pos = events
+        .iter()
+        .position(|e| matches!(e, Event::PaletteUpdated { palette_id: 5, .. }))
+        .unwrap_or_else(|| panic!("expected a PaletteUpdated for palette 5, got {events:?}"));
+
+    let thin_tile_payload_pos = events
+        .iter()
+        .position(|e| {
+            matches!(
+                e,
+                Event::TilePayload {
+                    frame_seq: 2,
+                    data: TileData::PalRle { palette_id: 5, .. },
+                    ..
+                }
+            )
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "thin tile did not produce a TilePayload — likely rejected as \
+                 ThinUncachedPalette, meaning the palette was not applied in \
+                 time; got {events:?}"
+            )
+        });
+
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            Event::DecodeError {
+                code: ghostframe_client_core::DecodeErrorCode::ThinUncachedPalette,
+                ..
+            }
+        )),
+        "thin tile must not be rejected as uncached when the bundled tile \
+         arrived first, got {events:?}"
+    );
+
+    assert!(
+        palette_updated_pos < thin_tile_payload_pos,
+        "PaletteUpdated (index {palette_updated_pos}) must precede the thin \
+         tile's TilePayload (index {thin_tile_payload_pos}) in the emitted \
+         event sequence, got {events:?}"
+    );
+}
+
+/// The other half of the pin. A test that passes under both orderings is not
+/// testing ordering — so this reverses the wire order from the test above
+/// (thin tile first, Bundled second) and asserts the thin tile genuinely
+/// fails with `ThinUncachedPalette` against an empty shadow. Together the two
+/// tests show palette-then-thin succeeds and thin-then-palette fails, which
+/// pins the mechanism rather than a coincidence of test construction.
+#[test]
+fn palette_then_thin_reversed_order_fails_with_thin_uncached_palette() {
+    use ghostframe_protocol::codec::pal_rle::{encode_pal_rle_payload, PaletteEntry};
+
+    let mut colors = [[0u8; 4]; 16];
+    colors[0] = [10, 20, 30, 255];
+    colors[1] = [40, 50, 60, 255];
+    let entry = PaletteEntry { colors, count: 2 };
+    let packed = [0u8; 512];
+
+    let mut core = core_with(TileDelivery::Payload);
+    let mut events = Vec::new();
+
+    // Wire order reversed: thin tile referencing palette 5 first, while the
+    // shadow is still empty...
+    let thin = encode_pal_rle_payload(&packed, &entry, 5, false);
+    for dg in tile_datagrams(1, 0, 0, Codec::PalRle, 0, &thin, 1200) {
+        events.extend(core.handle_datagram(&dg, 0));
+    }
+
+    // ...then the Bundled tile that would have installed it.
+    let bundled = encode_pal_rle_payload(&packed, &entry, 5, true);
+    for dg in tile_datagrams(2, 1, 0, Codec::PalRle, 0, &bundled, 1200) {
+        events.extend(core.handle_datagram(&dg, 0));
+    }
+
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::DecodeError {
+                code: ghostframe_client_core::DecodeErrorCode::ThinUncachedPalette,
+                ..
+            }
+        )),
+        "thin tile arriving before any Bundled tile for its palette must \
+         fail with ThinUncachedPalette, got {events:?}"
+    );
+
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            Event::TilePayload {
+                frame_seq: 1,
+                data: TileData::PalRle { palette_id: 5, .. },
+                ..
+            }
+        )),
+        "the thin tile must not produce a TilePayload when its palette is \
+         unknown, got {events:?}"
+    );
+}
+
 /// The Decoded path must be untouched. Same input, pixels out, and the first
 /// pixel resolves through palette entry 0.
 #[test]
