@@ -16,6 +16,15 @@
 // `ghostframe-web-client/tests/cdf53_globals.test.ts` for the proof that
 // each of the five actually moves.
 
+/** Mirror of `WasmTileData` (boundary.rs), tagged on `codec`. `PalRle` and
+ * `Cdf53` carry the core's prevalidated product, not the raw wire bytes —
+ * see `TileData` in `event.rs`. */
+export type ProtocolTileData =
+  | { codec: 'Raw'; bytes: Uint8Array }
+  | { codec: 'Solid'; bytes: Uint8Array }
+  | { codec: 'PalRle'; palette_id: number; count: number; indices: Uint8Array }
+  | { codec: 'Cdf53'; pass_idx: number; bit_planes: Uint8Array };
+
 /** The two event kinds this module cares about. Structurally matches the
  * corresponding arms of `main.ts`'s `WasmEvent` (itself mirroring
  * `ghostframe-client-wasm/src/boundary.rs`), but declared independently so
@@ -33,8 +42,8 @@ export type ProtocolEvent =
       frame_seq: number;
       tile_x: number;
       tile_y: number;
-      codec: number;
-      payload: Uint8Array;
+      generation: number;
+      data: ProtocolTileData;
     }
   | { kind: 'DecodeError'; codec: number; tile_x: number; tile_y: number; code: number };
 
@@ -72,6 +81,22 @@ export interface Cdf53ErrorCodes {
  * main.ts:836). */
 const MAX_H5_LOG = 32768;
 
+/** `ghostframe_protocol::protocol::Codec` discriminants (decoder.ts's
+ * `Codec` enum), keyed by the `TileData`/`ProtocolTileData` tag. Used only
+ * to keep `__h5_tilePushLog`'s `codec` field numeric, matching its
+ * pre-cutover shape and `globals.d.ts`'s ambient declaration. */
+const CODEC_DISCRIMINANT: Record<ProtocolTileData['codec'], number> = {
+  Raw: 4,
+  Solid: 3,
+  PalRle: 2,
+  Cdf53: 5,
+};
+
+/** `ghostframe_protocol::protocol::Codec::Cdf53`. `DecodeError` still
+ * carries this as a raw numeric discriminant (boundary.rs's `codec: u8`) —
+ * unlike `TilePayload`, it never had a `TileData` to move the tag into. */
+const CDF53_CODEC = CODEC_DISCRIMINANT.Cdf53;
+
 /** First up to `n` bytes of `bytes`, as lowercase hex — mirrors the
  * pre-cutover `h5c0` computation (former main.ts:820-827) so the e2e
  * diagnostic dumps that parse this field see the same shape. */
@@ -98,7 +123,6 @@ function hexPrefix(bytes: Uint8Array, n = 8): string {
 export function recordProtocolEvent(
   globals: ProtocolGlobals,
   ev: ProtocolEvent,
-  cdf53Codec: number,
   cdf53ErrorCodes: Cdf53ErrorCodes,
   nowMs: number,
 ): void {
@@ -107,15 +131,17 @@ export function recordProtocolEvent(
   const log = (globals.__h5_tilePushLog ??= []);
 
   if (ev.kind === 'TilePayload') {
+    const d = ev.data;
+    const bytes = d.codec === 'PalRle' ? d.indices : d.codec === 'Cdf53' ? d.bit_planes : d.bytes;
     log.push({
       seq: ev.frame_seq,
       tx: ev.tile_x,
       ty: ev.tile_y,
-      codec: ev.codec,
-      c0: hexPrefix(ev.payload),
+      codec: CODEC_DISCRIMINANT[d.codec],
+      c0: hexPrefix(bytes),
       ts: nowMs,
     });
-    if (ev.codec === cdf53Codec) {
+    if (d.codec === 'Cdf53') {
       // __cdf53DispatchSeen sums TilePayload (this, the success half) and
       // DecodeError (the failure half, below) for codec Cdf53. The old
       // counter incremented on every Cdf53 arrival *before* prevalidation
@@ -137,7 +163,7 @@ export function recordProtocolEvent(
       c0: `ERR:${ev.code}`,
       ts: nowMs,
     });
-    if (ev.codec === cdf53Codec) {
+    if (ev.codec === CDF53_CODEC) {
       globals.__cdf53DispatchSeen = (globals.__cdf53DispatchSeen ?? 0) + 1;
 
       const isCdf53Code =

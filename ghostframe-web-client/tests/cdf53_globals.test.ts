@@ -70,8 +70,8 @@ describe('protocol-derived test globals move (docs/specs/wasm-cutover-main-ts-ma
     const validFrags = fragmentTile(1, 3, 4, CDF53_CODEC, /*gen*/ 1, /*pass*/ 0, validCdf53PassPayload(), 1200);
     expect(validFrags.length).toBe(1);
     const validEvents = core.handleDatagram(validFrags[0], 0n) as any[];
-    expect(validEvents.some((e) => e.kind === 'TilePayload' && e.codec === CDF53_CODEC)).toBe(true);
-    for (const ev of validEvents) recordProtocolEvent(globals, ev, CDF53_CODEC, codes, 1);
+    expect(validEvents.some((e) => e.kind === 'TilePayload' && e.data.codec === 'Cdf53')).toBe(true);
+    for (const ev of validEvents) recordProtocolEvent(globals, ev, codes, 1);
 
     const afterValid = snapshot();
     expect(afterValid.dispatchSeen).toBe(1);
@@ -88,7 +88,7 @@ describe('protocol-derived test globals move (docs/specs/wasm-cutover-main-ts-ma
     const badFrags = fragmentTile(2, 3, 4, CDF53_CODEC, /*gen*/ 1, /*pass*/ 14, validCdf53PassPayload(), 1200);
     const badEvents = core.handleDatagram(badFrags[0], 0n) as any[];
     expect(badEvents.some((e) => e.kind === 'DecodeError' && e.codec === CDF53_CODEC)).toBe(true);
-    for (const ev of badEvents) recordProtocolEvent(globals, ev, CDF53_CODEC, codes, 2);
+    for (const ev of badEvents) recordProtocolEvent(globals, ev, codes, 2);
 
     const afterBad = snapshot();
     // __cdf53DispatchSeen sums TilePayload + DecodeError for codec Cdf53 —

@@ -1,4 +1,4 @@
-import { Codec, FullFrameDecoder } from './decoder.js';
+import { FullFrameDecoder } from './decoder.js';
 import { WebGpuRenderer } from './webgpu/renderer.js';
 import { WebGpuUnavailableError } from './webgpu/init.js';
 import { attachInputCapture } from './input/wire';
@@ -11,12 +11,6 @@ import init, {
   WasmClientCore,
   tileNackEnvelope,
   errorCodes,
-  // Aliased: the TS `prevalidateCdf53` import above (from prevalidate_cdf53.js)
-  // stays in scope because the now-orphaned `finishAssembly` still calls it.
-  // This is the standalone wasm export the live TilePayload/Cdf53 dispatch
-  // path uses instead — see the map doc's "CDF53 is prevalidated twice"
-  // section for why a second prevalidation call is required here at all.
-  prevalidateCdf53 as prevalidateCdf53Wasm,
 } from '../pkg-web/ghostframe_client_wasm.js';
 
 /** Microsecond clock for every `now_us` parameter WasmClientCore expects. */
@@ -482,6 +476,15 @@ async function main() {
   // docs/specs/wasm-cutover-main-ts-map.md Part 2. `handleDatagram` and
   // `onTimeout` return `any` in the .d.ts (serde_wasm_bindgen erases the
   // type at the boundary); this is the real shape crossing it.
+  // `TileData`'s mirror (boundary.rs's `WasmTileData`), tagged on `codec`.
+  // `PalRle` and `Cdf53` arrive prevalidated — the core already computed the
+  // GPU-ready product, so there is no second prevalidation call here.
+  type WasmTileData =
+    | { codec: 'Raw'; bytes: Uint8Array }
+    | { codec: 'Solid'; bytes: Uint8Array }
+    | { codec: 'PalRle'; palette_id: number; count: number; indices: Uint8Array }
+    | { codec: 'Cdf53'; pass_idx: number; bit_planes: Uint8Array };
+
   type WasmEvent =
     | { kind: 'TileReady'; frame_seq: number; tile_x: number; tile_y: number; rgba: Uint8Array }
     | {
@@ -489,11 +492,8 @@ async function main() {
         frame_seq: number;
         tile_x: number;
         tile_y: number;
-        pass_idx: number;
         generation: number;
-        /** `Codec` repr(u8) discriminant: Skip=0, H264=1, PalRle=2, Solid=3, Raw=4, Cdf53=5. */
-        codec: number;
-        payload: Uint8Array;
+        data: WasmTileData;
       }
     | { kind: 'PaletteUpdated'; palette_id: number; colors: [number, number, number, number][] }
     | { kind: 'FrameDimensions'; width: number; height: number }
@@ -505,19 +505,6 @@ async function main() {
         payload: Uint8Array;
       }
     | { kind: 'DecodeError'; codec: number; tile_x: number; tile_y: number; code: number };
-
-  // Flat mirror of `WasmPrevalidatedCdf53` (units.rs), the shape returned by
-  // the standalone `prevalidateCdf53Wasm` free function. Field names differ
-  // from the TS `PrevalidatedCdf53` (prevalidate_cdf53.ts) that
-  // `renderer.pushCdf53` expects — adapted at the call site below rather
-  // than touching the renderer.
-  type WasmPrevalidatedCdf53Result = {
-    ok: boolean;
-    code: number;
-    generation: number;
-    pass_idx: number;
-    bit_planes: Uint8Array;
-  };
 
   /**
    * Renders one event out of `core.handleDatagram`/`core.onTimeout`.
@@ -536,7 +523,7 @@ async function main() {
    * updates them is never duplicated.
    */
   function handleEvent(ev: WasmEvent): void {
-    recordProtocolEvent(window as any, ev as any, Codec.Cdf53, cdf53ErrorCodes, performance.now());
+    recordProtocolEvent(window as any, ev as any, cdf53ErrorCodes, performance.now());
     switch (ev.kind) {
       case 'TileReady': {
         console.error(
@@ -549,63 +536,48 @@ async function main() {
       }
 
       case 'TilePayload': {
-        switch (ev.codec) {
-          case Codec.Raw:
-            renderer.pushRaw({ tileX: ev.tile_x, tileY: ev.tile_y, bgra: ev.payload });
+        const d = ev.data;
+        let sampleBytes: Uint8Array;
+        switch (d.codec) {
+          case 'Raw':
+            renderer.pushRaw({ tileX: ev.tile_x, tileY: ev.tile_y, bgra: d.bytes });
+            sampleBytes = d.bytes;
             break;
-          case Codec.Solid:
-            // main.ts only ever painted Solid when the payload was exactly
-            // 4B — preserved from the old finishAssembly guard.
-            if (ev.payload.byteLength === 4) {
-              renderer.pushSolid({ tileX: ev.tile_x, tileY: ev.tile_y, bgra: ev.payload });
-            }
+          case 'Solid':
+            renderer.pushSolid({ tileX: ev.tile_x, tileY: ev.tile_y, bgra: d.bytes });
+            sampleBytes = d.bytes;
             break;
-          case Codec.PalRle:
-            renderer.pushPalRle({ tileX: ev.tile_x, tileY: ev.tile_y, payload: ev.payload });
+          case 'PalRle':
+            renderer.pushPalRle({
+              tileX: ev.tile_x,
+              tileY: ev.tile_y,
+              paletteId: d.palette_id,
+              count: d.count,
+              indices: d.indices,
+            });
+            sampleBytes = d.indices;
             break;
-          case Codec.Cdf53: {
-            // Known double decode (accepted — see the map doc's final
-            // section): the core already prevalidated this payload once,
-            // internally, to drive coverage/NACK/ACK bookkeeping, then
-            // handed back the raw wire payload rather than the bit planes
-            // it discarded. `renderer.pushCdf53` needs those bit planes, so
-            // they're recomputed here via the standalone wasm export.
-            const r = prevalidateCdf53Wasm(
-              ev.payload,
-              ev.generation,
-              ev.pass_idx,
-            ) as WasmPrevalidatedCdf53Result;
-            if (r.ok) {
-              renderer.pushCdf53({
-                tileX: ev.tile_x,
-                tileY: ev.tile_y,
-                gen: r.generation,
-                passIdx: r.pass_idx,
-                bitPlanes: r.bit_planes,
-              });
-            } else {
-              // The core already validated this exact payload successfully
-              // before emitting TilePayload at all — a failure here means
-              // the standalone export and the core's internal prevalidation
-              // have diverged. That's a real bug, not a wire-loss event.
-              console.error(
-                `prevalidateCdf53Wasm disagreed with the core's own ` +
-                `prevalidation for tile (${ev.tile_x},${ev.tile_y}) ` +
-                `gen=${ev.generation} pass=${ev.pass_idx}: code=${r.code}`,
-              );
-            }
+          case 'Cdf53':
+            // Prevalidated by the core (`reassembly.rs`'s `prevalidate_cdf53`
+            // call) — no second prevalidation here. See the design doc's
+            // "Why the drain-time ordering constraint dissolves".
+            renderer.pushCdf53({
+              tileX: ev.tile_x,
+              tileY: ev.tile_y,
+              gen: ev.generation,
+              passIdx: d.pass_idx,
+              bitPlanes: d.bit_planes,
+            });
+            sampleBytes = d.bit_planes;
             break;
-          }
-          default:
-            console.error(`TilePayload with unrecognised codec ${ev.codec}`, ev);
         }
 
         if (!firstTileRendered) {
           firstTileRendered = true;
-          const sample = Array.from(ev.payload.slice(0, 16))
+          const sample = Array.from(sampleBytes.slice(0, 16))
             .map(b => b.toString(16).padStart(2, '0'))
             .join(' ');
-          log(`First tile: (${ev.tile_x},${ev.tile_y}) ${ev.payload.byteLength}B`);
+          log(`First tile: (${ev.tile_x},${ev.tile_y}) ${sampleBytes.byteLength}B`);
           log(`First bytes: ${sample}`);
           statusEl.textContent = 'Receiving frames';
         }
