@@ -417,3 +417,38 @@ same `refinement_bandwidth_fraction`. `drain_refinement_pass_major`'s
 ordering is real and correct; it just never gets the chance to matter while
 critical and refinement passes compete for the same undifferentiated
 budget slice every tick.
+
+### Reading the 2.1 result precisely
+
+"Still ~1.0" undersells what the numbers say. Two things are visible.
+
+**The new metric is measurably more sensitive, as designed.** Mean ratio
+across the three batches:
+
+| Metric | Mean ratio | Range |
+|---|---:|---|
+| `last_sent_at -> ACK` | 0.987 | 0.968-0.996 |
+| `queued_at -> ACK` | **0.970** | 0.959-0.982 |
+
+`queued_at -> ACK` sits 1.6 points lower. It is picking up scheduler
+queueing that the emit-relative metric cannot see, which is exactly the
+reason it was built. That is a working instrument, not a null result.
+
+**Pass-major ordering produces a real but small advantage: ~3%.** A ratio of
+0.970 means critical passes are confirmed delivered about 3% sooner than
+refinement ones. So `drain_refinement_pass_major` is not inert — it is simply
+not worth much at the current budget split.
+
+**The tail is where it fails.** Critical and refinement track within a point
+or two at *every* bucket, including 200-500 ms (16.6% vs 16.9%) and 500+ ms
+(2.3% vs 2.4%). Queueing delay under load shows up in the tail, and that is
+precisely where the ordering is buying nothing.
+
+That pattern — a few percent at the mean, nothing at the tail — is what the
+design predicted for outcome 2: intra-drain ordering cannot help a pass that
+has not been reached yet, because earlier frames' refinement work consumed
+the tick budget first. Ordering within a slice does not matter when the slice
+itself is the constraint.
+
+**So Stage 2.3 targets the budget split, not the drain order**, and the
+number to beat is a 0.970 mean ratio with no tail separation — not 1.0.
