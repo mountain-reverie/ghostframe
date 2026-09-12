@@ -257,7 +257,15 @@ fn palrle_in_payload_mode_applies_and_reports_the_palette() {
     colors[0] = [10, 20, 30, 255];
     colors[1] = [40, 50, 60, 255];
     let entry = PaletteEntry { colors, count: 2 };
-    let packed = [0u8; 512];
+    // A non-trivial index pattern, not all zeros: two runs the RLE has to
+    // encode and the prevalidator has to expand back. With count = 2 the only
+    // legal indices are 0 and 1, so 0x10 is the pixel pair (0, 1) — low nibble
+    // first — and 0x01 is (1, 0). An implementation that returned a correctly
+    // sized zero buffer would pass against an all-zero input; it cannot pass
+    // against this one.
+    let mut packed = [0u8; 512];
+    packed[..256].fill(0x10);
+    packed[256..].fill(0x01);
     let bundled = encode_pal_rle_payload(&packed, &entry, 5, true);
 
     let events = drive_one_tile(TileDelivery::Payload, Codec::PalRle, &bundled);
@@ -282,8 +290,8 @@ fn palrle_in_payload_mode_applies_and_reports_the_palette() {
     // the test never re-decoded the wire RLE to check its content. Now the
     // prevalidated fields sit directly on the event, so assert them: this is
     // the exact product palrle_decode.wgsl consumes, which is a strengthened
-    // check, not a relocated one. `packed` is all zeros, so the expanded
-    // indices must be too.
+    // check, not a relocated one. The input pattern is
+    // non-uniform, so the expansion is actually checked.
     let payload: Vec<_> = events
         .iter()
         .filter_map(|e| match e {
@@ -309,7 +317,14 @@ fn palrle_in_payload_mode_applies_and_reports_the_palette() {
         "TilePayload must reference the same palette slot"
     );
     assert_eq!(payload[0].1, 2);
-    assert_eq!(payload[0].2, vec![0u8; 512]);
+    let mut expected_indices = vec![0u8; 512];
+    expected_indices[..256].fill(0x10);
+    expected_indices[256..].fill(0x01);
+    assert_eq!(
+        payload[0].2, expected_indices,
+        "indices must be the expanded 512-byte buffer the shader reads, \
+         round-tripped through the wire RLE"
+    );
 
     assert!(
         !events.iter().any(|e| matches!(e, Event::TileReady { .. })),
