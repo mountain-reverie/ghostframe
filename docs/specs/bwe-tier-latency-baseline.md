@@ -113,9 +113,28 @@ pacer's regression check must not get away with either.
 Pooled mean, max, and bucket-percentage distributions are nearly identical
 between `Critical` (passes 0-3) and `Refinement` (passes 4-13) — within
 noise of each other at every bucket. This is the expected, and diagnostic,
-pre-pacing result: nothing in the current emission path (a single FIFO
-`EmissionQueue`, AIMD byte budget, no priority ordering) distinguishes the
-two tiers today, so their latency distributions come out the same. **This
+pre-pacing result — but the reason is more specific than "no priority
+ordering exists", and Stage 2 should start from the specific version.
+
+`Scheduler` **does** already have two queues, `priority_queue` and
+`refinement_queue` (`scheduler.rs:77`, `:80`), with a split byte budget and a
+defined drain order. They just do not split along the tier axis:
+
+- `enqueue_at` (`:209`) puts fresh, non-CDF53 tile work in `priority_queue`.
+- `enqueue_refinement_at` (`:735`) pushes **every** CDF53 pass — `pass_idx` 0
+  through 13 alike — into `refinement_queue`, in arrival order.
+
+So `Critical` (0-3) and `Refinement` (4-13) are both in the *same* queue,
+drained FIFO. The existing split is "CDF53 progressive passes vs everything
+else", which is a different axis from the one this instrumentation measures.
+That is why the two tiers come out identical: nothing has ever ordered them
+relative to each other.
+
+**This makes Stage 2 smaller than "pacer restructure" suggests.** The
+machinery — two queues, a split budget, a drain order — already exists. What
+is missing is tier-awareness *inside* `refinement_queue`: either split it in
+two, or order its drain by `pass_tier`. Starting from a rewrite would
+discard working code and a working budget split. **This
 is precisely the gap Stage 2's six-priority-queue pacer is meant to close**
 — if the pacer works, `Critical` should separate from `Refinement` in favor
 of `Critical`, at least in the tail (the 100-500+ ms buckets, which is where
