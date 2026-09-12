@@ -127,8 +127,33 @@ as wrong colours rather than an error.
 | `src/prevalidate.ts` | the renderer's only caller of `prevalidatePalRle` goes |
 | `src/palette_shadow.ts` | the renderer's shadow goes |
 | `src/prevalidate_cdf53.ts` | `main.ts`'s second prevalidation goes; `PrevalidatedCdf53` becomes a renderer-local type |
-| `src/decode_error_batcher.ts` | its remaining caller reports the renderer's own prevalidation failures, which no longer exist |
-| `src/feedback.ts` | only the kept prevalidators needed its `ERR_*` constants |
+| ~~`src/decode_error_batcher.ts`~~ | **Wrong — it stays.** See below. |
+| ~~`src/feedback.ts`~~ | **Wrong — it stays**, because `decode_error_batcher.ts` imports `encodeDecodeError` from it. |
+
+**Correction, found during implementation.** This table claimed
+`decode_error_batcher.ts`'s remaining caller "reports the renderer's own
+prevalidation failures, which no longer exist". That is wrong, and it
+conflated two unrelated error sources.
+
+Its live caller is `main.ts`'s `tick()` via `renderer.encodeAndPresentFrame`'s
+`onDecodeError`, fed by `palrlePipeline.encodeErrorsReadback` — which reads an
+atomic buffer written by **`palrle_decode.wgsl` itself**:
+
+```wgsl
+// palrle_decode.wgsl:63
+atomicStore(&errors[wg.x], 5u);  // ERR_INDEX_OOB
+```
+
+That is a GPU shader-level bounds check on palette indices, reported at
+`renderer.ts:382` with placeholder tile coordinates. It is independent of the
+CPU-side prevalidation that moved into `client-core`, it still fires, and it
+still needs a reporting path. `feedback.ts` stays with it, since
+`decode_error_batcher.ts` imports `encodeDecodeError` from it.
+
+**So this change deletes three modules, not five:** `prevalidate.ts`,
+`prevalidate_cdf53.ts` and `palette_shadow.ts`. The remaining two are not
+drift — they serve a live shader-level safety net that has no Rust equivalent,
+because the check happens on the GPU.
 
 `decoder.ts` stays: it holds `FullFrameDecoder` (WebCodecs glue) and `Codec`.
 `Codec` may become unused in `main.ts` once the dispatcher switches on `data`,
