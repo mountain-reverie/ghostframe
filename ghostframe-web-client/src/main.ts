@@ -1,22 +1,11 @@
-import {
-  DATAGRAM_HEADER_SIZE, TILE_HEADER_SIZE, TILE_SIZE, Codec,
-  decodeDatagramHeader, decodeTileHeader, tileKey, TileAssembly,
-  FRAME_HEADER_SIZE, TILE_DATAGRAM_FLAG, FrameAssembly,
-  isTileDatagram, decodeFrameHeader, frameKey, FullFrameDecoder,
-  FRAME_DIMENSIONS_SENTINEL_X, FRAME_DIMENSIONS_SENTINEL_Y,
-} from './decoder.js';
+import { Codec, FullFrameDecoder } from './decoder.js';
 import { WebGpuRenderer } from './webgpu/renderer.js';
 import { WebGpuUnavailableError } from './webgpu/init.js';
-import { ParityRecovery } from './fec';
-import { ParityDecoder, parseParityEnvelope, TILE_PARITY_ENVELOPE } from './parity_decoder.js';
 import { LossTracker } from './feedback';
 import { attachInputCapture } from './input/wire';
 import { DecodeErrorBatcher } from './decode_error_batcher';
-import { AckBatcher } from './ack';
-import { NackBatcher } from './nack.js';
 import { initDiagnostics } from './diagnostics.js';
 import { prevalidateCdf53 } from './prevalidate_cdf53.js';
-import { applyCdf53Arrival, type Cdf53CoverageEntry } from './cdf53_coverage.js';
 import { bootstrap } from './bootstrap.js';
 import { recordProtocolEvent, type Cdf53ErrorCodes } from './cdf53_globals.js';
 import init, {
@@ -345,7 +334,6 @@ async function main() {
   log('Connected!');
   statusEl.textContent = 'Connected';
 
-  const parityMap = new Map<string, ParityRecovery>();
   const lossTracker = new LossTracker();
 
   // Open the feedback bidi stream. Used for: HELLO (one-shot at connect),
@@ -363,11 +351,9 @@ async function main() {
     }
   })();
 
-  // ACK/NACK datagram writer. Declared here (moved up from its historical
-  // position just above ackBatcher, further down) because drainTransmit's
-  // Datagram branch needs it immediately: the core queues its HELLO output
-  // at construction, and that queue is drained below before anything else
-  // touches the feedback stream.
+  // ACK/NACK datagram writer, needed by drainTransmit immediately: the
+  // core queues its HELLO output at construction, and that queue is
+  // drained below before anything else touches the feedback stream.
   const ackWriter = transport.datagrams.writable.getWriter();
   let ackWriteLogged = false;
 
@@ -475,29 +461,14 @@ async function main() {
     }, 100);
   }
 
-  // Full-frame decoder and reassembly state.
+  // Full-frame decoder state.
   let fullFrameDecoder: FullFrameDecoder | null = null;
-  const frameAssemblies = new Map<string, FrameAssembly>();
-  let latestFullFrameSeq = 0;
-
-  // Batched ACK sender — fire-and-forget unreliable datagrams. `ackWriter`
-  // and `ackWriteLogged` are declared earlier now (needed by drainTransmit
-  // before this point). The catch logs the first error per writer so a
-  // broken ACK path is discoverable; subsequent writes are silent to avoid
-  // spamming during normal teardown.
-  const ackBatcher = new AckBatcher((dg) => {
-    ackWriter.write(dg).catch((err) => {
-      if (!ackWriteLogged) {
-        console.warn('ACK datagram write failed:', err);
-        ackWriteLogged = true;
-      }
-    });
-  });
 
   // Reliable-tile-emitter FEC counters — RETIRED, not live.
   //
   // These used to be fed by the TS parity branch removed from the receive
-  // loop (0x04 TILE_PARITY_ENVELOPE dispatch + ParityDecoder.recordSource).
+  // loop (0x04 TileParityEnvelope dispatch + the TS parity decoder's
+  // recordSource, both now deleted).
   // Parity recovery is now internal to `WasmClientCore::handle_datagram`
   // (ghostframe-client-core/src/reassembly.rs) and does not report itself
   // as an event — a recovered source datagram is just folded back into
@@ -516,24 +487,6 @@ async function main() {
   // visible in this log line post-cutover.
   const FEC_COUNTER_NOT_MEASURED = 'n/a(wasm-internal)';
 
-  // ParityDecoder window: server emits one parity per K=10 source group with
-  // +2K interleave offset, so the decoder needs to hold at least the in-flight
-  // source datagrams covering 4 × K groups to allow late-source recovery once
-  // the offset parity arrives. See parity_decoder.ts (Task 21) and the
-  // server-side TileParityEnvelope emitter (Task 35).
-  const parityDecoder = new ParityDecoder(40);
-
-  // Reliable-tile-emitter NACK sender — reuses the same datagrams writer.
-  // Fire-and-forget; rejection from a closed stream is benign at this point.
-  // The wrapper increments `nackSent` by the entry-count in the envelope
-  // header (buf[1]) before forwarding to the writer.
-  const nackBatcher = new NackBatcher((buf) => {
-    if (buf.length >= 2) nackSent += buf[1];
-    ackWriter.write(buf).catch(() => {});
-  });
-
-  const assemblies = new Map<string, TileAssembly>();
-  let latestFrameSeq = 0;
   let firstTileRendered = false;
   let frameDimensionsKnown = false;
 
@@ -761,72 +714,6 @@ async function main() {
   // Idle suppression: skip emission when the snapshot is identical to
   // the last one. No heartbeat; silence means nothing changed.
   let __lastStatsLineKey = '';
-  // Pass-level NACK strategy: gap-detection on receive + short
-  // tail-fallback. CDF53 passes are emitted by the server in pass-major
-  // order (0→13 per tile). When the wire delivers pass N for a tile but
-  // we don't yet have some pass M<N, M was either lost or is in-flight
-  // due to UDP reordering. Gap detection (in the per-pass receive
-  // handler above) queues a NACK for M immediately; the debounced
-  // flush below re-checks the bitmap a few rAF ticks later so an in-
-  // flight M that arrives in the debounce window cancels the NACK.
-  //
-  // The debounce is the only thing here measured in time. It's a tiny
-  // reordering tolerance, not a polling interval.
-  //
-  // Tail fallback: gap detection can't catch the FINAL pass being lost
-  // (no higher pass arrives to trigger detection). If a tile is below
-  // FULL_PASS_MASK and its bitmap hasn't gained a new bit in
-  // TAIL_FALLBACK_MS, NACK whatever is still missing.
-  const NACK_DEBOUNCE_MS = 50;
-  const TAIL_FALLBACK_MS = 1500;
-  const TAIL_SWEEP_INTERVAL_MS = 500;
-  const FULL_PASS_MASK = (1 << 14) - 1;
-  // Queue of NACKs awaiting debounce flush, keyed by string so
-  // duplicate gap-detections (same pass already pending) coalesce.
-  // The deferred flush re-checks the bitmap right before emitting,
-  // so an in-flight pass that lands during the debounce cancels
-  // itself out without server load.
-  type PendingNack = { frameSeq: number; tileX: number; tileY: number; passIdx: number };
-  const pendingNacks: Map<string, PendingNack> = new Map();
-  let nackFlushTimer: ReturnType<typeof setTimeout> | null = null;
-  function flushPendingNacks() {
-    nackFlushTimer = null;
-    if (pendingNacks.size === 0) return;
-    const cov = (window as any).__cdf53Coverage as
-      | Map<number, Cdf53CoverageEntry>
-      | undefined;
-    for (const entry of pendingNacks.values()) {
-      // Re-check the live bitmap right before sending. A pass that
-      // arrived during the debounce window is now flagged and we skip.
-      const tileKey = (entry.tileX << 8) | entry.tileY;
-      const v = cov?.get(tileKey);
-      if (v && (v.passMask & (1 << entry.passIdx)) !== 0) continue;
-      nackBatcher.add(
-        {
-          frameSeq: entry.frameSeq | TILE_DATAGRAM_FLAG,
-          tileX: entry.tileX,
-          tileY: entry.tileY,
-          passIdx: entry.passIdx,
-        },
-        0,
-      );
-    }
-    pendingNacks.clear();
-  }
-  function queuePassNack(frameSeq: number, tileX: number, tileY: number, passIdx: number): void {
-    const key = `${tileX}|${tileY}|${passIdx}`;
-    if (pendingNacks.has(key)) return;
-    pendingNacks.set(key, { frameSeq, tileX, tileY, passIdx });
-    if (nackFlushTimer === null) {
-      nackFlushTimer = setTimeout(flushPendingNacks, NACK_DEBOUNCE_MS);
-    }
-  }
-  // Make queuePassNack visible to the receive handler above by exposing
-  // it on the closure-shared symbol. (TS hoisting: function declarations
-  // are hoisted to the enclosing scope, so the per-pass handler above
-  // can call queuePassNack even though it lexically appears after.)
-  // No additional wiring needed.
-  let __lastTailSweepMs = 0;
   function tick() {
     __rafTicks++;
     diag.recordRafTick(__rafTicks);
@@ -910,7 +797,12 @@ async function main() {
       // The histogram exposes the *distribution* of pass counts so we
       // can tell e.g. "most are stuck at 8" (LL3 + a few bit-planes)
       // vs "most are at 14 but a handful missing one or two passes".
-      const cdf53Cov = (w.__cdf53Coverage ?? new Map<number, Cdf53CoverageEntry>()) as Map<number, Cdf53CoverageEntry>;
+      // `Cdf53CoverageEntry` (cdf53_coverage.ts) was deleted in Phase 4b
+      // along with its sole writer (finishAssembly); window.__cdf53Coverage
+      // is never populated post-cutover, so this map is always empty. Only
+      // `.passMask` was ever read here, so a minimal inline shape replaces
+      // the deleted type rather than pulling the module back in.
+      const cdf53Cov = (w.__cdf53Coverage ?? new Map<number, { passMask: number }>()) as Map<number, { passMask: number }>;
       let cdf53Refined = 0;
       let cdf53Partial = 0;
       const cdf53PassHist = new Array(15).fill(0); // bucket index = passes received (0..14)
