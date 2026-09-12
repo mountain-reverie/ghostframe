@@ -271,3 +271,149 @@ positive this document was written to prevent.
 Keep measuring `last_sent_at -> ACK` too: it is the one that would reveal a
 pacer *causing* wire queueing by overfilling the link, which is a real way
 for this work to go wrong.
+
+## BWE Stage 2.1: `queued_at -> ACK` re-baseline
+
+**Date:** 2026-09-12
+**Git rev:** `369dec12ce5b2d21bdc5ede6c03fb0ce77d92e41` (branch `spec/bwe-stage2`)
+**Parent:** `2cfea5c` (`docs(spec): BWE Stage 2 design`)
+
+This section answers the question the previous section raised: with
+`queued_at -> ACK` actually measurable, does the critical/refinement ratio
+move off the ~0.99 the `last_sent_at -> ACK` metric reported? **No
+scheduling code changed for this measurement** — only the plumbing
+(`TileWork::queued_at` -> `CacheEntry::queued_at` -> `BweSample` -> a second
+`TierLatencyStats` pair) and the ignored `bwe_tier_latency_baseline` test's
+printed output changed. The commit that landed the plumbing carries no
+functional diff to `Scheduler`, the emitter's drain order, or any budget.
+
+### What is being measured
+
+Identical scene, method, and test to the Stage 2.0 baseline above — same
+`busy_frames(2)` 4x4 CDF53 grid, 10% independent loss, 10 s duration, same
+seed sequence `0xB17E0000..`, same "10 successful runs per batch, retry on
+`MAX_ITERS` bail-out" protocol, same
+`cargo test -p ghostframe-e2e --test browserless_runner bwe_tier_latency_baseline -- --ignored --nocapture --test-threads=1`
+command, run 3 times. The only difference is the metric: `queued_at -> ACK`
+is reported alongside the existing `last_sent_at -> ACK`, both read off
+`BrowserlessResult` from the same runs.
+
+`queued_at` is `TileWork::queued_at` — the instant the scheduler enqueued
+the pass — carried unchanged through retransmits (unlike `last_sent_at`,
+which is overwritten on every retry). So `queued_at -> ACK` additionally
+counts however long a pass sat in `refinement_queue` before
+`drain_refinement_pass_major` ever picked it up, on top of everything
+`last_sent_at -> ACK` already counted.
+
+Batch 1 hit one `MAX_ITERS` bail-out (seed `0xB17E0007`, backfilled by
+`0xB17E000A`, same as the original Stage 2.0 baseline's batch 2 — same seed,
+same known heavy-tail run); batches 2 and 3 were 10/10 clean.
+
+### Sanity check: `queued_at -> ACK` >= `last_sent_at -> ACK`
+
+Confirmed for every one of the 30 successful runs across all 3 batches, at
+both the mean and the max, for both tiers — the re-baseline test now asserts
+this directly (`bwe_tier_latency_baseline`'s four `assert!`s) and it held
+without exception. `queued_at` starts at or before `last_sent_at` for the
+same sample by construction, so this is the expected floor, not a
+coincidence — but the brief asked for it to be checked rather than assumed,
+and all 3 batches (`cargo test ... -- --ignored --nocapture --test-threads=1`,
+run 3 times) passed clean.
+
+Both new accumulators are non-zero in both tiers in every run: pooled across
+all 30 runs, `queued_critical_latency_count` = 4,404 and
+`queued_refinement_latency_count` = 11,013 — the same population sizes as
+the existing `last_sent_at` counters, as expected since both pairs are fed
+from the same ACK batches at the same drain site.
+
+### Results (30 scene runs, pooled)
+
+| Metric | Tier | Runs | Samples | Pooled mean | Max |
+|---|---|---:|---:|---:|---:|
+| `last_sent_at -> ACK` | Critical (0-3) | 30 | 4,404 | 46.7 ms | 305.0 ms |
+| `last_sent_at -> ACK` | Refinement (4-13) | 30 | 11,013 | 47.5 ms | 305.0 ms |
+| `queued_at -> ACK` | Critical (0-3) | 30 | 4,404 | 103.9 ms | 1546.0 ms |
+| `queued_at -> ACK` | Refinement (4-13) | 30 | 11,013 | 106.8 ms | 1546.0 ms |
+
+`queued_at -> ACK`'s pooled mean is roughly double `last_sent_at -> ACK`'s
+for both tiers — consistent with the design's expectation that it adds
+scheduler queueing delay on top of the wire round trip. Sample counts are
+identical between the two metrics per tier, as they must be (same ACKs, two
+different start points).
+
+### Bucket distribution, `queued_at -> ACK` (all 30 runs pooled, ms)
+
+| Bucket | Critical count | Critical % | Refinement count | Refinement % |
+|---|---:|---:|---:|---:|
+| 0-5 | 20 | 0.5% | 44 | 0.4% |
+| 5-10 | 168 | 3.8% | 383 | 3.5% |
+| 10-20 | 531 | 12.1% | 1,172 | 10.6% |
+| 20-50 | 1,811 | 41.1% | 4,613 | 41.9% |
+| 50-100 | 482 | 10.9% | 1,217 | 11.1% |
+| 100-200 | 562 | 12.8% | 1,456 | 13.2% |
+| 200-500 | 729 | 16.6% | 1,860 | 16.9% |
+| 500+ | 101 | 2.3% | 268 | 2.4% |
+
+Per-bucket percentages track each other within a point or two at every
+bucket, including the 200-500 ms and 500+ tail buckets — the tail is not
+shifting in critical's favour. This is the more sensitive metric the
+previous section called for, and it shows the same "no separation" picture
+`last_sent_at -> ACK` showed, not a hidden effect the coarser metric missed.
+
+### The within-run ratio: still ~1.0
+
+| Batch | `last_sent_at` critical | `last_sent_at` refinement | `last_sent_at` ratio | `queued_at` critical | `queued_at` refinement | `queued_at` ratio |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 58.7 ms | 60.6 ms | 0.968 | 144.6 ms | 147.2 ms | 0.982 |
+| 2 | 40.1 ms | 40.3 ms | 0.996 | 81.3 ms | 83.8 ms | 0.970 |
+| 3 | 40.5 ms | 40.7 ms | 0.996 | 83.3 ms | 86.8 ms | 0.959 |
+
+| Metric | Ratio range | Spread |
+|---|---|---|
+| `last_sent_at -> ACK` ratio | 0.968-0.996 | 1.029x |
+| `queued_at -> ACK` ratio | 0.959-0.982 | 1.024x |
+
+Both metrics land in the same band, both consistently a hair below 1.0,
+and the `queued_at` ratio's batch-to-batch spread (1.024x) is no tighter or
+looser than `last_sent_at`'s (1.029x) — neither reads as a load-bearing
+effect against the noise floor the original document established (1.019x
+on the same metric, same scene, different batches). Absolute means moved
+as expected (`queued_at` roughly doubles `last_sent_at`, since it adds
+queueing time on top of the wire round trip), but the *ratio* — the number
+this document's own acceptance criterion is built on — did not move outside
+where `last_sent_at -> ACK` already put it.
+
+### Which of the three outcomes: **Ratio still ~1.0**
+
+This is the design doc's second named outcome, not the first or third:
+
+- Not "ratio already below 1.0" — 0.959-0.982 is the same distance from 1.0
+  that the admittedly-noisy `last_sent_at` metric already showed
+  (0.968-0.996 here, 0.978-0.997 in the original Stage 2.0 baseline), and
+  the bucket distribution shows no tail separation at all.
+- Not "ratio above 1.0" — nothing here suggests critical passes arrive
+  *later*; there is no defect to stop and investigate.
+- **It is "ordering is not translating into delivery latency."** Pass-major
+  draining (`drain_refinement_pass_major`) does put passes 0-3 on the wire
+  before 4-13 *within a given drain call*, but `queued_at -> ACK` — the
+  metric built specifically to see queueing delay accumulated *before* that
+  drain call runs — shows no benefit from it. The design doc's own
+  hypothesis for this outcome names the likely reason:
+  `refinement_bandwidth_fraction` (5-20% of the tick budget) is a small
+  enough slice that a tick's budget is often consumed by refinement work
+  queued from *earlier frames* before a later frame's critical passes are
+  even reachable, regardless of how those critical passes are ordered once
+  their own frame's work is being drained.
+
+### What this means for 2.3
+
+Per the design doc's own sequencing: this result means 2.3 is **not**
+unnecessary (that was outcome 1's conclusion), and it is **not** chasing a
+defect (outcome 3's). It is exactly the case the design doc pre-committed
+to address by changing the *budget split*, not the *drain order*: a
+guaranteed slice of the tick budget for `PassTier::Critical`, rather than
+having all CDF53 passes — critical and refinement alike — draw from the
+same `refinement_bandwidth_fraction`. `drain_refinement_pass_major`'s
+ordering is real and correct; it just never gets the chance to matter while
+critical and refinement passes compete for the same undifferentiated
+budget slice every tick.
