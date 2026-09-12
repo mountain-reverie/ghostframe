@@ -313,7 +313,11 @@ done
 
 Every line must be empty. **A non-empty line means a call site was missed — stop and report it.** That matters more than the deletion.
 
-`decoder.ts` stays: `FullFrameDecoder` is WebCodecs glue. `Codec` may now be unused in `main.ts`; if so, leave the export and say so — `decoder.ts` is not this plan's to prune.
+`decoder.ts` stays: `FullFrameDecoder` is WebCodecs glue. `Codec` became unused in `main.ts` and its import was removed in Task 3; the export stays — `decoder.ts` is not this plan's to prune.
+
+**One call site must be repointed before `prevalidate_cdf53.ts` can go.** `main.ts`'s `__cdf53TestIntegrate` global still calls the TypeScript `prevalidateCdf53` — a GPU test hook, unrelated to the dispatcher, and **hard-asserted by `e2e_cdf53_integrate_correctness`**. It is not dead code; deleting the module under it would break a gating e2e test.
+
+Repoint it at the wasm export `prevalidateCdf53(payload, generation, pass_idx)`, which returns the flat `{ ok, code, generation, pass_idx, bit_planes }` shape. Adapt at the call site to whatever the hook feeds the GPU, and verify it still produces the same values — an assertion reads this, not a diagnostic, so a wrong shape fails CI rather than passing quietly.
 
 - [ ] **Step 2: Delete, verify on a clean tree, commit**
 
