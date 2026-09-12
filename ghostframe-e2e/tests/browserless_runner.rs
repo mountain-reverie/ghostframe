@@ -644,7 +644,7 @@ async fn bwe_tier_latency_baseline() {
         };
         successes += 1;
         println!(
-            "seed={seed:#010x} critical: count={:>5} mean_us={:>7} max_us={:>7} buckets={:?} \
+            "seed={seed:#010x} last_sent->ACK critical: count={:>5} mean_us={:>7} max_us={:>7} buckets={:?} \
              | refinement: count={:>5} mean_us={:>7} max_us={:>7} buckets={:?}",
             r.critical_latency_count,
             r.critical_latency_mean_us,
@@ -654,6 +654,69 @@ async fn bwe_tier_latency_baseline() {
             r.refinement_latency_mean_us,
             r.refinement_latency_max_us,
             r.refinement_latency_buckets,
+        );
+        // BWE Stage 2.1: the same run's `queued_at -> ACK` pair, and the
+        // within-run critical/refinement ratio for each metric — see
+        // `docs/specs/bwe-tier-latency-baseline.md` for why the ratio,
+        // not the absolute mean, is the number that matters here.
+        println!(
+            "seed={seed:#010x} queued_at->ACK  critical: count={:>5} mean_us={:>7} max_us={:>7} buckets={:?} \
+             | refinement: count={:>5} mean_us={:>7} max_us={:>7} buckets={:?}",
+            r.queued_critical_latency_count,
+            r.queued_critical_latency_mean_us,
+            r.queued_critical_latency_max_us,
+            r.queued_critical_latency_buckets,
+            r.queued_refinement_latency_count,
+            r.queued_refinement_latency_mean_us,
+            r.queued_refinement_latency_max_us,
+            r.queued_refinement_latency_buckets,
+        );
+        if r.refinement_latency_mean_us > 0 {
+            println!(
+                "seed={seed:#010x} last_sent->ACK ratio (critical/refinement) = {:.3}",
+                r.critical_latency_mean_us as f64 / r.refinement_latency_mean_us as f64
+            );
+        }
+        if r.queued_refinement_latency_mean_us > 0 {
+            println!(
+                "seed={seed:#010x} queued_at->ACK ratio (critical/refinement) = {:.3}",
+                r.queued_critical_latency_mean_us as f64
+                    / r.queued_refinement_latency_mean_us as f64
+            );
+        }
+        // Sanity check (see BWE Stage 2.1 task brief): `queued_at -> ACK`
+        // starts at or before `last_sent_at -> ACK` for the same
+        // population, so its mean/max can never be smaller. A violation
+        // here means the plumbing is wrong, not that the network did
+        // something surprising — report it rather than silently
+        // continuing.
+        assert!(
+            r.queued_critical_latency_mean_us >= r.critical_latency_mean_us,
+            "seed={seed:#010x}: queued_at->ACK critical mean ({}) < last_sent_at->ACK \
+             critical mean ({}) — queued_at plumbing is wrong",
+            r.queued_critical_latency_mean_us,
+            r.critical_latency_mean_us
+        );
+        assert!(
+            r.queued_refinement_latency_mean_us >= r.refinement_latency_mean_us,
+            "seed={seed:#010x}: queued_at->ACK refinement mean ({}) < last_sent_at->ACK \
+             refinement mean ({}) — queued_at plumbing is wrong",
+            r.queued_refinement_latency_mean_us,
+            r.refinement_latency_mean_us
+        );
+        assert!(
+            r.queued_critical_latency_max_us >= r.critical_latency_max_us,
+            "seed={seed:#010x}: queued_at->ACK critical max ({}) < last_sent_at->ACK \
+             critical max ({}) — queued_at plumbing is wrong",
+            r.queued_critical_latency_max_us,
+            r.critical_latency_max_us
+        );
+        assert!(
+            r.queued_refinement_latency_max_us >= r.refinement_latency_max_us,
+            "seed={seed:#010x}: queued_at->ACK refinement max ({}) < last_sent_at->ACK \
+             refinement max ({}) — queued_at plumbing is wrong",
+            r.queued_refinement_latency_max_us,
+            r.refinement_latency_max_us
         );
     }
     println!("{successes}/{TARGET_SUCCESSFUL_RUNS} target runs completed");

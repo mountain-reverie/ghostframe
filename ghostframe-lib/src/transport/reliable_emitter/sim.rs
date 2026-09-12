@@ -114,7 +114,7 @@ impl Sim {
     fn submit_many(&mut self, n: u32) {
         for i in 0..n {
             self.emitter
-                .submit_one(EmitKey::new(i, 0, 0, 0), fake_source(i), self.t);
+                .submit_one(EmitKey::new(i, 0, 0, 0), fake_source(i), self.t, self.t);
         }
         self.emitter.drain(&mut self.sender, self.t);
         self.ack_delivered();
@@ -174,7 +174,7 @@ fn sim_generation_churn_no_orphan_retransmits() {
     let mut sim = Sim::new(0.3, 3);
     for i in 0..100u32 {
         sim.emitter
-            .submit_one(EmitKey::new(i, 5, 5, 0), fake_source(i), sim.t);
+            .submit_one(EmitKey::new(i, 5, 5, 0), fake_source(i), sim.t, sim.t);
         sim.emitter.drain(&mut sim.sender, sim.t);
         // Every 10 submissions bump tile (5,5).
         if i % 10 == 9 {

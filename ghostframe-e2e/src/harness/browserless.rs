@@ -184,6 +184,34 @@ pub struct BrowserlessResult {
     pub refinement_latency_max_us: u64,
     /// Same as `critical_latency_buckets`, for the refinement tier.
     pub refinement_latency_buckets: [u64; 8],
+    /// Same population as `critical_latency_count`, but measured
+    /// `queued_at -> ACK` instead of `last_sent_at -> ACK` (BWE Stage
+    /// 2.1) — `queued_at` is when the underlying `TileWork` became
+    /// available to the scheduler, so this additionally captures
+    /// scheduler queueing delay that `critical_latency_count`'s interval
+    /// cannot see (it starts only when a pass last left the wire). Read
+    /// from `IoBridge::queued_latency_stats_publish_handle()`, same
+    /// cell/republish/read-after-abort pattern as `critical_latency_count`.
+    pub queued_critical_latency_count: u64,
+    /// Mean of `(received_at - queued_at)` in microseconds across
+    /// `queued_critical_latency_count` samples. Always >= the
+    /// corresponding `critical_latency_mean_us` for the same population,
+    /// since it starts earlier. Zero when the count is zero.
+    pub queued_critical_latency_mean_us: u64,
+    /// Max of the same per-sample latency, over the same population.
+    pub queued_critical_latency_max_us: u64,
+    /// Same bucket scheme as `critical_latency_buckets`, over the
+    /// `queued_at -> ACK` population.
+    pub queued_critical_latency_buckets: [u64; 8],
+    /// Same as `queued_critical_latency_count`, for refinement-tier
+    /// (CDF53 passes 4-13) samples.
+    pub queued_refinement_latency_count: u64,
+    /// Same as `queued_critical_latency_mean_us`, for the refinement tier.
+    pub queued_refinement_latency_mean_us: u64,
+    /// Same as `queued_critical_latency_max_us`, for the refinement tier.
+    pub queued_refinement_latency_max_us: u64,
+    /// Same as `queued_critical_latency_buckets`, for the refinement tier.
+    pub queued_refinement_latency_buckets: [u64; 8],
 }
 
 /// The address the harness uses to identify the client, baked into every
@@ -257,6 +285,10 @@ async fn run_inner(scene: BrowserlessScene) -> anyhow::Result<BrowserlessResult>
     // (BWE Stage 2.0 baseline measurement) — see `latency_stats_publish`'s
     // doc comment in `io_bridge.rs`.
     let latency_stats_cell = bridge.latency_stats_publish_handle();
+    // Same reasoning, same pattern, for the `queued_at -> ACK` per-tier
+    // latency stats (BWE Stage 2.1) — see
+    // `queued_latency_stats_publish`'s doc comment in `io_bridge.rs`.
+    let queued_latency_stats_cell = bridge.queued_latency_stats_publish_handle();
     // `IoBridge::run` is an infinite event loop that only returns on EOF or
     // error; it must be aborted explicitly (see below) rather than awaited.
     let bridge_handle = tokio::task::spawn_local(async move {
@@ -305,6 +337,9 @@ async fn run_inner(scene: BrowserlessScene) -> anyhow::Result<BrowserlessResult>
     let (critical_latency, refinement_latency) = *latency_stats_cell
         .lock()
         .expect("latency_stats_publish mutex poisoned");
+    let (queued_critical_latency, queued_refinement_latency) = *queued_latency_stats_cell
+        .lock()
+        .expect("queued_latency_stats_publish mutex poisoned");
 
     Ok(BrowserlessResult {
         framebuffer,
@@ -328,6 +363,14 @@ async fn run_inner(scene: BrowserlessScene) -> anyhow::Result<BrowserlessResult>
         refinement_latency_mean_us: refinement_latency.mean_us(),
         refinement_latency_max_us: refinement_latency.max_us,
         refinement_latency_buckets: refinement_latency.buckets,
+        queued_critical_latency_count: queued_critical_latency.count,
+        queued_critical_latency_mean_us: queued_critical_latency.mean_us(),
+        queued_critical_latency_max_us: queued_critical_latency.max_us,
+        queued_critical_latency_buckets: queued_critical_latency.buckets,
+        queued_refinement_latency_count: queued_refinement_latency.count,
+        queued_refinement_latency_mean_us: queued_refinement_latency.mean_us(),
+        queued_refinement_latency_max_us: queued_refinement_latency.max_us,
+        queued_refinement_latency_buckets: queued_refinement_latency.buckets,
     })
 }
 
