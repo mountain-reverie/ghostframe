@@ -222,3 +222,52 @@ Report absolute numbers too, for the record. Just do not gate on them.
   `bps_refinement` in the periodic `ghostframe::bwe` log target) and its
   own regression guard (`every_cdf53_pass_eventually_lands`). Stage 2's
   acceptance criterion needs both numbers, not just this one.
+
+## This metric is the least sensitive of three, and Stage 2 needs a second one
+
+Recorded after the baseline was measured, on further reading of the emission
+path. It does not invalidate the numbers above, but it changes what they can
+be expected to show.
+
+**Emission order already prioritises the tiers.**
+`Scheduler::drain_refinement_pass_major` (`scheduler.rs:649`) drains
+**pass-major**:
+
+```rust
+while let Some(min_pass) = queue.iter().map(|w| w.pass_idx).min() {
+```
+
+It takes the lowest `pass_idx` present, emits every tile's work at that pass,
+then moves to the next. So passes 0-3 already leave before passes 4-13. The
+ordering Stage 2 is meant to introduce partly exists.
+
+**But this metric cannot see that.** It measures `last_sent_at -> ACK
+receipt` — a round trip that begins *when the pass leaves*. Pass 0 and pass
+13 each take their own ~35 ms from their own emit to their own ACK, however
+far apart those emissions were. Scheduler ordering changes *when* a pass is
+sent, not how long its ACK takes afterwards, so it is largely invisible here.
+That is a second, more specific reason the two tiers measure the same.
+
+Three metrics are available in principle, in increasing sensitivity to what a
+pacer changes:
+
+| Metric | Start point | Captures | Available? |
+|---|---|---|---|
+| `last_sent_at -> ACK` | last (re)transmission | wire round trip, queueing *on the link* | **yes — this baseline** |
+| `first_sent_at -> ACK` | first transmission | the above, plus retransmit delay | yes, `CacheEntry::first_sent_at` exists |
+| `queued_at -> ACK` | when the work was known | the above, plus **scheduler queueing** | **no** — `queued_at` is on `TileWork` and never reaches `CacheEntry` |
+
+The third is the one that expresses the deliverable. "Pass 0-3 latency drops"
+most naturally means time from when a pass became available to when it was
+confirmed delivered, and that is precisely the interval scheduler
+prioritisation shortens.
+
+**So Stage 2's first task is to plumb `queued_at` into `CacheEntry` and
+baseline `queued_at -> ACK` as well.** Without it, a working pacer and a
+broken one would both show a flat emit-to-ACK ratio, and the natural reading
+would be "the pacer did nothing" — a false negative rather than the false
+positive this document was written to prevent.
+
+Keep measuring `last_sent_at -> ACK` too: it is the one that would reveal a
+pacer *causing* wire queueing by overfilling the link, which is a real way
+for this work to go wrong.
