@@ -108,37 +108,45 @@ fn tile_delivery_defaults_to_decoded() {
     assert_eq!(cfg.tile_delivery, TileDelivery::Decoded);
 }
 
-use ghostframe_client_core::Event;
+use ghostframe_client_core::{Event, TileData};
 
 /// `TilePayload` carries everything the GPU decoder needs and should not have
-/// to re-derive: which tile, which pass, which generation, which codec.
+/// to re-derive: which tile, which generation, and (via `TileData`) which
+/// codec plus its codec-specific fields. `pass_idx` used to live directly on
+/// the event; it now lives inside `TileData::Cdf53` only — it is meaningless
+/// for the other three codecs — so this test exercises the Cdf53 variant to
+/// keep `pass_idx` covered.
 #[test]
 fn tile_payload_carries_the_gpu_decoders_inputs() {
     let e = Event::TilePayload {
         frame_seq: 7,
         tile_x: 1,
         tile_y: 2,
-        pass_idx: 3,
         generation: 4,
-        codec: Codec::PalRle,
-        payload: vec![0xAA, 0xBB],
+        data: TileData::Cdf53 {
+            pass_idx: 3,
+            bit_planes: vec![0xAA, 0xBB],
+        },
     };
     match e {
         Event::TilePayload {
             frame_seq,
             tile_x,
             tile_y,
-            pass_idx,
             generation,
-            codec,
-            payload,
+            data,
         } => {
-            assert_eq!(
-                (frame_seq, tile_x, tile_y, pass_idx, generation),
-                (7, 1, 2, 3, 4)
-            );
-            assert_eq!(codec, Codec::PalRle);
-            assert_eq!(payload, vec![0xAA, 0xBB]);
+            assert_eq!((frame_seq, tile_x, tile_y, generation), (7, 1, 2, 4));
+            match data {
+                TileData::Cdf53 {
+                    pass_idx,
+                    bit_planes,
+                } => {
+                    assert_eq!(pass_idx, 3);
+                    assert_eq!(bit_planes, vec![0xAA, 0xBB]);
+                }
+                other => panic!("wrong TileData variant: {other:?}"),
+            }
         }
         other => panic!("wrong variant: {other:?}"),
     }
@@ -172,7 +180,7 @@ fn solid_in_payload_mode_emits_wire_bytes() {
     let payloads: Vec<_> = events
         .iter()
         .filter_map(|e| match e {
-            Event::TilePayload { payload, codec, .. } => Some((payload.clone(), *codec)),
+            Event::TilePayload { data, .. } => Some(data.clone()),
             _ => None,
         })
         .collect();
@@ -181,8 +189,17 @@ fn solid_in_payload_mode_emits_wire_bytes() {
         1,
         "expected exactly one TilePayload, got {events:?}"
     );
-    assert_eq!(payloads[0].0, vec![10, 20, 30, 255]);
-    assert_eq!(payloads[0].1, Codec::Solid);
+    // Was `assert_eq!(codec, Codec::Solid)` against a codec tag; the codec is
+    // now the variant itself, so the variant check takes its place.
+    assert!(
+        matches!(payloads[0], TileData::Solid(_)),
+        "expected TileData::Solid, got {:?}",
+        payloads[0]
+    );
+    match &payloads[0] {
+        TileData::Solid(quad) => assert_eq!(*quad, [10, 20, 30, 255]),
+        other => panic!("wrong TileData variant: {other:?}"),
+    }
     assert!(
         !events.iter().any(|e| matches!(e, Event::TileReady { .. })),
         "Payload mode must not emit TileReady"
@@ -216,7 +233,11 @@ fn raw_in_payload_mode_passes_bytes_through() {
     let got: Vec<_> = events
         .iter()
         .filter_map(|e| match e {
-            Event::TilePayload { payload, .. } => Some(payload.clone()),
+            Event::TilePayload {
+                data: TileData::Raw(bytes),
+                ..
+            } => Some(bytes.clone()),
+            Event::TilePayload { data, .. } => panic!("expected TileData::Raw, got {data:?}"),
             _ => None,
         })
         .collect();
@@ -257,16 +278,39 @@ fn palrle_in_payload_mode_applies_and_reports_the_palette() {
     assert_eq!(updated[0].1[0], [10, 20, 30, 255]);
     assert_eq!(updated[0].1[1], [40, 50, 60, 255]);
 
-    assert!(
-        events.iter().any(|e| matches!(
-            e,
+    // Previously this only checked that a PalRle-coded TilePayload existed —
+    // the test never re-decoded the wire RLE to check its content. Now the
+    // prevalidated fields sit directly on the event, so assert them: this is
+    // the exact product palrle_decode.wgsl consumes, which is a strengthened
+    // check, not a relocated one. `packed` is all zeros, so the expanded
+    // indices must be too.
+    let payload: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
             Event::TilePayload {
-                codec: Codec::PalRle,
+                data:
+                    TileData::PalRle {
+                        palette_id,
+                        count,
+                        indices,
+                    },
                 ..
-            }
-        )),
+            } => Some((*palette_id, *count, indices.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        payload.len(),
+        1,
         "the tile payload itself must still be emitted, got {events:?}"
     );
+    assert_eq!(
+        payload[0].0, 5,
+        "TilePayload must reference the same palette slot"
+    );
+    assert_eq!(payload[0].1, 2);
+    assert_eq!(payload[0].2, vec![0u8; 512]);
+
     assert!(
         !events.iter().any(|e| matches!(e, Event::TileReady { .. })),
         "Payload mode must not emit TileReady"
@@ -328,11 +372,16 @@ fn payload_mode_really_stores_the_palette_not_just_reports_it() {
         "thin tile was rejected as uncached — the bundled tile announced the \
          palette but did not store it, got {events2:?}"
     );
+    // Was `codec: Codec::PalRle` against a codec tag; matching on
+    // `TileData::PalRle { palette_id: 5, .. }` reaches the same check (a
+    // payload was produced) and additionally confirms it references the
+    // slot the bundled tile installed — a small strengthening, not just a
+    // relocation.
     assert!(
         events2.iter().any(|e| matches!(
             e,
             Event::TilePayload {
-                codec: Codec::PalRle,
+                data: TileData::PalRle { palette_id: 5, .. },
                 ..
             }
         )),
@@ -385,15 +434,37 @@ fn cdf53_in_payload_mode_keeps_the_ack_and_skips_integrate() {
     let (events, outputs) =
         drive_one_tile_with_outputs(TileDelivery::Payload, Codec::Cdf53, &pass0);
 
-    assert!(
-        events.iter().any(|e| matches!(
-            e,
+    // Previously this only checked that a Cdf53-coded TilePayload existed.
+    // The prevalidated bit_planes are now directly on the event, so assert
+    // their shape too (384 bytes: 3 channels x 128) — the exact product
+    // cdf53_integrate.wgsl consumes. Strengthened, not relocated.
+    let cdf53_payloads: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
             Event::TilePayload {
-                codec: Codec::Cdf53,
+                data:
+                    TileData::Cdf53 {
+                        pass_idx,
+                        bit_planes,
+                    },
                 ..
-            }
-        )),
+            } => Some((*pass_idx, bit_planes.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        cdf53_payloads.len(),
+        1,
         "expected a Cdf53 TilePayload, got {events:?}"
+    );
+    assert_eq!(
+        cdf53_payloads[0].0, 0,
+        "pass0 payload should carry pass_idx 0"
+    );
+    assert_eq!(
+        cdf53_payloads[0].1.len(),
+        384,
+        "bit_planes must be 3 channels x 128 bytes"
     );
     assert!(
         !events.iter().any(|e| matches!(e, Event::TileReady { .. })),
