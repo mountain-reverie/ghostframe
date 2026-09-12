@@ -14,6 +14,13 @@ use std::time::Instant;
 pub struct CacheEntry {
     pub fragments: SmallVec<[Bytes; 2]>,
     pub wire_seqs: SmallVec<[u32; 2]>,
+    /// When the underlying `TileWork` became available to the scheduler
+    /// (`TileWork::queued_at`), copied through unchanged across
+    /// retransmits (unlike `last_sent_at`) — it's the start point for
+    /// `queued_at -> ACK` latency (BWE Stage 2.1), which captures
+    /// scheduler queueing delay that `last_sent_at -> ACK` (Stage 2.0)
+    /// cannot see.
+    pub queued_at: Instant,
     pub first_sent_at: Instant,
     pub last_sent_at: Instant,
     pub attempts: u8,
@@ -128,6 +135,7 @@ mod tests {
         CacheEntry {
             fragments: smallvec![Bytes::from(vec![1, 2, 3])],
             wire_seqs: smallvec![0],
+            queued_at: now,
             first_sent_at: now,
             last_sent_at: now,
             attempts: 0,

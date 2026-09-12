@@ -689,6 +689,17 @@ pub struct IoBridge {
     /// identical ownership reason — see `bwe_publish`'s doc comment.
     #[cfg(any(test, feature = "browserless-harness"))]
     latency_stats_publish: std::sync::Arc<std::sync::Mutex<(TierLatencyStats, TierLatencyStats)>>,
+    /// Same publish-cell pattern as `latency_stats_publish`, for the
+    /// `queued_at -> ACK` pair (BWE Stage 2.1) — `queued_at` is when the
+    /// underlying `TileWork` became available to the scheduler, so this
+    /// interval additionally captures scheduler queueing delay that
+    /// `latency_stats_publish`'s `last_sent_at -> ACK` cannot see. Kept
+    /// alongside, not instead of, `latency_stats_publish`: the latter is
+    /// what would reveal a pacer overfilling the link and causing wire
+    /// queueing.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    queued_latency_stats_publish:
+        std::sync::Arc<std::sync::Mutex<(TierLatencyStats, TierLatencyStats)>>,
     /// Cumulative bytes of CDF53 critical-tier (passes 0-3) datagrams
     /// emitted since startup. Counts every successful emit including
     /// retransmits, because the BWE-side rate computation should reflect
@@ -705,6 +716,17 @@ pub struct IoBridge {
     critical_latency_stats: TierLatencyStats,
     /// Same as `critical_latency_stats`, for `PassTier::Refinement`.
     refinement_latency_stats: TierLatencyStats,
+    /// `queued_at -> ACK` per-tier latency stats (BWE Stage 2.1). Same
+    /// accumulation site (`run()`'s `bwe_samples_buffer` drain) as
+    /// `critical_latency_stats`, but measured from `BweSample::queued_at`
+    /// (via `CacheEntry::queued_at`, ultimately `TileWork::queued_at`)
+    /// rather than `last_sent_at`. This is the interval scheduler
+    /// prioritisation (pass-major drain, and later tier budgeting)
+    /// actually shortens: `last_sent_at -> ACK` starts only when a pass
+    /// leaves, so it cannot see queueing delay incurred before that.
+    queued_critical_latency_stats: TierLatencyStats,
+    /// Same as `queued_critical_latency_stats`, for `PassTier::Refinement`.
+    queued_refinement_latency_stats: TierLatencyStats,
     /// Snapshot of (critical, refinement) byte counters at the previous
     /// periodic-log tick, used to derive per-window rates without
     /// polluting the cumulative counters.
@@ -739,6 +761,16 @@ struct BweSample {
     /// Monotonic and full-precision — unlike the arrival series this never
     /// crosses the wire, so it needs no unwrapping.
     server_emit_us: u64,
+    /// When the underlying `TileWork` became available to the scheduler
+    /// (`CacheEntry::queued_at`, ultimately `TileWork::queued_at`), in
+    /// microseconds since the bridge's BWE epoch — same clock and units as
+    /// `server_emit_us`, computed the same way. Unlike `server_emit_us`,
+    /// this does NOT change on retransmit: `queued_at` is copied through
+    /// unchanged by `ReliableTileEmitter::submit_one` regardless of how
+    /// many times a pass is resent, because the work became available
+    /// exactly once. Feeds `queued_at -> ACK` (BWE Stage 2.1), the
+    /// interval scheduler prioritisation actually shortens.
+    queued_since_epoch_us: u64,
     /// Low 16 bits of the client's receive time in ms, echoed back via
     /// the ACK envelope's `arrival_time_ms_lo16`.
     client_arrival_ms_lo16: u16,
@@ -1041,10 +1073,20 @@ impl IoBridge {
                 TierLatencyStats::default(),
                 TierLatencyStats::default(),
             ))),
+            // Same cfg-gate and reasoning, for the `queued_at -> ACK`
+            // per-tier latency stats (BWE Stage 2.1) — see
+            // `queued_latency_stats_publish`'s doc comment.
+            #[cfg(any(test, feature = "browserless-harness"))]
+            queued_latency_stats_publish: std::sync::Arc::new(std::sync::Mutex::new((
+                TierLatencyStats::default(),
+                TierLatencyStats::default(),
+            ))),
             bytes_emitted_critical: 0,
             bytes_emitted_refinement: 0,
             critical_latency_stats: TierLatencyStats::default(),
             refinement_latency_stats: TierLatencyStats::default(),
+            queued_critical_latency_stats: TierLatencyStats::default(),
+            queued_refinement_latency_stats: TierLatencyStats::default(),
             bytes_emitted_snapshot: (0, 0),
             bwe_log_last_at: None,
             diagnostics: lib_config.diagnostics,
@@ -1692,8 +1734,11 @@ impl IoBridge {
         // The actual wire write happens in `reliable_emitter.drain(&mut
         // adapter, now)` below.
         let frame_seq_with_flag = seq | TILE_DATAGRAM_FLAG;
-        let mut items: Vec<(crate::transport::reliable_emitter::EmitKey, bytes::Bytes)> =
-            Vec::with_capacity(drained.len());
+        let mut items: Vec<(
+            crate::transport::reliable_emitter::EmitKey,
+            bytes::Bytes,
+            std::time::Instant,
+        )> = Vec::with_capacity(drained.len());
         for work in drained {
             let datagrams = fragment_tile(
                 &TileFragmentInputs {
@@ -1830,7 +1875,7 @@ impl IoBridge {
                 work.pass_idx,
             );
             for dg in datagrams {
-                items.push((key, bytes::Bytes::from(dg)));
+                items.push((key, bytes::Bytes::from(dg), work.queued_at));
             }
         }
         // Submit the batch (stamps wire_seq, caches, schedules RTO + parity).
@@ -2152,6 +2197,14 @@ impl IoBridge {
                             .last_sent_at
                             .saturating_duration_since(self.bwe_epoch)
                             .as_micros() as u64;
+                        // BWE Stage 2.1: `queued_at` is copied through
+                        // unchanged across retransmits (see
+                        // `CacheEntry::queued_at`'s doc comment), unlike
+                        // `last_sent_at` above.
+                        let queued_since_epoch_us = entry
+                            .queued_at
+                            .saturating_duration_since(self.bwe_epoch)
+                            .as_micros() as u64;
                         let arrival_lo16 = e.arrival_time_ms_lo16;
                         let tier = pass_tier(e.pass_idx);
                         let emit_lo16 = ((server_emit_us / 1000) & 0xFFFF) as u16;
@@ -2159,6 +2212,7 @@ impl IoBridge {
                         self.bwe_samples_buffer.push(BweSample {
                             tier,
                             server_emit_us,
+                            queued_since_epoch_us,
                             client_arrival_ms_lo16: arrival_lo16,
                             owd_ms_lo16,
                             size_bytes,
@@ -3882,6 +3936,22 @@ impl IoBridge {
                         refinement_latency_count = self.refinement_latency_stats.count,
                         refinement_latency_mean_us = self.refinement_latency_stats.mean_us(),
                         refinement_latency_max_us = self.refinement_latency_stats.max_us,
+                        // BWE Stage 2.1: same population, measured from
+                        // `queued_at` (when the work became available to
+                        // the scheduler) instead of `last_sent_at`. This is
+                        // the interval scheduler prioritisation actually
+                        // shortens; always >= the corresponding
+                        // `*_latency_*_us` field above for the same sample.
+                        queued_critical_latency_count = self.queued_critical_latency_stats.count,
+                        queued_critical_latency_mean_us =
+                            self.queued_critical_latency_stats.mean_us(),
+                        queued_critical_latency_max_us = self.queued_critical_latency_stats.max_us,
+                        queued_refinement_latency_count =
+                            self.queued_refinement_latency_stats.count,
+                        queued_refinement_latency_mean_us =
+                            self.queued_refinement_latency_stats.mean_us(),
+                        queued_refinement_latency_max_us =
+                            self.queued_refinement_latency_stats.max_us,
                         "cumulative emit (datagrams handed to quinn since startup, per codec)"
                     );
 
@@ -4163,6 +4233,21 @@ impl IoBridge {
                             self.refinement_latency_stats.record(ack_latency_us)
                         }
                     }
+                    // BWE Stage 2.1: `queued_at -> ACK`, alongside (not
+                    // instead of) the `last_sent_at -> ACK` pair above.
+                    // Starts earlier (when the work was queued rather than
+                    // when it last left the wire), so this is always >=
+                    // `ack_latency_us` for the same sample.
+                    let queued_latency_us =
+                        elapsed_since_epoch_us.saturating_sub(s.queued_since_epoch_us);
+                    match s.tier {
+                        PassTier::Critical => {
+                            self.queued_critical_latency_stats.record(queued_latency_us)
+                        }
+                        PassTier::Refinement => self
+                            .queued_refinement_latency_stats
+                            .record(queued_latency_us),
+                    }
                     records.push(AckArrival {
                         wire_seq: (((s.server_emit_us / 1000) as u32) << 16)
                             | (s.client_arrival_ms_lo16 as u32),
@@ -4198,6 +4283,10 @@ impl IoBridge {
                 *self.emitter_stats_publish.lock().unwrap() = self.reliable_emitter.stats;
                 *self.latency_stats_publish.lock().unwrap() =
                     (self.critical_latency_stats, self.refinement_latency_stats);
+                *self.queued_latency_stats_publish.lock().unwrap() = (
+                    self.queued_critical_latency_stats,
+                    self.queued_refinement_latency_stats,
+                );
             }
 
             // [BRIDGE-DIAG] heartbeat every 2s of virtual time (tokio's
@@ -4776,10 +4865,20 @@ impl IoBridge {
                 TierLatencyStats::default(),
                 TierLatencyStats::default(),
             ))),
+            // Same cfg-gate and reasoning, for the `queued_at -> ACK`
+            // per-tier latency stats (BWE Stage 2.1) — see
+            // `queued_latency_stats_publish`'s doc comment.
+            #[cfg(any(test, feature = "browserless-harness"))]
+            queued_latency_stats_publish: std::sync::Arc::new(std::sync::Mutex::new((
+                TierLatencyStats::default(),
+                TierLatencyStats::default(),
+            ))),
             bytes_emitted_critical: 0,
             bytes_emitted_refinement: 0,
             critical_latency_stats: TierLatencyStats::default(),
             refinement_latency_stats: TierLatencyStats::default(),
+            queued_critical_latency_stats: TierLatencyStats::default(),
+            queued_refinement_latency_stats: TierLatencyStats::default(),
             bytes_emitted_snapshot: (0, 0),
             bwe_log_last_at: None,
             diagnostics: lib_config.diagnostics,
@@ -4876,6 +4975,18 @@ impl IoBridge {
         &self,
     ) -> std::sync::Arc<std::sync::Mutex<(TierLatencyStats, TierLatencyStats)>> {
         self.latency_stats_publish.clone()
+    }
+
+    /// Clone of the `Arc` behind `queued_latency_stats_publish` — `(critical,
+    /// refinement)` `queued_at -> ACK` stats (BWE Stage 2.1). Same
+    /// ownership problem and fix as `latency_stats_publish_handle`; call
+    /// this *before* the move, read the clone's contents *after* aborting
+    /// the task.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub fn queued_latency_stats_publish_handle(
+        &self,
+    ) -> std::sync::Arc<std::sync::Mutex<(TierLatencyStats, TierLatencyStats)>> {
+        self.queued_latency_stats_publish.clone()
     }
 
     /// Drive exactly one injected frame: enqueue its work, then attempt the
@@ -5665,6 +5776,7 @@ mod tests {
             key,
             bytes::Bytes::from(vec![0u8; 25]),
             std::time::Instant::now(),
+            std::time::Instant::now(),
         );
         let nack_env = crate::transport::protocol::TileNackEnvelope {
             entries: vec![crate::transport::protocol::TileNackEntry {
@@ -5695,6 +5807,7 @@ mod tests {
         bridge.reliable_emitter.submit_one(
             key,
             bytes::Bytes::from(vec![0u8; 25]),
+            std::time::Instant::now(),
             std::time::Instant::now(),
         );
         let ack_env = crate::transport::ack::AckBatch {
@@ -7073,9 +7186,12 @@ mod tests {
                 // fragment is long enough to look like a real tile datagram.
                 let mut frag = vec![0u8; 20];
                 frag[12..16].copy_from_slice(&1_000_000u32.to_be_bytes());
-                bridge
-                    .reliable_emitter
-                    .submit_one(key, bytes::Bytes::from(frag), super::now_std());
+                bridge.reliable_emitter.submit_one(
+                    key,
+                    bytes::Bytes::from(frag),
+                    super::now_std(),
+                    super::now_std(),
+                );
                 entries.push(AckEntry {
                     frame_seq,
                     tile_x: 1,

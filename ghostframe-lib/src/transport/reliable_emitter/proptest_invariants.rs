@@ -53,6 +53,7 @@ proptest! {
                 CacheEntry {
                     fragments: smallvec![Bytes::from(vec![0u8])],
                     wire_seqs: smallvec![0],
+                    queued_at: now,
                     first_sent_at: now, last_sent_at: now,
                     attempts: 0, rto_deadline: now,
                 },
