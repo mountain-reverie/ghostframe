@@ -203,3 +203,60 @@ adding the wasm-bindgen glue import and event-dispatch wiring in `main.ts`.
 
 This is a record, not a gate, per the top of this document. No size
 assertion is added.
+
+## Post-TS-deletion measurement, 2026-09-12 (typed-tile-payload plan, Task 6)
+
+**Git rev:** `8fe874c` **Branch:** `refactor/single-palrle-prevalidator`
+
+Re-run using the exact commands in "How to re-measure" above, from
+`ghostframe-web-client/` with `pkg-web`, `pkg-node` and `dist` deleted first
+for a from-scratch build. This follows the typed-tile-payload plan
+(Tasks 1-5): `ghostframe-client-core` now emits each codec's prevalidated
+`TileData` product and `main.ts` dispatches on it; the renderer no longer
+prevalidates PalRLE or keeps a palette shadow. Task 6 repointed the
+`__cdf53TestIntegrate` test hook at the wasm `prevalidateCdf53` export and
+deleted three now-unreferenced TS modules (`prevalidate.ts`,
+`prevalidate_cdf53.ts`, `palette_shadow.ts`). `feedback.ts` and
+`decode_error_batcher.ts`, also named in the plan's deletion list, were
+kept: `decode_error_batcher.ts` still has a live caller in `main.ts`'s
+`tick()`, reporting GPU-shader-detected PalRLE `IndexOob` errors
+independent of the deleted CPU-side prevalidation, and `feedback.ts` is its
+only remaining dependency.
+
+### Full production build (`npm run build`) — the number to compare against §1 and the 2026-09-11 post-cutover measurement
+
+| Asset | Raw bytes | Gzip bytes |
+|---|---:|---:|
+| `dist/index.html` | 556 | 367 |
+| `dist/assets/index-DL3RJbgj.js` | 83,520 | 24,255 |
+| `dist/assets/ghostframe_client_wasm_bg-D3kJaMmF.wasm` | 138,735 | 56,170 |
+| **Total** | **222,811** | **80,792** |
+
+### Wasm module on its own (`npm run build:wasm`), for comparison to §2
+
+| Asset | Raw bytes | Gzip bytes |
+|---|---:|---:|
+| `pkg-web/ghostframe_client_wasm_bg.wasm` | 138,735 | 56,161 |
+| `pkg-web/ghostframe_client_wasm.js` (glue) | 38,048 | 7,050 |
+| **Total** | **176,783** | **63,211** |
+
+### Comparison to the 2026-09-11 post-cutover measurement
+
+| | 2026-09-11 (wasm wired, 6 TS modules deleted) | 2026-09-12 (3 more TS modules deleted) | Delta |
+|---|---:|---:|---:|
+| Raw total | 224,956 | 222,811 | −2,145 |
+| Gzip total | 81,432 | 80,792 | −640 |
+
+The `.js` bundle shrank slightly (87,111 → 83,520 raw; 25,521 → 24,255
+gzip) from deleting `prevalidate.ts`, `prevalidate_cdf53.ts`, and
+`palette_shadow.ts` — as expected, since `__cdf53TestIntegrate` was the
+only real call site among them and it now calls the wasm export instead.
+The `.wasm` binary grew marginally (137,289 → 138,735 raw; 55,547/55,538 →
+56,170/56,161 gzip), consistent with the note in "How to re-measure": wasm
+size drifts slightly between builds independent of TS-side changes.
+`feedback.ts` and `decode_error_batcher.ts` remain in the bundle, so this
+is not the full reduction five deletions would have produced — see the
+note above on why those two modules were kept.
+
+This is a record, not a gate, per the top of this document. No size
+assertion is added.
