@@ -12,7 +12,7 @@ use ghostframe_client_core::{
     cdf53_coverage::{ArrivalOutcome, CoverageEntry},
     cdf53_prevalidate::PrevalidatedCdf53,
     pal_rle_decode::{PalRleVariant, PrevalidatedPalRle},
-    Event, PollOutput,
+    Event, PollOutput, TileData,
 };
 use ghostframe_protocol::ack::AckEntry;
 use ghostframe_protocol::protocol::{TileNackEntry, TileParityEnvelope};
@@ -32,13 +32,8 @@ pub enum WasmEvent {
         frame_seq: u32,
         tile_x: u8,
         tile_y: u8,
-        pass_idx: u8,
         generation: u8,
-        /// `Codec` discriminant; `Codec` lives in `ghostframe-protocol` and
-        /// is not `Serialize`, so it crosses as its `repr(u8)` value.
-        codec: u8,
-        #[serde(with = "serde_bytes")]
-        payload: Vec<u8>,
+        data: WasmTileData,
     },
     PaletteUpdated {
         palette_id: u8,
@@ -64,6 +59,62 @@ pub enum WasmEvent {
     },
 }
 
+/// Mirror of `TileData`. Serialised `#[serde(tag = "codec")]`, so JS sees
+/// `{ codec: 'PalRle', palette_id, count, indices }` — the codec tag the old
+/// flat shape carried separately is now the variant itself.
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(tag = "codec")]
+pub enum WasmTileData {
+    Raw {
+        #[serde(with = "serde_bytes")]
+        bytes: Vec<u8>,
+    },
+    Solid {
+        #[serde(with = "serde_bytes")]
+        bytes: Vec<u8>,
+    },
+    PalRle {
+        palette_id: u8,
+        count: u8,
+        #[serde(with = "serde_bytes")]
+        indices: Vec<u8>,
+    },
+    Cdf53 {
+        pass_idx: u8,
+        #[serde(with = "serde_bytes")]
+        bit_planes: Vec<u8>,
+    },
+}
+
+impl From<&TileData> for WasmTileData {
+    fn from(data: &TileData) -> Self {
+        match data {
+            TileData::Raw(bytes) => WasmTileData::Raw {
+                bytes: bytes.clone(),
+            },
+            TileData::Solid(quad) => WasmTileData::Solid {
+                bytes: quad.to_vec(),
+            },
+            TileData::PalRle {
+                palette_id,
+                count,
+                indices,
+            } => WasmTileData::PalRle {
+                palette_id: *palette_id,
+                count: *count,
+                indices: indices.clone(),
+            },
+            TileData::Cdf53 {
+                pass_idx,
+                bit_planes,
+            } => WasmTileData::Cdf53 {
+                pass_idx: *pass_idx,
+                bit_planes: bit_planes.clone(),
+            },
+        }
+    }
+}
+
 impl From<&Event> for WasmEvent {
     fn from(ev: &Event) -> Self {
         match ev {
@@ -82,18 +133,14 @@ impl From<&Event> for WasmEvent {
                 frame_seq,
                 tile_x,
                 tile_y,
-                pass_idx,
                 generation,
-                codec,
-                payload,
+                data,
             } => WasmEvent::TilePayload {
                 frame_seq: *frame_seq,
                 tile_x: *tile_x,
                 tile_y: *tile_y,
-                pass_idx: *pass_idx,
                 generation: *generation,
-                codec: *codec as u8,
-                payload: payload.clone(),
+                data: data.into(),
             },
             Event::PaletteUpdated { palette_id, colors } => WasmEvent::PaletteUpdated {
                 palette_id: *palette_id,
@@ -348,7 +395,7 @@ impl From<ArrivalOutcome> for WasmArrivalOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ghostframe_client_core::{DecodeErrorCode, Event};
+    use ghostframe_client_core::{DecodeErrorCode, Event, TileData};
     use ghostframe_protocol::protocol::Codec;
 
     #[test]
@@ -357,28 +404,34 @@ mod tests {
             frame_seq: 0x1234_5678,
             tile_x: 3,
             tile_y: 7,
-            pass_idx: 13,
             generation: 2,
-            codec: Codec::Cdf53,
-            payload: vec![1, 2, 3],
+            data: TileData::Cdf53 {
+                pass_idx: 13,
+                bit_planes: vec![1, 2, 3],
+            },
         };
         match WasmEvent::from(&ev) {
             WasmEvent::TilePayload {
                 frame_seq,
                 tile_x,
                 tile_y,
-                pass_idx,
                 generation,
-                codec,
-                payload,
+                data,
             } => {
                 assert_eq!(frame_seq, 0x1234_5678);
                 assert_eq!(tile_x, 3);
                 assert_eq!(tile_y, 7);
-                assert_eq!(pass_idx, 13);
                 assert_eq!(generation, 2);
-                assert_eq!(codec, Codec::Cdf53 as u8);
-                assert_eq!(payload, vec![1, 2, 3]);
+                match data {
+                    WasmTileData::Cdf53 {
+                        pass_idx,
+                        bit_planes,
+                    } => {
+                        assert_eq!(pass_idx, 13);
+                        assert_eq!(bit_planes, vec![1, 2, 3]);
+                    }
+                    other => panic!("wrong TileData variant: {other:?}"),
+                }
             }
             other => panic!("wrong variant: {other:?}"),
         }

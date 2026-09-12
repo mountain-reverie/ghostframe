@@ -23,6 +23,33 @@ pub enum DecodeErrorCode {
     Cdf53RleLength = 10,
 }
 
+/// What a completed tile actually hands the GPU.
+///
+/// The four codecs produce genuinely different things, so this is an enum
+/// rather than a byte slice plus a codec tag the consumer has to interpret.
+/// `PalRle` and `Cdf53` arrive prevalidated: `reassembly.rs` computes these
+/// products anyway, to drive palette state and pass coverage, and emitting
+/// the raw wire bytes instead forced every consumer to redo that work.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TileData {
+    /// BGRA wire bytes, unswizzled. Length is payload-proportional
+    /// (<= 4096, a multiple of 4).
+    Raw(Vec<u8>),
+    /// One BGRA quad, expanded to the full tile by the shader.
+    Solid([u8; 4]),
+    /// `indices` is 512 bytes: two 4-bit palette indices per byte, low
+    /// nibble first. The palette itself arrives separately as
+    /// `Event::PaletteUpdated` — the GPU upload path never reads an upsert
+    /// from here.
+    PalRle {
+        palette_id: u8,
+        count: u8,
+        indices: Vec<u8>,
+    },
+    /// `bit_planes` is 384 bytes: 3 channels x 128, packed B, G, R.
+    Cdf53 { pass_idx: u8, bit_planes: Vec<u8> },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     /// Fully decoded 32x32 RGBA tile, RGBA byte order. For
@@ -59,10 +86,10 @@ pub enum Event {
         frame_seq: u32,
         tile_x: u8,
         tile_y: u8,
-        pass_idx: u8,
+        /// Tile generation, for superseding. Stays on the event rather than
+        /// in `TileData`: superseding is codec-independent.
         generation: u8,
-        codec: Codec,
-        payload: Vec<u8>,
+        data: TileData,
     },
     /// A palette slot changed. Only emitted under `TileDelivery::Payload`:
     /// under `Decoded` the core applies the palette itself and the consumer

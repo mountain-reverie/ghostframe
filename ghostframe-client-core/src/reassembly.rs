@@ -19,7 +19,7 @@ use ghostframe_protocol::protocol::{
 
 use crate::cdf53_coverage::apply_cdf53_arrival;
 use crate::cdf53_prevalidate::prevalidate_cdf53;
-use crate::event::{Event, PollOutput, TileKey};
+use crate::event::{Event, PollOutput, TileData, TileKey};
 use crate::pal_rle_decode::{decode_pal_rle_tile, prevalidate_pal_rle};
 use crate::{Assembly, ClientCore, TileDelivery};
 
@@ -254,14 +254,26 @@ impl ClientCore {
         if self.tile_delivery == TileDelivery::Payload
             && matches!(asm.codec, Codec::Raw | Codec::Solid)
         {
+            let data = match asm.codec {
+                Codec::Raw => TileData::Raw(payload),
+                Codec::Solid => match payload.try_into() {
+                    Ok(quad) => TileData::Solid(quad),
+                    Err(_) => {
+                        // Wire-derived: a malformed Solid payload must not
+                        // panic. main.ts only ever painted Solid when the
+                        // payload was exactly 4 bytes; mirror that by
+                        // dropping the tile silently rather than crashing.
+                        return;
+                    }
+                },
+                _ => unreachable!("matches! above restricts to Raw | Solid"),
+            };
             events.push(Event::TilePayload {
                 frame_seq,
                 tile_x: tx,
                 tile_y: ty,
-                pass_idx: asm.pass,
                 generation: asm.generation,
-                codec: asm.codec,
-                payload,
+                data,
             });
             return;
         }
@@ -343,10 +355,12 @@ impl ClientCore {
                             frame_seq,
                             tile_x: tx,
                             tile_y: ty,
-                            pass_idx: asm.pass,
                             generation: asm.generation,
-                            codec: Codec::PalRle,
-                            payload,
+                            data: TileData::PalRle {
+                                palette_id: validated.palette_id,
+                                count: validated.count,
+                                indices: validated.indices,
+                            },
                         });
                     }
                     Err(code) => {
@@ -429,10 +443,11 @@ impl ClientCore {
                                     frame_seq,
                                     tile_x: tx,
                                     tile_y: ty,
-                                    pass_idx: asm.pass,
                                     generation: asm.generation,
-                                    codec: Codec::Cdf53,
-                                    payload,
+                                    data: TileData::Cdf53 {
+                                        pass_idx: pre.pass_idx,
+                                        bit_planes: pre.bit_planes,
+                                    },
                                 });
                             }
                         }
