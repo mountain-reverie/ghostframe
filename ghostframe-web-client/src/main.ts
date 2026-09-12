@@ -4,13 +4,13 @@ import { WebGpuUnavailableError } from './webgpu/init.js';
 import { attachInputCapture } from './input/wire';
 import { DecodeErrorBatcher } from './decode_error_batcher';
 import { initDiagnostics } from './diagnostics.js';
-import { prevalidateCdf53 } from './prevalidate_cdf53.js';
 import { bootstrap } from './bootstrap.js';
 import { recordProtocolEvent, type Cdf53ErrorCodes } from './cdf53_globals.js';
 import init, {
   WasmClientCore,
   tileNackEnvelope,
   errorCodes,
+  prevalidateCdf53,
 } from '../pkg-web/ghostframe_client_wasm.js';
 
 /** Microsecond clock for every `now_us` parameter WasmClientCore expects. */
@@ -142,14 +142,20 @@ async function main() {
     device.queue.writeBuffer(pipe.tileGenBuffer, 0, new Uint32Array([0]));      // force gen-bump on first pass
 
     // Build the batch from the 14 encoded passes (all for tile 0, gen=1).
+    // `prevalidateCdf53` (wasm) returns a flat result — no nested `entry` to
+    // mutate, so tileX/tileY are filled in directly on construction.
     const entries: Array<{ tileX: number; tileY: number; gen: number; passIdx: number; bitPlanes: Uint8Array }> = [];
     for (let passIdx = 0; passIdx < encodedPasses.length; passIdx++) {
       const payload = new Uint8Array(encodedPasses[passIdx]);
       const r = prevalidateCdf53(payload, 1, passIdx);
-      if (!r.ok) throw new Error('prevalidate failed for pass ' + passIdx + ' err=' + r.errorCode);
-      r.entry.tileX = 0;
-      r.entry.tileY = 0;
-      entries.push(r.entry);
+      if (!r.ok) throw new Error('prevalidate failed for pass ' + passIdx + ' err=' + r.code);
+      entries.push({
+        tileX: 0,
+        tileY: 0,
+        gen: r.generation,
+        passIdx: r.pass_idx,
+        bitPlanes: r.bit_planes,
+      });
     }
 
     // Upload + integrate.
