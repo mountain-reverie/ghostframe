@@ -9,7 +9,7 @@ import { WebGpuRenderer } from './webgpu/renderer.js';
 import { WebGpuUnavailableError } from './webgpu/init.js';
 import { ParityRecovery } from './fec';
 import { ParityDecoder, parseParityEnvelope, TILE_PARITY_ENVELOPE } from './parity_decoder.js';
-import { LossTracker, encodeHello } from './feedback';
+import { LossTracker } from './feedback';
 import { attachInputCapture } from './input/wire';
 import { DecodeErrorBatcher } from './decode_error_batcher';
 import { AckBatcher } from './ack';
@@ -18,6 +18,10 @@ import { initDiagnostics } from './diagnostics.js';
 import { prevalidateCdf53 } from './prevalidate_cdf53.js';
 import { applyCdf53Arrival, type Cdf53CoverageEntry } from './cdf53_coverage.js';
 import { bootstrap } from './bootstrap.js';
+import init, { WasmClientCore, tileNackEnvelope } from '../pkg-web/ghostframe_client_wasm.js';
+
+/** Microsecond clock for every `now_us` parameter WasmClientCore expects. */
+const nowUs = (): bigint => BigInt(Math.round(performance.now() * 1000));
 
 const statusEl = document.getElementById('status')!;
 const logEl = document.getElementById('log')!;
@@ -33,6 +37,11 @@ function log(msg: string) {
 }
 
 async function main() {
+  // wasm-bindgen `--target web`: the module must be initialized before any
+  // WasmClientCore construction. Awaited here rather than at module scope —
+  // a top-level await fails the vite build for the configured target.
+  await init();
+
   const url = new URL(window.location.href);
 
   // ?e2e=lossless: strip page chrome so a CDP Page.captureScreenshot
@@ -330,6 +339,9 @@ async function main() {
 
   // Open the feedback bidi stream. Used for: HELLO (one-shot at connect),
   // ReceiverFeedback (periodic), and DECODE_ERROR (rate-limited, on demand).
+  // Can be null — construction catches a failure to open the bidi stream
+  // and returns null rather than throwing, so every write site below must
+  // treat it as optional.
   const feedbackWriter = await (async () => {
     try {
       const bidi = await transport.createBidirectionalStream();
@@ -340,24 +352,70 @@ async function main() {
     }
   })();
 
-  // Emit HELLO immediately. We hard-require WebGPU, so indicesRawEnabled is
-  // unconditional. supportsH264 reflects the result of the renderer's startup
-  // probe (probeH264 in webgpu/renderer.ts): true on Chrome/Chromium where
-  // texture_external + WebCodecs are available, false on Firefox where Naga
-  // currently rejects the h264_blit shader for lack of TEXTURE_EXTERNAL
-  // capability. The server uses this to gate FrameMode::H264 selection so
-  // Firefox never receives unplayable H.264 frames.
-  if (feedbackWriter) {
-    try {
-      await feedbackWriter.write(
-        encodeHello({
-          indicesRawEnabled: true,
-          supportsH264: renderer.h264Supported,
-        }),
-      );
-    } catch (e) {
-      console.warn('HELLO write failed:', e);
+  // ACK/NACK datagram writer. Declared here (moved up from its historical
+  // position just above ackBatcher, further down) because drainTransmit's
+  // Datagram branch needs it immediately: the core queues its HELLO output
+  // at construction, and that queue is drained below before anything else
+  // touches the feedback stream.
+  const ackWriter = transport.datagrams.writable.getWriter();
+  let ackWriteLogged = false;
+
+  // Reliable-tile-emitter NACK counter, fed by drainTransmit below when it
+  // recognises a NACK envelope among the Datagram outputs. Feeds the
+  // periodic fec-coverage log line.
+  let nackSent = 0;
+
+  // Construct the wasm protocol core. We hard-require WebGPU, so
+  // indices_raw_enabled is unconditionally true. supports_h264 reflects the
+  // result of the renderer's startup probe (probeH264 in
+  // webgpu/renderer.ts): true on Chrome/Chromium where texture_external +
+  // WebCodecs are available, false on Firefox where Naga currently rejects
+  // the h264_blit shader for lack of TEXTURE_EXTERNAL capability. The server
+  // uses this to gate FrameMode::H264 selection so Firefox never receives
+  // unplayable H.264 frames.
+  //
+  // tile_delivery_payload is unconditionally true: it gives the browser
+  // validated-but-undecoded payloads for the GPU (TileDelivery::Payload).
+  // Passing false would silently route tiles down the native Decoded path
+  // and hand back RGBA instead — wrong, and it would look like it worked.
+  const core = new WasmClientCore(true, renderer.h264Supported, true, nowUs());
+
+  type WasmPollOutput = { kind: 'Datagram' | 'Stream'; bytes: Uint8Array };
+
+  /** Drain every pending outbound buffer, routing it to the right wire. */
+  async function drainTransmit(): Promise<void> {
+    for (;;) {
+      const out = core.pollTransmit(nowUs()) as WasmPollOutput | undefined;
+      if (out === undefined) break;
+      if (out.kind === 'Datagram') {
+        // NACK envelopes arrive here too (same writer as ACK batches); a
+        // leading TILE_NACK_ENVELOPE discriminator identifies one so the
+        // fec-coverage nackSent counter keeps moving.
+        if (out.bytes.length >= 2 && out.bytes[0] === tileNackEnvelope()) {
+          nackSent += out.bytes[1];
+        }
+        ackWriter.write(out.bytes).catch((err) => {
+          if (!ackWriteLogged) {
+            console.warn('ACK/NACK datagram write failed:', err);
+            ackWriteLogged = true;
+          }
+        });
+      } else {
+        await feedbackWriter?.write(out.bytes);
+      }
     }
+  }
+
+  // Flush the HELLO the core queued at construction. Must happen before
+  // attachInputCapture is wired below, so no input event can beat it onto
+  // the feedback stream. Caught locally (rather than left to main()'s
+  // top-level catch) so a transient write failure logs a warning instead
+  // of aborting the rest of session setup — matching the old manual-HELLO
+  // behavior it replaces.
+  try {
+    await drainTransmit();
+  } catch (e) {
+    console.warn('HELLO write failed:', e);
   }
 
   // Browser → server input forwarding. Hooks pointer / wheel / keyboard
@@ -405,11 +463,11 @@ async function main() {
   const frameAssemblies = new Map<string, FrameAssembly>();
   let latestFullFrameSeq = 0;
 
-  // Batched ACK sender — fire-and-forget unreliable datagrams. The catch
-  // logs the first error per writer so a broken ACK path is discoverable;
-  // subsequent writes are silent to avoid spamming during normal teardown.
-  const ackWriter = transport.datagrams.writable.getWriter();
-  let ackWriteLogged = false;
+  // Batched ACK sender — fire-and-forget unreliable datagrams. `ackWriter`
+  // and `ackWriteLogged` are declared earlier now (needed by drainTransmit
+  // before this point). The catch logs the first error per writer so a
+  // broken ACK path is discoverable; subsequent writes are silent to avoid
+  // spamming during normal teardown.
   const ackBatcher = new AckBatcher((dg) => {
     ackWriter.write(dg).catch((err) => {
       if (!ackWriteLogged) {
@@ -419,14 +477,14 @@ async function main() {
     });
   });
 
-  // Reliable-tile-emitter FEC + NACK counters — surfaced via the periodic
+  // Reliable-tile-emitter FEC counters — surfaced via the periodic
   // `fec-coverage` log line (sibling to `cdf53-coverage`) for side-by-side
   // wire-loss inspection. The counters move once the ParityDecoder dispatch
   // branches below route 0x04 envelopes and record source datagrams.
+  // (`nackSent` is declared earlier now — fed by drainTransmit.)
   let fecRecovered = 0;
   let fecParityRx = 0;
   let fecParityUnrecoverable = 0;
-  let nackSent = 0;
 
   // ParityDecoder window: server emits one parity per K=10 source group with
   // +2K interleave offset, so the decoder needs to hold at least the in-flight
