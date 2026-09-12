@@ -154,6 +154,36 @@ pub struct BrowserlessResult {
     /// timer, independent of any client NACK). Zero does not imply the
     /// path was unfed — a scene can retransmit purely via `nack_hit`.
     pub rto_fired: u64,
+    /// Number of ACKed critical-tier (CDF53 passes 0-3) samples that fed
+    /// `critical_latency_mean_us`/`critical_latency_max_us`/
+    /// `critical_latency_buckets`. Read from
+    /// `IoBridge::latency_stats_publish_handle()` after the bridge task is
+    /// aborted — same cell/republish/read-after-abort pattern as
+    /// `bwe_estimate_bps` (BWE Stage 2.0 baseline measurement). Zero here
+    /// means passes 0-3 were never ACKed in this scene — a pacer built on
+    /// top of this baseline would have nothing to optimise for.
+    pub critical_latency_count: u64,
+    /// Mean of `(received_at - server_emit_us)` in microseconds across
+    /// `critical_latency_count` samples — both timestamps are on the
+    /// server's own clock, so this is an emit-to-ACK-receipt round trip,
+    /// not a one-way delay. Zero when `critical_latency_count` is zero.
+    pub critical_latency_mean_us: u64,
+    /// Max of the same per-sample latency, over the same population.
+    pub critical_latency_max_us: u64,
+    /// Coarse latency histogram over the same population, bucket bounds
+    /// (ms, exclusive upper bound) `[5, 10, 20, 50, 100, 200, 500]` plus an
+    /// open-ended "500+" tail as the 8th bucket. See
+    /// `ghostframe_lib::transport::io_bridge::TierLatencyStats`.
+    pub critical_latency_buckets: [u64; 8],
+    /// Same as `critical_latency_count`, for refinement-tier (CDF53 passes
+    /// 4-13) samples.
+    pub refinement_latency_count: u64,
+    /// Same as `critical_latency_mean_us`, for the refinement tier.
+    pub refinement_latency_mean_us: u64,
+    /// Same as `critical_latency_max_us`, for the refinement tier.
+    pub refinement_latency_max_us: u64,
+    /// Same as `critical_latency_buckets`, for the refinement tier.
+    pub refinement_latency_buckets: [u64; 8],
 }
 
 /// The address the harness uses to identify the client, baked into every
@@ -223,6 +253,10 @@ async fn run_inner(scene: BrowserlessScene) -> anyhow::Result<BrowserlessResult>
     // Same reasoning, same pattern, for the reliable emitter's retransmit
     // counters — see `emitter_stats_publish`'s doc comment in `io_bridge.rs`.
     let emitter_stats_cell = bridge.emitter_stats_publish_handle();
+    // Same reasoning, same pattern, for the per-tier ACK latency stats
+    // (BWE Stage 2.0 baseline measurement) — see `latency_stats_publish`'s
+    // doc comment in `io_bridge.rs`.
+    let latency_stats_cell = bridge.latency_stats_publish_handle();
     // `IoBridge::run` is an infinite event loop that only returns on EOF or
     // error; it must be aborted explicitly (see below) rather than awaited.
     let bridge_handle = tokio::task::spawn_local(async move {
@@ -268,6 +302,9 @@ async fn run_inner(scene: BrowserlessScene) -> anyhow::Result<BrowserlessResult>
     let emitter_stats = *emitter_stats_cell
         .lock()
         .expect("emitter_stats_publish mutex poisoned");
+    let (critical_latency, refinement_latency) = *latency_stats_cell
+        .lock()
+        .expect("latency_stats_publish mutex poisoned");
 
     Ok(BrowserlessResult {
         framebuffer,
@@ -283,6 +320,14 @@ async fn run_inner(scene: BrowserlessScene) -> anyhow::Result<BrowserlessResult>
         nack_hit: emitter_stats.nack_hit,
         nack_miss: emitter_stats.nack_miss,
         rto_fired: emitter_stats.rto_fired,
+        critical_latency_count: critical_latency.count,
+        critical_latency_mean_us: critical_latency.mean_us(),
+        critical_latency_max_us: critical_latency.max_us,
+        critical_latency_buckets: critical_latency.buckets,
+        refinement_latency_count: refinement_latency.count,
+        refinement_latency_mean_us: refinement_latency.mean_us(),
+        refinement_latency_max_us: refinement_latency.max_us,
+        refinement_latency_buckets: refinement_latency.buckets,
     })
 }
 
