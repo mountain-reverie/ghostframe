@@ -73,6 +73,31 @@ pub struct BweSnapshot {
     pub pacer_rate_bps: Option<u64>,
 }
 
+/// A probe goog_cc has asked for (BWE Stage 2.4), surfaced from
+/// `NetworkControlUpdate::probe_cluster_configs`. Rates and durations are
+/// converted out of goog_cc's units at this boundary so nothing downstream
+/// of `BweWrapper` needs the crate's types — see this module's doc comment
+/// on why `goog_cc` types don't leak past here.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ProbeRequest {
+    /// goog_cc's `ProbeClusterConfig::id`. Threaded through unchanged so
+    /// the eventual `PacedPacketInfo::probe_cluster_id` matches what
+    /// goog_cc itself assigned the cluster.
+    pub id: i32,
+    pub target_rate_bps: u64,
+    pub duration: Duration,
+    /// From the config's `target_probe_count`. The estimator discards a
+    /// cluster with fewer acknowledged packets than this
+    /// (`probe_bitrate_estimator.rs:137`).
+    pub min_probes: i64,
+    /// `target_rate x duration`, converted from bits to bytes. goog_cc
+    /// offers no helper for this derivation — `PacedPacketInfo::new` just
+    /// takes it as a plain `i64` argument — so it is derived here and
+    /// pinned by a bench assertion (BWE Stage 2.4 Task 4) against a known
+    /// config.
+    pub min_bytes: i64,
+}
+
 // ── BweWrapper ────────────────────────────────────────────────────────────────
 
 /// Bandwidth estimator wrapper. Delegates to a real `GoogCcDriver`
@@ -124,6 +149,17 @@ impl BweWrapper {
     /// on the estimator's derived RTT. See `GoogCcDriver::note_path_rtt`.
     pub fn note_path_rtt(&mut self, rtt: Duration) {
         self.driver.note_path_rtt(rtt);
+    }
+
+    /// Return and clear the most recently requested probe cluster, if any
+    /// (BWE Stage 2.4). Consumes it: a config is surfaced exactly once
+    /// rather than re-triggering on every subsequent poll that happens to
+    /// see it still stored. Only one request is ever held — a later config
+    /// (from the same or a subsequent `update()`) replaces whatever was
+    /// pending, since `IoBridge` runs at most one active probe window at a
+    /// time.
+    pub fn take_probe_request(&mut self) -> Option<ProbeRequest> {
+        self.driver.take_probe_request()
     }
 }
 

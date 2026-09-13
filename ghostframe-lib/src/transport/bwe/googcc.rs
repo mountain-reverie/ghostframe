@@ -9,8 +9,8 @@ use super::timeline::Lo16Timeline;
 use super::{AckArrival, BweSnapshot};
 use goog_cc::network_control::{NetworkControllerConfig, NetworkControllerInterface};
 use goog_cc::transport::{
-    NetworkControlUpdate, PacketResult, ProcessInterval, SentPacket, TargetRateConstraints,
-    TransportPacketsFeedback,
+    NetworkControlUpdate, PacketResult, ProbeClusterConfig, ProcessInterval, SentPacket,
+    TargetRateConstraints, TransportPacketsFeedback,
 };
 use goog_cc::units::{DataRate, DataSize, Timestamp};
 use goog_cc::{GoogCcConfig, GoogCcNetworkController};
@@ -42,6 +42,15 @@ pub(crate) struct GoogCcDriver {
     /// consumes this directly rather than deriving a rate from
     /// `target_rate` (see `absorb`'s doc comment on that field).
     pacer_rate_bps: Option<u64>,
+    /// The most recently requested, not-yet-consumed probe cluster (BWE
+    /// Stage 2.4), converted out of goog_cc's units by `to_probe_request`.
+    /// `absorb` overwrites this whenever `NetworkControlUpdate` carries a
+    /// new config — one active probe at a time, per the design: a config
+    /// this driver hasn't surfaced yet is itself indistinguishable from
+    /// "no probe pending" to any caller, so overwriting rather than
+    /// queuing loses nothing a caller could have observed. Cleared by
+    /// `take_probe_request`.
+    pending_probe_request: Option<super::ProbeRequest>,
 }
 
 /// Newtype carrying the `Send` assertion, so it covers exactly the one type
@@ -105,6 +114,7 @@ impl GoogCcDriver {
             path_rtt: None,
             implausible_rtt_samples: 0,
             pacer_rate_bps: None,
+            pending_probe_request: None,
         }
     }
 
@@ -256,8 +266,10 @@ impl GoogCcDriver {
             // "prefer draining queued work faster over sending padding":
             // our queues normally hold real refinement work that is wanted
             // anyway, so there's no case where we'd pad instead of just
-            // sending that. `probe_cluster_configs` is also unconsumed here
-            // — that is 2.4's job, not 2.2's.
+            // sending that. `probe_cluster_configs` (below) is 2.4's, kept
+            // as a separate `if` from this one rather than folded in since
+            // pacer config and probe requests arrive independently and
+            // either can be absent from a given update.
             //
             // `data_window` / `time_window` are guarded finite before
             // calling `data_rate()`: goog_cc always sets `time_window` to a
@@ -274,6 +286,51 @@ impl GoogCcDriver {
                 }
             }
         }
+        // BWE Stage 2.4: `ProbeController` may ask for a burst above the
+        // current estimate to discover headroom after a capacity increase.
+        // Store the *most recent* config -- `IoBridge` keeps one active
+        // probe window at a time (overlapping clusters would interleave
+        // their packets and corrupt both measurements), so an
+        // as-yet-unsurfaced earlier config in this same batch is
+        // indistinguishable to any caller from "never requested" and can
+        // simply be overwritten.
+        if let Some(cfg) = upd.probe_cluster_configs.last() {
+            self.pending_probe_request = Some(Self::to_probe_request(cfg));
+        }
+    }
+
+    /// Convert a goog_cc `ProbeClusterConfig` into our own `ProbeRequest`,
+    /// converting units at this boundary so the type doesn't leak
+    /// `goog_cc` types past the `bwe` module.
+    fn to_probe_request(cfg: &ProbeClusterConfig) -> super::ProbeRequest {
+        // `bps()` / `us()` return negative only for `minus_infinity()`-ish
+        // sentinel values goog_cc never actually hands back here; `.max(0)`
+        // is a defensive floor, not an expected path.
+        let target_rate_bps = cfg.target_data_rate.bps().max(0);
+        let duration_us = cfg.target_duration.us().max(0);
+        super::ProbeRequest {
+            id: cfg.id,
+            target_rate_bps: target_rate_bps as u64,
+            duration: Duration::from_micros(duration_us as u64),
+            min_probes: cfg.target_probe_count.max(0) as i64,
+            // bits/sec * microseconds, then /8 (bits -> bytes) /1_000_000
+            // (microseconds -> seconds) = bytes. goog_cc exposes no direct
+            // helper for this -- `PacedPacketInfo::new` takes `min_bytes`
+            // as a plain `i64` -- so this derivation is ours; pinned by a
+            // bench assertion against a known config (BWE Stage 2.4
+            // Task 4). Both factors are well under 2^32 (rate clamped to
+            // `MAX_BPS` = 2e8, duration realistically under a few seconds)
+            // so the product fits comfortably in i64 with no overflow risk.
+            min_bytes: (target_rate_bps * duration_us) / 8_000_000,
+        }
+    }
+
+    /// Return and clear the pending probe request, if any -- see
+    /// `pending_probe_request`'s doc comment. A config is consumed exactly
+    /// once rather than re-triggering on every poll that still sees it
+    /// stored.
+    pub(crate) fn take_probe_request(&mut self) -> Option<super::ProbeRequest> {
+        self.pending_probe_request.take()
     }
 
     fn to_timestamp(&self, now: Instant) -> Timestamp {
