@@ -7,10 +7,11 @@
 //! Deterministic. Unlike the browserless scenes this is a pure function of
 //! its inputs, so any failure here reproduces exactly from the source.
 
-use ghostframe_lib::transport::bwe::{AckArrival, BweWrapper};
+use ghostframe_lib::transport::bwe::{AckArrival, BweWrapper, ProbeRequest};
 use ghostframe_lib::transport::io_bridge::{
     combine_pacing_budget, pacer_tick_budget_bytes, select_pacing_mode, PacingMode,
 };
+use ghostframe_lib::transport::reliable_emitter::cache::ProbeTag;
 use std::time::{Duration, Instant};
 
 const PKT_BYTES: u32 = 1200;
@@ -216,5 +217,283 @@ fn estimate_survives_a_timestamp_wrap() {
     assert!(
         final_bps > 1_000_000,
         "estimate {final_bps} collapsed across a timestamp wrap"
+    );
+}
+
+// ── BWE Stage 2.4: probe clusters — the gate ────────────────────────────────
+//
+// Three different claims, per the design doc: (1) the config was read, (2)
+// packets were tagged, (3) the estimator accepted the cluster. Tasks 1-3
+// proved (1) and (2) — a tagged `AckArrival` reaches `PacedPacketInfo`
+// intact. Only (3) means probing actually works, and
+// `probe_bitrate_estimator.rs:137` discards an under-filled cluster with no
+// signal at all. Every test below distinguishes "read" from "consumed".
+//
+// The cluster requests driving these tests are real, not fabricated:
+// `GoogCcNetworkController`'s very first `on_process_interval` call applies
+// its `initial_config` via `reset_constraints`, which calls
+// `ProbeController::set_bitrates` while the controller is still in its
+// startup `State::Init` — that unconditionally fires the exponential-probing
+// path (`initiate_exponential_probing`: one cluster at 3x the seed rate, one
+// at 6x), and `absorb` (`googcc.rs`) keeps the more recent (6x) one as
+// `pending_probe_request`. A single ACK-arrival batch is enough to trigger
+// it. (This only fires at all because `GoogCcDriver::new` now calls
+// `on_network_availability` — see that constructor's doc comment: without
+// it `ProbeController` is stuck in `State::Init` forever and never proposes
+// a cluster, which is what this bench found before that fix landed.)
+
+/// Trigger goog_cc's real initial-probing path and return the wrapper, its
+/// clock base, and the `ProbeRequest` it surfaced. Panics if none arrives —
+/// that would mean `ProbeController` never left `State::Init`, which is
+/// itself the finding to report, not something to paper over with a
+/// fabricated `ProbeRequest`.
+fn request_a_real_probe(seed_bps: u64) -> (BweWrapper, Instant, ProbeRequest) {
+    let t0 = Instant::now();
+    let mut w = BweWrapper::new(seed_bps, t0);
+    // Any non-empty batch trips `on_process_interval`; the content doesn't
+    // matter to the probe path, only that `update()` runs once.
+    let seed_batch = vec![AckArrival {
+        wire_seq: 0,
+        server_emit_us: 0,
+        client_arrival_ms_lo16: 15,
+        size_bytes: PKT_BYTES,
+        probe: None,
+    }];
+    w.update(&seed_batch, t0 + Duration::from_millis(20));
+    let req = w.take_probe_request().unwrap_or_else(|| {
+        panic!(
+            "goog_cc's ProbeController did not request an initial probe \
+             cluster from a single seed batch — the exponential-probing \
+             path did not fire (see GoogCcDriver::new's on_network_availability \
+             call, required for ProbeController to ever leave State::Init)"
+        )
+    });
+    (w, t0, req)
+}
+
+/// Build one tagged `AckArrival`, the `i`-th of `n` packets in a fill
+/// attempt against `req`, each `pkt_bytes` and 1 ms apart. `bytes_sent`
+/// (the cluster's running total *before* this packet) is threaded through
+/// by the caller, mirroring `ProbeTag::bytes_sent_before`'s real semantics.
+fn tagged_probe_packet(
+    req: &ProbeRequest,
+    i: u32,
+    pkt_bytes: u32,
+    bytes_sent_before: i64,
+) -> AckArrival {
+    let send_us = 100_000 + (i as u64) * 1_000;
+    let arrival_ms = send_us / 1_000 + 10 + i as u64;
+    AckArrival {
+        wire_seq: 1_000 + i,
+        server_emit_us: send_us,
+        client_arrival_ms_lo16: (arrival_ms & 0xFFFF) as u16,
+        size_bytes: pkt_bytes,
+        probe: Some(ProbeTag {
+            id: req.id,
+            min_probes: req.min_probes,
+            min_bytes: req.min_bytes,
+            bytes_sent_before,
+        }),
+    }
+}
+
+/// Step 1 — a cluster is emitted *and consumed*. Fill a real, requested
+/// cluster comfortably past both thresholds and assert the estimate moves.
+///
+/// The control (identical timing and sizes, `probe: None`) is the point:
+/// any feedback batch nudges the acknowledged-bitrate estimator a little,
+/// so "the number changed" alone would not prove the *probe* path fired.
+/// The tagged run must move dramatically more than that baseline —
+/// specifically, toward the cluster's target rate — which only the probe
+/// estimator's short-circuit into `set_send_bitrate` can produce from an
+/// 11-packet batch.
+#[test]
+fn a_requested_probe_cluster_is_filled_and_consumed() {
+    let (mut w, t0, req) = request_a_real_probe(1_000_000);
+    let before = w.snapshot().bitrate_bps;
+
+    // Comfortably past both min_probes and min_bytes -- the estimator's own
+    // margin is 80% of each (probe_bitrate_estimator.rs's
+    // MIN_RECEIVED_PROBES_RATIO / MIN_RECEIVED_BYTES_RATIO), so this uses a
+    // healthy multiple of the raw thresholds rather than the exact floor.
+    let n = (req.min_probes as u32 * 2).max(8);
+    let pkt_bytes = ((req.min_bytes as u64 / n as u64) + 100) as u32;
+    assert!(
+        (n as i64) >= req.min_probes && (n as i64 * pkt_bytes as i64) >= req.min_bytes,
+        "test construction bug: fill batch (n={n}, bytes={pkt_bytes}) does not \
+         actually clear min_probes={} / min_bytes={}",
+        req.min_probes,
+        req.min_bytes
+    );
+
+    let mut bytes_sent_before = 0i64;
+    let batch: Vec<AckArrival> = (0..n)
+        .map(|i| {
+            let pkt = tagged_probe_packet(&req, i, pkt_bytes, bytes_sent_before);
+            bytes_sent_before += pkt_bytes as i64;
+            pkt
+        })
+        .collect();
+    let after = w
+        .update(&batch, t0 + Duration::from_millis(200))
+        .bitrate_bps;
+
+    // Control: the same shape of traffic, untagged, from a fresh wrapper
+    // seeded identically -- isolates "any feedback moves the number a
+    // little" from "the probe estimator accepted this cluster".
+    let (mut control, ct0, _) = request_a_real_probe(1_000_000);
+    let control_before = control.snapshot().bitrate_bps;
+    let control_batch: Vec<AckArrival> = (0..n)
+        .map(|i| AckArrival {
+            probe: None,
+            ..tagged_probe_packet(&req, i, pkt_bytes, 0)
+        })
+        .collect();
+    let control_after = control
+        .update(&control_batch, ct0 + Duration::from_millis(200))
+        .bitrate_bps;
+
+    assert_ne!(
+        after, before,
+        "estimate did not move at all after a filled, requested probe cluster"
+    );
+    assert!(
+        after > control_after * 2,
+        "tagged fill (before={before} after={after}) did not move \
+         substantially more than an identically-shaped untagged control \
+         (before={control_before} after={control_after}) -- this is the \
+         evidence that the *probe* path fired, not just routine feedback \
+         absorption"
+    );
+}
+
+/// Step 2 — an under-filled cluster is discarded, silently, exactly as
+/// `probe_bitrate_estimator.rs:137` documents. Same real request as step 1,
+/// but the fill stays under the estimator's byte threshold (well under even
+/// its 80%-of-min_bytes acceptance margin) while still meeting
+/// `min_probes` on packet count alone.
+///
+/// Without this test, step 1 could pass while every real probe silently
+/// fails: an over-filled cluster trivially satisfies both thresholds, and
+/// nothing else distinguishes "the estimator is wired correctly" from "the
+/// estimator ignores the tag and something else moved the number".
+#[test]
+fn an_underfilled_probe_cluster_is_discarded_silently() {
+    let (mut w, t0, req) = request_a_real_probe(1_000_000);
+    let before = w.snapshot().bitrate_bps;
+
+    // Meets min_probes on count, but well under 80% of min_bytes.
+    let n = (req.min_probes as u32).max(5);
+    let pkt_bytes = ((req.min_bytes as u64 / n as u64) / 4).max(1) as u32;
+    let total_bytes = n as i64 * pkt_bytes as i64;
+    assert!(
+        total_bytes < (req.min_bytes as f64 * 0.8) as i64,
+        "test construction bug: fill batch (total={total_bytes}) is not \
+         actually under the estimator's 80%-of-min_bytes threshold ({})",
+        (req.min_bytes as f64 * 0.8) as i64
+    );
+
+    let mut bytes_sent_before = 0i64;
+    let batch: Vec<AckArrival> = (0..n)
+        .map(|i| {
+            let pkt = tagged_probe_packet(&req, i, pkt_bytes, bytes_sent_before);
+            bytes_sent_before += pkt_bytes as i64;
+            pkt
+        })
+        .collect();
+    let after = w
+        .update(&batch, t0 + Duration::from_millis(200))
+        .bitrate_bps;
+
+    // Control: an identically-shaped, fully untagged batch from a fresh,
+    // identically-seeded wrapper. The under-filled cluster's effect on the
+    // estimate should be indistinguishable from ordinary traffic of the
+    // same size and timing -- that is what "silently discarded" means.
+    let (mut control, ct0, _) = request_a_real_probe(1_000_000);
+    let control_batch: Vec<AckArrival> = (0..n)
+        .map(|i| AckArrival {
+            probe: None,
+            ..tagged_probe_packet(&req, i, pkt_bytes, 0)
+        })
+        .collect();
+    let control_after = control
+        .update(&control_batch, ct0 + Duration::from_millis(200))
+        .bitrate_bps;
+
+    assert_eq!(
+        after, control_after,
+        "before={before} after={after} (control={control_after}) -- an \
+         under-filled cluster should land exactly like ordinary untagged \
+         traffic of the same shape, not partially move the estimate"
+    );
+}
+
+/// Step 3 — the `min_bytes` derivation is right. goog_cc offers no helper
+/// for `target_data_rate x target_duration` (`PacedPacketInfo::new` takes
+/// `min_bytes` as a plain `i64`), so `to_probe_request` (`googcc.rs`)
+/// computes it itself. A silent error there makes every cluster either
+/// trivially pass (derived value too low) or never pass (too high), and
+/// this checks it against a real, controller-produced `ProbeRequest`
+/// rather than a hand-picked one.
+#[test]
+fn probe_request_min_bytes_is_target_rate_times_duration() {
+    let (_w, _t0, req) = request_a_real_probe(1_000_000);
+
+    // bits/sec * microseconds / 8 (bits->bytes) / 1_000_000 (us->s) = bytes,
+    // mirroring `GoogCcDriver::to_probe_request`'s own derivation exactly.
+    let expected_min_bytes =
+        (req.target_rate_bps as i64 * req.duration.as_micros() as i64) / 8_000_000;
+
+    assert_eq!(
+        req.min_bytes, expected_min_bytes,
+        "min_bytes ({}) does not equal target_rate_bps ({}) x duration ({:?}) \
+         -- the derivation in GoogCcDriver::to_probe_request has drifted",
+        req.min_bytes, req.target_rate_bps, req.duration
+    );
+    // Sanity: goog_cc's default exponential probe is 6x a 1 Mbit/s seed for
+    // 15ms, at 5 minimum packets -- pin the concrete numbers too, so a
+    // change in goog_cc's own defaults (a dependency bump) is visible here
+    // rather than only in the formula check above.
+    assert_eq!(req.target_rate_bps, 6_000_000);
+    assert_eq!(req.duration, Duration::from_millis(15));
+    assert_eq!(req.min_probes, 5);
+    assert_eq!(req.min_bytes, 11_250);
+}
+
+/// Step 4 — untagged traffic is unaffected. `ProbeController` requests a
+/// cluster from the very first batch (see `request_a_real_probe`), but
+/// ordinary traffic that never carries the tag must behave exactly as it
+/// did before probing existed: a clean link's estimate still rises above
+/// its seed. This is the same assertion as `wrapper_rises_on_a_clean_link`
+/// in `bwe/mod.rs`, run here specifically *with* a pending, unconsumed
+/// probe request in play, to prove the two paths don't interact.
+#[test]
+fn untagged_traffic_tracks_normally_around_a_pending_probe() {
+    let (mut w, t0, _req) = request_a_real_probe(4_000_000);
+
+    let mut last = w.snapshot().bitrate_bps;
+    for step in 0..400u32 {
+        let batch: Vec<AckArrival> = (0..12u32)
+            .map(|i| {
+                let emit_us = ((step * 20 + i) as u64) * 1_000;
+                AckArrival {
+                    wire_seq: step * 12 + i,
+                    server_emit_us: emit_us,
+                    client_arrival_ms_lo16: ((emit_us / 1_000 + 15) & 0xFFFF) as u16,
+                    size_bytes: PKT_BYTES,
+                    probe: None,
+                }
+            })
+            .collect();
+        last = w
+            .update(&batch, t0 + Duration::from_millis(20 * step as u64))
+            .bitrate_bps;
+    }
+
+    assert!(
+        last > 4_000_000,
+        "estimate {last} did not rise on a clean link with an unconsumed \
+         probe request pending -- untagged traffic should be unaffected by \
+         probe machinery it never opted into"
     );
 }
