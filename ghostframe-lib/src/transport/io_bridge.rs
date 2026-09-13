@@ -1750,21 +1750,23 @@ impl IoBridge {
         self.reliable_emitter.drain(&mut adapter, tick_now);
     }
 
-    /// Build the continuation an injected drain should leave behind, given
+    /// Build the continuation a scheduler drain should leave behind, given
     /// the (already-clamped) budget it drained against and how many bytes
-    /// actually went out. Mirrors the continuation bookkeeping at the end of
-    /// `dispatch_dirty_tiles_via_scheduler` (`:1452-1468`): `None` once the
-    /// budget is fully spent, otherwise `Some` carrying the injected frame's
-    /// own identity (`seq`/`timestamp_us`/`max_frag`) and the leftover
-    /// budget, so `Event::DatagramsUnblocked` -> `resume_scheduler_continuation`
-    /// can top the drain back up without waiting for the next injected
-    /// frame.
+    /// actually went out. `None` once the budget is fully spent, otherwise
+    /// `Some` carrying the frame's own identity (`seq`/`timestamp_us`/
+    /// `max_frag`) and the leftover budget, so
+    /// `Event::DatagramsUnblocked` -> `resume_scheduler_continuation` can
+    /// top the drain back up without waiting for the next capture tick or
+    /// injected frame.
+    ///
+    /// Used by `emit_via_scheduler`, shared by both the capture and
+    /// injected-harness paths.
     ///
     /// A free function (no `&self`) so it is directly unit-testable: unlike
-    /// its call site in `apply_injected_frame` (behind
-    /// `compute_max_datagram_size()`, which needs a live post-handshake
-    /// session), this is pure arithmetic over its arguments.
-    fn injected_continuation_after_drain(
+    /// its callers (behind `compute_max_datagram_size()`, which needs a
+    /// live post-handshake session), this is pure arithmetic over its
+    /// arguments.
+    fn scheduler_continuation_after_drain(
         seq: u32,
         timestamp_us: u32,
         max_frag: usize,
@@ -1972,78 +1974,38 @@ impl IoBridge {
             * SCHEDULER_TICK_INTERVAL_US
             * SCHEDULER_TICK_BUDGET_FRACTION) as usize)
             .max(SCHEDULER_TICK_BUDGET_FLOOR_BYTES);
-        let tick_budget_bytes = match policy {
-            SchedulerEmissionPolicy::CpuRawOnly => usize::MAX,
+        // Clamp the AIMD-derived budget to what `quinn-proto` can actually
+        // accept right now. `scheduler.tick` is destructive on the
+        // refinement queue (popped work is removed, not marked `InFlight`),
+        // and `send_datagram` returning `Err(Blocked)` discards the
+        // already-popped TileWork irrecoverably. Pre-checking
+        // `send_buffer_space()` — the only thing that triggers quinn's
+        // Blocked (`outgoing_total + data.len() > datagram_send_buffer_size`
+        // in quinn-proto/datagrams.rs) — prevents the scheduler from
+        // popping more than quinn can absorb in this tick. Anything left
+        // over stays in `refinement_queue` for the next `DatagramsUnblocked`
+        // continuation or the next 33 ms capture tick.
+        //
+        // The 80 % safety fraction (`QUINN_SEND_BUFFER_SAFETY_FRACTION`)
+        // leaves headroom for per-fragment wire overhead (WT quarter-
+        // stream-id VarInt + tile-fragment header, ~30–60 B per datagram)
+        // that `scheduler.tick` accounts as payload bytes only. That clamp,
+        // the pacing combine, the drain, and the continuation bookkeeping
+        // all live in `emit_via_scheduler`, shared with `apply_injected_
+        // frame` — see its doc comment.
+        //
+        // CpuRawOnly bypasses all of that with `usize::MAX` so unit
+        // fixtures that pre-seed tiles still drain in one tick.
+        let (stats, drained_bytes, drained_count) = match policy {
+            SchedulerEmissionPolicy::CpuRawOnly => {
+                self.drain_scheduler_into_quinn(seq, timestamp_us, max_frag, usize::MAX)
+            }
             _ => {
-                // Clamp the AIMD-derived budget to what `quinn-proto` can
-                // actually accept right now. `scheduler.tick` is
-                // destructive on the refinement queue (popped work is
-                // removed, not marked `InFlight`), and `send_datagram`
-                // returning `Err(Blocked)` discards the already-popped
-                // TileWork irrecoverably. Pre-checking
-                // `send_buffer_space()` — the only thing that triggers
-                // quinn's Blocked (`outgoing_total + data.len() >
-                // datagram_send_buffer_size` in
-                // quinn-proto/datagrams.rs) — prevents the scheduler
-                // from popping more than quinn can absorb in this tick.
-                // Anything left over stays in `refinement_queue` for
-                // the next `DatagramsUnblocked` continuation or the next
-                // 33 ms capture tick.
-                //
-                // The 80 % safety fraction
-                // (`QUINN_SEND_BUFFER_SAFETY_FRACTION`) leaves headroom
-                // for per-fragment wire overhead (WT quarter-stream-id
-                // VarInt + tile-fragment header, ~30–60 B per datagram)
-                // that `scheduler.tick` accounts as payload bytes only.
                 let aimd_budget =
                     ((base_budget_bytes as f64) * self.tick_budget_multiplier) as usize;
-                // BWE Stage 2.2: goog_cc's pacer additionally bounds the
-                // budget once the estimator has enough samples to trust
-                // (`PacingMode`) — `min(aimd_budget, googcc_budget)`, not a
-                // replacement. `clamp_to_quinn_capacity` still runs last.
-                let bwe_snap = self.bwe.snapshot();
-                let pacing_mode = select_pacing_mode(bwe_snap.samples_seen);
-                // BWE Stage 2.4: a probe window overrides the pacing budget
-                // outright rather than going through `combine_pacing_budget`
-                // — probing exists to send *above* goog_cc's own current
-                // estimate, so `min(aimd, googcc)` would defeat the point.
-                // `clamp_to_quinn_capacity` still runs last and still wins
-                // (below): a probe is not worth dropping tiles for, and
-                // that clamp exists because `scheduler.tick` is
-                // destructive.
-                let pre_clamp_budget = match &self.active_probe {
-                    Some(probe) => {
-                        pacer_tick_budget_bytes(probe.target_rate_bps, SCHEDULER_TICK_INTERVAL_US)
-                    }
-                    None => combine_pacing_budget(
-                        pacing_mode,
-                        aimd_budget,
-                        bwe_snap.pacer_rate_bps,
-                        SCHEDULER_TICK_INTERVAL_US,
-                    ),
-                };
-                self.clamp_to_quinn_capacity(pre_clamp_budget)
+                self.emit_via_scheduler(seq, timestamp_us, max_frag, aimd_budget)
             }
         };
-        let (stats, drained_bytes, drained_count) =
-            self.drain_scheduler_into_quinn(seq, timestamp_us, max_frag, tick_budget_bytes);
-        // Cache the continuation context so `Event::DatagramsUnblocked`
-        // can resume draining the same logical frame without waiting for
-        // the next 33 ms capture tick. CpuRawOnly drains to completion
-        // in one shot under `usize::MAX`; no continuation needed.
-        if !matches!(policy, SchedulerEmissionPolicy::CpuRawOnly) {
-            let remaining = tick_budget_bytes.saturating_sub(drained_bytes);
-            self.scheduler_continuation = if remaining > 0 {
-                Some(SchedulerContinuation {
-                    seq,
-                    timestamp_us,
-                    max_frag,
-                    remaining_budget_bytes: remaining,
-                })
-            } else {
-                None
-            };
-        }
         // ---- AIMD feedback: shrink the multiplier on any send error,
         //      ramp back up on a clean dispatch. CpuRawOnly bypasses the
         //      tracking — it ran with unbudgeted `usize::MAX` and unit
@@ -2063,7 +2025,7 @@ impl IoBridge {
             }
             tracing::debug!(
                 drained_count = drained_count,
-                tick_budget_bytes = tick_budget_bytes,
+                drained_bytes = drained_bytes,
                 base_budget_bytes = base_budget_bytes,
                 bytes_per_us = self.adaptation_context.bytes_per_us,
                 errs_this_dispatch = errs_this_dispatch,
@@ -2291,6 +2253,83 @@ impl IoBridge {
         (stats, total_wire_bytes_sent, drained_count)
     }
 
+    /// The one emission tail: probe override -> pacing combine -> quinn
+    /// clamp -> drain -> continuation bookkeeping.
+    ///
+    /// Both the capture path (`dispatch_dirty_tiles_via_scheduler`) and the
+    /// harness injection path (`apply_injected_frame`) call this, so they
+    /// cannot drift — four BWE Stage 2 defects came from feeding what were
+    /// once two independent copies of this logic different inputs. Anything
+    /// that must differ between the two callers belongs *before* this call,
+    /// in how their work is produced and enqueued, never in how it is
+    /// emitted.
+    ///
+    /// Takes `base_budget_bytes` and nothing that identifies the caller. If
+    /// this function ever needs to know who called it, the extraction has
+    /// failed and the split has been rebuilt one level down.
+    ///
+    /// `SchedulerEmissionPolicy::CpuRawOnly` does not call this at all — it
+    /// bypasses probe override, pacing combine, the quinn clamp, AND
+    /// continuation bookkeeping outright with a direct `usize::MAX` drain
+    /// (see the `match policy` in `dispatch_dirty_tiles_via_scheduler`).
+    /// That is a bigger bypass than any budget value this function could be
+    /// handed would produce, so it stays a caller-side branch rather than a
+    /// parameter here.
+    ///
+    /// The AIMD `tick_budget_multiplier` is likewise applied by the caller,
+    /// before this is called: it is fed by `send_datagram` errors observed
+    /// on the dispatch path only, and the injected path has no equivalent
+    /// feedback signal.
+    fn emit_via_scheduler(
+        &mut self,
+        seq: u32,
+        timestamp_us: u32,
+        max_frag: usize,
+        base_budget_bytes: usize,
+    ) -> (FrameSendStats, usize, usize) {
+        // BWE Stage 2.2: goog_cc's pacer additionally bounds the budget
+        // once the estimator has enough samples to trust (`PacingMode`) —
+        // `min(base_budget_bytes, googcc_budget)`, not a replacement.
+        let bwe_snap = self.bwe.snapshot();
+        let pacing_mode = select_pacing_mode(bwe_snap.samples_seen);
+        // BWE Stage 2.4: a probe window overrides the pacing budget
+        // outright rather than going through `combine_pacing_budget` —
+        // probing exists to send *above* goog_cc's own current estimate,
+        // so `min(base, googcc)` would defeat the point. `clamp_to_quinn_
+        // capacity` still runs last (below) and still wins: a probe is not
+        // worth dropping tiles for, and that clamp exists because
+        // `scheduler.tick` is destructive.
+        let pre_clamp_budget = match &self.active_probe {
+            Some(probe) => {
+                pacer_tick_budget_bytes(probe.target_rate_bps, SCHEDULER_TICK_INTERVAL_US)
+            }
+            None => combine_pacing_budget(
+                pacing_mode,
+                base_budget_bytes,
+                bwe_snap.pacer_rate_bps,
+                SCHEDULER_TICK_INTERVAL_US,
+            ),
+        };
+        // Never pop more from the scheduler than quinn can actually absorb
+        // right now — see `clamp_to_quinn_capacity`'s doc comment for why
+        // this is mandatory rather than defensive.
+        let budget_bytes = self.clamp_to_quinn_capacity(pre_clamp_budget);
+        let (stats, drained_bytes, drained_count) =
+            self.drain_scheduler_into_quinn(seq, timestamp_us, max_frag, budget_bytes);
+        // Cache the continuation context so `Event::DatagramsUnblocked` ->
+        // `resume_scheduler_continuation` can resume draining the same
+        // logical frame without waiting for the next capture tick / next
+        // injected frame.
+        self.scheduler_continuation = Self::scheduler_continuation_after_drain(
+            seq,
+            timestamp_us,
+            max_frag,
+            budget_bytes,
+            drained_bytes,
+        );
+        (stats, drained_bytes, drained_count)
+    }
+
     /// Enqueue an injected frame's tile work into the scheduler, then
     /// attempt to drain it to the wire. Used by both the `run()` select
     /// arm and the `drain_injection_for_test` test accessor, so the two
@@ -2441,57 +2480,16 @@ impl IoBridge {
                 rows * crate::tile::TILE_SIZE,
             );
 
-            // BWE Stage 2.2: goog_cc's pacer also bounds the injected-scene
-            // budget, same as the real capture path — see
-            // `combine_pacing_budget`'s doc comment on why the two sites
-            // must not drift apart. This does NOT reintroduce AIMD
-            // (`tick_budget_multiplier`) here: `inj.budget_bytes` is passed
-            // through unmodified when goog_cc doesn't bind, exactly as
-            // before. Without this, the browserless harness's scenes —
-            // which always pass `budget_bytes: usize::MAX` and rely on
-            // `clamp_to_quinn_capacity` alone — would never exercise
-            // `PacingMode::Paced` at all, and `bwe-tier-latency-baseline.md`'s
-            // guard measurement would be blind to this change.
-            let bwe_snap = self.bwe.snapshot();
-            // BWE Stage 2.4: same override as
-            // `dispatch_dirty_tiles_via_scheduler` — an active probe window
-            // replaces `combine_pacing_budget` outright rather than being
-            // combined with it, since a probe exists to send above the
-            // current estimate. `clamp_to_quinn_capacity` still runs last,
-            // below, and still wins.
-            let pre_clamp_budget = match &self.active_probe {
-                Some(probe) => {
-                    pacer_tick_budget_bytes(probe.target_rate_bps, SCHEDULER_TICK_INTERVAL_US)
-                }
-                None => combine_pacing_budget(
-                    select_pacing_mode(bwe_snap.samples_seen),
-                    inj.budget_bytes,
-                    bwe_snap.pacer_rate_bps,
-                    SCHEDULER_TICK_INTERVAL_US,
-                ),
-            };
-            // Never pop more from the scheduler than quinn can absorb right
-            // now — see `clamp_to_quinn_capacity`'s doc comment for why this
-            // is mandatory rather than defensive.
-            let budget_bytes = self.clamp_to_quinn_capacity(pre_clamp_budget);
-            let (_, drained_bytes, _) =
-                self.drain_scheduler_into_quinn(inj.seq, inj.timestamp_us, max_frag, budget_bytes);
-            // Mirror dispatch_dirty_tiles_via_scheduler's post-drain
-            // continuation bookkeeping (:1452-1468) so a budget-limited
-            // injected drain resumes on the next Event::DatagramsUnblocked
-            // instead of waiting for the *next injected frame* — which,
-            // given Commit 1's clamp makes budget-limited drains the normal
-            // case rather than the exception, would otherwise strand
-            // refinement work indefinitely once a scene stops injecting new
-            // frames (resume_scheduler_continuation returns immediately on
-            // `None`, :1774-1778).
-            self.scheduler_continuation = Self::injected_continuation_after_drain(
-                inj.seq,
-                inj.timestamp_us,
-                max_frag,
-                budget_bytes,
-                drained_bytes,
-            );
+            // BWE Stage 2.2/2.4 pacing, the quinn-capacity clamp, the drain
+            // itself, and the post-drain continuation bookkeeping are all
+            // shared with `dispatch_dirty_tiles_via_scheduler` via
+            // `emit_via_scheduler` — see its doc comment. `inj.budget_bytes`
+            // is passed through unmodified: unlike the capture path, there
+            // is no AIMD (`tick_budget_multiplier`) to apply here, since
+            // that feedback loop reacts to *this bridge's own*
+            // `send_datagram` errors, which the injected path has no
+            // equivalent signal for.
+            self.emit_via_scheduler(inj.seq, inj.timestamp_us, max_frag, inj.budget_bytes);
         }
         // Mirror the frame path's post-dispatch RTO sweep so injected
         // scenes exercise retransmission the same way real frames do.
@@ -7921,12 +7919,12 @@ mod tests {
         );
     }
 
-    /// Pins `injected_continuation_after_drain`'s arithmetic: a drain that
+    /// Pins `scheduler_continuation_after_drain`'s arithmetic: a drain that
     /// didn't spend the whole clamped budget must leave a continuation
     /// behind carrying exactly the leftover.
     #[test]
-    fn injected_continuation_after_drain_carries_the_remaining_budget() {
-        let cont = IoBridge::injected_continuation_after_drain(7, 123, 1200, 5000, 2000);
+    fn scheduler_continuation_after_drain_carries_the_remaining_budget() {
+        let cont = IoBridge::scheduler_continuation_after_drain(7, 123, 1200, 5000, 2000);
         assert_eq!(
             cont,
             Some(SchedulerContinuation {
@@ -7942,13 +7940,13 @@ mod tests {
     /// than it — `saturating_sub` must not wrap) must clear the
     /// continuation rather than leave a zero/garbage entry behind.
     #[test]
-    fn injected_continuation_after_drain_clears_once_the_budget_is_spent() {
+    fn scheduler_continuation_after_drain_clears_once_the_budget_is_spent() {
         assert_eq!(
-            IoBridge::injected_continuation_after_drain(7, 123, 1200, 5000, 5000),
+            IoBridge::scheduler_continuation_after_drain(7, 123, 1200, 5000, 5000),
             None
         );
         assert_eq!(
-            IoBridge::injected_continuation_after_drain(7, 123, 1200, 5000, 6000),
+            IoBridge::scheduler_continuation_after_drain(7, 123, 1200, 5000, 6000),
             None,
             "drained_bytes > budget_bytes must saturate, not wrap/panic"
         );
@@ -7964,7 +7962,7 @@ mod tests {
     /// This drives the real, unmodified `resume_scheduler_continuation`
     /// consumer (`:1774`, wired from `Event::DatagramsUnblocked` at
     /// `:4139`) against a continuation shaped exactly like the one
-    /// `apply_injected_frame` now builds via `injected_continuation_after_drain`
+    /// `emit_via_scheduler` now builds via `scheduler_continuation_after_drain`
     /// (pinned separately above) — proving the two ends are wired together
     /// correctly. It does not drive `apply_injected_frame`'s own
     /// continuation-setting call site directly: that sits behind
@@ -8013,7 +8011,7 @@ mod tests {
         // Commit 3 code builds: plenty of remaining budget, as if the prior
         // drain had been clamped to 0 bytes.
         bridge.scheduler_continuation =
-            IoBridge::injected_continuation_after_drain(7, 123, 1200, 1_000_000, 0);
+            IoBridge::scheduler_continuation_after_drain(7, 123, 1200, 1_000_000, 0);
         assert!(
             bridge.scheduler_continuation.is_some(),
             "a fully-unconsumed budget must leave a continuation behind"
