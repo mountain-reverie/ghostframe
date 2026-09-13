@@ -212,6 +212,21 @@ pub struct BrowserlessResult {
     pub queued_refinement_latency_max_us: u64,
     /// Same as `queued_critical_latency_buckets`, for the refinement tier.
     pub queued_refinement_latency_buckets: [u64; 8],
+    /// Cumulative count of probe windows (BWE Stage 2.4) that closed having
+    /// met both `min_probes` and `min_bytes`, read from
+    /// `IoBridge::probe_stats_publish_handle()` after the bridge task is
+    /// aborted — same cell/republish/read-after-abort pattern as
+    /// `bwe_estimate_bps`. **Zero here alongside a zero
+    /// `probes_abandoned` means the probe window never opened at all** —
+    /// goog_cc's `ProbeController` never requested a cluster during this
+    /// scene — which is different from, and should not be read as, "probing
+    /// ran and found nothing to report".
+    pub probes_completed: u64,
+    /// Cumulative count of probe windows that closed *without* meeting both
+    /// thresholds. Per the design's "No padding" section this is the
+    /// **expected** outcome on an idle link, not a bug — see
+    /// `probes_completed`'s doc comment for the zero/zero case.
+    pub probes_abandoned: u64,
 }
 
 /// The address the harness uses to identify the client, baked into every
@@ -289,6 +304,10 @@ async fn run_inner(scene: BrowserlessScene) -> anyhow::Result<BrowserlessResult>
     // latency stats (BWE Stage 2.1) — see
     // `queued_latency_stats_publish`'s doc comment in `io_bridge.rs`.
     let queued_latency_stats_cell = bridge.queued_latency_stats_publish_handle();
+    // Same reasoning, same pattern, for the probe-window counters (BWE
+    // Stage 2.4) — see `probe_stats_publish`'s doc comment in
+    // `io_bridge.rs`.
+    let probe_stats_cell = bridge.probe_stats_publish_handle();
     // `IoBridge::run` is an infinite event loop that only returns on EOF or
     // error; it must be aborted explicitly (see below) rather than awaited.
     let bridge_handle = tokio::task::spawn_local(async move {
@@ -340,6 +359,9 @@ async fn run_inner(scene: BrowserlessScene) -> anyhow::Result<BrowserlessResult>
     let (queued_critical_latency, queued_refinement_latency) = *queued_latency_stats_cell
         .lock()
         .expect("queued_latency_stats_publish mutex poisoned");
+    let (probes_completed, probes_abandoned) = *probe_stats_cell
+        .lock()
+        .expect("probe_stats_publish mutex poisoned");
 
     Ok(BrowserlessResult {
         framebuffer,
@@ -371,6 +393,8 @@ async fn run_inner(scene: BrowserlessScene) -> anyhow::Result<BrowserlessResult>
         queued_refinement_latency_mean_us: queued_refinement_latency.mean_us(),
         queued_refinement_latency_max_us: queued_refinement_latency.max_us,
         queued_refinement_latency_buckets: queued_refinement_latency.buckets,
+        probes_completed,
+        probes_abandoned,
     })
 }
 

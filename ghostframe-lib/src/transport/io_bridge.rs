@@ -842,6 +842,15 @@ pub struct IoBridge {
     #[cfg(any(test, feature = "browserless-harness"))]
     queued_latency_stats_publish:
         std::sync::Arc<std::sync::Mutex<(TierLatencyStats, TierLatencyStats)>>,
+    /// Shared cell the browserless harness reads the final probe-window
+    /// counters from, after aborting the `run()` task: `(probes_completed,
+    /// probes_abandoned)`. Same cell/republish/read-after-abort pattern as
+    /// `bwe_publish` above and for the identical ownership reason — see
+    /// that field's doc comment. Added for BWE Stage 2.4 Task 5's
+    /// measurement: a scene run reporting zero of both means the probe
+    /// window never opened, which the harness has no other way to see.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    probe_stats_publish: std::sync::Arc<std::sync::Mutex<(u64, u64)>>,
     /// Cumulative bytes of CDF53 critical-tier (passes 0-3) datagrams
     /// emitted since startup. Counts every successful emit including
     /// retransmits, because the BWE-side rate computation should reflect
@@ -1233,6 +1242,11 @@ impl IoBridge {
                 TierLatencyStats::default(),
                 TierLatencyStats::default(),
             ))),
+            // Same cfg-gate and reasoning, for the probe-window counters —
+            // see `probe_stats_publish`'s doc comment. Both start at zero,
+            // matching `probes_completed`/`probes_abandoned` above.
+            #[cfg(any(test, feature = "browserless-harness"))]
+            probe_stats_publish: std::sync::Arc::new(std::sync::Mutex::new((0u64, 0u64))),
             bytes_emitted_critical: 0,
             bytes_emitted_refinement: 0,
             critical_latency_stats: TierLatencyStats::default(),
@@ -4637,6 +4651,8 @@ impl IoBridge {
                     self.queued_critical_latency_stats,
                     self.queued_refinement_latency_stats,
                 );
+                *self.probe_stats_publish.lock().unwrap() =
+                    (self.probes_completed, self.probes_abandoned);
             }
 
             // [BRIDGE-DIAG] heartbeat every 2s of virtual time (tokio's
@@ -5226,6 +5242,11 @@ impl IoBridge {
                 TierLatencyStats::default(),
                 TierLatencyStats::default(),
             ))),
+            // Same cfg-gate and reasoning, for the probe-window counters —
+            // see `probe_stats_publish`'s doc comment. Both start at zero,
+            // matching `probes_completed`/`probes_abandoned` above.
+            #[cfg(any(test, feature = "browserless-harness"))]
+            probe_stats_publish: std::sync::Arc::new(std::sync::Mutex::new((0u64, 0u64))),
             bytes_emitted_critical: 0,
             bytes_emitted_refinement: 0,
             critical_latency_stats: TierLatencyStats::default(),
@@ -5340,6 +5361,15 @@ impl IoBridge {
         &self,
     ) -> std::sync::Arc<std::sync::Mutex<(TierLatencyStats, TierLatencyStats)>> {
         self.queued_latency_stats_publish.clone()
+    }
+
+    /// Clone of the `Arc` behind `probe_stats_publish` — `(probes_completed,
+    /// probes_abandoned)` (BWE Stage 2.4). Same ownership problem and fix as
+    /// `latency_stats_publish_handle`; call this *before* the move, read the
+    /// clone's contents *after* aborting the task.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub fn probe_stats_publish_handle(&self) -> std::sync::Arc<std::sync::Mutex<(u64, u64)>> {
+        self.probe_stats_publish.clone()
     }
 
     /// Drive exactly one injected frame: enqueue its work, then attempt the
