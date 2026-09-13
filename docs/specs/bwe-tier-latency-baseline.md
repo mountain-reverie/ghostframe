@@ -673,3 +673,189 @@ If the ratio drops sharply once the harness uses the production path, 2.3 is
 unnecessary and the honest answer is that production was already doing the
 right thing. That is a good outcome, and cheaper to discover now than after
 building a budget split against it.
+
+## Harness fidelity fix: `apply_injected_frame` now uses `refinement_queue`
+
+**Date:** 2026-09-12
+**Git rev:** `d3f3df222c3c42ca335eb5651daffa6ed5e16812` (branch
+`fix/harness-uses-refinement-queue`)
+**Parent:** `73d28529a470f2bb9ee85464a15c9604dd4c11aa` (the "Correction" entry
+above)
+
+This lands the fix the correction called for. `apply_injected_frame`
+(`ghostframe-lib/src/transport/io_bridge.rs`) now routes by `work.codec`:
+CDF53 passes go to a new `Scheduler::enqueue_refinement_work_at`, which
+pushes an already-formed `TileWork` straight into `refinement_queue` —
+mirroring `enqueue_at` but targeting the pass-major-drained queue instead of
+the FIFO one. Everything else keeps going through `enqueue_at` into
+`priority_queue`, unchanged.
+
+`enqueue_refinement_work_at` was chosen over grouping the harness's CDF53
+work by `(tile_x, tile_y, generation)` and calling the existing
+`enqueue_refinement_at`/`enqueue_refinement_subset_at`: both of those rebuild
+`pass_idx`/`total_passes` from a `Vec<Vec<u8>>`'s position, which would
+silently renumber a partial or out-of-order pass set. The harness's
+`TileWork` already carries its own correct `pass_idx`/`total_passes` (built
+by `scene_tiles.rs::encode_tile`), so pushing it through unchanged is both
+simpler and strictly more faithful to what a scene actually submitted. A new
+regression test,
+`injected_cdf53_work_lands_in_refinement_queue_not_priority_queue`
+(`io_bridge.rs`), submits two tiles' CDF53 passes out of order and as a
+partial set alongside a non-CDF53 tile, and asserts directly (via new
+`refinement_peek_for_test`/`scheduler_refinement_peek_for_test` accessors)
+that CDF53 work lands in `refinement_queue` with `pass_idx`/`total_passes`
+preserved exactly, while the non-CDF53 tile still lands in `priority_queue`.
+
+`supersede_pending_for_tile` needed no change: it already chains
+`priority_queue.iter_mut().chain(refinement_queue.iter_mut())` in one pass
+(`scheduler.rs:237-250`), so it invalidates stale queued work in either
+queue regardless of which one a given `TileWork` lands in.
+
+**No production emission, pacer, budget, or `refinement_bandwidth_fraction`
+code changed.** This is a test-harness-only change: which queue
+`apply_injected_frame` enqueues CDF53 work into. All 11 non-ignored
+browserless scenes stay green, including the three this document's own
+brief called out as CDF53-delivery-dependent
+(`cdf53_converges_to_lossless_under_10pct_loss`,
+`every_cdf53_pass_eventually_lands`, `superseded_generations_never_render`),
+alongside the full 398-test `ghostframe-lib` suite.
+
+### Re-measurement: same scene, same protocol, now through `refinement_queue`
+
+Identical scene, method, and re-measure protocol to every prior entry in
+this document: `busy_frames(2)` 4x4 CDF53 grid, 10% independent loss, 10 s
+duration, seed sequence `0xB17E0000..` incrementing past bail-outs, same
+`cargo test -p ghostframe-e2e --test browserless_runner
+bwe_tier_latency_baseline -- --ignored --nocapture --test-threads=1` command,
+run 3 times (30 successful runs total). Both metrics (`last_sent_at -> ACK`
+and `queued_at -> ACK`) reported, as in every entry since 2.1. The only thing
+that changed between this run and the 2.2 entry above is the harness fix
+described in this section — no scheduling, pacing, or budget code differs.
+
+Batches 2 and 3 each hit 3 `MAX_ITERS` bail-outs (seeds `0xB17E0001`,
+`0xB17E0004`, `0xB17E000A`, backfilled by `0xB17E000B`, `0xB17E000C`, and one
+more); batch 1 was 10/10 clean. Bail-out rate and pattern are consistent
+with the pre-existing `busy_frames(2)` flake rate documented earlier in this
+file — not a consequence of this change.
+
+Regression guards, run separately before this measurement (`cargo test -p
+ghostframe-e2e --test browserless_runner -- --test-threads=1`, 11/11
+non-ignored tests green): `cdf53_converges_to_lossless_under_10pct_loss`,
+`every_cdf53_pass_eventually_lands`, and `superseded_generations_never_render`
+all passed, alongside the full existing suite.
+
+The re-baseline test's own sanity assertions (`queued_at -> ACK >=
+last_sent_at -> ACK` for both tiers' mean and max) held for all 30 runs
+across all 3 batches, exactly as in every prior entry.
+
+#### Results (30 scene runs, pooled)
+
+| Metric | Tier | Runs | Samples | Pooled mean | Max |
+|---|---|---:|---:|---:|---:|
+| `last_sent_at -> ACK` | Critical (0-3) | 30 | 3,922 | 26.4 ms | 160.0 ms |
+| `last_sent_at -> ACK` | Refinement (4-13) | 30 | 9,843 | 38.4 ms | 206.0 ms |
+| `queued_at -> ACK` | Critical (0-3) | 30 | 3,922 | 51.3 ms | 656.0 ms |
+| `queued_at -> ACK` | Refinement (4-13) | 30 | 9,843 | 70.9 ms | 653.0 ms |
+
+Critical's pooled mean is now visibly lower than refinement's at both
+metrics — the first time in this document that has been true. Compare to
+2.2 (the last entry with no harness-routing change): critical and
+refinement pooled means were 39.5/40.0 ms (`last_sent_at`) and 84.8/86.4 ms
+(`queued_at`) — a ~1-2% gap, within noise. Now the gap is ~31% (`last_sent_at`)
+and ~28% (`queued_at`).
+
+#### Bucket distribution (all 30 runs pooled, ms)
+
+`last_sent_at -> ACK`:
+
+| Bucket | Critical count | Critical % | Refinement count | Refinement % |
+|---|---:|---:|---:|---:|
+| 0-5 | 15 | 0.4% | 32 | 0.3% |
+| 5-10 | 522 | 13.3% | 305 | 3.1% |
+| 10-20 | 1,392 | 35.5% | 1,275 | 13.0% |
+| 20-50 | 1,551 | 39.5% | 5,974 | 60.7% |
+| 50-100 | 336 | 8.6% | 1,777 | 18.1% |
+| 100-200 | 106 | 2.7% | 477 | 4.8% |
+| 200-500 | 0 | 0.0% | 3 | 0.0% |
+| 500+ | 0 | 0.0% | 0 | 0.0% |
+
+`queued_at -> ACK`:
+
+| Bucket | Critical count | Critical % | Refinement count | Refinement % |
+|---|---:|---:|---:|---:|
+| 0-5 | 0 | 0.0% | 0 | 0.0% |
+| 5-10 | 479 | 12.2% | 192 | 2.0% |
+| 10-20 | 1,258 | 32.1% | 861 | 8.7% |
+| 20-50 | 1,239 | 31.6% | 5,013 | 50.9% |
+| 50-100 | 332 | 8.5% | 1,438 | 14.6% |
+| 100-200 | 429 | 10.9% | 1,740 | 17.7% |
+| 200-500 | 171 | 4.4% | 577 | 5.9% |
+| 500+ | 14 | 0.4% | 22 | 0.2% |
+
+For the first time in this document, critical and refinement diverge at
+*every* bucket, and in the same direction throughout: critical is
+front-loaded into the fast buckets (5-10, 10-20 ms) and refinement is
+weighted toward the slower ones (20-50 ms and up), for both metrics. The
+100-200 ms and 200-500 ms buckets — the ones every prior entry pointed at as
+"where a real effect would show" — now show real separation too
+(`queued_at`: 10.9% vs 17.7% at 100-200 ms; 4.4% vs 5.9% at 200-500 ms).
+
+#### The within-run ratio
+
+| Batch | `last_sent_at` critical | `last_sent_at` refinement | `last_sent_at` ratio | `queued_at` critical | `queued_at` refinement | `queued_at` ratio |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 25.2 ms | 38.6 ms | 0.653 | 47.6 ms | 63.7 ms | 0.747 |
+| 2 | 27.3 ms | 37.7 ms | 0.722 | 52.1 ms | 72.9 ms | 0.714 |
+| 3 | 26.7 ms | 38.8 ms | 0.689 | 54.4 ms | 76.1 ms | 0.715 |
+| **Mean** | | | **0.688** | | | **0.725** |
+
+Per-run ratio spread (30 individual runs, not batch-pooled): `last_sent_at`
+0.375-0.980 (mean 0.683), `queued_at` 0.212-1.760 (mean 0.735). Individual
+runs vary more than the batch-pooled numbers — small per-run sample counts
+(~130 critical samples/run) make a single run noisier than the ~1,300-run
+batch pool — but every batch-pooled ratio, and the large majority of
+individual runs, land well under 1.0. This is a qualitatively different
+picture from every prior entry, where every batch-pooled ratio landed in
+0.96-1.00 regardless of metric.
+
+| Metric | This entry (post-fix) | 2.2 (pre-fix) | 2.1 (pre-fix) |
+|---|---:|---:|---:|
+| `last_sent_at -> ACK` mean ratio | **0.688** | 0.989 | 0.987 |
+| `queued_at -> ACK` mean ratio | **0.725** | 0.981 | 0.970 |
+
+#### Which of the three outcomes: **ratio drops sharply**
+
+This is the design doc's first named outcome. Both metrics moved from
+"statistically indistinguishable from 1.0" to "critical arrives roughly
+30% sooner than refinement, confirmed delivered" — a change far larger than
+the batch-to-batch noise band (±0.01-0.03) documented at every prior stage.
+The bucket distribution supports the same read: separation is not confined
+to one bucket or one metric, it appears at every bucket for both metrics,
+with critical systematically shifted toward the fast end.
+
+**Production's `drain_refinement_pass_major` was already prioritising
+critical passes correctly.** The flat ~0.97-0.99 ratios measured at every
+previous stage were an artifact of the harness routing all CDF53 work
+through `priority_queue`'s FIFO drain in tile-major insertion order — never
+exercising the pass-major drain at all, exactly as the "Correction" section
+above diagnosed. Now that the harness exercises the same queue and drain
+order production uses, the ordering shows up clearly.
+
+**This means BWE Stage 2.3's guaranteed-slice-for-`PassTier::Critical`
+budget split is not motivated by this measurement.** The premise 2.3 was
+about to be built on — "pass-major ordering exists but a shared
+`refinement_bandwidth_fraction` budget prevents it from paying off" — was
+drawn from a harness path with no ordering behavior at all, and does not
+survive contact with a harness that actually has that ordering. Production
+already separates the tiers by a wide margin with the existing
+`drain_refinement_pass_major` and the existing single
+`refinement_bandwidth_fraction` slice. Building a second, more complex
+budget split to chase an effect that already exists would be solving a
+problem this data does not show.
+
+This does not mean 2.3 can never be justified — a different scene shape
+(a larger grid, sustained multi-frame load, or a lower loss rate that
+shifts where queueing delay accumulates) could still reveal a case where
+pass-major ordering alone is insufficient. But the specific case this
+document has measured from Stage 2.0 through this entry no longer supports
+building it.
