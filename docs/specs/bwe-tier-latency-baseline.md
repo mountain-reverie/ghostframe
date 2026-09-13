@@ -452,3 +452,133 @@ itself is the constraint.
 
 **So Stage 2.3 targets the budget split, not the drain order**, and the
 number to beat is a 0.970 mean ratio with no tail separation — not 1.0.
+
+## BWE Stage 2.2: `PacingMode` — the estimate governs the budget
+
+**Date:** 2026-09-12
+**Git rev:** `4a321152f5a264a3148506acefd5ceb0af40171c` (branch `feat/bwe-pacing-mode`)
+**Parent:** `5485afd` (`docs: sharpen the 2.1 reading`, tip of `spec/bwe-stage2`)
+
+Stage 2.2 puts goog_cc's bandwidth estimate in charge of the per-tick
+emission budget for the first time — `self.bwe` previously fed the
+estimator and published a snapshot nobody consumed. `PacingMode::Paced`
+additionally bounds the budget by goog_cc's `pacer_config`-derived rate
+once the estimator has seen enough ACK samples to trust
+(`samples_seen >= 150`); the budget is `min(aimd_budget, googcc_budget)`,
+not a replacement, and `clamp_to_quinn_capacity` still runs last. See
+`ghostframe-lib/src/transport/io_bridge.rs`'s `combine_pacing_budget` and
+`ghostframe-lib/src/transport/bwe/googcc.rs`'s `absorb`.
+
+**No tier-prioritisation, drain-order, or `refinement_bandwidth_fraction`
+code changed for this measurement** — that is 2.3, deliberately
+unspecified until this result is in. Only the budget's *source* changed.
+
+### Method
+
+Identical scene, method, and re-measure protocol to the 2.0/2.1 baselines
+above: same `busy_frames(2)` 4x4 CDF53 grid, 10% independent loss, 10 s
+duration, same seed sequence `0xB17E0000..`, same "10 successful runs per
+batch, retry on `MAX_ITERS` bail-out" protocol, same
+`cargo test -p ghostframe-e2e --test browserless_runner bwe_tier_latency_baseline -- --ignored --nocapture --test-threads=1`
+command, run 3 times (30 total data points). Both metrics
+(`last_sent_at -> ACK` and `queued_at -> ACK`) are reported, exactly as in
+2.1, since both are needed to read this result correctly — see "Which
+metric moved" below.
+
+All three batches ran 10/10 clean — no `MAX_ITERS` bail-outs at all (the
+2.1 baseline had one, in batch 1).
+
+Regression guards, run separately before this measurement
+(`cargo test -p ghostframe-e2e --test browserless_runner -- --test-threads=1`,
+11/11 non-ignored tests): `cdf53_converges_to_lossless_under_10pct_loss` and
+`every_cdf53_pass_eventually_lands` both green, alongside the full existing
+suite (`retransmits_fire_under_loss_but_not_on_a_perfect_link` included).
+
+### Results (30 scene runs, pooled)
+
+| Metric | Tier | Runs | Samples | Pooled mean | Max |
+|---|---|---:|---:|---:|---:|
+| `last_sent_at -> ACK` | Critical (0-3) | 30 | 4,336 | 39.5 ms | 181.0 ms |
+| `last_sent_at -> ACK` | Refinement (4-13) | 30 | 10,810 | 40.0 ms | 181.0 ms |
+| `queued_at -> ACK` | Critical (0-3) | 30 | 4,336 | 84.8 ms | 656.0 ms |
+| `queued_at -> ACK` | Refinement (4-13) | 30 | 10,810 | 86.4 ms | 745.0 ms |
+
+### The guard: `last_sent_at -> ACK` did not rise
+
+This is the metric that exists specifically to catch a pacer *causing* the
+wire queueing it's meant to prevent (a real way for 2.2 to go wrong per the
+design doc's risk table).
+
+| | 2.1 baseline (pre-`PacingMode`) | 2.2 (post-`PacingMode`) | Direction |
+|---|---:|---:|---|
+| `last_sent_at -> ACK` pooled mean, critical | 46.7 ms | 39.5 ms | **down** |
+| `last_sent_at -> ACK` pooled mean, refinement | 47.5 ms | 40.0 ms | **down** |
+| `last_sent_at -> ACK` pooled max | 305.0 ms | 181.0 ms | **down** |
+| `queued_at -> ACK` pooled mean, critical | 103.9 ms | 84.8 ms | **down** |
+| `queued_at -> ACK` pooled mean, refinement | 106.8 ms | 86.4 ms | **down** |
+| `queued_at -> ACK` pooled max | 1546.0 ms | 656.0 ms | **down** |
+
+**Guard passes — every one of these fell, none rose.** Per this document's
+own repeated caution (2.1's spread section, and the design doc's own
+framing), absolute means are noisy across batches and not something to
+gate on by themselves; a bounded, real-network-estimate-driven budget that
+tracks the link more closely than a fixed AIMD ramp plausibly explains
+less queueing (both at the wire and in the scheduler) even though nothing
+about *which* pass goes first changed. Reported for the record, not as the
+primary acceptance criterion — the ratio is that, and is covered next.
+
+### The tier ratio: flat, as the design predicted it would be
+
+| Batch | `last_sent_at` ratio | `queued_at` ratio |
+|---|---:|---:|
+| 1 | 1.001 | 0.985 |
+| 2 | 0.976 | 0.968 |
+| 3 | 0.989 | 0.991 |
+| **Mean** | **0.989** | **0.981** |
+
+| Metric | 2.1 mean ratio | 2.1 range | 2.2 mean ratio | 2.2 range |
+|---|---:|---|---:|---|
+| `last_sent_at -> ACK` | 0.987 | 0.968-0.996 | 0.989 | 0.976-1.001 |
+| `queued_at -> ACK` | 0.970 | 0.959-0.982 | 0.981 | 0.968-0.991 |
+
+Both ratios land inside (or a hair above, for `queued_at`) the 2.1 band —
+not a load-bearing move in either direction, and both still far from the
+"materially below 1.0" the design's acceptance criterion asks for. This
+is the expected, stated-in-advance outcome: **"the tier ratio is not
+expected to move much here. 2.2 changes *how much* is sent, not *what
+order*."** A pacer that only re-sizes the budget cannot separate critical
+from refinement when both tiers still draw from the same undifferentiated
+`refinement_queue` and the same `refinement_bandwidth_fraction` slice —
+that is exactly 2.3's job, still open. If anything, `queued_at`'s ratio
+inching from 0.970 toward 0.981 is consistent with a smaller, better-fit
+budget slightly *reducing* the raw queueing-delay gap 2.3 will need to
+close, rather than 2.2 having incidentally done 2.3's work — but one
+measurement 1.1 points inside a documented ~1.02-1.03x batch-to-batch
+noise band is not evidence of that, just an observation for whoever reads
+this next.
+
+### Which metric moved, and why that's the right read
+
+`last_sent_at -> ACK`'s absolute pooled means fell by about 15-18% and its
+max nearly halved (305 ms -> 181 ms); `queued_at -> ACK`'s fell by a
+similar fraction (103.9/106.8 ms -> 84.8/86.4 ms) with its max also
+roughly halving (1546 ms -> 656/745 ms). The *ratio* between tiers — the
+number this document's acceptance criterion is actually built on — moved
+far less, staying inside the pre-existing noise band. That split is
+exactly what 2.2 was supposed to produce: a budget that fits the link
+better reduces queueing and retransmit-driven tail latency for *all*
+traffic roughly equally, without doing anything that would make critical
+passes specifically faster than refinement ones. The estimate is now
+governing emission (goal 1 of the design doc); it is not yet steering
+*which* tier gets the governed bytes first (goal 3, deferred to 2.3).
+
+### What this means for 2.3
+
+Unchanged from 2.1's conclusion, now confirmed rather than merely
+predicted: 2.2 does not touch the tier axis, so it could not have made
+2.3 unnecessary, and it did not. The next number to beat is still the
+0.970 (`queued_at`) / 0.987 (`last_sent_at`) mean ratios from 2.1 — 2.2's
+0.981 / 0.989 are statistically the same result, not an improvement.
+2.3's guaranteed-slice-for-`PassTier::Critical` design (from the sequencing
+doc) is still the outstanding piece, and now has a `PacingMode`-governed
+budget underneath it to split rather than an unbounded AIMD ramp.
