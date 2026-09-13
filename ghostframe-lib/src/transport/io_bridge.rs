@@ -5381,7 +5381,12 @@ mod tests {
     /// combine with.
     #[test]
     fn combine_pacing_budget_paced_without_a_rate_falls_back_to_aimd() {
-        let got = combine_pacing_budget(PacingMode::Paced, 1_000_000, None, SCHEDULER_TICK_INTERVAL_US);
+        let got = combine_pacing_budget(
+            PacingMode::Paced,
+            1_000_000,
+            None,
+            SCHEDULER_TICK_INTERVAL_US,
+        );
         assert_eq!(got, 1_000_000);
     }
 

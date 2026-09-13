@@ -267,8 +267,7 @@ impl GoogCcDriver {
             // through `Div<TimeDelta>`) panics on an infinite/oversized
             // operand and dividing by a zero `TimeDelta` panics too, so both
             // are checked defensively rather than trusted.
-            if pc.data_window.is_finite() && pc.time_window.is_finite() && pc.time_window.us() > 0
-            {
+            if pc.data_window.is_finite() && pc.time_window.is_finite() && pc.time_window.us() > 0 {
                 let bps = pc.data_rate().bps();
                 if bps > 0 {
                     self.pacer_rate_bps = Some(bps as u64);
