@@ -202,3 +202,69 @@ observed.
   with no flakes. `cdf53_converges_to_lossless_under_10pct_loss` and
   `every_cdf53_pass_eventually_lands` stayed green throughout.
 - `cargo clippy -p ghostframe-lib -p ghostframe-e2e --all-targets`: clean.
+
+## Attribution experiment (2026-09-13): the fix fires, the queue is empty
+
+PR #78 shipped with the caveat that the browserless harness could not
+attribute `drain_for_probe_window_open` — the scene completed probes with the
+fix disabled. The suspected reason was the harness's near-zero-RTT socketpair
+making `DatagramsUnblocked` a free emission opportunity.
+
+**That was not the reason.** Re-running the probe scene on a realistic link
+(`delay_us: 10_000`, `CapTimeline::constant(20_000_000)` — both already
+supported by `NetSim`, both previously unused by the probe scenes) with the
+drain instrumented directly:
+
+```
+EXPPROBE: drain_for_probe_window_open entered
+          pre_clamp_budget=49999 effective_budget=49999
+          queued_priority=0 queued_refinement=0
+EXPPROBE: drain result  drained_bytes=0 drained_count=0
+```
+
+The fix **fires correctly**, with a 49,999-byte budget against a 22,500-byte
+`min_bytes` — more than sufficient, and unclamped. It finds **both scheduler
+queues empty**.
+
+### Why the queue is empty: a third harness-fidelity gap
+
+Three facts compose:
+
+1. `PacingMode` only reaches `Paced` at `BWE_PACED_MODE_SAMPLE_THRESHOLD`
+   = **150 ACK samples**.
+2. Below that, `combine_pacing_budget` returns the AIMD budget unchanged
+   (`_ => aimd_budget_bytes`).
+3. The browserless harness passes **`budget_bytes: usize::MAX`**
+   (`browserless.rs:734`, `:763`).
+
+So until 150 samples accumulate, every injection drains the **entire** queue —
+there is no backlog by construction. And goog_cc's initial exponential probe
+fires from the **first ACK batch**, far below that threshold.
+
+The probe therefore always opens against an empty queue, and no link profile
+can change that: the emptiness comes from the harness's unlimited injection
+budget, not from the network.
+
+This is the same family as the `enqueue_at`/`refinement_queue` routing gap:
+**the harness does not reproduce the production emission path**, and
+conclusions drawn from it about production were wrong in the same way.
+Production's frames go through `dispatch_dirty_tiles_via_scheduler` with a
+real AIMD budget from the first frame, so production *does* build backlog.
+
+### What this means for the fix
+
+`drain_for_probe_window_open` is **correct and necessary**, and now has
+direct evidence of firing with a healthy budget — stronger than PR #78's
+unit-test-only attribution. What it cannot do is manufacture work that was
+never queued.
+
+### The remaining step
+
+Make the harness inject with a **realistic budget** instead of `usize::MAX`,
+so backlog accumulates the way it does in production. That is a harness
+change, not a production one, and it is the prerequisite for any end-to-end
+probe-completion evidence.
+
+Until then, probe completion cannot be demonstrated end to end for a reason
+that has nothing to do with probes.
+
