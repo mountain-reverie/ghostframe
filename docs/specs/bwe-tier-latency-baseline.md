@@ -1221,3 +1221,68 @@ refactor.
 - Probe windows still open every run and still never complete on this
   scene, for a now better-understood reason (traffic concentration, not
   queue emptiness) — PR #78's caveat is narrowed, not yet closed.
+## Re-baseline after the harness delivery fix (2026-09-13)
+
+The browserless harness used to await each datagram's arrival at the point
+it was sent, serialising the link to one datagram in flight. At `delay_us: 0`
+— every scene this document has ever measured — that await returns
+immediately, so the shape was invisible. Replaced by an `InFlight` queue
+delivered from the scene loop (see `docs/specs/bwe-probe-emission-timing.md`,
+"Realistic budget landed, and RTT with it").
+
+**Every measurement above was taken on the serialised harness**, Stage 2.5
+included. The emission interleaving differs, so this is a re-baseline, not
+another batch.
+
+### Results (30 runs, pooled by sample count)
+
+Same scene, method and protocol as Stage 2.5: `busy_frames(2)` 4x4 CDF53,
+10% loss, 10 s, seeds `0xB17E0000..`, 3 batches of 10.
+
+| Metric | Tier | Samples | Pooled mean |
+|---|---|---:|---:|
+| `last_sent_at -> ACK` | Critical (0-3) | 3,891 | **31.4 ms** |
+| `last_sent_at -> ACK` | Refinement (4-13) | 9,757 | **45.7 ms** |
+| pooled ratio | | | **0.685** |
+
+Against Stage 2.5 (27.4 ms / 41.2 ms / 0.665): **both tiers rose**, critical
+by 14.6% and refinement by 10.9%.
+
+### The guard rose. It is a measurement shift, not a production regression.
+
+`last_sent_at -> ACK` must not rise, and it did. The reason it is not a
+regression is that **no production code changed**: the commits behind this
+entry touch `ghostframe-e2e` and docs only, never `ghostframe-lib`. The
+server emits exactly what it emitted before.
+
+What changed is where the harness processes an inbound datagram. Delivery
+used to happen inline inside the `tokio::select!` arm that received it; it
+now happens at the top of the following loop iteration. Every inbound
+datagram — ACKs included — picks up one extra scheduling hop before the
+client sees it, and this metric measures to ACK *processing*. A uniform
+~10-15% inflation across both tiers is the expected shape of that, and the
+tiers moved together rather than separately.
+
+The practical consequence: **pre-fix and post-fix numbers in this document
+are not comparable.** Future measurements should be taken on the fixed
+harness and compared to this entry, not to Stage 2.5 or earlier.
+
+### The pooled ratio is stable, and remains the figure to quote
+
+0.685 here against 0.665 at Stage 2.5 and 0.688-0.698 originally — unchanged
+within noise across every harness generation this document covers, including
+one that altered both absolute means by >10%. That is a stronger case for
+the ratio than the earlier entries could make.
+
+A per-seed ratio is *not* the same statistic and should not be substituted
+for it: across these 30 runs individual seeds span 0.395 to 1.177, because a
+single unlucky seed (`0xb17e0007`, 84-88 ms critical against a ~20 ms median)
+moves an unweighted average a long way. Pool by sample count.
+
+### Supersedes: probe completion has now been observed
+
+The section above closes by saying probing "has not yet been observed to
+*complete* on any scene exercised so far, browserless or otherwise." That is
+no longer true. With PR #79's realistic injection budget the 8x8 CDF53 scene
+completes clusters organically — 9/10 seeds on this tree, 30/30 in a
+30-seed run — with the demand-starved negative control still at 0.
