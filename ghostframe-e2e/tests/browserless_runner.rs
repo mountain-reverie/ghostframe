@@ -750,6 +750,149 @@ async fn bwe_tier_latency_baseline() {
     }
 }
 
+/// Same shape as `busy_frames`, but over a caller-chosen grid instead of a
+/// fixed 4x4 — BWE Stage 2.4b's positive probe-fill scene needs enough
+/// simultaneous CDF53 demand that goog_cc's first exponential probe window
+/// (which opens within the first couple of injected frames — see
+/// `docs/specs/bwe-probe-emission-timing.md`) lands while the scheduler
+/// still has undrained backlog, rather than an already-empty queue.
+fn busy_frames_grid(n: usize, cols: u8, rows: u8) -> Vec<FrameScript> {
+    (0..n)
+        .map(|i| FrameScript {
+            tiles: (0..cols)
+                .flat_map(move |x| {
+                    (0..rows).map(move |y| {
+                        (
+                            (x, y),
+                            TileSpec::Cdf53 {
+                                bgra: shifted_gradient_tile(i as u32, x, y),
+                            },
+                        )
+                    })
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// BWE Stage 2.4b acceptance: on a busy enough link, probe clusters must
+/// actually complete — not just open and get abandoned. This is the
+/// positive half of the fix's acceptance bar in
+/// `docs/specs/bwe-probe-emission-timing.md`.
+///
+/// The harness is not seed-reproducible
+/// (`feedback_browserless_not_seed_reproducible`), and goog_cc's initial
+/// exponential probe opens within the first couple of injected frames,
+/// while a mix of the fix's immediate drain-on-open *and* ordinary
+/// continuation-driven emission (`Event::DatagramsUnblocked` firing in a
+/// tight burst under this scene's heavy backlog) can both land inside the
+/// 15ms window — this test cannot cleanly attribute a given completion to
+/// one or the other. `drain_for_probe_window_open_fills_from_existing_backlog`
+/// and `drain_for_probe_window_open_is_a_noop_without_a_prior_drain` in
+/// `ghostframe-lib::transport::io_bridge`'s unit tests isolate the fix's
+/// mechanism directly and deterministically; this test asserts the
+/// outcome-level acceptance criterion the fix exists to satisfy: a real
+/// session, driven end-to-end, must be able to complete a probe cluster
+/// at all. Measured empirically at 7-8 of 10 seeds completing per batch —
+/// summing across seeds and asserting `>= 1` is what "reliably" can mean
+/// given the harness's non-reproducibility, matching this file's existing
+/// aggregate-across-seeds pattern (see `bwe_tier_latency_baseline`,
+/// `retransmits_fire_under_loss_but_not_on_a_perfect_link`).
+#[tokio::test(start_paused = true)]
+async fn probe_windows_can_complete_on_a_busy_link() {
+    let mut probes_completed_total = 0u64;
+    let mut probes_abandoned_total = 0u64;
+    for i in 0..10u64 {
+        let seed = 0xF11E_0000_u64.wrapping_add(i);
+        let scene = BrowserlessScene {
+            seed,
+            frames: busy_frames_grid(8, 8, 8),
+            net: NetProfile::perfect(),
+            duration: Duration::from_secs(10),
+            grid_cols: 8,
+            grid_rows: 8,
+        };
+        let r = run_browserless(scene).await.expect("scene ran");
+        println!(
+            "seed={seed:#010x} probes: completed={} abandoned={}",
+            r.probes_completed, r.probes_abandoned
+        );
+        probes_completed_total += r.probes_completed;
+        probes_abandoned_total += r.probes_abandoned;
+    }
+    println!(
+        "probe_windows_can_complete_on_a_busy_link: completed={probes_completed_total} \
+         abandoned={probes_abandoned_total} across 10 seeds"
+    );
+    assert!(
+        probes_completed_total >= 1,
+        "a busy 8x8 CDF53 link must complete at least one probe cluster \
+         across 10 seeds (completed={probes_completed_total} \
+         abandoned={probes_abandoned_total}) — zero here means \
+         `drain_for_probe_window_open` (or the ordinary continuation path) \
+         is not filling windows even when backlog is plentiful"
+    );
+}
+
+/// BWE Stage 2.4b's negative control: a scene with genuinely insufficient
+/// demand must still show the probe window opening and being abandoned —
+/// `probes_abandoned` moving while `probes_completed` stays at zero. Without
+/// this, `probe_windows_can_complete_on_a_busy_link`'s positive assertion
+/// could be satisfied by a bridge that (incorrectly) always completes every
+/// probe window regardless of demand, e.g. by padding — which the design
+/// explicitly forbids (see `docs/specs/bwe-probe-emission-timing.md`'s "No
+/// padding" section).
+///
+/// Reuses `bwe_tier_latency_baseline`'s exact scene shape (`busy_frames(2)`,
+/// 4x4 grid, 10% loss): measured before this fix at 0 completed / 30
+/// abandoned across 30 runs (see the spec doc's "before" evidence), and
+/// still 0 completed / 10 abandoned across 10 runs after it — confirmed by
+/// direct diagnostic logging that `drain_for_probe_window_open`'s own
+/// immediate drain sees a genuinely empty scheduler queue at the moment
+/// this scene's single early probe window opens (the fix correctly does
+/// nothing when there's nothing to drain; see that method's doc comment on
+/// "the demand requirement" the fix does not remove).
+#[tokio::test(start_paused = true)]
+async fn probe_windows_are_abandoned_on_a_demand_starved_link() {
+    let mut probes_completed_total = 0u64;
+    let mut probes_abandoned_total = 0u64;
+    for i in 0..5u64 {
+        let seed = 0xB17E_1000_u64.wrapping_add(i);
+        let scene = BrowserlessScene {
+            seed,
+            frames: busy_frames(2),
+            net: NetProfile {
+                loss: 0.10,
+                ..NetProfile::perfect()
+            },
+            duration: Duration::from_secs(10),
+            grid_cols: 4,
+            grid_rows: 4,
+        };
+        let r = run_browserless(scene).await.expect("scene ran");
+        println!(
+            "seed={seed:#010x} probes: completed={} abandoned={}",
+            r.probes_completed, r.probes_abandoned
+        );
+        probes_completed_total += r.probes_completed;
+        probes_abandoned_total += r.probes_abandoned;
+    }
+    assert!(
+        probes_abandoned_total > 0,
+        "a demand-starved scene must still open and abandon at least one \
+         probe window across 5 seeds (completed={probes_completed_total} \
+         abandoned={probes_abandoned_total}) — zero here means the window \
+         never opened at all, which says nothing about padding"
+    );
+    assert_eq!(
+        probes_completed_total, 0,
+        "this scene has genuinely insufficient demand to fill a probe \
+         window; any completion here (completed={probes_completed_total}) \
+         would mean either padding crept in, or the scene has accidentally \
+         gained enough backlog to no longer serve as a negative control"
+    );
+}
+
 /// A 32x32 BGRA gradient tile, so Cdf53 passes carry real, distinct
 /// bit-plane content rather than a uniform tile's near-identical passes.
 /// Matches `tests/framebuffer.rs`'s `gradient_bgra` pixel-for-pixel.
