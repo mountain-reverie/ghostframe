@@ -211,9 +211,10 @@ const RTO_RETRANSMITS_PER_TICK: usize = 64;
 // The estimate takes charge of the per-tick emission budget. Two call
 // sites derive a starting budget before handing it to
 // `clamp_to_quinn_capacity` — `dispatch_dirty_tiles_via_scheduler`'s
-// `aimd_budget` and `apply_injected_frame`'s `inj.budget_bytes` — and both
-// route through `combine_pacing_budget` so the two don't independently
-// re-derive the same "should goog_cc bind here?" decision and drift apart.
+// AIMD-scaled `aimd_budget` and `apply_injected_frame`'s unscaled
+// `base_budget_bytes()` — and both route through `combine_pacing_budget` so
+// the two don't independently re-derive the same "should goog_cc bind
+// here?" decision and drift apart.
 
 /// Minimum `BweSnapshot::samples_seen` before `PacingMode::Paced` is
 /// trusted over `PacingMode::PathStats`. Below this, `GoogCcDriver` is
@@ -468,9 +469,6 @@ const FRAME_DIMENSIONS_RETRANSMITS: u8 = 10;
 pub struct InjectedFrame {
     pub seq: u32,
     pub timestamp_us: u32,
-    /// Byte budget for this drain. `usize::MAX` means unpaced — in wave 1
-    /// the netsim's token bucket does the real capping.
-    pub budget_bytes: usize,
     pub work: Vec<crate::transport::scheduler::TileWork>,
 }
 
@@ -1808,6 +1806,27 @@ impl IoBridge {
         }
     }
 
+    /// Per-tick emission budget before any pacing override or AIMD
+    /// modulation: measured QUIC bandwidth (`adaptation_context.bytes_per_us`)
+    /// × the capture tick interval × a fixed headroom fraction, floored so
+    /// the first frames of a session (before `bytes_per_us` is populated
+    /// from path stats) still emit promptly. See the long comment on
+    /// `SCHEDULER_TICK_BUDGET_FLOOR_BYTES`.
+    ///
+    /// Shared by `dispatch_dirty_tiles_via_scheduler` (which further scales
+    /// this by `tick_budget_multiplier`, the AIMD ramp/backoff fed by
+    /// observed `send_datagram` errors) and `apply_injected_frame` (which
+    /// does not — see that call site's comment for why). Both callers must
+    /// derive from the same production numbers rather than each computing
+    /// their own idea of "the budget", which is exactly the split that
+    /// generated Stage 2's defects.
+    fn base_budget_bytes(&self) -> usize {
+        (((self.adaptation_context.bytes_per_us as f64)
+            * SCHEDULER_TICK_INTERVAL_US
+            * SCHEDULER_TICK_BUDGET_FRACTION) as usize)
+            .max(SCHEDULER_TICK_BUDGET_FLOOR_BYTES)
+    }
+
     /// Shared scheduler dispatch: grid-sync → RTT update → bump+encode+enqueue
     /// per dirty tile → tick → fragment+send. Called by both `process_frame_cpu`
     /// and `process_frame_gpu`'s `FrameMode::TileCodec` branch.
@@ -1970,10 +1989,7 @@ impl IoBridge {
         // CpuRawOnly tests bypass this with `usize::MAX` so unit fixtures
         // that pre-seed tiles still drain in one tick.
         let pre_dispatch_send_errs = self.datagram_send_errs;
-        let base_budget_bytes = (((self.adaptation_context.bytes_per_us as f64)
-            * SCHEDULER_TICK_INTERVAL_US
-            * SCHEDULER_TICK_BUDGET_FRACTION) as usize)
-            .max(SCHEDULER_TICK_BUDGET_FLOOR_BYTES);
+        let base_budget_bytes = self.base_budget_bytes();
         // Clamp the AIMD-derived budget to what `quinn-proto` can actually
         // accept right now. `scheduler.tick` is destructive on the
         // refinement queue (popped work is removed, not marked `InFlight`),
@@ -2483,13 +2499,38 @@ impl IoBridge {
             // BWE Stage 2.2/2.4 pacing, the quinn-capacity clamp, the drain
             // itself, and the post-drain continuation bookkeeping are all
             // shared with `dispatch_dirty_tiles_via_scheduler` via
-            // `emit_via_scheduler` — see its doc comment. `inj.budget_bytes`
-            // is passed through unmodified: unlike the capture path, there
-            // is no AIMD (`tick_budget_multiplier`) to apply here, since
-            // that feedback loop reacts to *this bridge's own*
-            // `send_datagram` errors, which the injected path has no
-            // equivalent signal for.
-            self.emit_via_scheduler(inj.seq, inj.timestamp_us, max_frag, inj.budget_bytes);
+            // `emit_via_scheduler` — see its doc comment.
+            //
+            // The base budget is `base_budget_bytes()` — the same
+            // bytes_per_us-derived, floor-clamped number the capture path
+            // starts from — rather than a harness-private constant.
+            // `InjectedFrame` used to carry its own `budget_bytes` (always
+            // `usize::MAX` in practice, i.e. "drain the whole queue every
+            // injection"), which was deleted along with the field: an
+            // always-unbounded budget meant the harness never queued the
+            // way production does, which in turn meant a probe window
+            // could never open against a non-empty queue. See
+            // docs/superpowers/specs/2026-09-13-unified-emission-path-design.md.
+            //
+            // Deliberately *not* scaled by `tick_budget_multiplier`. That
+            // AIMD ramp/backoff is adjusted at the dispatch call site from a
+            // pre/post delta of `self.datagram_send_errs` computed around
+            // that specific call (see `dispatch_dirty_tiles_via_scheduler`).
+            // `send_datagram` errors are in fact recorded regardless of
+            // which path triggered them, but nothing here tracks a
+            // comparable delta for injected frames, and the AIMD loop is
+            // calibrated for a roughly-periodic 33 ms real capture cadence —
+            // the harness submits frames on whatever cadence a scene
+            // script chooses, under virtual (`start_paused`) time, which is
+            // not that cadence. Wiring the same ramp/backoff bookkeeping
+            // into this call site would duplicate the AIMD accounting the
+            // Task 1 extraction exists to avoid duplicating, in exchange for
+            // a control loop whose tuning assumptions this path doesn't
+            // meet. If a future scene needs to exercise AIMD backoff
+            // specifically, that is a reason to add tracking here
+            // deliberately, not a reason to have inherited it by accident.
+            let base_budget_bytes = self.base_budget_bytes();
+            self.emit_via_scheduler(inj.seq, inj.timestamp_us, max_frag, base_budget_bytes);
         }
         // Mirror the frame path's post-dispatch RTO sweep so injected
         // scenes exercise retransmission the same way real frames do.
@@ -5941,7 +5982,6 @@ mod tests {
         let frame_of = |seq: u32, work: TileWork| InjectedFrame {
             seq,
             timestamp_us: seq * 16_000,
-            budget_bytes: usize::MAX,
             work: vec![work],
         };
 
@@ -8213,7 +8253,6 @@ mod tests {
         tx.send(InjectedFrame {
             seq: 1,
             timestamp_us: 0,
-            budget_bytes: usize::MAX,
             work: vec![TileWork {
                 tile_x: 1,
                 tile_y: 2,
@@ -8276,7 +8315,6 @@ mod tests {
         tx.send(InjectedFrame {
             seq: 1,
             timestamp_us: 0,
-            budget_bytes: usize::MAX,
             work: vec![
                 // Tile (0,0): submitted out of order (pass 3 before pass 0)
                 // and as a partial set (only 2 of 14 passes) — exactly the
@@ -8398,7 +8436,6 @@ mod tests {
         tx.send(InjectedFrame {
             seq: 1,
             timestamp_us: 0,
-            budget_bytes: usize::MAX,
             work: vec![make_work(0, 0)],
         })
         .await
@@ -8410,7 +8447,6 @@ mod tests {
         tx.send(InjectedFrame {
             seq: 2,
             timestamp_us: 0,
-            budget_bytes: usize::MAX,
             work: vec![make_work(3, 3)],
         })
         .await
@@ -8451,7 +8487,6 @@ mod tests {
         tx.send(InjectedFrame {
             seq: 1,
             timestamp_us: 0,
-            budget_bytes: usize::MAX,
             work: vec![TileWork {
                 tile_x: 5,
                 tile_y: 5,
@@ -8512,7 +8547,6 @@ mod tests {
         tx.send(InjectedFrame {
             seq: 1,
             timestamp_us: 0,
-            budget_bytes: usize::MAX,
             work: vec![make_work(0, 0), make_work(5, 5)],
         })
         .await
