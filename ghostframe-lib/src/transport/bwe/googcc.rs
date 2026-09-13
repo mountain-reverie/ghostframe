@@ -35,6 +35,13 @@ pub(crate) struct GoogCcDriver {
     /// derived RTT — never fed to the controller. See `note_path_rtt`.
     path_rtt: Option<Duration>,
     implausible_rtt_samples: u64,
+    /// Bits-per-second derived from the controller's most recent
+    /// `NetworkControlUpdate::pacer_config` (`PacerConfig::data_rate()`).
+    /// `None` until the controller has produced at least one pacer config —
+    /// see `absorb`. This is Stage 2.2's pacing rate: BWE Stage 2's pacer
+    /// consumes this directly rather than deriving a rate from
+    /// `target_rate` (see `absorb`'s doc comment on that field).
+    pacer_rate_bps: Option<u64>,
 }
 
 /// Newtype carrying the `Send` assertion, so it covers exactly the one type
@@ -97,6 +104,7 @@ impl GoogCcDriver {
             samples_seen: 0,
             path_rtt: None,
             implausible_rtt_samples: 0,
+            pacer_rate_bps: None,
         }
     }
 
@@ -212,6 +220,7 @@ impl GoogCcDriver {
             bitrate_bps: self.estimate_bps,
             samples_seen: self.samples_seen,
             implausible_rtt_samples: self.implausible_rtt_samples,
+            pacer_rate_bps: self.pacer_rate_bps,
         }
     }
 
@@ -228,16 +237,42 @@ impl GoogCcDriver {
             // any caller here consumes: this wrapper has no encoder-rate
             // caller and the pacer is driven by
             // `NetworkControlUpdate::pacer_config`, which goog_cc computes
-            // independently.
+            // independently and which `pacer_rate_bps` below captures.
             //
             // `target_rate` is the controller's actual bandwidth estimate —
-            // the delay-based/loss-based AIMD result — and is what Stage 2's
-            // pacer should be validated against once it's wired up (it
-            // should consume `upd.pacer_config` directly rather than
-            // deriving a rate from this field).
+            // the delay-based/loss-based AIMD result — and is kept for
+            // observability (`BweSnapshot::bitrate_bps`, the periodic log)
+            // even though Stage 2.2's pacer consumes `pacer_rate_bps`
+            // instead.
             let bps = t.target_rate.bps();
             if bps > 0 {
                 self.estimate_bps = bps as u64;
+            }
+        }
+        if let Some(pc) = upd.pacer_config {
+            // `pad_window` ("send at least this much, as padding, to hold a
+            // floor rate") is deliberately unused. This project does not
+            // send padding — see the Stage 2 design doc's 2.4 section,
+            // "prefer draining queued work faster over sending padding":
+            // our queues normally hold real refinement work that is wanted
+            // anyway, so there's no case where we'd pad instead of just
+            // sending that. `probe_cluster_configs` is also unconsumed here
+            // — that is 2.4's job, not 2.2's.
+            //
+            // `data_window` / `time_window` are guarded finite before
+            // calling `data_rate()`: goog_cc always sets `time_window` to a
+            // literal 1 s in `get_pacing_rates`, and `data_window` from a
+            // finite pacing rate, so this should always hold in practice —
+            // but `DataSize::microbits()` (which `data_rate()` calls
+            // through `Div<TimeDelta>`) panics on an infinite/oversized
+            // operand and dividing by a zero `TimeDelta` panics too, so both
+            // are checked defensively rather than trusted.
+            if pc.data_window.is_finite() && pc.time_window.is_finite() && pc.time_window.us() > 0
+            {
+                let bps = pc.data_rate().bps();
+                if bps > 0 {
+                    self.pacer_rate_bps = Some(bps as u64);
+                }
             }
         }
     }
@@ -358,5 +393,46 @@ mod tests {
         let mut d = GoogCcDriver::new(4_000_000, t0);
         d.observe_derived_rtt(Duration::from_secs(30));
         assert_eq!(d.snapshot().implausible_rtt_samples, 0);
+    }
+
+    /// BWE Stage 2.2 consumes `pacer_rate_bps`, not `bitrate_bps`, to drive
+    /// emission. Before any feedback it must be `None` (nothing to consume
+    /// yet — `PacingMode::Paced` must not be reachable off a
+    /// never-produced pacer config), and it must become `Some` once the
+    /// controller has processed at least one feedback batch, since
+    /// `GoogCcNetworkController::on_transport_packets_feedback` /
+    /// `on_process_interval` always populate `pacer_config` (see
+    /// `get_pacing_rates`).
+    #[test]
+    fn pacer_rate_appears_only_after_feedback() {
+        let t0 = Instant::now();
+        let mut d = GoogCcDriver::new(1_000_000, t0);
+        assert_eq!(
+            d.snapshot().pacer_rate_bps,
+            None,
+            "pacer rate must be None before any feedback is absorbed"
+        );
+
+        let batch: Vec<AckArrival> = (0..12u32)
+            .map(|i| {
+                let emit_us = (i as u64) * 1_000;
+                AckArrival {
+                    wire_seq: i,
+                    server_emit_us: emit_us,
+                    client_arrival_ms_lo16: ((emit_us / 1_000 + 15) & 0xFFFF) as u16,
+                    size_bytes: 1200,
+                }
+            })
+            .collect();
+        d.update(&batch, t0 + Duration::from_millis(20));
+
+        let pacer_bps = d
+            .snapshot()
+            .pacer_rate_bps
+            .expect("pacer_config was not absorbed after a feedback batch");
+        assert!(
+            pacer_bps > 0,
+            "pacer rate derived from PacerConfig::data_rate() must be positive"
+        );
     }
 }

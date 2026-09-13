@@ -62,6 +62,15 @@ pub struct BweSnapshot {
     /// timestamps being differenced likely do not share an epoch — a real
     /// bug, not a slow link. Zero whenever no path RTT has been supplied yet.
     pub implausible_rtt_samples: u64,
+    /// BWE Stage 2.2's pacing rate, bits per second — derived from the
+    /// controller's most recent `NetworkControlUpdate::pacer_config`
+    /// (`PacerConfig::data_rate()`). `None` until the controller has
+    /// processed at least one feedback batch. This, not `bitrate_bps`, is
+    /// what `PacingMode::Paced` (`transport::io_bridge`) consumes to bound
+    /// the per-tick emission budget — see `GoogCcDriver::absorb`'s doc
+    /// comment for why the two fields diverge and `pad_window` (padding to
+    /// hold a floor rate) is deliberately not surfaced here at all.
+    pub pacer_rate_bps: Option<u64>,
 }
 
 // ── BweWrapper ────────────────────────────────────────────────────────────────
@@ -138,6 +147,35 @@ mod tests {
             BweWrapper::INITIAL_BPS,
         );
         assert_eq!(snap.samples_seen, 0);
+    }
+
+    /// `BweWrapper::snapshot()` must forward `pacer_rate_bps` unchanged from
+    /// the driver — the wrapper is documented as a thin seam
+    /// (`AckArrival` in, `BweSnapshot` out) and this field is exactly the
+    /// kind of thing a careless refactor could drop while still compiling
+    /// (both are `Option<u64>`-shaped, easy to leave zeroed).
+    #[test]
+    fn snapshot_forwards_pacer_rate_after_feedback() {
+        let t0 = Instant::now();
+        let mut bwe = BweWrapper::new(BweWrapper::INITIAL_BPS, t0);
+        assert_eq!(bwe.snapshot().pacer_rate_bps, None);
+
+        let records: Vec<AckArrival> = (0..12u32)
+            .map(|i| {
+                let emit_us = (i as u64) * 1_000;
+                AckArrival {
+                    wire_seq: i,
+                    server_emit_us: emit_us,
+                    client_arrival_ms_lo16: ((emit_us / 1_000 + 15) & 0xFFFF) as u16,
+                    size_bytes: 1200,
+                }
+            })
+            .collect();
+        let snap = bwe.update(&records, t0 + Duration::from_millis(20));
+        assert!(
+            snap.pacer_rate_bps.is_some_and(|bps| bps > 0),
+            "wrapper did not forward a positive pacer rate after feedback"
+        );
     }
 
     #[test]
