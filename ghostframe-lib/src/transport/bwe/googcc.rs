@@ -9,8 +9,8 @@ use super::timeline::Lo16Timeline;
 use super::{AckArrival, BweSnapshot};
 use goog_cc::network_control::{NetworkControllerConfig, NetworkControllerInterface};
 use goog_cc::transport::{
-    NetworkControlUpdate, PacketResult, ProbeClusterConfig, ProcessInterval, SentPacket,
-    TargetRateConstraints, TransportPacketsFeedback,
+    NetworkControlUpdate, PacedPacketInfo, PacketResult, ProbeClusterConfig, ProcessInterval,
+    SentPacket, TargetRateConstraints, TransportPacketsFeedback,
 };
 use goog_cc::units::{DataRate, DataSize, Timestamp};
 use goog_cc::{GoogCcConfig, GoogCcNetworkController};
@@ -191,6 +191,13 @@ impl GoogCcDriver {
             let sent = SentPacket {
                 send_time: Timestamp::from_millis(send_ms),
                 size: DataSize::from_bytes(r.size_bytes as i64),
+                // BWE Stage 2.4: tag this `SentPacket` as a probe packet
+                // iff the pass it came from was tagged at emit time. See
+                // `pacing_info_for`'s doc comment for why an untagged pass
+                // must produce `PacedPacketInfo::default()`
+                // (`probe_cluster_id == NOT_APROBE`) rather than anything
+                // else.
+                pacing_info: pacing_info_for(r.probe),
                 ..Default::default()
             };
             // The controller must see the send before the acknowledgement.
@@ -338,6 +345,38 @@ impl GoogCcDriver {
     }
 }
 
+/// Build the `PacedPacketInfo` a `SentPacket` should carry for this
+/// `AckArrival`'s probe tag (BWE Stage 2.4). A free function (not a method)
+/// so the mapping is directly unit-testable without going through the
+/// whole driver/controller plumbing -- see the tests below for exactly
+/// what this is checked against.
+///
+/// `None` (ordinary traffic, the overwhelming majority) MUST produce
+/// `PacedPacketInfo::default()`, whose `probe_cluster_id` is
+/// `PacedPacketInfo::NOT_APROBE`: `probe_bitrate_estimator.rs:88` asserts
+/// `cluster_id != NOT_APROBE` the moment a feedback packet's
+/// `pacing_info.probe_cluster_id` is anything else, so mis-tagging
+/// ordinary traffic would feed the probe estimator garbage instead of
+/// merely leaving it unaffected.
+///
+/// `Some` sets the estimator's per-packet cluster identity plus the
+/// thresholds it gates completion on (`min_probes`/`min_bytes`) and the
+/// cluster's running byte total *as of this packet*
+/// (`bytes_sent_before` -> `probe_cluster_bytes_sent`) -- goog_cc's own
+/// semantics for that field, not the cluster's eventual final total.
+fn pacing_info_for(
+    probe: Option<crate::transport::reliable_emitter::cache::ProbeTag>,
+) -> PacedPacketInfo {
+    match probe {
+        Some(p) => {
+            let mut info = PacedPacketInfo::new(p.id, p.min_probes, p.min_bytes);
+            info.probe_cluster_bytes_sent = p.bytes_sent_before;
+            info
+        }
+        None => PacedPacketInfo::default(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::GoogCcDriver;
@@ -363,6 +402,7 @@ mod tests {
                         // 15 ms one-way delay, constant.
                         client_arrival_ms_lo16: ((emit_us / 1_000 + 15) & 0xFFFF) as u16,
                         size_bytes: 1200,
+                        probe: None,
                     }
                 })
                 .collect();
@@ -404,6 +444,7 @@ mod tests {
                             server_emit_us: emit_us,
                             client_arrival_ms_lo16: (arrival_ms & 0xFFFF) as u16,
                             size_bytes: 1200,
+                            probe: None,
                         }
                     })
                     .collect();
@@ -477,6 +518,7 @@ mod tests {
                     server_emit_us: emit_us,
                     client_arrival_ms_lo16: ((emit_us / 1_000 + 15) & 0xFFFF) as u16,
                     size_bytes: 1200,
+                    probe: None,
                 }
             })
             .collect();
@@ -490,5 +532,89 @@ mod tests {
             pacer_bps > 0,
             "pacer rate derived from PacerConfig::data_rate() must be positive"
         );
+    }
+
+    // ── BWE Stage 2.4: probe tagging reaches PacedPacketInfo ──────────────
+    //
+    // These are the direct-evidence tests: a change that compiles but
+    // leaves every packet at `NOT_APROBE` would otherwise be invisible,
+    // because the estimator would behave exactly as it does today and
+    // nothing would fail.
+
+    use super::pacing_info_for;
+    use crate::transport::reliable_emitter::cache::ProbeTag;
+    use goog_cc::transport::PacedPacketInfo;
+
+    /// The overwhelming-majority case: an untagged pass must produce
+    /// `PacedPacketInfo::default()`, whose `probe_cluster_id` is
+    /// `NOT_APROBE`. `probe_bitrate_estimator.rs:88` asserts on exactly
+    /// this value, so a regression here would panic the first time *any*
+    /// feedback batch reached the real estimator, not just probe batches.
+    #[test]
+    fn untagged_pass_keeps_not_a_probe() {
+        let info = pacing_info_for(None);
+        assert_eq!(info.probe_cluster_id, PacedPacketInfo::NOT_APROBE);
+    }
+
+    /// The evidence this task exists to produce: a tagged pass must arrive
+    /// at the driver with a real, non-`NOT_APROBE` `probe_cluster_id`, and
+    /// every other `PacedPacketInfo` field must reflect the tag's values —
+    /// not some default or placeholder. In particular
+    /// `probe_cluster_bytes_sent` must come from `bytes_sent_before` (the
+    /// cluster's running total *before* this packet), not `min_bytes` or
+    /// zero.
+    #[test]
+    fn tagged_pass_carries_its_probe_identity_into_paced_packet_info() {
+        let tag = ProbeTag {
+            id: 7,
+            min_probes: 4,
+            min_bytes: 12_000,
+            bytes_sent_before: 3_500,
+        };
+        let info = pacing_info_for(Some(tag));
+        assert_ne!(
+            info.probe_cluster_id,
+            PacedPacketInfo::NOT_APROBE,
+            "a tagged pass must not be indistinguishable from ordinary traffic"
+        );
+        assert_eq!(info.probe_cluster_id, 7);
+        assert_eq!(info.probe_cluster_min_probes, 4);
+        assert_eq!(info.probe_cluster_min_bytes, 12_000);
+        assert_eq!(info.probe_cluster_bytes_sent, 3_500);
+    }
+
+    /// End-to-end: a probe-tagged `AckArrival` fed through the real
+    /// `update()` must reach goog_cc's own `ProbeBitrateEstimator`
+    /// (`goog_cc_network_control.rs:811` routes any feedback packet whose
+    /// `probe_cluster_id != NOT_APROBE` there) without tripping its
+    /// internal invariants -- `probe_bitrate_estimator.rs:88`'s
+    /// `assert_ne!(cluster_id, NOT_APROBE)` and its two `assert!(... > 0)`
+    /// checks on `probe_cluster_min_probes` / `probe_cluster_min_bytes`.
+    /// If `pacing_info_for` ever regressed to not tagging the packet, or to
+    /// building a degenerate `PacedPacketInfo`, this reaches those
+    /// assertions for real and panics -- rather than silently producing a
+    /// snapshot indistinguishable from the untagged case, which is the
+    /// exact failure mode ("instrumentation that compiles and reads zero")
+    /// this project has hit before.
+    #[test]
+    fn a_probe_tagged_ack_arrival_reaches_the_controller_without_tripping_its_invariants() {
+        let t0 = Instant::now();
+        let mut d = GoogCcDriver::new(4_000_000, t0);
+        let tag = ProbeTag {
+            id: 3,
+            min_probes: 2,
+            min_bytes: 1_000,
+            bytes_sent_before: 0,
+        };
+        let records = vec![AckArrival {
+            wire_seq: 1,
+            server_emit_us: 0,
+            client_arrival_ms_lo16: 15,
+            size_bytes: 1200,
+            probe: Some(tag),
+        }];
+        // Must not panic.
+        let snap = d.update(&records, t0 + Duration::from_millis(20));
+        assert_eq!(snap.samples_seen, 1);
     }
 }

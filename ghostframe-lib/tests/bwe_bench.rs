@@ -52,6 +52,7 @@ fn run(steps: u32, capacity_bps: impl Fn(u32) -> u64) -> Vec<u64> {
                 server_emit_us: send_us,
                 client_arrival_ms_lo16: (arrival_ms & 0xFFFF) as u16,
                 size_bytes: PKT_BYTES,
+                probe: None,
             });
         }
         emit_us += 20_000;
@@ -105,6 +106,7 @@ fn real_pacer_rate_bps() -> u64 {
                     server_emit_us: emit_us,
                     client_arrival_ms_lo16: ((emit_us / 1_000 + 15) & 0xFFFF) as u16,
                     size_bytes: PKT_BYTES,
+                    probe: None,
                 }
             })
             .collect();
@@ -189,6 +191,7 @@ fn pacing_mode_reaches_paced_after_enough_real_feedback() {
                     server_emit_us: emit_us,
                     client_arrival_ms_lo16: ((emit_us / 1_000 + 15) & 0xFFFF) as u16,
                     size_bytes: PKT_BYTES,
+                    probe: None,
                 }
             })
             .collect();

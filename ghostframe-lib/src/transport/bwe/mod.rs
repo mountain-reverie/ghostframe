@@ -47,6 +47,12 @@ pub struct AckArrival {
     /// per packet on IPv6), so the estimate runs a few percent low on
     /// full-size datagrams — no correction factor is applied here.
     pub size_bytes: u32,
+    /// Probe cluster this pass was tagged with at emit time (BWE Stage
+    /// 2.4), carried through unchanged from `CacheEntry::probe` via
+    /// `BweSample::probe`. `None` for ordinary traffic. `GoogCcDriver`
+    /// converts this into the `SentPacket.pacing_info` goog_cc's
+    /// `ProbeBitrateEstimator` requires — see `googcc::pacing_info_for`.
+    pub probe: Option<crate::transport::reliable_emitter::cache::ProbeTag>,
 }
 
 /// Public observability snapshot returned by `BweWrapper::snapshot()`.
@@ -204,6 +210,7 @@ mod tests {
                     server_emit_us: emit_us,
                     client_arrival_ms_lo16: ((emit_us / 1_000 + 15) & 0xFFFF) as u16,
                     size_bytes: 1200,
+                    probe: None,
                 }
             })
             .collect();
@@ -223,12 +230,14 @@ mod tests {
                 server_emit_us: 100,
                 client_arrival_ms_lo16: 110,
                 size_bytes: 1200,
+                probe: None,
             },
             AckArrival {
                 wire_seq: 2,
                 server_emit_us: 120,
                 client_arrival_ms_lo16: 135,
                 size_bytes: 1200,
+                probe: None,
             },
         ];
         let snap = bwe.update(&records, Instant::now());
@@ -272,6 +281,7 @@ mod tests {
             server_emit_us: 10,
             client_arrival_ms_lo16: 25,
             size_bytes: 1200,
+            probe: None,
         };
         assert_eq!(a.size_bytes, 1200);
     }
@@ -287,6 +297,7 @@ mod tests {
             server_emit_us: 5_000_000,
             client_arrival_ms_lo16: 25,
             size_bytes: 1200,
+            probe: None,
         };
         assert_eq!(a.server_emit_us, 5_000_000);
     }
@@ -311,6 +322,7 @@ mod tests {
                         server_emit_us: emit_us,
                         client_arrival_ms_lo16: (arrival_ms & 0xFFFF) as u16,
                         size_bytes: 1200,
+                        probe: None,
                     }
                 })
                 .collect();
@@ -347,6 +359,7 @@ mod tests {
                         server_emit_us: emit_us,
                         client_arrival_ms_lo16: (arrival_ms & 0xFFFF) as u16,
                         size_bytes: 1200,
+                        probe: None,
                     }
                 })
                 .collect();

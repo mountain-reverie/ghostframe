@@ -2,7 +2,7 @@
 //! builder, and RTO wheel into one struct. Per-session.
 
 use crate::transport::protocol::TileParityEnvelope;
-use crate::transport::reliable_emitter::cache::{CacheEntry, RetransmitCache};
+use crate::transport::reliable_emitter::cache::{CacheEntry, ProbeTag, RetransmitCache};
 use crate::transport::reliable_emitter::emission_queue::{Emission, EmissionQueue};
 use crate::transport::reliable_emitter::parity::GroupBuilder;
 use crate::transport::reliable_emitter::rto::{rto_for_attempt, RtoTimerWheel};
@@ -77,11 +77,18 @@ impl ReliableTileEmitter {
     /// so the ACK path can measure `queued_at -> ACK` (BWE Stage 2.1) in
     /// addition to `last_sent_at -> ACK` (Stage 2.0) — the former captures
     /// scheduler queueing delay, which the latter cannot see.
+    ///
+    /// `probe` mirrors `queued_at`'s treatment: `Some` iff this pass is
+    /// being sent inside an active BWE Stage 2.4 probe window, and it is
+    /// carried onto `CacheEntry` unchanged so the ACK path can build the
+    /// `PacedPacketInfo` goog_cc's probe estimator requires. `None` for
+    /// the overwhelming majority of ordinary traffic.
     pub fn submit_one(
         &mut self,
         key: EmitKey,
         source_datagram_bytes: Bytes,
         queued_at: Instant,
+        probe: Option<ProbeTag>,
         now: Instant,
     ) {
         let wire_seq = self.alloc.allocate();
@@ -107,6 +114,7 @@ impl ReliableTileEmitter {
             last_sent_at: now,
             attempts: 0,
             rto_deadline: now + rto_for_attempt(self.smoothed_rtt, 0),
+            probe,
         };
         self.cache.insert(key, entry);
         self.rto
@@ -132,9 +140,13 @@ impl ReliableTileEmitter {
         self.stats.source_emitted += 1;
     }
 
-    pub fn submit_batch(&mut self, items: Vec<(EmitKey, Bytes, Instant)>, now: Instant) {
-        for (key, bytes, queued_at) in items {
-            self.submit_one(key, bytes, queued_at, now);
+    pub fn submit_batch(
+        &mut self,
+        items: Vec<(EmitKey, Bytes, Instant, Option<ProbeTag>)>,
+        now: Instant,
+    ) {
+        for (key, bytes, queued_at, probe) in items {
+            self.submit_one(key, bytes, queued_at, probe, now);
         }
     }
 
@@ -387,7 +399,7 @@ mod tests {
         let mut sender = CollectSender::default();
         let now = Instant::now();
         let key = EmitKey::new(1, 0, 0, 0);
-        e.submit_one(key, fake_source(1, 0, 0xAA), now, now);
+        e.submit_one(key, fake_source(1, 0, 0xAA), now, None, now);
         e.drain(&mut sender, now);
         assert_eq!(sender.sent.len(), 1);
         assert_eq!(e.stats.source_emitted, 1);
@@ -399,8 +411,20 @@ mod tests {
         let mut e = ReliableTileEmitter::new(Instant::now());
         let mut sender = CollectSender::default();
         let now = Instant::now();
-        e.submit_one(EmitKey::new(1, 0, 0, 0), fake_source(1, 0, 0), now, now);
-        e.submit_one(EmitKey::new(2, 0, 0, 0), fake_source(2, 0, 0), now, now);
+        e.submit_one(
+            EmitKey::new(1, 0, 0, 0),
+            fake_source(1, 0, 0),
+            now,
+            None,
+            now,
+        );
+        e.submit_one(
+            EmitKey::new(2, 0, 0, 0),
+            fake_source(2, 0, 0),
+            now,
+            None,
+            now,
+        );
         e.drain(&mut sender, now);
         let s0 = &sender.sent[0];
         let s1 = &sender.sent[1];
@@ -419,11 +443,23 @@ mod tests {
         // Submit K sources for group 0, then K sources for group 1 (so the
         // offset-interleaved parity for group 0 is reachable).
         for i in 0..(FEC_GROUP_SIZE_K as u32 * 2) {
-            e.submit_one(EmitKey::new(i, 0, 0, 0), fake_source(i, 0, 0), now, now);
+            e.submit_one(
+                EmitKey::new(i, 0, 0, 0),
+                fake_source(i, 0, 0),
+                now,
+                None,
+                now,
+            );
         }
         // Drain past wire_seq 20 by submitting one more source so allocator's
         // peek advances.
-        e.submit_one(EmitKey::new(99, 0, 0, 0), fake_source(99, 0, 0), now, now);
+        e.submit_one(
+            EmitKey::new(99, 0, 0, 0),
+            fake_source(99, 0, 0),
+            now,
+            None,
+            now,
+        );
         e.drain(&mut sender, now);
         // At least one parity datagram should have been emitted
         assert_eq!(
@@ -446,7 +482,7 @@ mod tests {
         let mut sender = CollectSender::default();
         let now = Instant::now();
         let key = EmitKey::new(1, 0, 0, 0);
-        e.submit_one(key, fake_source(1, 0, 0), now, now);
+        e.submit_one(key, fake_source(1, 0, 0), now, None, now);
         e.drain(&mut sender, now);
         assert!(e.cache.get(&key).is_some());
         e.on_ack(&[key]);
@@ -469,7 +505,7 @@ mod tests {
         let mut sender = CollectSender::default();
         let t0 = Instant::now();
         let key = EmitKey::new(1, 0, 0, 0);
-        e.submit_one(key, fake_source(1, 0, 0), t0, t0);
+        e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
         e.drain(&mut sender, t0);
         assert_eq!(sender.sent.len(), 1);
         let entry_first_sent = e.cache.get(&key).unwrap().first_sent_at;
@@ -494,7 +530,7 @@ mod tests {
         let mut sender = CollectSender::default();
         let t0 = Instant::now();
         let key = EmitKey::new(1, 0, 0, 0);
-        e.submit_one(key, fake_source(1, 0, 0), t0, t0);
+        e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
         e.drain(&mut sender, t0);
         let mut tn = t0;
         for _ in 0..10 {
@@ -514,7 +550,7 @@ mod tests {
         let mut sender = CollectSender::default();
         let t0 = Instant::now();
         let key = EmitKey::new(1, 0, 0, 0);
-        e.submit_one(key, fake_source(1, 0, 0), t0, t0);
+        e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
         e.drain(&mut sender, t0);
         e.on_ack(&[key]);
         let t1 = t0 + Duration::from_millis(60);
@@ -530,7 +566,7 @@ mod tests {
         let mut sender = CollectSender::default();
         let t0 = Instant::now();
         let key = EmitKey::new(1, 0, 0, 0);
-        e.submit_one(key, fake_source(1, 0, 0), t0, t0);
+        e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
         e.drain(&mut sender, t0);
         assert_eq!(sender.sent.len(), 1);
         // NACK for frag_idx=0 (the only one)
@@ -556,9 +592,9 @@ mod tests {
         let k1 = EmitKey::new(1, 5, 5, 0);
         let k2 = EmitKey::new(2, 5, 5, 1);
         let k3 = EmitKey::new(1, 5, 6, 0); // different tile
-        e.submit_one(k1, fake_source(1, 0, 0), t0, t0);
-        e.submit_one(k2, fake_source(2, 0, 0), t0, t0);
-        e.submit_one(k3, fake_source(3, 0, 0), t0, t0);
+        e.submit_one(k1, fake_source(1, 0, 0), t0, None, t0);
+        e.submit_one(k2, fake_source(2, 0, 0), t0, None, t0);
+        e.submit_one(k3, fake_source(3, 0, 0), t0, None, t0);
         e.drain(&mut sender, t0);
         e.cancel_for_tile(5, 5);
         assert!(e.cache.get(&k1).is_none());
@@ -579,7 +615,7 @@ mod tests {
         let mut sender = CollectSender::default();
         let t0 = Instant::now();
         let key = EmitKey::new(1, 0, 0, 0);
-        e.submit_one(key, fake_source(1, 0, 0), t0, t0);
+        e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
         e.drain(&mut sender, t0);
         let nacks = 10usize;
         for _ in 0..nacks {
@@ -598,8 +634,8 @@ mod tests {
         let mut e = ReliableTileEmitter::new(Instant::now());
         let mut sender = CollectSender::default();
         let now = Instant::now();
-        let items: Vec<(EmitKey, Bytes, Instant)> = (0..5)
-            .map(|i| (EmitKey::new(i, 0, 0, 0), fake_source(i, 0, 0), now))
+        let items: Vec<(EmitKey, Bytes, Instant, Option<ProbeTag>)> = (0..5)
+            .map(|i| (EmitKey::new(i, 0, 0, 0), fake_source(i, 0, 0), now, None))
             .collect();
         e.submit_batch(items, now);
         e.drain(&mut sender, now);
@@ -612,7 +648,7 @@ mod tests {
         let mut e = ReliableTileEmitter::new(Instant::now());
         let key = EmitKey::new(1, 0, 0, 0);
         let now = Instant::now();
-        e.submit_one(key, bytes::Bytes::from(vec![0u8; 16]), now, now);
+        e.submit_one(key, bytes::Bytes::from(vec![0u8; 16]), now, None, now);
         // Drain the initial emission so the queue is empty.
         let mut sink: Vec<Vec<u8>> = Vec::new();
         struct Sink<'a>(&'a mut Vec<Vec<u8>>);
@@ -660,7 +696,7 @@ mod tests {
         let now = Instant::now();
         for i in 0..1000u32 {
             let k = EmitKey::new(i, 0, 0, 0);
-            e.submit_one(k, bytes::Bytes::from(vec![0u8; 16]), now, now);
+            e.submit_one(k, bytes::Bytes::from(vec![0u8; 16]), now, None, now);
         }
         // Drain the initial 1000 submissions.
         struct Sink<'a>(&'a mut Vec<Vec<u8>>);
@@ -735,7 +771,13 @@ mod tests {
         let mut sender = CollectSender::default();
 
         let now0 = crate::transport::io_bridge::now_std();
-        e.submit_one(EmitKey::new(1, 0, 0, 0), fake_source(1, 0, 0), now0, now0);
+        e.submit_one(
+            EmitKey::new(1, 0, 0, 0),
+            fake_source(1, 0, 0),
+            now0,
+            None,
+            now0,
+        );
         e.drain(&mut sender, now0);
 
         // Real wall-clock time spent on the next few lines is on the order
@@ -743,7 +785,13 @@ mod tests {
         tokio::time::advance(Duration::from_millis(250)).await;
 
         let now1 = crate::transport::io_bridge::now_std();
-        e.submit_one(EmitKey::new(2, 0, 0, 0), fake_source(2, 0, 0), now1, now1);
+        e.submit_one(
+            EmitKey::new(2, 0, 0, 0),
+            fake_source(2, 0, 0),
+            now1,
+            None,
+            now1,
+        );
         e.drain(&mut sender, now1);
 
         assert_eq!(sender.sent.len(), 2);
@@ -787,7 +835,7 @@ mod tests {
         let mut e = ReliableTileEmitter::new(t0);
         let mut sender = CollectSender::default();
         let key = EmitKey::new(1, 0, 0, 0);
-        e.submit_one(key, fake_source(1, 0, 0), t0, t0);
+        e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
         e.drain(&mut sender, t0);
 
         // Real wall-clock time spent on the next few lines is on the order
