@@ -268,3 +268,87 @@ probe-completion evidence.
 Until then, probe completion cannot be demonstrated end to end for a reason
 that has nothing to do with probes.
 
+
+## Realistic budget landed, and RTT with it (2026-09-13)
+
+"The remaining step" above — a realistic injection budget — landed in PR #79,
+which deleted `InjectedFrame.budget_bytes` and made `apply_injected_frame`
+derive its budget the way the dispatch path does. Probes now complete end to
+end: **7 of 10 seeds** on the 8x8 CDF53 scene, against 0 of 30 before Stage
+2.4. The negative control still shows 0 completed / 5 abandoned, so the scene
+discriminates on demand rather than passing everything.
+
+PR #79 did not itself cause that. Measured on `origin/master` alone and on
+master+#79, the busy scene gives identical seed-by-seed results (7/10, the
+same three failures). The completions come from #78's drain; #79 neither
+helps nor hurts them, which is expected — closing the divergence class was
+its goal and probe completion was only a hoped-for side effect.
+
+### The near-zero-RTT explanation was right, and was a harness defect
+
+PR #78 disclaimed its own scene: disabling `drain_for_probe_window_open`
+changed nothing, because "the harness's near-zero-RTT socketpair lets
+`DatagramsUnblocked` continuation bursts supply emission opportunities inside
+a window that production — 33.3ms ticks, real RTT — would not."
+
+That reasoning was correct, and pointed at something fixable: `NetProfile`
+has a `delay_us` knob no browserless scene had ever set. Setting it did not
+produce a slower link. It produced no link at all:
+
+| one-way delay | outcome |
+|---|---|
+| 0 (every scene) | 11.0s |
+| 1ms | 11.7s |
+| 5ms | 28.7s |
+| 10ms | no progress in 400s |
+| 20ms | no progress in 15+ min, 0.2% CPU |
+
+Delivery was awaited at the point of sending, serialising the link to one
+datagram in flight at a time. The client->server transmit drain checks
+neither `MAX_ITERS` nor `overall_deadline`, so a busy scene burned
+`backlog x delay_us` of virtual time inside one outer iteration with no
+bail-out reachable — the loop counter froze at iteration 200 while virtual
+time advanced exactly one datagram per 10ms. It also made `reorder_us`
+inert: with arrivals serialised, `at_us` could only increase, so no datagram
+could overtake another.
+
+This is a **fourth** harness-fidelity gap of the same family, and the largest
+in scope: BWE and pacing — subsystems whose entire purpose is reacting to
+path conditions — had never been exercised against a path with any
+propagation delay at all. Fixed by queueing decided datagrams in an
+`InFlight` heap and delivering them from the scene loop when due.
+
+### The fix is still not attributable in this harness
+
+With real RTT available, the experiment PR #78 could not run, run:
+
+| one-way delay | `drain_for_probe_window_open` | completed | abandoned |
+|---|---|---|---|
+| 0 | on | 30 | 0 |
+| 0 | **off** | 29 | 1 |
+| 20ms | on | 30 | 0 |
+| 20ms | **off** | 30 | 1 |
+| 40ms | on | 10 | 0 |
+| 40ms | **off** | 10 | 1 |
+
+Completions never collapse. The only difference is a single abandoned window
+without the fix — and it appears at **zero delay too**, so it is not the
+RTT-dependent effect the hypothesis predicted. One event across 30 runs, in a
+harness documented as not seed-reproducible, is noise-scale.
+
+**PR #78's disclaimer stands, unchanged.** Attribution lives in its two unit
+tests, which call the method directly and fail if it stops working. The
+scene asserts the narrower thing it always asserted: a real session can
+complete a probe cluster at all.
+
+Recording this as a null result rather than tuning the scene until the fix
+looks load-bearing. The RTT work's value is the fidelity gap it closes for
+BWE generally, not probe attribution.
+
+### One number moved at zero delay
+
+The probe scene went from 7/10 completions to 10/10 at `delay_us: 0` after
+the delivery-queue change, with all scenes still passing. `deliver_s2c` now
+lands at the top of the loop rather than inside the `select!` arm, which
+shifts interleaving relative to event-draining and injection. The earlier
+7/10 figures were themselves an artifact of serialised delivery.
