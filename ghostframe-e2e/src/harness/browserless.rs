@@ -727,11 +727,14 @@ async fn inject_frame(
     let frame = InjectedFrame {
         seq: frame_idx as u32,
         timestamp_us: (frame_idx as u64 * FRAME_SPACING_US) as u32,
-        // Unpaced: the netsim's token bucket does the real capping, and
-        // `IoBridge` clamps to quinn's actual send capacity
-        // (`clamp_to_quinn_capacity`, io_bridge.rs:1154) so this cannot
-        // overrun quinn's send buffer.
-        budget_bytes: usize::MAX,
+        // No `budget_bytes` here: `IoBridge::apply_injected_frame` derives
+        // its own per-tick budget the same way the production capture path
+        // does (`IoBridge::base_budget_bytes`), rather than accepting one
+        // from the caller. The netsim's token bucket still does the link
+        // capping, and `IoBridge` still clamps to quinn's actual send
+        // capacity (`clamp_to_quinn_capacity`) — this only removes the
+        // harness's own unbounded "drain everything" budget that sat in
+        // front of both.
         work,
     };
 
@@ -760,7 +763,6 @@ async fn inject_heartbeat(seq: u32, inject_tx: &mpsc::Sender<InjectedFrame>) -> 
     let frame = InjectedFrame {
         seq,
         timestamp_us: (seq as u64 * FRAME_SPACING_US) as u32,
-        budget_bytes: usize::MAX,
         work: Vec::new(),
     };
     inject_tx
