@@ -617,3 +617,59 @@ Two consequences worth carrying forward:
   rather than `usize::MAX`, so both arms are paced and only the *source* of
   the rate differs. That is a harness change, not a production one, and it is
   not required for 2.3.
+
+## Correction: the harness never exercises pass-major ordering
+
+Found while designing 2.3, and it invalidates an earlier reading in this
+document. **The measurements are sound; the interpretation attached to them
+was not.**
+
+Earlier text here said pass-major ordering "is not inert — it is worth about
+3%". That is wrong. On the measured path, pass-major ordering **never runs**.
+
+There are two enqueue paths and two drains, and they pair differently:
+
+| Path | Enqueue | Queue | Drain |
+|---|---|---|---|
+| Production CDF53 refinement | `enqueue_refinement_at` | `refinement_queue` | `drain_refinement_pass_major` — **pass-major** |
+| Browserless harness | `enqueue_at` (`io_bridge.rs:2088`) | `priority_queue` | `drain_priority_queue` — **FIFO** |
+
+`apply_injected_frame` routes **every** work item — CDF53 passes included —
+through `enqueue_at`, which pushes to `priority_queue`.
+`drain_priority_queue` iterates `for work in queue.iter_mut()`: pure
+insertion order, no `pass_idx` consideration anywhere.
+
+And the insertion order is **tile-major**. `scene_tiles.rs` builds passes
+0..13 for one tile before moving to the next, so the queue holds
+tile A pass 0..13, then tile B pass 0..13, and so on.
+
+**So the harness emits tile B's pass 0 — a critical pass — after tile A's
+pass 13.** That is not "prioritisation that isn't paying off"; it is the
+inverse of prioritisation. On a 4x4 grid the last tile's critical pass sits
+behind 15 x 14 = 210 entries. A flat tier ratio is the *expected* result of
+that ordering, not evidence about the production one.
+
+The ~3% that does appear is incidental: within a single tile, FIFO happens to
+emit pass 0 before pass 13.
+
+### What this means for 2.3
+
+**The premise 2.3 was about to be built on is unverified.** This document
+previously concluded that ordering exists but the budget slice is too small
+to let it pay off, and pointed 2.3 at the budget split. That conclusion came
+from a path with no ordering at all, so it is not evidence for or against the
+budget-split hypothesis.
+
+Production may already prioritise critical passes well. Nothing here measures
+it.
+
+**The next step is harness fidelity, not a pacer change.** Route the
+harness's CDF53 work through `enqueue_refinement_at` so it uses
+`refinement_queue` and the pass-major drain, then re-measure. That is a test
+change, not a production one, and it is the only way to learn whether 2.3 is
+needed.
+
+If the ratio drops sharply once the harness uses the production path, 2.3 is
+unnecessary and the honest answer is that production was already doing the
+right thing. That is a good outcome, and cheaper to discover now than after
+building a budget split against it.
