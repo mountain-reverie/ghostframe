@@ -10,6 +10,34 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::time::Instant;
 
+/// Probe cluster a tile-pass was tagged for at emit time (BWE Stage 2.4).
+/// `None` for ordinary traffic, which is the overwhelming majority — only
+/// passes emitted while `IoBridge`'s `ActiveProbe` window is open carry
+/// `Some`. Mirrors `queued_at`: copied through unchanged once set, since
+/// `ReliableTileEmitter::tick`'s RTO retransmit path resends the cached
+/// bytes directly (`self.queue.push_source`) without going through
+/// `submit_one` again, so a retransmitted pass keeps whatever tag (or lack
+/// of one) it was originally submitted with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeTag {
+    /// goog_cc's `ProbeClusterConfig::id`, echoed onto
+    /// `PacedPacketInfo::probe_cluster_id`.
+    pub id: i32,
+    /// From the config's `target_probe_count`; the estimator discards the
+    /// cluster if fewer packets than this are acknowledged.
+    pub min_probes: i64,
+    /// Derived `target_data_rate x target_duration`; the estimator
+    /// discards the cluster if fewer bytes than this are acknowledged.
+    pub min_bytes: i64,
+    /// The active probe's cumulative tagged-byte count *before* this
+    /// packet — goog_cc's `probe_cluster_bytes_sent` semantics, not the
+    /// cluster's eventual final total. Getting this wrong (e.g. using the
+    /// total-after-this-packet, or the window's final count) is silent:
+    /// nothing asserts on it downstream, it just skews the estimator's
+    /// send-rate calculation.
+    pub bytes_sent_before: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct CacheEntry {
     pub fragments: SmallVec<[Bytes; 2]>,
@@ -25,6 +53,8 @@ pub struct CacheEntry {
     pub last_sent_at: Instant,
     pub attempts: u8,
     pub rto_deadline: Instant,
+    /// See `ProbeTag`'s doc comment.
+    pub probe: Option<ProbeTag>,
 }
 
 pub struct RetransmitCache {
@@ -140,6 +170,7 @@ mod tests {
             last_sent_at: now,
             attempts: 0,
             rto_deadline: now,
+            probe: None,
         }
     }
 

@@ -922,6 +922,13 @@ struct BweSample {
     owd_ms_lo16: u16,
     /// Wire size of this datagram in bytes, summed over its fragments.
     size_bytes: u32,
+    /// Probe cluster this pass was tagged with at emit time (BWE Stage
+    /// 2.4), read off `CacheEntry::probe` while the entry is still live —
+    /// see the extraction site in `dispatch_ack_datagram`. Carried through
+    /// unchanged to `AckArrival::probe` so `GoogCcDriver` can build the
+    /// `PacedPacketInfo` goog_cc's probe estimator requires. `None` for
+    /// the overwhelming majority of ordinary traffic.
+    probe: Option<crate::transport::reliable_emitter::cache::ProbeTag>,
     /// Wall-clock instant when the ACK arrived (for periodic-drain timing).
     received_at: std::time::Instant,
 }
@@ -1998,6 +2005,7 @@ impl IoBridge {
             crate::transport::reliable_emitter::EmitKey,
             bytes::Bytes,
             std::time::Instant,
+            Option<crate::transport::reliable_emitter::cache::ProbeTag>,
         )> = Vec::with_capacity(drained.len());
         for work in drained {
             let datagrams = fragment_tile(
@@ -2135,7 +2143,26 @@ impl IoBridge {
                 work.pass_idx,
             );
             for dg in datagrams {
-                items.push((key, bytes::Bytes::from(dg), work.queued_at));
+                // BWE Stage 2.4: tag this datagram for the active probe
+                // window, if any -- mirrors `queued_at`'s treatment above:
+                // the tag travels with the pass from here through
+                // `CacheEntry` to the ACK path. `bytes_sent_before` is the
+                // cluster's running total *before* this datagram (goog_cc's
+                // `probe_cluster_bytes_sent` semantics), so it must be read
+                // before `bytes_sent` is advanced by this datagram's size.
+                let dg_len = dg.len() as i64;
+                let probe_tag = self.active_probe.as_mut().map(|p| {
+                    let tag = crate::transport::reliable_emitter::cache::ProbeTag {
+                        id: p.id,
+                        min_probes: p.min_probes,
+                        min_bytes: p.min_bytes,
+                        bytes_sent_before: p.bytes_sent,
+                    };
+                    p.bytes_sent = p.bytes_sent.saturating_add(dg_len);
+                    p.packets_sent = p.packets_sent.saturating_add(1);
+                    tag
+                });
+                items.push((key, bytes::Bytes::from(dg), work.queued_at, probe_tag));
             }
         }
         // Submit the batch (stamps wire_seq, caches, schedules RTO + parity).
@@ -2514,6 +2541,10 @@ impl IoBridge {
                         let tier = pass_tier(e.pass_idx);
                         let emit_lo16 = ((server_emit_us / 1000) & 0xFFFF) as u16;
                         let owd_ms_lo16 = arrival_lo16.wrapping_sub(emit_lo16);
+                        // BWE Stage 2.4: carry the probe tag (if any)
+                        // through to the sample, same pattern as
+                        // `queued_since_epoch_us` above.
+                        let probe = entry.probe;
                         self.bwe_samples_buffer.push(BweSample {
                             tier,
                             server_emit_us,
@@ -2521,6 +2552,7 @@ impl IoBridge {
                             client_arrival_ms_lo16: arrival_lo16,
                             owd_ms_lo16,
                             size_bytes,
+                            probe,
                             received_at: now_for_samples,
                         });
                     }
@@ -4571,6 +4603,7 @@ impl IoBridge {
                         server_emit_us: s.server_emit_us,
                         client_arrival_ms_lo16: s.client_arrival_ms_lo16,
                         size_bytes: s.size_bytes,
+                        probe: s.probe,
                     });
                 }
                 // quinn already measures path RTT for the scheduler; reuse it
@@ -6168,6 +6201,7 @@ mod tests {
             key,
             bytes::Bytes::from(vec![0u8; 25]),
             std::time::Instant::now(),
+            None,
             std::time::Instant::now(),
         );
         let nack_env = crate::transport::protocol::TileNackEnvelope {
@@ -6200,6 +6234,7 @@ mod tests {
             key,
             bytes::Bytes::from(vec![0u8; 25]),
             std::time::Instant::now(),
+            None,
             std::time::Instant::now(),
         );
         let ack_env = crate::transport::ack::AckBatch {
@@ -7582,6 +7617,7 @@ mod tests {
                     key,
                     bytes::Bytes::from(frag),
                     super::now_std(),
+                    None,
                     super::now_std(),
                 );
                 entries.push(AckEntry {

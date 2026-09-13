@@ -56,6 +56,7 @@ proptest! {
                     queued_at: now,
                     first_sent_at: now, last_sent_at: now,
                     attempts: 0, rto_deadline: now,
+                    probe: None,
                 },
             );
         }
