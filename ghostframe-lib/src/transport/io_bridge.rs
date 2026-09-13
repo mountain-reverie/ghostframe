@@ -474,6 +474,32 @@ pub struct InjectedFrame {
     pub work: Vec<crate::transport::scheduler::TileWork>,
 }
 
+/// The probe cluster currently being filled (BWE Stage 2.4), if any. One at
+/// a time: a new request replaces this rather than queueing, because two
+/// clusters' packets interleaving on the wire would corrupt both
+/// measurements, and `ProbeController` does not expect concurrent clusters
+/// anyway.
+struct ActiveProbe {
+    id: i32,
+    /// Target rate for the burst; overrides the pacing budget for ticks
+    /// inside the window (see `poll_probe_window`'s call sites) — sending
+    /// above the current estimate is the entire point of a probe.
+    target_rate_bps: u64,
+    /// Wall-clock end of the window, from the poll time the request was
+    /// observed plus the config's `target_duration`.
+    ends_at: std::time::Instant,
+    /// From the config's `target_probe_count` — see `ProbeRequest`.
+    min_probes: i64,
+    /// From `target_data_rate x target_duration` — see `ProbeRequest`.
+    min_bytes: i64,
+    /// Cumulative tagged bytes so far — goog_cc's `probe_cluster_bytes_sent`
+    /// semantics. Advanced once per tagged datagram in
+    /// `drain_scheduler_into_quinn`.
+    bytes_sent: i64,
+    /// Cumulative tagged packets so far, for the min-probes check at close.
+    packets_sent: i64,
+}
+
 pub struct IoBridge {
     /// Keep the ghostbridge handle alive so the socketpair fd stays open.
     /// `None` only in the test-only constructor, which builds directly from a
@@ -749,6 +775,23 @@ pub struct IoBridge {
     /// but the estimate doesn't drive emission yet. Phase 2 will plug
     /// `bwe.snapshot().bitrate_bps` into the pacer.
     bwe: crate::transport::bwe::BweWrapper,
+    /// The probe cluster window currently open (BWE Stage 2.4), if any. See
+    /// `ActiveProbe`'s doc comment and `poll_probe_window`.
+    active_probe: Option<ActiveProbe>,
+    /// Cumulative count of probe windows that closed having met both
+    /// `min_probes` and `min_bytes` (BWE Stage 2.4). Paired with
+    /// `probes_abandoned` — exactly one of the two increments per closed
+    /// window, in `poll_probe_window`'s `close_probe_window`.
+    probes_completed: u64,
+    /// Cumulative count of probe windows that closed *without* meeting
+    /// both thresholds. Per the design's "No padding" section, this is the
+    /// **expected** outcome on an idle link — the server never generates
+    /// filler to complete a probe, so an under-filled window is discarded
+    /// by goog_cc's own estimator (`probe_bitrate_estimator.rs:137`) and
+    /// silently means nothing without this counter. A non-zero rate here
+    /// alongside genuine encoder/scheduler backlog (not just idle gaps)
+    /// would indicate probing is broken rather than merely unexercised.
+    probes_abandoned: u64,
     /// Shared cell the browserless harness reads the final `BweSnapshot`
     /// from, after aborting the `run()` task.
     ///
@@ -1143,6 +1186,9 @@ impl IoBridge {
                 crate::transport::bwe::BweWrapper::INITIAL_BPS,
                 now_std(),
             ),
+            active_probe: None,
+            probes_completed: 0,
+            probes_abandoned: 0,
             // Throwaway estimator solely to obtain the same starting
             // `BweSnapshot` (`bwe.snapshot()` right above is unavailable
             // here — `self` doesn't exist yet inside this literal). Cheap:
@@ -1474,6 +1520,91 @@ impl IoBridge {
         budget.min(quinn_cap)
     }
 
+    /// BWE Stage 2.4: open a new probe window if goog_cc requested one
+    /// since the last poll, then close the current window once its
+    /// duration has elapsed. Called unconditionally from every `run()`
+    /// iteration — not only when `bwe_samples_buffer` had something to
+    /// drain — because a probe window on an otherwise-idle link (no
+    /// further ACKs arriving) must still close on schedule rather than
+    /// hang open forever waiting for the next sample.
+    ///
+    /// `take_probe_request()` only ever returns `Some` in the same tick
+    /// `self.bwe.update()` ran (it's populated by `absorb`, which only
+    /// runs from inside `update()`), so in practice the "open" half of
+    /// this only fires from ticks that also drained `bwe_samples_buffer` —
+    /// but polling unconditionally costs nothing and keeps the "close"
+    /// half correct regardless.
+    fn poll_probe_window(&mut self, now: std::time::Instant) {
+        if let Some(req) = self.bwe.take_probe_request() {
+            if let Some(old) = self.active_probe.take() {
+                // One active probe: a new request replaces any window
+                // still open, per the design — overlapping clusters would
+                // interleave their packets and corrupt both measurements.
+                // The replaced window is still accounted for below rather
+                // than silently dropped: whatever it accumulated before
+                // being superseded is real signal on whether probing is
+                // working, and the whole point of `probes_abandoned` is to
+                // not let that vanish unnoticed.
+                self.close_probe_window(old);
+            }
+            tracing::debug!(
+                probe_id = req.id,
+                target_rate_bps = req.target_rate_bps,
+                duration_ms = req.duration.as_millis() as u64,
+                min_probes = req.min_probes,
+                min_bytes = req.min_bytes,
+                "bwe: probe cluster window opened"
+            );
+            self.active_probe = Some(ActiveProbe {
+                id: req.id,
+                target_rate_bps: req.target_rate_bps,
+                ends_at: now + req.duration,
+                min_probes: req.min_probes,
+                min_bytes: req.min_bytes,
+                bytes_sent: 0,
+                packets_sent: 0,
+            });
+            // A freshly opened window cannot also be due to close on this
+            // same poll — its `ends_at` is strictly in the future.
+            return;
+        }
+
+        let is_due = matches!(&self.active_probe, Some(p) if now >= p.ends_at);
+        if is_due {
+            let probe = self.active_probe.take().expect("checked Some above");
+            self.close_probe_window(probe);
+        }
+    }
+
+    /// Credit exactly one of `probes_completed` / `probes_abandoned` for a
+    /// window that just closed (naturally, at `ends_at`, or early because a
+    /// new request replaced it). See `probes_abandoned`'s doc comment for
+    /// why under-filling is the expected outcome on an idle link, not a
+    /// bug — no padding is ever sent to force completion.
+    fn close_probe_window(&mut self, probe: ActiveProbe) {
+        if probe.packets_sent >= probe.min_probes && probe.bytes_sent >= probe.min_bytes {
+            self.probes_completed += 1;
+            tracing::debug!(
+                probe_id = probe.id,
+                packets_sent = probe.packets_sent,
+                bytes_sent = probe.bytes_sent,
+                "bwe: probe cluster window completed"
+            );
+        } else {
+            self.probes_abandoned += 1;
+            tracing::debug!(
+                probe_id = probe.id,
+                packets_sent = probe.packets_sent,
+                min_probes = probe.min_probes,
+                bytes_sent = probe.bytes_sent,
+                min_bytes = probe.min_bytes,
+                "bwe: probe cluster window abandoned — under-filled (no \
+                 padding is sent; an idle link legitimately under-fills, \
+                 see BWE Stage 2.4 design's \"No padding\" section)"
+            );
+        }
+    }
+
     /// Fire any cached retransmits whose RTO deadline has elapsed, then
     /// drain the resulting emission queue (source + parity) to the wire.
     /// `tick()` is rate-limited to `RTO_RETRANSMITS_PER_TICK` entries per
@@ -1759,12 +1890,25 @@ impl IoBridge {
                 // replacement. `clamp_to_quinn_capacity` still runs last.
                 let bwe_snap = self.bwe.snapshot();
                 let pacing_mode = select_pacing_mode(bwe_snap.samples_seen);
-                let pre_clamp_budget = combine_pacing_budget(
-                    pacing_mode,
-                    aimd_budget,
-                    bwe_snap.pacer_rate_bps,
-                    SCHEDULER_TICK_INTERVAL_US,
-                );
+                // BWE Stage 2.4: a probe window overrides the pacing budget
+                // outright rather than going through `combine_pacing_budget`
+                // — probing exists to send *above* goog_cc's own current
+                // estimate, so `min(aimd, googcc)` would defeat the point.
+                // `clamp_to_quinn_capacity` still runs last and still wins
+                // (below): a probe is not worth dropping tiles for, and
+                // that clamp exists because `scheduler.tick` is
+                // destructive.
+                let pre_clamp_budget = match &self.active_probe {
+                    Some(probe) => {
+                        pacer_tick_budget_bytes(probe.target_rate_bps, SCHEDULER_TICK_INTERVAL_US)
+                    }
+                    None => combine_pacing_budget(
+                        pacing_mode,
+                        aimd_budget,
+                        bwe_snap.pacer_rate_bps,
+                        SCHEDULER_TICK_INTERVAL_US,
+                    ),
+                };
                 self.clamp_to_quinn_capacity(pre_clamp_budget)
             }
         };
@@ -2167,12 +2311,23 @@ impl IoBridge {
             // `PacingMode::Paced` at all, and `bwe-tier-latency-baseline.md`'s
             // guard measurement would be blind to this change.
             let bwe_snap = self.bwe.snapshot();
-            let pre_clamp_budget = combine_pacing_budget(
-                select_pacing_mode(bwe_snap.samples_seen),
-                inj.budget_bytes,
-                bwe_snap.pacer_rate_bps,
-                SCHEDULER_TICK_INTERVAL_US,
-            );
+            // BWE Stage 2.4: same override as
+            // `dispatch_dirty_tiles_via_scheduler` — an active probe window
+            // replaces `combine_pacing_budget` outright rather than being
+            // combined with it, since a probe exists to send above the
+            // current estimate. `clamp_to_quinn_capacity` still runs last,
+            // below, and still wins.
+            let pre_clamp_budget = match &self.active_probe {
+                Some(probe) => {
+                    pacer_tick_budget_bytes(probe.target_rate_bps, SCHEDULER_TICK_INTERVAL_US)
+                }
+                None => combine_pacing_budget(
+                    select_pacing_mode(bwe_snap.samples_seen),
+                    inj.budget_bytes,
+                    bwe_snap.pacer_rate_bps,
+                    SCHEDULER_TICK_INTERVAL_US,
+                ),
+            };
             // Never pop more from the scheduler than quinn can absorb right
             // now — see `clamp_to_quinn_capacity`'s doc comment for why this
             // is mandatory rather than defensive.
@@ -4356,6 +4511,12 @@ impl IoBridge {
             // bandwidth estimate stays current. No-op when no connections.
             self.sample_all_path_stats();
 
+            // BWE Stage 2.4: open/close the probe cluster window. See
+            // `poll_probe_window`'s doc comment for why this runs
+            // unconditionally rather than only alongside the BWE drain
+            // below.
+            self.poll_probe_window(now_std());
+
             // Phase 1 Task 8: drain accumulated BWE samples (populated by
             // the ACK-receive path in Task 5) into the estimator. Cheap
             // on empty. The wire_seq we feed is a Phase 1 placeholder
@@ -4992,6 +5153,9 @@ impl IoBridge {
                 crate::transport::bwe::BweWrapper::INITIAL_BPS,
                 now_std(),
             ),
+            active_probe: None,
+            probes_completed: 0,
+            probes_abandoned: 0,
             // Throwaway estimator solely to obtain the same starting
             // `BweSnapshot` (`bwe.snapshot()` right above is unavailable
             // here — `self` doesn't exist yet inside this literal). Cheap:
