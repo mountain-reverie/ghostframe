@@ -206,6 +206,105 @@ const CUMULATIVE_EMIT_LOG_INTERVAL_FRAMES: u32 = 60;
 // observed in production with no cap).
 const RTO_RETRANSMITS_PER_TICK: usize = 64;
 
+// ── BWE Stage 2.2: PacingMode ────────────────────────────────────────────
+//
+// The estimate takes charge of the per-tick emission budget. Two call
+// sites derive a starting budget before handing it to
+// `clamp_to_quinn_capacity` — `dispatch_dirty_tiles_via_scheduler`'s
+// `aimd_budget` and `apply_injected_frame`'s `inj.budget_bytes` — and both
+// route through `combine_pacing_budget` so the two don't independently
+// re-derive the same "should goog_cc bind here?" decision and drift apart.
+
+/// Minimum `BweSnapshot::samples_seen` before `PacingMode::Paced` is
+/// trusted over `PacingMode::PathStats`. Below this, `GoogCcDriver` is
+/// still reporting values seeded at construction (`BweWrapper::INITIAL_BPS`
+/// for `bitrate_bps`; no `pacer_config` at all yet for `pacer_rate_bps`) —
+/// indistinguishable from a converged estimate without this check. Stage 1
+/// added `samples_seen` for exactly this reason.
+///
+/// EMPIRICAL GUESS, not yet validated against the bench (flagged per this
+/// project's precedent — see the M3.6/M3.7 constant-tuning work — for
+/// retuning once real data exists): the browserless baseline scene
+/// (`docs/specs/bwe-tier-latency-baseline.md`) produces roughly 500 ACK
+/// samples over its 10 s duration, ~50/s pooled across 30 runs. 150 samples
+/// is ~3 s of steady ACK arrivals at that rate — long enough to clear
+/// goog_cc's own delay-based estimator warm-up (the trendline/inter-arrival
+/// machinery wants on the order of a few dozen packet groups before its
+/// slope estimate means anything) while still switching to `Paced` well
+/// before a typical session's midpoint rather than at the very end of it.
+///
+/// Deliberately not `pub`: it would otherwise leak into `ghostframe.h`
+/// (cbindgen scrapes every `pub const` in this crate for the C FFI surface)
+/// alongside genuinely wire-relevant constants like `FEC_GROUP_SIZE_K` —
+/// this is an internal tuning knob, matching every other AIMD/budget
+/// constant in this file (`SCHEDULER_BUDGET_BACKOFF` and friends, none of
+/// which are `pub` either).
+const BWE_PACED_MODE_SAMPLE_THRESHOLD: u64 = 150;
+
+/// Which source governs the per-tick emission budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PacingMode {
+    /// Quinn path stats with AIMD — today's behaviour. The startup mode,
+    /// and the fallback while the estimator has too few samples to trust
+    /// (see `BWE_PACED_MODE_SAMPLE_THRESHOLD`).
+    PathStats,
+    /// goog_cc's `pacer_config` additionally governs the budget — see
+    /// `combine_pacing_budget`. Does not replace the `PathStats`
+    /// computation; the two are combined by taking the minimum.
+    Paced,
+}
+
+/// Select `PacingMode` from the estimator's `samples_seen` counter.
+/// `samples_seen` only grows for the life of a session, so in practice this
+/// is a one-way switch (`PathStats` -> `Paced`), never back — matching the
+/// design's framing of `PathStats` as "the startup mode."
+pub fn select_pacing_mode(samples_seen: u64) -> PacingMode {
+    if samples_seen >= BWE_PACED_MODE_SAMPLE_THRESHOLD {
+        PacingMode::Paced
+    } else {
+        PacingMode::PathStats
+    }
+}
+
+/// Bytes a `pacer_rate_bps` rate (bits per second, from
+/// `BweSnapshot::pacer_rate_bps`) affords over one tick of `tick_interval_us`
+/// microseconds. Pure arithmetic, factored out of `combine_pacing_budget` so
+/// it's independently checkable and so `bwe_bench.rs` can pin the unit
+/// conversion directly.
+pub fn pacer_tick_budget_bytes(pacer_rate_bps: u64, tick_interval_us: f64) -> usize {
+    (((pacer_rate_bps as f64) / 8.0) * tick_interval_us / 1_000_000.0) as usize
+}
+
+/// Combine the quinn-path-stats/AIMD-derived budget with goog_cc's
+/// pacer-derived budget for the same tick, by taking the smaller —
+/// `min`, not a replacement. They constrain different things: quinn's send
+/// buffer is a hard local limit whose violation drops popped work; goog_cc's
+/// pacer is a network estimate that can simply be wrong. Taking the minimum
+/// means a wrong estimate costs throughput rather than dropping tiles.
+///
+/// `PacingMode::PathStats`, or `Paced` before the estimator has ever
+/// produced a `pacer_config` (`pacer_rate_bps: None`), returns
+/// `aimd_budget_bytes` unchanged — there is nothing from goog_cc to combine
+/// with yet.
+///
+/// Callers must still pass the result through `clamp_to_quinn_capacity`
+/// afterwards, last — this function has no knowledge of quinn's live
+/// send-buffer state, and that clamp exists to prevent the scheduler
+/// over-popping into quinn regardless of which mode produced the budget.
+pub fn combine_pacing_budget(
+    mode: PacingMode,
+    aimd_budget_bytes: usize,
+    pacer_rate_bps: Option<u64>,
+    tick_interval_us: f64,
+) -> usize {
+    match (mode, pacer_rate_bps) {
+        (PacingMode::Paced, Some(bps)) => {
+            aimd_budget_bytes.min(pacer_tick_budget_bytes(bps, tick_interval_us))
+        }
+        _ => aimd_budget_bytes,
+    }
+}
+
 /// Visual-importance tier of a CDF53 pass.
 /// - Critical: passes 0-3 — LL3 sub-band + first 3 bit-planes. Carry
 ///   most of the perceived image quality. NACKed aggressively, given
@@ -1354,7 +1453,12 @@ impl IoBridge {
     /// clamp: `dispatch_dirty_tiles_via_scheduler` applies
     /// `tick_budget_multiplier` (AIMD) to its budget *before* calling this,
     /// and `apply_injected_frame` deliberately does not — that feedback loop
-    /// is not exercised on the injected path.
+    /// (which reacts to *this bridge's own* `send_datagram` errors) is not
+    /// exercised on the injected path. BWE Stage 2.2's `combine_pacing_budget`
+    /// (goog_cc's pacer, an independent network estimate) is a different
+    /// axis and both sites *do* apply it before calling this, so that the
+    /// browserless harness — which only ever exercises the injected path —
+    /// can actually observe `PacingMode::Paced`.
     ///
     /// A plain method (rather than inlined at each site) so unit tests can
     /// pin this arithmetic directly: `apply_injected_frame`'s own call site
@@ -1649,7 +1753,19 @@ impl IoBridge {
                 // that `scheduler.tick` accounts as payload bytes only.
                 let aimd_budget =
                     ((base_budget_bytes as f64) * self.tick_budget_multiplier) as usize;
-                self.clamp_to_quinn_capacity(aimd_budget)
+                // BWE Stage 2.2: goog_cc's pacer additionally bounds the
+                // budget once the estimator has enough samples to trust
+                // (`PacingMode`) — `min(aimd_budget, googcc_budget)`, not a
+                // replacement. `clamp_to_quinn_capacity` still runs last.
+                let bwe_snap = self.bwe.snapshot();
+                let pacing_mode = select_pacing_mode(bwe_snap.samples_seen);
+                let pre_clamp_budget = combine_pacing_budget(
+                    pacing_mode,
+                    aimd_budget,
+                    bwe_snap.pacer_rate_bps,
+                    SCHEDULER_TICK_INTERVAL_US,
+                );
+                self.clamp_to_quinn_capacity(pre_clamp_budget)
             }
         };
         let (stats, drained_bytes, drained_count) =
@@ -2023,10 +2139,28 @@ impl IoBridge {
                 rows * crate::tile::TILE_SIZE,
             );
 
+            // BWE Stage 2.2: goog_cc's pacer also bounds the injected-scene
+            // budget, same as the real capture path — see
+            // `combine_pacing_budget`'s doc comment on why the two sites
+            // must not drift apart. This does NOT reintroduce AIMD
+            // (`tick_budget_multiplier`) here: `inj.budget_bytes` is passed
+            // through unmodified when goog_cc doesn't bind, exactly as
+            // before. Without this, the browserless harness's scenes —
+            // which always pass `budget_bytes: usize::MAX` and rely on
+            // `clamp_to_quinn_capacity` alone — would never exercise
+            // `PacingMode::Paced` at all, and `bwe-tier-latency-baseline.md`'s
+            // guard measurement would be blind to this change.
+            let bwe_snap = self.bwe.snapshot();
+            let pre_clamp_budget = combine_pacing_budget(
+                select_pacing_mode(bwe_snap.samples_seen),
+                inj.budget_bytes,
+                bwe_snap.pacer_rate_bps,
+                SCHEDULER_TICK_INTERVAL_US,
+            );
             // Never pop more from the scheduler than quinn can absorb right
             // now — see `clamp_to_quinn_capacity`'s doc comment for why this
             // is mandatory rather than defensive.
-            let budget_bytes = self.clamp_to_quinn_capacity(inj.budget_bytes);
+            let budget_bytes = self.clamp_to_quinn_capacity(pre_clamp_budget);
             let (_, drained_bytes, _) =
                 self.drain_scheduler_into_quinn(inj.seq, inj.timestamp_us, max_frag, budget_bytes);
             // Mirror dispatch_dirty_tiles_via_scheduler's post-drain
@@ -4028,6 +4162,12 @@ impl IoBridge {
                         target: "ghostframe::bwe",
                         bwe_estimate_bps = bwe_snap.bitrate_bps,
                         bwe_samples_seen = bwe_snap.samples_seen,
+                        // BWE Stage 2.2 observability: which budget source
+                        // is actually governing emission right now, and
+                        // what goog_cc's pacer is asking for (0 = no
+                        // pacer_config absorbed yet).
+                        pacing_mode = ?select_pacing_mode(bwe_snap.samples_seen),
+                        pacer_rate_bps = bwe_snap.pacer_rate_bps.unwrap_or(0),
                         bps_critical = bps_crit,
                         bps_refinement = bps_refn,
                         cumulative_bytes_critical = self.bytes_emitted_critical,
@@ -5185,6 +5325,65 @@ fn parse_listen_port(listen_addr: &str) -> io::Result<u16> {
 mod tests {
     use super::*;
     use tokio::net::UnixStream;
+
+    // ── BWE Stage 2.2: PacingMode ────────────────────────────────────────
+
+    #[test]
+    fn select_pacing_mode_below_threshold_is_path_stats() {
+        assert_eq!(
+            select_pacing_mode(BWE_PACED_MODE_SAMPLE_THRESHOLD - 1),
+            PacingMode::PathStats
+        );
+        assert_eq!(select_pacing_mode(0), PacingMode::PathStats);
+    }
+
+    #[test]
+    fn select_pacing_mode_at_or_above_threshold_is_paced() {
+        assert_eq!(
+            select_pacing_mode(BWE_PACED_MODE_SAMPLE_THRESHOLD),
+            PacingMode::Paced
+        );
+        assert_eq!(
+            select_pacing_mode(BWE_PACED_MODE_SAMPLE_THRESHOLD * 100),
+            PacingMode::Paced
+        );
+    }
+
+    /// `pacer_tick_budget_bytes` is the one piece of unit-conversion
+    /// arithmetic in the pacing chain; pin it against a hand-computed value
+    /// so a units mistake (bits vs bytes, µs vs ms) fails loudly here
+    /// instead of silently mis-pacing production traffic.
+    #[test]
+    fn pacer_tick_budget_bytes_matches_hand_computed_value() {
+        // 8,000,000 bps == 1,000,000 bytes/s == 1000 bytes/ms. Over a
+        // 33,333 µs (33.333 ms) tick that's 33,333 bytes.
+        let got = pacer_tick_budget_bytes(8_000_000, 33_333.0);
+        assert_eq!(got, 33_333);
+    }
+
+    /// `PathStats` mode must ignore `pacer_rate_bps` entirely, even when it
+    /// would bind tighter than the AIMD budget — the estimator is not
+    /// trusted yet at this sample count, so its output must not leak into
+    /// the budget at all.
+    #[test]
+    fn combine_pacing_budget_path_stats_ignores_googcc() {
+        let got = combine_pacing_budget(
+            PacingMode::PathStats,
+            1_000_000,
+            Some(1_000), // absurdly small; would dominate if consulted
+            SCHEDULER_TICK_INTERVAL_US,
+        );
+        assert_eq!(got, 1_000_000);
+    }
+
+    /// `Paced` mode with no `pacer_config` absorbed yet (`None`) must fall
+    /// back to the AIMD budget unchanged — there is nothing from goog_cc to
+    /// combine with.
+    #[test]
+    fn combine_pacing_budget_paced_without_a_rate_falls_back_to_aimd() {
+        let got = combine_pacing_budget(PacingMode::Paced, 1_000_000, None, SCHEDULER_TICK_INTERVAL_US);
+        assert_eq!(got, 1_000_000);
+    }
 
     /// Test-only helper: construct an IoBridge with a fresh UnixStream pair
     /// and QuicServer. Discards the peer end of the stream pair (caller
