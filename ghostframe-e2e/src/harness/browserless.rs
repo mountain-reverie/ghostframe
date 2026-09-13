@@ -38,7 +38,8 @@
 //! scheduling off the same clock keeps both sides of the socketpair on one
 //! consistent timeline under `#[tokio::test(start_paused = true)]`.
 
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 use std::net::{Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
@@ -440,6 +441,16 @@ async fn drive_session(
     let mut net_c2s = NetSim::new(scene.net.clone(), seed);
     let mut net_s2c = NetSim::new(scene.net.clone(), seed ^ 0xA5A5_A5A5_A5A5_A5A5);
 
+    // Datagrams `NetSim` has already ruled on whose propagation delay has
+    // not yet elapsed. Delivery happens from the scene loop below, never
+    // inline at the point of sending: awaiting a datagram's arrival where
+    // it is sent serialises the link to one datagram in flight at a time.
+    // That is invisible at `delay_us: 0` (the await returns immediately)
+    // and wedges any busy scene at a realistic RTT, because the inner
+    // transmit drain sits outside both `MAX_ITERS` and `overall_deadline`.
+    let mut in_flight: BinaryHeap<InFlight> = BinaryHeap::new();
+    let mut next_in_flight_seq: u64 = 0;
+
     let mut events: Vec<ClientNetEvent> = Vec::new();
     let mut bytes_delivered: u64 = 0;
     let mut bytes_dropped: u64 = 0;
@@ -522,19 +533,30 @@ async fn drive_session(
         // routing each datagram through the client->server NetSim.
         while let Some(out) = client.poll_transmit() {
             let t = now_us(base);
-            deliver_c2s(
-                pump,
+            schedule(
                 &mut net_c2s,
+                Direction::C2s,
                 out.payload,
-                client_addr,
                 t,
-                base,
-                &mut bytes_delivered,
+                &mut in_flight,
+                &mut next_in_flight_seq,
                 &mut bytes_dropped,
-            )
-            .await
-            .map_err(|e| anyhow!("seed {seed}: pump send failed at iteration {iter}: {e}"))?;
+            );
         }
+
+        // The single point where datagrams actually arrive, in both
+        // directions, once their scheduled time has come.
+        flush_due(
+            &mut in_flight,
+            now_us(base),
+            pump,
+            &mut client,
+            client_addr,
+            server_addr,
+            &mut bytes_delivered,
+        )
+        .await
+        .map_err(|e| anyhow!("seed {seed}: pump send failed at iteration {iter}: {e}"))?;
 
         let new_events = client.take_events();
         for ev in &new_events {
@@ -638,6 +660,11 @@ async fn drive_session(
         if let Some(d) = client.poll_timeout() {
             wake_at = wake_at.min(base + Duration::from_micros(d));
         }
+        // A datagram in flight is its own wake-up reason: nothing else
+        // necessarily fires at the moment it lands.
+        if let Some(next) = in_flight.peek() {
+            wake_at = wake_at.min(base + Duration::from_micros(next.at_us));
+        }
         if session_ready {
             // Unconditional once `session_ready`: unlike the injection
             // branch above, waking up for the next due time applies
@@ -658,17 +685,15 @@ async fn drive_session(
                      (last events observed: {events:?}): {e}"
                 ))?;
                 let t = now_us(base);
-                deliver_s2c(
-                    &mut client,
+                schedule(
                     &mut net_s2c,
+                    Direction::S2c,
                     pkt.payload,
-                    server_addr,
                     t,
-                    base,
-                    &mut bytes_delivered,
+                    &mut in_flight,
+                    &mut next_in_flight_seq,
                     &mut bytes_dropped,
-                )
-                .await;
+                );
             }
             _ = tokio::time::sleep_until(wake_at) => {
                 if now_us(base) >= client.poll_timeout().unwrap_or(u64::MAX) {
@@ -778,15 +803,6 @@ fn now_us(base: TokioInstant) -> u64 {
         .as_micros() as u64
 }
 
-/// Sleep until virtual time reaches `at_us` since `base`, or return
-/// immediately if that time has already passed.
-async fn wait_until(base: TokioInstant, at_us: u64) {
-    let target = base + Duration::from_micros(at_us);
-    if TokioInstant::now() < target {
-        tokio::time::sleep_until(target).await;
-    }
-}
-
 /// Flip bit `bit_index` (as `NetSim::decide` numbers them: bit 0 is the
 /// LSB of byte 0) in `payload`, in place. A `bit_index` past the end of
 /// `payload` is a no-op rather than a panic — `payload` here is always the
@@ -799,91 +815,126 @@ fn flip_bit(payload: &mut [u8], bit_index: usize) {
     }
 }
 
-/// Route one client-produced datagram through the client->server `NetSim`
-/// and, if it survives, write it onto the socketpair pump for `IoBridge`
-/// to consume. Corruption flips a bit in the payload itself, never in the
-/// ghostbridge framing `pump.send` adds on top.
-#[allow(clippy::too_many_arguments)]
-async fn deliver_c2s(
-    pump: &mut SocketPairPump,
-    sim: &mut NetSim,
+/// Which way a queued datagram is travelling.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Direction {
+    /// Client -> server: written onto the socketpair pump for `IoBridge`.
+    C2s,
+    /// Server -> client: fed into `ClientNet::handle_udp`.
+    S2c,
+}
+
+/// A datagram `NetSim` has ruled on, waiting for its delivery time.
+///
+/// Ordered by `(at_us, seq)` and reversed, so the `BinaryHeap` holding
+/// these — a max-heap — yields the *earliest* arrival first. `seq` is a
+/// monotonic per-scene counter that breaks ties between datagrams sharing
+/// an `at_us`, keeping their relative order the one they were queued in
+/// rather than an arbitrary heap order.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct InFlight {
+    at_us: u64,
+    seq: u64,
+    dir: Direction,
     payload: Vec<u8>,
-    client_addr: SocketAddr,
+}
+
+impl Ord for InFlight {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .at_us
+            .cmp(&self.at_us)
+            .then_with(|| other.seq.cmp(&self.seq))
+    }
+}
+
+impl PartialOrd for InFlight {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Route one datagram through `sim` and queue whatever survives for
+/// delivery at the time the verdict assigns it.
+///
+/// This is deliberately synchronous. An earlier version awaited each
+/// datagram's arrival at its send site, which made the link serial: one
+/// datagram in flight at a time, the next not even ruled on until the
+/// previous had landed. At `delay_us: 0` that await returns immediately
+/// and the difference is invisible, which is why every scene passed. At a
+/// realistic RTT it meant a busy scene spent `backlog x delay_us` of
+/// virtual time inside the transmit drain — a loop that checks neither
+/// `MAX_ITERS` nor `overall_deadline`, so neither guard could fire.
+///
+/// It also made `reorder_us` inert: with arrivals serialised, each
+/// datagram's `at_us` was computed from a clock already advanced past the
+/// previous arrival, so `at_us` could only ever increase and no datagram
+/// could overtake another. Queueing restores the overtaking the field
+/// exists to model.
+fn schedule(
+    sim: &mut NetSim,
+    dir: Direction,
+    payload: Vec<u8>,
     now_us_at_send: u64,
-    base: TokioInstant,
-    bytes_delivered: &mut u64,
+    in_flight: &mut BinaryHeap<InFlight>,
+    next_seq: &mut u64,
     bytes_dropped: &mut u64,
-) -> std::io::Result<()> {
+) {
+    let mut queue = |at_us: u64, payload: Vec<u8>| {
+        in_flight.push(InFlight {
+            at_us,
+            seq: *next_seq,
+            dir,
+            payload,
+        });
+        *next_seq += 1;
+    };
+
     match sim.decide(payload.len(), now_us_at_send) {
         Verdict::Drop => {
             *bytes_dropped += payload.len() as u64;
         }
         Verdict::Deliver { at_us } => {
-            wait_until(base, at_us).await;
-            pump.send(&payload, &client_addr).await?;
-            *bytes_delivered += payload.len() as u64;
+            queue(at_us, payload);
         }
         Verdict::Duplicate { at_us, dup_at_us } => {
-            wait_until(base, at_us).await;
-            pump.send(&payload, &client_addr).await?;
-            *bytes_delivered += payload.len() as u64;
-            wait_until(base, dup_at_us).await;
-            pump.send(&payload, &client_addr).await?;
-            *bytes_delivered += payload.len() as u64;
+            queue(at_us, payload.clone());
+            queue(dup_at_us, payload);
         }
         Verdict::Corrupt { at_us, bit_index } => {
+            // Corruption flips a bit in the payload itself, never in the
+            // ghostbridge framing `pump.send` adds on top.
             let mut corrupted = payload;
             flip_bit(&mut corrupted, bit_index);
-            wait_until(base, at_us).await;
-            pump.send(&corrupted, &client_addr).await?;
-            *bytes_delivered += corrupted.len() as u64;
+            queue(at_us, corrupted);
         }
     }
-    Ok(())
 }
 
-/// Route one server-produced datagram (already read off the socketpair
-/// pump) through the server->client `NetSim` and, if it survives, feed it
-/// into `ClientNet`. Corruption flips a bit in the payload itself, never
-/// in the ghostbridge framing that already came off the wire.
+/// Deliver every queued datagram whose arrival time has come, in arrival
+/// order across both directions.
+///
+/// Called once per scene-loop iteration. `now` is the current virtual
+/// time, and is also the timestamp handed to `ClientNet::handle_udp` —
+/// the client sees the datagram as arriving when it actually arrives,
+/// not when it was sent.
 #[allow(clippy::too_many_arguments)]
-async fn deliver_s2c(
+async fn flush_due(
+    in_flight: &mut BinaryHeap<InFlight>,
+    now: u64,
+    pump: &mut SocketPairPump,
     client: &mut ClientNet,
-    sim: &mut NetSim,
-    payload: Vec<u8>,
+    client_addr: SocketAddr,
     server_addr: SocketAddr,
-    now_us_at_recv: u64,
-    base: TokioInstant,
     bytes_delivered: &mut u64,
-    bytes_dropped: &mut u64,
-) {
-    match sim.decide(payload.len(), now_us_at_recv) {
-        Verdict::Drop => {
-            *bytes_dropped += payload.len() as u64;
+) -> std::io::Result<()> {
+    while in_flight.peek().is_some_and(|f| f.at_us <= now) {
+        let f = in_flight.pop().expect("peek just confirmed a due datagram");
+        match f.dir {
+            Direction::C2s => pump.send(&f.payload, &client_addr).await?,
+            Direction::S2c => client.handle_udp(&f.payload, server_addr, now),
         }
-        Verdict::Deliver { at_us } => {
-            wait_until(base, at_us).await;
-            let t = now_us(base);
-            client.handle_udp(&payload, server_addr, t);
-            *bytes_delivered += payload.len() as u64;
-        }
-        Verdict::Duplicate { at_us, dup_at_us } => {
-            wait_until(base, at_us).await;
-            let t = now_us(base);
-            client.handle_udp(&payload, server_addr, t);
-            *bytes_delivered += payload.len() as u64;
-            wait_until(base, dup_at_us).await;
-            let t2 = now_us(base);
-            client.handle_udp(&payload, server_addr, t2);
-            *bytes_delivered += payload.len() as u64;
-        }
-        Verdict::Corrupt { at_us, bit_index } => {
-            let mut corrupted = payload;
-            flip_bit(&mut corrupted, bit_index);
-            wait_until(base, at_us).await;
-            let t = now_us(base);
-            client.handle_udp(&corrupted, server_addr, t);
-            *bytes_delivered += corrupted.len() as u64;
-        }
+        *bytes_delivered += f.payload.len() as u64;
     }
+    Ok(())
 }
