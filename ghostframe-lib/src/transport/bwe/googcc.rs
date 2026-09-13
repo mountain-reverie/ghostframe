@@ -9,8 +9,8 @@ use super::timeline::Lo16Timeline;
 use super::{AckArrival, BweSnapshot};
 use goog_cc::network_control::{NetworkControllerConfig, NetworkControllerInterface};
 use goog_cc::transport::{
-    NetworkControlUpdate, PacedPacketInfo, PacketResult, ProbeClusterConfig, ProcessInterval,
-    SentPacket, TargetRateConstraints, TransportPacketsFeedback,
+    NetworkAvailability, NetworkControlUpdate, PacedPacketInfo, PacketResult, ProbeClusterConfig,
+    ProcessInterval, SentPacket, TargetRateConstraints, TransportPacketsFeedback,
 };
 use goog_cc::units::{DataRate, DataSize, Timestamp};
 use goog_cc::{GoogCcConfig, GoogCcNetworkController};
@@ -92,21 +92,41 @@ impl GoogCcDriver {
             },
             ..Default::default()
         };
+        let mut ctl = GoogCcNetworkController::new(
+            cfg,
+            GoogCcConfig {
+                // We only ever feed `TransportPacketsFeedback` — there is
+                // no separate REMB channel and no independent RTT/loss
+                // report. `feedback_only: true` tells the controller to
+                // derive RTT and loss itself from that feedback (see
+                // `GoogCcNetworkController::on_transport_packets_feedback`'s
+                // `packet_feedback_only` branch); `false` disables that
+                // derivation entirely and starves the loss/RTT-based side
+                // of the estimator.
+                feedback_only: true,
+            },
+        );
+        // BWE Stage 2.4: `ProbeController` starts in `State::Init` and can
+        // only ever leave it — for exponential (or any later) probing — if
+        // `network_available` has been set `true` via `on_network_availability`
+        // first (`probe_controller.rs`'s `set_bitrates`/`on_network_availability`
+        // both gate on it). Nothing else in this driver ever calls it: we have
+        // no separate "network up/down" signal, and a live `IoBridge` session
+        // implies an available network for as long as it exists. Without this
+        // call `ProbeController` is stuck in `Init` forever and
+        // `probe_cluster_configs` is permanently empty — discovered while
+        // writing Task 4's bench, which could not otherwise drive a real
+        // probe request out of the controller at all. `start_bitrate` is
+        // still zero at this point (only set later via `set_bitrates`, which
+        // `on_process_interval` triggers from `initial_config` on the first
+        // `update()` call), so this call itself never yields a probe cluster
+        // — it only flips the flag that lets the first real one through.
+        let _ = ctl.on_network_availability(NetworkAvailability {
+            at_time,
+            network_available: true,
+        });
         Self {
-            ctl: SendCtl(GoogCcNetworkController::new(
-                cfg,
-                GoogCcConfig {
-                    // We only ever feed `TransportPacketsFeedback` — there is
-                    // no separate REMB channel and no independent RTT/loss
-                    // report. `feedback_only: true` tells the controller to
-                    // derive RTT and loss itself from that feedback (see
-                    // `GoogCcNetworkController::on_transport_packets_feedback`'s
-                    // `packet_feedback_only` branch); `false` disables that
-                    // derivation entirely and starves the loss/RTT-based side
-                    // of the estimator.
-                    feedback_only: true,
-                },
-            )),
+            ctl: SendCtl(ctl),
             arrival_time: Lo16Timeline::default(),
             base: now,
             estimate_bps: initial_bps,
