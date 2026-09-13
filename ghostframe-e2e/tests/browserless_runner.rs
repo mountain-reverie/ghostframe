@@ -619,6 +619,16 @@ async fn bwe_tier_latency_baseline() {
     const TARGET_SUCCESSFUL_RUNS: u64 = 10;
     const MAX_ATTEMPTS: u64 = 30;
     let mut successes = 0u64;
+    // BWE Stage 2.4 Task 5: cumulative probe-window outcomes across every
+    // successful run in this invocation. Reported alongside the latency
+    // numbers rather than in a separate test, since it's a "does probing
+    // engage on this scene at all" question about the very same runs the
+    // latency guard measures. Zero of both across every run means the
+    // window never opened on this scene -- goog_cc's `ProbeController`
+    // never requested a cluster -- which must be reported as a finding,
+    // not silently treated as "probing ran cleanly".
+    let mut probes_completed_total = 0u64;
+    let mut probes_abandoned_total = 0u64;
     for i in 0..MAX_ATTEMPTS {
         if successes >= TARGET_SUCCESSFUL_RUNS {
             break;
@@ -643,6 +653,12 @@ async fn bwe_tier_latency_baseline() {
             }
         };
         successes += 1;
+        probes_completed_total += r.probes_completed;
+        probes_abandoned_total += r.probes_abandoned;
+        println!(
+            "seed={seed:#010x} probes: completed={} abandoned={}",
+            r.probes_completed, r.probes_abandoned
+        );
         println!(
             "seed={seed:#010x} last_sent->ACK critical: count={:>5} mean_us={:>7} max_us={:>7} buckets={:?} \
              | refinement: count={:>5} mean_us={:>7} max_us={:>7} buckets={:?}",
@@ -720,6 +736,18 @@ async fn bwe_tier_latency_baseline() {
         );
     }
     println!("{successes}/{TARGET_SUCCESSFUL_RUNS} target runs completed");
+    println!(
+        "probes across {successes} runs: completed={probes_completed_total} \
+         abandoned={probes_abandoned_total}"
+    );
+    if probes_completed_total == 0 && probes_abandoned_total == 0 {
+        println!(
+            "NOTE: zero probe windows opened across every run -- this scene \
+             never drove goog_cc's ProbeController into requesting a \
+             cluster, so it says nothing about whether probing works on a \
+             real link"
+        );
+    }
 }
 
 /// A 32x32 BGRA gradient tile, so Cdf53 passes carry real, distinct

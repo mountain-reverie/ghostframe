@@ -859,3 +859,146 @@ shifts where queueing delay accumulates) could still reveal a case where
 pass-major ordering alone is insufficient. But the specific case this
 document has measured from Stage 2.0 through this entry no longer supports
 building it.
+
+## BWE Stage 2.4: probe clusters — regression guard + measurement
+
+**Date:** 2026-09-12
+**Git rev:** `fe078d3` (branch `spec/bwe-probe-clusters`)
+**Parent:** `5829ace` (tip of `spec/bwe-stage2`, the "harness fidelity fix"
+entry above)
+
+This is Task 5 of the probe-clusters plan
+(`docs/superpowers/plans/2026-09-12-bwe-probe-clusters.md`): re-run this
+document's own guard metric after landing probe support, and report the
+probe-window outcome counters from a real scene. Task 4's bench
+(`ghostframe-lib/tests/bwe_bench.rs`) is the correctness gate for probing
+itself; this section only answers "did adding it disturb the latency this
+document has been tracking, and does it ever actually engage on this
+scene."
+
+Two commits precede this measurement, on top of the harness-fidelity-fix
+baseline above:
+
+- `ddbff52` — a production fix, not part of the original plan. Writing
+  Task 4's bench found that `GoogCcDriver` never called
+  `on_network_availability`, so goog_cc's `ProbeController` was
+  permanently stuck in `State::Init` and could never request a cluster —
+  in the bench *or* in production. Fixed by calling it once at
+  construction, before `start_bitrate` is set, so it only unblocks the
+  first real request rather than firing one itself.
+- `fe078d3` — Task 4's bench coverage, proving (with a real,
+  controller-requested cluster, not a fabricated one) that a filled
+  cluster moves the estimate, an under-filled one is silently discarded
+  exactly like ordinary traffic, the `min_bytes` derivation is right, and
+  untagged traffic is unaffected by a pending request.
+
+### Method
+
+Identical scene, method, and re-measure protocol to every prior entry:
+`busy_frames(2)` 4x4 CDF53 grid, 10% independent loss, 10s duration, seed
+sequence `0xB17E0000..` incrementing past bail-outs, same
+`cargo test -p ghostframe-e2e --test browserless_runner
+bwe_tier_latency_baseline -- --ignored --nocapture --test-threads=1`
+command, run 3 times (30 successful runs total). Both metrics
+(`last_sent_at -> ACK` and `queued_at -> ACK`) reported, as in every entry
+since 2.1.
+
+The only code difference from the harness-fidelity-fix baseline is the two
+commits above, plus test-only instrumentation added for this measurement:
+`IoBridge::probe_stats_publish` (mirrors the existing
+`bwe_publish`/`latency_stats_publish` cell-and-republish pattern) surfaces
+`probes_completed`/`probes_abandoned` through `BrowserlessResult`, and
+`bwe_tier_latency_baseline` now prints them per run. **No scheduling,
+pacing, budget, or tier-ordering code changed** — Stage 2.3 remains
+retired, per the plan.
+
+Batch 1 hit one `MAX_ITERS` bail-out (seed `0xB17E0001`, backfilled by
+`0xB17E000A`); batches 2 and 3 were 10/10 clean — consistent with this
+scene's previously documented bail-out rate.
+
+Regression guards, run separately before this measurement (`cargo test -p
+ghostframe-e2e --test browserless_runner -- --test-threads=1`, run 6
+times, 11/11 non-ignored tests green every time, no flakes observed):
+`cdf53_converges_to_lossless_under_10pct_loss` and
+`every_cdf53_pass_eventually_lands` both green every run, alongside the
+full existing suite. `cargo test -p ghostframe-lib` (401 lib tests, plus
+the 10 `bwe_bench` tests including Task 4's 4 new ones) and
+`cargo clippy -p ghostframe-lib -p ghostframe-e2e --all-targets` both
+clean.
+
+### Results (30 scene runs, pooled)
+
+| Metric | Tier | Runs | Samples | Pooled mean | Max |
+|---|---|---:|---:|---:|---:|
+| `last_sent_at -> ACK` | Critical (0-3) | 30 | 3,925 | 29.4 ms | 394.0 ms |
+| `last_sent_at -> ACK` | Refinement (4-13) | 30 | 9,815 | 42.1 ms | 424.0 ms |
+| `queued_at -> ACK` | Critical (0-3) | 30 | 3,925 | 63.3 ms | 656.0 ms |
+| `queued_at -> ACK` | Refinement (4-13) | 30 | 9,815 | 87.0 ms | 1033.0 ms |
+
+### The guard: `last_sent_at -> ACK` did not rise
+
+| | Harness-fidelity-fix baseline (pre-probes) | This entry (post-probes) | Direction |
+|---|---:|---:|---|
+| `last_sent_at -> ACK` pooled mean, critical | 26.4 ms | 29.4 ms | +11% |
+| `last_sent_at -> ACK` pooled mean, refinement | 38.4 ms | 42.1 ms | +9.7% |
+| `last_sent_at -> ACK` ratio (critical/refinement) | 0.688 | 0.698 | flat |
+| `queued_at -> ACK` ratio (critical/refinement) | 0.725 | 0.727 | flat |
+
+The absolute pooled means moved up by single-digit percentages, but per
+this document's own repeated caution (see "Use the within-run ratio, not
+the absolute latency" above), absolute means are noisy across batches by
+design — batch 1 alone pooled to a 35.5 ms critical mean against batches
+2 and 3's ~26 ms, the same single-heavy-batch pattern this document has
+seen at every prior stage, not something new to probing. **The ratio —
+what this document's acceptance criterion is actually built on — did not
+move**: 0.698 against a 0.688 reference, and 0.727 against 0.725, both
+comfortably inside the ~0.65-0.72 per-batch spread already visible within
+this entry's own three batches (0.761/0.661/0.661 last_sent; matching
+per-batch spread was already documented at every earlier stage too).
+**Guard passes**: nothing here indicates a probe overshoot queued the
+wire in a way this metric would have caught, and the design's own scope
+(a 15 ms window, at most once per scene here, against a 10 s duration) is
+consistent with an effect too small to separate from existing noise.
+
+### Probe outcomes from a real scene: opens every time, completes never
+
+| Batch | Runs | `probes_completed` | `probes_abandoned` |
+|---|---:|---:|---:|
+| 1 | 10 | 0 | 10 |
+| 2 | 10 | 0 | 10 |
+| 3 | 10 | 0 | 10 |
+| **Total** | **30** | **0** | **30** |
+
+**Not the zero/zero case the plan warned about.** Every one of the 30
+successful runs opened exactly one probe window — goog_cc's
+`ProbeController` requests its initial exponential probe (3x/6x the
+starting rate) from the very first ACK batch of every session, so this
+scene reliably drives the window open. But every single one was
+abandoned, never completed: the initial probe's target rate on this
+scene's 2 Mbit/s seed (`BweWrapper::INITIAL_BPS`) is 12 Mbit/s (6x) for a
+15 ms window, giving `min_bytes = 12,000,000 x 0.015 / 8 = 22,500` bytes,
+so the estimator's 80%-of-`min_bytes` acceptance floor is 18,000 bytes
+that must arrive, ACKed, inside that same 15 ms. `busy_frames(2)`'s
+concurrent load, spread across a 4x4 grid with 10 CDF53 passes per tile,
+does not concentrate that much emitted, ACKed traffic inside any single
+15 ms window this early in the scene — consistent with the design's own
+"No padding" section: an idle-relative-to-the-probe link legitimately
+under-fills, and this counter is exactly what distinguishes that from
+probing being broken. Task 4's bench is the evidence that the *estimator
+and tagging path* work when a cluster is actually filled; this scene
+simply never generates enough concentrated, ACKed traffic inside a 15 ms
+window to fill one. A sustained, higher-throughput scene (more frames,
+finer-grained ACKs arriving faster than 15 ms apart in volume) would be
+needed to observe a completed probe in the browserless harness — out of
+scope for this measurement.
+
+### What this means going forward
+
+Probing is wired correctly (Task 4's bench) and does not regress the
+latency this document tracks (the guard above). It has not yet been
+observed to *complete* on any scene exercised so far, browserless or
+otherwise — the only completions on record are Task 4's bench, which
+fills a cluster directly rather than through a scene's organic traffic.
+Whether real sessions accumulate enough tile traffic inside a 15 ms
+window to complete a probe in practice is an open question this
+measurement does not answer either way.
