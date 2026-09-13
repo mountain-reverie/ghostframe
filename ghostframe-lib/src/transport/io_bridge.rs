@@ -2085,7 +2085,23 @@ impl IoBridge {
                 first_out_of_grid.get_or_insert((work.tile_x, work.tile_y));
                 continue;
             }
-            self.scheduler.enqueue_at(work, now_std());
+            // Route CDF53 passes through `refinement_queue` so they get
+            // `drain_refinement_pass_major`'s pass-major drain, exactly as
+            // the production capture path does via `enqueue_refinement_at`.
+            // Everything else (Solid/PalRle/Raw single-pass work) keeps
+            // going through `enqueue_at` -> `priority_queue` -> FIFO drain,
+            // unchanged. `enqueue_refinement_work_at` pushes the harness's
+            // already-formed `TileWork` as-is, preserving its `pass_idx`/
+            // `total_passes` exactly rather than rebuilding them by
+            // position — load-bearing when a scene submits a partial or
+            // out-of-order set of passes. See
+            // docs/specs/bwe-tier-latency-baseline.md's "Correction: the
+            // harness never exercises pass-major ordering".
+            if work.codec == crate::transport::protocol::Codec::Cdf53 {
+                self.scheduler.enqueue_refinement_work_at(work, now_std());
+            } else {
+                self.scheduler.enqueue_at(work, now_std());
+            }
             enqueued_count += 1;
         }
         if let Some((tile_x, tile_y)) = first_out_of_grid {
@@ -5182,6 +5198,14 @@ impl IoBridge {
         self.scheduler.peek_for_test()
     }
 
+    /// Same as `scheduler_peek_for_test`, but for `refinement_queue` — lets
+    /// a test confirm CDF53 injected work lands in the pass-major-drained
+    /// queue rather than the FIFO one.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub fn scheduler_refinement_peek_for_test(&self) -> Vec<crate::transport::scheduler::TileWork> {
+        self.scheduler.refinement_peek_for_test()
+    }
+
     /// Return the capabilities most recently advertised by the client via HELLO.
     /// Returns `ClientCapabilities::default()` until the first HELLO is received.
     pub fn current_client_caps(&self) -> crate::transport::client_caps::ClientCapabilities {
@@ -7727,6 +7751,130 @@ mod tests {
         assert_eq!(queued.len(), 1, "one work item must be queued");
         assert_eq!((queued[0].tile_x, queued[0].tile_y), (1, 2));
         assert_eq!(queued[0].codec, Codec::Solid);
+    }
+
+    /// Test-fidelity regression: `apply_injected_frame` must route CDF53
+    /// passes into `refinement_queue` (the pass-major-drained one), not
+    /// `priority_queue` (FIFO), or the browserless harness never exercises
+    /// `drain_refinement_pass_major` at all — see
+    /// docs/specs/bwe-tier-latency-baseline.md's "Correction: the harness
+    /// never exercises pass-major ordering". Injects two tiles' worth of
+    /// out-of-order CDF53 passes (deliberately not pass_idx-ascending, and a
+    /// non-CDF53 Solid tile alongside them) and asserts: CDF53 work lands in
+    /// `refinement_queue` with `pass_idx`/`total_passes` preserved exactly
+    /// as submitted (no renumbering by position), `priority_queue` gets only
+    /// the Solid tile, and `refinement_queue` is untouched by the Solid
+    /// tile.
+    #[tokio::test(start_paused = true)]
+    async fn injected_cdf53_work_lands_in_refinement_queue_not_priority_queue() {
+        use crate::transport::protocol::Codec;
+        use crate::transport::scheduler::{TileWork, WorkState};
+
+        let (ours, _peer) = tokio::net::UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("QuicServer::new");
+        let (tx, rx) = mpsc::channel(8);
+        let mut bridge = IoBridge::new_with_injection_for_test(ours, server, rx, 4, 4);
+
+        let cdf53_work = |tile_x: u8, tile_y: u8, pass_idx: u8| TileWork {
+            tile_x,
+            tile_y,
+            generation: 0,
+            pass_idx,
+            total_passes: 14,
+            codec: Codec::Cdf53,
+            payload: vec![pass_idx; 4],
+            queued_at: super::now_std(),
+            last_sent_at: None,
+            state: WorkState::Pending,
+        };
+
+        tx.send(InjectedFrame {
+            seq: 1,
+            timestamp_us: 0,
+            budget_bytes: usize::MAX,
+            work: vec![
+                // Tile (0,0): submitted out of order (pass 3 before pass 0)
+                // and as a partial set (only 2 of 14 passes) — exactly the
+                // shape `enqueue_refinement_work_at` must not renumber.
+                cdf53_work(0, 0, 3),
+                cdf53_work(0, 0, 0),
+                // Tile (1, 1): a single CDF53 pass.
+                cdf53_work(1, 1, 7),
+                // A non-CDF53 tile alongside them, which must still go to
+                // priority_queue exactly as before this change.
+                TileWork {
+                    tile_x: 2,
+                    tile_y: 2,
+                    generation: 0,
+                    pass_idx: 0,
+                    total_passes: 1,
+                    codec: Codec::Solid,
+                    payload: vec![1, 2, 3, 255],
+                    queued_at: super::now_std(),
+                    last_sent_at: None,
+                    state: WorkState::Pending,
+                },
+            ],
+        })
+        .await
+        .expect("send injection");
+
+        bridge.drain_injection_for_test().await;
+
+        // No connected session -> compute_max_datagram_size() is None ->
+        // the drain is skipped, so everything above is still sitting
+        // exactly where it was enqueued.
+        let priority = bridge.scheduler_peek_for_test();
+        let refinement = bridge.scheduler_refinement_peek_for_test();
+
+        assert_eq!(
+            priority.len(),
+            1,
+            "priority_queue must hold only the non-CDF53 (Solid) tile"
+        );
+        assert_eq!((priority[0].tile_x, priority[0].tile_y), (2, 2));
+        assert_eq!(priority[0].codec, Codec::Solid);
+
+        assert_eq!(
+            refinement.len(),
+            3,
+            "refinement_queue must hold all 3 CDF53 passes across both tiles"
+        );
+        assert!(
+            refinement.iter().all(|w| w.codec == Codec::Cdf53),
+            "priority_queue must never receive CDF53 work post-fix"
+        );
+
+        // pass_idx/total_passes must be exactly what was submitted -- not
+        // renumbered by insertion position (which would turn pass_idx 3
+        // into 0 and pass_idx 0 into 1 for tile (0,0) if this used
+        // enqueue_refinement_at's positional Vec<Vec<u8>> path instead of
+        // enqueue_refinement_work_at).
+        let tile00: Vec<(u8, u8)> = refinement
+            .iter()
+            .filter(|w| (w.tile_x, w.tile_y) == (0, 0))
+            .map(|w| (w.pass_idx, w.total_passes))
+            .collect();
+        assert_eq!(
+            tile00.len(),
+            2,
+            "tile (0,0) must keep both of its submitted passes"
+        );
+        assert!(
+            tile00.contains(&(3, 14)),
+            "pass_idx 3 must survive as 3, not be renumbered: {tile00:?}"
+        );
+        assert!(
+            tile00.contains(&(0, 14)),
+            "pass_idx 0 must survive as 0: {tile00:?}"
+        );
+
+        let tile11: Vec<(u8, u8)> = refinement
+            .iter()
+            .filter(|w| (w.tile_x, w.tile_y) == (1, 1))
+            .map(|w| (w.pass_idx, w.total_passes))
+            .collect();
+        assert_eq!(tile11, vec![(7, 14)], "pass_idx 7 must survive as 7");
     }
 
     /// Regression test for the growth-on-demand hazard: a bounding-box

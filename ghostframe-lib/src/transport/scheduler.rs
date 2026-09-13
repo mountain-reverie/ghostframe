@@ -214,9 +214,41 @@ impl Scheduler {
         self.priority_queue.push_back(work);
     }
 
+    /// Push an already-formed `TileWork` straight into `refinement_queue`,
+    /// mirroring `enqueue_at` but targeting the pass-major-drained queue
+    /// instead of the FIFO one.
+    ///
+    /// Exists for callers that already hold a fully-formed `TileWork` (with
+    /// its own `pass_idx`/`total_passes` set correctly — e.g. a harness that
+    /// pre-encodes a possibly-partial or out-of-order set of CDF53 passes)
+    /// and must not have those fields recomputed by position, which is what
+    /// `enqueue_refinement_at`/`enqueue_refinement_subset_at` do when they
+    /// build `TileWork` from a `Vec<Vec<u8>>` of payloads. Those two remain
+    /// the right entry point for the production capture path, which always
+    /// hands over a complete, in-order pass vector; this one is for routing
+    /// pre-built `TileWork` (e.g. `InjectedFrame::work`) into the same queue
+    /// without regrouping or renumbering it.
+    pub fn enqueue_refinement_work_at(&mut self, mut work: TileWork, now: Instant) {
+        debug_assert!((work.tile_x as u32) < self.cols, "tile_x out of bounds");
+        debug_assert!((work.tile_y as u32) < self.rows, "tile_y out of bounds");
+        work.queued_at = now;
+        work.last_sent_at = None;
+        work.state = WorkState::Pending;
+        self.refinement_queue.push_back(work);
+    }
+
     #[cfg(any(test, feature = "browserless-harness"))]
     pub fn peek_for_test(&self) -> Vec<TileWork> {
         self.priority_queue.iter().cloned().collect()
+    }
+
+    /// Same as `peek_for_test`, but for `refinement_queue`. Lets a test
+    /// distinguish "the work landed in the pass-major-drained queue" from
+    /// "the work landed in the FIFO one" directly, rather than inferring it
+    /// from drain-order side effects.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub fn refinement_peek_for_test(&self) -> Vec<TileWork> {
+        self.refinement_queue.iter().cloned().collect()
     }
 
     #[cfg(test)]
