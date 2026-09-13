@@ -984,3 +984,75 @@ fn shifted_gradient_tile(shift: u32, tile_x: u8, tile_y: u8) -> Vec<u8> {
     }
     bgra
 }
+
+/// The link must carry datagrams concurrently: one in flight must not
+/// block the ones behind it.
+///
+/// This exists because it did block them. Delivery used to be awaited at
+/// the point of sending, making the link strictly serial — one datagram in
+/// flight at a time, the next not even ruled on by `NetSim` until the
+/// previous had landed. At `delay_us: 0`, which every other scene in this
+/// file uses, that await returns immediately and the shape is invisible;
+/// that is why the whole suite passed over it.
+///
+/// At a realistic RTT it was not merely slow. The client->server transmit
+/// drain checks neither `MAX_ITERS` nor `overall_deadline` — both guards
+/// live in the outer loop — so the scene spent `backlog x delay_us` of
+/// virtual time inside a single outer iteration with no bail-out reachable.
+/// Measured at 10ms one-way: no progress in 400s, loop counter frozen at
+/// iteration 200 while virtual time advanced exactly one datagram per 10ms.
+///
+/// The assertion is a throughput floor rather than a timeout because the
+/// pre-fix failure was a wall-clock hang, and a hang cannot be asserted
+/// against under a paused clock — the test would hang too. A serialised
+/// link can deliver at most one datagram per `delay_us`, so
+/// `duration / delay_us` datagrams is a hard ceiling for the broken shape.
+/// Clearing it by a wide margin is only possible if datagrams overlap in
+/// flight.
+#[tokio::test(start_paused = true)]
+async fn a_link_with_propagation_delay_carries_datagrams_concurrently() {
+    const ONE_WAY_US: u64 = 20_000; // 40 ms RTT: a plausible wide-area path.
+    const DURATION_US: u64 = 10_000_000;
+
+    let scene = BrowserlessScene {
+        seed: 0x5D1A_7E00,
+        frames: busy_frames_grid(8, 8, 8),
+        net: NetProfile {
+            delay_us: ONE_WAY_US,
+            ..NetProfile::perfect()
+        },
+        duration: Duration::from_micros(DURATION_US),
+        grid_cols: 8,
+        grid_rows: 8,
+    };
+    let r = run_browserless(scene).await.expect("scene ran");
+
+    // A link that never established would deliver few bytes for reasons
+    // that have nothing to do with concurrency, so pin that down first.
+    assert!(
+        r.events.contains(&ClientNetEvent::SessionReady),
+        "the delayed link must still establish a session; events={:?}",
+        r.events
+    );
+
+    // Ceiling for a serialised link: one datagram per one-way delay, at a
+    // generous 1,200 bytes each. Real datagrams here are smaller, which
+    // only makes the ceiling harder to clear by accident.
+    let serial_max_datagrams = DURATION_US / ONE_WAY_US;
+    let serial_ceiling_bytes = serial_max_datagrams * 1_200;
+
+    println!(
+        "delayed link: bytes_delivered={} vs serialised ceiling={} \
+         ({serial_max_datagrams} datagrams x 1200B)",
+        r.bytes_delivered, serial_ceiling_bytes
+    );
+    assert!(
+        r.bytes_delivered > serial_ceiling_bytes,
+        "a {}ms-RTT link delivered {} bytes, at or below the {} a strictly \
+         serialised link could manage. Delivery has regressed to awaiting \
+         each datagram's arrival at the point it is sent.",
+        ONE_WAY_US * 2 / 1000,
+        r.bytes_delivered,
+        serial_ceiling_bytes
+    );
+}
