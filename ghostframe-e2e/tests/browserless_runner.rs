@@ -798,6 +798,19 @@ fn busy_frames_grid(n: usize, cols: u8, rows: u8) -> Vec<FrameScript> {
 /// given the harness's non-reproducibility, matching this file's existing
 /// aggregate-across-seeds pattern (see `bwe_tier_latency_baseline`,
 /// `retransmits_fire_under_loss_but_not_on_a_perfect_link`).
+///
+/// **This test does NOT validate `drain_for_probe_window_open`, and must not
+/// be read as doing so.** Verified by disabling that call site and re-running:
+/// completions are statistically indistinguishable with and without the fix.
+/// The browserless harness runs over a socketpair with near-zero RTT, so
+/// `DatagramsUnblocked`-driven continuation bursts supply emission
+/// opportunities inside a probe window that production — 33.3 ms ticks, real
+/// RTT — would not.
+///
+/// What this test asserts is narrower and still worth asserting: a real
+/// session driven end-to-end *can* complete a probe cluster at all, which was
+/// false before Stage 2.4. Attribution of the fix lives in the two unit tests
+/// named above; they call the method directly and fail if it stops working.
 #[tokio::test(start_paused = true)]
 async fn probe_windows_can_complete_on_a_busy_link() {
     let mut probes_completed_total = 0u64;
