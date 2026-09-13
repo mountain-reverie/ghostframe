@@ -582,3 +582,38 @@ predicted: 2.2 does not touch the tier axis, so it could not have made
 2.3's guaranteed-slice-for-`PassTier::Critical` design (from the sequencing
 doc) is still the outstanding piece, and now has a `PacingMode`-governed
 budget underneath it to split rather than an unbounded AIMD ramp.
+
+### Caveat on the 2.2 magnitude: the harness path was previously unpaced
+
+The guard result stands — `last_sent_at -> ACK` fell rather than rose, which
+is the safety-critical finding. But the **size** of the drop should not be
+read as "goog_cc beats AIMD", because on the measured path it is not being
+compared against AIMD at all.
+
+`apply_injected_frame` takes its budget from `inj.budget_bytes`, and the
+browserless harness passes **`usize::MAX`** (`browserless.rs:710`, `:739`) —
+i.e. unpaced, drain everything. So:
+
+| Path | Before 2.2 | After 2.2 |
+|---|---|---|
+| `dispatch_dirty_tiles_via_scheduler` (production) | AIMD from quinn path stats | `min(AIMD, googcc)` |
+| `apply_injected_frame` (harness, and what the baseline measures) | **unpaced** | `min(usize::MAX, googcc)` = googcc |
+
+The measurement therefore captures **unpaced -> goog_cc-paced**, which is a
+larger change than production will see, since production already had AIMD
+doing some of that work. Expect a smaller improvement on the dispatch path.
+
+Applying the combine at *both* sites was still right: confining it to the
+dispatch path would have left the change invisible to every browserless
+measurement, and a metric that cannot see the thing it is measuring is worse
+than a caveat.
+
+Two consequences worth carrying forward:
+
+- **Do not quote the 2.2 delta as a production figure.** The honest claim is
+  "pacing did not increase wire queueing, and reduced it on a previously
+  unpaced path".
+- A cleaner future comparison would run the harness with the AIMD budget
+  rather than `usize::MAX`, so both arms are paced and only the *source* of
+  the rate differs. That is a harness change, not a production one, and it is
+  not required for 2.3.
