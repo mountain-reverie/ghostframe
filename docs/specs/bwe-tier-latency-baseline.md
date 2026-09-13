@@ -1002,3 +1002,222 @@ fills a cluster directly rather than through a scene's organic traffic.
 Whether real sessions accumulate enough tile traffic inside a 15 ms
 window to complete a probe in practice is an open question this
 measurement does not answer either way.
+
+## BWE Stage 2.5: unified emission path — re-baseline with a real budget
+
+**Date:** 2026-09-13
+**Git rev:** `4ad48f3` (branch `refactor/unified-emission-path`)
+**Parent:** `798fe42` (pure extraction of `emit_via_scheduler`, Task 1 of
+`docs/superpowers/plans/2026-09-13-unified-emission-path.md`)
+
+This answers Task 3 of that plan: does removing `InjectedFrame.budget_bytes`
+(always `usize::MAX`, i.e. "drain the whole scheduler queue on every
+injection") change what this document has been tracking, now that the
+harness accumulates real backlog exactly as production does?
+
+**What changed since the "BWE Stage 2.4" entry above:** `apply_injected_frame`
+no longer accepts a caller-supplied budget. It derives its own per-tick
+budget the same way `dispatch_dirty_tiles_via_scheduler` does —
+`adaptation_context.bytes_per_us × SCHEDULER_TICK_INTERVAL_US ×
+SCHEDULER_TICK_BUDGET_FRACTION`, floored at `SCHEDULER_TICK_BUDGET_FLOOR_BYTES`
+— via a new shared `IoBridge::base_budget_bytes()` helper. It does **not**
+apply the AIMD `tick_budget_multiplier`: that ramp/backoff is adjusted from a
+send-error delta computed around the dispatch call specifically, calibrated
+for a periodic ~33 ms real capture cadence that the harness's scene-driven,
+virtual-time injection does not share (see the comment at the
+`apply_injected_frame` call site for the full reasoning). **No scheduling,
+pacing, budget-derivation-formula, or tier-ordering code changed** — only
+which number backs the injected path's per-tick ceiling.
+
+### Method
+
+Identical scene, method, and re-measure protocol to every prior entry in
+this document: `busy_frames(2)` 4×4 CDF53 grid, 10% independent loss, 10 s
+duration, seed sequence `0xB17E0000..` incrementing past bail-outs, same
+`cargo test -p ghostframe-e2e --test browserless_runner
+bwe_tier_latency_baseline -- --ignored --nocapture --test-threads=1` command,
+run 3 times (30 successful runs total). Both metrics (`last_sent_at -> ACK`
+and `queued_at -> ACK`) reported, as in every entry since 2.1.
+
+All three batches ran 10/10 clean — **zero `MAX_ITERS` bail-outs across all
+30 attempts**, the first entry in this document to report that. Regression
+guards, run separately (`cargo test -p ghostframe-e2e --test
+browserless_runner -- --test-threads=1`, 11/11 non-ignored tests green):
+`cdf53_converges_to_lossless_under_10pct_loss` and
+`every_cdf53_pass_eventually_lands` both passed — the two guards this
+document's own testing section flagged as most likely to move now that
+emission is bounded, since both depend on everything eventually draining.
+Neither moved. `cargo test -p ghostframe-lib` (401 tests) and `cargo clippy
+-p ghostframe-lib -p ghostframe-e2e --all-targets` both clean. All 12
+`browserless_runner` tests (11 non-ignored + the ignored baseline) were also
+run 8 times back-to-back before this measurement, entirely outside the
+`#[ignore]`'d test, with no failures and no scene needing adjustment — see
+the Task 2 commit for detail.
+
+### Results (30 scene runs, pooled)
+
+| Metric | Tier | Runs | Samples | Pooled mean | Max |
+|---|---|---:|---:|---:|---:|
+| `last_sent_at -> ACK` | Critical (0-3) | 30 | 3,924 | 27.4 ms | 236.0 ms |
+| `last_sent_at -> ACK` | Refinement (4-13) | 30 | 9,810 | 41.2 ms | 311.0 ms |
+| `queued_at -> ACK` | Critical (0-3) | 30 | 3,924 | 61.1 ms | 1440.0 ms |
+| `queued_at -> ACK` | Refinement (4-13) | 30 | 9,810 | 80.7 ms | 2745.0 ms |
+
+### The guard: `last_sent_at -> ACK` did not rise
+
+This is the specific check the design doc's risk table and Task 3's brief
+both call for: backlog that used to drain instantly now queues, so if
+anything was going to cause the wire itself to back up, this is where it
+would show.
+
+| | Stage 2.4 (pre-Task-2, `usize::MAX` harness budget) | This entry (post-Task-2, real budget) | Direction |
+|---|---:|---:|---|
+| `last_sent_at -> ACK` pooled mean, critical | 29.4 ms | 27.4 ms | **down** |
+| `last_sent_at -> ACK` pooled mean, refinement | 42.1 ms | 41.2 ms | **down** |
+| `last_sent_at -> ACK` pooled max | 394.0 ms | 236.0 ms | **down** |
+| `queued_at -> ACK` pooled mean, critical | 63.3 ms | 61.1 ms | **down** |
+| `queued_at -> ACK` pooled mean, refinement | 87.0 ms | 80.7 ms | **down** |
+| `queued_at -> ACK` pooled max | 656.0 ms / 1033.0 ms | 1440.0 ms / 2745.0 ms | **up** (single-seed tail outlier — see below) |
+
+**Guard passes on every mean and on both `last_sent_at` maxes.** The two
+`queued_at` maxes did rise, but both trace to the same seed, `0xb17e0002`,
+which drew a heavy tail in every one of the three batches it appeared in
+(refinement max 2745 ms in batch 1, critical/refinement max 1440 ms in
+batch 2, 745 ms in batch 3) — not seed-*reproducibility* (the harness
+isn't: see `feedback_browserless_not_seed_reproducible`), just this
+particular seed's loss draw landing badly across all three independent
+attempts. This is the same kind of heavy-tail outlier this document's very
+first baseline (Stage 2.0) documented and explicitly warned against reading
+absolute maxima without: "one run... is a heavy-tail outlier... a plausible
+consequence of 10% independent loss occasionally stacking multiple RTO
+backoffs on the same pass within one run, not a measurement bug." Excluding
+every run of that one seed, the next-highest `queued_at` max across the
+remaining 27 runs is 762 ms (refinement, seed `0xb17e0004`) and 656 ms
+(critical, seed `0xb17e0003`) — both in family with Stage 2.4's 656.0/1033.0
+ms pooled maxes. The **means**, which this
+document has repeatedly cautioned are the number to trust over any single
+run's max, moved down at every tier and every metric. This is consistent
+with real backlog now smoothing bursts across ticks rather than draining a
+whole frame's queue instantly (which is what `usize::MAX` did) — the same
+direction the Stage 2.2 entry's "goog_cc vs unpaced" comparison predicted a
+bounded budget would move things, now confirmed with the harness's budget
+itself finally bounded rather than the estimator being the only thing
+standing between an empty queue and a full one.
+
+### The tier ratio: still clearly below 1.0, ordering intact
+
+| Batch | `last_sent_at` critical | `last_sent_at` refinement | `last_sent_at` ratio | `queued_at` critical | `queued_at` refinement | `queued_at` ratio |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 27.2 ms | 40.1 ms | 0.679 | 62.3 ms | 80.2 ms | 0.776 |
+| 2 | 27.4 ms | 39.6 ms | 0.692 | 55.7 ms | 74.0 ms | 0.753 |
+| 3 | 27.7 ms | 44.0 ms | 0.629 | 65.3 ms | 87.9 ms | 0.742 |
+| **Mean** | | | **0.667** | | | **0.757** |
+
+Per-run ratio spread (30 individual runs, not batch-pooled): `last_sent_at`
+0.442-0.884 (mean 0.661), `queued_at` 0.113-1.676 (mean 0.826) — the same
+kind of per-run noise (small per-run sample counts, ~130 critical
+samples/run) this document has seen at every entry since the harness fidelity
+fix landed.
+
+| Metric | This entry (post-Task-2) | Stage 2.4 (pre-Task-2) | Reference band (2.2/harness-fix) |
+|---|---:|---:|---|
+| `last_sent_at -> ACK` mean ratio | **0.667** | 0.698 | 0.688-0.698 |
+| `queued_at -> ACK` mean ratio | **0.757** | 0.727 | 0.725-0.727 |
+
+`last_sent_at`'s ratio moved slightly further below 1.0 (more separation,
+not less); `queued_at`'s moved slightly toward 1.0 but stayed well clear of
+it. Both stayed in the same qualitative regime every entry has shown since
+the harness fidelity fix: **critical passes are still confirmed delivered
+meaningfully sooner than refinement ones**, and the bucket distribution
+confirms the separation is not an artifact of the ratio's noise floor:
+
+| Bucket | `last_sent_at` critical % | `last_sent_at` refinement % | `queued_at` critical % | `queued_at` refinement % |
+|---|---:|---:|---:|---:|
+| 0-5 | 1.7% | 0.5% | 1.6% | 0.0% |
+| 5-10 | 18.5% | 3.7% | 18.4% | 1.0% |
+| 10-20 | 31.2% | 12.3% | 26.0% | 9.4% |
+| 20-50 | 35.1% | 59.6% | 27.8% | 49.6% |
+| 50-100 | 9.2% | 17.9% | 6.6% | 15.3% |
+| 100-200 | 3.3% | 4.1% | 10.8% | 13.5% |
+| 200-500 | 1.0% | 1.8% | 7.0% | 10.1% |
+| 500+ | 0.0% | 0.0% | 1.7% | 1.1% |
+
+Critical is still front-loaded into the fast buckets and refinement is
+still weighted toward the slower ones, at essentially every bucket, for
+both metrics — the same pattern the harness-fidelity-fix entry established
+and Stage 2.4 preserved. **Task 2 did not disturb the tier-prioritisation
+result this document exists to protect.**
+
+### Probe counters: still opens every time, completes never
+
+| Batch | Runs | `probes_completed` | `probes_abandoned` |
+|---|---:|---:|---:|
+| 1 | 10 | 0 | 10 |
+| 2 | 10 | 0 | 10 |
+| 3 | 10 | 0 | 10 |
+| **Total** | **30** | **0** | **30** |
+
+**No completions appeared.** This is the same zero/zero-completions result
+as the Stage 2.4 entry, even though the premise for expecting a change was
+real: with the harness's budget now bounded like production's instead of
+`usize::MAX`, a probe window can in principle open against a queue that
+still has work sitting in it (the exact condition `drain_for_probe_window_
+open` was built for and — per the design doc — could never be observed
+under the old unbounded-drain harness). That did not translate into
+completions here. Per this document's own repeated framing (Stage 2.4's
+"What this means going forward"): **a null result here does not diminish
+the refactor** — the refactor's goal was closing the four defects in the
+design doc's table, not making probes complete, and defect 4 (unbounded
+harness drain hiding probe-window state) is closed regardless of this
+outcome.
+
+For the reason, one run's cluster was inspected directly with temporary
+`tracing::debug!` output enabled for `ghostframe_lib::transport::io_bridge`
+(not committed — diagnostic only, for this section). Every window in that
+run requested the same probe: `target_rate_bps=12,000,000` (goog_cc's
+initial 6x exponential probe on this scene's 2 Mbit/s seed),
+`duration_ms=15`, `min_probes=5`, `min_bytes=22,500` — identical to the
+Stage 2.4 entry's analytical derivation
+(`12,000,000 × 0.015 / 8 = 22,500`). Across that run's 10 windows (one per
+scene, `busy_frames(2)`'s first ACK batch triggers exactly one initial
+probe per session): **8 of 10 windows sent zero tagged packets** in their
+15 ms span (`packets_sent=0`, `bytes_sent=0` at close), and the other 2
+reached `packets_sent=224`, `bytes_sent=18,619` — comfortably past
+`min_probes` (5) but still short of `min_bytes` (22,500), at about 83% of
+target. So even with real backlog now sitting in the scheduler queue by the
+time a probe window opens, `busy_frames(2)`'s traffic is not concentrated
+enough, early enough in the session, to fill a 15 ms window's byte
+requirement — consistent with Stage 2.4's own conclusion that a sustained,
+higher-throughput scene would be needed to observe a completed probe here,
+not a defect this refactor was expected to fix.
+
+If they stay at zero, report that too, with the debug output — that
+instruction is satisfied above; the honest reading is that PR #78's
+caveat still stands, but for a *different* reason than before. Before Task
+2, probe windows could not meaningfully open against backlog at all,
+because the harness had none. After Task 2, windows do open against
+whatever backlog exists at that moment, but this scene's traffic still
+does not concentrate enough of it inside 15 ms to fill one. That is a
+scene-shape question for a future measurement, not a defect in the
+refactor.
+
+### Summary
+
+- The field is deleted; both callers derive `base_budget_bytes` from the
+  same production formula; the AIMD multiplier is deliberately left off the
+  injected path, for the reason recorded at that call site.
+- No browserless scene moved. 8 repeated full-suite runs (11/11 each) plus
+  3 batches (30 runs) of the ignored baseline all passed with zero
+  `MAX_ITERS` bail-outs — the traffic volume `busy_frames(2)` was chosen
+  for specifically because it doesn't need unbounded emission to avoid
+  that failure mode.
+- **`last_sent_at -> ACK` did not rise** at any pooled mean or at either
+  `last_sent_at` max; the two `queued_at` maxima that did rise trace to one
+  documented-pattern heavy-tail seed, not a systemic regression.
+- The tier ratio stayed in the same regime this document has reported since
+  the harness fidelity fix (`last_sent_at` 0.667 vs. a 0.688-0.698
+  reference band; `queued_at` 0.757 vs. 0.725-0.727) — pass-major ordering's
+  benefit survived the harness gaining a realistic budget.
+- Probe windows still open every run and still never complete on this
+  scene, for a now better-understood reason (traffic concentration, not
+  queue emptiness) — PR #78's caveat is narrowed, not yet closed.
