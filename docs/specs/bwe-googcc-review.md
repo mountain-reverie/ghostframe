@@ -228,3 +228,77 @@ Candidates not yet explored:
   is a substantial component in its own right.
 
 The first is the cheapest to test and the most likely to break the circle.
+
+## Root cause of the slow ramp (2026-09-14): goog_cc rejects most of our probes
+
+The previous section left the ramp blocked on "goog_cc rarely asks to probe at
+a rate the link can answer". That framing was wrong in an informative way. It
+asks often enough once told to. **It throws away most of the answers.**
+
+### Making goog_cc say why
+
+`ProbeBitrateEstimator::handle_probe_and_estimate_bitrate` logs its reason for
+discarding a cluster, at debug level. Installing a `tracing` subscriber in the
+step-up scene (env-gated, `GF_TRACE_GOOGCC=1 RUST_LOG=goog_cc=debug`) turns the
+whole question into one command:
+
+```
+ 23  Probing successful
+ 66  Probing unsuccessful, invalid send/receive interval
+ 32  Probing unsuccessful, receive/send ratio too high
+```
+
+**80% of probe measurements are discarded.** That is why more probing did not
+help: the clusters complete by our accounting, and goog_cc then refuses to
+derive a bitrate from them, so its estimate never adopts what they found.
+
+### Two causes, one fixable
+
+**Send timestamps were quantised to milliseconds.** The driver did
+`Timestamp::from_millis(server_emit_us / 1_000)` while holding microsecond
+precision. goog_cc rejects any cluster whose `last_send - first_send` is zero,
+and a probe burst drained in one scheduler tick lands inside a single
+millisecond. This is not an artifact of the virtual clock — a burst takes well
+under a millisecond on a real clock too.
+
+Feeding microseconds instead moved the numbers but did not fix the problem:
+invalid-interval rejections fell 66 -> 40, "ratio too high" rose 32 -> 46, and
+net successes fell 23 -> 15. Not shipped, because it is not a clean win on its
+own.
+
+**Arrival timestamps are millisecond-quantised on the wire, and cannot be
+fixed locally.** `ghostframe-protocol`'s ACK frame carries
+`arrival_time_ms_lo16: u16` — milliseconds. goog_cc computes
+`receive_rate = size / (last_receive - first_receive)`. A 15 ms probe cluster
+whose packets arrive within 1-2 ms therefore has 50-100% error in its receive
+rate, which is what trips the `receive/send ratio` guard.
+
+That is the binding constraint: **probe bitrate estimation needs sub-
+millisecond arrival timestamps, and the protocol provides milliseconds.**
+Widening that field is a wire-format change, and it is the prerequisite for
+any of this working — not more probing, not a better capacity signal.
+
+### What was tried and reverted on the way
+
+| change | probes | ramp | verdict |
+|---|---|---|---|
+| periodic network-state probing, fed by observed throughput | 1 -> 3 | unchanged | +10% loss, reverted |
+| same, fed by quinn's `cwnd/rtt` | 1 -> 3 | unchanged | reverted |
+| microsecond send timestamps | 3 -> 5 | unchanged | ambiguous, reverted |
+
+### quinn's congestion controller is a good capacity signal
+
+Worth recording even though the change was reverted, because it is reusable.
+`PathStats` exposes `cwnd` and `rtt`, and `cwnd * 8 / rtt` tracked real
+capacity closely — where goog_cc's own estimate did not:
+
+| scene | true capacity | quinn `cwnd/rtt` | goog_cc estimate |
+|---|---|---|---|
+| congested | 480 kbps | 580-630 kbps | 200,000 (its floor) |
+| spacious | 3.2 Mbps | 3.15-3.32 Mbps | 2,012,571 (its seed) |
+| uncapped | — | grows to 44-62 Mbps | ~2.0 Mbps |
+
+It is also genuinely independent in the way the throughput signal was not: it
+grows with successful delivery, and when the sender is application-limited it
+falls back to roughly `initial_window / rtt` rather than collapsing onto the
+estimate. If a capacity signal is ever needed again, this is the one to use.

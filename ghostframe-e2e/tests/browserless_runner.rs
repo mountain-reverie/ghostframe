@@ -1229,6 +1229,15 @@ async fn the_estimate_separates_a_congested_link_from_an_uncongested_one() {
 /// test's business.
 #[tokio::test(start_paused = true)]
 async fn the_estimate_follows_a_mid_scene_capacity_step_up() {
+    if std::env::var_os("GF_TRACE_GOOGCC").is_some() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "goog_cc=debug".into()),
+            )
+            .with_writer(std::io::stderr)
+            .try_init();
+    }
     const LOW: u64 = 60_000; // bytes/s -> 480 kbps, below the ~1.6 Mbps offered
     const HIGH: u64 = 400_000; // bytes/s -> 3.2 Mbps, ample headroom
     const STEP_AT_US: u64 = 5_000_000;
