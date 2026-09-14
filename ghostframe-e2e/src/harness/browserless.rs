@@ -74,7 +74,7 @@ const FRAME_SPACING_US: u64 = 16_000;
 /// but multiplies the outer event loop's iteration count by
 /// `scene.duration / FRAME_SPACING_US` for the entire remainder of every
 /// scene once its declared frames run out, which measurably pushed
-/// longer-duration scenes toward `drive_session`'s `MAX_ITERS` bail-out.
+/// longer-duration scenes toward `drive_session`'s no-progress bail-out.
 /// 100ms comfortably clears the RTO floor with room for multiple backoff
 /// attempts, while keeping that iteration multiplier small.
 const HEARTBEAT_SPACING_US: u64 = 100_000;
@@ -447,7 +447,8 @@ async fn drive_session(
     // it is sent serialises the link to one datagram in flight at a time.
     // That is invisible at `delay_us: 0` (the await returns immediately)
     // and wedges any busy scene at a realistic RTT, because the inner
-    // transmit drain sits outside both `MAX_ITERS` and `overall_deadline`.
+    // transmit drain sits outside both the no-progress guard and
+    // `overall_deadline`.
     let mut in_flight: BinaryHeap<InFlight> = BinaryHeap::new();
     let mut next_in_flight_seq: u64 = 0;
 
@@ -474,41 +475,65 @@ async fn drive_session(
     let mut heartbeat_seq: u32 = scene.frames.len() as u32;
 
     // Two independent bounds so a stuck scene fails loudly instead of
-    // hanging: `MAX_ITERS` guards the loop, and `overall_deadline` guards
+    // hanging: the no-progress guard catches a stuck loop, and
+    // `overall_deadline` guards
     // virtual time itself (derived from `scene.duration`, the only time
     // budget the scene declares).
     //
-    // `MAX_ITERS` is reached by two very different situations, and the bail
-    // message distinguishes them because they were once confused for each
-    // other. The rare one is a genuine pathological loop making "progress"
-    // without advancing virtual time. The common one is simply a scene busy
-    // enough that 5,000 iterations cover only a few virtual seconds: under
-    // `start_paused`, tokio advances the clock only when every task goes
-    // idle, so traffic volume and virtual-time throughput trade off directly.
-    // A 4x4 Cdf53 grid over 8 frames at 10% loss lands around 3,700 events
-    // and ~2-5 virtual seconds per 5,000 iterations — i.e. it exhausts this
-    // budget while perfectly healthy.
-    const MAX_ITERS: usize = 5_000;
+    // The guard is on *virtual-time progress*, not raw iteration count.
+    //
+    // It used to be a flat `MAX_ITERS = 5_000`, and that number could not
+    // distinguish the two situations it was asked to catch. A genuinely
+    // stuck loop and a merely busy one both reach it; only the second is
+    // healthy. Under `start_paused` tokio advances the clock only when every
+    // task goes idle, so how many iterations a virtual second costs depends
+    // on how often the client's timers fire — and that varies hugely with
+    // the connection's state. Measured on the demand-starved probe scene:
+    // ~28 ms of virtual time per iteration when quinn is pacing on its
+    // ACK-delay timer (the whole 10 s scene in ~350 iterations), but ~500 us
+    // per iteration when it falls into fine-grained loss-detection timers —
+    // a 56x swing, entirely legitimate, which blew the flat budget and
+    // failed the scene with a bail rather than an assertion.
+    //
+    // Iterations that advance the clock are progress, however many of them
+    // there are: `overall_deadline` already bounds the scene in the units it
+    // actually declares. What must never happen is the loop turning without
+    // the clock moving at all, so that is what this counts.
+    const MAX_ITERS_WITHOUT_PROGRESS: usize = 5_000;
     let overall_deadline = base + scene.duration;
     let mut iter: usize = 0;
 
+    // Virtual time at the last iteration that made progress, and how many
+    // iterations have turned since.
+    let mut last_progress_vt: u64 = 0;
+    let mut iters_without_progress: usize = 0;
+
     loop {
         iter += 1;
-        if iter > MAX_ITERS {
+        let vt_now = now_us(base);
+        if vt_now > last_progress_vt {
+            last_progress_vt = vt_now;
+            iters_without_progress = 0;
+        } else {
+            iters_without_progress += 1;
+        }
+        if iters_without_progress > MAX_ITERS_WITHOUT_PROGRESS {
             bail!(
-                "seed {seed}: scene did not finish within {MAX_ITERS} iterations; \
-                 progress: virtual_elapsed={}us of {}us, events={}, \
-                 frames_injected={next_frame_idx}/{}, session_ready={session_ready}, \
+                "seed {seed}: scene made no virtual-time progress for \
+                 {MAX_ITERS_WITHOUT_PROGRESS} consecutive iterations (total \
+                 iterations {iter}); progress: virtual_elapsed={}us of {}us, \
+                 events={}, frames_injected={next_frame_idx}/{}, \
+                 session_ready={session_ready}, \
                  bytes_delivered={bytes_delivered}, bytes_dropped={bytes_dropped}.\n\
                  \n\
-                 If session_ready is true and frames_injected is complete and bytes \
-                 are still flowing, this is NOT a stall — it is the iteration budget \
-                 running out before the virtual-time budget. Under `start_paused` \
-                 tokio advances the clock only when every task goes idle, so a \
-                 high-traffic scene spends many iterations per virtual microsecond \
-                 and can burn {MAX_ITERS} iterations in a few virtual seconds. Lower \
-                 the scene's traffic (fewer frames or a smaller grid) or raise \
-                 MAX_ITERS; do not go looking for a deadlock.",
+                 Unlike the flat iteration budget this replaces, reaching here \
+                 does mean the loop is stuck: every iteration that moves the \
+                 clock resets the counter, so a merely busy scene — however \
+                 many iterations a virtual second costs it — cannot trip this. \
+                 The clock is not moving, so look for something awaited that \
+                 never becomes ready, or a `wake_at` that keeps landing at or \
+                 before the current instant so `sleep_until` returns without \
+                 advancing anything.",
                 now_us(base),
                 (overall_deadline - base).as_micros(),
                 events.len(),
@@ -886,7 +911,8 @@ impl PartialOrd for InFlight {
 /// out of the drain loop and into a batch. Under `start_paused` the virtual
 /// clock advances only when the runtime goes idle, so relocating those yields
 /// changed when time advanced: the demand-starved scene intermittently burned
-/// all 5,000 of `MAX_ITERS` in ~1.2 virtual seconds where it needs ~350 for
+/// all 5,000 iterations of the old flat budget in ~1.2 virtual seconds
+/// where it needs ~350 for
 /// the full 10. Keeping the due path free of the queue keeps a zero-delay
 /// scene behaving exactly as it did before propagation delay was modelled.
 fn rule(
