@@ -2,7 +2,7 @@
 //!
 //! Wire format:
 //! ```text
-//! [0]      message_type = 0x05
+//! [0]      message_type = 0x06
 //! [1]      count_fresh: u8    (0..=MAX_FRESH_ENTRIES_PER_BATCH)
 //! [2]      count_overlap: u8  (0..=ACK_OVERLAP_COUNT)
 //! [3..7]   base_arrival_us: u32 little-endian
@@ -64,14 +64,26 @@
 //! packed(gen,pass), reserved)`. Bumping the message-type byte means a
 //! stale dev binary mid-rollout fails loud with
 //! `AckDecodeError::WrongMsgType(0x02)` rather than silently mis-parsing.
+//!
+//! Message-type lineage: `0x02 -> 0x03 -> 0x04 -> 0x06`. `0x05` is
+//! deliberately skipped -- it was briefly assigned here in 2026-09-14 and
+//! collided with `TILE_NACK_ENVELOPE = 0x05` (both are client->server
+//! datagrams dispatched by the same `classify_inbound`), which would have
+//! silently routed every ACK batch into the NACK handler. Do not reuse
+//! `0x05` for this format.
 
-/// ACK envelope wire-format version. Bumped 0x04 → 0x05 in 2026-09 to move
+/// ACK envelope wire-format version. Bumped 0x04 → 0x06 in 2026-09 to move
 /// from millisecond to microsecond arrival timestamps: goog_cc was
 /// discarding the majority of probe measurements because sub-millisecond
 /// inter-packet arrival spacing was unrepresentable in the old format. Old
 /// (0x04) clients/servers are not wire-compatible with new — both sides
 /// ship in lockstep.
-pub const ACK_BATCH_MSG_TYPE: u8 = 0x05;
+///
+/// `0x05` was skipped: it was assigned first and collided with
+/// `TILE_NACK_ENVELOPE` (`protocol.rs`), silently routing every ACK batch
+/// into the NACK handler. See `protocol::tests::
+/// inbound_message_discriminators_do_not_collide` for the regression test.
+pub const ACK_BATCH_MSG_TYPE: u8 = 0x06;
 /// Maximum number of *fresh* entries the client packs into one batch
 /// before flushing (mirrors `MAX_ACK_ENTRIES` in ack.ts). This is also the
 /// wire-acceptance cap for `count_fresh`, enforced independently by both
@@ -99,7 +111,7 @@ pub const ACK_OVERLAP_ENTRY_SIZE: usize = 11;
 pub enum AckDecodeError {
     #[error("ack batch too short ({0} bytes)")]
     TooShort(usize),
-    #[error("wrong message type: expected 0x05, got 0x{0:02x}")]
+    #[error("wrong message type: expected 0x06, got 0x{0:02x}")]
     WrongMsgType(u8),
     #[error("invalid {section} count: {count} exceeds the cap of {cap}")]
     InvalidCount {
@@ -453,8 +465,8 @@ mod tests {
         )
         .unwrap();
         let bytes = batch.encode();
-        assert_eq!(bytes[0], ACK_BATCH_MSG_TYPE, "msg type = 0x05");
-        assert_eq!(bytes[0], 0x05);
+        assert_eq!(bytes[0], ACK_BATCH_MSG_TYPE, "msg type = 0x06");
+        assert_eq!(bytes[0], 0x06);
         assert_eq!(bytes[1], 1, "count_fresh = 1");
         assert_eq!(bytes[2], 0, "count_overlap = 0");
         assert_eq!(bytes[7..11], [0x78, 0x56, 0x34, 0x12], "frame_seq LE");

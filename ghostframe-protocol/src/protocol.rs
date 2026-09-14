@@ -10,6 +10,9 @@
 
 use thiserror::Error;
 
+use crate::ack::ACK_BATCH_MSG_TYPE;
+use crate::feedback::FEEDBACK_MSG_TYPE;
+
 // ---------------------------------------------------------------------------
 // M0 constants (kept for io_bridge.rs compatibility)
 // ---------------------------------------------------------------------------
@@ -798,23 +801,34 @@ impl TileNackEnvelope {
 pub enum InboundKind {
     Empty,
     Unknown,
-    Hello,         // 0x01
-    AckBatchV1,    // 0x02 (deprecated, still routed)
-    AckBatch,      // 0x03
-    TileParity,    // 0x04
-    TileNack,      // 0x05
+    Hello,         // FEEDBACK_MSG_TYPE (0x01)
+    AckBatchV1,    // 0x02 (deprecated pre-M3.3d format, no longer produced but still routed)
+    AckBatch,      // ACK_BATCH_MSG_TYPE (currently 0x06 -- see ack.rs for the lineage)
+    TileParity,    // TILE_PARITY_ENVELOPE (0x04)
+    TileNack,      // TILE_NACK_ENVELOPE (0x05)
     FrameFragment, // first byte 0x10..=0x7F
     TileFragment,  // first byte 0x80..=0xFF (TILE_DATAGRAM_FLAG bit set)
 }
 
+/// Classify a client->server datagram by its first byte.
+///
+/// The fixed-value arms below (everything but the two fragment ranges) must
+/// map to pairwise-distinct discriminators, checked by
+/// `tests::inbound_message_discriminators_do_not_collide`. Match against the
+/// owning module's constant, not a bare literal, for every arm that has one
+/// -- a hardcoded literal here is exactly how `AckBatch` drifted onto a
+/// stale `0x03` for multiple codec bumps (`ack.rs`'s message type moved to
+/// 0x04, then briefly 0x05, then 0x06, while this stayed 0x03), and
+/// separately how the `0x05` collision with `TILE_NACK_ENVELOPE` shipped in
+/// the first place.
 pub fn classify_inbound(data: &[u8]) -> InboundKind {
     let Some(&first) = data.first() else {
         return InboundKind::Empty;
     };
     match first {
-        0x01 => InboundKind::Hello,
+        FEEDBACK_MSG_TYPE => InboundKind::Hello,
         0x02 => InboundKind::AckBatchV1,
-        0x03 => InboundKind::AckBatch,
+        ACK_BATCH_MSG_TYPE => InboundKind::AckBatch,
         TILE_PARITY_ENVELOPE => InboundKind::TileParity,
         TILE_NACK_ENVELOPE => InboundKind::TileNack,
         b if b < 0x10 => InboundKind::Unknown,
@@ -1431,7 +1445,10 @@ mod tests {
         assert_eq!(classify_inbound(&frame_dg), InboundKind::FrameFragment);
 
         // Envelopes
-        assert_eq!(classify_inbound(&[0x03]), InboundKind::AckBatch);
+        assert_eq!(
+            classify_inbound(&[ACK_BATCH_MSG_TYPE]),
+            InboundKind::AckBatch
+        );
         assert_eq!(
             classify_inbound(&[TILE_PARITY_ENVELOPE]),
             InboundKind::TileParity
@@ -1442,5 +1459,40 @@ mod tests {
         );
         assert_eq!(classify_inbound(&[0x09]), InboundKind::Unknown);
         assert_eq!(classify_inbound(&[]), InboundKind::Empty);
+    }
+
+    #[test]
+    fn ack_batch_is_not_misrouted_to_the_nack_handler() {
+        // The specific regression this task fixed: ACK_BATCH_MSG_TYPE was
+        // briefly 0x05, the same value as TILE_NACK_ENVELOPE, so every ACK
+        // batch classified as TileNack and was dropped by the wrong
+        // handler's decoder. Pin both the positive and negative outcome.
+        assert_eq!(
+            classify_inbound(&[ACK_BATCH_MSG_TYPE]),
+            InboundKind::AckBatch
+        );
+        assert_ne!(
+            classify_inbound(&[ACK_BATCH_MSG_TYPE]),
+            InboundKind::TileNack
+        );
+    }
+
+    #[test]
+    fn inbound_message_discriminators_do_not_collide() {
+        // Every client->server first byte must map to exactly one kind. A
+        // collision does not fail loudly -- it silently routes one message
+        // type into another's handler, which drops it. ACK_BATCH_MSG_TYPE
+        // and TILE_NACK_ENVELOPE were both 0x05 until 2026-09-14.
+        let discriminators = [
+            ("feedback/hello", FEEDBACK_MSG_TYPE),
+            ("ack batch", ACK_BATCH_MSG_TYPE),
+            ("tile parity", TILE_PARITY_ENVELOPE),
+            ("tile nack", TILE_NACK_ENVELOPE),
+        ];
+        for (i, (name_a, a)) in discriminators.iter().enumerate() {
+            for (name_b, b) in &discriminators[i + 1..] {
+                assert_ne!(a, b, "{name_a} and {name_b} share discriminator 0x{a:02x}");
+            }
+        }
     }
 }
