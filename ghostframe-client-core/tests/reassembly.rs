@@ -4,6 +4,7 @@
 //! the client sees in production.
 
 use ghostframe_client_core::{ClientConfig, ClientCore, Event, PollOutput};
+use ghostframe_protocol::ack::ACK_BATCH_MSG_TYPE;
 use ghostframe_protocol::protocol::{
     build_frame_dimensions_datagram, fragment_tile, Codec, TileFragmentInputs, TILE_DATAGRAM_FLAG,
 };
@@ -180,17 +181,19 @@ fn cdf53_ack_deferred_until_prevalidation() {
         "no ACK should flush before the batcher deadline"
     );
 
-    // Drive the ACK batcher deadline; the flushed ACK batch datagram (0x03)
-    // now appears.
+    // Drive the ACK batcher deadline; the flushed ACK batch datagram
+    // (ACK_BATCH_MSG_TYPE) now appears.
     let deadline = core.poll_timeout().expect("ack batcher deadline pending");
     let _ = core.on_timeout(deadline);
     let ack = core
         .poll_transmit(deadline)
         .expect("ACK datagram after deadline");
     match ack {
-        // AckBatch (ACK_BATCH_MSG_TYPE) rides the Datagram channel as 0x04;
-        // decode-error messages share the byte but ride the Stream channel.
-        PollOutput::Datagram(buf) => assert_eq!(buf[0], 0x04, "expected AckBatch datagram"),
+        // AckBatch rides the Datagram channel as ACK_BATCH_MSG_TYPE;
+        // decode-error messages share a byte but ride the Stream channel.
+        PollOutput::Datagram(buf) => {
+            assert_eq!(buf[0], ACK_BATCH_MSG_TYPE, "expected AckBatch datagram")
+        }
         other => panic!("expected ACK datagram, got {other:?}"),
     }
     // Drain any trailing outputs.

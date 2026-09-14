@@ -97,7 +97,7 @@ impl ClientCore {
                 tile_x: th.tile_x,
                 tile_y: th.tile_y,
                 pass_idx: th.pass,
-                arrival_time_ms_lo16: ((now_us / 1000) & 0xFFFF) as u16,
+                arrival_us: (now_us & 0xFFFF_FFFF) as u32,
             };
             if let Some(dg) = self.ack_batcher.add(entry, now_us) {
                 self.outbox.push_back(PollOutput::Datagram(dg));
@@ -459,7 +459,7 @@ impl ClientCore {
                             tile_x: tx,
                             tile_y: ty,
                             pass_idx: asm.pass,
-                            arrival_time_ms_lo16: ((now_us / 1000) & 0xFFFF) as u16,
+                            arrival_us: (now_us & 0xFFFF_FFFF) as u32,
                         };
                         if let Some(dg) = self.ack_batcher.add(entry, now_us) {
                             self.outbox.push_back(PollOutput::Datagram(dg));
