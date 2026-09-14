@@ -1154,16 +1154,20 @@ async fn the_estimate_separates_a_congested_link_from_an_uncongested_one() {
     let spacious = run_bottleneck_scene(0xC0FF_EE01, CapTimeline::constant(400_000), 10).await;
 
     println!(
-        "congested: est={} pacer={:?} delivered={} dropped={}\n\
-         spacious:  est={} pacer={:?} delivered={} dropped={}",
+        "congested: est={} pacer={:?} s2c={} c2s={} dropped={} retx={}\n\
+         spacious:  est={} pacer={:?} s2c={} c2s={} dropped={} retx={}",
         congested.bwe_estimate_bps,
         congested.pacer_rate_bps,
-        congested.bytes_delivered,
+        congested.bytes_delivered_s2c,
+        congested.bytes_delivered_c2s,
         congested.bytes_dropped,
+        congested.retransmit_attempts_total,
         spacious.bwe_estimate_bps,
         spacious.pacer_rate_bps,
-        spacious.bytes_delivered,
+        spacious.bytes_delivered_s2c,
+        spacious.bytes_delivered_c2s,
         spacious.bytes_dropped,
+        spacious.retransmit_attempts_total,
     );
 
     // The scenes must actually be what they claim, or the comparison below
