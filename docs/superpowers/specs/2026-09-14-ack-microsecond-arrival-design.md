@@ -133,9 +133,20 @@ in-memory type; the wire representation differs per section, and reconstruction
 `arrival_time_ms_lo16`; `BweSample::client_arrival_ms_lo16` and `owd_ms_lo16`
 become microsecond-based (`owd_ms_lo16` is currently `#[allow(dead_code)]`,
 staged for the Phase 2 controller and read nowhere, so this costs nothing).
-`bwe/timeline.rs`'s `Lo16Timeline` becomes a 32-bit unwrapper over microseconds
-— wrapping every 71.6 minutes instead of every 65.5 seconds — and unwraps
-**once per batch** (the base) rather than once per entry.
+`bwe/timeline.rs`'s `Lo16Timeline` becomes a 32-bit unwrapper over microseconds,
+wrapping every 71.6 minutes instead of every 65.5 seconds.
+
+The decoder is stateless, so it cannot unwrap: it returns values in 32-bit
+wrapped space — `base + delta` for fresh entries, the absolute field for
+overlap ones — and the server unwraps them into its own `u64` timeline. That
+means **one unwrap for the fresh section** (the base, with deltas added after)
+and **one per overlap entry**, since each is an independent absolute. At most
+nine unwraps per batch against seventy-two today.
+
+The overlap entries are also the reason the unwrapper must stay a sequence-space
+unwrapper rather than becoming a simple widening: an overlap entry is genuinely
+older than the base, so it can sit on the other side of a wrap boundary from
+it.
 
 **The matching server-side fix — `bwe/googcc.rs`.** `send_time:
 Timestamp::from_millis(send_ms)` becomes `Timestamp::from_micros(
