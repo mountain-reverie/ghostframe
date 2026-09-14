@@ -85,14 +85,26 @@ pub struct FrameScript {
     pub tiles: Vec<((u8, u8), TileSpec)>,
 }
 
+/// Where a scene's frames come from.
+pub enum SceneLoad {
+    /// An explicit list, drained in order. Right for small deterministic
+    /// scenes that assert on specific pixels.
+    Script(Vec<FrameScript>),
+    /// Generated across the scene's whole duration, so the scene never runs
+    /// out of frames and never falls back to empty heartbeats. Right for
+    /// anything measuring bandwidth, pacing or probing, where a scene that
+    /// goes quiet after a short burst is not modelling production at all.
+    Profile(crate::harness::load_profile::LoadProfile),
+}
+
 /// A netsim scene to run browserlessly: a real `IoBridge` <-> `ClientNet`
 /// session, no browser, no tsnet, driven under tokio's virtual clock.
 pub struct BrowserlessScene {
     pub seed: u64,
-    /// Drained in order once the session reaches `SessionReady`, one
-    /// `FrameScript` every `FRAME_SPACING_US` of virtual time. See the
-    /// module docs.
-    pub frames: Vec<FrameScript>,
+    /// Resolved once at the top of `drive_session`, then drained in order
+    /// after `SessionReady`, one `FrameScript` every `FRAME_SPACING_US` of
+    /// virtual time. See the module docs.
+    pub load: SceneLoad,
     pub net: NetProfile,
     pub duration: Duration,
     /// Grid dimensions, fixed for the whole scene.
@@ -452,6 +464,20 @@ async fn drive_session(
     let mut in_flight: BinaryHeap<InFlight> = BinaryHeap::new();
     let mut next_in_flight_seq: u64 = 0;
 
+    // Resolved once here so the loop below never cares which kind of load
+    // the scene declared; a generated profile is just a longer script.
+    // Borrowed, never cloned: a generated profile can run to tens of
+    // thousands of tiles, and a scripted scene's frames are already owned by
+    // the caller's `BrowserlessScene`.
+    let generated: Vec<FrameScript>;
+    let frames: &[FrameScript] = match &scene.load {
+        SceneLoad::Script(f) => f,
+        SceneLoad::Profile(p) => {
+            generated = p.frames_for(scene.duration, scene.grid_cols as u8, scene.grid_rows as u8);
+            &generated
+        }
+    };
+
     let mut events: Vec<ClientNetEvent> = Vec::new();
     let mut bytes_delivered: u64 = 0;
     let mut bytes_dropped: u64 = 0;
@@ -468,11 +494,11 @@ async fn drive_session(
     // once those run out, a heartbeat — see below) is due at virtual time
     // `t` (us since `base`)".
     let mut next_inject_at_us: Option<u64> = None;
-    // `seq` for heartbeat `InjectedFrame`s sent after `scene.frames` is
-    // exhausted (see below). Starts at `scene.frames.len()`, one past the
+    // `seq` for heartbeat `InjectedFrame`s sent after the resolved frame
+    // list is exhausted (see below). Starts at `frames.len()`, one past the
     // highest `seq` any real scene frame uses, so a heartbeat can never
     // collide with a real frame's wire `frame_seq`.
-    let mut heartbeat_seq: u32 = scene.frames.len() as u32;
+    let mut heartbeat_seq: u32 = frames.len() as u32;
 
     // Two independent bounds so a stuck scene fails loudly instead of
     // hanging: the no-progress guard catches a stuck loop, and
@@ -537,7 +563,7 @@ async fn drive_session(
                 now_us(base),
                 (overall_deadline - base).as_micros(),
                 events.len(),
-                scene.frames.len(),
+                frames.len(),
             );
         }
         if TokioInstant::now() >= overall_deadline {
@@ -616,7 +642,7 @@ async fn drive_session(
 
         if !session_ready && events.contains(&ClientNetEvent::SessionReady) {
             session_ready = true;
-            if scene.frames.is_empty() {
+            if frames.is_empty() {
                 // Nothing to inject: preserve task 15a's exact behavior of
                 // returning the instant the session is ready.
                 break;
@@ -628,16 +654,22 @@ async fn drive_session(
             if let Some(due_at) = next_inject_at_us {
                 if now_us(base) >= due_at {
                     let spacing_us;
-                    if next_frame_idx < scene.frames.len() {
-                        inject_frame(scene, next_frame_idx, &mut generations, inject_tx)
-                            .await
-                            .map_err(|e| {
-                                anyhow!("seed {seed}: frame {next_frame_idx} injection failed: {e}")
-                            })?;
+                    if next_frame_idx < frames.len() {
+                        inject_frame(
+                            scene,
+                            next_frame_idx,
+                            &frames[next_frame_idx],
+                            &mut generations,
+                            inject_tx,
+                        )
+                        .await
+                        .map_err(|e| {
+                            anyhow!("seed {seed}: frame {next_frame_idx} injection failed: {e}")
+                        })?;
                         next_frame_idx += 1;
                         spacing_us = FRAME_SPACING_US;
                     } else {
-                        // `scene.frames` is exhausted, but `scene.duration`
+                        // the frame list is exhausted, but `scene.duration`
                         // may still have plenty of virtual time left, and a
                         // datagram dropped on its one and only send attempt
                         // needs *something* to keep giving it a chance to
@@ -654,7 +686,7 @@ async fn drive_session(
                         // capture loop free-runs regardless of screen
                         // dirtiness), so the RTO wheel is always getting
                         // swept somewhere. This harness has no such
-                        // free-running capture loop: once `scene.frames`
+                        // free-running capture loop: once the frame list
                         // runs out, nothing would otherwise ever call
                         // `apply_injected_frame` again, and `DatagramsUnblocked`
                         // does not fire on its own absent a previously
@@ -712,7 +744,7 @@ async fn drive_session(
             // branch above, waking up for the next due time applies
             // whether that next injection is a real scene frame or a
             // heartbeat (see above) — heartbeats keep being scheduled for
-            // the rest of `scene.duration`, not just until `scene.frames`
+            // the rest of `scene.duration`, not just until the frame list
             // runs out.
             if let Some(due_at) = next_inject_at_us {
                 wake_at = wake_at.min(base + Duration::from_micros(due_at));
@@ -771,11 +803,11 @@ async fn drive_session(
 async fn inject_frame(
     scene: &BrowserlessScene,
     frame_idx: usize,
+    script: &FrameScript,
     generations: &mut HashMap<(u8, u8), u8>,
     inject_tx: &mpsc::Sender<InjectedFrame>,
 ) -> anyhow::Result<()> {
     let seed = scene.seed;
-    let script = &scene.frames[frame_idx];
     let mut work = Vec::new();
 
     for ((tile_x, tile_y), spec) in &script.tiles {
