@@ -100,16 +100,33 @@ pub enum AckDecodeError {
     InvalidCount(u8),
 }
 
-/// Encoding a batch whose fresh-entry span exceeds the `u16` delta budget
-/// is refused rather than silently truncated. This cannot happen with the
-/// intended `FLUSH_INTERVAL_US = 5_000`, so reaching it is a caller bug —
-/// and silently truncating would feed the estimator a wrong arrival time,
-/// which is the class of defect this format exists to end.
+/// Encoding refuses rather than silently mangles a malformed or
+/// out-of-range batch. This cannot happen with correctly-constructed
+/// input (`fresh_count <= entries.len()`, section lengths within their
+/// caps, and fresh entries within `FLUSH_INTERVAL_US` of the batch base),
+/// so reaching any of these is a caller bug — and silently clamping or
+/// truncating would feed the estimator a wrong arrival time, or reinterpret
+/// the fresh/overlap boundary, which is the class of defect this format
+/// exists to end.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-#[error("fresh entry {index} is {delta_us}us from the batch base, over the u16 limit")]
-pub struct AckEncodeError {
-    pub index: usize,
-    pub delta_us: u64,
+pub enum AckEncodeError {
+    #[error("fresh entry {index} is {delta_us}us from the batch base, over the u16 limit")]
+    FreshDeltaOverflow { index: usize, delta_us: u64 },
+    #[error("fresh_count {fresh_count} exceeds {entries} entries")]
+    FreshCountExceedsEntries { fresh_count: usize, entries: usize },
+    #[error("{count} {section} entries exceeds the cap of {cap}")]
+    TooManyEntries {
+        section: &'static str,
+        count: usize,
+        cap: usize,
+    },
+    /// A batch with zero fresh and zero overlap entries would encode as
+    /// `count_fresh=0, count_overlap=0`, which `decode` correctly refuses
+    /// (`AckDecodeError::InvalidCount(0)`) as carrying nothing to
+    /// acknowledge. Refusing it here too keeps encode/decode symmetric:
+    /// anything `try_encode` emits, `decode` must accept.
+    #[error("batch has no fresh and no overlap entries")]
+    Empty,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,16 +155,39 @@ pub struct AckBatch {
 }
 
 impl AckBatch {
-    /// Encode this batch, panicking if a fresh entry's delta from the batch
-    /// base overflows `u16`. Use `try_encode` to handle that case instead.
+    /// Encode this batch, panicking if the batch is malformed or a fresh
+    /// entry's delta from the batch base overflows `u16`. Use `try_encode`
+    /// to handle those cases instead.
     pub fn encode(&self) -> Vec<u8> {
-        self.try_encode()
-            .expect("fresh entries must fit within FLUSH_INTERVAL_US of the batch base")
+        self.try_encode().expect("AckBatch must be well-formed: fresh_count <= entries.len(), section counts within their caps, and fresh entries within FLUSH_INTERVAL_US of the batch base")
     }
 
     pub fn try_encode(&self) -> Result<Vec<u8>, AckEncodeError> {
+        if self.fresh_count > self.entries.len() {
+            return Err(AckEncodeError::FreshCountExceedsEntries {
+                fresh_count: self.fresh_count,
+                entries: self.entries.len(),
+            });
+        }
         let fresh = &self.entries[..self.fresh_count];
         let overlap = &self.entries[self.fresh_count..];
+        if fresh.is_empty() && overlap.is_empty() {
+            return Err(AckEncodeError::Empty);
+        }
+        if fresh.len() > MAX_FRESH_ENTRIES_PER_BATCH {
+            return Err(AckEncodeError::TooManyEntries {
+                section: "fresh",
+                count: fresh.len(),
+                cap: MAX_FRESH_ENTRIES_PER_BATCH,
+            });
+        }
+        if overlap.len() > ACK_OVERLAP_COUNT {
+            return Err(AckEncodeError::TooManyEntries {
+                section: "overlap",
+                count: overlap.len(),
+                cap: ACK_OVERLAP_COUNT,
+            });
+        }
         let base_arrival_us: u32 = fresh.first().map(|e| e.arrival_us as u32).unwrap_or(0);
 
         let mut out = Vec::with_capacity(
@@ -164,7 +204,7 @@ impl AckBatch {
             let delta_us = (e.arrival_us as u32).wrapping_sub(base_arrival_us) as u64;
             let delta: u16 = delta_us
                 .try_into()
-                .map_err(|_| AckEncodeError { index: i, delta_us })?;
+                .map_err(|_| AckEncodeError::FreshDeltaOverflow { index: i, delta_us })?;
             out.extend_from_slice(&e.frame_seq.to_le_bytes());
             out.push(e.tile_x);
             out.push(e.tile_y);
@@ -405,7 +445,81 @@ mod tests {
             entries: vec![entry(1, 1_000), entry(2, 1_000 + u16::MAX as u64 + 1)],
             fresh_count: 2,
         };
-        assert!(b.try_encode().is_err());
+        assert!(matches!(
+            b.try_encode(),
+            Err(AckEncodeError::FreshDeltaOverflow { index: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn empty_batch_is_refused_because_decode_would_refuse_it_too() {
+        // decode() correctly rejects count_fresh=0 && count_overlap=0 as
+        // InvalidCount(0). If try_encode() were to emit that batch anyway,
+        // encode() and decode() would disagree about what's valid -- caught
+        // by the arbitrary_batches_round_trip_or_are_refused property below.
+        let b = AckBatch {
+            entries: vec![],
+            fresh_count: 0,
+        };
+        assert_eq!(b.try_encode(), Err(AckEncodeError::Empty));
+    }
+
+    #[test]
+    fn fresh_count_exceeding_entries_len_is_refused_rather_than_panicking() {
+        // Fields are public with no constructor, so this is trivially
+        // constructible by a caller bug. A `try_` function must not panic.
+        let b = AckBatch {
+            entries: vec![entry(1, 1_000)],
+            fresh_count: 2,
+        };
+        assert_eq!(
+            b.try_encode(),
+            Err(AckEncodeError::FreshCountExceedsEntries {
+                fresh_count: 2,
+                entries: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn too_many_fresh_entries_is_refused_rather_than_truncating_the_count_byte() {
+        // count_fresh is a u8 on the wire; 256 fresh entries would silently
+        // encode as count_fresh=0, producing a structurally wrong batch.
+        let fresh_count = MAX_FRESH_ENTRIES_PER_BATCH + 1;
+        let entries: Vec<_> = (0..fresh_count)
+            .map(|i| entry(i as u32, i as u64))
+            .collect();
+        let b = AckBatch {
+            entries,
+            fresh_count,
+        };
+        assert_eq!(
+            b.try_encode(),
+            Err(AckEncodeError::TooManyEntries {
+                section: "fresh",
+                count: fresh_count,
+                cap: MAX_FRESH_ENTRIES_PER_BATCH,
+            })
+        );
+    }
+
+    #[test]
+    fn too_many_overlap_entries_is_refused_rather_than_truncating_the_count_byte() {
+        let overlap_count = ACK_OVERLAP_COUNT + 1;
+        let mut entries = vec![entry(0, 0)];
+        entries.extend((0..overlap_count).map(|i| entry(100 + i as u32, i as u64)));
+        let b = AckBatch {
+            entries,
+            fresh_count: 1,
+        };
+        assert_eq!(
+            b.try_encode(),
+            Err(AckEncodeError::TooManyEntries {
+                section: "overlap",
+                count: overlap_count,
+                cap: ACK_OVERLAP_COUNT,
+            })
+        );
     }
 
     #[test]
@@ -413,6 +527,89 @@ mod tests {
         let b = AckBatch {
             entries: vec![entry(1, 5_000_000), entry(2, 1_000)],
             fresh_count: 1,
+        };
+        assert_eq!(AckBatch::decode(&b.encode()).unwrap(), b);
+    }
+
+    #[test]
+    fn base_and_overlap_section_bytes_match_the_documented_offsets() {
+        // A self-consistent encoder/decoder pair could put base_arrival_us
+        // at the wrong offset, or scramble the overlap field order, and
+        // still pass every round-trip-only test. Pin the wire bytes down.
+        let fresh = AckEntry {
+            frame_seq: 0x1111_2222,
+            tile_x: 9,
+            tile_y: 8,
+            pass_idx: 7,
+            arrival_us: 5_000_000,
+        };
+        let overlap = AckEntry {
+            frame_seq: 0xAAAA_BBBB,
+            tile_x: 44,
+            tile_y: 55,
+            pass_idx: 66,
+            arrival_us: 0x0102_0304,
+        };
+        let b = AckBatch {
+            entries: vec![fresh, overlap],
+            fresh_count: 1,
+        };
+        let bytes = b.encode();
+
+        // [3..7]: base_arrival_us = the (only) fresh entry's arrival_us.
+        assert_eq!(
+            &bytes[3..7],
+            &5_000_000u32.to_le_bytes(),
+            "base_arrival_us LE at [3..7]"
+        );
+
+        // Overlap section starts right after the header + 1 fresh entry.
+        let off = ACK_HEADER_SIZE + ACK_FRESH_ENTRY_SIZE;
+        assert_eq!(
+            &bytes[off..off + 4],
+            &0xAAAA_BBBBu32.to_le_bytes(),
+            "overlap frame_seq LE"
+        );
+        assert_eq!(bytes[off + 4], 44, "overlap tile_x");
+        assert_eq!(bytes[off + 5], 55, "overlap tile_y");
+        assert_eq!(bytes[off + 6], 66, "overlap pass_idx");
+        assert_eq!(
+            &bytes[off + 7..off + 11],
+            &0x0102_0304u32.to_le_bytes(),
+            "overlap arrival_us LE (absolute, not a delta)"
+        );
+
+        assert_eq!(AckBatch::decode(&bytes).unwrap(), b);
+    }
+
+    #[test]
+    fn per_entry_tile_fields_are_not_collapsed_to_the_first_entrys() {
+        // The shared `entry()` test helper hardcodes tile_x/tile_y/pass_idx
+        // to 1/2/3 for every call, so a bug that wrote entry[0]'s tile
+        // fields into every slot would pass unnoticed by every other test
+        // in this file. Vary them explicitly across fresh and overlap.
+        fn varied(
+            frame_seq: u32,
+            tile_x: u8,
+            tile_y: u8,
+            pass_idx: u8,
+            arrival_us: u64,
+        ) -> AckEntry {
+            AckEntry {
+                frame_seq,
+                tile_x,
+                tile_y,
+                pass_idx,
+                arrival_us,
+            }
+        }
+        let b = AckBatch {
+            entries: vec![
+                varied(1, 10, 20, 1, 1_000),
+                varied(2, 11, 21, 2, 1_500),
+                varied(3, 12, 22, 3, 2_000_000),
+            ],
+            fresh_count: 2,
         };
         assert_eq!(AckBatch::decode(&b.encode()).unwrap(), b);
     }
@@ -498,5 +695,54 @@ mod tests {
         };
         assert_eq!(b.encode().len(), 671);
         assert_eq!(AckBatch::decode(&b.encode()).unwrap(), b);
+    }
+
+    use proptest::prelude::*;
+
+    fn any_entry() -> impl Strategy<Value = AckEntry> {
+        (
+            any::<u32>(),
+            any::<u8>(),
+            any::<u8>(),
+            any::<u8>(),
+            0u64..=(u32::MAX as u64),
+        )
+            .prop_map(
+                |(frame_seq, tile_x, tile_y, pass_idx, arrival_us)| AckEntry {
+                    frame_seq,
+                    tile_x,
+                    tile_y,
+                    pass_idx,
+                    arrival_us,
+                },
+            )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(500))]
+        #[test]
+        fn arbitrary_batches_round_trip_or_are_refused(
+            entries in prop::collection::vec(any_entry(), 0..100),
+            fresh_count_raw in 0usize..200,
+        ) {
+            // Keep fresh_count within [0, entries.len()] so most cases
+            // exercise the round-trip path rather than only the
+            // FreshCountExceedsEntries guard; section-cap and delta-budget
+            // refusals are still reachable from the arbitrary lengths and
+            // arbitrary timestamps above.
+            let fresh_count = fresh_count_raw % (entries.len() + 1);
+            let batch = AckBatch { entries, fresh_count };
+            match batch.try_encode() {
+                // Refusal is an acceptable outcome for out-of-range input;
+                // the property is "round-trip exactly, or refuse" -- never
+                // silently mutate.
+                Err(_) => {}
+                Ok(bytes) => {
+                    let decoded = AckBatch::decode(&bytes)
+                        .expect("anything try_encode emits must be decodable");
+                    prop_assert_eq!(decoded, batch);
+                }
+            }
+        }
     }
 }

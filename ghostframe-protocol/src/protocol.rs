@@ -122,7 +122,7 @@ pub struct DatagramHeader {
     /// ≈ 71 min). Stamped at the wire-write site in
     /// `reliable_emitter::ReliableTileEmitter::{submit_one,tick}`. Used by
     /// the client's per-tier latency tracking AND echoed back to the server
-    /// via the ACK envelope's `arrival_time_ms_lo16` for the GCC
+    /// via the ACK envelope's `arrival_us` for the GCC
     /// delay-gradient estimator. Semantics changed in 2026-06-27 — was
     /// previously frame capture time for tile datagrams too, which was
     /// useless for inter-datagram timing.
