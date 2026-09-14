@@ -14,8 +14,9 @@ use ghostframe_client_net::ClientNetEvent;
 use ghostframe_e2e::harness::browserless::{
     run_browserless, BrowserlessScene, FrameScript, SceneLoad, DEFAULT_CADENCE_US,
 };
+use ghostframe_e2e::harness::load_profile::{Churn, LoadProfile, PRODUCTION_CADENCE_US};
 use ghostframe_e2e::harness::scene_tiles::TileSpec;
-use ghostframe_e2e::netsim::{CapTimeline, NetProfile};
+use ghostframe_e2e::netsim::{Bottleneck, CapTimeline, NetProfile};
 
 #[tokio::test(start_paused = true)]
 async fn the_session_establishes_over_the_socketpair() {
@@ -1087,5 +1088,102 @@ async fn a_link_with_propagation_delay_carries_datagrams_concurrently() {
         ONE_WAY_US * 2 / 1000,
         r.bytes_delivered,
         serial_ceiling_bytes
+    );
+}
+
+/// Run a sustained production-cadence scene over a queueing bottleneck of a
+/// given capacity, and report what the estimator made of it.
+async fn run_bottleneck_scene(
+    seed: u64,
+    cap: CapTimeline,
+    secs: u64,
+) -> ghostframe_e2e::harness::browserless::BrowserlessResult {
+    let scene = BrowserlessScene {
+        seed,
+        load: SceneLoad::Profile(LoadProfile {
+            cadence_us: PRODUCTION_CADENCE_US,
+            churn: Churn::Region { tiles_per_tick: 4 },
+        }),
+        cadence_us: PRODUCTION_CADENCE_US,
+        net: NetProfile {
+            delay_us: 10_000,
+            cap,
+            bottleneck: Some(Bottleneck::wifi()),
+            ..NetProfile::perfect()
+        },
+        duration: Duration::from_secs(secs),
+        grid_cols: 8,
+        grid_rows: 8,
+    };
+    run_browserless(scene).await.expect("scene ran")
+}
+
+/// The estimator must tell a congested link from an uncongested one.
+///
+/// This deliberately does **not** assert convergence to the link rate, which
+/// would be false: on the congested link the estimate sits on goog_cc's
+/// `MIN_BPS` floor (200 kbps), and on the uncongested one it stays near its
+/// 2 Mbps seed because nothing ever signals congestion. Asserting "within a
+/// factor of capacity" would fail on both sides for opposite reasons.
+///
+/// What it does assert is the property that makes an estimator an estimator:
+/// a link that queues and drops must produce a materially lower estimate than
+/// one with headroom to spare. Measured separation is ~10x with no run-to-run
+/// variance, so the 2x threshold here has a wide margin.
+///
+/// On the bottleneck's role, stated precisely, because an induced-failure
+/// check refuted the stronger claim this comment first made: the *estimate
+/// separation* above is visible against the old drop-without-queueing cap
+/// too (201 kbps vs 2.02 Mbps measured). What the bottleneck changes is the
+/// `bytes_dropped` guards. A token bucket drops bursts even on a link with
+/// ample headroom — 1,200 bytes shed from the spacious scene — which is not
+/// how an uncongested link behaves, so `dropped == 0` is assertable only
+/// against a queue. It also makes the scene reproducible: queue occupancy is
+/// a deterministic function of arrivals, where the bucket's drop decisions
+/// were timing-sensitive and gave estimates spanning 215 kbps to 2.0 Mbps on
+/// identical inputs.
+///
+/// The queueing model still matters for the wider point — without a
+/// queuing-delay gradient goog_cc's delay-based half never runs at all — but
+/// that is not what *this* assertion rests on. See
+/// `docs/specs/bwe-probe-emission-timing.md`.
+#[tokio::test(start_paused = true)]
+async fn the_estimate_separates_a_congested_link_from_an_uncongested_one() {
+    // Offered load is ~1.6 Mbps, so 480 kbps congests and 3.2 Mbps does not.
+    let congested = run_bottleneck_scene(0xC0FF_EE01, CapTimeline::constant(60_000), 10).await;
+    let spacious = run_bottleneck_scene(0xC0FF_EE01, CapTimeline::constant(400_000), 10).await;
+
+    println!(
+        "congested: est={} pacer={:?} delivered={} dropped={}\n\
+         spacious:  est={} pacer={:?} delivered={} dropped={}",
+        congested.bwe_estimate_bps,
+        congested.pacer_rate_bps,
+        congested.bytes_delivered,
+        congested.bytes_dropped,
+        spacious.bwe_estimate_bps,
+        spacious.pacer_rate_bps,
+        spacious.bytes_delivered,
+        spacious.bytes_dropped,
+    );
+
+    // The scenes must actually be what they claim, or the comparison below
+    // is between two identical links and proves nothing.
+    assert!(
+        congested.bytes_dropped > 0,
+        "the congested scene must overflow its buffer; dropped={}",
+        congested.bytes_dropped
+    );
+    assert_eq!(
+        spacious.bytes_dropped, 0,
+        "the spacious scene must have headroom to spare, but dropped {}",
+        spacious.bytes_dropped
+    );
+
+    assert!(
+        spacious.bwe_estimate_bps > congested.bwe_estimate_bps * 2,
+        "a link with headroom must estimate materially higher than a congested \
+         one: spacious={} congested={}",
+        spacious.bwe_estimate_bps,
+        congested.bwe_estimate_bps
     );
 }

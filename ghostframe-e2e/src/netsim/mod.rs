@@ -49,6 +49,11 @@ pub enum Verdict {
 
 /// The main network simulator: applies a NetProfile to each datagram,
 /// tracking burst state, token bucket state, and reorder buffers.
+/// One MTU's worth of bytes. RFC 8289 exempts a queue below this from
+/// dropping, so a link too slow to hold a full packet without exceeding the
+/// AQM target does not drop every packet forever.
+const MTU_BYTES: u64 = 1_500;
+
 pub struct NetSim {
     profile: NetProfile,
     rng: DetRng,
@@ -128,7 +133,16 @@ impl NetSim {
         let sojourn_us = departure - now_us;
 
         if let Some(codel) = &bn.aqm {
-            if self.codel_should_drop(codel, sojourn_us, now_us) {
+            // RFC 8289 measures how long a packet *waited*, not how long it
+            // took to transmit, and never drops while the queue holds less
+            // than one MTU. Both matter on a slow link: at 100 kB/s a single
+            // 1000-byte datagram takes 10 ms to serialise, so counting its
+            // own transmission would put every packet above a 5 ms target
+            // even with an empty queue ahead of it — CoDel would then drop
+            // permanently. Measured before this was fixed: 42% loss and a
+            // session that barely established.
+            let backlog_bytes = backlog_us.saturating_mul(rate_bytes_s) / 1_000_000;
+            if backlog_bytes >= MTU_BYTES && self.codel_should_drop(codel, backlog_us, now_us) {
                 // Dropped by AQM: it never entered the queue, so the drain
                 // time does not advance.
                 return None;
