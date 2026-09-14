@@ -145,6 +145,13 @@ pub struct BrowserlessResult {
     pub framebuffer: FrameBuffer,
     pub events: Vec<ClientNetEvent>,
     pub bytes_delivered: u64,
+    /// Server -> client bytes delivered. `bytes_delivered` sums both
+    /// directions, which makes it useless for reasoning about what the
+    /// server's emission budget is doing — the client's ACK stream is in
+    /// there too.
+    pub bytes_delivered_s2c: u64,
+    /// Client -> server bytes delivered (ACKs, NACKs, input).
+    pub bytes_delivered_c2s: u64,
     pub bytes_dropped: u64,
     /// Read from `FrameBuffer::stale_frame_tiles()` — a scene run only
     /// ever ingests via `FrameBuffer::apply_tile_ready` (real decoded
@@ -397,7 +404,8 @@ async fn run_inner(scene: BrowserlessScene) -> anyhow::Result<BrowserlessResult>
     // point after the abort where `run()` could publish again.
     bridge_handle.abort();
 
-    let (events, bytes_delivered, bytes_dropped) = outcome?;
+    let (events, bytes_delivered, bytes_delivered_s2c, bytes_delivered_c2s, bytes_dropped) =
+        outcome?;
 
     let stale_generation_tiles = framebuffer.stale_frame_tiles();
     let bwe_snapshot = *bwe_cell.lock().expect("bwe_publish mutex poisoned");
@@ -418,6 +426,8 @@ async fn run_inner(scene: BrowserlessScene) -> anyhow::Result<BrowserlessResult>
         framebuffer,
         events,
         bytes_delivered,
+        bytes_delivered_s2c,
+        bytes_delivered_c2s,
         bytes_dropped,
         stale_generation_tiles,
         seed,
@@ -480,7 +490,7 @@ async fn drive_session(
     framebuffer: &mut FrameBuffer,
     bwe_cell: &std::sync::Arc<std::sync::Mutex<ghostframe_lib::transport::bwe::BweSnapshot>>,
     bwe_samples: &mut Vec<(u64, u64)>,
-) -> anyhow::Result<(Vec<ClientNetEvent>, u64, u64)> {
+) -> anyhow::Result<(Vec<ClientNetEvent>, u64, u64, u64, u64)> {
     let seed = scene.seed;
 
     let mut client = ClientNet::new(cfg, now_us(base))
@@ -528,6 +538,8 @@ async fn drive_session(
 
     let mut events: Vec<ClientNetEvent> = Vec::new();
     let mut bytes_delivered: u64 = 0;
+    let mut bytes_delivered_s2c: u64 = 0;
+    let mut bytes_delivered_c2s: u64 = 0;
     let mut bytes_dropped: u64 = 0;
 
     // Per-tile generation counters for injected frames: a coordinate's
@@ -664,6 +676,7 @@ async fn drive_session(
                         anyhow!("seed {seed}: pump send failed at iteration {iter}: {e}")
                     })?;
                     bytes_delivered += item.payload.len() as u64;
+                    bytes_delivered_c2s += item.payload.len() as u64;
                 } else {
                     in_flight.push(InFlight {
                         seq: next_in_flight_seq,
@@ -684,6 +697,8 @@ async fn drive_session(
             client_addr,
             server_addr,
             &mut bytes_delivered,
+            &mut bytes_delivered_s2c,
+            &mut bytes_delivered_c2s,
         )
         .await
         .map_err(|e| anyhow!("seed {seed}: pump send failed at iteration {iter}: {e}"))?;
@@ -827,6 +842,7 @@ async fn drive_session(
                     if item.at_us <= t {
                         client.handle_udp(&item.payload, server_addr, t);
                         bytes_delivered += item.payload.len() as u64;
+                        bytes_delivered_s2c += item.payload.len() as u64;
                     } else {
                         in_flight.push(InFlight {
                             seq: next_in_flight_seq,
@@ -844,7 +860,13 @@ async fn drive_session(
         }
     }
 
-    Ok((events, bytes_delivered, bytes_dropped))
+    Ok((
+        events,
+        bytes_delivered,
+        bytes_delivered_s2c,
+        bytes_delivered_c2s,
+        bytes_dropped,
+    ))
 }
 
 /// Encode and inject one `FrameScript`'s tiles as an `InjectedFrame`.
@@ -1066,6 +1088,8 @@ async fn flush_due(
     client_addr: SocketAddr,
     server_addr: SocketAddr,
     bytes_delivered: &mut u64,
+    bytes_delivered_s2c: &mut u64,
+    bytes_delivered_c2s: &mut u64,
 ) -> std::io::Result<()> {
     while in_flight.peek().is_some_and(|f| f.at_us <= now) {
         let f = in_flight.pop().expect("peek just confirmed a due datagram");
@@ -1074,6 +1098,10 @@ async fn flush_due(
             Direction::S2c => client.handle_udp(&f.payload, server_addr, now),
         }
         *bytes_delivered += f.payload.len() as u64;
+        match f.dir {
+            Direction::C2s => *bytes_delivered_c2s += f.payload.len() as u64,
+            Direction::S2c => *bytes_delivered_s2c += f.payload.len() as u64,
+        }
     }
     Ok(())
 }
