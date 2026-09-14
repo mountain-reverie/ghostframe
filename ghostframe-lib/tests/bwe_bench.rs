@@ -58,7 +58,11 @@ fn run(steps: u32, capacity_bps: impl Fn(u32) -> u64) -> Vec<u64> {
         }
         emit_us += 20_000;
 
-        let snap = w.update(&batch, t0 + Duration::from_micros(emit_us));
+        let snap = w.update(
+            &batch,
+            t0 + Duration::from_micros(emit_us),
+            batch.iter().map(|r| r.size_bytes as usize).sum(),
+        );
         send_rate_bps = snap.bitrate_bps.max(200_000);
         out.push(snap.bitrate_bps);
     }
@@ -111,7 +115,11 @@ fn real_pacer_rate_bps() -> u64 {
                 }
             })
             .collect();
-        let snap = w.update(&batch, t0 + Duration::from_millis(20 * step as u64));
+        let snap = w.update(
+            &batch,
+            t0 + Duration::from_millis(20 * step as u64),
+            batch.iter().map(|r| r.size_bytes as usize).sum(),
+        );
         pacer_rate_bps = snap.pacer_rate_bps;
     }
     pacer_rate_bps.expect("estimator produced no pacer_config after 50 feedback batches")
@@ -197,7 +205,11 @@ fn pacing_mode_reaches_paced_after_enough_real_feedback() {
             })
             .collect();
         samples_seen = w
-            .update(&batch, t0 + Duration::from_millis(20 * step as u64))
+            .update(
+                &batch,
+                t0 + Duration::from_millis(20 * step as u64),
+                batch.iter().map(|r| r.size_bytes as usize).sum(),
+            )
             .samples_seen;
     }
     assert_eq!(
@@ -259,7 +271,11 @@ fn request_a_real_probe(seed_bps: u64) -> (BweWrapper, Instant, ProbeRequest) {
         size_bytes: PKT_BYTES,
         probe: None,
     }];
-    w.update(&seed_batch, t0 + Duration::from_millis(20));
+    w.update(
+        &seed_batch,
+        t0 + Duration::from_millis(20),
+        seed_batch.iter().map(|r| r.size_bytes as usize).sum(),
+    );
     let req = w.take_probe_request().unwrap_or_else(|| {
         panic!(
             "goog_cc's ProbeController did not request an initial probe \
@@ -335,7 +351,11 @@ fn a_requested_probe_cluster_is_filled_and_consumed() {
         })
         .collect();
     let after = w
-        .update(&batch, t0 + Duration::from_millis(200))
+        .update(
+            &batch,
+            t0 + Duration::from_millis(200),
+            batch.iter().map(|r| r.size_bytes as usize).sum(),
+        )
         .bitrate_bps;
 
     // Control: the same shape of traffic, untagged, from a fresh wrapper
@@ -350,7 +370,11 @@ fn a_requested_probe_cluster_is_filled_and_consumed() {
         })
         .collect();
     let control_after = control
-        .update(&control_batch, ct0 + Duration::from_millis(200))
+        .update(
+            &control_batch,
+            ct0 + Duration::from_millis(200),
+            control_batch.iter().map(|r| r.size_bytes as usize).sum(),
+        )
         .bitrate_bps;
 
     assert_ne!(
@@ -402,7 +426,11 @@ fn an_underfilled_probe_cluster_is_discarded_silently() {
         })
         .collect();
     let after = w
-        .update(&batch, t0 + Duration::from_millis(200))
+        .update(
+            &batch,
+            t0 + Duration::from_millis(200),
+            batch.iter().map(|r| r.size_bytes as usize).sum(),
+        )
         .bitrate_bps;
 
     // Control: an identically-shaped, fully untagged batch from a fresh,
@@ -417,7 +445,11 @@ fn an_underfilled_probe_cluster_is_discarded_silently() {
         })
         .collect();
     let control_after = control
-        .update(&control_batch, ct0 + Duration::from_millis(200))
+        .update(
+            &control_batch,
+            ct0 + Duration::from_millis(200),
+            control_batch.iter().map(|r| r.size_bytes as usize).sum(),
+        )
         .bitrate_bps;
 
     assert_eq!(
@@ -486,7 +518,11 @@ fn untagged_traffic_tracks_normally_around_a_pending_probe() {
             })
             .collect();
         last = w
-            .update(&batch, t0 + Duration::from_millis(20 * step as u64))
+            .update(
+                &batch,
+                t0 + Duration::from_millis(20 * step as u64),
+                batch.iter().map(|r| r.size_bytes as usize).sum(),
+            )
             .bitrate_bps;
     }
 

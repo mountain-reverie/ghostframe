@@ -4771,7 +4771,12 @@ impl IoBridge {
                 {
                     self.bwe.note_path_rtt(rtt);
                 }
-                self.bwe.update(&records, now_std());
+                // Real in-flight bytes rather than a hardcoded zero, so
+                // goog_cc's congestion-window pushback has something to act
+                // on. Read before `update` so it reflects the state the
+                // feedback describes.
+                let in_flight = self.reliable_emitter.bytes_in_flight();
+                self.bwe.update(&records, now_std(), in_flight);
             }
 
             // Republish into `bwe_publish` every iteration, not only when
