@@ -4,7 +4,7 @@
 
 **Goal:** Carry client ACK arrival times at microsecond resolution so goog_cc stops discarding 80% of our probe measurements.
 
-**Architecture:** ACK wire format `0x05` splits a batch into two sections. Fresh entries (dense, ≤5 ms span) carry `u16` microsecond deltas from a per-batch base; overlap entries (arbitrarily old) carry absolute low-32-bit microseconds. In memory `AckEntry` exposes one uniform `arrival_us`, so the three server consumer sites barely change. The server's own send timestamps gain matching precision.
+**Architecture:** ACK wire format `0x06` splits a batch into two sections. Fresh entries (dense, ≤5 ms span) carry `u16` microsecond deltas from a per-batch base; overlap entries (arbitrarily old) carry absolute low-32-bit microseconds. In memory `AckEntry` exposes one uniform `arrival_us`, so the three server consumer sites barely change. The server's own send timestamps gain matching precision.
 
 **Tech Stack:** Rust. `ghostframe-protocol` (codec), `ghostframe-client-core` (producer), `ghostframe-lib` (consumer + goog_cc adapter).
 
@@ -16,7 +16,7 @@ Design: `docs/superpowers/specs/2026-09-14-ack-microsecond-arrival-design.md`. R
 
 | File | Responsibility | Change |
 |---|---|---|
-| `ghostframe-protocol/src/ack.rs` | Wire codec, caps, error type | Two-section encode/decode, `0x05`, `arrival_us` |
+| `ghostframe-protocol/src/ack.rs` | Wire codec, caps, error type | Two-section encode/decode, `0x06`, `arrival_us` |
 | `ghostframe-client-core/src/reassembly.rs` | Produces `AckEntry` on datagram receipt | Stop discarding precision (2 sites) |
 | `ghostframe-client-core/src/ack_batcher.rs` | Assembles `[fresh, overlap]` | Tell the batch where fresh ends |
 | `ghostframe-client-core/tests/oracle_ack.rs` | Oracle round-trip | Follow the field rename |
@@ -877,7 +877,7 @@ baseline, so the before and after sit together.
 
 ## Done criteria
 
-- [ ] `ACK_BATCH_MSG_TYPE` is `0x05`; a `0x04` batch is rejected with `WrongMsgType`.
+- [ ] `ACK_BATCH_MSG_TYPE` is `0x06`; a `0x04` batch is rejected with `WrongMsgType`.
 - [ ] Worst-case batch is exactly 671 bytes.
 - [ ] No entry is ever dropped to make a batch encode; an over-range fresh delta is an error, not a truncation.
 - [ ] Overlap entries of any age round-trip exactly.

@@ -44,10 +44,10 @@ representable-range failure mode.
 mechanism's size or purpose, or anything about tile datagrams. This is a
 timestamp-resolution change.
 
-## Wire format (`ACK_BATCH_MSG_TYPE = 0x05`)
+## Wire format (`ACK_BATCH_MSG_TYPE = 0x06`)
 
 ```text
-[0]      message_type = 0x05
+[0]      message_type = 0x06
 [1]      count_fresh: u8      (0..=64, MAX_FRESH_ENTRIES_PER_BATCH)
 [2]      count_overlap: u8    (0..=8,  ACK_OVERLAP_COUNT)
 [3..7]   base_arrival_us: u32 little-endian
@@ -201,10 +201,10 @@ and should be reported as such rather than kept for tidiness.
 
 ## Rollout
 
-Lockstep wire break, following `0x02 -> 0x03 -> 0x04`. The message-type bump
+Lockstep wire break, following `0x02 -> 0x03 -> 0x04 -> 0x06`. The message-type bump
 means a mismatched pair fails loud with `AckDecodeError::WrongMsgType`
 carrying whichever byte was actually seen — a new server rejects an old
-client's `0x04`, an old server rejects a new client's `0x05` — rather than
+client's `0x04`, an old server rejects a new client's `0x06` — rather than
 either mis-parsing a two-section batch as a flat one. Nothing is deployed that
 cannot be upgraded together.
 
@@ -217,6 +217,29 @@ Coherence checklist — every site that touches the field:
 - `ghostframe-lib/src/transport/io_bridge.rs` (consumer, `BweSample`)
 - `ghostframe-lib/src/transport/bwe/timeline.rs` (unwrapper)
 - `ghostframe-lib/src/transport/bwe/googcc.rs` (send-side precision)
+
+> **Amended 2026-09-14: the message type is `0x06`, not `0x05`.** This
+> document originally said `0x05`, reasoning only from the ACK codec's own
+> lineage `0x02 -> 0x03 -> 0x04`. It never checked the wider discriminator
+> namespace, and `0x05` was already `TILE_NACK_ENVELOPE`. Both are
+> client->server datagrams, and the server dispatches `TileNack` first and
+> everything else to the ACK handler — so every ACK batch would have routed
+> into the NACK handler, failed to decode, and been **silently dropped**,
+> disabling the entire feedback path this change exists to improve. No crash,
+> no error; probe rejections would simply not have improved and we would have
+> concluded the change did not work.
+>
+> Found by the Task 2 implementer investigating four unrelated test failures
+> rather than working around them. The namespace turned out to be already
+> fragile: the old `0x04` collides with `TILE_PARITY_ENVELOPE`, surviving only
+> because parity falls through the dispatch's `_` arm into the ACK handler,
+> and `classify_inbound` still hardcoded `0x03` for ACK batches — stale since
+> the codec moved to `0x04`.
+>
+> The renumber fixes today's bug. The durable fix is
+> `inbound_message_discriminators_do_not_collide`, a pairwise test over every
+> client->server discriminator, because a collision here never fails loudly —
+> it silently routes one message type into another's handler.
 
 ## Risks
 
