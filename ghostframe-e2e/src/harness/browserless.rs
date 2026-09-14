@@ -840,7 +840,10 @@ async fn drive_session(
                 for item in rule(&mut net_s2c, Direction::S2c, pkt.payload, t, &mut bytes_dropped)
                 {
                     if item.at_us <= t {
-                        client.handle_udp(&item.payload, server_addr, t);
+                        // Its own arrival instant, for the same reason as
+                        // in `flush_due`. Equal to `t` at zero delay, earlier
+                        // than it whenever the link models any.
+                        client.handle_udp(&item.payload, server_addr, item.at_us);
                         bytes_delivered += item.payload.len() as u64;
                         bytes_delivered_s2c += item.payload.len() as u64;
                     } else {
@@ -1075,10 +1078,12 @@ fn rule(
 /// Deliver every queued datagram whose arrival time has come, in arrival
 /// order across both directions.
 ///
-/// Called once per scene-loop iteration. `now` is the current virtual
-/// time, and is also the timestamp handed to `ClientNet::handle_udp` —
-/// the client sees the datagram as arriving when it actually arrives,
-/// not when it was sent.
+/// Called once per scene-loop iteration. `now` selects which datagrams are
+/// due; each one is then handed to `ClientNet::handle_udp` stamped with its
+/// *own* `at_us`, not with `now`. Those differ whenever more than one
+/// datagram comes due in the same pass, which is most of the time — and
+/// stamping them all with `now` would erase the arrival spread the
+/// bottleneck model exists to produce.
 #[allow(clippy::too_many_arguments)]
 async fn flush_due(
     in_flight: &mut BinaryHeap<InFlight>,
@@ -1095,7 +1100,16 @@ async fn flush_due(
         let f = in_flight.pop().expect("peek just confirmed a due datagram");
         match f.dir {
             Direction::C2s => pump.send(&f.payload, &client_addr).await?,
-            Direction::S2c => client.handle_udp(&f.payload, server_addr, now),
+            // Stamp each datagram with *its own* arrival time, not the
+            // loop's. `flush_due` drains everything already due in one pass,
+            // so using `now` collapsed a whole batch's arrival spread to a
+            // single instant -- discarding exactly the per-datagram
+            // serialisation delay the bottleneck model computes into
+            // `at_us`. Invisible at millisecond resolution; at microsecond
+            // resolution it made receive intervals ~5x shorter than the
+            // matching send intervals, and goog_cc rejected every probe
+            // cluster as `receive/send ratio too high`.
+            Direction::S2c => client.handle_udp(&f.payload, server_addr, f.at_us),
         }
         *bytes_delivered += f.payload.len() as u64;
         match f.dir {
