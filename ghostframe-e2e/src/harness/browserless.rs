@@ -57,11 +57,21 @@ use crate::harness::framebuffer::FrameBuffer;
 use crate::harness::scene_tiles::{encode_tile, TileSpec};
 use crate::netsim::{NetProfile, NetSim, SocketPairPump, Verdict};
 
-/// Two virtual milliseconds' worth of frame spacing between injected
-/// frames, matching a 62.5 fps scene-authoring cadence. Chosen simply to
-/// be a small, deterministic, non-zero gap — nothing downstream depends on
-/// this value meaning "one frame at 60fps" precisely.
-const FRAME_SPACING_US: u64 = 16_000;
+/// Default spacing between injected frames.
+///
+/// This was 16 ms, documented as "a small, deterministic, non-zero gap"
+/// that nothing downstream depended on. That turned out to be false.
+/// Production dispatches every `SCHEDULER_TICK_INTERVAL_US` (33.3 ms), and
+/// against a ~15 ms probe window the difference decides whether a window
+/// contains an emission at all: the 8x8 CDF53 probe scene completes ten
+/// clusters in ten seeds at 16 ms and **zero** at 33.3 ms, with or without
+/// `drain_for_probe_window_open`. Every probe-completion figure this project
+/// published before 2026-09-13 came from the faster regime. See
+/// `docs/specs/bwe-probe-emission-timing.md`.
+///
+/// Re-exported rather than redeclared so a scripted scene and a generated
+/// `LoadProfile` cannot drift to different defaults.
+pub use crate::harness::load_profile::PRODUCTION_CADENCE_US as DEFAULT_CADENCE_US;
 
 /// Spacing between post-injection heartbeat ticks (see `drive_session`'s
 /// doc comment on why heartbeats exist at all). Deliberately much coarser
@@ -105,6 +115,10 @@ pub struct BrowserlessScene {
     /// after `SessionReady`, one `FrameScript` every `FRAME_SPACING_US` of
     /// virtual time. See the module docs.
     pub load: SceneLoad,
+    /// Interval between injected frames. Use [`DEFAULT_CADENCE_US`] unless
+    /// the scene specifically needs another cadence; a `SceneLoad::Profile`
+    /// carries its own and overrides this.
+    pub cadence_us: u64,
     pub net: NetProfile,
     pub duration: Duration,
     /// Grid dimensions, fixed for the whole scene.
@@ -469,6 +483,12 @@ async fn drive_session(
     // Borrowed, never cloned: a generated profile can run to tens of
     // thousands of tiles, and a scripted scene's frames are already owned by
     // the caller's `BrowserlessScene`.
+    // A generated profile owns its cadence; a scripted scene declares one.
+    let cadence_us = match &scene.load {
+        SceneLoad::Profile(p) => p.cadence_us,
+        SceneLoad::Script(_) => scene.cadence_us,
+    };
+
     let generated: Vec<FrameScript>;
     let frames: &[FrameScript] = match &scene.load {
         SceneLoad::Script(f) => f,
@@ -659,6 +679,7 @@ async fn drive_session(
                             scene,
                             next_frame_idx,
                             &frames[next_frame_idx],
+                            cadence_us,
                             &mut generations,
                             inject_tx,
                         )
@@ -667,7 +688,7 @@ async fn drive_session(
                             anyhow!("seed {seed}: frame {next_frame_idx} injection failed: {e}")
                         })?;
                         next_frame_idx += 1;
-                        spacing_us = FRAME_SPACING_US;
+                        spacing_us = cadence_us;
                     } else {
                         // the frame list is exhausted, but `scene.duration`
                         // may still have plenty of virtual time left, and a
@@ -700,7 +721,7 @@ async fn drive_session(
                         // harness's substitute for "a client stays
                         // connected and capture keeps ticking", not a new
                         // behavior IoBridge doesn't already have.
-                        inject_heartbeat(heartbeat_seq, inject_tx)
+                        inject_heartbeat(heartbeat_seq, cadence_us, inject_tx)
                             .await
                             .map_err(|e| {
                                 anyhow!(
@@ -804,6 +825,7 @@ async fn inject_frame(
     scene: &BrowserlessScene,
     frame_idx: usize,
     script: &FrameScript,
+    cadence_us: u64,
     generations: &mut HashMap<(u8, u8), u8>,
     inject_tx: &mpsc::Sender<InjectedFrame>,
 ) -> anyhow::Result<()> {
@@ -829,7 +851,7 @@ async fn inject_frame(
 
     let frame = InjectedFrame {
         seq: frame_idx as u32,
-        timestamp_us: (frame_idx as u64 * FRAME_SPACING_US) as u32,
+        timestamp_us: (frame_idx as u64 * cadence_us) as u32,
         // No `budget_bytes` here: `IoBridge::apply_injected_frame` derives
         // its own per-tick budget the same way the production capture path
         // does (`IoBridge::base_budget_bytes`), rather than accepting one
@@ -862,10 +884,14 @@ async fn inject_frame(
 /// otherwise this would collide with a real frame's wire `frame_seq` in
 /// `IoBridge`'s per-tile-pass ACK/NACK/coverage bookkeeping, which is keyed
 /// by `frame_seq`.
-async fn inject_heartbeat(seq: u32, inject_tx: &mpsc::Sender<InjectedFrame>) -> anyhow::Result<()> {
+async fn inject_heartbeat(
+    seq: u32,
+    cadence_us: u64,
+    inject_tx: &mpsc::Sender<InjectedFrame>,
+) -> anyhow::Result<()> {
     let frame = InjectedFrame {
         seq,
-        timestamp_us: (seq as u64 * FRAME_SPACING_US) as u32,
+        timestamp_us: (seq as u64 * cadence_us) as u32,
         work: Vec::new(),
     };
     inject_tx
