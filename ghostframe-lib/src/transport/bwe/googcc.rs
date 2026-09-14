@@ -42,15 +42,18 @@ pub(crate) struct GoogCcDriver {
     /// consumes this directly rather than deriving a rate from
     /// `target_rate` (see `absorb`'s doc comment on that field).
     pacer_rate_bps: Option<u64>,
-    /// The most recently requested, not-yet-consumed probe cluster (BWE
-    /// Stage 2.4), converted out of goog_cc's units by `to_probe_request`.
-    /// `absorb` overwrites this whenever `NetworkControlUpdate` carries a
-    /// new config — one active probe at a time, per the design: a config
-    /// this driver hasn't surfaced yet is itself indistinguishable from
-    /// "no probe pending" to any caller, so overwriting rather than
-    /// queuing loses nothing a caller could have observed. Cleared by
-    /// `take_probe_request`.
-    pending_probe_request: Option<super::ProbeRequest>,
+    /// Requested, not-yet-consumed probe clusters (BWE Stage 2.4), converted
+    /// out of goog_cc's units by `to_probe_request` and surfaced one at a
+    /// time by `take_probe_request`.
+    ///
+    /// This used to hold only the most recent config, on the reasoning that a
+    /// config never surfaced is indistinguishable from one never requested.
+    /// That is true of any single config and false of the set: goog_cc's
+    /// exponential probing asks for a *ladder*, and the first request of a
+    /// session was measured here as a pair at 6 Mbps and 12 Mbps. Keeping the
+    /// last discarded the lower rung — the one more likely to be answerable
+    /// on a slow link. Bounded by `MAX_PENDING_PROBE_REQUESTS`.
+    pending_probe_requests: std::collections::VecDeque<super::ProbeRequest>,
 }
 
 /// Newtype carrying the `Send` assertion, so it covers exactly the one type
@@ -79,6 +82,11 @@ struct SendCtl(GoogCcNetworkController);
 unsafe impl Send for SendCtl {}
 
 impl GoogCcDriver {
+    /// Most probe requests held at once. goog_cc asks for a ladder of at
+    /// most a few clusters; anything beyond this is a backlog the session
+    /// will never work through while the rates still describe the link.
+    const MAX_PENDING_PROBE_REQUESTS: usize = 4;
+
     pub(crate) fn new(initial_bps: u64, now: Instant) -> Self {
         let at_time = Timestamp::from_millis(0);
         let cfg = NetworkControllerConfig {
@@ -134,7 +142,7 @@ impl GoogCcDriver {
             path_rtt: None,
             implausible_rtt_samples: 0,
             pacer_rate_bps: None,
-            pending_probe_request: None,
+            pending_probe_requests: std::collections::VecDeque::new(),
         }
     }
 
@@ -332,8 +340,22 @@ impl GoogCcDriver {
         // as-yet-unsurfaced earlier config in this same batch is
         // indistinguishable to any caller from "never requested" and can
         // simply be overwritten.
-        if let Some(cfg) = upd.probe_cluster_configs.last() {
-            self.pending_probe_request = Some(Self::to_probe_request(cfg));
+        for cfg in &upd.probe_cluster_configs {
+            // Every requested cluster is queued, not just the last. goog_cc's
+            // exponential probing asks for a *ladder* -- the first request of
+            // a session is a pair, measured here as 6 Mbps then 12 Mbps -- and
+            // keeping only the last discarded the lower rung, which is the one
+            // more likely to be answerable on a slow link.
+            //
+            // Bounded so a burst of requests cannot queue probes the session
+            // will still be working through long after they stopped
+            // describing the link. Oldest goes first: a stale probe rate is
+            // worth less than a fresh one.
+            if self.pending_probe_requests.len() == Self::MAX_PENDING_PROBE_REQUESTS {
+                self.pending_probe_requests.pop_front();
+            }
+            self.pending_probe_requests
+                .push_back(Self::to_probe_request(cfg));
         }
     }
 
@@ -368,7 +390,7 @@ impl GoogCcDriver {
     /// once rather than re-triggering on every poll that still sees it
     /// stored.
     pub(crate) fn take_probe_request(&mut self) -> Option<super::ProbeRequest> {
-        self.pending_probe_request.take()
+        self.pending_probe_requests.pop_front()
     }
 
     fn to_timestamp(&self, now: Instant) -> Timestamp {
