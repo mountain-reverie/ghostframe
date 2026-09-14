@@ -138,18 +138,25 @@
 #define CACHE_CAPACITY 32768
 
 /**
- * ACK envelope wire-format version. Bumped 0x03 → 0x04 in 2026-06-27
- * to add a 2-byte per-entry receiver-arrival-time field (low 16 bits
- * of wall-clock milliseconds) used by the server's bandwidth-estimator
- * hook. Old (0x03) clients/servers are not wire-compatible with new —
- * both sides ship in lockstep.
+ * ACK envelope wire-format version. Bumped 0x04 → 0x06 in 2026-09 to move
+ * from millisecond to microsecond arrival timestamps: goog_cc was
+ * discarding the majority of probe measurements because sub-millisecond
+ * inter-packet arrival spacing was unrepresentable in the old format. Old
+ * (0x04) clients/servers are not wire-compatible with new — both sides
+ * ship in lockstep.
+ *
+ * `0x05` was skipped: it was assigned first and collided with
+ * `TILE_NACK_ENVELOPE` (`protocol.rs`), silently routing every ACK batch
+ * into the NACK handler. See `protocol::tests::
+ * inbound_message_discriminators_do_not_collide` for the regression test.
  */
-#define ACK_BATCH_MSG_TYPE 4
+#define ACK_BATCH_MSG_TYPE 6
 
 /**
  * Maximum number of *fresh* entries the client packs into one batch
- * before flushing (mirrors `MAX_ACK_ENTRIES` in ack.ts). Used for the
- * roundtrip-size tests; the wire-acceptance cap is below.
+ * before flushing (mirrors `MAX_ACK_ENTRIES` in ack.ts). This is also the
+ * wire-acceptance cap for `count_fresh`, enforced independently by both
+ * `decode` and `AckBatch::new`.
  */
 #define MAX_FRESH_ENTRIES_PER_BATCH 64
 
@@ -157,16 +164,33 @@
  * Trailing overlap count the client appends to each batch (mirrors
  * `ACK_OVERLAP_COUNT` in ack.ts). A single dropped ACK batch
  * therefore needs ACK_OVERLAP_COUNT + 1 consecutive drops to lose
- * any entry.
+ * any entry. This is also the wire-acceptance cap for `count_overlap`,
+ * enforced independently by both `decode` and `AckBatch::new`.
  */
 #define ACK_OVERLAP_COUNT 8
 
 /**
- * Wire-acceptance cap for one ACK batch: fresh + overlap.
+ * Combined size of a full-fresh, full-overlap batch. Informational only:
+ * nothing checks this sum directly, because it holds automatically from
+ * `count_fresh` and `count_overlap` each being capped independently (by
+ * `MAX_FRESH_ENTRIES_PER_BATCH` and `ACK_OVERLAP_COUNT` respectively).
  */
 #define MAX_ACK_ENTRIES_PER_BATCH (MAX_FRESH_ENTRIES_PER_BATCH + ACK_OVERLAP_COUNT)
 
-#define ACK_ENTRY_SIZE 9
+/**
+ * `[msg_type][count_fresh][count_overlap][base_arrival_us: u32]`
+ */
+#define ACK_HEADER_SIZE (((1 + 1) + 1) + 4)
+
+/**
+ * `[frame_seq: u32][tile_x][tile_y][pass_idx][arrival_delta_us: u16]`
+ */
+#define ACK_FRESH_ENTRY_SIZE 9
+
+/**
+ * `[frame_seq: u32][tile_x][tile_y][pass_idx][arrival_us: u32]`
+ */
+#define ACK_OVERLAP_ENTRY_SIZE 11
 
 /**
  * Number of progressive passes emitted per Cdf53 tile.

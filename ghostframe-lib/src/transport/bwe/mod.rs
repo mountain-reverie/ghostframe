@@ -19,7 +19,7 @@
 use std::time::{Duration, Instant};
 
 mod googcc;
-mod timeline;
+pub(crate) mod timeline;
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -28,9 +28,12 @@ mod timeline;
 #[derive(Debug, Clone, Copy)]
 pub struct AckArrival {
     /// Per-session monotonic seq we feed the estimator as packet identity.
-    /// In Phase 1 this is `(emit_lo16 << 16) | arrival_lo16` — a stable
-    /// per-sample identifier. Phase 2 will replace it with the actual
-    /// wire_seq from the cache entry once plumbed through `BweSample`.
+    /// This is still a Phase 1 placeholder — `(emit_lo16 << 16) |
+    /// arrival_lo16`, taken from the low 16 bits of each now-microsecond
+    /// field rather than the old millisecond ones — and stable per sample,
+    /// nothing more; goog_cc's driver never reads it outside its own tests.
+    /// Phase 2 will replace it with the actual wire_seq from the cache
+    /// entry once plumbed through `BweSample`.
     pub wire_seq: u32,
     /// Server-side send time in microseconds since the bridge's BWE epoch,
     /// taken from the retransmit cache's `last_sent_at`, so a retransmitted
@@ -38,8 +41,12 @@ pub struct AckArrival {
     /// Monotonic and full-precision — unlike the arrival series this never
     /// crosses the wire, so it needs no unwrapping.
     pub server_emit_us: u64,
-    /// Low 16 bits of the client's arrival time in ms.
-    pub client_arrival_ms_lo16: u16,
+    /// Client's arrival time in microseconds, already unwrapped onto a
+    /// monotonic timeline by `IoBridge`'s `arrival_timeline`
+    /// (`Lo32Timeline`). The wire only ever carries the low 32 bits of this
+    /// value; unwrapping happens once, at ingestion, so every consumer past
+    /// that point sees a plain monotonic microsecond series.
+    pub client_arrival_us: u64,
     /// Wire size of the acknowledged datagram in bytes, summed over its
     /// fragments. GoogCC derives delivery rate from bytes; without this the
     /// controller sees arrivals but no volume and cannot form an estimate.
@@ -213,7 +220,8 @@ mod tests {
                 AckArrival {
                     wire_seq: i,
                     server_emit_us: emit_us,
-                    client_arrival_ms_lo16: ((emit_us / 1_000 + 15) & 0xFFFF) as u16,
+                    // 15 ms one-way delay, in real microseconds now.
+                    client_arrival_us: emit_us + 15_000,
                     size_bytes: 1200,
                     probe: None,
                 }
@@ -237,14 +245,14 @@ mod tests {
             AckArrival {
                 wire_seq: 1,
                 server_emit_us: 100,
-                client_arrival_ms_lo16: 110,
+                client_arrival_us: 10_100,
                 size_bytes: 1200,
                 probe: None,
             },
             AckArrival {
                 wire_seq: 2,
                 server_emit_us: 120,
-                client_arrival_ms_lo16: 135,
+                client_arrival_us: 10_135,
                 size_bytes: 1200,
                 probe: None,
             },
@@ -292,7 +300,7 @@ mod tests {
         let a = AckArrival {
             wire_seq: 1,
             server_emit_us: 10,
-            client_arrival_ms_lo16: 25,
+            client_arrival_us: 25_000,
             size_bytes: 1200,
             probe: None,
         };
@@ -308,7 +316,7 @@ mod tests {
         let a = AckArrival {
             wire_seq: 1,
             server_emit_us: 5_000_000,
-            client_arrival_ms_lo16: 25,
+            client_arrival_us: 5_025_000,
             size_bytes: 1200,
             probe: None,
         };
@@ -329,11 +337,11 @@ mod tests {
                 .map(|i| {
                     let emit_us = ((step * 20 + i) as u64) * 1_000;
                     // One-way delay grows 10 ms per step. Volume is constant.
-                    let arrival_ms = emit_us / 1_000 + 15 + (step as u64) * 10;
+                    let arrival_us = emit_us + 15_000 + (step as u64) * 10_000;
                     AckArrival {
                         wire_seq: step * 12 + i,
                         server_emit_us: emit_us,
-                        client_arrival_ms_lo16: (arrival_ms & 0xFFFF) as u16,
+                        client_arrival_us: arrival_us,
                         size_bytes: 1200,
                         probe: None,
                     }
@@ -367,11 +375,11 @@ mod tests {
             let batch: Vec<AckArrival> = (0..12u32)
                 .map(|i| {
                     let emit_us = ((step * 20 + i) as u64) * 1_000;
-                    let arrival_ms = emit_us / 1_000 + 15;
+                    let arrival_us = emit_us + 15_000;
                     AckArrival {
                         wire_seq: step * 12 + i,
                         server_emit_us: emit_us,
-                        client_arrival_ms_lo16: (arrival_ms & 0xFFFF) as u16,
+                        client_arrival_us: arrival_us,
                         size_bytes: 1200,
                         probe: None,
                     }

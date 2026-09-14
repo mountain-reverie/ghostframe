@@ -760,7 +760,7 @@ mod tests {
     /// barely moves while `tokio::time::advance` fast-forwards the virtual
     /// clock, so two tile passes submitted 250ms apart on the virtual clock
     /// would carry emit stamps only microseconds apart — corrupting the
-    /// deltas the BWE consumer (`io_bridge.rs`'s `owd_ms_lo16` computation)
+    /// deltas the BWE consumer (`io_bridge.rs`'s `owd_us` computation)
     /// depends on.
     ///
     /// This test submits one tile pass, advances tokio's paused clock by

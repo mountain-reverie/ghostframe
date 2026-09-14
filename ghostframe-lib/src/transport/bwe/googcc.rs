@@ -5,7 +5,6 @@
 //! envelope are sufficient. A constant clock offset between the two cancels in
 //! GoogCC's `recv_delta - send_delta`.
 
-use super::timeline::Lo16Timeline;
 use super::{AckArrival, BweSnapshot};
 use goog_cc::network_control::{NetworkControllerConfig, NetworkControllerInterface};
 use goog_cc::transport::{
@@ -24,10 +23,6 @@ const MAX_BPS: i64 = 200_000_000;
 
 pub(crate) struct GoogCcDriver {
     ctl: SendCtl,
-    /// Only the arrival series needs unwrapping: it crosses the wire as 16
-    /// bits of the client's clock. `server_emit_us` is already monotonic
-    /// server-side microseconds and is used directly.
-    arrival_time: Lo16Timeline,
     base: Instant,
     estimate_bps: u64,
     samples_seen: u64,
@@ -135,7 +130,6 @@ impl GoogCcDriver {
         });
         Self {
             ctl: SendCtl(ctl),
-            arrival_time: Lo16Timeline::default(),
             base: now,
             estimate_bps: initial_bps,
             samples_seen: 0,
@@ -193,23 +187,42 @@ impl GoogCcDriver {
         // ms past the caller's sampled `now` — so floor feedback_time at the
         // batch's own latest send timestamp.
         //
-        // Deliberately `send_ms` only — NOT `recv_ms`. `send_ms` is derived
-        // from `server_emit_us`, measured from the server's `bwe_epoch`.
-        // `recv_ms` is derived from `client_arrival_ms_lo16`, which in the
-        // browser is `performance.now() & 0xFFFF` — a page-navigation epoch
-        // wrapping every 65.5s — passed through `Lo16Timeline`, which
-        // anchors on whatever it first sees. The offset between the two
-        // epochs is arbitrary in [0, 65.5s) and `max()` across them is
+        // This floor is still computed at millisecond resolution
+        // (`send_ms_max`) and still deliberately from `send_ms` only — NOT
+        // from the arrival series. `server_emit_us`/`send_ms` are measured
+        // from the server's own `bwe_epoch`; the arrival series is on the
+        // client's independent clock (unwrapped onto a monotonic timeline
+        // once, in `io_bridge`, before it ever reaches this driver — see
+        // `IoBridge::arrival_timeline`). The offset between the two epochs
+        // is arbitrary and `max()`-ing `feedback_time` across them is
         // meaningless: when the client series runs ahead, flooring on it
         // drags `feedback_time` into the client's epoch while `send_time`
         // stays in the server's, so goog_cc computes `feedback_rtt` as the
         // epoch offset instead of a real RTT. That trips `RttBasedBackoff`'s
         // 3s limit continuously, drives `LinkCapacityTracker::capacity_estimate_bps`
         // negative, and panics inside `DataRate::from_bits_per_sec_float`'s
-        // `value >= 0.0` assertion. Everything else in the controller
-        // consumes `receive_time` only as recv-minus-recv differences, so
-        // the client epoch cancels naturally without needing to be floored
-        // against anything here.
+        // `value >= 0.0` assertion. Millisecond resolution is fine for this
+        // floor specifically -- it only needs to be *no earlier* than the
+        // batch's last send, not exact -- unlike the per-packet
+        // `send_time`/`receive_time` pair below.
+        //
+        // Those per-packet timestamps ARE full microsecond precision, and
+        // that precision is essential, not cosmetic: `server_emit_us` and
+        // `client_arrival_us` are both already monotonic microseconds by
+        // the time they reach here. Rounding either down to milliseconds
+        // before building `SentPacket`/`PacketResult` was the bug this
+        // whole change exists to fix -- a probe cluster drained in one
+        // scheduler tick lands inside a single millisecond, so
+        // `last_send - first_send` reads as exactly zero and goog_cc
+        // rejects the whole cluster outright ("invalid send/receive
+        // interval"). Fixing only the receive side was measured and made
+        // things *worse* (net successes 23 -> 15): goog_cc's
+        // receive/send ratio guard needs both sides precise, or a
+        // millisecond-quantized `send_time` against a precise
+        // `receive_time` produces an equally degenerate ratio. Everything
+        // else in the controller consumes `receive_time` only as
+        // recv-minus-recv differences, so the client epoch cancels
+        // naturally without needing to be floored against anything here.
         let mut feedback_time = self.to_timestamp(now);
         // Safe to initialize from the first record's send_ms: `records` was
         // checked non-empty above.
@@ -218,11 +231,12 @@ impl GoogCcDriver {
         let mut last_derived = Duration::ZERO;
         for r in records {
             let send_ms = (r.server_emit_us / 1_000) as i64;
-            let recv_ms = self.arrival_time.unwrap_ms(r.client_arrival_ms_lo16) as i64;
+            let send_us = r.server_emit_us as i64;
+            let recv_us = r.client_arrival_us as i64;
             send_ms_max = send_ms_max.max(send_ms);
-            last_derived = Duration::from_millis((recv_ms - send_ms).max(0) as u64);
+            last_derived = Duration::from_micros((recv_us - send_us).max(0) as u64);
             let sent = SentPacket {
-                send_time: Timestamp::from_millis(send_ms),
+                send_time: Timestamp::from_micros(send_us),
                 size: DataSize::from_bytes(r.size_bytes as i64),
                 // BWE Stage 2.4: tag this `SentPacket` as a probe packet
                 // iff the pass it came from was tagged at emit time. See
@@ -237,7 +251,7 @@ impl GoogCcDriver {
             self.ctl.0.on_sent_packet(sent);
             packet_feedbacks.push(PacketResult {
                 sent_packet: sent,
-                receive_time: Timestamp::from_millis(recv_ms),
+                receive_time: Timestamp::from_micros(recv_us),
                 ..Default::default()
             });
         }
@@ -452,8 +466,8 @@ mod tests {
                     AckArrival {
                         wire_seq: step * 12 + i,
                         server_emit_us: emit_us,
-                        // 15 ms one-way delay, constant.
-                        client_arrival_ms_lo16: ((emit_us / 1_000 + 15) & 0xFFFF) as u16,
+                        // 15 ms one-way delay, constant, in real microseconds.
+                        client_arrival_us: emit_us + 15_000,
                         size_bytes: 1200,
                         probe: None,
                     }
@@ -479,15 +493,17 @@ mod tests {
         );
     }
 
-    /// The client's arrival clock is a completely independent epoch — in the
-    /// browser it is `performance.now() & 0xFFFF`, anchored at page load. The
-    /// driver must be immune to that offset. Flooring `feedback_time` with a
-    /// client-epoch value instead makes goog_cc read the offset as an RTT,
-    /// trips its 3 s RttBasedBackoff, drives the link-capacity estimate
-    /// negative, and panics inside the bridge task.
+    /// The client's arrival clock is a completely independent epoch —
+    /// unwrapped onto its own monotonic timeline by `IoBridge::arrival_timeline`
+    /// before it ever reaches this driver, with no relationship to the
+    /// server's `bwe_epoch`. The driver must be immune to that offset.
+    /// Flooring `feedback_time` with a client-epoch value instead makes
+    /// goog_cc read the offset as an RTT, trips its 3 s RttBasedBackoff,
+    /// drives the link-capacity estimate negative, and panics inside the
+    /// bridge task.
     #[test]
     fn an_independently_epoched_client_clock_does_not_panic() {
-        for offset_ms in [0u64, 3_000, 10_000, 40_000] {
+        for offset_us in [0u64, 3_000_000, 10_000_000, 40_000_000] {
             let t0 = Instant::now();
             let mut d = GoogCcDriver::new(4_000_000, t0);
             for step in 0..400u32 {
@@ -495,11 +511,11 @@ mod tests {
                     .map(|i| {
                         let emit_us = ((step * 20 + i) as u64) * 1_000;
                         // Constant 15 ms one-way delay; only the epoch differs.
-                        let arrival_ms = emit_us / 1_000 + 15 + offset_ms;
+                        let arrival_us = emit_us + 15_000 + offset_us;
                         AckArrival {
                             wire_seq: step * 12 + i,
                             server_emit_us: emit_us,
-                            client_arrival_ms_lo16: (arrival_ms & 0xFFFF) as u16,
+                            client_arrival_us: arrival_us,
                             size_bytes: 1200,
                             probe: None,
                         }
@@ -512,7 +528,7 @@ mod tests {
                 );
             }
             let bps = d.snapshot().bitrate_bps;
-            assert!(bps > 0, "offset {offset_ms} ms produced no estimate");
+            assert!(bps > 0, "offset {offset_us} us produced no estimate");
         }
     }
 
@@ -577,7 +593,7 @@ mod tests {
                 AckArrival {
                     wire_seq: i,
                     server_emit_us: emit_us,
-                    client_arrival_ms_lo16: ((emit_us / 1_000 + 15) & 0xFFFF) as u16,
+                    client_arrival_us: emit_us + 15_000,
                     size_bytes: 1200,
                     probe: None,
                 }
@@ -674,7 +690,7 @@ mod tests {
         let records = vec![AckArrival {
             wire_seq: 1,
             server_emit_us: 0,
-            client_arrival_ms_lo16: 15,
+            client_arrival_us: 15_000,
             size_bytes: 1200,
             probe: Some(tag),
         }];

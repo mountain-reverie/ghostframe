@@ -339,7 +339,7 @@ const LATENCY_BUCKET_BOUNDS_MS: [u64; 7] = [5, 10, 20, 50, 100, 200, 500];
 /// `run()` from `received_at - server_emit_us` — both timestamps are on
 /// the server's own monotonic clock, so this is an emit-to-ACK-receipt
 /// round trip, not a one-way delay. See that call site's comment for why
-/// `client_arrival_ms_lo16` (the client-clock field) is not used here.
+/// `client_arrival_us` (the client-clock field) is not used here.
 ///
 /// Cumulative since bridge construction, mirroring `bytes_emitted_critical`
 /// / `bytes_emitted_refinement` — never reset, so the periodic log's values
@@ -779,6 +779,10 @@ pub struct IoBridge {
     /// load excess samples are dropped (the consumer doesn't need
     /// every single sample for a useful estimate).
     bwe_samples_buffer: Vec<BweSample>,
+    /// Unwraps the client's 32-bit microsecond arrival series onto a
+    /// monotonic timeline. One instance per series -- never share this with
+    /// any other timestamp stream.
+    arrival_timeline: crate::transport::bwe::timeline::Lo32Timeline,
     /// Bandwidth-estimator wrapper. Phase 1: runs in PASSIVE mode — we
     /// feed it ACK arrivals and read its estimate for the periodic log,
     /// but the estimate doesn't drive emission yet. Phase 2 will plug
@@ -902,12 +906,14 @@ pub struct IoBridge {
 }
 
 /// One-way-delay sample observed at ACK time. Used as input to the
-/// per-tier latency histograms and the goog_cc estimator. All timestamps
-/// are u16 wall-clock-ms wrapped; the consumer looks at *relative* deltas,
+/// per-tier latency histograms and the goog_cc estimator. `client_arrival_us`
+/// and `owd_us` are full-precision microseconds on monotonic timelines (the
+/// former already unwrapped from the wire's wrapped 32-bit field by
+/// `IoBridge::arrival_timeline`); the consumer looks at *relative* deltas,
 /// so clock skew is fine.
 ///
 /// `tier` and `received_at` are consumed at the drain site (`run()`) to
-/// accumulate `TierLatencyStats` (BWE Stage 2.0). `owd_ms_lo16` is still
+/// accumulate `TierLatencyStats` (BWE Stage 2.0). `owd_us` is still
 /// staged for the Phase 2 controller's delay-gradient input and not read
 /// anywhere yet; kept in the struct so the layout is stable across the
 /// Phase 1 → 2 handoff, hence the remaining `allow(dead_code)`.
@@ -931,13 +937,16 @@ struct BweSample {
     /// exactly once. Feeds `queued_at -> ACK` (BWE Stage 2.1), the
     /// interval scheduler prioritisation actually shortens.
     queued_since_epoch_us: u64,
-    /// Low 16 bits of the client's receive time in ms, echoed back via
-    /// the ACK envelope's `arrival_time_ms_lo16`.
-    client_arrival_ms_lo16: u16,
-    /// Modular u16 subtraction of arrival - emit. *Delta-of-deltas* input
-    /// to delay-gradient estimation; the absolute value is meaningless
-    /// because of clock skew.
-    owd_ms_lo16: u16,
+    /// Client's receive time in microseconds, unwrapped from the ACK
+    /// envelope's wrapped 32-bit `arrival_us` by `IoBridge::arrival_timeline`
+    /// onto a monotonic timeline.
+    client_arrival_us: u64,
+    /// Wrapping subtraction of arrival - emit, both already full-precision
+    /// microseconds on their own monotonic timelines. Kept wrapping because
+    /// the two clocks have unrelated epochs, so the absolute value is
+    /// meaningless -- only deltas-of-deltas matter. *Delta-of-deltas* input
+    /// to delay-gradient estimation.
+    owd_us: u64,
     /// Wire size of this datagram in bytes, summed over its fragments.
     size_bytes: u32,
     /// Probe cluster this pass was tagged with at emit time (BWE Stage
@@ -1228,6 +1237,7 @@ impl IoBridge {
                 now_std(),
             ),
             bwe_samples_buffer: Vec::with_capacity(BWE_SAMPLES_BUFFER_CAPACITY),
+            arrival_timeline: crate::transport::bwe::timeline::Lo32Timeline::default(),
             bwe: crate::transport::bwe::BweWrapper::new(
                 crate::transport::bwe::BweWrapper::INITIAL_BPS,
                 now_std(),
@@ -2635,7 +2645,7 @@ impl IoBridge {
             if let Ok(batch) = crate::transport::ack::AckBatch::decode(data) {
                 tracing::info!(
                     target: "ghostframe::cdf53",
-                    entry_count = batch.entries.len(),
+                    entry_count = batch.entries().len(),
                     "ack_batch_received"
                 );
                 // Route every ACKed key into the reliable-tile emitter as
@@ -2649,18 +2659,22 @@ impl IoBridge {
                 // on_ack removes the cache entries. The cache lookup below
                 // recovers the server's emit time from `CacheEntry::last_sent_at`
                 // (monotonic µs since `self.bwe_epoch`) and pairs it with the
-                // client's echoed arrival_time_ms_lo16 (u16 wall-clock-ms
-                // wrapped). Reading `last_sent_at` rather than the stamp
-                // baked into the cached datagram bytes matters on retransmit:
-                // `ReliableEmitter::tick` re-stamps the *copy* it re-sends but
-                // updates `last_sent_at` on the cache entry itself, so this is
-                // the only place that reflects the actual on-wire moment for a
-                // retransmitted pass. The BWE consumer uses relative deltas
-                // only, so clock skew is acceptable. Cache misses are silent
-                // (already ACKed by an overlapping batch, or RTO-evicted).
+                // client's echoed `arrival_us` (wrapped 32-bit microseconds),
+                // unwrapped onto a monotonic timeline by `self.arrival_timeline`
+                // before use -- see `entries()`'s doc comment on why every
+                // entry, fresh or overlap, is a plain wrapped value by the
+                // time it reaches here. Reading `last_sent_at` rather than the
+                // stamp baked into the cached datagram bytes matters on
+                // retransmit: `ReliableEmitter::tick` re-stamps the *copy* it
+                // re-sends but updates `last_sent_at` on the cache entry
+                // itself, so this is the only place that reflects the actual
+                // on-wire moment for a retransmitted pass. The BWE consumer
+                // uses relative deltas only, so clock skew is acceptable.
+                // Cache misses are silent (already ACKed by an overlapping
+                // batch, or RTO-evicted).
                 let now_for_samples = now_std();
                 let emit_keys: Vec<crate::transport::reliable_emitter::EmitKey> = batch
-                    .entries
+                    .entries()
                     .iter()
                     .map(|e| {
                         crate::transport::reliable_emitter::EmitKey::new(
@@ -2672,7 +2686,7 @@ impl IoBridge {
                     })
                     .collect();
                 // Extract BweSamples while the cache entries are still live.
-                for (emit_key, e) in emit_keys.iter().zip(batch.entries.iter()) {
+                for (emit_key, e) in emit_keys.iter().zip(batch.entries().iter()) {
                     if self.bwe_samples_buffer.len() < BWE_SAMPLES_BUFFER_CAPACITY {
                         let cache_entry = self.reliable_emitter.cache.get(emit_key);
                         let Some(entry) = cache_entry else {
@@ -2691,10 +2705,23 @@ impl IoBridge {
                             .queued_at
                             .saturating_duration_since(self.bwe_epoch)
                             .as_micros() as u64;
-                        let arrival_lo16 = e.arrival_time_ms_lo16;
+                        // Every entry -- fresh or overlap -- reaches `entries()`
+                        // as a plain wrapped 32-bit value (the decoder already
+                        // reconstructed fresh entries as base + delta), so a
+                        // single timeline unwraps them all, in iteration
+                        // order. `arrival_timeline` is one instance per
+                        // series -- never share it with any other timestamp
+                        // stream.
+                        let client_arrival_us = self.arrival_timeline.unwrap_us(e.arrival_us);
                         let tier = pass_tier(e.pass_idx);
-                        let emit_lo16 = ((server_emit_us / 1000) & 0xFFFF) as u16;
-                        let owd_ms_lo16 = arrival_lo16.wrapping_sub(emit_lo16);
+                        // Both operands are now full-precision microseconds
+                        // on monotonic timelines, but the two clocks have
+                        // unrelated epochs, so the absolute value here is
+                        // meaningless -- only deltas-of-deltas matter. Kept
+                        // wrapping so a caller comparing two `owd_us`
+                        // samples still sees a well-defined (if arbitrary)
+                        // delta rather than a panic on underflow.
+                        let owd_us = client_arrival_us.wrapping_sub(server_emit_us);
                         // BWE Stage 2.4: carry the probe tag (if any)
                         // through to the sample, same pattern as
                         // `queued_since_epoch_us` above.
@@ -2703,8 +2730,8 @@ impl IoBridge {
                             tier,
                             server_emit_us,
                             queued_since_epoch_us,
-                            client_arrival_ms_lo16: arrival_lo16,
-                            owd_ms_lo16,
+                            client_arrival_us,
+                            owd_us,
                             size_bytes,
                             probe,
                             received_at: now_for_samples,
@@ -2712,7 +2739,7 @@ impl IoBridge {
                     }
                 }
                 self.reliable_emitter.on_ack(&emit_keys);
-                for e in batch.entries {
+                for e in batch.entries() {
                     // Key matches how coverage is recorded at emit time:
                     // (frame_seq, tile_x, tile_y, pass_idx).
                     let key = (e.frame_seq, e.tile_x, e.tile_y, e.pass_idx);
@@ -4721,7 +4748,7 @@ impl IoBridge {
                 // round trip, not a one-way delay — deliberately: pacing
                 // (Stage 2) reduces queueing delay for critical passes, and
                 // this round trip is what surfaces that. Do NOT substitute
-                // `client_arrival_ms_lo16` here — it's on the client's clock
+                // `client_arrival_us` here — it's on the client's clock
                 // with an unknown epoch, which is exactly what
                 // `implausible_rtt_samples` (Stage 1) exists to detect.
                 for s in self.bwe_samples_buffer.drain(..) {
@@ -4752,10 +4779,17 @@ impl IoBridge {
                             .record(queued_latency_us),
                     }
                     records.push(AckArrival {
-                        wire_seq: (((s.server_emit_us / 1000) as u32) << 16)
-                            | (s.client_arrival_ms_lo16 as u32),
+                        // Phase 1 placeholder, still not read by anything
+                        // outside goog_cc's driver's own tests -- see
+                        // `AckArrival::wire_seq`'s doc comment. Rederived
+                        // from the low 16 bits of each now-microsecond
+                        // field rather than the old millisecond ones; a
+                        // stable per-sample identifier is all this needs
+                        // to be.
+                        wire_seq: (((s.server_emit_us & 0xFFFF) as u32) << 16)
+                            | ((s.client_arrival_us & 0xFFFF) as u32),
                         server_emit_us: s.server_emit_us,
-                        client_arrival_ms_lo16: s.client_arrival_ms_lo16,
+                        client_arrival_us: s.client_arrival_us,
                         size_bytes: s.size_bytes,
                         probe: s.probe,
                     });
@@ -5344,6 +5378,7 @@ impl IoBridge {
                 now_std(),
             ),
             bwe_samples_buffer: Vec::with_capacity(BWE_SAMPLES_BUFFER_CAPACITY),
+            arrival_timeline: crate::transport::bwe::timeline::Lo32Timeline::default(),
             bwe: crate::transport::bwe::BweWrapper::new(
                 crate::transport::bwe::BweWrapper::INITIAL_BPS,
                 now_std(),
@@ -6306,15 +6341,17 @@ mod tests {
         // Key: (frame_seq=100, tile_x=7, tile_y=9, pass_idx=0)
         bridge.fragment_coverage.record((100, 7, 9, 0), cov);
 
-        let batch = crate::transport::ack::AckBatch {
-            entries: vec![crate::transport::ack::AckEntry {
+        let batch = crate::transport::ack::AckBatch::new(
+            vec![crate::transport::ack::AckEntry {
                 frame_seq: 100,
                 tile_x: 7,
                 tile_y: 9,
                 pass_idx: 0,
-                arrival_time_ms_lo16: 0,
+                arrival_us: 0,
             }],
-        };
+            vec![],
+        )
+        .unwrap();
         bridge.dispatch_ack_datagram(&batch.encode());
 
         assert_eq!(
@@ -6330,18 +6367,93 @@ mod tests {
         let server = QuicServer::new().expect("server");
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
         let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
-        let batch = crate::transport::ack::AckBatch {
-            entries: vec![crate::transport::ack::AckEntry {
+        let batch = crate::transport::ack::AckBatch::new(
+            vec![crate::transport::ack::AckEntry {
                 frame_seq: 999,
                 tile_x: 9,
                 tile_y: 5,
                 pass_idx: 3,
-                arrival_time_ms_lo16: 0,
+                arrival_us: 0,
             }],
-        };
+            vec![],
+        )
+        .unwrap();
         // Should not panic, should not modify any state.
         bridge.dispatch_ack_datagram(&batch.encode());
         assert_eq!(bridge.scheduler.cdf53_passes_acked_for_test(0, 0, 0), 0,);
+    }
+
+    /// The wire-format bug this whole change exists to fix: sub-millisecond
+    /// arrival spacing was unrepresentable in the old u16-milliseconds
+    /// arrival field, so a probe cluster arriving microseconds apart
+    /// collapsed to a near-zero or zero-length receive interval once
+    /// floored to whole milliseconds -- exactly the "invalid interval"
+    /// rejection this format exists to end. Proves two ACK entries 1,500us
+    /// apart reach `bwe_samples_buffer` -- and from there,
+    /// `AckArrival::client_arrival_us` -- through the real
+    /// `dispatch_ack_datagram` entry point with their separation intact,
+    /// unwrapped by `self.arrival_timeline` in `entries()` iteration order.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sub_millisecond_ack_arrivals_reach_the_estimator_distinct() {
+        use crate::transport::ack::{AckBatch, AckEntry};
+        use crate::transport::reliable_emitter::EmitKey;
+
+        let (our_end, _peer) = UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("server");
+        let mut bridge = IoBridge::new_with_stream_for_test(our_end, server);
+
+        for frame_seq in [10u32, 11u32] {
+            let key = EmitKey::new(frame_seq, 0, 0, 0);
+            bridge.reliable_emitter.submit_one(
+                key,
+                bytes::Bytes::from(vec![0u8; 20]),
+                std::time::Instant::now(),
+                None,
+                std::time::Instant::now(),
+            );
+        }
+
+        let base_arrival_us: u32 = 1_000_000;
+        let batch = AckBatch::new(
+            vec![
+                AckEntry {
+                    frame_seq: 10,
+                    tile_x: 0,
+                    tile_y: 0,
+                    pass_idx: 0,
+                    arrival_us: base_arrival_us,
+                },
+                AckEntry {
+                    frame_seq: 11,
+                    tile_x: 0,
+                    tile_y: 0,
+                    pass_idx: 0,
+                    // 500us later. Genuinely sub-millisecond: floored to
+                    // whole milliseconds both arrivals land in bucket 1000,
+                    // so the old wire format could not tell them apart at
+                    // all and reported an interval of exactly zero -- which
+                    // goog_cc rejects outright as an invalid probe cluster.
+                    arrival_us: base_arrival_us + 500,
+                },
+            ],
+            vec![],
+        )
+        .expect("valid ack batch");
+        bridge.dispatch_ack_datagram(&batch.encode());
+
+        assert_eq!(bridge.bwe_samples_buffer.len(), 2);
+        let a0 = bridge.bwe_samples_buffer[0].client_arrival_us;
+        let a1 = bridge.bwe_samples_buffer[1].client_arrival_us;
+        assert_eq!(
+            a1 - a0,
+            500,
+            "sub-millisecond arrival spacing must survive unwrapping \
+             intact. Both of these floor to millisecond bucket 1000, so the \
+             old field reported them as simultaneous -- and a probe cluster \
+             whose first and last arrival are simultaneous is rejected by \
+             goog_cc as an invalid interval, which is 66 of the 121 \
+             rejections this wire format exists to remove"
+        );
     }
 
     /// dispatch_ack_datagram silently ignores datagrams whose first byte
@@ -6412,15 +6524,17 @@ mod tests {
             None,
             std::time::Instant::now(),
         );
-        let ack_env = crate::transport::ack::AckBatch {
-            entries: vec![crate::transport::ack::AckEntry {
+        let ack_env = crate::transport::ack::AckBatch::new(
+            vec![crate::transport::ack::AckEntry {
                 frame_seq: 1,
                 tile_x: 0,
                 tile_y: 0,
                 pass_idx: 0,
-                arrival_time_ms_lo16: 0,
+                arrival_us: 0,
             }],
-        };
+            vec![],
+        )
+        .unwrap();
         bridge.dispatch_ack_datagram(&ack_env.encode());
         assert_eq!(bridge.reliable_emitter.stats.ack_hit, 1);
         assert!(bridge.reliable_emitter.cache.get(&key).is_none());
@@ -6904,15 +7018,17 @@ mod tests {
         // Key: (frame_seq=200, tile_x=0, tile_y=0, pass_idx=0)
         bridge.fragment_coverage.record((200, 0, 0, 0), cov);
 
-        let batch = crate::transport::ack::AckBatch {
-            entries: vec![crate::transport::ack::AckEntry {
+        let batch = crate::transport::ack::AckBatch::new(
+            vec![crate::transport::ack::AckEntry {
                 frame_seq: 200,
                 tile_x: 0,
                 tile_y: 0,
                 pass_idx: 0,
-                arrival_time_ms_lo16: 0,
+                arrival_us: 0,
             }],
-        };
+            vec![],
+        )
+        .unwrap();
         bridge.dispatch_ack_datagram(&batch.encode());
 
         assert!(bridge.palette_table.delivered.contains(7));
@@ -6949,15 +7065,17 @@ mod tests {
         // Key: (frame_seq=201, tile_x=0, tile_y=0, pass_idx=0)
         bridge.fragment_coverage.record((201, 0, 0, 0), cov);
 
-        let batch = crate::transport::ack::AckBatch {
-            entries: vec![crate::transport::ack::AckEntry {
+        let batch = crate::transport::ack::AckBatch::new(
+            vec![crate::transport::ack::AckEntry {
                 frame_seq: 201,
                 tile_x: 0,
                 tile_y: 0,
                 pass_idx: 0,
-                arrival_time_ms_lo16: 0,
+                arrival_us: 0,
             }],
-        };
+            vec![],
+        )
+        .unwrap();
         bridge.dispatch_ack_datagram(&batch.encode());
 
         assert_eq!(
@@ -7800,10 +7918,11 @@ mod tests {
                     tile_x: 1,
                     tile_y: 2,
                     pass_idx: 0,
-                    arrival_time_ms_lo16: 1_500,
+                    // 15 ms one-way delay, in real microseconds.
+                    arrival_us: 15_000,
                 });
             }
-            let batch = AckBatch { entries };
+            let batch = AckBatch::new(entries, vec![]).expect("valid ack batch");
             // Real production entry point for inbound ACK_BATCH datagrams.
             bridge.dispatch_ack_datagram(&batch.encode());
 

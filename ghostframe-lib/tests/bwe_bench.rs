@@ -47,11 +47,11 @@ fn run(steps: u32, capacity_bps: impl Fn(u32) -> u64) -> Vec<u64> {
             let start_us = queue_free_us.max(send_us);
             let arrive_us = start_us + serial_us;
             queue_free_us = arrive_us;
-            let arrival_ms = arrive_us / 1_000 + 15; // + propagation
+            let arrival_us = arrive_us + 15_000; // + propagation
             batch.push(AckArrival {
                 wire_seq: step * 1_000 + i as u32,
                 server_emit_us: send_us,
-                client_arrival_ms_lo16: (arrival_ms & 0xFFFF) as u16,
+                client_arrival_us: arrival_us,
                 size_bytes: PKT_BYTES,
                 probe: None,
             });
@@ -109,7 +109,7 @@ fn real_pacer_rate_bps() -> u64 {
                 AckArrival {
                     wire_seq: step * 12 + i,
                     server_emit_us: emit_us,
-                    client_arrival_ms_lo16: ((emit_us / 1_000 + 15) & 0xFFFF) as u16,
+                    client_arrival_us: emit_us + 15_000,
                     size_bytes: PKT_BYTES,
                     probe: None,
                 }
@@ -198,7 +198,7 @@ fn pacing_mode_reaches_paced_after_enough_real_feedback() {
                 AckArrival {
                     wire_seq: step * 12 + i,
                     server_emit_us: emit_us,
-                    client_arrival_ms_lo16: ((emit_us / 1_000 + 15) & 0xFFFF) as u16,
+                    client_arrival_us: emit_us + 15_000,
                     size_bytes: PKT_BYTES,
                     probe: None,
                 }
@@ -219,16 +219,21 @@ fn pacing_mode_reaches_paced_after_enough_real_feedback() {
     );
 }
 
+/// Long-duration stability check. This used to also prove the arrival
+/// series survived wrapping across the driver's own (now-removed)
+/// `Lo16Timeline`; unwrapping is no longer the driver's job at all —
+/// `AckArrival::client_arrival_us` arrives pre-unwrapped from
+/// `IoBridge::arrival_timeline` (`Lo32Timeline`, tested directly in
+/// `timeline.rs`). What's still worth proving here is that the estimator
+/// itself stays well-behaved over many ticks (4000 x 20ms = 80s) rather
+/// than drifting or collapsing.
 #[test]
-fn estimate_survives_a_timestamp_wrap() {
-    // The client arrival series is 16-bit ms and wraps every 65_536 ms;
-    // 4000 ticks x 20 ms crosses that boundary more than once. Without
-    // unwrapping, each wrap poisons the delay gradient.
+fn estimate_stays_healthy_over_a_long_running_session() {
     let series = run(4_000, |_| 3_000_000);
     let final_bps = *series.last().unwrap();
     assert!(
         final_bps > 1_000_000,
-        "estimate {final_bps} collapsed across a timestamp wrap"
+        "estimate {final_bps} collapsed over a long-running session"
     );
 }
 
@@ -267,7 +272,7 @@ fn request_a_real_probe(seed_bps: u64) -> (BweWrapper, Instant, ProbeRequest) {
     let seed_batch = vec![AckArrival {
         wire_seq: 0,
         server_emit_us: 0,
-        client_arrival_ms_lo16: 15,
+        client_arrival_us: 15_000,
         size_bytes: PKT_BYTES,
         probe: None,
     }];
@@ -298,11 +303,11 @@ fn tagged_probe_packet(
     bytes_sent_before: i64,
 ) -> AckArrival {
     let send_us = 100_000 + (i as u64) * 1_000;
-    let arrival_ms = send_us / 1_000 + 10 + i as u64;
+    let arrival_us = send_us + 10_000 + (i as u64) * 1_000;
     AckArrival {
         wire_seq: 1_000 + i,
         server_emit_us: send_us,
-        client_arrival_ms_lo16: (arrival_ms & 0xFFFF) as u16,
+        client_arrival_us: arrival_us,
         size_bytes: pkt_bytes,
         probe: Some(ProbeTag {
             id: req.id,
@@ -551,7 +556,7 @@ fn untagged_traffic_tracks_normally_around_a_pending_probe() {
                 AckArrival {
                     wire_seq: step * 12 + i,
                     server_emit_us: emit_us,
-                    client_arrival_ms_lo16: ((emit_us / 1_000 + 15) & 0xFFFF) as u16,
+                    client_arrival_us: emit_us + 15_000,
                     size_bytes: PKT_BYTES,
                     probe: None,
                 }
