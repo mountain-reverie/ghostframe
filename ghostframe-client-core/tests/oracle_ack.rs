@@ -1,13 +1,15 @@
 use ghostframe_client_core::ack_batcher::AckBatcher;
-use ghostframe_protocol::ack::{AckBatch, AckEntry, ACK_ENTRY_SIZE, ACK_OVERLAP_COUNT};
+use ghostframe_protocol::ack::{
+    AckBatch, AckEntry, ACK_FRESH_ENTRY_SIZE, ACK_HEADER_SIZE, ACK_OVERLAP_COUNT,
+};
 
-fn e(frame_seq: u32, tile_x: u8, tile_y: u8, pass_idx: u8, ts: u16) -> AckEntry {
+fn e(frame_seq: u32, tile_x: u8, tile_y: u8, pass_idx: u8, ts: u32) -> AckEntry {
     AckEntry {
         frame_seq,
         tile_x,
         tile_y,
         pass_idx,
-        arrival_time_ms_lo16: ts,
+        arrival_us: ts,
     }
 }
 
@@ -16,11 +18,11 @@ fn encodes_msg_type_and_fields() {
     let mut b = AckBatcher::new();
     assert!(b.add(e(0x12345678, 3, 7, 13, 0), 0).is_none());
     let d = b.flush().unwrap();
-    assert_eq!(d[0], 0x04);
+    assert_eq!(d[0], 0x06);
     assert_eq!(d[1], 1);
-    assert_eq!(&d[2..6], &[0x78, 0x56, 0x34, 0x12]); // LE
-    assert_eq!((d[6], d[7], d[8]), (3, 7, 13));
-    assert_eq!(&d[9..11], &[0, 0]);
+    assert_eq!(&d[7..11], &[0x78, 0x56, 0x34, 0x12]); // frame_seq LE
+    assert_eq!((d[11], d[12], d[13]), (3, 7, 13)); // tile_x, tile_y, pass_idx
+    assert_eq!(&d[14..16], &[0, 0]); // arrival_delta_us
 }
 
 #[test]
@@ -34,7 +36,7 @@ fn flushes_at_max_entries_without_timer() {
     }
     let d = sent.expect("64th add flushes");
     assert_eq!(d[1], 64);
-    assert_eq!(d.len(), 2 + 64 * ACK_ENTRY_SIZE);
+    assert_eq!(d.len(), ACK_HEADER_SIZE + 64 * ACK_FRESH_ENTRY_SIZE);
 }
 
 #[test]
@@ -48,10 +50,12 @@ fn overlap_appends_up_to_eight_prior_entries() {
         b.add(e(100 + i, 0, 0, 0, 0), 0);
     }
     let d = b.flush().unwrap();
-    let count = d[1] as usize;
-    assert_eq!(count, 3 + 5.min(ACK_OVERLAP_COUNT)); // 3 fresh + 5 overlap
+    let count_fresh = d[1] as usize;
+    let count_overlap = d[2] as usize;
+    assert_eq!(count_fresh, 3);
+    assert_eq!(count_overlap, 5.min(ACK_OVERLAP_COUNT)); // 3 fresh + up to 5 overlap
     let batch = AckBatch::decode(&d).unwrap();
-    assert_eq!(batch.entries[0].frame_seq, 100); // fresh first
+    assert_eq!(batch.entries()[0].frame_seq, 100); // fresh first
 }
 
 #[test]
@@ -66,15 +70,15 @@ fn timer_flush_after_5ms() {
 }
 
 #[test]
-fn round_trips_arrival_time_ms_lo16() {
+fn round_trips_arrival_us() {
     let mut b = AckBatcher::new();
     b.add(e(0x12345678, 7, 9, 3, 0xABCD), 0);
     let d = b.flush().unwrap();
     let batch = AckBatch::decode(&d).unwrap();
-    assert_eq!(batch.entries.len(), 1);
-    assert_eq!(batch.entries[0].arrival_time_ms_lo16, 0xABCD);
-    assert_eq!(batch.entries[0].frame_seq, 0x12345678);
-    assert_eq!(batch.entries[0].pass_idx, 3);
+    assert_eq!(batch.entries().len(), 1);
+    assert_eq!(batch.entries()[0].arrival_us, 0xABCD);
+    assert_eq!(batch.entries()[0].frame_seq, 0x12345678);
+    assert_eq!(batch.entries()[0].pass_idx, 3);
 }
 
 #[test]
@@ -93,11 +97,11 @@ fn caps_overlap_at_eight_after_twenty_single_entry_flushes() {
     b.add(e(100, 1, 2, 3, 0), 0);
     let d = b.flush().unwrap();
     let batch = AckBatch::decode(&d).unwrap();
-    assert_eq!(batch.entries.len(), 1 + ACK_OVERLAP_COUNT);
-    assert_eq!(batch.entries[0], e(100, 1, 2, 3, 0));
+    assert_eq!(batch.entries().len(), 1 + ACK_OVERLAP_COUNT);
+    assert_eq!(batch.entries()[0], e(100, 1, 2, 3, 0));
     for k in 0..ACK_OVERLAP_COUNT {
         let expected_frame_seq = 20 - ACK_OVERLAP_COUNT as u32 + k as u32;
-        assert_eq!(batch.entries[1 + k].frame_seq, expected_frame_seq);
+        assert_eq!(batch.entries()[1 + k].frame_seq, expected_frame_seq);
     }
 }
 
@@ -107,7 +111,7 @@ fn no_overlap_on_very_first_batch() {
     b.add(e(42, 1, 2, 3, 0), 0);
     let d = b.flush().unwrap();
     let batch = AckBatch::decode(&d).unwrap();
-    assert_eq!(batch.entries.len(), 1);
+    assert_eq!(batch.entries().len(), 1);
 }
 
 #[test]
