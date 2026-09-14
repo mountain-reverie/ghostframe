@@ -156,3 +156,75 @@ Stated here because they were nearly written into a spec as findings.
   a misread of a sparsely sampled series. One run reached 2.1 Mbps and held it.
 - ~~"Capping the ACK path depresses the estimate."~~ Refuted by experiment:
   identical results with the return path capped and uncapped.
+
+---
+
+## Attempt (2026-09-14): fixing the ramp via periodic probing — and why it fails
+
+The open gap above is blocked on the ramp, and the ramp is blocked on goog_cc
+rarely asking to probe at a rate the link can answer. This is what happened
+when that was attacked directly. **Nothing from this attempt was kept**; it is
+recorded because the negative results are load-bearing for whatever is tried
+next.
+
+### What was tried
+
+`ProbeController` has a periodic probing path — `time_for_network_state_probe`
+— that fires whenever the estimate sits below a known link capacity. It is
+disabled twice over by default: `network_state_interval` is
+`TimeDelta::plus_infinity()`, and it requires a `NetworkStateEstimate` that
+nothing supplies. Both are reachable through
+`NetworkControllerConfig::field_trials.probing_configuration`.
+
+Both were set: a finite 2 s interval, and a `link_capacity_upper` measured from
+delivered bytes over a 1 s window — an observation, not a prediction.
+
+### It works, and it does not help
+
+Probing frequency tripled and stayed there: **completed clusters went from 1 to
+3 per scene**, reproducibly across four runs.
+
+The ramp did not move. Tail estimates were 277k, 223k, 215k, 207k against a
+baseline of 223k, 231k, 210k, 208k — noise. Post-step maxima were comparable.
+
+And it costs: on the congested scene, loss rose from 33,839 to 37,305 bytes
+(~10%) from the extra probe traffic, with the estimate unchanged at its floor.
+Measurable cost, no measurable benefit, so it was reverted.
+
+### The circularity, confirmed by measurement
+
+Retrying the source-rate bucket *together with* periodic probing — on the
+theory that the two gaps were mutually blocking and might only close together
+— produced **548,610 bytes on the RTT guard, against 548,602 without probing**.
+Identical.
+
+The reason was written into the signal's own doc comment before it was tested,
+and the measurement confirmed it. With the source bucket on, emission is
+limited to the estimate, so observed throughput collapses onto the estimate,
+so `estimated_bitrate < link_capacity_upper` is never true, so no probe ever
+fires. **A capacity signal derived from our own throughput cannot drive a ramp
+whose purpose is to raise the limit on that throughput.**
+
+### What this leaves
+
+The two gaps are genuinely coupled:
+
+- The source cannot be held at `target_rate` until the estimate reaches
+  capacity quickly.
+- The estimate cannot reach capacity quickly while sustained loss from
+  emitting above capacity suppresses it.
+
+Breaking that needs a capacity signal **independent of our own emission**.
+Candidates not yet explored:
+
+- **quinn's own congestion controller.** It runs Cubic or BBR over the same
+  path with an independent algorithm, and `PathStats` is already read for RTT.
+  If it exposes a bandwidth or congestion-window figure, that is a genuinely
+  independent second opinion.
+- **goog_cc's internal link-capacity tracker**, which `stable_target_rate`
+  already reflects (`min(link_capacity_estimate, pushback_target_rate)`) — it
+  is derived from probe results rather than from offered load.
+- **A real `NetworkStateEstimator`**, which is what libwebrtc supplies here and
+  is a substantial component in its own right.
+
+The first is the cheapest to test and the most likely to break the circle.
