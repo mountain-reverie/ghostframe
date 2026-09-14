@@ -111,6 +111,17 @@ pub enum AckDecodeError {
     Empty,
     #[error("ack batch wrong length: got {got} bytes, need exactly {want}")]
     WrongLength { got: usize, want: usize },
+    /// The wire bytes parsed structurally (right message type, counts
+    /// within cap, right length), but the resulting batch fails the same
+    /// invariants `AckBatch::new` enforces -- e.g. a wire-legal batch whose
+    /// `base_arrival_us` disagrees with `fresh[0]`'s own reconstructed
+    /// delta, since the wire carries them as two separate fields that a
+    /// well-behaved encoder keeps in sync (delta_0 == 0) but a decoder
+    /// cannot assume of arbitrary bytes. Rejecting this here means "if an
+    /// `AckBatch` exists, it encodes" holds for both constructors, not just
+    /// `new`.
+    #[error("decoded batch fails its own encoding invariants: {0}")]
+    Unencodable(AckEncodeError),
 }
 
 /// Encoding refuses rather than silently mangles a batch that violates any
@@ -397,10 +408,18 @@ impl AckBatch {
             });
         }
 
-        Ok(AckBatch {
+        let batch = AckBatch {
             entries,
             fresh_count: count_fresh as usize,
-        })
+        };
+        // The wire parsed structurally, but base_arrival_us and fresh[0]'s
+        // delta are two independent fields on the wire -- a well-behaved
+        // encoder keeps delta_0 == 0, but arbitrary bytes need not. Without
+        // this, a hand-crafted (or third-party) datagram could decode into
+        // an AckBatch that panics if ever re-encoded, which would make the
+        // "if it exists, it encodes" guarantee true only for `new`.
+        batch.validate().map_err(AckDecodeError::Unencodable)?;
+        Ok(batch)
     }
 }
 
@@ -783,6 +802,40 @@ mod tests {
             AckBatch::decode(&bytes),
             Err(AckDecodeError::WrongLength { .. })
         ));
+    }
+
+    #[test]
+    fn decode_rejects_a_wire_legal_batch_whose_reconstructed_fresh_is_out_of_order() {
+        // Hand-craft a datagram that parses structurally (right msg type,
+        // counts in range, right length) but whose fresh section is not
+        // something try_encode() could ever have produced: base_arrival_us
+        // and fresh[0]'s own delta are two independent wire fields, and a
+        // well-behaved encoder always writes delta_0 == 0 -- but arbitrary
+        // bytes need not. With base=1_000_000 and deltas [5000, 0], this
+        // reconstructs to fresh = [1_005_000, 1_000_000], which is out of
+        // order. Before this test, decode() built that AckBatch anyway; it
+        // would panic the moment anything tried to re-encode it.
+        let mut data = vec![ACK_BATCH_MSG_TYPE, 2, 0];
+        data.extend_from_slice(&1_000_000u32.to_le_bytes());
+        // fresh[0]: frame_seq=1, tile 1/2/3, delta=5000
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&[1, 2, 3]);
+        data.extend_from_slice(&5000u16.to_le_bytes());
+        // fresh[1]: frame_seq=2, tile 1/2/3, delta=0
+        data.extend_from_slice(&2u32.to_le_bytes());
+        data.extend_from_slice(&[1, 2, 3]);
+        data.extend_from_slice(&0u16.to_le_bytes());
+        assert_eq!(data.len(), ACK_HEADER_SIZE + 2 * ACK_FRESH_ENTRY_SIZE);
+
+        assert_eq!(
+            AckBatch::decode(&data),
+            Err(AckDecodeError::Unencodable(
+                AckEncodeError::FreshEntryOutOfOrder {
+                    index: 1,
+                    behind_us: 5000,
+                }
+            ))
+        );
     }
 
     #[test]
