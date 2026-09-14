@@ -508,16 +508,9 @@ to:
 In `ack_batcher.rs`'s `flush`, replace the `AckBatch` construction:
 
 ```rust
-        let fresh_count = fresh.len();
-        let mut all_entries = fresh.clone();
-        all_entries.extend(overlap);
-
-        let batch = AckBatch {
-            entries: all_entries,
-            fresh_count,
-        };
-        // `try_encode` cannot fail here: fresh entries span at most
-        // FLUSH_INTERVAL_US (5 ms), well inside a u16 of microseconds.
+        // `AckBatch::new` validates and takes the two sections separately.
+        let batch = AckBatch::new(fresh.clone(), overlap)
+            .expect("batcher upholds AckBatch::new's invariants");
         let out = batch.encode();
 ```
 

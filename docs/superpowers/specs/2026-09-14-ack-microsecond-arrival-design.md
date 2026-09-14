@@ -125,9 +125,26 @@ separately. Since the wasm cutover, client-core is the *only* ACK producer —
 there is no TypeScript encoder to keep in step.
 
 **Codec — `ghostframe-protocol/src/ack.rs`.** `AckBatch` gains the two-section
-layout. `AckEntry::arrival_time_ms_lo16: u16` becomes `arrival_us: u64` in the
-in-memory type; the wire representation differs per section, and reconstruction
-(`base + delta`) happens in the decoder so consumers see one uniform field.
+layout. `AckEntry::arrival_time_ms_lo16: u16` becomes `arrival_us: **u32**`;
+the wire representation differs per section, and reconstruction (`base + delta`)
+happens in the decoder so consumers see one uniform field.
+
+> **Amended 2026-09-14, after implementation review.** This section originally
+> specified `arrival_us: u64` holding a value "in low-32-bit wrapped space".
+> That invariant existed only as prose, and encode narrowed it with three
+> unchecked `as u32` casts: a caller passing a real wall-clock microsecond
+> value got back a self-consistent but entirely different batch, with working
+> deltas, plausible BWE output, and no error. `u32` makes the truncation
+> unrepresentable instead of documented. The review also found the round-trip
+> property test's one narrowed strategy range was precisely the range that hid
+> it — a bound on a property-test strategy is a claim about what cannot
+> happen, and needs justifying like any assertion.
+
+`AckBatch`'s fields are private behind `AckBatch::new(fresh, overlap) ->
+Result<Self, AckEncodeError>`, which validates every invariant up front, with
+`fresh()`/`overlap()`/`entries()` accessors. `decode` validates too, so the
+guarantee is total over both constructors: **if an `AckBatch` exists, it
+encodes.**
 
 **Consumers — `ghostframe-lib`.** `io_bridge.rs` reads `arrival_us` instead of
 `arrival_time_ms_lo16`; `BweSample::client_arrival_ms_lo16` and `owd_ms_lo16`
