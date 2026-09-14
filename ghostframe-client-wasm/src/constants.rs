@@ -14,7 +14,8 @@ use ghostframe_client_core::{
     nack_batcher::{FLUSH_INTERVAL_US as NACK_FLUSH_INTERVAL_US, NACK_BATCH_MAX},
 };
 use ghostframe_protocol::ack::{
-    ACK_BATCH_MSG_TYPE, ACK_ENTRY_SIZE, ACK_OVERLAP_COUNT, MAX_FRESH_ENTRIES_PER_BATCH,
+    ACK_BATCH_MSG_TYPE, ACK_FRESH_ENTRY_SIZE, ACK_HEADER_SIZE, ACK_OVERLAP_COUNT,
+    ACK_OVERLAP_ENTRY_SIZE, MAX_FRESH_ENTRIES_PER_BATCH,
 };
 use ghostframe_protocol::protocol::{TILE_NACK_ENVELOPE, TILE_PARITY_ENVELOPE};
 use wasm_bindgen::prelude::*;
@@ -34,7 +35,19 @@ export_const!(
     u8,
     ACK_BATCH_MSG_TYPE
 );
-export_const!("ackEntrySize", ack_entry_size, usize, ACK_ENTRY_SIZE);
+export_const!("ackHeaderSize", ack_header_size, usize, ACK_HEADER_SIZE);
+export_const!(
+    "ackFreshEntrySize",
+    ack_fresh_entry_size,
+    usize,
+    ACK_FRESH_ENTRY_SIZE
+);
+export_const!(
+    "ackOverlapEntrySize",
+    ack_overlap_entry_size,
+    usize,
+    ACK_OVERLAP_ENTRY_SIZE
+);
 export_const!(
     "ackOverlapCount",
     ack_overlap_count,

@@ -207,7 +207,7 @@ pub struct WasmAckEntry {
     pub tile_x: u8,
     pub tile_y: u8,
     pub pass_idx: u8,
-    pub arrival_time_ms_lo16: u16,
+    pub arrival_us: u32,
 }
 
 impl From<&AckEntry> for WasmAckEntry {
@@ -217,7 +217,7 @@ impl From<&AckEntry> for WasmAckEntry {
             tile_x: e.tile_x,
             tile_y: e.tile_y,
             pass_idx: e.pass_idx,
-            arrival_time_ms_lo16: e.arrival_time_ms_lo16,
+            arrival_us: e.arrival_us,
         }
     }
 }

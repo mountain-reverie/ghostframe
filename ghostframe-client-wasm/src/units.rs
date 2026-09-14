@@ -79,7 +79,7 @@ impl WasmAckBatcher {
         tile_x: u8,
         tile_y: u8,
         pass_idx: u8,
-        arrival_time_ms_lo16: u16,
+        arrival_us: u32,
         now_us: u64,
     ) -> Option<Vec<u8>> {
         self.inner.add(
@@ -88,7 +88,7 @@ impl WasmAckBatcher {
                 tile_x,
                 tile_y,
                 pass_idx,
-                arrival_time_ms_lo16,
+                arrival_us,
             },
             now_us,
         )
@@ -129,7 +129,7 @@ impl Default for WasmAckBatcher {
 pub fn parse_ack_envelope(bytes: &[u8]) -> Result<JsValue, JsValue> {
     let entries: Option<Vec<WasmAckEntry>> = AckBatch::decode(bytes)
         .ok()
-        .map(|b| b.entries.iter().map(WasmAckEntry::from).collect());
+        .map(|b| b.entries().iter().map(WasmAckEntry::from).collect());
     serde_wasm_bindgen::to_value(&entries).map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
