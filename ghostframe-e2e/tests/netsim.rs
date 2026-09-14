@@ -1,6 +1,6 @@
 //! Tests for the netsim module: RNG determinism and loss rate accuracy.
 
-use ghostframe_e2e::netsim::{CapTimeline, DetRng, NetProfile, NetSim, Verdict};
+use ghostframe_e2e::netsim::{Bottleneck, CapTimeline, DetRng, NetProfile, NetSim, Verdict};
 
 #[test]
 fn identical_seeds_produce_identical_streams() {
@@ -289,6 +289,7 @@ fn adding_a_cap_does_not_shift_the_rng_draw_sequence() {
             jitter_us: 2_000,
             reorder_us: 500,
             cap,
+            bottleneck: None,
         };
         let mut sim = NetSim::new(profile, 1234);
         (0..500).map(|i| sim.decide(1200, 500 * i as u64)).collect()
@@ -323,4 +324,167 @@ fn adding_a_cap_does_not_shift_the_rng_draw_sequence() {
         "cap only converted {converted_to_drop} verdicts to Drop; it must \
          actually bite for this test to mean anything"
     );
+}
+
+// ── Bottleneck: queue first, drop only when full ────────────────────────────
+
+/// Offer `n` datagrams of `len` bytes at `every_us` intervals and report, per
+/// datagram, the queuing delay it incurred (`at_us - now_us`) or `None` if it
+/// was dropped.
+fn offer(profile: NetProfile, len: usize, n: usize, every_us: u64) -> Vec<Option<u64>> {
+    let mut sim = NetSim::new(profile, 0xB077_1E00);
+    (0..n)
+        .map(|i| {
+            let now = i as u64 * every_us;
+            match sim.decide(len, now) {
+                Verdict::Deliver { at_us } => Some(at_us - now),
+                Verdict::Drop => None,
+                other => panic!("unexpected verdict {other:?}"),
+            }
+        })
+        .collect()
+}
+
+/// A link offered less than it can carry must add no queuing delay at all.
+#[test]
+fn an_under_loaded_bottleneck_adds_no_delay() {
+    // 100 kB/s link, 1000-byte datagrams every 20 ms = 50 kB/s offered.
+    let p = NetProfile {
+        cap: CapTimeline::constant(100_000),
+        bottleneck: Some(Bottleneck {
+            depth_ms: 200,
+            aqm: None,
+        }),
+        ..NetProfile::perfect()
+    };
+    let delays = offer(p, 1_000, 40, 20_000);
+    assert!(delays.iter().all(|d| d.is_some()), "nothing should drop");
+    // Only its own serialisation time: 1000 bytes at 100 kB/s = 10 ms.
+    assert!(
+        delays.iter().flatten().all(|&d| d <= 10_000),
+        "under-loaded link must not build a queue: {delays:?}"
+    );
+}
+
+/// The property the whole model exists for: an over-loaded link must show
+/// *growing* delay, because that is the signal a delay-based congestion
+/// controller estimates from. A dropping-only cap shows none of this.
+#[test]
+fn an_over_loaded_bottleneck_builds_queuing_delay_before_it_drops() {
+    // 100 kB/s link, 1000-byte datagrams every 5 ms = 200 kB/s offered: 2x.
+    let p = NetProfile {
+        cap: CapTimeline::constant(100_000),
+        bottleneck: Some(Bottleneck {
+            depth_ms: 500,
+            aqm: None,
+        }),
+        ..NetProfile::perfect()
+    };
+    let delays = offer(p, 1_000, 60, 5_000);
+    let seen: Vec<u64> = delays.iter().flatten().copied().collect();
+    assert!(seen.len() >= 2, "some datagrams must get through");
+    assert!(
+        seen.last().unwrap() > seen.first().unwrap(),
+        "queuing delay must grow under sustained overload: {seen:?}"
+    );
+    // And loss must be the tail event, not the first one: the earliest
+    // datagrams queue rather than vanish.
+    assert!(
+        delays[..10].iter().all(|d| d.is_some()),
+        "early datagrams must queue, not drop: {:?}",
+        &delays[..10]
+    );
+}
+
+/// Bufferbloat: a deep buffer with no AQM should reach hundreds of
+/// milliseconds of delay while barely dropping anything. This is the LTE/WiFi
+/// case, and the one where a loss-based-only controller sees nothing wrong.
+#[test]
+fn a_deep_buffer_bloats_delay_instead_of_dropping() {
+    let p = NetProfile {
+        cap: CapTimeline::constant(100_000),
+        bottleneck: Some(Bottleneck::lte_bufferbloat()),
+        ..NetProfile::perfect()
+    };
+    let delays = offer(p, 1_000, 80, 5_000);
+    let dropped = delays.iter().filter(|d| d.is_none()).count();
+    let max_delay = delays.iter().flatten().copied().max().unwrap_or(0);
+    assert!(
+        max_delay > 100_000,
+        "a 600 ms buffer must bloat past 100 ms of delay, saw {max_delay}us"
+    );
+    assert!(
+        dropped * 4 < delays.len(),
+        "bufferbloat drops little: {dropped} of {}",
+        delays.len()
+    );
+}
+
+/// AQM is the difference between the fibre case and the LTE case: under the
+/// same offered load, CoDel must hold delay far below what a deep unmanaged
+/// buffer reaches, by dropping earlier instead.
+#[test]
+fn aqm_holds_delay_down_where_a_deep_buffer_does_not() {
+    let load = |bn: Bottleneck| -> (u64, usize) {
+        let p = NetProfile {
+            cap: CapTimeline::constant(100_000),
+            bottleneck: Some(bn),
+            ..NetProfile::perfect()
+        };
+        let d = offer(p, 1_000, 120, 5_000);
+        (
+            d.iter().flatten().copied().max().unwrap_or(0),
+            d.iter().filter(|x| x.is_none()).count(),
+        )
+    };
+    let (bloat_delay, bloat_drops) = load(Bottleneck::lte_bufferbloat());
+    let (aqm_delay, aqm_drops) = load(Bottleneck::fibre_aqm());
+
+    assert!(
+        aqm_delay < bloat_delay,
+        "AQM must hold delay below an unmanaged deep buffer: aqm={aqm_delay}us \
+         bloat={bloat_delay}us"
+    );
+    assert!(
+        aqm_drops > bloat_drops,
+        "AQM trades loss for latency, so it must drop more: aqm={aqm_drops} \
+         bloat={bloat_drops}"
+    );
+}
+
+/// The queue must drain: once the burst stops, delay returns to baseline.
+#[test]
+fn the_queue_drains_after_a_burst() {
+    let p = NetProfile {
+        cap: CapTimeline::constant(100_000),
+        bottleneck: Some(Bottleneck {
+            depth_ms: 500,
+            aqm: None,
+        }),
+        ..NetProfile::perfect()
+    };
+    let mut sim = NetSim::new(p, 7);
+    // Burst: 30 datagrams in 150 ms, far above the link rate.
+    let mut peak = 0u64;
+    for i in 0..30u64 {
+        let now = i * 5_000;
+        if let Verdict::Deliver { at_us } = sim.decide(1_000, now) {
+            peak = peak.max(at_us - now);
+        }
+    }
+    // The burst must actually have built a queue, or "it drained" is vacuous
+    // — this assertion is what makes the drain below mean something.
+    assert!(
+        peak > 50_000,
+        "the burst must build a real queue first, peak was {peak}us"
+    );
+
+    // Then idle for two seconds and offer one more.
+    match sim.decide(1_000, 2_150_000) {
+        Verdict::Deliver { at_us } => {
+            let q = at_us - 2_150_000;
+            assert!(q <= 10_000, "queue must have drained, saw {q}us");
+        }
+        other => panic!("expected delivery after drain, got {other:?}"),
+    }
 }
