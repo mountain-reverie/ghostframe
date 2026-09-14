@@ -533,15 +533,32 @@ async fn drive_session(
         // routing each datagram through the client->server NetSim.
         while let Some(out) = client.poll_transmit() {
             let t = now_us(base);
-            schedule(
+            for item in rule(
                 &mut net_c2s,
                 Direction::C2s,
                 out.payload,
                 t,
-                &mut in_flight,
-                &mut next_in_flight_seq,
                 &mut bytes_dropped,
-            );
+            ) {
+                if item.at_us <= t {
+                    // Due now: send it here, inside the drain loop, so each
+                    // send yields to the runtime exactly where it did before
+                    // arrivals could be queued at all. Batching these and
+                    // flushing them together changes where the runtime goes
+                    // idle, and under `start_paused` that changes when the
+                    // virtual clock advances.
+                    pump.send(&item.payload, &client_addr).await.map_err(|e| {
+                        anyhow!("seed {seed}: pump send failed at iteration {iter}: {e}")
+                    })?;
+                    bytes_delivered += item.payload.len() as u64;
+                } else {
+                    in_flight.push(InFlight {
+                        seq: next_in_flight_seq,
+                        ..item
+                    });
+                    next_in_flight_seq += 1;
+                }
+            }
         }
 
         // The single point where datagrams actually arrive, in both
@@ -685,15 +702,19 @@ async fn drive_session(
                      (last events observed: {events:?}): {e}"
                 ))?;
                 let t = now_us(base);
-                schedule(
-                    &mut net_s2c,
-                    Direction::S2c,
-                    pkt.payload,
-                    t,
-                    &mut in_flight,
-                    &mut next_in_flight_seq,
-                    &mut bytes_dropped,
-                );
+                for item in rule(&mut net_s2c, Direction::S2c, pkt.payload, t, &mut bytes_dropped)
+                {
+                    if item.at_us <= t {
+                        client.handle_udp(&item.payload, server_addr, t);
+                        bytes_delivered += item.payload.len() as u64;
+                    } else {
+                        in_flight.push(InFlight {
+                            seq: next_in_flight_seq,
+                            ..item
+                        });
+                        next_in_flight_seq += 1;
+                    }
+                }
             }
             _ = tokio::time::sleep_until(wake_at) => {
                 if now_us(base) >= client.poll_timeout().unwrap_or(u64::MAX) {
@@ -854,59 +875,51 @@ impl PartialOrd for InFlight {
     }
 }
 
-/// Route one datagram through `sim` and queue whatever survives for
-/// delivery at the time the verdict assigns it.
+/// Run one datagram through `sim` and return whatever survives, as zero,
+/// one, or two arrivals with the times the verdict assigns them.
 ///
-/// This is deliberately synchronous. An earlier version awaited each
-/// datagram's arrival at its send site, which made the link serial: one
-/// datagram in flight at a time, the next not even ruled on until the
-/// previous had landed. At `delay_us: 0` that await returns immediately
-/// and the difference is invisible, which is why every scene passed. At a
-/// realistic RTT it meant a busy scene spent `backlog x delay_us` of
-/// virtual time inside the transmit drain — a loop that checks neither
-/// `MAX_ITERS` nor `overall_deadline`, so neither guard could fire.
-///
-/// It also made `reorder_us` inert: with arrivals serialised, each
-/// datagram's `at_us` was computed from a clock already advanced past the
-/// previous arrival, so `at_us` could only ever increase and no datagram
-/// could overtake another. Queueing restores the overtaking the field
-/// exists to model.
-fn schedule(
+/// Deliberately decides nothing about *when* delivery happens: the caller
+/// delivers an already-due arrival immediately and queues a future one. That
+/// split matters. An earlier version pushed every arrival onto the queue and
+/// flushed them together at the top of the loop, which at `delay_us: 0` —
+/// where every `at_us` equals the moment it was ruled on — moved every send
+/// out of the drain loop and into a batch. Under `start_paused` the virtual
+/// clock advances only when the runtime goes idle, so relocating those yields
+/// changed when time advanced: the demand-starved scene intermittently burned
+/// all 5,000 of `MAX_ITERS` in ~1.2 virtual seconds where it needs ~350 for
+/// the full 10. Keeping the due path free of the queue keeps a zero-delay
+/// scene behaving exactly as it did before propagation delay was modelled.
+fn rule(
     sim: &mut NetSim,
     dir: Direction,
     payload: Vec<u8>,
     now_us_at_send: u64,
-    in_flight: &mut BinaryHeap<InFlight>,
-    next_seq: &mut u64,
     bytes_dropped: &mut u64,
-) {
-    let mut queue = |at_us: u64, payload: Vec<u8>| {
-        in_flight.push(InFlight {
-            at_us,
-            seq: *next_seq,
-            dir,
-            payload,
-        });
-        *next_seq += 1;
+) -> Vec<InFlight> {
+    // `seq` is a placeholder here; the caller assigns a real one if and when
+    // it queues the arrival, so queued arrivals stay ordered by insertion.
+    let at = |at_us: u64, payload: Vec<u8>| InFlight {
+        at_us,
+        seq: 0,
+        dir,
+        payload,
     };
 
     match sim.decide(payload.len(), now_us_at_send) {
         Verdict::Drop => {
             *bytes_dropped += payload.len() as u64;
+            Vec::new()
         }
-        Verdict::Deliver { at_us } => {
-            queue(at_us, payload);
-        }
+        Verdict::Deliver { at_us } => vec![at(at_us, payload)],
         Verdict::Duplicate { at_us, dup_at_us } => {
-            queue(at_us, payload.clone());
-            queue(dup_at_us, payload);
+            vec![at(at_us, payload.clone()), at(dup_at_us, payload)]
         }
         Verdict::Corrupt { at_us, bit_index } => {
             // Corruption flips a bit in the payload itself, never in the
             // ghostbridge framing `pump.send` adds on top.
             let mut corrupted = payload;
             flip_bit(&mut corrupted, bit_index);
-            queue(at_us, corrupted);
+            vec![at(at_us, corrupted)]
         }
     }
 }
