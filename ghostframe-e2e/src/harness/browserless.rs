@@ -104,6 +104,14 @@ pub enum SceneLoad {
     /// out of frames and never falls back to empty heartbeats. Right for
     /// anything measuring bandwidth, pacing or probing, where a scene that
     /// goes quiet after a short burst is not modelling production at all.
+    ///
+    /// The heartbeat path below exists so `sweep_rto_retransmits` keeps
+    /// being called once a script is exhausted. A profile generates
+    /// `duration / cadence_us` frames while injection only begins at
+    /// `SessionReady`, so its last frame is scheduled past the scene's own
+    /// deadline and `next_frame_idx < frames.len()` holds throughout —
+    /// heartbeats never fire here. The path stays for scripted scenes,
+    /// which very much do still need it.
     Profile(crate::harness::load_profile::LoadProfile),
 }
 
@@ -148,6 +156,14 @@ pub struct BrowserlessResult {
     /// Server-side bandwidth estimate at the end of the scene, bits per
     /// second. Zero if the controller never produced one.
     pub bwe_estimate_bps: u64,
+    /// `(virtual_us, bitrate_bps)` sampled at most every 100 ms of virtual
+    /// time while the scene runs.
+    ///
+    /// `bwe_estimate_bps` alone cannot distinguish an estimator that tracked
+    /// a changing link from one that happened to finish near the right
+    /// number. A step-up scene needs to see both sides of the step, so this
+    /// records the series the final value is drawn from.
+    pub bwe_estimate_samples: Vec<(u64, u64)>,
     /// Count of derived RTTs implausible against quinn's measured path RTT.
     /// Non-zero means emit and arrival timestamps are not on one clock.
     pub implausible_rtt_samples: u64,
@@ -354,6 +370,7 @@ async fn run_inner(scene: BrowserlessScene) -> anyhow::Result<BrowserlessResult>
     };
 
     let mut framebuffer = FrameBuffer::new();
+    let mut bwe_estimate_samples: Vec<(u64, u64)> = Vec::new();
     let outcome = drive_session(
         cfg,
         &mut pump,
@@ -363,6 +380,8 @@ async fn run_inner(scene: BrowserlessScene) -> anyhow::Result<BrowserlessResult>
         &scene,
         &inject_tx,
         &mut framebuffer,
+        &bwe_cell,
+        &mut bwe_estimate_samples,
     )
     .await;
 
@@ -398,6 +417,7 @@ async fn run_inner(scene: BrowserlessScene) -> anyhow::Result<BrowserlessResult>
         stale_generation_tiles,
         seed,
         bwe_estimate_bps: bwe_snapshot.bitrate_bps,
+        bwe_estimate_samples,
         implausible_rtt_samples: bwe_snapshot.implausible_rtt_samples,
         bwe_samples_seen: bwe_snapshot.samples_seen,
         retransmit_attempts_total: emitter_stats.retransmit_attempts_total,
@@ -452,6 +472,8 @@ async fn drive_session(
     scene: &BrowserlessScene,
     inject_tx: &mpsc::Sender<InjectedFrame>,
     framebuffer: &mut FrameBuffer,
+    bwe_cell: &std::sync::Arc<std::sync::Mutex<ghostframe_lib::transport::bwe::BweSnapshot>>,
+    bwe_samples: &mut Vec<(u64, u64)>,
 ) -> anyhow::Result<(Vec<ClientNetEvent>, u64, u64)> {
     let seed = scene.seed;
 
@@ -549,6 +571,9 @@ async fn drive_session(
     let overall_deadline = base + scene.duration;
     let mut iter: usize = 0;
 
+    // Next virtual time at which to record a bandwidth-estimate sample.
+    let mut next_bwe_sample_us: u64 = 0;
+
     // Virtual time at the last iteration that made progress, and how many
     // iterations have turned since.
     let mut last_progress_vt: u64 = 0;
@@ -557,6 +582,17 @@ async fn drive_session(
     loop {
         iter += 1;
         let vt_now = now_us(base);
+        if vt_now >= next_bwe_sample_us {
+            // `run()` republishes into this cell every iteration of its own
+            // loop, so reading it here is a live sample rather than the
+            // post-abort final one `run_browserless` takes.
+            let bps = bwe_cell
+                .lock()
+                .expect("bwe_publish mutex poisoned")
+                .bitrate_bps;
+            bwe_samples.push((vt_now, bps));
+            next_bwe_sample_us = vt_now + 100_000;
+        }
         if vt_now > last_progress_vt {
             last_progress_vt = vt_now;
             iters_without_progress = 0;
