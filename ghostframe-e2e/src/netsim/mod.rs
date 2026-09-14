@@ -27,7 +27,7 @@ pub mod profile;
 pub mod pump;
 pub mod rng;
 
-pub use profile::{CapTimeline, NetProfile};
+pub use profile::{Bottleneck, CapTimeline, CoDel, NetProfile};
 pub use pump::SocketPairPump;
 pub use rng::DetRng;
 
@@ -62,6 +62,21 @@ pub struct NetSim {
     tokens: f64,
     last_refill_us: u64,
 
+    /// Bottleneck state: virtual time at which the link finishes draining
+    /// everything currently queued. A datagram arriving before this waits;
+    /// one arriving after it finds an empty queue. Zero means idle.
+    queue_drain_at_us: u64,
+
+    /// CoDel state (RFC 8289). `codel_above_since_us` is when sojourn delay
+    /// first went above target and stayed there; `codel_dropping` is whether
+    /// we are in the dropping state; `codel_drop_next_us` is when the next
+    /// drop is scheduled; `codel_count` is the drop count driving the
+    /// `interval / sqrt(count)` schedule.
+    codel_above_since_us: Option<u64>,
+    codel_dropping: bool,
+    codel_drop_next_us: u64,
+    codel_count: u32,
+
     /// The seed used to construct this simulator; logged in test diagnostics.
     pub seed: u64,
 }
@@ -75,8 +90,91 @@ impl NetSim {
             in_burst: false,
             tokens: 0.0,
             last_refill_us: 0,
+            queue_drain_at_us: 0,
+            codel_above_since_us: None,
+            codel_dropping: false,
+            codel_drop_next_us: 0,
+            codel_count: 0,
             seed,
         }
+    }
+
+    /// Queuing delay this datagram would incur at the bottleneck, or `None`
+    /// if the buffer is full (tail drop) or AQM chose to drop it.
+    ///
+    /// The link drains at `rate_bytes_s`; `queue_drain_at_us` is when it
+    /// finishes everything already queued. A datagram arriving before that
+    /// waits behind it, which is what makes one-way delay grow under load —
+    /// the signal a delay-based congestion controller estimates from.
+    fn bottleneck_delay(
+        &mut self,
+        bn: &Bottleneck,
+        len: usize,
+        now_us: u64,
+        rate_bytes_s: u64,
+    ) -> Option<u64> {
+        let drain_at = self.queue_drain_at_us.max(now_us);
+        let backlog_us = drain_at - now_us;
+
+        // Tail drop: the buffer is full. Depth is held in time rather than
+        // bytes so it tracks a `CapTimeline` step instead of silently
+        // becoming a different buffer when the rate changes.
+        if backlog_us >= bn.depth_ms.saturating_mul(1_000) {
+            return None;
+        }
+
+        let serialise_us = (len as u64).saturating_mul(1_000_000) / rate_bytes_s.max(1);
+        let departure = drain_at.saturating_add(serialise_us);
+        let sojourn_us = departure - now_us;
+
+        if let Some(codel) = &bn.aqm {
+            if self.codel_should_drop(codel, sojourn_us, now_us) {
+                // Dropped by AQM: it never entered the queue, so the drain
+                // time does not advance.
+                return None;
+            }
+        }
+
+        self.queue_drain_at_us = departure;
+        Some(sojourn_us)
+    }
+
+    /// CoDel (RFC 8289), simplified to what a datagram-granularity simulator
+    /// can express: no head-drop (we decide at enqueue, not dequeue) and no
+    /// ECN marking (nothing here touches IP headers).
+    ///
+    /// Sojourn delay below target resets everything. Above target for a full
+    /// `interval_us`, dropping starts and continues on an
+    /// `interval / sqrt(count)` schedule, which is what holds the standing
+    /// queue near target instead of letting the buffer fill.
+    fn codel_should_drop(&mut self, c: &CoDel, sojourn_us: u64, now_us: u64) -> bool {
+        if sojourn_us < c.target_us {
+            self.codel_above_since_us = None;
+            self.codel_dropping = false;
+            self.codel_count = 0;
+            return false;
+        }
+
+        let above_since = *self.codel_above_since_us.get_or_insert(now_us);
+
+        if self.codel_dropping {
+            if now_us >= self.codel_drop_next_us {
+                self.codel_count = self.codel_count.saturating_add(1);
+                let step = c.interval_us as f64 / (self.codel_count as f64).sqrt();
+                self.codel_drop_next_us = now_us.saturating_add(step as u64);
+                return true;
+            }
+            return false;
+        }
+
+        if now_us.saturating_sub(above_since) >= c.interval_us {
+            self.codel_dropping = true;
+            self.codel_count = 1;
+            self.codel_drop_next_us = now_us.saturating_add(c.interval_us);
+            return true;
+        }
+
+        false
     }
 
     /// Decide the fate of one datagram of `len` bytes offered at `now_us`.
@@ -195,6 +293,20 @@ impl NetSim {
         if bps == u64::MAX {
             return verdict;
         }
+        // Bottleneck, if configured: queue first, drop only on a full
+        // buffer. Runs here — after every rng draw, exactly where the token
+        // bucket runs — so it can subtract a delivery or delay one but can
+        // never alter the rng stream. `tests/netsim.rs` asserts that
+        // property for the cap; it holds for the same reason here.
+        if let Some(bn) = self.profile.bottleneck.clone() {
+            if bps != u64::MAX {
+                return match self.bottleneck_delay(&bn, len, now_us, bps) {
+                    Some(queue_us) => shift_arrival(verdict, queue_us),
+                    None => Verdict::Drop,
+                };
+            }
+        }
+
         match verdict {
             Verdict::Duplicate { at_us, dup_at_us } => {
                 let full_cost = 2.0 * len as f64;
@@ -221,6 +333,27 @@ impl NetSim {
                 }
             }
         }
+    }
+}
+
+/// Push a verdict's arrival time(s) out by `queue_us` of bottleneck delay.
+///
+/// `Drop` has no arrival to shift. A duplicate's second copy shifts by the
+/// same amount: both copies queued behind the same backlog.
+fn shift_arrival(v: Verdict, queue_us: u64) -> Verdict {
+    match v {
+        Verdict::Drop => Verdict::Drop,
+        Verdict::Deliver { at_us } => Verdict::Deliver {
+            at_us: at_us + queue_us,
+        },
+        Verdict::Duplicate { at_us, dup_at_us } => Verdict::Duplicate {
+            at_us: at_us + queue_us,
+            dup_at_us: dup_at_us + queue_us,
+        },
+        Verdict::Corrupt { at_us, bit_index } => Verdict::Corrupt {
+            at_us: at_us + queue_us,
+            bit_index,
+        },
     }
 }
 
