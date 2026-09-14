@@ -352,3 +352,61 @@ the delivery-queue change, with all scenes still passing. `deliver_s2c` now
 lands at the top of the loop rather than inside the `select!` arm, which
 shifts interleaving relative to event-draining and injection. The earlier
 7/10 figures were themselves an artifact of serialised delivery.
+
+## Answered (2026-09-14): abandonment is not what limits headroom discovery
+
+The question this document has carried since PR #78 — whether probe
+abandonment matters, and therefore what `drain_for_probe_window_open` is worth
+— now has a measured answer. It took a harness that could model a congested
+link, which is the work in
+`docs/superpowers/specs/2026-09-13-production-like-load-design.md`.
+
+### What changed in the harness
+
+**Production cadence.** The harness injected every 16 ms where production
+dispatches every 33.3 ms. Injection cadence is now per-scene and defaults to
+production's. Measured blast radius across the suite: one scene.
+
+**A bottleneck that queues.** `NetProfile.cap` was a token bucket that dropped
+whatever it could not afford and never delayed anything — a lossy link, not a
+congested one. Since goog_cc estimates from delay first, that left its
+delay-based half inert and only the loss-based fallback running, which pins the
+estimate to `MIN_BPS` whatever the capacity. `NetProfile.bottleneck` now models
+a real bottleneck: queue first, tail-drop only when full, with optional CoDel.
+Presets cover fibre-behind-fq_codel, consumer WiFi, and LTE bufferbloat.
+
+**Sustained load.** A scripted scene injects its frames and then goes quiet,
+sending empty heartbeats for the rest of its duration, while production's
+capture loop free-runs. `SceneLoad::Profile` generates frames for the whole
+scene.
+
+### The answer
+
+With a queueing bottleneck at production cadence, **probe clusters complete**:
+1/1 in every run of the step-up scene, and 1/2 after the probe-ladder fix. At
+production cadence over the old dropping cap they never completed at all.
+
+And the estimate still ramps slowly: post-step maxima of 378k, 391k, 335k and
+2,112k bits/s against 3.2 Mbps of new capacity, with the final sample equal to
+the maximum in every run — still climbing when the scene ends at 12 s.
+
+**So probing works here, and the slow ramp is not explained by abandonment.**
+That bounds what `drain_for_probe_window_open` can be worth: it increases the
+number of windows that fill, and filling more windows is not what the session
+is short of. PR #78's decision to keep attribution in unit tests rather than
+claim it from a scene remains the right call.
+
+What *is* short is how often goog_cc asks to probe at a rate the link can
+answer. See `docs/specs/bwe-googcc-review.md` for that, together with two
+defects found while reviewing our use of the controller — a hardcoded
+`data_in_flight` of zero, and a probe ladder truncated to its top rung — and
+for the slow-start overshoot dynamic that explains the shape of all these
+measurements.
+
+### A caveat on the cadence table above
+
+The table in "Realistic budget landed, and RTT with it" was measured over the
+old dropping cap. Its conclusion stands — production cadence completes no
+probes there — but the mechanism is now known to be two compounding things,
+not one: the cadence, and a bottleneck that produced no queuing delay for the
+controller to read.
