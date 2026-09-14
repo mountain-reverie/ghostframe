@@ -165,7 +165,12 @@ impl GoogCcDriver {
     }
 
     /// Feed one ACK batch and advance the controller.
-    pub(crate) fn update(&mut self, records: &[AckArrival], now: Instant) -> BweSnapshot {
+    pub(crate) fn update(
+        &mut self,
+        records: &[AckArrival],
+        now: Instant,
+        data_in_flight_bytes: usize,
+    ) -> BweSnapshot {
         if records.is_empty() {
             return self.snapshot();
         }
@@ -237,7 +242,13 @@ impl GoogCcDriver {
             .0
             .on_transport_packets_feedback(TransportPacketsFeedback {
                 feedback_time,
-                data_in_flight: DataSize::from_bytes(0),
+                // Real outstanding bytes, from the retransmit cache: an
+                // entry lives there from emission until its ACK. goog_cc's
+                // congestion-window pushback controller reads this, and fed
+                // a hardcoded zero -- as it was until 2026-09-14 -- it has
+                // nothing to push back against, so that half of the
+                // controller never engages.
+                data_in_flight: DataSize::from_bytes(data_in_flight_bytes as i64),
                 packet_feedbacks,
                 sendless_arrival_times: Vec::new(),
             });
@@ -426,7 +437,11 @@ mod tests {
                     }
                 })
                 .collect();
-            d.update(&batch, t0 + Duration::from_millis(20 * step as u64));
+            d.update(
+                &batch,
+                t0 + Duration::from_millis(20 * step as u64),
+                batch.iter().map(|r| r.size_bytes as usize).sum(),
+            );
         }
 
         let snap = d.snapshot();
@@ -468,7 +483,11 @@ mod tests {
                         }
                     })
                     .collect();
-                d.update(&batch, t0 + Duration::from_millis(20 * step as u64));
+                d.update(
+                    &batch,
+                    t0 + Duration::from_millis(20 * step as u64),
+                    batch.iter().map(|r| r.size_bytes as usize).sum(),
+                );
             }
             let bps = d.snapshot().bitrate_bps;
             assert!(bps > 0, "offset {offset_ms} ms produced no estimate");
@@ -542,7 +561,11 @@ mod tests {
                 }
             })
             .collect();
-        d.update(&batch, t0 + Duration::from_millis(20));
+        d.update(
+            &batch,
+            t0 + Duration::from_millis(20),
+            batch.iter().map(|r| r.size_bytes as usize).sum(),
+        );
 
         let pacer_bps = d
             .snapshot()
@@ -634,7 +657,11 @@ mod tests {
             probe: Some(tag),
         }];
         // Must not panic.
-        let snap = d.update(&records, t0 + Duration::from_millis(20));
+        let snap = d.update(
+            &records,
+            t0 + Duration::from_millis(20),
+            records.iter().map(|r| r.size_bytes as usize).sum(),
+        );
         assert_eq!(snap.samples_seen, 1);
     }
 }

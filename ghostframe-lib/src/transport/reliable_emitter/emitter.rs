@@ -250,6 +250,12 @@ impl ReliableTileEmitter {
         self.cache.len()
     }
 
+    /// Wire bytes currently in flight: everything cached and not yet ACKed.
+    /// Fed to goog_cc as `TransportPacketsFeedback::data_in_flight`.
+    pub fn bytes_in_flight(&self) -> usize {
+        self.cache.bytes_outstanding()
+    }
+
     /// Ingest a batch of NACKs from the client. For each (key, frag_idx):
     /// - Cache miss → bump `nack_miss` and continue.
     /// - Out-of-range frag_idx → silently skip.

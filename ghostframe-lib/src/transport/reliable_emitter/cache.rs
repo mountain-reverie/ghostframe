@@ -86,6 +86,21 @@ impl RetransmitCache {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
+
+    /// Total wire bytes held across all unACKed entries.
+    ///
+    /// This is the session's in-flight data: an entry lives here from the
+    /// moment its fragments go out until the ACK arrives (or the tile is
+    /// cancelled/superseded). goog_cc's congestion-window pushback reads the
+    /// equivalent number as `TransportPacketsFeedback::data_in_flight`, and
+    /// fed zero it has nothing to push back against.
+    pub fn bytes_outstanding(&self) -> usize {
+        self.entries
+            .values()
+            .flat_map(|e| e.fragments.iter())
+            .map(|f| f.len())
+            .sum()
+    }
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -172,6 +187,46 @@ mod tests {
             rto_deadline: now,
             probe: None,
         }
+    }
+
+    /// `bytes_outstanding` is what reaches goog_cc as
+    /// `TransportPacketsFeedback::data_in_flight`. A cache that reported
+    /// zero — as this code path did until 2026-09-14, where the value was
+    /// hardcoded — leaves the controller's congestion-window pushback with
+    /// nothing to act on, so it silently never engages.
+    #[test]
+    fn bytes_outstanding_counts_unacked_fragments_and_drains_on_ack() {
+        let mut c = RetransmitCache::new();
+        let now = Instant::now();
+        assert_eq!(c.bytes_outstanding(), 0, "an empty cache holds nothing");
+
+        let k1 = EmitKey::new(1, 0, 0, 0);
+        let k2 = EmitKey::new(1, 0, 1, 0);
+        c.insert(k1, mk_entry(now)); // 3 bytes
+        c.insert(k2, mk_entry(now)); // 3 bytes
+        assert_eq!(
+            c.bytes_outstanding(),
+            6,
+            "both entries' fragments are in flight"
+        );
+
+        // A multi-fragment entry must count every fragment, not just the first.
+        let k3 = EmitKey::new(2, 0, 0, 0);
+        c.insert(
+            k3,
+            CacheEntry {
+                fragments: smallvec![Bytes::from(vec![0; 10]), Bytes::from(vec![0; 5])],
+                wire_seqs: smallvec![1, 2],
+                ..mk_entry(now)
+            },
+        );
+        assert_eq!(c.bytes_outstanding(), 21);
+
+        c.remove(&k3);
+        c.remove(&k2);
+        assert_eq!(c.bytes_outstanding(), 3, "ACKed entries stop counting");
+        c.remove(&k1);
+        assert_eq!(c.bytes_outstanding(), 0, "a drained cache holds nothing");
     }
 
     #[test]

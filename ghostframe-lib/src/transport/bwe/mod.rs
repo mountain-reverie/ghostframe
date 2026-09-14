@@ -142,8 +142,13 @@ impl BweWrapper {
     /// collected (typically `Instant::now()` at ACK-parse time).
     ///
     /// Returns the updated `BweSnapshot`.
-    pub fn update(&mut self, records: &[AckArrival], now: Instant) -> BweSnapshot {
-        self.driver.update(records, now)
+    pub fn update(
+        &mut self,
+        records: &[AckArrival],
+        now: Instant,
+        data_in_flight_bytes: usize,
+    ) -> BweSnapshot {
+        self.driver.update(records, now, data_in_flight_bytes)
     }
 
     /// Return the current observability snapshot without advancing the estimator.
@@ -214,7 +219,11 @@ mod tests {
                 }
             })
             .collect();
-        let snap = bwe.update(&records, t0 + Duration::from_millis(20));
+        let snap = bwe.update(
+            &records,
+            t0 + Duration::from_millis(20),
+            records.iter().map(|r| r.size_bytes as usize).sum(),
+        );
         assert!(
             snap.pacer_rate_bps.is_some_and(|bps| bps > 0),
             "wrapper did not forward a positive pacer rate after feedback"
@@ -240,7 +249,11 @@ mod tests {
                 probe: None,
             },
         ];
-        let snap = bwe.update(&records, Instant::now());
+        let snap = bwe.update(
+            &records,
+            Instant::now(),
+            records.iter().map(|r| r.size_bytes as usize).sum(),
+        );
         assert_eq!(snap.samples_seen, 2);
     }
 
@@ -330,6 +343,7 @@ mod tests {
                 .update(
                     &batch,
                     t0 + std::time::Duration::from_millis(20 * step as u64),
+                    batch.iter().map(|r| r.size_bytes as usize).sum(),
                 )
                 .bitrate_bps;
         }
@@ -367,6 +381,7 @@ mod tests {
                 .update(
                     &batch,
                     t0 + std::time::Duration::from_millis(20 * step as u64),
+                    batch.iter().map(|r| r.size_bytes as usize).sum(),
                 )
                 .bitrate_bps;
         }
