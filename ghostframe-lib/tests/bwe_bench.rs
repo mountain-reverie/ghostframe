@@ -482,14 +482,54 @@ fn probe_request_min_bytes_is_target_rate_times_duration() {
          -- the derivation in GoogCcDriver::to_probe_request has drifted",
         req.min_bytes, req.target_rate_bps, req.duration
     );
-    // Sanity: goog_cc's default exponential probe is 6x a 1 Mbit/s seed for
-    // 15ms, at 5 minimum packets -- pin the concrete numbers too, so a
-    // change in goog_cc's own defaults (a dependency bump) is visible here
-    // rather than only in the formula check above.
-    assert_eq!(req.target_rate_bps, 6_000_000);
+    // Sanity: goog_cc's exponential probing asks for a *ladder* from a
+    // 1 Mbit/s seed -- 3x then 6x -- each for 15ms at 5 minimum packets.
+    // Pin the concrete numbers so a change in goog_cc's own defaults (a
+    // dependency bump) is visible here rather than only in the formula check.
+    //
+    // The first request surfaced is the *lower* rung. Until 2026-09-14 the
+    // driver kept only the last config of each batch and this assertion read
+    // 6_000_000: the 3 Mbit/s rung was being discarded, which is the one more
+    // likely to be answerable on a slow link.
+    assert_eq!(req.target_rate_bps, 3_000_000);
     assert_eq!(req.duration, Duration::from_millis(15));
     assert_eq!(req.min_probes, 5);
-    assert_eq!(req.min_bytes, 11_250);
+    assert_eq!(req.min_bytes, 5_625);
+}
+
+/// goog_cc asks for a ladder of probe clusters, not one; every rung must
+/// survive to the caller.
+///
+/// The driver used to keep only the last config of each `NetworkControlUpdate`,
+/// reasoning that a config never surfaced is indistinguishable from one never
+/// requested. That holds for any single config and fails for the set: the
+/// first request of a session is a pair, and discarding the lower rung throws
+/// away the probe more likely to be answerable on a slow link. Measured on a
+/// browserless scene, the discarded rung was 6 Mbps of a [6, 12] Mbps pair
+/// against a 480 kbps link.
+#[test]
+fn every_rung_of_a_probe_ladder_is_surfaced_in_order() {
+    let (mut w, _t0, first) = request_a_real_probe(1_000_000);
+
+    let second = w
+        .take_probe_request()
+        .expect("the second rung of the ladder must still be pending");
+    assert!(
+        second.target_rate_bps > first.target_rate_bps,
+        "rungs must surface lowest-first so the answerable one is tried \
+         first: got {} then {}",
+        first.target_rate_bps,
+        second.target_rate_bps
+    );
+    assert_eq!(
+        (first.target_rate_bps, second.target_rate_bps),
+        (3_000_000, 6_000_000),
+        "goog_cc's exponential ladder from a 1 Mbit/s seed is 3x then 6x"
+    );
+    assert!(
+        w.take_probe_request().is_none(),
+        "the ladder had two rungs; a third would mean requests are accumulating"
+    );
 }
 
 /// Step 4 — untagged traffic is unaffected. `ProbeController` requests a
