@@ -156,6 +156,11 @@ pub struct BrowserlessResult {
     /// Server-side bandwidth estimate at the end of the scene, bits per
     /// second. Zero if the controller never produced one.
     pub bwe_estimate_bps: u64,
+    /// goog_cc's pacer rate at scene end, bits per second. This, not
+    /// `bwe_estimate_bps`, is what `combine_pacing_budget` actually limits
+    /// emission with, so a scene whose wire rate exceeds the estimate should
+    /// be read against this before concluding the estimate is being ignored.
+    pub pacer_rate_bps: Option<u64>,
     /// `(virtual_us, bitrate_bps)` sampled at most every 100 ms of virtual
     /// time while the scene runs.
     ///
@@ -417,6 +422,7 @@ async fn run_inner(scene: BrowserlessScene) -> anyhow::Result<BrowserlessResult>
         stale_generation_tiles,
         seed,
         bwe_estimate_bps: bwe_snapshot.bitrate_bps,
+        pacer_rate_bps: bwe_snapshot.pacer_rate_bps,
         bwe_estimate_samples,
         implausible_rtt_samples: bwe_snapshot.implausible_rtt_samples,
         bwe_samples_seen: bwe_snapshot.samples_seen,
