@@ -1187,3 +1187,111 @@ async fn the_estimate_separates_a_congested_link_from_an_uncongested_one() {
         congested.bwe_estimate_bps
     );
 }
+
+/// Capacity triples mid-session: does the estimate find the new headroom?
+///
+/// This is the scenario probing exists for, and the one no test covered.
+/// A session that starts congested and is then handed room to grow has to
+/// *discover* that room — nothing tells it. goog_cc's answer is to probe:
+/// send a short burst above the current estimate and read the ACKs.
+///
+/// Measured answer, 2026-09-14, four runs: the estimate **does** recover,
+/// slowly and with wide variance. Post-step maxima were 378k, 391k, 335k and
+/// 2,112k bits/s against 3.2 Mbps of new capacity, and in every run the final
+/// sample equalled the maximum — the estimate is still climbing when the
+/// scene ends, so 12 s is too short to observe full recovery. One run reached
+/// 2.1 Mbps about 5.8 s after the step; the other three were still near 10%
+/// of capacity at 12 s.
+///
+/// Probe clusters completed (1/1) in all four runs, which is itself new: at
+/// production cadence over the old drop-without-queueing cap they never did.
+/// So probing is working here and the slow ramp is not explained by probe
+/// abandonment — which bounds how much `drain_for_probe_window_open` could
+/// be worth, the open question in
+/// `docs/specs/bwe-probe-emission-timing.md`.
+///
+/// A longer scene would show the full ramp, but 30 s currently panics in
+/// `MetricsTracker::idx` (an unguarded `metrics_tracker.get` in
+/// `dispatch_dirty_tiles_via_scheduler`, whose sibling call a few lines later
+/// *is* bounds-guarded for exactly this reason). Tracked separately; not this
+/// test's business.
+#[tokio::test(start_paused = true)]
+async fn the_estimate_follows_a_mid_scene_capacity_step_up() {
+    const LOW: u64 = 60_000; // bytes/s -> 480 kbps, below the ~1.6 Mbps offered
+    const HIGH: u64 = 400_000; // bytes/s -> 3.2 Mbps, ample headroom
+    const STEP_AT_US: u64 = 5_000_000;
+
+    let r = run_bottleneck_scene(
+        0xC0FF_EE02,
+        CapTimeline::step(LOW, STEP_AT_US, HIGH),
+        std::env::var("GF_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(12),
+    )
+    .await;
+
+    // goog_cc's floor. While the link is congested the estimate sits exactly
+    // here, which is what makes "climbed off the floor" a usable signal.
+    const MIN_BPS: u64 = 200_000;
+
+    let median = |mut v: Vec<u64>| -> u64 {
+        v.sort_unstable();
+        v[v.len() / 2]
+    };
+
+    // Timestamped series, so a window artifact cannot be mistaken for
+    // estimator behaviour. An earlier version of this test used a fixed
+    // [4s, 5s) window for the pre-step value and was flaky for exactly that
+    // reason: how long the estimate stays at its 2 Mbps seed before
+    // congestion is detected varies run to run, so the window sometimes
+    // averaged the seed instead of the converged floor.
+    let series: Vec<String> = r
+        .bwe_estimate_samples
+        .iter()
+        .map(|(t, b)| format!("{}ms:{}", t / 1000, b))
+        .collect();
+    println!("step-up series: {}", series.join(" "));
+
+    let floored_before_step = r
+        .bwe_estimate_samples
+        .iter()
+        .any(|(t, b)| *t < STEP_AT_US && *b <= MIN_BPS);
+    // The last three seconds: goog_cc does not react instantly and the
+    // question is whether it gets there at all, not how fast.
+    let tail: Vec<u64> = r
+        .bwe_estimate_samples
+        .iter()
+        .filter(|(t, _)| *t >= r.bwe_estimate_samples.last().unwrap().0 - 3_000_000)
+        .map(|(_, b)| *b)
+        .collect();
+
+    println!(
+        "step-up: floored_before_step={floored_before_step} tail(median)={} \
+         probes={}/{} pacer={:?}",
+        median(tail.clone()),
+        r.probes_completed,
+        r.probes_abandoned,
+        r.pacer_rate_bps,
+    );
+
+    assert!(
+        floored_before_step,
+        "the pre-step link must actually congest the session down to the \
+         {MIN_BPS} floor, or there is no headroom discovery to observe"
+    );
+    assert!(
+        !tail.is_empty(),
+        "need estimate samples in the final seconds of the scene"
+    );
+    assert!(
+        median(tail.clone()) > MIN_BPS,
+        "after capacity goes from {} to {} bits/s the estimate must climb off \
+         the {MIN_BPS} floor: tail(median)={}. Staying pinned would mean the \
+         session never discovered the new headroom — which is what probing is \
+         for, and a finding rather than a flaky test",
+        LOW * 8,
+        HIGH * 8,
+        median(tail)
+    );
+}
