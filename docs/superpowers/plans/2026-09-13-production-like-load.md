@@ -44,7 +44,7 @@ Re-derive these; they drift.
 - Create: `ghostframe-e2e/src/harness/load_profile.rs`
 - Modify: `ghostframe-e2e/src/harness/mod.rs`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create `ghostframe-e2e/src/harness/load_profile.rs` with only the tests:
 
@@ -113,7 +113,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run them to verify they fail**
+- [x] **Step 2: Run them to verify they fail**
 
 ```bash
 cd /home/cedric/work/ghostframe
@@ -122,7 +122,7 @@ cargo test -p ghostframe-e2e --lib load_profile 2>&1 | tail -5
 
 Expected: compile error, `cannot find type LoadProfile`.
 
-- [ ] **Step 3: Implement the generator**
+- [x] **Step 3: Implement the generator**
 
 Prepend to the same file, above the test module:
 
@@ -246,7 +246,7 @@ Register it in `ghostframe-e2e/src/harness/mod.rs` by adding, alongside the exis
 pub mod load_profile;
 ```
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 ```bash
 cargo test -p ghostframe-e2e --lib load_profile 2>&1 | grep 'test result'
@@ -254,7 +254,7 @@ cargo test -p ghostframe-e2e --lib load_profile 2>&1 | grep 'test result'
 
 Expected: `test result: ok. 4 passed`.
 
-- [ ] **Step 5: Measure generation cost before anything depends on it**
+- [x] **Step 5: Measure generation cost before anything depends on it**
 
 The design flags runtime as the main risk: a 10 s `FullGrid` scene over an 8x8 grid is 19,200 tile encodes per seed.
 
@@ -274,7 +274,7 @@ Run: `cargo test -p ghostframe-e2e --lib generation_cost -- --nocapture 2>&1 | g
 
 **Record the number.** If generation alone exceeds ~2 s, report it and stop — the convergence scenes will need `Region` churn or a smaller grid, and the later tasks' scene shapes need revising before they are written.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add ghostframe-e2e/src/harness/load_profile.rs ghostframe-e2e/src/harness/mod.rs
@@ -293,7 +293,7 @@ grid, which is closer to what a desktop actually dirties."
 - Modify: `ghostframe-e2e/src/harness/browserless.rs`
 - Modify: `ghostframe-e2e/tests/browserless_runner.rs`
 
-- [ ] **Step 1: Add the enum and switch the field**
+- [x] **Step 1: Add the enum and switch the field**
 
 In `browserless.rs`, above `BrowserlessScene`:
 
@@ -311,7 +311,7 @@ pub enum SceneLoad {
 
 Change `BrowserlessScene.frames` from `Vec<FrameScript>` to `pub load: SceneLoad`.
 
-- [ ] **Step 2: Resolve it once, at the top of `run_browserless`**
+- [x] **Step 2: Resolve it once, at the top of `run_browserless`**
 
 Find where `scene.frames` is first used and resolve the load into a concrete `Vec<FrameScript>` before the loop, so the loop body is unchanged:
 
@@ -334,7 +334,7 @@ grep -n 'scene\.frames' ghostframe-e2e/src/harness/browserless.rs
 
 Expected after the edit: no matches.
 
-- [ ] **Step 3: Migrate the existing scenes**
+- [x] **Step 3: Migrate the existing scenes**
 
 Every scene in `tests/browserless_runner.rs` changes `frames: X,` to `load: SceneLoad::Script(X),`. There are 14. Add the import:
 
@@ -342,7 +342,7 @@ Every scene in `tests/browserless_runner.rs` changes `frames: X,` to `load: Scen
 use ghostframe_e2e::harness::browserless::SceneLoad;
 ```
 
-- [ ] **Step 4: Verify nothing moved**
+- [x] **Step 4: Verify nothing moved**
 
 ```bash
 cargo test -p ghostframe-e2e --test browserless_runner -- --test-threads=1 2>&1 | grep 'test result'
@@ -350,7 +350,7 @@ cargo test -p ghostframe-e2e --test browserless_runner -- --test-threads=1 2>&1 
 
 Expected: `14 passed; 0 failed; 1 ignored`. **This task is behaviour-preserving.** A scene that moves means the resolution in Step 2 is wrong, not that anything improved.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A && git commit -m "refactor(e2e): scene load is scripted or generated
@@ -368,7 +368,7 @@ run_browserless so the scene loop is unchanged."
 
 The harness injects every 16 ms; production dispatches every 33.3 ms. Measured blast radius of the change across the whole suite: **exactly 2 scenes of 15**, both probe scenes, both of which Task 6 rewrites.
 
-- [ ] **Step 1: Make cadence a scene field**
+- [x] **Step 1: Make cadence a scene field**
 
 Replace the module constant:
 
@@ -404,11 +404,11 @@ let cadence_us = match &scene.load {
 
 Replace the three `FRAME_SPACING_US` uses (the injection-spacing assignment and two `timestamp_us` computations — find them with `grep -n FRAME_SPACING_US`) with `cadence_us`.
 
-- [ ] **Step 2: Set it on every existing scene**
+- [x] **Step 2: Set it on every existing scene**
 
 Add `cadence_us: DEFAULT_CADENCE_US,` to all 14 scenes.
 
-- [ ] **Step 3: Run the suite and expect exactly two failures**
+- [x] **Step 3: Run the suite and expect exactly two failures**
 
 ```bash
 cargo test -p ghostframe-e2e --test browserless_runner -- --test-threads=1 2>&1 | grep -E '^test |test result'
@@ -416,7 +416,7 @@ cargo test -p ghostframe-e2e --test browserless_runner -- --test-threads=1 2>&1 
 
 Expected: `probe_windows_can_complete_on_a_busy_link` FAILS (0 completions at production cadence — the finding, not a defect). The other 13 pass. If anything else moves, **stop and report**: the measured blast radius was two scenes, and a third means this task changed something it should not have.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add -A && git commit -m "feat(e2e): injection cadence is per-scene, defaulting to 33.3ms
@@ -434,7 +434,7 @@ of 15, both probe scenes, both rewritten in the next commits."
 
 A step-up test needs the estimate before and after the step, not just at the end.
 
-- [ ] **Step 1: Add the field**
+- [x] **Step 1: Add the field**
 
 ```rust
 /// `(virtual_us, bitrate_bps)` sampled at most every 100 ms of virtual
@@ -444,7 +444,7 @@ A step-up test needs the estimate before and after the step, not just at the end
 pub bwe_estimate_samples: Vec<(u64, u64)>,
 ```
 
-- [ ] **Step 2: Sample in the scene loop**
+- [x] **Step 2: Sample in the scene loop**
 
 `bwe_cell` is already cloned before the bridge is moved (`browserless.rs` ~296) and `run()` republishes into it every iteration, so the loop can read it live. Pass the clone into `drive_session`, and near the top of the loop:
 
@@ -466,7 +466,7 @@ let mut next_bwe_sample_us: u64 = 0;
 
 Return `bwe_samples` alongside the existing tuple and populate the new field.
 
-- [ ] **Step 3: Check whether a generated scene still needs heartbeats**
+- [x] **Step 3: Check whether a generated scene still needs heartbeats**
 
 The design flags this as something to verify rather than assume. Heartbeats
 exist so `sweep_rto_retransmits` keeps being called once a script runs out;
@@ -481,7 +481,7 @@ If `next_frame_idx < frames.len()` holds for the whole scene, heartbeats
 never fire and nothing needs changing — **record that and move on**. Do not
 remove the heartbeat path: scripted scenes still depend on it.
 
-- [ ] **Step 4: Verify the series is actually populated**
+- [x] **Step 4: Verify the series is actually populated**
 
 ```bash
 cargo test -p ghostframe-e2e --test browserless_runner bytes_actually_cross -- --test-threads=1 2>&1 | grep 'test result'
@@ -489,7 +489,7 @@ cargo test -p ghostframe-e2e --test browserless_runner bytes_actually_cross -- -
 
 Then add a temporary assertion to that test — `assert!(!r.bwe_estimate_samples.is_empty())` — run it, confirm it passes, and remove it. An empty series that nobody checks is exactly the kind of instrumentation this project has shipped before.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A && git commit -m "feat(e2e): sample the bandwidth estimate over scene time
@@ -504,7 +504,7 @@ virtual time from the cell the bridge already republishes."
 **Files:**
 - Modify: `ghostframe-e2e/tests/browserless_runner.rs`
 
-- [ ] **Step 1: Measure before asserting**
+- [x] **Step 1: Measure before asserting**
 
 Write the scene with a diagnostic print and **no assertion yet**:
 
@@ -547,7 +547,7 @@ done
 
 **Record the spread.** The design requires the tolerance be justified by measurement, not chosen to make the test pass.
 
-- [ ] **Step 2: Decide, and state the discriminating power**
+- [x] **Step 2: Decide, and state the discriminating power**
 
 Set the tolerance from the measured spread, then write the assertion with a comment saying **what regression it would catch**. A tolerance so wide that a broken estimator would still pass is worse than no test:
 
@@ -567,11 +567,11 @@ Set the tolerance from the measured spread, then write the assertion with a comm
 
 Replace the placeholder bounds above with the measured ones.
 
-- [ ] **Step 3: Verify it discriminates**
+- [x] **Step 3: Verify it discriminates**
 
 Temporarily halve `CAP_BPS` in the `NetProfile` only (leaving the assertion's `CAP_BPS`), re-run, and confirm the test **fails**. Restore. A convergence assertion that passes against the wrong cap is measuring nothing.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add -A && git commit -m "test(e2e): the estimate converges toward a known cap
@@ -586,7 +586,7 @@ deliberately wrong cap."
 **Files:**
 - Modify: `ghostframe-e2e/tests/browserless_runner.rs`
 
-- [ ] **Step 1: Write the step-up scene**
+- [x] **Step 1: Write the step-up scene**
 
 ```rust
 /// The scenario probing exists for: capacity increases mid-session, and the
@@ -633,7 +633,7 @@ async fn estimate_follows_a_mid_scene_capacity_step_up() {
 }
 ```
 
-- [ ] **Step 2: Run it, and report the answer either way**
+- [x] **Step 2: Run it, and report the answer either way**
 
 ```bash
 for i in 1 2 3; do
@@ -644,13 +644,13 @@ done
 
 **This is the experiment, not just a test.** If the estimate rises, probe abandonment is benign — the session finds headroom without completing clusters, which answers the question `docs/specs/bwe-probe-emission-timing.md` leaves open. If it does not rise, that is a real production finding about goog_cc's ramp in this system. **Report whichever happens; do not tune the scene until it passes.**
 
-- [ ] **Step 3: Rework the two probe scenes**
+- [x] **Step 3: Rework the two probe scenes**
 
 `probe_windows_can_complete_on_a_busy_link` asserts `probes_completed >= 1`, which is false at production cadence. Replace its assertion with the diagnostic print plus a comment pointing at the spec's cadence table, and rename it to `probe_windows_are_observed_on_a_busy_link`.
 
 Keep `probe_windows_are_abandoned_on_a_demand_starved_link` and its `probes_completed == 0` assertion: it guards against padding creeping in, which is still a real invariant, and it passes at production cadence.
 
-- [ ] **Step 4: Full suite, repeatedly**
+- [x] **Step 4: Full suite, repeatedly**
 
 ```bash
 for i in 1 2 3 4 5; do
@@ -662,7 +662,7 @@ cargo fmt -p ghostframe-e2e
 
 Expected: all green, five times. Local green is weak evidence for this harness — CI is the arbiter.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A && git commit -m "test(e2e): the estimate must follow a mid-scene capacity step-up
@@ -679,23 +679,23 @@ against padding creeping in."
 **Files:**
 - Modify: `docs/specs/bwe-probe-emission-timing.md`
 
-- [ ] **Step 1: Append the result**
+- [x] **Step 1: Append the result**
 
 Add a dated section giving the step-up numbers and stating plainly whether the estimate tracked capacity while probes were abandoned. If it did, say that abandonment is benign in this system and that the drain fix's value is therefore bounded. If it did not, say that and name it as a production concern.
 
-- [ ] **Step 2: Commit and open the PR**
+- [x] **Step 2: Commit and open the PR**
 
 ---
 
 ## Done criteria
 
-- [ ] `LoadProfile::frames_for` covers a scene's whole duration; `Region` churn moves and stays in bounds.
-- [ ] All 14 existing scenes pass unchanged on `SceneLoad::Script`.
-- [ ] Cadence defaults to 33 333 µs; exactly the two probe scenes needed rework.
-- [ ] `bwe_estimate_samples` is populated and verified non-empty.
-- [ ] Convergence tolerance derived from measurement, with its discriminating power stated and verified by a deliberately wrong cap.
-- [ ] Step-up result reported either way, and written into the spec.
-- [ ] Suite green across five consecutive runs; clippy and fmt clean.
+- [x] `LoadProfile::frames_for` covers a scene's whole duration; `Region` churn moves and stays in bounds.
+- [x] All 14 existing scenes pass unchanged on `SceneLoad::Script`.
+- [x] Cadence defaults to 33 333 µs; exactly the two probe scenes needed rework.
+- [x] `bwe_estimate_samples` is populated and verified non-empty.
+- [x] Convergence tolerance derived from measurement, with its discriminating power stated and verified by a deliberately wrong cap.
+- [x] Step-up result reported either way, and written into the spec.
+- [x] Suite green across five consecutive runs; clippy and fmt clean.
 
 ## What this plan does not do
 
