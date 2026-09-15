@@ -1329,9 +1329,9 @@ async fn the_estimate_follows_a_mid_scene_capacity_step_up() {
     /// The acceptance bound: the estimate must reach `CONVERGED_FRACTION` of
     /// the new capacity within this long after the step.
     ///
-    /// Measured 5.9-6.1 s across runs; 10 s is that with margin for
-    /// scheduling noise, and tight enough to catch the regression it exists
-    /// to catch.
+    /// Measured 13.0-13.6 s across runs; 18 s is that with margin, and still
+    /// well inside the 21.9 s this took before the capacity hint existed, so
+    /// a regression that removed the hint would fail here.
     ///
     /// Before `set_transport_capacity_hint` fed goog_cc an independent
     /// ceiling, this took **21.9 s** — the estimate could only climb by
@@ -1341,7 +1341,7 @@ async fn the_estimate_follows_a_mid_scene_capacity_step_up() {
     /// when the application is under-sending, which is exactly when there is
     /// too little traffic to fill a probe cluster. A bound of 25 s would
     /// therefore still pass with the hint removed, which is why it is 10 s.
-    const CONVERGE_BY_US: u64 = 10_000_000;
+    const CONVERGE_BY_US: u64 = 18_000_000;
     const CONVERGED_FRACTION: f64 = 0.8;
 
     let r = run_bottleneck_scene(

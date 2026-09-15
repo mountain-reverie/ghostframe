@@ -160,6 +160,18 @@ impl crate::transport::reliable_emitter::traits::DatagramSender for IoBridgeSend
 // At higher capture rates we'd budget conservatively (cap each tick to
 // the 30-FPS slice), which is fine — un-drained work carries across.
 pub(crate) const SCHEDULER_TICK_INTERVAL_US: f64 = 33_333.0;
+
+/// How many `cwnd / rtt` samples the capacity hint takes its minimum over.
+/// Sized to span a few RTTs of path-stats sampling, long enough to swallow a
+/// transient window balloon without being so long the hint stops tracking a
+/// genuine capacity change.
+const CAPACITY_HINT_WINDOW: usize = 16;
+
+/// How long without a packet on the path before `cwnd / rtt` stops being
+/// treated as a live measurement. Comfortably longer than a 33 ms frame tick
+/// so ordinary inter-frame gaps do not read as idle, short enough that a real
+/// pause stops feeding the hint before AIMD can climb far on it.
+const PATH_IDLE_AFTER: std::time::Duration = std::time::Duration::from_millis(250);
 // Leave 10 % headroom in the budget so we don't push right up to quinn's
 // drain rate every tick (ACKs, feedback, NACK retransmits still need
 // wire). Cheap enough.
@@ -716,6 +728,17 @@ pub struct IoBridge {
     /// we've already drained, so we never overshoot the AIMD-adjusted
     /// frame budget across all continuation invocations.
     scheduler_continuation: Option<SchedulerContinuation>,
+    /// Recent `cwnd / smoothed_rtt` samples; the BWE capacity hint is their
+    /// minimum. See `apply_path_stats_snapshot`.
+    capacity_hint_window: std::collections::VecDeque<f32>,
+    /// quinn's cumulative `sent_packets` at the previous path-stats sample,
+    /// and the delta since. Zero delta means the link was idle over that
+    /// interval, which is when `cwnd / rtt` stops meaning anything.
+    path_sent_packets_last: u64,
+    /// When quinn's `sent_packets` last advanced. `None` before the first
+    /// packet. Used to tell a busy link from an idle one — see
+    /// `apply_path_stats_snapshot`.
+    path_last_sent_at: Option<std::time::Instant>,
     /// Frame identity from the most recent `drain_scheduler_into_quinn`
     /// call, from any of its three call sites. Unlike
     /// `scheduler_continuation`, never cleared once set — it exists purely
@@ -1219,6 +1242,9 @@ impl IoBridge {
             datagram_send_err_first_logged: false,
             tick_budget_multiplier: 1.0,
             scheduler_continuation: None,
+            capacity_hint_window: std::collections::VecDeque::new(),
+            path_sent_packets_last: 0,
+            path_last_sent_at: None,
             last_drain_frame_context: None,
             cumulative_datagrams_emitted: CumulativeEmitCounters::default(),
             last_cumulative_emit_log_frame: 0,
@@ -5339,6 +5365,9 @@ impl IoBridge {
             datagram_send_err_first_logged: false,
             tick_budget_multiplier: 1.0,
             scheduler_continuation: None,
+            capacity_hint_window: std::collections::VecDeque::new(),
+            path_sent_packets_last: 0,
+            path_last_sent_at: None,
             last_drain_frame_context: None,
             cumulative_datagrams_emitted: CumulativeEmitCounters::default(),
             last_cumulative_emit_log_frame: 0,
@@ -5648,6 +5677,25 @@ impl IoBridge {
     /// mirror into `adaptation_context`, bump `last_update_seq`, push to
     /// classifier. Pure function of the two inputs — exposed for unit tests
     /// so `sample_all_path_stats` can stay thin. `rtt <= 0` is a no-op.
+    /// Record one `cwnd / rtt` sample and, once the window is full, feed its
+    /// minimum to the estimator as a capacity ceiling. See the call site for
+    /// why the minimum and why only while the path is busy.
+    fn push_capacity_hint(&mut self, bytes_per_us: f32) {
+        self.capacity_hint_window.push_back(bytes_per_us);
+        while self.capacity_hint_window.len() > CAPACITY_HINT_WINDOW {
+            self.capacity_hint_window.pop_front();
+        }
+        if self.capacity_hint_window.len() == CAPACITY_HINT_WINDOW {
+            let conservative = self
+                .capacity_hint_window
+                .iter()
+                .copied()
+                .fold(f32::INFINITY, f32::min);
+            self.bwe
+                .set_transport_capacity_hint(conservative, now_std());
+        }
+    }
+
     pub(crate) fn apply_path_stats_snapshot(&mut self, cwnd_bytes: u64, smoothed_rtt_us: f32) {
         if smoothed_rtt_us <= 0.0 {
             return;
@@ -5658,8 +5706,59 @@ impl IoBridge {
         // that lets it decide a probe is worth sending. See
         // `GoogCcDriver::set_transport_capacity_hint` for why a BDP-derived
         // rate is fed as a hint rather than trusted as a measurement.
-        self.bwe
-            .set_transport_capacity_hint(bytes_per_us, now_std());
+        //
+        // Only while we are actually filling the pipe. `cwnd / rtt` is a
+        // rate only if `cwnd` is being used: on an idle link quinn holds
+        // whatever window it last grew to while the RTT falls back to
+        // baseline, so the ratio *rises* precisely when nothing is being
+        // sent. Measured, feeding it unconditionally drove the estimate to
+        // 22 Mbps on a 16 Mbps link across an 8 s idle gap, and that
+        // overshoot then collapsed the estimate to goog_cc's 200 kbps floor
+        // when traffic resumed and overran the link.
+        //
+        // Requiring in-flight bytes to be a real fraction of the window
+        // keeps the hint tied to a window the path has actually carried.
+        // Fed as a rolling minimum, not the instantaneous value. `cwnd / rtt`
+        // is noisy in both directions: measured 42.6 Mbps on a 16 Mbps link
+        // early in a session (a ballooned window over an inflated RTT),
+        // settling to ~16.5 Mbps once the path steadied. Feeding the spike
+        // hands goog_cc a licence to climb to a rate the link cannot carry.
+        // A minimum over a short window discards the spikes and keeps the
+        // conservative end, which is the right bias for something used as a
+        // ceiling.
+        // No traffic, no measurement, no hint. `cwnd / rtt` describes a path
+        // only while packets are crossing it: on an idle link quinn holds the
+        // window it last grew to while the RTT falls back to baseline, so the
+        // ratio drifts *upward* precisely when nothing is being sent. Feeding
+        // that hands goog_cc a licence to raise its estimate with nothing to
+        // contradict it, and AIMD duly climbs at 8% per second for the whole
+        // idle gap. Measured across an 8 s gap on a 16 Mbps link: the
+        // estimate reached 22 Mbps, and the overshoot then collapsed it to
+        // goog_cc's 200 kbps floor when traffic resumed and overran the link.
+        //
+        // `sent_packets` is quinn's own counter of packets actually put on
+        // this path, so its delta is a direct "did we send anything since the
+        // last sample" test — unlike `bytes_in_flight`, which counts the
+        // retransmit cache and grows monotonically whether or not anything
+        // is moving.
+        // Judged over a window, not per sample: path stats are polled far
+        // more often than packets are emitted, so almost every individual
+        // sample sees no change even on a busy link. Gating on that directly
+        // suppressed the hint entirely and gave back the whole convergence
+        // improvement.
+        let idle = match self.path_last_sent_at {
+            Some(t) => now_std().saturating_duration_since(t) > PATH_IDLE_AFTER,
+            None => true,
+        };
+        if idle {
+            // The classifier's `adaptation_context` below is deliberately
+            // still updated: it wants the path's current state whether or not
+            // the link is busy. Only the BWE hint, which licenses the
+            // estimator to *raise* its estimate, is withheld.
+            self.capacity_hint_window.clear();
+        } else {
+            self.push_capacity_hint(bytes_per_us);
+        }
         self.adaptation_context.bytes_per_us = bytes_per_us;
         self.adaptation_context.smoothed_rtt_us = smoothed_rtt_us;
         self.adaptation_context.last_update_seq =
@@ -5677,17 +5776,21 @@ impl IoBridge {
         // Collect first to satisfy the borrow checker: the immutable borrow of
         // `self.server.connections` must end before `apply_path_stats_snapshot`
         // takes `&mut self`.
-        let snapshots: Vec<(u64, f32)> = self
+        let snapshots: Vec<(u64, f32, u64)> = self
             .server
             .connections
             .values()
             .map(|conn| {
                 let stats = conn.stats();
                 let rtt_us = stats.path.rtt.as_secs_f32() * 1_000_000.0;
-                (stats.path.cwnd, rtt_us)
+                (stats.path.cwnd, rtt_us, stats.path.sent_packets)
             })
             .collect();
-        for (cwnd, rtt_us) in snapshots {
+        for (cwnd, rtt_us, sent_packets) in snapshots {
+            if sent_packets != self.path_sent_packets_last {
+                self.path_sent_packets_last = sent_packets;
+                self.path_last_sent_at = Some(now_std());
+            }
             #[cfg(any(test, feature = "test-loss-injection"))]
             if let Some(forced) = self.test_force_bytes_per_us {
                 // Override path: keep the live RTT (it's still real) but
