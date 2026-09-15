@@ -888,15 +888,23 @@ async fn probe_windows_are_opened_on_a_busy_link() {
 /// explicitly forbids (see `docs/specs/bwe-probe-emission-timing.md`'s "No
 /// padding" section).
 ///
-/// Reuses `bwe_tier_latency_baseline`'s exact scene shape (`busy_frames(2)`,
-/// 4x4 grid, 10% loss): measured before this fix at 0 completed / 30
-/// abandoned across 30 runs (see the spec doc's "before" evidence), and
-/// still 0 completed / 10 abandoned across 10 runs after it — confirmed by
-/// direct diagnostic logging that `drain_for_probe_window_open`'s own
-/// immediate drain sees a genuinely empty scheduler queue at the moment
-/// this scene's single early probe window opens (the fix correctly does
-/// nothing when there's nothing to drain; see that method's doc comment on
-/// "the demand requirement" the fix does not remove).
+/// Uses a 2x2 grid rather than `bwe_tier_latency_baseline`'s 4x4 one,
+/// because a negative control has to be *robustly* starved, not marginally
+/// so. The 4x4 shape was neither: instrumenting `close_probe_window`
+/// showed its busiest window reaching 18619 bytes against a 22500-byte
+/// `min_bytes` — 83% of the way to completing, and passing `min_probes`
+/// (5) forty-five times over at 224 packets. It stayed under the bar on
+/// byte count alone, with under 4 KB of headroom, so any timing
+/// perturbation tipped it: it began failing in CI purely from a build
+/// profile change that altered task interleaving across the harness's real
+/// socketpair, with no behavioural change at all. At 2x2 the busiest
+/// window reaches 39% of `min_bytes` and most reach 0%, which is the
+/// margin this control needs to mean anything.
+///
+/// The scene still carries real traffic (56 packets in that busiest
+/// window) and still opens and abandons two windows per seed, so the
+/// padding it is written to detect would be just as visible — more so, in
+/// fact, since padding would now have to manufacture the missing 61%.
 #[tokio::test(start_paused = true)]
 async fn probe_windows_are_abandoned_on_a_demand_starved_link() {
     let mut probes_completed_total = 0u64;
@@ -905,15 +913,15 @@ async fn probe_windows_are_abandoned_on_a_demand_starved_link() {
         let seed = 0xB17E_1000_u64.wrapping_add(i);
         let scene = BrowserlessScene {
             seed,
-            load: SceneLoad::Script(busy_frames(2)),
+            load: SceneLoad::Script(busy_frames_grid(2, 2, 2)),
             cadence_us: DEFAULT_CADENCE_US,
             net: NetProfile {
                 loss: 0.10,
                 ..NetProfile::perfect()
             },
             duration: Duration::from_secs(10),
-            grid_cols: 4,
-            grid_rows: 4,
+            grid_cols: 2,
+            grid_rows: 2,
         };
         let r = run_browserless(scene).await.expect("scene ran");
         println!(
