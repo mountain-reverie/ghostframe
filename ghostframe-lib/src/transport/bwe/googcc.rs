@@ -11,6 +11,7 @@ use goog_cc::network_control::{NetworkControllerConfig, NetworkControllerInterfa
 use goog_cc::transport::{
     NetworkAvailability, NetworkControlUpdate, PacedPacketInfo, PacketResult, ProbeClusterConfig,
     ProcessInterval, SentPacket, TargetRateConstraints, TransportPacketsFeedback,
+    StreamsConfig,
 };
 use goog_cc::units::{DataRate, DataSize, Timestamp};
 use goog_cc::{GoogCcConfig, GoogCcNetworkController};
@@ -97,6 +98,35 @@ impl GoogCcDriver {
                 starting_rate: Some(DataRate::from_bits_per_sec(
                     (initial_bps as i64).clamp(MIN_BPS, MAX_BPS),
                 )),
+            },
+            // Both of these default to `None`, which leaves the
+            // `ProbeController` issuing exactly one ladder of probes at
+            // t=0 and then never probing again for the life of the
+            // session. Measured before setting them, on a 12 s
+            // continuous-traffic scene: two windows opened, both at
+            // t=0 ms, and nothing else ever opened.
+            stream_based_config: StreamsConfig {
+                at_time,
+                // Without this, `enable_periodic_alr_probing` is never
+                // called and stays at its `false` default, so
+                // `ProbeController::time_for_alr_probe` returns `false`
+                // unconditionally. A screen-sharing source is
+                // application-limited almost all of the time — it sends
+                // what the screen produced, not what the link could carry
+                // — so ALR probing is the mechanism that would ever
+                // re-measure capacity after startup. Without it a link
+                // whose capacity rises is never discovered: measured
+                // 5.5 Mbps estimated on a link that stepped up to
+                // 20 Mbps mid-scene.
+                requests_alr_probing: Some(true),
+                // The t=0 ladder is issued before the first frame has been
+                // captured, so the scheduler queue is empty and the
+                // windows close having emitted nothing (`packets_sent=0`,
+                // not an under-fill). This re-probes every 1 s for the
+                // first 5 s, by which point there is real traffic for a
+                // window to measure.
+                enable_repeated_initial_probing: Some(true),
+                ..Default::default()
             },
             ..Default::default()
         };

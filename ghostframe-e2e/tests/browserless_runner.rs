@@ -1110,7 +1110,7 @@ async fn run_bottleneck_scene(
         seed,
         load: SceneLoad::Profile(LoadProfile {
             cadence_us: PRODUCTION_CADENCE_US,
-            churn: Churn::Region { tiles_per_tick: 4 },
+            churn: Churn::Region { tiles_per_tick: 32 },
         }),
         cadence_us: PRODUCTION_CADENCE_US,
         net: NetProfile {
@@ -1120,8 +1120,8 @@ async fn run_bottleneck_scene(
             ..NetProfile::perfect()
         },
         duration: Duration::from_secs(secs),
-        grid_cols: 8,
-        grid_rows: 8,
+        grid_cols: 16,
+        grid_rows: 16,
     };
     run_browserless(scene).await.expect("scene ran")
 }
@@ -1158,8 +1158,8 @@ async fn run_bottleneck_scene(
 #[tokio::test(start_paused = true)]
 async fn the_estimate_separates_a_congested_link_from_an_uncongested_one() {
     // Offered load is ~1.6 Mbps, so 480 kbps congests and 3.2 Mbps does not.
-    let congested = run_bottleneck_scene(0xC0FF_EE01, CapTimeline::constant(60_000), 10).await;
-    let spacious = run_bottleneck_scene(0xC0FF_EE01, CapTimeline::constant(400_000), 10).await;
+    let congested = run_bottleneck_scene(0xC0FF_EE01, CapTimeline::constant(500_000), 20).await;
+    let spacious = run_bottleneck_scene(0xC0FF_EE01, CapTimeline::constant(2_000_000), 20).await;
 
     println!(
         "congested: est={} pacer={:?} s2c={} c2s={} dropped={} retx={}\n\
@@ -1229,9 +1229,9 @@ async fn the_estimate_separates_a_congested_link_from_an_uncongested_one() {
 /// test's business.
 #[tokio::test(start_paused = true)]
 async fn the_estimate_follows_a_mid_scene_capacity_step_up() {
-    const LOW: u64 = 60_000; // bytes/s -> 480 kbps, below the ~1.6 Mbps offered
-    const HIGH: u64 = 400_000; // bytes/s -> 3.2 Mbps, ample headroom
-    const STEP_AT_US: u64 = 5_000_000;
+    const LOW: u64 = 500_000; // bytes/s -> 4 Mbps, well below the ~10 Mbps offered
+    const HIGH: u64 = 2_000_000; // bytes/s -> 16 Mbps, ample headroom
+    const STEP_AT_US: u64 = 4_000_000;
 
     let r = run_bottleneck_scene(
         0xC0FF_EE02,
@@ -1239,13 +1239,9 @@ async fn the_estimate_follows_a_mid_scene_capacity_step_up() {
         std::env::var("GF_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(12),
+            .unwrap_or(20),
     )
     .await;
-
-    // goog_cc's floor. While the link is congested the estimate sits exactly
-    // here, which is what makes "climbed off the floor" a usable signal.
-    const MIN_BPS: u64 = 200_000;
 
     let median = |mut v: Vec<u64>| -> u64 {
         v.sort_unstable();
@@ -1265,10 +1261,19 @@ async fn the_estimate_follows_a_mid_scene_capacity_step_up() {
         .collect();
     println!("step-up series: {}", series.join(" "));
 
-    let floored_before_step = r
+    // Pre-step level, measured from 1 s in so the 2 Mbps seed has had time
+    // to be replaced by something the link actually justifies. This used to
+    // assert the estimate was pinned at `MIN_BPS` exactly, which only held
+    // because the old scene offered so little that goog_cc was driven into
+    // its floor and parked there. A scene that genuinely saturates its link
+    // settles on a real value instead (~1.3 Mbps on the 4 Mbps cap), so
+    // "did it climb" is both the honest question and the one with margin.
+    let pre_step: Vec<u64> = r
         .bwe_estimate_samples
         .iter()
-        .any(|(t, b)| *t < STEP_AT_US && *b <= MIN_BPS);
+        .filter(|(t, _)| *t >= 1_000_000 && *t < STEP_AT_US)
+        .map(|(_, b)| *b)
+        .collect();
     // The last three seconds: goog_cc does not react instantly and the
     // question is whether it gets there at all, not how fast.
     let tail: Vec<u64> = r
@@ -1279,8 +1284,8 @@ async fn the_estimate_follows_a_mid_scene_capacity_step_up() {
         .collect();
 
     println!(
-        "step-up: floored_before_step={floored_before_step} tail(median)={} \
-         probes={}/{} pacer={:?}",
+        "step-up: pre_step(median)={} tail(median)={} probes={}/{} pacer={:?}",
+        median(pre_step.clone()),
         median(tail.clone()),
         r.probes_completed,
         r.probes_abandoned,
@@ -1288,22 +1293,31 @@ async fn the_estimate_follows_a_mid_scene_capacity_step_up() {
     );
 
     assert!(
-        floored_before_step,
-        "the pre-step link must actually congest the session down to the \
-         {MIN_BPS} floor, or there is no headroom discovery to observe"
+        !pre_step.is_empty(),
+        "need estimate samples between 1 s and the step at {STEP_AT_US} us"
+    );
+    // The pre-step link carries 4 Mbps against ~10 Mbps offered, so an
+    // estimate anywhere near the post-step capacity would mean the scene
+    // never congested and there is no headroom discovery to observe.
+    assert!(
+        median(pre_step.clone()) < 3_000_000,
+        "the pre-step link must actually congest the session: \
+         pre_step(median)={}",
+        median(pre_step.clone())
     );
     assert!(
         !tail.is_empty(),
         "need estimate samples in the final seconds of the scene"
     );
     assert!(
-        median(tail.clone()) > MIN_BPS,
-        "after capacity goes from {} to {} bits/s the estimate must climb off \
-         the {MIN_BPS} floor: tail(median)={}. Staying pinned would mean the \
+        median(tail.clone()) > median(pre_step.clone()) * 2,
+        "after capacity goes from {} to {} bits/s the estimate must at least \
+         double: pre_step(median)={} tail(median)={}. Staying flat would mean the \
          session never discovered the new headroom — which is what probing is \
          for, and a finding rather than a flaky test",
         LOW * 8,
         HIGH * 8,
+        median(pre_step.clone()),
         median(tail)
     );
 }
