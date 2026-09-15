@@ -7,12 +7,15 @@
 
 use super::timeline::Lo16Timeline;
 use super::{AckArrival, BweSnapshot};
+use goog_cc::experiments::FieldTrials;
 use goog_cc::network_control::{NetworkControllerConfig, NetworkControllerInterface};
 use goog_cc::transport::{
-    NetworkAvailability, NetworkControlUpdate, PacedPacketInfo, PacketResult, ProbeClusterConfig,
-    ProcessInterval, SentPacket, StreamsConfig, TargetRateConstraints, TransportPacketsFeedback,
+    NetworkAvailability, NetworkControlUpdate, NetworkStateEstimate, PacedPacketInfo, PacketResult,
+    ProbeClusterConfig, ProcessInterval, SentPacket, StreamsConfig, TargetRateConstraints,
+    TransportPacketsFeedback,
 };
-use goog_cc::units::{DataRate, DataSize, Timestamp};
+use goog_cc::units::{DataRate, DataSize, TimeDelta, Timestamp};
+use goog_cc::ProbeControllerConfig;
 use goog_cc::{GoogCcConfig, GoogCcNetworkController};
 use std::time::{Duration, Instant};
 
@@ -127,7 +130,27 @@ impl GoogCcDriver {
                 enable_repeated_initial_probing: Some(true),
                 ..Default::default()
             },
-            ..Default::default()
+            field_trials: FieldTrials {
+                probing_configuration: ProbeControllerConfig {
+                    // Both default to `plus_infinity()`, which disables
+                    // `ProbeController::time_for_network_state_probe`
+                    // outright — it returns `false` before even looking at
+                    // the estimate. Finite intervals are what let a fed
+                    // `NetworkStateEstimate` actually trigger a probe.
+                    //
+                    // `network_state_interval` paces the "estimate is below
+                    // the link's known ceiling, go look" probe.
+                    // `est_lower_than_network_interval` paces the more
+                    // urgent case where the estimate is *far* below it
+                    // (`est_lower_than_network_ratio`, default 0.85) and the
+                    // limit is delay-based rather than loss-based — which is
+                    // exactly the post-capacity-increase situation.
+                    network_state_interval: TimeDelta::from_seconds(5),
+                    est_lower_than_network_interval: TimeDelta::from_seconds(3),
+                    ..ProbeControllerConfig::default()
+                },
+                ..FieldTrials::default()
+            },
         };
         let mut ctl = GoogCcNetworkController::new(
             cfg,
@@ -173,6 +196,49 @@ impl GoogCcDriver {
             pacer_rate_bps: None,
             pending_probe_requests: std::collections::VecDeque::new(),
         }
+    }
+
+    /// Feed an independent, transport-derived view of the link's ceiling so
+    /// `ProbeController::time_for_network_state_probe` has something to
+    /// compare the estimate against.
+    ///
+    /// Without this the controller's only route to a mid-session capacity
+    /// increase is `AimdRateControl`'s multiplicative increase, hardcoded at
+    /// `alpha = 1.08` capped to one second of effect — at most 8% per second,
+    /// measured at 21.9 s to reach 80% of a 4 -> 16 Mbps step. ALR probing
+    /// cannot substitute: it fires only when the application is
+    /// under-sending, which is precisely when there is too little traffic to
+    /// fill a probe cluster (measured 0 completed / 7 abandoned).
+    ///
+    /// `bytes_per_us` is `cwnd / smoothed_rtt` from quinn's `PathStats` — a
+    /// BDP-derived rate, which is **not** a capacity measurement. It is what
+    /// quinn's own congestion controller is currently willing to keep in
+    /// flight, so it is bounded below by what the path has actually carried
+    /// without loss, and it responds to congestion on its own. That makes it
+    /// a defensible *upper* hint and a poor absolute truth, which is why it
+    /// is fed only as `link_capacity_upper` and paired with a deliberately
+    /// conservative `confidence`. `link_capacity_lower` is left at zero
+    /// rather than guessed: goog_cc uses the lower bound to raise estimates
+    /// directly, and a wrong floor would push the estimate up with no
+    /// measurement behind it.
+    pub(crate) fn set_transport_capacity_hint(&mut self, bytes_per_us: f32, now: Instant) {
+        if !(bytes_per_us.is_finite() && bytes_per_us > 0.0) {
+            return;
+        }
+        let bps = (bytes_per_us as f64 * 8.0 * 1_000_000.0).min(MAX_BPS as f64);
+        let at = self.to_timestamp(now);
+        let est = NetworkStateEstimate {
+            confidence: 0.5,
+            update_time: at,
+            last_receive_time: at,
+            last_send_time: at,
+            link_capacity: DataRate::from_bits_per_sec(bps as i64),
+            link_capacity_lower: DataRate::zero(),
+            link_capacity_upper: DataRate::from_bits_per_sec(bps as i64),
+            ..Default::default()
+        };
+        let upd = self.ctl.0.on_network_state_estimate(est);
+        self.absorb(upd);
     }
 
     /// Record quinn's measured path RTT. Deliberately NOT fed to the
