@@ -200,6 +200,24 @@ impl ReliableTileEmitter {
             // Bump attempts, re-enqueue every cached fragment, reschedule RTO.
             entry.attempts += 1;
             entry.last_sent_at = now;
+            // A probe cluster measures one burst: goog_cc divides the
+            // cluster's bytes by the span between its first and last send
+            // to get a send rate. This entry is about to be re-sent with a
+            // fresh `emit_us` (below) while still carrying the cluster id
+            // from its original transmission, which stretches that span to
+            // cover the retransmit and makes the rate meaningless.
+            // Measured before this: clusters reported `send: 8970 bytes /
+            // 167 ms` — five frame ticks — against a 20 ms receive span, so
+            // every one was rejected as `receive/send ratio too high`.
+            //
+            // Dropping only the cluster membership is deliberately narrower
+            // than Karn's algorithm, which discards the whole timing sample
+            // from an ambiguous retransmission. That was tried and reverted
+            // (see the revert of 033b138): on a congested link it threw away
+            // 99% of samples and the delay-based estimator went blind. The
+            // delay gradient tolerates the ambiguity; the probe-rate
+            // division does not, so only the latter opts out.
+            entry.probe = None;
             let new_rto = rto_for_attempt(self.smoothed_rtt, entry.attempts);
             entry.rto_deadline = now + new_rto;
             let frags: Vec<Vec<u8>> = entry.fragments.iter().map(|b| b.to_vec()).collect();
@@ -525,6 +543,46 @@ mod tests {
         assert!(entry.last_sent_at > entry_first_sent);
         assert_eq!(e.stats.rto_fired, 1);
         assert_eq!(e.stats.retransmit_attempts_total, 1);
+    }
+
+    #[test]
+    fn retransmit_drops_probe_cluster_membership_but_keeps_the_entry() {
+        // A probe cluster's send rate is its bytes divided by the span
+        // between its first and last send. A retransmit re-sends with a
+        // fresh emit timestamp, so leaving the cluster id attached stretches
+        // that span across the retransmit and corrupts the rate for every
+        // packet in the cluster -- not just this one.
+        let mut e = ReliableTileEmitter::new(Instant::now());
+        let mut sender = CollectSender::default();
+        let t0 = Instant::now();
+        let key = EmitKey::new(1, 0, 0, 0);
+        let tag = ProbeTag {
+            id: 7,
+            min_probes: 5,
+            min_bytes: 11_250,
+            bytes_sent_before: 0,
+        };
+        e.submit_one(key, fake_source(1, 0, 0), t0, Some(tag), t0);
+        e.drain(&mut sender, t0);
+        assert_eq!(
+            e.cache.get(&key).unwrap().probe.map(|p| p.id),
+            Some(7),
+            "the first transmission is a genuine member of cluster 7"
+        );
+
+        let t1 = t0 + Duration::from_millis(60);
+        e.tick(t1, usize::MAX);
+        e.drain(&mut sender, t1);
+
+        let entry = e.cache.get(&key).expect(
+            "the entry must survive: dropping the sample entirely is Karn's \
+             algorithm, which starved the delay-based estimator and was reverted",
+        );
+        assert_eq!(entry.attempts, 1, "it really was retransmitted");
+        assert!(
+            entry.probe.is_none(),
+            "a retransmission belongs to no probe cluster"
+        );
     }
 
     #[test]
