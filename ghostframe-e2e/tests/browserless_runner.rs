@@ -947,6 +947,100 @@ async fn probe_windows_are_abandoned_on_a_demand_starved_link() {
     );
 }
 
+/// BWE/pacing acceptance, criterion 2: **no pass starvation under sustained
+/// pressure**.
+///
+/// `every_cdf53_pass_eventually_lands` covers "every pass of one frame
+/// eventually lands", which is a different and weaker property: it sends a
+/// single frame and gives it 20 s of quiet to converge, so nothing ever
+/// competes with its refinement passes. Starvation is precisely what
+/// happens when something does.
+///
+/// Here the left half of the grid is rewritten every tick for 200 frames
+/// while the right half is written once and never again, on a link too slow
+/// to carry the left half (400 kB/s against the offered load, 5% loss).
+/// The right half's refinement passes are therefore competing with a
+/// saturating stream of fresher, higher-priority work for the whole scene.
+/// If the scheduler starves them, those tiles never reach lossless.
+///
+/// This deliberately does *not* assert on `refinement_latency_max_us`.
+/// Measured at 16.2 s here, which looks alarming and is correct: under
+/// sustained pressure refinement is *deprioritized*, and a bound on that
+/// latency would be asserting a scheduling policy rather than the absence
+/// of starvation. The distinction that matters is whether the passes
+/// eventually land at all.
+#[tokio::test(start_paused = true)]
+async fn a_static_region_still_refines_while_a_busy_one_saturates() {
+    const COLS: u8 = 8;
+    const ROWS: u8 = 8;
+    /// Columns at or above this index are written once, in frame 0, then
+    /// never again — so anything that reaches them afterwards is refinement.
+    const STATIC_FROM: u8 = 4;
+    const FRAMES: usize = 200;
+
+    let frames: Vec<FrameScript> = (0..FRAMES)
+        .map(|i| FrameScript {
+            tiles: (0..COLS)
+                .flat_map(|x| (0..ROWS).map(move |y| (x, y)))
+                .filter(|(x, _)| i == 0 || *x < STATIC_FROM)
+                .map(|(x, y)| {
+                    let bgra = if x < STATIC_FROM {
+                        shifted_gradient_tile(i as u32, x, y)
+                    } else {
+                        gradient_tile()
+                    };
+                    ((x, y), TileSpec::Cdf53 { bgra })
+                })
+                .collect(),
+        })
+        .collect();
+
+    let scene = BrowserlessScene {
+        seed: 0xF00D_5747,
+        load: SceneLoad::Script(frames),
+        cadence_us: DEFAULT_CADENCE_US,
+        net: NetProfile {
+            delay_us: 10_000,
+            loss: 0.05,
+            cap: CapTimeline::constant(400_000),
+            bottleneck: Some(Bottleneck::wifi()),
+            ..NetProfile::perfect()
+        },
+        duration: Duration::from_secs(20),
+        grid_cols: COLS as u32,
+        grid_rows: ROWS as u32,
+    };
+    let r = run_browserless(scene).await.expect("scene ran");
+
+    // The scene must actually be under pressure, or there is no starvation
+    // to observe and this passes vacuously.
+    assert!(
+        r.bytes_dropped > 0,
+        "the busy half must actually saturate the link; dropped={}",
+        r.bytes_dropped
+    );
+
+    let want = expected_rgba(&gradient_tile());
+    let mut starved = Vec::new();
+    for x in STATIC_FROM..COLS {
+        for y in 0..ROWS {
+            if r.framebuffer.tile_rgba(x, y) != Some(want.as_slice()) {
+                starved.push((x, y));
+            }
+        }
+    }
+    assert!(
+        starved.is_empty(),
+        "seed 0xF00D5747: {} static tiles never converged to lossless while the \
+         busy half saturated the link: {:?} -- their refinement passes were \
+         starved (refinement_latency_max={}us, dropped={})",
+        starved.len(),
+        starved,
+        r.refinement_latency_max_us,
+        r.bytes_dropped
+    );
+}
+
 /// A 32x32 BGRA gradient tile, so Cdf53 passes carry real, distinct
 /// bit-plane content rather than a uniform tile's near-identical passes.
 /// Matches `tests/framebuffer.rs`'s `gradient_bgra` pixel-for-pixel.
@@ -1232,6 +1326,24 @@ async fn the_estimate_follows_a_mid_scene_capacity_step_up() {
     const LOW: u64 = 500_000; // bytes/s -> 4 Mbps, well below the ~10 Mbps offered
     const HIGH: u64 = 2_000_000; // bytes/s -> 16 Mbps, ample headroom
     const STEP_AT_US: u64 = 4_000_000;
+    /// The acceptance bound: the estimate must reach `CONVERGED_FRACTION` of
+    /// the new capacity within this long after the step.
+    ///
+    /// 25 s is not a target anyone chose — it is what goog_cc's
+    /// `AimdRateControl::multiplicative_rate_increase` permits. That function
+    /// hardcodes `alpha = 1.08` capped to one second of effect, i.e. at most
+    /// 8% per second, and it is the only mechanism available here: probing
+    /// cannot help, because `ProbeController::time_for_alr_probe` requires
+    /// the *application* to be under-sending, and this scene is
+    /// demand-saturated throughout. Measured 21.9 s to 80%; the bound leaves
+    /// margin for scheduling noise without leaving room for a regression.
+    ///
+    /// Startup is a different story and much faster — the first frame is a
+    /// full screen, `open_probe_window_for_burst` turns it into a real probe
+    /// cluster, and 80% of a 16 Mbps link is reached in ~1.1 s. Only
+    /// *mid-session* increases are gated on AIMD.
+    const CONVERGE_BY_US: u64 = 25_000_000;
+    const CONVERGED_FRACTION: f64 = 0.8;
 
     let r = run_bottleneck_scene(
         0xC0FF_EE02,
@@ -1239,7 +1351,7 @@ async fn the_estimate_follows_a_mid_scene_capacity_step_up() {
         std::env::var("GF_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(20),
+            .unwrap_or(34),
     )
     .await;
 
@@ -1309,15 +1421,41 @@ async fn the_estimate_follows_a_mid_scene_capacity_step_up() {
         !tail.is_empty(),
         "need estimate samples in the final seconds of the scene"
     );
-    assert!(
-        median(tail.clone()) > median(pre_step.clone()) * 2,
-        "after capacity goes from {} to {} bits/s the estimate must at least \
-         double: pre_step(median)={} tail(median)={}. Staying flat would mean the \
-         session never discovered the new headroom — which is what probing is \
-         for, and a finding rather than a flaky test",
-        LOW * 8,
-        HIGH * 8,
-        median(pre_step.clone()),
-        median(tail)
-    );
+    // The acceptance criterion proper: not merely "it moved", but that it
+    // reached the new capacity, and did so within a stated bound. An earlier
+    // version asserted only a doubling, which a 2 -> 4.1 Mbps move on a
+    // 16 Mbps link would have satisfied while missing the cap four-fold.
+    let target_bps = (HIGH * 8) as f64 * CONVERGED_FRACTION;
+    let converged_at = r
+        .bwe_estimate_samples
+        .iter()
+        .find(|(t, b)| *t >= STEP_AT_US && (*b as f64) >= target_bps)
+        .map(|(t, _)| t - STEP_AT_US);
+
+    match converged_at {
+        Some(dt) => assert!(
+            dt <= CONVERGE_BY_US,
+            "capacity went {} -> {} bits/s at {STEP_AT_US}us; the estimate reached \
+             {:.0}% of it only after {}ms, past the {}ms bound. pre_step(median)={} \
+             tail(median)={}",
+            LOW * 8,
+            HIGH * 8,
+            CONVERGED_FRACTION * 100.0,
+            dt / 1000,
+            CONVERGE_BY_US / 1000,
+            median(pre_step.clone()),
+            median(tail.clone())
+        ),
+        None => panic!(
+            "capacity went {} -> {} bits/s at {STEP_AT_US}us and the estimate never \
+             reached {:.0}% of it before the scene ended. pre_step(median)={} \
+             tail(median)={}. Never discovering the new headroom is a finding, \
+             not a flaky test",
+            LOW * 8,
+            HIGH * 8,
+            CONVERGED_FRACTION * 100.0,
+            median(pre_step.clone()),
+            median(tail.clone())
+        ),
+    }
 }
