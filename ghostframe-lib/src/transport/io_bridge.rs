@@ -4949,13 +4949,22 @@ impl IoBridge {
                         }
                     }
                     for dg in to_dispatch {
-                        // Route by discriminator. AckBatch (0x02/0x03) goes
-                        // through the legacy ACK handler; TileNack (0x05)
-                        // routes into the reliable-tile emitter. Other
-                        // kinds (Hello, parity, frame/tile fragments) are
-                        // not currently dispatched on the inbound server
-                        // path and fall through to the no-op leg, which
-                        // matches pre-NACK behavior.
+                        // Route by discriminator. TileNack
+                        // (`TILE_NACK_ENVELOPE`) routes into the
+                        // reliable-tile emitter; everything else falls
+                        // through to `dispatch_ack_datagram`, which
+                        // re-checks the first byte against
+                        // `ACK_BATCH_MSG_TYPE` itself and ignores anything
+                        // else. Other kinds (Hello, frame/tile fragments)
+                        // are not dispatched on the inbound server path.
+                        //
+                        // Note the catch-all is load-bearing: it is why a
+                        // stale `classify_inbound` mapping for the ACK
+                        // discriminator went unnoticed from 2026-06-27
+                        // until 2026-09-15. Adding a second specific arm
+                        // here without checking what `classify_inbound`
+                        // actually returns for a live ACK would silently
+                        // swallow the ACK stream.
                         match crate::transport::protocol::classify_inbound(&dg) {
                             crate::transport::protocol::InboundKind::TileNack => {
                                 self.dispatch_tile_nack_datagram(&dg);
