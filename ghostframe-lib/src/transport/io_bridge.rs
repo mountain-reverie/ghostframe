@@ -159,7 +159,7 @@ impl crate::transport::reliable_emitter::traits::DatagramSender for IoBridgeSend
 // Frame interval: hard-coded for 30 FPS capture (the daemon default).
 // At higher capture rates we'd budget conservatively (cap each tick to
 // the 30-FPS slice), which is fine — un-drained work carries across.
-const SCHEDULER_TICK_INTERVAL_US: f64 = 33_333.0;
+pub(crate) const SCHEDULER_TICK_INTERVAL_US: f64 = 33_333.0;
 // Leave 10 % headroom in the budget so we don't push right up to quinn's
 // drain rate every tick (ACKs, feedback, NACK retransmits still need
 // wire). Cheap enough.

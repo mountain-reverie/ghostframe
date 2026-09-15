@@ -483,18 +483,31 @@ fn probe_request_min_bytes_is_target_rate_times_duration() {
         req.min_bytes, req.target_rate_bps, req.duration
     );
     // Sanity: goog_cc's exponential probing asks for a *ladder* from a
-    // 1 Mbit/s seed -- 3x then 6x -- each for 15ms at 5 minimum packets.
-    // Pin the concrete numbers so a change in goog_cc's own defaults (a
-    // dependency bump) is visible here rather than only in the formula check.
+    // 1 Mbit/s seed -- 3x then 6x -- at 5 minimum packets. Pin the concrete
+    // numbers so a change in goog_cc's own defaults (a dependency bump) is
+    // visible here rather than only in the formula check.
     //
     // The first request surfaced is the *lower* rung. Until 2026-09-14 the
     // driver kept only the last config of each batch and this assertion read
     // 6_000_000: the 3 Mbit/s rung was being discarded, which is the one more
     // likely to be answerable on a slow link.
     assert_eq!(req.target_rate_bps, 3_000_000);
-    assert_eq!(req.duration, Duration::from_millis(15));
     assert_eq!(req.min_probes, 5);
-    assert_eq!(req.min_bytes, 5_625);
+
+    // goog_cc asks for 15 ms, sized for a continuous pacer. `to_probe_request`
+    // floors it at 3 scheduler ticks because our emission is frame-quantised:
+    // every datagram in one tick carries the same `emit_us`, so a window
+    // narrower than a tick can only ever hold one burst and goog_cc rejects
+    // the cluster outright with `send interval: 0 us`. Both the widened
+    // duration and the `min_bytes` derived from it are pinned here, since a
+    // duration floor that failed to scale `min_bytes` would make every
+    // cluster trivially completable.
+    assert!(
+        req.duration >= Duration::from_micros(99_999),
+        "probe window must span multiple scheduler ticks, got {:?}",
+        req.duration
+    );
+    assert_eq!(req.min_bytes, 37_499);
 }
 
 /// goog_cc asks for a ladder of probe clusters, not one; every rung must

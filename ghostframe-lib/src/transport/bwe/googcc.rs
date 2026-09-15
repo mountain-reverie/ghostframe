@@ -397,7 +397,24 @@ impl GoogCcDriver {
         // sentinel values goog_cc never actually hands back here; `.max(0)`
         // is a defensive floor, not an expected path.
         let target_rate_bps = cfg.target_data_rate.bps().max(0);
-        let duration_us = cfg.target_duration.us().max(0);
+        // goog_cc sizes a probe cluster for a continuous pacer, which
+        // spreads the cluster's packets across the window so that
+        // `last_send - first_send` is a real interval it can divide bytes
+        // by. Ours is frame-quantised: a tick hands a whole frame's
+        // datagrams to quinn in one instant, so every packet emitted in one
+        // tick carries the same `emit_us`. A window shorter than the tick
+        // interval can therefore only ever contain a single burst, and
+        // goog_cc rejected every such cluster with `send interval: 0 us`.
+        //
+        // Flooring the window at `MIN_PROBE_TICKS` frame intervals gives it
+        // room for that many distinct send timestamps. `min_bytes` below is
+        // derived from this same widened duration, so the target rate still
+        // has to be *sustained* across the whole window — widening the
+        // window makes a cluster harder to complete, not easier.
+        const MIN_PROBE_TICKS: f64 = 3.0;
+        let min_duration_us = (super::super::io_bridge::SCHEDULER_TICK_INTERVAL_US
+            * MIN_PROBE_TICKS) as i64;
+        let duration_us = cfg.target_duration.us().max(0).max(min_duration_us);
         super::ProbeRequest {
             id: cfg.id,
             target_rate_bps: target_rate_bps as u64,
