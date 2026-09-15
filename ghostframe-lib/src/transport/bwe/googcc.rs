@@ -10,8 +10,7 @@ use super::{AckArrival, BweSnapshot};
 use goog_cc::network_control::{NetworkControllerConfig, NetworkControllerInterface};
 use goog_cc::transport::{
     NetworkAvailability, NetworkControlUpdate, PacedPacketInfo, PacketResult, ProbeClusterConfig,
-    ProcessInterval, SentPacket, TargetRateConstraints, TransportPacketsFeedback,
-    StreamsConfig,
+    ProcessInterval, SentPacket, StreamsConfig, TargetRateConstraints, TransportPacketsFeedback,
 };
 use goog_cc::units::{DataRate, DataSize, Timestamp};
 use goog_cc::{GoogCcConfig, GoogCcNetworkController};
@@ -412,8 +411,8 @@ impl GoogCcDriver {
         // has to be *sustained* across the whole window — widening the
         // window makes a cluster harder to complete, not easier.
         const MIN_PROBE_TICKS: f64 = 3.0;
-        let min_duration_us = (super::super::io_bridge::SCHEDULER_TICK_INTERVAL_US
-            * MIN_PROBE_TICKS) as i64;
+        let min_duration_us =
+            (super::super::io_bridge::SCHEDULER_TICK_INTERVAL_US * MIN_PROBE_TICKS) as i64;
         let duration_us = cfg.target_duration.us().max(0).max(min_duration_us);
         super::ProbeRequest {
             id: cfg.id,
