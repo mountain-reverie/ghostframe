@@ -3,9 +3,10 @@
 //! Used in place of `std::collections::HashMap` wherever iteration order
 //! must match JS `Map` semantics (insertion order, with `set` on an
 //! existing key updating the value *in place* rather than moving it to the
-//! end). These collections are always small (a handful of pending parity
-//! groups, or a handful of fragment groups per tile), so linear scans are
-//! fine and avoid pulling in an external `indexmap` dependency.
+//! end). Every operation here is a linear scan, so this is only
+//! appropriate while a collection stays small — and keeping it small is
+//! the caller's job. `ParityDecoder::pending_parities` once failed to, and
+//! its per-datagram probe loop became quadratic in session length.
 
 /// Insertion-ordered map. Mirrors the subset of JS `Map` behavior this
 /// crate relies on: `set` on an existing key updates the value in place
@@ -60,5 +61,28 @@ impl<K: PartialEq, V> OrderedMap<K, V> {
     /// Iterate entries in insertion order.
     pub fn iter(&self) -> impl Iterator<Item = &(K, V)> {
         self.entries.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Keep only the entries for which `f` returns true, preserving
+    /// insertion order.
+    pub fn retain(&mut self, mut f: impl FnMut(&K, &V) -> bool) {
+        self.entries.retain(|(k, v)| f(k, v));
+    }
+
+    /// Remove and return the oldest entry, or `None` if empty.
+    pub fn remove_oldest(&mut self) -> Option<(K, V)> {
+        if self.is_empty() {
+            None
+        } else {
+            Some(self.entries.remove(0))
+        }
     }
 }
