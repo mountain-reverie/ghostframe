@@ -1329,20 +1329,19 @@ async fn the_estimate_follows_a_mid_scene_capacity_step_up() {
     /// The acceptance bound: the estimate must reach `CONVERGED_FRACTION` of
     /// the new capacity within this long after the step.
     ///
-    /// 25 s is not a target anyone chose — it is what goog_cc's
-    /// `AimdRateControl::multiplicative_rate_increase` permits. That function
-    /// hardcodes `alpha = 1.08` capped to one second of effect, i.e. at most
-    /// 8% per second, and it is the only mechanism available here: probing
-    /// cannot help, because `ProbeController::time_for_alr_probe` requires
-    /// the *application* to be under-sending, and this scene is
-    /// demand-saturated throughout. Measured 21.9 s to 80%; the bound leaves
-    /// margin for scheduling noise without leaving room for a regression.
+    /// Measured 5.9-6.1 s across runs; 10 s is that with margin for
+    /// scheduling noise, and tight enough to catch the regression it exists
+    /// to catch.
     ///
-    /// Startup is a different story and much faster — the first frame is a
-    /// full screen, `open_probe_window_for_burst` turns it into a real probe
-    /// cluster, and 80% of a 16 Mbps link is reached in ~1.1 s. Only
-    /// *mid-session* increases are gated on AIMD.
-    const CONVERGE_BY_US: u64 = 25_000_000;
+    /// Before `set_transport_capacity_hint` fed goog_cc an independent
+    /// ceiling, this took **21.9 s** — the estimate could only climb by
+    /// `AimdRateControl`'s multiplicative increase, which hardcodes
+    /// `alpha = 1.08` capped to one second of effect (8% per second). ALR
+    /// probing cannot substitute for it: `time_for_alr_probe` fires only
+    /// when the application is under-sending, which is exactly when there is
+    /// too little traffic to fill a probe cluster. A bound of 25 s would
+    /// therefore still pass with the hint removed, which is why it is 10 s.
+    const CONVERGE_BY_US: u64 = 10_000_000;
     const CONVERGED_FRACTION: f64 = 0.8;
 
     let r = run_bottleneck_scene(
@@ -1351,7 +1350,7 @@ async fn the_estimate_follows_a_mid_scene_capacity_step_up() {
         std::env::var("GF_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(34),
+            .unwrap_or(20),
     )
     .await;
 
@@ -1396,7 +1395,12 @@ async fn the_estimate_follows_a_mid_scene_capacity_step_up() {
         .collect();
 
     println!(
-        "step-up: pre_step(median)={} tail(median)={} probes={}/{} pacer={:?}",
+        "step-up: converged_at={:?}ms pre_step(median)={} tail(median)={} probes={}/{} pacer={:?}",
+        r.bwe_estimate_samples
+            .iter()
+            .find(|(t, b)| *t >= STEP_AT_US
+                && (*b as f64) >= (HIGH * 8) as f64 * CONVERGED_FRACTION)
+            .map(|(t, _)| (t - STEP_AT_US) / 1000),
         median(pre_step.clone()),
         median(tail.clone()),
         r.probes_completed,
@@ -1408,13 +1412,22 @@ async fn the_estimate_follows_a_mid_scene_capacity_step_up() {
         !pre_step.is_empty(),
         "need estimate samples between 1 s and the step at {STEP_AT_US} us"
     );
-    // The pre-step link carries 4 Mbps against ~10 Mbps offered, so an
-    // estimate anywhere near the post-step capacity would mean the scene
-    // never congested and there is no headroom discovery to observe.
+    // The pre-step link carries 4 Mbps against ~10 Mbps offered, so the
+    // estimate must sit at or below that — an estimate anywhere near the
+    // post-step capacity would mean the scene never congested and there is
+    // no headroom discovery to observe.
+    //
+    // Bounded by the *actual* pre-step capacity rather than a hand-picked
+    // number: an estimate above the link's real rate is an overestimate,
+    // which is a bug in its own right and the dangerous direction. An
+    // earlier version used a flat 3 Mbps and started failing when the
+    // estimator got *better* (1.9 -> 3.03 Mbps on a 4 Mbps link), which is
+    // the wrong thing for a test to punish.
     assert!(
-        median(pre_step.clone()) < 3_000_000,
-        "the pre-step link must actually congest the session: \
-         pre_step(median)={}",
+        median(pre_step.clone()) <= LOW * 8,
+        "the pre-step link carries {} bits/s; an estimate above that is an \
+         overestimate, not congestion: pre_step(median)={}",
+        LOW * 8,
         median(pre_step.clone())
     );
     assert!(

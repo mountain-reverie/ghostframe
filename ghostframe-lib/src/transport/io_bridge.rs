@@ -2290,7 +2290,29 @@ impl IoBridge {
         // `scheduler.tick` is destructive.
         let pre_clamp_budget = match &self.active_probe {
             Some(probe) => {
-                pacer_tick_budget_bytes(probe.target_rate_bps, SCHEDULER_TICK_INTERVAL_US)
+                // A probe must send at *least* its target rate, but must
+                // never send *less* than we otherwise would. Overriding the
+                // pacing budget outright throttles emission whenever the
+                // probe target sits below the current pacer rate — the pacer
+                // runs at 2.5x the estimate while an early ladder rung is
+                // only 2x, so that window is real. Measured on the
+                // propagation-delay scene: delivered bytes fell 23% (747 kB
+                // -> 577 kB) once network-state probing made windows
+                // frequent enough for it to matter.
+                //
+                // Taking the max keeps the cluster's floor at the target
+                // while leaving throughput alone. goog_cc computes a
+                // cluster's send rate from what was actually sent, not from
+                // what was requested, so exceeding the target costs nothing.
+                let probe_budget =
+                    pacer_tick_budget_bytes(probe.target_rate_bps, SCHEDULER_TICK_INTERVAL_US);
+                let paced_budget = combine_pacing_budget(
+                    pacing_mode,
+                    base_budget_bytes,
+                    bwe_snap.pacer_rate_bps,
+                    SCHEDULER_TICK_INTERVAL_US,
+                );
+                probe_budget.max(paced_budget)
             }
             None => combine_pacing_budget(
                 pacing_mode,
@@ -5631,6 +5653,13 @@ impl IoBridge {
             return;
         }
         let bytes_per_us = (cwnd_bytes as f32) / smoothed_rtt_us;
+        // Same number, second consumer: the classifier uses it to pick
+        // codecs, and the BWE controller uses it as the independent ceiling
+        // that lets it decide a probe is worth sending. See
+        // `GoogCcDriver::set_transport_capacity_hint` for why a BDP-derived
+        // rate is fed as a hint rather than trusted as a measurement.
+        self.bwe
+            .set_transport_capacity_hint(bytes_per_us, now_std());
         self.adaptation_context.bytes_per_us = bytes_per_us;
         self.adaptation_context.smoothed_rtt_us = smoothed_rtt_us;
         self.adaptation_context.last_update_seq =
