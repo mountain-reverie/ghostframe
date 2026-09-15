@@ -172,6 +172,50 @@ const CAPACITY_HINT_WINDOW: usize = 16;
 /// so ordinary inter-frame gaps do not read as idle, short enough that a real
 /// pause stops feeding the hint before AIMD can climb far on it.
 const PATH_IDLE_AFTER: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How far back the link-stability judgement looks. Matches RFC 7661's
+/// non-validated period, which is the longest any standard is willing to
+/// trust a capacity measurement across.
+const STABILITY_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Cumulative time the path must actually have been *carrying traffic*
+/// within `STABILITY_WINDOW` before the long hold can be granted.
+///
+/// This is the load-bearing guard. A link is only observable while we are
+/// sending, so "no fast change was seen" is nearly vacuous for a session
+/// that was idle throughout — and would otherwise hand the *most* trust to
+/// the case with the *least* evidence. Requiring positive evidence inverts
+/// that: stability must be earned, not merely un-contradicted.
+const STABILITY_MIN_ACTIVE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Largest ratio between the highest and lowest estimate in the window that
+/// still counts as a stable link.
+///
+/// Deliberately measured on our own estimate, which conflates a real
+/// capacity change with our control loop oscillating. That is the right
+/// conflation for this decision: if the estimate swung this far, either the
+/// link moved or the loop is unstable, and a stale value is a bad thing to
+/// trust in both cases.
+const STABILITY_MAX_SWING: f64 = 1.5;
+
+/// Hold granted to a link that has earned it.
+const HOLD_STABLE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Hold for everything else. Cellular capacity is measured oscillating by a
+/// factor of two within a few seconds, so an unearned hold belongs in
+/// seconds; RFC 7661's five minutes is justified for wired paths only.
+const HOLD_UNPROVEN: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// How long a held rate keeps applying *after* traffic resumes.
+///
+/// The hold exists to bridge a gap, not to replace measurement. Its whole
+/// value is in the first moments of resumption, before fresh feedback has
+/// reached the estimator; past that, goog_cc has real evidence again and
+/// deferring to a stale number would be strictly worse. Leaving the hold in
+/// force while actively sending overrode the live estimate for the length of
+/// the hold and produced precisely the overshoot-then-collapse it was added
+/// to prevent.
+const HOLD_HANDOVER: std::time::Duration = std::time::Duration::from_millis(500);
 // Leave 10 % headroom in the budget so we don't push right up to quinn's
 // drain rate every tick (ACKs, feedback, NACK retransmits still need
 // wire). Cheap enough.
@@ -735,6 +779,22 @@ pub struct IoBridge {
     /// and the delta since. Zero delta means the link was idle over that
     /// interval, which is when `cwnd / rtt` stops meaning anything.
     path_sent_packets_last: u64,
+    /// quinn's cumulative `congestion_events` at the previous sample. A rise
+    /// after an idle hold resumes means the held rate was wrong, and the
+    /// hold is abandoned immediately.
+    path_congestion_events_last: u64,
+    /// `(observed_at, estimate_bps)` over `STABILITY_WINDOW`, recorded only
+    /// while the path is carrying traffic. See `link_is_stable`.
+    stability_samples: std::collections::VecDeque<(std::time::Instant, u64)>,
+    /// Cumulative time the path was active within the window, approximated by
+    /// summing the gaps between consecutive active samples.
+    stability_active: std::time::Duration,
+    /// Set when the path goes idle: the pacing rate that was live at that
+    /// moment, and when trusting it expires. See `idle_hold_pacer_rate`.
+    idle_hold: Option<IdleHold>,
+    /// When the path last went from idle back to carrying traffic. Bounds how
+    /// long a held rate keeps applying once real feedback is flowing again.
+    active_since: Option<std::time::Instant>,
     /// When quinn's `sent_packets` last advanced. `None` before the first
     /// packet. Used to tell a busy link from an idle one — see
     /// `apply_path_stats_snapshot`.
@@ -1023,6 +1083,30 @@ struct UniqueColorHistogram {
 /// in-flight drain and is cleared once that budget is exhausted — this
 /// field is never cleared; it always holds the last valid identity.
 ///
+/// A bandwidth measurement kept alive across an idle gap.
+///
+/// The literature is consistent that decaying an estimate through idle is
+/// the wrong default — RFC 2861 tried it and was withdrawn as "too
+/// conservative"; RFC 7661 replaced it with a non-validated period that
+/// preserves the window for up to five minutes; BBR simply never lowers
+/// `max_bw` from application-limited samples and resumes paced at the old
+/// rate. RFC 9002 section 7.8 requires only that the window not be
+/// *increased* while underutilized, which is what `PATH_IDLE_AFTER` already
+/// enforces on the capacity hint.
+///
+/// What none of them do is trust the old value unconditionally. Each pairs
+/// it with a restart safeguard, so this does too: the resumed rate is paced,
+/// not burst, and the first congestion event after resumption abandons the
+/// hold outright.
+#[derive(Debug, Clone, Copy)]
+struct IdleHold {
+    /// The pacing rate that was live when the path went idle.
+    pacer_rate_bps: u64,
+    /// When this stops being trusted. Length depends on whether the link had
+    /// earned it — see `hold_duration_for_link`.
+    expires_at: std::time::Instant,
+}
+
 /// BWE probe-window bookkeeping (see `open_probe_window_for_burst`)
 /// reuses this: `drain_scheduler_into_quinn` stamps `seq |
 /// TILE_DATAGRAM_FLAG` into every datagram header, and the client keys tile
@@ -1244,6 +1328,11 @@ impl IoBridge {
             scheduler_continuation: None,
             capacity_hint_window: std::collections::VecDeque::new(),
             path_sent_packets_last: 0,
+            path_congestion_events_last: 0,
+            stability_samples: std::collections::VecDeque::new(),
+            stability_active: std::time::Duration::ZERO,
+            idle_hold: None,
+            active_since: None,
             path_last_sent_at: None,
             last_drain_frame_context: None,
             cumulative_datagrams_emitted: CumulativeEmitCounters::default(),
@@ -2307,6 +2396,14 @@ impl IoBridge {
 
         let bwe_snap = self.bwe.snapshot();
         let pacing_mode = select_pacing_mode(bwe_snap.samples_seen);
+        // goog_cc decays its estimate through an idle gap because it has no
+        // evidence to support it. `idle_hold_pacer_rate` supplies the
+        // evidence it discarded — the rate this link was last measured at —
+        // bounded by how much the link has earned (see `IdleHold`). It is
+        // still a *pacing* rate, so the resumed burst is paced at the held
+        // value rather than dumped, which is the restart safeguard BBR and
+        // RFC 7661 both require.
+        let effective_pacer_rate = self.idle_hold_pacer_rate(now_std(), bwe_snap.pacer_rate_bps);
         // BWE Stage 2.4: a probe window overrides the pacing budget
         // outright rather than going through `combine_pacing_budget` —
         // probing exists to send *above* goog_cc's own current estimate,
@@ -2335,7 +2432,7 @@ impl IoBridge {
                 let paced_budget = combine_pacing_budget(
                     pacing_mode,
                     base_budget_bytes,
-                    bwe_snap.pacer_rate_bps,
+                    effective_pacer_rate,
                     SCHEDULER_TICK_INTERVAL_US,
                 );
                 probe_budget.max(paced_budget)
@@ -2343,7 +2440,7 @@ impl IoBridge {
             None => combine_pacing_budget(
                 pacing_mode,
                 base_budget_bytes,
-                bwe_snap.pacer_rate_bps,
+                effective_pacer_rate,
                 SCHEDULER_TICK_INTERVAL_US,
             ),
         };
@@ -5367,6 +5464,11 @@ impl IoBridge {
             scheduler_continuation: None,
             capacity_hint_window: std::collections::VecDeque::new(),
             path_sent_packets_last: 0,
+            path_congestion_events_last: 0,
+            stability_samples: std::collections::VecDeque::new(),
+            stability_active: std::time::Duration::ZERO,
+            idle_hold: None,
+            active_since: None,
             path_last_sent_at: None,
             last_drain_frame_context: None,
             cumulative_datagrams_emitted: CumulativeEmitCounters::default(),
@@ -5677,6 +5779,90 @@ impl IoBridge {
     /// mirror into `adaptation_context`, bump `last_update_seq`, push to
     /// classifier. Pure function of the two inputs — exposed for unit tests
     /// so `sample_all_path_stats` can stay thin. `rtt <= 0` is a no-op.
+    /// Record the current estimate as evidence about this link, and age out
+    /// anything older than `STABILITY_WINDOW`.
+    ///
+    /// Only called while the path is carrying traffic: an estimate observed
+    /// over an idle link says nothing about the link.
+    fn record_stability_sample(&mut self, now: std::time::Instant, estimate_bps: u64) {
+        if let Some((prev_at, _)) = self.stability_samples.back() {
+            // Sum only gaps short enough to be one continuous active stretch.
+            // A longer gap means the path went quiet in between, and that
+            // time was not observation.
+            let gap = now.saturating_duration_since(*prev_at);
+            if gap <= PATH_IDLE_AFTER {
+                self.stability_active += gap;
+            }
+        }
+        self.stability_samples.push_back((now, estimate_bps));
+        while let Some((at, _)) = self.stability_samples.front() {
+            if now.saturating_duration_since(*at) > STABILITY_WINDOW {
+                self.stability_samples.pop_front();
+            } else {
+                break;
+            }
+        }
+        // `stability_active` is a running sum rather than a recomputation, so
+        // it would otherwise grow past the window it is meant to describe.
+        let span = match (self.stability_samples.front(), self.stability_samples.back()) {
+            (Some((first, _)), Some((last, _))) => last.saturating_duration_since(*first),
+            _ => std::time::Duration::ZERO,
+        };
+        self.stability_active = self.stability_active.min(span);
+    }
+
+    /// Whether this link has *earned* a long hold.
+    ///
+    /// Two conditions, both required. The active-time floor is the important
+    /// one: a link is only observable while we send, so absence of an
+    /// observed change is not evidence of stability, and without this the
+    /// least-observed sessions would get the most trust.
+    fn link_is_stable(&self) -> bool {
+        if self.stability_active < STABILITY_MIN_ACTIVE {
+            return false;
+        }
+        let mut lo = u64::MAX;
+        let mut hi = 0u64;
+        for (_, bps) in self.stability_samples.iter() {
+            lo = lo.min(*bps);
+            hi = hi.max(*bps);
+        }
+        if lo == 0 || hi == 0 {
+            return false;
+        }
+        (hi as f64 / lo as f64) <= STABILITY_MAX_SWING
+    }
+
+    fn hold_duration_for_link(&self) -> std::time::Duration {
+        if self.link_is_stable() {
+            HOLD_STABLE
+        } else {
+            HOLD_UNPROVEN
+        }
+    }
+
+    /// The pacing rate to use right now, accounting for a held measurement.
+    ///
+    /// Returns the larger of goog_cc's current rate and a held one that has
+    /// not expired. goog_cc decays its estimate through idle because it has
+    /// no evidence to support it; this supplies the evidence it discarded,
+    /// bounded by how much the link has earned.
+    fn idle_hold_pacer_rate(&mut self, now: std::time::Instant, live: Option<u64>) -> Option<u64> {
+        let held = match self.idle_hold {
+            Some(h) if now < h.expires_at => Some(h.pacer_rate_bps),
+            Some(_) => {
+                self.idle_hold = None;
+                None
+            }
+            None => None,
+        };
+        match (live, held) {
+            (Some(l), Some(h)) => Some(l.max(h)),
+            (Some(l), None) => Some(l),
+            (None, h) => h,
+        }
+    }
+
     /// Record one `cwnd / rtt` sample and, once the window is full, feed its
     /// minimum to the estimator as a capacity ceiling. See the call site for
     /// why the minimum and why only while the path is busy.
@@ -5750,14 +5936,43 @@ impl IoBridge {
             Some(t) => now_std().saturating_duration_since(t) > PATH_IDLE_AFTER,
             None => true,
         };
+        let now = now_std();
         if idle {
             // The classifier's `adaptation_context` below is deliberately
             // still updated: it wants the path's current state whether or not
             // the link is busy. Only the BWE hint, which licenses the
             // estimator to *raise* its estimate, is withheld.
             self.capacity_hint_window.clear();
+            self.active_since = None;
+            // Capture the rate that was live going into the gap, once, and
+            // for as long as this link has earned.
+            if self.idle_hold.is_none() {
+                if let Some(rate) = self.bwe.snapshot().pacer_rate_bps {
+                    let hold = self.hold_duration_for_link();
+                    tracing::debug!(
+                        pacer_rate_bps = rate,
+                        hold_secs = hold.as_secs(),
+                        stable = self.link_is_stable(),
+                        active_secs = self.stability_active.as_secs(),
+                        "bwe: path idle, holding last measured rate"
+                    );
+                    self.idle_hold = Some(IdleHold {
+                        pacer_rate_bps: rate,
+                        expires_at: now + hold,
+                    });
+                }
+            }
         } else {
+            // Traffic is flowing again. The held rate covers the handover and
+            // then stands down: past `HOLD_HANDOVER` the estimator has fresh
+            // feedback and is the better authority.
+            let resumed_at = *self.active_since.get_or_insert(now);
+            if now.saturating_duration_since(resumed_at) > HOLD_HANDOVER {
+                self.idle_hold = None;
+            }
             self.push_capacity_hint(bytes_per_us);
+            let est = self.bwe.snapshot().bitrate_bps;
+            self.record_stability_sample(now, est);
         }
         self.adaptation_context.bytes_per_us = bytes_per_us;
         self.adaptation_context.smoothed_rtt_us = smoothed_rtt_us;
@@ -5776,17 +5991,33 @@ impl IoBridge {
         // Collect first to satisfy the borrow checker: the immutable borrow of
         // `self.server.connections` must end before `apply_path_stats_snapshot`
         // takes `&mut self`.
-        let snapshots: Vec<(u64, f32, u64)> = self
+        let snapshots: Vec<(u64, f32, u64, u64)> = self
             .server
             .connections
             .values()
             .map(|conn| {
                 let stats = conn.stats();
                 let rtt_us = stats.path.rtt.as_secs_f32() * 1_000_000.0;
-                (stats.path.cwnd, rtt_us, stats.path.sent_packets)
+                (
+                    stats.path.cwnd,
+                    rtt_us,
+                    stats.path.sent_packets,
+                    stats.path.congestion_events,
+                )
             })
             .collect();
-        for (cwnd, rtt_us, sent_packets) in snapshots {
+        for (cwnd, rtt_us, sent_packets, congestion_events) in snapshots {
+            // A congestion event while a held rate is in force means the
+            // held rate was wrong for the link we came back to. Abandon it
+            // at once rather than waiting for the hold to expire — this is
+            // the safeguard every source that preserves a stale estimate
+            // pairs it with.
+            if congestion_events > self.path_congestion_events_last {
+                self.path_congestion_events_last = congestion_events;
+                if self.idle_hold.take().is_some() {
+                    tracing::debug!("bwe: congestion after idle hold; abandoning held rate");
+                }
+            }
             if sent_packets != self.path_sent_packets_last {
                 self.path_sent_packets_last = sent_packets;
                 self.path_last_sent_at = Some(now_std());
