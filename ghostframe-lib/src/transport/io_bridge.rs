@@ -1571,7 +1571,6 @@ impl IoBridge {
         budget.min(quinn_cap)
     }
 
-
     /// BWE Stage 2.4: open a new probe window if goog_cc requested one
     /// since the last poll, then close the current window once its
     /// duration has elapsed. Called unconditionally from every `run()`
@@ -8057,8 +8056,6 @@ mod tests {
             );
         }
     }
-
-
 
     /// Task 3: the tile-injection channel must enqueue injected work into
     /// the scheduler and attempt a drain. With no connected WebTransport
