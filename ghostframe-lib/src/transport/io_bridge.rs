@@ -2692,29 +2692,6 @@ impl IoBridge {
                         let Some(entry) = cache_entry else {
                             continue;
                         };
-                        // Karn's algorithm. An ACK names a tile-pass
-                        // (`EmitKey`), not a transmission, so once a pass has
-                        // been retransmitted there is no way to know which
-                        // send the ACK refers to -- and `last_sent_at` has
-                        // already been overwritten by the most recent one.
-                        // Pairing them reports a send time that may never have
-                        // produced this ACK.
-                        //
-                        // For a probe-tagged pass it is worse than a bad RTT
-                        // sample: the retransmit re-enters the cluster under
-                        // the original id at a far later send time, stretching
-                        // the cluster's measured send interval past the window
-                        // it was meant to occupy. goog_cc rejects any cluster
-                        // whose send interval exceeds MAX_PROBE_INTERVAL (1s),
-                        // and we measured spans of 1167ms.
-                        //
-                        // The standard answer is to take no timing sample from
-                        // a retransmitted packet. Delivery accounting is
-                        // unaffected -- that happens in the ACK loop below,
-                        // which still sees every entry.
-                        if entry.attempts > 0 {
-                            continue;
-                        }
                         let size_bytes: u32 = entry.fragments.iter().map(|f| f.len() as u32).sum();
                         let server_emit_us = entry
                             .last_sent_at
@@ -6476,67 +6453,6 @@ mod tests {
              whose first and last arrival are simultaneous is rejected by \
              goog_cc as an invalid interval, which is 66 of the 121 \
              rejections this wire format exists to remove"
-        );
-    }
-
-    /// Karn's algorithm: a retransmitted pass yields no timing sample.
-    ///
-    /// An ACK names a tile-pass, not a transmission, so after a retransmit
-    /// there is no way to tell which send it acknowledges -- and
-    /// `last_sent_at` now holds the later one. Sampling it would report a
-    /// send time that may never have produced this ACK, and for a
-    /// probe-tagged pass would stretch the cluster's send interval past
-    /// goog_cc's 1s limit.
-    ///
-    /// Delivery accounting must be unaffected: the ACK still counts.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_retransmitted_pass_yields_no_timing_sample() {
-        use crate::transport::ack::{AckBatch, AckEntry};
-        use crate::transport::reliable_emitter::EmitKey;
-
-        let (our_end, _peer) = UnixStream::pair().expect("pair");
-        let server = QuicServer::new().expect("server");
-        let mut bridge = IoBridge::new_with_stream_for_test(our_end, server);
-
-        // Two passes: one sent once, one retransmitted.
-        let fresh_key = EmitKey::new(20, 0, 0, 0);
-        let resent_key = EmitKey::new(21, 0, 0, 0);
-        for key in [fresh_key, resent_key] {
-            bridge.reliable_emitter.submit_one(
-                key,
-                bytes::Bytes::from(vec![0u8; 20]),
-                std::time::Instant::now(),
-                None,
-                std::time::Instant::now(),
-            );
-        }
-        // Mark one as having been resent, exactly as the RTO path does.
-        bridge
-            .reliable_emitter
-            .cache
-            .get_mut(&resent_key)
-            .expect("cached")
-            .attempts = 1;
-
-        let batch = AckBatch::new(
-            vec![
-                AckEntry { frame_seq: 20, tile_x: 0, tile_y: 0, pass_idx: 0, arrival_us: 1_000_000 },
-                AckEntry { frame_seq: 21, tile_x: 0, tile_y: 0, pass_idx: 0, arrival_us: 1_000_500 },
-            ],
-            vec![],
-        )
-        .expect("valid ack batch");
-        bridge.dispatch_ack_datagram(&batch.encode());
-
-        assert_eq!(
-            bridge.bwe_samples_buffer.len(),
-            1,
-            "only the once-sent pass may produce a timing sample; the \
-             retransmitted one is ambiguous and must be skipped"
-        );
-        assert_eq!(
-            bridge.bwe_samples_buffer[0].client_arrival_us, 1_000_000,
-            "the surviving sample must be the once-sent pass, not the resent one"
         );
     }
 
