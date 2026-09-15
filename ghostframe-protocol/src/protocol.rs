@@ -810,6 +810,34 @@ pub enum InboundKind {
     TileFragment,  // first byte 0x80..=0xFF (TILE_DATAGRAM_FLAG bit set)
 }
 
+/// Every discriminator that can lead the first byte of a **client -> server**
+/// datagram, paired with the kind `classify_inbound` must return for it.
+///
+/// This is the single place to register an inbound message type. Two tests
+/// hold it to that: one checks no two entries share a value, and the other
+/// walks every envelope byte and fails if `classify_inbound` routes one that
+/// is missing here. The second direction is the load-bearing one — it means
+/// a new type cannot be wired into the classifier without being registered,
+/// and therefore cannot collide with an existing type unnoticed.
+///
+/// Superseded revisions (0x02, 0x03) are deliberately absent: they classify
+/// as `AckBatchV1`, which the tests treat as "not routed anywhere that
+/// matters" — the decoder rejects them outright.
+#[cfg(test)]
+const INBOUND_DISCRIMINATORS: &[(&str, u8, InboundKind)] = &[
+    (
+        "feedback/hello",
+        crate::feedback::FEEDBACK_MSG_TYPE,
+        InboundKind::Hello,
+    ),
+    (
+        "ack batch",
+        crate::ack::ACK_BATCH_MSG_TYPE,
+        InboundKind::AckBatch,
+    ),
+    ("tile nack", TILE_NACK_ENVELOPE, InboundKind::TileNack),
+];
+
 pub fn classify_inbound(data: &[u8]) -> InboundKind {
     let Some(&first) = data.first() else {
         return InboundKind::Empty;
@@ -1490,18 +1518,46 @@ mod tests {
 
     #[test]
     fn inbound_message_discriminators_do_not_collide() {
-        // Every client->server first byte must map to exactly one kind. A
-        // collision does not fail loudly -- it silently routes one message
+        // A collision does not fail loudly -- it silently routes one message
         // type into another's handler, which drops it.
-        let discriminators = [
-            ("feedback/hello", crate::feedback::FEEDBACK_MSG_TYPE),
-            ("ack batch", crate::ack::ACK_BATCH_MSG_TYPE),
-            ("tile nack", TILE_NACK_ENVELOPE),
-        ];
-        for (i, (name_a, a)) in discriminators.iter().enumerate() {
-            for (name_b, b) in &discriminators[i + 1..] {
+        for (i, (name_a, a, _)) in INBOUND_DISCRIMINATORS.iter().enumerate() {
+            for (name_b, b, _) in &INBOUND_DISCRIMINATORS[i + 1..] {
                 assert_ne!(a, b, "{name_a} and {name_b} share discriminator 0x{a:02x}");
             }
+            assert_eq!(
+                classify_inbound(&[*a]),
+                INBOUND_DISCRIMINATORS[i].2,
+                "{name_a} (0x{a:02x}) does not classify as its registered kind"
+            );
+        }
+    }
+
+    #[test]
+    fn every_routed_envelope_byte_is_registered() {
+        // The direction that actually protects us. The collision test above
+        // can only compare types someone remembered to list; this one walks
+        // the whole envelope range and fails if `classify_inbound` routes a
+        // byte that is not registered. A new message type therefore cannot
+        // be wired into the classifier without landing in
+        // `INBOUND_DISCRIMINATORS`, where the collision check will see it.
+        //
+        // Verified against the real gap: adding a second constant with an
+        // existing value passed all 110 tests before this existed.
+        for byte in 0x00u8..0x10 {
+            let kind = classify_inbound(&[byte]);
+            match kind {
+                // Not routed to a handler of its own.
+                InboundKind::Unknown | InboundKind::AckBatchV1 => continue,
+                _ => {}
+            }
+            assert!(
+                INBOUND_DISCRIMINATORS
+                    .iter()
+                    .any(|(_, v, k)| *v == byte && *k == kind),
+                "classify_inbound routes 0x{byte:02x} to {kind:?}, but it is not in \
+                 INBOUND_DISCRIMINATORS -- register it there so the collision check \
+                 covers it"
+            );
         }
     }
 }
