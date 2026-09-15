@@ -798,11 +798,14 @@ impl TileNackEnvelope {
 pub enum InboundKind {
     Empty,
     Unknown,
-    Hello,         // 0x01
-    AckBatchV1,    // 0x02 (deprecated, still routed)
-    AckBatch,      // 0x03
-    TileParity,    // 0x04
-    TileNack,      // 0x05
+    Hello,      // FEEDBACK_MSG_TYPE (0x01)
+    AckBatchV1, // superseded ACK revisions (0x02, 0x03) — decoder rejects them
+    AckBatch,   // ACK_BATCH_MSG_TYPE (0x04)
+    /// Server -> client only, so this never classifies an inbound datagram.
+    /// Retained because the enum names message kinds, not just the ones this
+    /// direction can carry.
+    TileParity,
+    TileNack,      // TILE_NACK_ENVELOPE (0x05)
     FrameFragment, // first byte 0x10..=0x7F
     TileFragment,  // first byte 0x80..=0xFF (TILE_DATAGRAM_FLAG bit set)
 }
@@ -812,10 +815,26 @@ pub fn classify_inbound(data: &[u8]) -> InboundKind {
         return InboundKind::Empty;
     };
     match first {
-        0x01 => InboundKind::Hello,
-        0x02 => InboundKind::AckBatchV1,
-        0x03 => InboundKind::AckBatch,
-        TILE_PARITY_ENVELOPE => InboundKind::TileParity,
+        crate::feedback::FEEDBACK_MSG_TYPE => InboundKind::Hello,
+        // 0x02 and 0x03 are superseded ACK envelope revisions. `AckBatch::
+        // decode` rejects both with `WrongMsgType`, so they are named here
+        // only so an old client shows up as an old client rather than as
+        // `Unknown`.
+        0x02 | 0x03 => InboundKind::AckBatchV1,
+        // The current ACK envelope. This arm used to read
+        // `TILE_PARITY_ENVELOPE => TileParity`, which shares the value 0x04:
+        // when the ACK envelope was bumped 0x03 -> 0x04 in 2026-06-27 this
+        // function was not updated, so every live ACK batch classified as
+        // `TileParity`. Nothing broke only because the one caller
+        // (`IoBridge`'s inbound datagram dispatch) special-cases `TileNack`
+        // and routes everything else to the ACK handler, which re-checks the
+        // first byte itself. Adding any second special case to that match
+        // would have silently swallowed every ACK.
+        //
+        // Parity travels server -> client only (`ReliableTileEmitter` is the
+        // sole producer), so 0x04 arriving inbound is unambiguously an ACK
+        // and there is no inbound parity arm to conflict with.
+        crate::ack::ACK_BATCH_MSG_TYPE => InboundKind::AckBatch,
         TILE_NACK_ENVELOPE => InboundKind::TileNack,
         b if b < 0x10 => InboundKind::Unknown,
         b if b < 0x80 => InboundKind::FrameFragment,
@@ -1431,10 +1450,15 @@ mod tests {
         assert_eq!(classify_inbound(&frame_dg), InboundKind::FrameFragment);
 
         // Envelopes
-        assert_eq!(classify_inbound(&[0x03]), InboundKind::AckBatch);
+        assert_eq!(classify_inbound(&[0x03]), InboundKind::AckBatchV1);
+        // 0x04 inbound is an ACK batch, not parity, even though
+        // `TILE_PARITY_ENVELOPE` shares the value: parity is server ->
+        // client only, so it never arrives on the path this function
+        // classifies. This assertion used to read `TileParity` and was
+        // pinning a stale mapping — see `classify_inbound`'s own comment.
         assert_eq!(
             classify_inbound(&[TILE_PARITY_ENVELOPE]),
-            InboundKind::TileParity
+            InboundKind::AckBatch
         );
         assert_eq!(
             classify_inbound(&[TILE_NACK_ENVELOPE]),
@@ -1442,5 +1466,42 @@ mod tests {
         );
         assert_eq!(classify_inbound(&[0x09]), InboundKind::Unknown);
         assert_eq!(classify_inbound(&[]), InboundKind::Empty);
+    }
+
+    #[test]
+    fn ack_batch_is_not_misrouted_to_another_handler() {
+        // The current ACK envelope must classify as an ACK. This is written
+        // against `ACK_BATCH_MSG_TYPE` rather than a literal precisely
+        // because the literal is what drifted: `classify_inbound` was not
+        // updated when the envelope went 0x03 -> 0x04 in 2026-06-27.
+        assert_eq!(
+            classify_inbound(&[crate::ack::ACK_BATCH_MSG_TYPE]),
+            InboundKind::AckBatch
+        );
+        assert_ne!(
+            classify_inbound(&[crate::ack::ACK_BATCH_MSG_TYPE]),
+            InboundKind::TileNack
+        );
+        assert_ne!(
+            classify_inbound(&[crate::ack::ACK_BATCH_MSG_TYPE]),
+            InboundKind::TileParity
+        );
+    }
+
+    #[test]
+    fn inbound_message_discriminators_do_not_collide() {
+        // Every client->server first byte must map to exactly one kind. A
+        // collision does not fail loudly -- it silently routes one message
+        // type into another's handler, which drops it.
+        let discriminators = [
+            ("feedback/hello", crate::feedback::FEEDBACK_MSG_TYPE),
+            ("ack batch", crate::ack::ACK_BATCH_MSG_TYPE),
+            ("tile nack", TILE_NACK_ENVELOPE),
+        ];
+        for (i, (name_a, a)) in discriminators.iter().enumerate() {
+            for (name_b, b) in &discriminators[i + 1..] {
+                assert_ne!(a, b, "{name_a} and {name_b} share discriminator 0x{a:02x}");
+            }
+        }
     }
 }
