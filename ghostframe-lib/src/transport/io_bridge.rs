@@ -720,7 +720,7 @@ pub struct IoBridge {
     /// call, from any of its three call sites. Unlike
     /// `scheduler_continuation`, never cleared once set — it exists purely
     /// so BWE Stage 2.4b's probe-window-open drain
-    /// (`drain_for_probe_window_open`) has a valid `seq` /
+    /// (see `open_probe_window_for_burst`) has a valid `seq` /
     /// `timestamp_us` / `max_frag` to tag its datagrams with. `None` until
     /// the bridge's first drain; a probe window that opens before then
     /// (e.g. racing session start) has nothing valid to stamp and skips
@@ -1000,7 +1000,7 @@ struct UniqueColorHistogram {
 /// in-flight drain and is cleared once that budget is exhausted — this
 /// field is never cleared; it always holds the last valid identity.
 ///
-/// BWE Stage 2.4b's probe-window-open drain (`drain_for_probe_window_open`)
+/// BWE probe-window bookkeeping (see `open_probe_window_for_burst`)
 /// reuses this: `drain_scheduler_into_quinn` stamps `seq |
 /// TILE_DATAGRAM_FLAG` into every datagram header, and the client keys tile
 /// assembly / ACKs off that value, so a probe drain cannot invent a seq the
@@ -1571,53 +1571,6 @@ impl IoBridge {
         budget.min(quinn_cap)
     }
 
-    /// BWE Stage 2.4b: drain the scheduler once, immediately, when a probe
-    /// window opens. See `docs/specs/bwe-probe-emission-timing.md` for the
-    /// measurement: a probe window is short enough relative to the
-    /// production scheduler tick (and browserless frame injection) that
-    /// most windows would otherwise open and close with no emission
-    /// opportunity inside them at all.
-    ///
-    /// Called exactly once, from `poll_probe_window`'s "open" branch —
-    /// never from the "close" branch or from any other poll of an
-    /// already-open window, or a long window would be drained repeatedly
-    /// and consume many ticks' worth of budget through this one path.
-    ///
-    /// Uses the same `pacer_tick_budget_bytes(target_rate_bps,
-    /// SCHEDULER_TICK_INTERVAL_US)` budget that a normal tick already uses
-    /// while a probe is active (see `dispatch_dirty_tiles_via_scheduler`
-    /// and `apply_injected_frame`'s matching `match &self.active_probe`
-    /// arms) — this is not a new budget policy, just an extra opportunity
-    /// to spend the existing one. `clamp_to_quinn_capacity` still runs
-    /// last and still wins: a probe is not worth dropping tiles for, and
-    /// that clamp exists because `scheduler.tick` is destructive.
-    ///
-    /// Requires a previously recorded frame identity
-    /// (`last_drain_frame_context`): `drain_scheduler_into_quinn` stamps
-    /// `seq | TILE_DATAGRAM_FLAG` into every datagram header, and the
-    /// client keys tile assembly and ACKs off that value, so this drain
-    /// cannot fabricate a seq the client has never seen. Reusing the most
-    /// recently drained frame's identity for work that logically belongs
-    /// to "now" mirrors what `resume_scheduler_continuation` already does
-    /// for continuation drains that outlive their triggering tick — this
-    /// is existing practice, not a new convention. If no frame has ever
-    /// been drained (a probe request racing session start, or a
-    /// pathological all-idle session), there is nothing valid to tag with
-    /// and the drain is skipped entirely: the window under-fills and is
-    /// abandoned, which is the existing, correct behaviour for a queue
-    /// that cannot supply enough work — no padding is fabricated to force
-    /// a completion.
-    fn drain_for_probe_window_open(&mut self, target_rate_bps: u64) {
-        let Some(ctx) = self.last_drain_frame_context else {
-            return;
-        };
-        let pre_clamp_budget = pacer_tick_budget_bytes(target_rate_bps, SCHEDULER_TICK_INTERVAL_US);
-        let effective_budget = self.clamp_to_quinn_capacity(pre_clamp_budget);
-        if effective_budget == 0 {
-            return;
-        }
-        self.drain_scheduler_into_quinn(ctx.seq, ctx.timestamp_us, ctx.max_frag, effective_budget);
-    }
 
     /// BWE Stage 2.4: open a new probe window if goog_cc requested one
     /// since the last poll, then close the current window once its
@@ -1633,53 +1586,69 @@ impl IoBridge {
     /// this only fires from ticks that also drained `bwe_samples_buffer` —
     /// but polling unconditionally costs nothing and keeps the "close"
     /// half correct regardless.
-    fn poll_probe_window(&mut self, now: std::time::Instant) {
-        if let Some(req) = self.bwe.take_probe_request() {
-            if let Some(old) = self.active_probe.take() {
-                // One active probe: a new request replaces any window
-                // still open, per the design — overlapping clusters would
-                // interleave their packets and corrupt both measurements.
-                // The replaced window is still accounted for below rather
-                // than silently dropped: whatever it accumulated before
-                // being superseded is real signal on whether probing is
-                // working, and the whole point of `probes_abandoned` is to
-                // not let that vanish unnoticed.
-                self.close_probe_window(old);
-            }
-            tracing::debug!(
-                probe_id = req.id,
-                target_rate_bps = req.target_rate_bps,
-                duration_ms = req.duration.as_millis() as u64,
-                min_probes = req.min_probes,
-                min_bytes = req.min_bytes,
-                "bwe: probe cluster window opened"
-            );
-            self.active_probe = Some(ActiveProbe {
-                id: req.id,
-                target_rate_bps: req.target_rate_bps,
-                ends_at: now + req.duration,
-                min_probes: req.min_probes,
-                min_bytes: req.min_bytes,
-                bytes_sent: 0,
-                packets_sent: 0,
-            });
-            // BWE Stage 2.4b: fill-on-open (see
-            // docs/specs/bwe-probe-emission-timing.md). Emission is
-            // otherwise frame-quantised — a 15 ms probe window against a
-            // 33.3 ms production tick or 16 ms browserless injection means
-            // most windows would open and close with zero emission
-            // opportunities inside them at all (`packets_sent=0`, not an
-            // under-fill). Draining once here, at the moment the window
-            // opens, guarantees at least one emission falls inside every
-            // window. Must run only here, on open — not on every poll, or
-            // a long-lived window would be drained repeatedly and defeat
-            // its own budget.
-            self.drain_for_probe_window_open(req.target_rate_bps);
-            // A freshly opened window cannot also be due to close on this
-            // same poll — its `ends_at` is strictly in the future.
+    /// Claim a pending probe cluster at the instant a drain with real work
+    /// is about to run, so the burst it emits lands *inside* the window.
+    ///
+    /// goog_cc issues its initial ladder on a timer, which for us fires at
+    /// session start — before the first frame has been captured. Measured,
+    /// those windows opened at t=0 ms and t=4 ms and closed having sent
+    /// nothing at all (`packets_sent=0`, not an under-fill), because the
+    /// scheduler queue is empty at every tick: tiles are enqueued and
+    /// drained inside one call, so no timer-driven observer between ticks
+    /// ever sees work waiting. A `drain_for_probe_window_open` helper used
+    /// to paper over this by draining on open; it could not work for the
+    /// same reason — the queue it drained was always empty — and was
+    /// removed along with this change.
+    ///
+    /// Opening here inverts that. `emit_via_scheduler` already switches its
+    /// budget to `probe.target_rate_bps` whenever a window is open (see its
+    /// `pre_clamp_budget`), so claiming the request immediately before that
+    /// budget is computed means this frame drains *at the probe's rate*
+    /// rather than the pacer's — which is what a probe cluster is. No
+    /// padding is involved: the bytes are real frame content that was going
+    /// to be sent regardless.
+    ///
+    /// This matters most at startup, where the first frame is a full screen
+    /// and therefore the largest natural burst a session ever produces —
+    /// the best probe material available, and available exactly when a
+    /// fast capacity estimate is worth the most.
+    fn open_probe_window_for_burst(&mut self, now: std::time::Instant) {
+        // An open window is already collecting; never replace it mid-flight.
+        if self.active_probe.is_some() {
             return;
         }
+        let Some(req) = self.bwe.take_probe_request() else {
+            return;
+        };
+        tracing::debug!(
+            probe_id = req.id,
+            target_rate_bps = req.target_rate_bps,
+            duration_ms = req.duration.as_millis() as u64,
+            min_probes = req.min_probes,
+            min_bytes = req.min_bytes,
+            "bwe: probe cluster window opened on burst"
+        );
+        self.active_probe = Some(ActiveProbe {
+            id: req.id,
+            target_rate_bps: req.target_rate_bps,
+            ends_at: now + req.duration,
+            min_probes: req.min_probes,
+            min_bytes: req.min_bytes,
+            bytes_sent: 0,
+            packets_sent: 0,
+        });
+    }
 
+    /// Close the active probe window once its duration is up.
+    ///
+    /// Opening moved to `open_probe_window_for_burst` (see its doc comment):
+    /// a window opened from this tick-driven poll could — and measurably did
+    /// — open at a moment with no work to emit, then close having sent
+    /// nothing. Requests therefore sit in `bwe`'s pending queue, bounded by
+    /// `MAX_PENDING_PROBE_REQUESTS`, until a drain with real content claims
+    /// one. A session that never emits never probes, which is correct: there
+    /// is nothing to measure a link with.
+    fn poll_probe_window(&mut self, now: std::time::Instant) {
         let is_due = matches!(&self.active_probe, Some(p) if now >= p.ends_at);
         if is_due {
             let probe = self.active_probe.take().expect("checked Some above");
@@ -2077,7 +2046,7 @@ impl IoBridge {
         // Record this call's frame identity unconditionally, before any of
         // the budget/queue-dependent logic below, so a later probe-window
         // open always has the most recent valid `seq` to reuse — see
-        // `DrainFrameContext` and `drain_for_probe_window_open`.
+        // `DrainFrameContext` and `open_probe_window_for_burst`.
         self.last_drain_frame_context = Some(DrainFrameContext {
             seq,
             timestamp_us,
@@ -2306,6 +2275,11 @@ impl IoBridge {
         // BWE Stage 2.2: goog_cc's pacer additionally bounds the budget
         // once the estimator has enough samples to trust (`PacingMode`) —
         // `min(base_budget_bytes, googcc_budget)`, not a replacement.
+        // BWE burst discovery: claim a pending probe window *here*, at the
+        // one moment we know datagrams are about to be emitted. See
+        // `open_probe_window_for_burst`.
+        self.open_probe_window_for_burst(now_std());
+
         let bwe_snap = self.bwe.snapshot();
         let pacing_mode = select_pacing_mode(bwe_snap.samples_seen);
         // BWE Stage 2.4: a probe window overrides the pacing budget
@@ -8084,160 +8058,7 @@ mod tests {
         }
     }
 
-    /// BWE Stage 2.4b: `drain_for_probe_window_open` must actually pull
-    /// queued backlog into the wire path when a valid frame identity is on
-    /// record — this is the whole point of the fix in
-    /// `docs/specs/bwe-probe-emission-timing.md`: a probe window that opens
-    /// while the scheduler holds undrained work must not sit there empty
-    /// until the next tick.
-    ///
-    /// Drives the real, unmodified `drain_for_probe_window_open` directly
-    /// (it's only ever called from `poll_probe_window`'s open branch in
-    /// production, which additionally requires a live goog_cc probe
-    /// request — out of scope to fabricate here, same reasoning as
-    /// `resume_scheduler_continuation_drains_stranded_injected_work`
-    /// above). No connected session is needed:
-    /// `min_session_send_buffer_space()` falls back to `usize::MAX`, so
-    /// `clamp_to_quinn_capacity` is a no-op and the probe's own
-    /// `pacer_tick_budget_bytes` bound is the only thing limiting the
-    /// drain — exactly like the production call site once quinn's buffer
-    /// isn't the binding constraint.
-    #[tokio::test(start_paused = true)]
-    async fn drain_for_probe_window_open_fills_from_existing_backlog() {
-        use crate::transport::protocol::Codec;
-        use crate::transport::scheduler::{TileWork, WorkState};
 
-        let (ours, _peer) = tokio::net::UnixStream::pair().expect("pair");
-        let server = QuicServer::new().expect("QuicServer::new");
-        let (_tx, rx) = mpsc::channel(8);
-        let mut bridge = IoBridge::new_with_injection_for_test(ours, server, rx, 8, 8);
-
-        // Seed `last_drain_frame_context` the same way a real session
-        // would: one prior call to `drain_scheduler_into_quinn`, which
-        // records the context unconditionally regardless of budget or
-        // queue contents (see that method's doc comment). Budget 0 and an
-        // empty queue means this call itself drains nothing — it exists
-        // purely to establish "a frame has been drained before", which is
-        // the precondition `drain_for_probe_window_open` requires.
-        bridge.drain_scheduler_into_quinn(7, 123_456, 1200, 0);
-        assert_eq!(
-            bridge.last_drain_frame_context,
-            Some(DrainFrameContext {
-                seq: 7,
-                timestamp_us: 123_456,
-                max_frag: 1200,
-            }),
-            "drain_scheduler_into_quinn must record its identity unconditionally"
-        );
-
-        // Now queue real backlog -- work an earlier, budget-limited drain
-        // left behind, exactly the scenario the design's "the queue holds
-        // the work" caveat describes.
-        for (tile_x, tile_y) in [(0u8, 0u8), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0)] {
-            bridge.scheduler.enqueue(TileWork {
-                tile_x,
-                tile_y,
-                generation: 0,
-                pass_idx: 0,
-                total_passes: 1,
-                codec: Codec::Solid,
-                payload: vec![10, 20, 30, 255],
-                queued_at: super::now_std(),
-                last_sent_at: None,
-                state: WorkState::Pending,
-            });
-        }
-        assert_eq!(bridge.scheduler_peek_for_test().len(), 6, "backlog queued");
-
-        // A window just opened: `poll_probe_window` would have already set
-        // this before calling `drain_for_probe_window_open`.
-        bridge.active_probe = Some(ActiveProbe {
-            id: 1,
-            target_rate_bps: 4_000_000,
-            ends_at: super::now_std() + std::time::Duration::from_millis(15),
-            min_probes: 5,
-            min_bytes: 1,
-            bytes_sent: 0,
-            packets_sent: 0,
-        });
-
-        bridge.drain_for_probe_window_open(4_000_000);
-
-        let probe = bridge.active_probe.as_ref().expect("probe still open");
-        assert!(
-            probe.packets_sent >= 5,
-            "immediate drain must tag at least min_probes datagrams into \
-             the still-open window; got {}",
-            probe.packets_sent
-        );
-        assert!(
-            probe.bytes_sent > 0,
-            "immediate drain must advance the probe's byte counter"
-        );
-        let states = bridge.scheduler.queue_states_for_test();
-        assert!(
-            states.iter().any(|(_, _, s)| *s == WorkState::InFlight),
-            "at least some queued backlog must have actually been drained, \
-             not merely counted"
-        );
-    }
-
-    /// The other half of the fix's contract: with no prior drain on
-    /// record, `drain_for_probe_window_open` must do nothing rather than
-    /// fabricate a `seq` — see `DrainFrameContext`'s doc comment on why an
-    /// invented seq would corrupt the client's tile assembly / ACK
-    /// keying. Queued backlog must survive untouched, and the probe must
-    /// close as abandoned rather than complete by accident.
-    #[tokio::test(start_paused = true)]
-    async fn drain_for_probe_window_open_is_a_noop_without_a_prior_drain() {
-        use crate::transport::protocol::Codec;
-        use crate::transport::scheduler::{TileWork, WorkState};
-
-        let (ours, _peer) = tokio::net::UnixStream::pair().expect("pair");
-        let server = QuicServer::new().expect("QuicServer::new");
-        let (_tx, rx) = mpsc::channel(8);
-        let mut bridge = IoBridge::new_with_injection_for_test(ours, server, rx, 8, 8);
-
-        assert_eq!(
-            bridge.last_drain_frame_context, None,
-            "a freshly constructed bridge has never drained a frame"
-        );
-
-        bridge.scheduler.enqueue(TileWork {
-            tile_x: 0,
-            tile_y: 0,
-            generation: 0,
-            pass_idx: 0,
-            total_passes: 1,
-            codec: Codec::Solid,
-            payload: vec![10, 20, 30, 255],
-            queued_at: super::now_std(),
-            last_sent_at: None,
-            state: WorkState::Pending,
-        });
-
-        bridge.active_probe = Some(ActiveProbe {
-            id: 1,
-            target_rate_bps: 4_000_000,
-            ends_at: super::now_std() + std::time::Duration::from_millis(15),
-            min_probes: 5,
-            min_bytes: 1,
-            bytes_sent: 0,
-            packets_sent: 0,
-        });
-
-        bridge.drain_for_probe_window_open(4_000_000);
-
-        let probe = bridge.active_probe.as_ref().expect("probe still open");
-        assert_eq!(probe.packets_sent, 0, "no context -> no emission");
-        assert_eq!(probe.bytes_sent, 0, "no context -> no emission");
-        let states = bridge.scheduler.queue_states_for_test();
-        assert_eq!(
-            states,
-            vec![(0, 0, WorkState::Pending)],
-            "queued backlog must be left untouched, not silently consumed"
-        );
-    }
 
     /// Task 3: the tile-injection channel must enqueue injected work into
     /// the scheduler and attempt a drain. With no connected WebTransport
