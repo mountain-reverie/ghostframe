@@ -61,3 +61,28 @@ ash = { version = "0.38", default-features = false, features = ["std", "debug", 
 
 # ffmpeg-next 9.0.0 — Rust bindings for FFmpeg (libavcodec, libavutil, libswscale)
 ffmpeg-next = { version = "=9.0.0" }
+
+# Tests run the full production data path — QUIC AEAD crypto, the CDF53
+# codec, tile reassembly — so an unoptimized build is dominated by it. The
+# browserless netsim scenes are the extreme case: 13.9s unoptimized against
+# 0.8s optimized for one delayed-link scene, and the e2e sweep runs dozens.
+#
+# Dependencies go to full `opt-level = 3` (they are built once and cached,
+# and nobody steps through ring or quinn-proto); our own crates take
+# `opt-level = 1`, which keeps compile times and debuggability close to a
+# plain debug build. `debug = true` is inherited from the default `dev`
+# profile, so backtraces and breakpoints still work.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+# `test` inherits from `dev`, but state it explicitly: these two are what
+# `cargo test` actually builds, and a future edit to `dev` alone should not
+# silently change them.
+[profile.test]
+opt-level = 1
+
+[profile.test.package."*"]
+opt-level = 3
