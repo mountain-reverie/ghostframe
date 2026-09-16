@@ -586,6 +586,32 @@ async fn drive_session(
     // actually declares. What must never happen is the loop turning without
     // the clock moving at all, so that is what this counts.
     const MAX_ITERS_WITHOUT_PROGRESS: usize = 5_000;
+
+    /// Consecutive iterations the loop may serve an already-readable pump before
+    /// it must let the paused clock advance instead.
+    ///
+    /// `tokio::select!` below is `biased`, so a readable `pump.recv()` always
+    /// wins over `sleep_until`. That is the right priority — inbound data should
+    /// be drained promptly — but it means a pump with a standing backlog starves
+    /// the timer arm completely, and only the timer arm advances virtual time.
+    /// The loop then turns indefinitely doing real work while the clock stands
+    /// still, which is indistinguishable from a hang and trips
+    /// `MAX_ITERS_WITHOUT_PROGRESS`.
+    ///
+    /// Observed on CI as `probe_windows_are_opened_on_a_busy_link` stalling at
+    /// ~470 ms of a 10 s scene having processed 6803 events across 5586
+    /// iterations — roughly one datagram per iteration, i.e. a loop that was
+    /// never idle and therefore never let time move. Probe bursts make a
+    /// standing backlog far more likely, which is why this surfaced alongside
+    /// the probing work.
+    ///
+    /// 512 sits above the deepest run observed on a healthy local sweep (192),
+    /// so ordinary bursts still drain in one pass and scene timing is unchanged;
+    /// it is far below the 5000 non-advancing iterations that trip the progress
+    /// guard, so the pathological case is capped long before it looks like a
+    /// hang. Hitting the cap is not a compromise — sleeping to `wake_at` is what
+    /// the loop would do anyway once the pump ran dry.
+    const MAX_CONSECUTIVE_PUMP_SERVES: usize = 512;
     let overall_deadline = base + scene.duration;
     let mut iter: usize = 0;
 
@@ -596,6 +622,9 @@ async fn drive_session(
     // iterations have turned since.
     let mut last_progress_vt: u64 = 0;
     let mut iters_without_progress: usize = 0;
+    // Consecutive iterations whose `select!` was won by the pump. See
+    // `MAX_CONSECUTIVE_PUMP_SERVES`.
+    let mut consecutive_pump_serves: usize = 0;
 
     loop {
         iter += 1;
@@ -829,9 +858,22 @@ async fn drive_session(
             }
         }
 
+        // Let the clock move before serving the pump again. Without this the
+        // biased `select!` below never reaches its timer arm while the pump
+        // has a backlog — see `MAX_CONSECUTIVE_PUMP_SERVES`. Sleeping to the
+        // already-computed `wake_at` is safe: it is the next instant anything
+        // in this scene needs attention, and the backlog is still there
+        // afterwards.
+        if consecutive_pump_serves >= MAX_CONSECUTIVE_PUMP_SERVES {
+            consecutive_pump_serves = 0;
+            tokio::time::sleep_until(wake_at).await;
+            continue;
+        }
+
         tokio::select! {
             biased;
             recv_res = pump.recv() => {
+                consecutive_pump_serves += 1;
                 let pkt = recv_res.map_err(|e| anyhow!(
                     "seed {seed}: socketpair pump recv failed at iteration {iter} \
                      (last events observed: {events:?}): {e}"
@@ -856,6 +898,7 @@ async fn drive_session(
                 }
             }
             _ = tokio::time::sleep_until(wake_at) => {
+                consecutive_pump_serves = 0;
                 if now_us(base) >= client.poll_timeout().unwrap_or(u64::MAX) {
                     client.on_timeout(now_us(base));
                 }

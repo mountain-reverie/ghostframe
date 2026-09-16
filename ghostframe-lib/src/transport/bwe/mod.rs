@@ -162,6 +162,13 @@ impl BweWrapper {
         self.driver.note_path_rtt(rtt);
     }
 
+    /// Feed the transport's own BDP-derived rate as an independent ceiling
+    /// for probe decisions. See `GoogCcDriver::set_transport_capacity_hint`
+    /// for what this number is and is not.
+    pub fn set_transport_capacity_hint(&mut self, bytes_per_us: f32, now: Instant) {
+        self.driver.set_transport_capacity_hint(bytes_per_us, now);
+    }
+
     /// Return and clear the most recently requested probe cluster, if any
     /// (BWE Stage 2.4). Consumes it: a config is surfaced exactly once
     /// rather than re-triggering on every subsequent poll that happens to
