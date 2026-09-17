@@ -172,6 +172,12 @@ const CAPACITY_HINT_WINDOW: usize = 16;
 /// so ordinary inter-frame gaps do not read as idle, short enough that a real
 /// pause stops feeding the hint before AIMD can climb far on it.
 const PATH_IDLE_AFTER: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Cap on losses held waiting for an acknowledgement to report them with.
+/// Comfortably more than a congested tick produces, and small enough that a
+/// session whose acknowledgements never resume cannot accumulate without
+/// bound.
+const MAX_PENDING_RTO_LOSSES: usize = 4096;
 // Leave 10 % headroom in the budget so we don't push right up to quinn's
 // drain rate every tick (ACKs, feedback, NACK retransmits still need
 // wire). Cheap enough.
@@ -735,6 +741,9 @@ pub struct IoBridge {
     /// and the delta since. Zero delta means the link was idle over that
     /// interval, which is when `cwnd / rtt` stops meaning anything.
     path_sent_packets_last: u64,
+    /// RTO-fired transmissions awaiting a feedback report with at least one
+    /// acknowledgement to travel in. See the drain site.
+    pending_rto_losses: Vec<(u32, usize)>,
     /// When quinn's `sent_packets` last advanced. `None` before the first
     /// packet. Used to tell a busy link from an idle one — see
     /// `apply_path_stats_snapshot`.
@@ -1244,6 +1253,7 @@ impl IoBridge {
             scheduler_continuation: None,
             capacity_hint_window: std::collections::VecDeque::new(),
             path_sent_packets_last: 0,
+            pending_rto_losses: Vec::new(),
             path_last_sent_at: None,
             last_drain_frame_context: None,
             cumulative_datagrams_emitted: CumulativeEmitCounters::default(),
@@ -4730,6 +4740,24 @@ impl IoBridge {
             // (composed from emit/arrival timestamps); Phase 2 will plumb
             // the real cache-entry wire_seq through `BweSample` if the
             // estimator backend needs strict packet-sequence identity.
+            // Drained every tick, but reported only alongside an
+            // acknowledgement: goog_cc unwraps the max receive time over a
+            // report's received packets, so a loss-only report panics inside
+            // the library. A congested link can spend whole ticks
+            // retransmitting with no ACK coming back, so they accumulate here
+            // until one arrives rather than being dropped.
+            self.pending_rto_losses
+                .extend(self.reliable_emitter.take_losses());
+            // Bounded: if acknowledgements never resume, the session is dead
+            // and the backlog is worthless. Oldest go first — a stale loss
+            // describes a send time the estimator has long since moved past.
+            let overflow = self
+                .pending_rto_losses
+                .len()
+                .saturating_sub(MAX_PENDING_RTO_LOSSES);
+            if overflow > 0 {
+                self.pending_rto_losses.drain(..overflow);
+            }
             if !self.bwe_samples_buffer.is_empty() {
                 use crate::transport::bwe::AckArrival;
                 let mut records: Vec<AckArrival> =
@@ -4797,7 +4825,8 @@ impl IoBridge {
                 // on. Read before `update` so it reflects the state the
                 // feedback describes.
                 let in_flight = self.reliable_emitter.bytes_in_flight();
-                self.bwe.update(&records, now_std(), in_flight);
+                let losses = std::mem::take(&mut self.pending_rto_losses);
+                self.bwe.update(&records, &losses, now_std(), in_flight);
             }
 
             // Republish into `bwe_publish` every iteration, not only when
@@ -5367,6 +5396,7 @@ impl IoBridge {
             scheduler_continuation: None,
             capacity_hint_window: std::collections::VecDeque::new(),
             path_sent_packets_last: 0,
+            pending_rto_losses: Vec::new(),
             path_last_sent_at: None,
             last_drain_frame_context: None,
             cumulative_datagrams_emitted: CumulativeEmitCounters::default(),

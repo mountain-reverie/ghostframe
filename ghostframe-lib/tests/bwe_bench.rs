@@ -60,6 +60,7 @@ fn run(steps: u32, capacity_bps: impl Fn(u32) -> u64) -> Vec<u64> {
 
         let snap = w.update(
             &batch,
+            &[],
             t0 + Duration::from_micros(emit_us),
             batch.iter().map(|r| r.size_bytes as usize).sum(),
         );
@@ -117,6 +118,7 @@ fn real_pacer_rate_bps() -> u64 {
             .collect();
         let snap = w.update(
             &batch,
+            &[],
             t0 + Duration::from_millis(20 * step as u64),
             batch.iter().map(|r| r.size_bytes as usize).sum(),
         );
@@ -207,6 +209,7 @@ fn pacing_mode_reaches_paced_after_enough_real_feedback() {
         samples_seen = w
             .update(
                 &batch,
+                &[],
                 t0 + Duration::from_millis(20 * step as u64),
                 batch.iter().map(|r| r.size_bytes as usize).sum(),
             )
@@ -273,6 +276,7 @@ fn request_a_real_probe(seed_bps: u64) -> (BweWrapper, Instant, ProbeRequest) {
     }];
     w.update(
         &seed_batch,
+        &[],
         t0 + Duration::from_millis(20),
         seed_batch.iter().map(|r| r.size_bytes as usize).sum(),
     );
@@ -353,6 +357,7 @@ fn a_requested_probe_cluster_is_filled_and_consumed() {
     let after = w
         .update(
             &batch,
+            &[],
             t0 + Duration::from_millis(200),
             batch.iter().map(|r| r.size_bytes as usize).sum(),
         )
@@ -372,6 +377,7 @@ fn a_requested_probe_cluster_is_filled_and_consumed() {
     let control_after = control
         .update(
             &control_batch,
+            &[],
             ct0 + Duration::from_millis(200),
             control_batch.iter().map(|r| r.size_bytes as usize).sum(),
         )
@@ -428,6 +434,7 @@ fn an_underfilled_probe_cluster_is_discarded_silently() {
     let after = w
         .update(
             &batch,
+            &[],
             t0 + Duration::from_millis(200),
             batch.iter().map(|r| r.size_bytes as usize).sum(),
         )
@@ -447,6 +454,7 @@ fn an_underfilled_probe_cluster_is_discarded_silently() {
     let control_after = control
         .update(
             &control_batch,
+            &[],
             ct0 + Duration::from_millis(200),
             control_batch.iter().map(|r| r.size_bytes as usize).sum(),
         )
@@ -573,6 +581,7 @@ fn untagged_traffic_tracks_normally_around_a_pending_probe() {
         last = w
             .update(
                 &batch,
+                &[],
                 t0 + Duration::from_millis(20 * step as u64),
                 batch.iter().map(|r| r.size_bytes as usize).sum(),
             )

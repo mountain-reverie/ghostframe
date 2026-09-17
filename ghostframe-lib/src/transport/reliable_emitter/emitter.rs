@@ -27,6 +27,10 @@ pub struct ReliableTileEmitter {
     /// `now_std()` in production (which tracks tokio's clock, paused or
     /// not), a bare `Instant::now()` in unit tests. See `emit_us` below.
     pub(crate) time_base: Instant,
+    /// Transmissions that RTO fired on, as `(emit_us, wire_bytes)`, awaiting
+    /// collection by `take_rto_losses`. These are the only loss signal the
+    /// bandwidth estimator gets — see where they are pushed in `tick`.
+    losses: Vec<(u32, usize)>,
     pub stats: EmitterStats,
 }
 
@@ -58,6 +62,7 @@ impl ReliableTileEmitter {
             rto: RtoTimerWheel::new(),
             smoothed_rtt: Duration::from_millis(20),
             time_base: now,
+            losses: Vec::new(),
             stats: EmitterStats::default(),
         }
     }
@@ -249,6 +254,18 @@ impl ReliableTileEmitter {
                 // the actual on-wire moment, not the original send. Tile
                 // datagrams only (top bit of byte 0 set).
                 if bytes.len() >= 16 && (bytes[0] & 0x80) != 0 {
+                    // The stamp being overwritten belongs to a transmission
+                    // that was never acknowledged — RTO firing is what we
+                    // are responding to. Record it as a loss before it is
+                    // lost: goog_cc's loss-based estimator determines loss
+                    // purely from feedback entries whose `receive_time` is
+                    // infinite, and an ACK-only feedback stream contains
+                    // none, so without this the entire loss half of the
+                    // controller is blind. Read here rather than kept
+                    // alongside `CacheEntry` so the value and its epoch come
+                    // from the same place that wrote them.
+                    let prev = u32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+                    self.losses.push((prev, bytes.len()));
                     let emit_us = self.emit_us(now);
                     bytes[12..16].copy_from_slice(&emit_us.to_be_bytes());
                 }
@@ -293,6 +310,8 @@ impl ReliableTileEmitter {
     /// in production) so `last_sent_at` stays comparable against those
     /// other stamps under a paused tokio clock.
     pub fn on_nack(&mut self, entries: &[(EmitKey, u8)], now: Instant) {
+        // Computed before the cache borrow below, which holds `&mut self`.
+        let emit_us_now = self.emit_us(now);
         for &(key, frag_idx) in entries {
             let Some(entry) = self.cache.get_mut(&key) else {
                 self.stats.nack_miss += 1;
@@ -301,11 +320,31 @@ impl ReliableTileEmitter {
             let Some(frag) = entry.fragments.get(frag_idx as usize) else {
                 continue;
             };
-            let bytes = frag.to_vec();
+            let mut bytes = frag.to_vec();
+            // A NACK is the client stating outright that this fragment did
+            // not arrive — ground truth, unlike RTO, which fires on delay as
+            // readily as on loss and never fires at all for a tile that gets
+            // superseded first. On a churning screen supersession is the
+            // common case, so NACKs carry most of the loss signal the
+            // estimator ever sees.
+            //
+            // Re-stamped for the same reason as the RTO path: the consumer
+            // wants the on-wire moment of *this* transmission, and the stamp
+            // being overwritten identifies the one that was lost.
+            let mut loss = None;
+            if bytes.len() >= 16 && (bytes[0] & 0x80) != 0 {
+                let prev = u32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+                loss = Some((prev, bytes.len()));
+                bytes[12..16].copy_from_slice(&emit_us_now.to_be_bytes());
+            }
             entry.attempts += 1;
             entry.last_sent_at = now;
+            entry.probe = None;
             // Release the entry borrow before touching self.queue / self.stats.
             let _ = entry;
+            if let Some(l) = loss {
+                self.losses.push(l);
+            }
             self.queue.push_source(bytes);
             self.stats.nack_hit += 1;
             self.stats.retransmit_attempts_total += 1;
@@ -350,6 +389,24 @@ impl ReliableTileEmitter {
     }
 
     /// Drain emissions to a sender until the queue is empty.
+    /// Take the transmissions known not to have arrived since the last
+    /// call, as `(emit_us, wire_bytes)`.
+    ///
+    /// Two sources, deliberately: a client NACK, which is ground truth, and
+    /// an RTO firing, which is not — RTO responds to delay as readily as to
+    /// loss. NACKs alone would miss whatever the client never learns to ask
+    /// for; RTO alone misses everything superseded before it fires, which on
+    /// a churning screen is most of it.
+    ///
+    /// goog_cc's loss-based estimator needs per-packet results rather than
+    /// an aggregate rate, and derives loss purely from feedback entries with
+    /// an infinite receive time. Feeding it none — which is what happened
+    /// until this existed — leaves that half of the controller permanently
+    /// blind however much traffic is being dropped.
+    pub fn take_losses(&mut self) -> Vec<(u32, usize)> {
+        std::mem::take(&mut self.losses)
+    }
+
     pub fn drain<S: DatagramSender>(&mut self, sender: &mut S, now: Instant) {
         let next = self.alloc.peek();
         while let Some(emission) = self.queue.pop(next, now) {
