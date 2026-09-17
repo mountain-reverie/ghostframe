@@ -12,6 +12,7 @@ pub use ghostframe_protocol::protocol;
 pub mod quic;
 pub mod reliable_emitter;
 pub mod scheduler;
+pub mod transmission_ledger;
 pub mod webtransport;
 
 #[cfg(any(test, feature = "test-loss-injection"))]
