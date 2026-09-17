@@ -253,19 +253,21 @@ impl ReliableTileEmitter {
                 // Re-stamp emit time on retransmit so the BWE consumer sees
                 // the actual on-wire moment, not the original send. Tile
                 // datagrams only (top bit of byte 0 set).
+                // A retransmission is a *new transmission* and gets its own
+                // `wire_seq`. Reusing the original's — which both retransmit
+                // paths did — is what made an acknowledgement ambiguous
+                // about which send it referred to, and that ambiguity is the
+                // reason a Karn-style filter had to discard 99% of timing
+                // samples on a congested link before being reverted.
+                //
+                // Fragments of a pass each carry their own `wire_seq`, so
+                // this allocates per fragment exactly as the original
+                // submission did.
+                if bytes.len() >= 12 {
+                    let ws = self.alloc.allocate();
+                    bytes[8..12].copy_from_slice(&ws.to_be_bytes());
+                }
                 if bytes.len() >= 16 && (bytes[0] & 0x80) != 0 {
-                    // The stamp being overwritten belongs to a transmission
-                    // that was never acknowledged — RTO firing is what we
-                    // are responding to. Record it as a loss before it is
-                    // lost: goog_cc's loss-based estimator determines loss
-                    // purely from feedback entries whose `receive_time` is
-                    // infinite, and an ACK-only feedback stream contains
-                    // none, so without this the entire loss half of the
-                    // controller is blind. Read here rather than kept
-                    // alongside `CacheEntry` so the value and its epoch come
-                    // from the same place that wrote them.
-                    let prev = u32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
-                    self.losses.push((prev, bytes.len()));
                     let emit_us = self.emit_us(now);
                     bytes[12..16].copy_from_slice(&emit_us.to_be_bytes());
                 }
@@ -331,10 +333,12 @@ impl ReliableTileEmitter {
             // Re-stamped for the same reason as the RTO path: the consumer
             // wants the on-wire moment of *this* transmission, and the stamp
             // being overwritten identifies the one that was lost.
-            let mut loss = None;
+            // Fresh `wire_seq` for the same reason as the RTO path above.
+            if bytes.len() >= 12 {
+                let ws = self.alloc.allocate();
+                bytes[8..12].copy_from_slice(&ws.to_be_bytes());
+            }
             if bytes.len() >= 16 && (bytes[0] & 0x80) != 0 {
-                let prev = u32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
-                loss = Some((prev, bytes.len()));
                 bytes[12..16].copy_from_slice(&emit_us_now.to_be_bytes());
             }
             entry.attempts += 1;
@@ -342,9 +346,6 @@ impl ReliableTileEmitter {
             entry.probe = None;
             // Release the entry borrow before touching self.queue / self.stats.
             let _ = entry;
-            if let Some(l) = loss {
-                self.losses.push(l);
-            }
             self.queue.push_source(bytes);
             self.stats.nack_hit += 1;
             self.stats.retransmit_attempts_total += 1;
@@ -603,6 +604,50 @@ mod tests {
     }
 
     #[test]
+    fn a_retransmission_gets_its_own_wire_seq() {
+        // `wire_seq` has to identify a *transmission*, not a fragment of a
+        // pass. Both retransmit paths used to re-queue the cached bytes with
+        // the original stamp intact, which left an acknowledgement unable to
+        // say which send it referred to — the ambiguity that made a
+        // Karn-style filter necessary, and then untenable.
+        fn wire_seq_of(b: &[u8]) -> u32 {
+            u32::from_be_bytes([b[8], b[9], b[10], b[11]])
+        }
+
+        let mut e = ReliableTileEmitter::new(Instant::now());
+        let mut sender = CollectSender::default();
+        let t0 = Instant::now();
+        let key = EmitKey::new(1, 0, 0, 0);
+        e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
+        e.drain(&mut sender, t0);
+        assert_eq!(sender.sent.len(), 1);
+        let first = wire_seq_of(&sender.sent[0]);
+
+        // RTO retransmit.
+        let t1 = t0 + Duration::from_millis(60);
+        e.tick(t1, usize::MAX);
+        e.drain(&mut sender, t1);
+        assert_eq!(sender.sent.len(), 2);
+        let second = wire_seq_of(&sender.sent[1]);
+        assert_ne!(
+            second, first,
+            "an RTO retransmission must not reuse the original wire_seq"
+        );
+
+        // NACK retransmit.
+        let t2 = t1 + Duration::from_millis(10);
+        e.on_nack(&[(key, 0)], t2);
+        e.drain(&mut sender, t2);
+        assert_eq!(sender.sent.len(), 3);
+        let third = wire_seq_of(&sender.sent[2]);
+        assert_ne!(
+            third, second,
+            "a NACK retransmission must not reuse the previous wire_seq"
+        );
+        assert_ne!(third, first);
+    }
+
+    #[test]
     fn retransmit_drops_probe_cluster_membership_but_keeps_the_entry() {
         // A probe cluster's send rate is its bytes divided by the span
         // between its first and last send. A retransmit re-sends with a
@@ -842,7 +887,18 @@ mod tests {
             64,
             "first tick must fire exactly the budget"
         );
-        assert_eq!(sink.len(), 64, "exactly 64 retransmits drained to wire");
+        // Counted from `rto_fired` above rather than `sink.len()`: since a
+        // retransmission allocates its own `wire_seq`, the allocator advances
+        // faster, which promotes a pending parity datagram into the same
+        // drain. Drained-datagram count is therefore no longer a proxy for
+        // retransmits fired — it includes whatever parity came due — so this
+        // asserts the budget was respected and that nothing beyond the
+        // retransmits plus at most the promoted parity reached the wire.
+        assert!(
+            (64..=65).contains(&sink.len()),
+            "64 retransmits plus at most one promoted parity, got {}",
+            sink.len()
+        );
 
         // Second tick at same instant: another 64 should fire (936 still due).
         sink.clear();
@@ -854,7 +910,7 @@ mod tests {
             64,
             "second tick fires another batch"
         );
-        assert_eq!(sink.len(), 64);
+        assert!((64..=65).contains(&sink.len()), "got {}", sink.len());
 
         // After many ticks at budget=64, all 1000 entries should be popped
         // (each pop reschedules its RTO into the future, so subsequent ticks
