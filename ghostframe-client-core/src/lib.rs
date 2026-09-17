@@ -104,6 +104,18 @@ pub(crate) struct Assembly {
     /// Fragment indices already NACKed by the assembly-timeout scan, so a
     /// missing fragment is only ever NACKed once per assembly.
     pub nacked_frag_idxs: HashSet<usize>,
+    /// The `wire_seq` each fragment arrived on, parallel to `fragments`.
+    ///
+    /// Kept separately because `fragments` holds stripped *payload*, so the
+    /// transmission identity would otherwise be discarded at reassembly. The
+    /// deferred Cdf53 acknowledgement needs it: a pass is acknowledged after
+    /// prevalidation, by which point the datagrams it arrived on are gone,
+    /// and naming transmissions means each must be acknowledged individually
+    /// or the unmentioned ones would be counted lost.
+    ///
+    /// A FEC-recovered fragment stays `None`: no transmission of it arrived,
+    /// so there is nothing to acknowledge.
+    pub wire_seqs: Vec<Option<u32>>,
 }
 
 impl Assembly {
@@ -116,6 +128,7 @@ impl Assembly {
             pass: header.pass,
             frame_seq,
             fragments: vec![None; frag_total as usize],
+            wire_seqs: vec![None; frag_total as usize],
             received: 0,
             partial_since_us: now_us,
             nacked_frag_idxs: HashSet::new(),

@@ -188,9 +188,13 @@ fn cdf53_ack_deferred_until_prevalidation() {
         .poll_transmit(deadline)
         .expect("ACK datagram after deadline");
     match ack {
-        // AckBatch (ACK_BATCH_MSG_TYPE) rides the Datagram channel as 0x04;
-        // decode-error messages share the byte but ride the Stream channel.
-        PollOutput::Datagram(buf) => assert_eq!(buf[0], 0x04, "expected AckBatch datagram"),
+        // AckBatch (ACK_BATCH_MSG_TYPE) rides the Datagram channel as 0x06;
+        // decode-error messages ride the Stream channel.
+        PollOutput::Datagram(buf) => assert_eq!(
+            buf[0],
+            ghostframe_protocol::ack::ACK_BATCH_MSG_TYPE,
+            "expected AckBatch datagram"
+        ),
         other => panic!("expected ACK datagram, got {other:?}"),
     }
     // Drain any trailing outputs.
@@ -212,7 +216,11 @@ fn cdf53_ack_deferred_until_prevalidation() {
     while let Some(out) = core.poll_transmit(2_000) {
         match out {
             PollOutput::Stream(b) if b.first() == Some(&0x04) => saw_stream_error = true,
-            PollOutput::Datagram(b) if b.first() == Some(&0x04) => saw_ack = true,
+            PollOutput::Datagram(b)
+                if b.first() == Some(&ghostframe_protocol::ack::ACK_BATCH_MSG_TYPE) =>
+            {
+                saw_ack = true
+            }
             _ => {}
         }
     }

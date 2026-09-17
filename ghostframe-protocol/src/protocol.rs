@@ -97,9 +97,16 @@ pub struct DatagramHeader {
     ///
     /// Scope: per QUIC session lifetime — restarts at 0 (or any value the
     /// emitter chooses to begin with) on every fresh session. Within a
-    /// session it is monotonic: each *new* tile-pass emission gets the
-    /// next value; retransmits of the same fragment reuse the original
-    /// `wire_seq` so the client can drop duplicates.
+    /// session it is monotonic and identifies a **transmission**: every send
+    /// gets its own value, retransmissions included. That is what lets an
+    /// acknowledgement say *which send* arrived, which the ACK envelope
+    /// (rev3) relies on and which the server's transmission ledger needs to
+    /// classify each datagram received or lost exactly once.
+    ///
+    /// Retransmissions used to reuse the original value. Duplicate suppression
+    /// does not depend on that: tile assembly is idempotent per
+    /// `(TileKey, frag_idx)`, and the parity window simply records a
+    /// retransmission as the distinct source it is.
     ///
     /// Convention: `0` means "not yet stamped". All call sites that build
     /// a header before the emitter sees it (`fragment_tile`,
@@ -844,11 +851,13 @@ pub fn classify_inbound(data: &[u8]) -> InboundKind {
     };
     match first {
         crate::feedback::FEEDBACK_MSG_TYPE => InboundKind::Hello,
-        // 0x02 and 0x03 are superseded ACK envelope revisions. `AckBatch::
-        // decode` rejects both with `WrongMsgType`, so they are named here
-        // only so an old client shows up as an old client rather than as
-        // `Unknown`.
-        0x02 | 0x03 => InboundKind::AckBatchV1,
+        // Superseded ACK envelope revisions. `AckBatch::decode` rejects all
+        // of them with `WrongMsgType`, so they are named here only so an old
+        // client shows up as an old client rather than as `Unknown`. 0x04 was
+        // the rev2 tile-pass format, retired in favour of transmission
+        // identity; it is also `TILE_PARITY_ENVELOPE`, which travels
+        // server -> client only and so never arrives on this path.
+        0x02..=0x04 => InboundKind::AckBatchV1,
         // The current ACK envelope. This arm used to read
         // `TILE_PARITY_ENVELOPE => TileParity`, which shares the value 0x04:
         // when the ACK envelope was bumped 0x03 -> 0x04 in 2026-06-27 this
@@ -1479,14 +1488,18 @@ mod tests {
 
         // Envelopes
         assert_eq!(classify_inbound(&[0x03]), InboundKind::AckBatchV1);
-        // 0x04 inbound is an ACK batch, not parity, even though
-        // `TILE_PARITY_ENVELOPE` shares the value: parity is server ->
-        // client only, so it never arrives on the path this function
-        // classifies. This assertion used to read `TileParity` and was
-        // pinning a stale mapping — see `classify_inbound`'s own comment.
+        // 0x04 is the superseded rev2 ACK format, so inbound it means an old
+        // client rather than parity — parity travels server -> client only
+        // and never arrives on the path this function classifies. It shares
+        // the value with `TILE_PARITY_ENVELOPE` for that reason, harmlessly.
         assert_eq!(
             classify_inbound(&[TILE_PARITY_ENVELOPE]),
-            InboundKind::AckBatch
+            InboundKind::AckBatchV1
+        );
+        assert_eq!(
+            classify_inbound(&[crate::ack::ACK_BATCH_MSG_TYPE]),
+            InboundKind::AckBatch,
+            "the current ACK revision routes to the ACK handler"
         );
         assert_eq!(
             classify_inbound(&[TILE_NACK_ENVELOPE]),

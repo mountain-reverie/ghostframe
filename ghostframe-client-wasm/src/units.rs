@@ -75,19 +75,13 @@ impl WasmAckBatcher {
     /// immediate flush, otherwise `undefined`.
     pub fn add(
         &mut self,
-        frame_seq: u32,
-        tile_x: u8,
-        tile_y: u8,
-        pass_idx: u8,
+        wire_seq: u32,
         arrival_time_ms_lo16: u16,
         now_us: u64,
     ) -> Option<Vec<u8>> {
         self.inner.add(
             AckEntry {
-                frame_seq,
-                tile_x,
-                tile_y,
-                pass_idx,
+                wire_seq,
                 arrival_time_ms_lo16,
             },
             now_us,

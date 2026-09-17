@@ -92,11 +92,21 @@ impl ClientCore {
 
         // ACK on receipt unless sentinel or Cdf53 (main.ts:1118-1145).
         if !is_sentinel && th.codec != Codec::Cdf53 {
+            // Names the transmission, not the content. The server maps it
+            // back to the tile-pass through its ledger, so every delivery
+            // consumer downstream is unchanged.
+            //
+            // A FEC-recovered replay reaches here carrying the *original*
+            // `wire_seq`, so acknowledging it reports a transmission that did
+            // not actually arrive — the parity did. That slightly
+            // under-reports loss, bounded by the FEC recovery rate, and is
+            // taken deliberately: the alternative leaves recovered content
+            // unacknowledged, so the server retransmits data the client
+            // already has. Exact accounting here would mean acknowledging
+            // parity envelopes in their own right, which is a larger change
+            // than it is worth today.
             let entry = AckEntry {
-                frame_seq: frame_seq | TILE_DATAGRAM_FLAG,
-                tile_x: th.tile_x,
-                tile_y: th.tile_y,
-                pass_idx: th.pass,
+                wire_seq: dh.wire_seq,
                 arrival_time_ms_lo16: ((now_us / 1000) & 0xFFFF) as u16,
             };
             if let Some(dg) = self.ack_batcher.add(entry, now_us) {
@@ -186,6 +196,9 @@ impl ClientCore {
         let fi = dh.frag_idx as usize;
         if fi < asm.fragments.len() && asm.fragments[fi].is_none() {
             asm.fragments[fi] = Some(payload.to_vec());
+            if fi < asm.wire_seqs.len() {
+                asm.wire_seqs[fi] = Some(dh.wire_seq);
+            }
             asm.received += 1;
         }
         let received = asm.received;
@@ -454,15 +467,26 @@ impl ClientCore {
                         // Deferred ACK — fires only after prevalidation success.
                         // Deliberately outside the match: it is protocol, not
                         // decoding, and must happen in both modes.
-                        let entry = AckEntry {
-                            frame_seq: frame_seq | TILE_DATAGRAM_FLAG,
-                            tile_x: tx,
-                            tile_y: ty,
-                            pass_idx: asm.pass,
-                            arrival_time_ms_lo16: ((now_us / 1000) & 0xFFFF) as u16,
-                        };
-                        if let Some(dg) = self.ack_batcher.add(entry, now_us) {
-                            self.outbox.push_back(PollOutput::Datagram(dg));
+                        //
+                        // One entry per *fragment*, since each was its own
+                        // transmission with its own `wire_seq`. A tile-pass
+                        // acknowledgement covered all of them at once when
+                        // entries named content; naming transmissions means
+                        // the pass's fragments have to be named individually
+                        // or the ones not mentioned would be counted lost.
+                        let arrival = ((now_us / 1000) & 0xFFFF) as u16;
+                        // A FEC-recovered fragment has no `wire_seq` of its
+                        // own — no transmission of it arrived — so it is
+                        // absent here and correctly goes unacknowledged.
+                        let wire_seqs: Vec<u32> = asm.wire_seqs.iter().flatten().copied().collect();
+                        for ws in wire_seqs {
+                            let entry = AckEntry {
+                                wire_seq: ws,
+                                arrival_time_ms_lo16: arrival,
+                            };
+                            if let Some(dg) = self.ack_batcher.add(entry, now_us) {
+                                self.outbox.push_back(PollOutput::Datagram(dg));
+                            }
                         }
                     }
                     Err(code) => {

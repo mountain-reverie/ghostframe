@@ -138,13 +138,17 @@
 #define CACHE_CAPACITY 32768
 
 /**
- * ACK envelope wire-format version. Bumped 0x03 → 0x04 in 2026-06-27
- * to add a 2-byte per-entry receiver-arrival-time field (low 16 bits
- * of wall-clock milliseconds) used by the server's bandwidth-estimator
- * hook. Old (0x03) clients/servers are not wire-compatible with new —
- * both sides ship in lockstep.
+ * ACK envelope wire-format version. Bumped 0x04 → 0x06 in 2026-09-17 when
+ * entries switched from naming a tile-pass to naming a transmission.
+ * 0x05 is skipped: it is `TILE_NACK_ENVELOPE`, and an ACK batch landing in
+ * the NACK handler would be silently dropped by the wrong decoder — a
+ * collision this project has already shipped once and caught late.
+ *
+ * Old clients/servers are not wire-compatible with new; both sides ship in
+ * lockstep, and the bumped byte makes a stale binary fail loud with
+ * `WrongMsgType` rather than mis-parse.
  */
-#define ACK_BATCH_MSG_TYPE 4
+#define ACK_BATCH_MSG_TYPE 6
 
 /**
  * Maximum number of *fresh* entries the client packs into one batch
@@ -166,7 +170,7 @@
  */
 #define MAX_ACK_ENTRIES_PER_BATCH (MAX_FRESH_ENTRIES_PER_BATCH + ACK_OVERLAP_COUNT)
 
-#define ACK_ENTRY_SIZE 9
+#define ACK_ENTRY_SIZE 6
 
 /**
  * Number of progressive passes emitted per Cdf53 tile.

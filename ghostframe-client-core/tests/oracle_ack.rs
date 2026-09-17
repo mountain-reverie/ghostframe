@@ -1,14 +1,21 @@
 use ghostframe_client_core::ack_batcher::AckBatcher;
 use ghostframe_protocol::ack::{AckBatch, AckEntry, ACK_ENTRY_SIZE, ACK_OVERLAP_COUNT};
 
+/// Entries name a transmission now, so the tile coordinates that used to
+/// identify one are folded into a distinct `wire_seq`. The batcher does not
+/// interpret the field — these suites exercise batching, flushing and overlap
+/// — so any injective mapping preserves what they were written to check.
 fn e(frame_seq: u32, tile_x: u8, tile_y: u8, pass_idx: u8, ts: u16) -> AckEntry {
     AckEntry {
-        frame_seq,
-        tile_x,
-        tile_y,
-        pass_idx,
+        wire_seq: ws(frame_seq, tile_x, tile_y, pass_idx),
         arrival_time_ms_lo16: ts,
     }
+}
+
+/// The injective mapping `e` uses, exposed so assertions can name the same
+/// transmission the helper built.
+fn ws(frame_seq: u32, tile_x: u8, tile_y: u8, pass_idx: u8) -> u32 {
+    frame_seq ^ ((tile_x as u32) << 16) ^ ((tile_y as u32) << 8) ^ (pass_idx as u32)
 }
 
 #[test]
@@ -16,11 +23,10 @@ fn encodes_msg_type_and_fields() {
     let mut b = AckBatcher::new();
     assert!(b.add(e(0x12345678, 3, 7, 13, 0), 0).is_none());
     let d = b.flush().unwrap();
-    assert_eq!(d[0], 0x04);
+    assert_eq!(d[0], 0x06, "rev3 message type");
     assert_eq!(d[1], 1);
-    assert_eq!(&d[2..6], &[0x78, 0x56, 0x34, 0x12]); // LE
-    assert_eq!((d[6], d[7], d[8]), (3, 7, 13));
-    assert_eq!(&d[9..11], &[0, 0]);
+    assert_eq!(&d[2..6], &ws(0x12345678, 3, 7, 13).to_le_bytes()); // LE
+    assert_eq!(&d[6..8], &[0, 0], "arrival");
 }
 
 #[test]
@@ -51,7 +57,7 @@ fn overlap_appends_up_to_eight_prior_entries() {
     let count = d[1] as usize;
     assert_eq!(count, 3 + 5.min(ACK_OVERLAP_COUNT)); // 3 fresh + 5 overlap
     let batch = AckBatch::decode(&d).unwrap();
-    assert_eq!(batch.entries[0].frame_seq, 100); // fresh first
+    assert_eq!(batch.entries[0].wire_seq, ws(100, 0, 0, 0)); // fresh first
 }
 
 #[test]
@@ -73,8 +79,7 @@ fn round_trips_arrival_time_ms_lo16() {
     let batch = AckBatch::decode(&d).unwrap();
     assert_eq!(batch.entries.len(), 1);
     assert_eq!(batch.entries[0].arrival_time_ms_lo16, 0xABCD);
-    assert_eq!(batch.entries[0].frame_seq, 0x12345678);
-    assert_eq!(batch.entries[0].pass_idx, 3);
+    assert_eq!(batch.entries[0].wire_seq, ws(0x12345678, 7, 9, 3));
 }
 
 #[test]
@@ -97,7 +102,10 @@ fn caps_overlap_at_eight_after_twenty_single_entry_flushes() {
     assert_eq!(batch.entries[0], e(100, 1, 2, 3, 0));
     for k in 0..ACK_OVERLAP_COUNT {
         let expected_frame_seq = 20 - ACK_OVERLAP_COUNT as u32 + k as u32;
-        assert_eq!(batch.entries[1 + k].frame_seq, expected_frame_seq);
+        assert_eq!(
+            batch.entries[1 + k].wire_seq,
+            ws(expected_frame_seq, 0, 0, 0)
+        );
     }
 }
 
