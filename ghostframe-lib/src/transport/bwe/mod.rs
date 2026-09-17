@@ -142,13 +142,19 @@ impl BweWrapper {
     /// collected (typically `Instant::now()` at ACK-parse time).
     ///
     /// Returns the updated `BweSnapshot`.
+    /// `losses` are transmissions RTO fired on, as `(emit_us, wire_bytes)`,
+    /// from `ReliableTileEmitter::take_rto_losses`. They are the only loss
+    /// signal the estimator receives; without them goog_cc's loss-based half
+    /// never engages.
     pub fn update(
         &mut self,
         records: &[AckArrival],
+        losses: &[(u32, usize)],
         now: Instant,
         data_in_flight_bytes: usize,
     ) -> BweSnapshot {
-        self.driver.update(records, now, data_in_flight_bytes)
+        self.driver
+            .update(records, losses, now, data_in_flight_bytes)
     }
 
     /// Return the current observability snapshot without advancing the estimator.
@@ -228,6 +234,7 @@ mod tests {
             .collect();
         let snap = bwe.update(
             &records,
+            &[],
             t0 + Duration::from_millis(20),
             records.iter().map(|r| r.size_bytes as usize).sum(),
         );
@@ -258,6 +265,7 @@ mod tests {
         ];
         let snap = bwe.update(
             &records,
+            &[],
             Instant::now(),
             records.iter().map(|r| r.size_bytes as usize).sum(),
         );
@@ -349,6 +357,7 @@ mod tests {
             last = w
                 .update(
                     &batch,
+                    &[],
                     t0 + std::time::Duration::from_millis(20 * step as u64),
                     batch.iter().map(|r| r.size_bytes as usize).sum(),
                 )
@@ -387,6 +396,7 @@ mod tests {
             last = w
                 .update(
                     &batch,
+                    &[],
                     t0 + std::time::Duration::from_millis(20 * step as u64),
                     batch.iter().map(|r| r.size_bytes as usize).sum(),
                 )

@@ -271,9 +271,14 @@ impl GoogCcDriver {
     pub(crate) fn update(
         &mut self,
         records: &[AckArrival],
+        losses: &[(u32, usize)],
         now: Instant,
         data_in_flight_bytes: usize,
     ) -> BweSnapshot {
+        // Records, not losses, gate this. `on_transport_packets_feedback`
+        // unwraps `received_with_send_info().max()`, so a report carrying
+        // only losses panics inside goog_cc. Callers therefore hold losses
+        // back until an acknowledgement is available to accompany them.
         if records.is_empty() {
             return self.snapshot();
         }
@@ -306,10 +311,9 @@ impl GoogCcDriver {
         // the client epoch cancels naturally without needing to be floored
         // against anything here.
         let mut feedback_time = self.to_timestamp(now);
-        // Safe to initialize from the first record's send_ms: `records` was
-        // checked non-empty above.
+        // Safe to index: `records` is checked non-empty above.
         let mut send_ms_max = (records[0].server_emit_us / 1_000) as i64;
-        let mut packet_feedbacks = Vec::with_capacity(records.len());
+        let mut packet_feedbacks = Vec::with_capacity(records.len() + losses.len());
         let mut last_derived = Duration::ZERO;
         for r in records {
             let send_ms = (r.server_emit_us / 1_000) as i64;
@@ -336,6 +340,39 @@ impl GoogCcDriver {
                 ..Default::default()
             });
         }
+        // Losses, reported as feedback entries with no receive time.
+        // `PacketResult::is_received` is `!receive_time.is_plus_infinity()`
+        // and goog_cc's `lost_packets()` filters on exactly that, so an
+        // ACK-only feedback stream reports zero losses however much traffic
+        // is being dropped — the loss-based estimator never engages at all.
+        // Measured before this: a link dropping from 16 to 4 Mbps under
+        // ~750 kB of loss left the estimate pinned at its pre-drop 16.4 Mbps
+        // in 5 runs out of 6, a sustained 4x overestimate of a degraded
+        // link.
+        for &(emit_us, size_bytes) in losses {
+            let send_ms = (emit_us as u64 / 1_000) as i64;
+            send_ms_max = send_ms_max.max(send_ms);
+            let sent = SentPacket {
+                send_time: Timestamp::from_millis(send_ms),
+                size: DataSize::from_bytes(size_bytes as i64),
+                // Never a probe: a retransmission belongs to no cluster
+                // (see the emitter's `entry.probe = None`), and the
+                // transmission this stands in for was lost, so it measured
+                // nothing.
+                pacing_info: PacedPacketInfo::default(),
+                ..Default::default()
+            };
+            self.ctl.0.on_sent_packet(sent);
+            packet_feedbacks.push(PacketResult {
+                sent_packet: sent,
+                receive_time: Timestamp::plus_infinity(),
+                ..Default::default()
+            });
+        }
+        // goog_cc walks this vector in order; keep sends monotonic so a
+        // loss interleaved with acknowledgements lands where it belongs.
+        packet_feedbacks.sort_by_key(|f| f.sent_packet.send_time);
+
         feedback_time = feedback_time.max(Timestamp::from_millis(send_ms_max));
         self.samples_seen += records.len() as u64;
         self.observe_derived_rtt(last_derived);
@@ -573,6 +610,7 @@ mod tests {
                 .collect();
             d.update(
                 &batch,
+                &[],
                 t0 + Duration::from_millis(20 * step as u64),
                 batch.iter().map(|r| r.size_bytes as usize).sum(),
             );
@@ -619,6 +657,7 @@ mod tests {
                     .collect();
                 d.update(
                     &batch,
+                    &[],
                     t0 + Duration::from_millis(20 * step as u64),
                     batch.iter().map(|r| r.size_bytes as usize).sum(),
                 );
@@ -697,6 +736,7 @@ mod tests {
             .collect();
         d.update(
             &batch,
+            &[],
             t0 + Duration::from_millis(20),
             batch.iter().map(|r| r.size_bytes as usize).sum(),
         );
@@ -793,6 +833,7 @@ mod tests {
         // Must not panic.
         let snap = d.update(
             &records,
+            &[],
             t0 + Duration::from_millis(20),
             records.iter().map(|r| r.size_bytes as usize).sum(),
         );
