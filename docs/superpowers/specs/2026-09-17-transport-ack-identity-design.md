@@ -97,12 +97,33 @@ send time the estimator has long since moved past.
 ### The loss horizon
 
 An unacknowledged `wire_seq` is declared lost after
-`max(LOSS_HORIZON_FLOOR, LOSS_HORIZON_RTTS x smoothed_rtt)`.
+`clamp(LOSS_HORIZON_RTTS x smoothed_rtt, LOSS_HORIZON_FLOOR, LOSS_HORIZON_CEIL)`.
 
 Too short and reordering reads as loss; too long and backoff lags the
-degradation it exists to catch. The floor must clear the client's 5 ms ACK
-batching plus one ACK batch interval. Initial values are a starting point to be
-measured against the degradation scene, not a tuned result.
+degradation the horizon exists to catch.
+
+**Adaptive**, because the spread is too wide for one number: measured RTT on
+this system ranges from ~20 ms on a clean link to 147 ms through the
+bufferbloated wifi bottleneck. A constant sized for the slow case delays
+reporting several-fold on the fast one; sized for the fast case, late
+acknowledgements on a slow path read as loss.
+
+**Floored**, because the client's 5 ms ACK batching is RTT-independent and does
+not shrink on a fast link. The floor covers that quantum plus a batch interval.
+
+**Capped**, because the adaptation has a perverse direction: under bufferbloat
+RTT inflates *because of* the congestion being detected, which would stretch
+the horizon at exactly the moment loss should be reported fastest. The 20 ms ->
+147 ms figure above is that effect, measured. The ceiling must still clear a
+legitimately high-RTT path, so it bounds the pathology without truncating
+honest latency.
+
+There is precedent for distrusting an RTT-derived value here:
+`GoogCcDriver::note_path_rtt` already cross-checks the estimator's derived RTT
+against quinn's measured path RTT and counts `implausible_rtt_samples`.
+
+Initial values are a starting point to be measured against the degradation
+scene, not a tuned result.
 
 ### Reporting to goog_cc
 
@@ -142,10 +163,13 @@ never something the decoder relied on.
 - **Unit:** ledger classifies exactly once; supersession leaves the ledger
   untouched; horizon expiry reports loss; late ACK after expiry does not
   double-report.
-- **Property:** for any interleaving of emits, ACKs, supersessions and horizon
-  expiries, every emitted `wire_seq` is reported exactly once.
 - **Wire:** ACK round-trip including the overlap entries; a rejected batch from
   a stale peer fails loud on the message-type byte rather than mis-parsing.
+- **Property (required):** for any interleaving of emits, acknowledgements,
+  supersessions and horizon expiries, every emitted `wire_seq` is reported
+  exactly once — never twice, never not at all. This is the invariant the whole
+  design rests on and the one most likely to break under an ordering nobody
+  thought of.
 - **Acceptance (the point of the exercise):** on the 16 -> 4 Mbps degradation
   scene, the estimate settles to within 1.5x of the new capacity, in every run
   rather than 1 in 6. The loss fraction goog_cc observes should approach the
