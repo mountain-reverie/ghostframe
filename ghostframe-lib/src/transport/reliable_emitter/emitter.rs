@@ -27,11 +27,26 @@ pub struct ReliableTileEmitter {
     /// `now_std()` in production (which tracks tokio's clock, paused or
     /// not), a bare `Instant::now()` in unit tests. See `emit_us` below.
     pub(crate) time_base: Instant,
-    /// Transmissions that RTO fired on, as `(emit_us, wire_bytes)`, awaiting
-    /// collection by `take_rto_losses`. These are the only loss signal the
-    /// bandwidth estimator gets — see where they are pushed in `tick`.
-    losses: Vec<(u32, usize)>,
+    /// Everything actually put on the wire since the last collection, for the
+    /// transmission ledger. Recorded here because this is where `wire_seq` is
+    /// allocated; the caller cannot otherwise know which value a datagram
+    /// carried.
+    transmissions: Vec<EmittedDatagram>,
     pub stats: EmitterStats,
+}
+
+/// One datagram as it went on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmittedDatagram {
+    /// Unique per transmission, retransmissions included.
+    pub wire_seq: u32,
+    /// The stamp written into this datagram's header, in the emitter's
+    /// clock-relative microseconds.
+    pub emit_us: u32,
+    pub wire_bytes: usize,
+    /// The content this transmission was carrying, so an acknowledgement can
+    /// be mapped back to the tile-pass every delivery consumer expects.
+    pub key: EmitKey,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -62,7 +77,7 @@ impl ReliableTileEmitter {
             rto: RtoTimerWheel::new(),
             smoothed_rtt: Duration::from_millis(20),
             time_base: now,
-            losses: Vec::new(),
+            transmissions: Vec::new(),
             stats: EmitterStats::default(),
         }
     }
@@ -106,10 +121,18 @@ impl ReliableTileEmitter {
         // (which set TILE_DATAGRAM_FLAG = 0x80 in byte 0). Used by the
         // client's per-tier latency tracking and echoed back via the ACK
         // envelope for the BWE delay-gradient input.
+        let mut stamped_emit_us = 0u32;
         if bytes.len() >= 16 && (bytes[0] & 0x80) != 0 {
             let emit_us = self.emit_us(now);
+            stamped_emit_us = emit_us;
             bytes[12..16].copy_from_slice(&emit_us.to_be_bytes());
         }
+        self.transmissions.push(EmittedDatagram {
+            wire_seq,
+            emit_us: stamped_emit_us,
+            wire_bytes: bytes.len(),
+            key,
+        });
         // Cache & RTO.
         let entry = CacheEntry {
             fragments: smallvec![Bytes::from(bytes.clone())],
@@ -263,14 +286,22 @@ impl ReliableTileEmitter {
                 // Fragments of a pass each carry their own `wire_seq`, so
                 // this allocates per fragment exactly as the original
                 // submission did.
+                let mut ws = 0u32;
                 if bytes.len() >= 12 {
-                    let ws = self.alloc.allocate();
+                    ws = self.alloc.allocate();
                     bytes[8..12].copy_from_slice(&ws.to_be_bytes());
                 }
+                let mut stamped = 0u32;
                 if bytes.len() >= 16 && (bytes[0] & 0x80) != 0 {
-                    let emit_us = self.emit_us(now);
-                    bytes[12..16].copy_from_slice(&emit_us.to_be_bytes());
+                    stamped = self.emit_us(now);
+                    bytes[12..16].copy_from_slice(&stamped.to_be_bytes());
                 }
+                self.transmissions.push(EmittedDatagram {
+                    wire_seq: ws,
+                    emit_us: stamped,
+                    wire_bytes: bytes.len(),
+                    key,
+                });
                 self.queue.push_source(bytes);
             }
             self.rto.schedule(key, now + new_rto);
@@ -334,18 +365,26 @@ impl ReliableTileEmitter {
             // wants the on-wire moment of *this* transmission, and the stamp
             // being overwritten identifies the one that was lost.
             // Fresh `wire_seq` for the same reason as the RTO path above.
+            let mut ws = 0u32;
             if bytes.len() >= 12 {
-                let ws = self.alloc.allocate();
+                ws = self.alloc.allocate();
                 bytes[8..12].copy_from_slice(&ws.to_be_bytes());
             }
             if bytes.len() >= 16 && (bytes[0] & 0x80) != 0 {
                 bytes[12..16].copy_from_slice(&emit_us_now.to_be_bytes());
             }
+            let emitted = EmittedDatagram {
+                wire_seq: ws,
+                emit_us: emit_us_now,
+                wire_bytes: bytes.len(),
+                key,
+            };
             entry.attempts += 1;
             entry.last_sent_at = now;
             entry.probe = None;
             // Release the entry borrow before touching self.queue / self.stats.
             let _ = entry;
+            self.transmissions.push(emitted);
             self.queue.push_source(bytes);
             self.stats.nack_hit += 1;
             self.stats.retransmit_attempts_total += 1;
@@ -390,22 +429,14 @@ impl ReliableTileEmitter {
     }
 
     /// Drain emissions to a sender until the queue is empty.
-    /// Take the transmissions known not to have arrived since the last
-    /// call, as `(emit_us, wire_bytes)`.
+    /// Take everything put on the wire since the last call, for recording in
+    /// the transmission ledger.
     ///
-    /// Two sources, deliberately: a client NACK, which is ground truth, and
-    /// an RTO firing, which is not — RTO responds to delay as readily as to
-    /// loss. NACKs alone would miss whatever the client never learns to ask
-    /// for; RTO alone misses everything superseded before it fires, which on
-    /// a churning screen is most of it.
-    ///
-    /// goog_cc's loss-based estimator needs per-packet results rather than
-    /// an aggregate rate, and derives loss purely from feedback entries with
-    /// an infinite receive time. Feeding it none — which is what happened
-    /// until this existed — leaves that half of the controller permanently
-    /// blind however much traffic is being dropped.
-    pub fn take_losses(&mut self) -> Vec<(u32, usize)> {
-        std::mem::take(&mut self.losses)
+    /// Emitted here rather than inferred by the caller because `wire_seq` is
+    /// allocated inside this type — including for retransmissions, which each
+    /// get their own.
+    pub fn take_transmissions(&mut self) -> Vec<EmittedDatagram> {
+        std::mem::take(&mut self.transmissions)
     }
 
     pub fn drain<S: DatagramSender>(&mut self, sender: &mut S, now: Instant) {

@@ -22,7 +22,11 @@ const GLOBAL_CAP: usize = 32;
 /// Decode-error report, sent on the feedback stream. Wire layout
 /// `[DECODE_ERROR_MSG_TYPE, codec, tile_x, tile_y, code]`.
 ///
-/// Shares the value 0x04 with `ACK_BATCH_MSG_TYPE`, which is unambiguous
+/// Shared the value 0x04 with `ACK_BATCH_MSG_TYPE` until that moved to 0x06
+/// for transmission-identity entries; the reasoning below stands regardless,
+/// since the two ride different channels and were never disambiguated by the
+/// byte alone. Kept as written because it is the channel separation, not the
+/// value, that makes this unambiguous
 /// only because the two travel on different channels: ACK batches are
 /// datagrams, decode errors are stream messages. Do not merge them.
 pub const DECODE_ERROR_MSG_TYPE: u8 = 0x04;

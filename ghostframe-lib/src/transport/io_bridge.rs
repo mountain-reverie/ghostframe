@@ -177,7 +177,30 @@ const PATH_IDLE_AFTER: std::time::Duration = std::time::Duration::from_millis(25
 /// Comfortably more than a congested tick produces, and small enough that a
 /// session whose acknowledgements never resume cannot accumulate without
 /// bound.
-const MAX_PENDING_RTO_LOSSES: usize = 4096;
+const MAX_PENDING_LOSSES: usize = 4096;
+
+/// Outstanding transmissions the ledger will hold. Sized by send rate x
+/// horizon rather than session length — roughly 2000 packets/s at 20 Mbps
+/// against a horizon measured in hundreds of milliseconds. The cap is a
+/// backstop against a peer that stops acknowledging, not the normal bound.
+const TRANSMISSION_LEDGER_CAPACITY: usize = 16_384;
+
+/// Loss horizon bounds. An unacknowledged transmission is declared lost after
+/// `clamp(LOSS_HORIZON_RTTS x smoothed_rtt, FLOOR, CEIL)`.
+///
+/// Adaptive because the spread is too wide for one number: measured RTT on
+/// this system runs from ~20 ms on a clean link to 147 ms through the
+/// bufferbloated wifi bottleneck.
+///
+/// The floor covers the client's 5 ms ACK batching plus a batch interval,
+/// which is RTT-independent and does not shrink on a fast link.
+///
+/// The ceiling bounds a perverse coupling: under bufferbloat RTT inflates
+/// *because of* the congestion being detected, which would stretch the
+/// horizon exactly when loss should be reported fastest.
+const LOSS_HORIZON_RTTS: u32 = 3;
+const LOSS_HORIZON_FLOOR: std::time::Duration = std::time::Duration::from_millis(60);
+const LOSS_HORIZON_CEIL: std::time::Duration = std::time::Duration::from_millis(600);
 // Leave 10 % headroom in the budget so we don't push right up to quinn's
 // drain rate every tick (ACKs, feedback, NACK retransmits still need
 // wire). Cheap enough.
@@ -741,9 +764,13 @@ pub struct IoBridge {
     /// and the delta since. Zero delta means the link was idle over that
     /// interval, which is when `cwnd / rtt` stops meaning anything.
     path_sent_packets_last: u64,
-    /// RTO-fired transmissions awaiting a feedback report with at least one
-    /// acknowledgement to travel in. See the drain site.
-    pending_rto_losses: Vec<(u32, usize)>,
+    /// Losses awaiting a feedback report with at least one acknowledgement to
+    /// travel in. See the drain site.
+    pending_losses: Vec<(u32, usize)>,
+    /// Per-transmission accounting. Deliberately not the retransmit cache:
+    /// that one is content-scoped and emptied by supersession, which is what
+    /// hid most losses from the estimator.
+    transmission_ledger: crate::transport::transmission_ledger::TransmissionLedger,
     /// When quinn's `sent_packets` last advanced. `None` before the first
     /// packet. Used to tell a busy link from an idle one — see
     /// `apply_path_stats_snapshot`.
@@ -1253,7 +1280,10 @@ impl IoBridge {
             scheduler_continuation: None,
             capacity_hint_window: std::collections::VecDeque::new(),
             path_sent_packets_last: 0,
-            pending_rto_losses: Vec::new(),
+            pending_losses: Vec::new(),
+            transmission_ledger: crate::transport::transmission_ledger::TransmissionLedger::new(
+                TRANSMISSION_LEDGER_CAPACITY,
+            ),
             path_last_sent_at: None,
             last_drain_frame_context: None,
             cumulative_datagrams_emitted: CumulativeEmitCounters::default(),
@@ -2690,62 +2720,71 @@ impl IoBridge {
                 // only, so clock skew is acceptable. Cache misses are silent
                 // (already ACKed by an overlapping batch, or RTO-evicted).
                 let now_for_samples = now_std();
-                let emit_keys: Vec<crate::transport::reliable_emitter::EmitKey> = batch
+                // Entries name transmissions now, so the ledger supplies both
+                // halves: the content identity every delivery consumer below
+                // expects, and the exact send time of *that* transmission —
+                // no longer inferred from a cache entry that a retransmission
+                // may have re-stamped since.
+                let resolved: Vec<(
+                    crate::transport::reliable_emitter::EmitKey,
+                    crate::transport::transmission_ledger::Transmission,
+                    u16,
+                )> = batch
                     .entries
                     .iter()
-                    .map(|e| {
-                        crate::transport::reliable_emitter::EmitKey::new(
-                            e.frame_seq,
-                            e.tile_x,
-                            e.tile_y,
-                            e.pass_idx,
-                        )
+                    .filter_map(|e| {
+                        self.transmission_ledger
+                            .resolve(e.wire_seq)
+                            .map(|tx| (tx.key, tx, e.arrival_time_ms_lo16))
                     })
                     .collect();
-                // Extract BweSamples while the cache entries are still live.
-                for (emit_key, e) in emit_keys.iter().zip(batch.entries.iter()) {
-                    if self.bwe_samples_buffer.len() < BWE_SAMPLES_BUFFER_CAPACITY {
-                        let cache_entry = self.reliable_emitter.cache.get(emit_key);
-                        let Some(entry) = cache_entry else {
-                            continue;
-                        };
-                        let size_bytes: u32 = entry.fragments.iter().map(|f| f.len() as u32).sum();
-                        let server_emit_us = entry
-                            .last_sent_at
-                            .saturating_duration_since(self.bwe_epoch)
-                            .as_micros() as u64;
-                        // BWE Stage 2.1: `queued_at` is copied through
-                        // unchanged across retransmits (see
-                        // `CacheEntry::queued_at`'s doc comment), unlike
-                        // `last_sent_at` above.
-                        let queued_since_epoch_us = entry
-                            .queued_at
-                            .saturating_duration_since(self.bwe_epoch)
-                            .as_micros() as u64;
-                        let arrival_lo16 = e.arrival_time_ms_lo16;
-                        let tier = pass_tier(e.pass_idx);
-                        let emit_lo16 = ((server_emit_us / 1000) & 0xFFFF) as u16;
-                        let owd_ms_lo16 = arrival_lo16.wrapping_sub(emit_lo16);
-                        // BWE Stage 2.4: carry the probe tag (if any)
-                        // through to the sample, same pattern as
-                        // `queued_since_epoch_us` above.
-                        let probe = entry.probe;
-                        self.bwe_samples_buffer.push(BweSample {
-                            tier,
-                            server_emit_us,
-                            queued_since_epoch_us,
-                            client_arrival_ms_lo16: arrival_lo16,
-                            owd_ms_lo16,
-                            size_bytes,
-                            probe,
-                            received_at: now_for_samples,
-                        });
+                let emit_keys: Vec<crate::transport::reliable_emitter::EmitKey> =
+                    resolved.iter().map(|(k, _, _)| *k).collect();
+                // Samples come from the ledger record, not the cache entry.
+                // `Transmission::emit_us` is the stamp *this* datagram
+                // carried, so a retransmission no longer borrows the send time
+                // of whichever transmission the cache happened to hold last —
+                // the ambiguity that made a Karn-style filter necessary.
+                //
+                // `queued_at` and the probe tag still come from the cache,
+                // which is content-scoped and may legitimately be gone if the
+                // tile was superseded. Absent, the sample is still recorded:
+                // its timing is what the estimator came for.
+                for (emit_key, tx, arrival_lo16) in resolved.iter() {
+                    if self.bwe_samples_buffer.len() >= BWE_SAMPLES_BUFFER_CAPACITY {
+                        break;
                     }
+                    let cache_entry = self.reliable_emitter.cache.get(emit_key);
+                    let server_emit_us = tx.emit_us as u64;
+                    let queued_since_epoch_us = cache_entry
+                        .map(|entry| {
+                            entry
+                                .queued_at
+                                .saturating_duration_since(self.bwe_epoch)
+                                .as_micros() as u64
+                        })
+                        .unwrap_or(server_emit_us);
+                    let tier = pass_tier(emit_key.pass_idx);
+                    let emit_lo16 = ((server_emit_us / 1000) & 0xFFFF) as u16;
+                    let owd_ms_lo16 = arrival_lo16.wrapping_sub(emit_lo16);
+                    let probe = cache_entry.and_then(|entry| entry.probe);
+                    self.bwe_samples_buffer.push(BweSample {
+                        tier,
+                        server_emit_us,
+                        queued_since_epoch_us,
+                        client_arrival_ms_lo16: *arrival_lo16,
+                        owd_ms_lo16,
+                        size_bytes: tx.wire_bytes as u32,
+                        probe,
+                        received_at: now_for_samples,
+                    });
                 }
                 self.reliable_emitter.on_ack(&emit_keys);
-                for e in batch.entries {
+                for (emit_key, _, _) in resolved.iter() {
                     // Key matches how coverage is recorded at emit time:
-                    // (frame_seq, tile_x, tile_y, pass_idx).
+                    // (frame_seq, tile_x, tile_y, pass_idx), recovered from
+                    // the ledger since the entry named a transmission.
+                    let e = *emit_key;
                     let key = (e.frame_seq, e.tile_x, e.tile_y, e.pass_idx);
                     let coverage = match self.fragment_coverage.take(key) {
                         Some(c) => c,
@@ -4740,23 +4779,41 @@ impl IoBridge {
             // (composed from emit/arrival timestamps); Phase 2 will plumb
             // the real cache-entry wire_seq through `BweSample` if the
             // estimator backend needs strict packet-sequence identity.
-            // Drained every tick, but reported only alongside an
-            // acknowledgement: goog_cc unwraps the max receive time over a
-            // report's received packets, so a loss-only report panics inside
-            // the library. A congested link can spend whole ticks
-            // retransmitting with no ACK coming back, so they accumulate here
-            // until one arrives rather than being dropped.
-            self.pending_rto_losses
-                .extend(self.reliable_emitter.take_losses());
-            // Bounded: if acknowledgements never resume, the session is dead
+            // Everything the emitter put on the wire becomes an outstanding
+            // record. `wire_seq` is allocated inside the emitter, so this is
+            // the only place that knows which value each datagram carried.
+            let ledger_now = now_std();
+            for e in self.reliable_emitter.take_transmissions() {
+                self.transmission_ledger.record(
+                    e.wire_seq,
+                    ledger_now,
+                    crate::transport::transmission_ledger::Transmission {
+                        emit_us: e.emit_us,
+                        wire_bytes: e.wire_bytes,
+                        key: e.key,
+                    },
+                );
+            }
+            // Anything outstanding past the horizon is lost. This is the
+            // complete loss signal: it does not care whether the content was
+            // superseded, which is precisely what NACK- and RTO-derived
+            // signals could not see.
+            let horizon = self.loss_horizon();
+            for tx in self.transmission_ledger.expire(ledger_now, horizon) {
+                self.pending_losses.push((tx.emit_us, tx.wire_bytes));
+            }
+            // Reported only alongside an acknowledgement: goog_cc unwraps the
+            // max receive time over a report's received packets, so a
+            // loss-only report panics inside the library. A congested link can
+            // spend whole ticks with nothing acknowledged, so they accumulate
+            // here rather than being dropped.
+            //
+            // Bounded: if acknowledgements never resume the session is dead
             // and the backlog is worthless. Oldest go first — a stale loss
             // describes a send time the estimator has long since moved past.
-            let overflow = self
-                .pending_rto_losses
-                .len()
-                .saturating_sub(MAX_PENDING_RTO_LOSSES);
+            let overflow = self.pending_losses.len().saturating_sub(MAX_PENDING_LOSSES);
             if overflow > 0 {
-                self.pending_rto_losses.drain(..overflow);
+                self.pending_losses.drain(..overflow);
             }
             if !self.bwe_samples_buffer.is_empty() {
                 use crate::transport::bwe::AckArrival;
@@ -4825,7 +4882,7 @@ impl IoBridge {
                 // on. Read before `update` so it reflects the state the
                 // feedback describes.
                 let in_flight = self.reliable_emitter.bytes_in_flight();
-                let losses = std::mem::take(&mut self.pending_rto_losses);
+                let losses = std::mem::take(&mut self.pending_losses);
                 self.bwe.update(&records, &losses, now_std(), in_flight);
             }
 
@@ -5396,7 +5453,10 @@ impl IoBridge {
             scheduler_continuation: None,
             capacity_hint_window: std::collections::VecDeque::new(),
             path_sent_packets_last: 0,
-            pending_rto_losses: Vec::new(),
+            pending_losses: Vec::new(),
+            transmission_ledger: crate::transport::transmission_ledger::TransmissionLedger::new(
+                TRANSMISSION_LEDGER_CAPACITY,
+            ),
             path_last_sent_at: None,
             last_drain_frame_context: None,
             cumulative_datagrams_emitted: CumulativeEmitCounters::default(),
@@ -5707,6 +5767,48 @@ impl IoBridge {
     /// mirror into `adaptation_context`, bump `last_update_seq`, push to
     /// classifier. Pure function of the two inputs — exposed for unit tests
     /// so `sample_all_path_stats` can stay thin. `rtt <= 0` is a no-op.
+    /// Seed the transmission ledger so a test can acknowledge content by
+    /// naming a transmission, the way the wire now does.
+    ///
+    /// Production records these from `ReliableTileEmitter::take_transmissions`
+    /// because `wire_seq` is allocated in there. A test that hand-builds an
+    /// ACK has no emitter run behind it, so it declares the mapping directly.
+    #[cfg(test)]
+    pub(crate) fn seed_transmission_for_test(
+        &mut self,
+        wire_seq: u32,
+        key: crate::transport::reliable_emitter::EmitKey,
+    ) {
+        self.transmission_ledger.record(
+            wire_seq,
+            now_std(),
+            crate::transport::transmission_ledger::Transmission {
+                emit_us: 0,
+                wire_bytes: 1200,
+                key,
+            },
+        );
+    }
+
+    /// How long an unacknowledged transmission waits before being declared
+    /// lost. See `LOSS_HORIZON_RTTS` and friends for why this adapts, and why
+    /// it is bounded at both ends.
+    ///
+    /// Sourced from quinn's measured path RTT rather than the estimator's
+    /// derived one: the derived value is downstream of the very feedback this
+    /// horizon governs, and `GoogCcDriver::note_path_rtt` already exists
+    /// because that derivation has been seen to go implausible.
+    fn loss_horizon(&self) -> std::time::Duration {
+        let rtt = self
+            .server
+            .connections
+            .values()
+            .map(|c| c.stats().path.rtt)
+            .min()
+            .unwrap_or(LOSS_HORIZON_FLOOR);
+        (rtt * LOSS_HORIZON_RTTS).clamp(LOSS_HORIZON_FLOOR, LOSS_HORIZON_CEIL)
+    }
+
     /// Record one `cwnd / rtt` sample and, once the window is full, feed its
     /// minimum to the estimator as a capacity ceiling. See the call site for
     /// why the minimum and why only while the path is busy.
@@ -6450,12 +6552,13 @@ mod tests {
         // Key: (frame_seq=100, tile_x=7, tile_y=9, pass_idx=0)
         bridge.fragment_coverage.record((100, 7, 9, 0), cov);
 
+        bridge.seed_transmission_for_test(
+            1000,
+            crate::transport::reliable_emitter::EmitKey::new(100, 7, 9, 0),
+        );
         let batch = crate::transport::ack::AckBatch {
             entries: vec![crate::transport::ack::AckEntry {
-                frame_seq: 100,
-                tile_x: 7,
-                tile_y: 9,
-                pass_idx: 0,
+                wire_seq: 1000,
                 arrival_time_ms_lo16: 0,
             }],
         };
@@ -6474,12 +6577,13 @@ mod tests {
         let server = QuicServer::new().expect("server");
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
         let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+        bridge.seed_transmission_for_test(
+            1001,
+            crate::transport::reliable_emitter::EmitKey::new(999, 9, 5, 3),
+        );
         let batch = crate::transport::ack::AckBatch {
             entries: vec![crate::transport::ack::AckEntry {
-                frame_seq: 999,
-                tile_x: 9,
-                tile_y: 5,
-                pass_idx: 3,
+                wire_seq: 1001,
                 arrival_time_ms_lo16: 0,
             }],
         };
@@ -6556,12 +6660,25 @@ mod tests {
             None,
             std::time::Instant::now(),
         );
+        // Acknowledge the transmission the emitter actually allocated,
+        // recorded into the ledger as the production drain would.
+        let ledger_now = now_std();
+        let emitted = bridge.reliable_emitter.take_transmissions();
+        assert_eq!(emitted.len(), 1, "one datagram was submitted");
+        for e in &emitted {
+            bridge.transmission_ledger.record(
+                e.wire_seq,
+                ledger_now,
+                crate::transport::transmission_ledger::Transmission {
+                    emit_us: e.emit_us,
+                    wire_bytes: e.wire_bytes,
+                    key: e.key,
+                },
+            );
+        }
         let ack_env = crate::transport::ack::AckBatch {
             entries: vec![crate::transport::ack::AckEntry {
-                frame_seq: 1,
-                tile_x: 0,
-                tile_y: 0,
-                pass_idx: 0,
+                wire_seq: emitted[0].wire_seq,
                 arrival_time_ms_lo16: 0,
             }],
         };
@@ -7048,12 +7165,13 @@ mod tests {
         // Key: (frame_seq=200, tile_x=0, tile_y=0, pass_idx=0)
         bridge.fragment_coverage.record((200, 0, 0, 0), cov);
 
+        bridge.seed_transmission_for_test(
+            1003,
+            crate::transport::reliable_emitter::EmitKey::new(200, 0, 0, 0),
+        );
         let batch = crate::transport::ack::AckBatch {
             entries: vec![crate::transport::ack::AckEntry {
-                frame_seq: 200,
-                tile_x: 0,
-                tile_y: 0,
-                pass_idx: 0,
+                wire_seq: 1003,
                 arrival_time_ms_lo16: 0,
             }],
         };
@@ -7093,12 +7211,13 @@ mod tests {
         // Key: (frame_seq=201, tile_x=0, tile_y=0, pass_idx=0)
         bridge.fragment_coverage.record((201, 0, 0, 0), cov);
 
+        bridge.seed_transmission_for_test(
+            1004,
+            crate::transport::reliable_emitter::EmitKey::new(201, 0, 0, 0),
+        );
         let batch = crate::transport::ack::AckBatch {
             entries: vec![crate::transport::ack::AckEntry {
-                frame_seq: 201,
-                tile_x: 0,
-                tile_y: 0,
-                pass_idx: 0,
+                wire_seq: 1004,
                 arrival_time_ms_lo16: 0,
             }],
         };
@@ -7939,11 +8058,24 @@ mod tests {
                     None,
                     super::now_std(),
                 );
+            }
+            // This test really does submit through the emitter, so it can
+            // acknowledge the `wire_seq` values actually allocated rather
+            // than declaring a mapping — recording them the same way the
+            // production drain does.
+            let ledger_now = super::now_std();
+            for e in bridge.reliable_emitter.take_transmissions() {
+                bridge.transmission_ledger.record(
+                    e.wire_seq,
+                    ledger_now,
+                    crate::transport::transmission_ledger::Transmission {
+                        emit_us: e.emit_us,
+                        wire_bytes: e.wire_bytes,
+                        key: e.key,
+                    },
+                );
                 entries.push(AckEntry {
-                    frame_seq,
-                    tile_x: 1,
-                    tile_y: 2,
-                    pass_idx: 0,
+                    wire_seq: e.wire_seq,
                     arrival_time_ms_lo16: 1_500,
                 });
             }
