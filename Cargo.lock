@@ -1692,6 +1692,7 @@ dependencies = [
  "futures",
  "ghostframe-protocol",
  "ghostframe-test-pattern",
+ "ghostframe-tsnet",
  "goog_cc",
  "hex",
  "libc",
@@ -1735,6 +1736,14 @@ dependencies = [
  "ghostframe-bench",
  "libc",
  "x11rb",
+]
+
+[[package]]
+name = "ghostframe-tsnet"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
