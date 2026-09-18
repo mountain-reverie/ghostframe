@@ -1,4 +1,10 @@
-//! Rust FFI bindings to the ghostbridge Go `c-archive`.
+//! Rust FFI bindings to the ghostbridge Go `c-archive` — the tsnet byte pump.
+//!
+//! Its own crate so a client can reach the wire without depending on the
+//! server. That is also why there is no plain-socket escape hatch here: every
+//! path goes through ghostbridge into the tailnet, and keeping the pump in a
+//! crate of its own makes that a structural property rather than a convention
+//! someone has to remember.
 //!
 //! Ghostbridge exposes `tsnet.Server.ListenPacket` / `Dial` as C-callable
 //! functions that return a Unix-domain socketpair fd. Each datagram crossing

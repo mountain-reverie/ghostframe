@@ -37,6 +37,7 @@ quinn-proto = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
+ghostframe-tsnet = { path = "../ghostframe-tsnet" }
 tracing = { workspace = true }
 rustls = { workspace = true }
 rcgen = { workspace = true }

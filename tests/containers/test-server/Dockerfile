@@ -37,6 +37,9 @@ COPY ghostframe-xdaemon/Cargo.toml ghostframe-xdaemon/Cargo.toml
 COPY ghostframe-test-pattern/Cargo.toml ghostframe-test-pattern/Cargo.toml
 # ghostframe-lib depends on ghostframe-protocol, so its full source is needed.
 COPY ghostframe-protocol/ ghostframe-protocol/
+# ghostframe-tsnet likewise: ghostframe-lib links the ghostbridge archive
+# through it, and its build.rs is what runs `make archive`.
+COPY ghostframe-tsnet/ ghostframe-tsnet/
 # Workspace member not built here; Cargo.toml + src/ satisfy manifest resolution.
 COPY ghostframe-client-core/Cargo.toml ghostframe-client-core/Cargo.toml
 COPY ghostframe-client-core/src/ ghostframe-client-core/src/

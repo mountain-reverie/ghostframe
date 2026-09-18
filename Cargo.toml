@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "ghostframe-protocol",
+    "ghostframe-tsnet",
     "ghostframe-client-core",
     "ghostframe-client-net",
     "ghostframe-client-wasm",

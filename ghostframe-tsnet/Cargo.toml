@@ -1,0 +1,16 @@
+[package]
+name = "ghostframe-tsnet"
+version = "0.1.0"
+edition = "2021"
+
+# The tsnet byte pump, and the only sanctioned way onto the wire.
+#
+# Extracted from `ghostframe-lib` so a client can use it without pulling in
+# the server. Nothing here offers a plain socket: every path goes through
+# ghostbridge into the tailnet, which is a security property the module
+# boundary is meant to make hard to lose rather than a convention to
+# remember.
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }

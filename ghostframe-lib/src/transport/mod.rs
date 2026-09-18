@@ -5,11 +5,14 @@ pub mod decode_error;
 pub use ghostframe_protocol::fec;
 pub use ghostframe_protocol::feedback;
 pub mod fragment_coverage;
-pub mod ghostbridge;
 pub mod input_inject;
 pub mod io_bridge;
 pub use ghostframe_protocol::protocol;
 pub mod quic;
+/// The tsnet byte pump now lives in its own crate so a client can use it
+/// without the server. Re-exported at the old path so in-crate callers and
+/// the C API keep working.
+pub use ghostframe_tsnet as ghostbridge;
 pub mod reliable_emitter;
 pub mod scheduler;
 pub mod transmission_ledger;

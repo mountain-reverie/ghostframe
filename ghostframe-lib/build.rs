@@ -1,46 +1,13 @@
 use std::env;
 use std::path::PathBuf;
-use std::process::Command;
 
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
-    let ghostbridge_dir = PathBuf::from(&manifest_dir).join("../ghostbridge");
 
-    // Build the ghostbridge Go c-archive. This shells out to `make` because
-    // mixing `go build` and Cargo's build graph directly is a known rabbit
-    // hole; the Makefile keeps the glue trivial.
-    let output = Command::new("make")
-        .args(["-C", ghostbridge_dir.to_str().unwrap(), "archive"])
-        .output()
-        .expect("Failed to build ghostbridge. Is `make` and `go` installed?");
-
-    if !output.status.success() {
-        panic!(
-            "ghostbridge build failed:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    // Link against the generated archive.
-    println!(
-        "cargo:rustc-link-search=native={}",
-        ghostbridge_dir.display()
-    );
-    println!("cargo:rustc-link-lib=static=ghostbridge");
-
-    // Go c-archive pulls in the Go runtime, which needs pthread and libm.
-    println!("cargo:rustc-link-lib=pthread");
-    println!("cargo:rustc-link-lib=m");
-
-    // Rerun if anything in ghostbridge/ changes. Watching the directory
-    // catches new .go files, go.sum updates, and the Makefile.
-    println!("cargo:rerun-if-changed={}", ghostbridge_dir.display());
-
-    // The SPA tree lives outside ghostbridge/ and is rsync'd in by the
-    // Makefile. Without this rerun-if-changed, edits to the web client
-    // won't trigger a re-link.
-    let web_dist = PathBuf::from(&manifest_dir).join("../ghostframe-web-client/dist");
-    println!("cargo:rerun-if-changed={}", web_dist.display());
+    // The ghostbridge c-archive build and its link directives moved to
+    // `ghostframe-tsnet`, which owns that FFI surface. Cargo propagates a
+    // dependency's `cargo:rustc-link-*` output to whatever links it, so this
+    // crate still gets the archive without repeating the recipe.
 
     // Generate a C header with cbindgen. Non-fatal while ghostframe-lib has
     // no `pub extern "C"` exports — it becomes fatal once M1 starts exporting
