@@ -106,6 +106,11 @@ pub struct Scheduler {
     /// per tile is sufficient for the *readers*; see `slots.rs` and
     /// `record_cdf53_ack` for why delivery accounting stays separate.
     slots: SlotMap,
+    /// Work items examined by `mark_acked`. Test-only observability: the
+    /// index exists so this stays flat as the queue grows, and a linear
+    /// scan returning here is a silent O(n^2) regression.
+    #[cfg(test)]
+    pub(crate) mark_acked_comparisons: std::cell::Cell<u64>,
 }
 
 impl Scheduler {
@@ -122,6 +127,8 @@ impl Scheduler {
             low_delivery_rounds: 0,
             high_delivery_rounds: 0,
             slots: SlotMap::new(cols, rows),
+            #[cfg(test)]
+            mark_acked_comparisons: std::cell::Cell::new(0),
         }
     }
 
@@ -359,11 +366,15 @@ impl Scheduler {
     /// transition — but scanning that queue too is harmless and keeps the
     /// invariant uniform.
     pub fn mark_acked(&mut self, tile_x: u8, tile_y: u8, generation: u8, pass_idx: u8) {
+        #[cfg(test)]
+        let counter = &self.mark_acked_comparisons;
         for work in self
             .priority_queue
             .iter_mut()
             .chain(self.refinement_queue.iter_mut())
         {
+            #[cfg(test)]
+            counter.set(counter.get() + 1);
             if work.tile_x == tile_x
                 && work.tile_y == tile_y
                 && work.generation == generation
@@ -1064,6 +1075,37 @@ mod tests {
         s.enqueue(TileWork::raw_for_test(0, 0, 0, vec![2]));
         let out = s.tick(usize::MAX);
         assert_eq!(out.len(), 1, "new Pending entry emits");
+    }
+
+    /// `mark_acked` must not scan the queue. It is cheap today only because
+    /// refinement work is removed from the queue at emit time; the repair
+    /// redesign holds work until it is acknowledged, at which point a linear
+    /// scan becomes O(n^2) over the whole session.
+    #[test]
+    fn mark_acked_cost_does_not_grow_with_queue_depth() {
+        fn comparisons_with_queue_depth(depth: u8) -> u64 {
+            let mut s = Scheduler::new(16, 16);
+            let now = Instant::now();
+            for i in 0..depth {
+                let mut w = TileWork::raw_for_test(i % 16, i / 16, 0, vec![0u8; 8]);
+                w.pass_idx = 0;
+                s.enqueue_at(w, now);
+            }
+            // Acknowledge the tile enqueued first, i.e. the worst case for a
+            // scan that walks from the front.
+            s.mark_acked_comparisons.set(0);
+            s.mark_acked(0, 0, 0, 0);
+            s.mark_acked_comparisons.get()
+        }
+
+        let shallow = comparisons_with_queue_depth(4);
+        let deep = comparisons_with_queue_depth(200);
+        assert!(
+            deep <= shallow + 2,
+            "mark_acked examined {deep} items at depth 200 versus {shallow} at \
+             depth 4 -- it is scanning the queue, which is O(n^2) once work is \
+             held until acknowledged"
+        );
     }
 
     #[test]
