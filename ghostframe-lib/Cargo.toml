@@ -22,7 +22,13 @@ test-loss-injection = []
 # `advance()`) explicitly -- the harness runs the real IoBridge event loop
 # under a paused tokio clock, and that's a real dependency of this feature,
 # not an incidental side effect of some other feature enabling it.
-browserless-harness = ["tokio/test-util"]
+#
+# Implies `test-loss-injection` for the same reason: `set_drop_plan` is gated
+# on this feature, but the `drop_plan` field and the hook it drives in
+# `send_to_all_sessions` live behind `test-loss-injection` alongside
+# `outbound_loss`. Without the implication, enabling this feature alone leaves
+# the setter referring to a field that does not exist.
+browserless-harness = ["test-loss-injection", "tokio/test-util"]
 # Cdf53 GPU-vs-CPU diagnostic instrumentation: GHOSTFRAME_CDF53_DIFF_TILE
 # one-shot diff log on the io_bridge encode path, GHOSTFRAME_CDF53_SKIP_L2_L3
 # / GHOSTFRAME_CDF53_SKIP_L3 env-var gates on the GPU forward pipeline, and
