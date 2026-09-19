@@ -420,15 +420,20 @@ impl Scheduler {
     /// transition — but scanning that queue too is harmless and keeps the
     /// invariant uniform.
     pub fn mark_acked(&mut self, tile_x: u8, tile_y: u8, generation: u8, pass_idx: u8) {
-        #[cfg(test)]
-        self.mark_acked_comparisons
-            .set(self.mark_acked_comparisons.get() + 1);
         let Some(h) = self.slots.handle(tile_x, tile_y, pass_idx) else {
             return;
         };
         let Some(work) = self.work.get_mut(h) else {
             return;
         };
+        // Counts *work items examined*, not calls. Anything reintroducing a
+        // scan here must increment once per item inspected, or
+        // `mark_acked_cost_does_not_grow_with_queue_depth` silently stops
+        // measuring anything — an increment at the top of the function reads
+        // 1 no matter what the body does.
+        #[cfg(test)]
+        self.mark_acked_comparisons
+            .set(self.mark_acked_comparisons.get() + 1);
         // Stale-generation, stale-pass, or already-resolved entries are
         // skipped silently: late ACKs after bump_generation, and duplicate
         // per-fragment ACKs, are both normal.
@@ -1211,15 +1216,28 @@ mod tests {
                 w.pass_idx = 0;
                 s.enqueue_at(w, now);
             }
-            // Acknowledge the tile enqueued first, i.e. the worst case for a
-            // scan that walks from the front.
+            // Acknowledge the tile enqueued *last*. That is the worst case
+            // for a scan walking from the front, so a reintroduced scan shows
+            // up as a count proportional to depth. Targeting the first-
+            // enqueued tile instead would let a front-walking scan match on
+            // its first comparison and look O(1).
+            let last = depth - 1;
             s.mark_acked_comparisons.set(0);
-            s.mark_acked(0, 0, 0, 0);
+            s.mark_acked(last % 16, last / 16, 0, 0);
             s.mark_acked_comparisons.get()
         }
 
         let shallow = comparisons_with_queue_depth(4);
         let deep = comparisons_with_queue_depth(200);
+        // Absolute bound as well as depth-invariance: a counter that is
+        // stuck at a constant satisfies `deep <= shallow + 2` trivially, so
+        // depth-invariance alone cannot distinguish "examines one item" from
+        // "is not measuring anything".
+        assert!(
+            deep <= 2,
+            "mark_acked examined {deep} work items for one acknowledgement -- \
+             it must resolve through the slot index, not walk the queue"
+        );
         assert!(
             deep <= shallow + 2,
             "mark_acked examined {deep} items at depth 200 versus {shallow} at \
