@@ -97,3 +97,11 @@ mod tests {
         assert!(!m.contains_key(&k3));
     }
 }
+
+/// [RTO-PROBE] temporary: gate for the retransmission-storm measurement.
+/// Set `GHOSTFRAME_RTO_PROBE=1` to emit one line per RTO fire and per
+/// acknowledgement, for offline histogramming. Remove with the probe.
+pub(crate) fn rto_probe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GHOSTFRAME_RTO_PROBE").is_ok_and(|v| v == "1"))
+}

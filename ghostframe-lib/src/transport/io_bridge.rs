@@ -2740,9 +2740,16 @@ impl IoBridge {
                     .entries
                     .iter()
                     .filter_map(|e| {
-                        self.transmission_ledger
+                        let r = self
+                            .transmission_ledger
                             .resolve(e.wire_seq)
-                            .map(|tx| (tx.key, tx, e.arrival_time_ms_lo16))
+                            .map(|tx| (tx.key, tx, e.arrival_time_ms_lo16));
+                        if r.is_none()
+                            && crate::transport::reliable_emitter::rto_probe_enabled()
+                        {
+                            eprintln!("RTOPROBE resolve_miss ws={}", e.wire_seq);
+                        }
+                        r
                     })
                     .collect();
                 let emit_keys: Vec<crate::transport::reliable_emitter::EmitKey> =
@@ -2757,6 +2764,27 @@ impl IoBridge {
                 // which is content-scoped and may legitimately be gone if the
                 // tile was superseded. Absent, the sample is still recorded:
                 // its timing is what the estimator came for.
+                // [RTO-PROBE] temporary instrumentation: emit -> acknowledgement
+                // latency, measured on the same clock the RTO deadline uses.
+                if crate::transport::reliable_emitter::rto_probe_enabled() {
+                    let ack_us = self.reliable_emitter.emit_us(now_for_samples) as i64;
+                    for (k, tx, _) in resolved.iter() {
+                        let codec = self
+                            .reliable_emitter
+                            .cache
+                            .get(k)
+                            .and_then(|e| e.fragments.first())
+                            .and_then(|f| f.get(18).copied())
+                            .map(|b| b >> 1)
+                            .unwrap_or(255);
+                        eprintln!(
+                            "RTOPROBE ack codec={} pass={} latency_us={}",
+                            codec,
+                            k.pass_idx,
+                            ack_us - tx.emit_us as i64
+                        );
+                    }
+                }
                 for (emit_key, tx, arrival_lo16) in resolved.iter() {
                     if self.bwe_samples_buffer.len() >= BWE_SAMPLES_BUFFER_CAPACITY {
                         break;
@@ -4821,7 +4849,15 @@ impl IoBridge {
             // superseded, which is precisely what NACK- and RTO-derived
             // signals could not see.
             let horizon = self.loss_horizon();
-            for tx in self.transmission_ledger.expire(ledger_now, horizon) {
+            let __expired = self.transmission_ledger.expire(ledger_now, horizon);
+            if crate::transport::reliable_emitter::rto_probe_enabled() && !__expired.is_empty() {
+                eprintln!(
+                    "RTOPROBE expire n={} horizon_us={}",
+                    __expired.len(),
+                    horizon.as_micros()
+                );
+            }
+            for tx in __expired {
                 self.pending_losses.push((tx.emit_us, tx.wire_bytes));
             }
             // Reported only alongside an acknowledgement: goog_cc unwraps the

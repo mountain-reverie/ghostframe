@@ -133,6 +133,9 @@ impl TransmissionLedger {
                     }
                     self.order.pop_front();
                     if let Some((_, tx)) = self.records.remove(&front) {
+                        if crate::transport::reliable_emitter::rto_probe_enabled() {
+                            eprintln!("RTOPROBE expired_ws ws={}", front);
+                        }
                         lost.push(tx);
                     }
                 }
