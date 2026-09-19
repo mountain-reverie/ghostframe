@@ -231,6 +231,74 @@ estimator already counted as a loss."
 
 ## Task 2: Release on a late acknowledgement
 
+> **AMENDED after Task 1.** Changing `resolve`'s return type breaks **three**
+> pre-existing tests in `transmission_ledger.rs`, not just the `io_bridge.rs`
+> caller. Task 1 was correctly forbidden from touching them; Task 2 owns them.
+>
+> Two are mechanical — they compare `resolve(...)` against a bare
+> `Transmission`, which no longer type-checks:
+>
+> - `a_resolved_transmission_is_classified_once_and_not_expired` (~line 212)
+> - `the_cap_evicts_oldest_first_and_counts` (~line 425)
+>
+> Wrap the expectation: `assert_eq!(l.resolve(7), Some(Resolution::Live(tx(7))))`.
+> Change nothing else about them.
+>
+> The third is not mechanical. `an_acknowledgement_after_expiry_is_counted_not_retracted`
+> asserts `l.resolve(7) == None` with `unknown_acks == 1` and the comment
+> *"a late acknowledgement is visible, not silent"*. **It encodes the
+> pre-tombstone behaviour as intended** — its author knew late acknowledgements
+> happen and chose to make them countable without releasing the content.
+>
+> Its two real intents survive this phase and must be preserved:
+> the late acknowledgement is still **visible** (now as
+> `acked_after_declared_lost`, a more precise name than `unknown_acks`), and
+> the loss is still **not retracted** to the estimator (`Resolution::Late`
+> produces no `BweSample` — that is Step 1 of this task). What changes is that
+> the content is now released instead of stranded. Rewrite it to say so:
+>
+> ```rust
+>     /// A late acknowledgement is visible and does not retract the loss --
+>     /// but it does release the content.
+>     ///
+>     /// Previously this asserted `resolve` returned `None`, which made the
+>     /// acknowledgement countable while leaving its cache entry unreachable
+>     /// forever. Visibility and non-retraction were the point and are kept;
+>     /// the stranding was not, and is gone.
+>     #[test]
+>     fn an_acknowledgement_after_expiry_is_counted_and_releases_content() {
+>         let t0 = Instant::now();
+>         let mut l = TransmissionLedger::new(64);
+>         l.record(7, t0, tx(7));
+>         assert_eq!(
+>             l.expire(t0 + Duration::from_millis(500), Duration::from_millis(100))
+>                 .len(),
+>             1
+>         );
+>         assert_eq!(
+>             l.resolve(7),
+>             Some(Resolution::Late(tx(7))),
+>             "the content must still be releasable, or its cache entry is stranded"
+>         );
+>         assert_eq!(
+>             l.stats().acked_after_declared_lost,
+>             1,
+>             "a late acknowledgement is visible, not silent"
+>         );
+>         assert_eq!(
+>             l.stats().unknown_acks,
+>             0,
+>             "it is no longer an unknown acknowledgement -- we know exactly what it was"
+>         );
+>     }
+> ```
+>
+> Task 1 could not run the real crate's tests at all, since it does not
+> compile until this task lands. It verified its logic in a scratch copy
+> instead. **Re-run the real suite here and report the true numbers** — the
+> scratch result does not count as verification of what is in the tree.
+
+
 **Files:** `ghostframe-lib/src/transport/io_bridge.rs` — the ACK resolution block (search `transmission_ledger.resolve`)
 
 - [ ] **Step 1: Consume the new type**
