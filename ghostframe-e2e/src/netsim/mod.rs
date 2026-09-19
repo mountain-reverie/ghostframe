@@ -23,12 +23,15 @@
 //! counters, and when a byte-count assertion is unavoidable give it
 //! order-of-magnitude margins rather than tight bounds.
 
-pub mod drop_plan;
 pub mod profile;
 pub mod pump;
 pub mod rng;
 
-pub use drop_plan::{DropPlan, DropRule};
+/// `DropPlan`/`DropRule` now live in `ghostframe_lib::transport::drop_plan`:
+/// see that module's doc comment for why. Re-exported here so existing
+/// `ghostframe_e2e::netsim::{DropPlan, DropRule}` callers (scenes and tests)
+/// don't need to know it moved.
+pub use ghostframe_lib::transport::drop_plan::{DropPlan, DropRule};
 pub use profile::{Bottleneck, CapTimeline, CoDel, NetProfile};
 pub use pump::SocketPairPump;
 pub use rng::DetRng;

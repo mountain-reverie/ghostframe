@@ -634,6 +634,17 @@ pub struct IoBridge {
     /// that lost palette shadow without the server noticing.
     #[cfg(any(test, feature = "test-loss-injection"))]
     pub(crate) skip_palette_session_reset: bool,
+    /// Cfg-gated deterministic drop plan for e2e tests: drops the Nth
+    /// occurrence of a datagram carrying a named tile. Consulted in
+    /// `send_to_all_sessions`, immediately after `outbound_loss` — this is
+    /// the plaintext seam, the last point before QUIC encrypts the
+    /// datagram, which is why the check lives here and not at the UDP/QUIC
+    /// layer (see `drop_plan`'s module doc). `Arc<Mutex<_>>` because the
+    /// harness needs to read the fired-count back out after `self` has been
+    /// moved wholesale into a `spawn_local`'d task; see `set_drop_plan`.
+    #[cfg(any(test, feature = "test-loss-injection"))]
+    pub(crate) drop_plan:
+        Option<std::sync::Arc<std::sync::Mutex<crate::transport::drop_plan::DropPlan>>>,
     /// Remaining frames to force all-dirty after a new session connects.
     /// QUIC slow-start can only deliver a fraction of tiles in the first burst;
     /// forcing dirty for several frames lets the congestion window open.
@@ -1248,6 +1259,8 @@ impl IoBridge {
             oob_inject_at: lib_config.transport.oob_inject_at,
             #[cfg(any(test, feature = "test-loss-injection"))]
             skip_palette_session_reset: lib_config.transport.skip_palette_session_reset,
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            drop_plan: None,
             force_dirty_frames: 0,
             palette_table: crate::encoder::pal_rle::PaletteTable::new(),
             client_caps: crate::transport::client_caps::ClientCapabilities::default(),
@@ -1520,6 +1533,16 @@ impl IoBridge {
         #[cfg(any(test, feature = "test-loss-injection"))]
         if let Some(inj) = self.outbound_loss.as_mut() {
             if inj.should_drop(dg) {
+                return;
+            }
+        }
+        #[cfg(any(test, feature = "test-loss-injection"))]
+        if let Some(plan) = self.drop_plan.as_ref() {
+            if plan
+                .lock()
+                .expect("drop_plan mutex poisoned")
+                .should_drop(dg)
+            {
                 return;
             }
         }
@@ -5480,6 +5503,8 @@ impl IoBridge {
             oob_inject_at: lib_config.transport.oob_inject_at,
             #[cfg(any(test, feature = "test-loss-injection"))]
             skip_palette_session_reset: lib_config.transport.skip_palette_session_reset,
+            #[cfg(any(test, feature = "test-loss-injection"))]
+            drop_plan: None,
             force_dirty_frames: 0,
             palette_table: crate::encoder::pal_rle::PaletteTable::new(),
             client_caps: crate::transport::client_caps::ClientCapabilities::default(),
@@ -5646,6 +5671,26 @@ impl IoBridge {
         &self,
     ) -> std::sync::Arc<std::sync::Mutex<crate::transport::bwe::BweSnapshot>> {
         self.bwe_publish.clone()
+    }
+
+    /// Install a deterministic drop plan, for a caller that is about to move
+    /// `self` into a `spawn_local`'d task (as the browserless harness does
+    /// with `IoBridge::run`) and needs a way to both drive the plan from
+    /// inside `send_to_all_sessions` and read its fired-count back out
+    /// afterwards. Unlike `bwe_publish_handle` and friends, the `Arc` here
+    /// originates with the *caller* (it already holds the rules to enforce)
+    /// rather than with the bridge, so this is a setter rather than a
+    /// handle getter — but the reason an `Arc<Mutex<_>>` is needed at all is
+    /// the same ownership problem: once `self` is owned by a spawned task, a
+    /// plain `&self`/`&mut self` accessor is unreachable, so the caller must
+    /// keep its own clone of the `Arc` from *before* the move and read the
+    /// clone's contents *after* aborting the task.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub fn set_drop_plan(
+        &mut self,
+        plan: std::sync::Arc<std::sync::Mutex<crate::transport::drop_plan::DropPlan>>,
+    ) {
+        self.drop_plan = Some(plan);
     }
 
     /// Clone of the `Arc` behind `emitter_stats_publish`, for a caller that
