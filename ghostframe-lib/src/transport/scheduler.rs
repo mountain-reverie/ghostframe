@@ -9,6 +9,10 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+#[path = "scheduler/slab.rs"]
+pub mod slab;
+pub use slab::{Handle, Slab};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkState {
     Pending,
