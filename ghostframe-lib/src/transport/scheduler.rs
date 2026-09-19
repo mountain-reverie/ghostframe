@@ -14,6 +14,7 @@ pub use slab::{Handle, Slab};
 
 #[path = "scheduler/slots.rs"]
 pub mod slots;
+use slots::PASS_SLOTS;
 pub use slots::{SlotMap, TileSlot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,12 +78,18 @@ impl TileWork {
 pub struct Scheduler {
     cols: u32,
     rows: u32,
+    /// Owns every queued/in-flight `TileWork` payload. The two order queues
+    /// below hold only cheap `Handle`s into this slab, and `slots` maps
+    /// `(tile, pass)` to its live handle so lookups (`mark_acked`,
+    /// `supersede_pending_for_tile`) resolve directly instead of scanning.
+    work: Slab<TileWork>,
     /// FIFO of pending/in-flight priority tile work (single-pass codec emissions).
-    /// Renamed from `queue` in M3.3a to distinguish from `refinement_queue`.
-    priority_queue: VecDeque<TileWork>,
-    /// FIFO of multi-pass Cdf53 refinement work. Drained in pass-major order
-    /// by `drain_refinement_pass_major`.
-    refinement_queue: VecDeque<TileWork>,
+    /// Renamed from `queue` in M3.3a to distinguish from `refinement_order`.
+    priority_order: VecDeque<Handle>,
+    /// Refinement order bucketed by `pass_idx`, so pass-major drain
+    /// (`drain_refinement_pass_major`) is a walk over buckets rather than a
+    /// repeated `min()` over the whole queue.
+    refinement_order: [VecDeque<Handle>; PASS_SLOTS],
     /// QUIC RTT estimate used to drive 2×RTT retry. Updated by `set_rtt`.
     rtt: Duration,
     /// Fraction of tick budget allocated to refinement passes (default 0.2).
@@ -107,8 +114,10 @@ pub struct Scheduler {
     /// `record_cdf53_ack` for why delivery accounting stays separate.
     slots: SlotMap,
     /// Work items examined by `mark_acked`. Test-only observability: the
-    /// index exists so this stays flat as the queue grows, and a linear
-    /// scan returning here is a silent O(n^2) regression.
+    /// index exists so this stays flat as the queue grows — `mark_acked`
+    /// is a single slot-index lookup, so this increments at most once per
+    /// call, and a value that grows with queue depth is a regression back
+    /// to the old O(n) scan.
     #[cfg(test)]
     pub(crate) mark_acked_comparisons: std::cell::Cell<u64>,
 }
@@ -118,8 +127,9 @@ impl Scheduler {
         Self {
             cols,
             rows,
-            priority_queue: VecDeque::new(),
-            refinement_queue: VecDeque::new(),
+            work: Slab::new(),
+            priority_order: VecDeque::new(),
+            refinement_order: std::array::from_fn(|_| VecDeque::new()),
             rtt: Duration::from_millis(20),
             refinement_bandwidth_fraction: 0.2,
             delivery_window_emitted: 0,
@@ -135,8 +145,11 @@ impl Scheduler {
     pub fn resize(&mut self, cols: u32, rows: u32) {
         self.cols = cols;
         self.rows = rows;
-        self.priority_queue.clear();
-        self.refinement_queue.clear();
+        self.work.clear();
+        self.priority_order.clear();
+        for q in self.refinement_order.iter_mut() {
+            q.clear();
+        }
         self.slots.resize(cols, rows);
     }
 
@@ -145,8 +158,11 @@ impl Scheduler {
     /// matching work is gone). Called on session reconnect to prevent stale
     /// work from polluting the new client's first tick.
     pub fn clear(&mut self) {
-        self.priority_queue.clear();
-        self.refinement_queue.clear();
+        self.work.clear();
+        self.priority_order.clear();
+        for q in self.refinement_order.iter_mut() {
+            q.clear();
+        }
         // Only queued handles are dropped; generations and ACK state are
         // kept for the same reason they always were — a late ACK on a
         // stale (tile, gen) is a safe no-op, and the mask is harmless
@@ -165,31 +181,33 @@ impl Scheduler {
         self.rows
     }
     pub fn queue_len(&self) -> usize {
-        self.priority_queue.len()
+        self.priority_order.len()
     }
 
     /// Count of unique (tile_x, tile_y) coordinates with outstanding
-    /// refinement work — i.e. entries in `refinement_queue` whose state
+    /// refinement work — i.e. entries in `refinement_order` whose state
     /// is not `WorkState::Acked`. Consumed by M3.6b's classifier
     /// refinement-deficit bias (see `tile/classifier.rs::REFINEMENT_BIAS_PER_TILE_US`).
     pub fn refinement_deficit_tiles(&self) -> u32 {
         let mut seen: std::collections::HashSet<(u8, u8)> = std::collections::HashSet::new();
-        for w in self.refinement_queue.iter() {
-            if w.state != WorkState::Acked {
-                seen.insert((w.tile_x, w.tile_y));
+        for h in self.refinement_order.iter().flatten() {
+            if let Some(w) = self.work.get(*h) {
+                if w.state != WorkState::Acked {
+                    seen.insert((w.tile_x, w.tile_y));
+                }
             }
         }
         seen.len() as u32
     }
 
-    /// Total number of entries currently in the refinement queue,
+    /// Total number of entries currently in the refinement order queues,
     /// including ones marked `WorkState::Superseded` that will be
     /// retain-dropped on the next tick. Diagnostic accessor for the
     /// io_bridge cumulative log — pairs with `bump_count_accumulator`
     /// to show "how many bumps just happened" vs "how deep is the
     /// resulting queue".
     pub fn refinement_queue_len(&self) -> usize {
-        self.refinement_queue.len()
+        self.refinement_order.iter().map(|q| q.len()).sum()
     }
 
     pub fn generation_for(&self, tile_x: u8, tile_y: u8) -> u8 {
@@ -223,7 +241,34 @@ impl Scheduler {
         work.queued_at = now;
         work.last_sent_at = None;
         work.state = WorkState::Pending;
-        self.priority_queue.push_back(work);
+        let (tx, ty, pass) = (work.tile_x, work.tile_y, work.pass_idx);
+        self.supersede_live_handle(tx, ty, pass);
+        let h = self.work.insert(work);
+        self.slots.set_handle(tx, ty, pass, Some(h));
+        self.priority_order.push_back(h);
+    }
+
+    /// Retire any live work already occupying this `(tile, pass)` slot.
+    ///
+    /// The slot holds one handle, so a second live entry for the same
+    /// tile-pass would orphan the first — unreachable by `mark_acked` and by
+    /// supersession, so it could never leave the queue. Marking it
+    /// `Superseded` keeps it reachable and lets the next drain retain it
+    /// out, and matches what supersession already means: newer content for
+    /// a tile-pass replaces older.
+    ///
+    /// Reachable in production: the stranded-tile escalation re-enqueues at
+    /// the existing generation without a `bump_generation`, so nothing else
+    /// retires the previous entry.
+    fn supersede_live_handle(&mut self, tile_x: u8, tile_y: u8, pass_idx: u8) {
+        let Some(h) = self.slots.handle(tile_x, tile_y, pass_idx) else {
+            return;
+        };
+        if let Some(w) = self.work.get_mut(h) {
+            if matches!(w.state, WorkState::Pending | WorkState::InFlight) {
+                w.state = WorkState::Superseded;
+            }
+        }
     }
 
     /// Push an already-formed `TileWork` straight into `refinement_queue`,
@@ -246,21 +291,32 @@ impl Scheduler {
         work.queued_at = now;
         work.last_sent_at = None;
         work.state = WorkState::Pending;
-        self.refinement_queue.push_back(work);
+        let (tx, ty, pass) = (work.tile_x, work.tile_y, work.pass_idx);
+        self.supersede_live_handle(tx, ty, pass);
+        let h = self.work.insert(work);
+        self.slots.set_handle(tx, ty, pass, Some(h));
+        self.refinement_order[(pass as usize).min(PASS_SLOTS - 1)].push_back(h);
     }
 
     #[cfg(any(test, feature = "browserless-harness"))]
     pub fn peek_for_test(&self) -> Vec<TileWork> {
-        self.priority_queue.iter().cloned().collect()
+        self.priority_order
+            .iter()
+            .filter_map(|h| self.work.get(*h).cloned())
+            .collect()
     }
 
-    /// Same as `peek_for_test`, but for `refinement_queue`. Lets a test
+    /// Same as `peek_for_test`, but for `refinement_order`. Lets a test
     /// distinguish "the work landed in the pass-major-drained queue" from
     /// "the work landed in the FIFO one" directly, rather than inferring it
     /// from drain-order side effects.
     #[cfg(any(test, feature = "browserless-harness"))]
     pub fn refinement_peek_for_test(&self) -> Vec<TileWork> {
-        self.refinement_queue.iter().cloned().collect()
+        self.refinement_order
+            .iter()
+            .flatten()
+            .filter_map(|h| self.work.get(*h).cloned())
+            .collect()
     }
 
     #[cfg(test)]
@@ -276,16 +332,13 @@ impl Scheduler {
     /// `bump_generation` does this as part of the capture path; the injected
     /// path calls it directly, since it supplies its own generations.
     pub fn supersede_pending_for_tile(&mut self, tile_x: u8, tile_y: u8) {
-        for work in self
-            .priority_queue
-            .iter_mut()
-            .chain(self.refinement_queue.iter_mut())
-        {
-            if work.tile_x == tile_x
-                && work.tile_y == tile_y
-                && !matches!(work.state, WorkState::Superseded | WorkState::Acked)
-            {
-                work.state = WorkState::Superseded;
+        for p in 0..PASS_SLOTS as u8 {
+            if let Some(h) = self.slots.handle(tile_x, tile_y, p) {
+                if let Some(w) = self.work.get_mut(h) {
+                    if matches!(w.state, WorkState::Pending | WorkState::InFlight) {
+                        w.state = WorkState::Superseded;
+                    }
+                }
             }
         }
     }
@@ -301,8 +354,9 @@ impl Scheduler {
 
     #[cfg(test)]
     pub fn queue_states_for_test(&self) -> Vec<(u8, u8, WorkState)> {
-        self.priority_queue
+        self.priority_order
             .iter()
+            .filter_map(|h| self.work.get(*h))
             .map(|w| (w.tile_x, w.tile_y, w.state))
             .collect()
     }
@@ -367,23 +421,19 @@ impl Scheduler {
     /// invariant uniform.
     pub fn mark_acked(&mut self, tile_x: u8, tile_y: u8, generation: u8, pass_idx: u8) {
         #[cfg(test)]
-        let counter = &self.mark_acked_comparisons;
-        for work in self
-            .priority_queue
-            .iter_mut()
-            .chain(self.refinement_queue.iter_mut())
-        {
-            #[cfg(test)]
-            counter.set(counter.get() + 1);
-            if work.tile_x == tile_x
-                && work.tile_y == tile_y
-                && work.generation == generation
-                && work.pass_idx == pass_idx
-                && work.state == WorkState::InFlight
-            {
-                work.state = WorkState::Acked;
-                return;
-            }
+        self.mark_acked_comparisons
+            .set(self.mark_acked_comparisons.get() + 1);
+        let Some(h) = self.slots.handle(tile_x, tile_y, pass_idx) else {
+            return;
+        };
+        let Some(work) = self.work.get_mut(h) else {
+            return;
+        };
+        // Stale-generation, stale-pass, or already-resolved entries are
+        // skipped silently: late ACKs after bump_generation, and duplicate
+        // per-fragment ACKs, are both normal.
+        if work.generation == generation && work.state == WorkState::InFlight {
+            work.state = WorkState::Acked;
         }
     }
 
@@ -449,10 +499,15 @@ impl Scheduler {
     /// they're not stuck, just unsent. O(queue) — cheap because queue is
     /// pruned every drain cycle.
     pub fn refinement_queue_holds_tile(&self, tile_x: u8, tile_y: u8) -> bool {
-        self.refinement_queue.iter().any(|w| {
-            w.tile_x == tile_x
-                && w.tile_y == tile_y
-                && !matches!(w.state, WorkState::Acked | WorkState::Superseded)
+        (0..PASS_SLOTS as u8).any(|p| {
+            self.slots
+                .handle(tile_x, tile_y, p)
+                .and_then(|h| self.work.get(h))
+                .is_some_and(|w| {
+                    w.tile_x == tile_x
+                        && w.tile_y == tile_y
+                        && !matches!(w.state, WorkState::Acked | WorkState::Superseded)
+                })
         })
     }
 
@@ -472,13 +527,15 @@ impl Scheduler {
     ) -> Vec<(u8, u8, u8, u8)> {
         use std::collections::HashMap;
         let mut counts: HashMap<(u8, u8, u8), u8> = HashMap::new();
-        // Source 1: Pending/InFlight entries still in the refinement queue.
-        for w in self.refinement_queue.iter() {
-            if matches!(w.state, WorkState::Pending | WorkState::InFlight) {
-                let c = counts
-                    .entry((w.tile_x, w.tile_y, w.generation))
-                    .or_insert(0);
-                *c = c.saturating_add(1);
+        // Source 1: Pending/InFlight entries still in the refinement order.
+        for h in self.refinement_order.iter().flatten() {
+            if let Some(w) = self.work.get(*h) {
+                if matches!(w.state, WorkState::Pending | WorkState::InFlight) {
+                    let c = counts
+                        .entry((w.tile_x, w.tile_y, w.generation))
+                        .or_insert(0);
+                    *c = c.saturating_add(1);
+                }
             }
         }
         // Source 2: outstanding Cdf53 coverage entries (emitted-but-not-ACKed
@@ -512,43 +569,72 @@ impl Scheduler {
         tile_y: u8,
     ) -> (u8, Vec<ResolvedTileWork>) {
         let mut resolved: Vec<ResolvedTileWork> = Vec::new();
-        for entry in self
-            .priority_queue
-            .iter_mut()
-            .chain(self.refinement_queue.iter_mut())
         {
-            if entry.tile_x == tile_x
-                && entry.tile_y == tile_y
-                && entry.state != WorkState::Acked
-                && entry.state != WorkState::Superseded
+            let Scheduler {
+                work,
+                priority_order,
+                refinement_order,
+                ..
+            } = self;
+            for &h in priority_order
+                .iter()
+                .chain(refinement_order.iter().flatten())
             {
-                let palette_id = if entry.codec == Codec::PalRle {
-                    debug_assert!(
-                        entry.payload.len() >= 2,
-                        "PalRle TileWork has malformed payload: {} bytes",
-                        entry.payload.len()
-                    );
-                    entry.payload.get(1).copied()
-                } else {
-                    None
-                };
-                resolved.push(ResolvedTileWork {
-                    tile_x,
-                    tile_y,
-                    generation: entry.generation,
-                    pass: entry.pass_idx,
-                    codec: entry.codec,
-                    palette_id,
-                    via_ack: false,
-                });
-                entry.state = WorkState::Superseded;
+                if let Some(entry) = work.get_mut(h) {
+                    if entry.tile_x == tile_x
+                        && entry.tile_y == tile_y
+                        && entry.state != WorkState::Acked
+                        && entry.state != WorkState::Superseded
+                    {
+                        let palette_id = if entry.codec == Codec::PalRle {
+                            debug_assert!(
+                                entry.payload.len() >= 2,
+                                "PalRle TileWork has malformed payload: {} bytes",
+                                entry.payload.len()
+                            );
+                            entry.payload.get(1).copied()
+                        } else {
+                            None
+                        };
+                        resolved.push(ResolvedTileWork {
+                            tile_x,
+                            tile_y,
+                            generation: entry.generation,
+                            pass: entry.pass_idx,
+                            codec: entry.codec,
+                            palette_id,
+                            via_ack: false,
+                        });
+                        entry.state = WorkState::Superseded;
+                    }
+                }
             }
         }
         let new_gen = self.bump_generation(tile_x, tile_y);
-        self.priority_queue
-            .retain(|w| w.state != WorkState::Superseded);
-        self.refinement_queue
-            .retain(|w| w.state != WorkState::Superseded);
+        let Scheduler {
+            work,
+            priority_order,
+            refinement_order,
+            ..
+        } = self;
+        priority_order.retain(|&h| match work.get(h) {
+            Some(w) if w.state == WorkState::Superseded => {
+                work.remove(h);
+                false
+            }
+            Some(_) => true,
+            None => false,
+        });
+        for bucket in refinement_order.iter_mut() {
+            bucket.retain(|&h| match work.get(h) {
+                Some(w) if w.state == WorkState::Superseded => {
+                    work.remove(h);
+                    false
+                }
+                Some(_) => true,
+                None => false,
+            });
+        }
         (new_gen, resolved)
     }
 
@@ -588,10 +674,10 @@ impl Scheduler {
         let mut priority_budget = budget_bytes.saturating_sub(refinement_budget);
 
         // Empty-queue repurposing.
-        if self.refinement_queue.is_empty() {
+        if self.refinement_order.iter().all(|q| q.is_empty()) {
             priority_budget = budget_bytes;
             refinement_budget = 0;
-        } else if self.priority_queue.is_empty() {
+        } else if self.priority_order.is_empty() {
             refinement_budget = budget_bytes;
             priority_budget = 0;
         }
@@ -599,14 +685,16 @@ impl Scheduler {
         let mut emitted = Vec::new();
         let rtt = self.rtt;
         Self::drain_priority_queue(
-            &mut self.priority_queue,
+            &mut self.work,
+            &mut self.priority_order,
             priority_budget,
             rtt,
             now,
             &mut emitted,
         );
         Self::drain_refinement_pass_major(
-            &mut self.refinement_queue,
+            &mut self.work,
+            &mut self.refinement_order,
             refinement_budget,
             now,
             &mut emitted,
@@ -621,7 +709,8 @@ impl Scheduler {
     }
 
     fn drain_priority_queue(
-        queue: &mut VecDeque<TileWork>,
+        work: &mut Slab<TileWork>,
+        order: &mut VecDeque<Handle>,
         budget: usize,
         rtt: Duration,
         now: Instant,
@@ -629,14 +718,24 @@ impl Scheduler {
     ) {
         let retry_after = 2 * rtt;
 
-        // Drop terminal-state entries first.
-        queue.retain(|w| !matches!(w.state, WorkState::Superseded | WorkState::Acked));
+        // Drop terminal-state entries first, freeing their slab slot.
+        order.retain(|&h| match work.get(h) {
+            Some(w) if matches!(w.state, WorkState::Superseded | WorkState::Acked) => {
+                work.remove(h);
+                false
+            }
+            Some(_) => true,
+            None => false,
+        });
 
         let mut spent = 0usize;
-        for work in queue.iter_mut() {
-            let eligible = match work.state {
+        for &h in order.iter() {
+            let Some(w) = work.get_mut(h) else {
+                continue;
+            };
+            let eligible = match w.state {
                 WorkState::Pending => true,
-                WorkState::InFlight => work
+                WorkState::InFlight => w
                     .last_sent_at
                     .map(|t| now.duration_since(t) >= retry_after)
                     .unwrap_or(true),
@@ -648,50 +747,62 @@ impl Scheduler {
             if spent >= budget {
                 break;
             }
-            work.state = WorkState::InFlight;
-            work.last_sent_at = Some(now);
-            spent = spent.saturating_add(work.payload.len());
-            out.push(work.clone());
+            w.state = WorkState::InFlight;
+            w.last_sent_at = Some(now);
+            spent = spent.saturating_add(w.payload.len());
+            out.push(w.clone());
         }
     }
 
-    /// Drain refinement queue in pass-major order: every tile's pass 0 before
-    /// any tile's pass 1.
+    /// Drain refinement work in pass-major order: every tile's pass 0 before
+    /// any tile's pass 1. `refinement_order` is already bucketed by
+    /// `pass_idx`, so this is a walk over the buckets in order rather than a
+    /// repeated `min()` scan over a flat queue.
     fn drain_refinement_pass_major(
-        queue: &mut VecDeque<TileWork>,
+        work: &mut Slab<TileWork>,
+        order: &mut [VecDeque<Handle>; PASS_SLOTS],
         budget: usize,
         now: Instant,
         out: &mut Vec<TileWork>,
     ) {
-        // Drop terminal-state entries first. Mirrors drain_priority_queue.
-        // Without this, plain bump_generation (which only marks Superseded
-        // without retain) leaves stale Pending->Superseded entries that
-        // re-emit on the next tick with old gen values — corrupting the
-        // client integrator (which clears its tile state on gen change).
-        queue.retain(|w| !matches!(w.state, WorkState::Superseded | WorkState::Acked));
+        // Drop terminal-state entries first, freeing their slab slot.
+        // Mirrors drain_priority_queue. Without this, plain bump_generation
+        // (which only marks Superseded without retain) leaves stale
+        // Pending->Superseded entries that re-emit on the next tick with
+        // old gen values — corrupting the client integrator (which clears
+        // its tile state on gen change).
+        for bucket in order.iter_mut() {
+            bucket.retain(|&h| match work.get(h) {
+                Some(w) if matches!(w.state, WorkState::Superseded | WorkState::Acked) => {
+                    work.remove(h);
+                    false
+                }
+                Some(_) => true,
+                None => false,
+            });
+        }
 
         let mut spent = 0usize;
-        while let Some(min_pass) = queue.iter().map(|w| w.pass_idx).min() {
-            let mut still_at_this_pass = false;
-            let mut idx = 0;
-            while idx < queue.len() {
-                if queue[idx].pass_idx == min_pass {
-                    let cost = queue[idx].payload.len();
-                    if spent + cost > budget {
-                        return;
+        for bucket in order.iter_mut() {
+            while let Some(&h) = bucket.front() {
+                let cost = match work.get(h) {
+                    Some(w) => w.payload.len(),
+                    None => {
+                        // Orphaned handle (shouldn't happen); drop and move on.
+                        bucket.pop_front();
+                        continue;
                     }
-                    let mut work = queue.remove(idx).unwrap();
-                    work.last_sent_at = Some(now);
-                    work.state = WorkState::InFlight;
-                    spent += cost;
-                    out.push(work);
-                    still_at_this_pass = true;
-                } else {
-                    idx += 1;
+                };
+                if spent + cost > budget {
+                    return;
                 }
-            }
-            if !still_at_this_pass {
-                break;
+                bucket.pop_front();
+                if let Some(mut w) = work.remove(h) {
+                    w.last_sent_at = Some(now);
+                    w.state = WorkState::InFlight;
+                    spent += cost;
+                    out.push(w);
+                }
             }
         }
     }
@@ -767,18 +878,23 @@ impl Scheduler {
     ) {
         let total = passes.len() as u8;
         for (pass_idx, payload) in passes.into_iter().enumerate() {
-            self.refinement_queue.push_back(TileWork {
+            let pass_idx = pass_idx as u8;
+            self.supersede_live_handle(tile_x, tile_y, pass_idx);
+            let w = TileWork {
                 tile_x,
                 tile_y,
                 generation: gen,
-                pass_idx: pass_idx as u8,
+                pass_idx,
                 total_passes: total,
                 codec: Codec::Cdf53,
                 payload,
                 queued_at: now,
                 last_sent_at: None,
                 state: WorkState::Pending,
-            });
+            };
+            let h = self.work.insert(w);
+            self.slots.set_handle(tile_x, tile_y, pass_idx, Some(h));
+            self.refinement_order[(pass_idx as usize).min(PASS_SLOTS - 1)].push_back(h);
         }
     }
 
@@ -834,7 +950,8 @@ impl Scheduler {
                 continue;
             }
             let Some(payload) = iter.next() else { break };
-            self.refinement_queue.push_back(TileWork {
+            self.supersede_live_handle(tile_x, tile_y, pass_idx);
+            let w = TileWork {
                 tile_x,
                 tile_y,
                 generation: gen,
@@ -845,7 +962,10 @@ impl Scheduler {
                 queued_at: now,
                 last_sent_at: None,
                 state: WorkState::Pending,
-            });
+            };
+            let h = self.work.insert(w);
+            self.slots.set_handle(tile_x, tile_y, pass_idx, Some(h));
+            self.refinement_order[(pass_idx as usize).min(PASS_SLOTS - 1)].push_back(h);
         }
     }
 }
@@ -1217,9 +1337,15 @@ mod tests {
 
     #[test]
     fn refinement_fraction_halves_on_sustained_low_delivery() {
-        let mut sch = Scheduler::new(8, 8);
-        for i in 0..200 {
-            sch.enqueue_refinement(0, 0, 0, vec![vec![i as u8]; 14]);
+        // 200 distinct tiles, not 200 copies of the same tile-pass: under
+        // supersede-on-collision (every enqueue path retires whatever
+        // handle already lives in that tile-pass's slot), 200 enqueues of
+        // the *same* tile-pass would leave only the last one live, the
+        // queue would drain in a single tick, and the halving below would
+        // never fire.
+        let mut sch = Scheduler::new(64, 64);
+        for i in 0..200u16 {
+            sch.enqueue_refinement((i % 64) as u8, (i / 64) as u8, 0, vec![vec![i as u8]; 14]);
         }
         // tick(250) drains ~250 items per call → queue stays non-empty for 10+
         // ticks, so every round has emissions + no acks → rate=0 → halving fires
@@ -1252,10 +1378,10 @@ mod tests {
     fn bump_generation_cancels_refinement_work() {
         let mut sch = Scheduler::new(8, 8);
         sch.enqueue_refinement(3, 4, 0, vec![vec![0u8; 50]; 14]);
-        assert_eq!(sch.refinement_queue.len(), 14);
+        assert_eq!(sch.refinement_queue_len(), 14);
         let _new_gen = sch.bump_generation(3, 4);
         let superseded_count = sch
-            .refinement_queue
+            .refinement_peek_for_test()
             .iter()
             .filter(|w| w.state == WorkState::Superseded)
             .count();
@@ -1434,48 +1560,29 @@ mod tests {
 
     #[test]
     fn refinement_deficit_tiles_counts_unique_pending_tiles() {
-        use crate::transport::protocol::Codec;
         let mut s = Scheduler::new(4, 4);
         // Empty refinement queue ⇒ zero deficit.
         assert_eq!(s.refinement_deficit_tiles(), 0);
 
         // Inject two refinement passes for tile (0,0) and one for (1,2).
         // Both tiles count once each → deficit = 2.
-        for pass_idx in [0u8, 1u8] {
-            s.refinement_queue.push_back(TileWork {
-                tile_x: 0,
-                tile_y: 0,
-                generation: 0,
-                pass_idx,
-                total_passes: 14,
-                codec: Codec::Cdf53,
-                payload: Vec::new(),
-                queued_at: std::time::Instant::now(),
-                last_sent_at: None,
-                state: WorkState::Pending,
-            });
-        }
-        s.refinement_queue.push_back(TileWork {
-            tile_x: 1,
-            tile_y: 2,
-            generation: 0,
-            pass_idx: 0,
-            total_passes: 14,
-            codec: Codec::Cdf53,
-            payload: Vec::new(),
-            queued_at: std::time::Instant::now(),
-            last_sent_at: None,
-            state: WorkState::Pending,
-        });
+        let now = Instant::now();
+        s.enqueue_refinement_at(0, 0, 0, vec![Vec::new(), Vec::new()], now);
+        s.enqueue_refinement_at(1, 2, 0, vec![Vec::new()], now);
         assert_eq!(s.refinement_deficit_tiles(), 2);
 
         // Marking one of (0,0)'s passes as Acked must not change the count
-        // (the other pass on (0,0) is still pending).
-        s.refinement_queue.front_mut().unwrap().state = WorkState::Acked;
+        // (the other pass on (0,0) is still pending). Poked directly via
+        // the slot index/slab rather than `mark_acked`, which requires
+        // InFlight state -- this test is about `refinement_deficit_tiles`'s
+        // counting, not the Ack transition itself.
+        let h = s.slots.handle(0, 0, 0).expect("(0,0) pass 0 was enqueued");
+        s.work.get_mut(h).unwrap().state = WorkState::Acked;
         assert_eq!(s.refinement_deficit_tiles(), 2);
 
         // Marking BOTH (0,0) passes as Acked ⇒ only (1,2) outstanding ⇒ 1.
-        s.refinement_queue[1].state = WorkState::Acked;
+        let h = s.slots.handle(0, 0, 1).expect("(0,0) pass 1 was enqueued");
+        s.work.get_mut(h).unwrap().state = WorkState::Acked;
         assert_eq!(s.refinement_deficit_tiles(), 1);
     }
 
@@ -1640,9 +1747,10 @@ mod tests {
             mask,
             vec![vec![0xAA], vec![0xBB], vec![0xCC]],
         );
-        // Walk refinement_queue and verify pass_idx mapping.
+        // Walk refinement_order (bucketed by pass_idx, so already in
+        // ascending pass_idx order) and verify the pass_idx mapping.
         let entries: Vec<_> = s
-            .refinement_queue
+            .refinement_peek_for_test()
             .iter()
             .map(|w| (w.pass_idx, w.payload.clone(), w.generation, w.total_passes))
             .collect();
@@ -1656,15 +1764,16 @@ mod tests {
     fn enqueue_refinement_subset_empty_mask_is_noop() {
         let mut s = Scheduler::new(2, 2);
         s.enqueue_refinement_subset(0, 0, 1, 0, vec![]);
-        assert_eq!(s.refinement_queue.len(), 0);
+        assert_eq!(s.refinement_queue_len(), 0);
     }
 
     #[test]
     fn enqueue_refinement_subset_single_pass() {
         let mut s = Scheduler::new(2, 2);
         s.enqueue_refinement_subset(1, 1, 2, 1u16 << 7, vec![vec![0xDE, 0xAD]]);
-        assert_eq!(s.refinement_queue.len(), 1);
-        let w = &s.refinement_queue[0];
+        assert_eq!(s.refinement_queue_len(), 1);
+        let entries = s.refinement_peek_for_test();
+        let w = &entries[0];
         assert_eq!(w.pass_idx, 7);
         assert_eq!(w.payload, vec![0xDE, 0xAD]);
         assert_eq!(w.total_passes, 14);
