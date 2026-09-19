@@ -1878,6 +1878,47 @@ phase's."
 
 ---
 
+## Phase 1 complete (2026-09-19)
+
+**Tasks 10 and 11 were absorbed into Task 9** rather than executed separately.
+Moving the queues to handles required rewriting both drains and every
+remaining walker in the same change — the old `priority_queue`/`refinement_queue`
+fields are deleted, so nothing that touched them could compile until it was
+ported. Verified directly rather than by dispatching redundant work:
+
+- the repeated `queue.iter().map(|w| w.pass_idx).min()` scan is **gone** (no
+  `.min()` remains in the file);
+- both drains take `&mut Slab<TileWork>` plus their order structures, with
+  refinement bucketed as `[VecDeque<Handle>; PASS_SLOTS]`;
+- `pending_refinement_snapshot`, `queue_states_for_test` and
+  `bump_generation_collecting` are ported.
+
+**Closing measurements**
+
+| check | result |
+|---|---|
+| lib suite | 427 passed, 0 failed |
+| browserless | 18 passed, 0 failed, 2 ignored |
+| storm reproduction | **1788 retransmits** — identical to the Phase 0 baseline |
+| `mark_acked` cost | 1 comparison at depth 4 and at depth 200 |
+| mutation: front-walking scan in `mark_acked` | caught (`deep=201` vs `shallow=5`) |
+| `cdf53_passes_acked` field | deleted, along with its per-bump full scan |
+| generated C header | byte-identical (`PASS_SLOTS` narrowed to `pub(crate)`) |
+
+The storm reproduction still reading exactly 1788 is the phase's real
+acceptance criterion: no repair policy changed, so the bug Phase 3 fixes must
+still reproduce identically.
+
+**Production code in `io_bridge.rs` changed only via Task 5B**, the authorised
+stranded-tile guard fix. Task 7's only `io_bridge.rs` hunk is inside
+`mod tests`.
+
+**Three defects were found in this plan while executing it**, each requiring a
+decision rather than a patch: the one-handle-per-(tile, pass) invariant did not
+hold; `record_cdf53_ack`'s two consumers needed opposite generation semantics;
+and the bounded-scan test measured nothing once the counter moved. All three are
+recorded in the task sections above.
+
 ## Done when
 
 - [ ] Browserless has deterministic drop injection, and an existing-scene run is bit-identical with an empty plan.
