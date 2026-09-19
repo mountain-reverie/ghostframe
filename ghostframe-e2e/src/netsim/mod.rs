@@ -26,10 +26,12 @@
 pub mod profile;
 pub mod pump;
 pub mod rng;
+pub mod drop_plan;
 
 pub use profile::{Bottleneck, CapTimeline, CoDel, NetProfile};
 pub use pump::SocketPairPump;
 pub use rng::DetRng;
+pub use drop_plan::{DropPlan, DropRule};
 
 /// The fate of a single datagram as determined by the network simulator.
 #[derive(Debug, Clone, PartialEq)]
