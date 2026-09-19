@@ -376,6 +376,16 @@ async fn a_solid_tile_whose_only_datagram_is_dropped_is_still_repaired() {
     };
     let result = run_browserless(scene).await.expect("scene ran");
 
+    // NOTE: `run_browserless` takes the scene by value, so `DropPlan::drops()`
+    // is unreachable after the run. `bytes_dropped` is the available signal,
+    // and on a lossless profile it is exact: every dropped byte is ours.
+    //
+    // `NetProfile::perfect()` also sidesteps two subtleties of applying the
+    // plan after `NetSim::decide`: a plan-injected drop spends token-bucket
+    // capacity (a `loss` drop deliberately does not), and occurrence indices
+    // count only datagrams that reached a `Deliver` verdict. With no loss, no
+    // cap and no duplication, neither distinction can bite.
+
     // Premise check: the injected drop must actually have fired. The profile
     // is lossless, so every dropped byte is ours. Without this the test
     // passes when the drop silently never matched -- which is the failure
