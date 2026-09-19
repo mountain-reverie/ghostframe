@@ -571,7 +571,7 @@ fn parity_group_recovers_without_retransmit() {
         group_first_wire_seq: base_wire_seq,
         k: k as u8,
         parity_idx: 0,
-        group_first_payload_len: fragments[0].len() as u16,
+        source_lens: fragments.iter().map(|f| f.len() as u16).collect(),
         parity_payload,
     };
     let mut parity_bytes = Vec::new();

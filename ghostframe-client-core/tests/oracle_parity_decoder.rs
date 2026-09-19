@@ -54,7 +54,7 @@ fn recovers_single_missing_source() {
         group_first_wire_seq: 0,
         k: FEC_K as u8,
         parity_idx: 0,
-        group_first_payload_len: sources[0].len() as u16,
+        source_lens: vec![sources[0].len() as u16; FEC_K as usize],
         parity_payload: parity,
     };
     let recovered = decoder.receive_parity(&envelope);
@@ -76,7 +76,7 @@ fn returns_none_when_multiple_sources_missing() {
         group_first_wire_seq: 0,
         k: FEC_K as u8,
         parity_idx: 0,
-        group_first_payload_len: sources[0].len() as u16,
+        source_lens: vec![sources[0].len() as u16; FEC_K as usize],
         parity_payload: parity,
     };
     let recovered = decoder.receive_parity(&envelope);
@@ -98,7 +98,7 @@ fn returns_none_when_no_sources_missing() {
         group_first_wire_seq: 0,
         k: FEC_K as u8,
         parity_idx: 0,
-        group_first_payload_len: sources[0].len() as u16,
+        source_lens: vec![sources[0].len() as u16; FEC_K as usize],
         parity_payload: parity,
     };
     let recovered = decoder.receive_parity(&envelope);
@@ -133,7 +133,7 @@ fn replays_buffered_parity_when_missing_source_finally_arrives() {
         group_first_wire_seq: 0,
         k: FEC_K as u8,
         parity_idx: 0,
-        group_first_payload_len: sources[0].len() as u16,
+        source_lens: vec![sources[0].len() as u16; FEC_K as usize],
         parity_payload: parity,
     };
 
@@ -154,14 +154,18 @@ fn recovers_first_inserted_pending_parity_when_multiple_become_recoverable() {
     // later-inserted entry is also recoverable.
     let mut decoder = ParityDecoder::new(64);
 
+    // Payloads are 4 bytes (not 2): `try_recover` now validates a
+    // reconstruction with `is_tile_datagram`, which requires at least 4
+    // bytes, and 0xAA's top bit doubles as the tile-datagram flag.
+    //
     // Group A (inserted FIRST): k=2, covers wire_seq {100, 101}. Neither is
     // present yet, so this is buffered (missing_count == 2).
     let group_a = TileParityEnvelope {
         group_first_wire_seq: 100,
         k: 2,
         parity_idx: 0,
-        group_first_payload_len: 2,
-        parity_payload: vec![0xAA, 0xAA],
+        source_lens: vec![4, 4],
+        parity_payload: vec![0xAA, 0xAA, 0xAA, 0xAA],
     };
     assert_eq!(decoder.receive_parity(&group_a), None);
 
@@ -171,16 +175,16 @@ fn recovers_first_inserted_pending_parity_when_multiple_become_recoverable() {
         group_first_wire_seq: 99,
         k: 2,
         parity_idx: 0,
-        group_first_payload_len: 2,
-        parity_payload: vec![0x00, 0x00],
+        source_lens: vec![4, 4],
+        parity_payload: vec![0x00, 0x00, 0x00, 0x00],
     };
     assert_eq!(decoder.receive_parity(&group_b), None);
 
     // Recording wire_seq 100 leaves group A missing only 101 (count=1) and
     // group B missing only 99 (count=1) — BOTH become recoverable.
     // Insertion order (group A first) must win.
-    let recovered = decoder.record_source(100, &[0x00, 0x00]);
-    assert_eq!(recovered, Some(vec![0xAA, 0xAA]));
+    let recovered = decoder.record_source(100, &[0x00, 0x00, 0x00, 0x00]);
+    assert_eq!(recovered, Some(vec![0xAA, 0xAA, 0xAA, 0xAA]));
 }
 
 // ---------------------------------------------------------------------------
