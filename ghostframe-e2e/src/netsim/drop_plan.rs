@@ -6,22 +6,31 @@
 //! raising `loss` does not work — at the rates where it becomes likely the
 //! scene stops establishing at all (measured: bails at 0.60 and 0.90).
 //!
-//! Applied *after* `NetSim::decide` so the rng stream is untouched; see
-//! that function's doc comment on draw ordering.
+//! Applied *after* `NetSim::decide` so the rng stream is untouched; see that
+//! function's doc comment on draw ordering.
+//!
+//! Wire constants are imported rather than re-declared, for the reason
+//! `pump.rs` gives: the production framing helpers are `pub` specifically so
+//! this harness cannot drift from what actually goes on the wire.
 
-/// Byte offsets of the tile coordinates inside a tile datagram.
-const TILE_X_OFFSET: usize = 16;
-const TILE_Y_OFFSET: usize = 17;
-/// Shortest payload that can carry both coordinates.
+use ghostframe_protocol::protocol::{is_tile_datagram, DATAGRAM_HEADER_SIZE};
+
+/// Tile coordinates are the first two bytes of `TileHeader`, which follows
+/// the fixed-size `DatagramHeader`.
+const TILE_X_OFFSET: usize = DATAGRAM_HEADER_SIZE;
+const TILE_Y_OFFSET: usize = DATAGRAM_HEADER_SIZE + 1;
+/// Shortest payload whose byte at `TILE_Y_OFFSET` exists.
 const MIN_TILE_LEN: usize = TILE_Y_OFFSET + 1;
-/// Byte 0 has the tile flag bit set (0x80 in big-endian, which is bit 31 of frame_seq).
-const TILE_DATAGRAM_FLAG_BYTE: u8 = 0x80;
 
 /// Drop the given occurrences of datagrams carrying this tile.
 ///
 /// `occurrences` are zero-based counts of matching datagrams seen so far:
 /// `vec![0]` drops the first and lets every later one through, which is the
 /// "last write lost, then static" case.
+///
+/// Note that `(255, 255)` is not a tile: it is the frame-dimensions sentinel
+/// (`FRAME_DIMENSIONS_SENTINEL_X`/`_Y`), so a rule naming it would drop
+/// control traffic rather than picture content.
 #[derive(Debug, Clone)]
 pub struct DropRule {
     pub tile_x: u8,
@@ -29,17 +38,63 @@ pub struct DropRule {
     pub occurrences: Vec<u32>,
 }
 
-#[derive(Debug, Clone, Default)]
+/// A set of deterministic drop rules, at most one per tile.
+///
+/// Deliberately not `Clone`: the occurrence counters are live state, and a
+/// copy would silently fork the drop schedule.
+#[derive(Debug, Default)]
 pub struct DropPlan {
     rules: Vec<DropRule>,
-    /// Matches seen so far per rule, parallel to `rules`.
+    /// Matching datagrams seen so far, per rule, parallel to `rules`.
     seen: Vec<u32>,
+    /// Datagrams actually dropped so far, per rule, parallel to `rules`.
+    dropped: Vec<u32>,
 }
 
 impl DropPlan {
+    /// Build a plan from `rules`.
+    ///
+    /// The `debug_assert`s reject the two ways to write a rule that can never
+    /// fire. Both matter more than usual here: this type exists to make a
+    /// test's premise real, and a rule that quietly does nothing turns that
+    /// test into one that passes without testing anything.
     pub fn new(rules: Vec<DropRule>) -> Self {
-        let seen = vec![0; rules.len()];
-        Self { rules, seen }
+        for (i, rule) in rules.iter().enumerate() {
+            debug_assert!(
+                !rule.occurrences.is_empty(),
+                "DropRule for tile ({}, {}) names no occurrences: it would match \
+                 every transmission and drop none, so the test it was written for \
+                 would pass vacuously",
+                rule.tile_x,
+                rule.tile_y
+            );
+            debug_assert!(
+                !rules[..i]
+                    .iter()
+                    .any(|r| r.tile_x == rule.tile_x && r.tile_y == rule.tile_y),
+                "duplicate DropRule for tile ({}, {}): should_drop returns on the \
+                 first match, so this rule could never fire",
+                rule.tile_x,
+                rule.tile_y
+            );
+        }
+        let n = rules.len();
+        Self {
+            rules,
+            seen: vec![0; n],
+            dropped: vec![0; n],
+        }
+    }
+
+    /// Datagrams actually dropped so far, per rule, parallel to the rules
+    /// given to `new`.
+    ///
+    /// A scene asserting on the *effect* of an injected drop should first
+    /// assert the matching entry is non-zero. A rule naming a tile the scene
+    /// never sends is silent, and without this the assertion would pass
+    /// whether or not anything was ever dropped.
+    pub fn drops(&self) -> &[u32] {
+        &self.dropped
     }
 
     /// True if this datagram should be dropped. Advances the per-rule
@@ -48,7 +103,10 @@ impl DropPlan {
         if self.rules.is_empty() {
             return false;
         }
-        if payload.len() < MIN_TILE_LEN || (payload[0] & TILE_DATAGRAM_FLAG_BYTE) == 0 {
+        // Both guards are load-bearing and independent: a non-tile datagram
+        // can be longer than MIN_TILE_LEN and carry arbitrary bytes at the
+        // coordinate offsets. An ACK batch is exactly that.
+        if payload.len() < MIN_TILE_LEN || !is_tile_datagram(payload) {
             return false;
         }
         let tx = payload[TILE_X_OFFSET];
@@ -57,7 +115,11 @@ impl DropPlan {
             if rule.tile_x == tx && rule.tile_y == ty {
                 let n = self.seen[i];
                 self.seen[i] = n.saturating_add(1);
-                return rule.occurrences.contains(&n);
+                let drop = rule.occurrences.contains(&n);
+                if drop {
+                    self.dropped[i] = self.dropped[i].saturating_add(1);
+                }
+                return drop;
             }
         }
         false
@@ -73,8 +135,8 @@ mod tests {
     fn tile_datagram(tile_x: u8, tile_y: u8) -> Vec<u8> {
         let mut v = vec![0u8; 20];
         v[0] = 0x80;
-        v[16] = tile_x;
-        v[17] = tile_y;
+        v[TILE_X_OFFSET] = tile_x;
+        v[TILE_Y_OFFSET] = tile_y;
         v
     }
 
@@ -89,6 +151,7 @@ mod tests {
         assert!(plan.should_drop(&dg), "first occurrence must drop");
         assert!(!plan.should_drop(&dg), "second occurrence must pass");
         assert!(!plan.should_drop(&dg), "third occurrence must pass");
+        assert_eq!(plan.drops(), &[1], "exactly one datagram was dropped");
     }
 
     #[test]
@@ -100,28 +163,88 @@ mod tests {
         }]);
         assert!(!plan.should_drop(&tile_datagram(0, 0)));
         assert!(!plan.should_drop(&tile_datagram(2, 4)));
-        // The named tile is still on its first occurrence.
+        // The named tile is still on its first occurrence: a non-matching
+        // datagram must not have consumed it.
         assert!(plan.should_drop(&tile_datagram(2, 3)));
     }
 
+    /// The tile-flag guard, isolated from the length guard.
+    ///
+    /// An ACK batch (`ACK_BATCH_MSG_TYPE` = 0x06, 7-byte entries) runs well
+    /// past byte 17, and whatever entry bytes land there are arbitrary — they
+    /// can equal any tile coordinate. Without the flag check a plan would
+    /// silently eat acknowledgements, corrupting the very feedback path these
+    /// scenes measure, while still looking like a successful tile drop.
     #[test]
-    fn ignores_non_tile_datagrams() {
+    fn a_non_tile_datagram_is_never_dropped_however_long_it_is() {
+        let mut plan = DropPlan::new(vec![DropRule {
+            tile_x: 6,
+            tile_y: 0,
+            occurrences: vec![0],
+        }]);
+        let mut ack = vec![0u8; 32];
+        ack[0] = 0x06;
+        ack[TILE_X_OFFSET] = 6;
+        ack[TILE_Y_OFFSET] = 0;
+        assert!(
+            !plan.should_drop(&ack),
+            "a non-tile datagram must never drop"
+        );
+        assert_eq!(plan.drops(), &[0]);
+        assert!(
+            plan.should_drop(&tile_datagram(6, 0)),
+            "the real first transmission must still be the one that drops"
+        );
+    }
+
+    #[test]
+    fn a_payload_too_short_to_carry_coordinates_is_ignored() {
         let mut plan = DropPlan::new(vec![DropRule {
             tile_x: 0,
             tile_y: 0,
             occurrences: vec![0],
         }]);
-        // ACK/NACK envelopes do not set the tile flag; byte 0 is a message
-        // type. A plan must never swallow one.
-        let ack = vec![0x06u8, 0, 0, 0, 0, 0];
-        assert!(!plan.should_drop(&ack));
-        // Too short to carry tile coordinates.
         assert!(!plan.should_drop(&[0x80u8, 0, 0]));
+    }
+
+    /// Pins the exact length boundary: an off-by-one here would index out of
+    /// bounds on a 17-byte datagram.
+    #[test]
+    fn reads_coordinates_at_the_exact_length_boundary() {
+        let mut plan = DropPlan::new(vec![DropRule {
+            tile_x: 9,
+            tile_y: 9,
+            occurrences: vec![0],
+        }]);
+        let mut dg = vec![0u8; MIN_TILE_LEN];
+        dg[0] = 0x80;
+        dg[TILE_X_OFFSET] = 9;
+        dg[TILE_Y_OFFSET] = 9;
+        assert!(plan.should_drop(&dg), "18 bytes carries both coordinates");
+        assert!(
+            !plan.should_drop(&dg[..MIN_TILE_LEN - 1]),
+            "one byte shorter must be ignored, not indexed"
+        );
+    }
+
+    /// The whole `occurrences` list is honoured, not just its first entry.
+    #[test]
+    fn honours_every_listed_occurrence_not_just_the_first() {
+        let mut plan = DropPlan::new(vec![DropRule {
+            tile_x: 1,
+            tile_y: 1,
+            occurrences: vec![1, 3],
+        }]);
+        let dg = tile_datagram(1, 1);
+        let fates: Vec<bool> = (0..5).map(|_| plan.should_drop(&dg)).collect();
+        assert_eq!(fates, vec![false, true, false, true, false]);
+        assert_eq!(plan.drops(), &[2]);
     }
 
     #[test]
     fn an_empty_plan_drops_nothing() {
         let mut plan = DropPlan::default();
         assert!(!plan.should_drop(&tile_datagram(1, 1)));
+        assert!(plan.drops().is_empty());
     }
 }
