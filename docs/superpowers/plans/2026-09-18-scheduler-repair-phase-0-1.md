@@ -1149,6 +1149,64 @@ comparison instead of a map lookup."
 
 ## Task 7: Migrate `Scheduler` onto `SlotMap`
 
+> **AMENDED (2026-09-19) after the first attempt came back BLOCKED.**
+>
+> The original step text claimed the three mask readers are "all called with
+> the tile's current generation". True for readers — `io_bridge.rs:3902`,
+> `:3466`, `:3617` all pass `scheduler.generation_for(...)`. **Not true for the
+> writer:** `record_cdf53_ack` is called at `io_bridge.rs:2883` with
+> `entry.generation`, the *emit-time* generation from the coverage entry.
+>
+> When a tile bumps between emit and acknowledgement — common, since ACK
+> latency p50 is 145 ms against a 33 ms frame — the old `HashMap` wrote that
+> acknowledgement into a stale bucket **no reader ever queried**. So the mask
+> behaviour is genuinely unchanged by scoping to the live generation.
+>
+> But `record_cdf53_ack` has a *second* consumer: it increments
+> `delivery_window_acked`, the AIMD counter behind
+> `maybe_adjust_refinement_fraction`. Under the old model a stale-generation
+> acknowledgement still counted. Scoping it away would under-count delivery on
+> churning screens and halve the refinement fraction more aggressively — a real
+> behavioural change, and one the bench work that tuned those constants did not
+> assume.
+>
+> **Decision: split the two concerns.** An acknowledgement proves bytes crossed
+> the wire; superseding the content afterwards does not un-deliver them.
+>
+> ```rust
+>     pub fn record_cdf53_ack(&mut self, tile_x: u8, tile_y: u8, generation: u8, pass_idx: u8) {
+>         // Delivery accounting is generation-agnostic: this pass reached the
+>         // client, and a later supersession does not un-deliver those bytes.
+>         // Duplicates cannot reach here -- `TransmissionLedger::resolve`
+>         // removes the record, so a repeated `wire_seq` resolves to nothing
+>         // and never becomes an ack. The old per-generation `was_set` dedup
+>         // was belt-and-braces, not load-bearing.
+>         self.delivery_window_acked = self.delivery_window_acked.saturating_add(1);
+>         // Content completeness is generation-scoped: only the live
+>         // generation's mask means anything to the readers.
+>         self.slots.record_ack(tile_x, tile_y, generation, pass_idx);
+>     }
+> ```
+>
+> `SlotMap::is_new_ack` is then unused by this path; leave it in place for the
+> mask-side callers or delete it if nothing references it.
+>
+> **Nine tests still need a fixture update** and that is approved. They ack at
+> `generation = 1` on a freshly-constructed `Scheduler` whose `current_gen` is
+> `0`, without ever calling `bump_generation` — they were written against the
+> old map's generation-keyed buckets, which accepted a write at any generation.
+> Insert a `bump_generation` so the generation under test is actually live:
+>
+> ```rust
+>         let mut s = Scheduler::new(4, 4);
+>         s.bump_generation(tile_x, tile_y);   // make gen 1 the live generation
+>         s.record_cdf53_ack(tile_x, tile_y, 1, pass);
+> ```
+>
+> Change only the fixture, never an assertion. `record_cdf53_ack_increments_delivery_window_counter`
+> needs no change — the split fixes it.
+
+
 Replaces `generations` and `cdf53_passes_acked` with a single `SlotMap`. The public API does not change; every existing test must pass untouched.
 
 **Files:**
