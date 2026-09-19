@@ -23,3 +23,6 @@ pub mod loss_injection;
 
 #[cfg(any(test, feature = "test-loss-injection"))]
 pub mod bandwidth_cap;
+
+#[cfg(any(test, feature = "test-loss-injection"))]
+pub mod drop_plan;

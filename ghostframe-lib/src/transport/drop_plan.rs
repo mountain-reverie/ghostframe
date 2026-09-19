@@ -1,4 +1,4 @@
-//! Deterministic drop injection for the browserless harness.
+//! Deterministic drop injection for e2e tests.
 //!
 //! `NetProfile::loss` is probabilistic, which cannot produce the case this
 //! exists for: a tile whose *only* transmission is lost, so the receiver
@@ -6,14 +6,35 @@
 //! raising `loss` does not work — at the rates where it becomes likely the
 //! scene stops establishing at all (measured: bails at 0.60 and 0.90).
 //!
-//! Applied *after* `NetSim::decide` so the rng stream is untouched; see that
-//! function's doc comment on draw ordering.
+//! ## Why this lives here, not at the QUIC layer
+//!
+//! An earlier version of this plan was consulted inside the browserless
+//! harness's `rule()`, which operates on raw UDP payloads — i.e. QUIC
+//! packets. That is the wrong layer: application tile datagrams travel
+//! *inside* QUIC DATAGRAM frames, encrypted, so `is_tile_datagram` and the
+//! tile-coordinate offsets below are meaningless once QUIC has touched the
+//! bytes. Measured on a scene that genuinely delivers a tile
+//! (`a_single_solid_tile_arrives_on_a_perfect_link`): 20 server-to-client
+//! packets, and `is_tile_datagram` returned true exactly once — on packet
+//! #1, the QUIC Initial (long-header, `byte0=0xc3`), because bit 7 of byte 0
+//! is the unprotected long-header form bit. Every packet that could
+//! actually carry a tile is short-header, where that bit is always 0. So a
+//! rule wired in at that layer could never drop a tile, and a rule whose
+//! coordinates happened to match the Initial's bytes 16/17 would eat the
+//! handshake instead — while still reporting that it fired, fabricating the
+//! "this drop is real" signal by destroying the connection.
+//!
+//! `IoBridge::send_to_all_sessions` is the plaintext seam instead: it takes
+//! the application datagram *before* QUIC encrypts it, and already hosts
+//! the equivalent `outbound_loss` hook for probabilistic loss. This plan is
+//! consulted there, immediately after that hook.
 //!
 //! Wire constants are imported rather than re-declared, for the reason
-//! `pump.rs` gives: the production framing helpers are `pub` specifically so
-//! this harness cannot drift from what actually goes on the wire.
+//! `pump.rs` (in `ghostframe-e2e`) gives: the production framing helpers are
+//! `pub` specifically so nothing consulting them can drift from what
+//! actually goes on the wire.
 
-use ghostframe_protocol::protocol::{is_tile_datagram, DATAGRAM_HEADER_SIZE};
+use crate::transport::protocol::{is_tile_datagram, DATAGRAM_HEADER_SIZE};
 
 /// Tile coordinates are the first two bytes of `TileHeader`, which follows
 /// the fixed-size `DatagramHeader`.

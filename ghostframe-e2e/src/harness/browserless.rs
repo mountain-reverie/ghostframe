@@ -286,6 +286,14 @@ pub struct BrowserlessResult {
     /// **expected** outcome on an idle link, not a bug — see
     /// `probes_completed`'s doc comment for the zero/zero case.
     pub probes_abandoned: u64,
+    /// Datagrams each `DropRule` in `BrowserlessScene::drops` actually dropped,
+    /// parallel to the rules given to `DropPlan::new`. A scene asserting on the
+    /// *effect* of an injected drop must first assert the matching entry is
+    /// non-zero: a rule naming a tile the scene never sends is silent, and
+    /// without that check the effect assertion passes whether or not anything
+    /// was ever dropped. Distinct from `bytes_dropped`, which counts *netsim*
+    /// drops across both directions and cannot separate the two causes.
+    pub drops_fired: Vec<u32>,
 }
 
 /// The address the harness uses to identify the client, baked into every
@@ -367,6 +375,16 @@ async fn run_inner(mut scene: BrowserlessScene) -> anyhow::Result<BrowserlessRes
     // Stage 2.4) — see `probe_stats_publish`'s doc comment in
     // `io_bridge.rs`.
     let probe_stats_cell = bridge.probe_stats_publish_handle();
+    // Same ownership problem, opposite direction: this `Arc` originates
+    // here (it already holds `scene.drops`'s rules), and `set_drop_plan`
+    // installs it into the bridge so `send_to_all_sessions` can consult it
+    // at the plaintext seam — see `drop_plan`'s doc comment in
+    // `io_bridge.rs` for why that seam, not the QUIC layer. `mem::take`
+    // leaves an empty (default) plan behind in `scene`, which is fine: the
+    // scene has nothing further to do with it.
+    let drop_plan_cell =
+        std::sync::Arc::new(std::sync::Mutex::new(std::mem::take(&mut scene.drops)));
+    bridge.set_drop_plan(drop_plan_cell.clone());
     // `IoBridge::run` is an infinite event loop that only returns on EOF or
     // error; it must be aborted explicitly (see below) rather than awaited.
     let bridge_handle = tokio::task::spawn_local(async move {
@@ -393,7 +411,7 @@ async fn run_inner(mut scene: BrowserlessScene) -> anyhow::Result<BrowserlessRes
         client_addr,
         server_addr,
         base,
-        &mut scene,
+        &scene,
         &inject_tx,
         &mut framebuffer,
         &bwe_cell,
@@ -425,6 +443,11 @@ async fn run_inner(mut scene: BrowserlessScene) -> anyhow::Result<BrowserlessRes
     let (probes_completed, probes_abandoned) = *probe_stats_cell
         .lock()
         .expect("probe_stats_publish mutex poisoned");
+    let drops_fired = drop_plan_cell
+        .lock()
+        .expect("drop_plan mutex poisoned")
+        .drops()
+        .to_vec();
 
     Ok(BrowserlessResult {
         framebuffer,
@@ -462,6 +485,7 @@ async fn run_inner(mut scene: BrowserlessScene) -> anyhow::Result<BrowserlessRes
         queued_refinement_latency_buckets: queued_refinement_latency.buckets,
         probes_completed,
         probes_abandoned,
+        drops_fired,
     })
 }
 
@@ -489,7 +513,7 @@ async fn drive_session(
     client_addr: SocketAddr,
     server_addr: SocketAddr,
     base: TokioInstant,
-    scene: &mut BrowserlessScene,
+    scene: &BrowserlessScene,
     inject_tx: &mpsc::Sender<InjectedFrame>,
     framebuffer: &mut FrameBuffer,
     bwe_cell: &std::sync::Arc<std::sync::Mutex<ghostframe_lib::transport::bwe::BweSnapshot>>,
@@ -697,7 +721,6 @@ async fn drive_session(
                 out.payload,
                 t,
                 &mut bytes_dropped,
-                &mut scene.drops,
             ) {
                 if item.at_us <= t {
                     // Due now: send it here, inside the drain loop, so each
@@ -884,14 +907,8 @@ async fn drive_session(
                      (last events observed: {events:?}): {e}"
                 ))?;
                 let t = now_us(base);
-                for item in rule(
-                    &mut net_s2c,
-                    Direction::S2c,
-                    pkt.payload,
-                    t,
-                    &mut bytes_dropped,
-                    &mut scene.drops,
-                ) {
+                for item in rule(&mut net_s2c, Direction::S2c, pkt.payload, t, &mut bytes_dropped)
+                {
                     if item.at_us <= t {
                         // Its own arrival instant, for the same reason as
                         // in `flush_due`. Equal to `t` at zero delay, earlier
@@ -1100,7 +1117,6 @@ fn rule(
     payload: Vec<u8>,
     now_us_at_send: u64,
     bytes_dropped: &mut u64,
-    drops: &mut crate::netsim::DropPlan,
 ) -> Vec<InFlight> {
     // `seq` is a placeholder here; the caller assigns a real one if and when
     // it queues the arrival, so queued arrivals stay ordered by insertion.
@@ -1116,16 +1132,7 @@ fn rule(
             *bytes_dropped += payload.len() as u64;
             Vec::new()
         }
-        Verdict::Deliver { at_us } => {
-            // Applied *after* `decide` so the rng draw order above is
-            // untouched -- see `NetSim::decide`'s doc comment. A plan can
-            // only turn a delivery into a drop, never the reverse.
-            if dir == Direction::S2c && drops.should_drop(&payload) {
-                *bytes_dropped += payload.len() as u64;
-                return Vec::new();
-            }
-            vec![at(at_us, payload)]
-        }
+        Verdict::Deliver { at_us } => vec![at(at_us, payload)],
         Verdict::Duplicate { at_us, dup_at_us } => {
             vec![at(at_us, payload.clone()), at(dup_at_us, payload)]
         }
