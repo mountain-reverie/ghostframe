@@ -367,8 +367,14 @@ impl ReliableTileEmitter {
         for &(key, frag_idx) in entries {
             let Some(entry) = self.cache.get_mut(&key) else {
                 self.stats.nack_miss += 1;
+                if crate::transport::reliable_emitter::rto_probe_enabled() {
+                    eprintln!("RTOPROBE nack_miss");
+                }
                 continue;
             };
+            if crate::transport::reliable_emitter::rto_probe_enabled() {
+                eprintln!("RTOPROBE nack_hit");
+            }
             let Some(frag) = entry.fragments.get(frag_idx as usize) else {
                 continue;
             };

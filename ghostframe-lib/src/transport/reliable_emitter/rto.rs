@@ -50,6 +50,10 @@ impl RtoTimerWheel {
     /// is yet due. Callers re-validate the returned key against the live
     /// cache before retransmitting.
     pub fn pop_due(&mut self, now: Instant) -> Option<EmitKey> {
+        // EXPERIMENT: RTO timer disabled. Cache + NACK path untouched.
+        if std::env::var("GHOSTFRAME_NO_RTO").is_ok_and(|v| v == "1") {
+            return None;
+        }
         let Reverse(top) = self.heap.peek()?;
         if top.deadline > now {
             return None;
