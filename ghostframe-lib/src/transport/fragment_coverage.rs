@@ -51,6 +51,15 @@ pub struct FragmentCoverage {
     pub codec: Codec,
     /// Some(_) only for PalRle; drives `PaletteTable.delivered` tracking.
     pub palette_id: Option<u8>,
+    /// Whether this PalRle emission carried the palette inline.
+    ///
+    /// `PaletteTable::in_flight_carrying` counts emissions that are *carrying*
+    /// a palette, and is only incremented for bundled ones. The acknowledgement
+    /// path has to know which kind it is acknowledging or the two sides do not
+    /// pair: decrementing for a thin emission takes down a count it never put
+    /// up, which underflows and — worse — drops a `release` against an
+    /// `acquire` that never happened.
+    pub palette_bundled: bool,
 }
 
 /// Inline capacity for the coverage list per key.
@@ -199,6 +208,7 @@ mod tests {
             pass_idx: 11,
             codec: Codec::Cdf53,
             palette_id: None,
+            palette_bundled: false,
         };
         assert_eq!(c.tile_x, 5);
         assert_eq!(c.tile_y, 7);
@@ -217,6 +227,7 @@ mod tests {
             pass_idx: 0,
             codec: Codec::PalRle,
             palette_id: Some(42),
+            palette_bundled: false,
         };
         assert_eq!(c.palette_id, Some(42));
     }
@@ -231,6 +242,7 @@ mod tests {
             pass_idx: 0,
             codec: Codec::Solid,
             palette_id: None,
+            palette_bundled: false,
         }];
         // key: (frame_seq=100, tile_x=1, tile_y=2, pass_idx=0)
         m.record((100, 1, 2, 0), cov.clone());
@@ -272,6 +284,7 @@ mod tests {
                 pass_idx: 0,
                 codec: Codec::Cdf53,
                 palette_id: None,
+            palette_bundled: false,
             }]
         };
         // Same tile (5,3) spread across two frames and two passes (4 entries).
@@ -318,6 +331,7 @@ mod tests {
                 pass_idx: 0,
                 codec,
                 palette_id,
+                palette_bundled: palette_id.is_some(),
             }]
         };
         m.record((10, 4, 4, 0), one(Codec::Solid, None));
@@ -348,6 +362,7 @@ mod tests {
             pass_idx: 0,
             codec: Codec::Cdf53,
             palette_id: None,
+            palette_bundled: false,
         }];
         m.record((0, 1, 1, 0), cdf53.clone());
         m.record((0, 2, 2, 0), cdf53.clone());
@@ -381,6 +396,7 @@ mod tests {
                 pass_idx,
                 codec: Codec::Cdf53,
                 palette_id: None,
+            palette_bundled: false,
             }]
         };
         // Record all 14 passes of tile (5,3) in frame 42 — no collision.
