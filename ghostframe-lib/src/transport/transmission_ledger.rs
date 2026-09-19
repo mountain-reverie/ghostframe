@@ -209,7 +209,7 @@ mod tests {
         let t0 = Instant::now();
         let mut l = TransmissionLedger::new(64);
         l.record(7, t0, tx(7));
-        assert_eq!(l.resolve(7), Some(tx(7)));
+        assert_eq!(l.resolve(7), Some(Resolution::Live(tx(7))));
         assert_eq!(l.resolve(7), None, "a second resolve finds nothing");
         assert!(
             l.expire(t0 + Duration::from_secs(10), Duration::from_millis(1))
@@ -232,8 +232,15 @@ mod tests {
         );
     }
 
+    /// A late acknowledgement is visible and does not retract the loss --
+    /// but it does release the content.
+    ///
+    /// Previously this asserted `resolve` returned `None`, which made the
+    /// acknowledgement countable while leaving its cache entry unreachable
+    /// forever. Visibility and non-retraction were the point and are kept;
+    /// the stranding was not, and is gone.
     #[test]
-    fn an_acknowledgement_after_expiry_is_counted_not_retracted() {
+    fn an_acknowledgement_after_expiry_is_counted_and_releases_content() {
         let t0 = Instant::now();
         let mut l = TransmissionLedger::new(64);
         l.record(7, t0, tx(7));
@@ -242,11 +249,20 @@ mod tests {
                 .len(),
             1
         );
-        assert_eq!(l.resolve(7), None);
         assert_eq!(
-            l.stats().unknown_acks,
+            l.resolve(7),
+            Some(Resolution::Late(tx(7))),
+            "the content must still be releasable, or its cache entry is stranded"
+        );
+        assert_eq!(
+            l.stats().acked_after_declared_lost,
             1,
             "a late acknowledgement is visible, not silent"
+        );
+        assert_eq!(
+            l.stats().unknown_acks,
+            0,
+            "it is no longer an unknown acknowledgement -- we know exactly what it was"
         );
     }
 
@@ -422,7 +438,7 @@ mod tests {
         l.record(3, t0, tx(3));
         assert_eq!(l.len(), 2);
         assert_eq!(l.resolve(1), None, "oldest was evicted");
-        assert_eq!(l.resolve(3), Some(tx(3)));
+        assert_eq!(l.resolve(3), Some(Resolution::Live(tx(3))));
         assert_eq!(l.stats().capacity_evictions, 1);
     }
 }
