@@ -2168,6 +2168,12 @@ impl IoBridge {
                 } else {
                     None
                 };
+                // Byte 0 bit 0 is the bundled flag (see `pal_rle::decode`).
+                // Recorded so the acknowledgement path decrements
+                // `in_flight_carrying` only for the emissions that
+                // incremented it.
+                let palette_bundled = work.codec == crate::transport::protocol::Codec::PalRle
+                    && work.payload.first().is_some_and(|f| f & 0x01 != 0);
                 let coverage: crate::transport::fragment_coverage::CoverageList =
                     smallvec![crate::transport::fragment_coverage::FragmentCoverage {
                         tile_x: work.tile_x,
@@ -2176,6 +2182,7 @@ impl IoBridge {
                         pass_idx: work.pass_idx,
                         codec: work.codec,
                         palette_id,
+                        palette_bundled,
                     }];
                 let key = (frame_seq_with_flag, work.tile_x, work.tile_y, work.pass_idx);
                 self.fragment_coverage.record(key, coverage);
@@ -2838,21 +2845,36 @@ impl IoBridge {
                                 // ResolvedTileWork.palette_id channel.
                                 if let Some(pid) = entry.palette_id {
                                     let pid_usize = pid as usize;
+                                    // Delivery is about the palette, so it is
+                                    // recorded for thin emissions too: a thin
+                                    // one arriving proves the receiver already
+                                    // had the palette.
                                     if !self.palette_table.delivered.contains(pid) {
                                         self.palette_table.delivered.insert(pid);
                                     }
-                                    let cnt = self.palette_table.in_flight_carrying[pid_usize];
-                                    self.palette_table.in_flight_carrying[pid_usize] =
-                                        cnt.saturating_sub(1);
-                                    if cnt == 0 {
-                                        tracing::warn!(
-                                            target: "palrle.alloc",
-                                            palette_id = pid,
-                                            "in_flight_carrying underflow — enqueue/ack pairing bug",
-                                        );
-                                    }
-                                    if self.palette_table.ref_count[pid_usize] > 0 {
-                                        self.palette_table.release(pid);
+                                    // The counter and the acquire are about
+                                    // this *emission* carrying a palette, and
+                                    // only a bundled emission does. Both are
+                                    // taken on the bundled path at encode time
+                                    // (`in_flight_carrying += 1` next to
+                                    // `acquire_or_allocate`), so undoing them
+                                    // for a thin emission takes down a count
+                                    // that was never put up and releases an
+                                    // acquire that never happened.
+                                    if entry.palette_bundled {
+                                        let cnt = self.palette_table.in_flight_carrying[pid_usize];
+                                        self.palette_table.in_flight_carrying[pid_usize] =
+                                            cnt.saturating_sub(1);
+                                        if cnt == 0 {
+                                            tracing::warn!(
+                                                target: "palrle.alloc",
+                                                palette_id = pid,
+                                                "in_flight_carrying underflow — enqueue/ack pairing bug",
+                                            );
+                                        }
+                                        if self.palette_table.ref_count[pid_usize] > 0 {
+                                            self.palette_table.release(pid);
+                                        }
                                     }
                                 }
                             }
@@ -6548,6 +6570,7 @@ mod tests {
                 pass_idx: 0,
                 codec: crate::transport::protocol::Codec::Cdf53,
                 palette_id: None,
+            palette_bundled: false,
             }];
         // Key: (frame_seq=100, tile_x=7, tile_y=9, pass_idx=0)
         bridge.fragment_coverage.record((100, 7, 9, 0), cov);
@@ -6932,6 +6955,68 @@ mod tests {
         );
     }
 
+    /// A *thin* PalRle emission must not decrement `in_flight_carrying`, and
+    /// must not release a palette acquire.
+    ///
+    /// Both the counter bump and the acquire are taken only on the bundled
+    /// path, next to `acquire_or_allocate`. Undoing them for a thin emission
+    /// takes down a count that was never put up — which underflows — and
+    /// releases a reference that was never taken, which can free a palette
+    /// slot another tile is still using.
+    ///
+    /// This fired 602 times in a single live session while the same log showed
+    /// none in the preceding week, with the warning text naming itself an
+    /// "enqueue/ack pairing bug".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ack_for_a_thin_palrle_tile_leaves_the_carry_count_alone() {
+        let (our_end, _peer) = UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("server");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+
+        // One bundled emission is outstanding, holding one acquire.
+        bridge.palette_table.ref_count[9] = 1;
+        bridge.palette_table.in_flight_carrying[9] = 1;
+
+        // A *thin* emission of the same palette is acknowledged. It carried no
+        // palette, so it took neither the count nor the acquire.
+        let cov: crate::transport::fragment_coverage::CoverageList =
+            smallvec::smallvec![crate::transport::fragment_coverage::FragmentCoverage {
+                tile_x: 2,
+                tile_y: 3,
+                generation: 0,
+                pass_idx: 0,
+                codec: crate::transport::protocol::Codec::PalRle,
+                palette_id: Some(9),
+                palette_bundled: false,
+            }];
+        bridge.fragment_coverage.record((301, 2, 3, 0), cov);
+        bridge.seed_transmission_for_test(
+            2001,
+            crate::transport::reliable_emitter::EmitKey::new(301, 2, 3, 0),
+        );
+        let batch = crate::transport::ack::AckBatch {
+            entries: vec![crate::transport::ack::AckEntry {
+                wire_seq: 2001,
+                arrival_time_ms_lo16: 0,
+            }],
+        };
+        bridge.dispatch_ack_datagram(&batch.encode());
+
+        assert_eq!(
+            bridge.palette_table.in_flight_carrying[9], 1,
+            "a thin emission must not decrement the bundled emission's carry count"
+        );
+        assert_eq!(
+            bridge.palette_table.ref_count[9], 1,
+            "a thin emission must not release an acquire it never took"
+        );
+        assert!(
+            bridge.palette_table.delivered.contains(9),
+            "a thin emission arriving still proves the receiver has the palette"
+        );
+    }
+
     /// Verify that `IoBridge` constructors initialize `palette_table` to an
     /// all-empty state. M3.2a: palette state is per-server, so a fresh bridge
     /// must start with no allocated slots.
@@ -7161,6 +7246,7 @@ mod tests {
                 pass_idx: 0,
                 codec: crate::transport::protocol::Codec::PalRle,
                 palette_id: Some(7),
+            palette_bundled: true,
             }];
         // Key: (frame_seq=200, tile_x=0, tile_y=0, pass_idx=0)
         bridge.fragment_coverage.record((200, 0, 0, 0), cov);
@@ -7198,7 +7284,11 @@ mod tests {
         bridge.palette_table.ref_count[5] = 1;
         bridge.palette_table.in_flight_carrying[5] = 1;
 
-        // Record coverage as if the server emitted a PalRle tile with palette_id=5.
+        // Record coverage as if the server emitted a PalRle tile with
+        // palette_id=5, carrying the palette inline. Bundled specifically:
+        // the acquire and the `in_flight_carrying` bump seeded above are both
+        // taken on that path, so only a bundled emission has anything for the
+        // acknowledgement to undo.
         let cov: crate::transport::fragment_coverage::CoverageList =
             smallvec::smallvec![crate::transport::fragment_coverage::FragmentCoverage {
                 tile_x: 0,
@@ -7207,6 +7297,7 @@ mod tests {
                 pass_idx: 0,
                 codec: crate::transport::protocol::Codec::PalRle,
                 palette_id: Some(5),
+                palette_bundled: true,
             }];
         // Key: (frame_seq=201, tile_x=0, tile_y=0, pass_idx=0)
         bridge.fragment_coverage.record((201, 0, 0, 0), cov);
