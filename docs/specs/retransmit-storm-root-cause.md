@@ -10,6 +10,11 @@ On a link that drops nothing, the server retransmitted **1788 times**.
 
 ---
 
+> **Correction (same day):** the first version of this document read the
+> codec split as evidence that Cdf53's deferred acknowledgement caused the
+> long tail. It does not — see "The measurement". The ledger-expiry mechanism
+> below is unaffected and stands.
+
 ## Root cause
 
 An acknowledgement no longer names the content it acknowledges. Since
@@ -51,10 +56,30 @@ The horizon sits at 236 ms; the acknowledgement distribution's upper decile
 sits above it. Every transmission in that tail is declared lost, and none of
 them were.
 
-**Every one of the 1016 RTO fires was codec 5 (Cdf53). Zero for Solid, PalRle
-or H264.** Those three acknowledge on receipt and always beat the horizon.
-Cdf53 defers its acknowledgement until the whole pass assembles and
-prevalidates, which is what pushes its tail past 236 ms.
+All 1016 RTO fires were codec 5 (Cdf53) — but **this scene emits nothing
+else**, so that is not a discriminator. An earlier draft read it as one and
+concluded the Cdf53 deferred acknowledgement was what pushed the tail past the
+horizon. Two later measurements refute that:
+
+- **Every Cdf53 pass here is a single datagram** (0 `EmitKey` re-insert
+  collisions across 2016 emissions; `EmitKey` has no `frag_idx` and
+  `submit_one` always builds a one-fragment entry). Assembly of a
+  one-fragment pass completes on arrival, so the deferral costs approximately
+  nothing.
+- Acknowledging on receipt moved the floor 85 ms -> 75 ms and left the median
+  untouched.
+
+So the deferral is not the cause of the long tail. **What does put ACK latency
+at p50 145 ms / p90 251 ms, against an RTT-plus-batching floor of 75 ms, is
+still unexplained** — and since the horizon is 236 ms, that unexplained
+70-176 ms is the entire margin. It is the next thing to measure, and it
+should be checked against harness fidelity first: this is a paused-clock
+harness whose divergences have produced wrong conclusions before.
+
+The accounting is at least complete and consistent: 2016 original emissions +
+1788 retransmissions = 3804 datagrams; the client prevalidated 3805 and
+rejected none; 2346 acknowledgements resolved in time and 1458 expired first.
+Nothing was lost, and everything sent was received.
 
 ## What this is not
 
@@ -73,7 +98,8 @@ Each ruled out by experiment on the reproduction, not by argument.
   wrong reason.)
 - **Not prevalidation rejecting superseded passes.** The client prevalidated
   **3805 Cdf53 passes and rejected none**. It acknowledges everything it
-  receives.
+  receives. (This remains a latent second trigger — see remediation 4 — but it
+  is not firing today.)
 - **Not a missing `cancel_for_tile`.** Both `bump_generation` sites pair with
   it correctly.
 - **Not sufficient to acknowledge Cdf53 on receipt.** Tried: 1788 -> 1739,
@@ -108,7 +134,20 @@ showed persistent stale tiles is the first one running that code.
 3. **Size the horizon on what it is actually racing.** `3 x RTT` measures the
    network; the deadline it must beat includes client-side batching and
    assembly. Derive it from observed acknowledgement latency instead.
-4. **Acknowledge Cdf53 on receipt.** Measured insufficient on its own, but it
-   removes a layering violation: the deferral dates from July 2, when
-   `AckEntry` named content and a single fragment could not be named. PR #90
-   removed that constraint; the deferral outlived its reason.
+4. **Acknowledge Cdf53 on receipt.** Measured insufficient on its own, and —
+   since passes are single-datagram — worth almost nothing in latency. The
+   reason to do it anyway is that it disarms a *second* route into this same
+   bug: gating a transport fact ("datagram N arrived") on a content predicate
+   (`prevalidate_cdf53` succeeding) means a pass that ever fails prevalidation
+   is never acknowledged, its ledger record expires, and its cache entry goes
+   immortal by exactly the mechanism above — with no timing race needed. The
+   deferral dates from July 2, when `AckEntry` named content and a single
+   fragment could not be named; PR #90 removed that constraint and the
+   deferral outlived its reason.
+
+5. **Reconsider whether RTO replay belongs to Cdf53 refinement at all.** The
+   scheduler's priority queue already knows what each tile currently needs. A
+   timer replaying a one-second-old refinement pass competes with it, and
+   spends bandwidth on content the scheduler may have moved past. Coverage
+   NACKs plus re-enqueue at current priority is the recovery path that
+   respects the queue; the RTO is a third mechanism racing the other two.
