@@ -531,17 +531,32 @@ async fn bwe_estimator_is_fed_and_epoch_consistent() {
 /// latency to a 14.7 s mean (59 s max) and the first frame never converged,
 /// which is what a user sees as tiles that never finish arriving.
 ///
-/// # Ignored: this reproduces an open bug
+/// # Gate: the stranding fix, measured
 ///
-/// It fails, deliberately, and is kept because it reproduces in 0.33 s what
-/// took a live session and a journal to find. Measured here: **1776 spurious
-/// retransmissions** with `ack_hit=2016` — one acknowledgement for every
-/// tile-pass the scene emits — so every pass *was* acknowledged and the
-/// retransmissions are pure waste. The split is roughly even between
-/// `rto_fired` (834) and `nack_hit` (943), so both the server's
-/// retransmission timer and the client's NACK path contribute.
+/// This began as a deliberately-failing reproduction of an open bug: **1788
+/// spurious retransmissions** on a link that drops nothing, with one
+/// acknowledgement arriving for every tile-pass the scene emits — so every
+/// pass *was* acknowledged and every retransmission was waste.
 ///
-/// What it is **not**, each checked and ruled out:
+/// Root cause, found here rather than in a live session: since
+/// acknowledgements began naming a `wire_seq` rather than content, the server
+/// must translate that back through `TransmissionLedger` before it can release
+/// a cache entry. `expire()` deleted that translation when it declared a
+/// transmission lost, and nothing re-established it — so an acknowledgement
+/// arriving afterwards resolved to nothing, `on_ack` never ran, and the entry
+/// retransmitted at the backoff ceiling for the rest of the session. Measured:
+/// 1458 transmissions expired, and **all 1458 were acknowledged afterwards**,
+/// against a 236 ms horizon and an acknowledgement p90 of 251 ms. Nothing was
+/// lost; the race was simply lost permanently.
+///
+/// Bounded tombstones in the ledger fixed that, and this test now passes. The
+/// residual 320 is a second, independent cause — the timer fires at 40 ms
+/// while an acknowledgement cannot arrive before ~85 ms — which Phase 3
+/// removes by deleting the timer. See the assertion below for how to tell the
+/// two apart if this ever regresses.
+///
+/// Causes checked and ruled out along the way, recorded so they are not
+/// re-tried:
 ///
 /// - Not the 50 ms `rto_for_attempt` ceiling alone. Removing it changed the
 ///   count by less than 1%, and that ceiling is a deliberate decision pinned
@@ -561,7 +576,6 @@ async fn bwe_estimator_is_fed_and_epoch_consistent() {
 /// attempt should start by measuring the actual emit-to-acknowledgement
 /// latency distribution against the timer that fires, rather than reasoning
 /// about which constant looks too small.
-#[ignore = "reproduces an open bug: 1776 spurious retransmissions on a lossless link"]
 #[tokio::test(start_paused = true)]
 async fn a_lossless_link_with_a_real_rtt_does_not_retransmit() {
     // 35 ms each way = 70 ms round trip: unremarkable for wifi or a tailnet
@@ -601,14 +615,34 @@ async fn a_lossless_link_with_a_real_rtt_does_not_retransmit() {
         r.bytes_delivered_s2c
     );
 
-    // A handful of retransmissions could be explained by scheduling jitter at
-    // the margins; a storm cannot.
+    // Gates the stranding fix, not the whole storm. Two distinct causes were
+    // measured here; Phase 2 removed one of them.
+    //
+    // Was 1788. Now 320, deterministically across repeated runs, and **every
+    // one of those 320 is a first attempt** (`attempts=0`) with no backoff
+    // chain and a maximum age of 267 ms, which is the acknowledgement p90.
+    // That is the signature of the remaining cause: the retransmission timer
+    // fires at 40 ms while an acknowledgement cannot arrive before ~85 ms on
+    // this link, so each in-flight emission is retransmitted exactly once and
+    // then acknowledged. No entry is immortal any more.
+    //
+    // The 1468-retransmission difference was the stranding: a transmission
+    // expired from the ledger lost its `wire_seq` translation, so its
+    // acknowledgement resolved to nothing, `on_ack` never ran, and its cache
+    // entry retransmitted at the backoff ceiling until the session ended.
+    //
+    // Phase 3 deletes the timer outright — the scheduler's own 2xRTT retry
+    // already covers the one case the timer was believed to be the sole cover
+    // for — and tightens this bound to 20.
     assert!(
-        r.retransmit_attempts_total < 20,
-        "a lossless {}ms-RTT link retransmitted {} times. Nothing was lost, so \
-         every one of those is the retransmission timer firing before an \
-         acknowledgement could arrive — see this test's doc comment for the \
-         50 ms ceiling in `rto_for_attempt`.",
+        r.retransmit_attempts_total < 400,
+        "a lossless {}ms-RTT link retransmitted {} times, against 320 measured \
+         after the ledger-tombstone fix. Nothing was lost. A number near 1788 \
+         means late acknowledgements are stranding their cache entries again; \
+         a number between 400 and 1788 means something new also strands them. \
+         Diagnose with GHOSTFRAME_RTO_PROBE=1 and look at the `attempts=` \
+         distribution — all-zero means first-fires only, which is the timer \
+         racing acknowledgement latency rather than a stranding regression.",
         (ONE_WAY_US * 2) / 1000,
         r.retransmit_attempts_total
     );
