@@ -55,6 +55,21 @@ phase's diff confined to one file plus two additions.
 
 ## Task 1: `DropPlan` type
 
+> **Corrected after review (2026-09-18).** The four tests prescribed below were
+> partly vacuous and were replaced during execution. Mutation testing found three
+> surviving mutants: deleting the tile-flag check, honouring only
+> `occurrences.first()`, and an off-by-one in `MIN_TILE_LEN` each left the suite
+> green. The root cause was that both payloads in `ignores_non_tile_datagrams`
+> were shorter than `MIN_TILE_LEN`, so they exited at the length guard before the
+> flag guard was ever evaluated — the test asserted a property it never reached.
+> The committed implementation also imports `is_tile_datagram` and
+> `DATAGRAM_HEADER_SIZE` from `ghostframe-protocol` instead of re-declaring the
+> wire constants (per the convention `netsim/pump.rs` states), drops `Clone` from
+> `DropPlan` because the occurrence counters are live state, and adds `drops()`
+> so a scene can assert its injected drop actually fired. **The committed file is
+> the source of truth for this task, not the code below.**
+
+
 A `DropPlan` names datagrams to drop by their tile-pass identity and occurrence count, so a test can say "drop the first transmission of tile (2,3) pass 0" and get exactly that, every run.
 
 Tile datagrams carry a known layout: byte 0 has `TILE_DATAGRAM_FLAG` (0x80) set, `tile_x` is at byte 16, `tile_y` at byte 17, and `TileHeader.codec` at byte 18 as `(codec << 1) | lz4`. The pass index is not in a fixed byte across codecs, so `DropPlan` matches on tile coordinates only — which is sufficient for the cases this plan needs and avoids depending on per-codec layout.
@@ -356,6 +371,18 @@ async fn a_solid_tile_whose_only_datagram_is_dropped_is_still_repaired() {
         grid_rows: 4,
     };
     let result = run_browserless(scene).await.expect("scene ran");
+
+    // Premise check: the injected drop must actually have fired. The profile
+    // is lossless, so every dropped byte is ours. Without this the test
+    // passes when the drop silently never matched -- which is the failure
+    // mode this whole plan exists to avoid, and which review caught in
+    // Task 1's own tests.
+    assert!(
+        result.bytes_dropped > 0,
+        "no datagram was dropped, so this test never created the case it \
+         claims to test -- check the DropRule's tile coordinates against what \
+         the scene actually emits"
+    );
 
     // Control: the undropped tile proves the scene worked at all.
     assert!(
