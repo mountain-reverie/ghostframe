@@ -148,12 +148,33 @@ impl ReliableTileEmitter {
         self.rto
             .schedule(key, now + rto_for_attempt(self.smoothed_rtt, 0));
         // Feed group builder; on K-th source build & schedule parity envelope.
-        if let Some(result) = self.group.add(wire_seq, &bytes) {
+        self.feed_group(wire_seq, &bytes);
+        // Enqueue the source itself.
+        self.queue.push_source(bytes);
+        self.stats.source_emitted += 1;
+    }
+
+    /// Feed one freshly on-the-wire source datagram into the FEC group
+    /// builder and, when it completes a group, build the parity envelope
+    /// and hand it to the emission queue.
+    ///
+    /// Every site that allocates a `wire_seq` for a source transmission —
+    /// `submit_one`, `tick`'s RTO retransmit, and `on_nack` — must route
+    /// through here rather than each building its own envelope. The
+    /// decoder reconstructs a group's membership as a contiguous run of
+    /// `k` wire_seqs starting at `group_first_wire_seq`, so if any
+    /// allocated `wire_seq` skipped the group builder (which is exactly
+    /// the bug this helper fixes: `tick` and `on_nack` used to allocate
+    /// `wire_seq`s that never joined a group), the decoder would treat a
+    /// `wire_seq` that was never a source as a missing one and fabricate
+    /// a datagram that was never sent.
+    fn feed_group(&mut self, wire_seq: u32, bytes: &[u8]) {
+        if let Some(result) = self.group.add(wire_seq, bytes) {
             let envelope = TileParityEnvelope {
                 group_first_wire_seq: result.group_first_wire_seq,
                 k: result.k,
                 parity_idx: 0,
-                group_first_payload_len: result.first_len,
+                source_lens: result.source_lens,
                 parity_payload: result.parity,
             };
             let mut env_bytes = Vec::new();
@@ -163,9 +184,6 @@ impl ReliableTileEmitter {
                 .wrapping_add(PARITY_INTERLEAVE_OFFSET);
             self.queue.schedule_parity(emit_after, env_bytes);
         }
-        // Enqueue the source itself.
-        self.queue.push_source(bytes);
-        self.stats.source_emitted += 1;
     }
 
     pub fn submit_batch(
@@ -321,6 +339,14 @@ impl ReliableTileEmitter {
                     wire_bytes: bytes.len(),
                     key,
                 });
+                // A retransmit allocates its own `wire_seq` above; it must
+                // join the FEC group exactly as a first transmission does
+                // (see `feed_group`'s doc comment), or the group builder's
+                // membership range no longer matches what was actually put
+                // on the wire.
+                if bytes.len() >= 12 {
+                    self.feed_group(ws, &bytes);
+                }
                 self.queue.push_source(bytes);
             }
             self.rto.schedule(key, now + new_rto);
@@ -407,9 +433,16 @@ impl ReliableTileEmitter {
             entry.attempts += 1;
             entry.last_sent_at = now;
             entry.probe = None;
-            // Release the entry borrow before touching self.queue / self.stats.
+            // Release the entry borrow before touching self.queue / self.stats
+            // / self.group (feed_group takes &mut self).
             let _ = entry;
             self.transmissions.push(emitted);
+            // A NACK retransmit allocates its own `wire_seq` above; it must
+            // join the FEC group exactly as a first transmission does (see
+            // `feed_group`'s doc comment).
+            if bytes.len() >= 12 {
+                self.feed_group(ws, &bytes);
+            }
             self.queue.push_source(bytes);
             self.stats.nack_hit += 1;
             self.stats.retransmit_attempts_total += 1;
@@ -944,15 +977,20 @@ mod tests {
             "first tick must fire exactly the budget"
         );
         // Counted from `rto_fired` above rather than `sink.len()`: since a
-        // retransmission allocates its own `wire_seq`, the allocator advances
-        // faster, which promotes a pending parity datagram into the same
-        // drain. Drained-datagram count is therefore no longer a proxy for
-        // retransmits fired — it includes whatever parity came due — so this
-        // asserts the budget was respected and that nothing beyond the
-        // retransmits plus at most the promoted parity reached the wire.
-        assert!(
-            (64..=65).contains(&sink.len()),
-            "64 retransmits plus at most one promoted parity, got {}",
+        // retransmission allocates its own `wire_seq`, and (as of the fix
+        // that feeds every allocated `wire_seq` into the FEC group builder)
+        // that `wire_seq` is now a genuine group member, 64 contiguous
+        // retransmit wire_seqs complete floor(64/10) = 6 new groups, each
+        // scheduling a parity envelope. Those newly-scheduled parities —
+        // plus whichever single not-yet-promoted parity was left over from
+        // the initial 1000 submissions — become promotable in this same
+        // drain because the allocator's `next` value has advanced past
+        // their `emit_after` threshold. So the drain sees 64 retransmitted
+        // sources plus 6 parities: 70.
+        assert_eq!(
+            sink.len(),
+            70,
+            "64 retransmits + 6 newly-completed FEC groups' parities, got {}",
             sink.len()
         );
 
@@ -966,7 +1004,13 @@ mod tests {
             64,
             "second tick fires another batch"
         );
-        assert!((64..=65).contains(&sink.len()), "got {}", sink.len());
+        // Same shape as the first batch: the group builder carries a
+        // 4-source remainder from the first batch (64 is not a multiple of
+        // the group size 10), so this batch again completes 6 full groups
+        // (using that remainder plus 56 of its own 64) whose parities are
+        // promoted alongside the one left pending from the first batch's
+        // drain.
+        assert_eq!(sink.len(), 70, "got {}", sink.len());
 
         // After many ticks at budget=64, all 1000 entries should be popped
         // (each pop reschedules its RTO into the future, so subsequent ticks
