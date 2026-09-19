@@ -2759,22 +2759,33 @@ impl IoBridge {
                     crate::transport::reliable_emitter::EmitKey,
                     crate::transport::transmission_ledger::Transmission,
                     u16,
+                    bool, // late: already reported lost, so no timing sample
                 )> = batch
                     .entries
                     .iter()
                     .filter_map(|e| {
-                        let r = self
-                            .transmission_ledger
-                            .resolve(e.wire_seq)
-                            .map(|tx| (tx.key, tx, e.arrival_time_ms_lo16));
+                        use crate::transport::transmission_ledger::Resolution;
+                        let r = match self.transmission_ledger.resolve(e.wire_seq) {
+                            Some(Resolution::Live(tx)) => {
+                                Some((tx.key, tx, e.arrival_time_ms_lo16, false))
+                            }
+                            Some(Resolution::Late(tx)) => {
+                                Some((tx.key, tx, e.arrival_time_ms_lo16, true))
+                            }
+                            None => None,
+                        };
                         if r.is_none() && crate::transport::reliable_emitter::rto_probe_enabled() {
                             eprintln!("RTOPROBE resolve_miss ws={}", e.wire_seq);
                         }
                         r
                     })
                     .collect();
+                // Both Live and Late resolutions release their content --
+                // that release is the entire point of this phase, since
+                // nothing else ever clears a cache entry acknowledged after
+                // its transmission was declared lost.
                 let emit_keys: Vec<crate::transport::reliable_emitter::EmitKey> =
-                    resolved.iter().map(|(k, _, _)| *k).collect();
+                    resolved.iter().map(|(k, _, _, _)| *k).collect();
                 // Samples come from the ledger record, not the cache entry.
                 // `Transmission::emit_us` is the stamp *this* datagram
                 // carried, so a retransmission no longer borrows the send time
@@ -2789,7 +2800,7 @@ impl IoBridge {
                 // latency, measured on the same clock the RTO deadline uses.
                 if crate::transport::reliable_emitter::rto_probe_enabled() {
                     let ack_us = self.reliable_emitter.emit_us(now_for_samples) as i64;
-                    for (k, tx, _) in resolved.iter() {
+                    for (k, tx, _, _) in resolved.iter() {
                         let codec = self
                             .reliable_emitter
                             .cache
@@ -2806,7 +2817,12 @@ impl IoBridge {
                         );
                     }
                 }
-                for (emit_key, tx, arrival_lo16) in resolved.iter() {
+                for (emit_key, tx, arrival_lo16, late) in resolved.iter() {
+                    if *late {
+                        // Already counted as a loss when it expired. Feeding
+                        // its timing now would report the same bytes twice.
+                        continue;
+                    }
                     if self.bwe_samples_buffer.len() >= BWE_SAMPLES_BUFFER_CAPACITY {
                         break;
                     }
@@ -2836,7 +2852,7 @@ impl IoBridge {
                     });
                 }
                 self.reliable_emitter.on_ack(&emit_keys);
-                for (emit_key, _, _) in resolved.iter() {
+                for (emit_key, _, _, _) in resolved.iter() {
                     // Key matches how coverage is recorded at emit time:
                     // (frame_seq, tile_x, tile_y, pass_idx), recovered from
                     // the ledger since the entry named a transmission.
