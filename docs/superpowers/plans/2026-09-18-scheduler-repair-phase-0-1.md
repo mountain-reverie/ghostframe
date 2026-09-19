@@ -53,6 +53,57 @@ phase's diff confined to one file plus two additions.
 
 # Phase 0 — deterministic drop injection
 
+> ## CORRECTION (2026-09-18, after Task 2 review): the wiring point was wrong
+>
+> Tasks 1 and 2 hooked `DropPlan` into `rule()` in the browserless harness,
+> which operates on **UDP payloads — QUIC packets**. Application tile datagrams
+> ride inside QUIC DATAGRAM frames, encrypted. Reading byte 0 for
+> `TILE_DATAGRAM_FLAG` and bytes 16/17 for tile coordinates is meaningless at
+> that layer.
+>
+> Measured on `a_single_solid_tile_arrives_on_a_perfect_link`, a scene that
+> does deliver a real tile: 20 server-to-client packets, and
+> `is_tile_datagram` fires **exactly once** — on packet #1, `byte0=0xc3`,
+> len 1200, the QUIC Initial. Every packet that could carry the tile is
+> short-header, so bit 7 of byte 0 is the unprotected form bit and is always
+> `0`.
+>
+> Two consequences:
+> - **It can never drop a tile.** Structurally inert for its stated purpose.
+> - **It can drop the handshake.** Long-header packets have bit 7 set, so a
+>   rule whose coordinates happen to match the Initial's bytes 16/17 would eat
+>   it *and report `drops() == [1]`* — manufacturing the very "the drop fired,
+>   so my premise is real" signal, by destroying the connection.
+>
+> This is the failure mode this plan exists to prevent, produced by the plan
+> itself. It survived two review stages because `drop_plan.rs`'s unit tests
+> feed it synthetic tile datagrams built by hand, and no scene set a non-empty
+> plan — so nothing exercised it against what the harness actually hands it.
+>
+> **Corrected design.** The only server-side plaintext seam is
+> `IoBridge::send_to_all_sessions` (`ghostframe-lib/src/transport/io_bridge.rs:1513`),
+> which takes the application datagram pre-encryption and *already* hosts this
+> exact kind of hook for `outbound_loss`. `ghostframe-e2e` already enables
+> `test-loss-injection` and `browserless-harness`, so the seam is reachable.
+>
+> `LossInjector` cannot be reused: its `DropPredicate` is
+> `fn(&[u8]) -> bool` — stateless by type, so it cannot express "the Nth
+> occurrence". `DropPlan` therefore moves to
+> `ghostframe-lib/src/transport/drop_plan.rs`, beside `loss_injection.rs`,
+> behind the same feature gates, held as `Option<Arc<Mutex<DropPlan>>>` so its
+> counters survive `bridge` being moved into the spawned task — the same
+> shared-cell pattern the harness already uses for `bwe_cell` and
+> `emitter_stats_cell`.
+>
+> The `DropPlan` **type** is unchanged and its seven tests port verbatim. What
+> changes is where it lives and where it is consulted. Task 2's
+> `rule()` parameter, the `dir == Direction::S2c` gate, both call-site edits
+> and the `&mut BrowserlessScene` widening are all reverted.
+>
+> **Superseding tasks: 2R (relocate + rehook) and 3 (unchanged in intent).**
+> The task text below is retained as the record of what was tried.
+
+
 ## Task 1: `DropPlan` type
 
 > **Corrected after review (2026-09-18).** The four tests prescribed below were
