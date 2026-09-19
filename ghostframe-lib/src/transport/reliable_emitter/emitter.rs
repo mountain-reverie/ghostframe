@@ -225,6 +225,25 @@ impl ReliableTileEmitter {
                 // Already ACKed or cancelled — stale heap entry; skip silently.
                 continue;
             };
+            // [RTO-PROBE] temporary instrumentation: how old was this entry
+            // when its timer fired, and what deadline was it given?
+            if crate::transport::reliable_emitter::rto_probe_enabled() {
+                let probe_codec = entry
+                    .fragments
+                    .first()
+                    .and_then(|f| f.get(18).copied())
+                    .map(|b| b >> 1)
+                    .unwrap_or(255);
+                eprintln!(
+                    "RTOPROBE fire codec={} pass={} age_since_first_us={} age_since_last_us={} attempts={} rto_us={}",
+                    probe_codec,
+                    key.pass_idx,
+                    now.saturating_duration_since(entry.first_sent_at).as_micros(),
+                    now.saturating_duration_since(entry.last_sent_at).as_micros(),
+                    entry.attempts,
+                    rto_for_attempt(self.smoothed_rtt, entry.attempts).as_micros(),
+                );
+            }
             // Bump attempts, re-enqueue every cached fragment, reschedule RTO.
             entry.attempts += 1;
             entry.last_sent_at = now;
@@ -424,7 +443,7 @@ impl ReliableTileEmitter {
     /// `Instant::now()` in unit tests that don't care about virtual time.
     /// `duration_since` saturates to zero rather than panicking if `now`
     /// somehow precedes `time_base`.
-    fn emit_us(&self, now: Instant) -> u32 {
+    pub(crate) fn emit_us(&self, now: Instant) -> u32 {
         now.duration_since(self.time_base).as_micros() as u32
     }
 
