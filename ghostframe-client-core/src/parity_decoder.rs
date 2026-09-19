@@ -202,6 +202,54 @@ mod tests {
         }
     }
 
+    /// Sources in a group are not all the same length -- a real tile
+    /// datagram's size depends on its payload -- and recovery must return the
+    /// missing source's *exact bytes*, not a zero-padded version of them.
+    ///
+    /// `xor_payloads` left-pads shorter sources, so the XOR result for a
+    /// short missing source carries leading zeros. Every other test in this
+    /// file builds its group from the fixed 8-byte `src()` helper, so the
+    /// padding is always zero and this path was never exercised.
+    #[ignore = "reproduces an open bug: FEC recovery returns a left-padded buffer"]
+    #[test]
+    fn recovery_restores_the_exact_bytes_of_a_short_source() {
+        // Group of 3: a long one, the short one we will drop, another long.
+        let long_a: Vec<u8> = (0..20u8).collect();
+        let short: Vec<u8> = vec![0xAA, 0xBB, 0xCC, 0xDD];
+        let long_b: Vec<u8> = (100..120u8).collect();
+
+        let max_len = 20;
+        let mut parity = vec![0u8; max_len];
+        for srcbuf in [&long_a, &short, &long_b] {
+            xor_into(&mut parity, srcbuf);
+        }
+        let env = TileParityEnvelope {
+            group_first_wire_seq: 0,
+            k: 3,
+            parity_idx: 0,
+            group_first_payload_len: long_a.len() as u16,
+            parity_payload: parity,
+        };
+
+        let mut d = ParityDecoder::new(64);
+        d.record_source(0, &long_a);
+        d.record_source(2, &long_b);
+        // wire_seq 1 (the short source) never arrives.
+        let recovered = d
+            .receive_parity(&env)
+            .expect("one missing source of three is recoverable");
+
+        assert_eq!(
+            recovered,
+            short,
+            "recovery returned {} bytes for a {}-byte source -- the XOR \
+             left-pads, so a short source comes back with leading zeros and \
+             every downstream parser reads the wrong offsets",
+            recovered.len(),
+            short.len()
+        );
+    }
+
     #[test]
     fn a_pending_parity_whose_group_has_aged_out_is_pruned() {
         let cap = 8;
