@@ -240,9 +240,10 @@
 #define TILE_PARITY_ENVELOPE 4
 
 /**
- * Size of the fixed-length header preceding `parity_payload`.
+ * Size of the fixed-length part of the header, preceding the `source_lens`
+ * table and `parity_payload`.
  */
-#define TILE_PARITY_HEADER_SIZE ((((1 + 4) + 1) + 1) + 2)
+#define TILE_PARITY_HEADER_SIZE (((1 + 4) + 1) + 1)
 
 /**
  * Envelope discriminator byte for the per-fragment NACK datagram
