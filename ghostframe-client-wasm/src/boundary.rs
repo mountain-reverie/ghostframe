@@ -355,7 +355,10 @@ pub struct WasmParityEnvelope {
     pub group_first_wire_seq: u32,
     pub k: u8,
     pub parity_idx: u8,
-    pub group_first_payload_len: u16,
+    /// Byte length of each of the group's `k` sources, in `wire_seq` order.
+    /// The decoder needs every one: the XOR left-pads to the group's longest
+    /// source, so a recovered source must be trimmed to its own length.
+    pub source_lens: Vec<u16>,
     #[serde(with = "serde_bytes")]
     pub parity_payload: Vec<u8>,
 }
@@ -366,7 +369,7 @@ impl From<&TileParityEnvelope> for WasmParityEnvelope {
             group_first_wire_seq: e.group_first_wire_seq,
             k: e.k,
             parity_idx: e.parity_idx,
-            group_first_payload_len: e.group_first_payload_len,
+            source_lens: e.source_lens.clone(),
             parity_payload: e.parity_payload.clone(),
         }
     }

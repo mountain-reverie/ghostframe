@@ -427,21 +427,26 @@ pub fn parse_parity_envelope(bytes: &[u8]) -> Result<JsValue, JsValue> {
 }
 
 /// Builds a parity envelope — the counterpart of the TS
-/// `encodeParityEnvelopeForTest`. `parity_decoder.test.ts` constructs
-/// envelopes to feed the decoder, so this is required, not a convenience.
+/// `encodeParityEnvelopeForTest`.
+///
+/// Note: the TS parity branch and its `parity_decoder.test.ts` were removed
+/// when recovery moved inside `WasmClientCore::handle_datagram`, and nothing
+/// in the web client calls this or `parseParityEnvelope` any more. Both are
+/// kept for now because deleting a `wasm_bindgen` export is a wider change
+/// than this one; they are candidates for removal.
 #[wasm_bindgen(js_name = encodeParityEnvelope)]
 pub fn encode_parity_envelope(
     group_first_wire_seq: u32,
     k: u8,
     parity_idx: u8,
-    group_first_payload_len: u16,
+    source_lens: &[u16],
     parity_payload: &[u8],
 ) -> Vec<u8> {
     let env = TileParityEnvelope {
         group_first_wire_seq,
         k,
         parity_idx,
-        group_first_payload_len,
+        source_lens: source_lens.to_vec(),
         parity_payload: parity_payload.to_vec(),
     };
     let mut out = Vec::new();
