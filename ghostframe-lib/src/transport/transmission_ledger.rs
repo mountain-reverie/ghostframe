@@ -29,6 +29,23 @@ pub struct Transmission {
     pub key: EmitKey,
 }
 
+/// What an acknowledgement turned out to refer to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resolution {
+    /// Outstanding when the acknowledgement arrived — the normal case.
+    Live(Transmission),
+    /// Already expired and reported to the estimator as lost, but
+    /// acknowledged after all.
+    ///
+    /// The content still has to be released, or its cache entry is stranded
+    /// forever: nothing else ever clears it, and it retransmits at the
+    /// backoff ceiling for the rest of the session. The timing, however, must
+    /// **not** be fed to the estimator — that transmission has already been
+    /// accounted for as a loss, and counting it again would report the same
+    /// bytes twice.
+    Late(Transmission),
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LedgerStats {
     /// Acknowledgements naming a `wire_seq` this ledger has no record of.
@@ -42,6 +59,11 @@ pub struct LedgerStats {
     /// bound the ledger instead of time — the loss ratio is under-reported
     /// while this is rising.
     pub capacity_evictions: u64,
+    /// Acknowledgements that arrived after their transmission had been
+    /// declared lost. A healthy link reads near zero; on the lossless 70 ms
+    /// reproduction this read 1458 per 8-second scene, every one of which
+    /// stranded a cache entry.
+    pub acked_after_declared_lost: u64,
 }
 
 pub struct TransmissionLedger {
@@ -51,6 +73,11 @@ pub struct TransmissionLedger {
     order: VecDeque<u32>,
     capacity: usize,
     stats: LedgerStats,
+    /// `wire_seq -> Transmission` for expired records, retained so a late
+    /// acknowledgement can still release its content. Bounded by the same
+    /// capacity as `records`; oldest evicted first.
+    tombstones: HashMap<u32, Transmission>,
+    tombstone_order: VecDeque<u32>,
 }
 
 impl TransmissionLedger {
@@ -60,11 +87,17 @@ impl TransmissionLedger {
             order: VecDeque::new(),
             capacity,
             stats: LedgerStats::default(),
+            tombstones: HashMap::new(),
+            tombstone_order: VecDeque::new(),
         }
     }
 
     pub fn stats(&self) -> LedgerStats {
         self.stats
+    }
+
+    pub fn tombstone_len(&self) -> usize {
+        self.tombstones.len()
     }
 
     pub fn len(&self) -> usize {
@@ -101,19 +134,23 @@ impl TransmissionLedger {
     }
 
     /// Classify a transmission as received. Returns `None` if it is not
-    /// outstanding — already resolved, or already expired as lost.
+    /// outstanding and has no tombstone — already resolved, or the
+    /// acknowledgement is unknown to this ledger entirely.
     ///
     /// Not retracting an expiry is deliberate: goog_cc has no retraction, and
     /// an acknowledgement arriving after the horizon is genuinely a late
-    /// arrival rather than evidence the loss report was wrong.
-    pub fn resolve(&mut self, wire_seq: u32) -> Option<Transmission> {
-        match self.records.remove(&wire_seq) {
-            Some((_, tx)) => Some(tx),
-            None => {
-                self.stats.unknown_acks += 1;
-                None
-            }
+    /// arrival rather than evidence the loss report was wrong. The tombstone
+    /// still lets the content be released — see `Resolution::Late`.
+    pub fn resolve(&mut self, wire_seq: u32) -> Option<Resolution> {
+        if let Some((_, tx)) = self.records.remove(&wire_seq) {
+            return Some(Resolution::Live(tx));
         }
+        if let Some(tx) = self.tombstones.remove(&wire_seq) {
+            self.stats.acked_after_declared_lost += 1;
+            return Some(Resolution::Late(tx));
+        }
+        self.stats.unknown_acks += 1;
+        None
     }
 
     /// Classify everything outstanding longer than `horizon` as lost.
@@ -135,6 +172,15 @@ impl TransmissionLedger {
                     if let Some((_, tx)) = self.records.remove(&front) {
                         if crate::transport::reliable_emitter::rto_probe_enabled() {
                             eprintln!("RTOPROBE expired_ws ws={}", front);
+                        }
+                        self.tombstones.insert(front, tx.clone());
+                        self.tombstone_order.push_back(front);
+                        while self.tombstones.len() > self.capacity {
+                            if let Some(oldest) = self.tombstone_order.pop_front() {
+                                self.tombstones.remove(&oldest);
+                            } else {
+                                break;
+                            }
                         }
                         lost.push(tx);
                     }
@@ -299,6 +345,72 @@ mod tests {
             );
             proptest::prop_assert_eq!(classified.len(), next_ws as usize);
         }
+    }
+
+    #[test]
+    fn a_late_acknowledgement_still_resolves_after_expiry() {
+        let t0 = Instant::now();
+        let mut l = TransmissionLedger::new(64);
+        let key = EmitKey::new(7, 1, 2, 0);
+        l.record(99, t0, Transmission { emit_us: 10, wire_bytes: 500, key });
+
+        let lost = l.expire(t0 + Duration::from_millis(300), Duration::from_millis(100));
+        assert_eq!(lost.len(), 1, "the transmission is declared lost");
+
+        match l.resolve(99) {
+            Some(Resolution::Late(tx)) => assert_eq!(tx.key, key),
+            other => panic!("a late ack must still resolve to its content, got {other:?}"),
+        }
+        assert_eq!(l.stats().acked_after_declared_lost, 1);
+    }
+
+    #[test]
+    fn a_live_acknowledgement_resolves_as_live() {
+        let t0 = Instant::now();
+        let mut l = TransmissionLedger::new(64);
+        let key = EmitKey::new(7, 1, 2, 0);
+        l.record(99, t0, Transmission { emit_us: 10, wire_bytes: 500, key });
+        match l.resolve(99) {
+            Some(Resolution::Live(tx)) => assert_eq!(tx.key, key),
+            other => panic!("expected Live, got {other:?}"),
+        }
+        assert_eq!(l.stats().acked_after_declared_lost, 0);
+    }
+
+    #[test]
+    fn a_tombstone_resolves_only_once() {
+        let t0 = Instant::now();
+        let mut l = TransmissionLedger::new(64);
+        l.record(99, t0, Transmission { emit_us: 10, wire_bytes: 500, key: EmitKey::new(7, 1, 2, 0) });
+        let _ = l.expire(t0 + Duration::from_millis(300), Duration::from_millis(100));
+        assert!(matches!(l.resolve(99), Some(Resolution::Late(_))));
+        assert!(l.resolve(99).is_none(), "a duplicate ack must not resolve twice");
+        assert_eq!(l.stats().acked_after_declared_lost, 1, "and must not double-count");
+    }
+
+    #[test]
+    fn tombstones_are_bounded() {
+        let t0 = Instant::now();
+        let mut l = TransmissionLedger::new(8);
+        for ws in 0..40u32 {
+            l.record(ws, t0, Transmission { emit_us: 0, wire_bytes: 1, key: EmitKey::new(ws, 0, 0, 0) });
+            let _ = l.expire(t0 + Duration::from_millis(300), Duration::from_millis(100));
+        }
+        assert!(
+            l.tombstone_len() <= 8,
+            "tombstones must be bounded by capacity; got {}",
+            l.tombstone_len()
+        );
+        // The most recent expiry must still be resolvable -- eviction drops
+        // the oldest, which is the one least likely to still be in flight.
+        assert!(matches!(l.resolve(39), Some(Resolution::Late(_))));
+    }
+
+    #[test]
+    fn an_unknown_wire_seq_still_resolves_to_nothing() {
+        let mut l = TransmissionLedger::new(8);
+        assert!(l.resolve(12345).is_none());
+        assert_eq!(l.stats().unknown_acks, 1);
     }
 
     #[test]
