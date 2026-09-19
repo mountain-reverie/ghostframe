@@ -6667,6 +6667,14 @@ mod tests {
         let server = QuicServer::new().expect("server");
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
         let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+        // The test bridge is constructed with `Scheduler::new(0, 0)`; production
+        // resizes in lockstep with the dirty-detection grid (io_bridge.rs:1910)
+        // before any tile can be acknowledged. `SlotMap` is dense, so a tile
+        // outside the grid has no slot to record into — size the grid first.
+        bridge.scheduler.resize(8, 10);
+        // An acknowledgement only writes the mask of the tile's *live*
+        // generation, and the coverage entry below names generation 1.
+        bridge.scheduler.bump_generation(7, 9);
         // Record coverage as if the server had just emitted a Cdf53 pass.
         let cov: crate::transport::fragment_coverage::CoverageList =
             smallvec::smallvec![crate::transport::fragment_coverage::FragmentCoverage {
