@@ -218,11 +218,23 @@ header already describes.
 
 Carried deliberately into implementation rather than assumed away.
 
-1. **The scheduler's existing 2xRTT retry has never been observed firing
-   end-to-end** — only its unit test (`"InFlight work should retry after
-   2xRTT"`). Every scene measured showed zero retries, consistent with
-   nothing being lost, but not positive evidence. The design leans on that
-   path being real; verify it before deleting the emitter's timer.
+1. **Resolved.** `a_solid_tile_whose_only_datagram_is_dropped_is_still_repaired`
+   (`ghostframe-e2e/tests/browserless_runner.rs`) drops the sole datagram of
+   a Solid tile before it reaches the netsim (`drops_fired=[1]`,
+   `bytes_dropped=0`, confirming the premise held), leaving the client with
+   no assembly and no coverage entry for that tile — no NACK is possible.
+   The tile still rendered. Re-run under `GHOSTFRAME_NO_RTO=1` (emitter RTO
+   timer disabled, cache and NACK path untouched) also passed, and
+   `GHOSTFRAME_RTO_PROBE=1` confirmed no `RTOPROBE fire` line was emitted in
+   that run — the emitter's RTO timer never fired, yet the tile was still
+   repaired. FEC parity is independently ruled out for this scene: the
+   group builder only emits a parity envelope on the K=10th source
+   (`FEC_GROUP_SIZE_K`), and this scene emits only 2 sources total, so no
+   parity envelope was ever built. That leaves the scheduler's own 2xRTT
+   `InFlight` retry in `drain_priority_queue` as the only mechanism left
+   standing, exactly the path the design leans on. **Confirmed positive**:
+   the scheduler's 2xRTT retry is real end-to-end, independent of the
+   emitter's RTO timer, and Phase 3 can delete that timer as planned.
 2. **ACK latency of p50 145 ms against an RTT-plus-batching floor of 75 ms is
    unexplained.** Every threshold here is sized on that distribution. If the
    tail is a harness artifact of the paused clock, the structure still holds

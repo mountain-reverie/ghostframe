@@ -16,7 +16,7 @@ use ghostframe_e2e::harness::browserless::{
 };
 use ghostframe_e2e::harness::load_profile::{Churn, LoadProfile, PRODUCTION_CADENCE_US};
 use ghostframe_e2e::harness::scene_tiles::TileSpec;
-use ghostframe_e2e::netsim::{Bottleneck, CapTimeline, NetProfile};
+use ghostframe_e2e::netsim::{Bottleneck, CapTimeline, DropPlan, DropRule, NetProfile};
 
 #[tokio::test(start_paused = true)]
 async fn the_session_establishes_over_the_socketpair() {
@@ -1598,4 +1598,81 @@ async fn the_estimate_follows_a_mid_scene_capacity_step_up() {
             median(tail.clone())
         ),
     }
+}
+
+/// The case no receiver-driven mechanism can cover: a tile emitted exactly
+/// once, whose only datagram is dropped. The client builds no assembly and
+/// no coverage entry, so it cannot NACK — it does not know the tile exists.
+///
+/// Only a sender-side repair can render this tile. That makes this test the
+/// direct evidence for whether `drain_priority_queue`'s 2xRTT `InFlight`
+/// retry actually fires end-to-end, which had never been observed when the
+/// repair redesign was specified.
+#[tokio::test(start_paused = true)]
+async fn a_solid_tile_whose_only_datagram_is_dropped_is_still_repaired() {
+    let scene = BrowserlessScene {
+        seed: 0x0D30_0001,
+        load: SceneLoad::Script(vec![FrameScript {
+            tiles: vec![
+                (
+                    (0, 0),
+                    TileSpec::Solid {
+                        bgra: [10, 20, 30, 255],
+                    },
+                ),
+                (
+                    (1, 1),
+                    TileSpec::Solid {
+                        bgra: [40, 50, 60, 255],
+                    },
+                ),
+            ],
+        }]),
+        cadence_us: DEFAULT_CADENCE_US,
+        // Lossless apart from the one deliberate drop, so anything missing
+        // is attributable to that drop alone.
+        net: NetProfile::perfect(),
+        drops: DropPlan::new(vec![DropRule {
+            tile_x: 1,
+            tile_y: 1,
+            occurrences: vec![0],
+        }]),
+        duration: Duration::from_secs(5),
+        grid_cols: 4,
+        grid_rows: 4,
+    };
+    let result = run_browserless(scene).await.expect("scene ran");
+
+    // Premise check: the injected drop must actually have fired. Without
+    // this, the test passes when the drop silently never matched -- the
+    // failure mode this whole plan exists to avoid, and the one that made an
+    // entire earlier version of this feature inert.
+    //
+    // Use `drops_fired`, NOT `bytes_dropped`. The plan is consulted in
+    // `IoBridge::send_to_all_sessions`, upstream of the netsim, so a
+    // plan-dropped datagram never reaches the simulated link and is never
+    // counted there. Measured on exactly this scene shape:
+    // `drops_fired=[1] bytes_dropped=0`.
+    assert_eq!(
+        result.drops_fired,
+        vec![1],
+        "the injected drop never fired, so this test never created the case \
+         it claims to test -- check the DropRule's coordinates against what \
+         the scene actually emits"
+    );
+
+    // Control: the undropped tile proves the scene worked at all.
+    assert!(
+        result.framebuffer.tile_rgba(0, 0).is_some(),
+        "control tile (0,0) never arrived -- the scene itself is broken, \
+         so this test proves nothing about repair"
+    );
+
+    assert!(
+        result.framebuffer.tile_rgba(1, 1).is_some(),
+        "tile (1,1) had its only datagram dropped and was never repaired. \
+         The client cannot NACK it: with nothing received it has no \
+         assembly and no coverage entry, so it does not know the tile \
+         exists. Only a sender-side repair can recover this."
+    );
 }
