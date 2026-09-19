@@ -713,6 +713,38 @@ acknowledge the wrong tile."
 
 ## Task 5: Prove the one-handle-per-(tile, pass) invariant before relying on it
 
+> **CORRECTED (2026-09-19). The invariant does NOT hold.**
+>
+> This task's step text instrumented only `enqueue_at` and
+> `enqueue_refinement_work_at`. There are **four** paths that push into the
+> queues; the two it missed — `enqueue_refinement_at` (scheduler.rs:781) and
+> `enqueue_refinement_subset_at` (:848) — are the ones the code itself calls
+> "the right entry point for the production capture path". With the assertion
+> added to those two, it **fires**:
+>
+> ```
+> panicked at scheduler.rs:793:
+> two live work items for tile (0,0) pass 0
+> ```
+>
+> It fires on a synthetic unit test, but production can reach it: the
+> stranded-tile escalation calls `enqueue_refinement_subset_at` **at the
+> existing generation with no `bump_generation`**, so nothing supersedes work
+> already queued. The guard written for exactly this case,
+> `Scheduler::refinement_queue_holds_tile` — *"the resweep skips tiles whose
+> passes are still queued — they're not stuck, just unsent"* — is **dead
+> code**, called only from its own unit test, as is
+> `cdf53_unacked_tiles_for_gen`.
+>
+> **Decision: supersede on collision, and wire up the guard.** Enqueueing a
+> `(tile, gen, pass)` that already has a live entry marks the old one
+> `Superseded` and replaces it — newer payload wins, which is what
+> supersession already means here. That keeps `Option<Handle>` and O(1)
+> lookup, and makes the structure sound regardless of caller discipline.
+> Separately, wiring the dead guard fixes the latent double-emission that
+> exists today. See **Task 5B** and the amended **Task 9**.
+
+
 `TileSlot` will hold exactly one handle per `(tile, pass)`. That is only sound if two live work items for the same tile-pass never coexist. Measure it rather than assume it — this is cheap, and assuming it would corrupt delivery state under a case nobody tested.
 
 **Files:**
@@ -770,6 +802,53 @@ suite: no caller ever enqueues two live work items for the same tile and
 pass. TileSlot can therefore hold Option<Handle> per pass rather than a
 collection. Removed the assertion; recording the evidence here."
 ```
+
+## Task 5B: Wire up the dead stranded-tile guard
+
+A production bug found while verifying Task 5's invariant, independent of the
+index refactor and worth fixing on its own.
+
+`Scheduler::refinement_queue_holds_tile` exists to stop the stranded-tile
+escalation re-sending passes that are merely *unsent* rather than lost. Its doc
+comment states that intent. It is never called. Neither is
+`cdf53_unacked_tiles_for_gen`. Both are referenced only by their own unit
+tests.
+
+Consequence today: the escalation calls `enqueue_refinement_subset_at` at the
+existing generation with no `bump_generation`, so a pass still sitting
+`Pending` in the refinement queue gets enqueued a second time and emitted
+twice — wasted bandwidth on a path whose entire purpose is recovering from
+scarcity.
+
+**Files:** `ghostframe-lib/src/transport/io_bridge.rs` (the stranded-tile
+escalation, around the `enqueue_refinement_subset_at` call at :4384).
+
+- [ ] **Step 1: Write the failing test**
+
+In `io_bridge.rs`'s test module, drive the escalation for a tile whose passes
+are still queued and assert no second enqueue happens. Assert on
+`scheduler.refinement_queue_len()` before and after: it must not grow.
+
+- [ ] **Step 2: Run it, confirm it fails** — the queue grows by the number of
+  unacked passes, because nothing consults the guard.
+
+- [ ] **Step 3: Consult the guard before re-enqueueing**
+
+Immediately before the `enqueue_refinement_subset_at` call:
+
+```rust
+// Still queued means unsent, not stranded: re-enqueueing here would
+// emit the same pass twice. `refinement_queue_holds_tile` was written
+// for this check and was never called.
+if self.scheduler.refinement_queue_holds_tile(tile_x, tile_y) {
+    continue;
+}
+```
+
+- [ ] **Step 4: Run it, confirm it passes**, and confirm the full lib suite
+  and browserless are unchanged.
+
+- [ ] **Step 5: Commit**
 
 ## Task 6: `TileSlot` — fold the ACK bitmap into the existing dense array
 
@@ -1326,10 +1405,54 @@ with:
         work.last_sent_at = None;
         work.state = WorkState::Pending;
         let (tx, ty, pass) = (work.tile_x, work.tile_y, work.pass_idx);
+        self.supersede_live_handle(tx, ty, pass);
         let h = self.work.insert(work);
         self.slots.set_handle(tx, ty, pass, Some(h));
         self.priority_order.push_back(h);
     }
+```
+
+**All four enqueue paths must call `supersede_live_handle` first** — including
+`enqueue_refinement_at` and `enqueue_refinement_subset_at`, which are the ones
+that can actually collide (see Task 5's correction). Add it to `Scheduler`:
+
+```rust
+    /// Retire any live work already occupying this `(tile, pass)` slot.
+    ///
+    /// The slot holds one handle, so a second live entry for the same
+    /// tile-pass would orphan the first — unreachable by `mark_acked` and by
+    /// supersession, so it could never leave the queue. Marking it
+    /// `Superseded` keeps it reachable and lets the next drain retain it out,
+    /// and matches what supersession already means: newer content for a
+    /// tile-pass replaces older.
+    ///
+    /// Reachable in production: the stranded-tile escalation re-enqueues at
+    /// the existing generation without a `bump_generation`, so nothing else
+    /// retires the previous entry.
+    fn supersede_live_handle(&mut self, tile_x: u8, tile_y: u8, pass_idx: u8) {
+        let Some(h) = self.slots.handle(tile_x, tile_y, pass_idx) else {
+            return;
+        };
+        if let Some(w) = self.work.get_mut(h) {
+            if matches!(w.state, WorkState::Pending | WorkState::InFlight) {
+                w.state = WorkState::Superseded;
+            }
+        }
+    }
+```
+
+**One existing test must be rewritten**: `refinement_fraction_halves_on_sustained_low_delivery`
+(`scheduler.rs:1237`) enqueues 200 copies of *the same* tile-pass to keep the
+queue deep across 10 ticks. Under supersede-on-collision only the last
+survives, so the queue drains in one tick and the halving never fires. Change
+the fixture to 200 **distinct** tiles — the test's intent (fraction halves
+under sustained low delivery) is unchanged, only the way depth is created:
+
+```rust
+        let mut sch = Scheduler::new(64, 64);
+        for i in 0..200u16 {
+            sch.enqueue_refinement((i % 64) as u8, (i / 64) as u8, 0, vec![vec![i as u8]; 14]);
+        }
 ```
 
 `enqueue_refinement_work_at` is identical except the last line:
