@@ -245,6 +245,14 @@ const CUMULATIVE_EMIT_LOG_INTERVAL_FRAMES: u32 = 60;
 // `SendDatagramError::Blocked`, the cache never drains, and the link
 // settles into a self-sustained storm (~1.4 M retransmits / 3 minutes
 // observed in production with no cap).
+//
+// Bounds *retransmissions*, not datagrams. Since every allocated `wire_seq`
+// now joins an FEC group, a full sweep of 64 contiguous retransmits completes
+// floor(64/10) = 6 groups, each scheduling a parity that the same drain may
+// promote. So a sweep can hand quinn up to ~70 datagrams, not 64. That
+// headroom is deliberate: the cap is a safety valve against a self-sustained
+// storm, not a precise shaper, and tightening it to a datagram count would
+// change what `max_retransmits` means without changing its name.
 const RTO_RETRANSMITS_PER_TICK: usize = 64;
 
 // ── BWE Stage 2.2: PacingMode ────────────────────────────────────────────
