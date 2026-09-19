@@ -2744,9 +2744,7 @@ impl IoBridge {
                             .transmission_ledger
                             .resolve(e.wire_seq)
                             .map(|tx| (tx.key, tx, e.arrival_time_ms_lo16));
-                        if r.is_none()
-                            && crate::transport::reliable_emitter::rto_probe_enabled()
-                        {
+                        if r.is_none() && crate::transport::reliable_emitter::rto_probe_enabled() {
                             eprintln!("RTOPROBE resolve_miss ws={}", e.wire_seq);
                         }
                         r
