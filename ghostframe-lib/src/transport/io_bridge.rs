@@ -2806,6 +2806,22 @@ impl IoBridge {
                 // its timing is what the estimator came for.
                 // [RTO-PROBE] temporary instrumentation: emit -> acknowledgement
                 // latency, measured on the same clock the RTO deadline uses.
+                if crate::transport::reliable_emitter::ack_order_probe_enabled() {
+                    // One line per batch, entries in arrival order. Kept
+                    // compact: a real session produces thousands. Gated
+                    // independently of the RTO probe -- these answer different
+                    // questions and are enabled separately.
+                    let seqs: Vec<String> = batch
+                        .entries
+                        .iter()
+                        .map(|e| e.wire_seq.to_string())
+                        .collect();
+                    tracing::info!(
+                        target: "ghostframe::ackorder",
+                        "ACKORDER {}",
+                        seqs.join(",")
+                    );
+                }
                 if crate::transport::reliable_emitter::rto_probe_enabled() {
                     let ack_us = self.reliable_emitter.emit_us(now_for_samples) as i64;
                     for (k, tx, _, _) in resolved.iter() {
