@@ -173,7 +173,7 @@ impl TransmissionLedger {
                         if crate::transport::reliable_emitter::rto_probe_enabled() {
                             eprintln!("RTOPROBE expired_ws ws={}", front);
                         }
-                        self.tombstones.insert(front, tx.clone());
+                        self.tombstones.insert(front, tx);
                         self.tombstone_order.push_back(front);
                         while self.tombstones.len() > self.capacity {
                             if let Some(oldest) = self.tombstone_order.pop_front() {
@@ -368,7 +368,15 @@ mod tests {
         let t0 = Instant::now();
         let mut l = TransmissionLedger::new(64);
         let key = EmitKey::new(7, 1, 2, 0);
-        l.record(99, t0, Transmission { emit_us: 10, wire_bytes: 500, key });
+        l.record(
+            99,
+            t0,
+            Transmission {
+                emit_us: 10,
+                wire_bytes: 500,
+                key,
+            },
+        );
 
         let lost = l.expire(t0 + Duration::from_millis(300), Duration::from_millis(100));
         assert_eq!(lost.len(), 1, "the transmission is declared lost");
@@ -385,7 +393,15 @@ mod tests {
         let t0 = Instant::now();
         let mut l = TransmissionLedger::new(64);
         let key = EmitKey::new(7, 1, 2, 0);
-        l.record(99, t0, Transmission { emit_us: 10, wire_bytes: 500, key });
+        l.record(
+            99,
+            t0,
+            Transmission {
+                emit_us: 10,
+                wire_bytes: 500,
+                key,
+            },
+        );
         match l.resolve(99) {
             Some(Resolution::Live(tx)) => assert_eq!(tx.key, key),
             other => panic!("expected Live, got {other:?}"),
@@ -397,11 +413,26 @@ mod tests {
     fn a_tombstone_resolves_only_once() {
         let t0 = Instant::now();
         let mut l = TransmissionLedger::new(64);
-        l.record(99, t0, Transmission { emit_us: 10, wire_bytes: 500, key: EmitKey::new(7, 1, 2, 0) });
+        l.record(
+            99,
+            t0,
+            Transmission {
+                emit_us: 10,
+                wire_bytes: 500,
+                key: EmitKey::new(7, 1, 2, 0),
+            },
+        );
         let _ = l.expire(t0 + Duration::from_millis(300), Duration::from_millis(100));
         assert!(matches!(l.resolve(99), Some(Resolution::Late(_))));
-        assert!(l.resolve(99).is_none(), "a duplicate ack must not resolve twice");
-        assert_eq!(l.stats().acked_after_declared_lost, 1, "and must not double-count");
+        assert!(
+            l.resolve(99).is_none(),
+            "a duplicate ack must not resolve twice"
+        );
+        assert_eq!(
+            l.stats().acked_after_declared_lost,
+            1,
+            "and must not double-count"
+        );
     }
 
     #[test]
@@ -409,7 +440,15 @@ mod tests {
         let t0 = Instant::now();
         let mut l = TransmissionLedger::new(8);
         for ws in 0..40u32 {
-            l.record(ws, t0, Transmission { emit_us: 0, wire_bytes: 1, key: EmitKey::new(ws, 0, 0, 0) });
+            l.record(
+                ws,
+                t0,
+                Transmission {
+                    emit_us: 0,
+                    wire_bytes: 1,
+                    key: EmitKey::new(ws, 0, 0, 0),
+                },
+            );
             let _ = l.expire(t0 + Duration::from_millis(300), Duration::from_millis(100));
         }
         assert!(
