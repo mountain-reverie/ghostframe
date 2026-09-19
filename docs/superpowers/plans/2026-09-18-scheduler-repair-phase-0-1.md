@@ -427,25 +427,21 @@ async fn a_solid_tile_whose_only_datagram_is_dropped_is_still_repaired() {
     };
     let result = run_browserless(scene).await.expect("scene ran");
 
-    // NOTE: `run_browserless` takes the scene by value, so `DropPlan::drops()`
-    // is unreachable after the run. `bytes_dropped` is the available signal,
-    // and on a lossless profile it is exact: every dropped byte is ours.
+    // Premise check: the injected drop must actually have fired. Without
+    // this, the test passes when the drop silently never matched -- the
+    // failure mode this whole plan exists to avoid, and the one that made an
+    // entire earlier version of this feature inert.
     //
-    // `NetProfile::perfect()` also sidesteps two subtleties of applying the
-    // plan after `NetSim::decide`: a plan-injected drop spends token-bucket
-    // capacity (a `loss` drop deliberately does not), and occurrence indices
-    // count only datagrams that reached a `Deliver` verdict. With no loss, no
-    // cap and no duplication, neither distinction can bite.
-
-    // Premise check: the injected drop must actually have fired. The profile
-    // is lossless, so every dropped byte is ours. Without this the test
-    // passes when the drop silently never matched -- which is the failure
-    // mode this whole plan exists to avoid, and which review caught in
-    // Task 1's own tests.
-    assert!(
-        result.bytes_dropped > 0,
-        "no datagram was dropped, so this test never created the case it \
-         claims to test -- check the DropRule's tile coordinates against what \
+    // Use `drops_fired`, NOT `bytes_dropped`. The plan is consulted in
+    // `IoBridge::send_to_all_sessions`, upstream of the netsim, so a
+    // plan-dropped datagram never reaches the simulated link and is never
+    // counted there. Measured on exactly this scene shape:
+    // `drops_fired=[1] bytes_dropped=0`.
+    assert_eq!(
+        result.drops_fired,
+        vec![1],
+        "the injected drop never fired, so this test never created the case \
+         it claims to test -- check the DropRule's coordinates against what \
          the scene actually emits"
     );
 
