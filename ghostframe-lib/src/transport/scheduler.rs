@@ -13,6 +13,10 @@ use std::time::{Duration, Instant};
 pub mod slab;
 pub use slab::{Handle, Slab};
 
+#[path = "scheduler/slots.rs"]
+pub mod slots;
+pub use slots::{SlotMap, TileSlot, PASS_SLOTS};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkState {
     Pending,
