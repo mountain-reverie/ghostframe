@@ -128,6 +128,10 @@ pub struct BrowserlessScene {
     /// carries its own and overrides this.
     pub cadence_us: u64,
     pub net: NetProfile,
+    /// Deterministic drops, applied on top of `net`'s probabilistic loss.
+    /// Server-to-client only. Empty by default, so existing scenes are
+    /// bit-identical.
+    pub drops: crate::netsim::DropPlan,
     pub duration: Duration,
     /// Grid dimensions, fixed for the whole scene.
     ///
@@ -312,7 +316,7 @@ pub async fn run_browserless(scene: BrowserlessScene) -> anyhow::Result<Browserl
     local.run_until(run_inner(scene)).await
 }
 
-async fn run_inner(scene: BrowserlessScene) -> anyhow::Result<BrowserlessResult> {
+async fn run_inner(mut scene: BrowserlessScene) -> anyhow::Result<BrowserlessResult> {
     let seed = scene.seed;
 
     let (ours, peer) = tokio::net::UnixStream::pair()
@@ -389,7 +393,7 @@ async fn run_inner(scene: BrowserlessScene) -> anyhow::Result<BrowserlessResult>
         client_addr,
         server_addr,
         base,
-        &scene,
+        &mut scene,
         &inject_tx,
         &mut framebuffer,
         &bwe_cell,
@@ -485,7 +489,7 @@ async fn drive_session(
     client_addr: SocketAddr,
     server_addr: SocketAddr,
     base: TokioInstant,
-    scene: &BrowserlessScene,
+    scene: &mut BrowserlessScene,
     inject_tx: &mpsc::Sender<InjectedFrame>,
     framebuffer: &mut FrameBuffer,
     bwe_cell: &std::sync::Arc<std::sync::Mutex<ghostframe_lib::transport::bwe::BweSnapshot>>,
@@ -693,6 +697,7 @@ async fn drive_session(
                 out.payload,
                 t,
                 &mut bytes_dropped,
+                &mut scene.drops,
             ) {
                 if item.at_us <= t {
                     // Due now: send it here, inside the drain loop, so each
@@ -879,8 +884,14 @@ async fn drive_session(
                      (last events observed: {events:?}): {e}"
                 ))?;
                 let t = now_us(base);
-                for item in rule(&mut net_s2c, Direction::S2c, pkt.payload, t, &mut bytes_dropped)
-                {
+                for item in rule(
+                    &mut net_s2c,
+                    Direction::S2c,
+                    pkt.payload,
+                    t,
+                    &mut bytes_dropped,
+                    &mut scene.drops,
+                ) {
                     if item.at_us <= t {
                         // Its own arrival instant, for the same reason as
                         // in `flush_due`. Equal to `t` at zero delay, earlier
@@ -1089,6 +1100,7 @@ fn rule(
     payload: Vec<u8>,
     now_us_at_send: u64,
     bytes_dropped: &mut u64,
+    drops: &mut crate::netsim::DropPlan,
 ) -> Vec<InFlight> {
     // `seq` is a placeholder here; the caller assigns a real one if and when
     // it queues the arrival, so queued arrivals stay ordered by insertion.
@@ -1104,7 +1116,16 @@ fn rule(
             *bytes_dropped += payload.len() as u64;
             Vec::new()
         }
-        Verdict::Deliver { at_us } => vec![at(at_us, payload)],
+        Verdict::Deliver { at_us } => {
+            // Applied *after* `decide` so the rng draw order above is
+            // untouched -- see `NetSim::decide`'s doc comment. A plan can
+            // only turn a delivery into a drop, never the reverse.
+            if dir == Direction::S2c && drops.should_drop(&payload) {
+                *bytes_dropped += payload.len() as u64;
+                return Vec::new();
+            }
+            vec![at(at_us, payload)]
+        }
         Verdict::Duplicate { at_us, dup_at_us } => {
             vec![at(at_us, payload.clone()), at(dup_at_us, payload)]
         }

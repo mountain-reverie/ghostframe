@@ -25,6 +25,7 @@ async fn the_session_establishes_over_the_socketpair() {
         load: SceneLoad::Script(vec![]),
         cadence_us: DEFAULT_CADENCE_US,
         net: NetProfile::perfect(),
+        drops: Default::default(),
         duration: Duration::from_millis(500),
         grid_cols: 4,
         grid_rows: 4,
@@ -51,6 +52,7 @@ async fn bytes_actually_cross_the_socketpair() {
         load: SceneLoad::Script(vec![]),
         cadence_us: DEFAULT_CADENCE_US,
         net: NetProfile::perfect(),
+        drops: Default::default(),
         duration: Duration::from_millis(500),
         grid_cols: 4,
         grid_rows: 4,
@@ -86,6 +88,7 @@ async fn a_lossy_link_still_establishes_and_records_drops() {
             loss: 0.10,
             ..NetProfile::perfect()
         },
+        drops: Default::default(),
         duration: Duration::from_secs(5),
         grid_cols: 4,
         grid_rows: 4,
@@ -124,6 +127,7 @@ async fn a_single_solid_tile_arrives_on_a_perfect_link() {
         }]),
         cadence_us: DEFAULT_CADENCE_US,
         net: NetProfile::perfect(),
+        drops: Default::default(),
         duration: Duration::from_millis(500),
         grid_cols: 4,
         grid_rows: 4,
@@ -177,6 +181,7 @@ async fn a_second_frame_overwrites_the_first_frames_tile() {
         ]),
         cadence_us: DEFAULT_CADENCE_US,
         net: NetProfile::perfect(),
+        drops: Default::default(),
         duration: Duration::from_millis(500),
         grid_cols: 4,
         grid_rows: 4,
@@ -227,6 +232,7 @@ async fn cdf53_converges_to_lossless_under_10pct_loss() {
             loss: 0.10,
             ..NetProfile::perfect()
         },
+        drops: Default::default(),
         duration: Duration::from_secs(10),
         grid_cols: 1,
         grid_rows: 1,
@@ -286,6 +292,7 @@ async fn superseded_generations_never_render() {
             reorder_us: 30_000,
             ..NetProfile::perfect()
         },
+        drops: Default::default(),
         duration: Duration::from_secs(5),
         grid_cols: 1,
         grid_rows: 1,
@@ -345,6 +352,7 @@ async fn a_tighter_cap_sheds_more_traffic() {
                 cap: CapTimeline::constant(cap_bps),
                 ..NetProfile::perfect()
             },
+            drops: Default::default(),
             duration: Duration::from_secs(4),
             // busy_frames(8) rewrites a fixed 4x4 grid every frame; see its
             // doc comment.
@@ -414,6 +422,7 @@ async fn every_cdf53_pass_eventually_lands() {
             cap: CapTimeline::constant(400_000),
             ..NetProfile::perfect()
         },
+        drops: Default::default(),
         duration: Duration::from_secs(20),
         grid_cols: 4,
         grid_rows: 4,
@@ -454,6 +463,7 @@ async fn bwe_estimator_is_fed_and_epoch_consistent() {
             cap: CapTimeline::constant(1_000_000),
             ..NetProfile::perfect()
         },
+        drops: Default::default(),
         duration: Duration::from_secs(6),
         grid_cols: 4,
         grid_rows: 4,
@@ -569,6 +579,7 @@ async fn a_lossless_link_with_a_real_rtt_does_not_retransmit() {
             // recover.
             ..NetProfile::perfect()
         },
+        drops: Default::default(),
         duration: Duration::from_secs(8),
         grid_cols: 6,
         grid_rows: 6,
@@ -660,6 +671,7 @@ async fn retransmits_fire_under_loss_but_not_on_a_perfect_link() {
             load: SceneLoad::Script(busy_frames(2)),
             cadence_us: DEFAULT_CADENCE_US,
             net,
+            drops: Default::default(),
             duration: Duration::from_secs(10),
             grid_cols: 4,
             grid_rows: 4,
@@ -767,6 +779,7 @@ async fn bwe_tier_latency_baseline() {
                 loss: 0.10,
                 ..NetProfile::perfect()
             },
+            drops: Default::default(),
             duration: Duration::from_secs(10),
             grid_cols: 4,
             grid_rows: 4,
@@ -948,6 +961,7 @@ async fn probe_windows_are_opened_on_a_busy_link() {
             load: SceneLoad::Script(busy_frames_grid(8, 8, 8)),
             cadence_us: DEFAULT_CADENCE_US,
             net: NetProfile::perfect(),
+            drops: Default::default(),
             duration: Duration::from_secs(10),
             grid_cols: 8,
             grid_rows: 8,
@@ -1028,6 +1042,7 @@ async fn probe_windows_are_abandoned_on_a_demand_starved_link() {
                 loss: 0.10,
                 ..NetProfile::perfect()
             },
+            drops: Default::default(),
             duration: Duration::from_secs(10),
             grid_cols: 2,
             grid_rows: 2,
@@ -1115,6 +1130,7 @@ async fn a_static_region_still_refines_while_a_busy_one_saturates() {
             bottleneck: Some(Bottleneck::wifi()),
             ..NetProfile::perfect()
         },
+        drops: Default::default(),
         duration: Duration::from_secs(20),
         grid_cols: COLS as u32,
         grid_rows: ROWS as u32,
@@ -1266,6 +1282,7 @@ async fn a_link_with_propagation_delay_carries_datagrams_concurrently() {
             delay_us: ONE_WAY_US,
             ..NetProfile::perfect()
         },
+        drops: Default::default(),
         duration: Duration::from_micros(DURATION_US),
         grid_cols: 8,
         grid_rows: 8,
@@ -1322,6 +1339,7 @@ async fn run_bottleneck_scene(
             bottleneck: Some(Bottleneck::wifi()),
             ..NetProfile::perfect()
         },
+        drops: Default::default(),
         duration: Duration::from_secs(secs),
         grid_cols: 16,
         grid_rows: 16,
