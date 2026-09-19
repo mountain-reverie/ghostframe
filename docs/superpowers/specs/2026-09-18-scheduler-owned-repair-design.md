@@ -153,9 +153,14 @@ count it. That abandons one repair, which is honest degradation; an unbounded
 hold is worse. The worst case is the ~50K entries / ~25 MB the emitter cache
 already documents for a 1080p first paint — the same bytes, relocated.
 
-**Give-up escalates rather than abandons.** After N repair attempts the tile
-is handed back as dirty and re-encoded fresh at current priority, instead of
-replaying stale bytes.
+**Give-up escalates rather than abandons.** After `MAX_REPAIR_ATTEMPTS = 3`
+the tile is handed back as dirty and re-encoded fresh at current priority,
+instead of replaying stale bytes. Three is chosen because the sweep only ever
+fires for a tile with nothing acked: if three spaced attempts have all gone
+unanswered, the content is more likely stale than unlucky, and re-encoding at
+current priority is both cheaper and more correct than a fourth replay. It is
+a tuning constant, not a load-bearing invariant — any bound terminates the
+sequence, which is the property that matters.
 
 ## Testing
 
@@ -176,6 +181,38 @@ rates where the "receiver cannot know" case appears — confirmed at 60% and
 90%, where the scene fails before running. Probabilistic loss cannot test it.
 Deterministic drop injection is needed (drop *this* tile's first emission);
 the e2e side has loss predicates, browserless does not.
+
+## Phasing
+
+More than one plan's worth of work. Each phase produces working, testable
+software on its own and is ordered so that risk and user-visible value come
+early.
+
+**Phase 0 — harness.** Deterministic drop injection for browserless (drop
+*this* tile's *n*th emission), plus the property test for terminal states.
+First because the case the redesign protects cannot be tested with
+probabilistic loss, and because every later phase is verified against these.
+
+**Phase 1 — index structure.** Slots + versioned slab + per-pass buckets,
+behind the existing `Scheduler` API. Pure refactor, no behavioural change: the
+browserless suite and all 406 lib tests must stay green, and the bounded
+comparison-count test lands here. Doing this before the ownership move means
+the move never runs on an O(n^2) structure.
+
+**Phase 2 — ledger correctness.** Versioned handles, tombstones, and the loss
+deadline sized on `ack_p99`. **This phase alone fixes the production bug** —
+late ACKs resolve, entries stop stranding, and the storm reproduction should
+go from 1788 repairs to near zero without any ownership change. Ship it before
+the larger move.
+
+**Phase 3 — ownership move.** The scheduler holds work until terminal; delete
+the emitter cache, the RTO wheel, `rto_for_attempt`, `cancel_for_tile` and the
+1.5-B escalation. Route NACKs to the scheduler. Add `AckLatencyTracker` and
+the gated safety sweep.
+
+**Phase 4 — collapse `fragment_coverage`.** Its metadata moves onto the slab
+entry; delete the module and its callers, completing the retirement its own
+header already describes.
 
 ## Open uncertainties
 
