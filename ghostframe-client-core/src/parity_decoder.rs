@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use ghostframe_protocol::protocol::TileParityEnvelope;
+use ghostframe_protocol::protocol::{is_tile_datagram, TileParityEnvelope};
 
 use crate::ordered_map::OrderedMap;
 
@@ -161,7 +161,7 @@ impl ParityDecoder {
         if missing_count != 1 {
             return None;
         }
-        let _ = missing;
+        let missing_ws = missing?;
 
         let target_len = received
             .iter()
@@ -172,7 +172,28 @@ impl ParityDecoder {
         for src in received {
             xor_into(&mut out, src);
         }
-        Some(out)
+
+        // The XOR result is left-padded to the group's longest source, so a
+        // shorter missing source must be trimmed to its own length -- the
+        // real bytes are the last `len` of `out`.
+        let idx = (missing_ws.wrapping_sub(parity.group_first_wire_seq)) as usize;
+        let len = *parity.source_lens.get(idx)? as usize;
+        if len > out.len() {
+            return None; // wire-supplied length longer than the XOR result
+        }
+        let start = out.len() - len;
+        let recovered = out[start..].to_vec();
+
+        // A recovered buffer is reconstructed, not received. If the group's
+        // membership was ever wrong the XOR yields plausible-looking bytes
+        // that are not a datagram, and everything downstream -- render,
+        // acknowledge -- would treat them as one. Measured: two such
+        // fabrications reached the render path in a lossless scene.
+        if !is_tile_datagram(&recovered) {
+            return None;
+        }
+
+        Some(recovered)
     }
 }
 
@@ -181,9 +202,11 @@ mod tests {
     use super::*;
 
     /// A source datagram is opaque to the decoder — it only ever XORs them
-    /// — so a fixed-length filler keyed on `wire_seq` is enough.
+    /// — so a fixed-length filler keyed on `wire_seq` is enough. The top bit
+    /// of the first byte is forced on so a recovered instance of this filler
+    /// still passes the `is_tile_datagram` validation in `try_recover`.
     fn src(wire_seq: u32) -> Vec<u8> {
-        vec![(wire_seq & 0xFF) as u8; 8]
+        vec![(wire_seq & 0xFF) as u8 | 0x80; 8]
     }
 
     /// Parity over the whole group, so the group becomes recoverable the
@@ -197,7 +220,7 @@ mod tests {
             group_first_wire_seq: group_first,
             k,
             parity_idx: 0,
-            group_first_payload_len: 8,
+            source_lens: vec![8; k as usize],
             parity_payload: payload,
         }
     }
@@ -210,13 +233,12 @@ mod tests {
     /// short missing source carries leading zeros. Every other test in this
     /// file builds its group from the fixed 8-byte `src()` helper, so the
     /// padding is always zero and this path was never exercised.
-    #[ignore = "reproduces an open bug: FEC recovery returns a left-padded buffer"]
     #[test]
     fn recovery_restores_the_exact_bytes_of_a_short_source() {
         // Group of 3: a long one, the short one we will drop, another long.
         let long_a: Vec<u8> = (0..20u8).collect();
         let short: Vec<u8> = vec![0xAA, 0xBB, 0xCC, 0xDD];
-        let long_b: Vec<u8> = (100..120u8).collect();
+        let long_b: Vec<u8> = (100..117u8).collect();
 
         let max_len = 20;
         let mut parity = vec![0u8; max_len];
@@ -227,7 +249,7 @@ mod tests {
             group_first_wire_seq: 0,
             k: 3,
             parity_idx: 0,
-            group_first_payload_len: long_a.len() as u16,
+            source_lens: vec![20, 4, 17],
             parity_payload: parity,
         };
 
@@ -247,6 +269,30 @@ mod tests {
              every downstream parser reads the wrong offsets",
             recovered.len(),
             short.len()
+        );
+    }
+
+    #[test]
+    fn a_recovery_that_is_not_a_tile_datagram_is_discarded() {
+        // Sources whose XOR cannot produce a valid tile datagram: no source
+        // here has the tile flag set, so neither can the reconstruction.
+        let a = vec![0x01u8; 24];
+        let b = vec![0x02u8; 24];
+        let mut parity = vec![0u8; 24];
+        xor_into(&mut parity, &a);
+        xor_into(&mut parity, &b);
+        let env = TileParityEnvelope {
+            group_first_wire_seq: 0,
+            k: 2,
+            parity_idx: 0,
+            source_lens: vec![24, 24],
+            parity_payload: parity,
+        };
+        let mut d = ParityDecoder::new(64);
+        d.record_source(0, &a);
+        assert!(
+            d.receive_parity(&env).is_none(),
+            "a reconstruction that is not a tile datagram must not be returned"
         );
     }
 
