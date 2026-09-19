@@ -128,9 +128,19 @@ pub struct BrowserlessScene {
     /// carries its own and overrides this.
     pub cadence_us: u64,
     pub net: NetProfile,
-    /// Deterministic drops, applied on top of `net`'s probabilistic loss.
-    /// Server-to-client only. Empty by default, so existing scenes are
-    /// bit-identical.
+    /// Deterministic drops, enforced inside the server before QUIC
+    /// encryption — `IoBridge::send_to_all_sessions`, beside `outbound_loss`.
+    ///
+    /// This does **not** compose with `net`: the datagram is discarded before
+    /// it reaches the simulated link, so `net`'s loss, cap and delay never see
+    /// it and `BrowserlessResult::bytes_dropped` never counts it. Assert on
+    /// `BrowserlessResult::drops_fired` instead.
+    ///
+    /// It has to be enforced there because tile identity is invisible once
+    /// QUIC has encrypted the datagram — see
+    /// `ghostframe_lib::transport::drop_plan`'s module doc for the
+    /// measurement that established this. Empty by default, so existing
+    /// scenes are bit-identical.
     pub drops: crate::netsim::DropPlan,
     pub duration: Duration,
     /// Grid dimensions, fixed for the whole scene.
