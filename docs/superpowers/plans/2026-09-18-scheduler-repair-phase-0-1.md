@@ -271,7 +271,7 @@ In `BrowserlessScene`, after the `net: NetProfile,` field:
     pub drops: crate::netsim::DropPlan,
 ```
 
-Every existing `BrowserlessScene { .. }` literal in `ghostframe-e2e/tests/browserless_runner.rs` must gain `drops: Default::default(),`. There are 19 of them; the compiler will name each one.
+Every existing `BrowserlessScene { .. }` literal in `ghostframe-e2e/tests/browserless_runner.rs` must gain `drops: Default::default(),`. There are 18 of them; the compiler will name each one.
 
 - [ ] **Step 2: Apply it after `decide`, never before**
 
@@ -293,7 +293,7 @@ fn rule(
             // Applied *after* `decide` so the rng draw order above is
             // untouched -- see `NetSim::decide`'s doc comment. A plan can
             // only turn a delivery into a drop, never the reverse.
-            if dir == Direction::ServerToClient && drops.should_drop(&payload) {
+            if matches!(dir, Direction::S2c) && drops.should_drop(&payload) {
                 *bytes_dropped += payload.len() as u64;
                 return Vec::new();
             }
@@ -301,7 +301,11 @@ fn rule(
         }
 ```
 
-Thread `drops` from the scene through every `rule(...)` call site. The compiler will list them.
+Thread `drops` from the scene through both `rule(...)` call sites
+(`browserless.rs:690` and `browserless.rs:882` — they currently pass different
+argument counts, so read both). The direction enum is declared at
+`browserless.rs:1034` with variants `C2s`/`S2c`; `matches!` avoids depending on
+whether it derives `PartialEq`.
 
 - [ ] **Step 3: Verify no existing scene changed**
 
