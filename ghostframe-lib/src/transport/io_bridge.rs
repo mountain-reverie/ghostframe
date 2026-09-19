@@ -3426,6 +3426,92 @@ impl IoBridge {
         );
     }
 
+    /// Phase 1.5-B stranded-tile re-enqueue: given the freshly re-decoded
+    /// `passes` for one escalation slot already known to be Cdf53
+    /// (`codec_state`), re-enqueues ONLY the still-unacked passes at the
+    /// existing generation.
+    ///
+    /// No `cancel_for_tile` (the retransmit cache is empty for a stranded
+    /// tile — that's the detection gate), no `bump_generation` (a bump
+    /// would discard the client's partial bitmap for already-acked
+    /// passes, which this path exists to preserve).
+    ///
+    /// Guards, in order:
+    ///  - `codec_state` must carry `max_passes` (Cdf53) — anything else
+    ///    means the detection gate raced with a codec-state change since
+    ///    candidate collection; skip rather than panic.
+    ///  - `unacked == 0` — the client ACKed everything between detection
+    ///    and dispatch this frame; nothing to resend.
+    ///  - `refinement_queue_holds_tile` — the tile's passes are still
+    ///    `Pending`/`InFlight` in the refinement queue, i.e. merely
+    ///    unsent, not actually stranded. Re-enqueueing here would emit
+    ///    the same pass twice on a path whose entire purpose is
+    ///    recovering from scarcity, not multiplying unsent work.
+    ///    `refinement_queue_holds_tile` was written for exactly this
+    ///    check and, until now, was never called.
+    fn stranded_reenqueue(
+        &mut self,
+        tile_x: u8,
+        tile_y: u8,
+        codec_state: crate::tile::CodecState,
+        passes: Vec<Vec<u8>>,
+    ) {
+        let max_passes = match codec_state {
+            crate::tile::CodecState::Cdf53 { max_passes, .. } => max_passes,
+            _ => return, // Should not happen — detection enforced.
+        };
+        let gen = self.scheduler.generation_for(tile_x, tile_y);
+        let unacked = self
+            .scheduler
+            .cdf53_unacked_pass_mask(tile_x, tile_y, gen, max_passes);
+        if unacked == 0 {
+            return; // Race: client ACKed everything between detect and dispatch.
+        }
+        // Still queued means unsent, not stranded: re-enqueueing here
+        // would emit the same pass twice. `refinement_queue_holds_tile`
+        // was written for this check and was never called.
+        if self.scheduler.refinement_queue_holds_tile(tile_x, tile_y) {
+            return;
+        }
+        let only_unacked: Vec<Vec<u8>> = passes
+            .into_iter()
+            .enumerate()
+            .filter_map(|(pass_idx, p)| {
+                if (unacked & (1u16 << pass_idx)) != 0 {
+                    Some(p)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for (slot_pass_idx, payload) in only_unacked.iter().enumerate() {
+            // Map slot_pass_idx back to the absolute pass_idx (the bitmap
+            // had the unacked bits in order, so the Nth retained pass
+            // corresponds to the Nth set bit).
+            let _ = slot_pass_idx; // payload index, not used in log.
+            tracing::info!(
+                target: "ghostframe::cdf53",
+                tile_x = tile_x,
+                tile_y = tile_y,
+                gen = gen,
+                unacked_mask = unacked,
+                payload_size = payload.len(),
+                source = "stranded",
+                "cdf53.emit"
+            );
+        }
+        // Use the index-preserving variant so the scheduler enqueues the
+        // correct pass_idx for each retained payload (not 0..N).
+        self.scheduler.enqueue_refinement_subset_at(
+            tile_x,
+            tile_y,
+            gen,
+            unacked,
+            only_unacked,
+            now_std(),
+        );
+    }
+
     /// GPU-accelerated full-frame pipeline: Vulkan compute dirty detection +
     /// VA-API VPP BGRA→NV12 conversion + H.264 encoding (true zero-copy).
     fn process_frame_gpu(&mut self, frame: FrameSubmission) {
@@ -4329,66 +4415,7 @@ impl IoBridge {
                         let coeffs_i16: Vec<i16> = coeffs_i32.iter().map(|&v| v as i16).collect();
                         let passes = crate::encoder::cdf53::encode_passes(&coeffs_i16);
                         if is_stranded {
-                            // Phase 1.5-B stranded path: re-enqueue ONLY
-                            // the unacked passes at the existing
-                            // generation. The retransmit cache for this
-                            // tile is empty (detection gate), so
-                            // enqueueing creates fresh cache entries; RTO
-                            // / NACK handle subsequent losses. No
-                            // `cancel_for_tile` (no entries to cancel),
-                            // no `bump_generation` (preserves the
-                            // client's partial bitmap for already-acked
-                            // passes).
-                            let max_passes = match codec_state {
-                                crate::tile::CodecState::Cdf53 { max_passes, .. } => max_passes,
-                                _ => continue, // Should not happen — detection enforced.
-                            };
-                            let gen = self.scheduler.generation_for(tile_x, tile_y);
-                            let unacked = self
-                                .scheduler
-                                .cdf53_unacked_pass_mask(tile_x, tile_y, gen, max_passes);
-                            if unacked == 0 {
-                                continue; // Race: client ACKed everything between detect and dispatch.
-                            }
-                            let only_unacked: Vec<Vec<u8>> = passes
-                                .into_iter()
-                                .enumerate()
-                                .filter_map(|(pass_idx, p)| {
-                                    if (unacked & (1u16 << pass_idx)) != 0 {
-                                        Some(p)
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect();
-                            for (slot_pass_idx, payload) in only_unacked.iter().enumerate() {
-                                // Map slot_pass_idx back to the absolute
-                                // pass_idx (the bitmap had the unacked
-                                // bits in order, so the Nth retained
-                                // pass corresponds to the Nth set bit).
-                                let _ = slot_pass_idx; // payload index, not used in log.
-                                tracing::info!(
-                                    target: "ghostframe::cdf53",
-                                    tile_x = tile_x,
-                                    tile_y = tile_y,
-                                    gen = gen,
-                                    unacked_mask = unacked,
-                                    payload_size = payload.len(),
-                                    source = "stranded",
-                                    "cdf53.emit"
-                                );
-                            }
-                            // Use the index-preserving variant so the
-                            // scheduler enqueues the correct pass_idx
-                            // for each retained payload (not 0..N).
-                            self.scheduler.enqueue_refinement_subset_at(
-                                tile_x,
-                                tile_y,
-                                gen,
-                                unacked,
-                                only_unacked,
-                                now_std(),
-                            );
+                            self.stranded_reenqueue(tile_x, tile_y, codec_state, passes);
                             continue;
                         }
                         // H264 escalation path (existing).
@@ -8528,6 +8555,80 @@ mod tests {
                 "tile ({tile_x}, {tile_y}) must have been drained (Pending -> InFlight)"
             );
         }
+    }
+
+    /// Regression test for the dead stranded-tile guard: `IoBridge`'s
+    /// Phase 1.5-B stranded escalation calls `enqueue_refinement_subset_at`
+    /// at the EXISTING generation (deliberately, so the client's
+    /// already-delivered passes survive). Because there is no
+    /// `bump_generation`, nothing supersedes work already sitting in the
+    /// refinement queue — so a pass that is merely *unsent* (still
+    /// `Pending`, never transmitted) got enqueued a second time and
+    /// emitted twice. `Scheduler::refinement_queue_holds_tile` exists
+    /// exactly to stop this and was never called.
+    ///
+    /// This drives the real, unmodified `IoBridge::stranded_reenqueue`
+    /// (the extracted body of the stranded branch inside
+    /// `process_frame_gpu`'s post-fence Phase B loop) directly, seeding
+    /// the scheduler's refinement queue the same way a prior frame's
+    /// dispatch would have: one `Pending` `TileWork` entry per Cdf53
+    /// pass, never drained. No ACKs are recorded, so
+    /// `cdf53_unacked_pass_mask` reports every pass unacked — exactly
+    /// what a real stranded-detection sweep would see for this tile.
+    #[tokio::test(start_paused = true)]
+    async fn stranded_reenqueue_skips_tiles_still_pending_in_the_queue() {
+        use crate::transport::protocol::Codec;
+        use crate::transport::scheduler::{TileWork, WorkState};
+
+        let (ours, _peer) = tokio::net::UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("QuicServer::new");
+        let (_tx, rx) = mpsc::channel(8);
+        let mut bridge = IoBridge::new_with_injection_for_test(ours, server, rx, 4, 4);
+
+        let max_passes = crate::encoder::cdf53::CDF53_PASS_COUNT as u8;
+        let (tile_x, tile_y) = (2u8, 1u8);
+
+        // Seed the refinement queue with this tile's passes, still
+        // `Pending` — classified and enqueued by an earlier frame, but
+        // never drained/sent. This is the "merely unsent" case the
+        // stranded escalation must not duplicate.
+        for pass_idx in 0..max_passes {
+            bridge.scheduler.enqueue_refinement_work_at(
+                TileWork {
+                    tile_x,
+                    tile_y,
+                    generation: 0,
+                    pass_idx,
+                    total_passes: max_passes,
+                    codec: Codec::Cdf53,
+                    payload: vec![0u8; 4],
+                    queued_at: super::now_std(),
+                    last_sent_at: None,
+                    state: WorkState::Pending,
+                },
+                super::now_std(),
+            );
+        }
+
+        let before = bridge.scheduler.refinement_queue_len();
+        assert_eq!(
+            before, max_passes as usize,
+            "queue seeded with one Pending entry per pass"
+        );
+
+        let codec_state = crate::tile::CodecState::Cdf53 {
+            passes_sent: 0,
+            max_passes,
+        };
+        let passes: Vec<Vec<u8>> = (0..max_passes).map(|i| vec![i; 4]).collect();
+        bridge.stranded_reenqueue(tile_x, tile_y, codec_state, passes);
+
+        let after = bridge.scheduler.refinement_queue_len();
+        assert_eq!(
+            after, before,
+            "stranded re-enqueue must not duplicate passes still Pending \
+             in the refinement queue (before={before}, after={after})"
+        );
     }
 
     /// Task 3: the tile-injection channel must enqueue injected work into
