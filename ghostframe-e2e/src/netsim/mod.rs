@@ -23,15 +23,15 @@
 //! counters, and when a byte-count assertion is unavoidable give it
 //! order-of-magnitude margins rather than tight bounds.
 
+pub mod drop_plan;
 pub mod profile;
 pub mod pump;
 pub mod rng;
-pub mod drop_plan;
 
+pub use drop_plan::{DropPlan, DropRule};
 pub use profile::{Bottleneck, CapTimeline, CoDel, NetProfile};
 pub use pump::SocketPairPump;
 pub use rng::DetRng;
-pub use drop_plan::{DropPlan, DropRule};
 
 /// The fate of a single datagram as determined by the network simulator.
 #[derive(Debug, Clone, PartialEq)]
