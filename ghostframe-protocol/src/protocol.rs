@@ -624,12 +624,12 @@ impl NackMessage {
 // TILE_PARITY envelope (0x04)
 //
 // Wire format (spec §5.2):
-//   [0]       discriminator:              u8  (= TILE_PARITY_ENVELOPE = 0x04)
-//   [1..5]    group_first_wire_seq:       u32 BE
-//   [5]       k:                          u8  (number of source datagrams covered)
-//   [6]       parity_idx:                 u8  (0-indexed within group's R parities)
-//   [7..9]    group_first_payload_len:    u16 BE
-//   [9..]     parity_payload                  (XOR of K sources, left-padded)
+//   [0]         discriminator:        u8  (= TILE_PARITY_ENVELOPE = 0x04)
+//   [1..5]      group_first_wire_seq: u32 BE
+//   [5]         k:                    u8  (number of source datagrams covered)
+//   [6]         parity_idx:           u8  (0-indexed within group's R parities)
+//   [7..7+2k]   source_lens:          k x u16 BE
+//   [7+2k..]    parity_payload            (XOR of K sources, left-padded)
 // ---------------------------------------------------------------------------
 
 /// Envelope discriminator byte for the tile-FEC parity datagram.
@@ -646,14 +646,17 @@ pub struct TileParityEnvelope {
     /// Index of this parity within the group's R parities. v1 always emits
     /// R=1 parity per group, so `parity_idx` is always 0.
     pub parity_idx: u8,
-    /// Length of the first source datagram in the group, used by the
-    /// decoder to extract a recovered payload of the right size.
-    pub group_first_payload_len: u16,
+    /// Byte length of each of the group's `k` sources, in `wire_seq` order
+    /// starting at `group_first_wire_seq`. The decoder needs every one: XOR
+    /// left-pads to the group's longest source, so a recovered source must
+    /// be trimmed to its own length or it arrives with leading zeros.
+    pub source_lens: Vec<u16>,
     pub parity_payload: Vec<u8>,
 }
 
-/// Size of the fixed-length header preceding `parity_payload`.
-pub const TILE_PARITY_HEADER_SIZE: usize = 1 + 4 + 1 + 1 + 2; // = 9
+/// Size of the fixed-length part of the header, preceding the `source_lens`
+/// table and `parity_payload`.
+pub const TILE_PARITY_HEADER_SIZE: usize = 1 + 4 + 1 + 1; // = 7
 
 impl TileParityEnvelope {
     pub fn encode(&self, buf: &mut Vec<u8>) {
@@ -661,7 +664,9 @@ impl TileParityEnvelope {
         buf.extend_from_slice(&self.group_first_wire_seq.to_be_bytes());
         buf.push(self.k);
         buf.push(self.parity_idx);
-        buf.extend_from_slice(&self.group_first_payload_len.to_be_bytes());
+        for len in &self.source_lens {
+            buf.extend_from_slice(&len.to_be_bytes());
+        }
         buf.extend_from_slice(&self.parity_payload);
     }
 
@@ -678,13 +683,28 @@ impl TileParityEnvelope {
         let group_first_wire_seq = u32::from_be_bytes(data[1..5].try_into().unwrap());
         let k = data[5];
         let parity_idx = data[6];
-        let group_first_payload_len = u16::from_be_bytes(data[7..9].try_into().unwrap());
-        let parity_payload = data[TILE_PARITY_HEADER_SIZE..].to_vec();
+
+        // `k` is wire-supplied and may be hostile or corrupt: verify the
+        // buffer actually holds the full length table before slicing into
+        // it, so a bogus `k` cannot index past the end of `data`.
+        let table_end = TILE_PARITY_HEADER_SIZE + 2 * k as usize;
+        if data.len() < table_end {
+            return Err(ProtocolError::TooShort {
+                expected: table_end,
+                got: data.len(),
+            });
+        }
+
+        let mut source_lens = Vec::with_capacity(k as usize);
+        for chunk in data[TILE_PARITY_HEADER_SIZE..table_end].chunks_exact(2) {
+            source_lens.push(u16::from_be_bytes(chunk.try_into().unwrap()));
+        }
+        let parity_payload = data[table_end..].to_vec();
         Ok(Self {
             group_first_wire_seq,
             k,
             parity_idx,
-            group_first_payload_len,
+            source_lens,
             parity_payload,
         })
     }
@@ -1399,11 +1419,12 @@ mod tests {
     #[test]
     fn tile_parity_envelope_roundtrip() {
         let parity_payload = vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
+        let source_lens: Vec<u16> = (0..10).map(|_| 512).collect();
         let envelope = TileParityEnvelope {
             group_first_wire_seq: 1000,
             k: 10,
             parity_idx: 0,
-            group_first_payload_len: 512,
+            source_lens: source_lens.clone(),
             parity_payload: parity_payload.clone(),
         };
         let mut buf = Vec::new();
@@ -1413,8 +1434,45 @@ mod tests {
         assert_eq!(parsed.group_first_wire_seq, 1000);
         assert_eq!(parsed.k, 10);
         assert_eq!(parsed.parity_idx, 0);
-        assert_eq!(parsed.group_first_payload_len, 512);
+        assert_eq!(parsed.source_lens, source_lens);
         assert_eq!(parsed.parity_payload, parity_payload);
+    }
+
+    #[test]
+    fn parity_envelope_round_trips_every_source_length() {
+        let env = TileParityEnvelope {
+            group_first_wire_seq: 0xDEAD_BEEF,
+            k: 3,
+            parity_idx: 0,
+            source_lens: vec![20, 4, 17],
+            parity_payload: vec![1, 2, 3, 4, 5],
+        };
+        let mut buf = Vec::new();
+        env.encode(&mut buf);
+        let back = TileParityEnvelope::decode(&buf).expect("round trip");
+        assert_eq!(back.source_lens, vec![20, 4, 17]);
+        assert_eq!(back.group_first_wire_seq, 0xDEAD_BEEF);
+        assert_eq!(back.k, 3);
+        assert_eq!(back.parity_payload, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn a_parity_envelope_whose_length_table_is_truncated_is_rejected() {
+        let env = TileParityEnvelope {
+            group_first_wire_seq: 1,
+            k: 4,
+            parity_idx: 0,
+            source_lens: vec![8, 8, 8, 8],
+            parity_payload: vec![9; 8],
+        };
+        let mut buf = Vec::new();
+        env.encode(&mut buf);
+        // Truncate inside the length table: k says 4 entries, bytes stop short.
+        buf.truncate(7 + 2 * 3);
+        assert!(
+            TileParityEnvelope::decode(&buf).is_err(),
+            "a k that overruns the buffer must be rejected, not indexed past the end"
+        );
     }
 
     #[test]
