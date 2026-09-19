@@ -494,6 +494,115 @@ async fn bwe_estimator_is_fed_and_epoch_consistent() {
     );
 }
 
+/// A lossless link with an ordinary wide-area RTT must not retransmit.
+///
+/// `retransmits_fire_under_loss_but_not_on_a_perfect_link` already asserts
+/// "no loss, no retransmits", but it runs at effectively zero delay, where
+/// an acknowledgement is back long before any timer could fire. The bug this
+/// guards lives entirely in the gap between that and a real path.
+///
+/// `rto_for_attempt` computes `min(max(2 x smoothed_rtt, 25ms), BASE_RTO_MS)`
+/// for a first attempt, and `BASE_RTO_MS` is 50 ms. That `min` is a *ceiling*:
+/// no matter how slow the path, the first retransmission timer never exceeds
+/// 50 ms. On any link whose round trip is slower than that, the timer expires
+/// before an acknowledgement can physically arrive, so every datagram is
+/// retransmitted at least once — not because anything was lost, but because
+/// the timer cannot be set correctly.
+///
+/// Compounding it, `ReliableTileEmitter::set_smoothed_rtt` is never called
+/// from anywhere, so `smoothed_rtt` also stays at its 20 ms constructor
+/// default and the ceiling is reached from below as well.
+///
+/// Observed in production on a tailnet path: `rto_fired=65331` and
+/// `retransmit_attempts_total=88118` against 43981 datagrams actually
+/// emitted — roughly twice as many retransmission attempts as transmissions —
+/// while `emitter_ack_hits` covered 99.7% of originals. Nearly everything
+/// arrived; the retransmissions were spurious. That storm pushed queued
+/// latency to a 14.7 s mean (59 s max) and the first frame never converged,
+/// which is what a user sees as tiles that never finish arriving.
+///
+/// # Ignored: this reproduces an open bug
+///
+/// It fails, deliberately, and is kept because it reproduces in 0.33 s what
+/// took a live session and a journal to find. Measured here: **1776 spurious
+/// retransmissions** with `ack_hit=2016` — one acknowledgement for every
+/// tile-pass the scene emits — so every pass *was* acknowledged and the
+/// retransmissions are pure waste. The split is roughly even between
+/// `rto_fired` (834) and `nack_hit` (943), so both the server's
+/// retransmission timer and the client's NACK path contribute.
+///
+/// What it is **not**, each checked and ruled out:
+///
+/// - Not the 50 ms `rto_for_attempt` ceiling alone. Removing it changed the
+///   count by less than 1%, and that ceiling is a deliberate decision pinned
+///   by `rto_first_attempt_high_rtt_caps_at_50ms` — a slow first retry means
+///   a visibly stuck tile, which is presumably why it is capped.
+/// - Not `set_smoothed_rtt` never being called (it isn't, anywhere). Wiring
+///   quinn's measured RTT through moved the count by 11 out of 1788.
+/// - Not the 20 ms `smoothed_rtt` default used before the first path sample.
+///   Raising it to 100 ms changed nothing and broke 7 tests that encode the
+///   old timing.
+/// - Not `ASSEMBLY_TIMEOUT_US` being 30 ms, below the server's own 33.3 ms
+///   scheduler tick. Raising it to 250 ms changed nothing on its own,
+///   although the inversion still looks wrong.
+///
+/// Four plausible causes, each individually ruled out by measurement rather
+/// than argument. Whatever drives this is something else, and the next
+/// attempt should start by measuring the actual emit-to-acknowledgement
+/// latency distribution against the timer that fires, rather than reasoning
+/// about which constant looks too small.
+#[ignore = "reproduces an open bug: 1776 spurious retransmissions on a lossless link"]
+#[tokio::test(start_paused = true)]
+async fn a_lossless_link_with_a_real_rtt_does_not_retransmit() {
+    // 35 ms each way = 70 ms round trip: unremarkable for wifi or a tailnet
+    // hop, and comfortably past the 50 ms ceiling.
+    const ONE_WAY_US: u64 = 35_000;
+
+    let scene = BrowserlessScene {
+        seed: 0x9E77_0001,
+        load: SceneLoad::Script(busy_frames_grid(4, 6, 6)),
+        cadence_us: DEFAULT_CADENCE_US,
+        net: NetProfile {
+            delay_us: ONE_WAY_US,
+            // Explicitly lossless. Every retransmission counted below is
+            // therefore spurious by construction — there is nothing to
+            // recover.
+            ..NetProfile::perfect()
+        },
+        duration: Duration::from_secs(8),
+        grid_cols: 6,
+        grid_rows: 6,
+    };
+    let r = run_browserless(scene).await.expect("scene ran");
+
+    // The scene has to have actually delivered something, or "no
+    // retransmissions" is vacuous.
+    assert!(
+        r.bytes_delivered_s2c > 50_000,
+        "scene must carry real traffic; delivered {} bytes",
+        r.bytes_delivered_s2c
+    );
+
+    println!(
+        "lossless {}ms RTT: retransmit_attempts={} delivered_s2c={}",
+        (ONE_WAY_US * 2) / 1000,
+        r.retransmit_attempts_total,
+        r.bytes_delivered_s2c
+    );
+
+    // A handful of retransmissions could be explained by scheduling jitter at
+    // the margins; a storm cannot.
+    assert!(
+        r.retransmit_attempts_total < 20,
+        "a lossless {}ms-RTT link retransmitted {} times. Nothing was lost, so \
+         every one of those is the retransmission timer firing before an \
+         acknowledgement could arrive — see this test's doc comment for the \
+         50 ms ceiling in `rto_for_attempt`.",
+        (ONE_WAY_US * 2) / 1000,
+        r.retransmit_attempts_total
+    );
+}
+
 /// BWE Stage 2 prereq: proves the server's `ReliableTileEmitter` retransmit
 /// path (`EmitterStats::retransmit_attempts_total`) is actually reachable
 /// from a browserless scene at all. A prior investigation found 238 BWE
