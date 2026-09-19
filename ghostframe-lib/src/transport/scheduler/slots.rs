@@ -8,11 +8,24 @@
 //!
 //! At most one generation per tile is live — `bump_generation` supersedes
 //! the rest — so a single `current_gen` plus one mask is sufficient.
+//!
+//! Out-of-range tiles are a silent no-op rather than a panic: `index`
+//! rejects any coordinate beyond `cols`/`rows`, so `record_ack`,
+//! `bump_generation` and the handle accessors all do nothing. That makes the
+//! grid sizing load-bearing in a way the previous `HashMap<(tile, gen), mask>`
+//! did not — it keyed on the raw tuple and tracked any coordinate regardless
+//! of the declared grid.
+//!
+//! Production maintains the invariant: `IoBridge` resizes the scheduler in
+//! lockstep with the dirty-detection grid at the top of frame handling, before
+//! any tile can be enqueued or acknowledged, so every tracked tile is in
+//! range. A bridge constructed but never given a frame has a 0x0 grid and
+//! tracks nothing, which is correct — there is nothing to track yet.
 
 use crate::transport::scheduler::Handle;
 
 /// Cdf53 emits 14 progressive passes; single-pass codecs use index 0.
-pub const PASS_SLOTS: usize = 14;
+pub(crate) const PASS_SLOTS: usize = 14;
 
 /// Generations are 4 bits on the wire.
 const GENERATION_MASK: u8 = 0x0F;

@@ -5,7 +5,6 @@
 //! fields are reserved for M3.3 progressive refinement.
 
 use crate::transport::protocol::Codec;
-use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -15,7 +14,7 @@ pub use slab::{Handle, Slab};
 
 #[path = "scheduler/slots.rs"]
 pub mod slots;
-pub use slots::{SlotMap, TileSlot, PASS_SLOTS};
+pub use slots::{SlotMap, TileSlot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkState {
@@ -78,8 +77,6 @@ impl TileWork {
 pub struct Scheduler {
     cols: u32,
     rows: u32,
-    /// Per-tile generation counter, indexed `y * cols + x`. 4-bit wrap.
-    generations: Vec<u8>,
     /// FIFO of pending/in-flight priority tile work (single-pass codec emissions).
     /// Renamed from `queue` in M3.3a to distinguish from `refinement_queue`.
     priority_queue: VecDeque<TileWork>,
@@ -99,14 +96,16 @@ pub struct Scheduler {
     low_delivery_rounds: u32,
     /// Consecutive rounds with delivery rate at or above HIGH_DELIVERY threshold.
     high_delivery_rounds: u32,
-    /// Per-(tile_x, tile_y, generation) bitmap of received ACK pass_idxs.
-    /// Bit `i` set means pass `i` has been ACKed at least once. Duplicate
-    /// ACKs (e.g. from the AckBatcher overlap window where each batch
-    /// re-sends the last few ACKs) are idempotent: `bitmap |= 1 << pass`
-    /// is a no-op on a set bit. The previous u8 counter could be inflated
-    /// past `max_passes` by overlap, falsely satisfying tile_fully_acked
-    /// without all distinct passes having been delivered.
-    cdf53_passes_acked: HashMap<(u8, u8, u8), u16>,
+    /// Dense per-tile generation + ACK-pass-bitmap state, indexed
+    /// `tile_y * cols + tile_x`. Bit `i` of a slot's mask set means pass
+    /// `i` has been ACKed at least once for the slot's `current_gen`.
+    /// Duplicate ACKs (e.g. from the AckBatcher overlap window where each
+    /// batch re-sends the last few ACKs) are idempotent: `mask |= 1 << pass`
+    /// is a no-op on a set bit. At most one generation per tile is ever
+    /// live -- `bump_generation` supersedes the rest -- so a single mask
+    /// per tile is sufficient for the *readers*; see `slots.rs` and
+    /// `record_cdf53_ack` for why delivery accounting stays separate.
+    slots: SlotMap,
 }
 
 impl Scheduler {
@@ -114,7 +113,6 @@ impl Scheduler {
         Self {
             cols,
             rows,
-            generations: vec![0; (cols as usize) * (rows as usize)],
             priority_queue: VecDeque::new(),
             refinement_queue: VecDeque::new(),
             rtt: Duration::from_millis(20),
@@ -123,17 +121,16 @@ impl Scheduler {
             delivery_window_acked: 0,
             low_delivery_rounds: 0,
             high_delivery_rounds: 0,
-            cdf53_passes_acked: HashMap::new(),
+            slots: SlotMap::new(cols, rows),
         }
     }
 
     pub fn resize(&mut self, cols: u32, rows: u32) {
         self.cols = cols;
         self.rows = rows;
-        self.generations = vec![0; (cols as usize) * (rows as usize)];
         self.priority_queue.clear();
         self.refinement_queue.clear();
-        self.cdf53_passes_acked.clear();
+        self.slots.resize(cols, rows);
     }
 
     /// Drain all pending and in-flight work. Generations are preserved so
@@ -143,10 +140,11 @@ impl Scheduler {
     pub fn clear(&mut self) {
         self.priority_queue.clear();
         self.refinement_queue.clear();
-        // Per-(tile, gen) ACK counters are kept for the same reason
-        // `generations` is kept — a late ACK on a stale (tile, gen) is a
-        // safe no-op, and the counter is harmless until the next
-        // bump_generation for that tile clears it.
+        // Only queued handles are dropped; generations and ACK state are
+        // kept for the same reason they always were — a late ACK on a
+        // stale (tile, gen) is a safe no-op, and the mask is harmless
+        // until the next bump_generation for that tile clears it.
+        self.slots.clear_handles();
     }
 
     pub fn set_rtt(&mut self, rtt: Duration) {
@@ -188,8 +186,7 @@ impl Scheduler {
     }
 
     pub fn generation_for(&self, tile_x: u8, tile_y: u8) -> u8 {
-        let idx = (tile_y as usize) * (self.cols as usize) + (tile_x as usize);
-        self.generations.get(idx).copied().unwrap_or(0)
+        self.slots.generation(tile_x, tile_y)
     }
 
     /// Thin wrapper over `enqueue_at` using the wall clock. Non-harness
@@ -261,10 +258,7 @@ impl Scheduler {
 
     #[cfg(test)]
     pub fn cdf53_passes_acked_for_test(&self, tile_x: u8, tile_y: u8, generation: u8) -> u8 {
-        self.cdf53_passes_acked
-            .get(&(tile_x, tile_y, generation))
-            .map(|&bitmap| bitmap.count_ones() as u8)
-            .unwrap_or(0)
+        self.slots.acked_count(tile_x, tile_y, generation)
     }
 
     /// Mark every queued entry for `(tile_x, tile_y)` as `Superseded` so the
@@ -290,17 +284,12 @@ impl Scheduler {
     }
 
     pub fn bump_generation(&mut self, tile_x: u8, tile_y: u8) -> u8 {
-        let idx = (tile_y as usize) * (self.cols as usize) + (tile_x as usize);
-        let new_gen = (self.generations[idx] + 1) & 0x0F;
-        self.generations[idx] = new_gen;
         // Any queued work for this tile is now stale; mark Superseded so the
         // next tick drops it. Acked entries don't matter (already done).
         self.supersede_pending_for_tile(tile_x, tile_y);
-        // Drop any per-(tile, gen) ACK counters for the old gen — they're
-        // no longer relevant once the gen advances.
-        self.cdf53_passes_acked
-            .retain(|&(tx, ty, _g), _| !(tx == tile_x && ty == tile_y));
-        new_gen
+        // Per-tile ACK state is cleared by the bump itself; there is no
+        // longer a map to scan.
+        self.slots.bump_generation(tile_x, tile_y)
     }
 
     #[cfg(test)]
@@ -329,19 +318,27 @@ impl Scheduler {
         // the shift — better than a silent UB, still a bug we'd want to
         // catch.
         debug_assert!(pass_idx < 16, "pass_idx {pass_idx} out of bitmap range");
-        let bitmap = self
-            .cdf53_passes_acked
-            .entry((tile_x, tile_y, generation))
-            .or_insert(0);
-        let bit = 1u16 << (pass_idx & 0x0F);
-        let was_set = (*bitmap & bit) != 0;
-        *bitmap |= bit;
-        // Only count newly-acked passes toward the AIMD delivery window —
-        // duplicates don't reflect new wire delivery and would distort the
-        // bandwidth-budget heuristic if counted.
-        if !was_set {
-            self.delivery_window_acked = self.delivery_window_acked.saturating_add(1);
-        }
+        // Delivery accounting is generation-agnostic: this pass reached the
+        // client, and a later supersession does not un-deliver those bytes.
+        // The caller (`IoBridge::dispatch_ack_datagram`) passes the coverage
+        // entry's emit-time generation, which may already be stale by the
+        // time the ack arrives (ACK latency p50 is 145ms against a 33ms
+        // frame) — that must still count toward the AIMD delivery window,
+        // or churning screens under-count delivery and the refinement
+        // fraction halves more aggressively than intended.
+        // Duplicates cannot reach here -- `TransmissionLedger::resolve`
+        // removes the record, so a repeated `wire_seq` resolves to nothing
+        // and never becomes an ack. The old per-generation `was_set` dedup
+        // was belt-and-braces, not load-bearing.
+        self.delivery_window_acked = self.delivery_window_acked.saturating_add(1);
+        // Content completeness is generation-scoped: only the live
+        // generation's mask means anything to the readers (tile_fully_acked,
+        // cdf53_unacked_pass_mask, cdf53_unacked_tiles_for_gen), which are
+        // all queried with `generation_for`'s current value. An ack naming a
+        // superseded generation is silently ignored here — no reader would
+        // ever have found it under the old HashMap either, since every
+        // reader only ever looked up the tile's live generation.
+        self.slots.record_ack(tile_x, tile_y, generation, pass_idx);
     }
 
     /// Mark the matching InFlight entry in `priority_queue` as `Acked` so the
@@ -389,24 +386,15 @@ impl Scheduler {
     /// `IoBridge` to signal `CodecState::PixelPerfect` once a tile is
     /// fully refined.
     pub fn tile_fully_acked(&self, tile_x: u8, tile_y: u8, generation: u8, max_passes: u8) -> bool {
-        let needed: u16 = if max_passes >= 16 {
-            0xFFFF
-        } else {
-            (1u16 << max_passes) - 1
-        };
-        self.cdf53_passes_acked
-            .get(&(tile_x, tile_y, generation))
-            .is_some_and(|&bitmap| (bitmap & needed) == needed)
+        self.slots
+            .fully_acked(tile_x, tile_y, generation, max_passes)
     }
 
     /// Returns the number of **distinct** pass_idxs ACKed for this
     /// (tile, gen). Diagnostic accessor; PixelPerfect transition uses
     /// `tile_fully_acked` instead.
     pub fn cdf53_passes_acked_count(&self, tile_x: u8, tile_y: u8, generation: u8) -> u8 {
-        self.cdf53_passes_acked
-            .get(&(tile_x, tile_y, generation))
-            .map(|&bitmap| bitmap.count_ones() as u8)
-            .unwrap_or(0)
+        self.slots.acked_count(tile_x, tile_y, generation)
     }
 
     /// Bitmap of UNACKED passes for `(tile, gen)`. Bit i set means pass
@@ -424,17 +412,8 @@ impl Scheduler {
         generation: u8,
         max_passes: u8,
     ) -> u16 {
-        let full: u16 = if max_passes >= 16 {
-            0xFFFF
-        } else {
-            (1u16 << max_passes) - 1
-        };
-        let acked = self
-            .cdf53_passes_acked
-            .get(&(tile_x, tile_y, generation))
-            .copied()
-            .unwrap_or(0);
-        full & !acked
+        self.slots
+            .unacked_mask(tile_x, tile_y, generation, max_passes)
     }
 
     /// Filter the caller-provided `(tile, gen, max_passes)` tuples down to
@@ -448,12 +427,7 @@ impl Scheduler {
         candidates
             .iter()
             .filter_map(|&((tx, ty), gen, max_passes)| {
-                let acked = self
-                    .cdf53_passes_acked
-                    .get(&(tx, ty, gen))
-                    .map(|&bitmap| bitmap.count_ones() as u8)
-                    .unwrap_or(0);
-                (acked < max_passes).then_some((tx, ty))
+                (self.slots.acked_count(tx, ty, gen) < max_passes).then_some((tx, ty))
             })
             .collect()
     }
@@ -1252,6 +1226,7 @@ mod tests {
     #[test]
     fn tile_fully_acked_returns_true_after_all_passes_acked() {
         let mut s = Scheduler::new(4, 4);
+        s.bump_generation(2, 3); // make gen 1 the live generation
         assert!(!s.tile_fully_acked(2, 3, 1, 14));
         for pass in 0..13u8 {
             s.record_cdf53_ack(2, 3, 1, pass);
@@ -1267,6 +1242,7 @@ mod tests {
     #[test]
     fn tile_fully_acked_isolates_per_tile_and_gen() {
         let mut s = Scheduler::new(4, 4);
+        s.bump_generation(0, 0); // make gen 1 the live generation
         for pass in 0..14u8 {
             s.record_cdf53_ack(0, 0, 1, pass);
         }
@@ -1278,6 +1254,7 @@ mod tests {
     #[test]
     fn bump_generation_drops_old_gen_ack_counter() {
         let mut s = Scheduler::new(4, 4);
+        s.bump_generation(0, 0); // make gen 1 the live generation
         for pass in 0..14u8 {
             s.record_cdf53_ack(0, 0, 1, pass);
         }
@@ -1293,6 +1270,8 @@ mod tests {
     #[test]
     fn bump_generation_only_clears_target_tile() {
         let mut s = Scheduler::new(4, 4);
+        s.bump_generation(0, 0); // make gen 1 the live generation for both tiles
+        s.bump_generation(1, 1);
         for pass in 0..14u8 {
             s.record_cdf53_ack(0, 0, 1, pass);
             s.record_cdf53_ack(1, 1, 1, pass);
@@ -1309,6 +1288,7 @@ mod tests {
     #[test]
     fn record_cdf53_ack_increments_per_tile_gen_counter() {
         let mut s = Scheduler::new(4, 4);
+        s.bump_generation(2, 3); // make gen 1 the live generation
         assert!(!s.tile_fully_acked(2, 3, 1, 14));
         for p in 0..14u8 {
             s.record_cdf53_ack(2, 3, 1, p);
@@ -1319,6 +1299,7 @@ mod tests {
     #[test]
     fn record_cdf53_ack_isolates_per_tile_and_gen() {
         let mut s = Scheduler::new(4, 4);
+        s.bump_generation(0, 0); // make gen 1 the live generation
         for p in 0..14u8 {
             s.record_cdf53_ack(0, 0, 1, p);
         }
@@ -1500,6 +1481,10 @@ mod tests {
     #[test]
     fn cdf53_unacked_tiles_for_gen_lists_under_target() {
         let mut s = Scheduler::new(4, 4);
+        // Make gen 1 the live generation for all three tiles under test.
+        s.bump_generation(0, 0);
+        s.bump_generation(1, 0);
+        s.bump_generation(2, 0);
         // (0,0, gen=1): 3 of 14 acked → unacked.
         for p in 0..3u8 {
             s.record_cdf53_ack(0, 0, 1, p);
@@ -1522,11 +1507,12 @@ mod tests {
     #[test]
     fn record_cdf53_ack_is_idempotent_per_pass_idx() {
         let mut s = Scheduler::new(4, 4);
-        // ACK pass 3 of (2,3, gen=1) eleven times — should not satisfy
-        // tile_fully_acked(.., max_passes=14). Pre-fix this would have
-        // counted 11 and remained under threshold, but a 4×PASS dupe
-        // (4*4=16) would falsely pass; with the bitmap, no number of
-        // dupes of a single pass_idx can fool it.
+        s.bump_generation(2, 3); // make gen 1 the live generation
+                                 // ACK pass 3 of (2,3, gen=1) eleven times — should not satisfy
+                                 // tile_fully_acked(.., max_passes=14). Pre-fix this would have
+                                 // counted 11 and remained under threshold, but a 4×PASS dupe
+                                 // (4*4=16) would falsely pass; with the bitmap, no number of
+                                 // dupes of a single pass_idx can fool it.
         for _ in 0..11 {
             s.record_cdf53_ack(2, 3, 1, 3);
         }
@@ -1569,6 +1555,7 @@ mod tests {
     #[test]
     fn cdf53_unacked_pass_mask_with_full_acks_returns_zero() {
         let mut s = Scheduler::new(4, 4);
+        s.bump_generation(0, 0); // make gen 1 the live generation
         for p in 0..14u8 {
             s.record_cdf53_ack(0, 0, 1, p);
         }
