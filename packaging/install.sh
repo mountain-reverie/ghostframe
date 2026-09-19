@@ -245,6 +245,20 @@ info "enabling ghostframe.target for user $target_user..."
 info "enabling getty@tty1..."
 systemctl enable getty@tty1.service
 
+# Lingering is belt-and-braces next to the getty autologin above. The
+# autologin is what normally starts the target; lingering means the user
+# manager (and so the daemon) also survives a session that ends for any other
+# reason. Without it, starting the service by hand from a transient
+# su/machinectl session looks like it worked and then dies silently minutes
+# later when that session is reaped -- the unit log shows a clean shutdown,
+# not a fault, which sends anyone debugging it in the wrong direction.
+info "enabling lingering for $target_user..."
+if ! loginctl enable-linger "$target_user"; then
+  info "warn: could not enable lingering for $target_user."
+  info "      The daemon still starts via the getty autologin above, but it"
+  info "      will not survive that session ending."
+fi
+
 info ""
 info "installation complete."
 if [[ "$seeded" -eq 1 ]]; then

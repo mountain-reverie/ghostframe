@@ -4,4 +4,13 @@
 
 [Service]
 ExecStart=
-ExecStart=-/sbin/agetty -o '-p -- \\u' --autologin __USER__ --noclear %I $TERM
+# No `-o '-p -- \\u'`. That form is widely documented, but the `--` inside it
+# terminates agetty's own option parsing on util-linux 2.42.2, so
+# `--autologin` is swallowed as a positional argument and never registers:
+# agetty then execs `/bin/login -p --` with no username and the terminal sits
+# at an ordinary login prompt. The failure is silent — the unit reports
+# active, and the only symptom is that the session never appears.
+#
+# Passing the user directly has nothing to go wrong: no option terminator, no
+# `\u` substitution that depends on autologin having been parsed first.
+ExecStart=-/usr/bin/agetty --autologin __USER__ --noclear %I $TERM
