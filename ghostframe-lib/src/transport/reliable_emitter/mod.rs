@@ -56,6 +56,25 @@ pub const RTO_BACKOFF_FACTOR: u32 = 2;
 // any realistic ceiling.
 pub const CACHE_CAPACITY: usize = 32768;
 
+/// Gate for the acknowledgement-ordering measurement.
+///
+/// Set `GHOSTFRAME_ACK_ORDER_PROBE=1` to log the `wire_seq` of every
+/// acknowledgement entry in arrival order. Replaying an RFC 9002
+/// packet-threshold rule against that order tells us whether ordering-based
+/// loss inference is usable on a given path: the rule declares a
+/// transmission lost once 3 later ones are acknowledged, so it is only safe
+/// where reordering stays shallow *in sequence-number terms*.
+///
+/// Measured on the browserless netsim: 0% false declarations with no
+/// reordering, but 32% at a 2 ms reorder window, with inversions 140 deep.
+/// The sender is bursty -- hundreds of datagrams within microseconds -- so a
+/// small time window spans a large sequence range. This probe exists to find
+/// out what a real path does, since that result cannot be assumed.
+pub(crate) fn ack_order_probe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GHOSTFRAME_ACK_ORDER_PROBE").is_ok_and(|v| v == "1"))
+}
+
 /// [RTO-PROBE] temporary: gate for the retransmission-storm measurement.
 /// Set `GHOSTFRAME_RTO_PROBE=1` to emit one line per RTO fire and per
 /// acknowledgement, for offline histogramming. Remove with the probe.
