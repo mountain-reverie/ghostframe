@@ -6570,7 +6570,7 @@ mod tests {
                 pass_idx: 0,
                 codec: crate::transport::protocol::Codec::Cdf53,
                 palette_id: None,
-            palette_bundled: false,
+                palette_bundled: false,
             }];
         // Key: (frame_seq=100, tile_x=7, tile_y=9, pass_idx=0)
         bridge.fragment_coverage.record((100, 7, 9, 0), cov);
@@ -7246,7 +7246,7 @@ mod tests {
                 pass_idx: 0,
                 codec: crate::transport::protocol::Codec::PalRle,
                 palette_id: Some(7),
-            palette_bundled: true,
+                palette_bundled: true,
             }];
         // Key: (frame_seq=200, tile_x=0, tile_y=0, pass_idx=0)
         bridge.fragment_coverage.record((200, 0, 0, 0), cov);

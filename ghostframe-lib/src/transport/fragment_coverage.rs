@@ -284,7 +284,7 @@ mod tests {
                 pass_idx: 0,
                 codec: Codec::Cdf53,
                 palette_id: None,
-            palette_bundled: false,
+                palette_bundled: false,
             }]
         };
         // Same tile (5,3) spread across two frames and two passes (4 entries).
@@ -396,7 +396,7 @@ mod tests {
                 pass_idx,
                 codec: Codec::Cdf53,
                 palette_id: None,
-            palette_bundled: false,
+                palette_bundled: false,
             }]
         };
         // Record all 14 passes of tile (5,3) in frame 42 — no collision.
