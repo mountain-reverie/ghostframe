@@ -235,6 +235,16 @@ Carried deliberately into implementation rather than assumed away.
    standing, exactly the path the design leans on. **Confirmed positive**:
    the scheduler's 2xRTT retry is real end-to-end, independent of the
    emitter's RTO timer, and Phase 3 can delete that timer as planned.
+   **Confirmed by direct observation, not only by elimination.** Instrumenting
+   the re-emit site in `drain_priority_queue` prints exactly one
+   `SCHEDRETRY x=1 y=1 gen=0 pass=0` per run — one retry, naming the dropped
+   tile — in both the baseline and the `GHOSTFRAME_NO_RTO=1` run, where the
+   emitter's RTO fire count is zero. The mechanism was watched firing, so the
+   conclusion does not rest on having eliminated every alternative.
+
+   **Implication:** Phase 3 may delete the emitter's RTO timer. The case it
+   was believed to be the sole cover for is in fact covered by the scheduler.
+
 2. **ACK latency of p50 145 ms against an RTT-plus-batching floor of 75 ms is
    unexplained.** Every threshold here is sized on that distribution. If the
    tail is a harness artifact of the paused clock, the structure still holds
