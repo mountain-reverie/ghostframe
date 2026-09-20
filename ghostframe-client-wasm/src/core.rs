@@ -88,6 +88,37 @@ impl WasmClientCore {
         self.inner.poll_timeout()
     }
 
+    /// Per-tile Cdf53 coverage, for the client's diagnostics log.
+    ///
+    /// Returns `{ tiles, complete, partial, bitmap_unknown, gave_up,
+    /// pass_hist, line }`, where `line` is a preformatted one-line summary.
+    ///
+    /// This exists because the browser cannot derive coverage any more: the
+    /// TypeScript decode path that maintained `window.__cdf53Coverage` was
+    /// deleted at the wasm cutover, and the log line that read it reported
+    /// `tiles=0 refined=0` on sessions that had decoded thousands of tiles.
+    #[wasm_bindgen(js_name = cdf53Coverage)]
+    pub fn cdf53_coverage(&self) -> Result<JsValue, JsValue> {
+        let s = self.inner.cdf53_coverage_summary();
+        to_js(&crate::boundary::WasmCdf53Coverage::from(&s))
+    }
+
+    /// Tiles still missing at least one present pass, most-stalled first.
+    ///
+    /// `limit` caps the list so a fully stalled screen cannot produce a
+    /// 2040-entry log line. Each entry is
+    /// `{ tile_x, tile_y, pass_mask, present_passes, missing, sweep_attempts }`.
+    #[wasm_bindgen(js_name = cdf53IncompleteTiles)]
+    pub fn cdf53_incomplete_tiles(&self, limit: usize) -> Result<JsValue, JsValue> {
+        let v: Vec<crate::boundary::WasmCdf53IncompleteTile> = self
+            .inner
+            .cdf53_incomplete_tiles(limit)
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        to_js(&v)
+    }
+
     /// Encode a receiver-feedback report for the bidi stream.
     #[wasm_bindgen(js_name = encodeFeedback)]
     pub fn encode_feedback(&mut self, now_us: u64) -> Vec<u8> {

@@ -185,3 +185,81 @@ pub fn apply_cdf53_arrival(
         nack_passes,
     }
 }
+
+/// A snapshot of per-tile Cdf53 coverage, for diagnostics.
+///
+/// The browser used to compute this itself from a `window.__cdf53Coverage`
+/// map maintained by the TypeScript decode path. That path was deleted at
+/// the wasm cutover and the map was never repopulated, so the client's
+/// `cdf53-coverage` log line reported `tiles=0 refined=0` on sessions that
+/// had in fact decoded well over a thousand tiles. This puts the same view
+/// back, sourced from the state that actually exists.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Cdf53CoverageSummary {
+    /// Tiles with any coverage state at all.
+    pub tiles: u32,
+    /// Tiles whose received passes equal their `present_passes` bitmap.
+    pub complete: u32,
+    /// Tiles still missing at least one present pass.
+    pub partial: u32,
+    /// Tiles whose bitmap is still unknown because pass 0 has not arrived.
+    /// These cannot be judged complete at all, and can only ask for pass 0.
+    pub bitmap_unknown: u32,
+    /// Tiles that have exhausted their tail-sweep budget and stopped asking.
+    /// A non-zero count here is the signal that some tile is permanently
+    /// stuck at a partial pass set — i.e. rendering wrong, forever.
+    pub gave_up: u32,
+    /// Histogram over the number of received passes (index = popcount of
+    /// `pass_mask`, 0..=14).
+    pub pass_hist: [u32; 15],
+}
+
+impl Cdf53CoverageSummary {
+    /// Compact one-line form for a log.
+    pub fn to_log_line(&self) -> String {
+        let hist: Vec<String> = self
+            .pass_hist
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| **n > 0)
+            .map(|(i, n)| format!("{i}:{n}"))
+            .collect();
+        format!(
+            "tiles={} complete={} partial={} bitmap_unknown={} gave_up={} pass-hist{{{}}}",
+            self.tiles,
+            self.complete,
+            self.partial,
+            self.bitmap_unknown,
+            self.gave_up,
+            hist.join(" ")
+        )
+    }
+}
+
+/// Summarise a coverage map. `max_sweeps` is the tail-sweep give-up
+/// threshold, passed in so this stays a pure function over the map.
+pub fn summarize<'a, I>(entries: I, max_sweeps: u8) -> Cdf53CoverageSummary
+where
+    I: IntoIterator<Item = &'a CoverageEntry>,
+{
+    let mut s = Cdf53CoverageSummary::default();
+    for e in entries {
+        s.tiles += 1;
+        let received = e.pass_mask.count_ones() as usize;
+        s.pass_hist[received.min(14)] += 1;
+        match e.present_passes {
+            Some(present) => {
+                if e.pass_mask & present == present {
+                    s.complete += 1;
+                } else {
+                    s.partial += 1;
+                }
+            }
+            None => s.bitmap_unknown += 1,
+        }
+        if e.sweep_attempts >= max_sweeps {
+            s.gave_up += 1;
+        }
+    }
+    s
+}

@@ -413,6 +413,52 @@ impl ClientCore {
     /// gap-detection can fire again if arrivals resume. `last_change_us`
     /// is reset on every sweep of a stalled tile, so it isn't re-swept on
     /// the very next tick.
+    /// Snapshot of per-tile Cdf53 coverage, for diagnostics.
+    ///
+    /// Exposed because the browser can no longer derive this: the TypeScript
+    /// decode path that maintained `window.__cdf53Coverage` was deleted at
+    /// the wasm cutover, leaving the client's `cdf53-coverage` log line
+    /// reporting zeros on sessions that had decoded thousands of tiles.
+    ///
+    /// `gave_up` is the field worth watching: it counts tiles that have
+    /// exhausted `MAX_TAIL_SWEEP_ATTEMPTS` and stopped asking for the passes
+    /// they are missing, which means they are stuck at a partial pass set and
+    /// will render wrong for the rest of the session.
+    pub fn cdf53_coverage_summary(&self) -> crate::cdf53_coverage::Cdf53CoverageSummary {
+        crate::cdf53_coverage::summarize(self.cdf53_coverage.values(), MAX_TAIL_SWEEP_ATTEMPTS)
+    }
+
+    /// Coordinates of tiles still missing at least one present pass, with
+    /// their received and expected masks, capped at `limit` so a fully
+    /// stalled screen cannot produce a 2040-entry log line.
+    pub fn cdf53_incomplete_tiles(&self, limit: usize) -> Vec<(u8, u8, u16, u16, u8)> {
+        let mut out: Vec<(u8, u8, u16, u16, u8)> = self
+            .cdf53_coverage
+            .iter()
+            .filter_map(|((x, y), e)| {
+                let present = e.present_passes?;
+                (e.pass_mask & present != present).then_some((
+                    *x,
+                    *y,
+                    e.pass_mask,
+                    present,
+                    e.sweep_attempts,
+                ))
+            })
+            .collect();
+        // Most-stalled first, then by position so the list is stable.
+        out.sort_by_key(|(x, y, mask, present, sweeps)| {
+            (
+                std::cmp::Reverse(*sweeps),
+                (present & !mask).count_ones(),
+                *y,
+                *x,
+            )
+        });
+        out.truncate(limit);
+        out
+    }
+
     fn tail_sweep(&mut self, now_us: u64) {
         if now_us < self.next_tail_sweep_us {
             return;

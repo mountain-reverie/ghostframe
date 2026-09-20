@@ -816,7 +816,47 @@ async function main() {
         `fb:${fb.width}x${fb.height} ` +
         `cdf53fails:${cdf53Fails}(last=${cdf53Last}) ` +
         `raf:${__rafTicks} submit:${(window as unknown as { __gpuSubmitCount?: number }).__gpuSubmitCount ?? 0} lastSeq=${COUNTER_NOT_MEASURED}`;
-      const coverageLine = `cdf53-coverage: ${COUNTER_NOT_MEASURED} (per-tile pass coverage now lives in the wasm core)`;
+      // Per-tile Cdf53 coverage, read back from the wasm core -- the state
+      // that actually exists. This line reported `tiles=0 refined=0` for the
+      // whole post-cutover period because it was reading a `window` map whose
+      // only writer had been deleted; see COUNTER_NOT_MEASURED above.
+      //
+      // `gave_up` is the field to watch. It counts tiles that exhausted
+      // MAX_TAIL_SWEEP_ATTEMPTS and stopped asking for the passes they are
+      // missing, so they are stuck at a partial pass set and will render
+      // wrong for the rest of the session. `incomplete` then names them.
+      let coverageLine: string;
+      let incompleteLine: string | null = null;
+      try {
+        const cov = core.cdf53Coverage() as {
+          line: string;
+          partial: number;
+          gaveUp?: number;
+          gave_up?: number;
+        };
+        coverageLine = `cdf53-coverage: ${cov.line}`;
+        const stuck = cov.gave_up ?? cov.gaveUp ?? 0;
+        if (cov.partial > 0 || stuck > 0) {
+          const worst = core.cdf53IncompleteTiles(8) as Array<{
+            tile_x: number;
+            tile_y: number;
+            missing: number;
+            sweep_attempts: number;
+          }>;
+          incompleteLine =
+            'cdf53-incomplete: ' +
+            worst
+              .map(
+                t =>
+                  `(${t.tile_x},${t.tile_y}) missing=0b${t.missing
+                    .toString(2)
+                    .padStart(14, '0')} sweeps=${t.sweep_attempts}`,
+              )
+              .join(' ');
+        }
+      } catch (e) {
+        coverageLine = `cdf53-coverage: unavailable (${String(e)})`;
+      }
       // Reliable-tile-emitter coverage: FEC recoveries + parity / NACK traffic.
       // Pairs with the server's reliability counters (Task 35) for side-by-side
       // wire-loss inspection. `parity_rx` / `recovered` / `parity_unrecoverable`
@@ -859,6 +899,7 @@ async function main() {
         __lastStatsLineKey = lineKey;
         log(statsLine);
         log(coverageLine);
+        if (incompleteLine) log(incompleteLine);
         log(fecCoverageLine);
         log(bweTierLine);
       }
