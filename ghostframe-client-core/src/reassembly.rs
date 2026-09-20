@@ -279,7 +279,13 @@ impl ClientCore {
                         return;
                     }
                 },
-                _ => unreachable!("matches! above restricts to Raw | Solid"),
+                // The `matches!` guard above admits only Raw and Solid.
+                // Listed rather than `_` so that widening that guard to a new
+                // codec fails to compile here instead of hitting an
+                // `unreachable!` at runtime on real wire data.
+                Codec::Skip | Codec::H264 | Codec::PalRle | Codec::Cdf53 => {
+                    unreachable!("matches! above restricts to Raw | Solid")
+                }
             };
             events.push(Event::TilePayload {
                 frame_seq,

@@ -1,3 +1,18 @@
+//! ## Catch-all match arms
+//!
+//! `clippy::wildcard_enum_match_arm` is on for non-test code in this crate.
+//! A `_ =>` arm that silently absorbs unknown variants has twice hidden real
+//! defects here: a wrong classifier that stood for three months, and inbound
+//! routing that fed every non-NACK datagram to the ACK parser. Listing the
+//! variants makes adding one a compile error at every site that must decide
+//! about it.
+//!
+//! Wildcards that fail *loudly* (`other => panic!(...)` in a test) are fine,
+//! which is why the lint is scoped to `not(test)`. A wildcard that is
+//! genuinely required -- a foreign enum we do not control -- takes a local
+//! `#[allow]` with a reason, so every exception is a decision on the record.
+#![cfg_attr(not(test), warn(clippy::wildcard_enum_match_arm))]
+
 //! Sans-IO QUIC + WebTransport client session wrapping `ClientCore`.
 //!
 //! There is deliberately no dial API and no socket code in this crate: the
@@ -317,7 +332,21 @@ impl ClientNet {
                         reason: reason.to_string(),
                     });
                 }
-                _ => {}
+                // Deliberately ignored, listed rather than caught by `_`.
+                // `quinn_proto::Event` is not `#[non_exhaustive]`, so naming
+                // the variants is possible -- and it means a quinn-proto
+                // upgrade that adds an event breaks the build here instead of
+                // being silently dropped on the transport's hot path.
+                //
+                // - `HandshakeDataReady`: session readiness is driven by the
+                //   WebTransport CONNECT response, not by this event.
+                // - `Stream(_)`: stream readiness is polled directly in the
+                //   feedback-stream drain below, not event-driven.
+                // - `DatagramsUnblocked`: send capacity is re-checked on the
+                //   next poll; there is no queued-send backlog to flush.
+                quinn_proto::Event::HandshakeDataReady
+                | quinn_proto::Event::Stream(_)
+                | quinn_proto::Event::DatagramsUnblocked => {}
             }
         }
 
