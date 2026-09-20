@@ -395,6 +395,7 @@ pub fn apply_cdf53_arrival(
         pass_mask: prev_pass_mask,
         nacked_mask: prev_nacked_mask,
         last_change_us: prev_last_change_us,
+        sweep_attempts: 0,
     });
     let out = WasmArrivalOutcome::from(cdf53_coverage::apply_cdf53_arrival(
         prev,
