@@ -13,6 +13,9 @@ export interface PrevalidatedCdf53 {
   gen: number;     // 0..15
   passIdx: number; // 0..13
   bitPlanes: Uint8Array; // 384 = 128 × 3 (B, G, R)
+  /** `present_passes` bitmap, non-null only on pass 0. See
+   *  `Cdf53Pipeline.passesProcessedCpu` for why the GPU needs it. */
+  presentPasses?: number | null;
 }
 
 /**
@@ -38,6 +41,47 @@ export interface PrevalidatedCdf53 {
  *
  * Cleared on `clearAllState()` (called from `WebGpuRenderer.onSessionReset`).
  */
+/** All 14 Cdf53 pass bits. */
+const FULL_PASS_MASK = (1 << 14) - 1;
+
+/**
+ * `passesProcessed` for a tile: how many leading bit-planes the inverse
+ * shaders may treat as decoded, which is what `read_coeff` uses to decide
+ * its midpoint correction (`14 - K` unknown low bits, skipped at K >= 14).
+ *
+ * `presentPasses` is the tile's bitmap from pass 0, or 0 when pass 0 has not
+ * arrived. `receivedMask` is which passes have landed for this generation.
+ *
+ * With the bitmap known, a pass the encoder *skipped* is resolved — it is
+ * known zero, not merely undelivered — which is exactly how
+ * `Cdf53TileState::integrate` treats it (it backfills an all-zero plane).
+ * K is then the contiguous prefix of resolved passes and reaches 14 once
+ * every present pass has landed, so no midpoint is applied to a tile that
+ * is in fact losslessly reconstructed.
+ *
+ * Without the bitmap, fall back to `max(passIdx + 1)`: nothing better is
+ * knowable, and the Rust decoder behaves identically in that state.
+ *
+ * Exported as a pure function so the rule is testable without a GPUDevice;
+ * its numerical consequences are pinned in
+ * `ghostframe-client-core/tests/oracle_gpu_sparse.rs`.
+ */
+export function computePassesProcessed(
+  receivedMask: number,
+  presentPasses: number,
+  prevPassesProcessed: number,
+  passIdx: number,
+): number {
+  const present = presentPasses & FULL_PASS_MASK;
+  if (present === 0) {
+    return Math.max(prevPassesProcessed, passIdx + 1);
+  }
+  const resolved = (receivedMask | ~present) & FULL_PASS_MASK;
+  let k = 0;
+  while (k < 14 && (resolved & (1 << k)) !== 0) k++;
+  return k;
+}
+
 export class Cdf53Pipeline {
   // Persistent per-tile state.
   coefficientBuffer!: GPUBuffer;
@@ -68,6 +112,24 @@ export class Cdf53Pipeline {
   // time an entry arrives (max with passIdx + 1), then writeBuffer'd to the
   // GPU before the integrate dispatch.
   private passesProcessedCpu: Uint32Array = new Uint32Array(0);
+  // Per-tile `present_passes` bitmap (0 = not yet known) and the mask of
+  // passes actually received for the current generation.
+  //
+  // Without the bitmap, `passesProcessed` was `max(passIdx + 1)`. That is
+  // only equal to "number of decoded bit-planes" when passes are contiguous.
+  // Sparse encoding skips empty planes, and when it skips *trailing* ones
+  // the max under-counts: read_coeff then reads "K of 14 decoded, low bits
+  // unknown" and adds a midpoint for bits that were skipped precisely
+  // because they are zero. Measured at 16/255 per channel on flat content
+  // (present = {0,6,7,8} ⇒ K=9 ⇒ midpoint 2^4), against a Rust decoder that
+  // is exact on the same input — see
+  // ghostframe-client-core/tests/oracle_gpu_sparse.rs.
+  //
+  // With the bitmap we mirror `Cdf53TileState::integrate`: an absent pass is
+  // *resolved* (known zero), so K is the contiguous prefix of resolved
+  // passes and reaches 14 once every present pass has landed.
+  private presentPassesCpu: Uint16Array = new Uint16Array(0);
+  private receivedMaskCpu: Uint16Array = new Uint16Array(0);
   private cols: number = 0;
 
   // M3.3b diagnostic: per-tile capture. When (watcherX, watcherY) is set,
@@ -210,6 +272,8 @@ export class Cdf53Pipeline {
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
     });
     this.passesProcessedCpu = new Uint32Array(maxTiles);
+    this.presentPassesCpu = new Uint16Array(maxTiles);
+    this.receivedMaskCpu = new Uint16Array(maxTiles);
     this.dirtyTilesBuffer = this.device.createBuffer({
       size: Math.max(maxTiles, 1) * 4,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
@@ -302,6 +366,8 @@ export class Cdf53Pipeline {
     this.device.queue.writeBuffer(this.passesProcessedBuffer, 0, passesZeros);
     this.lastSeenGen.fill(0);
     this.passesProcessedCpu.fill(0);
+    this.presentPassesCpu.fill(0);
+    this.receivedMaskCpu.fill(0);
   }
 
   /** Returns the framebuffer view for binding by the L1 inverse shader. */
@@ -356,18 +422,37 @@ export class Cdf53Pipeline {
       if (this.lastSeenGen[tileIdx] !== e.gen && !clearedTiles.has(tileIdx)) {
         this.device.queue.writeBuffer(this.coefficientBuffer, tileIdx * 6144, this.coefZeroPerTile);
         this.device.queue.writeBuffer(this.signBuffer, tileIdx * 384, this.signZeroPerTile);
-        // Gen bump also resets pass-count tracking for the tile.
+        // Gen bump also resets pass-count tracking for the tile. The
+        // bitmap is per-generation too: a new generation re-encodes the
+        // tile and may have a different present set entirely.
         this.passesProcessedCpu[tileIdx] = 0;
+        this.presentPassesCpu[tileIdx] = 0;
+        this.receivedMaskCpu[tileIdx] = 0;
         this.lastSeenGen[tileIdx] = e.gen;
         clearedTiles.add(tileIdx);
       }
-      // Track highest-seen pass index for the midpoint-reconstruction in
-      // the inverse shaders. Stores pass_idx + 1 so the GPU side reads
-      // "number of processed passes" (matches Rust decode_passes semantics).
-      const candidate = e.passIdx + 1;
-      if (candidate > this.passesProcessedCpu[tileIdx]) {
-        this.passesProcessedCpu[tileIdx] = candidate;
+      // Track which passes have landed, and the tile's present set once
+      // pass 0 teaches us it.
+      this.receivedMaskCpu[tileIdx] |= 1 << e.passIdx;
+      if (e.presentPasses != null) {
+        this.presentPassesCpu[tileIdx] = e.presentPasses & FULL_PASS_MASK;
       }
+      // `passesProcessed` for the inverse shaders' midpoint reconstruction.
+      //
+      // Known bitmap: a pass the encoder skipped is resolved (known zero),
+      // exactly as `Cdf53TileState::integrate` treats it by backfilling an
+      // all-zero plane. K is then the contiguous prefix of resolved passes,
+      // which reaches 14 — no midpoint — once every present pass has landed.
+      //
+      // Unknown bitmap (pass 0 not yet delivered): fall back to the old
+      // max(passIdx + 1). Nothing better is knowable, and it matches what
+      // the Rust decoder does in the same state.
+      this.passesProcessedCpu[tileIdx] = computePassesProcessed(
+        this.receivedMaskCpu[tileIdx],
+        this.presentPassesCpu[tileIdx],
+        this.passesProcessedCpu[tileIdx],
+        e.passIdx,
+      );
       touchedTiles.add(tileIdx);
     }
     // Upload the (possibly sparse) passes-processed updates. For batch sizes

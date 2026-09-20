@@ -493,7 +493,7 @@ async function main() {
     | { codec: 'Raw'; bytes: Uint8Array }
     | { codec: 'Solid'; bytes: Uint8Array }
     | { codec: 'PalRle'; palette_id: number; count: number; indices: Uint8Array }
-    | { codec: 'Cdf53'; pass_idx: number; bit_planes: Uint8Array };
+    | { codec: 'Cdf53'; pass_idx: number; bit_planes: Uint8Array; present_passes?: number | null };
 
   type WasmEvent =
     | { kind: 'TileReady'; frame_seq: number; tile_x: number; tile_y: number; rgba: Uint8Array }
@@ -577,6 +577,7 @@ async function main() {
               gen: ev.generation,
               passIdx: d.pass_idx,
               bitPlanes: d.bit_planes,
+              presentPasses: d.present_passes,
             });
             sampleBytes = d.bit_planes;
             break;
