@@ -479,3 +479,55 @@ mod tests {
         }
     }
 }
+
+/// Serde mirror of `Cdf53CoverageSummary`, plus a preformatted `line` so the
+/// client does not have to re-derive the same string in TypeScript.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WasmCdf53Coverage {
+    pub tiles: u32,
+    pub complete: u32,
+    pub partial: u32,
+    pub bitmap_unknown: u32,
+    pub gave_up: u32,
+    pub pass_hist: Vec<u32>,
+    pub line: String,
+}
+
+impl From<&ghostframe_client_core::cdf53_coverage::Cdf53CoverageSummary> for WasmCdf53Coverage {
+    fn from(s: &ghostframe_client_core::cdf53_coverage::Cdf53CoverageSummary) -> Self {
+        Self {
+            tiles: s.tiles,
+            complete: s.complete,
+            partial: s.partial,
+            bitmap_unknown: s.bitmap_unknown,
+            gave_up: s.gave_up,
+            pass_hist: s.pass_hist.to_vec(),
+            line: s.to_log_line(),
+        }
+    }
+}
+
+/// One tile that has not reached its full pass set.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WasmCdf53IncompleteTile {
+    pub tile_x: u8,
+    pub tile_y: u8,
+    pub pass_mask: u16,
+    pub present_passes: u16,
+    /// `present_passes & !pass_mask` — the passes still owed.
+    pub missing: u16,
+    pub sweep_attempts: u8,
+}
+
+impl From<(u8, u8, u16, u16, u8)> for WasmCdf53IncompleteTile {
+    fn from((tile_x, tile_y, pass_mask, present_passes, sweep_attempts): (u8, u8, u16, u16, u8)) -> Self {
+        Self {
+            tile_x,
+            tile_y,
+            pass_mask,
+            present_passes,
+            missing: present_passes & !pass_mask,
+            sweep_attempts,
+        }
+    }
+}
