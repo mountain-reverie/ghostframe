@@ -511,75 +511,85 @@ async fn bwe_estimator_is_fed_and_epoch_consistent() {
 /// an acknowledgement is back long before any timer could fire. The bug this
 /// guards lives entirely in the gap between that and a real path.
 ///
-/// `rto_for_attempt` computes `min(max(2 x smoothed_rtt, 25ms), BASE_RTO_MS)`
-/// for a first attempt, and `BASE_RTO_MS` is 50 ms. That `min` is a *ceiling*:
-/// no matter how slow the path, the first retransmission timer never exceeds
-/// 50 ms. On any link whose round trip is slower than that, the timer expires
-/// before an acknowledgement can physically arrive, so every datagram is
-/// retransmitted at least once — not because anything was lost, but because
-/// the timer cannot be set correctly.
+/// `rto_for_attempt` used to compute `min(max(2 x smoothed_rtt, 25ms),
+/// BASE_RTO_MS)` for a first attempt, and `BASE_RTO_MS` was 50 ms. That `min`
+/// was a *ceiling*: no matter how slow the path, the first retransmission
+/// timer never exceeded 50 ms. On any link whose round trip was slower than
+/// that, the timer expired before an acknowledgement could physically
+/// arrive, so every datagram was retransmitted at least once — not because
+/// anything was lost, but because the timer couldn't be set correctly.
 ///
-/// Compounding it, `ReliableTileEmitter::set_smoothed_rtt` is never called
-/// from anywhere, so `smoothed_rtt` also stays at its 20 ms constructor
-/// default and the ceiling is reached from below as well.
+/// Compounding it, `ReliableTileEmitter::set_smoothed_rtt` was never called
+/// from anywhere, so `smoothed_rtt` also stayed at its 20 ms constructor
+/// default and the ceiling was reached from below as well.
 ///
-/// Observed in production on a tailnet path: `rto_fired=65331` and
-/// `retransmit_attempts_total=88118` against 43981 datagrams actually
-/// emitted — roughly twice as many retransmission attempts as transmissions —
-/// while `emitter_ack_hits` covered 99.7% of originals. Nearly everything
-/// arrived; the retransmissions were spurious. That storm pushed queued
-/// latency to a 14.7 s mean (59 s max) and the first frame never converged,
-/// which is what a user sees as tiles that never finish arriving.
+/// Observed in production on a tailnet path: `rto_fired=33685` and
+/// `retransmit_attempts_total=44207` against 26578 fresh emissions — 1.7x
+/// more retransmission than actual picture — while `emitter_ack_hits`
+/// covered every single emission (`emitter_ack_misses=59`). Nothing was
+/// lost; the retransmissions were spurious. Mean ACK latency was 29 ms, but
+/// the max was 103 ms over 6517 samples — a fixed deadline anywhere near
+/// that mean loses to the tail constantly. That storm competed with first
+/// paint for wire bandwidth, which is what a user sees as a screen that
+/// takes many seconds to converge.
 ///
-/// # Gate: the stranding fix, measured
+/// # Gate: two fixes, measured
 ///
 /// This began as a deliberately-failing reproduction of an open bug: **1788
 /// spurious retransmissions** on a link that drops nothing, with one
 /// acknowledgement arriving for every tile-pass the scene emits — so every
 /// pass *was* acknowledged and every retransmission was waste.
 ///
-/// Root cause, found here rather than in a live session: since
-/// acknowledgements began naming a `wire_seq` rather than content, the server
-/// must translate that back through `TransmissionLedger` before it can release
-/// a cache entry. `expire()` deleted that translation when it declared a
-/// transmission lost, and nothing re-established it — so an acknowledgement
-/// arriving afterwards resolved to nothing, `on_ack` never ran, and the entry
-/// retransmitted at the backoff ceiling for the rest of the session. Measured:
-/// 1458 transmissions expired, and **all 1458 were acknowledged afterwards**,
-/// against a 236 ms horizon and an acknowledgement p90 of 251 ms. Nothing was
-/// lost; the race was simply lost permanently.
+/// **Fix 1 (stranding).** Since acknowledgements began naming a `wire_seq`
+/// rather than content, the server had to translate that back through
+/// `TransmissionLedger` before it could release a cache entry. `expire()`
+/// deleted that translation when it declared a transmission lost, and
+/// nothing re-established it — so an acknowledgement arriving afterwards
+/// resolved to nothing, `on_ack` never ran, and the entry retransmitted at
+/// the backoff ceiling for the rest of the session. Measured: 1458
+/// transmissions expired, and **all 1458 were acknowledged afterwards**,
+/// against a 236 ms horizon and an acknowledgement p90 of 251 ms. Nothing
+/// was lost; the race was simply lost permanently. Bounded tombstones in
+/// the ledger fixed that, dropping the count from 1788 to 320.
 ///
-/// Bounded tombstones in the ledger fixed that, and this test now passes. The
-/// residual 320 is a second, independent cause — the timer fires at 40 ms
-/// while an acknowledgement cannot arrive before ~85 ms — which Phase 3
-/// removes by deleting the timer. See the assertion below for how to tell the
-/// two apart if this ever regresses.
+/// **Fix 2 (the fixed deadline itself).** The residual 320 was a second,
+/// independent cause: the timer fired at 40 ms while an acknowledgement
+/// couldn't arrive before ~85 ms on this link, so each in-flight emission
+/// retransmitted exactly once and was then acknowledged — every one at
+/// `attempts=0`, no backoff chain, max age 267 ms (the ACK p90). That's a
+/// timer racing latency, not a stranding regression. Deleting the timer
+/// outright was considered and rejected: the scheduler's own 2xRTT
+/// `InFlight` retry covers the one case a receiver can't see (a tile whose
+/// only datagram is lost, then static), but disabling the RTO entirely
+/// removes the last-resort cover for every other case. Instead the
+/// deadline now derives from a rolling p95 of measured ACK latency
+/// (`ack_latency::AckLatencyTracker`), doubled and clamped to
+/// `[150ms, 2s]` (see `rto_for_attempt`'s doc comment) — a deadline that
+/// tracks the path instead of guessing at it. Measured on this scene: 320
+/// -> 128, all of which are the same signature as before (deadline still
+/// slightly under the true ACK latency for a bursty first-paint sender, but
+/// now within the p95-derived floor's design margin rather than racing a
+/// fixed 40 ms constant).
 ///
 /// Causes checked and ruled out along the way, recorded so they are not
 /// re-tried:
 ///
-/// - Not the 50 ms `rto_for_attempt` ceiling alone. Removing it changed the
-///   count by less than 1%, and that ceiling is a deliberate decision pinned
-///   by `rto_first_attempt_high_rtt_caps_at_50ms` — a slow first retry means
-///   a visibly stuck tile, which is presumably why it is capped.
-/// - Not `set_smoothed_rtt` never being called (it isn't, anywhere). Wiring
-///   quinn's measured RTT through moved the count by 11 out of 1788.
-/// - Not the 20 ms `smoothed_rtt` default used before the first path sample.
-///   Raising it to 100 ms changed nothing and broke 7 tests that encode the
-///   old timing.
+/// - Not the 50 ms `rto_for_attempt` ceiling alone (pre-fix). Removing it
+///   changed the count by less than 1%.
+/// - Not `set_smoothed_rtt` never being called (it wasn't, anywhere; the
+///   field and setter are gone now). Wiring quinn's measured RTT through
+///   moved the count by 11 out of 1788.
+/// - Not the 20 ms `smoothed_rtt` default used before the first path
+///   sample. Raising it to 100 ms changed nothing and broke 7 tests that
+///   encoded the old timing.
 /// - Not `ASSEMBLY_TIMEOUT_US` being 30 ms, below the server's own 33.3 ms
 ///   scheduler tick. Raising it to 250 ms changed nothing on its own,
 ///   although the inversion still looks wrong.
-///
-/// Four plausible causes, each individually ruled out by measurement rather
-/// than argument. Whatever drives this is something else, and the next
-/// attempt should start by measuring the actual emit-to-acknowledgement
-/// latency distribution against the timer that fires, rather than reasoning
-/// about which constant looks too small.
 #[tokio::test(start_paused = true)]
 async fn a_lossless_link_with_a_real_rtt_does_not_retransmit() {
     // 35 ms each way = 70 ms round trip: unremarkable for wifi or a tailnet
-    // hop, and comfortably past the 50 ms ceiling.
+    // hop, and comfortably past the old 50 ms ceiling this test was written
+    // to catch.
     const ONE_WAY_US: u64 = 35_000;
 
     let scene = BrowserlessScene {
@@ -615,34 +625,33 @@ async fn a_lossless_link_with_a_real_rtt_does_not_retransmit() {
         r.bytes_delivered_s2c
     );
 
-    // Gates the stranding fix, not the whole storm. Two distinct causes were
-    // measured here; Phase 2 removed one of them.
+    // Gates both fixes now (see the doc comment above for the full history):
+    // the ledger-tombstone fix (1788 -> 320) and the ack-latency-derived RTO
+    // deadline that replaced the fixed 40 ms timer (320 -> 128, measured
+    // deterministically across repeated runs -- `retransmit_attempts_total`
+    // does not vary with `bytes_delivered_s2c`'s minor run-to-run jitter).
     //
-    // Was 1788. Now 320, deterministically across repeated runs, and **every
-    // one of those 320 is a first attempt** (`attempts=0`) with no backoff
-    // chain and a maximum age of 267 ms, which is the acknowledgement p90.
-    // That is the signature of the remaining cause: the retransmission timer
-    // fires at 40 ms while an acknowledgement cannot arrive before ~85 ms on
-    // this link, so each in-flight emission is retransmitted exactly once and
-    // then acknowledged. No entry is immortal any more.
-    //
-    // The 1468-retransmission difference was the stranding: a transmission
-    // expired from the ledger lost its `wire_seq` translation, so its
-    // acknowledgement resolved to nothing, `on_ack` never ran, and its cache
-    // entry retransmitted at the backoff ceiling until the session ended.
-    //
-    // Phase 3 deletes the timer outright — the scheduler's own 2xRTT retry
-    // already covers the one case the timer was believed to be the sole cover
-    // for — and tightens this bound to 20.
+    // 128 is not zero: the deadline is `clamp(ack_p95 * 2, 150ms, 2s)`, and
+    // on this link the measured p95 lands close enough to the 150 ms floor
+    // that a first-paint burst still occasionally beats its own deadline
+    // before the tracker's window reflects the burst's true latency. That
+    // is a materially different signature from either prior cause (no
+    // stranding, no fixed-constant race) and 128 is small enough that it no
+    // longer competes meaningfully with first paint. Tightened from < 400
+    // to keep a large margin above 128 for run-to-run variance while still
+    // catching a regression back toward either prior cause; do not raise it
+    // back toward 400 without measuring why 128 grew.
     assert!(
-        r.retransmit_attempts_total < 400,
-        "a lossless {}ms-RTT link retransmitted {} times, against 320 measured \
-         after the ledger-tombstone fix. Nothing was lost. A number near 1788 \
-         means late acknowledgements are stranding their cache entries again; \
-         a number between 400 and 1788 means something new also strands them. \
+        r.retransmit_attempts_total < 200,
+        "a lossless {}ms-RTT link retransmitted {} times, against 128 measured \
+         with the ack-latency-derived RTO deadline. Nothing was lost. A number \
+         near 1788 means late acknowledgements are stranding their cache \
+         entries again; a number near 320 means the deadline is back to \
+         racing a fixed constant instead of tracking measured latency. \
          Diagnose with GHOSTFRAME_RTO_PROBE=1 and look at the `attempts=` \
-         distribution — all-zero means first-fires only, which is the timer \
-         racing acknowledgement latency rather than a stranding regression.",
+         and `rto_us=` distribution, and at the `rto_ack_latency_p95_us` / \
+         `rto_first_attempt_deadline_us` fields on the `cumulative emit` log \
+         line.",
         (ONE_WAY_US * 2) / 1000,
         r.retransmit_attempts_total
     );

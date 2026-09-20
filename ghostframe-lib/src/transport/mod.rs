@@ -1,4 +1,5 @@
 pub use ghostframe_protocol::ack;
+pub mod ack_latency;
 pub mod bwe;
 pub mod client_caps;
 pub mod decode_error;

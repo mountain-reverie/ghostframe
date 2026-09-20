@@ -19,7 +19,14 @@ pub struct ReliableTileEmitter {
     pub(crate) queue: EmissionQueue,
     pub(crate) group: GroupBuilder,
     pub(crate) rto: RtoTimerWheel,
-    pub(crate) smoothed_rtt: Duration,
+    /// Latest measured ACK-latency p95, fed from `IoBridge` via
+    /// `set_ack_deadline` once per BWE-sample drain. `rto_for_attempt`
+    /// derives the actual first-attempt RTO deadline from this (doubling,
+    /// then floor/ceiling clamp — see that function's doc comment).
+    /// `Duration::ZERO` before the first measurement arrives, which
+    /// `rto_for_attempt`'s floor clamps to a safe default rather than
+    /// racing a real latency at zero.
+    pub(crate) ack_deadline: Duration,
     /// Reference instant this emitter was constructed with. Tile-datagram
     /// emit stamps (`DatagramHeader.timestamp_us`) are measured as
     /// `now.duration_since(time_base)` rather than the wall clock, so they
@@ -75,15 +82,19 @@ impl ReliableTileEmitter {
             queue: EmissionQueue::new(),
             group: GroupBuilder::new(FEC_GROUP_SIZE_K),
             rto: RtoTimerWheel::new(),
-            smoothed_rtt: Duration::from_millis(20),
+            ack_deadline: Duration::ZERO,
             time_base: now,
             transmissions: Vec::new(),
             stats: EmitterStats::default(),
         }
     }
 
-    pub fn set_smoothed_rtt(&mut self, rtt: Duration) {
-        self.smoothed_rtt = rtt;
+    /// Update the measured ACK-latency p95 that `rto_for_attempt` derives
+    /// the first-attempt RTO deadline from. Called by `IoBridge` once per
+    /// BWE-sample drain (see `ack_latency::AckLatencyTracker`) — cheap, a
+    /// plain field write.
+    pub fn set_ack_deadline(&mut self, d: Duration) {
+        self.ack_deadline = d;
     }
 
     /// Submit one tile-pass with a single payload buffer. The buffer is
@@ -141,12 +152,12 @@ impl ReliableTileEmitter {
             first_sent_at: now,
             last_sent_at: now,
             attempts: 0,
-            rto_deadline: now + rto_for_attempt(self.smoothed_rtt, 0),
+            rto_deadline: now + rto_for_attempt(self.ack_deadline, 0),
             probe,
         };
         self.cache.insert(key, entry);
         self.rto
-            .schedule(key, now + rto_for_attempt(self.smoothed_rtt, 0));
+            .schedule(key, now + rto_for_attempt(self.ack_deadline, 0));
         // Feed group builder; on K-th source build & schedule parity envelope.
         self.feed_group(wire_seq, &bytes);
         // Enqueue the source itself.
@@ -259,7 +270,7 @@ impl ReliableTileEmitter {
                     now.saturating_duration_since(entry.first_sent_at).as_micros(),
                     now.saturating_duration_since(entry.last_sent_at).as_micros(),
                     entry.attempts,
-                    rto_for_attempt(self.smoothed_rtt, entry.attempts).as_micros(),
+                    rto_for_attempt(self.ack_deadline, entry.attempts).as_micros(),
                 );
             }
             // Bump attempts, re-enqueue every cached fragment, reschedule RTO.
@@ -283,7 +294,7 @@ impl ReliableTileEmitter {
             // delay gradient tolerates the ambiguity; the probe-rate
             // division does not, so only the latter opts out.
             entry.probe = None;
-            let new_rto = rto_for_attempt(self.smoothed_rtt, entry.attempts);
+            let new_rto = rto_for_attempt(self.ack_deadline, entry.attempts);
             entry.rto_deadline = now + new_rto;
             let frags: Vec<Vec<u8>> = entry.fragments.iter().map(|b| b.to_vec()).collect();
             // [H3-DIAG] log every actual retransmit. Captures the EmitKey
@@ -681,7 +692,7 @@ mod tests {
         assert_eq!(sender.sent.len(), 1);
         let entry_first_sent = e.cache.get(&key).unwrap().first_sent_at;
         // Advance past RTO; tick should retransmit.
-        let t1 = t0 + Duration::from_millis(60);
+        let t1 = t0 + Duration::from_millis(160);
         e.tick(t1, usize::MAX);
         e.drain(&mut sender, t1);
         assert_eq!(sender.sent.len(), 2);
@@ -713,7 +724,7 @@ mod tests {
         let first = wire_seq_of(&sender.sent[0]);
 
         // RTO retransmit.
-        let t1 = t0 + Duration::from_millis(60);
+        let t1 = t0 + Duration::from_millis(160);
         e.tick(t1, usize::MAX);
         e.drain(&mut sender, t1);
         assert_eq!(sender.sent.len(), 2);
@@ -761,7 +772,7 @@ mod tests {
             "the first transmission is a genuine member of cluster 7"
         );
 
-        let t1 = t0 + Duration::from_millis(60);
+        let t1 = t0 + Duration::from_millis(160);
         e.tick(t1, usize::MAX);
         e.drain(&mut sender, t1);
 
@@ -808,7 +819,7 @@ mod tests {
         e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
         e.drain(&mut sender, t0);
         e.on_ack(&[key]);
-        let t1 = t0 + Duration::from_millis(60);
+        let t1 = t0 + Duration::from_millis(160);
         e.tick(t1, usize::MAX);
         e.drain(&mut sender, t1);
         assert_eq!(sender.sent.len(), 1, "no retransmit after ACK");
@@ -856,7 +867,7 @@ mod tests {
         assert!(e.cache.get(&k2).is_none());
         assert!(e.cache.get(&k3).is_some());
         // Tick past RTO — no retransmit for cancelled, retransmit for k3.
-        let t1 = t0 + Duration::from_millis(60);
+        let t1 = t0 + Duration::from_millis(160);
         e.tick(t1, usize::MAX);
         e.drain(&mut sender, t1);
         assert_eq!(sender.sent.len(), 4, "3 initial + 1 retransmit for k3 only");

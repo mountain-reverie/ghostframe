@@ -965,6 +965,16 @@ pub struct IoBridge {
     queued_critical_latency_stats: TierLatencyStats,
     /// Same as `queued_critical_latency_stats`, for `PassTier::Refinement`.
     queued_refinement_latency_stats: TierLatencyStats,
+    /// Rolling ACK-latency tracker feeding the RTO policy. Recorded once
+    /// per sample at the same drain site as the `*_latency_stats` fields
+    /// above (`ack_latency_us`, before it's routed to a per-tier bucket);
+    /// its p95 is pushed into `reliable_emitter.set_ack_deadline` once per
+    /// drain. See `ack_latency::AckLatencyTracker`'s doc comment for why
+    /// p95 over a small window rather than the cumulative mean/max the
+    /// `TierLatencyStats` fields track — this is a control input, not a
+    /// baseline measurement, and needs to track the *current* path rather
+    /// than the whole session.
+    ack_latency_tracker: crate::transport::ack_latency::AckLatencyTracker,
     /// Snapshot of (critical, refinement) byte counters at the previous
     /// periodic-log tick, used to derive per-window rates without
     /// polluting the cumulative counters.
@@ -1370,6 +1380,7 @@ impl IoBridge {
             refinement_latency_stats: TierLatencyStats::default(),
             queued_critical_latency_stats: TierLatencyStats::default(),
             queued_refinement_latency_stats: TierLatencyStats::default(),
+            ack_latency_tracker: crate::transport::ack_latency::AckLatencyTracker::new(),
             bytes_emitted_snapshot: (0, 0),
             bwe_log_last_at: None,
             diagnostics: lib_config.diagnostics,
@@ -4632,9 +4643,30 @@ impl IoBridge {
                         critical_latency_count = self.critical_latency_stats.count,
                         critical_latency_mean_us = self.critical_latency_stats.mean_us(),
                         critical_latency_max_us = self.critical_latency_stats.max_us,
+                        // Bucket counts for `[0-5, 5-10, 10-20, 20-50,
+                        // 50-100, 100-200, 200-500, 500+]` ms (see
+                        // `LATENCY_BUCKET_BOUNDS_MS`), populated since
+                        // startup but never logged until now -- a mean
+                        // alone hid exactly the distribution shape (29 ms
+                        // mean, 103 ms max) that made a fixed 40 ms RTO
+                        // deadline fire constantly.
+                        critical_latency_buckets = ?self.critical_latency_stats.buckets,
                         refinement_latency_count = self.refinement_latency_stats.count,
                         refinement_latency_mean_us = self.refinement_latency_stats.mean_us(),
                         refinement_latency_max_us = self.refinement_latency_stats.max_us,
+                        refinement_latency_buckets = ?self.refinement_latency_stats.buckets,
+                        // Current RTO policy inputs/output (see
+                        // `rto::rto_for_attempt`): the rolling p95 this
+                        // window's ack_deadline was derived from, and the
+                        // first-attempt deadline that derivation currently
+                        // yields.
+                        rto_ack_latency_p95_us = self.ack_latency_tracker.p95().as_micros() as u64,
+                        rto_first_attempt_deadline_us =
+                            crate::transport::reliable_emitter::rto::rto_for_attempt(
+                                self.ack_latency_tracker.p95(),
+                                0,
+                            )
+                            .as_micros() as u64,
                         // BWE Stage 2.1: same population, measured from
                         // `queued_at` (when the work became available to
                         // the scheduler) instead of `last_sent_at`. This is
@@ -5007,6 +5039,13 @@ impl IoBridge {
                             self.refinement_latency_stats.record(ack_latency_us)
                         }
                     }
+                    // Feed the RTO policy's rolling tracker with the same
+                    // per-sample latency, regardless of tier -- the RTO
+                    // applies uniformly to every emitted tile-pass, so its
+                    // deadline should track the whole population rather
+                    // than either tier alone. See `ack_latency_tracker`'s
+                    // doc comment.
+                    self.ack_latency_tracker.record(ack_latency_us);
                     // BWE Stage 2.1: `queued_at -> ACK`, alongside (not
                     // instead of) the `last_sent_at -> ACK` pair above.
                     // Starts earlier (when the work was queued rather than
@@ -5031,6 +5070,13 @@ impl IoBridge {
                         probe: s.probe,
                     });
                 }
+                // Once per drain is enough: this is a cheap setter, and the
+                // tracker only just received new samples above. Derives the
+                // emitter's next first-attempt RTO deadline from the
+                // rolling p95 -- see `rto::rto_for_attempt`'s doc comment
+                // for the floor/ceiling this feeds into.
+                self.reliable_emitter
+                    .set_ack_deadline(self.ack_latency_tracker.p95());
                 // quinn already measures path RTT for the scheduler; reuse it
                 // as the reference for the estimator's plausibility check.
                 if let Some(rtt) = self
@@ -5689,6 +5735,7 @@ impl IoBridge {
             refinement_latency_stats: TierLatencyStats::default(),
             queued_critical_latency_stats: TierLatencyStats::default(),
             queued_refinement_latency_stats: TierLatencyStats::default(),
+            ack_latency_tracker: crate::transport::ack_latency::AckLatencyTracker::new(),
             bytes_emitted_snapshot: (0, 0),
             bwe_log_last_at: None,
             diagnostics: lib_config.diagnostics,
