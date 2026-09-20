@@ -1876,3 +1876,87 @@ async fn the_client_gives_up_on_a_pass_it_can_never_get() {
         r.nack_miss
     );
 }
+
+/// Production reproduction: a second full-screen dirty frame arriving while
+/// the first frame's refinement is still in flight leaves tiles permanently
+/// short of a complete pass set.
+///
+/// `bump_generation` supersedes a tile's queued refinement work, which is
+/// correct when the content changed -- those passes describe a stale
+/// picture. But the client's completeness criterion is
+/// `FULL_PASS_MASK = (1 << 14) - 1`: it waits for all 14 passes and has no
+/// way to learn that fewer are coming, because `TileHeader` carries `pass`
+/// but not `total_passes`. A tile whose refinement was superseded therefore
+/// never completes on the client, however long it waits.
+///
+/// Measured in production on a 1920x1080 session: `dirty_count` was 2040 on
+/// exactly two frames and 0 on the other 26,196, and `emitted_cdf53` froze
+/// at 24,094 against the 2040 x 14 = 28,560 a full refinement needs -- 4,466
+/// passes short, permanently. The screen never converged.
+#[ignore = "reproduces an open bug: a superseded tile never completes"]
+#[tokio::test(start_paused = true)]
+async fn refinement_completes_when_a_second_frame_supersedes_the_first() {
+    let a = gradient_tile();
+    let mut b = gradient_tile();
+    // Make frame 2 genuinely different so it dirties every tile.
+    for (i, px) in b.iter_mut().enumerate() {
+        *px = px.wrapping_add(((i % 7) as u8) + 11);
+    }
+
+    let tiles_of = |bgra: &Vec<u8>| -> Vec<((u8, u8), TileSpec)> {
+        (0..4u8)
+            .flat_map(|x| {
+                let bgra = bgra.clone();
+                (0..4u8).map(move |y| ((x, y), TileSpec::Cdf53 { bgra: bgra.clone() }))
+            })
+            .collect()
+    };
+
+    let scene = BrowserlessScene {
+        seed: 0x50BE_5EED,
+        load: SceneLoad::Script(vec![
+            FrameScript {
+                tiles: tiles_of(&a),
+            },
+            // Second full-screen dirty frame, back-to-back: its generation
+            // bump supersedes frame 1's still-queued refinement passes.
+            FrameScript {
+                tiles: tiles_of(&b),
+            },
+        ]),
+        cadence_us: DEFAULT_CADENCE_US,
+        net: NetProfile::perfect(),
+        drops: Default::default(),
+        // Ample time: if convergence were merely slow this would catch it.
+        duration: Duration::from_secs(20),
+        grid_cols: 4,
+        grid_rows: 4,
+    };
+    let r = run_browserless(scene).await.expect("scene ran");
+
+    let expected = expected_rgba(&b);
+    let mut wrong = Vec::new();
+    for x in 0..4u8 {
+        for y in 0..4u8 {
+            if r.framebuffer.tile_rgba(x, y) != Some(expected.as_slice()) {
+                wrong.push((x, y));
+            }
+        }
+    }
+    println!(
+        "supersede: wrong_tiles={} nack_hit={} nack_miss={} retransmits={}",
+        wrong.len(),
+        r.nack_hit,
+        r.nack_miss,
+        r.retransmit_attempts_total
+    );
+    assert!(
+        wrong.is_empty(),
+        "{} of 16 tiles never converged to the second frame's content: {:?}. \
+         The first frame's refinement was superseded mid-flight, and the \
+         client waits for all 14 passes because TileHeader carries `pass` but \
+         not `total_passes` -- it cannot learn that fewer are coming.",
+        wrong.len(),
+        wrong
+    );
+}
