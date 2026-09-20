@@ -44,6 +44,15 @@ const NACK_DEBOUNCE_US: u64 = 50_000;
 /// Tail-fallback stall threshold (main.ts:807, `TAIL_FALLBACK_MS`).
 const TAIL_FALLBACK_US: u64 = 1_500_000;
 
+/// How many tail sweeps a tile gets before the client stops asking.
+///
+/// Each sweep re-requests every pass the tile is missing. Six of them spans
+/// `6 * TAIL_SWEEP_INTERVAL_US` = 3 s of continued silence after the
+/// `TAIL_FALLBACK_US` grace period, which is ample for a path that is merely
+/// slow. Beyond that the passes are not coming, and continuing to ask costs
+/// the server a lookup and a futile retransmission every 500 ms forever.
+const MAX_TAIL_SWEEP_ATTEMPTS: u8 = 6;
+
 /// Tail-sweep scan cadence (main.ts:808, `TAIL_SWEEP_INTERVAL_MS`).
 const TAIL_SWEEP_INTERVAL_US: u64 = 500_000;
 
@@ -411,6 +420,25 @@ impl ClientCore {
                 if now_us.saturating_sub(entry.last_change_us) < TAIL_FALLBACK_US {
                     continue;
                 }
+                // Give up on a tile that has stopped making progress. The
+                // sweep clears `nacked_mask` below so a request can repeat,
+                // which on its own never terminates: a pass that will never
+                // arrive is asked for every TAIL_SWEEP_INTERVAL_US for the
+                // life of the session, and each request costs the server a
+                // cache lookup and -- when it hits -- a retransmission of
+                // something that is not going to help.
+                //
+                // Measured in production on a static screen with nothing to
+                // send: 106,847 NACKs from the client against 94,834 server
+                // retransmissions and 53,761 acknowledgements. Reproduced as
+                // growth exactly linear in session duration.
+                //
+                // `sweep_attempts` resets whenever a pass lands, so a tile
+                // still receiving data keeps its full budget; only a stalled
+                // one runs out.
+                if entry.sweep_attempts >= MAX_TAIL_SWEEP_ATTEMPTS {
+                    continue;
+                }
                 (entry.frame_seq, !entry.pass_mask & FULL_PASS_MASK)
             };
             for p in 0..14u8 {
@@ -421,6 +449,7 @@ impl ClientCore {
             if let Some(entry) = self.cdf53_coverage.get_mut(&key) {
                 entry.nacked_mask &= !missing;
                 entry.last_change_us = now_us;
+                entry.sweep_attempts = entry.sweep_attempts.saturating_add(1);
             }
         }
     }

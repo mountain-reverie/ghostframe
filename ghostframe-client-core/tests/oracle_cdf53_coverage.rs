@@ -27,6 +27,7 @@ fn replaces_the_entry_when_generation_differs() {
         pass_mask: 0x3FFF,
         nacked_mask: 0x0F,
         last_change_us: 50,
+        sweep_attempts: 0,
     };
     let out = apply_cdf53_arrival(Some(stale), 3, 5, 7, 100, true);
     assert_eq!(out.entry.generation, 3);
@@ -45,6 +46,7 @@ fn refreshes_frame_seq_on_existing_generation_arrival() {
         pass_mask: 1,
         nacked_mask: 0,
         last_change_us: 0,
+        sweep_attempts: 0,
     };
     let out = apply_cdf53_arrival(Some(e), 1, 1, 9, 10, true);
     assert_eq!(out.entry.frame_seq, 9);
@@ -58,6 +60,7 @@ fn runs_gap_detection_on_existing_gen_success_and_nacks_missing_lower_passes() {
         pass_mask: 0b0000001,
         nacked_mask: 0,
         last_change_us: 0,
+        sweep_attempts: 0,
     };
     let out = apply_cdf53_arrival(Some(e), 1, 4, 0, 10, true);
     assert_eq!(out.nack_passes, vec![1, 2, 3]);
@@ -81,6 +84,7 @@ fn dedups_gap_detection_nacks_via_nacked_mask() {
         pass_mask: 1,
         nacked_mask: 0b0000010,
         last_change_us: 0,
+        sweep_attempts: 0,
     };
     let out = apply_cdf53_arrival(Some(e), 1, 3, 0, 10, true);
     assert_eq!(out.nack_passes, vec![2]);
@@ -103,6 +107,7 @@ fn phase_1_5a_does_not_re_nack_an_already_nacked_failed_pass() {
         pass_mask: 0,
         nacked_mask: 1 << 7,
         last_change_us: 0,
+        sweep_attempts: 0,
     };
     let out = apply_cdf53_arrival(Some(e), 1, 7, 0, 100, false);
     assert_eq!(out.nack_passes, Vec::<u8>::new());
@@ -118,6 +123,7 @@ fn phase_1_5a_failure_does_not_advance_last_change_us() {
         pass_mask: 0,
         nacked_mask: 0,
         last_change_us: 42,
+        sweep_attempts: 0,
     };
     let out = apply_cdf53_arrival(Some(e), 1, 3, 0, 999, false);
     assert_eq!(out.entry.last_change_us, 42);
@@ -131,6 +137,7 @@ fn phase_1_5a_success_on_a_previously_failed_pass_sets_bit_and_retains_nacked_ma
         pass_mask: 0,
         nacked_mask: 1 << 5,
         last_change_us: 0,
+        sweep_attempts: 0,
     };
     let out = apply_cdf53_arrival(Some(e), 1, 5, 0, 200, true);
     assert_eq!(out.entry.pass_mask, 1 << 5);
@@ -147,6 +154,7 @@ fn duplicate_success_arrivals_do_not_advance_last_change_us() {
         pass_mask: 1 << 3,
         nacked_mask: 0,
         last_change_us: 42,
+        sweep_attempts: 0,
     };
     let out = apply_cdf53_arrival(Some(e), 1, 3, 0, 999, true);
     assert_eq!(out.entry.pass_mask, 1 << 3);
@@ -164,6 +172,7 @@ fn gap_detection_nacks_missing_lower_passes() {
         pass_mask: 0b1,
         nacked_mask: 0,
         last_change_us: 42,
+        sweep_attempts: 0,
     };
     let out = apply_cdf53_arrival(Some(prev), 3, 4, 9, 100, true);
     assert_eq!(out.nack_passes, vec![1, 2, 3]);

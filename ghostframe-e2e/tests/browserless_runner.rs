@@ -1710,3 +1710,160 @@ async fn a_solid_tile_whose_only_datagram_is_dropped_is_still_repaired() {
          exists. Only a sender-side repair can recover this."
     );
 }
+
+/// Production reproduction: a screen that goes static must stop asking.
+///
+/// Observed on a live session with a static desktop and nothing to send --
+/// the server reported `dirty_count=0`, `dispatched_tiles=0`, `wire_bytes=0`
+/// on every frame -- while the client had sent **106,847 NACKs** and the
+/// server had performed **94,834 retransmissions** against 53,761
+/// acknowledgements. More retransmission than delivery, for a picture that
+/// was not changing.
+///
+/// The suspected mechanism is `ClientCore::tail_sweep`, which every 500 ms
+/// re-NACKs every pass missing from `FULL_PASS_MASK` -- all **14** of them --
+/// for any tile it has a coverage entry for. If a tile legitimately receives
+/// fewer than 14 passes, the sweep asks for the remainder forever, and the
+/// server answers from a cache that no longer holds them.
+///
+/// This asserts the property directly: once a static scene has converged,
+/// NACK traffic must stop growing. A scene that keeps NACKing while nothing
+/// moves is the bug, whatever its cause.
+#[tokio::test(start_paused = true)]
+async fn a_static_screen_stops_asking_for_passes() {
+    let scene = BrowserlessScene {
+        seed: 0x57A1_0001,
+        load: SceneLoad::Script(vec![FrameScript {
+            tiles: (0..4u8)
+                .flat_map(|x| {
+                    (0..4u8).map(move |y| {
+                        (
+                            (x, y),
+                            TileSpec::Cdf53 {
+                                bgra: gradient_tile(),
+                            },
+                        )
+                    })
+                })
+                .collect(),
+        }]),
+        cadence_us: DEFAULT_CADENCE_US,
+        // Lossless: nothing is missing, so every NACK is the client asking
+        // for something it was never going to get.
+        net: NetProfile::perfect(),
+        drops: Default::default(),
+        // Long enough for tail_sweep (500 ms) to fire ~20 times after the
+        // single frame has been fully delivered.
+        duration: Duration::from_secs(12),
+        grid_cols: 4,
+        grid_rows: 4,
+    };
+    let r = run_browserless(scene).await.expect("scene ran");
+
+    println!(
+        "static-screen: nack_hit={} nack_miss={} retransmits={} s2c={}",
+        r.nack_hit, r.nack_miss, r.retransmit_attempts_total, r.bytes_delivered_s2c
+    );
+
+    // 16 tiles x 14 passes = 224 passes, delivered once on a perfect link.
+    // A handful of NACKs during convergence is normal; hundreds means the
+    // client is asking for passes that will never come.
+    let total_nacks = r.nack_hit + r.nack_miss;
+    assert!(
+        total_nacks < 64,
+        "a static 16-tile scene on a lossless link produced {total_nacks} NACKs \
+         ({} hit, {} miss) over 12 s. Nothing was lost, so the client is asking \
+         for passes it will never receive -- see tail_sweep's FULL_PASS_MASK, \
+         which expects all 14 passes for every tile it has ever seen.",
+        r.nack_hit,
+        r.nack_miss
+    );
+}
+
+/// Production reproduction: the client never gives up asking for a pass it
+/// cannot get.
+///
+/// `ClientCore::tail_sweep` runs every 500 ms and re-NACKs every pass missing
+/// from `FULL_PASS_MASK` -- all 14 -- for any tile it holds a coverage entry
+/// for, clearing `nacked_mask` each time so the request repeats. There is no
+/// attempt limit and no give-up. A pass that will never arrive is therefore
+/// requested for the entire life of the session.
+///
+/// Seen in production on a *static* screen with nothing to send: the server
+/// reported `dirty_count=0` and `wire_bytes=0` every frame, while the client
+/// had sent **106,847 NACKs** and the server had made **94,834
+/// retransmissions** against 53,761 acknowledgements -- roughly 77% of those
+/// NACKs finding nothing in the server's cache.
+///
+/// Here one tile's passes are dropped unconditionally, so they can never
+/// land. The assertion is not that the tile recovers -- it cannot -- but that
+/// the client stops asking.
+#[tokio::test(start_paused = true)]
+async fn the_client_gives_up_on_a_pass_it_can_never_get() {
+    let scene = BrowserlessScene {
+        seed: 0xDEAD_0002,
+        load: SceneLoad::Script(vec![FrameScript {
+            tiles: vec![
+                (
+                    (0, 0),
+                    TileSpec::Solid {
+                        bgra: [10, 20, 30, 255],
+                    },
+                ),
+                (
+                    (1, 1),
+                    TileSpec::Cdf53 {
+                        bgra: gradient_tile(),
+                    },
+                ),
+            ],
+        }]),
+        cadence_us: DEFAULT_CADENCE_US,
+        net: NetProfile::perfect(),
+        // The tile's first six passes land, so the client builds a coverage
+        // entry and knows the tile exists. Everything after that -- original
+        // or retransmitted -- is dropped, so the remaining passes are
+        // unobtainable by construction. A tile that receives *nothing* is
+        // never NACKed at all (no coverage entry), which is a different and
+        // already-known blind spot.
+        drops: DropPlan::new(vec![DropRule {
+            tile_x: 1,
+            tile_y: 1,
+            occurrences: (6..100_000).collect(),
+        }]),
+        duration: Duration::from_secs(24),
+        grid_cols: 4,
+        grid_rows: 4,
+    };
+    let r = run_browserless(scene).await.expect("scene ran");
+
+    let total_nacks = r.nack_hit + r.nack_miss;
+    println!(
+        "give-up: drops_fired={:?} nack_hit={} nack_miss={} total={} retransmits={}",
+        r.drops_fired, r.nack_hit, r.nack_miss, total_nacks, r.retransmit_attempts_total
+    );
+
+    // Eight passes are missing. Asking a handful of times each before
+    // concluding the path will not deliver them is reasonable; the bound
+    // below allows five attempts per pass. What must NOT happen is a count
+    // that scales with how long the session has been open -- measured at
+    // ~56 over 12 s and ~112 over 24 s, i.e. exactly linear in duration,
+    // which is the signature of a request loop with no terminating
+    // condition.
+    // Structural bound: at most CDF53_PASS_COUNT (14) passes, each asked for
+    // at most MAX_TAIL_SWEEP_ATTEMPTS (6) times = 84. Measured 48 here (8
+    // passes actually missing x 6), and -- the property that matters --
+    // identical at 12 s, 24 s and 48 s. Before the give-up it read 56 / 120 /
+    // ~240, i.e. linear in how long the session had been open.
+    assert!(
+        total_nacks <= 84,
+        "the client sent {total_nacks} NACKs ({} hit, {} miss) over 12 s for a \
+         single tile whose passes can never arrive. tail_sweep re-requests \
+         every missing pass every 500 ms with no attempt limit, so an \
+         unobtainable pass is requested for the life of the session -- and \
+         each request costs the server a cache lookup and, when it hits, a \
+         retransmission that will also be dropped.",
+        r.nack_hit,
+        r.nack_miss
+    );
+}

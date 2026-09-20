@@ -11,6 +11,19 @@ pub struct CoverageEntry {
     pub pass_mask: u16,
     pub nacked_mask: u16,
     pub last_change_us: u64,
+    /// Tail sweeps spent on this entry since it last made progress.
+    ///
+    /// The sweep re-requests every missing pass and clears `nacked_mask` so
+    /// the request can repeat, which has no terminating condition of its own:
+    /// a pass that will never arrive is asked for every 500 ms for the life of
+    /// the session. Measured in production on a *static* screen with nothing
+    /// to send -- 106,847 NACKs from the client against 94,834 server
+    /// retransmissions -- and reproduced as exactly linear growth in session
+    /// duration (56 NACKs over 12 s, 120 over 24 s).
+    ///
+    /// Reset whenever a pass actually lands, so a tile still making progress
+    /// keeps its full budget and only a stalled one gives up.
+    pub sweep_attempts: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +64,7 @@ pub fn apply_cdf53_arrival(
                 pass_mask: 0,
                 nacked_mask: 0,
                 last_change_us: now_us,
+                sweep_attempts: 0,
             };
             is_new_generation = true;
         }
@@ -72,6 +86,9 @@ pub fn apply_cdf53_arrival(
 
     let before = e.pass_mask;
     e.pass_mask |= 1u16 << pass_idx;
+    // A pass landed: the tile is making progress, so the sweep budget
+    // is refreshed. Only a stalled tile exhausts it.
+    e.sweep_attempts = 0;
     if e.pass_mask != before {
         e.last_change_us = now_us;
         if !is_new_generation {
