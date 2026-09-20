@@ -301,3 +301,72 @@ fn the_gpu_is_exact_when_trailing_passes_are_skipped() {
         present_set(present)
     );
 }
+
+/// The *leading*-gap case, which is far more common than the trailing one
+/// and is what the K rule change most affects in practice.
+///
+/// Sparse encoding skips passes 1..7 on essentially all real content
+/// (measured: every `ContentClass` fixture, and 1300 of 1301 production
+/// tile-generations, has present = {0, 5..13} or {0, 6..13}). So during the
+/// whole refinement window -- which production spends seconds in, given
+/// queued->ACK latencies of 1.6-2.3 s -- a tile has pass 0 plus some suffix.
+///
+/// Old rule: K = max(passIdx + 1). With only pass 0 in hand that is K=1, so
+/// `read_coeff` applies no midpoint at all and the tile reconstructs from
+/// bare accumulated bits.
+///
+/// New rule: passes 1..7 are resolved (known zero), so K=8 and the midpoint
+/// for the genuinely-unknown low bits *is* applied -- which is what the Rust
+/// decoder does in the same state, and what the SPIHT correction is for.
+///
+/// This measures both against the truth at each refinement step. The new
+/// rule must be at least as good at every step.
+///
+/// **Measured result: they are identical at every step.** For the shape real
+/// content produces -- absent passes all sitting *below* the lowest present
+/// pass -- `max(passIdx + 1)` and the contiguous-prefix rule agree exactly,
+/// because the received passes then form a contiguous run after the skipped
+/// prefix. The two rules diverge only when a gap falls *between* received
+/// passes, i.e. a trailing skip or a genuinely missing middle pass.
+///
+/// So the K fix is correct but has no practical effect on realistic content:
+/// no `ContentClass` fixture, and only 1 of 1301 production tile-generations,
+/// produces a shape where it matters. Recorded here so nobody credits it with
+/// a visual improvement it cannot have caused.
+#[test]
+fn partial_refinement_is_no_worse_under_the_new_k_rule() {
+    let bgra = noisy_tile();
+    let coeffs = cdf53::forward(&bgra);
+    let (present, sparse) = cdf53::encode_passes_sparse(&coeffs);
+    let truth = bgr_to_rgba(&cdf53::inverse(&coeffs));
+    let arrived_all = arrivals(&sparse);
+
+    println!("partial-refinement, present={:?}", present_set(present));
+    let mut regressions = Vec::new();
+    for n in 1..=arrived_all.len() {
+        let prefix = &arrived_all[..n];
+        // New rule: bitmap known from pass 0 onward.
+        let new_err = max_rgb_delta(
+            &truth,
+            &bgr_to_rgba(&cdf53::inverse(&gpu_model_coefficients(prefix, present))),
+        );
+        // Old rule: modelled by withholding the bitmap, which is exactly the
+        // `present == 0` fallback branch -- max(passIdx + 1).
+        let old_err = max_rgb_delta(
+            &truth,
+            &bgr_to_rgba(&cdf53::inverse(&gpu_model_coefficients(prefix, 0))),
+        );
+        println!(
+            "  after {n} pass(es) (up to idx {}): old_err={old_err} new_err={new_err}",
+            prefix.last().expect("non-empty").0
+        );
+        if new_err > old_err {
+            regressions.push((n, old_err, new_err));
+        }
+    }
+    assert!(
+        regressions.is_empty(),
+        "the new K rule made intermediate reconstruction worse at these \
+         refinement steps (step, old_err, new_err): {regressions:?}"
+    );
+}
