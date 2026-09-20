@@ -26,10 +26,16 @@ const CDF53_CODEC = 5; // ghostframe_protocol::protocol::Codec::Cdf53
  */
 function validCdf53PassPayload(): Uint8Array {
   const channel = new Uint8Array([0x00, 0x01, 0xff]); // len=1, rle=[0xFF] -> 128 zero bytes
-  const out = new Uint8Array(channel.length * 3);
-  out.set(channel, 0);
-  out.set(channel, channel.length);
-  out.set(channel, channel.length * 2);
+  // Pass 0 carries a 2-byte big-endian `present_passes` bitmap ahead of the
+  // 3-channel block (see cdf53_prevalidate.rs). Bit 0 names pass 0 itself and
+  // must be set, or prevalidation rejects the tile as malformed. 0x0001 =
+  // "this tile has only pass 0", which is all this fixture sends.
+  const PRESENT_PASSES_PREFIX = new Uint8Array([0x00, 0x01]);
+  const out = new Uint8Array(PRESENT_PASSES_PREFIX.length + channel.length * 3);
+  out.set(PRESENT_PASSES_PREFIX, 0);
+  for (let ch = 0; ch < 3; ch++) {
+    out.set(channel, PRESENT_PASSES_PREFIX.length + ch * channel.length);
+  }
   return out;
 }
 

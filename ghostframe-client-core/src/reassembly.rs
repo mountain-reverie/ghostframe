@@ -496,6 +496,7 @@ impl ClientCore {
                                     data: TileData::Cdf53 {
                                         pass_idx: pre.pass_idx,
                                         bit_planes: pre.bit_planes,
+                                        present_passes: pre.present_passes,
                                     },
                                 });
                             }

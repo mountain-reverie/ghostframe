@@ -47,7 +47,21 @@ pub enum TileData {
         indices: Vec<u8>,
     },
     /// `bit_planes` is 384 bytes: 3 channels x 128, packed B, G, R.
-    Cdf53 { pass_idx: u8, bit_planes: Vec<u8> },
+    Cdf53 {
+        pass_idx: u8,
+        bit_planes: Vec<u8>,
+        /// The tile's `present_passes` bitmap, `Some` only on pass 0 (the
+        /// only pass that carries it on the wire).
+        ///
+        /// Forwarded to the consumer rather than kept internal because the
+        /// browser's GPU decoder needs it: without the bitmap it derives its
+        /// pass count as `max(pass_idx + 1)`, which treats a *skipped
+        /// trailing* bit-plane as "not yet decoded" instead of "known zero"
+        /// and adds a midpoint correction that should not be there. Measured
+        /// at 16/255 per channel on flat content -- see
+        /// `tests/oracle_gpu_sparse.rs`.
+        present_passes: Option<u16>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

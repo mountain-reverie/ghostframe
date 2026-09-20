@@ -23,7 +23,7 @@ export type ProtocolTileData =
   | { codec: 'Raw'; bytes: Uint8Array }
   | { codec: 'Solid'; bytes: Uint8Array }
   | { codec: 'PalRle'; palette_id: number; count: number; indices: Uint8Array }
-  | { codec: 'Cdf53'; pass_idx: number; bit_planes: Uint8Array };
+  | { codec: 'Cdf53'; pass_idx: number; bit_planes: Uint8Array; present_passes?: number | null };
 
 /** The two event kinds this module cares about. Structurally matches the
  * corresponding arms of `main.ts`'s `WasmEvent` (itself mirroring

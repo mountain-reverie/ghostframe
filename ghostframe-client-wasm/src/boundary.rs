@@ -83,6 +83,9 @@ pub enum WasmTileData {
         pass_idx: u8,
         #[serde(with = "serde_bytes")]
         bit_planes: Vec<u8>,
+        /// `Some` only on pass 0. The GPU decoder needs it to tell a
+        /// skipped-because-empty trailing plane from an undelivered one.
+        present_passes: Option<u16>,
     },
 }
 
@@ -107,9 +110,11 @@ impl From<&TileData> for WasmTileData {
             TileData::Cdf53 {
                 pass_idx,
                 bit_planes,
+                present_passes,
             } => WasmTileData::Cdf53 {
                 pass_idx: *pass_idx,
                 bit_planes: bit_planes.clone(),
+                present_passes: *present_passes,
             },
         }
     }
@@ -414,6 +419,7 @@ mod tests {
             data: TileData::Cdf53 {
                 pass_idx: 13,
                 bit_planes: vec![1, 2, 3],
+                present_passes: None,
             },
         };
         match WasmEvent::from(&ev) {
@@ -432,6 +438,7 @@ mod tests {
                     WasmTileData::Cdf53 {
                         pass_idx,
                         bit_planes,
+                        present_passes: _,
                     } => {
                         assert_eq!(pass_idx, 13);
                         assert_eq!(bit_planes, vec![1, 2, 3]);
