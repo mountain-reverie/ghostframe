@@ -22,6 +22,10 @@ struct TileEntry {
     generation_set: bool,
     /// Decoded 384-byte bit-planes (B,G,R × 128 bytes), one slot per pass.
     planes: [Option<Vec<u8>>; CDF53_PASS_COUNT],
+    /// The tile's `present_passes` bitmap, learned from pass 0's payload.
+    /// `None` until pass 0 arrives. See `integrate`'s doc comment for how
+    /// this interacts with the "contiguous prefix" reconstruction rule.
+    present_passes: Option<u16>,
 }
 
 /// Per-(tile_x, tile_y) CDF53 progressive-pass accumulator.
@@ -43,10 +47,17 @@ impl Cdf53TileState {
     /// the new pass (stale-generation rule) — the new generation never
     /// blends with the old one.
     ///
-    /// Reconstructs from the contiguous prefix of received passes starting
-    /// at pass 0 (a gap at pass K means passes > K are held but unused until
-    /// the gap fills). Returns the freshly reconstructed 4096-byte RGBA tile
-    /// (BGR from `inverse()` converted to RGB, plus alpha 255).
+    /// Reconstructs from the contiguous prefix of *resolved* passes starting
+    /// at pass 0, where a pass counts as resolved once either its plane has
+    /// actually arrived, or the tile's `present_passes` bitmap (known once
+    /// pass 0 arrives) says it was never going to be sent -- sparse encoding
+    /// skips bit-planes that are all-zero, and an all-zero plane is exactly
+    /// what "never sent" should decode as, so treating it as immediately
+    /// resolved is lossless. A gap at pass K that IS marked present in the
+    /// bitmap (or the bitmap isn't known yet) means passes > K are held but
+    /// unused until the gap fills. Returns the freshly reconstructed
+    /// 4096-byte RGBA tile (BGR from `inverse()` converted to RGB, plus
+    /// alpha 255).
     pub fn integrate(&mut self, tile_x: u8, tile_y: u8, entry: &PrevalidatedCdf53) -> Vec<u8> {
         let tile = self.tiles.entry((tile_x, tile_y)).or_default();
 
@@ -54,6 +65,7 @@ impl Cdf53TileState {
             tile.generation = entry.generation;
             tile.generation_set = true;
             tile.planes = Default::default();
+            tile.present_passes = None;
         }
 
         let idx = entry.pass_idx as usize;
@@ -61,7 +73,22 @@ impl Cdf53TileState {
             tile.planes[idx] = Some(entry.bit_planes.clone());
         }
 
-        // Contiguous prefix of received passes starting at 0.
+        // Pass 0 just taught us (or re-confirmed) which passes exist for
+        // this generation. Backfill every known-absent slot that hasn't
+        // actually received data with an explicit all-zero plane -- the
+        // same content an "empty" pass would have produced had it been
+        // sent -- so the contiguous-prefix scan below doesn't stall on a
+        // pass that is never coming.
+        if let Some(present) = entry.present_passes {
+            tile.present_passes = Some(present);
+            for i in 0..CDF53_PASS_COUNT {
+                if present & (1u16 << i) == 0 && tile.planes[i].is_none() {
+                    tile.planes[i] = Some(vec![0u8; 384]);
+                }
+            }
+        }
+
+        // Contiguous prefix of resolved passes starting at 0.
         let mut prefix_len = 0usize;
         while prefix_len < CDF53_PASS_COUNT && tile.planes[prefix_len].is_some() {
             prefix_len += 1;

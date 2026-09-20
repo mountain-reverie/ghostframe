@@ -444,8 +444,16 @@ impl ClientCore {
 
                 let result = prevalidate_cdf53(&payload, asm.generation, asm.pass);
                 let ok = result.is_ok();
-                let outcome =
-                    apply_cdf53_arrival(prev, asm.generation, asm.pass, frame_seq, now_us, ok);
+                let present_passes = result.as_ref().ok().and_then(|p| p.present_passes);
+                let outcome = apply_cdf53_arrival(
+                    prev,
+                    asm.generation,
+                    asm.pass,
+                    frame_seq,
+                    now_us,
+                    ok,
+                    present_passes,
+                );
                 self.cdf53_coverage.insert((tx, ty), outcome.entry);
                 for p in outcome.nack_passes {
                     // Coverage NACKs are routed through the debounced

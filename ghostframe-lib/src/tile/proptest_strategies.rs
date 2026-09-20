@@ -95,7 +95,7 @@ pub fn codec_state() -> impl Strategy<Value = CodecState> {
             .prop_map(|(s, m)| {
                 CodecState::Cdf53 {
                     passes_sent: s.min(m),
-                    max_passes: m,
+                    present_passes: (1u16 << m) - 1,
                 }
             }),
         Just(CodecState::PixelPerfect),

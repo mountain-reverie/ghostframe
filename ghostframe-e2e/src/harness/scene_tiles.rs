@@ -54,19 +54,29 @@ pub fn encode_tile(spec: &TileSpec, tile_x: u8, tile_y: u8, generation: u8) -> V
             )]
         }
         TileSpec::Cdf53 { bgra } => {
+            // `encode_passes_sparse`, not `encode_passes` — the server's two
+            // Cdf53 emission sites both use the sparse encoder, which skips
+            // bit-planes that are entirely zero and carries the resulting
+            // `present_passes` bitmap as a 2-byte prefix on pass 0. Injecting
+            // dense passes here would leave the whole e2e suite blind to the
+            // sparse path: every scene would exercise a pass layout the
+            // server no longer produces.
+            //
+            // `total_passes` is `CDF53_PASS_COUNT`, matching what
+            // `Scheduler::enqueue_refinement_subset_at` stamps on production
+            // work items — it is the codec's pass *space*, not the count
+            // actually sent, which is what the bitmap is for.
             let coefficients = cdf53::forward(bgra);
-            let passes = cdf53::encode_passes(&coefficients);
-            let total_passes = passes.len() as u8;
+            let (_present_passes, passes) = cdf53::encode_passes_sparse(&coefficients);
             passes
                 .into_iter()
-                .enumerate()
                 .map(|(pass_idx, payload)| {
                     work_item(
                         tile_x,
                         tile_y,
                         generation,
-                        pass_idx as u8,
-                        total_passes,
+                        pass_idx,
+                        cdf53::CDF53_PASS_COUNT as u8,
                         Codec::Cdf53,
                         payload,
                     )

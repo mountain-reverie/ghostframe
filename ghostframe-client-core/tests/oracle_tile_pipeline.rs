@@ -305,6 +305,7 @@ fn fold_arrivals(arrivals: &[(u8, u8)]) -> (Option<CoverageEntry>, Vec<(u8, u8)>
             u32::from(*generation) + 1,
             i as u64 * 1000,
             true,
+            None,
         );
         for p in &out.nack_passes {
             nacks.push((*generation, *p));

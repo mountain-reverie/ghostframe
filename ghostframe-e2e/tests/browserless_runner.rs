@@ -1314,7 +1314,16 @@ fn shifted_gradient_tile(shift: u32, tile_x: u8, tile_y: u8) -> Vec<u8> {
 /// flight.
 #[tokio::test(start_paused = true)]
 async fn a_link_with_propagation_delay_carries_datagrams_concurrently() {
-    const ONE_WAY_US: u64 = 20_000; // 40 ms RTT: a plausible wide-area path.
+    // 100 ms RTT: a plausible intercontinental path, and -- unlike the 40 ms
+    // this used -- one where the serialised ceiling is genuinely
+    // discriminating. Delivery here is bandwidth-limited at ~460 kbps, i.e.
+    // one ~1130-byte datagram per ~19.6 ms. Against a 20 ms one-way delay
+    // that put the serialised ceiling (500) within 1% of actual delivery
+    // (504-509 across runs): the test cleared it by coincidence rather than
+    // by demonstrating overlap, and was one small shift away from flaking.
+    // At 50 ms the ceiling is 200 and delivery is ~500, so clearing it
+    // requires datagrams to genuinely be in flight concurrently.
+    const ONE_WAY_US: u64 = 50_000;
     const DURATION_US: u64 = 10_000_000;
 
     let scene = BrowserlessScene {
@@ -1340,25 +1349,32 @@ async fn a_link_with_propagation_delay_carries_datagrams_concurrently() {
         r.events
     );
 
-    // Ceiling for a serialised link: one datagram per one-way delay, at a
-    // generous 1,200 bytes each. Real datagrams here are smaller, which
-    // only makes the ceiling harder to clear by accident.
+    // Ceiling for a serialised link: one datagram per one-way delay.
+    //
+    // Counted in datagrams, not bytes. The byte form of this assertion was a
+    // proxy -- "more than N datagrams" expressed as "more than N x 1200
+    // bytes" -- and it silently depended on payloads staying near that
+    // bound. Switching the Cdf53 encoder to skip empty bit-planes shrank
+    // payloads and dropped delivery to 581,755 bytes against a 600,000 floor
+    // while concurrency was completely unchanged, i.e. the proxy failed for a
+    // reason the test does not care about. Datagram count is what the
+    // serialisation argument is actually about, so assert on that directly.
     let serial_max_datagrams = DURATION_US / ONE_WAY_US;
-    let serial_ceiling_bytes = serial_max_datagrams * 1_200;
 
     println!(
-        "delayed link: bytes_delivered={} vs serialised ceiling={} \
-         ({serial_max_datagrams} datagrams x 1200B)",
-        r.bytes_delivered, serial_ceiling_bytes
+        "delayed link: datagrams_delivered_s2c={} vs serialised ceiling={} \
+         ({} bytes delivered)",
+        r.datagrams_delivered_s2c, serial_max_datagrams, r.bytes_delivered
     );
     assert!(
-        r.bytes_delivered > serial_ceiling_bytes,
-        "a {}ms-RTT link delivered {} bytes, at or below the {} a strictly \
-         serialised link could manage. Delivery has regressed to awaiting \
-         each datagram's arrival at the point it is sent.",
+        r.datagrams_delivered_s2c > serial_max_datagrams,
+        "a {}ms-RTT link delivered {} server->client datagrams, at or below \
+         the {} a strictly serialised link could manage. Delivery has \
+         regressed to awaiting each datagram's arrival at the point it is \
+         sent.",
         ONE_WAY_US * 2 / 1000,
-        r.bytes_delivered,
-        serial_ceiling_bytes
+        r.datagrams_delivered_s2c,
+        serial_max_datagrams
     );
 }
 

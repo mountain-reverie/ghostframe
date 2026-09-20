@@ -10,6 +10,13 @@ pub struct CoverageEntry {
     pub frame_seq: u32,
     pub pass_mask: u16,
     pub nacked_mask: u16,
+    /// The tile's `present_passes` bitmap (bit *i* set ⇒ pass *i* was
+    /// actually sent for this generation), learned from pass 0's payload.
+    /// `None` until pass 0 arrives -- a tile is not "complete" while this is
+    /// `None`, and the only pass worth asking for in that state is pass 0
+    /// itself (there is no way to know which of 1..13 to expect yet).
+    /// Reset to `None` on every new generation, like the rest of the entry.
+    pub present_passes: Option<u16>,
     pub last_change_us: u64,
     /// Tail sweeps spent on this entry since it last made progress.
     ///
@@ -60,6 +67,13 @@ pub fn generation_is_newer(candidate: u8, current: u8) -> bool {
 /// - On prevalidation SUCCESS: `pass_mask` gets the bit set. If the
 ///   bitmap grew, `last_change_us` advances and gap-detection scans for
 ///   lower-indexed missing passes (only on existing-generation arrivals).
+///
+/// `present_passes` is the freshly-parsed bitmap from `PrevalidatedCdf53`
+/// (`Some` only when `pass_idx == 0` and prevalidation succeeded; `None`
+/// otherwise). When `Some`, it's stored on the entry; when `None`, the
+/// entry's existing value (if any) is left untouched -- passes 1..13 carry
+/// no bitmap of their own and must not clobber what pass 0 already taught
+/// the tile.
 pub fn apply_cdf53_arrival(
     prev: Option<CoverageEntry>,
     generation: u8,
@@ -67,6 +81,7 @@ pub fn apply_cdf53_arrival(
     frame_seq: u32,
     now_us: u64,
     prevalidation_ok: bool,
+    present_passes: Option<u16>,
 ) -> ArrivalOutcome {
     // A pass from a generation *older* than the entry's is stale: the server
     // has already superseded that content. Accepting it used to fall into the
@@ -102,11 +117,19 @@ pub fn apply_cdf53_arrival(
                 frame_seq,
                 pass_mask: 0,
                 nacked_mask: 0,
+                present_passes: None,
                 last_change_us: now_us,
                 sweep_attempts: 0,
             };
             is_new_generation = true;
         }
+    }
+
+    // Pass 0's bitmap, once known, is stuck to the entry regardless of
+    // whether this particular arrival is the one that set it (passes 1..13
+    // carry `None` and must not clobber it).
+    if let Some(p) = present_passes {
+        e.present_passes = Some(p);
     }
 
     let mut nack_passes = Vec::new();
@@ -131,8 +154,21 @@ pub fn apply_cdf53_arrival(
     if e.pass_mask != before {
         e.last_change_us = now_us;
         if !is_new_generation {
+            // Gap detection is judged against the tile's OWN pass set, the
+            // same rule `tail_sweep` uses. Sparse encoding skips bit-planes
+            // that are entirely zero, so a lower index is not evidence of a
+            // gap -- it is usually a pass the server never sent. Measured on
+            // a static 16-tile lossless scene: treating every lower index as
+            // expected produced 80 NACKs, all misses, because passes 1-5 are
+            // empty for essentially all content and no cache entry exists for
+            // them.
+            //
+            // Until pass 0 arrives its bitmap is unknown, and pass 0 is the
+            // only pass guaranteed to exist -- there is no way to know which
+            // of 1..13 to expect without it, so assume nothing else.
+            let expected: u16 = e.present_passes.unwrap_or(1);
             let sentinel: u16 = (1u16 << pass_idx) - 1;
-            let missing_below = sentinel & !e.pass_mask & !e.nacked_mask;
+            let missing_below = sentinel & expected & !e.pass_mask & !e.nacked_mask;
             if missing_below != 0 {
                 for p in 0..pass_idx {
                     if missing_below & (1u16 << p) != 0 {

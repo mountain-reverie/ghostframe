@@ -281,6 +281,10 @@ pub struct WasmPrevalidatedCdf53 {
     /// 384 bytes = 3 channels x 128, packed B, G, R. Empty when `ok` is false.
     #[serde(with = "serde_bytes")]
     pub bit_planes: Vec<u8>,
+    /// The tile's `present_passes` bitmap, parsed from pass 0's payload
+    /// prefix. `Some` only for `pass_idx == 0`; `None` for passes 1..13
+    /// and whenever `ok` is false.
+    pub present_passes: Option<u16>,
 }
 
 impl From<Result<PrevalidatedCdf53, ghostframe_client_core::DecodeErrorCode>>
@@ -294,6 +298,7 @@ impl From<Result<PrevalidatedCdf53, ghostframe_client_core::DecodeErrorCode>>
                 generation: p.generation,
                 pass_idx: p.pass_idx,
                 bit_planes: p.bit_planes,
+                present_passes: p.present_passes,
             },
             Err(code) => WasmPrevalidatedCdf53 {
                 ok: false,
@@ -301,6 +306,7 @@ impl From<Result<PrevalidatedCdf53, ghostframe_client_core::DecodeErrorCode>>
                 generation: 0,
                 pass_idx: 0,
                 bit_planes: Vec::new(),
+                present_passes: None,
             },
         }
     }
@@ -312,6 +318,7 @@ pub struct WasmCoverageEntry {
     pub frame_seq: u32,
     pub pass_mask: u16,
     pub nacked_mask: u16,
+    pub present_passes: Option<u16>,
     pub last_change_us: u64,
 }
 
@@ -322,6 +329,7 @@ impl From<CoverageEntry> for WasmCoverageEntry {
             frame_seq: e.frame_seq,
             pass_mask: e.pass_mask,
             nacked_mask: e.nacked_mask,
+            present_passes: e.present_passes,
             last_change_us: e.last_change_us,
         }
     }

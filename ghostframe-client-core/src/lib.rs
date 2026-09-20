@@ -59,9 +59,6 @@ const TAIL_SWEEP_INTERVAL_US: u64 = 500_000;
 /// Periodic ReceiverFeedback cadence (main.ts:391-401, 100ms setInterval).
 const FEEDBACK_INTERVAL_US: u64 = 100_000;
 
-/// All 14 CDF53 passes present (main.ts:809, `FULL_PASS_MASK`).
-const FULL_PASS_MASK: u16 = (1 << 14) - 1;
-
 /// One coverage NACK awaiting the debounce window (main.ts:815, `PendingNack`).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PendingNack {
@@ -414,9 +411,26 @@ impl ClientCore {
                     Some(e) => e,
                     None => continue,
                 };
-                if entry.pass_mask == FULL_PASS_MASK {
-                    continue;
-                }
+                // Completeness is judged against the tile's OWN bitmap, not
+                // a hardcoded "all 14" mask: sparse encoding means a tile's
+                // real pass set is a subset of 14, sent as a bitmap in pass
+                // 0's payload.
+                //   - known (`present_passes` learned from pass 0): complete
+                //     once `pass_mask == present_passes`; the missing set is
+                //     `present_passes & !pass_mask`.
+                //   - unknown (pass 0 hasn't arrived yet): the tile can't be
+                //     complete, and the only pass worth re-asking for is
+                //     pass 0 itself -- there's no way to know which of
+                //     1..13 to expect without it.
+                let missing = match entry.present_passes {
+                    Some(present) => {
+                        if entry.pass_mask == present {
+                            continue; // complete
+                        }
+                        present & !entry.pass_mask
+                    }
+                    None => 1u16, // pass 0 unknown; ask only for pass 0.
+                };
                 if now_us.saturating_sub(entry.last_change_us) < TAIL_FALLBACK_US {
                     continue;
                 }
@@ -439,7 +453,7 @@ impl ClientCore {
                 if entry.sweep_attempts >= MAX_TAIL_SWEEP_ATTEMPTS {
                     continue;
                 }
-                (entry.frame_seq, !entry.pass_mask & FULL_PASS_MASK)
+                (entry.frame_seq, missing)
             };
             for p in 0..14u8 {
                 if missing & (1u16 << p) != 0 {

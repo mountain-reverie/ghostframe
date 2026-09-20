@@ -136,21 +136,16 @@ impl SlotMap {
         self.acked_mask(tile_x, tile_y, generation).count_ones() as u8
     }
 
-    fn full_mask(max_passes: u8) -> u16 {
-        if max_passes >= 16 {
-            0xFFFF
-        } else {
-            (1u16 << max_passes) - 1
-        }
+    /// `present_mask` names the passes that must be acked, bit *i* set ⇒
+    /// pass *i* is expected — not a count. Sparse CDF53 encoding skips empty
+    /// bit-planes, so the expected set is not necessarily a contiguous
+    /// `0..N` prefix; a count could not express it.
+    pub fn fully_acked(&self, tile_x: u8, tile_y: u8, generation: u8, present_mask: u16) -> bool {
+        (self.acked_mask(tile_x, tile_y, generation) & present_mask) == present_mask
     }
 
-    pub fn fully_acked(&self, tile_x: u8, tile_y: u8, generation: u8, max_passes: u8) -> bool {
-        let needed = Self::full_mask(max_passes);
-        (self.acked_mask(tile_x, tile_y, generation) & needed) == needed
-    }
-
-    pub fn unacked_mask(&self, tile_x: u8, tile_y: u8, generation: u8, max_passes: u8) -> u16 {
-        Self::full_mask(max_passes) & !self.acked_mask(tile_x, tile_y, generation)
+    pub fn unacked_mask(&self, tile_x: u8, tile_y: u8, generation: u8, present_mask: u16) -> u16 {
+        present_mask & !self.acked_mask(tile_x, tile_y, generation)
     }
 
     pub fn handle(&self, tile_x: u8, tile_y: u8, pass_idx: u8) -> Option<Handle> {
@@ -233,17 +228,30 @@ mod tests {
         for p in 0..13u8 {
             map.record_ack(0, 0, 0, p);
         }
-        assert!(!map.fully_acked(0, 0, 0, 14));
+        assert!(!map.fully_acked(0, 0, 0, 0x3FFF));
         map.record_ack(0, 0, 0, 13);
-        assert!(map.fully_acked(0, 0, 0, 14));
+        assert!(map.fully_acked(0, 0, 0, 0x3FFF));
+    }
+
+    #[test]
+    fn fully_acked_only_needs_the_present_bits() {
+        // Sparse present set {0, 6}: acking just those two bits is enough,
+        // even though bits 1..5 and 7..13 are never acked at all.
+        let mut map = SlotMap::new(1, 1);
+        let present: u16 = (1 << 0) | (1 << 6);
+        assert!(!map.fully_acked(0, 0, 0, present));
+        map.record_ack(0, 0, 0, 0);
+        assert!(!map.fully_acked(0, 0, 0, present));
+        map.record_ack(0, 0, 0, 6);
+        assert!(map.fully_acked(0, 0, 0, present));
     }
 
     #[test]
     fn unacked_mask_is_the_complement_below_max() {
         let mut map = SlotMap::new(1, 1);
-        assert_eq!(map.unacked_mask(0, 0, 0, 14), 0x3FFF);
+        assert_eq!(map.unacked_mask(0, 0, 0, 0x3FFF), 0x3FFF);
         map.record_ack(0, 0, 0, 0);
-        assert_eq!(map.unacked_mask(0, 0, 0, 14), 0x3FFE);
+        assert_eq!(map.unacked_mask(0, 0, 0, 0x3FFF), 0x3FFE);
     }
 
     #[test]

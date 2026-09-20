@@ -102,7 +102,15 @@ pub enum CodecState {
     Solid,
     Cdf53 {
         passes_sent: u8,
-        max_passes: u8,
+        /// Bitmap of passes actually sent for this tile's current
+        /// generation (bit *i* set ⇒ pass *i* was transmitted). Sparse
+        /// encoding skips empty bit-planes, so this is not necessarily a
+        /// contiguous `0..N` prefix and cannot be represented as a count.
+        /// Set from `encode_passes_sparse`'s return value at the point of
+        /// actual encoding; classification sites that haven't encoded yet
+        /// use the full `0x3FFF` (all 14 passes) as a placeholder that gets
+        /// overwritten once Phase B runs.
+        present_passes: u16,
     },
     PixelPerfect,
 }

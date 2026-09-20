@@ -216,7 +216,7 @@ pub fn classify_tile(metrics: &TileMetrics, prev: &CodecState) -> CodecState {
         }
         return CodecState::Cdf53 {
             passes_sent: 0,
-            max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
+            present_passes: 0x3FFF,
         };
     }
 
@@ -238,7 +238,7 @@ pub fn classify_tile(metrics: &TileMetrics, prev: &CodecState) -> CodecState {
         }
         return CodecState::Cdf53 {
             passes_sent: 0,
-            max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
+            present_passes: 0x3FFF,
         }; // Rule 5 fallback
     }
 
@@ -255,7 +255,7 @@ pub fn classify_tile(metrics: &TileMetrics, prev: &CodecState) -> CodecState {
     // Rule 8: fallback ⇒ Cdf53 (lossy → refinement). M3.0 emission is Raw.
     CodecState::Cdf53 {
         passes_sent: 0,
-        max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
+        present_passes: 0x3FFF,
     }
 }
 
@@ -457,7 +457,7 @@ impl Classifier {
         self.adaptation_context
     }
 
-    /// Number of tiles currently in `Cdf53 { passes_sent < max_passes }`.
+    /// Number of tiles currently in `Cdf53 { passes_sent < present_passes.count_ones() }`.
     /// Caller (io_bridge) updates this each frame from the per-tile state.
     /// Used by M3.6b's refinement-deficit bias term in `decide_frame_mode`.
     pub fn set_refinement_deficit_tiles(&mut self, count: u32) {
