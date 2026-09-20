@@ -155,7 +155,9 @@ fn build_pointer_dispatch_js(
     // we set the bit for `button`; for everything else we leave it 0.
     let buttons: u32 = match kind {
         PointerEventKind::Down => 1u32 << button,
-        _ => 0,
+        // No button held: Up has already released it, Move and Leave never
+        // held one. Listed so a new kind must state its own mask.
+        PointerEventKind::Move | PointerEventKind::Up | PointerEventKind::Leave => 0,
     };
     format!(
         "(() => {{\n  const el = document.querySelector({sel});\n  if (!el) return false;\n  const rect = el.getBoundingClientRect();\n  el.dispatchEvent(new PointerEvent({ty}, {{\n    clientX: rect.left + {x},\n    clientY: rect.top + {y},\n    button: {button},\n    buttons: {buttons},\n    isPrimary: true,\n    bubbles: true,\n  }}));\n  return true;\n}})()",

@@ -709,6 +709,15 @@ pub struct IoBridge {
     /// (different lifetime semantics: retransmit window is RTT-bounded;
     /// coverage retention is until-ACKed-or-evicted).
     fragment_coverage: crate::transport::fragment_coverage::FragmentCoverageMap,
+    /// Inbound datagrams whose `InboundKind` has no route on this path.
+    ///
+    /// The routing match that feeds this used to end in `_ =>
+    /// dispatch_ack_datagram`, so every unrecognised, empty, or
+    /// wrong-direction datagram was handed to the ACK parser. Counting them
+    /// instead keeps the miscount visible: a non-zero value here means
+    /// something is arriving that nothing claims, which is worth knowing and
+    /// was previously indistinguishable from a malformed ACK.
+    unroutable_inbound_datagrams: u64,
     /// Last (width, height) the server emitted as a frame-dimensions datagram.
     /// `None` means we've never emitted dimensions (first frame upcoming).
     last_emitted_dimensions: Option<(u32, u32)>,
@@ -1299,6 +1308,7 @@ impl IoBridge {
             fragment_coverage: crate::transport::fragment_coverage::FragmentCoverageMap::new(
                 crate::transport::fragment_coverage::FRAGMENT_COVERAGE_CAPACITY,
             ),
+            unroutable_inbound_datagrams: 0,
             last_emitted_dimensions: None,
             dimensions_retransmits_left: 0,
             connected_session_count: Arc::new(AtomicUsize::new(0)),
@@ -2026,7 +2036,17 @@ impl IoBridge {
                                 None => (Codec::Raw, tile_data), // table-full fallback or no GPU prep
                             }
                         }
-                        _ => (Codec::Raw, tile_data),
+                        // Raw is the encoder of last resort: these states
+                        // either have no tile-local encoding of their own
+                        // (H264 is a whole-frame path, Skip emits nothing)
+                        // or are handled before this match. Listed so a new
+                        // CodecState must choose its encoder rather than
+                        // silently inheriting Raw, which is the most
+                        // expensive option on the wire.
+                        CodecState::H264 { .. }
+                        | CodecState::Cdf53 { .. }
+                        | CodecState::PixelPerfect
+                        | CodecState::Skip => (Codec::Raw, tile_data),
                     }
                 }
             };
@@ -2246,7 +2266,11 @@ impl IoBridge {
                         Codec::Raw => {
                             stats.codec_histogram.raw = stats.codec_histogram.raw.saturating_add(1);
                         }
-                        _ => {}
+                        // No histogram bucket: H264 is counted on the
+                        // whole-frame path, Skip emits no datagram. Listed so
+                        // a new codec cannot go uncounted without someone
+                        // deciding that it should.
+                        Codec::H264 | Codec::Skip => {}
                     }
                 }
                 let tile_wire_bytes: u32 = datagrams.iter().map(|dg| dg.len() as u32).sum();
@@ -2299,7 +2323,9 @@ impl IoBridge {
                     self.cumulative_datagrams_emitted.raw =
                         self.cumulative_datagrams_emitted.raw.saturating_add(n_dg);
                 }
-                _ => {}
+                // Same reasoning as the histogram above: no per-codec
+                // datagram counter for these, stated rather than defaulted.
+                Codec::H264 | Codec::Skip => {}
             }
             // Hand every fragment to the reliable emitter under the
             // same EmitKey (the per-tile-pass identity used by ACK/NACK).
@@ -2978,9 +3004,13 @@ impl IoBridge {
                                     }
                                 }
                             }
-                            // Solid, Raw, H264, Skip: mark_acked above
-                            // is the only scheduler-state update needed.
-                            _ => {}
+                            // mark_acked above is the only scheduler-state
+                            // update these need. Listed rather than caught by
+                            // `_`: this is the per-codec ACK-side state hook,
+                            // and a new codec needing release/refcount work
+                            // here would otherwise get none, silently -- the
+                            // shape of the PalRle palette-leak bug.
+                            Codec::Solid | Codec::Raw | Codec::H264 | Codec::Skip => {}
                         }
                     }
                 }
@@ -3637,7 +3667,14 @@ impl IoBridge {
                     }
                     let present_passes = match m.codec_state {
                         crate::tile::CodecState::Cdf53 { present_passes, .. } => present_passes,
-                        _ => continue,
+                        // Cdf53-only sweep: a tile in any other state has no
+                        // pass set to refine. Listed so a future progressive
+                        // codec is not silently skipped here.
+                        crate::tile::CodecState::PalRle { .. }
+                        | crate::tile::CodecState::Solid
+                        | crate::tile::CodecState::H264 { .. }
+                        | crate::tile::CodecState::PixelPerfect
+                        | crate::tile::CodecState::Skip => continue,
                     };
                     // NOTE: TileMetrics.passes_sent is dead state in the
                     // current codebase — it's initialized to 0 at every
@@ -3935,7 +3972,14 @@ impl IoBridge {
                     let tm = self.metrics_tracker.get(tile_x as u32, tile_y as u32);
                     match tm.codec_state {
                         crate::tile::CodecState::Cdf53 { present_passes, .. } => present_passes,
-                        _ => continue,
+                        // Cdf53-only sweep: a tile in any other state has no
+                        // pass set to refine. Listed so a future progressive
+                        // codec is not silently skipped here.
+                        crate::tile::CodecState::PalRle { .. }
+                        | crate::tile::CodecState::Solid
+                        | crate::tile::CodecState::H264 { .. }
+                        | crate::tile::CodecState::PixelPerfect
+                        | crate::tile::CodecState::Skip => continue,
                     }
                 };
                 let gen = self.scheduler.generation_for(tile_x, tile_y);
@@ -5327,12 +5371,35 @@ impl IoBridge {
                         // here without checking what `classify_inbound`
                         // actually returns for a live ACK would silently
                         // swallow the ACK stream.
-                        match crate::transport::protocol::classify_inbound(&dg) {
-                            crate::transport::protocol::InboundKind::TileNack => {
-                                self.dispatch_tile_nack_datagram(&dg);
-                            }
-                            _ => {
-                                self.dispatch_ack_datagram(&dg);
+                        {
+                            use crate::transport::protocol::InboundKind as K;
+                            match crate::transport::protocol::classify_inbound(&dg) {
+                                K::TileNack => self.dispatch_tile_nack_datagram(&dg),
+                                K::AckBatch => self.dispatch_ack_datagram(&dg),
+                                // Superseded ACK revisions still reach the ACK
+                                // decoder, which rejects them by design -- that
+                                // rejection is the intended handling, not a
+                                // fallthrough.
+                                K::AckBatchV1 => self.dispatch_ack_datagram(&dg),
+                                // Everything else is not an ACK and must not be
+                                // handed to the ACK parser. This arm used to be
+                                // `_ =>` feeding *every* non-NACK kind into
+                                // `dispatch_ack_datagram`, which quietly
+                                // undermined the INBOUND_DISCRIMINATORS registry
+                                // that exists precisely so routing is explicit.
+                                //
+                                // Listing the kinds means a new inbound type
+                                // cannot be added without a decision being made
+                                // here about where it goes.
+                                K::Empty
+                                | K::Unknown
+                                | K::Hello
+                                | K::TileParity
+                                | K::FrameFragment
+                                | K::TileFragment => {
+                                    self.unroutable_inbound_datagrams =
+                                        self.unroutable_inbound_datagrams.saturating_add(1);
+                                }
                             }
                         }
                     }
@@ -5671,6 +5738,7 @@ impl IoBridge {
             fragment_coverage: crate::transport::fragment_coverage::FragmentCoverageMap::new(
                 crate::transport::fragment_coverage::FRAGMENT_COVERAGE_CAPACITY,
             ),
+            unroutable_inbound_datagrams: 0,
             last_emitted_dimensions: None,
             dimensions_retransmits_left: 0,
             connected_session_count: Arc::new(AtomicUsize::new(0)),

@@ -757,7 +757,11 @@ impl Scheduler {
                     .last_sent_at
                     .map(|t| now.duration_since(t) >= retry_after)
                     .unwrap_or(true),
-                _ => false,
+                // Terminal states: nothing further to send. Listed rather
+                // than caught by `_` so a new WorkState has to declare
+                // whether it is eligible instead of silently defaulting to
+                // "never send this again".
+                WorkState::Acked | WorkState::Superseded => false,
             };
             if !eligible {
                 continue;

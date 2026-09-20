@@ -189,9 +189,18 @@ pub fn classify_tile(metrics: &TileMetrics, prev: &CodecState) -> CodecState {
 
     // Rule 2: high freq AND high magnitude ⇒ H264
     if freq > 15.0 && mag > 0.3 {
+        // Not already in H264 => this is the first frame of a new H264 run.
+        // The variants are listed rather than caught by `_` because this
+        // file is where a catch-all once hid a wrong classifier for three
+        // months: a new CodecState silently restarting the counter is
+        // exactly the class of defect that cost.
         let frames = match prev {
             CodecState::H264 { frames_in_h264 } => frames_in_h264.saturating_add(1),
-            _ => 1,
+            CodecState::PalRle { .. }
+            | CodecState::Solid
+            | CodecState::Cdf53 { .. }
+            | CodecState::PixelPerfect
+            | CodecState::Skip => 1,
         };
         return CodecState::H264 {
             frames_in_h264: frames,
