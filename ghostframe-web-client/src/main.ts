@@ -473,6 +473,10 @@ async function main() {
   // still fed by drainTransmit below) remains the only wire-loss signal
   // visible in this log line post-cutover.
   const FEC_COUNTER_NOT_MEASURED = 'n/a(wasm-internal)';
+  /// Same sentinel, for counters orphaned by the wasm cutover whose readers
+  /// outlived their writers. Distinguishes "not measured" from "measured
+  /// zero" -- see the stats-line comment below for why that matters.
+  const COUNTER_NOT_MEASURED = 'n/a(wasm-internal)';
 
   let firstTileRendered = false;
   let frameDimensionsKnown = false;
@@ -793,15 +797,25 @@ async function main() {
       // key excludes `raf:` (which always changes) and the cdf53fails
       // counter (also bookkeeping that creeps) — we suppress only when
       // nothing the user cares about has actually moved.
+      // `rx{}`, `cdf53-coverage` and `lastSeq` read `window.__tileCounts`,
+      // `window.__cdf53Coverage` and `window.__lastTileSeq`. All three were
+      // orphaned by the wasm cutover: every writer was deleted with the TS
+      // decode path, and only these readers remain. They are therefore
+      // structurally always zero/empty.
+      //
+      // Printed as literal `0`/`tiles=0` they read as measurements, and a
+      // reader reasonably concludes "no tiles were received" on a session
+      // that in fact decoded 1300 of them — which is exactly the wrong turn
+      // a live debugging session took. Print the same explicit "not
+      // measured" sentinel the FEC counters above already use, so the
+      // distinction between "measured zero" and "not measured" survives.
       const statsLine =
-        `stats: rx{r:${counts.raw} s:${counts.solid} p:${counts.palrle} c:${counts.cdf53} h:${counts.h264}} ` +
+        `stats: rx=${COUNTER_NOT_MEASURED} ` +
         `Δdrain{r:${drainDelta.raw} s:${drainDelta.solid} p:${drainDelta.palrle} c:${drainDelta.cdf53} h:${drainDelta.h264}} ` +
         `fb:${fb.width}x${fb.height} ` +
         `cdf53fails:${cdf53Fails}(last=${cdf53Last}) ` +
-        `raf:${__rafTicks} submit:${(window as unknown as { __gpuSubmitCount?: number }).__gpuSubmitCount ?? 0} lastSeq:${w.__lastTileSeq ?? '-'}`;
-      const coverageLine =
-        `cdf53-coverage: tiles=${cdf53Tiles} refined=${cdf53Refined}/14p partial=${cdf53Partial} ` +
-        `pass-hist{${histCompact}}`;
+        `raf:${__rafTicks} submit:${(window as unknown as { __gpuSubmitCount?: number }).__gpuSubmitCount ?? 0} lastSeq=${COUNTER_NOT_MEASURED}`;
+      const coverageLine = `cdf53-coverage: ${COUNTER_NOT_MEASURED} (per-tile pass coverage now lives in the wasm core)`;
       // Reliable-tile-emitter coverage: FEC recoveries + parity / NACK traffic.
       // Pairs with the server's reliability counters (Task 35) for side-by-side
       // wire-loss inspection. `parity_rx` / `recovered` / `parity_unrecoverable`
@@ -823,17 +837,22 @@ async function main() {
       const bpsRefn = Math.floor(((bytesRecvRefinement - bytesRecvRefinementSnapshot) * 8 * 1000) / dtMs);
       bytesRecvCriticalSnapshot = bytesRecvCritical;
       bytesRecvRefinementSnapshot = bytesRecvRefinement;
-      const bweTierLine =
-        `bwe-tier: bps_critical=${bpsCrit} bps_refinement=${bpsRefn} ` +
-        `bytes_critical=${bytesRecvCritical} bytes_refinement=${bytesRecvRefinement}`;
+      // Same orphaning as `rx{}` above: `bytesRecvCritical` /
+      // `bytesRecvRefinement` have no increment site left post-cutover, so
+      // every derived rate here is structurally zero rather than measured.
+      void bpsCrit;
+      void bpsRefn;
+      const bweTierLine = `bwe-tier: ${COUNTER_NOT_MEASURED} (per-tier receive bytes are no longer counted client-side)`;
+      // Retired counters dropped from the dedup key entirely (see
+      // FEC_COUNTER_NOT_MEASURED) — they're constant now, so keeping them
+      // here would only ever contribute a no-op comparison. That now covers
+      // the cutover-orphaned ones too (`__tileCounts`, `__cdf53Coverage`,
+      // `__lastTileSeq`, the per-tier receive bytes): including them made
+      // the key look content-sensitive while contributing nothing.
       const lineKey =
-        `r:${counts.raw}|s:${counts.solid}|p:${counts.palrle}|c:${counts.cdf53}|h:${counts.h264}|` +
-        `seq:${w.__lastTileSeq ?? '-'}|cov:${cdf53Refined}/${cdf53Partial}/${cdf53Tiles}|hist:${histCompact}|` +
-        // Retired counters dropped from the dedup key entirely (see
-        // FEC_COUNTER_NOT_MEASURED) — they're constant now, so keeping them
-        // here would only ever contribute a no-op comparison.
-        `fec:${nackSent}|` +
-        `bwe:${bytesRecvCritical}/${bytesRecvRefinement}`;
+        `drain:${drainDelta.raw}/${drainDelta.solid}/${drainDelta.palrle}/` +
+        `${drainDelta.cdf53}/${drainDelta.h264}|` +
+        `fb:${fb.width}x${fb.height}|fails:${cdf53Fails}|fec:${nackSent}`;
       const statsChanged = lineKey !== __lastStatsLineKey;
       if (statsChanged) {
         __lastStatsLineKey = lineKey;
