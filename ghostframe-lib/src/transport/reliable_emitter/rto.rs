@@ -89,6 +89,24 @@ pub const RTO_BACKOFF_MAX: Duration = Duration::from_secs(5);
 /// exists to remove.
 pub const ACK_DEADLINE_FLOOR: Duration = Duration::from_millis(150);
 
+/// First-attempt deadline used while the latency tracker has no trustworthy
+/// measurement (`AckLatencyTracker::p95()` returns `Duration::ZERO` until
+/// `MIN_SAMPLES` acknowledgements have arrived).
+///
+/// Deliberately pessimistic, and deliberately well above the floor. The two
+/// failure directions are not symmetric: guessing too slow delays a
+/// last-resort repair that NACKs and the scheduler's 2xRTT retry already
+/// cover, while guessing too fast retransmits everything in flight -- and
+/// those retransmissions compete with the first paint that is generating the
+/// very samples the tracker is waiting for, so the optimistic guess makes
+/// itself true.
+///
+/// One second is longer than any acknowledgement latency observed on either
+/// a real tailnet path (max 103 ms) or the browserless harness (max 317 ms),
+/// so the cold-start window costs at most one second of delayed repair on a
+/// path that genuinely drops its opening datagrams.
+pub const ACK_DEADLINE_COLD_START: Duration = Duration::from_secs(1);
+
 /// Ceiling for the first-attempt ACK deadline (`base`, below).
 ///
 /// The RTO is a last resort — client NACKs handle real loss immediately,
@@ -130,7 +148,13 @@ pub const ACK_DEADLINE_CEILING: Duration = Duration::from_secs(2);
 /// `a_lossless_link_with_a_real_rtt_does_not_retransmit` in
 /// `browserless_runner.rs` for the regression gate.
 pub fn rto_for_attempt(ack_p95: Duration, attempts: u8) -> Duration {
-    let base = (ack_p95 * 2).clamp(ACK_DEADLINE_FLOOR, ACK_DEADLINE_CEILING);
+    // `Duration::ZERO` means the tracker has no trustworthy measurement yet,
+    // not that the path is instant. Assume the worst until told otherwise.
+    let base = if ack_p95.is_zero() {
+        ACK_DEADLINE_COLD_START
+    } else {
+        (ack_p95 * 2).clamp(ACK_DEADLINE_FLOOR, ACK_DEADLINE_CEILING)
+    };
     let shift = attempts.min(8) as u32;
     let backoff = base
         .checked_mul(RTO_BACKOFF_FACTOR.pow(shift))
@@ -148,14 +172,26 @@ mod tests {
 
     #[test]
     fn rto_first_attempt_floors_at_150ms() {
-        // A near-zero (or absent -- Duration::ZERO, before the tracker's
-        // first sample) ack_p95 must not chase it: the floor sits above
-        // the 103 ms max measured in production, which is exactly the
-        // distribution a lower floor raced and lost.
+        // A genuinely measured but tiny p95 must not be chased: the floor
+        // sits above the 103 ms max measured in production, which is exactly
+        // the distribution a lower floor raced and lost.
         let r = rto_for_attempt(Duration::from_millis(1), 0);
         assert_eq!(r, ACK_DEADLINE_FLOOR);
-        let r_zero = rto_for_attempt(Duration::ZERO, 0);
-        assert_eq!(r_zero, ACK_DEADLINE_FLOOR);
+    }
+
+    /// `Duration::ZERO` is the tracker saying "I have no measurement", not
+    /// "the path is instant". Answering it with the floor is what left 128
+    /// retransmissions on the browserless storm scene: the first p95 read
+    /// 93 ms against a true p50 of 280 ms, and every one of those fires
+    /// landed between the optimistic deadline and the real latency.
+    #[test]
+    fn no_measurement_yet_gets_the_pessimistic_cold_start_deadline() {
+        let r = rto_for_attempt(Duration::ZERO, 0);
+        assert_eq!(r, ACK_DEADLINE_COLD_START);
+        assert!(
+            ACK_DEADLINE_COLD_START > ACK_DEADLINE_FLOOR,
+            "an unmeasured path must be assumed slower than a measured fast one"
+        );
     }
 
     #[test]
@@ -216,12 +252,22 @@ mod tests {
     #[test]
     fn ack_deadline_floors_when_measurement_is_tiny() {
         use crate::transport::ack_latency::AckLatencyTracker;
+        use crate::transport::ack_latency::MIN_SAMPLES;
         let mut t = AckLatencyTracker::new();
-        for _ in 0..10 {
+        // Enough samples to count as a measurement, all of them tiny.
+        for _ in 0..MIN_SAMPLES {
             t.record(1_000); // 1ms
         }
         let deadline = rto_for_attempt(t.p95(), 0);
         assert_eq!(deadline, ACK_DEADLINE_FLOOR);
+
+        // Below the threshold the same samples are not a measurement, and
+        // the policy must err slow instead.
+        let mut cold = AckLatencyTracker::new();
+        for _ in 0..MIN_SAMPLES - 1 {
+            cold.record(1_000);
+        }
+        assert_eq!(rto_for_attempt(cold.p95(), 0), ACK_DEADLINE_COLD_START);
     }
 
     #[test]

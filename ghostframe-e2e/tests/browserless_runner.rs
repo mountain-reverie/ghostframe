@@ -642,7 +642,7 @@ async fn a_lossless_link_with_a_real_rtt_does_not_retransmit() {
     // catching a regression back toward either prior cause; do not raise it
     // back toward 400 without measuring why 128 grew.
     assert!(
-        r.retransmit_attempts_total < 200,
+        r.retransmit_attempts_total < 100,
         "a lossless {}ms-RTT link retransmitted {} times, against 128 measured \
          with the ack-latency-derived RTO deadline. Nothing was lost. A number \
          near 1788 means late acknowledgements are stranding their cache \
