@@ -144,6 +144,19 @@ Recorded because each cost real time and would cost it again.
   sits at its seed before congestion is detected varies run to run, so a
   `[4s, 5s)` "before" window sometimes averaged the seed instead of the
   converged floor, making a test flaky 1 run in 3.
+- **A threshold inside its own success distribution is a coin flip, not a
+  gate.** `the_estimate_follows_a_mid_scene_capacity_step_up` failed ~50% of
+  runs because its 80%-of-capacity bar (12.8 Mbps) sat inside the *passing*
+  population: with the capacity hint the final estimate measures 12.0-18.2
+  Mbps, and without it 7.0-7.2 Mbps. The fix was to measure both populations
+  and put the bar in the gap (60%, 9.6 Mbps) — a weaker-sounding number that
+  separates strictly better. Before tuning a flaky threshold, measure what
+  the two sides of it actually look like; the answer is often that the
+  threshold was never separating them.
+- **An acceptance bound longer than the observation window is unobservable.**
+  The same test ran a 20 s scene stepping at 4 s — 16 s of recovery to watch
+  — against an 18 s convergence bound. No run could ever exercise the
+  (16 s, 18 s] part of the range it claimed to admit.
 
 ## Claims retracted
 
