@@ -115,17 +115,20 @@ impl AckLatencyTracker {
     /// (the 95th-smallest-of-100 convention): `rank = ceil(0.95 * n)`,
     /// 1-indexed, clamped into range.
     ///
-    /// `Duration::ZERO` until [`MIN_SAMPLES`] have been recorded, meaning
-    /// "no trustworthy measurement yet" rather than "zero latency".
-    /// `rto_for_attempt` answers that with a pessimistic cold-start deadline
-    /// — see [`MIN_SAMPLES`] for why erring slow is the safe direction.
+    /// `None` until [`MIN_SAMPLES`] have been recorded.
+    ///
+    /// `None` rather than a sentinel `Duration`: "no measurement yet" and
+    /// "the path is instant" are opposite facts, and encoding both as
+    /// `Duration::ZERO` is what let the policy answer the first with the
+    /// treatment meant for the second. `rto_for_attempt` takes the same
+    /// `Option` so the distinction survives to the decision.
     ///
     /// Sorts a stack-allocated copy of the window (fixed-size array, not a
     /// `Vec`) — see the module doc for why that's an acceptable query-time
     /// cost.
-    pub fn p95(&self) -> Duration {
+    pub fn p95(&self) -> Option<Duration> {
         if self.len < MIN_SAMPLES {
-            return Duration::ZERO;
+            return None;
         }
         let mut buf = [0u64; WINDOW];
         buf[..self.len].copy_from_slice(&self.samples[..self.len]);
@@ -136,7 +139,7 @@ impl AckLatencyTracker {
         // ceil(0.95 * n), 1-indexed rank into the sorted sample.
         let rank = (95 * n).div_ceil(100);
         let idx = (rank.saturating_sub(1) as usize).min(self.len - 1);
-        Duration::from_micros(sorted[idx])
+        Some(Duration::from_micros(sorted[idx]))
     }
 }
 
@@ -147,7 +150,7 @@ mod tests {
     #[test]
     fn empty_tracker_reports_zero() {
         let t = AckLatencyTracker::new();
-        assert_eq!(t.p95(), Duration::ZERO);
+        assert_eq!(t.p95(), None);
         assert_eq!(t.len(), 0);
         assert!(t.is_empty());
     }
@@ -158,7 +161,7 @@ mod tests {
         t.record(12_345);
         assert_eq!(
             t.p95(),
-            Duration::ZERO,
+            None,
             "one sample is not a distribution; reporting it would let a single \
              fast acknowledgement set the deadline for everything behind it"
         );
@@ -176,11 +179,11 @@ mod tests {
         }
         assert_eq!(
             t.p95(),
-            Duration::ZERO,
+            None,
             "one sample short of the threshold is still no measurement"
         );
         t.record(40_000);
-        assert_eq!(t.p95(), Duration::from_micros(40_000));
+        assert_eq!(t.p95(), Some(Duration::from_micros(40_000)));
     }
 
     #[test]
@@ -196,7 +199,7 @@ mod tests {
         for _ in 0..6 {
             t.record(80_000);
         }
-        assert_eq!(t.p95(), Duration::from_millis(80));
+        assert_eq!(t.p95(), Some(Duration::from_millis(80)));
     }
 
     #[test]
@@ -206,7 +209,7 @@ mod tests {
         for _ in 0..WINDOW {
             t.record(500_000);
         }
-        assert_eq!(t.p95(), Duration::from_micros(500_000));
+        assert_eq!(t.p95(), Some(Duration::from_micros(500_000)));
         // ...then fully overwrite it with a low one. If eviction didn't
         // work, some 500ms samples would still be in the window and p95
         // would not equal the low value.
@@ -214,7 +217,7 @@ mod tests {
             t.record(1_000);
         }
         assert_eq!(t.len(), WINDOW);
-        assert_eq!(t.p95(), Duration::from_micros(1_000));
+        assert_eq!(t.p95(), Some(Duration::from_micros(1_000)));
     }
 
     #[test]
@@ -238,7 +241,7 @@ mod tests {
             let rank = (95 * n as u64).div_ceil(100) as usize;
             v[rank.saturating_sub(1).min(n - 1)]
         };
-        assert_eq!(t.p95(), Duration::from_micros(expected));
+        assert_eq!(t.p95(), Some(Duration::from_micros(expected)));
     }
 
     #[test]

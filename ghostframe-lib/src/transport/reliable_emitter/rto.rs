@@ -147,13 +147,14 @@ pub const ACK_DEADLINE_CEILING: Duration = Duration::from_secs(2);
 /// retransmissions, 200 ms -> 128, 300 ms -> 0. See
 /// `a_lossless_link_with_a_real_rtt_does_not_retransmit` in
 /// `browserless_runner.rs` for the regression gate.
-pub fn rto_for_attempt(ack_p95: Duration, attempts: u8) -> Duration {
-    // `Duration::ZERO` means the tracker has no trustworthy measurement yet,
-    // not that the path is instant. Assume the worst until told otherwise.
-    let base = if ack_p95.is_zero() {
-        ACK_DEADLINE_COLD_START
-    } else {
-        (ack_p95 * 2).clamp(ACK_DEADLINE_FLOOR, ACK_DEADLINE_CEILING)
+pub fn rto_for_attempt(ack_p95: Option<Duration>, attempts: u8) -> Duration {
+    // `None` is the tracker saying it has no trustworthy measurement yet,
+    // which is a different fact from a fast path. Assume the worst until
+    // told otherwise; see `ACK_DEADLINE_COLD_START` for why slow is the safe
+    // direction to be wrong in.
+    let base = match ack_p95 {
+        Some(p95) => (p95 * 2).clamp(ACK_DEADLINE_FLOOR, ACK_DEADLINE_CEILING),
+        None => ACK_DEADLINE_COLD_START,
     };
     let shift = attempts.min(8) as u32;
     let backoff = base
@@ -175,7 +176,7 @@ mod tests {
         // A genuinely measured but tiny p95 must not be chased: the floor
         // sits above the 103 ms max measured in production, which is exactly
         // the distribution a lower floor raced and lost.
-        let r = rto_for_attempt(Duration::from_millis(1), 0);
+        let r = rto_for_attempt(Some(Duration::from_millis(1)), 0);
         assert_eq!(r, ACK_DEADLINE_FLOOR);
     }
 
@@ -186,7 +187,7 @@ mod tests {
     /// landed between the optimistic deadline and the real latency.
     #[test]
     fn no_measurement_yet_gets_the_pessimistic_cold_start_deadline() {
-        let r = rto_for_attempt(Duration::ZERO, 0);
+        let r = rto_for_attempt(None, 0);
         assert_eq!(r, ACK_DEADLINE_COLD_START);
         assert!(
             ACK_DEADLINE_COLD_START > ACK_DEADLINE_FLOOR,
@@ -199,7 +200,7 @@ mod tests {
         // A single pathological ack_p95 (a start-of-session spike, or a
         // genuinely broken path) must not disable the RTO's contribution
         // to recovery by pushing the deadline out indefinitely.
-        let r = rto_for_attempt(Duration::from_secs(5), 0);
+        let r = rto_for_attempt(Some(Duration::from_secs(5)), 0);
         assert_eq!(r, ACK_DEADLINE_CEILING);
     }
 
@@ -208,10 +209,10 @@ mod tests {
         // ack_p95 = 100ms -> base = clamp(200ms, 150ms, 2s) = 200ms,
         // comfortably inside floor/ceiling so doubling is visible
         // untouched by either clamp.
-        let r0 = rto_for_attempt(Duration::from_millis(100), 0);
-        let r1 = rto_for_attempt(Duration::from_millis(100), 1);
-        let r2 = rto_for_attempt(Duration::from_millis(100), 2);
-        let r3 = rto_for_attempt(Duration::from_millis(100), 3);
+        let r0 = rto_for_attempt(Some(Duration::from_millis(100)), 0);
+        let r1 = rto_for_attempt(Some(Duration::from_millis(100)), 1);
+        let r2 = rto_for_attempt(Some(Duration::from_millis(100)), 2);
+        let r3 = rto_for_attempt(Some(Duration::from_millis(100)), 3);
         assert_eq!(r0, Duration::from_millis(200));
         assert_eq!(r1, Duration::from_millis(400));
         assert_eq!(r2, Duration::from_millis(800));
@@ -221,13 +222,13 @@ mod tests {
     #[test]
     fn rto_backoff_caps_at_5_seconds() {
         // Same base = 200ms as the doubling test above.
-        let r4 = rto_for_attempt(Duration::from_millis(100), 4);
+        let r4 = rto_for_attempt(Some(Duration::from_millis(100)), 4);
         assert_eq!(r4, Duration::from_millis(3200));
         // attempt 5 would compute 6400ms, but the cap is 5000ms.
-        let r5 = rto_for_attempt(Duration::from_millis(100), 5);
+        let r5 = rto_for_attempt(Some(Duration::from_millis(100)), 5);
         assert_eq!(r5, Duration::from_secs(5));
         // attempt 99 must never exceed 5 s regardless of shift saturation.
-        let r99 = rto_for_attempt(Duration::from_millis(100), 99);
+        let r99 = rto_for_attempt(Some(Duration::from_millis(100)), 99);
         assert_eq!(r99, Duration::from_secs(5));
     }
 
@@ -244,7 +245,7 @@ mod tests {
         for _ in 0..6 {
             t.record(80_000); // 80ms
         }
-        assert_eq!(t.p95(), Duration::from_millis(80));
+        assert_eq!(t.p95(), Some(Duration::from_millis(80)));
         let deadline = rto_for_attempt(t.p95(), 0);
         assert_eq!(deadline, Duration::from_millis(160));
     }

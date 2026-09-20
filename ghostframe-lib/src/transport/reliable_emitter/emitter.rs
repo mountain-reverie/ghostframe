@@ -26,7 +26,7 @@ pub struct ReliableTileEmitter {
     /// `Duration::ZERO` before the first measurement arrives, which
     /// `rto_for_attempt`'s floor clamps to a safe default rather than
     /// racing a real latency at zero.
-    pub(crate) ack_deadline: Duration,
+    pub(crate) ack_deadline: Option<Duration>,
     /// Reference instant this emitter was constructed with. Tile-datagram
     /// emit stamps (`DatagramHeader.timestamp_us`) are measured as
     /// `now.duration_since(time_base)` rather than the wall clock, so they
@@ -82,7 +82,7 @@ impl ReliableTileEmitter {
             queue: EmissionQueue::new(),
             group: GroupBuilder::new(FEC_GROUP_SIZE_K),
             rto: RtoTimerWheel::new(),
-            ack_deadline: Duration::ZERO,
+            ack_deadline: None,
             time_base: now,
             transmissions: Vec::new(),
             stats: EmitterStats::default(),
@@ -93,7 +93,7 @@ impl ReliableTileEmitter {
     /// the first-attempt RTO deadline from. Called by `IoBridge` once per
     /// BWE-sample drain (see `ack_latency::AckLatencyTracker`) — cheap, a
     /// plain field write.
-    pub fn set_ack_deadline(&mut self, d: Duration) {
+    pub fn set_ack_deadline(&mut self, d: Option<Duration>) {
         self.ack_deadline = d;
     }
 

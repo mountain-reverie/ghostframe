@@ -4660,7 +4660,14 @@ impl IoBridge {
                         // window's ack_deadline was derived from, and the
                         // first-attempt deadline that derivation currently
                         // yields.
-                        rto_ack_latency_p95_us = self.ack_latency_tracker.p95().as_micros() as u64,
+                        // -1 distinguishes "no measurement yet" from a
+                        // genuinely tiny p95 in the log, the same distinction
+                        // the Option carries in the code.
+                        rto_ack_latency_p95_us = self
+                            .ack_latency_tracker
+                            .p95()
+                            .map(|d| d.as_micros() as i64)
+                            .unwrap_or(-1),
                         rto_first_attempt_deadline_us =
                             crate::transport::reliable_emitter::rto::rto_for_attempt(
                                 self.ack_latency_tracker.p95(),
