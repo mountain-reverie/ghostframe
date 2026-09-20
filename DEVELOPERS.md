@@ -48,7 +48,7 @@ cd ghostframe-web-client
 npm install
 npm run build
 # or, from repo root:
-just web-client-build
+just build-web
 ```
 
 > The e2e harness serves `ghostframe-web-client/dist/` over HTTP to headless
