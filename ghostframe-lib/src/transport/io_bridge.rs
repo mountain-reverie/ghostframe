@@ -4981,7 +4981,26 @@ impl IoBridge {
                         .received_at
                         .saturating_duration_since(self.bwe_epoch)
                         .as_micros() as u64;
-                    let ack_latency_us = elapsed_since_epoch_us.saturating_sub(s.server_emit_us);
+                    // `server_emit_us` comes from `ReliableTileEmitter::emit_us`,
+                    // which is `u32` microseconds because that is what the
+                    // datagram header carries at bytes [12..16]. It wraps every
+                    // 2^32 us = 71.6 minutes, while `elapsed_since_epoch_us` is
+                    // u64 and never does. Subtracting one from the other breaks
+                    // at the first wrap: the u64 keeps climbing while the u32
+                    // resets, so the difference becomes the elapsed session time
+                    // instead of a round trip.
+                    //
+                    // Observed in production: a daemon up 81 minutes reported
+                    // `critical_latency_mean_us=2448007853` -- 2448 seconds --
+                    // having read a steady 19375 us for the preceding hour. The
+                    // same corruption reaches `BweSample::server_emit_us`, so
+                    // goog_cc's timing input is garbage past the first wrap.
+                    //
+                    // Do the subtraction in wrapping u32, which is correct
+                    // across a wrap because the true delta is milliseconds.
+                    let ack_latency_us = (elapsed_since_epoch_us as u32)
+                        .wrapping_sub(s.server_emit_us as u32)
+                        as u64;
                     match s.tier {
                         PassTier::Critical => self.critical_latency_stats.record(ack_latency_us),
                         PassTier::Refinement => {
@@ -7121,6 +7140,45 @@ mod tests {
     /// This fired 602 times in a single live session while the same log showed
     /// none in the preceding week, with the warning text naming itself an
     /// "enqueue/ack pairing bug".
+    /// The emit stamp is `u32` microseconds because the datagram header
+    /// carries it in 4 bytes, so it wraps every 2^32 us = 71.6 minutes. The
+    /// clock it is subtracted from is `u64` and does not. Mixing them breaks
+    /// at the first wrap: the u64 keeps climbing while the u32 resets, and the
+    /// difference becomes elapsed session time rather than a round trip.
+    ///
+    /// Observed in production on a daemon up 81 minutes:
+    /// `critical_latency_mean_us=2448007853` (2448 seconds), after an hour of
+    /// a steady 19375 us. The same corruption reaches
+    /// `BweSample::server_emit_us`, so the bandwidth estimator's timing input
+    /// is garbage past the first wrap.
+    #[test]
+    fn ack_latency_survives_the_emit_stamp_wrapping() {
+        // A session past its first wrap. True elapsed at emit is
+        // 4_300_000_000 us (~71.7 min), which the u32 stamp records as
+        // 5_032_704 -- it has wrapped. The acknowledgement arrives 30 ms
+        // later, and the u64 epoch clock reads the true 4_300_030_000.
+        const WRAP: u64 = 1u64 << 32;
+        let true_emit_us: u64 = 4_300_000_000;
+        let emit_us: u32 = true_emit_us as u32; // what the header carries
+        let elapsed_since_epoch_us: u64 = true_emit_us + 30_000;
+        assert!(
+            true_emit_us > WRAP,
+            "precondition: the session must be past the first wrap"
+        );
+
+        let naive = elapsed_since_epoch_us.saturating_sub(emit_us as u64);
+        assert!(
+            naive > 1_000_000,
+            "precondition: the naive subtraction must be absurd, got {naive} us"
+        );
+
+        let wrapped = (elapsed_since_epoch_us as u32).wrapping_sub(emit_us) as u64;
+        assert_eq!(
+            wrapped, 30_000,
+            "wrapping subtraction must recover the true 30 ms round trip"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn ack_for_a_thin_palrle_tile_leaves_the_carry_count_alone() {
         let (our_end, _peer) = UnixStream::pair().expect("pair");
