@@ -417,11 +417,33 @@ impl ClientCore {
                 }
             }
             Codec::Cdf53 => {
+                // A pass from a generation older than the one this tile is
+                // already accumulating is stale -- the server superseded that
+                // content -- and must not reach the integrator. Integrating it
+                // mixes coefficients from two different pictures, which is
+                // exactly what left a tile rendering wrong forever in the
+                // supersede reproduction: its sequence was
+                // `gen0 p0..p13, gen1 p0, gen0 p12, gen1 p1..p13`, and that
+                // one late `gen0 p12` corrupted the generation-1 image.
+                //
+                // Checked here rather than only in `apply_cdf53_arrival`
+                // because coverage bookkeeping and rendering are separate
+                // consumers; fixing the bookkeeping alone stopped the
+                // spurious NACKs and left the pixels wrong.
+                let prev = self.cdf53_coverage.get(&(tx, ty)).copied();
+                if let Some(entry) = prev {
+                    if entry.generation != asm.generation
+                        && !crate::cdf53_coverage::generation_is_newer(
+                            asm.generation,
+                            entry.generation,
+                        )
+                    {
+                        return;
+                    }
+                }
+
                 let result = prevalidate_cdf53(&payload, asm.generation, asm.pass);
                 let ok = result.is_ok();
-
-                // Coverage bookkeeping + NACK decision (shared success/fail).
-                let prev = self.cdf53_coverage.get(&(tx, ty)).copied();
                 let outcome =
                     apply_cdf53_arrival(prev, asm.generation, asm.pass, frame_seq, now_us, ok);
                 self.cdf53_coverage.insert((tx, ty), outcome.entry);
