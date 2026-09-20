@@ -1,11 +1,31 @@
-//! Is the browserless harness actually a deterministic simulator?
+//! Is the browserless harness a deterministic simulator?
 //!
 //! A simulator whose output depends on anything but its seed cannot be used
 //! to bisect a protocol bug: a rerun that behaves differently is
-//! indistinguishable from a fix. This file runs one scene twice in a single
-//! process and compares what came out.
+//! indistinguishable from a fix. These tests run one scene twice in a single
+//! process and compare what came out.
 //!
-//! Probe only — this exists to locate divergence, not yet to gate it.
+//! # What was measured
+//!
+//! **Behaviour is reproducible; byte volume is not.** Across repeated runs of
+//! the same seed, every behavioural counter matched exactly — events,
+//! retransmit attempts, NACK hit/miss, RTO firings, ACK-latency sample
+//! counts, BWE samples, probe outcomes. Only the delivered byte totals
+//! differed, by roughly 0.3% (11607 vs 11573 server->client), along with the
+//! datagram count those bytes arrived in (53 vs 52) — one extra ACK-only
+//! packet, carrying no application data.
+//!
+//! The divergence is not in the handshake: a scene with no tiles is
+//! byte-identical run to run (`an_empty_scene_is_byte_identical`). It appears
+//! only once tiles flow, and it moves bytes without moving any
+//! protocol-visible count — consistent with QUIC-level framing (ACK frame
+//! size, packet bundling) varying with task-scheduling order, rather than
+//! with anything this project decides.
+//!
+//! So the gate here is on behaviour. That is the property a bisect actually
+//! needs, and it is the one that would break if the protocol became
+//! order-dependent. Asserting byte equality as well would buy nothing and
+//! flake on tokio's scheduler.
 
 use std::time::Duration;
 
@@ -43,13 +63,14 @@ fn scene() -> BrowserlessScene {
     }
 }
 
-/// Every scalar worth comparing, as (name, value), so a divergence names
-/// itself instead of showing up as a bare `assert_eq` on a struct.
+/// Every behavioural scalar worth comparing, as (name, value), so a
+/// divergence names itself instead of showing up as a bare `assert_eq` on a
+/// struct.
+///
+/// Byte totals are deliberately absent — see the module docs.
 fn digest(r: &BrowserlessResult) -> Vec<(&'static str, u64)> {
     vec![
         ("events_len", r.events.len() as u64),
-        ("bytes_delivered_s2c", r.bytes_delivered_s2c),
-        ("bytes_delivered_c2s", r.bytes_delivered_c2s),
         ("bytes_dropped", r.bytes_dropped),
         ("stale_generation_tiles", r.stale_generation_tiles as u64),
         ("retransmit_attempts_total", r.retransmit_attempts_total),
@@ -66,9 +87,20 @@ fn digest(r: &BrowserlessResult) -> Vec<(&'static str, u64)> {
 }
 
 #[tokio::test(start_paused = true)]
-async fn the_same_seed_produces_the_same_scene() {
+async fn the_same_seed_produces_the_same_behaviour() {
     let a = run_browserless(scene()).await.expect("run a");
     let b = run_browserless(scene()).await.expect("run b");
+
+    // Premise: a digest of all zeros compares equal for the uninteresting
+    // reason. Two tests in this file's own history passed vacuously before
+    // someone checked, so pin down that the scene actually ran.
+    assert!(
+        a.events.len() > 1 && a.critical_latency_count > 0,
+        "scene produced nothing to compare (events={}, critical_latency_count={}); \
+         equality below would hold whether or not the harness is deterministic",
+        a.events.len(),
+        a.critical_latency_count
+    );
 
     let (da, db) = (digest(&a), digest(&b));
     let diffs: Vec<String> = da
@@ -78,16 +110,9 @@ async fn the_same_seed_produces_the_same_scene() {
         .map(|((n, x), (_, y))| format!("  {n}: {x} != {y}"))
         .collect();
 
-    eprintln!(
-        "MEASURE s2c={} c2s={} crit={} refine={}",
-        a.bytes_delivered_s2c,
-        a.bytes_delivered_c2s,
-        a.critical_latency_count,
-        a.refinement_latency_count
-    );
     assert!(
         diffs.is_empty(),
-        "the same seed produced two different scenes:\n{}",
+        "the same seed produced two behaviourally different scenes:\n{}",
         diffs.join("\n")
     );
 }

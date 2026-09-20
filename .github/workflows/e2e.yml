@@ -58,13 +58,15 @@ jobs:
       # `injected_frame_supersedes_prior_work_for_the_same_tile`).
       #
       # Serial execution stays because these scenes each spawn a tokio
-      # runtime, a LocalSet and an IoBridge task, and the harness is
-      # genuinely not reproducible run to run — see
-      # `ghostframe-e2e/src/netsim/mod.rs` for which layer is deterministic
-      # and which is not. Running them serially keeps that variance from
-      # compounding across nine concurrent scenes.
+      # runtime, a LocalSet and an IoBridge task. What varies run to run is
+      # now measured rather than assumed: `browserless_determinism` pins the
+      # protocol-visible behaviour as reproducible for a given seed, and
+      # documents that delivered bytes and datagram counts are not (QUIC
+      # framing shifts with task-scheduling order). Running these serially
+      # keeps that variance from compounding across nine concurrent scenes.
       - run: cargo test --test netsim --test netsim_pump --test scene_tiles --test framebuffer
       - run: cargo test --test browserless_runner -- --test-threads=1
+      - run: cargo test --test browserless_determinism -- --test-threads=1
 
   harness-smoke:
     name: harness-smoke
