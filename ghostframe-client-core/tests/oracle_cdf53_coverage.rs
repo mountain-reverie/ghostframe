@@ -179,3 +179,68 @@ fn gap_detection_nacks_missing_lower_passes() {
     assert_eq!(out.entry.pass_mask, 0b0010001);
     assert_eq!(out.entry.nacked_mask, 0b0001110);
 }
+
+// ---------------------------------------------------------------------------
+// Stale-generation handling. Not part of the TS port: the behaviour below did
+// not exist there, and its absence is what left a tile rendering wrong
+// forever. See `refinement_completes_when_a_second_frame_supersedes_the_first`
+// in ghostframe-e2e for the end-to-end reproduction.
+// ---------------------------------------------------------------------------
+
+/// A pass from an older generation must leave the entry untouched.
+///
+/// The catch-all that used to handle "generation differs" reset the entry to
+/// whatever generation arrived -- including a stale one -- discarding
+/// everything accumulated for the current generation. Guarded here as well as
+/// at the reassembly call site because this function is public API: the wasm
+/// boundary calls it directly, without that call site's protection.
+#[test]
+fn a_pass_from_an_older_generation_is_ignored() {
+    let current = CoverageEntry {
+        generation: 1,
+        frame_seq: 10,
+        pass_mask: 0b11, // gen 1 passes 0 and 1 already landed
+        nacked_mask: 0,
+        last_change_us: 500,
+        sweep_attempts: 0,
+    };
+    let out = apply_cdf53_arrival(Some(current), 0, 12, 11, 900, true);
+    assert_eq!(
+        out.entry, current,
+        "a stale generation-0 pass must not touch a generation-1 entry"
+    );
+    assert!(out.nack_passes.is_empty(), "and must not provoke a NACK");
+}
+
+#[test]
+fn a_pass_from_a_newer_generation_starts_over() {
+    let current = CoverageEntry {
+        generation: 1,
+        frame_seq: 10,
+        pass_mask: 0b11,
+        nacked_mask: 0,
+        last_change_us: 500,
+        sweep_attempts: 0,
+    };
+    let out = apply_cdf53_arrival(Some(current), 2, 0, 11, 900, true);
+    assert_eq!(out.entry.generation, 2);
+    assert_eq!(
+        out.entry.pass_mask, 0b1,
+        "a newer generation starts from scratch with only its own pass"
+    );
+}
+
+/// Generations are 4 bits and wrap at 16, so "newer" cannot be a plain `>`.
+#[test]
+fn generation_ordering_handles_the_four_bit_wrap() {
+    use ghostframe_client_core::cdf53_coverage::generation_is_newer;
+    assert!(generation_is_newer(1, 0));
+    assert!(generation_is_newer(0, 15), "0 follows 15");
+    assert!(generation_is_newer(2, 15), "and 2 is newer still");
+    assert!(
+        !generation_is_newer(15, 0),
+        "15 is stale once 0 has arrived"
+    );
+    assert!(!generation_is_newer(0, 1));
+    assert!(!generation_is_newer(3, 3), "equal is not newer");
+}

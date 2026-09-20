@@ -1893,7 +1893,6 @@ async fn the_client_gives_up_on_a_pass_it_can_never_get() {
 /// exactly two frames and 0 on the other 26,196, and `emitted_cdf53` froze
 /// at 24,094 against the 2040 x 14 = 28,560 a full refinement needs -- 4,466
 /// passes short, permanently. The screen never converged.
-#[ignore = "reproduces an open bug: a superseded tile never completes"]
 #[tokio::test(start_paused = true)]
 async fn refinement_completes_when_a_second_frame_supersedes_the_first() {
     let a = gradient_tile();
