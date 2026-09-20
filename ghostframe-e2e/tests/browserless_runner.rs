@@ -1487,26 +1487,44 @@ async fn the_estimate_separates_a_congested_link_from_an_uncongested_one() {
 /// *discover* that room — nothing tells it. goog_cc's answer is to probe:
 /// send a short burst above the current estimate and read the ACKs.
 ///
-/// Measured answer, 2026-09-14, four runs: the estimate **does** recover,
-/// slowly and with wide variance. Post-step maxima were 378k, 391k, 335k and
-/// 2,112k bits/s against 3.2 Mbps of new capacity, and in every run the final
-/// sample equalled the maximum — the estimate is still climbing when the
-/// scene ends, so 12 s is too short to observe full recovery. One run reached
-/// 2.1 Mbps about 5.8 s after the step; the other three were still near 10%
-/// of capacity at 12 s.
+/// Probe clusters complete here, which is itself new: at production cadence
+/// over the old drop-without-queueing cap they never did. So probing works
+/// and any slow ramp is not explained by probe abandonment — which bounds
+/// how much `drain_for_probe_window_open` could be worth, the open question
+/// in `docs/specs/bwe-probe-emission-timing.md`.
 ///
-/// Probe clusters completed (1/1) in all four runs, which is itself new: at
-/// production cadence over the old drop-without-queueing cap they never did.
-/// So probing is working here and the slow ramp is not explained by probe
-/// abandonment — which bounds how much `drain_for_probe_window_open` could
-/// be worth, the open question in
-/// `docs/specs/bwe-probe-emission-timing.md`.
+/// # Why the thresholds are what they are
 ///
-/// A longer scene would show the full ramp, but 30 s currently panics in
-/// `MetricsTracker::idx` (an unguarded `metrics_tracker.get` in
-/// `dispatch_dirty_tiles_via_scheduler`, whose sibling call a few lines later
-/// *is* bounds-guarded for exactly this reason). Tracked separately; not this
-/// test's business.
+/// This test was ~50% flaky until 2026-09-20, and re-measuring showed the
+/// cause was not noise but two threshold choices that did not match the
+/// behaviour being measured.
+///
+/// **The acceptance level.** Measured final estimates on this 16 Mbps
+/// post-step link, 8 runs each:
+///
+/// | | final estimate |
+/// |---|---|
+/// | with `set_transport_capacity_hint` | 12.0 - 18.2 Mbps |
+/// | with the hint disabled | 7.0 - 7.2 Mbps |
+///
+/// The old 80% bar (12.8 Mbps) cut straight through the *with-hint* range,
+/// so the test was a coin flip on its own success case. 60% (9.6 Mbps) sits
+/// in the gap between the two populations: 34% above the no-hint maximum and
+/// 20% below the with-hint minimum. It is a weaker-sounding number that
+/// discriminates strictly better, and it is still far more than the
+/// "doubling" an earlier version asserted — a 2 -> 4.1 Mbps move would not
+/// come close.
+///
+/// **The observation window.** The scene ran 20 s with the step at 4 s, so it
+/// could only ever watch 16 s of recovery — against an 18 s bound. Part of
+/// the acceptance range was unobservable by construction. The scene is now
+/// 26 s, giving 22 s of post-step observation against the same 18 s bound.
+///
+/// Time-to-converge at the 60% level now measures 4.4 - 10.1 s across 8 runs,
+/// so 18 s carries real margin. Note the bound is no longer what guards
+/// against the hint regressing: with the hint disabled the estimate does not
+/// reach 60% *at all* within the scene, in any run. Convergence happening is
+/// the discriminator; the bound just keeps "eventually" honest.
 #[tokio::test(start_paused = true)]
 async fn the_estimate_follows_a_mid_scene_capacity_step_up() {
     const LOW: u64 = 500_000; // bytes/s -> 4 Mbps, well below the ~10 Mbps offered
@@ -1515,28 +1533,36 @@ async fn the_estimate_follows_a_mid_scene_capacity_step_up() {
     /// The acceptance bound: the estimate must reach `CONVERGED_FRACTION` of
     /// the new capacity within this long after the step.
     ///
-    /// Measured 13.0-13.6 s across runs; 18 s is that with margin, and still
-    /// well inside the 21.9 s this took before the capacity hint existed, so
-    /// a regression that removed the hint would fail here.
+    /// Measured 4.4-10.1 s across 8 runs at the 60% level, so this carries
+    /// roughly 80% margin over the observed worst case. It must also stay
+    /// under the post-step observation window (26 s scene - 4 s step = 22 s),
+    /// or part of the range it admits can never be observed — which is
+    /// exactly what made the old 18 s bound unreachable against a 16 s
+    /// window.
     ///
     /// Before `set_transport_capacity_hint` fed goog_cc an independent
-    /// ceiling, this took **21.9 s** — the estimate could only climb by
-    /// `AimdRateControl`'s multiplicative increase, which hardcodes
-    /// `alpha = 1.08` capped to one second of effect (8% per second). ALR
-    /// probing cannot substitute for it: `time_for_alr_probe` fires only
-    /// when the application is under-sending, which is exactly when there is
-    /// too little traffic to fill a probe cluster. A bound of 25 s would
-    /// therefore still pass with the hint removed, which is why it is 10 s.
+    /// ceiling, the estimate could only climb by `AimdRateControl`'s
+    /// multiplicative increase, which hardcodes `alpha = 1.08` capped to one
+    /// second of effect (8% per second). ALR probing cannot substitute for
+    /// it: `time_for_alr_probe` fires only when the application is
+    /// under-sending, which is exactly when there is too little traffic to
+    /// fill a probe cluster. Disabling the hint and re-running confirms it:
+    /// the estimate plateaus at ~7.1 Mbps and never reaches this bar.
     const CONVERGE_BY_US: u64 = 18_000_000;
-    const CONVERGED_FRACTION: f64 = 0.8;
+    /// See the "Why the thresholds are what they are" section above: this
+    /// sits in the measured gap between the with-hint and no-hint
+    /// populations, where 0.8 sat inside the with-hint spread.
+    const CONVERGED_FRACTION: f64 = 0.6;
 
     let r = run_bottleneck_scene(
         0xC0FF_EE02,
         CapTimeline::step(LOW, STEP_AT_US, HIGH),
+        // 26 s, not 20: the step lands at 4 s, so this is what makes the
+        // post-step observation window (22 s) longer than CONVERGE_BY_US.
         std::env::var("GF_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(20),
+            .unwrap_or(26),
     )
     .await;
 
