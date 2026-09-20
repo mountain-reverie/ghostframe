@@ -3563,7 +3563,16 @@ impl IoBridge {
             .iter()
             .fold(0u16, |acc, (pass_idx, _)| acc | (1u16 << pass_idx));
         for (pass_idx, payload) in &only_unacked {
-            tracing::info!(
+            // DEBUG, not INFO: this fires once per pass per tile. A full-screen first
+            // frame emits ~9200 of them in ~300 ms, which overruns journald's default
+            // RateLimitBurst (10000 per 30 s) and makes it silently discard everything
+            // the daemon logs for the rest of the interval -- measured in production as
+            // "Suppressed 23232 messages", a 20-second hole that reads exactly like a
+            // stalled capture loop and cost a debugging session before the suppression
+            // notice was found. The per-frame aggregate stays at INFO on the "dispatch
+            // returned" line (codec_cdf53=N), and e2e runs RUST_LOG=ghostframe=trace,debug
+            // so it still sees every line.
+            tracing::debug!(
                 target: "ghostframe::cdf53",
                 tile_x = tile_x,
                 tile_y = tile_y,
@@ -4417,7 +4426,16 @@ impl IoBridge {
                             // Diagnostic: one line per pass actually sent (sparse
                             // encoding skips empty bit-planes) for the e2e log scan.
                             for (pass_idx, payload) in &passes {
-                                tracing::info!(
+                                // DEBUG, not INFO: this fires once per pass per tile. A full-screen first
+                                // frame emits ~9200 of them in ~300 ms, which overruns journald's default
+                                // RateLimitBurst (10000 per 30 s) and makes it silently discard everything
+                                // the daemon logs for the rest of the interval -- measured in production as
+                                // "Suppressed 23232 messages", a 20-second hole that reads exactly like a
+                                // stalled capture loop and cost a debugging session before the suppression
+                                // notice was found. The per-frame aggregate stays at INFO on the "dispatch
+                                // returned" line (codec_cdf53=N), and e2e runs RUST_LOG=ghostframe=trace,debug
+                                // so it still sees every line.
+                                tracing::debug!(
                                     target: "ghostframe::cdf53",
                                     tile_x = tile_x,
                                     tile_y = tile_y,
@@ -4537,7 +4555,16 @@ impl IoBridge {
                         // became redundant when Task 25 paired emitter
                         // cancellation with every bump_generation site.)
                         for (pass_idx, payload) in &passes {
-                            tracing::info!(
+                            // DEBUG, not INFO: this fires once per pass per tile. A full-screen first
+                            // frame emits ~9200 of them in ~300 ms, which overruns journald's default
+                            // RateLimitBurst (10000 per 30 s) and makes it silently discard everything
+                            // the daemon logs for the rest of the interval -- measured in production as
+                            // "Suppressed 23232 messages", a 20-second hole that reads exactly like a
+                            // stalled capture loop and cost a debugging session before the suppression
+                            // notice was found. The per-frame aggregate stays at INFO on the "dispatch
+                            // returned" line (codec_cdf53=N), and e2e runs RUST_LOG=ghostframe=trace,debug
+                            // so it still sees every line.
+                            tracing::debug!(
                                 target: "ghostframe::cdf53",
                                 tile_x = tile_x,
                                 tile_y = tile_y,
