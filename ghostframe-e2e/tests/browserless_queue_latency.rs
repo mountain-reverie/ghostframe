@@ -265,11 +265,18 @@ async fn refinement_work_queues_behind_critical_work() {
 
 /// **A known fidelity gap, pinned so it cannot be forgotten.**
 ///
-/// Critical-tier queueing is *not* reproduced. In production the first frame
-/// leaves critical passes waiting 2,289,529 us on average against 22,748 us
-/// on the wire -- a 100x separation, 16.8 s at worst. Here the two are
-/// *identical*, not close: equal, at every backlog size and link capacity
-/// measured, including production's own 2040-tile grid at 2 Mbps.
+/// Critical-tier queueing is *not* reproduced **on a lossless link**. In
+/// production the first frame leaves critical passes waiting 2,289,529 us on
+/// average against 22,748 us on the wire -- a 100x separation, 16.8 s at
+/// worst. On a lossless link here the two are *identical*, not close: equal,
+/// at every backlog size and link capacity measured, including production's
+/// own 2040-tile grid at 2 Mbps.
+///
+/// Scope matters. `retransmission_alone_separates_queued_from_sent` shows
+/// that adding loss *does* separate the two clocks (ratio ~6.9), because a
+/// retransmit moves `last_sent_at` and leaves `queued_at` alone. That is a
+/// different cause from backlog, and it is why this test pins a lossless
+/// scene: it is isolating scheduler queueing specifically.
 ///
 /// Refinement queueing (above) *is* reproduced, so this is not a broken
 /// metric -- it is specifically the critical tier, which drains first under
@@ -299,6 +306,74 @@ async fn critical_tier_queueing_is_not_yet_reproduced() {
          datagram_send_buffer, this harness can finally reproduce production's \
          critical-tier queueing (2.3 s mean / 16.8 s max against 22.7 ms on \
          the wire) -- delete this test and assert on the ratio instead.",
+        r.queued_critical_latency_mean_us,
+        r.critical_latency_mean_us
+    );
+}
+
+// ---------------------------------------------------------------------------
+// What the queued-vs-wire gap actually measures.
+// ---------------------------------------------------------------------------
+
+use ghostframe_e2e::netsim::{DropPlan, DropRule};
+
+/// Loss alone separates `queued_at -> ACK` from `last_sent_at -> ACK`, with
+/// no scheduler backlog involved.
+///
+/// A retransmission updates `last_sent_at` and leaves `queued_at` at the
+/// original enqueue, so a pass that needed several attempts reports a large
+/// queued latency and a small wire latency. That is a different cause from
+/// "the work sat in the scheduler behind a backlog", and the two are
+/// indistinguishable in the aggregate counters.
+///
+/// Measured here: one tile's first 40 transmissions dropped, then a clean
+/// link. Critical tier comes back at ratio ~6.9 with a 3.1 s worst case --
+/// on a scene whose lossless twin reports ratio 1.00.
+///
+/// This matters for reading production, which had `rto_fired=6739` against
+/// 9208 original passes. Its 16.8 s `queued_critical_latency_max_us` cannot
+/// be attributed to scheduler queueing without separating the two causes
+/// first.
+///
+/// Incidentally the tile recovers: `nack_miss=0`, the emitter's cache still
+/// held every requested pass and served it. Bounded loss does not strand a
+/// tile here.
+#[tokio::test(start_paused = true)]
+async fn retransmission_alone_separates_queued_from_sent() {
+    let mut scene = burst_scene(8, 8, 25);
+    scene.drops = DropPlan::new(vec![DropRule {
+        tile_x: 2,
+        tile_y: 2,
+        occurrences: (0..40).collect(),
+    }]);
+    let r = run_browserless(scene).await.expect("scene ran");
+    report("retransmit_separation", &r);
+
+    // Premise: the drop must have fired enough to force retransmissions.
+    assert_eq!(r.drops_fired.len(), 1, "expected one rule; got {:?}", r.drops_fired);
+    assert!(
+        r.drops_fired[0] >= 7,
+        "drop rule fired only {} times -- too few to force a retransmit cycle",
+        r.drops_fired[0]
+    );
+    assert!(
+        r.retransmit_attempts_total > 0,
+        "no retransmissions occurred, so this scene cannot demonstrate \
+         retransmission-driven latency separation"
+    );
+
+    let observed = ratio(
+        r.queued_critical_latency_mean_us,
+        r.critical_latency_mean_us,
+    );
+    println!(
+        "retransmit separation: ratio={observed:.2} nack_hit={} nack_miss={} retransmits={}",
+        r.nack_hit, r.nack_miss, r.retransmit_attempts_total
+    );
+    assert!(
+        observed > 2.0,
+        "expected retransmission to separate the two clocks, but ratio={observed:.2} \
+         (queued_mean={} us, wire_mean={} us)",
         r.queued_critical_latency_mean_us,
         r.critical_latency_mean_us
     );
