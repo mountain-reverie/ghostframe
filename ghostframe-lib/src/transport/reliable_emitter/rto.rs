@@ -2,7 +2,7 @@
 //! pops entries whose deadline ≤ now, validates each against the live
 //! cache, and retransmits.
 
-use crate::transport::reliable_emitter::{EmitKey, BASE_RTO_MS, RTO_BACKOFF_FACTOR};
+use crate::transport::reliable_emitter::{EmitKey, RTO_BACKOFF_FACTOR};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::time::{Duration, Instant};
@@ -76,15 +76,61 @@ impl RtoTimerWheel {
 /// perceptible to the user, slow enough to not flood the link.
 pub const RTO_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
+/// Floor for the first-attempt ACK deadline (`base`, below).
+///
+/// Set above the 103 ms *max* observed on the live session that motivated
+/// this policy (mean 29 ms, max 103 ms over 6517 samples) — not just the
+/// mean, and not the p95 either, because a floor between the p95 and the
+/// max would still race the tail on every session whose distribution
+/// happens to look like that one. Without this floor a quiet or
+/// just-started tracker (`AckLatencyTracker::p95()` returns
+/// `Duration::ZERO` before its first sample) would derive a `base` of
+/// zero, doubled to zero, which is the exact failure mode this change
+/// exists to remove.
+pub const ACK_DEADLINE_FLOOR: Duration = Duration::from_millis(150);
+
+/// Ceiling for the first-attempt ACK deadline (`base`, below).
+///
+/// The RTO is a last resort — client NACKs handle real loss immediately,
+/// and the scheduler's own 2xRTT `InFlight` retry covers the one case a
+/// receiver can't see (a tile whose only datagram is lost, then static).
+/// So a slow RTO is safe. But an unbounded one is not: a single
+/// pathological `ack_p95` measurement (a session-start spike before the
+/// tracker has filled, or a genuinely broken path) must not push the
+/// deadline out far enough to functionally disable the RTO's own
+/// contribution to recovery. 2 s is far above any latency this system is
+/// designed to tolerate, so it only ever bites the pathological case.
+pub const ACK_DEADLINE_CEILING: Duration = Duration::from_secs(2);
+
 /// Compute the RTO for a given attempt number (0 = first transmission's
 /// RTO; 1, 2, ... = backoff for subsequent retries).
 ///
-/// Returns `min(base * 2^attempts, RTO_BACKOFF_MAX)` where
-/// `base ∈ [25ms, BASE_RTO_MS=50ms]` derived from smoothed RTT.
-/// Once the cap is reached, steady-state retries fire every 5 s.
-pub fn rto_for_attempt(smoothed_rtt: Duration, attempts: u8) -> Duration {
-    let base = (smoothed_rtt * 2).max(Duration::from_millis(25));
-    let base = base.min(Duration::from_millis(BASE_RTO_MS));
+/// `ack_p95` is the emitter's measured ACK-latency p95 (see
+/// [`crate::transport::ack_latency::AckLatencyTracker`]), fed in via
+/// `ReliableTileEmitter::set_ack_deadline`. The base deadline is
+/// `clamp(ack_p95 * 2, ACK_DEADLINE_FLOOR, ACK_DEADLINE_CEILING)`: doubling
+/// the measured p95 gives real headroom over the tail instead of racing
+/// it, and the floor/ceiling bound a bad or absent measurement (see their
+/// doc comments). Returns `min(base * 2^attempts, RTO_BACKOFF_MAX)` — once
+/// the cap is reached, steady-state retries fire every 5 s.
+///
+/// # History
+///
+/// Before this, `base` was derived from `smoothed_rtt` — which
+/// `set_smoothed_rtt` never actually updated, since nothing called it —
+/// and hard-capped at a 50 ms ceiling (`BASE_RTO_MS`), in practice reached
+/// from a 20 ms constructor default. Measured on a live session, 2m45s
+/// uptime, on a link that dropped nothing: 29 ms mean / 103 ms max ACK
+/// latency (6517 samples) against a 40 ms deadline fired `rto_fired=33685`
+/// times and retransmitted 1.7x the actual picture
+/// (`retransmit_attempts_total=44207` against 26578 fresh emissions).
+/// Confirmed independently in the browserless harness by sweeping the
+/// first-attempt deadline on a lossless scene: 40 ms -> 320
+/// retransmissions, 200 ms -> 128, 300 ms -> 0. See
+/// `a_lossless_link_with_a_real_rtt_does_not_retransmit` in
+/// `browserless_runner.rs` for the regression gate.
+pub fn rto_for_attempt(ack_p95: Duration, attempts: u8) -> Duration {
+    let base = (ack_p95 * 2).clamp(ACK_DEADLINE_FLOOR, ACK_DEADLINE_CEILING);
     let shift = attempts.min(8) as u32;
     let backoff = base
         .checked_mul(RTO_BACKOFF_FACTOR.pow(shift))
@@ -96,45 +142,91 @@ pub fn rto_for_attempt(smoothed_rtt: Duration, attempts: u8) -> Duration {
 mod tests {
     use super::*;
 
+    // These four tests encode the RTO policy itself and are the policy's
+    // documentation as much as its verification — see `rto_for_attempt`'s
+    // doc comment for the full history of why the policy looks like this.
+
     #[test]
-    fn rto_first_attempt_high_rtt_caps_at_50ms() {
-        let r = rto_for_attempt(Duration::from_millis(100), 0);
-        assert_eq!(r, Duration::from_millis(50));
+    fn rto_first_attempt_floors_at_150ms() {
+        // A near-zero (or absent -- Duration::ZERO, before the tracker's
+        // first sample) ack_p95 must not chase it: the floor sits above
+        // the 103 ms max measured in production, which is exactly the
+        // distribution a lower floor raced and lost.
+        let r = rto_for_attempt(Duration::from_millis(1), 0);
+        assert_eq!(r, ACK_DEADLINE_FLOOR);
+        let r_zero = rto_for_attempt(Duration::ZERO, 0);
+        assert_eq!(r_zero, ACK_DEADLINE_FLOOR);
     }
 
     #[test]
-    fn rto_first_attempt_low_rtt_floors_at_25ms() {
-        let r = rto_for_attempt(Duration::from_millis(1), 0);
-        assert_eq!(r, Duration::from_millis(25));
+    fn rto_first_attempt_ceiling_caps_pathological_measurement() {
+        // A single pathological ack_p95 (a start-of-session spike, or a
+        // genuinely broken path) must not disable the RTO's contribution
+        // to recovery by pushing the deadline out indefinitely.
+        let r = rto_for_attempt(Duration::from_secs(5), 0);
+        assert_eq!(r, ACK_DEADLINE_CEILING);
     }
 
     #[test]
     fn rto_backoff_doubles_per_attempt() {
+        // ack_p95 = 100ms -> base = clamp(200ms, 150ms, 2s) = 200ms,
+        // comfortably inside floor/ceiling so doubling is visible
+        // untouched by either clamp.
         let r0 = rto_for_attempt(Duration::from_millis(100), 0);
         let r1 = rto_for_attempt(Duration::from_millis(100), 1);
         let r2 = rto_for_attempt(Duration::from_millis(100), 2);
         let r3 = rto_for_attempt(Duration::from_millis(100), 3);
-        assert_eq!(r0, Duration::from_millis(50));
-        assert_eq!(r1, Duration::from_millis(100));
-        assert_eq!(r2, Duration::from_millis(200));
-        assert_eq!(r3, Duration::from_millis(400));
+        assert_eq!(r0, Duration::from_millis(200));
+        assert_eq!(r1, Duration::from_millis(400));
+        assert_eq!(r2, Duration::from_millis(800));
+        assert_eq!(r3, Duration::from_millis(1600));
     }
 
     #[test]
     fn rto_backoff_caps_at_5_seconds() {
-        // attempt 99 must never exceed 5 s.
-        let r = rto_for_attempt(Duration::from_millis(100), 99);
-        assert_eq!(r, Duration::from_secs(5));
-        // intermediate attempts still double until the cap.
+        // Same base = 200ms as the doubling test above.
         let r4 = rto_for_attempt(Duration::from_millis(100), 4);
-        assert_eq!(r4, Duration::from_millis(800));
+        assert_eq!(r4, Duration::from_millis(3200));
+        // attempt 5 would compute 6400ms, but the cap is 5000ms.
         let r5 = rto_for_attempt(Duration::from_millis(100), 5);
-        assert_eq!(r5, Duration::from_millis(1600));
-        let r6 = rto_for_attempt(Duration::from_millis(100), 6);
-        assert_eq!(r6, Duration::from_millis(3200));
-        // attempt 7 would compute 6400ms, but cap is 5000ms.
-        let r7 = rto_for_attempt(Duration::from_millis(100), 7);
-        assert_eq!(r7, Duration::from_secs(5));
+        assert_eq!(r5, Duration::from_secs(5));
+        // attempt 99 must never exceed 5 s regardless of shift saturation.
+        let r99 = rto_for_attempt(Duration::from_millis(100), 99);
+        assert_eq!(r99, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn ack_deadline_tracks_measured_p95() {
+        // The whole point of this policy: the deadline moves with what the
+        // link actually does, instead of sitting at a fixed constant. Same
+        // fixture as `ack_latency::tests::p95_of_100_samples_is_the_95th_smallest`.
+        use crate::transport::ack_latency::AckLatencyTracker;
+        let mut t = AckLatencyTracker::new();
+        for _ in 0..94 {
+            t.record(50_000); // 50ms
+        }
+        for _ in 0..6 {
+            t.record(80_000); // 80ms
+        }
+        assert_eq!(t.p95(), Duration::from_millis(80));
+        let deadline = rto_for_attempt(t.p95(), 0);
+        assert_eq!(deadline, Duration::from_millis(160));
+    }
+
+    #[test]
+    fn ack_deadline_floors_when_measurement_is_tiny() {
+        use crate::transport::ack_latency::AckLatencyTracker;
+        let mut t = AckLatencyTracker::new();
+        for _ in 0..10 {
+            t.record(1_000); // 1ms
+        }
+        let deadline = rto_for_attempt(t.p95(), 0);
+        assert_eq!(deadline, ACK_DEADLINE_FLOOR);
+    }
+
+    #[test]
+    fn ack_deadline_floor_is_below_ceiling() {
+        assert!(ACK_DEADLINE_FLOOR < ACK_DEADLINE_CEILING);
     }
 
     #[test]

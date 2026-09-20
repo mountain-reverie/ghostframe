@@ -42,7 +42,6 @@ pub const FEC_GROUP_SIZE_K: usize = 10;
 pub const FEC_PARITY_PER_GROUP_R: usize = 1;
 pub const PARITY_INTERLEAVE_OFFSET: u32 = (2 * FEC_GROUP_SIZE_K) as u32;
 pub const END_OF_STREAM_PARITY_FLUSH_MS: u64 = 5;
-pub const BASE_RTO_MS: u64 = 50;
 pub const RTO_BACKOFF_FACTOR: u32 = 2;
 // Sized for the first-paint burst: at 1920×1080 with 32×32 tiles the
 // worst case is ~2040 dirty tiles × 14 cdf53 passes ≈ 28 K tile-passes
@@ -92,7 +91,6 @@ mod tests {
             assert!(FEC_GROUP_SIZE_K >= 2);
             assert!(FEC_PARITY_PER_GROUP_R >= 1);
             assert!(PARITY_INTERLEAVE_OFFSET == 20);
-            assert!(BASE_RTO_MS >= 25 && BASE_RTO_MS <= 200);
             assert!(CACHE_CAPACITY.is_power_of_two() || CACHE_CAPACITY >= 1024);
         }
     }
