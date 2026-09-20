@@ -36,6 +36,27 @@
 
 use std::time::Duration;
 
+/// Samples required before the window's p95 is treated as a measurement.
+///
+/// Below this, `p95` reports `Duration::ZERO` -- "I do not know yet" -- and
+/// the RTO policy substitutes a deliberately pessimistic cold-start deadline
+/// rather than its floor.
+///
+/// The distinction matters because the two failure directions are not
+/// symmetric. Guessing *too slow* on an unmeasured path delays a last-resort
+/// repair that NACKs and the scheduler's own retry already cover. Guessing
+/// *too fast* retransmits everything in flight, and those retransmissions
+/// compete with the first paint that is producing the very samples the
+/// tracker needs -- the guess makes itself true.
+///
+/// Measured on the browserless storm scene before this distinction existed:
+/// the tracker's first p95 read 93 ms against a true p50 of 280 ms, giving a
+/// 186 ms deadline, and all 128 remaining retransmissions fired between
+/// 200 ms and 300 ms -- i.e. in the window between the optimistic early
+/// deadline and the real latency. The tracker then climbed 93 -> 134 -> 170
+/// -> 215 -> 251 -> 256 ms and stopped firing, but the burst had happened.
+pub(crate) const MIN_SAMPLES: usize = 32;
+
 /// Number of most-recent samples retained. See the module doc for why 256.
 ///
 /// `pub(crate)`, not `pub`: this is an implementation detail of the ring
@@ -92,16 +113,18 @@ impl AckLatencyTracker {
 
     /// p95 latency over the current window, via the nearest-rank method
     /// (the 95th-smallest-of-100 convention): `rank = ceil(0.95 * n)`,
-    /// 1-indexed, clamped into range. `Duration::ZERO` when no samples have
-    /// been recorded yet — callers (namely `rto_for_attempt`) treat that as
-    /// "no measurement", which its floor clamps to a safe default rather
-    /// than racing a real latency.
+    /// 1-indexed, clamped into range.
+    ///
+    /// `Duration::ZERO` until [`MIN_SAMPLES`] have been recorded, meaning
+    /// "no trustworthy measurement yet" rather than "zero latency".
+    /// `rto_for_attempt` answers that with a pessimistic cold-start deadline
+    /// — see [`MIN_SAMPLES`] for why erring slow is the safe direction.
     ///
     /// Sorts a stack-allocated copy of the window (fixed-size array, not a
     /// `Vec`) — see the module doc for why that's an acceptable query-time
     /// cost.
     pub fn p95(&self) -> Duration {
-        if self.len == 0 {
+        if self.len < MIN_SAMPLES {
             return Duration::ZERO;
         }
         let mut buf = [0u64; WINDOW];
@@ -130,11 +153,34 @@ mod tests {
     }
 
     #[test]
-    fn single_sample_p95_is_that_sample() {
+    fn a_single_sample_is_not_yet_a_measurement() {
         let mut t = AckLatencyTracker::new();
         t.record(12_345);
-        assert_eq!(t.p95(), Duration::from_micros(12_345));
-        assert_eq!(t.len(), 1);
+        assert_eq!(
+            t.p95(),
+            Duration::ZERO,
+            "one sample is not a distribution; reporting it would let a single \
+             fast acknowledgement set the deadline for everything behind it"
+        );
+        assert_eq!(t.len(), 1, "but it is still retained");
+    }
+
+    /// The threshold is a real boundary, not decoration: one sample short
+    /// reports nothing, and the next sample turns the window into a
+    /// measurement.
+    #[test]
+    fn p95_becomes_a_measurement_exactly_at_min_samples() {
+        let mut t = AckLatencyTracker::new();
+        for _ in 0..MIN_SAMPLES - 1 {
+            t.record(40_000);
+        }
+        assert_eq!(
+            t.p95(),
+            Duration::ZERO,
+            "one sample short of the threshold is still no measurement"
+        );
+        t.record(40_000);
+        assert_eq!(t.p95(), Duration::from_micros(40_000));
     }
 
     #[test]
@@ -174,12 +220,25 @@ mod tests {
     #[test]
     fn partial_window_uses_only_recorded_samples() {
         let mut t = AckLatencyTracker::new();
-        t.record(10_000);
+        // Fill to the threshold with a low value, then add three higher ones,
+        // so the window is still partial (< WINDOW) but is a measurement.
+        for _ in 0..MIN_SAMPLES {
+            t.record(10_000);
+        }
         t.record(20_000);
         t.record(30_000);
-        // n=3: rank = ceil(0.95*3) = 3 -> idx 2 -> the max of the 3.
-        assert_eq!(t.p95(), Duration::from_micros(30_000));
-        assert_eq!(t.len(), 3);
+        t.record(40_000);
+        let n = MIN_SAMPLES + 3;
+        assert_eq!(t.len(), n, "a partial window must not be padded to WINDOW");
+        // rank = ceil(0.95 * n) over [10ms x MIN_SAMPLES, 20ms, 30ms, 40ms].
+        let expected = {
+            let mut v: Vec<u64> = vec![10_000; MIN_SAMPLES];
+            v.extend([20_000, 30_000, 40_000]);
+            v.sort_unstable();
+            let rank = (95 * n as u64).div_ceil(100) as usize;
+            v[rank.saturating_sub(1).min(n - 1)]
+        };
+        assert_eq!(t.p95(), Duration::from_micros(expected));
     }
 
     #[test]

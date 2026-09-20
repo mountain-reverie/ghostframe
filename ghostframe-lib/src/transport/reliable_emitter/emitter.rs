@@ -692,7 +692,7 @@ mod tests {
         assert_eq!(sender.sent.len(), 1);
         let entry_first_sent = e.cache.get(&key).unwrap().first_sent_at;
         // Advance past RTO; tick should retransmit.
-        let t1 = t0 + Duration::from_millis(160);
+        let t1 = t0 + Duration::from_millis(1_100);
         e.tick(t1, usize::MAX);
         e.drain(&mut sender, t1);
         assert_eq!(sender.sent.len(), 2);
@@ -724,7 +724,7 @@ mod tests {
         let first = wire_seq_of(&sender.sent[0]);
 
         // RTO retransmit.
-        let t1 = t0 + Duration::from_millis(160);
+        let t1 = t0 + Duration::from_millis(1_100);
         e.tick(t1, usize::MAX);
         e.drain(&mut sender, t1);
         assert_eq!(sender.sent.len(), 2);
@@ -772,7 +772,7 @@ mod tests {
             "the first transmission is a genuine member of cluster 7"
         );
 
-        let t1 = t0 + Duration::from_millis(160);
+        let t1 = t0 + Duration::from_millis(1_100);
         e.tick(t1, usize::MAX);
         e.drain(&mut sender, t1);
 
@@ -819,7 +819,7 @@ mod tests {
         e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
         e.drain(&mut sender, t0);
         e.on_ack(&[key]);
-        let t1 = t0 + Duration::from_millis(160);
+        let t1 = t0 + Duration::from_millis(1_100);
         e.tick(t1, usize::MAX);
         e.drain(&mut sender, t1);
         assert_eq!(sender.sent.len(), 1, "no retransmit after ACK");
@@ -867,7 +867,7 @@ mod tests {
         assert!(e.cache.get(&k2).is_none());
         assert!(e.cache.get(&k3).is_some());
         // Tick past RTO — no retransmit for cancelled, retransmit for k3.
-        let t1 = t0 + Duration::from_millis(160);
+        let t1 = t0 + Duration::from_millis(1_100);
         e.tick(t1, usize::MAX);
         e.drain(&mut sender, t1);
         assert_eq!(sender.sent.len(), 4, "3 initial + 1 retransmit for k3 only");
