@@ -50,7 +50,7 @@ fn high_freq_low_magnitude_many_colors_picks_cdf53() {
         classify_tile(&m, &CodecState::Skip),
         CodecState::Cdf53 {
             passes_sent: 0,
-            max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
+            present_passes: 0x3FFF,
         },
     );
 }
@@ -62,7 +62,7 @@ fn high_freq_low_magnitude_sentinel_unique_colors_picks_cdf53() {
         classify_tile(&m, &CodecState::Skip),
         CodecState::Cdf53 {
             passes_sent: 0,
-            max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
+            present_passes: 0x3FFF,
         },
     );
 }
@@ -81,7 +81,7 @@ fn medium_freq_no_prior_h264_picks_cdf53() {
         classify_tile(&m, &CodecState::Skip),
         CodecState::Cdf53 {
             passes_sent: 0,
-            max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
+            present_passes: 0x3FFF,
         },
     );
 }
@@ -129,7 +129,7 @@ fn freq_at_15_lands_in_rule_4_range() {
         classify_tile(&m, &CodecState::Skip),
         CodecState::Cdf53 {
             passes_sent: 0,
-            max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
+            present_passes: 0x3FFF,
         },
     );
 }
@@ -142,7 +142,7 @@ fn freq_at_5_lands_in_rule_4_range() {
         classify_tile(&m, &CodecState::Skip),
         CodecState::Cdf53 {
             passes_sent: 0,
-            max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
+            present_passes: 0x3FFF,
         },
     );
 }
@@ -190,14 +190,15 @@ fn h264_tile_at_low_freq_falls_through_to_rules_6_to_8() {
 
 #[test]
 fn cdf53_fallback_uses_cdf53_pass_count() {
-    // The fallback must use CDF53_PASS_COUNT (14) as max_passes, not a
-    // hardcoded 9, so that the full pass budget is visible to the scheduler.
+    // The fallback must use the full 14-pass bitmap (0x3FFF) as
+    // present_passes, not a hardcoded 9, so that the full pass budget is
+    // visible to the scheduler until the real encode overwrites it.
     let m = metrics(2.0, 0.05, 0, super::super::UNIQUE_COLORS_UNKNOWN);
     assert_eq!(
         classify_tile(&m, &CodecState::Skip),
         CodecState::Cdf53 {
             passes_sent: 0,
-            max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
+            present_passes: 0x3FFF,
         },
     );
 }
@@ -209,7 +210,7 @@ fn medium_freq_with_single_color_prefers_solid_over_fallback() {
     let m = metrics(6.0, 0.05, 0, 1);
     let prev = CodecState::Cdf53 {
         passes_sent: 0,
-        max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
+        present_passes: 0x3FFF,
     };
     assert_eq!(classify_tile(&m, &prev), CodecState::Solid);
 }
@@ -220,7 +221,7 @@ fn medium_freq_with_few_colors_prefers_palrle_over_fallback() {
     let m = metrics(8.0, 0.10, 0, 8);
     let prev = CodecState::Cdf53 {
         passes_sent: 0,
-        max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
+        present_passes: 0x3FFF,
     };
     assert_eq!(
         classify_tile(&m, &prev),
@@ -234,13 +235,13 @@ fn medium_freq_with_many_colors_falls_back_to_cdf53() {
     let m = metrics(6.0, 0.05, 0, 100);
     let prev = CodecState::Cdf53 {
         passes_sent: 0,
-        max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
+        present_passes: 0x3FFF,
     };
     assert_eq!(
         classify_tile(&m, &prev),
         CodecState::Cdf53 {
             passes_sent: 0,
-            max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
+            present_passes: 0x3FFF,
         },
     );
 }
@@ -251,13 +252,13 @@ fn medium_freq_unknown_colors_falls_back_to_cdf53() {
     let m = metrics(6.0, 0.05, 0, super::super::UNIQUE_COLORS_UNKNOWN);
     let prev = CodecState::Cdf53 {
         passes_sent: 0,
-        max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
+        present_passes: 0x3FFF,
     };
     assert_eq!(
         classify_tile(&m, &prev),
         CodecState::Cdf53 {
             passes_sent: 0,
-            max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
+            present_passes: 0x3FFF,
         },
     );
 }

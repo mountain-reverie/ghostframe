@@ -501,12 +501,21 @@ fn col_inverse(buf: &mut [i32], n: usize) {
     row_inverse(buf, n);
 }
 
-/// Encode a tile's coefficients into 14 progressive bit-plane passes.
+/// Encode a tile's coefficients into 14 progressive bit-plane passes, all
+/// 14 always sent regardless of content (see `encode_passes_sparse` for the
+/// bandwidth-saving variant that skips empty ones).
+///
 /// Each pass payload is the concatenation of 3 channels' RLE-encoded
 /// bit-planes in BGR order:
 ///   [u16 BE len_B] [len_B bytes RLE bit-plane B]
 ///   [u16 BE len_G] [len_G bytes RLE bit-plane G]
 ///   [u16 BE len_R] [len_R bytes RLE bit-plane R]
+/// Pass 0's payload additionally carries a 2-byte big-endian
+/// `present_passes` prefix ahead of the 3-channel block, fixed at `0x3FFF`
+/// (all 14 passes) since this function never omits one -- every pass-0
+/// payload on the wire carries this prefix, dense or sparse, so decoders
+/// (`decode_passes`, `cdf53_prevalidate::prevalidate_cdf53`) can rely on it
+/// unconditionally.
 /// Pass 0 = sign-bit-plane (bit set iff coefficient is negative).
 /// Pass 1..13 = magnitude bit-planes from bit 12 down to bit 0.
 pub fn encode_passes(coefficients: &[i16]) -> Vec<Vec<u8>> {
@@ -514,6 +523,11 @@ pub fn encode_passes(coefficients: &[i16]) -> Vec<Vec<u8>> {
     let mut passes = Vec::with_capacity(CDF53_PASS_COUNT);
     for pass_idx in 0..CDF53_PASS_COUNT {
         let mut payload = Vec::new();
+        if pass_idx == 0 {
+            let present_passes: u16 = (1u16 << CDF53_PASS_COUNT) - 1;
+            payload.push((present_passes >> 8) as u8);
+            payload.push(present_passes as u8);
+        }
         for ch in 0..CDF53_CHANNELS {
             let channel_offset = ch * CDF53_COEFFS_PER_CHANNEL;
             let channel = &coefficients[channel_offset..channel_offset + CDF53_COEFFS_PER_CHANNEL];
@@ -527,6 +541,74 @@ pub fn encode_passes(coefficients: &[i16]) -> Vec<Vec<u8>> {
         passes.push(payload);
     }
     passes
+}
+
+/// Encode only the passes that carry data, plus a bitmap naming them.
+///
+/// Real content rarely trips the high magnitude bit-planes: measured against
+/// the real encoder, flat/gradient/checker fixtures leave 6-13 of the 14
+/// passes empty. Sending an empty pass costs a full datagram (9 bytes of
+/// payload plus wire framing) for zero information, and at 2000+ tiles per
+/// frame that's a lot of otherwise-avoidable datagrams.
+///
+/// A pass is empty when its bit-plane -- checked on the raw, pre-RLE bits,
+/// not by comparing the RLE'd length against a magic constant -- is zero for
+/// **every** coefficient in **all three** channels. Emptiness is a property
+/// of the content, not of the encoding.
+///
+/// Returns `(present_passes, passes)`. `present_passes` bit *i* set means
+/// pass *i* is present in `passes` (which is sorted ascending by pass_idx).
+/// Pass 0 is always present, even when its own bit-plane is empty, because
+/// its payload is the one that carries `present_passes` to the decoder --
+/// a tile that never mentions which of passes 1..13 to expect could not
+/// otherwise distinguish "not sent because empty" from "lost in transit".
+///
+/// Pass 0's payload is a 2-byte big-endian `present_passes` prefix followed
+/// by the ordinary 3-channel length-prefixed block (see `encode_passes`).
+/// Passes 1..13, when present, are encoded exactly as `encode_passes` would.
+pub fn encode_passes_sparse(coefficients: &[i16]) -> (u16, Vec<(u8, Vec<u8>)>) {
+    assert_eq!(coefficients.len(), CDF53_TOTAL_COEFFS);
+
+    // Extract every bit-plane up front so presence can be decided (over all
+    // 3 channels) before anything is RLE-encoded or emitted.
+    let mut bit_planes: Vec<[Vec<u8>; CDF53_CHANNELS]> = Vec::with_capacity(CDF53_PASS_COUNT);
+    let mut present_passes: u16 = 1; // Bit 0 (pass 0) is always present.
+    for pass_idx in 0..CDF53_PASS_COUNT {
+        let mut planes = [Vec::new(), Vec::new(), Vec::new()];
+        let mut any_set = false;
+        for ch in 0..CDF53_CHANNELS {
+            let channel_offset = ch * CDF53_COEFFS_PER_CHANNEL;
+            let channel = &coefficients[channel_offset..channel_offset + CDF53_COEFFS_PER_CHANNEL];
+            let plane = extract_bit_plane(channel, pass_idx);
+            any_set |= plane.iter().any(|&b| b != 0);
+            planes[ch] = plane;
+        }
+        if any_set {
+            present_passes |= 1u16 << pass_idx;
+        }
+        bit_planes.push(planes);
+    }
+
+    let mut passes = Vec::with_capacity(present_passes.count_ones() as usize);
+    for (pass_idx, planes) in bit_planes.into_iter().enumerate() {
+        if present_passes & (1u16 << pass_idx) == 0 {
+            continue;
+        }
+        let mut payload = Vec::new();
+        if pass_idx == 0 {
+            payload.push((present_passes >> 8) as u8);
+            payload.push(present_passes as u8);
+        }
+        for plane in &planes {
+            let rle = rle_encode(plane);
+            let len = rle.len() as u16;
+            payload.push((len >> 8) as u8);
+            payload.push(len as u8);
+            payload.extend_from_slice(&rle);
+        }
+        passes.push((pass_idx as u8, payload));
+    }
+    (present_passes, passes)
 }
 
 /// Extract the bit-plane for the given pass index from a channel's coefficients.
@@ -634,9 +716,20 @@ pub fn decode_passes(passes: &[&[u8]]) -> Vec<i16> {
     // channels), bailing out (returning zeroed coefficients, matching the
     // legacy behavior) on malformed input.
     let mut decoded_planes: Vec<Vec<u8>> = Vec::with_capacity(passes.len());
-    for payload in passes {
+    for (pass_idx, payload) in passes.iter().enumerate() {
         let mut plane = vec![0u8; CDF53_CHANNELS * (CDF53_COEFFS_PER_CHANNEL / 8)];
-        let mut offset = 0;
+        // Pass 0's payload carries a 2-byte big-endian `present_passes`
+        // bitmap ahead of the 3-channel block (see `encode_passes` /
+        // `encode_passes_sparse`); skip it here since this function only
+        // reassembles coefficients and has no use for the bitmap itself.
+        let mut offset = if pass_idx == 0 {
+            if payload.len() < 2 {
+                return zeroed();
+            }
+            2
+        } else {
+            0
+        };
         for ch in 0..CDF53_CHANNELS {
             if offset + 2 > payload.len() {
                 return zeroed();
@@ -901,6 +994,117 @@ mod tests_passes {
             recovered, coefficients,
             "encode_passes → decode_passes should recover coefficients exactly"
         );
+    }
+
+    #[test]
+    fn encode_passes_sparse_matches_encode_passes_on_dense_content() {
+        // Whichever passes ARE present must byte-match the dense encoder's
+        // corresponding payload (module the 2-byte prefix pass 0 carries).
+        let original = super::tests::make_test_tile(0x1234_5678);
+        let coefficients = forward(&original);
+        let (present, sparse) = encode_passes_sparse(&coefficients);
+        let dense = encode_passes(&coefficients);
+        for (pass_idx, dense_payload) in dense.iter().enumerate() {
+            if present & (1u16 << pass_idx) == 0 {
+                continue;
+            }
+            let sparse_payload = &sparse
+                .iter()
+                .find(|(p, _)| *p as usize == pass_idx)
+                .unwrap()
+                .1;
+            if pass_idx == 0 {
+                // Both carry a 2-byte present_passes prefix, but the two
+                // encoders can disagree on ITS value (dense is always
+                // 0x3FFF; sparse reflects the real bitmap) -- only the
+                // 3-channel block after it must match byte-for-byte.
+                assert_eq!(&sparse_payload[2..], &dense_payload[2..]);
+            } else {
+                assert_eq!(sparse_payload, dense_payload);
+            }
+        }
+    }
+
+    #[test]
+    fn encode_passes_sparse_skips_bitplanes_that_are_all_zero() {
+        // A flat tile: every coefficient beyond DC is 0 after the wavelet
+        // transform, so only the sign plane (pass 0, which is also all-zero
+        // here but always sent) and whichever single magnitude pass covers
+        // the DC value's bits should be present.
+        let flat = vec![0x40u8; 32 * 32 * 4]; // uniform BGRA — no alpha stored.
+        let coefficients = forward(&flat);
+        let (present, sparse) = encode_passes_sparse(&coefficients);
+        assert_eq!(
+            present & 1,
+            1,
+            "pass 0 must always be present, even when empty"
+        );
+        assert!(
+            present.count_ones() < CDF53_PASS_COUNT as u32,
+            "a flat tile must not send every one of the 14 passes, got present={present:#06x}"
+        );
+        // Every payload actually present in `sparse` must correspond to a
+        // set bit, and `sparse` must be sorted ascending with no duplicates.
+        let mut last: i32 = -1;
+        for (pass_idx, _) in &sparse {
+            assert!(*pass_idx as i32 > last, "passes must be strictly ascending");
+            last = *pass_idx as i32;
+            assert_ne!(present & (1u16 << pass_idx), 0);
+        }
+        assert_eq!(sparse.len(), present.count_ones() as usize);
+    }
+
+    #[test]
+    fn encode_passes_sparse_pass0_prefix_carries_the_bitmap() {
+        let original = super::tests::make_test_tile(0xABCD_EF01);
+        let coefficients = forward(&original);
+        let (present, sparse) = encode_passes_sparse(&coefficients);
+        let pass0 = &sparse.iter().find(|(p, _)| *p == 0).unwrap().1;
+        assert!(pass0.len() >= 2);
+        let parsed = ((pass0[0] as u16) << 8) | pass0[1] as u16;
+        assert_eq!(parsed, present);
+    }
+
+    #[test]
+    fn encode_passes_sparse_reconstructs_exactly_when_gaps_are_treated_as_zero() {
+        // Reconstruction must be identical to the dense path once the
+        // client fills in "known absent" passes with zero bit-planes rather
+        // than treating them as a blocking gap (this is what
+        // `Cdf53TileState::integrate` does on the client side).
+        for seed in [0x1234_5678u32, 0x0BAD_F00D, 0xCAFE_BABE] {
+            let original = super::tests::make_test_tile(seed);
+            let coefficients = forward(&original);
+            let (present, sparse) = encode_passes_sparse(&coefficients);
+
+            let mut full: Vec<Vec<u8>> = vec![vec![0u8; 384]; CDF53_PASS_COUNT];
+            for (pass_idx, payload) in &sparse {
+                let raw = if *pass_idx == 0 {
+                    &payload[2..]
+                } else {
+                    &payload[..]
+                };
+                // Re-decode this pass's payload into a 384-byte plane the
+                // same way the client's prevalidator would.
+                let mut plane = vec![0u8; 384];
+                let mut offset = 0;
+                for ch in 0..CDF53_CHANNELS {
+                    let len = ((raw[offset] as usize) << 8) | raw[offset + 1] as usize;
+                    offset += 2;
+                    let decoded = rle_decode(&raw[offset..offset + len]);
+                    offset += len;
+                    plane[ch * 128..ch * 128 + 128].copy_from_slice(&decoded);
+                }
+                full[*pass_idx as usize] = plane;
+            }
+            let _ = present;
+            let plane_refs: Vec<&[u8]> = full.iter().map(|p| p.as_slice()).collect();
+            let recovered = decode_planes(&plane_refs);
+            assert_eq!(
+                recovered, coefficients,
+                "seed={seed:08x}: sparse encode + zero-filled gaps must exactly \
+                 recover what the dense path recovers"
+            );
+        }
     }
 
     #[test]

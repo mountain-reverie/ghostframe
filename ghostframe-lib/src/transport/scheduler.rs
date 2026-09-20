@@ -447,13 +447,25 @@ impl Scheduler {
         self.delivery_window_acked
     }
 
-    /// Returns true iff all `max_passes` passes for the given (tile, gen)
-    /// have transitioned to `WorkState::Acked`. O(1) lookup. Used by
-    /// `IoBridge` to signal `CodecState::PixelPerfect` once a tile is
+    /// Returns true iff every pass named in `present_passes` for the given
+    /// (tile, gen) has transitioned to `WorkState::Acked`. O(1) lookup. Used
+    /// by `IoBridge` to signal `CodecState::PixelPerfect` once a tile is
     /// fully refined.
-    pub fn tile_fully_acked(&self, tile_x: u8, tile_y: u8, generation: u8, max_passes: u8) -> bool {
+    ///
+    /// `present_passes` is the tile's own bitmap (bit *i* set ⇒ pass *i* was
+    /// actually sent), not a pass *count*: since sparse encoding skips empty
+    /// bit-planes, the sent set is not necessarily a contiguous `0..N`
+    /// prefix, so a count cannot express it. Pass a literal `0x3FFF` for "all
+    /// 14 passes" when the caller isn't tracking a real sparse bitmap.
+    pub fn tile_fully_acked(
+        &self,
+        tile_x: u8,
+        tile_y: u8,
+        generation: u8,
+        present_passes: u16,
+    ) -> bool {
         self.slots
-            .fully_acked(tile_x, tile_y, generation, max_passes)
+            .fully_acked(tile_x, tile_y, generation, present_passes)
     }
 
     /// Returns the number of **distinct** pass_idxs ACKed for this
@@ -464,36 +476,37 @@ impl Scheduler {
     }
 
     /// Bitmap of UNACKED passes for `(tile, gen)`. Bit i set means pass
-    /// `i` has not been acked. Bits 14..=15 are always 0 (CDF53 has 14
-    /// passes). Returns `0xFFFF & ((1 << max_passes) - 1)` when no ack
-    /// entry exists (every pass is unacked); returns 0 when every pass
-    /// in `0..max_passes` has been acked. Used by `IoBridge`'s Phase 1.5-B
+    /// `i` is present but has not been acked. Returns `present_passes` when
+    /// no ack entry exists (every present pass is unacked); returns 0 when
+    /// every present pass has been acked. Used by `IoBridge`'s Phase 1.5-B
     /// stranded-tile escalation to re-enqueue only the missing passes
     /// at the existing generation (no `bump_generation`, preserving
     /// the client's already-delivered passes for this tile).
+    ///
+    /// See `tile_fully_acked` for why this takes a bitmap rather than a count.
     pub fn cdf53_unacked_pass_mask(
         &self,
         tile_x: u8,
         tile_y: u8,
         generation: u8,
-        max_passes: u8,
+        present_passes: u16,
     ) -> u16 {
         self.slots
-            .unacked_mask(tile_x, tile_y, generation, max_passes)
+            .unacked_mask(tile_x, tile_y, generation, present_passes)
     }
 
-    /// Filter the caller-provided `(tile, gen, max_passes)` tuples down to
-    /// those whose acked count is strictly less than `max_passes`. Used by
-    /// `IoBridge`'s stuck-tile resweep — the scheduler doesn't know which
-    /// tiles are still in Cdf53 codec state (that's in `metrics_tracker`),
-    /// so the caller passes the candidate set in. Return shape is the bare
-    /// `(tile_x, tile_y)` pair since callers re-derive `gen` / `max_passes`
-    /// from the tile's metrics row.
-    pub fn cdf53_unacked_tiles_for_gen(&self, candidates: &[((u8, u8), u8, u8)]) -> Vec<(u8, u8)> {
+    /// Filter the caller-provided `(tile, gen, present_passes)` tuples down
+    /// to those not yet fully acked. Used by `IoBridge`'s stuck-tile
+    /// resweep — the scheduler doesn't know which tiles are still in Cdf53
+    /// codec state (that's in `metrics_tracker`), so the caller passes the
+    /// candidate set in. Return shape is the bare `(tile_x, tile_y)` pair
+    /// since callers re-derive `gen` / `present_passes` from the tile's
+    /// metrics row.
+    pub fn cdf53_unacked_tiles_for_gen(&self, candidates: &[((u8, u8), u8, u16)]) -> Vec<(u8, u8)> {
         candidates
             .iter()
-            .filter_map(|&((tx, ty), gen, max_passes)| {
-                (self.slots.acked_count(tx, ty, gen) < max_passes).then_some((tx, ty))
+            .filter_map(|&((tx, ty), gen, present_passes)| {
+                (!self.slots.fully_acked(tx, ty, gen, present_passes)).then_some((tx, ty))
             })
             .collect()
     }
@@ -1413,16 +1426,16 @@ mod tests {
     fn tile_fully_acked_returns_true_after_all_passes_acked() {
         let mut s = Scheduler::new(4, 4);
         s.bump_generation(2, 3); // make gen 1 the live generation
-        assert!(!s.tile_fully_acked(2, 3, 1, 14));
+        assert!(!s.tile_fully_acked(2, 3, 1, 0x3FFF));
         for pass in 0..13u8 {
             s.record_cdf53_ack(2, 3, 1, pass);
             assert!(
-                !s.tile_fully_acked(2, 3, 1, 14),
+                !s.tile_fully_acked(2, 3, 1, 0x3FFF),
                 "should not be fully_acked before all 14 acks"
             );
         }
         s.record_cdf53_ack(2, 3, 1, 13);
-        assert!(s.tile_fully_acked(2, 3, 1, 14));
+        assert!(s.tile_fully_acked(2, 3, 1, 0x3FFF));
     }
 
     #[test]
@@ -1432,9 +1445,9 @@ mod tests {
         for pass in 0..14u8 {
             s.record_cdf53_ack(0, 0, 1, pass);
         }
-        assert!(s.tile_fully_acked(0, 0, 1, 14));
-        assert!(!s.tile_fully_acked(1, 0, 1, 14));
-        assert!(!s.tile_fully_acked(0, 0, 2, 14)); // different gen
+        assert!(s.tile_fully_acked(0, 0, 1, 0x3FFF));
+        assert!(!s.tile_fully_acked(1, 0, 1, 0x3FFF));
+        assert!(!s.tile_fully_acked(0, 0, 2, 0x3FFF)); // different gen
     }
 
     #[test]
@@ -1444,13 +1457,16 @@ mod tests {
         for pass in 0..14u8 {
             s.record_cdf53_ack(0, 0, 1, pass);
         }
-        assert!(s.tile_fully_acked(0, 0, 1, 14));
+        assert!(s.tile_fully_acked(0, 0, 1, 0x3FFF));
         let _ = s.bump_generation(0, 0);
         assert!(
-            !s.tile_fully_acked(0, 0, 1, 14),
+            !s.tile_fully_acked(0, 0, 1, 0x3FFF),
             "old gen counter should be dropped"
         );
-        assert!(!s.tile_fully_acked(0, 0, 2, 14), "new gen has no acks yet");
+        assert!(
+            !s.tile_fully_acked(0, 0, 2, 0x3FFF),
+            "new gen has no acks yet"
+        );
     }
 
     #[test]
@@ -1462,24 +1478,27 @@ mod tests {
             s.record_cdf53_ack(0, 0, 1, pass);
             s.record_cdf53_ack(1, 1, 1, pass);
         }
-        assert!(s.tile_fully_acked(0, 0, 1, 14));
-        assert!(s.tile_fully_acked(1, 1, 1, 14));
+        assert!(s.tile_fully_acked(0, 0, 1, 0x3FFF));
+        assert!(s.tile_fully_acked(1, 1, 1, 0x3FFF));
 
         // Bump only (0, 0). Tile (1, 1)'s counter must survive.
         let _ = s.bump_generation(0, 0);
-        assert!(!s.tile_fully_acked(0, 0, 1, 14), "target tile cleared");
-        assert!(s.tile_fully_acked(1, 1, 1, 14), "non-target tile preserved");
+        assert!(!s.tile_fully_acked(0, 0, 1, 0x3FFF), "target tile cleared");
+        assert!(
+            s.tile_fully_acked(1, 1, 1, 0x3FFF),
+            "non-target tile preserved"
+        );
     }
 
     #[test]
     fn record_cdf53_ack_increments_per_tile_gen_counter() {
         let mut s = Scheduler::new(4, 4);
         s.bump_generation(2, 3); // make gen 1 the live generation
-        assert!(!s.tile_fully_acked(2, 3, 1, 14));
+        assert!(!s.tile_fully_acked(2, 3, 1, 0x3FFF));
         for p in 0..14u8 {
             s.record_cdf53_ack(2, 3, 1, p);
         }
-        assert!(s.tile_fully_acked(2, 3, 1, 14));
+        assert!(s.tile_fully_acked(2, 3, 1, 0x3FFF));
     }
 
     #[test]
@@ -1489,9 +1508,9 @@ mod tests {
         for p in 0..14u8 {
             s.record_cdf53_ack(0, 0, 1, p);
         }
-        assert!(s.tile_fully_acked(0, 0, 1, 14));
-        assert!(!s.tile_fully_acked(1, 0, 1, 14), "different tile");
-        assert!(!s.tile_fully_acked(0, 0, 2, 14), "different gen");
+        assert!(s.tile_fully_acked(0, 0, 1, 0x3FFF));
+        assert!(!s.tile_fully_acked(1, 0, 1, 0x3FFF), "different tile");
+        assert!(!s.tile_fully_acked(0, 0, 2, 0x3FFF), "different gen");
     }
 
     #[test]
@@ -1663,9 +1682,9 @@ mod tests {
         // (2,0, gen=1): no acks → unacked.
         let _ = s.cdf53_passes_acked_count(2, 0, 1);
         let mut out = s.cdf53_unacked_tiles_for_gen(&[
-            ((0u8, 0u8), 1u8, 14u8),
-            ((1u8, 0u8), 1u8, 14u8),
-            ((2u8, 0u8), 1u8, 14u8),
+            ((0u8, 0u8), 1u8, 0x3FFFu16),
+            ((1u8, 0u8), 1u8, 0x3FFFu16),
+            ((2u8, 0u8), 1u8, 0x3FFFu16),
         ]);
         out.sort();
         assert_eq!(out, vec![(0u8, 0u8), (2u8, 0u8)]);
@@ -1684,7 +1703,7 @@ mod tests {
             s.record_cdf53_ack(2, 3, 1, 3);
         }
         assert!(
-            !s.tile_fully_acked(2, 3, 1, 14),
+            !s.tile_fully_acked(2, 3, 1, 0x3FFF),
             "duplicate ACKs of the same pass_idx must not satisfy tile_fully_acked"
         );
         // Now ACK every distinct pass_idx 0..14 exactly once.
@@ -1692,11 +1711,11 @@ mod tests {
             s.record_cdf53_ack(2, 3, 1, p);
         }
         assert!(
-            s.tile_fully_acked(2, 3, 1, 14),
+            s.tile_fully_acked(2, 3, 1, 0x3FFF),
             "all 14 distinct pass_idxs ACKed → tile_fully_acked"
         );
         // Different gen: same tile, no ACKs yet.
-        assert!(!s.tile_fully_acked(2, 3, 2, 14));
+        assert!(!s.tile_fully_acked(2, 3, 2, 0x3FFF));
     }
 
     #[test]
@@ -1716,7 +1735,7 @@ mod tests {
         let s = Scheduler::new(4, 4);
         // No record_cdf53_ack call → every pass is unacked. For
         // max_passes=14 the mask is 0x3FFF (bits 0..13 set).
-        assert_eq!(s.cdf53_unacked_pass_mask(0, 0, 1, 14), 0x3FFF);
+        assert_eq!(s.cdf53_unacked_pass_mask(0, 0, 1, 0x3FFF), 0x3FFF);
     }
 
     #[test]
@@ -1726,7 +1745,7 @@ mod tests {
         for p in 0..14u8 {
             s.record_cdf53_ack(0, 0, 1, p);
         }
-        assert_eq!(s.cdf53_unacked_pass_mask(0, 0, 1, 14), 0);
+        assert_eq!(s.cdf53_unacked_pass_mask(0, 0, 1, 0x3FFF), 0);
     }
 
     #[test]
@@ -1739,7 +1758,7 @@ mod tests {
         let acked_bits = (1u16 << 0) | (1u16 << 4) | (1u16 << 7);
         let full = (1u16 << 14) - 1;
         let expected = full & !acked_bits;
-        assert_eq!(s.cdf53_unacked_pass_mask(2, 3, 0, 14), expected);
+        assert_eq!(s.cdf53_unacked_pass_mask(2, 3, 0, 0x3FFF), expected);
     }
 
     #[test]
@@ -1749,7 +1768,7 @@ mod tests {
         for p in 0..14u8 {
             s.record_cdf53_ack(0, 0, 1, p);
         }
-        assert_eq!(s.cdf53_unacked_pass_mask(0, 0, 2, 14), 0x3FFF);
+        assert_eq!(s.cdf53_unacked_pass_mask(0, 0, 2, 0x3FFF), 0x3FFF);
     }
 
     #[test]

@@ -86,7 +86,7 @@ mod tests {
         m.idle_frames = 100;
         m.codec_state = CodecState::Cdf53 {
             passes_sent: 0,
-            max_passes: 14,
+            present_passes: 0x3FFF,
         };
         assert!(detect_escalation_candidates(&t, 100).is_empty());
     }

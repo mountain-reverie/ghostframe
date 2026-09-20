@@ -124,7 +124,7 @@ fn enters_h264_after_sustain_frames_via_cost_path_only() {
     let states = vec![
         CodecState::Cdf53 {
             passes_sent: 0,
-            max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
+            present_passes: 0x3FFF,
         };
         200
     ];
@@ -244,7 +244,7 @@ fn refinement_bias_promotes_tilecodec_under_headroom() {
     let tentative: Vec<CodecState> = (0..40)
         .map(|_| CodecState::Cdf53 {
             passes_sent: 3,
-            max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
+            present_passes: 0x3FFF,
         })
         .collect();
 
@@ -351,11 +351,11 @@ fn hysteresis_micros_holds_dwell_across_frame_rate() {
     // Cdf53 cost. Reuses the Task 7 calibration: 40 tiles at the default
     // bandwidth pushes tile_codec_cost above enter_factor * h264_cost.
     let make_tentative = || -> Vec<CodecState> {
-        let max_passes = crate::encoder::cdf53::CDF53_PASS_COUNT as u8;
+        let present_passes: u16 = 0x3FFF;
         (0..40)
             .map(|_| CodecState::Cdf53 {
                 passes_sent: 0,
-                max_passes,
+                present_passes,
             })
             .collect()
     };
@@ -445,11 +445,11 @@ fn env_var_override_refinement_bias_us() {
         suspended: false,
         last_update_seq: 1,
     };
-    let max_passes = crate::encoder::cdf53::CDF53_PASS_COUNT as u8;
+    let present_passes: u16 = 0x3FFF;
     let tentative: Vec<CodecState> = (0..40)
         .map(|_| CodecState::Cdf53 {
             passes_sent: 0,
-            max_passes,
+            present_passes,
         })
         .collect();
 
@@ -729,11 +729,11 @@ fn hybrid_hysteresis_wall_clock_jump_without_streak_does_not_flip() {
     c.set_adaptation_context(ctx);
 
     // Construct a workload that triggers enter_now=true (cost path picks H264).
-    let max_passes = crate::encoder::cdf53::CDF53_PASS_COUNT as u8;
+    let present_passes: u16 = 0x3FFF;
     let tentative: Vec<CodecState> = (0..200)
         .map(|_| CodecState::Cdf53 {
             passes_sent: 0,
-            max_passes,
+            present_passes,
         })
         .collect();
 

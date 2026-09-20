@@ -382,18 +382,21 @@ pub fn apply_cdf53_arrival(
     prev_frame_seq: u32,
     prev_pass_mask: u16,
     prev_nacked_mask: u16,
+    prev_present_passes: Option<u16>,
     prev_last_change_us: u64,
     generation: u8,
     pass_idx: u8,
     frame_seq: u32,
     now_us: u64,
     prevalidation_ok: bool,
+    present_passes: Option<u16>,
 ) -> Result<JsValue, JsValue> {
     let prev = prev_generation.map(|g| CoverageEntry {
         generation: g,
         frame_seq: prev_frame_seq,
         pass_mask: prev_pass_mask,
         nacked_mask: prev_nacked_mask,
+        present_passes: prev_present_passes,
         last_change_us: prev_last_change_us,
         sweep_attempts: 0,
     });
@@ -404,6 +407,7 @@ pub fn apply_cdf53_arrival(
         frame_seq,
         now_us,
         prevalidation_ok,
+        present_passes,
     ));
     serde_wasm_bindgen::to_value(&out).map_err(|e| JsValue::from_str(&e.to_string()))
 }

@@ -3477,10 +3477,11 @@ impl IoBridge {
         );
     }
 
-    /// Phase 1.5-B stranded-tile re-enqueue: given the freshly re-decoded
-    /// `passes` for one escalation slot already known to be Cdf53
-    /// (`codec_state`), re-enqueues ONLY the still-unacked passes at the
-    /// existing generation.
+    /// Phase 1.5-B stranded-tile re-enqueue: given the freshly re-encoded
+    /// sparse `passes` (and their `present_passes` bitmap) for one
+    /// escalation slot already known to be Cdf53 (`codec_state`),
+    /// re-enqueues ONLY the still-unacked passes at the existing
+    /// generation.
     ///
     /// No `cancel_for_tile` (the retransmit cache is empty for a stranded
     /// tile — that's the detection gate), no `bump_generation` (a bump
@@ -3488,9 +3489,9 @@ impl IoBridge {
     /// passes, which this path exists to preserve).
     ///
     /// Guards, in order:
-    ///  - `codec_state` must carry `max_passes` (Cdf53) — anything else
-    ///    means the detection gate raced with a codec-state change since
-    ///    candidate collection; skip rather than panic.
+    ///  - `codec_state` must be Cdf53 — anything else means the detection
+    ///    gate raced with a codec-state change since candidate collection;
+    ///    skip rather than panic.
     ///  - `unacked == 0` — the client ACKed everything between detection
     ///    and dispatch this frame; nothing to resend.
     ///  - `refinement_queue_holds_tile` — the tile's passes are still
@@ -3505,16 +3506,16 @@ impl IoBridge {
         tile_x: u8,
         tile_y: u8,
         codec_state: crate::tile::CodecState,
-        passes: Vec<Vec<u8>>,
+        present_passes: u16,
+        passes: Vec<(u8, Vec<u8>)>,
     ) {
-        let max_passes = match codec_state {
-            crate::tile::CodecState::Cdf53 { max_passes, .. } => max_passes,
-            _ => return, // Should not happen — detection enforced.
-        };
+        if !matches!(codec_state, crate::tile::CodecState::Cdf53 { .. }) {
+            return; // Should not happen — detection enforced.
+        }
         let gen = self.scheduler.generation_for(tile_x, tile_y);
         let unacked = self
             .scheduler
-            .cdf53_unacked_pass_mask(tile_x, tile_y, gen, max_passes);
+            .cdf53_unacked_pass_mask(tile_x, tile_y, gen, present_passes);
         if unacked == 0 {
             return; // Race: client ACKed everything between detect and dispatch.
         }
@@ -3524,41 +3525,35 @@ impl IoBridge {
         if self.scheduler.refinement_queue_holds_tile(tile_x, tile_y) {
             return;
         }
-        let only_unacked: Vec<Vec<u8>> = passes
+        let only_unacked: Vec<(u8, Vec<u8>)> = passes
             .into_iter()
-            .enumerate()
-            .filter_map(|(pass_idx, p)| {
-                if (unacked & (1u16 << pass_idx)) != 0 {
-                    Some(p)
-                } else {
-                    None
-                }
-            })
+            .filter(|(pass_idx, _)| (unacked & (1u16 << pass_idx)) != 0)
             .collect();
-        for (slot_pass_idx, payload) in only_unacked.iter().enumerate() {
-            // Map slot_pass_idx back to the absolute pass_idx (the bitmap
-            // had the unacked bits in order, so the Nth retained pass
-            // corresponds to the Nth set bit).
-            let _ = slot_pass_idx; // payload index, not used in log.
+        let subset_mask: u16 = only_unacked
+            .iter()
+            .fold(0u16, |acc, (pass_idx, _)| acc | (1u16 << pass_idx));
+        for (pass_idx, payload) in &only_unacked {
             tracing::info!(
                 target: "ghostframe::cdf53",
                 tile_x = tile_x,
                 tile_y = tile_y,
                 gen = gen,
+                pass_idx = *pass_idx,
                 unacked_mask = unacked,
                 payload_size = payload.len(),
                 source = "stranded",
                 "cdf53.emit"
             );
         }
+        let payloads: Vec<Vec<u8>> = only_unacked.into_iter().map(|(_, p)| p).collect();
         // Use the index-preserving variant so the scheduler enqueues the
         // correct pass_idx for each retained payload (not 0..N).
         self.scheduler.enqueue_refinement_subset_at(
             tile_x,
             tile_y,
             gen,
-            unacked,
-            only_unacked,
+            subset_mask,
+            payloads,
             now_std(),
         );
     }
@@ -3640,8 +3635,8 @@ impl IoBridge {
                     if m.idle_frames <= crate::tile::escalation::IDLE_THRESHOLD {
                         continue;
                     }
-                    let max_passes = match m.codec_state {
-                        crate::tile::CodecState::Cdf53 { max_passes, .. } => max_passes,
+                    let present_passes = match m.codec_state {
+                        crate::tile::CodecState::Cdf53 { present_passes, .. } => present_passes,
                         _ => continue,
                     };
                     // NOTE: TileMetrics.passes_sent is dead state in the
@@ -3663,9 +3658,9 @@ impl IoBridge {
                         continue;
                     }
                     let gen = self.scheduler.generation_for(tile_x, tile_y);
-                    let unacked = self
-                        .scheduler
-                        .cdf53_unacked_pass_mask(tile_x, tile_y, gen, max_passes);
+                    let unacked =
+                        self.scheduler
+                            .cdf53_unacked_pass_mask(tile_x, tile_y, gen, present_passes);
                     if unacked == 0 {
                         continue;
                     }
@@ -3931,26 +3926,27 @@ impl IoBridge {
             let tile_count = (cols * rows) as usize;
             let diag_frame = seq.is_multiple_of(10);
             let mut sweep_acked_total: u32 = 0;
-            let mut sweep_max_passes_total: u32 = 0;
+            let mut sweep_present_total: u32 = 0;
             let mut sweep_tile_count: u32 = 0;
             for idx in 0..tile_count {
                 let tile_x = (idx as u32 % cols) as u8;
                 let tile_y = (idx as u32 / cols) as u8;
-                let max_passes = {
+                let present_passes = {
                     let tm = self.metrics_tracker.get(tile_x as u32, tile_y as u32);
                     match tm.codec_state {
-                        crate::tile::CodecState::Cdf53 { max_passes, .. } => max_passes,
+                        crate::tile::CodecState::Cdf53 { present_passes, .. } => present_passes,
                         _ => continue,
                     }
                 };
                 let gen = self.scheduler.generation_for(tile_x, tile_y);
                 let acked = self.scheduler.cdf53_passes_acked_count(tile_x, tile_y, gen);
                 sweep_acked_total = sweep_acked_total.saturating_add(acked as u32);
-                sweep_max_passes_total = sweep_max_passes_total.saturating_add(max_passes as u32);
+                sweep_present_total =
+                    sweep_present_total.saturating_add(present_passes.count_ones());
                 sweep_tile_count = sweep_tile_count.saturating_add(1);
                 if self
                     .scheduler
-                    .tile_fully_acked(tile_x, tile_y, gen, max_passes)
+                    .tile_fully_acked(tile_x, tile_y, gen, present_passes)
                 {
                     self.metrics_tracker
                         .get_mut(tile_x as u32, tile_y as u32)
@@ -3976,7 +3972,7 @@ impl IoBridge {
                     target: "ghostframe::cdf53",
                     cdf53_tiles = sweep_tile_count,
                     acked_total = sweep_acked_total,
-                    max_passes_total = sweep_max_passes_total,
+                    present_total = sweep_present_total,
                     "cdf53.sweep_summary"
                 );
             }
@@ -4354,7 +4350,8 @@ impl IoBridge {
                                     );
                                 }
                             }
-                            let passes = crate::encoder::cdf53::encode_passes(&coeffs_i16);
+                            let (present_passes, passes) =
+                                crate::encoder::cdf53::encode_passes_sparse(&coeffs_i16);
                             // Drop emitter retransmit state in lock-step (see
                             // dispatch_dirty_tiles_via_scheduler for the
                             // dangling-pointer rationale).
@@ -4373,24 +4370,28 @@ impl IoBridge {
                             self.metrics_tracker
                                 .get_mut(tile_x as u32, tile_y as u32)
                                 .already_escalated_this_gen = false;
-                            // Diagnostic: one line per pass for the e2e log scan.
-                            for (pass_idx, payload) in passes.iter().enumerate() {
+                            // Diagnostic: one line per pass actually sent (sparse
+                            // encoding skips empty bit-planes) for the e2e log scan.
+                            for (pass_idx, payload) in &passes {
                                 tracing::info!(
                                     target: "ghostframe::cdf53",
                                     tile_x = tile_x,
                                     tile_y = tile_y,
                                     gen = gen,
-                                    pass_idx = pass_idx,
+                                    pass_idx = *pass_idx,
                                     payload_size = payload.len(),
                                     source = "dirty",
                                     "cdf53.emit"
                                 );
                             }
-                            self.scheduler.enqueue_refinement_at(
+                            let payloads: Vec<Vec<u8>> =
+                                passes.into_iter().map(|(_, p)| p).collect();
+                            self.scheduler.enqueue_refinement_subset_at(
                                 tile_x,
                                 tile_y,
                                 gen,
-                                passes,
+                                present_passes,
+                                payloads,
                                 now_std(),
                             );
                             // Override the CPU classifier's codec_state so that
@@ -4404,7 +4405,7 @@ impl IoBridge {
                                 .get_mut(tile_x as u32, tile_y as u32)
                                 .codec_state = crate::tile::CodecState::Cdf53 {
                                 passes_sent: 0,
-                                max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
+                                present_passes,
                             };
                         }
                     }
@@ -4464,9 +4465,16 @@ impl IoBridge {
                             )
                         };
                         let coeffs_i16: Vec<i16> = coeffs_i32.iter().map(|&v| v as i16).collect();
-                        let passes = crate::encoder::cdf53::encode_passes(&coeffs_i16);
+                        let (present_passes, passes) =
+                            crate::encoder::cdf53::encode_passes_sparse(&coeffs_i16);
                         if is_stranded {
-                            self.stranded_reenqueue(tile_x, tile_y, codec_state, passes);
+                            self.stranded_reenqueue(
+                                tile_x,
+                                tile_y,
+                                codec_state,
+                                present_passes,
+                                passes,
+                            );
                             continue;
                         }
                         // H264 escalation path (existing).
@@ -4484,30 +4492,32 @@ impl IoBridge {
                         // call above; the fragment_coverage drop here
                         // became redundant when Task 25 paired emitter
                         // cancellation with every bump_generation site.)
-                        for (pass_idx, payload) in passes.iter().enumerate() {
+                        for (pass_idx, payload) in &passes {
                             tracing::info!(
                                 target: "ghostframe::cdf53",
                                 tile_x = tile_x,
                                 tile_y = tile_y,
                                 gen = gen,
-                                pass_idx = pass_idx,
+                                pass_idx = *pass_idx,
                                 payload_size = payload.len(),
                                 source = "escalation",
                                 "cdf53.emit"
                             );
                         }
-                        self.scheduler.enqueue_refinement_at(
+                        let payloads: Vec<Vec<u8>> = passes.into_iter().map(|(_, p)| p).collect();
+                        self.scheduler.enqueue_refinement_subset_at(
                             tile_x,
                             tile_y,
                             gen,
-                            passes,
+                            present_passes,
+                            payloads,
                             now_std(),
                         );
 
                         let tm = self.metrics_tracker.get_mut(tile_x as u32, tile_y as u32);
                         tm.codec_state = crate::tile::CodecState::Cdf53 {
                             passes_sent: 0,
-                            max_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
+                            present_passes,
                         };
                         tm.already_escalated_this_gen = true;
                     }
@@ -8776,12 +8786,13 @@ mod tests {
             "queue seeded with one Pending entry per pass"
         );
 
+        let present_passes: u16 = 0x3FFF;
         let codec_state = crate::tile::CodecState::Cdf53 {
             passes_sent: 0,
-            max_passes,
+            present_passes,
         };
-        let passes: Vec<Vec<u8>> = (0..max_passes).map(|i| vec![i; 4]).collect();
-        bridge.stranded_reenqueue(tile_x, tile_y, codec_state, passes);
+        let passes: Vec<(u8, Vec<u8>)> = (0..max_passes).map(|i| (i, vec![i; 4])).collect();
+        bridge.stranded_reenqueue(tile_x, tile_y, codec_state, present_passes, passes);
 
         let after = bridge.scheduler.refinement_queue_len();
         assert_eq!(

@@ -166,6 +166,16 @@ pub struct BrowserlessResult {
     pub bytes_delivered_s2c: u64,
     /// Client -> server bytes delivered (ACKs, NACKs, input).
     pub bytes_delivered_c2s: u64,
+    /// Server -> client datagrams delivered.
+    ///
+    /// Distinct from `bytes_delivered_s2c` and not derivable from it. A test
+    /// reasoning about *concurrency* -- how many datagrams a link could have
+    /// carried in flight at once -- must count datagrams, because bytes
+    /// conflate "fewer datagrams" with "smaller datagrams". Switching the
+    /// Cdf53 encoder to skip empty bit-planes shrank payloads enough to push
+    /// `a_link_with_propagation_delay_carries_datagrams_concurrently` under a
+    /// byte floor it had been clearing, with concurrency entirely unchanged.
+    pub datagrams_delivered_s2c: u64,
     pub bytes_dropped: u64,
     /// Read from `FrameBuffer::stale_frame_tiles()` — a scene run only
     /// ever ingests via `FrameBuffer::apply_tile_ready` (real decoded
@@ -436,8 +446,14 @@ async fn run_inner(mut scene: BrowserlessScene) -> anyhow::Result<BrowserlessRes
     // point after the abort where `run()` could publish again.
     bridge_handle.abort();
 
-    let (events, bytes_delivered, bytes_delivered_s2c, bytes_delivered_c2s, bytes_dropped) =
-        outcome?;
+    let (
+        events,
+        bytes_delivered,
+        bytes_delivered_s2c,
+        bytes_delivered_c2s,
+        datagrams_delivered_s2c,
+        bytes_dropped,
+    ) = outcome?;
 
     let stale_generation_tiles = framebuffer.stale_frame_tiles();
     let bwe_snapshot = *bwe_cell.lock().expect("bwe_publish mutex poisoned");
@@ -465,6 +481,7 @@ async fn run_inner(mut scene: BrowserlessScene) -> anyhow::Result<BrowserlessRes
         bytes_delivered,
         bytes_delivered_s2c,
         bytes_delivered_c2s,
+        datagrams_delivered_s2c,
         bytes_dropped,
         stale_generation_tiles,
         seed,
@@ -528,7 +545,7 @@ async fn drive_session(
     framebuffer: &mut FrameBuffer,
     bwe_cell: &std::sync::Arc<std::sync::Mutex<ghostframe_lib::transport::bwe::BweSnapshot>>,
     bwe_samples: &mut Vec<(u64, u64)>,
-) -> anyhow::Result<(Vec<ClientNetEvent>, u64, u64, u64, u64)> {
+) -> anyhow::Result<(Vec<ClientNetEvent>, u64, u64, u64, u64, u64)> {
     let seed = scene.seed;
 
     let mut client = ClientNet::new(cfg, now_us(base))
@@ -578,6 +595,7 @@ async fn drive_session(
     let mut bytes_delivered: u64 = 0;
     let mut bytes_delivered_s2c: u64 = 0;
     let mut bytes_delivered_c2s: u64 = 0;
+    let mut datagrams_delivered_s2c: u64 = 0;
     let mut bytes_dropped: u64 = 0;
 
     // Per-tile generation counters for injected frames: a coordinate's
@@ -766,6 +784,7 @@ async fn drive_session(
             &mut bytes_delivered,
             &mut bytes_delivered_s2c,
             &mut bytes_delivered_c2s,
+            &mut datagrams_delivered_s2c,
         )
         .await
         .map_err(|e| anyhow!("seed {seed}: pump send failed at iteration {iter}: {e}"))?;
@@ -926,6 +945,7 @@ async fn drive_session(
                         client.handle_udp(&item.payload, server_addr, item.at_us);
                         bytes_delivered += item.payload.len() as u64;
                         bytes_delivered_s2c += item.payload.len() as u64;
+                        datagrams_delivered_s2c += 1;
                     } else {
                         in_flight.push(InFlight {
                             seq: next_in_flight_seq,
@@ -949,6 +969,7 @@ async fn drive_session(
         bytes_delivered,
         bytes_delivered_s2c,
         bytes_delivered_c2s,
+        datagrams_delivered_s2c,
         bytes_dropped,
     ))
 }
@@ -1176,6 +1197,7 @@ async fn flush_due(
     bytes_delivered: &mut u64,
     bytes_delivered_s2c: &mut u64,
     bytes_delivered_c2s: &mut u64,
+    datagrams_delivered_s2c: &mut u64,
 ) -> std::io::Result<()> {
     while in_flight.peek().is_some_and(|f| f.at_us <= now) {
         let f = in_flight.pop().expect("peek just confirmed a due datagram");
@@ -1195,7 +1217,10 @@ async fn flush_due(
         *bytes_delivered += f.payload.len() as u64;
         match f.dir {
             Direction::C2s => *bytes_delivered_c2s += f.payload.len() as u64,
-            Direction::S2c => *bytes_delivered_s2c += f.payload.len() as u64,
+            Direction::S2c => {
+                *bytes_delivered_s2c += f.payload.len() as u64;
+                *datagrams_delivered_s2c += 1;
+            }
         }
     }
     Ok(())

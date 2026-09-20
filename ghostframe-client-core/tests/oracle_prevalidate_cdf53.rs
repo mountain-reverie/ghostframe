@@ -54,7 +54,9 @@ fn rle_decode_matches_fixture_for_all_passes_and_channels() {
     let fixture = load_fixture();
     for pass in 0..fixture.pass_count {
         let payload = &fixture.encoded_passes[pass];
-        let mut offset = 0usize;
+        // Pass 0's payload carries a 2-byte present_passes prefix ahead of
+        // the 3-channel block; every other pass starts the block at 0.
+        let mut offset = if pass == 0 { 2usize } else { 0usize };
         for ch in 0..fixture.channels {
             let len = ((payload[offset] as usize) << 8) | (payload[offset + 1] as usize);
             offset += 2;
@@ -99,6 +101,8 @@ fn rejects_truncated_section_header_with_cdf53_truncated() {
 
 #[test]
 fn rejects_rle_wrong_byte_count_with_cdf53_rle_length() {
-    let r = prevalidate_cdf53(&[0, 1, 0x05], 0, 0);
+    // pass_idx = 1 (not 0): no present_passes prefix to account for, so
+    // this payload is read straight as one channel's [len][rle] block.
+    let r = prevalidate_cdf53(&[0, 1, 0x05], 0, 1);
     assert_eq!(r, Err(DecodeErrorCode::Cdf53RleLength));
 }

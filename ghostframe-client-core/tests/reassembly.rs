@@ -48,8 +48,10 @@ fn tile_datagrams(
 
 /// A CDF53 pass payload whose three channels each RLE-decode to 128 zero
 /// bytes: `[u16 BE len=1][0xFF]` per channel (0xFF => 128-byte zero run).
+/// A valid **pass 0** payload: present_passes prefix (bit 0 set, naming
+/// only pass 0 itself) followed by the 3-channel block.
 fn valid_cdf53_payload() -> Vec<u8> {
-    let mut p = Vec::new();
+    let mut p = vec![0x00, 0x01]; // present_passes = 0x0001
     for _ in 0..3 {
         p.extend_from_slice(&[0x00, 0x01, 0xFF]);
     }

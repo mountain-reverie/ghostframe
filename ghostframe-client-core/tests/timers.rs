@@ -44,11 +44,22 @@ fn tile_datagrams(
 
 /// A CDF53 pass payload whose three channels each RLE-decode to 128 zero
 /// bytes: `[u16 BE len=1][0xFF]` per channel (0xFF => 128-byte zero run).
+/// Valid for passes 1..13, which carry no present_passes prefix.
 fn valid_cdf53_payload() -> Vec<u8> {
     let mut p = Vec::new();
     for _ in 0..3 {
         p.extend_from_slice(&[0x00, 0x01, 0xFF]);
     }
+    p
+}
+
+/// Same content as `valid_cdf53_payload`, but for pass 0: prefixed with a
+/// 2-byte big-endian `present_passes` bitmap. The tail-sweep/debounce tests
+/// in this file want the tile to claim all 14 passes so the "missing"
+/// count they assert on (13 = passes 1..13) stays meaningful.
+fn valid_cdf53_pass0_payload() -> Vec<u8> {
+    let mut p = vec![0x3F, 0xFF]; // present_passes = 0x3FFF (all 14 passes).
+    p.extend_from_slice(&valid_cdf53_payload());
     p
 }
 
@@ -163,7 +174,7 @@ fn feedback_emitted_every_100ms() {
 fn tail_sweep_renacks_stalled_cdf53_tile_after_1500ms() {
     let mut core = test_core();
     // One valid pass 0 at t=0 -> coverage entry created, pass_mask bit 0 set.
-    let dgs = tile_datagrams(1, 2, 3, Codec::Cdf53, 0, &valid_cdf53_payload(), 1200);
+    let dgs = tile_datagrams(1, 2, 3, Codec::Cdf53, 0, &valid_cdf53_pass0_payload(), 1200);
     core.handle_datagram(&dgs[0], 0);
     // Drain the ACK/decode outputs from the initial arrival.
     drain_datagrams(&mut core);
@@ -193,7 +204,7 @@ fn tail_sweep_renacks_stalled_cdf53_tile_after_1500ms() {
 fn coverage_nack_debounce_suppresses_pass_that_arrives_in_window() {
     let mut core = test_core();
     // Pass 0 valid at t=0.
-    let dgs0 = tile_datagrams(1, 5, 6, Codec::Cdf53, 0, &valid_cdf53_payload(), 1200);
+    let dgs0 = tile_datagrams(1, 5, 6, Codec::Cdf53, 0, &valid_cdf53_pass0_payload(), 1200);
     core.handle_datagram(&dgs0[0], 0);
     drain_datagrams(&mut core);
     drain_stream(&mut core);
@@ -226,7 +237,7 @@ fn coverage_nack_debounce_suppresses_pass_that_arrives_in_window() {
 #[test]
 fn coverage_nack_debounce_sends_pass_that_never_arrives() {
     let mut core = test_core();
-    let dgs0 = tile_datagrams(1, 7, 8, Codec::Cdf53, 0, &valid_cdf53_payload(), 1200);
+    let dgs0 = tile_datagrams(1, 7, 8, Codec::Cdf53, 0, &valid_cdf53_pass0_payload(), 1200);
     core.handle_datagram(&dgs0[0], 0);
     drain_datagrams(&mut core);
     drain_stream(&mut core);
