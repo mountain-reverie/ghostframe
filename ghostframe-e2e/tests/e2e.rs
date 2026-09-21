@@ -1739,47 +1739,45 @@ async fn e2e_static_mixed_codecs_converge_on_a_shaped_link() -> Result<()> {
     Ok(())
 }
 
-/// **KNOWN-FAILING: reproduces the reported production defect.**
+/// Production scale, production capture rate, 1% loss: it converges.
 ///
-/// A production-scale screen (1920x1080 = 60x34 = 2040 tiles) on a
-/// production-shaped link with 1% loss never finishes refining, and most of
-/// it gives up. Measured across three runs, all in the *pre-burst* phase --
-/// i.e. on a screen that has not changed since the first frame:
+///   tiles=2040 complete=2040 partial=0 gave_up=0 pass-hist{10:2040}
 ///
-///   tiles=2040 complete=0 partial=2040 gave_up=1587  pass-hist{1:288 6:671 7:1081}
-///   tiles=2040 complete=0 partial=2040 gave_up=227   pass-hist{3:1340 4:700}
-///   tiles=2040 complete=0 partial=2040 gave_up=0     pass-hist{4:1619 5:421}
+/// 1920x1080 is 60x34 = 2040 tiles, the real screen. Earlier scenes ran at
+/// VKMS's preferred 1024x768 (768 tiles), a third of that.
 ///
-/// The stranded tiles hold `{0, 5..10}` and are missing `{11, 12, 13}` -- the
-/// three finest bit-planes -- with `sweep_attempts=6`, the give-up limit.
-/// Detail that never arrives on a quiet screen is exactly the reported
-/// symptom: text and UI chrome that stay soft and never sharpen.
+/// # What this scene cost, and what it taught
 ///
-/// # Why it took this long to reproduce
+/// It was committed as a reproduction of the production defect, on the
+/// strength of `tiles=2040 complete=0 gave_up=1587` with tiles stranded
+/// missing their three finest passes. That was real, reproducible, and an
+/// artifact of this test: `CAPTURE_FPS_DRM_DIRECT=5`, inherited from the
+/// overload scene. Production captures at ~30 fps. Raising it converges the
+/// same scene completely.
 ///
-/// It is scale-dependent, and every earlier scene ran at a third of
-/// production. VKMS advertises 1024x768 as its preferred mode, so
-/// `--drm-direct` scenes were 32x24 = 768 tiles. At 768 tiles this exact
-/// shape converges cleanly. At 2040 it does not.
+/// The artifact is worth understanding, because it is a real property of
+/// the delivery path rather than a quirk of the harness. Measured at 5 fps
+/// on a 2040-tile screen behind 8 Mbit:
 ///
-/// A plausible mechanism, not yet confirmed: the scheduler drains pass-major
-/// (every tile's pass 0, then every tile's pass 5, ...), so a tile waits a
-/// full screen-sweep between its own passes -- ~2040 datagrams, roughly
-/// 800 KB, ~0.8 s at 8 Mbit before loss and retransmits. The client's
-/// tail-sweep budget is 6 sweeps x 500 ms = 3 s of *no progress for that
-/// tile*. As the screen grows, the gap between a tile's passes approaches
-/// and then exceeds that budget, and the tail of the refinement gives up
-/// while the head is still being served.
+///   scheduler.tick refinement_fraction=0.2 refinement_queue_len=16150
+///                  drained_count=63 drained_bytes=25641
+///                  base_budget_bytes=262144
 ///
-/// Lossless at the same scale converges
-/// (`e2e_production_shaped_session_strands_no_tiles`, complete=2040), so
-/// loss is what pushes the per-tile gap past the budget.
+/// ~5 drains/second -- exactly the capture rate -- moving ~25 KB each, so
+/// ~125 KB/s offered into a link carrying 1 MB/s. **Refinement throughput
+/// tracks the capture frame rate, not the link.** `Event::DatagramsUnblocked`
+/// exists to decouple them ("scheduler.tick runs when quinn signals it has
+/// room, not when the next frame arrives") but contributed almost nothing:
+/// drains/second matched fps.
 ///
-/// The burst-then-quiet phases below are retained: once convergence is
-/// fixed, this scene should also show that a single change on a settled
-/// screen recovers. Today it never reaches them.
+/// Note also what the same data ruled out. The adaptive
+/// `refinement_bandwidth_fraction` halves toward a 0.05 floor under poor
+/// delivery, which looked like an obvious culprit -- cutting refinement
+/// bandwidth exactly when loss makes it scarce. It was pinned at its 0.2
+/// maximum throughout. That hypothesis was wrong, and only the added
+/// instrumentation showed it.
 #[tokio::test(flavor = "multi_thread")]
-async fn e2e_production_scale_with_loss_never_converges() -> Result<()> {
+async fn e2e_production_scale_with_loss_converges() -> Result<()> {
     use ghostframe_e2e::harness::net_shape::NetShape;
 
     // The burst delay counts from *test-pattern start*, not from client
@@ -1799,7 +1797,11 @@ async fn e2e_production_scale_with_loss_never_converges() -> Result<()> {
         // server then captured 44 frames without a single dirty tile.
         "--tile-pattern photo --subtle-drift-once 60000 --drm-direct",
         &[
-            ("CAPTURE_FPS_DRM_DIRECT", "5"),
+            // Production captures at ~30 fps. 5 was inherited from the
+            // overload scene and is not production-like: the refinement
+            // drain fires about once per captured frame, so a low capture
+            // rate throttles delivery independently of link capacity.
+            ("CAPTURE_FPS_DRM_DIRECT", "30"),
             ("GHOSTFRAME_ENABLE_CDF53", "1"),
             ("GHOSTFRAME_FORCE_TILECODEC", "1"),
             // Production scale. VKMS prefers 1024x768 (32x24 = 768 tiles);
