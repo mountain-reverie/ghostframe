@@ -1564,6 +1564,157 @@ async fn e2e_multi_tile_grid() -> Result<()> {
     Ok(())
 }
 
+/// The shape of a real desktop: a quiet screen mixing all three tile codecs,
+/// behind latency and a modest bandwidth cap.
+///
+/// This is the closest scene to the reported production case. `--mixed-static`
+/// paints three regions and then stops touching the screen:
+///
+///   solid    (flat fill)     -> Codec::Solid
+///   text     (few colours)   -> Codec::PalRle
+///   gradient (smooth image)  -> Codec::Cdf53
+///
+/// No spinner, so the classifier is not chasing motion and cannot flip the
+/// frame to H264 on cost grounds; `GHOSTFRAME_FORCE_TILECODEC=1` pins that
+/// besides. Everything after the first frames is pure delivery and
+/// refinement over a shaped link.
+///
+/// # What it asserts
+///
+/// 1. **All three codecs really are on the wire.** Without this the scene
+///    could quietly degenerate to one codec and still "converge".
+/// 2. **It settles, and how fast.** Polls coverage until every Cdf53 tile
+///    has its full pass set, and reports the time. A static screen behind
+///    12 ms and 8 Mbit has no reason to take seconds.
+/// 3. **Nothing is left stranded** -- `gave_up == 0`.
+/// 4. **The pixels are right**, sampled per region, so "converged" cannot
+///    mean "converged on the wrong image".
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_static_mixed_codecs_converge_on_a_shaped_link() -> Result<()> {
+    use ghostframe_e2e::harness::net_shape::NetShape;
+
+    let setup = setup_e2e_webgpu_gpu_with_env(
+        "--mixed-static",
+        &[
+            ("GHOSTFRAME_ENABLE_CDF53", "1"),
+            ("GHOSTFRAME_FORCE_TILECODEC", "1"),
+        ],
+    )
+    .await?;
+
+    let container = setup.server.server_container_name.clone();
+    NetShape::tailnet_like()
+        .apply(&container)
+        .context("apply shaped link")?;
+    let qdisc = NetShape::verify(&container).context("read back qdisc")?;
+    assert!(
+        qdisc.contains("netem"),
+        "netem was not applied to {container}; qdisc reads: {qdisc:?}"
+    );
+    eprintln!("shaped link: {}", qdisc.trim());
+
+    // Poll until every Cdf53 tile holds its full pass set, so the reported
+    // settle time is measured rather than assumed from a fixed sleep.
+    let started = std::time::Instant::now();
+    let mut settled_after: Option<Duration> = None;
+    let mut last_cov = serde_json::Value::Null;
+    // 20 ms poll: a static screen behind 12 ms of delay is expected to settle
+    // in tens of milliseconds, so a coarser interval would report its own
+    // period rather than the convergence time. (First measured at a 250 ms
+    // interval, which duly reported 251 ms.)
+    for _ in 0..1_500 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let cov: serde_json::Value = setup
+            .page()
+            .evaluate("window.__cdf53CoverageSummary()")
+            .await?
+            .into_value()?;
+        let s = &cov["summary"];
+        let tiles = s["tiles"].as_u64().unwrap_or(0);
+        let complete = s["complete"].as_u64().unwrap_or(0);
+        last_cov = cov;
+        if tiles > 0 && complete == tiles {
+            settled_after = Some(started.elapsed());
+            break;
+        }
+    }
+
+    eprintln!("final coverage: {last_cov}");
+    let codecs: Vec<u8> = setup
+        .page()
+        .evaluate("window.__ghostframeRecordedCodecs || []")
+        .await?
+        .into_value()?;
+    let count = |c: Codec| codecs.iter().filter(|&&x| x == c as u8).count();
+    let (n_solid, n_palrle, n_cdf53) =
+        (count(Codec::Solid), count(Codec::PalRle), count(Codec::Cdf53));
+    eprintln!(
+        "codecs on the wire: solid={n_solid} palrle={n_palrle} cdf53={n_cdf53} \
+         (settled_after={settled_after:?})"
+    );
+
+    // (1) Premise: this must genuinely be a mixed scene.
+    for (name, n) in [
+        ("Solid", n_solid),
+        ("PalRle", n_palrle),
+        ("Cdf53", n_cdf53),
+    ] {
+        assert!(
+            n > 0,
+            "no {name} tiles reached the client, so this scene is not \
+             exercising mixed codecs and the convergence claim below is \
+             about something narrower than it looks. \
+             solid={n_solid} palrle={n_palrle} cdf53={n_cdf53}"
+        );
+    }
+
+    let summary = &last_cov["summary"];
+    let tiles = summary["tiles"].as_u64().unwrap_or(0);
+    let complete = summary["complete"].as_u64().unwrap_or(0);
+    let gave_up = summary["gave_up"].as_u64().unwrap_or(0);
+
+    // (2) It must settle at all, within the polling window.
+    let settled = settled_after.with_context(|| {
+        format!(
+            "a static mixed screen behind 12 ms / 8 Mbit never reached full \
+             Cdf53 coverage in 30 s: {complete} of {tiles} tiles complete, \
+             {gave_up} gave up. Outstanding: {}",
+            last_cov["incomplete"]
+        )
+    })?;
+
+    // (3) Nothing stranded.
+    assert_eq!(
+        gave_up, 0,
+        "{gave_up} tiles stopped asking for passes they never received. \
+         Stuck: {}",
+        last_cov["incomplete"]
+    );
+
+    // (4) The pixels, sampled inside each region, so "converged" cannot mean
+    // "converged on the wrong image". Coordinates are region centres from
+    // `mixed::REGIONS`; the solid quadrant is painted red (0x00FF0000).
+    let solid_px: Vec<u8> = setup
+        .page()
+        .evaluate("window.__readPixelRect(160, 120, 1, 1)")
+        .await?
+        .into_value()?;
+    assert!(
+        solid_px.len() >= 3,
+        "pixel readback returned {} bytes for the solid region",
+        solid_px.len()
+    );
+    assert!(
+        solid_px[0] > 200 && solid_px[1] < 60 && solid_px[2] < 60,
+        "the solid quadrant should be red after convergence, read {:?}",
+        &solid_px[..3.min(solid_px.len())]
+    );
+
+    eprintln!("settled in {settled:?} ({complete}/{tiles} tiles, gave_up=0)");
+    NetShape::clear(&container).ok();
+    Ok(())
+}
+
 /// **A characterisation of overload, not a reproduction of the production
 /// defect.** Named for what it measures after two corrections.
 ///

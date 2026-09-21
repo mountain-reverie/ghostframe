@@ -82,6 +82,28 @@ pub fn render_and_spin<C: Connection>(
     spinner_loop(conn, root, region("spinner"))
 }
 
+/// Paint the three **static** regions (solid, text, gradient) and park.
+///
+/// `render_and_spin` never stops repainting the spinner quadrant, so a scene
+/// using it is never quiet: the classifier sees dirty tiles every 100 ms and
+/// may switch the whole frame to H264 on cost grounds. That makes it useless
+/// for asking "does a settled screen converge, and how fast".
+///
+/// This variant covers the three codecs a real desktop is mostly made of --
+/// flat fills (Solid), UI text (PalRle), and smooth imagery (Cdf53) -- and
+/// then stops touching the screen, so everything after the first frames is
+/// pure delivery and refinement.
+pub fn render_static_only<C: Connection>(
+    conn: &C,
+    root: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    paint_static(conn, root)?;
+    eprintln!("test-pattern: mixed-static painted, screen is now quiet");
+    loop {
+        std::thread::sleep(Duration::from_secs(3600));
+    }
+}
+
 fn paint_static<C: Connection>(conn: &C, root: u32) -> Result<(), Box<dyn std::error::Error>> {
     paint_solid(conn, root, region("solid"))?;
     paint_text(conn, root, region("text"))?;

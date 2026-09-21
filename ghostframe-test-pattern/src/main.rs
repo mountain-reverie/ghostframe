@@ -35,6 +35,14 @@ struct Args {
     #[arg(long)]
     mixed: bool,
 
+    /// Like --mixed but without the spinner: paints solid + text + gradient
+    /// and then leaves the screen alone. For scenes that need a *quiet*
+    /// screen exercising Solid, PalRle and Cdf53 together -- the spinner
+    /// repaints every 100 ms, which keeps the classifier busy and can flip
+    /// the whole frame to H264.
+    #[arg(long)]
+    mixed_static: bool,
+
     /// Cycle between static and motion content every `SECS` seconds (so the
     /// full cycle is `2 * SECS`). Drives `e2e_mode_switch` to verify the
     /// classifier flips between H264 and TileCodec modes.
@@ -187,6 +195,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(secs) = args.mode_switch_cycle {
         let half = std::time::Duration::from_secs(secs);
         return ghostframe_test_pattern::mode_switch::run(&conn, root, half);
+    }
+
+    if args.mixed_static {
+        // Three static regions, then quiet. Checked before --mixed so the
+        // two flags cannot both fire.
+        return mixed::render_static_only(&conn, root);
     }
 
     if args.mixed {
