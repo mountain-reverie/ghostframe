@@ -98,16 +98,16 @@ e2e_input_forwarding_firefox
 # reproduction. Skipped in CI only so the suite stays green; it must keep
 # failing locally, because failing is its job.
 #
-# Drives a rate-limited link ~15x past capacity (768 tiles x ~10 passes x
-# 5 fps vs ~2,500 passes/s of 8 Mbit) and measures what happens:
-#   tiles=768 complete=0 partial=767 gave_up=237
-# 237 tiles exhaust MAX_TAIL_SWEEP_ATTEMPTS and stop asking, permanently --
-# nothing resets sweep_attempts except a pass arriving, and the server
-# believes each tile complete because every pass it sent was ACKed.
+# Reproduces the reported production defect. A production-scale screen
+# (1920x1080 = 2040 tiles) on a shaped link with 1% loss never finishes
+# refining on a screen that has not changed:
+#   tiles=2040 complete=0 partial=2040 gave_up=1587
+# Stranded tiles hold {0,5..10} and are missing {11,12,13} -- the three
+# finest bit-planes -- at sweep_attempts=6, the give-up limit. That is
+# detail which never arrives on a quiet screen.
 #
-# The give-up-with-no-recovery gap is real. Starving a link 15x over is NOT
-# the reported production symptom, which was a static screen (dirty_count=0
-# for minutes) with tiles stale anyway. Do not read this as that bug.
+# Scale-dependent: the same shape at 768 tiles (VKMS's preferred 1024x768)
+# converges cleanly, which is why every earlier scene missed it.
 #
 # Delete this entry once a recovery path lands; it is that fix's gate.
 e2e_saturated_link_starves_tiles_into_giving_up
