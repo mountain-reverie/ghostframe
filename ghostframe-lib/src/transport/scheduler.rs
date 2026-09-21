@@ -95,6 +95,13 @@ pub struct Scheduler {
     /// Fraction of tick budget allocated to refinement passes (default 0.2).
     /// Adjusted adaptively by `maybe_adjust_refinement_fraction`.
     refinement_bandwidth_fraction: f32,
+    /// Refinement budget handed to the last `tick_at`, for diagnostics.
+    ///
+    /// Without it a `scheduler.tick` line showing a small `drained_bytes`
+    /// against a large `base_budget_bytes` is ambiguous: the drain may have
+    /// spent its share and stopped, or stopped early with budget to spare.
+    /// Those have different causes and different fixes.
+    last_refinement_budget: usize,
     /// Count of work items emitted in the current delivery window.
     delivery_window_emitted: u32,
     /// Count of ACKed items in the current delivery window.
@@ -132,6 +139,7 @@ impl Scheduler {
             refinement_order: std::array::from_fn(|_| VecDeque::new()),
             rtt: Duration::from_millis(20),
             refinement_bandwidth_fraction: 0.2,
+            last_refinement_budget: 0,
             delivery_window_emitted: 0,
             delivery_window_acked: 0,
             low_delivery_rounds: 0,
@@ -689,6 +697,7 @@ impl Scheduler {
     pub fn tick_at(&mut self, budget_bytes: usize, now: Instant) -> Vec<TileWork> {
         let fraction = self.refinement_bandwidth_fraction;
         let mut refinement_budget = (budget_bytes as f32 * fraction) as usize;
+        self.last_refinement_budget = refinement_budget;
         let mut priority_budget = budget_bytes.saturating_sub(refinement_budget);
 
         // Empty-queue repurposing.
@@ -871,6 +880,11 @@ impl Scheduler {
     }
 
     /// Diagnostic accessor: current refinement-bandwidth fraction.
+    /// Refinement budget handed to the most recent `tick_at`.
+    pub fn last_refinement_budget(&self) -> usize {
+        self.last_refinement_budget
+    }
+
     pub fn current_refinement_fraction(&self) -> f32 {
         self.refinement_bandwidth_fraction
     }
