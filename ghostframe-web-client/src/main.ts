@@ -5,7 +5,11 @@ import { attachInputCapture } from './input/wire';
 import { DecodeErrorBatcher } from './decode_error_batcher';
 import { initDiagnostics } from './diagnostics.js';
 import { bootstrap } from './bootstrap.js';
-import { recordProtocolEvent, type Cdf53ErrorCodes } from './cdf53_globals.js';
+import {
+  recordProtocolEvent,
+  CODEC_DISCRIMINANT,
+  type Cdf53ErrorCodes,
+} from './cdf53_globals.js';
 import init, {
   WasmClientCore,
   tileNackEnvelope,
@@ -582,6 +586,28 @@ async function main() {
             sampleBytes = d.bit_planes;
             break;
         }
+
+        // Re-derive the `__ghostframeRecorded*` test globals.
+        //
+        // `diag.recordTile` lost its only caller when finishAssembly was
+        // deleted at the wasm cutover (14aa7d4, 2026-09-11), so
+        // `__ghostframeRecordedCodecs` / `Tiles` / `Flags` have been empty
+        // ever since. Three e2e tests read them and have been failing on
+        // `saw codecs: []` since that day -- the same orphaning that left
+        // `__tileCounts` and `__cdf53Coverage` reporting zeros.
+        //
+        // Fed from the event rather than reimplemented here: recordTile
+        // owns the FIFO cap and populates all three globals consistently.
+        diag.recordTile({
+          seq: ev.frame_seq,
+          tileX: ev.tile_x,
+          tileY: ev.tile_y,
+          codec: CODEC_DISCRIMINANT[d.codec],
+          payloadLen: sampleBytes.byteLength,
+          fbWidth: renderer.framebuffer.width,
+          fbHeight: renderer.framebuffer.height,
+          palRleFlag: d.codec === 'PalRle' ? d.palette_id : undefined,
+        });
 
         if (!firstTileRendered) {
           firstTileRendered = true;
