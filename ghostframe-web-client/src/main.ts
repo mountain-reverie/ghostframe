@@ -369,6 +369,25 @@ async function main() {
   // and hand back RGBA instead — wrong, and it would look like it worked.
   const core = new WasmClientCore(true, renderer.h264Supported, true, nowUs());
 
+  // Per-tile Cdf53 coverage, for e2e assertions.
+  //
+  // The interesting fields are `gave_up` (tiles that exhausted
+  // MAX_TAIL_SWEEP_ATTEMPTS and stopped asking, so they are stranded at a
+  // partial pass set for the rest of the session) and `partial` (tiles still
+  // owed passes). A production-shaped scene that ends with either non-zero
+  // has reproduced the stale-tile symptom; `incomplete` then names the
+  // coordinates and the missing-pass mask.
+  //
+  // Exposed here rather than scraped from the log line so a test asserts on
+  // structured state instead of parsing prose.
+  (window as any).__cdf53CoverageSummary = () => {
+    const summary = core.cdf53Coverage();
+    return {
+      summary,
+      incomplete: core.cdf53IncompleteTiles(16),
+    };
+  };
+
   // The three CDF53 `DecodeErrorCode` discriminants, read from the wasm
   // export rather than hardcoded 8/9/10 — a drifting discriminant should
   // break `recordProtocolEvent`'s classification loudly, not silently stop

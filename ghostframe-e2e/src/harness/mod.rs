@@ -16,6 +16,7 @@ pub mod e2e_setup;
 pub mod fixtures;
 pub mod framebuffer;
 pub mod load_profile;
+pub mod net_shape;
 pub mod pixels;
 pub mod scene;
 pub mod scene_tiles;
