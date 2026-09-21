@@ -1564,21 +1564,46 @@ async fn e2e_multi_tile_grid() -> Result<()> {
     Ok(())
 }
 
-/// The same production-shaped link, plus the loss that drives the retransmit
-/// path.
+/// **A characterisation of overload, not a reproduction of the production
+/// defect.** Named for what it measures after two corrections.
 ///
-/// The lossless variant above passes: 768 tiles, all complete. So if a tile
-/// can be stranded, loss is the likelier trigger -- the production session
-/// showed `rto_fired=6739` against 9208 original passes, i.e. the retransmit
-/// path was heavily active.
+/// Continuously drifting content on a rate-limited link demands far more than
+/// the link can carry: 768 tiles x ~10 passes x 5 fps is ~38,000 passes/s
+/// against roughly 2,500/s of 8 Mbit capacity, i.e. ~15x oversubscribed.
+/// Measured outcome:
 ///
-/// This is the one place where a tile *can* be lost for good: the client
-/// gives up after `MAX_TAIL_SWEEP_ATTEMPTS`, and nothing on either side
-/// undoes that -- the server believes the tile complete (every pass it sent
-/// was ACKed), and on a static screen nothing marks it dirty again. Whether
-/// that is reachable in practice is what this measures.
+///   tiles=768 complete=0 partial=767 gave_up=237
+///   pass-hist{1:529 3:26 4:208 5:5}
+///
+/// Most tiles hold a single pass. 237 exhausted MAX_TAIL_SWEEP_ATTEMPTS and
+/// stopped asking -- and that give-up is permanent: nothing resets
+/// `sweep_attempts` except a pass arriving, the server believes each tile
+/// complete because every pass it *sent* was ACKed, and
+/// `RetransmitCache::cancel_for_tile` has since dropped the cached passes
+/// anyway. So the design gap is real and this scene exhibits it.
+///
+/// What it is NOT is the reported production symptom. That session showed
+/// `dirty_count=0` for minutes -- a *static* screen -- with tiles stale
+/// anyway. Starving a link 15x over is a different failure, and a system
+/// that drops work under that load is behaving reasonably.
+///
+/// # Two corrections this test went through
+///
+/// 1. It first ran `--text-grid` and reported `tiles=0`: text has few enough
+///    colours that the classifier picks PalRle, so no Cdf53 coverage existed
+///    and every assertion passed vacuously. The premise check caught it.
+/// 2. It then reported `gave_up=768` -- every tile -- which looked like a
+///    total stranding. The server log showed why: `mode.decision
+///    from=TileCodec to=H264 reason="cost_comparison"` fired 15 ms after the
+///    last `cdf53.emit`. Cdf53 emission stops by design on that switch and
+///    the coverage map freezes wherever it was, which is indistinguishable
+///    from stranding in the client's view. `GHOSTFRAME_FORCE_TILECODEC=1`
+///    pins the mode, and the assertion below fails loudly if it flips anyway.
+///
+/// Both corrections are why this asserts server-side context, not just
+/// client coverage: a frozen coverage map is ambiguous on its own.
 #[tokio::test(flavor = "multi_thread")]
-async fn e2e_production_shaped_lossy_session_strands_no_tiles() -> Result<()> {
+async fn e2e_saturated_link_starves_tiles_into_giving_up() -> Result<()> {
     use ghostframe_e2e::harness::net_shape::NetShape;
 
     let setup = setup_e2e_webgpu_gpu_with_env(
@@ -1592,6 +1617,9 @@ async fn e2e_production_shaped_lossy_session_strands_no_tiles() -> Result<()> {
         &[
             ("CAPTURE_FPS_DRM_DIRECT", "5"),
             ("GHOSTFRAME_ENABLE_CDF53", "1"),
+            // See the lossless scene: pins the frame mode so a cost-based
+            // H264 switch cannot masquerade as stranded tiles.
+            ("GHOSTFRAME_FORCE_TILECODEC", "1"),
         ],
     )
     .await?;
@@ -1615,6 +1643,41 @@ async fn e2e_production_shaped_lossy_session_strands_no_tiles() -> Result<()> {
         .await?
         .into_value()?;
     eprintln!("coverage: {cov}");
+
+    // Server-side context for whatever the coverage says. Without this a
+    // frozen Cdf53 coverage map is ambiguous: it looks identical whether
+    // passes were owed and never delivered, or the frame mode flipped to
+    // H264 so Cdf53 emission legitimately stopped. The mode decisions and
+    // the emitter's NACK accounting separate those.
+    let logs = helpers::read_server_logs_stripped(&container);
+    let mode_flips: Vec<&str> = logs
+        .lines()
+        .filter(|l| l.contains("mode.decision"))
+        .rev()
+        .take(4)
+        .collect();
+    let emitter_stats = logs
+        .lines()
+        .rev()
+        .find(|l| l.contains("cumulative emit"))
+        .unwrap_or("<no cumulative emit line>");
+    eprintln!("server mode decisions (last 4): {mode_flips:#?}");
+    eprintln!("server emitter stats: {emitter_stats}");
+
+    // A switch out of TileCodec invalidates every Cdf53 assertion below:
+    // emission stops by design and the coverage map freezes wherever it was.
+    // GHOSTFRAME_FORCE_TILECODEC is set to prevent this, so a flip here means
+    // the pin stopped working, not that tiles were stranded.
+    let flipped_to_h264 = logs
+        .lines()
+        .any(|l| l.contains("mode.decision") && l.contains("to=H264"));
+    assert!(
+        !flipped_to_h264,
+        "the frame mode switched to H264 despite GHOSTFRAME_FORCE_TILECODEC=1. \
+         Cdf53 emission stops on that switch and the coverage map freezes \
+         mid-refinement, which looks identical to stranded tiles but is not. \
+         Recent decisions: {mode_flips:#?}"
+    );
 
     let summary = &cov["summary"];
     let tiles = summary["tiles"].as_u64().unwrap_or(0);
@@ -1685,6 +1748,14 @@ async fn e2e_production_shaped_session_strands_no_tiles() -> Result<()> {
         &[
             ("CAPTURE_FPS_DRM_DIRECT", "2"),
             ("GHOSTFRAME_ENABLE_CDF53", "1"),
+            // Pin the frame mode. Without this the classifier may switch to
+            // H264 mid-scene on cost grounds, Cdf53 emission stops, and the
+            // client's Cdf53 coverage freezes mid-refinement -- which reads
+            // as "every tile stranded" while nothing is actually stranded.
+            // Measured: a drifting-photo scene flipped at
+            // reason="cost_comparison" with refinement_deficit_tiles=768,
+            // 15 ms after the last cdf53.emit.
+            ("GHOSTFRAME_FORCE_TILECODEC", "1"),
         ],
     )
     .await?;
