@@ -1735,6 +1735,223 @@ async fn e2e_static_mixed_codecs_converge_on_a_shaped_link() -> Result<()> {
     Ok(())
 }
 
+/// A dialog opening on a settled desktop: one burst of change, then silence.
+///
+/// This is the shape the reported production session had, and the one no
+/// other scene covers. `e2e_static_mixed_codecs_converge_on_a_shaped_link`
+/// never changes (converges in ~22 ms); the saturated scene never stops
+/// changing (starves). The interesting case is in between.
+///
+/// # Why this shape specifically
+///
+/// At a generation bump the two sides do things that only compose safely
+/// while the screen keeps changing:
+///
+/// - The server calls `RetransmitCache::cancel_for_tile`, which drops every
+///   cached pass for that tile across all frame_seqs. A NACK arriving after
+///   the bump therefore cannot be served -- `ReliableTileEmitter::on_nack`
+///   counts `nack_miss` and drops the request on the floor.
+/// - The client gives up on a tile after `MAX_TAIL_SWEEP_ATTEMPTS` sweeps
+///   without progress, and `sweep_attempts` resets only when a pass arrives.
+/// - The server will not send unasked: `refinement_deficit_tiles` is computed
+///   from its own ACK record, and every pass it sent *was* ACKed.
+///
+/// While content keeps changing, the next generation rescues any tile that
+/// got stuck. Once the screen goes still, nothing does. Loss during the burst
+/// is what makes a pass go missing in the first place, so it is applied here.
+///
+/// # What it asserts
+///
+/// That the screen converges *again* after the burst, with nothing stranded.
+/// A failure here is the production symptom: tiles permanently short of
+/// their finest passes on a quiet screen.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_one_burst_then_quiet_leaves_nothing_stranded() -> Result<()> {
+    use ghostframe_e2e::harness::net_shape::NetShape;
+
+    // The burst delay counts from *test-pattern start*, not from client
+    // connect, and the client only attaches ~22 s later once containers,
+    // tsnet and the browser are up. A 45 s setting therefore fired ~23 s
+    // into the session and landed mid-refinement -- which read as the screen
+    // mysteriously regressing (8-9 passes per tile back down to 3-4) until
+    // the server log showed the burst itself was the cause.
+    //
+    // So the delay is generous and the phases below *wait for events* rather
+    // than assume a schedule: converge, then watch for the burst marker, then
+    // converge again. Nothing here depends on how long startup took.
+    let setup = setup_e2e_webgpu_gpu_with_env(
+        // DRM path, not X11: the server captures from DRM, and with no
+        // compositor an X11 repaint after the initial modeset never reaches
+        // scanout. Measured -- a mixed.rs repaint printed its marker and the
+        // server then captured 44 frames without a single dirty tile.
+        "--tile-pattern photo --subtle-drift-once 60000 --drm-direct",
+        &[
+            ("CAPTURE_FPS_DRM_DIRECT", "5"),
+            ("GHOSTFRAME_ENABLE_CDF53", "1"),
+            ("GHOSTFRAME_FORCE_TILECODEC", "1"),
+        ],
+    )
+    .await?;
+
+    let container = setup.server.server_container_name.clone();
+    // Loss is the point: a pass has to go missing during the burst for the
+    // give-up path to be reachable at all.
+    NetShape::tailnet_like_lossy()
+        .apply(&container)
+        .context("apply lossy shaped link")?;
+    let qdisc = NetShape::verify(&container).context("read back qdisc")?;
+    assert!(
+        qdisc.contains("netem") && qdisc.contains("loss"),
+        "lossy netem was not applied to {container}; qdisc reads: {qdisc:?}"
+    );
+    eprintln!("shaped link: {}", qdisc.trim());
+
+    let read_cov = |page: &chromiumoxide::Page| {
+        let page = page.clone();
+        async move {
+            page.evaluate("window.__cdf53CoverageSummary()")
+                .await?
+                .into_value::<serde_json::Value>()
+                .map_err(anyhow::Error::from)
+        }
+    };
+
+    // Phase 1: wait for the pre-burst screen to converge.
+    let mut pre_burst = serde_json::Value::Null;
+    let mut converged_before = false;
+    for _ in 0..1_600 {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let cov = read_cov(setup.page()).await?;
+        let s = &cov["summary"];
+        let tiles = s["tiles"].as_u64().unwrap_or(0);
+        if tiles > 0 && s["complete"].as_u64().unwrap_or(0) == tiles {
+            converged_before = true;
+            pre_burst = cov;
+            break;
+        }
+        pre_burst = cov;
+    }
+    eprintln!("pre-burst coverage: {pre_burst}");
+    // Emission baseline, taken while the screen is converged and quiet. Not
+    // at burst-detection time: the marker poll runs at 1 s and the burst's
+    // whole re-encode completes inside that window, so a baseline sampled
+    // then already includes the work it is supposed to detect (measured:
+    // 15360 before and 15360 after, i.e. both full screens counted).
+    let emits_before = helpers::read_server_logs_stripped(&container)
+        .lines()
+        .filter(|l| l.contains("cdf53.emit"))
+        .count();
+    assert!(
+        converged_before,
+        "the screen never converged before the burst, so the burst did not \
+         land on a settled client and nothing below is about the \
+         burst-then-quiet case. pre-burst: {pre_burst}"
+    );
+
+    // Phase 2: wait for the burst itself, rather than sleeping a guessed
+    // interval. The pattern prints a marker when it fires.
+    //
+    // The emission baseline is counted, never located by the marker's
+    // position. `docker logs` snapshots stdout and stderr separately, so the
+    // marker (pattern stderr) and the emissions (server stdout) do not
+    // reliably interleave in the snapshot even though they do in real time --
+    // a positional check reported "no emissions after the burst" while a
+    // streamed log showed a full 7,680-line re-encode following it.
+    let mut burst_seen = false;
+    for _ in 0..90 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if helpers::read_server_logs_stripped(&container)
+            .lines()
+            .any(|x| x.contains("single burst applied"))
+        {
+            burst_seen = true;
+            break;
+        }
+    }
+    assert!(
+        burst_seen,
+        "the test pattern never reported applying its burst, so this scene \
+         never created the case it claims to test"
+    );
+    eprintln!("burst fired; waiting for the screen to settle again");
+
+    // Phase 3: poll for re-convergence rather than sleeping a fixed interval.
+    // A 20 s sleep reported tiles still owed passes with sweep_attempts=1 --
+    // i.e. the client was actively refining and simply had not finished, which
+    // is a different thing from being stranded. Stop as soon as either
+    // outcome is decided: fully converged, or some tile has given up.
+    let mut reconverged = false;
+    for _ in 0..2_400 {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let cov = read_cov(setup.page()).await?;
+        let sm = &cov["summary"];
+        let tiles = sm["tiles"].as_u64().unwrap_or(0);
+        if tiles > 0 && sm["complete"].as_u64().unwrap_or(0) == tiles {
+            reconverged = true;
+            break;
+        }
+        if sm["gave_up"].as_u64().unwrap_or(0) > 0 {
+            break; // decided the other way; assertions below report it
+        }
+    }
+    eprintln!("post-burst reconverged={reconverged}");
+
+    let logs = helpers::read_server_logs_stripped(&container);
+    let flipped_to_h264 = logs
+        .lines()
+        .any(|l| l.contains("mode.decision") && l.contains("to=H264"));
+    assert!(
+        !flipped_to_h264,
+        "the frame mode switched to H264 despite GHOSTFRAME_FORCE_TILECODEC=1; \
+         Cdf53 emission stops on that switch and the coverage map freezes, \
+         which is indistinguishable from stranding"
+    );
+
+    // Premise: the burst must have produced new work. Counted, not located.
+    let emits_now = logs.lines().filter(|l| l.contains("cdf53.emit")).count();
+    let emits_after_burst = emits_now.saturating_sub(emits_before);
+    assert!(
+        emits_after_burst > 0,
+        "the burst fired but the server emitted no further Cdf53 passes \
+         ({emits_before} while quiet, {emits_now} now), so the screen never \
+         changed as far as the server is concerned"
+    );
+    eprintln!("cdf53 emissions after the burst: {emits_after_burst}");
+
+    let post = read_cov(setup.page()).await?;
+    eprintln!("post-burst coverage: {post}");
+    let s = &post["summary"];
+    let tiles = s["tiles"].as_u64().unwrap_or(0);
+    let complete = s["complete"].as_u64().unwrap_or(0);
+    let partial = s["partial"].as_u64().unwrap_or(0);
+    let gave_up = s["gave_up"].as_u64().unwrap_or(0);
+
+    assert!(
+        tiles >= 16,
+        "only {tiles} tiles have Cdf53 coverage; too few to conclude \
+         anything. post-burst: {post}"
+    );
+
+    assert_eq!(
+        gave_up, 0,
+        "{gave_up} of {tiles} tiles stopped asking for passes they never \
+         received, on a screen that has been quiet for ~20 s. Each is \
+         stranded short of its finest passes and will render wrong for the \
+         rest of the session -- the reported production symptom. Stuck \
+         tiles: {}",
+        post["incomplete"]
+    );
+    assert_eq!(
+        partial, 0,
+        "{partial} of {tiles} tiles are still owed passes ({complete} \
+         complete) on a quiet screen. Outstanding: {}",
+        post["incomplete"]
+    );
+
+    NetShape::clear(&container).ok();
+    Ok(())
+}
+
 /// **A characterisation of overload, not a reproduction of the production
 /// defect.** Named for what it measures after two corrections.
 ///

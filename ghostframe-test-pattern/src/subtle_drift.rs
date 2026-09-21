@@ -15,6 +15,24 @@ pub fn run(
     class_name: &str,
     drift_ms: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    run_inner(card_path, class_name, drift_ms, false)
+}
+
+/// Shift exactly once after `delay_ms`, then leave the screen alone forever.
+pub fn run_once(
+    card_path: &str,
+    class_name: &str,
+    delay_ms: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_inner(card_path, class_name, delay_ms, true)
+}
+
+fn run_inner(
+    card_path: &str,
+    class_name: &str,
+    drift_ms: u64,
+    once: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     if drift_ms == 0 {
         // 0 ⇒ disable drift, fall through to the existing static behavior.
         return tile_pattern::run(card_path, class_name);
@@ -46,6 +64,17 @@ pub fn run(
         msync_buffer(bytes);
     }
 
+    // `drift_ms` with `once` set means: wait, shift exactly once, then stop
+    // touching the buffer. That is the "a dialog opened on a settled desktop"
+    // shape -- one burst of dirty tiles followed by silence -- which neither
+    // a never-changing screen nor a never-stopping drift can produce.
+    //
+    // It has to happen on the DRM path rather than via X11. The e2e server
+    // captures from DRM, and with no compositor and a non-flipping driver,
+    // X rendering after the initial modeset never reaches scanout: a mixed.rs
+    // repaint fires, prints its marker, and the server captures 44 further
+    // frames without ever seeing a dirty tile. Writing the dumb buffer
+    // directly is what the capture actually reads.
     // Drift loop: shift bytes left by 4 (one BGRX pixel) per row, wrapping
     // the leftmost pixel to the right edge. msync each frame.
     loop {
@@ -68,5 +97,14 @@ pub fn run(
             bytes[start + row_bytes - 4..start + row_bytes].copy_from_slice(&leftmost);
         }
         msync_buffer(bytes);
+
+        if once {
+            eprintln!(
+                "subtle-drift: single burst applied, screen is now quiet for good"
+            );
+            loop {
+                std::thread::sleep(Duration::from_secs(3600));
+            }
+        }
     }
 }
