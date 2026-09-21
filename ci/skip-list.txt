@@ -94,17 +94,20 @@ e2e_edge_tiles_firefox
 # locally on dev boxes where a real GPU is present.
 e2e_input_forwarding_firefox
 
-# KNOWN-FAILING REPRODUCTION, not a flake. Skipped in CI only so the suite
-# stays green; it must keep failing locally, because failing is its job.
+# KNOWN-FAILING CHARACTERISATION, not a flake and not a production
+# reproduction. Skipped in CI only so the suite stays green; it must keep
+# failing locally, because failing is its job.
 #
-# Reproduces a real production defect: under content churn (generation bumps
-# while passes are in flight) plus 1% loss on a production-shaped link, every
-# tile on screen ends up stranded --
-#   tiles=768 complete=0 partial=762 gave_up=768
-# with the stranded tiles missing passes {12, 13}, the two finest bit-planes.
-# That is "text that never sharpens", and it is permanent: the client gives
-# up after MAX_TAIL_SWEEP_ATTEMPTS and nothing on either side undoes it.
+# Drives a rate-limited link ~15x past capacity (768 tiles x ~10 passes x
+# 5 fps vs ~2,500 passes/s of 8 Mbit) and measures what happens:
+#   tiles=768 complete=0 partial=767 gave_up=237
+# 237 tiles exhaust MAX_TAIL_SWEEP_ATTEMPTS and stop asking, permanently --
+# nothing resets sweep_attempts except a pass arriving, and the server
+# believes each tile complete because every pass it sent was ACKed.
 #
-# Delete this entry once a recovery path lands; the test is the acceptance
-# gate for that fix.
-e2e_production_shaped_lossy_session_strands_no_tiles
+# The give-up-with-no-recovery gap is real. Starving a link 15x over is NOT
+# the reported production symptom, which was a static screen (dirty_count=0
+# for minutes) with tiles stale anyway. Do not read this as that bug.
+#
+# Delete this entry once a recovery path lands; it is that fix's gate.
+e2e_saturated_link_starves_tiles_into_giving_up
