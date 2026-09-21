@@ -2135,6 +2135,7 @@ impl IoBridge {
                 self.tick_budget_multiplier = (self.tick_budget_multiplier * SCHEDULER_BUDGET_RAMP)
                     .min(SCHEDULER_BUDGET_MULT_MAX);
             }
+            let quinn_space_diag = self.min_session_send_buffer_space();
             // `refinement_fraction` and the two queue depths are here
             // because their absence made a real defect unreadable: a drain
             // moving 5 KB against a 256 KB base budget looks like the budget
@@ -2144,7 +2145,9 @@ impl IoBridge {
             // fields the log shows the symptom (tiny drains) and hides both
             // the cause (the fraction) and the consequence (the backlog).
             tracing::debug!(
+                quinn_send_buffer_space = quinn_space_diag,
                 refinement_fraction = self.scheduler.current_refinement_fraction(),
+                refinement_budget_bytes = self.scheduler.last_refinement_budget(),
                 refinement_queue_len = self.scheduler.refinement_queue_len(),
                 priority_queue_len = self.scheduler.queue_len(),
                 drained_count = drained_count,
