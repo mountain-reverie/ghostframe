@@ -3736,16 +3736,53 @@ async fn e2e_cdf53_tile_watcher() -> Result<()> {
     // wrong work — a real client-side optimization opportunity but
     // not a correctness regression.
     //
-    // Assert on the SET of pass_idxes covered instead: every
-    // pass_idx 0..13 must be observed at least once.
-    for (p, &n) in counted_per_pass.iter().enumerate() {
-        assert!(
-            n >= 1,
-            "no capture observed for pass_idx {p} — server didn't emit \
-             this pass, or every emission + retransmit was lost before \
-             reaching the GPU integrate path"
-        );
-    }
+    // Assert on the SET of pass_idxes covered instead.
+    //
+    // NOT "every pass_idx 0..13": sparse encoding
+    // (`cdf53::encode_passes_sparse`) omits bit-planes that are entirely
+    // zero across all three channels, so a tile's pass set is a subset of
+    // 14 and is content-dependent. Measured on every `ContentClass`
+    // fixture, passes 1..4 are empty and never sent; the typical real set
+    // is {0, 5..13} or {0, 6..13}. Demanding pass 1 asserted a dense wire
+    // format the server stopped producing.
+    //
+    // What must hold regardless of content: pass 0 is always present (it
+    // carries the `present_passes` bitmap), the observed set must be
+    // contiguous from its lowest member to 13 (the encoder skips a
+    // *prefix* of high-order planes, not holes in the middle), and every
+    // pass that WAS observed must have arrived intact -- which is what
+    // `total_mismatches` covers below.
+    let observed: Vec<usize> = counted_per_pass
+        .iter()
+        .enumerate()
+        .filter(|(_, &n)| n >= 1)
+        .map(|(p, _)| p)
+        .collect();
+    assert!(
+        counted_per_pass[0] >= 1,
+        "pass 0 was never captured. It carries the present_passes bitmap and \
+         is always emitted, so its absence means emissions never reached the \
+         GPU integrate path at all. observed={observed:?}"
+    );
+    // The lowest *magnitude* pass, i.e. the smallest observed member above
+    // pass 0. Pass 0 is the sign plane and always present, so it is not the
+    // anchor for the contiguous run -- using it would demand passes 1..=13
+    // and re-assert the dense format. Measured here on real hardware:
+    // {0, 5..=13}, matching what encode_passes_sparse produces for every
+    // ContentClass fixture.
+    let lowest_magnitude = observed
+        .iter()
+        .copied()
+        .find(|&p| p > 0)
+        .expect("a Cdf53 tile carries at least one magnitude pass");
+    let expected: Vec<usize> = std::iter::once(0).chain(lowest_magnitude..=13).collect();
+    assert_eq!(
+        observed, expected,
+        "the captured pass set is not a contiguous suffix of 0..=13 anchored \
+         at pass 0. Sparse encoding skips a prefix of empty high-order \
+         planes, so a hole in the middle means a pass was emitted and lost \
+         before reaching the GPU, not skipped by the encoder."
+    );
     assert_eq!(
         total_mismatches, 0,
         "JS→GPU bit-plane handoff diverges from CPU `extract_bit_plane(forward(gradient))` — \

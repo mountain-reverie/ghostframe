@@ -85,7 +85,7 @@ const MAX_H5_LOG = 32768;
  * `Codec` enum), keyed by the `TileData`/`ProtocolTileData` tag. Used only
  * to keep `__h5_tilePushLog`'s `codec` field numeric, matching its
  * pre-cutover shape and `globals.d.ts`'s ambient declaration. */
-const CODEC_DISCRIMINANT: Record<ProtocolTileData['codec'], number> = {
+export const CODEC_DISCRIMINANT: Record<ProtocolTileData['codec'], number> = {
   Raw: 4,
   Solid: 3,
   PalRle: 2,
