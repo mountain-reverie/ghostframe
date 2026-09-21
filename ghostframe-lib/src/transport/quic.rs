@@ -33,6 +33,80 @@ pub struct QuicServer {
     pub(crate) cert_info: CertInfo,
 }
 
+/// Bytes of un-ACKed datagrams quinn will hold before `send_datagram`
+/// returns `Blocked`.
+///
+/// # Why not the 16 MB this used to be
+///
+/// A send buffer is a queue, and a queue on a slow link is latency. 16 MB
+/// drained at the ~1 MB/s a real session gets is up to **16 seconds** of
+/// datagrams committed before any backpressure appears. Measured at
+/// production scale over 291 scheduler ticks: 6.71 MB peak buffered, i.e.
+/// ~6.7 s of queueing before a byte reached the wire. Production reported
+/// `queued_critical_latency_max_us=16,844,729` -- 16.8 s -- which is the
+/// same effect on a fuller buffer and a slower link.
+///
+/// A refinement pass that arrives 6 seconds late is usually worthless: the
+/// tile may have been superseded twice over, and the client has spent that
+/// time NACKing for it.
+///
+/// # Why 16 MB was chosen, and why shrinking is safe now
+///
+/// It was a deliberate stopgap. A 2 MB cap predated the cdf53 refinement
+/// queue, so a first-frame burst (2040 tiles x ~14 passes) saturated the
+/// buffer and quinn *rejected the tail*, losing ~70% of tiles; the comment
+/// that set 16 MB called a rate-paced scheduler the real fix.
+///
+/// That fix has since landed. Every drain is now clamped to
+/// `QUINN_SEND_BUFFER_SAFETY_FRACTION * send_buffer_space()`
+/// (`io_bridge.rs`), so the scheduler cannot over-pop into a full buffer and
+/// cannot lose already-popped work to a rejection. With the clamp in place a
+/// smaller buffer does not drop tiles -- it leaves them queued one layer up,
+/// in the scheduler.
+///
+/// That is the right layer. The scheduler can supersede a stale generation,
+/// reprioritise by pass, and drop work that no longer matters. quinn's
+/// datagram queue is an opaque FIFO that can do none of those: a superseded
+/// pass sitting in it is still transmitted, still ACKed, and still counted.
+///
+/// # Why the default is still 16 MB
+///
+/// Shrinking it to 256 KiB was tried and **measured**, and it does fix the
+/// bufferbloat: peak buffered fell from 6.71 MB (~6.7 s) to 256 KB (~0.25 s).
+/// It also broke delivery outright, at production scale with 1% loss:
+///
+/// | | 256 KiB | 16 MiB |
+/// |---|---|---|
+/// | emitted_cdf53 | 4,506 | 40,800 |
+/// | send_datagram_errs_total | **15,944** | 0 |
+/// | rto_fired | 14,301 | - |
+/// | client coverage | complete=0, gave_up=2034 | complete=2040 |
+///
+/// The scheduler's `0.8 * send_buffer_space()` clamp covers scheduler
+/// drains, but **not the retransmit path**: `RTO_RETRANSMITS_PER_TICK` is
+/// documented as "sized to comfortably fit in quinn's datagram_send_buffer",
+/// and that sizing assumed 16 MB. Against a small buffer the RTO sweep
+/// overruns it, `Blocked` discards work the emitter already popped, the
+/// missing passes provoke more RTO, and the buffer stays pinned full --
+/// observed at `quinn_send_buffer_space=61` with `drained_count=0` and
+/// 15,894 passes queued behind it.
+///
+/// So 16 MB is not a considered size, it is a workaround masking an
+/// unclamped retransmit path. Shrinking it is the right direction and wants
+/// that path clamped first; until then the large buffer is the safer
+/// behaviour, and this stays a knob rather than a regression.
+///
+/// `GHOSTFRAME_DATAGRAM_SEND_BUFFER_BYTES` overrides it, so the experiment
+/// above can be repeated without a rebuild.
+fn datagram_send_buffer_bytes() -> usize {
+    const DEFAULT: usize = 16 * 1024 * 1024;
+    std::env::var("GHOSTFRAME_DATAGRAM_SEND_BUFFER_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT)
+}
+
 impl QuicServer {
     /// Construct a new `QuicServer` with a freshly-generated self-signed cert.
     ///
@@ -88,22 +162,7 @@ impl QuicServer {
         // `datagram_receive_buffer_size` takes `Option<usize>`.
         transport_config.datagram_receive_buffer_size(Some(65536));
         // `datagram_send_buffer_size` takes `usize` (not Option) in quinn-proto 0.11.
-        //
-        // Sized for the worst-case first-frame cdf53 burst: 2040 dirty tiles ×
-        // 14 progressive passes × ~500 B mean payload ≈ 14 MB. The previous
-        // 2 MB cap was set for a raw-codec frame and pre-dated the cdf53
-        // refinement queue, so cdf53 emissions saturated the buffer at
-        // session start and the tail of the burst was rejected (visible as
-        // a ~70 % drop in tiles reaching the client even after we flipped
-        // quinn-proto's silent-drop-oldest behaviour off in `send_datagram`).
-        //
-        // 16 MB worth of pending datagrams is well below any realistic
-        // memory ceiling, the cost is only paid when emission outruns
-        // drain, and it buys us enough headroom to absorb the entire first
-        // frame's cdf53 burst until cwnd ramps. A proper rate-paced
-        // scheduler is the longer-term fix — this just gets cdf53
-        // first-frame quality usable in the meantime.
-        transport_config.datagram_send_buffer_size(16 * 1024 * 1024);
+        transport_config.datagram_send_buffer_size(datagram_send_buffer_bytes());
 
         // --- 6. ServerConfig ---
         let mut server_config = ServerConfig::with_crypto(Arc::new(quic_tls));
@@ -301,5 +360,52 @@ mod tests {
         let cert = params.self_signed(&key_pair).unwrap();
         std::fs::write("/tmp/test_cert.der", cert.der()).unwrap();
         println!("Cert written to /tmp/test_cert.der");
+    }
+}
+
+#[cfg(test)]
+mod datagram_buffer_tests {
+    use super::datagram_send_buffer_bytes;
+
+    /// Serialises the three tests below, which mutate one process-global env
+    /// var. Local rather than shared because no other test reads
+    /// `GHOSTFRAME_DATAGRAM_SEND_BUFFER_BYTES`; a test that starts to must
+    /// take this lock too, or the two will race under parallel `cargo test`.
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn defaults_to_16_mib() {
+        let _g = lock_env();
+        std::env::remove_var("GHOSTFRAME_DATAGRAM_SEND_BUFFER_BYTES");
+        assert_eq!(datagram_send_buffer_bytes(), 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn env_override_is_honoured() {
+        let _g = lock_env();
+        std::env::set_var("GHOSTFRAME_DATAGRAM_SEND_BUFFER_BYTES", "1048576");
+        assert_eq!(datagram_send_buffer_bytes(), 1024 * 1024);
+        std::env::remove_var("GHOSTFRAME_DATAGRAM_SEND_BUFFER_BYTES");
+    }
+
+    #[test]
+    fn nonsense_values_fall_back_rather_than_producing_a_zero_buffer() {
+        // A zero-byte send buffer rejects every datagram, which would look
+        // like total packet loss rather than a bad config value.
+        let _g = lock_env();
+        for bad in ["0", "-1", "lots", ""] {
+            std::env::set_var("GHOSTFRAME_DATAGRAM_SEND_BUFFER_BYTES", bad);
+            assert_eq!(
+                datagram_send_buffer_bytes(),
+                16 * 1024 * 1024,
+                "{bad:?} should fall back to the default"
+            );
+        }
+        std::env::remove_var("GHOSTFRAME_DATAGRAM_SEND_BUFFER_BYTES");
     }
 }
