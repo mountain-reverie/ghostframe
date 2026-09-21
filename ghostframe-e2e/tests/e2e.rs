@@ -1564,6 +1564,194 @@ async fn e2e_multi_tile_grid() -> Result<()> {
     Ok(())
 }
 
+/// The same production-shaped link, plus the loss that drives the retransmit
+/// path.
+///
+/// The lossless variant above passes: 768 tiles, all complete. So if a tile
+/// can be stranded, loss is the likelier trigger -- the production session
+/// showed `rto_fired=6739` against 9208 original passes, i.e. the retransmit
+/// path was heavily active.
+///
+/// This is the one place where a tile *can* be lost for good: the client
+/// gives up after `MAX_TAIL_SWEEP_ATTEMPTS`, and nothing on either side
+/// undoes that -- the server believes the tile complete (every pass it sent
+/// was ACKed), and on a static screen nothing marks it dirty again. Whether
+/// that is reachable in practice is what this measures.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_production_shaped_lossy_session_strands_no_tiles() -> Result<()> {
+    use ghostframe_e2e::harness::net_shape::NetShape;
+
+    let setup = setup_e2e_webgpu_gpu_with_env(
+        // Drifting content, not a static screen: the bitmap shifts every
+        // 250 ms, so tiles are re-encoded at new generations while earlier
+        // passes are still in flight. A static screen cannot produce the
+        // supersede churn a live desktop does, and the lossless/static
+        // variants above already show a static screen converges cleanly
+        // even at 2 Mbit with 8% loss.
+        "--tile-pattern photo --subtle-drift 250 --drm-direct",
+        &[
+            ("CAPTURE_FPS_DRM_DIRECT", "5"),
+            ("GHOSTFRAME_ENABLE_CDF53", "1"),
+        ],
+    )
+    .await?;
+
+    let container = setup.server.server_container_name.clone();
+    NetShape::tailnet_like_lossy()
+        .apply(&container)
+        .context("apply lossy production-like shape")?;
+    let qdisc = NetShape::verify(&container).context("read back qdisc")?;
+    assert!(
+        qdisc.contains("netem") && qdisc.contains("loss"),
+        "lossy netem was not applied to {container}; qdisc reads: {qdisc:?}"
+    );
+    eprintln!("shaped link: {}", qdisc.trim());
+
+    tokio::time::sleep(Duration::from_secs(25)).await;
+
+    let cov: serde_json::Value = setup
+        .page()
+        .evaluate("window.__cdf53CoverageSummary()")
+        .await?
+        .into_value()?;
+    eprintln!("coverage: {cov}");
+
+    let summary = &cov["summary"];
+    let tiles = summary["tiles"].as_u64().unwrap_or(0);
+    let gave_up = summary["gave_up"].as_u64().unwrap_or(0);
+    let partial = summary["partial"].as_u64().unwrap_or(0);
+
+    assert!(
+        tiles >= 64,
+        "only {tiles} tiles have coverage state; scene too small to conclude \
+         anything. coverage={cov}"
+    );
+    assert_eq!(
+        gave_up, 0,
+        "{gave_up} of {tiles} tiles stopped asking for passes they never \
+         received, under loss. Each is stranded for the rest of the session. \
+         Stuck tiles: {}",
+        cov["incomplete"]
+    );
+    assert_eq!(
+        partial, 0,
+        "{partial} of {tiles} tiles still owed passes after 25 s. \
+         Outstanding: {}",
+        cov["incomplete"]
+    );
+
+    NetShape::clear(&container).ok();
+    Ok(())
+}
+
+/// A production-shaped session: real browser, real GPU, real QUIC, over a
+/// link shaped like the one a real client sits behind.
+///
+/// # What this covers that nothing else did
+///
+/// The browserless harness shapes the network but has no browser and no GPU,
+/// and its token bucket sits *below* quinn's send buffer so it cannot apply
+/// backpressure. The browser e2e has the browser and the GPU but no shaping
+/// at all -- ~0 RTT over a loopback bridge, which is nothing like a tailnet
+/// path. Neither reproduces the conditions a struggling session actually
+/// runs under.
+///
+/// `NetShape` closes that: `tc netem` on the server container's egress,
+/// below tsnet and below quinn, so delay and rate limiting produce genuine
+/// send-buffer backpressure -- the mechanism that drives
+/// `Event::DatagramsUnblocked` and therefore the whole drain cadence.
+///
+/// # The assertion
+///
+/// Not pixels. `gave_up` counts tiles that exhausted
+/// `MAX_TAIL_SWEEP_ATTEMPTS` and stopped asking for passes they never
+/// received; such a tile is stranded at a partial pass set for the rest of
+/// the session and renders wrong forever. That is the stale-tile symptom
+/// reported from production, stated as a number rather than as a
+/// screenshot.
+///
+/// `--gradient` because the classifier routes it to Cdf53 across the whole
+/// screen, which is the shape of the production first frame (2040 tiles, all
+/// dirty, ~9200 passes enqueued at once). `--text-grid` was tried first and
+/// produced `tiles=0`: text has few enough colours that the classifier picks
+/// PalRle, so no Cdf53 coverage state exists and every assertion below would
+/// have passed vacuously. The premise check caught it.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_production_shaped_session_strands_no_tiles() -> Result<()> {
+    use ghostframe_e2e::harness::net_shape::NetShape;
+
+    let setup = setup_e2e_webgpu_gpu_with_env(
+        "--gradient --drm-direct",
+        &[
+            ("CAPTURE_FPS_DRM_DIRECT", "2"),
+            ("GHOSTFRAME_ENABLE_CDF53", "1"),
+        ],
+    )
+    .await?;
+
+    let container = setup.server.server_container_name.clone();
+    let shape = NetShape::tailnet_like();
+    shape
+        .apply(&container)
+        .context("apply production-like network shape")?;
+
+    // Premise: prove the shaping is actually in place. An unshaped run would
+    // report the absence of a problem it never created -- the exact way a
+    // scene passes vacuously.
+    let qdisc = NetShape::verify(&container).context("read back qdisc")?;
+    assert!(
+        qdisc.contains("netem"),
+        "netem was not applied to {container}; qdisc reads: {qdisc:?}"
+    );
+    eprintln!("shaped link: {}", qdisc.trim());
+
+    // Long enough for the first-frame burst to drain over a rate-limited
+    // link and for the client's tail sweep (500 ms interval, 6 attempts) to
+    // have given up on anything it was never going to get.
+    tokio::time::sleep(Duration::from_secs(25)).await;
+
+    let cov: serde_json::Value = setup
+        .page()
+        .evaluate("window.__cdf53CoverageSummary()")
+        .await?
+        .into_value()?;
+    eprintln!("coverage: {cov}");
+
+    let summary = &cov["summary"];
+    let tiles = summary["tiles"].as_u64().unwrap_or(0);
+    let complete = summary["complete"].as_u64().unwrap_or(0);
+    let partial = summary["partial"].as_u64().unwrap_or(0);
+    let gave_up = summary["gave_up"].as_u64().unwrap_or(0);
+
+    // Premise: the scene must have decoded a real screenful of Cdf53 tiles,
+    // or "no stranded tiles" is trivially true.
+    assert!(
+        tiles >= 64,
+        "only {tiles} tiles have coverage state; this scene did not exercise \
+         Cdf53 broadly enough for the assertions below to mean anything. \
+         coverage={cov}"
+    );
+
+    assert_eq!(
+        gave_up, 0,
+        "{gave_up} of {tiles} tiles exhausted their tail-sweep budget and \
+         stopped asking for passes they never received. Each is stranded at \
+         a partial pass set and will render wrong for the rest of the \
+         session -- the stale-tile symptom. Stuck tiles: {}",
+        cov["incomplete"]
+    );
+
+    assert_eq!(
+        partial, 0,
+        "{partial} of {tiles} tiles are still missing passes after 25 s on a \
+         link with headroom ({complete} complete). Outstanding: {}",
+        cov["incomplete"]
+    );
+
+    NetShape::clear(&container).ok();
+    Ok(())
+}
+
 /// Pre-M3: validate text legibility via per-pixel contrast at known glyph
 /// positions. Post-M3 (CDF 5/3 refinement) this test should be tightened
 /// to assert SSIM > 0.99 against a reference PNG; see TODO below.
