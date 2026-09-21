@@ -43,6 +43,24 @@ struct Args {
     #[arg(long)]
     mixed_static: bool,
 
+    /// Like --mixed-static, but changes the screen ONCE after this many
+    /// milliseconds and then goes quiet for good. Models a dialog opening on
+    /// a settled desktop -- a single burst of dirty tiles followed by
+    /// silence, which is the one shape neither --mixed-static (never
+    /// changes) nor --subtle-drift (never stops) covers.
+    #[arg(long)]
+    mixed_static_repaint_ms: Option<u64>,
+
+    /// With --drm-direct and --tile-pattern: paint, wait this many
+    /// milliseconds, shift the bitmap ONCE, then leave the screen alone
+    /// forever. Models a dialog opening on a settled desktop.
+    ///
+    /// Must be the DRM path: the e2e server captures from DRM, and with no
+    /// compositor an X11 repaint after the initial modeset never reaches
+    /// scanout, so the change is invisible to capture.
+    #[arg(long)]
+    subtle_drift_once: Option<u64>,
+
     /// Cycle between static and motion content every `SECS` seconds (so the
     /// full cycle is `2 * SECS`). Drives `e2e_mode_switch` to verify the
     /// classifier flips between H264 and TileCodec modes.
@@ -154,6 +172,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // dirty events for the classifier (M3.7a bench).
     if args.drm_direct {
         if let Some(ref class_name) = args.tile_pattern {
+            if let Some(delay_ms) = args.subtle_drift_once {
+                return ghostframe_test_pattern::subtle_drift::run_once(
+                    &args.drm_device,
+                    class_name,
+                    delay_ms,
+                );
+            }
             if let Some(drift_ms) = args.subtle_drift {
                 return ghostframe_test_pattern::subtle_drift::run(
                     &args.drm_device,
@@ -195,6 +220,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(secs) = args.mode_switch_cycle {
         let half = std::time::Duration::from_secs(secs);
         return ghostframe_test_pattern::mode_switch::run(&conn, root, half);
+    }
+
+    if let Some(ms) = args.mixed_static_repaint_ms {
+        return mixed::render_static_then_repaint(
+            &conn,
+            root,
+            std::time::Duration::from_millis(ms),
+        );
     }
 
     if args.mixed_static {

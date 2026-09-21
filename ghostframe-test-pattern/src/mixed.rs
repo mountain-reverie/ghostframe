@@ -104,6 +104,93 @@ pub fn render_static_only<C: Connection>(
     }
 }
 
+/// Paint the static screen, let it settle, then change it **once** and go
+/// quiet again.
+///
+/// This is the shape a real desktop actually has, and the one no other scene
+/// covers: a dialog opens on a settled screen. `--mixed-static` never
+/// changes, and `--subtle-drift` never stops -- the interesting case is a
+/// single burst of dirty tiles followed by silence.
+///
+/// It matters because of what the two sides do at a generation bump. The
+/// server calls `RetransmitCache::cancel_for_tile`, which drops every cached
+/// pass for that tile across all frame_seqs, so a NACK arriving after the
+/// bump can never be served (`nack_miss`, and the emitter drops it on the
+/// floor). The client, meanwhile, gives up on a tile after
+/// `MAX_TAIL_SWEEP_ATTEMPTS` sweeps without progress, and nothing resets that
+/// except a pass arriving. On a screen that keeps changing, the next
+/// generation rescues the tile. On one that goes still, nothing does.
+///
+/// `repaint_after` is how long to wait before the burst -- long enough for
+/// the first screen to have fully converged.
+pub fn render_static_then_repaint<C: Connection>(
+    conn: &C,
+    root: u32,
+    repaint_after: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    paint_static(conn, root)?;
+    eprintln!("test-pattern: mixed-static painted; repaint in {repaint_after:?}");
+    std::thread::sleep(repaint_after);
+
+    // The burst: a filled rectangle straddling all three static regions, so
+    // every codec's tiles are dirtied at once -- the way a dialog opening
+    // does not respect content boundaries.
+    let dialog = Region {
+        name: "dialog",
+        x: 160,
+        y: 120,
+        w: 320,
+        h: 240,
+        expected_codec: "PalRle",
+    };
+    paint_dialog(conn, root, &dialog)?;
+    conn.flush()?;
+    eprintln!("test-pattern: repaint burst done, screen is now quiet for good");
+
+    loop {
+        std::thread::sleep(Duration::from_secs(3600));
+    }
+}
+
+/// A flat panel with a few text-like bars: few enough colours to look like
+/// UI chrome, large enough to dirty tiles across every region.
+fn paint_dialog<C: Connection>(
+    conn: &C,
+    root: u32,
+    r: &Region,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let gc = conn.generate_id()?;
+    conn.create_gc(gc, root, &CreateGCAux::new().foreground(0x0020_2830))?;
+    conn.poly_fill_rectangle(
+        root,
+        gc,
+        &[Rectangle {
+            x: r.x as i16,
+            y: r.y as i16,
+            width: r.w as u16,
+            height: r.h as u16,
+        }],
+    )?;
+    // A handful of lighter bars standing in for rows of text.
+    conn.change_gc(gc, &ChangeGCAux::new().foreground(0x00C8_D0D8))?;
+    let mut row = r.y + 24;
+    while row + 8 < r.y + r.h {
+        conn.poly_fill_rectangle(
+            root,
+            gc,
+            &[Rectangle {
+                x: (r.x + 16) as i16,
+                y: row as i16,
+                width: (r.w - 32) as u16,
+                height: 8,
+            }],
+        )?;
+        row += 32;
+    }
+    conn.free_gc(gc)?;
+    Ok(())
+}
+
 fn paint_static<C: Connection>(conn: &C, root: u32) -> Result<(), Box<dyn std::error::Error>> {
     paint_solid(conn, root, region("solid"))?;
     paint_text(conn, root, region("text"))?;
