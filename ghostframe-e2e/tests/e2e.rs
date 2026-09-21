@@ -1634,7 +1634,16 @@ async fn e2e_static_mixed_codecs_converge_on_a_shaped_link() -> Result<()> {
         let complete = s["complete"].as_u64().unwrap_or(0);
         last_cov = cov;
         if tiles > 0 && complete == tiles {
-            settled_after = Some(started.elapsed());
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "this test runs on the real clock (multi_thread, no \
+                          start_paused) and is measuring genuine wall-clock \
+                          convergence; the assertion below refuses a zero \
+                          reading, so a future switch to a paused clock \
+                          fails loudly instead of silently reporting 0ns"
+            )]
+            let elapsed = started.elapsed();
+            settled_after = Some(elapsed);
             break;
         }
     }
@@ -1682,6 +1691,17 @@ async fn e2e_static_mixed_codecs_converge_on_a_shaped_link() -> Result<()> {
             last_cov["incomplete"]
         )
     })?;
+
+    // A zero reading means the clock saturated rather than that the screen
+    // converged instantly -- the exact failure `clippy::disallowed_methods`
+    // warns about for `Instant::elapsed` against a virtual clock. Refuse it
+    // rather than report "settled in 0ns".
+    assert!(
+        settled > Duration::ZERO,
+        "measured a zero settle time, which means the clock is not advancing \
+         (a paused tokio clock saturates Instant::elapsed to 0ns), not that \
+         the screen converged instantly"
+    );
 
     // (3) Nothing stranded.
     assert_eq!(
