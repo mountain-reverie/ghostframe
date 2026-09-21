@@ -4610,13 +4610,24 @@ impl IoBridge {
                     );
                 }
 
-                // Diagnostic: pre-dispatch announce. Uses the module default
-                // target so we ride the same env_filter rule the existing
-                // "dirty tile detection complete" debug log lives under —
-                // the `ghostframe::diag` target wasn't appearing in journal
-                // under the daemon's default `ghostframe=debug,info` filter
-                // for reasons that don't matter for this diagnostic.
-                tracing::info!(
+                // Diagnostic: pre-dispatch announce.
+                //
+                // DEBUG, not INFO. This fires once per captured frame -- ~29
+                // times a second, forever, including on a screen with nothing
+                // dirty and nothing to send. Paired with "dispatch returned"
+                // below it was two of the six log lines a live idle session
+                // wrote per frame (~207 lines/second measured), each costing
+                // formatting plus a journald write, and contributing to the
+                // RateLimitBurst exhaustion that silently swallowed 23232
+                // messages during a first-frame burst.
+                //
+                // Nothing consumes these two lines: the bench harness parses
+                // `frame.captured` / `frame.last_send` (still INFO), and the
+                // only other reference is a code comment. The per-frame
+                // aggregate a reader actually wants -- codec counts and wire
+                // bytes -- is on the `cumulative emit` line, which stays INFO
+                // and fires once every 30 frames.
+                tracing::debug!(
                     frame_seq = seq,
                     dirty_tiles = dirty_xy.len(),
                     priority_queue_len = self.scheduler.queue_len(),
@@ -4650,7 +4661,7 @@ impl IoBridge {
                 // stats log block is silencing execution. If neither fires,
                 // dispatch_dirty_tiles_via_scheduler is panicking/returning
                 // through an unwind.
-                tracing::info!(
+                tracing::debug!(
                     frame_seq = seq,
                     dispatched_tiles = stats.tile_count,
                     wire_bytes = stats.total_wire_bytes,

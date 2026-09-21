@@ -65,8 +65,20 @@ fn wait_for_x11(timeout: Duration) -> Result<(), String> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let log_format = std::env::var("GHOSTFRAME_LOG_FORMAT").unwrap_or_else(|_| "text".into());
+    // Default to INFO, not DEBUG. `ghostframe=debug` as a *default* means a
+    // deployed daemon writes every DEBUG line forever: measured on a live
+    // session at ~207 lines/second on a screen with nothing to send, six per
+    // captured frame at ~29 fps (two INFO dispatch lines, two bench lines,
+    // plus DEBUG scheduler.tick and dirty-tile-detection). That is formatting
+    // and a journald write per line, and it is also what makes journald's
+    // RateLimitBurst reachable -- a first-frame burst on top of this steady
+    // rate blew the 10000/30s budget and silently discarded 23232 messages,
+    // leaving a 20-second hole in the journal.
+    //
+    // DEBUG stays one `RUST_LOG=ghostframe=debug` away for anyone who wants
+    // it; e2e sets `ghostframe=trace,debug` explicitly and is unaffected.
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "ghostframe=debug,info".into());
+        .unwrap_or_else(|_| "ghostframe=info".into());
 
     match log_format.as_str() {
         "json" => {
