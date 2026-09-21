@@ -2135,7 +2135,18 @@ impl IoBridge {
                 self.tick_budget_multiplier = (self.tick_budget_multiplier * SCHEDULER_BUDGET_RAMP)
                     .min(SCHEDULER_BUDGET_MULT_MAX);
             }
+            // `refinement_fraction` and the two queue depths are here
+            // because their absence made a real defect unreadable: a drain
+            // moving 5 KB against a 256 KB base budget looks like the budget
+            // is irrelevant, when in fact refinement only ever gets
+            // `base * refinement_fraction`, and that fraction halves toward
+            // a 0.05 floor whenever delivery drops below 50%. Without these
+            // fields the log shows the symptom (tiny drains) and hides both
+            // the cause (the fraction) and the consequence (the backlog).
             tracing::debug!(
+                refinement_fraction = self.scheduler.current_refinement_fraction(),
+                refinement_queue_len = self.scheduler.refinement_queue_len(),
+                priority_queue_len = self.scheduler.queue_len(),
                 drained_count = drained_count,
                 drained_bytes = drained_bytes,
                 base_budget_bytes = base_budget_bytes,
