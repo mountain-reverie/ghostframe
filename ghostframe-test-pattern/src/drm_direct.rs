@@ -126,7 +126,39 @@ pub(crate) fn setup_dumb_scanout(
         if info.state() != connector::State::Connected {
             continue;
         }
-        if let Some(m) = info.modes().first().copied() {
+        // `GHOSTFRAME_DRM_MODE=WxH` pins an exact mode.
+        //
+        // VKMS advertises 1024x768 as its preferred mode, which is a 32x24 =
+        // 768-tile screen -- a third of the 2040 tiles a 1920x1080 session
+        // drives. Scenes asking how a full screenful of tiles behaves were
+        // therefore running at a third of production scale, so they pin
+        // 1920x1080 instead. Unpinned callers keep the preferred mode.
+        let want = std::env::var("GHOSTFRAME_DRM_MODE").ok();
+        let pick = want
+            .as_deref()
+            .and_then(|w| {
+                let (ws, hs) = w.split_once('x')?;
+                let (ww, hh): (u16, u16) = (ws.parse().ok()?, hs.parse().ok()?);
+                info.modes()
+                    .iter()
+                    .find(|m| m.size() == (ww, hh))
+                    .copied()
+            })
+            // Fallback stays the connector's preferred mode. Deliberately
+            // not "largest": VKMS advertises 4096x2160, which is 128x68 =
+            // 8704 tiles -- four times a real 1920x1080 session, not closer
+            // to it. Scenes that want production scale pin it explicitly.
+            .or_else(|| info.modes().first().copied());
+        if let Some(m) = pick {
+            if let Some(w) = want.as_deref() {
+                let (mw, mh) = m.size();
+                if format!("{mw}x{mh}") != w {
+                    eprintln!(
+                        "drm_direct: GHOSTFRAME_DRM_MODE={w} not offered by this \
+                         connector; falling back to largest ({mw}x{mh})"
+                    );
+                }
+            }
             chosen = Some((info, m));
             break;
         }

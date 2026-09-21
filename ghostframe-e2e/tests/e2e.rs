@@ -1598,6 +1598,10 @@ async fn e2e_static_mixed_codecs_converge_on_a_shaped_link() -> Result<()> {
         &[
             ("GHOSTFRAME_ENABLE_CDF53", "1"),
             ("GHOSTFRAME_FORCE_TILECODEC", "1"),
+            // Production scale. VKMS prefers 1024x768 (32x24 = 768 tiles);
+            // a real session is 1920x1080 (60x34 = 2040), so these scenes
+            // were running at a third of the tile count they reason about.
+            ("GHOSTFRAME_DRM_MODE", "1920x1080"),
         ],
     )
     .await?;
@@ -1735,38 +1739,47 @@ async fn e2e_static_mixed_codecs_converge_on_a_shaped_link() -> Result<()> {
     Ok(())
 }
 
-/// A dialog opening on a settled desktop: one burst of change, then silence.
+/// **KNOWN-FAILING: reproduces the reported production defect.**
 ///
-/// This is the shape the reported production session had, and the one no
-/// other scene covers. `e2e_static_mixed_codecs_converge_on_a_shaped_link`
-/// never changes (converges in ~22 ms); the saturated scene never stops
-/// changing (starves). The interesting case is in between.
+/// A production-scale screen (1920x1080 = 60x34 = 2040 tiles) on a
+/// production-shaped link with 1% loss never finishes refining, and most of
+/// it gives up. Measured across three runs, all in the *pre-burst* phase --
+/// i.e. on a screen that has not changed since the first frame:
 ///
-/// # Why this shape specifically
+///   tiles=2040 complete=0 partial=2040 gave_up=1587  pass-hist{1:288 6:671 7:1081}
+///   tiles=2040 complete=0 partial=2040 gave_up=227   pass-hist{3:1340 4:700}
+///   tiles=2040 complete=0 partial=2040 gave_up=0     pass-hist{4:1619 5:421}
 ///
-/// At a generation bump the two sides do things that only compose safely
-/// while the screen keeps changing:
+/// The stranded tiles hold `{0, 5..10}` and are missing `{11, 12, 13}` -- the
+/// three finest bit-planes -- with `sweep_attempts=6`, the give-up limit.
+/// Detail that never arrives on a quiet screen is exactly the reported
+/// symptom: text and UI chrome that stay soft and never sharpen.
 ///
-/// - The server calls `RetransmitCache::cancel_for_tile`, which drops every
-///   cached pass for that tile across all frame_seqs. A NACK arriving after
-///   the bump therefore cannot be served -- `ReliableTileEmitter::on_nack`
-///   counts `nack_miss` and drops the request on the floor.
-/// - The client gives up on a tile after `MAX_TAIL_SWEEP_ATTEMPTS` sweeps
-///   without progress, and `sweep_attempts` resets only when a pass arrives.
-/// - The server will not send unasked: `refinement_deficit_tiles` is computed
-///   from its own ACK record, and every pass it sent *was* ACKed.
+/// # Why it took this long to reproduce
 ///
-/// While content keeps changing, the next generation rescues any tile that
-/// got stuck. Once the screen goes still, nothing does. Loss during the burst
-/// is what makes a pass go missing in the first place, so it is applied here.
+/// It is scale-dependent, and every earlier scene ran at a third of
+/// production. VKMS advertises 1024x768 as its preferred mode, so
+/// `--drm-direct` scenes were 32x24 = 768 tiles. At 768 tiles this exact
+/// shape converges cleanly. At 2040 it does not.
 ///
-/// # What it asserts
+/// A plausible mechanism, not yet confirmed: the scheduler drains pass-major
+/// (every tile's pass 0, then every tile's pass 5, ...), so a tile waits a
+/// full screen-sweep between its own passes -- ~2040 datagrams, roughly
+/// 800 KB, ~0.8 s at 8 Mbit before loss and retransmits. The client's
+/// tail-sweep budget is 6 sweeps x 500 ms = 3 s of *no progress for that
+/// tile*. As the screen grows, the gap between a tile's passes approaches
+/// and then exceeds that budget, and the tail of the refinement gives up
+/// while the head is still being served.
 ///
-/// That the screen converges *again* after the burst, with nothing stranded.
-/// A failure here is the production symptom: tiles permanently short of
-/// their finest passes on a quiet screen.
+/// Lossless at the same scale converges
+/// (`e2e_production_shaped_session_strands_no_tiles`, complete=2040), so
+/// loss is what pushes the per-tile gap past the budget.
+///
+/// The burst-then-quiet phases below are retained: once convergence is
+/// fixed, this scene should also show that a single change on a settled
+/// screen recovers. Today it never reaches them.
 #[tokio::test(flavor = "multi_thread")]
-async fn e2e_one_burst_then_quiet_leaves_nothing_stranded() -> Result<()> {
+async fn e2e_production_scale_with_loss_never_converges() -> Result<()> {
     use ghostframe_e2e::harness::net_shape::NetShape;
 
     // The burst delay counts from *test-pattern start*, not from client
@@ -1789,6 +1802,10 @@ async fn e2e_one_burst_then_quiet_leaves_nothing_stranded() -> Result<()> {
             ("CAPTURE_FPS_DRM_DIRECT", "5"),
             ("GHOSTFRAME_ENABLE_CDF53", "1"),
             ("GHOSTFRAME_FORCE_TILECODEC", "1"),
+            // Production scale. VKMS prefers 1024x768 (32x24 = 768 tiles);
+            // a real session is 1920x1080 (60x34 = 2040), so these scenes
+            // were running at a third of the tile count they reason about.
+            ("GHOSTFRAME_DRM_MODE", "1920x1080"),
         ],
     )
     .await?;
@@ -2008,6 +2025,10 @@ async fn e2e_saturated_link_starves_tiles_into_giving_up() -> Result<()> {
             // See the lossless scene: pins the frame mode so a cost-based
             // H264 switch cannot masquerade as stranded tiles.
             ("GHOSTFRAME_FORCE_TILECODEC", "1"),
+            // Production scale. VKMS prefers 1024x768 (32x24 = 768 tiles);
+            // a real session is 1920x1080 (60x34 = 2040), so these scenes
+            // were running at a third of the tile count they reason about.
+            ("GHOSTFRAME_DRM_MODE", "1920x1080"),
         ],
     )
     .await?;
@@ -2144,6 +2165,10 @@ async fn e2e_production_shaped_session_strands_no_tiles() -> Result<()> {
             // reason="cost_comparison" with refinement_deficit_tiles=768,
             // 15 ms after the last cdf53.emit.
             ("GHOSTFRAME_FORCE_TILECODEC", "1"),
+            // Production scale. VKMS prefers 1024x768 (32x24 = 768 tiles);
+            // a real session is 1920x1080 (60x34 = 2040), so these scenes
+            // were running at a third of the tile count they reason about.
+            ("GHOSTFRAME_DRM_MODE", "1920x1080"),
         ],
     )
     .await?;
@@ -5098,6 +5123,10 @@ async fn e2e_lossless_golden_png() -> Result<()> {
         "--lossless-golden --drm-direct",
         &[
             ("GHOSTFRAME_FORCE_TILECODEC", "1"),
+            // Production scale. VKMS prefers 1024x768 (32x24 = 768 tiles);
+            // a real session is 1920x1080 (60x34 = 2040), so these scenes
+            // were running at a third of the tile count they reason about.
+            ("GHOSTFRAME_DRM_MODE", "1920x1080"),
             ("CAPTURE_FPS_DRM_DIRECT", "2"),
         ],
         "&e2e=lossless",
