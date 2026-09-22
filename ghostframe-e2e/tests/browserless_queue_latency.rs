@@ -65,6 +65,7 @@ fn full_grid_frame(cols: u8, rows: u8) -> FrameScript {
 fn burst_scene(cols: u8, rows: u8, secs: u64) -> BrowserlessScene {
     BrowserlessScene {
         seed: 0x0B0B_0001,
+        datagram_send_buffer_bytes: None,
         load: SceneLoad::Script(vec![full_grid_frame(cols, rows)]),
         cadence_us: DEFAULT_CADENCE_US,
         // No loss, no delay, no cap: anything the queue does here is the

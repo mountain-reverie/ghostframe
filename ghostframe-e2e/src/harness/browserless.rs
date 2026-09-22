@@ -119,6 +119,18 @@ pub enum SceneLoad {
 /// session, no browser, no tsnet, driven under tokio's virtual clock.
 pub struct BrowserlessScene {
     pub seed: u64,
+    /// Override quinn's datagram send-buffer size for this scene.
+    ///
+    /// `None` keeps the production default (16 MiB). A small value is how a
+    /// scene provokes `SendDatagramError::Blocked`, which is the only thing
+    /// that makes quinn emit `DatagramsUnblocked` and the only condition
+    /// under which `send_to_all_sessions`'s drop-on-error path runs.
+    ///
+    /// Passed to `QuicServer::new_with_datagram_send_buffer` rather than set
+    /// via `GHOSTFRAME_DATAGRAM_SEND_BUFFER_BYTES`: that env var is
+    /// process-global and scenes run in-process, so it would race between
+    /// concurrent scenes instead of configuring one.
+    pub datagram_send_buffer_bytes: Option<usize>,
     /// Resolved once at the top of `drive_session`, then drained in order
     /// after `SessionReady`, one `FrameScript` every `FRAME_SPACING_US` of
     /// virtual time. See the module docs.
@@ -166,6 +178,13 @@ pub struct BrowserlessResult {
     pub bytes_delivered_s2c: u64,
     /// Client -> server bytes delivered (ACKs, NACKs, input).
     pub bytes_delivered_c2s: u64,
+    /// Cumulative `send_datagram` failures on the server, overwhelmingly
+    /// `SendDatagramError::Blocked`.
+    ///
+    /// A scene claiming anything about the Blocked path must assert this is
+    /// non-zero first: with the production 16 MiB buffer it is always 0, so
+    /// such a scene would otherwise pass without ever creating the case.
+    pub send_datagram_errs: u64,
     /// Server -> client datagrams delivered.
     ///
     /// Distinct from `bytes_delivered_s2c` and not derivable from it. A test
@@ -351,7 +370,12 @@ async fn run_inner(mut scene: BrowserlessScene) -> anyhow::Result<BrowserlessRes
         .map_err(|e| anyhow!("seed {seed}: UnixStream::pair failed: {e}"))?;
 
     let server =
-        QuicServer::new().map_err(|e| anyhow!("seed {seed}: QuicServer::new failed: {e}"))?;
+        match scene.datagram_send_buffer_bytes {
+            Some(bytes) => QuicServer::new_with_datagram_send_buffer(bytes)
+                .map_err(|e| anyhow!("seed {seed}: QuicServer::new failed: {e}"))?,
+            None => QuicServer::new()
+                .map_err(|e| anyhow!("seed {seed}: QuicServer::new failed: {e}"))?,
+        };
 
     // Cert hash MUST be taken before `server` moves into the bridge below.
     let mut server_cert_sha256 = [0u8; 32];
@@ -395,6 +419,7 @@ async fn run_inner(mut scene: BrowserlessScene) -> anyhow::Result<BrowserlessRes
     // Stage 2.4) — see `probe_stats_publish`'s doc comment in
     // `io_bridge.rs`.
     let probe_stats_cell = bridge.probe_stats_publish_handle();
+    let send_errs_cell = bridge.send_errs_publish_handle();
     // Same ownership problem, opposite direction: this `Arc` originates
     // here (it already holds `scene.drops`'s rules), and `set_drop_plan`
     // installs it into the bridge so `send_to_all_sessions` can consult it
@@ -466,6 +491,7 @@ async fn run_inner(mut scene: BrowserlessScene) -> anyhow::Result<BrowserlessRes
     let (queued_critical_latency, queued_refinement_latency) = *queued_latency_stats_cell
         .lock()
         .expect("queued_latency_stats_publish mutex poisoned");
+    let send_datagram_errs = *send_errs_cell.lock().expect("send_errs mutex poisoned");
     let (probes_completed, probes_abandoned) = *probe_stats_cell
         .lock()
         .expect("probe_stats_publish mutex poisoned");
@@ -476,6 +502,7 @@ async fn run_inner(mut scene: BrowserlessScene) -> anyhow::Result<BrowserlessRes
         .to_vec();
 
     Ok(BrowserlessResult {
+        send_datagram_errs,
         framebuffer,
         events,
         bytes_delivered,

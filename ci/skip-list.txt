@@ -111,3 +111,19 @@ e2e_input_forwarding_firefox
 #
 # Delete this entry once a recovery path lands; it is that fix's gate.
 e2e_saturated_link_starves_tiles_into_giving_up
+
+# KNOWN-FAILING ACCEPTANCE GATE for the Blocked-path redesign. Skipped in CI
+# only so the suite stays green; it must keep failing locally until the
+# redesign lands, because failing is its job.
+#
+# Measured at production scale (2040 tiles), 64 KiB vs 16 MiB send buffer:
+#   bytes delivered   3,591,308 -> 2,353,116   (ratio 0.66)
+#   send rejections           0 -> 4,726
+#   stale generation tiles 7,316 -> 1,170      (6.3x better)
+#
+# Shrinking the send buffer removes the bufferbloat staleness and costs a
+# third of delivery, because send_to_all_sessions drops a rejected datagram
+# after the scheduler has already popped the work. The redesign has to keep
+# the staleness win and recover the delivery; this test asserts both, so
+# neither can be traded away silently.
+work_rejected_by_a_full_send_buffer_still_reaches_the_client
