@@ -925,12 +925,40 @@ Add to `impl ExportedImage`:
             })
         };
 
-        // SAFETY: hal_tex was created from this device.
-        Ok(unsafe { device.create_texture_from_hal::<wgpu_hal::api::Vulkan>(hal_tex, &desc) })
+        // SAFETY: hal_tex was created from this device. The image is
+        // freshly created and still in VK_IMAGE_LAYOUT_UNDEFINED, which is
+        // exactly what TextureUses::UNINITIALIZED tells wgpu's tracker.
+        Ok(unsafe {
+            device.create_texture_from_hal::<wgpu_hal::api::Vulkan>(
+                hal_tex,
+                &desc,
+                wgpu::TextureUses::UNINITIALIZED,
+            )
+        })
     }
 ```
 
-`hal_texture_descriptor` converts a `wgpu::TextureDescriptor` to the `wgpu_hal::TextureDescriptor` the version pinned in Task 1 expects; write it alongside.
+`hal_texture_descriptor` converts a `wgpu::TextureDescriptor` into the distinct
+`wgpu_hal::TextureDescriptor`. They are NOT the same type. The hal one is
+(`wgpu-hal-30.0.1/src/lib.rs:2200`):
+
+```rust
+pub struct TextureDescriptor<'a> {
+    pub label: Label<'a>,
+    pub size: wgt::Extent3d,
+    pub mip_level_count: u32,
+    pub sample_count: u32,
+    pub dimension: wgt::TextureDimension,
+    pub format: wgt::TextureFormat,
+    pub usage: wgt::TextureUses,      // NB: TextureUses, not TextureUsages
+    pub memory_flags: MemoryFlags,
+    pub view_formats: Vec<wgt::TextureFormat>,  // owned Vec, not a slice
+}
+```
+
+The `usage` field takes hal-level `TextureUses` bits (`COPY_SRC`/`COPY_DST`),
+not the `wgpu::TextureUsages` of the public descriptor, and `view_formats` is an
+owned `Vec` rather than a borrowed slice.
 
 The ownership arguments are the important part, and there are two of them in
 wgpu-hal 30:
