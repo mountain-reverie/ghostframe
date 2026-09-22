@@ -139,10 +139,7 @@ pub(crate) fn setup_dumb_scanout(
             .and_then(|w| {
                 let (ws, hs) = w.split_once('x')?;
                 let (ww, hh): (u16, u16) = (ws.parse().ok()?, hs.parse().ok()?);
-                info.modes()
-                    .iter()
-                    .find(|m| m.size() == (ww, hh))
-                    .copied()
+                info.modes().iter().find(|m| m.size() == (ww, hh)).copied()
             })
             // Fallback stays the connector's preferred mode. Deliberately
             // not "largest": VKMS advertises 4096x2160, which is 128x68 =

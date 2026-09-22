@@ -131,10 +131,7 @@ struct IoBridgeSenderAdapter {
 }
 
 impl crate::transport::reliable_emitter::traits::DatagramSender for IoBridgeSenderAdapter {
-    fn send(
-        &mut self,
-        dg: &[u8],
-    ) -> crate::transport::reliable_emitter::traits::SendOutcome {
+    fn send(&mut self, dg: &[u8]) -> crate::transport::reliable_emitter::traits::SendOutcome {
         // SAFETY: see struct doc — the pointer is valid for the duration
         // of the surrounding `&mut self` call on `IoBridge`.
         unsafe { (*self.bridge).send_to_all_sessions(dg) }
@@ -163,7 +160,6 @@ impl crate::transport::reliable_emitter::traits::DatagramSender for IoBridgeSend
 // At higher capture rates we'd budget conservatively (cap each tick to
 // the 30-FPS slice), which is fine — un-drained work carries across.
 pub(crate) const SCHEDULER_TICK_INTERVAL_US: f64 = 33_333.0;
-
 
 /// How many `cwnd / rtt` samples the capacity hint takes its minimum over.
 /// Sized to span a few RTTs of path-stats sampling, long enough to swallow a
@@ -1680,7 +1676,6 @@ impl IoBridge {
                 }
             }
         }
-    
 
         // No connected session counts as sent, not rejected: re-queueing a
         // datagram with nowhere to go would spin the drain forever.

@@ -99,9 +99,7 @@ fn run_inner(
         msync_buffer(bytes);
 
         if once {
-            eprintln!(
-                "subtle-drift: single burst applied, screen is now quiet for good"
-            );
+            eprintln!("subtle-drift: single burst applied, screen is now quiet for good");
             loop {
                 std::thread::sleep(Duration::from_secs(3600));
             }

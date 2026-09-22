@@ -374,7 +374,7 @@ async fn work_rejected_by_a_full_send_buffer_still_reaches_the_client() {
 fn fast_link_scene(cols: u8, rows: u8, send_buffer: Option<usize>) -> BrowserlessScene {
     let mut scene = squeezed_scene(cols, rows, send_buffer);
     scene.net = NetProfile {
-        delay_us: 25_000, // 50 ms RTT
+        delay_us: 25_000,                      // 50 ms RTT
         cap: CapTimeline::constant(6_250_000), // 50 Mbit, in BYTES/s
         bottleneck: Some(Bottleneck::wifi()),
         ..NetProfile::perfect()
@@ -413,9 +413,19 @@ fn saturating_fast_scene(cols: u8, rows: u8, send_buffer: Option<usize>) -> Brow
 async fn probe_saturating_fast_link() {
     const COLS: u8 = 60;
     const ROWS: u8 = 34;
-    for size in [Some(32 * 1024), Some(64 * 1024), Some(256 * 1024), Some(1024 * 1024), None] {
-        let r = run_browserless(saturating_fast_scene(COLS, ROWS, size)).await.expect("ran");
-        let label = size.map(|s| format!("{}KiB", s / 1024)).unwrap_or("16MiB".into());
+    for size in [
+        Some(32 * 1024),
+        Some(64 * 1024),
+        Some(256 * 1024),
+        Some(1024 * 1024),
+        None,
+    ] {
+        let r = run_browserless(saturating_fast_scene(COLS, ROWS, size))
+            .await
+            .expect("ran");
+        let label = size
+            .map(|s| format!("{}KiB", s / 1024))
+            .unwrap_or("16MiB".into());
         println!(
             "SAT {label:>7}: bytes={:>9} dg={:>6} stale={:>6} retx={:>6} \
              send_errs={:>6} emit_q_peak={:>6}",
@@ -435,8 +445,12 @@ async fn probe_send_buffer_sizes_on_a_fast_link() {
     const COLS: u8 = 60;
     const ROWS: u8 = 34;
     for size in [Some(32 * 1024), Some(256 * 1024), Some(1024 * 1024), None] {
-        let r = run_browserless(fast_link_scene(COLS, ROWS, size)).await.expect("ran");
-        let label = size.map(|s| format!("{}KiB", s / 1024)).unwrap_or("16MiB".into());
+        let r = run_browserless(fast_link_scene(COLS, ROWS, size))
+            .await
+            .expect("ran");
+        let label = size
+            .map(|s| format!("{}KiB", s / 1024))
+            .unwrap_or("16MiB".into());
         println!(
             "FAST {label:>7}: tiles={:>4} stale={:>5} bytes={:>8} retx={:>5} \
              send_errs={:>5} emit_q_peak={:>5}",
@@ -463,8 +477,12 @@ async fn probe_send_buffer_sizes() {
         Some(1024 * 1024),
         None, // 16 MiB production default
     ] {
-        let r = run_browserless(squeezed_scene(COLS, ROWS, size)).await.expect("ran");
-        let label = size.map(|s| format!("{}KiB", s / 1024)).unwrap_or("16MiB".into());
+        let r = run_browserless(squeezed_scene(COLS, ROWS, size))
+            .await
+            .expect("ran");
+        let label = size
+            .map(|s| format!("{}KiB", s / 1024))
+            .unwrap_or("16MiB".into());
         println!(
             "SWEEP {label:>7}: tiles={:>4} stale={:>5} bytes={:>8} retx={:>5} \
              send_errs={:>5} emit_q_peak={:>5}",
@@ -565,17 +583,29 @@ async fn probe_capacity_transitions() {
     const COLS: u8 = 60;
     const ROWS: u8 = 34;
     let cases: [(&str, Vec<(u64, u64)>); 3] = [
-        ("step_down_50_to_5", vec![(0, mbit(50.0)), (3_000_000, mbit(5.0))]),
-        ("step_up_5_to_50", vec![(0, mbit(5.0)), (3_000_000, mbit(50.0))]),
+        (
+            "step_down_50_to_5",
+            vec![(0, mbit(50.0)), (3_000_000, mbit(5.0))],
+        ),
+        (
+            "step_up_5_to_50",
+            vec![(0, mbit(5.0)), (3_000_000, mbit(50.0))],
+        ),
         (
             "oscillate_50_5_50",
-            vec![(0, mbit(50.0)), (2_000_000, mbit(5.0)), (4_000_000, mbit(50.0))],
+            vec![
+                (0, mbit(50.0)),
+                (2_000_000, mbit(5.0)),
+                (4_000_000, mbit(50.0)),
+            ],
         ),
     ];
     for (name, points) in cases {
         for (label, floor) in [("floor=256K", None), ("floor=8K", Some(LOW_FLOOR_BYTES))] {
             let mut scene = ladder_scene(COLS, ROWS, mbit(50.0), floor);
-            scene.net.cap = CapTimeline { points: points.clone() };
+            scene.net.cap = CapTimeline {
+                points: points.clone(),
+            };
             let r = run_browserless(scene).await.expect("ran");
             println!(
                 "TRANS {name:>18} {label:>10}: bytes={:>9} tiles={:>4} stale={:>6} \

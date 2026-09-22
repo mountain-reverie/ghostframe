@@ -99,12 +99,9 @@ pub struct QuicServer {
 /// `GHOSTFRAME_DATAGRAM_SEND_BUFFER_BYTES` overrides it, so the experiment
 /// above can be repeated without a rebuild.
 fn datagram_send_buffer_bytes() -> usize {
-    const DEFAULT: usize = 16 * 1024 * 1024;
-    std::env::var("GHOSTFRAME_DATAGRAM_SEND_BUFFER_BYTES")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(DEFAULT)
+    // Read in `config`, never here: see that module's header on why a
+    // call-site `env::var` races other tests in the same process.
+    crate::config::datagram_send_buffer_bytes()
 }
 
 impl QuicServer {
@@ -372,52 +369,5 @@ mod tests {
         let cert = params.self_signed(&key_pair).unwrap();
         std::fs::write("/tmp/test_cert.der", cert.der()).unwrap();
         println!("Cert written to /tmp/test_cert.der");
-    }
-}
-
-#[cfg(test)]
-mod datagram_buffer_tests {
-    use super::datagram_send_buffer_bytes;
-
-    /// Serialises the three tests below, which mutate one process-global env
-    /// var. Local rather than shared because no other test reads
-    /// `GHOSTFRAME_DATAGRAM_SEND_BUFFER_BYTES`; a test that starts to must
-    /// take this lock too, or the two will race under parallel `cargo test`.
-    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    #[test]
-    fn defaults_to_16_mib() {
-        let _g = lock_env();
-        std::env::remove_var("GHOSTFRAME_DATAGRAM_SEND_BUFFER_BYTES");
-        assert_eq!(datagram_send_buffer_bytes(), 16 * 1024 * 1024);
-    }
-
-    #[test]
-    fn env_override_is_honoured() {
-        let _g = lock_env();
-        std::env::set_var("GHOSTFRAME_DATAGRAM_SEND_BUFFER_BYTES", "1048576");
-        assert_eq!(datagram_send_buffer_bytes(), 1024 * 1024);
-        std::env::remove_var("GHOSTFRAME_DATAGRAM_SEND_BUFFER_BYTES");
-    }
-
-    #[test]
-    fn nonsense_values_fall_back_rather_than_producing_a_zero_buffer() {
-        // A zero-byte send buffer rejects every datagram, which would look
-        // like total packet loss rather than a bad config value.
-        let _g = lock_env();
-        for bad in ["0", "-1", "lots", ""] {
-            std::env::set_var("GHOSTFRAME_DATAGRAM_SEND_BUFFER_BYTES", bad);
-            assert_eq!(
-                datagram_send_buffer_bytes(),
-                16 * 1024 * 1024,
-                "{bad:?} should fall back to the default"
-            );
-        }
-        std::env::remove_var("GHOSTFRAME_DATAGRAM_SEND_BUFFER_BYTES");
     }
 }

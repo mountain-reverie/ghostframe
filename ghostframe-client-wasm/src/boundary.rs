@@ -520,7 +520,9 @@ pub struct WasmCdf53IncompleteTile {
 }
 
 impl From<(u8, u8, u16, u16, u8)> for WasmCdf53IncompleteTile {
-    fn from((tile_x, tile_y, pass_mask, present_passes, sweep_attempts): (u8, u8, u16, u16, u8)) -> Self {
+    fn from(
+        (tile_x, tile_y, pass_mask, present_passes, sweep_attempts): (u8, u8, u16, u16, u8),
+    ) -> Self {
         Self {
             tile_x,
             tile_y,

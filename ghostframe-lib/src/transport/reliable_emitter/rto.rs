@@ -51,7 +51,10 @@ impl RtoTimerWheel {
     /// cache before retransmitting.
     pub fn pop_due(&mut self, now: Instant) -> Option<EmitKey> {
         // EXPERIMENT: RTO timer disabled. Cache + NACK path untouched.
-        if std::env::var("GHOSTFRAME_NO_RTO").is_ok_and(|v| v == "1") {
+        // Cached in `config`; this runs on every scheduler tick, so the
+        // previous per-call `env::var` was a hot-path read as well as a
+        // violation of the single-env-read-site rule.
+        if crate::config::no_rto() {
             return None;
         }
         let Reverse(top) = self.heap.peek()?;

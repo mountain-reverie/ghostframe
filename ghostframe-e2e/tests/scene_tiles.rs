@@ -27,8 +27,19 @@ fn solid_encodes_to_one_work_item_of_four_bytes() {
     assert_eq!((work[0].tile_x, work[0].tile_y), (3, 4));
 }
 
+/// The pass *universe* is 14; the number actually emitted is not.
+///
+/// This asserted `work.len() == 14` and a dense `pass_idx == i`, which
+/// described the harness's old `encode_passes` and not what the server sends.
+/// `encode_tile` now uses `encode_passes_sparse`, which omits every all-zero
+/// bit-plane -- and a uniform tile is the extreme case, since almost all of
+/// its wavelet coefficients are zero.
+///
+/// So the invariants worth holding are the protocol's, not a count: the total
+/// is 14, pass 0 leads (it carries `present_passes`), indices strictly
+/// increase, and every item is a Cdf53 pass.
 #[test]
-fn cdf53_encodes_to_fourteen_passes() {
+fn cdf53_emits_a_sparse_subset_of_the_fourteen_pass_universe() {
     let work = encode_tile(
         &TileSpec::Cdf53 {
             bgra: solid_bgra(10, 20, 30),
@@ -37,21 +48,31 @@ fn cdf53_encodes_to_fourteen_passes() {
         0,
         0,
     );
-    assert_eq!(work.len(), 14, "CDF53 emits 14 progressive passes");
-    assert_eq!(work[0].total_passes, 14);
-    for (i, w) in work.iter().enumerate() {
-        assert_eq!(w.pass_idx as usize, i);
+    assert!(!work.is_empty(), "a Cdf53 tile must emit at least pass 0");
+    assert!(
+        work.len() <= 14,
+        "emitted {} passes, more than the 14-pass universe",
+        work.len()
+    );
+    assert_eq!(work[0].total_passes, 14, "the universe is still 14");
+    assert_eq!(work[0].pass_idx, 0, "pass 0 must lead");
+    assert!(
+        work.windows(2).all(|w| w[0].pass_idx < w[1].pass_idx),
+        "pass indices must strictly increase: {:?}",
+        work.iter().map(|w| w.pass_idx).collect::<Vec<_>>()
+    );
+    for w in &work {
         assert_eq!(w.codec, Codec::Cdf53);
     }
 }
 
 /// A perfectly uniform tile can legitimately compress to near-identical
 /// (or even byte-identical, for high bit-planes that are all-zero) pass
-/// payloads, so it would not catch an encoder that emits 14 copies of an
+/// payloads, so it would not catch an encoder that emits copies of an
 /// empty/placeholder payload. Use a non-uniform gradient tile instead so
 /// each pass plausibly carries distinct bit-plane content, and assert that
-/// (a) every payload is non-empty and (b) not all 14 payloads collapse to
-/// the same bytes.
+/// (a) every payload is non-empty and (b) the payloads do not all collapse
+/// to the same bytes.
 #[test]
 fn cdf53_passes_carry_real_distinct_data() {
     let mut bgra = Vec::with_capacity(32 * 32 * 4);
@@ -64,7 +85,15 @@ fn cdf53_passes_carry_real_distinct_data() {
         }
     }
     let work = encode_tile(&TileSpec::Cdf53 { bgra }, 1, 2, 0);
-    assert_eq!(work.len(), 14);
+    // Sparse encoding means the count is content-dependent (9 for this
+    // gradient), so require only enough passes for "not all identical" below
+    // to mean something.
+    assert!(
+        work.len() >= 2,
+        "need at least two passes for the distinctness check to be \
+         meaningful, got {}",
+        work.len()
+    );
     for w in &work {
         assert!(
             !w.payload.is_empty(),

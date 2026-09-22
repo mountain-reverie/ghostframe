@@ -1659,19 +1659,18 @@ async fn e2e_static_mixed_codecs_converge_on_a_shaped_link() -> Result<()> {
         .await?
         .into_value()?;
     let count = |c: Codec| codecs.iter().filter(|&&x| x == c as u8).count();
-    let (n_solid, n_palrle, n_cdf53) =
-        (count(Codec::Solid), count(Codec::PalRle), count(Codec::Cdf53));
+    let (n_solid, n_palrle, n_cdf53) = (
+        count(Codec::Solid),
+        count(Codec::PalRle),
+        count(Codec::Cdf53),
+    );
     eprintln!(
         "codecs on the wire: solid={n_solid} palrle={n_palrle} cdf53={n_cdf53} \
          (settled_after={settled_after:?})"
     );
 
     // (1) Premise: this must genuinely be a mixed scene.
-    for (name, n) in [
-        ("Solid", n_solid),
-        ("PalRle", n_palrle),
-        ("Cdf53", n_cdf53),
-    ] {
+    for (name, n) in [("Solid", n_solid), ("PalRle", n_palrle), ("Cdf53", n_cdf53)] {
         assert!(
             n > 0,
             "no {name} tiles reached the client, so this scene is not \

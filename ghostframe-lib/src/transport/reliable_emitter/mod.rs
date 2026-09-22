@@ -70,16 +70,14 @@ pub const CACHE_CAPACITY: usize = 32768;
 /// small time window spans a large sequence range. This probe exists to find
 /// out what a real path does, since that result cannot be assumed.
 pub(crate) fn ack_order_probe_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("GHOSTFRAME_ACK_ORDER_PROBE").is_ok_and(|v| v == "1"))
+    crate::config::ack_order_probe_enabled()
 }
 
 /// [RTO-PROBE] temporary: gate for the retransmission-storm measurement.
 /// Set `GHOSTFRAME_RTO_PROBE=1` to emit one line per RTO fire and per
 /// acknowledgement, for offline histogramming. Remove with the probe.
 pub(crate) fn rto_probe_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("GHOSTFRAME_RTO_PROBE").is_ok_and(|v| v == "1"))
+    crate::config::rto_probe_enabled()
 }
 
 #[cfg(test)]

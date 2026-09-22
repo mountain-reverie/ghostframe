@@ -150,9 +150,8 @@ impl NetShape {
             "netem".to_string(),
         ];
         cmd.extend(args.iter().cloned());
-        run_docker(&cmd).with_context(|| {
-            format!("apply netem to {container}:{iface} with args {args:?}")
-        })?;
+        run_docker(&cmd)
+            .with_context(|| format!("apply netem to {container}:{iface} with args {args:?}"))?;
         Ok(())
     }
 
@@ -160,12 +159,14 @@ impl NetShape {
     pub fn clear(container: &str) -> Result<()> {
         let iface = default_iface(container)?;
         // `del` errors when no qdisc is present; that is not a failure here.
-        let _ = run_docker(&[
-            "exec", container, "tc", "qdisc", "del", "dev", &iface, "root",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>());
+        let _ = run_docker(
+            &[
+                "exec", container, "tc", "qdisc", "del", "dev", &iface, "root",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
+        );
         Ok(())
     }
 

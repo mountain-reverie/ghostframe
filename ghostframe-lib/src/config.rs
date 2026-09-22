@@ -415,6 +415,58 @@ impl LibConfig {
     }
 }
 
+// ── Transport knobs read here, not at the consumption site ───────────────
+//
+// These four live here for the reason this module exists: `cargo test` runs
+// tests as threads in one process, so a call-time `env::var` is a
+// process-global read that races other tests. CI enforces it -- grep for
+// `env::var` outside this file fails the build.
+
+/// Size of quinn's datagram send buffer, in bytes.
+///
+/// 16 MiB by default. `GHOSTFRAME_DATAGRAM_SEND_BUFFER_BYTES` overrides it so
+/// the buffer-size sweeps in `browserless_blocked_path` can be repeated
+/// without a rebuild. A zero or unparseable value falls back to the default:
+/// a zero-byte buffer rejects every datagram, which presents as total packet
+/// loss rather than as a bad config value.
+///
+/// Deliberately **not** cached: the tests below set the variable and expect
+/// the next call to observe it.
+pub fn datagram_send_buffer_bytes() -> usize {
+    const DEFAULT: usize = 16 * 1024 * 1024;
+    std::env::var("GHOSTFRAME_DATAGRAM_SEND_BUFFER_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT)
+}
+
+/// `GHOSTFRAME_ACK_ORDER_PROBE=1` — emit one line per ACK batch for offline
+/// reorder histogramming. Cached: a probe flag that changed mid-process would
+/// make its own output uninterpretable.
+pub(crate) fn ack_order_probe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GHOSTFRAME_ACK_ORDER_PROBE").is_ok_and(|v| v == "1"))
+}
+
+/// `GHOSTFRAME_RTO_PROBE=1` — one line per RTO fire and per acknowledgement.
+pub(crate) fn rto_probe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GHOSTFRAME_RTO_PROBE").is_ok_and(|v| v == "1"))
+}
+
+/// `GHOSTFRAME_NO_RTO=1` — disable the RTO timer, leaving the cache and NACK
+/// path untouched, so a test can attribute a repair to one mechanism.
+///
+/// Cached, unlike the buffer size above. This gates `RtoHeap::pop_due`, which
+/// runs on every scheduler tick; it previously read the environment on each
+/// call, which is both a guard violation and a syscall-shaped cost in a hot
+/// path.
+pub(crate) fn no_rto() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GHOSTFRAME_NO_RTO").is_ok_and(|v| v == "1"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -871,5 +923,40 @@ mod tests {
             "SKIP_L2_L3 alone must also imply skip_l3"
         );
         assert!(!DiagnosticsConfig::from_lookup(lookup(&[])).cdf53_skip_l3);
+    }
+
+    // Moved here from `transport::quic`, which had its own `lock_env` over a
+    // *different* mutex -- so the two sets of env tests did not serialise
+    // against each other and could still race. One lock, one place.
+
+    #[test]
+    fn datagram_send_buffer_defaults_to_16_mib() {
+        let _g = lock_env();
+        std::env::remove_var("GHOSTFRAME_DATAGRAM_SEND_BUFFER_BYTES");
+        assert_eq!(datagram_send_buffer_bytes(), 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn datagram_send_buffer_env_override_is_honoured() {
+        let _g = lock_env();
+        std::env::set_var("GHOSTFRAME_DATAGRAM_SEND_BUFFER_BYTES", "1048576");
+        assert_eq!(datagram_send_buffer_bytes(), 1024 * 1024);
+        std::env::remove_var("GHOSTFRAME_DATAGRAM_SEND_BUFFER_BYTES");
+    }
+
+    #[test]
+    fn datagram_send_buffer_nonsense_values_fall_back() {
+        // A zero-byte send buffer rejects every datagram, which would look
+        // like total packet loss rather than a bad config value.
+        let _g = lock_env();
+        for bad in ["0", "-1", "lots", ""] {
+            std::env::set_var("GHOSTFRAME_DATAGRAM_SEND_BUFFER_BYTES", bad);
+            assert_eq!(
+                datagram_send_buffer_bytes(),
+                16 * 1024 * 1024,
+                "{bad:?} should fall back to the default"
+            );
+        }
+        std::env::remove_var("GHOSTFRAME_DATAGRAM_SEND_BUFFER_BYTES");
     }
 }
