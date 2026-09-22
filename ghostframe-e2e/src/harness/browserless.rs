@@ -131,6 +131,13 @@ pub struct BrowserlessScene {
     /// process-global and scenes run in-process, so it would race between
     /// concurrent scenes instead of configuring one.
     pub datagram_send_buffer_bytes: Option<usize>,
+
+    /// Override `IoBridge`'s `base_budget_bytes` floor, in bytes per
+    /// 33.3 ms tick. `None` keeps the production default (256 KiB), which
+    /// is equivalent to 7.86 MB/s and therefore dominates the
+    /// bandwidth-derived term on any link below ~70 Mbit/s. Lower it to let
+    /// the bandwidth term actually bind.
+    pub tick_budget_floor_bytes: Option<usize>,
     /// Resolved once at the top of `drive_session`, then drained in order
     /// after `SessionReady`, one `FrameScript` every `FRAME_SPACING_US` of
     /// virtual time. See the module docs.
@@ -437,6 +444,9 @@ async fn run_inner(mut scene: BrowserlessScene) -> anyhow::Result<BrowserlessRes
     let drop_plan_cell =
         std::sync::Arc::new(std::sync::Mutex::new(std::mem::take(&mut scene.drops)));
     bridge.set_drop_plan(drop_plan_cell.clone());
+    if let Some(floor) = scene.tick_budget_floor_bytes {
+        bridge.set_tick_budget_floor_bytes(floor);
+    }
     // `IoBridge::run` is an infinite event loop that only returns on EOF or
     // error; it must be aborted explicitly (see below) rather than awaited.
     let bridge_handle = tokio::task::spawn_local(async move {

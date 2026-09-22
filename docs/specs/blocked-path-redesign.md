@@ -303,3 +303,93 @@ saturated fast-link sweep keeps 16 MiB's throughput (~24 MB).
   decides the budget.
 - **Shrinking the buffer first.** Measured: 15,944 rejections, delivery to
   11%, client coverage `complete=0`. This is step C without steps A and B.
+
+---
+
+## Bandwidth as an axis: the budget floor is the dominant term
+
+**Date:** 2026-09-21
+
+Two static link speeds (2 Mbit, 50 Mbit) were used for every measurement
+above. That turns out to have hidden the largest effect in the system.
+
+`base_budget_bytes` is
+
+```
+bytes_per_us * 33.3 ms * 0.90   .max(SCHEDULER_TICK_BUDGET_FLOOR_BYTES)
+```
+
+and the floor is 256 KiB **per 33.3 ms tick**, i.e. **7.86 MB/s**. With the
+0.90 fraction the bandwidth-derived term only overtakes it above
+**~70 Mbit/s**. Every link this system has been measured on -- and every link
+it realistically serves -- is below that. **The bandwidth term has never
+bound. The budget has been a constant all along.**
+
+This is why billing the budget by elapsed time measured as a no-op, and why
+step C' looked like new machinery: it is not. The machinery exists; the floor
+sits above it.
+
+### Measured: a saturating 60x34 scene, 30 s, 50 ms RTT
+
+`floor=8K` lowers the floor to 8 KiB so the bandwidth term actually binds.
+
+| link | floor | bytes | stale | retx | send_errs | emit_q_peak | qlat_max |
+|---|---|---|---|---|---|---|---|
+| 1 Mbit | 256K | 3,600,948 | 0 | 102,954 | 2,019 | **77,150** | 131 ms |
+| 1 Mbit | 8K | 3,672,688 | 6,015 | 20,032 | 0 | **642** | 598 ms |
+| 2 Mbit | 256K | 7,438,217 | 332 | 217,557 | 3,889 | **168,335** | 116 ms |
+| 2 Mbit | 8K | 4,889,063 | 2,118 | 10,951 | 0 | **642** | 599 ms |
+| 5 Mbit | 256K | 18,565,865 | 1,060 | 511,473 | 8,495 | **389,053** | 114 ms |
+| 5 Mbit | 8K | 6,824,734 | 1,897 | 18,831 | 0 | **1,206** | 4.72 s |
+| 10 Mbit | 256K | 6,973,279 | 150 | 20,291 | 0 | 3,904 | 6.40 s |
+| 10 Mbit | 8K | 7,815,289 | 2,639 | 16,396 | 0 | 1,617 | 9.17 s |
+| 25 Mbit | 256K | 20,822,935 | 5,839 | 20,379 | 0 | 3,929 | 29.46 s |
+| 25 Mbit | 8K | 10,231,763 | 5,834 | 18,072 | 0 | 1,932 | 13.35 s |
+| 50 Mbit | 256K | 24,267,070 | 6,451 | 22,110 | 0 | 6,004 | 29.33 s |
+| 50 Mbit | 8K | 9,107,585 | **0** | **0** | 0 | 3,017 | **153 ms** |
+| 100 Mbit | 256K | 46,462,927 | **85,601** | 106,904 | 776 | 26,912 | **28.88 s** |
+| 100 Mbit | 8K | 8,591,378 | **0** | **0** | 0 | 2,823 | **97 ms** |
+
+200 Mbit did not run: the harness bailed. Not investigated; see
+`feedback-browserless-scene-stall-flake`.
+
+### What it says
+
+1. **`tiles_rendered` is 2040 in every single row.** The screen always fully
+   converges. The choice is entirely about waste and latency, never coverage
+   -- so any test gating on "did the screen arrive" cannot see this at all.
+
+2. **The production floor's damage is worst at *low* bandwidth**, which is the
+   opposite of where the earlier sweeps looked hardest. At 5 Mbit it drives
+   **511,473 retransmit attempts and an emitter queue peaking at 389,053
+   entries**. Lowering the floor cuts those to 18,831 (27x) and 1,206 (323x).
+
+3. **At high bandwidth the low floor is better on every quality metric at
+   once.** At 100 Mbit: staleness 85,601 -> 0, retransmits 106,904 -> 0,
+   queued latency 28.88 s -> 97 ms.
+
+4. **8 KiB is still too blunt.** It is itself ~246 KB/s (~2 Mbit), so on a
+   1 Mbit link it still overdrives while now also throttling -- which is why
+   the 1-5 Mbit rows trade retransmits away for staleness and latency rather
+   than winning outright. The fix is not a smaller constant; it is no constant.
+
+5. **`bytes_delivered_s2c` is not goodput.** The 5 Mbit/256K row "delivers"
+   18.5 MB on an 18.75 MB link while rendering the same 2040 tiles as the
+   6.8 MB row: it is retransmitting, not progressing. This is the same trap as
+   the byte-ratio metric retired earlier, and it means the step-C throughput
+   comparison above (24.3 MB vs 4.0 MB) deserves a goodput cross-check before
+   it is leaned on further.
+
+### An unexplained lead worth keeping
+
+At 25-100 Mbit with the production floor, `queued_critical_latency_max_us`
+reaches **~29 s in a 30 s scene** -- a critical-tier tile queued early and not
+ACKed until the end. At 50 and 100 Mbit the low floor collapses that to
+153 ms / 97 ms.
+
+A tile that never resolves on an otherwise-healthy link is the shape of the
+original production report (blurry regions on a quiet screen) that has
+resisted reproduction across every scene tried so far. **The mechanism has not
+been identified and this is not yet a reproduction** -- the queue peak at
+those rows is only ~4-6k, so depth alone does not explain 29 s. It is the
+strongest lead so far and should be chased directly.

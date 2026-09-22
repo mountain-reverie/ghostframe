@@ -78,6 +78,7 @@ fn squeezed_scene(cols: u8, rows: u8, send_buffer: Option<usize>) -> Browserless
     BrowserlessScene {
         seed: 0x5B10_C4ED,
         datagram_send_buffer_bytes: send_buffer,
+        tick_budget_floor_bytes: None,
         load: SceneLoad::Script(vec![full_grid_frame(cols, rows)]),
         cadence_us: DEFAULT_CADENCE_US,
         net: NetProfile {
@@ -442,5 +443,119 @@ async fn probe_send_buffer_sizes() {
             r.send_datagram_errs,
             r.emission_queue_peak,
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bandwidth as an axis
+// ---------------------------------------------------------------------------
+
+/// A floor low enough that `base_budget_bytes`'s bandwidth term always wins.
+///
+/// The production floor is 256 KiB per 33.3 ms tick, i.e. 7.86 MB/s, so with
+/// `SCHEDULER_TICK_BUDGET_FRACTION = 0.90` the bandwidth term only overtakes
+/// it above ~70 Mbit/s. Every link measured in this file is below that, which
+/// means the budget has been the constant 256 KiB in all of them.
+const LOW_FLOOR_BYTES: usize = 8 * 1024;
+
+fn mbit(m: f64) -> u64 {
+    (m * 1_000_000.0 / 8.0) as u64
+}
+
+/// A saturating scene on a link of the given capacity.
+///
+/// Saturating matters: a scene that offers less than the link can carry
+/// measures offered load, not capacity, and reports every configuration as
+/// identical. That mistake cost a whole round of fast-link measurement -- see
+/// `saturating_fast_scene`.
+fn ladder_scene(cols: u8, rows: u8, bytes_per_s: u64, floor: Option<usize>) -> BrowserlessScene {
+    let mut scene = saturating_fast_scene(cols, rows, None);
+    scene.net = NetProfile {
+        delay_us: 25_000, // 50 ms RTT
+        cap: CapTimeline::constant(bytes_per_s),
+        bottleneck: Some(Bottleneck::wifi()),
+        ..NetProfile::perfect()
+    };
+    scene.tick_budget_floor_bytes = floor;
+    scene
+}
+
+/// Sweep capacity across the floor's knee, with the floor in and out of play.
+///
+/// Two static points cannot validate a control law that claims invariance
+/// over bandwidth, and they especially cannot find a knee that sits outside
+/// both of them. The ladder straddles ~70 Mbit so the floor's effect becomes
+/// an observation rather than an inference.
+///
+/// Read it as two columns: with the production floor, the budget is a
+/// constant and should look bandwidth-independent; with `LOW_FLOOR_BYTES` the
+/// bandwidth term binds and delivered bytes should track capacity.
+#[tokio::test(start_paused = true)]
+#[ignore = "diagnostic-only: run on demand with --ignored"]
+async fn probe_bandwidth_ladder() {
+    const COLS: u8 = 60;
+    const ROWS: u8 = 34;
+    for m in [1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 200.0] {
+        for (label, floor) in [("floor=256K", None), ("floor=8K", Some(LOW_FLOOR_BYTES))] {
+            let r = run_browserless(ladder_scene(COLS, ROWS, mbit(m), floor))
+                .await
+                .expect("ran");
+            println!(
+                "LADDER {m:>6} Mbit {label:>10}: bytes={:>9} tiles={:>4} stale={:>6} \
+                 retx={:>6} send_errs={:>6} emit_q_peak={:>6} qlat_max_us={:>8}",
+                r.bytes_delivered_s2c,
+                tiles_rendered(&r, COLS, ROWS),
+                r.stale_generation_tiles,
+                r.retransmit_attempts_total,
+                r.send_datagram_errs,
+                r.emission_queue_peak,
+                r.queued_critical_latency_max_us,
+            );
+        }
+    }
+}
+
+/// The axis that killed a structurally similar design.
+///
+/// `docs/specs/bwe-googcc-review.md` records a source-rate token bucket
+/// refilled at goog_cc's `target_rate`: it was a net regression (752,637 ->
+/// 548,602 delivered, against a 600,000 "not serialised" floor) because the
+/// estimate takes 5-7 s to reach capacity. Any budget derived from that same
+/// estimate inherits the same lag, so static capacities are not a sufficient
+/// test -- the interesting behaviour is where the estimate is *wrong*.
+///
+/// Step-down is the safety case (stale-high estimate overfills, which is the
+/// bloat this work exists to remove) and step-up is the throughput case
+/// (stale-low estimate pins the sender below the link).
+#[tokio::test(start_paused = true)]
+#[ignore = "diagnostic-only: run on demand with --ignored"]
+async fn probe_capacity_transitions() {
+    const COLS: u8 = 60;
+    const ROWS: u8 = 34;
+    let cases: [(&str, Vec<(u64, u64)>); 3] = [
+        ("step_down_50_to_5", vec![(0, mbit(50.0)), (3_000_000, mbit(5.0))]),
+        ("step_up_5_to_50", vec![(0, mbit(5.0)), (3_000_000, mbit(50.0))]),
+        (
+            "oscillate_50_5_50",
+            vec![(0, mbit(50.0)), (2_000_000, mbit(5.0)), (4_000_000, mbit(50.0))],
+        ),
+    ];
+    for (name, points) in cases {
+        for (label, floor) in [("floor=256K", None), ("floor=8K", Some(LOW_FLOOR_BYTES))] {
+            let mut scene = ladder_scene(COLS, ROWS, mbit(50.0), floor);
+            scene.net.cap = CapTimeline { points: points.clone() };
+            let r = run_browserless(scene).await.expect("ran");
+            println!(
+                "TRANS {name:>18} {label:>10}: bytes={:>9} tiles={:>4} stale={:>6} \
+                 retx={:>6} send_errs={:>6} emit_q_peak={:>6} qlat_max_us={:>8}",
+                r.bytes_delivered_s2c,
+                tiles_rendered(&r, COLS, ROWS),
+                r.stale_generation_tiles,
+                r.retransmit_attempts_total,
+                r.send_datagram_errs,
+                r.emission_queue_peak,
+                r.queued_critical_latency_max_us,
+            );
+        }
     }
 }
