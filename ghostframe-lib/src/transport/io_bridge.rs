@@ -4842,7 +4842,26 @@ impl IoBridge {
                         fec_parity_emitted = es.parity_emitted,
                         rto_fired = es.rto_fired,
                         rto_max_retransmits_reached = es.rto_max_retransmits_reached,
+                        // Split, not summed. This was logged as a single
+                        // `nack_received = nack_hit + nack_miss`, which cannot
+                        // distinguish "the client asked and we resent" from
+                        // "the client asked and we had nothing to send" --
+                        // and the second is the one that leaves a tile stuck
+                        // at a partial pass set for the rest of the session.
+                        //
+                        // `on_nack` treats a cache miss as `nack_miss += 1;
+                        // continue`, i.e. the request is dropped silently. A
+                        // client that keeps sweeping for the same pass and a
+                        // server whose cache no longer holds it will sit in
+                        // that loop until the client gives up, with nothing
+                        // in the log to say so.
                         nack_received = es.nack_hit + es.nack_miss,
+                        nack_hit = es.nack_hit,
+                        nack_miss = es.nack_miss,
+                        // Step A's counter: datagrams quinn refused. Never
+                        // surfaced before, and it is the difference between
+                        // "we never sent it" and "we sent it and it was lost".
+                        send_rejected = es.send_rejected,
                         // `emitter_` prefix so `e2e_ack_telemetry_no_waste`'s
                         // `ack_miss` log-line filter doesn't false-match this
                         // structured field — the test counts per-ACK debug
