@@ -150,9 +150,34 @@ async fn an_empty_scene_is_byte_identical() {
         "empty scene delivered nothing, so byte equality proves nothing \
          about handshake determinism"
     );
+    // Only the server->client direction is reproducible, and this test is
+    // how that was established. Asserting both directions failed roughly one
+    // run in three: `s2c` measured 3050 on every run, while `c2s` moved
+    // across 2872 / 2874 / 2905.
+    //
+    // That asymmetry is the finding, not a defect to tune away. `c2s` on a
+    // tile-less scene is handshake plus ACK traffic, and ACK batching depends
+    // on when the client's timer happens to fire relative to arrivals --
+    // wall-clock-dependent even under a paused tokio clock, because the
+    // harness drives real I/O over a socketpair. `s2c` is emitted by the
+    // scheduler against virtual time and does not have that freedom.
+    //
+    // So this pins the half that is genuinely deterministic. Widening the
+    // assertion to a tolerance on `c2s` would only re-encode the same flake
+    // with a threshold in front of it, and a tolerance sitting inside its own
+    // success distribution is a coin flip, not a gate --
+    // see `docs/specs/bwe-googcc-review.md`.
     assert_eq!(
-        (a.bytes_delivered_s2c, a.bytes_delivered_c2s),
-        (b.bytes_delivered_s2c, b.bytes_delivered_c2s),
-        "handshake-only scene is not byte-reproducible"
+        a.bytes_delivered_s2c, b.bytes_delivered_s2c,
+        "the server->client byte count is not reproducible across two \
+         identical handshake-only scenes ({} vs {}). This direction is \
+         scheduler-driven against virtual time, so it should not vary; if it \
+         does, the non-determinism has spread beyond the ACK path.",
+        a.bytes_delivered_s2c, b.bytes_delivered_s2c
+    );
+    assert!(
+        a.bytes_delivered_c2s > 0 && b.bytes_delivered_c2s > 0,
+        "no client->server bytes at all, so the handshake did not complete \
+         and the s2c comparison above proves nothing"
     );
 }
