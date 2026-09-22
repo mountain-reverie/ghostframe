@@ -4917,6 +4917,30 @@ impl IoBridge {
                             self.queued_refinement_latency_stats.mean_us(),
                         queued_refinement_latency_max_us =
                             self.queued_refinement_latency_stats.max_us,
+                        // The per-tick emission budget and the floor it is
+                        // clamped against. These were only ever logged at
+                        // `debug!`, on a per-frame site, which the xdaemon's
+                        // `ghostframe=info` default filter drops -- so a
+                        // deployed build could not show whether the budget
+                        // was tracking the path or pinned at its floor.
+                        //
+                        // That distinction is the whole point of the floor
+                        // change: a flat 256 KiB floor is 7.86 MB/s and beat
+                        // the bandwidth term on every link below ~70 Mbit/s,
+                        // making the estimate dead code. If
+                        // `base_budget_bytes` here equals
+                        // `tick_budget_floor_bytes`, the estimate is still
+                        // not binding and the same failure has returned.
+                        //
+                        // Logged on the existing 60-frame cadence rather
+                        // than per frame: journald's RateLimitBurst drops a
+                        // burst wholesale and leaves a hole that reads as a
+                        // stalled loop, which has already cost one
+                        // misdiagnosis here.
+                        base_budget_bytes = self.base_budget_bytes(),
+                        tick_budget_floor_bytes = self.tick_budget_floor(),
+                        bytes_per_us = self.adaptation_context.bytes_per_us,
+                        smoothed_rtt_us = self.adaptation_context.smoothed_rtt_us,
                         "cumulative emit (datagrams handed to quinn since startup, per codec)"
                     );
 

@@ -425,9 +425,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 tracing::info!(frames = frame_count, "capture running");
             }
             // Per-iter heartbeat — trace level so prod and the default e2e
-            // log volume stay quiet (RUST_LOG defaults `ghostframe=debug,info`
-            // and the e2e harness sets `ghostframe=trace,debug` which still
-            // hits trace for ghostframe targets when explicitly debugging).
+            // log volume stay quiet (RUST_LOG now defaults to
+            // `ghostframe=info`; the e2e harness sets `ghostframe=trace,debug`
+            // which still hits trace for ghostframe targets when explicitly
+            // debugging).
             // Captures the four timing components separately so we can spot
             // exactly which one stalls when the daemon goes silent.
             if frame_count.is_multiple_of(heartbeat_every) {
