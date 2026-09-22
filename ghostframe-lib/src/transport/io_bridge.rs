@@ -131,7 +131,10 @@ struct IoBridgeSenderAdapter {
 }
 
 impl crate::transport::reliable_emitter::traits::DatagramSender for IoBridgeSenderAdapter {
-    fn send(&mut self, dg: &[u8]) {
+    fn send(
+        &mut self,
+        dg: &[u8],
+    ) -> crate::transport::reliable_emitter::traits::SendOutcome {
         // SAFETY: see struct doc — the pointer is valid for the duration
         // of the surrounding `&mut self` call on `IoBridge`.
         unsafe { (*self.bridge).send_to_all_sessions(dg) }
@@ -1577,17 +1580,24 @@ impl IoBridge {
     }
 
     /// Send a datagram to all connected WebTransport sessions.
-    fn send_to_all_sessions(&mut self, dg: &[u8]) {
+    fn send_to_all_sessions(
+        &mut self,
+        dg: &[u8],
+    ) -> crate::transport::reliable_emitter::traits::SendOutcome {
+        use crate::transport::reliable_emitter::traits::SendOutcome;
         #[cfg(any(test, feature = "test-loss-injection"))]
         if let Some(cap) = self.outbound_bandwidth_cap.as_mut() {
             if !cap.try_consume(dg.len()) {
-                return;
+                // A harness-injected drop *consumes* the datagram. Reporting
+                // `Rejected` here would make the emitter re-queue the same
+                // bytes forever and the injected loss would never happen.
+                return SendOutcome::Sent;
             }
         }
         #[cfg(any(test, feature = "test-loss-injection"))]
         if let Some(inj) = self.outbound_loss.as_mut() {
             if inj.should_drop(dg) {
-                return;
+                return SendOutcome::Sent; // injected loss: consumed, see above
             }
         }
         #[cfg(any(test, feature = "test-loss-injection"))]
@@ -1597,15 +1607,22 @@ impl IoBridge {
                 .expect("drop_plan mutex poisoned")
                 .should_drop(dg)
             {
-                return;
+                return SendOutcome::Sent; // injected drop: consumed, see above
             }
         }
+        // Every datagram goes to every connected session, so one refusal
+        // means re-queue. With more than one session that re-sends to the
+        // ones that accepted; the duplicate is wasted bandwidth rather than
+        // corruption -- the client dedups on wire_seq and tile reassembly is
+        // idempotent per frag_idx. Production runs a single session.
+        let mut rejected = false;
         for (handle, wt) in &mut self.wt_sessions {
             if !wt.is_connected() {
                 continue;
             }
             if let Some(conn) = self.server.connections.get_mut(handle) {
                 if let Err(e) = wt.send_datagram(conn, dg) {
+                    rejected = true;
                     self.datagram_send_errs = self.datagram_send_errs.saturating_add(1);
                     if !self.datagram_send_err_first_logged {
                         self.datagram_send_err_first_logged = true;
@@ -1622,6 +1639,15 @@ impl IoBridge {
                     }
                 }
             }
+        }
+    
+
+        // No connected session counts as sent, not rejected: re-queueing a
+        // datagram with nowhere to go would spin the drain forever.
+        if rejected {
+            SendOutcome::Rejected
+        } else {
+            SendOutcome::Sent
         }
     }
 
