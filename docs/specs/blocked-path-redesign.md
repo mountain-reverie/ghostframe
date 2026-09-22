@@ -393,3 +393,64 @@ resisted reproduction across every scene tried so far. **The mechanism has not
 been identified and this is not yet a reproduction** -- the queue peak at
 those rows is only ~4-6k, so depth alone does not explain 29 s. It is the
 strongest lead so far and should be chased directly.
+
+### Capacity transitions: the hazard was mis-specified
+
+The concern raised before running this was that a bandwidth-derived budget
+inherits goog_cc's 5-7 s convergence, repeating the source-rate token bucket's
+regression (`bwe-googcc-review.md`: 752,637 -> 548,602 delivered).
+
+**That premise was wrong.** `base_budget_bytes` reads
+`adaptation_context.bytes_per_us`, and that is
+
+```rust
+// io_bridge.rs:6312, from sampled quinn path stats
+let bytes_per_us = (cwnd_bytes as f32) / smoothed_rtt_us;
+```
+
+-- quinn's **congestion window over smoothed RTT**, not goog_cc's
+`target_rate`. It tracks capacity at RTT timescale, not at estimator-
+convergence timescale. The token bucket's failure mode does not transfer.
+
+Measured, same scene, capacity stepping at 3 s:
+
+| transition | floor | stale | retx | send_errs | emit_q_peak | qlat_max |
+|---|---|---|---|---|---|---|
+| 50 -> 5 Mbit | 256K | 9,611 | 24,422 | 0 | 6,338 | 29.44 s |
+| 50 -> 5 Mbit | 8K | **0** | **0** | 0 | 2,850 | **107 ms** |
+| 5 -> 50 Mbit | 256K | **833,844** | **1,213,785** | 27,476 | **478,806** | 131 ms |
+| 5 -> 50 Mbit | 8K | 3,130 | 13,672 | 0 | 1,593 | 9.33 s |
+| 50/5/50 | 256K | 8,686 | 23,732 | 0 | 6,357 | 29.46 s |
+| 50/5/50 | 8K | 3,064 | 7,110 | 0 | 2,859 | 107 ms |
+
+1. **Step-up with the production floor is the worst configuration measured
+   anywhere: 1,213,785 retransmit attempts, 833,844 stale tiles, an emitter
+   queue 478,806 deep.** A capacity *increase* is turned into a retransmit
+   storm -- the 5 Mbit opening phase is overdriven ~12x, the backlog builds,
+   and when the link opens the whole stale backlog floods out.
+
+2. **The predicted regression did not appear.** Step-up is where the low floor
+   is weakest, and it still beats the production floor by 266x on staleness.
+
+3. **`qlat_max` must be read against staleness, never alone.** The 5->50/256K
+   row has the *best* queued latency in the table (131 ms) and the worst
+   staleness (833,844): it ACKs quickly because it is retransmitting
+   constantly. Latency is only meaningful once the delivered content is right.
+
+4. **The residual weakness is step-up queued latency** (9.33 s at floor=8K,
+   against 107 ms on the other two transitions). This is the one place a
+   lagging allowance is visible, and it is the case for driving the budget
+   from *observed* queueing rather than from `cwnd/RTT` -- but it is a
+   refinement, not a blocker.
+
+### Where this leaves the redesign
+
+Step C' as originally written -- "take the drain budget from the bandwidth
+estimate" -- is already implemented. The work is to stop the constant floor
+from masking it. That is a far smaller change than specified, and the ladder
+and transition sweeps are the acceptance evidence for it.
+
+The remaining question is what replaces 256 KiB. It cannot be a smaller
+constant (8 KiB is itself ~2 Mbit and still overdrives a 1 Mbit link); the
+floor's only legitimate job is to keep the budget above one MTU so a tile can
+always make progress.
