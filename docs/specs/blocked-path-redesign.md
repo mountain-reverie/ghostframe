@@ -203,15 +203,80 @@ added is already there, and it works better the smaller the buffer is.
 Pinned by an assertion in the gate test so a future change cannot regress
 into emitter-side bloat unnoticed.
 
-### C. Shrink the send buffer
+### C. Shrink the send buffer — BLOCKED, and not for the reason expected
 
-Only now is `datagram_send_buffer_size` safe to reduce toward a BDP-sized
-value (~24 KB at 8 Mbit with 24 ms RTT; an order of magnitude above that is
-still far below 16 MiB). `GHOSTFRAME_DATAGRAM_SEND_BUFFER_BYTES` already
-exists for bisecting this.
+**Status: measured and not done. The default stays 16 MiB.**
 
-**Acceptance:** peak buffered drops from 6.71 MB to the configured size,
-queued-to-ACK latency falls with it, and delivery is unchanged.
+Shrinking is clearly right on a slow link. Swept at production scale over a
+2 Mbit path (`probe_send_buffer_sizes`):
+
+| size | tiles | stale | bytes | retransmits |
+|---|---|---|---|---|
+| 32 KiB | 2040 | **51** | 2.65 M | **345** |
+| 64 KiB | 2040 | 388 | 2.67 M | 684 |
+| 128 KiB | 2040 | 398 | 2.67 M | 742 |
+| 256 KiB | 2040 | 1,831 | 4.72 M | 16,742 |
+| 1 MiB | 2040 | 12,236 | 6.56 M | 29,646 |
+| 16 MiB | 2040 | 7,355 | 3.58 M | 7,733 |
+
+Every size renders the full screen -- step A made them all safe -- and 32 KiB
+is best on every axis, with 144x less staleness than 16 MiB. Note also that
+mid sizes are *worse* than either extreme: 256 KiB and 1 MiB thrash, because
+the clamp scales drains with buffer space, so they pop enough work to fill
+the buffer and then reject it.
+
+Then the same sweep on a **saturated** 50 Mbit path
+(`probe_saturating_fast_link`, offering far more work than the link carries):
+
+| size | bytes delivered | stale | retransmits |
+|---|---|---|---|
+| 32 KiB | 4,031,406 | 0 | 0 |
+| 64 KiB | 7,774,183 | 2,689 | 17,921 |
+| 256 KiB | 4,189,475 | 62 | 827 |
+| 1 MiB | 5,178,564 | 804 | 1,903 |
+| 16 MiB | **24,330,181** | 8,140 | 23,072 |
+
+16 MiB delivers **6x more** than 32 KiB. A single-frame fast-link probe had
+missed this entirely -- every size delivered the same ~2.66 MB, because that
+was the offered work rather than the link's capacity. A throughput ceiling is
+invisible until offered load exceeds what the link can carry.
+
+The cause is the clamp, not the buffer. Every drain is limited to
+`QUINN_SEND_BUFFER_SAFETY_FRACTION * send_buffer_space()`, so throughput is
+bounded by roughly `drains_per_second * 0.8 * buffer_size`. At 32 KiB and
+~30 drains/s that is ~780 KB/s -- about 6 Mbit. **The send buffer is
+currently the throughput governor**, which is why it cannot be shrunk on its
+own.
+
+This is the same clamp that made step B unnecessary. It is doing two jobs at
+once: bounding how much the scheduler pops (useful) and setting the
+transmission rate (not its business).
+
+### C'. Decouple the drain budget from the buffer, then shrink
+
+The prerequisite step C needs, and the redesign this whole line of work has
+been converging on.
+
+The drain budget should come from the bandwidth estimate, and resumption from
+`Event::DatagramsUnblocked` -- which step A made reachable for the first time,
+because `Blocked` now actually happens. Then a small buffer bounds latency
+(its only job) while throughput stays bandwidth-limited.
+
+Two known obstacles, both already measured:
+
+- `base_budget_bytes` is `bytes_per_us * SCHEDULER_TICK_INTERVAL_US`
+  floored at `SCHEDULER_TICK_BUDGET_FLOOR_BYTES` (256 KB), and the floor
+  dominates every realistic interval, so the bandwidth term currently never
+  decides anything. Elapsed-time billing was tried and measured as a no-op
+  for exactly this reason.
+- A continuation is only created when a drain stops with budget left
+  (`scheduler_continuation_after_drain`), which does not happen while the
+  clamp sets the budget to what the drain then spends. Resumption needs the
+  budget to be the bandwidth's, not the buffer's, before it has anything to
+  resume.
+
+**Acceptance:** the slow-link sweep keeps 32 KiB's staleness (~51) while the
+saturated fast-link sweep keeps 16 MiB's throughput (~24 MB).
 
 ## What this does not claim
 
