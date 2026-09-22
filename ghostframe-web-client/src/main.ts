@@ -812,33 +812,16 @@ async function main() {
       // The histogram exposes the *distribution* of pass counts so we
       // can tell e.g. "most are stuck at 8" (LL3 + a few bit-planes)
       // vs "most are at 14 but a handful missing one or two passes".
-      // `Cdf53CoverageEntry` (cdf53_coverage.ts) was deleted in Phase 4b
-      // along with its sole writer (finishAssembly); window.__cdf53Coverage
-      // is never populated post-cutover, so this map is always empty. Only
-      // `.passMask` was ever read here, so a minimal inline shape replaces
-      // the deleted type rather than pulling the module back in.
-      const cdf53Cov = (w.__cdf53Coverage ?? new Map<number, { passMask: number }>()) as Map<number, { passMask: number }>;
-      let cdf53Refined = 0;
-      let cdf53Partial = 0;
-      const cdf53PassHist = new Array(15).fill(0); // bucket index = passes received (0..14)
-      const FULL_MASK_14 = (1 << 14) - 1;
-      for (const v of cdf53Cov.values()) {
-        // Mask off bits >= 14 in case of header corruption.
-        const mask = v.passMask & FULL_MASK_14;
-        let bits = mask;
-        bits = bits - ((bits >> 1) & 0x5555);
-        bits = (bits & 0x3333) + ((bits >> 2) & 0x3333);
-        bits = (bits + (bits >> 4)) & 0x0f0f;
-        const popcount = ((bits * 0x0101) >> 8) & 0xff;
-        cdf53PassHist[popcount] = (cdf53PassHist[popcount] ?? 0) + 1;
-        if (popcount === 14) cdf53Refined++;
-        else if (popcount > 0) cdf53Partial++;
-      }
-      const cdf53Tiles = cdf53Cov.size;
-      const histCompact = cdf53PassHist
-        .map((n, i) => (n > 0 ? `${i}:${n}` : ''))
-        .filter(Boolean)
-        .join(' ');
+      // The Cdf53 pass histogram that used to be computed here is gone.
+      // It read `window.__cdf53Coverage`, whose sole writer (finishAssembly)
+      // was deleted in the wasm cutover's Phase 4b, so every value it derived
+      // -- tiles, refined, partial, the histogram -- was structurally zero.
+      // None of them were printed, so this was ~20 lines of dead arithmetic
+      // running on every stats tick, and a decoy for anyone reading the file
+      // while debugging convergence.
+      //
+      // The live equivalent is `core.cdf53Coverage()` below, read back from
+      // the wasm core, which is the state that actually exists.
       // Compose the line + an identity key for idle suppression. The
       // key excludes `raf:` (which always changes) and the cdf53fails
       // counter (also bookkeeping that creeps) — we suppress only when
