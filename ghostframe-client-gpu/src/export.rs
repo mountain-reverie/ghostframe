@@ -685,13 +685,22 @@ impl ExportedImage {
         // SAFETY: `phys` is a valid physical device handle from `with_raw`.
         let props = unsafe { instance.get_physical_device_memory_properties(phys) };
 
-        (0..props.memory_type_count)
-            .find(|&i| {
+        let matching = |flags: vk::MemoryPropertyFlags| {
+            (0..props.memory_type_count).find(|&i| {
                 type_bits & (1 << i) != 0
                     && props.memory_types[i as usize]
                         .property_flags
-                        .contains(preferred_flags)
+                        .contains(flags)
             })
+        };
+
+        // Three tiers, not two. The last resort used to be "any type at all",
+        // which on a device whose BAR aperture is unavailable can land an
+        // image the GPU renders into in plain host RAM. Losing CPU readback
+        // (a test-only feature) is a far smaller price than losing
+        // DEVICE_LOCAL, so try device-local-without-host-visible first.
+        matching(preferred_flags)
+            .or_else(|| matching(vk::MemoryPropertyFlags::DEVICE_LOCAL))
             .or_else(|| (0..props.memory_type_count).find(|&i| type_bits & (1 << i) != 0))
     }
 }
