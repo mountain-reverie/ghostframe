@@ -41,7 +41,10 @@ journalctl _UID=$(id -u guest) | grep 'cumulative emit'
 ```
 
 One line every 60 frames at `info`, which is the shipped default filter
-(`ghostframe=info`). The fields that matter here:
+(`ghostframe=info`); the first lands at `frame_seq=60`. A short or idle
+session may produce none at all -- a solid-colour e2e scene reached only ~3
+scheduler ticks and logged nothing, so give the session real activity before
+concluding the field is missing. The fields that matter here:
 
 | field | reading |
 |---|---|
@@ -51,6 +54,33 @@ One line every 60 frames at `info`, which is the shipped default filter
 | `queued_critical_latency_mean_us` / `_max_us` | **the headline metric** |
 | `send_datagram_errs_total` | quinn refusing datagrams -- overdrive |
 | `retransmit_attempts_total` | wasted work |
+
+### Grepping these out
+
+The formatter emits ANSI escapes *between* the field name and its value, so
+`grep -oE 'base_budget_bytes=[0-9]+'` matches **nothing** and looks like a
+missing field. Strip them first:
+
+```bash
+journalctl _UID=$(id -u guest) | grep 'cumulative emit' \
+  | sed -r 's/\x1B\[[0-9;]*[mK]//g' \
+  | grep -oE '(base_budget_bytes|tick_budget_floor_bytes|bytes_per_us|queued_critical_latency_(mean|max)_us)=[0-9.e+-]+'
+```
+
+Verified against a real container session on 2026-09-22:
+
+```
+base_budget_bytes=2039581   tick_budget_floor_bytes=1198
+bytes_per_us=67.98          smoothed_rtt_us=6148.65
+queued_critical_latency_mean_us=152486   queued_critical_latency_max_us=162237
+send_datagram_errs_total=0  retransmit_attempts_total=0
+```
+
+`1198` is one MTU, which is the shipped floor. `67.98 * 33333 * 0.90 =
+2,039,575`, matching `base_budget_bytes` -- the bandwidth term is setting the
+budget and the floor is inert, which is the intended state. (That container
+link is ~544 Mbit, above the ~70 Mbit knee, so the old floor would not have
+bound there either. A slow real link is where the change matters.)
 
 **The first check is that the change is live at all:** if
 `base_budget_bytes == tick_budget_floor_bytes` on every line, the estimate is
