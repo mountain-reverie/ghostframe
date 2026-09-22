@@ -657,6 +657,17 @@ pub struct IoBridge {
     #[cfg(any(test, feature = "test-loss-injection"))]
     pub(crate) drop_plan:
         Option<std::sync::Arc<std::sync::Mutex<crate::transport::drop_plan::DropPlan>>>,
+
+    /// Lower bound applied to `base_budget_bytes`, defaulting to
+    /// `SCHEDULER_TICK_BUDGET_FLOOR_BYTES`.
+    ///
+    /// A field rather than the bare constant because the constant is not a
+    /// neutral safety net: 256 KiB per 33.3 ms tick is 7.86 MB/s, so the
+    /// floor only stops dominating above ~70 Mbit/s. Every link this system
+    /// has been measured on is below that, which means the bandwidth-derived
+    /// term has never once bound and the budget has been a constant. Varying
+    /// the floor is how a test reaches the other side of that knee.
+    tick_budget_floor_bytes: usize,
     /// Remaining frames to force all-dirty after a new session connects.
     /// QUIC slow-start can only deliver a fraction of tiles in the first burst;
     /// forcing dirty for several frames lets the congestion window open.
@@ -1312,6 +1323,7 @@ impl IoBridge {
             skip_palette_session_reset: lib_config.transport.skip_palette_session_reset,
             #[cfg(any(test, feature = "test-loss-injection"))]
             drop_plan: None,
+            tick_budget_floor_bytes: SCHEDULER_TICK_BUDGET_FLOOR_BYTES,
             force_dirty_frames: 0,
             palette_table: crate::encoder::pal_rle::PaletteTable::new(),
             client_caps: crate::transport::client_caps::ClientCapabilities::default(),
@@ -1970,7 +1982,7 @@ impl IoBridge {
         (((self.adaptation_context.bytes_per_us as f64)
             * SCHEDULER_TICK_INTERVAL_US
             * SCHEDULER_TICK_BUDGET_FRACTION) as usize)
-            .max(SCHEDULER_TICK_BUDGET_FLOOR_BYTES)
+            .max(self.tick_budget_floor_bytes)
     }
 
     /// Shared scheduler dispatch: grid-sync → RTT update → bump+encode+enqueue
@@ -5845,6 +5857,7 @@ impl IoBridge {
             skip_palette_session_reset: lib_config.transport.skip_palette_session_reset,
             #[cfg(any(test, feature = "test-loss-injection"))]
             drop_plan: None,
+            tick_budget_floor_bytes: SCHEDULER_TICK_BUDGET_FLOOR_BYTES,
             force_dirty_frames: 0,
             palette_table: crate::encoder::pal_rle::PaletteTable::new(),
             client_caps: crate::transport::client_caps::ClientCapabilities::default(),
@@ -6037,6 +6050,15 @@ impl IoBridge {
         plan: std::sync::Arc<std::sync::Mutex<crate::transport::drop_plan::DropPlan>>,
     ) {
         self.drop_plan = Some(plan);
+    }
+
+    /// Override the `base_budget_bytes` floor. See `tick_budget_floor_bytes`
+    /// for why this is worth varying: the default sits above every link the
+    /// system actually serves, so without lowering it a test cannot observe
+    /// the bandwidth-derived budget binding at all.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub fn set_tick_budget_floor_bytes(&mut self, bytes: usize) {
+        self.tick_budget_floor_bytes = bytes;
     }
 
     /// Clone of the `Arc` behind `emitter_stats_publish`, for a caller that
