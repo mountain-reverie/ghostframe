@@ -64,14 +64,18 @@ time = { version = "0.3" }
 # ash 0.38 — raw Vulkan bindings for DMA-BUF import readback
 ash = { version = "0.38", default-features = false, features = ["std", "debug", "loaded"] }
 
-# wgpu 30.0.1 — the newest release that compiles on the pinned 1.96.1
-# toolchain (verified 2026-09-22). Vulkan-only: the client's output is a
-# dmabuf, so the other backends are dead weight in the shipped library.
+# wgpu 30.0.1 — the current newest release, which builds on the 1.96.1
+# toolchain this workspace pins (verified 2026-09-22; there is no 31.x to
+# reject). Vulkan-only: the native client's output is a dmabuf, so the other
+# backends are dead weight in a library other projects link.
 wgpu = { version = "=30.0.1", default-features = false, features = ["vulkan", "wgsl"] }
 
-# wgpu-hal — needed for the escape hatch only: wgpu exposes no dmabuf export,
-# so we build the VkDevice ourselves and hand it up via from_hal. Must track
-# wgpu's version exactly.
+# wgpu-hal — the escape hatch for the one thing wgpu cannot do. wgpu 30 can
+# IMPORT a dmabuf (Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF plus
+# texture_from_dmabuf_fd) but has no export counterpart, so the client
+# allocates exportable images itself and re-wraps them with
+# wgpu_hal::vulkan::Device::texture_from_raw. Must track wgpu's version
+# exactly: texture_from_raw's signature has changed across releases.
 wgpu-hal = { version = "=30.0.1", default-features = false, features = ["vulkan"] }
 
 # ffmpeg-next 9.0.0 — Rust bindings for FFmpeg (libavcodec, libavutil, libswscale)
