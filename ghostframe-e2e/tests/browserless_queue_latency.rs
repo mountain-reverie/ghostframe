@@ -66,6 +66,7 @@ fn burst_scene(cols: u8, rows: u8, secs: u64) -> BrowserlessScene {
     BrowserlessScene {
         seed: 0x0B0B_0001,
         datagram_send_buffer_bytes: None,
+        tick_budget_floor_bytes: None,
         load: SceneLoad::Script(vec![full_grid_frame(cols, rows)]),
         cadence_us: DEFAULT_CADENCE_US,
         // No loss, no delay, no cap: anything the queue does here is the
@@ -266,47 +267,52 @@ async fn refinement_work_queues_behind_critical_work() {
 
 /// **A known fidelity gap, pinned so it cannot be forgotten.**
 ///
-/// Critical-tier queueing is *not* reproduced **on a lossless link**. In
-/// production the first frame leaves critical passes waiting 2,289,529 us on
-/// average against 22,748 us on the wire -- a 100x separation, 16.8 s at
-/// worst. On a lossless link here the two are *identical*, not close: equal,
-/// at every backlog size and link capacity measured, including production's
-/// own 2040-tile grid at 2 Mbps.
+/// Critical-tier queueing **is** now reproduced on a lossless link -- but
+/// not by the mechanism this test was built to wait for.
 ///
-/// Scope matters. `retransmission_alone_separates_queued_from_sent` shows
-/// that adding loss *does* separate the two clocks (ratio ~6.9), because a
-/// retransmit moves `last_sent_at` and leaves `queued_at` alone. That is a
-/// different cause from backlog, and it is why this test pins a lossless
-/// scene: it is isolating scheduler queueing specifically.
+/// It used to assert that `queued->ACK` and `last_sent->ACK` were *exactly
+/// equal* for the critical tier, and they were, at every backlog size and
+/// link capacity tried. The doc predicted the equality would break once
+/// backpressure reached quinn's `datagram_send_buffer`, and said to replace
+/// the test with a ratio bound when it did.
 ///
-/// Refinement queueing (above) *is* reproduced, so this is not a broken
-/// metric -- it is specifically the critical tier, which drains first under
-/// pass-major ordering and here always fits the first drain.
+/// The equality did break. The predicted cause is not what broke it.
 ///
-/// The cause is documented at `scheduler_continuation_after_drain` in
-/// `io_bridge.rs`: the netsim's token bucket is consumed inside
-/// `send_to_all_sessions`, *below* quinn's `datagram_send_buffer`. It shapes
-/// what reaches the wire but cannot stop the scheduler from over-popping into
-/// quinn. The socketpair write never blocks, so the send buffer never fills,
-/// so `Event::DatagramsUnblocked` never throttles the drain -- and that
-/// pull-driven pacing is what makes production's critical passes wait.
+/// What changed is the budget floor: `base_budget_bytes` used to floor at a
+/// flat 256 KiB per 33.3 ms tick (7.86 MB/s), which is far above any link
+/// here, so the scheduler over-popped into quinn on every tick and nothing
+/// ever waited with `queued_at` stamped on it. With the floor at one
+/// datagram the bandwidth term governs, the scheduler pops what the path can
+/// carry, and the remainder waits in the scheduler queue -- which is exactly
+/// what `queued_at -> ACK` measures. The wait moved from quinn's buffer into
+/// the scheduler, where work can still be superseded rather than sent stale.
 ///
-/// This asserts the gap still exists. When backpressure reaches the send
-/// buffer, it will fail -- and that failure is the signal to replace it with
-/// a real bound on the critical-tier ratio.
+/// So this is *not* a reproduction of production's cause. Production shows a
+/// ~100x separation and 16.8 s at worst; measured here is 3.28x, 841 ms mean
+/// and 2.68 s max. Same signature, an order of magnitude smaller, different
+/// mechanism. The harness still cannot exercise production's path, because
+/// the netsim's token bucket is consumed in `send_to_all_sessions`, *below*
+/// the send buffer -- see `feedback-browserless-harness-fidelity`.
+///
+/// The bound below therefore asserts only what is true here: the two clocks
+/// diverge, so the metric is live and the scheduler is pacing rather than
+/// over-popping. It deliberately does not encode production's ratio.
 #[tokio::test(start_paused = true)]
-async fn critical_tier_queueing_is_not_yet_reproduced() {
+async fn critical_tier_queueing_separates_once_the_scheduler_paces() {
     let r = run_browserless(capped_scene(60, 34, 250_000)).await.expect("ran");
     report("critical_fidelity", &r);
     assert_measured(&r, 64);
 
-    assert_eq!(
-        r.queued_critical_latency_mean_us, r.critical_latency_mean_us,
-        "queued->ACK and last_sent->ACK have diverged for the critical tier \
-         ({} vs {} us). If backpressure now reaches quinn's \
-         datagram_send_buffer, this harness can finally reproduce production's \
-         critical-tier queueing (2.3 s mean / 16.8 s max against 22.7 ms on \
-         the wire) -- delete this test and assert on the ratio instead.",
+    let observed = ratio(
+        r.queued_critical_latency_mean_us,
+        r.critical_latency_mean_us,
+    );
+    assert!(
+        observed > 1.5,
+        "queued->ACK and last_sent->ACK have collapsed back together for the \
+         critical tier (ratio={observed:.2}, {} vs {} us). That means the \
+         scheduler is over-popping into quinn again rather than pacing -- \
+         suspect the budget floor having re-grown above the bandwidth term.",
         r.queued_critical_latency_mean_us,
         r.critical_latency_mean_us
     );
@@ -342,6 +348,15 @@ use ghostframe_e2e::netsim::{DropPlan, DropRule};
 #[tokio::test(start_paused = true)]
 async fn retransmission_alone_separates_queued_from_sent() {
     let mut scene = burst_scene(8, 8, 25);
+    // Pinned to the old flat 256 KiB budget floor. This test is about what
+    // the two clocks *mean* -- a retransmit moves `last_sent_at` and leaves
+    // `queued_at` alone, so the two separate -- and it needs enough
+    // retransmission for that to show in a mean. Under the shipped floor
+    // (one datagram) the sender paces and retransmission nearly vanishes:
+    // measured 38 retransmits and ratio 1.22, against the >2.0 this asserts.
+    // Fewer retransmits is the point of that change, so the fix here is to
+    // pin the condition, not to weaken the bound.
+    scene.tick_budget_floor_bytes = Some(256 * 1024);
     scene.drops = DropPlan::new(vec![DropRule {
         tile_x: 2,
         tile_y: 2,

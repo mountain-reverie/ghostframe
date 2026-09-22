@@ -41,6 +41,7 @@ fn scene() -> BrowserlessScene {
     BrowserlessScene {
         seed: 0xDE7E_0001,
         datagram_send_buffer_bytes: None,
+        tick_budget_floor_bytes: None,
         load: SceneLoad::Script(vec![
             FrameScript {
                 tiles: vec![
@@ -126,6 +127,7 @@ async fn an_empty_scene_is_byte_identical() {
     let empty = || BrowserlessScene {
         seed: 0xDE7E_0002,
         datagram_send_buffer_bytes: None,
+        tick_budget_floor_bytes: None,
         load: SceneLoad::Script(vec![]),
         cadence_us: DEFAULT_CADENCE_US,
         net: NetProfile::perfect(),
