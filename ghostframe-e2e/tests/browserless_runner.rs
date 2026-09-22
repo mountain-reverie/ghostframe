@@ -22,6 +22,7 @@ use ghostframe_e2e::netsim::{Bottleneck, CapTimeline, DropPlan, DropRule, NetPro
 async fn the_session_establishes_over_the_socketpair() {
     let scene = BrowserlessScene {
         seed: 1,
+        datagram_send_buffer_bytes: None,
         load: SceneLoad::Script(vec![]),
         cadence_us: DEFAULT_CADENCE_US,
         net: NetProfile::perfect(),
@@ -49,6 +50,7 @@ async fn the_session_establishes_over_the_socketpair() {
 async fn bytes_actually_cross_the_socketpair() {
     let scene = BrowserlessScene {
         seed: 2,
+        datagram_send_buffer_bytes: None,
         load: SceneLoad::Script(vec![]),
         cadence_us: DEFAULT_CADENCE_US,
         net: NetProfile::perfect(),
@@ -82,6 +84,7 @@ async fn bytes_actually_cross_the_socketpair() {
 async fn a_lossy_link_still_establishes_and_records_drops() {
     let scene = BrowserlessScene {
         seed: 7,
+        datagram_send_buffer_bytes: None,
         load: SceneLoad::Script(vec![]),
         cadence_us: DEFAULT_CADENCE_US,
         net: NetProfile {
@@ -117,6 +120,7 @@ async fn a_lossy_link_still_establishes_and_records_drops() {
 async fn a_single_solid_tile_arrives_on_a_perfect_link() {
     let scene = BrowserlessScene {
         seed: 1,
+        datagram_send_buffer_bytes: None,
         load: SceneLoad::Script(vec![FrameScript {
             tiles: vec![(
                 (0, 0),
@@ -161,6 +165,7 @@ async fn a_single_solid_tile_arrives_on_a_perfect_link() {
 async fn a_second_frame_overwrites_the_first_frames_tile() {
     let scene = BrowserlessScene {
         seed: 3,
+        datagram_send_buffer_bytes: None,
         load: SceneLoad::Script(vec![
             FrameScript {
                 tiles: vec![(
@@ -219,6 +224,7 @@ async fn a_second_frame_overwrites_the_first_frames_tile() {
 async fn cdf53_converges_to_lossless_under_10pct_loss() {
     let scene = BrowserlessScene {
         seed: 0x5EED,
+        datagram_send_buffer_bytes: None,
         load: SceneLoad::Script(vec![FrameScript {
             tiles: vec![(
                 (0, 0),
@@ -273,6 +279,7 @@ async fn cdf53_converges_to_lossless_under_10pct_loss() {
 async fn superseded_generations_never_render() {
     let scene = BrowserlessScene {
         seed: 0xB0B,
+        datagram_send_buffer_bytes: None,
         // Same tile rewritten with a different colour on each of 20 frames.
         load: SceneLoad::Script(
             (0..20u8)
@@ -346,6 +353,7 @@ async fn a_tighter_cap_sheds_more_traffic() {
     async fn run_at(cap_bps: u64) -> (u64, u64) {
         let scene = BrowserlessScene {
             seed: 0xCAFE,
+            datagram_send_buffer_bytes: None,
             load: SceneLoad::Script(busy_frames(8)),
             cadence_us: DEFAULT_CADENCE_US,
             net: NetProfile {
@@ -402,6 +410,7 @@ async fn a_tighter_cap_sheds_more_traffic() {
 async fn every_cdf53_pass_eventually_lands() {
     let scene = BrowserlessScene {
         seed: 0xF00D,
+        datagram_send_buffer_bytes: None,
         load: SceneLoad::Script(vec![FrameScript {
             tiles: (0..4u8)
                 .flat_map(|x| {
@@ -457,6 +466,7 @@ async fn every_cdf53_pass_eventually_lands() {
 async fn bwe_estimator_is_fed_and_epoch_consistent() {
     let scene = BrowserlessScene {
         seed: 0xB4E,
+        datagram_send_buffer_bytes: None,
         load: SceneLoad::Script(busy_frames(8)),
         cadence_us: DEFAULT_CADENCE_US,
         net: NetProfile {
@@ -594,6 +604,7 @@ async fn a_lossless_link_with_a_real_rtt_does_not_retransmit() {
 
     let scene = BrowserlessScene {
         seed: 0x9E77_0001,
+        datagram_send_buffer_bytes: None,
         load: SceneLoad::Script(busy_frames_grid(4, 6, 6)),
         cadence_us: DEFAULT_CADENCE_US,
         net: NetProfile {
@@ -711,6 +722,7 @@ async fn retransmits_fire_under_loss_but_not_on_a_perfect_link() {
     async fn run_at(net: NetProfile, seed: u64) -> (u64, u64, u64, u64) {
         let scene = BrowserlessScene {
             seed,
+            datagram_send_buffer_bytes: None,
             load: SceneLoad::Script(busy_frames(2)),
             cadence_us: DEFAULT_CADENCE_US,
             net,
@@ -816,6 +828,7 @@ async fn bwe_tier_latency_baseline() {
         let seed = 0xB17E_0000_u64.wrapping_add(i);
         let scene = BrowserlessScene {
             seed,
+            datagram_send_buffer_bytes: None,
             load: SceneLoad::Script(busy_frames(2)),
             cadence_us: DEFAULT_CADENCE_US,
             net: NetProfile {
@@ -1001,6 +1014,7 @@ async fn probe_windows_are_opened_on_a_busy_link() {
         let seed = 0xF11E_0000_u64.wrapping_add(i);
         let scene = BrowserlessScene {
             seed,
+            datagram_send_buffer_bytes: None,
             load: SceneLoad::Script(busy_frames_grid(8, 8, 8)),
             cadence_us: DEFAULT_CADENCE_US,
             net: NetProfile::perfect(),
@@ -1079,6 +1093,7 @@ async fn probe_windows_are_abandoned_on_a_demand_starved_link() {
         let seed = 0xB17E_1000_u64.wrapping_add(i);
         let scene = BrowserlessScene {
             seed,
+            datagram_send_buffer_bytes: None,
             load: SceneLoad::Script(busy_frames_grid(2, 2, 2)),
             cadence_us: DEFAULT_CADENCE_US,
             net: NetProfile {
@@ -1164,6 +1179,7 @@ async fn a_static_region_still_refines_while_a_busy_one_saturates() {
 
     let scene = BrowserlessScene {
         seed: 0xF00D_5747,
+        datagram_send_buffer_bytes: None,
         load: SceneLoad::Script(frames),
         cadence_us: DEFAULT_CADENCE_US,
         net: NetProfile {
@@ -1328,6 +1344,7 @@ async fn a_link_with_propagation_delay_carries_datagrams_concurrently() {
 
     let scene = BrowserlessScene {
         seed: 0x5D1A_7E00,
+        datagram_send_buffer_bytes: None,
         load: SceneLoad::Script(busy_frames_grid(8, 8, 8)),
         cadence_us: DEFAULT_CADENCE_US,
         net: NetProfile {
@@ -1387,6 +1404,7 @@ async fn run_bottleneck_scene(
 ) -> ghostframe_e2e::harness::browserless::BrowserlessResult {
     let scene = BrowserlessScene {
         seed,
+        datagram_send_buffer_bytes: None,
         load: SceneLoad::Profile(LoadProfile {
             cadence_us: PRODUCTION_CADENCE_US,
             churn: Churn::Region { tiles_per_tick: 32 },
@@ -1697,6 +1715,7 @@ async fn the_estimate_follows_a_mid_scene_capacity_step_up() {
 async fn a_solid_tile_whose_only_datagram_is_dropped_is_still_repaired() {
     let scene = BrowserlessScene {
         seed: 0x0D30_0001,
+        datagram_send_buffer_bytes: None,
         load: SceneLoad::Script(vec![FrameScript {
             tiles: vec![
                 (
@@ -1784,6 +1803,7 @@ async fn a_solid_tile_whose_only_datagram_is_dropped_is_still_repaired() {
 async fn a_static_screen_stops_asking_for_passes() {
     let scene = BrowserlessScene {
         seed: 0x57A1_0001,
+        datagram_send_buffer_bytes: None,
         load: SceneLoad::Script(vec![FrameScript {
             tiles: (0..4u8)
                 .flat_map(|x| {
@@ -1853,6 +1873,7 @@ async fn a_static_screen_stops_asking_for_passes() {
 async fn the_client_gives_up_on_a_pass_it_can_never_get() {
     let scene = BrowserlessScene {
         seed: 0xDEAD_0002,
+        datagram_send_buffer_bytes: None,
         load: SceneLoad::Script(vec![FrameScript {
             tiles: vec![
                 (
@@ -1955,6 +1976,7 @@ async fn refinement_completes_when_a_second_frame_supersedes_the_first() {
 
     let scene = BrowserlessScene {
         seed: 0x50BE_5EED,
+        datagram_send_buffer_bytes: None,
         load: SceneLoad::Script(vec![
             FrameScript {
                 tiles: tiles_of(&a),

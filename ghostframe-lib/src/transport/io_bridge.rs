@@ -718,6 +718,16 @@ pub struct IoBridge {
     /// unobservable: it was dead for the whole life of the code (its only
     /// trigger, `Event::DatagramsUnblocked`, cannot fire while the capacity
     /// clamp prevents `Blocked`) and nothing showed that.
+    /// Republished copy of `datagram_send_errs`, for a harness that needs to
+    /// read it back after the bridge has moved into a spawned task.
+    ///
+    /// `SendDatagramError::Blocked` is the signal this whole area turns on:
+    /// quinn only emits `DatagramsUnblocked` after one, and
+    /// `send_to_all_sessions` currently drops the rejected datagram. A test
+    /// asserting anything about that path must be able to prove Blocked
+    /// actually happened, or it passes on a scene that never provoked it.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    send_errs_publish: std::sync::Arc<std::sync::Mutex<u64>>,
     continuation_resumes: u64,
     continuation_drained_bytes: u64,
     /// Inbound datagrams whose `InboundKind` has no route on this path.
@@ -1320,6 +1330,8 @@ impl IoBridge {
                 crate::transport::fragment_coverage::FRAGMENT_COVERAGE_CAPACITY,
             ),
             unroutable_inbound_datagrams: 0,
+            #[cfg(any(test, feature = "browserless-harness"))]
+            send_errs_publish: std::sync::Arc::new(std::sync::Mutex::new(0)),
             continuation_resumes: 0,
             continuation_drained_bytes: 0,
             last_emitted_dimensions: None,
@@ -5251,6 +5263,10 @@ impl IoBridge {
             {
                 *self.bwe_publish.lock().unwrap() = self.bwe.snapshot();
                 *self.emitter_stats_publish.lock().unwrap() = self.reliable_emitter.stats;
+                #[cfg(any(test, feature = "browserless-harness"))]
+                {
+                    *self.send_errs_publish.lock().unwrap() = self.datagram_send_errs;
+                }
                 *self.latency_stats_publish.lock().unwrap() =
                     (self.critical_latency_stats, self.refinement_latency_stats);
                 *self.queued_latency_stats_publish.lock().unwrap() = (
@@ -5821,6 +5837,8 @@ impl IoBridge {
                 crate::transport::fragment_coverage::FRAGMENT_COVERAGE_CAPACITY,
             ),
             unroutable_inbound_datagrams: 0,
+            #[cfg(any(test, feature = "browserless-harness"))]
+            send_errs_publish: std::sync::Arc::new(std::sync::Mutex::new(0)),
             continuation_resumes: 0,
             continuation_drained_bytes: 0,
             last_emitted_dimensions: None,
@@ -6007,6 +6025,14 @@ impl IoBridge {
     ) -> std::sync::Arc<std::sync::Mutex<crate::transport::reliable_emitter::emitter::EmitterStats>>
     {
         self.emitter_stats_publish.clone()
+    }
+
+    /// Clone of the `Arc` behind `send_errs_publish` — cumulative
+    /// `send_datagram` failures, overwhelmingly `Blocked`. Same
+    /// ownership problem and fix as `emitter_stats_publish_handle`.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub fn send_errs_publish_handle(&self) -> std::sync::Arc<std::sync::Mutex<u64>> {
+        self.send_errs_publish.clone()
     }
 
     /// Clone of the `Arc` behind `latency_stats_publish` — `(critical,

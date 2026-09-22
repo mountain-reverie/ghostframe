@@ -68,6 +68,7 @@ jobs:
       - run: cargo test --test browserless_runner -- --test-threads=1
       - run: cargo test --test browserless_determinism -- --test-threads=1
       - run: cargo test --test browserless_queue_latency -- --test-threads=1
+      - run: cargo test --test browserless_blocked_path -- --test-threads=1
 
   harness-smoke:
     name: harness-smoke

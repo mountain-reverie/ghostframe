@@ -40,6 +40,7 @@ use ghostframe_e2e::netsim::NetProfile;
 fn scene() -> BrowserlessScene {
     BrowserlessScene {
         seed: 0xDE7E_0001,
+        datagram_send_buffer_bytes: None,
         load: SceneLoad::Script(vec![
             FrameScript {
                 tiles: vec![
@@ -124,6 +125,7 @@ async fn the_same_seed_produces_the_same_behaviour() {
 async fn an_empty_scene_is_byte_identical() {
     let empty = || BrowserlessScene {
         seed: 0xDE7E_0002,
+        datagram_send_buffer_bytes: None,
         load: SceneLoad::Script(vec![]),
         cadence_us: DEFAULT_CADENCE_US,
         net: NetProfile::perfect(),

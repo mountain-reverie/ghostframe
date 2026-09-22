@@ -113,6 +113,18 @@ impl QuicServer {
     /// Returns `Err` if TLS configuration fails (cert generation, key parsing,
     /// cipher-suite negotiation, etc.).
     pub fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::new_with_datagram_send_buffer(datagram_send_buffer_bytes())
+    }
+
+    /// `new`, with an explicit datagram send-buffer size.
+    ///
+    /// Exists so a test can shrink the buffer without touching
+    /// `GHOSTFRAME_DATAGRAM_SEND_BUFFER_BYTES`: that is process-global, and
+    /// browserless scenes run in-process and in parallel, so an env var
+    /// would race between scenes rather than configure one.
+    pub fn new_with_datagram_send_buffer(
+        datagram_send_buffer: usize,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         // --- 1. Generate self-signed cert ---
         // SANs include both "localhost" (DNS) and "127.0.0.1" (IP) so that
         // Chromium's cert-hash pinning works when the E2E forwarder is bound to
@@ -162,7 +174,7 @@ impl QuicServer {
         // `datagram_receive_buffer_size` takes `Option<usize>`.
         transport_config.datagram_receive_buffer_size(Some(65536));
         // `datagram_send_buffer_size` takes `usize` (not Option) in quinn-proto 0.11.
-        transport_config.datagram_send_buffer_size(datagram_send_buffer_bytes());
+        transport_config.datagram_send_buffer_size(datagram_send_buffer);
 
         // --- 6. ServerConfig ---
         let mut server_config = ServerConfig::with_crypto(Arc::new(quic_tls));
