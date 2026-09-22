@@ -16,6 +16,7 @@
 #![cfg_attr(not(test), warn(clippy::wildcard_enum_match_arm))]
 
 pub mod config;
+pub mod export;
 pub mod wgpu_ctx;
 
 use thiserror::Error;

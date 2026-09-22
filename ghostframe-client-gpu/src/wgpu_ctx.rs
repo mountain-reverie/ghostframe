@@ -124,4 +124,29 @@ impl WgpuContext {
         let hal_dev = unsafe { self.device.as_hal::<wgpu_hal::api::Vulkan>() }?;
         Some(f(hal_dev.raw_device(), hal_dev.raw_physical_device()))
     }
+
+    /// Run `f` with the raw Vulkan instance, device, and physical device.
+    ///
+    /// `export.rs` needs the `ash::Instance` too, to construct the
+    /// `VK_KHR_external_memory_fd` / `VK_EXT_image_drm_format_modifier`
+    /// extension function-pointer tables, which `ash`'s device-extension
+    /// wrappers require at construction time even though every call after
+    /// that goes through the device.
+    ///
+    /// Returns `None` if the backend is not Vulkan.
+    pub fn with_raw<R>(
+        &self,
+        f: impl FnOnce(&ash::Instance, &ash::Device, ash::vk::PhysicalDevice) -> R,
+    ) -> Option<R> {
+        // SAFETY: the borrowed instance/device must not outlive `self`, and
+        // we must never destroy anything wgpu owns -- we only allocate our
+        // own images bound to memory we export.
+        let hal_inst = unsafe { self.instance.as_hal::<wgpu_hal::api::Vulkan>() }?;
+        let hal_dev = unsafe { self.device.as_hal::<wgpu_hal::api::Vulkan>() }?;
+        Some(f(
+            hal_inst.shared_instance().raw_instance(),
+            hal_dev.raw_device(),
+            hal_dev.raw_physical_device(),
+        ))
+    }
 }
