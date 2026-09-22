@@ -273,13 +273,22 @@ sentinel-driven resize are lost.
 
 ### 5.5 Synchronisation: a deliberate v1 simplification
 
-wgpu's submit does not expose semaphore signalling, so exporting a real
-`sync_file` means dropping to the hal queue. For v1, `device.poll(Wait)` after the
-blit and report `acquire_fence_fd = -1` (already signalled). That is a CPU stall
-per frame on a small copy, and it is correct. The field exists from day one so
-exporting a real fence later is not an API break.
+**Corrected 2026-09-22 against wgpu 30.0.1.** This section originally said wgpu
+cannot signal a semaphore on submit. That is false: `wgpu_hal::vulkan::Queue`
+exposes `add_signal_semaphore` and `add_wait_semaphore`
+(`wgpu-hal-30.0.1/src/vulkan/mod.rs:1522-1560`), so an exportable binary
+semaphore can be signalled on the blit submission and turned into a `sync_file`
+fd with `vkGetSemaphoreFdKHR`.
 
-This is a known cost we are choosing to defer, not an oversight.
+M1 still ships the simple version — `device.poll(PollType::wait_indefinitely())`
+after the blit, reporting `acquire_fence_fd = -1` (already signalled). It is
+correct, the copy is small, and it keeps the export ring focused. The field
+exists from day one so exporting a real fence later is not an API break.
+
+The difference is that this is now a choice, not a limitation. The upgrade is a
+contained change to `ExportRing::publish` plus one more device extension
+(`VK_KHR_external_semaphore_fd`), and it is the first optimisation to make if
+frame pacing shows the stall.
 
 ## 6. Damage tracking
 
