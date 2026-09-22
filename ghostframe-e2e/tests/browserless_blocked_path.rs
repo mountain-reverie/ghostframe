@@ -330,3 +330,117 @@ async fn work_rejected_by_a_full_send_buffer_still_reaches_the_client() {
         squeezed.rto_fired
     );
 }
+
+/// A fast link, to check a small buffer does not starve the pipe.
+///
+/// The main sweep runs at 2 Mbit, where the bandwidth-delay product is ~6 KB
+/// and 32 KiB is five times it. On a fast path the BDP is the binding number:
+/// 50 Mbit with 50 ms RTT is ~312 KB in flight, and a buffer below that
+/// cannot keep the pipe full however well it bounds latency. A default has
+/// to survive both.
+fn fast_link_scene(cols: u8, rows: u8, send_buffer: Option<usize>) -> BrowserlessScene {
+    let mut scene = squeezed_scene(cols, rows, send_buffer);
+    scene.net = NetProfile {
+        delay_us: 25_000, // 50 ms RTT
+        cap: CapTimeline::constant(6_250_000), // 50 Mbit, in BYTES/s
+        bottleneck: Some(Bottleneck::wifi()),
+        ..NetProfile::perfect()
+    };
+    scene
+}
+
+/// Sustained load on a fast link, to see whether a small buffer caps
+/// throughput.
+///
+/// The single-frame fast-link probe cannot answer this: every buffer size
+/// delivered the same ~2.66 MB, which is the offered work, not the link's
+/// capacity. If offered load never exceeds what the link can carry, a
+/// throughput ceiling is invisible.
+///
+/// It matters because the scheduler clamps each drain to
+/// `QUINN_SEND_BUFFER_SAFETY_FRACTION * send_buffer_space()`, so throughput
+/// is bounded by roughly `drains_per_second * 0.8 * buffer_size`. At 32 KiB
+/// and ~30 drains/s that is ~780 KB/s -- about 6 Mbit, which would cap a
+/// 50 Mbit path. This scene offers far more work than the link can carry so
+/// the ceiling, if there is one, shows up as delivered bytes.
+fn saturating_fast_scene(cols: u8, rows: u8, send_buffer: Option<usize>) -> BrowserlessScene {
+    let frames: Vec<FrameScript> = (0..40).map(|_| full_grid_frame(cols, rows)).collect();
+    let mut scene = fast_link_scene(cols, rows, send_buffer);
+    scene.load = SceneLoad::Script(frames);
+    scene
+}
+
+/// Sweep the send-buffer size, so step C's default is chosen from data.
+///
+/// Reports the quantities the choice trades off: how much of the screen
+/// renders, how much staleness the buffer's depth causes, how many bytes it
+/// costs, and whether rejections stay bounded.
+#[tokio::test(start_paused = true)]
+#[ignore = "diagnostic-only: run on demand with --ignored"]
+async fn probe_saturating_fast_link() {
+    const COLS: u8 = 60;
+    const ROWS: u8 = 34;
+    for size in [Some(32 * 1024), Some(64 * 1024), Some(256 * 1024), Some(1024 * 1024), None] {
+        let r = run_browserless(saturating_fast_scene(COLS, ROWS, size)).await.expect("ran");
+        let label = size.map(|s| format!("{}KiB", s / 1024)).unwrap_or("16MiB".into());
+        println!(
+            "SAT {label:>7}: bytes={:>9} dg={:>6} stale={:>6} retx={:>6} \
+             send_errs={:>6} emit_q_peak={:>6}",
+            r.bytes_delivered_s2c,
+            r.datagrams_delivered_s2c,
+            r.stale_generation_tiles,
+            r.retransmit_attempts_total,
+            r.send_datagram_errs,
+            r.emission_queue_peak,
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+#[ignore = "diagnostic-only: run on demand with --ignored"]
+async fn probe_send_buffer_sizes_on_a_fast_link() {
+    const COLS: u8 = 60;
+    const ROWS: u8 = 34;
+    for size in [Some(32 * 1024), Some(256 * 1024), Some(1024 * 1024), None] {
+        let r = run_browserless(fast_link_scene(COLS, ROWS, size)).await.expect("ran");
+        let label = size.map(|s| format!("{}KiB", s / 1024)).unwrap_or("16MiB".into());
+        println!(
+            "FAST {label:>7}: tiles={:>4} stale={:>5} bytes={:>8} retx={:>5} \
+             send_errs={:>5} emit_q_peak={:>5}",
+            tiles_rendered(&r, COLS, ROWS),
+            r.stale_generation_tiles,
+            r.bytes_delivered_s2c,
+            r.retransmit_attempts_total,
+            r.send_datagram_errs,
+            r.emission_queue_peak,
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+#[ignore = "diagnostic-only: run on demand with --ignored"]
+async fn probe_send_buffer_sizes() {
+    const COLS: u8 = 60;
+    const ROWS: u8 = 34;
+    for size in [
+        Some(32 * 1024),
+        Some(64 * 1024),
+        Some(128 * 1024),
+        Some(256 * 1024),
+        Some(1024 * 1024),
+        None, // 16 MiB production default
+    ] {
+        let r = run_browserless(squeezed_scene(COLS, ROWS, size)).await.expect("ran");
+        let label = size.map(|s| format!("{}KiB", s / 1024)).unwrap_or("16MiB".into());
+        println!(
+            "SWEEP {label:>7}: tiles={:>4} stale={:>5} bytes={:>8} retx={:>5} \
+             send_errs={:>5} emit_q_peak={:>5}",
+            tiles_rendered(&r, COLS, ROWS),
+            r.stale_generation_tiles,
+            r.bytes_delivered_s2c,
+            r.retransmit_attempts_total,
+            r.send_datagram_errs,
+            r.emission_queue_peak,
+        );
+    }
+}
