@@ -152,11 +152,25 @@ async fn the_production_send_buffer_never_rejects_a_datagram() {
 
 /// A small send buffer must provoke rejections -- the premise for the test
 /// below, isolated so a failure there cannot be mistaken for this.
+///
+/// # Why this scene has to overdrive on purpose
+///
+/// It did not, once. A 64 KiB buffer on a 2 Mbit link used to reject
+/// thousands of datagrams all by itself, because `base_budget_bytes` floored
+/// at a flat 256 KiB per 33.3 ms tick -- 7.86 MB/s, about 31x the link. The
+/// sender simply outran the path, and `Blocked` fell out of that.
+///
+/// Once the floor became one datagram and the bandwidth term took over, the
+/// sender paced itself and this scene stopped rejecting anything at all
+/// (`send_errs=0`). That is the fix working, but it would have quietly
+/// deleted the only coverage of step A's re-queue path, so the overdrive is
+/// now an explicit condition of the test rather than an accident of the
+/// default.
 #[tokio::test(start_paused = true)]
 async fn a_small_send_buffer_does_provoke_rejections() {
-    let r = run_browserless(squeezed_scene(8, 8, Some(64 * 1024)))
-        .await
-        .expect("scene ran");
+    let mut scene = squeezed_scene(8, 8, Some(64 * 1024));
+    scene.tick_budget_floor_bytes = Some(256 * 1024);
+    let r = run_browserless(scene).await.expect("scene ran");
     report("squeezed_64kib", &r);
     assert!(
         r.send_datagram_errs > 0,
@@ -272,15 +286,33 @@ async fn work_rejected_by_a_full_send_buffer_still_reaches_the_client() {
         "stale tiles squeezed={} roomy={}",
         squeezed.stale_generation_tiles, roomy.stale_generation_tiles
     );
+    // This used to assert `squeezed <= roomy`, on the reasoning that a small
+    // buffer holds less stale work and so renders fresher. That ordering was
+    // real while the buffer *was* the throughput governor: every drain was
+    // clamped to `0.80 * send_buffer_space()`, so buffer size set the rate.
+    //
+    // It is not real any more, and the assertion had to go rather than be
+    // re-tuned. With the budget floored at one datagram the bandwidth term
+    // governs, the buffer governs nothing, and the two runs land on top of
+    // each other -- measured 184 vs 177 stale, which is inside run-to-run
+    // noise for this harness (it is not seed-reproducible). An ordering
+    // assertion between two indistinguishable populations is a coin flip,
+    // exactly the failure documented in `bwe-googcc-review.md`.
+    //
+    // What is still worth pinning is that neither run is badly stale, which
+    // is a real property and does not depend on the two being ordered.
+    const STALE_CEILING: u32 = 1_000;
     assert!(
-        squeezed.stale_generation_tiles <= roomy.stale_generation_tiles,
-        "the small buffer was supposed to reduce staleness (that is the point \
-         of shrinking it) but produced {} stale tiles against the roomy run's \
-         {}. If this fails, re-check the premise: a buffer that rejects work \
-         without delivering it can look 'less stale' only because less \
-         arrived at all.",
+        squeezed.stale_generation_tiles < STALE_CEILING
+            && roomy.stale_generation_tiles < STALE_CEILING,
+        "staleness regressed: squeezed={} roomy={} against a {} ceiling. \
+         Both runs render all {} tiles, so this is about freshness, not \
+         coverage -- suspect the budget floor re-growing until it outruns \
+         the path again.",
         squeezed.stale_generation_tiles,
-        roomy.stale_generation_tiles
+        roomy.stale_generation_tiles,
+        STALE_CEILING,
+        squeezed_tiles
     );
 
     // Rejections must be bounded by how often we attempt a drain, not by how
@@ -548,6 +580,43 @@ async fn probe_capacity_transitions() {
             println!(
                 "TRANS {name:>18} {label:>10}: bytes={:>9} tiles={:>4} stale={:>6} \
                  retx={:>6} send_errs={:>6} emit_q_peak={:>6} qlat_max_us={:>8}",
+                r.bytes_delivered_s2c,
+                tiles_rendered(&r, COLS, ROWS),
+                r.stale_generation_tiles,
+                r.retransmit_attempts_total,
+                r.send_datagram_errs,
+                r.emission_queue_peak,
+                r.queued_critical_latency_max_us,
+            );
+        }
+    }
+}
+
+/// Choose the replacement for the 256 KiB floor from data.
+///
+/// The floor's only legitimate job is to keep the budget above one datagram,
+/// so a tile can always make progress. Everything above that is the
+/// bandwidth term's business. The candidates are multiples of a ~1200 byte
+/// datagram; 256 KiB is carried as the control.
+///
+/// Read the rows as: all of them render 2040 tiles, so pick on waste
+/// (`retx`), backlog (`emit_q_peak`) and freshness (`stale`), and read
+/// `qlat` only alongside `stale` -- a row that retransmits constantly ACKs
+/// fast while showing the wrong pixels.
+#[tokio::test(start_paused = true)]
+#[ignore = "diagnostic-only: run on demand with --ignored"]
+async fn probe_budget_floor_candidates() {
+    const COLS: u8 = 60;
+    const ROWS: u8 = 34;
+    for m in [1.0, 2.0, 5.0, 10.0, 50.0] {
+        for floor in [1_200usize, 4_800, 16_384, 262_144] {
+            let r = run_browserless(ladder_scene(COLS, ROWS, mbit(m), Some(floor)))
+                .await
+                .expect("ran");
+            println!(
+                "FLOOR {m:>6} Mbit {:>7}B: bytes={:>9} tiles={:>4} stale={:>6} \
+                 retx={:>7} send_errs={:>6} emit_q_peak={:>6} qlat_max_us={:>8}",
+                floor,
                 r.bytes_delivered_s2c,
                 tiles_rendered(&r, COLS, ROWS),
                 r.stale_generation_tiles,

@@ -454,3 +454,113 @@ The remaining question is what replaces 256 KiB. It cannot be a smaller
 constant (8 KiB is itself ~2 Mbit and still overdrives a 1 Mbit link); the
 floor's only legitimate job is to keep the budget above one MTU so a tile can
 always make progress.
+
+---
+
+## The fix: the floor is one datagram, and the estimate does the rest
+
+`SCHEDULER_TICK_BUDGET_FLOOR_BYTES = 256 * 1024` is replaced by
+`SCHEDULER_TICK_BUDGET_FLOOR_DATAGRAMS = 1`, evaluated against the live MTU
+(`compute_max_datagram_size`, now cached so a `&self` computation can read
+it). The floor's only job is to keep the budget above a single datagram, so a
+tile can always make progress when the estimate is pessimistic or not yet
+established. Everything above that belongs to the bandwidth term.
+
+### Why one datagram and not a smaller constant
+
+Swept at 1/2/5/10/50 Mbit against floors of 1,200 / 4,800 / 16,384 / 262,144
+bytes. Every low floor holds retransmits near 18 k and the emitter queue near
+1 k; 256 KiB costs 104 k-511 k retransmits and queues of 78 k-389 k. The
+differences *within* the low range do not separate -- at 1 Mbit the 1,200 B
+row is stale 2,985 against 16,384 B's 2,955, and at 2 Mbit the ordering
+reverses. This harness is not seed-reproducible, so those are noise, not a
+ranking. The constant is therefore chosen on the principle (one datagram is
+what "can still make progress" means), not fitted to a run.
+
+### The result on a realistic scene
+
+`probe_send_buffer_sizes` -- single frame, 2 Mbit, production grid -- before
+and after, same sweep:
+
+| buffer | stale before | stale after | retx before | retx after |
+|---|---|---|---|---|
+| 32 KiB | 51 | 0 | 345 | 351 |
+| 256 KiB | 1,831 | 236 | 16,742 | 687 |
+| 1 MiB | 12,236 | 164 | 29,646 | 587 |
+| 16 MiB (shipped) | **7,355** | **167** | **7,733** | **564** |
+
+At the shipped buffer size: **44x less staleness and 13.7x fewer
+retransmits.** The spread across buffer sizes collapses from 51..12,236 to
+0..336 -- the send buffer has stopped being the throughput governor, which is
+what step C set out to achieve and could not.
+
+### The acceptance criterion was wrong and is revised
+
+It read: *"the slow-link sweep keeps 32 KiB's staleness (~51) while the
+saturated fast-link sweep keeps 16 MiB's throughput (~24 MB)."*
+
+The second half enshrined a contaminated metric. On the saturated 50 Mbit
+path the new floor delivers ~9 MB where the old delivered ~24 MB -- and
+renders the same 2040 tiles with **0** stale and **0** retransmits, against
+6,477 and 22,419. The 24 MB was not throughput, it was repetition.
+`bytes_delivered_s2c` counts retransmissions, so "more bytes" was never the
+goal; delivering the screen correctly is. Revised criterion: **all tiles
+render, with staleness and retransmits bounded, across 1-100 Mbit and across
+capacity transitions.**
+
+### Four tests changed, and what that cost
+
+Nothing in the lib suite moved -- 452 passed before and after -- so the floor
+had no unit coverage at all. Added
+`the_budget_floor_is_one_datagram_not_a_fixed_quarter_megabyte`, verified
+load-bearing by mutating the constant back to 219 datagrams (~256 KiB) and
+watching it fail.
+
+Three browserless tests had their premises invalidated *by the fix working*,
+which is worth recording because each looked like a regression first:
+
+1. `a_small_send_buffer_does_provoke_rejections` -- a 64 KiB buffer stopped
+   rejecting anything (`send_errs=0`). It only ever rejected because the
+   sender outran the path by ~31x. The overdrive is now explicit in the
+   scene, so step A's re-queue keeps its coverage.
+2. `work_rejected_by_a_full_send_buffer_still_reaches_the_client` -- asserted
+   the small buffer was *less stale* than the roomy one. Measured 184 vs 177,
+   then 164 vs 179 on the next run: the populations are identical now that
+   the buffer governs nothing, so the ordering is a coin flip. Replaced with
+   a staleness ceiling, which is the property that actually holds.
+3. `retransmits_fire_under_loss_but_not_on_a_perfect_link` -- zero
+   retransmits under 10% loss. On a *busy* grid the paced sender lets a
+   dropped tile be superseded before repair is due, which is correct
+   (repairing superseded content is waste). The safety property is covered
+   elsewhere and still passes under the shipped default:
+   `a_solid_tile_whose_only_datagram_is_dropped_is_still_repaired`.
+
+### A tripwire fired, and its prediction was wrong
+
+`critical_tier_queueing_is_not_yet_reproduced` asserted the critical tier's
+`queued->ACK` and `last_sent->ACK` were *exactly equal*, and documented that
+when that broke it would mean backpressure had reached quinn's send buffer.
+
+It broke. Not for that reason. The scheduler used to over-pop on every tick,
+so nothing waited with `queued_at` stamped on it; now it paces, and the
+remainder waits in the scheduler queue -- where it can still be superseded
+rather than sent stale. The wait moved out of quinn's buffer into a place
+where it is both visible and cancellable.
+
+Measured 3.28x separation, 841 ms mean, 2.68 s max, against production's
+~100x and 16.8 s. **Same signature, an order of magnitude smaller, different
+mechanism -- this is not a reproduction of production's cause**, and the
+harness still cannot be one while the netsim sits below the send buffer.
+
+### What is and is not established
+
+Established across 1-100 Mbit and three capacity transitions: far less
+retransmission, far shallower queues, no send-buffer rejections, and equal or
+better staleness everywhere except 1-2 Mbit, where the old floor bought
+freshness with 5.6x the retransmissions.
+
+**Not established: that this fixes the reported production symptom.** The
+harness cannot reproduce production's backpressure path. The case for
+expecting improvement is that the over-popping which fills quinn's buffer in
+production is exactly what the floor caused -- but that is an argument, not a
+measurement, and it needs confirming against a real session.

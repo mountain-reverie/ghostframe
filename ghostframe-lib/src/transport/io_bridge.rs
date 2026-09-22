@@ -213,7 +213,25 @@ const SCHEDULER_TICK_BUDGET_FRACTION: f64 = 0.90;
 // has been populated from path stats. 256 KB × 30 FPS = 7.5 MB/s — well
 // under any realistic tailnet path so we won't hammer a slow link, but
 // big enough that the visible-content first frame still lands quickly.
-const SCHEDULER_TICK_BUDGET_FLOOR_BYTES: usize = 256 * 1024;
+/// Budget floor, in datagrams rather than bytes.
+///
+/// This was a flat 256 KiB, which is 7.86 MB/s at a 33.3 ms tick. With
+/// `SCHEDULER_TICK_BUDGET_FRACTION` that meant the bandwidth-derived term in
+/// `base_budget_bytes` only overtook the floor above ~70 Mbit/s -- above every
+/// link this system serves. The budget was therefore a constant, and slow
+/// links were overdriven by up to ~12x. Measured cost of that on a saturating
+/// 60x34 scene: 511,473 retransmit attempts and an emitter queue 389,053 deep
+/// at 5 Mbit, and 1,213,785 retransmits on a 5 -> 50 Mbit step-up.
+///
+/// The floor's only legitimate job is to keep the budget above a single
+/// datagram, so a tile can always make progress even when the estimate is
+/// pessimistic or not yet established. Everything above that belongs to the
+/// bandwidth term. See `docs/specs/blocked-path-redesign.md`.
+const SCHEDULER_TICK_BUDGET_FLOOR_DATAGRAMS: usize = 1;
+
+/// Datagram size assumed when no session is connected yet, so the floor is
+/// defined before `compute_max_datagram_size` has a live connection to read.
+const SCHEDULER_TICK_BUDGET_FLOOR_FALLBACK_BYTES: usize = 1_200;
 // AIMD constants. Halving on error is conservative; 10 % ramp-up
 // per clean frame recovers a 16× drop in ~30 frames (1 second at 30 FPS).
 // Floor at 5 % so a sustained-loss link can't pin us to "send nothing".
@@ -667,7 +685,11 @@ pub struct IoBridge {
     /// has been measured on is below that, which means the bandwidth-derived
     /// term has never once bound and the budget has been a constant. Varying
     /// the floor is how a test reaches the other side of that knee.
-    tick_budget_floor_bytes: usize,
+    tick_budget_floor_bytes: Option<usize>,
+
+    /// Most recent result of `compute_max_datagram_size`, so the budget
+    /// floor can be expressed in datagrams rather than in bytes.
+    last_max_datagram_size: Option<usize>,
     /// Remaining frames to force all-dirty after a new session connects.
     /// QUIC slow-start can only deliver a fraction of tiles in the first burst;
     /// forcing dirty for several frames lets the congestion window open.
@@ -1323,7 +1345,8 @@ impl IoBridge {
             skip_palette_session_reset: lib_config.transport.skip_palette_session_reset,
             #[cfg(any(test, feature = "test-loss-injection"))]
             drop_plan: None,
-            tick_budget_floor_bytes: SCHEDULER_TICK_BUDGET_FLOOR_BYTES,
+            tick_budget_floor_bytes: None,
+            last_max_datagram_size: None,
             force_dirty_frames: 0,
             palette_table: crate::encoder::pal_rle::PaletteTable::new(),
             client_caps: crate::transport::client_caps::ClientCapabilities::default(),
@@ -1588,7 +1611,12 @@ impl IoBridge {
                 }
             }
         }
-        min_size.filter(|&sz| sz > 0)
+        let out = min_size.filter(|&sz| sz > 0);
+        // Cached so `tick_budget_floor` can size itself in datagrams from
+        // `&self`. Calling `compute_max_datagram_size` there instead would
+        // re-run `refresh_connected_session_count` a second time per tick.
+        self.last_max_datagram_size = out;
+        out
     }
 
     /// Send a datagram to all connected WebTransport sessions.
@@ -1969,6 +1997,19 @@ impl IoBridge {
     /// derive from the same production numbers rather than each computing
     /// their own idea of "the budget", which is exactly the split that
     /// generated Stage 2's defects.
+    /// Lower bound for `base_budget_bytes`: one datagram at the live MTU,
+    /// unless a test has pinned it. Sized in datagrams so it scales with the
+    /// path rather than with a constant chosen for a link speed we do not
+    /// serve -- see `SCHEDULER_TICK_BUDGET_FLOOR_DATAGRAMS`.
+    fn tick_budget_floor(&self) -> usize {
+        if let Some(explicit) = self.tick_budget_floor_bytes {
+            return explicit;
+        }
+        self.last_max_datagram_size
+            .unwrap_or(SCHEDULER_TICK_BUDGET_FLOOR_FALLBACK_BYTES)
+            .saturating_mul(SCHEDULER_TICK_BUDGET_FLOOR_DATAGRAMS)
+    }
+
     fn base_budget_bytes(&self) -> usize {
         // Billing a fixed 33 ms slice per call looks wrong -- ticks are
         // frame-driven, so at 5 fps this grants 5 x 33 ms of bandwidth per
@@ -1982,7 +2023,7 @@ impl IoBridge {
         (((self.adaptation_context.bytes_per_us as f64)
             * SCHEDULER_TICK_INTERVAL_US
             * SCHEDULER_TICK_BUDGET_FRACTION) as usize)
-            .max(self.tick_budget_floor_bytes)
+            .max(self.tick_budget_floor())
     }
 
     /// Shared scheduler dispatch: grid-sync → RTT update → bump+encode+enqueue
@@ -5857,7 +5898,8 @@ impl IoBridge {
             skip_palette_session_reset: lib_config.transport.skip_palette_session_reset,
             #[cfg(any(test, feature = "test-loss-injection"))]
             drop_plan: None,
-            tick_budget_floor_bytes: SCHEDULER_TICK_BUDGET_FLOOR_BYTES,
+            tick_budget_floor_bytes: None,
+            last_max_datagram_size: None,
             force_dirty_frames: 0,
             palette_table: crate::encoder::pal_rle::PaletteTable::new(),
             client_caps: crate::transport::client_caps::ClientCapabilities::default(),
@@ -6058,7 +6100,7 @@ impl IoBridge {
     /// the bandwidth-derived budget binding at all.
     #[cfg(any(test, feature = "browserless-harness"))]
     pub fn set_tick_budget_floor_bytes(&mut self, bytes: usize) {
-        self.tick_budget_floor_bytes = bytes;
+        self.tick_budget_floor_bytes = Some(bytes);
     }
 
     /// Clone of the `Arc` behind `emitter_stats_publish`, for a caller that
@@ -8337,6 +8379,44 @@ mod tests {
         assert!((bridge.adaptation_context.smoothed_rtt_us - 12_000.0).abs() < 1e-6);
         // cwnd / rtt = 60_000 bytes / 12_000 µs = 5.0 B/µs.
         assert!((bridge.adaptation_context.bytes_per_us - 5.0).abs() < 0.01);
+    }
+
+    /// The budget floor is one datagram, not a fixed 256 KiB.
+    ///
+    /// This is a regression gate, not a description: the old flat floor was
+    /// 256 KiB per 33.3 ms tick (7.86 MB/s), so the bandwidth-derived term
+    /// only bound above ~70 Mbit/s and the budget was effectively constant on
+    /// every link this system serves. Nothing in the lib suite moved when that
+    /// changed -- 452 tests passed before and after -- so without this test
+    /// the floor can silently drift back to dominating the estimate.
+    #[tokio::test]
+    async fn the_budget_floor_is_one_datagram_not_a_fixed_quarter_megabyte() {
+        let (our_end, _peer) = UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("server");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+
+        // A slow path: 0.01 B/µs is 10 kB/s, far below any plausible floor.
+        bridge.adaptation_context.bytes_per_us = 0.01;
+        bridge.last_max_datagram_size = Some(1_200);
+
+        let budget = bridge.base_budget_bytes();
+        assert_eq!(
+            budget, 1_200,
+            "a starved path should floor at one datagram so a tile can still \
+             make progress, not at a constant that re-establishes the old \
+             ~70 Mbit/s knee"
+        );
+
+        // A fast path must clear the floor and be set by the estimate:
+        // 5 B/µs * 33_333 µs * 0.90 = 149_998 bytes.
+        bridge.adaptation_context.bytes_per_us = 5.0;
+        let fast = bridge.base_budget_bytes();
+        assert!(
+            fast > 100_000,
+            "the bandwidth term must set the budget once it clears the floor, \
+             got {fast}"
+        );
     }
 
     #[tokio::test]
