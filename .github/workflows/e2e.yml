@@ -66,6 +66,11 @@ jobs:
       # keeps that variance from compounding across nine concurrent scenes.
       - run: cargo test --test netsim --test netsim_pump --test scene_tiles --test framebuffer
       - run: cargo test --test browserless_runner -- --test-threads=1
+      # Split out of browserless_runner: two 20s bottleneck scenes that both
+      # pass in isolation and flaked ~1 run in 9 inside a 22-test sequential
+      # binary. Named explicitly because this workflow lists targets one by
+      # one -- a tests/*.rs that nothing names simply never runs.
+      - run: cargo test --test browserless_bwe_capacity -- --test-threads=1
       - run: cargo test --test browserless_determinism -- --test-threads=1
       - run: cargo test --test browserless_queue_latency -- --test-threads=1
       - run: cargo test --test browserless_blocked_path -- --test-threads=1
