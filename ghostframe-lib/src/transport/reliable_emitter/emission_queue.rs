@@ -39,6 +39,16 @@ impl EmissionQueue {
         }
     }
 
+    /// Emissions waiting to be handed to the transport.
+    ///
+    /// A gauge, not a counter. Step A made the drain stop at the first
+    /// refusal, which raised the question this measures: if the transport
+    /// keeps refusing while the scheduler keeps submitting, does the backlog
+    /// simply move from quinn's send buffer into this queue?
+    pub fn len(&self) -> usize {
+        self.queue.len()
+    }
+
     /// Put a popped emission back at the head, undoing the pop.
     ///
     /// For the case where the transport refused the datagram. Safe precisely
