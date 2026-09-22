@@ -1,0 +1,16 @@
+[package]
+name = "ghostframe-client-capi"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "ghostframe_client"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+ghostframe-client-native = { path = "../ghostframe-client-native" }
+libc = { workspace = true }
+tracing = { workspace = true }
+
+[build-dependencies]
+cbindgen = { workspace = true }

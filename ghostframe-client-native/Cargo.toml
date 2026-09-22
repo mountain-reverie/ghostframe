@@ -1,0 +1,14 @@
+[package]
+name = "ghostframe-client-native"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ghostframe-protocol = { path = "../ghostframe-protocol" }
+ghostframe-client-core = { path = "../ghostframe-client-core" }
+ghostframe-client-net = { path = "../ghostframe-client-net" }
+ghostframe-client-gpu = { path = "../ghostframe-client-gpu" }
+ghostframe-tsnet = { path = "../ghostframe-tsnet" }
+libc = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

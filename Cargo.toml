@@ -6,6 +6,10 @@ members = [
     "ghostframe-client-core",
     "ghostframe-client-net",
     "ghostframe-client-wasm",
+    "ghostframe-client-gpu",
+    "ghostframe-client-native",
+    "ghostframe-client-capi",
+    "ghostframe-cli",
     "ghostframe-lib",
     "ghostframe-xdaemon",
     "ghostframe-test-pattern",
@@ -59,6 +63,16 @@ time = { version = "0.3" }
 
 # ash 0.38 — raw Vulkan bindings for DMA-BUF import readback
 ash = { version = "0.38", default-features = false, features = ["std", "debug", "loaded"] }
+
+# wgpu 30.0.1 — the newest release that compiles on the pinned 1.96.1
+# toolchain (verified 2026-09-22). Vulkan-only: the client's output is a
+# dmabuf, so the other backends are dead weight in the shipped library.
+wgpu = { version = "=30.0.1", default-features = false, features = ["vulkan", "wgsl"] }
+
+# wgpu-hal — needed for the escape hatch only: wgpu exposes no dmabuf export,
+# so we build the VkDevice ourselves and hand it up via from_hal. Must track
+# wgpu's version exactly.
+wgpu-hal = { version = "=30.0.1", default-features = false, features = ["vulkan"] }
 
 # ffmpeg-next 9.0.0 — Rust bindings for FFmpeg (libavcodec, libavutil, libswscale)
 ffmpeg-next = { version = "=9.0.0" }
