@@ -161,6 +161,7 @@ impl crate::transport::reliable_emitter::traits::DatagramSender for IoBridgeSend
 // the 30-FPS slice), which is fine — un-drained work carries across.
 pub(crate) const SCHEDULER_TICK_INTERVAL_US: f64 = 33_333.0;
 
+
 /// How many `cwnd / rtt` samples the capacity hint takes its minimum over.
 /// Sized to span a few RTTs of path-stats sampling, long enough to swallow a
 /// transient window balloon without being so long the hint stops tracking a
@@ -709,6 +710,16 @@ pub struct IoBridge {
     /// (different lifetime semantics: retransmit window is RTT-bounded;
     /// coverage retention is until-ACKed-or-evicted).
     fragment_coverage: crate::transport::fragment_coverage::FragmentCoverageMap,
+    /// Times `resume_scheduler_continuation` actually drained work, and the
+    /// bytes it moved.
+    ///
+    /// Separate from the per-frame `scheduler.tick` line, which counts only
+    /// frame-driven drains. Without these the continuation path is
+    /// unobservable: it was dead for the whole life of the code (its only
+    /// trigger, `Event::DatagramsUnblocked`, cannot fire while the capacity
+    /// clamp prevents `Blocked`) and nothing showed that.
+    continuation_resumes: u64,
+    continuation_drained_bytes: u64,
     /// Inbound datagrams whose `InboundKind` has no route on this path.
     ///
     /// The routing match that feeds this used to end in `_ =>
@@ -1309,6 +1320,8 @@ impl IoBridge {
                 crate::transport::fragment_coverage::FRAGMENT_COVERAGE_CAPACITY,
             ),
             unroutable_inbound_datagrams: 0,
+            continuation_resumes: 0,
+            continuation_drained_bytes: 0,
             last_emitted_dimensions: None,
             dimensions_retransmits_left: 0,
             connected_session_count: Arc::new(AtomicUsize::new(0)),
@@ -1907,6 +1920,15 @@ impl IoBridge {
     /// their own idea of "the budget", which is exactly the split that
     /// generated Stage 2's defects.
     fn base_budget_bytes(&self) -> usize {
+        // Billing a fixed 33 ms slice per call looks wrong -- ticks are
+        // frame-driven, so at 5 fps this grants 5 x 33 ms of bandwidth per
+        // second of wall clock. Replacing it with elapsed-time billing was
+        // implemented and measured, and changed nothing: the
+        // `SCHEDULER_TICK_BUDGET_FLOOR_BYTES` floor below dominates at every
+        // realistic interval (33 ms computes ~30 KB, 250 ms ~225 KB, both
+        // under the 256 KB floor), so this expression's first term never
+        // decides the budget. Reverted rather than kept, because unvalidated
+        // arithmetic in the send path is a liability.
         (((self.adaptation_context.bytes_per_us as f64)
             * SCHEDULER_TICK_INTERVAL_US
             * SCHEDULER_TICK_BUDGET_FRACTION) as usize)
@@ -2735,13 +2757,19 @@ impl IoBridge {
             effective_budget,
         );
         let new_remaining = ctx.remaining_budget_bytes.saturating_sub(drained_bytes);
+        if drained_count > 0 {
+            self.continuation_resumes = self.continuation_resumes.saturating_add(1);
+            self.continuation_drained_bytes = self
+                .continuation_drained_bytes
+                .saturating_add(drained_bytes as u64);
+        }
         tracing::debug!(
             seq = ctx.seq,
             drained_count = drained_count,
             drained_bytes = drained_bytes,
             remaining_before = ctx.remaining_budget_bytes,
             remaining_after = new_remaining,
-            "DatagramsUnblocked → scheduler continuation"
+            "scheduler continuation resumed"
         );
         // Clear the continuation when the budget is exhausted. We also
         // clear when drained_count == 0 AND drained_bytes == 0 (the
@@ -4730,6 +4758,8 @@ impl IoBridge {
                         // events, not the aggregate counter.
                         emitter_ack_hits = es.ack_hit,
                         emitter_ack_misses = es.ack_miss,
+                        continuation_resumes = self.continuation_resumes,
+                        continuation_drained_bytes = self.continuation_drained_bytes,
                         cache_lru_eviction = self.reliable_emitter.cache.stats.lru_eviction,
                         retransmit_attempts_total = es.retransmit_attempts_total,
                         // Per-window snapshot of un-ACKed tile-passes still in
@@ -5791,6 +5821,8 @@ impl IoBridge {
                 crate::transport::fragment_coverage::FRAGMENT_COVERAGE_CAPACITY,
             ),
             unroutable_inbound_datagrams: 0,
+            continuation_resumes: 0,
+            continuation_drained_bytes: 0,
             last_emitted_dimensions: None,
             dimensions_retransmits_left: 0,
             connected_session_count: Arc::new(AtomicUsize::new(0)),
