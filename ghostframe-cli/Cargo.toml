@@ -7,7 +7,8 @@ edition = "2021"
 name = "ghostframe"
 path = "src/main.rs"
 
+# No dependencies until M2. Depending on ghostframe-client-capi now would
+# pull in ghostframe-tsnet, whose build.rs requires the built web SPA, making
+# a seven-line stub unbuildable in a fresh checkout. They are one line each
+# to add when the CLI is actually implemented.
 [dependencies]
-ghostframe-client-capi = { path = "../ghostframe-client-capi" }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
