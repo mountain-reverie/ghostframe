@@ -17,6 +17,7 @@
 
 pub mod config;
 pub mod export;
+pub mod framebuffer;
 pub mod wgpu_ctx;
 
 use thiserror::Error;
