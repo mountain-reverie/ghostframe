@@ -1,0 +1,24 @@
+[package]
+name = "ghostframe-client-gpu"
+version = "0.1.0"
+edition = "2021"
+
+# GPU decode and dmabuf export for the native client.
+#
+# Deliberately knows nothing about networking: it takes decoded or
+# undecoded tile payloads and produces an exported dmabuf. That boundary
+# is what lets the real WGSL be tested with no transport at all, which
+# `ghostframe-client-core/tests/oracle_gpu_sparse.rs` explicitly cannot do.
+
+[dependencies]
+ghostframe-protocol = { path = "../ghostframe-protocol" }
+ghostframe-client-core = { path = "../ghostframe-client-core" }
+wgpu = { workspace = true }
+wgpu-hal = { workspace = true }
+ash = { workspace = true }
+libc = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"

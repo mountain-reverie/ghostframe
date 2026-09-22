@@ -47,6 +47,16 @@ COPY ghostframe-client-core/src/ ghostframe-client-core/src/
 # so cargo refuses to resolve the manifest without it.
 COPY ghostframe-client-net/Cargo.toml ghostframe-client-net/Cargo.toml
 COPY ghostframe-client-net/src/ ghostframe-client-net/src/
+# Same again for the native-client crates: not built here, but workspace
+# members, so cargo refuses to resolve the manifest without them.
+COPY ghostframe-client-gpu/Cargo.toml ghostframe-client-gpu/Cargo.toml
+COPY ghostframe-client-gpu/src/ ghostframe-client-gpu/src/
+COPY ghostframe-client-native/Cargo.toml ghostframe-client-native/Cargo.toml
+COPY ghostframe-client-native/src/ ghostframe-client-native/src/
+COPY ghostframe-client-capi/Cargo.toml ghostframe-client-capi/Cargo.toml
+COPY ghostframe-client-capi/src/ ghostframe-client-capi/src/
+COPY ghostframe-cli/Cargo.toml ghostframe-cli/Cargo.toml
+COPY ghostframe-cli/src/ ghostframe-cli/src/
 COPY ghostframe-client-wasm/Cargo.toml ghostframe-client-wasm/Cargo.toml
 COPY ghostframe-client-wasm/src/ ghostframe-client-wasm/src/
 COPY ghostframe-client-wasm/build.rs ghostframe-client-wasm/build.rs
