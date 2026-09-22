@@ -93,6 +93,20 @@ fn squeezed_scene(cols: u8, rows: u8, send_buffer: Option<usize>) -> Browserless
     }
 }
 
+/// Tiles that actually have pixels -- the user-visible outcome.
+///
+/// Delivered *bytes* are the wrong metric, and an earlier version of this
+/// test used them. The roomy run retransmits heavily (measured
+/// rto_fired=7,696 and retransmits=7,801 against the squeezed run's 693), so
+/// counting bytes rewards retransmit waste: a run can "deliver" more bytes
+/// while rendering no more screen.
+fn tiles_rendered(r: &BrowserlessResult, cols: u8, rows: u8) -> usize {
+    (0..cols)
+        .flat_map(|x| (0..rows).map(move |y| (x, y)))
+        .filter(|(x, y)| r.framebuffer.tile_rgba(*x, *y).is_some())
+        .count()
+}
+
 fn report(name: &str, r: &BrowserlessResult) {
     println!(
         "{name}: send_errs={} s2c_dg={} s2c_bytes={} rto_fired={} retransmits={} \
@@ -151,8 +165,36 @@ async fn a_small_send_buffer_does_provoke_rejections() {
     );
 }
 
-/// **Expected to FAIL today.** The invariant a `Blocked`-driven design needs,
-/// and the measurement that makes the redesign worth doing.
+/// The transport must back off from a full send buffer, not hammer it.
+///
+/// # What this measures, and what it cannot
+///
+/// Two things changed together when `DatagramSender::send` gained an
+/// outcome: `drain` now **stops** at the first rejection, and the rejected
+/// emission is **re-queued**. Measured separately, the back-off is what
+/// moves the numbers:
+///
+/// | | hammering (before) | stops (drop) | stops + re-queues |
+/// |---|---|---|---|
+/// | send rejections | 4,726 | 337 | 319 |
+/// | retransmits | 3,424 | 746 | 691 |
+/// | stale tiles | 1,170 | 338 | 353 |
+///
+/// Before, `drain` walked the entire queue calling `send` on every emission,
+/// each refused and discarded -- thousands of rejections and thousands of
+/// lost datagrams per drain. Stopping at the first refusal cuts that ~14x.
+///
+/// The re-queue is worth having for correctness -- it is the difference
+/// between losing one datagram per drain and losing none -- but it is not
+/// visible here: a single loss per drain is well within what the emitter's
+/// RTO recovers in a 30 s scene. That invariant is unit-tested instead, in
+/// `emitter.rs`: `a_rejected_datagram_is_re_queued_not_dropped` and
+/// `a_re_queued_datagram_keeps_its_place_and_its_wire_seq`, both
+/// mutation-verified.
+///
+/// So this asserts the two things it can actually discriminate: the screen
+/// still renders in full, and rejections stay bounded instead of scaling
+/// with queue depth.
 ///
 /// Measured at production scale (60x34 = 2040 tiles), 64 KiB vs 16 MiB send
 /// buffer, everything else identical:
@@ -204,14 +246,21 @@ async fn work_rejected_by_a_full_send_buffer_still_reaches_the_client() {
          about the Blocked path"
     );
 
-    // The claim: rejection should cost pacing, not delivery. Both runs offer
-    // the same work over the same link for the same duration, so a lossless
-    // rejection path leaves them comparable.
-    let ratio = squeezed.bytes_delivered_s2c as f64 / roomy.bytes_delivered_s2c.max(1) as f64;
+    // The claim: rejection should cost pacing, not the screen. Both runs
+    // offer the same work over the same link for the same duration, so a
+    // lossless rejection path leaves comparable amounts rendered.
+    const COLS: u8 = 60;
+    const ROWS: u8 = 34;
+    let roomy_tiles = tiles_rendered(&roomy, COLS, ROWS);
+    let squeezed_tiles = tiles_rendered(&squeezed, COLS, ROWS);
+    let ratio = squeezed_tiles as f64 / roomy_tiles.max(1) as f64;
     println!(
-        "delivered ratio squeezed/roomy = {ratio:.3} \
-         ({} vs {} bytes, {} rejections)",
-        squeezed.bytes_delivered_s2c, roomy.bytes_delivered_s2c, squeezed.send_datagram_errs
+        "tiles rendered squeezed={squeezed_tiles} roomy={roomy_tiles} \
+         (ratio {ratio:.3}); bytes {} vs {}; retransmits {} vs {}",
+        squeezed.bytes_delivered_s2c,
+        roomy.bytes_delivered_s2c,
+        squeezed.retransmit_attempts_total,
+        roomy.retransmit_attempts_total,
     );
     // The benefit side. A smaller buffer should reduce staleness, because a
     // datagram that waits seconds in a FIFO can arrive after its tile has
@@ -232,16 +281,28 @@ async fn work_rejected_by_a_full_send_buffer_still_reaches_the_client() {
         roomy.stale_generation_tiles
     );
 
+    // Rejections must be bounded by how often we attempt a drain, not by how
+    // much work is queued. ~20,400 passes are enqueued here; hammering
+    // produced 4,726 rejections (23% of the queue), backing off produces
+    // ~330 (1.6%). 1,000 sits an order of magnitude below the former and
+    // 3x above the latter.
     assert!(
-        ratio > 0.8,
-        "a full send buffer cost delivery, not just pacing: the squeezed run \
-         delivered {} bytes against the roomy run's {} (ratio {ratio:.3}) \
-         with {} rejections and {} RTO firings. send_to_all_sessions drops a \
-         rejected datagram and the scheduler has already popped the work, so \
-         recovery depends entirely on the emitter's bounded RTO. Making \
-         rejection lossless is what this asserts.",
-        squeezed.bytes_delivered_s2c,
-        roomy.bytes_delivered_s2c,
+        squeezed.send_datagram_errs < 1_000,
+        "{} rejections against ~20,400 queued passes: the drain is hammering \
+         a full send buffer rather than stopping at the first refusal. Each \
+         rejection past the first is a datagram offered to a transport that \
+         has already said no.",
+        squeezed.send_datagram_errs
+    );
+
+    assert!(
+        ratio > 0.9,
+        "a full send buffer cost the screen, not just pacing: the squeezed \
+         run rendered {squeezed_tiles} of {COLS}x{ROWS} tiles against the \
+         roomy run's {roomy_tiles} (ratio {ratio:.3}), with {} rejections and \
+         {} RTO firings. Rejected work must be re-queued rather than dropped: \
+         drain_refinement_pass_major pops with queue.remove, so a datagram \
+         the transport refuses has no scheduler-side retry.",
         squeezed.send_datagram_errs,
         squeezed.rto_fired
     );

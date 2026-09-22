@@ -39,6 +39,22 @@ impl EmissionQueue {
         }
     }
 
+    /// Put a popped emission back at the head, undoing the pop.
+    ///
+    /// For the case where the transport refused the datagram. Safe precisely
+    /// because a queued `Emission` is a byte blob that has not left yet:
+    /// `submit_one` has already allocated the wire_seq, baked it into these
+    /// bytes, inserted the retransmit-cache entry and fed the FEC group, so
+    /// there is nothing to roll back and the transmission simply happens
+    /// later under the sequence it already holds.
+    ///
+    /// Front, not back: the queue is in wire order, so this restores exactly
+    /// the order that existed before the pop.
+    pub fn push_front(&mut self, emission: Emission) {
+        self.queue.push_front(emission);
+        self.end_of_stream_idle_since = None;
+    }
+
     pub fn push_source(&mut self, bytes: Vec<u8>) {
         self.queue.push_back(Emission::Source(bytes));
         self.end_of_stream_idle_since = None;

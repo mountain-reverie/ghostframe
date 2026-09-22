@@ -6,7 +6,7 @@ use crate::transport::reliable_emitter::cache::{CacheEntry, ProbeTag, Retransmit
 use crate::transport::reliable_emitter::emission_queue::{Emission, EmissionQueue};
 use crate::transport::reliable_emitter::parity::GroupBuilder;
 use crate::transport::reliable_emitter::rto::{rto_for_attempt, RtoTimerWheel};
-use crate::transport::reliable_emitter::traits::DatagramSender;
+use crate::transport::reliable_emitter::traits::{DatagramSender, SendOutcome};
 use crate::transport::reliable_emitter::wire_seq::WireSeqAllocator;
 use crate::transport::reliable_emitter::{EmitKey, FEC_GROUP_SIZE_K, PARITY_INTERLEAVE_OFFSET};
 use bytes::Bytes;
@@ -66,6 +66,11 @@ pub struct EmitterStats {
     pub ack_miss: u64,
     pub nack_hit: u64,
     pub nack_miss: u64,
+    /// Datagrams the transport refused, each of which was re-queued rather
+    /// than dropped. Non-zero means `Blocked` is being exercised, which is
+    /// the condition `DatagramsUnblocked` and the whole continuation path
+    /// depend on.
+    pub send_rejected: u64,
     pub retransmit_attempts_total: u64,
 }
 
@@ -508,14 +513,41 @@ impl ReliableTileEmitter {
         std::mem::take(&mut self.transmissions)
     }
 
+    /// Hand queued emissions to the transport until it refuses one.
+    ///
+    /// On refusal the emission goes back to the head of the queue and the
+    /// drain stops. Stopping matters: `Rejected` means quinn's datagram send
+    /// buffer is full, so the next emission would be refused too, and
+    /// continuing would spin through the whole queue discarding work.
+    ///
+    /// Re-queueing is what makes `Blocked` survivable as ordinary flow
+    /// control. Before this, `DatagramSender::send` returned unit, the
+    /// rejected datagram was dropped, and recovery depended on the emitter's
+    /// bounded RTO -- which covers a handful of rejections and collapses
+    /// under thousands (measured: 4,726 rejections cost a third of delivery
+    /// at production scale).
     pub fn drain<S: DatagramSender>(&mut self, sender: &mut S, now: Instant) {
         let next = self.alloc.peek();
         while let Some(emission) = self.queue.pop(next, now) {
-            match emission {
-                Emission::Source(bytes) => sender.send(&bytes),
-                Emission::Parity(bytes) => {
-                    sender.send(&bytes);
-                    self.stats.parity_emitted += 1;
+            let outcome = match &emission {
+                Emission::Source(bytes) => sender.send(bytes),
+                Emission::Parity(bytes) => sender.send(bytes),
+            };
+            match outcome {
+                SendOutcome::Sent => {
+                    if matches!(emission, Emission::Parity(_)) {
+                        self.stats.parity_emitted += 1;
+                    }
+                }
+                SendOutcome::Rejected => {
+                    self.queue.push_front(emission);
+                    self.stats.send_rejected += 1;
+                    // The `return` is not an optimisation, it is required.
+                    // `push_front` puts this emission back at the head, so
+                    // continuing the loop would pop the very same one and
+                    // offer it again -- an infinite loop. Verified by
+                    // removing it: the browserless gate stopped terminating.
+                    return;
                 }
             }
         }
@@ -586,6 +618,85 @@ mod tests {
         assert_eq!(sender.sent.len(), 1);
         assert_eq!(e.stats.source_emitted, 1);
         assert!(e.cache.get(&key).is_some());
+    }
+
+    #[test]
+    fn a_rejected_datagram_is_re_queued_not_dropped() {
+        use crate::transport::reliable_emitter::traits::testing::RejectAfterSender;
+
+        let mut e = ReliableTileEmitter::new(Instant::now());
+        let now = Instant::now();
+        for i in 0..4u32 {
+            e.submit_one(
+                EmitKey::new(1, 0, 0, i as u8),
+                fake_source(1, 0, i as u8),
+                now,
+                None,
+                now,
+            );
+        }
+
+        // Accept two, refuse the rest.
+        let mut sender = RejectAfterSender::new(2);
+        e.drain(&mut sender, now);
+        assert_eq!(sender.sent.len(), 2, "two accepted");
+        assert_eq!(
+            sender.rejected, 1,
+            "the drain must stop at the first refusal, not keep offering \
+             emissions the transport has no room for"
+        );
+        assert_eq!(e.stats.send_rejected, 1);
+
+        // The refused emission and everything behind it must still be
+        // queued. A sender that now accepts everything drains them.
+        let mut sender2 = CollectSender::default();
+        e.drain(&mut sender2, now);
+        assert_eq!(
+            sender2.sent.len(),
+            2,
+            "the refused emission and the one behind it were dropped rather \
+             than re-queued"
+        );
+    }
+
+    #[test]
+    fn a_re_queued_datagram_keeps_its_place_and_its_wire_seq() {
+        use crate::transport::reliable_emitter::traits::testing::RejectAfterSender;
+
+        let mut e = ReliableTileEmitter::new(Instant::now());
+        let now = Instant::now();
+        for i in 0..3u32 {
+            e.submit_one(
+                EmitKey::new(1, 0, 0, i as u8),
+                fake_source(1, 0, i as u8),
+                now,
+                None,
+                now,
+            );
+        }
+
+        // Refuse everything, then accept everything.
+        let mut all_reject = RejectAfterSender::new(0);
+        e.drain(&mut all_reject, now);
+        assert!(all_reject.sent.is_empty());
+
+        let mut accept = CollectSender::default();
+        e.drain(&mut accept, now);
+        assert_eq!(accept.sent.len(), 3, "all three survived the refusal");
+
+        // wire_seq lives at bytes [8..12], stamped by `submit_one` before the
+        // send. Re-queueing must not renumber or reorder: the queue is in
+        // wire order and a refused emission goes back to the head it came
+        // from. Out-of-order wire_seqs would desynchronise the receiver's
+        // ledger and show up as phantom loss.
+        let seqs: Vec<u32> = accept
+            .sent
+            .iter()
+            .map(|d| u32::from_be_bytes(d[8..12].try_into().unwrap()))
+            .collect();
+        let mut sorted = seqs.clone();
+        sorted.sort_unstable();
+        assert_eq!(seqs, sorted, "wire order changed across a refusal: {seqs:?}");
     }
 
     #[test]
@@ -919,8 +1030,12 @@ mod tests {
         let mut sink: Vec<Vec<u8>> = Vec::new();
         struct Sink<'a>(&'a mut Vec<Vec<u8>>);
         impl<'a> crate::transport::reliable_emitter::traits::DatagramSender for Sink<'a> {
-            fn send(&mut self, dg: &[u8]) {
+            fn send(
+                &mut self,
+                dg: &[u8],
+            ) -> crate::transport::reliable_emitter::traits::SendOutcome {
                 self.0.push(dg.to_vec());
+                crate::transport::reliable_emitter::traits::SendOutcome::Sent
             }
         }
         e.drain(&mut Sink(&mut sink), now);
@@ -967,8 +1082,12 @@ mod tests {
         // Drain the initial 1000 submissions.
         struct Sink<'a>(&'a mut Vec<Vec<u8>>);
         impl<'a> crate::transport::reliable_emitter::traits::DatagramSender for Sink<'a> {
-            fn send(&mut self, dg: &[u8]) {
+            fn send(
+                &mut self,
+                dg: &[u8],
+            ) -> crate::transport::reliable_emitter::traits::SendOutcome {
                 self.0.push(dg.to_vec());
+                crate::transport::reliable_emitter::traits::SendOutcome::Sent
             }
         }
         let mut sink: Vec<Vec<u8>> = Vec::new();

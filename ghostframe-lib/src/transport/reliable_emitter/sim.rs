@@ -4,7 +4,7 @@
 #![cfg(test)]
 
 use super::emitter::ReliableTileEmitter;
-use super::traits::DatagramSender;
+use super::traits::{DatagramSender, SendOutcome};
 use super::*;
 use bytes::Bytes;
 use std::cell::RefCell;
@@ -37,11 +37,15 @@ struct LossSender {
     p: f64,
 }
 impl DatagramSender for LossSender {
-    fn send(&mut self, dg: &[u8]) {
+    fn send(&mut self, dg: &[u8]) -> SendOutcome {
         if self.rng.bool(self.p) {
-            return;
+            // Simulated wire loss consumes the datagram. `Rejected` is
+            // transport backpressure and would be re-queued; a lost packet
+            // must not be.
+            return SendOutcome::Sent;
         }
         self.delivered.borrow_mut().push(dg.to_vec());
+        SendOutcome::Sent
     }
 }
 

@@ -140,8 +140,41 @@ wasted bandwidth rather than corruption, since the client dedups on
 `wire_seq` and tile reassembly is idempotent per `frag_idx`. Worth stating
 because production has one session and the cost is invisible there.
 
-**Acceptance:** the gate test's delivery ratio returns above 0.8 while stale
-tiles stay near the 64 KiB run's 1,170.
+**Status: implemented.** Measured, and the credit does not go where this
+design predicted. Two things changed together -- the drain now *stops* at the
+first rejection, and the rejected emission is re-queued -- and the back-off is
+what moves the numbers:
+
+| | hammering (before) | stops (drop) | stops + re-queues |
+|---|---|---|---|
+| send rejections | 4,726 | 337 | 319 |
+| retransmits | 3,424 | 746 | 691 |
+| stale tiles | 1,170 | 338 | 353 |
+
+Previously `drain` walked the whole queue offering every emission to a
+transport that had already refused one, discarding each. Stopping cuts that
+~14x. The re-queue is worth having -- it is the difference between losing one
+datagram per drain and losing none -- but it is invisible at integration
+level, because a single loss per drain is well within what RTO recovers in a
+30 s scene. It is unit-tested instead
+(`a_rejected_datagram_is_re_queued_not_dropped`,
+`a_re_queued_datagram_keeps_its_place_and_its_wire_seq`, both
+mutation-verified).
+
+The two halves are a required pair, not independent: `push_front` without the
+`return` re-pops the same emission forever. Removing the `return` hung the
+gate rather than failing it.
+
+Also measured, and the reason step C now looks safe: at 64 KiB the screen
+renders in full (2040 of 2040 tiles, same as 16 MiB) using **26% fewer bytes**
+(2.66 MB vs 3.60 MB, because retransmits drop 12x from 7,741 to 660) with
+**21x less staleness** (348 vs 7,375). The small buffer is now strictly better
+on every axis measured.
+
+A note on metrics: the gate first compared delivered *bytes* and read as a
+34% regression. That metric rewards retransmit waste -- the roomy run
+"delivers" more because it retransmits 12x more. Tiles rendered is the
+user-visible outcome, and by that measure the two are identical.
 
 ### B. Backpressure the scheduler on the emitter queue
 
