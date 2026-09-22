@@ -429,11 +429,11 @@ fn wgpu_device_has_dmabuf_export_capability() {
         mapped_at_creation: false,
     });
     ctx.queue.write_buffer(&buf, 0, &[0xABu8; 256]);
-    ctx.device.poll(wgpu::PollType::Wait).expect("poll");
+    ctx.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
 
     let slice = buf.slice(..);
     slice.map_async(wgpu::MapMode::Read, |r| r.expect("map"));
-    ctx.device.poll(wgpu::PollType::Wait).expect("poll");
+    ctx.device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
     assert_eq!(slice.get_mapped_range()[0], 0xAB);
 }
 
@@ -486,7 +486,8 @@ pub struct WgpuContext {
 
 impl WgpuContext {
     pub fn new() -> Result<Self, GpuError> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        // NB: wgpu 30 takes the descriptor by value, not by reference.
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
             ..Default::default()
         });
@@ -535,9 +536,26 @@ impl WgpuContext {
 }
 ```
 
-`with_raw_device` uses `Device::as_hal::<wgpu_hal::api::Vulkan, _, _>` to reach
-`hal_device.raw_device()` and `raw_physical_device()`; check the exact accessor
-names in `wgpu-hal-30.0.1/src/vulkan/mod.rs`.
+`with_raw_device` uses `Device::as_hal`, whose wgpu 30 signature **returns** the
+device rather than taking a closure:
+
+```rust
+pub unsafe fn as_hal<A: hal::Api>(&self) -> Option<impl Deref<Target = A::Device>>
+```
+
+So the body is:
+
+```rust
+        // SAFETY: the returned device must not outlive `self`, and we must
+        // never destroy anything wgpu owns -- we only allocate our own images.
+        let hal_dev = unsafe { self.device.as_hal::<wgpu_hal::api::Vulkan>() }?;
+        Some(f(hal_dev.raw_device(), hal_dev.raw_physical_device()))
+```
+
+Accessors verified present on `wgpu_hal::vulkan::Device`
+(`wgpu-hal-30.0.1/src/vulkan/device.rs:826-842`): `raw_device() -> &ash::Device`,
+`raw_physical_device() -> vk::PhysicalDevice`, `raw_queue() -> vk::Queue`,
+`shared_instance()`.
 
 You need a small block-on helper since wgpu's request functions are async and
 this crate has no runtime. Either add the `pollster` crate (tiny, no transitive
