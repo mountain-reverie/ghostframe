@@ -32,3 +32,9 @@ ghostbridge/libghostbridge.h
 ghostframe-lib/libghostbridge.a
 ghostframe-lib/libghostbridge.h
 .serena/
+
+# Screenshots dropped in the repo root while debugging a live session.
+# One was committed by accident (a 2 MB blob, stripped from history on
+# 2026-09-22) because `git add -A` sweeps untracked files. Test fixtures and
+# golden images live under */fixtures/ and */golden/ and are unaffected.
+Screenshot*.png
