@@ -176,22 +176,32 @@ A note on metrics: the gate first compared delivered *bytes* and read as a
 "delivers" more because it retransmits 12x more. Tiles rendered is the
 user-visible outcome, and by that measure the two are identical.
 
-### B. Backpressure the scheduler on the emitter queue
+### B. Backpressure the scheduler on the emitter queue — NOT NEEDED
 
-Step A alone moves the bloat rather than removing it: if sends are rejected
-and the scheduler keeps popping and submitting, the emitter's queue grows
-without bound. The clamp must read *our* queue depth, not only quinn's
-`send_buffer_space()`.
+**Status: retired by measurement, not implemented.**
 
-This is strictly better than clamping on quinn's buffer, and it is the
-argument for the whole design: the emitter and scheduler queues can supersede
-a stale generation, reprioritise by pass, and drop work that no longer
-matters. quinn's datagram queue is an opaque FIFO that can do none of those —
-a superseded pass sitting in it is still transmitted, still ACKed, and still
-counted.
+The concern was that step A moves the bloat rather than removing it: if the
+transport keeps refusing while the scheduler keeps submitting, the emitter's
+queue grows without bound. Measured instead of assumed, at production scale
+(~20,400 passes enqueued):
 
-**Acceptance:** a scene that rejects sustainedly shows a bounded emitter
-queue, and `refinement_queue_len` absorbs the backlog instead.
+| | send rejections | emission-queue peak |
+|---|---|---|
+| 16 MiB buffer | 0 | 3,904 |
+| 64 KiB buffer | 323 | **1,453-1,574** |
+
+The backlog does not migrate. The 64 KiB run's emitter queue is *shallower*
+than the 16 MiB run's, and both sit far below the enqueued work, so most of
+it waits in the scheduler's refinement queue -- which is exactly where it
+should, because that queue can supersede a stale generation.
+
+The reason is the clamp that already exists. Every drain is limited to
+`QUINN_SEND_BUFFER_SAFETY_FRACTION * send_buffer_space()`, so a small buffer
+makes the scheduler pop *less*, not more. The backpressure step B would have
+added is already there, and it works better the smaller the buffer is.
+
+Pinned by an assertion in the gate test so a future change cannot regress
+into emitter-side bloat unnoticed.
 
 ### C. Shrink the send buffer
 

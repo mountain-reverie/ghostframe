@@ -71,6 +71,13 @@ pub struct EmitterStats {
     /// the condition `DatagramsUnblocked` and the whole continuation path
     /// depend on.
     pub send_rejected: u64,
+    /// High-water mark of the emission queue's depth.
+    ///
+    /// Answers whether backpressure is needed between the scheduler and the
+    /// emitter, or whether the existing quinn-capacity clamp already bounds
+    /// the backlog. A peak that scales with queued work means the bloat moved
+    /// here; a bounded peak means it did not.
+    pub emission_queue_peak: usize,
     pub retransmit_attempts_total: u64,
 }
 
@@ -165,6 +172,7 @@ impl ReliableTileEmitter {
             .schedule(key, now + rto_for_attempt(self.ack_deadline, 0));
         // Feed group builder; on K-th source build & schedule parity envelope.
         self.feed_group(wire_seq, &bytes);
+        self.note_emission_queue_depth();
         // Enqueue the source itself.
         self.queue.push_source(bytes);
         self.stats.source_emitted += 1;
@@ -526,6 +534,14 @@ impl ReliableTileEmitter {
     /// bounded RTO -- which covers a handful of rejections and collapses
     /// under thousands (measured: 4,726 rejections cost a third of delivery
     /// at production scale).
+    /// Record the emission queue's high-water depth.
+    fn note_emission_queue_depth(&mut self) {
+        let d = self.queue.len();
+        if d > self.stats.emission_queue_peak {
+            self.stats.emission_queue_peak = d;
+        }
+    }
+
     pub fn drain<S: DatagramSender>(&mut self, sender: &mut S, now: Instant) {
         let next = self.alloc.peek();
         while let Some(emission) = self.queue.pop(next, now) {
@@ -542,6 +558,7 @@ impl ReliableTileEmitter {
                 SendOutcome::Rejected => {
                     self.queue.push_front(emission);
                     self.stats.send_rejected += 1;
+                    self.note_emission_queue_depth();
                     // The `return` is not an optimisation, it is required.
                     // `push_front` puts this emission back at the head, so
                     // continuing the loop would pop the very same one and

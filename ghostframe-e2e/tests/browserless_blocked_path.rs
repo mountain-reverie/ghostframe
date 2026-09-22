@@ -109,9 +109,10 @@ fn tiles_rendered(r: &BrowserlessResult, cols: u8, rows: u8) -> usize {
 
 fn report(name: &str, r: &BrowserlessResult) {
     println!(
-        "{name}: send_errs={} s2c_dg={} s2c_bytes={} rto_fired={} retransmits={} \
-         nack_hit={} nack_miss={} stale={}",
+        "{name}: send_errs={} emit_q_peak={} s2c_dg={} s2c_bytes={} \
+         rto_fired={} retransmits={} nack_hit={} nack_miss={} stale={}",
         r.send_datagram_errs,
+        r.emission_queue_peak,
         r.datagrams_delivered_s2c,
         r.bytes_delivered_s2c,
         r.rto_fired,
@@ -293,6 +294,28 @@ async fn work_rejected_by_a_full_send_buffer_still_reaches_the_client() {
          rejection past the first is a datagram offered to a transport that \
          has already said no.",
         squeezed.send_datagram_errs
+    );
+
+    // The backlog must not simply migrate out of quinn's send buffer into
+    // ours. Measured: the squeezed run peaks at ~1,574 queued emissions and
+    // the roomy run at ~3,904, against ~20,400 passes enqueued -- so most
+    // work waits in the scheduler's refinement queue, which is where it can
+    // still be superseded. A tight clamp makes the scheduler pop *less*, so
+    // the small buffer has the shallower emitter queue of the two.
+    //
+    // This is the measurement that retired step B of
+    // docs/specs/blocked-path-redesign.md (scheduler backpressure on
+    // emitter-queue depth): the existing quinn-capacity clamp already bounds
+    // it. 5,000 is ~3x the observed peak and a quarter of the enqueued work,
+    // so it catches a migration without being brittle.
+    assert!(
+        squeezed.emission_queue_peak < 5_000,
+        "the emitter's emission queue peaked at {} against ~20,400 enqueued \
+         passes (roomy run: {}). The backlog has moved out of quinn's send \
+         buffer into ours, which is the case scheduler-side backpressure \
+         would exist to prevent.",
+        squeezed.emission_queue_peak,
+        roomy.emission_queue_peak
     );
 
     assert!(

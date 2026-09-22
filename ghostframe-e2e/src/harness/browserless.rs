@@ -185,6 +185,13 @@ pub struct BrowserlessResult {
     /// non-zero first: with the production 16 MiB buffer it is always 0, so
     /// such a scene would otherwise pass without ever creating the case.
     pub send_datagram_errs: u64,
+    /// High-water depth of the emitter's emission queue.
+    ///
+    /// The measurement that decides whether step B (scheduler backpressure
+    /// on emitter-queue depth) is needed: a peak that scales with the work
+    /// enqueued means the backlog merely moved out of quinn's send buffer
+    /// into ours.
+    pub emission_queue_peak: usize,
     /// Server -> client datagrams delivered.
     ///
     /// Distinct from `bytes_delivered_s2c` and not derivable from it. A test
@@ -503,6 +510,7 @@ async fn run_inner(mut scene: BrowserlessScene) -> anyhow::Result<BrowserlessRes
 
     Ok(BrowserlessResult {
         send_datagram_errs,
+        emission_queue_peak: emitter_stats.emission_queue_peak,
         framebuffer,
         events,
         bytes_delivered,
