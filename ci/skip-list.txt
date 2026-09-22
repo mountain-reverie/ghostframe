@@ -42,6 +42,20 @@ e2e_refinement_cancel
 e2e_solid_per_tile_pixels
 e2e_text_clarity
 
+# Added with the budget-floor PR. All three call
+# `setup_e2e_webgpu_gpu_with_env` and drive a 1920x1080 DRM mode, so they
+# need the same VKMS + /dev/dri the group above does. On a GitHub runner the
+# capture produces nothing and they fail their own premise checks with
+# `tiles=0 complete=0 partial=0 pass-hist{}` -- which is the premise check
+# working, not the assertion under test.
+#
+# The skip lives here rather than as `#[ignore]` or a runtime self-skip so
+# they still run for every developer locally, which is where they are load
+# bearing: they are the production-scale scenes.
+e2e_production_scale_with_loss_converges
+e2e_production_shaped_session_strands_no_tiles
+e2e_static_mixed_codecs_converge_on_a_shaped_link
+
 # --- Category 2: software-H.264-decode-too-slow-on-2-vCPU-runners ----------
 # Tests whose assertions assume the WebCodecs H.264 decoder keeps up with a
 # 30fps live stream within ~2s. GitHub-hosted ubuntu-24.04 runners have 2
