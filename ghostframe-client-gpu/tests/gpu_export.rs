@@ -119,3 +119,72 @@ fn exported_fd_is_a_real_dmabuf() {
         "fd is not a dmabuf: {link:?}"
     );
 }
+
+#[test]
+fn exported_image_can_be_wrapped_as_a_wgpu_texture() {
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let img = ExportedImage::new(&ctx, 64, 64, &[]).expect("export image");
+    let tex = img
+        .as_wgpu_texture(&ctx.device)
+        .expect("wrap as wgpu texture");
+
+    assert_eq!(tex.width(), 64);
+    assert_eq!(tex.height(), 64);
+    assert_eq!(tex.format(), wgpu::TextureFormat::Rgba8Unorm);
+}
+
+use ghostframe_client_gpu::framebuffer::Framebuffer;
+
+#[test]
+fn framebuffer_blits_into_the_exported_dmabuf() {
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let mut fb = Framebuffer::new(&ctx.device, 64, 64);
+
+    // A colour that cannot be confused with zeroed memory or with a
+    // channel-order mistake: R, G and B all differ.
+    fb.debug_fill(&ctx.device, &ctx.queue, [0x11, 0x22, 0x33, 0xFF]);
+
+    let img = ExportedImage::new(&ctx, 64, 64, &[]).expect("export image");
+    let tex = img.as_wgpu_texture(&ctx.device).expect("wrap");
+    fb.blit_full(&ctx.device, &ctx.queue, &tex);
+    ctx.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+
+    let bytes = img.map_read().expect("map dmabuf");
+    let stride = img.planes[0].stride as usize;
+    let base = img.planes[0].offset as usize;
+
+    // Check a pixel away from the origin: an origin-only check passes even
+    // when the stride is wrong.
+    let off = base + 40 * stride + 20 * 4;
+    assert_eq!(
+        &bytes[off..off + 4],
+        &[0x11, 0x22, 0x33, 0xFF],
+        "wrong pixel at (20,40); channel order or stride is wrong"
+    );
+}
+
+#[test]
+fn framebuffer_preserves_content_across_resize() {
+    // Mirrors the web client's preserve-on-resize copy. Without it, tiles
+    // written before a late sentinel-driven resize are lost.
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let mut fb = Framebuffer::new(&ctx.device, 64, 64);
+    fb.debug_fill(&ctx.device, &ctx.queue, [0x44, 0x55, 0x66, 0xFF]);
+
+    fb.resize(&ctx.device, &ctx.queue, 128, 96);
+    ctx.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+
+    assert_eq!(fb.width, 128);
+    assert_eq!(fb.height, 96);
+    let bytes = fb.debug_read(&ctx.device, &ctx.queue);
+    let off = (10 * 128 + 10) * 4; // inside the preserved region
+    assert_eq!(
+        &bytes[off..off + 4],
+        &[0x44, 0x55, 0x66, 0xFF],
+        "resize did not preserve existing content"
+    );
+}
