@@ -78,8 +78,7 @@ Read these before starting. They are not obvious from the code.
 |---|---|
 | `src/lib.rs` | Crate root, re-exports, `GpuError` |
 | `src/config.rs` | The only place in the crate that reads env |
-| `src/vulkan.rs` | `VulkanContext`: hand-built instance/device with the export extensions |
-| `src/wgpu_ctx.rs` | `WgpuContext`: wraps `VulkanContext` via `from_hal` |
+| `src/wgpu_ctx.rs` | `WgpuContext`: wgpu device with `VULKAN_EXTERNAL_MEMORY_DMA_BUF`, plus the raw-device escape hatch |
 | `src/export.rs` | `ExportedImage`: dmabuf-backed `VkImage`, fd export, plane layout, test-only CPU map |
 | `src/ring.rs` | `ExportBuffer` and the export ring, fill policy |
 | `src/dirty.rs` | `DirtyGrid`, `DirtyHistory` |
@@ -370,15 +369,32 @@ missing COPY fails the image build before any test runs."
 
 ---
 
-## Task 2: S1 spike — a wgpu device built from our own Vulkan device
+## Task 2: Acquire a wgpu device with dmabuf export capability
 
-**This is the load-bearing risk in the whole milestone.** wgpu will not enable `VK_EXT_external_memory_dma_buf` or `VK_EXT_image_drm_format_modifier` on request, so we build the instance and device ourselves and hand them up. If this does not work, the stack choice in the spec is wrong and we stop and reconsider rather than working around it.
+> **REVISED 2026-09-22 after Task 1 landed on wgpu 30.0.1.** The original
+> plan assumed wgpu would never enable the dmabuf extensions, so it built the
+> `VkInstance`/`VkDevice` by hand and handed them up through `from_hal`. That is
+> no longer necessary. wgpu 30 has a first-class feature,
+> `wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF` (bit 63), which enables
+> `VK_EXT_external_memory_dma_buf`, `VK_EXT_image_drm_format_modifier` and
+> `VK_KHR_external_memory_fd` on the device. Verified by reading
+> `wgpu-hal-30.0.1/src/vulkan/adapter.rs:1349-1356` and
+> `wgpu-types-30.0.1/src/features.rs:1246`.
+>
+> This removes the milestone's single biggest risk. What it does **not** give us
+> is export: wgpu-hal 30 has `texture_from_dmabuf_fd` (import) and **no export
+> counterpart**, so Task 3 still writes the export path in ash — but against
+> wgpu's own `VkDevice`, reached through `Device::as_hal`, rather than one we
+> built. The hand-built `from_hal` route remains a documented fallback if the
+> feature turns out to be unavailable on the target hardware.
 
 **Files:**
-- Create: `ghostframe-client-gpu/src/vulkan.rs`
 - Create: `ghostframe-client-gpu/src/wgpu_ctx.rs`
 - Create: `ghostframe-client-gpu/tests/gpu_export.rs`
 - Modify: `ghostframe-client-gpu/src/lib.rs`
+
+Note there is no longer a `src/vulkan.rs` in this task. The crate's file structure
+changes accordingly: drop that row from the plan's table.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -393,14 +409,16 @@ missing COPY fails the image build before any test runs."
 use ghostframe_client_gpu::wgpu_ctx::WgpuContext;
 
 #[test]
-fn wgpu_device_is_built_from_our_own_vulkan_device() {
-    let ctx = WgpuContext::new().expect("build wgpu context from hand-built Vulkan device");
+fn wgpu_device_has_dmabuf_export_capability() {
+    let ctx = WgpuContext::new().expect("create wgpu context with dmabuf support");
 
-    // The whole point: the device must carry the extensions wgpu would
-    // never have requested on its own.
+    // The whole point: without this feature the device cannot allocate
+    // memory that can leave the process as a dmabuf.
     assert!(
-        ctx.vk.dmabuf_export_supported,
-        "device was created without the dmabuf export extensions"
+        ctx.device
+            .features()
+            .contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF),
+        "device lacks VULKAN_EXTERNAL_MEMORY_DMA_BUF"
     );
 
     // And it must still be a usable wgpu device.
@@ -411,14 +429,28 @@ fn wgpu_device_is_built_from_our_own_vulkan_device() {
         mapped_at_creation: false,
     });
     ctx.queue.write_buffer(&buf, 0, &[0xABu8; 256]);
-    ctx.device.poll(wgpu::Maintain::Wait);
+    ctx.device.poll(wgpu::PollType::Wait).expect("poll");
 
     let slice = buf.slice(..);
     slice.map_async(wgpu::MapMode::Read, |r| r.expect("map"));
-    ctx.device.poll(wgpu::Maintain::Wait);
+    ctx.device.poll(wgpu::PollType::Wait).expect("poll");
     assert_eq!(slice.get_mapped_range()[0], 0xAB);
 }
+
+#[test]
+fn raw_vulkan_device_is_reachable_for_the_export_path() {
+    // Task 3 needs the raw VkDevice to allocate exportable images, because
+    // wgpu-hal 30 offers dmabuf IMPORT but no export. Prove the escape
+    // hatch is reachable before building on it.
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let reached = ctx.with_raw_device(|_raw_device, _phys| true);
+    assert_eq!(reached, Some(true), "could not reach the raw VkDevice via as_hal");
+}
 ```
+
+Check `poll`'s exact shape against wgpu 30 (`PollType` vs the older `Maintain`);
+adjust if the compiler disagrees and note what you used, because the rest of the
+plan's test code uses whichever form you settle on.
 
 - [ ] **Step 2: Run it to confirm it fails**
 
@@ -428,108 +460,24 @@ cargo test -p ghostframe-client-gpu --test gpu_export -- --nocapture
 
 Expected: FAIL to compile, `unresolved import ghostframe_client_gpu::wgpu_ctx`.
 
-- [ ] **Step 3: Implement `VulkanContext`**
-
-`ghostframe-client-gpu/src/vulkan.rs`. Create instance and device with the extensions wgpu will not request:
-
-```rust
-use ash::{vk, Entry, Instance, Device};
-use std::ffi::CStr;
-use crate::GpuError;
-
-/// A Vulkan instance and device built by hand so that the dmabuf export
-/// extensions are enabled. wgpu enables device extensions from its own
-/// feature flags and offers no way to request these, which is why the
-/// device is constructed here and handed up rather than the other way
-/// round.
-pub struct VulkanContext {
-    pub entry: Entry,
-    pub instance: Instance,
-    pub physical_device: vk::PhysicalDevice,
-    pub device: Device,
-    pub queue_family_index: u32,
-    pub queue: vk::Queue,
-    pub dmabuf_export_supported: bool,
-}
-
-/// Device extensions required to allocate an image whose memory can be
-/// exported as a dmabuf with an explicit DRM format modifier.
-const REQUIRED_DEVICE_EXTENSIONS: &[&CStr] = &[
-    vk::KHR_EXTERNAL_MEMORY_FD_NAME,
-    vk::EXT_EXTERNAL_MEMORY_DMA_BUF_NAME,
-    vk::EXT_IMAGE_DRM_FORMAT_MODIFIER_NAME,
-    vk::KHR_EXTERNAL_MEMORY_NAME,
-    // Required by VK_EXT_image_drm_format_modifier.
-    vk::KHR_IMAGE_FORMAT_LIST_NAME,
-    vk::KHR_BIND_MEMORY2_NAME,
-    vk::KHR_GET_MEMORY_REQUIREMENTS2_NAME,
-    vk::KHR_SAMPLER_YCBCR_CONVERSION_NAME,
-    vk::KHR_MAINTENANCE1_NAME,
-];
-
-impl VulkanContext {
-    pub fn new() -> Result<Self, GpuError> {
-        // SAFETY: loading the system Vulkan loader; failure is reported.
-        let entry = unsafe { Entry::load() }
-            .map_err(|e| GpuError::Vulkan(format!("load libvulkan: {e}")))?;
-
-        // wgpu-hal requires an instance with the extensions it expects to
-        // find. Ask wgpu-hal which those are rather than guessing, so an
-        // upgrade cannot silently leave one out.
-        let instance = Self::create_instance(&entry)?;
-        let (physical_device, queue_family_index) =
-            Self::pick_device(&instance)?;
-        let device = Self::create_device(&instance, physical_device, queue_family_index)?;
-        // SAFETY: queue_family_index came from this device's properties.
-        let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
-
-        Ok(VulkanContext {
-            entry,
-            instance,
-            physical_device,
-            device,
-            queue_family_index,
-            queue,
-            dmabuf_export_supported: true,
-        })
-    }
-
-    /// Returns `Err(NoSuitableAdapter)` if no physical device supports
-    /// every extension in `REQUIRED_DEVICE_EXTENSIONS`, rather than
-    /// falling back to a device that cannot export — a client that
-    /// silently produced an unusable buffer would be worse than one that
-    /// refuses to start.
-    fn pick_device(instance: &Instance)
-        -> Result<(vk::PhysicalDevice, u32), GpuError> { todo_impl() }
-
-    fn create_instance(entry: &Entry) -> Result<Instance, GpuError> { todo_impl() }
-
-    fn create_device(
-        instance: &Instance,
-        pd: vk::PhysicalDevice,
-        qfi: u32,
-    ) -> Result<Device, GpuError> { todo_impl() }
-}
-```
-
-Implement the three helpers with ordinary ash calls: `enumerate_physical_devices`, `enumerate_device_extension_properties`, `get_physical_device_queue_family_properties` picking a family with `vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE`, then `create_device` with `REQUIRED_DEVICE_EXTENSIONS` plus whatever wgpu-hal reports it needs. Vulkan API version must be at least 1.1 (`VK_KHR_sampler_ycbcr_conversion` and `bind_memory2` are core there; request 1.2 to keep the list short if the device offers it).
-
-Replace `todo_impl()` with the real body — it is written out here only to show the signatures the rest of the plan depends on.
-
-- [ ] **Step 4: Implement `WgpuContext`**
+- [ ] **Step 3: Implement `WgpuContext`**
 
 `ghostframe-client-gpu/src/wgpu_ctx.rs`:
 
 ```rust
-use std::sync::Arc;
-use crate::{vulkan::VulkanContext, GpuError};
+use crate::GpuError;
 
-/// A wgpu device backed by a Vulkan device we built ourselves.
+/// A wgpu device that can export its images as dmabufs.
 ///
-/// Above this line everything is ordinary, safe wgpu. The unsafe hand-up
-/// is confined to `new`.
+/// Ordinary wgpu construction: we request
+/// `Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF`, which makes wgpu enable
+/// VK_EXT_external_memory_dma_buf, VK_EXT_image_drm_format_modifier and
+/// VK_KHR_external_memory_fd on the device.
+///
+/// wgpu-hal 30 can IMPORT a dmabuf (`texture_from_dmabuf_fd`) but cannot
+/// export one, so `with_raw_device` exposes the underlying VkDevice for
+/// the export path in `export.rs`. That is the only unsafe surface here.
 pub struct WgpuContext {
-    pub vk: Arc<VulkanContext>,
     pub instance: wgpu::Instance,
     pub adapter: wgpu::Adapter,
     pub device: wgpu::Device,
@@ -538,99 +486,123 @@ pub struct WgpuContext {
 
 impl WgpuContext {
     pub fn new() -> Result<Self, GpuError> {
-        let vk = Arc::new(VulkanContext::new()?);
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            ..Default::default()
+        });
 
-        // SAFETY: the instance/device were created by VulkanContext with
-        // the extension set wgpu-hal expects, and `vk` is kept alive for
-        // as long as the wgpu objects by the Arc stored below.
-        let hal_instance = unsafe {
-            wgpu_hal::vulkan::Instance::from_raw(
-                vk.entry.clone(),
-                vk.instance.clone(),
-                /* driver_api_version */ vk::API_VERSION_1_2,
-                /* android_sdk_version */ 0,
-                /* debug_utils */ None,
-                /* extensions */ instance_extensions(),
-                /* flags */ wgpu_hal::InstanceFlags::empty(),
-                /* memory_budget_thresholds */ Default::default(),
-                /* drop_callback */ None,
-            )
-        }.map_err(|e| GpuError::Vulkan(format!("hal instance from_raw: {e}")))?;
+        // Pick an adapter that actually advertises the feature rather than
+        // taking the default and failing later: a client that cannot export
+        // should refuse to start, not produce an unusable buffer.
+        let adapter = pollster_block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+        }))
+        .map_err(|_| GpuError::NoSuitableAdapter)?;
 
-        let hal_exposed = hal_instance
-            .expose_adapter(vk.physical_device)
-            .ok_or(GpuError::NoSuitableAdapter)?;
+        if !adapter
+            .features()
+            .contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF)
+        {
+            return Err(GpuError::NoSuitableAdapter);
+        }
 
-        // SAFETY: hal_instance was created from vk.instance above.
-        let instance = unsafe { wgpu::Instance::from_hal::<wgpu_hal::api::Vulkan>(hal_instance) };
-        // SAFETY: hal_exposed came from this instance's internal handle.
-        let adapter = unsafe { instance.create_adapter_from_hal(hal_exposed) };
+        let (device, queue) = pollster_block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("ghostframe-client"),
+            required_features: wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF,
+            // downlevel_defaults caps maxComputeInvocationsPerWorkgroup at
+            // the portable 256 that palrle_decode.wgsl was designed around,
+            // so a limit the browser would not have is not silently
+            // available here.
+            required_limits: wgpu::Limits::downlevel_defaults(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            trace: wgpu::Trace::Off,
+        }))
+        .map_err(|e| GpuError::Vulkan(format!("request_device: {e}")))?;
 
-        let hal_device = /* wgpu_hal::vulkan::Adapter::device_from_raw(...) */ todo_impl();
-
-        // SAFETY: hal_device is compatible with `adapter` by construction.
-        let (device, queue) = unsafe {
-            adapter.create_device_from_hal(hal_device, &wgpu::DeviceDescriptor {
-                label: Some("ghostframe-client"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_defaults(),
-                memory_hints: wgpu::MemoryHints::Performance,
-                trace: wgpu::Trace::Off,
-            })
-        }.map_err(|e| GpuError::Vulkan(format!("create_device_from_hal: {e}")))?;
-
-        Ok(WgpuContext { vk, instance, adapter, device, queue })
+        Ok(WgpuContext { instance, adapter, device, queue })
     }
+
+    /// Run `f` with the raw Vulkan device and physical device.
+    ///
+    /// Returns `None` if the backend is not Vulkan. Used only by the
+    /// export path, which wgpu does not provide.
+    pub fn with_raw_device<R>(
+        &self,
+        f: impl FnOnce(&ash::Device, ash::vk::PhysicalDevice) -> R,
+    ) -> Option<R> { todo_impl() }
 }
 ```
 
-The exact argument lists of `Instance::from_raw` and `Adapter::device_from_raw` change between wgpu releases. **Read the docs for the version pinned in Task 1** rather than trusting the sketch above; the shape (build raw, expose adapter, `from_hal`, `device_from_raw`, `create_device_from_hal`) is what matters and is stable.
+`with_raw_device` uses `Device::as_hal::<wgpu_hal::api::Vulkan, _, _>` to reach
+`hal_device.raw_device()` and `raw_physical_device()`; check the exact accessor
+names in `wgpu-hal-30.0.1/src/vulkan/mod.rs`.
 
-Use `wgpu::Limits::downlevel_defaults()` deliberately: it caps `maxComputeInvocationsPerWorkgroup` at the portable 256 that `palrle_decode.wgsl` was designed around, so a limit the browser would not have is not silently available here.
+You need a small block-on helper since wgpu's request functions are async and
+this crate has no runtime. Either add the `pollster` crate (tiny, no transitive
+deps) or write a three-line parking-lot-free executor. Prefer `pollster`, and
+pin it in `[workspace.dependencies]` with a comment explaining why, matching the
+file's convention. Report which you chose.
 
-- [ ] **Step 5: Wire the modules up**
+- [ ] **Step 4: Wire the module up**
 
 In `ghostframe-client-gpu/src/lib.rs`, add:
 
 ```rust
 pub mod config;
-pub mod vulkan;
 pub mod wgpu_ctx;
 ```
 
-- [ ] **Step 6: Run the test**
+- [ ] **Step 5: Run the test**
 
 ```bash
 cargo test -p ghostframe-client-gpu --test gpu_export -- --nocapture
 ```
 
-Expected: PASS.
+Expected: PASS, both tests.
 
-**If it does not pass after genuine effort, STOP and report.** Do not fall back to raw ash silently — that trades away the macOS hedge the spec chose wgpu for, and is the user's decision, not the implementer's.
+**If `VULKAN_EXTERNAL_MEMORY_DMA_BUF` is not available on this machine's adapter,
+STOP and report** rather than falling back. The fallback (hand-building the
+device and using `from_hal`) is a real option but it is a design decision, not an
+implementer's call. Include in your report: the adapter name, its backend, and
+the full feature set it does advertise.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add ghostframe-client-gpu/src/vulkan.rs ghostframe-client-gpu/src/wgpu_ctx.rs \
-        ghostframe-client-gpu/src/lib.rs ghostframe-client-gpu/tests/gpu_export.rs
-git commit -m "feat(client-gpu): build the wgpu device from our own Vulkan device
+git add ghostframe-client-gpu/src/wgpu_ctx.rs ghostframe-client-gpu/src/lib.rs \
+        ghostframe-client-gpu/tests/gpu_export.rs Cargo.toml Cargo.lock
+git commit -m "feat(client-gpu): wgpu device with dmabuf export capability
 
-wgpu enables device extensions from its own feature flags and offers no
-way to request VK_EXT_external_memory_dma_buf or
-VK_EXT_image_drm_format_modifier. So the instance and device are built
-with ash and handed up through from_hal; everything above that line is
-ordinary safe wgpu.
+wgpu 30 has a first-class VULKAN_EXTERNAL_MEMORY_DMA_BUF feature that
+enables VK_EXT_external_memory_dma_buf, VK_EXT_image_drm_format_modifier
+and VK_KHR_external_memory_fd, so the device is built with ordinary wgpu
+rather than by hand and handed up through from_hal.
 
-Device selection fails rather than falling back when no physical device
-supports the export extensions: a client that silently produced a buffer
-its consumer cannot import would be worse than one that refuses to start."
+Adapter selection requires the feature up front: a client that cannot
+export should refuse to start rather than hand its consumer a buffer it
+cannot import.
+
+wgpu-hal 30 can import a dmabuf but not export one, so with_raw_device
+exposes the VkDevice for the export path in the next task. That is the
+crate's only unsafe surface."
 ```
 
 ---
 
+
 # Phase B — Export path
 
 ## Task 3: `ExportedImage` — a dmabuf-backed VkImage
+
+> **REVISED with Task 2.** All Vulkan calls here run against **wgpu's own
+> `VkDevice`**, reached with `WgpuContext::with_raw_device`. The required
+> extensions are already enabled by the `VULKAN_EXTERNAL_MEMORY_DMA_BUF`
+> feature, so this task allocates and exports only — it does not create a
+> device. Everywhere the sketch below says `vk_ctx`, use the raw device from
+> `with_raw_device`.
+
 
 **Files:**
 - Create: `ghostframe-client-gpu/src/export.rs`
@@ -649,7 +621,7 @@ fn exported_image_yields_a_usable_dmabuf_fd_and_layout() {
     let ctx = WgpuContext::new().expect("wgpu context");
 
     // Empty preference list means "library picks"; it must still succeed.
-    let img = ExportedImage::new(&ctx.vk, 256, 128, &[]).expect("export image");
+    let img = ExportedImage::new(&ctx, 256, 128, &[]).expect("export image");
 
     assert_eq!(img.width, 256);
     assert_eq!(img.height, 128);
@@ -669,7 +641,7 @@ fn exported_image_yields_a_usable_dmabuf_fd_and_layout() {
 fn unsatisfiable_modifier_preference_fails_loudly() {
     let ctx = WgpuContext::new().expect("wgpu context");
     // A reserved-invalid modifier no device supports.
-    let err = ExportedImage::new(&ctx.vk, 64, 64, &[0x00ff_ffff_ffff_fffe]);
+    let err = ExportedImage::new(&ctx, 64, 64, &[0x00ff_ffff_ffff_fffe]);
     assert!(
         matches!(err, Err(ghostframe_client_gpu::GpuError::NoCommonModifier)),
         "expected NoCommonModifier, got {err:?}"
@@ -694,7 +666,7 @@ Expected: FAIL, `unresolved import ... export`.
 ```rust
 use std::os::fd::{FromRawFd, OwnedFd, AsRawFd};
 use ash::vk;
-use crate::{vulkan::VulkanContext, GpuError};
+use crate::{wgpu_ctx::WgpuContext, GpuError};
 
 /// Byte layout of one dmabuf plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -719,7 +691,7 @@ impl ExportedImage {
     /// Empty means "library picks", which prefers DRM_FORMAT_MOD_LINEAR
     /// because it is the one every consumer can import.
     pub fn new(
-        vk_ctx: &VulkanContext,
+        ctx: &crate::wgpu_ctx::WgpuContext,
         width: u32,
         height: u32,
         preferred: &[u64],
@@ -745,7 +717,7 @@ impl ExportedImage {
     pub fn raw_fd(&self) -> i32 { self.fd.as_raw_fd() }
 
     /// Modifiers this device supports for RGBA8 with the usages we need.
-    fn supported_modifiers(vk_ctx: &VulkanContext) -> Result<Vec<u64>, GpuError> {
+    fn supported_modifiers(ctx: &WgpuContext) -> Result<Vec<u64>, GpuError> {
         // vkGetPhysicalDeviceFormatProperties2 with
         // VkDrmFormatModifierPropertiesListEXT chained, then filter each
         // by vkGetPhysicalDeviceImageFormatProperties2 with
@@ -848,7 +820,7 @@ reading COLOR under DRM-modifier tiling returns a zero stride."
 #[test]
 fn exported_image_can_be_used_as_a_wgpu_render_target() {
     let ctx = WgpuContext::new().expect("wgpu context");
-    let img = ExportedImage::new(&ctx.vk, 64, 64, &[]).expect("export image");
+    let img = ExportedImage::new(&ctx, 64, 64, &[]).expect("export image");
     let tex = img.as_wgpu_texture(&ctx.device).expect("wrap as wgpu texture");
 
     assert_eq!(tex.width(), 64);
@@ -894,8 +866,9 @@ Add to `impl ExportedImage`:
             view_formats: &[],
         };
 
-        // SAFETY: self.image was created to match `desc`; the drop
-        // callback is a no-op so ownership stays with self.
+        // SAFETY: self.image was created to match `desc`; the no-op drop
+        // callback keeps image ownership with self, and TextureMemory::External
+        // tells wgpu-hal the backing memory is not its to free.
         let hal_tex = unsafe {
             device.as_hal::<wgpu_hal::api::Vulkan, _, _>(|hal_dev| {
                 let hal_dev = hal_dev.expect("vulkan backend");
@@ -903,6 +876,7 @@ Add to `impl ExportedImage`:
                     self.image,
                     &hal_texture_descriptor(&desc),
                     Some(Box::new(|| {})),
+                    wgpu_hal::vulkan::TextureMemory::External,
                 )
             })
         };
@@ -914,7 +888,22 @@ Add to `impl ExportedImage`:
 
 `hal_texture_descriptor` converts a `wgpu::TextureDescriptor` to the `wgpu_hal::TextureDescriptor` the version pinned in Task 1 expects; write it alongside.
 
-The ownership comment is the important part. A `None` drop callback makes wgpu-hal destroy the `VkImage`, which then double-frees against `ExportedImage::drop`.
+The ownership arguments are the important part, and there are two of them in
+wgpu-hal 30:
+
+- A `None` **drop callback** makes wgpu-hal destroy the `VkImage`, which then
+  double-frees against `ExportedImage::drop`. Pass a no-op callback.
+- **`TextureMemory`** is the fourth parameter (new in wgpu-hal 30; older docs show
+  a three-argument form). `External` means "memory not owned by wgpu", which is
+  exactly our case — the `VkDeviceMemory` was allocated by `export.rs` and is
+  freed there. Passing `Dedicated(memory)` would hand wgpu-hal ownership and
+  double-free.
+
+Useful to know for M3: wgpu-hal 30 *does* provide `texture_from_dmabuf_fd` for the
+**import** direction, but it is **single-plane only**. That is not a problem for
+the planned NV12 path, which deliberately imports the same dmabuf twice — plane 0
+as `R8Unorm`, plane 1 as `Rg8Unorm` — so each import is single-plane. There is no
+export counterpart, which is why this task exists.
 
 - [ ] **Step 4: Run the test**
 
@@ -980,7 +969,7 @@ fn framebuffer_blits_into_the_exported_dmabuf() {
     // zeroed memory or with a channel-order mistake: R, G and B all differ.
     fb.debug_fill(&ctx.device, &ctx.queue, [0x11, 0x22, 0x33, 0xFF]);
 
-    let img = ExportedImage::new(&ctx.vk, 64, 64, &[0]).expect("linear export image");
+    let img = ExportedImage::new(&ctx, 64, 64, &[0]).expect("linear export image");
     let tex = img.as_wgpu_texture(&ctx.device).expect("wrap");
     fb.blit_full(&ctx.device, &ctx.queue, &tex);
     ctx.device.poll(wgpu::Maintain::Wait);
@@ -1433,7 +1422,7 @@ use ghostframe_client_gpu::ring::ExportRing;
 fn ring_publishes_partial_updates_and_recycles_buffers() {
     let ctx = WgpuContext::new().expect("wgpu context");
     let mut fb = Framebuffer::new(&ctx.device, 64, 64);
-    let mut ring = ExportRing::new(&ctx.vk, &ctx.device, 64, 64, 3, &[0]).expect("ring");
+    let mut ring = ExportRing::new(&ctx, &ctx.device, 64, 64, 3, &[0]).expect("ring");
 
     // Frame 1: whole surface red. First fill of a fresh buffer is full.
     fb.debug_fill(&ctx.device, &ctx.queue, [0xFF, 0x00, 0x00, 0xFF]);
@@ -1470,7 +1459,7 @@ fn ring_publishes_partial_updates_and_recycles_buffers() {
 fn publish_returns_none_when_every_buffer_is_held() {
     let ctx = WgpuContext::new().expect("wgpu context");
     let fb = Framebuffer::new(&ctx.device, 64, 64);
-    let mut ring = ExportRing::new(&ctx.vk, &ctx.device, 64, 64, 2, &[0]).expect("ring");
+    let mut ring = ExportRing::new(&ctx, &ctx.device, 64, 64, 2, &[0]).expect("ring");
     ring.mark_dirty_all();
     assert!(ring.publish(&ctx.device, &ctx.queue, &fb).is_some());
     ring.mark_dirty_all();
@@ -1497,7 +1486,7 @@ Expected: FAIL, unresolved import `ring`.
 
 ```rust
 use crate::{coalesce, dirty::DirtyHistory, export::ExportedImage,
-            framebuffer::Framebuffer, vulkan::VulkanContext, GpuError};
+            framebuffer::Framebuffer, wgpu_ctx::WgpuContext, GpuError};
 
 pub struct ExportBuffer {
     pub exported: ExportedImage,
@@ -1528,7 +1517,7 @@ pub struct ExportRing {
 }
 
 impl ExportRing {
-    pub fn new(vk: &VulkanContext, device: &wgpu::Device,
+    pub fn new(ctx: &WgpuContext, device: &wgpu::Device,
                width: u32, height: u32, count: usize,
                preferred_modifiers: &[u64]) -> Result<Self, GpuError> { todo_impl() }
 
@@ -1559,7 +1548,7 @@ impl ExportRing {
     pub fn release(&mut self, frame_id: u32) { todo_impl() }
 
     /// Reallocate every buffer at the new size and drop all history.
-    pub fn resize(&mut self, vk: &VulkanContext, device: &wgpu::Device,
+    pub fn resize(&mut self, ctx: &WgpuContext, device: &wgpu::Device,
                   width: u32, height: u32) -> Result<(), GpuError> { todo_impl() }
 }
 ```
