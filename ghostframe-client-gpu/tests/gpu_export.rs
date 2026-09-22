@@ -63,3 +63,59 @@ fn raw_vulkan_device_is_reachable_for_the_export_path() {
         "could not reach the raw VkDevice via as_hal"
     );
 }
+
+use ghostframe_client_gpu::export::ExportedImage;
+
+#[test]
+fn exported_image_yields_a_usable_dmabuf_fd_and_layout() {
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let img = ExportedImage::new(&ctx, 256, 128, &[]).expect("export image");
+
+    assert_eq!(img.width, 256);
+    assert_eq!(img.height, 128);
+    assert!(!img.planes.is_empty(), "no plane layout reported");
+    assert!(img.raw_fd() >= 0, "invalid dmabuf fd");
+    // Stride must cover the row. A zero stride is the classic symptom of
+    // reading the layout off the wrong subresource aspect.
+    assert!(
+        img.planes[0].stride >= 256 * 4,
+        "implausible stride {}",
+        img.planes[0].stride
+    );
+    // On a driver without VK_EXT_image_drm_format_modifier the only
+    // possible answer is LINEAR.
+    if !ctx.explicit_modifiers {
+        assert_eq!(
+            img.modifier, 0,
+            "linear path must report DRM_FORMAT_MOD_LINEAR"
+        );
+    }
+}
+
+#[test]
+fn unsatisfiable_modifier_preference_fails_loudly() {
+    let ctx = WgpuContext::new().expect("wgpu context");
+    // A reserved-invalid modifier no device supports.
+    let err = ExportedImage::new(&ctx, 64, 64, &[0x00ff_ffff_ffff_fffe]);
+    assert!(
+        matches!(
+            err,
+            Err(ghostframe_client_gpu::GpuError::NoCommonModifier { .. })
+        ),
+        "expected NoCommonModifier, got {err:?}"
+    );
+}
+
+#[test]
+fn exported_fd_is_a_real_dmabuf() {
+    // A plausible fd number proves nothing -- verify the kernel agrees it
+    // is a dma_buf, or a bug that returns some other fd passes silently.
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let img = ExportedImage::new(&ctx, 64, 64, &[]).expect("export image");
+    let link = std::fs::read_link(format!("/proc/self/fd/{}", img.raw_fd()))
+        .expect("read /proc/self/fd link");
+    assert!(
+        link.to_string_lossy().contains("dmabuf"),
+        "fd is not a dmabuf: {link:?}"
+    );
+}
