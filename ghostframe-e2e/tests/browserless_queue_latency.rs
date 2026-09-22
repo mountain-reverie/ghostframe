@@ -96,7 +96,11 @@ fn capped_scene(cols: u8, rows: u8, cap_bytes_per_s: u64) -> BrowserlessScene {
 }
 
 fn ratio(queued: u64, wire: u64) -> f64 {
-    if wire == 0 { 0.0 } else { queued as f64 / wire as f64 }
+    if wire == 0 {
+        0.0
+    } else {
+        queued as f64 / wire as f64
+    }
 }
 
 fn report(name: &str, r: &BrowserlessResult) {
@@ -106,12 +110,18 @@ fn report(name: &str, r: &BrowserlessResult) {
          s2c_bytes={} s2c_dg={}",
         r.queued_critical_latency_mean_us,
         r.critical_latency_mean_us,
-        ratio(r.queued_critical_latency_mean_us, r.critical_latency_mean_us),
+        ratio(
+            r.queued_critical_latency_mean_us,
+            r.critical_latency_mean_us
+        ),
         r.queued_critical_latency_max_us,
         r.queued_critical_latency_count,
         r.queued_refinement_latency_mean_us,
         r.refinement_latency_mean_us,
-        ratio(r.queued_refinement_latency_mean_us, r.refinement_latency_mean_us),
+        ratio(
+            r.queued_refinement_latency_mean_us,
+            r.refinement_latency_mean_us
+        ),
         r.queued_refinement_latency_max_us,
         r.queued_refinement_latency_count,
         r.bytes_delivered_s2c,
@@ -142,7 +152,9 @@ fn assert_measured(r: &BrowserlessResult, min_samples: u64) {
 /// rather than on the backlog.
 #[tokio::test(start_paused = true)]
 async fn a_small_frame_does_not_queue() {
-    let r = run_browserless(burst_scene(2, 2, 5)).await.expect("scene ran");
+    let r = run_browserless(burst_scene(2, 2, 5))
+        .await
+        .expect("scene ran");
     report("small", &r);
     assert_measured(&r, 4);
 
@@ -194,9 +206,15 @@ async fn a_full_grid_first_frame_clears_without_multi_second_queueing() {
 /// cap is raised 4x.
 #[tokio::test(start_paused = true)]
 async fn queueing_delay_responds_to_backlog_and_capacity() {
-    let small = run_browserless(capped_scene(16, 16, 250_000)).await.expect("ran");
-    let large = run_browserless(capped_scene(60, 34, 250_000)).await.expect("ran");
-    let roomy = run_browserless(capped_scene(60, 34, 1_000_000)).await.expect("ran");
+    let small = run_browserless(capped_scene(16, 16, 250_000))
+        .await
+        .expect("ran");
+    let large = run_browserless(capped_scene(60, 34, 250_000))
+        .await
+        .expect("ran");
+    let roomy = run_browserless(capped_scene(60, 34, 1_000_000))
+        .await
+        .expect("ran");
     report("capped_16x16", &small);
     report("capped_60x34", &large);
     report("roomy_60x34", &roomy);
@@ -235,7 +253,9 @@ async fn queueing_delay_responds_to_backlog_and_capacity() {
 /// two clocks, or that let the backlog grow without bound, moves these.
 #[tokio::test(start_paused = true)]
 async fn refinement_work_queues_behind_critical_work() {
-    let r = run_browserless(capped_scene(60, 34, 1_000_000)).await.expect("ran");
+    let r = run_browserless(capped_scene(60, 34, 1_000_000))
+        .await
+        .expect("ran");
     report("refinement_queueing", &r);
     assert_measured(&r, 64);
     assert!(
@@ -299,7 +319,9 @@ async fn refinement_work_queues_behind_critical_work() {
 /// over-popping. It deliberately does not encode production's ratio.
 #[tokio::test(start_paused = true)]
 async fn critical_tier_queueing_separates_once_the_scheduler_paces() {
-    let r = run_browserless(capped_scene(60, 34, 250_000)).await.expect("ran");
+    let r = run_browserless(capped_scene(60, 34, 250_000))
+        .await
+        .expect("ran");
     report("critical_fidelity", &r);
     assert_measured(&r, 64);
 
@@ -366,7 +388,12 @@ async fn retransmission_alone_separates_queued_from_sent() {
     report("retransmit_separation", &r);
 
     // Premise: the drop must have fired enough to force retransmissions.
-    assert_eq!(r.drops_fired.len(), 1, "expected one rule; got {:?}", r.drops_fired);
+    assert_eq!(
+        r.drops_fired.len(),
+        1,
+        "expected one rule; got {:?}",
+        r.drops_fired
+    );
     assert!(
         r.drops_fired[0] >= 7,
         "drop rule fired only {} times -- too few to force a retransmit cycle",

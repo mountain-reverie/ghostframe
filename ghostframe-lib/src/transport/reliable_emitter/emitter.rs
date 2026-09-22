@@ -713,7 +713,10 @@ mod tests {
             .collect();
         let mut sorted = seqs.clone();
         sorted.sort_unstable();
-        assert_eq!(seqs, sorted, "wire order changed across a refusal: {seqs:?}");
+        assert_eq!(
+            seqs, sorted,
+            "wire order changed across a refusal: {seqs:?}"
+        );
     }
 
     #[test]

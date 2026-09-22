@@ -313,7 +313,6 @@ fn generation_ordering_handles_the_four_bit_wrap() {
     assert!(!generation_is_newer(3, 3), "equal is not newer");
 }
 
-
 /// Gap detection must respect the tile's own pass set.
 ///
 /// Regression guard for the defect that a static 16-tile lossless scene
@@ -411,7 +410,10 @@ fn a_tile_without_a_bitmap_is_neither_complete_nor_partial() {
     // cannot be judged either way. Counting it as "partial" would inflate
     // the stuck-tile signal on a session that is merely still starting up.
     let s = summarize([entry(1 << 8, None, 0)].iter(), 6);
-    assert_eq!((s.tiles, s.complete, s.partial, s.bitmap_unknown), (1, 0, 0, 1));
+    assert_eq!(
+        (s.tiles, s.complete, s.partial, s.bitmap_unknown),
+        (1, 0, 0, 1)
+    );
 }
 
 #[test]
@@ -449,7 +451,10 @@ fn the_log_line_reports_every_field_and_omits_empty_histogram_buckets() {
     // Two entries hold one pass, one holds two.
     assert!(line.contains("1:2"), "expected bucket 1:2 in {line:?}");
     assert!(line.contains("2:1"), "expected bucket 2:1 in {line:?}");
-    assert!(!line.contains("0:0"), "empty buckets must be omitted: {line:?}");
+    assert!(
+        !line.contains("0:0"),
+        "empty buckets must be omitted: {line:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -520,7 +525,10 @@ fn incomplete_tiles_names_the_tile_and_the_passes_it_is_owed() {
     assert_eq!(incomplete.len(), 1, "exactly one tile is incomplete");
     let (x, y, mask, reported_present, _sweeps) = incomplete[0];
     assert_eq!((x, y), (TX, TY), "the diagnostic must name the right tile");
-    assert_eq!(reported_present, present, "reported bitmap must be the wire's");
+    assert_eq!(
+        reported_present, present,
+        "reported bitmap must be the wire's"
+    );
     assert_eq!(
         reported_present & !mask,
         1u16 << last_idx,

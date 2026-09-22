@@ -33,8 +33,8 @@ use ghostframe_e2e::harness::browserless::{
     run_browserless, BrowserlessResult, BrowserlessScene, FrameScript, SceneLoad,
     DEFAULT_CADENCE_US,
 };
-use ghostframe_e2e::harness::scene_tiles::TileSpec;
 use ghostframe_e2e::harness::load_profile::gradient_tile;
+use ghostframe_e2e::harness::scene_tiles::TileSpec;
 use ghostframe_e2e::netsim::NetProfile;
 
 fn scene() -> BrowserlessScene {
@@ -45,14 +45,26 @@ fn scene() -> BrowserlessScene {
         load: SceneLoad::Script(vec![
             FrameScript {
                 tiles: vec![
-                    ((0, 0), TileSpec::Solid { bgra: [10, 20, 30, 255] }),
-                    ((1, 1), TileSpec::Cdf53 { bgra: gradient_tile(0, 1, 1) }),
+                    (
+                        (0, 0),
+                        TileSpec::Solid {
+                            bgra: [10, 20, 30, 255],
+                        },
+                    ),
+                    (
+                        (1, 1),
+                        TileSpec::Cdf53 {
+                            bgra: gradient_tile(0, 1, 1),
+                        },
+                    ),
                 ],
             },
             FrameScript {
                 tiles: vec![(
                     (1, 1),
-                    TileSpec::Cdf53 { bgra: gradient_tile(37, 1, 1) },
+                    TileSpec::Cdf53 {
+                        bgra: gradient_tile(37, 1, 1),
+                    },
                 )],
             },
         ]),

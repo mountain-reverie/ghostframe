@@ -219,7 +219,10 @@ fn present_set(present: u16) -> Vec<u8> {
 fn compare(name: &str, bgra: &[u8]) -> (i32, u16, u8) {
     let coeffs = cdf53::forward(bgra);
     let (present, sparse) = cdf53::encode_passes_sparse(&coeffs);
-    let highest = present_set(present).into_iter().max().expect("pass 0 present");
+    let highest = present_set(present)
+        .into_iter()
+        .max()
+        .expect("pass 0 present");
 
     let truth = bgr_to_rgba(&cdf53::inverse(&coeffs));
     let rust = rust_client_rgba(&sparse);
@@ -265,7 +268,10 @@ fn the_rust_decoder_is_exact_once_all_present_passes_arrive() {
 #[test]
 fn the_gpu_model_agrees_when_no_trailing_pass_is_skipped() {
     let (gpu_err, _present, highest) = compare("noisy", &noisy_tile());
-    assert_eq!(highest, 13, "premise: noisy content must fill the last plane");
+    assert_eq!(
+        highest, 13,
+        "premise: noisy content must fill the last plane"
+    );
     assert_eq!(
         gpu_err, 0,
         "with the last plane present the GPU applies no midpoint and must be exact"
@@ -293,7 +299,8 @@ fn the_gpu_is_exact_when_trailing_passes_are_skipped() {
         present_set(present)
     );
     assert_eq!(
-        gpu_err, 0,
+        gpu_err,
+        0,
         "GPU reconstruction is off by {gpu_err} per channel against a decoder \
          that is exact on the same input. A skipped trailing plane must count \
          as resolved (known zero), not undecoded, or read_coeff adds a \

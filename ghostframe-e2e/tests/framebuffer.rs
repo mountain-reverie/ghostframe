@@ -101,7 +101,29 @@ fn pal_rle_round_trips_through_the_buffer() {
 fn cdf53_accumulates_across_all_passes() {
     let bgra = gradient_bgra();
     let work = encode_tile(&TileSpec::Cdf53 { bgra }, 2, 2, 0);
-    assert_eq!(work.len(), 14);
+    // Not 14. `encode_tile` moved to `encode_passes_sparse` so the harness
+    // emits the pass layout production actually sends, and a sparse encoder
+    // omits every all-zero bit-plane -- 9 for this gradient. The old literal
+    // described the dense encoder the harness used to have, which is exactly
+    // the divergence that once hid a real production bug.
+    //
+    // The count is a property of the content, so this asserts what the test
+    // needs rather than pinning a number that moves with the fixture: pass 0
+    // must lead (it carries the `present_passes` bitmap), the set must be
+    // strictly increasing, and there must be at least two passes or the
+    // refinement claim below is vacuous.
+    assert!(
+        work.len() >= 2,
+        "sparse encoding produced {} pass(es); with fewer than two there is \
+         no refinement to observe and the assertion below proves nothing",
+        work.len()
+    );
+    assert_eq!(work[0].pass_idx, 0, "pass 0 must lead the sequence");
+    assert!(
+        work.windows(2).all(|w| w[0].pass_idx < w[1].pass_idx),
+        "pass indices must be strictly increasing: {:?}",
+        work.iter().map(|w| w.pass_idx).collect::<Vec<_>>()
+    );
 
     let mut fb = FrameBuffer::new();
 

@@ -383,13 +383,13 @@ async fn run_inner(mut scene: BrowserlessScene) -> anyhow::Result<BrowserlessRes
     let (ours, peer) = tokio::net::UnixStream::pair()
         .map_err(|e| anyhow!("seed {seed}: UnixStream::pair failed: {e}"))?;
 
-    let server =
-        match scene.datagram_send_buffer_bytes {
-            Some(bytes) => QuicServer::new_with_datagram_send_buffer(bytes)
-                .map_err(|e| anyhow!("seed {seed}: QuicServer::new failed: {e}"))?,
-            None => QuicServer::new()
-                .map_err(|e| anyhow!("seed {seed}: QuicServer::new failed: {e}"))?,
-        };
+    let server = match scene.datagram_send_buffer_bytes {
+        Some(bytes) => QuicServer::new_with_datagram_send_buffer(bytes)
+            .map_err(|e| anyhow!("seed {seed}: QuicServer::new failed: {e}"))?,
+        None => {
+            QuicServer::new().map_err(|e| anyhow!("seed {seed}: QuicServer::new failed: {e}"))?
+        }
+    };
 
     // Cert hash MUST be taken before `server` moves into the bridge below.
     let mut server_cert_sha256 = [0u8; 32];
