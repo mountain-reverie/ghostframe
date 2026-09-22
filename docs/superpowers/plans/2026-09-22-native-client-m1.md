@@ -615,11 +615,37 @@ crate's only unsafe surface."
 ## Task 3: `ExportedImage` — a dmabuf-backed VkImage
 
 > **REVISED with Task 2.** All Vulkan calls here run against **wgpu's own
-> `VkDevice`**, reached with `WgpuContext::with_raw_device`. The required
-> extensions are already enabled by the `VULKAN_EXTERNAL_MEMORY_DMA_BUF`
-> feature, so this task allocates and exports only — it does not create a
-> device. Everywhere the sketch below says `vk_ctx`, use the raw device from
-> `with_raw_device`.
+> `VkDevice`**, reached with `WgpuContext::with_raw_device`. This task allocates
+> and exports only — it does not create a device. Everywhere the sketch below
+> says `vk_ctx`, use the raw device from `with_raw_device`.
+>
+> **There are two export paths and you must implement both**, selected by
+> `WgpuContext::explicit_modifiers`:
+>
+> - **`true` — explicit modifier path.** Tiling
+>   `vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT`, with
+>   `VkImageDrmFormatModifierListCreateInfoEXT` narrowed to the negotiated
+>   modifier. Read plane layouts with `vkGetImageSubresourceLayout` using the
+>   **`MEMORY_PLANE_0_EXT`** aspect (using `COLOR` here returns a zero stride),
+>   and confirm the modifier the driver actually chose with
+>   `vkGetImageDrmFormatModifierProperties`.
+>
+> - **`false` — linear path.** `VK_EXT_image_drm_format_modifier` is absent, so
+>   there is nothing to negotiate: tiling is `vk::ImageTiling::LINEAR`, the
+>   modifier is implicitly `DRM_FORMAT_MOD_LINEAR` (0), and plane layout comes
+>   from `vkGetImageSubresourceLayout` with the ordinary **`COLOR`** aspect.
+>   This is the pre-modifier dmabuf export path and every consumer can import
+>   it.
+>
+> **The dev machine takes the linear path** (RADV Polaris, Mesa 26.1.7), so that
+> is the branch the tests will actually exercise. Write the explicit-modifier
+> branch anyway — it is what makes tiled, faster buffers possible on hardware
+> that has the extension — but do not let it go untested silently: log which
+> path was taken at `info`, and assert the reported modifier in the test.
+>
+> `GpuError::NoCommonModifier` now carries `{ device: Vec<u64>, requested:
+> Vec<u64> }`. On the linear path, a consumer that demands anything other than
+> 0 gets that error with `device: vec![0]`.
 
 
 **Files:**
