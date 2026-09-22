@@ -6,9 +6,12 @@ edition = "2021"
 # GPU decode and dmabuf export for the native client.
 #
 # Deliberately knows nothing about networking: it takes decoded or
-# undecoded tile payloads and produces an exported dmabuf. That boundary
-# is what lets the real WGSL be tested with no transport at all, which
-# `ghostframe-client-core/tests/oracle_gpu_sparse.rs` explicitly cannot do.
+# undecoded tile payloads and produces an exported dmabuf. That boundary is
+# what lets the real WGSL run against real pixels in-process.
+# `ghostframe-client-core/tests/oracle_gpu_sparse.rs` can only re-implement
+# the shader arithmetic in Rust, hand-kept in step with three shader sites,
+# so a divergence between that model and the shipped WGSL is invisible to
+# it. Closing that gap is this crate's reason to exist.
 
 [dependencies]
 ghostframe-protocol = { path = "../ghostframe-protocol" }
@@ -19,6 +22,7 @@ ash = { workspace = true }
 libc = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+pollster = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"

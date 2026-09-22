@@ -78,6 +78,12 @@ wgpu = { version = "=30.0.1", default-features = false, features = ["vulkan", "w
 # exactly: texture_from_raw's signature has changed across releases.
 wgpu-hal = { version = "=30.0.1", default-features = false, features = ["vulkan"] }
 
+# pollster 1.0.1 — latest stable 1.x. wgpu's request_adapter/request_device
+# are async but this crate has no async runtime (and doesn't want tokio
+# just to block on two futures at startup); pollster's block_on spins the
+# calling thread to completion with zero transitive deps.
+pollster = { version = "=1.0.1" }
+
 # ffmpeg-next 9.0.0 — Rust bindings for FFmpeg (libavcodec, libavutil, libswscale)
 ffmpeg-next = { version = "=9.0.0" }
 
