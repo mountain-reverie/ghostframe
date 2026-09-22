@@ -64,7 +64,22 @@ Read these before starting. They are not obvious from the code.
 
 7. **CI names `--test` targets one by one** in `.github/workflows/*.yml`. A new `tests/*.rs` does not run in CI until a workflow names it. This is the mechanism used here to keep GPU-requiring tests out of CI while always running them locally — the skip lives in the workflow, never in `#[ignore]` or a runtime self-skip.
 
-8. **Never `git add -A`.** Stage explicit paths. Screenshots and scratch files live in the repo root.
+8. **The decode shaders are all native-compatible, and all fit `downlevel_defaults()`.** Verified 2026-09-22 by scanning the shader set:
+
+   - Only `h264_blit.wgsl` uses WebGPU-only constructs (`texture_external`,
+     `textureSampleBaseClampToEdge`). It is excluded from M1 and replaced in M3
+     by `h264_nv12_blit.wgsl`. Every other shader compiles natively.
+   - Largest workgroup is 16x16 = 256 invocations (`palrle_decode`,
+     `cdf53_inverse_l1`, `cdf53_inverse_l2`), exactly the portable
+     `maxComputeInvocationsPerWorkgroup` that `wgpu::Limits::downlevel_defaults()`
+     enforces. Total workgroup storage across all shaders is one `u32`.
+
+   So the deliberately restrictive limits chosen in Task 2 do not need relaxing
+   for any M1 pipeline. If a later shader exceeds them, that is a signal to
+   re-examine the shader, not to raise the limit -- the browser does not have a
+   higher one.
+
+9. **Never `git add -A`.** Stage explicit paths. Screenshots and scratch files live in the repo root.
 
 9. **Local gates must match CI.** `cargo clippy` alone is not green. CI also runs `cargo fmt --all -- --check` and an env-read guard. Run `just ci-local` before declaring a task done.
 
