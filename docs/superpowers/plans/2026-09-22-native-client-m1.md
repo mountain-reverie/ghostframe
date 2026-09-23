@@ -3008,3 +3008,41 @@ full-surface damage."
 - [ ] `ghostframe_client.h` generates and passes `gcc -fsyntax-only`
 - [ ] The coalescing proptest has been shown to fail under a deliberate mutation
 - [ ] No `#[ignore]` anywhere in the new crates
+
+---
+
+## Task 20: realistic-scenario e2e (deferred until Task 19 lands)
+
+**Not yet specified in detail. Written here so it is not lost.**
+
+Task 19 is a *smoke* test: connect, static pattern, one pixel. It proves the pipe
+is connected. It does not prove the client behaves on a real link, and the
+milestone should not be called done on it alone.
+
+The motivating bug is scale- and loss-dependent:
+`e2e_saturated_link_starves_tiles_into_giving_up` strands 2040 tiles at
+1920x1080 on a shaped link with 1% loss, holding `{0,5..10}` and never receiving
+`{11,12,13}`. The same shape at 768 tiles converges cleanly, which is why it hid
+for so long. A smoke test cannot reach it.
+
+Task 20 must therefore:
+
+- Run the native client at **production resolution** (1920x1080, 2040 tiles), not
+  the harness's convenient 1024x768.
+- Apply realistic network conditions. The repo already has everything needed —
+  do **not** rebuild it: `NetShape::{tailnet_like, tailnet_like_lossy}` (real `tc`
+  shaping on the container, with `verify()`), the `netsim` profiles
+  (`wifi()`, `lte_bufferbloat()`, `fibre_aqm()`, `CoDel`, `CapTimeline`), and the
+  deterministic loss-injection env vars
+  `GHOSTFRAME_{OUTBOUND,INBOUND}_LOSS_{PROBABILITY,PREDICATE,SEED}`. Prefer the
+  env vars where reproducibility matters, since `tc` loss is statistical.
+- Assert **convergence**, not just liveness: the framebuffer reaches the
+  reference, and CDF 5/3 tiles finish rather than stranding.
+- Read coverage telemetry **in-process** via `ClientCore::cdf53_coverage_summary()`
+  and `cdf53_incomplete_tiles()`. This is where the native client finally pays for
+  itself: in the browser this required the user to paste console text.
+
+**Weston is deliberately NOT part of this.** `spawn_weston_headless` exists to host
+a *browser* (it is spawned only when `webgpu: true`, providing an XWayland display
+for Chrome). The native client is itself the GPU client, so adding Weston to its
+path would be cargo-culting infrastructure that tests nothing.
