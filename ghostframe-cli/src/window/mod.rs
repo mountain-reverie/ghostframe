@@ -35,6 +35,17 @@ pub trait Backend {
     /// A pollable fd, so the caller can wait on the display server and the
     /// client's event fd together instead of spinning.
     fn event_fd(&self) -> RawFd;
+
+    /// DRM format modifiers this backend's compositor prefers for imported
+    /// dmabufs, in priority order, for feeding into
+    /// `ghostframe_client_native::Config::preferred_modifiers` before
+    /// `Client::new`. Empty means "no preference" -- the render thread's
+    /// export ring falls back to `DRM_FORMAT_MOD_LINEAR`, which is exactly
+    /// right for X11 (no such negotiation exists there) and for a Wayland
+    /// compositor that hasn't advertised any.
+    fn preferred_dmabuf_modifiers(&self) -> Vec<u64> {
+        Vec::new()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
