@@ -24,6 +24,7 @@ import (
 	"unsafe"
 
 	"tailscale.com/envknob"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/netns"
 	"tailscale.com/tsnet"
 )
@@ -259,9 +260,18 @@ var errLoginTimeout = errors.New("ghostbridge: timed out waiting for auth URL or
 // Server.Up blocks until Running and never surfaces the auth URL itself
 // (see loginURL's doc comment), so we have to poll LocalClient status
 // instead. The interval is tsnet's own printAuthURLLoop cadence (5s) cut
-// down to 250ms so a human watching a CLI doesn't wait a full DERP-region
-// round trip to see the URL appear; the timeout is generous because control
+// down to 250ms so a human watching a CLI doesn't wait up to 5s to see a
+// URL control has already published; the timeout is generous because control
 // plane round trips over a slow link are legitimately multi-second.
+// Status codes for the login/logout exports. Named rather than inline so
+// `ghostframe-tsnet` can pin them the way web_status_codes_are_distinct
+// already pins the web-server codes -- a silent renumbering across the FFI
+// boundary is otherwise only found by a confused caller.
+const (
+	gbridgeLoginStatusBufferTooSmall = -5
+	gbridgeLoginStatusTimeout        = -6
+)
+
 const (
 	loginPollInterval = 250 * time.Millisecond
 	loginPollTimeout  = 60 * time.Second
@@ -281,7 +291,11 @@ func loginURLForHandle(sd int32, timeout time.Duration) (string, error) {
 	if h == nil {
 		return "", errUnknownHandle
 	}
-	return loginURL(h.server, timeout)
+	lc, err := h.server.LocalClient()
+	if err != nil {
+		return "", fmt.Errorf("ghostbridge: loginURL: LocalClient: %w", err)
+	}
+	return loginURL(lc, timeout)
 }
 
 // loginURL returns the URL a user must visit to authorise this node, or an
@@ -298,12 +312,18 @@ func loginURLForHandle(sd int32, timeout time.Duration) (string, error) {
 // An already-authorised node returns ("", nil), NOT an error: a caller with
 // seeded state (e.g. a prior successful login persisted to StateDir) must
 // not be forced through an interactive path it does not need.
-func loginURL(s *tsnet.Server, timeout time.Duration) (string, error) {
-	lc, err := s.LocalClient()
-	if err != nil {
-		return "", fmt.Errorf("ghostbridge: loginURL: LocalClient: %w", err)
-	}
+// statusPoller is the one method loginURL needs from *local.Client.
+//
+// Narrowed to an interface so the three outcomes -- URL published, already
+// authorised, timed out -- are testable without a tailnet. The
+// already-authorised path in particular is what Rust's
+// GhostbridgeHandle::login_url turns into Option::None, and a refactor that
+// silently turned it into a 60s hang would be invisible otherwise.
+type statusPoller interface {
+	StatusWithoutPeers(ctx context.Context) (*ipnstate.Status, error)
+}
 
+func loginURL(lc statusPoller, timeout time.Duration) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
@@ -313,6 +333,14 @@ func loginURL(s *tsnet.Server, timeout time.Duration) (string, error) {
 	for {
 		st, err := lc.StatusWithoutPeers(ctx)
 		if err != nil {
+			// The deadline can expire *inside* the call, not only between
+			// calls: StatusWithoutPeers uses NewRequestWithContext, so an
+			// expired ctx surfaces as a context error here rather than at
+			// the select below. Without this check a timeout reports the
+			// generic code and the caller cannot tell it apart.
+			if ctx.Err() != nil {
+				return "", errLoginTimeout
+			}
 			return "", fmt.Errorf("ghostbridge: loginURL: StatusWithoutPeers: %w", err)
 		}
 		if st.AuthURL != "" {
@@ -344,8 +372,8 @@ func logoutForHandle(sd int32, timeout time.Duration) error {
 // This is NOT the same as deleting the state directory: that leaves the
 // node registered and visible in the tailnet's device list with no way to
 // reach it. Callers must log out BEFORE removing local state, because the
-// credentials logout needs (the LocalAPI auth cookie, the node's current
-// session) live in that state.
+// credentials logout needs -- the node key and its current control session
+// -- live in that state.
 func logout(s *tsnet.Server, timeout time.Duration) error {
 	lc, err := s.LocalClient()
 	if err != nil {
@@ -359,7 +387,6 @@ func logout(s *tsnet.Server, timeout time.Duration) error {
 	return nil
 }
 
-//export gbridge_login_url
 // Return the URL a user must visit to authorise this node, or an empty
 // string if it is already authorised.
 //
@@ -369,6 +396,8 @@ func logout(s *tsnet.Server, timeout time.Duration) error {
 // An already-authorised node yields an empty string and success, NOT an
 // error: a caller with seeded state must not be forced through an
 // interactive path it does not need.
+//
+//export gbridge_login_url
 func gbridge_login_url(sd C.int32_t, cBuf *C.char, cBufLen C.size_t) C.gbridge_status {
 	url, err := loginURLForHandle(int32(sd), loginPollTimeout)
 	if err != nil {
@@ -384,7 +413,7 @@ func gbridge_login_url(sd C.int32_t, cBuf *C.char, cBufLen C.size_t) C.gbridge_s
 		}
 	}
 	if C.size_t(len(url)+1) > cBufLen {
-		return -5
+		return gbridgeLoginStatusBufferTooSmall
 	}
 	dst := unsafe.Slice((*byte)(unsafe.Pointer(cBuf)), int(cBufLen))
 	copy(dst, url)
@@ -392,13 +421,14 @@ func gbridge_login_url(sd C.int32_t, cBuf *C.char, cBufLen C.size_t) C.gbridge_s
 	return 0
 }
 
-//export gbridge_logout
 // Log this node out of the tailnet.
 //
 // NOT the same as deleting the state directory: that leaves the node
 // registered and visible in the tailnet's device list with no way to reach
 // it. Callers must log out BEFORE removing local state, because the
 // credentials needed to log out live there.
+//
+//export gbridge_logout
 func gbridge_logout(sd C.int32_t) C.gbridge_status {
 	err := logoutForHandle(int32(sd), logoutTimeout)
 	if err != nil {
