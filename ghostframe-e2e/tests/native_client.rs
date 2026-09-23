@@ -45,6 +45,7 @@
 use std::time::{Duration, Instant};
 
 use ghostframe_client_native::{Client, ClientEvent, Config, PublishedFrame};
+use ghostframe_e2e::harness::net_shape::NetShape;
 use ghostframe_e2e::harness::{read_server_logs_stripped, setup_e2e_server, E2eServerSpec};
 
 /// Drain queued events (logging each) and return the first published frame,
@@ -203,6 +204,232 @@ async fn native_client_renders_the_test_pattern_into_an_exported_dmabuf() {
     client.disconnect().expect("disconnect");
 }
 
+/// Task 20: the native client at production scale (1920x1080 = 2040 tiles)
+/// on a shaped, lossy link -- the scenario the whole native client was
+/// commissioned for.
+///
+/// # Reproducing the production symptom
+///
+/// The handoff describes a production session that never finished refining
+/// a *static* screen: `tiles=2040 complete=0 partial=2040 gave_up=1587`,
+/// stranded tiles missing exactly the finest bit-planes (`{11,12,13}`). The
+/// scale matters: the same shape at VKMS's default 1024x768 (768 tiles)
+/// converges cleanly, which is why every earlier e2e scene missed it.
+///
+/// # Deviation from the M1 test-pattern convention: `--gradient`, not `--solid-red`
+///
+/// `e2e_saturated_link_starves_tiles_into_giving_up` (`e2e.rs`) reproduces
+/// this with `--tile-pattern photo --subtle-drift 250`, i.e. *moving*
+/// content. This test wants a screen that has stopped changing, to isolate
+/// "detail never arrives" from "new content keeps superseding old passes".
+/// But `--solid-red` is the wrong static content for that: every tile is a
+/// single color, so `classify_tile`'s Rule 6 (`unique_colors <= 1`) always
+/// picks `CodecState::Solid` -- CDF 5/3 is never entered at all, and
+/// `cdf53_coverage_summary` would report `tiles=0` regardless of what the
+/// link does to it. `--gradient --drm-direct` (used by
+/// `e2e_cdf53_lossless_buildup_*` for exactly this reason) paints a static,
+/// full-screen diagonal gradient: every 32x32 tile has hundreds of unique
+/// colors, so the classifier's Rule 8 fallback forces Cdf53, and the scene
+/// never changes after the first paint (see
+/// `ghostframe-test-pattern/src/gradient.rs`: "paint once, sleep forever").
+/// That is the static-but-detailed screen the production bug actually needs.
+///
+/// # Outcomes
+///
+/// Both are useful and neither is a failure of this test itself:
+/// - Convergence (`complete == tiles`, `gave_up == 0`): the native client
+///   handles production scale under loss.
+/// - Stranding (`gave_up > 0` or `complete < tiles`): the first in-process,
+///   greppable reproduction of the production symptom (previously only
+///   observed via a user pasting browser console text).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Docker + GPU + VKMS; production-scale, several minutes"]
+async fn native_client_converges_at_production_scale_under_loss() {
+    eprintln!("[phase] starting headscale + ghostframe-server containers (production scale)");
+    let setup = setup_e2e_server(E2eServerSpec {
+        test_pattern_args: "--gradient --drm-direct",
+        extra_env: &[
+            ("GHOSTFRAME_DRM_MODE", "1920x1080"),
+            ("GHOSTFRAME_ENABLE_CDF53", "1"),
+            // Pin the frame mode so a cost-based H264 switch can't freeze
+            // Cdf53 emission mid-refinement and masquerade as stranding --
+            // see `e2e_saturated_link_starves_tiles_into_giving_up`'s doc
+            // comment for how that fooled an earlier run of that test.
+            ("GHOSTFRAME_FORCE_TILECODEC", "1"),
+            // Deterministic outbound tile loss, independent of (and in
+            // addition to) the kernel-level `tc netem` shaping applied
+            // below. Seeded so a stranding reproduction is reproducible.
+            ("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "0.01"),
+            ("GHOSTFRAME_OUTBOUND_LOSS_PREDICATE", "tile"),
+            ("GHOSTFRAME_OUTBOUND_LOSS_SEED", "20260922"),
+        ],
+        gpu: true,
+        webgpu: false,
+        url_query_extra: "",
+    })
+    .await
+    .expect("bring up headscale + ghostframe server");
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
+    eprintln!(
+        "[phase] shaping {} with a tailnet-like lossy link",
+        setup.server_container_name
+    );
+    NetShape::tailnet_like_lossy()
+        .apply(&setup.server_container_name)
+        .expect("apply tailnet-like lossy shape");
+    let qdisc =
+        NetShape::verify(&setup.server_container_name).expect("read back the applied qdisc");
+    eprintln!("shaped link qdisc: {}", qdisc.trim());
+    assert!(
+        qdisc.contains("netem") && qdisc.contains("loss"),
+        "lossy netem was not actually applied to {}; qdisc reads: {qdisc:?}. \
+         A silently-unshaped run would masquerade as the easy case.",
+        setup.server_container_name
+    );
+
+    eprintln!("[phase] containers up; building client");
+    let state_dir = tempfile::tempdir().expect("tempdir");
+    let mut client = Client::new(Config {
+        hostname: "native-client-scale-test".into(),
+        authkey: String::new(), // unused: the bridge below is already up
+        state_dir: state_dir.path().to_path_buf(),
+        supports_h264: false,
+        indices_raw: false,
+        n_export_buffers: 3,
+        preferred_modifiers: vec![],
+    })
+    .expect("create client");
+    client.attach_bridge(setup._test_node.bridge());
+
+    eprintln!(
+        "[phase] connecting to {}:443 over tsnet",
+        setup.server_container_name
+    );
+    let connect_result = client.connect(&setup.server_container_name, 443);
+    if let Err(e) = &connect_result {
+        eprintln!(
+            "--- server logs ({}) ---\n{}",
+            setup.server_container_name,
+            read_server_logs_stripped(&setup.server_container_name)
+        );
+        panic!("connect over the tailnet failed: {e}");
+    }
+
+    eprintln!("[phase] waiting for the first published frame");
+    let frame = match wait_for_frame(&mut client, Duration::from_secs(60)) {
+        Some(f) => f,
+        None => {
+            eprintln!(
+                "--- server logs ({}) ---\n{}",
+                setup.server_container_name,
+                read_server_logs_stripped(&setup.server_container_name)
+            );
+            panic!("no frame published within 60s");
+        }
+    };
+    eprintln!(
+        "frame_id={} buffer_id={} {}x{} damage={:?}",
+        frame.frame_id, frame.buffer_id, frame.width, frame.height, frame.damage
+    );
+    client.release_frame(frame.frame_id);
+
+    eprintln!("[phase] polling cdf53 coverage for up to 90s");
+    let poll_deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        // Drain events between polls so a real `ClientEvent::Error` (e.g. a
+        // connection loss under this much loss/shaping) fails loudly rather
+        // than being silently absorbed by the polling loop.
+        while let Some(ev) = client.next_event() {
+            tracing::info!(?ev, "client event");
+            if let ClientEvent::Error { message } = &ev {
+                eprintln!(
+                    "--- server logs ({}) ---\n{}",
+                    setup.server_container_name,
+                    read_server_logs_stripped(&setup.server_container_name)
+                );
+                panic!("client reported an error while polling coverage: {message}");
+            }
+        }
+
+        let cov = client.cdf53_coverage().expect("query cdf53 coverage");
+        eprintln!("[coverage] {}", cov.summary.to_log_line());
+
+        if cov.summary.tiles > 0 && cov.summary.complete == cov.summary.tiles {
+            eprintln!("[phase] converged");
+            break;
+        }
+        if Instant::now() >= poll_deadline {
+            eprintln!("[phase] 90s poll deadline reached without full convergence");
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+
+    let final_cov = client.cdf53_coverage().expect("final cdf53 coverage query");
+    eprintln!("[final] {}", final_cov.summary.to_log_line());
+
+    if final_cov.summary.gave_up > 0 || final_cov.summary.complete < final_cov.summary.tiles {
+        eprintln!(
+            "--- {} most-stalled incomplete tiles ---",
+            final_cov.incomplete.len()
+        );
+        for (x, y, received, present, sweeps) in &final_cov.incomplete {
+            let missing = present & !received;
+            eprintln!(
+                "tile ({x},{y}): received={received:#06x} present={present:#06x} \
+                 missing={missing:#06x} sweep_attempts={sweeps} \
+                 missing_finest_planes={:?}",
+                (11u16..=13)
+                    .filter(|b| missing & (1 << b) != 0)
+                    .collect::<Vec<_>>()
+            );
+        }
+        eprintln!(
+            "--- server logs ({}) ---\n{}",
+            setup.server_container_name,
+            read_server_logs_stripped(&setup.server_container_name)
+        );
+    }
+
+    // Load-bearing: proves this ran at production scale, not silently at
+    // VKMS's 768-tile default. Without this a misconfigured resolution
+    // turns the whole test back into the easy case that already converges.
+    assert!(
+        final_cov.summary.tiles >= 2000,
+        "expected production scale (1920x1080 = 2040 tiles), got only {} tiles \
+         with any coverage state -- resolution is probably misconfigured. \
+         full summary: {}",
+        final_cov.summary.tiles,
+        final_cov.summary.to_log_line()
+    );
+    assert_eq!(
+        final_cov.summary.gave_up,
+        0,
+        "{} of {} tiles exhausted the tail-sweep budget and stopped asking for \
+         passes they never received -- each is stranded, rendering wrong, for \
+         the rest of the session. full summary: {}",
+        final_cov.summary.gave_up,
+        final_cov.summary.tiles,
+        final_cov.summary.to_log_line()
+    );
+    assert_eq!(
+        final_cov.summary.complete,
+        final_cov.summary.tiles,
+        "{} of {} tiles are still incomplete after 90s on a screen that has \
+         not changed since the first paint. full summary: {}",
+        final_cov.summary.tiles - final_cov.summary.complete,
+        final_cov.summary.tiles,
+        final_cov.summary.to_log_line()
+    );
+
+    NetShape::clear(&setup.server_container_name).ok();
+    client.disconnect().expect("disconnect");
+}
+
 /// Isolation: does `setup_e2e_server` alone bring a host-side tsnet node up?
 ///
 /// The acceptance test above stalls inside `setup_e2e_server`, at the
@@ -225,9 +452,17 @@ async fn harness_setup_alone_brings_up_a_tsnet_node() {
     })
     .await
     .expect("setup_e2e_server");
+    // This test drives real Docker/tsnet setup on the real wall clock (not
+    // exposed to `tokio::time::pause()`), so an `elapsed()` here is
+    // measuring genuine setup latency, not silently saturating against a
+    // virtual clock -- exactly the case `disallowed_methods` carves out.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "diagnostic wall-clock timing in a real-Docker (non-virtual-clock) test"
+    )]
+    let elapsed = started.elapsed();
     eprintln!(
         "[iso] setup returned after {:?}; server={}",
-        started.elapsed(),
-        setup.server_container_name
+        elapsed, setup.server_container_name
     );
 }

@@ -447,6 +447,21 @@ impl ClientNet {
         self.connected
     }
 
+    /// Snapshot of `core`'s per-tile CDF 5/3 coverage state, for diagnostics
+    /// (e.g. detecting tiles that have permanently given up refining). See
+    /// `ClientCore::cdf53_coverage_summary`.
+    pub fn cdf53_coverage_summary(
+        &self,
+    ) -> ghostframe_client_core::cdf53_coverage::Cdf53CoverageSummary {
+        self.core.cdf53_coverage_summary()
+    }
+
+    /// The first `limit` tiles still missing at least one present pass, most
+    /// stalled first. See `ClientCore::cdf53_incomplete_tiles`.
+    pub fn cdf53_incomplete_tiles(&self, limit: usize) -> Vec<(u8, u8, u16, u16, u8)> {
+        self.core.cdf53_incomplete_tiles(limit)
+    }
+
     /// Drain and return every event accumulated since the last call. Events
     /// can be produced by a timer expiry inside `drive_outgoing` as well as
     /// by an inbound datagram, so this single drain point (rather than a
