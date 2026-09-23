@@ -467,4 +467,33 @@ impl ClientNet {
     pub fn server_name(&self) -> &str {
         &self.config.server_name
     }
+
+    /// Queue a raw payload (e.g. an encoded input event) onto the
+    /// bidirectional feedback stream and flush immediately.
+    ///
+    /// `pending_stream_out` already carries every `PollOutput::Stream`
+    /// `core` produces (Hello, ReceiverFeedback, DecodeError) to the same
+    /// stream -- see its doc comment -- and is generic over `Vec<u8>`
+    /// rather than typed to `core`'s output, so queuing an
+    /// independently-encoded input event onto it needs no new plumbing.
+    /// The server's `INPUT_MSG_TYPE = 0x05` routing
+    /// (`ghostframe-lib/src/transport/input_inject.rs`) expects exactly
+    /// this stream.
+    ///
+    /// Unlike the writes `drain_connection_events` performs as a side
+    /// effect of an incoming datagram or a timer firing, an input event has
+    /// no such trigger of its own -- the embedder calls this directly, so
+    /// it must drive the flush itself rather than only queuing and waiting
+    /// for the next unrelated event. Calling the same
+    /// `drain_connection_events` used everywhere else keeps this the only
+    /// place that writes to `pending_stream_out` and flushes it.
+    ///
+    /// A no-op before `SessionReady` (the feedback stream is not open yet):
+    /// the bytes sit in `pending_stream_out` and are sent on the next call
+    /// that observes `session_ready`, same as a `Hello` queued before the
+    /// handshake completes.
+    pub fn send_input(&mut self, bytes: Vec<u8>, now_us: u64) {
+        self.pending_stream_out.push(bytes);
+        self.drain_connection_events(now_us);
+    }
 }
