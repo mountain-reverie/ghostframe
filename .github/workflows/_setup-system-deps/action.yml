@@ -1,7 +1,8 @@
 name: Setup ghostframe system dependencies
 description: >
   Installs the apt packages required to build ghostframe on a runner
-  (clang, ffmpeg dev libs, x264, X11/DRM dev headers). When the
+  (clang, ffmpeg dev libs, x264, X11/DRM dev headers, xkbcommon for the
+  native client's keyboard handling). When the
   `e2e-runtime` input is `true`, also installs the runtime packages
   the e2e harness needs on the host itself (weston compositor,
   XWayland, mesa GL DRI driver for weston's GL renderer, mesa Vulkan
@@ -42,6 +43,14 @@ runs:
     - name: install build deps
       shell: bash
       run: |
+        # libxkbcommon-dev is a hard build-time gate, not a convenience:
+        # smithay-client-toolkit's build.rs does an unconditional
+        # `pkg_config::find("xkbcommon").unwrap()` under the `xkbcommon`
+        # feature, so without it every job that compiles the workspace dies
+        # in a build script before a single test runs. libxkbcommon-x11-dev
+        # is needed at link time instead -- the `xkbcommon` crate's `x11`
+        # feature carries `#[link(name = "xkbcommon-x11")]`, and only the
+        # -dev package ships the unversioned .so the linker resolves.
         sudo apt-get install -y --no-install-recommends \
           build-essential \
           pkg-config \
@@ -56,7 +65,9 @@ runs:
           libx11-dev \
           libxext-dev \
           libxdamage-dev \
-          libdrm-dev
+          libdrm-dev \
+          libxkbcommon-dev \
+          libxkbcommon-x11-dev
 
     - name: install e2e-harness runtime deps
       if: ${{ inputs.e2e-runtime == 'true' }}

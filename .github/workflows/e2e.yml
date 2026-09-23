@@ -53,6 +53,11 @@ jobs:
       - run: cargo test -p ghostframe-client-gpu --lib --test coalesce --test dirty --test cdf53_passes
       - run: cargo test -p ghostframe-client-native
       - run: cargo test -p ghostframe-client-capi
+      # ghostframe-cli's four integration targets (chord, geometry, cli,
+      # event_loop) are pure logic and need no display. `cargo test
+      # --workspace --lib` in ci.yml reaches only its lib target, so
+      # without this line they run on developer machines and nowhere else.
+      - run: cargo test -p ghostframe-cli
       - run: cargo build -p ghostframe-client-capi
       # The netsim harness suites. These live in separate integration test
       # targets, so neither `cargo test --workspace --lib` (lib targets only)
