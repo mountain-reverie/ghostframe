@@ -2232,12 +2232,13 @@ fn gpu_decode_matches_cpu_decode_for_solid_palrle_and_cdf53() {
             let off = ((py * 64 + px) * 4) as usize;
             let gpu = &fb[off..off + 4];
             let cpu = &cpu_rgba[i * 4..i * 4 + 4];
-            // Cdf53 reconstruction differs in the last bit between the
-            // integer CPU path and the shader's float math; 2/255 is the
-            // tolerance, NOT a licence for a systematic offset.
+            // EXACT equality. CDF 5/3 is integer-reversible and the
+            // inverse shaders use only i32, so CPU and GPU must agree bit
+            // for bit. (An earlier draft allowed 2/255 for "float math"
+            // that does not exist in these shaders.)
             for c in 0..4 {
                 assert!(
-                    (gpu[c] as i32 - cpu[c] as i32).abs() <= 2,
+                    gpu[c] == cpu[c],
                     "tile ({tx},{ty}) pixel {i} channel {c}: gpu {} cpu {}",
                     gpu[c], cpu[c]
                 );
@@ -2307,9 +2308,15 @@ capture through both modes compares the Rust decoder against the real
 WGSL directly. This is what oracle_gpu_sparse.rs could not do -- it
 reimplements the shader's arithmetic in Rust and says so in its header.
 
-Tolerance is 2/255 for Cdf53 float-vs-integer reconstruction. It is not
-licence for a systematic offset: a disagreement is a bug to investigate,
-not a number to raise."
+**Exact equality, no tolerance.** An earlier draft allowed 2/255 "for Cdf53
+float-vs-integer reconstruction". That was an unverified assumption and it is
+false: CDF 5/3 is an integer-reversible lifting transform and
+`cdf53_inverse_l1/l2/l3.wgsl` contain no floating point at all. The only `f32`
+in the chain is `cdf53_inverse_l1_pass2`'s final `/255.0` for `textureStore`
+into an `rgba8unorm` target, which round-trips integers 0..255 exactly.
+Measured divergence across the mixed-codec capture is 0/255 on every channel of
+all three codecs. Both decoders also apply the same midpoint formula on an
+incomplete pass set, so they must agree mid-refinement too."
 ```
 
 ---

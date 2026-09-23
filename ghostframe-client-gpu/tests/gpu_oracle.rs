@@ -73,14 +73,25 @@ fn gpu_decode_matches_cpu_decode_for_solid_palrle_and_cdf53() {
             let o = ((py * 64 + px) * 4) as usize;
             let gpu = &fb[o..o + 4];
             let cpu = &cpu_rgba[i * 4..i * 4 + 4];
-            for c in 0..4 {
-                assert!(
-                    (gpu[c] as i32 - cpu[c] as i32).abs() <= 2,
-                    "tile ({tx},{ty}) pixel {i} channel {c}: gpu {} cpu {}",
-                    gpu[c],
-                    cpu[c]
-                );
-            }
+            // EXACT equality, no tolerance.
+            //
+            // CDF 5/3 is an integer-reversible lifting transform, and the
+            // inverse shaders (cdf53_inverse_l1/l2/l3) contain no floating
+            // point at all -- only i32. The sole f32 in the chain is
+            // cdf53_inverse_l1_pass2's final `/255.0` for textureStore into
+            // an rgba8unorm target, which round-trips integers 0..255
+            // exactly.
+            //
+            // Both decoders also apply the same midpoint formula for an
+            // incomplete pass set, so they must agree even mid-refinement.
+            // A tolerance here would hide precisely the systematic drift
+            // this oracle exists to detect: the known sparse-K bug is worth
+            // ~16/255, but a smaller constant offset would slip under any
+            // slack we allowed.
+            assert_eq!(
+                gpu, cpu,
+                "tile ({tx},{ty}) pixel {i}: gpu {gpu:?} != cpu {cpu:?}"
+            );
             compared += 1;
         }
     }
