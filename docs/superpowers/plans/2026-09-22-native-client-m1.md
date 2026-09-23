@@ -88,16 +88,30 @@ Read these before starting. They are not obvious from the code.
    shader -- Chrome will not give it more either. The invocation cap
    `palrle_decode.wgsl` depends on is the second kind and must stay at 256.
 
-10. **CDF 5/3 generation tracking is NOT implemented in M1.** The browser's
-    `cdf53.ts` carries a per-tile generation and clears state when it bumps, which
-    is how a superseded tile stops contributing stale coefficients. The M1 port
-    writes a constant `gen = 1` marker purely to satisfy the inverse shaders'
-    "tile is active" check, and relies on wgpu zero-initialising buffers at
-    creation. This is adequate for static content and for the Task 13 oracle, but
-    it means a tile superseded mid-refinement will not behave as the browser does.
-    Close this before any progressive-refinement or mode-switch scenario
-    (i.e. before Task 20).
+10. **CDF 5/3 generation tracking is implemented** (closed 2026-09-22, commit
+    `d5768bd`). A tile's generation bumps when the server re-encodes that region
+    from scratch. Because the integrate shader OR-integrates bit planes into a
+    persistent per-tile buffer, a bump that does not clear that buffer makes the
+    new generation land on top of the old one and the tile reconstructs as a
+    blend of two images.
 
+    Three details are load-bearing and must not be "simplified":
+
+    - **The clear is host-side (`queue.write_buffer`) before the integrate pass,
+      not inside the shader.** An earlier intra-shader clear in the browser had a
+      cross-workgroup race causing HL2 cols 4/5 sign-bit loss for ch=0. Moving it
+      host-side is the fix; `write_buffer` is ordered ahead of the submit.
+    - **It dedupes within a batch.** A batch routinely carries several passes for
+      one tile at the same new generation; clearing per entry wipes passes
+      integrated moments earlier in the same batch.
+    - **It resets `present_passes` and `received_mask`, not just the buffers.** A
+      new generation may skip an entirely different set of passes, so a stale
+      bitmap computes the wrong K and applies a midpoint correction that should
+      not be there.
+
+    Verified load-bearing by mutation: with the clear disabled, generation 2 of a
+    0xC0 tile reconstructs as 0xE0 — the OR-integration blend, exactly as
+    predicted.
 11. **Never `git add -A`.** Stage explicit paths. Screenshots and scratch files live in the repo root.
 
 9. **Local gates must match CI.** `cargo clippy` alone is not green. CI also runs `cargo fmt --all -- --check` and an env-read guard. Run `just ci-local` before declaring a task done.
