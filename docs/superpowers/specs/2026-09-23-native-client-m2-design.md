@@ -233,5 +233,27 @@ Optimising a number nobody has measured is how a day disappears for no gain.
 3. **X11 DRI3 is hand-written and manually verified**, so it will rot faster than
    the Wayland path. Dropping it is cheaper than replacing it if it becomes a
    burden.
+
+4. **X11 almost certainly shows red and blue swapped.** Found while implementing
+   Task 8, confirmed by analysis, not yet observed on a display.
+
+   The GPU exports `VK_FORMAT_R8G8B8A8_UNORM`, which puts red at the lowest
+   address — DRM fourcc `ABGR8888`. Wayland is *told* that explicitly through
+   the linux-dmabuf protocol's format field. **DRI3's `PixmapFromBuffers` has no
+   format field at all**: the X server infers the layout from `depth`/`bpp` using
+   the same fixed table Mesa's DRI3 loader uses, which yields `XRGB8888` —
+   blue at the lowest address. There is no channel through which to correct it.
+
+   The fix is a BGRA-ordered export for the X11 path. `copy_texture_to_texture`
+   requires matching formats, and `Rgba8Unorm`/`Bgra8Unorm` are not a legal
+   view-format pair, so it needs a swizzling blit (a render pass reusing the
+   `present_blit` machinery) rather than a format tweak — roughly 40 lines in
+   `ghostframe-client-gpu`, plus a per-backend export-format choice.
+
+   **Verify on the first manual X11 run before building the fix.** If the colours
+   are correct, this analysis is wrong somewhere and the fix would introduce the
+   very bug it is meant to prevent. This is the same red/blue transposition class
+   that produced long-misdiagnosed e2e flakes before `847d870` found the real
+   cause, so it is worth confirming rather than assuming in either direction.
 4. **The tsnet login API differs across releases** — checked against the pinned
    version rather than assumed.
