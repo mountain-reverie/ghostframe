@@ -257,7 +257,13 @@ pub fn connect(host: String, port: u16, chord_prefix: String) -> Result<(), Comm
     client.connect(&host, port)?;
     println!("connected to {host}:{port}.");
 
-    let result = run_window_loop(&mut client, backend.as_mut(), &mut chord);
+    let result = run_window_loop(
+        &mut client,
+        backend.as_mut(),
+        &mut chord,
+        &mut |_| {},
+        &mut || false,
+    );
 
     // Always tear the session down, even if the loop errored -- best-effort,
     // since we don't want a teardown failure to hide the loop's own error
@@ -275,12 +281,41 @@ pub fn connect(host: String, port: u16, chord_prefix: String) -> Result<(), Comm
 const POLL_TIMEOUT_MS: i32 = 100;
 
 /// Drive the render/event loop until the user quits, the window is closed,
-/// or the connection drops. See the module-level pseudocode in the M2 plan
-/// for the shape this mirrors.
-fn run_window_loop(
+/// `should_quit` says to stop, or the connection drops. See the
+/// module-level pseudocode in the M2 plan for the shape this mirrors.
+///
+/// `pub`, and parameterised by `on_frame_presented`/`should_quit`, so a test
+/// can drive it directly against an already-connected `Client` and an
+/// already-open `Backend` -- built the same way `connect` builds them, just
+/// without `connect`'s login checks or its own tsnet node -- rather than
+/// spawning the CLI binary as a subprocess. That matters here because a
+/// second `tsnet.Server` per process is known not to converge a working
+/// peer datapath (see `ghostframe-e2e/tests/native_client.rs`'s module
+/// doc); a test wants to reuse a harness's existing node instead, which
+/// only the library path allows. `connect` itself calls this with no-op
+/// hooks (`&mut |_| {}`, `&mut || false`): production never quits early and
+/// has no use for a frame counter.
+///
+/// `on_frame_presented` is called with the running count immediately after
+/// each successful `backend.present`, which is the one place this loop
+/// knows a frame genuinely reached the display server -- a test asserting
+/// "a frame was presented" should assert on this, not merely on the
+/// process/loop staying alive (that would pass even with a black window).
+/// `should_quit` is polled once per iteration, before blocking in `poll`;
+/// returning `true` ends the loop the same way `ChordAction::Quit` or
+/// `WindowEvent::CloseRequested` would (`Ok(())`), without needing genuine
+/// synthetic input -- which a headless Weston has no protocol to deliver in
+/// this build (no `virtual-keyboard-unstable-v1` / `wlr-virtual-pointer`,
+/// and the headless backend has no real input devices for a compositor-side
+/// injection either). The prefix-chord -> quit *routing* itself is already
+/// covered without a display, by `ghostframe-cli/tests/event_loop.rs`'s
+/// `a_completed_quit_chord_yields_quit` and `close_requested_yields_quit`.
+pub fn run_window_loop(
     client: &mut Client,
     backend: &mut dyn Backend,
     chord: &mut Chord,
+    on_frame_presented: &mut dyn FnMut(u64),
+    should_quit: &mut dyn FnMut() -> bool,
 ) -> Result<(), CommandError> {
     // The remote's screen size, learned from `ClientEvent::Resized`; `None`
     // until then, since there is nothing sensible to present or map pointer
@@ -297,7 +332,13 @@ fn run_window_loop(
     let client_fd = client.event_fd();
     let backend_fd = backend.event_fd();
 
+    let mut frames_presented: u64 = 0;
+
     loop {
+        if should_quit() {
+            return Ok(());
+        }
+
         let mut fds = [
             libc::pollfd {
                 fd: client_fd,
@@ -341,7 +382,8 @@ fn run_window_loop(
                         // and a leaked one stalls publishing after exactly
                         // 3 frames with no error anywhere -- the window
                         // just freezes.
-                        let present_result = if remote_size.is_some() {
+                        let presented = remote_size.is_some();
+                        let present_result = if presented {
                             backend.present(&frame, &placement)
                         } else {
                             Ok(())
@@ -349,6 +391,10 @@ fn run_window_loop(
                         client.release_frame(frame.frame_id);
                         present_result
                             .map_err(|e| CommandError::Message(format!("presenting frame: {e}")))?;
+                        if presented {
+                            frames_presented += 1;
+                            on_frame_presented(frames_presented);
+                        }
                     }
                 }
                 ClientEvent::Disconnected { reason } => {

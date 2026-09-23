@@ -1809,6 +1809,7 @@ dependencies = [
  "chromiumoxide",
  "fantoccini",
  "futures",
+ "ghostframe-cli",
  "ghostframe-client-core",
  "ghostframe-client-native",
  "ghostframe-client-net",
