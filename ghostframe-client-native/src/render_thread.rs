@@ -15,7 +15,7 @@
 //! this is the "frame boundary" the crate-level docs describe, since
 //! `ClientCore` has no explicit end-of-frame event of its own to key off.
 
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use ghostframe_client_core::Event as CoreEvent;
@@ -24,6 +24,7 @@ use ghostframe_client_gpu::ring::PublishedFrame;
 use ghostframe_client_gpu::wgpu_ctx::WgpuContext;
 
 use crate::event::{ClientEvent, EventQueue};
+use crate::DebugFrameBytes;
 
 /// Default export-ring buffer count used when [`crate::Config::n_export_buffers`]
 /// is `0`. Kept here, in the caller, rather than inside `Renderer` -- the
@@ -35,7 +36,40 @@ const DEFAULT_EXPORT_BUFFER_COUNT: u32 = 3;
 pub(crate) enum RenderMsg {
     Core(CoreEvent),
     Release(u32),
+    /// Map a published frame's exported dmabuf and reply with its bytes.
+    /// Test and diagnostic use only -- see [`crate::Client::debug_map_frame`].
+    /// The render thread owns the `Renderer` (and therefore the
+    /// `ExportedImage`), so this round-trips through here rather than
+    /// letting the caller reach the buffer directly.
+    DebugMapFrame(u32, Sender<Result<DebugFrameBytes, String>>),
     Shutdown,
+}
+
+/// Handle a [`RenderMsg::DebugMapFrame`]: look up the exported buffer, map
+/// it, and reply. Never panics on a bad `buffer_id` or an unconstructed
+/// renderer -- errors are reported to the caller instead, since this is a
+/// debug path a test may call before the first frame exists.
+fn handle_debug_map_frame(
+    renderer: &Option<Renderer>,
+    buffer_id: u32,
+) -> Result<DebugFrameBytes, String> {
+    let renderer = renderer
+        .as_ref()
+        .ok_or_else(|| "renderer not yet constructed (no frame published yet)".to_string())?;
+    let exported = renderer.export_buffer(buffer_id);
+    let plane = exported
+        .planes
+        .first()
+        .copied()
+        .ok_or_else(|| "exported image has no plane layout".to_string())?;
+    let bytes = exported.map_read().map_err(|e| e.to_string())?;
+    Ok(DebugFrameBytes {
+        bytes,
+        stride: plane.stride,
+        offset: plane.offset,
+        width: exported.width,
+        height: exported.height,
+    })
 }
 
 /// Route one core event to the renderer, lazily constructing it on the
@@ -122,6 +156,9 @@ pub(crate) fn run(
                     &preferred_modifiers,
                 );
             }
+            RenderMsg::DebugMapFrame(buffer_id, reply) => {
+                let _ = reply.send(handle_debug_map_frame(&renderer, buffer_id));
+            }
         }
 
         // Drain whatever else is already queued without blocking, so a
@@ -147,6 +184,9 @@ pub(crate) fn run(
                         export_buffers,
                         &preferred_modifiers,
                     );
+                }
+                Ok(RenderMsg::DebugMapFrame(buffer_id, reply)) => {
+                    let _ = reply.send(handle_debug_map_frame(&renderer, buffer_id));
                 }
                 Err(_) => break,
             }

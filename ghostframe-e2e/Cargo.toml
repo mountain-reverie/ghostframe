@@ -64,3 +64,5 @@ ghostframe-test-pattern = { path = "../ghostframe-test-pattern" }
 quinn-proto = { workspace = true }
 url = "2"
 web-transport-proto = { workspace = true }
+# Only used by tests/native_client.rs (M1 native-client acceptance test).
+ghostframe-client-native = { path = "../ghostframe-client-native" }

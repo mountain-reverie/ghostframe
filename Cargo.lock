@@ -1745,6 +1745,7 @@ dependencies = [
  "fantoccini",
  "futures",
  "ghostframe-client-core",
+ "ghostframe-client-native",
  "ghostframe-client-net",
  "ghostframe-lib",
  "ghostframe-protocol",
