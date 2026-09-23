@@ -5,6 +5,8 @@
 //! Wayland is mostly third-party, X11 is hand-written -- and that is accepted
 //! rather than equalised.
 
+pub mod wayland;
+
 use std::os::fd::RawFd;
 
 use ghostframe_client_native::PublishedFrame;
@@ -109,16 +111,12 @@ fn select_backend(
 }
 
 /// Wayland if `WAYLAND_DISPLAY` is set, else X11 if `DISPLAY` is, else error.
-pub fn open(_title: &str) -> Result<Box<dyn Backend>, WindowError> {
+pub fn open(title: &str) -> Result<Box<dyn Backend>, WindowError> {
     let wayland_display = std::env::var("WAYLAND_DISPLAY").ok();
     let display = std::env::var("DISPLAY").ok();
 
     match select_backend(wayland_display.as_deref(), display.as_deref())? {
-        // The Wayland backend lands in M2 Task 7.
-        Selected::Wayland => Err(WindowError::Unsupported(
-            "WAYLAND_DISPLAY is set but the Wayland backend is not implemented yet (M2 task 7)"
-                .to_string(),
-        )),
+        Selected::Wayland => Ok(Box::new(wayland::WaylandBackend::open(title)?)),
         // X11 lands in M2 Task 8. Left as an explicit error rather than a
         // stub `Backend` impl, so a caller can't mistake "compiles" for
         // "works".

@@ -18,3 +18,5 @@ clap = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+smithay-client-toolkit = { version = "0.21", features = ["xkbcommon"] }
+wayland-client = "0.31"
