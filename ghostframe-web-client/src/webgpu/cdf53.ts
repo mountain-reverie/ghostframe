@@ -1,8 +1,8 @@
-import integrateWgsl from './shaders/cdf53_integrate.wgsl?raw';
-import inverseL3Wgsl from './shaders/cdf53_inverse_l3.wgsl?raw';
-import inverseL2Wgsl from './shaders/cdf53_inverse_l2.wgsl?raw';
-import inverseL1Wgsl from './shaders/cdf53_inverse_l1.wgsl?raw';
-import inverseL1Pass2Wgsl from './shaders/cdf53_inverse_l1_pass2.wgsl?raw';
+import integrateWgsl from '../../../shaders/client/cdf53_integrate.wgsl?raw';
+import inverseL3Wgsl from '../../../shaders/client/cdf53_inverse_l3.wgsl?raw';
+import inverseL2Wgsl from '../../../shaders/client/cdf53_inverse_l2.wgsl?raw';
+import inverseL1Wgsl from '../../../shaders/client/cdf53_inverse_l1.wgsl?raw';
+import inverseL1Pass2Wgsl from '../../../shaders/client/cdf53_inverse_l1_pass2.wgsl?raw';
 import { createLabeledShaderModule } from './shader_module';
 
 /** A prevalidated Cdf53 tile pass, ready for the GPU. Produced by the core

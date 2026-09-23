@@ -1,4 +1,4 @@
-import palrleWgsl from './shaders/palrle_decode.wgsl?raw';
+import palrleWgsl from '../../../shaders/client/palrle_decode.wgsl?raw';
 import { createLabeledShaderModule } from './shader_module';
 
 /** A prevalidated PalRLE tile, ready for the GPU. Produced by the core,

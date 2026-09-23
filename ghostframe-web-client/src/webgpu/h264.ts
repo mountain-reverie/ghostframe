@@ -1,4 +1,4 @@
-import h264Wgsl from './shaders/h264_blit.wgsl?raw';
+import h264Wgsl from '../../../shaders/client/h264_blit.wgsl?raw';
 import { createLabeledShaderModule } from './shader_module';
 
 export class H264Pipeline {
