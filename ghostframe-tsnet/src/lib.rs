@@ -42,6 +42,8 @@ extern "C" {
     fn gbridge_getips(sd: c_int, buf: *mut c_char, buf_len: usize) -> c_int;
     fn gbridge_start_web_server(sd: c_int, cert_hash_hex: *const c_char) -> c_int;
     fn gbridge_dial_tcp(sd: c_int, remote_addr: *const c_char, fd_out: *mut c_int) -> c_int;
+    fn gbridge_login_url(sd: c_int, buf: *mut c_char, buf_len: usize) -> c_int;
+    fn gbridge_logout(sd: c_int) -> c_int;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -186,6 +188,46 @@ impl GhostbridgeHandle {
             .split(',')
             .map(|s| s.parse().map_err(|_| GhostbridgeError::Frame("invalid IP")))
             .collect()
+    }
+
+    /// The URL a user must visit to authorise this node, or `None` if it is
+    /// already authorised.
+    ///
+    /// Blocks until the control plane provides a URL or the node reaches
+    /// Running, so a caller with seeded state gets `None` promptly rather
+    /// than waiting out a timeout.
+    ///
+    /// `tsnet`'s own `Up()` blocks until Running and never surfaces this URL;
+    /// ghostbridge reads it from `StatusWithoutPeers().AuthURL`, which is the
+    /// same field tsnet's `printAuthURLLoop` logs.
+    pub fn login_url(&self) -> Result<Option<String>, GhostbridgeError> {
+        let mut buf = [0u8; 1024];
+        let rc = unsafe { gbridge_login_url(self.sd, buf.as_mut_ptr() as *mut c_char, buf.len()) };
+        if rc < 0 {
+            return Err(GhostbridgeError::Ffi("gbridge_login_url", rc));
+        }
+        let url_str = CStr::from_bytes_until_nul(&buf)
+            .map_err(|_| GhostbridgeError::Frame("gbridge_login_url: missing NUL"))?
+            .to_str()
+            .map_err(|_| GhostbridgeError::Frame("gbridge_login_url: non-utf8"))?;
+        if url_str.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(url_str.to_string()))
+    }
+
+    /// Log this node out of the tailnet.
+    ///
+    /// NOT the same as deleting the state directory: that leaves the node
+    /// registered and visible in the tailnet's device list with no way to
+    /// reach it. Call this BEFORE removing local state, because the
+    /// credentials needed to log out live there.
+    pub fn logout(&self) -> Result<(), GhostbridgeError> {
+        let rc = unsafe { gbridge_logout(self.sd) };
+        if rc < 0 {
+            return Err(GhostbridgeError::Ffi("gbridge_logout", rc));
+        }
+        Ok(())
     }
 
     /// Start the embedded HTTPS web server on tsnet `:443` plus a `:80`
