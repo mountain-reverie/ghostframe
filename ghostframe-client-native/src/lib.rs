@@ -119,7 +119,7 @@ pub struct Client {
     queue: Arc<EventQueue>,
 
     // `Some` only between a successful `connect` and `disconnect`/`Drop`.
-    bridge: Option<GhostbridgeHandle>,
+    bridge: Option<std::sync::Arc<GhostbridgeHandle>>,
     net_thread: Option<std::thread::JoinHandle<()>>,
     render_thread: Option<std::thread::JoinHandle<()>>,
     net_cmd_tx: Option<mpsc::Sender<NetCommand>>,
@@ -180,6 +180,22 @@ impl Client {
     /// forwarded to the render thread, which passes them to
     /// `Renderer::new`/`ExportRing::new` at first-frame construction time
     /// (renderer construction is lazy -- see `render_thread::handle_core_event`).
+    /// Use an existing tsnet node instead of creating one in `connect`.
+    ///
+    /// A host application that is already on the tailnet -- because it runs
+    /// its own tsnet node, or because it embeds several ghostframe clients --
+    /// should not be forced to stand up a second one. Call this before
+    /// `connect` and the client dials through the node you supply; its
+    /// lifetime is then yours, not ours.
+    ///
+    /// This is also what the e2e harness needs: it already owns a tsnet node
+    /// for its forwarders, and running a second `tsnet.Server` in the same
+    /// process was observed not to converge a working peer datapath even
+    /// though both nodes logged in to the control plane successfully.
+    pub fn attach_bridge(&mut self, bridge: std::sync::Arc<GhostbridgeHandle>) {
+        self.bridge = Some(bridge);
+    }
+
     pub fn connect(&mut self, host: &str, port: u16) -> Result<(), ClientError> {
         if self.net_thread.is_some() {
             return Err(ClientError::Connect("already connected".into()));
@@ -204,14 +220,21 @@ impl Client {
         // production embedder always wants the real tailnet, and the one
         // consumer that doesn't (this crate's own e2e test) is exactly the
         // kind of test-only override an env var is for.
-        let control_url = std::env::var("TS_CONTROL_URL").unwrap_or_default();
-        let bridge = GhostbridgeHandle::connect(&GhostbridgeConfig {
-            hostname: self.config.hostname.clone(),
-            authkey: self.config.authkey.clone(),
-            state_dir: self.config.state_dir.to_string_lossy().into_owned(),
-            control_url,
-        })?;
-        bridge.up()?;
+        let bridge = match self.bridge.clone() {
+            // Supplied by the embedder via `attach_bridge`; already up.
+            Some(existing) => existing,
+            None => {
+                let control_url = std::env::var("TS_CONTROL_URL").unwrap_or_default();
+                let b = std::sync::Arc::new(GhostbridgeHandle::connect(&GhostbridgeConfig {
+                    hostname: self.config.hostname.clone(),
+                    authkey: self.config.authkey.clone(),
+                    state_dir: self.config.state_dir.to_string_lossy().into_owned(),
+                    control_url,
+                })?);
+                b.up()?;
+                b
+            }
+        };
 
         let cert_hash = bootstrap::fetch_cert_hash(&bridge, host, port)?;
 

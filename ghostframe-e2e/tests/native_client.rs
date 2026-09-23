@@ -6,15 +6,46 @@
 //! tailnet is a security property of this system, not a test convenience.
 //!
 //! Requires Docker AND a GPU. Deliberately NOT named in any CI workflow
+//!
+//! # `TS_CONTROL_URL` must be in the PROCESS environment, not set from Rust
+//!
+//! Run this as:
+//!
+//! ```text
+//! TS_CONTROL_URL=http://127.0.0.1:18080 \
+//!   cargo test -p ghostframe-e2e --test native_client -- --nocapture --test-threads=1
+//! ```
+//!
+//! ghostbridge's Go `init()` picks the DERP transport at **package-init time,
+//! before `main`**, from `os.Getenv("TS_CONTROL_URL")`: non-empty means
+//! headscale, so opt into `TS_DEBUG_USE_DERP_HTTP=1`; empty means the public
+//! tailnet, which requires HTTPS DERP (`ghostbridge/main.go`).
+//!
+//! A `std::env::set_var("TS_CONTROL_URL", ..)` in the test body is therefore
+//! far too late -- the decision was made when the binary loaded. The node
+//! still *logs in*, because the control URL is passed separately at runtime
+//! through `GhostbridgeConfig`, so headscale lists it online and everything
+//! looks healthy. But DERP then speaks TLS to headscale's plain-HTTP relay
+//! and every dial hangs, producing a wall of
+//!
+//! ```text
+//! netcheck: UDP is blocked, trying HTTPS
+//! derp.Recv(derp-999): tls: first record does not look like a TLS handshake
+//! ```
+//!
+//! which reads like a network fault rather than a missing env var. The
+//! giveaway is ghostbridge's very first log line:
+//! `init: production path (public Tailscale)`.
+//!
+//! The harness sets `TS_CONTROL_URL` on the server *container*
+//! (`e2e_setup.rs`), which is why containerised nodes never hit this and only
+//! a host-side tsnet node does.
 //! (see `ghostframe-client-gpu/README.md`'s test-target table).
 
 use std::time::{Duration, Instant};
 
 use ghostframe_client_native::{Client, ClientEvent, Config, PublishedFrame};
-use ghostframe_e2e::harness::e2e_setup::HEADSCALE_HOST_PORT;
-use ghostframe_e2e::harness::{
-    create_preauth_key, read_server_logs_stripped, setup_e2e_server, E2eServerSpec,
-};
+use ghostframe_e2e::harness::{read_server_logs_stripped, setup_e2e_server, E2eServerSpec};
 
 /// Drain queued events (logging each) and return the first published frame,
 /// or `None` if `timeout` elapses first. Panics eagerly on a
@@ -55,26 +86,26 @@ async fn native_client_renders_the_test_pattern_into_an_exported_dmabuf() {
     .await
     .expect("bring up headscale + ghostframe server");
 
-    // Join the tailnet as our own node, exactly as a real client would --
-    // no forwarder, no direct socket, just tsnet.
-    let authkey = create_preauth_key("headscale", "ghostframe")
-        .await
-        .expect("preauth key");
-
-    // `Client::connect` reads `TS_CONTROL_URL` the same way
-    // `ghostframe-xdaemon` does (unset = the real Tailscale network, set =
-    // this custom control plane); point it at the same headscale instance
-    // `setup_e2e_server`'s own tsnet node joined, reachable from the host at
-    // the port `e2e_setup::HEADSCALE_HOST_PORT` maps.
-    std::env::set_var(
-        "TS_CONTROL_URL",
-        format!("http://127.0.0.1:{HEADSCALE_HOST_PORT}"),
-    );
-
+    // Reuse the tsnet node `setup_e2e_server` already joined, rather than
+    // standing up a second one.
+    //
+    // A second `tsnet.Server` in the same OS process was observed not to
+    // converge a working peer datapath: both nodes log in to headscale and
+    // reach `Running`, headscale lists all three as online, but wgengine
+    // reconfigures with an incomplete peer set and no packet ever crosses --
+    // every dial then hangs. A single-node control run of the same harness
+    // (`harness_smoke_solid_1s`) passes in ~65s under identical DERP noise,
+    // which is what isolates it to the second node rather than to the
+    // environment.
+    //
+    // Sharing is also what a real embedder wants: a host application already
+    // on the tailnet should not be forced to create another node, which is
+    // why `Client::attach_bridge` exists rather than this being a test-only
+    // shim.
     let state_dir = tempfile::tempdir().expect("tempdir");
     let mut client = Client::new(Config {
         hostname: "native-client-test".into(),
-        authkey,
+        authkey: String::new(), // unused: the bridge below is already up
         state_dir: state_dir.path().to_path_buf(),
         supports_h264: false,
         indices_raw: false,
@@ -82,6 +113,7 @@ async fn native_client_renders_the_test_pattern_into_an_exported_dmabuf() {
         preferred_modifiers: vec![],
     })
     .expect("create client");
+    client.attach_bridge(setup._test_node.bridge());
 
     let connect_result = client.connect(&setup.server_container_name, 443);
     if let Err(e) = &connect_result {
