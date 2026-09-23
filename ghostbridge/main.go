@@ -10,6 +10,8 @@ import "C"
 import (
 	"context"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -18,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"tailscale.com/envknob"
@@ -239,6 +242,174 @@ func gbridge_close(sd C.int32_t) C.gbridge_status {
 		return -1
 	}
 	h.server.Close()
+	return 0
+}
+
+// errUnknownHandle is returned by the *ForHandle helpers when sd does not
+// resolve via lookup(). Kept distinct from other failures so the cgo
+// wrappers can map it to the same -1 "invalid handle" code every other
+// export uses.
+var errUnknownHandle = errors.New("ghostbridge: unknown session handle")
+
+// errLoginTimeout is returned by loginURL when neither an AuthURL nor a
+// Running backend state showed up within the deadline.
+var errLoginTimeout = errors.New("ghostbridge: timed out waiting for auth URL or running state")
+
+// loginPollInterval and loginPollTimeout bound gbridge_login_url. tsnet's
+// Server.Up blocks until Running and never surfaces the auth URL itself
+// (see loginURL's doc comment), so we have to poll LocalClient status
+// instead. The interval is tsnet's own printAuthURLLoop cadence (5s) cut
+// down to 250ms so a human watching a CLI doesn't wait a full DERP-region
+// round trip to see the URL appear; the timeout is generous because control
+// plane round trips over a slow link are legitimately multi-second.
+const (
+	loginPollInterval = 250 * time.Millisecond
+	loginPollTimeout  = 60 * time.Second
+
+	// logoutTimeout bounds gbridge_logout's single LocalAPI call. Much
+	// shorter than loginPollTimeout because this is one request-response,
+	// not a poll loop waiting on human action or a control-plane round
+	// trip for authorisation.
+	logoutTimeout = 10 * time.Second
+)
+
+// loginURLForHandle resolves sd and delegates to loginURL. Factored out so
+// tests can exercise the unknown-handle path without cgo types (see
+// main_test.go).
+func loginURLForHandle(sd int32, timeout time.Duration) (string, error) {
+	h := lookup(sd)
+	if h == nil {
+		return "", errUnknownHandle
+	}
+	return loginURL(h.server, timeout)
+}
+
+// loginURL returns the URL a user must visit to authorise this node, or an
+// empty string if the node is already authorised.
+//
+// tsnet's Server.Up(ctx) blocks until the backend reaches Running and does
+// NOT return the auth URL — calling Up() alone here would block forever
+// waiting for an authorisation the caller never saw a URL for. The URL
+// lives on ipnstate.Status.AuthURL, reachable via
+// LocalClient().StatusWithoutPeers(ctx); tsnet's own internal
+// printAuthURLLoop reads exactly this field to log it, and so do we, just
+// programmatically instead of to a log line.
+//
+// An already-authorised node returns ("", nil), NOT an error: a caller with
+// seeded state (e.g. a prior successful login persisted to StateDir) must
+// not be forced through an interactive path it does not need.
+func loginURL(s *tsnet.Server, timeout time.Duration) (string, error) {
+	lc, err := s.LocalClient()
+	if err != nil {
+		return "", fmt.Errorf("ghostbridge: loginURL: LocalClient: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	ticker := time.NewTicker(loginPollInterval)
+	defer ticker.Stop()
+
+	for {
+		st, err := lc.StatusWithoutPeers(ctx)
+		if err != nil {
+			return "", fmt.Errorf("ghostbridge: loginURL: StatusWithoutPeers: %w", err)
+		}
+		if st.AuthURL != "" {
+			return st.AuthURL, nil
+		}
+		if st.BackendState == "Running" {
+			return "", nil
+		}
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			return "", errLoginTimeout
+		}
+	}
+}
+
+// logoutForHandle resolves sd and delegates to logout. Factored out so
+// tests can exercise the unknown-handle path without cgo types.
+func logoutForHandle(sd int32, timeout time.Duration) error {
+	h := lookup(sd)
+	if h == nil {
+		return errUnknownHandle
+	}
+	return logout(h.server, timeout)
+}
+
+// logout logs this node out of the tailnet.
+//
+// This is NOT the same as deleting the state directory: that leaves the
+// node registered and visible in the tailnet's device list with no way to
+// reach it. Callers must log out BEFORE removing local state, because the
+// credentials logout needs (the LocalAPI auth cookie, the node's current
+// session) live in that state.
+func logout(s *tsnet.Server, timeout time.Duration) error {
+	lc, err := s.LocalClient()
+	if err != nil {
+		return fmt.Errorf("ghostbridge: logout: LocalClient: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if err := lc.Logout(ctx); err != nil {
+		return fmt.Errorf("ghostbridge: logout: %w", err)
+	}
+	return nil
+}
+
+//export gbridge_login_url
+// Return the URL a user must visit to authorise this node, or an empty
+// string if it is already authorised.
+//
+// tsnet's Up() blocks until Running and never surfaces this URL; tsnet's own
+// printAuthURLLoop reads it from StatusWithoutPeers().AuthURL, and so do we.
+//
+// An already-authorised node yields an empty string and success, NOT an
+// error: a caller with seeded state must not be forced through an
+// interactive path it does not need.
+func gbridge_login_url(sd C.int32_t, cBuf *C.char, cBufLen C.size_t) C.gbridge_status {
+	url, err := loginURLForHandle(int32(sd), loginPollTimeout)
+	if err != nil {
+		switch {
+		case errors.Is(err, errUnknownHandle):
+			return -1
+		case errors.Is(err, errLoginTimeout):
+			log.Printf("ghostbridge: gbridge_login_url: timed out waiting for auth URL or running state")
+			return -6
+		default:
+			log.Printf("ghostbridge: gbridge_login_url: %v", err)
+			return -2
+		}
+	}
+	if C.size_t(len(url)+1) > cBufLen {
+		return -5
+	}
+	dst := unsafe.Slice((*byte)(unsafe.Pointer(cBuf)), int(cBufLen))
+	copy(dst, url)
+	dst[len(url)] = 0
+	return 0
+}
+
+//export gbridge_logout
+// Log this node out of the tailnet.
+//
+// NOT the same as deleting the state directory: that leaves the node
+// registered and visible in the tailnet's device list with no way to reach
+// it. Callers must log out BEFORE removing local state, because the
+// credentials needed to log out live there.
+func gbridge_logout(sd C.int32_t) C.gbridge_status {
+	err := logoutForHandle(int32(sd), logoutTimeout)
+	if err != nil {
+		switch {
+		case errors.Is(err, errUnknownHandle):
+			return -1
+		default:
+			log.Printf("ghostbridge: gbridge_logout: %v", err)
+			return -2
+		}
+	}
 	return 0
 }
 
