@@ -87,6 +87,10 @@ pollster = { version = "=1.0.1" }
 # ffmpeg-next 9.0.0 — Rust bindings for FFmpeg (libavcodec, libavutil, libswscale)
 ffmpeg-next = { version = "=9.0.0" }
 
+# clap 4.6.7 — latest stable 4.x as of 2026-09-22; derive-based CLI parsing
+# for ghostframe-cli.
+clap = { version = "=4.6.7", features = ["derive"] }
+
 # Tests run the full production data path — QUIC AEAD crypto, the CDF53
 # codec, tile reassembly — so an unoptimized build is dominated by it. The
 # browserless netsim scenes are the extreme case: 13.9s unoptimized against
