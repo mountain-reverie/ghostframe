@@ -103,6 +103,7 @@ impl Renderer {
             Event::TilePayload {
                 tile_x,
                 tile_y,
+                generation,
                 data,
                 ..
             } => {
@@ -134,6 +135,7 @@ impl Renderer {
                         self.pending_cdf53.push((
                             *tile_x,
                             *tile_y,
+                            *generation,
                             *pass_idx,
                             bit_planes.clone(),
                             *present_passes,
