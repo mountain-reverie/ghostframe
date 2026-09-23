@@ -76,6 +76,7 @@ async fn native_client_renders_the_test_pattern_into_an_exported_dmabuf() {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
 
+    eprintln!("[phase] starting headscale + ghostframe-server containers");
     let setup = setup_e2e_server(E2eServerSpec {
         test_pattern_args: "--solid-red",
         extra_env: &[],
@@ -102,6 +103,7 @@ async fn native_client_renders_the_test_pattern_into_an_exported_dmabuf() {
     // on the tailnet should not be forced to create another node, which is
     // why `Client::attach_bridge` exists rather than this being a test-only
     // shim.
+    eprintln!("[phase] containers up; building client");
     let state_dir = tempfile::tempdir().expect("tempdir");
     let mut client = Client::new(Config {
         hostname: "native-client-test".into(),
@@ -115,7 +117,15 @@ async fn native_client_renders_the_test_pattern_into_an_exported_dmabuf() {
     .expect("create client");
     client.attach_bridge(setup._test_node.bridge());
 
+    eprintln!(
+        "[phase] connecting to {}:443 over tsnet",
+        setup.server_container_name
+    );
     let connect_result = client.connect(&setup.server_container_name, 443);
+    eprintln!(
+        "[phase] connect returned: {:?}",
+        connect_result.as_ref().map(|_| "ok")
+    );
     if let Err(e) = &connect_result {
         eprintln!(
             "--- server logs ({}) ---\n{}",
@@ -125,6 +135,7 @@ async fn native_client_renders_the_test_pattern_into_an_exported_dmabuf() {
         panic!("connect over the tailnet failed: {e}");
     }
 
+    eprintln!("[phase] waiting for the first published frame");
     let frame = match wait_for_frame(&mut client, Duration::from_secs(60)) {
         Some(f) => f,
         None => {

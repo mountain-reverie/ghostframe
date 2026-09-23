@@ -57,10 +57,36 @@ func newWebMux(certHashHex string) http.Handler {
 }
 
 // newRedirectHandler returns an HTTP handler that 301-redirects every
-// request to the same host:path on https://. Used for the tsnet :80
-// listener so users can paste the bare-hostname URL.
-func newRedirectHandler() http.Handler {
+// request to the same host:path on https://, EXCEPT /config.json, which it
+// serves directly.
+//
+// Used for the tsnet :80 listener so users can paste the bare-hostname URL.
+//
+// Why /config.json is exempt: a non-browser client needs the WebTransport
+// cert hash before it can open a session, and it has no reason to speak TLS
+// to get it. The :443 listener exists because browsers refuse WebTransport
+// over anything else -- not for confidentiality on the wire. Both listeners
+// are tsnet listeners, so every byte reaching them has already been
+// encrypted and authenticated by WireGuard; TLS here is a second envelope
+// inside a tunnel that already has one.
+//
+// The hash itself is a public fingerprint, not a secret: it identifies a
+// certificate, and holding it grants nothing without the private key. The
+// browser fetches the same value over the same tailnet today.
+//
+// Without this, a native client's plaintext GET to :443 blocks forever --
+// the server is waiting for a ClientHello and the client is waiting for a
+// response. That failure is silent and reads like a network fault.
+func newRedirectHandler(certHashHex string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/config.json" {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cache-Control", "no-store")
+			_ = json.NewEncoder(w).Encode(struct {
+				CertHash string `json:"certHash"`
+			}{CertHash: certHashHex})
+			return
+		}
 		target := "https://" + r.Host + r.URL.RequestURI()
 		http.Redirect(w, r, target, http.StatusMovedPermanently)
 	})
@@ -167,7 +193,7 @@ func startWebListeners(
 		IdleTimeout:       60 * time.Second,
 	}
 	redirServer := &http.Server{
-		Handler:           newRedirectHandler(),
+		Handler:           newRedirectHandler(certHashHex),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,

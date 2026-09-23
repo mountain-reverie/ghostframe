@@ -67,7 +67,7 @@ func TestServeConfigJSON(t *testing.T) {
 }
 
 func TestRedirectHandler(t *testing.T) {
-	h := newRedirectHandler()
+	h := newRedirectHandler("deadbeef")
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
@@ -149,5 +149,33 @@ func TestLoadStaticCertFromEnv_BothSet(t *testing.T) {
 	}
 	if cert == nil {
 		t.Fatal("expected non-nil cert when both env vars are set")
+	}
+}
+
+// The :80 listener must serve /config.json directly rather than redirecting
+// it. A native client needs the cert hash before it can open a WebTransport
+// session and has no reason to speak TLS to fetch it; a redirect would send
+// it to :443, where a plaintext GET blocks forever waiting for a response
+// while the server waits for a ClientHello.
+func TestRedirectHandlerServesConfigJSONPlain(t *testing.T) {
+	const hash = "deadbeefcafebabe1234567890abcdef0011223344556677889900aabbccddeeff"
+	srv := httptest.NewServer(newRedirectHandler(hash))
+	defer srv.Close()
+
+	client := &http.Client{
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	resp, err := client.Get(srv.URL + "/config.json")
+	if err != nil {
+		t.Fatalf("GET /config.json: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d, want 200 (a redirect here hangs a plaintext client)", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	want := `{"certHash":"` + hash + `"}`
+	if strings.TrimSpace(string(body)) != want {
+		t.Fatalf("body %q, want %q", string(body), want)
 	}
 }
