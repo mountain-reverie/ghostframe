@@ -74,12 +74,31 @@ Read these before starting. They are not obvious from the code.
      `maxComputeInvocationsPerWorkgroup` that `wgpu::Limits::downlevel_defaults()`
      enforces. Total workgroup storage across all shaders is one `u32`.
 
-   So the deliberately restrictive limits chosen in Task 2 do not need relaxing
-   for any M1 pipeline. If a later shader exceeds them, that is a signal to
-   re-examine the shader, not to raise the limit -- the browser does not have a
-   higher one.
+   **Corrected after Task 12.** That last claim was too absolute.
+   `downlevel_defaults()` is stricter than WebGPU in places: it caps
+   `max_storage_buffers_per_shader_stage` at 4 (`wgpu-types-30.0.1/src/limits.rs:562`)
+   while the WebGPU spec default is 8 (`:434`). `cdf53_integrate.wgsl` binds 7
+   storage buffers -- a layout every browser must support -- so that single limit
+   is raised back to 8 in `wgpu_ctx.rs`, with the rest of `downlevel_defaults()`
+   left alone.
 
-9. **Never `git add -A`.** Stage explicit paths. Screenshots and scratch files live in the repo root.
+   The rule to apply is therefore: a shader exceeding a limit is a reason to check
+   **which** limit. If the browser's own default is higher, raise ours to the spec
+   value and say so. If the shader exceeds what WebGPU itself guarantees, fix the
+   shader -- Chrome will not give it more either. The invocation cap
+   `palrle_decode.wgsl` depends on is the second kind and must stay at 256.
+
+10. **CDF 5/3 generation tracking is NOT implemented in M1.** The browser's
+    `cdf53.ts` carries a per-tile generation and clears state when it bumps, which
+    is how a superseded tile stops contributing stale coefficients. The M1 port
+    writes a constant `gen = 1` marker purely to satisfy the inverse shaders'
+    "tile is active" check, and relies on wgpu zero-initialising buffers at
+    creation. This is adequate for static content and for the Task 13 oracle, but
+    it means a tile superseded mid-refinement will not behave as the browser does.
+    Close this before any progressive-refinement or mode-switch scenario
+    (i.e. before Task 20).
+
+11. **Never `git add -A`.** Stage explicit paths. Screenshots and scratch files live in the repo root.
 
 9. **Local gates must match CI.** `cargo clippy` alone is not green. CI also runs `cargo fmt --all -- --check` and an env-read guard. Run `just ci-local` before declaring a task done.
 
