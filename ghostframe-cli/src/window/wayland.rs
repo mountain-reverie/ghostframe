@@ -280,7 +280,7 @@ impl WaylandBackend {
         // `dmabuf_feedback()` and feed them into `Config::preferred_modifiers`
         // (M2 Task 9). A compositor stuck on protocol version 3 simply
         // never calls back here; `dmabuf_feedback()` then stays `None`,
-        // which the caller falls back on `DmabufState::modifiers()` for.
+        // which the caller falls back on `dmabuf_modifiers()` for.
         if let Ok(feedback) = state.dmabuf_state.get_default_feedback(&qh) {
             let _ = feedback;
             let _ = event_queue.roundtrip(&mut state);
@@ -298,10 +298,18 @@ impl WaylandBackend {
     /// zwp_linux_dmabuf_v1 v4+ compositor has sent them by now. `None`
     /// either means "not sent yet" (call `poll_events` again) or "this
     /// compositor only speaks v3", in which case
-    /// `DmabufState::modifiers()` (not exposed here; M2 Task 9's problem)
-    /// is the fallback.
+    /// [`WaylandBackend::dmabuf_modifiers`] is the fallback.
     pub fn dmabuf_feedback(&self) -> Option<&DmabufFeedback> {
         self.state.feedback.as_ref()
+    }
+
+    /// Format/modifier pairs advertised the pre-feedback way (protocol
+    /// version 3): the fallback for [`WaylandBackend::dmabuf_feedback`] on
+    /// a compositor that never sends feedback at all. Empty on a v4+
+    /// compositor, which advertises modifiers exclusively through
+    /// feedback instead.
+    pub fn dmabuf_modifiers(&self) -> &[smithay_client_toolkit::dmabuf::DmabufFormat] {
+        self.state.dmabuf_state.modifiers()
     }
 }
 
