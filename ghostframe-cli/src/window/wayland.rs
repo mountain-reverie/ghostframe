@@ -314,6 +314,16 @@ impl WaylandBackend {
 }
 
 impl Backend for WaylandBackend {
+    /// Overrides the trait's empty default with the actual list from
+    /// [`WaylandBackend::dmabuf_modifiers`] -- the v3 pre-feedback
+    /// modifiers, already fetched by the roundtrip in `open`. `connect`
+    /// (M2 Task 9) reads this before constructing the `Client`, so a v4+
+    /// compositor's async feedback tranches (`dmabuf_feedback`) are
+    /// deliberately not awaited here.
+    fn preferred_dmabuf_modifiers(&self) -> Vec<u64> {
+        self.dmabuf_modifiers().iter().map(|f| f.modifier).collect()
+    }
+
     /// `placement` is accepted to satisfy the trait but unused here:
     /// xdg-shell already centres a fullscreened surface smaller than the
     /// output and fills the remainder black on its own (see the module
