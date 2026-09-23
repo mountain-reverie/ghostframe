@@ -25,6 +25,13 @@ use ghostframe_client_gpu::wgpu_ctx::WgpuContext;
 
 use crate::event::{ClientEvent, EventQueue};
 
+/// Default export-ring buffer count used when [`crate::Config::n_export_buffers`]
+/// is `0`. Kept here, in the caller, rather than inside `Renderer` -- the
+/// renderer treats 0 as a rejected configuration (see
+/// [`ghostframe_client_gpu::GpuError::NoExportBuffers`]), and it is this
+/// thread's job to decide what a client that didn't specify a count gets.
+const DEFAULT_EXPORT_BUFFER_COUNT: u32 = 3;
+
 pub(crate) enum RenderMsg {
     Core(CoreEvent),
     Release(u32),
@@ -41,6 +48,8 @@ fn handle_core_event(
     renderer: &mut Option<Renderer>,
     ev: CoreEvent,
     queue: &EventQueue,
+    export_buffers: usize,
+    preferred_modifiers: &[u64],
 ) -> bool {
     if renderer.is_none() {
         let CoreEvent::FrameDimensions { width, height } = &ev else {
@@ -51,7 +60,7 @@ fn handle_core_event(
             );
             return false;
         };
-        match Renderer::new(ctx, *width, *height) {
+        match Renderer::new(ctx, *width, *height, export_buffers, preferred_modifiers) {
             Ok(r) => *renderer = Some(r),
             Err(e) => {
                 queue.push(ClientEvent::Error {
@@ -76,8 +85,19 @@ pub(crate) fn run(
     rx: Receiver<RenderMsg>,
     queue: Arc<EventQueue>,
     published: Arc<Mutex<Option<PublishedFrame>>>,
+    export_buffers: u32,
+    preferred_modifiers: Vec<u64>,
 ) {
     let mut renderer: Option<Renderer> = None;
+    // `0` means "the embedder didn't specify a count"; a `Renderer` with
+    // zero export buffers is a rejected config (it could never publish a
+    // frame), so this thread -- not the renderer -- decides what "didn't
+    // specify" defaults to.
+    let export_buffers = if export_buffers == 0 {
+        DEFAULT_EXPORT_BUFFER_COUNT as usize
+    } else {
+        export_buffers as usize
+    };
 
     while let Ok(first) = rx.recv() {
         // `Err` here means every `Sender` was dropped; the loop condition
@@ -93,7 +113,14 @@ pub(crate) fn run(
                 }
             }
             RenderMsg::Core(ev) => {
-                got_event |= handle_core_event(&ctx, &mut renderer, ev, &queue);
+                got_event |= handle_core_event(
+                    &ctx,
+                    &mut renderer,
+                    ev,
+                    &queue,
+                    export_buffers,
+                    &preferred_modifiers,
+                );
             }
         }
 
@@ -112,7 +139,14 @@ pub(crate) fn run(
                     }
                 }
                 Ok(RenderMsg::Core(ev)) => {
-                    got_event |= handle_core_event(&ctx, &mut renderer, ev, &queue);
+                    got_event |= handle_core_event(
+                        &ctx,
+                        &mut renderer,
+                        ev,
+                        &queue,
+                        export_buffers,
+                        &preferred_modifiers,
+                    );
                 }
                 Err(_) => break,
             }

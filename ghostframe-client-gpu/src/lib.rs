@@ -65,4 +65,11 @@ pub enum GpuError {
 
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+
+    /// `export_buffers == 0` was requested. An export ring with no buffers
+    /// can never hand `publish` a free one, so the client would connect
+    /// successfully and then never show a frame -- a failure mode much
+    /// harder to notice than a rejected config.
+    #[error("export_buffers must be at least 1 (got 0); a client with zero export buffers can never publish a frame")]
+    NoExportBuffers,
 }

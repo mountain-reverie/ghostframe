@@ -58,7 +58,7 @@ fn gpu_decode_matches_cpu_decode_for_solid_palrle_and_cdf53() {
 
     // GPU path, same capture.
     let ctx = WgpuContext::new().expect("wgpu context");
-    let mut renderer = Renderer::new(&ctx, 64, 64).expect("renderer");
+    let mut renderer = Renderer::new(&ctx, 64, 64, 3, &[]).expect("renderer");
     for ev in drain(&capture, TileDelivery::Payload) {
         renderer.apply_event(&ctx, &ev);
     }
