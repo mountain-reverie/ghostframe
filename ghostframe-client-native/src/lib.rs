@@ -236,7 +236,7 @@ impl Client {
             }
         };
 
-        let cert_hash = bootstrap::fetch_cert_hash(&bridge, host, port)?;
+        let cert_hash = bootstrap::fetch_cert_hash(&bridge, host)?;
 
         let udp_fd = bridge.dial_udp(&format!("{host}:{port}"))?.into_raw_fd();
         // SAFETY: `into_raw_fd` just handed us sole ownership of a freshly
