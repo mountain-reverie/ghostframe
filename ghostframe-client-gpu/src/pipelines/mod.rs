@@ -5,6 +5,7 @@
 //! `shaders/client/`, the directory Task 9 moved the WGSL into precisely so
 //! both the web client and this native client compile the exact same file.
 
+pub mod cdf53_passes;
 pub mod palrle;
 pub mod raw;
 pub mod solid;
