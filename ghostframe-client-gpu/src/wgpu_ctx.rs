@@ -94,8 +94,16 @@ impl WgpuContext {
             // downlevel_defaults caps maxComputeInvocationsPerWorkgroup at
             // the portable 256 that palrle_decode.wgsl was designed around,
             // so a limit the browser would not have is not silently
-            // available here.
-            required_limits: wgpu::Limits::downlevel_defaults(),
+            // available here. It also caps maxStorageBuffersPerShaderStage
+            // at 4, which is BELOW the WebGPU spec's own default of 8 --
+            // cdf53_integrate.wgsl binds 7 storage buffers (a real WebGPU
+            // layout every browser must support), so raise just that one
+            // limit back up to the spec default rather than the
+            // downlevel-conservative value.
+            required_limits: wgpu::Limits {
+                max_storage_buffers_per_shader_stage: 8,
+                ..wgpu::Limits::downlevel_defaults()
+            },
             memory_hints: wgpu::MemoryHints::Performance,
             trace: wgpu::Trace::Off,
             ..Default::default()

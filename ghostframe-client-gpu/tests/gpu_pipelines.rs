@@ -1,10 +1,12 @@
 //! Real-WGSL pipeline tests. Requires a GPU; NOT named in any CI workflow.
 
+use ghostframe_client_core::cdf53_prevalidate::prevalidate_cdf53;
 use ghostframe_client_gpu::{
     framebuffer::Framebuffer,
-    pipelines::{palrle::PalRlePipeline, solid::SolidPipeline},
+    pipelines::{cdf53::Cdf53Pipeline, palrle::PalRlePipeline, solid::SolidPipeline},
     wgpu_ctx::WgpuContext,
 };
+use ghostframe_protocol::codec::cdf53 as cdf53_codec;
 
 fn px(fb_bytes: &[u8], fb_w: u32, x: u32, y: u32) -> [u8; 4] {
     let o = ((y * fb_w + x) * 4) as usize;
@@ -320,4 +322,46 @@ fn palrle_errors_do_not_leak_between_decodes() {
         pipe.take_errors(&ctx.device, &ctx.queue).is_empty(),
         "stale error leaked"
     );
+}
+
+#[test]
+fn cdf53_flat_tile_reconstructs_its_flat_colour() {
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let mut fb = Framebuffer::new(&ctx.device, 64, 64);
+    fb.debug_fill(&ctx.device, &ctx.queue, [0, 0, 0, 0xFF]);
+
+    let mut pipe = Cdf53Pipeline::new(&ctx.device);
+    pipe.resize(&ctx.device, &ctx.queue, 2, 2);
+
+    // Build a wire-accurate pass-0..N payload for a uniform mid-grey tile
+    // using the real CPU encoder (ghostframe_protocol::codec::cdf53), so
+    // the fixture cannot drift from the wire format. BGRA, mid-grey.
+    let bgra = [0x80u8, 0x80, 0x80, 0xFF].repeat(32 * 32);
+    let coeffs = cdf53_codec::forward(&bgra);
+    let (present, sparse) = cdf53_codec::encode_passes_sparse(&coeffs);
+
+    let tiles: Vec<ghostframe_client_gpu::pipelines::cdf53::Cdf53PassEntry> = sparse
+        .iter()
+        .map(|(pass_idx, payload)| {
+            let pre = prevalidate_cdf53(payload, 1, *pass_idx).expect("wire payload prevalidates");
+            let present_passes = if *pass_idx == 0 { Some(present) } else { None };
+            (0u8, 0u8, *pass_idx, pre.bit_planes, present_passes)
+        })
+        .collect();
+
+    pipe.integrate(&ctx.device, &ctx.queue, &tiles);
+    pipe.inverse(&ctx.device, &ctx.queue, &fb);
+    ctx.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+
+    let b = fb.debug_read(&ctx.device, &ctx.queue);
+    let p = px(&b, 64, 4, 4);
+    for c in 0..3 {
+        assert!(
+            (p[c] as i32 - 0x80).abs() <= 4,
+            "channel {c} reconstructed as {} not ~0x80; full pixel {p:?}",
+            p[c]
+        );
+    }
 }
