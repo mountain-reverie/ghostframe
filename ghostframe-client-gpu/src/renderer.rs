@@ -22,11 +22,6 @@ use ghostframe_client_core::{DecodeErrorCode, Event, TileData};
 use ghostframe_protocol::protocol::Codec;
 use ghostframe_protocol::tile::TILE_SIZE;
 
-/// Number of exported buffers the ring keeps. Matches the count used by
-/// this crate's own `ring.rs` tests; large enough that the host can hold a
-/// couple of frames without stalling decode.
-const EXPORT_BUFFER_COUNT: usize = 3;
-
 fn tile_grid(width: u32, height: u32) -> (u32, u32) {
     (width.div_ceil(TILE_SIZE), height.div_ceil(TILE_SIZE))
 }
@@ -51,9 +46,23 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new(ctx: &WgpuContext, width: u32, height: u32) -> Result<Self, GpuError> {
+    /// `export_buffers` must be at least 1 -- a ring with zero buffers can
+    /// never hand `publish` a free one, so the client would connect and
+    /// then never show a frame. Rejected here rather than clamped, since a
+    /// silent clamp would hide a misconfigured caller behind a working demo
+    /// and a broken embed.
+    pub fn new(
+        ctx: &WgpuContext,
+        width: u32,
+        height: u32,
+        export_buffers: usize,
+        preferred_modifiers: &[u64],
+    ) -> Result<Self, GpuError> {
+        if export_buffers == 0 {
+            return Err(GpuError::NoExportBuffers);
+        }
         let fb = Framebuffer::new(&ctx.device, width, height);
-        let ring = ExportRing::new(ctx, width, height, EXPORT_BUFFER_COUNT, &[])?;
+        let ring = ExportRing::new(ctx, width, height, export_buffers, preferred_modifiers)?;
 
         let mut solid = SolidPipeline::new(&ctx.device);
         solid.set_canvas_size(&ctx.device, &ctx.queue, width, height);

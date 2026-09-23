@@ -73,13 +73,15 @@ pub struct Config {
     /// False in M1 -- H.264 decode is M3 scope.
     pub supports_h264: bool,
     pub indices_raw: bool,
-    /// Reserved for the export ring's buffer count. `Renderer::new`
-    /// currently hardcodes its own count and does not yet accept this --
-    /// see the note on [`Client::connect`].
+    /// The export ring's buffer count. `0` means "use the render thread's
+    /// default" (currently 3) -- see `render_thread::DEFAULT_EXPORT_BUFFER_COUNT`.
+    /// A nonzero value is passed straight to `Renderer::new`, which rejects
+    /// `0` itself (`GpuError::NoExportBuffers`) since a ring with no
+    /// buffers could never publish a frame.
     pub n_export_buffers: u32,
-    /// Reserved for DRM modifier negotiation. `Renderer::new` currently
-    /// always requests `DRM_FORMAT_MOD_LINEAR` via an empty modifier list
-    /// and does not yet accept this -- see the note on [`Client::connect`].
+    /// DRM format modifiers the consumer prefers, in priority order. Empty
+    /// means "linear only" (`DRM_FORMAT_MOD_LINEAR`). Passed straight to
+    /// `ExportRing::new`.
     pub preferred_modifiers: Vec<u64>,
 }
 
@@ -155,12 +157,9 @@ impl Client {
     /// this one.
     ///
     /// `Config::n_export_buffers` and `Config::preferred_modifiers` are
-    /// accepted but not yet threaded through to
-    /// `Renderer::new`/`ExportRing::new`, which currently hardcode 3
-    /// buffers and an empty (LINEAR-only) modifier list respectively. That
-    /// is a real gap against the design doc's `gf_client_config`, tracked
-    /// here rather than papered over: wiring it through is a
-    /// `client-gpu` change, not a `client-native` one.
+    /// forwarded to the render thread, which passes them to
+    /// `Renderer::new`/`ExportRing::new` at first-frame construction time
+    /// (renderer construction is lazy -- see `render_thread::handle_core_event`).
     pub fn connect(&mut self, host: &str, port: u16) -> Result<(), ClientError> {
         if self.net_thread.is_some() {
             return Err(ClientError::Connect("already connected".into()));
@@ -221,9 +220,20 @@ impl Client {
 
         let render_queue = Arc::clone(&self.queue);
         let published = Arc::clone(&self.published);
+        let export_buffers = self.config.n_export_buffers;
+        let preferred_modifiers = self.config.preferred_modifiers.clone();
         let render_handle = std::thread::Builder::new()
             .name("gf-render".into())
-            .spawn(move || render_thread::run(ctx, render_rx, render_queue, published))
+            .spawn(move || {
+                render_thread::run(
+                    ctx,
+                    render_rx,
+                    render_queue,
+                    published,
+                    export_buffers,
+                    preferred_modifiers,
+                )
+            })
             .map_err(ClientError::Io)?;
 
         let net_queue = Arc::clone(&self.queue);

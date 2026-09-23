@@ -21,7 +21,7 @@
 
 use crate::coalesce::{coalesce, Rect};
 use crate::dirty::DirtyHistory;
-use crate::export::ExportedImage;
+use crate::export::{ExportedImage, PlaneLayout};
 use crate::framebuffer::Framebuffer;
 use crate::wgpu_ctx::WgpuContext;
 use crate::GpuError;
@@ -48,11 +48,29 @@ pub struct ExportBuffer {
 }
 
 /// What [`ExportRing::publish`] hands back.
+///
+/// Carries a snapshot of the published buffer's dmabuf handle alongside the
+/// ring bookkeeping (`frame_id`/`buffer_id`/`damage`) so a consumer several
+/// layers away (`ghostframe-client-capi`'s `gf_client_acquire_frame`) can
+/// fill a `gf_frame` without a second round-trip back into the render
+/// thread -- there is no other thread-safe way to reach the `Renderer`
+/// that owns the underlying `ExportedImage`. `fd`/`planes`/`modifier` are
+/// exactly [`ExportedImage::raw_fd`]/`planes`/`modifier` for
+/// `buffer_id`, read at the moment of publish; the fd itself is owned by
+/// the `ExportedImage` (i.e. by this crate) for as long as that buffer
+/// lives, not by this struct or its eventual caller.
 pub struct PublishedFrame {
     pub frame_id: u32,
     pub buffer_id: u32,
     /// Damage in PIXEL coordinates, ready for the host.
     pub damage: Vec<Rect>,
+    pub width: u32,
+    pub height: u32,
+    pub modifier: u64,
+    /// The dmabuf fd backing this buffer. Owned by the library's
+    /// `ExportedImage`, not by this struct -- do not close it.
+    pub fd: i32,
+    pub planes: Vec<PlaneLayout>,
 }
 
 /// A ring of exported dmabuf buffers, filled with history-aware partial
@@ -197,10 +215,16 @@ impl ExportRing {
         self.next_frame_id = self.next_frame_id.wrapping_add(1);
         self.in_flight.insert(frame_id, buffer_id);
 
+        let exported = &self.buffers[buffer_id as usize].exported;
         Some(PublishedFrame {
             frame_id,
             buffer_id,
             damage: pixel_rects,
+            width: exported.width,
+            height: exported.height,
+            modifier: exported.modifier,
+            fd: exported.raw_fd(),
+            planes: exported.planes.clone(),
         })
     }
 
