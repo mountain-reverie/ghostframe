@@ -227,6 +227,13 @@ pub(crate) struct NetThreadArgs {
     pub render_tx: std::sync::mpsc::Sender<RenderMsg>,
     pub queue: Arc<EventQueue>,
     pub base: Instant,
+    /// The single peer address quinn-proto was told about in
+    /// `ClientNet::connect`. Every inbound datagram is attributed to this,
+    /// NOT to the address ghostbridge reports per frame: the socketpair is
+    /// point-to-point and ghostbridge's dialedPacketConn ignores the
+    /// destination on send, so the address is a label. Feeding quinn a
+    /// different source than it was told to expect reads as path migration.
+    pub(crate) peer_addr: std::net::SocketAddr,
 }
 
 pub(crate) fn run(args: NetThreadArgs) {
@@ -238,6 +245,7 @@ pub(crate) fn run(args: NetThreadArgs) {
         render_tx,
         queue,
         base,
+        peer_addr,
     } = args;
 
     let udp_raw = udp_fd.as_raw_fd();
@@ -308,7 +316,8 @@ pub(crate) fn run(args: NetThreadArgs) {
                     Ok(packets) => {
                         for pkt in packets {
                             let now_us = Instant::now().duration_since(base).as_micros() as u64;
-                            client_net.handle_udp(&pkt.payload, pkt.addr, now_us);
+                            // Deliberately `peer_addr`, not `pkt.addr` -- see the field doc.
+                            client_net.handle_udp(&pkt.payload, peer_addr, now_us);
                         }
                     }
                     Err(e) => {
