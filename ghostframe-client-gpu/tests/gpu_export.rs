@@ -283,3 +283,76 @@ fn releasing_an_unknown_frame_id_is_ignored() {
     let mut ring = ExportRing::new(&ctx, 64, 64, 2, &[]).expect("ring");
     ring.release(4242); // must not panic
 }
+
+#[test]
+fn recycled_buffer_receives_only_its_damage_and_keeps_the_rest() {
+    // The genuine partial-blit path, which the "preserves untouched regions"
+    // test above does NOT reach: there the recycled buffer had never been
+    // filled, so `union_since(None)` forced a full-surface blit and the
+    // assertions passed without any rect coalescing happening at all.
+    //
+    // A ring of ONE buffer makes recycling deterministic, so the second
+    // publish must reuse a buffer whose `filled_at_gen` is already set and
+    // therefore takes the `union_since(Some(gen)) -> coalesce` branch.
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let mut fb = Framebuffer::new(&ctx.device, 64, 64);
+    let mut ring = ExportRing::new(&ctx, 64, 64, 1, &[]).expect("ring");
+
+    // Frame 1: whole surface red, full blit into the only buffer.
+    fb.debug_fill(&ctx.device, &ctx.queue, [0xFF, 0x00, 0x00, 0xFF]);
+    ring.mark_dirty_all();
+    let a = ring
+        .publish(&ctx.device, &ctx.queue, &fb)
+        .expect("publish 1");
+    ctx.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+    ring.release(a.frame_id);
+
+    // Frame 2: one tile green. The buffer is already filled, so this must
+    // be a PARTIAL blit of just that tile.
+    fb.debug_fill_tile(&ctx.device, &ctx.queue, 1, 0, [0x00, 0xFF, 0x00, 0xFF]);
+    ring.mark_dirty(1, 0);
+    let b = ring
+        .publish(&ctx.device, &ctx.queue, &fb)
+        .expect("publish 2");
+    assert_eq!(a.buffer_id, b.buffer_id, "one-buffer ring must recycle");
+    ctx.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+
+    // Damage must be the single tile, not the whole surface. This is what
+    // proves the partial branch ran rather than the full-blit fallback.
+    assert_eq!(
+        b.damage.len(),
+        1,
+        "expected one damage rect, got {:?}",
+        b.damage
+    );
+    assert_eq!(
+        (b.damage[0].x, b.damage[0].y, b.damage[0].w, b.damage[0].h),
+        (32, 0, 32, 32),
+        "damage should be exactly tile (1,0) in pixels"
+    );
+
+    let img = ring.buffer(b.buffer_id);
+    let bytes = img.map_read().expect("map");
+    let stride = img.planes[0].stride as usize;
+    let base = img.planes[0].offset as usize;
+
+    assert_eq!(
+        &bytes[base + 32 * 4..base + 32 * 4 + 4],
+        &[0x00, 0xFF, 0x00, 0xFF],
+        "partial blit did not copy the damaged tile"
+    );
+    assert_eq!(
+        &bytes[base..base + 4],
+        &[0xFF, 0x00, 0x00, 0xFF],
+        "partial blit clobbered an undamaged region"
+    );
+    assert_eq!(
+        &bytes[base + 40 * stride..base + 40 * stride + 4],
+        &[0xFF, 0x00, 0x00, 0xFF],
+        "partial blit clobbered a distant undamaged row"
+    );
+}
