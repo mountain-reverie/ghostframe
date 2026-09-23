@@ -81,7 +81,7 @@ pub async fn create_preauth_key(container_name: &str, user: &str) -> Result<Stri
 /// tailnet via ghostbridge so the test can dial the server container directly
 /// over the tailnet.
 pub struct TestNode {
-    handle: GhostbridgeHandle,
+    handle: std::sync::Arc<GhostbridgeHandle>,
 }
 
 impl TestNode {
@@ -93,7 +93,21 @@ impl TestNode {
             control_url,
         })?;
         handle.up()?;
-        Ok(Self { handle })
+        Ok(Self {
+            handle: std::sync::Arc::new(handle),
+        })
+    }
+
+    /// Share this node with something that would otherwise stand up its own.
+    ///
+    /// Running two `tsnet.Server` instances in one process was observed not
+    /// to converge a working peer datapath here -- both nodes log in to the
+    /// control plane and reach `Running`, but the WireGuard datapath never
+    /// comes up and every dial hangs. Tests that need a tailnet-attached
+    /// client (e.g. `ghostframe-client-native`'s) should reuse this node via
+    /// `Client::attach_bridge` rather than creating a second one.
+    pub fn bridge(&self) -> std::sync::Arc<GhostbridgeHandle> {
+        std::sync::Arc::clone(&self.handle)
     }
 
     pub fn dial(&self, remote: &str) -> Result<UdpPacketConn> {
