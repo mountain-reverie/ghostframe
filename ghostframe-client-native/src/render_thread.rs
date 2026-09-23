@@ -1,0 +1,136 @@
+//! The render thread: owns `WgpuContext` and the per-session `Renderer`.
+//!
+//! Kept off the net thread deliberately. `ExportRing::publish` calls
+//! `device.poll(PollType::wait_indefinitely())` after its blit (see the
+//! design doc's section 5.5) -- a real GPU stall, not a fast path. If that lived
+//! on the same thread that owns `ClientNet`, a stall there would delay
+//! ACK/NACK batching and timer-driven feedback, and much of the M3
+//! transport stack is timing-sensitive. Splitting the threads means a GPU
+//! hiccup only ever delays a frame, never the transport's own clock.
+//!
+//! `ghostframe_client_core::Event`s arrive over an `mpsc` channel from the
+//! net thread; `RenderMsg::Release` arrives from whichever thread the
+//! embedder calls `Client::release_frame` from. A batch of whatever is
+//! immediately available is applied, then `flush` + `publish` run once --
+//! this is the "frame boundary" the crate-level docs describe, since
+//! `ClientCore` has no explicit end-of-frame event of its own to key off.
+
+use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Mutex};
+
+use ghostframe_client_core::Event as CoreEvent;
+use ghostframe_client_gpu::renderer::Renderer;
+use ghostframe_client_gpu::ring::PublishedFrame;
+use ghostframe_client_gpu::wgpu_ctx::WgpuContext;
+
+use crate::event::{ClientEvent, EventQueue};
+
+pub(crate) enum RenderMsg {
+    Core(CoreEvent),
+    Release(u32),
+    Shutdown,
+}
+
+/// Route one core event to the renderer, lazily constructing it on the
+/// first `FrameDimensions` (the earliest point at which a size is known --
+/// see the design doc's "Allocation timing" note). Returns whether a
+/// render-worthy change happened, i.e. whether `flush`+`publish` are worth
+/// running this batch.
+fn handle_core_event(
+    ctx: &WgpuContext,
+    renderer: &mut Option<Renderer>,
+    ev: CoreEvent,
+    queue: &EventQueue,
+) -> bool {
+    if renderer.is_none() {
+        let CoreEvent::FrameDimensions { width, height } = &ev else {
+            tracing::warn!(
+                ?ev,
+                "core event before the first FrameDimensions; renderer not \
+                 yet constructed, dropping"
+            );
+            return false;
+        };
+        match Renderer::new(ctx, *width, *height) {
+            Ok(r) => *renderer = Some(r),
+            Err(e) => {
+                queue.push(ClientEvent::Error {
+                    message: format!("renderer init failed: {e}"),
+                });
+                return false;
+            }
+        }
+        // `Renderer::new` already sized the framebuffer/ring to this
+        // event's dimensions; there is nothing further to apply from it.
+        return true;
+    }
+    renderer
+        .as_mut()
+        .expect("renderer.is_none() handled above")
+        .apply_event(ctx, &ev);
+    true
+}
+
+pub(crate) fn run(
+    ctx: WgpuContext,
+    rx: Receiver<RenderMsg>,
+    queue: Arc<EventQueue>,
+    published: Arc<Mutex<Option<PublishedFrame>>>,
+) {
+    let mut renderer: Option<Renderer> = None;
+
+    while let Ok(first) = rx.recv() {
+        // `Err` here means every `Sender` was dropped; the loop condition
+        // above already exits for us.
+        let mut got_event = false;
+        let mut shutdown = false;
+
+        match first {
+            RenderMsg::Shutdown => break,
+            RenderMsg::Release(id) => {
+                if let Some(r) = renderer.as_mut() {
+                    r.release(id);
+                }
+            }
+            RenderMsg::Core(ev) => {
+                got_event |= handle_core_event(&ctx, &mut renderer, ev, &queue);
+            }
+        }
+
+        // Drain whatever else is already queued without blocking, so a
+        // burst of events lands in one render pass instead of one per
+        // message.
+        loop {
+            match rx.try_recv() {
+                Ok(RenderMsg::Shutdown) => {
+                    shutdown = true;
+                    break;
+                }
+                Ok(RenderMsg::Release(id)) => {
+                    if let Some(r) = renderer.as_mut() {
+                        r.release(id);
+                    }
+                }
+                Ok(RenderMsg::Core(ev)) => {
+                    got_event |= handle_core_event(&ctx, &mut renderer, ev, &queue);
+                }
+                Err(_) => break,
+            }
+        }
+
+        if got_event {
+            if let Some(r) = renderer.as_mut() {
+                r.flush(&ctx);
+                if let Some(pf) = r.publish(&ctx) {
+                    let frame_id = pf.frame_id;
+                    *published.lock().unwrap_or_else(|e| e.into_inner()) = Some(pf);
+                    queue.push(ClientEvent::FrameReady { frame_id });
+                }
+            }
+        }
+
+        if shutdown {
+            break;
+        }
+    }
+}
