@@ -138,15 +138,21 @@ impl Client {
     /// Bring the tailnet up, fetch and pin the server's cert hash, open the
     /// QUIC/WebTransport session, and start the net and render threads.
     ///
-    /// `host` must currently be a bare IP literal (a tailscale IP such as
-    /// `100.x.y.z`), not a MagicDNS name: `ClientNet::connect` needs a
-    /// concrete `SocketAddr` up front to hand to quinn-proto, and this
-    /// crate has no DNS resolver of its own -- `dial_udp`/`dial_tcp` do
-    /// their own resolution inside ghostbridge, but nothing here exposes
-    /// that result back to Rust before the first packet is sent. A real
-    /// resolver would need a new ghostbridge export (`gbridge_resolve`,
-    /// analogous to the existing `gbridge_getips`); out of scope for this
-    /// task.
+    /// `host` may be an IP literal or a MagicDNS name. Resolution happens
+    /// inside ghostbridge (`dial_udp`/`dial_tcp` take a string), and the
+    /// `SocketAddr` quinn-proto works with never has to be the real one:
+    /// `dial_udp` returns a *dialed* socketpair, and ghostbridge's
+    /// `dialedPacketConn::WriteTo` ignores the destination argument
+    /// entirely (`ghostbridge/main.go`), writing to the connected peer. The
+    /// address is therefore a label quinn uses to identify its single peer,
+    /// not a destination.
+    ///
+    /// What DOES matter is that the label is used consistently: every
+    /// inbound datagram must be attributed to the same address `connect`
+    /// announced, or quinn sees packets arriving from an unexpected source
+    /// and treats it as path migration. So the net thread deliberately
+    /// ignores the address ghostbridge reports per frame and substitutes
+    /// this one.
     ///
     /// `Config::n_export_buffers` and `Config::preferred_modifiers` are
     /// accepted but not yet threaded through to
@@ -160,12 +166,14 @@ impl Client {
             return Err(ClientError::Connect("already connected".into()));
         }
 
-        let remote: SocketAddr = format!("{host}:{port}").parse().map_err(|_| {
-            ClientError::Connect(format!(
-                "host {host:?} is not an IP literal; MagicDNS resolution is \
-                 not yet wired into this crate (see Client::connect's doc comment)"
-            ))
-        })?;
+        // The peer label quinn-proto will use. If `host` is an IP literal we
+        // keep it so logs and packet captures read naturally; otherwise we
+        // use a stable RFC 5737 TEST-NET-1 documentation address, which can
+        // never collide with a real route. Either way ghostbridge ignores it
+        // on send and the net thread pins it on receive.
+        let remote: SocketAddr = format!("{host}:{port}")
+            .parse()
+            .unwrap_or_else(|_| SocketAddr::from(([192, 0, 2, 1], port)));
 
         let bridge = GhostbridgeHandle::connect(&GhostbridgeConfig {
             hostname: self.config.hostname.clone(),
@@ -232,6 +240,7 @@ impl Client {
                     render_tx: net_render_tx,
                     queue: net_queue,
                     base,
+                    peer_addr: remote,
                 })
             })
             .map_err(ClientError::Io)?;
