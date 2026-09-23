@@ -356,12 +356,23 @@ fn cdf53_flat_tile_reconstructs_its_flat_colour() {
         .expect("poll");
 
     let b = fb.debug_read(&ctx.device, &ctx.queue);
-    let p = px(&b, 64, 4, 4);
-    for c in 0..3 {
-        assert!(
-            (p[c] as i32 - 0x80).abs() <= 4,
-            "channel {c} reconstructed as {} not ~0x80; full pixel {p:?}",
-            p[c]
-        );
-    }
+    // EXACT, not approximate. CDF 5/3 is an integer-reversible lifting
+    // transform and the inverse shaders use only i32; with every pass
+    // delivered, reconstruction is lossless by construction. A tolerance
+    // here would let a systematic reconstruction error hide -- and a
+    // systematic error is exactly the failure mode this pipeline has
+    // historically had.
+    assert_eq!(
+        px(&b, 64, 4, 4),
+        [0x80, 0x80, 0x80, 0xFF],
+        "flat tile did not reconstruct losslessly"
+    );
+    // A corner too: a partial inverse can be right in the tile interior
+    // and wrong at the boundary, where the lifting filter needs its
+    // symmetric extension.
+    assert_eq!(
+        px(&b, 64, 31, 31),
+        [0x80, 0x80, 0x80, 0xFF],
+        "flat tile wrong at the far corner"
+    );
 }
