@@ -21,7 +21,9 @@ pub mod dirty;
 pub mod export;
 pub mod framebuffer;
 pub mod pipelines;
+pub mod renderer;
 pub mod ring;
+pub mod testdata;
 pub mod wgpu_ctx;
 
 use thiserror::Error;
