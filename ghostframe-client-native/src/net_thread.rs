@@ -34,6 +34,10 @@ pub(crate) enum NetCommand {
     /// An encoded input event (see `crate::input`), to be written onto the
     /// feedback stream via `ClientNet::send_input`.
     SendInput(Vec<u8>),
+    /// Diagnostic: snapshot `ClientNet`'s CDF 5/3 coverage state and reply
+    /// with it. Mirrors `RenderMsg::DebugMapFrame`'s round-trip shape -- see
+    /// `Client::cdf53_coverage`.
+    Cdf53Coverage(std::sync::mpsc::Sender<crate::Cdf53Coverage>),
     Shutdown,
 }
 
@@ -340,6 +344,15 @@ pub(crate) fn run(args: NetThreadArgs) {
                         Ok(NetCommand::SendInput(bytes)) => {
                             let now_us = Instant::now().duration_since(base).as_micros() as u64;
                             client_net.send_input(bytes, now_us);
+                        }
+                        Ok(NetCommand::Cdf53Coverage(reply_tx)) => {
+                            let summary = client_net.cdf53_coverage_summary();
+                            let incomplete = client_net
+                                .cdf53_incomplete_tiles(crate::CDF53_INCOMPLETE_TILES_LIMIT);
+                            let _ = reply_tx.send(crate::Cdf53Coverage {
+                                summary,
+                                incomplete,
+                            });
                         }
                         Ok(NetCommand::Shutdown) => break 'outer,
                         Err(TryRecvError::Empty) => break,

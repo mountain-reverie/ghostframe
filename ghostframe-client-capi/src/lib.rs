@@ -66,8 +66,9 @@ fn map_client_error(e: &ClientError) -> gf_result {
     match e {
         ClientError::Gpu(_) => gf_result::GF_ERR_GPU,
         ClientError::Connect(_) => gf_result::GF_ERR_STATE,
-        // `DebugMap` is test/diagnostic-only (`Client::debug_map_frame` is
-        // not exposed through this C ABI at all), but the match must stay
+        // `DebugMap` and `Cdf53Coverage` are test/diagnostic-only
+        // (`Client::debug_map_frame` / `Client::cdf53_coverage` are not
+        // exposed through this C ABI at all), but the match must stay
         // exhaustive -- grouped with the other I/O-flavored failures rather
         // than given its own `gf_result` variant nothing would ever produce
         // through this surface.
@@ -75,7 +76,8 @@ fn map_client_error(e: &ClientError) -> gf_result {
         | ClientError::Io(_)
         | ClientError::Bootstrap(_)
         | ClientError::Net(_)
-        | ClientError::DebugMap(_) => gf_result::GF_ERR_IO,
+        | ClientError::DebugMap(_)
+        | ClientError::Cdf53Coverage(_) => gf_result::GF_ERR_IO,
     }
 }
 

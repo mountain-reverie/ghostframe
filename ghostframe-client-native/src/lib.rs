@@ -66,6 +66,10 @@ pub enum ClientError {
     /// the dmabuf mmap itself failed.
     #[error("debug_map_frame: {0}")]
     DebugMap(String),
+    /// [`Client::cdf53_coverage`] failed: not connected, or the net thread
+    /// did not reply within its timeout.
+    #[error("cdf53_coverage: {0}")]
+    Cdf53Coverage(String),
 }
 
 /// Configuration for a [`Client`]. Mirrors `gf_client_config` in the C API
@@ -99,6 +103,27 @@ pub struct DebugFrameBytes {
     pub width: u32,
     pub height: u32,
 }
+
+/// Snapshot of the net thread's CDF 5/3 tile-coverage state. Test and
+/// diagnostic use only -- see [`Client::cdf53_coverage`]. Not part of the C
+/// ABI: `ghostframe-client-capi` does not (yet) expose this.
+pub struct Cdf53Coverage {
+    pub summary: ghostframe_client_core::cdf53_coverage::Cdf53CoverageSummary,
+    /// The most-stalled incomplete tiles, capped at
+    /// `CDF53_INCOMPLETE_TILES_LIMIT`. Each entry is
+    /// `(tile_x, tile_y, received_mask, present_mask, sweep_attempts)`.
+    pub incomplete: Vec<(u8, u8, u16, u16, u8)>,
+}
+
+/// Cap on how many incomplete tiles [`Client::cdf53_coverage`] returns, so a
+/// fully stalled production-scale screen (2000+ tiles) can't turn one
+/// diagnostic call into an unbounded reply.
+const CDF53_INCOMPLETE_TILES_LIMIT: usize = 20;
+
+/// How long [`Client::cdf53_coverage`] waits for the net thread to reply
+/// before giving up. Mirrors [`DEBUG_MAP_FRAME_TIMEOUT`]'s reasoning: a
+/// wedged net thread should fail loudly, not hang the caller.
+const CDF53_COVERAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long [`Client::debug_map_frame`] waits for the render thread to
 /// reply before giving up. A wedged render thread (GPU hang, deadlock)
@@ -410,6 +435,41 @@ impl Client {
                 ))
             })?
             .map_err(ClientError::DebugMap)
+    }
+
+    /// Snapshot the net thread's CDF 5/3 tile-coverage state.
+    ///
+    /// Diagnostic API only -- not part of the C ABI. `ClientCore` (and the
+    /// `ClientNet` that owns it) lives entirely on the net thread, so this
+    /// round-trips a request through the same wake-eventfd + channel pair
+    /// `push_*` uses to send input, with an `mpsc::Sender` reply mirroring
+    /// [`Client::debug_map_frame`]'s round-trip to the render thread. A
+    /// bounded timeout means a wedged net thread fails loudly rather than
+    /// hanging the caller.
+    pub fn cdf53_coverage(&self) -> Result<Cdf53Coverage, ClientError> {
+        let tx = self
+            .net_cmd_tx
+            .as_ref()
+            .ok_or_else(|| ClientError::Cdf53Coverage("not connected".into()))?;
+        let (reply_tx, reply_rx) = mpsc::channel();
+        tx.send(NetCommand::Cdf53Coverage(reply_tx))
+            .map_err(|_| ClientError::Cdf53Coverage("net thread is not running".into()))?;
+        if let Some(wake) = &self.wake_fd {
+            let one: u64 = 1;
+            // SAFETY: see `shutdown_threads`'s identical write.
+            unsafe {
+                let _ = libc::write(
+                    wake.as_raw_fd(),
+                    &one as *const u64 as *const libc::c_void,
+                    std::mem::size_of::<u64>(),
+                );
+            }
+        }
+        reply_rx.recv_timeout(CDF53_COVERAGE_TIMEOUT).map_err(|_| {
+            ClientError::Cdf53Coverage(format!(
+                "net thread did not reply within {CDF53_COVERAGE_TIMEOUT:?} (wedged net thread?)"
+            ))
+        })
     }
 
     fn send_input(&mut self, bytes: Vec<u8>) {
