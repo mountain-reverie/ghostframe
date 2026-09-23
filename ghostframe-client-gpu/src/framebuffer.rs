@@ -105,6 +105,57 @@ impl Framebuffer {
         queue.submit(std::iter::once(encoder.finish()));
     }
 
+    /// Copy only `rects` (PIXEL coordinates) into `dst`.
+    ///
+    /// One `copy_texture_to_texture` per rect in a single encoder, so a
+    /// frame's damage costs one submission regardless of rect count.
+    /// Zero-area rects are skipped rather than handed to wgpu: a
+    /// `copy_texture_to_texture` with a zero-sized `Extent3d` is a
+    /// validation error, and [`crate::coalesce::Rect::to_pixels`] can
+    /// legitimately produce one when clamping a tile rect against a
+    /// non-tile-aligned framebuffer edge.
+    pub fn blit_rects(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        dst: &wgpu::Texture,
+        rects: &[crate::coalesce::Rect],
+    ) {
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("ghostframe-framebuffer-blit-rects"),
+        });
+        for rect in rects {
+            if rect.w == 0 || rect.h == 0 {
+                continue;
+            }
+            let origin = wgpu::Origin3d {
+                x: rect.x,
+                y: rect.y,
+                z: 0,
+            };
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.texture,
+                    mip_level: 0,
+                    origin,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: dst,
+                    mip_level: 0,
+                    origin,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: rect.w,
+                    height: rect.h,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        queue.submit(std::iter::once(encoder.finish()));
+    }
+
     /// Fill the whole framebuffer with one RGBA colour. Test use only.
     pub fn debug_fill(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, rgba: [u8; 4]) {
         let pixel_count = self.width as usize * self.height as usize;
@@ -132,6 +183,56 @@ impl Framebuffer {
         device
             .poll(wgpu::PollType::wait_indefinitely())
             .expect("poll after debug_fill");
+    }
+
+    /// Fill one 32x32 tile at tile coordinates `(tile_x, tile_y)` with one
+    /// RGBA colour. Test use only. Clamped to the framebuffer edge, mirroring
+    /// [`crate::coalesce::Rect::to_pixels`]'s clamp for a non-tile-aligned
+    /// bottom/right edge.
+    pub fn debug_fill_tile(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        tile_x: u32,
+        tile_y: u32,
+        rgba: [u8; 4],
+    ) {
+        const T: u32 = 32;
+        let x = tile_x * T;
+        let y = tile_y * T;
+        let w = T.min(self.width.saturating_sub(x));
+        let h = T.min(self.height.saturating_sub(y));
+        if w == 0 || h == 0 {
+            return;
+        }
+
+        let mut data = Vec::with_capacity(w as usize * h as usize * 4);
+        for _ in 0..(w * h) {
+            data.extend_from_slice(&rgba);
+        }
+
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(w * 4),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll after debug_fill_tile");
     }
 
     /// Read the framebuffer back as tight RGBA. Test use only.

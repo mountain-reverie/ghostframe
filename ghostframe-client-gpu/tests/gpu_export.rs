@@ -188,3 +188,98 @@ fn framebuffer_preserves_content_across_resize() {
         "resize did not preserve existing content"
     );
 }
+
+use ghostframe_client_gpu::ring::ExportRing;
+
+#[test]
+fn ring_partial_update_preserves_untouched_regions() {
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let mut fb = Framebuffer::new(&ctx.device, 64, 64);
+    let mut ring = ExportRing::new(&ctx, 64, 64, 3, &[]).expect("ring");
+
+    // Frame 1: whole surface red, into buffer A.
+    fb.debug_fill(&ctx.device, &ctx.queue, [0xFF, 0x00, 0x00, 0xFF]);
+    ring.mark_dirty_all();
+    let a = ring
+        .publish(&ctx.device, &ctx.queue, &fb)
+        .expect("publish 1");
+    ctx.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+
+    // Frame 2: paint ONLY tile (1,0) green, publish into a different buffer.
+    fb.debug_fill_tile(&ctx.device, &ctx.queue, 1, 0, [0x00, 0xFF, 0x00, 0xFF]);
+    ring.mark_dirty(1, 0);
+    let b = ring
+        .publish(&ctx.device, &ctx.queue, &fb)
+        .expect("publish 2");
+    assert_ne!(
+        a.buffer_id, b.buffer_id,
+        "must not reuse a buffer still held"
+    );
+    ctx.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+
+    let img = ring.buffer(b.buffer_id);
+    let bytes = img.map_read().expect("map");
+    let stride = img.planes[0].stride as usize;
+    let base = img.planes[0].offset as usize;
+
+    // The newly painted tile starts at pixel x=32.
+    assert_eq!(
+        &bytes[base + 32 * 4..base + 32 * 4 + 4],
+        &[0x00, 0xFF, 0x00, 0xFF],
+        "new tile not copied"
+    );
+    // THE POINT: buffer B was never written before, so it must have received
+    // frame 1's red as well -- not just frame 2's single green tile.
+    assert_eq!(
+        &bytes[base..base + 4],
+        &[0xFF, 0x00, 0x00, 0xFF],
+        "untouched region lost: partial blit ignored buffer history"
+    );
+    // And a row far away, to catch a stride mistake.
+    assert_eq!(
+        &bytes[base + 40 * stride..base + 40 * stride + 4],
+        &[0xFF, 0x00, 0x00, 0xFF],
+        "untouched row lost"
+    );
+}
+
+#[test]
+fn publish_returns_none_when_every_buffer_is_held() {
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let fb = Framebuffer::new(&ctx.device, 64, 64);
+    let mut ring = ExportRing::new(&ctx, 64, 64, 2, &[]).expect("ring");
+    ring.mark_dirty_all();
+    assert!(ring.publish(&ctx.device, &ctx.queue, &fb).is_some());
+    ring.mark_dirty_all();
+    assert!(ring.publish(&ctx.device, &ctx.queue, &fb).is_some());
+    ring.mark_dirty_all();
+    // Nothing free: the library keeps decoding privately, it does not stall.
+    assert!(ring.publish(&ctx.device, &ctx.queue, &fb).is_none());
+}
+
+#[test]
+fn released_buffers_are_recycled() {
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let fb = Framebuffer::new(&ctx.device, 64, 64);
+    let mut ring = ExportRing::new(&ctx, 64, 64, 2, &[]).expect("ring");
+    ring.mark_dirty_all();
+    let a = ring.publish(&ctx.device, &ctx.queue, &fb).expect("a");
+    ring.mark_dirty_all();
+    let b = ring.publish(&ctx.device, &ctx.queue, &fb).expect("b");
+    ring.release(a.frame_id);
+    ring.release(b.frame_id);
+    ring.mark_dirty_all();
+    let c = ring.publish(&ctx.device, &ctx.queue, &fb).expect("c");
+    assert!(c.buffer_id == a.buffer_id || c.buffer_id == b.buffer_id);
+}
+
+#[test]
+fn releasing_an_unknown_frame_id_is_ignored() {
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let mut ring = ExportRing::new(&ctx, 64, 64, 2, &[]).expect("ring");
+    ring.release(4242); // must not panic
+}

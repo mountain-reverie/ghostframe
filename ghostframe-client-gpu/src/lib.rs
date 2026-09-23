@@ -20,6 +20,7 @@ pub mod config;
 pub mod dirty;
 pub mod export;
 pub mod framebuffer;
+pub mod ring;
 pub mod wgpu_ctx;
 
 use thiserror::Error;
