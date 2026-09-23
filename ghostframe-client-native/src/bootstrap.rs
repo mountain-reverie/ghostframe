@@ -21,12 +21,28 @@ use crate::ClientError;
 /// Opens a plain HTTP/1.1 request over the `UnixStream` `dial_tcp` returns
 /// -- one GET, `Connection: close`, read to EOF. No HTTP client crate: this
 /// is the only request this library ever makes.
+/// Port of the server's plain-HTTP tailnet listener.
+///
+/// The cert hash is fetched here, NOT from the QUIC/WebTransport port. The
+/// `:443` listener speaks TLS -- it exists because browsers refuse
+/// WebTransport over anything else -- so a plaintext GET to it blocks
+/// forever: the server waits for a ClientHello while the client waits for a
+/// response, and neither times out. That was a silent hang that read like a
+/// network fault.
+///
+/// Both listeners are tsnet listeners, so traffic to either has already been
+/// encrypted and authenticated by WireGuard; the hash is a public
+/// fingerprint that grants nothing without the private key. See
+/// `newRedirectHandler` in `ghostbridge/web_server.go`, which serves
+/// `/config.json` directly on this port and redirects everything else.
+pub const CONFIG_HTTP_PORT: u16 = 80;
+
 pub fn fetch_cert_hash(
     bridge: &GhostbridgeHandle,
     host: &str,
-    port: u16,
+    _quic_port: u16,
 ) -> Result<[u8; 32], ClientError> {
-    let target = format!("{host}:{port}");
+    let target = format!("{host}:{CONFIG_HTTP_PORT}");
     let mut stream = bridge.dial_tcp(&target)?;
     // `dial_tcp`'s fd comes back non-blocking (ghostbridge sets it for the
     // tokio AsyncFd consumer this library does not use); flip it back to a
