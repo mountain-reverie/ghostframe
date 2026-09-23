@@ -45,6 +45,15 @@ jobs:
       # its dev-dependencies reach ghostframe-lib, which needs the ffmpeg dev
       # libraries only this workflow installs.
       - run: cargo test -p ghostframe-client-net
+      # Pure-logic targets only. The GPU-requiring targets in client-gpu
+      # (gpu_export, gpu_pipelines, gpu_oracle) are deliberately NOT named
+      # here: runners have no suitable device. They run on every developer
+      # machine via `cargo test -p ghostframe-client-gpu`, which is the
+      # point -- an #[ignore] would hide them locally too.
+      - run: cargo test -p ghostframe-client-gpu --lib --test coalesce --test dirty --test cdf53_passes
+      - run: cargo test -p ghostframe-client-native
+      - run: cargo test -p ghostframe-client-capi
+      - run: cargo build -p ghostframe-client-capi
       # The netsim harness suites. These live in separate integration test
       # targets, so neither `cargo test --workspace --lib` (lib targets only)
       # nor the named `--test` invocations above reach them — they were not
