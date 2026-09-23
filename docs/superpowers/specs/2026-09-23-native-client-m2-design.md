@@ -17,8 +17,9 @@ input that reaches the remote:
   gains the safe wrappers.
 - **B.** The `ghostframe` CLI: `login`, `logout`, `connect`.
 - **C.** The showcase window: fullscreen, 1:1, chorded quit and minimize.
-- **D.** The fence-export upgrade deferred from M1 §5.5 — **measured before
-  built**.
+- **D.** The fence-export upgrade deferred from M1 §5.5 — **measured, and
+  deferred again**: the `device.poll` stall is 1.93 ms worst case, 97 µs
+  steady-state median, against a 16.67 ms 60 Hz budget. See §5.
 
 C and D compose deliberately. The showcase is the first consumer that actually
 presents frames, so it is the first place `ExportRing::publish`'s blocking
@@ -201,23 +202,81 @@ This development machine has **no desktop session** (`loginctl` reports
 maps and a frame is presented, drive the quit chord, assert clean exit. A second
 headless stack for the X11 path is not worth it for ~150 lines.
 
-## 5. Fence export: measure, then decide
+## 5. Fence export: measured, and deferred
 
 `ExportRing::publish` blocks on `device.poll(PollType::wait_indefinitely())` and
 reports `acquire_fence_fd = -1`. M1 shipped that deliberately; the field exists
 so the upgrade is not an ABI break.
 
-**Measure first.** Once the showcase presents frames, instrument published-frame
-intervals and report p50/p99 over a 60-second 1080p session.
+### Measurement (Task 11, 2026-09-23)
 
-- **Clean at 60 Hz** — the upgrade stays deferred and M2 ends smaller. This is a
-  live possibility: the blit is ~8 MB and the stall may sit well inside a frame
-  budget.
-- **Visible stalls** — implement it:
-  `wgpu_hal::vulkan::Queue::add_signal_semaphore` on the blit submission,
-  exported with `vkGetSemaphoreFdKHR`, requiring `VK_KHR_external_semaphore_fd`.
-  The showcase then becomes the first consumer that actually waits on the fence,
-  which is also the only way to know the export side is correct.
+`ghostframe-e2e/tests/showcase.rs::measure_publish_frame_pacing` (`#[ignore]`d,
+run manually) drives the showcase window against a live server under headless
+Weston with the `--spinner` test pattern (a steady, real damage source — see
+the test's doc comment for why not `--solid-red`), and:
+
+- times `ExportRing::publish`'s `device.poll` call directly
+  (`ghostframe-client-gpu/src/ring.rs`, `tracing::debug!` on the
+  `ghostframe_client_gpu::ring` target, off by default), scraped back out via a
+  JSON tracing subscriber, and
+- times the interval between successive `on_frame_presented` calls from
+  `run_window_loop`.
+
+One run, 94 frames over 46.47s wall time:
+
+```
+frames presented:      94
+wall duration:         46.47 s
+inter-frame interval:  p50=500.87ms p99=507.69ms
+publish() poll stall:  n=94 p50=97µs p99=1.877ms max=1.934ms
+publish() poll stall, first 3 (full-surface blit): [1163, 417, 1934] us
+publish() poll stall, remaining 91 (partial blit): p50=97µs p99=624µs
+```
+
+The first 3 samples are the worst case this ring ever does: `n_export_buffers`
+(3) is unfilled at start, so each buffer's first fill forces a full
+`fb.width x fb.height` blit before `publish` polls. Every subsequent frame is
+the steady-state case: a small partial blit of whatever `--spinner`'s 64x64
+region touched. Both shapes are visible above, and both come in well under the
+60 Hz frame budget (16.67 ms): full-surface worst case is 1.934 ms (~11.6% of
+budget), steady state is 97 µs at the median and 624 µs at p99.
+
+**Caveats, stated plainly:**
+
+- **Weston headless is not a real compositor.** The *inter-frame interval*
+  numbers (~500ms) are shaped by `--spinner`'s content-change rate and this
+  synthetic compositor's own pacing, not by a genuine 60 Hz display — they say
+  nothing about the stall itself. The *interval's regularity* is still useful
+  signal though: p50 and p99 sit within 7ms of each other, i.e. the pipeline is
+  not janking, it is just slower than 60 Hz end-to-end for reasons upstream of
+  `publish` (capture/encode/network cadence, not investigated here — out of
+  scope for this measurement, which targets `publish` specifically).
+- **The `publish` stall number is not subject to that caveat.** It is
+  wall-clock time spent inside a real `device.poll` call on the render thread,
+  identical regardless of what (or whether) anything is on the other end of
+  the Wayland connection.
+- **Single run, one dev machine, RX 480 (Polaris/RADV).** Not a swept
+  distribution across hardware. The number is real but not exhaustively
+  validated.
+
+### Decision: deferred
+
+Both the worst case (1.934 ms, full-surface blit, happens 3 times per session
+at buffer-warm-up) and the steady-state p99 (624 µs) sit well under the ~2 ms
+threshold this section set out to check against, and far under the 16.67 ms
+60 Hz budget. The upgrade `wgpu_hal::vulkan::Queue::add_signal_semaphore` /
+`vkGetSemaphoreFdKHR` / `VK_KHR_external_semaphore_fd` described below stays
+**deferred** — there is no measured stall to remove. If a future hardware
+target or a much larger export surface changes this picture, re-run
+`measure_publish_frame_pacing` before reopening this decision; do not
+implement the fence on the strength of this doc's reasoning alone, re-measure
+first.
+
+**If a future measurement instead shows a visible stall**, the fix is:
+`wgpu_hal::vulkan::Queue::add_signal_semaphore` on the blit submission,
+exported with `vkGetSemaphoreFdKHR`, requiring `VK_KHR_external_semaphore_fd`.
+The showcase would then become the first consumer that actually waits on the
+fence, which is also the only way to know the export side is correct.
 
 Optimising a number nobody has measured is how a day disappears for no gain.
 
