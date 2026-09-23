@@ -468,6 +468,21 @@ and asserts pixels.
 **M2 -- CLI and showcase.** ghostbridge login/logout exports, tsnet wrappers, CLI,
 both window backends, quit chord. Deliverable: watch a real session.
 
+M2 also carries the synchronisation upgrade deferred from M1 (see 5.5).
+`ExportRing::publish` currently blocks on
+`device.poll(PollType::wait_indefinitely())` and reports
+`acquire_fence_fd = -1`. The upgrade is
+`wgpu_hal::vulkan::Queue::add_signal_semaphore` on the blit submission,
+exported with `vkGetSemaphoreFdKHR` (requires `VK_KHR_external_semaphore_fd`),
+yielding a real `sync_file` in `gf_frame.acquire_fence_fd`. The field exists
+already, so this is not an API break.
+
+It belongs in M2 specifically because the showcase is the first consumer that
+presents frames, and therefore the first point at which the stall can be
+*measured* rather than guessed at. Measure first: if the showcase paces cleanly
+at 60 Hz with the blocking version, the upgrade can stay deferred. If it does
+not, this per-frame stall is the first thing to remove.
+
 **M3 -- H.264.** VA-API decode, NV12 dual-plane import, `h264_nv12_blit.wgsl`,
 browser cross-check. Flip `supports_h264 = true`.
 

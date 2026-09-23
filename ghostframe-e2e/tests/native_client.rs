@@ -73,6 +73,21 @@ fn wait_for_frame(client: &mut Client, timeout: Duration) -> Option<PublishedFra
 
 #[tokio::test(flavor = "multi_thread")]
 async fn native_client_renders_the_test_pattern_into_an_exported_dmabuf() {
+    // Installed before setup, deliberately, so it covers container bring-up.
+    //
+    // An earlier round of debugging concluded that a subscriber here stalled
+    // `setup_e2e_server` (it failed 5/5 with it, passed once moved after).
+    // That was wrong. Bisected properly afterwards: the setup-only test
+    // passes with a stdout subscriber (41s) and without one (34s), and this
+    // test passes with the subscriber restored to this position. The stall
+    // was always the bootstrap bug -- a plaintext GET to the TLS port, then
+    // an EOF-framed read -- and the phase attribution was an artefact of
+    // cargo buffering the `[phase] containers up` marker away when `timeout`
+    // killed the run, which made a completed setup look stalled.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
     eprintln!("[phase] starting headscale + ghostframe-server containers");
     let setup = setup_e2e_server(E2eServerSpec {
         test_pattern_args: "--solid-red",
@@ -87,15 +102,6 @@ async fn native_client_renders_the_test_pattern_into_an_exported_dmabuf() {
     })
     .await
     .expect("bring up headscale + ghostframe server");
-
-    // Subscriber installed AFTER setup on purpose. With it installed first,
-    // this test stalled inside `setup_e2e_server` every time (5/5) while an
-    // otherwise-identical setup-only test passed in ~42s (see
-    // `harness_setup_alone_brings_up_a_tsnet_node`). That was the only
-    // difference between them.
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .try_init();
 
     // Reuse the tsnet node `setup_e2e_server` already joined, rather than
     // standing up a second one.
@@ -123,6 +129,8 @@ async fn native_client_renders_the_test_pattern_into_an_exported_dmabuf() {
         indices_raw: false,
         n_export_buffers: 3,
         preferred_modifiers: vec![],
+        // Diagnostic readback: this test asserts on dmabuf contents.
+        debug_map_frames: true,
     })
     .expect("create client");
     client.attach_bridge(setup._test_node.bridge());
@@ -301,6 +309,8 @@ async fn native_client_converges_at_production_scale_under_loss() {
         indices_raw: false,
         n_export_buffers: 3,
         preferred_modifiers: vec![],
+        // Diagnostic readback: this test asserts on dmabuf contents.
+        debug_map_frames: true,
     })
     .expect("create client");
     client.attach_bridge(setup._test_node.bridge());
@@ -438,9 +448,46 @@ async fn native_client_converges_at_production_scale_under_loss() {
 /// call with the same control URL and passes reliably. This test contains
 /// nothing but the setup, so a failure here is a harness problem and a pass
 /// here moves the fault back into the acceptance test.
+/// Install a subscriber per `GF_SUBSCRIBER`, for bisecting the stall.
+///
+/// `none` (default) installs nothing. `stdout` reproduces what the
+/// acceptance test originally did. `stderr` and `sink` vary only the
+/// writer, which is what discriminates "a subscriber exists" from "the
+/// subscriber writes to stdout".
+fn install_subscriber_variant() -> &'static str {
+    let which = std::env::var("GF_SUBSCRIBER").unwrap_or_else(|_| "none".into());
+    let filter = || tracing_subscriber::EnvFilter::from_default_env();
+    match which.as_str() {
+        "stdout" => {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter())
+                .with_writer(std::io::stdout)
+                .try_init();
+            "stdout"
+        }
+        "stderr" => {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter())
+                .with_writer(std::io::stderr)
+                .try_init();
+            "stderr"
+        }
+        "sink" => {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter())
+                .with_writer(std::io::sink)
+                .try_init();
+            "sink"
+        }
+        _ => "none",
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "diagnostic; requires Docker"]
 async fn harness_setup_alone_brings_up_a_tsnet_node() {
+    let variant = install_subscriber_variant();
+    eprintln!("[iso] subscriber variant: {variant}");
     eprintln!("[iso] calling setup_e2e_server");
     let started = Instant::now();
     let setup = setup_e2e_server(E2eServerSpec {

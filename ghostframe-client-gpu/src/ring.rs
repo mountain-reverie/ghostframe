@@ -89,6 +89,7 @@ pub struct ExportRing {
     /// Kept so [`ExportRing::resize`] can reallocate with the same
     /// consumer preference the ring was constructed with.
     preferred_modifiers: Vec<u64>,
+    host_visible: bool,
 }
 
 impl ExportRing {
@@ -98,10 +99,17 @@ impl ExportRing {
         height: u32,
         count: usize,
         preferred_modifiers: &[u64],
+        // `host_visible`: allocate export buffers in CPU-mappable memory so
+        // `ExportedImage::map_read` works. Diagnostic only -- production
+        // passes false, because demanding host visibility can pin every
+        // export to a small BAR aperture (256 MiB here, against 7.75 GiB of
+        // CPU-invisible VRAM) for a readback a real consumer never performs.
+        host_visible: bool,
     ) -> Result<Self, GpuError> {
         let mut buffers = Vec::with_capacity(count);
         for _ in 0..count {
-            let exported = ExportedImage::new(ctx, width, height, preferred_modifiers)?;
+            let exported =
+                ExportedImage::new(ctx, width, height, preferred_modifiers, host_visible)?;
             let texture = exported.as_wgpu_texture(&ctx.device)?;
             buffers.push(ExportBuffer {
                 exported,
@@ -121,6 +129,7 @@ impl ExportRing {
             width,
             height,
             preferred_modifiers: preferred_modifiers.to_vec(),
+            host_visible,
         })
     }
 
@@ -251,7 +260,13 @@ impl ExportRing {
 
         let mut new_buffers = Vec::with_capacity(count);
         for _ in 0..count {
-            let exported = ExportedImage::new(ctx, width, height, &self.preferred_modifiers)?;
+            let exported = ExportedImage::new(
+                ctx,
+                width,
+                height,
+                &self.preferred_modifiers,
+                self.host_visible,
+            )?;
             let texture = exported.as_wgpu_texture(&ctx.device)?;
             new_buffers.push(ExportBuffer {
                 exported,

@@ -13,6 +13,7 @@ fn client_drop_without_connect_is_clean() {
         indices_raw: false,
         n_export_buffers: 3,
         preferred_modifiers: vec![],
+        debug_map_frames: false,
     };
     match Client::new(cfg) {
         Ok(c) => drop(c),

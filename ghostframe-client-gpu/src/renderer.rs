@@ -57,12 +57,22 @@ impl Renderer {
         height: u32,
         export_buffers: usize,
         preferred_modifiers: &[u64],
+        // Diagnostic-only: makes `debug_map_frame` possible at the cost of
+        // pinning exports to CPU-visible memory. Production passes false.
+        host_visible: bool,
     ) -> Result<Self, GpuError> {
         if export_buffers == 0 {
             return Err(GpuError::NoExportBuffers);
         }
         let fb = Framebuffer::new(&ctx.device, width, height);
-        let ring = ExportRing::new(ctx, width, height, export_buffers, preferred_modifiers)?;
+        let ring = ExportRing::new(
+            ctx,
+            width,
+            height,
+            export_buffers,
+            preferred_modifiers,
+            host_visible,
+        )?;
 
         let mut solid = SolidPipeline::new(&ctx.device);
         solid.set_canvas_size(&ctx.device, &ctx.queue, width, height);
