@@ -6,6 +6,7 @@
 //! rather than equalised.
 
 pub mod wayland;
+pub mod x11;
 
 use std::os::fd::RawFd;
 
@@ -81,6 +82,10 @@ pub enum WindowError {
     /// or a protocol-level error.
     #[error("wayland: {0}")]
     Wayland(String),
+    /// The X11 backend failed -- connecting, a required extension (DRI3,
+    /// Present, XKB) missing, or a protocol-level error.
+    #[error("x11: {0}")]
+    X11(String),
     /// A local I/O failure (fd setup, dmabuf import, ...).
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
@@ -117,12 +122,7 @@ pub fn open(title: &str) -> Result<Box<dyn Backend>, WindowError> {
 
     match select_backend(wayland_display.as_deref(), display.as_deref())? {
         Selected::Wayland => Ok(Box::new(wayland::WaylandBackend::open(title)?)),
-        // X11 lands in M2 Task 8. Left as an explicit error rather than a
-        // stub `Backend` impl, so a caller can't mistake "compiles" for
-        // "works".
-        Selected::X11 => Err(WindowError::Unsupported(
-            "DISPLAY is set but the X11 backend is not implemented yet (M2 task 8)".to_string(),
-        )),
+        Selected::X11 => Ok(Box::new(x11::X11Backend::open(title)?)),
     }
 }
 

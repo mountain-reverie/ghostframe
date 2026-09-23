@@ -15,8 +15,11 @@ path = "src/main.rs"
 ghostframe-client-native = { path = "../ghostframe-client-native" }
 ghostframe-tsnet = { path = "../ghostframe-tsnet" }
 clap = { workspace = true }
+libc = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 smithay-client-toolkit = { version = "0.21", features = ["xkbcommon"] }
 wayland-client = "0.31"
+x11rb = { version = "0.13", features = ["dri3", "present", "xfixes", "allow-unsafe-code"] }
+xkbcommon = { version = "0.8", features = ["x11"] }
