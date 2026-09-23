@@ -66,10 +66,16 @@ fn map_client_error(e: &ClientError) -> gf_result {
     match e {
         ClientError::Gpu(_) => gf_result::GF_ERR_GPU,
         ClientError::Connect(_) => gf_result::GF_ERR_STATE,
+        // `DebugMap` is test/diagnostic-only (`Client::debug_map_frame` is
+        // not exposed through this C ABI at all), but the match must stay
+        // exhaustive -- grouped with the other I/O-flavored failures rather
+        // than given its own `gf_result` variant nothing would ever produce
+        // through this surface.
         ClientError::Bridge(_)
         | ClientError::Io(_)
         | ClientError::Bootstrap(_)
-        | ClientError::Net(_) => gf_result::GF_ERR_IO,
+        | ClientError::Net(_)
+        | ClientError::DebugMap(_) => gf_result::GF_ERR_IO,
     }
 }
 

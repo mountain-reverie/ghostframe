@@ -61,6 +61,11 @@ pub enum ClientError {
     /// makes connecting impossible (already connected, unresolvable host).
     #[error("connect: {0}")]
     Connect(String),
+    /// [`Client::debug_map_frame`] failed: not connected, an unknown
+    /// `buffer_id`, the render thread did not reply within its timeout, or
+    /// the dmabuf mmap itself failed.
+    #[error("debug_map_frame: {0}")]
+    DebugMap(String),
 }
 
 /// Configuration for a [`Client`]. Mirrors `gf_client_config` in the C API
@@ -84,6 +89,21 @@ pub struct Config {
     /// `ExportRing::new`.
     pub preferred_modifiers: Vec<u64>,
 }
+
+/// A published frame's exported dmabuf, mapped and copied out as plain
+/// bytes. Test and diagnostic use only -- see [`Client::debug_map_frame`].
+pub struct DebugFrameBytes {
+    pub bytes: Vec<u8>,
+    pub stride: u64,
+    pub offset: u64,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// How long [`Client::debug_map_frame`] waits for the render thread to
+/// reply before giving up. A wedged render thread (GPU hang, deadlock)
+/// should fail the caller with a clear message rather than hang forever.
+const DEBUG_MAP_FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// An embeddable ghostframe session: tailnet transport, QUIC/WebTransport,
 /// GPU decode and export, driven by two background threads (see
@@ -174,11 +194,22 @@ impl Client {
             .parse()
             .unwrap_or_else(|_| SocketAddr::from(([192, 0, 2, 1], port)));
 
+        // `TS_CONTROL_URL` mirrors `ghostframe-xdaemon`'s own
+        // `env::var("TS_CONTROL_URL").unwrap_or_default()` (see
+        // `ghostframe-xdaemon/src/main.rs`): unset means "join the real
+        // Tailscale network" (ghostbridge's `gbridge_new` treats an empty
+        // string as "use tsnet's default `ControlURL`"), set means "join
+        // this custom control plane instead" -- e.g. the e2e harness's
+        // headscale. There is deliberately no `Config` field for this: a
+        // production embedder always wants the real tailnet, and the one
+        // consumer that doesn't (this crate's own e2e test) is exactly the
+        // kind of test-only override an env var is for.
+        let control_url = std::env::var("TS_CONTROL_URL").unwrap_or_default();
         let bridge = GhostbridgeHandle::connect(&GhostbridgeConfig {
             hostname: self.config.hostname.clone(),
             authkey: self.config.authkey.clone(),
             state_dir: self.config.state_dir.to_string_lossy().into_owned(),
-            control_url: String::new(),
+            control_url,
         })?;
         bridge.up()?;
 
@@ -329,6 +360,33 @@ impl Client {
         if let Some(tx) = &self.render_tx {
             let _ = tx.send(RenderMsg::Release(frame_id));
         }
+    }
+
+    /// Map a published frame's dmabuf and copy its bytes out, together with
+    /// the plane stride and offset needed to index them.
+    ///
+    /// Test and diagnostic use only. Round-trips a request to the render
+    /// thread, which owns the `Renderer`; `ExportedImage::map_read` is a CPU
+    /// mmap with explicit DMA_BUF_IOCTL_SYNC rather than a second Vulkan
+    /// import, because cross-device PRIME import returns stale bytes on this
+    /// hardware and previously read as a decode bug.
+    pub fn debug_map_frame(&self, frame: &PublishedFrame) -> Result<DebugFrameBytes, ClientError> {
+        let tx = self
+            .render_tx
+            .as_ref()
+            .ok_or_else(|| ClientError::DebugMap("not connected".into()))?;
+        let (reply_tx, reply_rx) = mpsc::channel();
+        tx.send(RenderMsg::DebugMapFrame(frame.buffer_id, reply_tx))
+            .map_err(|_| ClientError::DebugMap("render thread is not running".into()))?;
+        reply_rx
+            .recv_timeout(DEBUG_MAP_FRAME_TIMEOUT)
+            .map_err(|_| {
+                ClientError::DebugMap(format!(
+                    "render thread did not reply within {DEBUG_MAP_FRAME_TIMEOUT:?} \
+                     (wedged render thread?)"
+                ))
+            })?
+            .map_err(ClientError::DebugMap)
     }
 
     fn send_input(&mut self, bytes: Vec<u8>) {
