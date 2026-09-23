@@ -92,6 +92,18 @@ pub struct Config {
     /// means "linear only" (`DRM_FORMAT_MOD_LINEAR`). Passed straight to
     /// `ExportRing::new`.
     pub preferred_modifiers: Vec<u64>,
+    /// Allocate export buffers in CPU-mappable memory so
+    /// [`Client::debug_map_frame`] can read pixels back.
+    ///
+    /// **Leave this `false` in production.** A consumer imports the dmabuf
+    /// into its own GPU and never touches it with the CPU, and demanding
+    /// host visibility can pin every export to a small BAR aperture -- on
+    /// the development hardware that is 256 MiB, against 7.75 GiB of
+    /// CPU-invisible VRAM. It also risks tests and production landing in
+    /// different memory types, which is how a bug becomes unreproducible.
+    ///
+    /// `debug_map_frame` returns an error when this is `false`.
+    pub debug_map_frames: bool,
 }
 
 /// A published frame's exported dmabuf, mapped and copied out as plain
@@ -301,6 +313,7 @@ impl Client {
         let published = Arc::clone(&self.published);
         let export_buffers = self.config.n_export_buffers;
         let preferred_modifiers = self.config.preferred_modifiers.clone();
+        let host_visible = self.config.debug_map_frames;
         let render_handle = std::thread::Builder::new()
             .name("gf-render".into())
             .spawn(move || {
@@ -310,6 +323,7 @@ impl Client {
                     render_queue,
                     published,
                     export_buffers,
+                    host_visible,
                     preferred_modifiers,
                 )
             })
@@ -419,6 +433,17 @@ impl Client {
     /// import, because cross-device PRIME import returns stale bytes on this
     /// hardware and previously read as a decode bug.
     pub fn debug_map_frame(&self, frame: &PublishedFrame) -> Result<DebugFrameBytes, ClientError> {
+        // Fail with the reason rather than with a bare mmap EPERM from deep
+        // inside the render thread. Without host-visible export memory the
+        // buffer simply cannot be mapped, and that errno points nowhere
+        // near the missing config flag.
+        if !self.config.debug_map_frames {
+            return Err(ClientError::DebugMap(
+                "Config::debug_map_frames is false, so export buffers were allocated in \
+                 device-local memory the CPU cannot map; set it to true for diagnostics"
+                    .into(),
+            ));
+        }
         let tx = self
             .render_tx
             .as_ref()

@@ -83,6 +83,7 @@ fn handle_core_event(
     ev: CoreEvent,
     queue: &EventQueue,
     export_buffers: usize,
+    host_visible: bool,
     preferred_modifiers: &[u64],
 ) -> bool {
     if renderer.is_none() {
@@ -94,7 +95,14 @@ fn handle_core_event(
             );
             return false;
         };
-        match Renderer::new(ctx, *width, *height, export_buffers, preferred_modifiers) {
+        match Renderer::new(
+            ctx,
+            *width,
+            *height,
+            export_buffers,
+            preferred_modifiers,
+            host_visible,
+        ) {
             Ok(r) => *renderer = Some(r),
             Err(e) => {
                 queue.push(ClientEvent::Error {
@@ -120,6 +128,7 @@ pub(crate) fn run(
     queue: Arc<EventQueue>,
     published: Arc<Mutex<Option<PublishedFrame>>>,
     export_buffers: u32,
+    host_visible: bool,
     preferred_modifiers: Vec<u64>,
 ) {
     let mut renderer: Option<Renderer> = None;
@@ -153,6 +162,7 @@ pub(crate) fn run(
                     ev,
                     &queue,
                     export_buffers,
+                    host_visible,
                     &preferred_modifiers,
                 );
             }
@@ -182,6 +192,7 @@ pub(crate) fn run(
                         ev,
                         &queue,
                         export_buffers,
+                        host_visible,
                         &preferred_modifiers,
                     );
                 }

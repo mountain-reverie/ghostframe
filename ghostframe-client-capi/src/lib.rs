@@ -156,6 +156,10 @@ pub unsafe extern "C" fn gf_client_create(
             indices_raw: cfg.indices_raw,
             n_export_buffers: cfg.n_export_buffers,
             preferred_modifiers,
+            // The C ABI never exposes debug_map_frame, so a C consumer has
+            // no use for CPU-mappable exports -- and paying for them would
+            // pin every buffer to a small BAR aperture.
+            debug_map_frames: false,
         };
 
         let client = match Client::new(config) {

@@ -165,17 +165,46 @@ impl ExportedImage {
     /// `preferred` is the consumer's modifier list, most-preferred first.
     /// Empty means "library picks", which prefers `DRM_FORMAT_MOD_LINEAR`
     /// because it is the one every consumer can import.
+    /// `host_visible` asks for memory the CPU can `mmap`, which
+    /// [`ExportedImage::map_read`] needs.
+    ///
+    /// **Production should pass `false`.** A consumer imports the dmabuf
+    /// into its own GPU and never touches it with the CPU, and demanding
+    /// host visibility can cost real memory: on this hardware the
+    /// host-visible VRAM heap is the 256 MiB PCI BAR aperture, against 7.75
+    /// GiB of CPU-invisible VRAM. Constraining every export to the small
+    /// heap so that a test-only readback works is the wrong trade for a
+    /// library, and it also risks tests and production landing in different
+    /// memory types -- the kind of divergence that makes a bug
+    /// unreproducible.
     pub fn new(
         ctx: &WgpuContext,
         width: u32,
         height: u32,
         preferred: &[u64],
+        host_visible: bool,
     ) -> Result<Self, GpuError> {
         ctx.with_raw(|instance, device, phys| {
             if ctx.explicit_modifiers {
-                Self::create_explicit(instance, device, phys, width, height, preferred)
+                Self::create_explicit(
+                    host_visible,
+                    instance,
+                    device,
+                    phys,
+                    width,
+                    height,
+                    preferred,
+                )
             } else {
-                Self::create_linear(instance, device, phys, width, height, preferred)
+                Self::create_linear(
+                    host_visible,
+                    instance,
+                    device,
+                    phys,
+                    width,
+                    height,
+                    preferred,
+                )
             }
         })
         .ok_or_else(|| GpuError::Vulkan("wgpu is not running on the Vulkan backend".to_string()))?
@@ -335,6 +364,7 @@ impl ExportedImage {
     }
 
     fn create_linear(
+        host_visible: bool,
         instance: &ash::Instance,
         device: &ash::Device,
         phys: vk::PhysicalDevice,
@@ -383,6 +413,7 @@ impl ExportedImage {
             .map_err(|e| GpuError::Vulkan(format!("create_image (linear): {e}")))?;
 
         Self::finish_export(
+            host_visible,
             instance,
             device,
             phys,
@@ -395,6 +426,7 @@ impl ExportedImage {
     }
 
     fn create_explicit(
+        host_visible: bool,
         instance: &ash::Instance,
         device: &ash::Device,
         phys: vk::PhysicalDevice,
@@ -473,6 +505,7 @@ impl ExportedImage {
         }
 
         Self::finish_export(
+            host_visible,
             instance,
             device,
             phys,
@@ -518,6 +551,7 @@ impl ExportedImage {
     /// never leak a partially-constructed export on the error path.
     #[allow(clippy::too_many_arguments)]
     fn finish_export(
+        host_visible: bool,
         instance: &ash::Instance,
         device: &ash::Device,
         phys: vk::PhysicalDevice,
@@ -528,6 +562,7 @@ impl ExportedImage {
         aspect_mask: vk::ImageAspectFlags,
     ) -> Result<Self, GpuError> {
         match Self::finish_export_inner(
+            host_visible,
             instance,
             device,
             phys,
@@ -549,6 +584,7 @@ impl ExportedImage {
 
     #[allow(clippy::too_many_arguments)]
     fn finish_export_inner(
+        host_visible: bool,
         instance: &ash::Instance,
         device: &ash::Device,
         phys: vk::PhysicalDevice,
@@ -577,15 +613,16 @@ impl ExportedImage {
         // still degrades to CPU-invisible memory if a device has no visible
         // heap; `map_read` is documented test/diagnostic-only, so that
         // degraded path just gives up CPU verification, not correctness.
-        let mem_type_index = Self::find_memory_type_index(
-            instance,
-            phys,
-            mem_req.memory_type_bits,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL | vk::MemoryPropertyFlags::HOST_VISIBLE,
-        )
-        .ok_or_else(|| {
-            GpuError::Vulkan("no memory type supports this exportable image".to_string())
-        })?;
+        let preferred_flags = if host_visible {
+            vk::MemoryPropertyFlags::DEVICE_LOCAL | vk::MemoryPropertyFlags::HOST_VISIBLE
+        } else {
+            vk::MemoryPropertyFlags::DEVICE_LOCAL
+        };
+        let mem_type_index =
+            Self::find_memory_type_index(instance, phys, mem_req.memory_type_bits, preferred_flags)
+                .ok_or_else(|| {
+                    GpuError::Vulkan("no memory type supports this exportable image".to_string())
+                })?;
 
         let mut export_alloc_info = vk::ExportMemoryAllocateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);

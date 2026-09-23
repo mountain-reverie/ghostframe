@@ -69,7 +69,7 @@ use ghostframe_client_gpu::export::ExportedImage;
 #[test]
 fn exported_image_yields_a_usable_dmabuf_fd_and_layout() {
     let ctx = WgpuContext::new().expect("wgpu context");
-    let img = ExportedImage::new(&ctx, 256, 128, &[]).expect("export image");
+    let img = ExportedImage::new(&ctx, 256, 128, &[], true).expect("export image");
 
     assert_eq!(img.width, 256);
     assert_eq!(img.height, 128);
@@ -96,7 +96,7 @@ fn exported_image_yields_a_usable_dmabuf_fd_and_layout() {
 fn unsatisfiable_modifier_preference_fails_loudly() {
     let ctx = WgpuContext::new().expect("wgpu context");
     // A reserved-invalid modifier no device supports.
-    let err = ExportedImage::new(&ctx, 64, 64, &[0x00ff_ffff_ffff_fffe]);
+    let err = ExportedImage::new(&ctx, 64, 64, &[0x00ff_ffff_ffff_fffe], true);
     assert!(
         matches!(
             err,
@@ -111,7 +111,7 @@ fn exported_fd_is_a_real_dmabuf() {
     // A plausible fd number proves nothing -- verify the kernel agrees it
     // is a dma_buf, or a bug that returns some other fd passes silently.
     let ctx = WgpuContext::new().expect("wgpu context");
-    let img = ExportedImage::new(&ctx, 64, 64, &[]).expect("export image");
+    let img = ExportedImage::new(&ctx, 64, 64, &[], true).expect("export image");
     let link = std::fs::read_link(format!("/proc/self/fd/{}", img.raw_fd()))
         .expect("read /proc/self/fd link");
     assert!(
@@ -123,7 +123,7 @@ fn exported_fd_is_a_real_dmabuf() {
 #[test]
 fn exported_image_can_be_wrapped_as_a_wgpu_texture() {
     let ctx = WgpuContext::new().expect("wgpu context");
-    let img = ExportedImage::new(&ctx, 64, 64, &[]).expect("export image");
+    let img = ExportedImage::new(&ctx, 64, 64, &[], true).expect("export image");
     let tex = img
         .as_wgpu_texture(&ctx.device)
         .expect("wrap as wgpu texture");
@@ -144,7 +144,7 @@ fn framebuffer_blits_into_the_exported_dmabuf() {
     // channel-order mistake: R, G and B all differ.
     fb.debug_fill(&ctx.device, &ctx.queue, [0x11, 0x22, 0x33, 0xFF]);
 
-    let img = ExportedImage::new(&ctx, 64, 64, &[]).expect("export image");
+    let img = ExportedImage::new(&ctx, 64, 64, &[], true).expect("export image");
     let tex = img.as_wgpu_texture(&ctx.device).expect("wrap");
     fb.blit_full(&ctx.device, &ctx.queue, &tex);
     ctx.device
@@ -195,7 +195,7 @@ use ghostframe_client_gpu::ring::ExportRing;
 fn ring_partial_update_preserves_untouched_regions() {
     let ctx = WgpuContext::new().expect("wgpu context");
     let mut fb = Framebuffer::new(&ctx.device, 64, 64);
-    let mut ring = ExportRing::new(&ctx, 64, 64, 3, &[]).expect("ring");
+    let mut ring = ExportRing::new(&ctx, 64, 64, 3, &[], true).expect("ring");
 
     // Frame 1: whole surface red, into buffer A.
     fb.debug_fill(&ctx.device, &ctx.queue, [0xFF, 0x00, 0x00, 0xFF]);
@@ -251,7 +251,7 @@ fn ring_partial_update_preserves_untouched_regions() {
 fn publish_returns_none_when_every_buffer_is_held() {
     let ctx = WgpuContext::new().expect("wgpu context");
     let fb = Framebuffer::new(&ctx.device, 64, 64);
-    let mut ring = ExportRing::new(&ctx, 64, 64, 2, &[]).expect("ring");
+    let mut ring = ExportRing::new(&ctx, 64, 64, 2, &[], true).expect("ring");
     ring.mark_dirty_all();
     assert!(ring.publish(&ctx.device, &ctx.queue, &fb).is_some());
     ring.mark_dirty_all();
@@ -265,7 +265,7 @@ fn publish_returns_none_when_every_buffer_is_held() {
 fn released_buffers_are_recycled() {
     let ctx = WgpuContext::new().expect("wgpu context");
     let fb = Framebuffer::new(&ctx.device, 64, 64);
-    let mut ring = ExportRing::new(&ctx, 64, 64, 2, &[]).expect("ring");
+    let mut ring = ExportRing::new(&ctx, 64, 64, 2, &[], true).expect("ring");
     ring.mark_dirty_all();
     let a = ring.publish(&ctx.device, &ctx.queue, &fb).expect("a");
     ring.mark_dirty_all();
@@ -280,7 +280,7 @@ fn released_buffers_are_recycled() {
 #[test]
 fn releasing_an_unknown_frame_id_is_ignored() {
     let ctx = WgpuContext::new().expect("wgpu context");
-    let mut ring = ExportRing::new(&ctx, 64, 64, 2, &[]).expect("ring");
+    let mut ring = ExportRing::new(&ctx, 64, 64, 2, &[], true).expect("ring");
     ring.release(4242); // must not panic
 }
 
@@ -296,7 +296,7 @@ fn recycled_buffer_receives_only_its_damage_and_keeps_the_rest() {
     // therefore takes the `union_since(Some(gen)) -> coalesce` branch.
     let ctx = WgpuContext::new().expect("wgpu context");
     let mut fb = Framebuffer::new(&ctx.device, 64, 64);
-    let mut ring = ExportRing::new(&ctx, 64, 64, 1, &[]).expect("ring");
+    let mut ring = ExportRing::new(&ctx, 64, 64, 1, &[], true).expect("ring");
 
     // Frame 1: whole surface red, full blit into the only buffer.
     fb.debug_fill(&ctx.device, &ctx.queue, [0xFF, 0x00, 0x00, 0xFF]);
