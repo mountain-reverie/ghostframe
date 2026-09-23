@@ -72,20 +72,29 @@ fn wait_for_frame(client: &mut Client, timeout: Duration) -> Option<PublishedFra
 
 #[tokio::test(flavor = "multi_thread")]
 async fn native_client_renders_the_test_pattern_into_an_exported_dmabuf() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .try_init();
-
     eprintln!("[phase] starting headscale + ghostframe-server containers");
     let setup = setup_e2e_server(E2eServerSpec {
         test_pattern_args: "--solid-red",
         extra_env: &[],
+        // The GPU under test is the CLIENT's. Leaving the server on its CPU
+        // capture path keeps this test off the host's VKMS setup. (Tried
+        // `true` while bisecting the stall; it made no difference, and the
+        // cause was elsewhere.)
         gpu: false,
         webgpu: false,
         url_query_extra: "",
     })
     .await
     .expect("bring up headscale + ghostframe server");
+
+    // Subscriber installed AFTER setup on purpose. With it installed first,
+    // this test stalled inside `setup_e2e_server` every time (5/5) while an
+    // otherwise-identical setup-only test passed in ~42s (see
+    // `harness_setup_alone_brings_up_a_tsnet_node`). That was the only
+    // difference between them.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
 
     // Reuse the tsnet node `setup_e2e_server` already joined, rather than
     // standing up a second one.
@@ -192,4 +201,33 @@ async fn native_client_renders_the_test_pattern_into_an_exported_dmabuf() {
 
     client.release_frame(frame.frame_id);
     client.disconnect().expect("disconnect");
+}
+
+/// Isolation: does `setup_e2e_server` alone bring a host-side tsnet node up?
+///
+/// The acceptance test above stalls inside `setup_e2e_server`, at the
+/// harness's own `TestNode::join` -> `server.Up()`, before any client code
+/// runs. `harness_smoke` (which goes through `run_scene`) makes the same
+/// call with the same control URL and passes reliably. This test contains
+/// nothing but the setup, so a failure here is a harness problem and a pass
+/// here moves the fault back into the acceptance test.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "diagnostic; requires Docker"]
+async fn harness_setup_alone_brings_up_a_tsnet_node() {
+    eprintln!("[iso] calling setup_e2e_server");
+    let started = Instant::now();
+    let setup = setup_e2e_server(E2eServerSpec {
+        test_pattern_args: "--solid-red",
+        extra_env: &[],
+        gpu: true,
+        webgpu: false,
+        url_query_extra: "",
+    })
+    .await
+    .expect("setup_e2e_server");
+    eprintln!(
+        "[iso] setup returned after {:?}; server={}",
+        started.elapsed(),
+        setup.server_container_name
+    );
 }

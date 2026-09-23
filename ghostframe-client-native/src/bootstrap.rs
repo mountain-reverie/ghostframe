@@ -37,6 +37,13 @@ use crate::ClientError;
 /// `/config.json` directly on this port and redirects everything else.
 pub const CONFIG_HTTP_PORT: u16 = 80;
 
+/// How long the one-shot cert-hash fetch may take before giving up.
+///
+/// Generous for a handful of bytes over a tailnet, but finite: this runs
+/// inside `Client::connect`, so a hang here stalls the caller with no
+/// diagnostic at all.
+pub const CONFIG_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 pub fn fetch_cert_hash(
     bridge: &GhostbridgeHandle,
     host: &str,
@@ -50,11 +57,25 @@ pub fn fetch_cert_hash(
     // looping on WouldBlock for a handful of small reads/writes.
     stream.set_nonblocking(false)?;
 
+    // Bound the exchange. Without these, a dial that never establishes -- or
+    // a peer that accepts and then says nothing -- leaves `read_to_end`
+    // blocked forever inside `connect()`, which is upstream of every
+    // caller's own timeout. That produced multi-minute silent stalls that
+    // read like a network fault instead of a failed fetch.
+    stream.set_read_timeout(Some(CONFIG_FETCH_TIMEOUT))?;
+    stream.set_write_timeout(Some(CONFIG_FETCH_TIMEOUT))?;
+
     let request = format!("GET /config.json HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     stream.write_all(request.as_bytes())?;
 
     let mut buf = Vec::new();
-    stream.read_to_end(&mut buf)?;
+    stream.read_to_end(&mut buf).map_err(|e| {
+        ClientError::Bootstrap(format!(
+            "reading http://{host}:{CONFIG_HTTP_PORT}/config.json failed after \
+             {CONFIG_FETCH_TIMEOUT:?}: {e} (got {} bytes)",
+            buf.len()
+        ))
+    })?;
 
     let split_at = find_subslice(&buf, b"\r\n\r\n").ok_or_else(|| {
         ClientError::Bootstrap("malformed HTTP response: no header/body separator".into())
