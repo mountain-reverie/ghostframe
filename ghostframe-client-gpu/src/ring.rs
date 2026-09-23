@@ -216,9 +216,25 @@ impl ExportRing {
         // real fence. wgpu-hal 30 *can* signal an exportable semaphore via
         // `Queue::add_signal_semaphore`, so this is a deliberate deferral,
         // not a limitation -- not implemented here.
+        //
+        // Timed at `debug` level so M2's pacing measurement (design doc §5)
+        // can isolate this stall from everything else `publish` does,
+        // without adding an unconditional cost to the hot path -- off by
+        // default, on with `RUST_LOG=ghostframe_client_gpu::ring=debug`.
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "measuring a real GPU stall for M2 §5's pacing decision, not a virtual-clock path"
+        )]
+        let poll_start = std::time::Instant::now();
         device
             .poll(wgpu::PollType::wait_indefinitely())
             .expect("poll after export publish");
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "measuring a real GPU stall for M2 §5's pacing decision, not a virtual-clock path"
+        )]
+        let poll_us = poll_start.elapsed().as_micros() as u64;
+        tracing::debug!(poll_us, "publish: device.poll stall");
 
         let frame_id = self.next_frame_id;
         self.next_frame_id = self.next_frame_id.wrapping_add(1);
