@@ -1,4 +1,4 @@
-import solidWgsl from './shaders/solid.wgsl?raw';
+import solidWgsl from '../../../shaders/client/solid.wgsl?raw';
 import { createLabeledShaderModule } from './shader_module';
 
 export interface SolidTile {

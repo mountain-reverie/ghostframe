@@ -1,4 +1,4 @@
-import presentBlitWgsl from './shaders/present_blit.wgsl?raw';
+import presentBlitWgsl from '../../../shaders/client/present_blit.wgsl?raw';
 import { createLabeledShaderModule } from './shader_module';
 
 export class Framebuffer {

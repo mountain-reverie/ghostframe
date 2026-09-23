@@ -15,7 +15,7 @@
  *      from finishAssembly / the rAF tick as needed.
  */
 
-import debugGradientWgsl from './webgpu/shaders/debug_gradient.wgsl?raw';
+import debugGradientWgsl from '../../shaders/client/debug_gradient.wgsl?raw';
 import { createLabeledShaderModule } from './webgpu/shader_module';
 import { frameRgba as losslessGoldenFrameRgba } from './lossless_golden';
 
