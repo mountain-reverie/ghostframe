@@ -15,7 +15,9 @@
 //! `#[allow]` with a reason, so every exception is a decision on the record.
 #![cfg_attr(not(test), warn(clippy::wildcard_enum_match_arm))]
 
+pub mod coalesce;
 pub mod config;
+pub mod dirty;
 pub mod export;
 pub mod framebuffer;
 pub mod wgpu_ctx;
