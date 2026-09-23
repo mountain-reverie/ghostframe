@@ -1,7 +1,9 @@
 //! Real-WGSL pipeline tests. Requires a GPU; NOT named in any CI workflow.
 
 use ghostframe_client_gpu::{
-    framebuffer::Framebuffer, pipelines::solid::SolidPipeline, wgpu_ctx::WgpuContext,
+    framebuffer::Framebuffer,
+    pipelines::{palrle::PalRlePipeline, solid::SolidPipeline},
+    wgpu_ctx::WgpuContext,
 };
 
 fn px(fb_bytes: &[u8], fb_w: u32, x: u32, y: u32) -> [u8; 4] {
@@ -143,4 +145,179 @@ fn raw_tile_shorter_than_a_full_tile_uploads_only_its_rows() {
     assert_eq!(px(&b, 64, 31, 1), [0x30, 0x20, 0x10, 0xFF]);
     // Row 2 was not covered by the payload and must be untouched.
     assert_eq!(px(&b, 64, 0, 2), [0, 0, 0, 0xFF], "wrote past the payload");
+}
+
+#[test]
+fn palrle_decodes_low_nibble_first_against_the_palette() {
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let mut fb = Framebuffer::new(&ctx.device, 64, 64);
+    fb.debug_fill(&ctx.device, &ctx.queue, [0, 0, 0, 0xFF]);
+
+    let mut pipe = PalRlePipeline::new(&ctx.device);
+
+    // Palette 3: slot 0 blue-ish, slot 1 red-ish. Colours are BGRA.
+    let mut palette = [[0u8; 4]; 16];
+    palette[0] = [0xC0, 0x10, 0x20, 0xFF]; // B=C0 G=10 R=20
+    palette[1] = [0x20, 0x10, 0xC0, 0xFF]; // B=20 G=10 R=C0
+    pipe.upload_palette(&ctx.queue, 3, &palette);
+
+    // 512 bytes, two 4-bit indices per byte, LOW NIBBLE FIRST.
+    // 0x10 => pixel 0 -> slot 0, pixel 1 -> slot 1.
+    let indices = vec![0x10u8; 512];
+    pipe.decode(
+        &ctx.device,
+        &ctx.queue,
+        &fb,
+        &[(0u8, 0u8, 3u8, 2u8, indices)],
+    );
+    ctx.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+
+    let b = fb.debug_read(&ctx.device, &ctx.queue);
+    // Pixel 0 -> slot 0 -> RGBA 0x20,0x10,0xC0
+    assert_eq!(
+        px(&b, 64, 0, 0),
+        [0x20, 0x10, 0xC0, 0xFF],
+        "pixel 0 wrong (nibble order or swizzle)"
+    );
+    // Pixel 1 -> slot 1 -> RGBA 0xC0,0x10,0x20
+    assert_eq!(
+        px(&b, 64, 1, 0),
+        [0xC0, 0x10, 0x20, 0xFF],
+        "pixel 1 wrong (nibble order)"
+    );
+}
+
+#[test]
+fn palrle_covers_the_whole_tile_including_the_far_corner() {
+    // The 2x2 workgroup arrangement means a wg.y/wg.z mix-up still paints
+    // the top-left quadrant correctly. Check the far corner, which only
+    // the (1,1) sub-workgroup reaches.
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let mut fb = Framebuffer::new(&ctx.device, 64, 64);
+    fb.debug_fill(&ctx.device, &ctx.queue, [0, 0, 0, 0xFF]);
+    let mut pipe = PalRlePipeline::new(&ctx.device);
+    let mut palette = [[0u8; 4]; 16];
+    palette[0] = [0x11, 0x22, 0x33, 0xFF];
+    pipe.upload_palette(&ctx.queue, 0, &palette);
+    pipe.decode(
+        &ctx.device,
+        &ctx.queue,
+        &fb,
+        &[(0u8, 0u8, 0u8, 1u8, vec![0x00u8; 512])],
+    );
+    ctx.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+
+    let b = fb.debug_read(&ctx.device, &ctx.queue);
+    for (x, y) in [(0u32, 0u32), (31, 0), (0, 31), (31, 31), (16, 16)] {
+        assert_eq!(
+            px(&b, 64, x, y),
+            [0x33, 0x22, 0x11, 0xFF],
+            "tile pixel ({x},{y}) not written"
+        );
+    }
+    // Outside the tile stays untouched.
+    assert_eq!(px(&b, 64, 32, 0), [0, 0, 0, 0xFF]);
+}
+
+#[test]
+fn palrle_writes_the_correct_tile_offset() {
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let mut fb = Framebuffer::new(&ctx.device, 64, 64);
+    fb.debug_fill(&ctx.device, &ctx.queue, [0, 0, 0, 0xFF]);
+    let mut pipe = PalRlePipeline::new(&ctx.device);
+    let mut palette = [[0u8; 4]; 16];
+    palette[0] = [0x44, 0x55, 0x66, 0xFF];
+    pipe.upload_palette(&ctx.queue, 0, &palette);
+    pipe.decode(
+        &ctx.device,
+        &ctx.queue,
+        &fb,
+        &[(1u8, 1u8, 0u8, 1u8, vec![0x00u8; 512])],
+    );
+    ctx.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+
+    let b = fb.debug_read(&ctx.device, &ctx.queue);
+    assert_eq!(
+        px(&b, 64, 32, 32),
+        [0x66, 0x55, 0x44, 0xFF],
+        "tile (1,1) not at pixel (32,32)"
+    );
+    assert_eq!(
+        px(&b, 64, 0, 0),
+        [0, 0, 0, 0xFF],
+        "wrote to tile (0,0) instead"
+    );
+}
+
+#[test]
+fn palrle_reports_an_out_of_range_index() {
+    // The shader stores code 5 (ERR_INDEX_OOB, matching
+    // DecodeErrorCode::IndexOob) when an index is >= count. If this is not
+    // surfaced, corrupt palette data decodes to arbitrary colours silently.
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let fb = Framebuffer::new(&ctx.device, 64, 64);
+    let mut pipe = PalRlePipeline::new(&ctx.device);
+    let mut palette = [[0u8; 4]; 16];
+    palette[0] = [0x11, 0x22, 0x33, 0xFF];
+    pipe.upload_palette(&ctx.queue, 0, &palette);
+
+    // count = 1, but every index is 7 -> out of range.
+    pipe.decode(
+        &ctx.device,
+        &ctx.queue,
+        &fb,
+        &[(0u8, 0u8, 0u8, 1u8, vec![0x77u8; 512])],
+    );
+    ctx.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+
+    let errors = pipe.take_errors(&ctx.device, &ctx.queue);
+    assert_eq!(
+        errors,
+        vec![(0u32, 5u32)],
+        "expected ERR_INDEX_OOB for tile 0, got {errors:?}"
+    );
+}
+
+#[test]
+fn palrle_errors_do_not_leak_between_decodes() {
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let fb = Framebuffer::new(&ctx.device, 64, 64);
+    let mut pipe = PalRlePipeline::new(&ctx.device);
+    let mut palette = [[0u8; 4]; 16];
+    palette[0] = [0x11, 0x22, 0x33, 0xFF];
+    pipe.upload_palette(&ctx.queue, 0, &palette);
+
+    pipe.decode(
+        &ctx.device,
+        &ctx.queue,
+        &fb,
+        &[(0u8, 0u8, 0u8, 1u8, vec![0x77u8; 512])],
+    );
+    ctx.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+    assert!(!pipe.take_errors(&ctx.device, &ctx.queue).is_empty());
+
+    // A clean decode must not still report the previous failure.
+    pipe.decode(
+        &ctx.device,
+        &ctx.queue,
+        &fb,
+        &[(0u8, 0u8, 0u8, 1u8, vec![0x00u8; 512])],
+    );
+    ctx.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+    assert!(
+        pipe.take_errors(&ctx.device, &ctx.queue).is_empty(),
+        "stale error leaked"
+    );
 }
