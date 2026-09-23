@@ -15,16 +15,31 @@
 //!
 //! ## Generation
 //!
-//! The TS reference tracks a per-tile `gen` so a tile whose generation
-//! bumps mid-batch gets its coefficient/sign state cleared before the new
-//! pass OR-integrates into it (a fresh encode never blends with a stale
-//! one). This pipeline's `integrate` signature carries no generation --
-//! see the task's public API -- so that clearing is out of scope here: a
-//! freshly `resize`d storage buffer is zero-initialized by wgpu, and every
-//! `tile_work` entry writes a constant non-zero `gen` (1) purely so the
-//! inverse shaders' `tileGen[tile_idx] == 0` early-exit sees the tile as
-//! active. Generation-bump handling belongs to a caller that has a
-//! generation to hand it.
+//! A tile's `generation` bumps when the server supersedes it (the region
+//! changed and is being re-encoded from scratch). The integrate shader
+//! OR-integrates bit planes into the persistent per-tile coefficient/sign
+//! buffers, so if a generation bump is not accompanied by a clear, the new
+//! generation's planes land on top of the old one's and the tile
+//! reconstructs as a blend of two different images.
+//!
+//! [`Cdf53Pipeline::integrate`] tracks `last_seen_gen` per tile (mirroring
+//! `Cdf53Pipeline.lastSeenGen` in the TS reference) and, the first time a
+//! batch entry's `generation` differs from it, zeroes that tile's
+//! coefficient/sign slots and resets `received_mask` / `present_passes` /
+//! `passes_processed` -- a new generation may re-encode with an entirely
+//! different present-pass set, so the old bitmap is not just stale data,
+//! it would compute the wrong K and apply a wrong midpoint correction. A
+//! batch can carry several passes for the same tile at the same new
+//! generation, so the clear is deduped within the batch: only the first
+//! entry that observes the bump clears, later entries at that generation
+//! must not wipe passes just integrated earlier in the same batch.
+//!
+//! The clear itself is issued with `queue.write_buffer` *before* the
+//! integrate compute pass is submitted, not from inside the shader.
+//! `write_buffer` is ordered on the queue before any subsequent `submit`,
+//! so the compute pass always observes the zeroed state. An earlier
+//! attempt to clear from inside the integrate shader had a cross-workgroup
+//! race (HL2 cols 4/5 sign-bit loss for ch=0); keep this host-side.
 
 use crate::framebuffer::Framebuffer;
 use crate::pipelines::cdf53_passes::passes_processed;
@@ -55,22 +70,22 @@ const WORK_AREA_STRIDE: u64 = 12288;
 /// buffers.
 const MAX_PASSES_PER_TILE: u64 = 14;
 
-/// One arrived Cdf53 pass: (tile_x, tile_y, pass_idx, bit_planes,
-/// present_passes). `bit_planes` is exactly 384 bytes; `present_passes` is
-/// `Some` only on pass 0.
-pub type Cdf53PassEntry = (u8, u8, u8, Vec<u8>, Option<u16>);
+/// One arrived Cdf53 pass: (tile_x, tile_y, generation, pass_idx,
+/// bit_planes, present_passes). `bit_planes` is exactly 384 bytes;
+/// `present_passes` is `Some` only on pass 0.
+pub type Cdf53PassEntry = (u8, u8, u8, u8, Vec<u8>, Option<u16>);
 
-/// `coefficient`, `sign` and `dirty_tiles` are never read back by field
-/// name after `resize` builds the cached bind groups from them -- they are
-/// held here only so the buffers outlive this struct (dropping the last
-/// `wgpu::Buffer` handle would be premature even though the bind groups
-/// hold their own internal reference, since nothing else names them).
-#[allow(dead_code)]
+/// `dirty_tiles` is never read back by field name after `resize` builds the
+/// cached bind groups from it -- it is held here only so the buffer
+/// outlives this struct (dropping the last `wgpu::Buffer` handle would be
+/// premature even though the bind group holds its own internal reference,
+/// since nothing else names it).
 struct PersistentBuffers {
     coefficient: wgpu::Buffer,
     sign: wgpu::Buffer,
     tile_gen: wgpu::Buffer,
     passes_processed: wgpu::Buffer,
+    #[allow(dead_code)]
     dirty_tiles: wgpu::Buffer,
     dirty_tiles_count: wgpu::Buffer,
     tile_work: wgpu::Buffer,
@@ -79,10 +94,11 @@ struct PersistentBuffers {
 }
 
 /// One tile's CPU-side pass-tracking state, mirroring `Cdf53Pipeline`'s
-/// `receivedMaskCpu` / `presentPassesCpu` / `passesProcessedCpu` in the TS
-/// reference (there is no `lastSeenGen` here -- see the module doc).
+/// `lastSeenGen` / `receivedMaskCpu` / `presentPassesCpu` /
+/// `passesProcessedCpu` in the TS reference.
 #[derive(Clone, Copy, Default)]
 struct TileTrack {
+    last_seen_gen: u32,
     received_mask: u16,
     present_passes: u16,
     passes_processed: u32,
@@ -363,9 +379,9 @@ impl Cdf53Pipeline {
         self.max_tiles = max_tiles;
     }
 
-    /// `tiles` is (tile_x, tile_y, pass_idx, bit_planes, present_passes).
-    /// `bit_planes` is exactly 384 bytes. `present_passes` is Some only on
-    /// pass 0.
+    /// `tiles` is (tile_x, tile_y, generation, pass_idx, bit_planes,
+    /// present_passes). `bit_planes` is exactly 384 bytes. `present_passes`
+    /// is Some only on pass 0.
     pub fn integrate(
         &mut self,
         device: &wgpu::Device,
@@ -389,7 +405,15 @@ impl Cdf53Pipeline {
         let mut tile_work = Vec::with_capacity(tiles.len() * TILE_WORK_STRIDE as usize);
         let mut bit_planes_data = Vec::with_capacity(tiles.len() * BIT_PLANES_STRIDE as usize);
 
-        for (i, (tile_x, tile_y, pass_idx, bit_planes, present_passes)) in tiles.iter().enumerate()
+        // Per-tile gen transitions: clear those tiles BEFORE the integrate
+        // pass sees them. See the module doc for why this must stay
+        // host-side, and why it is deduped within the batch.
+        let coef_zero = vec![0u8; COEFFICIENT_STRIDE as usize];
+        let sign_zero = vec![0u8; SIGN_STRIDE as usize];
+        let mut cleared_tiles: std::collections::HashSet<u32> = std::collections::HashSet::new();
+
+        for (i, (tile_x, tile_y, generation, pass_idx, bit_planes, present_passes)) in
+            tiles.iter().enumerate()
         {
             debug_assert_eq!(
                 bit_planes.len(),
@@ -398,6 +422,22 @@ impl Cdf53Pipeline {
             );
             let tile_idx = *tile_y as u32 * self.cols + *tile_x as u32;
             let track = &mut self.tracks[tile_idx as usize];
+
+            if track.last_seen_gen != *generation as u32 && cleared_tiles.insert(tile_idx) {
+                queue.write_buffer(
+                    &buffers.coefficient,
+                    tile_idx as u64 * COEFFICIENT_STRIDE,
+                    &coef_zero,
+                );
+                queue.write_buffer(&buffers.sign, tile_idx as u64 * SIGN_STRIDE, &sign_zero);
+                // Gen bump also resets pass-count tracking. The bitmap is
+                // per-generation too: a new generation re-encodes the tile
+                // and may have a different present set entirely.
+                track.passes_processed = 0;
+                track.present_passes = 0;
+                track.received_mask = 0;
+                track.last_seen_gen = *generation as u32;
+            }
 
             track.received_mask |= 1u16 << pass_idx;
             if let Some(present) = present_passes {
@@ -417,9 +457,7 @@ impl Cdf53Pipeline {
 
             tile_work.extend_from_slice(&(*tile_x as u32).to_le_bytes());
             tile_work.extend_from_slice(&(*tile_y as u32).to_le_bytes());
-            // gen: constant non-zero marker -- see module doc for why this
-            // pipeline carries no real generation.
-            tile_work.extend_from_slice(&1u32.to_le_bytes());
+            tile_work.extend_from_slice(&(*generation as u32).to_le_bytes());
             tile_work.extend_from_slice(&(*pass_idx as u32).to_le_bytes());
             // u32 index into bitPlanes: 96 u32 (384 bytes) per entry.
             tile_work.extend_from_slice(&(i as u32 * 96).to_le_bytes());
