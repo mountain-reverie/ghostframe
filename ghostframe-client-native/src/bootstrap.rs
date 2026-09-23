@@ -68,14 +68,54 @@ pub fn fetch_cert_hash(
     let request = format!("GET /config.json HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     stream.write_all(request.as_bytes())?;
 
+    // Read headers, then exactly `Content-Length` bytes of body.
+    //
+    // NOT `read_to_end`. That waits for the peer to close, and Go's
+    // http.Server holds the connection open regardless of our
+    // `Connection: close` request header -- the full response arrives (232
+    // bytes here) and then the read blocks until it times out, discarding a
+    // response we already had. Relying on EOF to frame an HTTP/1.1 response
+    // is wrong whenever the server may keep the socket alive.
     let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).map_err(|e| {
-        ClientError::Bootstrap(format!(
-            "reading http://{host}:{CONFIG_HTTP_PORT}/config.json failed after \
-             {CONFIG_FETCH_TIMEOUT:?}: {e} (got {} bytes)",
-            buf.len()
-        ))
-    })?;
+    let mut chunk = [0u8; 1024];
+    let mut header_end: Option<usize> = None;
+    let mut want: Option<usize> = None;
+
+    loop {
+        // Stop as soon as the declared body is complete.
+        if let (Some(h), Some(n)) = (header_end, want) {
+            if buf.len() >= h + 4 + n {
+                break;
+            }
+        }
+        let read = stream.read(&mut chunk).map_err(|e| {
+            ClientError::Bootstrap(format!(
+                "reading http://{host}:{CONFIG_HTTP_PORT}/config.json failed after \
+                 {CONFIG_FETCH_TIMEOUT:?}: {e} (got {} bytes)",
+                buf.len()
+            ))
+        })?;
+        if read == 0 {
+            break; // peer closed; whatever we have is all there is
+        }
+        buf.extend_from_slice(&chunk[..read]);
+
+        if header_end.is_none() {
+            if let Some(h) = find_subslice(&buf, b"\r\n\r\n") {
+                header_end = Some(h);
+                let head = String::from_utf8_lossy(&buf[..h]).to_ascii_lowercase();
+                want = head.lines().find_map(|l| {
+                    l.strip_prefix("content-length:")
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                });
+                if want.is_none() {
+                    return Err(ClientError::Bootstrap(
+                        "config.json response has no Content-Length".into(),
+                    ));
+                }
+            }
+        }
+    }
 
     let split_at = find_subslice(&buf, b"\r\n\r\n").ok_or_else(|| {
         ClientError::Bootstrap("malformed HTTP response: no header/body separator".into())
