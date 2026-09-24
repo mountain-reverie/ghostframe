@@ -1,11 +1,18 @@
 //! Shared polling helper for the native-client e2e acceptance tests
-//! (`tests/native_client.rs`, `tests/h264.rs`). Lives in the harness
-//! library rather than being copy-pasted per test file -- both tests need
-//! it byte-identical, and a fix in one copy silently not reaching the
-//! other is exactly the kind of drift this crate's harness/ exists to
-//! avoid (see `framebuffer.rs` and `browserless.rs` for the same move,
-//! made for the same reason: `ghostframe-client-native` moved from a
-//! dev-dependency to a normal one in `Cargo.toml` so this file can use it).
+//! (`tests/native_client.rs`, `tests/h264.rs`, `tests/eviction.rs`). Lives
+//! in `tests/common/` rather than being copy-pasted per test file -- every
+//! test that uses it needs it byte-identical, and a fix in one copy
+//! silently not reaching the others is exactly the kind of drift this
+//! crate's harness/ exists to avoid (see `framebuffer.rs` and
+//! `browserless.rs` for the same move, made for the same reason).
+//!
+//! `ghostframe-client-native` is a **dev-dependency** of `ghostframe-e2e`
+//! (`Cargo.toml`), deliberately kept that way: an earlier attempt to
+//! promote it to a normal dependency pulled `client-gpu` into the
+//! server image's build graph, where `shaders/` are not copied, and broke
+//! CI. It was reverted. This file lives under `tests/` specifically
+//! *because* the dependency stayed dev-only -- a `src/` module here could
+//! not use it.
 
 use std::time::{Duration, Instant};
 
