@@ -364,6 +364,48 @@ evidence never supported. The defect was in the plan, not the spike. A spike
 step that pre-commits to a conclusion for an unseen measurement deserves the
 same suspicion next time.
 
+### 7.2 Linearity measurement (Task 5, 2026-09-23)
+
+§7.1 left linearity **unmeasured**: the modifier is structurally `INVALID` on
+this GFX8 chip and the plane arithmetic (pitch/offset/size) cannot distinguish
+a linear layout from GFX8 1D/micro-tiling, which reorders bytes within the
+same footprint. Task 5 settles it without any GPU API, per the plan
+(`ghostframe-client-h264/tests/oracle_decode.rs::
+the_exported_dmabuf_is_linear_at_the_descriptors_layout`): `mmap` the exported
+dmabuf read-only at the descriptor's own offsets and pitches, and compare it
+byte for byte against `av_hwframe_transfer_data`'s output on the same
+`HwFrame` -- the same call this crate already trusts as ground truth in the
+decode oracle next to it.
+
+Measured on the same machine as §7.1 (RX 480, RADV Polaris10, Mesa 26.1.7
+radeonsi), against a 640x480 3-frame gradient clip:
+
+```
+[m3] dmabuf-vs-download: 0 of 460800 bytes differ (luma 0, chroma 0)
+```
+
+**Zero bytes differ, across the full luma plane (307200 bytes) and the full
+interleaved chroma plane (153600 bytes).** `av_hwframe_transfer_data`'s CPU
+download and a raw `mmap` of the exported dmabuf, read at exactly the offsets
+and pitches `AVDRMFrameDescriptor` reports, are byte-identical. That is only
+possible if the surface is genuinely linear at that layout: 8x8 micro-tiling
+would have reordered bytes within the footprint and shown up as diffs at
+predictable strides, and it did not.
+
+**Reading:** the surface radeonsi exports for H.264 decode on this Polaris10
+part **is linear**, not tiled, despite the modifier field saying nothing
+either way. `import_nv12`'s `VK_IMAGE_TILING_LINEAR` path (§7, row 1 of the
+outcomes table) is therefore expected to work here, with Task 6's runtime
+`vkGetImageSubresourceLayout` pitch check (point 2 above) as the guard that
+catches it if some machine or driver revision disagrees. Task 6's CPU-copy
+fallback (row 3) stays in the build regardless, both as the floor for tiled
+hardware elsewhere and as what the pitch check falls back to if it ever
+fires.
+
+This closes the open question §7 posed. It does not change anything about
+*why* the modifier is uninformative on GFX8 (§7.1 already explains that
+correctly) -- it answers the question §7.1 said the modifier could not.
+
 ---
 
 ## 8. Error handling
