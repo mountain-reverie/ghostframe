@@ -5,10 +5,8 @@
 //! not an error: the server then sends tile codecs, which is what every
 //! session did before M3.
 
-use crate::{BufRef, H264Error};
+use crate::H264Error;
 use ffmpeg_sys_next as ffi;
-use std::ffi::CString;
-use std::ptr;
 
 /// Default VA-API render node. Matches
 /// `ghostframe-lib/src/encoder/vaapi_device.rs`'s `VAAPI_DEVICE`.
@@ -40,7 +38,15 @@ pub fn vaapi_h264_decode_available() -> bool {
     // an accepted cost, since the alternative is unsuppressable stderr noise
     // on a path this design calls normal.
     static LOG_MUTE: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    let _guard = LOG_MUTE.get_or_init(|| std::sync::Mutex::new(())).lock();
+    // The guarded data is `()` -- poisoning carries no meaning here, only
+    // "some earlier probe panicked while holding the lock". `PoisonError`
+    // still owns the guard, so recovering it with `into_inner` still
+    // serializes correctly; it is not a bypass. Deliberately not `.unwrap()`:
+    // that turns a benign poison into a panic on the connect path.
+    let _guard = LOG_MUTE
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
 
     // ffmpeg logs libva failures straight to stderr at its default level. On a
     // machine with no VA-API -- the outcome this whole design calls normal --
@@ -54,7 +60,6 @@ pub fn vaapi_h264_decode_available() -> bool {
     // quiet for the rest of the process.
     let _restore = QuietLogGuard::new();
     let verdict = probe_inner();
-    drop(_restore);
     match &verdict {
         Ok(()) => true,
         Err(e) => {
@@ -100,36 +105,6 @@ impl Drop for QuietLogGuard {
 /// has no H.264 decode profile" -- three very different things for a user to
 /// act on, and a bare `false` flattens them.
 fn probe_inner() -> Result<(), H264Error> {
-    let path = CString::new(RENDER_NODE)
-        .map_err(|_| H264Error::VaapiUnavailable(format!("bad device path {RENDER_NODE:?}")))?;
-
-    // RAII: `BufRef` unrefs on drop, so every early return below is leak-free
-    // without repeating the cleanup. Mirrors
-    // `ghostframe-lib/src/encoder/vaapi_device.rs`'s wrapper of the same name.
-    let mut raw: *mut ffi::AVBufferRef = ptr::null_mut();
-    // SAFETY: `path` outlives the call; `raw` is a valid out-param that ffmpeg
-    // leaves null on failure, which the check below respects before any deref.
-    let ret = unsafe {
-        ffi::av_hwdevice_ctx_create(
-            &mut raw,
-            ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
-            path.as_ptr(),
-            ptr::null_mut(),
-            0,
-        )
-    };
-    if ret < 0 {
-        // Render the errno: -13 (permission -- not in the `render` group) and
-        // -2 (no such device) are the two common causes and they need
-        // completely different fixes. A bare negative integer tells a user
-        // nothing.
-        return Err(H264Error::VaapiUnavailable(format!(
-            "av_hwdevice_ctx_create({RENDER_NODE}): {}",
-            ffmpeg_next::Error::from(ret)
-        )));
-    }
-    let _device = BufRef(raw);
-
     // SAFETY: a plain registry lookup with no ownership transfer.
     let codec = unsafe { ffi::avcodec_find_decoder(ffi::AVCodecID::AV_CODEC_ID_H264) };
     if codec.is_null() {
@@ -138,6 +113,17 @@ fn probe_inner() -> Result<(), H264Error> {
 
     // Does libavcodec actually carry a VA-API hwaccel for H.264? Without this
     // the check above is satisfied by the software decoder on every build.
+    //
+    // No device is opened here: that used to happen in this function too
+    // (a first `av_hwdevice_ctx_create` held for the whole probe), which
+    // meant two live `vaInitialize` calls on the same node whenever the
+    // hwaccel config matched -- this one, and the second one
+    // `probe_decodes_a_frame` opens via `H264Decoder::new()`, both inside
+    // the global `LOG_MUTE` above. The first open's only remaining value was
+    // distinguishing "device won't open" from "no hwaccel built", and
+    // `H264Decoder::new()` already returns `VaapiUnavailable` with the
+    // rendered ffmpeg error for exactly that, so the duplicate bought
+    // nothing.
     let mut i = 0;
     loop {
         // SAFETY: `codec` is a valid static codec descriptor; ffmpeg returns
@@ -158,16 +144,32 @@ fn probe_inner() -> Result<(), H264Error> {
     }
 }
 
-/// A 64x64 gray H.264 keyframe, Annex-B, ~655 bytes. Regenerate with:
+/// A 64x64 gray H.264 keyframe, Annex-B, High profile, ~758 bytes. Regenerate
+/// with:
 ///
 /// ```text
 /// ffmpeg -f lavfi -i color=c=gray:s=64x64:d=1 -frames:v 1 \
-///   -c:v libx264 -preset ultrafast -f h264 -y src/probe_clip.h264
+///   -c:v libx264 -preset veryfast -profile:v high -f h264 \
+///   -y src/probe_clip.h264
+/// ffprobe -loglevel error -show_entries stream=profile -of csv=p=0 \
+///   src/probe_clip.h264   # MUST print: High
 /// ```
 ///
 /// Embedded rather than encoded at runtime so the probe does not depend on
 /// libx264 being present in the host's ffmpeg build, and costs no encode on
 /// the connect path.
+///
+/// **Must be High profile, because that is what the server sends.**
+/// `ghostframe-lib/src/encoder/h264_vaapi.rs` sets no profile, so ffmpeg's
+/// `h264_vaapi` encoder defaults to High, and VA-API advertises
+/// ConstrainedBaseline / Main / High as separate *decode* profiles -- a
+/// driver carrying High but not ConstrainedBaseline would fail a CBP probe
+/// clip and silently lose H.264 it can decode perfectly well. Note
+/// `-preset ultrafast` cannot produce High at all: it disables CABAC and
+/// 8x8 DCT, the features that make it High, so `-profile:v high` alone
+/// silently still yields Constrained Baseline -- hence `veryfast` above, and
+/// the `ffprobe` check, which is there because the profile is not what the
+/// `-profile:v` flag alone determines.
 const PROBE_CLIP: &[u8] = include_bytes!("probe_clip.h264");
 
 /// Decode one frame through VA-API. The only check that actually proves the
@@ -175,7 +177,7 @@ const PROBE_CLIP: &[u8] = include_bytes!("probe_clip.h264");
 fn probe_decodes_a_frame() -> Result<(), H264Error> {
     let mut decoder = crate::decoder::H264Decoder::new()?;
     let mut frames = decoder.decode(PROBE_CLIP)?;
-    frames.extend(decoder.flush()?);
+    frames.extend(decoder.finish()?);
     let frame = frames.first().ok_or_else(|| {
         H264Error::VaapiUnavailable(
             "VA-API accepted the stream but produced no frame (driver likely has no \
@@ -189,6 +191,52 @@ fn probe_decodes_a_frame() -> Result<(), H264Error> {
         ));
     }
     Ok(())
+}
+
+/// Ground truth for whether this driver has an H.264 VLD decode entrypoint,
+/// established independently of anything else in this crate.
+///
+/// `Some(true)`/`Some(false)` is what `vainfo` reports. `None` means there is
+/// no ground truth to check against -- `vainfo` is missing, or exited
+/// non-zero (`Command::output()` returns `Ok` even for a failed child, so
+/// this checks `status.success()` rather than just reading stdout) -- and
+/// callers should skip rather than guess.
+///
+/// Named explicitly rather than letting `vainfo` pick its own display: a bare
+/// `vainfo` invocation need not open the same device [`RENDER_NODE`]
+/// hardcodes, so it could establish ground truth against the wrong GPU on a
+/// multi-GPU box.
+///
+/// Shared by [`vaapi_h264_decode_available`]'s own test
+/// (`probe_agrees_with_the_driver`, which checks the probe's verdict against
+/// this) and `decoder::tests::skip_without_vaapi`, which gates on this and
+/// NOT on `vaapi_h264_decode_available` -- since the probe now decodes a
+/// real frame, gating on it would be circular: a regression in the decoder
+/// would make the probe return `false`, which would make the decoder tests
+/// skip and report green exactly when they should fail.
+///
+/// `#[cfg(test)]`: every caller is a test, in this module or `decoder`'s.
+#[cfg(test)]
+pub(crate) fn vainfo_reports_h264_vld() -> Option<bool> {
+    let vainfo = std::process::Command::new("vainfo")
+        .args(["--display", "drm", "--device", RENDER_NODE])
+        .output();
+    let Ok(out) = vainfo else {
+        eprintln!("vainfo not installed; cannot establish ground truth, skipping");
+        return None;
+    };
+    if !out.status.success() {
+        eprintln!(
+            "vainfo exited with {:?}; cannot establish ground truth, skipping",
+            out.status
+        );
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    Some(
+        text.lines()
+            .any(|l| l.contains("VAProfileH264") && l.contains("VAEntrypointVLD")),
+    )
 }
 
 #[cfg(test)]
@@ -212,34 +260,9 @@ mod tests {
     /// answer there and entrench the very defect the probe exists to avoid.
     #[test]
     fn probe_agrees_with_the_driver() {
-        // Named explicitly rather than letting vainfo pick its own display:
-        // bare `vainfo` need not open the same device the probe hardcodes
-        // (`RENDER_NODE`), so an unqualified invocation could establish
-        // ground truth against the wrong GPU on a multi-GPU box.
-        let vainfo = std::process::Command::new("vainfo")
-            .args(["--display", "drm", "--device", RENDER_NODE])
-            .output();
-        let Ok(out) = vainfo else {
-            eprintln!("vainfo not installed; cannot establish ground truth, skipping");
+        let Some(driver_decodes_h264) = vainfo_reports_h264_vld() else {
             return;
         };
-        if !out.status.success() {
-            // `Command::output()` returns `Ok` even when the child process
-            // exits non-zero -- e.g. no VA-API device at all, which prints
-            // nothing to stdout. Without this check, that failure silently
-            // reads as "driver reports no H.264 entrypoint" and asserts the
-            // probe says `false`, a spurious failure on a box where the
-            // probe legitimately succeeds by some other means.
-            eprintln!(
-                "vainfo exited with {:?}; cannot establish ground truth, skipping",
-                out.status
-            );
-            return;
-        }
-        let text = String::from_utf8_lossy(&out.stdout);
-        let driver_decodes_h264 = text
-            .lines()
-            .any(|l| l.contains("VAProfileH264") && l.contains("VAEntrypointVLD"));
         if !driver_decodes_h264 {
             eprintln!("driver reports no H.264 VLD entrypoint; probe should say false");
             assert!(

@@ -1,8 +1,18 @@
 //! Test-only: synthesize a known H.264 clip with libx264.
 //!
 //! Not `#[cfg(test)]` because the oracle in `ghostframe-e2e` and the
-//! `client-gpu` tests need it too. Costs nothing in a release build beyond
-//! the code size of one function.
+//! `client-gpu` tests need it too -- both live in other crates, where this
+//! crate's own `#[cfg(test)]` is never active. The `testclip` cargo feature
+//! (see `Cargo.toml`) is the mechanism that reaches across that boundary
+//! while keeping this module, with its nine panicking paths, out of a
+//! release build of this production crate by default.
+//!
+//! In-band SPS/PPS is load-bearing here: no `AV_CODEC_FLAG_GLOBAL_HEADER` is
+//! set below, so every access unit this produces carries its own parameter
+//! sets. That is *why* `H264Decoder`'s tests work by feeding it access units
+//! one at a time with nothing extracted out-of-band first -- an encoder
+//! configured for global headers would produce a stream this decoder, as
+//! written, could not parse standalone.
 
 use ffmpeg_next as ffmpeg;
 
@@ -11,9 +21,21 @@ use ffmpeg_next as ffmpeg;
 ///
 /// The gradient matters: a flat colour compresses to almost nothing and
 /// would exercise none of the decoder's transform paths.
+///
+/// # Panics
+/// On any ffmpeg failure: libx264 missing from the build, the encoder
+/// refusing this width/height/format, or a hard encode error. This is test
+/// support, not production code -- a clip that fails to synthesize should
+/// fail the test loudly, not be worked around.
 pub fn gradient_clip(w: u32, h: u32, n: usize) -> Vec<Vec<u8>> {
     ffmpeg::init().expect("ffmpeg init");
-    let codec = ffmpeg::encoder::find(ffmpeg::codec::Id::H264).expect("libx264 not available");
+    // `find_by_name`, not `find(Id::H264)`: the latter returns whichever
+    // H.264 encoder registers first, which can be `h264_vaapi` or
+    // `h264_nvenc`. Those then fail on a YUV420P software frame with no
+    // hardware frames context, while the `.expect` below claims libx264 is
+    // missing. Same house rule as
+    // `ghostframe-lib/src/encoder/h264_vaapi.rs:159`.
+    let codec = ffmpeg::encoder::find_by_name("libx264").expect("libx264 not available");
     let ctx = ffmpeg::codec::context::Context::new_with_codec(codec);
     let mut enc = ctx.encoder().video().expect("video encoder");
     enc.set_width(w);
@@ -25,8 +47,18 @@ pub fn gradient_clip(w: u32, h: u32, n: usize) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     let drain = |enc: &mut ffmpeg::encoder::video::Encoder, out: &mut Vec<Vec<u8>>| {
         let mut pkt = ffmpeg::Packet::empty();
-        while enc.receive_packet(&mut pkt).is_ok() {
-            out.push(pkt.data().expect("packet data").to_vec());
+        loop {
+            match enc.receive_packet(&mut pkt) {
+                Ok(()) => out.push(pkt.data().expect("packet data").to_vec()),
+                // EAGAIN ("send more input before another packet is ready")
+                // and EOF are the two expected reasons this stops yielding
+                // packets. Matching only on `.is_ok()` would treat a genuine
+                // encode failure the same way -- silently truncating the
+                // clip mid-test instead of failing it.
+                Err(ffmpeg::Error::Other { errno }) if errno == libc::EAGAIN => break,
+                Err(ffmpeg::Error::Eof) => break,
+                Err(e) => panic!("libx264 receive_packet failed: {e}"),
+            }
         }
     };
 

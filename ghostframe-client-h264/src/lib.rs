@@ -10,6 +10,13 @@
 pub mod decoder;
 pub mod descriptor;
 pub mod probe;
+// Behind a feature, not `#[cfg(test)]`: the oracle in `ghostframe-e2e` and
+// `ghostframe-client-gpu`'s tests need `gradient_clip` too, from a different
+// crate's test build, where `#[cfg(test)]` on the defining crate would never
+// be active. A cargo feature is the mechanism that reaches across the crate
+// boundary while still keeping nine panicking paths out of a release build
+// of this production crate by default.
+#[cfg(feature = "testclip")]
 pub mod testclip;
 
 pub use descriptor::{DmabufPlanes, PlaneDesc};
@@ -35,18 +42,4 @@ pub enum H264Error {
 
     #[error("unexpected DRM descriptor: {0}")]
     Descriptor(String),
-}
-
-/// RAII wrapper around `*mut AVBufferRef` so no early return leaks a hardware
-/// device context. Mirrors `ghostframe-lib/src/encoder/vaapi_device.rs`'s
-/// `BufRef`; this crate has its own because it is declared the owner of every
-/// unsafe ffmpeg call in the client and should not reach into the server crate.
-pub(crate) struct BufRef(pub *mut ffmpeg_sys_next::AVBufferRef);
-
-impl Drop for BufRef {
-    fn drop(&mut self) {
-        // SAFETY: `AVBufferRef` is refcounted; this struct owns exactly one
-        // reference and releases it exactly once.
-        unsafe { ffmpeg_sys_next::av_buffer_unref(&mut self.0) };
-    }
 }
