@@ -10,7 +10,6 @@
 pub mod browser;
 pub mod browserless;
 pub mod cleanup;
-pub mod client_wait;
 pub mod containers;
 pub mod e2e_certs;
 pub mod e2e_setup;
@@ -31,7 +30,6 @@ pub use browser::{
     KeyEventKind, PointerEventKind,
 };
 pub use cleanup::{cleanup_stale_xvfb_sockets, read_server_logs_stripped};
-pub use client_wait::wait_for_frame;
 pub use containers::{create_preauth_key, docker_run_in_container, TestNode, NETWORK_NAME};
 pub use e2e_setup::{setup_e2e_server, wait_for_frames, E2eServerSetup, E2eServerSpec};
 pub use pixels::{assert_ssim_against_golden, decode_screenshot};

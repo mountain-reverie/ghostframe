@@ -49,9 +49,11 @@
 use std::time::{Duration, Instant};
 
 use ghostframe_client_native::{Client, Config, DebugFrameBytes};
-use ghostframe_e2e::harness::{
-    read_server_logs_stripped, setup_e2e_server, wait_for_frame, E2eServerSpec,
-};
+use ghostframe_e2e::harness::{read_server_logs_stripped, setup_e2e_server, E2eServerSpec};
+
+#[path = "common/client_wait.rs"]
+mod client_wait;
+use client_wait::wait_for_frame;
 
 /// Below this, a decoded region counts as "flat" for the purposes of the
 /// retry loop in the test body -- see that loop's comment for why a flat

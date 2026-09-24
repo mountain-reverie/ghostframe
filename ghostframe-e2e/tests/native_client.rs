@@ -46,9 +46,11 @@ use std::time::{Duration, Instant};
 
 use ghostframe_client_native::{Client, ClientEvent, Config};
 use ghostframe_e2e::harness::net_shape::NetShape;
-use ghostframe_e2e::harness::{
-    read_server_logs_stripped, setup_e2e_server, wait_for_frame, E2eServerSpec,
-};
+use ghostframe_e2e::harness::{read_server_logs_stripped, setup_e2e_server, E2eServerSpec};
+
+#[path = "common/client_wait.rs"]
+mod client_wait;
+use client_wait::wait_for_frame;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn native_client_renders_the_test_pattern_into_an_exported_dmabuf() {
