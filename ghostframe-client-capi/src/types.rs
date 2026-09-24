@@ -154,4 +154,14 @@ pub struct gf_event {
     /// `const char *` here would need its own ownership rule and free
     /// function for what is only ever a short diagnostic string.
     pub message: [libc::c_char; 256],
+    /// Valid for `GF_EVENT_DISCONNECTED`. `true` when the server ended this
+    /// session deliberately (eviction by another client) -- an ordinary
+    /// hand-off, safe for a host to treat as a clean exit. `false` for a
+    /// transport failure (idle timeout, reset, TLS failure, ...), which is
+    /// not. Appended at the end of the struct per the `struct_size`
+    /// forward-compatibility mechanism documented on the type -- a caller
+    /// built against a header from before this field existed has
+    /// `struct_size` too small to include it and this library never writes
+    /// past what that caller promised was there.
+    pub disconnect_expected: bool,
 }

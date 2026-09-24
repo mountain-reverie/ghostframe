@@ -24,10 +24,26 @@ use std::sync::Mutex;
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientEvent {
     Connected,
-    Disconnected { reason: String },
-    Resized { width: u32, height: u32 },
-    FrameReady { frame_id: u32 },
-    Error { message: String },
+    Disconnected {
+        reason: String,
+        /// True when the server deliberately ended this session
+        /// (eviction). False for transport failure, idle timeout, or
+        /// server shutdown. A host embedder (e.g. the CLI) exits cleanly
+        /// only for the former: displacement is an ordinary hand-off, a
+        /// dropped link is not, and a caller must be able to tell them
+        /// apart from this field alone, not by parsing `reason`.
+        expected: bool,
+    },
+    Resized {
+        width: u32,
+        height: u32,
+    },
+    FrameReady {
+        frame_id: u32,
+    },
+    Error {
+        message: String,
+    },
 }
 
 /// A thread-safe queue whose eventfd the host can put in its own poll set.

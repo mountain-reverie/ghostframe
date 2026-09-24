@@ -243,15 +243,31 @@ pub(crate) fn host_event_for(core_ev: &ghostframe_client_core::Event) -> Option<
         }),
         // `ClientEvent::Disconnected` already exists and already carries a
         // reason string; eviction is a disconnect with a known cause, not a
-        // new kind of host event.
+        // new kind of host event. `expected: true` -- the server ended this
+        // session deliberately, unlike a `ConnectionLost` (below), which is
+        // always a transport failure.
         Event::Evicted { reason } => Some(ClientEvent::Disconnected {
             reason: format!("{reason:?}"),
+            expected: true,
         }),
         Event::TileReady { .. }
         | Event::NeedsH264 { .. }
         | Event::DecodeError { .. }
         | Event::TilePayload { .. }
         | Event::PaletteUpdated { .. } => None,
+    }
+}
+
+/// The host-visible event for a `ClientNetEvent::ConnectionLost`. Always
+/// `expected: false` -- this is quinn's own connection-loss signal (idle
+/// timeout, reset, TLS failure, ...), never the server explaining itself;
+/// that path is `Event::Evicted`, handled above by `host_event_for`.
+/// Extracted for the same reason `host_event_for` is: testable without a
+/// live network client.
+pub(crate) fn host_event_for_connection_lost(reason: String) -> ClientEvent {
+    ClientEvent::Disconnected {
+        reason,
+        expected: false,
     }
 }
 
@@ -406,7 +422,7 @@ pub(crate) fn run(args: NetThreadArgs) {
                     queue.push(ClientEvent::Connected);
                 }
                 ClientNetEvent::ConnectionLost { reason } => {
-                    queue.push(ClientEvent::Disconnected { reason });
+                    queue.push(host_event_for_connection_lost(reason));
                 }
                 ClientNetEvent::Core(core_ev) => {
                     if let Some(host_ev) = host_event_for(&core_ev) {
@@ -444,11 +460,36 @@ mod tests {
             reason: EvictionReason::DisplacedByNewSession,
         });
         match ev {
-            Some(ClientEvent::Disconnected { reason }) => assert!(
-                reason.contains("DisplacedByNewSession"),
-                "the reason must name the cause so an embedder can tell \
-                 displacement from a network failure, got {reason:?}"
-            ),
+            Some(ClientEvent::Disconnected { reason, expected }) => {
+                assert!(
+                    reason.contains("DisplacedByNewSession"),
+                    "the reason must name the cause so an embedder can tell \
+                     displacement from a network failure, got {reason:?}"
+                );
+                assert!(
+                    expected,
+                    "eviction is a deliberate, expected disconnect -- a \
+                     host must be able to exit cleanly on it"
+                );
+            }
+            other => panic!("expected Disconnected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn connection_loss_is_not_an_expected_disconnect() {
+        // Distinct from eviction: this is quinn's own `ConnectionLost`
+        // (idle timeout, reset, TLS failure, ...), not the server
+        // explaining itself. A host must not exit 0 on it.
+        match host_event_for_connection_lost("timed out".to_string()) {
+            ClientEvent::Disconnected { reason, expected } => {
+                assert_eq!(reason, "timed out");
+                assert!(
+                    !expected,
+                    "a transport failure must not report as an expected \
+                     disconnect, or a real crash would exit 0"
+                );
+            }
             other => panic!("expected Disconnected, got {other:?}"),
         }
     }
@@ -478,10 +519,13 @@ mod tests {
             reason: EvictionReason::Unknown(0x7A),
         });
         match ev {
-            Some(ClientEvent::Disconnected { reason }) => assert!(
-                reason.contains("122") || reason.contains("7A") || reason.contains("7a"),
-                "expected the raw byte to be visible in the reason, got {reason:?}"
-            ),
+            Some(ClientEvent::Disconnected { reason, expected }) => {
+                assert!(
+                    reason.contains("122") || reason.contains("7A") || reason.contains("7a"),
+                    "expected the raw byte to be visible in the reason, got {reason:?}"
+                );
+                assert!(expected, "an unrecognized reason is still an eviction");
+            }
             other => panic!("expected Disconnected, got {other:?}"),
         }
     }
