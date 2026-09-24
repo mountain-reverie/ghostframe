@@ -264,6 +264,64 @@ e2e path already falls back to CPU mmap for the same class of reason.
 Whichever path runs, it logs which one at startup. A silent fallback is how a
 performance regression hides for a month.
 
+### 7.1 Spike result (Task 1, 2026-09-23)
+
+Ran the Task 1 spike on this machine (RX 480, RADV Polaris10, Mesa 26.1.7
+radeonsi, `libva` driver `Mesa Gallium driver ... radeonsi, polaris10, ACO`).
+`vainfo` confirms `VAProfileH264Main`/`VAProfileH264High` at `VAEntrypointVLD`
+before anything else was attempted, so the decode path itself is healthy.
+
+The spike compiled and ran **unmodified** — no fixes needed to the code in the
+plan. `cargo run --release` decoded one frame (of 3 encoded access units; the
+decoder wasn't flushed with EOF before the loop exited, so only the first
+output frame was observed — irrelevant to this question, since every plane
+descriptor is stable across 3 separate runs). Output:
+
+```
+[spike] frame 640x480 format=AV_PIX_FMT_VAAPI
+[spike] nb_objects=1 nb_layers=2
+[spike]   object[0] fd=6 size=552960 modifier=0x00ffffffffffffff
+[spike]   layer[0] format=0x20203852 nb_planes=1
+[spike]     plane[0] object_index=0 offset=0 pitch=768
+[spike]   layer[1] format=0x38385247 nb_planes=1
+[spike]     plane[0] object_index=0 offset=368640 pitch=768
+```
+
+**The modifier is `0x00ffffffffffffff` — `DRM_FORMAT_MOD_INVALID`, not
+`DRM_FORMAT_MOD_LINEAR` (0).** This is not a tiled modifier either (a real AMD
+tiled modifier would be a `fourcc_mod_code(AMD, ...)` value with vendor byte
+`0x02` in bit 56, not all-ones). `DRM_FORMAT_MOD_INVALID` is the sentinel
+`AVDRMFrameDescriptor` uses when the export path carries **no modifier
+metadata at all** — consistent with ffmpeg's `hwcontext_vaapi` falling back to
+the legacy `vaDeriveImage`/`vaAcquireBufferHandle` derivation instead of the
+newer `vaExportSurfaceHandle(..., PRIME_2)` path that would report a real
+modifier (linear-explicit-0 or an AMD tile code) on radeonsi.
+
+Shape observed: **one object, two layers, one plane each** — `object[0]` is a
+single dmabuf (fd, 552960 bytes) backing both layers. `layer[0]` format
+`0x20203852` decodes (little-endian fourcc bytes) to `"R8  "` (`DRM_FORMAT_R8`,
+the Y plane); `layer[1]` format `0x38385247` decodes to `"GR88"`
+(`DRM_FORMAT_GR88`, the interleaved UV plane) — i.e. this is exactly the NV12
+shape M1/M3 assumed, not the "one layer with two planes" alternative. For
+640x480: Y at offset 0, pitch 768 (640 padded up to a 256-byte multiple);
+UV at offset 368640 (= 768 × 480, i.e. right after the full padded Y plane),
+pitch 768, height 240. `768 × 480 + 768 × 240 = 552960`, which matches
+`object[0].size` exactly, so the plane math is self-consistent and this is a
+standard padded raster layout, not an opaque tiled blob — but that is a
+plausibility observation, not proof, given the modifier itself is unreported.
+
+**Direct Vulkan import is not viable on this hardware, for two independent
+reasons:** (1) `VK_EXT_image_drm_format_modifier` is absent from this GPU's
+Vulkan driver regardless of what VA-API reports, and (2) even if that
+extension were present, VA-API is not handing back a confirmed
+`DRM_FORMAT_MOD_LINEAR`, so there is no safe modifier to import with, and
+importing through the modifier-less `VK_IMAGE_TILING_LINEAR` path would be an
+unverified assumption about a layout the driver explicitly declined to
+promise. **Task 6's CPU fallback (`av_hwframe_transfer_data` into a CPU NV12
+frame, then `write_texture`) is the live path on this machine** — this is the
+third row of the outcomes table above, not the first. The design already
+anticipated and priced this outcome; it is not a blocker.
+
 ---
 
 ## 8. Error handling
