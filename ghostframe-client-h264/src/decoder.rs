@@ -495,8 +495,13 @@ mod tests {
     /// in the decoder makes the probe return `false`, which makes this
     /// helper skip the test, which reports green exactly when the decoder
     /// is broken.
+    ///
+    /// Passes `crate::probe::RENDER_NODE` explicitly -- every test below
+    /// opens the decoder through `H264Decoder::new()`, which opens exactly
+    /// that node, so ground truth must be established against the same
+    /// device the test actually exercises.
     fn skip_without_vaapi() -> bool {
-        match crate::probe::vainfo_reports_h264_vld() {
+        match crate::probe::vainfo_reports_h264_vld(crate::probe::RENDER_NODE) {
             Some(true) => false,
             Some(false) => {
                 eprintln!("driver reports no H.264 VLD entrypoint; skipping");
