@@ -611,6 +611,29 @@ answer.
 
 ---
 
+## 12.1 An environment gap worth closing
+
+**No Vulkan validation layers are installed on the development machine**
+(`/usr/share/vulkan/explicit_layer.d` is empty; `vulkaninfo` reports two
+instance layers, neither Khronos validation). This was found while
+mutation-testing Task 6: deliberately halving the `allocationSize` passed to
+`vkAllocateMemory` produced **no observable effect** — RADV's dma-buf import
+uses the fd's real backing size regardless — and nothing flagged the
+out-of-bounds bind that would be. The code carries a `debug_assert_eq!` as the
+only thing that catches it.
+
+That is a blind spot for a milestone that imports external memory, binds two
+images into one allocation at manual offsets, and hands raw `VkImage` handles
+to wgpu. `vulkan-validationlayers` would catch exactly this class: bad bind
+offsets, undersized allocations, layout-transition mistakes, and
+use-after-destroy — the last of which is the hazard §C3 of Task 6's review
+identified in `ImportedNv12`'s per-frame `Drop`.
+
+Installing it is a system change and is not done here. Recommended before
+Task 9 wires the import into the per-frame render path, where a
+use-after-destroy would otherwise present as an intermittent GPU hang rather
+than a message naming the object.
+
 ## 13. Risks
 
 1. **Tiled export with no route to linear** (§7). Mitigated by the CPU fallback,
