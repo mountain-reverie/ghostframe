@@ -28,11 +28,6 @@ ghostframe-client-net = { path = "../ghostframe-client-net" }
 # Used directly by src/harness/browserless.rs to decode the server's
 # cert hash for ClientNetConfig::server_cert_sha256.
 hex = { workspace = true }
-# Used directly by src/harness/client_wait.rs's wait_for_frame, shared by
-# tests/native_client.rs and tests/h264.rs (was a dev-dep; client_wait.rs
-# is in the library, not just tests -- same move as ghostframe-client-core
-# above, same reason).
-ghostframe-client-native = { path = "../ghostframe-client-native" }
 # Harness library needs these at lib-build time (was dev-deps).
 testcontainers = "0.27"
 chromiumoxide = "0.9"
@@ -69,6 +64,14 @@ ghostframe-test-pattern = { path = "../ghostframe-test-pattern" }
 quinn-proto = { workspace = true }
 url = "2"
 web-transport-proto = { workspace = true }
+# Only used by tests/native_client.rs and tests/h264.rs (the M1 and M3
+# acceptance tests). Deliberately a DEV-dependency: making it a normal one
+# pulls ghostframe-client-gpu into the normal dependency graph, and the e2e
+# test-server container image then compiles it during
+# `cargo build -p ghostframe-xdaemon -p ghostframe-test-pattern` -- where
+# `shaders/` is not copied, so every `include_str!` fails and the image
+# build dies. That is how CI broke on PR #96.
+ghostframe-client-native = { path = "../ghostframe-client-native" }
 # Only used by tests/showcase.rs (M2 acceptance test): drives the CLI's
 # window loop and chord directly, against a Weston-headless compositor.
 ghostframe-cli = { path = "../ghostframe-cli" }
