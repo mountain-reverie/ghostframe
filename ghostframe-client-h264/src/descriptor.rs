@@ -328,21 +328,20 @@ mod tests {
         let b = two_layers_one_plane_each();
         let pa = DmabufPlanes::from_descriptor(&a, 1024, 768).expect("parse a");
         let pb = DmabufPlanes::from_descriptor(&b, 1024, 768).expect("parse b");
-        // Every field except `fd` must agree: the two fixtures describe the
-        // same buffer layout via a different fd (7 vs. 9) on purpose, to
-        // prove that choice is irrelevant to how the shape is read. Checking
-        // `size` and the `fourcc_*` fields too, not just `luma`/`chroma`, is
-        // what makes this assert load-bearing rather than near-vacuous --
-        // both fixtures previously used identical offsets, so the original
-        // field-by-field asserts alone would pass even if the two shapes
-        // were parsed by coincidence rather than by the intended logic.
+        // The two fixtures deliberately use different fds (7 vs. 9) so this
+        // isn't accidentally comparing a fixture to itself -- assert that
+        // premise directly rather than merely relying on it. `luma`/`chroma`
+        // are the only comparison that is actually evidence of anything:
+        // `size`/`width`/`height` come from identical fixture constants on
+        // both sides, and `fourcc_luma`/`fourcc_chroma` are compile-time
+        // constants in both accepted shapes, so none of those three could
+        // ever differ and asserting them would not test this function.
+        assert_ne!(
+            pa.fd, pb.fd,
+            "fixtures must use different fds for this comparison to mean anything"
+        );
         assert_eq!(pa.luma, pb.luma);
         assert_eq!(pa.chroma, pb.chroma);
-        assert_eq!(pa.size, pb.size);
-        assert_eq!(pa.width, pb.width);
-        assert_eq!(pa.height, pb.height);
-        assert_eq!(pa.fourcc_luma, pb.fourcc_luma);
-        assert_eq!(pa.fourcc_chroma, pb.fourcc_chroma);
     }
 
     /// Two objects means the planes live in separate dmabufs. The import
@@ -374,17 +373,56 @@ mod tests {
         assert!(matches!(err, Err(H264Error::Descriptor(_))));
     }
 
-    /// A P010 (10-bit) export also has 2 planes, and would parse cleanly as
-    /// NV12 if only the plane count were checked -- Task 6 would then build
-    /// `R8Unorm`/`Rg8Unorm` textures over 16-bit data and render garbage
-    /// that looks like a decode bug. Rejecting by fourcc is what catches it
-    /// here instead.
+    /// The single-layer branch checks the layer's own fourcc, not just its
+    /// plane count: a layer that reports 2 planes but a format other than
+    /// `DRM_FORMAT_NV12` (here an arbitrary non-NV12 value) must still be
+    /// rejected, not accepted because the plane count happened to match.
+    /// See `rejects_a_p010_style_two_layer_descriptor` below for the
+    /// realistic case this check exists for.
     #[test]
-    fn rejects_a_non_nv12_fourcc() {
+    fn rejects_a_single_layer_descriptor_whose_format_is_not_nv12() {
         let mut d = one_object_two_planes();
         d.layers[0].format = fourcc_code(b'R', b'1', b'6', b' '); // DRM_FORMAT_R16
-        let err = DmabufPlanes::from_descriptor(&d, 1024, 768);
-        assert!(matches!(err, Err(H264Error::Descriptor(_))));
+        match DmabufPlanes::from_descriptor(&d, 1024, 768) {
+            Err(H264Error::Descriptor(msg)) => {
+                assert!(
+                    msg.contains("DRM_FORMAT_NV12"),
+                    "wrong error message: {msg}"
+                );
+            }
+            other => {
+                panic!("expected a Descriptor error naming the expected fourcc, got {other:?}")
+            }
+        }
+    }
+
+    /// A P010 (10-bit) export in the *separate-layers* shape -- one
+    /// `DRM_FORMAT_R16` layer, one `DRM_FORMAT_GR1616` layer, one plane
+    /// each -- has exactly the same layer/plane counts as the two-layer
+    /// NV12 export and would parse cleanly if only shape were checked.
+    /// Task 6 would then build `R8Unorm`/`Rg8Unorm` textures over 16-bit
+    /// data and render garbage that looks like a decode bug. Rejecting by
+    /// fourcc is what catches it here instead.
+    ///
+    /// `DRM_FORMAT_GR1616`'s macro value packs ASCII `'G','R','3','2'`, not
+    /// `'1','6','1','6'` -- `<drm/drm_fourcc.h>` names it after the total
+    /// bit depth (32), the same convention `DRM_FORMAT_GR88` uses for 8+8.
+    #[test]
+    fn rejects_a_p010_style_two_layer_descriptor() {
+        let mut d = two_layers_one_plane_each();
+        d.layers[0].format = fourcc_code(b'R', b'1', b'6', b' '); // DRM_FORMAT_R16
+        d.layers[1].format = fourcc_code(b'G', b'R', b'3', b'2'); // DRM_FORMAT_GR1616
+        match DmabufPlanes::from_descriptor(&d, 1024, 768) {
+            Err(H264Error::Descriptor(msg)) => {
+                assert!(
+                    msg.contains("DRM_FORMAT_R8") && msg.contains("DRM_FORMAT_GR88"),
+                    "wrong error message: {msg}"
+                );
+            }
+            other => {
+                panic!("expected a Descriptor error naming the expected fourccs, got {other:?}")
+            }
+        }
     }
 
     /// I420 (planar YUV, Y/U/V each their own layer) is a real shape a
@@ -420,36 +458,63 @@ mod tests {
     /// wraps to a huge `usize` on the `as` cast), must report a
     /// `Descriptor` error instead of taking the process down -- this runs
     /// per frame, on Task 9's render thread.
+    /// Asserting the message, not just the `Descriptor` variant, matters
+    /// here specifically: every rejection path in this file returns the
+    /// same variant, so a bare `matches!` would still pass if this
+    /// descriptor were (wrongly) rejected for, say, a bad fourcc instead of
+    /// the out-of-range count this test exists to exercise.
     #[test]
     fn out_of_range_layer_count_does_not_panic() {
         let mut d = one_object_two_planes();
         d.nb_layers = 37;
-        let err = DmabufPlanes::from_descriptor(&d, 1024, 768);
-        assert!(matches!(err, Err(H264Error::Descriptor(_))));
+        match DmabufPlanes::from_descriptor(&d, 1024, 768) {
+            Err(H264Error::Descriptor(msg)) => {
+                assert!(msg.contains("got 37"), "wrong error message: {msg}");
+            }
+            other => panic!("expected a Descriptor error naming the layer count, got {other:?}"),
+        }
     }
 
     #[test]
     fn negative_layer_count_does_not_panic() {
         let mut d = one_object_two_planes();
         d.nb_layers = -1;
-        let err = DmabufPlanes::from_descriptor(&d, 1024, 768);
-        assert!(matches!(err, Err(H264Error::Descriptor(_))));
+        match DmabufPlanes::from_descriptor(&d, 1024, 768) {
+            Err(H264Error::Descriptor(msg)) => {
+                assert!(msg.contains("got -1"), "wrong error message: {msg}");
+            }
+            other => panic!("expected a Descriptor error naming the layer count, got {other:?}"),
+        }
     }
 
     #[test]
     fn out_of_range_plane_count_does_not_panic() {
         let mut d = one_object_two_planes();
         d.layers[0].nb_planes = 99;
-        let err = DmabufPlanes::from_descriptor(&d, 1024, 768);
-        assert!(matches!(err, Err(H264Error::Descriptor(_))));
+        match DmabufPlanes::from_descriptor(&d, 1024, 768) {
+            Err(H264Error::Descriptor(msg)) => {
+                assert!(
+                    msg.contains("2 planes") && msg.contains("99"),
+                    "wrong error message: {msg}"
+                );
+            }
+            other => panic!("expected a Descriptor error naming the plane count, got {other:?}"),
+        }
     }
 
     #[test]
     fn negative_plane_count_does_not_panic() {
         let mut d = one_object_two_planes();
         d.layers[0].nb_planes = -1;
-        let err = DmabufPlanes::from_descriptor(&d, 1024, 768);
-        assert!(matches!(err, Err(H264Error::Descriptor(_))));
+        match DmabufPlanes::from_descriptor(&d, 1024, 768) {
+            Err(H264Error::Descriptor(msg)) => {
+                assert!(
+                    msg.contains("2 planes") && msg.contains("-1"),
+                    "wrong error message: {msg}"
+                );
+            }
+            other => panic!("expected a Descriptor error naming the plane count, got {other:?}"),
+        }
     }
 
     /// A plane that claims to extend past the object's reported allocation.
