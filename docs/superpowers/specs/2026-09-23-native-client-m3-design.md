@@ -601,125 +601,240 @@ the `[0.50, 0.6245)` window.
 
 M2's precedent: measure, then decide, and write the numbers down.
 
+**Revision note (2026-09-24):** the first version of this section timed only
+`decoder.decode()` and concluded "no decode thread justified" at a claimed
+22% of budget. A review round reproduced the measurement independently and
+found the timed span excluded the hardware decode itself — ffmpeg's VA-API
+hwaccel does not synchronise the decoded surface inside
+`avcodec_receive_frame`; the `vaSyncSurface` wait lives in the map-to-DRM
+path, i.e. inside `HwFrame::map_dmabuf`, called later in `blit_h264_frame`,
+after the original timer had already stopped. That review also found
+`H264Decoder::new()`'s one-time cost excluded from the "one-time stall"
+number, and the test using a non-production memory type
+(`host_visible: true`) for the publish-cadence comparison. All three are
+fixed below: `map_dmabuf` and `H264Decoder::new()` are now timed
+(`ghostframe-client-gpu/src/renderer.rs`), the harness passes
+`host_visible: false` to match production
+(`ghostframe-client-gpu/tests/gpu_h264_render.rs`), and both an unpaced and a
+60Hz-paced run were captured, because the review's own reproduction showed
+pacing changes the `map_dmabuf` distribution substantially. §10.2-§10.6 below
+are the corrected numbers and verdict; nothing here should be read as
+correcting §10.3 (import path) or the parts of §10.5 unaffected by the sync
+gap, which held up.
+
 ### 10.1 How this was collected
 
-`ghostframe-e2e`'s Task 11 e2e test does not exist yet (it needs container
-images that were mid-rebuild when this was written), so this uses
-`ghostframe-client-gpu/tests/gpu_h264_render.rs::decode_and_publish_timing_at_1920x1080`
-instead — a new `#[ignore]`d test added for this measurement. It feeds real
-decoded access units through `Renderer::apply_event` exactly as the render
-thread does (`render_thread.rs`'s per-event `decode -> flush -> publish ->
-release`), on this machine's real VA-API hardware (RX 480, RADV Polaris10 —
-the same GPU as §7.1/§7.2). What it does **not** do is talk to a live server:
-the access units come from `gradient_clip`, a synthetic moving-gradient clip
+`ghostframe-e2e/tests/h264.rs` (added after the first draft of this section,
+in a later commit) is the real e2e acceptance test — a live server, a real
+tailnet, GPU capture on the server side — but it installs no tracing
+subscriber (see its own module doc for why) and so has no debug-log output
+to measure from. This section still uses
+`ghostframe-client-gpu/tests/gpu_h264_render.rs`'s two `#[ignore]`d
+`decode_and_publish_timing_at_1920x1080_{unpaced,paced_60hz}` harnesses
+instead. They feed real decoded access units through `Renderer::apply_event`
+exactly as the render thread does (`render_thread.rs`'s per-event `decode ->
+flush -> publish -> release`), on this machine's real VA-API hardware (RX
+480, RADV Polaris10 — the same GPU as §7.1/§7.2, and the same GPU `h264.rs`
+runs against). What neither harness does is talk to a live server: the
+access units come from `gradient_clip`, a synthetic moving-gradient clip
 encoded once with libx264 at default settings. That means the bitrate and
 keyframe cadence are whatever libx264's defaults produce for a gradient, not
 production desktop content or the server's actual `h264_vaapi.rs` encoder
 settings — real content (text, static regions, scene cuts) compresses
 differently and could shift the per-frame byte count `avcodec_send_packet`
-copies. One run, one GPU, one clip; not a swept distribution.
+copies. One run of each variant, one GPU, one clip; not a swept distribution.
 
-`decode_h264` was instrumented with `std::time::Instant` timing around
-`decoder.decode(au)` (submit through `avcodec_send_packet` to every frame
-`drain()` yields), logged at `debug` on the `ghostframe_client_gpu::renderer`
-target — same precedent as `ring.rs`'s existing `publish` timing, same
-`#[allow(clippy::disallowed_methods, ...)]` shape, off by default. The run
-below is 120 frames at 1920x1080 (the production resolution), captured with
+Three spans are now timed with `std::time::Instant`, all in
+`ghostframe-client-gpu/src/renderer.rs`, all logged at `debug` on the
+`ghostframe_client_gpu::renderer` target, same precedent as `ring.rs`'s
+existing `publish` timing (`#[allow(clippy::disallowed_methods, ...)]`, off
+by default):
+
+- `new_us` — `H264Decoder::new()`, the one-time session-startup device open.
+- `decode_us` — `decoder.decode(au)`: submit through
+  `avcodec_receive_frame` returning. **Not** "submit to surface available" —
+  see the revision note above and `decode_h264`'s doc comment at that call
+  site for why.
+- `map_us` — `frame.map_dmabuf()` in `blit_h264_frame`: this is where
+  `vaSyncSurface` actually waits for the hardware decode to finish.
+
+`ring::publish`'s existing `poll_us` is the fourth number, unchanged. Both
+runs below are 120 frames at 1920x1080 (the production resolution), captured
+with
 `RUST_LOG=ghostframe_client_gpu::renderer=debug,ghostframe_client_gpu::ring=debug`.
+"Steady" below excludes the first 5 frames (frame 0's one-time cost plus
+frames 1-4's B-frame-reorder pipeline fill, per §10.2).
 
-### 10.2 Decode time per frame
+### 10.2 The one-time session-startup cost: ~43-46 ms, not 32.66 ms
 
 ```
-decode_us, all 120 frames:            min=110  p50=153  p99=1010  max=32656
-decode_us, frames 1-119 (no frame 0):  min=110  p50=153  p99=831   max=1010
-decode_us, last 60 frames (steady):   min=110  p50=145  p99=212   max=248
+                          UNPACED    PACED (60Hz)
+H264Decoder::new()        12.75 ms   15.13 ms
+frame 0 decode_us         30.75 ms   30.82 ms
+                          --------   --------
+first-frame total         43.49 ms   45.95 ms
 ```
 
-**Frame 0 (the keyframe, first submit of the session) cost 32.66 ms** —
-`frame_count=0` on that call, i.e. it didn't even yield a decoded frame; the
-cost is VA-API device/surface-pool setup happening lazily inside the first
-`avcodec_send_packet`, not steady per-frame decode. It is a one-time
-per-session cost, not a per-frame one — it happens once whether the session
-runs 10 frames or 10,000 — but it is real and it lands on the render thread:
-a 32.66 ms stall on the first H.264 frame of a session, against a 16.67 ms
-budget. Frames 1-4 cost 700 us-1.01 ms as the decoder's internal pipeline
-depth fills (normal B-frame reorder latency, not a defect); by frame 5 it
-settles to the steady-state band above and stays there for the rest of the
-120-frame run. Steady-state p50 (145 us) and p99 (212 us) are both under 1.5%
-of the 16.67 ms budget.
+The first draft of this section attributed frame 0's cost to "VA-API
+device/surface-pool setup happening lazily inside the first
+`avcodec_send_packet`" and reported only that number (32.66 ms in that run).
+That was wrong in two ways: device setup (`av_hwdevice_ctx_create`) happens
+inside `H264Decoder::new()`, called *before* `decode_h264`'s timer starts —
+excluded from every §10.2 number in the first draft, not the source of frame
+0's cost. What frame 0's ~30.7-30.8 ms actually contains, matching this
+project's own `decoder.rs`, is SPS parse → `get_format` → hw-frames-context
+and surface-pool init → `vaCreateConfig`/`vaCreateContext` → the first
+submission — the sentence that matters if something here is to be
+pre-warmed, since it names what the warm-up call needs to trigger, not just
+that a stall exists.
+
+`new_us` varied between the two runs (12.75 ms vs 15.13 ms) despite running
+back to back in the same process invocation via `cargo test`, each in its
+own `#[ignore]`d test — real driver/kernel-state variance, not a
+measurement artifact; treat both as one-run samples, not a stable constant.
+**Total first-H.264-frame stall is ~43.5-46 ms, roughly 2.6-2.8 sixty-hertz
+frame budgets** — this is the number that should drive any "warm the VA-API
+context at startup" decision, not the ~32.7 ms the first draft credited it
+with. It remains a one-time, per-session cost (open once, decode 10 frames
+or 10,000, same startup bill), not a per-frame one, and warming the context
+before the first real access unit arrives is still a smaller, more targeted
+fix than a decode thread.
 
 ### 10.3 Import path
 
-**Zero-copy dmabuf import ran for all 120 frames** — `blit_h264_frame`'s
-"H.264 import path: zero-copy dmabuf" logged once and no CPU-copy fallback
-path fired, confirming Task 9's finding (§7.2) holds under a longer run.
-There is no CPU copy cost to report on this hardware.
+**Zero-copy dmabuf import ran for all 120 frames** in both runs —
+`blit_h264_frame`'s `H.264 import path: zero-copy dmabuf` logged once and no
+CPU-copy fallback path fired, confirming Task 9's finding (§7.2) holds under
+a longer run. There is no CPU copy cost to report on this hardware. (This
+finding was not affected by the sync-timing gap and is unchanged from the
+first draft.)
 
-### 10.4 Publish cadence, and why the comparison to M2 needs a caveat
+### 10.4 Steady-state per-frame cost: decode, the sync wait, and publish
 
 ```
-poll_us (device.poll inside publish), 120 samples:
-  min=7  p50=501  p99=2726  max=3476
+                        UNPACED (n=115/117)          PACED 60Hz (n=115/117)
+decode_us   min=106  p50=122  p90=142  p99=190  max=323    min=106  p50=156  p90=233  p99=306  max=345
+map_us      min=3    p50=758  p90=3035 p99=3854 max=3914   min=3    p50=9    p90=2898 p99=4034 max=4071
+poll_us     min=443  p50=507  p90=1931 p99=2914 max=3412   min=468  p50=1762 p90=2049 p99=2244 max=2245
 ```
 
-This is **not directly comparable to M2's steady-state number (p50 97 us,
-p99 624 us)**: that number was measured under partial-blit damage (a 64x64
-spinner region), and `blit_h264_frame` calls `ring.mark_dirty_all()` on
-*every* H.264 frame — the whole frame is dirty every publish, because H.264
-replaces the whole picture. The honest comparison is M2's own **full-surface**
-samples, the three buffer-warmup blits it recorded at whatever resolution
-`showcase.rs` ran at: `[1163, 417, 1934] us`. This run's full-surface numbers
-(min 7, p50 501, p99 2726, max 3476 us, at 1920x1080 — a larger surface than
-M2's) sit in the same order of magnitude, running consistently higher, which
-is consistent with a bigger blit at a higher resolution rather than with
-decode perturbing the thread: the `poll_us` samples near 500 us track a
-roughly bimodal pattern (~450-520 us most frames, ~1.4-3.5 ms on a
-minority) that does not correlate frame-by-frame with elevated `decode_us` —
-the worst `poll_us` values (2.5-3.5 ms) occur next to *ordinary* ~140-180 us
-decodes, not next to the frame-0/frame-1-4 decode spikes. The low outlier
-(7 us) is a publish call with nothing to blit yet, from decoder pipeline
-latency (`frame_count=0`) at the start of the run. **Max observed sum of
-decode + publish-poll on one iteration is well under budget**: even pairing
-the worst `poll_us` (3.48 ms) with a steady-state `decode_us` (~150-250 us)
-totals ~3.7 ms, 22% of 16.67 ms.
+(`decode_us`/`map_us` n=115/117: `map_dmabuf` runs once per *yielded* frame,
+and one steady-state access unit occasionally yields more than one frame
+through B-frame reordering, so it has slightly more samples than `decode_us`
+over the same 115 steady iterations.)
+
+**`map_us` — the actual hardware-decode wait — is the largest of the three
+numbers, not `decode_us`.** In the unpaced run its median (758 us) is 6x
+`decode_us`'s median (122 us), and its p99 (3.85 ms) is 20x `decode_us`'s
+p99 (190 us). This is the number the first draft of this section never
+measured.
+
+**Pacing changes `map_us`'s shape substantially, matching what the review
+that caught this predicted from its own reproduction.** Paced to the real
+16.667 ms (60 Hz) arrival cadence, `map_us`'s median drops to 9 us — the
+hardware has usually already finished decoding by the time `map_dmabuf` asks
+— but the tail does not go away: 29 of 117 steady samples (24.8%) still
+exceed 1 ms, topping out at a 4.07 ms max. Unpaced, that fraction is 42 of
+117 (35.9%). Read together: under real arrival timing, roughly one frame in
+four still pays a multi-millisecond wait; the other three pay next to
+nothing.
+
+`decode_us` itself is essentially unaffected by pacing (steady p50 122-156
+us, p99 190-306 us in both runs) — it is CPU-side packet handling, not the
+part waiting on the GPU.
+
+**`poll_us` is higher here than in either M2's steady-state number or the
+first draft of this section, and for two compounding reasons, not one.**
+First (unchanged from the first draft): `blit_h264_frame` calls
+`ring.mark_dirty_all()` on every H.264 frame, so every `publish` here does a
+full-frame blit, not M2's partial 64x64-region blit — the fair comparison is
+M2's own three full-surface buffer-warmup samples (`[1163, 417, 1934] us`),
+not its 97/624 us steady-state pair. Second (new in this round, per review
+MODERATE 4): the first draft's harness passed `host_visible: true` to
+`Renderer::new`, pinning export buffers to CPU-mappable memory; production
+derives that flag from `Config::debug_map_frames`, which defaults `false` —
+device-local memory. This section's numbers now use `host_visible: false`,
+so `poll_us` here is finally measuring the same memory type `fb.blit_rects`
+targets in production, closing that gap rather than just noting it.
+
+**Per-iteration worst case, summing `decode_us` + that iteration's
+`map_us` + `poll_us`:**
+
+```
+                              UNPACED                    PACED 60Hz
+sum, steady (n=115)     p50=1794  p99=4608  max=5273   p50=2142  p99=5854  max=5856  (us)
+% of 16.67 ms budget      11%       28%       32%         13%       35%       35%
+```
+
+This is meaningfully worse than the first draft's "~3.7 ms, 22% of budget"
+claim, which omitted `map_us` entirely. It is also **not** the review's own
+reproduction number (8-11.7 ms, 45-70%): that run's `map_us` distribution
+(p50 1986 us, p99 7943 us, max 8046 us) ran roughly 2-3x higher than either
+run captured here. Both reproductions agree on the *shape* — `map_us`
+dominates, pacing helps the median but not the tail — but not on the exact
+magnitude, on the same class of hardware, within the same investigation.
+That gap is itself a finding: **this number has real run-to-run variance on
+one machine**, wide enough that neither single run should be read as *the*
+number. Nothing in either run exceeded the 16.67 ms budget on its own worst
+sample, but the margin that remains is thin enough, and variable enough,
+that "comfortably under" is not the right phrase for it (see §10.6).
 
 ### 10.5 The per-call allocations
 
-Not measured in isolation — `decode_us` already includes
-`avcodec_send_packet`'s deep copy, `drain()`'s `AVFrame` allocations, and the
-`Vec` built for every call that yields frames, because they all happen inside
-the timed `decoder.decode(au)` call. Even attributing the *entire* steady-state
-decode cost to allocation (a deliberately generous upper bound — actual VA-API
-submission and driver-side work is in there too) puts the ceiling at 212 us
-p99 / 248 us max, 60-80x under the 16.67 ms budget. **Not worth moving to
-`hw_decode.c`'s scratch-`AVFrame`-plus-`av_frame_move_ref` shape on this
-evidence.** What would change the answer: multiple concurrent H.264 sessions
-sharing one render thread (this measured one), or a future finding that
-per-frame allocation specifically — not decode as a whole — shows up as GC-like
-pressure (allocator contention, page faults) under sustained load; neither was
-observed here, and isolating allocation from decode was not attempted because
-the combined number already left enormous headroom.
+Still not measured in isolation, and that conclusion is **not** overturned
+by the sync-timing fix: `decode_us` (which does contain
+`avcodec_send_packet`'s deep copy, `drain()`'s `AVFrame` allocations, and
+the per-yielding-call `Vec`) stayed small and pacing-insensitive throughout
+this round (steady p99 190-306 us) — the cost this section found to be
+large, `map_us`, is a hardware wait, not an allocation, and moving to
+`hw_decode.c`'s scratch-`AVFrame`-plus-`av_frame_move_ref` shape would not
+touch it. Attributing the *entire* steady-state `decode_us` p99 (306 us,
+the higher of the two runs) to allocation still puts the ceiling at 54x
+under the 16.67 ms budget. **Still not worth moving to the `hw_decode.c`
+shape on this evidence** — the finding this round changed is about the sync
+wait, not about `decode_us`'s composition. What would change this specific
+answer is unchanged from the first draft: concurrent sessions sharing one
+render thread, or a future finding that allocation specifically (not decode
+as a whole) shows allocator-contention symptoms under load.
 
 ### 10.6 Verdict: is a decode thread justified?
 
-**No, not on this evidence.** The recurring per-frame cost (steady-state
-decode ~150-250 us, plus the full-frame publish-poll averaging ~500 us with a
-p99 near 2.7 ms) totals a worst-observed ~3.7 ms against a 16.67 ms budget —
-comfortably under, with no sign that decode work is stealing time from
-`publish`'s poll (§10.4). The one number that *does* argue for concern is
-**the 32.66 ms one-time keyframe/hardware-init stall on the very first H.264
-frame of a session** — that alone exceeds one 60 Hz frame budget and would
-show up as a visible first-paint hitch. It is a session-startup cost, not a
-steady-state one, so it does not justify moving *ongoing* decode to its own
-thread; it might justify warming the VA-API context (opening the decoder and
-submitting a throwaway packet) before the first real frame is due, which is a
-smaller, more targeted fix than a decode thread. What would change the
-steady-state answer: a measurement at a lower-power target device (this is a
-dedicated discrete GPU on a desktop; an embedded or shared-GPU target could
-show materially higher decode or contended `poll` times), multiple concurrent
-sessions, or production content whose bitrate/motion characteristics differ
-enough from a synthetic gradient to change `avcodec_send_packet`'s per-call
-copy size materially.
+**Thinner margin than first reported, genuinely so — but still "no" on this
+evidence, held more cautiously than the first draft held it.** The
+corrected worst-observed per-iteration cost is 28-35% of the 16.67 ms budget
+at p99/max in steady state (§10.4), driven almost entirely by `map_us` (the
+`vaSyncSurface` wait the first draft never timed), not by `decode_us`. That
+is a real finding, not noise: it moves this section from "comfortably
+under" to "using a third of the budget at the tail, on one frame in four
+under realistic pacing." It did not, in either run captured here, exceed the
+budget on a single iteration. The review that caught this gap reproduced
+`map_us` at roughly 2-3x this round's magnitude on nominally the same
+hardware, which is reason to treat 35% as a floor on the real tail cost
+here, not a ceiling.
+
+Two things follow from that, not one:
+
+1. **The one-time first-frame stall is worse than first reported and is
+   still the clearer, higher-value fix.** ~43.5-46 ms (§10.2) against a
+   16.67 ms budget is unambiguous regardless of steady-state variance;
+   warming the VA-API context before the first real access unit arrives
+   remains the recommended fix, now with roughly double the previously
+   credited payoff.
+2. **The steady-state question is closer than "no" implies and should not
+   be read as closed.** A decode thread is not justified by *this*
+   evidence — no measured iteration exceeded budget, and the dominant cost
+   (`map_us`) is a hardware wait a decode thread would move off the render
+   thread but not shrink. But the margin measured here (65-72% headroom at
+   worst observed) is not the 78%+ headroom the first draft reported, the
+   two reproductions of the same measurement disagree by 2-3x on the tail,
+   and nothing here tested the condition most likely to close that
+   remaining margin: concurrent sessions, other render-thread work stacked
+   on top, or a less capable GPU than this dedicated RX 480. **What would
+   flip the verdict:** a repeat of this measurement under any of those
+   three conditions showing the `map_us` tail pushing the per-iteration sum
+   materially past what is measured here — at the review's own 45-70%
+   figure, a decode thread would be the honest conclusion, not a deferred
+   one.
 
 ---
 

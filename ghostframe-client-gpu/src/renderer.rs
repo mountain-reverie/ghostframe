@@ -316,7 +316,26 @@ impl Renderer {
             return;
         }
         if self.h264_decoder.is_none() {
-            match ghostframe_client_h264::decoder::H264Decoder::new() {
+            // Timed separately from `decoder.decode()` below: this is the
+            // one-time session-startup cost (`av_hwdevice_ctx_create`, open
+            // `/dev/dri/renderD128`, `vaInitialize`, dlopen the VA driver --
+            // see `h264_unavailable`'s doc), paid once per session, not
+            // once per frame. M3 §10's first review round found it excluded
+            // entirely, which understated the real first-frame stall by
+            // roughly half.
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "measuring a real hardware VA-API device-open stall for M3 §10's decode-thread decision, not a virtual-clock path"
+            )]
+            let new_start = std::time::Instant::now();
+            let opened = ghostframe_client_h264::decoder::H264Decoder::new();
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "measuring a real hardware VA-API device-open stall for M3 §10's decode-thread decision, not a virtual-clock path"
+            )]
+            let new_us = new_start.elapsed().as_micros() as u64;
+            tracing::debug!(new_us, "decode_h264: H264Decoder::new stall");
+            match opened {
                 Ok(d) => self.h264_decoder = Some(d),
                 Err(e) => {
                     tracing::error!(
@@ -370,11 +389,21 @@ impl Renderer {
         }
 
         // Timed at `debug` level so M3's decode-cost measurement (design doc
-        // §10) can isolate the hardware decode stall -- submit to surface
-        // available -- from everything else `decode_h264` does, without
-        // adding an unconditional cost to the hot path -- off by default, on
-        // with `RUST_LOG=ghostframe_client_gpu::renderer=debug`. Mirrors the
-        // precedent in `ring.rs`'s `publish` timing exactly.
+        // §10) can isolate this span from everything else `decode_h264`
+        // does. Two unconditional `Instant::now()` calls (~40ns/frame,
+        // matching `ring.rs`'s `publish` timing precedent exactly) bracket
+        // it; only the `tracing::debug!` line below is level-gated, off by
+        // default, on with `RUST_LOG=ghostframe_client_gpu::renderer=debug`.
+        //
+        // What this span is NOT: "submit to surface available". ffmpeg's
+        // VA-API hwaccel does not synchronise the decoded surface inside
+        // `avcodec_receive_frame` -- the `vaSyncSurface` wait for the
+        // hardware to actually finish decoding lives in the map-to-DRM
+        // path, i.e. inside `frame.map_dmabuf()` in `blit_h264_frame`
+        // below, which is timed separately. This span is submit-through-
+        // `avcodec_receive_frame`-return: CPU-side packet handling plus
+        // whatever of the decode VA-API's async submission model makes
+        // synchronous, not the hardware decode itself.
         #[allow(
             clippy::disallowed_methods,
             reason = "measuring a real hardware H.264 decode stall for M3 §10's decode-thread decision, not a virtual-clock path"
@@ -527,7 +556,27 @@ impl Renderer {
         // `mapped` is kept alive alongside `imported`/the textures through
         // the draw below -- see this function's doc for exactly what that
         // does and does not guarantee.
+        //
+        // Timed at `debug` for the same M3 §10 measurement as
+        // `decode_h264`'s `decode_us` above, and load-bearing to that
+        // measurement's honesty: this call, not `decoder.decode()`, is
+        // where `vaSyncSurface` actually waits for the hardware to finish
+        // decoding (inside ffmpeg's map-to-DRM path in `hwcontext_vaapi`).
+        // A first review round timed only `decode()` and reported the
+        // submit cost as if it were the decode cost; this span is what was
+        // missing.
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "measuring a real hardware vaSyncSurface wait for M3 §10's decode-thread decision, not a virtual-clock path"
+        )]
+        let map_start = std::time::Instant::now();
         let mapped = frame.map_dmabuf();
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "measuring a real hardware vaSyncSurface wait for M3 §10's decode-thread decision, not a virtual-clock path"
+        )]
+        let map_us = map_start.elapsed().as_micros() as u64;
+        tracing::debug!(frame_seq, map_us, "blit_h264_frame: map_dmabuf stall");
         let imported = match &mapped {
             Ok(m) => crate::import::import_nv12(ctx, m.planes()).map_err(|e| e.to_string()),
             Err(e) => Err(e.to_string()),
