@@ -314,11 +314,14 @@ impl H264Decoder {
             // counts frames, and a full frame of added latency to someone
             // watching a remote desktop.
             //
-            // The server encodes with `tune=zerolatency` and no B-frames
-            // (`ghostframe-lib/src/encoder/h264_vaapi.rs:261`), so nothing is
-            // given up. If a future encoder change did emit reordered
-            // frames, this flag makes the decoder refuse to buffer them --
-            // they would arrive out of order rather than late.
+            // The native client decodes full frames via FullFrameEncoder,
+            // whose VA-API path (production on hardware with VA-API support)
+            // sets only the GOP length (`ghostframe-lib/src/encoder/
+            // h264_vaapi.rs:573`), leaving max_b_frames at its default of 2.
+            // Without this flag, the decoder would buffer for those reordered
+            // frames. The libx264 fallback does set tune=zerolatency (:616),
+            // which disables B-frames in software, but the decoder needs the
+            // guarantee regardless of which path encoded the stream.
             // SAFETY: `ctx` is an allocated, not-yet-opened codec context.
             (*ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
 
