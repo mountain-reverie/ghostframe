@@ -884,32 +884,46 @@ rare in practice (window reconfiguration, not classifier flapping), so a single
 resize drag**, which can fire many `FrameDimensions` per second and would pay
 this repeatedly — that, not mode flapping, is the case worth watching.
 
-**Pre-warm was built and measured (native-client M3 perf task, after the
-above).** The fix: `Renderer::new` gains `max_decode_width`/`max_decode_height`
-(the client's own screen size, plumbed from `Config`/`gf_client_config`
-through the CLI's window backend and the C ABI, with `struct_size`-gated
-backward compatibility on the latter); when both are non-zero,
-`H264Decoder::with_prewarm` builds and `av_hwframe_ctx_init`s an
-`AVHWFramesContext` at that size — `initial_pool_size = 17` (1 base surface +
-16 for H.264's DPB, matching `vaapi_decode.c`'s own non-dynamic sizing) —
-synchronously inside `Renderer::new`, instead of leaving `H264Decoder`
-unconstructed until the first `NeedsH264` event. `get_vaapi_format` then hands
-the pre-built pool to the decoder (`av_buffer_ref`, a fresh reference) whenever
-the pool covers the stream's `coded_width`/`coded_height`, and leaves
-`hw_frames_ctx` null otherwise — verified against ffmpeg n9.0.1
-(`libavcodec/decode.c`'s `ff_get_format`, `libavcodec/h264_slice.c`'s
-`init_dimensions`/`get_pixel_format`, `libavcodec/vaapi_decode.c`'s
-`ff_vaapi_decode_init`) that `get_format` runs again on every resolution
-change with `hw_frames_ctx` already cleared, that `ff_decode_get_hw_frames_ctx`
-no-ops when a caller has already set `hw_frames_ctx` (so nothing upstream
-double-checks the size — `get_vaapi_format`'s own `>=` check is the only
-guard), and that `vaCreateContext` is called with the *stream's* coded
-size but the *pool's* surface list, which is the documented VA-API idiom for
-surfaces larger than the decode target.
+**Measurement caveat (for both paragraphs above).** `gradient_clip` uses plain
+libx264 with B-frames, so a re-entry picture's sync lands two access units
+after the one that decoded it, and the harness walks the log forward to find
+it. Production sets `tune=zerolatency` (`h264_vaapi.rs:261`) and has no such
+reordering, so the attribution is harder in the test than in production, not
+easier.
+
+### 10.8 The decoder pre-warm investigation: a fix that measured zero, and the fix that did not
+
+Native-client M3 perf task, after §10.7 above. The owner's request, following
+§10.2's ~43.5 ms session-start figure: pre-warm the decoder at client init,
+sized to the client's own screen, with a documented requirement that a bigger
+stream must still decode — "gracefully, even if slow" — never fail.
+
+**What was built and measured first: a pre-warmed hardware frames pool.**
+`Renderer::new` grew `max_decode_width`/`max_decode_height` (the client's own
+screen size, plumbed from `Config`/`gf_client_config` through the CLI's window
+backend and the C ABI, with `struct_size`-gated backward compatibility on the
+latter); when both were non-zero, `H264Decoder::with_prewarm` built and
+`av_hwframe_ctx_init`ed an `AVHWFramesContext` at that size —
+`initial_pool_size = 17` (1 base surface + 16 for H.264's DPB, matching
+`vaapi_decode.c`'s own non-dynamic sizing) — synchronously inside
+`Renderer::new`, instead of leaving `H264Decoder` unconstructed until the
+first `NeedsH264` event. `get_vaapi_format` handed the pre-built pool to the
+decoder (`av_buffer_ref`, a fresh reference) whenever the pool covered the
+stream's `coded_width`/`coded_height`, and left `hw_frames_ctx` null
+otherwise — verified against ffmpeg n9.0.1 (`libavcodec/decode.c`'s
+`ff_get_format`, `libavcodec/h264_slice.c`'s `init_dimensions`/
+`get_pixel_format`, `libavcodec/vaapi_decode.c`'s `ff_vaapi_decode_init`) that
+`get_format` runs again on every resolution change with `hw_frames_ctx`
+already cleared, that `ff_decode_get_hw_frames_ctx` no-ops when a caller has
+already set `hw_frames_ctx` (so nothing upstream double-checks the size —
+`get_vaapi_format`'s own `>=` check was the only guard), and that
+`vaCreateContext` is called with the *stream's* coded size but the *pool's*
+surface list, which is the documented VA-API idiom for surfaces larger than
+the decode target.
 
 Four cases, each a fresh process (`cargo test <name> -- --ignored`, matching a
 real client's one-process-per-session shape more closely than a batched run —
-both were tried; the numbers agree within noise):
+both were tried; the numbers agreed within noise):
 
 ```
                                     prewarm_us   first decode_us   steady decode_us (p50)
@@ -919,42 +933,29 @@ both were tried; the numbers agree within noise):
 1280x720  -> stream 1920x1080       12 740       30 236            119
 ```
 
-**The hypothesis was wrong.** The fix's target case (pool matches the
-stream, both 1920x1080) shows no improvement over no pre-warm at all —
-29.9 ms against 30.7 ms, well inside run-to-run noise. The oversized-pool
-case (1280x720 pool, 1920x1080 stream — the owner's "bigger frame" scenario)
-costs the same ~30 ms as the matching case, not more: correctness holds
-(40/40 access units decode correctly in every case, confirmed both by
-`Renderer`-level framebuffer assertions and by direct `H264Decoder`-level
-per-frame width/height checks in `ghostframe-client-h264/src/decoder.rs`'s
-`prewarm_smaller_than_stream_still_decodes_correctly`), but the graceful
-path is exactly as fast as the "fast" path — because neither is actually
-fast. What *does* correlate with the ~30 ms cost is the stream's own
-resolution, not pre-warm status at all: every 1920x1080 stream in every
-scenario above costs ~30 ms on its first frame regardless of what was
-pre-warmed or not; the 1280x720 stream costs ~3.8 ms in the one case that
-used it, matching steady state. A targeted follow-up (three fresh
-`H264Decoder`s in one process, no `Renderer`/Vulkan involved:
-no-pre-warm-1080p, then pre-warm-1080p, then no-pre-warm-1080p again) showed
-the ~30 ms cost paid exactly once, by whichever decoder decodes *first in
-the process* — the second and third, regardless of resolution or pre-warm,
-both landed under 4 ms. That does not fully explain the `Renderer`-level
-result (all four scenarios above ran in one process too, yet every
-1920x1080 case paid the cost independently) — the best available reading is
-that constructing a fresh `WgpuContext` (Vulkan device) between scenarios
-resets whatever warm state the previous scenario built up, and that
-whatever pays this cost inside `avcodec_send_packet` scales with the
-*decoded picture's* size, not with anything `av_hwframe_ctx_init` touches.
+**The hypothesis was wrong: pre-warming the pool bought a measured zero.**
+The fix's target case (pool matches the stream, both 1920x1080) showed no
+improvement over no pre-warm at all — 29.9 ms against 30.7 ms, well inside
+run-to-run noise. The oversized-pool case (1280x720 pool, 1920x1080 stream —
+the owner's "bigger frame" scenario) cost the same ~30 ms as the matching
+case, not more: correctness held (40/40 access units decoded correctly in
+every case, confirmed both by `Renderer`-level framebuffer assertions and by
+direct `H264Decoder`-level per-frame width/height checks), but the graceful
+path was exactly as fast as the "fast" path — because neither was actually
+fast. What correlated with the ~30 ms cost was the stream's own resolution,
+not pre-warm status: every 1920x1080 stream in every scenario above cost
+~30 ms on its first frame regardless of what was pre-warmed; the 1280x720
+stream cost ~3.8 ms in the one case that used it, matching steady state.
 
-**Where the cost actually lives.** `av_hwframe_ctx_init` (what pre-warm
-moves into `Renderer::new`) only allocates one test surface, to probe
-`vaDeriveImage` — cheap, and confirmed cheap by `prewarm_us` above
-(12.7-12.8 ms, matching §10.2's already-measured `H264Decoder::new()`
-device-open cost of ~12.75 ms almost exactly, meaning `av_hwframe_ctx_init`
-itself adds close to nothing). The real surface pool fills lazily, one
-`vaCreateSurfaces` call per frame, on both the pre-warmed and the
-ffmpeg-managed path alike — pre-warming does not change *when* those calls
-happen, only where the `AVHWFramesContext` struct itself comes from.
+**Why: the cost lives in `vaCreateConfig`/`vaCreateContext`, not the frames
+pool.** `av_hwframe_ctx_init` (what pre-warm moved into `Renderer::new`) only
+allocates one test surface, to probe `vaDeriveImage` — cheap, and confirmed
+cheap by `prewarm_us` above (12.7-12.8 ms, matching §10.2's already-measured
+`H264Decoder::new()` device-open cost of ~12.75 ms almost exactly, meaning
+`av_hwframe_ctx_init` itself added close to nothing). The real surface pool
+fills lazily, one `vaCreateSurfaces` call per frame, on both the pre-warmed
+and the ffmpeg-managed path alike — pre-warming does not change *when* those
+calls happen, only where the `AVHWFramesContext` struct itself comes from.
 What pre-warming cannot touch is `ff_vaapi_decode_init`
 (`libavcodec/vaapi_decode.c`): `vaapi_decode_make_config` (`vaCreateConfig`,
 `av_hwdevice_get_hwframe_constraints`) and `vaCreateContext` both run only at
@@ -964,30 +965,64 @@ H.264 hwaccel init path with no supported way to run them earlier — doing so
 would mean bypassing `ff_vaapi_decode_init` and driving `vaCreateConfig`/
 `vaCreateContext` by hand outside ffmpeg's own ownership of
 `avctx->internal->hwaccel_priv_data`, a materially bigger and riskier change
-than this task's brief, and out of scope here.
+than this task's brief. Closing this gap is a different, larger task and
+remains undone; **if anyone proposes pre-warming the frames pool again, this
+section is why not** — the measurement above is the answer, not a guess.
 
-**The trade, plainly.** Session-start cost is up: `Renderer::new` now costs
-~13 ms more whenever the host supplies a max resolution (paid even for a
-session that never receives H.264 at all). First-H.264-frame cost is
-*not* meaningfully down for the primary target case — the ~30 ms figure
-§10.2 measured turns out to live almost entirely in VA-API decode-context
-setup, not the hardware-frames-pool allocation this fix pre-builds. What the
-fix *does* deliver, exactly as asked: an oversized stream (bigger than the
-client's own screen) still decodes correctly, at the same cost a matching
-stream already pays — never a crash, never corrupted output, and never
-slower than the case that was already the norm. The owner is not buying a
-faster first frame here; they are buying a `0`x`0`-safe, always-graceful
-decoder init path, at a small (~13 ms) fixed session-start cost that a host
-which never sets `max_decode_width`/`max_decode_height` does not pay at all.
-Closing the real ~30 ms gap is a different, larger task (moving
-`vaCreateConfig`/`vaCreateContext` out of ffmpeg's hwaccel-init path) and is
-not attempted here.
+**What did work: opening the decoder eagerly.** The pool machinery
+(`H264Decoder::with_prewarm`, `PrewarmPool`, the `max_decode_width`/
+`max_decode_height` config surface and its C ABI fields) was removed. In its
+place, `Renderer::new` gained a plain `open_h264_eagerly: bool`, gated on
+`Client::effective_h264` (the AND of the host's request and the local VA-API
+probe, already computed for HELLO) rather than any new config field — no ABI
+change. Sessions begin in H.264 mode (`io_bridge.rs`'s classifier default),
+so a client that advertised the capability opens the decoder at `Renderer::new`
+(triggered by the session's first `FrameDimensions` event) instead of lazily
+on the first `NeedsH264` event, moving `H264Decoder::new()`'s device-open
+call off the critical path of the first H.264 access unit. The
+oversized/mismatched-resolution path needed no new code at all: it was always
+ffmpeg's own default (`hw_frames_ctx` null, `ff_decode_get_hw_frames_ctx`
+builds a correctly-sized context on demand), unconditionally, whether the
+decoder was opened eagerly or lazily.
 
-**Measurement caveat.** `gradient_clip` uses plain libx264 with B-frames, so a
-re-entry picture's sync lands two access units after the one that decoded it,
-and the harness walks the log forward to find it. Production sets
-`tune=zerolatency` (`h264_vaapi.rs:261`) and has no such reordering, so the
-attribution is harder in the test than in production, not easier.
+Re-measured (`ghostframe-client-gpu/tests/gpu_h264_render.rs`'s
+`h264_decoder_open_{eager,lazy}_first_frame_cost`, 120 frames at 1920x1080,
+`host_visible: false` — matching `run_decode_and_publish_timing`'s
+already-reliable shape; an earlier, shorter version of this harness gave
+inconsistent numbers run to run, which is why the shape matters, not just the
+resolution), three isolated-process runs each:
+
+```
+                new_us (H264Decoder::new)   first decode_us   visible hitch (new_us + decode_us, only when both land on the same event)
+eager (x3)      12 165 - 12 585             29 900 - 31 103   ~29.9-31.1 ms (new_us already paid earlier, off this event)
+lazy  (x3)      11 872 - 12 035             30 025 - 31 012   ~42-43 ms (new_us + decode_us both stack onto the first NeedsH264 event)
+```
+
+Both `new_us` and `decode_us` are near-identical between eager and lazy —
+eager open does not change either cost, it only changes *which event* pays
+`new_us`. With lazy open, the first `NeedsH264` event pays `new_us` and
+`decode_us` back to back (~42-43 ms of stall before that frame can publish).
+With eager open, `new_us` is already paid during `Renderer::new` (triggered
+by the session's first `FrameDimensions` event, which always precedes the
+first `NeedsH264` event), so the first `NeedsH264` event pays only
+`decode_us` (~30 ms) — the visible hitch drops by almost exactly the ~12.7 ms
+`H264Decoder::new()` costs, confirming design doc §10.2's device-open figure
+survives the regating from a dedicated config field onto `effective_h264`.
+
+**The trade, plainly.** A session that begins in H.264 mode (the common case)
+sees its visible first-frame hitch drop from ~43.4 ms to ~29.9 ms, at no new
+config surface and no ABI change. A client that never advertised (or never
+has hardware for) H.264 pays nothing extra — `effective_h264` is `false`, the
+decoder stays lazy exactly as before. The remaining ~30 ms — `vaCreateConfig`/
+`vaCreateContext` inside `ff_vaapi_decode_init` — is unresolved: closing it
+would mean driving ffmpeg's own hwaccel objects by hand, which is out of
+scope here, same as it was for the frames-pool attempt above.
+
+**Measurement caveat.** Same as §10.7's: `gradient_clip`'s B-frame reordering
+makes the picture-level attribution harder in the test than
+`tune=zerolatency` production, not easier — irrelevant to the
+`H264Decoder::new()`/`decode()` timings this section reports, which are
+per-call, not per-picture.
 
 ## 11. Deferred, with the conditions
 
@@ -1004,21 +1039,23 @@ milestone.
 
 **Virtual EDID negotiation — the gate for calling the native client done.**
 The client cannot currently tell the server what resolution it can display;
-the server picks and the client takes what arrives. The decoder pre-warm
-(§10.7) therefore sizes its hardware frames pool from the client's *own
-screen*, as a stand-in for the ceiling EDID would establish. A larger stream
-still decodes correctly — `get_format` falls back to letting ffmpeg allocate
-its own pool — at the same ~30 ms first-frame cost a matching-size stream
-already pays (§10.7's measured verdict: that cost is not primarily inside
-the frames-pool allocation this fallback avoids, so an oversized stream is
-not measurably slower than an in-budget one, just not faster either). That
-fallback is the live path today rather than a theoretical safety net,
-because nothing prevents the server choosing a bigger mode.
+the server picks and the client takes what arrives. A stream at any
+resolution decodes correctly today regardless — `get_format` leaves
+`hw_frames_ctx` null and ffmpeg allocates a correctly-sized pool on demand —
+at the ~30 ms first-decode cost §10.2/§10.8 measured, the same whether the
+resolution was expected or not; nothing about this path is a theoretical
+safety net, because nothing prevents the server choosing a bigger mode.
 
-When EDID negotiation lands, the pre-warm ceiling should become the negotiated
-size rather than a guess from the local display, and the oversized-stream path
-becomes genuinely exceptional. The web client will need the same negotiation
-eventually. Out of scope here: M3's job was making the pipeline work.
+Sizing a pre-warmed hardware frames pool from the negotiated ceiling was the
+obvious use for EDID data once it exists, and was tried early — as a stand-in
+using the client's own screen size, before EDID negotiation exists — and
+measured to help nothing: §10.8 found the ~30 ms cost lives in
+`vaCreateConfig`/`vaCreateContext`, not the frames-pool allocation a
+pre-warmed ceiling would avoid. EDID negotiation may still be worth building
+for other reasons (the server should not have to guess a resolution the
+client can't even display), but when it lands, revisit whether a sizing
+strategy keyed off it is worth building at all before assuming it is — §10.8
+is the measurement that says the obvious one is not.
 
 **Fence export.** Still deferred from M1 and re-measured in M2 (p99 624µs against
 a 16.67ms budget). M3 re-checks it only if §10 shows decode changed the picture.

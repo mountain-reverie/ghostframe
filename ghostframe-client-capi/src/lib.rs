@@ -99,20 +99,8 @@ fn fill_message(dst: &mut [libc::c_char; 256], msg: &str) {
     }
 }
 
-/// The byte offset of [`gf_client_config::max_decode_width`] -- i.e. the
-/// size of `gf_client_config` as it existed before that field (and
-/// `max_decode_height`) were appended. A `struct_size` at least this large
-/// covers every field this function unconditionally reads; a `struct_size`
-/// at least `size_of::<gf_client_config>()` additionally covers the two
-/// pre-warm fields. See [`gf_client_create`]'s doc.
-const GF_CLIENT_CONFIG_SIZE_BEFORE_PREWARM: usize =
-    std::mem::offset_of!(gf_client_config, max_decode_width);
-
 /// # Safety
-/// `cfg` must be null, or point to at least `cfg.struct_size` readable
-/// bytes laid out as a prefix of `gf_client_config` -- i.e. a struct built
-/// against this exact header, or an older header that had fewer trailing
-/// fields (see [`gf_client_config`]'s doc on `struct_size`).
+/// `cfg` must be null or point to a valid, readable `gf_client_config`.
 /// `out` must be null or point to a valid, writable `*mut gf_client`.
 #[no_mangle]
 pub unsafe extern "C" fn gf_client_create(
@@ -124,19 +112,9 @@ pub unsafe extern "C" fn gf_client_create(
             return gf_result::GF_ERR_INVALID;
         }
         // SAFETY: non-null per the check above; validity of the pointee is
-        // the caller's contract (documented on this function). Reading
-        // `struct_size` through `&*cfg` before checking it -- rather than
-        // an offset-only raw read -- matches this function's long-standing
-        // pattern and is sound for the same reason the rest of this
-        // function's field reads are: every real C ABI lays out
-        // `gf_client_config`'s fields at a fixed prefix that does not move
-        // as later fields are appended, so a shorter caller allocation
-        // (an older header) still has real bytes at every offset this
-        // function reads up to its own `struct_size` -- checked field by
-        // field below before each read that a later addition could miss.
+        // the caller's contract (documented on this function).
         let cfg = unsafe { &*cfg };
-        let struct_size = cfg.struct_size as usize;
-        if struct_size < GF_CLIENT_CONFIG_SIZE_BEFORE_PREWARM {
+        if cfg.struct_size as usize != std::mem::size_of::<gf_client_config>() {
             return gf_result::GF_ERR_INVALID;
         }
 
@@ -170,19 +148,6 @@ pub unsafe extern "C" fn gf_client_create(
             .to_vec()
         };
 
-        // Read only when `struct_size` actually covers these two fields --
-        // a caller built against a header from before they existed reports
-        // a smaller `struct_size` here (checked above to be at least
-        // `GF_CLIENT_CONFIG_SIZE_BEFORE_PREWARM`), and gets `0`/`0`
-        // ("unknown, do not pre-warm") rather than whatever uninitialised
-        // or unallocated bytes happen to sit past their own struct.
-        let (max_decode_width, max_decode_height) =
-            if struct_size >= std::mem::size_of::<gf_client_config>() {
-                (cfg.max_decode_width, cfg.max_decode_height)
-            } else {
-                (0, 0)
-            };
-
         let config = Config {
             hostname,
             authkey,
@@ -195,8 +160,6 @@ pub unsafe extern "C" fn gf_client_create(
             // no use for CPU-mappable exports -- and paying for them would
             // pin every buffer to a small BAR aperture.
             debug_map_frames: false,
-            max_decode_width,
-            max_decode_height,
         };
 
         let client = match Client::new(config) {
