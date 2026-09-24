@@ -29,7 +29,17 @@ tracing = { workspace = true }
 pollster = { workspace = true }
 
 [dev-dependencies]
+# `test-support` enables `gradient_clip` and `vainfo_reports_h264_vld`,
+# needed by `tests/gpu_h264_render.rs`. Additive only for test/bench
+# builds -- `[dependencies]` above stays feature-bare, so a release build of
+# this crate (and anything depending on it) never picks this up; see that
+# entry's own comment for why this crate must not link ffmpeg outside tests.
+ghostframe-client-h264 = { path = "../ghostframe-client-h264", features = ["test-support"] }
 proptest = "1"
+# So `tests/gpu_h264_render.rs` can print which import path
+# (`blit_h264_frame`'s `tracing::info!`) actually ran -- with no subscriber
+# installed those events go nowhere, not even under `--nocapture`.
+tracing-subscriber = { workspace = true }
 # Parses/validates `shaders/client/*.wgsl` directly (src/shader_validation.rs,
 # Task 8 review item (a)) -- no GPU needed, so this runs under CI's `cargo
 # test --workspace --lib`. Pinned to the exact version `wgpu` itself resolves

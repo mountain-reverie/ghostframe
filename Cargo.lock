@@ -1748,6 +1748,7 @@ dependencies = [
  "proptest",
  "thiserror 2.0.18",
  "tracing",
+ "tracing-subscriber",
  "wgpu",
  "wgpu-hal",
 ]
@@ -1769,6 +1770,7 @@ version = "0.1.0"
 dependencies = [
  "ghostframe-client-core",
  "ghostframe-client-gpu",
+ "ghostframe-client-h264",
  "ghostframe-client-net",
  "ghostframe-protocol",
  "ghostframe-tsnet",

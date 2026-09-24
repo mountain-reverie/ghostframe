@@ -40,6 +40,55 @@ impl HwFrame {
         self.frame
     }
 
+    /// Download this surface to system memory as tightly packed NV12.
+    ///
+    /// The fallback when the dmabuf cannot be imported (tiled modifier,
+    /// misaligned plane offset, or a driver row pitch that disagrees with
+    /// the producer's). Costs a full-frame copy across the bus; correct
+    /// everywhere. Mirrors `oracle_tests::hw_frame_to_nv12`, which this same
+    /// crate's exactness oracle already exercises against a software
+    /// decode, byte for byte.
+    pub fn download_nv12(&self) -> Option<(Vec<u8>, Vec<u8>)> {
+        let w = self.width() as usize;
+        let h = self.height() as usize;
+        // SAFETY: `self.frame` is a live VAAPI frame owned by `self` for the
+        // duration of this call. `sw` is a fresh allocation freed on every
+        // path out of this function through the named `sw` binding (never a
+        // throwaway `&mut { sw }` temporary), so a future edit that touches
+        // `sw` after `av_frame_free` would see ffmpeg's null-out instead of
+        // reading a dangling pointer.
+        unsafe {
+            let mut sw = ffi::av_frame_alloc();
+            if sw.is_null() {
+                return None;
+            }
+            (*sw).format = ffi::AVPixelFormat::AV_PIX_FMT_NV12 as i32;
+            if ffi::av_hwframe_transfer_data(sw, self.frame, 0) < 0 {
+                ffi::av_frame_free(&mut sw);
+                return None;
+            }
+            let y_stride = (*sw).linesize[0] as usize;
+            let uv_stride = (*sw).linesize[1] as usize;
+            let mut luma = Vec::with_capacity(w * h);
+            for row in 0..h {
+                luma.extend_from_slice(std::slice::from_raw_parts(
+                    (*sw).data[0].add(row * y_stride),
+                    w,
+                ));
+            }
+            let chroma_h = h.div_ceil(2);
+            let mut chroma = Vec::with_capacity(w * chroma_h);
+            for row in 0..chroma_h {
+                chroma.extend_from_slice(std::slice::from_raw_parts(
+                    (*sw).data[1].add(row * uv_stride),
+                    w,
+                ));
+            }
+            ffi::av_frame_free(&mut sw);
+            Some((luma, chroma))
+        }
+    }
+
     /// Map this hardware surface to a DRM_PRIME dmabuf description.
     ///
     /// The returned [`MappedFrame`] owns the mapping; its

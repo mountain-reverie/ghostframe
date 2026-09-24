@@ -43,6 +43,14 @@ pub struct Renderer {
     pending_solid: Vec<(u8, u8, [u8; 4])>,
     pending_palrle: Vec<(u8, u8, u8, u8, Vec<u8>)>,
     pending_cdf53: Vec<Cdf53PassEntry>,
+
+    /// Lazily created: a client that never receives H.264 never opens a
+    /// decoder, and a machine without VA-API never can.
+    h264_decoder: Option<ghostframe_client_h264::decoder::H264Decoder>,
+    h264_pipeline: Option<crate::pipelines::h264_nv12::H264Nv12Pipeline>,
+    /// Logged once, so the import path taken is visible without spamming
+    /// every frame.
+    h264_path_logged: bool,
 }
 
 impl Renderer {
@@ -92,6 +100,9 @@ impl Renderer {
             pending_solid: Vec::new(),
             pending_palrle: Vec::new(),
             pending_cdf53: Vec::new(),
+            h264_decoder: None,
+            h264_pipeline: None,
+            h264_path_logged: false,
         })
     }
 
@@ -178,12 +189,13 @@ impl Renderer {
                 let (cols, rows) = tile_grid(*width, *height);
                 self.cdf53.resize(&ctx.device, &ctx.queue, cols, rows);
             }
-            Event::NeedsH264 { .. } => {
-                // H.264 decode is M3 scope. This client negotiates
-                // `supports_h264 = false` in its `ClientConfig::Hello`, so
-                // the server never emits an H.264 access unit to it in the
-                // first place; if one somehow arrived anyway there is no
-                // GPU decode path yet to hand it to.
+            Event::NeedsH264 {
+                frame_seq,
+                payload,
+                is_keyframe,
+                ..
+            } => {
+                self.decode_h264(ctx, *frame_seq, *is_keyframe, payload);
             }
             Event::DecodeError {
                 codec,
@@ -249,6 +261,138 @@ impl Renderer {
 
     pub fn debug_read_framebuffer(&self, ctx: &WgpuContext) -> Vec<u8> {
         self.fb.debug_read(&ctx.device, &ctx.queue)
+    }
+
+    /// Decode one access unit and blit every frame it produced.
+    ///
+    /// Failures are logged, never fatal: a corrupt access unit (FEC failed
+    /// to recover one) must not take down the session, and the next
+    /// keyframe recovers.
+    fn decode_h264(&mut self, ctx: &WgpuContext, frame_seq: u32, is_keyframe: bool, au: &[u8]) {
+        if self.h264_decoder.is_none() {
+            match ghostframe_client_h264::decoder::H264Decoder::new() {
+                Ok(d) => self.h264_decoder = Some(d),
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "H.264 arrived but no decoder could be opened -- the capability \
+                         was advertised without hardware to back it"
+                    );
+                    return;
+                }
+            }
+        }
+        if self.h264_pipeline.is_none() {
+            self.h264_pipeline = Some(crate::pipelines::h264_nv12::H264Nv12Pipeline::new(
+                &ctx.device,
+            ));
+        }
+
+        let decoder = self.h264_decoder.as_mut().expect("just created");
+        let frames = match decoder.decode(au) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(frame_seq, is_keyframe, error = %e, "H.264 decode failed");
+                return;
+            }
+        };
+
+        for frame in frames {
+            self.blit_h264_frame(ctx, frame_seq, &frame);
+        }
+    }
+
+    /// Blit one decoded H.264 frame into the framebuffer.
+    ///
+    /// Each `HwFrame` holds a VA-API surface out of the decoder's pool for
+    /// as long as it lives. This function drops every frame within the loop
+    /// iteration it was decoded in (the `for frame in frames` loop in
+    /// [`Renderer::decode_h264`]), so nothing is held across presents and
+    /// the decoder's default pool size is fine -- but that is a property of
+    /// this code, not a guarantee. A later change that queues frames (e.g.
+    /// to hand them to a compositor across a frame boundary) makes the next
+    /// `receive_frame` stall on pool exhaustion rather than fail, which
+    /// reads as a hang, not a decode error.
+    fn blit_h264_frame(
+        &mut self,
+        ctx: &WgpuContext,
+        frame_seq: u32,
+        frame: &ghostframe_client_h264::decoder::HwFrame,
+    ) {
+        // A decoded size that disagrees with the framebuffer means the tile
+        // stream's FrameDimensions and the H.264 SPS disagree. Blitting
+        // anyway corrupts the framebuffer; dropping recovers at the next
+        // keyframe.
+        if frame.width() != self.fb.width || frame.height() != self.fb.height {
+            tracing::warn!(
+                frame_seq,
+                decoded_w = frame.width(),
+                decoded_h = frame.height(),
+                fb_w = self.fb.width,
+                fb_h = self.fb.height,
+                "dropping H.264 frame whose size disagrees with the framebuffer"
+            );
+            return;
+        }
+
+        let pipeline = self.h264_pipeline.as_mut().expect("created by caller");
+
+        // Preferred path: import the decoder's dmabuf directly. Falls back
+        // to a CPU download when the surface is tiled, misaligned, or the
+        // driver's linear pitch disagrees with the producer's -- all of
+        // which `import_nv12` reports rather than rendering wrong pixels.
+        // The import (and the `MappedFrame` it borrows planes from) is not
+        // kept alive past this call: `ImportedNv12` has no `Drop` of its
+        // own (Task 6) -- each texture carries a wgpu drop callback that
+        // destroys its `VkImage`, and they share an `Arc` whose drop frees
+        // the backing memory, so wgpu-core keeps everything alive until the
+        // submission below retires. No `poll(Wait)` needed here.
+        let imported = frame.map_dmabuf().and_then(|mapped| {
+            crate::import::import_nv12(ctx, mapped.planes())
+                .map_err(|e| ghostframe_client_h264::H264Error::Ffmpeg(e.to_string()))
+        });
+
+        match imported {
+            Ok(imported) => {
+                if !self.h264_path_logged {
+                    tracing::info!("H.264 import path: zero-copy dmabuf");
+                    self.h264_path_logged = true;
+                }
+                pipeline.draw(
+                    &ctx.device,
+                    &ctx.queue,
+                    &self.fb,
+                    imported.luma(),
+                    imported.chroma(),
+                );
+            }
+            Err(e) => {
+                if !self.h264_path_logged {
+                    tracing::info!(
+                        reason = %e,
+                        "H.264 import path: CPU copy (dmabuf import unavailable)"
+                    );
+                    self.h264_path_logged = true;
+                }
+                let Some((luma, chroma)) = frame.download_nv12() else {
+                    tracing::warn!(frame_seq, "H.264 CPU download failed");
+                    return;
+                };
+                let (luma_tex, chroma_tex) =
+                    crate::pipelines::h264_nv12::H264Nv12Pipeline::upload_planes(
+                        &ctx.device,
+                        &ctx.queue,
+                        self.fb.width,
+                        self.fb.height,
+                        &luma,
+                        &chroma,
+                    );
+                pipeline.draw(&ctx.device, &ctx.queue, &self.fb, &luma_tex, &chroma_tex);
+            }
+        }
+
+        // H.264 replaces the whole frame, so every tile is dirty.
+        self.ring.mark_dirty_all();
     }
 }
 
