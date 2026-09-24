@@ -21,6 +21,7 @@ absent from CI:
 |---|---|---|
 | `ghostframe-e2e --test native_client` | Docker + GPU | no |
 | `ghostframe-e2e --test showcase` | Docker + GPU + Weston | no |
+| `ghostframe-e2e --test h264` | Docker + GPU + VA-API + VKMS | no |
 | `ghostframe-e2e --test native_client -- --ignored native_client_converges_at_production_scale_under_loss` | Docker + GPU + VKMS | no |
 
 Run everything locally with `cargo test -p ghostframe-client-gpu`.
@@ -46,6 +47,18 @@ compositor-accepted dmabuf import -- not merely that the process stayed
 alive. Same rule applies: run it locally, needs a real GPU (for the
 dmabuf export) and Weston in addition to Docker, deliberately not named
 in any CI workflow.
+
+`ghostframe-e2e --test h264` (`tests/h264.rs`) is the M3 acceptance test:
+H.264 access units encoded by a live server (GPU capture, `--drm-direct`,
+frame mode pinned to H.264), carried over the same tailnet as
+`native_client`, decoded on VA-API hardware, and blitted through the
+NV12->RGB shader into an exported dmabuf. It asserts the decoded frame
+actually varies across a gradient test pattern -- structure, not exact
+pixels, since H.264 is lossy and the three exactness oracles elsewhere
+already own exact-value coverage. Needs the server's GPU capture pipeline
+in addition to everything `native_client` needs, so it is not simply
+`native_client` run twice; same rule applies otherwise, deliberately not
+named in any CI workflow.
 
 The same file's `native_client_converges_at_production_scale_under_loss`
 is Task 20: the native client at production scale (1920x1080 = 2040 tiles)
