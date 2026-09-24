@@ -103,7 +103,14 @@ fn chroma_pixel(x: u32, y: u32) -> (u8, u8) {
 /// `fd`, at `luma_pitch`/`chroma_offset`/`chroma_pitch`. `len` must be a
 /// safe (<=) bound on the dmabuf's real size -- `fd` is mapped read-write
 /// for exactly that many bytes.
-fn write_patterns(fd: i32, len: usize, luma_pitch: u64, chroma_offset: u64, chroma_pitch: u64) {
+fn write_patterns(
+    fd: i32,
+    len: usize,
+    luma_offset: u64,
+    luma_pitch: u64,
+    chroma_offset: u64,
+    chroma_pitch: u64,
+) {
     // SAFETY: `fd` is a live dmabuf fd for the duration of this call, freshly
     // exported by this same process and not yet imported by Vulkan, so
     // nothing else is reading or writing it concurrently. `len` is a
@@ -127,7 +134,7 @@ fn write_patterns(fd: i32, len: usize, luma_pitch: u64, chroma_offset: u64, chro
 
         for y in 0..LUMA_H as u64 {
             for x in 0..LUMA_W as u64 {
-                let off = y * luma_pitch + x;
+                let off = luma_offset + y * luma_pitch + x;
                 *base.add(off as usize) = luma_pixel(x as u32, y as u32);
             }
         }
@@ -212,19 +219,27 @@ fn read_back(
 
 /// Builds the dmabuf described above: `export.rs`'s LINEAR path produces a
 /// real, over-provisioned RGBA dmabuf purely as a source of page-backed
-/// bytes; this writes an R8 luma pattern at offset 0 and an RG8 chroma
-/// pattern at a distinct, nonzero, alignment-correct offset into it, and
-/// returns the `ExportedImage` (kept alive to keep the fd valid) and the
-/// `DmabufPlanes` describing it.
+/// bytes; this writes an R8 luma pattern at a nonzero offset and an RG8
+/// chroma pattern at a second, distinct, alignment-correct offset into it,
+/// and returns the `ExportedImage` (kept alive to keep the fd valid) and
+/// the `DmabufPlanes` describing it.
 fn build_test_dmabuf(ctx: &WgpuContext) -> (ExportedImage, DmabufPlanes) {
     let (luma_req, luma_pitch) = query_layout(ctx, LUMA_W, LUMA_H, vk::Format::R8_UNORM);
     let (chroma_req, chroma_pitch) = query_layout(ctx, CHROMA_W, CHROMA_H, vk::Format::R8G8_UNORM);
 
-    let luma_offset = 0u64;
-    let chroma_offset = round_up(luma_req.size, chroma_req.alignment);
+    // Neither offset is 0: a real decoder output's luma offset commonly IS
+    // 0, but a test that hardcodes that lets a bug that hardcodes 0 in the
+    // luma bind (instead of using `planes.luma.offset`) pass unnoticed --
+    // this pads a reserved region ahead of luma so a hardcoded-0 bind reads
+    // padding, not the pattern, and the round-trip assertions below catch
+    // it. `luma_req.alignment` is trivially a multiple of itself, so this
+    // stays alignment-correct without another `round_up`.
+    let luma_offset = luma_req.alignment;
+    let chroma_offset = round_up(luma_offset + luma_req.size, chroma_req.alignment);
     assert!(
         chroma_offset > luma_offset,
-        "test setup bug: chroma must land at a distinct, nonzero offset"
+        "test setup bug: chroma must land at a distinct offset, further from \
+         the start of the buffer than luma's"
     );
     let total = chroma_offset + chroma_req.size;
 
@@ -236,17 +251,19 @@ fn build_test_dmabuf(ctx: &WgpuContext) -> (ExportedImage, DmabufPlanes) {
     // written into it below; it exists purely to produce a real dmabuf fd.
     // (A tight-vs-generous backing size was also tried empirically while
     // developing this test, to see whether a too-small declared allocation
-    // -- see `import.rs`'s `debug_assert_eq!` on `total` -- would become
-    // observable through sizing alone; it did not, on either size, because
-    // RADV's dma-buf import uses the fd's real backing size regardless of
-    // the declared `allocationSize`. That is why the guard against that
-    // class of bug lives in `import.rs` itself, not in how this test sizes
-    // its dmabuf.)
+    // would become observable through sizing alone; it did not, on either
+    // size, because RADV's dma-buf import uses the fd's real backing size
+    // regardless of the declared `allocationSize`. That is why `import.rs`
+    // guards this by single-sourcing the value it validates and the value
+    // it allocates, plus an `lseek` cross-check against the fd's own
+    // account of its size, rather than by anything this test could size
+    // its way into exercising.)
     let src = ExportedImage::new(ctx, 64, 512, &[], true).expect("export backing dmabuf");
 
     write_patterns(
         src.raw_fd(),
         total as usize,
+        luma_offset,
         luma_pitch,
         chroma_offset,
         chroma_pitch,
@@ -383,8 +400,65 @@ fn a_misaligned_chroma_offset_is_rejected() {
 
     let err = import_nv12(&ctx, &planes)
         .expect_err("a misaligned chroma offset must be rejected before binding");
+    // `matches!(err, GpuError::Vulkan(_))` alone is not enough:
+    // `check_plane_fits` (the extent guard) also returns `GpuError::Vulkan`,
+    // and is exactly the check that fired here by mistake once before, when
+    // this test increased the offset instead of decreasing it. Asserting
+    // the message names the alignment problem specifically is what would
+    // have caught that mixup, and is what stands between this test and
+    // silently passing for the wrong reason again after a future change to
+    // `build_test_dmabuf`'s sizing.
+    let msg = err.to_string();
     assert!(
-        matches!(err, GpuError::Vulkan(_)),
-        "expected a Vulkan error naming the alignment problem, got {err:?}"
+        matches!(err, GpuError::Vulkan(_))
+            && msg.contains("chroma plane offset")
+            && msg.contains("not a multiple of the required alignment"),
+        "expected the alignment guard's own message, got: {msg}"
     );
+}
+
+#[test]
+fn a_cloned_texture_outlives_the_import_and_stays_usable() {
+    // The regression test C3's fix exists for: under the earlier
+    // per-struct `Drop` design, `ImportedNv12::drop` destroyed both
+    // `VkImage`s and freed their memory synchronously, regardless of what
+    // else still referenced them. A caller that cloned a texture (or built
+    // a view/bind group from one) and then dropped the import -- exactly
+    // what the plan's own Task 9 reference snippet did, dropping the
+    // import right after `draw`, which only submits and never waits --
+    // would have a live `wgpu::Texture` pointing at an already-destroyed
+    // `VkImage`. That is a use-after-free with no validation layers on
+    // this machine to turn it into a clean, loud error; it would present
+    // as silent corruption or an intermittent GPU hang instead. The fix
+    // (`wrap_texture`'s real per-image drop callback, `Arc<ImportOwner>`
+    // shared between both) makes the destroy wait for wgpu's own resource
+    // tracking to decide nothing references the image anymore, so this
+    // must now be sound.
+    let ctx = WgpuContext::new().expect("create wgpu context");
+    let (_src, planes) = build_test_dmabuf(&ctx);
+    let imported = import_nv12(&ctx, &planes).expect("import");
+
+    // Take an owning clone before dropping the import -- the exact
+    // operation the struct doc says must be safe.
+    let luma_clone = imported.luma().clone();
+
+    // Drop the import now, before any GPU work has touched `luma_clone` --
+    // the worst-case ordering for the old design.
+    drop(imported);
+
+    // The clone must still be a fully usable texture. A real GPU readback
+    // is what actually exercises the hazard rather than merely
+    // type-checking it: if the VkImage were already destroyed, this
+    // `copy_texture_to_buffer` reads through a dangling handle.
+    let luma_bytes = read_back(&ctx.device, &ctx.queue, &luma_clone, LUMA_W, LUMA_H, 1);
+    for y in 0..LUMA_H {
+        for x in 0..LUMA_W {
+            let idx = (y * LUMA_W + x) as usize;
+            assert_eq!(
+                luma_bytes[idx],
+                luma_pixel(x, y),
+                "clone read wrong bytes at ({x},{y}) after the import was dropped"
+            );
+        }
+    }
 }
