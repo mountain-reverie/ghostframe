@@ -1070,6 +1070,19 @@ git commit -m "feat(h264): VA-API decoder, and a probe that decodes to prove it"
 
 ## Task 4: The DRM descriptor
 
+> **The listings below predate this task's review and were NOT updated.**
+> What shipped differs: `from_descriptor` is a safe `fn` (its body has no
+> unsafe operations), uses an explicit `match d.nb_layers { 1 => .., 2 => ..,
+> n => Err }` rather than a flatten loop — so no driver-supplied count can
+> reach an array index — validates the layer fourcc against `NV12` or the
+> `{R8, GR88}` pair, and `DmabufPlanes` carries `size`, `fourcc_luma`,
+> `fourcc_chroma` and `chroma_width()`/`chroma_height()`. `MappedFrame::planes`
+> is an accessor, not a field.
+>
+> Read `ghostframe-client-h264/src/descriptor.rs` for the real shape. This
+> listing is kept as the record of what was specified; the source is the record
+> of what shipped. Following the code below verbatim would undo the review.
+
 **Files:**
 - Create: `ghostframe-client-h264/src/descriptor.rs`
 - Modify: `ghostframe-client-h264/src/decoder.rs` (add `HwFrame::map_dmabuf`)
