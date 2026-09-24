@@ -273,9 +273,21 @@ stream's `FrameDimensions` and the H.264 SPS disagreeing means something is
 wrong upstream; blitting anyway corrupts the framebuffer, and the next keyframe
 recovers. Dropping is recoverable, corruption is not.
 
-**Decode error** → report through the existing `DecodeError` feedback path
-rather than inventing telemetry, and wait for the next keyframe. The server's
-`decode_error_batcher` already aggregates these.
+**Decode error** → log at `warn` and wait for the next keyframe.
+
+This is weaker than it first looks, and the weakness is worth stating. The
+`DecodeError` feedback path runs in `ClientCore`, which reports *tile* decode
+failures it detects itself; the renderer sits downstream of it and has no
+channel back. So an H.264 decode failure is visible locally and invisible to the
+server, which will keep sending H.264 to a client that cannot decode it. M1's
+existing `DecodeError` arm has the same shape and the same limitation.
+
+Accepted for M3 because the recovery does not depend on the server knowing: the
+next keyframe fixes the stream, and a client whose hardware cannot decode at all
+never advertises the capability in the first place (§6). Wiring renderer-side
+failures into the feedback stream is a real improvement, and belongs with a
+decision about what the server should *do* with it — which is more than this
+milestone should decide on its own.
 
 **No keyframe yet** → ffmpeg returns `EAGAIN` until it has one. Feed packets,
 emit nothing, do not log per frame. This is normal at session start, not an
