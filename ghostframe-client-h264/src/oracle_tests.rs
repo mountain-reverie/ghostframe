@@ -1,8 +1,13 @@
 //! Oracle: VA-API decode == software decode, byte for byte.
 //!
-//! Requires VA-API hardware. Deliberately NOT named in any CI workflow --
-//! runners have no GPU. An #[ignore] would hide it on developer machines
-//! too, which is where it has to run.
+//! Requires VA-API hardware, so these tests run in CI (picked up by `cargo
+//! test --workspace --lib`, `.github/workflows/ci.yml:71`) but self-skip
+//! there: the GPU-less CI runner has no `vainfo`, and every test below gates
+//! on [`crate::probe::vainfo_reports_h264_vld`] returning `None` (not on
+//! `vaapi_h264_decode_available()` -- see the comment on each test for why).
+//! No `#[ignore]` and no CI exclusion by name: this module runs everywhere
+//! it can, and is silent only where it genuinely cannot establish ground
+//! truth.
 //!
 //! A `#[cfg(test)]` module in `src/`, not `tests/*.rs`: these oracles test
 //! this crate's own behaviour, and a unit-test module can see `#[cfg(test)]`
@@ -22,12 +27,39 @@ use crate::testclip::gradient_clip;
 use ffmpeg_next as ffmpeg;
 use ffmpeg_sys_next as ffi;
 
+/// Resolution the exactness oracle (`hardware_decode_matches_software_
+/// decode_exactly`) runs at. Arbitrary but fixed, so the mutation check
+/// recorded on that test stays reproducible.
 const W: u32 = 640;
 const H: u32 = 480;
 
+/// `Some(true)`/`None` gate shared by every oracle in this module: skip
+/// unless independent ground truth (`vainfo`, NOT this crate's own probe)
+/// says the driver can decode H.264.
+///
+/// Gating on `vaapi_h264_decode_available()` would be circular: since that
+/// probe decodes a real frame through `H264Decoder`, a regression in the
+/// decoder would make the probe return `false`, which would make every
+/// oracle skip and report green exactly when it should fail. Task 3's
+/// review rejected that circularity once already; it must not come back at
+/// every oracle.
+fn skip_without_independently_verified_vaapi() -> bool {
+    match crate::probe::vainfo_reports_h264_vld() {
+        Some(true) => false,
+        Some(false) => {
+            eprintln!("driver reports no H.264 VLD entrypoint; skipping");
+            true
+        }
+        None => {
+            eprintln!("vainfo unavailable; cannot establish ground truth, skipping");
+            true
+        }
+    }
+}
+
 /// Decode with libavcodec's software H.264 decoder; return NV12 planes per
-/// frame as (luma, chroma), tightly packed at W and W bytes per row.
-fn software_decode_nv12(clip: &[Vec<u8>]) -> Vec<(Vec<u8>, Vec<u8>)> {
+/// frame as (luma, chroma), tightly packed at `w` and `w` bytes per row.
+fn software_decode_nv12(clip: &[Vec<u8>], w: u32, h: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
     ffmpeg::init().expect("ffmpeg init");
     let codec = ffmpeg::decoder::find(ffmpeg::codec::Id::H264).expect("no h264 decoder");
     let ctx = ffmpeg::codec::context::Context::new_with_codec(codec);
@@ -38,18 +70,18 @@ fn software_decode_nv12(clip: &[Vec<u8>]) -> Vec<(Vec<u8>, Vec<u8>)> {
         let mut frame = ffmpeg::frame::Video::empty();
         while dec.receive_frame(&mut frame).is_ok() {
             let y_stride = frame.stride(0);
-            let mut luma = Vec::with_capacity((W * H) as usize);
-            for row in 0..H as usize {
-                luma.extend_from_slice(&frame.data(0)[row * y_stride..row * y_stride + W as usize]);
+            let mut luma = Vec::with_capacity((w * h) as usize);
+            for row in 0..h as usize {
+                luma.extend_from_slice(&frame.data(0)[row * y_stride..row * y_stride + w as usize]);
             }
             // YUV420P -> NV12: interleave U and V. Exact, not a conversion.
             let u_stride = frame.stride(1);
             let v_stride = frame.stride(2);
-            let mut chroma = Vec::with_capacity((W * H / 2) as usize);
-            for row in 0..(H / 2) as usize {
-                let u = &frame.data(1)[row * u_stride..row * u_stride + (W / 2) as usize];
-                let v = &frame.data(2)[row * v_stride..row * v_stride + (W / 2) as usize];
-                for i in 0..(W / 2) as usize {
+            let mut chroma = Vec::with_capacity((w * h / 2) as usize);
+            for row in 0..(h / 2) as usize {
+                let u = &frame.data(1)[row * u_stride..row * u_stride + (w / 2) as usize];
+                let v = &frame.data(2)[row * v_stride..row * v_stride + (w / 2) as usize];
+                for i in 0..(w / 2) as usize {
                     chroma.push(u[i]);
                     chroma.push(v[i]);
                 }
@@ -68,8 +100,10 @@ fn software_decode_nv12(clip: &[Vec<u8>]) -> Vec<(Vec<u8>, Vec<u8>)> {
     out
 }
 
-/// Download a VA-API surface to system memory as NV12, tightly packed.
-fn hw_frame_to_nv12(frame: &crate::decoder::HwFrame) -> (Vec<u8>, Vec<u8>) {
+/// Download a VA-API surface to system memory as NV12, tightly packed at
+/// `w`/`h` (the frame's own display dimensions, not necessarily this
+/// module's `W`/`H` consts -- the linearity check runs this at 1080p too).
+fn hw_frame_to_nv12(frame: &crate::decoder::HwFrame, w: u32, h: u32) -> (Vec<u8>, Vec<u8>) {
     // SAFETY: `frame` holds a live VAAPI AVFrame; `sw` is freed before return.
     unsafe {
         let sw = ffi::av_frame_alloc();
@@ -80,58 +114,69 @@ fn hw_frame_to_nv12(frame: &crate::decoder::HwFrame) -> (Vec<u8>, Vec<u8>) {
 
         let y_stride = (*sw).linesize[0] as usize;
         let uv_stride = (*sw).linesize[1] as usize;
-        let mut luma = Vec::with_capacity((W * H) as usize);
-        for row in 0..H as usize {
+        let mut luma = Vec::with_capacity((w * h) as usize);
+        for row in 0..h as usize {
             let p = (*sw).data[0].add(row * y_stride);
-            luma.extend_from_slice(std::slice::from_raw_parts(p, W as usize));
+            luma.extend_from_slice(std::slice::from_raw_parts(p, w as usize));
         }
-        let mut chroma = Vec::with_capacity((W * H / 2) as usize);
-        for row in 0..(H / 2) as usize {
+        let mut chroma = Vec::with_capacity((w * h / 2) as usize);
+        for row in 0..(h / 2) as usize {
             let p = (*sw).data[1].add(row * uv_stride);
-            chroma.extend_from_slice(std::slice::from_raw_parts(p, W as usize));
+            chroma.extend_from_slice(std::slice::from_raw_parts(p, w as usize));
         }
         ffi::av_frame_free(&mut { sw });
         (luma, chroma)
     }
 }
 
+/// **Mutation check (recorded, not just run):** temporarily added
+/// `luma[0] = luma[0].wrapping_add(1);` right before this function's `return`
+/// -- corrupting one byte of the hardware side of the comparison below --
+/// and re-ran `hardware_decode_matches_software_decode_exactly`. It FAILED,
+/// naming `frame 0: hardware and software decode disagree on 1 luma and 0
+/// chroma bytes`, exactly as expected. Then reverted. This is what
+/// establishes the oracle actually exercises the comparison it claims to,
+/// rather than passing by construction.
 #[test]
 fn hardware_decode_matches_software_decode_exactly() {
-    // Gate on the DRIVER's own claim, not on `vaapi_h264_decode_available()`.
-    // That probe decodes a frame, so gating on it would mean a decoder
-    // regression makes this test skip and report green -- the test would
-    // vanish exactly when it should fail. Task 3's review rejected that
-    // circularity once already; it must not come back at every oracle.
-    match crate::probe::vainfo_reports_h264_vld() {
-        Some(true) => {}
-        Some(false) => {
-            eprintln!("driver reports no H.264 VLD entrypoint; skipping");
-            return;
-        }
-        None => {
-            eprintln!("vainfo unavailable; cannot establish ground truth, skipping");
-            return;
-        }
+    if skip_without_independently_verified_vaapi() {
+        return;
     }
 
     let clip = gradient_clip(W, H, 8);
-    let sw = software_decode_nv12(&clip);
+    let sw = software_decode_nv12(&clip, W, H);
 
     let mut dec = H264Decoder::new().expect("open hw decoder");
     let mut hw = Vec::new();
     for au in &clip {
         for frame in dec.decode(au).expect("decode") {
-            hw.push(hw_frame_to_nv12(&frame));
+            hw.push(hw_frame_to_nv12(&frame, W, H));
         }
     }
     for frame in dec.finish().expect("finish") {
-        hw.push(hw_frame_to_nv12(&frame));
+        hw.push(hw_frame_to_nv12(&frame, W, H));
     }
 
     assert_eq!(hw.len(), sw.len(), "frame counts differ");
     assert!(!hw.is_empty(), "nothing decoded");
 
     for (i, ((hw_y, hw_uv), (sw_y, sw_uv))) in hw.iter().zip(sw.iter()).enumerate() {
+        // The exactness gate below rests on a zip, which silently truncates
+        // to the shorter side. Both vectors are `W*H` (luma) / `W*H/2`
+        // (chroma) by construction of `hw_frame_to_nv12`/
+        // `software_decode_nv12` above, so this cannot fire today -- but the
+        // gate should rest on an assertion, not on that construction staying
+        // true forever.
+        assert_eq!(
+            hw_y.len(),
+            sw_y.len(),
+            "frame {i}: luma plane length mismatch"
+        );
+        assert_eq!(
+            hw_uv.len(),
+            sw_uv.len(),
+            "frame {i}: chroma plane length mismatch"
+        );
         let y_diff = hw_y.iter().zip(sw_y).filter(|(a, b)| a != b).count();
         let uv_diff = hw_uv.iter().zip(sw_uv).filter(|(a, b)| a != b).count();
         assert_eq!(
@@ -145,7 +190,8 @@ fn hardware_decode_matches_software_decode_exactly() {
     }
 }
 
-/// Is the exported dmabuf laid out exactly as its descriptor claims?
+/// Is the exported dmabuf laid out exactly as its descriptor claims, at
+/// resolution `w`x`h`?
 ///
 /// The modifier field cannot answer this on GFX8 (spec §7.1), so compare the
 /// bytes directly: `av_hwframe_transfer_data` is authoritative, and an mmap of
@@ -155,26 +201,22 @@ fn hardware_decode_matches_software_decode_exactly() {
 /// A match means `import_nv12`'s LINEAR path is sound here despite the missing
 /// metadata. A mismatch means tiled, and the CPU copy is confirmed on evidence
 /// rather than on an absent field.
-#[test]
-fn the_exported_dmabuf_is_linear_at_the_descriptors_layout() {
-    // Gate on the DRIVER's own claim, not on `vaapi_h264_decode_available()`.
-    // That probe decodes a frame, so gating on it would mean a decoder
-    // regression makes this test skip and report green -- the test would
-    // vanish exactly when it should fail. Task 3's review rejected that
-    // circularity once already; it must not come back at every oracle.
-    match crate::probe::vainfo_reports_h264_vld() {
-        Some(true) => {}
-        Some(false) => {
-            eprintln!("driver reports no H.264 VLD entrypoint; skipping");
-            return;
-        }
-        None => {
-            eprintln!("vainfo unavailable; cannot establish ground truth, skipping");
-            return;
-        }
+///
+/// Takes `w`/`h` rather than hardcoding this module's `W`/`H`: radeonsi
+/// chooses tiling per surface from dimensions and alignment, so "linear at
+/// 640x480" does not establish "linear at 1920x1080" -- and 1080p, not
+/// 640x480, is the resolution production actually runs at. Both call sites
+/// below (`..._at_640x480`, `..._at_1080p`) log their own `[m3]` line so
+/// each resolution's result is visible independently; neither is tuned to
+/// agree with the other, and a difference between them would itself be the
+/// finding (linear at one size, tiled at another) that Task 6's runtime
+/// pitch check exists to catch.
+fn assert_dmabuf_is_linear_at(w: u32, h: u32) {
+    if skip_without_independently_verified_vaapi() {
+        return;
     }
 
-    let clip = gradient_clip(W, H, 3);
+    let clip = gradient_clip(w, h, 3);
     let mut dec = H264Decoder::new().expect("open hw decoder");
     let mut frames = Vec::new();
     for au in &clip {
@@ -184,12 +226,12 @@ fn the_exported_dmabuf_is_linear_at_the_descriptors_layout() {
     let frame = frames.first().expect("no frame decoded");
 
     // Authoritative pixels.
-    let (want_luma, want_chroma) = hw_frame_to_nv12(frame);
+    let (want_luma, want_chroma) = hw_frame_to_nv12(frame, w, h);
 
     // The same surface, seen as raw memory.
     let mapped = frame.map_dmabuf().expect("map to dmabuf");
     let p = mapped.planes();
-    let len = (p.chroma.offset + p.chroma.pitch * (H as u64 / 2)) as usize;
+    let len = (p.chroma.offset + p.chroma.pitch * (h as u64 / 2)) as usize;
 
     // SAFETY: `p.fd` is a live dmabuf owned by `mapped`, and `len` is within
     // the object size the descriptor reports. Read-only, shared.
@@ -213,22 +255,22 @@ fn the_exported_dmabuf_is_linear_at_the_descriptors_layout() {
     let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
 
     let mut luma_diff = 0usize;
-    for y in 0..H as usize {
-        let row = &bytes[y * p.luma.pitch as usize..y * p.luma.pitch as usize + W as usize];
+    for y in 0..h as usize {
+        let row = &bytes[y * p.luma.pitch as usize..y * p.luma.pitch as usize + w as usize];
         luma_diff += row
             .iter()
-            .zip(&want_luma[y * W as usize..(y + 1) * W as usize])
+            .zip(&want_luma[y * w as usize..(y + 1) * w as usize])
             .filter(|(a, b)| a != b)
             .count();
     }
 
     let mut chroma_diff = 0usize;
-    for y in 0..(H / 2) as usize {
+    for y in 0..(h / 2) as usize {
         let off = p.chroma.offset as usize + y * p.chroma.pitch as usize;
-        let row = &bytes[off..off + W as usize];
+        let row = &bytes[off..off + w as usize];
         chroma_diff += row
             .iter()
-            .zip(&want_chroma[y * W as usize..(y + 1) * W as usize])
+            .zip(&want_chroma[y * w as usize..(y + 1) * w as usize])
             .filter(|(a, b)| a != b)
             .count();
     }
@@ -237,9 +279,9 @@ fn the_exported_dmabuf_is_linear_at_the_descriptors_layout() {
     // holds the mapping.
     unsafe { libc::munmap(ptr, len) };
 
-    let total = (W * H) as usize + (W * H / 2) as usize;
+    let total = (w * h) as usize + (w * h / 2) as usize;
     eprintln!(
-        "[m3] dmabuf-vs-download: {} of {} bytes differ (luma {}, chroma {})",
+        "[m3] dmabuf-vs-download {w}x{h}: {} of {} bytes differ (luma {}, chroma {})",
         luma_diff + chroma_diff,
         total,
         luma_diff,
@@ -247,9 +289,22 @@ fn the_exported_dmabuf_is_linear_at_the_descriptors_layout() {
     );
 
     // Deliberately NOT an assertion of linearity: both outcomes are valid
-    // findings, and which one holds decides whether `import_nv12` can take the
-    // LINEAR path on this hardware. What IS asserted is that the comparison
-    // actually ran over real data -- a silently empty comparison would report
-    // "0 differ" and look like success.
-    assert!(total > 0 && !want_luma.is_empty(), "nothing was compared");
+    // findings, and which one holds decides whether `import_nv12` can take
+    // the LINEAR path on this hardware. What IS asserted is that the
+    // comparison actually ran over real data -- a decode that silently
+    // produced nothing would make every loop above a no-op and report
+    // "0 differ" indistinguishable from a genuine linear match.
+    assert!(!want_luma.is_empty(), "nothing was compared");
+}
+
+#[test]
+fn the_exported_dmabuf_is_linear_at_the_descriptors_layout_640x480() {
+    assert_dmabuf_is_linear_at(640, 480);
+}
+
+/// Production resolution. See [`assert_dmabuf_is_linear_at`]'s doc for why
+/// the 640x480 result alone does not establish this one.
+#[test]
+fn the_exported_dmabuf_is_linear_at_the_descriptors_layout_1080p() {
+    assert_dmabuf_is_linear_at(1920, 1080);
 }
