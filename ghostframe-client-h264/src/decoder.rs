@@ -171,6 +171,17 @@ fn warn_dropped(frames: &[HwFrame], cause: &str) {
     }
 }
 
+/// Which ffmpeg call [`H264Decoder::submit`] is making, for error messages
+/// -- so a log line can say whether `decode()` or `finish()` produced it,
+/// which the two calls sharing one error format previously lost.
+fn submit_label(au: Option<&[u8]>) -> &'static str {
+    if au.is_some() {
+        "send_packet"
+    } else {
+        "send_packet(NULL)"
+    }
+}
+
 pub struct H264Decoder {
     ctx: *mut ffi::AVCodecContext,
     hw_device: *mut ffi::AVBufferRef,
@@ -301,43 +312,54 @@ impl H264Decoder {
     ///
     /// `Ok(false)` means `EAGAIN`: the decoder's internal buffer is full and
     /// the caller must drain before resending the same input. `Ok(true)`
-    /// covers two different ffmpeg outcomes that both mean "nothing more to
-    /// do here": the input was accepted, *or* this is a second-or-later EOF
-    /// signal and the decoder already reported `AVERROR_EOF` for the first
-    /// one. Per `avcodec.h`, the first flush packet returns success and
-    /// every one after it returns `AVERROR_EOF` -- treating that as
-    /// `Ok(true)` rather than an error is what makes [`Self::finish`]
-    /// idempotent.
+    /// means the input was accepted, *or* -- only on the EOF path (`au ==
+    /// None`) -- that this is a second-or-later EOF signal and the decoder
+    /// already reported `AVERROR_EOF` for the first one. Per `avcodec.h`,
+    /// the first flush packet returns success and every one after it
+    /// returns `AVERROR_EOF`; treating that as `Ok(true)` is what makes
+    /// [`Self::finish`] idempotent.
+    ///
+    /// **That tolerance is gated to `au.is_none()` on purpose.** `finish()`
+    /// puts the decoder into a state where every subsequent
+    /// `avcodec_send_packet` -- packet or null -- returns `AVERROR_EOF`.
+    /// Folding both senders into this one function once let `AVERROR_EOF`
+    /// on a real access unit read as `Ok(true)` too, which made
+    /// `decode()` after `finish()` (without an intervening [`Self::reset`])
+    /// silently swallow the access unit and return an empty `Ok` instead of
+    /// the error `77cc743` exists to guarantee.
+    /// See `decode_after_finish_without_reset_is_an_error`.
     fn submit(&mut self, au: Option<&[u8]>) -> Result<bool, H264Error> {
-        let (ret, what) = match au {
+        let ret = match au {
             Some(au) => {
                 // SAFETY: `au` outlives the call, which copies what it needs
                 // into ffmpeg's own buffers; `self.packet` is a live
                 // allocation reset after every use so it never retains a
                 // dangling pointer into `au`.
-                let ret = unsafe {
+                unsafe {
                     (*self.packet).data = au.as_ptr() as *mut u8;
                     (*self.packet).size = au.len() as i32;
                     let ret = ffi::avcodec_send_packet(self.ctx, self.packet);
                     (*self.packet).data = ptr::null_mut();
                     (*self.packet).size = 0;
                     ret
-                };
-                (ret, "send_packet")
+                }
             }
             None => {
                 // SAFETY: a null packet is ffmpeg's documented end-of-stream
                 // signal.
-                let ret = unsafe { ffi::avcodec_send_packet(self.ctx, ptr::null()) };
-                (ret, "send_packet(NULL)")
+                unsafe { ffi::avcodec_send_packet(self.ctx, ptr::null()) }
             }
         };
         if ret == ffi::AVERROR(libc::EAGAIN) {
             return Ok(false);
         }
-        if ret < 0 && ret != ffi::AVERROR_EOF {
+        if ret == ffi::AVERROR_EOF && au.is_none() {
+            return Ok(true);
+        }
+        if ret < 0 {
             return Err(H264Error::Ffmpeg(format!(
-                "{what}: {}",
+                "{}: {}",
+                submit_label(au),
                 ffmpeg_next::Error::from(ret)
             )));
         }
@@ -353,7 +375,8 @@ impl H264Decoder {
     /// resend error, the other silently discarded them. Factoring it out
     /// makes that omission impossible rather than merely fixed, on every
     /// exit that would otherwise drop frames the decoder already produced
-    /// -- `Result` can carry the error or the frames but not both, so
+    /// -- including the final drain below, after a successful submit --
+    /// since `Result` can carry the error or the frames but not both, so
     /// they're logged instead of vanishing without a trace.
     fn submit_with_retry(&mut self, au: Option<&[u8]>) -> Result<Vec<HwFrame>, H264Error> {
         let mut out = match self.submit(au) {
@@ -364,9 +387,10 @@ impl H264Decoder {
                     Ok(true) => out,
                     Ok(false) => {
                         warn_dropped(&out, "the decoder was still full after drain-and-retry");
-                        return Err(H264Error::Ffmpeg(
-                            "decoder still full after drain-and-retry".into(),
-                        ));
+                        return Err(H264Error::Ffmpeg(format!(
+                            "{}: decoder still full after drain-and-retry",
+                            submit_label(au)
+                        )));
                     }
                     Err(e) => {
                         warn_dropped(&out, "a hard resend error");
@@ -381,8 +405,16 @@ impl H264Decoder {
                 return Err(e);
             }
         };
-        out.extend(self.drain()?);
-        Ok(out)
+        match self.drain() {
+            Ok(more) => {
+                out.extend(more);
+                Ok(out)
+            }
+            Err(e) => {
+                warn_dropped(&out, "a hard error on the final drain");
+                Err(e)
+            }
+        }
     }
 
     /// Discard buffered state and continue decoding -- ffmpeg's
@@ -523,6 +555,35 @@ mod tests {
         }
         frames += dec.finish().expect("finish after reset").len();
         assert!(frames > 0, "decoder produced nothing after reset");
+    }
+
+    /// `finish()` is terminal: once it succeeds, `avcodec_send_packet`
+    /// returns `AVERROR_EOF` for every packet sent afterwards, real or
+    /// null, until [`H264Decoder::reset`]. `decode()` must surface that as
+    /// an error, not silently accept and drop the access unit -- this is
+    /// exactly the regression a refactor introduced when `send_packet` and
+    /// `send_eof` were merged into one `submit` and the EOF tolerance
+    /// leaked onto the packet path. `reset_makes_the_decoder_usable_after_
+    /// finish` above always calls `reset()` first, so it cannot catch this;
+    /// this test deliberately does not.
+    #[test]
+    fn decode_after_finish_without_reset_is_an_error() {
+        if skip_without_vaapi() {
+            return;
+        }
+        let clip = gradient_clip(640, 480, 2);
+        let mut dec = H264Decoder::new().expect("open decoder");
+        for au in &clip {
+            dec.decode(au).expect("decode");
+        }
+        dec.finish().expect("finish");
+
+        let err = dec.decode(&clip[0]);
+        assert!(
+            err.is_err(),
+            "decode() after finish() without reset() must report an error, not silently \
+             accept and drop the access unit"
+        );
     }
 
     /// The real descriptor from real hardware. Records the modifier in the
