@@ -455,6 +455,15 @@ M2's precedent: measure, then decide, and write the numbers down.
 
 - Decode time per frame (submit → surface available), p50/p99.
 - Import path taken (direct / VPP / CPU) and, if CPU, the copy cost.
+- The per-call allocations Task 3's review identified, so the numbers decide
+  whether they are worth removing rather than an opinion doing it:
+  `avcodec_send_packet` deep-copies the entire access unit (it takes the
+  `src->buf == NULL` branch, because the packet is not refcounted) — hundreds
+  of KB for a 1080p keyframe; `drain()` allocates at least two `AVFrame`s per
+  call and frees one; and every call that yields frames allocates a `Vec`.
+  ffmpeg's canonical `hw_decode.c` keeps one scratch `AVFrame` in the struct
+  and `av_frame_move_ref`s out on success, which is the shape to move to if
+  the numbers justify it.
 - Whether decode on the render thread perturbs the publish cadence measured in
   M2 (p50 97µs, p99 624µs steady-state).
 

@@ -611,7 +611,12 @@ use ffmpeg_next as ffmpeg;
 /// would exercise none of the decoder's transform paths.
 pub fn gradient_clip(w: u32, h: u32, n: usize) -> Vec<Vec<u8>> {
     ffmpeg::init().expect("ffmpeg init");
-    let codec = ffmpeg::encoder::find(ffmpeg::codec::Id::H264).expect("libx264 not available");
+    // `find_by_name`, not `find(Id::H264)`: the latter returns whichever H.264
+    // encoder registers first, which can be `h264_vaapi` or `h264_nvenc`. Those
+    // then fail on a YUV420P software frame with no hardware frames context,
+    // while the `.expect` below claims libx264 is missing. Same house rule as
+    // `ghostframe-lib/src/encoder/h264_vaapi.rs:159`.
+    let codec = ffmpeg::encoder::find_by_name("libx264").expect("libx264 not available");
     let ctx = ffmpeg::codec::context::Context::new_with_codec(codec);
     let mut enc = ctx.encoder().video().expect("video encoder");
     enc.set_width(w);
@@ -690,7 +695,7 @@ mod tests {
                 frames += 1;
             }
         }
-        for frame in dec.flush().expect("flush") {
+        for frame in dec.finish().expect("finish") {
             assert_eq!(frame.width(), 640);
             frames += 1;
         }
@@ -879,8 +884,14 @@ impl H264Decoder {
         self.drain()
     }
 
-    /// Drain frames the decoder is still holding. Call at end of stream.
-    pub fn flush(&mut self) -> Result<Vec<HwFrame>, H264Error> {
+    /// Signal end of stream and drain what the decoder still holds.
+    ///
+    /// **Terminal.** After this the decoder returns `AVERROR_EOF` for every
+    /// subsequent packet; use [`H264Decoder::reset`] to make it usable again.
+    /// Deliberately NOT called `flush`: ffmpeg's `avcodec_flush_buffers` means
+    /// the opposite thing (discard state and continue), and `reset` below is
+    /// the wrapper for that.
+    pub fn finish(&mut self) -> Result<Vec<HwFrame>, H264Error> {
         // SAFETY: a null packet is ffmpeg's documented end-of-stream signal.
         unsafe {
             let ret = ffi::avcodec_send_packet(self.ctx, ptr::null());
@@ -912,6 +923,19 @@ impl H264Decoder {
             }
             out.push(HwFrame { frame });
         }
+    }
+}
+
+    /// Discard buffered state and continue decoding — ffmpeg's
+    /// `avcodec_flush_buffers`.
+    ///
+    /// Task 9 needs this on stream discontinuity: unrecovered loss, a
+    /// resolution change, or a session reset. Without it the decoder keeps
+    /// trying to reference frames that will never arrive, and every output
+    /// until the next keyframe is built on stale references.
+    pub fn reset(&mut self) {
+        // SAFETY: `self.ctx` is an open codec context owned solely by `self`.
+        unsafe { ffi::avcodec_flush_buffers(self.ctx) };
     }
 }
 
@@ -947,9 +971,11 @@ path.
 ```bash
 cd /home/cedric/work/ghostframe
 ffmpeg -hide_banner -loglevel error -f lavfi -i color=c=gray:s=64x64:d=1 \
-  -frames:v 1 -c:v libx264 -preset ultrafast -f h264 \
+  -frames:v 1 -c:v libx264 -preset veryfast -profile:v high -f h264 \
   -y ghostframe-client-h264/src/probe_clip.h264
-ls -l ghostframe-client-h264/src/probe_clip.h264   # expect ~655 bytes
+ls -l ghostframe-client-h264/src/probe_clip.h264   # expect ~758 bytes
+ffprobe -loglevel error -show_entries stream=profile -of csv=p=0 \
+  ghostframe-client-h264/src/probe_clip.h264        # MUST print: High
 ```
 
 Replace `probe_inner`'s final `Ok(())` — the one returned when the hwaccel
@@ -966,6 +992,16 @@ config matches — with an actual decode. Append to `probe.rs`:
 /// Embedded rather than encoded at runtime so the probe does not depend on
 /// libx264 being present in the host's ffmpeg build, and costs no encode on
 /// the connect path.
+///
+/// **It must be High profile, because that is what the server sends.**
+/// `h264_vaapi.rs` sets no profile, so ffmpeg's `h264_vaapi` encoder defaults
+/// to High, and VA-API advertises ConstrainedBaseline / Main / High as
+/// separate decode profiles. Probing with a Constrained Baseline clip would
+/// reject a High-only driver that can decode the real stream perfectly well.
+/// Note `-preset ultrafast` cannot produce High — it disables CABAC and 8x8
+/// DCT, which are the features that make it High — so the preset above is
+/// `veryfast`, and the `ffprobe` check is there because the profile is not
+/// what the `-profile:v` flag alone determines.
 const PROBE_CLIP: &[u8] = include_bytes!("probe_clip.h264");
 
 /// Decode one frame through VA-API. The only check that actually proves the
@@ -973,7 +1009,7 @@ const PROBE_CLIP: &[u8] = include_bytes!("probe_clip.h264");
 fn probe_decodes_a_frame() -> Result<(), H264Error> {
     let mut decoder = crate::decoder::H264Decoder::new()?;
     let mut frames = decoder.decode(PROBE_CLIP)?;
-    frames.extend(decoder.flush()?);
+    frames.extend(decoder.finish()?);
     let frame = frames.first().ok_or_else(|| {
         H264Error::VaapiUnavailable(
             "VA-API accepted the stream but produced no frame (driver likely has no \
@@ -1478,7 +1514,7 @@ fn hardware_decode_matches_software_decode_exactly() {
             hw.push(hw_frame_to_nv12(&frame));
         }
     }
-    for frame in dec.flush().expect("flush") {
+    for frame in dec.finish().expect("finish") {
         hw.push(hw_frame_to_nv12(&frame));
     }
 
@@ -1570,7 +1606,7 @@ fn the_exported_dmabuf_is_linear_at_the_descriptors_layout() {
     for au in &clip {
         frames.extend(dec.decode(au).expect("decode"));
     }
-    frames.extend(dec.flush().expect("flush"));
+    frames.extend(dec.finish().expect("finish"));
     let frame = frames.first().expect("no frame decoded");
 
     // Authoritative pixels.
@@ -2857,7 +2893,34 @@ and add these methods to `impl Renderer`:
     }
 ```
 
-- [ ] **Step 4: Add the CPU download to `HwFrame`**
+- [ ] **Step 4: Set the decoder up for per-frame use on the render thread**
+
+Task 3's review surfaced two things that only bite once `decode()` runs per
+frame from the render loop. One is cheap to set at construction; the other is a
+constraint to record where it would be broken.
+
+In `H264Decoder::with_device`, before `avcodec_open2`:
+
+```rust
+            // Without LOW_DELAY, a stream whose SPS carries a non-zero
+            // max_num_reorder_frames makes the decoder hold every frame for one
+            // frame-time before emitting it. That is invisible to a test that
+            // counts total frames, and very visible to someone watching a
+            // remote desktop. The server encodes without B-frames, so there is
+            // nothing to reorder and nothing to lose here.
+            // SAFETY: `ctx` is an allocated, not-yet-opened codec context.
+            unsafe { (*ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32 };
+```
+
+On the frames pool: each `HwFrame` holds a VA-API surface out of the decoder's
+pool for as long as it lives. `blit_h264_frame` below drops every frame within
+the loop iteration, so nothing is held across presents and the default pool
+size is fine — but that is a property of this code, not a guarantee. A later
+change that queues frames or hands them to the compositor makes `receive_frame`
+stall on pool exhaustion rather than fail, which reads as a hang. Say so in
+`blit_h264_frame`'s doc comment, where someone making that change will see it.
+
+- [ ] **Step 5: Add the CPU download to `HwFrame`**
 
 In `ghostframe-client-h264/src/decoder.rs`, add to `impl HwFrame`:
 
@@ -2905,7 +2968,7 @@ In `ghostframe-client-h264/src/decoder.rs`, add to `impl HwFrame`:
     }
 ```
 
-- [ ] **Step 5: Run the test**
+- [ ] **Step 6: Run the test**
 
 ```bash
 cargo test -p ghostframe-client-gpu --test gpu_h264_render -- --nocapture 2>&1 | grep -E 'import path|test result'
@@ -2914,7 +2977,7 @@ cargo test -p ghostframe-client-gpu --test gpu_h264_render -- --nocapture 2>&1 |
 Expected: PASS, and one `H.264 import path: ...` line naming which path ran.
 **Record which one** — it is the answer Task 1 predicted, now confirmed end to end.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add ghostframe-client-gpu ghostframe-client-h264
