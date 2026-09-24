@@ -1614,7 +1614,7 @@ fn the_exported_dmabuf_is_linear_at_the_descriptors_layout() {
 
     // The same surface, seen as raw memory.
     let mapped = frame.map_dmabuf().expect("map to dmabuf");
-    let p = &mapped.planes;
+    let p = mapped.planes();
     let len = (p.chroma.offset + p.chroma.pitch * (H as u64 / 2)) as usize;
 
     // SAFETY: `p.fd` is a live dmabuf owned by `mapped`, and `len` is within
@@ -1756,6 +1756,11 @@ fn imports_a_linear_dmabuf_and_reads_the_bytes_back() {
     let planes = DmabufPlanes {
         fd: src.raw_fd(),
         modifier: src.modifier,
+        // The whole exported object. `from_descriptor` fills this from
+        // `objects[0].size`; here we know it because we allocated it.
+        size: pitch * 64,
+        fourcc_luma: ghostframe_client_h264::DRM_FORMAT_R8,
+        fourcc_chroma: ghostframe_client_h264::DRM_FORMAT_GR88,
         width: 64,
         height: 64,
         luma: PlaneDesc {
@@ -1889,8 +1894,8 @@ fn import_inner(
     )?;
     let chroma = match create_linear_image(
         device,
-        planes.width / 2,
-        planes.height / 2,
+        planes.chroma_width(),
+        planes.chroma_height(),
         vk::Format::R8G8_UNORM,
     ) {
         Ok(i) => i,
@@ -1990,7 +1995,13 @@ fn bind_and_wrap(
         )));
     }
 
-    let total = planes.chroma.offset + planes.chroma.pitch * (planes.height as u64 / 2);
+    // `planes.size` is what the driver reported for the dmabuf object.
+    // Reconstructing it as `chroma.offset + chroma.pitch * chroma_height()`
+    // looks equivalent and is not: any padding past the last chroma row, or an
+    // alignment-driven taller chroma plane, makes the guess short, and a short
+    // `vkAllocateMemory` surfaces as an opaque import failure with nothing
+    // pointing back to the arithmetic.
+    let total = planes.size;
 
     let mut import_info = vk::ImportMemoryFdInfoKHR::default()
         .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
@@ -2042,8 +2053,8 @@ fn bind_and_wrap(
     let chroma_tex = wrap_texture(
         wgpu_device,
         chroma,
-        planes.width / 2,
-        planes.height / 2,
+        planes.chroma_width(),
+        planes.chroma_height(),
         wgpu::TextureFormat::Rg8Unorm,
         "ghostframe-imported-chroma",
     )?;
@@ -2847,7 +2858,7 @@ and add these methods to `impl Renderer`:
         let imported = frame
             .map_dmabuf()
             .and_then(|mapped| {
-                crate::import::import_nv12(ctx, &mapped.planes)
+                crate::import::import_nv12(ctx, mapped.planes())
                     .map_err(|e| ghostframe_client_h264::H264Error::Ffmpeg(e.to_string()))
                     .map(|imported| (mapped, imported))
             });
