@@ -12,21 +12,30 @@ pub mod descriptor;
 pub mod probe;
 // `cfg(test)` covers this crate's own unit tests (decoder::tests uses
 // `gradient_clip`) without a self-referencing dev-dependency on the
-// `testclip` feature -- that idiom compiled the lib twice under
+// `test-support` feature -- that idiom compiled the lib twice under
 // `--all-targets` and let `crate::H264Error` and `ghostframe_client_h264::
 // H264Error` collide as distinct types.
 //
-// The `testclip` feature stays for everyone else: the oracle in
-// `ghostframe-e2e` and `ghostframe-client-gpu`'s tests need `gradient_clip`
-// too, from a different crate's test build, where `#[cfg(test)]` on the
-// defining crate would never be active. A cargo feature is the mechanism
-// that reaches across the crate boundary while still keeping nine panicking
-// paths out of a release build of this production crate by default.
-#[cfg(any(test, feature = "testclip"))]
+// The `test-support` feature stays for everyone else: `tests/*.rs`
+// integration tests in THIS crate (oracle_decode.rs), the oracle in
+// `ghostframe-e2e`, and `ghostframe-client-gpu`'s tests all need
+// `gradient_clip` from a different crate unit's test build, where
+// `#[cfg(test)]` on the defining crate would never be active. A cargo
+// feature is the mechanism that reaches across the crate-unit boundary
+// while still keeping nine panicking paths out of a release build of a
+// production crate that depends on this one with `default-features =
+// false`.
+#[cfg(any(test, feature = "test-support"))]
 pub mod testclip;
 
 pub use descriptor::{DmabufPlanes, PlaneDesc, DRM_FORMAT_GR88, DRM_FORMAT_NV12, DRM_FORMAT_R8};
 pub use probe::vaapi_h264_decode_available;
+// Re-exported so `tests/*.rs` (and other crates' own test builds) can reach
+// the independent ground truth every oracle gates on, without reaching
+// through `probe::`. See probe.rs for why this must NOT be
+// `vaapi_h264_decode_available` itself.
+#[cfg(any(test, feature = "test-support"))]
+pub use probe::vainfo_reports_h264_vld;
 
 #[derive(Debug, thiserror::Error)]
 pub enum H264Error {

@@ -31,6 +31,15 @@ impl HwFrame {
         unsafe { (*self.frame).height as u32 }
     }
 
+    /// Raw pointer to the underlying frame, for callers that need ffmpeg
+    /// APIs this crate does not wrap -- the decode oracle in
+    /// `tests/oracle_decode.rs` downloads through `av_hwframe_transfer_data`
+    /// to build the authoritative NV12 comparison. The frame stays owned by
+    /// `self`; this pointer must not outlive it.
+    pub fn as_ptr(&self) -> *const ffi::AVFrame {
+        self.frame
+    }
+
     /// Map this hardware surface to a DRM_PRIME dmabuf description.
     ///
     /// The returned [`MappedFrame`] owns the mapping; its
@@ -578,12 +587,41 @@ mod tests {
         }
         dec.finish().expect("finish");
 
-        let err = dec.decode(&clip[0]);
+        let msg = match dec.decode(&clip[0]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!(
+                "decode() after finish() without reset() must report an error, not silently \
+                 accept and drop the access unit"
+            ),
+        };
         assert!(
-            err.is_err(),
-            "decode() after finish() without reset() must report an error, not silently \
-             accept and drop the access unit"
+            msg.contains("send_packet"),
+            "error should name send_packet, the call that actually failed; got: {msg}"
         );
+    }
+
+    /// The `if ret == AVERROR_EOF && au.is_none() { return Ok(true) }` gate
+    /// in [`H264Decoder::submit`] is what makes a second `finish()` return
+    /// `Ok` instead of erroring -- per `avcodec.h`, only the first
+    /// EOF-signalling `send_packet(NULL)` succeeds; every one after it
+    /// returns `AVERROR_EOF`, which this gate turns back into `Ok(true)`.
+    /// Removing the whole gate (not just its `au.is_none()` half -- that
+    /// half's own regression is `decode_after_finish_without_reset_is_an_
+    /// error`'s job) would leave every one of the other 21 tests in this
+    /// file passing, since none of them call `finish()` twice: this is the
+    /// one that would catch it.
+    #[test]
+    fn finish_is_idempotent() {
+        if skip_without_vaapi() {
+            return;
+        }
+        let clip = gradient_clip(640, 480, 2);
+        let mut dec = H264Decoder::new().expect("open decoder");
+        for au in &clip {
+            dec.decode(au).expect("decode");
+        }
+        dec.finish().expect("first finish");
+        dec.finish().expect("second finish must also be Ok");
     }
 
     /// The real descriptor from real hardware. Records the modifier in the
