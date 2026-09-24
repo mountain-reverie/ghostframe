@@ -90,6 +90,25 @@ const SKIP_CODEC = 0; // ghostframe_protocol::protocol::Codec::Skip
  * exactly as unfragmented/untied to any wasm-bindgen export or Cargo
  * feature gate as `fragmentTile` itself is.
  */
+/**
+ * Build an eviction datagram the way the server would.
+ *
+ * **What this does NOT prove.** These bytes are encoded here in TypeScript,
+ * using this file's own copies of the sentinel coordinates and codec id --
+ * `ghostframe_protocol::eviction::build_eviction_datagram` is never called.
+ * So a test built on this verifies the *decoder* (wasm core routing) against
+ * a TS-encoded datagram; it cannot catch the Rust encoder drifting away from
+ * these constants. That drift would ship green here and fail only in
+ * production.
+ *
+ * This repo has been bitten by exactly that before: a harness that encoded
+ * its own tiles hid a real bug in the product's encoder. The mitigation is
+ * not to trust this file alone -- the Rust round-trip is covered by
+ * `ghostframe-protocol/src/eviction.rs`'s own tests, and the full
+ * server-to-client path by `ghostframe-e2e/tests/eviction.rs`. If you change
+ * a sentinel or the codec on the Rust side, those are what will tell you;
+ * this helper must then be updated by hand.
+ */
 export function buildEvictionDatagram(reason: number): Uint8Array {
   const frags = fragmentTile(
     0,
