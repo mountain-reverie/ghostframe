@@ -1896,16 +1896,41 @@ impl Drop for ImportedNv12 {
 /// The fd is duplicated, so the caller keeps ownership of theirs and may drop
 /// the mapped frame as soon as this returns.
 pub fn import_nv12(ctx: &WgpuContext, planes: &DmabufPlanes) -> Result<ImportedNv12, GpuError> {
-    // A tiled modifier cannot be imported without
-    // VK_EXT_image_drm_format_modifier. Say so precisely rather than failing
-    // deeper in with a confusing Vulkan error.
+    // Three cases, and the middle one is the one that matters here.
+    //
+    // LINEAR: import, nothing to check.
+    //
+    // INVALID: the producer declined to say. On AMD pre-GFX9 that is the ONLY
+    // value the driver can report -- modifiers begin at GFX9, so radeonsi has
+    // no vocabulary for "linear" either (spec §7.1). Refusing on INVALID would
+    // make this whole function dead code on exactly the hardware it was
+    // written for. Spec §7.2 measured those surfaces byte-for-byte against
+    // `av_hwframe_transfer_data` at 640x480 and 1920x1080 and found them
+    // linear, so we proceed -- and the `check_pitch` below is what keeps that
+    // from being an assumption: it compares the pitch the driver actually
+    // chose against the descriptor's, and refuses the import on disagreement.
+    //
+    // Any other modifier is a real tiled layout, which needs
+    // VK_EXT_image_drm_format_modifier to import. Say so precisely rather than
+    // failing deeper in with a confusing Vulkan error.
     const DRM_FORMAT_MOD_LINEAR: u64 = 0;
-    if planes.modifier != DRM_FORMAT_MOD_LINEAR && !ctx.explicit_modifiers {
-        return Err(GpuError::Vulkan(format!(
-            "dmabuf has modifier 0x{:016x} but this adapter lacks \
-             VK_EXT_image_drm_format_modifier, so only LINEAR (0) can be imported",
-            planes.modifier
-        )));
+    const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
+    match planes.modifier {
+        DRM_FORMAT_MOD_LINEAR => {}
+        DRM_FORMAT_MOD_INVALID => {
+            tracing::debug!(
+                "dmabuf reports no modifier; attempting a linear import, \
+                 guarded by the pitch check"
+            );
+        }
+        m if !ctx.explicit_modifiers => {
+            return Err(GpuError::Vulkan(format!(
+                "dmabuf has modifier 0x{m:016x} but this adapter lacks \
+                 VK_EXT_image_drm_format_modifier, so only LINEAR (0) or \
+                 INVALID (unspecified) can be imported"
+            )));
+        }
+        _ => {}
     }
 
     ctx.with_raw(|instance, device, phys| {
