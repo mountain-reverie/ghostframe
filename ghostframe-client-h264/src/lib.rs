@@ -35,3 +35,17 @@ pub enum H264Error {
     #[error("unexpected DRM descriptor: {0}")]
     Descriptor(String),
 }
+
+/// RAII wrapper around `*mut AVBufferRef` so no early return leaks a hardware
+/// device context. Mirrors `ghostframe-lib/src/encoder/vaapi_device.rs`'s
+/// `BufRef`; this crate has its own because it is declared the owner of every
+/// unsafe ffmpeg call in the client and should not reach into the server crate.
+pub(crate) struct BufRef(pub *mut ffmpeg_sys_next::AVBufferRef);
+
+impl Drop for BufRef {
+    fn drop(&mut self) {
+        // SAFETY: `AVBufferRef` is refcounted; this struct owns exactly one
+        // reference and releases it exactly once.
+        unsafe { ffmpeg_sys_next::av_buffer_unref(&mut self.0) };
+    }
+}

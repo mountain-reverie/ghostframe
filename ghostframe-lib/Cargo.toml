@@ -63,7 +63,7 @@ libc = { workspace = true }
 time = { workspace = true }
 ash = { workspace = true }
 ffmpeg-next = { workspace = true }
-ffmpeg-sys-next = "9.0.0"
+ffmpeg-sys-next = { workspace = true }
 
 [build-dependencies]
 cbindgen = { workspace = true }
