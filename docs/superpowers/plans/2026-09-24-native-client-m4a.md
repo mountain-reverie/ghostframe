@@ -1071,6 +1071,17 @@ providing none."
 
 Two native clients, one server, over tsnet. Requires Docker + GPU.
 
+> **This test is now the ONLY coverage of the eviction send path.** Task 3's
+> review found that setting `EVICTION_REPEATS = 0` leaves every one of the 460
+> lib tests green: the test bridge has no `server.connections` entries, so
+> `evict_session`'s `if let Some(conn)` never enters, and the whole build →
+> 3× → send half of the feature is unverified at unit level. It cannot
+> reasonably be unit-tested — `send_datagram` needs a real
+> `quinn_proto::Connection`. So the assertion here that client A *receives the
+> reason* is not a nice-to-have duplicate of a unit test; it is the only thing
+> standing between a silently broken notice and production. Do not weaken it
+> to "the connection dropped".
+
 **`wait_for_frame` cannot be reused here.** It drains events and keeps only
 frames, discarding `Disconnected` — so this test needs its own waiter. Put it
 in this test file, not in `common/client_wait.rs`: that helper exists because
