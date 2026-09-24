@@ -108,6 +108,11 @@ pub struct gf_client_config {
     pub hostname: *const libc::c_char,
     pub state_dir: *const libc::c_char,
     pub authkey: *const libc::c_char,
+    /// A *request*, not an assertion: whether the host wants H.264 decode if
+    /// this machine can do it. `gf_client_supports_h264` returns the answer
+    /// -- a host that asks for H.264 on a machine without VA-API gets
+    /// `false` there and a working session on the tile codecs, not a
+    /// failure.
     pub supports_h264: bool,
     pub indices_raw: bool,
     /// `0` means "use the library's default" (currently 3).

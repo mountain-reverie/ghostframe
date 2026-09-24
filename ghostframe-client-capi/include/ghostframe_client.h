@@ -81,6 +81,13 @@ typedef struct gf_client_config {
   const char *hostname;
   const char *state_dir;
   const char *authkey;
+  /**
+   * A *request*, not an assertion: whether the host wants H.264 decode if
+   * this machine can do it. `gf_client_supports_h264` returns the answer
+   * -- a host that asks for H.264 on a machine without VA-API gets
+   * `false` there and a working session on the tile codecs, not a
+   * failure.
+   */
   bool supports_h264;
   bool indices_raw;
   /**
@@ -203,6 +210,20 @@ void gf_client_destroy(struct gf_client *c);
  * `c` must be null or a valid, live `gf_client` pointer.
  */
 int32_t gf_client_event_fd(const struct gf_client *c);
+
+/**
+ * The H.264 capability the client actually advertised.
+ *
+ * `gf_client_config.supports_h264` is a *request*; this is the *answer*. A
+ * host that asked for H.264 on a machine without VA-API gets `false` here
+ * and a working session on the tile codecs.
+ *
+ * Returns `false` for a null client.
+ *
+ * # Safety
+ * `c` must be null or a valid, live `gf_client` pointer.
+ */
+bool gf_client_supports_h264(const struct gf_client *c);
 
 /**
  * Never blocks. Returns `GF_AGAIN` when the queue is empty.

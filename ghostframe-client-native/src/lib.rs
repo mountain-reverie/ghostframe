@@ -79,7 +79,9 @@ pub struct Config {
     pub hostname: String,
     pub authkey: String,
     pub state_dir: std::path::PathBuf,
-    /// False in M1 -- H.264 decode is M3 scope.
+    /// A *request*, not an assertion: whether the host wants H.264 decode
+    /// if this machine can do it. [`Client::supports_h264`] is the answer,
+    /// ANDing this with a VA-API probe run once in [`Client::new`].
     pub supports_h264: bool,
     pub indices_raw: bool,
     /// The export ring's buffer count. `0` means "use the render thread's
@@ -174,6 +176,10 @@ pub struct Client {
     /// every one the render thread produced -- a channel would need its
     /// own draining logic to get the same "just the newest" behaviour.
     published: Arc<Mutex<Option<PublishedFrame>>>,
+    /// The capability actually advertised in HELLO: what the host asked for,
+    /// AND what the machine can do. Computed once in `new`, because HELLO is
+    /// built at connect and never revised.
+    effective_h264: bool,
 }
 
 impl Client {
@@ -181,6 +187,16 @@ impl Client {
     /// session -- see the struct doc.
     pub fn new(config: Config) -> Result<Self, ClientError> {
         let queue = Arc::new(EventQueue::new()?);
+        let effective_h264 = config.supports_h264 && {
+            let probed = ghostframe_client_h264::vaapi_h264_decode_available();
+            if config.supports_h264 && !probed {
+                tracing::info!(
+                    "H.264 was requested but VA-API decode is unavailable here; \
+                     advertising tile codecs only"
+                );
+            }
+            probed
+        };
         Ok(Self {
             config,
             queue,
@@ -191,7 +207,17 @@ impl Client {
             render_tx: None,
             wake_fd: None,
             published: Arc::new(Mutex::new(None)),
+            effective_h264,
         })
+    }
+
+    /// The H.264 capability this client actually advertises.
+    ///
+    /// `Config::supports_h264` is a *permission*, not an assertion: a host
+    /// may ask for H.264 on a machine that cannot decode it, and gets a
+    /// working session on the tile codecs rather than a failure.
+    pub fn supports_h264(&self) -> bool {
+        self.effective_h264
     }
 
     /// Bring the tailnet up, fetch and pin the server's cert hash, open the
@@ -292,7 +318,7 @@ impl Client {
             server_name: host.to_string(),
             server_cert_sha256: cert_hash,
             indices_raw_enabled: self.config.indices_raw,
-            supports_h264: self.config.supports_h264,
+            supports_h264: self.effective_h264,
         };
         let mut client_net = ClientNet::new(net_config, 0)?;
         client_net.connect(remote, 0)?;

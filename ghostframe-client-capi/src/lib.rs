@@ -210,6 +210,29 @@ pub unsafe extern "C" fn gf_client_event_fd(c: *const gf_client) -> i32 {
     .unwrap_or(-1)
 }
 
+/// The H.264 capability the client actually advertised.
+///
+/// `gf_client_config.supports_h264` is a *request*; this is the *answer*. A
+/// host that asked for H.264 on a machine without VA-API gets `false` here
+/// and a working session on the tile codecs.
+///
+/// Returns `false` for a null client.
+///
+/// # Safety
+/// `c` must be null or a valid, live `gf_client` pointer.
+#[no_mangle]
+pub unsafe extern "C" fn gf_client_supports_h264(c: *const gf_client) -> bool {
+    catch_unwind(AssertUnwindSafe(move || {
+        if c.is_null() {
+            return false;
+        }
+        // SAFETY: non-null per the check above; validity is the caller's
+        // contract.
+        unsafe { &*c }.inner.supports_h264()
+    }))
+    .unwrap_or(false)
+}
+
 /// Never blocks. Returns `GF_AGAIN` when the queue is empty.
 ///
 /// # Safety
