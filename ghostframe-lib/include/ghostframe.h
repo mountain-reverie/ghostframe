@@ -187,6 +187,15 @@
 #define PALETTE_TABLE_SLOTS 256
 
 /**
+ * Sentinel tile coordinates marking an eviction notice. Distinct from
+ * `FRAME_DIMENSIONS_SENTINEL_*` (0xFF) so the two control messages cannot
+ * be confused for one another.
+ */
+#define EVICTION_SENTINEL_X 254
+
+#define EVICTION_SENTINEL_Y 254
+
+/**
  * Size of the parity packet header in bytes:
  *   - group_start: u16 BE (2 bytes)
  *   - group_len:   u8    (1 byte)
