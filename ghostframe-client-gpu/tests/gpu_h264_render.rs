@@ -126,7 +126,7 @@ fn a_decoded_frame_lands_in_the_framebuffer() {
         return;
     };
 
-    let mut renderer = Renderer::new(&ctx, 640, 480, 3, &[], true).expect("renderer");
+    let mut renderer = Renderer::new(&ctx, 640, 480, 3, &[], true, 0, 0).expect("renderer");
     renderer.apply_event(
         &ctx,
         &Event::FrameDimensions {
@@ -216,7 +216,7 @@ fn run_decode_and_publish_timing(paced: bool) {
         FRAME_COUNT
     );
 
-    let mut renderer = Renderer::new(&ctx, WIDTH, HEIGHT, 3, &[], false).expect("renderer");
+    let mut renderer = Renderer::new(&ctx, WIDTH, HEIGHT, 3, &[], false, 0, 0).expect("renderer");
     renderer.apply_event(
         &ctx,
         &Event::FrameDimensions {
@@ -376,6 +376,11 @@ fn field_u64(line: &str, key: &str) -> Option<u64> {
 enum LogLine {
     /// `H264Decoder::new()` stall, once per session-start decoder open.
     NewStall(u64),
+    /// `Renderer::new`'s eager `H264Decoder::with_prewarm` stall -- the
+    /// pre-warm task's own cost, distinct from `NewStall` above (the lazy
+    /// `decode_h264` open path, which never runs when pre-warm succeeded).
+    /// See `run_prewarm_scenario`.
+    PrewarmStall(u64),
     /// `decode_h264` detected a sequence gap on this `frame_seq` and
     /// therefore called `decoder.reset()` (see that field's doc on
     /// `Renderer::h264_needs_reset`) immediately before decoding it.
@@ -397,6 +402,10 @@ fn parse_log(buf: &[u8]) -> Vec<LogLine> {
         if line.contains("H264Decoder::new stall") {
             if let Some(v) = field_u64(line, "new_us=") {
                 out.push(LogLine::NewStall(v));
+            }
+        } else if line.contains("H264Decoder::with_prewarm stall") {
+            if let Some(v) = field_u64(line, "prewarm_us=") {
+                out.push(LogLine::PrewarmStall(v));
             }
         } else if line.contains("decoder.decode stall") {
             if let (Some(seq), Some(decode_us)) =
@@ -432,6 +441,21 @@ fn new_us_values(log: &[LogLine]) -> Vec<u64> {
             _ => None,
         })
         .collect()
+}
+
+fn prewarm_us_values(log: &[LogLine]) -> Vec<u64> {
+    log.iter()
+        .filter_map(|l| match l {
+            LogLine::PrewarmStall(v) => Some(*v),
+            _ => None,
+        })
+        .collect()
+}
+
+fn decode_count(log: &[LogLine]) -> usize {
+    log.iter()
+        .filter(|l| matches!(l, LogLine::Decode { .. }))
+        .count()
 }
 
 fn gap_detected_seqs(log: &[LogLine]) -> Vec<u32> {
@@ -609,7 +633,7 @@ fn h264_mode_reentry_timing() {
 
     eprintln!("=== h264_mode_reentry_timing ({WIDTH}x{HEIGHT}) ===");
 
-    let mut renderer = Renderer::new(&ctx, WIDTH, HEIGHT, 3, &[], false).expect("renderer");
+    let mut renderer = Renderer::new(&ctx, WIDTH, HEIGHT, 3, &[], false, 0, 0).expect("renderer");
     renderer.apply_event(
         &ctx,
         &Event::FrameDimensions {
@@ -744,7 +768,7 @@ fn h264_resolution_change_timing() {
 
     eprintln!("=== h264_resolution_change_timing ({W1}x{H1} <-> {W2}x{H2}) ===");
 
-    let mut renderer = Renderer::new(&ctx, W1, H1, 3, &[], false).expect("renderer");
+    let mut renderer = Renderer::new(&ctx, W1, H1, 3, &[], false, 0, 0).expect("renderer");
     renderer.apply_event(
         &ctx,
         &Event::FrameDimensions {
@@ -826,4 +850,199 @@ fn h264_resolution_change_timing() {
         "gap-detected frame_seqs: {gaps:?} (expect empty -- a resolution change alone has no \
          client-visible frame_seq gap, so decoder.reset() should NOT fire here)"
     );
+}
+
+// ---------------------------------------------------------------------
+// Native-client perf fix: pre-warm the H.264 decoder's hardware frames pool
+// in `Renderer::new`, sized to the client's maximum resolution -- design
+// doc §10/§10.7. Four required cases: pre-warm == stream (the fix's
+// target), pre-warm > stream (still uses the warm pool), pre-warm < stream
+// (the owner's "bigger frame" graceful-degradation case -- MUST decode
+// correctly, not just avoid a crash), and no pre-warm at all (today's
+// behaviour, unaffected).
+// ---------------------------------------------------------------------
+
+/// Frames per clip for every pre-warm scenario below -- long enough for a
+/// real steady-state sample after the first-frame cost, short enough that
+/// four `#[ignore]`d harnesses stay a reasonable manual run.
+const PREWARM_SCENARIO_FRAMES: usize = 40;
+/// Skip this many warmup frames when computing the steady-state baseline,
+/// same reasoning as `h264_mode_reentry_timing`'s `STEADY_SKIP`.
+const PREWARM_SCENARIO_STEADY_SKIP: u32 = 5;
+
+/// One scenario's measurements. `prewarm_us` is `None` exactly when
+/// `prewarm_w`/`prewarm_h` were `0` (no pre-warm requested) -- see
+/// `run_prewarm_scenario`.
+struct PrewarmScenario {
+    prewarm_us: Option<u64>,
+    first_decode_us: Option<u64>,
+    first_map_us: Option<u64>,
+    steady_decode: Vec<u64>,
+    steady_map: Vec<u64>,
+    steady_sum: Vec<u64>,
+    /// How many access units the clip actually contained, and how many
+    /// produced a `decoder.decode stall` log line -- equal only if every
+    /// AU decoded without a hard error. This is the correctness check case
+    /// 3 (pre-warm smaller than the stream) asserts on directly: a decode
+    /// failure would otherwise only show up as a slightly-off final
+    /// framebuffer, which `assert_looks_like_gradient`'s tolerances are not
+    /// built to catch.
+    clip_len: usize,
+    decoded_count: usize,
+}
+
+/// Run one pre-warm/stream size pair through `Renderer`, the same way
+/// `render_thread.rs`/`decode_h264` really do it (`Renderer::new` once,
+/// then one `NeedsH264` event + flush + publish + release per access unit
+/// via `drive_clip`), and collect every M3 §10 timing plus a correctness
+/// check on the final framebuffer. `host_visible: true` so
+/// `debug_read_framebuffer` works, matching `a_decoded_frame_lands_in_the_
+/// framebuffer`'s precedent -- these are correctness-asserting scenarios,
+/// not the pure-throughput `run_decode_and_publish_timing` harness above,
+/// which deliberately uses `false` to match production's memory type.
+/// Returns `None` if there is no usable GPU/VA-API (already reported by
+/// `gpu_and_vaapi_or_skip`).
+fn run_prewarm_scenario(
+    prewarm_w: u32,
+    prewarm_h: u32,
+    stream_w: u32,
+    stream_h: u32,
+) -> Option<PrewarmScenario> {
+    let (log_buf, _guard) = capture_renderer_logs();
+    let ctx = gpu_and_vaapi_or_skip()?;
+
+    let mut renderer = Renderer::new(&ctx, stream_w, stream_h, 3, &[], true, prewarm_w, prewarm_h)
+        .expect("renderer");
+    renderer.apply_event(
+        &ctx,
+        &Event::FrameDimensions {
+            width: stream_w,
+            height: stream_h,
+        },
+    );
+
+    let clip = gradient_clip(stream_w, stream_h, PREWARM_SCENARIO_FRAMES);
+    let clip_len = clip.len();
+    drive_clip(&mut renderer, &ctx, &clip, 0);
+    renderer.finish_h264(&ctx);
+    renderer.flush(&ctx);
+
+    let pixels = renderer.debug_read_framebuffer(&ctx);
+    assert_looks_like_gradient(&pixels, stream_w, stream_h);
+
+    let log = parse_log(&log_buf.lock().unwrap());
+    let prewarm_us = prewarm_us_values(&log).first().copied();
+    let first_decode_us = decode_us_for(&log, 0);
+    let first_map_us = first_map_after(&log, 0).map(|(_, map_us, _)| map_us);
+    let (steady_decode, steady_map, steady_sum) = steady_samples(
+        &log,
+        PREWARM_SCENARIO_STEADY_SKIP..PREWARM_SCENARIO_FRAMES as u32,
+    );
+
+    Some(PrewarmScenario {
+        prewarm_us,
+        first_decode_us,
+        first_map_us,
+        steady_decode,
+        steady_map,
+        steady_sum,
+        clip_len,
+        decoded_count: decode_count(&log),
+    })
+}
+
+fn report_prewarm_scenario(label: &str, s: &PrewarmScenario) {
+    eprintln!("=== prewarm scenario: {label} ===");
+    match s.prewarm_us {
+        Some(us) => eprintln!(
+            "Renderer::new pool-construction cost: prewarm_us={us} (compare against design \
+             doc §10's ~43.5ms session-start baseline)"
+        ),
+        None => eprintln!("Renderer::new pool-construction cost: n/a (no pre-warm requested)"),
+    }
+    eprintln!(
+        "first frame: decode_us={:?} map_us={:?} decode_us+map_us={:?}",
+        s.first_decode_us,
+        s.first_map_us,
+        s.first_decode_us.zip(s.first_map_us).map(|(d, m)| d + m),
+    );
+    report_percentiles("steady decode_us", s.steady_decode.clone());
+    report_percentiles("steady map_us", s.steady_map.clone());
+    report_percentiles("steady decode_us+map_us", s.steady_sum.clone());
+    eprintln!("decoded {}/{} access units", s.decoded_count, s.clip_len);
+}
+
+/// Case 1 (the fix's target): pre-warm 1920x1080, stream 1920x1080. The
+/// pre-warmed pool exactly fits the stream, so `get_vaapi_format` hands it
+/// straight over -- first-frame decode/map cost should fall towards steady
+/// state instead of paying design doc §10's ~43.5ms session-start cost.
+#[test]
+#[ignore = "manual measurement harness for the native-client decoder pre-warm perf fix"]
+fn prewarm_1920x1080_stream_1920x1080() {
+    let Some(s) = run_prewarm_scenario(1920, 1080, 1920, 1080) else {
+        return;
+    };
+    report_prewarm_scenario("prewarm=1920x1080 stream=1920x1080 (matching)", &s);
+    assert_eq!(s.decoded_count, s.clip_len, "every access unit must decode");
+}
+
+/// Case 2: pre-warm 1920x1080, stream 1280x720 -- a stream smaller than the
+/// pool. `get_vaapi_format`'s `>=` check still accepts it: no reallocation,
+/// same as case 1.
+#[test]
+#[ignore = "manual measurement harness for the native-client decoder pre-warm perf fix"]
+fn prewarm_1920x1080_stream_1280x720() {
+    let Some(s) = run_prewarm_scenario(1920, 1080, 1280, 720) else {
+        return;
+    };
+    report_prewarm_scenario(
+        "prewarm=1920x1080 stream=1280x720 (pool larger than stream)",
+        &s,
+    );
+    assert_eq!(s.decoded_count, s.clip_len, "every access unit must decode");
+}
+
+/// Case 3 -- the owner's "bigger frame" case, and the one that must be
+/// *asserted*, not merely measured: pre-warm 1280x720, stream 1920x1080.
+/// The pre-warmed pool is too small for this stream, so `get_vaapi_format`
+/// must leave `hw_frames_ctx` null and let ffmpeg allocate its own --
+/// slower, but correct. Every access unit must still decode (asserted
+/// below via `decoded_count == clip_len`, not inferred from the absence of
+/// a panic), and the final framebuffer must still look like the real
+/// gradient clip, not a corrupted or truncated one.
+#[test]
+#[ignore = "manual measurement harness for the native-client decoder pre-warm perf fix"]
+fn prewarm_1280x720_stream_1920x1080_still_decodes_correctly() {
+    let Some(s) = run_prewarm_scenario(1280, 720, 1920, 1080) else {
+        return;
+    };
+    report_prewarm_scenario(
+        "prewarm=1280x720 stream=1920x1080 (pool SMALLER than stream -- graceful path)",
+        &s,
+    );
+    assert_eq!(
+        s.decoded_count, s.clip_len,
+        "the graceful-degradation path must decode every access unit correctly, not just \
+         avoid a crash"
+    );
+}
+
+/// Case 4: pre-warm 0x0 -- no pre-warm requested, today's behaviour (the
+/// decoder still opens, lazily, on the first H.264 access unit inside
+/// `decode_h264`). Still works, unaffected by this task.
+#[test]
+#[ignore = "manual measurement harness for the native-client decoder pre-warm perf fix"]
+fn prewarm_0x0_no_prewarm() {
+    let Some(s) = run_prewarm_scenario(0, 0, 1920, 1080) else {
+        return;
+    };
+    report_prewarm_scenario(
+        "prewarm=0x0 (no pre-warm requested -- today's behaviour)",
+        &s,
+    );
+    assert!(
+        s.prewarm_us.is_none(),
+        "0x0 must not pre-warm -- Renderer::new should not have opened the decoder eagerly"
+    );
+    assert_eq!(s.decoded_count, s.clip_len, "every access unit must decode");
 }

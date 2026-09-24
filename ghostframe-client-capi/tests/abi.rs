@@ -28,6 +28,43 @@ fn a_wrong_struct_size_is_rejected() {
     }
 }
 
+/// A `struct_size` reporting the struct as it existed before
+/// `max_decode_width`/`max_decode_height` were appended -- standing in for
+/// a caller built against an older header -- must be accepted, not
+/// rejected: that is the whole point of appending fields rather than
+/// breaking `struct_size`'s exact-match check. Companion to
+/// `a_wrong_struct_size_is_rejected`: that test proves too-small is still
+/// rejected below the original struct's size; this one proves "smaller
+/// than today, but at least the original size" is NOT lumped in with
+/// "wrong".
+#[test]
+fn an_older_smaller_struct_size_is_accepted_with_prewarm_defaulted() {
+    let host = std::ffi::CString::new("test").unwrap();
+    let dir = std::ffi::CString::new("/tmp/gf-capi-test-oldcfg").unwrap();
+    let key = std::ffi::CString::new("").unwrap();
+    let mut cfg: gf_client_config = unsafe { std::mem::zeroed() };
+    cfg.struct_size = std::mem::offset_of!(gf_client_config, max_decode_width) as u32;
+    cfg.hostname = host.as_ptr();
+    cfg.state_dir = dir.as_ptr();
+    cfg.authkey = key.as_ptr();
+    cfg.n_export_buffers = 3;
+    // An old caller's real allocation has no bytes here at all; a non-zero
+    // sentinel confirms the library actually gates on `struct_size` rather
+    // than merely defaulting because these happened to be zeroed.
+    cfg.max_decode_width = 0xdead_beef;
+    cfg.max_decode_height = 0xdead_beef;
+    let mut out: *mut gf_client = std::ptr::null_mut();
+    unsafe {
+        assert_eq!(
+            gf_client_create(&cfg, &mut out),
+            gf_result::GF_OK,
+            "a struct_size matching an older header must be accepted, not rejected"
+        );
+        assert!(!out.is_null());
+        gf_client_destroy(out);
+    }
+}
+
 #[test]
 fn version_is_reported() {
     let (mut a, mut b, mut c) = (0u32, 0u32, 0u32);
