@@ -15,33 +15,21 @@ tracing = { workspace = true }
 # encoder with nine panicking paths) and `vainfo_reports_h264_vld` (the
 # independent-of-this-crate's-own-probe ground truth every oracle gates on
 # -- see probe.rs). Named `test-support`, not `testclip`, because it now
-# carries more than the clip generator.
+# carries more than the clip generator. Off by default: Task 3's review
+# required exactly this, so the panicking clip encoder can never ship in a
+# release build of a production crate by accident.
 #
-# This crate's own unit tests reach both through `#[cfg(any(test, feature =
-# "test-support"))]` in lib.rs and probe.rs, with no dev-dependency needed.
-# `tests/*.rs` integration tests (e.g. `oracle_decode.rs`) are a SEPARATE
-# crate unit that never sees `#[cfg(test)]`, so they need the feature path;
-# that is what the `default = [...]` below and the `[[test]]` stanza's
-# `required-features` are for -- together they let `cargo test -p
-# ghostframe-client-h264` build and run those tests with no extra flag and
-# no self-referencing dev-dependency (which would compile this crate twice
-# and make `crate::H264Error` and `ghostframe_client_h264::H264Error`
-# distinct types -- see lib.rs for why that was rejected).
+# This crate's own tests (unit tests, and `src/oracle_tests.rs`'s
+# `#[cfg(test)]` module) reach both through `#[cfg(any(test, feature =
+# "test-support"))]` in lib.rs and probe.rs, with no feature and no
+# dev-dependency needed -- `cargo test -p ghostframe-client-h264` runs them
+# with no extra flag.
 #
-# A crate that depends on this one for PRODUCTION use, not tests, must set
-# `default-features = false` to keep the testclip encoder and the
-# probe-bypassing helper out of its release build. A crate that only needs
-# `gradient_clip`/`vainfo_reports_h264_vld` from its OWN tests (client-gpu,
-# ghostframe-e2e) can leave the default on, or spell it out explicitly with
-# `features = ["test-support"]` under its own `[dev-dependencies]`.
-default = ["test-support"]
+# A crate that needs `gradient_clip`/`vainfo_reports_h264_vld` from its OWN
+# tests (client-gpu, ghostframe-e2e) enables this feature explicitly under
+# its own `[dev-dependencies]`: `ghostframe-client-h264 = { path = "...",
+# features = ["test-support"] }`. That is safe specifically because the
+# default is off -- a plain `path = "..."` dependency for production use
+# gets none of it.
+default = []
 test-support = []
-
-# The oracle in tests/oracle_decode.rs needs VA-API hardware and is
-# deliberately not named in any CI workflow (runners have no GPU); it still
-# needs `test-support` to reach `testclip::gradient_clip` and
-# `vainfo_reports_h264_vld`, both gated behind the feature above.
-[[test]]
-name = "oracle_decode"
-path = "tests/oracle_decode.rs"
-required-features = ["test-support"]
