@@ -1,5 +1,6 @@
-// Datagram-builder helper shared by the suites that drive WasmClientCore's
-// tile reassembly directly (tile_assembly.test.ts, cdf53_globals.test.ts).
+// Datagram-builder helpers shared by the suites that drive WasmClientCore's
+// tile reassembly directly (tile_assembly.test.ts, cdf53_globals.test.ts,
+// eviction.test.ts).
 //
 // This file used to also hold Clock/AckHarness/NackHarness/
 // parseNackEnvelopeNested, adapting the wasm ACK/NACK batchers' poll-and-
@@ -67,4 +68,41 @@ export function fragmentTile(
     out.set(chunk, header.length);
     return out;
   });
+}
+
+const EVICTION_SENTINEL_X = 0xfe;
+const EVICTION_SENTINEL_Y = 0xfe;
+const SKIP_CODEC = 0; // ghostframe_protocol::protocol::Codec::Skip
+
+/**
+ * Builds a single eviction-notice datagram matching
+ * `ghostframe_protocol::eviction::build_eviction_datagram`'s wire layout:
+ * a tile datagram at the eviction sentinel coordinates (0xFE, 0xFE),
+ * `Codec::Skip`, and a 1-byte reason payload.
+ *
+ * There is no wasm-side builder to call here, and none is added: unlike
+ * the sentinel-parsing logic (which moved server->client into
+ * `ghostframe-client-core`/`ghostframe-protocol` at the wasm cutover),
+ * `build_eviction_datagram` is server-only (`ghostframe_protocol::eviction`,
+ * called from `ghostframe-lib`'s `io_bridge.rs`) and reuses `fragment_tile`
+ * with fixed inputs -- the same wire builder `fragmentTile` above already
+ * mirrors byte-for-byte. So this is a thin wrapper around `fragmentTile`,
+ * exactly as unfragmented/untied to any wasm-bindgen export or Cargo
+ * feature gate as `fragmentTile` itself is.
+ */
+export function buildEvictionDatagram(reason: number): Uint8Array {
+  const frags = fragmentTile(
+    0,
+    EVICTION_SENTINEL_X,
+    EVICTION_SENTINEL_Y,
+    SKIP_CODEC,
+    /* generation */ 0,
+    /* pass */ 0,
+    new Uint8Array([reason]),
+    1,
+  );
+  if (frags.length !== 1) {
+    throw new Error(`expected exactly one eviction datagram, got ${frags.length}`);
+  }
+  return frags[0];
 }
