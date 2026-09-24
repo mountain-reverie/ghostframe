@@ -99,13 +99,8 @@ pub struct gf_frame {
 ///
 /// `struct_size` MUST be set to `sizeof(gf_client_config)` by the caller;
 /// it is the forward-compatibility mechanism that lets a future ABI
-/// revision add fields without breaking a caller built against an older
-/// header. `struct_size` smaller than this library understands the fields
-/// up to (see [`Self::max_decode_width`]'s doc) is rejected with
-/// `GF_ERR_INVALID`; a `struct_size` that covers the original fields but
-/// not a later addition is accepted, with the addition's fields read as
-/// whatever default that field's own doc names (never misread from
-/// unallocated memory).
+/// revision add fields without silently misreading a caller built against
+/// an older header. A mismatch is rejected with `GF_ERR_INVALID`.
 #[repr(C)]
 #[derive(Debug)]
 pub struct gf_client_config {
@@ -126,19 +121,6 @@ pub struct gf_client_config {
     /// Array of `n_preferred_modifiers` `u64`s, most-preferred first. May
     /// be null when `n_preferred_modifiers == 0`.
     pub preferred_modifiers: *const u64,
-    /// This client's own maximum display resolution (its screen, or
-    /// eventually its negotiated virtual EDID) -- NOT the session's current
-    /// frame size, which arrives separately over the wire. Appended after
-    /// `preferred_modifiers`, so a caller built against a header from
-    /// before this field existed reports a smaller `struct_size` and gets
-    /// `0` read here rather than a rejected config -- see this struct's own
-    /// doc. `0` in either `max_decode_width` or `max_decode_height` means
-    /// "unknown, do not pre-warm", identical to what an old caller gets by
-    /// construction: the H.264 decoder opens lazily on the first H.264
-    /// frame instead of being pre-warmed in `gf_client_create`. See
-    /// `ghostframe_client_native::Config::max_decode_width`.
-    pub max_decode_width: u32,
-    pub max_decode_height: u32,
 }
 
 #[repr(C)]

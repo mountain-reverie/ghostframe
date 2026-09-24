@@ -13,8 +13,6 @@ fn config(supports_h264: bool) -> Config {
         n_export_buffers: 3,
         preferred_modifiers: vec![],
         debug_map_frames: false,
-        max_decode_width: 0,
-        max_decode_height: 0,
     }
 }
 

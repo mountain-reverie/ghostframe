@@ -241,12 +241,6 @@ pub fn connect(host: String, port: u16, chord_prefix: String) -> Result<(), Comm
     // from is a backend that is already open.
     let mut backend = window::open("ghostframe")?;
     let preferred_modifiers = backend.preferred_dmabuf_modifiers();
-    // The client's own screen size, not the remote session's current frame
-    // size (that arrives later over the wire, as `ClientEvent::Resized`).
-    // `Backend::output_size` already returns `(0, 0)` for a backend that
-    // cannot report one, which is exactly `Config`'s own "unknown, do not
-    // pre-warm" sentinel -- see its doc.
-    let (max_decode_width, max_decode_height) = backend.output_size();
 
     let config = Config {
         hostname: default_hostname(),
@@ -257,8 +251,6 @@ pub fn connect(host: String, port: u16, chord_prefix: String) -> Result<(), Comm
         n_export_buffers: 3,
         preferred_modifiers,
         debug_map_frames: false,
-        max_decode_width,
-        max_decode_height,
     };
 
     let mut client = Client::new(config)?;

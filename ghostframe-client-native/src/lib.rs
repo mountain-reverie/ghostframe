@@ -106,20 +106,6 @@ pub struct Config {
     ///
     /// `debug_map_frame` returns an error when this is `false`.
     pub debug_map_frames: bool,
-    /// This client's own maximum display resolution -- its screen, or
-    /// eventually its negotiated virtual EDID -- NOT the current session's
-    /// frame size, which is announced separately over the wire and can be
-    /// smaller. `0` in either field means "unknown, do not pre-warm",
-    /// preserving today's behaviour (the H.264 decoder opens lazily on the
-    /// first H.264 access unit of a session). When both are non-zero, the
-    /// H.264 decoder -- device, codec, and its hardware frames pool -- is
-    /// opened synchronously in `Renderer::new` (at the first frame of a
-    /// session) instead, sized to these dimensions: see
-    /// `ghostframe_client_h264::decoder::H264Decoder::with_prewarm`. A
-    /// server that later sends a frame larger than this still decodes
-    /// correctly, just without the pre-warm speedup for that resolution.
-    pub max_decode_width: u32,
-    pub max_decode_height: u32,
 }
 
 /// A published frame's exported dmabuf, mapped and copied out as plain
@@ -354,8 +340,14 @@ impl Client {
         let export_buffers = self.config.n_export_buffers;
         let preferred_modifiers = self.config.preferred_modifiers.clone();
         let host_visible = self.config.debug_map_frames;
-        let max_decode_width = self.config.max_decode_width;
-        let max_decode_height = self.config.max_decode_height;
+        // Sessions begin in H.264 mode (`io_bridge.rs`'s classifier default),
+        // so a client that advertised (and has hardware for) H.264 will
+        // almost always use it -- opening the decoder here, eagerly, moves
+        // `H264Decoder::new()`'s ~12.7 ms device-open cost off the first
+        // H.264 frame. `effective_h264` is already the AND of the host's
+        // request and the local VA-API probe (see its own doc), so a client
+        // that never advertised the capability never pays this at all.
+        let open_h264_eagerly = self.effective_h264;
         let render_handle = std::thread::Builder::new()
             .name("gf-render".into())
             .spawn(move || {
@@ -367,8 +359,7 @@ impl Client {
                     export_buffers,
                     host_visible,
                     preferred_modifiers,
-                    max_decode_width,
-                    max_decode_height,
+                    open_h264_eagerly,
                 )
             })
             .map_err(ClientError::Io)?;

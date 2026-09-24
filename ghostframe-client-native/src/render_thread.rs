@@ -86,8 +86,7 @@ fn handle_core_event(
     export_buffers: usize,
     host_visible: bool,
     preferred_modifiers: &[u64],
-    max_decode_width: u32,
-    max_decode_height: u32,
+    open_h264_eagerly: bool,
 ) -> bool {
     if renderer.is_none() {
         let CoreEvent::FrameDimensions { width, height } = &ev else {
@@ -105,8 +104,7 @@ fn handle_core_event(
             export_buffers,
             preferred_modifiers,
             host_visible,
-            max_decode_width,
-            max_decode_height,
+            open_h264_eagerly,
         ) {
             Ok(r) => *renderer = Some(r),
             Err(e) => {
@@ -136,8 +134,7 @@ pub(crate) fn run(
     export_buffers: u32,
     host_visible: bool,
     preferred_modifiers: Vec<u64>,
-    max_decode_width: u32,
-    max_decode_height: u32,
+    open_h264_eagerly: bool,
 ) {
     let mut renderer: Option<Renderer> = None;
     // `0` means "the embedder didn't specify a count"; a `Renderer` with
@@ -172,8 +169,7 @@ pub(crate) fn run(
                     export_buffers,
                     host_visible,
                     &preferred_modifiers,
-                    max_decode_width,
-                    max_decode_height,
+                    open_h264_eagerly,
                 );
             }
             RenderMsg::DebugMapFrame(buffer_id, reply) => {
@@ -204,8 +200,7 @@ pub(crate) fn run(
                         export_buffers,
                         host_visible,
                         &preferred_modifiers,
-                        max_decode_width,
-                        max_decode_height,
+                        open_h264_eagerly,
                     );
                 }
                 Ok(RenderMsg::DebugMapFrame(buffer_id, reply)) => {
