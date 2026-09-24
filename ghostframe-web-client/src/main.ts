@@ -5,6 +5,7 @@ import { attachInputCapture } from './input/wire';
 import { DecodeErrorBatcher } from './decode_error_batcher';
 import { initDiagnostics } from './diagnostics.js';
 import { bootstrap } from './bootstrap.js';
+import { showDisconnectedOverlay } from './disconnect_overlay.js';
 import {
   recordProtocolEvent,
   CODEC_DISCRIMINANT,
@@ -19,6 +20,9 @@ import init, {
 
 /** Microsecond clock for every `now_us` parameter WasmClientCore expects. */
 const nowUs = (): bigint => BigInt(Math.round(performance.now() * 1000));
+
+/** `EvictionReason::DisplacedByNewSession` -- ghostframe-protocol/src/eviction.rs. */
+const EVICTION_REASON_DISPLACED = 1;
 
 const statusEl = document.getElementById('status')!;
 const logEl = document.getElementById('log')!;
@@ -537,7 +541,8 @@ async function main() {
         is_keyframe: boolean;
         payload: Uint8Array;
       }
-    | { kind: 'DecodeError'; codec: number; tile_x: number; tile_y: number; code: number };
+    | { kind: 'DecodeError'; codec: number; tile_x: number; tile_y: number; code: number }
+    | { kind: 'Evicted'; reason: number };
 
   /**
    * Renders one event out of `core.handleDatagram`/`core.onTimeout`.
@@ -694,6 +699,18 @@ async function main() {
         // Counters land in a later task (see the doc comment above
         // handleEvent). Reachable now so the switch is exhaustive and the
         // event isn't silently swallowed.
+        break;
+      }
+
+      case 'Evicted': {
+        // Terminal: the server has already dropped this session. Do not
+        // reconnect -- two clients with retry logic evict each other
+        // indefinitely (design doc §4).
+        showDisconnectedOverlay(
+          ev.reason === EVICTION_REASON_DISPLACED
+            ? 'Another session took over this desktop.'
+            : 'The server ended this session.',
+        );
         break;
       }
     }
