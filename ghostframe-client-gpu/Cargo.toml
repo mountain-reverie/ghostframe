@@ -30,3 +30,15 @@ pollster = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"
+
+# `nv12_reference` (src/nv12_reference.rs) is the CPU oracle Task 8's shader
+# test asserts against; it has no reason to exist in a release build. Off by
+# default, mirroring `ghostframe-client-h264`'s `test-support` (see that
+# crate's Cargo.toml, and 21a0221, which fixed the same defect for that
+# crate: a default-on test-support feature ships test-only code into every
+# release build that forgets `default-features = false`). This crate's own
+# `#[cfg(test)]` builds reach `nv12_reference` without the feature; a
+# `tests/*.rs` integration test, a separate crate unit, needs it explicitly.
+[features]
+default = []
+test-support = []
