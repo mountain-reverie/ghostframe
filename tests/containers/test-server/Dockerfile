@@ -59,6 +59,8 @@ COPY ghostframe-client-capi/build.rs ghostframe-client-capi/build.rs
 COPY ghostframe-client-capi/cbindgen.toml ghostframe-client-capi/cbindgen.toml
 COPY ghostframe-cli/Cargo.toml ghostframe-cli/Cargo.toml
 COPY ghostframe-cli/src/ ghostframe-cli/src/
+COPY ghostframe-client-h264/Cargo.toml ghostframe-client-h264/Cargo.toml
+COPY ghostframe-client-h264/src/ ghostframe-client-h264/src/
 COPY ghostframe-client-wasm/Cargo.toml ghostframe-client-wasm/Cargo.toml
 COPY ghostframe-client-wasm/src/ ghostframe-client-wasm/src/
 COPY ghostframe-client-wasm/build.rs ghostframe-client-wasm/build.rs
