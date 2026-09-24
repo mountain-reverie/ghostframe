@@ -71,11 +71,30 @@ closing the session, so a single loss does not swallow it and the client has a
 scheduling slot in which to process it.
 
 Both numbers are guesses, not measurements, and should be labelled as such
-where they are written. Three repeats survives two independent losses at the
-~1% rates this project tests under; 16 ms is one frame at 60 Hz, chosen because
-the client's event loop already turns over at that cadence. If either proves
-insufficient the upgrade is a reliable stream, and the reason code carries over
-unchanged.
+where they are written. 16 ms is one frame at 60 Hz, chosen because the
+client's event loop already turns over at that cadence.
+
+**Correction (2026-09-24, during implementation):** this section originally
+claimed three repeats "survives two independent losses at the ~1% rates this
+project tests under." That is wrong, and the code review caught it. The three
+copies are queued back-to-back into the same outgoing datagram deque, and
+quinn-proto's transmit loop packs as many queued DATAGRAM frames as fit into a
+single packet (`connection/mod.rs`, the DATAGRAM loop). At ~15 bytes each they
+normally ride **one** UDP packet and are lost together. The repeats are not
+independent, and whether they are spread across packets at all depends on
+unrelated traffic happening to fill the first one.
+
+Three is kept, because it costs nothing and does help in the cases where other
+traffic splits them. But it should not be mistaken for loss resistance. Real
+loss resistance needs the reliable stream named below, and the honest summary
+is that the notice is best-effort with a weak retry, not a triply-redundant
+one.
+
+A related implementation note: the server now logs `notices_sent`, because
+these sends fail with `Blocked` under exactly the conditions eviction fires
+(a loaded session, a full send buffer). Without it, a log line saying
+"evicting session" could not distinguish a delivered notice from three
+swallowed ones.
 
 **Not WebTransport's own close capsule.** `CLOSE_WEBTRANSPORT_SESSION` carries
 an error code *and* a UTF-8 reason, which would be the natural home for this —
