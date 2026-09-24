@@ -577,6 +577,11 @@ pub struct IoBridge {
     local_addr: SocketAddr,
     /// Per-connection WebTransport handshake state.
     wt_sessions: HashMap<ConnectionHandle, WebTransportServer>,
+    /// Which session most recently advertised capabilities. `None` until the
+    /// first HELLO. Task 3 uses this to tell the incumbent from a newcomer;
+    /// it is also what makes `apply_hello`'s singular state attributable to a
+    /// specific client rather than to whoever spoke last.
+    hello_sender: Option<ConnectionHandle>,
     /// Per-handle "have we already fired on_session_reset for this
     /// connection?" tracking. Set when `maybe_fire_session_reset` runs
     /// for a handle; cleared on `Event::ConnectionLost` so a rare
@@ -1312,6 +1317,7 @@ impl IoBridge {
             server,
             local_addr,
             wt_sessions: HashMap::new(),
+            hello_sender: None,
             session_resets_fired: HashSet::new(),
             has_seen_prior_session: false,
             frame_rx: None,
@@ -3217,7 +3223,7 @@ impl IoBridge {
     /// Unknown message types abort parsing of the rest of the buffer
     /// (we can't safely advance past an unknown variable-length message).
     /// Future message types must extend this dispatcher.
-    pub(crate) fn dispatch_feedback_bytes(&mut self, data: &[u8]) {
+    pub(crate) fn dispatch_feedback_bytes(&mut self, from: ConnectionHandle, data: &[u8]) {
         use crate::transport::client_caps::{HelloMsg, HELLO_MSG_TYPE, HELLO_SIZE};
         use crate::transport::decode_error::{
             DecodeErrorMsg, DECODE_ERROR_MSG_TYPE, DECODE_ERROR_SIZE,
@@ -3260,7 +3266,7 @@ impl IoBridge {
                         break;
                     }
                     if let Some(msg) = HelloMsg::decode(&buf[offset..]) {
-                        self.apply_hello(msg);
+                        self.apply_hello(from, msg);
                     }
                     offset += HELLO_SIZE;
                 }
@@ -5690,13 +5696,20 @@ impl IoBridge {
         }
 
         // Process any feedback data received on non-session bidi streams.
-        let feedback_data: Vec<Vec<u8>> = self
+        // `iter_mut`, not `values_mut`: the handle identifies which client
+        // sent each buffer, which eviction (and any future per-client state)
+        // needs. Collecting first avoids holding a borrow of `wt_sessions`
+        // across the `dispatch_feedback_bytes` calls, which take `&mut self`.
+        let feedback_data: Vec<(ConnectionHandle, Vec<u8>)> = self
             .wt_sessions
-            .values_mut()
-            .flat_map(|wt| wt.drain_feedback())
+            .iter_mut()
+            .flat_map(|(handle, wt)| {
+                let h = *handle;
+                wt.drain_feedback().into_iter().map(move |d| (h, d))
+            })
             .collect();
-        for data in &feedback_data {
-            self.dispatch_feedback_bytes(data);
+        for (handle, data) in &feedback_data {
+            self.dispatch_feedback_bytes(*handle, data);
         }
 
         // Bootstrap-deadlock guard: refresh the connected-session count so a
@@ -5907,6 +5920,7 @@ impl IoBridge {
             server,
             local_addr: "0.0.0.0:443".parse().unwrap(),
             wt_sessions: HashMap::new(),
+            hello_sender: None,
             session_resets_fired: HashSet::new(),
             has_seen_prior_session: false,
             frame_rx: None,
@@ -6266,7 +6280,12 @@ impl IoBridge {
     }
 
     /// Update capabilities from a parsed HELLO message.
-    pub(crate) fn apply_hello(&mut self, msg: crate::transport::client_caps::HelloMsg) {
+    pub(crate) fn apply_hello(
+        &mut self,
+        from: ConnectionHandle,
+        msg: crate::transport::client_caps::HelloMsg,
+    ) {
+        self.hello_sender = Some(from);
         self.client_caps = msg.caps;
         // Mirror the H.264 capability into the adaptation context so the
         // classifier's hard override sees it on the very next decision —
@@ -6282,6 +6301,14 @@ impl IoBridge {
             supports_h264 = msg.caps.supports_h264,
             "HELLO received, client capabilities updated"
         );
+    }
+
+    /// Which session most recently sent HELLO, i.e. advertised capabilities.
+    /// `None` until the first HELLO arrives. Unused outside tests until a
+    /// later M4a task wires it into eviction.
+    #[allow(dead_code)]
+    pub(crate) fn hello_sender(&self) -> Option<ConnectionHandle> {
+        self.hello_sender
     }
 
     /// Update FEC parity state based on receiver feedback.
@@ -6599,6 +6626,22 @@ mod tests {
         IoBridge::new_with_stream_for_test(our_end, server)
     }
 
+    /// Test-only helper: construct an IoBridge with one WebTransport session
+    /// already attached (handle `ConnectionHandle(0)`), returning both the
+    /// bridge and the handle that identifies that session. Mirrors the
+    /// session setup done inline in
+    /// `maybe_fire_session_reset_skips_first_connect_fires_on_reconnect`.
+    fn test_bridge_with_one_session() -> (IoBridge, ConnectionHandle) {
+        let (our_end, _peer) = UnixStream::pair().expect("UnixStream::pair failed");
+        let server = QuicServer::new().expect("QuicServer::new failed");
+        let mut bridge = IoBridge::new_with_stream_for_test(our_end, server);
+        let handle = ConnectionHandle(0);
+        bridge
+            .wt_sessions
+            .insert(handle, WebTransportServer::default());
+        (bridge, handle)
+    }
+
     /// `IoBridge::new_with_lib_config_for_test` must take its transport
     /// settings from the supplied `LibConfig`, not the process environment.
     /// This is the whole point of threading config through the bridge:
@@ -6668,7 +6711,7 @@ mod tests {
                 supports_h264: false,
             },
         };
-        bridge.apply_hello(msg);
+        bridge.apply_hello(ConnectionHandle(0), msg);
         assert!(bridge.current_client_caps().indices_raw_enabled);
     }
 
@@ -6682,23 +6725,51 @@ mod tests {
         use crate::transport::client_caps::{ClientCapabilities, HelloMsg};
         let mut bridge = make_bridge_for_test().await;
 
-        bridge.apply_hello(HelloMsg {
-            caps: ClientCapabilities {
-                indices_raw_enabled: false,
-                supports_h264: false,
+        bridge.apply_hello(
+            ConnectionHandle(0),
+            HelloMsg {
+                caps: ClientCapabilities {
+                    indices_raw_enabled: false,
+                    supports_h264: false,
+                },
             },
-        });
+        );
         assert!(!bridge.current_client_caps().supports_h264);
         assert!(!bridge.classifier.adaptation_context().supports_h264);
 
-        bridge.apply_hello(HelloMsg {
-            caps: ClientCapabilities {
+        bridge.apply_hello(
+            ConnectionHandle(0),
+            HelloMsg {
+                caps: ClientCapabilities {
+                    indices_raw_enabled: false,
+                    supports_h264: true,
+                },
+            },
+        );
+        assert!(bridge.current_client_caps().supports_h264);
+        assert!(bridge.classifier.adaptation_context().supports_h264);
+    }
+
+    #[tokio::test]
+    async fn dispatch_feedback_bytes_knows_which_session_sent_it() {
+        let (mut bridge, handle) = test_bridge_with_one_session();
+        let mut buf = Vec::new();
+        crate::transport::client_caps::HelloMsg {
+            caps: crate::transport::client_caps::ClientCapabilities {
                 indices_raw_enabled: false,
                 supports_h264: true,
             },
-        });
-        assert!(bridge.current_client_caps().supports_h264);
-        assert!(bridge.classifier.adaptation_context().supports_h264);
+        }
+        .encode(&mut buf);
+
+        bridge.dispatch_feedback_bytes(handle, &buf);
+
+        assert_eq!(
+            bridge.hello_sender(),
+            Some(handle),
+            "the bridge must record which session advertised capabilities; \
+             without it, eviction cannot tell the newcomer from the incumbent"
+        );
     }
 
     /// Verify that `IoBridge::run` returns `Ok(())` when the peer end of the
@@ -6944,7 +7015,7 @@ mod tests {
         };
         let mut buf = Vec::new();
         fb.encode(&mut buf);
-        bridge.dispatch_feedback_bytes(&buf);
+        bridge.dispatch_feedback_bytes(ConnectionHandle(0), &buf);
         assert!(bridge.adaptation_context.last_update_seq > initial_seq);
         // Single feedback in history: 200 / (800 + 200) = 0.20 — well above 0.
         assert!(bridge.adaptation_context.loss_rate > 0.0);
@@ -8045,7 +8116,7 @@ mod tests {
         err.encode(&mut buf);
         assert_eq!(buf.len(), 2 + 22 + 5);
 
-        bridge.dispatch_feedback_bytes(&buf);
+        bridge.dispatch_feedback_bytes(ConnectionHandle(0), &buf);
 
         // HELLO applied:
         assert!(
@@ -8508,7 +8579,7 @@ mod tests {
         bridge.input_injector = Some(injector.clone() as Arc<dyn InputInjector>);
 
         // pointer-move (0x05 0x01 x=100 y=200) — 100 = 0x0064, 200 = 0x00c8
-        bridge.dispatch_feedback_bytes(&[0x05, 0x01, 0x00, 0x64, 0x00, 0xc8]);
+        bridge.dispatch_feedback_bytes(ConnectionHandle(0), &[0x05, 0x01, 0x00, 0x64, 0x00, 0xc8]);
 
         assert_eq!(injector.moves.lock().unwrap().clone(), vec![(100, 200)]);
     }
@@ -8517,7 +8588,7 @@ mod tests {
     async fn dispatch_feedback_bytes_silently_skips_input_when_no_injector() {
         // input_injector is None on the test bridge — must not panic.
         let mut bridge = make_bridge_for_test().await;
-        bridge.dispatch_feedback_bytes(&[0x05, 0x01, 0x00, 0x64, 0x00, 0xc8]);
+        bridge.dispatch_feedback_bytes(ConnectionHandle(0), &[0x05, 0x01, 0x00, 0x64, 0x00, 0xc8]);
     }
 
     #[tokio::test]
@@ -8549,12 +8620,12 @@ mod tests {
         // PointerButton x=100 y=200 button=1 down=true → 8 bytes total:
         //   [0x05, 0x02, 0x00, 0x64, 0x00, 0xc8, 0x01, 0x01]
         // Deliver as 6 + 2 — the exact split observed on the wire.
-        bridge.dispatch_feedback_bytes(&[0x05, 0x02, 0x00, 0x64, 0x00, 0xc8]);
+        bridge.dispatch_feedback_bytes(ConnectionHandle(0), &[0x05, 0x02, 0x00, 0x64, 0x00, 0xc8]);
         assert!(
             injector.buttons.lock().unwrap().is_empty(),
             "first half must not dispatch — message is incomplete"
         );
-        bridge.dispatch_feedback_bytes(&[0x01, 0x01]);
+        bridge.dispatch_feedback_bytes(ConnectionHandle(0), &[0x01, 0x01]);
         assert_eq!(
             injector.buttons.lock().unwrap().clone(),
             vec![(100, 200, 1, true)]
@@ -8586,8 +8657,8 @@ mod tests {
         let mut bridge = make_bridge_for_test().await;
         bridge.input_injector = Some(injector.clone() as Arc<dyn InputInjector>);
 
-        bridge.dispatch_feedback_bytes(&[0xff, 0xaa, 0xbb]);
-        bridge.dispatch_feedback_bytes(&[0x05, 0x01, 0x00, 0x0a, 0x00, 0x14]);
+        bridge.dispatch_feedback_bytes(ConnectionHandle(0), &[0xff, 0xaa, 0xbb]);
+        bridge.dispatch_feedback_bytes(ConnectionHandle(0), &[0x05, 0x01, 0x00, 0x0a, 0x00, 0x14]);
         assert_eq!(injector.moves.lock().unwrap().clone(), vec![(10, 20)]);
     }
 
