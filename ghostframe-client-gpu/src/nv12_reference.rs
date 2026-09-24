@@ -180,6 +180,18 @@ mod tests {
     /// ends. Under a LIMITED-range matrix, Y=0 would map to black only after
     /// a 16/255 pedestal subtraction and Y=255 would clip early -- so this
     /// test is what catches a well-meaning "fix" to BT.709 limited.
+    ///
+    /// The endpoints alone do NOT catch it, though: under limited range,
+    /// Y=0 computes to -18.6 and Y=255 to 278, and both still clamp right
+    /// back to 0 and 255 -- so only an INTERIOR point, where clamping never
+    /// engages, can tell full range from limited range apart. Mid-grey
+    /// (Y=128) does, but on only a 1-LSB margin (limited range's 255/219
+    /// slope puts it one code short of full range's). Y=64 and Y=32 widen
+    /// that margin to 8 and 13 LSB respectively (limited range gives 56 and
+    /// 19), which a slope error of limited range's magnitude (~16%) cannot
+    /// close by construction, and checking both -- on opposite sides of
+    /// mid-grey -- means a change that only bends the curve near one end
+    /// cannot pass by accident either.
     #[test]
     fn full_range_luma_maps_to_the_full_grey_ramp() {
         assert_eq!(nv12_pixel_to_rgba(0, 128, 128), [0, 0, 0, 255]);
@@ -188,6 +200,19 @@ mod tests {
         assert!(
             (127..=129).contains(&mid[0]),
             "mid grey should stay mid grey, got {mid:?}"
+        );
+
+        let q_hi = nv12_pixel_to_rgba(64, 128, 128);
+        assert!(
+            (62..=66).contains(&q_hi[0]),
+            "Y=64 should stay close to 64 under full range \
+             (a limited-range matrix would give 56), got {q_hi:?}"
+        );
+        let q_lo = nv12_pixel_to_rgba(32, 128, 128);
+        assert!(
+            (29..=35).contains(&q_lo[0]),
+            "Y=32 should stay close to 32 under full range \
+             (a limited-range matrix would give 19), got {q_lo:?}"
         );
     }
 

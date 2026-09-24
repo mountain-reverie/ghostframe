@@ -27,7 +27,11 @@ impl H264Nv12Pipeline {
     /// `vec4<f32>` output with no fp16 packing (design doc §9.1), which is
     /// what makes a bit-exact arithmetic comparison possible in the first
     /// place. Production always calls [`Self::new`].
-    pub fn with_format(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+    ///
+    /// `pub(crate)`, not `pub`: nothing outside this crate needs any format
+    /// but `Rgba8Unorm` -- only `nv12_oracle_tests` (same crate, Tier A)
+    /// does.
+    pub(crate) fn with_format(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("ghostframe-h264-nv12-shader"),
             source: wgpu::ShaderSource::Wgsl(SHADER_SRC.into()),
@@ -67,6 +71,22 @@ impl H264Nv12Pipeline {
 
     /// Upload CPU-side NV12 planes as textures. Used by the oracle, and by
     /// the CPU fallback path when a dmabuf cannot be imported.
+    ///
+    /// Chroma is sized `width.div_ceil(2)` x `height.div_ceil(2)`, matching
+    /// `DmabufPlanes::chroma_width`/`chroma_height` in
+    /// `ghostframe-client-h264` (that crate's `descriptor.rs` spells out why
+    /// `div_ceil`, not `/ 2`: this client is deliberately tested at
+    /// non-16-aligned resolutions, where truncation drops the last chroma
+    /// column, or, at odd height, the last chroma row entirely -- which
+    /// then reads back to the caller as a tinted bottom row via the
+    /// shader's `p / 2` indexing landing out of bounds, per WGSL texture
+    /// robustness rules).
+    ///
+    /// `chroma` is assumed TIGHTLY packed -- `chroma_width() * 2` bytes per
+    /// row, no padding -- which is what `download_nv12` (Task 9's CPU
+    /// fallback source) actually produces. There is no stride parameter
+    /// here for that reason: a caller with a padded source (e.g. a dmabuf's
+    /// own pitch) needs a different entry point, not this one.
     pub fn upload_planes(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -109,11 +129,20 @@ impl H264Nv12Pipeline {
             },
         );
 
+        // `div_ceil`, NOT `/ 2` -- see the doc above. A `/ 2` here silently
+        // truncates the last chroma column (odd width) or drops the last
+        // chroma row (odd height) with no wgpu validation error at all: the
+        // sizes it computes are merely self-consistent, just wrong against
+        // what a real decoded surface actually has.
+        let chroma_width = width.div_ceil(2);
+        let chroma_height = height.div_ceil(2);
+        let chroma_bytes_per_row = chroma_width * 2; // Rg8Unorm: 2 bytes/texel.
+
         let chroma_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("ghostframe-h264-chroma"),
             size: wgpu::Extent3d {
-                width: width / 2,
-                height: height / 2,
+                width: chroma_width,
+                height: chroma_height,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -133,12 +162,12 @@ impl H264Nv12Pipeline {
             chroma,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(width),
-                rows_per_image: Some(height / 2),
+                bytes_per_row: Some(chroma_bytes_per_row),
+                rows_per_image: Some(chroma_height),
             },
             wgpu::Extent3d {
-                width: width / 2,
-                height: height / 2,
+                width: chroma_width,
+                height: chroma_height,
                 depth_or_array_layers: 1,
             },
         );
@@ -158,6 +187,20 @@ impl H264Nv12Pipeline {
         luma: &wgpu::Texture,
         chroma: &wgpu::Texture,
     ) {
+        // `h264_nv12_blit.wgsl`'s own header documents the failure mode a
+        // size mismatch produces: `in.pos` ties the shader to the viewport
+        // (here, `fb`'s size) and the decoded surface (`luma`'s size) being
+        // equal, and WGSL's texture-robustness rules turn an out-of-range
+        // `textureLoad` into silent zeros -- i.e. a quietly wrong black band
+        // at the edge, not an error. A `debug_assert_eq!` costs nothing in
+        // release and converts that into a loud failure in every debug
+        // build and test run.
+        debug_assert_eq!(
+            (fb.width, fb.height),
+            (luma.width(), luma.height()),
+            "framebuffer/decoded-surface size mismatch would silently black-band the edge \
+             (h264_nv12_blit.wgsl's own doc) instead of failing loudly"
+        );
         self.draw_to_texture(device, queue, fb.texture(), luma, chroma);
     }
 
@@ -167,7 +210,11 @@ impl H264Nv12Pipeline {
     /// `fb.texture()`. Task 8's Tier A oracle calls this directly against a
     /// raw `Rgba32Float` texture that has no `Framebuffer` wrapper -- see
     /// [`Self::with_format`].
-    pub fn draw_to_texture(
+    ///
+    /// `pub(crate)`, not `pub`: production only ever reaches this through
+    /// [`Self::draw`]; only `nv12_oracle_tests` (same crate, Tier A) calls
+    /// it directly.
+    pub(crate) fn draw_to_texture(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
