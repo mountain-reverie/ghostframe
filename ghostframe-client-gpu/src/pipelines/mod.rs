@@ -7,6 +7,7 @@
 
 pub mod cdf53;
 pub mod cdf53_passes;
+pub mod h264_nv12;
 pub mod palrle;
 pub mod raw;
 pub mod solid;

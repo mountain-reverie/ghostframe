@@ -199,8 +199,12 @@ fn read_back(
     );
     queue.submit(std::iter::once(encoder.finish()));
 
-    // Per `ImportedNv12`'s lifetime contract: this poll is what makes it
-    // safe for the caller to drop the import afterwards.
+    // This poll is what makes `padded_bytes` below safe to read -- it is
+    // not what makes dropping `imported` safe. `ImportedNv12` has no such
+    // lifetime contract (see its struct doc in import.rs): wgpu's own
+    // resource tracking keeps the real image (and, through it, the imported
+    // memory) alive for as long as anything -- a clone, a view, a bind
+    // group -- references it, regardless of whether this poll has run.
     let slice = staging.slice(..);
     slice.map_async(wgpu::MapMode::Read, |r| r.expect("map readback buffer"));
     device
@@ -347,9 +351,12 @@ fn imports_a_linear_dmabuf_and_reads_the_bytes_back() {
         }
     }
 
-    // `imported` must outlive every GPU operation that reads its textures
-    // (struct doc's lifetime contract); `read_back` already polled to
-    // completion above, so dropping it now is sound.
+    // `imported` does NOT need to outlive the GPU operations that read its
+    // textures -- see `a_cloned_texture_outlives_the_import_and_stays_
+    // usable` below, which drops the import before any GPU work has even
+    // been submitted against a clone of one of its textures, and is still
+    // sound. Dropped here anyway simply because this test has no further
+    // use for it.
     drop(imported);
 }
 

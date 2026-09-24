@@ -30,6 +30,19 @@ pollster = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"
+# Parses/validates `shaders/client/*.wgsl` directly (src/shader_validation.rs,
+# Task 8 review item (a)) -- no GPU needed, so this runs under CI's `cargo
+# test --workspace --lib`. Pinned to the exact version `wgpu` itself resolves
+# (`cargo tree -p ghostframe-client-gpu -i naga`), so this test parses with
+# the same frontend `create_shader_module` will use, not a drifted one.
+# `wgsl-in` is required explicitly: naga's default features are empty.
+naga = { version = "=30.0.1", features = ["wgsl-in"] }
+# Cross-checks the Tier B oracle's own hand-written round-toward-zero f32->f16
+# packer (src/nv12_oracle_tests.rs) against a standard round-to-nearest-even
+# f16 implementation in a property test. Test-only: the oracle's actual
+# quantiser is not this crate's `half::f16::from_f32`, which rounds the wrong
+# way for design doc §9.1's compressed-export model.
+half = "2"
 
 # `nv12_reference` (src/nv12_reference.rs) is the CPU oracle Task 8's shader
 # test asserts against; it has no reason to exist in a release build. Off by

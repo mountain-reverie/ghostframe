@@ -31,9 +31,22 @@ pub mod import;
 // release build of every crate that forgets `default-features = false`.
 #[cfg(any(test, feature = "test-support"))]
 pub mod nv12_reference;
+// Task 8's NV12 shader oracle. Lives here, not `tests/*.rs`, for the same
+// reason `ghostframe-client-h264`'s `oracle_tests.rs` does: it needs
+// `nv12_reference`, which only a `#[cfg(test)]` build of this crate's own
+// unit tests can see without a feature flag or a self-referencing
+// dev-dependency (both rejected -- see this module's own doc).
+#[cfg(test)]
+mod nv12_oracle_tests;
 pub mod pipelines;
 pub mod renderer;
 pub mod ring;
+// Needs no GPU (see the module doc): a syntax/type error in any WGSL under
+// `shaders/client/` would otherwise reach `master` green, since naga only
+// parses a shader at `create_shader_module` time, which CI's GPU-less
+// runners never call.
+#[cfg(test)]
+mod shader_validation;
 pub mod testdata;
 pub mod wgpu_ctx;
 
