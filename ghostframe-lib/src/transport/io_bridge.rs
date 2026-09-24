@@ -5523,8 +5523,7 @@ impl IoBridge {
                             "new QUIC connection — pruning stale wt_sessions and clearing emitter cache"
                         );
                         for h in &stale {
-                            self.wt_sessions.remove(h);
-                            self.session_resets_fired.remove(h);
+                            self.forget_session(*h);
                         }
                         self.reliable_emitter.clear_cache();
                     }
@@ -5628,15 +5627,7 @@ impl IoBridge {
 
                 Event::ConnectionLost { reason } => {
                     tracing::info!(?handle, %reason, "connection lost");
-                    self.wt_sessions.remove(&handle);
-                    self.session_resets_fired.remove(&handle);
-                    // quinn allocates ConnectionHandle from a slab (`vacant_key`), so a
-                    // retained handle can silently alias a *different* future connection.
-                    // Leaving this set would make a later HELLO from a reused handle look
-                    // like the incumbent re-identifying itself, skipping its eviction.
-                    if self.last_hello_from == Some(handle) {
-                        self.last_hello_from = None;
-                    }
+                    self.forget_session(handle);
                     // Delivery-guarantee invariant: when the session ends,
                     // un-ACKed tile-passes are no longer deliverable and
                     // must not occupy memory or fire spurious retransmits
@@ -6316,6 +6307,17 @@ impl IoBridge {
         self.last_hello_from
     }
 
+    /// Forget everything keyed by a connection handle. Every site that drops
+    /// a session must go through here: quinn reuses handles from a slab, so
+    /// a forgotten entry can alias a future connection.
+    fn forget_session(&mut self, handle: ConnectionHandle) {
+        self.wt_sessions.remove(&handle);
+        self.session_resets_fired.remove(&handle);
+        if self.last_hello_from == Some(handle) {
+            self.last_hello_from = None;
+        }
+    }
+
     /// Update FEC parity state based on receiver feedback.
     /// Enables parity (K=4) when loss exceeds threshold, disables when it drops.
     fn update_fec_from_feedback(&mut self, fb: &ReceiverFeedback) {
@@ -6631,6 +6633,14 @@ mod tests {
         IoBridge::new_with_stream_for_test(our_end, server)
     }
 
+    /// Test-only helper: attach a fresh (disconnected) WebTransport session
+    /// for `h` to `bridge`. Shared by `test_bridge_with_sessions` and any
+    /// test that needs to attach a session mid-test (e.g. simulating a
+    /// reconnect on a new handle).
+    fn attach_session(bridge: &mut IoBridge, h: ConnectionHandle) {
+        bridge.wt_sessions.insert(h, WebTransportServer::default());
+    }
+
     /// Test-only helper: construct an IoBridge with a WebTransport session
     /// already attached for each given handle. `async fn` (not plain `fn`)
     /// because it calls tokio's `UnixStream::pair()`, which panics outside a
@@ -6641,7 +6651,7 @@ mod tests {
         let server = QuicServer::new().expect("QuicServer::new failed");
         let mut bridge = IoBridge::new_with_stream_for_test(our_end, server);
         for &h in handles {
-            bridge.wt_sessions.insert(h, WebTransportServer::default());
+            attach_session(&mut bridge, h);
         }
         bridge
     }
@@ -6776,6 +6786,61 @@ mod tests {
             Some(handle),
             "the bridge must record which session advertised capabilities; \
              without it, eviction cannot tell the newcomer from the incumbent"
+        );
+    }
+
+    #[tokio::test]
+    async fn forget_session_clears_last_hello_from_for_that_handle() {
+        let handle_a = ConnectionHandle(7);
+        let handle_b = ConnectionHandle(9);
+        let mut bridge = test_bridge_with_sessions(&[handle_a, handle_b]).await;
+
+        let mut buf = Vec::new();
+        crate::transport::client_caps::HelloMsg {
+            caps: crate::transport::client_caps::ClientCapabilities {
+                indices_raw_enabled: false,
+                supports_h264: true,
+            },
+        }
+        .encode(&mut buf);
+        bridge.dispatch_feedback_bytes(handle_a, &buf);
+        assert_eq!(bridge.last_hello_from(), Some(handle_a));
+
+        bridge.forget_session(handle_a);
+
+        assert_eq!(
+            bridge.last_hello_from(),
+            None,
+            "forgetting the session that sent HELLO must clear the stale attribution; \
+             quinn can hand the freed handle to a future, unrelated connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn forget_session_leaves_a_different_sessions_attribution_intact() {
+        let handle_a = ConnectionHandle(7);
+        let handle_b = ConnectionHandle(9);
+        let mut bridge = test_bridge_with_sessions(&[handle_a, handle_b]).await;
+
+        let mut buf = Vec::new();
+        crate::transport::client_caps::HelloMsg {
+            caps: crate::transport::client_caps::ClientCapabilities {
+                indices_raw_enabled: false,
+                supports_h264: true,
+            },
+        }
+        .encode(&mut buf);
+        bridge.dispatch_feedback_bytes(handle_a, &buf);
+        assert_eq!(bridge.last_hello_from(), Some(handle_a));
+
+        // Forgetting an unrelated session must not clobber handle_a's attribution.
+        bridge.forget_session(handle_b);
+
+        assert_eq!(
+            bridge.last_hello_from(),
+            Some(handle_a),
+            "forget_session must only clear last_hello_from when it names the \
+             handle being forgotten"
         );
     }
 
@@ -7421,14 +7486,11 @@ mod tests {
         );
 
         // Simulate ConnectionLost on handle_a (per real wiring at Event::ConnectionLost).
-        bridge.wt_sessions.remove(&handle_a);
-        bridge.session_resets_fired.remove(&handle_a);
+        bridge.forget_session(handle_a);
 
         // RECONNECT (new handle_b): reset body fires now (has_seen_prior_session=true).
         let handle_b = ConnectionHandle(1);
-        bridge
-            .wt_sessions
-            .insert(handle_b, WebTransportServer::default());
+        attach_session(&mut bridge, handle_b);
         bridge
             .wt_sessions
             .get_mut(&handle_b)
