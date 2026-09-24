@@ -35,7 +35,6 @@ use crate::capture::gpu_pipeline::GpuFrameProcessor;
 use crate::encoder::h264_vaapi::FullFrameEncoder;
 use crate::server::FrameSubmission;
 use crate::tile::{DirtyTracker, TileGrid};
-use crate::transport::eviction::{build_eviction_datagram, EvictionReason};
 use crate::transport::fec;
 use crate::transport::fec::fec_group_size;
 use crate::transport::feedback::ReceiverFeedback;
@@ -49,6 +48,7 @@ use crate::transport::protocol::{
 };
 use crate::transport::quic::QuicServer;
 use crate::transport::webtransport::WebTransportServer;
+use ghostframe_protocol::eviction::{build_eviction_datagram, EvictionReason};
 
 // ---------------------------------------------------------------------------
 // Clock discipline
@@ -5665,14 +5665,14 @@ impl IoBridge {
         // Known race, not fixed here: this collects every session's
         // feedback into one batch before any of it is dispatched. If an
         // incumbent's re-HELLO and a genuinely new client's first HELLO
-        // both land in the same batch with the incumbent ordered last, the
-        // incumbent's `apply_hello` runs second and evicts the newcomer it
-        // was racing against -- leaving zero attached sessions until the
-        // next connection. It takes a re-HELLO racing a brand-new client
-        // within a single event-loop pass, and both receive paths are
-        // gated on `wt_sessions`, so an already-evicted handle produces no
-        // further feedback once its entry is gone. Narrow enough that
-        // restructuring the batch isn't warranted; noted so a future
+        // both land in the same batch, `wt_sessions` is a `HashMap`, so
+        // which one is ordered last -- and therefore which `apply_hello`
+        // runs second and evicts the other -- is a coin flip per pass; the
+        // rare part is the simultaneous re-HELLO itself, not the ordering.
+        // Not a wedge either way: both parties receive an eviction notice
+        // (best-effort; see `evict_session`), so both disconnect knowing
+        // why and either can reconnect. Narrow and self-recovering enough
+        // that restructuring the batch isn't warranted; noted so a future
         // "sessions keep vanishing under load" report has a lead.
         let feedback_data: Vec<(ConnectionHandle, Vec<u8>)> = self
             .wt_sessions
@@ -6263,7 +6263,7 @@ impl IoBridge {
         self.last_hello_from = Some(from);
 
         // One client at a time. A second client identifying itself displaces
-        // the incumbent, which is told why (design doc §2, §3).
+        // the incumbent, which is told why (M4a design §2, §3).
         //
         // Keyed on HELLO rather than on session accept: a connection that
         // never identifies itself -- a port scan, an abandoned handshake, a
@@ -6319,15 +6319,20 @@ impl IoBridge {
     /// a new QUIC connection, which displaced an incumbent before it could
     /// be told why -- and let a connection that never identified itself
     /// kill a working session. Eviction is keyed on HELLO instead (see
-    /// `apply_hello`); a dead connection that never reconnects is reaped by
-    /// quinn's idle timeout through `Event::ConnectionLost` ->
-    /// `forget_session`.
+    /// `apply_hello`). The page-reload flood the prune was written for is
+    /// still covered: the reloaded client's HELLO arrives within a
+    /// round-trip of `Connected` and evicts the stale session then -- see
+    /// `reconnect_ends_with_one_session_and_a_cleared_emitter_cache`, which
+    /// asserts exactly that. Only a connection that never identifies itself
+    /// waits for quinn's idle timeout, and such a connection is not the one
+    /// flooding you. If stale sessions ever *do* flood, the fix is to close
+    /// the QUIC connection on eviction, not to prune on connect.
     ///
     /// Extracted to its own method (rather than inlined in the
     /// `Event::Connected` arm) so a unit test can call it directly and
-    /// prove that property: `establishing_a_second_connection_does_not_
-    /// disturb_an_existing_session` reintroduces the deleted prune here
-    /// under mutation and fails, which is the guard against it coming back.
+    /// prove that property: reintroducing the deleted prune here makes
+    /// `establishing_a_second_connection_does_not_disturb_an_existing_session`
+    /// fail -- verified by hand, then reverted.
     fn on_connection_established(&mut self, handle: ConnectionHandle) {
         let wt = self.wt_sessions.entry(handle).or_default();
         if let Some(conn) = self.server.connections.get_mut(&handle) {
@@ -6341,10 +6346,14 @@ impl IoBridge {
     /// client then falls back to a generic disconnect. Sent three times
     /// because a single loss should not swallow it.
     ///
-    /// **Three is a guess, not a measurement.** It survives two independent
-    /// losses at the ~1% rates this project tests under. If it proves
-    /// insufficient the fix is a reliable stream (design doc §3), not a
-    /// larger number.
+    /// **Three is a guess, not a measurement, and it buys less than it
+    /// looks like.** The three copies are queued back-to-back, and quinn
+    /// packs queued DATAGRAM frames into one packet while space remains
+    /// (`connection/mod.rs`, the DATAGRAM loop) -- at ~15 bytes each they
+    /// normally share a single UDP packet and are lost together. They help
+    /// only when other traffic splits them across packets. Real loss
+    /// resistance needs a reliable stream (M4a design §3), not a larger
+    /// number.
     ///
     /// No grace-period sleep before dropping the session: `forget_session`
     /// only removes our own bookkeeping (`wt_sessions`, etc.) -- it does not
@@ -6363,22 +6372,37 @@ impl IoBridge {
     /// is what the milestone's end-to-end test (last task) exercises; that
     /// is the coverage for this half of the method, not anything here.
     fn evict_session(&mut self, handle: ConnectionHandle, reason: EvictionReason) {
+        // A guess, not a measurement -- see this method's doc comment.
         const EVICTION_REPEATS: usize = 3;
 
         let datagram = build_eviction_datagram(reason);
+        let mut notices_sent = 0usize;
         if let Some(conn) = self.server.connections.get_mut(&handle) {
             if let Some(wt) = self.wt_sessions.get_mut(&handle) {
                 for _ in 0..EVICTION_REPEATS {
-                    // Ignore send errors: the session may already be gone,
-                    // which is the same outcome we are driving towards.
-                    let _ = wt.send_datagram(conn, &datagram);
+                    // Deliberately discarded: `Disabled` means the session
+                    // is already gone (the outcome we are driving towards)
+                    // and `Blocked` means quinn's send buffer is full,
+                    // which retrying in this loop cannot drain. Count what
+                    // left so the log says whether the client could have
+                    // learned the reason -- eviction fires exactly when a
+                    // session is loaded, so a full send buffer here is the
+                    // likely state, not the exotic one (see the
+                    // `datagram_send_errs` field note: these failures are
+                    // overwhelmingly `Blocked`).
+                    if wt.send_datagram(conn, &datagram).is_ok() {
+                        notices_sent += 1;
+                    }
                 }
             }
         }
-        tracing::info!(?handle, ?reason, "evicting session");
+        tracing::info!(?handle, ?reason, notices_sent, "evicting session");
         // Moved here from the old connect-time prune: the displaced
         // session's pending entries are un-ACKable, and left in place they
-        // flood the link until RTO.
+        // flood the link until RTO. `clear_cache()` is server-global, not
+        // scoped to `handle` -- clearing it here is correct only because
+        // of the one-client-at-a-time invariant this method enforces; a
+        // future multi-client design would need a per-session cache.
         self.reliable_emitter.clear_cache();
         self.forget_session(handle);
     }
@@ -7055,6 +7079,11 @@ mod tests {
         assert!(
             !bridge.wt_sessions.contains_key(&old),
             "the pre-reload session must be gone"
+        );
+        assert_eq!(
+            bridge.last_hello_from(),
+            Some(reconnected),
+            "attribution must point at the reconnected session, not the evicted one"
         );
         assert_eq!(
             bridge.reliable_emitter.pending_cache_entries(),
