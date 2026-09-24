@@ -494,6 +494,44 @@ pre-emptively. M1's CDF 5/3 episode is the precedent: a tolerance written on an
 unverified assumption was wide enough to hide the systematic drift the oracle
 existed to catch.
 
+### 9.1 That measurement, taken
+
+Task 7's review enumerated the full cube — all 256³ (luma, cb, cr) triples
+across 3 channels, 50,331,648 channel-samples — rather than sampling. **224
+differ by exactly 1 LSB**, from two causes, and the tie-break rule is not one
+of them (the cube contains exactly one exact `.5` tie, and round-half-even and
+round-half-away agree on it).
+
+**170 were a defect in the CPU reference and are fixed.** `(v * 255.0 + 0.5)
+as u8` evaluates `v * 255.0` in f32, which rounds; a product whose exact value
+is `129.4999998807907` becomes exactly `129.5` in f32, and `+ 0.5` then carries
+it to 130, where the hardware — rounding the exact product — yields 129. No
+tie-break policy reconciles that, because the CPU is rounding a value that is
+not a tie as though it were. Computing in f64 eliminates all 170. The idiom was
+inherited from `bgra_to_nv12.comp`, where it is correct: that shader *defines*
+the forward quantisation, whereas this function models the fixed-function unorm
+write, specified as `round(f × 255)` on the exact product.
+
+**54 are FMA contraction and are irreducible.** naga 30.0.1 emits no
+`NoContraction` decoration, so nothing in the SPIR-V forbids RADV from fusing
+`y - c1*u` with `+ c2*v`. An alternative contraction order was measured and
+produces the same 54. No source-level arrangement lets the CPU predict the
+driver's choice.
+
+They are concentrated in **4 chroma pairs out of 65,536** — `(58,147)`,
+`(75,24)`, `(205,190)`, `(222,62)` — with runs of consecutive luma values
+inside each. That distribution is why a small synthetic plane would pass today
+and fail the day someone widened the pattern, which is the worse outcome.
+
+**So the oracle asserts exact equality with one precisely-bounded exception:**
+a 1-LSB difference is permitted only where the exact product lies within
+`2e-5` of a half-integer, which is the FMA-reachable set and is enumerable up
+front. Every other difference fails. That keeps the gate able to catch what it
+exists for — a wrong matrix, wrong chroma indexing, a limited-range
+"correction" — all of which produce differences far outside that window, while
+not failing on arithmetic no implementation can make agree. The count is
+asserted too: a full-cube sweep must find no more than 54.
+
 **`e2e_h264` — live server, H.264 frame mode, toleranced.**
 `GHOSTFRAME_TEST_FORCE_FRAME_MODE=h264` pins the classifier, so the test does not
 depend on the adaptation policy choosing H.264 on its own. Session entry already
