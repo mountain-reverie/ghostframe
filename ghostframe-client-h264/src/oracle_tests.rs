@@ -4,15 +4,23 @@
 //! runners have no GPU. An #[ignore] would hide it on developer machines
 //! too, which is where it has to run.
 //!
-//! Requires the `test-support` feature (on by default for this crate's own
-//! `cargo test`, see `Cargo.toml`), which is what makes `testclip::
-//! gradient_clip` and `vainfo_reports_h264_vld` reachable from this separate
-//! crate unit.
+//! A `#[cfg(test)]` module in `src/`, not `tests/*.rs`: these oracles test
+//! this crate's own behaviour, and a unit-test module can see `#[cfg(test)]`
+//! items directly (`testclip`, `probe::vainfo_reports_h264_vld`) with no
+//! `test-support` feature and no self-referencing dev-dependency. Putting
+//! this in `tests/*.rs` -- a separate crate unit that never sees
+//! `#[cfg(test)]` -- was the earlier shape, and it forced `test-support` to
+//! be a default feature just so `cargo test` would build it, which shipped
+//! the panicking `testclip` encoder in every release build of every
+//! downstream crate that forgot `default-features = false`. See
+//! `Cargo.toml`: `test-support` is off by default again, and only crates
+//! that need `gradient_clip`/`vainfo_reports_h264_vld` from their OWN tests
+//! (client-gpu, ghostframe-e2e) opt in explicitly.
 
+use crate::decoder::H264Decoder;
+use crate::testclip::gradient_clip;
 use ffmpeg_next as ffmpeg;
 use ffmpeg_sys_next as ffi;
-use ghostframe_client_h264::decoder::H264Decoder;
-use ghostframe_client_h264::testclip::gradient_clip;
 
 const W: u32 = 640;
 const H: u32 = 480;
@@ -61,7 +69,7 @@ fn software_decode_nv12(clip: &[Vec<u8>]) -> Vec<(Vec<u8>, Vec<u8>)> {
 }
 
 /// Download a VA-API surface to system memory as NV12, tightly packed.
-fn hw_frame_to_nv12(frame: &ghostframe_client_h264::decoder::HwFrame) -> (Vec<u8>, Vec<u8>) {
+fn hw_frame_to_nv12(frame: &crate::decoder::HwFrame) -> (Vec<u8>, Vec<u8>) {
     // SAFETY: `frame` holds a live VAAPI AVFrame; `sw` is freed before return.
     unsafe {
         let sw = ffi::av_frame_alloc();
@@ -94,7 +102,7 @@ fn hardware_decode_matches_software_decode_exactly() {
     // regression makes this test skip and report green -- the test would
     // vanish exactly when it should fail. Task 3's review rejected that
     // circularity once already; it must not come back at every oracle.
-    match ghostframe_client_h264::vainfo_reports_h264_vld() {
+    match crate::probe::vainfo_reports_h264_vld() {
         Some(true) => {}
         Some(false) => {
             eprintln!("driver reports no H.264 VLD entrypoint; skipping");
@@ -154,7 +162,7 @@ fn the_exported_dmabuf_is_linear_at_the_descriptors_layout() {
     // regression makes this test skip and report green -- the test would
     // vanish exactly when it should fail. Task 3's review rejected that
     // circularity once already; it must not come back at every oracle.
-    match ghostframe_client_h264::vainfo_reports_h264_vld() {
+    match crate::probe::vainfo_reports_h264_vld() {
         Some(true) => {}
         Some(false) => {
             eprintln!("driver reports no H.264 VLD entrypoint; skipping");

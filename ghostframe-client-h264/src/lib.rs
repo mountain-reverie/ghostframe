@@ -10,30 +10,37 @@
 pub mod decoder;
 pub mod descriptor;
 pub mod probe;
-// `cfg(test)` covers this crate's own unit tests (decoder::tests uses
-// `gradient_clip`) without a self-referencing dev-dependency on the
-// `test-support` feature -- that idiom compiled the lib twice under
-// `--all-targets` and let `crate::H264Error` and `ghostframe_client_h264::
-// H264Error` collide as distinct types.
+// `cfg(test)` covers this crate's own unit tests (decoder::tests and
+// oracle_tests both use `gradient_clip`) without a self-referencing
+// dev-dependency on the `test-support` feature -- that idiom compiled the
+// lib twice under `--all-targets` and let `crate::H264Error` and
+// `ghostframe_client_h264::H264Error` collide as distinct types.
 //
-// The `test-support` feature stays for everyone else: `tests/*.rs`
-// integration tests in THIS crate (oracle_decode.rs), the oracle in
-// `ghostframe-e2e`, and `ghostframe-client-gpu`'s tests all need
+// The `test-support` feature stays for everyone else: other crates'
+// integration tests (`ghostframe-client-gpu`, `ghostframe-e2e`) need
 // `gradient_clip` from a different crate unit's test build, where
 // `#[cfg(test)]` on the defining crate would never be active. A cargo
 // feature is the mechanism that reaches across the crate-unit boundary
-// while still keeping nine panicking paths out of a release build of a
-// production crate that depends on this one with `default-features =
-// false`.
+// while still keeping nine panicking paths out of THIS crate's own release
+// build by default -- see `Cargo.toml`, where `test-support` is off by
+// default for exactly that reason.
 #[cfg(any(test, feature = "test-support"))]
 pub mod testclip;
+// The hw-vs-sw decode oracle and the dmabuf-linearity check (spec §7.2).
+// Lives in `src/`, not `tests/*.rs`: it tests this crate's own behaviour,
+// and a `#[cfg(test)]` module in `src/` can see `testclip` and
+// `probe::vainfo_reports_h264_vld` directly with no feature and no
+// self-referencing dev-dependency, unlike a separate `tests/*.rs` crate
+// unit.
+#[cfg(test)]
+mod oracle_tests;
 
 pub use descriptor::{DmabufPlanes, PlaneDesc, DRM_FORMAT_GR88, DRM_FORMAT_NV12, DRM_FORMAT_R8};
 pub use probe::vaapi_h264_decode_available;
-// Re-exported so `tests/*.rs` (and other crates' own test builds) can reach
-// the independent ground truth every oracle gates on, without reaching
-// through `probe::`. See probe.rs for why this must NOT be
-// `vaapi_h264_decode_available` itself.
+// Re-exported so other crates' own test builds can reach the independent
+// ground truth every oracle gates on, without reaching through `probe::`.
+// See probe.rs for why this must NOT be `vaapi_h264_decode_available`
+// itself.
 #[cfg(any(test, feature = "test-support"))]
 pub use probe::vainfo_reports_h264_vld;
 

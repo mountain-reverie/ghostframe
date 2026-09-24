@@ -33,9 +33,9 @@ impl HwFrame {
 
     /// Raw pointer to the underlying frame, for callers that need ffmpeg
     /// APIs this crate does not wrap -- the decode oracle in
-    /// `tests/oracle_decode.rs` downloads through `av_hwframe_transfer_data`
-    /// to build the authoritative NV12 comparison. The frame stays owned by
-    /// `self`; this pointer must not outlive it.
+    /// `oracle_tests` downloads through `av_hwframe_transfer_data` to build
+    /// the authoritative NV12 comparison. The frame stays owned by `self`;
+    /// this pointer must not outlive it.
     pub fn as_ptr(&self) -> *const ffi::AVFrame {
         self.frame
     }

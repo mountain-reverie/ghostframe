@@ -210,18 +210,20 @@ fn probe_decodes_a_frame() -> Result<(), H264Error> {
 /// Shared by [`vaapi_h264_decode_available`]'s own test
 /// (`probe_agrees_with_the_driver`, which checks the probe's verdict against
 /// this), `decoder::tests::skip_without_vaapi`, and the oracles in
-/// `tests/oracle_decode.rs` -- all of which gate on this and NOT on
+/// `oracle_tests` -- all of which gate on this and NOT on
 /// `vaapi_h264_decode_available` -- since the probe now decodes a real
 /// frame, gating on it would be circular: a regression in the decoder would
 /// make the probe return `false`, which would make every test that skips on
 /// it report green exactly when it should fail.
 ///
-/// `pub`, re-exported at the crate root, and gated on `test-support` rather
-/// than `pub(crate)` + `#[cfg(test)]`: `tests/*.rs` is a separate crate unit
-/// that never sees `#[cfg(test)]` on THIS crate, and `pub(crate)` is
-/// invisible across a crate boundary regardless. See lib.rs for the
-/// `test-support` feature and why a self-referencing dev-dependency is not
-/// used to reach this instead.
+/// `pub` and re-exported at the crate root -- not just `pub(crate)` --
+/// because other crates' own tests (`ghostframe-client-gpu`,
+/// `ghostframe-e2e`) need the same ground truth and reach it through the
+/// `test-support` feature (off by default; see `Cargo.toml`) rather than a
+/// self-referencing dev-dependency on this crate. `#[cfg(test)]` alone
+/// would not reach them: `#[cfg(test)]` is only active when THIS crate is
+/// itself being tested, never when it is compiled as an ordinary dependency
+/// for another crate's test build.
 #[cfg(any(test, feature = "test-support"))]
 pub fn vainfo_reports_h264_vld() -> Option<bool> {
     let vainfo = std::process::Command::new("vainfo")
