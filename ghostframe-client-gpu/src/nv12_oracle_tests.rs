@@ -8,12 +8,15 @@
 //! the fragment shader's `vec4<f32>` untouched (no fp16 packing -- §9.1), so
 //! this is the arithmetic gate, at full precision.
 //!
-//! **Tier B** renders to a real `Rgba8Unorm` framebuffer and asserts
+//! **Tier B** renders to a real `Rgba8Unorm` framebuffer. On AMD it asserts
 //! equality against `round_half_away(f16_rtz(v) * 255)` -- the measured
-//! model of this GPU's compressed fp16 ABGR export path (§9.1). That
-//! quantiser is `gpu_byte`/`f16_rtz_bits` below, deliberately NOT in
-//! `nv12_reference.rs`, which models a conformant write, not this specific
-//! hardware quirk.
+//! model of this GPU's compressed fp16 ABGR export path (§9.1). On other
+//! vendors, §9.2 says to relax to the two-element set `{round(v),
+//! round(f16_rtz(v))}` (adjacent by construction, never a magnitude
+//! tolerance) and let Tier A carry arithmetic correctness -- see
+//! `is_amd`/`round_conformant` below. That quantiser is `gpu_byte`/
+//! `f16_rtz_bits`, deliberately NOT in `nv12_reference.rs`, which models a
+//! conformant write, not this specific hardware quirk.
 //!
 //! ## Why this lives in `src/`, not `tests/*.rs`
 //!
@@ -66,38 +69,56 @@ mod tests {
     use crate::pipelines::h264_nv12::H264Nv12Pipeline;
     use crate::wgpu_ctx::WgpuContext;
 
-    /// Large enough that the divergence this oracle exists to catch (spec
-    /// §9.2: the textbook-BT.601 mutation touches 3.216% of the full YUV
-    /// cube) has, over `W * H` = 1,048,576 samples, a chance of going
-    /// entirely unobserved smaller than any realistic flake budget. Kept
-    /// inside `wgpu::Limits::downlevel_defaults()`'s 2048 max texture
+    /// Kept inside `wgpu::Limits::downlevel_defaults()`'s 2048 max texture
     /// dimension (`WgpuContext::new` requests exactly those limits, bumping
-    /// only `max_storage_buffers_per_shader_stage`).
-    const W: u32 = 1024;
-    const H: u32 = 1024;
+    /// only `max_storage_buffers_per_shader_stage`) -- `2048` itself is the
+    /// documented maximum, not merely "under" it.
+    const W: u32 = 2048;
+    const H: u32 = 2048;
+
+    /// Width, in luma columns, of each of the two chroma-exhaustive edge
+    /// bands in [`synthetic_nv12`] -- see that function's doc for what these
+    /// buy.
+    const EDGE_BAND: u32 = 512;
 
     /// Synthetic NV12 planes built to sweep, not to coincidentally pass.
     ///
-    /// Luma cycles through every one of the 256 possible values many times
-    /// over as `x`/`y` vary (`x + 3*y`, decorrelated from the chroma index
-    /// below so the two don't move in lockstep), and the two edge columns
-    /// are forced to the full-range extremes explicitly -- `x = 0` is always
-    /// `Y = 0` and `x = W - 1` is always `Y = 255`, at every row, so those
-    /// edges are tested against the *entire* chroma sweep below, not one
-    /// isolated pixel.
+    /// The image is three vertical bands:
     ///
-    /// Chroma is derived from the chroma-plane block index with two
-    /// different affine strides per channel, which spreads `(cb, cr)` pairs
-    /// across the full `[0, 255] x [0, 255]` plane rather than walking it in
-    /// lockstep (a naive `cb = cr = block_index % 256` would make every
-    /// sample lie on the diagonal, missing most of the cube).
+    /// - `x < EDGE_BAND`: luma forced to `0` on every pixel.
+    /// - `x >= W - EDGE_BAND`: luma forced to `255` on every pixel.
+    /// - the `1024`-column middle: luma `(x + 3*y) % 256`, decorrelated from
+    ///   the chroma index so the two don't move in lockstep.
+    ///
+    /// Chroma is `cb = cx % 256, cr = cy % 256` (`cx`/`cy` the chroma-plane
+    /// block index) -- independent per axis, so both vary over their full
+    /// range without walking the plane in lockstep. Measured, not assumed
+    /// (`python3` sweep over this exact construction, kept in the commit
+    /// history for this file): this reaches all 65,536 `(cb, cr)` pairs
+    /// overall, AND all 65,536 pairs *within each edge band on its own* --
+    /// each `EDGE_BAND`-wide band is `256` chroma columns wide, enough on
+    /// its own for `cb = cx % 256` (or, mirrored, `cr = cy % 256` against
+    /// the full image height) to hit every residue, so `Y=0` and `Y=255`
+    /// are each tested against the *entire* chroma plane, not a slice of
+    /// it. The full grid (edge bands plus the decorrelated middle) yields
+    /// 391,168 distinct `(Y, cb, cr)` triples -- out of 16,777,216 possible,
+    /// far short of the full cube, but roughly 12x what the version of this
+    /// sweep an earlier review measured (33,272), at the same pixel count
+    /// order of magnitude.
+    ///
+    /// An earlier revision of this function claimed the edges were tested
+    /// "against the entire chroma sweep" while actually forcing a single
+    /// edge *column*, which pairs `Y=0`/`Y=255` against only the chroma
+    /// values reachable from `cx = 0` (or `cx = (W-1)/2`) -- a thin slice,
+    /// not the full plane. The band construction above is what makes the
+    /// comment true rather than aspirational.
     fn synthetic_nv12() -> (Vec<u8>, Vec<u8>) {
         let mut luma = vec![0u8; (W * H) as usize];
         for y in 0..H {
             for x in 0..W {
-                let v = if x == 0 {
+                let v = if x < EDGE_BAND {
                     0
-                } else if x == W - 1 {
+                } else if x >= W - EDGE_BAND {
                     255
                 } else {
                     ((x.wrapping_add(3 * y)) % 256) as u8
@@ -111,12 +132,8 @@ mod tests {
         let mut chroma = vec![0u8; (cw * ch * 2) as usize];
         for cy in 0..ch {
             for cx in 0..cw {
-                let cb = ((cx.wrapping_mul(7).wrapping_add(cy.wrapping_mul(13))) % 256) as u8;
-                let cr = ((cx
-                    .wrapping_mul(11)
-                    .wrapping_add(cy.wrapping_mul(17))
-                    .wrapping_add(64))
-                    % 256) as u8;
+                let cb = (cx % 256) as u8;
+                let cr = (cy % 256) as u8;
                 let idx = ((cy * cw + cx) * 2) as usize;
                 chroma[idx] = cb;
                 chroma[idx + 1] = cr;
@@ -131,6 +148,17 @@ mod tests {
         let cw = W / 2;
         let idx = (((y / 2) * cw + (x / 2)) * 2) as usize;
         (chroma[idx], chroma[idx + 1])
+    }
+
+    /// True when `ctx`'s adapter is AMD -- the only vendor `gpu_byte`'s
+    /// fp16-RTZ compressed-export model (design doc §9.1) is measured
+    /// against. `0x1002` is AMD's PCI vendor ID; `WgpuContext` only enables
+    /// the Vulkan backend, so `AdapterInfo::vendor` is always a real PCI
+    /// vendor ID here, not a backend-specific substitute (see that field's
+    /// own doc in `wgpu-types`).
+    fn is_amd(ctx: &WgpuContext) -> bool {
+        const AMD_PCI_VENDOR_ID: u32 = 0x1002;
+        ctx.adapter.get_info().vendor == AMD_PCI_VENDOR_ID
     }
 
     /// Read a whole `Rgba32Float` texture back as `[f32; 4]` per pixel.
@@ -253,11 +281,12 @@ mod tests {
     }
 
     #[test]
-    fn tier_b_matches_the_amd_fp16_rtz_export_model_exact_on_rgba8unorm() {
+    fn tier_b_matches_the_measured_export_model_exact_on_rgba8unorm() {
         let Ok(ctx) = WgpuContext::new() else {
             eprintln!("no usable GPU; skipping tier B NV12 oracle");
             return;
         };
+        let amd = is_amd(&ctx);
 
         let (luma, chroma) = synthetic_nv12();
         let mut pipeline = H264Nv12Pipeline::new(&ctx.device);
@@ -275,19 +304,27 @@ mod tests {
             for x in 0..W {
                 let (cb, cr) = chroma_at(&chroma, x, y);
                 let want_f32 = nv12_pixel_to_rgb_f32(luma[(y * W + x) as usize], cb, cr);
-                let want = [
-                    gpu_byte(want_f32[0]),
-                    gpu_byte(want_f32[1]),
-                    gpu_byte(want_f32[2]),
-                ];
                 let base = ((y * W + x) * 4) as usize;
-                let have = [got[base], got[base + 1], got[base + 2]];
                 for c in 0..3 {
                     compared += 1;
-                    if have[c] != want[c] {
+                    let exact = gpu_byte(want_f32[c]);
+                    let have = got[base + c];
+                    // §9.2: on AMD, the fp16-RTZ model is exact, no slack.
+                    // On any other vendor, relax to the two-element accept
+                    // set {conformant round, fp16-RTZ round} -- both are
+                    // exact values, adjacent by construction (RTZ can only
+                    // round the same way or one step closer to zero), never
+                    // a magnitude tolerance -- and let Tier A alone carry
+                    // arithmetic correctness there.
+                    let ok = if amd {
+                        have == exact
+                    } else {
+                        have == exact || have == round_conformant(want_f32[c])
+                    };
+                    if !ok {
                         mismatches += 1;
                         if first_bad.is_none() {
-                            first_bad = Some((x, y, c, want[c], have[c]));
+                            first_bad = Some((x, y, c, exact, have));
                         }
                     }
                 }
@@ -304,13 +341,25 @@ mod tests {
             }
         }
 
-        eprintln!("tier B: {compared} channel-samples compared, {mismatches} differed");
+        eprintln!(
+            "tier B ({}): {compared} channel-samples compared, {mismatches} differed",
+            if amd {
+                "AMD, exact"
+            } else {
+                "non-AMD, relaxed per §9.2"
+            }
+        );
         assert_eq!(
-            mismatches, 0,
-            "{mismatches} of {compared} channel-samples differ from \
-             round_half_away(f16_rtz(v) * 255) -- the measured model of this GPU's compressed \
-             fp16 ABGR export path (Tier B, design doc §9.1-9.2). First mismatch (x, y, \
-             channel, want, have): {first_bad:?}."
+            mismatches,
+            0,
+            "{mismatches} of {compared} channel-samples differ from the measured export model \
+             (Tier B, design doc §9.1-9.2; {} on this adapter). First mismatch (x, y, channel, \
+             want, have): {first_bad:?}.",
+            if amd {
+                "round_half_away(f16_rtz(v) * 255), exact"
+            } else {
+                "{round(v), round(f16_rtz(v))}, relaxed for non-AMD"
+            }
         );
     }
 
@@ -327,15 +376,33 @@ mod tests {
     /// the two tiers.
     fn gpu_byte(v: f32) -> u8 {
         let packed = f16_bits_to_f32(f32_to_f16_rtz_bits(v));
-        (packed as f64 * 255.0 + 0.5).floor() as u8
+        round_conformant(packed)
+    }
+
+    /// The conformant unorm8 write: round the exact product to the nearest
+    /// integer, ties away from zero, with no fp16 packing at all. Same
+    /// formula as `nv12_reference::to_u8` (private to that module, so
+    /// duplicated here rather than exposed) -- the non-AMD half of §9.2's
+    /// two-element accept set, and also `gpu_byte`'s own final rounding
+    /// step once its input has already been through the fp16-RTZ pack.
+    fn round_conformant(v: f32) -> u8 {
+        (v.clamp(0.0, 1.0) as f64 * 255.0 + 0.5).floor() as u8
     }
 
     /// `f32 -> binary16`, rounding toward zero (truncation), not the
     /// round-to-nearest-even every standard library/hardware `f16`
-    /// conversion normally performs. Domain here is always `[0, 1]`
-    /// (post-`clamp`), but implemented generally and exercised by
-    /// `f16_rtz_is_never_further_from_zero_than_round_to_nearest` below over
-    /// a broad sweep, not just that domain.
+    /// conversion normally performs.
+    ///
+    /// Domain reached from `gpu_byte` is always `[0, 1]` (post-`clamp`), and
+    /// within THAT domain this is implemented generally (subnormal results,
+    /// zero) and exercised over a broad sweep by the property tests below,
+    /// not just a handful of points. Outside that domain it is only
+    /// half-general: overflow (`unbiased_exp > 15`) saturates toward the
+    /// largest finite value, which is the correct RTZ answer for a large
+    /// finite input, but a real f32 infinity or NaN also lands in that same
+    /// branch and is wrongly turned into a finite value instead of f16
+    /// infinity/NaN. Unreachable from this shader's `[0, 1]` domain, so left
+    /// as is rather than special-cased for inputs this function never sees.
     fn f32_to_f16_rtz_bits(v: f32) -> u16 {
         let bits = v.to_bits();
         let sign = ((bits >> 16) & 0x8000) as u16;
@@ -358,7 +425,9 @@ mod tests {
         if unbiased_exp > 15 {
             // Overflow: RTZ saturates to the largest finite f16 magnitude
             // rather than going to infinity. Not reachable from this
-            // shader's [0, 1] domain (max unbiased_exp there is 0).
+            // shader's [0, 1] domain (max unbiased_exp there is 0) -- see
+            // this function's doc for why real infinity/NaN inputs would
+            // land here too, and wrongly.
             return sign | 0x7BFF;
         }
         if unbiased_exp < -24 {
@@ -420,6 +489,43 @@ mod tests {
                 f16_bits_to_f32(f32_to_f16_rtz_bits(exact)),
                 exact,
                 "f16 exactly represents {exact}; RTZ must round-trip it unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn f16_rtz_bit_pattern_matches_the_standard_layout_for_exact_values() {
+        // Round-tripping through THIS module's own encoder/decoder pair
+        // (the test above) cannot catch a self-consistent layout bug -- a
+        // truncator shaped like bfloat16 (1-8-7 sign/exponent/mantissa
+        // instead of binary16's 1-5-10) would round-trip through its own
+        // matching decoder just fine, and would also satisfy every property
+        // test below (never overshoots, never rounds further than
+        // round-to-nearest): those properties hold for ANY truncating
+        // float format, not specifically binary16.
+        //
+        // For a value that already sits exactly on the f16 grid, RTZ and
+        // round-to-nearest cannot differ -- no rounding decision is even
+        // reachable -- so comparing raw bits against `half`'s independent
+        // binary16 encoder pins the exact layout (5-bit exponent, 10-bit
+        // mantissa, 13-bit truncation shift from f32's 23-bit mantissa).
+        for exact in [
+            0.0f32,
+            1.0,
+            0.5,
+            0.25,
+            2.0,
+            3.0,
+            1.5,
+            1.0 + 2f32.powi(-10), // smallest f16 step above 1.0.
+            1.0 - 2f32.powi(-11), // largest f16 value strictly below 1.0.
+        ] {
+            let want = half::f16::from_f32(exact).to_bits();
+            let got = f32_to_f16_rtz_bits(exact);
+            assert_eq!(
+                got, want,
+                "exact value {exact} needs no rounding decision, so RTZ and round-to-nearest \
+                 must produce identical bits: got {got:#06x}, want {want:#06x}"
             );
         }
     }
