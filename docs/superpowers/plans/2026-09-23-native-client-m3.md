@@ -3432,11 +3432,18 @@ In `.github/workflows/e2e.yml`, after the `cargo test -p ghostframe-cli` line
 added in M2:
 
 ```yaml
-      # ghostframe-client-h264's probe and descriptor tests are pure logic and
-      # run anywhere: the probe self-skips without a render node, and the
-      # descriptor tests build their structs by hand. Its GPU/VA-API targets
+      # ghostframe-client-h264's descriptor tests are pure logic and run
+      # anywhere: they build their structs by hand. Its GPU/VA-API targets
       # (oracle_decode) are deliberately NOT named -- runners have neither, and
       # an #[ignore] would hide them on developer machines too.
+      #
+      # Note what this line does NOT cover. The decoder and probe tests gate
+      # themselves on `vainfo` reporting a VAProfileH264*/VAEntrypointVLD pair.
+      # Runners have neither libva-utils nor a VA-API device, so those tests
+      # SKIP here and only ever really run on a developer machine. That is a
+      # capability gate rather than a CI carve-out, but the effect is the same
+      # and it should be visible rather than discovered: nothing in CI fails if
+      # VA-API decode breaks.
       - run: cargo test -p ghostframe-client-h264 --lib
 ```
 
