@@ -41,7 +41,8 @@ reporting it. M1 lost time to a false BLOCKED of exactly this shape.
 |---|---|---|
 | `ghostframe-client-h264/Cargo.toml` | New crate manifest | 2 |
 | `ghostframe-client-h264/src/lib.rs` | Error type, re-exports | 2 |
-| `ghostframe-client-h264/src/probe.rs` | "Can this machine decode H.264 via VA-API?" | 2 |
+| `ghostframe-client-h264/src/probe.rs` | "Can this machine decode H.264 via VA-API?" | 2, 3 |
+| `ghostframe-client-h264/src/probe_clip.h264` | 655-byte keyframe the probe decodes to prove it | 3 |
 | `ghostframe-client-h264/src/decoder.rs` | `H264Decoder`: codec ctx, hw device ctx, send/receive | 3 |
 | `ghostframe-client-h264/src/descriptor.rs` | `AVDRMFrameDescriptor` → `DmabufPlanes` | 4 |
 | `ghostframe-client-h264/src/testclip.rs` | Test-only: encode a known clip with libx264 | 3 |
@@ -302,20 +303,36 @@ mod tests {
         let _verdict: bool = vaapi_h264_decode_available();
     }
 
-    /// On a machine that reports VA-API H.264 decode, the probe must say so.
-    /// Skipped where the device node is absent, because there the correct
-    /// answer is genuinely `false` and asserting `true` would be asserting
-    /// the hardware, not the code.
+    /// On a machine whose driver reports an H.264 decode entrypoint, the probe
+    /// must say so.
+    ///
+    /// The gate is `vainfo`, NOT the mere existence of a render node. A node
+    /// exists on machines whose Mesa was built without video codecs, where the
+    /// correct answer is `false` -- gating on the node would demand the wrong
+    /// answer there and entrench the very defect the probe exists to avoid.
     #[test]
-    fn probe_agrees_with_the_render_node() {
-        if !std::path::Path::new("/dev/dri/renderD128").exists() {
-            eprintln!("no /dev/dri/renderD128; skipping");
+    fn probe_agrees_with_the_driver() {
+        let vainfo = std::process::Command::new("vainfo").output();
+        let Ok(out) = vainfo else {
+            eprintln!("vainfo not installed; cannot establish ground truth, skipping");
+            return;
+        };
+        let text = String::from_utf8_lossy(&out.stdout);
+        let driver_decodes_h264 = text
+            .lines()
+            .any(|l| l.contains("VAProfileH264") && l.contains("VAEntrypointVLD"));
+        if !driver_decodes_h264 {
+            eprintln!("driver reports no H.264 VLD entrypoint; probe should say false");
+            assert!(
+                !vaapi_h264_decode_available(),
+                "the driver reports no H.264 decode entrypoint, but the probe said yes -- \
+                 this is the false positive that produces a black window on first paint"
+            );
             return;
         }
         assert!(
             vaapi_h264_decode_available(),
-            "a render node exists but the probe says no H.264 decode -- if this \
-             machine genuinely lacks it, check `vainfo | grep VAProfileH264`"
+            "`vainfo` reports a VAProfileH264*/VAEntrypointVLD pair but the probe says no"
         );
     }
 }
@@ -407,46 +424,132 @@ use std::ptr;
 /// `ghostframe-lib/src/encoder/vaapi_device.rs`'s `VAAPI_DEVICE`.
 pub const RENDER_NODE: &str = "/dev/dri/renderD128";
 
-/// True when a VA-API device opens AND ffmpeg has an H.264 decoder that can
-/// use it.
+/// True when this machine can plausibly decode H.264 through VA-API.
+///
+/// **This is a necessary condition, not a sufficient one, and Task 3 replaces
+/// it with a functional check.** `avcodec_find_decoder(AV_CODEC_ID_H264)`
+/// returns libavcodec's *software* decoder and is entirely independent of
+/// VA-API -- there is no `h264_vaapi` decoder, only an `h264` decoder with a
+/// VA-API hwaccel. So the strongest thing reachable without decoding a frame
+/// is: a VA-API device opens, AND libavcodec was built with a VA-API hwaccel
+/// for H.264. A driver whose H.264 profile is missing entirely (Mesa built
+/// without `video-codecs`, which several distributions shipped for years)
+/// still passes this.
+///
+/// That gap matters because sessions begin in H.264 mode, so a false positive
+/// is a black window rather than a degraded one. It is tolerable only because
+/// nothing advertises the capability until Task 10, by which point Task 3 has
+/// made this check functional.
 ///
 /// Deliberately does NOT test whether the decoded surface can be imported
 /// into Vulkan -- that is a separate question (see the design doc §7), and
 /// conflating them would make an import bug look like missing hardware.
 pub fn vaapi_h264_decode_available() -> bool {
-    let Ok(path) = CString::new(RENDER_NODE) else {
-        return false;
+    // ffmpeg logs libva failures straight to stderr at its default level. On a
+    // machine with no VA-API -- the outcome this whole design calls normal --
+    // that puts an unstructured error line on the host application's stderr,
+    // which a C host embedding this library cannot suppress. Quiet it for the
+    // duration of the probe and restore afterwards.
+    // SAFETY: `av_log_get_level`/`av_log_set_level` are plain global accessors.
+    let prior_log_level = unsafe {
+        let prior = ffi::av_log_get_level();
+        ffi::av_log_set_level(ffi::AV_LOG_QUIET);
+        prior
     };
+    let verdict = probe_inner();
+    // SAFETY: as above; restores exactly what was read.
+    unsafe { ffi::av_log_set_level(prior_log_level) };
+    match &verdict {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::info!(reason = %e, "H.264 will not be advertised");
+            false
+        }
+    }
+}
 
-    // SAFETY: `path` is a valid NUL-terminated string that outlives the call;
-    // `hw_dev` is a valid out-param. On failure ffmpeg leaves it null and we
-    // never deref it.
-    unsafe {
-        let mut hw_dev: *mut ffi::AVBufferRef = ptr::null_mut();
-        let ret = ffi::av_hwdevice_ctx_create(
-            &mut hw_dev,
+/// The probe proper, returning WHY it failed.
+///
+/// Separate from the `bool` wrapper so the reason survives: `H264Error` is how
+/// `gf_client_supports_h264`'s caller could one day learn the difference
+/// between "no GPU", "permission denied on the render node", and "this driver
+/// has no H.264 decode profile" -- three very different things for a user to
+/// act on, and a bare `false` flattens them.
+fn probe_inner() -> Result<(), H264Error> {
+    let path = CString::new(RENDER_NODE)
+        .map_err(|_| H264Error::VaapiUnavailable(format!("bad device path {RENDER_NODE:?}")))?;
+
+    // RAII: `BufRef` unrefs on drop, so every early return below is leak-free
+    // without repeating the cleanup. Mirrors
+    // `ghostframe-lib/src/encoder/vaapi_device.rs`'s wrapper of the same name.
+    let mut raw: *mut ffi::AVBufferRef = ptr::null_mut();
+    // SAFETY: `path` outlives the call; `raw` is a valid out-param that ffmpeg
+    // leaves null on failure, which the check below respects before any deref.
+    let ret = unsafe {
+        ffi::av_hwdevice_ctx_create(
+            &mut raw,
             ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
             path.as_ptr(),
             ptr::null_mut(),
             0,
-        );
-        if ret < 0 {
-            tracing::info!(
-                ret,
-                node = RENDER_NODE,
-                "VA-API device did not open; H.264 will not be advertised"
-            );
-            return false;
-        }
-        ffi::av_buffer_unref(&mut hw_dev);
-
-        let codec = ffi::avcodec_find_decoder(ffi::AVCodecID::AV_CODEC_ID_H264);
-        if codec.is_null() {
-            tracing::info!("ffmpeg has no H.264 decoder; H.264 will not be advertised");
-            return false;
-        }
+        )
+    };
+    if ret < 0 {
+        // Render the errno: -13 (permission -- not in the `render` group) and
+        // -2 (no such device) are the two common causes and they need
+        // completely different fixes. A bare negative integer tells a user
+        // nothing.
+        return Err(H264Error::VaapiUnavailable(format!(
+            "av_hwdevice_ctx_create({RENDER_NODE}): {}",
+            ffmpeg_next::Error::from(ret)
+        )));
     }
-    true
+    let _device = BufRef(raw);
+
+    // SAFETY: a plain registry lookup with no ownership transfer.
+    let codec = unsafe { ffi::avcodec_find_decoder(ffi::AVCodecID::AV_CODEC_ID_H264) };
+    if codec.is_null() {
+        return Err(H264Error::Ffmpeg("no H.264 decoder in ffmpeg".into()));
+    }
+
+    // Does libavcodec actually carry a VA-API hwaccel for H.264? Without this
+    // the check above is satisfied by the software decoder on every build.
+    let mut i = 0;
+    loop {
+        // SAFETY: `codec` is a valid static codec descriptor; ffmpeg returns
+        // null past the end of the config list, which terminates the loop.
+        let cfg = unsafe { ffi::avcodec_get_hw_config(codec, i) };
+        if cfg.is_null() {
+            return Err(H264Error::VaapiUnavailable(
+                "libavcodec has no VA-API hwaccel for H.264 (built without it)".into(),
+            ));
+        }
+        // SAFETY: `cfg` is non-null and points at a live static config.
+        let (methods, device_type) = unsafe { ((*cfg).methods, (*cfg).device_type) };
+        let has_device_ctx = methods & ffi::AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as i32 != 0;
+        if has_device_ctx && device_type == ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI {
+            return Ok(());
+        }
+        i += 1;
+    }
+}
+```
+
+Add the RAII wrapper to `ghostframe-client-h264/src/lib.rs`:
+
+```rust
+/// RAII wrapper around `*mut AVBufferRef` so no early return leaks a hardware
+/// device context. Mirrors `ghostframe-lib/src/encoder/vaapi_device.rs`'s
+/// `BufRef`; this crate has its own because it is declared the owner of every
+/// unsafe ffmpeg call in the client and should not reach into the server crate.
+pub(crate) struct BufRef(pub *mut ffmpeg_sys_next::AVBufferRef);
+
+impl Drop for BufRef {
+    fn drop(&mut self) {
+        // SAFETY: `AVBufferRef` is refcounted; this struct owns exactly one
+        // reference and releases it exactly once.
+        unsafe { ffmpeg_sys_next::av_buffer_unref(&mut self.0) };
+    }
 }
 ```
 
@@ -827,7 +930,92 @@ impl Drop for H264Decoder {
 
 Add `pub mod testclip;` to `lib.rs`.
 
-- [ ] **Step 5: Run the tests**
+- [ ] **Step 5: Make the probe functional**
+
+Task 2's probe establishes only a necessary condition: a VA-API device opens
+and libavcodec carries a VA-API hwaccel for H.264. It cannot see whether the
+*driver* has an H.264 decode profile — Mesa built without `video-codecs` passes
+it — and a false positive there is a black window on first paint, because
+sessions begin in H.264 mode. Now that `H264Decoder` exists, the probe can
+answer the question by doing the thing.
+
+Generate a tiny clip to decode. 64x64 is 655 bytes and decodes fine on VA-API
+here, and embedding it beats generating one at runtime: no dependency on
+libx264 being in the host's ffmpeg build, and no encode cost on the connect
+path.
+
+```bash
+cd /home/cedric/work/ghostframe
+ffmpeg -hide_banner -loglevel error -f lavfi -i color=c=gray:s=64x64:d=1 \
+  -frames:v 1 -c:v libx264 -preset ultrafast -f h264 \
+  -y ghostframe-client-h264/src/probe_clip.h264
+ls -l ghostframe-client-h264/src/probe_clip.h264   # expect ~655 bytes
+```
+
+Replace `probe_inner`'s final `Ok(())` — the one returned when the hwaccel
+config matches — with an actual decode. Append to `probe.rs`:
+
+```rust
+/// A 64x64 gray H.264 keyframe, Annex-B, ~655 bytes. Regenerate with:
+///
+/// ```text
+/// ffmpeg -f lavfi -i color=c=gray:s=64x64:d=1 -frames:v 1 \
+///   -c:v libx264 -preset ultrafast -f h264 -y src/probe_clip.h264
+/// ```
+///
+/// Embedded rather than encoded at runtime so the probe does not depend on
+/// libx264 being present in the host's ffmpeg build, and costs no encode on
+/// the connect path.
+const PROBE_CLIP: &[u8] = include_bytes!("probe_clip.h264");
+
+/// Decode one frame through VA-API. The only check that actually proves the
+/// driver can do it.
+fn probe_decodes_a_frame() -> Result<(), H264Error> {
+    let mut decoder = crate::decoder::H264Decoder::new()?;
+    let mut frames = decoder.decode(PROBE_CLIP)?;
+    frames.extend(decoder.flush()?);
+    let frame = frames.first().ok_or_else(|| {
+        H264Error::VaapiUnavailable(
+            "VA-API accepted the stream but produced no frame (driver likely has no \
+             H.264 decode profile)"
+                .into(),
+        )
+    })?;
+    if frame.width() == 0 || frame.height() == 0 {
+        return Err(H264Error::VaapiUnavailable(
+            "decoded probe frame has zero extent".into(),
+        ));
+    }
+    Ok(())
+}
+```
+
+and change the hwaccel-match arm in `probe_inner` from `return Ok(());` to
+`return probe_decodes_a_frame();`.
+
+Update `vaapi_h264_decode_available`'s doc comment: delete the paragraph
+calling it "a necessary condition, not a sufficient one" and the paragraph
+about the Task 3 replacement, and say instead that it decodes a 64x64 keyframe
+through VA-API and returns whether a hardware frame came out.
+
+- [ ] **Step 6: Confirm the probe still agrees with the driver**
+
+```bash
+cargo test -p ghostframe-client-h264 probe -- --nocapture
+```
+
+Expected: both probe tests pass. `probe_agrees_with_the_driver` gates on
+`vainfo`'s entrypoint list, so it now checks a functional probe against the
+driver's own claim rather than against the existence of a device node.
+
+- [ ] **Step 7: Prove the probe is load-bearing**
+
+Temporarily point `RENDER_NODE` at a path that is not a VA-API device (e.g.
+`/dev/null`), run the probe tests, and confirm `vaapi_h264_decode_available`
+returns false rather than panicking or hanging. Revert. This is the path a
+machine without VA-API takes, and it must be boring.
+
+- [ ] **Step 8: Run the tests**
 
 ```bash
 cargo test -p ghostframe-client-h264
@@ -835,11 +1023,11 @@ cargo test -p ghostframe-client-h264
 
 Expected: 4 passed (2 probe + 2 decoder).
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
 git add ghostframe-client-h264
-git commit -m "feat(h264): VA-API H.264 decoder with an in-process test clip"
+git commit -m "feat(h264): VA-API decoder, and a probe that decodes to prove it"
 ```
 
 ---
@@ -973,13 +1161,27 @@ pub struct PlaneDesc {
 /// An NV12 dmabuf: one fd, luma plane, chroma plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DmabufPlanes {
-    /// Borrowed from the mapped `AVFrame`, which owns it. Do not close.
+    /// Borrowed from the mapped `AVFrame`, which owns it, and valid only while
+    /// that `MappedFrame` is alive.
+    ///
+    /// **An importer must `dup()` this before any call that takes ownership.**
+    /// `vkImportMemoryFdKHR` takes ownership: the fd is closed by
+    /// `vkFreeMemory`, so handing this one over directly double-closes it
+    /// against the `AVFrame`'s own unref. The design imports the same dmabuf
+    /// twice (luma and chroma planes), which would be two closes of one fd.
+    /// `import.rs` duplicates for exactly this reason.
     pub fd: i32,
     pub modifier: u64,
+    /// DISPLAY dimensions (`AVFrame::width`/`height`), not the coded size.
+    /// The alignment padding lives in `PlaneDesc::pitch`, which is why both
+    /// are carried separately: a 640-wide frame here has pitch 768.
     pub width: u32,
     pub height: u32,
     pub luma: PlaneDesc,
-    /// Half width, half height, two bytes per sample (U and V interleaved).
+    /// `width.div_ceil(2)` x `height.div_ceil(2)` samples, two bytes each (U
+    /// and V interleaved). `div_ceil`, not `/ 2`: this client is deliberately
+    /// tested at non-16-aligned resolutions, where truncation loses the last
+    /// chroma column.
     pub chroma: PlaneDesc,
 }
 
