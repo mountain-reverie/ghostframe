@@ -289,6 +289,18 @@ impl Renderer {
         }
 
         let decoder = self.h264_decoder.as_mut().expect("just created");
+
+        // Timed at `debug` level so M3's decode-cost measurement (design doc
+        // §10) can isolate the hardware decode stall -- submit to surface
+        // available -- from everything else `decode_h264` does, without
+        // adding an unconditional cost to the hot path -- off by default, on
+        // with `RUST_LOG=ghostframe_client_gpu::renderer=debug`. Mirrors the
+        // precedent in `ring.rs`'s `publish` timing exactly.
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "measuring a real hardware H.264 decode stall for M3 §10's decode-thread decision, not a virtual-clock path"
+        )]
+        let decode_start = std::time::Instant::now();
         let frames = match decoder.decode(au) {
             Ok(f) => f,
             Err(e) => {
@@ -296,6 +308,18 @@ impl Renderer {
                 return;
             }
         };
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "measuring a real hardware H.264 decode stall for M3 §10's decode-thread decision, not a virtual-clock path"
+        )]
+        let decode_us = decode_start.elapsed().as_micros() as u64;
+        tracing::debug!(
+            frame_seq,
+            is_keyframe,
+            decode_us,
+            frame_count = frames.len(),
+            "decode_h264: decoder.decode stall"
+        );
 
         for frame in frames {
             self.blit_h264_frame(ctx, frame_seq, &frame);

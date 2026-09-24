@@ -601,23 +601,125 @@ the `[0.50, 0.6245)` window.
 
 M2's precedent: measure, then decide, and write the numbers down.
 
-- Decode time per frame (submit → surface available), p50/p99.
-- Import path taken (direct / VPP / CPU) and, if CPU, the copy cost.
-- The per-call allocations Task 3's review identified, so the numbers decide
-  whether they are worth removing rather than an opinion doing it:
-  `avcodec_send_packet` deep-copies the entire access unit (it takes the
-  `src->buf == NULL` branch, because the packet is not refcounted) — hundreds
-  of KB for a 1080p keyframe; `drain()` allocates at least two `AVFrame`s per
-  call and frees one; and every call that yields frames allocates a `Vec`.
-  ffmpeg's canonical `hw_decode.c` keeps one scratch `AVFrame` in the struct
-  and `av_frame_move_ref`s out on success, which is the shape to move to if
-  the numbers justify it.
-- Whether decode on the render thread perturbs the publish cadence measured in
-  M2 (p50 97µs, p99 624µs steady-state).
+### 10.1 How this was collected
 
-If decode blocks the render thread enough to matter, a decode thread is the
-answer — but that is a conclusion to reach from a number, not from the shape of
-the code.
+`ghostframe-e2e`'s Task 11 e2e test does not exist yet (it needs container
+images that were mid-rebuild when this was written), so this uses
+`ghostframe-client-gpu/tests/gpu_h264_render.rs::decode_and_publish_timing_at_1920x1080`
+instead — a new `#[ignore]`d test added for this measurement. It feeds real
+decoded access units through `Renderer::apply_event` exactly as the render
+thread does (`render_thread.rs`'s per-event `decode -> flush -> publish ->
+release`), on this machine's real VA-API hardware (RX 480, RADV Polaris10 —
+the same GPU as §7.1/§7.2). What it does **not** do is talk to a live server:
+the access units come from `gradient_clip`, a synthetic moving-gradient clip
+encoded once with libx264 at default settings. That means the bitrate and
+keyframe cadence are whatever libx264's defaults produce for a gradient, not
+production desktop content or the server's actual `h264_vaapi.rs` encoder
+settings — real content (text, static regions, scene cuts) compresses
+differently and could shift the per-frame byte count `avcodec_send_packet`
+copies. One run, one GPU, one clip; not a swept distribution.
+
+`decode_h264` was instrumented with `std::time::Instant` timing around
+`decoder.decode(au)` (submit through `avcodec_send_packet` to every frame
+`drain()` yields), logged at `debug` on the `ghostframe_client_gpu::renderer`
+target — same precedent as `ring.rs`'s existing `publish` timing, same
+`#[allow(clippy::disallowed_methods, ...)]` shape, off by default. The run
+below is 120 frames at 1920x1080 (the production resolution), captured with
+`RUST_LOG=ghostframe_client_gpu::renderer=debug,ghostframe_client_gpu::ring=debug`.
+
+### 10.2 Decode time per frame
+
+```
+decode_us, all 120 frames:            min=110  p50=153  p99=1010  max=32656
+decode_us, frames 1-119 (no frame 0):  min=110  p50=153  p99=831   max=1010
+decode_us, last 60 frames (steady):   min=110  p50=145  p99=212   max=248
+```
+
+**Frame 0 (the keyframe, first submit of the session) cost 32.66 ms** —
+`frame_count=0` on that call, i.e. it didn't even yield a decoded frame; the
+cost is VA-API device/surface-pool setup happening lazily inside the first
+`avcodec_send_packet`, not steady per-frame decode. It is a one-time
+per-session cost, not a per-frame one — it happens once whether the session
+runs 10 frames or 10,000 — but it is real and it lands on the render thread:
+a 32.66 ms stall on the first H.264 frame of a session, against a 16.67 ms
+budget. Frames 1-4 cost 700 us-1.01 ms as the decoder's internal pipeline
+depth fills (normal B-frame reorder latency, not a defect); by frame 5 it
+settles to the steady-state band above and stays there for the rest of the
+120-frame run. Steady-state p50 (145 us) and p99 (212 us) are both under 1.5%
+of the 16.67 ms budget.
+
+### 10.3 Import path
+
+**Zero-copy dmabuf import ran for all 120 frames** — `blit_h264_frame`'s
+"H.264 import path: zero-copy dmabuf" logged once and no CPU-copy fallback
+path fired, confirming Task 9's finding (§7.2) holds under a longer run.
+There is no CPU copy cost to report on this hardware.
+
+### 10.4 Publish cadence, and why the comparison to M2 needs a caveat
+
+```
+poll_us (device.poll inside publish), 120 samples:
+  min=7  p50=501  p99=2726  max=3476
+```
+
+This is **not directly comparable to M2's steady-state number (p50 97 us,
+p99 624 us)**: that number was measured under partial-blit damage (a 64x64
+spinner region), and `blit_h264_frame` calls `ring.mark_dirty_all()` on
+*every* H.264 frame — the whole frame is dirty every publish, because H.264
+replaces the whole picture. The honest comparison is M2's own **full-surface**
+samples, the three buffer-warmup blits it recorded at whatever resolution
+`showcase.rs` ran at: `[1163, 417, 1934] us`. This run's full-surface numbers
+(min 7, p50 501, p99 2726, max 3476 us, at 1920x1080 — a larger surface than
+M2's) sit in the same order of magnitude, running consistently higher, which
+is consistent with a bigger blit at a higher resolution rather than with
+decode perturbing the thread: the `poll_us` samples near 500 us track a
+roughly bimodal pattern (~450-520 us most frames, ~1.4-3.5 ms on a
+minority) that does not correlate frame-by-frame with elevated `decode_us` —
+the worst `poll_us` values (2.5-3.5 ms) occur next to *ordinary* ~140-180 us
+decodes, not next to the frame-0/frame-1-4 decode spikes. The low outlier
+(7 us) is a publish call with nothing to blit yet, from decoder pipeline
+latency (`frame_count=0`) at the start of the run. **Max observed sum of
+decode + publish-poll on one iteration is well under budget**: even pairing
+the worst `poll_us` (3.48 ms) with a steady-state `decode_us` (~150-250 us)
+totals ~3.7 ms, 22% of 16.67 ms.
+
+### 10.5 The per-call allocations
+
+Not measured in isolation — `decode_us` already includes
+`avcodec_send_packet`'s deep copy, `drain()`'s `AVFrame` allocations, and the
+`Vec` built for every call that yields frames, because they all happen inside
+the timed `decoder.decode(au)` call. Even attributing the *entire* steady-state
+decode cost to allocation (a deliberately generous upper bound — actual VA-API
+submission and driver-side work is in there too) puts the ceiling at 212 us
+p99 / 248 us max, 60-80x under the 16.67 ms budget. **Not worth moving to
+`hw_decode.c`'s scratch-`AVFrame`-plus-`av_frame_move_ref` shape on this
+evidence.** What would change the answer: multiple concurrent H.264 sessions
+sharing one render thread (this measured one), or a future finding that
+per-frame allocation specifically — not decode as a whole — shows up as GC-like
+pressure (allocator contention, page faults) under sustained load; neither was
+observed here, and isolating allocation from decode was not attempted because
+the combined number already left enormous headroom.
+
+### 10.6 Verdict: is a decode thread justified?
+
+**No, not on this evidence.** The recurring per-frame cost (steady-state
+decode ~150-250 us, plus the full-frame publish-poll averaging ~500 us with a
+p99 near 2.7 ms) totals a worst-observed ~3.7 ms against a 16.67 ms budget —
+comfortably under, with no sign that decode work is stealing time from
+`publish`'s poll (§10.4). The one number that *does* argue for concern is
+**the 32.66 ms one-time keyframe/hardware-init stall on the very first H.264
+frame of a session** — that alone exceeds one 60 Hz frame budget and would
+show up as a visible first-paint hitch. It is a session-startup cost, not a
+steady-state one, so it does not justify moving *ongoing* decode to its own
+thread; it might justify warming the VA-API context (opening the decoder and
+submitting a throwaway packet) before the first real frame is due, which is a
+smaller, more targeted fix than a decode thread. What would change the
+steady-state answer: a measurement at a lower-power target device (this is a
+dedicated discrete GPU on a desktop; an embedded or shared-GPU target could
+show materially higher decode or contended `poll` times), multiple concurrent
+sessions, or production content whose bitrate/motion characteristics differ
+enough from a synthetic gradient to change `avcodec_send_packet`'s per-call
+copy size materially.
 
 ---
 
