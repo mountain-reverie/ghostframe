@@ -308,6 +308,20 @@ impl H264Decoder {
             (*ctx).hw_device_ctx = dup;
             (*ctx).get_format = Some(get_vaapi_format);
 
+            // Without LOW_DELAY, a stream whose SPS carries a non-zero
+            // max_num_reorder_frames makes the decoder hold every frame for
+            // one frame-time before emitting it -- invisible to a test that
+            // counts frames, and a full frame of added latency to someone
+            // watching a remote desktop.
+            //
+            // The server encodes with `tune=zerolatency` and no B-frames
+            // (`ghostframe-lib/src/encoder/h264_vaapi.rs:261`), so nothing is
+            // given up. If a future encoder change did emit reordered
+            // frames, this flag makes the decoder refuse to buffer them --
+            // they would arrive out of order rather than late.
+            // SAFETY: `ctx` is an allocated, not-yet-opened codec context.
+            (*ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
+
             let ret = ffi::avcodec_open2(ctx, codec, ptr::null_mut());
             if ret < 0 {
                 let mut c = ctx;
