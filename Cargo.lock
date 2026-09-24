@@ -1750,6 +1750,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ghostframe-client-h264"
+version = "0.1.0"
+dependencies = [
+ "ffmpeg-next",
+ "ffmpeg-sys-next",
+ "libc",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "ghostframe-client-native"
 version = "0.1.0"
 dependencies = [
