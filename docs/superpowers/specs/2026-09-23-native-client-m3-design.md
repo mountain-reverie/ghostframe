@@ -909,6 +909,21 @@ set `colorspace`/`color_range` on the `AVCodecContext` so the stream says what i
 is — and it changes rendering for the shipped web client, which needs its own
 milestone.
 
+**Virtual EDID negotiation — the gate for calling the native client done.**
+The client cannot currently tell the server what resolution it can display;
+the server picks and the client takes what arrives. M3's decoder pre-warm
+therefore sizes its hardware frames pool from the client's *own screen*, as a
+stand-in for the ceiling EDID would establish. A larger stream still decodes —
+`get_format` falls back to allocating its own pool — but at the 2.6-4.9 ms
+realloc cost §10.7 measures, and that fallback is the live path today rather
+than a theoretical safety net, because nothing prevents the server choosing a
+bigger mode.
+
+When EDID negotiation lands, the pre-warm ceiling should become the negotiated
+size rather than a guess from the local display, and the oversized-stream path
+becomes genuinely exceptional. The web client will need the same negotiation
+eventually. Out of scope here: M3's job was making the pipeline work.
+
 **Fence export.** Still deferred from M1 and re-measured in M2 (p99 624µs against
 a 16.67ms budget). M3 re-checks it only if §10 shows decode changed the picture.
 
