@@ -314,14 +314,24 @@ impl H264Decoder {
             // counts frames, and a full frame of added latency to someone
             // watching a remote desktop.
             //
-            // The native client decodes full frames via FullFrameEncoder,
-            // whose VA-API path (production on hardware with VA-API support)
-            // sets only the GOP length (`ghostframe-lib/src/encoder/
-            // h264_vaapi.rs:573`), leaving max_b_frames at its default of 2.
-            // Without this flag, the decoder would buffer for those reordered
-            // frames. The libx264 fallback does set tune=zerolatency (:616),
-            // which disables B-frames in software, but the decoder needs the
-            // guarantee regardless of which path encoded the stream.
+            // The native client decodes full frames, so the encoder that
+            // matters is `FullFrameEncoder` (NOT the tile encoder in the same
+            // file). Its VA-API path -- the production one -- sets only the
+            // GOP length (`ghostframe-lib/src/encoder/h264_vaapi.rs:573`) and
+            // never touches `max_b_frames`; its libx264 fallback additionally
+            // sets `tune=zerolatency` (:616), an x264-only option.
+            //
+            // So the "no B-frames" guarantee is not configured, it is
+            // measured. Encoding with h264_vaapi and only `-g` set on this
+            // stack emits no B-frames at all (1 I + 59 P over 60 frames,
+            // `has_b_frames=0`), i.e. `max_b_frames` is effectively 0, so
+            // this flag gives up nothing today.
+            //
+            // That measurement is the load-bearing assumption. If a future
+            // encoder change ever does enable B-frames, this flag stops being
+            // free: the decoder would emit in decode order rather than
+            // presentation order -- visibly wrong, not merely late. Recheck
+            // here if the encoder's B-frame settings change.
             // SAFETY: `ctx` is an allocated, not-yet-opened codec context.
             (*ctx).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
 
