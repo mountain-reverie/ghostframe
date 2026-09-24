@@ -2,10 +2,10 @@
 //!
 //! Not `#[cfg(test)]` because the oracle in `ghostframe-e2e` and the
 //! `client-gpu` tests need it too -- both live in other crates, where this
-//! crate's own `#[cfg(test)]` is never active. The `testclip` cargo feature
-//! (see `Cargo.toml`) is the mechanism that reaches across that boundary
-//! while keeping this module, with its nine panicking paths, out of a
-//! release build of this production crate by default.
+//! crate's own `#[cfg(test)]` is never active. The `test-support` cargo
+//! feature (see `Cargo.toml`) is the mechanism that reaches across that
+//! boundary while keeping this module, with its nine panicking paths, out
+//! of a release build of this production crate by default.
 //!
 //! In-band SPS/PPS is load-bearing here: no `AV_CODEC_FLAG_GLOBAL_HEADER` is
 //! set below, so every access unit this produces carries its own parameter
@@ -20,7 +20,12 @@ use ffmpeg_next as ffmpeg;
 /// units, one per frame.
 ///
 /// The gradient matters: a flat colour compresses to almost nothing and
-/// would exercise none of the decoder's transform paths.
+/// would exercise none of the decoder's transform paths. Both luma AND
+/// chroma vary along both `x` and `y` -- not decoration: it is what lets
+/// `ghostframe-client-h264/src/oracle_tests.rs`'s linearity check actually
+/// detect tiling. A pattern invariant down one axis of a plane cannot tell
+/// a correctly-laid-out plane from one whose rows along that axis have been
+/// permuted, and would report "0 differ" over a genuinely tiled surface.
 ///
 /// # Panics
 /// On any ffmpeg failure: libx264 missing from the build, the encoder
@@ -76,7 +81,7 @@ pub fn gradient_clip(w: u32, h: u32, n: usize) -> Vec<Vec<u8>> {
             for y in 0..(h / 2) as usize {
                 let row = &mut f.data_mut(plane)[y * stride..y * stride + (w / 2) as usize];
                 for (x, px) in row.iter_mut().enumerate() {
-                    *px = ((x * 2 + plane * 40 + i * 8) % 256) as u8;
+                    *px = ((x * 2 + y * 3 + plane * 40 + i * 8) % 256) as u8;
                 }
             }
         }

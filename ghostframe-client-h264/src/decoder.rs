@@ -594,9 +594,15 @@ mod tests {
                  accept and drop the access unit"
             ),
         };
+        // `msg.contains("send_packet")` alone would also match the
+        // `"send_packet(NULL)"` label `finish()` uses -- checking for the
+        // bare label followed by `:` (the exact prefix `submit_label`
+        // produces for `au: Some(_)`) is what actually pins this down to
+        // the `decode()` call, not just any call through `submit`.
         assert!(
-            msg.contains("send_packet"),
-            "error should name send_packet, the call that actually failed; got: {msg}"
+            msg.contains("send_packet:"),
+            "error should name plain send_packet (not send_packet(NULL)), the call that \
+             actually failed; got: {msg}"
         );
     }
 
