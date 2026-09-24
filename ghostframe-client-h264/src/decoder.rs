@@ -8,7 +8,7 @@
 
 use crate::H264Error;
 use ffmpeg_sys_next as ffi;
-use std::ffi::CString;
+use std::ffi::{c_void, CString};
 use std::ptr;
 
 /// One decoded hardware frame. Owns its `AVFrame`.
@@ -189,33 +189,192 @@ impl Drop for MappedFrame {
     }
 }
 
-/// Pin AV_PIX_FMT_VAAPI out of the decoder's offered format list.
+/// `initial_pool_size` for a pre-warmed hardware frames pool: matches
+/// ffmpeg's own sizing for VA-API H.264 decode (`vaapi_decode_make_config`
+/// in `libavcodec/vaapi_decode.c`, the `!CONFIG_VAAPI_1` branch): one base
+/// surface plus 16 for H.264's DPB (`ref_frame_count` plus short/long-term
+/// reference slack). Ffmpeg normally computes this itself inside
+/// `avcodec_get_hw_frames_parameters`, but that path only runs when ffmpeg
+/// builds its own frames context -- since [`H264Decoder::with_prewarm`]
+/// builds one ahead of time instead, nothing upstream sizes it for us.
+const PREWARM_POOL_SIZE: i32 = 1 + 16;
+
+/// A hardware frames pool built ahead of time at
+/// [`H264Decoder::with_prewarm`]'s max resolution, so the VA-API driver's
+/// (often disproportionately expensive) first-surface allocation happens
+/// during `H264Decoder::new`/`with_prewarm`, not inside the first
+/// `avcodec_send_packet` of a session -- see this module's doc and design
+/// doc §10.
+///
+/// Reached from [`get_vaapi_format`] through `AVCodecContext::opaque`,
+/// which ffmpeg never touches itself (`avcodec.h`: "Set by user" for both
+/// encoding and decoding). [`H264Decoder`] boxes this so its heap address
+/// stays fixed even if the `H264Decoder` itself is moved -- moving a `Box`
+/// moves the pointer, not the pointee -- and owns it for at least as long
+/// as `ctx` is open: `H264Decoder::drop` frees `ctx` (which may hold its
+/// own separate reference on `frames`, taken by `get_vaapi_format`) before
+/// this struct's own `Drop` unrefs the master reference.
+struct PrewarmPool {
+    /// The one reference this struct owns. Every `AVCodecContext` that ends
+    /// up using the pool holds an *independent* reference of its own
+    /// (`av_buffer_ref` in `get_vaapi_format`), so dropping this one does
+    /// not invalidate frames a still-open codec context is using -- see
+    /// [`Drop for PrewarmPool`](#impl-Drop-for-PrewarmPool).
+    frames: *mut ffi::AVBufferRef,
+    width: u32,
+    height: u32,
+}
+
+// SAFETY: exclusive ownership of `frames`, freed exactly once in `Drop`; no
+// thread affinity in the underlying `AVHWFramesContext`/VA-API device.
+unsafe impl Send for PrewarmPool {}
+
+impl Drop for PrewarmPool {
+    fn drop(&mut self) {
+        // SAFETY: `frames` was allocated by `av_hwframe_ctx_alloc` and
+        // initialised by `av_hwframe_ctx_init` in `build_prewarm_pool`,
+        // and this struct owns that one reference exclusively. Any codec
+        // context that copied a separate reference in `get_vaapi_format`
+        // holds its own independent refcount on the same underlying
+        // buffer (`av_buffer_ref` does not share ownership of *this*
+        // handle), so unreffing this one does not free the buffer out
+        // from under a codec context still using it -- ffmpeg's
+        // underlying `AVBufferPool` is only torn down once every
+        // reference, this one included, has been unreffed.
+        unsafe { ffi::av_buffer_unref(&mut self.frames) };
+    }
+}
+
+/// Build and `av_hwframe_ctx_init` an `AVHWFramesContext` sized to
+/// `width`x`height` on `hw_device`, with a fixed VA-API surface pool sized
+/// for H.264's DPB (see [`PREWARM_POOL_SIZE`]).
+///
+/// `format`/`sw_format` mirror what [`get_vaapi_format`] pins the decoder
+/// to (`AV_PIX_FMT_VAAPI` over `AV_PIX_FMT_NV12`) -- `ff_get_format`
+/// (`libavcodec/decode.c`) rejects a supplied `hw_frames_ctx` whose
+/// `format` disagrees with the chosen pixel format, so these must match.
+fn build_prewarm_pool(
+    hw_device: *mut ffi::AVBufferRef,
+    width: u32,
+    height: u32,
+) -> Result<*mut ffi::AVBufferRef, H264Error> {
+    // SAFETY: `hw_device` is a live `AVBufferRef` owned by the caller
+    // (`H264Decoder::open`) for at least the duration of this call.
+    // `av_hwframe_ctx_alloc` takes its own reference on it internally
+    // (`libavutil/hwcontext.c`: `av_buffer_ref(device_ref_in)`) rather than
+    // consuming the caller's, so `hw_device` is untouched by this
+    // function and remains the caller's to free. `frames_ref` is a fresh
+    // allocation freed on the error path below; on success ownership
+    // passes to the caller.
+    unsafe {
+        let mut frames_ref = ffi::av_hwframe_ctx_alloc(hw_device);
+        if frames_ref.is_null() {
+            return Err(H264Error::Ffmpeg("av_hwframe_ctx_alloc failed".into()));
+        }
+        let frames = (*frames_ref).data as *mut ffi::AVHWFramesContext;
+        (*frames).format = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
+        (*frames).sw_format = ffi::AVPixelFormat::AV_PIX_FMT_NV12;
+        (*frames).width = width as i32;
+        (*frames).height = height as i32;
+        (*frames).initial_pool_size = PREWARM_POOL_SIZE;
+
+        let ret = ffi::av_hwframe_ctx_init(frames_ref);
+        if ret < 0 {
+            ffi::av_buffer_unref(&mut frames_ref);
+            return Err(H264Error::Ffmpeg(format!(
+                "av_hwframe_ctx_init (prewarm {width}x{height}): {}",
+                ffmpeg_next::Error::from(ret)
+            )));
+        }
+        Ok(frames_ref)
+    }
+}
+
+/// Pin AV_PIX_FMT_VAAPI out of the decoder's offered format list, and --
+/// when [`H264Decoder`] was built with [`H264Decoder::with_prewarm`] and
+/// the pre-warmed pool is large enough for this stream -- hand the decoder
+/// a ready-made hardware frames pool instead of letting it allocate its
+/// own.
 ///
 /// # Safety
 /// Called by ffmpeg with a valid NUL-terminated (`AV_PIX_FMT_NONE`) format
 /// array. Returning a format not in that list is undefined behaviour, so the
 /// fallback returns `AV_PIX_FMT_NONE`, which ffmpeg treats as "cannot decode".
+///
+/// `ctx` is non-null (ffmpeg's documented `get_format` contract) and safe to
+/// dereference read-write for the duration of this call. This function runs
+/// on ffmpeg's own stack (inside `avcodec_send_packet`, via `ff_get_format`)
+/// and must never panic; every path below is infallible arithmetic or a
+/// checked ffmpeg call.
 unsafe extern "C" fn get_vaapi_format(
-    _ctx: *mut ffi::AVCodecContext,
+    ctx: *mut ffi::AVCodecContext,
     fmts: *const ffi::AVPixelFormat,
 ) -> ffi::AVPixelFormat {
-    if fmts.is_null() {
+    if fmts.is_null() || ctx.is_null() {
         return ffi::AVPixelFormat::AV_PIX_FMT_NONE;
     }
     // SAFETY: `fmts` is non-null, and per this function's documented
     // contract (ffmpeg's `AVCodecContext::get_format`) it points at an array
     // that is read-only here and NUL-terminated with `AV_PIX_FMT_NONE`,
     // which bounds the walk below.
-    unsafe {
+    let has_vaapi = unsafe {
         let mut p = fmts;
+        let mut found = false;
         while *p != ffi::AVPixelFormat::AV_PIX_FMT_NONE {
             if *p == ffi::AVPixelFormat::AV_PIX_FMT_VAAPI {
-                return ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
+                found = true;
+                break;
             }
             p = p.add(1);
         }
+        found
+    };
+    if !has_vaapi {
+        return ffi::AVPixelFormat::AV_PIX_FMT_NONE;
     }
-    ffi::AVPixelFormat::AV_PIX_FMT_NONE
+
+    // SAFETY: `ctx` is non-null (checked above). `(*ctx).opaque`, if
+    // non-null, was written by `H264Decoder::open` to a `Box<PrewarmPool>`
+    // leaked for exactly this purpose before `ctx` was ever handed to
+    // ffmpeg, and stays valid for as long as `ctx` itself does --
+    // `H264Decoder::drop` frees `ctx` before reclaiming the box (see
+    // `PrewarmPool`'s doc). `(*ctx).coded_width`/`coded_height` are safe to
+    // read here: ffmpeg's H.264 decoder sets them (`init_dimensions` in
+    // `h264_slice.c`) before ever calling `get_format`, which this function
+    // is -- verified against ffmpeg's `libavcodec/h264_slice.c` (n9.0.1).
+    // `ff_get_format` (`libavcodec/decode.c`) also guarantees
+    // `(*ctx).hw_frames_ctx` is already null here (`ff_hwaccel_uninit`
+    // unrefs it immediately before calling this callback), so assigning it
+    // below never leaks a previous reference.
+    unsafe {
+        if !(*ctx).opaque.is_null() {
+            let pool = &*((*ctx).opaque as *const PrewarmPool);
+            let coded_w = (*ctx).coded_width as i64;
+            let coded_h = (*ctx).coded_height as i64;
+            if coded_w >= 0
+                && coded_h >= 0
+                && pool.width as i64 >= coded_w
+                && pool.height as i64 >= coded_h
+            {
+                let r = ffi::av_buffer_ref(pool.frames);
+                if !r.is_null() {
+                    (*ctx).hw_frames_ctx = r;
+                }
+                // `av_buffer_ref` returning null (allocation failure) is
+                // left as the graceful fallback below: `hw_frames_ctx`
+                // stays null and ffmpeg allocates its own frames context
+                // sized to the stream, exactly as it would for a stream
+                // that outgrew the pre-warmed pool.
+            }
+            // Else: the stream is larger than the pre-warmed pool.
+            // `hw_frames_ctx` stays null; `ff_decode_get_hw_frames_ctx`
+            // (`libavcodec/decode.c`) then builds a correctly-sized one on
+            // demand -- slower, but correct. This is the graceful
+            // oversized-stream path.
+        }
+    }
+
+    ffi::AVPixelFormat::AV_PIX_FMT_VAAPI
 }
 
 /// Log frames that a caller can never see because `Result` can carry the
@@ -244,6 +403,14 @@ pub struct H264Decoder {
     ctx: *mut ffi::AVCodecContext,
     hw_device: *mut ffi::AVBufferRef,
     packet: *mut ffi::AVPacket,
+    /// `Some` only when constructed via [`H264Decoder::with_prewarm`] with
+    /// both dimensions non-zero AND the pre-warm actually succeeded.
+    /// `(*ctx).opaque` points at this box's heap allocation for as long as
+    /// `ctx` is open -- see [`PrewarmPool`]'s doc for the lifetime
+    /// argument. Declared last so the derived part of `Drop` (which runs
+    /// after this struct's own `Drop::drop` body) frees it after `ctx`
+    /// itself has already been freed.
+    prewarm: Option<Box<PrewarmPool>>,
 }
 
 // SAFETY: `Send` only requires that this struct be safe to move to another
@@ -257,10 +424,30 @@ unsafe impl Send for H264Decoder {}
 
 impl H264Decoder {
     pub fn new() -> Result<Self, H264Error> {
-        Self::with_device(crate::probe::RENDER_NODE)
+        Self::open(crate::probe::RENDER_NODE, 0, 0)
     }
 
     pub fn with_device(node: &str) -> Result<Self, H264Error> {
+        Self::open(node, 0, 0)
+    }
+
+    /// Open the decoder and, when both `max_width` and `max_height` are
+    /// non-zero, pre-build a hardware frames pool sized to them --
+    /// `0`x`0` (or either dimension `0`) means "unknown, do not pre-warm",
+    /// identical to [`H264Decoder::new`].
+    ///
+    /// A pre-warm attempt that fails does NOT fail the whole call: the
+    /// decoder still opens and works, exactly as if `max_width`/
+    /// `max_height` had been `0` -- ffmpeg allocates its own frames context
+    /// per resolution encountered instead. See [`get_vaapi_format`]'s doc
+    /// for the runtime fallback this enables when a stream turns out
+    /// larger than `max_width`x`max_height` too: never a hard failure,
+    /// only ever a speed difference.
+    pub fn with_prewarm(max_width: u32, max_height: u32) -> Result<Self, H264Error> {
+        Self::open(crate::probe::RENDER_NODE, max_width, max_height)
+    }
+
+    fn open(node: &str, max_width: u32, max_height: u32) -> Result<Self, H264Error> {
         let path = CString::new(node)
             .map_err(|_| H264Error::VaapiUnavailable(format!("bad device path {node:?}")))?;
 
@@ -327,10 +514,49 @@ impl H264Decoder {
                 return Err(H264Error::Ffmpeg("av_packet_alloc failed".into()));
             }
 
+            // Pre-warm is best-effort: a failure here does not fail
+            // `open()` itself, it just means this decoder behaves exactly
+            // as if `max_width`/`max_height` were `0` -- see
+            // `with_prewarm`'s doc.
+            let prewarm = if max_width > 0 && max_height > 0 {
+                match build_prewarm_pool(hw_device, max_width, max_height) {
+                    Ok(frames) => {
+                        let boxed = Box::new(PrewarmPool {
+                            frames,
+                            width: max_width,
+                            height: max_height,
+                        });
+                        // `ctx.opaque` gets the box's heap address, not
+                        // ownership: `H264Decoder` (via `prewarm` below)
+                        // keeps the one owning `Box` for its whole
+                        // lifetime. Moving a `Box` moves only the pointer
+                        // wrapper -- the heap allocation this address
+                        // points at does not move -- so this pointer stays
+                        // valid even after `H264Decoder` itself is moved.
+                        let ptr: *mut PrewarmPool = &*boxed as *const PrewarmPool as *mut _;
+                        (*ctx).opaque = ptr as *mut c_void;
+                        Some(boxed)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            max_width,
+                            max_height,
+                            "H.264 decoder pre-warm failed; falling back to \
+                             per-resolution frames-context allocation"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             Ok(H264Decoder {
                 ctx,
                 hw_device,
                 packet,
+                prewarm,
             })
         }
     }
@@ -488,6 +714,18 @@ impl H264Decoder {
         unsafe { ffi::avcodec_flush_buffers(self.ctx) };
     }
 
+    /// The pre-warmed hardware frames pool's dimensions, if this decoder
+    /// actually has one. `None` covers every non-pre-warmed case alike:
+    /// `new`/`with_device` (never asked for one), `with_prewarm(0, _)` /
+    /// `with_prewarm(_, 0)` ("unknown, do not pre-warm"), and a
+    /// `with_prewarm` call whose pool build itself failed and fell back
+    /// gracefully -- see `with_prewarm`'s doc. Test/diagnostic use: lets a
+    /// caller confirm which path a given decoder actually took without
+    /// depending on log-message text.
+    pub fn prewarm_pool_dims(&self) -> Option<(u32, u32)> {
+        self.prewarm.as_ref().map(|p| (p.width, p.height))
+    }
+
     fn drain(&mut self) -> Result<Vec<HwFrame>, H264Error> {
         let mut out = Vec::new();
         loop {
@@ -522,12 +760,25 @@ impl H264Decoder {
 impl Drop for H264Decoder {
     fn drop(&mut self) {
         // SAFETY: freeing in reverse allocation order; each pointer is owned
-        // solely by this struct and freed exactly once.
+        // solely by this struct and freed exactly once. `avcodec_free_context`
+        // closes the codec (running `ff_hwaccel_uninit`, which unrefs
+        // whatever separate `hw_frames_ctx` reference `get_vaapi_format` gave
+        // it) before `self.prewarm`'s own `Drop` (run automatically, after
+        // this function returns, since `prewarm` is a plain struct field)
+        // unrefs the master reference -- but the order between those two
+        // unrefs does not actually matter for correctness: each is an
+        // independent refcount on the same underlying `AVBufferPool`
+        // (`av_buffer_ref` in `get_vaapi_format` created a distinct handle),
+        // which ffmpeg only tears down once every reference, from either
+        // side, has been unreffed.
         unsafe {
             ffi::av_packet_free(&mut self.packet);
             ffi::avcodec_free_context(&mut self.ctx);
             ffi::av_buffer_unref(&mut self.hw_device);
         }
+        // `self.prewarm` (an `Option<Box<PrewarmPool>>`) drops here, after
+        // this body, via the compiler-generated field drop -- see
+        // `PrewarmPool`'s own `Drop` for what that does.
     }
 }
 
@@ -727,5 +978,103 @@ mod tests {
             }
         }
         assert!(mapped > 0, "no frame was mapped");
+    }
+
+    /// `with_prewarm(0, 0)` must behave exactly like `new()`: no pool, and
+    /// decode still works. Preserves today's behaviour for hosts that do
+    /// not know their max resolution.
+    #[test]
+    fn prewarm_zero_means_no_prewarm() {
+        if skip_without_vaapi() {
+            return;
+        }
+        let mut dec = H264Decoder::with_prewarm(0, 0).expect("open decoder");
+        assert_eq!(dec.prewarm_pool_dims(), None);
+        let clip = gradient_clip(640, 480, 3);
+        let mut frames = 0;
+        for au in &clip {
+            frames += dec.decode(au).expect("decode").len();
+        }
+        frames += dec.finish().expect("finish").len();
+        assert!(
+            frames > 0,
+            "decoder with no pre-warm still produced nothing"
+        );
+    }
+
+    /// A stream that exactly matches the pre-warmed size must decode
+    /// correctly using the warm pool.
+    #[test]
+    fn prewarm_matching_stream_decodes() {
+        if skip_without_vaapi() {
+            return;
+        }
+        let mut dec = H264Decoder::with_prewarm(640, 480).expect("open decoder");
+        assert_eq!(dec.prewarm_pool_dims(), Some((640, 480)));
+        let clip = gradient_clip(640, 480, 3);
+        let mut frames = 0;
+        for au in &clip {
+            for frame in dec.decode(au).expect("decode") {
+                assert_eq!(frame.width(), 640);
+                assert_eq!(frame.height(), 480);
+                frames += 1;
+            }
+        }
+        frames += dec.finish().expect("finish").len();
+        assert!(frames > 0, "pre-warmed decoder produced nothing");
+    }
+
+    /// A stream *smaller* than the pre-warmed pool must still decode
+    /// correctly (the pool is large enough, `get_vaapi_format` hands it
+    /// over per the `>=` check).
+    #[test]
+    fn prewarm_larger_than_stream_still_decodes() {
+        if skip_without_vaapi() {
+            return;
+        }
+        let mut dec = H264Decoder::with_prewarm(1920, 1080).expect("open decoder");
+        assert_eq!(dec.prewarm_pool_dims(), Some((1920, 1080)));
+        let clip = gradient_clip(640, 480, 3);
+        let mut frames = 0;
+        for au in &clip {
+            for frame in dec.decode(au).expect("decode") {
+                assert_eq!(frame.width(), 640);
+                assert_eq!(frame.height(), 480);
+                frames += 1;
+            }
+        }
+        frames += dec.finish().expect("finish").len();
+        assert!(
+            frames > 0,
+            "decoder produced nothing for a stream smaller than the pool"
+        );
+    }
+
+    /// The owner's "bigger frame" case: a stream *larger* than the
+    /// pre-warmed pool must still decode correctly -- `get_vaapi_format`'s
+    /// `>=` check must fail closed (leave `hw_frames_ctx` null, let ffmpeg
+    /// allocate its own) rather than handing over an undersized pool that
+    /// would corrupt or crash the decode.
+    #[test]
+    fn prewarm_smaller_than_stream_still_decodes_correctly() {
+        if skip_without_vaapi() {
+            return;
+        }
+        let mut dec = H264Decoder::with_prewarm(320, 240).expect("open decoder");
+        assert_eq!(dec.prewarm_pool_dims(), Some((320, 240)));
+        let clip = gradient_clip(640, 480, 3);
+        let mut frames = 0;
+        for au in &clip {
+            for frame in dec.decode(au).expect("decode") {
+                assert_eq!(frame.width(), 640);
+                assert_eq!(frame.height(), 480);
+                frames += 1;
+            }
+        }
+        frames += dec.finish().expect("finish").len();
+        assert_eq!(
+            frames, 3,
+            "decoder must decode every frame of an oversized stream correctly, not just avoid a crash"
+        );
     }
 }

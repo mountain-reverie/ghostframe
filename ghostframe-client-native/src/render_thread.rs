@@ -77,6 +77,7 @@ fn handle_debug_map_frame(
 /// see the design doc's "Allocation timing" note). Returns whether a
 /// render-worthy change happened, i.e. whether `flush`+`publish` are worth
 /// running this batch.
+#[allow(clippy::too_many_arguments)]
 fn handle_core_event(
     ctx: &WgpuContext,
     renderer: &mut Option<Renderer>,
@@ -85,6 +86,8 @@ fn handle_core_event(
     export_buffers: usize,
     host_visible: bool,
     preferred_modifiers: &[u64],
+    max_decode_width: u32,
+    max_decode_height: u32,
 ) -> bool {
     if renderer.is_none() {
         let CoreEvent::FrameDimensions { width, height } = &ev else {
@@ -102,6 +105,8 @@ fn handle_core_event(
             export_buffers,
             preferred_modifiers,
             host_visible,
+            max_decode_width,
+            max_decode_height,
         ) {
             Ok(r) => *renderer = Some(r),
             Err(e) => {
@@ -122,6 +127,7 @@ fn handle_core_event(
     true
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
     ctx: WgpuContext,
     rx: Receiver<RenderMsg>,
@@ -130,6 +136,8 @@ pub(crate) fn run(
     export_buffers: u32,
     host_visible: bool,
     preferred_modifiers: Vec<u64>,
+    max_decode_width: u32,
+    max_decode_height: u32,
 ) {
     let mut renderer: Option<Renderer> = None;
     // `0` means "the embedder didn't specify a count"; a `Renderer` with
@@ -164,6 +172,8 @@ pub(crate) fn run(
                     export_buffers,
                     host_visible,
                     &preferred_modifiers,
+                    max_decode_width,
+                    max_decode_height,
                 );
             }
             RenderMsg::DebugMapFrame(buffer_id, reply) => {
@@ -194,6 +204,8 @@ pub(crate) fn run(
                         export_buffers,
                         host_visible,
                         &preferred_modifiers,
+                        max_decode_width,
+                        max_decode_height,
                     );
                 }
                 Ok(RenderMsg::DebugMapFrame(buffer_id, reply)) => {

@@ -56,8 +56,13 @@ pub struct Renderer {
     pending_palrle: Vec<(u8, u8, u8, u8, Vec<u8>)>,
     pending_cdf53: Vec<Cdf53PassEntry>,
 
-    /// Lazily created: a client that never receives H.264 never opens a
-    /// decoder, and a machine without VA-API never can.
+    /// `Some` from construction on when `Renderer::new`'s
+    /// `max_decode_width`/`max_decode_height` were both non-zero (the
+    /// decoder, and its hardware frames pool, are pre-warmed synchronously
+    /// in `Renderer::new` -- see that function's doc). Otherwise lazily
+    /// created on the first `NeedsH264` event in `decode_h264`: a client
+    /// that never receives H.264 and never had a known max resolution
+    /// never opens a decoder, and a machine without VA-API never can.
     h264_decoder: Option<ghostframe_client_h264::decoder::H264Decoder>,
     h264_pipeline: Option<crate::pipelines::h264_nv12::H264Nv12Pipeline>,
     /// `true` once opening the decoder has failed. Latches the failure so a
@@ -94,6 +99,20 @@ impl Renderer {
     /// then never show a frame. Rejected here rather than clamped, since a
     /// silent clamp would hide a misconfigured caller behind a working demo
     /// and a broken embed.
+    /// `max_decode_width`/`max_decode_height` are the client's own maximum
+    /// display resolution (its screen, or eventually its negotiated virtual
+    /// EDID) -- NOT this session's current `width`/`height`, which can be
+    /// smaller. `0` in either means "unknown, do not pre-warm", preserving
+    /// the old lazy-open-on-first-H.264-frame behaviour: see
+    /// [`ghostframe_client_h264::decoder::H264Decoder::with_prewarm`]. When
+    /// both are non-zero, the H.264 decoder (device, codec, and hardware
+    /// frames pool) is opened right here, synchronously, instead of lazily
+    /// inside [`Renderer::apply_event`]'s `NeedsH264` handling -- moving
+    /// the session-start H.264 decode cost from the first H.264 access unit
+    /// to `Renderer::new` itself. A stream that later turns out larger than
+    /// the pre-warmed pool still decodes correctly, just without the
+    /// pre-warm speedup -- see that function's doc for the mechanism.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         ctx: &WgpuContext,
         width: u32,
@@ -103,6 +122,8 @@ impl Renderer {
         // Diagnostic-only: makes `debug_map_frame` possible at the cost of
         // pinning exports to CPU-visible memory. Production passes false.
         host_visible: bool,
+        max_decode_width: u32,
+        max_decode_height: u32,
     ) -> Result<Self, GpuError> {
         if export_buffers == 0 {
             return Err(GpuError::NoExportBuffers);
@@ -126,6 +147,56 @@ impl Renderer {
         let (cols, rows) = tile_grid(width, height);
         cdf53.resize(&ctx.device, &ctx.queue, cols, rows);
 
+        // Pre-warm: `0` in either dimension means the host does not know
+        // its max resolution, so behave exactly as before (lazy open on
+        // the first `NeedsH264` event, see `decode_h264`). When both are
+        // known, open the decoder -- device, codec, AND its hardware
+        // frames pool -- right now, synchronously, so the pool build's
+        // cost lands on `Renderer::new` instead of the first H.264 access
+        // unit of the session.
+        let (h264_decoder, h264_unavailable) = if max_decode_width > 0 && max_decode_height > 0 {
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "measuring a real hardware VA-API device-open + pool-prewarm stall for M3 §10's decode-thread decision, not a virtual-clock path"
+            )]
+            let start = std::time::Instant::now();
+            let opened = ghostframe_client_h264::decoder::H264Decoder::with_prewarm(
+                max_decode_width,
+                max_decode_height,
+            );
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "measuring a real hardware VA-API device-open + pool-prewarm stall for M3 §10's decode-thread decision, not a virtual-clock path"
+            )]
+            let prewarm_us = start.elapsed().as_micros() as u64;
+            tracing::debug!(
+                prewarm_us,
+                max_decode_width,
+                max_decode_height,
+                "Renderer::new: H264Decoder::with_prewarm stall"
+            );
+            match opened {
+                Ok(d) => (Some(d), false),
+                // Same reasoning as `decode_h264`'s lazy open: a genuine
+                // device/codec-open failure (no VA-API at all) means every
+                // later retry would fail identically, so latch it rather
+                // than retry per access unit. A failure to build just the
+                // *pool* at this size does NOT reach here -- `with_prewarm`
+                // itself falls back gracefully and still returns `Ok`, see
+                // its doc.
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "H.264 pre-warm requested but no decoder could be opened -- the \
+                         capability was advertised without hardware to back it"
+                    );
+                    (None, true)
+                }
+            }
+        } else {
+            (None, false)
+        };
+
         Ok(Renderer {
             fb,
             ring,
@@ -135,9 +206,9 @@ impl Renderer {
             pending_solid: Vec::new(),
             pending_palrle: Vec::new(),
             pending_cdf53: Vec::new(),
-            h264_decoder: None,
+            h264_decoder,
             h264_pipeline: None,
-            h264_unavailable: false,
+            h264_unavailable,
             h264_import_path: None,
             h264_last_frame_seq: None,
             h264_needs_reset: false,
