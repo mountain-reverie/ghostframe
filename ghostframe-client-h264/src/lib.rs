@@ -25,7 +25,7 @@ pub mod probe;
 #[cfg(any(test, feature = "testclip"))]
 pub mod testclip;
 
-pub use descriptor::{DmabufPlanes, PlaneDesc};
+pub use descriptor::{DmabufPlanes, PlaneDesc, DRM_FORMAT_GR88, DRM_FORMAT_NV12, DRM_FORMAT_R8};
 pub use probe::vaapi_h264_decode_available;
 
 #[derive(Debug, thiserror::Error)]

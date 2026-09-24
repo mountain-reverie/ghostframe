@@ -33,8 +33,13 @@ impl HwFrame {
 
     /// Map this hardware surface to a DRM_PRIME dmabuf description.
     ///
-    /// The returned [`MappedFrame`] owns the mapping; `planes.fd` is valid
-    /// exactly as long as it lives, and must not be closed by the caller.
+    /// The returned [`MappedFrame`] owns the mapping; its
+    /// [`planes()`](MappedFrame::planes)`.fd` is valid exactly as long as it
+    /// lives, and must not be closed by the caller. `av_hwframe_map` takes
+    /// its own reference on `self.frame`'s underlying VA-API surface, so the
+    /// returned `MappedFrame` does not borrow from `self` and may outlive
+    /// it -- `self` can be dropped (freeing this `HwFrame`'s own reference)
+    /// while the mapping, and the dmabuf fd inside it, stay valid.
     pub fn map_dmabuf(&self) -> Result<MappedFrame, H264Error> {
         // SAFETY: `self.frame` is a live VAAPI frame owned by `self` for the
         // duration of this call. `drm` is a fresh allocation freed on every
@@ -89,20 +94,34 @@ impl Drop for HwFrame {
 
 /// A hardware frame mapped to DRM_PRIME. Holds the mapped `AVFrame` alive,
 /// because the fd inside [`crate::DmabufPlanes`] is a borrow into it: ffmpeg
-/// closes the dmabuf fd when the mapped frame is unrefed, so `planes.fd`
-/// is valid only for as long as this `MappedFrame` lives. Dropping this
-/// while `planes` is still held elsewhere leaves that fd dangling -- there
-/// is nothing in the type system stopping a caller from copying `planes`
-/// out and using it after `self` is gone, so that discipline is on the
-/// caller, and is the whole reason this type is separate from `HwFrame`
-/// rather than a method that returns `DmabufPlanes` alone.
+/// closes the dmabuf fd when the mapped frame is unrefed, so `planes().fd`
+/// is valid only for as long as this `MappedFrame` lives.
+///
+/// `planes` is deliberately private with a `&self` accessor rather than a
+/// `pub` field. `DmabufPlanes` is `Copy`, so a `pub` field would let a
+/// caller copy it out and use the fd after `self` drops -- not "fd is
+/// closed" (which at least fails loudly) but "fd number was recycled by
+/// the kernel", where a later `dup()` succeeds and silently imports an
+/// unrelated file. [`Self::planes`] borrowing `&self` turns that into a
+/// borrow-checker error at the call site instead: `import_nv12(&ctx,
+/// m.planes())` ties the import call to `m`'s lifetime, and copying out
+/// now requires writing `*m.planes()` explicitly -- exactly where a reader
+/// should pause.
 pub struct MappedFrame {
     drm: *mut ffi::AVFrame,
-    pub planes: crate::DmabufPlanes,
+    planes: crate::DmabufPlanes,
 }
 
 // SAFETY: exclusive ownership of `drm`, freed exactly once in `Drop`.
 unsafe impl Send for MappedFrame {}
+
+impl MappedFrame {
+    /// Borrow the dmabuf description. See the struct docs for why this is
+    /// an accessor and not a `pub` field.
+    pub fn planes(&self) -> &crate::DmabufPlanes {
+        &self.planes
+    }
+}
 
 impl Drop for MappedFrame {
     fn drop(&mut self) {
@@ -139,6 +158,17 @@ unsafe extern "C" fn get_vaapi_format(
         }
     }
     ffi::AVPixelFormat::AV_PIX_FMT_NONE
+}
+
+/// Log frames that a caller can never see because `Result` can carry the
+/// error that made them orphaned, or the frames themselves, but not both.
+fn warn_dropped(frames: &[HwFrame], cause: &str) {
+    if !frames.is_empty() {
+        tracing::warn!(
+            count = frames.len(),
+            "discarding frames completed before {cause}"
+        );
+    }
 }
 
 pub struct H264Decoder {
@@ -241,97 +271,14 @@ impl H264Decoder {
     /// An empty result is normal, not an error: the decoder emits nothing
     /// until it has a keyframe, and B-frame reordering delays output.
     ///
-    /// On `EAGAIN` -- the decoder's internal buffer is full -- this drains
-    /// what is ready and retries the send once, rather than treating
-    /// "resend this packet" as success and silently dropping the access
-    /// unit. For H.264 a dropped access unit means corruption until the
-    /// next IDR, with nothing to tell the caller it happened. `drain()`
-    /// empties the decoder after every call here, which is why EAGAIN is
-    /// normally unreachable in testing; it exists for whatever buffering
-    /// condition triggers it first in production.
+    /// On `EAGAIN` -- the decoder's internal buffer is full -- drains what
+    /// is ready and retries the send once, rather than treating "resend
+    /// this packet" as success and silently dropping the access unit. For
+    /// H.264 a dropped access unit means corruption until the next IDR,
+    /// with nothing to tell the caller it happened. See
+    /// [`Self::submit_with_retry`] for the shared mechanics.
     pub fn decode(&mut self, au: &[u8]) -> Result<Vec<HwFrame>, H264Error> {
-        let mut out = match self.send_packet(au) {
-            Ok(true) => Vec::new(),
-            Ok(false) => {
-                let out = self.drain()?;
-                match self.send_packet(au) {
-                    Ok(true) => out,
-                    Ok(false) => {
-                        // Frames drained above are about to be discarded
-                        // along with the error below -- `Result` can't
-                        // carry both. Same reasoning as the hard-error arm
-                        // just below: log rather than let them vanish
-                        // silently.
-                        if !out.is_empty() {
-                            tracing::warn!(
-                                count = out.len(),
-                                "discarding frames drained during a still-full \
-                                 drain-and-retry"
-                            );
-                        }
-                        return Err(H264Error::Ffmpeg(
-                            "send_packet: decoder still full after drain-and-retry".into(),
-                        ));
-                    }
-                    Err(e) => {
-                        if !out.is_empty() {
-                            tracing::warn!(
-                                count = out.len(),
-                                "discarding frames drained before a hard resend error"
-                            );
-                        }
-                        return Err(e);
-                    }
-                }
-            }
-            Err(e) => {
-                // The send failed outright, but frames the decoder finished
-                // before this call could still be sitting in its output
-                // queue. Drain and log rather than silently discarding them
-                // along with the error this call reports -- `Result` can't
-                // carry both, so they can't be returned to the caller, but
-                // they don't have to vanish without a trace either.
-                if let Ok(orphaned) = self.drain() {
-                    if !orphaned.is_empty() {
-                        tracing::warn!(
-                            count = orphaned.len(),
-                            "discarding frames completed before a hard decode error"
-                        );
-                    }
-                }
-                return Err(e);
-            }
-        };
-        out.extend(self.drain()?);
-        Ok(out)
-    }
-
-    /// Send one packet to the decoder.
-    ///
-    /// `Ok(false)` means `EAGAIN`: the decoder's internal buffer is full and
-    /// the caller must drain before resending the same packet. `Ok(true)`
-    /// means the packet was accepted.
-    fn send_packet(&mut self, au: &[u8]) -> Result<bool, H264Error> {
-        // SAFETY: `au` outlives the call, which copies what it needs into
-        // ffmpeg's own buffers; `self.packet` is a live allocation reset
-        // after every use so it never retains a dangling pointer into `au`.
-        unsafe {
-            (*self.packet).data = au.as_ptr() as *mut u8;
-            (*self.packet).size = au.len() as i32;
-            let ret = ffi::avcodec_send_packet(self.ctx, self.packet);
-            (*self.packet).data = ptr::null_mut();
-            (*self.packet).size = 0;
-            if ret == ffi::AVERROR(libc::EAGAIN) {
-                return Ok(false);
-            }
-            if ret < 0 {
-                return Err(H264Error::Ffmpeg(format!(
-                    "send_packet: {}",
-                    ffmpeg_next::Error::from(ret)
-                )));
-            }
-        }
-        Ok(true)
+        self.submit_with_retry(Some(au))
     }
 
     /// Signal end of stream and drain what the decoder still holds.
@@ -341,70 +288,101 @@ impl H264Decoder {
     /// again. Deliberately NOT called `flush`: ffmpeg's
     /// `avcodec_flush_buffers` means the opposite thing (discard state and
     /// continue), and `reset` below is the wrapper for that.
+    ///
+    /// Shares [`Self::submit_with_retry`] with [`Self::decode`], so an
+    /// `EAGAIN` here -- the decoder's internal buffer still full when the
+    /// EOF signal is sent -- is drained and retried exactly like a normal
+    /// access unit, rather than reported as a hard failure.
     pub fn finish(&mut self) -> Result<Vec<HwFrame>, H264Error> {
-        let mut out = match self.send_eof() {
-            Ok(true) => Vec::new(),
-            Ok(false) => {
-                // Same condition `decode()`'s `send_packet` reports as
-                // `Ok(false)`: the decoder's internal buffer is full and the
-                // EOF signal must be resent after a drain. In this crate's
-                // own tests it never fires -- every call site drains after
-                // every `decode()` before reaching `finish()` -- but nothing
-                // about the API guarantees a caller does that, and this is
-                // the one place in the file that used to treat EAGAIN as a
-                // hard error instead of distinguishing it, which is the
-                // whole theme here.
-                let out = self.drain()?;
-                match self.send_eof() {
-                    Ok(true) => out,
-                    Ok(false) => {
-                        if !out.is_empty() {
-                            tracing::warn!(
-                                count = out.len(),
-                                "discarding frames drained during a still-full finish retry"
-                            );
-                        }
-                        return Err(H264Error::Ffmpeg(
-                            "send_packet(NULL): decoder still full after drain-and-retry".into(),
-                        ));
-                    }
-                    Err(e) => {
-                        if !out.is_empty() {
-                            tracing::warn!(
-                                count = out.len(),
-                                "discarding frames drained before a hard finish-retry error"
-                            );
-                        }
-                        return Err(e);
-                    }
-                }
-            }
-            Err(e) => return Err(e),
-        };
-        out.extend(self.drain()?);
-        Ok(out)
+        self.submit_with_retry(None)
     }
 
-    /// Send the end-of-stream signal (a null packet).
+    /// Send one packet to the decoder, or (`None`) the end-of-stream signal.
     ///
-    /// `Ok(false)` means `EAGAIN` -- the same condition [`Self::send_packet`]
-    /// reports: the decoder's internal buffer is full and the caller must
-    /// drain before resending. Split out from [`Self::finish`] because
-    /// ffmpeg's null-packet EOF signal takes no `AVPacket*` for this crate
-    /// to reset afterwards, unlike a real access unit.
-    fn send_eof(&mut self) -> Result<bool, H264Error> {
-        // SAFETY: a null packet is ffmpeg's documented end-of-stream signal.
-        let ret = unsafe { ffi::avcodec_send_packet(self.ctx, ptr::null()) };
+    /// `Ok(false)` means `EAGAIN`: the decoder's internal buffer is full and
+    /// the caller must drain before resending the same input. `Ok(true)`
+    /// covers two different ffmpeg outcomes that both mean "nothing more to
+    /// do here": the input was accepted, *or* this is a second-or-later EOF
+    /// signal and the decoder already reported `AVERROR_EOF` for the first
+    /// one. Per `avcodec.h`, the first flush packet returns success and
+    /// every one after it returns `AVERROR_EOF` -- treating that as
+    /// `Ok(true)` rather than an error is what makes [`Self::finish`]
+    /// idempotent.
+    fn submit(&mut self, au: Option<&[u8]>) -> Result<bool, H264Error> {
+        let (ret, what) = match au {
+            Some(au) => {
+                // SAFETY: `au` outlives the call, which copies what it needs
+                // into ffmpeg's own buffers; `self.packet` is a live
+                // allocation reset after every use so it never retains a
+                // dangling pointer into `au`.
+                let ret = unsafe {
+                    (*self.packet).data = au.as_ptr() as *mut u8;
+                    (*self.packet).size = au.len() as i32;
+                    let ret = ffi::avcodec_send_packet(self.ctx, self.packet);
+                    (*self.packet).data = ptr::null_mut();
+                    (*self.packet).size = 0;
+                    ret
+                };
+                (ret, "send_packet")
+            }
+            None => {
+                // SAFETY: a null packet is ffmpeg's documented end-of-stream
+                // signal.
+                let ret = unsafe { ffi::avcodec_send_packet(self.ctx, ptr::null()) };
+                (ret, "send_packet(NULL)")
+            }
+        };
         if ret == ffi::AVERROR(libc::EAGAIN) {
             return Ok(false);
         }
         if ret < 0 && ret != ffi::AVERROR_EOF {
             return Err(H264Error::Ffmpeg(format!(
-                "send_packet(NULL): {}",
+                "{what}: {}",
                 ffmpeg_next::Error::from(ret)
             )));
         }
         Ok(true)
+    }
+
+    /// Submit `au` (or, for `None`, the end-of-stream signal), draining and
+    /// retrying once on `EAGAIN` before giving up.
+    ///
+    /// This is the whole drain-retry-warn dance shared by [`Self::decode`]
+    /// and [`Self::finish`], which used to be two independent copies that
+    /// had already diverged: one warned about frames dropped on a hard
+    /// resend error, the other silently discarded them. Factoring it out
+    /// makes that omission impossible rather than merely fixed, on every
+    /// exit that would otherwise drop frames the decoder already produced
+    /// -- `Result` can carry the error or the frames but not both, so
+    /// they're logged instead of vanishing without a trace.
+    fn submit_with_retry(&mut self, au: Option<&[u8]>) -> Result<Vec<HwFrame>, H264Error> {
+        let mut out = match self.submit(au) {
+            Ok(true) => Vec::new(),
+            Ok(false) => {
+                let out = self.drain()?;
+                match self.submit(au) {
+                    Ok(true) => out,
+                    Ok(false) => {
+                        warn_dropped(&out, "the decoder was still full after drain-and-retry");
+                        return Err(H264Error::Ffmpeg(
+                            "decoder still full after drain-and-retry".into(),
+                        ));
+                    }
+                    Err(e) => {
+                        warn_dropped(&out, "a hard resend error");
+                        return Err(e);
+                    }
+                }
+            }
+            Err(e) => {
+                if let Ok(orphaned) = self.drain() {
+                    warn_dropped(&orphaned, "a hard decode error");
+                }
+                return Err(e);
+            }
+        };
+        out.extend(self.drain()?);
+        Ok(out)
     }
 
     /// Discard buffered state and continue decoding -- ffmpeg's
@@ -561,21 +539,30 @@ mod tests {
         for au in &clip {
             for frame in dec.decode(au).expect("decode") {
                 let m = frame.map_dmabuf().expect("map to dmabuf");
-                assert!(m.planes.fd >= 0, "dmabuf fd must be valid");
-                assert_eq!(m.planes.width, 640);
-                assert_eq!(m.planes.height, 480);
+                let planes = m.planes();
+                assert!(planes.fd >= 0, "dmabuf fd must be valid");
+                assert_eq!(planes.width, 640);
+                assert_eq!(planes.height, 480);
+                assert_eq!(planes.fourcc_luma, crate::DRM_FORMAT_R8);
+                assert_eq!(planes.fourcc_chroma, crate::DRM_FORMAT_GR88);
                 assert!(
-                    m.planes.luma.pitch >= 640,
+                    planes.luma.offset + planes.luma.pitch * planes.height as u64 <= planes.size,
+                    "luma plane overruns the {}-byte dmabuf object",
+                    planes.size
+                );
+                assert!(
+                    planes.luma.pitch >= 640,
                     "luma pitch {} is narrower than the frame",
-                    m.planes.luma.pitch
+                    planes.luma.pitch
                 );
                 eprintln!(
-                    "[m3] modifier=0x{:016x} luma(off={},pitch={}) chroma(off={},pitch={})",
-                    m.planes.modifier,
-                    m.planes.luma.offset,
-                    m.planes.luma.pitch,
-                    m.planes.chroma.offset,
-                    m.planes.chroma.pitch
+                    "[m3] modifier=0x{:016x} size={} luma(off={},pitch={}) chroma(off={},pitch={})",
+                    planes.modifier,
+                    planes.size,
+                    planes.luma.offset,
+                    planes.luma.pitch,
+                    planes.chroma.offset,
+                    planes.chroma.pitch
                 );
                 mapped += 1;
             }
