@@ -62,9 +62,15 @@ pub struct DmabufPlanes {
     /// that `MappedFrame` is alive.
     ///
     /// **An importer must `dup()` this before any call that takes ownership.**
-    /// `vkImportMemoryFdKHR` takes ownership: the fd is closed by
-    /// `vkFreeMemory`, so handing this one over directly double-closes it
-    /// against the `AVFrame`'s own unref. The design imports the same dmabuf
+    /// `vkImportMemoryFdKHR` takes ownership: after a successful
+    /// `vkAllocateMemory` the fd belongs to the Vulkan implementation and
+    /// this process must never `close()` it again. *When* the implementation
+    /// closes it is unspecified — RADV does so synchronously inside
+    /// `vkAllocateMemory`, which is how this was found (see
+    /// `ghostframe-client-gpu/src/import.rs`), but a driver that defers the
+    /// close makes the same double-close silent rather than fatal. So handing
+    /// this fd over directly double-closes it against the `AVFrame`'s own
+    /// unref, on every driver, whether or not it aborts. The design imports the same dmabuf
     /// twice (luma and chroma planes), which would be two closes of one fd.
     /// The future importer (Task 6's `import.rs`) must `dup()` this fd for
     /// exactly this reason.

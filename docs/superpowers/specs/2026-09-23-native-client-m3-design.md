@@ -422,6 +422,15 @@ the import on disagreement, and the CPU copy stays in the build as the floor.
 This measurement upgrades direct import from "unfounded assumption" to
 "expected, and verified at runtime before it is trusted" — not to "guaranteed".
 
+**This is now a gate, not just a record.** The test asserts zero diffs
+whenever the modifier is `LINEAR` or `INVALID` — the two cases where a linear
+layout is what we are relying on — and prints-and-skips on a real tiled
+modifier, since comparing a legitimately tiled buffer against a linear read is
+expected to differ and says nothing about a bug. So a driver revision that
+changed the tiling here fails this test with the byte counts in the message,
+rather than being discovered later as an opaque import failure. Both
+resolutions are separate tests, so a size-dependent change names the size.
+
 This closes the open question §7 posed. It does not change anything about
 *why* the modifier is uninformative on GFX8 (§7.1 already explains that
 correctly) -- it answers the question §7.1 said the modifier could not.
