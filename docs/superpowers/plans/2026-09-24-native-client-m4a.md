@@ -20,6 +20,14 @@
 
 **The negative test matters more than the positive one.** "A second client evicts the first" would be noticed the moment it broke. "A connection that never sent HELLO evicts nobody" is the one that rots silently — and it is what stands between a port scan and someone's session dying.
 
+**Any new `pub` item in `ghostframe-protocol` or `ghostframe-lib` regenerates
+the C header.** `ghostframe-lib/build.rs` runs cbindgen into
+`ghostframe-lib/include/ghostframe.h`, and CI fails if the committed copy is
+stale (`ci.yml:140`, "verify committed header is up to date"). Task 2's new
+`pub const`s landed there and were nearly left uncommitted. After any task
+that adds a public constant or type, run `cargo check -p ghostframe-lib` and
+commit the regenerated header alongside the change.
+
 **Numbers in this plan that are guesses:** three repeats of the eviction datagram, and a ~16 ms grace before close. Label them as guesses where you write them. They are not measurements and should not read as if they were.
 
 ---
@@ -563,6 +571,21 @@ cargo test -p ghostframe-client-core eviction
 Expected: FAIL — `Event::Evicted` does not exist.
 
 - [ ] **Step 3: Add the event and route the sentinel**
+
+> **A bug to prevent, found while reviewing Task 2.** `reassembly.rs:90`
+> computes `is_sentinel` from the frame-dimensions sentinel **only**:
+>
+> ```rust
+> let is_sentinel =
+>     th.tile_x == FRAME_DIMENSIONS_SENTINEL_X && th.tile_y == FRAME_DIMENSIONS_SENTINEL_Y;
+> ```
+>
+> As it stands an eviction datagram is not a sentinel by that test, so it
+> gets ACKed (`:93`) and then falls through into tile assembly as a
+> `Codec::Skip` tile at (254, 254) — a coordinate no real tile occupies.
+> Extend `is_sentinel` to cover eviction as well, and route eviction before
+> assembly, so the notice never reaches the tile path.
+
 
 In `ghostframe-client-core/src/event.rs`:
 
