@@ -45,9 +45,11 @@ ci-local:
     cd ghostframe-web-client && npx tsc --noEmit
     @echo "=== release build ==="
     cargo build --workspace --release --exclude ghostframe-e2e
-    @echo "=== cbindgen header up-to-date ==="
+    @echo "=== cbindgen headers up-to-date ==="
     cargo check -p ghostframe-lib
     git diff --exit-code ghostframe-lib/include/ghostframe.h
+    cargo check -p ghostframe-client-capi
+    git diff --exit-code ghostframe-client-capi/include/ghostframe_client.h
     @echo "=== go vet + build ==="
     cd ghostbridge && go vet ./... && go build ./...
     @echo "=== ci-local passed ==="
