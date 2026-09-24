@@ -21,6 +21,15 @@ pub mod dirty;
 pub mod export;
 pub mod framebuffer;
 pub mod import;
+// The CPU reference is consumed only by Task 8's oracle test (a separate
+// crate unit under `tests/`, so `#[cfg(test)]` alone would not reach it --
+// hence the `test-support` feature) and has no reason to exist in a release
+// build otherwise. Same precedent as `ghostframe-client-h264`'s own
+// `test-support` gate on `testclip` (see that crate's `Cargo.toml`), and the
+// same defect this branch already fixed once for that crate in 21a0221:
+// making this feature default-on would put an oracle-only module into every
+// release build of every crate that forgets `default-features = false`.
+#[cfg(any(test, feature = "test-support"))]
 pub mod nv12_reference;
 pub mod pipelines;
 pub mod renderer;
@@ -67,6 +76,24 @@ pub enum GpuError {
 
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+
+    /// [`import::check_pitch`]'s guard fired: the driver's linear image did
+    /// not agree with the dmabuf descriptor's row pitch for one plane. The
+    /// only error this module produces that a caller is meant to *handle*
+    /// (fall back to the CPU copy path) rather than propagate, so it gets
+    /// its own variant instead of sharing [`GpuError::Vulkan`]'s free-form
+    /// string -- a caller reacting to that would otherwise have to
+    /// substring-match "pitch mismatch".
+    #[error(
+        "{plane} plane pitch mismatch: the dmabuf says {dmabuf}, the driver's \
+         linear image wants {driver}. Importing anyway would shear the image. \
+         Use the CPU copy path for this frame."
+    )]
+    PitchMismatch {
+        plane: &'static str,
+        dmabuf: u64,
+        driver: u64,
+    },
 
     /// `export_buffers == 0` was requested. An export ring with no buffers
     /// can never hand `publish` a free one, so the client would connect

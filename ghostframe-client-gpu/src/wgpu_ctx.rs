@@ -1,4 +1,5 @@
 use crate::GpuError;
+use std::sync::OnceLock;
 
 /// A wgpu device that can export its images as dmabufs.
 ///
@@ -44,6 +45,16 @@ pub struct WgpuContext {
     /// use an explicitly negotiated tiling. When false, exports must be
     /// `DRM_FORMAT_MOD_LINEAR`.
     pub explicit_modifiers: bool,
+    /// Lazily-built caches for `import.rs`, which calls
+    /// [`WgpuContext::ext_memory_fd`] and [`WgpuContext::memory_properties`]
+    /// once per decoded frame (Task 9 imports a fresh dmabuf every frame).
+    /// Both underlying calls are call-invariant for this device's lifetime
+    /// but not free: `ash::khr::external_memory_fd::Device::new` walks
+    /// `vkGetDeviceProcAddr` to build its whole function table, and
+    /// `vkGetPhysicalDeviceMemoryProperties` copies a ~520-byte struct.
+    /// Built once, on first use, and reused for every import after that.
+    ext_memory_fd: OnceLock<ash::khr::external_memory_fd::Device>,
+    mem_properties: OnceLock<ash::vk::PhysicalDeviceMemoryProperties>,
 }
 
 impl WgpuContext {
@@ -116,6 +127,34 @@ impl WgpuContext {
             device,
             queue,
             explicit_modifiers,
+            ext_memory_fd: OnceLock::new(),
+            mem_properties: OnceLock::new(),
+        })
+    }
+
+    /// Cached `VK_KHR_external_memory_fd` device-extension function table.
+    /// See the field doc on [`WgpuContext::ext_memory_fd`]'s storage for why
+    /// this is cached rather than rebuilt on every call.
+    pub(crate) fn ext_memory_fd(
+        &self,
+        instance: &ash::Instance,
+        device: &ash::Device,
+    ) -> &ash::khr::external_memory_fd::Device {
+        self.ext_memory_fd
+            .get_or_init(|| ash::khr::external_memory_fd::Device::new(instance, device))
+    }
+
+    /// Cached `vkGetPhysicalDeviceMemoryProperties` result.
+    pub(crate) fn memory_properties(
+        &self,
+        instance: &ash::Instance,
+        phys: ash::vk::PhysicalDevice,
+    ) -> ash::vk::PhysicalDeviceMemoryProperties {
+        *self.mem_properties.get_or_init(|| {
+            // SAFETY: `instance` and `phys` are live handles borrowed from
+            // `with_raw` for the duration of this call; this is a read-only
+            // property query with no side effects to sequence against.
+            unsafe { instance.get_physical_device_memory_properties(phys) }
         })
     }
 
