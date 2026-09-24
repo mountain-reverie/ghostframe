@@ -326,15 +326,19 @@ GFX8 1D/micro-tiling: 8×8 micro-tiling reorders bytes *within the same
 allocation footprint*, so pitch, offset and size are identical either way. The
 one piece of evidence available is blind to the most likely alternative.
 
-**So linearity is unmeasured, not disproven, and direct import is not ruled
-out.** The absence of `VK_EXT_image_drm_format_modifier` rules out importing a
+**Linearity was unmeasured here, not disproven — §7.2 has since measured it,
+and the answer is linear.** Read that section before acting on this one. The
+rest of this paragraph is kept because the reasoning still holds: the absence
+of `VK_EXT_image_drm_format_modifier` never ruled direct import out.
+
+**Direct import is not ruled out.** The absence of `VK_EXT_image_drm_format_modifier` rules out importing a
 *tiled* modifier; it says nothing about the linear path, which
 `ghostframe-client-gpu/src/export.rs` uses in production on this exact GPU
 today, precisely because the extension is missing. An earlier draft of this
 section called that extension an independent second reason to abandon direct
 import. It is not a reason at all.
 
-Two things settle it, and both are already planned work:
+Two things settle it. The first has now run (§7.2); the second ships in Task 6:
 
 1. **Task 5's linearity check** (added after this review): `mmap` the exported
    dmabuf and compare it byte for byte against `av_hwframe_transfer_data`'s
@@ -370,7 +374,7 @@ same suspicion next time.
 this GFX8 chip and the plane arithmetic (pitch/offset/size) cannot distinguish
 a linear layout from GFX8 1D/micro-tiling, which reorders bytes within the
 same footprint. Task 5 settles it without any GPU API, per the plan
-(`ghostframe-client-h264/tests/oracle_decode.rs::
+(`ghostframe-client-h264/src/oracle_tests.rs::
 the_exported_dmabuf_is_linear_at_the_descriptors_layout`): `mmap` the exported
 dmabuf read-only at the descriptor's own offsets and pitches, and compare it
 byte for byte against `av_hwframe_transfer_data`'s output on the same
@@ -378,29 +382,45 @@ byte for byte against `av_hwframe_transfer_data`'s output on the same
 decode oracle next to it.
 
 Measured on the same machine as §7.1 (RX 480, RADV Polaris10, Mesa 26.1.7
-radeonsi), against a 640x480 3-frame gradient clip:
+radeonsi), at two resolutions, comparing **one decoded frame** at each:
 
 ```
-[m3] dmabuf-vs-download: 0 of 460800 bytes differ (luma 0, chroma 0)
+[m3] dmabuf-vs-download 640x480:   0 of 460800 bytes differ (luma 0, chroma 0)
+[m3] dmabuf-vs-download 1920x1080: 0 of 3110400 bytes differ (luma 0, chroma 0)
 ```
 
-**Zero bytes differ, across the full luma plane (307200 bytes) and the full
-interleaved chroma plane (153600 bytes).** `av_hwframe_transfer_data`'s CPU
-download and a raw `mmap` of the exported dmabuf, read at exactly the offsets
-and pitches `AVDRMFrameDescriptor` reports, are byte-identical. That is only
-possible if the surface is genuinely linear at that layout: 8x8 micro-tiling
-would have reordered bytes within the footprint and shown up as diffs at
-predictable strides, and it did not.
+`460800 = 640*480*1.5` and `3110400 = 1920*1080*1.5`, i.e. the full luma plane
+and the full interleaved chroma plane in both cases. The mmap reads at the
+descriptor's own offsets and pitches (768 for a 640-wide frame), so the
+comparison exercises the stride handling as well as the content.
 
-**Reading:** the surface radeonsi exports for H.264 decode on this Polaris10
-part **is linear**, not tiled, despite the modifier field saying nothing
-either way. `import_nv12`'s `VK_IMAGE_TILING_LINEAR` path (§7, row 1 of the
-outcomes table) is therefore expected to work here, with Task 6's runtime
-`vkGetImageSubresourceLayout` pitch check (point 2 above) as the guard that
-catches it if some machine or driver revision disagrees. Task 6's CPU-copy
-fallback (row 3) stays in the build regardless, both as the floor for tiled
-hardware elsewhere and as what the pitch check falls back to if it ever
-fires.
+**1920x1080 is measured, not extrapolated, and that is the point.** radeonsi
+chooses tiling per surface from its dimensions and alignment, so a result at
+640x480 says nothing about the resolution this client actually runs at. An
+earlier draft of this section generalised from the small clip alone; the
+second measurement exists because that generalisation was not safe to make.
+
+**Both planes are load-bearing.** The test can only detect tiling if the
+content varies within a tile, and `gradient_clip`'s chroma pattern originally
+did not vary down `y` — meaning a layout that permuted chroma *rows* would have
+produced zero diffs there, leaving luma to carry the whole finding. The pattern
+now varies in both axes on both planes. Re-measured after that change: still
+zero diffs, so the result was not an artefact of the weaker pattern.
+
+**Reading:** at 640x480 and at 1920x1080 on this Polaris10 part, the surface
+radeonsi exports for H.264 decode **is linear at the descriptor's exact
+layout**, despite the modifier field being structurally incapable of saying so
+(§7.1). `import_nv12`'s `VK_IMAGE_TILING_LINEAR` path (§7, row 1) is therefore
+expected to work here.
+
+**What this does not establish.** One frame at each of two sizes, one driver,
+one GPU generation. It does not prove linearity at every resolution the server
+might negotiate, on another Mesa revision, or on other hardware. It does not
+need to: Task 6's runtime `vkGetImageSubresourceLayout` pitch check compares
+what the driver actually chose against what the descriptor claims and refuses
+the import on disagreement, and the CPU copy stays in the build as the floor.
+This measurement upgrades direct import from "unfounded assumption" to
+"expected, and verified at runtime before it is trusted" — not to "guaranteed".
 
 This closes the open question §7 posed. It does not change anything about
 *why* the modifier is uninformative on GFX8 (§7.1 already explains that

@@ -1411,6 +1411,15 @@ git commit -m "feat(h264): normalise the DRM descriptor into DmabufPlanes"
 
 ## Task 5: Oracle 1 — hardware decode equals software decode, exactly
 
+> **Shipped differently from the listings below.** The oracle lives in
+> `ghostframe-client-h264/src/oracle_tests.rs` as a `#[cfg(test)] mod`, not in
+> `tests/oracle_decode.rs`: an integration test cannot see `#[cfg(test)]`
+> items, and the alternatives (a self-referencing dev-dependency, or a default
+> `test-support` feature) were both rejected — the first compiles the lib twice
+> and makes `crate::H264Error` and `ghostframe_client_h264::H264Error` distinct
+> types, the second ships the panicking clip encoder in release builds. The
+> linearity check also runs at 1920x1080 as well as 640x480. See spec §7.2.
+
 **Files:**
 - Create: `ghostframe-client-h264/tests/oracle_decode.rs`
 
