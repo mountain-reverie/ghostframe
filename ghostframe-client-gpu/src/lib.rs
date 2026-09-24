@@ -21,6 +21,7 @@ pub mod dirty;
 pub mod export;
 pub mod framebuffer;
 pub mod import;
+pub mod nv12_reference;
 pub mod pipelines;
 pub mod renderer;
 pub mod ring;
