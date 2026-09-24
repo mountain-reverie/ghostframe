@@ -373,6 +373,27 @@ pub fn max_fragment_payload(max_datagram_size: usize) -> usize {
 // build_frame_dimensions_datagram
 // ---------------------------------------------------------------------------
 
+/// Registry of sentinel tile coordinates allocated for control messages.
+/// Tile coords are `u8`; each allocation below is structurally impossible
+/// as a real tile at any sensible resolution, so the receiver routes on it
+/// without a new datagram type or version negotiation. Allocated so far:
+///
+/// - `(0xFF, 0xFF)` -- `FRAME_DIMENSIONS_SENTINEL_X`/`_Y`, below.
+/// - `(0xFE, 0xFE)` -- `eviction::EVICTION_SENTINEL_X`/`_Y`
+///   (`ghostframe-protocol/src/eviction.rs`).
+///
+/// Each sentinel consumed here is a real cost, not a free bit: it lowers
+/// the maximum addressable tile column/row by one. Two allocations put the
+/// ceiling at 254 tiles (8128 px at the 32px tile size this protocol uses),
+/// down from 255 (8160 px) with one. Both are far beyond any resolution
+/// this system targets, but the trade is real, so it is recorded here
+/// rather than discovered by a future implementer doing the arithmetic.
+///
+/// Allocate a fourth control message by extending this list -- or by
+/// introducing a `ControlKind` predicate that decodes intent from the
+/// sentinel pair instead of adding more magic coordinates, if the list
+/// grows past a couple more entries.
+///
 /// Sentinel tile coordinates marking a control message that carries the
 /// current frame dimensions rather than pixel data. Tile coords are `u8`;
 /// 0xFF (255) is structurally impossible at any sensible resolution
