@@ -1756,6 +1756,18 @@ git commit -m "test(h264): oracle -- hardware decode is bit-exact against softwa
 
 ## Task 6: Import the dmabuf into wgpu
 
+> **Shipped differently from the listings below; read `import.rs` for the real
+> shape.** `check_pitch` runs immediately after image creation, before the fd
+> is duplicated and before any allocation — `vkGetImageSubresourceLayout` needs
+> no bound memory, and moving it there means a rejected frame never takes
+> ownership of the caller's fd. A `PartialImport` RAII guard owns cleanup on
+> every failure path (the listing below destroys `luma` twice when the chroma
+> bind fails, and leaks the memory and the imported fd on four later paths).
+> `GpuError::PitchMismatch` is its own variant, both planes are extent- and
+> alignment-checked, `ImportedNv12`'s fields are private behind accessors, and
+> texture destruction is deferred to wgpu's drop callbacks so a clone or view
+> cannot outlive the `VkImage`.
+
 **Files:**
 - Create: `ghostframe-client-gpu/src/import.rs`
 - Modify: `ghostframe-client-gpu/src/lib.rs` (add `pub mod import;`), `ghostframe-client-gpu/Cargo.toml`
@@ -2980,8 +2992,8 @@ and add these methods to `impl Renderer`:
                     &ctx.device,
                     &ctx.queue,
                     &self.fb,
-                    &imported.luma,
-                    &imported.chroma,
+                    imported.luma(),
+                    imported.chroma(),
                 );
             }
             Err(e) => {
