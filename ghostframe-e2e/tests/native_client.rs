@@ -44,32 +44,11 @@
 
 use std::time::{Duration, Instant};
 
-use ghostframe_client_native::{Client, ClientEvent, Config, PublishedFrame};
+use ghostframe_client_native::{Client, ClientEvent, Config};
 use ghostframe_e2e::harness::net_shape::NetShape;
-use ghostframe_e2e::harness::{read_server_logs_stripped, setup_e2e_server, E2eServerSpec};
-
-/// Drain queued events (logging each) and return the first published frame,
-/// or `None` if `timeout` elapses first. Panics eagerly on a
-/// `ClientEvent::Error` rather than waiting out the full timeout, since that
-/// event means the library has already given up.
-fn wait_for_frame(client: &mut Client, timeout: Duration) -> Option<PublishedFrame> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        while let Some(ev) = client.next_event() {
-            tracing::info!(?ev, "client event");
-            if let ClientEvent::Error { message } = &ev {
-                panic!("client reported an error while waiting for a frame: {message}");
-            }
-        }
-        if let Some(frame) = client.acquire_frame() {
-            return Some(frame);
-        }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
+use ghostframe_e2e::harness::{
+    read_server_logs_stripped, setup_e2e_server, wait_for_frame, E2eServerSpec,
+};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn native_client_renders_the_test_pattern_into_an_exported_dmabuf() {
