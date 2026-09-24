@@ -26,6 +26,13 @@ use ffmpeg_next as ffmpeg;
 /// detect tiling. A pattern invariant down one axis of a plane cannot tell
 /// a correctly-laid-out plane from one whose rows along that axis have been
 /// permuted, and would report "0 differ" over a genuinely tiled surface.
+/// At resolutions whose chroma plane has more than 256 rows (1920x1080's
+/// has 540), the `y * 3 % 256` term wraps: source rows `y` and `y + 256`
+/// are byte-identical *before* encoding. Row-distinctness in the linearity
+/// check at that size survives only because H.264's lossy quantization
+/// noise perturbs the two differently on the way through the encoder and
+/// back, not because the source pattern itself stays distinct that far
+/// down the plane.
 ///
 /// # Panics
 /// On any ffmpeg failure: libx264 missing from the build, the encoder
@@ -34,6 +41,11 @@ use ffmpeg_next as ffmpeg;
 /// fail the test loudly, not be worked around.
 pub fn gradient_clip(w: u32, h: u32, n: usize) -> Vec<Vec<u8>> {
     ffmpeg::init().expect("ffmpeg init");
+    // Quiets libx264's own per-frame stats (`[libx264 @ ...] frame I: ...`),
+    // which it `av_log`s at INFO and which would otherwise flood every
+    // `cargo test` in the workspace that touches this function. Same guard
+    // `probe.rs` built for the same reason, against the same noise source.
+    let _quiet = crate::probe::QuietLogGuard::new();
     // `find_by_name`, not `find(Id::H264)`: the latter returns whichever
     // H.264 encoder registers first, which can be `h264_vaapi` or
     // `h264_nvenc`. Those then fail on a YUV420P software frame with no

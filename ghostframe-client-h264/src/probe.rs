@@ -29,25 +29,6 @@ pub const RENDER_NODE: &str = "/dev/dri/renderD128";
 /// into Vulkan -- that is a separate question (see the design doc §7), and
 /// conflating them would make an import bug look like missing hardware.
 pub fn vaapi_h264_decode_available() -> bool {
-    // Serializes the log-mute below: `av_log_set_level` is an unsynchronized
-    // global, so two concurrent probes (e.g. this crate's own test suite,
-    // which calls the probe from more than one test under `cargo test`'s
-    // default parallelism) can interleave save/save/restore/restore and
-    // strand the level at QUIET. Holding this for the probe's duration also
-    // means one probe briefly suppresses other threads' ffmpeg logging --
-    // an accepted cost, since the alternative is unsuppressable stderr noise
-    // on a path this design calls normal.
-    static LOG_MUTE: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    // The guarded data is `()` -- poisoning carries no meaning here, only
-    // "some earlier probe panicked while holding the lock". `PoisonError`
-    // still owns the guard, so recovering it with `into_inner` still
-    // serializes correctly; it is not a bypass. Deliberately not `.unwrap()`:
-    // that turns a benign poison into a panic on the connect path.
-    let _guard = LOG_MUTE
-        .get_or_init(|| std::sync::Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-
     // ffmpeg logs libva failures straight to stderr at its default level. On a
     // machine with no VA-API -- the outcome this whole design calls normal --
     // that puts an unstructured error line on the host application's stderr,
@@ -57,7 +38,9 @@ pub fn vaapi_h264_decode_available() -> bool {
     // `probe_inner` (or `probe_decodes_a_frame`, which now runs a real
     // decode loop with more failure surface than the pointer-chasing this
     // used to be) must not unwind past the restore and leave ffmpeg globally
-    // quiet for the rest of the process.
+    // quiet for the rest of the process. `QuietLogGuard::new()` also
+    // serializes against every other caller (see its doc) -- no separate
+    // lock needed here.
     let _restore = QuietLogGuard::new();
     let verdict = probe_inner();
     match &verdict {
@@ -72,12 +55,44 @@ pub fn vaapi_h264_decode_available() -> bool {
 /// RAII guard: mutes ffmpeg's global log level and restores the prior level
 /// on drop, including on unwind. See [`vaapi_h264_decode_available`] for why
 /// a bare save/restore pair is not unwind-safe.
-struct QuietLogGuard {
+///
+/// `pub(crate)`, not private: `testclip::gradient_clip` uses this too, to
+/// quiet libx264's own per-frame stats spam (`av_log`-ged at INFO) rather
+/// than let it flood every `cargo test` in the workspace.
+///
+/// Holds a lock on a shared, process-wide mutex for its entire lifetime,
+/// not just a save/restore pair on the log level: `av_log_set_level` is an
+/// unsynchronized global, so two concurrent holders (this crate's own test
+/// suite alone has the probe's tests and ~10 gated oracle/decoder tests,
+/// all under `cargo test`'s default parallelism, and some of *those* call
+/// `gradient_clip`, which now takes this guard too) can interleave
+/// save/save/restore/restore and strand the level at QUIET -- or, worse,
+/// leave a window where it is back at the noisy default while a second
+/// caller's encode/decode is mid-flight, which is what let libx264's stats
+/// spam through even after `gradient_clip` started taking a guard, until
+/// this lock was folded in here rather than left to each call site to
+/// remember separately. Holding the lock for a guard's whole lifetime also
+/// means one holder briefly suppresses every other thread's ffmpeg logging
+/// -- an accepted cost, since the alternative is unsuppressable stderr
+/// noise on paths this design calls normal.
+pub(crate) struct QuietLogGuard {
+    // The guarded data is `()` -- poisoning carries no meaning here, only
+    // "some earlier guard-holder panicked while holding the lock".
+    // `PoisonError` still owns the guard, so recovering it with
+    // `into_inner` still serializes correctly; it is not a bypass.
+    // Deliberately not `.unwrap()`: that turns a benign poison into a panic
+    // on the connect path (`vaapi_h264_decode_available`) or a test.
+    _lock: std::sync::MutexGuard<'static, ()>,
     prior: libc::c_int,
 }
 
 impl QuietLogGuard {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
+        static LOG_MUTE: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        let _lock = LOG_MUTE
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // SAFETY: `av_log_get_level`/`av_log_set_level` are plain global
         // accessors with no preconditions.
         let prior = unsafe {
@@ -85,14 +100,15 @@ impl QuietLogGuard {
             ffi::av_log_set_level(ffi::AV_LOG_QUIET);
             prior
         };
-        QuietLogGuard { prior }
+        QuietLogGuard { _lock, prior }
     }
 }
 
 impl Drop for QuietLogGuard {
     fn drop(&mut self) {
         // SAFETY: as above; restores exactly what was read in `new`, even if
-        // we get here by unwinding out of `probe_inner`.
+        // we get here by unwinding out of `probe_inner` or a caller's own
+        // code. `_lock` releases after this, once `Drop` returns.
         unsafe { ffi::av_log_set_level(self.prior) };
     }
 }
@@ -193,8 +209,9 @@ fn probe_decodes_a_frame() -> Result<(), H264Error> {
     Ok(())
 }
 
-/// Ground truth for whether this driver has an H.264 VLD decode entrypoint,
-/// established independently of anything else in this crate.
+/// Ground truth for whether this driver has a **High**-profile H.264 VLD
+/// decode entrypoint on `node`, established independently of anything else
+/// in this crate.
 ///
 /// `Some(true)`/`Some(false)` is what `vainfo` reports. `None` means there is
 /// no ground truth to check against -- `vainfo` is missing, or exited
@@ -202,10 +219,32 @@ fn probe_decodes_a_frame() -> Result<(), H264Error> {
 /// this checks `status.success()` rather than just reading stdout) -- and
 /// callers should skip rather than guess.
 ///
-/// Named explicitly rather than letting `vainfo` pick its own display: a bare
-/// `vainfo` invocation need not open the same device [`RENDER_NODE`]
-/// hardcodes, so it could establish ground truth against the wrong GPU on a
-/// multi-GPU box.
+/// Matches `VAProfileH264High` specifically, not a bare `VAProfileH264`
+/// substring: the latter also matches `VAProfileH264ConstrainedBaseline`,
+/// `...StereoHigh` and `...MultiviewHigh`. [`PROBE_CLIP`]'s doc comment
+/// above explains at length why the probe itself must be High profile --
+/// VA-API treats each profile as a separate decode capability, and a driver
+/// exposing only ConstrainedBaseline correctly fails a High probe clip. A
+/// profile-agnostic ground truth would call that driver's correct `false` a
+/// bug: `Some(true)` from CBP-only `vainfo` output, the High probe clip
+/// failing, and `probe_agrees_with_the_driver` asserting a failure that was
+/// actually the right answer.
+///
+/// Takes `node` rather than hardcoding [`RENDER_NODE`] so a caller can name
+/// whichever device it actually opened -- `vainfo --device` defaults to
+/// nothing usable and `H264Decoder::with_device` already takes one. Baking
+/// in `RENDER_NODE` here made every gated test on a box whose GPU is *not*
+/// `renderD128` (a `renderD129` multi-GPU box, say) establish ground truth
+/// against a device nobody opened: `vainfo --device renderD128` on such a
+/// box exits non-zero, this returns `None`, and every test gated on it
+/// silently skips -- green without having run, the exact failure mode this
+/// project's CI-exemption rule exists to prevent for production code, now
+/// showing up in the tests meant to catch it.
+///
+/// Cached per `node` behind a process-lifetime [`OnceLock`](std::sync::OnceLock):
+/// roughly ten tests in this crate alone gate on this, each of which would
+/// otherwise spawn `vainfo` and pay a full `vaInitialize` on the shared
+/// libva instance, and the answer cannot change within a test run.
 ///
 /// Shared by [`vaapi_h264_decode_available`]'s own test
 /// (`probe_agrees_with_the_driver`, which checks the probe's verdict against
@@ -225,9 +264,30 @@ fn probe_decodes_a_frame() -> Result<(), H264Error> {
 /// itself being tested, never when it is compiled as an ordinary dependency
 /// for another crate's test build.
 #[cfg(any(test, feature = "test-support"))]
-pub fn vainfo_reports_h264_vld() -> Option<bool> {
+pub fn vainfo_reports_h264_vld(node: &str) -> Option<bool> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<bool>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
+    if let Some(cached) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(node) {
+        return *cached;
+    }
+
+    let result = vainfo_reports_h264_vld_uncached(node);
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(node.to_string(), result);
+    result
+}
+
+/// The actual `vainfo` invocation behind [`vainfo_reports_h264_vld`]'s cache.
+#[cfg(any(test, feature = "test-support"))]
+fn vainfo_reports_h264_vld_uncached(node: &str) -> Option<bool> {
     let vainfo = std::process::Command::new("vainfo")
-        .args(["--display", "drm", "--device", RENDER_NODE])
+        .args(["--display", "drm", "--device", node])
         .output();
     let Ok(out) = vainfo else {
         eprintln!("vainfo not installed; cannot establish ground truth, skipping");
@@ -243,7 +303,7 @@ pub fn vainfo_reports_h264_vld() -> Option<bool> {
     let text = String::from_utf8_lossy(&out.stdout);
     Some(
         text.lines()
-            .any(|l| l.contains("VAProfileH264") && l.contains("VAEntrypointVLD")),
+            .any(|l| l.contains("VAProfileH264High") && l.contains("VAEntrypointVLD")),
     )
 }
 
@@ -268,7 +328,7 @@ mod tests {
     /// answer there and entrench the very defect the probe exists to avoid.
     #[test]
     fn probe_agrees_with_the_driver() {
-        let Some(driver_decodes_h264) = vainfo_reports_h264_vld() else {
+        let Some(driver_decodes_h264) = vainfo_reports_h264_vld(RENDER_NODE) else {
             return;
         };
         if !driver_decodes_h264 {
