@@ -577,11 +577,11 @@ pub struct IoBridge {
     local_addr: SocketAddr,
     /// Per-connection WebTransport handshake state.
     wt_sessions: HashMap<ConnectionHandle, WebTransportServer>,
-    /// Which session most recently advertised capabilities. `None` until the
-    /// first HELLO. Task 3 uses this to tell the incumbent from a newcomer;
-    /// it is also what makes `apply_hello`'s singular state attributable to a
-    /// specific client rather than to whoever spoke last.
-    hello_sender: Option<ConnectionHandle>,
+    /// Which session most recently sent HELLO. `None` until the first one
+    /// arrives. Note this does not make `client_caps` per-session — those
+    /// remain last-writer-wins; this field only names that writer, which is
+    /// what a later M4a task needs to tell an incumbent from a newcomer.
+    last_hello_from: Option<ConnectionHandle>,
     /// Per-handle "have we already fired on_session_reset for this
     /// connection?" tracking. Set when `maybe_fire_session_reset` runs
     /// for a handle; cleared on `Event::ConnectionLost` so a rare
@@ -1317,7 +1317,7 @@ impl IoBridge {
             server,
             local_addr,
             wt_sessions: HashMap::new(),
-            hello_sender: None,
+            last_hello_from: None,
             session_resets_fired: HashSet::new(),
             has_seen_prior_session: false,
             frame_rx: None,
@@ -5630,6 +5630,13 @@ impl IoBridge {
                     tracing::info!(?handle, %reason, "connection lost");
                     self.wt_sessions.remove(&handle);
                     self.session_resets_fired.remove(&handle);
+                    // quinn allocates ConnectionHandle from a slab (`vacant_key`), so a
+                    // retained handle can silently alias a *different* future connection.
+                    // Leaving this set would make a later HELLO from a reused handle look
+                    // like the incumbent re-identifying itself, skipping its eviction.
+                    if self.last_hello_from == Some(handle) {
+                        self.last_hello_from = None;
+                    }
                     // Delivery-guarantee invariant: when the session ends,
                     // un-ACKed tile-passes are no longer deliverable and
                     // must not occupy memory or fire spurious retransmits
@@ -5703,10 +5710,7 @@ impl IoBridge {
         let feedback_data: Vec<(ConnectionHandle, Vec<u8>)> = self
             .wt_sessions
             .iter_mut()
-            .flat_map(|(handle, wt)| {
-                let h = *handle;
-                wt.drain_feedback().into_iter().map(move |d| (h, d))
-            })
+            .flat_map(|(&handle, wt)| wt.drain_feedback().into_iter().map(move |d| (handle, d)))
             .collect();
         for (handle, data) in &feedback_data {
             self.dispatch_feedback_bytes(*handle, data);
@@ -5920,7 +5924,7 @@ impl IoBridge {
             server,
             local_addr: "0.0.0.0:443".parse().unwrap(),
             wt_sessions: HashMap::new(),
-            hello_sender: None,
+            last_hello_from: None,
             session_resets_fired: HashSet::new(),
             has_seen_prior_session: false,
             frame_rx: None,
@@ -6285,7 +6289,7 @@ impl IoBridge {
         from: ConnectionHandle,
         msg: crate::transport::client_caps::HelloMsg,
     ) {
-        self.hello_sender = Some(from);
+        self.last_hello_from = Some(from);
         self.client_caps = msg.caps;
         // Mirror the H.264 capability into the adaptation context so the
         // classifier's hard override sees it on the very next decision —
@@ -6297,18 +6301,19 @@ impl IoBridge {
         self.classifier
             .set_adaptation_context(self.adaptation_context);
         tracing::info!(
+            ?from,
             indices_raw = msg.caps.indices_raw_enabled,
             supports_h264 = msg.caps.supports_h264,
             "HELLO received, client capabilities updated"
         );
     }
 
-    /// Which session most recently sent HELLO, i.e. advertised capabilities.
-    /// `None` until the first HELLO arrives. Unused outside tests until a
-    /// later M4a task wires it into eviction.
+    /// Which session most recently sent HELLO. `None` until the first HELLO
+    /// arrives. Unused outside tests until a later M4a task wires it into
+    /// eviction.
     #[allow(dead_code)]
-    pub(crate) fn hello_sender(&self) -> Option<ConnectionHandle> {
-        self.hello_sender
+    pub(crate) fn last_hello_from(&self) -> Option<ConnectionHandle> {
+        self.last_hello_from
     }
 
     /// Update FEC parity state based on receiver feedback.
@@ -6626,20 +6631,19 @@ mod tests {
         IoBridge::new_with_stream_for_test(our_end, server)
     }
 
-    /// Test-only helper: construct an IoBridge with one WebTransport session
-    /// already attached (handle `ConnectionHandle(0)`), returning both the
-    /// bridge and the handle that identifies that session. Mirrors the
-    /// session setup done inline in
-    /// `maybe_fire_session_reset_skips_first_connect_fires_on_reconnect`.
-    fn test_bridge_with_one_session() -> (IoBridge, ConnectionHandle) {
+    /// Test-only helper: construct an IoBridge with a WebTransport session
+    /// already attached for each given handle. `async fn` (not plain `fn`)
+    /// because it calls tokio's `UnixStream::pair()`, which panics outside a
+    /// reactor; requiring `.await` enforces that structurally instead of
+    /// failing at runtime with an unrelated-looking message.
+    async fn test_bridge_with_sessions(handles: &[ConnectionHandle]) -> IoBridge {
         let (our_end, _peer) = UnixStream::pair().expect("UnixStream::pair failed");
         let server = QuicServer::new().expect("QuicServer::new failed");
         let mut bridge = IoBridge::new_with_stream_for_test(our_end, server);
-        let handle = ConnectionHandle(0);
+        for &h in handles {
+            bridge.wt_sessions.insert(h, WebTransportServer::default());
+        }
         bridge
-            .wt_sessions
-            .insert(handle, WebTransportServer::default());
-        (bridge, handle)
     }
 
     /// `IoBridge::new_with_lib_config_for_test` must take its transport
@@ -6752,7 +6756,10 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_feedback_bytes_knows_which_session_sent_it() {
-        let (mut bridge, handle) = test_bridge_with_one_session();
+        // A non-default handle: with ConnectionHandle(0) the assertion below
+        // could not distinguish "records the sender" from "records handle 0".
+        let handle = ConnectionHandle(7);
+        let mut bridge = test_bridge_with_sessions(&[handle]).await;
         let mut buf = Vec::new();
         crate::transport::client_caps::HelloMsg {
             caps: crate::transport::client_caps::ClientCapabilities {
@@ -6765,7 +6772,7 @@ mod tests {
         bridge.dispatch_feedback_bytes(handle, &buf);
 
         assert_eq!(
-            bridge.hello_sender(),
+            bridge.last_hello_from(),
             Some(handle),
             "the bridge must record which session advertised capabilities; \
              without it, eviction cannot tell the newcomer from the incumbent"
@@ -7381,21 +7388,10 @@ mod tests {
         // No `lock_env()` needed: nothing left in this module's test suite
         // mutates process env (Task 4 moved every such test into
         // `config.rs` alongside the `from_lookup` parsing it covers).
-        use crate::transport::quic::QuicServer;
-        use crate::transport::webtransport::WebTransportServer;
-        use quinn_proto::ConnectionHandle;
-        use tokio::net::UnixStream as TokioUnixStream;
-
-        let (stream, _peer) = TokioUnixStream::pair().expect("UnixStream::pair");
-        let server = QuicServer::new().expect("QuicServer::new");
-        let mut bridge = IoBridge::new_with_stream_for_test(stream, server);
+        let handle_a = ConnectionHandle(0);
+        let mut bridge = test_bridge_with_sessions(&[handle_a]).await;
 
         bridge.palette_table.delivered.insert(7);
-
-        let handle_a = ConnectionHandle(0);
-        bridge
-            .wt_sessions
-            .insert(handle_a, WebTransportServer::default());
 
         // Pre-connected → no fire.
         bridge.maybe_fire_session_reset(handle_a);
