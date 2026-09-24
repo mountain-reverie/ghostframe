@@ -50,8 +50,10 @@ const MIN_TILE_LEN: usize = TILE_Y_OFFSET + 1;
 /// "last write lost, then static" case.
 ///
 /// Note that `(255, 255)` is not a tile: it is the frame-dimensions sentinel
-/// (`FRAME_DIMENSIONS_SENTINEL_X`/`_Y`), so a rule naming it would drop
-/// control traffic rather than picture content.
+/// (`FRAME_DIMENSIONS_SENTINEL_X`/`_Y`), and `(254, 254)` is not a tile
+/// either: it is the eviction-notice sentinel (`EVICTION_SENTINEL_X`/`_Y`
+/// in `ghostframe-protocol/src/eviction.rs`), so a rule naming either would
+/// drop control traffic rather than picture content.
 #[derive(Debug, Clone)]
 pub struct DropRule {
     pub tile_x: u8,

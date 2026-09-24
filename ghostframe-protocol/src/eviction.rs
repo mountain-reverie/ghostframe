@@ -4,7 +4,9 @@
 //! idiom `protocol::build_frame_dimensions_datagram` established: tile
 //! coordinates are `u8`, and a sentinel value is structurally impossible at
 //! any sensible resolution, so the receiver can route on it without a new
-//! datagram type or a version negotiation.
+//! datagram type or a version negotiation. See the sentinel registry in
+//! `protocol.rs` near `FRAME_DIMENSIONS_SENTINEL_X` for the full list and
+//! its cost.
 //!
 //! **This is best-effort.** Datagrams are lossy and the session closes
 //! shortly after, so a client may never see it and will fall back to a
@@ -21,30 +23,44 @@ pub const EVICTION_SENTINEL_X: u8 = 0xFE;
 pub const EVICTION_SENTINEL_Y: u8 = 0xFE;
 
 /// Why the server closed this session.
+///
+/// Not `#[repr(u8)]`: `Unknown` carries the raw byte, so there is no single
+/// integer cast that represents every variant. Use `to_byte`/`from_byte`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
 pub enum EvictionReason {
     /// Another client connected. This server serves one client at a time.
-    DisplacedByNewSession = 1,
-    /// A reason this build does not know. Still an eviction: the session is
-    /// going away regardless, and a client that ignored it would sit
-    /// connected to a server that has already dropped it.
-    Unknown = 0xFF,
+    DisplacedByNewSession,
+    /// A code this build does not know. Carried verbatim so the log line
+    /// names the actual byte -- the client disconnects either way, but the
+    /// operator debugging a version skew needs the number, not "unknown".
+    Unknown(u8),
 }
 
 impl EvictionReason {
+    pub fn to_byte(self) -> u8 {
+        match self {
+            Self::DisplacedByNewSession => 1,
+            Self::Unknown(b) => b,
+        }
+    }
+
     fn from_byte(b: u8) -> Self {
         match b {
-            1 => EvictionReason::DisplacedByNewSession,
-            _ => EvictionReason::Unknown,
+            1 => Self::DisplacedByNewSession,
+            // Named, not `_`: this repo lost three months to a load-bearing
+            // catch-all arm once (see `feedback_load_bearing_catch_all.md`).
+            // `other` reads as a deliberate decision, not an oversight.
+            other => Self::Unknown(other),
         }
     }
 }
 
 /// Build a single eviction datagram. Always fits one datagram: the payload
-/// is one byte.
+/// is one byte, and passing `payload.len()` as the fragment-size cap makes
+/// "exactly one fragment" a structural property of `fragment_tile` rather
+/// than something asserted after the fact.
 pub fn build_eviction_datagram(reason: EvictionReason) -> Vec<u8> {
-    let payload = [reason as u8];
+    let payload = [reason.to_byte()];
     let inputs = TileFragmentInputs {
         frame_seq: TILE_DATAGRAM_FLAG,
         tile_x: EVICTION_SENTINEL_X,
@@ -54,8 +70,13 @@ pub fn build_eviction_datagram(reason: EvictionReason) -> Vec<u8> {
         pass: 0,
         timestamp_us: 0,
     };
-    let datagrams = fragment_tile(&inputs, &payload, /* max_fragment_payload */ 1);
-    debug_assert_eq!(
+    let datagrams = fragment_tile(&inputs, &payload, payload.len());
+    // Not `debug_assert!`: in release this condition failing would silently
+    // emit fragment 0 of N with `frag_total = N`, and the receiver would
+    // wait forever for fragments that are never sent -- a swallowed
+    // eviction, not a crash. This runs a handful of times per session
+    // lifetime; the branch is free.
+    assert_eq!(
         datagrams.len(),
         1,
         "an eviction notice must fit one datagram"
@@ -66,12 +87,21 @@ pub fn build_eviction_datagram(reason: EvictionReason) -> Vec<u8> {
 /// Returns the reason if `datagram` is an eviction notice, `None` if it is
 /// any other datagram (including one too short to be any tile datagram at
 /// all).
+///
+/// A well-formed sentinel datagram with an empty payload is *not* "any
+/// other datagram" -- the sentinel coordinates alone already say this is an
+/// eviction notice. Consistent with this module's philosophy that the
+/// session is going away regardless of what happened to the reason byte:
+/// a missing byte parses the same as an unrecognized one, `Unknown(0)`,
+/// rather than being dropped as `None`.
 pub fn parse_eviction(datagram: &[u8]) -> Option<EvictionReason> {
     let (_dh, th, payload) = decode_tile_datagram(datagram).ok()?;
     if th.tile_x != EVICTION_SENTINEL_X || th.tile_y != EVICTION_SENTINEL_Y {
         return None;
     }
-    Some(EvictionReason::from_byte(*payload.first()?))
+    Some(EvictionReason::from_byte(
+        payload.first().copied().unwrap_or(0),
+    ))
 }
 
 #[cfg(test)]
@@ -113,10 +143,54 @@ mod tests {
         // A future server may add reasons this client predates. Treating an
         // unknown code as "not an eviction" would leave the client connected
         // to a server that has already dropped it; treating it as Unknown
-        // still disconnects, just without a specific message.
+        // still disconnects, just without a specific message. The byte is
+        // carried, not discarded, so a log line can name it.
         let mut dg = build_eviction_datagram(EvictionReason::DisplacedByNewSession);
         let last = dg.len() - 1;
         dg[last] = 0xEE;
-        assert_eq!(parse_eviction(&dg), Some(EvictionReason::Unknown));
+        assert_eq!(parse_eviction(&dg), Some(EvictionReason::Unknown(0xEE)));
+    }
+
+    #[test]
+    fn every_known_reason_round_trips() {
+        // Exhaustive on purpose. `from_byte` matches a u8, so
+        // clippy::wildcard_enum_match_arm (lib.rs) cannot see a missing arm --
+        // this match is the only compile-time guard. Adding a variant breaks
+        // this match; adding it to the list below then fails the round trip
+        // until `from_byte` learns it.
+        for reason in [
+            EvictionReason::DisplacedByNewSession,
+            EvictionReason::Unknown(0xEE),
+        ] {
+            match reason {
+                EvictionReason::DisplacedByNewSession | EvictionReason::Unknown(_) => {}
+            }
+            assert_eq!(
+                parse_eviction(&build_eviction_datagram(reason)),
+                Some(reason)
+            );
+        }
+    }
+
+    #[test]
+    fn empty_payload_is_treated_as_an_eviction_with_unknown_zero_reason() {
+        // A well-formed sentinel datagram missing its reason byte is not
+        // "any other datagram" -- the sentinel coordinates alone say this
+        // is an eviction. Untested before this review: `parse_eviction`
+        // used to return `None` here, contradicting its own doc comment.
+        let inputs = crate::protocol::TileFragmentInputs {
+            frame_seq: TILE_DATAGRAM_FLAG,
+            tile_x: EVICTION_SENTINEL_X,
+            tile_y: EVICTION_SENTINEL_Y,
+            codec: Codec::Skip,
+            generation: 0,
+            pass: 0,
+            timestamp_us: 0,
+        };
+        let dg = crate::protocol::fragment_tile(&inputs, &[], 1)
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(parse_eviction(&dg), Some(EvictionReason::Unknown(0)));
     }
 }
