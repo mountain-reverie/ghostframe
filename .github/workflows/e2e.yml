@@ -73,17 +73,23 @@ jobs:
       # ghostframe-client-h264 has no separate integration-test targets --
       # every test (probe, decoder, descriptor, oracle_tests) lives as a
       # #[cfg(test)] module inside the lib itself, so --lib reaches all of
-      # them in one invocation. The descriptor tests are pure logic
-      # (hand-built structs, no hardware) and run everywhere.
+      # them in one invocation.
       #
-      # Note what this line does NOT cover. The probe, decoder and
-      # oracle_tests modules gate themselves on `vainfo` reporting a
-      # VAProfileH264*/VAEntrypointVLD pair. Runners have neither
-      # libva-utils nor a VA-API device, so those tests SKIP here and only
-      # ever really run on a developer machine. That is a capability gate
-      # rather than a deliberate CI carve-out, but the consequence is
-      # identical, so it belongs here rather than being discovered later:
-      # nothing in CI fails if VA-API decode breaks.
+      # WHAT THIS DOES NOT COVER. The decoder, probe and oracle tests in this
+      # crate gate on `vainfo` reporting a VAProfileH264High/VAEntrypointVLD
+      # pair, and runners have neither libva-utils nor a VA-API device, so
+      # they SKIP here. Nothing in CI fails if hardware H.264 decode
+      # regresses; those tests are developer-machine-only.
+      #
+      # Installing a software VA-API driver so they execute against
+      # *something* was considered and rejected: they would then verify a
+      # different implementation than the one they exist to check, and a
+      # green run asserting a software decoder's behaviour reads as coverage
+      # while providing none. An honest skip is worth more.
+      #
+      # What DOES run here: the descriptor tests (pure logic, hand-built
+      # structs) and, in client-gpu's --lib, the shader-validation walk over
+      # shaders/client/*.wgsl, which needs no GPU.
       - run: cargo test -p ghostframe-client-h264 --lib
       - run: cargo build -p ghostframe-client-capi
       # The netsim harness suites. These live in separate integration test
