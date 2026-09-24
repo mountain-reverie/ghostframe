@@ -15,6 +15,7 @@
 
 pub mod ack;
 pub mod codec;
+pub mod eviction;
 pub mod fec;
 pub mod feedback;
 pub mod protocol;
