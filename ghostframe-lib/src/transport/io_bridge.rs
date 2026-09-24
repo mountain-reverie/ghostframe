@@ -5494,22 +5494,7 @@ impl IoBridge {
             tracing::trace!(?handle, ?event, "app event");
 
             match event {
-                Event::Connected => {
-                    // New connection fully established — start the H3 handshake.
-                    //
-                    // No stale-session prune here any more. It used to drop
-                    // every other session on a new QUIC connection, which
-                    // displaced an incumbent before it could be told why --
-                    // and let a connection that never identified itself kill
-                    // a working session. Eviction is keyed on HELLO instead
-                    // (see `apply_hello`); a dead connection that never
-                    // reconnects is reaped by quinn's idle timeout through
-                    // `Event::ConnectionLost` -> `forget_session`.
-                    let wt = self.wt_sessions.entry(handle).or_default();
-                    if let Some(conn) = self.server.connections.get_mut(&handle) {
-                        wt.on_new_connection(conn);
-                    }
-                }
+                Event::Connected => self.on_connection_established(handle),
 
                 Event::Stream(StreamEvent::Opened { dir }) => {
                     // Accept all newly-opened peer streams for this direction.
@@ -5676,6 +5661,19 @@ impl IoBridge {
         // sent each buffer, which eviction (and any future per-client state)
         // needs. Collecting first avoids holding a borrow of `wt_sessions`
         // across the `dispatch_feedback_bytes` calls, which take `&mut self`.
+        //
+        // Known race, not fixed here: this collects every session's
+        // feedback into one batch before any of it is dispatched. If an
+        // incumbent's re-HELLO and a genuinely new client's first HELLO
+        // both land in the same batch with the incumbent ordered last, the
+        // incumbent's `apply_hello` runs second and evicts the newcomer it
+        // was racing against -- leaving zero attached sessions until the
+        // next connection. It takes a re-HELLO racing a brand-new client
+        // within a single event-loop pass, and both receive paths are
+        // gated on `wt_sessions`, so an already-evicted handle produces no
+        // further feedback once its entry is gone. Narrow enough that
+        // restructuring the batch isn't warranted; noted so a future
+        // "sessions keep vanishing under load" report has a lead.
         let feedback_data: Vec<(ConnectionHandle, Vec<u8>)> = self
             .wt_sessions
             .iter_mut()
@@ -6296,8 +6294,8 @@ impl IoBridge {
     }
 
     /// Which session most recently sent HELLO. `None` until the first HELLO
-    /// arrives. Unused outside tests until a later M4a task wires it into
-    /// eviction.
+    /// arrives. Eviction (`apply_hello`) reads the `last_hello_from` field
+    /// directly rather than through this accessor, which exists for tests.
     #[allow(dead_code)]
     pub(crate) fn last_hello_from(&self) -> Option<ConnectionHandle> {
         self.last_hello_from
@@ -6311,6 +6309,29 @@ impl IoBridge {
         self.session_resets_fired.remove(&handle);
         if self.last_hello_from == Some(handle) {
             self.last_hello_from = None;
+        }
+    }
+
+    /// A new QUIC connection has fully established — start its H3
+    /// handshake.
+    ///
+    /// No stale-session prune here. It used to drop every other session on
+    /// a new QUIC connection, which displaced an incumbent before it could
+    /// be told why -- and let a connection that never identified itself
+    /// kill a working session. Eviction is keyed on HELLO instead (see
+    /// `apply_hello`); a dead connection that never reconnects is reaped by
+    /// quinn's idle timeout through `Event::ConnectionLost` ->
+    /// `forget_session`.
+    ///
+    /// Extracted to its own method (rather than inlined in the
+    /// `Event::Connected` arm) so a unit test can call it directly and
+    /// prove that property: `establishing_a_second_connection_does_not_
+    /// disturb_an_existing_session` reintroduces the deleted prune here
+    /// under mutation and fails, which is the guard against it coming back.
+    fn on_connection_established(&mut self, handle: ConnectionHandle) {
+        let wt = self.wt_sessions.entry(handle).or_default();
+        if let Some(conn) = self.server.connections.get_mut(&handle) {
+            wt.on_new_connection(conn);
         }
     }
 
@@ -6332,6 +6353,15 @@ impl IoBridge {
     /// loop. The eviction datagrams queued below are flushed on that
     /// schedule same as any other datagram; the connection itself is only
     /// reclaimed later, by quinn's idle timeout via `Event::ConnectionLost`.
+    ///
+    /// **The send below has zero unit-test coverage.** `self.server
+    /// .connections.get_mut(&handle)` never yields `Some` in a unit-test
+    /// bridge -- the test helpers attach a `wt_sessions` entry without ever
+    /// running a real `quinn_proto` handshake, so the send is always
+    /// skipped and `EVICTION_REPEATS` could be set to 0 without a single
+    /// test failing. Driving it honestly needs a real `Connection`, which
+    /// is what the milestone's end-to-end test (last task) exercises; that
+    /// is the coverage for this half of the method, not anything here.
     fn evict_session(&mut self, handle: ConnectionHandle, reason: EvictionReason) {
         const EVICTION_REPEATS: usize = 3;
 
@@ -6912,20 +6942,59 @@ mod tests {
         );
     }
 
+    /// THE test of this milestone: establishing a second QUIC connection
+    /// must not disturb an existing, HELLO-identified session. A port
+    /// scan, an abandoned handshake, or a client that dies mid-negotiation
+    /// must not kill a working session -- and the old connect-time prune
+    /// did exactly that, before it could tell the incumbent why.
+    ///
+    /// Drives the real production path (`on_connection_established`, the
+    /// extracted body of the `Event::Connected` arm) rather than merely
+    /// calling `apply_hello` in isolation -- `server.connections.get_mut`
+    /// returning `None` for the synthetic handle is harmless here, since
+    /// `on_connection_established` tolerates a connection-less handle by
+    /// design (a QUIC `Connected` event always has a live connection in
+    /// production; the test only needs the `wt_sessions`-side effect).
+    ///
+    /// This is the guard against reintroducing the deleted prune: putting
+    /// its body back inside `on_connection_established` makes this test
+    /// fail (verified by hand while landing this test, then reverted).
     #[tokio::test]
-    async fn a_connection_that_never_said_hello_evicts_nobody() {
-        // THE test of this milestone. A port scan, an abandoned handshake, or
-        // a client that dies mid-negotiation must not kill a working session.
+    async fn establishing_a_second_connection_does_not_disturb_an_existing_session() {
         let incumbent = ConnectionHandle(7);
-        let silent = ConnectionHandle(9);
-        let mut bridge = test_bridge_with_sessions(&[incumbent, silent]).await;
-
+        let mut bridge = test_bridge_with_sessions(&[incumbent]).await;
         bridge.apply_hello(incumbent, hello(true));
-        let _ = silent; // exists as a session, never sends HELLO
+
+        // Stand-in for the "thousands of un-ACKable pending entries" the
+        // old prune's comment described: a live retransmit-cache entry
+        // that a wrongful eviction would incorrectly clear.
+        let now = std::time::Instant::now();
+        bridge.reliable_emitter.submit_one(
+            crate::transport::reliable_emitter::EmitKey::new(1, 0, 0, 0),
+            bytes::Bytes::from_static(&[0u8; 16]),
+            now,
+            None,
+            now,
+        );
+        assert_eq!(bridge.reliable_emitter.pending_cache_entries(), 1);
+
+        // A second, distinct QUIC connection establishes -- e.g. a port
+        // scan or an abandoned handshake -- and never sends HELLO.
+        bridge.on_connection_established(ConnectionHandle(9));
 
         assert!(
             bridge.wt_sessions.contains_key(&incumbent),
-            "a session that never identified itself must not displace one that did"
+            "a second connection establishing must not displace an existing session"
+        );
+        assert_eq!(
+            bridge.last_hello_from(),
+            Some(incumbent),
+            "attribution must survive an unrelated connection establishing"
+        );
+        assert_eq!(
+            bridge.reliable_emitter.pending_cache_entries(),
+            1,
+            "the incumbent's pending entries must not be cleared by an unrelated connection"
         );
     }
 
