@@ -77,13 +77,26 @@ use std::sync::Arc;
 
 /// Shared ownership of the imported `VkDeviceMemory`.
 ///
-/// Both plane textures' drop callbacks (see [`wrap_texture`]) hold an
-/// `Arc<ImportOwner>` clone, so this is freed only once the *last* of them
-/// drops -- which `Arc` guarantees cannot happen before both callbacks have
-/// already run `destroy_image` (each callback destroys its image, then lets
-/// its own clone drop at the end of the closure invocation). That gives the
-/// order Vulkan requires -- images destroyed before the memory they were
-/// bound to -- without this module needing to track or sequence it by hand.
+/// On the success path -- both plane images handed to [`wrap_texture`] and
+/// on to wgpu -- both drop callbacks hold an `Arc<ImportOwner>` clone, so
+/// this is freed only once the *last* of them drops, which `Arc` guarantees
+/// cannot happen before both callbacks have already run `destroy_image`
+/// (each callback destroys its image, then lets its own clone drop at the
+/// end of the closure invocation). That gives images destroyed before the
+/// memory they were bound to, without this module needing to track or
+/// sequence it by hand.
+///
+/// That ordering is NOT universal, though: on `import_inner`'s
+/// `bind_image_memory` error paths, the local `owner` (declared after
+/// `guard`, a `PartialImport`) drops first, in reverse declaration order --
+/// this `Drop` frees the memory while `guard`'s images (still `Some`, never
+/// having reached `wrap_texture`) are destroyed only afterwards. That is
+/// still sound: `vkFreeMemory` only requires that the memory not be *used*
+/// (mapped, bound to a live command) afterwards, and `vkDestroyImage` on an
+/// image whose bound memory has already been freed is not a use of that
+/// memory -- destroying an image accesses no memory contents. So "images
+/// destroyed before their memory is freed" describes the success path, not
+/// a Vulkan requirement this type enforces everywhere.
 struct ImportOwner {
     device: ash::Device,
     memory: vk::DeviceMemory,
@@ -92,10 +105,12 @@ struct ImportOwner {
 impl Drop for ImportOwner {
     fn drop(&mut self) {
         // SAFETY: `memory` was allocated by this module, bound to both
-        // plane images, and is freed exactly once here. See the struct doc:
-        // by the time an `Arc<ImportOwner>`'s last reference drops, both
-        // images' `destroy_image` calls have already completed, which is
-        // the order Vulkan requires.
+        // plane images (or, on an error path, to neither yet -- see the
+        // struct doc), and is freed exactly once here. Freeing it before an
+        // already-created-but-not-yet-bound-or-wrapped image is destroyed is
+        // sound (struct doc); `vkFreeMemory` requires only that nothing
+        // still uses the memory, and destroying an image is not a use of
+        // the memory it happens to be bound to.
         unsafe {
             self.device.free_memory(self.memory, None);
         }
@@ -626,10 +641,16 @@ fn wrap_texture(
 
     // Runs exactly once, whenever wgpu-core decides this texture's
     // underlying resource is no longer referenced by anything (a clone, a
-    // view, a bind group) AND the GPU work that used it has retired --
-    // `wgpu_hal::vulkan::Device::destroy_texture` only calls this because
-    // `memory` is `TextureMemory::External` below, so wgpu-hal itself never
-    // touches `image` or the memory it is bound to.
+    // view, a bind group) AND the GPU work that used it has retired.
+    // `wgpu_hal::vulkan::Device::destroy_texture` checks `texture.drop_guard
+    // .is_none()` before calling `destroy_image` itself -- since we pass
+    // `Some(drop_guard)` below, it skips that, and this closure runs instead
+    // when the `Texture` it consumed (and, with it, the drop guard) drops at
+    // the end of that call. `TextureMemory::External` is a SEPARATE switch
+    // on that same function: it only tells `destroy_texture` not to run its
+    // own memory-freeing arm (this module frees the memory itself, via
+    // `owner`'s `Drop`), so wgpu-hal never touches the memory `image` is
+    // bound to.
     let drop_callback: wgpu_hal::DropCallback = Box::new(move || {
         // SAFETY: `image` was handed to wgpu-hal below with `Some` drop
         // callback, which per `texture_from_raw`'s contract means "`vk_image`

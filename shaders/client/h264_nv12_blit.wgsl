@@ -26,9 +26,10 @@
 // look smoother and be further from the source.
 //
 // Mirrored on the CPU in ghostframe-client-gpu/src/nv12_reference.rs, which
-// tests/gpu_nv12_blit.rs asserts this against exactly (Task 8; a 1-LSB
-// tolerance applies only to the small FMA-reachable sample set recorded in
-// the design doc's §9.1, not to this reference in general).
+// src/nv12_oracle_tests.rs asserts this against exactly, in two tiers (Task
+// 8; design doc §9.2): Rgba32Float bit-exact against the pre-quantisation
+// arithmetic, and Rgba8Unorm exact against a measured model of this GPU's
+// compressed fp16 export path. No tolerance in either tier.
 
 const CHROMA_CENTRE: f32 = 0.502;
 

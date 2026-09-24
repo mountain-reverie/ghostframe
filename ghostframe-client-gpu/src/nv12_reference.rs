@@ -9,19 +9,31 @@
 //! two: this file, the WGSL, and the `.comp` shader they both invert. All
 //! three must change together.
 //!
-//! This file has two conversion functions, and they model different halves
-//! of the pipeline:
+//! This file has three conversion functions, and they model different
+//! halves of the pipeline:
 //!
-//! - [`nv12_pixel_to_rgba`] is pure colour-matrix arithmetic on three
-//!   already-selected samples. It does not know NV12 is a planar format and
-//!   performs no plane indexing or chroma upsampling.
+//! - [`nv12_pixel_to_rgb_f32`] is pure colour-matrix arithmetic on three
+//!   already-selected samples, stopped right where the fragment shader
+//!   itself stops: `clamp(r/g/b, 0.0, 1.0)`, before any write to a colour
+//!   target. This is what Tier A of Task 8's oracle (design doc §9.2)
+//!   compares against a real `Rgba32Float` render target, bit-exactly --
+//!   that target receives the fragment's `vec4<f32>` untouched (no fp16
+//!   packing, spec §9.1), so this function's output IS the fragment shader's
+//!   output, not a model of one.
+//! - [`nv12_pixel_to_rgba`] carries that through the fixed-function unorm8
+//!   **write** ([`to_u8`]), modelling a conformant `Rgba8Unorm` target. Task
+//!   8's Tier B does NOT compare against this directly -- on this GPU an
+//!   `Rgba8Unorm` target is written through a compressed fp16 export that
+//!   this function does not model (see the oracle's own `f16_rtz`
+//!   quantiser, deliberately kept out of this file).
 //! - [`nv12_plane_pixel_to_rgba`] models the actual NV12 planes -- luma and
 //!   chroma byte buffers with their own strides -- and performs the
-//!   nearest-neighbour chroma selection itself before calling the former.
-//!   This is the one Task 8's oracle should compare against the shader,
-//!   because the shader's `p / 2` chroma indexing is exactly as likely a
-//!   source of a real bug as the matrix is, and a reference that never
-//!   exercises indexing would "agree" with a wrong shader by construction.
+//!   nearest-neighbour chroma selection itself before calling
+//!   [`nv12_pixel_to_rgba`]. This is the one Task 8's oracle should compare
+//!   against the shader, because the shader's `p / 2` chroma indexing is
+//!   exactly as likely a source of a real bug as the matrix is, and a
+//!   reference that never exercises indexing would "agree" with a wrong
+//!   shader by construction.
 //!
 //! Both assume the unorm *decode* (byte -> `[0, 1]`) is `byte as f32 /
 //! 255.0`, matching every conformant fixed-function texture fetch. That is
@@ -53,14 +65,20 @@ pub const G_COEFF: [f32; 3] = [1.0, -0.343695, -0.714169];
 #[allow(clippy::excessive_precision)]
 pub const B_COEFF: [f32; 3] = [1.0, 1.772160, 0.000990];
 
-/// Convert one already-selected NV12 sample triple to RGBA8.
+/// Convert one already-selected NV12 sample triple to the fragment shader's
+/// own pre-quantisation output: `[r, g, b]`, each already clamped to `[0,
+/// 1]` exactly as `fs_main`'s `clamp(r/g/b, 0.0, 1.0)` does, and in the same
+/// arithmetic order (no FMA contraction -- see the module doc and design
+/// doc §9.1, which measured 0 bit differences between this style of plain
+/// Rust f32 arithmetic and the GPU's `v_mad_f32`).
 ///
-/// Pure matrix arithmetic: `luma`/`cb`/`cr` are raw 8-bit samples the caller
-/// has already picked out of the two planes. This function does not know
-/// chroma is stored at half resolution and performs no upsampling -- see
-/// [`nv12_plane_pixel_to_rgba`] for the function that does, and the module
-/// doc for why the two are kept separate.
-pub fn nv12_pixel_to_rgba(luma: u8, cb: u8, cr: u8) -> [u8; 4] {
+/// This is the function Task 8's Tier A oracle asserts bit-exact equality
+/// against on a real `Rgba32Float` render target: that format receives the
+/// fragment shader's `vec4<f32>` with no packing at all (design doc §9.1),
+/// so there is no quantisation step between this function and what the GPU
+/// writes -- unlike [`nv12_pixel_to_rgba`] below, which goes one step
+/// further into a *specific* target format's write.
+pub fn nv12_pixel_to_rgb_f32(luma: u8, cb: u8, cr: u8) -> [f32; 3] {
     let y = luma as f32 / 255.0;
     let u = cb as f32 / 255.0 - CHROMA_CENTRE;
     let v = cr as f32 / 255.0 - CHROMA_CENTRE;
@@ -69,6 +87,22 @@ pub fn nv12_pixel_to_rgba(luma: u8, cb: u8, cr: u8) -> [u8; 4] {
     let g = G_COEFF[0] * y + G_COEFF[1] * u + G_COEFF[2] * v;
     let b = B_COEFF[0] * y + B_COEFF[1] * u + B_COEFF[2] * v;
 
+    [r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0)]
+}
+
+/// Convert one already-selected NV12 sample triple to RGBA8.
+///
+/// Pure matrix arithmetic: `luma`/`cb`/`cr` are raw 8-bit samples the caller
+/// has already picked out of the two planes. This function does not know
+/// chroma is stored at half resolution and performs no upsampling -- see
+/// [`nv12_plane_pixel_to_rgba`] for the function that does, and the module
+/// doc for why the two are kept separate.
+///
+/// Composes [`nv12_pixel_to_rgb_f32`] (the arithmetic) with [`to_u8`] (the
+/// conformant fixed-function write) -- see both docs for which half of the
+/// pipeline each models.
+pub fn nv12_pixel_to_rgba(luma: u8, cb: u8, cr: u8) -> [u8; 4] {
+    let [r, g, b] = nv12_pixel_to_rgb_f32(luma, cb, cr);
     [to_u8(r), to_u8(g), to_u8(b), 255]
 }
 
