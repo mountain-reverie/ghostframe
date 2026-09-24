@@ -292,10 +292,24 @@ descriptor is stable across 3 separate runs). Output:
 tiled modifier would be a `fourcc_mod_code(AMD, ...)` value with vendor byte
 `0x02` in bit 56, not all-ones). `DRM_FORMAT_MOD_INVALID` is the sentinel
 `AVDRMFrameDescriptor` uses when the export path carries **no modifier
-metadata at all** — consistent with ffmpeg's `hwcontext_vaapi` falling back to
-the legacy `vaDeriveImage`/`vaAcquireBufferHandle` derivation instead of the
-newer `vaExportSurfaceHandle(..., PRIME_2)` path that would report a real
-modifier (linear-explicit-0 or an AMD tile code) on radeonsi.
+metadata at all**.
+
+Two different causes produce exactly this observation, and the spike cannot
+tell them apart:
+
+1. ffmpeg used its legacy `vaAcquireBufferHandle` mapping, which sets
+   `format_modifier = DRM_FORMAT_MOD_INVALID` unconditionally, whatever the
+   surface actually is.
+2. ffmpeg used `vaExportSurfaceHandle(PRIME_2)` and *radeonsi itself* reported
+   `INVALID`, which is what a driver returns for a surface allocated without
+   explicit modifier negotiation.
+
+Both paths write the same byte pattern into the same field, so the value alone
+is not evidence for either. Distinguishing them means calling
+`vaExportSurfaceHandle` directly against libva and comparing — worth doing only
+if §10's measurement shows the CPU copy costs enough to justify chasing a
+zero-copy path. Recording the ambiguity here so the next person does not read a
+guess as a finding.
 
 Shape observed: **one object, two layers, one plane each** — `object[0]` is a
 single dmabuf (fd, 552960 bytes) backing both layers. `layer[0]` format
