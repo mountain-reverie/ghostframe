@@ -288,28 +288,25 @@ descriptor is stable across 3 separate runs). Output:
 ```
 
 **The modifier is `0x00ffffffffffffff` — `DRM_FORMAT_MOD_INVALID`, not
-`DRM_FORMAT_MOD_LINEAR` (0).** This is not a tiled modifier either (a real AMD
-tiled modifier would be a `fourcc_mod_code(AMD, ...)` value with vendor byte
-`0x02` in bit 56, not all-ones). `DRM_FORMAT_MOD_INVALID` is the sentinel
-`AVDRMFrameDescriptor` uses when the export path carries **no modifier
-metadata at all**.
+`DRM_FORMAT_MOD_LINEAR` (0).**
 
-Two different causes produce exactly this observation, and the spike cannot
-tell them apart:
+**And on this chip that value carries no information whatsoever.** AMD format
+modifiers begin at GFX9: the lowest tile version in `/usr/include/drm/drm_fourcc.h`
+is `AMD_FMT_MOD_TILE_VER_GFX9 1`, and radeonsi's `ac_is_modifier_supported()`
+returns false for `gfx_level < GFX9` *before* it would accept even
+`DRM_FORMAT_MOD_LINEAR`. Polaris10 is GFX8. So `INVALID` is the only value
+`vaExportSurfaceHandle` can return here — for a linear surface and a tiled one
+alike. Reading it as evidence of tiling is reading a field that has no
+vocabulary to say anything with.
 
-1. ffmpeg used its legacy `vaAcquireBufferHandle` mapping, which sets
-   `format_modifier = DRM_FORMAT_MOD_INVALID` unconditionally, whatever the
-   surface actually is.
-2. ffmpeg used `vaExportSurfaceHandle(PRIME_2)` and *radeonsi itself* reported
-   `INVALID`, which is what a driver returns for a surface allocated without
-   explicit modifier negotiation.
-
-Both paths write the same byte pattern into the same field, so the value alone
-is not evidence for either. Distinguishing them means calling
-`vaExportSurfaceHandle` directly against libva and comparing — worth doing only
-if §10's measurement shows the CPU copy costs enough to justify chasing a
-zero-copy path. Recording the ambiguity here so the next person does not read a
-guess as a finding.
+The mapping did take the modern export path, not a legacy fallback. ffmpeg's
+`vaapi_map_to_drm_abh()` picks the first `vaapi_drm_format_map` entry matching
+the VA fourcc, and that table lists `DRM_FORMAT_RG88` (`0x38384752`) ahead of
+the `GR88` variant; the spike observed `GR88` (`0x38385247`), which is what
+Mesa passes straight through under `vaExportSurfaceHandle(PRIME_2)`. The two
+fourcc values were checked here; the table ordering is from a review of ffmpeg
+n9.0.1's `libavutil/hwcontext_vaapi.c` and has not been re-verified locally
+(the source is not installed on this machine).
 
 Shape observed: **one object, two layers, one plane each** — `object[0]` is a
 single dmabuf (fd, 552960 bytes) backing both layers. `layer[0]` format
@@ -320,21 +317,52 @@ shape M1/M3 assumed, not the "one layer with two planes" alternative. For
 640x480: Y at offset 0, pitch 768 (640 padded up to a 256-byte multiple);
 UV at offset 368640 (= 768 × 480, i.e. right after the full padded Y plane),
 pitch 768, height 240. `768 × 480 + 768 × 240 = 552960`, which matches
-`object[0].size` exactly, so the plane math is self-consistent and this is a
-standard padded raster layout, not an opaque tiled blob — but that is a
-plausibility observation, not proof, given the modifier itself is unreported.
+`object[0].size` exactly.
 
-**Direct Vulkan import is not viable on this hardware, for two independent
-reasons:** (1) `VK_EXT_image_drm_format_modifier` is absent from this GPU's
-Vulkan driver regardless of what VA-API reports, and (2) even if that
-extension were present, VA-API is not handing back a confirmed
-`DRM_FORMAT_MOD_LINEAR`, so there is no safe modifier to import with, and
-importing through the modifier-less `VK_IMAGE_TILING_LINEAR` path would be an
-unverified assumption about a layout the driver explicitly declined to
-promise. **Task 6's CPU fallback (`av_hwframe_transfer_data` into a CPU NV12
-frame, then `write_texture`) is the live path on this machine** — this is the
-third row of the outcomes table above, not the first. The design already
-anticipated and priced this outcome; it is not a blocker.
+**What this does and does not establish.** The plane arithmetic is
+self-consistent, which rules out 2D/macro-tiling (that pads height and the
+slice base, changing the total size). It does **not** distinguish linear from
+GFX8 1D/micro-tiling: 8×8 micro-tiling reorders bytes *within the same
+allocation footprint*, so pitch, offset and size are identical either way. The
+one piece of evidence available is blind to the most likely alternative.
+
+**So linearity is unmeasured, not disproven, and direct import is not ruled
+out.** The absence of `VK_EXT_image_drm_format_modifier` rules out importing a
+*tiled* modifier; it says nothing about the linear path, which
+`ghostframe-client-gpu/src/export.rs` uses in production on this exact GPU
+today, precisely because the extension is missing. An earlier draft of this
+section called that extension an independent second reason to abandon direct
+import. It is not a reason at all.
+
+Two things settle it, and both are already planned work:
+
+1. **Task 5's linearity check** (added after this review): `mmap` the exported
+   dmabuf and compare it byte for byte against `av_hwframe_transfer_data`'s
+   output, which is authoritative. Equal means the buffer *is* linear at the
+   descriptor's exact layout, whatever the metadata declines to say. The
+   `mmap` + `DMA_BUF_IOCTL_SYNC` wrapper already exists in `export.rs`, and the
+   oracle already calls `av_hwframe_transfer_data` on the same surface.
+2. **Task 6's runtime pitch check**, which was in the plan before any of this:
+   create the image, ask `vkGetImageSubresourceLayout` what pitch the driver
+   actually chose, and refuse the import if it disagrees with the descriptor.
+   That is what makes attempting an un-promised linear import *safe* — it
+   either verifies at runtime or fails cleanly, instead of rendering a sheared
+   frame.
+
+Task 6 gets built, and the import path is chosen at runtime with the startup
+log §7 already requires. The CPU copy (`av_hwframe_transfer_data` into a CPU
+NV12 frame, then `write_texture`, built across Tasks 8 and 9) remains the
+guaranteed floor and is needed regardless — it is the portability fallback for
+any machine whose surface cannot be imported.
+
+**A note on how this section went wrong first.** The plan instructed the spike:
+"if the modifier is not 0, state that direct import cannot work on this GPU."
+That rule silently assumed `modifier != 0` implies tiled. On GFX8 the modifier
+is *structurally* never 0, so the rule fired on a hardware fact that has
+nothing to do with tiling, and the spike faithfully recorded a conclusion the
+evidence never supported. The defect was in the plan, not the spike. A spike
+step that pre-commits to a conclusion for an unseen measurement deserves the
+same suspicion next time.
 
 ---
 

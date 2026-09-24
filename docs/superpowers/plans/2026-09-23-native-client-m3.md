@@ -1335,7 +1335,133 @@ corrupt one byte of the hardware output inside `hw_frame_to_nv12` — e.g. add
 `luma[0] = luma[0].wrapping_add(1);` before returning — re-run, and confirm it
 FAILS naming frame 0. Then revert the corruption.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Settle whether the dmabuf is actually linear**
+
+Spec §7.1: on this GPU (GFX8) the DRM modifier is structurally always
+`INVALID`, so it says nothing about tiling, and the plane arithmetic cannot
+distinguish linear from 1D/micro-tiled. This decides it, and it needs no GPU
+API at all — just a memory map and the decoder's own authoritative download.
+
+Add to `ghostframe-client-h264/tests/oracle_decode.rs`:
+
+```rust
+/// Is the exported dmabuf laid out exactly as its descriptor claims?
+///
+/// The modifier field cannot answer this on GFX8 (spec §7.1), so compare the
+/// bytes directly: `av_hwframe_transfer_data` is authoritative, and an mmap of
+/// the dmabuf at the descriptor's offsets and pitches must match it if — and
+/// only if — the surface is linear at that layout.
+///
+/// A match means `import_nv12`'s LINEAR path is sound here despite the missing
+/// metadata. A mismatch means tiled, and the CPU copy is confirmed on evidence
+/// rather than on an absent field.
+#[test]
+fn the_exported_dmabuf_is_linear_at_the_descriptors_layout() {
+    if !ghostframe_client_h264::vaapi_h264_decode_available() {
+        eprintln!("no VA-API H.264 decode here; skipping");
+        return;
+    }
+
+    let clip = gradient_clip(W, H, 3);
+    let mut dec = H264Decoder::new().expect("open hw decoder");
+    let mut frames = Vec::new();
+    for au in &clip {
+        frames.extend(dec.decode(au).expect("decode"));
+    }
+    frames.extend(dec.flush().expect("flush"));
+    let frame = frames.first().expect("no frame decoded");
+
+    // Authoritative pixels.
+    let (want_luma, want_chroma) = hw_frame_to_nv12(frame);
+
+    // The same surface, seen as raw memory.
+    let mapped = frame.map_dmabuf().expect("map to dmabuf");
+    let p = &mapped.planes;
+    let len = (p.chroma.offset + p.chroma.pitch * (H as u64 / 2)) as usize;
+
+    // SAFETY: `p.fd` is a live dmabuf owned by `mapped`, and `len` is within
+    // the object size the descriptor reports. Read-only, shared.
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            p.fd,
+            0,
+        )
+    };
+    assert!(
+        ptr != libc::MAP_FAILED,
+        "mmap of the decoder's dmabuf failed: {}. Without a CPU mapping this \
+         question cannot be settled from this test.",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: `ptr` is a valid mapping of `len` bytes, live until munmap below.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+
+    let mut luma_diff = 0usize;
+    for y in 0..H as usize {
+        let row = &bytes[y * p.luma.pitch as usize..y * p.luma.pitch as usize + W as usize];
+        luma_diff += row
+            .iter()
+            .zip(&want_luma[y * W as usize..(y + 1) * W as usize])
+            .filter(|(a, b)| a != b)
+            .count();
+    }
+
+    let mut chroma_diff = 0usize;
+    for y in 0..(H / 2) as usize {
+        let off = p.chroma.offset as usize + y * p.chroma.pitch as usize;
+        let row = &bytes[off..off + W as usize];
+        chroma_diff += row
+            .iter()
+            .zip(&want_chroma[y * W as usize..(y + 1) * W as usize])
+            .filter(|(a, b)| a != b)
+            .count();
+    }
+
+    // SAFETY: `ptr`/`len` are exactly what mmap returned and nothing else
+    // holds the mapping.
+    unsafe { libc::munmap(ptr, len) };
+
+    let total = (W * H) as usize + (W * H / 2) as usize;
+    eprintln!(
+        "[m3] dmabuf-vs-download: {} of {} bytes differ (luma {}, chroma {})",
+        luma_diff + chroma_diff,
+        total,
+        luma_diff,
+        chroma_diff
+    );
+
+    // Deliberately NOT an assertion of linearity: both outcomes are valid
+    // findings, and which one holds decides whether `import_nv12` can take the
+    // LINEAR path on this hardware. What IS asserted is that the comparison
+    // actually ran over real data -- a silently empty comparison would report
+    // "0 differ" and look like success.
+    assert!(total > 0 && !want_luma.is_empty(), "nothing was compared");
+}
+```
+
+Add `libc = { workspace = true }` to `ghostframe-client-h264`'s
+`[dev-dependencies]` if it is not already a normal dependency.
+
+Run it and **record the byte-difference count in spec §7.1**, replacing the
+"unmeasured" language with the measurement:
+
+```bash
+cargo test -p ghostframe-client-h264 --test oracle_decode -- --nocapture 2>&1 | grep '\[m3\]'
+```
+
+- **0 differ** → the surface is linear at the descriptor's layout. Say so, and
+  note that `import_nv12`'s LINEAR path is expected to work here, with Task 6's
+  pitch check as the runtime guard.
+- **many differ** → the surface is tiled. Say so, and the CPU copy is confirmed
+  on evidence. Task 6 still gets built: it is the path for every *other*
+  machine, and its rejection here is then a verified behaviour rather than an
+  assumption.
+
+- [ ] **Step 7: Commit**
 
 ```bash
 git add ghostframe-client-h264
