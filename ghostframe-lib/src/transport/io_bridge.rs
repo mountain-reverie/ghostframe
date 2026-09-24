@@ -35,6 +35,7 @@ use crate::capture::gpu_pipeline::GpuFrameProcessor;
 use crate::encoder::h264_vaapi::FullFrameEncoder;
 use crate::server::FrameSubmission;
 use crate::tile::{DirtyTracker, TileGrid};
+use crate::transport::eviction::{build_eviction_datagram, EvictionReason};
 use crate::transport::fec;
 use crate::transport::fec::fec_group_size;
 use crate::transport::feedback::ReceiverFeedback;
@@ -5496,37 +5497,14 @@ impl IoBridge {
                 Event::Connected => {
                     // New connection fully established — start the H3 handshake.
                     //
-                    // Single-client cleanup: drop any wt_sessions left over from
-                    // a prior QUIC connection and clear the emitter cache. The
-                    // server is designed for one viewer at a time; on page
-                    // reload the browser opens a fresh QUIC connection
-                    // (different ConnectionHandle) without closing the old one
-                    // cleanly via `Event::ConnectionLost` (quinn only emits
-                    // that on idle timeout or transport error, not on graceful
-                    // WT close). Without this prune, the stale session stays
-                    // marked `is_connected()=true` forever, every emitted
-                    // datagram is fanned out to its dead handle (consuming
-                    // quinn buffer and generating Blocked errors), and the
-                    // emitter's cache inherits thousands of un-ACKable pending
-                    // entries from the old session that flood the link until
-                    // RTO eventually times out the old QUIC connection.
-                    let stale: Vec<ConnectionHandle> = self
-                        .wt_sessions
-                        .keys()
-                        .copied()
-                        .filter(|h| *h != handle)
-                        .collect();
-                    if !stale.is_empty() {
-                        tracing::info!(
-                            new_handle = ?handle,
-                            stale_count = stale.len(),
-                            "new QUIC connection — pruning stale wt_sessions and clearing emitter cache"
-                        );
-                        for h in &stale {
-                            self.forget_session(*h);
-                        }
-                        self.reliable_emitter.clear_cache();
-                    }
+                    // No stale-session prune here any more. It used to drop
+                    // every other session on a new QUIC connection, which
+                    // displaced an incumbent before it could be told why --
+                    // and let a connection that never identified itself kill
+                    // a working session. Eviction is keyed on HELLO instead
+                    // (see `apply_hello`); a dead connection that never
+                    // reconnects is reaped by quinn's idle timeout through
+                    // `Event::ConnectionLost` -> `forget_session`.
                     let wt = self.wt_sessions.entry(handle).or_default();
                     if let Some(conn) = self.server.connections.get_mut(&handle) {
                         wt.on_new_connection(conn);
@@ -6280,7 +6258,25 @@ impl IoBridge {
         from: ConnectionHandle,
         msg: crate::transport::client_caps::HelloMsg,
     ) {
+        // Capture the previous value before overwriting it: the eviction
+        // check below needs to know who held the session *before* this
+        // HELLO, not `from` itself.
+        let incumbent = self.last_hello_from;
         self.last_hello_from = Some(from);
+
+        // One client at a time. A second client identifying itself displaces
+        // the incumbent, which is told why (design doc §2, §3).
+        //
+        // Keyed on HELLO rather than on session accept: a connection that
+        // never identifies itself -- a port scan, an abandoned handshake, a
+        // client that died mid-negotiation -- must not be able to kill a
+        // working session.
+        if let Some(incumbent) = incumbent {
+            if incumbent != from {
+                self.evict_session(incumbent, EvictionReason::DisplacedByNewSession);
+            }
+        }
+
         self.client_caps = msg.caps;
         // Mirror the H.264 capability into the adaptation context so the
         // classifier's hard override sees it on the very next decision —
@@ -6316,6 +6312,45 @@ impl IoBridge {
         if self.last_hello_from == Some(handle) {
             self.last_hello_from = None;
         }
+    }
+
+    /// Tell `handle` it has been displaced, then drop it.
+    ///
+    /// Best-effort: the notice is a datagram, so it can be lost, and the
+    /// client then falls back to a generic disconnect. Sent three times
+    /// because a single loss should not swallow it.
+    ///
+    /// **Three is a guess, not a measurement.** It survives two independent
+    /// losses at the ~1% rates this project tests under. If it proves
+    /// insufficient the fix is a reliable stream (design doc §3), not a
+    /// larger number.
+    ///
+    /// No grace-period sleep before dropping the session: `forget_session`
+    /// only removes our own bookkeeping (`wt_sessions`, etc.) -- it does not
+    /// touch `self.server.connections`, so the underlying QUIC connection
+    /// stays open and keeps being driven by the normal `poll_transmit`
+    /// loop. The eviction datagrams queued below are flushed on that
+    /// schedule same as any other datagram; the connection itself is only
+    /// reclaimed later, by quinn's idle timeout via `Event::ConnectionLost`.
+    fn evict_session(&mut self, handle: ConnectionHandle, reason: EvictionReason) {
+        const EVICTION_REPEATS: usize = 3;
+
+        let datagram = build_eviction_datagram(reason);
+        if let Some(conn) = self.server.connections.get_mut(&handle) {
+            if let Some(wt) = self.wt_sessions.get_mut(&handle) {
+                for _ in 0..EVICTION_REPEATS {
+                    // Ignore send errors: the session may already be gone,
+                    // which is the same outcome we are driving towards.
+                    let _ = wt.send_datagram(conn, &datagram);
+                }
+            }
+        }
+        tracing::info!(?handle, ?reason, "evicting session");
+        // Moved here from the old connect-time prune: the displaced
+        // session's pending entries are un-ACKable, and left in place they
+        // flood the link until RTO.
+        self.reliable_emitter.clear_cache();
+        self.forget_session(handle);
     }
 
     /// Update FEC parity state based on receiver feedback.
@@ -6841,6 +6876,121 @@ mod tests {
             Some(handle_a),
             "forget_session must only clear last_hello_from when it names the \
              handle being forgotten"
+        );
+    }
+
+    /// Test-only helper: a `HelloMsg` advertising the given H.264 support,
+    /// with `indices_raw_enabled` fixed at `false` since none of the
+    /// eviction tests care about that bit.
+    fn hello(supports_h264: bool) -> crate::transport::client_caps::HelloMsg {
+        crate::transport::client_caps::HelloMsg {
+            caps: crate::transport::client_caps::ClientCapabilities {
+                indices_raw_enabled: false,
+                supports_h264,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_hello_evicts_the_incumbent() {
+        let first = ConnectionHandle(7);
+        let second = ConnectionHandle(9);
+        let mut bridge = test_bridge_with_sessions(&[first, second]).await;
+
+        bridge.apply_hello(first, hello(true));
+        assert!(bridge.wt_sessions.contains_key(&first));
+
+        bridge.apply_hello(second, hello(true));
+
+        assert!(
+            !bridge.wt_sessions.contains_key(&first),
+            "the incumbent must be dropped when a second client identifies itself"
+        );
+        assert!(
+            bridge.wt_sessions.contains_key(&second),
+            "the newcomer must survive its own arrival"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_never_said_hello_evicts_nobody() {
+        // THE test of this milestone. A port scan, an abandoned handshake, or
+        // a client that dies mid-negotiation must not kill a working session.
+        let incumbent = ConnectionHandle(7);
+        let silent = ConnectionHandle(9);
+        let mut bridge = test_bridge_with_sessions(&[incumbent, silent]).await;
+
+        bridge.apply_hello(incumbent, hello(true));
+        let _ = silent; // exists as a session, never sends HELLO
+
+        assert!(
+            bridge.wt_sessions.contains_key(&incumbent),
+            "a session that never identified itself must not displace one that did"
+        );
+    }
+
+    #[tokio::test]
+    async fn re_hello_from_the_same_session_does_not_evict_itself() {
+        // A client may re-send HELLO (capability change, or a reconnect
+        // within the same session). Treating that as a newcomer would have
+        // it evict itself.
+        let only = ConnectionHandle(7);
+        let mut bridge = test_bridge_with_sessions(&[only]).await;
+
+        bridge.apply_hello(only, hello(false));
+        bridge.apply_hello(only, hello(true));
+
+        assert!(bridge.wt_sessions.contains_key(&only));
+        assert!(
+            bridge.current_client_caps().supports_h264,
+            "the second HELLO's capabilities must still be applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_ends_with_one_session_and_a_cleared_emitter_cache() {
+        // The property the old connect-time prune protected: a page reload
+        // opens a fresh QUIC connection (new handle) without the old one
+        // ever going through `Event::ConnectionLost`. Eviction must deliver
+        // the same outcome -- exactly one live session, and no stale
+        // un-ACKable entries left in the emitter's retransmit cache.
+        let old = ConnectionHandle(7);
+        let mut bridge = test_bridge_with_sessions(&[old]).await;
+        bridge.apply_hello(old, hello(true));
+
+        // Seed the emitter with a pending (un-ACKed) entry, standing in for
+        // the "thousands of un-ACKable pending entries" the old prune's
+        // comment described.
+        let now = std::time::Instant::now();
+        bridge.reliable_emitter.submit_one(
+            crate::transport::reliable_emitter::EmitKey::new(1, 0, 0, 0),
+            bytes::Bytes::from_static(&[0u8; 16]),
+            now,
+            None,
+            now,
+        );
+        assert_eq!(bridge.reliable_emitter.pending_cache_entries(), 1);
+
+        // Simulate a page reload: a new QUIC connection (new handle) is
+        // accepted, then the newcomer sends HELLO.
+        let reconnected = ConnectionHandle(9);
+        attach_session(&mut bridge, reconnected);
+        bridge.apply_hello(reconnected, hello(true));
+
+        assert_eq!(
+            bridge.wt_sessions.len(),
+            1,
+            "exactly one live session must remain after the reconnect"
+        );
+        assert!(bridge.wt_sessions.contains_key(&reconnected));
+        assert!(
+            !bridge.wt_sessions.contains_key(&old),
+            "the pre-reload session must be gone"
+        );
+        assert_eq!(
+            bridge.reliable_emitter.pending_cache_entries(),
+            0,
+            "the old session's un-ACKable pending entries must not survive the reconnect"
         );
     }
 
