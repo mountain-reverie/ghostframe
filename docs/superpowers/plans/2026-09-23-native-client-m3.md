@@ -1512,9 +1512,21 @@ fn hw_frame_to_nv12(frame: &ghostframe_client_h264::decoder::HwFrame) -> (Vec<u8
 
 #[test]
 fn hardware_decode_matches_software_decode_exactly() {
-    if !ghostframe_client_h264::vaapi_h264_decode_available() {
-        eprintln!("no VA-API H.264 decode here; skipping");
-        return;
+    // Gate on the DRIVER's own claim, not on `vaapi_h264_decode_available()`.
+    // That probe decodes a frame, so gating on it would mean a decoder
+    // regression makes this test skip and report green -- the test would
+    // vanish exactly when it should fail. Task 3's review rejected that
+    // circularity once already; it must not come back at every oracle.
+    match ghostframe_client_h264::vainfo_reports_h264_vld() {
+        Some(true) => {}
+        Some(false) => {
+            eprintln!("driver reports no H.264 VLD entrypoint; skipping");
+            return;
+        }
+        None => {
+            eprintln!("vainfo unavailable; cannot establish ground truth, skipping");
+            return;
+        }
     }
 
     let clip = gradient_clip(W, H, 8);
@@ -1608,9 +1620,21 @@ Add to `ghostframe-client-h264/tests/oracle_decode.rs`:
 /// rather than on an absent field.
 #[test]
 fn the_exported_dmabuf_is_linear_at_the_descriptors_layout() {
-    if !ghostframe_client_h264::vaapi_h264_decode_available() {
-        eprintln!("no VA-API H.264 decode here; skipping");
-        return;
+    // Gate on the DRIVER's own claim, not on `vaapi_h264_decode_available()`.
+    // That probe decodes a frame, so gating on it would mean a decoder
+    // regression makes this test skip and report green -- the test would
+    // vanish exactly when it should fail. Task 3's review rejected that
+    // circularity once already; it must not come back at every oracle.
+    match ghostframe_client_h264::vainfo_reports_h264_vld() {
+        Some(true) => {}
+        Some(false) => {
+            eprintln!("driver reports no H.264 VLD entrypoint; skipping");
+            return;
+        }
+        None => {
+            eprintln!("vainfo unavailable; cannot establish ground truth, skipping");
+            return;
+        }
     }
 
     let clip = gradient_clip(W, H, 3);
@@ -2720,9 +2744,21 @@ fn a_decoded_frame_lands_in_the_framebuffer() {
         eprintln!("no usable GPU; skipping");
         return;
     };
-    if !ghostframe_client_h264::vaapi_h264_decode_available() {
-        eprintln!("no VA-API H.264 decode here; skipping");
-        return;
+    // Gate on the DRIVER's own claim, not on `vaapi_h264_decode_available()`.
+    // That probe decodes a frame, so gating on it would mean a decoder
+    // regression makes this test skip and report green -- the test would
+    // vanish exactly when it should fail. Task 3's review rejected that
+    // circularity once already; it must not come back at every oracle.
+    match ghostframe_client_h264::vainfo_reports_h264_vld() {
+        Some(true) => {}
+        Some(false) => {
+            eprintln!("driver reports no H.264 VLD entrypoint; skipping");
+            return;
+        }
+        None => {
+            eprintln!("vainfo unavailable; cannot establish ground truth, skipping");
+            return;
+        }
     }
 
     let mut renderer = Renderer::new(&ctx, 640, 480, 3, &[], true).expect("renderer");
