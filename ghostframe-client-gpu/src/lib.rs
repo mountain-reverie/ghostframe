@@ -20,6 +20,7 @@ pub mod config;
 pub mod dirty;
 pub mod export;
 pub mod framebuffer;
+pub mod import;
 pub mod pipelines;
 pub mod renderer;
 pub mod ring;
