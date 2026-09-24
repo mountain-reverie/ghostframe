@@ -1739,6 +1739,7 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "ghostframe-client-core",
+ "ghostframe-client-h264",
  "ghostframe-protocol",
  "libc",
  "pollster",

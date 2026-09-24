@@ -16,6 +16,10 @@ edition = "2021"
 [dependencies]
 ghostframe-protocol = { path = "../ghostframe-protocol" }
 ghostframe-client-core = { path = "../ghostframe-client-core" }
+# Only for `DmabufPlanes`/`PlaneDesc` (see `src/import.rs`) -- this crate must
+# not link ffmpeg, so `test-support` (gradient_clip, vainfo_reports_h264_vld)
+# stays out of this dependency and out of the default feature set.
+ghostframe-client-h264 = { path = "../ghostframe-client-h264" }
 wgpu = { workspace = true }
 wgpu-hal = { workspace = true }
 ash = { workspace = true }
