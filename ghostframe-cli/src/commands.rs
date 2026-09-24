@@ -246,7 +246,7 @@ pub fn connect(host: String, port: u16, chord_prefix: String) -> Result<(), Comm
         hostname: default_hostname(),
         authkey: String::new(),
         state_dir: dir,
-        supports_h264: false,
+        supports_h264: true,
         indices_raw: false,
         n_export_buffers: 3,
         preferred_modifiers,

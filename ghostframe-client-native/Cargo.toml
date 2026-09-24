@@ -8,6 +8,7 @@ ghostframe-protocol = { path = "../ghostframe-protocol" }
 ghostframe-client-core = { path = "../ghostframe-client-core" }
 ghostframe-client-net = { path = "../ghostframe-client-net" }
 ghostframe-client-gpu = { path = "../ghostframe-client-gpu" }
+ghostframe-client-h264 = { path = "../ghostframe-client-h264" }
 ghostframe-tsnet = { path = "../ghostframe-tsnet" }
 libc = { workspace = true }
 thiserror = { workspace = true }

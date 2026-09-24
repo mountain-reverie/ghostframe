@@ -88,7 +88,11 @@ async fn showcase_presents_frames_under_weston_and_exits_cleanly() {
     eprintln!("[phase] starting headscale + ghostframe-server containers");
     let setup = setup_e2e_server(E2eServerSpec {
         test_pattern_args: "--solid-red",
-        extra_env: &[],
+        // Pin tile mode. Sessions start in H.264 (`io_bridge.rs:3435`), so
+        // once the CLI advertises the capability this test would silently
+        // become an H.264 test instead of the tile-path test it was written
+        // as. That is covered by `tests/h264.rs`; this one stays what it is.
+        extra_env: &[("GHOSTFRAME_TEST_FORCE_FRAME_MODE", "tile")],
         // The GPU under test is the CLIENT's (via the Wayland/dmabuf path);
         // keep the server on its CPU capture path, matching native_client.rs.
         gpu: false,
@@ -346,7 +350,11 @@ async fn measure_publish_frame_pacing() {
     eprintln!("[phase] starting headscale + ghostframe-server containers");
     let setup = setup_e2e_server(E2eServerSpec {
         test_pattern_args: "--spinner",
-        extra_env: &[],
+        // Pin tile mode. Sessions start in H.264 (`io_bridge.rs:3435`), so
+        // once the CLI advertises the capability this test would silently
+        // become an H.264 test instead of the tile-path test it was written
+        // as. That is covered by `tests/h264.rs`; this one stays what it is.
+        extra_env: &[("GHOSTFRAME_TEST_FORCE_FRAME_MODE", "tile")],
         gpu: false,
         webgpu: false,
         url_query_extra: "",
