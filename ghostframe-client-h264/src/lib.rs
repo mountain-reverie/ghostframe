@@ -10,6 +10,7 @@
 pub mod decoder;
 pub mod descriptor;
 pub mod probe;
+pub mod testclip;
 
 pub use descriptor::{DmabufPlanes, PlaneDesc};
 pub use probe::vaapi_h264_decode_available;

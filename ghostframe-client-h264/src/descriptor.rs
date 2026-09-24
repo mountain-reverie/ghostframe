@@ -22,7 +22,8 @@ pub struct DmabufPlanes {
     /// `vkFreeMemory`, so handing this one over directly double-closes it
     /// against the `AVFrame`'s own unref. The design imports the same dmabuf
     /// twice (luma and chroma planes), which would be two closes of one fd.
-    /// `import.rs` duplicates for exactly this reason.
+    /// The future importer (Task 6's `import.rs`) must `dup()` this fd for
+    /// exactly this reason.
     pub fd: i32,
     pub modifier: u64,
     /// DISPLAY dimensions (`AVFrame::width`/`height`), not the coded size.

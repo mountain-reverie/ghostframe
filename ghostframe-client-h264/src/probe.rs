@@ -14,47 +14,81 @@ use std::ptr;
 /// `ghostframe-lib/src/encoder/vaapi_device.rs`'s `VAAPI_DEVICE`.
 pub const RENDER_NODE: &str = "/dev/dri/renderD128";
 
-/// True when this machine can plausibly decode H.264 through VA-API.
+/// True when this machine can decode H.264 through VA-API.
 ///
-/// **This is a necessary condition, not a sufficient one, and Task 3 replaces
-/// it with a functional check.** `avcodec_find_decoder(AV_CODEC_ID_H264)`
-/// returns libavcodec's *software* decoder and is entirely independent of
-/// VA-API -- there is no `h264_vaapi` decoder, only an `h264` decoder with a
-/// VA-API hwaccel. So the strongest thing reachable without decoding a frame
-/// is: a VA-API device opens, AND libavcodec was built with a VA-API hwaccel
-/// for H.264. A driver whose H.264 profile is missing entirely (Mesa built
-/// without `video-codecs`, which several distributions shipped for years)
-/// still passes this.
+/// Decodes a 64x64 keyframe (embedded, see [`PROBE_CLIP`]) through VA-API and
+/// returns whether a hardware frame came out. This is the only check that
+/// actually proves the driver can do it: `avcodec_find_decoder` and
+/// `avcodec_get_hw_config` alone only prove libavcodec was *built* with a
+/// VA-API hwaccel for H.264, not that the driver has an H.264 decode profile
+/// -- Mesa built without `video-codecs` passes those checks and still fails
+/// here.
 ///
 /// That gap matters because sessions begin in H.264 mode, so a false positive
-/// is a black window rather than a degraded one. It is tolerable only because
-/// nothing advertises the capability until Task 10, by which point Task 3 has
-/// made this check functional.
+/// is a black window rather than a degraded one.
 ///
 /// Deliberately does NOT test whether the decoded surface can be imported
 /// into Vulkan -- that is a separate question (see the design doc §7), and
 /// conflating them would make an import bug look like missing hardware.
 pub fn vaapi_h264_decode_available() -> bool {
+    // Serializes the log-mute below: `av_log_set_level` is an unsynchronized
+    // global, so two concurrent probes (e.g. this crate's own test suite,
+    // which calls the probe from more than one test under `cargo test`'s
+    // default parallelism) can interleave save/save/restore/restore and
+    // strand the level at QUIET. Holding this for the probe's duration also
+    // means one probe briefly suppresses other threads' ffmpeg logging --
+    // an accepted cost, since the alternative is unsuppressable stderr noise
+    // on a path this design calls normal.
+    static LOG_MUTE: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    let _guard = LOG_MUTE.get_or_init(|| std::sync::Mutex::new(())).lock();
+
     // ffmpeg logs libva failures straight to stderr at its default level. On a
     // machine with no VA-API -- the outcome this whole design calls normal --
     // that puts an unstructured error line on the host application's stderr,
     // which a C host embedding this library cannot suppress. Quiet it for the
-    // duration of the probe and restore afterwards.
-    // SAFETY: `av_log_get_level`/`av_log_set_level` are plain global accessors.
-    let prior_log_level = unsafe {
-        let prior = ffi::av_log_get_level();
-        ffi::av_log_set_level(ffi::AV_LOG_QUIET);
-        prior
-    };
+    // duration of the probe and restore afterwards. `_restore` is a Drop
+    // guard rather than a manual restore-at-the-end: a panic inside
+    // `probe_inner` (or `probe_decodes_a_frame`, which now runs a real
+    // decode loop with more failure surface than the pointer-chasing this
+    // used to be) must not unwind past the restore and leave ffmpeg globally
+    // quiet for the rest of the process.
+    let _restore = QuietLogGuard::new();
     let verdict = probe_inner();
-    // SAFETY: as above; restores exactly what was read.
-    unsafe { ffi::av_log_set_level(prior_log_level) };
+    drop(_restore);
     match &verdict {
         Ok(()) => true,
         Err(e) => {
             tracing::info!(reason = %e, "H.264 will not be advertised");
             false
         }
+    }
+}
+
+/// RAII guard: mutes ffmpeg's global log level and restores the prior level
+/// on drop, including on unwind. See [`vaapi_h264_decode_available`] for why
+/// a bare save/restore pair is not unwind-safe.
+struct QuietLogGuard {
+    prior: libc::c_int,
+}
+
+impl QuietLogGuard {
+    fn new() -> Self {
+        // SAFETY: `av_log_get_level`/`av_log_set_level` are plain global
+        // accessors with no preconditions.
+        let prior = unsafe {
+            let prior = ffi::av_log_get_level();
+            ffi::av_log_set_level(ffi::AV_LOG_QUIET);
+            prior
+        };
+        QuietLogGuard { prior }
+    }
+}
+
+impl Drop for QuietLogGuard {
+    fn drop(&mut self) {
+        // SAFETY: as above; restores exactly what was read in `new`, even if
+        // we get here by unwinding out of `probe_inner`.
+        unsafe { ffi::av_log_set_level(self.prior) };
     }
 }
 
@@ -118,10 +152,43 @@ fn probe_inner() -> Result<(), H264Error> {
         let (methods, device_type) = unsafe { ((*cfg).methods, (*cfg).device_type) };
         let has_device_ctx = methods & ffi::AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as i32 != 0;
         if has_device_ctx && device_type == ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI {
-            return Ok(());
+            return probe_decodes_a_frame();
         }
         i += 1;
     }
+}
+
+/// A 64x64 gray H.264 keyframe, Annex-B, ~655 bytes. Regenerate with:
+///
+/// ```text
+/// ffmpeg -f lavfi -i color=c=gray:s=64x64:d=1 -frames:v 1 \
+///   -c:v libx264 -preset ultrafast -f h264 -y src/probe_clip.h264
+/// ```
+///
+/// Embedded rather than encoded at runtime so the probe does not depend on
+/// libx264 being present in the host's ffmpeg build, and costs no encode on
+/// the connect path.
+const PROBE_CLIP: &[u8] = include_bytes!("probe_clip.h264");
+
+/// Decode one frame through VA-API. The only check that actually proves the
+/// driver can do it.
+fn probe_decodes_a_frame() -> Result<(), H264Error> {
+    let mut decoder = crate::decoder::H264Decoder::new()?;
+    let mut frames = decoder.decode(PROBE_CLIP)?;
+    frames.extend(decoder.flush()?);
+    let frame = frames.first().ok_or_else(|| {
+        H264Error::VaapiUnavailable(
+            "VA-API accepted the stream but produced no frame (driver likely has no \
+             H.264 decode profile)"
+                .into(),
+        )
+    })?;
+    if frame.width() == 0 || frame.height() == 0 {
+        return Err(H264Error::VaapiUnavailable(
+            "decoded probe frame has zero extent".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -145,11 +212,30 @@ mod tests {
     /// answer there and entrench the very defect the probe exists to avoid.
     #[test]
     fn probe_agrees_with_the_driver() {
-        let vainfo = std::process::Command::new("vainfo").output();
+        // Named explicitly rather than letting vainfo pick its own display:
+        // bare `vainfo` need not open the same device the probe hardcodes
+        // (`RENDER_NODE`), so an unqualified invocation could establish
+        // ground truth against the wrong GPU on a multi-GPU box.
+        let vainfo = std::process::Command::new("vainfo")
+            .args(["--display", "drm", "--device", RENDER_NODE])
+            .output();
         let Ok(out) = vainfo else {
             eprintln!("vainfo not installed; cannot establish ground truth, skipping");
             return;
         };
+        if !out.status.success() {
+            // `Command::output()` returns `Ok` even when the child process
+            // exits non-zero -- e.g. no VA-API device at all, which prints
+            // nothing to stdout. Without this check, that failure silently
+            // reads as "driver reports no H.264 entrypoint" and asserts the
+            // probe says `false`, a spurious failure on a box where the
+            // probe legitimately succeeds by some other means.
+            eprintln!(
+                "vainfo exited with {:?}; cannot establish ground truth, skipping",
+                out.status
+            );
+            return;
+        }
         let text = String::from_utf8_lossy(&out.stdout);
         let driver_decodes_h264 = text
             .lines()
