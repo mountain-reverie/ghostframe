@@ -14,12 +14,26 @@ pub struct PlaneDesc {
 /// An NV12 dmabuf: one fd, luma plane, chroma plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DmabufPlanes {
-    /// Borrowed from the mapped `AVFrame`, which owns it. Do not close.
+    /// Borrowed from the mapped `AVFrame`, which owns it, and valid only while
+    /// that `MappedFrame` is alive.
+    ///
+    /// **An importer must `dup()` this before any call that takes ownership.**
+    /// `vkImportMemoryFdKHR` takes ownership: the fd is closed by
+    /// `vkFreeMemory`, so handing this one over directly double-closes it
+    /// against the `AVFrame`'s own unref. The design imports the same dmabuf
+    /// twice (luma and chroma planes), which would be two closes of one fd.
+    /// `import.rs` duplicates for exactly this reason.
     pub fd: i32,
     pub modifier: u64,
+    /// DISPLAY dimensions (`AVFrame::width`/`height`), not the coded size.
+    /// The alignment padding lives in `PlaneDesc::pitch`, which is why both
+    /// are carried separately: a 640-wide frame here has pitch 768.
     pub width: u32,
     pub height: u32,
     pub luma: PlaneDesc,
-    /// Half width, half height, two bytes per sample (U and V interleaved).
+    /// `width.div_ceil(2)` x `height.div_ceil(2)` samples, two bytes each (U
+    /// and V interleaved). `div_ceil`, not `/ 2`: this client is deliberately
+    /// tested at non-16-aligned resolutions, where truncation loses the last
+    /// chroma column.
     pub chroma: PlaneDesc,
 }

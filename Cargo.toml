@@ -88,11 +88,10 @@ pollster = { version = "=1.0.1" }
 # ffmpeg-next 9.0.0 — Rust bindings for FFmpeg (libavcodec, libavutil, libswscale)
 ffmpeg-next = { version = "=9.0.0" }
 
-# ffmpeg-sys-next — raw FFmpeg bindings, for the unsafe hwdevice/hwframe calls
-# ffmpeg-next doesn't expose (VA-API device/frame context setup). Unpinned
-# like ghostframe-lib's existing use (Cargo.toml:66 there); must resolve to
-# the same version ffmpeg-next 9.0.0 pulls in transitively.
-ffmpeg-sys-next = { version = "9.0.0" }
+# ffmpeg-sys-next 9.0.0 — raw FFmpeg bindings, for the unsafe hwdevice/hwframe
+# calls ffmpeg-next doesn't expose (VA-API device/frame context setup). Pinned
+# like every other entry in this table; must match ffmpeg-next's version.
+ffmpeg-sys-next = { version = "=9.0.0" }
 
 # clap 4.6.7 — latest stable 4.x as of 2026-09-22; derive-based CLI parsing
 # for ghostframe-cli.
