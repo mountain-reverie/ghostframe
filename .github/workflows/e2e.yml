@@ -363,17 +363,17 @@ jobs:
             | tee /tmp/ghostframe-probe/chromium-codecs.log
 
       # This job only ever invokes `--test e2e`, below. `ghostframe-e2e`
-      # also has three other integration-test *binaries* --
+      # also has four other integration-test *binaries* --
       # `tests/native_client.rs` (M1 acceptance), `tests/showcase.rs` (M2
-      # acceptance), and `tests/h264.rs` (M3 acceptance) -- and none of
-      # them is named here, or anywhere else in this file. That is
-      # deliberate, not an oversight: each needs a real GPU with VA-API and
-      # (for native_client.rs and h264.rs) the host's VKMS setup, none of
-      # which this runner has. Per this project's convention, the skip
-      # lives here where a workflow reader finds it, not as `#[ignore]` on
-      # the tests themselves -- see `ghostframe-client-gpu/README.md`'s
-      # test-target table for the full breakdown and how to run them
-      # locally.
+      # acceptance), `tests/h264.rs` (M3 acceptance), and `tests/eviction.rs`
+      # (M4a acceptance) -- and none of them is named here, or anywhere else
+      # in this file. That is deliberate, not an oversight: each needs a
+      # real GPU with VA-API and (for native_client.rs, h264.rs, and
+      # eviction.rs) the host's VKMS setup, none of which this runner has.
+      # Per this project's convention, the skip lives here where a workflow
+      # reader finds it, not as `#[ignore]` on the tests themselves -- see
+      # `ghostframe-client-gpu/README.md`'s test-target table for the full
+      # breakdown and how to run them locally.
       - name: Run e2e tests (VKMS-gated subset skipped)
         run: |
           set -o pipefail
