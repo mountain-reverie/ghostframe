@@ -838,6 +838,64 @@ Two things follow from that, not one:
 
 ---
 
+### 10.7 Mode transitions and resolution changes, measured
+
+§10 recorded a ~43.5 ms cost for the *first* H.264 frame of a session. The
+obvious follow-up question — the server flips between tile codecs and H.264 as
+the scene changes, so is that cost paid on every flip? — is answered here,
+because the difference between "once per session" and "once per scene change"
+is the difference between a startup hitch and a recurring stutter.
+
+**Mode re-entry does not pay it.** Three tile→H.264 transitions per run, two
+runs, 1920x1080:
+
+```
+steady state (p50)   decode 117-128us   map 435-787us    sum 553-950us
+re-entry (6 samples) decode 396-524us   map 1.9-2.9ms    sum 2.3-3.5ms
+```
+
+`H264Decoder::new()` fired exactly once per run and never on re-entry;
+`reset()` fired on every transition and is `avcodec_flush_buffers`, which keeps
+the codec context, the VA-API device context and the hardware frames pool. All
+three transitions cost the same, so there is no first-transition penalty. The
+elevated `map` on re-entry sits inside the *ordinary* steady-state p99 tail
+(which already reaches 3.8-4.0 ms), so it reads as normal `vaSyncSurface`
+jitter rather than a re-entry cost. Worst transition ≈ 21% of a 16.67 ms
+budget.
+
+**Resolution changes do pay something, and it lands in a different place.**
+1920x1080 → 1280x720 → 1920x1080, three runs:
+
+```
+resize (6 samples)   decode 2.6-4.9ms   map 31-384us     sum 2.8-5.2ms
+```
+
+20-40x steady state, and almost entirely inside `decode()` rather than the
+sync wait — which is what a hardware-frames-context reallocation inside
+`avcodec_send_packet` looks like when the SPS changes. Nothing in
+`Renderer::apply_event`'s `FrameDimensions` arm pre-empts or amortises it, and
+**revisiting a previously-seen resolution was not cheaper**, so ffmpeg caches
+nothing per-resolution: a decoder-per-resolution cache would have to be built
+deliberately.
+
+Worst observed ≈ 31% of budget, still inside one frame. Resolution changes are
+rare in practice (window reconfiguration, not classifier flapping), so a single
+3-5 ms hitch is unlikely to be visible. **The exception is a live interactive
+resize drag**, which can fire many `FrameDimensions` per second and would pay
+this repeatedly — that, not mode flapping, is the case worth watching.
+
+**If it ever needs fixing:** pre-create the hardware frames context at the
+session's negotiated maximum resolution inside `H264Decoder::new()`, folding
+the reallocation into the session-start cost that is already accepted and
+already worth warming. Not done here — everything measured stays under the
+frame budget.
+
+**Measurement caveat.** `gradient_clip` uses plain libx264 with B-frames, so a
+re-entry picture's sync lands two access units after the one that decoded it,
+and the harness walks the log forward to find it. Production sets
+`tune=zerolatency` (`h264_vaapi.rs:261`) and has no such reordering, so the
+attribution is harder in the test than in production, not easier.
+
 ## 11. Deferred, with the conditions
 
 **Software decode fallback.** Build it when a target machine is found that has no
