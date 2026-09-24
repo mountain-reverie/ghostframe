@@ -2432,6 +2432,30 @@ git commit -m "feat(gpu): NV12 -> RGBA shader and its CPU reference, full-range 
 
 ## Task 8: The pipeline, and Oracle 2 against the shader
 
+> **Two additions from Task 7's review, to fold into this task.**
+>
+> **(a) Nothing in CI parses any client shader.** naga only parses WGSL at
+> `create_shader_module` time, which happens only in GPU tests, which CI does
+> not run — so a syntax error in any of the eight files under `shaders/client/`
+> reaches master green. This is pre-existing and repo-wide, not something M3
+> introduced, and it is cheap to close: add a `#[cfg(test)]` test in
+> `ghostframe-client-gpu` that walks `shaders/client/*.wgsl`, runs
+> `naga::front::wgsl::parse_str` then `naga::valid::Validator::validate` on
+> each, and names the file in any failure. It needs no GPU, so CI's existing
+> `cargo test -p ghostframe-client-gpu --lib` picks it up. Enumerate the
+> directory rather than listing filenames, so a new shader is covered by
+> existing code. `naga` is already a transitive dependency via wgpu; pin the
+> same version wgpu resolves (`cargo tree -p ghostframe-client-gpu -i naga`).
+>
+> **(b) `full_range_luma_maps_to_the_full_grey_ramp` rests on one assertion.**
+> Its Y=0 and Y=255 endpoints pass under a limited-range matrix too — both
+> clamp — so only the mid-grey `127..=129` window discriminates, on a 1-LSB
+> margin. Add an assertion that cannot be satisfied by clamping: check a
+> mid-range luma against its exact expected value, or assert the slope between
+> two interior points (limited range scales by 255/219, which is a ~16% slope
+> error and unmissable). Leave the endpoints — they document intent.
+
+
 **Files:**
 - Create: `ghostframe-client-gpu/src/pipelines/h264_nv12.rs`, `ghostframe-client-gpu/tests/gpu_nv12_blit.rs`
 - Modify: `ghostframe-client-gpu/src/pipelines/mod.rs`
