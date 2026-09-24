@@ -16,9 +16,16 @@ edition = "2021"
 [dependencies]
 ghostframe-protocol = { path = "../ghostframe-protocol" }
 ghostframe-client-core = { path = "../ghostframe-client-core" }
-# Only for `DmabufPlanes`/`PlaneDesc` (see `src/import.rs`) -- this crate must
-# not link ffmpeg, so `test-support` (gradient_clip, vainfo_reports_h264_vld)
-# stays out of this dependency and out of the default feature set.
+# `DmabufPlanes`/`PlaneDesc` are the boundary type (see `src/import.rs`);
+# `src/renderer.rs` also drives `H264Decoder`/`HwFrame` directly for the
+# H.264 decode/blit path (Task 9). Both routes pull in ffmpeg transitively
+# through this dependency -- there is no ffmpeg-free build of this crate any
+# more, and there was not one even before Task 9: `ghostframe-client-h264`'s
+# `decoder.rs` is unconditional, not behind `test-support`. What
+# `test-support` (see `[dev-dependencies]` below) actually keeps out of the
+# default feature set is the ADDITIONAL encode-side surface -- `testclip`'s
+# libx264 encoder and `vainfo_reports_h264_vld` -- which is test-only and has
+# no reason to ship in a release build.
 ghostframe-client-h264 = { path = "../ghostframe-client-h264" }
 wgpu = { workspace = true }
 wgpu-hal = { workspace = true }
@@ -30,10 +37,11 @@ pollster = { workspace = true }
 
 [dev-dependencies]
 # `test-support` enables `gradient_clip` and `vainfo_reports_h264_vld`,
-# needed by `tests/gpu_h264_render.rs`. Additive only for test/bench
-# builds -- `[dependencies]` above stays feature-bare, so a release build of
-# this crate (and anything depending on it) never picks this up; see that
-# entry's own comment for why this crate must not link ffmpeg outside tests.
+# needed by `tests/gpu_h264_render.rs`. Still feature-gated and off by
+# default in `[dependencies]` above -- but see that entry's comment: since
+# Task 9, what stays out of a release build is the encode-side test helpers,
+# not ffmpeg linkage itself. Those stopped being the same question once
+# `renderer.rs` started calling `H264Decoder` unconditionally.
 ghostframe-client-h264 = { path = "../ghostframe-client-h264", features = ["test-support"] }
 proptest = "1"
 # So `tests/gpu_h264_render.rs` can print which import path

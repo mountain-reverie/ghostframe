@@ -1,4 +1,10 @@
-//! An access unit in, correct pixels in the framebuffer out.
+//! An access unit in, a plausible image in the framebuffer out.
+//!
+//! "Plausible", not "correct": this asserts wiring (something drew, luma
+//! and chroma both actually landed) rather than exact pixels. Task 8's Tier
+//! A/B oracles in `nv12_oracle_tests.rs` already cover the NV12->RGBA
+//! arithmetic bit-exactly against a real GPU target; re-deriving that here
+//! from a lossy H.264 clip would only add tolerance, not coverage.
 //!
 //! Requires a GPU and VA-API. Deliberately NOT named in any CI workflow.
 
@@ -59,6 +65,11 @@ fn a_decoded_frame_lands_in_the_framebuffer() {
             },
         );
     }
+    // libx264 defaults to B-frames, so the last access unit(s) fed above can
+    // still be buffered by reordering rather than decoded yet -- drain them
+    // so the assertions below see the whole clip, not however much of it
+    // happened to have already left the decoder.
+    renderer.finish_h264(&ctx);
     renderer.flush(&ctx);
 
     let pixels = renderer.debug_read_framebuffer(&ctx);
@@ -92,6 +103,19 @@ fn a_decoded_frame_lands_in_the_framebuffer() {
         spread > 32,
         "framebuffer is nearly uniform (max channel spread {spread}); a gradient clip \
          must produce a non-uniform framebuffer -- min={min:?} max={max:?}"
+    );
+
+    // Chroma varies too (see `gradient_clip`'s doc), so if it were dropped
+    // entirely -- or bound to the wrong texture slot -- R and B would track
+    // G exactly instead of diverging from it. This does not catch a U/V
+    // swap (both still diverge from G either way); it closes the
+    // chroma-not-wired-up-at-all hole the checks above cannot.
+    let chroma_diverges = pixels
+        .chunks_exact(4)
+        .any(|p| p[0].abs_diff(p[1]) > 16 || p[2].abs_diff(p[1]) > 16);
+    assert!(
+        chroma_diverges,
+        "R and B never diverge from G -- chroma is not reaching the framebuffer"
     );
 }
 
