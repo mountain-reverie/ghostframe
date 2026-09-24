@@ -494,69 +494,108 @@ pre-emptively. M1's CDF 5/3 episode is the precedent: a tolerance written on an
 unverified assumption was wide enough to hide the systematic drift the oracle
 existed to catch.
 
-### 9.1 That measurement, taken
+### 9.1 That measurement, taken — and then taken again, on real hardware
 
-Task 7's review enumerated the full cube — all 256³ (luma, cb, cr) triples
-across 3 channels, 50,331,648 channel-samples — rather than sampling. **224
-differ by exactly 1 LSB**, from two causes, and the tie-break rule is not one
-of them (the cube contains exactly one exact `.5` tie, and round-half-even and
-round-half-away agree on it).
+The first attempt measured the CPU reference against a *model* of the GPU and
+reported 224 divergences: 170 from a double-rounding defect in the reference,
+54 attributed to FMA contraction. The first number was right and that defect is
+fixed. **The second was model-vs-model noise, and the real divergence is four
+orders of magnitude larger.**
 
-**170 were a defect in the CPU reference and are fixed.** `(v * 255.0 + 0.5)
-as u8` evaluates `v * 255.0` in f32, which rounds; a product whose exact value
-is `129.4999998807907` becomes exactly `129.5` in f32, and `+ 0.5` then carries
-it to 130, where the hardware — rounding the exact product — yields 129. No
-tie-break policy reconciles that, because the CPU is rounding a value that is
-not a tie as though it were. Computing in f64 eliminates all 170. The idiom was
-inherited from `bgra_to_nv12.comp`, where it is correct: that shader *defines*
-the forward quantisation, whereas this function models the fixed-function unorm
-write, specified as `round(f × 255)` on the exact product.
+Two independently built harnesses — one feeding real NV12 textures, one feeding
+CPU-computed constants through a storage buffer with no textures at all —
+rendered the shipped shader to a real `Rgba8Unorm` target on this RX 480 and
+landed on the same count:
 
-**54 are FMA contraction and are irreducible.** naga 30.0.1 emits no
-`NoContraction` decoration, so nothing in the SPIR-V forbids RADV from fusing
-`y - c1*u` with `+ c2*v`. An alternative contraction order was measured and
-produces the same 54. No source-level arrangement lets the CPU predict the
-driver's choice.
+```
+total channel-samples : 50,331,648
+GPU != CPU reference  :  1,420,203  (2.8217%)
+worst |GPU - CPU|     :  1 LSB, always GPU = CPU - 1, never +1
+```
 
-They are concentrated in **4 chroma pairs out of 65,536** — `(58,147)`,
-`(75,24)`, `(205,190)`, `(222,62)` — with runs of consecutive luma values
-inside each. That distribution is why a small synthetic plane would pass today
-and fail the day someone widened the pattern, which is the worse outcome.
+**The mechanism, confirmed at the instruction level.** Same shader, same
+arithmetic, only the render-target format changed:
 
-**So the oracle asserts exact equality with one precisely-bounded exception:**
-a 1-LSB difference is permitted only where the exact product lies within
-`2e-5` of a half-integer, which is the FMA-reachable set and is enumerable up
-front. Every other difference fails. That keeps the gate able to catch what it
-exists for — a wrong matrix, wrong chroma indexing, a limited-range
-"correction" — all of which produce differences far outside that window, while
-not failing on arithmetic no implementation can make agree. The count is
-asserted too: a full-cube sweep must find no more than 54.
+```
+Rgba8Unorm:   v_cvt_pkrtz_f16_f32 v3, v3, v4   ; pack to f16, Round Toward Zero
+              exp mrt0 ... compr vm            ; COMPRESSED (fp16) export
+Rgba32Float:  exp mrt0 ...        vm           ; no packing
+```
 
-**`e2e_h264` — live server, H.264 frame mode, toleranced.**
-`GHOSTFRAME_TEST_FORCE_FRAME_MODE=h264` pins the classifier, so the test does not
-depend on the adaptation policy choosing H.264 on its own. Session entry already
-starts in H.264 (§6.1), so the first frames would arrive H.264-encoded anyway —
-but "anyway" is how a test becomes load-bearing on a default nobody meant to
-depend on. Pin it. The tolerance covers
-encoder quantisation, which is genuinely lossy and which no assertion can undo;
-the number goes in with the measured error beside it, not as a round figure
-chosen to make the test pass.
+On GCN/Polaris an 8-bit UNORM colour target uses the `SPI_SHADER_FP16_ABGR`
+export format, so ACO is *required* to pack fragment outputs to fp16 first, and
+that pack rounds toward zero. The ROP then converts fp16 → unorm8 with correct
+round-half-away:
 
-**Import unit test** — a known dmabuf imported and read back, so an import bug
-is distinguishable from a decode bug.
+```
+gpu_byte(v) = round_half_away( f16_round_toward_zero(v) * 255 )
+```
 
-**CI:** the VA-API and GPU tests are not named in any workflow, matching
-`native_client` and `showcase`. Runners have neither a GPU nor VA-API. Per the
-"CI exempts itself" rule the skip lives in the workflow's silence, never in an
-`#[ignore]` that would hide the test on developer machines too. `ghostframe-cli`
-and the pure-logic parts of the new crates *are* CI-visible and must be named
-explicitly — a new `tests/*.rs` is invisible until a workflow lists it.
+Zero mismatches against that model over the full cube. f16 ulp on `[0.5, 1)` is
+2⁻¹¹ = 0.1245 in units of 1/255, so truncation can only flip a rounding when the
+exact fractional part lands in `[0.50, 0.6245)`, and within that window it
+depends on how far below the next f16 the value sits. An earlier empirical
+sketch — "floor when the fraction is in [0.51, 0.61]" — fit the bulk and
+mispredicted individual samples.
 
-**Mutation check:** mutate out the R↔B channel assignment and confirm
-`oracle_nv12_blit` fails. That specific bug shipped once already (fixed in
-`847d870`, on the encoder side) and cost real debugging time.
+Ruled out by measurement rather than argument: dithering (each constant rendered
+at 8 y-positions, 0/63 position-dependent), sRGB, blending, MSAA, plain
+truncation, and round-to-even.
 
----
+**FMA contraction does not occur here.** ACO folds each multiply-add, but into
+`v_mad_f32` — the *non-fused* GFX8 MAD, which rounds the product before the add.
+A float-target comparison over 16,908,288 channel values found **0 bit
+differences** from non-contracted Rust f32. The premise (naga emits no
+`NoContraction`, so a driver *may* fuse) was right; the conclusion was not.
+GFX10+ dropped `v_mad_f32` for `v_fma_f32`, so this could become observable on
+another AMD generation — an argument for keeping the float tier below, not for
+pre-emptively tolerating anything.
+
+### 9.2 What the oracle asserts, and why not a tolerance
+
+**Tier A — render to `Rgba32Float`, assert f32 bit-equality** against the CPU
+reference's pre-quantisation channel values. Achievable exactly: 0 differences
+in 16,908,288 comparisons. This is the arithmetic gate, at full precision.
+
+**Tier B — render to the real `Rgba8Unorm` framebuffer, assert equality against
+`round_half_away(f16_rtz(v) * 255)`.** Also exact: 0 mismatches in 50,331,648.
+That quantiser lives **in the test**, labelled as a model of the AMD
+compressed-export path — not in `nv12_reference.rs`, which models a conformant
+write. On non-AMD hardware, relax only Tier B to the two-element set
+`{round(v), round(f16_rtz(v))}` — adjacent by construction, never a magnitude
+tolerance — and let Tier A carry arithmetic correctness. Tier B's remaining job
+is the plumbing: chroma `p/2` indexing, plane strides, orientation, all of which
+fail by enormous margins.
+
+**Why a blanket 1-LSB tolerance was rejected**, measured against the shipped
+matrix over the full cube:
+
+| substitution | differing | > 1 LSB | max |
+|---|---|---|---|
+| textbook BT.601 full-range inverse | 3.216% | **0.000%** | **1** |
+| BT.709 full-range inverse | 66.427% | 60.713% | 52 |
+| BT.601 **limited** range | 64.754% | 60.374% | 21 |
+| cb/cr swapped (indexing bug) | 86.181% | 85.318% | 255 |
+
+BT.709, limited range and chroma swaps are caught by anything. But the
+"helpful correction" to textbook BT.601 constants — the exact edit the shader
+header spends a paragraph warning against — **never exceeds 1 LSB**. A 1-LSB
+tolerance is precisely blind to the only mutation subtle enough to need a gate.
+An exact tier flags it on 1.6 million samples.
+
+### 9.3 Two consequences worth recording
+
+**This is in shipped output, not just tests.** `framebuffer.rs` is
+`Rgba8Unorm`, so every production H.264 blit carries this ≤1 LSB,
+always-downward bias. Invisible, not worth fixing — but recorded here as a
+characterised hardware property rather than resurfacing later as an unexplained
+discrepancy.
+
+**The other codecs are unaffected.** Solid, PalRle and Cdf53 write exact `k/255`
+values, and all 256 were verified to round-trip through f16-RTZ → unorm8 back to
+`k`. Only the H.264 blit produces the arbitrary intermediates that can land in
+the `[0.50, 0.6245)` window.
+
 
 ## 10. Measurement
 
