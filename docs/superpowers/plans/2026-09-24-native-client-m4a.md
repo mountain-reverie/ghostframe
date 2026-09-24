@@ -798,8 +798,16 @@ failure this repo has already had once.
 The routing work is therefore already done by Task 4's `Event::Evicted`.
 What is left is to carry it across the wasm boundary and render it.
 
+> **Step 3 below is already done.** Task 4 had to add `WasmEvent::Evicted`
+> and the `From<&Event>` arm to keep the workspace compiling — two other
+> crates match `Event` exhaustively (`client-gpu/src/renderer.rs::apply_event`
+> enables `wildcard_enum_match_arm`, and `boundary.rs` itself). Task 4's
+> follow-up changes the payload from `String` to `u8` via
+> `EvictionReason::to_byte()`. **Verify that is in place rather than
+> re-adding it**, then do the TS side.
+
 **Files:**
-- Modify: `ghostframe-client-wasm/src/boundary.rs`
+- Verify (done in Task 4): `ghostframe-client-wasm/src/boundary.rs`
 - Modify: `ghostframe-web-client/src/main.ts`
 - Create: `ghostframe-web-client/tests/eviction.test.ts`
 
