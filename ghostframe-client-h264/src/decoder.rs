@@ -30,6 +30,53 @@ impl HwFrame {
         // SAFETY: as above.
         unsafe { (*self.frame).height as u32 }
     }
+
+    /// Map this hardware surface to a DRM_PRIME dmabuf description.
+    ///
+    /// The returned [`MappedFrame`] owns the mapping; `planes.fd` is valid
+    /// exactly as long as it lives, and must not be closed by the caller.
+    pub fn map_dmabuf(&self) -> Result<MappedFrame, H264Error> {
+        // SAFETY: `self.frame` is a live VAAPI frame owned by `self` for the
+        // duration of this call. `drm` is a fresh allocation freed on every
+        // error path below; on success ownership passes to `MappedFrame`,
+        // which frees it exactly once in its own `Drop`.
+        unsafe {
+            let mut drm = ffi::av_frame_alloc();
+            if drm.is_null() {
+                return Err(H264Error::Ffmpeg("av_frame_alloc failed".into()));
+            }
+            (*drm).format = ffi::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
+            let ret = ffi::av_hwframe_map(
+                drm,
+                self.frame,
+                ffi::AV_HWFRAME_MAP_READ as i32 | ffi::AV_HWFRAME_MAP_DIRECT as i32,
+            );
+            if ret < 0 {
+                ffi::av_frame_free(&mut drm);
+                return Err(H264Error::Ffmpeg(format!(
+                    "av_hwframe_map: {}",
+                    ffmpeg_next::Error::from(ret)
+                )));
+            }
+            let desc = (*drm).data[0] as *const ffi::AVDRMFrameDescriptor;
+            if desc.is_null() {
+                ffi::av_frame_free(&mut drm);
+                return Err(H264Error::Descriptor(
+                    "mapped frame has no descriptor".into(),
+                ));
+            }
+            // SAFETY: `desc` is non-null and was just populated by
+            // `av_hwframe_map` above; it stays live for as long as `drm`
+            // does, which outlives this call.
+            match crate::DmabufPlanes::from_descriptor(&*desc, self.width(), self.height()) {
+                Ok(planes) => Ok(MappedFrame { drm, planes }),
+                Err(e) => {
+                    ffi::av_frame_free(&mut drm);
+                    Err(e)
+                }
+            }
+        }
+    }
 }
 
 impl Drop for HwFrame {
@@ -37,6 +84,31 @@ impl Drop for HwFrame {
         // SAFETY: `frame` was allocated by `av_frame_alloc` and is dropped
         // exactly once here.
         unsafe { ffi::av_frame_free(&mut self.frame) };
+    }
+}
+
+/// A hardware frame mapped to DRM_PRIME. Holds the mapped `AVFrame` alive,
+/// because the fd inside [`crate::DmabufPlanes`] is a borrow into it: ffmpeg
+/// closes the dmabuf fd when the mapped frame is unrefed, so `planes.fd`
+/// is valid only for as long as this `MappedFrame` lives. Dropping this
+/// while `planes` is still held elsewhere leaves that fd dangling -- there
+/// is nothing in the type system stopping a caller from copying `planes`
+/// out and using it after `self` is gone, so that discipline is on the
+/// caller, and is the whole reason this type is separate from `HwFrame`
+/// rather than a method that returns `DmabufPlanes` alone.
+pub struct MappedFrame {
+    drm: *mut ffi::AVFrame,
+    pub planes: crate::DmabufPlanes,
+}
+
+// SAFETY: exclusive ownership of `drm`, freed exactly once in `Drop`.
+unsafe impl Send for MappedFrame {}
+
+impl Drop for MappedFrame {
+    fn drop(&mut self) {
+        // SAFETY: allocated by `av_frame_alloc` in `map_dmabuf`, dropped
+        // exactly once here.
+        unsafe { ffi::av_frame_free(&mut self.drm) };
     }
 }
 
@@ -182,12 +254,35 @@ impl H264Decoder {
             Ok(true) => Vec::new(),
             Ok(false) => {
                 let out = self.drain()?;
-                if !self.send_packet(au)? {
-                    return Err(H264Error::Ffmpeg(
-                        "send_packet: decoder still full after drain-and-retry".into(),
-                    ));
+                match self.send_packet(au) {
+                    Ok(true) => out,
+                    Ok(false) => {
+                        // Frames drained above are about to be discarded
+                        // along with the error below -- `Result` can't
+                        // carry both. Same reasoning as the hard-error arm
+                        // just below: log rather than let them vanish
+                        // silently.
+                        if !out.is_empty() {
+                            tracing::warn!(
+                                count = out.len(),
+                                "discarding frames drained during a still-full \
+                                 drain-and-retry"
+                            );
+                        }
+                        return Err(H264Error::Ffmpeg(
+                            "send_packet: decoder still full after drain-and-retry".into(),
+                        ));
+                    }
+                    Err(e) => {
+                        if !out.is_empty() {
+                            tracing::warn!(
+                                count = out.len(),
+                                "discarding frames drained before a hard resend error"
+                            );
+                        }
+                        return Err(e);
+                    }
                 }
-                out
             }
             Err(e) => {
                 // The send failed outright, but frames the decoder finished
@@ -247,17 +342,69 @@ impl H264Decoder {
     /// `avcodec_flush_buffers` means the opposite thing (discard state and
     /// continue), and `reset` below is the wrapper for that.
     pub fn finish(&mut self) -> Result<Vec<HwFrame>, H264Error> {
-        // SAFETY: a null packet is ffmpeg's documented end-of-stream signal.
-        unsafe {
-            let ret = ffi::avcodec_send_packet(self.ctx, ptr::null());
-            if ret < 0 && ret != ffi::AVERROR_EOF {
-                return Err(H264Error::Ffmpeg(format!(
-                    "send_packet(NULL): {}",
-                    ffmpeg_next::Error::from(ret)
-                )));
+        let mut out = match self.send_eof() {
+            Ok(true) => Vec::new(),
+            Ok(false) => {
+                // Same condition `decode()`'s `send_packet` reports as
+                // `Ok(false)`: the decoder's internal buffer is full and the
+                // EOF signal must be resent after a drain. In this crate's
+                // own tests it never fires -- every call site drains after
+                // every `decode()` before reaching `finish()` -- but nothing
+                // about the API guarantees a caller does that, and this is
+                // the one place in the file that used to treat EAGAIN as a
+                // hard error instead of distinguishing it, which is the
+                // whole theme here.
+                let out = self.drain()?;
+                match self.send_eof() {
+                    Ok(true) => out,
+                    Ok(false) => {
+                        if !out.is_empty() {
+                            tracing::warn!(
+                                count = out.len(),
+                                "discarding frames drained during a still-full finish retry"
+                            );
+                        }
+                        return Err(H264Error::Ffmpeg(
+                            "send_packet(NULL): decoder still full after drain-and-retry".into(),
+                        ));
+                    }
+                    Err(e) => {
+                        if !out.is_empty() {
+                            tracing::warn!(
+                                count = out.len(),
+                                "discarding frames drained before a hard finish-retry error"
+                            );
+                        }
+                        return Err(e);
+                    }
+                }
             }
+            Err(e) => return Err(e),
+        };
+        out.extend(self.drain()?);
+        Ok(out)
+    }
+
+    /// Send the end-of-stream signal (a null packet).
+    ///
+    /// `Ok(false)` means `EAGAIN` -- the same condition [`Self::send_packet`]
+    /// reports: the decoder's internal buffer is full and the caller must
+    /// drain before resending. Split out from [`Self::finish`] because
+    /// ffmpeg's null-packet EOF signal takes no `AVPacket*` for this crate
+    /// to reset afterwards, unlike a real access unit.
+    fn send_eof(&mut self) -> Result<bool, H264Error> {
+        // SAFETY: a null packet is ffmpeg's documented end-of-stream signal.
+        let ret = unsafe { ffi::avcodec_send_packet(self.ctx, ptr::null()) };
+        if ret == ffi::AVERROR(libc::EAGAIN) {
+            return Ok(false);
         }
-        self.drain()
+        if ret < 0 && ret != ffi::AVERROR_EOF {
+            return Err(H264Error::Ffmpeg(format!(
+                "send_packet(NULL): {}",
+                ffmpeg_next::Error::from(ret)
+            )));
+        }
+        Ok(true)
     }
 
     /// Discard buffered state and continue decoding -- ffmpeg's
@@ -398,5 +545,41 @@ mod tests {
         }
         frames += dec.finish().expect("finish after reset").len();
         assert!(frames > 0, "decoder produced nothing after reset");
+    }
+
+    /// The real descriptor from real hardware. Records the modifier in the
+    /// failure message so a tiled surface names itself rather than showing
+    /// up later as corrupted pixels.
+    #[test]
+    fn maps_a_decoded_frame_to_a_dmabuf() {
+        if skip_without_vaapi() {
+            return;
+        }
+        let clip = gradient_clip(640, 480, 3);
+        let mut dec = H264Decoder::new().expect("open decoder");
+        let mut mapped = 0;
+        for au in &clip {
+            for frame in dec.decode(au).expect("decode") {
+                let m = frame.map_dmabuf().expect("map to dmabuf");
+                assert!(m.planes.fd >= 0, "dmabuf fd must be valid");
+                assert_eq!(m.planes.width, 640);
+                assert_eq!(m.planes.height, 480);
+                assert!(
+                    m.planes.luma.pitch >= 640,
+                    "luma pitch {} is narrower than the frame",
+                    m.planes.luma.pitch
+                );
+                eprintln!(
+                    "[m3] modifier=0x{:016x} luma(off={},pitch={}) chroma(off={},pitch={})",
+                    m.planes.modifier,
+                    m.planes.luma.offset,
+                    m.planes.luma.pitch,
+                    m.planes.chroma.offset,
+                    m.planes.chroma.pitch
+                );
+                mapped += 1;
+            }
+        }
+        assert!(mapped > 0, "no frame was mapped");
     }
 }

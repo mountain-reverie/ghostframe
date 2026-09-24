@@ -10,19 +10,15 @@ libc = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
-[dev-dependencies]
-# Enables the `testclip` feature for this crate's own unit tests
-# (decoder::tests uses gradient_clip). A crate depending on itself as a
-# dev-dependency is a normal Cargo idiom for turning on an optional feature
-# only for test/bench builds. Any OTHER crate that needs gradient_clip from
-# its own tests (Tasks 5, 8, 9: client-gpu, e2e) must do the same thing --
-# add this crate under its own [dev-dependencies] with
-# `features = ["testclip"]` -- since the module is gated behind the feature
-# specifically so it can never ship in a release build of a production
-# crate by accident.
-ghostframe-client-h264 = { path = ".", features = ["testclip"] }
-
 [features]
 # Gates `testclip`: a synthetic-clip encoder with nine panicking paths that
 # exists only to feed tests and oracles. Not on by default.
+#
+# This crate's own tests reach `testclip` through `#[cfg(any(test, feature =
+# "testclip"))]` in lib.rs, with no dev-dependency needed. Any OTHER crate
+# that needs `gradient_clip` from its own tests (Tasks 5, 8, 9: client-gpu,
+# e2e) enables this feature the normal way -- add this crate under its own
+# `[dev-dependencies]` with `features = ["testclip"]` -- since the module is
+# gated behind the feature specifically so it can never ship in a release
+# build of a production crate by accident.
 testclip = []

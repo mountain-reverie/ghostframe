@@ -10,13 +10,19 @@
 pub mod decoder;
 pub mod descriptor;
 pub mod probe;
-// Behind a feature, not `#[cfg(test)]`: the oracle in `ghostframe-e2e` and
-// `ghostframe-client-gpu`'s tests need `gradient_clip` too, from a different
-// crate's test build, where `#[cfg(test)]` on the defining crate would never
-// be active. A cargo feature is the mechanism that reaches across the crate
-// boundary while still keeping nine panicking paths out of a release build
-// of this production crate by default.
-#[cfg(feature = "testclip")]
+// `cfg(test)` covers this crate's own unit tests (decoder::tests uses
+// `gradient_clip`) without a self-referencing dev-dependency on the
+// `testclip` feature -- that idiom compiled the lib twice under
+// `--all-targets` and let `crate::H264Error` and `ghostframe_client_h264::
+// H264Error` collide as distinct types.
+//
+// The `testclip` feature stays for everyone else: the oracle in
+// `ghostframe-e2e` and `ghostframe-client-gpu`'s tests need `gradient_clip`
+// too, from a different crate's test build, where `#[cfg(test)]` on the
+// defining crate would never be active. A cargo feature is the mechanism
+// that reaches across the crate boundary while still keeping nine panicking
+// paths out of a release build of this production crate by default.
+#[cfg(any(test, feature = "testclip"))]
 pub mod testclip;
 
 pub use descriptor::{DmabufPlanes, PlaneDesc};
