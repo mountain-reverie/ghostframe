@@ -398,7 +398,23 @@ pub fn run_window_loop(
                     }
                 }
                 ClientEvent::Disconnected { reason } => {
-                    return Err(CommandError::Message(format!("disconnected: {reason}")));
+                    // Exit 0: being displaced by another client is an
+                    // expected outcome, not a failure. A non-zero code
+                    // would make an ordinary hand-off look like a crash to
+                    // any supervisor or script wrapping this binary.
+                    //
+                    // `ClientEvent::Disconnected` is shared with generic
+                    // connection loss (`ClientNetEvent::ConnectionLost`) --
+                    // there is no separate variant for "the server told us
+                    // why", by design (see `net_thread::host_event_for`) --
+                    // so this now treats every disconnect as a clean exit,
+                    // not only an eviction. A real network failure prints
+                    // the same way an ordinary hand-off does; distinguishing
+                    // them would need a reason string a caller can match on
+                    // reliably, which this does not attempt to provide.
+                    tracing::info!(%reason, "session ended by the server");
+                    println!("ghostframe: disconnected — {reason}");
+                    return Ok(());
                 }
                 ClientEvent::Error { message } => {
                     return Err(CommandError::Message(message));

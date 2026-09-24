@@ -163,6 +163,63 @@ fn sentinel_emits_frame_dimensions() {
 }
 
 #[test]
+fn an_eviction_datagram_becomes_an_event() {
+    let mut core = test_core();
+    let dg = ghostframe_protocol::eviction::build_eviction_datagram(
+        ghostframe_protocol::eviction::EvictionReason::DisplacedByNewSession,
+    );
+
+    let events = core.handle_datagram(&dg, 1_000);
+
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::Evicted {
+                reason: ghostframe_protocol::eviction::EvictionReason::DisplacedByNewSession
+            }
+        )),
+        "an eviction datagram must surface as an event, not be silently \
+         dropped as an unknown tile: got {events:?}"
+    );
+}
+
+#[test]
+fn an_eviction_datagram_is_not_acked_and_leaves_no_assembly_state() {
+    let mut core = test_core();
+    let dg = ghostframe_protocol::eviction::build_eviction_datagram(
+        ghostframe_protocol::eviction::EvictionReason::DisplacedByNewSession,
+    );
+
+    let _ = core.handle_datagram(&dg, 1_000);
+
+    // It must not be ACKed as though it were tile content: drive the ACK
+    // batcher's own deadline and confirm nothing is emitted.
+    if let Some(t) = core.poll_timeout() {
+        let _ = core.on_timeout(t);
+    }
+    let mut saw_ack = false;
+    while let Some(out) = core.poll_transmit(2_000) {
+        if let PollOutput::Datagram(b) = out {
+            if b.first() == Some(&ghostframe_protocol::ack::ACK_BATCH_MSG_TYPE) {
+                saw_ack = true;
+            }
+        }
+    }
+    assert!(
+        !saw_ack,
+        "an eviction notice must not be ACKed as tile content"
+    );
+
+    // And it must not fall through into tile assembly as a Codec::Skip tile
+    // at the eviction sentinel coordinates (254, 254).
+    let evs = core.handle_datagram(&dg, 2_000);
+    assert!(
+        !evs.iter().any(|e| matches!(e, Event::TileReady { .. })),
+        "eviction sentinel must never reach tile assembly: {evs:?}"
+    );
+}
+
+#[test]
 fn cdf53_ack_deferred_until_prevalidation() {
     let mut core = test_core();
 

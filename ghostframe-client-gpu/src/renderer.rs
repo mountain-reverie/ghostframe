@@ -322,6 +322,11 @@ impl Renderer {
                 }
                 self.palrle.upload_palette(&ctx.queue, *palette_id, &full);
             }
+            Event::Evicted { .. } => {
+                // Terminal: the session is going away and the net thread
+                // separately surfaces this to the host as
+                // `ClientEvent::Disconnected`. Nothing left to paint.
+            }
         }
     }
 

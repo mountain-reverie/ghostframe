@@ -57,6 +57,22 @@ pub enum WasmEvent {
         /// `DecodeErrorCode` discriminant, 1..=10.
         code: u8,
     },
+    /// The server has dropped this session and said why. Terminal: no
+    /// further frames will arrive.
+    ///
+    /// Mirrors `ghostframe_client_core::Event::Evicted` so this crate keeps
+    /// compiling against `Event`'s full variant set (this file has no
+    /// wildcard arm -- see the module doc's rationale for the other
+    /// variants). Surfacing this to the user in the browser UI is web-client
+    /// scope, not this boundary crate's.
+    Evicted {
+        /// `Debug`-formatted `ghostframe_protocol::eviction::EvictionReason`,
+        /// e.g. `"DisplacedByNewSession"` or `"Unknown(122)"` -- matches the
+        /// native client's `ClientEvent::Disconnected` reason string
+        /// (`net_thread::host_event_for`), so the two consumers agree on
+        /// what the reason looks like.
+        reason: String,
+    },
 }
 
 /// Mirror of `TileData`. Serialised `#[serde(tag = "codec")]`, so JS sees
@@ -176,6 +192,9 @@ impl From<&Event> for WasmEvent {
                 tile_x: *tile_x,
                 tile_y: *tile_y,
                 code: *code as u8,
+            },
+            Event::Evicted { reason } => WasmEvent::Evicted {
+                reason: format!("{reason:?}"),
             },
         }
     }

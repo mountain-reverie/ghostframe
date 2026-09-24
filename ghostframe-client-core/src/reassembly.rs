@@ -87,8 +87,17 @@ impl ClientCore {
         // loss_tracker.onDatagram (main.ts:1105).
         self.loss_tracker.on_datagram(now_us);
 
-        let is_sentinel =
+        let is_frame_dims_sentinel =
             th.tile_x == FRAME_DIMENSIONS_SENTINEL_X && th.tile_y == FRAME_DIMENSIONS_SENTINEL_Y;
+        // Eviction notices use their own sentinel coordinates (0xFE, 0xFE),
+        // distinct from the frame-dimensions sentinel (0xFF, 0xFF) -- see
+        // `ghostframe_protocol::eviction`. Folded into `is_sentinel` so an
+        // eviction notice is neither ACKed as tile content (below) nor
+        // treated as a `Codec::Skip` tile at (254, 254) that falls through
+        // into assembly.
+        let is_eviction_sentinel = th.tile_x == ghostframe_protocol::eviction::EVICTION_SENTINEL_X
+            && th.tile_y == ghostframe_protocol::eviction::EVICTION_SENTINEL_Y;
+        let is_sentinel = is_frame_dims_sentinel || is_eviction_sentinel;
 
         // ACK on receipt unless sentinel or Cdf53 (main.ts:1118-1145).
         if !is_sentinel && th.codec != Codec::Cdf53 {
@@ -169,15 +178,24 @@ impl ClientCore {
             return;
         }
 
-        // Frame-dimensions sentinel (0xFF, 0xFF) with >= 8-byte payload.
-        // main.ts:1211-1222. Sentinels are always single-fragment (Skip
-        // codec, 8-byte payload), so they are handled inline here and never
-        // reach the assembly/finish path.
+        // Frame-dimensions sentinel (0xFF, 0xFF) with >= 8-byte payload, and
+        // eviction sentinel (0xFE, 0xFE) with a 1-byte payload. main.ts:
+        // 1211-1222 for the frame-dimensions half. Both are always
+        // single-fragment, so they are handled inline here and never reach
+        // the assembly/finish path.
         if is_sentinel {
-            if payload.len() >= 8 {
-                let width = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                let height = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
-                events.push(Event::FrameDimensions { width, height });
+            if is_frame_dims_sentinel {
+                if payload.len() >= 8 {
+                    let width =
+                        u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                    let height =
+                        u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                    events.push(Event::FrameDimensions { width, height });
+                }
+            } else if is_eviction_sentinel {
+                if let Some(reason) = ghostframe_protocol::eviction::parse_eviction(bytes) {
+                    events.push(Event::Evicted { reason });
+                }
             }
             return;
         }
