@@ -16,24 +16,29 @@
 //!
 //! `vkAllocateMemory` with `VkImportMemoryFdInfoKHR` "transfers ownership of
 //! the file descriptor from the application to the Vulkan implementation"
-//! (`VK_KHR_external_memory_fd`). That is not a lazily-deferred transfer on
-//! this driver: measured here, RADV/amdgpu closes the exact fd number passed
-//! in synchronously, inside the `vkAllocateMemory` call that imports it (a
-//! DRM PRIME import dups the buffer at the kernel level and the userspace fd
-//! is done). Holding onto the duplicated fd in an `OwnedFd` field past that
-//! point -- as if `ImportedNv12` still owned it -- means its `Drop` later
-//! calls `close()` on an fd the driver already closed, which Rust's
-//! `OwnedFd` treats as a double-close and aborts the process
-//! (`std::os::fd::owned`'s `debug_assert_fd_is_open`). That is exactly what
-//! this module's first working version did, and how this was found. So the
-//! dup'd fd is `mem::forget`-ten immediately after a successful
-//! `allocate_memory`, not stored.
+//! (`VK_KHR_external_memory_fd`). That is the whole rule, unconditionally,
+//! for every driver: once that call returns success, this process must never
+//! call `close()` on that fd again. *When* the implementation actually
+//! closes it -- synchronously inside the call, lazily at `vkFreeMemory`, or
+//! never observably at all -- is not specified and not ours to depend on.
+//! Code here must treat the fd as gone the instant the call succeeds, full
+//! stop, regardless of what any particular driver happens to do.
+//!
+//! This was found on RADV, where the close is synchronous inside
+//! `vkAllocateMemory`, so holding the duplicated fd in an `OwnedFd` field --
+//! as if `ImportedNv12` still owned it -- made its `Drop` call `close()` on
+//! an fd already closed, which Rust's `OwnedFd` treats as a double-close and
+//! aborts the process (`std::os::fd::owned`'s `debug_assert_fd_is_open`).
+//! On a driver that defers the close, the same bug would be silent -- which
+//! is worse. So the dup'd fd's ownership is handed to the Vulkan
+//! implementation (`OwnedFd::into_raw_fd`, discarding the raw value)
+//! immediately after a successful `allocate_memory`, not stored.
 
 use crate::wgpu_ctx::WgpuContext;
 use crate::GpuError;
 use ash::vk;
 use ghostframe_client_h264::{DmabufPlanes, PlaneDesc};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 
 /// The two textures an NV12 dmabuf becomes.
 pub struct ImportedNv12 {
@@ -98,6 +103,19 @@ pub fn import_nv12(ctx: &WgpuContext, planes: &DmabufPlanes) -> Result<ImportedN
                  INVALID (unspecified) can be imported"
             )));
         }
+        // KNOWN GAP, not yet closed: a real tiled modifier on an adapter
+        // that DOES have `VK_EXT_image_drm_format_modifier` falls through to
+        // here and takes the same `create_linear_image` path as LINEAR/
+        // INVALID below -- there is no
+        // `VkImageDrmFormatModifierExplicitCreateInfoEXT` branch that would
+        // create a `DRM_FORMAT_MODIFIER_EXT`-tiled image for it. A tiled
+        // buffer would therefore be misimported as linear, and `check_pitch`
+        // may or may not catch it (a tiled layout's per-subresource layout
+        // query has different semantics than a linear one's). Inherited
+        // verbatim from the plan; no hardware in this project exposes the
+        // extension, so it has never been exercised. A future milestone that
+        // targets such hardware must add that branch before trusting this
+        // path.
         _ => {}
     }
 
@@ -224,6 +242,23 @@ fn bind_and_wrap(
         GpuError::Vulkan("no memory type can back this dmabuf and both plane images".to_string())
     })?;
 
+    // The luma image binds at `planes.luma.offset`, which is 0 in every
+    // shape this crate produces today (`DmabufPlanes::from_descriptor`
+    // always puts luma first) -- so this check never fires in practice, and
+    // 0 is trivially a multiple of any alignment. It stays anyway: nothing
+    // in the type enforces that offset is 0 (the `gpu_import.rs` test
+    // builds a `DmabufPlanes` by hand, and a future two-object export could
+    // do the same), and Vulkan's alignment rule applies to every plane
+    // binding, not just the conventionally-nonzero one. Cheap to check, and
+    // the alternative -- an obscure `bind_image_memory` failure -- is
+    // exactly what this same guard on the chroma plane exists to avoid.
+    if !planes.luma.offset.is_multiple_of(luma_req.alignment) {
+        return Err(GpuError::Vulkan(format!(
+            "luma plane offset {} is not a multiple of the required alignment {}",
+            planes.luma.offset, luma_req.alignment
+        )));
+    }
+
     // The chroma image binds at a nonzero offset into the same allocation,
     // which Vulkan only permits at a multiple of its alignment.
     if !planes.chroma.offset.is_multiple_of(chroma_req.alignment) {
@@ -255,11 +290,11 @@ fn bind_and_wrap(
         .map_err(|e| GpuError::Vulkan(format!("allocate_memory (import): {e}")))?;
 
     // Ownership of `fd` just passed to the Vulkan implementation (module
-    // doc: "the imported fd is not ours to close"). `mem::forget` releases
-    // it from `OwnedFd`'s bookkeeping without running `close()` on it --
-    // closing it here would be a double-close, since RADV already closed
-    // this exact fd number as part of the `allocate_memory` call above.
-    std::mem::forget(fd);
+    // doc: "the imported fd is not ours to close"). `into_raw_fd` names
+    // that handover directly -- "transfers ownership of the underlying
+    // file descriptor to the caller" -- and discarding its return value
+    // is what stops `OwnedFd`'s destructor from running `close()` on it.
+    let _ = fd.into_raw_fd();
 
     // SAFETY: images and memory are live and sized for each other.
     unsafe { device.bind_image_memory(luma, memory, planes.luma.offset) }.map_err(|e| {
