@@ -436,9 +436,52 @@ cargo test -p ghostframe-lib --lib evicts
 
 Expected: `a_second_hello_evicts_the_incumbent` FAILS (both sessions still present). The other two should already pass — they assert behaviour that exists — which is fine and worth noting: they are regression guards, not drivers.
 
-- [ ] **Step 3: Implement eviction**
+- [ ] **Step 3: Replace the connect-time prune with HELLO-keyed eviction**
 
-In `apply_hello`, before applying capabilities:
+> **This supersedes what Task 3 originally said.** `io_bridge.rs:5513-5529`
+> already prunes every other session whenever a new QUIC connection is
+> established — before any HELLO. Two consequences, both found during the
+> Task 1 review:
+>
+> 1. Eviction keyed on HELLO would rarely deliver its notice, because the
+>    incumbent's session is already gone by the time the newcomer's HELLO
+>    arrives. Unit tests calling `apply_hello` directly would pass while the
+>    e2e test in Task 8 failed.
+> 2. Design §2's security property is *already* violated: a bare QUIC
+>    connection displaces an established session today.
+>
+> Decision (user-approved): **delete the connect-time prune** and let
+> HELLO-keyed eviction do the work. A genuinely dead old connection still
+> gets cleaned up — quinn's idle timeout produces `ConnectionLost`, which
+> routes through `forget_session`. The prune was an immediacy optimisation;
+> we keep immediacy in the normal case (the newcomer sends HELLO) and fall
+> back to idle timeout for connections that never identify themselves.
+
+Delete the `stale` collection and its loop at `io_bridge.rs:5513-5529`.
+
+**Do not lose the emitter-cache clear.** That block ends with
+`self.reliable_emitter.clear_cache()`, and its comment explains why: the
+emitter's cache otherwise inherits thousands of un-ACKable pending entries
+from the old session and floods the link. That clear must move into the
+eviction path — a displaced session's pending entries are exactly as
+un-ACKable. Put it in `evict_session`, and say in a comment that it moved
+from the connect-time prune and why.
+
+Replace the deleted block with a comment recording what used to be there, so
+the next reader does not reintroduce it:
+
+```rust
+                    // No stale-session prune here any more. It used to drop
+                    // every other session on a new QUIC connection, which
+                    // displaced an incumbent before it could be told why --
+                    // and let a connection that never identified itself kill
+                    // a working session. Eviction is keyed on HELLO instead
+                    // (see `apply_hello`); a dead connection that never
+                    // reconnects is reaped by quinn's idle timeout through
+                    // `Event::ConnectionLost` -> `forget_session`.
+```
+
+Then, in `apply_hello`, before applying capabilities:
 
 ```rust
         // One client at a time. A second client identifying itself displaces
@@ -448,13 +491,17 @@ In `apply_hello`, before applying capabilities:
         // never identifies itself -- a port scan, an abandoned handshake, a
         // client that died mid-negotiation -- must not be able to kill a
         // working session.
-        if let Some(incumbent) = self.hello_sender {
+        if let Some(incumbent) = self.last_hello_from {
             if incumbent != from {
                 self.evict_session(incumbent, EvictionReason::DisplacedByNewSession);
             }
         }
-        self.hello_sender = Some(from);
 ```
+
+(`last_hello_from` is already assigned at the top of `apply_hello` by Task 1,
+so do not assign it again here — read it *before* that assignment, or move
+the assignment below this block. Check which, and make sure the ordering is
+covered by the re-HELLO test.)
 
 And the method itself:
 
@@ -481,24 +528,35 @@ And the method itself:
             }
         }
         tracing::info!(?handle, ?reason, "evicting session");
-        self.wt_sessions.remove(&handle);
-        self.session_resets_fired.remove(&handle);
+        // Moved here from the old connect-time prune: the displaced
+        // session's pending entries are un-ACKable, and left in place they
+        // flood the link until RTO.
+        self.reliable_emitter.clear_cache();
+        self.forget_session(handle);
     }
 ```
 
-**Check `WebTransportServer`'s real send method name** — `send_datagram` is the intent; match what exists (look at how tile datagrams are sent, around `io_bridge.rs:1596`).
+Use `forget_session` (added by Task 1) rather than removing from the maps by
+hand — it is the single place that knows every handle-keyed field, and
+bypassing it is how the stale-attribution bug got in.
 
-**On the grace period:** the design doc calls for ~16 ms between the notice and the close. `wt_sessions.remove` drops our bookkeeping but does not itself close the QUIC connection — check what actually tears the connection down, and whether the datagrams are flushed before it does. If removal alone leaves the connection open until the peer notices, the repeats have time to arrive and no explicit sleep is needed; say so in a comment. **If it does close immediately, that is a finding** — report it rather than adding a blocking sleep on the event loop.
+**Check `WebTransportServer`'s real send method name** — `send_datagram` is
+the intent; match what exists (look at how tile datagrams are sent, around
+`io_bridge.rs:1596`).
 
-Also clear `hello_sender` when a session is lost, in the `Event::ConnectionLost` arm near `io_bridge.rs:5625`:
+**On the grace period:** the design doc calls for ~16 ms between the notice
+and the close. `forget_session` drops our bookkeeping but does not itself
+close the QUIC connection — check what actually tears the connection down,
+and whether the datagrams are flushed before it does. If removal alone
+leaves the connection open until the peer notices, the repeats have time to
+arrive and no explicit sleep is needed; say so in a comment. **If it does
+close immediately, that is a finding** — report it rather than adding a
+blocking sleep on the event loop.
 
-```rust
-                    if self.hello_sender == Some(handle) {
-                        self.hello_sender = None;
-                    }
-```
-
-Without this, a client that disconnects normally leaves a stale `hello_sender`, and the *next* client to connect would evict a session that no longer exists — harmless today, but it makes the next reader distrust the invariant.
+**A test the deletion needs.** The prune fixed a real bug. Removing it must
+not resurrect it, so add a test that a reconnecting client (new handle,
+HELLO) results in exactly one live session and a cleared emitter cache —
+the property the prune was protecting, now delivered by eviction.
 
 - [ ] **Step 4: Run the tests**
 
