@@ -221,6 +221,40 @@ fn drain_eventfd(fd: RawFd) {
     }
 }
 
+/// Core events that the host embedder needs to see, as `ClientEvent`s.
+/// `None` for events that only concern the render thread.
+///
+/// Extracted from the thread loop so it can be tested directly: the loop
+/// itself needs a live network client and a render thread to run at all.
+///
+/// Variants are enumerated explicitly rather than via a `_ =>` catch-all.
+/// `ghostframe-client-core` does not itself enable
+/// `clippy::wildcard_enum_match_arm` for consumers, but this repo lost
+/// three months to a load-bearing wildcard arm once (see
+/// `feedback_load_bearing_catch_all.md`); listing every variant here means
+/// adding a new one to `Event` is a compile error at this site too, forcing
+/// a deliberate decision about whether the host needs to see it.
+pub(crate) fn host_event_for(core_ev: &ghostframe_client_core::Event) -> Option<ClientEvent> {
+    use ghostframe_client_core::Event;
+    match core_ev {
+        Event::FrameDimensions { width, height } => Some(ClientEvent::Resized {
+            width: *width,
+            height: *height,
+        }),
+        // `ClientEvent::Disconnected` already exists and already carries a
+        // reason string; eviction is a disconnect with a known cause, not a
+        // new kind of host event.
+        Event::Evicted { reason } => Some(ClientEvent::Disconnected {
+            reason: format!("{reason:?}"),
+        }),
+        Event::TileReady { .. }
+        | Event::NeedsH264 { .. }
+        | Event::DecodeError { .. }
+        | Event::TilePayload { .. }
+        | Event::PaletteUpdated { .. } => None,
+    }
+}
+
 /// Arguments bundled to keep `run`'s signature from growing every time a
 /// new piece of shared state is needed.
 pub(crate) struct NetThreadArgs {
@@ -375,13 +409,8 @@ pub(crate) fn run(args: NetThreadArgs) {
                     queue.push(ClientEvent::Disconnected { reason });
                 }
                 ClientNetEvent::Core(core_ev) => {
-                    if let ghostframe_client_core::Event::FrameDimensions { width, height } =
-                        &core_ev
-                    {
-                        queue.push(ClientEvent::Resized {
-                            width: *width,
-                            height: *height,
-                        });
+                    if let Some(host_ev) = host_event_for(&core_ev) {
+                        queue.push(host_ev);
                     }
                     if render_tx.send(RenderMsg::Core(core_ev)).is_err() {
                         // Render thread is gone; nothing more this thread
@@ -400,5 +429,60 @@ pub(crate) fn run(args: NetThreadArgs) {
         }
 
         arm_timer(timer_fd.as_raw_fd(), client_net.poll_timeout(), base);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ghostframe_client_core::Event;
+    use ghostframe_protocol::eviction::EvictionReason;
+
+    #[test]
+    fn eviction_becomes_a_disconnect_naming_the_cause() {
+        let ev = host_event_for(&Event::Evicted {
+            reason: EvictionReason::DisplacedByNewSession,
+        });
+        match ev {
+            Some(ClientEvent::Disconnected { reason }) => assert!(
+                reason.contains("DisplacedByNewSession"),
+                "the reason must name the cause so an embedder can tell \
+                 displacement from a network failure, got {reason:?}"
+            ),
+            other => panic!("expected Disconnected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn frame_dimensions_still_maps_to_resized() {
+        // Regression guard on the extraction itself.
+        assert_eq!(
+            host_event_for(&Event::FrameDimensions {
+                width: 800,
+                height: 600
+            }),
+            Some(ClientEvent::Resized {
+                width: 800,
+                height: 600
+            })
+        );
+    }
+
+    #[test]
+    fn unknown_eviction_reason_still_names_the_byte() {
+        // Task 2's `EvictionReason::Unknown` carries the raw byte so an
+        // operator debugging a version skew gets the number, not just
+        // "unknown" -- confirm that byte actually reaches the embedder's
+        // disconnect reason string.
+        let ev = host_event_for(&Event::Evicted {
+            reason: EvictionReason::Unknown(0x7A),
+        });
+        match ev {
+            Some(ClientEvent::Disconnected { reason }) => assert!(
+                reason.contains("122") || reason.contains("7A") || reason.contains("7a"),
+                "expected the raw byte to be visible in the reason, got {reason:?}"
+            ),
+            other => panic!("expected Disconnected, got {other:?}"),
+        }
     }
 }

@@ -114,6 +114,11 @@ pub enum Event {
         palette_id: u8,
         colors: Vec<[u8; 4]>,
     },
+    /// The server has dropped this session and said why. Terminal: no
+    /// further frames will arrive.
+    Evicted {
+        reason: ghostframe_protocol::eviction::EvictionReason,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
