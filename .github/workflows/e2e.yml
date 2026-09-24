@@ -46,10 +46,22 @@ jobs:
       # libraries only this workflow installs.
       - run: cargo test -p ghostframe-client-net
       # Pure-logic targets only. The GPU-requiring targets in client-gpu
-      # (gpu_export, gpu_pipelines, gpu_oracle) are deliberately NOT named
-      # here: runners have no suitable device. They run on every developer
-      # machine via `cargo test -p ghostframe-client-gpu`, which is the
-      # point -- an #[ignore] would hide them locally too.
+      # (gpu_export, gpu_pipelines, gpu_oracle, gpu_import) are deliberately
+      # NOT named here: runners have no suitable device. gpu_h264_render
+      # additionally needs VA-API, which runners also lack. All five run on
+      # every developer machine via `cargo test -p ghostframe-client-gpu`,
+      # which is the point -- an #[ignore] would hide them locally too.
+      #
+      # --lib matters here beyond coalesce/dirty/cdf53_passes: it is what
+      # picks up two #[cfg(test)] modules declared in src/lib.rs.
+      # shader_validation needs no GPU -- it walks shaders/client/*.wgsl and
+      # runs naga parse+validate -- so it actually runs in this job on every
+      # push, and is the only place any of the 11 client shaders gets parsed
+      # at all (naga only sees a shader at create_shader_module time, which
+      # a GPU-less runner never calls). nv12_oracle_tests needs a GPU and
+      # self-skips here, same as the five named targets above. Do not
+      # narrow this to `--test coalesce --test dirty --test cdf53_passes`
+      # alone -- that would silently drop shader_validation back out of CI.
       - run: cargo test -p ghostframe-client-gpu --lib --test coalesce --test dirty --test cdf53_passes
       - run: cargo test -p ghostframe-client-native
       - run: cargo test -p ghostframe-client-capi
@@ -58,6 +70,21 @@ jobs:
       # --workspace --lib` in ci.yml reaches only its lib target, so
       # without this line they run on developer machines and nowhere else.
       - run: cargo test -p ghostframe-cli
+      # ghostframe-client-h264 has no separate integration-test targets --
+      # every test (probe, decoder, descriptor, oracle_tests) lives as a
+      # #[cfg(test)] module inside the lib itself, so --lib reaches all of
+      # them in one invocation. The descriptor tests are pure logic
+      # (hand-built structs, no hardware) and run everywhere.
+      #
+      # Note what this line does NOT cover. The probe, decoder and
+      # oracle_tests modules gate themselves on `vainfo` reporting a
+      # VAProfileH264*/VAEntrypointVLD pair. Runners have neither
+      # libva-utils nor a VA-API device, so those tests SKIP here and only
+      # ever really run on a developer machine. That is a capability gate
+      # rather than a deliberate CI carve-out, but the consequence is
+      # identical, so it belongs here rather than being discovered later:
+      # nothing in CI fails if VA-API decode breaks.
+      - run: cargo test -p ghostframe-client-h264 --lib
       - run: cargo build -p ghostframe-client-capi
       # The netsim harness suites. These live in separate integration test
       # targets, so neither `cargo test --workspace --lib` (lib targets only)
