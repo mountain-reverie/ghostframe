@@ -260,15 +260,17 @@ pub unsafe extern "C" fn gf_client_next_event(c: *mut gf_client, out: *mut gf_ev
         out_ref.width = 0;
         out_ref.height = 0;
         out_ref.frame_id = 0;
+        out_ref.disconnect_expected = false;
         fill_message(&mut out_ref.message, "");
 
         match ev {
             ClientEvent::Connected => {
                 out_ref.kind = gf_event_type::GF_EVENT_CONNECTED;
             }
-            ClientEvent::Disconnected { reason } => {
+            ClientEvent::Disconnected { reason, expected } => {
                 out_ref.kind = gf_event_type::GF_EVENT_DISCONNECTED;
                 fill_message(&mut out_ref.message, &reason);
+                out_ref.disconnect_expected = expected;
             }
             ClientEvent::Resized { width, height } => {
                 out_ref.kind = gf_event_type::GF_EVENT_RESIZED;

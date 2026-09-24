@@ -66,12 +66,12 @@ pub enum WasmEvent {
     /// variants). Surfacing this to the user in the browser UI is web-client
     /// scope, not this boundary crate's.
     Evicted {
-        /// `Debug`-formatted `ghostframe_protocol::eviction::EvictionReason`,
-        /// e.g. `"DisplacedByNewSession"` or `"Unknown(122)"` -- matches the
-        /// native client's `ClientEvent::Disconnected` reason string
-        /// (`net_thread::host_event_for`), so the two consumers agree on
-        /// what the reason looks like.
-        reason: String,
+        /// `EvictionReason` discriminant (`to_byte()`): `1` for
+        /// `DisplacedByNewSession`, or the raw byte for `Unknown(b)`. A
+        /// code, not a string -- JS renders its own wording, and the
+        /// consumer compares against a numeric constant rather than parsing
+        /// a `Debug`-formatted string that is free to be reworded later.
+        reason: u8,
     },
 }
 
@@ -194,7 +194,7 @@ impl From<&Event> for WasmEvent {
                 code: *code as u8,
             },
             Event::Evicted { reason } => WasmEvent::Evicted {
-                reason: format!("{reason:?}"),
+                reason: reason.to_byte(),
             },
         }
     }
