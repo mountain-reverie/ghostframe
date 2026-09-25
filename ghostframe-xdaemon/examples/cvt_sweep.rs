@@ -3,13 +3,21 @@
 //! against the real `cvt(1)` binary (package `libxcvt`), the oracle this
 //! module is built to match.
 //!
-//! This is deliberately a `src/bin/*` binary, not a `#[test]` — it shells
-//! out to an external process for thousands of cases, which is far too
-//! slow and environment-dependent for `cargo test`. Run it by hand before
-//! touching the arithmetic in `../cvt.rs`:
+//! This is deliberately an **example**, not a `#[test]` and not a
+//! `src/bin/*` binary. Not a test because it shells out to an external
+//! process for thousands of cases, which is far too slow and
+//! environment-dependent for `cargo test`. Not a `src/bin/*` because
+//! `cargo build -p ghostframe-xdaemon` builds every binary in the package,
+//! and the e2e container image does exactly that
+//! (`tests/containers/test-server/Dockerfile`) — a dev-only tool would be
+//! compiled into and shipped with that image. `cargo build -p` does not
+//! build examples, while `clippy --all-targets` still does, so this stays
+//! lint-clean without riding along into the container.
+//!
+//! Run it by hand before touching the arithmetic in `../src/cvt.rs`:
 //!
 //! ```text
-//! cargo run -p ghostframe-xdaemon --bin cvt_sweep
+//! cargo run -p ghostframe-xdaemon --example cvt_sweep
 //! ```
 //!
 //! It re-includes `../cvt.rs` verbatim via `#[path]` (not a copy), so it can
@@ -22,7 +30,7 @@
 //! `../cvt.rs` for detail. This sweep expects exactly those two mismatches
 //! and reports anything beyond them as a failure.
 
-#[path = "../cvt.rs"]
+#[path = "../src/cvt.rs"]
 mod cvt;
 
 use std::process::Command;
