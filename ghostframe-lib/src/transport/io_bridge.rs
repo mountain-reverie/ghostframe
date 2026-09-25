@@ -560,7 +560,9 @@ struct PendingDisplayMode {
     width: u16,
     height: u16,
     /// Microseconds since `IoBridge::epoch` (same clock as the classifier's
-    /// `now_us` at `io_bridge.rs:3980`) at which this becomes due.
+    /// `now_us`, i.e. `now_std().duration_since(self.epoch)`, the same
+    /// epoch-relative clock the classifier's dwell timers use) at which this
+    /// becomes due.
     deadline_us: u64,
 }
 
@@ -3469,7 +3471,8 @@ impl IoBridge {
 
     /// Fire any due timers driven by `now_us` (microseconds since
     /// `IoBridge::epoch` -- the same clock `dispatch_feedback_bytes` stamps
-    /// `PendingDisplayMode::deadline_us` from at `io_bridge.rs:3980`'s
+    /// `PendingDisplayMode::deadline_us` from, i.e. the same
+    /// `now_std().duration_since(self.epoch)`
     /// pattern, so callers never need a second clock to drive this).
     ///
     /// Currently the only timer is the `DisplayMode` debounce: once
