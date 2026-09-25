@@ -109,11 +109,42 @@ say "Step 4: inject a known-good EDID (copied from your real monitor)"
 if [[ ! -r "$SRC_EDID" ]] || [[ $(wc -c < "$SRC_EDID") -lt 128 ]]; then
   echo "FAIL: cannot read a usable source EDID at $SRC_EDID"; exit 1
 fi
-head -c 128 "$SRC_EDID" > "$BLOB"
-ans "blob size" "$(wc -c < "$BLOB") bytes (base block only)"
+# Take the base block and make it SELF-CONSISTENT: byte 126 is the extension
+# count, and the kernel's drm_edid_override_set rejects the write with EINVAL
+# unless 128*(1+extensions) <= len. A raw `head -c 128` of a 256-byte monitor
+# EDID still claims 1 extension, which is why the first attempt failed.
+# Zeroing it and recomputing the byte-127 checksum yields a valid standalone
+# base block -- the same shape ghostframe-edid will synthesise.
+python3 - "$SRC_EDID" "$BLOB" <<'PYEOF'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+b = bytearray(open(src, 'rb').read()[:128])
+b[126] = 0                                   # no extension blocks follow
+b[127] = 0
+b[127] = (-sum(b)) & 0xFF                    # block must sum to 0 mod 256
+assert sum(b) % 256 == 0
+open(dst, 'wb').write(bytes(b))
+print(f"  built a self-consistent 128-byte base block (extensions=0, checksum=0x{b[127]:02X})")
+PYEOF
+ans "blob size" "$(wc -c < "$BLOB") bytes (base block, extensions=0)"
 ans "blob header ok" "$(head -c 8 "$BLOB" | xxd -p)"
+ans "blob checksum valid" "$(python3 -c "
+import sys
+b=open('$BLOB','rb').read()
+print('yes' if sum(b)%256==0 else 'NO')")"
 
-cat "$BLOB" > "$MINOR/Virtual-1/edid_override" || { echo "FAIL: write to edid_override failed"; exit 1; }
+if ! cat "$BLOB" > "$MINOR/Virtual-1/edid_override" 2>/dev/null; then
+  echo "  FAIL: write to edid_override rejected (EINVAL means the kernel"
+  echo "        considers the blob malformed: it validates len >= 128 and"
+  echo "        128*(1+extensions) <= len). Retrying with the full source EDID"
+  echo "        including its extension block:"
+  if cat "$SRC_EDID" > "$MINOR/Virtual-1/edid_override" 2>/dev/null; then
+    ans "full-size injection" "accepted (base+extension)"
+  else
+    echo "  FAIL: both forms rejected -- report this, it blocks the design."
+    exit 1
+  fi
+fi
 ans "edid_override write" "accepted"
 echo detect > "$STATUS_F" || { echo "FAIL: write 'detect' to status failed"; exit 1; }
 ans "status=detect (reprobe trigger)" "accepted"
