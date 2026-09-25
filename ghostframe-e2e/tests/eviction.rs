@@ -90,6 +90,7 @@ fn make_client(hostname: &str, state_dir: &std::path::Path) -> Client {
         n_export_buffers: 3,
         preferred_modifiers: vec![],
         debug_map_frames: false,
+        display: None,
     })
     .expect("create client")
 }

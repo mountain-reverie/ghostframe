@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
-use ghostframe_client_core::{ClientConfig, ClientCore, PollOutput};
+use ghostframe_client_core::{ClientConfig, ClientCore, ClientDisplay, PollOutput};
 use quinn_proto::{Dir, StreamId, TransportConfig};
 use web_transport_proto::VarInt;
 
@@ -49,6 +49,11 @@ pub struct ClientNetConfig {
     pub server_cert_sha256: [u8; 32],
     pub indices_raw_enabled: bool,
     pub supports_h264: bool,
+    /// What this client knows about its own display, if anything. Forwarded
+    /// straight to `ClientConfig::display`, which is what makes
+    /// `ClientCore::new` queue a `DisplayInfo` Hello payload -- see that
+    /// type's doc for why scale (not millimetres) is authoritative.
+    pub display: Option<ClientDisplay>,
 }
 
 pub struct ClientNet {
@@ -117,6 +122,7 @@ impl ClientNet {
             ClientConfig {
                 indices_raw_enabled: config.indices_raw_enabled,
                 supports_h264: config.supports_h264,
+                display: config.display,
                 ..Default::default()
             },
             now_us,
@@ -509,6 +515,20 @@ impl ClientNet {
     /// handshake completes.
     pub fn send_input(&mut self, bytes: Vec<u8>, now_us: u64) {
         self.pending_stream_out.push(bytes);
+        self.drain_connection_events(now_us);
+    }
+
+    /// Tell the server this client wants `width`x`height`.
+    ///
+    /// Unlike [`Self::send_input`], the encoded message is not pushed onto
+    /// `pending_stream_out` directly: `ClientCore::request_display_mode`
+    /// queues it in `core`'s own outbox (the same `VecDeque` `DisplayInfo`
+    /// and `Hello` go through), so draining `core.poll_transmit` -- which
+    /// `drain_connection_events` already does -- is what actually moves it
+    /// onto the wire. A no-op before `SessionReady` for the same reason
+    /// `send_input` is: the message just waits in the outbox.
+    pub fn request_display_mode(&mut self, width: u16, height: u16, now_us: u64) {
+        self.core.request_display_mode(width, height);
         self.drain_connection_events(now_us);
     }
 }

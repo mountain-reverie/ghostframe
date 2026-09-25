@@ -34,6 +34,12 @@ pub(crate) enum NetCommand {
     /// An encoded input event (see `crate::input`), to be written onto the
     /// feedback stream via `ClientNet::send_input`.
     SendInput(Vec<u8>),
+    /// Ask the server to switch to this display mode -- see
+    /// `Client::request_display_mode`.
+    RequestDisplayMode {
+        width: u16,
+        height: u16,
+    },
     /// Diagnostic: snapshot `ClientNet`'s CDF 5/3 coverage state and reply
     /// with it. Mirrors `RenderMsg::DebugMapFrame`'s round-trip shape -- see
     /// `Client::cdf53_coverage`.
@@ -394,6 +400,10 @@ pub(crate) fn run(args: NetThreadArgs) {
                         Ok(NetCommand::SendInput(bytes)) => {
                             let now_us = Instant::now().duration_since(base).as_micros() as u64;
                             client_net.send_input(bytes, now_us);
+                        }
+                        Ok(NetCommand::RequestDisplayMode { width, height }) => {
+                            let now_us = Instant::now().duration_since(base).as_micros() as u64;
+                            client_net.request_display_mode(width, height, now_us);
                         }
                         Ok(NetCommand::Cdf53Coverage(reply_tx)) => {
                             let summary = client_net.cdf53_coverage_summary();

@@ -14,6 +14,7 @@ fn quic_handshake_completes_against_the_real_server() {
         server_cert_sha256: pinned_hash(&server),
         indices_raw_enabled: true,
         supports_h264: false,
+        display: None,
     };
     let base = Instant::now();
     let mut now_us = 0u64;

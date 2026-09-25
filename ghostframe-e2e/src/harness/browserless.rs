@@ -463,6 +463,7 @@ async fn run_inner(mut scene: BrowserlessScene) -> anyhow::Result<BrowserlessRes
         server_cert_sha256,
         indices_raw_enabled: true,
         supports_h264: false,
+        display: None,
     };
 
     let mut framebuffer = FrameBuffer::new();

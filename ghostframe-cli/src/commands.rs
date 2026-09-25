@@ -242,6 +242,13 @@ pub fn connect(host: String, port: u16, chord_prefix: String) -> Result<(), Comm
     let mut backend = window::open("ghostframe")?;
     let preferred_modifiers = backend.preferred_dmabuf_modifiers();
 
+    // Independent of `backend`: a separate, short-lived probe connection
+    // (see `display_probe`'s module doc for why). `None` just means no
+    // `DisplayInfo` is sent -- the server falls back to whatever it did
+    // before display negotiation existed, so a probe failure is never
+    // fatal to `connect`.
+    let display = crate::display_probe::probe();
+
     let config = Config {
         hostname: default_hostname(),
         authkey: String::new(),
@@ -251,6 +258,7 @@ pub fn connect(host: String, port: u16, chord_prefix: String) -> Result<(), Comm
         n_export_buffers: 3,
         preferred_modifiers,
         debug_map_frames: false,
+        display,
     };
 
     let mut client = Client::new(config)?;
@@ -422,6 +430,15 @@ pub fn run_window_loop(
             if let WindowEvent::Resized { width, height } = ev {
                 out_w = width;
                 out_h = height;
+                // Deliberately un-debounced here: the server already
+                // debounces DisplayMode requests (250 ms -- see
+                // `io_bridge.rs`), and debouncing again on this side would
+                // make the effective delay the sum of both. Send on every
+                // resize and let the server collapse them.
+                client.request_display_mode(
+                    u16::try_from(width).unwrap_or(u16::MAX),
+                    u16::try_from(height).unwrap_or(u16::MAX),
+                );
             }
             match route_window_event(&ev, chord, &placement) {
                 LoopAction::Forward(input) => match input {

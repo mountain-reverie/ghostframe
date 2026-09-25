@@ -160,6 +160,7 @@ pub unsafe extern "C" fn gf_client_create(
             // no use for CPU-mappable exports -- and paying for them would
             // pin every buffer to a small BAR aperture.
             debug_map_frames: false,
+            display: None,
         };
 
         let client = match Client::new(config) {
