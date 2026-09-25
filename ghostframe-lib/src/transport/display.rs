@@ -93,6 +93,42 @@ impl DisplayModeMsg {
     }
 }
 
+/// Error from a `DisplayController::set_output` call. The X backend can fail
+/// for several reasons (RandR mode add/set failure, output not found); a
+/// future headless-Wayland backend would have its own. Kept as a plain
+/// reason string rather than a structured enum because every caller
+/// (`IoBridge::on_timeout`) only ever logs it -- there is no recovery branch
+/// that depends on which failure this was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisplayError(pub String);
+
+impl std::fmt::Display for DisplayError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "display controller error: {}", self.0)
+    }
+}
+
+impl std::error::Error for DisplayError {}
+
+/// Server-side display control. Implemented against X/RandR in
+/// `ghostframe-xdaemon`; mocked in tests. Mirrors `InputInjector`
+/// (`transport/input_inject.rs`), which exists for the same reason: keep
+/// protocol logic testable without a running display server.
+///
+/// **Nothing above this trait may mention X, RandR, or millimetres.** A
+/// future headless-Wayland backend implements the same two methods with
+/// `set_custom_mode` and `set_scale`; that port should need no change above
+/// this line. See the M4b design doc §5 and §7.
+pub trait DisplayController: Send + Sync {
+    /// The framebuffer ceiling. Requests above it are clamped, never rejected.
+    fn ceiling(&self) -> (u16, u16);
+
+    /// Apply a resolution and scale together -- they are one user-visible
+    /// change, and applying them separately would show an intermediate
+    /// state at the wrong size or the wrong font scale.
+    fn set_output(&self, width: u16, height: u16, scale_milli: u16) -> Result<(), DisplayError>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
