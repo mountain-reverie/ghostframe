@@ -373,6 +373,43 @@ async fn rapid_resizes_collapse_to_one_change() {
 }
 
 #[tokio::test]
+async fn a_width_is_aligned_down_to_the_cvt_granularity() {
+    // CVT rounds h_active UP to a multiple of 8: `cvt 1283 817 60 -r` gives
+    // a 1288-wide mode. Rendering 1288 into a 1283-wide window crops 5 px of
+    // the remote desktop off-screen -- content the user cannot see or scroll
+    // to. Aligning DOWN leaves a 3 px border instead, which is harmless.
+    let (mut bridge, handle) = test_bridge_with_one_session().await;
+    let ctl = Arc::new(RecordingController::default());
+    bridge.display_controller = Some(ctl.clone());
+
+    let mut buf = Vec::new();
+    DisplayModeMsg { width: 1283, height: 817 }.encode(&mut buf);
+    bridge.dispatch_feedback_bytes(handle, &buf);
+    bridge.on_timeout(debounce_elapsed_us());
+
+    assert_eq!(ctl.outputs(), vec![(1280, 817, 1000)],
+        "width must align down to a multiple of 8; height is unconstrained");
+}
+
+#[tokio::test]
+async fn a_tiny_window_does_not_collapse_to_nothing() {
+    // Aligning down must not produce a zero or absurd mode when someone
+    // drags a window very small.
+    let (mut bridge, handle) = test_bridge_with_one_session().await;
+    let ctl = Arc::new(RecordingController::default());
+    bridge.display_controller = Some(ctl.clone());
+
+    let mut buf = Vec::new();
+    DisplayModeMsg { width: 4, height: 3 }.encode(&mut buf);
+    bridge.dispatch_feedback_bytes(handle, &buf);
+    bridge.on_timeout(debounce_elapsed_us());
+
+    let (w, h, _) = ctl.outputs()[0];
+    assert!(w >= MIN_MODE_WIDTH && h >= MIN_MODE_HEIGHT,
+        "expected a floor, got {w}x{h}");
+}
+
+#[tokio::test]
 async fn a_mode_above_the_ceiling_is_clamped_not_rejected() {
     let (mut bridge, handle) = test_bridge_with_one_session().await;
     let ctl = Arc::new(RecordingController::with_ceiling(4096, 2160));
@@ -466,6 +503,17 @@ const DISPLAY_MODE_DEBOUNCE_US: u64 = 250_000;
 /// Scale before any DisplayInfo arrives. 1.0 -- the server's current
 /// behaviour, so a client that never negotiates sees no change.
 const DEFAULT_SCALE_MILLI: u16 = 1000;
+
+/// CVT rounds h_active UP to a multiple of 8 (verified: `cvt 1283 817 60 -r`
+/// yields a 1288-wide mode). Align requested widths DOWN to this instead:
+/// a mode wider than the client's window crops the remote desktop
+/// off-screen, while a narrower one leaves a harmless border.
+const MODE_WIDTH_GRANULARITY: u16 = 8;
+
+/// Floor so that aligning down, or a client dragging a window to nothing,
+/// cannot ask X for a degenerate mode.
+const MIN_MODE_WIDTH: u16 = 320;
+const MIN_MODE_HEIGHT: u16 = 240;
 ```
 
 Find how `poll_timeout`/`on_timeout` deadlines are managed in this file and
@@ -767,6 +815,7 @@ git commit -m "test(e2e): a client negotiates its resolution end to end"
 - [ ] A client advertising 2560x1440 with a 1280x800 window is served 1280x800.
 - [ ] Scale reaches X as a physical size, so 1.0 reports 96 DPI and 1.5 reports 144.
 - [ ] A resize drag produces one mode change, and that test fails if the debounce is removed.
+- [ ] A non-aligned window width yields a mode no wider than the window, never wider.
 - [ ] CVT timings match `cvt(1)` exactly, on at least four resolutions including one non-16:9.
 - [ ] Nothing above `DisplayController` mentions X, RandR, or millimetres as a control input.
 - [ ] No root, no debugfs, no privileged container anywhere in the diff.
