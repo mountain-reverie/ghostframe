@@ -18,7 +18,11 @@
 #   8. Enables ghostframe.target (user) and getty@tty1 (system).
 #
 # Re-running is idempotent except for step 7, which is skipped if the state dir
-# is already populated. Pass --force to overwrite the binary and xorg.conf.
+# is already populated. Pass --force to overwrite the binary. The Xorg config
+# (step 3) and the systemd units (step 6) are package-owned, not meant for
+# local edits, and are always reinstalled on every run — so packaging
+# changes (e.g. a framebuffer size bump) reach an existing install without
+# needing --force.
 # --force does NOT modify a pre-existing /etc/X11/Xwrapper.config — that file
 # is shared with the host and is left alone unconditionally.
 
@@ -30,7 +34,7 @@ info() { printf 'install.sh: %s\n' "$*"; }
 for arg in "$@"; do
   case "$arg" in
     --help|-h)
-      sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
   esac
@@ -104,13 +108,16 @@ if [[ -x "$built_bin" ]]; then
 fi
 
 # 3. Xorg config.
+#
+# Always reinstalled, unconditionally — no --force needed. This file is
+# package-owned, not a place for local edits, and step 6 (systemd units)
+# already follows this policy below. Previously this step skipped when the
+# file already existed, which meant an upgrade that changes this config
+# (e.g. M4b's framebuffer size bump) silently kept the old file on any
+# existing install and made the new feature look broken.
 xorg_dst="/etc/X11/ghostframe-headless.conf"
-if [[ -e "$xorg_dst" && $force -eq 0 ]]; then
-  info "skip: $xorg_dst already exists (use --force to overwrite)"
-else
-  info "install: $xorg_dst"
-  install -D -m 0644 -o root -g root "$pkg_dir/xorg-headless-amdgpu.conf" "$xorg_dst"
-fi
+info "install: $xorg_dst"
+install -D -m 0644 -o root -g root "$pkg_dir/xorg-headless-amdgpu.conf" "$xorg_dst"
 
 # 4. Xwrapper policy.
 #
