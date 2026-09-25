@@ -3480,6 +3480,36 @@ impl IoBridge {
     /// `display_controller.set_output` and clears it, so a resize drag's
     /// continuous stream of requests collapses into the one size the user
     /// actually settled on.
+    /// When the event loop must next wake: the earlier of QUIC's own
+    /// deadline and any pending `DisplayMode` debounce.
+    ///
+    /// **The display half is load-bearing, not belt-and-braces.** The loop
+    /// used to wait on `server.next_timeout()` alone, which is `None` when
+    /// no connection has a deadline pending. On a static desktop that is the
+    /// normal state: no damage means no captured frames, an idle client
+    /// sends nothing, and the loop blocks. A `DisplayMode` stored just
+    /// before that happens would sit with its 250 ms deadline unexamined for
+    /// as long as the session stayed quiet.
+    ///
+    /// The M4b end-to-end test caught exactly this: the server logged
+    /// "display mode requested; debounced", then went completely silent for
+    /// the remaining 10 s of the test while the resize never arrived. Every
+    /// unit test passed throughout, because they call `on_timeout` directly
+    /// and so never exercise the wakeup.
+    fn next_wake_deadline(&mut self) -> Option<std::time::Instant> {
+        let quic = self.server.next_timeout();
+        let display = self
+            .pending_display_mode
+            .as_ref()
+            .map(|p| self.epoch + std::time::Duration::from_micros(p.deadline_us));
+        match (quic, display) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
+
     pub(crate) fn on_timeout(&mut self, now_us: u64) {
         let Some(pending) = self.pending_display_mode.as_ref() else {
             return;
@@ -5299,7 +5329,7 @@ impl IoBridge {
             // Build a timer future that fires at the earliest QUIC timeout, or
             // a never-completing future if there are no active connections.
             let sleep_fut: Pin<Box<dyn Future<Output = ()> + Send>> =
-                match self.server.next_timeout() {
+                match self.next_wake_deadline() {
                     Some(deadline) => Box::pin(sleep_until(TokioInstant::from_std(deadline))),
                     None => Box::pin(pending::<()>()),
                 };
@@ -10108,6 +10138,43 @@ mod tests {
     /// margin without being so large it reads as an unrelated constant.
     fn debounce_elapsed_us() -> u64 {
         DISPLAY_MODE_DEBOUNCE_US * 10
+    }
+
+    #[tokio::test]
+    async fn a_pending_display_mode_arms_the_event_loop_wakeup() {
+        // The whole milestone was inert without this. `sleep_fut` used to
+        // wait on `server.next_timeout()` alone, which is `None` on an idle
+        // session -- so on a static desktop (no damage, no frames, silent
+        // client) the loop blocked and the 250 ms debounce was never
+        // examined. Every other display test passed throughout, because they
+        // call `on_timeout` directly and never exercise the wakeup.
+        use crate::transport::display::DisplayModeMsg;
+
+        let (mut bridge, handle) = test_bridge_with_one_session().await;
+        let ctl = Arc::new(RecordingController::default());
+        bridge.display_controller = Some(ctl.clone());
+
+        assert!(
+            bridge.next_wake_deadline().is_none(),
+            "no QUIC deadline and no pending mode should mean no wakeup"
+        );
+
+        let mut buf = Vec::new();
+        DisplayModeMsg {
+            width: 1280,
+            height: 800,
+        }
+        .encode(&mut buf);
+        bridge.dispatch_feedback_bytes(handle, &buf);
+
+        let deadline = bridge
+            .next_wake_deadline()
+            .expect("a pending DisplayMode must arm a wakeup, or it never fires");
+        let from_now = deadline.saturating_duration_since(now_std());
+        assert!(
+            from_now <= std::time::Duration::from_micros(DISPLAY_MODE_DEBOUNCE_US),
+            "wakeup must be no later than the debounce deadline, got {from_now:?}"
+        );
     }
 
     #[tokio::test]
