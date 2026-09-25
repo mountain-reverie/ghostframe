@@ -810,9 +810,141 @@ git commit -m "test(e2e): a client negotiates its resolution end to end"
 
 ---
 
+## Task 8: Make X11 capture follow a mode change
+
+**Added after the e2e proved the milestone incomplete.** Negotiation works
+end to end — the server logs `display mode applied width=1280 height=800`
+and `set_output` returns `Ok` — but the client never sees a new size,
+because the capture pipeline keeps producing frames at the startup
+resolution forever.
+
+**Files:** Modify `ghostframe-xdaemon/src/x11_capture.rs`
+
+### What is already true (verified; do not re-do it)
+
+- **The DRM backend already adapts.** `main.rs:372` calls
+  `drm_capture::capture()` fresh each frame and takes `geom.width`/`geom.height`
+  from the result. Only the X11 path is broken.
+- **Clients are told automatically.** `io_bridge.rs::emit_frame_dimensions`
+  compares against `last_emitted_dimensions` and retransmits on change. Once
+  capture reports the new size, the frame-dimensions message and the client's
+  `Resized` event follow with no extra work.
+- **The bug is one cached pair.** `x11_capture.rs:111-112` reads
+  `screen.width_in_pixels`/`height_in_pixels` **once** in `X11Capture::new()`
+  into `self.width`/`self.height`, and allocates `target` from them. Every
+  capture uses those values. There is no `RRScreenChangeNotify` subscription
+  anywhere in the daemon (`grep -rn "RRScreenChange\|ScreenChangeNotify"
+  ghostframe-xdaemon/src/` finds nothing).
+
+- [ ] **Step 1: Write the failing test**
+
+The capture path needs a live X server, so unit-test the part that does not:
+extract the resize decision into a pure helper and test that.
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_changed_root_geometry_requires_a_resize() {
+        assert_eq!(resize_needed((640, 480), (1280, 800)), Some((1280, 800)));
+    }
+
+    #[test]
+    fn an_unchanged_geometry_does_not() {
+        // This runs once per captured frame. Reallocating a
+        // multi-megabyte buffer every frame because the check was sloppy
+        // would be a worse bug than the one being fixed.
+        assert_eq!(resize_needed((1280, 800), (1280, 800)), None);
+    }
+
+    #[test]
+    fn a_zero_geometry_is_ignored() {
+        // X can briefly report 0 during a mode transition. Reallocating to
+        // a zero-sized buffer would panic or produce empty frames.
+        assert_eq!(resize_needed((1280, 800), (0, 0)), None);
+        assert_eq!(resize_needed((1280, 800), (1280, 0)), None);
+    }
+}
+```
+
+Run `cargo test -p ghostframe-xdaemon resize_needed` — expect a compile failure.
+
+- [ ] **Step 2: Implement detection and reallocation**
+
+At the top of the capture call, re-read the root geometry and resize if it
+changed:
+
+```rust
+/// Decide whether the cached capture geometry must be rebuilt.
+///
+/// Called once per captured frame, so the unchanged case must be free.
+/// A zero dimension is ignored rather than honoured: X can report one
+/// briefly mid-transition, and resizing to it would yield empty frames.
+fn resize_needed(current: (u16, u16), actual: (u16, u16)) -> Option<(u16, u16)> {
+    if actual.0 == 0 || actual.1 == 0 || actual == current {
+        return None;
+    }
+    Some(actual)
+}
+```
+
+Use `self.conn.get_geometry(self.root)` for the actual size — the file already
+uses `get_geometry` on child windows (`x11_capture.rs:218`), so the idiom and
+error handling are established there. On a change: update `self.width`/
+`self.height`, reallocate `self.target` to `w * h * 4`, and log at INFO with
+both old and new sizes (this is a rare, user-visible event worth a line).
+
+**Poll rather than subscribe to `RRScreenChangeNotify`.** One extra
+`GetGeometry` round-trip per frame is negligible beside the `GetImage` the
+capture already performs, and it cannot miss an event or need a second
+connection. If profiling later shows the round-trip matters, the RandR
+subscription is the upgrade — say so in a comment so the next reader knows
+the choice was deliberate.
+
+**Check whether the strategy needs re-picking.** `pick_strategy` runs once in
+`new()`. Decide whether a resize can invalidate it (e.g. a compositor
+appearing or a root pixmap being recreated) and say what you concluded — if it
+can, re-pick; if not, write down why not.
+
+- [ ] **Step 3: Verify the whole chain end to end**
+
+```bash
+just containers-build   # or: docker build --build-arg CARGO_JOBS=6 ...
+TS_CONTROL_URL=http://127.0.0.1:18080   cargo test -p ghostframe-e2e --test display_negotiation -- --nocapture --test-threads=1
+```
+
+The first test must now pass: `matched=true` with `1280x800` among the
+observed sizes.
+
+The second test (`..._larger_than_the_containers_startup_size`) answers an
+open question in the spec (§2.1): whether `Virtual`/`Modes` is a hard ceiling
+or merely the startup size. **Either outcome is a valid finding — report it,
+do not adjust the test to make it pass.** If it fails, record the answer in
+spec §2.1 and mark that test `#[ignore]` with the finding as its reason.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add ghostframe-xdaemon/src/x11_capture.rs
+git commit -m "fix(xdaemon): X11 capture follows a mode change
+
+X11Capture cached screen.width_in_pixels at construction, so after a RandR
+mode change it kept producing frames at the startup size forever and the
+client was never told. The DRM backend already re-read geometry per frame;
+only this path was affected.
+
+Polls root geometry per capture rather than subscribing to
+RRScreenChangeNotify: one GetGeometry is negligible beside the GetImage
+already performed, and it cannot miss an event."
+```
+
+---
+
 ## Done means
 
-- [ ] A client advertising 2560x1440 with a 1280x800 window is served 1280x800.
+- [ ] A client advertising 2560x1440 with a 1280x800 window is served 1280x800 **and the frames actually arrive at that size** (the e2e passes).
 - [ ] Scale reaches X as a physical size, so 1.0 reports 96 DPI and 1.5 reports 144.
 - [ ] A resize drag produces one mode change, and that test fails if the debounce is removed.
 - [ ] A non-aligned window width yields a mode no wider than the window, never wider.
