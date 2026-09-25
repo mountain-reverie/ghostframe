@@ -37,7 +37,7 @@
 //!
 //! A one-off wide sweep against the real `cvt(1)` binary (not a unit test —
 //! it shells out) lives at `ghostframe-xdaemon/src/bin/cvt_sweep.rs`. Run it
-//! with `cargo run -p ghostframe-xdaemon --bin cvt_sweep` before touching
+//! with `cargo run -p ghostframe-xdaemon --example cvt_sweep` before touching
 //! this module's arithmetic; it re-includes this file's source directly so
 //! it can never drift out of sync with what actually ships.
 
