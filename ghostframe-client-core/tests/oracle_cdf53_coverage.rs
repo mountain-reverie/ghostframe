@@ -480,6 +480,7 @@ fn incomplete_tiles_names_the_tile_and_the_passes_it_is_owed() {
             indices_raw_enabled: true,
             supports_h264: true,
             tile_delivery: TileDelivery::Decoded,
+            display: None,
         },
         0,
     );
@@ -545,6 +546,7 @@ fn incomplete_tiles_is_empty_when_every_present_pass_arrived() {
             indices_raw_enabled: true,
             supports_h264: true,
             tile_delivery: TileDelivery::Decoded,
+            display: None,
         },
         0,
     );

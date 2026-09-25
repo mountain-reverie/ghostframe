@@ -107,6 +107,24 @@ pub struct ClientConfig {
     pub supports_h264: bool,
     /// See [`TileDelivery`]. Defaults to `Decoded`.
     pub tile_delivery: TileDelivery,
+    /// What the client knows about its own display. `None` if the client
+    /// cannot determine it, in which case no DisplayInfo message is sent.
+    pub display: Option<ClientDisplay>,
+}
+
+/// What the client knows about its own display. Deliberately NOT named
+/// `DisplayInfo` -- that name belongs to the wire message in
+/// `ghostframe-lib`, and client-core cannot depend on the server crate, so
+/// two same-named types in different crates would read as one type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientDisplay {
+    pub max_width: u16,
+    pub max_height: u16,
+    /// Thousandths: 1000 = 1.0.
+    pub scale_milli: u16,
+    /// Advisory only -- see the module docs on why scale is authoritative.
+    pub mm_width: u16,
+    pub mm_height: u16,
 }
 
 /// One in-progress tile-pass assembly (fragments keyed by `TileKey`).
@@ -220,7 +238,28 @@ impl ClientCore {
                 config.supports_h264,
             )));
 
+        if let Some(display) = config.display {
+            core.outbox
+                .push_back(PollOutput::Stream(loss_tracker::encode_display_info(
+                    display.max_width,
+                    display.max_height,
+                    display.scale_milli,
+                    display.mm_width,
+                    display.mm_height,
+                )));
+        }
+
         core
+    }
+
+    /// Queue a display-mode request. The server clamps it and reports what
+    /// it actually set through the existing frame-dimensions message --
+    /// callers must render what arrives, not what they asked for.
+    pub fn request_display_mode(&mut self, width: u16, height: u16) {
+        self.outbox
+            .push_back(PollOutput::Stream(loss_tracker::encode_display_mode(
+                width, height,
+            )));
     }
 
     /// Drain one pending outbound message; call until None.

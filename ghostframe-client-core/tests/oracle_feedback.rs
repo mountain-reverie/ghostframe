@@ -1,4 +1,6 @@
-use ghostframe_client_core::loss_tracker::{encode_hello, LossTracker};
+use ghostframe_client_core::loss_tracker::{
+    encode_display_info, encode_display_mode, encode_hello, LossTracker,
+};
 use ghostframe_protocol::feedback::ReceiverFeedback;
 
 #[test]
@@ -68,4 +70,25 @@ fn loss_tracker_no_suspension_within_100ms_gap() {
     let buf = t.encode_feedback(100_000);
     let fb = ReceiverFeedback::decode(&buf).expect("decode failed");
     assert!(!fb.suspension_detected);
+}
+
+// Byte-exact oracle tests for DisplayInfo/DisplayMode: client-core cannot
+// depend on ghostframe-lib (the server crate), so its encoders are
+// duplicated there. These pin the exact wire bytes so a change on one side
+// without the other fails loudly, mirroring ghostframe-lib's
+// `transport::display` decode tests.
+#[test]
+fn display_info_wire_bytes() {
+    assert_eq!(
+        encode_display_info(2560, 1440, 1500, 597, 336),
+        vec![0x07, 0x0A, 0x00, 0x05, 0xA0, 0x05, 0xDC, 0x02, 0x55, 0x01, 0x50]
+    );
+}
+
+#[test]
+fn display_mode_wire_bytes() {
+    assert_eq!(
+        encode_display_mode(1280, 800),
+        vec![0x08, 0x05, 0x00, 0x03, 0x20]
+    );
 }

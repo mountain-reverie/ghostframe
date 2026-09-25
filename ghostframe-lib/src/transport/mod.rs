@@ -3,6 +3,7 @@ pub mod ack_latency;
 pub mod bwe;
 pub mod client_caps;
 pub mod decode_error;
+pub mod display;
 pub use ghostframe_protocol::fec;
 pub use ghostframe_protocol::feedback;
 pub mod fragment_coverage;
