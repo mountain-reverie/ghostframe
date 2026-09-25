@@ -95,7 +95,19 @@ COPY ghostframe-web-client/dist/ ghostframe-web-client/dist/
 RUN apt-get update -o Acquire::AllowInsecureRepositories=true && apt-get install -y --allow-unauthenticated --no-install-recommends rsync \
     && rm -rf /var/lib/apt/lists/*
 
-ENV CARGO_BUILD_JOBS=2
+# Parallelism for the in-container release build. Default 2 -- unchanged,
+# so CI runners (small, and sharing a host) behave exactly as before.
+# Override on a workstation where the build otherwise outruns the patience
+# of whoever is waiting:
+#
+#   docker build --build-arg CARGO_JOBS=6 -t ghostframe/test-server \
+#     -f tests/containers/test-server/Dockerfile .
+#
+# Each rustc job carries the 16 MiB stack set below and ffmpeg-next's
+# codegen is memory-hungry, so scale this against available RAM, not just
+# core count.
+ARG CARGO_JOBS=2
+ENV CARGO_BUILD_JOBS=${CARGO_JOBS}
 # ffmpeg-next overflows rustc's default 8 MiB stack on this codebase; bump
 # to 16 MiB (the value rustc itself suggests when it crashes).
 ENV RUST_MIN_STACK=16777216

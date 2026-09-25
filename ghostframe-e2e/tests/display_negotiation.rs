@@ -68,17 +68,37 @@ use client_wait::wait_for_frame;
 /// `wait_for_frame`'s reasoning, a resize that fails server-side (RandR
 /// rejects the mode) is exactly the finding this test exists to surface,
 /// not a bug in the harness.
-fn wait_for_resize(client: &mut Client, timeout: Duration) -> Option<(u32, u32)> {
+/// Pump events until a `Resized` reports `want`, or the timeout elapses.
+/// Returns every size observed, so a failure can say what actually arrived.
+///
+/// **Do not return the first `Resized` you see.** The client emits one
+/// whenever it learns frame dimensions, including the initial ones at
+/// connect -- so a first-match waiter returns the size the session started
+/// at and fails within milliseconds, long before the server's 250 ms
+/// debounce has elapsed. That is exactly the bug this helper replaced: the
+/// test reported "Resized to 640x480" and looked like a server failure,
+/// while the server was still correctly waiting out its debounce.
+fn wait_for_resize_to(
+    client: &mut Client,
+    want: (u32, u32),
+    timeout: Duration,
+) -> (bool, Vec<(u32, u32)>) {
     let deadline = Instant::now() + timeout;
+    let mut seen: Vec<(u32, u32)> = Vec::new();
     loop {
         while let Some(ev) = client.next_event() {
             tracing::info!(?ev, "client event");
             if let ClientEvent::Resized { width, height } = ev {
-                return Some((width, height));
+                if seen.last() != Some(&(width, height)) {
+                    seen.push((width, height));
+                }
+                if (width, height) == want {
+                    return (true, seen);
+                }
             }
         }
         if Instant::now() >= deadline {
-            return None;
+            return (false, seen);
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -178,29 +198,20 @@ async fn client_requests_a_mode_and_the_server_actually_applies_it() {
 
     // Well past the server's 250ms debounce.
     eprintln!("[phase] waiting for a Resized event reporting the new mode");
-    let resized = match wait_for_resize(&mut client, Duration::from_secs(30)) {
-        Some(dims) => dims,
-        None => {
-            eprintln!(
-                "--- server logs ({}) ---\n{}",
-                setup.server_container_name,
-                read_server_logs_stripped(&setup.server_container_name)
-            );
-            panic!("no Resized event within 30s of requesting {TARGET_W}x{TARGET_H}");
-        }
-    };
-    eprintln!("[result] Resized to {}x{}", resized.0, resized.1);
+    let (matched, seen) =
+        wait_for_resize_to(&mut client, (TARGET_W, TARGET_H), Duration::from_secs(30));
+    eprintln!("[result] matched={matched} sizes observed: {seen:?}");
 
-    if resized != (TARGET_W, TARGET_H) {
+    if !matched {
         eprintln!(
-            "--- server logs ({}) ---\n{}",
+            "--- server logs ({}) ---
+{}",
             setup.server_container_name,
             read_server_logs_stripped(&setup.server_container_name)
         );
     }
-    assert_eq!(
-        resized,
-        (TARGET_W, TARGET_H),
+    assert!(
+        matched,
         "server reported a resize but not to the requested mode -- clamping/alignment \
          may have altered it unexpectedly, or a stale FrameDimensions from before the \
          request raced this assertion"
@@ -304,34 +315,20 @@ async fn client_requests_a_mode_larger_than_the_containers_startup_size() {
     client.request_display_mode(TARGET_W as u16, TARGET_H as u16);
 
     eprintln!("[phase] waiting for a Resized event");
-    let resized = match wait_for_resize(&mut client, Duration::from_secs(30)) {
-        Some(dims) => dims,
-        None => {
-            eprintln!(
-                "--- server logs ({}) ---\n{}",
-                setup.server_container_name,
-                read_server_logs_stripped(&setup.server_container_name)
-            );
-            panic!(
-                "no Resized event within 30s of requesting {TARGET_W}x{TARGET_H} -- if the \
-                 server log shows \"display mode apply failed\", that is the finding: \
-                 growing past the container's startup size fails and Virtual/Modes IS a \
-                 ceiling"
-            );
-        }
-    };
-    eprintln!("[result] Resized to {}x{}", resized.0, resized.1);
+    let (matched, seen) =
+        wait_for_resize_to(&mut client, (TARGET_W, TARGET_H), Duration::from_secs(30));
+    eprintln!("[result] matched={matched} sizes observed: {seen:?}");
 
-    if resized != (TARGET_W, TARGET_H) {
+    if !matched {
         eprintln!(
-            "--- server logs ({}) ---\n{}",
+            "--- server logs ({}) ---
+{}",
             setup.server_container_name,
             read_server_logs_stripped(&setup.server_container_name)
         );
     }
-    assert_eq!(
-        resized,
-        (TARGET_W, TARGET_H),
+    assert!(
+        matched,
         "FINDING: the server did not grow to the requested size past its startup \
          resolution -- Virtual/Modes acts as a ceiling here (or something else clamped \
          the request); see the server log dumped above for which"
@@ -340,7 +337,7 @@ async fn client_requests_a_mode_larger_than_the_containers_startup_size() {
     eprintln!(
         "[result] FINDING: RandR grew the framebuffer past the container's startup \
                size ({}x{} -> {}x{}) -- Virtual/Modes is not a hard ceiling",
-        first_frame.width, first_frame.height, resized.0, resized.1
+        first_frame.width, first_frame.height, TARGET_W, TARGET_H
     );
 
     eprintln!("[phase] done");
