@@ -87,10 +87,21 @@ line. Two consequences:
 logged, and the session keeps its current mode (§6). Safe by failure, not by
 prediction.
 
-**Open question for the end-to-end task**: with an explicit `Virtual 1920 1080`,
-can RandR grow the screen to 2560x1440? That is cheap to answer once an X
-server on a virtual connector exists, and the answer decides whether raising
-`Virtual` is necessary or merely prudent. Do not guess it here.
+**ANSWERED (2026-09-25, `ghostframe-e2e/tests/display_negotiation.rs`)**: RandR
+**can** grow past the startup size. A container configured for 640x480 was
+driven to 2560x1440 and the frames arrived at that size:
+
+```
+[result] matched=true sizes observed: [(640, 480), (2560, 1440)]
+FINDING: RandR grew the framebuffer past the container's startup size
+```
+
+So §2's premise — that `Virtual` is a hard ceiling fixed at server start — is
+**wrong**. RandR 1.2 drivers reallocate through their resize hook. §2's
+*conclusion* (start generous) still stands as prudence: it avoids depending on
+that reallocation succeeding under memory pressure, and costs ~27 MB. But it is
+not required for correctness, and a deployment that cannot spare the
+framebuffer may leave `Virtual` small.
 
 ---
 
