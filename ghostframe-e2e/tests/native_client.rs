@@ -112,6 +112,7 @@ async fn native_client_renders_the_test_pattern_into_an_exported_dmabuf() {
         preferred_modifiers: vec![],
         // Diagnostic readback: this test asserts on dmabuf contents.
         debug_map_frames: true,
+        display: None,
     })
     .expect("create client");
     client.attach_bridge(setup._test_node.bridge());
@@ -292,6 +293,7 @@ async fn native_client_converges_at_production_scale_under_loss() {
         preferred_modifiers: vec![],
         // Diagnostic readback: this test asserts on dmabuf contents.
         debug_map_frames: true,
+        display: None,
     })
     .expect("create client");
     client.attach_bridge(setup._test_node.bridge());

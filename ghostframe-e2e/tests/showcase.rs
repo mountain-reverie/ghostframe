@@ -140,6 +140,7 @@ async fn showcase_presents_frames_under_weston_and_exits_cleanly() {
         n_export_buffers: 3,
         preferred_modifiers,
         debug_map_frames: false,
+        display: None,
     })
     .expect("create client");
     client.attach_bridge(setup._test_node.bridge());
@@ -383,6 +384,7 @@ async fn measure_publish_frame_pacing() {
         n_export_buffers: 3,
         preferred_modifiers,
         debug_map_frames: false,
+        display: None,
     })
     .expect("create client");
     client.attach_bridge(setup._test_node.bridge());

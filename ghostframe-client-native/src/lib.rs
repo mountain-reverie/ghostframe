@@ -27,6 +27,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+pub use ghostframe_client_core::ClientDisplay;
 pub use ghostframe_client_gpu::ring::PublishedFrame;
 use ghostframe_client_gpu::wgpu_ctx::WgpuContext;
 use ghostframe_client_net::{ClientNet, ClientNetConfig};
@@ -106,6 +107,13 @@ pub struct Config {
     ///
     /// `debug_map_frame` returns an error when this is `false`.
     pub debug_map_frames: bool,
+    /// What this client knows about its own display, probed by the
+    /// embedder (the CLI's `display_probe` module) before `Client::new`.
+    /// `None` if the embedder couldn't determine it, in which case no
+    /// `DisplayInfo` is sent and the server falls back to whatever it did
+    /// before display negotiation existed. Forwarded to
+    /// `ClientNetConfig::display` at `connect`.
+    pub display: Option<ghostframe_client_core::ClientDisplay>,
 }
 
 /// A published frame's exported dmabuf, mapped and copied out as plain
@@ -319,6 +327,7 @@ impl Client {
             server_cert_sha256: cert_hash,
             indices_raw_enabled: self.config.indices_raw,
             supports_h264: self.effective_h264,
+            display: self.config.display,
         };
         let mut client_net = ClientNet::new(net_config, 0)?;
         client_net.connect(remote, 0)?;
@@ -532,12 +541,15 @@ impl Client {
         })
     }
 
-    fn send_input(&mut self, bytes: Vec<u8>) {
+    /// Send one `NetCommand` to the net thread and wake its `epoll_wait`,
+    /// so a queued command is never left waiting for the next unrelated
+    /// wakeup (the UDP fd or the timerfd) to notice it.
+    fn send_net_command(&mut self, cmd: NetCommand) {
         let Some(tx) = &self.net_cmd_tx else {
-            tracing::warn!("push_* called before connect(); dropping input event");
+            tracing::warn!("push_*/request_display_mode called before connect(); dropping");
             return;
         };
-        if tx.send(NetCommand::SendInput(bytes)).is_err() {
+        if tx.send(cmd).is_err() {
             return;
         }
         if let Some(wake) = &self.wake_fd {
@@ -551,6 +563,20 @@ impl Client {
                 );
             }
         }
+    }
+
+    fn send_input(&mut self, bytes: Vec<u8>) {
+        self.send_net_command(NetCommand::SendInput(bytes));
+    }
+
+    /// Ask the server to switch to `width`x`height`.
+    ///
+    /// Deliberately un-debounced on this side: the server already debounces
+    /// (250 ms) display-mode requests, and debouncing again here would only
+    /// make the effective delay the sum of both. Call this on every resize
+    /// event and let the server collapse them.
+    pub fn request_display_mode(&mut self, width: u16, height: u16) {
+        self.send_net_command(NetCommand::RequestDisplayMode { width, height });
     }
 
     pub fn push_key(&mut self, keysym: u32, down: bool) {

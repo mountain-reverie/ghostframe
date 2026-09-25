@@ -139,6 +139,7 @@ async fn h264_frames_from_the_server_render_into_the_dmabuf() {
         preferred_modifiers: vec![],
         // Diagnostic readback: this test asserts on dmabuf contents.
         debug_map_frames: true,
+        display: None,
     })
     .expect("create client");
 
