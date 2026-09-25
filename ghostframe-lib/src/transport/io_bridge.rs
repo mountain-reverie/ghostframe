@@ -527,6 +527,57 @@ const FEC_DISABLE_THRESHOLD: f64 = 0.002;
 /// is 0.05^10 ≈ 9.7e-14.
 const FRAME_DIMENSIONS_RETRANSMITS: u8 = 10;
 
+/// How long to wait after the last `DisplayMode` before applying it.
+///
+/// **A guess, not a measurement.** Roughly the pause a person makes on
+/// releasing a window edge, and far longer than the 2.6-4.9 ms a resolution
+/// change costs (M3 spec §10.7), so being wrong means latency on the last
+/// resize rather than thrash. If it proves wrong, measure a real resize
+/// drag rather than guessing again.
+const DISPLAY_MODE_DEBOUNCE_US: u64 = 250_000;
+
+/// Scale before any `DisplayInfo` arrives. 1.0 -- the server's current
+/// behaviour, so a client that never negotiates sees no change.
+const DEFAULT_SCALE_MILLI: u16 = 1000;
+
+/// CVT rounds h_active UP to a multiple of 8 (verified: `cvt 1283 817 60 -r`
+/// yields a 1288-wide mode). Align requested widths DOWN to this instead:
+/// a mode wider than the client's window crops the remote desktop
+/// off-screen, while a narrower one leaves a harmless border.
+const MODE_WIDTH_GRANULARITY: u16 = 8;
+
+/// Floor so that aligning down, or a client dragging a window to nothing,
+/// cannot ask X for a degenerate mode.
+const MIN_MODE_WIDTH: u16 = 320;
+const MIN_MODE_HEIGHT: u16 = 240;
+
+/// A `DisplayMode` request awaiting the debounce deadline. Stores the
+/// already-clamped/aligned/floored size (see `clamp_and_align_mode`) so
+/// `on_timeout` only has to compare a deadline and call `set_output` --
+/// the decision of *what* to apply was made at dispatch time, `when` is
+/// decided here.
+struct PendingDisplayMode {
+    width: u16,
+    height: u16,
+    /// Microseconds since `IoBridge::epoch` (same clock as the classifier's
+    /// `now_us` at `io_bridge.rs:3980`) at which this becomes due.
+    deadline_us: u64,
+}
+
+/// Clamp a requested mode to the controller's ceiling, then align the width
+/// down to `MODE_WIDTH_GRANULARITY`, then apply the floors. Order matters:
+/// aligning down AFTER clamping guarantees the result never exceeds the
+/// ceiling even when the ceiling itself isn't a multiple of the granularity;
+/// aligning first and clamping second would not have that guarantee. Height
+/// is only clamped and floored -- CVT's granularity constraint is
+/// horizontal-only.
+fn clamp_and_align_mode(requested_w: u16, requested_h: u16, ceiling: (u16, u16)) -> (u16, u16) {
+    let w = requested_w.min(ceiling.0);
+    let h = requested_h.min(ceiling.1);
+    let w = (w / MODE_WIDTH_GRANULARITY) * MODE_WIDTH_GRANULARITY;
+    (w.max(MIN_MODE_WIDTH), h.max(MIN_MODE_HEIGHT))
+}
+
 /// One scene frame's worth of pre-encoded tile work, injected by the
 /// browserless harness in place of capture + classification.
 ///
@@ -802,6 +853,23 @@ pub struct IoBridge {
     /// is `None`.
     pub(crate) input_injector:
         Option<std::sync::Arc<dyn crate::transport::input_inject::InputInjector>>,
+    /// Production handle for server-side display control (X RandR; see
+    /// `transport::display::DisplayController`). `None` until a later M4b
+    /// task wires `XrandrDisplay` in -- the `DISPLAY_MODE_MSG_TYPE` dispatch
+    /// arm silently drops requests when this is `None`, mirroring
+    /// `input_injector`'s pattern.
+    pub(crate) display_controller:
+        Option<std::sync::Arc<dyn crate::transport::display::DisplayController>>,
+    /// Scale most recently advertised by `DisplayInfoMsg`. Carried forward
+    /// into every subsequent `set_output` call so a later resize doesn't
+    /// silently reset the user's DPI. Defaults to `DEFAULT_SCALE_MILLI`
+    /// (1.0) so a client that never sends `DisplayInfo` sees no change.
+    display_scale_milli: u16,
+    /// A `DisplayMode` request awaiting its debounce deadline. Overwritten
+    /// (not queued) by every new `DisplayMode`, which is what collapses a
+    /// resize drag's continuous stream of requests into a single applied
+    /// change. `on_timeout` clears this once it fires.
+    pending_display_mode: Option<PendingDisplayMode>,
     /// Accumulator for partial feedback-stream messages. QUIC stream reads
     /// can split a single browser-side write into multiple chunks; we
     /// buffer them here and only consume complete messages, leaving any
@@ -1380,6 +1448,9 @@ impl IoBridge {
             connected_session_count: Arc::new(AtomicUsize::new(0)),
             was_idle: true,
             input_injector: None,
+            display_controller: None,
+            display_scale_milli: DEFAULT_SCALE_MILLI,
+            pending_display_mode: None,
             feedback_recv_buf: Vec::new(),
             datagram_send_errs: 0,
             datagram_send_err_first_logged: false,
@@ -3229,6 +3300,10 @@ impl IoBridge {
         use crate::transport::decode_error::{
             DecodeErrorMsg, DECODE_ERROR_MSG_TYPE, DECODE_ERROR_SIZE,
         };
+        use crate::transport::display::{
+            DisplayInfoMsg, DisplayModeMsg, DISPLAY_INFO_MSG_TYPE, DISPLAY_INFO_SIZE,
+            DISPLAY_MODE_MSG_TYPE, DISPLAY_MODE_SIZE,
+        };
         use crate::transport::feedback::{FEEDBACK_MSG_TYPE, FEEDBACK_SIZE};
 
         // Append the new chunk to our accumulator. QUIC stream reads can
@@ -3279,6 +3354,60 @@ impl IoBridge {
                         self.handle_decode_error(msg);
                     }
                     offset += DECODE_ERROR_SIZE;
+                }
+                DISPLAY_INFO_MSG_TYPE => {
+                    if buf.len() - offset < DISPLAY_INFO_SIZE {
+                        break;
+                    }
+                    if let Some(msg) = DisplayInfoMsg::decode(&buf[offset..]) {
+                        // `mm_width`/`mm_height` are advisory-only (M4b design
+                        // §4.1, §7): logging them here is the ONLY thing
+                        // permitted to read them -- no decision below this
+                        // line may branch on them. `scale_milli` is the
+                        // authoritative DPI signal and is the only field
+                        // carried into `display_scale_milli`.
+                        tracing::debug!(
+                            max_width = msg.max_width,
+                            max_height = msg.max_height,
+                            scale_milli = msg.scale_milli,
+                            mm_width = msg.mm_width,
+                            mm_height = msg.mm_height,
+                            "display info"
+                        );
+                        self.display_scale_milli = msg.scale_milli;
+                    }
+                    offset += DISPLAY_INFO_SIZE;
+                }
+                DISPLAY_MODE_MSG_TYPE => {
+                    if buf.len() - offset < DISPLAY_MODE_SIZE {
+                        break;
+                    }
+                    if let Some(msg) = DisplayModeMsg::decode(&buf[offset..]) {
+                        // Clamp/align/floor now (the decision of *what* to
+                        // apply); only the *when* is deferred to the
+                        // debounce deadline below. A controller-less bridge
+                        // (X backend not wired in yet -- Task 4) has no
+                        // ceiling to clamp against, so the request is
+                        // dropped rather than guessed at.
+                        if let Some(ctl) = self.display_controller.as_ref() {
+                            let ceiling = ctl.ceiling();
+                            let (w, h) = clamp_and_align_mode(msg.width, msg.height, ceiling);
+                            let now_us = now_std().duration_since(self.epoch).as_micros() as u64;
+                            tracing::debug!(
+                                requested_w = msg.width,
+                                requested_h = msg.height,
+                                applied_w = w,
+                                applied_h = h,
+                                "display mode requested; debounced"
+                            );
+                            self.pending_display_mode = Some(PendingDisplayMode {
+                                width: w,
+                                height: h,
+                                deadline_us: now_us + DISPLAY_MODE_DEBOUNCE_US,
+                            });
+                        }
+                    }
+                    offset += DISPLAY_MODE_SIZE;
                 }
                 crate::transport::input_inject::INPUT_MSG_TYPE => {
                     use crate::transport::input_inject::{apply_input, decode_input_msg};
@@ -3335,6 +3464,44 @@ impl IoBridge {
         // so a corrupt byte doesn't wedge the dispatcher.
         if !discard_tail && offset < buf.len() {
             self.feedback_recv_buf.extend_from_slice(&buf[offset..]);
+        }
+    }
+
+    /// Fire any due timers driven by `now_us` (microseconds since
+    /// `IoBridge::epoch` -- the same clock `dispatch_feedback_bytes` stamps
+    /// `PendingDisplayMode::deadline_us` from at `io_bridge.rs:3980`'s
+    /// pattern, so callers never need a second clock to drive this).
+    ///
+    /// Currently the only timer is the `DisplayMode` debounce: once
+    /// `now_us` reaches the stored deadline, applies the pending mode via
+    /// `display_controller.set_output` and clears it, so a resize drag's
+    /// continuous stream of requests collapses into the one size the user
+    /// actually settled on.
+    pub(crate) fn on_timeout(&mut self, now_us: u64) {
+        let Some(pending) = self.pending_display_mode.as_ref() else {
+            return;
+        };
+        if now_us < pending.deadline_us {
+            return;
+        }
+        let PendingDisplayMode { width, height, .. } = self
+            .pending_display_mode
+            .take()
+            .expect("checked Some above");
+        if let Some(ctl) = self.display_controller.as_ref() {
+            match ctl.set_output(width, height, self.display_scale_milli) {
+                Ok(()) => {
+                    tracing::info!(
+                        width,
+                        height,
+                        scale_milli = self.display_scale_milli,
+                        "display mode applied"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(width, height, error = %e, "display mode apply failed");
+                }
+            }
         }
     }
 
@@ -5222,6 +5389,14 @@ impl IoBridge {
             // below.
             self.poll_probe_window(now_std());
 
+            // M4b: fire the DisplayMode debounce timer, if one is pending.
+            // Same epoch-relative clock the classifier's dwell timers use
+            // (`self.epoch`; see `dispatch_feedback_bytes`'s DisplayMode
+            // arm) -- not a second timing mechanism. Cheap no-op when
+            // nothing is pending.
+            let display_now_us = now_std().duration_since(self.epoch).as_micros() as u64;
+            self.on_timeout(display_now_us);
+
             // Phase 1 Task 8: drain accumulated BWE samples (populated by
             // the ACK-receive path in Task 5) into the estimator. Cheap
             // on empty. The wire_seq we feed is a Phase 1 placeholder
@@ -5950,6 +6125,9 @@ impl IoBridge {
             connected_session_count: Arc::new(AtomicUsize::new(0)),
             was_idle: true,
             input_injector: None,
+            display_controller: None,
+            display_scale_milli: DEFAULT_SCALE_MILLI,
+            pending_display_mode: None,
             feedback_recv_buf: Vec::new(),
             datagram_send_errs: 0,
             datagram_send_err_first_logged: false,
@@ -6743,6 +6921,17 @@ mod tests {
             attach_session(&mut bridge, h);
         }
         bridge
+    }
+
+    /// Test-only helper: an `IoBridge` with exactly one attached (disconnected)
+    /// WebTransport session, and the handle it was attached under.
+    /// Convenience wrapper around `test_bridge_with_sessions` for the M4b
+    /// display-negotiation tests, which only ever need one handle to
+    /// dispatch feedback bytes against.
+    async fn test_bridge_with_one_session() -> (IoBridge, ConnectionHandle) {
+        let handle = ConnectionHandle(0);
+        let bridge = test_bridge_with_sessions(&[handle]).await;
+        (bridge, handle)
     }
 
     /// `IoBridge::new_with_lib_config_for_test` must take its transport
@@ -9852,5 +10041,229 @@ mod tests {
         let queued = bridge.scheduler_peek_for_test();
         assert_eq!(queued.len(), 1, "only the in-grid tile is queued");
         assert_eq!((queued[0].tile_x, queued[0].tile_y), (0, 0));
+    }
+
+    // -----------------------------------------------------------------
+    // M4b Task 3: DisplayController dispatch + server-side debounce.
+    // -----------------------------------------------------------------
+
+    /// Mock `DisplayController` recording every `set_output` call as
+    /// `(width, height, scale_milli)`. `ceiling()` defaults to effectively
+    /// unbounded (`u16::MAX`) so tests that aren't exercising the clamp path
+    /// don't accidentally hit it.
+    struct RecordingController {
+        outputs: std::sync::Mutex<Vec<(u16, u16, u16)>>,
+        ceiling: (u16, u16),
+    }
+
+    impl Default for RecordingController {
+        fn default() -> Self {
+            Self {
+                outputs: std::sync::Mutex::new(Vec::new()),
+                ceiling: (u16::MAX, u16::MAX),
+            }
+        }
+    }
+
+    impl RecordingController {
+        fn with_ceiling(width: u16, height: u16) -> Self {
+            Self {
+                outputs: std::sync::Mutex::new(Vec::new()),
+                ceiling: (width, height),
+            }
+        }
+
+        fn outputs(&self) -> Vec<(u16, u16, u16)> {
+            self.outputs.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::transport::display::DisplayController for RecordingController {
+        fn ceiling(&self) -> (u16, u16) {
+            self.ceiling
+        }
+
+        fn set_output(
+            &self,
+            width: u16,
+            height: u16,
+            scale_milli: u16,
+        ) -> Result<(), crate::transport::display::DisplayError> {
+            self.outputs
+                .lock()
+                .unwrap()
+                .push((width, height, scale_milli));
+            Ok(())
+        }
+    }
+
+    /// A `now_us` value comfortably past `DISPLAY_MODE_DEBOUNCE_US` from
+    /// bridge construction, regardless of how much real wall-clock time
+    /// test setup itself burns (these tests don't pause tokio's clock, so
+    /// `self.epoch` is a real `Instant` and dispatch happens microseconds,
+    /// not milliseconds, after it). 10x the debounce interval leaves ample
+    /// margin without being so large it reads as an unrelated constant.
+    fn debounce_elapsed_us() -> u64 {
+        DISPLAY_MODE_DEBOUNCE_US * 10
+    }
+
+    #[tokio::test]
+    async fn a_display_mode_request_reaches_the_controller() {
+        use crate::transport::display::DisplayModeMsg;
+
+        let (mut bridge, handle) = test_bridge_with_one_session().await;
+        let ctl = Arc::new(RecordingController::default());
+        bridge.display_controller = Some(ctl.clone());
+
+        let mut buf = Vec::new();
+        DisplayModeMsg {
+            width: 1280,
+            height: 800,
+        }
+        .encode(&mut buf);
+        bridge.dispatch_feedback_bytes(handle, &buf);
+        bridge.on_timeout(debounce_elapsed_us());
+
+        assert_eq!(ctl.outputs(), vec![(1280, 800, 1000)]);
+    }
+
+    #[tokio::test]
+    async fn rapid_resizes_collapse_to_one_change() {
+        // A resize drag emits continuously. Applying every one would thrash
+        // X for sizes the user never settled on.
+        use crate::transport::display::DisplayModeMsg;
+
+        let (mut bridge, handle) = test_bridge_with_one_session().await;
+        let ctl = Arc::new(RecordingController::default());
+        bridge.display_controller = Some(ctl.clone());
+
+        for w in [1000u16, 1100, 1200, 1280] {
+            let mut buf = Vec::new();
+            DisplayModeMsg {
+                width: w,
+                height: 800,
+            }
+            .encode(&mut buf);
+            bridge.dispatch_feedback_bytes(handle, &buf);
+        }
+        bridge.on_timeout(debounce_elapsed_us());
+
+        assert_eq!(
+            ctl.outputs().len(),
+            1,
+            "only the final size should be applied"
+        );
+        assert_eq!(ctl.outputs()[0].0, 1280);
+    }
+
+    #[tokio::test]
+    async fn a_width_is_aligned_down_to_the_cvt_granularity() {
+        // CVT rounds h_active UP to a multiple of 8: `cvt 1283 817 60 -r`
+        // gives a 1288-wide mode. Rendering 1288 into a 1283-wide window
+        // crops 5 px of the remote desktop off-screen -- content the user
+        // cannot see or scroll to. Aligning DOWN leaves a 3 px border
+        // instead, which is harmless.
+        use crate::transport::display::DisplayModeMsg;
+
+        let (mut bridge, handle) = test_bridge_with_one_session().await;
+        let ctl = Arc::new(RecordingController::default());
+        bridge.display_controller = Some(ctl.clone());
+
+        let mut buf = Vec::new();
+        DisplayModeMsg {
+            width: 1283,
+            height: 817,
+        }
+        .encode(&mut buf);
+        bridge.dispatch_feedback_bytes(handle, &buf);
+        bridge.on_timeout(debounce_elapsed_us());
+
+        assert_eq!(
+            ctl.outputs(),
+            vec![(1280, 817, 1000)],
+            "width must align down to a multiple of 8; height is unconstrained"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tiny_window_does_not_collapse_to_nothing() {
+        use crate::transport::display::DisplayModeMsg;
+
+        let (mut bridge, handle) = test_bridge_with_one_session().await;
+        let ctl = Arc::new(RecordingController::default());
+        bridge.display_controller = Some(ctl.clone());
+
+        let mut buf = Vec::new();
+        DisplayModeMsg {
+            width: 4,
+            height: 3,
+        }
+        .encode(&mut buf);
+        bridge.dispatch_feedback_bytes(handle, &buf);
+        bridge.on_timeout(debounce_elapsed_us());
+
+        let (w, h, _) = ctl.outputs()[0];
+        assert!(
+            w >= MIN_MODE_WIDTH && h >= MIN_MODE_HEIGHT,
+            "expected a floor, got {w}x{h}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mode_above_the_ceiling_is_clamped_not_rejected() {
+        use crate::transport::display::DisplayModeMsg;
+
+        let (mut bridge, handle) = test_bridge_with_one_session().await;
+        let ctl = Arc::new(RecordingController::with_ceiling(4096, 2160));
+        bridge.display_controller = Some(ctl.clone());
+
+        let mut buf = Vec::new();
+        DisplayModeMsg {
+            width: 8192,
+            height: 4320,
+        }
+        .encode(&mut buf);
+        bridge.dispatch_feedback_bytes(handle, &buf);
+        bridge.on_timeout(debounce_elapsed_us());
+
+        assert_eq!(
+            ctl.outputs(),
+            vec![(4096, 2160, 1000)],
+            "an oversized request must be clamped so the client still gets a picture"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_scale_from_display_info_is_applied_to_later_modes() {
+        // DisplayInfo carries the scale once; every subsequent mode change
+        // must carry it through, or a resize would silently reset the
+        // user's DPI.
+        use crate::transport::display::{DisplayInfoMsg, DisplayModeMsg};
+
+        let (mut bridge, handle) = test_bridge_with_one_session().await;
+        let ctl = Arc::new(RecordingController::default());
+        bridge.display_controller = Some(ctl.clone());
+
+        let mut info = Vec::new();
+        DisplayInfoMsg {
+            max_width: 2560,
+            max_height: 1440,
+            scale_milli: 1500,
+            mm_width: 597,
+            mm_height: 336,
+        }
+        .encode(&mut info);
+        bridge.dispatch_feedback_bytes(handle, &info);
+
+        let mut mode = Vec::new();
+        DisplayModeMsg {
+            width: 1280,
+            height: 800,
+        }
+        .encode(&mut mode);
+        bridge.dispatch_feedback_bytes(handle, &mode);
+        bridge.on_timeout(debounce_elapsed_us());
+
+        assert_eq!(ctl.outputs(), vec![(1280, 800, 1500)]);
     }
 }
