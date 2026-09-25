@@ -188,6 +188,15 @@ impl DisplayController for XrandrDisplay {
                     width: timing.h_active,
                     height: timing.v_active,
                     // ModeInfo.dot_clock is Hz; `Timing::pixel_clock_khz` is kHz.
+                    //
+                    // Verified against a live X server rather than assumed:
+                    // `xrandr --verbose` reports 1920x1080 at 148.500MHz with
+                    // htotal 2640 and a horizontal clock of 56.25KHz, and
+                    // 148_500_000 / 2640 = 56_250 exactly. Only a Hz-valued
+                    // dot_clock makes that arithmetic close, so the *1000 is
+                    // right. A kHz value here would produce a mode whose
+                    // clock is 1000x too slow -- one X accepts and no display
+                    // can drive.
                     dot_clock: timing.pixel_clock_khz * 1000,
                     hsync_start: timing.h_sync_start,
                     hsync_end: timing.h_sync_end,
