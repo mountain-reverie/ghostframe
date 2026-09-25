@@ -1,4 +1,5 @@
 mod cvt;
+mod display;
 mod drm_capture;
 mod input_inject;
 mod x11_capture;
@@ -180,11 +181,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None
     };
 
+    // Same reasoning as the XTest injector above: RandR is an ordinary,
+    // unprivileged X client operation now that the X server is confirmed up.
+    // If it's unavailable (extension missing, no connected output), log and
+    // continue with no display controller -- the server still streams at a
+    // fixed resolution, which beats refusing to start.
+    let display_controller: Option<
+        std::sync::Arc<dyn ghostframe_lib::transport::display::DisplayController>,
+    > = if !init_mode {
+        match display::XrandrDisplay::new() {
+            Ok(ctl) => {
+                tracing::info!("XRandR display controller ready");
+                Some(std::sync::Arc::new(ctl))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "XRandR display controller unavailable; resolution negotiation disabled"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let lib_config = ghostframe_lib::config::LibConfig::from_env();
     tracing::info!(?lib_config, "effective LibConfig");
 
     tracing::info!("Connecting to Tailscale...");
-    let server = match GhostframeServer::new(config, ":443", lib_config, input_injector).await {
+    let server = match GhostframeServer::new(
+        config,
+        ":443",
+        lib_config,
+        input_injector,
+        display_controller,
+    )
+    .await
+    {
         Ok(s) => s,
         Err(e) => {
             if let Some(ws) = e.downcast_ref::<ghostframe_lib::WebServerError>() {
