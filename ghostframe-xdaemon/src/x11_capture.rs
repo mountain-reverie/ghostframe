@@ -135,8 +135,56 @@ impl X11Capture {
         }
     }
 
+    /// Poll the root window's current geometry and, if it changed since
+    /// the last capture, rebuild the cached dimensions and target buffer.
+    ///
+    /// Polled once per captured frame rather than driven by
+    /// `RRScreenChangeNotify`: this adds one `GetGeometry` round-trip next
+    /// to the `GetImage` the capture already performs -- negligible -- and,
+    /// unlike an event subscription, it can't miss a notification and
+    /// doesn't need a second X connection to listen on. If profiling ever
+    /// shows the round-trip matters, switching to the RandR event is the
+    /// natural upgrade; until then, this was a deliberate choice, not an
+    /// oversight.
+    fn refresh_geometry(&mut self) -> io::Result<()> {
+        let geom = self
+            .conn
+            .get_geometry(self.root)
+            .map_err(io::Error::other)?
+            .reply()
+            .map_err(io::Error::other)?;
+        if let Some((w, h)) = resize_needed((self.width, self.height), (geom.width, geom.height)) {
+            tracing::info!(
+                old_width = self.width,
+                old_height = self.height,
+                new_width = w,
+                new_height = h,
+                "X11 root geometry changed; resizing capture target"
+            );
+            self.width = w;
+            self.height = h;
+            self.target = vec![0u8; (w as usize) * (h as usize) * 4];
+            // We deliberately do NOT re-run `pick_strategy` here.
+            // `pick_strategy` depends on (a) whether the COMPOSITE
+            // extension is present -- fixed for the lifetime of this X
+            // connection -- and (b) who currently owns `_NET_WM_CM_S0`,
+            // i.e. whether a compositor is running. A RandR mode change
+            // resizes the existing compositor's output in place; it does
+            // not tear down or restart the compositing manager, so
+            // selection ownership is unaffected and re-probing here would
+            // just be an extra round trip that always finds the same
+            // answer. There's also no cached *root pixmap* to invalidate:
+            // `capture_root` re-issues `GetImage` on `self.root` (the
+            // window, not a pixmap) fresh every call. If we ever observe
+            // a compositor start or stop without an xdaemon restart,
+            // that would be the trigger to reconsider this.
+        }
+        Ok(())
+    }
+
     /// Capture a single frame.
     pub fn capture(&mut self, timestamp_us: u32) -> io::Result<FrameSubmission> {
+        self.refresh_geometry()?;
         let frame = match self.strategy {
             Strategy::PerWindowComposite => self.capture_composite(timestamp_us)?,
             Strategy::RootGetImage => self.capture_root(timestamp_us)?,
@@ -370,6 +418,18 @@ impl X11Capture {
             capture_done_ns,
         })
     }
+}
+
+/// Decide whether the cached capture geometry must be rebuilt.
+///
+/// Called once per captured frame, so the unchanged case must be free.
+/// A zero dimension is ignored rather than honoured: X can report one
+/// briefly mid-transition, and resizing to it would yield empty frames.
+fn resize_needed(current: (u16, u16), actual: (u16, u16)) -> Option<(u16, u16)> {
+    if actual.0 == 0 || actual.1 == 0 || actual == current {
+        return None;
+    }
+    Some(actual)
 }
 
 /// Pick a strategy by probing COMPOSITE + `_NET_WM_CM_S0`.
@@ -654,6 +714,27 @@ mod tests {
             },
         );
         assert_eq!(target, backup);
+    }
+
+    #[test]
+    fn a_changed_root_geometry_requires_a_resize() {
+        assert_eq!(resize_needed((640, 480), (1280, 800)), Some((1280, 800)));
+    }
+
+    #[test]
+    fn an_unchanged_geometry_does_not() {
+        // This runs once per captured frame. Reallocating a multi-megabyte
+        // buffer every frame because the check was sloppy would be a worse
+        // bug than the one being fixed.
+        assert_eq!(resize_needed((1280, 800), (1280, 800)), None);
+    }
+
+    #[test]
+    fn a_zero_geometry_is_ignored() {
+        // X can briefly report 0 during a mode transition. Resizing to it
+        // would yield empty frames or panic on a zero-sized buffer.
+        assert_eq!(resize_needed((1280, 800), (0, 0)), None);
+        assert_eq!(resize_needed((1280, 800), (1280, 0)), None);
     }
 
     #[test]
