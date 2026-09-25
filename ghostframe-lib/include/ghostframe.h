@@ -77,6 +77,14 @@
 
 #define ERR_RLE_UNDERSHOOT 7
 
+#define DISPLAY_INFO_MSG_TYPE 7
+
+#define DISPLAY_MODE_MSG_TYPE 8
+
+#define DISPLAY_INFO_SIZE 11
+
+#define DISPLAY_MODE_SIZE 5
+
 /**
  * Inline capacity for the coverage list per key.
  * Sized for typical bundled-PalRle and single-pass-Cdf53 cases without

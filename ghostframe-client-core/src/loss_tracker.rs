@@ -100,3 +100,42 @@ pub fn encode_hello(indices_raw: bool, supports_h264: bool) -> Vec<u8> {
     }
     vec![HELLO_MSG_TYPE, caps]
 }
+
+/// DisplayInfo message type. Mirrors `ghostframe_lib::transport::display`;
+/// duplicated here because `ghostframe-client-core` must not depend on
+/// `ghostframe-lib` (the server crate), so both sides are pinned together
+/// only by the byte-exact oracle tests in `tests/oracle_feedback.rs`.
+pub const DISPLAY_INFO_MSG_TYPE: u8 = 0x07;
+
+/// DisplayMode message type.
+pub const DISPLAY_MODE_MSG_TYPE: u8 = 0x08;
+
+/// Encode a DisplayInfo message:
+/// `[0x07][max_w:u16][max_h:u16][scale_milli:u16][mm_w:u16][mm_h:u16]`, all
+/// big-endian. `scale_milli` is authoritative; `mm_width`/`mm_height` are
+/// advisory only -- see [`crate::ClientDisplay`].
+pub fn encode_display_info(
+    max_width: u16,
+    max_height: u16,
+    scale_milli: u16,
+    mm_width: u16,
+    mm_height: u16,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(11);
+    buf.push(DISPLAY_INFO_MSG_TYPE);
+    buf.extend_from_slice(&max_width.to_be_bytes());
+    buf.extend_from_slice(&max_height.to_be_bytes());
+    buf.extend_from_slice(&scale_milli.to_be_bytes());
+    buf.extend_from_slice(&mm_width.to_be_bytes());
+    buf.extend_from_slice(&mm_height.to_be_bytes());
+    buf
+}
+
+/// Encode a DisplayMode message: `[0x08][w:u16][h:u16]`, big-endian.
+pub fn encode_display_mode(width: u16, height: u16) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(5);
+    buf.push(DISPLAY_MODE_MSG_TYPE);
+    buf.extend_from_slice(&width.to_be_bytes());
+    buf.extend_from_slice(&height.to_be_bytes());
+    buf
+}

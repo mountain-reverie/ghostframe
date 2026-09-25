@@ -9,6 +9,7 @@ fn core_with(delivery: TileDelivery) -> ClientCore {
             indices_raw_enabled: true,
             supports_h264: true,
             tile_delivery: delivery,
+            display: None,
         },
         0,
     );

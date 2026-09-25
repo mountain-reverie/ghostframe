@@ -59,6 +59,7 @@ fn core() -> ClientCore {
             indices_raw_enabled: true,
             supports_h264: true,
             tile_delivery: TileDelivery::Decoded,
+            display: None,
         },
         0,
     );

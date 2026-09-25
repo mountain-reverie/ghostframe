@@ -41,6 +41,7 @@ impl WasmClientCore {
             } else {
                 TileDelivery::Decoded
             },
+            display: None,
         };
         WasmClientCore {
             inner: ClientCore::new(config, now_us),
