@@ -75,12 +75,14 @@ impl GhostframeServer {
         listen_addr: &str,
         lib_config: crate::config::LibConfig,
         input_injector: Option<Arc<dyn crate::transport::input_inject::InputInjector>>,
+        display_controller: Option<Arc<dyn crate::transport::display::DisplayController>>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let (frame_tx, frame_rx) = mpsc::channel::<FrameSubmission>(2);
 
         let mut bridge =
             IoBridge::new_with_frames(&config, listen_addr, frame_rx, lib_config).await?;
         bridge.input_injector = input_injector;
+        bridge.display_controller = display_controller;
         let cert_hash = bridge.cert_hash_sha256().to_owned();
         let connected_session_count = bridge.connected_session_count_handle();
 

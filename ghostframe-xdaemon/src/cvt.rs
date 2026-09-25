@@ -43,9 +43,6 @@
 
 /// A full modeline: everything RandR's `CreateMode` needs beyond width and
 /// height.
-// Not yet consumed outside this module: the RandR `CreateMode` call site
-// lands in a later M4b task. Remove this once that wiring lands.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timing {
     pub pixel_clock_khz: u32,
@@ -74,8 +71,6 @@ pub struct Timing {
 /// refresh before this ever runs — so this is documented rather than
 /// guarded. Revisit if this function stops being fed only pre-validated
 /// input.
-// Not yet consumed outside this module: see `Timing`'s doc comment.
-#[allow(dead_code)]
 pub fn reduced_blanking(width: u16, height: u16, refresh_hz: u16) -> Timing {
     // --- Fixed CVT-RB v1 parameters (VESA CVT 1.2, reduced blanking) ---
     // Horizontal granularity: h_active is rounded to a multiple of this.
