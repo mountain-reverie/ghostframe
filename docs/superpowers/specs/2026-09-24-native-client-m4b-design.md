@@ -61,6 +61,37 @@ reconnecting from a different machine useful — the alternative, rewriting
 Two costs, accepted: a framebuffer sized for the worst case, and a hard clamp
 above 4K. Both recorded in §11.
 
+### 2.1 Correction: `Virtual` may not be a hard ceiling after all
+
+Measured during Task 4 on a live X server:
+
+```
+Screen 0: minimum 320 x 200, current 1920 x 1080, maximum 16384 x 16384
+```
+
+`GetScreenSizeRange` reports the **driver's** capability, not the `Virtual`
+line. Two consequences:
+
+1. **`ceiling()` clamps nothing in production.** Task 3's clamp logic is
+   correct and its tests pass against a mock ceiling, but with a real ceiling
+   of 16384x16384 no realistic client request is ever clamped. The clamp is a
+   guard against absurdity, not the mechanism that keeps requests in range.
+2. **RandR 1.2 drivers can grow the screen past the startup size** via the
+   driver's resize hook, so `Virtual` may be the *initial* size rather than a
+   ceiling. If so, §2's premise is wrong — though its conclusion (start
+   generous) is still harmless and still removes a dependency on the driver
+   reallocating.
+
+**What protects us either way**: a request the driver cannot satisfy fails at
+`SetScreenSize`/`SetCrtcConfig`, `set_output` returns `Err`, the failure is
+logged, and the session keeps its current mode (§6). Safe by failure, not by
+prediction.
+
+**Open question for the end-to-end task**: with an explicit `Virtual 1920 1080`,
+can RandR grow the screen to 2560x1440? That is cheap to answer once an X
+server on a virtual connector exists, and the answer decides whether raising
+`Virtual` is necessary or merely prudent. Do not guess it here.
+
 ---
 
 ## 3. What is negotiated
