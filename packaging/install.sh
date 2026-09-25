@@ -4,6 +4,15 @@
 # session for a specific user.
 #
 # Usage:  sudo ./packaging/install.sh <username> [--force]
+#                                      [--display-backend amdgpu|vkms]
+#
+# --display-backend amdgpu (default): the GPU presents a virtual connector via
+#   the `amdgpu virtual_display=` module option. Requires a machine with NO
+#   local desktop -- a DRM device has one master at a time, so a Ghostframe X
+#   server on the same GPU takes the display away from a local session.
+# --display-backend vkms: run the session on VKMS, a separate virtual DRM
+#   device. Safe alongside a local desktop; costs GPU acceleration inside the
+#   Ghostframe session (VKMS has no render node). Requires the vkms module.
 #
 # What it does:
 #   1. Verifies required binaries are on the host (Xorg, amdgpu, enlightenment).
@@ -43,10 +52,27 @@ done
 [[ ${EUID} -eq 0 ]] || die "must be run as root (try: sudo $0 $*)"
 
 force=0
+display_backend="amdgpu"
 target_user=""
+expect_backend=0
 for arg in "$@"; do
+  if [[ $expect_backend -eq 1 ]]; then
+    case "$arg" in
+      amdgpu|vkms) display_backend="$arg" ;;
+      *) die "--display-backend must be 'amdgpu' or 'vkms' (got '$arg')" ;;
+    esac
+    expect_backend=0
+    continue
+  fi
   case "$arg" in
     --force) force=1 ;;
+    --display-backend) expect_backend=1 ;;
+    --display-backend=*) 
+      case "${arg#*=}" in
+        amdgpu|vkms) display_backend="${arg#*=}" ;;
+        *) die "--display-backend must be 'amdgpu' or 'vkms' (got '${arg#*=}')" ;;
+      esac
+      ;;
     --help|-h) ;;
     -*) die "unknown flag: $arg" ;;
     *)
@@ -55,6 +81,11 @@ for arg in "$@"; do
       ;;
   esac
 done
+
+# A trailing bare `--display-backend` would otherwise leave the default in
+# place silently, which is the wrong outcome for a flag whose whole purpose is
+# to pick a non-default.
+[[ $expect_backend -eq 0 ]] || die "--display-backend requires a value: amdgpu or vkms"
 
 [[ -n "$target_user" ]] || die "username required (try: sudo $0 <username>)"
 id "$target_user" >/dev/null 2>&1 || die "user '$target_user' does not exist"
@@ -67,6 +98,7 @@ user_home=$(getent passwd "$target_user" | cut -d: -f6)
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 pkg_dir="$repo_root/packaging"
 [[ -f "$pkg_dir/xorg-headless-amdgpu.conf" ]] || die "missing $pkg_dir/xorg-headless-amdgpu.conf"
+[[ -f "$pkg_dir/xorg-headless-vkms.conf.tmpl" ]] || die "missing $pkg_dir/xorg-headless-vkms.conf.tmpl"
 
 # 1. Preflight.
 info "preflight: checking required binaries..."
@@ -116,8 +148,36 @@ fi
 # (e.g. M4b's framebuffer size bump) silently kept the old file on any
 # existing install and made the new feature look broken.
 xorg_dst="/etc/X11/ghostframe-headless.conf"
-info "install: $xorg_dst"
-install -D -m 0644 -o root -g root "$pkg_dir/xorg-headless-amdgpu.conf" "$xorg_dst"
+info "install: $xorg_dst  (backend: $display_backend)"
+if [[ "$display_backend" == "vkms" ]]; then
+  # VKMS is a virtual device: it has no /dev/dri/by-path entry and DRM card
+  # numbering is not stable across boots, so the kmsdev path cannot be
+  # hardcoded in the config. Identify it by the device directory's name --
+  # /sys/class/drm/cardN/device resolves to .../vkms for the virtual device
+  # and to a PCI address for a real GPU.
+  vkms_card=""
+  for c in /dev/dri/card*; do
+    [[ -c "$c" ]] || continue
+    dev_dir=$(readlink -f "/sys/class/drm/$(basename "$c")/device" 2>/dev/null) || continue
+    if [[ "$(basename "$dev_dir")" == "vkms" ]]; then
+      vkms_card="$c"
+      break
+    fi
+  done
+  if [[ -z "$vkms_card" ]]; then
+    die "--display-backend vkms: no VKMS DRM device found.
+     Load the module first:
+       echo vkms | sudo tee /etc/modules-load.d/vkms.conf
+       echo 'options vkms enable_writeback=1' | sudo tee /etc/modprobe.d/vkms.conf
+       sudo modprobe vkms
+     Then confirm:  ls /sys/class/drm/ | grep Virtual"
+  fi
+  info "       VKMS detected at $vkms_card"
+  sed "s|__KMSDEV__|$vkms_card|g" "$pkg_dir/xorg-headless-vkms.conf.tmpl" \
+    | install -D -m 0644 -o root -g root /dev/stdin "$xorg_dst"
+else
+  install -D -m 0644 -o root -g root "$pkg_dir/xorg-headless-amdgpu.conf" "$xorg_dst"
+fi
 
 # 4. Xwrapper policy.
 #

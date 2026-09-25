@@ -1,0 +1,104 @@
+# Ghostframe headless Xorg configuration for VKMS (Virtual KMS).
+#
+# Use this INSTEAD of xorg-headless-amdgpu.conf when the machine's GPU also
+# drives a local desktop.
+#
+# WHY THIS EXISTS
+#
+# A DRM device has exactly one master at a time, and VT switching is what hands
+# it between X servers. Two X servers therefore cannot both drive one GPU
+# simultaneously: whichever owns the active VT owns the device, and the other's
+# outputs go dark. An `amdgpu virtual_display` session on the same card as your
+# desktop will fight it for the GPU -- starting the Ghostframe session takes the
+# display away from the local one.
+#
+# Observed in production: a PiKVM attached to the host showed the *Ghostframe*
+# desktop instead of the console session after the Ghostframe units restarted.
+# That is not a misconfiguration to tune away; it is what one-master-per-device
+# means.
+#
+# VKMS is a separate DRM device with its own master. The Ghostframe X server
+# holds it indefinitely while the local desktop keeps the real GPU: no VT
+# contention, and no path by which this server can reach a physical connector.
+#
+# WHAT IT COSTS
+#
+# VKMS has no render node, so there is no GPU acceleration inside the Ghostframe
+# session -- rendering is software (llvmpipe for GL, CPU for core X). Fine for
+# terminals, editors and 2D applications; not for 3D or video playback.
+#
+# Capture and H.264 encode are NOT affected. They use the real GPU's render node
+# (/dev/dri/renderD128), which is a different device from this display one. The
+# guest install captures over the X protocol anyway --
+# ghostframe-xdaemon.service sets GHOSTFRAME_X11_CAPTURE_ONLY=1 so the DRM
+# fallback cannot read the host's scanout by mistake -- so none of the
+# DMA-BUF-coherency options the e2e container's VKMS config carries
+# (ShadowFB / PageFlip / DRI) are needed here.
+#
+# REQUIRES the vkms module, loaded before X starts:
+#
+#   /etc/modules-load.d/vkms.conf   containing: vkms
+#   /etc/modprobe.d/vkms.conf       containing: options vkms enable_writeback=1
+#
+# __KMSDEV__ is substituted by install.sh with the VKMS card it detected. VKMS
+# is a virtual device with no entry under /dev/dri/by-path, and DRM card
+# numbering is not stable across boots, so this path cannot be hardcoded.
+
+Section "ServerLayout"
+    Identifier "Layout0"
+    Screen 0 "Screen0"
+    # No secondary GPU: this X server must never bind the real card, or it
+    # would be back to contending for the master that the local desktop holds.
+    Option "AutoAddGPU" "off"
+    Option "AutoBindGPU" "off"
+EndSection
+
+Section "ServerFlags"
+    Option "DontVTSwitch" "true"
+    Option "AutoAddDevices" "false"
+EndSection
+
+Section "Device"
+    Identifier "VKMS"
+    Driver     "modesetting"
+    Option     "kmsdev" "__KMSDEV__"
+    # VKMS has no render node, so glamor has no GL device to bind. Say so
+    # explicitly rather than letting glamor initialise, fail, and fall back.
+    Option     "AccelMethod" "none"
+    # Bind the screen to the virtual connector only.
+    #
+    # Unlike the amdgpu config -- where this is what stops the server driving
+    # a physical output -- VKMS exposes no physical connectors, so this is not
+    # load-bearing for isolation. It is here because it fails LOUDLY: if the
+    # vkms module is not loaded, `Virtual-1` does not exist and Xorg refuses
+    # to start, rather than silently binding whatever else it found. Check
+    # `ls /sys/class/drm/ | grep Virtual` when diagnosing a failed start.
+    Option     "ZaphodHeads" "Virtual-1"
+EndSection
+
+Section "Monitor"
+    Identifier "VirtualMonitor"
+    HorizSync  30.0-120.0
+    VertRefresh 50.0-75.0
+    Option "Enable" "true"
+EndSection
+
+Section "Screen"
+    Identifier "Screen0"
+    Device     "VKMS"
+    Monitor    "VirtualMonitor"
+    DefaultDepth 24
+    SubSection "Display"
+        Depth  24
+        # 1920x1080 active by default; clients negotiate something else via
+        # RandR (M4b). `Virtual` allocates the framebuffer up to 4096x2160.
+        #
+        # Note M4b measured that `Virtual` is NOT a hard ceiling -- RandR 1.2
+        # drivers reallocate through their resize hook, and a 640x480 e2e
+        # container was driven to 2560x1440 successfully. Sizing it generously
+        # here is prudence (it avoids depending on that reallocation under
+        # memory pressure, for ~27 MB), not a requirement.
+        Modes  "1920x1080" "1280x720" "640x480"
+        Virtual 4096 2160
+    EndSubSection
+EndSection
