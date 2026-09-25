@@ -56,11 +56,19 @@ else
 fi
 
 # ------------------------------------------------- required debugfs files --
-say "Step 2: the two files the design depends on"
-for f in edid_override trigger_hotplug; do
-  if [[ -e "$MINOR/Virtual-1/$f" ]]; then ans "$f" "present"
-  else ans "$f" "MISSING -- design depends on it, stop here"; exit 1; fi
-done
+say "Step 2: the files the design depends on"
+# trigger_hotplug does NOT exist on this connector (found on the first spike
+# run). The reprobe trigger is the sysfs `status` file instead: writing
+# "detect" clears any forced state and re-runs connector probing, which
+# re-reads the EDID honouring the override and then emits a hotplug event.
+# Only edid_override needs debugfs; the trigger is plain sysfs.
+if [[ -e "$MINOR/Virtual-1/edid_override" ]]; then ans "edid_override (debugfs)" "present"
+else ans "edid_override (debugfs)" "MISSING -- design depends on it, stop here"; exit 1; fi
+if [[ -e "$MINOR/Virtual-1/trigger_hotplug" ]]; then ans "trigger_hotplug (debugfs)" "present (unused; status=detect is the trigger)"
+else ans "trigger_hotplug (debugfs)" "absent -- expected on this kernel, using status=detect"; fi
+STATUS_F="/sys/class/drm/$CONN/status"
+if [[ -w "$STATUS_F" ]]; then ans "status (sysfs, the trigger)" "writable"
+else ans "status (sysfs, the trigger)" "NOT writable -- no reprobe mechanism, stop"; exit 1; fi
 
 # ------------------------------------------------------------- before -----
 say "Step 3: state BEFORE injection"
@@ -72,8 +80,10 @@ ans "edid size (bytes)" "$BEFORE_EDID_BYTES"
 # restore on any exit from here on
 restore() {
   say "Restoring $CONN to its original state"
-  printf '1' > "$MINOR/Virtual-1/edid_override" 2>/dev/null
-  echo 1 > "$MINOR/Virtual-1/trigger_hotplug" 2>/dev/null
+  # Try the documented resets in order; verify after, do not assume.
+  : > "$MINOR/Virtual-1/edid_override" 2>/dev/null          # zero-length write
+  printf 'reset' > "$MINOR/Virtual-1/edid_override" 2>/dev/null
+  echo detect > "$STATUS_F" 2>/dev/null
   sleep 1
   local m b
   m=$(cat "/sys/class/drm/$CONN/modes" 2>/dev/null | tr '\n' ' ')
@@ -83,7 +93,12 @@ restore() {
   if [[ "$b" == "$BEFORE_EDID_BYTES" ]]; then
     ans "REVERSIBLE" "YES -- back to the original state"
   else
-    ans "REVERSIBLE" "NO -- edid size $b != original $BEFORE_EDID_BYTES (INVESTIGATE)"
+    ans "REVERSIBLE" "NO -- edid size $b != original $BEFORE_EDID_BYTES"
+    echo
+    echo "  !! The connector still has an injected EDID. To clear it fully:"
+    echo "       sudo modprobe -r vkms && sudo modprobe vkms"
+    echo "     (safe for your desktop -- it is on card1/amdgpu -- but it will"
+    echo "      disturb any VKMS-backed e2e run.)  A reboot also clears it."
   fi
   rm -f "$BLOB"
 }
@@ -100,8 +115,8 @@ ans "blob header ok" "$(head -c 8 "$BLOB" | xxd -p)"
 
 cat "$BLOB" > "$MINOR/Virtual-1/edid_override" || { echo "FAIL: write to edid_override failed"; exit 1; }
 ans "edid_override write" "accepted"
-echo 1 > "$MINOR/Virtual-1/trigger_hotplug" || { echo "FAIL: trigger_hotplug failed"; exit 1; }
-ans "trigger_hotplug" "accepted"
+echo detect > "$STATUS_F" || { echo "FAIL: write 'detect' to status failed"; exit 1; }
+ans "status=detect (reprobe trigger)" "accepted"
 sleep 1
 
 # -------------------------------------------------------------- after -----
