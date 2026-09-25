@@ -3514,6 +3514,20 @@ impl IoBridge {
         let Some(pending) = self.pending_display_mode.as_ref() else {
             return;
         };
+        // Diagnostic for the open M4b defect: the e2e shows a pending mode
+        // stored and never applied, with no log from either arm below. This
+        // line distinguishes "deadline never reached" from "loop never woke"
+        // -- run the server with
+        // `RUST_LOG=ghostframe_lib::transport::io_bridge=trace` to see it.
+        // Left in (at trace) rather than deleted because reproducing the
+        // failure needs a container rebuild, which is expensive.
+        tracing::trace!(
+            now_us,
+            deadline_us = pending.deadline_us,
+            due = now_us >= pending.deadline_us,
+            has_controller = self.display_controller.is_some(),
+            "m4b-diag: on_timeout saw a pending display mode"
+        );
         if now_us < pending.deadline_us {
             return;
         }
