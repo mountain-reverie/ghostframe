@@ -89,8 +89,15 @@ fn fill_message(dst: &mut [libc::c_char; 256], msg: &str) {
     // SAFETY: `libc::c_char` and `u8` are both one-byte integer types on
     // every platform this library targets; the pointer cast below just
     // reinterprets the destination's signedness.
+    //
+    // `.cast()` rather than a second `as`: `c_char` is `i8` on x86-64 but
+    // `u8` on aarch64, so `as *mut [u8; 256]` is a real cast on one and a
+    // no-op on the other -- and clippy's `unnecessary_cast` fires on the
+    // no-op, failing `-D warnings` on ARM only. CI runs x86-64 and never
+    // saw it. `pointer::cast` is exempt from that lint and compiles
+    // identically on both.
     let dst_u8: &mut [u8; 256] =
-        unsafe { &mut *(dst as *mut [libc::c_char; 256] as *mut [u8; 256]) };
+        unsafe { &mut *(dst as *mut [libc::c_char; 256]).cast::<[u8; 256]>() };
     dst_u8[..n].copy_from_slice(&bytes[..n]);
     dst_u8[n] = 0;
     // Zero any leftover tail from a previous, longer message.
