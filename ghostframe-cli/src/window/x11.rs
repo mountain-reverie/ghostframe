@@ -599,6 +599,22 @@ impl X11Backend {
 }
 
 impl Backend for X11Backend {
+    /// X11/DRI3 imports through `PixmapFromBuffers`, which this backend gives
+    /// the frame's modifier. In practice only `DRM_FORMAT_MOD_LINEAR` is safe to
+    /// assume: an X server that cannot handle a vendor-tiled or compressed
+    /// modifier does not reject the pixmap, it draws garbage.
+    ///
+    /// Declaring LINEAR rather than inheriting the default empty list is what
+    /// turns that into a negotiation. An empty list means "library picks", which
+    /// `choose_modifier` cannot distinguish from "anything works" -- and on
+    /// Mali/panfrost it duly picked AFBC, which rendered as a repeating green
+    /// grid. Now a producer that cannot offer linear fails with
+    /// `NoCommonModifier` instead, naming both sides' lists.
+    fn preferred_dmabuf_modifiers(&self) -> Vec<u64> {
+        const DRM_FORMAT_MOD_LINEAR: u64 = 0;
+        vec![DRM_FORMAT_MOD_LINEAR]
+    }
+
     fn present(
         &mut self,
         frame: &PublishedFrame,

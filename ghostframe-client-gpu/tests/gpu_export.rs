@@ -72,15 +72,20 @@ fn raw_vulkan_device_is_reachable_for_the_export_path() {
     );
 }
 
-/// The GLES sibling of the above, and for the same reason: wgpu-hal offers
-/// dmabuf import but no export, so `export_gles.rs` has to reach EGL directly.
+/// The GLES sibling of the above, and for the same reason: wgpu-hal cannot
+/// build a texture over a dmabuf we allocated, so `export_gles.rs` reaches EGL
+/// and GL directly.
 ///
-/// This asserts the *whole* hatch, not just that a pointer came back: that the
-/// EGL instance resolves, that the display is real, and that
-/// `eglExportDMABUFImageMESA` itself can be loaded through it. A driver that
-/// advertises the extension string but fails to resolve the entry point is a
-/// configuration that exists, and it would otherwise surface as a null call
-/// inside an export.
+/// Asserts the *whole* hatch, not just that a pointer came back: that the EGL
+/// instance resolves, that the display is real, and that every entry point the
+/// export path calls can be loaded through it. A driver that advertises the
+/// extension string and then fails to resolve one of its functions is a real
+/// configuration, and it would otherwise surface as a null call mid-export.
+///
+/// The list tracks what `export_gles.rs` actually loads. It named the
+/// `eglExportDMABUFImage*MESA` pair while the export went the other way
+/// (wgpu texture -> dmabuf); that direction is gone -- panfrost only ever
+/// exported AFBC -- so those are no longer the functions to check.
 #[cfg(feature = "gles")]
 #[test]
 fn raw_egl_is_reachable_and_exports_resolve() {
@@ -94,8 +99,11 @@ fn raw_egl_is_reachable_and_exports_resolve() {
             [
                 "eglCreateImageKHR",
                 "eglDestroyImageKHR",
-                "eglExportDMABUFImageQueryMESA",
-                "eglExportDMABUFImageMESA",
+                "glGenTextures",
+                "glBindTexture",
+                "glDeleteTextures",
+                "glTexParameteri",
+                "glEGLImageTargetTexture2DOES",
             ]
             .into_iter()
             .filter(|name| egl_ctx.egl.get_proc_address(name).is_none())
@@ -104,7 +112,7 @@ fn raw_egl_is_reachable_and_exports_resolve() {
         .expect("could not reach EGL via as_hal");
     assert!(
         resolved.is_empty(),
-        "EGL advertised dmabuf export but these entry points did not resolve: {resolved:?}"
+        "EGL/GL entry points the export path needs did not resolve: {resolved:?}"
     );
 }
 
@@ -183,12 +191,16 @@ fn exported_image_can_be_wrapped_as_a_wgpu_texture() {
 ///
 /// **Two paths, and the difference matters.** On a linear export this mmaps the
 /// dmabuf itself, which is the stronger assertion: it proves the pixels really
-/// are in the buffer the consumer will import. On a tiled export that is
-/// impossible -- a row-major read of ARM block tiling returns plausible-looking
-/// garbage, which is exactly how three of these tests failed before this helper
-/// existed -- so it verifies through a wgpu texture copy instead. That still
-/// proves the blit landed in the export texture; it just cannot speak for the
-/// dmabuf's byte layout.
+/// are in the buffer the consumer will import. On a non-linear one that is
+/// impossible -- a row-major read of tiled or compressed data returns
+/// plausible-looking garbage, which is exactly how three of these tests failed
+/// when the GLES export still produced AFBC -- so it falls back to a wgpu
+/// texture copy, which proves the blit landed but cannot speak for the dmabuf's
+/// byte layout.
+///
+/// Since the GLES backend allocates LINEAR through GBM, both backends should
+/// now take the mmap path, and the printed line below is how you notice if one
+/// silently stops.
 ///
 /// Which path ran is printed, because a test that silently downgrades what it
 /// proves is worse than one that fails.
