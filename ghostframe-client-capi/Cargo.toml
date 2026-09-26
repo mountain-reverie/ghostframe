@@ -8,9 +8,19 @@ name = "ghostframe_client"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-ghostframe-client-native = { path = "../ghostframe-client-native" }
+ghostframe-client-native = { path = "../ghostframe-client-native", default-features = false }
 libc = { workspace = true }
 tracing = { workspace = true }
 
 [build-dependencies]
 cbindgen = { workspace = true }
+
+# The GPU backend, forwarded from `ghostframe-client-gpu`. Exactly one, and
+# mutually exclusive -- see that crate's `[features]` for why the choice is
+# compile-time. Forwarded rather than resolved here so a consumer picks the
+# backend once, at the top of the tree, instead of every crate in the chain
+# having an opinion.
+[features]
+default = ["vulkan"]
+vulkan = ["ghostframe-client-native/vulkan"]
+gles = ["ghostframe-client-native/gles"]

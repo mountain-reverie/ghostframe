@@ -58,6 +58,13 @@ lint-client:
 check-gles:
     cargo clippy -p ghostframe-client-gpu --no-default-features --features gles,test-support --all-targets -- -D warnings
 
+# Build the `ghostframe` binary against the GLES backend, for a machine with
+# no Vulkan driver. The feature forwards up the chain
+# (cli -> client-native -> client-gpu), so it is selected once here rather
+# than per crate.
+build-client-gles:
+    cargo build -p ghostframe-cli --no-default-features --features gles
+
 # The GLES backend's tests. Needs a GLES 3.1 device with
 # EGL_MESA_image_dma_buf_export -- verified on Mali-T860/panfrost. Skips
 # gpu_import (Vulkan-only; see that file's header).
