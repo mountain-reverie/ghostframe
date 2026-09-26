@@ -91,10 +91,26 @@ the setting is now unnecessary instead.
 
 **Changed:** `Environment=DISPLAY=:1` becomes `DISPLAY=:0`.
 
-**Kept:** `GHOSTFRAME_X11_CAPTURE_ONLY=1`. It selects the X-protocol capture path,
-and its original rationale — stop the DRM fallback reading the host's scanout
-instead of the intended display — is if anything more pointed here, since the
-host's scanout *is* the target and we still want the X path, not a DRM one.
+**Kept:** `GHOSTFRAME_X11_CAPTURE_ONLY=1`, but **for a different reason than in
+headless mode**, and this section originally got that backwards.
+
+The headless rationale is that a DRM read would see the host's real scanout
+*instead of* the intended display — a content mismatch. **That does not apply
+here.** In attach mode the captured session *is* the physical display, so a DRM
+read would see the right pixels. Saying the original rationale is "more pointed
+here" was self-contradictory: it depended on the scanout not being the target.
+
+The variable stays set for a narrower, privilege-based reason. The zero-copy
+writeback path needs an atomic commit, which needs DRM master, and X holds it —
+`drm_capture.rs` says so explicitly and probes for it with a `TEST_ONLY` commit
+that returns `EACCES` when Xorg is master. That leaves the modesetting-FB
+fallback, which is also expected to fail for an unprivileged user unit, since
+`GETFB2`'s GEM-handle disclosure is gated on DRM-master-or-`CAP_SYS_ADMIN` and
+the daemon is neither. That second failure is reasoned, not measured.
+
+So: the X path is the known-working one, not a proven-optimal one. Whether any
+DRM path is viable in attach mode is unexplored, and anyone who measures it
+should replace this paragraph with the measurement.
 
 Verified on evangeline: `xprop -root` on `:0` responds with the session owner's
 `XAUTHORITY`, and no compositor owns `_NET_WM_CM_S0`, so capture takes the same

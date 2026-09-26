@@ -203,7 +203,7 @@ Start from `packaging/systemd/ghostframe-xdaemon.service` and make exactly these
 
 - **Drop** `Requires=`, `After=` and `PartOf=ghostframe-wm.service`. There is no wm unit in this mode. Replace with `PartOf=graphical-session.target` and `After=graphical-session.target` so the daemon's lifetime follows the session, per spec §4.
 - **Change** `Environment=DISPLAY=:1` to `Environment=DISPLAY=:0`.
-- **Keep** `Environment=GHOSTFRAME_X11_CAPTURE_ONLY=1` unchanged, and keep its existing comment — the rationale still holds.
+- **Keep** `Environment=GHOSTFRAME_X11_CAPTURE_ONLY=1`, but **rewrite its comment**. The headless text says a DRM read would see the host's scanout "instead of the guest Xorg on `DISPLAY=:1`" — a content mismatch that cannot arise here, since in attach mode the captured session *is* the physical display. The variable stays set for a privilege reason instead (writeback needs DRM master, X holds it; the FB fallback needs master or `CAP_SYS_ADMIN`). See spec §2, which was corrected on this point.
 - **Add** `Environment=GHOSTFRAME_ATTACH_MAX_RESOLUTION=__MAX_RESOLUTION__`.
 - **Add** `WantedBy=graphical-session.target` in `[Install]` (not `ghostframe.target`; there is no target in this mode).
 

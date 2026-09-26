@@ -24,22 +24,20 @@ Environment=TS_HOSTNAME=%H-ghostframe
 Environment=TS_STATE_DIR=%h/.local/share/ghostframe/ts-state
 # Use the X-protocol capture path, not DRM.
 #
-# NOTE this comment was rewritten for attach mode. The headless unit's
-# version explains that DRM capture reads the host's real scanout "instead
-# of the guest Xorg on DISPLAY=:1" -- a content mismatch. That specific
-# reasoning does NOT apply here: in attach mode the captured session IS the
-# physical display, so a DRM read would see the right pixels.
+# Not for the headless unit's reason -- there, a DRM read would see the wrong
+# display. Here the captured session IS the physical display, so a DRM read
+# would see the right pixels.
 #
-# It stays set anyway, for a different and narrower reason: the DRM paths
-# need privileges this daemon does not have. The zero-copy writeback path
-# needs an atomic commit, which needs DRM master -- and X holds it. That
-# leaves the modesetting-FB fallback, whose CPU-mmap read might well work
-# here, but nobody has tried it.
+# It stays set on privilege grounds. The zero-copy writeback path needs an
+# atomic commit, which needs DRM master, and X holds it (drm_capture.rs probes
+# this and gets EACCES). The modesetting-FB fallback is expected to fail too:
+# GETFB2's GEM-handle disclosure is gated on DRM-master-or-CAP_SYS_ADMIN and
+# this daemon is neither -- though that second failure is reasoned, not
+# measured.
 #
-# So this is the known-working path, not a proven-optimal one. Whether DRM
-# capture is viable in attach mode is genuinely unexplored; if someone
-# measures it, this comment should be replaced by that measurement rather
-# than by another assumption.
+# So this is the known-working path, not a proven-optimal one. If someone
+# measures DRM capture in attach mode, replace this comment with the
+# measurement rather than another assumption. See the M4b/attach design docs.
 Environment=GHOSTFRAME_X11_CAPTURE_ONLY=1
 # Caps how large a remote client may resize this session. In attach mode the
 # session IS the physical display, which a KVM may be capturing as the
