@@ -69,6 +69,68 @@ set -euo pipefail
 die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 info() { printf 'install.sh: %s\n' "$*"; }
 
+# Run a command as $1 (a username) inside their systemd --user context ($2 =
+# their uid, used to point XDG_RUNTIME_DIR at the right place). Factored out
+# of the enable step (step 9, below) so remove_other_mode_units can reach the
+# target user's session the exact same way instead of re-deriving it.
+run_as_user() {
+  local user="$1" uid="$2"; shift 2
+  sudo -u "$user" XDG_RUNTIME_DIR="/run/user/$uid" "$@"
+}
+
+# Remove the units belonging to the mode we are NOT installing.
+#
+# Load-bearing: if both modes' units remain installed, both X servers run and
+# contend for DRM mastership -- the exact failure attach mode exists to
+# avoid, presenting as a new bug rather than as a leftover file. It only
+# appears on a transition between modes, so nothing else would catch it.
+#
+# $2 (unit dir) is a parameter rather than a global so this is testable
+# without root or a real user session -- see
+# tests/packaging/mode_switch_test.sh. $target_user/$user_uid are read as
+# globals rather than parameters: they are unset when this function is
+# sourced for that test, so every use of them below is guarded to tolerate
+# that (`${target_user:-}` and a plain existence check) rather than require it.
+remove_other_mode_units() {
+  local target_mode="$1" unit_dir="$2" u
+  case "$target_mode" in
+    attach)
+      for u in ghostframe-xorg.service ghostframe-wm.service ghostframe.target; do
+        if [[ -e "$unit_dir/$u" ]]; then
+          info "remove: $unit_dir/$u (not used in attach mode)"
+          # `|| true` throughout: the unit may already be stopped/disabled,
+          # and the target user may have no running session to talk to (or,
+          # under test, no $target_user at all). Neither is an error -- we
+          # are asserting an end state, not performing a transition.
+          if [[ -n "${target_user:-}" ]]; then
+            run_as_user "${target_user:-}" "${user_uid:-}" systemctl --user stop "$u" 2>/dev/null || true
+            run_as_user "${target_user:-}" "${user_uid:-}" systemctl --user disable "$u" 2>/dev/null || true
+          fi
+          rm -f "$unit_dir/$u"
+        fi
+      done
+      ;;
+    headless)
+      # Nothing to remove. The attach unit is installed under the same
+      # filename (ghostframe-xdaemon.service) and is therefore overwritten in
+      # place by the headless install below. This branch exists so the
+      # symmetry is explicit -- without it a reader would reasonably assume
+      # it was unfinished.
+      :
+      ;;
+    *) die "remove_other_mode_units: unknown mode '$target_mode'" ;;
+  esac
+}
+
+# Allow this file to be sourced (instead of executed) so the functions above
+# can be unit tested without root, a target user, or any of the top-level
+# side effects below -- see tests/packaging/mode_switch_test.sh. When
+# sourced, stop right here, before the root check, argument parsing, and
+# every destructive step that follows.
+if (return 0 2>/dev/null); then
+  return
+fi
+
 for arg in "$@"; do
   case "$arg" in
     --help|-h)
@@ -356,6 +418,12 @@ fi
 # 6. User units.
 user_units_dir="$user_home/.config/systemd/user"
 install -d -m 0755 -o "$user_uid" -g "$user_gid" "$user_units_dir"
+
+# Remove whichever mode's units we are NOT installing, before installing the
+# selected mode's units below -- see remove_other_mode_units's own comment
+# for why this matters.
+remove_other_mode_units "$mode" "$user_units_dir"
+
 if [[ "$mode" == "attach" ]]; then
   xdaemon_unit_dst="$user_units_dir/ghostframe-xdaemon.service"
   info "install: $xdaemon_unit_dst  (attach mode)"
@@ -489,12 +557,8 @@ info "enabling $enable_unit for user $target_user..."
 # enable for the user, then their next login starts it. Equivalent to running
 # `systemctl --user enable` inside that user's session.
 {
-  sudo -u "$target_user" \
-    XDG_RUNTIME_DIR="/run/user/$user_uid" \
-    systemctl --user enable "$enable_unit" 2>/dev/null \
-    || sudo -u "$target_user" \
-         env XDG_RUNTIME_DIR="/run/user/$user_uid" \
-         systemctl --user --no-block enable "$enable_unit"
+  run_as_user "$target_user" "$user_uid" systemctl --user enable "$enable_unit" 2>/dev/null \
+    || run_as_user "$target_user" "$user_uid" systemctl --user --no-block enable "$enable_unit"
 } || {
   info "warn: 'systemctl --user enable $enable_unit' failed for user $target_user."
   info "      It should still autostart on first login/session via its own WantedBy=,"
