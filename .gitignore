@@ -29,6 +29,10 @@ ghostframe-client-wasm/pkg-web/
 # Ghostbridge build artifacts
 ghostbridge/libghostbridge.a
 ghostbridge/libghostbridge.h
+# `make sync-dist` rsyncs ghostframe-web-client/dist/ to here, because
+# //go:embed follows neither symlinks nor `..`. A second copy of the whole
+# built SPA -- same `git add -A` hazard as the binary below.
+ghostbridge/dist/
 # `just ci-local` runs `go build ./...` in ghostbridge/, which drops a
 # ~34 MB binary here. Untracked and unignored, it is one `git add -A`
 # away from the history.
@@ -36,6 +40,13 @@ ghostbridge/ghostbridge
 ghostframe-lib/libghostbridge.a
 ghostframe-lib/libghostbridge.h
 .serena/
+
+# Hand-run hardware probes (tools/hw-probe/Makefile). Compiled binaries and the
+# H.264 clip the README tells you to generate next to them.
+tools/hw-probe/glprobe
+tools/hw-probe/gbmprobe
+tools/hw-probe/expbuf_probe
+tools/hw-probe/*.h264
 
 # Screenshots dropped in the repo root while debugging a live session.
 # One was committed by accident (a 2 MB blob, stripped from history on

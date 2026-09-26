@@ -21,6 +21,15 @@ just containers-build   # REQUIRED after any ghostframe-lib/xdaemon change,
                         # or e2e silently runs the stale image
 ```
 
+Native client only — a strict subset, no server, no web bundle, no Docker.
+Worth reaching for on a machine that cannot afford the workspace:
+
+```bash
+just build-client       # or build-client-release
+just test-client        # clippy --all-targets + unit tests, client crates
+just ci-client          # the client-only analogue of ci-local
+```
+
 Deploying to a real session:
 
 ```bash
@@ -44,11 +53,26 @@ error — it is a NACK storm, slow convergence and visual artifacts. Use
 confirming the bundle actually changed:
 `strings target/release/ghostframe-xdaemon | grep -c <new-bundle-hash>`.
 
+**The embed is behind `ghostframe-tsnet`'s `web-embed` feature, off by
+default.** Server crates enable it (`ghostframe-lib` does); client crates do
+not, and get a `-tags noweb` ghostbridge with no SPA and no npm step. A new
+server crate that forgets it will not silently serve 404s — ghostbridge's
+`startWebListeners` refuses to bind and says why — but it will get that far
+before anyone notices. See DEVELOPERS.md, "Building only the native client".
+
 **`cargo test -p <crate>` hides test binaries that fail to compile.** A
 non-compiling test target is not a failing test; it vanishes from the summary
 and the run still reports `0 failed`. Only `cargo clippy --workspace
 --all-targets` sees it. Treat clippy as the gate, not the test summary. This
 has hidden a real regression here more than once.
+
+**CI is x86-64 only, and some clippy lints are architecture-dependent.**
+`libc::c_char` is `i8` on x86-64 and `u8` on aarch64, so a
+`… as *mut [c_char; N] as *mut [u8; N]` cast is necessary on one and a
+no-op on the other — and `clippy::unnecessary_cast` fires on the no-op,
+failing `-D warnings` on ARM while CI stays green. `ghostframe-client-capi`
+had exactly this (fixed by using `pointer::cast`). If clippy fails locally
+on something CI passes, check your arch before assuming a stale toolchain.
 
 **The systemd units are *user* units**, installed to
 `~<user>/.config/systemd/user/`. A drop-in placed in `/etc/systemd/system/` is
