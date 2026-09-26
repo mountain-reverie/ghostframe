@@ -100,8 +100,10 @@ versa.
 
 Attach mode avoids this contention by running ghostframe in the *same* X
 session as the local desktop, so there is no competition for the DRM master.
-This makes sense when the remote session *is* the primary use of the machine,
-and any local GUI access is exceptional rather than concurrent.
+This makes sense when the remote session *is* the primary use of the machine.
+It also makes the local output more useful rather than less: a monitor or KVM
+attached to the host shows exactly what the remote client sees, rather than a
+second, unrelated desktop.
 
 ### What It Does Not Require
 
@@ -113,8 +115,10 @@ Unlike headless mode, attach mode does not need:
 - A getty autologin on `tty1`
 - Loosening of `Xwrapper.config` to allow X servers to run as the current user
 
-The operator's existing X session — whichever window manager they use, whichever
-display it runs on — becomes the capture source.
+The operator's existing X session becomes the capture source, whichever window
+manager it runs. The unit does hardcode `DISPLAY=:0`, though, so a host that puts
+its graphical session somewhere else — a second seat, or a lightdm config that
+moves it — needs that changed before the daemon finds anything to capture.
 
 ### Security Position
 
@@ -140,6 +144,10 @@ To override this limit once you are confident recovery access is not needed:
 ```bash
 sudo ./packaging/install.sh <user> --mode attach --max-resolution none
 ```
+
+The flag writes `GHOSTFRAME_ATTACH_MAX_RESOLUTION` into the installed unit, and
+the installer prints the value it used. If a client with a larger display than
+1080p gets 1080p anyway, that variable is what to look for.
 
 ### Installation
 
@@ -186,9 +194,10 @@ be started immediately if already logged in.
 In attach mode, the session must exist for ghostframe to capture it. On an
 unattended boot, this means the specified user remains logged in automatically
 (via lightdm). This is by design: a machine whose purpose is to serve that
-session remotely has no competing need for a local logout. But be aware: if
-physical access is lost or the machine is compromised, you cannot regain a
-login prompt without remote access.
+session remotely has no competing need for a local logout. The consequence is
+worth stating plainly, though: anyone who reaches the machine physically after a
+boot finds a logged-in desktop, not a login prompt. If that is not acceptable,
+use headless mode, which runs its own session under a separate account.
 
 ## Update
 
