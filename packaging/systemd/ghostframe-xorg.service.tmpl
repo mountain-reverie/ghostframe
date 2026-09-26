@@ -1,0 +1,50 @@
+[Unit]
+Description=Ghostframe headless Xorg server on :1
+Before=ghostframe-wm.service
+# Surface real failures fast: after 3 failed starts within 60s the service
+# stays in 'failed' state instead of restart-looping ~100 times before
+# tripping systemd's built-in burst guard. Without this a permanent failure
+# (missing Xwrapper policy, missing amdgpu virtual_display, etc.) hides
+# under ~3 minutes of flapping.
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+# vt9: tty1-6 are gettys, tty7 is the host's display manager (lightdm/sddm/gdm)
+# on most desktops. Picking a high VT avoids the open() collision.
+#
+# An earlier version of this comment claimed `DontVTSwitch` in the Xorg config
+# means "we never take focus". That is **wrong**. DontVTSwitch stops this server
+# honouring later VT-switch *requests*; Xorg still activates its own VT at
+# startup unless given `-novtswitch`. So this service did take focus on every
+# start -- observed in production as a PiKVM showing the Ghostframe desktop
+# instead of the console session.
+#
+# __XORG_VT_FLAGS__ is substituted by install.sh with "-novtswitch", for both
+# display backends.
+#
+# It is safe regardless of backend because **this X server's output is never
+# viewed**. The daemon captures over the X protocol -- ghostframe-xdaemon.service
+# sets GHOSTFRAME_X11_CAPTURE_ONLY=1, which takes the GetImage(root) path -- so
+# it needs neither DRM master nor an active scanout. It only needs to exist and
+# hold a framebuffer that clients render into.
+#
+# Confirmed on hardware: after chvt'ing back to the console session, at which
+# point this server is definitively not the DRM master, it kept serving frames
+# to the web client.
+#
+# (An earlier revision applied this only to the vkms backend, on the theory that
+# amdgpu needed an active VT to modeset. That conflated "can display" with "can
+# be captured".)
+#
+# -config: bare filename, not absolute path. Xorg refuses absolute -config
+# paths when running with elevated privileges (Xwrapper's needs_root_rights=yes)
+# and only resolves bare names against /etc/X11/ and the standard config dirs.
+ExecStart=/usr/bin/Xorg :1 -config ghostframe-headless.conf -noreset -nolisten tcp __XORG_VT_FLAGS__ vt9
+Restart=on-failure
+RestartSec=2
+SyslogIdentifier=ghostframe-xorg
+
+[Install]
+WantedBy=ghostframe.target
