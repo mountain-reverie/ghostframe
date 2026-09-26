@@ -7,9 +7,19 @@ edition = "2021"
 ghostframe-protocol = { path = "../ghostframe-protocol" }
 ghostframe-client-core = { path = "../ghostframe-client-core" }
 ghostframe-client-net = { path = "../ghostframe-client-net" }
-ghostframe-client-gpu = { path = "../ghostframe-client-gpu" }
+ghostframe-client-gpu = { path = "../ghostframe-client-gpu", default-features = false }
 ghostframe-client-h264 = { path = "../ghostframe-client-h264" }
 ghostframe-tsnet = { path = "../ghostframe-tsnet" }
 libc = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+# The GPU backend, forwarded from `ghostframe-client-gpu`. Exactly one, and
+# mutually exclusive -- see that crate's `[features]` for why the choice is
+# compile-time. Forwarded rather than resolved here so a consumer picks the
+# backend once, at the top of the tree, instead of every crate in the chain
+# having an opinion.
+[features]
+default = ["vulkan"]
+vulkan = ["ghostframe-client-gpu/vulkan"]
+gles = ["ghostframe-client-gpu/gles"]

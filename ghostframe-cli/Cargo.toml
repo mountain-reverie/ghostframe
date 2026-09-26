@@ -12,7 +12,7 @@ name = "ghostframe"
 path = "src/main.rs"
 
 [dependencies]
-ghostframe-client-native = { path = "../ghostframe-client-native" }
+ghostframe-client-native = { path = "../ghostframe-client-native", default-features = false }
 ghostframe-tsnet = { path = "../ghostframe-tsnet" }
 clap = { workspace = true }
 libc = { workspace = true }
@@ -23,3 +23,13 @@ smithay-client-toolkit = { version = "0.21", features = ["xkbcommon"] }
 wayland-client = "0.31"
 x11rb = { version = "0.13", features = ["dri3", "present", "randr", "xfixes", "allow-unsafe-code"] }
 xkbcommon = { version = "0.8", features = ["x11"] }
+
+# The GPU backend, forwarded from `ghostframe-client-gpu`. Exactly one, and
+# mutually exclusive -- see that crate's `[features]` for why the choice is
+# compile-time. Forwarded rather than resolved here so a consumer picks the
+# backend once, at the top of the tree, instead of every crate in the chain
+# having an opinion.
+[features]
+default = ["vulkan"]
+vulkan = ["ghostframe-client-native/vulkan"]
+gles = ["ghostframe-client-native/gles"]
