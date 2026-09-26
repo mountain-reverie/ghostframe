@@ -14,6 +14,13 @@ fn wgpu_device_can_export_memory_as_a_file_descriptor() {
     // VULKAN_EXTERNAL_MEMORY_DMA_BUF: the latter additionally demands
     // VK_EXT_image_drm_format_modifier, which RADV on Polaris does not
     // ship, and which is only needed to negotiate an explicit tiling.
+    //
+    // There is no GLES equivalent to assert here: dmabuf export on that
+    // backend is `EGL_MESA_image_dma_buf_export`, a MESA extension wgpu has
+    // no feature bit for. `WgpuContext::new` checks the EGL extension string
+    // instead and returns `AdapterCannotExport` without it, so reaching this
+    // point at all is the assertion on that backend.
+    #[cfg(feature = "vulkan")]
     assert!(
         ctx.device
             .features()
@@ -50,6 +57,7 @@ fn wgpu_device_can_export_memory_as_a_file_descriptor() {
     assert_eq!(slice.get_mapped_range().expect("get_mapped_range")[0], 0xAB);
 }
 
+#[cfg(feature = "vulkan")]
 #[test]
 fn raw_vulkan_device_is_reachable_for_the_export_path() {
     // Task 3 needs the raw VkDevice to allocate exportable images, because
@@ -61,6 +69,42 @@ fn raw_vulkan_device_is_reachable_for_the_export_path() {
         reached,
         Some(true),
         "could not reach the raw VkDevice via as_hal"
+    );
+}
+
+/// The GLES sibling of the above, and for the same reason: wgpu-hal offers
+/// dmabuf import but no export, so `export_gles.rs` has to reach EGL directly.
+///
+/// This asserts the *whole* hatch, not just that a pointer came back: that the
+/// EGL instance resolves, that the display is real, and that
+/// `eglExportDMABUFImageMESA` itself can be loaded through it. A driver that
+/// advertises the extension string but fails to resolve the entry point is a
+/// configuration that exists, and it would otherwise surface as a null call
+/// inside an export.
+#[cfg(feature = "gles")]
+#[test]
+fn raw_egl_is_reachable_and_exports_resolve() {
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let resolved = ctx
+        .with_raw_egl(|egl_ctx| {
+            assert!(
+                !egl_ctx.display.as_ptr().is_null(),
+                "EGLDisplay is null despite with_raw_egl succeeding"
+            );
+            [
+                "eglCreateImageKHR",
+                "eglDestroyImageKHR",
+                "eglExportDMABUFImageQueryMESA",
+                "eglExportDMABUFImageMESA",
+            ]
+            .into_iter()
+            .filter(|name| egl_ctx.egl.get_proc_address(name).is_none())
+            .collect::<Vec<_>>()
+        })
+        .expect("could not reach EGL via as_hal");
+    assert!(
+        resolved.is_empty(),
+        "EGL advertised dmabuf export but these entry points did not resolve: {resolved:?}"
     );
 }
 
@@ -133,6 +177,85 @@ fn exported_image_can_be_wrapped_as_a_wgpu_texture() {
     assert_eq!(tex.format(), wgpu::TextureFormat::Rgba8Unorm);
 }
 
+/// Read an export back as row-major RGBA, whichever way the backend allows.
+///
+/// Returns `(bytes, stride, base_offset)`.
+///
+/// **Two paths, and the difference matters.** On a linear export this mmaps the
+/// dmabuf itself, which is the stronger assertion: it proves the pixels really
+/// are in the buffer the consumer will import. On a tiled export that is
+/// impossible -- a row-major read of ARM block tiling returns plausible-looking
+/// garbage, which is exactly how three of these tests failed before this helper
+/// existed -- so it verifies through a wgpu texture copy instead. That still
+/// proves the blit landed in the export texture; it just cannot speak for the
+/// dmabuf's byte layout.
+///
+/// Which path ran is printed, because a test that silently downgrades what it
+/// proves is worse than one that fails.
+fn read_export(ctx: &WgpuContext, img: &ExportedImage) -> (Vec<u8>, usize, usize) {
+    const DRM_FORMAT_MOD_LINEAR: u64 = 0;
+    if img.modifier == DRM_FORMAT_MOD_LINEAR {
+        let bytes = img.map_read().expect("map dmabuf");
+        return (
+            bytes,
+            img.planes[0].stride as usize,
+            img.planes[0].offset as usize,
+        );
+    }
+
+    eprintln!(
+        "read_export: modifier 0x{:016x} is tiled (vendor 0x{:02x}), so the dmabuf \
+         cannot be read row-major; verifying through a wgpu texture copy instead. \
+         This checks the blit landed, NOT the dmabuf's byte layout. See \
+         export_gles.rs's module doc.",
+        img.modifier,
+        (img.modifier >> 56) & 0xff,
+    );
+
+    let tex = img
+        .as_wgpu_texture(&ctx.device)
+        .expect("wrap export as texture");
+    // wgpu requires COPY_BYTES_PER_ROW_ALIGNMENT (256) on bytes_per_row.
+    let unpadded = img.width as usize * 4;
+    let stride = unpadded.div_ceil(256) * 256;
+    let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("export-readback"),
+        size: (stride * img.height as usize) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    encoder.copy_texture_to_buffer(
+        tex.as_image_copy(),
+        wgpu::TexelCopyBufferInfo {
+            buffer: &staging,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(stride as u32),
+                rows_per_image: Some(img.height),
+            },
+        },
+        wgpu::Extent3d {
+            width: img.width,
+            height: img.height,
+            depth_or_array_layers: 1,
+        },
+    );
+    ctx.queue.submit(std::iter::once(encoder.finish()));
+    ctx.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll after readback copy");
+    let slice = staging.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |r| r.expect("map readback"));
+    ctx.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll for map");
+    let bytes = slice.get_mapped_range().expect("get_mapped_range").to_vec();
+    (bytes, stride, 0)
+}
+
 use ghostframe_client_gpu::framebuffer::Framebuffer;
 
 #[test]
@@ -151,9 +274,7 @@ fn framebuffer_blits_into_the_exported_dmabuf() {
         .poll(wgpu::PollType::wait_indefinitely())
         .expect("poll");
 
-    let bytes = img.map_read().expect("map dmabuf");
-    let stride = img.planes[0].stride as usize;
-    let base = img.planes[0].offset as usize;
+    let (bytes, stride, base) = read_export(&ctx, &img);
 
     // Check a pixel away from the origin: an origin-only check passes even
     // when the stride is wrong.
@@ -222,9 +343,7 @@ fn ring_partial_update_preserves_untouched_regions() {
         .expect("poll");
 
     let img = ring.buffer(b.buffer_id);
-    let bytes = img.map_read().expect("map");
-    let stride = img.planes[0].stride as usize;
-    let base = img.planes[0].offset as usize;
+    let (bytes, stride, base) = read_export(&ctx, img);
 
     // The newly painted tile starts at pixel x=32.
     assert_eq!(
@@ -336,9 +455,7 @@ fn recycled_buffer_receives_only_its_damage_and_keeps_the_rest() {
     );
 
     let img = ring.buffer(b.buffer_id);
-    let bytes = img.map_read().expect("map");
-    let stride = img.planes[0].stride as usize;
-    let base = img.planes[0].offset as usize;
+    let (bytes, stride, base) = read_export(&ctx, img);
 
     assert_eq!(
         &bytes[base + 32 * 4..base + 32 * 4 + 4],

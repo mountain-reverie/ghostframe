@@ -15,11 +15,48 @@
 //! `#[allow]` with a reason, so every exception is a decision on the record.
 #![cfg_attr(not(test), warn(clippy::wildcard_enum_match_arm))]
 
+// Exactly one backend, selected by feature. See this crate's `Cargo.toml` for
+// why the choice is compile-time rather than runtime.
+#[cfg(all(feature = "vulkan", feature = "gles"))]
+compile_error!(
+    "ghostframe-client-gpu: features `vulkan` and `gles` are mutually exclusive. \
+     The two export paths share no code -- Vulkan allocates an exportable VkImage \
+     through ash, GLES calls eglExportDMABUFImageMESA through khronos-egl -- so a \
+     build with both would link both sets of bindings. Pick one: \
+     `--features gles --no-default-features`, or the default `vulkan`."
+);
+#[cfg(not(any(feature = "vulkan", feature = "gles")))]
+compile_error!(
+    "ghostframe-client-gpu: no backend selected. Enable `vulkan` (the default) or \
+     `gles`. Building with neither would compile a crate that cannot create a \
+     device at all."
+);
+
 pub mod coalesce;
 pub mod config;
 pub mod dirty;
+// dmabuf plane layout, modifier negotiation and DMA_BUF_IOCTL_SYNC -- about the
+// kernel, not about any graphics API, so shared by both backends.
+pub mod dmabuf;
+// `export`/`import` name one module each, whichever backend is active. The
+// `#[path]` attributes let both files claim the same module name, so
+// `renderer.rs`, `ring.rs` and the `tests/gpu_*.rs` suite are written against
+// `crate::export::ExportedImage` without caring which one they got. Each
+// backend's `ExportedImage` must therefore keep the same surface: `new`,
+// `as_wgpu_texture`, `raw_fd`, `map_read`, and the `width`/`height`/`modifier`/
+// `planes` fields (see `ring.rs`, which is the strictest consumer).
+#[cfg(feature = "vulkan")]
+#[path = "export.rs"]
+pub mod export;
+#[cfg(feature = "gles")]
+#[path = "export_gles.rs"]
 pub mod export;
 pub mod framebuffer;
+#[cfg(feature = "vulkan")]
+#[path = "import.rs"]
+pub mod import;
+#[cfg(feature = "gles")]
+#[path = "import_gles.rs"]
 pub mod import;
 // The CPU reference is consumed only by Task 8's oracle test (a separate
 // crate unit under `tests/`, so `#[cfg(test)]` alone would not reach it --
@@ -54,22 +91,54 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum GpuError {
+    #[cfg(feature = "vulkan")]
     #[error("vulkan: {0}")]
     Vulkan(String),
 
-    /// No Vulkan adapter at all -- missing loader, no ICD, or a broken driver
+    /// EGL/GLES equivalent of [`GpuError::Vulkan`]: a driver call failed with
+    /// no more specific variant to carry it. Separate rather than a shared
+    /// `Backend(String)` so the prefix in the message still tells a reader
+    /// which stack produced it without them having to know how the binary was
+    /// built.
+    #[cfg(feature = "gles")]
+    #[error("egl: {0}")]
+    Egl(String),
+
+    /// No usable adapter at all -- missing loader, no ICD, or a broken driver
     /// install. Distinct from [`GpuError::AdapterCannotExport`] so the message
     /// does not send someone hunting for extension support when the real
-    /// problem is that Vulkan is not working.
-    #[error("no Vulkan adapter found (is a Vulkan driver installed?)")]
-    NoVulkanAdapter,
+    /// problem is that the driver is not working.
+    ///
+    /// The message names the backend this binary was built for, because "no
+    /// adapter found" on a machine that demonstrably has a working GPU is
+    /// otherwise deeply confusing -- the usual cause is a client built for the
+    /// wrong one.
+    #[cfg_attr(
+        feature = "vulkan",
+        error("no Vulkan adapter found (is a Vulkan driver installed?)")
+    )]
+    #[cfg_attr(
+        feature = "gles",
+        error("no GLES adapter found (is a GL/EGL driver installed?)")
+    )]
+    NoAdapter,
 
     /// An adapter exists but cannot export memory as a file descriptor, so it
-    /// can never produce a dmabuf. The feature name is spelled out because it
-    /// is greppable against `vulkaninfo` output.
-    #[error(
-        "adapter {adapter:?} lacks VK_KHR_external_memory_fd \
-         (wgpu Features::VULKAN_EXTERNAL_MEMORY_FD), so it cannot export a dmabuf"
+    /// can never produce a dmabuf. The extension names are spelled out because
+    /// they are greppable against `vulkaninfo` / `eglinfo` output.
+    #[cfg_attr(
+        feature = "vulkan",
+        error(
+            "adapter {adapter:?} lacks VK_KHR_external_memory_fd \
+             (wgpu Features::VULKAN_EXTERNAL_MEMORY_FD), so it cannot export a dmabuf"
+        )
+    )]
+    #[cfg_attr(
+        feature = "gles",
+        error(
+            "adapter {adapter:?} lacks EGL_MESA_image_dma_buf_export, \
+             so it cannot export a dmabuf"
+        )
     )]
     AdapterCannotExport { adapter: String },
 

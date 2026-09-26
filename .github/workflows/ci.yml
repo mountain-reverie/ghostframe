@@ -50,6 +50,12 @@ jobs:
         with:
           shared-key: ci-fast
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # The GLES backend is mutually exclusive with the default `vulkan`
+      # feature, so --workspace above never compiles it. No runner has a Mali
+      # GPU, so its tests cannot run here -- which is exactly why the compile
+      # must be checked: a feature nobody builds is already broken. Hardware
+      # verification is `just test-client-gles` on a GLES 3.1 device.
+      - run: cargo clippy -p ghostframe-client-gpu --no-default-features --features gles,test-support --all-targets -- -D warnings
       - name: ghostframe-lib reads env only in config.rs
         run: |
           # Comment lines are excluded deliberately: the guard constrains code,

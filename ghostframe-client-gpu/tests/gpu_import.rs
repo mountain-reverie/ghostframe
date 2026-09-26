@@ -1,3 +1,17 @@
+//! NV12 dmabuf import against a real GPU. **Vulkan backend only.**
+//!
+//! Gated at the file level because these tests reach Vulkan internals
+//! directly -- `ash::vk`, `WgpuContext::with_raw_device`, `GpuError::Vulkan`
+//! -- to check import behaviour the shared API cannot express.
+//!
+//! The GLES backend has no counterpart yet because it has no NV12 import yet:
+//! `import_gles.rs` fails loudly and says why (its only caller is the H.264
+//! path, which needs the V4L2 decoder from tasks 3-6 of the GLES/V4L2 plan).
+//! When that lands, the equivalents belong here behind `cfg(feature = "gles")`
+//! rather than in a separate file, so the two backends' import contracts stay
+//! side by side.
+#![cfg(feature = "vulkan")]
+
 //! Import a dmabuf we created ourselves, and read the imported textures'
 //! bytes back through the GPU -- the only way to prove `import_nv12` placed
 //! each plane's pixels at the offsets and pitches the descriptor claims,

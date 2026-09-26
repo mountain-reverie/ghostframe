@@ -67,17 +67,44 @@ ash = { version = "0.38", default-features = false, features = ["std", "debug", 
 
 # wgpu 30.0.1 — the current newest release, which builds on the 1.96.1
 # toolchain this workspace pins (verified 2026-09-22; there is no 31.x to
-# reject). Vulkan-only: the native client's output is a dmabuf, so the other
-# backends are dead weight in a library other projects link.
-wgpu = { version = "=30.0.1", default-features = false, features = ["vulkan", "wgsl"] }
+# reject).
+#
+# NO backend is selected here. `ghostframe-client-gpu`'s own `vulkan`
+# (default) / `gles` features turn exactly one on, because the two need
+# different escape hatches and different link-time dependencies -- see that
+# crate's `[features]`. Selecting one here would force it on for both. The
+# other backends (metal, dx12, webgpu) stay off regardless: the native
+# client's output is a dmabuf, so they are dead weight in a library other
+# projects link.
+wgpu = { version = "=30.0.1", default-features = false, features = ["wgsl"] }
 
-# wgpu-hal — the escape hatch for the one thing wgpu cannot do. wgpu 30 can
-# IMPORT a dmabuf (Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF plus
-# texture_from_dmabuf_fd) but has no export counterpart, so the client
-# allocates exportable images itself and re-wraps them with
-# wgpu_hal::vulkan::Device::texture_from_raw. Must track wgpu's version
-# exactly: texture_from_raw's signature has changed across releases.
-wgpu-hal = { version = "=30.0.1", default-features = false, features = ["vulkan"] }
+# wgpu-hal — the escape hatch for the one thing wgpu cannot do: EXPORT a
+# dmabuf. wgpu 30 can import one but has no export counterpart, so the client
+# allocates the exportable resource itself and re-wraps it.
+#
+# Vulkan: allocate an exportable VkImage, re-wrap with
+# `wgpu_hal::vulkan::Device::texture_from_raw`.
+# GLES: `AdapterContext::egl_instance()` to load `eglExportDMABUFImageMESA`,
+# and `wgpu_hal::gles::Device::texture_from_raw` to wrap a GL texture name.
+#
+# Must track wgpu's version exactly: both `texture_from_raw` signatures have
+# changed across releases, and `EglInstance` is a khronos-egl type alias that
+# has to match the version wgpu-hal itself resolves (see `khronos-egl` below).
+wgpu-hal = { version = "=30.0.1", default-features = false }
+
+# khronos-egl 6 — EGL bindings for the GLES backend's dmabuf export/import.
+#
+# `wgpu_hal::gles::AdapterContext::egl_instance()` returns
+# `&khronos_egl::DynamicInstance<khronos_egl::EGL1_4>`, so this MUST be the
+# same version wgpu-hal resolves or the type does not match and the escape
+# hatch is unreachable. `dynamic` mirrors the feature wgpu-hal itself asks
+# for: it loads libEGL at runtime rather than linking it, which is what lets a
+# Vulkan-only build not depend on libEGL at all.
+#
+# MESA extensions (`eglExportDMABUFImageMESA`) are not wrapped by this crate;
+# they are loaded through `get_proc_address` and called as raw function
+# pointers. See `export.rs`'s GLES path.
+khronos-egl = { version = "=6.0.0", default-features = false, features = ["dynamic"] }
 
 # pollster 1.0.1 — latest stable 1.x. wgpu's request_adapter/request_device
 # are async but this crate has no async runtime (and doesn't want tokio
