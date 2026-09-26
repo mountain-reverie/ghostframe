@@ -90,5 +90,33 @@ remove_other_mode_units headless "$UNITS" "$dropin"
 unset -f getent
 check_present "$TEST_PREV_UNIT"
 
+# --- require_lightdm's main-conf override warning -------------------------
+#
+# lightdm reads lightdm.conf AFTER lightdm.conf.d, so an uncommented
+# autologin-user= there beats our drop-in and the machine autologins nobody.
+# The install would report success and then serve nothing after a reboot.
+target_user="somebody"
+# Force the lightdm.service branch so the check below is what we are testing.
+readlink() { echo /usr/lib/systemd/system/lightdm.service; }
+# shellcheck disable=SC2317
+systemctl() { return 1; }
+
+main_conf="$UNITS/lightdm.conf"
+warns() { require_lightdm "$main_conf" 2>&1 | grep -c "overrides the drop-in"; }
+
+printf '[Seat:*]\n#autologin-user=someone\n' > "$main_conf"
+[[ "$(warns)" == 0 ]] || { echo "FAIL: a commented autologin-user= must not warn"; fail=1; }
+
+printf '[Seat:*]\nautologin-user=someone\n' > "$main_conf"
+[[ "$(warns)" == 1 ]] || { echo "FAIL: an uncommented autologin-user= must warn"; fail=1; }
+
+# Empty value still overrides -- that is the measured failure, not a no-op.
+printf '[Seat:*]\nautologin-user=\n' > "$main_conf"
+[[ "$(warns)" == 1 ]] || { echo "FAIL: an empty autologin-user= still overrides, must warn"; fail=1; }
+
+rm -f "$main_conf"
+[[ "$(warns)" == 0 ]] || { echo "FAIL: absent lightdm.conf must not warn"; fail=1; }
+unset -f readlink systemctl
+
 [[ $fail -eq 0 ]] && echo "PASS"
 exit $fail
