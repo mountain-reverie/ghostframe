@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
-# packaging/install.sh — install ghostframe-xdaemon as a headless Xorg
-# session for a specific user.
+# packaging/install.sh — install ghostframe-xdaemon for a specific user, either
+# as a headless Xorg session of its own (--mode headless, the default) or
+# attached to that user's existing session (--mode attach).
 #
 # Usage:  sudo ./packaging/install.sh <username> [--force]
 #                                      [--display-backend amdgpu|vkms]
@@ -49,15 +50,22 @@
 #   7. (Interactive only) prompts for TS_AUTHKEY and seeds the tsnet state dir.
 #   8. Enables ghostframe.target (user) and getty@tty1 (system).
 #
-# In --mode attach, steps 3, 4 and 6 are skipped entirely (no ghostframe-owned
-# Xorg server, so no config and no Xwrapper.config loosening); step 5 installs
-# one unit (ghostframe-xdaemon.service, attach flavor) instead of three; step 6
-# installs a lightdm autologin drop-in instead of the getty one; and step 8
-# enables ghostframe-xdaemon.service directly, not ghostframe.target or getty.
+# In --mode attach, relative to the numbered list above:
+#   - steps 3 and 4 are skipped entirely (no ghostframe-owned Xorg server, so
+#     no config and no Xwrapper.config loosening);
+#   - step 5 installs one unit (ghostframe-xdaemon.service, attach flavour)
+#     instead of three;
+#   - step 6 installs a lightdm autologin drop-in instead of the getty one --
+#     replaced, not skipped;
+#   - step 8 enables ghostframe-xdaemon.service directly, not ghostframe.target
+#     or getty.
+#
+# Note the step comments in the code below number themselves differently (they
+# count the tsnet state dir as 5), so "step N" here always means the list above.
 #
 # Re-running is idempotent except for step 7, which is skipped if the state dir
 # is already populated. Pass --force to overwrite the binary. The Xorg config
-# (step 3) and the systemd units (step 6) are package-owned, not meant for
+# (step 3) and the systemd units (step 5) are package-owned, not meant for
 # local edits, and are always reinstalled on every run — so packaging
 # changes (e.g. a framebuffer size bump) reach an existing install without
 # needing --force.
@@ -91,6 +99,59 @@ run_as_user() {
 # globals rather than parameters: they are unset when this function is
 # sourced for that test, so every use of them below is guarded to tolerate
 # that (`${target_user:-}` and a plain existence check) rather than require it.
+# Attach mode needs lightdm, because lightdm's autologin is the only one it
+# automates. This MUST run in preflight, not at the install step that uses it:
+# the attach install overwrites ghostframe-xdaemon.service, so dying halfway
+# through leaves a previously-working headless install with an attach unit
+# (DISPLAY=:0, PartOf=graphical-session.target) and no headless stack behind it.
+# It is a pure precondition; it belongs with the other probing.
+require_lightdm() {
+  local dm_unit="" cand
+  if [[ -L /etc/systemd/system/display-manager.service ]]; then
+    dm_unit=$(basename "$(readlink -f /etc/systemd/system/display-manager.service)")
+  else
+    for cand in lightdm gdm gdm3 sddm; do
+      if systemctl is-active --quiet "$cand.service" 2>/dev/null \
+        || systemctl is-enabled --quiet "$cand.service" 2>/dev/null; then
+        dm_unit="$cand.service"
+        break
+      fi
+    done
+  fi
+  case "$dm_unit" in
+    lightdm.service) info "ok: display manager is lightdm." ;;
+    "")
+      die "attach mode: could not detect a display manager (checked the" \
+          "display-manager.service alias and lightdm/gdm/gdm3/sddm units)." \
+          "Attach mode currently only automates lightdm's autologin -- install" \
+          "lightdm, or configure autologin for your display manager yourself" \
+          "so :0 exists after an unattended boot, then re-run."
+      ;;
+    *)
+      die "attach mode: detected display manager '$dm_unit', but attach mode" \
+          "currently only automates lightdm's autologin. Configure autologin" \
+          "for '$dm_unit' yourself so :0 exists after an unattended boot" \
+          "(this is not optional -- without it the machine serves nothing" \
+          "after a reboot), or switch the host to lightdm and re-run."
+      ;;
+  esac
+
+  # lightdm reads every lightdm.conf.d directory FIRST and lightdm.conf LAST,
+  # so an uncommented autologin-user= in the main file silently beats our
+  # drop-in. Measured: main conf with an empty `autologin-user=` wins, and the
+  # machine autologins nobody -- the install reports success and then serves
+  # nothing after a reboot, which is the very failure the check above exists to
+  # prevent, reached through a different door. Warn rather than die: the
+  # operator may want their own value to win, and we cannot tell.
+  local main_conf="${1:-/etc/lightdm/lightdm.conf}"
+  if [[ -f "$main_conf" ]] \
+    && grep -qE '^[[:space:]]*autologin-user[[:space:]]*=' "$main_conf"; then
+    info "warn: $main_conf sets autologin-user= and is read AFTER lightdm.conf.d,"
+    info "      so it overrides the drop-in this script installs. Comment it out,"
+    info "      or set it to '$target_user' there, or autologin will not work."
+  fi
+}
+
 # remove_other_mode_units <mode> <unit_dir> [lightdm_dropin]
 #
 # The third argument exists so the packaging test can point the lightdm cleanup
@@ -282,6 +343,8 @@ for b in "${need_bins[@]}"; do
 done
 
 if [[ "$mode" == "attach" ]]; then
+  require_lightdm
+
   # $target_user must be the account whose desktop attach mode will capture.
   # Warn, don't die: if lightdm autologin (installed later in this same run)
   # hasn't taken effect yet -- e.g. this is a fresh install, pre-first-boot --
@@ -470,36 +533,6 @@ if [[ "$mode" == "attach" ]]; then
   # headless mode). Attach mode captures an *existing* X session -- so that
   # session must exist after an unattended boot, or this machine serves
   # nothing. Autologin creates it.
-  dm_unit=""
-  if [[ -L /etc/systemd/system/display-manager.service ]]; then
-    dm_unit=$(basename "$(readlink -f /etc/systemd/system/display-manager.service)")
-  else
-    for cand in lightdm gdm gdm3 sddm; do
-      if systemctl is-active --quiet "$cand.service" 2>/dev/null \
-        || systemctl is-enabled --quiet "$cand.service" 2>/dev/null; then
-        dm_unit="$cand.service"
-        break
-      fi
-    done
-  fi
-  case "$dm_unit" in
-    lightdm.service) ;;
-    "")
-      die "attach mode: could not detect a display manager (checked the" \
-          "display-manager.service alias and lightdm/gdm/gdm3/sddm units)." \
-          "Attach mode currently only automates lightdm's autologin -- install" \
-          "lightdm, or configure autologin for your display manager yourself" \
-          "so :0 exists after an unattended boot, then re-run."
-      ;;
-    *)
-      die "attach mode: detected display manager '$dm_unit', but attach mode" \
-          "currently only automates lightdm's autologin. Configure autologin" \
-          "for '$dm_unit' yourself so :0 exists after an unattended boot" \
-          "(this is not optional -- without it the machine serves nothing" \
-          "after a reboot), or switch the host to lightdm and re-run."
-      ;;
-  esac
-
   lightdm_dropin_dir="/etc/lightdm/lightdm.conf.d"
   if [[ -d "$lightdm_dropin_dir" ]]; then
     info "found: $lightdm_dropin_dir"
@@ -589,7 +622,14 @@ info "enabling $enable_unit for user $target_user..."
     || run_as_user "$target_user" "$user_uid" systemctl --user --no-block enable "$enable_unit"
 } || {
   info "warn: 'systemctl --user enable $enable_unit' failed for user $target_user."
-  info "      It should still autostart on first login/session via its own WantedBy=,"
+  # Name the concrete target rather than a bare "its own WantedBy=": the old
+  # headless message said default.target, and dropping that made the warning
+  # unactionable. The two modes genuinely differ, so branch.
+  if [[ "$mode" == "attach" ]]; then
+    info "      It should still autostart via WantedBy=graphical-session.target,"
+  else
+    info "      It should still autostart on first boot via WantedBy=default.target,"
+  fi
   info "      but if it does not, run after logging in as that user:"
   info "          systemctl --user enable $enable_unit"
 }
