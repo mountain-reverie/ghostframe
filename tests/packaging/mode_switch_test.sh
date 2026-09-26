@@ -96,10 +96,25 @@ check_present "$TEST_PREV_UNIT"
 # autologin-user= there beats our drop-in and the machine autologins nobody.
 # The install would report success and then serve nothing after a reboot.
 target_user="somebody"
-# Force the lightdm.service branch so the check below is what we are testing.
-readlink() { echo /usr/lib/systemd/system/lightdm.service; }
-# shellcheck disable=SC2317
-systemctl() { return 1; }
+# Stub detection rather than the primitives it uses. The first version of this
+# test overrode `readlink`/`systemctl`, which only works on a host that already
+# has /etc/systemd/system/display-manager.service -- so it passed here and died
+# on a CI runner with no display manager at all.
+detect_display_manager() { echo "lightdm.service"; }
+
+# The die paths first: they are the reason require_lightdm exists, and running
+# them needs a subshell because die exits.
+# `want` and not "$1": inside the nested function, $1 would be that function's
+# own first argument (there is none), not dm_exit's.
+dm_exit() {
+  local want="$1"
+  ( detect_display_manager() { echo "$want"; }; require_lightdm /dev/null >/dev/null 2>&1 )
+  echo $?
+}
+[[ "$(dm_exit lightdm.service)" == 0 ]] || { echo "FAIL: lightdm must be accepted"; fail=1; }
+[[ "$(dm_exit gdm.service)"     != 0 ]] || { echo "FAIL: gdm must be rejected"; fail=1; }
+[[ "$(dm_exit sddm.service)"    != 0 ]] || { echo "FAIL: sddm must be rejected"; fail=1; }
+[[ "$(dm_exit '')"              != 0 ]] || { echo "FAIL: no display manager must be rejected"; fail=1; }
 
 main_conf="$UNITS/lightdm.conf"
 warns() { require_lightdm "$main_conf" 2>&1 | grep -c "overrides the drop-in"; }
@@ -116,7 +131,7 @@ printf '[Seat:*]\nautologin-user=\n' > "$main_conf"
 
 rm -f "$main_conf"
 [[ "$(warns)" == 0 ]] || { echo "FAIL: absent lightdm.conf must not warn"; fail=1; }
-unset -f readlink systemctl
+unset -f detect_display_manager
 
 [[ $fail -eq 0 ]] && echo "PASS"
 exit $fail
