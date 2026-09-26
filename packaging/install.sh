@@ -22,7 +22,10 @@
 #   autologin. Existing installs are unaffected by adding this flag.
 # --mode attach: installs a single unit that captures the operator's own,
 #   already-running X session instead. The remote client sees the operator's
-#   real desktop, not a sandboxed guest session.
+#   real desktop, not a sandboxed guest session. Also configures lightdm to
+#   autologin that session on boot -- attach mode has nothing to capture
+#   otherwise. Requires lightdm as the display manager; install.sh dies with
+#   a clear message if another one (gdm, sddm, ...) is detected instead.
 #
 # --max-resolution WIDTHxHEIGHT|none (default: 1920x1080): caps how large a
 #   remote client may resize the captured session. Only meaningful in
@@ -46,6 +49,12 @@
 #   7. (Interactive only) prompts for TS_AUTHKEY and seeds the tsnet state dir.
 #   8. Enables ghostframe.target (user) and getty@tty1 (system).
 #
+# In --mode attach, steps 3, 4 and 6 are skipped entirely (no ghostframe-owned
+# Xorg server, so no config and no Xwrapper.config loosening); step 5 installs
+# one unit (ghostframe-xdaemon.service, attach flavor) instead of three; step 6
+# installs a lightdm autologin drop-in instead of the getty one; and step 8
+# enables ghostframe-xdaemon.service directly, not ghostframe.target or getty.
+#
 # Re-running is idempotent except for step 7, which is skipped if the state dir
 # is already populated. Pass --force to overwrite the binary. The Xorg config
 # (step 3) and the systemd units (step 6) are package-owned, not meant for
@@ -63,7 +72,15 @@ info() { printf 'install.sh: %s\n' "$*"; }
 for arg in "$@"; do
   case "$arg" in
     --help|-h)
-      sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'
+      # Print the whole header comment block: every line after the shebang
+      # until the first line that is not a comment.
+      #
+      # Deliberately NOT a hardcoded line range. This was `2,27p`, then
+      # `2,36p`, and both went stale as flags were added -- the second time
+      # silently dropping the entire "What it does:" list, with nothing to
+      # notice. A range that has to be recounted by hand on every edit is the
+      # wrong mechanism, not a number that keeps being got wrong.
+      awk 'NR > 1 { if ($0 !~ /^#/) exit; print }' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
   esac
@@ -152,15 +169,44 @@ user_home=$(getent passwd "$target_user" | cut -d: -f6)
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 pkg_dir="$repo_root/packaging"
-[[ -f "$pkg_dir/xorg-headless-amdgpu.conf" ]] || die "missing $pkg_dir/xorg-headless-amdgpu.conf"
-[[ -f "$pkg_dir/xorg-headless-vkms.conf.tmpl" ]] || die "missing $pkg_dir/xorg-headless-vkms.conf.tmpl"
+if [[ "$mode" == "headless" ]]; then
+  [[ -f "$pkg_dir/xorg-headless-amdgpu.conf" ]] || die "missing $pkg_dir/xorg-headless-amdgpu.conf"
+  [[ -f "$pkg_dir/xorg-headless-vkms.conf.tmpl" ]] || die "missing $pkg_dir/xorg-headless-vkms.conf.tmpl"
+else
+  [[ -f "$pkg_dir/systemd/ghostframe-xdaemon-attach.service.tmpl" ]] || die "missing $pkg_dir/systemd/ghostframe-xdaemon-attach.service.tmpl"
+  [[ -f "$pkg_dir/lightdm-autologin.conf.tmpl" ]] || die "missing $pkg_dir/lightdm-autologin.conf.tmpl"
+fi
 
 # 1. Preflight.
 info "preflight: checking required binaries..."
-need_bins=(Xorg enlightenment_start)
+if [[ "$mode" == "headless" ]]; then
+  need_bins=(Xorg enlightenment_start)
+else
+  # Attach mode captures the operator's already-running session: no
+  # ghostframe-owned X server and no window manager to check for.
+  need_bins=()
+  info "attach mode: no Xorg/window-manager binaries required (captures the existing session)."
+fi
 for b in "${need_bins[@]}"; do
   command -v "$b" >/dev/null 2>&1 || die "missing '$b' on PATH — install it and retry"
 done
+
+if [[ "$mode" == "attach" ]]; then
+  # $target_user must be the account whose desktop attach mode will capture.
+  # Warn, don't die: if lightdm autologin (installed later in this same run)
+  # hasn't taken effect yet -- e.g. this is a fresh install, pre-first-boot --
+  # the session legitimately doesn't exist yet. The point is to catch
+  # --mode attach pointed at the wrong account now, instead of failing
+  # opaquely at connect time later.
+  session_display=$(loginctl show-user "$target_user" -p Display --value 2>/dev/null || true)
+  if [[ -z "$session_display" ]]; then
+    info "warn: '$target_user' has no active graphical session right now (loginctl show-user -p Display is empty)."
+    info "      If lightdm autologin hasn't run yet (fresh install, pre-reboot), this is expected -- ignore it."
+    info "      Otherwise, double check '$target_user' is the account whose desktop should be captured."
+  else
+    info "ok: '$target_user' has an active graphical session (loginctl Display=$session_display)."
+  fi
+fi
 
 # Group membership: 'video' for KMS framebuffer + DRI, 'render' for
 # render-node ioctls. Without these, ghostframe-xdaemon's DRM capture path
@@ -193,6 +239,21 @@ if [[ -x "$built_bin" ]]; then
     install -m 0755 -o root -g root "$built_bin" "$installed_bin"
   fi
 fi
+
+if [[ "$mode" == "attach" ]]; then
+  # 3/4. Attach mode has no ghostframe-owned X server -- it captures the
+  # operator's own, already-running session -- so neither the headless Xorg
+  # config nor the Xwrapper.config loosening (which exists solely so a user
+  # unit can launch Xorg) is needed. Skip both entirely.
+  info "mode attach: skipping Xorg config and Xwrapper.config (no ghostframe-owned X server in this mode)"
+
+  xwrap_dst="/etc/X11/Xwrapper.config"
+  if [[ -f "$xwrap_dst" ]] && grep -q "Installed by ghostframe packaging/install.sh" "$xwrap_dst"; then
+    info "note: $xwrap_dst was installed by a previous ghostframe (headless) install."
+    info "      It is not needed in attach mode -- leaving it in place untouched, since"
+    info "      this script cannot know whether anything else on this host depends on it."
+  fi
+else
 
 # 3. Xorg config.
 #
@@ -283,6 +344,8 @@ else
   fi
 fi
 
+fi # mode == headless (steps 3/4)
+
 # 5. State dir.
 state_dir="$user_home/.local/share/ghostframe/ts-state"
 if [[ ! -d "$state_dir" ]]; then
@@ -293,31 +356,100 @@ fi
 # 6. User units.
 user_units_dir="$user_home/.config/systemd/user"
 install -d -m 0755 -o "$user_uid" -g "$user_gid" "$user_units_dir"
-for u in ghostframe.target ghostframe-xorg.service ghostframe-wm.service ghostframe-xdaemon.service; do
-  info "install: $user_units_dir/$u"
-  install -m 0644 -o "$user_uid" -g "$user_gid" "$pkg_dir/systemd/$u" "$user_units_dir/$u"
-done
+if [[ "$mode" == "attach" ]]; then
+  xdaemon_unit_dst="$user_units_dir/ghostframe-xdaemon.service"
+  info "install: $xdaemon_unit_dst  (attach mode)"
+  sed "s|__MAX_RESOLUTION__|$max_resolution|g" "$pkg_dir/systemd/ghostframe-xdaemon-attach.service.tmpl" \
+    | install -m 0644 -o "$user_uid" -g "$user_gid" /dev/stdin "$xdaemon_unit_dst"
+  info "GHOSTFRAME_ATTACH_MAX_RESOLUTION=$max_resolution (set in $xdaemon_unit_dst)"
+else
+  for u in ghostframe.target ghostframe-xorg.service ghostframe-wm.service ghostframe-xdaemon.service; do
+    info "install: $user_units_dir/$u"
+    install -m 0644 -o "$user_uid" -g "$user_gid" "$pkg_dir/systemd/$u" "$user_units_dir/$u"
+  done
+fi
 
-# 7. getty autologin drop-in.
-drop_dir="/etc/systemd/system/getty@tty1.service.d"
-install -d -m 0755 "$drop_dir"
-
-# Warn (but don't abort) if another autologin drop-in exists.
-shopt -s nullglob
-existing=("$drop_dir"/*.conf)
-shopt -u nullglob
-for f in "${existing[@]}"; do
-  base=$(basename "$f")
-  [[ "$base" == "99-ghostframe-autologin.conf" ]] && continue
-  if grep -q autologin "$f" 2>/dev/null; then
-    info "warn: existing autologin drop-in at $f — ours uses the 99- prefix and will win, but verify"
+if [[ "$mode" == "attach" ]]; then
+  # 7. lightdm autologin drop-in (replaces the getty autologin used in
+  # headless mode). Attach mode captures an *existing* X session -- so that
+  # session must exist after an unattended boot, or this machine serves
+  # nothing. Autologin creates it.
+  dm_unit=""
+  if [[ -L /etc/systemd/system/display-manager.service ]]; then
+    dm_unit=$(basename "$(readlink -f /etc/systemd/system/display-manager.service)")
+  else
+    for cand in lightdm gdm gdm3 sddm; do
+      if systemctl is-active --quiet "$cand.service" 2>/dev/null \
+        || systemctl is-enabled --quiet "$cand.service" 2>/dev/null; then
+        dm_unit="$cand.service"
+        break
+      fi
+    done
   fi
-done
+  case "$dm_unit" in
+    lightdm.service) ;;
+    "")
+      die "attach mode: could not detect a display manager (checked the" \
+          "display-manager.service alias and lightdm/gdm/gdm3/sddm units)." \
+          "Attach mode currently only automates lightdm's autologin -- install" \
+          "lightdm, or configure autologin for your display manager yourself" \
+          "so :0 exists after an unattended boot, then re-run."
+      ;;
+    *)
+      die "attach mode: detected display manager '$dm_unit', but attach mode" \
+          "currently only automates lightdm's autologin. Configure autologin" \
+          "for '$dm_unit' yourself so :0 exists after an unattended boot" \
+          "(this is not optional -- without it the machine serves nothing" \
+          "after a reboot), or switch the host to lightdm and re-run."
+      ;;
+  esac
 
-drop_dst="$drop_dir/99-ghostframe-autologin.conf"
-info "install: $drop_dst"
-sed "s|__USER__|$target_user|g" "$pkg_dir/systemd/getty-autologin.conf.tmpl" \
-  | install -m 0644 -o root -g root /dev/stdin "$drop_dst"
+  lightdm_dropin_dir="/etc/lightdm/lightdm.conf.d"
+  if [[ -d "$lightdm_dropin_dir" ]]; then
+    info "found: $lightdm_dropin_dir"
+  else
+    info "create: $lightdm_dropin_dir (did not exist; lightdm reads *.conf here automatically)"
+    install -d -m 0755 "$lightdm_dropin_dir"
+  fi
+
+  # Warn (but don't abort) if another autologin drop-in exists.
+  shopt -s nullglob
+  existing=("$lightdm_dropin_dir"/*.conf)
+  shopt -u nullglob
+  for f in "${existing[@]}"; do
+    base=$(basename "$f")
+    [[ "$base" == "99-ghostframe-autologin.conf" ]] && continue
+    if grep -q autologin "$f" 2>/dev/null; then
+      info "warn: existing autologin config at $f — ours uses the 99- prefix and will win, but verify"
+    fi
+  done
+
+  lightdm_dst="$lightdm_dropin_dir/99-ghostframe-autologin.conf"
+  info "install: $lightdm_dst"
+  sed "s|__USER__|$target_user|g" "$pkg_dir/lightdm-autologin.conf.tmpl" \
+    | install -m 0644 -o root -g root /dev/stdin "$lightdm_dst"
+else
+  # 7. getty autologin drop-in.
+  drop_dir="/etc/systemd/system/getty@tty1.service.d"
+  install -d -m 0755 "$drop_dir"
+
+  # Warn (but don't abort) if another autologin drop-in exists.
+  shopt -s nullglob
+  existing=("$drop_dir"/*.conf)
+  shopt -u nullglob
+  for f in "${existing[@]}"; do
+    base=$(basename "$f")
+    [[ "$base" == "99-ghostframe-autologin.conf" ]] && continue
+    if grep -q autologin "$f" 2>/dev/null; then
+      info "warn: existing autologin drop-in at $f — ours uses the 99- prefix and will win, but verify"
+    fi
+  done
+
+  drop_dst="$drop_dir/99-ghostframe-autologin.conf"
+  info "install: $drop_dst"
+  sed "s|__USER__|$target_user|g" "$pkg_dir/systemd/getty-autologin.conf.tmpl" \
+    | install -m 0644 -o root -g root /dev/stdin "$drop_dst"
+fi
 
 # 8. Tsnet seed.
 seeded=0
@@ -346,29 +478,46 @@ fi
 info "systemctl daemon-reload"
 systemctl daemon-reload
 
-info "enabling ghostframe.target for user $target_user..."
+if [[ "$mode" == "attach" ]]; then
+  enable_unit="ghostframe-xdaemon.service"
+else
+  enable_unit="ghostframe.target"
+fi
+
+info "enabling $enable_unit for user $target_user..."
 # The target user's --user manager may not be running. Use `--global` to
 # enable for the user, then their next login starts it. Equivalent to running
 # `systemctl --user enable` inside that user's session.
 {
   sudo -u "$target_user" \
     XDG_RUNTIME_DIR="/run/user/$user_uid" \
-    systemctl --user enable ghostframe.target 2>/dev/null \
+    systemctl --user enable "$enable_unit" 2>/dev/null \
     || sudo -u "$target_user" \
          env XDG_RUNTIME_DIR="/run/user/$user_uid" \
-         systemctl --user --no-block enable ghostframe.target
+         systemctl --user --no-block enable "$enable_unit"
 } || {
-  info "warn: 'systemctl --user enable ghostframe.target' failed for user $target_user."
-  info "      The target should still autostart on first boot via WantedBy=default.target,"
+  info "warn: 'systemctl --user enable $enable_unit' failed for user $target_user."
+  info "      It should still autostart on first login/session via its own WantedBy=,"
   info "      but if it does not, run after logging in as that user:"
-  info "          systemctl --user enable ghostframe.target"
+  info "          systemctl --user enable $enable_unit"
 }
 
-info "enabling getty@tty1..."
-systemctl enable getty@tty1.service
+if [[ "$mode" == "headless" ]]; then
+  info "enabling getty@tty1..."
+  systemctl enable getty@tty1.service
+fi
 
 info ""
 info "installation complete."
+if [[ "$mode" == "attach" ]]; then
+  info ""
+  info "ATTACH MODE -- SECURITY: a client that reaches the tailnet endpoint gets"
+  info "$target_user's own desktop -- their files, their browser sessions, their"
+  info "sudo -- not a sandboxed guest session. The tailnet is the only boundary."
+  info "GHOSTFRAME_ATTACH_MAX_RESOLUTION=$max_resolution (set in $user_units_dir/ghostframe-xdaemon.service)."
+  info "To change it later, edit that unit's Environment= line and run:"
+  info "  systemctl --user daemon-reload && systemctl --user restart ghostframe-xdaemon.service"
+fi
 if [[ "$seeded" -eq 1 ]]; then
   info "Reboot the machine. Then, on any tailnet device, open:"
   info "  https://$(hostname)-ghostframe.<tailnet>.ts.net/"
