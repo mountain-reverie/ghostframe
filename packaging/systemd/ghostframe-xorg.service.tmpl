@@ -21,18 +21,22 @@ Type=simple
 # start -- observed in production as a PiKVM showing the Ghostframe desktop
 # instead of the console session.
 #
-# __XORG_VT_FLAGS__ is substituted by install.sh:
+# __XORG_VT_FLAGS__ is substituted by install.sh with "-novtswitch", for both
+# display backends.
 #
-#   vkms backend   -> "-novtswitch". VKMS is not the console device (fbcon
-#                     binds the real GPU's fb0), so DRM mastership of the VKMS
-#                     card is independent of which VT is active. This server
-#                     can hold it without ever stealing focus.
+# It is safe regardless of backend because **this X server's output is never
+# viewed**. The daemon captures over the X protocol -- ghostframe-xdaemon.service
+# sets GHOSTFRAME_X11_CAPTURE_ONLY=1, which takes the GetImage(root) path -- so
+# it needs neither DRM master nor an active scanout. It only needs to exist and
+# hold a framebuffer that clients render into.
 #
-#   amdgpu backend -> "" (empty). There, the virtual connector lives on the
-#                     real GPU, and DRM mastership of that card follows the
-#                     active VT -- so the server must activate its VT or it
-#                     cannot modeset at all. That is safe only on a machine
-#                     with no local desktop, which is what that backend is for.
+# Confirmed on hardware: after chvt'ing back to the console session, at which
+# point this server is definitively not the DRM master, it kept serving frames
+# to the web client.
+#
+# (An earlier revision applied this only to the vkms backend, on the theory that
+# amdgpu needed an active VT to modeset. That conflated "can display" with "can
+# be captured".)
 #
 # -config: bare filename, not absolute path. Xorg refuses absolute -config
 # paths when running with elevated privileges (Xwrapper's needs_root_rights=yes)
