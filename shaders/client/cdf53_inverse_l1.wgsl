@@ -6,7 +6,17 @@
 // pixels into the framebuffer storage texture (alpha = 1.0).
 //
 // Four workgroups per dirty tile (one per 16×16 quadrant of the 32×32 tile),
-// @workgroup_size(16, 16, 1) = 256 invocations.
+// @workgroup_size(16, 8, 1) = 128 invocations, each covering two rows.
+//
+// 128, not the 256 a 16×16 quadrant would suggest one-per-element: GLES 3.1's
+// maxComputeInvocationsPerWorkgroup minimum is 128 and Mali-T860 reports
+// exactly that, so the native client on Midgard cannot create a device at all
+// at 256 (see the GLES/V4L2 design doc §5). WebGPU guarantees 256, so 128 is
+// valid in every browser too. Enforced by
+// `shader_validation.rs::no_compute_shader_exceeds_the_portable_workgroup_limit`.
+//
+// The workgroup COUNT is unchanged, so the dispatch in cdf53.rs and cdf53.ts
+// does not move.
 
 @group(0) @binding(0) var<storage, read> coefficientBuffer: array<u32>;
 @group(0) @binding(1) var<storage, read> signBuffer: array<u32>;
@@ -37,7 +47,7 @@ fn workarea_idx(tile_idx: u32, ch: u32, y: u32, x: u32) -> u32 {
   return tile_idx * 3072u + ch * 1024u + y * 32u + x;
 }
 
-@compute @workgroup_size(16, 16, 1)
+@compute @workgroup_size(16, 8, 1)
 fn main(@builtin(workgroup_id) wg: vec3<u32>,
         @builtin(local_invocation_id) lid: vec3<u32>) {
   let tile_slot = wg.x / 4u;
@@ -56,26 +66,31 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>,
   let qx = quadrant % 2u;
   let y_base = qy * 16u;
   let x_base = qx * 16u;
-  let y = y_base + lid.y;
   let x = x_base + lid.x;
 
-  for (var ch: u32 = 0u; ch < 3u; ch = ch + 1u) {
-    let in_top = y < 16u;
-    let in_left = x < 16u;
-    var v: i32 = 0;
-    if (in_top && in_left) {
-      v = workArea[workarea_idx(tile_idx, ch, y, x)]; // LL1 — preserved from L2 step
-    } else {
-      let dy = select(y - 16u, y, in_top);
-      let dx = select(x - 16u, x, in_left);
-      let base = select(
-        select(768u, 512u, in_left), // bottom: HH1 (right) or LH1 (left)
-        256u,                        // top right: HL1
-        in_top
-      );
-      let i = base + dy * 16u + dx;
-      v = read_coeff(tile_idx, ch, i);
-      workArea[workarea_idx(tile_idx, ch, y, x)] = v;
+  // Two rows per invocation: lid.y runs 0..8 and covers y_base+0..16. No
+  // barrier and no early return inside this loop, so the split is a pure
+  // re-indexing of the same per-(y, x) work.
+  for (var yy: u32 = 0u; yy < 2u; yy = yy + 1u) {
+    let y = y_base + lid.y * 2u + yy;
+    for (var ch: u32 = 0u; ch < 3u; ch = ch + 1u) {
+      let in_top = y < 16u;
+      let in_left = x < 16u;
+      var v: i32 = 0;
+      if (in_top && in_left) {
+        v = workArea[workarea_idx(tile_idx, ch, y, x)]; // LL1 — preserved from L2 step
+      } else {
+        let dy = select(y - 16u, y, in_top);
+        let dx = select(x - 16u, x, in_left);
+        let base = select(
+          select(768u, 512u, in_left), // bottom: HH1 (right) or LH1 (left)
+          256u,                        // top right: HL1
+          in_top
+        );
+        let i = base + dy * 16u + dx;
+        v = read_coeff(tile_idx, ch, i);
+        workArea[workarea_idx(tile_idx, ch, y, x)] = v;
+      }
     }
   }
   storageBarrier();
