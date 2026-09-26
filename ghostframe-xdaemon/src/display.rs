@@ -7,6 +7,7 @@
 //! modelines, millimetres -- stays inside this module; the trait itself
 //! must not gain an X concept. See the M4b design doc §5 and §7.
 
+use std::env;
 use std::sync::Mutex;
 
 use x11rb::connection::Connection;
@@ -36,6 +37,11 @@ pub struct XrandrDisplay {
     /// fails. Seeded from a real query in `new()` and refreshed on every
     /// subsequent successful call -- never a hardcoded guess.
     ceiling_fallback: Mutex<(u16, u16)>,
+    /// `GHOSTFRAME_ATTACH_MAX_RESOLUTION`, read once at construction (this
+    /// crate's convention -- see `main.rs`). `Some("WIDTHxHEIGHT")` lowers
+    /// what `ceiling()` reports; `None` (unset) leaves the hardware ceiling
+    /// alone. Applied by `clamp_ceiling()` on every path through `ceiling()`.
+    max_resolution: Option<String>,
 }
 
 impl XrandrDisplay {
@@ -107,12 +113,19 @@ impl XrandrDisplay {
             "XrandrDisplay connected"
         );
 
+        let max_resolution = env::var("GHOSTFRAME_ATTACH_MAX_RESOLUTION").ok();
+        tracing::info!(
+            max_resolution = ?max_resolution,
+            "display controller ceiling clamp"
+        );
+
         Ok(Self {
             conn,
             root,
             output,
             crtc,
             ceiling_fallback: Mutex::new((range.max_width, range.max_height)),
+            max_resolution,
         })
     }
 
@@ -132,7 +145,7 @@ impl XrandrDisplay {
 
 impl DisplayController for XrandrDisplay {
     fn ceiling(&self) -> (u16, u16) {
-        match self.query_ceiling() {
+        let hardware = match self.query_ceiling() {
             Ok(val) => {
                 *self.ceiling_fallback.lock().unwrap() = val;
                 val
@@ -144,7 +157,8 @@ impl DisplayController for XrandrDisplay {
                 );
                 *self.ceiling_fallback.lock().unwrap()
             }
-        }
+        };
+        clamp_ceiling(hardware, self.max_resolution.as_deref())
     }
 
     fn set_output(&self, width: u16, height: u16, scale_milli: u16) -> Result<(), DisplayError> {
@@ -426,6 +440,42 @@ fn mm_for_scale(px: u16, scale_milli: u16) -> u32 {
     ((f64::from(px) / dpi) * 25.4).round() as u32
 }
 
+/// Lower a hardware ceiling to an operator-configured maximum.
+///
+/// `raw` is the value of `GHOSTFRAME_ATTACH_MAX_RESOLUTION`: `"WIDTHxHEIGHT"`
+/// to clamp, `"none"` to disable, absent to disable.
+///
+/// **Only ever lowers.** A configured value above the hardware ceiling is
+/// ignored rather than applied, because raising it would have the server ask
+/// X for a mode it cannot allocate.
+///
+/// **Malformed input is ignored, not fatal.** A typo in a unit file must not
+/// stop the daemon serving; it warns and keeps the hardware ceiling. Failing
+/// closed here would turn a cosmetic mistake into an outage.
+fn clamp_ceiling(hardware: (u16, u16), raw: Option<&str>) -> (u16, u16) {
+    let Some(raw) = raw else {
+        return hardware;
+    };
+    let raw = raw.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("none") {
+        return hardware;
+    }
+    let parsed = raw
+        .split_once(['x', 'X'])
+        .and_then(|(w, h)| Some((w.trim().parse::<u16>().ok()?, h.trim().parse::<u16>().ok()?)))
+        .filter(|(w, h)| *w > 0 && *h > 0);
+    match parsed {
+        Some((w, h)) => (hardware.0.min(w), hardware.1.min(h)),
+        None => {
+            tracing::warn!(
+                value = raw,
+                "GHOSTFRAME_ATTACH_MAX_RESOLUTION is not WIDTHxHEIGHT or 'none'; ignoring"
+            );
+            hardware
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -526,6 +576,57 @@ mod tests {
             steps,
             vec![ResizeStep::SetScreen(1920, 1500), ResizeStep::SetCrtc]
         );
+    }
+
+    #[test]
+    fn unset_means_no_clamp() {
+        assert_eq!(clamp_ceiling((16384, 16384), None), (16384, 16384));
+    }
+
+    #[test]
+    fn a_wxh_value_lowers_the_ceiling() {
+        assert_eq!(
+            clamp_ceiling((16384, 16384), Some("1920x1080")),
+            (1920, 1080)
+        );
+    }
+
+    #[test]
+    fn each_axis_clamps_independently() {
+        // The five tests this started with all had either NO axis exceeding
+        // or BOTH exceeding, so none of them could tell per-axis `min` apart
+        // from whole-value rejection -- a review mutation to the latter left
+        // every test passing. This is the case that straddles: width is
+        // already under the clamp, height is over.
+        assert_eq!(clamp_ceiling((1280, 2160), Some("1920x1080")), (1280, 1080));
+        assert_eq!(clamp_ceiling((3840, 720), Some("1920x1080")), (1920, 720));
+    }
+
+    #[test]
+    fn the_clamp_only_ever_lowers() {
+        // A clamp larger than the hardware ceiling must not raise it -- that
+        // would ask X for a mode it cannot allocate.
+        assert_eq!(clamp_ceiling((1280, 720), Some("1920x1080")), (1280, 720));
+    }
+
+    #[test]
+    fn none_disables_the_clamp() {
+        // The documented escape hatch, for an operator who has decided the
+        // recovery view no longer needs protecting.
+        assert_eq!(clamp_ceiling((16384, 16384), Some("none")), (16384, 16384));
+    }
+
+    #[test]
+    fn malformed_values_are_ignored_not_fatal() {
+        // A typo in a unit file must not stop the daemon serving. Each of
+        // these logs a warning and leaves the hardware ceiling in place.
+        for bad in ["", "1920", "1920x", "x1080", "1920*1080", "abcxdef", "0x0"] {
+            assert_eq!(
+                clamp_ceiling((16384, 16384), Some(bad)),
+                (16384, 16384),
+                "input {bad:?} should have been ignored"
+            );
+        }
     }
 
     #[test]

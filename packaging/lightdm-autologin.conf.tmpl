@@ -1,0 +1,17 @@
+# Installed by ghostframe packaging/install.sh --mode attach.
+#
+# Attach mode captures an existing X session rather than starting one of its
+# own, so that session must exist after an unattended boot or the machine
+# serves nothing. This autologins the session user to create it.
+#
+# Consequence, deliberate: an unattended boot leaves this machine logged in.
+# On a host whose purpose is to serve that session remotely, that is the point
+# rather than a regression. If it is not what you want, use --mode headless,
+# which runs its own isolated session under a separate account instead.
+#
+# autologin-user-timeout=0 means log in immediately with no greeter countdown.
+# A non-zero value would leave the machine sitting at the greeter for that long
+# after every boot, serving nothing.
+[Seat:*]
+autologin-user=__USER__
+autologin-user-timeout=0

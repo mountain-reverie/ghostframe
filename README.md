@@ -83,6 +83,122 @@ After reboot, the configured user is automatically logged in on `tty1`,
 Xorg comes up on display `:1`, Enlightenment starts inside that session,
 and `ghostframe-xdaemon` joins the tailnet and starts capturing.
 
+## Attach Mode
+
+Attach mode captures the operator's existing X session instead of creating a
+dedicated headless session. This is useful when ghostframe is the primary
+workload and the machine would otherwise have a local desktop session
+contending for the same GPU.
+
+### When to Choose Attach Mode
+
+The fundamental constraint is that a GPU has exactly one DRM master at a time.
+When two X servers need to drive the same GPU — one running the local desktop,
+one running ghostframe — they contend for this mastership through VT switching.
+The local session's display is disrupted while ghostframe is active, and vice
+versa.
+
+Attach mode avoids this contention by running ghostframe in the *same* X
+session as the local desktop, so there is no competition for the DRM master.
+This makes sense when the remote session *is* the primary use of the machine.
+It also makes the local output more useful rather than less: a monitor or KVM
+attached to the host shows exactly what the remote client sees, rather than a
+second, unrelated desktop.
+
+### What It Does Not Require
+
+Unlike headless mode, attach mode does not need:
+
+- The `amdgpu virtual_display=` kernel module option or a reboot to install it
+- VKMS (Virtual Kernel Mode Setting)
+- A dedicated non-interactive user (it captures the existing operator's session)
+- A getty autologin on `tty1`
+- Loosening of `Xwrapper.config` to allow X servers to run as the current user
+
+The operator's existing X session becomes the capture source, whichever window
+manager it runs. The unit does hardcode `DISPLAY=:0`, though, so a host that puts
+its graphical session somewhere else — a second seat, or a lightdm config that
+moves it — needs that changed before the daemon finds anything to capture.
+
+### Security Position
+
+In attach mode, any client that connects to the tailnet endpoint sees the
+operator's own desktop: their files, browser sessions, saved passwords, and
+sudo privileges. There is no sandbox or separation from the local account.
+
+Single-client eviction still applies — only one remote client can attach at a
+time — but the tailnet is the only access boundary. **If you are choosing attach
+mode, you should understand that anyone with tailnet access to the ghostframe
+endpoint gets full access to that account's session.**
+
+### Max Resolution
+
+By default, attach mode caps the remote client to a maximum resolution of
+**1920×1080**. The reason is that attach mode is capturing the physical display,
+which may itself be captured by a KVM switch or remote management system as a
+recovery view. If a remote client sets a video mode that the recovery path cannot
+capture, you lose access at the moment you need it most.
+
+To override this limit once you are confident recovery access is not needed:
+
+```bash
+sudo ./packaging/install.sh <user> --mode attach --max-resolution none
+```
+
+The flag writes `GHOSTFRAME_ATTACH_MAX_RESOLUTION` into the installed unit, and
+the installer prints the value it used. If a client with a larger display than
+1080p gets 1080p anyway, that variable is what to look for.
+
+### Installation
+
+Attach mode requires **lightdm** as the display manager. The installer will error
+rather than silently skip if lightdm is not present, since silent failure after
+reboot is worse than failing loudly.
+
+If you do not already have lightdm installed:
+
+**Ubuntu 24.04:**
+```bash
+sudo apt-get install lightdm
+```
+
+**Arch Linux:**
+```bash
+sudo pacman -S lightdm
+```
+
+Then install ghostframe in attach mode:
+
+```bash
+# 1. Clone and build from source (same as headless).
+git clone https://github.com/mountain-reverie/ghostframe.git
+cd ghostframe
+just build-release
+
+# 2. Run the installer in attach mode, targeting the user who owns the local session.
+sudo ./packaging/install.sh <user> --mode attach
+
+# 3. Optionally cap the maximum resolution (default is 1920×1080):
+#    sudo ./packaging/install.sh <user> --mode attach --max-resolution 2560x1440
+
+# 4. Paste your Tailscale auth key when prompted. Unlike headless mode,
+#    no reboot is necessary — the changes take effect immediately.
+```
+
+After the install completes, `ghostframe-xdaemon` is installed as a user service
+for the specified account. It will start automatically on the next login, or can
+be started immediately if already logged in.
+
+### Unattended Boot Behavior
+
+In attach mode, the session must exist for ghostframe to capture it. On an
+unattended boot, this means the specified user remains logged in automatically
+(via lightdm). This is by design: a machine whose purpose is to serve that
+session remotely has no competing need for a local logout. The consequence is
+worth stating plainly, though: anyone who reaches the machine physically after a
+boot finds a logged-in desktop, not a login prompt. If that is not acceptable,
+use headless mode, which runs its own session under a separate account.
+
 ## Update
 
 To pick up a new version, rebuild from source and re-run the installer

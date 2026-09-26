@@ -1,0 +1,57 @@
+# ATTACH MODE. This daemon captures the session of the user it runs as --
+# DISPLAY=:0, the operator's own desktop.
+#
+# A client that reaches the tailnet endpoint therefore gets that desktop:
+# their files, their browser sessions, their sudo. Not a sandboxed guest
+# session as in headless mode. Single-client eviction (M4a) still applies, so
+# two clients cannot both attach, but the tailnet is the only boundary.
+#
+# If that is not what you want, use --mode headless.
+
+[Unit]
+Description=Ghostframe capture + transport daemon
+After=graphical-session.target
+# Restart with session: keeps the capture pipeline active for the lifetime
+# of the operator's desktop.
+PartOf=graphical-session.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+Environment=DISPLAY=:0
+Environment=TS_HOSTNAME=%H-ghostframe
+Environment=TS_STATE_DIR=%h/.local/share/ghostframe/ts-state
+# Use the X-protocol capture path, not DRM.
+#
+# Not for the headless unit's reason -- there, a DRM read would see the wrong
+# display. Here the captured session IS the physical display, so a DRM read
+# would see the right pixels.
+#
+# It stays set on privilege grounds. The zero-copy writeback path needs an
+# atomic commit, which needs DRM master, and X holds it (drm_capture.rs probes
+# this and gets EACCES). The modesetting-FB fallback is expected to fail too:
+# GETFB2's GEM-handle disclosure is gated on DRM-master-or-CAP_SYS_ADMIN and
+# this daemon is neither -- though that second failure is reasoned, not
+# measured.
+#
+# So this is the known-working path, not a proven-optimal one. If someone
+# measures DRM capture in attach mode, replace this comment with the
+# measurement rather than another assumption. See the M4b/attach design docs.
+Environment=GHOSTFRAME_X11_CAPTURE_ONLY=1
+# Caps how large a remote client may resize this session. In attach mode the
+# session IS the physical display, which a KVM may be capturing as the
+# machine's recovery view -- an unclamped client could set a mode that view
+# cannot capture, removing the recovery path exactly when it is wanted.
+# Substituted by install.sh; "none" disables the clamp.
+Environment=GHOSTFRAME_ATTACH_MAX_RESOLUTION=__MAX_RESOLUTION__
+# X11 readiness is gated inside the daemon (wait_for_x11 in main.rs): the
+# daemon blocks on x11rb::connect for up to 10s before bringing up tsnet,
+# and exits with a clear journal message on timeout.
+ExecStart=/usr/local/bin/ghostframe-xdaemon
+Restart=on-failure
+RestartSec=2
+SyslogIdentifier=ghostframe-xdaemon
+
+[Install]
+WantedBy=graphical-session.target
