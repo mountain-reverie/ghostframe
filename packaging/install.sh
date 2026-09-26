@@ -238,10 +238,23 @@ fi
 # 6. User units.
 user_units_dir="$user_home/.config/systemd/user"
 install -d -m 0755 -o "$user_uid" -g "$user_gid" "$user_units_dir"
-for u in ghostframe.target ghostframe-xorg.service ghostframe-wm.service ghostframe-xdaemon.service; do
+for u in ghostframe.target ghostframe-wm.service ghostframe-xdaemon.service; do
   info "install: $user_units_dir/$u"
   install -m 0644 -o "$user_uid" -g "$user_gid" "$pkg_dir/systemd/$u" "$user_units_dir/$u"
 done
+
+# ghostframe-xorg.service is templated: whether Xorg may activate its VT at
+# startup depends on the display backend. See the comment in the template.
+if [[ "$display_backend" == "vkms" ]]; then
+  xorg_vt_flags="-novtswitch"
+else
+  xorg_vt_flags=""
+fi
+info "install: $user_units_dir/ghostframe-xorg.service  (vt flags: '${xorg_vt_flags:-none}')"
+sed "s|__XORG_VT_FLAGS__|$xorg_vt_flags|g" \
+    "$pkg_dir/systemd/ghostframe-xorg.service.tmpl" \
+  | install -m 0644 -o "$user_uid" -g "$user_gid" /dev/stdin \
+      "$user_units_dir/ghostframe-xorg.service"
 
 # 7. getty autologin drop-in.
 drop_dir="/etc/systemd/system/getty@tty1.service.d"
