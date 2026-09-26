@@ -56,9 +56,13 @@ pub struct Renderer {
     pending_palrle: Vec<(u8, u8, u8, u8, Vec<u8>)>,
     pending_cdf53: Vec<Cdf53PassEntry>,
 
-    /// `GHOSTFRAME_CLIENT_DUMP_FRAME` fires once per process, not per frame.
-    /// Set even when the write fails -- see `maybe_dump_framebuffer`.
-    dumped_frame: bool,
+    /// How many PPM dumps have been written, against
+    /// `GHOSTFRAME_CLIENT_DUMP_COUNT`. Counts attempts, not successes -- see
+    /// `maybe_dump_framebuffer`.
+    dumps_written: u64,
+    /// Completed `flush` calls, so the dump can be deferred past a server's
+    /// opening burst.
+    flushes: u64,
 
     /// `Some` from construction on when `Renderer::new`'s `open_h264_eagerly`
     /// was `true` (the decoder is opened synchronously in `Renderer::new` --
@@ -200,7 +204,8 @@ impl Renderer {
             pending_solid: Vec::new(),
             pending_palrle: Vec::new(),
             pending_cdf53: Vec::new(),
-            dumped_frame: false,
+            dumps_written: 0,
+            flushes: 0,
             h264_decoder,
             h264_pipeline: None,
             h264_unavailable,
@@ -353,53 +358,66 @@ impl Renderer {
             self.pending_cdf53.clear();
             self.cdf53.inverse(&ctx.device, &ctx.queue, &self.fb);
         }
+
+        self.flushes = self.flushes.saturating_add(1);
+        self.maybe_dump_framebuffer(ctx);
     }
 
     /// Seal a generation and hand out an export buffer, if one is free.
     pub fn publish(&mut self, ctx: &WgpuContext) -> Option<PublishedFrame> {
-        let pf = self.ring.publish(&ctx.device, &ctx.queue, &self.fb);
-        if pf.is_some() {
-            self.maybe_dump_framebuffer(ctx);
-        }
-        pf
+        self.ring.publish(&ctx.device, &ctx.queue, &self.fb)
     }
 
-    /// Write the framebuffer to a binary PPM when
-    /// `GHOSTFRAME_CLIENT_DUMP_FRAME` names a path. Once per process.
+    /// Write the framebuffer to binary PPM files when
+    /// `GHOSTFRAME_CLIENT_DUMP_FRAME` names a path prefix.
     ///
-    /// **Reads the framebuffer, deliberately — not the exported dmabuf.** That
-    /// is what makes it useful: the framebuffer is an ordinary wgpu texture, so
-    /// `debug_read` gets tight row-major RGBA out of it whatever the exported
-    /// buffer's DRM modifier is. On a backend whose export turns out to be
-    /// tiled or compressed (see `export_gles.rs`'s module doc) that is the
-    /// difference between two very different bugs wearing the same face:
+    /// Writes `<prefix>.<n>.ppm` on each of the first
+    /// `GHOSTFRAME_CLIENT_DUMP_COUNT` flushes (default 1), logging dimensions
+    /// and a non-black pixel count for each.
     ///
-    /// - dump looks right, window looks wrong -> decode and render are fine,
-    ///   the export layout or the consumer's import is not.
-    /// - dump looks wrong -> the fault is upstream, in tile decode or the
+    /// **A series, not one frame, and that is deliberate.** A server's opening
+    /// burst is thousands of tiles, and the render thread batches aggressively
+    /// -- 12k events collapsed into a handful of flushes on the machine this
+    /// was written for. So a single dump lands at an arbitrary point in the
+    /// paint, and an almost-empty framebuffer is indistinguishable from one
+    /// that never fills. A short series shows whether content is accumulating.
+    ///
+    /// **Reads the framebuffer, deliberately -- not the exported dmabuf.** The
+    /// framebuffer is an ordinary wgpu texture, so `debug_read` returns tight
+    /// row-major RGBA whatever the export's DRM modifier is. Where the export
+    /// is tiled or compressed (see `export_gles.rs`) that distinction separates
+    /// two bugs that look identical from outside:
+    ///
+    /// - dumps fill in -> decode and render are fine; the export layout or the
+    ///   consumer's import is at fault.
+    /// - dumps stay black -> the fault is upstream, in tile decode or the
     ///   shaders, and the export is a red herring.
     ///
-    /// PPM because it needs no dependency and every image viewer opens it;
+    /// PPM because it needs no dependency and every viewer opens it;
     /// `ghostframe-xdaemon` pulls in a PNG encoder for its own capture dump,
     /// but that is a server-side cost and this is a library.
     fn maybe_dump_framebuffer(&mut self, ctx: &WgpuContext) {
-        if self.dumped_frame {
-            return;
-        }
-        let Ok(path) = std::env::var("GHOSTFRAME_CLIENT_DUMP_FRAME") else {
+        let Ok(prefix) = std::env::var("GHOSTFRAME_CLIENT_DUMP_FRAME") else {
             return;
         };
-        // Set regardless of outcome: a path that cannot be written will not
-        // start working on frame two, and retrying every frame would turn a
-        // typo into a log flood.
-        self.dumped_frame = true;
+        let want: u64 = std::env::var("GHOSTFRAME_CLIENT_DUMP_COUNT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        if self.dumps_written >= want {
+            return;
+        }
+        let n = self.dumps_written;
+        // Incremented regardless of outcome: a path that cannot be written will
+        // not start working on the next flush, and retrying every flush would
+        // turn a typo into a log flood.
+        self.dumps_written += 1;
 
         let (w, h) = (self.fb.width, self.fb.height);
         let rgba = self.fb.debug_read(&ctx.device, &ctx.queue);
 
-        // Non-black pixel count, logged alongside the write. "I dumped a
-        // frame" is not the useful fact; "the frame was entirely black" is,
-        // and it saves opening the file to find out.
+        // "I dumped a frame" is not the useful fact; "the frame was entirely
+        // black" is, and it saves opening the file to find out.
         let non_black = rgba
             .chunks_exact(4)
             .filter(|p| p[0] != 0 || p[1] != 0 || p[2] != 0)
@@ -411,6 +429,7 @@ impl Renderer {
             ppm.extend_from_slice(&px[..3]);
         }
 
+        let path = format!("{prefix}.{n}.ppm");
         match std::fs::write(&path, &ppm) {
             Ok(()) => tracing::info!(
                 path = %path,
@@ -418,8 +437,9 @@ impl Renderer {
                 height = h,
                 non_black_px = non_black,
                 total_px = w as usize * h as usize,
-                "dumped framebuffer (PPM, read back through wgpu -- unaffected \
-                 by the exported dmabuf's modifier)"
+                flush = self.flushes,
+                "dumped framebuffer (PPM via wgpu readback -- unaffected by the \
+                 exported dmabuf's modifier)"
             ),
             Err(e) => tracing::warn!(path = %path, error = %e, "framebuffer dump failed"),
         }
