@@ -4,8 +4,11 @@ build: build-web
 build-release: build-web
     cargo build --release
 
+# --bins is not redundant: it is the only thing that runs the tests in binary
+# crates (ghostframe-xdaemon, codec_report). `--lib` skips them silently.
 test-unit:
-    cargo test --lib
+    cargo test --workspace --lib
+    cargo test --workspace --bins
 
 # Run from a clean checkout: builds the web client SPA (vite) into
 # ghostframe-web-client/dist/, which ghostbridge //go:embeds at compile
@@ -48,6 +51,7 @@ ci-local:
     cargo clippy --workspace --all-targets -- -D warnings
     @echo "=== unit tests ==="
     cargo test --workspace --lib
+    cargo test --workspace --bins
     @echo "=== packaging tests ==="
     just test-packaging
     @echo "=== web client build ==="
