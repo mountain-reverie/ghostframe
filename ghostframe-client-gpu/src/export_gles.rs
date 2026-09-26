@@ -6,119 +6,67 @@
 //! `renderer.rs` and `tests/gpu_export.rs` are written against one shape and
 //! do not know which backend they got. See `lib.rs`'s module wiring.
 //!
-//! ## The order is inverted relative to Vulkan, deliberately
+//! ## Why it allocates instead of exporting
 //!
-//! `export.rs` allocates a `VkImage` itself and then wraps it as a wgpu
-//! texture, because Vulkan lets you ask for exportable memory at creation
-//! time and wgpu does not expose that.
+//! `export.rs` allocates a `VkImage` itself because Vulkan lets you ask for
+//! exportable memory at creation time and wgpu does not expose that. This
+//! module allocates for a different reason, learned the hard way.
 //!
-//! EGL has no such requirement: `eglExportDMABUFImageMESA` exports whatever a
-//! given `EGLImage` is backed by, and `eglCreateImageKHR` will build an
-//! `EGLImage` from an *existing* GL texture. So here wgpu creates the texture
-//! normally and the export happens afterwards. That means wgpu owns the
-//! texture's lifetime, which removes the whole class of double-free hazard
-//! `export.rs` has to document around its no-op drop callback.
-//!
-//! ## The EGLImage is destroyed immediately
-//!
-//! Once `eglExportDMABUFImageMESA` has returned an fd, that fd holds its own
-//! reference to the underlying buffer object — the `EGLImage` was only ever a
-//! handle used to ask for it. So it is destroyed at the end of `new` rather
-//! than kept alive in the struct, which is what lets `ExportedImage` need no
-//! `Drop` impl at all: wgpu frees the texture, `OwnedFd` closes the fd.
-//!
-//! ## What this exports is AFBC-COMPRESSED, and it is not importable as-is
-//!
-//! **This is the open defect on this backend.** Measured on Mali-T860 /
-//! panfrost / Mesa 24.0.2, a wgpu-created texture exports with modifier
-//! `0x0800000000000051`, which decodes as
-//! `DRM_FORMAT_MOD_ARM_AFBC(BLOCK_SIZE_16x16 | YTR | SPARSE)` -- Arm Frame
+//! The obvious GLES approach is the reverse: let wgpu create the texture, then
+//! `eglExportDMABUFImageMESA` it. That works, and produces a buffer nothing can
+//! use. On Mali-T860 / panfrost / Mesa 24.0.2 a wgpu-created texture exports
+//! with modifier `0x0800000000000051`, which decodes as
+//! `DRM_FORMAT_MOD_ARM_AFBC(BLOCK_SIZE_16x16 | YTR | SPARSE)` — Arm Frame
 //! Buffer Compression. Not a tiling shuffle: *compression*.
 //!
-//! Against a real server the window showed a repeating green grid with a 16px
-//! band at the top and black below: compressed payload and block headers read
-//! as raw RGBA, the 16x16 block size, and SPARSE leaving most blocks
-//! unwritten. Modifier negotiation did not catch it because the X11 backend
-//! offers no modifier preference, and an empty preference list means "library
-//! picks" -- indistinguishable from "anything works", so it accepted the
-//! driver's only offer.
+//! Against a real server that rendered a repeating green grid with a 16px band
+//! at the top and black below — compressed payload and block headers read as
+//! raw RGBA, the 16×16 block size, and SPARSE leaving most blocks unwritten.
+//! Modifier negotiation did not catch it because the X11 backend offered no
+//! preference, and an empty preference list means "library picks", which is
+//! indistinguishable from "anything works".
 //!
-//! **There is no usage-flag escape.** Measured across
+//! **No usage-flag combination avoids it.** Measured across
 //! `RENDER_ATTACHMENT|TEXTURE_BINDING|COPY_SRC|COPY_DST`, plus
 //! `STORAGE_BINDING`, plus COPY-only, plus `TEXTURE_BINDING|COPY_DST`: every
-//! combination that yields a GL texture yields AFBC. (`RENDER_ATTACHMENT`
-//! alone yields a renderbuffer, which has no name to export at all.) The
-//! buffer cannot be coaxed out of wgpu in an importable layout; it has to be
-//! allocated elsewhere and rendered into.
+//! combination that yields a GL texture yields AFBC. (`RENDER_ATTACHMENT` alone
+//! yields a renderbuffer, with no name to export at all.)
 //!
-//! ### The fix, with its feasibility already measured
-//!
-//! Allocate LINEAR through GBM and import that as the render target --
-//! inverting this module back to the Vulkan pattern of allocating ourselves
-//! and wrapping. Confirmed on this driver by `tools/hw-probe/gbmprobe.c`:
+//! So the buffer is allocated LINEAR through GBM and the texture built around
+//! it, which `tools/hw-probe/gbmprobe.c` shows this driver supports:
 //!
 //! ```text
 //! ABGR8888 flags=LINEAR|RENDERING   OK  planes=1 modifier=0x0 stride=2560
 //! ```
 //!
 //! `DRM_FORMAT_ABGR8888` is what `wgpu::TextureFormat::Rgba8Unorm` maps to, so
-//! the channel order matches -- worth stating, because a linear buffer in the
+//! the channel order matches — worth stating, because a linear buffer in the
 //! wrong order renders as swapped colours rather than failing.
 //!
-//! The steps, all reachable from `with_raw_egl` plus libgbm:
+//! The chain is: `gbm_bo_create(LINEAR|RENDERING)` →
+//! `eglCreateImageKHR(EGL_LINUX_DMA_BUF_EXT)` →
+//! `glEGLImageTargetTexture2DOES` → `texture_from_raw` →
+//! `create_texture_from_hal`. The EGL and GL entry points are loaded through
+//! `egl.get_proc_address`, which `AdapterContext::egl_instance`'s own doc says
+//! handles GL functions too — so this needs no `glow` dependency for four calls.
 //!
-//! 1. `gbm_bo_create(ABGR8888, GBM_BO_USE_LINEAR | GBM_BO_USE_RENDERING)`,
-//!    then `gbm_bo_get_fd` / `_get_stride` / `_get_modifier`.
-//! 2. `eglCreateImageKHR(EGL_LINUX_DMA_BUF_EXT, {fd, stride, offset, fourcc})`.
-//! 3. `glGenTextures` + `glBindTexture` + `glEGLImageTargetTexture2DOES`, all
-//!    loadable through `egl.get_proc_address` -- `AdapterContext::egl_instance`'s
-//!    own doc covers GL functions too, so this needs no `glow` dependency.
-//! 4. `wgpu_hal::gles::Device::texture_from_raw` + `wgpu::Texture::from_hal`.
+//! ## Teardown order is load-bearing
 //!
-//! Drop order becomes load-bearing, and inverts from what this module does
-//! today: wgpu texture, then the GL texture (via `texture_from_raw`'s drop
-//! callback), then the `EGLImage`, then the bo. The `EGLImage` must OUTLIVE
-//! the texture, because the texture's storage *is* the image.
+//! The texture's storage *is* the `EGLImage`, which *is* the bo. So they must
+//! be released in that order, and only once nothing holds the texture — and
+//! `as_wgpu_texture` hands out reference-counted clones that can outlive this
+//! struct, so tearing down from `Drop` here would be a use-after-free the
+//! moment `ring.rs` still held one.
 //!
-//! Steps 2-4 are the same machinery `import_gles.rs` needs, so building this
-//! also unblocks NV12 import.
-//!
-//! ## What this exports is TILED, and that has consequences
-//!
-//! Measured on Mali-T860 / panfrost / Mesa 24.0.2: a wgpu-created texture
-//! exports as one plane with modifier **`0x0800000000000051`** — vendor `0x08`
-//! is `DRM_FORMAT_MOD_VENDOR_ARM`, so this is ARM block tiling, not
-//! `DRM_FORMAT_MOD_LINEAR`. Its reported *stride* is nonetheless the linear
-//! stride (256 bytes for 64px RGBA), which makes a row-major CPU read look
-//! like it succeeded while returning scrambled pixels.
-//!
-//! Two consequences, both real:
-//!
-//! 1. [`ExportedImage::map_read`] refuses unless the modifier is linear. A
-//!    silently-wrong readback is worse than an error, and this one fooled three
-//!    of `tests/gpu_export.rs`'s assertions before the check existed.
-//! 2. **A consumer that cannot import ARM tiling gets nothing usable.** A GPU
-//!    consumer told the modifier is fine — that is what modifiers are for, and
-//!    `ring.rs` already carries it through to `PublishedFrame`. But a consumer
-//!    that needs linear (a CPU reader, or a compositor without the ARM
-//!    modifier) cannot be served by this path at all, because the export
-//!    reports the texture's existing tiling rather than choosing one.
-//!
-//! Serving a linear-only consumer means inverting this module back to the
-//! Vulkan pattern: allocate the buffer LINEAR up front and render into it,
-//! instead of exporting whatever wgpu allocated. `tools/hw-probe/gbmprobe.c`
-//! shows GBM on this driver *can* allocate `XRGB8888` with
-//! `GBM_BO_USE_LINEAR | GBM_BO_USE_RENDERING`, reporting modifier `0x0` — so
-//! the allocation side is available; the missing piece is importing it as an
-//! `EGLImage` and wrapping it via `wgpu_hal::gles::Device::texture_from_raw`,
-//! which is the same machinery `import_gles.rs` needs. See the GLES/V4L2
-//! design doc.
+//! [`TextureOwned`] therefore lives in the texture's own drop callback rather
+//! than in this struct, making the order correct by construction instead of by
+//! convention. That is also why `texture_from_raw` gets `Some(callback)` and not
+//! `None`: wgpu must not free the texture out from under the chain.
 //!
 //! ## Untested paths
 //!
-//! The multi-plane branch is written from the spec and has not run — this
-//! driver reports one plane. Treat a report of trouble there as plausible,
-//! not surprising.
+//! Single-plane only. A multi-plane linear import would need the PLANE1/2
+//! attribute triples, which nothing here produces — `Rgba8Unorm` is one plane.
 
 use crate::dmabuf::{
     choose_modifier, dma_buf_sync, DMA_BUF_SYNC_END, DMA_BUF_SYNC_READ, DMA_BUF_SYNC_START,
@@ -145,9 +93,6 @@ const FORMAT_WGPU: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 // through transmuted function pointers. The signatures below are from
 // `EGL_KHR_image_base` and `EGL_MESA_image_dma_buf_export`.
 
-/// `EGL_GL_TEXTURE_2D_KHR`, from `EGL_KHR_gl_image`.
-const EGL_GL_TEXTURE_2D_KHR: u32 = 0x30B1;
-
 type EglImageKhr = *mut c_void;
 
 type PfnEglCreateImageKhr = unsafe extern "system" fn(
@@ -160,23 +105,7 @@ type PfnEglCreateImageKhr = unsafe extern "system" fn(
 
 type PfnEglDestroyImageKhr = unsafe extern "system" fn(dpy: *mut c_void, image: EglImageKhr) -> u32;
 
-type PfnEglExportDmabufImageQueryMesa = unsafe extern "system" fn(
-    dpy: *mut c_void,
-    image: EglImageKhr,
-    fourcc: *mut i32,
-    num_planes: *mut i32,
-    modifiers: *mut u64,
-) -> u32;
-
-type PfnEglExportDmabufImageMesa = unsafe extern "system" fn(
-    dpy: *mut c_void,
-    image: EglImageKhr,
-    fds: *mut i32,
-    strides: *mut i32,
-    offsets: *mut i32,
-) -> u32;
-
-/// The four extension entry points, loaded once per export.
+/// The two `EGL_KHR_image_base` entry points, loaded once per export.
 ///
 /// Loaded rather than cached on `WgpuContext` because export happens a fixed
 /// number of times at pool setup, not per frame — `get_proc_address` on the
@@ -184,8 +113,6 @@ type PfnEglExportDmabufImageMesa = unsafe extern "system" fn(
 struct EglExportFns {
     create_image: PfnEglCreateImageKhr,
     destroy_image: PfnEglDestroyImageKhr,
-    query: PfnEglExportDmabufImageQueryMesa,
-    export: PfnEglExportDmabufImageMesa,
 }
 
 impl EglExportFns {
@@ -214,34 +141,216 @@ impl EglExportFns {
                 destroy_image: std::mem::transmute::<extern "system" fn(), PfnEglDestroyImageKhr>(
                     get(egl_ctx, "eglDestroyImageKHR")?,
                 ),
-                query: std::mem::transmute::<extern "system" fn(), PfnEglExportDmabufImageQueryMesa>(
-                    get(egl_ctx, "eglExportDMABUFImageQueryMESA")?,
-                ),
-                export: std::mem::transmute::<extern "system" fn(), PfnEglExportDmabufImageMesa>(
-                    get(egl_ctx, "eglExportDMABUFImageMESA")?,
-                ),
             }
         })
     }
 }
 
-/// A wgpu texture whose storage is exported as a dmabuf.
+// --- libgbm, for allocating a LINEAR buffer we can render into -----------
+//
+// Hand-declared rather than pulling the `gbm` crate: this needs five entry
+// points, and the crate brings `drm` with it. Same call this file's own
+// `dmabuf.rs` sibling makes for DMA_BUF_IOCTL_SYNC -- a handful of FFI
+// declarations is cheaper than a dependency in a library others link.
+
+#[repr(C)]
+struct GbmDevice {
+    _opaque: [u8; 0],
+}
+#[repr(C)]
+struct GbmBo {
+    _opaque: [u8; 0],
+}
+
+#[link(name = "gbm")]
+extern "C" {
+    fn gbm_create_device(fd: i32) -> *mut GbmDevice;
+    fn gbm_device_destroy(dev: *mut GbmDevice);
+    fn gbm_bo_create(
+        dev: *mut GbmDevice,
+        width: u32,
+        height: u32,
+        format: u32,
+        flags: u32,
+    ) -> *mut GbmBo;
+    fn gbm_bo_destroy(bo: *mut GbmBo);
+    fn gbm_bo_get_fd(bo: *mut GbmBo) -> i32;
+    fn gbm_bo_get_stride(bo: *mut GbmBo) -> u32;
+    fn gbm_bo_get_modifier(bo: *mut GbmBo) -> u64;
+}
+
+/// `GBM_BO_USE_RENDERING` -- the buffer will be a render/copy target.
+const GBM_BO_USE_RENDERING: u32 = 1 << 2;
+/// `GBM_BO_USE_LINEAR` -- the whole point. Without it panfrost picks AFBC.
+const GBM_BO_USE_LINEAR: u32 = 1 << 4;
+
+/// `DRM_FORMAT_ABGR8888`, `fourcc_code('A','B','2','4')`.
 ///
-/// No `Drop`: wgpu owns the texture and frees it when the last clone goes
-/// away; `OwnedFd` closes the dmabuf. The `EGLImage` used to perform the
-/// export is already destroyed by the time this value exists (see the module
-/// doc).
-#[derive(Debug)]
+/// This is what [`FORMAT_WGPU`] (`Rgba8Unorm`) maps to. The two must agree: a
+/// linear buffer in the wrong channel order renders as swapped colours rather
+/// than failing, which is a much worse way to find out.
+const DRM_FORMAT_ABGR8888: u32 = 0x3432_4241;
+
+/// The render node GBM allocates from. Matches `ghostframe-client-h264`'s
+/// `RENDER_NODE`; a machine with several GPUs and a client on the wrong one is
+/// a problem neither has solved yet.
+const RENDER_NODE: &str = "/dev/dri/renderD128";
+
+// --- EGL dmabuf import (EGL_EXT_image_dma_buf_import) -------------------
+
+const EGL_LINUX_DMA_BUF_EXT: u32 = 0x3270;
+const EGL_LINUX_DRM_FOURCC_EXT: i32 = 0x3271;
+const EGL_DMA_BUF_PLANE0_FD_EXT: i32 = 0x3272;
+const EGL_DMA_BUF_PLANE0_OFFSET_EXT: i32 = 0x3273;
+const EGL_DMA_BUF_PLANE0_PITCH_EXT: i32 = 0x3274;
+const EGL_WIDTH: i32 = 0x3057;
+const EGL_HEIGHT: i32 = 0x3056;
+const EGL_NONE_I: i32 = 0x3038;
+
+// --- the three GL calls needed to bind an EGLImage to a texture ---------
+
+const GL_TEXTURE_2D: u32 = 0x0DE1;
+const GL_TEXTURE_MIN_FILTER: u32 = 0x2801;
+const GL_TEXTURE_MAG_FILTER: u32 = 0x2800;
+const GL_LINEAR: i32 = 0x2601;
+
+type PfnGlGenTextures = unsafe extern "system" fn(n: i32, textures: *mut u32);
+type PfnGlBindTexture = unsafe extern "system" fn(target: u32, texture: u32);
+type PfnGlDeleteTextures = unsafe extern "system" fn(n: i32, textures: *const u32);
+type PfnGlTexParameteri = unsafe extern "system" fn(target: u32, pname: u32, param: i32);
+type PfnGlEglImageTargetTexture2DOes = unsafe extern "system" fn(target: u32, image: EglImageKhr);
+
+/// The GL entry points needed to bind an `EGLImage` to a texture.
+///
+/// Loaded through `egl.get_proc_address`, not linked: `glEGLImageTargetTexture2DOES`
+/// is a GLES extension, and `AdapterContext::egl_instance`'s own doc says that
+/// loader handles "GL and EGL extension functions". Going through EGL for the
+/// core calls too keeps them all on one mechanism, and avoids a `glow`
+/// dependency for four functions.
+struct GlTexFns {
+    gen_textures: PfnGlGenTextures,
+    bind_texture: PfnGlBindTexture,
+    delete_textures: PfnGlDeleteTextures,
+    tex_parameteri: PfnGlTexParameteri,
+    image_target_texture_2d: PfnGlEglImageTargetTexture2DOes,
+}
+
+impl GlTexFns {
+    fn load(egl_ctx: &EglCtx<'_>) -> Result<Self, GpuError> {
+        fn get(egl_ctx: &EglCtx<'_>, name: &str) -> Result<extern "system" fn(), GpuError> {
+            egl_ctx.egl.get_proc_address(name).ok_or_else(|| {
+                GpuError::Egl(format!("{name} does not resolve; cannot bind an EGLImage"))
+            })
+        }
+        // SAFETY of the transmutes: each name is transmuted to the signature
+        // the GL/GLES spec gives for that exact entry point.
+        Ok(unsafe {
+            Self {
+                gen_textures: std::mem::transmute::<extern "system" fn(), PfnGlGenTextures>(get(
+                    egl_ctx,
+                    "glGenTextures",
+                )?),
+                bind_texture: std::mem::transmute::<extern "system" fn(), PfnGlBindTexture>(get(
+                    egl_ctx,
+                    "glBindTexture",
+                )?),
+                delete_textures: std::mem::transmute::<extern "system" fn(), PfnGlDeleteTextures>(
+                    get(egl_ctx, "glDeleteTextures")?,
+                ),
+                tex_parameteri: std::mem::transmute::<extern "system" fn(), PfnGlTexParameteri>(
+                    get(egl_ctx, "glTexParameteri")?,
+                ),
+                image_target_texture_2d: std::mem::transmute::<
+                    extern "system" fn(),
+                    PfnGlEglImageTargetTexture2DOes,
+                >(get(
+                    egl_ctx,
+                    "glEGLImageTargetTexture2DOES",
+                )?),
+            }
+        })
+    }
+}
+
+/// A LINEAR dmabuf, allocated through GBM, wrapped as a wgpu texture.
+///
+/// The buffer is allocated first and the texture built around it, rather than
+/// exporting whatever wgpu allocated -- see the module doc for why that is
+/// forced on this backend.
+///
+/// ## Lifetimes
+///
+/// Everything that must outlive the texture is owned by the texture's own drop
+/// callback, not by this struct's `Drop`. `as_wgpu_texture` hands out
+/// reference-counted clones, so a clone can outlive this value; tearing the
+/// `EGLImage` or the bo down from here would be a use-after-free the moment
+/// `ring.rs` still held one. Letting wgpu run the teardown when it is genuinely
+/// finished with the texture makes the order correct by construction rather
+/// than by convention.
 pub struct ExportedImage {
     pub width: u32,
     pub height: u32,
     pub modifier: u64,
     pub planes: Vec<PlaneLayout>,
-    /// Held so the GL texture outlives the export. `wgpu::Texture` is
-    /// reference-counted, so [`ExportedImage::as_wgpu_texture`] hands out a
-    /// clone rather than re-wrapping anything.
     texture: wgpu::Texture,
     fd: OwnedFd,
+}
+
+impl std::fmt::Debug for ExportedImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExportedImage")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("modifier", &self.modifier)
+            .field("planes", &self.planes)
+            .field("fd", &self.fd.as_raw_fd())
+            .finish()
+    }
+}
+
+/// Resources the texture's drop callback owns and releases, in order.
+struct TextureOwned {
+    delete_textures: PfnGlDeleteTextures,
+    destroy_image: PfnEglDestroyImageKhr,
+    display_ptr: *mut c_void,
+    gl_name: u32,
+    image: EglImageKhr,
+    bo: *mut GbmBo,
+    gbm: *mut GbmDevice,
+    drm_fd: OwnedFd,
+}
+
+// SAFETY: the raw pointers are EGL/GBM handles, not Rust-visible memory, and
+// are valid process-wide rather than per-thread.
+//
+// `Send` because wgpu may run the drop callback on a different thread than the
+// one that built it, and the callback touches no `!Send` Rust state.
+//
+// `Sync` because `wgpu_hal::DropCallback` requires it. It is sound here for a
+// stronger reason than "the handles are shareable": `release` takes `self` by
+// value, so the handles can only be released once, by whichever thread owns the
+// callback. There is no shared-reference path to them at all.
+unsafe impl Send for TextureOwned {}
+unsafe impl Sync for TextureOwned {}
+
+impl TextureOwned {
+    /// Release in the one order that is safe: GL texture, then the image whose
+    /// storage it was, then the bo the image imported, then the device.
+    fn release(self) {
+        // SAFETY: every handle was created in `ExportedImage::new` and is
+        // released exactly once, here. `glDeleteTextures` needs the GL context
+        // current; wgpu runs this from its own texture cleanup, where it is.
+        // Should it ever not be, the worst outcome is a leaked texture NAME --
+        // not a use-after-free -- because the image and bo teardown below do
+        // not depend on GL.
+        unsafe {
+            (self.delete_textures)(1, &self.gl_name);
+            (self.destroy_image)(self.display_ptr, self.image);
+            gbm_bo_destroy(self.bo);
+            gbm_device_destroy(self.gbm);
+        }
+        drop(self.drm_fd);
+    }
 }
 
 impl ExportedImage {
@@ -249,208 +358,314 @@ impl ExportedImage {
     /// empty means "library picks". See [`crate::dmabuf::choose_modifier`].
     ///
     /// `host_visible` is accepted for signature parity with the Vulkan backend
-    /// and **ignored**. There is no EGL equivalent: whether an exported dmabuf
-    /// can be `mmap`ed is a property of how the driver allocated it, not
-    /// something the export API lets you request. [`ExportedImage::map_read`]
-    /// therefore may fail on this backend where it would succeed on Vulkan,
-    /// and it is a diagnostic path only.
+    /// and ignored: a GBM `LINEAR` buffer is CPU-mappable either way, so
+    /// [`ExportedImage::map_read`] works without asking.
     pub fn new(
         ctx: &WgpuContext,
         width: u32,
         height: u32,
         preferred: &[u64],
-        host_visible: bool,
+        _host_visible: bool,
     ) -> Result<Self, GpuError> {
-        if host_visible {
-            tracing::debug!(
-                "host_visible ignored on the GLES backend: EGL cannot request \
-                 CPU-mappable storage for an exported dmabuf"
+        // Everything happens inside `with_raw_egl`: the allocation, the import
+        // and the wrap all need the EGL/GL context, and keeping them in one
+        // scope is what lets each failure path clean up what it allocated with
+        // ordinary `?` instead of a hand-rolled unwind.
+        ctx.with_raw_egl(|egl_ctx| Self::alloc_import_wrap(ctx, egl_ctx, width, height, preferred))
+            .ok_or_else(|| {
+                GpuError::Egl(
+                    "wgpu is not running on the GLES backend, so there is no EGL \
+                     display to import a dmabuf through"
+                        .to_string(),
+                )
+            })?
+    }
+
+    /// Allocate a LINEAR dmabuf through GBM, import it as an `EGLImage`, bind
+    /// that to a GL texture, and wrap the texture for wgpu.
+    fn alloc_import_wrap(
+        ctx: &WgpuContext,
+        egl_ctx: &EglCtx<'_>,
+        width: u32,
+        height: u32,
+        preferred: &[u64],
+    ) -> Result<Self, GpuError> {
+        let egl_fns = EglExportFns::load(egl_ctx)?;
+        let gl = GlTexFns::load(egl_ctx)?;
+        let dpy = egl_ctx.display.as_ptr();
+
+        // --- 1. LINEAR dmabuf from GBM ---------------------------------
+        let drm_fd = OwnedFd::from(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(RENDER_NODE)
+                .map_err(|e| GpuError::Egl(format!("open {RENDER_NODE} for GBM: {e}")))?,
+        );
+
+        // SAFETY: `drm_fd` is a live render node. gbm_create_device borrows the
+        // fd rather than taking it, which is why `drm_fd` is kept alive in
+        // `TextureOwned` below.
+        let gbm = unsafe { gbm_create_device(drm_fd.as_raw_fd()) };
+        if gbm.is_null() {
+            return Err(GpuError::Egl(format!(
+                "gbm_create_device({RENDER_NODE}) failed"
+            )));
+        }
+        // From here on, every early return must release what is held. There are
+        // few enough paths to do it by hand, and a guard type would have to be
+        // disarmed on the success path anyway since ownership moves into the
+        // texture's drop callback.
+        let fail = |gbm: *mut GbmDevice, bo: *mut GbmBo, e: GpuError| -> GpuError {
+            // SAFETY: each handle is non-null when passed and released once.
+            unsafe {
+                if !bo.is_null() {
+                    gbm_bo_destroy(bo);
+                }
+                gbm_device_destroy(gbm);
+            }
+            e
+        };
+
+        // SAFETY: `gbm` is live; format and flags are constants.
+        let bo = unsafe {
+            gbm_bo_create(
+                gbm,
+                width,
+                height,
+                DRM_FORMAT_ABGR8888,
+                GBM_BO_USE_LINEAR | GBM_BO_USE_RENDERING,
+            )
+        };
+        if bo.is_null() {
+            return Err(fail(
+                gbm,
+                std::ptr::null_mut(),
+                GpuError::Egl(format!(
+                    "gbm_bo_create {width}x{height} ABGR8888 LINEAR|RENDERING failed \
+                     (tools/hw-probe/gbmprobe.c reports whether this driver can)"
+                )),
+            ));
+        }
+
+        // SAFETY: `bo` is live. gbm_bo_get_fd returns a NEW fd the caller owns.
+        let (raw_fd, stride, modifier) = unsafe {
+            (
+                gbm_bo_get_fd(bo),
+                gbm_bo_get_stride(bo),
+                gbm_bo_get_modifier(bo),
+            )
+        };
+        if raw_fd < 0 {
+            return Err(fail(
+                gbm,
+                bo,
+                GpuError::Egl("gbm_bo_get_fd returned no fd".to_string()),
+            ));
+        }
+        // SAFETY: a fresh fd owned by nobody else.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+
+        // The driver decides the modifier, so this is a compatibility check
+        // against the consumer rather than a negotiation -- but it goes through
+        // the shared helper so preference semantics cannot drift per backend.
+        let supported = [modifier];
+        if choose_modifier(&supported, preferred).is_none() {
+            return Err(fail(
+                gbm,
+                bo,
+                GpuError::NoCommonModifier {
+                    device: supported.to_vec(),
+                    requested: preferred.to_vec(),
+                },
+            ));
+        }
+        if modifier != DRM_FORMAT_MOD_LINEAR {
+            // Not fatal -- a GPU consumer told this modifier can still import
+            // it -- but it means GBM ignored GBM_BO_USE_LINEAR, and CPU
+            // readback and linear-only consumers will not work.
+            tracing::warn!(
+                modifier = format!("0x{modifier:016x}"),
+                "GBM honoured GBM_BO_USE_LINEAR with a non-linear modifier"
             );
         }
 
-        // wgpu creates and owns the texture. Usage mirrors what the Vulkan
-        // path's wrapped image is used for: the framebuffer blits into it
-        // (RENDER_ATTACHMENT), the pipelines sample it (TEXTURE_BINDING), and
-        // COPY_SRC keeps a wgpu-side readback possible for tests.
-        let texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("ghostframe-export"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
+        // --- 2. Import it as an EGLImage -------------------------------
+        //
+        // EGL_NO_CONTEXT: a dmabuf import builds the image from the buffer, not
+        // from a GL object, so no context participates. Modifier attributes are
+        // deliberately omitted -- the buffer is linear, and passing them without
+        // EGL_EXT_image_dma_buf_import_modifiers is an error, not a no-op.
+        let attribs: [i32; 13] = [
+            EGL_WIDTH,
+            width as i32,
+            EGL_HEIGHT,
+            height as i32,
+            EGL_LINUX_DRM_FOURCC_EXT,
+            DRM_FORMAT_ABGR8888 as i32,
+            EGL_DMA_BUF_PLANE0_FD_EXT,
+            fd.as_raw_fd(),
+            EGL_DMA_BUF_PLANE0_OFFSET_EXT,
+            0,
+            EGL_DMA_BUF_PLANE0_PITCH_EXT,
+            stride as i32,
+            EGL_NONE_I,
+        ];
+        // SAFETY: `dpy` is live for this borrow; `attribs` is EGL_NONE-
+        // terminated and describes the buffer behind `fd`. EGL does not take
+        // ownership of the fd.
+        let image = unsafe {
+            (egl_fns.create_image)(
+                dpy,
+                std::ptr::null_mut(),
+                EGL_LINUX_DMA_BUF_EXT,
+                std::ptr::null_mut(),
+                attribs.as_ptr(),
+            )
+        };
+        if image.is_null() {
+            return Err(fail(
+                gbm,
+                bo,
+                GpuError::Egl(format!(
+                    "eglCreateImageKHR(EGL_LINUX_DMA_BUF_EXT) failed for a \
+                     {width}x{height} linear ABGR8888 dmabuf, stride {stride}"
+                )),
+            ));
+        }
+
+        // --- 3. Bind it to a GL texture --------------------------------
+        //
+        // SAFETY: the GL context is current -- `with_raw_egl` holds wgpu-hal's
+        // context lock for this call. `name` is written before it is read.
+        let gl_name = unsafe {
+            let mut name: u32 = 0;
+            (gl.gen_textures)(1, &mut name);
+            if name == 0 {
+                (egl_fns.destroy_image)(dpy, image);
+                return Err(fail(
+                    gbm,
+                    bo,
+                    GpuError::Egl("glGenTextures returned 0".to_string()),
+                ));
+            }
+            (gl.bind_texture)(GL_TEXTURE_2D, name);
+            // An EGLImage-backed texture has no mipmaps, so the default
+            // mipmap-based MIN_FILTER leaves it incomplete -- which some
+            // drivers surface only as a silent no-op.
+            (gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            (gl.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            (gl.image_target_texture_2d)(GL_TEXTURE_2D, image);
+            (gl.bind_texture)(GL_TEXTURE_2D, 0);
+            name
+        };
+
+        // --- 4. Wrap as a wgpu texture, handing it the teardown chain ---
+        let texture = Self::wrap_gl_texture(
+            ctx,
+            gl_name,
+            width,
+            height,
+            TextureOwned {
+                delete_textures: gl.delete_textures,
+                destroy_image: egl_fns.destroy_image,
+                display_ptr: dpy,
+                gl_name,
+                image,
+                bo,
+                gbm,
+                drm_fd,
             },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: FORMAT_WGPU,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC
-                | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-
-        let gl_name = gl_texture_name(&texture)?;
-
-        let (fd, modifier, planes) = ctx
-            .with_raw_egl(|egl_ctx| Self::export_texture(egl_ctx, gl_name, preferred))
-            .ok_or_else(|| {
-                GpuError::Egl("wgpu is not running on the GLES backend".to_string())
-            })??;
+        );
 
         tracing::info!(
             width,
             height,
-            modifier,
-            planes = planes.len(),
-            "exported dmabuf via EGL_MESA_image_dma_buf_export"
+            modifier = format!("0x{modifier:016x}"),
+            stride,
+            "allocated a LINEAR dmabuf via GBM and bound it as the export texture"
         );
 
         Ok(Self {
             width,
             height,
             modifier,
-            planes,
+            planes: vec![PlaneLayout {
+                offset: 0,
+                stride: stride as u64,
+            }],
             texture,
             fd,
         })
     }
 
-    /// Wrap the GL texture in an `EGLImage`, export it, destroy the image.
-    fn export_texture(
-        egl_ctx: &EglCtx<'_>,
+    /// Wrap a GL texture name as a `wgpu::Texture`, giving `owned` to its drop
+    /// callback so the teardown order is correct by construction.
+    fn wrap_gl_texture(
+        ctx: &WgpuContext,
         gl_name: u32,
-        preferred: &[u64],
-    ) -> Result<(OwnedFd, u64, Vec<PlaneLayout>), GpuError> {
-        let fns = EglExportFns::load(egl_ctx)?;
-        let dpy = egl_ctx.display.as_ptr();
-
-        // SAFETY: `dpy`/`egl_ctx.context` are live EGL handles for the
-        // duration of `with_raw_egl`'s borrow; `gl_name` is a live GL texture
-        // owned by wgpu. The GL context is current because `with_raw_egl`
-        // holds wgpu-hal's context lock.
-        let image = unsafe {
-            (fns.create_image)(
-                dpy,
-                egl_ctx.context,
-                EGL_GL_TEXTURE_2D_KHR,
-                gl_name as usize as *mut c_void,
-                std::ptr::null(),
-            )
+        width: u32,
+        height: u32,
+        owned: TextureOwned,
+    ) -> wgpu::Texture {
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
         };
-        if image.is_null() {
-            return Err(GpuError::Egl(
-                "eglCreateImageKHR returned EGL_NO_IMAGE_KHR for the export texture".to_string(),
-            ));
-        }
-
-        // Everything from here must destroy `image` before returning, so the
-        // body is a closure and the destroy runs on both paths.
-        let result = Self::query_and_export(&fns, dpy, image, preferred);
-
-        // SAFETY: `image` is the handle just created and not yet destroyed.
-        // Destroying it does not invalidate an fd already exported from it --
-        // that fd holds its own reference (see the module doc).
-        let ok = unsafe { (fns.destroy_image)(dpy, image) };
-        if ok == 0 {
-            // Not fatal to a successful export, but it leaks an EGLImage per
-            // buffer, which over a long session is worth seeing.
-            tracing::warn!("eglDestroyImageKHR failed for an exported image");
-        }
-        result
-    }
-
-    fn query_and_export(
-        fns: &EglExportFns,
-        dpy: *mut c_void,
-        image: EglImageKhr,
-        preferred: &[u64],
-    ) -> Result<(OwnedFd, u64, Vec<PlaneLayout>), GpuError> {
-        let mut fourcc: i32 = 0;
-        let mut num_planes: i32 = 0;
-        let mut modifier: u64 = 0;
-        // SAFETY: all three out-params are live locals of the right types per
-        // the EGL_MESA_image_dma_buf_export spec.
-        let ok = unsafe { (fns.query)(dpy, image, &mut fourcc, &mut num_planes, &mut modifier) };
-        if ok == 0 {
-            return Err(GpuError::Egl(
-                "eglExportDMABUFImageQueryMESA failed".to_string(),
-            ));
-        }
-        if num_planes < 1 {
-            return Err(GpuError::Egl(format!(
-                "eglExportDMABUFImageQueryMESA reported {num_planes} planes; \
-                 an exported image must have at least one"
-            )));
-        }
-
-        // The driver tells us the modifier rather than being asked for one:
-        // the texture already exists with whatever tiling it was created with.
-        // So this is a compatibility check against the consumer's list, not a
-        // negotiation -- but it uses the same helper as the Vulkan path so the
-        // preference semantics cannot drift between backends.
-        let supported = [modifier];
-        let chosen = choose_modifier(&supported, preferred).ok_or(GpuError::NoCommonModifier {
-            device: supported.to_vec(),
-            requested: preferred.to_vec(),
-        })?;
-        debug_assert_eq!(chosen, modifier, "choose_modifier over a 1-element set");
-
-        let n = num_planes as usize;
-        let mut fds = vec![-1i32; n];
-        let mut strides = vec![0i32; n];
-        let mut offsets = vec![0i32; n];
-        // SAFETY: the three buffers are each `num_planes` long, which is what
-        // the spec says the driver writes.
-        let ok = unsafe {
-            (fns.export)(
-                dpy,
-                image,
-                fds.as_mut_ptr(),
-                strides.as_mut_ptr(),
-                offsets.as_mut_ptr(),
-            )
+        let name = std::num::NonZeroU32::new(gl_name).expect("checked non-zero by the caller");
+        // COPY_DST because `Framebuffer::blit_full` reaches the export through
+        // `copy_texture_to_texture`; COPY_SRC so a wgpu-side readback stays
+        // possible. Deliberately NOT RENDER_ATTACHMENT or TEXTURE_BINDING --
+        // nothing renders into or samples the export, and the Vulkan backend
+        // wraps with exactly this pair.
+        //
+        // SAFETY: `gl_name` is a live GL texture whose storage is `owned`'s
+        // EGLImage and matches `desc`. `Some(..)` rather than `None` because
+        // wgpu must NOT free the texture itself -- the callback releases the
+        // whole chain in the one safe order (see `TextureOwned::release`).
+        let hal_texture = unsafe {
+            ctx.device
+                .as_hal::<wgpu_hal::api::Gles>()
+                .map(|hal_device| {
+                    hal_device.texture_from_raw(
+                        name,
+                        &wgpu_hal::TextureDescriptor {
+                            label: Some("ghostframe-exported-image"),
+                            size,
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: FORMAT_WGPU,
+                            usage: wgpu::TextureUses::COPY_SRC | wgpu::TextureUses::COPY_DST,
+                            memory_flags: wgpu_hal::MemoryFlags::empty(),
+                            view_formats: Vec::new(),
+                        },
+                        Some(Box::new(move || owned.release())),
+                    )
+                })
+                .expect("with_raw_egl already established this is the GLES backend")
         };
-        if ok == 0 {
-            return Err(GpuError::Egl("eglExportDMABUFImageMESA failed".to_string()));
-        }
 
-        // One fd per plane is exported. This crate's format is single-plane
-        // RGBA, and the rest of the pipeline (`DmabufPlanes`, `ring.rs`,
-        // the window backends) carries exactly one fd -- so close any extras
-        // rather than leaking them, and say so.
-        for extra in fds.iter().skip(1) {
-            if *extra >= 0 {
-                // SAFETY: an fd the driver just handed us and nothing else owns.
-                unsafe { libc::close(*extra) };
-            }
+        // SAFETY: `hal_texture` was just built from a live GL texture matching
+        // `desc`. UNINITIALIZED is accurate -- the dmabuf holds whatever GBM
+        // left there, and wgpu's tracker must be told that rather than assume.
+        unsafe {
+            ctx.device.create_texture_from_hal::<wgpu_hal::api::Gles>(
+                hal_texture,
+                &wgpu::TextureDescriptor {
+                    label: Some("ghostframe-exported-image"),
+                    size,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: FORMAT_WGPU,
+                    usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                },
+                wgpu::TextureUses::UNINITIALIZED,
+            )
         }
-        if n > 1 {
-            tracing::warn!(
-                planes = n,
-                "exported image has more than one plane; only plane 0's fd is \
-                 carried and the rest were closed. A multi-plane export is not \
-                 expected for {FORMAT_WGPU:?}."
-            );
-        }
-
-        if fds[0] < 0 {
-            return Err(GpuError::Egl(
-                "eglExportDMABUFImageMESA succeeded but returned no fd for plane 0".to_string(),
-            ));
-        }
-        // SAFETY: `fds[0]` is a fresh dmabuf fd owned by nobody else; `OwnedFd`
-        // takes sole ownership and closes it on drop.
-        let fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-
-        let planes = (0..n)
-            .map(|i| PlaneLayout {
-                offset: offsets[i].max(0) as u64,
-                stride: strides[i].max(0) as u64,
-            })
-            .collect();
-
-        Ok((fd, modifier, planes))
     }
 
     pub fn raw_fd(&self) -> i32 {
@@ -536,37 +751,5 @@ impl ExportedImage {
         // SAFETY: `ptr`/`len` are the mapping just created and not yet unmapped.
         unsafe { libc::munmap(ptr, len) };
         out
-    }
-}
-
-/// The GL texture name behind a wgpu texture.
-///
-/// `wgpu_hal::gles::Texture::inner` is public, so this needs no patch — but it
-/// is an enum, and only the `Texture` variant has a name to export. A
-/// renderbuffer or a default-framebuffer texture cannot be turned into an
-/// `EGLImage`, and wgpu chooses between them from the usage flags, so getting
-/// this wrong would show up as a confusing EGL error rather than here.
-fn gl_texture_name(texture: &wgpu::Texture) -> Result<u32, GpuError> {
-    // SAFETY: the borrow does not outlive this function and nothing here
-    // mutates or destroys wgpu state -- it reads the texture's identity.
-    let hal = unsafe { texture.as_hal::<wgpu_hal::api::Gles>() }
-        .ok_or_else(|| GpuError::Egl("texture is not a GLES texture".to_string()))?;
-    // `TextureInner` is wgpu-hal's enum, not ours, so the wildcard is the
-    // exception `lib.rs`'s module doc allows: listing its variants would break
-    // this build every time wgpu-hal adds a backing kind we do not care about,
-    // and every non-`Texture` kind is handled identically here -- there is no
-    // per-variant decision to be forced.
-    #[allow(
-        clippy::wildcard_enum_match_arm,
-        reason = "foreign enum (wgpu_hal::gles::TextureInner); all non-Texture \
-                  kinds are one case and new ones should join it, not break the build"
-    )]
-    match &hal.inner {
-        wgpu_hal::gles::TextureInner::Texture { raw, .. } => Ok(raw.0.get()),
-        other => Err(GpuError::Egl(format!(
-            "export texture is backed by {other:?}, not a GL texture, so it \
-             cannot be wrapped in an EGLImage. This is a usage-flag problem in \
-             ExportedImage::new, not a driver limitation."
-        ))),
     }
 }
