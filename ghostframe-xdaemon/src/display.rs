@@ -592,6 +592,17 @@ mod tests {
     }
 
     #[test]
+    fn each_axis_clamps_independently() {
+        // The five tests this started with all had either NO axis exceeding
+        // or BOTH exceeding, so none of them could tell per-axis `min` apart
+        // from whole-value rejection -- a review mutation to the latter left
+        // every test passing. This is the case that straddles: width is
+        // already under the clamp, height is over.
+        assert_eq!(clamp_ceiling((1280, 2160), Some("1920x1080")), (1280, 1080));
+        assert_eq!(clamp_ceiling((3840, 720), Some("1920x1080")), (1920, 720));
+    }
+
+    #[test]
     fn the_clamp_only_ever_lowers() {
         // A clamp larger than the hardware ceiling must not raise it -- that
         // would ask X for a mode it cannot allocate.
