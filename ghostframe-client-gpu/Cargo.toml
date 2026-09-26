@@ -29,7 +29,10 @@ ghostframe-client-core = { path = "../ghostframe-client-core" }
 ghostframe-client-h264 = { path = "../ghostframe-client-h264" }
 wgpu = { workspace = true }
 wgpu-hal = { workspace = true }
-ash = { workspace = true }
+# Backend-specific, selected by the `vulkan` / `gles` features below. Optional
+# so a GLES build does not link Vulkan bindings and vice versa.
+ash = { workspace = true, optional = true }
+khronos-egl = { workspace = true, optional = true }
 libc = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
@@ -71,5 +74,28 @@ half = "2"
 # `#[cfg(test)]` builds reach `nv12_reference` without the feature; a
 # `tests/*.rs` integration test, a separate crate unit, needs it explicitly.
 [features]
-default = []
+default = ["vulkan"]
 test-support = []
+
+# Exactly one backend. Mutually exclusive, enforced by a `compile_error!` in
+# `wgpu_ctx.rs` rather than left to produce a confusing type error deep in
+# `export.rs`.
+#
+# Why compile-time and not runtime, when wgpu itself can pick a backend at
+# run time: the two export paths share no code. Vulkan allocates an exportable
+# `VkImage` through `ash`; GLES creates an `EGLImage` and calls
+# `eglExportDMABUFImageMESA` through `khronos-egl`. A build carrying both
+# would link both sets of bindings and carry two unsafe surfaces, in a library
+# other projects link. See the GLES/V4L2 design doc, §4.6.
+#
+# Revisit only for a single distro package covering both GPUs, which nobody
+# has asked for.
+vulkan = ["dep:ash", "wgpu/vulkan", "wgpu-hal/vulkan"]
+
+# For GPUs with no Vulkan driver at all -- Mali Midgard being the case that
+# forced this (Mesa's PanVK matrix starts Vulkan at Bifrost). Needs GLES 3.1
+# for compute, plus `EGL_MESA_image_dma_buf_export` and
+# `EGL_EXT_image_dma_buf_import`; `WgpuContext::new` checks for them and
+# refuses to start without export, the same way the Vulkan path refuses
+# without `VK_KHR_external_memory_fd`.
+gles = ["dep:khronos-egl", "wgpu/gles", "wgpu-hal/gles"]

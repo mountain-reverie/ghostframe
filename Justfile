@@ -44,6 +44,23 @@ test-client:
 lint-client:
     cargo clippy {{client-build-crates}} --all-targets -- -D warnings
 
+# The GLES backend, for GPUs with no Vulkan driver (Mali Midgard and friends).
+# Mutually exclusive with the default `vulkan` feature, so it needs its own
+# pass -- a `--all-features` build would fail the compile_error! guard on
+# purpose.
+#
+# CI can only *check* this (no runner has a Mali GPU), which is exactly why it
+# must be checked: a feature nobody builds is already broken. On real hardware
+# run `test-client-gles` instead.
+check-gles:
+    cargo clippy -p ghostframe-client-gpu --no-default-features --features gles,test-support --all-targets -- -D warnings
+
+# The GLES backend's tests. Needs a GLES 3.1 device with
+# EGL_MESA_image_dma_buf_export -- verified on Mali-T860/panfrost. Skips
+# gpu_import (Vulkan-only; see that file's header).
+test-client-gles:
+    cargo test -p ghostframe-client-gpu --no-default-features --features gles,test-support
+
 # Build, lint and test the native client -- the client-only `ci-local`.
 ci-client: build-client
     @echo "=== fmt-check ==="
@@ -53,6 +70,8 @@ ci-client: build-client
     @echo "=== cbindgen header up-to-date ==="
     cargo check -p ghostframe-client-capi
     git diff --exit-code ghostframe-client-capi/include/ghostframe_client.h
+    @echo "=== GLES backend still compiles ==="
+    just check-gles
     @echo "=== ci-client passed ==="
 
 # Run from a clean checkout: builds the web client SPA (vite) into

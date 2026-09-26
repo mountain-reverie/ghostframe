@@ -33,16 +33,24 @@
 //! path but has not run against real hardware; treat a report of trouble
 //! there as plausible, not surprising.
 
+use crate::dmabuf::{
+    choose_modifier, dma_buf_sync, DMA_BUF_SYNC_END, DMA_BUF_SYNC_READ, DMA_BUF_SYNC_START,
+    DRM_FORMAT_MOD_LINEAR,
+};
 use crate::wgpu_ctx::WgpuContext;
 use crate::GpuError;
 use ash::vk;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
+/// Re-exported so `ring.rs` and external consumers keep reaching it through
+/// `export::PlaneLayout` after the type moved to `crate::dmabuf`. Both
+/// backends expose it at the same path, so nothing downstream has to know
+/// which one it was built against.
+pub use crate::dmabuf::PlaneLayout;
+
 /// Format every exported image uses. Single-plane, so the explicit-modifier
 /// path's plane-count handling never has more than one plane to deal with.
 const FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
-
-const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 
 /// `FORMAT` expressed as the wgpu-facing type, for [`ExportedImage::as_wgpu_texture`].
 /// Must name the same format as `FORMAT` -- there is deliberately only one
@@ -50,80 +58,6 @@ const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 /// runtime conversion, since a mismatch here would silently reinterpret
 /// bytes.
 const FORMAT_WGPU: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
-
-// ---------------------------------------------------------------------------
-// dmabuf CPU-mmap readback (test/diagnostic path -- see `map_read`)
-// ---------------------------------------------------------------------------
-
-/// `DMA_BUF_IOCTL_SYNC` (`linux/dma-buf.h`): `_IOW(DMA_BUF_BASE, 0, struct
-/// dma_buf_sync)`, `DMA_BUF_BASE` is `'b'`, and `struct dma_buf_sync` is a
-/// single `__u64 flags` field (8 bytes). `libc` does not carry DMA-BUF's
-/// ioctl constants, so the request number is derived here from the
-/// `asm-generic/ioctl.h` encoding rather than hard-coded, so the derivation
-/// is checkable against the kernel header instead of trusted as a magic
-/// number:
-///
-/// ```text
-/// _IOC(dir, type, nr, size) =
-///     (dir  << _IOC_DIRSHIFT)  |   // _IOC_DIRSHIFT  = 30
-///     (type << _IOC_TYPESHIFT) |   // _IOC_TYPESHIFT = 8
-///     (nr   << _IOC_NRSHIFT)   |   // _IOC_NRSHIFT   = 0
-///     (size << _IOC_SIZESHIFT)     // _IOC_SIZESHIFT = 16
-/// _IOW(type, nr, size) = _IOC(_IOC_WRITE /* 1 */, type, nr, size_of(size))
-/// ```
-fn dma_buf_ioctl_sync() -> libc::Ioctl {
-    const IOC_WRITE: u64 = 1;
-    const IOC_NRSHIFT: u64 = 0;
-    const IOC_TYPESHIFT: u64 = 8;
-    const IOC_SIZESHIFT: u64 = 16;
-    const IOC_DIRSHIFT: u64 = 30;
-
-    const DMA_BUF_BASE: u64 = b'b' as u64;
-    const NR: u64 = 0;
-    const SIZE: u64 = std::mem::size_of::<DmaBufSync>() as u64;
-
-    let request = (IOC_WRITE << IOC_DIRSHIFT)
-        | (DMA_BUF_BASE << IOC_TYPESHIFT)
-        | (NR << IOC_NRSHIFT)
-        | (SIZE << IOC_SIZESHIFT);
-    request as libc::Ioctl
-}
-
-/// `DMA_BUF_SYNC_READ`, from `linux/dma-buf.h`.
-const DMA_BUF_SYNC_READ: u64 = 1 << 0;
-/// `DMA_BUF_SYNC_START`, from `linux/dma-buf.h`.
-const DMA_BUF_SYNC_START: u64 = 0;
-/// `DMA_BUF_SYNC_END`, from `linux/dma-buf.h`.
-const DMA_BUF_SYNC_END: u64 = 1 << 2;
-
-/// Mirrors `struct dma_buf_sync` from `linux/dma-buf.h`.
-#[repr(C)]
-struct DmaBufSync {
-    flags: u64,
-}
-
-/// Issue `DMA_BUF_IOCTL_SYNC` with the given flags.
-///
-/// # Safety
-/// `fd` must be a valid, open dmabuf file descriptor.
-unsafe fn dma_buf_sync(fd: i32, flags: u64) -> Result<(), GpuError> {
-    let arg = DmaBufSync { flags };
-    // SAFETY: `fd` is a valid dmabuf fd per this function's contract;
-    // `arg` is a correctly-shaped `struct dma_buf_sync` for the ioctl's
-    // duration.
-    let ret = unsafe { libc::ioctl(fd, dma_buf_ioctl_sync(), &arg as *const DmaBufSync) };
-    if ret != 0 {
-        return Err(GpuError::Io(std::io::Error::last_os_error()));
-    }
-    Ok(())
-}
-
-/// Byte layout of one dmabuf plane.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PlaneLayout {
-    pub offset: u64,
-    pub stride: u64,
-}
 
 /// A `VkImage` whose memory is exported as a dmabuf.
 ///
@@ -351,18 +285,6 @@ impl ExportedImage {
         Ok(bytes)
     }
 
-    /// First consumer preference the device also supports; if `preferred`
-    /// is empty, LINEAR when available, else the device's first.
-    fn choose_modifier(supported: &[u64], preferred: &[u64]) -> Option<u64> {
-        if preferred.is_empty() {
-            if supported.contains(&DRM_FORMAT_MOD_LINEAR) {
-                return Some(DRM_FORMAT_MOD_LINEAR);
-            }
-            return supported.first().copied();
-        }
-        preferred.iter().copied().find(|m| supported.contains(m))
-    }
-
     fn create_linear(
         host_visible: bool,
         instance: &ash::Instance,
@@ -373,12 +295,11 @@ impl ExportedImage {
         preferred: &[u64],
     ) -> Result<Self, GpuError> {
         let supported = [DRM_FORMAT_MOD_LINEAR];
-        let modifier = Self::choose_modifier(&supported, preferred).ok_or_else(|| {
-            GpuError::NoCommonModifier {
+        let modifier =
+            choose_modifier(&supported, preferred).ok_or_else(|| GpuError::NoCommonModifier {
                 device: supported.to_vec(),
                 requested: preferred.to_vec(),
-            }
-        })?;
+            })?;
 
         tracing::info!(
             width,
@@ -435,12 +356,11 @@ impl ExportedImage {
         preferred: &[u64],
     ) -> Result<Self, GpuError> {
         let supported = Self::enumerate_supported_modifiers(instance, phys);
-        let modifier = Self::choose_modifier(&supported, preferred).ok_or_else(|| {
-            GpuError::NoCommonModifier {
+        let modifier =
+            choose_modifier(&supported, preferred).ok_or_else(|| GpuError::NoCommonModifier {
                 device: supported.clone(),
                 requested: preferred.to_vec(),
-            }
-        })?;
+            })?;
 
         tracing::info!(
             width,
@@ -753,30 +673,5 @@ impl Drop for ExportedImage {
             self.device.destroy_image(self.image, None);
             self.device.free_memory(self.memory, None);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn empty_preference_prefers_linear() {
-        assert_eq!(ExportedImage::choose_modifier(&[7, 0, 9], &[]), Some(0));
-    }
-
-    #[test]
-    fn empty_preference_falls_back_to_first_when_no_linear() {
-        assert_eq!(ExportedImage::choose_modifier(&[7, 9], &[]), Some(7));
-    }
-
-    #[test]
-    fn consumer_preference_order_wins_over_device_order() {
-        assert_eq!(ExportedImage::choose_modifier(&[7, 9], &[9, 7]), Some(9));
-    }
-
-    #[test]
-    fn no_overlap_is_none() {
-        assert_eq!(ExportedImage::choose_modifier(&[7, 9], &[1, 2]), None);
     }
 }

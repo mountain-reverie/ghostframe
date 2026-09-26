@@ -1,5 +1,31 @@
 use crate::GpuError;
+#[cfg(feature = "vulkan")]
 use std::sync::OnceLock;
+
+/// The EGL instance type `wgpu_hal::gles::AdapterContext::egl_instance` hands
+/// back. wgpu-hal keeps its own alias private, so it is spelled out here —
+/// which is exactly why `khronos-egl` must be pinned to the version wgpu-hal
+/// resolves (see the workspace `Cargo.toml`). A mismatch makes this a
+/// different type and the escape hatch unreachable.
+#[cfg(feature = "gles")]
+pub type EglInstance = khronos_egl::DynamicInstance<khronos_egl::EGL1_4>;
+
+/// Everything an EGL extension call needs: the instance to load function
+/// pointers from, the display, and the raw `EGLContext` that
+/// `eglCreateImageKHR` wants when its target is a GL texture.
+///
+/// Handed to `export_gles.rs`/`import_gles.rs` by
+/// [`WgpuContext::with_raw_egl`], which holds wgpu-hal's own context lock for
+/// the duration — so the GL context is current and no wgpu-internal GL call
+/// can interleave.
+#[cfg(feature = "gles")]
+pub struct EglCtx<'a> {
+    pub egl: &'a EglInstance,
+    pub display: khronos_egl::Display,
+    /// `EGL_NO_CONTEXT` is null; a real context is non-null. Passed straight
+    /// through to `eglCreateImageKHR`.
+    pub context: *mut std::ffi::c_void,
+}
 
 /// A wgpu device that can export its images as dmabufs.
 ///
@@ -41,9 +67,14 @@ pub struct WgpuContext {
     pub adapter: wgpu::Adapter,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
-    /// `VK_EXT_image_drm_format_modifier` is available, so exported images may
-    /// use an explicitly negotiated tiling. When false, exports must be
-    /// `DRM_FORMAT_MOD_LINEAR`.
+    /// Exported images may use an explicitly negotiated tiling rather than
+    /// being forced to `DRM_FORMAT_MOD_LINEAR`.
+    ///
+    /// Sourced per backend, because the capability is spelled differently:
+    /// `VK_EXT_image_drm_format_modifier` on Vulkan (reported by wgpu as
+    /// `VULKAN_EXTERNAL_MEMORY_DMA_BUF`, which also requires the other two
+    /// extensions -- see the type doc above), and
+    /// `EGL_EXT_image_dma_buf_import_modifiers` on GLES.
     pub explicit_modifiers: bool,
     /// Lazily-built caches for `import.rs`, which calls
     /// [`WgpuContext::ext_memory_fd`] and [`WgpuContext::memory_properties`]
@@ -53,11 +84,23 @@ pub struct WgpuContext {
     /// `vkGetDeviceProcAddr` to build its whole function table, and
     /// `vkGetPhysicalDeviceMemoryProperties` copies a ~520-byte struct.
     /// Built once, on first use, and reused for every import after that.
+    ///
+    /// The GLES path has no equivalent: it imports each pool frame once at
+    /// setup rather than per decoded frame, so there is nothing hot enough to
+    /// be worth caching.
+    #[cfg(feature = "vulkan")]
     ext_memory_fd: OnceLock<ash::khr::external_memory_fd::Device>,
+    #[cfg(feature = "vulkan")]
     mem_properties: OnceLock<ash::vk::PhysicalDeviceMemoryProperties>,
+    /// The thread `new` ran on. GL contexts are current per-thread, so every
+    /// entry point that touches the device must run here. See
+    /// [`WgpuContext::assert_render_thread`].
+    #[cfg(feature = "gles")]
+    created_on: std::thread::ThreadId,
 }
 
 impl WgpuContext {
+    #[cfg(feature = "vulkan")]
     pub fn new() -> Result<Self, GpuError> {
         // NB: wgpu 30 takes the descriptor by value. `InstanceDescriptor`
         // has no `Default` impl (unlike `DeviceDescriptor`); the
@@ -74,7 +117,7 @@ impl WgpuContext {
             compatible_surface: None,
             ..Default::default()
         }))
-        .map_err(|_| GpuError::NoVulkanAdapter)?;
+        .map_err(|_| GpuError::NoAdapter)?;
 
         // Require fd export up front. A client that cannot export at all
         // should refuse to start rather than hand its consumer nothing.
@@ -127,14 +170,187 @@ impl WgpuContext {
             device,
             queue,
             explicit_modifiers,
+            #[cfg(feature = "vulkan")]
             ext_memory_fd: OnceLock::new(),
+            #[cfg(feature = "vulkan")]
             mem_properties: OnceLock::new(),
         })
+    }
+
+    /// GLES/EGL context, for GPUs with no Vulkan driver at all.
+    ///
+    /// Must be called on the thread that will own rendering: an EGL context is
+    /// current per-thread, and wgpu-hal's gles backend takes an internal lock
+    /// around its GL calls that makes a cross-thread violation look like it
+    /// works under light load. The thread id is recorded here and checked by
+    /// [`WgpuContext::assert_render_thread`].
+    #[cfg(feature = "gles")]
+    pub fn new() -> Result<Self, GpuError> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::GL,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+            ..Default::default()
+        }))
+        .map_err(|_| GpuError::NoAdapter)?;
+
+        let adapter_name = adapter.get_info().name;
+
+        // Ask EGL directly what it can do. wgpu has no feature bit for
+        // `EGL_MESA_image_dma_buf_export` -- it is a MESA extension wgpu never
+        // calls -- so the capability check has to go around wgpu, not through
+        // it.
+        let (can_export, explicit_modifiers) = {
+            // SAFETY: the borrowed hal adapter does not outlive this block, and
+            // nothing here mutates or destroys anything wgpu owns -- both calls
+            // are read-only EGL queries.
+            let hal_adapter = unsafe { adapter.as_hal::<wgpu_hal::api::Gles>() }
+                .ok_or_else(|| GpuError::Egl("adapter is not the GLES backend".into()))?;
+            let ctx = hal_adapter.adapter_context();
+            let egl = ctx.egl_instance().ok_or_else(|| {
+                GpuError::Egl(
+                    "no EGL instance on this adapter (externally created context?), \
+                     so dmabuf export is unreachable"
+                        .into(),
+                )
+            })?;
+            let display = ctx
+                .raw_display()
+                .copied()
+                .ok_or_else(|| GpuError::Egl("no EGLDisplay on this adapter".into()))?;
+            let exts = egl
+                .query_string(Some(display), khronos_egl::EXTENSIONS)
+                .map_err(|e| GpuError::Egl(format!("query EGL_EXTENSIONS: {e}")))?
+                .to_string_lossy()
+                .into_owned();
+            tracing::debug!(%exts, "EGL display extensions");
+            (
+                exts.split_whitespace()
+                    .any(|e| e == "EGL_MESA_image_dma_buf_export"),
+                exts.split_whitespace()
+                    .any(|e| e == "EGL_EXT_image_dma_buf_import_modifiers"),
+            )
+        };
+
+        // Same rule as the Vulkan path: a client that cannot export at all
+        // should refuse to start rather than hand its consumer nothing.
+        if !can_export {
+            return Err(GpuError::AdapterCannotExport {
+                adapter: adapter_name,
+            });
+        }
+        if !explicit_modifiers {
+            tracing::info!(
+                adapter = %adapter_name,
+                "EGL_EXT_image_dma_buf_import_modifiers unavailable; \
+                 exported buffers will be DRM_FORMAT_MOD_LINEAR only"
+            );
+        }
+
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("ghostframe-client"),
+            // Nothing to require: dmabuf export here is an EGL extension, not
+            // a wgpu feature, and it was already checked above.
+            required_features: wgpu::Features::empty(),
+            // NOT `downlevel_defaults()` unmodified. That asks for 256
+            // invocations per workgroup, and GLES 3.1's guaranteed minimum is
+            // 128 -- Mali-T860 reports exactly 128, so requesting 256 fails
+            // `request_device` outright, before any shader runs, and the error
+            // names the limit rather than the shader.
+            //
+            // 128 here and
+            // `shader_validation.rs::MAX_WORKGROUP_INVOCATIONS` must agree:
+            // this is what the device is asked for, that is what the shaders
+            // are checked against. The storage-buffer bump is the same as the
+            // Vulkan path's and for the same reason (cdf53_integrate.wgsl
+            // binds 7).
+            required_limits: wgpu::Limits {
+                max_storage_buffers_per_shader_stage: 8,
+                max_compute_invocations_per_workgroup: 128,
+                max_compute_workgroup_size_x: 128,
+                max_compute_workgroup_size_y: 128,
+                ..wgpu::Limits::downlevel_defaults()
+            },
+            memory_hints: wgpu::MemoryHints::Performance,
+            trace: wgpu::Trace::Off,
+            ..Default::default()
+        }))
+        .map_err(|e| GpuError::Egl(format!("request_device: {e}")))?;
+
+        Ok(WgpuContext {
+            instance,
+            adapter,
+            device,
+            queue,
+            explicit_modifiers,
+            created_on: std::thread::current().id(),
+        })
+    }
+
+    /// Panic in debug builds if called off the thread that created the context.
+    ///
+    /// An EGL context is current per-thread. wgpu-hal's gles backend guards its
+    /// own GL calls with a mutex, so touching the device from another thread
+    /// may appear to work and then fail under different timing -- the worst
+    /// kind of bug to find later. `ghostframe-client-native` already confines
+    /// GPU work to its render thread; this makes that an assertion rather than
+    /// a convention.
+    #[cfg(feature = "gles")]
+    pub fn assert_render_thread(&self) {
+        debug_assert_eq!(
+            std::thread::current().id(),
+            self.created_on,
+            "WgpuContext used off the thread that created it. EGL contexts are \
+             current per-thread; this is undefined behaviour that happens to \
+             work sometimes."
+        );
+    }
+
+    /// Run `f` with the EGL instance, display and context backing this device,
+    /// holding wgpu-hal's context lock so the GL context is current.
+    ///
+    /// The GLES counterpart to [`WgpuContext::with_raw_device`], and for the
+    /// same reason: wgpu can import a dmabuf but cannot export one, so
+    /// `export_gles.rs` loads `eglExportDMABUFImageMESA` itself.
+    ///
+    /// The lock matters beyond currency. `eglCreateImageKHR` with a
+    /// `EGL_GL_TEXTURE_2D_KHR` target reads GL state, and wgpu-hal serialises
+    /// all of its own GL work behind this same lock; taking it here is what
+    /// stops an export interleaving with a wgpu command submission on the
+    /// same context. The glow handle it yields is deliberately not passed on —
+    /// `f` has no business issuing GL commands, only EGL ones.
+    ///
+    /// Returns `None` if the backend is not GLES or the context was created
+    /// externally (`Adapter::new_external`), in which case there is no EGL
+    /// display to export through.
+    #[cfg(feature = "gles")]
+    pub fn with_raw_egl<R>(&self, f: impl FnOnce(&EglCtx<'_>) -> R) -> Option<R> {
+        self.assert_render_thread();
+        // SAFETY: the borrowed hal device does not outlive this call, and we
+        // never destroy anything wgpu owns -- we only create EGLImages (and
+        // destroy those same ones) and export fds for resources we allocated.
+        let hal_dev = unsafe { self.device.as_hal::<wgpu_hal::api::Gles>() }?;
+        let adapter_ctx = hal_dev.context();
+        let egl = adapter_ctx.egl_instance()?;
+        let display = adapter_ctx.raw_display().copied()?;
+        let context = adapter_ctx.raw_context();
+        let _gl_lock = adapter_ctx.lock();
+        Some(f(&EglCtx {
+            egl,
+            display,
+            context,
+        }))
     }
 
     /// Cached `VK_KHR_external_memory_fd` device-extension function table.
     /// See the field doc on [`WgpuContext::ext_memory_fd`]'s storage for why
     /// this is cached rather than rebuilt on every call.
+    #[cfg(feature = "vulkan")]
     pub(crate) fn ext_memory_fd(
         &self,
         instance: &ash::Instance,
@@ -145,6 +361,7 @@ impl WgpuContext {
     }
 
     /// Cached `vkGetPhysicalDeviceMemoryProperties` result.
+    #[cfg(feature = "vulkan")]
     pub(crate) fn memory_properties(
         &self,
         instance: &ash::Instance,
@@ -162,6 +379,7 @@ impl WgpuContext {
     ///
     /// Returns `None` if the backend is not Vulkan. Used only by the
     /// export path, which wgpu does not provide.
+    #[cfg(feature = "vulkan")]
     pub fn with_raw_device<R>(
         &self,
         f: impl FnOnce(&ash::Device, ash::vk::PhysicalDevice) -> R,
@@ -181,6 +399,7 @@ impl WgpuContext {
     /// that goes through the device.
     ///
     /// Returns `None` if the backend is not Vulkan.
+    #[cfg(feature = "vulkan")]
     pub fn with_raw<R>(
         &self,
         f: impl FnOnce(&ash::Instance, &ash::Device, ash::vk::PhysicalDevice) -> R,
