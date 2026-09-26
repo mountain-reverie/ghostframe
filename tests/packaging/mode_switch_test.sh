@@ -127,6 +127,18 @@ for u in ghostframe-xorg.service ghostframe-wm.service ghostframe.target \
 done
 check_absent "$getty_dropin"
 
+# Switching to headless must also drop attach's XDG autostart entry, or it keeps
+# trying to start a unit that is no longer installed on every login.
+AS="$GUEST_HOME/.config/autostart/ghostframe-attach.desktop"
+mkdir -p "$(dirname "$AS")"; touch "$AS"
+mkdir -p "$GUEST_DIR"; touch "$GUEST_DIR/ghostframe-xdaemon.service"
+printf '[Seat:*]\nautologin-user=%s\n' "$USER" > "$dropin"
+target_user="definitely-not-$USER"
+getent() { printf '%s:x:0:0::%s:/bin/sh\n' "$USER" "$GUEST_HOME"; }
+switch_to headless
+unset -f getent
+check_absent "$AS"
+
 # Same user: the xdaemon unit is overwritten in place by the install that
 # follows, so removing it here would delete what is about to be rewritten.
 mkdir -p "$GUEST_DIR"

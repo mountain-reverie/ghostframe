@@ -1,0 +1,24 @@
+[Desktop Entry]
+Type=Application
+Name=Ghostframe (attach mode)
+Comment=Starts ghostframe-xdaemon.service in this graphical session
+# WHY THIS EXISTS, alongside the unit's WantedBy=graphical-session.target
+#
+# graphical-session.target is the correct systemd hook and some desktops do
+# activate it -- but many do not, and nothing requires them to. Measured on a
+# lightdm + Enlightenment host: default.target, basic.target, sockets.target,
+# paths.target, timers.target and sound.target are all active after login and
+# graphical-session.target is NOT, so a unit wanted by it never starts. The
+# symptom is a correctly installed, correctly enabled service that simply never
+# runs, with nothing in any journal to say why.
+#
+# XDG autostart is honoured by every desktop that honours anything, so this is
+# the path that actually fires. `systemctl --user start` is idempotent, so on a
+# desktop that DOES activate graphical-session.target this is a harmless no-op
+# rather than a double start.
+#
+# Not used by headless mode: there the whole session is ghostframe's own and
+# ghostframe.target is wanted by default.target, which always activates.
+Exec=systemctl --user start ghostframe-xdaemon.service
+X-GNOME-Autostart-enabled=true
+NoDisplay=true
