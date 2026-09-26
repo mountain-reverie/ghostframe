@@ -243,13 +243,17 @@ for u in ghostframe.target ghostframe-wm.service ghostframe-xdaemon.service; do
   install -m 0644 -o "$user_uid" -g "$user_gid" "$pkg_dir/systemd/$u" "$user_units_dir/$u"
 done
 
-# ghostframe-xorg.service is templated: whether Xorg may activate its VT at
-# startup depends on the display backend. See the comment in the template.
-if [[ "$display_backend" == "vkms" ]]; then
-  xorg_vt_flags="-novtswitch"
-else
-  xorg_vt_flags=""
-fi
+# ghostframe-xorg.service is templated so the VT flags stay in one place.
+#
+# -novtswitch for BOTH backends. An earlier revision applied it only to vkms,
+# on the theory that the amdgpu backend must activate its VT to take DRM
+# master or it could not modeset. That reasoning was wrong: this X server's
+# output is never viewed. The daemon captures over the X protocol
+# (GHOSTFRAME_X11_CAPTURE_ONLY=1 -> GetImage(root)), which needs no DRM master
+# and no scanout. Confirmed on evangeline: after chvt'ing back to the console
+# session -- at which point the Ghostframe X server is definitively not
+# master -- it kept serving frames to the web client.
+xorg_vt_flags="-novtswitch"
 info "install: $user_units_dir/ghostframe-xorg.service  (vt flags: '${xorg_vt_flags:-none}')"
 sed "s|__XORG_VT_FLAGS__|$xorg_vt_flags|g" \
     "$pkg_dir/systemd/ghostframe-xorg.service.tmpl" \
