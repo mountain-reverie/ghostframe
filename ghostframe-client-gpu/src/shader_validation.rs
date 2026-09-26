@@ -122,6 +122,125 @@ mod tests {
         );
     }
 
+    /// The smallest `maxComputeInvocationsPerWorkgroup` any target this
+    /// project ships to provides.
+    ///
+    /// WebGPU guarantees 256, so the browser client alone would allow twice
+    /// this. GLES 3.1's spec *minimum* is 128, and Mali-T860 reports exactly
+    /// 128 (`tools/hw-probe/glprobe.c`) -- so the native client on that GPU is
+    /// what sets the bar, and a shader that fits here fits everywhere.
+    ///
+    /// This is a hard gate, not a style preference: `request_device` fails
+    /// outright when a limit is unavailable, so a 256-invocation workgroup does
+    /// not degrade on Mali, it prevents the device from being created at all --
+    /// before any shader runs, which reads as "the GLES backend is broken"
+    /// rather than "one shader is too wide".
+    ///
+    /// Raising this re-breaks the GLES client. If you need to, raise the
+    /// hardware floor in the design doc first and say which GPU you dropped.
+    const MAX_WORKGROUP_INVOCATIONS: u32 = 128;
+
+    /// No compute entry point under `shaders/client/` asks for more
+    /// invocations per workgroup than the weakest target can give.
+    ///
+    /// Needs no GPU: the limit is a property of the shader source, and naga
+    /// hands us the declared `@workgroup_size` after a parse. So this runs in
+    /// CI (`cargo test --workspace --lib`) even though nothing there can
+    /// create a device to check it against.
+    #[test]
+    fn no_compute_shader_exceeds_the_portable_workgroup_limit() {
+        let dir = client_shader_dir();
+        let mut paths = Vec::new();
+        find_wgsl_files(&dir, &mut paths);
+        // Deterministic failure output: `read_dir` order is not stable, and a
+        // list that reorders between runs is miserable to diff.
+        paths.sort();
+
+        let mut compute_entry_points = 0usize;
+        let mut failures = Vec::new();
+        for path in &paths {
+            let name = path
+                .strip_prefix(&dir)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .into_owned();
+            let src =
+                fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+
+            // A parse failure is `every_client_shader_parses_and_validates`'s
+            // job. Reporting it here too would double every message for one
+            // defect and make this test look like it found something it did not.
+            let Ok(module) = naga::front::wgsl::parse_str(&src) else {
+                continue;
+            };
+
+            for ep in &module.entry_points {
+                // `workgroup_size` is only meaningful on compute stages; it is
+                // `[0, 0, 0]` on vertex and fragment, whose product would pass
+                // this check for all the wrong reasons.
+                if ep.stage != naga::ShaderStage::Compute {
+                    continue;
+                }
+                compute_entry_points += 1;
+
+                // An override-sized workgroup means the literal array is not
+                // the real size, so this test would be reading the wrong
+                // number and silently stop guarding. None of the shaders does
+                // this today; fail loudly if one starts, rather than passing
+                // on a value that means nothing.
+                //
+                // `Some([None, None, None])` is not an override -- check the
+                // elements, not just the outer Option.
+                let overridden = ep
+                    .workgroup_size_overrides
+                    .is_some_and(|o| o.iter().any(Option::is_some));
+                if overridden {
+                    failures.push(format!(
+                        "{name}: entry point `{}` sizes its workgroup with override \
+                         expressions, so this test cannot see the real size. Teach it \
+                         to evaluate the overrides, or go back to a literal \
+                         @workgroup_size.",
+                        ep.name
+                    ));
+                    continue;
+                }
+
+                let [x, y, z] = ep.workgroup_size;
+                // saturating: a declared size cannot realistically overflow
+                // u32, but a wrong answer here would be a *passing* test.
+                let invocations = x.saturating_mul(y).saturating_mul(z);
+                if invocations > MAX_WORKGROUP_INVOCATIONS {
+                    failures.push(format!(
+                        "{name}: entry point `{}` declares @workgroup_size({x}, {y}, {z}) \
+                         = {invocations} invocations, over the {MAX_WORKGROUP_INVOCATIONS} \
+                         limit. Reshape it so each invocation covers more than one \
+                         element; keep the workgroup *count* the same so the dispatch \
+                         sites in src/pipelines/ and ghostframe-web-client/src/webgpu/ \
+                         do not have to change.",
+                        ep.name
+                    ));
+                }
+            }
+        }
+
+        // Without this, deleting every compute shader -- or breaking the
+        // directory walk, or having naga stop reporting compute stages --
+        // reports success.
+        assert!(
+            compute_entry_points > 0,
+            "found no compute entry points under {} -- this test checked nothing, \
+             which is not the same as passing",
+            dir.display()
+        );
+        assert!(
+            failures.is_empty(),
+            "{} compute entry point(s) of {compute_entry_points} exceed the portable \
+             workgroup limit:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
     /// `nv12_reference.rs`'s own module doc: "the same six coefficients and
     /// the 0.502 chroma centre appear in three places, not two: this file,
     /// the WGSL, and the .comp shader they both invert. All three must
