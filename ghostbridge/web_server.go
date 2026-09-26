@@ -3,11 +3,9 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -17,44 +15,8 @@ import (
 	"tailscale.com/tsnet"
 )
 
-//go:embed all:dist
-var webDist embed.FS
-
-// distFS returns the dist tree rooted at "dist/" so handlers can serve
-// "/index.html" instead of "/dist/index.html". Errors at startup are a
-// build-config bug (missing //go:embed sources), not a runtime concern.
-func distFS() fs.FS {
-	sub, err := fs.Sub(webDist, "dist")
-	if err != nil {
-		panic("ghostbridge: dist/ subtree missing from embed: " + err.Error())
-	}
-	return sub
-}
-
-// hstsHeader is the value of Strict-Transport-Security set on every
-// HTTPS response. One-year max-age locks browsers onto HTTPS for the
-// daemon's tailnet hostname; includeSubDomains is harmless because the
-// daemon is the only thing serving on this name.
-const hstsHeader = "max-age=31536000; includeSubDomains"
-
-// newWebMux builds the HTTP handler mux for the embedded SPA + config.
-// certHashHex is the lowercase-hex SHA-256 of the WebTransport server cert.
-func newWebMux(certHashHex string) http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/config.json", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Cache-Control", "no-store")
-		_ = json.NewEncoder(w).Encode(struct {
-			CertHash string `json:"certHash"`
-		}{CertHash: certHashHex})
-	})
-	mux.Handle("/", http.FileServer(http.FS(distFS())))
-	// Wrap so every HTTPS response carries HSTS.
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Strict-Transport-Security", hstsHeader)
-		mux.ServeHTTP(w, r)
-	})
-}
+// The embedded SPA and the mux that serves it live in the build-tagged
+// pair web_dist.go / web_dist_noweb.go.
 
 // newRedirectHandler returns an HTTP handler that 301-redirects every
 // request to the same host:path on https://, EXCEPT /config.json, which it
@@ -148,6 +110,18 @@ func startWebListeners(
 	certHashHex string,
 	staticCert *tls.Certificate,
 ) error {
+	// A noweb archive has no SPA to serve. Fail the bind instead of coming
+	// up and answering 404 for every asset: the second failure mode is
+	// indistinguishable, from the browser, from a client-side bug, and this
+	// one names the cause. Reaching here means a *server* was built with
+	// the native client's `-tags noweb`.
+	if !webDistEmbedded {
+		return errors.New(
+			"ghostbridge built with -tags noweb: no embedded web client " +
+				"(that build is for the native client; a server needs " +
+				"ghostframe-tsnet's `web-embed` feature)")
+	}
+
 	// :443 — TLS
 	var tlsLn net.Listener
 	if staticCert != nil {

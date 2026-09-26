@@ -43,7 +43,11 @@ quinn-proto = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
-ghostframe-tsnet = { path = "../ghostframe-tsnet" }
+# `web-embed`: this is the server half, so the ghostbridge archive it links
+# must carry the browser SPA. The feature is off by default so the native
+# client can link the same crate without building the web client; enabling
+# it here is what keeps `ghostframe-xdaemon` serving a real client.
+ghostframe-tsnet = { path = "../ghostframe-tsnet", features = ["web-embed"] }
 tracing = { workspace = true }
 rustls = { workspace = true }
 rcgen = { workspace = true }

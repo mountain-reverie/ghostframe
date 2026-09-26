@@ -11,6 +11,23 @@ edition = "2021"
 # boundary is meant to make hard to lose rather than a convention to
 # remember.
 
+[features]
+default = []
+
+# Embed the browser SPA into the ghostbridge archive.
+#
+# Off by default, and deliberately: ghostbridge `//go:embed`s
+# ghostframe-web-client/dist unconditionally, which made every consumer of
+# this crate -- including the native client, which never serves a browser
+# anything -- run `npm install && vite build` before it could link. Servers
+# (`ghostframe-lib`) turn it on; the native client (`ghostframe-cli`,
+# `ghostframe-client-native`) leaves it off and skips the web toolchain
+# entirely.
+#
+# Forgetting it on a new server crate is not silent: ghostbridge's
+# `startWebListeners` refuses to bind when the embed is absent and says so.
+web-embed = []
+
 [dependencies]
 thiserror = { workspace = true }
 tracing = { workspace = true }
