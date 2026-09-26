@@ -7,6 +7,54 @@ build-release: build-web
 test-unit:
     cargo test --lib
 
+# --- Native client only -----------------------------------------------
+#
+# The `ghostframe` binary and the crates beneath it. None of this touches
+# the server, the web client, Docker, or the e2e harness -- which matters
+# on a machine that cannot afford to build the workspace. `ghostframe-tsnet`
+# leaves its `web-embed` feature off here, so ghostbridge is built with
+# `-tags noweb` and no npm/vite step is involved at all.
+#
+# `ghostframe-client-net` is in the build list but NOT the test/lint lists:
+# its dev-dependencies include `ghostframe-lib`, so exercising its tests
+# drags in the whole server (and, through it, the embedded SPA). Run
+# `cargo test -p ghostframe-client-net` separately when you have the
+# headroom for that.
+client-build-crates := "-p ghostframe-cli -p ghostframe-client-native -p ghostframe-client-gpu -p ghostframe-client-h264 -p ghostframe-client-core -p ghostframe-client-net -p ghostframe-client-capi -p ghostframe-protocol -p ghostframe-tsnet"
+client-test-crates := "-p ghostframe-cli -p ghostframe-client-native -p ghostframe-client-gpu -p ghostframe-client-h264 -p ghostframe-client-core -p ghostframe-client-capi -p ghostframe-protocol -p ghostframe-tsnet"
+
+# Build the `ghostframe` native client (debug). No server, no web client.
+build-client:
+    cargo build {{client-build-crates}}
+
+# Build the `ghostframe` native client (release).
+build-client-release:
+    cargo build --release {{client-build-crates}}
+
+# `cargo test -p <crate>` silently drops test binaries that fail to compile
+# and still reports 0 failed (see AGENTS.md), so the clippy --all-targets
+# pass below is the real gate, not the test summary. Both run here.
+#
+# Clippy and unit-test the native client crates.
+test-client:
+    cargo clippy {{client-test-crates}} --all-targets -- -D warnings
+    cargo test {{client-test-crates}}
+
+# Clippy the native client crates.
+lint-client:
+    cargo clippy {{client-build-crates}} --all-targets -- -D warnings
+
+# Build, lint and test the native client -- the client-only `ci-local`.
+ci-client: build-client
+    @echo "=== fmt-check ==="
+    just fmt-check
+    @echo "=== clippy + unit tests (native client) ==="
+    just test-client
+    @echo "=== cbindgen header up-to-date ==="
+    cargo check -p ghostframe-client-capi
+    git diff --exit-code ghostframe-client-capi/include/ghostframe_client.h
+    @echo "=== ci-client passed ==="
+
 # Run from a clean checkout: builds the web client SPA (vite) into
 # ghostframe-web-client/dist/, which ghostbridge //go:embeds at compile
 # time. A stale or missing dist/ now fails the ghostbridge build with a
@@ -50,8 +98,10 @@ ci-local:
     git diff --exit-code ghostframe-lib/include/ghostframe.h
     cargo check -p ghostframe-client-capi
     git diff --exit-code ghostframe-client-capi/include/ghostframe_client.h
-    @echo "=== go vet + build ==="
+    @echo "=== go vet + build (both tags) ==="
     cd ghostbridge && go vet ./... && go build ./...
+    # The native client's archive; untagged vet never sees web_dist_noweb.go.
+    cd ghostbridge && go vet -tags noweb ./... && go build -tags noweb ./...
     @echo "=== ci-local passed ==="
 
 firefox-bin := env_var_or_default('GHOSTFRAME_E2E_FIREFOX_BIN', '/usr/bin/firefox')
