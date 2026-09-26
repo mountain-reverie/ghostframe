@@ -5,9 +5,21 @@
 //!
 //! Modern WMs (Enlightenment, Mutter, KWin) ship a built-in compositor
 //! that calls `XCompositeRedirectSubwindows(root, Manual)`. After
-//! redirect, top-level windows render into off-screen pixmaps and the
-//! root window pixmap stops receiving their contents — `GetImage(root)`
-//! captures only the desktop background.
+//! redirect, top-level windows render into off-screen pixmaps.
+//!
+//! Whether the root window then goes stale is **compositor-dependent**, and
+//! this module used to assert it did. Mutter and KWin composite into the
+//! Composite overlay window, leaving root holding only the wallpaper — there
+//! `GetImage(root)` really does capture just the background. Enlightenment
+//! 0.27 in X11 mode redirects windows *and* paints the composited scene back
+//! into root, where per-window capture is the broken one: measured on a live
+//! E desktop, of 19 root children 11 were BadMatch (E's 1x1 `e_layer_win`
+//! stacking anchors are not redirected), 7 unmapped, and 1 real window
+//! composited — one window on black, while `GetImage(root)` returned the whole
+//! desktop including the shelf.
+//!
+//! So `pick_strategy` verifies rather than assumes: see
+//! `root_already_composited`.
 //!
 //! We tried the obvious alternative — `XCompositeGetOverlayWindow` +
 //! `GetImage` on the overlay — but that only works for XRender-based
@@ -501,12 +513,162 @@ fn pick_strategy(conn: &RustConnection, root: u32) -> Strategy {
         return Strategy::RootGetImage;
     }
 
-    tracing::info!(
-        compositor_owner = cm_owner,
-        "compositor detected; using per-window NameWindowPixmap + GetImage composite \
-         (root={root})"
-    );
-    Strategy::PerWindowComposite
+    // A compositor existing does NOT mean the root pixmap is stale.
+    //
+    // Mutter and KWin composite into the Composite overlay window and leave
+    // root holding only the wallpaper, so per-window capture is required.
+    // Enlightenment 0.27 in X11 mode redirects windows AND paints the
+    // composited scene straight into root. There, per-window capture produces
+    // one window on black: measured on a live E desktop, 19 root children were
+    // 11 BadMatch (E's 1x1 e_layer_win stacking anchors, which are not
+    // redirected), 7 unmapped, and exactly 1 real window composited -- while
+    // GetImage(root) returned the complete desktop, shelf and all.
+    //
+    // So verify the inference instead of making it.
+    match root_already_composited(conn, root) {
+        Some(true) => {
+            tracing::info!(
+                compositor_owner = cm_owner,
+                "compositor detected, but root already holds the composited result \
+                 (a redirected window's pixmap matches the same rectangle of root) \
+                 — using GetImage(root)"
+            );
+            Strategy::RootGetImage
+        }
+        other => {
+            tracing::info!(
+                compositor_owner = cm_owner,
+                root_check = ?other,
+                "compositor detected; using per-window NameWindowPixmap + GetImage \
+                 composite (root={root})"
+            );
+            Strategy::PerWindowComposite
+        }
+    }
+}
+
+/// Fraction of pixels in `a` and `b` equal within `tol` per channel.
+///
+/// Both slices are BGRA (or BGRX) of the same length; alpha is ignored because
+/// root and a redirected pixmap disagree about it routinely.
+fn fraction_matching(a: &[u8], b: &[u8], tol: u8) -> f32 {
+    let n = a.len().min(b.len()) / 4;
+    if n == 0 {
+        return 0.0;
+    }
+    let mut hit = 0usize;
+    for i in 0..n {
+        let (p, q) = (&a[i * 4..i * 4 + 3], &b[i * 4..i * 4 + 3]);
+        if p.iter().zip(q).all(|(x, y)| x.abs_diff(*y) <= tol) {
+            hit += 1;
+        }
+    }
+    hit as f32 / n as f32
+}
+
+/// Does the root window already contain composited window content?
+///
+/// Takes the largest viewable, on-screen child whose redirected pixmap we can
+/// name, and compares that pixmap against the same screen rectangle of root.
+/// A match means root is showing composited windows rather than bare wallpaper.
+///
+/// `None` = could not test (no nameable window, or a request failed). Callers
+/// treat `None` and `Some(false)` alike and keep the per-window path, so this
+/// only ever *adds* a fallback on positive proof — it cannot turn a working
+/// composite desktop into a broken one.
+fn root_already_composited(conn: &RustConnection, root: u32) -> Option<bool> {
+    let tree = conn.query_tree(root).ok()?.reply().ok()?;
+    let root_geom = conn.get_geometry(root).ok()?.reply().ok()?;
+
+    // Largest on-screen viewable child: the biggest sample gives the most
+    // reliable comparison, and a 1x1 anchor window tells us nothing.
+    let mut best: Option<(u32, x11rb::protocol::xproto::GetGeometryReply)> = None;
+    for &child in &tree.children {
+        let attrs = match conn.get_window_attributes(child).ok()?.reply() {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+        if attrs.map_state != MapState::VIEWABLE {
+            continue;
+        }
+        let g = match conn.get_geometry(child).ok()?.reply() {
+            Ok(g) => g,
+            Err(_) => continue,
+        };
+        // Must lie fully inside the screen: a clipped window would compare a
+        // different rectangle on each side.
+        if g.width < 64
+            || g.height < 64
+            || g.x < 0
+            || g.y < 0
+            || (g.x as i32 + g.width as i32) > root_geom.width as i32
+            || (g.y as i32 + g.height as i32) > root_geom.height as i32
+        {
+            continue;
+        }
+        let area = g.width as u32 * g.height as u32;
+        if best.as_ref().is_none_or(|(a, _)| area > *a) {
+            best = Some((area, g));
+        }
+    }
+    let (_, geom) = best?;
+
+    // Re-walk to find the window matching that geometry and name its pixmap.
+    for &child in &tree.children {
+        let g = match conn.get_geometry(child).ok()?.reply() {
+            Ok(g) => g,
+            Err(_) => continue,
+        };
+        if g.x != geom.x || g.y != geom.y || g.width != geom.width || g.height != geom.height {
+            continue;
+        }
+        let pixmap_id = conn.generate_id().ok()?;
+        if conn
+            .composite_name_window_pixmap(child, pixmap_id)
+            .ok()?
+            .check()
+            .is_err()
+        {
+            continue;
+        }
+        let win_img = conn
+            .get_image(
+                ImageFormat::Z_PIXMAP,
+                pixmap_id,
+                0,
+                0,
+                geom.width,
+                geom.height,
+                !0,
+            )
+            .ok()
+            .and_then(|c| c.reply().ok());
+        let root_img = conn
+            .get_image(
+                ImageFormat::Z_PIXMAP,
+                root,
+                geom.x,
+                geom.y,
+                geom.width,
+                geom.height,
+                !0,
+            )
+            .ok()
+            .and_then(|c| c.reply().ok());
+        let _ = conn.free_pixmap(pixmap_id);
+
+        let (w, r) = (win_img?, root_img?);
+        // Tolerance 8 absorbs the compositor's own resampling; 0.90 leaves room
+        // for a cursor or a drop-shadow edge inside the sampled rectangle.
+        let frac = fraction_matching(&w.data, &r.data, 8);
+        tracing::debug!(
+            window = child,
+            match_fraction = frac,
+            "root-vs-window composite probe"
+        );
+        return Some(frac >= 0.90);
+    }
+    None
 }
 
 /// Bounds-and-source descriptor passed to `blit_window` — kept as a
@@ -633,6 +795,61 @@ fn blit_cursor(target: &mut [u8], target_w: i32, target_h: i32, cursor: &GetCurs
             target[dst_idx + 2] = (r + (dr * inv_a + 127) / 255).min(255) as u8;
             target[dst_idx + 3] = 0xff;
         }
+    }
+}
+
+#[cfg(test)]
+mod fraction_matching_tests {
+    use super::fraction_matching;
+
+    fn px(b: u8, g: u8, r: u8) -> [u8; 4] {
+        [b, g, r, 0xff]
+    }
+
+    #[test]
+    fn identical_buffers_match_completely() {
+        let a: Vec<u8> = [px(10, 20, 30), px(40, 50, 60)].concat();
+        assert_eq!(fraction_matching(&a, &a, 0), 1.0);
+    }
+
+    #[test]
+    fn alpha_is_ignored() {
+        // Root and a redirected pixmap disagree about alpha routinely; if that
+        // counted, every comparison on a desktop would fail.
+        let a: Vec<u8> = [[1, 2, 3, 0x00]].concat();
+        let b: Vec<u8> = [[1, 2, 3, 0xff]].concat();
+        assert_eq!(fraction_matching(&a, &b, 0), 1.0);
+    }
+
+    #[test]
+    fn tolerance_is_per_channel_and_inclusive() {
+        let a: Vec<u8> = [px(10, 10, 10)].concat();
+        assert_eq!(fraction_matching(&a, &[px(18, 10, 10)].concat(), 8), 1.0);
+        assert_eq!(fraction_matching(&a, &[px(19, 10, 10)].concat(), 8), 0.0);
+        // A single channel over tolerance disqualifies the pixel.
+        assert_eq!(fraction_matching(&a, &[px(10, 10, 30)].concat(), 8), 0.0);
+    }
+
+    #[test]
+    fn partial_match_is_the_pixel_fraction() {
+        let a: Vec<u8> = [px(0, 0, 0), px(0, 0, 0), px(0, 0, 0), px(0, 0, 0)].concat();
+        let b: Vec<u8> = [px(0, 0, 0), px(0, 0, 0), px(0, 0, 0), px(99, 99, 99)].concat();
+        assert_eq!(fraction_matching(&a, &b, 0), 0.75);
+    }
+
+    #[test]
+    fn mismatched_lengths_compare_the_shared_prefix() {
+        // GetImage on root and on a pixmap can disagree in length if the
+        // geometry shifted between the two round trips. Comparing the prefix
+        // beats panicking on a diagnostic path.
+        let a: Vec<u8> = [px(1, 1, 1), px(2, 2, 2)].concat();
+        let b: Vec<u8> = [px(1, 1, 1)].concat();
+        assert_eq!(fraction_matching(&a, &b, 0), 1.0);
+    }
+
+    #[test]
+    fn empty_input_does_not_divide_by_zero() {
+        assert_eq!(fraction_matching(&[], &[], 0), 0.0);
     }
 }
 
