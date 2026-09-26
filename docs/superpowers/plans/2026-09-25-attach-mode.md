@@ -259,6 +259,14 @@ mode="headless"
 
 as the default, set alongside the existing `display_backend="amdgpu"`.
 
+**Add `--max-resolution` in this task too**, not in Task 4 -- it is another value flag and belongs with the parsing work rather than split across tasks:
+
+```bash
+max_resolution="1920x1080"
+```
+
+Accept any `WIDTHxHEIGHT` or the literal `none`. Do **not** validate the geometry further here: `clamp_ceiling` (Task 1) already ignores malformed values at runtime without refusing to start, and duplicating the rule in bash would give two places to disagree. Reject only an empty value.
+
 Also extend the usage comment block at the top of the file (the one `--help` prints via `sed -n '2,NNp'`). **Check the line range that `--help` prints and widen it if the block grows**, exactly as the `--display-backend` change had to — otherwise `--help` silently truncates.
 
 - [ ] **Step 2: Test the parser before wiring anything to it**
@@ -319,6 +327,8 @@ In attach mode:
 3. **Skip** `ghostframe-xorg`, `ghostframe-wm`, `ghostframe.target`, the getty autologin drop-in, and the `Xwrapper.config` write entirely — spec §2.
 4. Enable `ghostframe-xdaemon.service` for the user rather than `ghostframe.target`.
 5. Print the §6 security notice **to stdout during install**, not only in the unit file.
+6. Print the effective `GHOSTFRAME_ATTACH_MAX_RESOLUTION` **and name the variable** (spec risk 5). A user whose 1440p client gets 1080p must be able to find out why without reading the source.
+7. If `/etc/X11/Xwrapper.config` exists and carries this project's header, print that the setting is no longer needed in attach mode and that the script is deliberately leaving it alone (spec §5). Do not remove it -- the script cannot know nothing else depends on it.
 
 Keep the headless path byte-identical in behaviour. The cleanest structure is one `if [[ "$mode" == "attach" ]]` branch around steps 3-8 of the existing script rather than an `if` inside each step; decide and say which you chose and why.
 
@@ -405,9 +415,46 @@ Expected: fails — `remove_other_mode_units: command not found`.
 
 - [ ] **Step 3: Implement**
 
-Add `remove_other_mode_units <mode> <unit_dir>` to `install.sh`, taking the unit directory as a parameter so it is testable without root or a real user. For `attach` it stops, disables and removes `ghostframe-xorg.service`, `ghostframe-wm.service` and `ghostframe.target`; for `headless` it currently removes nothing extra (the attach unit reuses the `ghostframe-xdaemon.service` name and is overwritten in place) — **state that explicitly in a comment**, because a reader will otherwise assume the `headless` branch is unfinished.
+```bash
+# Remove the units belonging to the mode we are NOT installing.
+#
+# Load-bearing: if both modes' units remain, both X servers run and contend for
+# DRM mastership -- the exact failure attach mode exists to avoid, and it
+# presents as a new bug rather than as a leftover file.
+#
+# $2 (unit dir) is a parameter rather than a global so this is testable without
+# root or a real user session -- see tests/packaging/mode_switch_test.sh.
+remove_other_mode_units() {
+  local target_mode="$1" unit_dir="$2" u
+  case "$target_mode" in
+    attach)
+      for u in ghostframe-xorg.service ghostframe-wm.service ghostframe.target; do
+        # `|| true` throughout: the unit may not exist, and the target user may
+        # have no running session to talk to. Neither is an error -- we are
+        # asserting an end state, not performing a transition.
+        if [[ -e "$unit_dir/$u" ]]; then
+          info "remove: $unit_dir/$u (not used in attach mode)"
+          run_as_user systemctl --user stop "$u" 2>/dev/null || true
+          run_as_user systemctl --user disable "$u" 2>/dev/null || true
+          rm -f "$unit_dir/$u"
+        fi
+      done
+      ;;
+    headless)
+      # Nothing to remove. The attach unit is installed under the same filename
+      # (ghostframe-xdaemon.service) and is therefore overwritten in place by the
+      # headless install. This branch exists so the symmetry is explicit --
+      # without it a reader would reasonably assume it was unfinished.
+      :
+      ;;
+    *) die "remove_other_mode_units: unknown mode '$target_mode'" ;;
+  esac
+}
+```
 
-Call it from the install flow before installing the selected mode's units. `systemctl --user` calls must tolerate a unit that does not exist or a user with no session — use `|| true` and say why.
+`run_as_user` is whatever helper `install.sh` already uses to run `systemctl --user` as the target account -- find it and reuse it rather than inlining a `sudo -u ... XDG_RUNTIME_DIR=...` incantation. If none exists, add one; Task 4 needs it too for enabling the attach unit.
+
+Call it from the install flow **before** installing the selected mode's units.
 
 - [ ] **Step 4: Run and commit**
 
@@ -463,5 +510,6 @@ git commit -m "docs: document attach mode"
 - [ ] `install.sh --mode headless` is unchanged in behaviour.
 - [ ] `--help` prints the full usage block, untruncated.
 - [ ] The security position appears in the spec, the unit file, the install output and the README.
+- [ ] The install output names `GHOSTFRAME_ATTACH_MAX_RESOLUTION` and its effective value, and says the `Xwrapper.config` setting is now unnecessary without removing it.
 - [ ] `cargo test -p ghostframe-xdaemon`, `cargo fmt`, `cargo clippy -D warnings` all clean.
 - [ ] What is untested is stated: capture from `:0`, autologin, lock-screen behaviour and whether the PiKVM holds its view across a restart all need the real machine.
