@@ -321,7 +321,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // emit a single info log on each idle↔active flip instead of every
     // iteration. The IoBridge logs the corresponding event on its side; this
     // log shows the capture loop's view (X11 GetImage suspended/resumed).
-    let mut was_idle = true;
+    // None = nothing logged yet, so the FIRST pass through the loop announces
+    // whichever state it finds. Seeded `true` this stayed silent on the most
+    // common startup path -- no client yet -- so the daemon logged "entering
+    // capture loop" and then went permanently quiet at 0% CPU with no frames.
+    // That is correct behaviour (capture is gated on a connected client) but it
+    // reads exactly like a hang, and cost real time to tell apart from one.
+    let mut was_idle: Option<bool> = None;
 
     // Optional capture-dump diagnostic: when set, write each captured frame
     // as a PNG to this directory (filename: frame_<count>.png). Useful for
@@ -353,16 +359,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // this gate, X11 GetImage copies a full 1920x1080 framebuffer through
         // the X server every 33 ms regardless of demand.
         if server.connected_session_count() == 0 {
-            if !was_idle {
+            if was_idle != Some(true) {
                 tracing::info!("no client connected; capture loop entering idle poll");
-                was_idle = true;
+                was_idle = Some(true);
             }
             tokio::time::sleep(idle_poll_interval).await;
             continue;
         }
-        if was_idle {
+        if was_idle != Some(false) {
             tracing::info!("client connected; capture loop resuming");
-            was_idle = false;
+            was_idle = Some(false);
         }
 
         let capture_start = std::time::Instant::now();
