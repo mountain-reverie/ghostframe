@@ -154,6 +154,12 @@ struct EventTally {
     palette_updated: u64,
     other: u64,
     publishes: u64,
+    /// `publish` calls that returned `None` because every export buffer was
+    /// still in flight. Paired with `releases`, this says whether the ring is
+    /// starved and, if so, which side stopped: no releases means the consumer
+    /// is not presenting; releases without publishes means something else.
+    publish_starved: u64,
+    releases: u64,
 }
 
 impl EventTally {
@@ -203,6 +209,8 @@ impl EventTally {
             palette_updated = self.palette_updated,
             other = self.other,
             publishes = self.publishes,
+            publish_starved = self.publish_starved,
+            releases = self.releases,
             "render thread: 1s summary"
         );
         *self = Self::default();
@@ -270,6 +278,7 @@ pub(crate) fn run(
         match first {
             RenderMsg::Shutdown => break,
             RenderMsg::Release(id) => {
+                tally.releases += 1;
                 if let Some(r) = renderer.as_mut() {
                     r.release(id);
                 }
@@ -292,16 +301,42 @@ pub(crate) fn run(
             }
         }
 
-        // Drain whatever else is already queued without blocking, so a
-        // burst of events lands in one render pass instead of one per
-        // message.
-        loop {
+        // Drain what is already queued without blocking, so a burst lands in
+        // one render pass instead of one per message -- but BOUNDED.
+        //
+        // An unbounded drain is a starvation hazard: `try_recv` only stops when
+        // the channel is momentarily empty, and every event here does GPU work
+        // (`upload_rgba_tile` -> `write_texture`), so against a producer faster
+        // than the consumer there is no guaranteed bound on how long `flush`
+        // and `publish` below are deferred. The cap is one screen's worth of
+        // tiles at 1080p (60x34 = 2040, rounded up), which makes the invariant
+        // easy to state: never batch more than a full frame before presenting
+        // one. On a machine that keeps up, the channel empties first and this
+        // never binds.
+        //
+        // Do NOT read this as the fix for a low frame rate -- it was tried as
+        // exactly that and measured not to be. On a Pinebook Pro against a live
+        // server the rate was ~3 publishes/sec before and after; capping the
+        // drain only changed the batch size. `publish_starved=0` throughout, so
+        // the export ring was never the constraint either. The actual cost is
+        // per-tile upload: ~2049 events take ~1s, i.e. roughly 0.5 ms for a
+        // 32x32 `write_texture`. Fixing the frame rate means attacking that --
+        // most likely batching tiles into one upload per flush, or the
+        // framebuffer texture being AFBC-compressed on panfrost so every
+        // partial write costs a decompress/recompress of the touched blocks
+        // (the same defect `export_gles.rs` documents for the export, which is
+        // fixed there and NOT here).
+        const MAX_DRAIN: usize = 2048;
+        let mut drained = 0usize;
+        while drained < MAX_DRAIN {
+            drained += 1;
             match rx.try_recv() {
                 Ok(RenderMsg::Shutdown) => {
                     shutdown = true;
                     break;
                 }
                 Ok(RenderMsg::Release(id)) => {
+                    tally.releases += 1;
                     if let Some(r) = renderer.as_mut() {
                         r.release(id);
                     }
@@ -329,7 +364,11 @@ pub(crate) fn run(
         if got_event {
             if let Some(r) = renderer.as_mut() {
                 r.flush(&ctx);
-                if let Some(pf) = r.publish(&ctx) {
+                let published_frame = r.publish(&ctx);
+                if published_frame.is_none() {
+                    tally.publish_starved += 1;
+                }
+                if let Some(pf) = published_frame {
                     tally.publishes += 1;
                     let frame_id = pf.frame_id;
                     *published.lock().unwrap_or_else(|e| e.into_inner()) = Some(pf);
