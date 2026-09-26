@@ -22,6 +22,14 @@ containers-build:
     docker build -t ghostframe/test-server -f tests/containers/test-server/Dockerfile .
     docker build -t ghostframe/test-headscale -f tests/containers/headscale/Dockerfile tests/containers/headscale/
 
+# Packaging tests. Pure bash, no toolchain, no root: sources
+# packaging/install.sh and asserts its mode-switch cleanup against a throwaway
+# unit dir. GHOSTFRAME_TEST_UNIT_DIR is mandatory and has no default on
+# purpose -- the test deletes every file it names, and a default would put
+# that rm one typo away from /etc/systemd.
+test-packaging:
+    GHOSTFRAME_TEST_UNIT_DIR="$(mktemp -d)" bash tests/packaging/mode_switch_test.sh
+
 lint:
     cargo clippy --workspace --all-targets -- -D warnings
 
@@ -40,6 +48,8 @@ ci-local:
     cargo clippy --workspace --all-targets -- -D warnings
     @echo "=== unit tests ==="
     cargo test --workspace --lib
+    @echo "=== packaging tests ==="
+    just test-packaging
     @echo "=== web client build ==="
     just build-web
     cd ghostframe-web-client && npx tsc --noEmit
