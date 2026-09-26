@@ -27,6 +27,62 @@
 //! than kept alive in the struct, which is what lets `ExportedImage` need no
 //! `Drop` impl at all: wgpu frees the texture, `OwnedFd` closes the fd.
 //!
+//! ## What this exports is AFBC-COMPRESSED, and it is not importable as-is
+//!
+//! **This is the open defect on this backend.** Measured on Mali-T860 /
+//! panfrost / Mesa 24.0.2, a wgpu-created texture exports with modifier
+//! `0x0800000000000051`, which decodes as
+//! `DRM_FORMAT_MOD_ARM_AFBC(BLOCK_SIZE_16x16 | YTR | SPARSE)` -- Arm Frame
+//! Buffer Compression. Not a tiling shuffle: *compression*.
+//!
+//! Against a real server the window showed a repeating green grid with a 16px
+//! band at the top and black below: compressed payload and block headers read
+//! as raw RGBA, the 16x16 block size, and SPARSE leaving most blocks
+//! unwritten. Modifier negotiation did not catch it because the X11 backend
+//! offers no modifier preference, and an empty preference list means "library
+//! picks" -- indistinguishable from "anything works", so it accepted the
+//! driver's only offer.
+//!
+//! **There is no usage-flag escape.** Measured across
+//! `RENDER_ATTACHMENT|TEXTURE_BINDING|COPY_SRC|COPY_DST`, plus
+//! `STORAGE_BINDING`, plus COPY-only, plus `TEXTURE_BINDING|COPY_DST`: every
+//! combination that yields a GL texture yields AFBC. (`RENDER_ATTACHMENT`
+//! alone yields a renderbuffer, which has no name to export at all.) The
+//! buffer cannot be coaxed out of wgpu in an importable layout; it has to be
+//! allocated elsewhere and rendered into.
+//!
+//! ### The fix, with its feasibility already measured
+//!
+//! Allocate LINEAR through GBM and import that as the render target --
+//! inverting this module back to the Vulkan pattern of allocating ourselves
+//! and wrapping. Confirmed on this driver by `tools/hw-probe/gbmprobe.c`:
+//!
+//! ```text
+//! ABGR8888 flags=LINEAR|RENDERING   OK  planes=1 modifier=0x0 stride=2560
+//! ```
+//!
+//! `DRM_FORMAT_ABGR8888` is what `wgpu::TextureFormat::Rgba8Unorm` maps to, so
+//! the channel order matches -- worth stating, because a linear buffer in the
+//! wrong order renders as swapped colours rather than failing.
+//!
+//! The steps, all reachable from `with_raw_egl` plus libgbm:
+//!
+//! 1. `gbm_bo_create(ABGR8888, GBM_BO_USE_LINEAR | GBM_BO_USE_RENDERING)`,
+//!    then `gbm_bo_get_fd` / `_get_stride` / `_get_modifier`.
+//! 2. `eglCreateImageKHR(EGL_LINUX_DMA_BUF_EXT, {fd, stride, offset, fourcc})`.
+//! 3. `glGenTextures` + `glBindTexture` + `glEGLImageTargetTexture2DOES`, all
+//!    loadable through `egl.get_proc_address` -- `AdapterContext::egl_instance`'s
+//!    own doc covers GL functions too, so this needs no `glow` dependency.
+//! 4. `wgpu_hal::gles::Device::texture_from_raw` + `wgpu::Texture::from_hal`.
+//!
+//! Drop order becomes load-bearing, and inverts from what this module does
+//! today: wgpu texture, then the GL texture (via `texture_from_raw`'s drop
+//! callback), then the `EGLImage`, then the bo. The `EGLImage` must OUTLIVE
+//! the texture, because the texture's storage *is* the image.
+//!
+//! Steps 2-4 are the same machinery `import_gles.rs` needs, so building this
+//! also unblocks NV12 import.
+//!
 //! ## What this exports is TILED, and that has consequences
 //!
 //! Measured on Mali-T860 / panfrost / Mesa 24.0.2: a wgpu-created texture

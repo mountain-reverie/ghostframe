@@ -56,6 +56,10 @@ pub struct Renderer {
     pending_palrle: Vec<(u8, u8, u8, u8, Vec<u8>)>,
     pending_cdf53: Vec<Cdf53PassEntry>,
 
+    /// `GHOSTFRAME_CLIENT_DUMP_FRAME` fires once per process, not per frame.
+    /// Set even when the write fails -- see `maybe_dump_framebuffer`.
+    dumped_frame: bool,
+
     /// `Some` from construction on when `Renderer::new`'s `open_h264_eagerly`
     /// was `true` (the decoder is opened synchronously in `Renderer::new` --
     /// see that function's doc). Otherwise lazily created on the first
@@ -196,6 +200,7 @@ impl Renderer {
             pending_solid: Vec::new(),
             pending_palrle: Vec::new(),
             pending_cdf53: Vec::new(),
+            dumped_frame: false,
             h264_decoder,
             h264_pipeline: None,
             h264_unavailable,
@@ -352,7 +357,72 @@ impl Renderer {
 
     /// Seal a generation and hand out an export buffer, if one is free.
     pub fn publish(&mut self, ctx: &WgpuContext) -> Option<PublishedFrame> {
-        self.ring.publish(&ctx.device, &ctx.queue, &self.fb)
+        let pf = self.ring.publish(&ctx.device, &ctx.queue, &self.fb);
+        if pf.is_some() {
+            self.maybe_dump_framebuffer(ctx);
+        }
+        pf
+    }
+
+    /// Write the framebuffer to a binary PPM when
+    /// `GHOSTFRAME_CLIENT_DUMP_FRAME` names a path. Once per process.
+    ///
+    /// **Reads the framebuffer, deliberately — not the exported dmabuf.** That
+    /// is what makes it useful: the framebuffer is an ordinary wgpu texture, so
+    /// `debug_read` gets tight row-major RGBA out of it whatever the exported
+    /// buffer's DRM modifier is. On a backend whose export turns out to be
+    /// tiled or compressed (see `export_gles.rs`'s module doc) that is the
+    /// difference between two very different bugs wearing the same face:
+    ///
+    /// - dump looks right, window looks wrong -> decode and render are fine,
+    ///   the export layout or the consumer's import is not.
+    /// - dump looks wrong -> the fault is upstream, in tile decode or the
+    ///   shaders, and the export is a red herring.
+    ///
+    /// PPM because it needs no dependency and every image viewer opens it;
+    /// `ghostframe-xdaemon` pulls in a PNG encoder for its own capture dump,
+    /// but that is a server-side cost and this is a library.
+    fn maybe_dump_framebuffer(&mut self, ctx: &WgpuContext) {
+        if self.dumped_frame {
+            return;
+        }
+        let Ok(path) = std::env::var("GHOSTFRAME_CLIENT_DUMP_FRAME") else {
+            return;
+        };
+        // Set regardless of outcome: a path that cannot be written will not
+        // start working on frame two, and retrying every frame would turn a
+        // typo into a log flood.
+        self.dumped_frame = true;
+
+        let (w, h) = (self.fb.width, self.fb.height);
+        let rgba = self.fb.debug_read(&ctx.device, &ctx.queue);
+
+        // Non-black pixel count, logged alongside the write. "I dumped a
+        // frame" is not the useful fact; "the frame was entirely black" is,
+        // and it saves opening the file to find out.
+        let non_black = rgba
+            .chunks_exact(4)
+            .filter(|p| p[0] != 0 || p[1] != 0 || p[2] != 0)
+            .count();
+
+        let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
+        ppm.reserve(w as usize * h as usize * 3);
+        for px in rgba.chunks_exact(4) {
+            ppm.extend_from_slice(&px[..3]);
+        }
+
+        match std::fs::write(&path, &ppm) {
+            Ok(()) => tracing::info!(
+                path = %path,
+                width = w,
+                height = h,
+                non_black_px = non_black,
+                total_px = w as usize * h as usize,
+                "dumped framebuffer (PPM, read back through wgpu -- unaffected \
+                 by the exported dmabuf's modifier)"
+            ),
+            Err(e) => tracing::warn!(path = %path, error = %e, "framebuffer dump failed"),
+        }
     }
 
     pub fn release(&mut self, frame_id: u32) {

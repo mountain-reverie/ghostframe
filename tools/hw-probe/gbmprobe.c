@@ -35,6 +35,14 @@ int main(void) {
     t(d, "NV12 flags=0", NV12, 0);
     t(d, "XRGB8888 flags=LINEAR|RENDERING", GBM_FORMAT_XRGB8888, GBM_BO_USE_LINEAR | GBM_BO_USE_RENDERING);
 
+    // wgpu's Rgba8Unorm is DRM_FORMAT_ABGR8888. The export path needs THIS
+    // format linear, not XRGB -- a linear buffer in the wrong channel order
+    // would render as swapped colours rather than failing.
+    printf("\nABGR8888 supported (render): %d\n", gbm_device_is_format_supported(d, GBM_FORMAT_ABGR8888, GBM_BO_USE_RENDERING));
+    t(d, "ABGR8888 flags=LINEAR|RENDERING", GBM_FORMAT_ABGR8888, GBM_BO_USE_LINEAR | GBM_BO_USE_RENDERING);
+    t(d, "ABGR8888 flags=LINEAR|RENDERING|SCANOUT", GBM_FORMAT_ABGR8888, GBM_BO_USE_LINEAR | GBM_BO_USE_RENDERING | GBM_BO_USE_SCANOUT);
+    t(d, "ARGB8888 flags=LINEAR|RENDERING", GBM_FORMAT_ARGB8888, GBM_BO_USE_LINEAR | GBM_BO_USE_RENDERING);
+
     gbm_device_destroy(d); close(fd);
     return 0;
 }
