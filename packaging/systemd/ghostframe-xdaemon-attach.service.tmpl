@@ -22,15 +22,24 @@ Type=simple
 Environment=DISPLAY=:0
 Environment=TS_HOSTNAME=%H-ghostframe
 Environment=TS_STATE_DIR=%h/.local/share/ghostframe/ts-state
-# Guest-mode install: skip DRM probe. The DRM modesetting-FB fallback
-# inside drm_capture::capture() reads /dev/dri/card0's active scanout
-# (= host's real display) instead of the guest Xorg on DISPLAY=:1, so
-# the captured framebuffer never matches what the guest WM is painting.
-# The writeback-connector DRM path can't escape this either while Xorg
-# holds master on the same card (see drm_capture.rs's "DRM master
-# conflicts" section). X11 GetImage against :1 reads the right pixels.
-# Unset this on truly headless deployments (no X server, xdaemon is the
-# sole DRM client) to re-enable the zero-copy DRM path.
+# Use the X-protocol capture path, not DRM.
+#
+# NOTE this comment was rewritten for attach mode. The headless unit's
+# version explains that DRM capture reads the host's real scanout "instead
+# of the guest Xorg on DISPLAY=:1" -- a content mismatch. That specific
+# reasoning does NOT apply here: in attach mode the captured session IS the
+# physical display, so a DRM read would see the right pixels.
+#
+# It stays set anyway, for a different and narrower reason: the DRM paths
+# need privileges this daemon does not have. The zero-copy writeback path
+# needs an atomic commit, which needs DRM master -- and X holds it. That
+# leaves the modesetting-FB fallback, whose CPU-mmap read might well work
+# here, but nobody has tried it.
+#
+# So this is the known-working path, not a proven-optimal one. Whether DRM
+# capture is viable in attach mode is genuinely unexplored; if someone
+# measures it, this comment should be replaced by that measurement rather
+# than by another assumption.
 Environment=GHOSTFRAME_X11_CAPTURE_ONLY=1
 # Caps how large a remote client may resize this session. In attach mode the
 # session IS the physical display, which a KVM may be capturing as the
