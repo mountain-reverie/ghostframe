@@ -91,8 +91,13 @@ run_as_user() {
 # globals rather than parameters: they are unset when this function is
 # sourced for that test, so every use of them below is guarded to tolerate
 # that (`${target_user:-}` and a plain existence check) rather than require it.
+# remove_other_mode_units <mode> <unit_dir> [lightdm_dropin]
+#
+# The third argument exists so the packaging test can point the lightdm cleanup
+# at a throwaway path instead of /etc.
 remove_other_mode_units() {
   local target_mode="$1" unit_dir="$2" u
+  local lightdm_dropin="${3:-/etc/lightdm/lightdm.conf.d/99-ghostframe-autologin.conf}"
   case "$target_mode" in
     attach)
       for u in ghostframe-xorg.service ghostframe-wm.service ghostframe.target; do
@@ -111,12 +116,35 @@ remove_other_mode_units() {
       done
       ;;
     headless)
-      # Nothing to remove. The attach unit is installed under the same
-      # filename (ghostframe-xdaemon.service) and is therefore overwritten in
-      # place by the headless install below. This branch exists so the
-      # symmetry is explicit -- without it a reader would reasonably assume
-      # it was unfinished.
-      :
+      # The attach unit uses the same filename (ghostframe-xdaemon.service), so
+      # a switch that keeps the same target user overwrites it in place and
+      # there is nothing to do. Two things do NOT clean themselves up:
+      #
+      # 1. lightdm autologin. Attach mode installs it so :0 exists after an
+      #    unattended boot. Headless mode has its own getty autologin for the
+      #    guest account, so leaving this one behind means BOTH autologin --
+      #    two graphical sessions contending for one GPU, which is precisely
+      #    the failure this cleanup exists to prevent.
+      #
+      # 2. A switch that also changes the target user. The attach unit then
+      #    stays in the *other* user's directory and keeps starting on their
+      #    login. The lightdm drop-in records who that user was, which is how
+      #    we find them.
+      if [[ -f "$lightdm_dropin" ]]; then
+        local prev_user prev_home prev_unit
+        prev_user=$(sed -n 's/^[[:space:]]*autologin-user[[:space:]]*=[[:space:]]*//p' \
+          "$lightdm_dropin" | head -1)
+        if [[ -n "$prev_user" && "$prev_user" != "${target_user:-}" ]]; then
+          prev_home=$(getent passwd "$prev_user" 2>/dev/null | cut -d: -f6)
+          prev_unit="$prev_home/.config/systemd/user/ghostframe-xdaemon.service"
+          if [[ -n "$prev_home" && -e "$prev_unit" ]]; then
+            info "remove: $prev_unit (attach unit for '$prev_user', unused in headless mode)"
+            rm -f "$prev_unit"
+          fi
+        fi
+        info "remove: $lightdm_dropin (autologin is not used in headless mode)"
+        rm -f "$lightdm_dropin"
+      fi
       ;;
     *) die "remove_other_mode_units: unknown mode '$target_mode'" ;;
   esac

@@ -48,5 +48,47 @@ remove_other_mode_units attach "$UNITS"
 remove_other_mode_units attach "$UNITS"
 check_absent "$UNITS/ghostframe-xorg.service"
 
+# Switching to headless must remove attach's lightdm autologin drop-in.
+# Leaving it means lightdm autologins the operator AND the headless getty
+# autologins guest: two graphical sessions on one GPU, the exact contention
+# this cleanup exists to prevent.
+dropin="$UNITS/99-ghostframe-autologin.conf"
+printf '[Seat:*]\nautologin-user=%s\nautologin-user-timeout=0\n' "$USER" > "$dropin"
+remove_other_mode_units headless "$UNITS" "$dropin"
+check_absent "$dropin"
+
+# ...and it must be safe when the drop-in is not there.
+remove_other_mode_units headless "$UNITS" "$dropin"
+
+# A switch that also CHANGES the target user does not overwrite the attach unit
+# in place -- it lands in the new user's directory while the old one keeps
+# starting on the previous user's login. The drop-in records who that was.
+# TEST_PREV_* and not prev_*: remove_other_mode_units declares `local prev_home`
+# and `local prev_unit`, which would shadow these inside the stub below.
+TEST_PREV_HOME="$UNITS/prevhome"
+TEST_PREV_UNIT="$TEST_PREV_HOME/.config/systemd/user/ghostframe-xdaemon.service"
+mkdir -p "$(dirname "$TEST_PREV_UNIT")"
+touch "$TEST_PREV_UNIT"
+printf '[Seat:*]\nautologin-user=%s\n' "$USER" > "$dropin"
+# The cleanup resolves the previous user's home with getent. Stub it so the test
+# does not depend on this machine's passwd database, and set target_user to
+# someone else so $USER counts as the *previous* user.
+target_user="definitely-not-$USER"
+getent() { printf '%s:x:0:0::%s:/bin/sh\n' "$USER" "$TEST_PREV_HOME"; }
+remove_other_mode_units headless "$UNITS" "$dropin"
+unset -f getent
+check_absent "$TEST_PREV_UNIT"
+check_absent "$dropin"
+
+# Same-user switch must NOT delete that user's unit -- the headless install
+# overwrites it in place, and removing it here would race that write.
+touch "$TEST_PREV_UNIT"
+printf '[Seat:*]\nautologin-user=%s\n' "$USER" > "$dropin"
+target_user="$USER"
+getent() { printf '%s:x:0:0::%s:/bin/sh\n' "$USER" "$TEST_PREV_HOME"; }
+remove_other_mode_units headless "$UNITS" "$dropin"
+unset -f getent
+check_present "$TEST_PREV_UNIT"
+
 [[ $fail -eq 0 ]] && echo "PASS"
 exit $fail
