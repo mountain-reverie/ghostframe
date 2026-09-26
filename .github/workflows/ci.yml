@@ -81,6 +81,10 @@ jobs:
         with:
           shared-key: ci-fast
       - run: cargo test --workspace --lib
+      # --lib skips binary crates entirely, so ghostframe-xdaemon's tests (the
+      # display clamp, the capture resize logic) and codec_report's ran nowhere
+      # in CI. 38 tests, no hardware needed.
+      - run: cargo test --workspace --bins
       # Integration-test targets are not covered by --lib and CI names them
       # explicitly; a new tests/*.rs file runs nowhere until it is listed here.
       - run: cargo test -p ghostframe-lib --test bwe_bench
