@@ -125,6 +125,90 @@ fn handle_core_event(
     true
 }
 
+/// Rolling tally of what the render thread is actually being handed.
+///
+/// `ghostframe-client-net` and `ghostframe-client-core` carry no tracing at
+/// all, so before this there was no way to tell "the server is sending nothing"
+/// apart from "tiles arrive and decode to nothing" -- and those need completely
+/// different fixes. A black window looks identical either way.
+///
+/// Logged as one line per second rather than per event: at 60fps with a full
+/// tile grid, per-event logging is both a flood and a measurable cost on a
+/// weak CPU, which is the machine this instrumentation exists for.
+#[derive(Default)]
+struct EventTally {
+    tile_ready: u64,
+    /// `TileReady` tiles carrying at least one non-black pixel.
+    ///
+    /// Distinguishes the two explanations for a black framebuffer that no
+    /// amount of GPU-side logging can separate: the upload path is broken, or
+    /// the server is faithfully sending a black desktop (a headless Xorg whose
+    /// WM never started is genuinely black, and the encoder has no opinion
+    /// about that). If this is 0 while `tile_ready` is in the thousands, the
+    /// client is working and the remote screen is blank.
+    tile_ready_nonblack: u64,
+    tile_payload: u64,
+    frame_dimensions: u64,
+    needs_h264: u64,
+    decode_error: u64,
+    palette_updated: u64,
+    other: u64,
+    publishes: u64,
+}
+
+impl EventTally {
+    fn record(&mut self, ev: &ghostframe_client_core::Event) {
+        use ghostframe_client_core::Event as E;
+        match ev {
+            E::TileReady { rgba, .. } => {
+                self.tile_ready += 1;
+                if rgba
+                    .chunks_exact(4)
+                    .any(|p| p[0] != 0 || p[1] != 0 || p[2] != 0)
+                {
+                    self.tile_ready_nonblack += 1;
+                }
+            }
+            E::TilePayload { .. } => self.tile_payload += 1,
+            E::FrameDimensions { .. } => self.frame_dimensions += 1,
+            E::NeedsH264 { .. } => self.needs_h264 += 1,
+            E::DecodeError { .. } => self.decode_error += 1,
+            E::PaletteUpdated { .. } => self.palette_updated += 1,
+            _ => self.other += 1,
+        }
+    }
+
+    fn total(&self) -> u64 {
+        self.tile_ready
+            + self.tile_payload
+            + self.frame_dimensions
+            + self.needs_h264
+            + self.decode_error
+            + self.palette_updated
+            + self.other
+    }
+
+    /// Emit and reset. `total() == 0` is the interesting case, not the boring
+    /// one, so it is logged too -- "the client received nothing for a second"
+    /// is precisely the fact a silent log would hide.
+    fn flush_log(&mut self) {
+        tracing::debug!(
+            events = self.total(),
+            tile_ready = self.tile_ready,
+            tile_ready_nonblack = self.tile_ready_nonblack,
+            tile_payload = self.tile_payload,
+            frame_dimensions = self.frame_dimensions,
+            needs_h264 = self.needs_h264,
+            decode_error = self.decode_error,
+            palette_updated = self.palette_updated,
+            other = self.other,
+            publishes = self.publishes,
+            "render thread: 1s summary"
+        );
+        *self = Self::default();
+    }
+}
+
 /// Build the GPU context *on this thread*, then run the render loop.
 ///
 /// The context is constructed here rather than by the caller because a GL
@@ -165,6 +249,8 @@ pub(crate) fn run(
         }
     };
     let mut renderer: Option<Renderer> = None;
+    let mut tally = EventTally::default();
+    let mut last_summary = std::time::Instant::now();
     // `0` means "the embedder didn't specify a count"; a `Renderer` with
     // zero export buffers is a rejected config (it could never publish a
     // frame), so this thread -- not the renderer -- decides what "didn't
@@ -189,6 +275,7 @@ pub(crate) fn run(
                 }
             }
             RenderMsg::Core(ev) => {
+                tally.record(&ev);
                 got_event |= handle_core_event(
                     &ctx,
                     &mut renderer,
@@ -220,6 +307,7 @@ pub(crate) fn run(
                     }
                 }
                 Ok(RenderMsg::Core(ev)) => {
+                    tally.record(&ev);
                     got_event |= handle_core_event(
                         &ctx,
                         &mut renderer,
@@ -242,11 +330,25 @@ pub(crate) fn run(
             if let Some(r) = renderer.as_mut() {
                 r.flush(&ctx);
                 if let Some(pf) = r.publish(&ctx) {
+                    tally.publishes += 1;
                     let frame_id = pf.frame_id;
                     *published.lock().unwrap_or_else(|e| e.into_inner()) = Some(pf);
                     queue.push(ClientEvent::FrameReady { frame_id });
                 }
             }
+        }
+
+        // Once a second, whatever happened -- including nothing. See
+        // `EventTally`'s doc for why a quiet second is the interesting case.
+        //
+        // `saturating_duration_since`, not `elapsed()`: the latter is banned in
+        // this workspace (see the clippy config) because it reads the real wall
+        // clock even on an Instant derived from a virtual one, and silently
+        // returns 0ns forever instead of erroring.
+        let now = std::time::Instant::now();
+        if now.saturating_duration_since(last_summary) >= std::time::Duration::from_secs(1) {
+            tally.flush_log();
+            last_summary = now;
         }
 
         if shutdown {
