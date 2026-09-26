@@ -5,6 +5,8 @@
 #
 # Usage:  sudo ./packaging/install.sh <username> [--force]
 #                                      [--display-backend amdgpu|vkms]
+#                                      [--mode attach|headless]
+#                                      [--max-resolution WIDTHxHEIGHT|none]
 #
 # --display-backend amdgpu (default): the GPU presents a virtual connector via
 #   the `amdgpu virtual_display=` module option. Requires a machine with NO
@@ -13,6 +15,24 @@
 # --display-backend vkms: run the session on VKMS, a separate virtual DRM
 #   device. Safe alongside a local desktop; costs GPU acceleration inside the
 #   Ghostframe session (VKMS has no render node). Requires the vkms module.
+#
+# --mode headless (default): installs ghostframe's own X server
+#   (ghostframe-xorg), a window manager (ghostframe-wm), and the capture
+#   daemon as three units, plus a sandboxed 'guest' user and a getty
+#   autologin. Existing installs are unaffected by adding this flag.
+# --mode attach: installs a single unit that captures the operator's own,
+#   already-running X session instead. The remote client sees the operator's
+#   real desktop, not a sandboxed guest session.
+#
+# --max-resolution WIDTHxHEIGHT|none (default: 1920x1080): caps how large a
+#   remote client may resize the captured session. Only meaningful in
+#   --mode attach, where the session *is* the physical display -- which a KVM
+#   may be capturing as the machine's recovery view, so an unclamped client
+#   could set a mode that view cannot capture. Only checked here for being
+#   non-empty: ghostframe-xdaemon/src/display.rs's clamp_ceiling already
+#   ignores a malformed value at runtime without refusing to start, and
+#   duplicating that rule in bash would just give it a second place to
+#   disagree -- do not "helpfully" add stricter validation here.
 #
 # What it does:
 #   1. Verifies required binaries are on the host (Xorg, amdgpu, enlightenment).
@@ -43,7 +63,7 @@ info() { printf 'install.sh: %s\n' "$*"; }
 for arg in "$@"; do
   case "$arg" in
     --help|-h)
-      sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
   esac
@@ -53,8 +73,12 @@ done
 
 force=0
 display_backend="amdgpu"
+mode="headless"
+max_resolution="1920x1080"
 target_user=""
 expect_backend=0
+expect_mode=0
+expect_max_resolution=0
 for arg in "$@"; do
   if [[ $expect_backend -eq 1 ]]; then
     case "$arg" in
@@ -64,14 +88,43 @@ for arg in "$@"; do
     expect_backend=0
     continue
   fi
+  if [[ $expect_mode -eq 1 ]]; then
+    case "$arg" in
+      attach|headless) mode="$arg" ;;
+      *) die "--mode must be 'attach' or 'headless' (got '$arg')" ;;
+    esac
+    expect_mode=0
+    continue
+  fi
+  if [[ $expect_max_resolution -eq 1 ]]; then
+    [[ -n "$arg" ]] || die "--max-resolution requires a value: WIDTHxHEIGHT or none"
+    max_resolution="$arg"
+    expect_max_resolution=0
+    continue
+  fi
   case "$arg" in
     --force) force=1 ;;
     --display-backend) expect_backend=1 ;;
-    --display-backend=*) 
+    --display-backend=*)
       case "${arg#*=}" in
         amdgpu|vkms) display_backend="${arg#*=}" ;;
         *) die "--display-backend must be 'amdgpu' or 'vkms' (got '${arg#*=}')" ;;
       esac
+      ;;
+    --mode) expect_mode=1 ;;
+    --mode=*)
+      case "${arg#*=}" in
+        attach|headless) mode="${arg#*=}" ;;
+        *) die "--mode must be 'attach' or 'headless' (got '${arg#*=}')" ;;
+      esac
+      ;;
+    --max-resolution) expect_max_resolution=1 ;;
+    --max-resolution=*)
+      # Only checked for non-emptiness -- see the usage comment above for why
+      # geometry validation belongs solely to clamp_ceiling at runtime, not
+      # here.
+      [[ -n "${arg#*=}" ]] || die "--max-resolution requires a value: WIDTHxHEIGHT or none"
+      max_resolution="${arg#*=}"
       ;;
     --help|-h) ;;
     -*) die "unknown flag: $arg" ;;
@@ -82,10 +135,12 @@ for arg in "$@"; do
   esac
 done
 
-# A trailing bare `--display-backend` would otherwise leave the default in
-# place silently, which is the wrong outcome for a flag whose whole purpose is
-# to pick a non-default.
+# A trailing bare `--display-backend` (or `--mode` / `--max-resolution`) would
+# otherwise leave the default in place silently, which is the wrong outcome
+# for a flag whose whole purpose is to pick a non-default.
 [[ $expect_backend -eq 0 ]] || die "--display-backend requires a value: amdgpu or vkms"
+[[ $expect_mode -eq 0 ]] || die "--mode requires a value: attach or headless"
+[[ $expect_max_resolution -eq 0 ]] || die "--max-resolution requires a value: WIDTHxHEIGHT or none"
 
 [[ -n "$target_user" ]] || die "username required (try: sudo $0 <username>)"
 id "$target_user" >/dev/null 2>&1 || die "user '$target_user' does not exist"
