@@ -185,7 +185,7 @@ purge_units() {
 }
 
 remove_other_mode_units() {
-  local target_mode="$1" unit_dir="$2"
+  local target_mode="$1" unit_dir="$2" prev_autostart
   local lightdm_dropin="${3:-/etc/lightdm/lightdm.conf.d/99-ghostframe-autologin.conf}"
   local getty_dropin="${4:-/etc/systemd/system/getty@tty1.service.d/99-ghostframe-autologin.conf}"
   case "$target_mode" in
@@ -271,6 +271,13 @@ remove_other_mode_units() {
           if [[ -n "$prev_home" && -e "$prev_unit" ]]; then
             info "remove: $prev_unit (attach unit for '$prev_user', unused in headless mode)"
             rm -f "$prev_unit"
+          fi
+          # The XDG autostart entry installed alongside it would otherwise keep
+          # trying to start a unit that is no longer there.
+          prev_autostart="$prev_home/.config/autostart/ghostframe-attach.desktop"
+          if [[ -n "$prev_home" && -e "$prev_autostart" ]]; then
+            info "remove: $prev_autostart (attach autostart, unused in headless mode)"
+            rm -f "$prev_autostart"
           fi
         fi
         info "remove: $lightdm_dropin (autologin is not used in headless mode)"
@@ -396,6 +403,8 @@ if [[ "$mode" == "headless" ]]; then
 else
   [[ -f "$pkg_dir/systemd/ghostframe-xdaemon-attach.service.tmpl" ]] || die "missing $pkg_dir/systemd/ghostframe-xdaemon-attach.service.tmpl"
   [[ -f "$pkg_dir/lightdm-autologin.conf.tmpl" ]] || die "missing $pkg_dir/lightdm-autologin.conf.tmpl"
+  [[ -f "$pkg_dir/ghostframe-attach-autostart.desktop.tmpl" ]] \
+    || die "missing $pkg_dir/ghostframe-attach-autostart.desktop.tmpl"
 fi
 
 # 1. Preflight.
@@ -591,6 +600,17 @@ if [[ "$mode" == "attach" ]]; then
   sed "s|__MAX_RESOLUTION__|$max_resolution|g" "$pkg_dir/systemd/ghostframe-xdaemon-attach.service.tmpl" \
     | install -m 0644 -o "$user_uid" -g "$user_gid" /dev/stdin "$xdaemon_unit_dst"
   info "GHOSTFRAME_ATTACH_MAX_RESOLUTION=$max_resolution (set in $xdaemon_unit_dst)"
+
+  # XDG autostart, because WantedBy=graphical-session.target is not enough: not
+  # every desktop activates that target, and one that does not leaves a
+  # correctly installed and enabled service that never runs, silently. See the
+  # template's own comment for the measurement.
+  autostart_dir="$user_home/.config/autostart"
+  install -d -m 0755 -o "$user_uid" -g "$user_gid" "$autostart_dir"
+  autostart_dst="$autostart_dir/ghostframe-attach.desktop"
+  info "install: $autostart_dst"
+  install -m 0644 -o "$user_uid" -g "$user_gid" \
+    "$pkg_dir/ghostframe-attach-autostart.desktop.tmpl" "$autostart_dst"
 else
   for u in ghostframe.target ghostframe-wm.service ghostframe-xdaemon.service; do
     info "install: $user_units_dir/$u"
