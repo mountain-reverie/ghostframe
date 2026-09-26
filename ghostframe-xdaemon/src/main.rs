@@ -31,12 +31,12 @@ fn state_dir_seeded(state_dir: &Path) -> bool {
 
 /// Block until `$DISPLAY` accepts an X11 connection, or the timeout expires.
 ///
-/// systemd's `After=ghostframe-wm.service` only guarantees enlightenment_start
-/// was launched, not that Xorg finished initialising. Without this gate the
-/// daemon would happily bring up tsnet (a ~5s operation) against a missing or
-/// crashed X server, and the only symptom downstream would be "no frames" —
-/// the actual failure (Xwrapper denial, vt conflict, etc.) lives only in
-/// ghostframe-xorg.service's journal.
+/// In headless mode, systemd's `After=ghostframe-wm.service` only guarantees
+/// enlightenment_start was launched, not that Xorg finished initialising. In
+/// attach mode `After=graphical-session.target` says nothing about whether the
+/// operator's session will accept a new client. Either way, without this gate
+/// the daemon would bring up tsnet (a ~5s operation) against an X server it
+/// cannot talk to, and the only symptom downstream would be "no frames".
 fn wait_for_x11(timeout: Duration) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     let mut attempt: u32 = 0;
@@ -148,9 +148,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .is_some();
     if !init_mode && !skip_x11_wait {
         if let Err(msg) = wait_for_x11(Duration::from_secs(10)) {
+            // Name both deployments. This hint used to point only at
+            // ghostframe-xorg.service, which does not exist in attach mode --
+            // so the one message an operator gets on the most common startup
+            // failure sent them looking for a unit that was never installed.
+            let dpy = env::var("DISPLAY").unwrap_or_else(|_| "(unset)".into());
             tracing::error!(
-                "{msg}\nCheck the upstream service: \
-                 `systemctl --user status ghostframe-xorg.service`"
+                "{msg}\n\
+                 - headless mode (ghostframe runs its own X server): check it with\n\
+                 \x20   `systemctl --user status ghostframe-xorg.service`\n\
+                 - attach mode (ghostframe captures an existing session): the display\n\
+                 \x20   is not ghostframe's to start. Confirm this user can open it:\n\
+                 \x20   `DISPLAY={dpy} xrandr --current`\n\
+                 \x20   The same failure there means the X server refused the\n\
+                 \x20   connection -- a wedged or exited session, not a ghostframe\n\
+                 \x20   misconfiguration."
             );
             std::process::exit(2);
         }
