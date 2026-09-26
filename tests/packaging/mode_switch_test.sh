@@ -24,11 +24,20 @@ check_present() { [[   -e "$1" ]] || { echo "FAIL: $1 should exist"; fail=1; }; 
 UNITS="${GHOSTFRAME_TEST_UNIT_DIR:?set to a throwaway unit dir}"
 mkdir -p "$UNITS"
 
+dropin="$UNITS/99-ghostframe-autologin.conf"
+getty_dropin="$UNITS/99-ghostframe-getty.conf"
+
+# ALWAYS call through this, never remove_other_mode_units directly: its 3rd and
+# 4th arguments default to real paths under /etc, and an earlier version of this
+# test omitted them and tried to delete this machine's actual getty drop-in. It
+# survived only because the test does not run as root -- install.sh does.
+switch_to() { remove_other_mode_units "$1" "$UNITS" "$dropin" "$getty_dropin"; }
+
 # A headless install has left its units behind; we are now switching to attach.
 touch "$UNITS/ghostframe-xorg.service" "$UNITS/ghostframe-wm.service" \
       "$UNITS/ghostframe.target" "$UNITS/ghostframe-xdaemon.service"
 
-remove_other_mode_units attach "$UNITS"
+switch_to attach
 check_absent  "$UNITS/ghostframe-xorg.service"
 check_absent  "$UNITS/ghostframe-wm.service"
 check_absent  "$UNITS/ghostframe.target"
@@ -37,28 +46,27 @@ check_present "$UNITS/ghostframe-xdaemon.service"
 # And the reverse: switching to headless must not delete the headless units.
 touch "$UNITS/ghostframe-xorg.service" "$UNITS/ghostframe-wm.service" \
       "$UNITS/ghostframe.target"
-remove_other_mode_units headless "$UNITS"
+switch_to headless
 check_present "$UNITS/ghostframe-xorg.service"
 check_present "$UNITS/ghostframe-wm.service"
 check_present "$UNITS/ghostframe.target"
 check_present "$UNITS/ghostframe-xdaemon.service"
 
 # Calling it twice must be safe -- install.sh may be re-run at any time.
-remove_other_mode_units attach "$UNITS"
-remove_other_mode_units attach "$UNITS"
+switch_to attach
+switch_to attach
 check_absent "$UNITS/ghostframe-xorg.service"
 
 # Switching to headless must remove attach's lightdm autologin drop-in.
 # Leaving it means lightdm autologins the operator AND the headless getty
 # autologins guest: two graphical sessions on one GPU, the exact contention
 # this cleanup exists to prevent.
-dropin="$UNITS/99-ghostframe-autologin.conf"
 printf '[Seat:*]\nautologin-user=%s\nautologin-user-timeout=0\n' "$USER" > "$dropin"
-remove_other_mode_units headless "$UNITS" "$dropin"
+switch_to headless
 check_absent "$dropin"
 
 # ...and it must be safe when the drop-in is not there.
-remove_other_mode_units headless "$UNITS" "$dropin"
+switch_to headless
 
 # A switch that also CHANGES the target user does not overwrite the attach unit
 # in place -- it lands in the new user's directory while the old one keeps
@@ -75,7 +83,7 @@ printf '[Seat:*]\nautologin-user=%s\n' "$USER" > "$dropin"
 # someone else so $USER counts as the *previous* user.
 target_user="definitely-not-$USER"
 getent() { printf '%s:x:0:0::%s:/bin/sh\n' "$USER" "$TEST_PREV_HOME"; }
-remove_other_mode_units headless "$UNITS" "$dropin"
+switch_to headless
 unset -f getent
 check_absent "$TEST_PREV_UNIT"
 check_absent "$dropin"
@@ -86,9 +94,50 @@ touch "$TEST_PREV_UNIT"
 printf '[Seat:*]\nautologin-user=%s\n' "$USER" > "$dropin"
 target_user="$USER"
 getent() { printf '%s:x:0:0::%s:/bin/sh\n' "$USER" "$TEST_PREV_HOME"; }
-remove_other_mode_units headless "$UNITS" "$dropin"
+switch_to headless
 unset -f getent
 check_present "$TEST_PREV_UNIT"
+
+# --- headless -> attach, where the headless stack belongs to ANOTHER user ----
+#
+# This is the real-world case: headless installs under `guest`, attach installs
+# under the operator's own account. The target user's unit dir is then EMPTY,
+# so a cleanup that only looks there leaves guest's whole stack enabled and
+# running -- a second daemon, a second tsnet node, and two X servers on one GPU.
+# The getty autologin drop-in records who that user was.
+GUEST_HOME="$UNITS/guesthome"
+GUEST_DIR="$GUEST_HOME/.config/systemd/user"
+mkdir -p "$GUEST_DIR"
+for u in ghostframe-xorg.service ghostframe-wm.service ghostframe.target \
+         ghostframe-xdaemon.service; do
+  touch "$GUEST_DIR/$u"
+done
+printf '[Service]\nExecStart=\nExecStart=-/sbin/agetty --autologin %s --noclear %%I $TERM\n' \
+  "$USER" > "$getty_dropin"
+
+target_user="definitely-not-$USER"
+user_uid=""
+getent() { printf '%s:x:0:0::%s:/bin/sh\n' "$USER" "$GUEST_HOME"; }
+switch_to attach
+unset -f getent
+
+for u in ghostframe-xorg.service ghostframe-wm.service ghostframe.target \
+         ghostframe-xdaemon.service; do
+  check_absent "$GUEST_DIR/$u"
+done
+check_absent "$getty_dropin"
+
+# Same user: the xdaemon unit is overwritten in place by the install that
+# follows, so removing it here would delete what is about to be rewritten.
+mkdir -p "$GUEST_DIR"
+touch "$GUEST_DIR/ghostframe-xdaemon.service"
+printf '[Service]\nExecStart=-/sbin/agetty --autologin %s --noclear %%I $TERM\n' \
+  "$USER" > "$getty_dropin"
+target_user="$USER"
+getent() { printf '%s:x:0:0::%s:/bin/sh\n' "$USER" "$GUEST_HOME"; }
+switch_to attach
+unset -f getent
+check_present "$GUEST_DIR/ghostframe-xdaemon.service"
 
 # --- require_lightdm's main-conf override warning -------------------------
 #

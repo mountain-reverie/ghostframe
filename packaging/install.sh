@@ -166,25 +166,64 @@ require_lightdm() {
 #
 # The third argument exists so the packaging test can point the lightdm cleanup
 # at a throwaway path instead of /etc.
+# Stop, disable and delete $units (a space-separated list) from $dir, running
+# the systemctl calls as $user. `|| true` throughout: a unit may already be
+# stopped or disabled, and the user may have no running session to talk to.
+# We are asserting an end state, not performing a transition.
+purge_units() {
+  local user="$1" uid="$2" dir="$3" why="$4" u
+  shift 4
+  for u in "$@"; do
+    [[ -e "$dir/$u" ]] || continue
+    info "remove: $dir/$u ($why)"
+    if [[ -n "$user" ]]; then
+      run_as_user "$user" "$uid" systemctl --user stop "$u" 2>/dev/null || true
+      run_as_user "$user" "$uid" systemctl --user disable "$u" 2>/dev/null || true
+    fi
+    rm -f "$dir/$u"
+  done
+}
+
 remove_other_mode_units() {
-  local target_mode="$1" unit_dir="$2" u
+  local target_mode="$1" unit_dir="$2"
   local lightdm_dropin="${3:-/etc/lightdm/lightdm.conf.d/99-ghostframe-autologin.conf}"
+  local getty_dropin="${4:-/etc/systemd/system/getty@tty1.service.d/99-ghostframe-autologin.conf}"
   case "$target_mode" in
     attach)
-      for u in ghostframe-xorg.service ghostframe-wm.service ghostframe.target; do
-        if [[ -e "$unit_dir/$u" ]]; then
-          info "remove: $unit_dir/$u (not used in attach mode)"
-          # `|| true` throughout: the unit may already be stopped/disabled,
-          # and the target user may have no running session to talk to (or,
-          # under test, no $target_user at all). Neither is an error -- we
-          # are asserting an end state, not performing a transition.
-          if [[ -n "${target_user:-}" ]]; then
-            run_as_user "${target_user:-}" "${user_uid:-}" systemctl --user stop "$u" 2>/dev/null || true
-            run_as_user "${target_user:-}" "${user_uid:-}" systemctl --user disable "$u" 2>/dev/null || true
+      purge_units "${target_user:-}" "${user_uid:-}" "$unit_dir" "not used in attach mode" \
+        ghostframe-xorg.service ghostframe-wm.service ghostframe.target
+
+      # The headless stack usually belongs to a DIFFERENT user -- `guest` is
+      # the documented default -- in which case none of the above is in
+      # $unit_dir at all and the entire headless stack keeps running: a second
+      # daemon, a second tsnet node, and two X servers on one GPU, which is the
+      # contention attach mode exists to avoid. The getty autologin drop-in
+      # records who that user was, mirroring how the lightdm drop-in records
+      # the attach user for the reverse switch.
+      #
+      # ghostframe-xdaemon.service is in this list and not the one above: for
+      # the same user it is overwritten in place by the install that follows,
+      # but a different user's copy would keep running.
+      if [[ -f "$getty_dropin" ]]; then
+        local prev_user prev_home prev_uid
+        prev_user=$(sed -n 's/.*--autologin[[:space:]]\{1,\}\([^[:space:]]\{1,\}\).*/\1/p' \
+          "$getty_dropin" | head -1)
+        if [[ -n "$prev_user" && "$prev_user" != "${target_user:-}" ]]; then
+          prev_home=$(getent passwd "$prev_user" 2>/dev/null | cut -d: -f6)
+          prev_uid=$(id -u "$prev_user" 2>/dev/null || true)
+          if [[ -n "$prev_home" ]]; then
+            purge_units "$prev_user" "$prev_uid" "$prev_home/.config/systemd/user" \
+              "headless unit for '$prev_user', unused in attach mode" \
+              ghostframe-xorg.service ghostframe-wm.service ghostframe.target \
+              ghostframe-xdaemon.service
           fi
-          rm -f "$unit_dir/$u"
         fi
-      done
+        # Removing this leaves tty1 a NORMAL login getty rather than one that
+        # autologins the headless account. getty@tty1 itself is deliberately
+        # left enabled: a console login is useful and not ours to take away.
+        info "remove: $getty_dropin (autologin is not used in attach mode)"
+        rm -f "$getty_dropin"
+      fi
       ;;
     headless)
       # The attach unit uses the same filename (ghostframe-xdaemon.service), so
