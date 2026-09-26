@@ -55,6 +55,8 @@ pub struct Renderer {
     pending_solid: Vec<(u8, u8, [u8; 4])>,
     pending_palrle: Vec<(u8, u8, u8, u8, Vec<u8>)>,
     pending_cdf53: Vec<Cdf53PassEntry>,
+    /// `TileReady` tiles awaiting upload, batched by [`Renderer::flush`].
+    pending_rgba: Vec<(u8, u8, Vec<u8>)>,
 
     /// How many PPM dumps have been written, against
     /// `GHOSTFRAME_CLIENT_DUMP_COUNT`. Counts attempts, not successes -- see
@@ -204,6 +206,7 @@ impl Renderer {
             pending_solid: Vec::new(),
             pending_palrle: Vec::new(),
             pending_cdf53: Vec::new(),
+            pending_rgba: Vec::new(),
             dumps_written: 0,
             flushes: 0,
             h264_decoder,
@@ -233,11 +236,14 @@ impl Renderer {
                 // Not the path this crate exists to test (that's
                 // `TilePayload`, decoded by the real WGSL below), but a
                 // valid event this renderer must still handle correctly:
-                // the bytes are already final RGBA pixels, so upload them
-                // straight into the framebuffer, same as `pipelines::raw`
-                // does for `Codec::Raw` (short of the BGRA swizzle, since
-                // there is none to do here).
-                upload_rgba_tile(&ctx.queue, &self.fb, *tile_x, *tile_y, rgba);
+                // the bytes are already final RGBA pixels.
+                //
+                // Buffered rather than uploaded here, and batched in `flush`.
+                // One `write_texture` per tile costs ~178us on a Pinebook Pro
+                // regardless of size -- almost entirely CPU-side call overhead
+                // -- so a full 1920x1080 repaint spent 363ms just issuing 2040
+                // of them. See `upload_pending_rgba`.
+                self.pending_rgba.push((*tile_x, *tile_y, rgba.clone()));
                 self.ring.mark_dirty(*tile_x as u32, *tile_y as u32);
             }
             Event::TilePayload {
@@ -352,6 +358,8 @@ impl Renderer {
                 .decode(&ctx.device, &ctx.queue, &self.fb, &self.pending_palrle);
             self.pending_palrle.clear();
         }
+        self.upload_pending_rgba(ctx);
+
         if !self.pending_cdf53.is_empty() {
             self.cdf53
                 .integrate(&ctx.device, &ctx.queue, &self.pending_cdf53);
@@ -361,6 +369,115 @@ impl Renderer {
 
         self.flushes = self.flushes.saturating_add(1);
         self.maybe_dump_framebuffer(ctx);
+    }
+
+    /// Upload every buffered `TileReady` tile, coalesced into as few
+    /// `write_texture` calls as the dirty set allows.
+    ///
+    /// **Why this exists.** `write_texture` costs about the same whatever it
+    /// carries: measured on a Pinebook Pro (Mali-T860), 2040 calls of 32x32
+    /// took 363ms while a single 1920x1080 call carrying more bytes took
+    /// 18.6ms -- and `issue` time equalled total time in both, so it is CPU-side
+    /// per-call overhead, not pixel throughput. A full-screen repaint was
+    /// therefore ~3fps, bounded entirely by call count.
+    ///
+    /// So the dirty tiles are merged into rectangles with the same
+    /// [`crate::coalesce`] pass the export ring already uses for damage, each
+    /// rectangle is assembled into one contiguous buffer, and each becomes one
+    /// upload. A full repaint collapses to a single call.
+    ///
+    /// Tiles whose payload is shorter than a full tile do not take part in a
+    /// rectangle and are uploaded individually. A rectangle assumes every tile
+    /// inside it supplies all its rows; a short one would leave the remainder
+    /// as buffer fill and write black over live pixels, which is a silent
+    /// corruption rather than a dropped update.
+    fn upload_pending_rgba(&mut self, ctx: &WgpuContext) {
+        if self.pending_rgba.is_empty() {
+            return;
+        }
+        let full_tile_bytes = (TILE_SIZE * TILE_SIZE * 4) as usize;
+        let pending = std::mem::take(&mut self.pending_rgba);
+
+        // Short payloads keep the old one-call-each path; see the doc above.
+        let (full, short): (Vec<_>, Vec<_>) = pending
+            .into_iter()
+            .partition(|(_, _, rgba)| rgba.len() >= full_tile_bytes);
+        for (tx, ty, rgba) in &short {
+            upload_rgba_tile(&ctx.queue, &self.fb, *tx, *ty, rgba);
+        }
+        if full.is_empty() {
+            return;
+        }
+
+        // Last write wins for a tile that arrived twice in one batch, matching
+        // the per-tile path's ordering.
+        let mut by_tile: std::collections::HashMap<(u32, u32), &[u8]> =
+            std::collections::HashMap::with_capacity(full.len());
+        let (cols, rows) = tile_grid(self.fb.width, self.fb.height);
+        let mut grid = crate::dirty::DirtyGrid::new(cols, rows);
+        for (tx, ty, rgba) in &full {
+            let (tx, ty) = (*tx as u32, *ty as u32);
+            if tx >= cols || ty >= rows {
+                continue;
+            }
+            grid.set(tx, ty);
+            by_tile.insert((tx, ty), rgba.as_slice());
+        }
+
+        let row_bytes = (TILE_SIZE * 4) as usize;
+        for rect in crate::coalesce::coalesce(&grid) {
+            let px = rect.to_pixels(self.fb.width, self.fb.height);
+            if px.w == 0 || px.h == 0 {
+                continue;
+            }
+            let dst_row_bytes = px.w as usize * 4;
+            let mut buf = vec![0u8; dst_row_bytes * px.h as usize];
+
+            for ty in rect.y..rect.y + rect.h {
+                for tx in rect.x..rect.x + rect.w {
+                    // `coalesce` emits rectangles covering exactly the set
+                    // tiles, so every tile here was inserted above.
+                    let Some(src) = by_tile.get(&(tx, ty)) else {
+                        continue;
+                    };
+                    let dx = (tx - rect.x) as usize * TILE_SIZE as usize;
+                    let dy = (ty - rect.y) as usize * TILE_SIZE as usize;
+                    // Clip against the rectangle, which is itself already
+                    // clamped to the framebuffer edge.
+                    let w = (TILE_SIZE as usize).min(px.w as usize - dx);
+                    let h = (TILE_SIZE as usize).min(px.h as usize - dy);
+                    for row in 0..h {
+                        let s = row * row_bytes;
+                        let d = (dy + row) * dst_row_bytes + dx * 4;
+                        buf[d..d + w * 4].copy_from_slice(&src[s..s + w * 4]);
+                    }
+                }
+            }
+
+            ctx.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: self.fb.texture(),
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: px.x,
+                        y: px.y,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &buf,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(px.w * 4),
+                    rows_per_image: Some(px.h),
+                },
+                wgpu::Extent3d {
+                    width: px.w,
+                    height: px.h,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
     }
 
     /// Seal a generation and hand out an export buffer, if one is free.
