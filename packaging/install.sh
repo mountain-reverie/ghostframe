@@ -657,6 +657,17 @@ if [[ -f "$state_dir/tailscaled.state" ]]; then
   seeded=1
 elif [[ -t 0 ]]; then
   info ""
+  # Name the path before prompting. Without this the only symptom of a state dir
+  # in the wrong place is being asked for a key you should not have needed, with
+  # nothing on screen to say where the script looked -- and answering it
+  # registers a SECOND node that then competes for the same hostname.
+  info "no tailscaled.state found at:"
+  info "  $state_dir"
+  info "so this will register a NEW tailnet node named $(hostname)-ghostframe."
+  info "If you moved an existing state dir here, stop and check that path first."
+  info "(A nested ts-state/ts-state/ is the usual cause: 'mv src dst' puts src"
+  info " INSIDE dst when dst already exists.)"
+  info ""
   info "Paste your Tailscale auth key (input hidden; tskey-auth-... format):"
   read -r -s ts_authkey
   info ""
