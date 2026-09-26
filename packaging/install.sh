@@ -224,6 +224,27 @@ remove_other_mode_units() {
         info "remove: $getty_dropin (autologin is not used in attach mode)"
         rm -f "$getty_dropin"
       fi
+
+      # A PREVIOUS ATTACH install may also have belonged to another user --
+      # re-pointing attach mode from one account to another is a normal thing to
+      # do, and the getty drop-in above cannot help because the first attach
+      # install already deleted it. The lightdm drop-in records that user. We do
+      # not remove the drop-in here: the install that follows overwrites it with
+      # the new user.
+      if [[ -f "$lightdm_dropin" ]]; then
+        local prev_attach prev_attach_home
+        prev_attach=$(sed -n 's/^[[:space:]]*autologin-user[[:space:]]*=[[:space:]]*//p' \
+          "$lightdm_dropin" | head -1)
+        if [[ -n "$prev_attach" && "$prev_attach" != "${target_user:-}" ]]; then
+          prev_attach_home=$(getent passwd "$prev_attach" 2>/dev/null | cut -d: -f6)
+          if [[ -n "$prev_attach_home" ]]; then
+            purge_units "$prev_attach" "$(id -u "$prev_attach" 2>/dev/null || true)" \
+              "$prev_attach_home/.config/systemd/user" \
+              "attach unit for '$prev_attach', replaced by '${target_user:-}'" \
+              ghostframe-xdaemon.service
+          fi
+        fi
+      fi
       ;;
     headless)
       # The attach unit uses the same filename (ghostframe-xdaemon.service), so

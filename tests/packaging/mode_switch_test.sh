@@ -139,6 +139,36 @@ switch_to attach
 unset -f getent
 check_present "$GUEST_DIR/ghostframe-xdaemon.service"
 
+# --- attach -> attach, re-pointed at a DIFFERENT user -----------------------
+#
+# Re-pointing attach mode from one account to another is a normal thing to do,
+# and the getty drop-in cannot help: the first attach install already deleted it.
+# The lightdm drop-in records the previous attach user. Without this, the old
+# user's daemon stays enabled and two daemons share one tsnet state dir.
+OLD_HOME="$UNITS/oldattach"
+OLD_DIR="$OLD_HOME/.config/systemd/user"
+mkdir -p "$OLD_DIR"
+touch "$OLD_DIR/ghostframe-xdaemon.service"
+printf '[Seat:*]\nautologin-user=%s\n' "$USER" > "$dropin"
+rm -f "$getty_dropin"          # already gone after the first attach install
+target_user="definitely-not-$USER"
+getent() { printf '%s:x:0:0::%s:/bin/sh\n' "$USER" "$OLD_HOME"; }
+switch_to attach
+unset -f getent
+check_absent "$OLD_DIR/ghostframe-xdaemon.service"
+# The drop-in itself must survive -- the install that follows rewrites it.
+check_present "$dropin"
+
+# Re-running for the SAME user must not delete the unit about to be rewritten.
+mkdir -p "$OLD_DIR"
+touch "$OLD_DIR/ghostframe-xdaemon.service"
+printf '[Seat:*]\nautologin-user=%s\n' "$USER" > "$dropin"
+target_user="$USER"
+getent() { printf '%s:x:0:0::%s:/bin/sh\n' "$USER" "$OLD_HOME"; }
+switch_to attach
+unset -f getent
+check_present "$OLD_DIR/ghostframe-xdaemon.service"
+
 # --- require_lightdm's main-conf override warning -------------------------
 #
 # lightdm reads lightdm.conf AFTER lightdm.conf.d, so an uncommented
