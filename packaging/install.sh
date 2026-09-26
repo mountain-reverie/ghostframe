@@ -105,19 +105,29 @@ run_as_user() {
 # through leaves a previously-working headless install with an attach unit
 # (DISPLAY=:0, PartOf=graphical-session.target) and no headless stack behind it.
 # It is a pure precondition; it belongs with the other probing.
-require_lightdm() {
-  local dm_unit="" cand
+# Echoes the active display manager's unit name, or nothing if none is found.
+# Split out from require_lightdm so tests can stub it: otherwise the checks
+# below can only be exercised on a host that already runs the display manager
+# under test, which is how the first version of this passed locally (evangeline
+# runs lightdm) and died on a CI runner that has no display manager at all.
+detect_display_manager() {
   if [[ -L /etc/systemd/system/display-manager.service ]]; then
-    dm_unit=$(basename "$(readlink -f /etc/systemd/system/display-manager.service)")
-  else
-    for cand in lightdm gdm gdm3 sddm; do
-      if systemctl is-active --quiet "$cand.service" 2>/dev/null \
-        || systemctl is-enabled --quiet "$cand.service" 2>/dev/null; then
-        dm_unit="$cand.service"
-        break
-      fi
-    done
+    basename "$(readlink -f /etc/systemd/system/display-manager.service)"
+    return
   fi
+  local cand
+  for cand in lightdm gdm gdm3 sddm; do
+    if systemctl is-active --quiet "$cand.service" 2>/dev/null \
+      || systemctl is-enabled --quiet "$cand.service" 2>/dev/null; then
+      echo "$cand.service"
+      return
+    fi
+  done
+}
+
+require_lightdm() {
+  local dm_unit
+  dm_unit=$(detect_display_manager)
   case "$dm_unit" in
     lightdm.service) info "ok: display manager is lightdm." ;;
     "")
