@@ -125,9 +125,25 @@ fn handle_core_event(
     true
 }
 
+/// Build the GPU context *on this thread*, then run the render loop.
+///
+/// The context is constructed here rather than by the caller because a GL
+/// context is current per-thread: `WgpuContext` records the thread that
+/// created it and asserts on it (see `wgpu_ctx.rs`'s `assert_render_thread`),
+/// and on the GLES backend using it from another thread is undefined
+/// behaviour that merely happens to work sometimes. Constructing it on the
+/// caller's thread and moving it here panicked this thread at the first
+/// export -- a black window, because nothing else is wrong enough to fail
+/// loudly.
+///
+/// `ready` carries the construction result back so `Client::connect` can
+/// still report "no adapter" / "cannot export" synchronously, which is why
+/// the caller built it in the first place. The caller blocks on it, so the
+/// error surfaces from `connect` exactly as before; only the thread it is
+/// built on changed.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
-    ctx: WgpuContext,
+    ready: std::sync::mpsc::Sender<Result<(), crate::ClientError>>,
     rx: Receiver<RenderMsg>,
     queue: Arc<EventQueue>,
     published: Arc<Mutex<Option<PublishedFrame>>>,
@@ -136,6 +152,18 @@ pub(crate) fn run(
     preferred_modifiers: Vec<u64>,
     open_h264_eagerly: bool,
 ) {
+    let ctx = match WgpuContext::new() {
+        Ok(ctx) => {
+            // Ignore a send failure: it only means `connect` gave up first,
+            // and there is nothing useful to do about it here.
+            let _ = ready.send(Ok(()));
+            ctx
+        }
+        Err(e) => {
+            let _ = ready.send(Err(crate::ClientError::Gpu(e)));
+            return;
+        }
+    };
     let mut renderer: Option<Renderer> = None;
     // `0` means "the embedder didn't specify a count"; a `Renderer` with
     // zero export buffers is a rejected config (it could never publish a

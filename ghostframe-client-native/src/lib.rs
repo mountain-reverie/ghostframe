@@ -29,7 +29,6 @@ use std::time::Instant;
 
 pub use ghostframe_client_core::ClientDisplay;
 pub use ghostframe_client_gpu::ring::PublishedFrame;
-use ghostframe_client_gpu::wgpu_ctx::WgpuContext;
 use ghostframe_client_net::{ClientNet, ClientNetConfig};
 use ghostframe_tsnet::{GhostbridgeConfig, GhostbridgeHandle};
 
@@ -314,12 +313,19 @@ impl Client {
         // returned, open fd.
         let udp_fd = unsafe { OwnedFd::from_raw_fd(udp_fd) };
 
-        // GPU device construction happens here, synchronously on the
-        // caller's thread, rather than inside the render thread: a failure
-        // (no Vulkan adapter, no dmabuf export support) should surface
-        // from `connect` itself rather than as an asynchronous event the
-        // caller might not be listening for yet.
-        let ctx = WgpuContext::new()?;
+        // GPU device construction happens on the RENDER thread (see
+        // `render_thread::run`), because a GL context is current per-thread
+        // and the GLES backend asserts on it. It used to happen here, and on
+        // that backend the result was a thread panic at the first export --
+        // i.e. a black window.
+        //
+        // The original reason for doing it here still holds, though: a
+        // failure (no adapter, no dmabuf export) must surface from `connect`
+        // itself rather than as an asynchronous event the caller may not be
+        // listening for yet. So the render thread sends the construction
+        // result back over `gpu_ready` and this function blocks on it below,
+        // which preserves that behaviour exactly.
+        let (gpu_ready_tx, gpu_ready_rx) = mpsc::channel();
 
         let base = Instant::now();
         let net_config = ClientNetConfig {
@@ -361,7 +367,7 @@ impl Client {
             .name("gf-render".into())
             .spawn(move || {
                 render_thread::run(
-                    ctx,
+                    gpu_ready_tx,
                     render_rx,
                     render_queue,
                     published,
@@ -372,6 +378,20 @@ impl Client {
                 )
             })
             .map_err(ClientError::Io)?;
+
+        // Block until the render thread has a GPU context, so `connect`
+        // still fails synchronously on an unusable adapter. A closed channel
+        // means the thread died before reporting, which is a bug in it rather
+        // than a GPU problem -- say so instead of reporting a GPU error.
+        match gpu_ready_rx.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(ClientError::Io(std::io::Error::other(
+                    "render thread exited before reporting GPU readiness",
+                )))
+            }
+        }
 
         let net_queue = Arc::clone(&self.queue);
         let net_render_tx = render_tx.clone();
