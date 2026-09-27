@@ -57,6 +57,13 @@ lint-client:
 # run `test-client-gles` instead.
 check-gles:
     cargo clippy -p ghostframe-client-gpu --no-default-features --features gles,test-support --all-targets -- -D warnings
+    # The whole chain, not just client-gpu. Cargo unions features across the
+    # entire graph, so a crate further up that depends on client-h264 with
+    # defaults left on re-enables `vaapi` and collides with the `v4l2` that
+    # `gles` selects -- from a manifest the line above never looks at. That
+    # happened: client-native had exactly that dependency, and a client-gpu-only
+    # gate reported green while `just build-client-gles` could not link.
+    cargo check -p ghostframe-cli --no-default-features --features gles
 
 # The V4L2 stateless H.264 decode backend, for a machine with no VA-API driver.
 # Comes along with `check-gles` (the `gles` feature forwards to it), and checked

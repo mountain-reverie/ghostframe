@@ -8,7 +8,13 @@ ghostframe-protocol = { path = "../ghostframe-protocol" }
 ghostframe-client-core = { path = "../ghostframe-client-core" }
 ghostframe-client-net = { path = "../ghostframe-client-net" }
 ghostframe-client-gpu = { path = "../ghostframe-client-gpu", default-features = false }
-ghostframe-client-h264 = { path = "../ghostframe-client-h264" }
+# `default-features = false`: the decode backend follows this crate's
+# `vulkan`/`gles` feature, forwarded below, not the dependency's default.
+# Leaving defaults on re-enables `vaapi` and collides with the `v4l2` that
+# `gles` selects -- and because cargo unions features across the whole graph,
+# it does so from HERE even though `ghostframe-client-gpu` gets it right, which
+# surfaces as that crate's mutually-exclusive-backends `compile_error!`.
+ghostframe-client-h264 = { path = "../ghostframe-client-h264", default-features = false }
 ghostframe-tsnet = { path = "../ghostframe-tsnet" }
 libc = { workspace = true }
 thiserror = { workspace = true }
@@ -21,5 +27,5 @@ tracing = { workspace = true }
 # having an opinion.
 [features]
 default = ["vulkan"]
-vulkan = ["ghostframe-client-gpu/vulkan"]
-gles = ["ghostframe-client-gpu/gles"]
+vulkan = ["ghostframe-client-gpu/vulkan", "ghostframe-client-h264/vaapi"]
+gles = ["ghostframe-client-gpu/gles", "ghostframe-client-h264/v4l2"]

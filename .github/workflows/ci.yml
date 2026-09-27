@@ -56,6 +56,12 @@ jobs:
       # must be checked: a feature nobody builds is already broken. Hardware
       # verification is `just test-client-gles` on a GLES 3.1 device.
       - run: cargo clippy -p ghostframe-client-gpu --no-default-features --features gles,test-support --all-targets -- -D warnings
+      # And the whole chain under `gles`, because cargo unions features across
+      # the graph: a crate further up depending on ghostframe-client-h264 with
+      # defaults left on re-enables `vaapi`, collides with `v4l2`, and the
+      # client-gpu-only check above stays green while the binary cannot link.
+      # Measured -- ghostframe-client-native had exactly that dependency.
+      - run: cargo check -p ghostframe-cli --no-default-features --features gles
       # The V4L2 stateless decode backend, for the same reason. It comes along
       # with `gles` above, but is checked on its own too so a break is
       # attributed to the decoder rather than to the GPU backend -- and so the
