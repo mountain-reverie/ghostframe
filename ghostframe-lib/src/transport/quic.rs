@@ -31,6 +31,13 @@ pub struct QuicServer {
     pub connections: HashMap<ConnectionHandle, Connection>,
     /// Certificate fingerprint for browser pinning.
     pub(crate) cert_info: CertInfo,
+    /// Stray `ConnectionEvent`s for handles we no longer hold, counted rather
+    /// than each logged. A client that goes away leaves packets in flight, and
+    /// one departure produced 208 identical warnings in a single burst in the
+    /// field. journald rate-limits a burst like that and drops a window of
+    /// unrelated lines with it -- so the flood does not merely add noise, it
+    /// destroys the log around the very event being diagnosed.
+    unknown_conn_events: u64,
 }
 
 /// Bytes of un-ACKed datagrams quinn will hold before `send_datagram`
@@ -189,6 +196,7 @@ impl QuicServer {
             endpoint,
             connections: HashMap::new(),
             cert_info: CertInfo { sha256_hex },
+            unknown_conn_events: 0,
         })
     }
 
@@ -243,7 +251,20 @@ impl QuicServer {
                 if let Some(conn) = self.connections.get_mut(&handle) {
                     conn.handle_event(event);
                 } else {
-                    tracing::warn!(?handle, "ConnectionEvent for unknown connection");
+                    // Log the first, then every 64th. The fact worth knowing is
+                    // "this is happening and roughly how much", which one line
+                    // per 64 conveys as well as 208 lines and without taking
+                    // the surrounding log down with it.
+                    self.unknown_conn_events += 1;
+                    if self.unknown_conn_events == 1 || self.unknown_conn_events.is_multiple_of(64)
+                    {
+                        tracing::warn!(
+                            ?handle,
+                            total = self.unknown_conn_events,
+                            "ConnectionEvent for unknown connection \
+                             (stale packets from a departed client; rate-limited)"
+                        );
+                    }
                 }
                 None
             }
