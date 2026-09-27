@@ -400,6 +400,10 @@ pkg_dir="$repo_root/packaging"
 if [[ "$mode" == "headless" ]]; then
   [[ -f "$pkg_dir/xorg-headless-amdgpu.conf" ]] || die "missing $pkg_dir/xorg-headless-amdgpu.conf"
   [[ -f "$pkg_dir/xorg-headless-vkms.conf.tmpl" ]] || die "missing $pkg_dir/xorg-headless-vkms.conf.tmpl"
+  # Load-bearing since #100 templated the VT flags: without it the install
+  # dies on an opaque `sed: can't read` instead of naming the missing file.
+  [[ -f "$pkg_dir/systemd/ghostframe-xorg.service.tmpl" ]] \
+    || die "missing $pkg_dir/systemd/ghostframe-xorg.service.tmpl"
 else
   [[ -f "$pkg_dir/systemd/ghostframe-xdaemon-attach.service.tmpl" ]] || die "missing $pkg_dir/systemd/ghostframe-xdaemon-attach.service.tmpl"
   [[ -f "$pkg_dir/lightdm-autologin.conf.tmpl" ]] || die "missing $pkg_dir/lightdm-autologin.conf.tmpl"
