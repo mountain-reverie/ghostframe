@@ -12,11 +12,15 @@
 
 ## Read this first
 
-**If you only do one thing, do Task 4.** It is the only piece with no working
-precedent inside `cros-codecs` and the only estimate in this plan that could be
-wrong by a factor of two. Tasks 1–2 are the low-risk warm-up and are verifiable
-on an x86 box today; Task 4 is the schedule risk. The design's §12 puts it first
-for that reason, and the ordering here is for readability, not priority.
+**Task 4 was the schedule risk and no longer is — read
+[`../investigations/2026-09-26-h264-v4l2-expbuf-feasibility.md`](../investigations/2026-09-26-h264-v4l2-expbuf-feasibility.md)
+before Task 4 or Task 5.** H.264 now decodes on rkvdec through cros-codecs into
+dmabufs, byte-identical to a software golden at 640x480 and 1920x1080, with a
+runnable reference implementation in `tools/hw-probe/v4l2-expbuf-rs/`. What that
+changes: the frame type is **downstream** ghostframe code, not a fork; the two
+fork patches are 35 lines total; and three traps that produce plausible-looking
+wrong output are named there with their symptoms. Tasks 1–2 remain the low-risk
+warm-up, verifiable on an x86 box today.
 
 **Do not touch `DmabufPlanes`.** `ghostframe-client-h264/src/descriptor.rs:60` is
 what makes this port cheap: it names no FFmpeg, VA-API or Vulkan type. If you
@@ -49,11 +53,18 @@ broken — land Task 10 with Task 7, not at the end.
 it. Nothing in this plan should change that surface; if the header moves,
 something leaked out of the GPU crate that should not have.
 
-**Numbers in this plan that are guesses, not measurements:** the 150–250 line
-estimate for Task 4, the 3-frame pool depth carried from `n_export_buffers: 3`,
-and "roughly one row per two invocations" as the cost model for the Task 2
-reshape. Label them as guesses where you act on them. Every *hardware* number
-below was measured — `tools/hw-probe/` reproduces them.
+**Numbers in this plan that are guesses, not measurements:** "roughly one row
+per two invocations" as the cost model for the Task 2 reshape. Label them as
+guesses where you act on them. Every *hardware* number below was measured —
+`tools/hw-probe/` reproduces them.
+
+Two former guesses are now settled, in the opposite direction from each other.
+The 150–250 line estimate for Task 4 held (~200 lines) but the code is
+downstream rather than forked. The 3-frame pool depth carried from
+`n_export_buffers: 3` is **wrong and not ghostframe's to choose**: the decoder's
+capture pool is driver-allocated, and asking for 5 got 7 (cros-codecs adds 2,
+`"+2 due to HCMP1_HHI_A.h264 needing more"`). Size the import table from what
+the driver gives back.
 
 ---
 
@@ -66,7 +77,8 @@ below was measured — `tools/hw-probe/` reproduces them.
 | `shaders/client/cdf53_inverse_l2.wgsl` | 256 → ≤128; **has a real trap**, see Task 2 | 2 |
 | `shaders/client/palrle_decode.wgsl` | 256 → ≤128 invocations | 2 |
 | `cros-codecs` fork | Honour an explicit V4L2 device path | 3 |
-| `cros-codecs` fork | `VideoFrame` over MMAP + `VIDIOC_EXPBUF` | 4 |
+| `cros-codecs` fork | Delegate `num_planes` through `PooledVideoFrame` | 3 |
+| `ghostframe-client-h264/src/v4l2_frame.rs` | `VideoFrame` over MMAP + `VIDIOC_EXPBUF` — **downstream, not a fork** | 4 |
 | `ghostframe-client-h264/src/decoder.rs` | ffmpeg/VA-API → cros-codecs | 5 |
 | `ghostframe-client-h264/src/probe.rs` | `vainfo` ground truth → `S264` enumeration | 6 |
 | `ghostframe-client-h264/Cargo.toml` | Backend features | 5 |
@@ -248,7 +260,16 @@ RK3399 that is `/dev/video0` — the hantro **encoder** — and the decoder dies
 
 `C2V4L2DecoderOptions::video_device_path` already exists carrying
 `TODO: This is currently unused`, so honouring it is the intended fix and the
-shape upstream wants.
+shape upstream wants. Note that ghostframe drives `StatelessDecoder::new_v4l2`
+directly rather than the C2 wrapper, so the override has to reach
+`enumerate_devices` itself; the probe does it with an env var, which is fine for
+a probe and not for the library.
+
+**A second patch belongs with it, found the hard way:** `PooledVideoFrame`
+delegates every other defaulted `VideoFrame` method but not `num_planes`, so the
+override Task 4 depends on is silently discarded behind the pool and QBUF fails
+`NumPlanesMismatch(2, 1)`. One line. Both patches together are 35 added lines —
+`tools/hw-probe/v4l2-expbuf-rs/cros-codecs-0.0.6.patch`.
 
 Note the ordering constraint before designing anything cleverer: device
 selection happens in `V4L2Device::new()`, which takes no arguments, while the
@@ -265,12 +286,15 @@ it to zero.
 
 ## Task 4: A dmabuf `VideoFrame` backed by MMAP + `VIDIOC_EXPBUF`
 
-**The real work.** Everything else in this plan is bounded; this is the task
-that could surprise you.
+**Done once already, as a probe.** `tools/hw-probe/v4l2-expbuf-rs/src/main.rs`
+is a working `V4l2ExpbufVideoFrame` that decodes 60 frames bit-exactly on this
+hardware. Lift it; do not start from scratch, and do not start from upstream's
+`V4l2MmapVideoFrame`, which `todo!()`s on every contiguous format.
 
 **Files:**
-- Patch: `cros-codecs` — new `src/video_frame/v4l2_expbuf_video_frame.rs`, plus
-  queue wiring in `src/device/v4l2/stateless/queue.rs`
+- Add: `ghostframe-client-h264/src/v4l2_frame.rs` — **downstream of cros-codecs,
+  not a fork.** The trait and everything it needs (`VideoFrame`, `FramePool`,
+  `v4l2r` via `pub use`) are public, so no queue wiring is required.
 
 ### 4.1 Why GBM cannot be used, so nobody retries it
 
@@ -304,8 +328,23 @@ EXPBUF buf 0..3 plane 0 -> dmabuf fd      4 dmabuf fds exported
 ```
 
 `v4l2r 0.0.5` already provides `ioctl::expbuf()`, so the ioctl is in hand. The
-new type holds the exported `File` per buffer and reports a `FrameLayout` built
-from the capture queue's `v4l2_pix_format_mplane`.
+new type reports a `FrameLayout` built from the capture queue's
+`v4l2_pix_format_mplane`.
+
+**It must hold the exported `File` per *buffer index*, not per frame object.**
+With `V4L2_MEMORY_MMAP` the driver owns the pool and assigns an index at dequeue
+time, so one frame object sees several indices over its life; caching the fd of
+the first index it saw makes the frame read whatever picture now occupies that
+buffer. The symptom is not corruption — every frame is a real frame, just the
+wrong one, which reads as a stutter and sends you looking in the wrong place. It
+cost 40 of 60 frames in the probe. Key the table `HashMap<u32, Arc<File>>` on
+the index, export on first sight, and **key the GPU import the same way** (this
+sharpens §5.1 below).
+
+**`num_planes()` must return the V4L2 plane count, not the logical one.** rkvdec
+reports 1 for NV12 — one buffer, both planes — and `queue_with_handles` rejects
+a mismatched handle count. `get_plane_size`/`get_plane_pitch`/`map` stay
+two-entry, because those *are* the logical planes.
 
 `FrameLayout` and `PlaneLayout` are public (`cros_codecs::FrameLayout`:
 `format: (Fourcc, u64 /* modifier */)`, `size`, `planes: Vec<PlaneLayout>` with
@@ -318,20 +357,31 @@ rkvdec reports `num_planes=1`, so there is **one** buffer holding both planes an
 V4L2 does not tell you where chroma starts. `sizeimage=614400` against 460800 for
 packed 640×480 NV12 — the buffer is height-padded.
 
-Derive the chroma offset as `bytesperline × aligned_height`, where the aligned
-height comes from the driver's own numbers, **not** from the visible resolution.
-Getting this wrong yields a plausible image with shifted colour rather than an
-error. It is not hypothetical: it is what made the first hardware-vs-software
-checksum comparison differ during investigation.
+Measured, at two resolutions:
 
-Assert it. A frame decoded through this path must match a software-decoded golden
-byte for byte (Task 5's test), and that assertion is the only thing that
-distinguishes a correct offset from a nearly-correct one.
+```
+chroma_offset = bytesperline * format.height    // the driver's CODED height
+```
+
+Two things it is **not**. Not from `sizeimage` — 614400 against 460800 of actual
+pixels, the rest zero scratch, so dividing it out gives a height of 640 for a
+480-row frame. And not from the *display* height whenever that isn't 16-aligned:
+at 1080p the driver reports display 1920x1080, coded 1920x1088, and chroma starts
+at `1920 * 1088`. 640x480 is the case where the two agree, so **a test only at
+640x480 proves nothing about this** — cover a non-16-aligned height.
+
+Getting it wrong yields a plausible image with shifted colour rather than an
+error, so assert it: a frame decoded through this path must match a
+software-decoded golden byte for byte (Task 5's test). Mutation-checked in the
+probe — `CHROMA_SHIFT_ROWS=1` fails, `=0` passes.
 
 ### 4.4 Upstream it
 
-This is not ghostframe-specific: it is what any mainline-kernel SoC without
-ChromeOS's GBM needs, which is most of them. Send it with Task 3.
+The *frame type* lives in ghostframe, so there is nothing to upstream there —
+that is the finding that shrank this task. What should go upstream is the pair of
+patches in Task 3, and a note that `V4l2MmapVideoFrame`'s contiguous-format
+`todo!()` is reachable on any mainline-kernel SoC without ChromeOS's GBM, which
+is most of them.
 
 ---
 
@@ -351,11 +401,16 @@ crate; churn is expected and pinning is the accepted answer.
 `cros-codecs` takes a caller-supplied `alloc_cb` and hands back
 `PooledVideoFrame<…>`. That inverts today's per-frame import:
 
-1. At setup, allocate N frames via Task 4 and record fd + `FrameLayout` per
-   frame. N follows `Config::n_export_buffers` (3) — *a guess*, carried from the
-   export ring for symmetry, not a measurement.
-2. Import each **once** into the GPU, keyed by fd, at pool creation (Task 9).
-3. Per decoded frame, look up the already-imported texture by pool index.
+1. At setup, allocate frames via Task 4 and record fd + `FrameLayout` per
+   **V4L2 buffer index**. The count is not ghostframe's to pick: the capture
+   pool is driver-allocated, and cros-codecs asks for `min_num_frames + 2`
+   (`"+2 due to HCMP1_HHI_A.h264 needing more"`) — 5 requested became 7 on this
+   hardware. Size the table from what came back, not from
+   `Config::n_export_buffers`.
+2. Import each **once** into the GPU, keyed by buffer index, on first sight
+   (Task 9). Not keyed by frame object — see Task 4, where that mistake silently
+   reordered 40 of 60 frames.
+3. Per decoded frame, look up the already-imported texture by buffer index.
 
 `GenericDmaVideoFrame`'s `dma_handles`/`layout` are private with no accessor —
 irrelevant, because ghostframe constructs the frames and already knows every fd
@@ -545,6 +600,14 @@ export.
 Import is `eglCreateImageKHR(EGL_LINUX_DMA_BUF_EXT)` → `glEGLImageTargetTexture2DOES`
 into a GL texture name → `wgpu_hal::gles::Device::texture_from_raw(name: NonZeroU32, …)`.
 
+Measured on this hardware (`tools/hw-probe/nv12import_probe.c`): Mali's EGL lists
+50 importable dmabuf formats including `R8`, `GR88` **and** `NV12`. So the
+two-image plan works, and note that GBM refusing to *allocate* NV12 says nothing
+about importing it — those are separate answers from the same driver. rkvdec's
+output is plain linear NV12 (its luma bytes match a software decode exactly at
+the reported stride), so `DRM_FORMAT_MOD_LINEAR` is correct and there is no
+detiling step — unlike the MediaTek MM21 path cros-codecs is written around.
+
 Then collapse the per-frame import into a per-pool one, per Task 5.1: import each
 pool frame once at setup, keyed by fd, and look up by pool index per decoded
 frame. This is strictly less work per frame than the Vulkan path does today.
@@ -590,8 +653,14 @@ reference machine.
 - [ ] H.264 decodes on rkvdec through cros-codecs, **bit-exact against a
       software golden**, with the chroma-offset mutation check failing as it
       must.
-- [ ] Both cros-codecs patches submitted upstream, and the carried delta pinned
-      by commit in `[patch.crates-io]` until they land.
+- [ ] Both cros-codecs patches (device override, `PooledVideoFrame::num_planes`)
+      submitted upstream, and the carried delta pinned by commit in
+      `[patch.crates-io]` until they land.
+- [ ] The dmabuf export table and the GPU import table are both keyed by **V4L2
+      buffer index**, with a test that would catch the frame-reordering symptom
+      described in Task 4 rather than only catching corruption.
+- [ ] The bit-exactness test covers a **non-16-aligned height** (e.g. 1080), not
+      only 640x480 where display and coded height coincide.
 - [ ] The capability probe's independent ground truth is still independent — it
       does not go through `cros-codecs`.
 - [ ] `ghostframe connect` renders a live session on the reference machine
