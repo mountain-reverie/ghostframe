@@ -398,6 +398,38 @@ async fn dispatch_feedback_bytes_knows_which_session_sent_it() {
     );
 }
 
+/// The observed field bug end to end: a browser stream whose first read
+/// carries the WebTransport header AND the HELLO. Before the strip the
+/// feedback parser read 0x40 as an unknown type and dropped the buffer,
+/// HELLO with it, and the session never went live.
+#[tokio::test]
+async fn hello_coalesced_with_the_webtransport_header_makes_the_session_live() {
+    use quinn_proto::{Dir, Side, StreamId};
+    let handle = ConnectionHandle(7);
+    let mut bridge = test_bridge_with_sessions(&[handle]).await;
+    let mut hello = Vec::new();
+    crate::transport::client_caps::HelloMsg {
+        caps: crate::transport::client_caps::ClientCapabilities {
+            indices_raw_enabled: false,
+            supports_h264: true,
+        },
+    }
+    .encode(&mut hello);
+    // varint(0x41) = 40 41, then varint(session id 0).
+    let mut wire = vec![0x40, 0x41, 0x00];
+    wire.extend_from_slice(&hello);
+
+    let sid = StreamId::new(Side::Client, Dir::Bi, 1);
+    let wt = bridge.wt_sessions.get_mut(&handle).unwrap();
+    wt.test_feed_feedback_stream(sid, &wire);
+    let queued = wt.drain_feedback();
+    assert_eq!(queued.len(), 1, "premise: the read reached the queue");
+    for d in &queued {
+        bridge.dispatch_feedback_bytes(handle, d);
+    }
+    assert_eq!(bridge.last_hello_from(), Some(handle), "HELLO was dropped");
+}
+
 #[tokio::test]
 async fn forget_session_clears_last_hello_from_for_that_handle() {
     let handle_a = ConnectionHandle(7);
