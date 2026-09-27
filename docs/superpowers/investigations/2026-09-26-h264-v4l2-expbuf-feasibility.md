@@ -26,8 +26,10 @@ is what was not.
 | Will Mali's EGL import the planes? | **Yes** — `R8`, `GR88` *and* `NV12` all importable | `nv12import_probe.c`, 50 formats enumerated |
 | How many EXPBUF calls per session? | **One per buffer index** (3), not one per frame | probe log |
 
-The two cros-codecs patches this needs are **35 added lines total**, both with
-an upstream-shaped rationale: `tools/hw-probe/v4l2-expbuf-rs/cros-codecs-0.0.6.patch`.
+The cros-codecs patches this needs grew from two to **five** as the backend was
+built and CI exercised it; they live in `third_party/cros-codecs-patches/`, with
+that README recording which defect each one fixes and why the delta is long-lived
+(upstream's last commit is March 2025).
 
 ## 2. Three traps, each found by watching the probe fail
 

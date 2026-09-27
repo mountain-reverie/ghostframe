@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ghostframe <noreply@anthropic.com>
+Date: Sun, 27 Sep 2026 09:25:55 -0600
+Subject: [PATCH 3/5] image_processing: gate the MM21 NEON path on the
+ architecture, not the feature
+
+`use std::arch::aarch64::*` and the whole MM21 detiling chain that needs it
+are gated on `feature = "v4l2"` alone. The V4L2 Request API is not
+ARM-specific, so `--features v4l2` on x86-64 fails to build the crate at all:
+
+    error[E0432]: unresolved import `std::arch::aarch64`
+     --> src/image_processing.rs:15:16
+      |
+    15 | use std::arch::aarch64::*;
+      |                ^^^^^^^ could not find `aarch64` in `arch`
+
+Gating only the import is not enough -- `detile_row` still names
+`uint8x16_t`, `vld1q_u8` and `vst1q_u8`, so the build fails one error later.
+All eight `v4l2`-gated items in this file belong to the same MM21 chain and
+are gated together here: the import, `align_detile`, `detile_row`,
+`detile_plane`, `mm21_to_nv12`, the `SUPPORTED_CONVERSION` entry, the
+dispatch arm and the test.
+
+MM21 is MediaTek's tiled NV12, so this costs nothing anywhere it was
+reachable before; it lets the rest of the V4L2 stateless decoder --
+which is architecture-neutral -- build and be tested on x86.
+---
+ src/image_processing.rs | 16 ++++++++--------
+ 1 file changed, 8 insertions(+), 8 deletions(-)
+
+diff --git a/src/image_processing.rs b/src/image_processing.rs
+index 0aec258..93829ad 100644
+--- a/src/image_processing.rs
++++ b/src/image_processing.rs
+@@ -11,7 +11,7 @@ use crate::DecodedFormat;
+ use byteorder::ByteOrder;
+ use byteorder::LittleEndian;
+ 
+-#[cfg(feature = "v4l2")]
++#[cfg(all(feature = "v4l2", target_arch = "aarch64"))]
+ use std::arch::aarch64::*;
+ 
+ pub const MM21_TILE_WIDTH: usize = 16;
+@@ -158,7 +158,7 @@ pub fn y410_to_i410(
+     }
+ }
+ 
+-#[cfg(feature = "v4l2")]
++#[cfg(all(feature = "v4l2", target_arch = "aarch64"))]
+ // SAFETY: Verified by caller that |src| and |dst| is valid and not
+ // a NULL-pointer or invalid memory.
+ pub unsafe fn align_detile(src: *const u8, src_tile_stride: isize, dst: *mut u8, width: usize) {
+@@ -190,7 +190,7 @@ pub unsafe fn align_detile(src: *const u8, src_tile_stride: isize, dst: *mut u8,
+         .copy_from_slice(&vout[0..remainder * bytes_per_pixel]);
+ }
+ 
+-#[cfg(feature = "v4l2")]
++#[cfg(all(feature = "v4l2", target_arch = "aarch64"))]
+ // SAFETY: Verified by caller that |src| and |dst| is valid and not
+ // a NULL-pointer or invalid memory.
+ pub unsafe fn detile_row(
+@@ -212,7 +212,7 @@ pub unsafe fn detile_row(
+ // TODO(bchoobineh): Use a fuzzer to verify the correctness of this SIMD
+ // code compared to its Rust equivalent
+ // Detiles a plane of data using implementation from LibYUV::DetilePlane.
+-#[cfg(feature = "v4l2")]
++#[cfg(all(feature = "v4l2", target_arch = "aarch64"))]
+ pub fn detile_plane(
+     src: &[u8],
+     src_stride: usize,
+@@ -283,7 +283,7 @@ pub fn detile_plane(
+ }
+ 
+ // Converts MM21 to NV12 using the implementation from LibYUV::MM21ToNV12.
+-#[cfg(feature = "v4l2")]
++#[cfg(all(feature = "v4l2", target_arch = "aarch64"))]
+ pub fn mm21_to_nv12(
+     src_y: &[u8],
+     src_stride_y: usize,
+@@ -374,7 +374,7 @@ pub fn i420_to_nv12(src_y: &[u8], dst_y: &mut [u8], src_u: &[u8], src_v: &[u8],
+ 
+ // TODO: Add more conversions. All supported conversion functions need to take stride parameters.
+ pub const SUPPORTED_CONVERSION: &'static [(DecodedFormat, DecodedFormat)] = &[
+-    #[cfg(feature = "v4l2")]
++    #[cfg(all(feature = "v4l2", target_arch = "aarch64"))]
+     (DecodedFormat::MM21, DecodedFormat::NV12),
+     (DecodedFormat::NV12, DecodedFormat::NV12),
+     (DecodedFormat::I420, DecodedFormat::I420),
+@@ -394,7 +394,7 @@ pub fn convert_video_frame(src: &impl VideoFrame, dst: &mut impl VideoFrame) ->
+     let dst_mapping = dst.map_mut().expect("Image processor dst mapping failed!");
+     let dst_planes = dst_mapping.get();
+     match conversion {
+-        #[cfg(feature = "v4l2")]
++        #[cfg(all(feature = "v4l2", target_arch = "aarch64"))]
+         (DecodedFormat::MM21, DecodedFormat::NV12) => mm21_to_nv12(
+             src_planes[Y_PLANE],
+             src_pitches[Y_PLANE],
+@@ -491,7 +491,7 @@ mod tests {
+     use super::*;
+ 
+     #[test]
+-    #[cfg(feature = "v4l2")]
++    #[cfg(all(feature = "v4l2", target_arch = "aarch64"))]
+     fn test_mm21_to_nv12() {
+         let test_input = include_bytes!("test_data/puppets-480x270_20230825.mm21.yuv");
+         let test_expected_output = include_bytes!("test_data/puppets-480x270_20230825.nv12.yuv");

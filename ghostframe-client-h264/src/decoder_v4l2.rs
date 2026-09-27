@@ -12,25 +12,20 @@
 //!
 //! ## Two things a reader should know before trusting this
 //!
-//! **It needs a patched `cros-codecs` to pick the right device.** The
-//! unpatched 0.0.6 scan takes the first `/dev/videoN` with an OUTPUT mplane
-//! queue, which on RK3399 is the hantro *encoder*. We carry a 25-line patch
-//! that honours `CROS_CODECS_V4L2_DEVICE`
-//! (`tools/hw-probe/v4l2-expbuf-rs/cros-codecs-0.0.6.patch`). When that is
-//! absent [`H264Decoder::with_device`] refuses with
-//! [`crate::H264Error::V4l2Unavailable`] rather than opening an encoder and
-//! failing per frame, so `probe.rs` reports no H.264 and the session runs on
-//! the tile codecs — which is the documented fallback, not a failure.
+//! **It needs a patched `cros-codecs`.** Five patches, all upstreamable, in
+//! `third_party/cros-codecs-patches/`. The one this file depends on directly is
+//! 0001: upstream `new_v4l2()` takes no device argument and its scan picks the
+//! first `/dev/videoN` with an OUTPUT mplane queue, which on RK3399 is the
+//! hantro *encoder*. Without the series the crate does not build here at all,
+//! so there is no silent-wrong-device failure mode left to guard against.
 //!
-//! **`cros-codecs` can panic on a stalled decode.** Its
-//! `V4l2Device::sync` gives a queued request ~250 ms and then
+//! **A stalled decode is an error, not a panic** -- but only because we patch
+//! it. Upstream's `V4l2Device::sync` gives a queued request ~250 ms and then
 //! `panic!("there should not be a scenario where a queued frame is not
-//! returned.")`. That is upstream's code on our render thread, and it is not
-//! ours to fix without another carried patch; [`HwFrame`] construction logs at
-//! TRACE before it can block, so the panic has a precursor in the log rather
-//! than appearing from nowhere. `DecodedHandle::is_ready` would let us avoid
-//! the blocking call entirely -- it is `todo!()` on this backend, so asking
-//! panics too.
+//! returned.")`, on what is our render thread. Patch 0004 threads the failure
+//! out to `DecodedHandle::sync`, whose `Result` upstream already had and
+//! discarded; patch 0005 implements `is_ready` so the blocking call can be
+//! anticipated rather than merely survived.
 
 use std::sync::Arc;
 
@@ -71,16 +66,15 @@ type DynDecodedHandleOfPooledFrame = Box<dyn DecodedHandle<Frame = PooledFrame>>
 
 impl HwFrame {
     fn from_handle(handle: DynDecodedHandleOfPooledFrame) -> Result<Self, H264Error> {
-        // The precursor line for upstream's ~250 ms `sync` panic: a decode that
-        // never completes is a driver or bitstream problem, and this is the last
-        // thing logged before cros-codecs gives up the way it gives up.
-        //
-        // It would be better to log this only when the frame is *not* ready.
-        // `DecodedHandle::is_ready` is `todo!()` on the V4L2 backend
-        // (`backend/v4l2/decoder/stateless.rs:98`), so merely asking panics --
-        // a fourth candidate patch, and the reason this is unconditional and at
-        // TRACE rather than conditional and at DEBUG.
-        tracing::trace!("v4l2 decode: syncing decoded frame");
+        // `sync` only blocks when the driver has not returned the buffer yet, so
+        // say so before it can. `is_ready` was `todo!()` upstream -- asking
+        // panicked -- which is why this used to be an unconditional TRACE line;
+        // patch 0005 implements it, so the log now marks a real stall.
+        if !handle.is_ready() {
+            tracing::debug!("v4l2 decode: frame not ready, waiting on the driver");
+        }
+        // And a stall is now an error rather than a panic on the render thread
+        // (patch 0004), which is why this `?` can do anything useful.
         handle
             .sync()
             .map_err(|e| H264Error::V4l2(format!("sync: {e}")))?;
@@ -261,14 +255,12 @@ impl H264Decoder {
         Self::with_device(&node)
     }
 
-    /// Open a specific node, refusing if `cros-codecs` would not use it.
+    /// Open a specific node.
     ///
-    /// The check is the point. `cros-codecs 0.0.6` chooses its own device and
-    /// ignores what it is told, so "succeeded in constructing a decoder" does
-    /// not mean "decoding on `node`". Refusing here turns a per-frame
-    /// `Unrecoverable decoding error` on an encoder into one clear message at
-    /// startup, and lets `probe.rs` report no H.264 so the session falls back
-    /// to the tile codecs.
+    /// Checked against `VIDIOC_ENUM_FMT` first, so "this node is not a
+    /// stateless H.264 decoder" is one clear message at startup rather than a
+    /// per-frame `Unrecoverable decoding error` further down. `probe.rs` then
+    /// reports no H.264 and the session falls back to the tile codecs.
     pub fn with_device(node: &str) -> Result<Self, H264Error> {
         let path = std::path::Path::new(node);
         if !v4l2_device::enumerates_h264_slice(path) {
@@ -276,39 +268,25 @@ impl H264Decoder {
                 "{node} does not enumerate V4L2_PIX_FMT_H264_SLICE on its OUTPUT queue"
             )));
         }
-        // Predict what cros-codecs will actually open: the override if one is
-        // set (the carried patch honours it), otherwise its own scan.
-        //
-        // Both halves matter, and the second was learned the hard way. A stale
-        // override is worse than none: `/dev/videoN` numbering is **not stable
-        // across boots** on this hardware -- rkvdec moved from video3 to video1
-        // over one reboot, swapping places with the hantro decoder -- so an
-        // override written down once silently starts naming a different device.
-        // Checking only "does the scan agree, or is an override set at all"
-        // accepted exactly that case and handed the stream to hantro, which
-        // advertises no H.264 and failed with `driver does not support S264`
-        // several layers down.
-        let effective = v4l2_device::device_cros_codecs_will_open();
-        if effective.as_deref() != Some(path) {
-            let named = effective
-                .as_deref()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "nothing".into());
-            return Err(H264Error::V4l2Unavailable(format!(
-                "cros-codecs would open {named} rather than {node}; set {}={node} and build \
-                 with tools/hw-probe/v4l2-expbuf-rs/cros-codecs-0.0.6.patch applied. Node \
-                 numbering is not stable across boots -- prefer discovering it with \
-                 `probe::default_device()` over writing one down.",
-                v4l2_device::DEVICE_OVERRIDE_ENV,
-            )));
-        }
 
         let exports = Arc::new(ExportTable::default());
         // NonBlocking so `next_event` polls rather than parking the render
         // thread inside the decoder.
-        let decoder = StatelessDecoder::<H264, _>::new_v4l2(BlockingMode::NonBlocking)
-            .map_err(|e| H264Error::V4l2Unavailable(format!("cannot open decoder: {e:?}")))?
-            .into_trait_object();
+        //
+        // The device is named outright. This used to be a much longer dance --
+        // set an environment variable, then predict which node cros-codecs'
+        // own scan would settle on and refuse if it disagreed -- because
+        // `new_v4l2()` took no arguments and the scan cannot tell a decoder from
+        // an encoder. `new_v4l2_with_device_path` is the upstream-shaped fix
+        // (patch 0001 of third_party/cros-codecs-patches), and it retires the
+        // whole mechanism: nothing to keep in sync, and no stale override to go
+        // wrong when `/dev/videoN` numbering shifts across a boot.
+        let decoder = StatelessDecoder::<H264, _>::new_v4l2_with_device_path(
+            Some(path.to_path_buf()),
+            BlockingMode::NonBlocking,
+        )
+        .map_err(|e| H264Error::V4l2Unavailable(format!("cannot open {node}: {e:?}")))?
+        .into_trait_object();
         tracing::info!(node, "v4l2 decode: opened stateless H.264 decoder");
         Ok(Self {
             decoder,
