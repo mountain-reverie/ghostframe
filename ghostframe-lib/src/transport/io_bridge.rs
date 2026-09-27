@@ -778,6 +778,12 @@ pub struct IoBridge {
     force_dirty_frames: u32,
     /// Ticks since startup, for `STUCK_SWEEP_EVERY_TICKS`.
     stuck_sweep_counter: u32,
+    /// When the current session was established, for session-duration
+    /// reporting on disconnect. `None` between sessions.
+    session_started_at: Option<std::time::Instant>,
+    /// When the last session ended, so the next connect can report how long
+    /// the server was serving nobody. `None` before the first disconnect.
+    last_disconnect_at: Option<std::time::Instant>,
     /// Persistent palette table for PalRLE codec emission. M3.2a single-client
     /// invariant — flat server-wide state.
     pub(crate) palette_table: crate::encoder::pal_rle::PaletteTable,
@@ -1451,6 +1457,8 @@ impl IoBridge {
             last_max_datagram_size: None,
             force_dirty_frames: 0,
             stuck_sweep_counter: 0,
+            session_started_at: None,
+            last_disconnect_at: None,
             palette_table: crate::encoder::pal_rle::PaletteTable::new(),
             client_caps: crate::transport::client_caps::ClientCapabilities::default(),
             // `fec_k` parses unconditionally in every build (see
@@ -3752,7 +3760,15 @@ impl IoBridge {
         if let Some(enc) = self.full_frame_encoder.as_mut() {
             enc.request_keyframe();
         }
-        tracing::debug!(?handle, "new session connected, dirty tracker reset");
+        // info, not debug: this is the line that says a reconnecting client is
+        // getting a clean slate rather than resuming, and at debug it was
+        // invisible in exactly the production logs where that matters.
+        tracing::info!(
+            ?handle,
+            force_dirty_frames = self.force_dirty_frames,
+            "session reset: dirty tracker, scheduler and palette cleared; \
+             keyframe requested"
+        );
     }
 
     /// Takes the one-shot BGRA frame-dump path, leaving `None` behind so a
@@ -5899,7 +5915,26 @@ impl IoBridge {
                 }
 
                 Event::ConnectionLost { reason } => {
-                    tracing::info!(?handle, %reason, "connection lost");
+                    // Everything needed to reconstruct the gap later: how long
+                    // this session lasted, and how much undelivered state died
+                    // with it. clear_cache() below used to discard all of it
+                    // silently, so a log could show a session ending and give
+                    // no hint that thousands of un-ACKed passes went with it.
+                    let discarded = self.reliable_emitter.pending_cache_entries();
+                    let discarded_bytes = self.reliable_emitter.bytes_in_flight();
+                    let now = std::time::Instant::now();
+                    tracing::info!(
+                        ?handle,
+                        %reason,
+                        session_secs = self
+                            .session_started_at
+                            .map(|t| now.saturating_duration_since(t).as_secs_f32()),
+                        discarded_pending_entries = discarded,
+                        discarded_bytes,
+                        "connection lost"
+                    );
+                    self.session_started_at = None;
+                    self.last_disconnect_at = Some(now);
                     self.forget_session(handle);
                     // Delivery-guarantee invariant: when the session ends,
                     // un-ACKed tile-passes are no longer deliverable and
@@ -6235,6 +6270,8 @@ impl IoBridge {
             last_max_datagram_size: None,
             force_dirty_frames: 0,
             stuck_sweep_counter: 0,
+            session_started_at: None,
+            last_disconnect_at: None,
             palette_table: crate::encoder::pal_rle::PaletteTable::new(),
             client_caps: crate::transport::client_caps::ClientCapabilities::default(),
             fec_k: lib_config.transport.fec_k.unwrap_or(0),
@@ -6648,6 +6685,21 @@ impl IoBridge {
     /// `establishing_a_second_connection_does_not_disturb_an_existing_session`
     /// fail -- verified by hand, then reverted.
     fn on_connection_established(&mut self, handle: ConnectionHandle) {
+        // Closes the loop opened by the `connection lost` line: together the
+        // two bound the interval during which the server was serving nobody.
+        // Without `gap_secs` that interval could only be inferred from
+        // timestamps, which is exactly the arithmetic you do not want to be
+        // doing while reading a field report.
+        let now = std::time::Instant::now();
+        tracing::info!(
+            ?handle,
+            gap_secs = self
+                .last_disconnect_at
+                .map(|t| now.saturating_duration_since(t).as_secs_f32()),
+            carried_pending_entries = self.reliable_emitter.pending_cache_entries(),
+            "connection established"
+        );
+        self.session_started_at = Some(now);
         let wt = self.wt_sessions.entry(handle).or_default();
         if let Some(conn) = self.server.connections.get_mut(&handle) {
             wt.on_new_connection(conn);
@@ -6710,7 +6762,24 @@ impl IoBridge {
                 }
             }
         }
-        tracing::info!(?handle, ?reason, notices_sent, "evicting session");
+        // Same shape as the `connection lost` line, because an eviction is the
+        // other way a session ends and a reader should not have to know which
+        // happened to find the same facts. session_secs/discarded_* are read
+        // BEFORE clear_cache() below, which is what destroys them.
+        let now = std::time::Instant::now();
+        tracing::info!(
+            ?handle,
+            ?reason,
+            notices_sent,
+            session_secs = self
+                .session_started_at
+                .map(|t| now.saturating_duration_since(t).as_secs_f32()),
+            discarded_pending_entries = self.reliable_emitter.pending_cache_entries(),
+            discarded_bytes = self.reliable_emitter.bytes_in_flight(),
+            "evicting session"
+        );
+        self.session_started_at = None;
+        self.last_disconnect_at = Some(now);
         // Moved here from the old connect-time prune: the displaced
         // session's pending entries are un-ACKable, and left in place they
         // flood the link until RTO. `clear_cache()` is server-global, not
@@ -7049,6 +7118,65 @@ mod tests {
     /// because it calls tokio's `UnixStream::pair()`, which panics outside a
     /// reactor; requiring `.await` enforces that structurally instead of
     /// failing at runtime with an unrelated-looking message.
+    /// The session-lifecycle log reports `session_secs` and `gap_secs` from
+    /// these two fields. Asserting on log output is brittle; asserting that the
+    /// values the log reads are maintained is not, and it is the part that can
+    /// actually be wrong.
+    #[tokio::test]
+    async fn connection_established_starts_the_session_clock() {
+        let h = ConnectionHandle(3);
+        let mut bridge = test_bridge_with_sessions(&[]).await;
+        assert!(
+            bridge.session_started_at.is_none(),
+            "no session has begun yet"
+        );
+        bridge.on_connection_established(h);
+        assert!(
+            bridge.session_started_at.is_some(),
+            "session_secs would report None for a live session"
+        );
+    }
+
+    #[tokio::test]
+    async fn eviction_ends_the_session_and_opens_the_gap() {
+        let h = ConnectionHandle(4);
+        let mut bridge = test_bridge_with_sessions(&[h]).await;
+        bridge.on_connection_established(h);
+        assert!(bridge.last_disconnect_at.is_none());
+
+        bridge.evict_session(h, EvictionReason::DisplacedByNewSession);
+
+        assert!(
+            bridge.session_started_at.is_none(),
+            "a session that ended must not keep reporting a duration"
+        );
+        assert!(
+            bridge.last_disconnect_at.is_some(),
+            "without this the next connect reports gap_secs=None and the \
+             serving-nobody interval stays invisible"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_can_measure_the_gap_it_followed() {
+        // The whole point of the pair: disconnect then connect must leave
+        // enough state to say how long nobody was being served.
+        let h = ConnectionHandle(5);
+        let mut bridge = test_bridge_with_sessions(&[h]).await;
+        bridge.on_connection_established(h);
+        bridge.evict_session(h, EvictionReason::DisplacedByNewSession);
+        let disconnected_at = bridge.last_disconnect_at.expect("set by eviction");
+
+        let h2 = ConnectionHandle(6);
+        bridge.on_connection_established(h2);
+        let started_at = bridge.session_started_at.expect("set by connect");
+        assert!(
+            started_at >= disconnected_at,
+            "gap_secs is computed as connect - last_disconnect; a negative \
+             interval would mean the ordering is wrong"
+        );
+    }
+
     async fn test_bridge_with_sessions(handles: &[ConnectionHandle]) -> IoBridge {
         let (our_end, _peer) = UnixStream::pair().expect("UnixStream::pair failed");
         let server = QuicServer::new().expect("QuicServer::new failed");
