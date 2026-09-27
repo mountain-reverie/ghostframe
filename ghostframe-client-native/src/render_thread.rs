@@ -125,6 +125,82 @@ fn handle_core_event(
     true
 }
 
+/// Dump the EXPORTED dmabuf's own pixels when `GHOSTFRAME_CLIENT_DUMP_EXPORT`
+/// names a path prefix, up to `GHOSTFRAME_CLIENT_DUMP_COUNT` times.
+///
+/// The counterpart to the framebuffer dump, and the pair is the point. The
+/// framebuffer dump reads through wgpu and so says whether *rendering* is
+/// right; this reads the buffer the window actually imports, and so says
+/// whether what leaves the client matches what it drew. Between them:
+///
+/// - framebuffer full, export full  -> the client is correct end to end and a
+///   wrong window is the consumer's import or present path.
+/// - framebuffer full, export partial -> the export ring's damage blit is
+///   losing content, and the window is faithfully showing a bad buffer.
+///
+/// Only possible because the GLES export is LINEAR (see `export_gles.rs`);
+/// `map_read` refuses a tiled or compressed buffer rather than returning
+/// plausible garbage.
+fn maybe_dump_export(
+    renderer: &ghostframe_client_gpu::renderer::Renderer,
+    pf: &PublishedFrame,
+    written: &mut u64,
+) {
+    let Ok(prefix) = std::env::var("GHOSTFRAME_CLIENT_DUMP_EXPORT") else {
+        return;
+    };
+    let want: u64 = std::env::var("GHOSTFRAME_CLIENT_DUMP_COUNT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    if *written >= want {
+        return;
+    }
+    let n = *written;
+    *written += 1;
+
+    let exported = renderer.export_buffer(pf.buffer_id);
+    let bytes = match exported.map_read() {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "export dump failed");
+            return;
+        }
+    };
+    let (w, h) = (exported.width, exported.height);
+    let stride = exported.planes.first().map(|p| p.stride).unwrap_or(0) as usize;
+    if stride == 0 {
+        tracing::warn!("export dump: plane 0 has no stride");
+        return;
+    }
+
+    let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
+    let mut non_black = 0usize;
+    for y in 0..h as usize {
+        let row = &bytes[y * stride..y * stride + w as usize * 4];
+        for px in row.chunks_exact(4) {
+            if px[0] != 0 || px[1] != 0 || px[2] != 0 {
+                non_black += 1;
+            }
+            ppm.extend_from_slice(&px[..3]);
+        }
+    }
+
+    let path = format!("{prefix}.{n}.ppm");
+    match std::fs::write(&path, &ppm) {
+        Ok(()) => tracing::info!(
+            path = %path,
+            buffer_id = pf.buffer_id,
+            frame_id = pf.frame_id,
+            damage_rects = pf.damage.len(),
+            non_black_px = non_black,
+            total_px = w as usize * h as usize,
+            "dumped the EXPORTED dmabuf (what the window imports)"
+        ),
+        Err(e) => tracing::warn!(path = %path, error = %e, "export dump write failed"),
+    }
+}
+
 /// Rolling tally of what the render thread is actually being handed.
 ///
 /// `ghostframe-client-net` and `ghostframe-client-core` carry no tracing at
@@ -258,6 +334,7 @@ pub(crate) fn run(
     };
     let mut renderer: Option<Renderer> = None;
     let mut tally = EventTally::default();
+    let mut export_dumps: u64 = 0;
     let mut last_summary = std::time::Instant::now();
     // `0` means "the embedder didn't specify a count"; a `Renderer` with
     // zero export buffers is a rejected config (it could never publish a
@@ -370,6 +447,7 @@ pub(crate) fn run(
                 }
                 if let Some(pf) = published_frame {
                     tally.publishes += 1;
+                    maybe_dump_export(r, &pf, &mut export_dumps);
                     let frame_id = pf.frame_id;
                     *published.lock().unwrap_or_else(|e| e.into_inner()) = Some(pf);
                     queue.push(ClientEvent::FrameReady { frame_id });

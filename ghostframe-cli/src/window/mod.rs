@@ -46,6 +46,32 @@ pub trait Backend {
     fn preferred_dmabuf_modifiers(&self) -> Vec<u64> {
         Vec::new()
     }
+
+    /// Whether this backend hands an export buffer back only when the display
+    /// server says so, rather than when [`Backend::present`] returns.
+    ///
+    /// `false` (the default) means the caller may release a frame as soon as
+    /// `present` returns. That is a race wherever the server keeps reading the
+    /// buffer after the request is queued -- which X11 does, and which showed
+    /// up as a flickering, partially-updated image: the export ring handed the
+    /// buffer straight back and the next publish blitted into the one the
+    /// server was still displaying.
+    ///
+    /// A backend returning `true` must report every presented frame through
+    /// [`Backend::take_idle_frames`] exactly once, or the ring runs out of
+    /// buffers and the window silently freezes. The caller keeps a watchdog
+    /// for that, but the contract is the backend's.
+    fn defers_buffer_release(&self) -> bool {
+        false
+    }
+
+    /// Frames the display server has finished reading since the last call.
+    ///
+    /// Only meaningful when [`Backend::defers_buffer_release`] is `true`.
+    /// Draining is destructive: a frame is reported once.
+    fn take_idle_frames(&mut self) -> Vec<u32> {
+        Vec::new()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

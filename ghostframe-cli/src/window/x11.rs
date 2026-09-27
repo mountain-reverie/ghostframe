@@ -81,6 +81,7 @@ use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use x11rb::atom_manager;
 use x11rb::connection::Connection as X11Connection;
 use x11rb::protocol::dri3::ConnectionExt as Dri3ConnectionExt;
+use x11rb::protocol::present;
 use x11rb::protocol::present::ConnectionExt as PresentConnectionExt;
 use x11rb::protocol::xproto::{self, ConnectionExt as XprotoConnectionExt};
 use x11rb::protocol::Event;
@@ -283,6 +284,15 @@ pub struct X11Backend {
     /// module doc.
     last_placement: Option<Placement>,
     next_serial: u32,
+    /// Last `(window_w, window_h, frame_w, frame_h, origin_x, origin_y)` that
+    /// was logged, so the geometry line appears on change rather than per frame.
+    last_geom_logged: Option<(u32, u32, u32, u32, i32, i32)>,
+    /// `present` serial -> `frame_id`, for frames the server has not yet
+    /// reported idle. Keyed on serial because `PresentIdleNotify` carries it
+    /// and a pixmap can be presented more than once.
+    presented: HashMap<u32, u32>,
+    /// Frames the server has finished with, drained by `take_idle_frames`.
+    idle_frames: Vec<u32>,
     xkb_state: xkb::State,
     events: Vec<WindowEvent>,
 }
@@ -399,6 +409,23 @@ impl X11Backend {
         )
         .map_err(|e| WindowError::X11(format!("_NET_WM_STATE: {e}")))?;
 
+        // Ask for PresentIdleNotify so the caller can hold an export buffer until
+
+        // the server is genuinely finished with it. Without this the buffer is
+
+        // recycled as soon as `present` returns and the next publish blits into
+
+        // one the server may still be reading -- a flickering, partially-updated
+
+        // image. See `Backend::defers_buffer_release`.
+
+        let present_eid = conn
+            .generate_id()
+            .map_err(|e| WindowError::X11(format!("generate_id (present eid): {e}")))?;
+
+        conn.present_select_input(present_eid, window, present::EventMask::IDLE_NOTIFY)
+            .map_err(|e| WindowError::X11(format!("present_select_input: {e}")))?;
+
         conn.map_window(window)
             .map_err(|e| WindowError::X11(format!("map_window: {e}")))?;
         conn.flush()
@@ -479,6 +506,9 @@ impl X11Backend {
             pixmaps: HashMap::new(),
             last_placement: None,
             next_serial: 0,
+            last_geom_logged: None,
+            presented: HashMap::new(),
+            idle_frames: Vec::new(),
             xkb_state,
             events: Vec::new(),
         };
@@ -615,6 +645,14 @@ impl Backend for X11Backend {
         vec![DRM_FORMAT_MOD_LINEAR]
     }
 
+    fn defers_buffer_release(&self) -> bool {
+        true
+    }
+
+    fn take_idle_frames(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.idle_frames)
+    }
+
     fn present(
         &mut self,
         frame: &PublishedFrame,
@@ -627,7 +665,45 @@ impl Backend for X11Backend {
 
         let pixmap = self.pixmap_for(frame)?;
 
+        // The frame is presented 1:1 -- `Placement::centre` crops rather than
+        // scales -- so a window smaller than the frame silently shows only its
+        // top-left corner. That is indistinguishable, from the outside, from
+        // the client rendering a partial frame, so log the numbers that tell
+        // them apart. Once per change, not per frame.
+        let geom = (
+            self.width,
+            self.height,
+            frame.width,
+            frame.height,
+            placement.origin_x,
+            placement.origin_y,
+        );
+        if self.last_geom_logged != Some(geom) {
+            self.last_geom_logged = Some(geom);
+            if frame.width > self.width || frame.height > self.height {
+                tracing::warn!(
+                    window_w = self.width,
+                    window_h = self.height,
+                    frame_w = frame.width,
+                    frame_h = frame.height,
+                    "frame is larger than the window: it is CROPPED to the \
+                     top-left, not scaled. The missing area is not a render bug."
+                );
+            } else {
+                tracing::info!(
+                    window_w = self.width,
+                    window_h = self.height,
+                    frame_w = frame.width,
+                    frame_h = frame.height,
+                    origin_x = placement.origin_x,
+                    origin_y = placement.origin_y,
+                    "presenting"
+                );
+            }
+        }
+
         self.next_serial = self.next_serial.wrapping_add(1);
+        self.presented.insert(self.next_serial, frame.frame_id);
         self.conn
             .present_pixmap(
                 self.window,
@@ -640,7 +716,22 @@ impl Backend for X11Backend {
                 0, // target_crtc: None -- let the server pick
                 0, // wait_fence: None
                 0, // idle_fence: None
-                0, // options: None
+                // PresentOptionCopy. Without it the server is free to FLIP the
+                // pixmap to scanout, which makes it the live front buffer --
+                // and this backend never learns when the server is done with
+                // it: it selects no Present events, so PresentIdleNotify never
+                // arrives, and `commands.rs` releases the frame the instant
+                // `present` returns. The ring then hands that buffer straight
+                // back and the next publish blits into the buffer the server is
+                // still displaying, which shows as a partially-updated,
+                // flickering image.
+                //
+                // Copying costs a blit per frame but makes the buffer ours
+                // again as soon as the request is serviced. The real fix is to
+                // select IDLE_NOTIFY and defer the release until the server
+                // reports the pixmap idle; this is the correct behaviour in the
+                // meantime rather than a silent race.
+                x11rb::protocol::present::Option::COPY.into(),
                 0, // target_msc
                 0, // divisor
                 0, // remainder: present as soon as possible
@@ -661,6 +752,13 @@ impl Backend for X11Backend {
             .map_err(|e| WindowError::X11(format!("polling for events: {e}")))?
         {
             match event {
+                Event::PresentIdleNotify(ev) => {
+                    // The server is done reading the pixmap for this present.
+                    // Only now is the export buffer ours to overwrite.
+                    if let Some(frame_id) = self.presented.remove(&ev.serial) {
+                        self.idle_frames.push(frame_id);
+                    }
+                }
                 Event::KeyPress(ev) => {
                     let keycode = xkb::Keycode::from(ev.detail);
                     let keysym = self.xkb_state.key_get_syms(keycode).first().copied();
