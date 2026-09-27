@@ -45,7 +45,7 @@ pub fn gradient_clip(w: u32, h: u32, n: usize) -> Vec<Vec<u8>> {
     // which it `av_log`s at INFO and which would otherwise flood every
     // `cargo test` in the workspace that touches this function. Same guard
     // `probe.rs` built for the same reason, against the same noise source.
-    let _quiet = crate::probe::QuietLogGuard::new();
+    let _quiet = crate::ffmpeg_log::QuietLogGuard::new();
     // `find_by_name`, not `find(Id::H264)`: the latter returns whichever
     // H.264 encoder registers first, which can be `h264_vaapi` or
     // `h264_nvenc`. Those then fail on a YUV420P software frame with no

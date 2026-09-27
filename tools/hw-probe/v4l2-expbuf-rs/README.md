@@ -57,15 +57,34 @@ ffmpeg -f lavfi -i "testsrc2=size=640x480:rate=30:duration=2" \
        -bsf:v h264_mp4toannexb -f h264 clip.h264
 ffmpeg -i clip.h264 -pix_fmt yuv420p -f rawvideo sw.i420
 
-# 4. Decode on the hardware decoder and compare.
-CROS_CODECS_V4L2_DEVICE=/dev/video3 RUST_LOG=info \
+# 4. Find the decoder. DO NOT hardcode this -- see below.
+for d in /dev/video*; do
+  printf '%s ' "$d"; v4l2-ctl -d "$d" --list-formats-out 2>/dev/null | grep -c S264
+done
+
+# 5. Decode on the hardware decoder and compare.
+CROS_CODECS_V4L2_DEVICE=/dev/videoN RUST_LOG=info \
   cargo run --release -- clip.h264 hw.i420
 cmp hw.i420 sw.i420
 ```
 
 `CROS_CODECS_V4L2_DEVICE` is what the first patch adds; without it the crate's
-scan picks `/dev/video0`, the hantro *encoder*, and decode fails with
-`Unrecoverable decoding error`.
+scan takes the first node with an OUTPUT mplane queue, with no check that it
+decodes anything.
+
+**`/dev/videoN` numbering is not stable across boots.** On the reference machine
+rkvdec and the hantro decoder swapped places -- video3 and video1 -- over a
+single reboot, which turned a recorded override into a pointer at a decoder that
+advertises no H.264 at all. The failure surfaced four layers down as
+`driver does not support S264`.
+
+So a written-down node number is a latent bug, not a configuration. Enumerate
+`S264` and use what you find; that is exactly what
+`ghostframe-client-h264`'s `probe::default_device()` does, and why it is a
+function rather than a constant. It also means the *upstream-correct* fix is to
+filter by coded format during enumeration rather than to plumb an explicit path
+-- the explicit path is the smaller patch and what the upstream TODO asks for,
+but it inherits this fragility.
 
 **The mutation check is not optional.** A bit-exactness test that passes with a
 deliberately wrong chroma offset is testing nothing, and that is precisely the

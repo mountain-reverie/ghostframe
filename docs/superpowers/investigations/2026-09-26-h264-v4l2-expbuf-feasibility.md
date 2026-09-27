@@ -105,6 +105,49 @@ Two things it is **not**:
 Mutation-checked: `CHROMA_SHIFT_ROWS=1` (one row of chroma offset) makes the
 comparison fail, `=0` makes it pass.
 
+## 3b. Two more upstream gaps, and one hardware fact, found while building it
+
+Added after the feasibility probe, while turning it into
+`ghostframe-client-h264`'s `v4l2` backend.
+
+### `DecodedHandle::is_ready` is `todo!()`
+
+`backend/v4l2/decoder/stateless.rs:98`. So a caller cannot ask whether a decoded
+frame is complete without panicking, which is unfortunate because the answer
+would let it avoid `sync()`'s blocking path entirely. Related: `V4l2Device::sync`
+gives a queued request ~250 ms and then
+`panic!("there should not be a scenario where a queued frame is not returned.")`
+— upstream code on our render thread. Neither is fatal to this work; both are
+candidate patches, and the decoder logs at TRACE before it can block so the
+panic has a precursor.
+
+### `/dev/videoN` numbering is not stable across boots
+
+**rkvdec moved from `/dev/video3` to `/dev/video1` over a single reboot**,
+swapping places with the hantro decoder. A recorded
+`CROS_CODECS_V4L2_DEVICE=/dev/video3` therefore started pointing at a driver
+that advertises MPEG-2 and VP8 and no H.264 at all, and the failure surfaced four
+layers down as `driver does not support S264`.
+
+Three consequences:
+
+1. **A written-down node number is a latent bug**, not configuration. Discover it
+   by enumerating `S264` — which is why `probe::default_device()` is a function
+   and not a constant.
+2. **"An override is set" is not evidence it is right.** The decoder's startup
+   check originally asked "does the scan agree, *or* is an override set?", which
+   accepts a stale override; it now predicts the node cros-codecs will actually
+   open (`v4l2_device::device_cros_codecs_will_open`) and compares that.
+3. **It strengthens the case for the upstream-correct fix.** Filtering by coded
+   format during enumeration has no stale state to go wrong. The explicit-path
+   patch is smaller and is what the upstream TODO asks for, but it inherits this
+   fragility.
+
+Worth noting what this boot also showed: with rkvdec at `/dev/video1` it is the
+first node with an OUTPUT mplane queue, so the **unpatched** scan picks correctly
+and the whole suite passes with no override at all. That is luck, not a fix — and
+it is the kind of luck that makes a device-selection bug look intermittent.
+
 ## 4. What this changes in the plan
 
 | Plan said | Now |

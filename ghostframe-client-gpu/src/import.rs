@@ -68,6 +68,16 @@
 //! data here, not fail loudly, so this is worth re-checking on new hardware
 //! rather than trusted by extension.
 
+/// Whether this backend can import a decoded NV12 dmabuf.
+///
+/// `true` here; `false` in `import_gles.rs`, where [`import_nv12`] is still a
+/// stub. Read by `ghostframe-client-native` when it decides whether to
+/// advertise H.264 at all: the decode side and the import side became
+/// independently available on the GLES/V4L2 port, and advertising a codec this
+/// build can decode but not display is a black window, which is the exact
+/// failure the capability probe exists to prevent.
+pub const NV12_IMPORT_IMPLEMENTED: bool = true;
+
 use crate::wgpu_ctx::WgpuContext;
 use crate::GpuError;
 use ash::vk;

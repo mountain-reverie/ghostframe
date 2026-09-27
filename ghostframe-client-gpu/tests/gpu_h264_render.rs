@@ -37,7 +37,7 @@ use ghostframe_client_h264::testclip::gradient_clip;
 /// Shared skip gate for every test in this file: a usable GPU, and the
 /// driver's own claim of an H.264 VLD entrypoint.
 ///
-/// Gates on `vainfo_reports_h264_vld`, not `vaapi_h264_decode_available()`:
+/// Gates on `driver_reports_h264_decode`, not `h264_decode_available()`:
 /// the latter decodes a frame to answer, so gating on it would mean a
 /// decoder regression makes every test here skip and report green -- the
 /// coverage would vanish exactly when it should fail.
@@ -49,8 +49,8 @@ fn gpu_and_vaapi_or_skip() -> Option<WgpuContext> {
             return None;
         }
     };
-    match ghostframe_client_h264::vainfo_reports_h264_vld(
-        ghostframe_client_h264::probe::RENDER_NODE,
+    match ghostframe_client_h264::driver_reports_h264_decode(
+        &ghostframe_client_h264::probe::default_device(),
     ) {
         Some(true) => Some(ctx),
         Some(false) => {

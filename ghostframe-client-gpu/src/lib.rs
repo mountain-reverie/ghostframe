@@ -58,6 +58,12 @@ pub mod import;
 #[cfg(feature = "gles")]
 #[path = "import_gles.rs"]
 pub mod import;
+// Re-exported at the crate root because the caller that needs it is
+// `ghostframe-client-native`'s capability decision, which has no other business
+// inside `import`. See the const's own doc: decode and import became available
+// independently on the GLES/V4L2 port, so "can this build display H.264" is a
+// question with two answers to combine.
+pub use import::NV12_IMPORT_IMPLEMENTED;
 // The CPU reference is consumed only by Task 8's oracle test (a separate
 // crate unit under `tests/`, so `#[cfg(test)]` alone would not reach it --
 // hence the `test-support` feature) and has no reason to exist in a release

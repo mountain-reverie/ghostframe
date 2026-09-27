@@ -194,16 +194,32 @@ impl Client {
     /// session -- see the struct doc.
     pub fn new(config: Config) -> Result<Self, ClientError> {
         let queue = Arc::new(EventQueue::new()?);
-        let effective_h264 = config.supports_h264 && {
-            let probed = ghostframe_client_h264::vaapi_h264_decode_available();
-            if config.supports_h264 && !probed {
-                tracing::info!(
-                    "H.264 was requested but VA-API decode is unavailable here; \
-                     advertising tile codecs only"
-                );
-            }
-            probed
-        };
+        // H.264 needs BOTH halves of the pipeline, and on the GLES/V4L2 port they
+        // did not arrive together: the V4L2 decode backend landed first, so
+        // `h264_decode_available()` can say yes on hardware whose GPU import is
+        // still a stub. Advertising a codec this build can decode but not
+        // display is a black window on first paint -- the precise failure the
+        // capability probe exists to prevent -- so the import side gets a vote.
+        //
+        // The decode probe is checked second because it opens a device; there is
+        // no reason to pay for it when the answer is already no.
+        let effective_h264 =
+            config.supports_h264 && ghostframe_client_gpu::NV12_IMPORT_IMPLEMENTED && {
+                let probed = ghostframe_client_h264::h264_decode_available();
+                if !probed {
+                    tracing::info!(
+                        "H.264 was requested but hardware decode is unavailable here; \
+                         advertising tile codecs only"
+                    );
+                }
+                probed
+            };
+        if config.supports_h264 && !ghostframe_client_gpu::NV12_IMPORT_IMPLEMENTED {
+            tracing::info!(
+                "H.264 was requested but this GPU backend cannot import a decoded \
+                 NV12 dmabuf yet; advertising tile codecs only"
+            );
+        }
         Ok(Self {
             config,
             queue,

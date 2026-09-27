@@ -32,7 +32,7 @@ fn opting_in_follows_the_probe() {
     let client = Client::new(config(true)).expect("create");
     assert_eq!(
         client.supports_h264(),
-        ghostframe_client_h264::vaapi_h264_decode_available(),
+        ghostframe_client_h264::h264_decode_available(),
         "the effective capability must equal the probe when the host opts in"
     );
 }

@@ -90,15 +90,26 @@ impl ImportedNv12 {
     }
 }
 
+/// Whether this backend can import a decoded NV12 dmabuf.
+///
+/// `false`: [`import_nv12`] below is a stub. `ghostframe-client-native` reads
+/// this when deciding whether to advertise H.264, and that gate is now
+/// load-bearing rather than belt-and-braces -- the V4L2 decode backend landed
+/// before this import did, so `probe::h264_decode_available()` says *yes* on the
+/// reference hardware while nothing here can display the result. Flip this to
+/// `true` in the same change that implements the import, not before.
+pub const NV12_IMPORT_IMPLEMENTED: bool = false;
+
 /// Import a decoded NV12 dmabuf. Always fails on the GLES backend — see the
 /// module doc for why, and for what implementing it involves.
 pub fn import_nv12(_ctx: &WgpuContext, _planes: &DmabufPlanes) -> Result<ImportedNv12, GpuError> {
     Err(GpuError::Egl(
         "NV12 dmabuf import is not implemented on the GLES backend yet, so \
          hardware H.264 cannot be displayed. This session should not have \
-         negotiated H.264: probe.rs reports no decoder on this backend, and the \
-         server falls back to tile codecs. Reaching here means that negotiation \
-         is wrong, not that the frame is bad. See GLES/V4L2 plan tasks 3-6."
+         negotiated H.264: `NV12_IMPORT_IMPLEMENTED` is false on this backend \
+         and `ghostframe-client-native` clears the capability bit because of it, \
+         so the server falls back to tile codecs. Reaching here means that gate \
+         was bypassed, not that the frame is bad. See GLES/V4L2 plan task 9."
             .to_string(),
     ))
 }
