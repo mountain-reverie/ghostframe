@@ -32,6 +32,10 @@ use web_transport_proto::{ConnectRequest, ConnectResponse, Settings, VarInt};
 
 use crate::transport::origin::OriginPolicy;
 
+/// VarInt signalling a client-initiated WebTransport bidirectional data stream
+/// (draft-ietf-webtrans-http3). Encodes on the wire as the two bytes `40 41`.
+const WEBTRANSPORT_BI_STREAM: u64 = 0x41;
+
 // ─── per-stream read buffer ───────────────────────────────────────────────────
 
 /// Accumulated bytes for an in-progress stream that hasn't been fully decoded yet.
@@ -45,6 +49,11 @@ impl StreamBuf {
 
     fn as_slice(&self) -> &[u8] {
         &self.0
+    }
+
+    /// Drop `n` bytes from the front, keeping whatever follows.
+    fn advance(&mut self, n: usize) {
+        let _ = self.0.split_to(n.min(self.0.len()));
     }
 }
 
@@ -97,6 +106,12 @@ pub struct WebTransportServer {
     /// framing included. Measurement only: with `outgoing_total` it gives the
     /// cumulative bytes that have left the queue.
     datagram_bytes_enqueued: u64,
+    /// Bidi streams whose WebTransport stream header has already been stripped.
+    ///
+    /// The header appears exactly once, at the front of the stream, so this is
+    /// the only state needed to know whether the bytes now at the front of a
+    /// buffer are payload or preamble.
+    wt_header_stripped: std::collections::HashSet<StreamId>,
 }
 
 impl WebTransportServer {
@@ -112,6 +127,7 @@ impl WebTransportServer {
             stream_bufs: HashMap::new(),
             pending_bidi_streams: Vec::new(),
             feedback_queue: Vec::new(),
+            wt_header_stripped: std::collections::HashSet::new(),
             abandoned_streams: std::collections::HashSet::new(),
             origin_policy: Arc::new(OriginPolicy::default()),
             datagram_bytes_enqueued: 0,
@@ -141,6 +157,17 @@ impl WebTransportServer {
         } else {
             ConnectResponse::new(web_transport_proto::http::StatusCode::FORBIDDEN)
         }
+    }
+
+    /// Test seam: buffer `bytes` on `sid` as if read from a bidi stream and
+    /// route them to the feedback queue, as `try_decode_connect` does once
+    /// connected. Lets other modules drive the header strip without a quinn
+    /// `Connection`.
+    #[cfg(test)]
+    pub(crate) fn test_feed_feedback_stream(&mut self, sid: StreamId, bytes: &[u8]) {
+        self.connected = true;
+        self.stream_bufs.entry(sid).or_default().extend(bytes);
+        self.route_stream_to_feedback(sid);
     }
 
     /// Returns `true` once the WebTransport CONNECT handshake has completed.
@@ -266,6 +293,7 @@ impl WebTransportServer {
         self.pending_bidi_streams.retain(|&s| s != sid);
         self.stream_bufs.remove(&sid);
         self.abandoned_streams.remove(&sid);
+        self.wt_header_stripped.remove(&sid);
     }
 
     /// Called when quinn-proto reports `StreamEvent::Readable { id }`.
@@ -492,20 +520,87 @@ impl WebTransportServer {
         }
     }
 
+    /// Route a non-session bidi stream's bytes to the feedback queue, stripping
+    /// the WebTransport stream header first.
+    ///
+    /// Split out of `try_decode_connect` because it has nothing to do with
+    /// decoding a CONNECT request and, unlike that path, needs no `Connection`
+    /// -- which is what makes it directly testable.
+    fn route_stream_to_feedback(&mut self, sid: StreamId) {
+        // Already have a session — this bidi stream is not a CONNECT
+        // request, so it carries WebTransport stream data (ReceiverFeedback
+        // and friends). Strip the WebTransport stream header before any of
+        // it reaches the feedback parser.
+        //
+        // A client-initiated WT bidi stream opens with two VarInts: the
+        // 0x41 WEBTRANSPORT_STREAM signal (2 bytes on the wire, `40 41`)
+        // and the session id. This used to be pushed to the feedback queue
+        // verbatim, so the parser read 0x40 as a message type, found it
+        // unknown, and logged
+        //   "unknown feedback-stream message type; dropping rest of buffer
+        //    msg_type=64"
+        // once per session. Harmless when the header lands in a read of its
+        // own -- the 3 bytes were the whole buffer, so "the rest" was
+        // nothing -- but a header coalesced with real feedback in one read
+        // would take that feedback down with it, silently.
+        if !self.wt_header_stripped.contains(&sid) {
+            let Some(buf) = self.stream_bufs.get_mut(&sid) else {
+                self.pending_bidi_streams.retain(|&s| s != sid);
+                return;
+            };
+            let mut slice: &[u8] = buf.as_slice();
+            let before = slice.len();
+            match (VarInt::decode(&mut slice), VarInt::decode(&mut slice)) {
+                (Ok(kind), Ok(session)) => {
+                    let consumed = before - slice.len();
+                    if u64::from(kind) == WEBTRANSPORT_BI_STREAM {
+                        buf.advance(consumed);
+                        tracing::debug!(
+                            stream_id = ?sid,
+                            session_id = u64::from(session),
+                            header_bytes = consumed,
+                            "stripped WebTransport bidi stream header"
+                        );
+                    } else {
+                        // Not a WT data stream. Leave the bytes alone and
+                        // let the feedback parser decide -- it is the layer
+                        // that knows its own message types, and guessing
+                        // here would hide a genuine protocol change.
+                        // `debug`, not `warn`: the native client sends no
+                        // header, so every native session takes this branch.
+                        tracing::debug!(
+                            stream_id = ?sid,
+                            stream_type = u64::from(kind),
+                            "bidi stream has no WebTransport header; \
+                             passing bytes through unstripped"
+                        );
+                    }
+                    self.wt_header_stripped.insert(sid);
+                }
+                _ => {
+                    // Header split across reads. Keep buffering: returning
+                    // here without draining is what makes the partial case
+                    // safe, and is why this cannot use `remove`.
+                    return;
+                }
+            }
+        }
+
+        if let Some(buf) = self.stream_bufs.remove(&sid) {
+            let data = buf.as_slice().to_vec();
+            if !data.is_empty() {
+                self.feedback_queue.push(data);
+            }
+        }
+        self.pending_bidi_streams.retain(|&s| s != sid);
+    }
+
     /// Try to decode a WebTransport CONNECT request from the buffered data for `sid`.
     ///
     /// On success: sends a 200 response and marks the session as connected.
     fn try_decode_connect(&mut self, conn: &mut Connection, sid: StreamId) {
         if self.connected {
-            // Already have a session — this bidi stream is not a CONNECT request.
-            // Route its data to the feedback queue (used for ReceiverFeedback).
-            if let Some(buf) = self.stream_bufs.remove(&sid) {
-                let data = buf.as_slice().to_vec();
-                if !data.is_empty() {
-                    self.feedback_queue.push(data);
-                }
-            }
-            self.pending_bidi_streams.retain(|&s| s != sid);
+            self.route_stream_to_feedback(sid);
             return;
         }
 
@@ -760,6 +855,175 @@ mod tests {
         let a = WebTransportServer::new();
         let b = WebTransportServer::default();
         assert_eq!(a.is_connected(), b.is_connected());
+    }
+
+    // ── WebTransport stream header stripping ─────────────────────────────────
+
+    /// The 3-byte preamble a client-initiated WT bidi stream opens with:
+    /// VarInt(0x41) encodes as `40 41`, then the session id VarInt.
+    fn wt_bidi_header(session_id: u64) -> Vec<u8> {
+        let mut v = BytesMut::new();
+        VarInt::from_u64(WEBTRANSPORT_BI_STREAM)
+            .unwrap()
+            .encode(&mut v);
+        VarInt::from_u64(session_id).unwrap().encode(&mut v);
+        v.to_vec()
+    }
+
+    /// A connected server with `bytes` buffered on `sid`, routed once.
+    fn route(bytes: &[u8]) -> (WebTransportServer, Vec<Vec<u8>>) {
+        let sid = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 1);
+        let mut wt = WebTransportServer::new();
+        wt.connected = true;
+        wt.stream_bufs.entry(sid).or_default().extend(bytes);
+        wt.route_stream_to_feedback(sid);
+        let q = wt.drain_feedback();
+        (wt, q)
+    }
+
+    #[test]
+    fn the_stream_header_never_reaches_the_feedback_queue() {
+        // The observed bug: the header arrived in a read of its own and was
+        // queued verbatim, so the parser read 0x40 as a message type.
+        let (_wt, q) = route(&wt_bidi_header(0));
+        assert!(
+            q.is_empty(),
+            "a header-only read must queue nothing, got {q:?}"
+        );
+    }
+
+    #[test]
+    fn a_header_coalesced_with_feedback_keeps_the_feedback() {
+        // The latent bug, and the reason this is worth fixing rather than
+        // silencing: "dropping rest of buffer" would have discarded this
+        // payload entirely.
+        let payload = [0x01u8, 0xAA, 0xBB];
+        let mut wire = wt_bidi_header(0);
+        wire.extend_from_slice(&payload);
+        let (_wt, q) = route(&wire);
+        assert_eq!(q, vec![payload.to_vec()], "payload must survive the strip");
+    }
+
+    #[test]
+    fn a_header_split_across_reads_is_not_lost() {
+        let sid = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 1);
+        let full = wt_bidi_header(0);
+        let mut wt = WebTransportServer::new();
+        wt.connected = true;
+
+        // First read: one byte of a two-byte VarInt. Nothing decodable yet.
+        wt.stream_bufs.entry(sid).or_default().extend(&full[..1]);
+        wt.route_stream_to_feedback(sid);
+        assert!(
+            wt.drain_feedback().is_empty(),
+            "a partial header must not be queued"
+        );
+
+        // Rest of the header plus payload.
+        let payload = [0x01u8, 0x02];
+        let mut rest = full[1..].to_vec();
+        rest.extend_from_slice(&payload);
+        wt.stream_bufs.entry(sid).or_default().extend(&rest);
+        wt.route_stream_to_feedback(sid);
+        assert_eq!(
+            wt.drain_feedback(),
+            vec![payload.to_vec()],
+            "the buffer must be retained across reads, not dropped"
+        );
+    }
+
+    #[test]
+    fn the_header_is_stripped_once_not_per_read() {
+        // Later reads on the same stream are pure payload. Stripping again
+        // would eat the first two VarInts of real feedback.
+        let sid = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 1);
+        let mut wt = WebTransportServer::new();
+        wt.connected = true;
+        wt.stream_bufs
+            .entry(sid)
+            .or_default()
+            .extend(&wt_bidi_header(0));
+        wt.route_stream_to_feedback(sid);
+        assert!(wt.drain_feedback().is_empty());
+
+        // Deliberately starts with the header's own bytes. A payload starting
+        // with anything else is NOT a test: VarInt::decode would read a
+        // different stream type, the code would take the pass-through branch,
+        // and a "strip every read" regression would survive. Verified by
+        // mutation -- with [0x01, ...] here, removing the once-only guard
+        // still passed.
+        let second = [0x40u8, 0x41, 0x00, 0x07, 0x08];
+        wt.stream_bufs.entry(sid).or_default().extend(&second);
+        wt.route_stream_to_feedback(sid);
+        assert_eq!(
+            wt.drain_feedback(),
+            vec![second.to_vec()],
+            "a second read must pass through untouched"
+        );
+    }
+
+    #[test]
+    fn header_alone_then_feedback_delivers_the_feedback_whole() {
+        // Chrome may write the header and HELLO as separate reads. The HELLO
+        // bytes (type 0x03) must arrive untouched.
+        let sid = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 1);
+        let mut wt = WebTransportServer::new();
+        wt.test_feed_feedback_stream(sid, &wt_bidi_header(0));
+        assert!(wt.drain_feedback().is_empty());
+        wt.test_feed_feedback_stream(sid, &[0x03, 0x01]);
+        assert_eq!(wt.drain_feedback(), vec![vec![0x03, 0x01]]);
+    }
+
+    #[test]
+    fn native_stream_without_a_header_is_delivered_whole() {
+        // The native client opens its stream with HELLO directly. Neither
+        // the first read nor the next may lose a byte.
+        let sid = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 1);
+        let mut wt = WebTransportServer::new();
+        wt.test_feed_feedback_stream(sid, &[0x03, 0x01]);
+        assert_eq!(wt.drain_feedback(), vec![vec![0x03, 0x01]]);
+        wt.test_feed_feedback_stream(sid, &[0x01, 0x02, 0x03]);
+        assert_eq!(wt.drain_feedback(), vec![vec![0x01, 0x02, 0x03]]);
+    }
+
+    #[test]
+    fn stripping_is_tracked_per_stream() {
+        // Stream A has been stripped; a new stream B must still get its own
+        // header stripped, and A's later bytes must not be re-stripped.
+        let a = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 1);
+        let b = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 2);
+        let mut wt = WebTransportServer::new();
+        wt.test_feed_feedback_stream(a, &wt_bidi_header(0));
+        let mut wire_b = wt_bidi_header(0);
+        wire_b.extend_from_slice(&[0x03, 0x01]);
+        wt.test_feed_feedback_stream(b, &wire_b);
+        assert_eq!(wt.drain_feedback(), vec![vec![0x03, 0x01]]);
+        let again = wt_bidi_header(0);
+        wt.test_feed_feedback_stream(a, &again);
+        assert_eq!(wt.drain_feedback(), vec![again]);
+    }
+
+    #[test]
+    fn an_ended_stream_leaves_no_strip_record() {
+        let sid = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 1);
+        let mut wt = WebTransportServer::new();
+        wt.test_feed_feedback_stream(sid, &wt_bidi_header(0));
+        assert!(wt.wt_header_stripped.contains(&sid), "premise: recorded");
+        wt.stream_ended(sid);
+        assert!(wt.wt_header_stripped.is_empty());
+    }
+
+    #[test]
+    fn a_non_webtransport_bidi_stream_passes_through_unstripped() {
+        // Guards the direction that would be worse than the bug: silently
+        // eating bytes from a stream whose framing we do not recognise.
+        let mut wire = BytesMut::new();
+        VarInt::from_u64(0x21).unwrap().encode(&mut wire); // not 0x41
+        VarInt::from_u64(0).unwrap().encode(&mut wire);
+        wire.extend_from_slice(&[0x01, 0x02]);
+        let expected = wire.to_vec();
+        let (_wt, q) = route(&expected);
+        assert_eq!(q, vec![expected], "unknown framing must not be consumed");
     }
 
     // ── VarInt quarter-stream-id encoding ────────────────────────────────────
