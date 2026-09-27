@@ -149,15 +149,31 @@ fn maybe_dump_export(
     let Ok(prefix) = std::env::var("GHOSTFRAME_CLIENT_DUMP_EXPORT") else {
         return;
     };
-    let want: u64 = std::env::var("GHOSTFRAME_CLIENT_DUMP_COUNT")
+    // `GHOSTFRAME_CLIENT_DUMP_EVERY=n` samples every nth publish instead,
+    // overwriting `<prefix>.latest.ppm`. A fixed count always lands in the
+    // opening paint -- a server's first second is thousands of tiles -- so it
+    // cannot answer "what does a buffer hold once things have settled", which
+    // is a different question and the one that matters for a steady-state
+    // artefact.
+    let every: u64 = std::env::var("GHOSTFRAME_CLIENT_DUMP_EVERY")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(1);
-    if *written >= want {
-        return;
-    }
+        .unwrap_or(0);
     let n = *written;
     *written += 1;
+    if every > 0 {
+        if !n.is_multiple_of(every) {
+            return;
+        }
+    } else {
+        let want: u64 = std::env::var("GHOSTFRAME_CLIENT_DUMP_COUNT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        if n >= want {
+            return;
+        }
+    }
 
     let exported = renderer.export_buffer(pf.buffer_id);
     let bytes = match exported.map_read() {
@@ -186,10 +202,15 @@ fn maybe_dump_export(
         }
     }
 
-    let path = format!("{prefix}.{n}.ppm");
+    let path = if every > 0 {
+        format!("{prefix}.latest.ppm")
+    } else {
+        format!("{prefix}.{n}.ppm")
+    };
     match std::fs::write(&path, &ppm) {
         Ok(()) => tracing::info!(
             path = %path,
+            publish_n = n,
             buffer_id = pf.buffer_id,
             frame_id = pf.frame_id,
             damage_rects = pf.damage.len(),
