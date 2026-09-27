@@ -30,6 +30,64 @@ pub const DOCKER_HOST_IP: &str = "172.17.0.1";
 ///
 /// All fields are held until drop so containers + forwarders + weston stay
 /// alive for the lifetime of the scenario.
+/// Dump the server container's logs when a test fails.
+///
+/// Without this an e2e failure reports a wrong pixel and says nothing about
+/// what the server did: the container's stdout never reached the test output,
+/// so a CI failure could not distinguish "the server never emitted it" from
+/// "the client never rendered it". The container already runs with
+/// `RUST_LOG=ghostframe=trace,debug`, and `scene.rs` already reads its logs for
+/// telemetry -- this path simply never used the capability.
+///
+/// On `E2eServerSetup` rather than the per-test wrapper so it covers every
+/// harness built on it (Chromium and Firefox alike), and because adding `Drop`
+/// to the wrapper would stop tests destructuring it.
+///
+/// Gated on `std::thread::panicking()` so a passing run stays silent, and
+/// tail-only: a trace-level server produces far more than is readable, and the
+/// end is where the failure is.
+impl Drop for E2eServerSetup {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        // Two passes, because one is not enough at TRACE volume: a failing run
+        // produces well over a thousand lines, so a tail alone covers barely a
+        // second, and the line that explains the failure is usually a WARN
+        // emitted much earlier.
+        const TAIL_LINES: usize = 400;
+        const MAX_NOTABLE: usize = 120;
+        let logs = crate::harness::cleanup::read_server_logs_stripped(&self.server_container_name);
+        let lines: Vec<&str> = logs.lines().collect();
+
+        let notable: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("WARN") || l.contains("ERROR"))
+            .take(MAX_NOTABLE)
+            .collect();
+        eprintln!(
+            "\n===== server container '{}': {} WARN/ERROR of {} lines =====",
+            self.server_container_name,
+            notable.len(),
+            lines.len()
+        );
+        for l in &notable {
+            eprintln!("{l}");
+        }
+
+        let start = lines.len().saturating_sub(TAIL_LINES);
+        eprintln!(
+            "----- tail ({} of {} lines) -----",
+            lines.len() - start,
+            lines.len()
+        );
+        for l in &lines[start..] {
+            eprintln!("{l}");
+        }
+        eprintln!("===== end server container logs =====\n");
+    }
+}
+
 pub struct E2eServerSetup {
     pub _headscale: ContainerAsync<GenericImage>,
     pub _server: ContainerAsync<GenericImage>,
