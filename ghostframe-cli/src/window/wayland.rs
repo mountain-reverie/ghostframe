@@ -71,12 +71,19 @@ use ghostframe_client_native::PublishedFrame;
 use crate::geometry::Placement;
 use crate::window::{Backend, WindowError, WindowEvent};
 
-/// `DRM_FORMAT_ABGR8888` (fourcc `'AB24'`, i.e. `0x34324241`): the DRM
-/// fourcc for exactly the byte order Vulkan's `R8G8B8A8_UNORM` produces in
-/// memory (R at the lowest address). `ghostframe-client-gpu`'s export path
-/// (`ghostframe-client-gpu/src/export.rs`, `FORMAT`) always exports in that
-/// Vulkan format, so this is the one fourcc this backend will ever need.
-const DRM_FORMAT_ABGR8888: u32 = 0x3432_4241;
+/// `DRM_FORMAT_ARGB8888` (fourcc `'AR24'`, i.e. `0x34325241`): a 32-bit word
+/// of `0xAARRGGBB`, so bytes B,G,R,A in memory.
+///
+/// That is exactly what `ghostframe-client-gpu`'s export produces --
+/// `VK_FORMAT_B8G8R8A8_UNORM` / `wgpu::TextureFormat::Bgra8Unorm` (see
+/// `export.rs`'s `FORMAT`) -- so this is the one fourcc this backend needs.
+///
+/// It was `ABGR8888` until the export moved to BGRA. Wayland takes an explicit
+/// fourcc and so was correct either way; X11/DRI3 does not -- it infers the
+/// layout from depth and bpp through Mesa's fixed table, and no depth means
+/// RGBA, so an RGBA export rendered with red and blue exchanged. The export
+/// format is shared, so this constant follows it.
+const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241;
 
 /// One cached `wl_buffer` import for a ring `buffer_id`, plus enough of the
 /// `PublishedFrame` it was built from to tell whether a later frame with
@@ -142,7 +149,7 @@ fn import_dmabuf(
     let (buffer, _params_proxy) = params.create_immed(
         frame.width as i32,
         frame.height as i32,
-        DRM_FORMAT_ABGR8888,
+        DRM_FORMAT_ARGB8888,
         zwp_linux_buffer_params_v1::Flags::empty(),
         qh,
     );
@@ -821,14 +828,14 @@ mod tests {
     }
 
     #[test]
-    fn drm_format_abgr8888_matches_the_fourcc_spec() {
-        // fourcc_code('A','B','2','4') per drm_fourcc.h -- see the
-        // `DRM_FORMAT_ABGR8888` doc comment for why this is the format
+    fn drm_format_argb8888_matches_the_fourcc_spec() {
+        // fourcc_code('A','R','2','4') per drm_fourcc.h -- see the
+        // `DRM_FORMAT_ARGB8888` doc comment for why this is the format
         // the GPU export path always produces.
         let expected = u32::from(b'A')
-            | (u32::from(b'B') << 8)
+            | (u32::from(b'R') << 8)
             | (u32::from(b'2') << 16)
             | (u32::from(b'4') << 24);
-        assert_eq!(DRM_FORMAT_ABGR8888, expected);
+        assert_eq!(DRM_FORMAT_ARGB8888, expected);
     }
 }

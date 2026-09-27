@@ -50,14 +50,16 @@ pub use crate::dmabuf::PlaneLayout;
 
 /// Format every exported image uses. Single-plane, so the explicit-modifier
 /// path's plane-count handling never has more than one plane to deal with.
-const FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
+// BGRA for the same reason as the GLES backend: X11/DRI3 reads a dmabuf
+// as XRGB8888 at depth 24 / bpp 32, and there is no depth meaning RGBA.
+const FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
 
 /// `FORMAT` expressed as the wgpu-facing type, for [`ExportedImage::as_wgpu_texture`].
 /// Must name the same format as `FORMAT` -- there is deliberately only one
 /// `const` for the Vulkan side and one for the wgpu side rather than a
 /// runtime conversion, since a mismatch here would silently reinterpret
 /// bytes.
-const FORMAT_WGPU: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+const FORMAT_WGPU: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
 
 /// A `VkImage` whose memory is exported as a dmabuf.
 ///
@@ -180,7 +182,7 @@ impl ExportedImage {
                         sample_count: 1,
                         dimension: wgpu::TextureDimension::D2,
                         format: FORMAT_WGPU,
-                        usage: wgpu::TextureUses::COPY_SRC | wgpu::TextureUses::COPY_DST,
+                        usage: wgpu::TextureUses::COPY_SRC | wgpu::TextureUses::COLOR_TARGET,
                         memory_flags: wgpu_hal::MemoryFlags::empty(),
                         view_formats: Vec::new(),
                     },
@@ -208,7 +210,7 @@ impl ExportedImage {
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
                     format: FORMAT_WGPU,
-                    usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+                    usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::RENDER_ATTACHMENT,
                     view_formats: &[],
                 },
                 wgpu::TextureUses::UNINITIALIZED,
