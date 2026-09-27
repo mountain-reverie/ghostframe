@@ -1,6 +1,7 @@
 //! `login`, `logout`, and `connect` — the CLI's actual behaviour.
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use ghostframe_client_native::{Client, ClientEvent, Config};
 use ghostframe_tsnet::{GhostbridgeConfig, GhostbridgeHandle};
@@ -337,6 +338,19 @@ pub fn run_window_loop(
     // nothing has been presented yet either.
     let mut placement = Placement::centre(0, 0, out_w, out_h);
 
+    // Frames presented but not yet reported idle by the backend, with when
+    // they were presented. Only populated when the backend defers release.
+    //
+    // The watchdog below matters more than it looks: the export ring has three
+    // buffers, so a backend that loses one idle report freezes the window after
+    // exactly three frames with no error anywhere. Rather than trust the
+    // contract, a frame held too long is released anyway and the lapse logged.
+    let mut in_flight_frames: std::collections::HashMap<u32, Instant> =
+        std::collections::HashMap::new();
+    // Generous: it bounds a bug, it does not pace anything. Too short and it
+    // reintroduces the very race the deferral exists to remove.
+    const IDLE_WATCHDOG: Duration = Duration::from_millis(500);
+
     let client_fd = client.event_fd();
     let backend_fd = backend.event_fd();
 
@@ -396,7 +410,19 @@ pub fn run_window_loop(
                         } else {
                             Ok(())
                         };
-                        client.release_frame(frame.frame_id);
+                        // Releasing here is only correct when the backend hands
+                        // the buffer back as `present` returns. X11 does not:
+                        // the server keeps reading the pixmap after the request
+                        // is queued, so recycling now lets the next publish blit
+                        // into a buffer still on screen -- a flickering,
+                        // partially-updated image. Those backends report the
+                        // frame through `take_idle_frames` instead, drained
+                        // below.
+                        if !presented || !backend.defers_buffer_release() {
+                            client.release_frame(frame.frame_id);
+                        } else {
+                            in_flight_frames.insert(frame.frame_id, Instant::now());
+                        }
                         present_result
                             .map_err(|e| CommandError::Message(format!("presenting frame: {e}")))?;
                         if presented {
@@ -423,6 +449,37 @@ pub fn run_window_loop(
                 ClientEvent::Error { message } => {
                     return Err(CommandError::Message(message));
                 }
+            }
+        }
+
+        // Hand back every buffer the display server has finished with, plus any
+
+        // the backend never reported (see IDLE_WATCHDOG).
+
+        if backend.defers_buffer_release() {
+            for frame_id in backend.take_idle_frames() {
+                if in_flight_frames.remove(&frame_id).is_some() {
+                    client.release_frame(frame_id);
+                }
+            }
+
+            let now = Instant::now();
+
+            let overdue: Vec<u32> = in_flight_frames
+                .iter()
+                .filter(|(_, at)| now.saturating_duration_since(**at) > IDLE_WATCHDOG)
+                .map(|(id, _)| *id)
+                .collect();
+
+            for frame_id in overdue {
+                in_flight_frames.remove(&frame_id);
+
+                tracing::warn!(
+                    frame_id,
+                    "no PresentIdleNotify within the watchdog; releasing anyway -- the window would otherwise freeze after three frames"
+                );
+
+                client.release_frame(frame_id);
             }
         }
 
