@@ -120,6 +120,30 @@ ffmpeg-next = { version = "=9.0.0" }
 # like every other entry in this table; must match ffmpeg-next's version.
 ffmpeg-sys-next = { version = "=9.0.0" }
 
+# cros-codecs 0.0.6 — H.264 bitstream parsing plus the V4L2 Request API
+# stateless decode backend, for the ARM client where there is no VA-API
+# driver at all (see docs/superpowers/specs/2026-09-25-native-client-gles-v4l2-design.md).
+# Only reached by `ghostframe-client-h264/v4l2`, which is off by default, so an
+# x86 build links none of it.
+#
+# `default-features = false` because the default pulls the VA-API backend and
+# libva with it, which is the exact dependency this backend exists to avoid.
+#
+# Pinned exactly, like every other entry here, and that matters more than
+# usual for a 0.0.x crate whose API churns: 0.0.6 is the version the hardware
+# feasibility work measured against, and the two patches we carry
+# (tools/hw-probe/v4l2-expbuf-rs/cros-codecs-0.0.6.patch) are written against
+# it line by line.
+cros-codecs = { version = "=0.0.6", default-features = false, features = ["v4l2"] }
+
+# There is deliberately no `v4l2r` entry here, even though this backend calls
+# `VIDIOC_EXPBUF` through it. `cros-codecs` re-exports the exact `v4l2r` it was
+# built against (`pub use v4l2r`), and that is the only version safe to use:
+# `VideoFrame::process_dqbuf` takes `v4l2r` types by value, so a second copy of
+# the crate at a different version meets it as a *different type* and surfaces
+# as a bewildering trait-mismatch error rather than a version complaint. Reach
+# it as `cros_codecs::v4l2r::…` and the question cannot arise.
+
 # clap 4.6.7 — latest stable 4.x as of 2026-09-22; derive-based CLI parsing
 # for ghostframe-cli.
 clap = { version = "=4.6.7", features = ["derive"] }

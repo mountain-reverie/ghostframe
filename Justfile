@@ -58,6 +58,22 @@ lint-client:
 check-gles:
     cargo clippy -p ghostframe-client-gpu --no-default-features --features gles,test-support --all-targets -- -D warnings
 
+# The V4L2 stateless H.264 decode backend, for a machine with no VA-API driver.
+# Comes along with `check-gles` (the `gles` feature forwards to it), and checked
+# separately so a break is attributed to the decoder rather than the GPU
+# backend, and so the no-ffmpeg-at-all combination is covered.
+check-v4l2:
+    cargo clippy -p ghostframe-client-h264 --no-default-features --features v4l2 --all-targets -- -D warnings
+
+# The V4L2 backend's tests, including the exactness oracle against a software
+# decode. Needs a stateless V4L2 H.264 decoder -- verified on RK3399/rkvdec --
+# AND the two cros-codecs patches applied through a `[patch.crates-io]` entry in
+# a machine-local `.cargo/config.toml`, plus `CROS_CODECS_V4L2_DEVICE` naming the
+# decoder node. See tools/hw-probe/v4l2-expbuf-rs/README.md. Without those the
+# tests self-skip with the reason, they do not fail.
+test-client-v4l2:
+    cargo test -p ghostframe-client-h264 --no-default-features --features v4l2,test-support
+
 # Build the `ghostframe` binary against the GLES backend, for a machine with
 # no Vulkan driver. The feature forwards up the chain
 # (cli -> client-native -> client-gpu), so it is selected once here rather
@@ -82,6 +98,8 @@ ci-client: build-client
     git diff --exit-code ghostframe-client-capi/include/ghostframe_client.h
     @echo "=== GLES backend still compiles ==="
     just check-gles
+    @echo "=== V4L2 decode backend still compiles ==="
+    just check-v4l2
     @echo "=== ci-client passed ==="
 
 # Run from a clean checkout: builds the web client SPA (vite) into

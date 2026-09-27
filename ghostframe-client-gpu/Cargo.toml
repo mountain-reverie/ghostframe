@@ -26,7 +26,11 @@ ghostframe-client-core = { path = "../ghostframe-client-core" }
 # default feature set is the ADDITIONAL encode-side surface -- `testclip`'s
 # libx264 encoder and `vainfo_reports_h264_vld` -- which is test-only and has
 # no reason to ship in a release build.
-ghostframe-client-h264 = { path = "../ghostframe-client-h264" }
+# `default-features = false`: the decode backend is selected by THIS crate's
+# `vulkan`/`gles` features below, not inherited. A default-features dependency
+# would drag VA-API into a GLES build, which is the exact combination that does
+# not exist on the hardware `gles` is for.
+ghostframe-client-h264 = { path = "../ghostframe-client-h264", default-features = false }
 wgpu = { workspace = true }
 wgpu-hal = { workspace = true }
 # Backend-specific, selected by the `vulkan` / `gles` features below. Optional
@@ -45,7 +49,14 @@ pollster = { workspace = true }
 # Task 9, what stays out of a release build is the encode-side test helpers,
 # not ffmpeg linkage itself. Those stopped being the same question once
 # `renderer.rs` started calling `H264Decoder` unconditionally.
-ghostframe-client-h264 = { path = "../ghostframe-client-h264", features = ["test-support"] }
+# `default-features = false` here as well as in `[dependencies]`, and that is
+# load-bearing: cargo unions a crate's normal and dev dependency features, so a
+# dev-dependency that leaves defaults on re-enables `vaapi` and collides with the
+# `v4l2` the `gles` feature forwards -- which surfaces as that crate's own
+# `compile_error!` about mutually exclusive backends, from a line nobody edited.
+ghostframe-client-h264 = { path = "../ghostframe-client-h264", default-features = false, features = [
+    "test-support",
+] }
 proptest = "1"
 # So `tests/gpu_h264_render.rs` can print which import path
 # (`blit_h264_frame`'s `tracing::info!`) actually ran -- with no subscriber
@@ -90,7 +101,7 @@ test-support = []
 #
 # Revisit only for a single distro package covering both GPUs, which nobody
 # has asked for.
-vulkan = ["dep:ash", "wgpu/vulkan", "wgpu-hal/vulkan"]
+vulkan = ["dep:ash", "wgpu/vulkan", "wgpu-hal/vulkan", "ghostframe-client-h264/vaapi"]
 
 # For GPUs with no Vulkan driver at all -- Mali Midgard being the case that
 # forced this (Mesa's PanVK matrix starts Vulkan at Bifrost). Needs GLES 3.1
@@ -98,4 +109,14 @@ vulkan = ["dep:ash", "wgpu/vulkan", "wgpu-hal/vulkan"]
 # `EGL_EXT_image_dma_buf_import`; `WgpuContext::new` checks for them and
 # refuses to start without export, the same way the Vulkan path refuses
 # without `VK_KHR_external_memory_fd`.
-gles = ["dep:khronos-egl", "wgpu/gles", "wgpu-hal/gles"]
+# Carries the decode backend with it, deliberately. In principle "which GPU
+# API" and "which video decoder" are separate axes; in practice the machine
+# that has no Vulkan driver is the machine that has no VA-API driver either,
+# and `import_gles.rs` is the only importer for a V4L2-decoded buffer. Splitting
+# them would add a feature combination nobody can run.
+gles = [
+    "dep:khronos-egl",
+    "wgpu/gles",
+    "wgpu-hal/gles",
+    "ghostframe-client-h264/v4l2",
+]

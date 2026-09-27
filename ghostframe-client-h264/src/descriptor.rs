@@ -12,6 +12,11 @@
 //! line up.
 
 use crate::H264Error;
+// Only the `vaapi` backend speaks `AVDRMFrameDescriptor`. Everything above
+// the `from_descriptor` impl block -- the fourccs, `PlaneDesc`,
+// `DmabufPlanes` itself -- is backend-neutral by design and is what the
+// `v4l2` backend builds by hand from the driver's own numbers.
+#[cfg(feature = "vaapi")]
 use ffmpeg_sys_next as ffi;
 
 /// Pack four ASCII bytes into a DRM fourcc the way `<drm/drm_fourcc.h>`'s
@@ -102,6 +107,7 @@ pub struct DmabufPlanes {
     pub fourcc_chroma: u32,
 }
 
+#[cfg(feature = "vaapi")]
 impl DmabufPlanes {
     /// Build from a mapped DRM_PRIME descriptor.
     ///
@@ -206,7 +212,9 @@ impl DmabufPlanes {
             fourcc_chroma,
         })
     }
+}
 
+impl DmabufPlanes {
     /// Chroma plane width in samples: `width.div_ceil(2)`. A method, not
     /// just a doc comment on `chroma`, so a caller writes `planes.width /
     /// 2` nowhere and gets the truncating version by copy-paste on a
@@ -224,6 +232,7 @@ impl DmabufPlanes {
 
 /// Read one plane, checked against the two ways a DRM plane descriptor can
 /// point somewhere this crate's single-fd import cannot follow.
+#[cfg(feature = "vaapi")]
 fn plane_desc(p: &ffi::AVDRMPlaneDescriptor) -> Result<PlaneDesc, H264Error> {
     if p.object_index != 0 {
         return Err(H264Error::Descriptor(format!(
@@ -244,7 +253,17 @@ fn plane_desc(p: &ffi::AVDRMPlaneDescriptor) -> Result<PlaneDesc, H264Error> {
 /// `offset + pitch * rows <= size`, computed with checked arithmetic so a
 /// driver-reported overflow is a `Descriptor` error rather than a silent
 /// wraparound that then passes the very check meant to catch it.
-fn check_extent(p: PlaneDesc, rows: u64, size: u64, which: &str) -> Result<(), H264Error> {
+///
+/// `pub(crate)` because the `v4l2` backend needs the same guarantee about
+/// numbers it derives from `v4l2_pix_format_mplane` rather than from a DRM
+/// descriptor -- a driver-reported stride and a coded height it did not
+/// choose can overflow exactly the same way.
+pub(crate) fn check_extent(
+    p: PlaneDesc,
+    rows: u64,
+    size: u64,
+    which: &str,
+) -> Result<(), H264Error> {
     let bytes = p.pitch.checked_mul(rows).ok_or_else(|| {
         H264Error::Descriptor(format!(
             "{which} plane pitch {} * {rows} rows overflows",
@@ -265,7 +284,12 @@ fn check_extent(p: PlaneDesc, rows: u64, size: u64, which: &str) -> Result<(), H
     Ok(())
 }
 
-#[cfg(test)]
+// Every case here builds an `AVDRMFrameDescriptor` by hand, so these are
+// `vaapi`-backend tests, not `DmabufPlanes` tests. The `v4l2` backend's
+// equivalent -- does the layout we derive describe the bytes the driver
+// wrote? -- is `oracle_tests_v4l2`, which answers it against a software
+// decode instead of against a struct we filled in ourselves.
+#[cfg(all(test, feature = "vaapi"))]
 mod tests {
     use super::*;
     use ffmpeg_sys_next as ffi;

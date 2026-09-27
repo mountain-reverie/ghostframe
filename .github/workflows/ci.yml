@@ -56,6 +56,19 @@ jobs:
       # must be checked: a feature nobody builds is already broken. Hardware
       # verification is `just test-client-gles` on a GLES 3.1 device.
       - run: cargo clippy -p ghostframe-client-gpu --no-default-features --features gles,test-support --all-targets -- -D warnings
+      # The V4L2 stateless decode backend, for the same reason. It comes along
+      # with `gles` above, but is checked on its own too so a break is
+      # attributed to the decoder rather than to the GPU backend -- and so the
+      # backend-only combination (v4l2 with no test-support, i.e. no ffmpeg
+      # linked at all) is covered, which the line above does not reach.
+      #
+      # Note this checks it against UNPATCHED cros-codecs from crates.io. The
+      # backend needs two patches to select the right V4L2 device at run time
+      # (tools/hw-probe/v4l2-expbuf-rs/cros-codecs-0.0.6.patch); without them
+      # it compiles and then refuses at startup, which is the designed
+      # behaviour -- the session falls back to tile codecs. Hardware
+      # verification is `just test-client-v4l2` on an RK3399-class device.
+      - run: cargo clippy -p ghostframe-client-h264 --no-default-features --features v4l2 --all-targets -- -D warnings
       - name: ghostframe-lib reads env only in config.rs
         run: |
           # Comment lines are excluded deliberately: the guard constrains code,

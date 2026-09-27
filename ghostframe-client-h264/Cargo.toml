@@ -4,20 +4,43 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-ffmpeg-next = { workspace = true }
-ffmpeg-sys-next = { workspace = true }
+# ffmpeg is the `vaapi` backend's decoder AND the `test-support` clip
+# generator / software golden. Those are separate reasons, so it is enabled by
+# either feature rather than being tied to the backend: a `v4l2` build with
+# `test-support` needs libx264 to produce a clip and a software decode to
+# compare against, without wanting VA-API anywhere near it.
+ffmpeg-next = { workspace = true, optional = true }
+ffmpeg-sys-next = { workspace = true, optional = true }
+cros-codecs = { workspace = true, optional = true }
 libc = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [features]
+# Exactly one backend. `vaapi` is the default because it is what every x86
+# host has and what CI can actually run; `v4l2` is for a mainline-kernel ARM
+# SoC with a stateless decoder behind the V4L2 Request API and no VA-API
+# driver at all (RK3399/rkvdec is the reference). The two share this crate's
+# public API -- `H264Decoder`, `HwFrame`, `MappedFrame`, `DmabufPlanes` -- and
+# nothing else; see the GLES/V4L2 design §4.6 for why this is compile-time
+# rather than a runtime choice.
+default = ["vaapi"]
+vaapi = ["ffmpeg-next", "ffmpeg-sys-next"]
+v4l2 = ["cros-codecs"]
+
 # Gates two things visible only to tests: `testclip` (a synthetic-clip
-# encoder with nine panicking paths) and `vainfo_reports_h264_vld` (the
-# independent-of-this-crate's-own-probe ground truth every oracle gates on
-# -- see probe.rs). Named `test-support`, not `testclip`, because it now
-# carries more than the clip generator. Off by default: Task 3's review
-# required exactly this, so the panicking clip encoder can never ship in a
-# release build of a production crate by accident.
+# encoder with nine panicking paths) and the independent-of-this-crate's-own-probe
+# ground truth every oracle gates on -- `vainfo_reports_h264_vld` on VA-API,
+# `v4l2_enum_fmt_reports_h264_slice` on V4L2 (see probe.rs). Named
+# `test-support`, not `testclip`, because it now carries more than the clip
+# generator. Off by default: Task 3's review required exactly this, so the
+# panicking clip encoder can never ship in a release build of a production
+# crate by accident.
+#
+# It pulls ffmpeg in under BOTH backends, deliberately. The V4L2 oracle's
+# whole job is to compare hardware output against a software decode, and
+# libavcodec is the software decoder -- linking it into a test build is the
+# point, not a leak of the other backend.
 #
 # This crate's own tests (unit tests, and `src/oracle_tests.rs`'s
 # `#[cfg(test)]` module) reach both through `#[cfg(any(test, feature =
@@ -25,11 +48,9 @@ tracing = { workspace = true }
 # dev-dependency needed -- `cargo test -p ghostframe-client-h264` runs them
 # with no extra flag.
 #
-# A crate that needs `gradient_clip`/`vainfo_reports_h264_vld` from its OWN
-# tests (client-gpu, ghostframe-e2e) enables this feature explicitly under
-# its own `[dev-dependencies]`: `ghostframe-client-h264 = { path = "...",
-# features = ["test-support"] }`. That is safe specifically because the
-# default is off -- a plain `path = "..."` dependency for production use
-# gets none of it.
-default = []
-test-support = []
+# A crate that needs `gradient_clip`/the ground truth from its OWN tests
+# (client-gpu, ghostframe-e2e) enables this feature explicitly under its own
+# `[dev-dependencies]`: `ghostframe-client-h264 = { path = "...", features =
+# ["test-support"] }`. That is safe specifically because the default is off --
+# a plain `path = "..."` dependency for production use gets none of it.
+test-support = ["ffmpeg-next", "ffmpeg-sys-next"]

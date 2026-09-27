@@ -25,7 +25,6 @@
 
 use crate::decoder::H264Decoder;
 use crate::testclip::gradient_clip;
-use ffmpeg_next as ffmpeg;
 use ffmpeg_sys_next as ffi;
 
 /// Resolution the exactness oracle (`hardware_decode_matches_software_
@@ -73,65 +72,6 @@ fn skip_without_independently_verified_vaapi() -> bool {
             true
         }
     }
-}
-
-/// Decode with libavcodec's software H.264 decoder; return NV12 planes per
-/// frame as (luma, chroma), tightly packed at `w` and `w` bytes per row.
-fn software_decode_nv12(clip: &[Vec<u8>], w: u32, h: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
-    ffmpeg::init().expect("ffmpeg init");
-    let codec = ffmpeg::decoder::find(ffmpeg::codec::Id::H264).expect("no h264 decoder");
-    let ctx = ffmpeg::codec::context::Context::new_with_codec(codec);
-    let mut dec = ctx.decoder().video().expect("video decoder");
-
-    let mut out = Vec::new();
-    // Matches `dec: &mut ffmpeg::decoder::Video` explicitly (not
-    // `.is_ok()`), same as `testclip::gradient_clip`'s own `drain` closure
-    // on the encode side: EAGAIN and EOF are the two expected reasons this
-    // stops yielding frames. Collapsing every other error into "no more
-    // frames" would silently truncate `out` on a genuine decode failure,
-    // surfacing later as a misleading "frame counts differ" instead of the
-    // actual cause.
-    let take = |dec: &mut ffmpeg::decoder::Video, out: &mut Vec<(Vec<u8>, Vec<u8>)>| loop {
-        let mut frame = ffmpeg::frame::Video::empty();
-        match dec.receive_frame(&mut frame) {
-            Ok(()) => {
-                let y_stride = frame.stride(0);
-                let mut luma = Vec::with_capacity((w * h) as usize);
-                for row in 0..h as usize {
-                    luma.extend_from_slice(
-                        &frame.data(0)[row * y_stride..row * y_stride + w as usize],
-                    );
-                }
-                // YUV420P -> NV12: interleave U and V. Exact, not a conversion.
-                let u_stride = frame.stride(1);
-                let v_stride = frame.stride(2);
-                let chroma_w = w.div_ceil(2) as usize;
-                let chroma_h = h.div_ceil(2) as usize;
-                let mut chroma = Vec::with_capacity(chroma_w * chroma_h * 2);
-                for row in 0..chroma_h {
-                    let u = &frame.data(1)[row * u_stride..row * u_stride + chroma_w];
-                    let v = &frame.data(2)[row * v_stride..row * v_stride + chroma_w];
-                    for i in 0..chroma_w {
-                        chroma.push(u[i]);
-                        chroma.push(v[i]);
-                    }
-                }
-                out.push((luma, chroma));
-            }
-            Err(ffmpeg::Error::Other { errno }) if errno == libc::EAGAIN => break,
-            Err(ffmpeg::Error::Eof) => break,
-            Err(e) => panic!("software h264 decode receive_frame failed: {e}"),
-        }
-    };
-
-    for au in clip {
-        let pkt = ffmpeg::Packet::copy(au);
-        dec.send_packet(&pkt).expect("send_packet");
-        take(&mut dec, &mut out);
-    }
-    dec.send_eof().expect("send_eof");
-    take(&mut dec, &mut out);
-    out
 }
 
 /// Download a VA-API surface to system memory as NV12, tightly packed at
@@ -184,7 +124,7 @@ fn hardware_decode_matches_software_decode_exactly() {
     }
 
     let clip = gradient_clip(W, H, 8);
-    let sw = software_decode_nv12(&clip, W, H);
+    let sw = crate::software_decode::software_decode_nv12(&clip, W, H);
 
     let mut dec = H264Decoder::new().expect("open hw decoder");
     let mut hw = Vec::new();
@@ -204,7 +144,7 @@ fn hardware_decode_matches_software_decode_exactly() {
         // The exactness gate below rests on a zip, which silently truncates
         // to the shorter side. Both vectors are `W*H` (luma) / `W*H/2`
         // (chroma) by construction of `hw_frame_to_nv12`/
-        // `software_decode_nv12` above, so this cannot fire today -- but the
+        // `software_decode::software_decode_nv12`, so this cannot fire today -- but the
         // gate should rest on an assertion, not on that construction staying
         // true forever.
         assert_eq!(
