@@ -5094,6 +5094,27 @@ impl IoBridge {
                         // the long-tail un-deliverable passes that the
                         // client should be NACKing.
                         cache_pending_entries = self.reliable_emitter.pending_cache_entries(),
+                        // Ledger stats. These existed but were never logged,
+                        // which left the field unable to tell the two halves
+                        // of an ACK failure apart: `emitter_ack_hits` frozen
+                        // could mean no ACK datagrams are arriving at all, or
+                        // that they arrive and resolve to nothing. An ACK that
+                        // fails to resolve is filtered out before `on_ack`, so
+                        // it lands in `ledger_unknown_acks` and in NEITHER
+                        // emitter counter -- invisible without this line.
+                        //
+                        // ledger_capacity_evictions > 0 means transmissions
+                        // outran acknowledgements badly enough that the cap,
+                        // not the horizon, bound the ledger; every evicted
+                        // record is an ACK that can no longer land, which
+                        // strands its cache entry permanently.
+                        ledger_records = self.transmission_ledger.len(),
+                        ledger_unknown_acks = self.transmission_ledger.stats().unknown_acks,
+                        ledger_capacity_evictions =
+                            self.transmission_ledger.stats().capacity_evictions,
+                        ledger_acked_after_declared_lost =
+                            self.transmission_ledger.stats().acked_after_declared_lost,
+                        ledger_tombstones = self.transmission_ledger.tombstone_len(),
                         // BWE Stage 2.0: per-tier ACK round-trip latency
                         // (emit -> ACK receipt, server clock only — see
                         // `TierLatencyStats`'s doc comment). Cumulative
