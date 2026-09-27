@@ -26,6 +26,17 @@ tracing = { workspace = true }
 # backend once, at the top of the tree, instead of every crate in the chain
 # having an opinion.
 [features]
-default = ["vulkan"]
-vulkan = ["ghostframe-client-gpu/vulkan", "ghostframe-client-h264/vaapi"]
-gles = ["ghostframe-client-gpu/gles", "ghostframe-client-h264/v4l2"]
+default = ["vulkan", "decode-vaapi"]
+vulkan = ["ghostframe-client-gpu/vulkan"]
+gles = ["ghostframe-client-gpu/gles"]
+
+# The decode backend, a separate axis -- see `ghostframe-client-gpu`'s
+# `[features]` for why it cannot be folded into the pair above.
+decode-vaapi = [
+    "ghostframe-client-gpu/decode-vaapi",
+    "ghostframe-client-h264/vaapi",
+]
+decode-v4l2 = [
+    "ghostframe-client-gpu/decode-v4l2",
+    "ghostframe-client-h264/v4l2",
+]

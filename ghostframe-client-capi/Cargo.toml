@@ -21,6 +21,9 @@ cbindgen = { workspace = true }
 # backend once, at the top of the tree, instead of every crate in the chain
 # having an opinion.
 [features]
-default = ["vulkan"]
+default = ["vulkan", "decode-vaapi"]
 vulkan = ["ghostframe-client-native/vulkan"]
 gles = ["ghostframe-client-native/gles"]
+# Separate axis; see `ghostframe-client-gpu`'s `[features]`.
+decode-vaapi = ["ghostframe-client-native/decode-vaapi"]
+decode-v4l2 = ["ghostframe-client-native/decode-v4l2"]

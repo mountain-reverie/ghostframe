@@ -626,9 +626,19 @@ fell back, or skipped, reports success indistinguishably from real success.
 - Modify: `.github/workflows/ci.yml`
 - Modify: `Justfile`
 
-`cargo check -p ghostframe-client-gpu --features gles --no-default-features`, and
+`cargo check -p ghostframe-client-gpu --no-default-features --features gles`, and
 the same for `ghostframe-client-h264 --features v4l2`. The tests cannot run on a
 runner, but the code must not rot uncompiled.
+
+**Both halves of that needed correcting once measured.** The GPU check must name
+the decode backend explicitly (`gles,decode-vaapi`), because coupling the two
+axes leaves no combination that builds on an x86 runner; and the `v4l2` half
+cannot be checked on x86 at all, because `cros-codecs 0.0.6` gates a NEON path on
+its `v4l2` feature rather than on the target architecture. See
+[`../investigations/2026-09-26-h264-v4l2-expbuf-feasibility.md`](../investigations/2026-09-26-h264-v4l2-expbuf-feasibility.md)
+§3b. Checking the whole chain (`-p ghostframe-cli`) matters too: cargo unions
+features across the graph, so a client-gpu-only gate stays green while the binary
+cannot link.
 
 Land this **with Task 7**, while there is something to check. Added at the end,
 it will be added after the first silent breakage instead of before it.

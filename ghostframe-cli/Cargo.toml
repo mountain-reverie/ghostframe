@@ -30,6 +30,15 @@ xkbcommon = { version = "0.8", features = ["x11"] }
 # backend once, at the top of the tree, instead of every crate in the chain
 # having an opinion.
 [features]
-default = ["vulkan"]
+default = ["vulkan", "decode-vaapi"]
 vulkan = ["ghostframe-client-native/vulkan"]
 gles = ["ghostframe-client-native/gles"]
+
+# The decode backend, a separate axis from the GPU backend -- see
+# `ghostframe-client-gpu`'s `[features]` for why they cannot be folded together
+# (`cros-codecs`' `v4l2` feature does not compile off aarch64).
+#
+# The reference ARM build therefore names both: `--no-default-features
+# --features gles,decode-v4l2`. `just build-client-gles` does that for you.
+decode-vaapi = ["ghostframe-client-native/decode-vaapi"]
+decode-v4l2 = ["ghostframe-client-native/decode-v4l2"]
