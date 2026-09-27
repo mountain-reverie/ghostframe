@@ -182,10 +182,30 @@ fn exported_image_can_be_wrapped_as_a_wgpu_texture() {
 
     assert_eq!(tex.width(), 64);
     assert_eq!(tex.height(), 64);
-    assert_eq!(tex.format(), wgpu::TextureFormat::Rgba8Unorm);
+    // BGRA: see `in_export`.
+    assert_eq!(tex.format(), wgpu::TextureFormat::Bgra8Unorm);
 }
 
-/// Read an export back as row-major RGBA, whichever way the backend allows.
+/// The bytes an RGBA colour occupies in an exported dmabuf.
+///
+/// The export is `bgra8unorm` -- X11/DRI3 infers a dmabuf's layout from depth
+/// and bpp and there is no depth meaning RGBA, so exporting RGBA put red and
+/// blue the wrong way round and a blue desktop rendered orange. See
+/// `export_gles.rs`'s module doc.
+///
+/// Spelled as a conversion rather than by writing the swapped literals inline,
+/// so the assertions below still read in the colour the test set. It is
+/// deliberately NOT applied inside `read_export`: doing the swap on the way out
+/// would mask a genuine channel-order regression, which is the exact defect
+/// this ordering exists to prevent.
+fn in_export(rgba: [u8; 4]) -> [u8; 4] {
+    [rgba[2], rgba[1], rgba[0], rgba[3]]
+}
+
+/// Read an export back row-major, whichever way the backend allows.
+///
+/// Bytes are in the EXPORT's order (BGRA), not RGBA -- compare against
+/// [`in_export`].
 ///
 /// Returns `(bytes, stride, base_offset)`.
 ///
@@ -293,7 +313,7 @@ fn framebuffer_blits_into_the_exported_dmabuf() {
     let off = base + 40 * stride + 20 * 4;
     assert_eq!(
         &bytes[off..off + 4],
-        &[0x11, 0x22, 0x33, 0xFF],
+        &in_export([0x11, 0x22, 0x33, 0xFF]),
         "wrong pixel at (20,40); channel order or stride is wrong"
     );
 }
@@ -360,20 +380,20 @@ fn ring_partial_update_preserves_untouched_regions() {
     // The newly painted tile starts at pixel x=32.
     assert_eq!(
         &bytes[base + 32 * 4..base + 32 * 4 + 4],
-        &[0x00, 0xFF, 0x00, 0xFF],
+        &in_export([0x00, 0xFF, 0x00, 0xFF]),
         "new tile not copied"
     );
     // THE POINT: buffer B was never written before, so it must have received
     // frame 1's red as well -- not just frame 2's single green tile.
     assert_eq!(
         &bytes[base..base + 4],
-        &[0xFF, 0x00, 0x00, 0xFF],
+        &in_export([0xFF, 0x00, 0x00, 0xFF]),
         "untouched region lost: partial blit ignored buffer history"
     );
     // And a row far away, to catch a stride mistake.
     assert_eq!(
         &bytes[base + 40 * stride..base + 40 * stride + 4],
-        &[0xFF, 0x00, 0x00, 0xFF],
+        &in_export([0xFF, 0x00, 0x00, 0xFF]),
         "untouched row lost"
     );
 }
@@ -471,17 +491,17 @@ fn recycled_buffer_receives_only_its_damage_and_keeps_the_rest() {
 
     assert_eq!(
         &bytes[base + 32 * 4..base + 32 * 4 + 4],
-        &[0x00, 0xFF, 0x00, 0xFF],
+        &in_export([0x00, 0xFF, 0x00, 0xFF]),
         "partial blit did not copy the damaged tile"
     );
     assert_eq!(
         &bytes[base..base + 4],
-        &[0xFF, 0x00, 0x00, 0xFF],
+        &in_export([0xFF, 0x00, 0x00, 0xFF]),
         "partial blit clobbered an undamaged region"
     );
     assert_eq!(
         &bytes[base + 40 * stride..base + 40 * stride + 4],
-        &[0xFF, 0x00, 0x00, 0xFF],
+        &in_export([0xFF, 0x00, 0x00, 0xFF]),
         "partial blit clobbered a distant undamaged row"
     );
 }

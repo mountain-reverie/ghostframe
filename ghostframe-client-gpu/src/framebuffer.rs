@@ -28,12 +28,22 @@ const USAGE: wgpu::TextureUsages = wgpu::TextureUsages::STORAGE_BINDING
 /// Holds the one texture tiles are decoded into and patched against across
 /// the lifetime of a session. Distinct from any [`crate::export::ExportedImage`]:
 /// this texture is never itself exported, only blitted into one.
+/// Lazily-built pipeline for the export blit. Built on first use rather than
+/// in `new` because a `Framebuffer` is also constructed in tests that never
+/// blit, and a pipeline compile is not free on a weak GPU.
+struct BlitPipeline {
+    pipeline: wgpu::RenderPipeline,
+    layout: wgpu::BindGroupLayout,
+    format: wgpu::TextureFormat,
+}
+
 pub struct Framebuffer {
     texture: wgpu::Texture,
     /// Public rather than an accessor: the M1 plan's own test asserts
     /// `fb.width`/`fb.height` directly after a resize.
     pub width: u32,
     pub height: u32,
+    blit: std::cell::OnceCell<BlitPipeline>,
 }
 
 impl Framebuffer {
@@ -43,6 +53,7 @@ impl Framebuffer {
             texture,
             width,
             height,
+            blit: std::cell::OnceCell::new(),
         }
     }
 
@@ -90,30 +101,29 @@ impl Framebuffer {
     /// Blit the whole framebuffer into `dst` (e.g. an
     /// [`crate::export::ExportedImage`] wrapped via `as_wgpu_texture`).
     pub fn blit_full(&self, device: &wgpu::Device, queue: &wgpu::Queue, dst: &wgpu::Texture) {
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("ghostframe-framebuffer-blit-full"),
-        });
-        encoder.copy_texture_to_texture(
-            self.texture.as_image_copy(),
-            dst.as_image_copy(),
-            wgpu::Extent3d {
-                width: self.width,
-                height: self.height,
-                depth_or_array_layers: 1,
-            },
-        );
-        queue.submit(std::iter::once(encoder.finish()));
+        let full = crate::coalesce::Rect {
+            x: 0,
+            y: 0,
+            w: self.width,
+            h: self.height,
+        };
+        self.blit_rects(device, queue, dst, &[full]);
     }
 
     /// Copy only `rects` (PIXEL coordinates) into `dst`.
     ///
-    /// One `copy_texture_to_texture` per rect in a single encoder, so a
-    /// frame's damage costs one submission regardless of rect count.
-    /// Zero-area rects are skipped rather than handed to wgpu: a
-    /// `copy_texture_to_texture` with a zero-sized `Extent3d` is a
-    /// validation error, and [`crate::coalesce::Rect::to_pixels`] can
-    /// legitimately produce one when clamping a tile rect against a
-    /// non-tile-aligned framebuffer edge.
+    /// A render pass, not `copy_texture_to_texture`. The export buffer is
+    /// `bgra8unorm` and the framebuffer is `rgba8unorm`, and WebGPU does not
+    /// consider those copy-compatible -- but a draw converts, because writing
+    /// a colour to a `bgra8unorm` target stores it in BGRA byte order. The
+    /// export has to be BGRA because X11/DRI3 infers a dmabuf's layout from
+    /// depth and bpp and there is no depth that means RGBA (see
+    /// `shaders/client/export_blit.wgsl`).
+    ///
+    /// One pass with `set_scissor_rect` per rect, not a pass per rect: the
+    /// damage clip is free and the load op stays `Load`, so untouched pixels
+    /// keep the content the buffer already had -- which is what lets the
+    /// export ring send only damage.
     pub fn blit_rects(
         &self,
         device: &wgpu::Device,
@@ -121,37 +131,72 @@ impl Framebuffer {
         dst: &wgpu::Texture,
         rects: &[crate::coalesce::Rect],
     ) {
+        if rects.iter().all(|r| r.w == 0 || r.h == 0) {
+            return;
+        }
+        let blit = self
+            .blit
+            .get_or_init(|| build_blit_pipeline(device, dst.format()));
+        debug_assert_eq!(
+            dst.format(),
+            blit.pipeline_format(),
+            "export format changed after the blit pipeline was built; the \
+             pipeline is cached per Framebuffer and cannot follow it"
+        );
+
+        let src_view = self
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ghostframe-export-blit"),
+            layout: &blit.layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&src_view),
+            }],
+        });
+        let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("ghostframe-framebuffer-blit-rects"),
         });
-        for rect in rects {
-            if rect.w == 0 || rect.h == 0 {
-                continue;
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("ghostframe-export-blit"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &dst_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        // `Load`, never `Clear`: everything outside the damage
+                        // rects must survive, or partial updates would blank
+                        // the rest of the screen.
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&blit.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            for rect in rects {
+                if rect.w == 0 || rect.h == 0 {
+                    continue;
+                }
+                // Clamp: a rect running past the edge is a scissor validation
+                // error, and the tile grid is a ceil division so the last row
+                // and column routinely do.
+                let w = rect.w.min(self.width.saturating_sub(rect.x));
+                let h = rect.h.min(self.height.saturating_sub(rect.y));
+                if w == 0 || h == 0 {
+                    continue;
+                }
+                pass.set_scissor_rect(rect.x, rect.y, w, h);
+                pass.draw(0..3, 0..1);
             }
-            let origin = wgpu::Origin3d {
-                x: rect.x,
-                y: rect.y,
-                z: 0,
-            };
-            encoder.copy_texture_to_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &self.texture,
-                    mip_level: 0,
-                    origin,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyTextureInfo {
-                    texture: dst,
-                    mip_level: 0,
-                    origin,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::Extent3d {
-                    width: rect.w,
-                    height: rect.h,
-                    depth_or_array_layers: 1,
-                },
-            );
         }
         queue.submit(std::iter::once(encoder.finish()));
     }
@@ -294,6 +339,68 @@ impl Framebuffer {
         }
 
         tight
+    }
+}
+
+impl BlitPipeline {
+    fn pipeline_format(&self) -> wgpu::TextureFormat {
+        self.format
+    }
+}
+
+fn build_blit_pipeline(device: &wgpu::Device, format: wgpu::TextureFormat) -> BlitPipeline {
+    const SHADER_SRC: &str = include_str!("../../shaders/client/export_blit.wgsl");
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("ghostframe-export-blit"),
+        source: wgpu::ShaderSource::Wgsl(SHADER_SRC.into()),
+    });
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("ghostframe-export-blit"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        }],
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("ghostframe-export-blit"),
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("ghostframe-export-blit"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vs_main"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+    BlitPipeline {
+        pipeline,
+        layout,
+        format,
     }
 }
 

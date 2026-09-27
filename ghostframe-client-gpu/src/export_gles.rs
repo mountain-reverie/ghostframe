@@ -39,7 +39,7 @@
 //! ABGR8888 flags=LINEAR|RENDERING   OK  planes=1 modifier=0x0 stride=2560
 //! ```
 //!
-//! `DRM_FORMAT_ABGR8888` is what `wgpu::TextureFormat::Rgba8Unorm` maps to, so
+//! `DRM_FORMAT_ARGB8888` is what `wgpu::TextureFormat::Rgba8Unorm` maps to, so
 //! the channel order matches — worth stating, because a linear buffer in the
 //! wrong order renders as swapped colours rather than failing.
 //!
@@ -82,9 +82,17 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 pub use crate::dmabuf::PlaneLayout;
 
 /// Format every exported image uses, matching `export.rs`'s `FORMAT_WGPU`.
-/// Both backends must agree: the consumer is told a fourcc derived from this,
-/// and a mismatch would silently reinterpret bytes.
-const FORMAT_WGPU: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+/// Both backends must agree: the consumer reads the buffer according to this
+/// layout, and a mismatch silently reinterprets bytes.
+///
+/// BGRA, not RGBA, because X11/DRI3 infers a dmabuf's layout from depth and
+/// bpp through Mesa's fixed table -- depth 24 / bpp 32 means XRGB8888, i.e.
+/// bytes B,G,R,X -- and no depth means RGBA. Exporting RGBA put red and blue
+/// the wrong way round, so a blue desktop rendered orange. `Framebuffer` stays
+/// `rgba8unorm` (WebGPU has no bgra8unorm storage format, and the compute
+/// shaders write to it as a storage texture); the conversion happens in the
+/// export blit, which is a render pass for exactly this reason.
+const FORMAT_WGPU: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
 
 // --- EGL bits `khronos-egl` does not wrap -------------------------------
 //
@@ -184,12 +192,13 @@ const GBM_BO_USE_RENDERING: u32 = 1 << 2;
 /// `GBM_BO_USE_LINEAR` -- the whole point. Without it panfrost picks AFBC.
 const GBM_BO_USE_LINEAR: u32 = 1 << 4;
 
-/// `DRM_FORMAT_ABGR8888`, `fourcc_code('A','B','2','4')`.
+/// `DRM_FORMAT_ARGB8888`, `fourcc_code('A','R','2','4')`.
 ///
-/// This is what [`FORMAT_WGPU`] (`Rgba8Unorm`) maps to. The two must agree: a
-/// linear buffer in the wrong channel order renders as swapped colours rather
-/// than failing, which is a much worse way to find out.
-const DRM_FORMAT_ABGR8888: u32 = 0x3432_4241;
+/// This is what [`FORMAT_WGPU`] (`Bgra8Unorm`) maps to -- a 32-bit word of
+/// 0xAARRGGBB, i.e. bytes B,G,R,A in memory. The two must agree: a buffer in
+/// the wrong channel order renders as swapped colours rather than failing,
+/// which is a much worse way to find out.
+const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241;
 
 /// The render node GBM allocates from. Matches `ghostframe-client-h264`'s
 /// `RENDER_NODE`; a machine with several GPUs and a client on the wrong one is
@@ -433,7 +442,7 @@ impl ExportedImage {
                 gbm,
                 width,
                 height,
-                DRM_FORMAT_ABGR8888,
+                DRM_FORMAT_ARGB8888,
                 GBM_BO_USE_LINEAR | GBM_BO_USE_RENDERING,
             )
         };
@@ -502,7 +511,7 @@ impl ExportedImage {
             EGL_HEIGHT,
             height as i32,
             EGL_LINUX_DRM_FOURCC_EXT,
-            DRM_FORMAT_ABGR8888 as i32,
+            DRM_FORMAT_ARGB8888 as i32,
             EGL_DMA_BUF_PLANE0_FD_EXT,
             fd.as_raw_fd(),
             EGL_DMA_BUF_PLANE0_OFFSET_EXT,
@@ -637,7 +646,7 @@ impl ExportedImage {
                             sample_count: 1,
                             dimension: wgpu::TextureDimension::D2,
                             format: FORMAT_WGPU,
-                            usage: wgpu::TextureUses::COPY_SRC | wgpu::TextureUses::COPY_DST,
+                            usage: wgpu::TextureUses::COPY_SRC | wgpu::TextureUses::COLOR_TARGET,
                             memory_flags: wgpu_hal::MemoryFlags::empty(),
                             view_formats: Vec::new(),
                         },
@@ -660,7 +669,7 @@ impl ExportedImage {
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
                     format: FORMAT_WGPU,
-                    usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+                    usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::RENDER_ATTACHMENT,
                     view_formats: &[],
                 },
                 wgpu::TextureUses::UNINITIALIZED,
