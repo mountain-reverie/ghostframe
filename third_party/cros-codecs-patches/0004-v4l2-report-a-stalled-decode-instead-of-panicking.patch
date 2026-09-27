@@ -1,0 +1,177 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ghostframe <noreply@anthropic.com>
+Date: Sun, 27 Sep 2026 09:32:14 -0600
+Subject: [PATCH 4/5] v4l2: report a stalled decode instead of panicking
+
+`DeviceHandle::sync` gives a queued request ~250 ms of exponential back-off
+and then
+
+    panic!("there should not be a scenario where a queued frame is not returned.")
+
+There is such a scenario: a driver that does not return the buffer, or a
+bitstream the hardware chokes on. Neither is a programming error in this
+crate, and the caller is typically a render thread, where a panic takes the
+whole session down over one bad frame.
+
+The error already had somewhere to go -- `DecodedHandle::sync` returns
+`anyhow::Result<()>` and was discarding it with `Ok(())`. This threads the
+failure out to it:
+
+    DeviceHandle::sync      -> Result<V4l2CaptureBuffer<V>, QueueError>
+    V4l2Device::sync        -> Result<..., QueueError>
+    PendingRequestHandle    -> Result<DoneRequestHandle<V>, QueueError>
+    RequestHandle::sync     -> Result<(), QueueError>
+    V4l2Request::sync       -> Result<(), QueueError>
+    V4l2Picture::sync       -> anyhow::Result<()>
+    DecodedHandle::sync     -> unchanged signature, now returns the error
+
+`PendingRequestHandle::sync` takes `&self` rather than `self` so a failure
+leaves the request Pending instead of destroying it, which also lets
+`RequestHandle::sync` drop its `std::mem::take` and stop passing through the
+`Unknown` state on every call. An out-of-order `sync` on an `Init` request is
+now `QueueError::State` rather than `panic!("ERROR")`.
+
+`RequestHandle::result` still panics when called before `sync`; that is API
+misuse rather than a driver condition, and `DecodedHandle::video_frame` has no
+`Result` to carry it. Left as-is deliberately.
+---
+ src/backend/v4l2/decoder/stateless.rs |  9 ++++----
+ src/device/v4l2/stateless/device.rs   | 13 ++++++++----
+ src/device/v4l2/stateless/request.rs  | 30 +++++++++++++++++----------
+ 3 files changed, 32 insertions(+), 20 deletions(-)
+
+diff --git a/src/backend/v4l2/decoder/stateless.rs b/src/backend/v4l2/decoder/stateless.rs
+index 85492b5..9fec808 100644
+--- a/src/backend/v4l2/decoder/stateless.rs
++++ b/src/backend/v4l2/decoder/stateless.rs
+@@ -46,10 +46,10 @@ impl<V: VideoFrame> V4l2Picture<V> {
+         self.ref_pictures = Some(ref_pictures);
+         self
+     }
+-    pub fn sync(&mut self) -> &mut Self {
+-        self.request.as_ref().borrow_mut().sync();
++    pub fn sync(&mut self) -> anyhow::Result<()> {
++        self.request.as_ref().borrow_mut().sync()?;
+         self.ref_pictures = None;
+-        self
++        Ok(())
+     }
+     pub fn request(&mut self) -> Rc<RefCell<V4l2Request<V>>> {
+         self.request.clone()
+@@ -90,8 +90,7 @@ impl<V: VideoFrame> DecodedHandle for V4l2StatelessDecoderHandle<V> {
+     }
+ 
+     fn sync(&self) -> anyhow::Result<()> {
+-        self.picture.borrow_mut().sync();
+-        Ok(())
++        self.picture.borrow_mut().sync()
+     }
+ 
+     fn is_ready(&self) -> bool {
+diff --git a/src/device/v4l2/stateless/device.rs b/src/device/v4l2/stateless/device.rs
+index 48d52df..3ee5086 100644
+--- a/src/device/v4l2/stateless/device.rs
++++ b/src/device/v4l2/stateless/device.rs
+@@ -136,7 +136,7 @@ impl<V: VideoFrame> DeviceHandle<V> {
+             }
+         }
+     }
+-    fn sync(&mut self, timestamp: u64) -> V4l2CaptureBuffer<V> {
++    fn sync(&mut self, timestamp: u64) -> Result<V4l2CaptureBuffer<V>, QueueError> {
+         let mut back_off_duration = Duration::from_millis(1);
+         let time_out = Duration::from_millis(120);
+         loop {
+@@ -145,7 +145,7 @@ impl<V: VideoFrame> DeviceHandle<V> {
+                     let dequeued_timestamp = buffer.timestamp();
+                     let request = self.requests.remove(&dequeued_timestamp).unwrap();
+                     if dequeued_timestamp == timestamp {
+-                        return buffer;
++                        return Ok(buffer);
+                     } else {
+                         match request.upgrade().unwrap().as_ref().try_borrow_mut() {
+                             Ok(mut request) => {
+@@ -159,7 +159,12 @@ impl<V: VideoFrame> DeviceHandle<V> {
+             }
+             back_off_duration = back_off_duration + back_off_duration;
+             if back_off_duration > time_out {
+-                panic!("there should not be a scenario where a queued frame is not returned.");
++                // A queued request that never comes back is a driver or
++                // bitstream problem, not a programming error in this crate, so
++                // it is reported rather than fatal: the caller is on a render
++                // thread and a panic there takes the whole session down.
++                log::error!("timed out waiting for capture buffer with timestamp {timestamp}");
++                return Err(QueueError::BufferDequeue);
+             }
+             sleep(back_off_duration);
+         }
+@@ -235,7 +240,7 @@ impl<V: VideoFrame> V4l2Device<V> {
+         self.handle.borrow_mut().insert_request_into_hash(Rc::downgrade(&request.clone()));
+         Ok(request)
+     }
+-    pub fn sync(&self, timestamp: u64) -> V4l2CaptureBuffer<V> {
++    pub fn sync(&self, timestamp: u64) -> Result<V4l2CaptureBuffer<V>, QueueError> {
+         self.handle.borrow_mut().sync(timestamp)
+     }
+     pub fn queue_capture_buffer(&self, frame: V) -> Result<(), QueueError> {
+diff --git a/src/device/v4l2/stateless/request.rs b/src/device/v4l2/stateless/request.rs
+index aedd12b..4b20f15 100644
+--- a/src/device/v4l2/stateless/request.rs
++++ b/src/device/v4l2/stateless/request.rs
+@@ -12,6 +12,7 @@ use v4l2r::ioctl;
+ 
+ use crate::backend::v4l2::decoder::stateless::V4l2Picture;
+ use crate::decoder::stateless::StatelessBackendError;
++use crate::device::v4l2::stateless::queue::QueueError;
+ use crate::decoder::stateless::StatelessBackendResult;
+ use crate::device::v4l2::stateless::device::V4l2Device;
+ use crate::device::v4l2::stateless::queue::V4l2CaptureBuffer;
+@@ -80,10 +81,13 @@ struct PendingRequestHandle<V: VideoFrame> {
+ }
+ 
+ impl<V: VideoFrame> PendingRequestHandle<V> {
+-    fn sync(self) -> DoneRequestHandle<V> {
+-        DoneRequestHandle {
+-            capture_buffer: Rc::new(RefCell::new(self.device.sync(self.timestamp))),
+-        }
++    /// Takes `&self` rather than `self`: on failure the request must stay
++    /// Pending so the caller can retry or report, which consuming it would make
++    /// impossible.
++    fn sync(&self) -> Result<DoneRequestHandle<V>, QueueError> {
++        Ok(DoneRequestHandle {
++            capture_buffer: Rc::new(RefCell::new(self.device.sync(self.timestamp)?)),
++        })
+     }
+     fn associate_dequeued_buffer(
+         &mut self,
+@@ -168,11 +172,15 @@ impl<V: VideoFrame> RequestHandle<V> {
+             _ => Err(StatelessBackendError::Other(anyhow::anyhow!("incorrect request state"))),
+         }
+     }
+-    fn sync(&mut self) {
+-        match std::mem::take(self) {
+-            Self::Pending(handle) => *self = Self::Done(handle.sync()),
+-            s @ Self::Done(_) => *self = s,
+-            _ => panic!("ERROR"),
++    fn sync(&mut self) -> Result<(), QueueError> {
++        match self {
++            Self::Pending(handle) => {
++                let done = handle.sync()?;
++                *self = Self::Done(done);
++                Ok(())
++            }
++            Self::Done(_) => Ok(()),
++            _ => Err(QueueError::State),
+         }
+     }
+     fn result(&self) -> V4l2Result<V> {
+@@ -230,8 +238,8 @@ impl<V: VideoFrame> V4l2Request<V> {
+     pub fn submit(&mut self) -> StatelessBackendResult<()> {
+         self.0.submit()
+     }
+-    pub fn sync(&mut self) {
+-        self.0.sync();
++    pub fn sync(&mut self) -> Result<(), QueueError> {
++        self.0.sync()
+     }
+     pub fn result(&self) -> V4l2Result<V> {
+         self.0.result()

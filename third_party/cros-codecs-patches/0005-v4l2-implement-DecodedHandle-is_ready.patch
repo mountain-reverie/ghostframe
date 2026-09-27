@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ghostframe <noreply@anthropic.com>
+Date: Sun, 27 Sep 2026 09:32:31 -0600
+Subject: [PATCH 5/5] v4l2: implement DecodedHandle::is_ready
+
+It was `todo!()`, so a caller could not ask whether a frame had finished
+decoding without panicking -- which is unfortunate, because the answer is
+exactly what lets a caller skip the blocking `sync` and do something else
+until the driver is done.
+
+The request state machine already has it: `try_dequeue_capture_buffers`
+promotes a request to `Done` as soon as its capture buffer comes back, so
+"ready" is `matches!(self, Done(_))`, non-blocking and already maintained.
+---
+ src/backend/v4l2/decoder/stateless.rs |  5 ++++-
+ src/device/v4l2/stateless/request.rs  | 11 +++++++++++
+ 2 files changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/src/backend/v4l2/decoder/stateless.rs b/src/backend/v4l2/decoder/stateless.rs
+index 9fec808..d630ebc 100644
+--- a/src/backend/v4l2/decoder/stateless.rs
++++ b/src/backend/v4l2/decoder/stateless.rs
+@@ -51,6 +51,9 @@ impl<V: VideoFrame> V4l2Picture<V> {
+         self.ref_pictures = None;
+         Ok(())
+     }
++    pub fn is_ready(&self) -> bool {
++        self.request.as_ref().borrow().is_ready()
++    }
+     pub fn request(&mut self) -> Rc<RefCell<V4l2Request<V>>> {
+         self.request.clone()
+     }
+@@ -94,7 +97,7 @@ impl<V: VideoFrame> DecodedHandle for V4l2StatelessDecoderHandle<V> {
+     }
+ 
+     fn is_ready(&self) -> bool {
+-        todo!();
++        self.picture.borrow().is_ready()
+     }
+ }
+ 
+diff --git a/src/device/v4l2/stateless/request.rs b/src/device/v4l2/stateless/request.rs
+index 4b20f15..828b9f4 100644
+--- a/src/device/v4l2/stateless/request.rs
++++ b/src/device/v4l2/stateless/request.rs
+@@ -183,6 +183,14 @@ impl<V: VideoFrame> RequestHandle<V> {
+             _ => Err(QueueError::State),
+         }
+     }
++    /// Whether the decode has completed and [`Self::result`] is safe to call.
++    ///
++    /// Non-blocking, unlike [`Self::sync`]: `try_dequeue_capture_buffers`
++    /// promotes a request to `Done` as soon as its capture buffer comes back, so
++    /// this is exactly "has the driver returned this frame yet".
++    fn is_ready(&self) -> bool {
++        matches!(self, Self::Done(_))
++    }
+     fn result(&self) -> V4l2Result<V> {
+         match self {
+             Self::Done(handle) => handle.result(),
+@@ -241,6 +249,9 @@ impl<V: VideoFrame> V4l2Request<V> {
+     pub fn sync(&mut self) -> Result<(), QueueError> {
+         self.0.sync()
+     }
++    pub fn is_ready(&self) -> bool {
++        self.0.is_ready()
++    }
+     pub fn result(&self) -> V4l2Result<V> {
+         self.0.result()
+     }

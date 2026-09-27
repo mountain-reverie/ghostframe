@@ -286,9 +286,17 @@ fn main() {
         },
     )));
 
-    let mut decoder = StatelessDecoder::<H264, _>::new_v4l2(BlockingMode::NonBlocking)
-        .expect("cannot create decoder")
-        .into_trait_object();
+    // Named explicitly, through patch 0001's `new_v4l2_with_device_path`. An
+    // earlier draft of that patch read `CROS_CODECS_V4L2_DEVICE` inside
+    // `enumerate_devices`; the landed one plumbs a path, so the env var is this
+    // probe's own UI and nothing more. Unset means "let the scan choose", which
+    // on most boards picks the wrong node -- see the README.
+    let device = std::env::var_os("CROS_CODECS_V4L2_DEVICE").map(std::path::PathBuf::from);
+    log::info!("decoding on {device:?} (None = cros-codecs' own scan)");
+    let mut decoder =
+        StatelessDecoder::<H264, _>::new_v4l2_with_device_path(device, BlockingMode::NonBlocking)
+            .expect("cannot create decoder")
+            .into_trait_object();
 
     let pool_for_alloc = framepool.clone();
     let mut frames = 0usize;
