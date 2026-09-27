@@ -38,11 +38,33 @@ The practical consequence: **treat this delta as long-lived.** It is the reason
 the patches are a readable series with real commit messages rather than one
 squashed diff.
 
-`nuxodecs 0.1.4` is a published third-party fork that independently fixes 0003
-(partially), 0004 and 0005. It is **not** a drop-in replacement: it leaves 0001
-and 0002 unfixed, and its 0003 equivalent gates only the `use` statement, so
-`detile_row`'s `uint8x16_t` / `vld1q_u8` / `vst1q_u8` still fail on x86 one error
-later. Recorded so nobody re-derives it.
+## Is there a better-maintained alternative? No — surveyed 2026-09-27
+
+Upstream being dormant is a maintenance problem, so this was checked properly
+rather than assumed. Every candidate, and why none of them is the answer:
+
+| Candidate | Fixes | Verdict |
+| --- | --- | --- |
+| `nuxodecs 0.1.4` | 0004, 0005; 0003 **partially** | Actively maintained (0.1.2→0.1.4 in Sept 2026) but one maintainer, 1 star, 0 forks. Leaves 0001 and 0002. Its 0003 gates only the `use` statement, so `detile_row`'s `uint8x16_t` / `vld1q_u8` / `vst1q_u8` still fail on x86 one error later — it *looks* fixed to a grep and is not |
+| `cros-codecs-extended 0.0.5-extended.2` | **none of the five** | Based on 0.0.5, older than what we use. Last push Aug 2026, 0 stars |
+| `cros-codecs-generic-vaapi` | n/a | VA-API surface work; nothing to do with V4L2 |
+| ffmpeg `v4l2request` hwaccel | all of them, by not needing the crate | **Dead end in practice.** Would reuse our existing ffmpeg decoder and drop this dependency entirely — but Arch Linux ARM's ffmpeg PKGBUILD does not pass `--enable-v4l2-request` even at 9.0.2, so no distro build has the hwaccel. Requires shipping a custom ffmpeg, i.e. moving the burden onto every user |
+| GStreamer `v4l2slh264dec` | all of them, by not needing the crate | **The genuine alternative.** Already verified on this hardware: bit-exact, 60 frames, dmabuf-backed (design §6.2, `tools/hw-probe/dmabuf_probe.py`). Distro-maintained, zero patches. Cost is a heavy runtime dependency and a different integration model |
+
+So switching forks would trade a dormant, Google-authored, *pinned* crate for an
+active one-person fork — while still carrying two or three patches, absorbing
+0.1.x API churn, and inheriting changes nobody here has reviewed. That is worse,
+not better.
+
+**The mitigation is not a different crate; it is that this delta is a readable
+series against a frozen version.** A pinned dependency that never changes is also
+a dependency that never breaks under us. What dormancy actually costs is the
+option the design doc counted on — "an upstreamed patch reduces the carried delta
+to zero" — and that is now off the table, which is recorded in the design's risk
+section rather than left as a stale hope.
+
+If the delta ever does become painful, GStreamer is the exit, and it is already
+proven on the reference machine.
 
 ## Applying them
 
