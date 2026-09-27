@@ -121,6 +121,40 @@ gives a queued request ~250 ms and then
 candidate patches, and the decoder logs at TRACE before it can block so the
 panic has a precursor.
 
+### `cros-codecs`' `v4l2` feature does not compile off aarch64
+
+`image_processing.rs:15` is `#[cfg(feature = "v4l2")] use std::arch::aarch64::*;`
+— gated on the **feature**, not the architecture — so the MM21 NEON detiling path
+is unconditional whenever `v4l2` is on. Upstream targets ChromeOS ARM devices,
+where the two coincide; on an x86-64 runner the build dies with
+`could not find aarch64 in arch` from inside the dependency.
+
+Found by CI, not locally, because every local build of this was on aarch64. The
+same trap AGENTS.md already records for the aarch64 clippy lint, from the other
+direction.
+
+Two consequences, and the second is the expensive one:
+
+1. **The `v4l2` backend is aarch64-only as published.** Not inherently — nothing
+   in the V4L2 Request API or in `v4l2_frame.rs` is ARM-specific — so fixing the
+   gate upstream would lift it. But CI builds cros-codecs from crates.io, so a
+   *carried* patch cannot make an x86 build work either. `ghostframe-client-h264`
+   now carries a `compile_error!` naming the reason, so the attempt fails with a
+   sentence instead of with a dependency's arch error.
+2. **The decode backend must be a separate feature axis from the GPU backend.**
+   It was briefly folded into `gles`, on the reasoning that the machine with no
+   Vulkan driver is the machine with no VA-API driver. That reasoning is sound
+   about hardware and wrong about CI: cargo features are additive, so a coupled
+   `gles` leaves **no flag combination** that compiles the GLES render path on an
+   x86 runner. It silently destroyed the only guard that path has — the one PR
+   #102 added precisely because no runner has a Mali GPU. `gles,decode-vaapi` is
+   a combination no real machine runs, and that is its entire purpose.
+
+Cross-compiling (`--target aarch64-unknown-linux-gnu`) would check the real code
+on an x86 runner and is the better answer if anyone wants it, but `v4l2r` runs
+bindgen in its build script, so it needs a target sysroot and libclang wired into
+CI first.
+
 ### `/dev/videoN` numbering is not stable across boots
 
 **rkvdec moved from `/dev/video3` to `/dev/video1` over a single reboot**,

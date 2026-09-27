@@ -55,26 +55,34 @@ jobs:
       # GPU, so its tests cannot run here -- which is exactly why the compile
       # must be checked: a feature nobody builds is already broken. Hardware
       # verification is `just test-client-gles` on a GLES 3.1 device.
-      - run: cargo clippy -p ghostframe-client-gpu --no-default-features --features gles,test-support --all-targets -- -D warnings
+      #
+      # `decode-vaapi` is named explicitly, and that is not redundant. The decode
+      # backend is a separate feature axis from the GPU backend (see
+      # ghostframe-client-gpu's [features]) because cros-codecs' `v4l2` feature
+      # does not compile on x86-64 at all -- it gates a NEON path on the feature
+      # instead of the architecture. Cargo features are additive, so if `gles`
+      # pulled `v4l2` in there would be NO flag combination that checks the GLES
+      # code on this runner, and this guard would be dead. It was, briefly.
+      - run: cargo clippy -p ghostframe-client-gpu --no-default-features --features gles,decode-vaapi,test-support --all-targets -- -D warnings
       # And the whole chain under `gles`, because cargo unions features across
       # the graph: a crate further up depending on ghostframe-client-h264 with
       # defaults left on re-enables `vaapi`, collides with `v4l2`, and the
       # client-gpu-only check above stays green while the binary cannot link.
       # Measured -- ghostframe-client-native had exactly that dependency.
-      - run: cargo check -p ghostframe-cli --no-default-features --features gles
-      # The V4L2 stateless decode backend, for the same reason. It comes along
-      # with `gles` above, but is checked on its own too so a break is
-      # attributed to the decoder rather than to the GPU backend -- and so the
-      # backend-only combination (v4l2 with no test-support, i.e. no ffmpeg
-      # linked at all) is covered, which the line above does not reach.
+      - run: cargo check -p ghostframe-cli --no-default-features --features gles,decode-vaapi
+      # There is deliberately NO x86 check of `ghostframe-client-h264`'s `v4l2`
+      # backend, and it is not an oversight to fix by adding one: cros-codecs
+      # 0.0.6 cannot compile off aarch64 with that feature on
+      # (image_processing.rs:15, `#[cfg(feature = "v4l2")] use
+      # std::arch::aarch64::*`). The crate carries a `compile_error!` saying so,
+      # so the attempt fails with a sentence rather than with
+      # `could not find aarch64 in arch` from a dependency.
       #
-      # Note this checks it against UNPATCHED cros-codecs from crates.io. The
-      # backend needs two patches to select the right V4L2 device at run time
-      # (tools/hw-probe/v4l2-expbuf-rs/cros-codecs-0.0.6.patch); without them
-      # it compiles and then refuses at startup, which is the designed
-      # behaviour -- the session falls back to tile codecs. Hardware
-      # verification is `just test-client-v4l2` on an RK3399-class device.
-      - run: cargo clippy -p ghostframe-client-h264 --no-default-features --features v4l2 --all-targets -- -D warnings
+      # Cross-compiling would check it for real, but v4l2r runs bindgen in its
+      # build script and would need a target sysroot and libclang wired up here.
+      # Until someone wants that, the V4L2 backend's guard is `just check-v4l2`
+      # plus `just test-client-v4l2` on the RK3399 reference machine, where the
+      # 12 hardware tests run against a software golden.
       - name: ghostframe-lib reads env only in config.rs
         run: |
           # Comment lines are excluded deliberately: the guard constrains code,

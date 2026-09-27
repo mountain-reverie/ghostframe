@@ -85,7 +85,7 @@ half = "2"
 # `#[cfg(test)]` builds reach `nv12_reference` without the feature; a
 # `tests/*.rs` integration test, a separate crate unit, needs it explicitly.
 [features]
-default = ["vulkan"]
+default = ["vulkan", "decode-vaapi"]
 test-support = []
 
 # Exactly one backend. Mutually exclusive, enforced by a `compile_error!` in
@@ -101,7 +101,7 @@ test-support = []
 #
 # Revisit only for a single distro package covering both GPUs, which nobody
 # has asked for.
-vulkan = ["dep:ash", "wgpu/vulkan", "wgpu-hal/vulkan", "ghostframe-client-h264/vaapi"]
+vulkan = ["dep:ash", "wgpu/vulkan", "wgpu-hal/vulkan"]
 
 # For GPUs with no Vulkan driver at all -- Mali Midgard being the case that
 # forced this (Mesa's PanVK matrix starts Vulkan at Bifrost). Needs GLES 3.1
@@ -109,14 +109,25 @@ vulkan = ["dep:ash", "wgpu/vulkan", "wgpu-hal/vulkan", "ghostframe-client-h264/v
 # `EGL_EXT_image_dma_buf_import`; `WgpuContext::new` checks for them and
 # refuses to start without export, the same way the Vulkan path refuses
 # without `VK_KHR_external_memory_fd`.
-# Carries the decode backend with it, deliberately. In principle "which GPU
-# API" and "which video decoder" are separate axes; in practice the machine
-# that has no Vulkan driver is the machine that has no VA-API driver either,
-# and `import_gles.rs` is the only importer for a V4L2-decoded buffer. Splitting
-# them would add a feature combination nobody can run.
-gles = [
-    "dep:khronos-egl",
-    "wgpu/gles",
-    "wgpu-hal/gles",
-    "ghostframe-client-h264/v4l2",
-]
+gles = ["dep:khronos-egl", "wgpu/gles", "wgpu-hal/gles"]
+
+# The DECODE backend, a separate axis from the GPU backend above. Exactly one,
+# same as the GPU pair, and forwarded to `ghostframe-client-h264` rather than
+# decided there so a consumer picks both once at the top of the tree.
+#
+# These were briefly folded into `vulkan`/`gles` -- the machine with no Vulkan
+# driver is the machine with no VA-API driver, so the pairing looked free. It is
+# not, and the reason is worth keeping: **`cros-codecs 0.0.6`'s `v4l2` feature
+# does not compile on x86-64 at all.** Its `image_processing.rs:15` reads
+# `#[cfg(feature = "v4l2")] use std::arch::aarch64::*;` -- gated on the feature,
+# not the architecture -- so the MM21 NEON path is unconditional under `v4l2`.
+#
+# Cargo features are additive, so a coupled `gles` could not be checked on an
+# x86 runner by any combination of flags: `gles` would drag `v4l2` in and the
+# build would fail in a dependency. That silently destroyed CI's only guard on
+# the GLES render path, which exists precisely because no runner has a Mali GPU
+# (see .github/workflows/ci.yml). Separate axes let CI compile every line of the
+# GLES code as `gles,decode-vaapi` while the real ARM build is
+# `gles,decode-v4l2`.
+decode-vaapi = ["ghostframe-client-h264/vaapi"]
+decode-v4l2 = ["ghostframe-client-h264/v4l2"]

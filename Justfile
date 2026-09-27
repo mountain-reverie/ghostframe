@@ -55,22 +55,33 @@ lint-client:
 # CI can only *check* this (no runner has a Mali GPU), which is exactly why it
 # must be checked: a feature nobody builds is already broken. On real hardware
 # run `test-client-gles` instead.
+#
+# Pairs `gles` with `decode-vaapi`, which is a combination no real machine runs
+# and is the point: it is the only way to compile-check every line of the GLES
+# render path on an x86 runner, because cros-codecs' `v4l2` feature does not
+# build off aarch64 and cargo features cannot be subtracted. The real ARM build
+# is `gles,decode-v4l2` -- see `build-client-gles`.
 check-gles:
-    cargo clippy -p ghostframe-client-gpu --no-default-features --features gles,test-support --all-targets -- -D warnings
+    cargo clippy -p ghostframe-client-gpu --no-default-features --features gles,decode-vaapi,test-support --all-targets -- -D warnings
     # The whole chain, not just client-gpu. Cargo unions features across the
     # entire graph, so a crate further up that depends on client-h264 with
-    # defaults left on re-enables `vaapi` and collides with the `v4l2` that
-    # `gles` selects -- from a manifest the line above never looks at. That
-    # happened: client-native had exactly that dependency, and a client-gpu-only
-    # gate reported green while `just build-client-gles` could not link.
-    cargo check -p ghostframe-cli --no-default-features --features gles
+    # defaults left on re-enables the other backend and collides -- from a
+    # manifest the line above never looks at. That happened: client-native had
+    # exactly that dependency, and a client-gpu-only gate reported green while
+    # `just build-client-gles` could not link.
+    cargo check -p ghostframe-cli --no-default-features --features gles,decode-vaapi
 
 # The V4L2 stateless H.264 decode backend, for a machine with no VA-API driver.
 # Comes along with `check-gles` (the `gles` feature forwards to it), and checked
 # separately so a break is attributed to the decoder rather than the GPU
 # backend, and so the no-ffmpeg-at-all combination is covered.
+# aarch64 ONLY: cros-codecs 0.0.6 gates its NEON MM21 path on the `v4l2` feature
+# rather than on the target architecture, so this cannot build on x86 and CI does
+# not try. The crate says so with a `compile_error!` rather than letting the
+# failure come from a dependency.
 check-v4l2:
     cargo clippy -p ghostframe-client-h264 --no-default-features --features v4l2 --all-targets -- -D warnings
+    cargo check -p ghostframe-cli --no-default-features --features gles,decode-v4l2
 
 # The V4L2 backend's tests, including the exactness oracle against a software
 # decode. Needs a stateless V4L2 H.264 decoder -- verified on RK3399/rkvdec --
@@ -86,13 +97,13 @@ test-client-v4l2:
 # (cli -> client-native -> client-gpu), so it is selected once here rather
 # than per crate.
 build-client-gles:
-    cargo build -p ghostframe-cli --no-default-features --features gles
+    cargo build -p ghostframe-cli --no-default-features --features gles,decode-v4l2
 
 # The GLES backend's tests. Needs a GLES 3.1 device with
 # EGL_MESA_image_dma_buf_export -- verified on Mali-T860/panfrost. Skips
 # gpu_import (Vulkan-only; see that file's header).
 test-client-gles:
-    cargo test -p ghostframe-client-gpu --no-default-features --features gles,test-support
+    cargo test -p ghostframe-client-gpu --no-default-features --features gles,decode-v4l2,test-support
 
 # Build, lint and test the native client -- the client-only `ci-local`.
 ci-client: build-client

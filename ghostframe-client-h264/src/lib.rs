@@ -45,6 +45,25 @@ compile_error!(
 compile_error!(
     "ghostframe-client-h264: enable exactly one decode backend, `vaapi` (default) or `v4l2`."
 );
+// `cros-codecs 0.0.6` cannot be built off aarch64 with its `v4l2` feature on:
+// `image_processing.rs:15` is `#[cfg(feature = "v4l2")] use std::arch::aarch64::*;`
+// -- gated on the feature rather than the architecture -- so its MM21 NEON path
+// is unconditional there. Without this the failure is
+// `could not find aarch64 in arch`, from a dependency, with nothing pointing at
+// the feature that asked for it.
+//
+// Not a limitation of this backend: the V4L2 Request API is not ARM-specific and
+// neither is anything in `v4l2_frame.rs`. Fixing the gate upstream would lift it,
+// and it is a candidate patch -- but CI builds cros-codecs from crates.io, so a
+// carried patch could not make an x86 build work anyway. `v4l2` is checked on the
+// reference machine (`just check-v4l2`) instead.
+#[cfg(all(feature = "v4l2", not(target_arch = "aarch64")))]
+compile_error!(
+    "ghostframe-client-h264: the `v4l2` backend needs aarch64, because \
+     cros-codecs 0.0.6 gates its NEON MM21 path on the `v4l2` FEATURE rather than \
+     on the target architecture (image_processing.rs:15). Use the default `vaapi` \
+     backend on this target."
+);
 
 #[cfg(feature = "vaapi")]
 pub mod decoder;
