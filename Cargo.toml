@@ -131,9 +131,10 @@ ffmpeg-sys-next = { version = "=9.0.0" }
 #
 # Pinned exactly, like every other entry here, and that matters more than
 # usual for a 0.0.x crate whose API churns: 0.0.6 is the version the hardware
-# feasibility work measured against, and the two patches we carry
-# (tools/hw-probe/v4l2-expbuf-rs/cros-codecs-0.0.6.patch) are written against
-# it line by line.
+# work measured against, and the five patches we carry
+# (third_party/cros-codecs-patches/) are written against it line by line. It is
+# also still the newest published version -- upstream's last commit is from
+# March 2025.
 cros-codecs = { version = "=0.0.6", default-features = false, features = ["v4l2"] }
 
 # There is deliberately no `v4l2r` entry here, even though this backend calls

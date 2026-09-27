@@ -17,10 +17,13 @@ for the measurements and what they change in the plan.
 ## The point of it
 
 `V4l2ExpbufVideoFrame` in `src/main.rs` is a `cros_codecs::video_frame::VideoFrame`
-implemented **downstream of the crate**. That is the finding that matters: the
-decode-side frame type does not need a cros-codecs fork, only the two one-line
-patches in `cros-codecs-0.0.6.patch`. It is written to be lifted into
-`ghostframe-client-h264` more or less as-is.
+implemented **downstream of the crate**. That is the finding that mattered: the
+decode-side frame type does not need a cros-codecs fork.
+
+It has since been lifted into `ghostframe-client-h264` (`v4l2_frame.rs`), so this
+probe is kept as the standalone reproduction rather than as the implementation.
+The patches it needs now live in `third_party/cros-codecs-patches/` -- five of
+them, not the two this probe was written against.
 
 Three things in it are load-bearing, and each was found by watching the probe
 fail:
@@ -45,10 +48,12 @@ fail:
 ## Running it
 
 ```sh
-# 1. Unpack cros-codecs 0.0.6 and apply the two patches.
+# 1. Unpack cros-codecs 0.0.6 and apply the series.
+#    See third_party/cros-codecs-patches/README.md for the full recipe.
 cargo fetch   # anywhere, to populate ~/.cargo/registry
 cp -r ~/.cargo/registry/src/*/cros-codecs-0.0.6 /tmp/cros
-( cd /tmp/cros && patch -p1 < .../tools/hw-probe/v4l2-expbuf-rs/cros-codecs-0.0.6.patch )
+( cd /tmp/cros && git init -q && git add -A && git commit -qm base \
+    && git am .../third_party/cros-codecs-patches/*.patch )
 
 # 2. Point this crate's path dependency at it (Cargo.toml expects ../cros).
 # 3. A clip and a software golden to compare against.
@@ -68,9 +73,16 @@ CROS_CODECS_V4L2_DEVICE=/dev/videoN RUST_LOG=info \
 cmp hw.i420 sw.i420
 ```
 
-`CROS_CODECS_V4L2_DEVICE` is what the first patch adds; without it the crate's
-scan takes the first node with an OUTPUT mplane queue, with no check that it
-decodes anything.
+`CROS_CODECS_V4L2_DEVICE` is an env-var override this probe still uses, from an
+earlier draft of patch 0001. The landed patch plumbs a real
+`new_v4l2_with_device_path` instead, which is what `ghostframe-client-h264` uses
+-- no environment variable, nothing to keep in sync, and no stale value to go
+wrong. The probe keeps the env var only because it is a one-file reproduction;
+do not copy the pattern.
+
+Either way the point stands: without an explicit device the crate's scan takes
+the first node with an OUTPUT mplane queue, with no check that it decodes
+anything.
 
 **`/dev/videoN` numbering is not stable across boots.** On the reference machine
 rkvdec and the hantro decoder swapped places -- video3 and video1 -- over a

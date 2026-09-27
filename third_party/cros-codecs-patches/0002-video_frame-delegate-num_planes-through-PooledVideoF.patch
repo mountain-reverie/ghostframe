@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ghostframe <noreply@anthropic.com>
+Date: Sun, 27 Sep 2026 09:24:16 -0600
+Subject: [PATCH 2/5] video_frame: delegate num_planes through PooledVideoFrame
+
+`PooledVideoFrame` forwards every other `VideoFrame` method to its inner
+frame -- fourcc, resolution, get_plane_size, get_plane_pitch, map, map_mut,
+fill_v4l2_plane, process_dqbuf -- but not `num_planes`, so it silently falls
+back to the trait default.
+
+That default derives the count from the fourcc: 2 for NV12. A `VideoFrame`
+that overrides it, as any implementation must when the driver reports a
+single V4L2 plane for a contiguous format, loses the override as soon as the
+frame goes into a pool. `BufferHandles::len()` then disagrees with the queue
+and QBUF fails `NumPlanesMismatch(2, 1)`, several layers from the cause.
+
+The same hole opens for any defaulted method added later.
+---
+ src/video_frame/frame_pool.rs | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/video_frame/frame_pool.rs b/src/video_frame/frame_pool.rs
+index b186b72..7807d59 100644
+--- a/src/video_frame/frame_pool.rs
++++ b/src/video_frame/frame_pool.rs
+@@ -47,6 +47,10 @@ impl<V: VideoFrame> VideoFrame for PooledVideoFrame<V> {
+         self.inner.as_ref().unwrap().resolution()
+     }
+ 
++    fn num_planes(&self) -> usize {
++        self.inner.as_ref().unwrap().num_planes()
++    }
++
+     fn get_plane_size(&self) -> Vec<usize> {
+         self.inner.as_ref().unwrap().get_plane_size()
+     }

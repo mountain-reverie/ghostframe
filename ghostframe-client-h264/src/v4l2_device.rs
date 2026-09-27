@@ -1,47 +1,28 @@
 //! Which `/dev/videoN` is the stateless H.264 decoder — asked with raw ioctls.
 //!
-//! Two callers, and the second is why this uses `libc::ioctl` directly instead
-//! of the perfectly good `v4l2r` that `cros-codecs` already re-exports:
+//! `probe.rs` needs an **independent ground truth** for the oracles: "does this
+//! machine have a hardware H.264 decoder?" answered without going through the
+//! thing being validated. That is the same role `vainfo_reports_h264_vld` plays
+//! for the VA-API backend, and it only works if it shares no code with the
+//! decode path. Reaching the answer through `cros_codecs::v4l2r` would share the
+//! dependency that selects and opens the device.
 //!
-//! 1. [`H264Decoder::with_device`](crate::decoder::H264Decoder::with_device)
-//!    needs to know whether the device it was asked for is the one the decoder
-//!    will actually get.
-//! 2. `probe.rs` needs an **independent ground truth** for the oracles —
-//!    "does this machine have a hardware H.264 decoder?" answered without
-//!    going through the thing being validated. That is the same role
-//!    `vainfo_reports_h264_vld` plays for the VA-API backend, and it only
-//!    works if it shares no code with the decode path. Reaching the answer
-//!    through `cros_codecs::v4l2r` would share the dependency that selects and
-//!    opens the device, which is exactly the part that has been wrong.
+//! So: `VIDIOC_ENUM_FMT`, and nothing else.
 //!
-//! So: `VIDIOC_QUERYCAP` and `VIDIOC_ENUM_FMT`, and nothing else.
+//! [`find_h264_decoder`] is also how the decoder picks its node, and why
+//! `probe::default_device()` is a function rather than a constant: `/dev/videoN`
+//! numbering is **not stable across boots**. On the reference machine rkvdec and
+//! the hantro decoder swapped places, video3 and video1, over a single reboot.
+//! Enumerating `S264` is the only durable way to name the right one.
 //!
-//! ## Why [`cros_codecs_would_pick`] exists at all
-//!
-//! `cros-codecs 0.0.6` selects its device by scanning `/dev/video0..`, taking
-//! the first node that has an OUTPUT mplane queue and a matching media device,
-//! **with no check that it decodes anything**. On RK3399 that is `/dev/video0`
-//! — the hantro *encoder* — and decode dies with `Unrecoverable decoding
-//! error` even though rkvdec on `/dev/video3` handles the same stream fine.
-//! `C2V4L2DecoderOptions::video_device_path` exists for this and is marked
-//! `TODO: This is currently unused`.
-//!
-//! We carry a patch that honours `CROS_CODECS_V4L2_DEVICE`
-//! (`tools/hw-probe/v4l2-expbuf-rs/cros-codecs-0.0.6.patch`, upstreamable).
-//! This module lets the decoder detect, before it tries, whether that patch is
-//! doing its job — and refuse cleanly if it is not, so the session falls back
-//! to tile codecs instead of opening an encoder and failing per frame.
+//! This module used to be twice this size, predicting which node `cros-codecs`'
+//! own scan would settle on so the decoder could refuse a mismatch. Patch 0001
+//! of `third_party/cros-codecs-patches/` lets the caller name the device
+//! outright, which retired all of it.
 
 use std::ffi::c_ulong;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
-
-/// The environment variable the carried cros-codecs patch reads.
-///
-/// Deliberately *read* here and never written: `setenv(3)` races `getenv(3)`
-/// in any other thread, and this crate is driven from a render thread inside a
-/// multi-threaded process. Packaging sets it; see the crate docs.
-pub const DEVICE_OVERRIDE_ENV: &str = "CROS_CODECS_V4L2_DEVICE";
 
 /// `V4L2_PIX_FMT_H264_SLICE` — `S264`, the coded format a *stateless* decoder
 /// accepts. Not `H264`: that fourcc is what a stateful decoder takes, and the
@@ -144,51 +125,6 @@ pub fn find_h264_decoder() -> Option<PathBuf> {
         .find(|p| enumerates_h264_slice(p))
 }
 
-/// The device `cros-codecs`' unpatched scan would settle on.
-///
-/// Replicates `enumerate_devices()`: first node that opens and has an OUTPUT
-/// mplane queue. It skips the media-device lookup, which makes this the
-/// *optimistic* prediction — if even this says the wrong device, the real scan
-/// certainly does. Read-only; it opens nothing it does not close.
-pub fn cros_codecs_would_pick() -> Option<PathBuf> {
-    for n in 0..MAX_DEVICE_NO {
-        let path = PathBuf::from(format!("/dev/video{n}"));
-        let Some(fd) = open_video(&path) else {
-            continue;
-        };
-        if !output_formats(&fd).is_empty() {
-            return Some(path);
-        }
-    }
-    None
-}
-
-/// Whether the override in the environment names `path`.
-pub fn override_selects(path: &Path) -> bool {
-    std::env::var_os(DEVICE_OVERRIDE_ENV).is_some_and(|v| Path::new(&v) == path)
-}
-
-/// The node `cros-codecs` will actually open: the override if one is set,
-/// otherwise its own scan.
-///
-/// The override wins because that is what the carried patch does, and modelling
-/// it that way is the only way to catch a **stale** override. `/dev/videoN`
-/// numbering is not stable across boots here -- rkvdec and the hantro decoder
-/// swapped places (video3 and video1) over a single reboot -- so an override
-/// recorded in a service file or a shell profile quietly starts naming the wrong
-/// driver, and "an override is set" is no evidence it is the right one.
-///
-/// Imperfect in one direction, and safely so: with the patch applied an
-/// *unusable* override falls back to the scan, which this reports as a mismatch
-/// rather than following. That yields a clean refusal and a message telling the
-/// caller to fix the override -- better than guessing right by accident.
-pub fn device_cros_codecs_will_open() -> Option<PathBuf> {
-    match std::env::var_os(DEVICE_OVERRIDE_ENV) {
-        Some(v) if !v.is_empty() => Some(PathBuf::from(v)),
-        _ => cros_codecs_would_pick(),
-    }
-}
-
 /// Serialises tests that drive the real decoder.
 ///
 /// One stateless decoder, one request queue: two `H264Decoder`s streaming on the
@@ -235,14 +171,6 @@ mod tests {
     fn a_missing_device_is_simply_not_a_decoder() {
         assert!(!enumerates_h264_slice(Path::new(
             "/dev/ghostframe-no-such-video-device"
-        )));
-    }
-
-    #[test]
-    fn override_selects_compares_the_whole_path() {
-        // Reading only: whatever the ambient value is, it is not this.
-        assert!(!override_selects(Path::new(
-            "/dev/video-that-nobody-would-set"
         )));
     }
 }

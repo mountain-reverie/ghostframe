@@ -1,0 +1,13 @@
+[package]
+name = "gst-dmabuf-rs"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+gstreamer = "0.25"
+gstreamer-app = "0.25"
+gstreamer-video = "0.25"
+gstreamer-allocators = "0.25"
+libc = "0.2"
+
+[workspace]

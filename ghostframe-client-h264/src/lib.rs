@@ -25,13 +25,11 @@
 //! choice because they share no code below that surface -- the same reasoning
 //! as `ghostframe-client-gpu`'s `vulkan`/`gles` split (design §4.6).
 //!
-//! **The `v4l2` backend needs a patched `cros-codecs`.** Upstream 0.0.6 picks
-//! its V4L2 device by scanning for the first node with an OUTPUT mplane queue,
-//! which on RK3399 is the hantro *encoder*; the 25-line fix is
-//! `tools/hw-probe/v4l2-expbuf-rs/cros-codecs-0.0.6.patch`, and the override it
-//! adds is read from `CROS_CODECS_V4L2_DEVICE`. Without both,
-//! [`decoder::H264Decoder::with_device`] refuses at startup and the session runs
-//! on tile codecs -- degraded, not broken. See [`v4l2_device`].
+//! **The `v4l2` backend needs a patched `cros-codecs`.** Five patches against
+//! 0.0.6, all upstreamable, in `third_party/cros-codecs-patches/` -- see that
+//! README for what each fixes and why the delta is long-lived. Without them the
+//! crate does not build here, so there is no degraded mode to reason about: the
+//! feature is off by default and only the reference machine turns it on.
 
 // Exactly one backend, and say so clearly rather than failing with a
 // missing-module error twenty lines down.
@@ -45,18 +43,19 @@ compile_error!(
 compile_error!(
     "ghostframe-client-h264: enable exactly one decode backend, `vaapi` (default) or `v4l2`."
 );
-// `cros-codecs 0.0.6` cannot be built off aarch64 with its `v4l2` feature on:
-// `image_processing.rs:15` is `#[cfg(feature = "v4l2")] use std::arch::aarch64::*;`
-// -- gated on the feature rather than the architecture -- so its MM21 NEON path
-// is unconditional there. Without this the failure is
-// `could not find aarch64 in arch`, from a dependency, with nothing pointing at
-// the feature that asked for it.
+// `cros-codecs 0.0.6` as published cannot be built off aarch64 with its `v4l2`
+// feature on: `image_processing.rs:15` is
+// `#[cfg(feature = "v4l2")] use std::arch::aarch64::*;` -- gated on the feature
+// rather than the architecture -- so its MM21 NEON path is unconditional there.
+// Without this guard the failure is `could not find aarch64 in arch`, from a
+// dependency, with nothing pointing at the feature that asked for it.
 //
 // Not a limitation of this backend: the V4L2 Request API is not ARM-specific and
-// neither is anything in `v4l2_frame.rs`. Fixing the gate upstream would lift it,
-// and it is a candidate patch -- but CI builds cros-codecs from crates.io, so a
-// carried patch could not make an x86 build work anyway. `v4l2` is checked on the
-// reference machine (`just check-v4l2`) instead.
+// neither is anything in `v4l2_frame.rs`. Patch 0003 of
+// `third_party/cros-codecs-patches/` fixes the gate, and a patched checkout does
+// `cargo check` clean for x86-64 -- but CI builds cros-codecs from crates.io, so
+// this guard describes the configuration everyone else actually gets. It comes
+// out if the patch ever lands upstream.
 #[cfg(all(feature = "v4l2", not(target_arch = "aarch64")))]
 compile_error!(
     "ghostframe-client-h264: the `v4l2` backend needs aarch64, because \
