@@ -66,6 +66,12 @@ pub struct EmitterStats {
     pub ack_miss: u64,
     pub nack_hit: u64,
     pub nack_miss: u64,
+    /// Entries removed by `retire_stuck` because they had been retransmitting
+    /// for longer than any plausible delivery. Each one was costing a
+    /// retransmit every `RTO_BACKOFF_MAX` forever. Non-zero means the link or
+    /// the ACK path is failing to retire content the normal way; sustained
+    /// growth is a defect, not a tuning matter.
+    pub stuck_entries_retired: u64,
     /// Datagrams the transport refused, each of which was re-queued rather
     /// than dropped. Non-zero means `Blocked` is being exercised, which is
     /// the condition `DatagramsUnblocked` and the whole continuation path
@@ -383,6 +389,20 @@ impl ReliableTileEmitter {
     /// Number of cache entries currently held — i.e. unACKed tile-passes
     /// awaiting either an ACK, a `cancel_for_tile`, or session end.
     /// Diagnostic accessor for the cumulative-emit log.
+    /// Retire entries that have been pending longer than `older_than`, and
+    /// return their keys so the caller can arrange for the content to be sent
+    /// again fresh.
+    ///
+    /// The returned keys are NOT "dropped frames" — the caller is expected to
+    /// force the affected tiles dirty, so the content is re-encoded at a
+    /// current `frame_seq` and re-sent. That is strictly better than what it
+    /// replaces: the retired payload was a snapshot from `older_than` ago.
+    pub fn retire_stuck(&mut self, now: Instant, older_than: Duration) -> Vec<EmitKey> {
+        let retired = self.cache.retire_older_than(now, older_than);
+        self.stats.stuck_entries_retired += retired.len() as u64;
+        retired
+    }
+
     pub fn pending_cache_entries(&self) -> usize {
         self.cache.len()
     }
@@ -972,6 +992,116 @@ mod tests {
         assert_eq!(sender.sent.len(), 2);
         assert_eq!(e.stats.nack_hit, 1);
         assert_eq!(e.cache.get(&key).unwrap().attempts, 1);
+    }
+
+    #[test]
+    fn retire_stuck_removes_only_entries_past_the_age() {
+        let t0 = Instant::now();
+        let mut e = ReliableTileEmitter::new(t0);
+        e.submit_one(
+            EmitKey::new(1, 0, 0, 0),
+            fake_source(1, 0, 0xAA),
+            t0,
+            None,
+            t0,
+        );
+        // 10 s later, a second entry.
+        let t10 = t0 + Duration::from_secs(10);
+        e.submit_one(
+            EmitKey::new(2, 0, 1, 0),
+            fake_source(1, 0, 0xBB),
+            t10,
+            None,
+            t10,
+        );
+        assert_eq!(e.pending_cache_entries(), 2);
+
+        // At t0+20 with a 15 s threshold, only the first is past it.
+        let retired = e.retire_stuck(t0 + Duration::from_secs(20), Duration::from_secs(15));
+        assert_eq!(retired, vec![EmitKey::new(1, 0, 0, 0)]);
+        assert_eq!(e.pending_cache_entries(), 1);
+        assert_eq!(e.stats.stuck_entries_retired, 1);
+    }
+
+    #[test]
+    fn retire_stuck_is_exclusive_at_the_boundary() {
+        // `> older_than`, not `>=`: an entry exactly at the threshold has not
+        // yet exceeded it, and a boundary that retires early is the direction
+        // that abandons still-live content.
+        let t0 = Instant::now();
+        let mut e = ReliableTileEmitter::new(t0);
+        e.submit_one(
+            EmitKey::new(1, 0, 0, 0),
+            fake_source(1, 0, 0xAA),
+            t0,
+            None,
+            t0,
+        );
+        assert!(e
+            .retire_stuck(t0 + Duration::from_secs(30), Duration::from_secs(30))
+            .is_empty());
+        assert_eq!(e.pending_cache_entries(), 1);
+        assert_eq!(
+            e.retire_stuck(
+                t0 + Duration::from_secs(30) + Duration::from_micros(1),
+                Duration::from_secs(30)
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn retire_stuck_bounds_the_retransmit_rate_that_caused_the_storm() {
+        // The defect this exists for: entries that are never acknowledged live
+        // forever, and each costs one retransmit per RTO_BACKOFF_MAX. Field
+        // measurement was 2697 pending -> 549 retransmits/s. Without
+        // retirement this cache stays full and the rate scales with it.
+        let t0 = Instant::now();
+        let mut e = ReliableTileEmitter::new(t0);
+        for i in 0..500u32 {
+            e.submit_one(
+                EmitKey::new(i, 0, 0, 0),
+                fake_source(1, 0, 0xCC),
+                t0,
+                None,
+                t0,
+            );
+        }
+        assert_eq!(e.pending_cache_entries(), 500);
+
+        // Nothing acknowledges them. A minute later they are all stuck.
+        let retired = e.retire_stuck(t0 + Duration::from_secs(60), Duration::from_secs(30));
+        assert_eq!(retired.len(), 500);
+        assert_eq!(
+            e.pending_cache_entries(),
+            0,
+            "an unacknowledged cache must not grow without bound -- this is the \
+             immortal-entry defect that starved CDF 5/3 in the field"
+        );
+    }
+
+    #[test]
+    fn retire_stuck_leaves_a_healthy_cache_alone() {
+        // Guards the direction that would be worse than the bug: retiring
+        // entries that are still legitimately in flight is what 0aa97de
+        // removed the attempt cap for.
+        let t0 = Instant::now();
+        let mut e = ReliableTileEmitter::new(t0);
+        for i in 0..100u32 {
+            e.submit_one(
+                EmitKey::new(i, 0, 0, 0),
+                fake_source(1, 0, 0xCC),
+                t0,
+                None,
+                t0,
+            );
+        }
+        assert!(e
+            .retire_stuck(t0 + Duration::from_secs(5), Duration::from_secs(30))
+            .is_empty());
+        assert_eq!(e.pending_cache_entries(), 100);
+        assert_eq!(e.stats.stuck_entries_retired, 0);
     }
 
     #[test]

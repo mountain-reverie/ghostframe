@@ -274,6 +274,33 @@ const CUMULATIVE_EMIT_LOG_INTERVAL_FRAMES: u32 = 60;
 // change what `max_retransmits` means without changing its name.
 const RTO_RETRANSMITS_PER_TICK: usize = 64;
 
+/// How long a cache entry may keep retransmitting before it is retired and its
+/// content re-sent fresh instead.
+///
+/// The retransmit cache is unbounded and 0aa97de deliberately removed the
+/// attempt cap, because a cap of 4 firings abandoned passes that were still
+/// legitimately in flight. That was the right call, but it left no aggregate
+/// bound at all: with backoff capped at `RTO_BACKOFF_MAX` (5 s), every entry
+/// that never gets acknowledged costs one retransmit every 5 s forever.
+/// Measured in the field on a daemon up two hours: 2697 pending entries
+/// producing 549 retransmits/s, which is what `cache_pending / 5 s` predicts to
+/// within 2%. That traffic exceeded the whole send budget, and since the
+/// scheduler admits by cost (solid 0.05 us, palRLE 8 us, CDF 5/3 90 us) the
+/// cheap codecs still fit while CDF 5/3 emitted nothing at all — the client
+/// received flat-colour tiles and no detail, indefinitely.
+///
+/// 30 s is chosen to be unambiguous rather than tight. The cache legitimately
+/// holds tens of thousands of entries during a first-paint burst over a
+/// high-RTT link, so a size threshold would fire on healthy traffic; an age
+/// threshold does not. Nothing that is still plausibly in flight is 30 s old,
+/// and a payload that age is a stale snapshot regardless — re-encoding beats
+/// retransmitting it.
+const STUCK_ENTRY_AGE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Ticks between stuck-entry sweeps. The sweep scans the whole cache, which is
+/// large exactly when it matters, so it does not belong on every tick.
+const STUCK_SWEEP_EVERY_TICKS: u32 = 30;
+
 // ── BWE Stage 2.2: PacingMode ────────────────────────────────────────────
 //
 // The estimate takes charge of the per-tick emission budget. Two call
@@ -749,6 +776,8 @@ pub struct IoBridge {
     /// QUIC slow-start can only deliver a fraction of tiles in the first burst;
     /// forcing dirty for several frames lets the congestion window open.
     force_dirty_frames: u32,
+    /// Ticks since startup, for `STUCK_SWEEP_EVERY_TICKS`.
+    stuck_sweep_counter: u32,
     /// Persistent palette table for PalRLE codec emission. M3.2a single-client
     /// invariant — flat server-wide state.
     pub(crate) palette_table: crate::encoder::pal_rle::PaletteTable,
@@ -1421,6 +1450,7 @@ impl IoBridge {
             tick_budget_floor_bytes: None,
             last_max_datagram_size: None,
             force_dirty_frames: 0,
+            stuck_sweep_counter: 0,
             palette_table: crate::encoder::pal_rle::PaletteTable::new(),
             client_caps: crate::transport::client_caps::ClientCapabilities::default(),
             // `fec_k` parses unconditionally in every build (see
@@ -1993,6 +2023,39 @@ impl IoBridge {
     /// their own) keeps that invariant auditable in a single place.
     fn sweep_rto_retransmits(&mut self) {
         let tick_now = now_std();
+        self.stuck_sweep_counter = self.stuck_sweep_counter.wrapping_add(1);
+        if self
+            .stuck_sweep_counter
+            .is_multiple_of(STUCK_SWEEP_EVERY_TICKS)
+        {
+            let retired = self
+                .reliable_emitter
+                .retire_stuck(tick_now, STUCK_ENTRY_AGE);
+            if !retired.is_empty() {
+                // Not a drop. Forcing the tiles dirty re-encodes them at a
+                // current frame_seq and sends them again, so the client ends up
+                // with newer content than the retired payload carried. This is
+                // the same mechanism a screen change uses; we are only
+                // asserting that a tile stuck this long counts as changed.
+                //
+                // Deliberately the existing whole-frame force rather than a
+                // per-tile one: there is no per-tile re-dirty hook, and a
+                // cache in this state is not a one-tile problem.
+                tracing::warn!(
+                    retired = retired.len(),
+                    pending_after = self.reliable_emitter.pending_cache_entries(),
+                    age_s = STUCK_ENTRY_AGE.as_secs(),
+                    "retired stuck retransmit entries and forced a re-dirty; \
+                     each was costing a retransmit every RTO_BACKOFF_MAX forever. \
+                     Sustained non-zero here means acknowledgements are not \
+                     retiring content the normal way — check ledger_unknown_acks."
+                );
+                self.force_dirty_frames = self.force_dirty_frames.max(2);
+                if let Some(p) = self.gpu_frame_processor.as_mut() {
+                    p.invalidate_baseline(2);
+                }
+            }
+        }
         self.reliable_emitter
             .tick(tick_now, RTO_RETRANSMITS_PER_TICK);
         let bridge_ptr: *mut IoBridge = self as *mut IoBridge;
@@ -5094,6 +5157,10 @@ impl IoBridge {
                         // the long-tail un-deliverable passes that the
                         // client should be NACKing.
                         cache_pending_entries = self.reliable_emitter.pending_cache_entries(),
+                        // Sustained growth here means acknowledgements are not
+                        // retiring content the normal way -- the sweep is a
+                        // backstop, not the intended mechanism.
+                        stuck_entries_retired = es.stuck_entries_retired,
                         // Ledger stats. These existed but were never logged,
                         // which left the field unable to tell the two halves
                         // of an ACK failure apart: `emitter_ack_hits` frozen
@@ -6167,6 +6234,7 @@ impl IoBridge {
             tick_budget_floor_bytes: None,
             last_max_datagram_size: None,
             force_dirty_frames: 0,
+            stuck_sweep_counter: 0,
             palette_table: crate::encoder::pal_rle::PaletteTable::new(),
             client_caps: crate::transport::client_caps::ClientCapabilities::default(),
             fec_k: lib_config.transport.fec_k.unwrap_or(0),

@@ -8,7 +8,7 @@ use lru::LruCache;
 use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Probe cluster a tile-pass was tagged for at emit time (BWE Stage 2.4).
 /// `None` for ordinary traffic, which is the overwhelming majority — only
@@ -155,6 +155,35 @@ impl RetransmitCache {
     /// — when the WebTransport session ends, the un-ACKed passes are no
     /// longer deliverable and must not occupy memory or fire spurious
     /// retransmits for the next-connecting client.
+    /// Remove every entry first sent longer ago than `older_than`, returning
+    /// their keys.
+    ///
+    /// Not an attempt cap. An attempt cap was tried and removed in 0aa97de for
+    /// a good reason: under sustained backpressure it abandoned passes that
+    /// were still legitimately in flight. This is the aggregate bound that
+    /// commit was missing — its arithmetic ("a single stuck pass retries 12
+    /// times per minute") is right for one entry and wrong for thousands, and
+    /// nothing bounded the total.
+    ///
+    /// An entry this old is not "in flight but slow". Its payload is a
+    /// snapshot of the screen from `older_than` ago, so re-encoding the tile
+    /// is strictly better than continuing to retransmit it: the caller pairs
+    /// this with a forced re-dirty, and the fresh content supersedes it
+    /// through the same path a normal screen change would take.
+    pub fn retire_older_than(&mut self, now: Instant, older_than: Duration) -> Vec<EmitKey> {
+        let stale: Vec<EmitKey> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| now.saturating_duration_since(e.first_sent_at) > older_than)
+            .map(|(k, _)| *k)
+            .collect();
+        for k in &stale {
+            self.entries.remove(k);
+            self.lru.pop(k);
+        }
+        stale
+    }
+
     pub fn clear(&mut self) {
         self.entries.clear();
         // LruCache has no clear(); rebuild it.
