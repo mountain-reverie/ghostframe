@@ -33,6 +33,26 @@ getty_dropin="$UNITS/99-ghostframe-getty.conf"
 # survived only because the test does not run as root -- install.sh does.
 switch_to() { remove_other_mode_units "$1" "$UNITS" "$dropin" "$getty_dropin"; }
 
+# getent resolves the PREVIOUS user's home, and the cleanup rm -f's inside it.
+# Stub it globally, before any switch_to call: with the real getent, a drop-in
+# naming $USER resolves to this developer's actual home and the test deletes
+# their installed unit and autostart entry. That is not hypothetical -- it
+# happened, silently, because nothing asserted on those paths. Individual
+# blocks may override this stub; none may remove it.
+STUB_HOME="$UNITS/stubhome"
+mkdir -p "$STUB_HOME/.config/systemd/user" "$STUB_HOME/.config/autostart"
+getent() { printf '%s:x:0:0::%s:/bin/sh\n' "${2:-stub}" "$STUB_HOME"; }
+# Never leave this empty: an unset target_user compares unequal to every real
+# username, which is what sent the cleanup into a real home in the first place.
+target_user="stub-user-never-real"
+
+# Canary. These are the paths a mis-stubbed test would destroy; record whether
+# they exist now and assert the test did not change that.
+CANARY_UNIT="$HOME/.config/systemd/user/ghostframe-xdaemon.service"
+CANARY_AUTOSTART="$HOME/.config/autostart/ghostframe-attach.desktop"
+canary_before_unit=$([[ -e "$CANARY_UNIT" ]] && echo yes || echo no)
+canary_before_autostart=$([[ -e "$CANARY_AUTOSTART" ]] && echo yes || echo no)
+
 # A headless install has left its units behind; we are now switching to attach.
 touch "$UNITS/ghostframe-xorg.service" "$UNITS/ghostframe-wm.service" \
       "$UNITS/ghostframe.target" "$UNITS/ghostframe-xdaemon.service"
@@ -223,6 +243,14 @@ printf '[Seat:*]\nautologin-user=\n' > "$main_conf"
 rm -f "$main_conf"
 [[ "$(warns)" == 0 ]] || { echo "FAIL: absent lightdm.conf must not warn"; fail=1; }
 unset -f detect_display_manager
+
+# The canary must be unchanged: this test may never touch a real home.
+canary_after_unit=$([[ -e "$CANARY_UNIT" ]] && echo yes || echo no)
+canary_after_autostart=$([[ -e "$CANARY_AUTOSTART" ]] && echo yes || echo no)
+[[ "$canary_before_unit" == "$canary_after_unit" ]] \
+  || { echo "FAIL: the test changed $CANARY_UNIT ($canary_before_unit -> $canary_after_unit)"; fail=1; }
+[[ "$canary_before_autostart" == "$canary_after_autostart" ]] \
+  || { echo "FAIL: the test changed $CANARY_AUTOSTART ($canary_before_autostart -> $canary_after_autostart)"; fail=1; }
 
 [[ $fail -eq 0 ]] && echo "PASS"
 exit $fail
