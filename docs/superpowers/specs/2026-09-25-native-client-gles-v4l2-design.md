@@ -499,6 +499,7 @@ numbers can be re-derived rather than trusted.
 | dma-heap | absent (`/dev/dma_heap` missing); CmaTotal 262144 kB | `ls`, `/proc/meminfo` |
 | GStreamer HW decode | bit-exact vs software, 60 frames, dmabuf-backed | `gst-launch`, `dmabuf_probe.py` |
 | FFmpeg | 6.1.1, no `v4l2request` hwaccel, `h264_v4l2m2m` only | `ffmpeg -hwaccels` |
+| FFmpeg, packaged | **no distro build enables `--enable-v4l2-request`** — checked against Arch Linux ARM's PKGBUILD at 9.0.2, so this is not a version problem that upgrading fixes | ALARM `PKGBUILD` |
 | cros-codecs | `0.0.6`, `v4l2` feature builds, ~12 deps, 3m48s | `cargo build` |
 
 ---
@@ -523,9 +524,20 @@ Anything requiring a later Mesa is out of reach on the reference machine
 regardless of merit — this is what rules out lavapipe's dmabuf support, and it
 could rule out other things.
 
-**cros-codecs is 0.0.x.** Pinning defers this rather than solving it; a future
-bump may require rework. Accepted deliberately — an upstreamed §6.3.2 reduces
-the carried delta to zero, which is the real mitigation.
+**cros-codecs is 0.0.x, and upstream is dormant.** Pinning defers the churn
+rather than solving it. The mitigation this document originally claimed —
+"an upstreamed §6.3.2 reduces the carried delta to zero" — **is no longer
+available**: `chromeos/cros-codecs`' last commits are Gerrit merges from March
+2025, its last push June 2025, 0.0.6 is still the newest published version, and
+all five defects we carry patches for are still present at HEAD. Contributing
+also requires a Google CLA.
+
+Corrected mitigation: the delta is a readable, re-appliable series against a
+frozen version (`third_party/cros-codecs-patches/`), and a pinned dependency that
+never changes is also one that never breaks underneath us. The published forks
+were surveyed and are worse rather than better — see that README. The exit, if
+the delta ever becomes painful, is §6.2's GStreamer path, already verified
+bit-exact on the reference machine.
 
 ---
 
