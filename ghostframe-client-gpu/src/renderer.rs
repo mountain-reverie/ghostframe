@@ -517,14 +517,29 @@ impl Renderer {
         let Ok(prefix) = std::env::var("GHOSTFRAME_CLIENT_DUMP_FRAME") else {
             return;
         };
-        let want: u64 = std::env::var("GHOSTFRAME_CLIENT_DUMP_COUNT")
+        // `GHOSTFRAME_CLIENT_DUMP_EVERY=n` samples every nth flush instead,
+        // overwriting `<prefix>.latest.ppm`, so a long session can be compared
+        // against the export dump at the same moment rather than only during
+        // the opening paint.
+        let every: u64 = std::env::var("GHOSTFRAME_CLIENT_DUMP_EVERY")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(1);
-        if self.dumps_written >= want {
-            return;
-        }
+            .unwrap_or(0);
         let n = self.dumps_written;
+        if every > 0 {
+            if !n.is_multiple_of(every) {
+                self.dumps_written += 1;
+                return;
+            }
+        } else {
+            let want: u64 = std::env::var("GHOSTFRAME_CLIENT_DUMP_COUNT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1);
+            if n >= want {
+                return;
+            }
+        }
         // Incremented regardless of outcome: a path that cannot be written will
         // not start working on the next flush, and retrying every flush would
         // turn a typo into a log flood.
@@ -546,7 +561,11 @@ impl Renderer {
             ppm.extend_from_slice(&px[..3]);
         }
 
-        let path = format!("{prefix}.{n}.ppm");
+        let path = if every > 0 {
+            format!("{prefix}.latest.ppm")
+        } else {
+            format!("{prefix}.{n}.ppm")
+        };
         match std::fs::write(&path, &ppm) {
             Ok(()) => tracing::info!(
                 path = %path,
