@@ -33,6 +33,33 @@ pub enum Command {
         /// `ctrl-alt-b` (default) or `super-b`.
         #[arg(long, default_value = "ctrl-alt-b")]
         chord_prefix: String,
+
+        /// Run without opening a window: connect, render, dump, exit.
+        ///
+        /// For debugging and for machines with no display. The render path is
+        /// unchanged -- frames are still decoded, composited and exported as
+        /// dmabufs -- only the present step is skipped, so a dump taken here
+        /// is the same image a window would have shown.
+        #[arg(long)]
+        headless: bool,
+
+        /// Write every frame into this directory as binary PPM.
+        ///
+        /// `frame-NNNNNN.ppm` is what the client rendered (the framebuffer,
+        /// read back through wgpu) and `export-NNNNNN.ppm` is the dmabuf a
+        /// display server would import. Both, because a difference between
+        /// them localises a fault that looks identical from outside: matching
+        /// but wrong means the fault is upstream in decode; differing means it
+        /// is in the export path.
+        #[arg(long, value_name = "DIR")]
+        dump_dir: Option<std::path::PathBuf>,
+
+        /// Exit this many seconds after the session is established.
+        ///
+        /// Timed from "session ready", not from process start, so it measures
+        /// the session rather than however long the tailnet took to come up.
+        #[arg(long, value_name = "SECONDS")]
+        duration: Option<u64>,
     },
 }
 
