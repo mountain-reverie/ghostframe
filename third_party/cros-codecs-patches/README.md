@@ -49,7 +49,7 @@ rather than assumed. Every candidate, and why none of them is the answer:
 | `cros-codecs-extended 0.0.5-extended.2` | **none of the five** | Based on 0.0.5, older than what we use. Last push Aug 2026, 0 stars |
 | `cros-codecs-generic-vaapi` | n/a | VA-API surface work; nothing to do with V4L2 |
 | ffmpeg `v4l2request` hwaccel | all of them, by not needing the crate | **Dead end in practice.** Would reuse our existing ffmpeg decoder and drop this dependency entirely — but Arch Linux ARM's ffmpeg PKGBUILD does not pass `--enable-v4l2-request` even at 9.0.2, so no distro build has the hwaccel. Requires shipping a custom ffmpeg, i.e. moving the burden onto every user |
-| GStreamer `v4l2slh264dec` | all of them, by not needing the crate | **The genuine alternative.** Already verified on this hardware: bit-exact, 60 frames, dmabuf-backed (design §6.2, `tools/hw-probe/dmabuf_probe.py`). Distro-maintained, zero patches. Cost is a heavy runtime dependency and a different integration model |
+| GStreamer `v4l2slh264dec` | all of them, by not needing the crate | **The real alternative, but it needs GStreamer ≥ 1.24.1** — see below. Distro-maintained, zero patches, and it hands over the plane layout so the chroma-offset trap disappears entirely. Cost is a heavy runtime dependency and a different integration model |
 
 So switching forks would trade a dormant, Google-authored, *pinned* crate for an
 active one-person fork — while still carrying two or three patches, absorbing
@@ -63,8 +63,35 @@ option the design doc counted on — "an upstreamed patch reduces the carried de
 to zero" — and that is now off the table, which is recorded in the design's risk
 section rather than left as a stale hope.
 
-If the delta ever does become painful, GStreamer is the exit, and it is already
-proven on the reference machine.
+### The GStreamer exit has a version floor, measured 2026-09-27
+
+The design doc recorded GStreamer as "bit-exact vs software, 60 frames,
+dmabuf-backed". **That was measured at 640x480 only, and it does not generalise.**
+Probed properly with `tools/hw-probe/gst-dmabuf-rs`:
+
+| | GStreamer 1.22.10 (what the reference machine had) |
+| --- | --- |
+| 640x480 | dmabuf, bit-exact through the fd, 60 frames over 11 pooled fds, layout from `GstVideoMeta`: `offsets [0, 307200] strides [640, 640] size 614400` |
+| 1920x1080 | **`SystemMemory`, 3110400 bytes — a full-frame CPU copy per frame**, silently, at the resolution sessions actually run at |
+
+Three levers were tried and none helps on 1.22:
+
+- Requiring `video/x-raw(memory:DMABuf)` — `v4l2slh264dec` does not advertise the
+  feature, so naming it fails to **link**, not to negotiate. `dmabuf_probe.py`'s
+  header already said this; it was rediscovered the slow way.
+- Enlarging the appsink pool past the 11 buffers it cycles.
+- Pinning `format=NV12` to rule out a tiled-format conversion (the decoder also
+  offers `NV12_4L4`, `NV12_32L32`, `NV12_16L32S`).
+
+GStreamer **1.24.1** fixed this — *"v4l2codecs: decoders: Add DMA_DRM caps
+support"* — which is the mechanism for *requiring* dmabuf rather than hoping for
+it. So the exit is real, but it carries a runtime floor of 1.24.1 and cannot be
+taken on an older stack.
+
+For contrast, and this is the comparison that matters: the cros-codecs path in
+this repo already delivers zero-copy **linear NV12 at 1080p**, measured bit-exact
+against a software golden. Switching to GStreamer on a 1.22 stack would be a
+regression, not an upgrade.
 
 ## Applying them
 

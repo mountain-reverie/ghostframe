@@ -497,7 +497,8 @@ numbers can be re-derived rather than trusted.
 | EXPBUF on rkvdec | 4 dmabuf fds; `bytesperline=640 sizeimage=614400 planes=1` | `expbuf_probe.c` |
 | GBM NV12 | unsupported, every flag; XRGB8888 OK, modifier `0x0` | `gbmprobe.c` |
 | dma-heap | absent (`/dev/dma_heap` missing); CmaTotal 262144 kB | `ls`, `/proc/meminfo` |
-| GStreamer HW decode | bit-exact vs software, 60 frames, dmabuf-backed | `gst-launch`, `dmabuf_probe.py` |
+| GStreamer HW decode | bit-exact vs software, 60 frames, dmabuf-backed — **at 640x480 only; see the row below** | `gst-launch`, `dmabuf_probe.py` |
+| GStreamer at 1080p | **NOT dmabuf on 1.22.10**: `SystemMemory`, 3110400 bytes, i.e. a full-frame CPU copy per frame. Needs GStreamer ≥ 1.24.1 (`v4l2codecs: decoders: Add DMA_DRM caps support`) to require dmabuf at all | `gst-dmabuf-rs` |
 | FFmpeg | 6.1.1, no `v4l2request` hwaccel, `h264_v4l2m2m` only | `ffmpeg -hwaccels` |
 | FFmpeg, packaged | **no distro build enables `--enable-v4l2-request`** — checked against Arch Linux ARM's PKGBUILD at 9.0.2, so this is not a version problem that upgrading fixes | ALARM `PKGBUILD` |
 | cros-codecs | `0.0.6`, `v4l2` feature builds, ~12 deps, 3m48s | `cargo build` |
