@@ -6,12 +6,15 @@
 
 CFLAGS ?= -O1 -Wall -Wextra
 
-PROBES = glprobe gbmprobe expbuf_probe
+PROBES = glprobe gbmprobe expbuf_probe nv12import_probe
 
 .PHONY: all clean run
 all: $(PROBES)
 
 glprobe: glprobe.c
+	$(CC) $(CFLAGS) $< -o $@ -lEGL -lGLESv2
+
+nv12import_probe: nv12import_probe.c
 	$(CC) $(CFLAGS) $< -o $@ -lEGL -lGLESv2
 
 gbmprobe: gbmprobe.c
@@ -26,6 +29,7 @@ run: $(PROBES)
 	@echo "=========== glprobe (GLES limits, EGL dmabuf) ==========="; ./glprobe || true
 	@echo; echo "=========== gbmprobe (can GBM allocate NV12?) ==========="; ./gbmprobe || true
 	@echo; echo "=========== expbuf_probe (driver dmabuf export) ==========="; ./expbuf_probe || true
+	@echo; echo "=========== nv12import_probe (can EGL import NV12 planes?) ==========="; ./nv12import_probe || true
 
 clean:
 	rm -f $(PROBES)
