@@ -35,6 +35,18 @@ fn run() -> Result<(), CommandError> {
             host,
             port,
             chord_prefix,
-        } => commands::connect(host, port, chord_prefix),
+            headless,
+            dump_dir,
+            duration,
+        } => commands::connect(
+            host,
+            port,
+            chord_prefix,
+            commands::ConnectOptions {
+                headless,
+                dump_dir,
+                duration: duration.map(std::time::Duration::from_secs),
+            },
+        ),
     }
 }

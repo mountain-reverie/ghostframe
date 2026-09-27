@@ -220,7 +220,24 @@ pub fn route_window_event(
     }
 }
 
-pub fn connect(host: String, port: u16, chord_prefix: String) -> Result<(), CommandError> {
+/// Everything `connect` needs beyond the host, grouped so the signature does
+/// not grow a tail of booleans.
+#[derive(Debug, Default)]
+pub struct ConnectOptions {
+    /// Skip opening a window. See `Command::Connect`'s `--headless`.
+    pub headless: bool,
+    /// Write every frame here as binary PPM.
+    pub dump_dir: Option<std::path::PathBuf>,
+    /// Stop this long after the session is established.
+    pub duration: Option<Duration>,
+}
+
+pub fn connect(
+    host: String,
+    port: u16,
+    chord_prefix: String,
+    opts: ConnectOptions,
+) -> Result<(), CommandError> {
     // Argument validation before any I/O or state check: a typo'd
     // --chord-prefix should fail the same way whether or not the caller
     // happens to be logged in.
@@ -234,14 +251,44 @@ pub fn connect(host: String, port: u16, chord_prefix: String) -> Result<(), Comm
         ));
     }
 
+    // Frame dumping is configured through the environment because that is what
+    // the render thread and renderer read (they are libraries; neither takes a
+    // CLI). Set here, before `Client::new` spawns anything, so the write
+    // happens-before every thread that will read it.
+    if let Some(dir) = &opts.dump_dir {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| CommandError::Message(format!("creating {}: {e}", dir.display())))?;
+        // SAFETY (soundness, not `unsafe`): single-threaded at this point --
+        // the client's net and render threads do not exist yet.
+        std::env::set_var("GHOSTFRAME_CLIENT_DUMP_FRAME", dir.join("frame"));
+        std::env::set_var("GHOSTFRAME_CLIENT_DUMP_EXPORT", dir.join("export"));
+        // Every frame, not a sample: the point of a dump directory is a
+        // complete record to step through afterwards.
+        std::env::set_var("GHOSTFRAME_CLIENT_DUMP_COUNT", u64::MAX.to_string());
+        tracing::info!(dir = %dir.display(), "dumping every frame");
+    }
+
     // Open the window BEFORE constructing the `Client`, even though "connect,
     // then show a window" reads as the natural order. `Config::preferred_modifiers`
     // has to reach `Client::new`/`connect` so the render thread's export ring
     // allocates dmabufs the compositor can actually import (see
     // `Backend::preferred_dmabuf_modifiers`); the only place that list comes
     // from is a backend that is already open.
-    let mut backend = window::open("ghostframe")?;
-    let preferred_modifiers = backend.preferred_dmabuf_modifiers();
+    //
+    // Headless has no backend to ask, so it names LINEAR explicitly rather
+    // than passing an empty list. Empty means "library picks", which would let
+    // the export come back in whatever the driver prefers -- on Mali that is
+    // AFBC, which nothing but that GPU can read and which `map_read` then
+    // refuses, silently costing the export dump this mode exists to produce.
+    let mut backend = if opts.headless {
+        None
+    } else {
+        Some(window::open("ghostframe")?)
+    };
+    let preferred_modifiers = match backend.as_ref() {
+        Some(b) => b.preferred_dmabuf_modifiers(),
+        None => vec![0 /* DRM_FORMAT_MOD_LINEAR */],
+    };
 
     // Independent of `backend`: a separate, short-lived probe connection
     // (see `display_probe`'s module doc for why). `None` just means no
@@ -266,13 +313,25 @@ pub fn connect(host: String, port: u16, chord_prefix: String) -> Result<(), Comm
     client.connect(&host, port)?;
     println!("connected to {host}:{port}.");
 
-    let result = run_window_loop(
-        &mut client,
-        backend.as_mut(),
-        &mut chord,
-        &mut |_| {},
-        &mut || false,
-    );
+    // The duration is measured from here -- the session being established --
+    // rather than from process start, so it times the session and not however
+    // long the tailnet took to come up.
+    let deadline = opts.duration.map(|d| Instant::now() + d);
+    let mut should_quit = move || match deadline {
+        Some(at) => Instant::now() >= at,
+        None => false,
+    };
+
+    let result = match backend.as_mut() {
+        Some(backend) => run_window_loop(
+            &mut client,
+            backend.as_mut(),
+            &mut chord,
+            &mut |_| {},
+            &mut should_quit,
+        ),
+        None => run_headless_loop(&mut client, &mut should_quit),
+    };
 
     // Always tear the session down, even if the loop errored -- best-effort,
     // since we don't want a teardown failure to hide the loop's own error
@@ -319,6 +378,69 @@ const POLL_TIMEOUT_MS: i32 = 100;
 /// injection either). The prefix-chord -> quit *routing* itself is already
 /// covered without a display, by `ghostframe-cli/tests/event_loop.rs`'s
 /// `a_completed_quit_chord_yields_quit` and `close_requested_yields_quit`.
+/// Drive a session with no display server: drain events, cycle export buffers,
+/// stop when `should_quit` says so.
+///
+/// Everything upstream of the window is unchanged -- tiles are decoded,
+/// composited and exported as dmabufs exactly as they would be with a window
+/// open -- so a frame dumped from here is the image a window would have shown.
+/// That is the whole point: it separates "the client renders the wrong thing"
+/// from "the display server shows the wrong thing", which look identical from
+/// in front of a screen.
+///
+/// Frames are acquired and released immediately. Nothing is reading them, so
+/// there is no idle-notify equivalent to wait for, and holding them would stall
+/// the export ring after three frames.
+fn run_headless_loop(
+    client: &mut Client,
+    should_quit: &mut dyn FnMut() -> bool,
+) -> Result<(), CommandError> {
+    let client_fd = client.event_fd();
+    let mut frames: u64 = 0;
+
+    loop {
+        if should_quit() {
+            tracing::info!(frames, "headless run finished");
+            return Ok(());
+        }
+
+        let mut fds = [libc::pollfd {
+            fd: client_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        // SAFETY: `fds` points to one valid, initialised `pollfd` for the
+        // duration of the call; `poll` only writes its `revents`.
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), 1, POLL_TIMEOUT_MS) };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(CommandError::Message(format!("poll: {err}")));
+        }
+
+        while let Some(ev) = client.next_event() {
+            match ev {
+                ClientEvent::FrameReady { .. } => {
+                    if let Some(frame) = client.acquire_frame() {
+                        client.release_frame(frame.frame_id);
+                        frames += 1;
+                    }
+                }
+                ClientEvent::Disconnected { reason, expected } => {
+                    tracing::info!(frames, %reason, expected, "headless run disconnected");
+                    return Ok(());
+                }
+                ClientEvent::Error { message } => {
+                    return Err(CommandError::Message(message));
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 pub fn run_window_loop(
     client: &mut Client,
     backend: &mut dyn Backend,
