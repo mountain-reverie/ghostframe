@@ -60,7 +60,7 @@ lint-client:
 # and is the point: it is the only way to compile-check every line of the GLES
 # render path on an x86 runner, because cros-codecs' `v4l2` feature does not
 # build off aarch64 and cargo features cannot be subtracted. The real ARM build
-# is `gles,decode-v4l2` -- see `build-client-gles`.
+# is `gles,decode-gstreamer` -- see `build-client-gles`.
 check-gles:
     cargo clippy -p ghostframe-client-gpu --no-default-features --features gles,decode-vaapi,test-support --all-targets -- -D warnings
     # The whole chain, not just client-gpu. Cargo unions features across the
@@ -75,35 +75,35 @@ check-gles:
 # Comes along with `check-gles` (the `gles` feature forwards to it), and checked
 # separately so a break is attributed to the decoder rather than the GPU
 # backend, and so the no-ffmpeg-at-all combination is covered.
-# aarch64 ONLY: cros-codecs 0.0.6 gates its NEON MM21 path on the `v4l2` feature
-# rather than on the target architecture, so this cannot build on x86 and CI does
-# not try. The crate says so with a `compile_error!` rather than letting the
-# failure come from a dependency.
-check-v4l2:
-    cargo clippy -p ghostframe-client-h264 --no-default-features --features v4l2 --all-targets -- -D warnings
-    cargo check -p ghostframe-cli --no-default-features --features gles,decode-v4l2
+# The ARM client's decode backend. Builds anywhere GStreamer's development
+# headers are present, including x86 -- which is why CI runs this too, unlike its
+# cros-codecs predecessor.
+check-gstreamer:
+    cargo clippy -p ghostframe-client-h264 --no-default-features --features gstreamer-backend --all-targets -- -D warnings
+    cargo clippy -p ghostframe-client-h264 --no-default-features --features gstreamer-backend,test-support --all-targets -- -D warnings
+    cargo check -p ghostframe-cli --no-default-features --features gles,decode-gstreamer
 
-# The V4L2 backend's tests, including the exactness oracle against a software
-# decode. Needs a stateless V4L2 H.264 decoder -- verified on RK3399/rkvdec --
-# AND the two cros-codecs patches applied through a `[patch.crates-io]` entry in
-# a machine-local `.cargo/config.toml`, plus `CROS_CODECS_V4L2_DEVICE` naming the
-# decoder node. See tools/hw-probe/v4l2-expbuf-rs/README.md. Without those the
-# tests self-skip with the reason, they do not fail.
-test-client-v4l2:
-    cargo test -p ghostframe-client-h264 --no-default-features --features v4l2,test-support
+# The GStreamer backend's tests, including the exactness oracles against a
+# software decode at 640x480 and 1920x1080. Needs a stateless H.264 decoder
+# (verified on RK3399/rkvdec) and GStreamer >= 1.24.1 with gst-plugins-bad's
+# v4l2codecs plugin. No patches and no environment variables -- GStreamer picks
+# the device. Without the hardware the tests self-skip with the reason on stderr;
+# they do not fail.
+test-client-gstreamer:
+    cargo test -p ghostframe-client-h264 --no-default-features --features gstreamer-backend,test-support
 
 # Build the `ghostframe` binary against the GLES backend, for a machine with
 # no Vulkan driver. The feature forwards up the chain
 # (cli -> client-native -> client-gpu), so it is selected once here rather
 # than per crate.
 build-client-gles:
-    cargo build -p ghostframe-cli --no-default-features --features gles,decode-v4l2
+    cargo build -p ghostframe-cli --no-default-features --features gles,decode-gstreamer
 
 # The GLES backend's tests. Needs a GLES 3.1 device with
 # EGL_MESA_image_dma_buf_export -- verified on Mali-T860/panfrost. Skips
 # gpu_import (Vulkan-only; see that file's header).
 test-client-gles:
-    cargo test -p ghostframe-client-gpu --no-default-features --features gles,decode-v4l2,test-support
+    cargo test -p ghostframe-client-gpu --no-default-features --features gles,decode-gstreamer,test-support
 
 # Build, lint and test the native client -- the client-only `ci-local`.
 ci-client: build-client
@@ -116,8 +116,8 @@ ci-client: build-client
     git diff --exit-code ghostframe-client-capi/include/ghostframe_client.h
     @echo "=== GLES backend still compiles ==="
     just check-gles
-    @echo "=== V4L2 decode backend still compiles ==="
-    just check-v4l2
+    @echo "=== GStreamer decode backend still compiles ==="
+    just check-gstreamer
     @echo "=== ci-client passed ==="
 
 # Run from a clean checkout: builds the web client SPA (vite) into

@@ -115,19 +115,17 @@ gles = ["dep:khronos-egl", "wgpu/gles", "wgpu-hal/gles"]
 # same as the GPU pair, and forwarded to `ghostframe-client-h264` rather than
 # decided there so a consumer picks both once at the top of the tree.
 #
-# These were briefly folded into `vulkan`/`gles` -- the machine with no Vulkan
-# driver is the machine with no VA-API driver, so the pairing looked free. It is
-# not, and the reason is worth keeping: **`cros-codecs 0.0.6`'s `v4l2` feature
-# does not compile on x86-64 at all.** Its `image_processing.rs:15` reads
-# `#[cfg(feature = "v4l2")] use std::arch::aarch64::*;` -- gated on the feature,
-# not the architecture -- so the MM21 NEON path is unconditional under `v4l2`.
+# Separate axes rather than folded into `vulkan`/`gles`, which is where they
+# started -- the machine with no Vulkan driver is the machine with no VA-API
+# driver, so the pairing looked free. It was not. Cargo features are additive, so
+# a coupled `gles` leaves no flag combination that checks the GLES render path
+# wherever the decode backend cannot build, and that silently destroyed CI's only
+# guard on code no runner can run (see .github/workflows/ci.yml).
 #
-# Cargo features are additive, so a coupled `gles` could not be checked on an
-# x86 runner by any combination of flags: `gles` would drag `v4l2` in and the
-# build would fail in a dependency. That silently destroyed CI's only guard on
-# the GLES render path, which exists precisely because no runner has a Mali GPU
-# (see .github/workflows/ci.yml). Separate axes let CI compile every line of the
-# GLES code as `gles,decode-vaapi` while the real ARM build is
-# `gles,decode-v4l2`.
+# That hazard was acute with the previous cros-codecs backend, which did not
+# compile off aarch64 at all. The GStreamer backend builds anywhere GStreamer's
+# development headers are present, so CI can now check `gles,decode-gstreamer`
+# for real -- but the axes stay separate, because the coupling bought nothing and
+# cost a guard. The real ARM build is `gles,decode-gstreamer`.
 decode-vaapi = ["ghostframe-client-h264/vaapi"]
-decode-v4l2 = ["ghostframe-client-h264/v4l2"]
+decode-gstreamer = ["ghostframe-client-h264/gstreamer-backend"]

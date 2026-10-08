@@ -21,7 +21,6 @@ make run          # builds and runs the three C probes
 | `expbuf_probe.c` | Can a V4L2 stateless decoder allocate its own buffers and export them as dmabufs? | nothing (raw ioctls) |
 | `nv12import_probe.c` | Will EGL *import* the planes of a decoded NV12 dmabuf (`R8`, `GR88`)? | libEGL, libGLESv2 |
 | `dmabuf_probe.py` | Does GStreamer's `v4l2slh264dec` hand out dmabuf-backed buffers? | PyGObject, gst-plugins-bad |
-| `v4l2-expbuf-rs/` | Does cros-codecs decode H.264 into an exportable dmabuf, bit-exactly? (own README) | Rust, cros-codecs 0.0.6 + the patch series |
 | `gst-dmabuf-rs/` | Does **GStreamer** hand out a dmabuf with an importable layout — at every resolution? (own README) | Rust, gstreamer-rs, gst-plugins-bad |
 
 ## Why each one exists
@@ -45,8 +44,9 @@ requires) and export each buffer with `VIDIOC_EXPBUF`. It also prints the
 capture queue's `bytesperline` / `sizeimage`, and the gap between them is the
 trap: rkvdec reports `sizeimage=614400` for a 640x480 NV12 whose pixels occupy
 460800, so a chroma offset derived from `sizeimage` lands 160 rows wrong. The
-offset is `bytesperline * format.height` — see `v4l2-expbuf-rs/`, which measures
-it against a software golden.
+offset is `bytesperline * format.height`. The decode backend no longer computes
+it -- GStreamer reports the layout -- but this probe's raw numbers still make the
+padding visible, which is what it is for.
 
 **`nv12import_probe.c`** — the other half of the dmabuf question, and a
 different answer from the same driver: panfrost will not *allocate* NV12
@@ -59,12 +59,6 @@ a separate probe rather than a footnote: the answer is resolution-dependent. 1.2
 yields a dmabuf at 640x480 and silently falls back to a per-frame CPU copy at
 1080p. Anything that concludes "GStreamer gives us dmabufs" from one clip is
 measuring the easy case.
-
-**`v4l2-expbuf-rs/`** — the end-to-end proof, in Rust: decode H.264 on the
-hardware decoder through `cros-codecs`, export the output buffers, read them back
-through the exported fds, and compare byte-for-byte against `ffmpeg`. It has its
-own README because it carries two cros-codecs patches and three traps worth
-reading before writing the production version.
 
 **`dmabuf_probe.py`** — checks whether GStreamer's stateless decoder yields
 dmabufs. Worth keeping even though the design rejects GStreamer: it is the

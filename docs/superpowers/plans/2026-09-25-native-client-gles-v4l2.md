@@ -10,6 +10,24 @@
 
 ---
 
+## Superseded for decode, 2026-10-08
+
+**Tasks 3-6 described a `cros-codecs` backend that no longer exists.** It was
+built (#105), patched (#106) and then replaced by GStreamer, because the five
+carried patches were against a crate dormant since March 2025 and the
+alternative turned out better on the merits — no patches, GStreamer reports the
+plane layout and DRM modifier instead of leaving them to be derived, and CI can
+compile-check the ARM decode path on an x86 runner for the first time.
+
+Read [`../investigations/2026-10-08-gstreamer-decode-pivot.md`](../investigations/2026-10-08-gstreamer-decode-pivot.md)
+before those tasks. What survives from them: the capability probe's independent
+ground truth (Task 6's reasoning, now `v4l2_device.rs`), `DmabufPlanes` as the
+untouched seam, and the display-vs-coded-height hazard, which moved rather than
+went away.
+
+Tasks 1, 2, 7, 8 and 10 landed as written. Task 9 (`import_gles.rs`) is still
+open and is the next piece.
+
 ## Read this first
 
 **Task 4 was the schedule risk and no longer is — read
