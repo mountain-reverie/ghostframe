@@ -14,13 +14,14 @@ ghostframe-web-client/dist/
 ghostframe-client-wasm/pkg-node/
 ghostframe-client-wasm/pkg-web/
 
-# Machine-local cargo config. The `v4l2` H.264 backend needs two patches to
-# cros-codecs 0.0.6 (see tools/hw-probe/v4l2-expbuf-rs/README.md), applied with
-# a `[patch.crates-io]` entry here rather than in the committed manifest: a
+# Machine-local cargo config. The `v4l2` H.264 backend needs five patches to
+# cros-codecs 0.0.6 (see third_party/cros-codecs-patches/README.md), applied
+# with a `[patch.crates-io]` entry here rather than in the committed manifest: a
 # committed patch would have to name a path or git rev that exists on every
 # machine, and the workspace must build with the crate straight from crates.io.
-# Only the reference hardware needs it, and only to RUN the V4L2 tests -- CI
-# compile-checks the feature against the unpatched crate.
+# Only the reference hardware needs it -- and it needs it to BUILD the backend
+# at all, not merely to run the tests, since two of the five are what make the
+# crate compile and stop it panicking on the render thread.
 /.cargo/config.toml
 
 # Editor / OS cruft

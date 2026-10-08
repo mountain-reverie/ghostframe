@@ -114,10 +114,14 @@ mod tests {
         let _verdict: bool = h264_decode_available();
     }
 
-    /// On a machine whose driver enumerates `S264`, the probe must say so --
-    /// unless the reason it cannot is the known device-selection defect, which
-    /// this asserts is the *only* accepted excuse rather than letting any
-    /// failure pass.
+    /// On a machine whose driver enumerates `S264`, the probe must say so.
+    ///
+    /// No tolerated disagreement any more. This test used to accept one --
+    /// `cros-codecs` opening a different node than the one asked for, which its
+    /// unpatched `new_v4l2()` could not avoid -- and that escape hatch is how a
+    /// stale device override once hid a real failure for a whole test run.
+    /// Patch 0001 lets the caller name the device, so a driver that advertises
+    /// `S264` and a probe that says no is now unambiguously a bug.
     #[test]
     fn probe_agrees_with_the_driver() {
         let _device = v4l2_device::exclusive_device_access();
@@ -126,30 +130,9 @@ mod tests {
             eprintln!("no S264-capable device; nothing to check against");
             return;
         };
-        if h264_decode_available() {
-            return;
-        }
-        // The one tolerated disagreement: cros-codecs will open a *different*
-        // device, so `with_device` refuses by design. Anything else is a real
-        // regression.
-        //
-        // "Will open" rather than "would scan to": a stale
-        // `CROS_CODECS_V4L2_DEVICE` counts as pointing elsewhere, and on this
-        // hardware that is not hypothetical -- node numbering moves across
-        // boots. Treating a set-but-wrong override as agreement is what let this
-        // assertion pass while the decode went to hantro.
-        let effective = v4l2_device::device_cros_codecs_will_open();
-        let path = std::path::Path::new(&node);
         assert!(
-            effective.as_deref() != Some(path),
-            "the driver enumerates S264 on {node} and cros-codecs will open exactly \
-             that, but the probe still said no"
-        );
-        eprintln!(
-            "probe declined because cros-codecs will open {effective:?} rather than {node}; \
-             apply tools/hw-probe/v4l2-expbuf-rs/cros-codecs-0.0.6.patch and set \
-             {}={node}",
-            v4l2_device::DEVICE_OVERRIDE_ENV
+            h264_decode_available(),
+            "the driver enumerates S264 on {node} but the probe said no"
         );
     }
 }
