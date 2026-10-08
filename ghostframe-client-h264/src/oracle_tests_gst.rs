@@ -1,22 +1,18 @@
-//! Oracle: rkvdec decode == software decode, byte for byte.
+//! Oracle: hardware decode == software decode, byte for byte.
 //!
-//! The `v4l2` backend's exactness oracle, and the only test that distinguishes
-//! a correct chroma offset from a nearly-correct one. A wrong offset here does
-//! not error or crash — it yields a plausible image with shifted colour, which
-//! is why comparing against a software decode is the whole design and not a
-//! nicety.
+//! The GStreamer backend's exactness oracle. GStreamer reports the plane layout
+//! now, so this no longer guards arithmetic *we* perform — but it still guards
+//! our *use* of that layout, and the failure mode is unchanged: a plausible
+//! image with shifted colour rather than an error. Both known ways to get it
+//! wrong were met while writing the backend, and both produce output of the
+//! right shape (see `the_display_size_comes_from_caps_not_the_meta`).
 //!
-//! Requires a V4L2 stateless decoder, so these self-skip everywhere else. The
+//! Requires a stateless H.264 decoder, so these self-skip everywhere else. The
 //! gate is [`crate::v4l2_device::enumerates_h264_slice`] — raw `VIDIOC_ENUM_FMT`,
-//! independent of `cros-codecs` — and **not** `h264_decode_available()`, which
+//! independent of GStreamer — and **not** `h264_decode_available()`, which
 //! decodes a frame to answer: gating on it would mean a decoder regression makes
 //! every oracle here skip and report green exactly when it should fail. Same
 //! circularity `oracle_tests` refuses for VA-API.
-//!
-//! The one other accepted skip is an unpatched `cros-codecs`, which cannot open
-//! the right device (see [`crate::decoder`]). That is not swallowed either:
-//! `probe_v4l2::tests::probe_agrees_with_the_driver` asserts it is the *only*
-//! reason the probe may decline.
 
 use crate::decoder::H264Decoder;
 use crate::software_decode::software_decode_nv12;
@@ -33,20 +29,18 @@ const H: u32 = 480;
 const TALL_W: u32 = 1920;
 const TALL_H: u32 = 1080;
 
-/// Frames per clip. Enough to cycle the driver's buffer pool several times,
-/// which is what makes the index-vs-frame-object export bug visible: with three
-/// buffers, reuse starts around frame 5 and a per-frame-object export table
-/// reorders everything after it.
-const FRAMES: usize = 12;
+/// Frames per clip. Enough to cycle the decoder's buffer pool several times --
+/// measured at 11 distinct dmabuf fds on this hardware -- so a frame that
+/// outlives its buffer, or a layout cached across buffers, shows up as reordered
+/// or repeated output rather than hiding inside the first few frames.
+const FRAMES: usize = 16;
 
 /// Run `f` against the real decoder, holding it exclusively, or skip.
 ///
 /// One entry point rather than an `open()` helper, because the device lock has
 /// to span the whole test: `cargo test`'s parallelism would otherwise have two
-/// oracles streaming on one decoder. `None` means "skipped, and the reason is on
-/// stderr" -- every caller returns early on it, and the reason is always either
-/// no hardware or the unpatched-cros-codecs refusal that
-/// `probe_v4l2::tests::probe_agrees_with_the_driver` pins down.
+/// pipelines on one decoder. `None` means "skipped, and the reason is on
+/// stderr".
 fn with_decoder<T>(f: impl FnOnce(&mut H264Decoder) -> T) -> Option<T> {
     let _device = crate::v4l2_device::exclusive_device_access();
     let node = crate::probe::default_device();
@@ -80,8 +74,19 @@ fn decode_each<T>(
             out.push(each(&frame));
         }
     }
-    for frame in decoder.finish().expect("drain decoder") {
-        out.push(each(&frame));
+    // `finish` until empty, consuming as we go. One call cannot hand back the
+    // whole tail: each frame pins a pooled dmabuf, so holding a poolful stalls
+    // the decoder that would produce the rest -- which is exactly how this
+    // backend first failed, returning 7 of 16 frames and reporting success on
+    // the subset. See `H264Decoder::finish`.
+    loop {
+        let batch = decoder.finish().expect("drain decoder");
+        if batch.is_empty() {
+            break;
+        }
+        for frame in batch {
+            out.push(each(&frame));
+        }
     }
     out
 }
@@ -107,7 +112,7 @@ fn assert_matches_software(w: u32, h: u32) {
         hw.len(),
         sw.len(),
         "hardware produced {} frames, software {} -- a count mismatch is usually \
-         frames emitted in the wrong order, not frames lost; see ExportTable",
+         frames emitted in the wrong order, not frames lost",
         hw.len(),
         sw.len()
     );
@@ -126,24 +131,12 @@ fn assert_matches_software(w: u32, h: u32) {
 
 /// The exactness oracle at a 16-aligned height.
 ///
-/// **Mutation check (recorded, not just run):** changed
-/// `V4l2Frame::chroma_offset` to `self.stride() * (self.coded_height() + 1)` --
-/// one row of chroma offset, the nearly-correct case this whole oracle exists
-/// for -- and re-ran the suite on rkvdec. Exactly the two exactness oracles
-/// failed (this one and the 1080p one); the other four still passed, which is
-/// the right outcome and worth recording:
-///
-/// - `the_chroma_offset_follows_the_drivers_coded_height` checks the offset is
-///   *past* the display height, and 1089 rows still is. It catches the opposite
-///   mistake -- deriving from the display height -- not this one.
-/// - `a_one_row_chroma_shift_does_not_match_the_golden` reads one row past
-///   whatever the offset says, so under the mutation it read two rows late and
-///   still, correctly, did not match.
-///
-/// So the byte-for-byte comparison is the only thing standing between a
-/// one-row error and a release. Reverted after measuring. The same
-/// perturbation is reachable from outside the crate with `CHROMA_SHIFT_ROWS=1`
-/// in `tools/hw-probe/v4l2-expbuf-rs`.
+/// **Mutation check (recorded, not just run):** perturbed `describe`'s chroma
+/// offset by one row (`offsets[1] += strides[1]`) and re-ran the suite on
+/// rkvdec. Both exactness oracles failed, as they must, and the structural
+/// tests did not -- which is the right split and worth recording, because it
+/// says the byte comparison is the only thing standing between a one-row error
+/// and a release. Reverted after measuring.
 #[test]
 fn hardware_decode_matches_software_decode_exactly() {
     assert_matches_software(W, H);
@@ -159,14 +152,17 @@ fn hardware_decode_matches_software_decode_at_a_non_16_aligned_height() {
     assert_matches_software(TALL_W, TALL_H);
 }
 
-/// The chroma offset comes from the driver's coded height, and at 1080p that is
-/// demonstrably not the display height.
+/// The frame reports the DISPLAY size, while the chroma offset reflects the
+/// CODED one.
 ///
-/// A structural assertion rather than a pixel one, so a future edit that
-/// switches to the display height fails here even on hardware whose coded and
-/// display heights happen to agree.
+/// The regression test for the mistake that was actually made: `GstVideoMeta`
+/// carries the coded height (1088 at 1080p), and reading it as the display
+/// height writes eight extra rows of luma -- output of exactly the right shape
+/// and the wrong content, which only a byte comparison or this assertion
+/// catches. Structural rather than pixel-based, so it still fails on hardware
+/// whose coded and display heights happen to agree.
 #[test]
-fn the_chroma_offset_follows_the_drivers_coded_height() {
+fn the_display_size_comes_from_caps_not_the_meta() {
     let clip = gradient_clip(TALL_W, TALL_H, 2);
     let Some(layouts) = with_decoder(|d| {
         decode_each(d, &clip, |frame| {
@@ -192,8 +188,8 @@ fn the_chroma_offset_follows_the_drivers_coded_height() {
     assert!(
         rows > u64::from(TALL_H),
         "chroma starts after {rows} luma rows, but the display height is {TALL_H}: \
-         either this driver codes 1080p unpadded (surprising) or the offset was \
-         derived from the display height instead of the coded one"
+         either this driver codes 1080p unpadded (surprising) or the layout was \
+         taken from the caps rather than from GstVideoMeta"
     );
     assert_eq!(
         planes.chroma.offset % planes.luma.pitch,
@@ -302,7 +298,9 @@ fn the_exported_dmabuf_is_linear_and_its_planes_fit() {
     assert_eq!(
         planes.modifier, 0,
         "DRM_FORMAT_MOD_LINEAR expected; a tiled modifier means the GLES import \
-         path needs a detiling step it does not have"
+         path needs a detiling step it does not have. Unlike the previous \
+         backend this is the decoder's own answer (`drm-format=NV12:0x0`) rather \
+         than an inference from bytes, so a change here is a real change"
     );
     assert_eq!(planes.fourcc_luma, crate::DRM_FORMAT_R8);
     assert_eq!(planes.fourcc_chroma, crate::DRM_FORMAT_GR88);
@@ -332,14 +330,26 @@ fn frames_come_out_once_each_and_in_order() {
     };
     let sw = software_decode_nv12(&clip, W, H);
     assert!(!hw.is_empty(), "hardware decode produced no frames");
+    // Assert the COUNT as well as the order. Without this the test passes on a
+    // truncated run -- seven frames that happen to be golden 0..6 map onto
+    // `0..hw.len()` perfectly -- which is how it reported green while the
+    // decoder was losing more than half the stream.
+    assert_eq!(
+        hw.len(),
+        sw.len(),
+        "hardware produced {} frames, software {}: a short run also satisfies the \
+         ordering check below, so the count is asserted first",
+        hw.len(),
+        sw.len()
+    );
     let position_in_golden = |plane: &Vec<u8>| sw.iter().position(|(y, _)| y == plane);
     let mapped: Vec<Option<usize>> = hw.iter().map(|(y, _)| position_in_golden(y)).collect();
     let expected: Vec<Option<usize>> = (0..hw.len()).map(Some).collect();
     assert_eq!(
         mapped, expected,
         "hardware frames map onto the golden sequence as {mapped:?} rather than in \
-         order. Repeats and gaps here are the signature of a dmabuf exported per \
-         frame object instead of per V4L2 buffer index -- every frame is genuine, \
-         just the wrong one"
+         order. Repeats and gaps are the signature of a frame outliving the buffer \
+         it describes -- every frame is genuine, just the wrong one, which reads as \
+         a stutter and sends you hunting in the renderer"
     );
 }

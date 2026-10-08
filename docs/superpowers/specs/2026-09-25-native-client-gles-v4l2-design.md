@@ -534,20 +534,22 @@ changes, since the whole GLES decision rested on these numbers:
 - **GStreamer crossed the 1.24.1 floor**, which is what makes §6.2 viable; see
   the measured-baseline table.
 
-**cros-codecs is 0.0.x, and upstream is dormant.** Pinning defers the churn
-rather than solving it. The mitigation this document originally claimed —
-"an upstreamed §6.3.2 reduces the carried delta to zero" — **is no longer
-available**: `chromeos/cros-codecs`' last commits are Gerrit merges from March
-2025, its last push June 2025, 0.0.6 is still the newest published version, and
-all five defects we carry patches for are still present at HEAD. Contributing
-also requires a Google CLA.
+**~~cros-codecs is 0.0.x, and upstream is dormant.~~ Resolved by taking the
+exit, 2026-10-08.** This risk was real and it came due: `chromeos/cros-codecs`'
+last commits are Gerrit merges from March 2025, 0.0.6 is still the newest
+published version, and all five defects the backend needed patches for are still
+present at HEAD. The mitigation this document originally claimed — "an upstreamed
+§6.3.2 reduces the carried delta to zero" — was never available, and
+contributing needs a Google CLA besides.
 
-Corrected mitigation: the delta is a readable, re-appliable series against a
-frozen version (`third_party/cros-codecs-patches/`), and a pinned dependency that
-never changes is also one that never breaks underneath us. The published forks
-were surveyed and are worse rather than better — see that README. The exit, if
-the delta ever becomes painful, is §6.2's GStreamer path, already verified
-bit-exact on the reference machine.
+So §6.2's GStreamer path became the implementation rather than the fallback, and
+the cros-codecs backend and its five patches were deleted. What that cost and
+bought is recorded in
+[`../investigations/2026-10-08-gstreamer-decode-pivot.md`](../investigations/2026-10-08-gstreamer-decode-pivot.md).
+
+The general lesson is worth keeping even though this instance is closed: a
+pinned 0.0.x dependency whose upstream has stopped is not a dependency that
+"never breaks underneath you", it is one whose every future defect is yours.
 
 ---
 

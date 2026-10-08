@@ -13,9 +13,10 @@
 //!
 //! - **`vaapi`** (default) -- ffmpeg + VA-API. What every x86 host has, and
 //!   the only one CI can run.
-//! - **`v4l2`** -- `cros-codecs` over the V4L2 Request API, for a
-//!   mainline-kernel ARM SoC with a stateless decoder and no VA-API driver at
-//!   all. RK3399/rkvdec is the reference; see
+//! - **`gstreamer-backend`** -- GStreamer, for a machine with no VA-API driver
+//!   at all. On the reference hardware (RK3399/rkvdec) that resolves to
+//!   `v4l2slh264dec` over the V4L2 Request API, but nothing here says so:
+//!   GStreamer picks the element and the device. See
 //!   `docs/superpowers/specs/2026-09-25-native-client-gles-v4l2-design.md`.
 //!
 //! Both present [`decoder::H264Decoder`], [`decoder::HwFrame`],
@@ -25,57 +26,44 @@
 //! choice because they share no code below that surface -- the same reasoning
 //! as `ghostframe-client-gpu`'s `vulkan`/`gles` split (design §4.6).
 //!
-//! **The `v4l2` backend needs a patched `cros-codecs`.** Five patches against
-//! 0.0.6, all upstreamable, in `third_party/cros-codecs-patches/` -- see that
-//! README for what each fixes and why the delta is long-lived. Without them the
-//! crate does not build here, so there is no degraded mode to reason about: the
-//! feature is off by default and only the reference machine turns it on.
+//! **The `gstreamer-backend` needs GStreamer >= 1.24.1**, which is where
+//! `v4l2codecs` gained DMA_DRM caps -- the only way to *require* a decoded
+//! dmabuf rather than hope for one. Below that floor the decoder silently hands
+//! back system memory at some resolutions, which is a full-frame CPU copy per
+//! frame and the exact cost the zero-copy design exists to avoid. The `v1_24`
+//! features on the gstreamer crates make the floor a link-time fact, and
+//! `probe::MIN_GSTREAMER` states it in a log line.
+//!
+//! This replaced a `cros-codecs` backend carrying five patches against a crate
+//! dormant since March 2025. The patches are gone, along with the device
+//! selection, frame pooling and plane-offset arithmetic they existed to fix --
+//! GStreamer reports the layout instead.
 
 // Exactly one backend, and say so clearly rather than failing with a
 // missing-module error twenty lines down.
-#[cfg(all(feature = "vaapi", feature = "v4l2"))]
+#[cfg(all(feature = "vaapi", feature = "gstreamer-backend"))]
 compile_error!(
-    "ghostframe-client-h264: `vaapi` and `v4l2` are mutually exclusive; they share no code \
-     below `H264Decoder`/`HwFrame` (see the crate docs). Pass \
-     `--no-default-features --features v4l2` for the V4L2 backend."
+    "ghostframe-client-h264: `vaapi` and `gstreamer-backend` are mutually exclusive; they \
+     share no code below `H264Decoder`/`HwFrame` (see the crate docs). Pass \
+     `--no-default-features --features gstreamer-backend` for the GStreamer backend."
 );
-#[cfg(not(any(feature = "vaapi", feature = "v4l2")))]
+#[cfg(not(any(feature = "vaapi", feature = "gstreamer-backend")))]
 compile_error!(
-    "ghostframe-client-h264: enable exactly one decode backend, `vaapi` (default) or `v4l2`."
+    "ghostframe-client-h264: enable exactly one decode backend, `vaapi` (default) or \
+     `gstreamer-backend`."
 );
-// `cros-codecs 0.0.6` as published cannot be built off aarch64 with its `v4l2`
-// feature on: `image_processing.rs:15` is
-// `#[cfg(feature = "v4l2")] use std::arch::aarch64::*;` -- gated on the feature
-// rather than the architecture -- so its MM21 NEON path is unconditional there.
-// Without this guard the failure is `could not find aarch64 in arch`, from a
-// dependency, with nothing pointing at the feature that asked for it.
-//
-// Not a limitation of this backend: the V4L2 Request API is not ARM-specific and
-// neither is anything in `v4l2_frame.rs`. Patch 0003 of
-// `third_party/cros-codecs-patches/` fixes the gate, and a patched checkout does
-// `cargo check` clean for x86-64 -- but CI builds cros-codecs from crates.io, so
-// this guard describes the configuration everyone else actually gets. It comes
-// out if the patch ever lands upstream.
-#[cfg(all(feature = "v4l2", not(target_arch = "aarch64")))]
-compile_error!(
-    "ghostframe-client-h264: the `v4l2` backend needs aarch64, because \
-     cros-codecs 0.0.6 gates its NEON MM21 path on the `v4l2` FEATURE rather than \
-     on the target architecture (image_processing.rs:15). Use the default `vaapi` \
-     backend on this target."
-);
-
 #[cfg(feature = "vaapi")]
 pub mod decoder;
-#[cfg(feature = "v4l2")]
-#[path = "decoder_v4l2.rs"]
+#[cfg(feature = "gstreamer-backend")]
+#[path = "decoder_gst.rs"]
 pub mod decoder;
 
 pub mod descriptor;
 
 #[cfg(feature = "vaapi")]
 pub mod probe;
-#[cfg(feature = "v4l2")]
-#[path = "probe_v4l2.rs"]
+#[cfg(feature = "gstreamer-backend")]
+#[path = "probe_gst.rs"]
 pub mod probe;
 
 // Wherever libavcodec is linked -- the `vaapi` backend, and a `v4l2` build with
@@ -92,13 +80,12 @@ mod ffmpeg_log;
 #[cfg(any(feature = "test-support", all(test, feature = "vaapi")))]
 pub mod software_decode;
 
-// The `v4l2` backend's two halves: the frames the decoder writes into, and the
-// raw-ioctl device discovery that keeps the capability probe's ground truth
-// independent of `cros-codecs`.
-#[cfg(feature = "v4l2")]
+// Raw-ioctl device discovery, kept so the capability probe's ground truth stays
+// independent of the thing it validates. This is all that survived the move off
+// cros-codecs: GStreamer owns device selection, buffer pooling and the plane
+// layout now, so the frame type and the decoder plumbing went with it.
+#[cfg(feature = "gstreamer-backend")]
 pub mod v4l2_device;
-#[cfg(feature = "v4l2")]
-mod v4l2_frame;
 // `cfg(test)` covers this crate's own unit tests (decoder::tests and
 // oracle_tests both use `gradient_clip`) without a self-referencing
 // dev-dependency on the `test-support` feature -- that idiom compiled the
@@ -126,11 +113,12 @@ pub mod testclip;
 // unit.
 #[cfg(all(test, feature = "vaapi"))]
 mod oracle_tests;
-// The `v4l2` backend's equivalent: hardware decode against a software golden,
-// which is the only test that distinguishes a correct chroma offset from a
-// nearly-correct one.
-#[cfg(all(test, feature = "v4l2", feature = "test-support"))]
-mod oracle_tests_v4l2;
+// The GStreamer backend's equivalent: hardware decode against a software
+// golden, which remains the only test that distinguishes a correct plane layout
+// from a nearly-correct one -- GStreamer reports the layout now, but using it
+// wrongly is still possible and still produces plausible output.
+#[cfg(all(test, feature = "gstreamer-backend", feature = "test-support"))]
+mod oracle_tests_gst;
 
 pub use descriptor::{DmabufPlanes, PlaneDesc, DRM_FORMAT_GR88, DRM_FORMAT_NV12, DRM_FORMAT_R8};
 pub use probe::h264_decode_available;
@@ -166,15 +154,15 @@ pub enum H264Error {
     #[error("unexpected DRM descriptor: {0}")]
     Descriptor(String),
 
-    /// The V4L2 stateless decode path failed. The `v4l2` backend's counterpart
-    /// to [`Self::Ffmpeg`].
-    #[error("v4l2: {0}")]
-    V4l2(String),
-
-    /// No usable V4L2 stateless decoder. The `v4l2` backend's counterpart to
-    /// [`Self::VaapiUnavailable`], and like it, not fatal anywhere in this
-    /// client: the capability bit stays clear and the session runs on the tile
-    /// codecs.
-    #[error("V4L2 stateless H.264 decode unavailable: {0}")]
-    V4l2Unavailable(String),
+    /// The GStreamer decode path failed. The `gstreamer-backend` counterpart to
+    /// [`Self::Ffmpeg`], and like it, not fatal anywhere in this client: the
+    /// capability bit stays clear and the session runs on the tile codecs.
+    ///
+    /// One variant rather than the two the previous backend had. The split there
+    /// was "the device could not be opened" against "decoding failed", and it
+    /// mattered because device selection was ours to get wrong. GStreamer
+    /// selects the device, so nearly everything that fails now fails in
+    /// negotiation, and splitting it would be a distinction without a caller.
+    #[error("gstreamer: {0}")]
+    Gst(String),
 }
