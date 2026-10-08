@@ -5175,6 +5175,16 @@ impl IoBridge {
                         nack_received = es.nack_hit + es.nack_miss,
                         nack_hit = es.nack_hit,
                         nack_miss = es.nack_miss,
+                        // How many of those hits only landed because the
+                        // cache was searched by tile-pass instead of by the
+                        // `frame_seq` the client sent. A coverage NACK names
+                        // a pass the client never received, so it has no
+                        // frame to echo; on a refinement-heavy session this
+                        // should be most of `nack_hit`. Reading zero while
+                        // `nack_miss` climbs means the content index is not
+                        // being maintained, which is the shape that left
+                        // tiles stranded without their finest bit-planes.
+                        nack_resolved_by_content = es.nack_resolved_by_content,
                         // Step A's counter: datagrams quinn refused. Never
                         // surfaced before, and it is the difference between
                         // "we never sent it" and "we sent it and it was lost".

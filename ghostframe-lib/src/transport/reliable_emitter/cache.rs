@@ -60,6 +60,20 @@ pub struct CacheEntry {
 pub struct RetransmitCache {
     entries: HashMap<EmitKey, CacheEntry>,
     lru: LruCache<EmitKey, ()>,
+    /// `(tile_x, tile_y, pass_idx) -> most recently emitted EmitKey`.
+    ///
+    /// A NACK cannot name a transmission. An ACK echoes the `frame_seq` of a
+    /// datagram the client *received*, so its `EmitKey` matches exactly; a
+    /// NACK names a pass the client never got, so it has no `frame_seq` to
+    /// echo and sends the tile's last-known one instead. Refinement passes
+    /// for one tile are emitted across different frames, so that value is
+    /// almost never the frame the missing pass was cached under -- which is
+    /// why `nack_hit` read exactly 0 in the field, not merely low.
+    ///
+    /// This index restores the content identity a NACK actually carries.
+    /// Last-write-wins: emission is chronological, so the newest entry for a
+    /// `(tile, pass)` is the one worth resending.
+    by_content: HashMap<(u8, u8, u8), EmitKey>,
     pub stats: CacheStats,
 }
 
@@ -79,6 +93,7 @@ impl RetransmitCache {
         Self {
             entries: HashMap::new(),
             lru: LruCache::new(NonZeroUsize::new(CACHE_CAPACITY).unwrap()),
+            by_content: HashMap::new(),
             stats: CacheStats::default(),
         }
     }
@@ -118,7 +133,33 @@ impl RetransmitCache {
         // field (still useful for spotting genuine ACK-failure cliffs in
         // the future) but never triggers eviction now.
         self.lru.put(key, ());
+        self.by_content
+            .insert((key.tile_x, key.tile_y, key.pass_idx), key);
         self.entries.insert(key, entry);
+    }
+
+    /// The newest cached `EmitKey` for this tile-pass, whatever frame it was
+    /// emitted in.
+    ///
+    /// Used only as a NACK fallback: see `by_content`'s doc comment for why a
+    /// NACK's `frame_seq` cannot be trusted.
+    pub fn lookup_content(&self, tile_x: u8, tile_y: u8, pass_idx: u8) -> Option<EmitKey> {
+        self.by_content.get(&(tile_x, tile_y, pass_idx)).copied()
+    }
+
+    /// Drop the content index entry for `key`, but only if it still points at
+    /// `key`.
+    ///
+    /// A newer emission of the same tile-pass has already repointed it, and
+    /// clearing that would lose the live entry's only content-addressable
+    /// route. Leaving a stale pointer would be worse: the fallback would hand
+    /// `on_nack` a key with no cache entry, and the retransmission would be
+    /// silently skipped.
+    fn forget_content(&mut self, key: &EmitKey) {
+        let slot = (key.tile_x, key.tile_y, key.pass_idx);
+        if self.by_content.get(&slot) == Some(key) {
+            self.by_content.remove(&slot);
+        }
     }
 
     pub fn get(&self, key: &EmitKey) -> Option<&CacheEntry> {
@@ -133,6 +174,7 @@ impl RetransmitCache {
 
     pub fn remove(&mut self, key: &EmitKey) -> Option<CacheEntry> {
         self.lru.pop(key);
+        self.forget_content(key);
         self.entries.remove(key)
     }
 
@@ -147,6 +189,7 @@ impl RetransmitCache {
             .collect();
         for k in &drop {
             self.lru.pop(k);
+            self.forget_content(k);
             self.entries.remove(k);
         }
     }
@@ -180,11 +223,13 @@ impl RetransmitCache {
         for k in &stale {
             self.entries.remove(k);
             self.lru.pop(k);
+            self.forget_content(k);
         }
         stale
     }
 
     pub fn clear(&mut self) {
+        self.by_content.clear();
         self.entries.clear();
         // LruCache has no clear(); rebuild it.
         self.lru = LruCache::new(NonZeroUsize::new(CACHE_CAPACITY).unwrap());

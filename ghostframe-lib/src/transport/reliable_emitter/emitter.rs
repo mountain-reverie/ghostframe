@@ -66,6 +66,14 @@ pub struct EmitterStats {
     pub ack_miss: u64,
     pub nack_hit: u64,
     pub nack_miss: u64,
+    /// NACKs whose exact `EmitKey` missed but whose tile-pass was found in
+    /// the cache's content index.
+    ///
+    /// Worth its own counter rather than folding into `nack_hit`: on a
+    /// refinement-heavy session this should be most of them, because a
+    /// coverage NACK cannot name a transmission. If it ever reads zero while
+    /// `nack_miss` is high, the index is not being maintained.
+    pub nack_resolved_by_content: u64,
     /// Entries removed by `retire_stuck` because they had been retransmitting
     /// for longer than any plausible delivery. Each one was costing a
     /// retransmit every `RTO_BACKOFF_MAX` forever. Non-zero means the link or
@@ -434,7 +442,35 @@ impl ReliableTileEmitter {
     pub fn on_nack(&mut self, entries: &[(EmitKey, u8)], now: Instant) {
         // Computed before the cache borrow below, which holds `&mut self`.
         let emit_us_now = self.emit_us(now);
-        for &(key, frag_idx) in entries {
+        for &(nacked_key, frag_idx) in entries {
+            // Exact first: a NACK for a fragment of a pass the client partly
+            // received *can* name the transmission, because it has the
+            // frame_seq from the fragments that did arrive.
+            //
+            // Content second: a coverage NACK for a wholly missing pass
+            // cannot. The client has no frame_seq for a datagram it never
+            // got, so it sends the tile's last-known one, and refinement
+            // passes for one tile are emitted across different frames. That
+            // mismatch is why `nack_hit` read exactly 0 in the field rather
+            // than merely low -- every coverage NACK missed, the pass was
+            // never resent, and the client gave up on it after
+            // MAX_TAIL_SWEEP_ATTEMPTS, stranding the tile short of its
+            // finest bit-planes for the rest of the session.
+            let key = if self.cache.get(&nacked_key).is_some() {
+                nacked_key
+            } else {
+                match self.cache.lookup_content(
+                    nacked_key.tile_x,
+                    nacked_key.tile_y,
+                    nacked_key.pass_idx,
+                ) {
+                    Some(found) => {
+                        self.stats.nack_resolved_by_content += 1;
+                        found
+                    }
+                    None => nacked_key,
+                }
+            };
             let Some(entry) = self.cache.get_mut(&key) else {
                 self.stats.nack_miss += 1;
                 if crate::transport::reliable_emitter::rto_probe_enabled() {
@@ -1109,6 +1145,127 @@ mod tests {
         let mut e = ReliableTileEmitter::new(Instant::now());
         e.on_nack(&[(EmitKey::new(99, 0, 0, 0), 0u8)], Instant::now());
         assert_eq!(e.stats.nack_miss, 1);
+    }
+
+    /// The field defect, reproduced at the unit level.
+    ///
+    /// A tile's CDF 5/3 passes are emitted across different frames, so pass 11
+    /// is cached under the frame it went out in. A coverage NACK for pass 11
+    /// cannot name that frame -- the client never received the datagram -- so
+    /// it sends the tile's last-known `frame_seq`, which is the frame of the
+    /// last pass that *did* arrive.
+    ///
+    /// Before the content index every such NACK missed, the pass was never
+    /// resent, and the client gave up after MAX_TAIL_SWEEP_ATTEMPTS. In the
+    /// field that read as `nack_hit=0 / nack_miss=6764` from a cold start and
+    /// left 478 of 2040 tiles stranded without their three finest bit-planes.
+    #[test]
+    fn a_coverage_nack_naming_a_stale_frame_seq_still_retransmits() {
+        let t0 = Instant::now();
+        let mut e = ReliableTileEmitter::new(t0);
+        let mut sender = CollectSender::default();
+
+        // Pass 10 went out in frame 40; pass 11 in frame 41. The client holds
+        // frame 40, because that is the newest pass that reached it.
+        let arrived = EmitKey::new(40, 7, 9, 10);
+        let missing = EmitKey::new(41, 7, 9, 11);
+        e.submit_one(arrived, fake_source(40, 0, 0xA0), t0, None, t0);
+        e.submit_one(missing, fake_source(41, 0, 0xB1), t0, None, t0);
+        e.drain(&mut sender, t0);
+        let sent_before = sender.sent.len();
+
+        // What the client actually puts on the wire: pass 11, frame 40.
+        let as_the_client_names_it = EmitKey::new(40, 7, 9, 11);
+        assert!(
+            e.cache.get(&as_the_client_names_it).is_none(),
+            "precondition: the key the client can name is not the key the \
+             pass is cached under -- without that there is nothing to fix"
+        );
+
+        e.on_nack(&[(as_the_client_names_it, 0u8)], t0);
+
+        assert_eq!(
+            e.stats.nack_miss, 0,
+            "a NACK for a pass that IS cached must not be recorded as a miss \
+             just because the client could not name its frame"
+        );
+        assert_eq!(e.stats.nack_hit, 1, "the pass must be resent");
+        assert_eq!(
+            e.stats.nack_resolved_by_content, 1,
+            "and resolved through the content index, not by luck"
+        );
+
+        e.drain(&mut sender, t0);
+        assert!(
+            sender.sent.len() > sent_before,
+            "a resolved NACK must put bytes back on the wire"
+        );
+    }
+
+    /// The fallback must not invent a hit: a tile-pass that was never cached
+    /// still misses.
+    #[test]
+    fn the_content_fallback_does_not_resurrect_uncached_passes() {
+        let t0 = Instant::now();
+        let mut e = ReliableTileEmitter::new(t0);
+        let mut sender = CollectSender::default();
+        e.submit_one(
+            EmitKey::new(40, 7, 9, 10),
+            fake_source(40, 0, 0xA0),
+            t0,
+            None,
+            t0,
+        );
+        e.drain(&mut sender, t0);
+
+        // Same tile, a pass that was never emitted.
+        e.on_nack(&[(EmitKey::new(40, 7, 9, 13), 0u8)], t0);
+        // A tile that does not exist at all.
+        e.on_nack(&[(EmitKey::new(40, 3, 3, 0), 0u8)], t0);
+
+        assert_eq!(e.stats.nack_miss, 2);
+        assert_eq!(e.stats.nack_hit, 0);
+        assert_eq!(e.stats.nack_resolved_by_content, 0);
+    }
+
+    /// Retiring a superseded emission must not unhook the live one.
+    ///
+    /// The same tile-pass can be emitted more than once -- a re-send, or a
+    /// later refinement sweep -- and the content index points at the newest.
+    /// When the older entry is then ACKed or retired, clearing the index
+    /// unconditionally would strand the newer entry: still cached, but with
+    /// no content-addressable route, so every coverage NACK for it would miss
+    /// again. That is why the removal is guarded on the slot still pointing
+    /// at the key being removed.
+    #[test]
+    fn retiring_a_superseded_emission_leaves_the_newer_one_reachable() {
+        let t0 = Instant::now();
+        let mut e = ReliableTileEmitter::new(t0);
+        let mut sender = CollectSender::default();
+
+        let older = EmitKey::new(41, 7, 9, 11);
+        let newer = EmitKey::new(50, 7, 9, 11);
+        e.submit_one(older, fake_source(41, 0, 0xB1), t0, None, t0);
+        e.submit_one(newer, fake_source(50, 0, 0xB2), t0, None, t0);
+        e.drain(&mut sender, t0);
+
+        // The older transmission is acknowledged and leaves the cache.
+        assert!(e.cache.remove(&older).is_some());
+        assert!(
+            e.cache.get(&newer).is_some(),
+            "precondition: the newer emission is still cached"
+        );
+
+        // A coverage NACK still cannot name either frame.
+        e.on_nack(&[(EmitKey::new(40, 7, 9, 11), 0u8)], t0);
+
+        assert_eq!(
+            e.stats.nack_miss, 0,
+            "removing the superseded entry must not take the live entry's \
+             content route with it"
+        );
+        assert_eq!(e.stats.nack_hit, 1);
+        assert_eq!(e.stats.nack_resolved_by_content, 1);
     }
 
     #[test]
