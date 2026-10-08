@@ -104,6 +104,24 @@ impl WasmClientCore {
         to_js(&crate::boundary::WasmCdf53Coverage::from(&s))
     }
 
+    /// Protocol datagrams accepted so far, as `{ tileDatagrams,
+    /// frameDatagrams }` -- the shape `window.__ghostframeStats` carries.
+    ///
+    /// The browser cannot derive this any more: the TypeScript receive loop
+    /// that incremented those counters went at the wasm cutover, leaving
+    /// `main.ts` holding a `stats` object it never wrote to. Five e2e tests
+    /// read the globals and saw 0 on sessions moving thousands of datagrams.
+    /// Classified by `ClientCore::handle_datagram`'s own dispatch rather than
+    /// re-tested here, so the two cannot drift.
+    #[wasm_bindgen(js_name = datagramCounts)]
+    pub fn datagram_counts(&self) -> Result<JsValue, JsValue> {
+        let (tile, frame) = self.inner.datagram_counts();
+        to_js(&crate::boundary::WasmDatagramCounts {
+            tile_datagrams: u32::try_from(tile).unwrap_or(u32::MAX),
+            frame_datagrams: u32::try_from(frame).unwrap_or(u32::MAX),
+        })
+    }
+
     /// Tiles still missing at least one present pass, most-stalled first.
     ///
     /// `limit` caps the list so a fully stalled screen cannot produce a

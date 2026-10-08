@@ -58,12 +58,16 @@ impl ClientCore {
 
         // 3. Not a tile datagram -> H.264 full-frame reassembly path.
         if !is_tile_datagram(bytes) {
+            // Counted on the branch that classifies it, not alongside it, so
+            // the count cannot disagree with the path taken.
+            self.datagrams_frame = self.datagrams_frame.saturating_add(1);
             self.handle_frame_datagram(bytes, now_us, &mut events);
             return events;
         }
 
         // 4. Tile datagram: feed the parity window (may replay a recovered
         //    source), then process this datagram.
+        self.datagrams_tile = self.datagrams_tile.saturating_add(1);
         let wire_seq = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
         if let Some(replayed) = self.parity_decoder.record_source(wire_seq, bytes) {
             self.handle_source_tile(&replayed, now_us, &mut events);
@@ -397,6 +401,7 @@ impl ClientCore {
                                 palette_id: validated.palette_id,
                                 count: validated.count,
                                 indices: validated.indices,
+                                wire_flags: validated.wire_flags,
                             },
                         });
                     }

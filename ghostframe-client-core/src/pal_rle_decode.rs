@@ -20,6 +20,15 @@ pub enum PalRleVariant {
 #[derive(Debug)]
 pub struct PrevalidatedPalRle {
     pub variant: PalRleVariant,
+    /// The payload's flags byte, verbatim.
+    ///
+    /// Carried rather than re-derived from `variant` so the consumer sees the
+    /// byte the *server* encoded. `e2e_indices_raw_handshake` proves the
+    /// indices-raw capability is actually exercised on the wire by testing
+    /// bit 1 of this byte; reconstructing a flags byte from `variant`
+    /// downstream would make that test assert against the client's own idea
+    /// of the flag instead of the encoder's.
+    pub wire_flags: u8,
     pub palette_id: u8,
     pub count: u8,
     /// 512 bytes, 2 pixels/byte, low nibble first.
@@ -52,6 +61,7 @@ pub fn prevalidate_pal_rle(
         }
         let indices = payload[2..2 + 512].to_vec();
         return Ok(PrevalidatedPalRle {
+            wire_flags: flags,
             variant: PalRleVariant::IndicesRaw,
             palette_id,
             count: shadow.count(palette_id),
@@ -90,6 +100,7 @@ pub fn prevalidate_pal_rle(
         expand_rle_to_indices(&payload[cursor..]).ok_or(DecodeErrorCode::PayloadTooShort)?;
 
     Ok(PrevalidatedPalRle {
+        wire_flags: flags,
         variant: if bundled {
             PalRleVariant::Bundled
         } else {

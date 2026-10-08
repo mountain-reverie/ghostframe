@@ -203,6 +203,16 @@ pub struct ClientCore {
     pub(crate) next_feedback_us: u64,
     /// See [`TileDelivery`]. Set once at construction from `ClientConfig`.
     pub(crate) tile_delivery: TileDelivery,
+    /// Protocol datagrams accepted by `handle_datagram`, split the same way
+    /// its dispatch splits them: tile datagrams (bit 31 of `frame_seq` set)
+    /// and H.264 frame datagrams (bit 31 clear).
+    ///
+    /// Counted here rather than in the browser because the browser cannot
+    /// classify them without duplicating that dispatch, and a second copy of
+    /// a discriminator is exactly how one drifts. Parity and NACK envelopes
+    /// are in neither count -- see [`ClientCore::datagram_counts`].
+    pub(crate) datagrams_tile: u64,
+    pub(crate) datagrams_frame: u64,
 }
 
 impl ClientCore {
@@ -228,6 +238,8 @@ impl ClientCore {
             next_tail_sweep_us: now_us + TAIL_SWEEP_INTERVAL_US,
             next_feedback_us: now_us + FEEDBACK_INTERVAL_US,
             tile_delivery: config.tile_delivery,
+            datagrams_tile: 0,
+            datagrams_frame: 0,
         };
 
         // Construct the Hello message [0x03, caps]
@@ -465,6 +477,24 @@ impl ClientCore {
     /// will render wrong for the rest of the session.
     pub fn cdf53_coverage_summary(&self) -> crate::cdf53_coverage::Cdf53CoverageSummary {
         crate::cdf53_coverage::summarize(self.cdf53_coverage.values(), MAX_TAIL_SWEEP_ATTEMPTS)
+    }
+
+    /// Protocol datagrams accepted so far as `(tile, frame)`.
+    ///
+    /// The split is the one `handle_datagram` actually dispatches on, so the
+    /// counts cannot disagree with the path a datagram took. Deliberately
+    /// excluded: ping/pong (not protocol), datagrams too short to carry a
+    /// header, and parity/NACK envelopes -- a parity datagram carries
+    /// recovered tile bytes but is not itself a tile datagram, and counting
+    /// it as one would inflate the tile side only on FEC-enabled sessions.
+    ///
+    /// This exists because `window.__ghostframeStats` was fed by the
+    /// TypeScript receive loop that the wasm cutover deleted. `main.ts` kept
+    /// `const stats = diag.stats` and never touched it again, so
+    /// `tileDatagrams`/`frameDatagrams` read 0 on sessions moving thousands
+    /// of datagrams, and the five e2e tests asserting on them could not pass.
+    pub fn datagram_counts(&self) -> (u64, u64) {
+        (self.datagrams_tile, self.datagrams_frame)
     }
 
     /// Coordinates of tiles still missing at least one present pass, with

@@ -298,3 +298,101 @@ fn cdf53_ack_deferred_until_prevalidation() {
     assert!(saw_stream_error, "expected decode-error stream message");
     assert!(!saw_ack, "corrupt cdf53 must not produce an ACK");
 }
+
+// ── datagram_counts: the e2e gates' measurement ──────────────────────────────
+
+/// `datagram_counts` must split datagrams the way `handle_datagram` dispatches
+/// them, because five e2e tests decide pass/fail on those two numbers.
+///
+/// Both tile and frame datagrams are built by the **server's** `fragment_tile`
+/// / `fragment_frame`, so the discriminator under test is the one production
+/// actually sets. Asserting against a hand-written byte with bit 31 flipped
+/// would pass just as happily if the classifier were reading the wrong bit.
+#[test]
+fn datagram_counts_split_tile_and_frame_as_the_dispatch_does() {
+    use ghostframe_protocol::protocol::fragment_frame;
+
+    let mut core = test_core();
+    assert_eq!(
+        core.datagram_counts(),
+        (0, 0),
+        "a fresh core has counted nothing"
+    );
+
+    // One tile, fragmented small enough to span several datagrams: the
+    // counter is per datagram, not per tile.
+    //
+    // The payload is deliberately not a decodable pass. A datagram counts
+    // because it arrived and was classified, not because its tile decoded --
+    // otherwise the counts would silently under-report exactly on the lossy
+    // and malformed sessions where they matter most. Moving the increment
+    // below the decode would fail this.
+    let tile = tile_datagrams(1, 0, 0, Codec::Cdf53, 0, &[0x5Au8; 200], 32);
+    assert!(
+        tile.len() > 1,
+        "tile payload should span multiple datagrams"
+    );
+    for dg in &tile {
+        core.handle_datagram(dg, 0);
+    }
+    assert_eq!(
+        core.datagram_counts(),
+        (tile.len() as u64, 0),
+        "every tile datagram counts on the tile side, and none on the frame side"
+    );
+
+    let frame = fragment_frame(7, 0, true, &[0x41u8; 3000], 1200);
+    assert!(
+        frame.len() > 1,
+        "frame payload should span multiple datagrams"
+    );
+    for dg in &frame {
+        core.handle_datagram(dg, 0);
+    }
+    assert_eq!(
+        core.datagram_counts(),
+        (tile.len() as u64, frame.len() as u64),
+        "frame datagrams must not be attributed to the tile side"
+    );
+}
+
+/// Anything that is not a protocol tile/frame datagram must leave both
+/// counters alone. A counter that drifts upward on ping/pong would make
+/// `tile_seen` true on a session that never received a tile -- the exact
+/// false pass these gates exist to prevent.
+#[test]
+fn datagram_counts_ignore_non_protocol_traffic() {
+    use ghostframe_protocol::protocol::{TileParityEnvelope, TILE_PARITY_ENVELOPE};
+
+    let mut core = test_core();
+
+    core.handle_datagram(b"", 0);
+    core.handle_datagram(b"pong", 0);
+    // Long enough to pass the ping/pong guard, too short to carry a header.
+    core.handle_datagram(&[0u8; 22], 0);
+    assert_eq!(
+        core.datagram_counts(),
+        (0, 0),
+        "empty, ping/pong and header-less datagrams are not protocol datagrams"
+    );
+
+    // A parity envelope carries recovered tile bytes but is not itself a tile
+    // datagram. Counting it as one would inflate the tile side only on
+    // FEC-enabled sessions, which is the hardest kind of skew to notice.
+    let mut parity = Vec::new();
+    TileParityEnvelope {
+        group_first_wire_seq: 1,
+        k: 2,
+        parity_idx: 0,
+        source_lens: vec![40, 40],
+        parity_payload: vec![0u8; 40],
+    }
+    .encode(&mut parity);
+    assert_eq!(parity[0], TILE_PARITY_ENVELOPE, "envelope discriminator");
+    core.handle_datagram(&parity, 0);
+    assert_eq!(
+        core.datagram_counts(),
+        (0, 0),
+        "parity envelopes are counted on neither side"
+    );
+}

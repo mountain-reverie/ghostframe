@@ -175,3 +175,78 @@ fn decode_pal_rle_tile_bundled_two_color_pixel0_matches_palette_color0_swizzled(
     assert_eq!(shadow.count(5), 2);
     assert_eq!(palettes[5][0], [0x11, 0x22, 0x33, 0x44]);
 }
+
+// ── wire_flags: forwarded verbatim, never re-derived ─────────────────────────
+
+/// `wire_flags` must be byte-identical to the payload's first byte for every
+/// variant.
+///
+/// `e2e_indices_raw_handshake` reads this value out through the wasm boundary
+/// and tests bit 1 to prove the indices-raw capability was exercised on the
+/// wire. Before this field existed, `main.ts` recorded `palette_id` in its
+/// place, so the assertion passed or failed on whether a palette id happened
+/// to have bit 1 set -- a gate that looked green for the wrong reason.
+///
+/// The test asserts equality with the whole byte rather than the one bit it
+/// cares about. Re-deriving the flags from `variant` downstream (returning
+/// `0x02` for IndicesRaw, `0x01` for Bundled, `0x00` for Thin) would satisfy
+/// a bit-1 check while silently dropping every other bit, including any the
+/// protocol gains later.
+#[test]
+fn wire_flags_is_the_payloads_first_byte_for_every_variant() {
+    let mut shadow = PaletteShadow::new();
+    shadow.put(7, 1);
+
+    let rle = vec![0x0Fu8; 64]; // 64 runs of 16 => 512 indices, all index 0
+    let bundled = bundled_payload(7, 1, &rle);
+    let v = prevalidate_pal_rle(&bundled, &shadow).expect("bundled prevalidates");
+    assert_eq!(v.variant, PalRleVariant::Bundled);
+    assert_eq!(
+        v.wire_flags, bundled[0],
+        "bundled: wire_flags must be the payload's flags byte"
+    );
+
+    let thin = thin_payload(7, &rle);
+    let v = prevalidate_pal_rle(&thin, &shadow).expect("thin prevalidates");
+    assert_eq!(v.variant, PalRleVariant::Thin);
+    assert_eq!(
+        v.wire_flags, thin[0],
+        "thin: wire_flags must be the payload's flags byte"
+    );
+
+    let raw = indices_raw_payload(7, &[0u8; 512]);
+    let v = prevalidate_pal_rle(&raw, &shadow).expect("indices_raw prevalidates");
+    assert_eq!(v.variant, PalRleVariant::IndicesRaw);
+    assert_eq!(
+        v.wire_flags, raw[0],
+        "indices_raw: wire_flags must be the payload's flags byte"
+    );
+    assert_ne!(
+        v.wire_flags & 0x02,
+        0,
+        "bit 1 is what e2e_indices_raw_handshake tests"
+    );
+}
+
+/// Bits the client does not interpret must still survive into `wire_flags`.
+///
+/// This is the case a `variant`-derived reconstruction cannot pass, and it is
+/// the reason the field is forwarded rather than rebuilt: a diagnostic that
+/// quietly normalises the wire byte stops being evidence of what the server
+/// sent.
+#[test]
+fn wire_flags_preserves_bits_the_client_does_not_interpret() {
+    let mut shadow = PaletteShadow::new();
+    shadow.put(3, 1);
+
+    // indices_raw (bit 1) plus a reserved bit the decoder ignores.
+    let mut raw = indices_raw_payload(3, &[0u8; 512]);
+    raw[0] |= 0x80;
+
+    let v = prevalidate_pal_rle(&raw, &shadow).expect("prevalidates: bit 7 is ignored");
+    assert_eq!(v.variant, PalRleVariant::IndicesRaw);
+    assert_eq!(
+        v.wire_flags, 0x82,
+        "the reserved bit must survive; a flags byte rebuilt from `variant` would read 0x02"
+    );
+}

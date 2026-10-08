@@ -127,8 +127,44 @@ ci-client: build-client
 build-web:
     cd ghostframe-web-client && npm install && npm run build
 
+# E2E tests that must not share a run with the rest of the suite.
+#
+# They pass alone and fail after a long sweep. The contention is
+# machine-level and cumulative -- thermal, page cache, Docker churn --
+# not concurrency within the test process, so `--test-threads=1` does
+# not help: it is already in force. Measured on 2026-10-08,
+# `e2e_mode_switch_chromium` passed standalone and failed 3/3 when run
+# straight after a 20-minute container build and a 24-test sweep.
+#
+# Giving each its own `cargo test` invocation is a mitigation, not a cure:
+# `e2e_multi_pattern` still came out ~50% (2/4) alone, on master as well as
+# on a branch, so it is listed here to give it the best conditions rather
+# than because isolation makes it deterministic. The alternative -- retuning
+# thresholds that are correct on an unsaturated machine -- would make the
+# tests weaker at catching the thing they exist for.
+#
+# Note these are all skipped on CI already (VKMS-gated, or software H.264 too
+# slow on 2-vCPU runners -- see ci/skip-list.txt), so this split only shapes
+# the local developer run, which is the only place they are load bearing.
+e2e-isolated := "e2e_mode_switch_chromium e2e_multi_pattern e2e_progressive_refinement_chromium"
+
+# Full e2e suite: the sweep, then the contention-sensitive tests alone.
 test-e2e: build-web containers-build
-    cargo test --test e2e
+    cargo test --test e2e -- --test-threads=1 \
+        --skip e2e_mode_switch_chromium \
+        --skip e2e_multi_pattern \
+        --skip e2e_progressive_refinement_chromium
+    just test-e2e-isolated
+
+# Run only the contention-sensitive e2e tests, one process each.
+test-e2e-isolated: containers-build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for t in {{ e2e-isolated }}; do
+        echo "=== $t (isolated run)"
+        docker rm -f ghostframe-server headscale >/dev/null 2>&1 || true
+        cargo test --test e2e -- "$t" --exact --test-threads=1
+    done
 
 containers-build:
     cargo build --release -p ghostframe-xdaemon -p ghostframe-test-pattern

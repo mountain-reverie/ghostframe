@@ -45,6 +45,11 @@ pub enum TileData {
         palette_id: u8,
         count: u8,
         indices: Vec<u8>,
+        /// The payload's flags byte as the server encoded it (bit 0 =
+        /// bundled, bit 1 = indices-raw). Forwarded verbatim so a consumer
+        /// can assert on what was on the wire rather than on the client's
+        /// re-derivation of it.
+        wire_flags: u8,
     },
     /// `bit_planes` is 384 bytes: 3 channels x 128, packed B, G, R.
     Cdf53 {
