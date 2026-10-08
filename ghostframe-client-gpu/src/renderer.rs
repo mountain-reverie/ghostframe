@@ -809,9 +809,17 @@ impl Renderer {
     /// `import.rs`'s module doc warns must be written down rather than
     /// relied on silently: a driver that does not fence a shared dma-buf's
     /// BO this way would read the decoder's next write mid-sample instead
-    /// of the frame this function intended, without any error. A future
-    /// hardware target should check for that fencing explicitly (or add a
-    /// real GPU-side fence handoff) before trusting this path.
+    /// of the frame this function intended, without any error.
+    ///
+    /// **That check has now been done, for the GLES/GStreamer target, and the
+    /// answer was no.** V4L2 hands a buffer back to its pool on release with
+    /// no fence for a GPU reader to wait on, and EGL's dmabuf import takes no
+    /// fence either -- so nothing orders the decoder's next write against this
+    /// draw. That path therefore waits for its own submission explicitly
+    /// before the frame is released; see `wait_for_submission`, which also
+    /// carries the measured cost. The Vulkan path keeps the implicit-fencing
+    /// assumption, because it is a different driver stack and has not been
+    /// re-measured -- not because it has been shown safe.
     fn blit_h264_frame(
         &mut self,
         ctx: &WgpuContext,
@@ -879,13 +887,26 @@ impl Renderer {
 
         let path = match imported {
             Ok(imported) => {
-                pipeline.draw(
+                let submission = pipeline.draw(
                     &ctx.device,
                     &ctx.queue,
                     &self.fb,
                     imported.luma(),
                     imported.chroma(),
                 );
+                // Wait for exactly this draw before returning, because the
+                // caller drops `frame` right after and that hands the decoder's
+                // buffer straight back to its pool. See this function's doc:
+                // the Vulkan path left this to the kernel's implicit dma-buf
+                // fencing and asked a future hardware target to check rather
+                // than inherit the assumption. This is that target, the
+                // assumption does not hold here, and the fence is explicit.
+                //
+                // `submission` and not "the most recent submission": the tile
+                // codecs share this queue, so an unqualified wait would block
+                // on their work too and make this cost depend on what else the
+                // frame happened to contain.
+                wait_for_submission(ctx, submission, frame_seq);
                 H264ImportPath::ZeroCopy
             }
             Err(reason) => {
@@ -908,7 +929,10 @@ impl Renderer {
                         &luma,
                         &chroma,
                     );
-                pipeline.draw(&ctx.device, &ctx.queue, &self.fb, &luma_tex, &chroma_tex);
+                // No wait: these textures are wgpu's own, uploaded from a
+                // `Vec` that has already been copied out of the decoder's
+                // buffer. Nothing reclaims them underneath the GPU.
+                let _ = pipeline.draw(&ctx.device, &ctx.queue, &self.fb, &luma_tex, &chroma_tex);
                 H264ImportPath::CpuCopy
             }
         };
@@ -921,6 +945,61 @@ impl Renderer {
         // doc for why that matters and what it does not guarantee.
         true
     }
+}
+
+/// Block until `submission` has executed on the GPU.
+///
+/// The price of a zero-copy import whose buffer is borrowed from a decoder
+/// pool. Without it, the sequence is: submit the draw, return, caller drops the
+/// frame, the pool hands that same buffer to the decoder, and the decoder
+/// writes the next picture into memory the GPU may still be sampling. The
+/// result is not an error -- it is a frame with a band of the *next* frame in
+/// it, which reads as tearing and has no diagnostic attached.
+///
+/// It would be nicer to hand the decoder a real fence and let the two overlap.
+/// Neither EGL's dmabuf import nor V4L2's buffer handover offers one here, and
+/// relying on the kernel to fence the dma-buf implicitly is what the Vulkan
+/// path does and explicitly flagged as unverified on new hardware.
+///
+/// **Measured on RK3399/Mali-T860 at 1920x1080**, paced 60Hz, 120 frames:
+/// p50 3.8ms, p90 5.7ms, p99 13.7ms, with a one-off 20.8ms on the third frame
+/// (pipeline warmup). About 11% of a 33ms frame budget at the median.
+///
+/// Most of that is the blit itself -- 2M pixels of NV12->RGBA on a 500MHz
+/// 4-core GPU -- not fence overhead, so the real cost of this call is the
+/// pipelining it gives up rather than the time it adds. Affordable at 30fps,
+/// tight at 60.
+///
+/// The identified optimisation, not taken here, is to defer the frame's release
+/// by one instead of waiting: a frame-time of slack is longer than any measured
+/// blit, so the buffer would be safe to recycle with no stall at all. It needs
+/// `Renderer` to hold the previous `HwFrame` (cheap -- the pool has ~11
+/// buffers), and it trades an explicit guarantee for a temporal one, which is
+/// worth doing deliberately with its own measurement rather than bolted on
+/// here.
+fn wait_for_submission(ctx: &WgpuContext, submission: wgpu::SubmissionIndex, frame_seq: u32) {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "measuring a real GPU wait, not a virtual-clock path"
+    )]
+    let start = std::time::Instant::now();
+    match ctx.device.poll(wgpu::PollType::Wait {
+        submission_index: Some(submission),
+        // No timeout: a draw that never completes means the GPU is wedged, and
+        // continuing would corrupt the next frame rather than recover. An
+        // indefinite wait at least stalls visibly instead of rendering
+        // plausible garbage.
+        timeout: None,
+    }) {
+        Ok(_) => {}
+        Err(e) => tracing::warn!(frame_seq, error = ?e, "h264 blit: waiting for the GPU failed"),
+    }
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "measuring a real GPU wait, not a virtual-clock path"
+    )]
+    let wait_us = start.elapsed().as_micros() as u64;
+    tracing::debug!(frame_seq, wait_us, "h264 blit: GPU fence wait");
 }
 
 fn log_decode_error(codec: Codec, tile_x: u8, tile_y: u8, code: DecodeErrorCode) {
