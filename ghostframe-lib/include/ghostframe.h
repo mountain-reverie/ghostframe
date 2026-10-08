@@ -347,6 +347,48 @@ int32_t gf_server_submit_frame(GfServerHandle handle,
                                uint32_t timestamp_us);
 
 /**
+ * Number of WebTransport clients currently connected.
+ *
+ * `0` means no consumer exists for a frame, so the caller's capture loop
+ * should skip the scrape entirely: without this gate a capture backend keeps
+ * copying full framebuffers at the frame rate regardless of demand. Returns
+ * `0` for a null handle, which is also the "do not capture" answer — a
+ * caller that lost its handle has nothing to feed anyway.
+ *
+ * Non-blocking. Prefer `gf_server_wait_for_client` while idle rather than
+ * polling this in a sleep loop: the sleep interval lands in full between a
+ * client connecting and the first frame being captured.
+ *
+ * # Safety
+ * `handle` must be a valid pointer from `gf_server_new`, or null.
+ */
+uintptr_t gf_server_connected_session_count(GfServerHandle handle);
+
+/**
+ * Block until at least one WebTransport client is connected.
+ *
+ * This is the idle gate for a C capture loop: it wakes on the connect event
+ * itself, so the first frame goes out without the latency a poll interval
+ * would add. Returns as soon as a client is already connected.
+ *
+ * `timeout_ms` of 0 waits indefinitely.
+ *
+ * Returns:
+ * - `> 0` — the number of connected clients; start capturing.
+ * - `0`   — `timeout_ms` elapsed with no client. Call again to keep waiting.
+ * - `-1`  — terminal: null handle, or the server event loop has exited and no
+ *   client can ever arrive. The caller should stop, not retry.
+ *
+ * Blocks the calling thread. The server's own event loop runs on its internal
+ * multi-threaded runtime and keeps making progress meanwhile, which is what
+ * lets the client this call is waiting for actually connect.
+ *
+ * # Safety
+ * `handle` must be a valid pointer from `gf_server_new`, or null.
+ */
+int32_t gf_server_wait_for_client(GfServerHandle handle, uint32_t timeout_ms);
+
+/**
  * Destroy a GhostframeServer and free its resources.
  *
  * # Safety

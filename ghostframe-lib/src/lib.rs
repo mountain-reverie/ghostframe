@@ -21,7 +21,7 @@ pub mod server;
 pub mod tile;
 pub mod transport;
 
-pub use server::{FrameSubmission, GhostframeServer};
+pub use server::{FrameSubmission, GhostframeServer, ServerShutDown};
 pub use transport::ghostbridge::{GhostbridgeConfig, GhostbridgeError, WebServerError};
 pub use transport::io_bridge::IoBridge;
 

@@ -2,7 +2,8 @@ name: Setup ghostframe system dependencies
 description: >
   Installs the apt packages required to build ghostframe on a runner
   (clang, ffmpeg dev libs, x264, X11/DRM dev headers, xkbcommon for the
-  native client's keyboard handling). When the
+  native client's keyboard handling, and Xvfb so the X11-dependent
+  xdaemon tests can run -- see the `unit` job in ci.yml). When the
   `e2e-runtime` input is `true`, also installs the runtime packages
   the e2e harness needs on the host itself (weston compositor,
   XWayland, mesa GL DRI driver for weston's GL renderer, mesa Vulkan
@@ -67,7 +68,8 @@ runs:
           libxdamage-dev \
           libdrm-dev \
           libxkbcommon-dev \
-          libxkbcommon-x11-dev
+          libxkbcommon-x11-dev \
+          xvfb
 
     - name: install e2e-harness runtime deps
       if: ${{ inputs.e2e-runtime == 'true' }}

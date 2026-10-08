@@ -105,6 +105,78 @@ pub unsafe extern "C" fn gf_server_submit_frame(
     }
 }
 
+/// Number of WebTransport clients currently connected.
+///
+/// `0` means no consumer exists for a frame, so the caller's capture loop
+/// should skip the scrape entirely: without this gate a capture backend keeps
+/// copying full framebuffers at the frame rate regardless of demand. Returns
+/// `0` for a null handle, which is also the "do not capture" answer — a
+/// caller that lost its handle has nothing to feed anyway.
+///
+/// Non-blocking. Prefer `gf_server_wait_for_client` while idle rather than
+/// polling this in a sleep loop: the sleep interval lands in full between a
+/// client connecting and the first frame being captured.
+///
+/// # Safety
+/// `handle` must be a valid pointer from `gf_server_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gf_server_connected_session_count(handle: GfServerHandle) -> usize {
+    if handle.is_null() {
+        return 0;
+    }
+    (*handle).server.connected_session_count()
+}
+
+/// Block until at least one WebTransport client is connected.
+///
+/// This is the idle gate for a C capture loop: it wakes on the connect event
+/// itself, so the first frame goes out without the latency a poll interval
+/// would add. Returns as soon as a client is already connected.
+///
+/// `timeout_ms` of 0 waits indefinitely.
+///
+/// Returns:
+/// - `> 0` — the number of connected clients; start capturing.
+/// - `0`   — `timeout_ms` elapsed with no client. Call again to keep waiting.
+/// - `-1`  — terminal: null handle, or the server event loop has exited and no
+///   client can ever arrive. The caller should stop, not retry.
+///
+/// Blocks the calling thread. The server's own event loop runs on its internal
+/// multi-threaded runtime and keeps making progress meanwhile, which is what
+/// lets the client this call is waiting for actually connect.
+///
+/// # Safety
+/// `handle` must be a valid pointer from `gf_server_new`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn gf_server_wait_for_client(handle: GfServerHandle, timeout_ms: u32) -> i32 {
+    if handle.is_null() {
+        return -1;
+    }
+    let ffi = &*handle;
+    let wait = ffi.server.wait_for_client();
+
+    let connected = if timeout_ms == 0 {
+        match ffi._rt.block_on(wait) {
+            Ok(n) => n,
+            Err(_) => return -1,
+        }
+    } else {
+        let dur = std::time::Duration::from_millis(u64::from(timeout_ms));
+        match ffi._rt.block_on(tokio::time::timeout(dur, wait)) {
+            // Timed out: no client yet, but the server is still alive.
+            Err(_) => return 0,
+            Ok(Ok(n)) => n,
+            Ok(Err(_)) => return -1,
+        }
+    };
+
+    // `wait_for_client` only returns Ok on a non-zero count, so this cannot
+    // collide with the timeout return. Saturate rather than wrap: a count
+    // past i32::MAX is impossible here (it is bounded by live QUIC
+    // connections), and clamping keeps the sign contract regardless.
+    i32::try_from(connected).unwrap_or(i32::MAX)
+}
+
 /// Destroy a GhostframeServer and free its resources.
 ///
 /// # Safety
@@ -113,5 +185,37 @@ pub unsafe extern "C" fn gf_server_submit_frame(
 pub unsafe extern "C" fn gf_server_destroy(handle: GfServerHandle) {
     if !handle.is_null() {
         let _ = Box::from_raw(handle);
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A C embedder with no handle must be told "no consumer", not crash.
+    #[test]
+    fn connected_session_count_of_null_is_zero() {
+        assert_eq!(
+            unsafe { gf_server_connected_session_count(std::ptr::null_mut()) },
+            0
+        );
+    }
+
+    /// The null check has to come *before* the wait, not after. A caller that
+    /// passes a null handle (or one whose `gf_server_new` returned null and
+    /// went unchecked) must get the terminal -1 immediately. Reorder the two
+    /// and this call blocks the thread forever on a channel that does not
+    /// exist -- a hang with no log line, which is the single worst failure
+    /// mode this FFI can have. `timeout_ms` is 0 here, the
+    /// wait-indefinitely value, precisely so the test hangs rather than
+    /// passing by luck if the order is ever broken.
+    #[test]
+    fn wait_for_client_rejects_null_without_blocking() {
+        assert_eq!(
+            unsafe { gf_server_wait_for_client(std::ptr::null_mut(), 0) },
+            -1
+        );
     }
 }
