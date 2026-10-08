@@ -220,6 +220,12 @@ impl Client {
                  NV12 dmabuf yet; advertising tile codecs only"
             );
         }
+        if effective_h264 {
+            tracing::info!(
+                "advertising H.264: hardware decode probed available and this GPU backend \
+                 can import a decoded NV12 dmabuf"
+            );
+        }
         Ok(Self {
             config,
             queue,
