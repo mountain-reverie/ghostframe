@@ -179,6 +179,11 @@ impl H264Nv12Pipeline {
     ///
     /// `LoadOp::Load`, never `Clear`: the framebuffer is shared with the
     /// tile codecs, and the draw covers every pixel anyway.
+    ///
+    /// Returns the submission index so a caller sampling *borrowed* textures
+    /// can wait for exactly this work before letting their owner reclaim them.
+    /// The CPU-copy path has no such need -- those textures are wgpu's -- which
+    /// is why this returns the index rather than waiting here.
     pub fn draw(
         &mut self,
         device: &wgpu::Device,
@@ -186,7 +191,7 @@ impl H264Nv12Pipeline {
         fb: &Framebuffer,
         luma: &wgpu::Texture,
         chroma: &wgpu::Texture,
-    ) {
+    ) -> wgpu::SubmissionIndex {
         // `h264_nv12_blit.wgsl`'s own header documents the failure mode a
         // size mismatch produces: `in.pos` ties the shader to the viewport
         // (here, `fb`'s size) and the decoded surface (`luma`'s size) being
@@ -201,7 +206,7 @@ impl H264Nv12Pipeline {
             "framebuffer/decoded-surface size mismatch would silently black-band the edge \
              (h264_nv12_blit.wgsl's own doc) instead of failing loudly"
         );
-        self.draw_to_texture(device, queue, fb.texture(), luma, chroma);
+        self.draw_to_texture(device, queue, fb.texture(), luma, chroma)
     }
 
     /// Draw the whole frame into an arbitrary colour target.
@@ -221,7 +226,7 @@ impl H264Nv12Pipeline {
         target: &wgpu::Texture,
         luma: &wgpu::Texture,
         chroma: &wgpu::Texture,
-    ) {
+    ) -> wgpu::SubmissionIndex {
         let luma_view = luma.create_view(&wgpu::TextureViewDescriptor::default());
         let chroma_view = chroma.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -264,6 +269,6 @@ impl H264Nv12Pipeline {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.draw(0..6, 0..1);
         }
-        queue.submit(Some(encoder.finish()));
+        queue.submit(Some(encoder.finish()))
     }
 }
