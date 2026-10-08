@@ -3150,7 +3150,7 @@ async fn e2e_headroom_guard_forces_h264() -> Result<()> {
     Ok(())
 }
 
-/// M3.6b: With GHOSTFRAME_INBOUND_LOSS_PROBABILITY=0.15 (well above
+/// M3.6b: With GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY=0.15 (well above
 /// the LOSS_OVERRIDE_THRESHOLD=0.10), the classifier's loss_override
 /// must force H264 mode. Exercises the full pipeline:
 /// loss injection → ReceiverFeedback.loss_rate → AdaptationContext →
@@ -3161,8 +3161,20 @@ async fn e2e_loss_override_forces_h264() -> Result<()> {
         "--drm-direct --mode-switch-cycle 2",
         &[
             ("GHOSTFRAME_ENABLE_CDF53", "1"),
-            ("GHOSTFRAME_INBOUND_LOSS_PROBABILITY", "0.15"),
-            ("GHOSTFRAME_INBOUND_LOSS_SEED", "42"),
+            // OUTBOUND, not inbound. `AdaptationContext::loss_rate` is
+            // `ReceiverFeedback::smoothed_loss_rate` -- the *client's*
+            // observation of gaps in what reached it -- so only server->client
+            // loss can raise it. Inbound loss drops the client's ACKs and
+            // feedback on their way to the server, which cannot make the
+            // client see loss; it just delivers fewer feedback samples. With
+            // the wrong direction the override never engaged and the test
+            // measured whatever H264 the mode-switch cycle produced on its
+            // own: frame_total came in at 113-122 against a threshold of 250,
+            // consistently, with no sign of why.
+            //
+            // 0.15 against LOSS_OVERRIDE_THRESHOLD = 0.10.
+            ("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "0.15"),
+            ("GHOSTFRAME_OUTBOUND_LOSS_SEED", "42"),
         ],
     )
     .await?;
@@ -3257,12 +3269,30 @@ async fn e2e_ack_loss() -> Result<()> {
 /// frames for the same palette emit thin+indices_raw (flags=0x02).
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_indices_raw_handshake() -> Result<()> {
+    // `--tile-pattern flat_ui --subtle-drift` is the only scene shape that
+    // can produce what this test asserts.
+    //
+    // It used to drive `--solid-per-tile`, whose module doc says it exists so
+    // "the classifier sees `unique_colors == 1` per tile and picks
+    // `CodecState::Solid`". PalRle needs 2..16 colours *within* one tile, and
+    // a tile that is colour A one frame and colour B the next is Solid in
+    // both -- so the "2-color flip cycles" the old comment here expected were
+    // never on the wire. The assertion read `got: []` because every recorded
+    // codec was Solid, not because the flag was missing.
+    //
+    // flat_ui's fixture tile uses a 16-colour palette, so every tile lands in
+    // PalRle. The 1-px X drift re-dirties each tile without changing which
+    // colours it contains, which is exactly the state indices-raw needs: the
+    // palette stays delivered from the first bundled emission, so each
+    // re-send carries indices only -- thin, and with the capability
+    // negotiated, indices-raw.
+    //
     // CAPTURE_FPS_DRM_DIRECT=2: see e2e_solid_per_tile_pixels for the
-    // rationale.  HELLO handshake + first PalRle emission only needs a
-    // handful of frames; 30 fps saturates CDP and the later evals time
-    // out.
+    // rationale. 30 fps saturates CDP and the later evals time out. The drift
+    // interval is shorter than the capture interval so every captured frame
+    // differs from the last.
     let setup = setup_e2e_webgpu_gpu_with_env(
-        "--solid-per-tile --drm-direct",
+        "--tile-pattern flat_ui --subtle-drift 100 --drm-direct",
         &[("CAPTURE_FPS_DRM_DIRECT", "2")],
     )
     .await?;
