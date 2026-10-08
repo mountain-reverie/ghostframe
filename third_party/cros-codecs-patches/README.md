@@ -49,7 +49,7 @@ rather than assumed. Every candidate, and why none of them is the answer:
 | `cros-codecs-extended 0.0.5-extended.2` | **none of the five** | Based on 0.0.5, older than what we use. Last push Aug 2026, 0 stars |
 | `cros-codecs-generic-vaapi` | n/a | VA-API surface work; nothing to do with V4L2 |
 | ffmpeg `v4l2request` hwaccel | all of them, by not needing the crate | **Dead end in practice.** Would reuse our existing ffmpeg decoder and drop this dependency entirely — but Arch Linux ARM's ffmpeg PKGBUILD does not pass `--enable-v4l2-request` even at 9.0.2, so no distro build has the hwaccel. Requires shipping a custom ffmpeg, i.e. moving the burden onto every user |
-| GStreamer `v4l2slh264dec` | all of them, by not needing the crate | **The real alternative, but it needs GStreamer ≥ 1.24.1** — see below. Distro-maintained, zero patches, and it hands over the plane layout so the chroma-offset trap disappears entirely. Cost is a heavy runtime dependency and a different integration model |
+| GStreamer `v4l2slh264dec` | all of them, by not needing the crate | **Verified working on GStreamer 1.26.5** — zero patches, dmabuf required rather than hoped for, bit-exact at 640x480 and 1920x1080, and it reports the DRM modifier instead of leaving it to be assumed. Needs ≥ 1.24.1; see below. Cost is a heavy runtime dependency and a different integration model |
 
 So switching forks would trade a dormant, Google-authored, *pinned* crate for an
 active one-person fork — while still carrying two or three patches, absorbing
@@ -63,7 +63,7 @@ option the design doc counted on — "an upstreamed patch reduces the carried de
 to zero" — and that is now off the table, which is recorded in the design's risk
 section rather than left as a stale hope.
 
-### The GStreamer exit has a version floor, measured 2026-09-27
+### The GStreamer exit is real, and has a version floor — measured 2026-09-27, re-measured 2026-10-08
 
 The design doc recorded GStreamer as "bit-exact vs software, 60 frames,
 dmabuf-backed". **That was measured at 640x480 only, and it does not generalise.**
@@ -85,13 +85,16 @@ Three levers were tried and none helps on 1.22:
 
 GStreamer **1.24.1** fixed this — *"v4l2codecs: decoders: Add DMA_DRM caps
 support"* — which is the mechanism for *requiring* dmabuf rather than hoping for
-it. So the exit is real, but it carries a runtime floor of 1.24.1 and cannot be
-taken on an older stack.
+it. Confirmed on **1.26.5** after upgrading the reference machine: dmabuf
+required, bit-exact at both 640x480 and 1920x1080, LINEAR modifier reported by
+the decoder. So the exit is real, and it carries a runtime floor of 1.24.1.
 
-For contrast, and this is the comparison that matters: the cros-codecs path in
-this repo already delivers zero-copy **linear NV12 at 1080p**, measured bit-exact
-against a software golden. Switching to GStreamer on a 1.22 stack would be a
-regression, not an upgrade.
+For contrast, and this was the comparison that mattered while the floor was
+unmet: the cros-codecs path in this repo already delivers zero-copy **linear NV12
+at 1080p**, measured bit-exact. On a 1.22 stack, switching would have been a
+regression rather than an upgrade. Above 1.24.1 that is no longer true, and
+`tools/hw-probe/gst-dmabuf-rs/README.md` records what it costs instead: three
+non-obvious negotiation requirements, none of which this crate needs.
 
 ## Applying them
 
