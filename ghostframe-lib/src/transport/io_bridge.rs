@@ -17,8 +17,6 @@ use std::io;
 use std::net::SocketAddr;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 
 use bytes::BytesMut;
 use quinn_proto::{ConnectionHandle, Event, StreamEvent};
@@ -26,6 +24,7 @@ use std::collections::{HashMap, HashSet};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream as TokioUnixStream;
 use tokio::sync::mpsc;
+use tokio::sync::watch;
 use tokio::time::{sleep_until, Instant as TokioInstant};
 
 use rayon::prelude::*;
@@ -873,12 +872,21 @@ pub struct IoBridge {
     /// frame re-emits the dimensions datagram; loss tolerance is 0.05^10 ≈ 1e-13.
     dimensions_retransmits_left: u8,
     /// Count of `wt_sessions` entries whose handshake is currently up,
-    /// shared with `GhostframeServer` so the capture loop in xdaemon can skip
+    /// published to `GhostframeServer` so the capture loop in xdaemon can skip
     /// capture work when no consumer exists. Refreshed inside
     /// `compute_max_datagram_size` and in the run loop after handling events.
-    /// `Relaxed` ordering is sufficient: a stale read costs at most one extra
-    /// frame captured (or one skipped) — no correctness implications.
-    connected_session_count: Arc<AtomicUsize>,
+    ///
+    /// A `watch` channel rather than an atomic so a capture loop can *park*
+    /// on the 0 → non-zero transition instead of polling it. Polling meant the
+    /// gate was only re-read once per poll interval, which put the whole
+    /// interval between a client connecting and the first frame being
+    /// scraped. `refresh_connected_session_count` notifies only on an actual
+    /// change, so the per-frame refresh does not wake parked waiters.
+    ///
+    /// Dropping this sender (i.e. the `IoBridge` event loop exiting) closes
+    /// the channel, which is how `GhostframeServer::wait_for_client` reports
+    /// that no client can ever arrive.
+    connected_session_count: watch::Sender<usize>,
     /// `true` while no `wt_sessions` entry is connected. Flips on transitions
     /// so we can emit a single info-level log on each enter/leave instead of
     /// once per dropped frame. Initial `true` (we start with zero sessions).
@@ -1485,7 +1493,7 @@ impl IoBridge {
             continuation_drained_bytes: 0,
             last_emitted_dimensions: None,
             dimensions_retransmits_left: 0,
-            connected_session_count: Arc::new(AtomicUsize::new(0)),
+            connected_session_count: watch::Sender::new(0),
             was_idle: true,
             input_injector: None,
             display_controller: None,
@@ -1595,12 +1603,13 @@ impl IoBridge {
         &self.server.cert_info().sha256_hex
     }
 
-    /// Hand out a shared handle to the connected-session counter so the capture
+    /// Hand out a receiver on the connected-session counter so the capture
     /// loop (running on a different task) can skip the GetImage/DRM scrape when
-    /// no consumer is attached. Updated by `compute_max_datagram_size` and the
-    /// run loop. See struct field doc for ordering semantics.
-    pub fn connected_session_count_handle(&self) -> Arc<AtomicUsize> {
-        self.connected_session_count.clone()
+    /// no consumer is attached, and park until one attaches. Updated by
+    /// `compute_max_datagram_size` and the run loop. See the struct field doc
+    /// for why this is a channel and not an atomic.
+    pub fn connected_session_count_handle(&self) -> watch::Receiver<usize> {
+        self.connected_session_count.subscribe()
     }
 
     /// Borrow the GhostbridgeHandle for callers that need to issue out-of-band
@@ -1672,7 +1681,7 @@ impl IoBridge {
         );
     }
 
-    /// Refresh the `connected_session_count` atomic the capture loop polls
+    /// Refresh the `connected_session_count` channel the capture loop reads
     /// to decide whether to scrape a frame. Counts only WT sessions whose H3
     /// handshake has completed (`wt.is_connected()`). Emits a single
     /// info-level log on each idle↔active transition.
@@ -1683,14 +1692,27 @@ impl IoBridge {
     /// frame is submitted — without this hook, no frame ever flows because
     /// the gate stays at 0 until a frame submission updates it, which can't
     /// happen until the gate opens. Classic bootstrap deadlock).
+    ///
+    /// `send_if_modified` rather than `send`: the per-frame call site would
+    /// otherwise mark the value changed ~30 times a second and wake every
+    /// parked `wait_for_client` waiter on each one. Notifying only on an
+    /// actual change makes a park cost one wakeup per connect, not one per
+    /// frame. It also means `send` can never fail here for want of
+    /// receivers — `send_if_modified` ignores the receiver count.
     fn refresh_connected_session_count(&mut self) {
         let connected = self
             .wt_sessions
             .values()
             .filter(|wt| wt.is_connected())
             .count();
-        self.connected_session_count
-            .store(connected, Ordering::Relaxed);
+        self.connected_session_count.send_if_modified(|current| {
+            if *current == connected {
+                false
+            } else {
+                *current = connected;
+                true
+            }
+        });
         let now_idle = connected == 0;
         if now_idle != self.was_idle {
             if now_idle {
@@ -6295,7 +6317,7 @@ impl IoBridge {
             continuation_drained_bytes: 0,
             last_emitted_dimensions: None,
             dimensions_retransmits_left: 0,
-            connected_session_count: Arc::new(AtomicUsize::new(0)),
+            connected_session_count: watch::Sender::new(0),
             was_idle: true,
             input_injector: None,
             display_controller: None,
@@ -7030,6 +7052,7 @@ fn parse_listen_port(listen_addr: &str) -> io::Result<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use tokio::net::UnixStream;
 
     // ── BWE Stage 2.2: PacingMode ────────────────────────────────────────
@@ -7174,6 +7197,83 @@ mod tests {
             started_at >= disconnected_at,
             "gap_secs is computed as connect - last_disconnect; a negative \
              interval would mean the ordering is wrong"
+        );
+    }
+
+    // ── connected_session_count: the capture-loop gate ───────────────────
+
+    /// The gate's publish side. Two properties the capture loop depends on:
+    ///
+    /// 1. Every transition is published, so a parked loop wakes on connect and
+    ///    stops on disconnect.
+    /// 2. An *unchanged* count publishes nothing. `refresh_connected_session_count`
+    ///    is called once per frame from `compute_max_datagram_size`, so a
+    ///    `send`-always implementation would wake every parked waiter ~30
+    ///    times a second for no reason.
+    #[tokio::test]
+    async fn refresh_publishes_transitions_but_not_unchanged_counts() {
+        let h = ConnectionHandle(1);
+        let mut bridge = test_bridge_with_sessions(&[h]).await;
+        let mut rx = bridge.connected_session_count_handle();
+
+        // Attached but not handshaked: not a consumer yet.
+        bridge.refresh_connected_session_count();
+        assert_eq!(
+            *rx.borrow_and_update(),
+            0,
+            "a session that has not completed its H3 handshake must not open the gate"
+        );
+
+        bridge
+            .wt_sessions
+            .get_mut(&h)
+            .expect("session attached above")
+            .test_set_connected(true);
+        bridge.refresh_connected_session_count();
+        assert!(
+            rx.has_changed().expect("sender alive"),
+            "0 -> 1 must be published, or a parked capture loop never wakes"
+        );
+        assert_eq!(*rx.borrow_and_update(), 1);
+
+        // Stand in for the per-frame refresh: nothing about the session
+        // changed, so nothing may be published.
+        for _ in 0..30 {
+            bridge.refresh_connected_session_count();
+        }
+        assert!(
+            !rx.has_changed().expect("sender alive"),
+            "an unchanged count must publish nothing; the per-frame refresh \
+             would otherwise wake every parked waiter once per frame"
+        );
+
+        bridge
+            .wt_sessions
+            .get_mut(&h)
+            .expect("session attached above")
+            .test_set_connected(false);
+        bridge.refresh_connected_session_count();
+        assert!(
+            rx.has_changed().expect("sender alive"),
+            "1 -> 0 must be published, or the capture loop keeps scraping for nobody"
+        );
+        assert_eq!(*rx.borrow_and_update(), 0);
+    }
+
+    /// Dropping the bridge closes the channel. That is the only signal a
+    /// parked capture loop has that the event loop is gone.
+    #[tokio::test]
+    async fn dropping_the_bridge_closes_the_session_count_channel() {
+        let bridge = test_bridge_with_sessions(&[]).await;
+        let rx = bridge.connected_session_count_handle();
+        assert!(
+            rx.has_changed().is_ok(),
+            "channel is open while the bridge lives"
+        );
+        drop(bridge);
+        assert!(
+            rx.has_changed().is_err(),
+            "a dropped bridge must close the channel so parked waiters are told"
         );
     }
 

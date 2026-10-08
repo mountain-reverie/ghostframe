@@ -116,8 +116,16 @@ jobs:
       - run: cargo test --workspace --lib
       # --lib skips binary crates entirely, so ghostframe-xdaemon's tests (the
       # display clamp, the capture resize logic) and codec_report's ran nowhere
-      # in CI. 38 tests, no hardware needed.
-      - run: cargo test --workspace --bins
+      # in CI. No hardware needed.
+      #
+      # Under xvfb-run because ghostframe-xdaemon's xdamage tests need a real
+      # X server: they arm and disarm a Damage object and assert that damage
+      # actually flows, which is the only way to catch an arm that silently
+      # stops reporting. A runtime self-skip was the alternative and is worse
+      # -- it would hide the failure from developers too. Xvfb comes from
+      # _setup-system-deps. The tests draw only into a scratch pixmap of their
+      # own, so they are also safe against a developer's live session.
+      - run: xvfb-run -a cargo test --workspace --bins
       # Integration-test targets are not covered by --lib and CI names them
       # explicitly; a new tests/*.rs file runs nowhere until it is listed here.
       - run: cargo test -p ghostframe-lib --test bwe_bench

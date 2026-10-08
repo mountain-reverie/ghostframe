@@ -302,9 +302,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     };
 
-    let xdamage_monitor = xdamage::XDamageMonitor::new();
+    // Not armed yet: damage reporting is switched on and off with the capture
+    // gate below, so the X server does no damage bookkeeping for us while no
+    // client is connected.
+    let mut xdamage_monitor = xdamage::XDamageMonitor::new();
     if xdamage_monitor.is_some() {
-        tracing::info!("XDamage monitoring active");
+        tracing::info!("XDamage available; armed only while a client is connected");
     } else {
         tracing::info!("XDamage not available, using full-frame dirty detection");
     }
@@ -312,15 +315,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::info!("Server ready, entering capture loop");
 
     let frame_interval = Duration::from_micros(1_000_000 / capture_fps);
-    // Sleep granularity while idle. 500 ms keeps the daemon responsive (≤ that
-    // much delay before the first frame after a client connects) without
-    // burning ~25% CPU on X11 GetImage scrapes nobody consumes.
-    let idle_poll_interval = Duration::from_millis(500);
     let mut frame_count = 0u64;
     // Tracks whether the loop is currently in idle (no-client) mode, so we
-    // emit a single info log on each idle↔active flip instead of every
-    // iteration. The IoBridge logs the corresponding event on its side; this
-    // log shows the capture loop's view (X11 GetImage suspended/resumed).
+    // emit a single info log on each idle↔active flip. The IoBridge logs the
+    // corresponding event on its side; this log shows the capture loop's view
+    // (X11 GetImage suspended/resumed).
     // None = nothing logged yet, so the FIRST pass through the loop announces
     // whichever state it finds. Seeded `true` this stayed silent on the most
     // common startup path -- no client yet -- so the daemon logged "entering
@@ -358,16 +357,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Skip the capture scrape entirely when nobody is connected. Without
         // this gate, X11 GetImage copies a full 1920x1080 framebuffer through
         // the X server every 33 ms regardless of demand.
+        //
+        // `wait_for_client` parks on the connect event itself. The earlier
+        // version slept a fixed 500 ms and only re-read the gate on waking,
+        // which put up to the whole interval between a client connecting and
+        // the first frame being scraped -- for no benefit, since the gate is
+        // already refreshed the moment a session's H3 handshake completes.
         if server.connected_session_count() == 0 {
             if was_idle != Some(true) {
-                tracing::info!("no client connected; capture loop entering idle poll");
+                // Tear the damage subscription down with the gate. Draining
+                // and discarding instead would leave the X server generating
+                // one RAW_RECTANGLES event per damaged rectangle for output
+                // nobody reads -- and would need a timer to do the
+                // draining, which is the idle poll this loop no longer has.
+                if let Some(monitor) = xdamage_monitor.as_mut() {
+                    monitor.disarm();
+                }
+                tracing::info!(
+                    "no client connected; capture loop parked until one arrives \
+                     (XDamage disarmed)"
+                );
                 was_idle = Some(true);
             }
-            tokio::time::sleep(idle_poll_interval).await;
+            if let Err(e) = server.wait_for_client().await {
+                // The IoBridge event loop is gone, so no client can ever
+                // arrive. Previously this loop could only notice a dead
+                // server via a failed `submit_frame` -- which it never
+                // reaches while the gate is shut -- so it polled a dead
+                // server at 2 Hz forever. Exits the same way the
+                // `submit_frame` path does (warn + Ok), so the process exit
+                // code is unchanged.
+                tracing::warn!(frames = frame_count, "{e}; capture loop exiting");
+                break;
+            }
+            // Re-check from the top: the client may already be gone again.
             continue;
         }
         if was_idle != Some(false) {
-            tracing::info!("client connected; capture loop resuming");
+            if let Some(monitor) = xdamage_monitor.as_mut() {
+                monitor.arm();
+            }
+            // `xdamage_armed` is the one place an operator can tell a working
+            // damage path from a silently dead one: an unarmed monitor
+            // reports no dirty tiles, every frame falls back to full-frame
+            // comparison, and the output stays correct while costing more.
+            tracing::info!(
+                xdamage_armed = xdamage_monitor.as_ref().is_some_and(|m| m.is_armed()),
+                "client connected; capture loop resuming"
+            );
             was_idle = Some(false);
         }
 
