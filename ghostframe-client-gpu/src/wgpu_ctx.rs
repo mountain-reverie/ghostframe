@@ -223,6 +223,16 @@ impl WgpuContext {
         .map_err(|_| GpuError::NoAdapter)?;
 
         let adapter_name = adapter.get_info().name;
+        {
+            let info = adapter.get_info();
+            tracing::info!(
+                adapter = %info.name,
+                driver = %info.driver,
+                driver_info = %info.driver_info,
+                backend = ?info.backend,
+                "GPU adapter selected"
+            );
+        }
 
         // Ask EGL directly what it can do. wgpu has no feature bit for
         // `EGL_MESA_image_dma_buf_export` -- it is a MESA extension wgpu never

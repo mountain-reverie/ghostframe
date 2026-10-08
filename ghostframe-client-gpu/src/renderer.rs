@@ -937,7 +937,15 @@ impl Renderer {
             }
         };
         if path == H264ImportPath::ZeroCopy && self.h264_import_path != Some(path) {
-            tracing::info!("H.264 import path: zero-copy dmabuf");
+            // The layout is logged with it because a wrong offset or pitch is
+            // the fault that still renders: right shape, wrong content.
+            match &mapped {
+                Ok(m) => tracing::info!(
+                    planes = ?m.planes(),
+                    "H.264 import path: zero-copy dmabuf"
+                ),
+                Err(_) => tracing::info!("H.264 import path: zero-copy dmabuf"),
+            }
         }
         self.h264_import_path = Some(path);
         // `mapped` drops here, at the end of this function -- after both
