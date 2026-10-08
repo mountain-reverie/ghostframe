@@ -4,10 +4,15 @@ version = "0.0.0"
 edition = "2021"
 
 [dependencies]
-gstreamer = "0.25"
-gstreamer-app = "0.25"
-gstreamer-video = "0.25"
-gstreamer-allocators = "0.25"
+# `v1_24` is what exposes `VideoInfoDmaDrm`, and it is not incidental: DMA_DRM
+# caps are the whole reason this probe can require dmabuf rather than hope for
+# it. Enabling the feature also makes the runtime floor explicit -- the binary
+# needs GStreamer >= 1.24 to load, which is the floor the V4L2 dmabuf path has
+# anyway (1.24.1 added "v4l2codecs: decoders: Add DMA_DRM caps support").
+gstreamer = { version = "0.25", features = ["v1_24"] }
+gstreamer-app = { version = "0.25", features = ["v1_24"] }
+gstreamer-video = { version = "0.25", features = ["v1_24"] }
+gstreamer-allocators = { version = "0.25", features = ["v1_24"] }
 libc = "0.2"
 
 [workspace]

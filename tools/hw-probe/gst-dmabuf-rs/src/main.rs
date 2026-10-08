@@ -33,6 +33,12 @@ struct Layout {
     /// Where the layout came from -- `GstVideoMeta` when the driver padded,
     /// otherwise computed from caps.
     source: &'static str,
+    /// DRM fourcc and modifier, when the caps were DMA_DRM. `import_gles.rs`
+    /// needs the modifier and the cros-codecs path could only assume it.
+    drm: Option<(u32, u64)>,
+    /// The coded height the meta reported, when it differed from display.
+    /// Recorded for visibility, never used as the display height.
+    coded_height: Option<u32>,
 }
 
 fn main() {
@@ -58,18 +64,50 @@ fn main() {
     let dec = gst::ElementFactory::make("v4l2slh264dec")
         .build()
         .expect("v4l2slh264dec -- is gst-plugins-bad's v4l2codecs installed?");
-    // No caps restriction: on GStreamer 1.22 `v4l2slh264dec` does not advertise
-    // `memory:DMABuf` at all, so naming it fails to LINK rather than negotiating.
-    // dmabuf export is implicit here, decided by allocation negotiation.
+    // **Require** dmabuf, through the DMA_DRM caps GStreamer >= 1.24.1 advertises.
     //
-    // `max_buffers` generously above the 11 the pool was observed to cycle, in
-    // case starving it is what makes the decoder fall back to copying.
-    // Pin plain NV12 (no DMABuf feature -- 1.22's decoder cannot advertise it).
-    // The decoder also offers tiled NV12_32L32 / NV12_4L4 / NV12_16L32S; if it
-    // negotiates one of those and then converts for downstream, the conversion is
-    // the system-memory copy we are trying to explain.
+    // On 1.22 this was impossible: `v4l2slh264dec` advertised only plain
+    // `video/x-raw`, dmabuf export was decided by allocation negotiation, and
+    // naming the feature failed to LINK rather than to negotiate. The result was
+    // a silent per-frame CPU copy at 1080p. On 1.26 the decoder's src template
+    // carries `video/x-raw(memory:DMABuf), format: DMA_DRM`, so asking for it is
+    // both possible and loud when it cannot be satisfied.
+    //
+    // `format=DMA_DRM` rather than `NV12`: with the dmabuf feature the pixel
+    // layout moves into a `drm-format` field (fourcc plus modifier), which is
+    // what `VideoInfoDmaDrm` reads back -- and which finally makes the modifier
+    // an answer rather than an assumption.
     let sink = gst_app::AppSink::builder()
-        .caps(&gst::Caps::builder("video/x-raw").field("format", "NV12").build())
+        .caps(
+            // The feature alone. Pinning `format=DMA_DRM` as well failed to
+            // negotiate (`not-negotiated (-4)`): the decoder fills in both
+            // `format` and `drm-format` itself, and over-specifying here only
+            // narrows the intersection. What it settles on is
+            // `format=DMA_DRM, drm-format=NV12`.
+            &gst::Caps::builder("video/x-raw")
+                .features(["memory:DMABuf"])
+                .build(),
+        )
+        // **Advertise GstVideoMeta support, or dmabuf negotiation is refused.**
+        //
+        // `v4l2codecs` rejects the whole thing otherwise, and says so exactly:
+        //   "DMABuf caps negotiated without the mandatory support of VideoMeta"
+        // It is mandatory for a good reason -- a dmabuf's plane offsets and
+        // strides live in that meta, so a sink that cannot read it has no way to
+        // interpret the buffer it just asked for. A default appsink does not
+        // advertise it, which is why requiring the dmabuf caps failed with a
+        // bare `not-negotiated (-4)` three elements upstream.
+        //
+        // `propose_allocation` on appsink needs GStreamer >= 1.24, the same
+        // floor DMA_DRM caps have.
+        .callbacks(
+            gst_app::AppSinkCallbacks::builder()
+                .propose_allocation(|_sink, query| {
+                    query.add_allocation_meta::<gst_video::VideoMeta>(None);
+                    true
+                })
+                .build(),
+        )
         .sync(false)
         .max_buffers(32)
         .build();
@@ -163,17 +201,40 @@ fn describe(sample: &gst::Sample) -> Option<Layout> {
     // format and size", which is exactly what `VideoInfo` computes. Treating a
     // missing meta as an error rejected every 1080p buffer on this hardware,
     // where the decoder happens to produce unpadded output.
-    let info = match gst_video::VideoInfo::from_caps(caps) {
-        Ok(info) => info,
-        Err(e) => {
-            eprintln!("cannot read VideoInfo from caps: {e}");
-            return None;
+    // With the dmabuf feature the caps are DMA_DRM, which plain `VideoInfo`
+    // cannot parse -- `VideoInfoDmaDrm` carries the fourcc and modifier and
+    // exposes the ordinary `VideoInfo` underneath for strides and offsets.
+    let (info, drm) = if caps
+        .features(0)
+        .is_some_and(|f| f.contains("memory:DMABuf"))
+    {
+        match gst_video::VideoInfoDmaDrm::from_caps(caps) {
+            Ok(drm) => match drm.to_video_info() {
+                Ok(info) => (info, Some((drm.fourcc(), drm.modifier()))),
+                Err(e) => {
+                    eprintln!("DMA_DRM caps carry no usable VideoInfo: {e}");
+                    return None;
+                }
+            },
+            Err(e) => {
+                eprintln!("cannot read VideoInfoDmaDrm from caps: {e}");
+                return None;
+            }
+        }
+    } else {
+        match gst_video::VideoInfo::from_caps(caps) {
+            Ok(info) => (info, None),
+            Err(e) => {
+                eprintln!("cannot read VideoInfo from caps: {e}");
+                return None;
+            }
         }
     };
     let mut offsets = [info.offset()[0], info.offset()[1]];
     let mut strides = [info.stride()[0] as usize, info.stride()[1] as usize];
-    let mut width = info.width();
-    let mut height = info.height();
+    let width = info.width();
+    let height = info.height();
+    let mut coded_height = None;
     let mut source = "caps/VideoInfo";
 
     // And when the meta IS there, it wins: it carries the driver's real padding.
@@ -182,10 +243,18 @@ fn describe(sample: &gst::Sample) -> Option<Layout> {
             eprintln!("VideoMeta reports {} planes, expected 2", meta.n_planes());
             return None;
         }
+        // Strides and offsets only. **Not width/height**: the meta carries the
+        // CODED size, and at 1080p that is 1088 -- taking it as the display size
+        // writes eight extra rows of luma and shifts everything after it. The
+        // display size stays the one from the caps.
+        //
+        // This is the same display-vs-coded distinction the cros-codecs path had
+        // to make, in a different place: there the coded height had to be read
+        // off the driver to FIND the chroma offset; here GStreamer has already
+        // applied it, and the hazard is using it for the wrong thing.
         offsets = [meta.offset()[0], meta.offset()[1]];
         strides = [meta.stride()[0] as usize, meta.stride()[1] as usize];
-        width = meta.width();
-        height = meta.height();
+        coded_height = Some(meta.height());
         source = "GstVideoMeta";
     }
 
@@ -207,10 +276,12 @@ fn describe(sample: &gst::Sample) -> Option<Layout> {
         fd: dmabuf.fd(),
         width,
         height,
+        coded_height,
         offsets,
         strides,
         size: mem.size(),
         source,
+        drm,
     })
 }
 

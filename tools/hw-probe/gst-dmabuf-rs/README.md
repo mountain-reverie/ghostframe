@@ -4,57 +4,81 @@ A standalone probe, not part of the workspace build. It exists because
 "GStreamer decodes H.264 in hardware on this box" was already known, and is the
 wrong question. The question is whether the decoded buffer arrives as a **dmabuf**
 with a layout precise enough to build a `DmabufPlanes` from — one fd, luma and
-chroma offsets, row pitches, total size — because that is what `import_gles.rs`
-needs and what `ghostframe-client-h264`'s cros-codecs path had to derive by hand.
+chroma offsets, row pitches, modifier, total size — because that is what
+`import_gles.rs` needs.
 
 It reads the decoded NV12 back **through the exported fd** and writes I420, so a
 byte comparison against `ffmpeg -pix_fmt yuv420p` validates the fd and the layout
-together, not just that something decoded.
+together, not merely that something decoded.
 
-## What it measured, 2026-09-27, GStreamer 1.22.10 / rkvdec
+## Measured on GStreamer 1.26.5 / rkvdec, 2026-10-08
+
+Both with the dmabuf caps **required**, so a silent fallback to a CPU copy is
+impossible rather than merely unobserved:
+
+| | display | coded | chroma offset | strides | dmabuf size | modifier | result |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 640x480 | 640x480 | 480 | 307200 | 1920/1920 → 640/640 | 614400 | 0 (LINEAR) | 60 frames bit-exact |
+| 1920x1080 | 1920x1080 | **1088** | 2088960 | 1920/1920 | 4177920 | 0 (LINEAR) | 30 frames bit-exact |
+
+11 pooled dmabuf fds in both cases, so an importer wants to import once per fd
+and look it up thereafter.
+
+`drm-format` comes back as `NV12:0x0000000000000000` — fourcc `NV12`, modifier
+**0, i.e. LINEAR**. That is reported by the decoder rather than assumed, which is
+the one thing the cros-codecs path could not do: there, linearity was inferred
+from luma bytes happening to match a software decode.
+
+## Three requirements, none of them obvious
+
+Each of these was a dead end first, and each failed in a way that pointed
+somewhere else entirely.
+
+**1. Require the feature, do not over-specify the format.** Ask for
+`video/x-raw(memory:DMABuf)` and let the decoder fill in `format=DMA_DRM` and
+`drm-format=NV12` itself. Pinning `format=DMA_DRM` as well narrows the
+intersection and fails with a bare `not-negotiated (-4)`.
+
+**2. The sink MUST advertise `GstVideoMeta` support in `propose_allocation`.**
+`v4l2codecs` refuses otherwise and says so precisely:
 
 ```
-640x480    layout: fd 10, offsets [0, 307200], strides [640, 640], size 614400
-           60 frames over 11 distinct dmabuf fds — bit-exact through the fd
-
-1920x1080  NOT dmabuf-backed: 3110400 bytes, allocator SystemMemory
+DMABuf caps negotiated without the mandatory support of VideoMeta
 ```
 
-Two conclusions, and the second is the reason this probe is committed rather than
-thrown away:
+It is mandatory for a sound reason — a dmabuf's plane offsets and strides live in
+that meta, so a sink that cannot read it has no way to interpret the buffer it
+asked for. A default `appsink` does not advertise it, and the resulting failure
+surfaces as `not-negotiated` reported by `h264parse`, three elements upstream of
+the actual problem.
 
-**The good part.** `offsets[1] = 307200` is GStreamer reporting the chroma offset
-itself, from `GstVideoMeta`. That is exactly the value the cros-codecs path had to
-compute as `bytesperline * coded_height` and got wrong twice — so on this route
-the whole chroma-offset trap belongs to GStreamer, not to us.
+**3. `GstVideoMeta` carries the CODED size. The display size comes from caps.**
+At 1080p the meta says `height: 1088`. Using that as the display height writes
+eight extra rows of luma and shifts everything after it — output that is the
+right shape and the wrong content. Take strides and offsets from the meta;
+take width and height from `VideoInfo`.
 
-**The blocking part.** At 1080p — the resolution sessions actually run at — 1.22
-silently hands over system memory instead, i.e. a full-frame CPU copy per frame,
-which is precisely the cost the dmabuf design exists to avoid. Three levers were
-tried and none of them helps:
+This is the same display-vs-coded distinction the cros-codecs path had to make,
+relocated: there the coded height had to be read off the driver in order to
+*find* the chroma offset, and here GStreamer has already applied it, so the
+hazard is using it for the wrong thing.
 
-- Requiring `video/x-raw(memory:DMABuf)`. `v4l2slh264dec` on 1.22 does not
-  advertise the feature, so naming it fails to **link** rather than to negotiate.
-  `dmabuf_probe.py`'s header already recorded this; it was rediscovered the slow
-  way, which is a decent argument for reading sibling probes first.
-- Enlarging the appsink pool past the 11 buffers the decoder cycles.
-- Pinning `format=NV12`, in case a tiled format (`NV12_4L4`, `NV12_32L32`,
-  `NV12_16L32S` are all offered) was being converted through the CPU.
+## Version floor: GStreamer >= 1.24.1
+
+Not a preference. On **1.22.10**, which this machine ran until 2026-10-08:
+
+- `v4l2slh264dec` advertised only plain `video/x-raw`; dmabuf export was decided
+  by allocation negotiation and could not be required. Naming the feature failed
+  to **link**, not to negotiate.
+- The result was resolution-dependent and silent: dmabuf at 640x480, and
+  `SystemMemory` (3110400 bytes) at 1920x1080 — a full-frame CPU copy per frame,
+  at exactly the resolution sessions run at.
+- Enlarging the pool and pinning `format=NV12` changed nothing.
 
 GStreamer **1.24.1** added *"v4l2codecs: decoders: Add DMA_DRM caps support"*,
-which is the mechanism for *requiring* dmabuf. So this route carries a hard
-runtime floor of 1.24.1 and cannot be taken on an older stack.
-
-## Two API lessons worth keeping
-
-**Absence of `GstVideoMeta` is not an error.** It means "standard packing for
-these caps", which is what `VideoInfo::from_caps` computes. Treating a missing
-meta as a failure rejected every 1080p buffer before the system-memory problem
-was even visible — the first, wrong diagnosis was "1080p has no metadata".
-
-**Read the bus.** Without draining it, a negotiation failure is completely
-silent: `try_pull_sample` returns `None`, the probe reports zero frames, and
-nothing says why. The link failure above was invisible until the bus was checked.
+which is what makes requirement 1 possible at all. The crate therefore builds
+with gstreamer-rs's `v1_24` features, which also makes the floor explicit at
+link time instead of discovering it at run time.
 
 ## Running it
 
@@ -70,12 +94,20 @@ ffmpeg -i clip.h264 -pix_fmt yuv420p -f rawvideo sw.i420
 cargo run --release -- clip.h264 hw.i420
 cmp hw.i420 sw.i420
 
-# And the case that matters, which is NOT the same answer:
+# And 1080p, which is a different answer on an older GStreamer and a different
+# code path even on a new one -- the coded height stops matching the display one:
 ffmpeg -f lavfi -i "testsrc2=size=1920x1080:rate=30:duration=1" \
        -c:v libx264 -preset veryfast -profile:v high -pix_fmt yuv420p \
        -bsf:v h264_mp4toannexb -f h264 clip1080.h264
+ffmpeg -i clip1080.h264 -pix_fmt yuv420p -f rawvideo sw1080.i420
 cargo run --release -- clip1080.h264 hw1080.i420
+cmp hw1080.i420 sw1080.i420
 ```
 
-A `NOT dmabuf-backed` line is the probe working correctly and telling you this
-stack cannot do zero-copy at that resolution. It is not a probe failure.
+A `NOT dmabuf-backed` line means the stack cannot do zero-copy at that
+resolution. It is the probe working, not failing.
+
+**Read the bus.** Without draining it, a negotiation failure is completely
+silent: `try_pull_sample` returns `None`, the probe reports zero frames, and
+nothing says why. Every failure above was invisible until the bus was checked,
+and the `VideoMeta` requirement was only ever stated there.
