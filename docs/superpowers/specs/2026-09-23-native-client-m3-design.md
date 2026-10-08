@@ -583,11 +583,50 @@ header spends a paragraph warning against — **never exceeds 1 LSB**. A 1-LSB
 tolerance is precisely blind to the only mutation subtle enough to need a gate.
 An exact tier flags it on 1.6 million samples.
 
+### 9.2a A third vendor, and why the answer is a budget — measured 2026-10-08
+
+Mali-T860/panfrost does not fit the two-element set. **0.1137%** of samples
+(14312 of 12582912) land one step above *both* candidates, with a shape too
+tight to be noise:
+
+- always **up**, never down; never by more than one step;
+- always with `frac(v * 255)` inside **[0.498049, 0.499999]** — a rounding
+  threshold slightly below the conformant one, and nowhere else.
+
+Tier A still passes with f32 bit-equality, so the shader arithmetic is exact;
+the whole deviation is in the hardware's `f32 -> unorm8` write.
+
+**No model reproduces it.** Scored over all 12.5M samples:
+
+| model | matches Mali |
+| --- | --- |
+| `round(v * 255)` (conformant) | 99.886% |
+| `round(f16_rtn(v) * 255)` | 98.789% |
+| `round(f16(v * 255))` | 97.639% |
+| `round(f16_rtz(v) * 255)` (§9.1's AMD model) | 97.493% |
+| `round(v * 256)` | **71.024%** |
+
+That last row is the cautionary one. `round(v * 256)` explains **14312 of
+14312** of the deviating samples — a flawless fit — and matches only 71% of
+everything else. A model fitted to the failures is indistinguishable from the
+truth until it is scored against the samples that were already passing.
+
+**So Tier B gets a bounded one-step slack rather than a third candidate**: at
+most 0.25% of samples may miss the accept set by exactly one step, all in the
+same direction, and nothing else is tolerated.
+
+That survives §9.2's own objection, which is the test it had to pass. The
+textbook-BT.601 mutation — the subtle one a blanket 1-LSB tolerance is blind to
+— was re-run against the bounded version and **fails it twice over**: 1.3098%
+of samples need slack (5x the budget) and they go in *both* directions
+(119280 up, 45536 down). Two unrelated guards, either sufficient.
+
 ### 9.3 Two consequences worth recording
 
 **This is in shipped output, not just tests.** `framebuffer.rs` is
-`Rgba8Unorm`, so every production H.264 blit carries this ≤1 LSB,
-always-downward bias. Invisible, not worth fixing — but recorded here as a
+`Rgba8Unorm`, so every production H.264 blit carries this ≤1 LSB bias —
+always *downward* on AMD (§9.1), always *upward* on Mali (§9.2a), on 0.11% of
+samples there. Invisible, not worth fixing — but recorded here as a
 characterised hardware property rather than resurfacing later as an unexplained
 discrepancy.
 
