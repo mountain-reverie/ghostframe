@@ -70,19 +70,20 @@ jobs:
       # client-gpu-only check above stays green while the binary cannot link.
       # Measured -- ghostframe-client-native had exactly that dependency.
       - run: cargo check -p ghostframe-cli --no-default-features --features gles,decode-vaapi
-      # There is deliberately NO x86 check of `ghostframe-client-h264`'s `v4l2`
-      # backend, and it is not an oversight to fix by adding one: cros-codecs
-      # 0.0.6 cannot compile off aarch64 with that feature on
-      # (image_processing.rs:15, `#[cfg(feature = "v4l2")] use
-      # std::arch::aarch64::*`). The crate carries a `compile_error!` saying so,
-      # so the attempt fails with a sentence rather than with
-      # `could not find aarch64 in arch` from a dependency.
+      # And the real ARM combination, which is now buildable here too.
+      - run: cargo check -p ghostframe-cli --no-default-features --features gles,decode-gstreamer
+      # The decode backend for the ARM client, compile-checked for real on this
+      # x86 runner. That is new: the previous cros-codecs backend could not be
+      # built off aarch64 at all (it gated a NEON path on a feature rather than
+      # on the architecture), so this check did not exist and the comment here
+      # explained why. GStreamer builds anywhere its headers are present, so the
+      # excuse is gone and the guard is back.
       #
-      # Cross-compiling would check it for real, but v4l2r runs bindgen in its
-      # build script and would need a target sysroot and libclang wired up here.
-      # Until someone wants that, the V4L2 backend's guard is `just check-v4l2`
-      # plus `just test-client-v4l2` on the RK3399 reference machine, where the
-      # 12 hardware tests run against a software golden.
+      # Still compile-only -- no runner has a stateless V4L2 decoder. The
+      # hardware gate is `just test-client-gstreamer` on the RK3399 reference
+      # machine, where the 11 oracles compare against a software golden.
+      - run: cargo clippy -p ghostframe-client-h264 --no-default-features --features gstreamer-backend --all-targets -- -D warnings
+      - run: cargo clippy -p ghostframe-client-h264 --no-default-features --features gstreamer-backend,test-support --all-targets -- -D warnings
       - name: ghostframe-lib reads env only in config.rs
         run: |
           # Comment lines are excluded deliberately: the guard constrains code,

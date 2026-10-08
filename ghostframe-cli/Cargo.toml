@@ -35,10 +35,9 @@ vulkan = ["ghostframe-client-native/vulkan"]
 gles = ["ghostframe-client-native/gles"]
 
 # The decode backend, a separate axis from the GPU backend -- see
-# `ghostframe-client-gpu`'s `[features]` for why they cannot be folded together
-# (`cros-codecs`' `v4l2` feature does not compile off aarch64).
+# `ghostframe-client-gpu`'s `[features]` for why they are not folded together.
 #
-# The reference ARM build therefore names both: `--no-default-features
-# --features gles,decode-v4l2`. `just build-client-gles` does that for you.
+# The reference ARM build names both: `--no-default-features --features
+# gles,decode-gstreamer`. `just build-client-gles` does that for you.
 decode-vaapi = ["ghostframe-client-native/decode-vaapi"]
-decode-v4l2 = ["ghostframe-client-native/decode-v4l2"]
+decode-gstreamer = ["ghostframe-client-native/decode-gstreamer"]

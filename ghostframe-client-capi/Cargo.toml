@@ -26,4 +26,4 @@ vulkan = ["ghostframe-client-native/vulkan"]
 gles = ["ghostframe-client-native/gles"]
 # Separate axis; see `ghostframe-client-gpu`'s `[features]`.
 decode-vaapi = ["ghostframe-client-native/decode-vaapi"]
-decode-v4l2 = ["ghostframe-client-native/decode-v4l2"]
+decode-gstreamer = ["ghostframe-client-native/decode-gstreamer"]

@@ -2,8 +2,9 @@ name: Setup ghostframe system dependencies
 description: >
   Installs the apt packages required to build ghostframe on a runner
   (clang, ffmpeg dev libs, x264, X11/DRM dev headers, xkbcommon for the
-  native client's keyboard handling, and Xvfb so the X11-dependent
-  xdaemon tests can run -- see the `unit` job in ci.yml). When the
+  native client's keyboard handling, GStreamer dev libs for the ARM
+  client's decode backend, and Xvfb so the X11-dependent xdaemon tests
+  can run -- see the `unit` job in ci.yml). When the
   `e2e-runtime` input is `true`, also installs the runtime packages
   the e2e harness needs on the host itself (weston compositor,
   XWayland, mesa GL DRI driver for weston's GL renderer, mesa Vulkan
@@ -44,6 +45,13 @@ runs:
     - name: install build deps
       shell: bash
       run: |
+        # libgstreamer*-dev are here so CI can COMPILE-CHECK the ARM client's
+        # decode backend, which no runner can run. That check was impossible
+        # with the previous cros-codecs backend -- it did not build off aarch64
+        # at all -- so this is the gate that replaced "verified by hand on the
+        # reference machine". Headers only; no GStreamer plugins are installed
+        # and nothing here executes a pipeline.
+        #
         # libxkbcommon-dev is a hard build-time gate, not a convenience:
         # smithay-client-toolkit's build.rs does an unconditional
         # `pkg_config::find("xkbcommon").unwrap()` under the `xkbcommon`
@@ -69,6 +77,8 @@ runs:
           libdrm-dev \
           libxkbcommon-dev \
           libxkbcommon-x11-dev \
+          libgstreamer1.0-dev \
+          libgstreamer-plugins-base1.0-dev \
           xvfb
 
     - name: install e2e-harness runtime deps

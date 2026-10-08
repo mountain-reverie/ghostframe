@@ -1,7 +1,7 @@
-//! Can this machine decode H.264 on a V4L2 stateless decoder?
+//! Can this machine decode H.264 through GStreamer?
 //!
-//! The `v4l2` backend's half of the capability probe; `probe.rs` is the VA-API
-//! one. Both expose the same three names -- [`h264_decode_available`],
+//! The `gstreamer` backend's half of the capability probe; `probe.rs` is the
+//! VA-API one. Both expose the same three names -- [`h264_decode_available`],
 //! [`default_device`], [`driver_reports_h264_decode`] -- so callers never cfg.
 //!
 //! Called on the connect path, before HELLO is built, because the capability
@@ -15,10 +15,13 @@
 //! It would be cheaper to stop at `VIDIOC_ENUM_FMT` reporting `S264`. That is
 //! not enough, for the same shape of reason the VA-API probe gives for not
 //! trusting `avcodec_get_hw_config`: enumerating a coded format proves the
-//! *driver* advertises it, not that a decode completes. On this hardware there
-//! is a second, sharper reason -- `cros-codecs 0.0.6` may open the wrong device
-//! entirely (see [`crate::decoder`]), and a probe that only asked the driver
-//! would answer `true` for a session that then produces nothing.
+//! *driver* advertises it, not that a decode completes.
+//!
+//! On this backend there is a second, sharper reason. Everything that can go
+//! wrong goes wrong in *negotiation*, not in the driver: a GStreamer missing the
+//! `v4l2codecs` plugin, older than 1.24.1, or unable to agree dmabuf caps all
+//! leave a pipeline that builds and then produces nothing. Only a real decode
+//! distinguishes those from a working one.
 //!
 //! Sessions begin in H.264 mode, so a false positive is a black window rather
 //! than a degraded one.
@@ -39,7 +42,17 @@ pub fn default_device() -> String {
         .unwrap_or_else(|| "/dev/video-no-h264-decoder".to_string())
 }
 
-/// True when this machine can decode H.264 on a stateless V4L2 decoder.
+/// Minimum GStreamer this backend needs, and why.
+///
+/// 1.24.1 is where `v4l2codecs` gained DMA_DRM caps, which is the only way to
+/// *require* a dmabuf rather than hope for one. Below it the decoder silently
+/// hands back system memory at some resolutions -- measured: dmabuf at 640x480
+/// and a full-frame CPU copy at 1080p on 1.22.10. The gstreamer crates' `v1_24`
+/// feature makes this a link-time requirement too; this constant is for saying
+/// so in a log line rather than in a linker error.
+pub const MIN_GSTREAMER: (u32, u32, u32) = (1, 24, 1);
+
+/// True when this machine can decode H.264 through GStreamer.
 ///
 /// Decodes the same embedded 64x64 keyframe the VA-API probe uses and checks a
 /// frame came out.
@@ -63,16 +76,25 @@ pub fn h264_decode_available() -> bool {
 const PROBE_CLIP: &[u8] = include_bytes!("probe_clip.h264");
 
 fn probe_inner() -> Result<(), H264Error> {
+    // Version first, so "GStreamer is too old" reads as that rather than as a
+    // negotiation failure five layers down.
+    let (major, minor, micro, _) = gstreamer::version();
+    if (major, minor, micro) < MIN_GSTREAMER {
+        return Err(H264Error::Gst(format!(
+            "GStreamer {major}.{minor}.{micro} is older than the {}.{}.{} this backend \
+             needs for DMA_DRM caps; without them a dmabuf cannot be required and the \
+             decoder may hand back system memory",
+            MIN_GSTREAMER.0, MIN_GSTREAMER.1, MIN_GSTREAMER.2
+        )));
+    }
     let mut decoder = crate::decoder::H264Decoder::new()?;
     let mut frames = decoder.decode(PROBE_CLIP)?;
     frames.extend(decoder.finish()?);
     let frame = frames.first().ok_or_else(|| {
-        H264Error::V4l2Unavailable("the decoder accepted the stream but produced no frame".into())
+        H264Error::Gst("the pipeline accepted the stream but produced no frame".into())
     })?;
     if frame.width() == 0 || frame.height() == 0 {
-        return Err(H264Error::V4l2Unavailable(
-            "decoded probe frame has zero extent".into(),
-        ));
+        return Err(H264Error::Gst("decoded probe frame has zero extent".into()));
     }
     Ok(())
 }
@@ -80,11 +102,11 @@ fn probe_inner() -> Result<(), H264Error> {
 /// Ground truth for whether this machine has a stateless H.264 decoder,
 /// established independently of everything above.
 ///
-/// `VIDIOC_ENUM_FMT` reporting `V4L2_PIX_FMT_H264_SLICE`, asked with raw
-/// ioctls in [`crate::v4l2_device`] -- **not** through `cros-codecs`. That
-/// independence is the whole value: an oracle that shares a code path with the
-/// thing it validates is not an oracle, and here the shared path would be
-/// precisely the device selection that has been wrong.
+/// `VIDIOC_ENUM_FMT` reporting `V4L2_PIX_FMT_H264_SLICE`, asked with raw ioctls
+/// in [`crate::v4l2_device`] -- **not** through GStreamer. That independence is
+/// the whole value: an oracle sharing a code path with the thing it validates is
+/// not an oracle. It is also why that module survived the move off cros-codecs
+/// when the rest of the V4L2 plumbing did not.
 ///
 /// Always `Some`: unlike `vainfo`, there is no external tool that might be
 /// missing, so "cannot establish ground truth" does not arise. `Option` is kept
@@ -116,12 +138,12 @@ mod tests {
 
     /// On a machine whose driver enumerates `S264`, the probe must say so.
     ///
-    /// No tolerated disagreement any more. This test used to accept one --
-    /// `cros-codecs` opening a different node than the one asked for, which its
-    /// unpatched `new_v4l2()` could not avoid -- and that escape hatch is how a
-    /// stale device override once hid a real failure for a whole test run.
-    /// Patch 0001 lets the caller name the device, so a driver that advertises
-    /// `S264` and a probe that says no is now unambiguously a bug.
+    /// No tolerated disagreement. An earlier version of this test accepted one
+    /// -- cros-codecs opening a different node than the one asked for -- and
+    /// that escape hatch is how a stale device override once hid a real failure
+    /// for a whole test run. GStreamer selects the device itself, so there is
+    /// nothing left to excuse: a driver that advertises `S264` and a probe that
+    /// says no is a bug.
     #[test]
     fn probe_agrees_with_the_driver() {
         let _device = v4l2_device::exclusive_device_access();

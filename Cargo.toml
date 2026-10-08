@@ -120,30 +120,26 @@ ffmpeg-next = { version = "=9.0.0" }
 # like every other entry in this table; must match ffmpeg-next's version.
 ffmpeg-sys-next = { version = "=9.0.0" }
 
-# cros-codecs 0.0.6 — H.264 bitstream parsing plus the V4L2 Request API
-# stateless decode backend, for the ARM client where there is no VA-API
-# driver at all (see docs/superpowers/specs/2026-09-25-native-client-gles-v4l2-design.md).
-# Only reached by `ghostframe-client-h264/v4l2`, which is off by default, so an
-# x86 build links none of it.
+# GStreamer 0.25 — H.264 decode for the ARM client, where there is no VA-API
+# driver at all. Only reached by `ghostframe-client-h264/gstreamer`, which is
+# off by default, so an x86 build links none of it.
 #
-# `default-features = false` because the default pulls the VA-API backend and
-# libva with it, which is the exact dependency this backend exists to avoid.
+# This replaced a `cros-codecs` dependency that needed five carried patches
+# against a crate whose upstream has been dormant since March 2025. GStreamer is
+# first-party maintained (freedesktop GitLab), distro-packaged, needs no patches,
+# and reports the decoded dmabuf's plane layout and DRM modifier instead of
+# leaving them to be derived — which is the arithmetic that produced plausible
+# wrong output twice on the old path.
 #
-# Pinned exactly, like every other entry here, and that matters more than
-# usual for a 0.0.x crate whose API churns: 0.0.6 is the version the hardware
-# work measured against, and the five patches we carry
-# (third_party/cros-codecs-patches/) are written against it line by line. It is
-# also still the newest published version -- upstream's last commit is from
-# March 2025.
-cros-codecs = { version = "=0.0.6", default-features = false, features = ["v4l2"] }
-
-# There is deliberately no `v4l2r` entry here, even though this backend calls
-# `VIDIOC_EXPBUF` through it. `cros-codecs` re-exports the exact `v4l2r` it was
-# built against (`pub use v4l2r`), and that is the only version safe to use:
-# `VideoFrame::process_dqbuf` takes `v4l2r` types by value, so a second copy of
-# the crate at a different version meets it as a *different type* and surfaces
-# as a bewildering trait-mismatch error rather than a version complaint. Reach
-# it as `cros_codecs::v4l2r::…` and the question cannot arise.
+# `v1_24` is not optional. GStreamer 1.24.1 added `v4l2codecs: decoders: Add
+# DMA_DRM caps support`, which is the only way to *require* a dmabuf rather than
+# hope for one; below it the decoder silently hands back system memory at some
+# resolutions. The feature makes that a link-time requirement rather than a
+# runtime surprise. See tools/hw-probe/gst-dmabuf-rs/README.md.
+gstreamer = { version = "0.25", features = ["v1_24"] }
+gstreamer-app = { version = "0.25", features = ["v1_24"] }
+gstreamer-video = { version = "0.25", features = ["v1_24"] }
+gstreamer-allocators = { version = "0.25", features = ["v1_24"] }
 
 # clap 4.6.7 — latest stable 4.x as of 2026-09-22; derive-based CLI parsing
 # for ghostframe-cli.

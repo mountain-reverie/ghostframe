@@ -36,7 +36,7 @@ decode-vaapi = [
     "ghostframe-client-gpu/decode-vaapi",
     "ghostframe-client-h264/vaapi",
 ]
-decode-v4l2 = [
-    "ghostframe-client-gpu/decode-v4l2",
-    "ghostframe-client-h264/v4l2",
+decode-gstreamer = [
+    "ghostframe-client-gpu/decode-gstreamer",
+    "ghostframe-client-h264/gstreamer-backend",
 ]

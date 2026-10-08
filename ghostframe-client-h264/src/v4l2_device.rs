@@ -15,10 +15,12 @@
 //! the hantro decoder swapped places, video3 and video1, over a single reboot.
 //! Enumerating `S264` is the only durable way to name the right one.
 //!
-//! This module used to be twice this size, predicting which node `cros-codecs`'
-//! own scan would settle on so the decoder could refuse a mismatch. Patch 0001
-//! of `third_party/cros-codecs-patches/` lets the caller name the device
-//! outright, which retired all of it.
+//! This module used to be twice this size, predicting which node a
+//! `cros-codecs` scan would settle on so the decoder could refuse a mismatch.
+//! GStreamer selects the device itself, so all of that is gone and this is the
+//! only part that survived the move — because an oracle sharing a code path with
+//! the thing it validates is not an oracle, and `VIDIOC_ENUM_FMT` shares nothing
+//! with a GStreamer pipeline.
 
 use std::ffi::c_ulong;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -60,9 +62,9 @@ struct V4l2Fmtdesc {
     reserved: [u32; 3],
 }
 
-/// How many `/dev/videoN` to look at. Matches `cros-codecs`' own
-/// `MAX_DEVICE_NO`, because [`cros_codecs_would_pick`] has to see the same
-/// nodes in the same order to predict the same answer.
+/// How many `/dev/videoN` to look at. Ten covers every board this has run on
+/// with room to spare; the numbering is not stable across boots, so the answer
+/// is found by enumeration rather than assumed.
 const MAX_DEVICE_NO: u32 = 10;
 
 fn open_video(path: &Path) -> Option<OwnedFd> {

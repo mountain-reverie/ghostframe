@@ -11,22 +11,35 @@ edition = "2021"
 # compare against, without wanting VA-API anywhere near it.
 ffmpeg-next = { workspace = true, optional = true }
 ffmpeg-sys-next = { workspace = true, optional = true }
-cros-codecs = { workspace = true, optional = true }
+gstreamer = { workspace = true, optional = true }
+gstreamer-app = { workspace = true, optional = true }
+gstreamer-video = { workspace = true, optional = true }
+gstreamer-allocators = { workspace = true, optional = true }
 libc = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [features]
-# Exactly one backend. `vaapi` is the default because it is what every x86
-# host has and what CI can actually run; `v4l2` is for a mainline-kernel ARM
-# SoC with a stateless decoder behind the V4L2 Request API and no VA-API
-# driver at all (RK3399/rkvdec is the reference). The two share this crate's
-# public API -- `H264Decoder`, `HwFrame`, `MappedFrame`, `DmabufPlanes` -- and
-# nothing else; see the GLES/V4L2 design §4.6 for why this is compile-time
-# rather than a runtime choice.
+# Exactly one backend. `vaapi` is the default because it is what every x86 host
+# has; `gstreamer-backend` is for a machine with no VA-API driver at all
+# (RK3399/rkvdec is the reference, reached via GStreamer's v4l2codecs). The two
+# share this crate's public API -- `H264Decoder`, `HwFrame`, `MappedFrame`,
+# `DmabufPlanes` -- and nothing else; see the GLES/V4L2 design §4.6 for why this
+# is compile-time rather than a runtime choice.
+#
+# Named `gstreamer-backend` rather than `gstreamer` because the latter is already
+# the name of the optional dependency, and a feature sharing a dependency's name
+# is implicitly that dependency -- which would make `--features gstreamer` link
+# the crate without selecting the backend, and trip the no-backend
+# `compile_error!` in a way that reads as a bug in the guard.
 default = ["vaapi"]
 vaapi = ["ffmpeg-next", "ffmpeg-sys-next"]
-v4l2 = ["cros-codecs"]
+gstreamer-backend = [
+    "gstreamer",
+    "gstreamer-app",
+    "gstreamer-video",
+    "gstreamer-allocators",
+]
 
 # Gates two things visible only to tests: `testclip` (a synthetic-clip
 # encoder with nine panicking paths) and the independent-of-this-crate's-own-probe
