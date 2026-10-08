@@ -129,13 +129,16 @@ On the reference machine:
 
 ## 6. Still open
 
-- **`nv12_oracle tier_b` still fails**, and it is now in this path's
-  neighbourhood rather than beside it: 14312 of 12582912 channel-samples differ
-  by exactly one (first at x=1944, y=0: want 75, have 76). It does not touch the
-  import — it uploads synthetic textures — so this work neither caused nor fixed
-  it. The accept set is `{round(v), round(f16_rtz(v))}`, measured on AMD, and
-  Mali lands on a third value in 0.11% of samples. Fixing it means measuring
-  what Mali's fp16 actually does, not widening the set until it passes.
+- ~~`nv12_oracle tier_b` still fails~~ **Diagnosed and closed** — see the design
+  doc's new §9.2a. It was a rounding-threshold difference in Mali's
+  `f32 -> unorm8` write: 0.1137% of samples one step high, always up, always
+  within 0.002 of a `.5` boundary, with Tier A still bit-exact so the shader
+  arithmetic was never in question. No model reproduced it; notably
+  `round(v * 256)` fitted every deviating sample perfectly and matched only 71%
+  of the rest, which is what fitting to the failures looks like from the inside.
+  Tier B now tolerates one step on a bounded share in one direction, verified
+  still to catch the textbook-BT.601 mutation that §9.2 rejected plain
+  tolerances over.
 - **No live session yet.** Every claim here is from tests. H.264 has never been
   seen on a screen end to end, and the BGRA fix from #102 has not been seen
   either.
