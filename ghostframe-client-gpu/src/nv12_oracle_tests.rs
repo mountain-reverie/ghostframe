@@ -18,6 +18,20 @@
 //! `f16_rtz_bits`, deliberately NOT in `nv12_reference.rs`, which models a
 //! conformant write, not this specific hardware quirk.
 //!
+//! **Mali-T860 needs a third thing, and it is a budget rather than a wider
+//! set.** 0.1137% of samples there land one step above both candidates --
+//! always up, never by more than one, always with `frac(v * 255)` inside
+//! [0.498, 0.5), i.e. a rounding threshold slightly below the conformant one.
+//! No model reproduces it: scored over all 12.5M samples, `round(v * 255)`
+//! matches 99.886%, fp16-round-to-nearest 98.789%, fp16-of-the-product
+//! 97.639%, the AMD model 97.493%, and `round(v * 256)` -- which fits *every
+//! one* of the deviating samples perfectly -- only 71.024%, which is what
+//! fitting a model to the failures alone looks like from the inside.
+//!
+//! So Tier B tolerates one step on a bounded share of samples, in one
+//! direction, and nothing else. See `SLACK_BUDGET` for why that still catches
+//! the mutation §9.2 rejected plain tolerances over.
+//!
 //! ## Why this lives in `src/`, not `tests/*.rs`
 //!
 //! Every other GPU test in this crate (`tests/gpu_export.rs`,
@@ -298,8 +312,39 @@ mod tests {
         let got = fb.debug_read(&ctx.device, &ctx.queue);
 
         let mut compared = 0usize;
-        let mut mismatches = 0usize;
+        /// The largest share of samples allowed to need the one-step slack
+        /// below, as a fraction of those compared.
+        ///
+        /// **This number is bounded from both sides by measurement, not
+        /// chosen.** Design doc §9.2 rejected a blanket 1-LSB tolerance for a
+        /// specific reason: the one mutation subtle enough to need a gate --
+        /// "correcting" the shader's matrix to the textbook full-range BT.601
+        /// inverse, which its header spends a paragraph warning against --
+        /// differs on thousands of samples and *never* exceeds 1 LSB. A
+        /// tolerance is blind to exactly the thing worth catching.
+        ///
+        /// A *budgeted* one-step slack is not, and that was verified rather
+        /// than assumed:
+        ///
+        /// | | share needing slack |
+        /// | --- | --- |
+        /// | Mali-T860, shipped matrix | **0.1137%** (14312 of 12582912) |
+        /// | Mali-T860, textbook-BT.601 matrix | **1.3098%**, and in both directions |
+        ///
+        /// 0.25% sits above the hardware's own rate with room for another
+        /// adapter of the same character, and 5x below the mutation's. The
+        /// direction assertion below catches that mutation independently, so
+        /// it has to defeat two unrelated guards.
+        ///
+        /// Raising this is a decision about what the oracle still catches. The
+        /// headroom to the mutation is the number to check before touching it.
+        const SLACK_BUDGET: f64 = 0.0025;
+        let mut hard_failures = 0usize;
+        let mut slack_used = 0usize;
+        let mut slack_up = 0usize;
+        let mut slack_down = 0usize;
         let mut first_bad = None;
+        let mut first_slack = None;
         for y in 0..H {
             for x in 0..W {
                 let (cb, cr) = chroma_at(&chroma, x, y);
@@ -316,15 +361,33 @@ mod tests {
                     // round the same way or one step closer to zero), never
                     // a magnitude tolerance -- and let Tier A alone carry
                     // arithmetic correctness there.
-                    let ok = if amd {
-                        have == exact
-                    } else {
-                        have == exact || have == round_conformant(want_f32[c])
-                    };
-                    if !ok {
-                        mismatches += 1;
-                        if first_bad.is_none() {
-                            first_bad = Some((x, y, c, exact, have));
+                    let conformant = round_conformant(want_f32[c]);
+                    let accepted = have == exact || have == conformant;
+                    if !accepted {
+                        // Outside the accept set. Bound what is tolerated
+                        // rather than widen the set -- see `SLACK_*` below.
+                        // Distance is to the NEAREST candidate, so the slack
+                        // cannot be spent reaching a value that is two steps
+                        // from everything the model allows.
+                        let delta = (i32::from(have) - i32::from(exact))
+                            .abs()
+                            .min((i32::from(have) - i32::from(conformant)).abs());
+                        let signed = i32::from(have) - i32::from(conformant);
+                        if amd || delta > 1 {
+                            hard_failures += 1;
+                            if first_bad.is_none() {
+                                first_bad = Some((x, y, c, exact, have));
+                            }
+                        } else {
+                            slack_used += 1;
+                            if signed > 0 {
+                                slack_up += 1;
+                            } else {
+                                slack_down += 1;
+                            }
+                            if first_slack.is_none() {
+                                first_slack = Some((x, y, c, conformant, have));
+                            }
                         }
                     }
                 }
@@ -341,25 +404,59 @@ mod tests {
             }
         }
 
+        let slack_share = slack_used as f64 / compared as f64;
         eprintln!(
-            "tier B ({}): {compared} channel-samples compared, {mismatches} differed",
+            "tier B ({}): {compared} channel-samples compared, {hard_failures} outside the \
+             model, {slack_used} ({:.4}%) needed the one-step slack (up {slack_up}, down \
+             {slack_down})",
             if amd {
                 "AMD, exact"
             } else {
-                "non-AMD, relaxed per §9.2"
-            }
+                "non-AMD, one-step slack bounded per §9.2"
+            },
+            slack_share * 100.0
         );
+
+        // 1. Nothing may miss the model by more than one step, ever, on any
+        //    adapter. This is the assertion that still catches a real
+        //    arithmetic or layout regression: those do not land one step from
+        //    a rounding boundary, they land anywhere.
         assert_eq!(
-            mismatches,
+            hard_failures,
             0,
-            "{mismatches} of {compared} channel-samples differ from the measured export model \
-             (Tier B, design doc §9.1-9.2; {} on this adapter). First mismatch (x, y, channel, \
-             want, have): {first_bad:?}.",
+            "{hard_failures} of {compared} channel-samples differ from the measured export \
+             model by MORE than one step, or on an adapter held to it exactly (Tier B, design \
+             doc §9.1-9.2; {} here). First (x, y, channel, want, have): {first_bad:?}.",
             if amd {
                 "round_half_away(f16_rtz(v) * 255), exact"
             } else {
-                "{round(v), round(f16_rtz(v))}, relaxed for non-AMD"
+                "{round(v), round(f16_rtz(v))} plus a bounded one-step slack"
             }
+        );
+
+        // 2. The slack is a budget, not a licence. A quantisation change that
+        //    affected materially more samples would blow this even while every
+        //    individual deviation stayed within one step.
+        assert!(
+            slack_share <= SLACK_BUDGET,
+            "{slack_used} of {compared} channel-samples ({:.4}%) needed the one-step slack, \
+             over the {:.4}% budget. Measured on Mali-T860 this is 0.1137%; a materially \
+             larger share is a change in the hardware's quantisation, not the same quirk. \
+             First slack use (x, y, channel, conformant, have): {first_slack:?}.",
+            slack_share * 100.0,
+            SLACK_BUDGET * 100.0
+        );
+
+        // 3. One direction only. On Mali every deviation rounds UP, in a band
+        //    just below the .5 boundary -- a coherent story about one rounding
+        //    threshold. Deviations in both directions would be a different
+        //    phenomenon wearing the same error bar, and this is what stops the
+        //    slack quietly absorbing it.
+        assert!(
+            slack_up == 0 || slack_down == 0,
+            "the one-step slack was used in BOTH directions ({slack_up} up, {slack_down} \
+             down), which is not the single-threshold rounding difference it exists for. \
+             Diagnose before widening anything."
         );
     }
 
