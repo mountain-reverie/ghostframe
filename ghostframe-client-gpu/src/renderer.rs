@@ -264,6 +264,9 @@ impl Renderer {
                         palette_id,
                         count,
                         indices,
+                        // Diagnostics-only; the decoder derives what it needs
+                        // from `count` and the indices themselves.
+                        wire_flags: _,
                     } => {
                         self.pending_palrle.push((
                             *tile_x,

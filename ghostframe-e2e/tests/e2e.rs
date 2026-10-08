@@ -3292,10 +3292,21 @@ async fn e2e_indices_raw_handshake() -> Result<()> {
         .evaluate("window.__ghostframeRecordedFlags || []")
         .await?
         .into_value()?;
+    // The recorded codecs come along for the ride because `flags: []` has two
+    // very different causes and the flags alone cannot tell them apart: no
+    // PalRle tile reached the client at all, or PalRle tiles arrived without
+    // the indices-raw bit. The codec list separates them on the first read.
+    let codecs: Vec<u8> = setup
+        .page()
+        .evaluate("window.__ghostframeRecordedCodecs || []")
+        .await?
+        .into_value()?;
     assert!(
         flags.iter().any(|&f| (f & 0x02) != 0),
-        "expected at least one PalRle tile with indices_raw flag (bit 1) set; got: {:?}",
-        flags
+        "expected at least one PalRle tile with indices_raw flag (bit 1) set; \
+         got flags: {:?} (recorded codecs: {:?})",
+        flags,
+        codecs
     );
 
     Ok(())
@@ -5120,30 +5131,45 @@ async fn e2e_lossless_golden_png() -> Result<()> {
     // divs and pins the canvas at (0, 0). That way Page.captureScreenshot
     // returns a PNG whose top-left pixel IS the canvas top-left pixel,
     // and the e2e doesn't have to scan for a sentinel boundary.
+
+    // The golden image and the server's DRM mode must describe the same
+    // screen, so both come from these two constants and the mode is pinned
+    // from them below. They used to disagree: the mode was pinned to
+    // 1920x1080 for production scale while the golden stayed 1024x768, so the
+    // comparison ran a 1024-wide golden against the top-left corner of a
+    // 1920-wide pattern. Roughly half the bytes mismatched, the first at the
+    // golden's Solid->PalRle boundary (x=320), where a 1920-wide pattern is
+    // still inside its Solid third. The test reports non-convergence instead
+    // of panicking, so it read as a flake for as long as it was broken.
+    //
+    // Production scale belongs in the scenes that reason about tile counts.
+    // This one asserts pixel-exact round-tripping through all three codecs,
+    // and 1024x768 covers 768 tiles of each; the tile count is not what it
+    // measures.
+    //
+    // Hard-coded rather than read back over CDP because under sustained
+    // datagram-paint load Chrome's renderer main thread stalls eval responses
+    // past chromiumoxide's hard-wired 30 s budget -- even a one-line property
+    // read times out. Page.captureScreenshot goes through the GPU process and
+    // is robust under the same load.
+    const WIDTH: u32 = 1024;
+    const HEIGHT: u32 = 768;
+
+    let drm_mode = format!("{WIDTH}x{HEIGHT}");
     let setup = setup_e2e_webgpu_gpu_with_env_url(
         "--lossless-golden --drm-direct",
         &[
             ("GHOSTFRAME_FORCE_TILECODEC", "1"),
-            // Production scale. VKMS prefers 1024x768 (32x24 = 768 tiles);
-            // a real session is 1920x1080 (60x34 = 2040), so these scenes
-            // were running at a third of the tile count they reason about.
-            ("GHOSTFRAME_DRM_MODE", "1920x1080"),
+            // Pinned from WIDTH/HEIGHT above so the mode and the golden
+            // cannot drift apart again. VKMS offers this as its preferred
+            // mode, so the pin matches what an unpinned run would choose.
+            ("GHOSTFRAME_DRM_MODE", &drm_mode),
             ("CAPTURE_FPS_DRM_DIRECT", "2"),
         ],
         "&e2e=lossless",
     )
     .await?;
 
-    // VKMS connector mode is fixed at 1024x768 in our test-server
-    // container (no DRM probe needed). We hard-code the expected
-    // dimensions instead of reading them via Runtime.evaluate because
-    // under sustained datagram-paint load Chrome's renderer main
-    // thread stalls CDP eval responses past chromiumoxide's hard-
-    // wired 30 s budget — even a one-line property read times out.
-    // Page.captureScreenshot, by contrast, goes through Chrome's GPU
-    // process and is robust under the same load.
-    const WIDTH: u32 = 1024;
-    const HEIGHT: u32 = 768;
     let expected: Vec<u8> = frame_rgba(WIDTH, HEIGHT);
     assert_eq!(expected.len(), (WIDTH * HEIGHT * 4) as usize);
 

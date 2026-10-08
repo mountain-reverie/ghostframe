@@ -304,6 +304,9 @@ fn palrle_in_payload_mode_applies_and_reports_the_palette() {
                         palette_id,
                         count,
                         indices,
+                        // Diagnostics-only; the decoder derives what it needs
+                        // from `count` and the indices themselves.
+                        wire_flags: _,
                     },
                 ..
             } => Some((*palette_id, *count, indices.clone())),

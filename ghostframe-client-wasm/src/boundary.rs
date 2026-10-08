@@ -94,6 +94,11 @@ pub enum WasmTileData {
         count: u8,
         #[serde(with = "serde_bytes")]
         indices: Vec<u8>,
+        /// The payload's flags byte as the server encoded it.
+        /// `e2e_indices_raw_handshake` reads this off
+        /// `window.__ghostframeRecordedFlags` and tests bit 1, so it must be
+        /// the wire byte and not a value the client reconstructed.
+        wire_flags: u8,
     },
     Cdf53 {
         pass_idx: u8,
@@ -118,10 +123,12 @@ impl From<&TileData> for WasmTileData {
                 palette_id,
                 count,
                 indices,
+                wire_flags,
             } => WasmTileData::PalRle {
                 palette_id: *palette_id,
                 count: *count,
                 indices: indices.clone(),
+                wire_flags: *wire_flags,
             },
             TileData::Cdf53 {
                 pass_idx,
@@ -497,6 +504,25 @@ mod tests {
             other => panic!("wrong variant: {other:?}"),
         }
     }
+}
+
+/// Protocol datagram counts, in the exact shape `window.__ghostframeStats`
+/// already had.
+///
+/// `camelCase` deliberately: the e2e tests read `tileDatagrams` /
+/// `frameDatagrams` off that global, so matching the existing property names
+/// lets `main.ts` assign straight across instead of renaming in flight.
+///
+/// `u32`, not `u64`: `serde_wasm_bindgen` renders a `u64` as a JS `BigInt`,
+/// and `BigInt` is not JSON-serializable -- the e2e readers round-trip these
+/// through `page.evaluate`, so a `u64` would throw inside the browser instead
+/// of returning a number. A session would need over four billion datagrams
+/// to reach the saturation point.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WasmDatagramCounts {
+    pub tile_datagrams: u32,
+    pub frame_datagrams: u32,
 }
 
 /// Serde mirror of `Cdf53CoverageSummary`, plus a preformatted `line` so the

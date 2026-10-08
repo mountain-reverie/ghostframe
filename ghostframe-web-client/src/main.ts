@@ -519,7 +519,14 @@ async function main() {
   type WasmTileData =
     | { codec: 'Raw'; bytes: Uint8Array }
     | { codec: 'Solid'; bytes: Uint8Array }
-    | { codec: 'PalRle'; palette_id: number; count: number; indices: Uint8Array }
+    | {
+        codec: 'PalRle';
+        palette_id: number;
+        count: number;
+        indices: Uint8Array;
+        /** Payload flags byte as encoded by the server: bit 0 bundled, bit 1 indices-raw. */
+        wire_flags: number;
+      }
     | { codec: 'Cdf53'; pass_idx: number; bit_planes: Uint8Array; present_passes?: number | null };
 
   type WasmEvent =
@@ -630,7 +637,13 @@ async function main() {
           payloadLen: sampleBytes.byteLength,
           fbWidth: renderer.framebuffer.width,
           fbHeight: renderer.framebuffer.height,
-          palRleFlag: d.codec === 'PalRle' ? d.palette_id : undefined,
+          // The wire flags byte, not the palette id. `e2e_indices_raw_handshake`
+          // tests bit 1 of this value (indices-raw); it was being handed
+          // `d.palette_id`, so the assertion passed or failed on whether a
+          // palette id happened to have bit 1 set. `wire_flags` is forwarded
+          // verbatim from the payload by the core, so the test now checks the
+          // byte the server actually encoded.
+          palRleFlag: d.codec === 'PalRle' ? d.wire_flags : undefined,
         });
 
         if (!firstTileRendered) {
@@ -1022,6 +1035,28 @@ async function main() {
     }
 
     for (const ev of core.handleDatagram(value, nowUs()) as WasmEvent[]) handleEvent(ev);
+
+    // Re-publish the datagram counters the e2e gates read off
+    // `window.__ghostframeStats`.
+    //
+    // `stats` was assigned from `diag.stats` at startup and then never
+    // written: the loop that used to increment it was the TypeScript decode
+    // path deleted at the wasm cutover (14aa7d4). Five e2e tests read these
+    // two numbers and saw 0 on sessions moving thousands of datagrams --
+    // `frame_total=0 (expected >= 250)` and `none observed` -- because the
+    // readers fall back to `{tileDatagrams:0, frameDatagrams:0}` when the
+    // global is missing or stale, which looks exactly like a measurement.
+    //
+    // Assigned from the core rather than incremented here on purpose: the
+    // core classifies tile vs frame in `handle_datagram`'s own dispatch, and
+    // a second copy of that discriminator in TypeScript is how the two drift.
+    const counts = core.datagramCounts() as {
+      tileDatagrams: number;
+      frameDatagrams: number;
+    };
+    stats.tileDatagrams = counts.tileDatagrams;
+    stats.frameDatagrams = counts.frameDatagrams;
+
     await drainTransmit();
   }
 }
