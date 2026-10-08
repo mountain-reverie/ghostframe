@@ -25,8 +25,12 @@ ground truth (Task 6's reasoning, now `v4l2_device.rs`), `DmabufPlanes` as the
 untouched seam, and the display-vs-coded-height hazard, which moved rather than
 went away.
 
-Tasks 1, 2, 7, 8 and 10 landed as written. Task 9 (`import_gles.rs`) is still
-open and is the next piece.
+Tasks 1, 2, 7, 8 and 10 landed as written. **Task 9 (`import_gles.rs`) landed
+too**, with two departures from what it specified, both recorded in
+[`../investigations/2026-10-08-gles-nv12-import.md`](../investigations/2026-10-08-gles-nv12-import.md):
+no `dup()` of the incoming fd (EGL does not take it), and no import-once-per-pool
+cache (it needs invalidation when the pool is rebuilt, which is the defect class
+that has already cost this project two sessions).
 
 ## Read this first
 

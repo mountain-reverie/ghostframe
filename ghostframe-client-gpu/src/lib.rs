@@ -48,6 +48,10 @@ pub mod dmabuf;
 #[cfg(feature = "vulkan")]
 #[path = "export.rs"]
 pub mod export;
+// Shared by the GLES export and import paths -- the same EGL/GL calls run in
+// both directions.
+#[cfg(feature = "gles")]
+mod egl_ffi;
 #[cfg(feature = "gles")]
 #[path = "export_gles.rs"]
 pub mod export;

@@ -72,6 +72,12 @@ use crate::dmabuf::{
     choose_modifier, dma_buf_sync, DMA_BUF_SYNC_END, DMA_BUF_SYNC_READ, DMA_BUF_SYNC_START,
     DRM_FORMAT_MOD_LINEAR,
 };
+use crate::egl_ffi::{
+    EglImageFns, EglImageKhr, GlTexFns, PfnEglDestroyImageKhr, PfnGlDeleteTextures,
+    EGL_DMA_BUF_PLANE0_FD_EXT, EGL_DMA_BUF_PLANE0_OFFSET_EXT, EGL_DMA_BUF_PLANE0_PITCH_EXT,
+    EGL_HEIGHT, EGL_LINUX_DMA_BUF_EXT, EGL_LINUX_DRM_FOURCC_EXT, EGL_NONE_I, EGL_WIDTH, GL_LINEAR,
+    GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_TEXTURE_MIN_FILTER,
+};
 use crate::wgpu_ctx::{EglCtx, WgpuContext};
 use crate::GpuError;
 use std::ffi::c_void;
@@ -100,59 +106,6 @@ const FORMAT_WGPU: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
 // export are extensions, so their entry points are loaded by name and called
 // through transmuted function pointers. The signatures below are from
 // `EGL_KHR_image_base` and `EGL_MESA_image_dma_buf_export`.
-
-type EglImageKhr = *mut c_void;
-
-type PfnEglCreateImageKhr = unsafe extern "system" fn(
-    dpy: *mut c_void,
-    ctx: *mut c_void,
-    target: u32,
-    buffer: *mut c_void,
-    attrib_list: *const i32,
-) -> EglImageKhr;
-
-type PfnEglDestroyImageKhr = unsafe extern "system" fn(dpy: *mut c_void, image: EglImageKhr) -> u32;
-
-/// The two `EGL_KHR_image_base` entry points, loaded once per export.
-///
-/// Loaded rather than cached on `WgpuContext` because export happens a fixed
-/// number of times at pool setup, not per frame — `get_proc_address` on the
-/// hot path would be worth avoiding, but there is no hot path here.
-struct EglExportFns {
-    create_image: PfnEglCreateImageKhr,
-    destroy_image: PfnEglDestroyImageKhr,
-}
-
-impl EglExportFns {
-    fn load(egl_ctx: &EglCtx<'_>) -> Result<Self, GpuError> {
-        // SAFETY of the transmutes: each name is transmuted to the signature
-        // the extension spec gives for that exact entry point. A driver that
-        // exports the name with a different signature would be non-conformant.
-        // `get_proc_address` returning None is handled as an error rather than
-        // unwrapped -- `WgpuContext::new` checked the extension string, but a
-        // driver that advertises an extension and then fails to resolve one of
-        // its functions is a real (if broken) configuration, and a clear error
-        // beats a null-pointer call.
-        fn get(egl_ctx: &EglCtx<'_>, name: &str) -> Result<extern "system" fn(), GpuError> {
-            egl_ctx.egl.get_proc_address(name).ok_or_else(|| {
-                GpuError::Egl(format!(
-                    "EGL_MESA_image_dma_buf_export is advertised but {name} \
-                     does not resolve"
-                ))
-            })
-        }
-        Ok(unsafe {
-            Self {
-                create_image: std::mem::transmute::<extern "system" fn(), PfnEglCreateImageKhr>(
-                    get(egl_ctx, "eglCreateImageKHR")?,
-                ),
-                destroy_image: std::mem::transmute::<extern "system" fn(), PfnEglDestroyImageKhr>(
-                    get(egl_ctx, "eglDestroyImageKHR")?,
-                ),
-            }
-        })
-    }
-}
 
 // --- libgbm, for allocating a LINEAR buffer we can render into -----------
 //
@@ -204,82 +157,6 @@ const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241;
 /// `RENDER_NODE`; a machine with several GPUs and a client on the wrong one is
 /// a problem neither has solved yet.
 const RENDER_NODE: &str = "/dev/dri/renderD128";
-
-// --- EGL dmabuf import (EGL_EXT_image_dma_buf_import) -------------------
-
-const EGL_LINUX_DMA_BUF_EXT: u32 = 0x3270;
-const EGL_LINUX_DRM_FOURCC_EXT: i32 = 0x3271;
-const EGL_DMA_BUF_PLANE0_FD_EXT: i32 = 0x3272;
-const EGL_DMA_BUF_PLANE0_OFFSET_EXT: i32 = 0x3273;
-const EGL_DMA_BUF_PLANE0_PITCH_EXT: i32 = 0x3274;
-const EGL_WIDTH: i32 = 0x3057;
-const EGL_HEIGHT: i32 = 0x3056;
-const EGL_NONE_I: i32 = 0x3038;
-
-// --- the three GL calls needed to bind an EGLImage to a texture ---------
-
-const GL_TEXTURE_2D: u32 = 0x0DE1;
-const GL_TEXTURE_MIN_FILTER: u32 = 0x2801;
-const GL_TEXTURE_MAG_FILTER: u32 = 0x2800;
-const GL_LINEAR: i32 = 0x2601;
-
-type PfnGlGenTextures = unsafe extern "system" fn(n: i32, textures: *mut u32);
-type PfnGlBindTexture = unsafe extern "system" fn(target: u32, texture: u32);
-type PfnGlDeleteTextures = unsafe extern "system" fn(n: i32, textures: *const u32);
-type PfnGlTexParameteri = unsafe extern "system" fn(target: u32, pname: u32, param: i32);
-type PfnGlEglImageTargetTexture2DOes = unsafe extern "system" fn(target: u32, image: EglImageKhr);
-
-/// The GL entry points needed to bind an `EGLImage` to a texture.
-///
-/// Loaded through `egl.get_proc_address`, not linked: `glEGLImageTargetTexture2DOES`
-/// is a GLES extension, and `AdapterContext::egl_instance`'s own doc says that
-/// loader handles "GL and EGL extension functions". Going through EGL for the
-/// core calls too keeps them all on one mechanism, and avoids a `glow`
-/// dependency for four functions.
-struct GlTexFns {
-    gen_textures: PfnGlGenTextures,
-    bind_texture: PfnGlBindTexture,
-    delete_textures: PfnGlDeleteTextures,
-    tex_parameteri: PfnGlTexParameteri,
-    image_target_texture_2d: PfnGlEglImageTargetTexture2DOes,
-}
-
-impl GlTexFns {
-    fn load(egl_ctx: &EglCtx<'_>) -> Result<Self, GpuError> {
-        fn get(egl_ctx: &EglCtx<'_>, name: &str) -> Result<extern "system" fn(), GpuError> {
-            egl_ctx.egl.get_proc_address(name).ok_or_else(|| {
-                GpuError::Egl(format!("{name} does not resolve; cannot bind an EGLImage"))
-            })
-        }
-        // SAFETY of the transmutes: each name is transmuted to the signature
-        // the GL/GLES spec gives for that exact entry point.
-        Ok(unsafe {
-            Self {
-                gen_textures: std::mem::transmute::<extern "system" fn(), PfnGlGenTextures>(get(
-                    egl_ctx,
-                    "glGenTextures",
-                )?),
-                bind_texture: std::mem::transmute::<extern "system" fn(), PfnGlBindTexture>(get(
-                    egl_ctx,
-                    "glBindTexture",
-                )?),
-                delete_textures: std::mem::transmute::<extern "system" fn(), PfnGlDeleteTextures>(
-                    get(egl_ctx, "glDeleteTextures")?,
-                ),
-                tex_parameteri: std::mem::transmute::<extern "system" fn(), PfnGlTexParameteri>(
-                    get(egl_ctx, "glTexParameteri")?,
-                ),
-                image_target_texture_2d: std::mem::transmute::<
-                    extern "system" fn(),
-                    PfnGlEglImageTargetTexture2DOes,
-                >(get(
-                    egl_ctx,
-                    "glEGLImageTargetTexture2DOES",
-                )?),
-            }
-        })
-    }
-}
 
 /// A LINEAR dmabuf, allocated through GBM, wrapped as a wgpu texture.
 ///
@@ -399,7 +276,7 @@ impl ExportedImage {
         height: u32,
         preferred: &[u64],
     ) -> Result<Self, GpuError> {
-        let egl_fns = EglExportFns::load(egl_ctx)?;
+        let egl_fns = EglImageFns::load(egl_ctx)?;
         let gl = GlTexFns::load(egl_ctx)?;
         let dpy = egl_ctx.display.as_ptr();
 

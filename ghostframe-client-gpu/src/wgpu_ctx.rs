@@ -1,5 +1,7 @@
 use crate::GpuError;
-#[cfg(feature = "vulkan")]
+// Both backends cache call-invariant lookups here: `ash` function tables and
+// memory properties on Vulkan, EGL/GL entry points on GLES.
+#[cfg(any(feature = "vulkan", feature = "gles"))]
 use std::sync::OnceLock;
 
 /// The EGL instance type `wgpu_hal::gles::AdapterContext::egl_instance` hands
@@ -85,13 +87,30 @@ pub struct WgpuContext {
     /// `vkGetPhysicalDeviceMemoryProperties` copies a ~520-byte struct.
     /// Built once, on first use, and reused for every import after that.
     ///
-    /// The GLES path has no equivalent: it imports each pool frame once at
-    /// setup rather than per decoded frame, so there is nothing hot enough to
-    /// be worth caching.
     #[cfg(feature = "vulkan")]
     ext_memory_fd: OnceLock<ash::khr::external_memory_fd::Device>,
     #[cfg(feature = "vulkan")]
     mem_properties: OnceLock<ash::vk::PhysicalDeviceMemoryProperties>,
+    /// The same thing for GLES, and for the same reason.
+    ///
+    /// `import_gles` resolves five EGL/GL entry points per imported plane, so
+    /// ten per decoded frame if they are loaded per call. `get_proc_address` is
+    /// not free, and per-call costs on this hardware have already been measured
+    /// hurting this client once -- 178us per `write_texture` turned into an
+    /// 11.7x speedup when batched. Loading these once is the cheap version of
+    /// that lesson.
+    ///
+    /// An earlier draft of this comment said the GLES path imports each pool
+    /// frame once at setup and so needed no cache. That was the plan in the
+    /// design's §6.4; the implementation imports per decoded frame like the
+    /// Vulkan path does, because caching textures by fd needs invalidation when
+    /// the decoder's pool is rebuilt and fds are recycled -- the defect class
+    /// that has already cost this project two debugging sessions. Caching the
+    /// function pointers is the part that is safe to do without that.
+    #[cfg(feature = "gles")]
+    egl_image_fns: OnceLock<crate::egl_ffi::EglImageFns>,
+    #[cfg(feature = "gles")]
+    gl_tex_fns: OnceLock<crate::egl_ffi::GlTexFns>,
     /// The thread `new` ran on. GL contexts are current per-thread, so every
     /// entry point that touches the device must run here. See
     /// [`WgpuContext::assert_render_thread`].
@@ -174,6 +193,10 @@ impl WgpuContext {
             ext_memory_fd: OnceLock::new(),
             #[cfg(feature = "vulkan")]
             mem_properties: OnceLock::new(),
+            #[cfg(feature = "gles")]
+            egl_image_fns: OnceLock::new(),
+            #[cfg(feature = "gles")]
+            gl_tex_fns: OnceLock::new(),
         })
     }
 
@@ -288,8 +311,51 @@ impl WgpuContext {
             device,
             queue,
             explicit_modifiers,
+            egl_image_fns: OnceLock::new(),
+            gl_tex_fns: OnceLock::new(),
             created_on: std::thread::current().id(),
         })
+    }
+
+    /// The `EGL_KHR_image_base` entry points, loaded once per context.
+    ///
+    /// Takes an `&EglCtx` rather than loading from `self` because
+    /// `get_proc_address` needs the EGL instance, which only exists inside
+    /// [`Self::with_raw_egl`]'s borrow.
+    #[cfg(feature = "gles")]
+    pub(crate) fn egl_image_fns(
+        &self,
+        egl_ctx: &EglCtx<'_>,
+    ) -> Result<&crate::egl_ffi::EglImageFns, GpuError> {
+        if let Some(fns) = self.egl_image_fns.get() {
+            return Ok(fns);
+        }
+        let fns = crate::egl_ffi::EglImageFns::load(egl_ctx)?;
+        // `set` losing a race is fine: both values are the same function
+        // pointers, and the loser is dropped.
+        let _ = self.egl_image_fns.set(fns);
+        Ok(self
+            .egl_image_fns
+            .get()
+            .expect("just set, or set by a racing caller"))
+    }
+
+    /// The GL entry points for binding an `EGLImage` to a texture, loaded once
+    /// per context. See [`Self::egl_image_fns`].
+    #[cfg(feature = "gles")]
+    pub(crate) fn gl_tex_fns(
+        &self,
+        egl_ctx: &EglCtx<'_>,
+    ) -> Result<&crate::egl_ffi::GlTexFns, GpuError> {
+        if let Some(fns) = self.gl_tex_fns.get() {
+            return Ok(fns);
+        }
+        let fns = crate::egl_ffi::GlTexFns::load(egl_ctx)?;
+        let _ = self.gl_tex_fns.set(fns);
+        Ok(self
+            .gl_tex_fns
+            .get()
+            .expect("just set, or set by a racing caller"))
     }
 
     /// Panic in debug builds if called off the thread that created the context.

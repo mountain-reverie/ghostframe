@@ -4,12 +4,14 @@
 //! directly -- `ash::vk`, `WgpuContext::with_raw_device`, `GpuError::Vulkan`
 //! -- to check import behaviour the shared API cannot express.
 //!
-//! The GLES backend has no counterpart yet because it has no NV12 import yet:
-//! `import_gles.rs` fails loudly and says why (its only caller is the H.264
-//! path, which needs the V4L2 decoder from tasks 3-6 of the GLES/V4L2 plan).
-//! When that lands, the equivalents belong here behind `cfg(feature = "gles")`
-//! rather than in a separate file, so the two backends' import contracts stay
-//! side by side.
+//! The GLES counterpart now exists and lives in `gpu_import_gles.rs`, not
+//! here. This file's own earlier note asked for it "behind `cfg(feature =
+//! "gles")` rather than in a separate file, so the two backends' import
+//! contracts stay side by side" -- which turned out not to work: every helper
+//! in this file is Vulkan-specific (`query_layout` calls
+//! `vkGetImageMemoryRequirements`, `write_patterns` maps through Vulkan), so
+//! the GLES version shares the *shape* of the oracle and none of its
+//! machinery. Two files that read alike beat one file that is half `cfg`.
 #![cfg(feature = "vulkan")]
 
 //! Import a dmabuf we created ourselves, and read the imported textures'
