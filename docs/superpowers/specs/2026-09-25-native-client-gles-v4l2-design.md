@@ -499,6 +499,7 @@ numbers can be re-derived rather than trusted.
 | dma-heap | absent (`/dev/dma_heap` missing); CmaTotal 262144 kB | `ls`, `/proc/meminfo` |
 | GStreamer HW decode | bit-exact vs software, 60 frames, dmabuf-backed — **at 640x480 only; see the row below** | `gst-launch`, `dmabuf_probe.py` |
 | GStreamer at 1080p | **NOT dmabuf on 1.22.10**: `SystemMemory`, 3110400 bytes, i.e. a full-frame CPU copy per frame. Needs GStreamer ≥ 1.24.1 (`v4l2codecs: decoders: Add DMA_DRM caps support`) to require dmabuf at all | `gst-dmabuf-rs` |
+| GStreamer on 1.26.5 | dmabuf **required** and bit-exact at 640x480 and 1920x1080; `drm-format=NV12:0x0` i.e. LINEAR, reported not assumed; 11 pooled fds; `GstVideoMeta` gives coded height 1088 at 1080p while display stays 1080 | `gst-dmabuf-rs` |
 | FFmpeg | 6.1.1, no `v4l2request` hwaccel, `h264_v4l2m2m` only | `ffmpeg -hwaccels` |
 | FFmpeg, packaged | **no distro build enables `--enable-v4l2-request`** — checked against Arch Linux ARM's PKGBUILD at 9.0.2, so this is not a version problem that upgrading fixes | ALARM `PKGBUILD` |
 | cros-codecs | `0.0.6`, `v4l2` feature builds, ~12 deps, 3m48s | `cargo build` |
@@ -520,10 +521,18 @@ by inspection; the §12 step-1 spike settles it.
 debug assertion is cheap insurance and should go in with the first GLES code,
 not after the first mystery.
 
-**Mesa 24.0.2 is old.** Manjaro ARM ships it and there is no newer package.
-Anything requiring a later Mesa is out of reach on the reference machine
-regardless of merit — this is what rules out lavapipe's dmabuf support, and it
-could rule out other things.
+**Mesa 24.0.2 is old.** ~~Manjaro ARM ships it and there is no newer package.~~
+**Superseded 2026-10-08:** the reference machine moved to Manjaro unstable and
+now runs Mesa 25.1.7, GStreamer 1.26.5 and FFmpeg 7.1.1. Re-checked what that
+changes, since the whole GLES decision rested on these numbers:
+
+- **Still no Vulkan.** `vulkaninfo` on Mesa 25.1.7 reports
+  `Failed to detect any valid GPUs` — PanVK still does not cover Midgard, so
+  the GLES backend remains the only option and §4 stands unchanged.
+- **Still no `v4l2request` in FFmpeg**, confirmed against the installed 7.1.1
+  binary and not only the PKGBUILD, so that route stays closed.
+- **GStreamer crossed the 1.24.1 floor**, which is what makes §6.2 viable; see
+  the measured-baseline table.
 
 **cros-codecs is 0.0.x, and upstream is dormant.** Pinning defers the churn
 rather than solving it. The mitigation this document originally claimed —
