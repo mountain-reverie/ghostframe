@@ -2008,6 +2008,28 @@ async fn e2e_production_scale_with_loss_converges() -> Result<()> {
 ///
 /// Both corrections are why this asserts server-side context, not just
 /// client coverage: a frozen coverage map is ambiguous on its own.
+///
+/// # A third, at production scale
+///
+/// Raised to 1920x1080 the scene stopped measuring a saturated link at all.
+/// It reported `tiles=35` and failed its own premise check, which read as
+/// "scene too small" and was in fact the server not reading the network:
+/// re-encoding 2040 tiles takes ~550 ms against a 200 ms capture interval,
+/// so a frame was always waiting, and the event loop's biased `select!`
+/// took frames ahead of the socket. 34 frames and 8 inbound packets in
+/// 18 s; no acknowledgement read; ~35 packets delivered. Fixed in
+/// `IoBridge::run` and pinned by `inbound_is_read_before_a_waiting_frame`.
+///
+/// With that fixed it fails where it is meant to:
+///
+///   tiles=786 complete=0 partial=786 gave_up=550 pass-hist{1:786}
+///
+/// and it will keep failing, because the screen changes faster than the
+/// link can carry one change. What is left to learn from it is in
+/// `docs/specs/retransmit-storm-root-cause.md`: the scheduler's budget is
+/// granted per frame rather than per unit of time, and the pass-major drain
+/// restarts at the same tile after every supersede, so the ~1250 tiles
+/// outside that count never receive a pass.
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_saturated_link_starves_tiles_into_giving_up() -> Result<()> {
     use ghostframe_e2e::harness::net_shape::NetShape;

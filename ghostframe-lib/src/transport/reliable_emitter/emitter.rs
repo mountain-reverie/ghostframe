@@ -11,6 +11,7 @@ use crate::transport::reliable_emitter::wire_seq::WireSeqAllocator;
 use crate::transport::reliable_emitter::{EmitKey, FEC_GROUP_SIZE_K, PARITY_INTERLEAVE_OFFSET};
 use bytes::Bytes;
 use smallvec::smallvec;
+use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 pub struct ReliableTileEmitter {
@@ -39,6 +40,16 @@ pub struct ReliableTileEmitter {
     /// allocated; the caller cannot otherwise know which value a datagram
     /// carried.
     transmissions: Vec<EmittedDatagram>,
+    /// Fragments the client has asked for again, waiting for retransmit
+    /// budget. Served oldest first by `tick_budgeted`, ahead of the RTO.
+    ///
+    /// A queue rather than an immediate send because a NACK arrives when the
+    /// client decides to send it, which has nothing to do with whether the
+    /// link has room. See `on_nack`.
+    pending_nacks: VecDeque<(EmitKey, u8)>,
+    /// Membership of `pending_nacks`, so a request repeated while the first
+    /// is still waiting does not become a second retransmission.
+    pending_nack_set: HashSet<(EmitKey, u8)>,
     pub stats: EmitterStats,
 }
 
@@ -93,6 +104,15 @@ pub struct EmitterStats {
     /// here; a bounded peak means it did not.
     pub emission_queue_peak: usize,
     pub retransmit_attempts_total: u64,
+    /// NACKs for a fragment that already had a request waiting for budget.
+    /// The client repeats itself every tail sweep; these cost nothing.
+    pub nack_deduped: u64,
+    /// Times `tick_budgeted` stopped on its byte budget with retransmission
+    /// work still due. Occasional is healthy -- it is the budget doing its
+    /// job. Growing on every tick means retransmission demand is exceeding
+    /// its share of the link, which is the precondition for the storm this
+    /// budget exists to prevent.
+    pub retransmit_budget_deferrals: u64,
 }
 
 impl ReliableTileEmitter {
@@ -111,6 +131,8 @@ impl ReliableTileEmitter {
             ack_deadline: None,
             time_base: now,
             transmissions: Vec::new(),
+            pending_nacks: VecDeque::new(),
+            pending_nack_set: HashSet::new(),
             stats: EmitterStats::default(),
         }
     }
@@ -272,8 +294,95 @@ impl ReliableTileEmitter {
     /// in `IoBridge::run` which calls this again whenever quinn frees
     /// up datagram-buffer space.
     pub fn tick(&mut self, now: Instant, max_retransmits: usize) {
+        self.tick_budgeted(now, max_retransmits, usize::MAX);
+    }
+
+    /// `tick`, bounded in bytes as well as in count. Returns the wire bytes
+    /// queued for retransmission, so the caller can bill them.
+    ///
+    /// Retransmission used to be bounded only by `max_retransmits` per call,
+    /// and this is called on every frame *and* on every
+    /// `Event::DatagramsUnblocked` -- so the bound was per event, not per
+    /// unit of time, and said nothing about what the link could carry.
+    /// Measured on a 2040-tile screen behind 8 Mbit, in the nine seconds
+    /// after a full-screen change: 29,889 retransmissions (14,081 RTO,
+    /// 15,808 NACK), ~1.7 MB/s offered to a link moving 1 MB/s, while the
+    /// scheduler -- which *is* budgeted -- was offering 0.6 MB/s of passes
+    /// the client did not have yet. The excess sat in quinn's 16 MB datagram
+    /// buffer until it was full, at which point `clamp_to_quinn_capacity`
+    /// gave the scheduler nothing and emission stopped for good, with every
+    /// acknowledgement arriving 16 seconds stale behind its own retransmits.
+    ///
+    /// Requests from the client go first: a NACK is the receiver saying a
+    /// datagram did not arrive, where the RTO is a timer guessing, and under
+    /// queueing delay the timer guesses wrong for everything in flight.
+    ///
+    /// The byte bound is soft, like `Scheduler::drain_priority_queue`'s: the
+    /// retransmission that crosses it is still sent and the loop stops
+    /// before the next. A hard bound would strand a pass larger than the
+    /// remaining budget behind it forever.
+    pub fn tick_budgeted(
+        &mut self,
+        now: Instant,
+        max_retransmits: usize,
+        max_bytes: usize,
+    ) -> usize {
         let mut count = 0;
-        while count < max_retransmits {
+        let mut spent = 0usize;
+        let emit_us_now = self.emit_us(now);
+        while count < max_retransmits && spent < max_bytes {
+            let Some((key, frag_idx)) = self.pending_nacks.pop_front() else {
+                break;
+            };
+            self.pending_nack_set.remove(&(key, frag_idx));
+            // Acknowledged or superseded while it waited: nothing to resend.
+            let Some(entry) = self.cache.get_mut(&key) else {
+                continue;
+            };
+            let Some(frag) = entry.fragments.get(frag_idx as usize) else {
+                continue;
+            };
+            let mut bytes = frag.to_vec();
+            // A NACK is the client stating outright that this fragment did
+            // not arrive — ground truth, unlike RTO, which fires on delay as
+            // readily as on loss and never fires at all for a tile that gets
+            // superseded first. On a churning screen supersession is the
+            // common case, so NACKs carry most of the loss signal the
+            // estimator ever sees.
+            //
+            // Re-stamped for the same reason as the RTO path: the consumer
+            // wants the on-wire moment of *this* transmission, and the stamp
+            // being overwritten identifies the one that was lost.
+            // Fresh `wire_seq` for the same reason as the RTO path below.
+            let mut ws = 0u32;
+            if bytes.len() >= 12 {
+                ws = self.alloc.allocate();
+                bytes[8..12].copy_from_slice(&ws.to_be_bytes());
+            }
+            if bytes.len() >= 16 && (bytes[0] & 0x80) != 0 {
+                bytes[12..16].copy_from_slice(&emit_us_now.to_be_bytes());
+            }
+            entry.attempts = entry.attempts.saturating_add(1);
+            entry.last_sent_at = now;
+            entry.probe = None;
+            self.transmissions.push(EmittedDatagram {
+                wire_seq: ws,
+                emit_us: emit_us_now,
+                wire_bytes: bytes.len(),
+                key,
+            });
+            // A NACK retransmit allocates its own `wire_seq` above; it must
+            // join the FEC group exactly as a first transmission does (see
+            // `feed_group`'s doc comment).
+            if bytes.len() >= 12 {
+                self.feed_group(ws, &bytes);
+            }
+            spent += bytes.len();
+            self.queue.push_source(bytes);
+            self.stats.retransmit_attempts_total += 1;
+            count += 1;
+        }
+        while count < max_retransmits && spent < max_bytes {
             let Some(key) = self.rto.pop_due(now) else {
                 break;
             };
@@ -385,6 +494,7 @@ impl ReliableTileEmitter {
                 if bytes.len() >= 12 {
                     self.feed_group(ws, &bytes);
                 }
+                spent += bytes.len();
                 self.queue.push_source(bytes);
             }
             self.rto.schedule(key, now + new_rto);
@@ -392,6 +502,10 @@ impl ReliableTileEmitter {
             self.stats.retransmit_attempts_total += 1;
             count += 1;
         }
+        if spent >= max_bytes && (!self.pending_nacks.is_empty() || self.rto.has_due(now)) {
+            self.stats.retransmit_budget_deferrals += 1;
+        }
+        spent
     }
 
     /// Number of cache entries currently held — i.e. unACKed tile-passes
@@ -424,24 +538,23 @@ impl ReliableTileEmitter {
     /// Ingest a batch of NACKs from the client. For each (key, frag_idx):
     /// - Cache miss → bump `nack_miss` and continue.
     /// - Out-of-range frag_idx → silently skip.
-    /// - Otherwise re-emit just that one fragment via the queue, bump
-    ///   `attempts`, advance `last_sent_at`, bump `nack_hit` and
-    ///   `retransmit_attempts_total`.
+    /// - Already waiting for budget → bump `nack_deduped` and continue.
+    /// - Otherwise queue that one fragment for `tick_budgeted` and bump
+    ///   `nack_hit`.
     ///
-    /// The RTO heap entry for this key stays in place; `tick` will see
-    /// the bumped `attempts` and re-fire with the capped backoff. No
-    /// active heap removal is required.
+    /// Nothing is sent from here. This used to push the fragment straight
+    /// onto the emission queue, which made the client's request rate the
+    /// server's send rate: the tail sweep re-asks for every missing pass of
+    /// every stalled tile each 500 ms, and nothing between that and the wire
+    /// knew what the link could carry. See `tick_budgeted`.
     ///
-    /// `now` is a single timestamp for the whole batch (not resampled per
-    /// entry) — a batch of NACKs arrived together, so one clock read is
-    /// both cheaper and more correct than drifting `last_sent_at` across
-    /// entries by however long the loop body takes. Callers should pass
-    /// the same clock source used for `submit_one` / `tick` (`now_std()`
-    /// in production) so `last_sent_at` stays comparable against those
-    /// other stamps under a paused tokio clock.
-    pub fn on_nack(&mut self, entries: &[(EmitKey, u8)], now: Instant) {
-        // Computed before the cache borrow below, which holds `&mut self`.
-        let emit_us_now = self.emit_us(now);
+    /// The RTO heap entry for this key stays in place; `tick_budgeted` bumps
+    /// `attempts` when the fragment actually goes out, and the RTO re-fires
+    /// with the capped backoff from there. No heap removal is required.
+    ///
+    /// `_now` is unused now that the send is deferred, and kept so callers
+    /// continue to pass the clock they use for `submit_one` / `tick`.
+    pub fn on_nack(&mut self, entries: &[(EmitKey, u8)], _now: Instant) {
         for &(nacked_key, frag_idx) in entries {
             // Exact first: a NACK for a fragment of a pass the client partly
             // received *can* name the transmission, because it has the
@@ -471,7 +584,7 @@ impl ReliableTileEmitter {
                     None => nacked_key,
                 }
             };
-            let Some(entry) = self.cache.get_mut(&key) else {
+            let Some(entry) = self.cache.get(&key) else {
                 self.stats.nack_miss += 1;
                 if crate::transport::reliable_emitter::rto_probe_enabled() {
                     eprintln!("RTOPROBE nack_miss");
@@ -481,51 +594,15 @@ impl ReliableTileEmitter {
             if crate::transport::reliable_emitter::rto_probe_enabled() {
                 eprintln!("RTOPROBE nack_hit");
             }
-            let Some(frag) = entry.fragments.get(frag_idx as usize) else {
+            if entry.fragments.get(frag_idx as usize).is_none() {
                 continue;
-            };
-            let mut bytes = frag.to_vec();
-            // A NACK is the client stating outright that this fragment did
-            // not arrive — ground truth, unlike RTO, which fires on delay as
-            // readily as on loss and never fires at all for a tile that gets
-            // superseded first. On a churning screen supersession is the
-            // common case, so NACKs carry most of the loss signal the
-            // estimator ever sees.
-            //
-            // Re-stamped for the same reason as the RTO path: the consumer
-            // wants the on-wire moment of *this* transmission, and the stamp
-            // being overwritten identifies the one that was lost.
-            // Fresh `wire_seq` for the same reason as the RTO path above.
-            let mut ws = 0u32;
-            if bytes.len() >= 12 {
-                ws = self.alloc.allocate();
-                bytes[8..12].copy_from_slice(&ws.to_be_bytes());
             }
-            if bytes.len() >= 16 && (bytes[0] & 0x80) != 0 {
-                bytes[12..16].copy_from_slice(&emit_us_now.to_be_bytes());
+            if !self.pending_nack_set.insert((key, frag_idx)) {
+                self.stats.nack_deduped += 1;
+                continue;
             }
-            let emitted = EmittedDatagram {
-                wire_seq: ws,
-                emit_us: emit_us_now,
-                wire_bytes: bytes.len(),
-                key,
-            };
-            entry.attempts += 1;
-            entry.last_sent_at = now;
-            entry.probe = None;
-            // Release the entry borrow before touching self.queue / self.stats
-            // / self.group (feed_group takes &mut self).
-            let _ = entry;
-            self.transmissions.push(emitted);
-            // A NACK retransmit allocates its own `wire_seq` above; it must
-            // join the FEC group exactly as a first transmission does (see
-            // `feed_group`'s doc comment).
-            if bytes.len() >= 12 {
-                self.feed_group(ws, &bytes);
-            }
-            self.queue.push_source(bytes);
+            self.pending_nacks.push_back((key, frag_idx));
             self.stats.nack_hit += 1;
-            self.stats.retransmit_attempts_total += 1;
         }
     }
 
@@ -924,6 +1001,7 @@ mod tests {
         // NACK retransmit.
         let t2 = t1 + Duration::from_millis(10);
         e.on_nack(&[(key, 0)], t2);
+        e.tick(t2, usize::MAX);
         e.drain(&mut sender, t2);
         assert_eq!(sender.sent.len(), 3);
         let third = wire_seq_of(&sender.sent[2]);
@@ -1024,6 +1102,7 @@ mod tests {
         assert_eq!(sender.sent.len(), 1);
         // NACK for frag_idx=0 (the only one)
         e.on_nack(&[(key, 0u8)], t0);
+        e.tick(t0, usize::MAX);
         e.drain(&mut sender, t0);
         assert_eq!(sender.sent.len(), 2);
         assert_eq!(e.stats.nack_hit, 1);
@@ -1195,6 +1274,7 @@ mod tests {
             "and resolved through the content index, not by luck"
         );
 
+        e.tick(t0, usize::MAX);
         e.drain(&mut sender, t0);
         assert!(
             sender.sent.len() > sent_before,
@@ -1291,26 +1371,147 @@ mod tests {
         assert_eq!(sender.sent.len(), 4, "3 initial + 1 retransmit for k3 only");
     }
 
+    /// A NACK is a request, not a send.
+    ///
+    /// `on_nack` used to push the fragment straight onto the emission queue,
+    /// and a test here pinned that as "every NACK produces a re-emission".
+    /// That is the retransmit storm stated as a requirement: the client's
+    /// tail sweep repeats its request for every missing pass of every tile
+    /// each 500 ms, so on a 2040-tile screen NACK-driven resends alone
+    /// outran an 8 Mbit link -- 15,808 of them in the nine seconds after a
+    /// full-screen change, on top of 14,081 from the RTO, filling quinn's
+    /// 16 MB datagram buffer and leaving the scheduler no room to emit the
+    /// passes the client was actually asking for.
     #[test]
-    fn on_nack_re_emits_without_budget_cap() {
-        // Retirement and NACK budget cap were removed: every NACK produces a
-        // re-emission as long as the cache entry is live.
-        let mut e = ReliableTileEmitter::new(Instant::now());
-        let mut sender = CollectSender::default();
+    fn a_nack_waits_for_the_retransmit_budget() {
         let t0 = Instant::now();
+        let mut e = ReliableTileEmitter::new(t0);
+        let mut sender = CollectSender::default();
         let key = EmitKey::new(1, 0, 0, 0);
         e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
         e.drain(&mut sender, t0);
-        let nacks = 10usize;
-        for _ in 0..nacks {
+        assert_eq!(sender.sent.len(), 1);
+
+        e.on_nack(&[(key, 0u8)], t0);
+        e.drain(&mut sender, t0);
+        assert_eq!(
+            sender.sent.len(),
+            1,
+            "a NACK must not reach the wire on its own; nothing has granted \
+             it any budget yet"
+        );
+
+        assert_eq!(e.tick_budgeted(t0, usize::MAX, 0), 0);
+        e.drain(&mut sender, t0);
+        assert_eq!(sender.sent.len(), 1, "a zero budget sends nothing");
+
+        let spent = e.tick_budgeted(t0, usize::MAX, usize::MAX);
+        e.drain(&mut sender, t0);
+        assert_eq!(sender.sent.len(), 2, "and it is sent once budget allows");
+        assert_eq!(spent, sender.sent[1].len(), "billed at its wire size");
+    }
+
+    /// The client repeats a request until the pass arrives. Requests that
+    /// pile up while the first is still waiting for budget are one
+    /// retransmission, not one each.
+    #[test]
+    fn a_repeated_nack_is_one_retransmission() {
+        let t0 = Instant::now();
+        let mut e = ReliableTileEmitter::new(t0);
+        let mut sender = CollectSender::default();
+        let key = EmitKey::new(1, 0, 0, 0);
+        e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
+        e.drain(&mut sender, t0);
+
+        for _ in 0..10 {
             e.on_nack(&[(key, 0u8)], t0);
-            e.drain(&mut sender, t0);
         }
-        // 1 original + nacks re-emits — all NACKs produce emissions now.
-        assert_eq!(sender.sent.len(), 1 + nacks);
-        assert_eq!(e.stats.nack_hit, nacks as u64);
-        // Entry is still live.
-        assert!(e.cache.get(&key).is_some());
+        e.tick_budgeted(t0, usize::MAX, usize::MAX);
+        e.drain(&mut sender, t0);
+
+        assert_eq!(sender.sent.len(), 2, "1 original + 1 resend, not 1 + 10");
+        assert_eq!(e.stats.nack_hit, 1);
+        assert_eq!(e.stats.nack_deduped, 9);
+        assert!(e.cache.get(&key).is_some(), "still live until acknowledged");
+
+        // Once it has gone out the request is spent; asking again is a new
+        // request and is honoured.
+        e.on_nack(&[(key, 0u8)], t0);
+        e.tick_budgeted(t0, usize::MAX, usize::MAX);
+        e.drain(&mut sender, t0);
+        assert_eq!(sender.sent.len(), 3);
+    }
+
+    /// A queued request for a pass that has since been acknowledged or
+    /// superseded is dropped, and costs no budget.
+    #[test]
+    fn a_queued_nack_for_a_retired_pass_is_dropped() {
+        let t0 = Instant::now();
+        let mut e = ReliableTileEmitter::new(t0);
+        let mut sender = CollectSender::default();
+        let key = EmitKey::new(1, 0, 0, 0);
+        e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
+        e.drain(&mut sender, t0);
+
+        e.on_nack(&[(key, 0u8)], t0);
+        e.on_ack(&[key]);
+        assert_eq!(e.tick_budgeted(t0, usize::MAX, usize::MAX), 0);
+        e.drain(&mut sender, t0);
+        assert_eq!(sender.sent.len(), 1);
+    }
+
+    /// The byte budget bounds RTO replay, and what it defers stays due.
+    #[test]
+    fn the_byte_budget_bounds_rto_replay_and_defers_the_rest() {
+        let t0 = Instant::now();
+        let mut e = ReliableTileEmitter::new(t0);
+        let mut sender = CollectSender::default();
+        for i in 0..100u32 {
+            e.submit_one(EmitKey::new(i, 0, 0, 0), fake_source(i, 0, 0), t0, None, t0);
+        }
+        e.drain(&mut sender, t0);
+        let one = sender.sent[0].len();
+
+        let t1 = t0 + Duration::from_secs(1);
+        let spent = e.tick_budgeted(t1, usize::MAX, 10 * one);
+        assert_eq!(e.stats.rto_fired, 10);
+        assert_eq!(spent, 10 * one);
+        assert_eq!(
+            e.stats.retransmit_budget_deferrals, 1,
+            "stopping with work still due is worth counting: sustained \
+             growth means retransmission demand exceeds its share of the link"
+        );
+
+        // Not lost, only later.
+        let spent = e.tick_budgeted(t1, usize::MAX, usize::MAX);
+        assert_eq!(e.stats.rto_fired, 100);
+        assert_eq!(spent, 90 * one);
+    }
+
+    /// The client saying "this did not arrive" outranks a timer guessing
+    /// that it might not have.
+    #[test]
+    fn nacks_are_served_ahead_of_the_rto() {
+        let t0 = Instant::now();
+        let mut e = ReliableTileEmitter::new(t0);
+        let mut sender = CollectSender::default();
+        let timed_out = EmitKey::new(1, 0, 0, 0);
+        let nacked = EmitKey::new(2, 1, 0, 0);
+        e.submit_one(timed_out, fake_source(1, 0, 0), t0, None, t0);
+        e.drain(&mut sender, t0);
+        let one = sender.sent[0].len();
+        // Submitted late enough that its own RTO is not yet due at `t1`.
+        let t_late = t0 + Duration::from_millis(900);
+        e.submit_one(nacked, fake_source(2, 0, 0), t_late, None, t_late);
+        e.drain(&mut sender, t_late);
+
+        let t1 = t0 + Duration::from_secs(1);
+        e.on_nack(&[(nacked, 0u8)], t1);
+        // Room for exactly one.
+        e.tick_budgeted(t1, usize::MAX, one);
+        assert_eq!(e.stats.rto_fired, 0, "the timer waits its turn");
+        assert_eq!(e.cache.get(&nacked).unwrap().attempts, 1);
+        assert_eq!(e.cache.get(&timed_out).unwrap().attempts, 0);
     }
 
     #[test]
@@ -1559,6 +1760,11 @@ mod tests {
 
         let now1 = crate::transport::io_bridge::now_std();
         e.on_nack(&[(key, 0u8)], now1);
+        // The resend, and with it the stamp, now happens when budget allows
+        // rather than inside `on_nack`. One retransmission only, so it is
+        // the NACK branch that stamps and not the RTO behind it.
+        e.tick_budgeted(now1, 1, usize::MAX);
+        assert_eq!(e.stats.rto_fired, 0);
 
         let last_sent_at = e.cache.get(&key).unwrap().last_sent_at;
         let delta = last_sent_at.duration_since(t0);

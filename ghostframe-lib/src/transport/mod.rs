@@ -16,6 +16,7 @@ pub mod quic;
 /// the C API keep working.
 pub use ghostframe_tsnet as ghostbridge;
 pub mod reliable_emitter;
+pub(crate) mod retransmit_pacer;
 pub mod scheduler;
 pub mod transmission_ledger;
 pub mod webtransport;

@@ -296,6 +296,32 @@ const RTO_RETRANSMITS_PER_TICK: usize = 64;
 /// retransmitting it.
 const STUCK_ENTRY_AGE: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Inbound packets the event loop will take back to back before the frame
+/// and injection arms get a turn regardless.
+///
+/// Inbound is polled ahead of frames (see the `select!` in `IoBridge::run`),
+/// which is safe only if it cannot starve them in turn. A packet costs tens
+/// of microseconds and a client's send rate is bounded by its own
+/// acknowledgement traffic, so in practice this never binds; it is here so
+/// that a peer sending as fast as it can gets a slow session, not a frozen
+/// one.
+const INBOUND_STREAK_LIMIT: u32 = 64;
+
+/// Share of the link estimate retransmission may use while the scheduler
+/// still has work queued. With nothing queued it may use all of it.
+///
+/// Half, because neither side can be shown to deserve more. A retransmission
+/// repairs a pass the client is known or suspected to lack, and until it
+/// lands the tile cannot finish; new work is what the user is waiting to
+/// see, and under queueing delay most "lost" passes are merely late, so the
+/// retransmission is waste. Starving either one stalls convergence -- the
+/// first by never completing tiles, the second, as measured before this
+/// existed, by never emitting them.
+///
+/// Not a tuned value. What matters is that the sum is bounded by the
+/// estimate at all; see `retransmit_pacer`.
+const RETRANSMIT_BUDGET_SHARE: f64 = 0.5;
+
 /// Ticks between stuck-entry sweeps. The sweep scans the whole cache, which is
 /// large exactly when it matters, so it does not belong on every tick.
 const STUCK_SWEEP_EVERY_TICKS: u32 = 30;
@@ -645,6 +671,16 @@ struct ActiveProbe {
     packets_sent: i64,
 }
 
+/// An arm of the `select!` in `IoBridge::run`. See `IoBridge::loop_arm_trace`.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopArm {
+    Timeout,
+    Inbound,
+    Frame,
+    Injected,
+}
+
 pub struct IoBridge {
     /// Keep the ghostbridge handle alive so the socketpair fd stays open.
     /// `None` only in the test-only constructor, which builds directly from a
@@ -777,6 +813,13 @@ pub struct IoBridge {
     force_dirty_frames: u32,
     /// Ticks since startup, for `STUCK_SWEEP_EVERY_TICKS`.
     stuck_sweep_counter: u32,
+    /// Byte allowance for RTO and NACK replay. See `retransmit_pacer`.
+    retransmit_pacer: crate::transport::retransmit_pacer::RetransmitPacer,
+    /// Which `select!` arm each `run()` iteration took, in order. The arm
+    /// *order* is the behaviour under test and leaves no other trace: with
+    /// every source ready the loop drains them all inside one poll.
+    #[cfg(test)]
+    loop_arm_trace: Vec<LoopArm>,
     /// When the current session was established, for session-duration
     /// reporting on disconnect. `None` between sessions.
     session_started_at: Option<std::time::Instant>,
@@ -1465,6 +1508,9 @@ impl IoBridge {
             last_max_datagram_size: None,
             force_dirty_frames: 0,
             stuck_sweep_counter: 0,
+            retransmit_pacer: crate::transport::retransmit_pacer::RetransmitPacer::new(),
+            #[cfg(test)]
+            loop_arm_trace: Vec::new(),
             session_started_at: None,
             last_disconnect_at: None,
             palette_table: crate::encoder::pal_rle::PaletteTable::new(),
@@ -2086,8 +2132,30 @@ impl IoBridge {
                 }
             }
         }
-        self.reliable_emitter
-            .tick(tick_now, RTO_RETRANSMITS_PER_TICK);
+        // Retransmission draws on the same link estimate the scheduler
+        // does. This is called per frame and per `DatagramsUnblocked`, so a
+        // per-call bound alone is a bound per *event*; the pacer turns it
+        // into one per unit of time.
+        let share = if self.scheduler.queue_len() == 0 && self.scheduler.refinement_queue_len() == 0
+        {
+            1.0
+        } else {
+            RETRANSMIT_BUDGET_SHARE
+        };
+        self.retransmit_pacer.refill(
+            tick_now,
+            self.paced_tick_budget_bytes(),
+            SCHEDULER_TICK_INTERVAL_US,
+            share,
+        );
+        // And on quinn's room, for the scheduler's reason: a datagram quinn
+        // refuses is re-queued, not lost, but queueing replay behind a full
+        // buffer only adds to the standing delay that is making timers fire.
+        let allowance = self.clamp_to_quinn_capacity(self.retransmit_pacer.available());
+        let spent =
+            self.reliable_emitter
+                .tick_budgeted(tick_now, RTO_RETRANSMITS_PER_TICK, allowance);
+        self.retransmit_pacer.spend(spent);
         let bridge_ptr: *mut IoBridge = self as *mut IoBridge;
         let mut adapter = IoBridgeSenderAdapter { bridge: bridge_ptr };
         self.reliable_emitter.drain(&mut adapter, tick_now);
@@ -2192,6 +2260,27 @@ impl IoBridge {
             * SCHEDULER_TICK_INTERVAL_US
             * SCHEDULER_TICK_BUDGET_FRACTION) as usize)
             .max(self.tick_budget_floor())
+    }
+
+    /// The per-tick emission budget as the scheduler computes it outside a
+    /// probe window: `base_budget_bytes` scaled by the AIMD multiplier, then
+    /// bounded by goog_cc's pacer once that is trusted.
+    ///
+    /// For callers that are not a frame dispatch -- retransmission -- and so
+    /// have no `aimd_budget` in hand, but must draw on the same estimate.
+    /// Probe windows are deliberately not consulted: a probe exists to send
+    /// *new* content above the estimate, and replaying old passes into it
+    /// would spend the measurement on bytes the client may already hold.
+    fn paced_tick_budget_bytes(&self) -> usize {
+        let aimd_budget =
+            ((self.base_budget_bytes() as f64) * self.tick_budget_multiplier) as usize;
+        let bwe_snap = self.bwe.snapshot();
+        combine_pacing_budget(
+            select_pacing_mode(bwe_snap.samples_seen),
+            aimd_budget,
+            bwe_snap.pacer_rate_bps,
+            SCHEDULER_TICK_INTERVAL_US,
+        )
     }
 
     /// Shared scheduler dispatch: grid-sync → RTT update → bump+encode+enqueue
@@ -2757,6 +2846,15 @@ impl IoBridge {
                 SCHEDULER_TICK_INTERVAL_US,
             ),
         };
+        // Retransmission since the last tick came out of the same link, so
+        // it comes out of this budget: the estimate bounds the sum, not each
+        // sender separately. Bounded by retransmission's own share so that a
+        // capture slower than the tick rate -- where several ticks' worth of
+        // replay legitimately fits between two frames -- cannot zero the
+        // scheduler out.
+        let replayed = self.retransmit_pacer.take_spent_since_tick();
+        let give_back = replayed.min((pre_clamp_budget as f64 * RETRANSMIT_BUDGET_SHARE) as usize);
+        let pre_clamp_budget = pre_clamp_budget - give_back;
         // Never pop more from the scheduler than quinn can actually absorb
         // right now — see `clamp_to_quinn_capacity`'s doc comment for why
         // this is mandatory rather than defensive.
@@ -4047,6 +4145,85 @@ impl IoBridge {
         );
     }
 
+    /// Phase 1.5-B detection: Cdf53 tiles, idle past `IDLE_THRESHOLD`, that
+    /// the client has not fully acknowledged and that nothing is still
+    /// working on. Returns up to `limit` flat tile indices.
+    ///
+    /// "Nothing is still working on" has two halves, and for a long time
+    /// only one was checked here:
+    ///
+    ///  - the retransmit cache holds no entry for the tile, so no RTO or
+    ///    NACK will resend anything; and
+    ///  - the refinement queue holds none of its passes, so the scheduler
+    ///    is not about to send anything either.
+    ///
+    /// The second half lived only in `stranded_reenqueue`, i.e. *after* the
+    /// candidate had been handed to the GPU for a forward transform and its
+    /// coefficients re-encoded on the CPU. A tile whose passes are merely
+    /// waiting their turn in the queue -- the normal state of every tile on
+    /// a link slower than the screen -- therefore cost a full re-encode per
+    /// frame to be told it was not stranded. Measured on a 2040-tile screen
+    /// refining over 8 Mbit: capture-to-dispatch went from 0.6 ms to 106 ms
+    /// the moment the tiles crossed the idle threshold, the frame rate fell
+    /// from 30 to 8, and since the scheduler is ticked per frame, delivery
+    /// fell with it.
+    ///
+    /// Inlined in this file (not in escalation.rs) to avoid a tile/ ->
+    /// transport/ layering dependency: the check needs the scheduler's
+    /// per-(tile, gen) ACK bitmap and the reliable emitter's cache
+    /// occupancy, both transport-layer state.
+    fn detect_stranded_cdf53_tiles(&self, limit: usize) -> Vec<u32> {
+        let mut out = Vec::new();
+        let cols = self.metrics_tracker.cols();
+        for (idx, m) in self.metrics_tracker.metrics().iter().enumerate() {
+            if out.len() >= limit {
+                break;
+            }
+            if m.idle_frames <= crate::tile::escalation::IDLE_THRESHOLD {
+                continue;
+            }
+            let present_passes = match m.codec_state {
+                crate::tile::CodecState::Cdf53 { present_passes, .. } => present_passes,
+                // Cdf53-only sweep: a tile in any other state has no
+                // pass set to refine. Listed so a future progressive
+                // codec is not silently skipped here.
+                crate::tile::CodecState::PalRle { .. }
+                | crate::tile::CodecState::Solid
+                | crate::tile::CodecState::H264 { .. }
+                | crate::tile::CodecState::PixelPerfect
+                | crate::tile::CodecState::Skip => continue,
+            };
+            // NOTE: TileMetrics.passes_sent is dead state in the current
+            // codebase — initialized to 0 at every Cdf53 transition and
+            // never incremented — so a `passes_sent == max_passes` gate
+            // never fires. The live `reliable_emitter` cache, the scheduler
+            // ACK bitmap and the refinement queue are the source of truth.
+            let tile_x = (idx as u32 % cols) as u8;
+            let tile_y = (idx as u32 / cols) as u8;
+            // RTO still has cached entries → it's pumping retransmits, not
+            // stranded.
+            if self
+                .reliable_emitter
+                .has_cache_entries_for_tile(tile_x, tile_y)
+            {
+                continue;
+            }
+            // Still queued → unsent, not stranded.
+            if self.scheduler.refinement_queue_holds_tile(tile_x, tile_y) {
+                continue;
+            }
+            let gen = self.scheduler.generation_for(tile_x, tile_y);
+            let unacked =
+                self.scheduler
+                    .cdf53_unacked_pass_mask(tile_x, tile_y, gen, present_passes);
+            if unacked == 0 {
+                continue;
+            }
+            out.push(idx as u32);
+        }
+        out
+    }
+
     /// GPU-accelerated full-frame pipeline: Vulkan compute dirty detection +
     /// VA-API VPP BGRA→NV12 conversion + H.264 encoding (true zero-copy).
     fn process_frame_gpu(&mut self, frame: FrameSubmission) {
@@ -4113,56 +4290,10 @@ impl IoBridge {
             // and the reliable_emitter's cache occupancy, both
             // transport-layer state.
             let stranded_candidates = if frame_mode_eligible {
-                let remaining = crate::capture::gpu_pipeline::MAX_ESCALATION_PER_FRAME
-                    .saturating_sub(h264_candidates.len());
-                let mut out = Vec::new();
-                let cols = self.metrics_tracker.cols();
-                for (idx, m) in self.metrics_tracker.metrics().iter().enumerate() {
-                    if out.len() >= remaining {
-                        break;
-                    }
-                    if m.idle_frames <= crate::tile::escalation::IDLE_THRESHOLD {
-                        continue;
-                    }
-                    let present_passes = match m.codec_state {
-                        crate::tile::CodecState::Cdf53 { present_passes, .. } => present_passes,
-                        // Cdf53-only sweep: a tile in any other state has no
-                        // pass set to refine. Listed so a future progressive
-                        // codec is not silently skipped here.
-                        crate::tile::CodecState::PalRle { .. }
-                        | crate::tile::CodecState::Solid
-                        | crate::tile::CodecState::H264 { .. }
-                        | crate::tile::CodecState::PixelPerfect
-                        | crate::tile::CodecState::Skip => continue,
-                    };
-                    // NOTE: TileMetrics.passes_sent is dead state in the
-                    // current codebase — it's initialized to 0 at every
-                    // Cdf53 transition (io_bridge.rs:3139, 3291;
-                    // classifier.rs:218/240/257) and never incremented.
-                    // So the original gate `passes_sent == max_passes`
-                    // never fired. Use the live `reliable_emitter` cache
-                    // + scheduler ACK bitmap as the source of truth.
-                    let tile_x = (idx as u32 % cols) as u8;
-                    let tile_y = (idx as u32 / cols) as u8;
-                    // RTO still has cached entries → it's pumping
-                    // retransmits, not stranded. Stranded == cache
-                    // drained but client hasn't ACKed everything.
-                    if self
-                        .reliable_emitter
-                        .has_cache_entries_for_tile(tile_x, tile_y)
-                    {
-                        continue;
-                    }
-                    let gen = self.scheduler.generation_for(tile_x, tile_y);
-                    let unacked =
-                        self.scheduler
-                            .cdf53_unacked_pass_mask(tile_x, tile_y, gen, present_passes);
-                    if unacked == 0 {
-                        continue;
-                    }
-                    out.push(idx as u32);
-                }
-                out
+                self.detect_stranded_cdf53_tiles(
+                    crate::capture::gpu_pipeline::MAX_ESCALATION_PER_FRAME
+                        .saturating_sub(h264_candidates.len()),
+                )
             } else {
                 Vec::new()
             };
@@ -5185,6 +5316,8 @@ impl IoBridge {
                         // being maintained, which is the shape that left
                         // tiles stranded without their finest bit-planes.
                         nack_resolved_by_content = es.nack_resolved_by_content,
+                        nack_deduped = es.nack_deduped,
+                        retransmit_budget_deferrals = es.retransmit_budget_deferrals,
                         // Step A's counter: datagrams quinn refused. Never
                         // surfaced before, and it is the difference between
                         // "we never sent it" and "we sent it and it was lost".
@@ -5474,6 +5607,8 @@ impl IoBridge {
         let mut diag_frame_arm: u64 = 0;
         let mut diag_inbound_arm: u64 = 0;
         let mut diag_last_heartbeat = now_std();
+        // Consecutive inbound packets taken without a frame arm running.
+        let mut inbound_streak: u32 = 0;
 
         loop {
             // Build a timer future that fires at the earliest QUIC timeout, or
@@ -5484,54 +5619,45 @@ impl IoBridge {
                     None => Box::pin(pending::<()>()),
                 };
 
+            // After `INBOUND_STREAK_LIMIT` packets in a row the inbound arm
+            // sits one round out, so a frame that has been waiting is taken.
+            let frames_turn = inbound_streak >= INBOUND_STREAK_LIMIT;
+
             tokio::select! {
                 biased;
 
                 // 1. Earliest QUIC timeout fired.
                 _ = sleep_fut => {
                     diag_timeout_arm += 1;
+                    #[cfg(test)]
+                    self.loop_arm_trace.push(LoopArm::Timeout);
                     self.server.handle_timeout(now_std());
                 }
 
-                // 2. Frame submission from capture thread.
-                frame = async {
-                    match self.frame_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    diag_frame_arm += 1;
-                    if let Some(frame) = frame {
-                        self.process_frame(frame);
-                    } else {
-                        tracing::warn!("frame_rx closed; capture upstream dropped");
-                    }
-                }
-
-                // 2b. Pre-encoded tile work injected by the browserless
-                // harness, in place of capture + classification. `None` in
-                // production (the field is always present so this branch
-                // needs no `cfg`; a `None` receiver just costs a pending
-                // future).
-                injected = async {
-                    match self.inject_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    match injected {
-                        Some(inj) => {
-                            self.apply_injected_frame(inj);
-                        }
-                        None => {
-                            self.inject_rx = None;
-                        }
-                    }
-                }
-
-                // 3. Inbound framed UDP packet from ghostbridge.
-                read_res = self.stream.read_exact(&mut header) => {
+                // 2. Inbound framed UDP packet from ghostbridge.
+                //
+                // Ahead of the frame arm, and it has to be. This `select!`
+                // is biased, so whichever of the two is listed first wins
+                // whenever both are ready -- and a frame is *always* ready
+                // once processing one takes longer than the capture
+                // interval. Frames used to be listed first. Measured on a
+                // 1920x1080 screen re-encoding every tile each frame (550 ms
+                // of work against a 200 ms capture interval): over 18 s the
+                // loop took 34 frames and 8 inbound packets, the server read
+                // no acknowledgement of any kind, quinn fell back to PTO
+                // probes on an exponential timer, and about 35 packets
+                // reached the client in half a minute. The session was up,
+                // the capture was running, and nothing was being delivered.
+                //
+                // Reading the network is cheap and is what lets everything
+                // already sent make progress; encoding another frame is
+                // expensive and, with the network unread, produces work that
+                // cannot leave. So the cheap thing that unblocks goes first.
+                read_res = self.stream.read_exact(&mut header), if !frames_turn => {
                     diag_inbound_arm += 1;
+                    inbound_streak += 1;
+                    #[cfg(test)]
+                    self.loop_arm_trace.push(LoopArm::Inbound);
                     match read_res {
                         Ok(_) => {
                             if let Err(e) = self.process_inbound(&header).await {
@@ -5544,6 +5670,56 @@ impl IoBridge {
                         }
                         Err(e) => return Err(e.into()),
                     }
+                }
+
+                // 3. Frame submission from capture thread.
+                frame = async {
+                    match self.frame_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    diag_frame_arm += 1;
+                    inbound_streak = 0;
+                    #[cfg(test)]
+                    self.loop_arm_trace.push(LoopArm::Frame);
+                    if let Some(frame) = frame {
+                        self.process_frame(frame);
+                    } else {
+                        tracing::warn!("frame_rx closed; capture upstream dropped");
+                    }
+                }
+
+                // 3b. Pre-encoded tile work injected by the browserless
+                // harness, in place of capture + classification. `None` in
+                // production (the field is always present so this branch
+                // needs no `cfg`; a `None` receiver just costs a pending
+                // future).
+                injected = async {
+                    match self.inject_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    inbound_streak = 0;
+                    #[cfg(test)]
+                    self.loop_arm_trace.push(LoopArm::Injected);
+                    match injected {
+                        Some(inj) => {
+                            self.apply_injected_frame(inj);
+                        }
+                        None => {
+                            self.inject_rx = None;
+                        }
+                    }
+                }
+
+                // 4. It was the frame arms' turn and neither had anything.
+                // Always ready, and last, so it fires only then: without it
+                // a round with inbound switched off and no frame pending
+                // would wait on a frame that may not be coming.
+                _ = std::future::ready(()), if frames_turn => {
+                    inbound_streak = 0;
                 }
             }
 
@@ -6302,6 +6478,9 @@ impl IoBridge {
             last_max_datagram_size: None,
             force_dirty_frames: 0,
             stuck_sweep_counter: 0,
+            retransmit_pacer: crate::transport::retransmit_pacer::RetransmitPacer::new(),
+            #[cfg(test)]
+            loop_arm_trace: Vec::new(),
             session_started_at: None,
             last_disconnect_at: None,
             palette_table: crate::encoder::pal_rle::PaletteTable::new(),
@@ -9793,6 +9972,138 @@ mod tests {
         );
     }
 
+    /// Run the bridge's real event loop until it has nothing left to do.
+    ///
+    /// Every source in these tests is queued up front, so the loop works
+    /// through all of it and then parks on its `select!`; the bounded-yield
+    /// arm wins at that point and hands the bridge back.
+    async fn run_until_idle(bridge: &mut IoBridge) {
+        tokio::select! {
+            biased;
+            result = bridge.run() => panic!("run() exited unexpectedly: {result:?}"),
+            _ = async {
+                for _ in 0..4096 {
+                    tokio::task::yield_now().await;
+                }
+            } => {}
+        }
+    }
+
+    /// A well-framed inbound packet too short to be anything: costs one pass
+    /// through the loop and is rejected with "frame too short".
+    const BOGUS_INBOUND: [u8; 8] = [0, 0, 0, 4, 0, 0, 0, 0];
+
+    /// The network is read before the next frame is taken.
+    ///
+    /// Frames used to be listed ahead of inbound in a biased `select!`, so a
+    /// capture that kept a frame waiting -- any time one frame's work
+    /// outlasts the capture interval -- starved the socket outright.
+    /// Measured on a production-scale screen: 34 frames and 8 inbound
+    /// packets in 18 s, no acknowledgement read, ~35 packets delivered.
+    #[tokio::test(start_paused = true)]
+    async fn inbound_is_read_before_a_waiting_frame() {
+        use tokio::io::AsyncWriteExt;
+
+        let (ours, mut peer) = tokio::net::UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("QuicServer::new");
+        let (tx, rx) = mpsc::channel(8);
+        let mut bridge = IoBridge::new_with_injection_for_test(ours, server, rx, 4, 4);
+
+        // Both sources ready before the loop runs at all, so the order they
+        // are taken in is purely the loop's choice.
+        for seq in 0..4u32 {
+            tx.send(InjectedFrame {
+                seq,
+                timestamp_us: 0,
+                work: Vec::new(),
+            })
+            .await
+            .expect("inject");
+        }
+        for _ in 0..4 {
+            peer.write_all(&BOGUS_INBOUND).await.expect("peer write");
+        }
+        peer.flush().await.ok();
+        // Written is not yet observable: tokio learns a socket is readable
+        // from its I/O driver, which has not had a turn. Without this the
+        // loop's first round sees a socket it believes empty and the test
+        // measures the driver's scheduling instead of the arm order.
+        bridge.stream.readable().await.expect("readable");
+
+        run_until_idle(&mut bridge).await;
+
+        let order: Vec<LoopArm> = bridge
+            .loop_arm_trace
+            .iter()
+            .copied()
+            .filter(|a| matches!(a, LoopArm::Inbound | LoopArm::Injected))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                LoopArm::Inbound,
+                LoopArm::Inbound,
+                LoopArm::Inbound,
+                LoopArm::Inbound,
+                LoopArm::Injected,
+                LoopArm::Injected,
+                LoopArm::Injected,
+                LoopArm::Injected,
+            ],
+            "every waiting inbound packet must be read before the next frame \
+             is taken; frames-first is the ordering that stopped the server \
+             reading acknowledgements whenever a frame was always waiting"
+        );
+    }
+
+    /// ...and reading the network cannot starve frames in turn.
+    #[tokio::test(start_paused = true)]
+    async fn a_flood_of_inbound_still_lets_a_frame_through() {
+        use tokio::io::AsyncWriteExt;
+
+        let (ours, mut peer) = tokio::net::UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("QuicServer::new");
+        let (tx, rx) = mpsc::channel(8);
+        let mut bridge = IoBridge::new_with_injection_for_test(ours, server, rx, 4, 4);
+
+        tx.send(InjectedFrame {
+            seq: 0,
+            timestamp_us: 0,
+            work: Vec::new(),
+        })
+        .await
+        .expect("inject");
+        let flood = INBOUND_STREAK_LIMIT as usize * 3;
+        for _ in 0..flood {
+            peer.write_all(&BOGUS_INBOUND).await.expect("peer write");
+        }
+        peer.flush().await.ok();
+        bridge.stream.readable().await.expect("readable");
+
+        run_until_idle(&mut bridge).await;
+
+        let trace = &bridge.loop_arm_trace;
+        let frame_at = trace
+            .iter()
+            .position(|a| *a == LoopArm::Injected)
+            .expect("the frame was never taken");
+        let inbound_before = trace[..frame_at]
+            .iter()
+            .filter(|a| **a == LoopArm::Inbound)
+            .count();
+        assert_eq!(
+            inbound_before, INBOUND_STREAK_LIMIT as usize,
+            "the frame must be taken after exactly one streak of inbound, \
+             not after the whole flood"
+        );
+        let inbound_total = trace.iter().filter(|a| **a == LoopArm::Inbound).count();
+        assert_eq!(
+            inbound_total, flood,
+            "and the rest of the flood is still read afterwards -- sitting \
+             out a round must not strand it"
+        );
+    }
+
     /// Regression test for the injected-path over-pop bug: `apply_injected_frame`
     /// must clamp its drain budget to what quinn can absorb, the same way
     /// `dispatch_dirty_tiles_via_scheduler` clamps its AIMD budget (see the
@@ -10083,6 +10394,58 @@ mod tests {
             after, before,
             "stranded re-enqueue must not duplicate passes still Pending \
              in the refinement queue (before={before}, after={after})"
+        );
+    }
+
+    /// A tile whose passes are still queued is not a stranded tile, and
+    /// must be turned away *before* it costs a GPU forward transform and a
+    /// re-encode -- not after, which is where the only check used to be.
+    #[tokio::test(start_paused = true)]
+    async fn a_tile_still_in_the_refinement_queue_is_not_a_stranded_candidate() {
+        use crate::transport::protocol::Codec;
+        use crate::transport::scheduler::{TileWork, WorkState};
+
+        let (ours, _peer) = tokio::net::UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("QuicServer::new");
+        let (_tx, rx) = mpsc::channel(8);
+        let mut bridge = IoBridge::new_with_injection_for_test(ours, server, rx, 4, 4);
+        bridge.metrics_tracker.resize(4, 4);
+
+        let present_passes: u16 = 0b0011_1110_0001;
+        let long_idle = crate::tile::escalation::IDLE_THRESHOLD + 1;
+        let (queued, stranded) = ((2u8, 1u8), (3u8, 3u8));
+        for (x, y) in [queued, stranded] {
+            let m = bridge.metrics_tracker.get_mut(x as u32, y as u32);
+            m.codec_state = crate::tile::CodecState::Cdf53 {
+                passes_sent: 0,
+                present_passes,
+            };
+            m.idle_frames = long_idle;
+        }
+        // One of the two still has a pass waiting to be sent.
+        bridge.scheduler.enqueue_refinement_work_at(
+            TileWork {
+                tile_x: queued.0,
+                tile_y: queued.1,
+                generation: 0,
+                pass_idx: 9,
+                total_passes: crate::encoder::cdf53::CDF53_PASS_COUNT as u8,
+                codec: Codec::Cdf53,
+                payload: vec![0u8; 4],
+                queued_at: super::now_std(),
+                last_sent_at: None,
+                state: WorkState::Pending,
+            },
+            super::now_std(),
+        );
+
+        let found = bridge.detect_stranded_cdf53_tiles(usize::MAX);
+        let flat = |(x, y): (u8, u8)| y as u32 * 4 + x as u32;
+        assert_eq!(
+            found,
+            vec![flat(stranded)],
+            "only the tile nothing is working on is stranded; the one with \
+             a pass still queued is merely unsent"
         );
     }
 
