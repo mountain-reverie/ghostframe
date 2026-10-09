@@ -715,6 +715,39 @@ impl Scheduler {
     /// the wall clock. This is what makes retransmission observable under
     /// `tokio::time::pause()` in the browserless harness.
     pub fn tick_at(&mut self, budget_bytes: usize, now: Instant) -> Vec<TileWork> {
+        self.tick_at_with(budget_bytes, now, &|_, _, _| false)
+    }
+
+    /// `tick_at`, told which in-flight tile-passes something else is already
+    /// responsible for re-sending.
+    ///
+    /// `recovery_owned(tile_x, tile_y, pass_idx)` returns true while another
+    /// mechanism holds that pass and will retransmit it -- in production,
+    /// the reliable emitter's retransmit cache. Such an item is never
+    /// re-sent from here, however long it has been in flight.
+    ///
+    /// Without this, a priority tile had two retry paths racing one
+    /// deadline. The emitter replays its cached datagram on RTO, with
+    /// exponential backoff, under the retransmit budget, and sooner if the
+    /// client NACKs. This queue re-sent the tile as a *new* emission --
+    /// fresh `EmitKey`, fresh cache entry, fresh RTO -- on a fixed interval
+    /// with no backoff. So one lost acknowledgement produced two resends,
+    /// and each scheduler resend left the previous cache entry behind to
+    /// keep retransmitting on its own until it was acknowledged separately.
+    ///
+    /// The retry here survives as the fallback it was always described as:
+    /// it fires only for a pass nobody else is holding. That happens when
+    /// the cache has lost the entry without the scheduler hearing of an
+    /// acknowledgement -- a cache wipe on `ConnectionLost`, a stuck entry
+    /// retired by age, a coverage record evicted before its ACK arrived --
+    /// and in those cases this is the only thing that would ever send the
+    /// tile again on a static screen.
+    pub fn tick_at_with(
+        &mut self,
+        budget_bytes: usize,
+        now: Instant,
+        recovery_owned: &dyn Fn(u8, u8, u8) -> bool,
+    ) -> Vec<TileWork> {
         let fraction = self.refinement_bandwidth_fraction;
         let mut refinement_budget = (budget_bytes as f32 * fraction) as usize;
         self.last_refinement_budget = refinement_budget;
@@ -737,6 +770,7 @@ impl Scheduler {
             priority_budget,
             retry_after,
             now,
+            recovery_owned,
             &mut emitted,
         );
         Self::drain_refinement_pass_major(
@@ -761,6 +795,7 @@ impl Scheduler {
         budget: usize,
         retry_after: Duration,
         now: Instant,
+        recovery_owned: &dyn Fn(u8, u8, u8) -> bool,
         out: &mut Vec<TileWork>,
     ) {
         // Drop terminal-state entries first, freeing their slab slot.
@@ -780,10 +815,15 @@ impl Scheduler {
             };
             let eligible = match w.state {
                 WorkState::Pending => true,
-                WorkState::InFlight => w
-                    .last_sent_at
-                    .map(|t| now.duration_since(t) >= retry_after)
-                    .unwrap_or(true),
+                WorkState::InFlight => {
+                    let overdue = w
+                        .last_sent_at
+                        .map(|t| now.duration_since(t) >= retry_after)
+                        .unwrap_or(true);
+                    // Checked second: it is a hash lookup per in-flight
+                    // item, and almost every item is not overdue.
+                    overdue && !recovery_owned(w.tile_x, w.tile_y, w.pass_idx)
+                }
                 // Terminal states: nothing further to send. Listed rather
                 // than caught by `_` so a new WorkState has to declare
                 // whether it is eligible instead of silently defaulting to
@@ -1179,6 +1219,41 @@ mod tests {
         // Past the deadline it is still recovered.
         let late = t0 + Duration::from_millis(150);
         assert_eq!(s.tick_at(usize::MAX, late).len(), 1);
+    }
+
+    /// While something else holds the pass, this queue leaves it alone --
+    /// and takes over the moment nothing does.
+    #[test]
+    fn an_in_flight_tile_someone_else_will_resend_is_not_resent_here() {
+        use std::cell::Cell;
+        let mut s = Scheduler::new(4, 4);
+        s.set_retry_after(Duration::from_millis(150));
+        let t0 = Instant::now();
+        s.enqueue_at(TileWork::raw_for_test(2, 1, 0, vec![1]), t0);
+        s.enqueue_at(TileWork::raw_for_test(3, 3, 0, vec![2]), t0);
+
+        // First send is never gated: nobody holds a pass that has not gone
+        // out yet, and a predicate that says otherwise must not block it.
+        let asked = Cell::new(0usize);
+        let first = s.tick_at_with(usize::MAX, t0, &|_, _, _| {
+            asked.set(asked.get() + 1);
+            true
+        });
+        assert_eq!(first.len(), 2);
+        assert_eq!(asked.get(), 0, "Pending work is not subject to the check");
+
+        // Well past the deadline. (2,1) is held elsewhere; (3,3) is not.
+        let late = t0 + Duration::from_secs(5);
+        let resent = s.tick_at_with(usize::MAX, late, &|x, y, p| (x, y, p) == (2, 1, 0));
+        assert_eq!(resent.len(), 1, "only the pass nobody else holds");
+        assert_eq!((resent[0].tile_x, resent[0].tile_y), (3, 3));
+
+        // The other mechanism lets go without an acknowledgement having
+        // reached the scheduler. This is now the only path left, and it
+        // takes it at once: the deadline has long since passed.
+        let fallback = s.tick_at_with(usize::MAX, late, &|_, _, _| false);
+        assert_eq!(fallback.len(), 1);
+        assert_eq!((fallback[0].tile_x, fallback[0].tile_y), (2, 1));
     }
 
     #[test]
