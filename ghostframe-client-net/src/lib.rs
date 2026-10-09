@@ -215,7 +215,7 @@ impl ClientNet {
         let quic_deadline = self
             .endpoint
             .next_wakeup()
-            .map(|t| t.saturating_duration_since(self.base).as_micros() as u64);
+            .map(|t| deadline_us(self.base, t));
         match (core_deadline, quic_deadline) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (Some(a), None) => Some(a),
@@ -530,5 +530,99 @@ impl ClientNet {
     pub fn request_display_mode(&mut self, width: u16, height: u16, now_us: u64) {
         self.core.request_display_mode(width, height);
         self.drain_connection_events(now_us);
+    }
+}
+
+/// A quinn deadline as microseconds since `base`, rounded **up**.
+///
+/// The embedder's clock is whole microseconds; quinn's is not. Its timers
+/// come out of RTT and pacing arithmetic on `Duration`s and carry
+/// nanoseconds. Truncating reports a deadline up to a microsecond early,
+/// and the embedder cannot recover from that: it calls `on_timeout` at the
+/// instant it was given, `drive_outgoing` compares the real deadline
+/// against that instant, finds it still a few hundred nanoseconds away and
+/// does nothing, and `poll_timeout` reports the same microsecond again. A
+/// driver that sleeps until `poll_timeout` then never sleeps, because the
+/// deadline it is shown is never in the future.
+///
+/// Seen as the browserless harness failing a scene with "no virtual-time
+/// progress for 5000 consecutive iterations": every one of those iterations
+/// was `on_timeout` at `t = 5_672_000` against a quinn deadline that printed
+/// as `5_672_000` and was not. It needs the virtual clock to be sitting
+/// within a microsecond below the deadline, so it was rare until a change
+/// to the server's retransmission pacing made it one run in three.
+///
+/// Rounding up costs at most a microsecond of lateness and makes the
+/// contract hold: `on_timeout` at the returned time is at or after the
+/// deadline.
+fn deadline_us(base: Instant, deadline: Instant) -> u64 {
+    let since = deadline.saturating_duration_since(base);
+    let us = since.as_micros() as u64;
+    if since.subsec_nanos().is_multiple_of(1_000) {
+        us
+    } else {
+        us + 1
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    #[test]
+    fn a_whole_microsecond_deadline_is_reported_exactly() {
+        let base = Instant::now();
+        assert_eq!(
+            deadline_us(base, base + Duration::from_micros(5_672_000)),
+            5_672_000
+        );
+        assert_eq!(deadline_us(base, base), 0);
+    }
+
+    #[test]
+    fn a_deadline_before_base_is_zero_not_a_wrap() {
+        let base = Instant::now() + Duration::from_secs(1);
+        assert_eq!(deadline_us(base, base - Duration::from_millis(5)), 0);
+    }
+
+    /// The stall, at the unit level: the deadline is 400 ns past a
+    /// microsecond boundary. Reported as that boundary, firing at the
+    /// reported time fires nothing.
+    #[test]
+    fn a_sub_microsecond_deadline_rounds_up_so_firing_at_it_is_not_early() {
+        let base = Instant::now();
+        let deadline = base + Duration::from_micros(5_672_000) + Duration::from_nanos(400);
+        let reported = deadline_us(base, deadline);
+        assert_eq!(reported, 5_672_001);
+        assert!(
+            base + Duration::from_micros(reported) >= deadline,
+            "an embedder that calls on_timeout at the reported time must \
+             find the timer due"
+        );
+    }
+
+    #[test]
+    fn firing_at_the_reported_time_is_never_early() {
+        let base = Instant::now();
+        for ns in [
+            1u64,
+            999,
+            1_000,
+            1_001,
+            33_333_333,
+            5_672_000_001,
+            9_999_999_999,
+        ] {
+            let deadline = base + Duration::from_nanos(ns);
+            let reported = deadline_us(base, deadline);
+            assert!(
+                base + Duration::from_micros(reported) >= deadline,
+                "ns={ns}"
+            );
+            assert!(
+                base + Duration::from_micros(reported) < deadline + Duration::from_micros(1),
+                "ns={ns}: and never more than a microsecond late"
+            );
+        }
     }
 }
