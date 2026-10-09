@@ -2566,7 +2566,13 @@ impl IoBridge {
             max_frag,
         });
         let now = now_std();
-        let drained = self.scheduler.tick_at(budget_bytes, now);
+        // The emitter owns recovery for whatever it still has cached; the
+        // scheduler re-sends only what the emitter has let go of. See
+        // `Scheduler::tick_at_with`.
+        let emitter = &self.reliable_emitter;
+        let drained = self
+            .scheduler
+            .tick_at_with(budget_bytes, now, &|x, y, p| emitter.holds_pass(x, y, p));
         let drained_count = drained.len();
         let mut stats = FrameSendStats::default();
         let mut total_wire_bytes_sent: usize = 0;
@@ -10401,6 +10407,67 @@ mod tests {
             "stranded re-enqueue must not duplicate passes still Pending \
              in the refinement queue (before={before}, after={after})"
         );
+    }
+
+    /// One retry path per tile. While the emitter has a priority tile
+    /// cached, the scheduler does not re-emit it; once the emitter has lost
+    /// it, the scheduler is what brings it back.
+    ///
+    /// Drives the real `drain_scheduler_into_quinn`, because the property
+    /// is in the wiring between the two: each half is unit-tested on its
+    /// own and both would still pass with the predicate never connected.
+    #[tokio::test(start_paused = true)]
+    async fn a_priority_tile_the_emitter_still_holds_is_not_re_emitted_by_the_scheduler() {
+        use crate::transport::protocol::Codec;
+        use crate::transport::scheduler::{TileWork, WorkState};
+
+        let (ours, _peer) = tokio::net::UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("QuicServer::new");
+        let (_tx, rx) = mpsc::channel(8);
+        let mut bridge = IoBridge::new_with_injection_for_test(ours, server, rx, 4, 4);
+        bridge
+            .scheduler
+            .set_retry_after(std::time::Duration::from_millis(150));
+
+        bridge.scheduler.enqueue_at(
+            TileWork {
+                tile_x: 2,
+                tile_y: 1,
+                generation: 0,
+                pass_idx: 0,
+                total_passes: 1,
+                codec: Codec::Solid,
+                payload: vec![10, 20, 30, 255],
+                queued_at: super::now_std(),
+                last_sent_at: None,
+                state: WorkState::Pending,
+            },
+            super::now_std(),
+        );
+
+        let (_, _, first) = bridge.drain_scheduler_into_quinn(1, 0, 1200, usize::MAX);
+        assert_eq!(first, 1, "the tile goes out once");
+        assert!(
+            bridge.reliable_emitter.holds_pass(2, 1, 0),
+            "precondition: emitting it put it in the retransmit cache"
+        );
+
+        // Far past the retry deadline, never acknowledged. The emitter's
+        // RTO is responsible for this tile now.
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        let (_, _, again) = bridge.drain_scheduler_into_quinn(2, 0, 1200, usize::MAX);
+        assert_eq!(
+            again, 0,
+            "the scheduler re-emitted a tile the emitter is still holding: \
+             two retry paths for one tile"
+        );
+
+        // The cache loses it without an acknowledgement -- what a
+        // `ConnectionLost` wipe does. Nothing else will ever resend it.
+        bridge.reliable_emitter.clear_cache();
+        let (_, _, recovered) = bridge.drain_scheduler_into_quinn(3, 0, 1200, usize::MAX);
+        assert_eq!(recovered, 1, "the fallback must bring the tile back");
+        assert!(bridge.reliable_emitter.holds_pass(2, 1, 0));
     }
 
     /// The scheduler's retry gate follows measured ACK latency and never

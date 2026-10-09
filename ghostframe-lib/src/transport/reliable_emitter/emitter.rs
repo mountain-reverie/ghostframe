@@ -624,6 +624,24 @@ impl ReliableTileEmitter {
         self.cache.has_entries_for_tile(tile_x, tile_y)
     }
 
+    /// Is this tile-pass still in the retransmit cache, i.e. will `tick`
+    /// re-send it if no acknowledgement arrives?
+    ///
+    /// O(1), through the content index, unlike
+    /// `has_cache_entries_for_tile`'s scan -- this is asked once per
+    /// in-flight priority tile per scheduler tick.
+    ///
+    /// May answer `false` for a pass that is in fact cached under an older
+    /// emission whose newer sibling has since been removed (the index
+    /// points at the newest and is cleared with it). The caller treats
+    /// `false` as "nobody is holding this, send it again", so that
+    /// direction costs a redundant resend and never a stranded tile.
+    pub fn holds_pass(&self, tile_x: u8, tile_y: u8, pass_idx: u8) -> bool {
+        self.cache
+            .lookup_content(tile_x, tile_y, pass_idx)
+            .is_some()
+    }
+
     /// Returns `now` measured against `time_base` (the instant this
     /// emitter was constructed with), truncated to a u32 microsecond
     /// counter (≈71 minute wrap). Used to stamp
@@ -1346,6 +1364,37 @@ mod tests {
         );
         assert_eq!(e.stats.nack_hit, 1);
         assert_eq!(e.stats.nack_resolved_by_content, 1);
+    }
+
+    /// `holds_pass` tracks the cache through every way an entry leaves it.
+    #[test]
+    fn holds_pass_follows_the_cache() {
+        let t0 = Instant::now();
+        let mut e = ReliableTileEmitter::new(t0);
+        let mut sender = CollectSender::default();
+        assert!(!e.holds_pass(7, 9, 0));
+
+        let key = EmitKey::new(40, 7, 9, 0);
+        e.submit_one(key, fake_source(40, 0, 0xA0), t0, None, t0);
+        e.drain(&mut sender, t0);
+        assert!(e.holds_pass(7, 9, 0));
+        assert!(!e.holds_pass(7, 9, 1), "a different pass of the same tile");
+        assert!(!e.holds_pass(9, 7, 0), "a different tile");
+
+        e.on_ack(&[key]);
+        assert!(!e.holds_pass(7, 9, 0), "acknowledged");
+
+        e.submit_one(key, fake_source(40, 0, 0xA0), t0, None, t0);
+        e.cancel_for_tile(7, 9);
+        assert!(!e.holds_pass(7, 9, 0), "superseded");
+
+        e.submit_one(key, fake_source(40, 0, 0xA0), t0, None, t0);
+        e.clear_cache();
+        assert!(!e.holds_pass(7, 9, 0), "wiped on connection loss");
+
+        e.submit_one(key, fake_source(40, 0, 0xA0), t0, None, t0);
+        e.retire_stuck(t0 + Duration::from_secs(60), Duration::from_secs(30));
+        assert!(!e.holds_pass(7, 9, 0), "retired by age");
     }
 
     #[test]
