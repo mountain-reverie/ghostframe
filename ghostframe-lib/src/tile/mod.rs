@@ -186,6 +186,30 @@ impl TileGrid {
         out
     }
 
+    /// The tile's top-left pixel: what `encode_solid` sends for a uniform
+    /// tile, read in place.
+    ///
+    /// Equal to `encode_solid(&self.extract_tile(..))` by construction,
+    /// including the zero pixel `extract_tile` yields when the source
+    /// buffer is too short to hold the tile's first row.
+    pub fn first_pixel(&self, pixels: &[u8], stride: u32, tile_x: u32, tile_y: u32) -> [u8; 4] {
+        let origin_x = tile_x * TILE_SIZE;
+        let origin_y = tile_y * TILE_SIZE;
+        let copy_w = (self.width.saturating_sub(origin_x)).min(TILE_SIZE);
+        let copy_h = (self.height.saturating_sub(origin_y)).min(TILE_SIZE);
+        let offset = (origin_y * stride + origin_x * BPP) as usize;
+        let row_bytes = (copy_w * BPP) as usize;
+        if copy_w == 0 || copy_h == 0 || offset + row_bytes > pixels.len() {
+            return [0; 4];
+        }
+        [
+            pixels[offset],
+            pixels[offset + 1],
+            pixels[offset + 2],
+            pixels[offset + 3],
+        ]
+    }
+
     /// Iterate all tile coordinates (col, row) in row-major order.
     pub fn iter_coords(&self) -> impl Iterator<Item = (u32, u32)> {
         let cols = self.cols;
@@ -495,5 +519,35 @@ mod tests {
     fn tile_metrics_default_has_already_escalated_false() {
         let m = TileMetrics::default();
         assert!(!m.already_escalated_this_gen);
+    }
+
+    /// `first_pixel` stands in for `encode_solid(extract_tile(..))` on the
+    /// hot path, so it has to agree with it everywhere -- interior tiles,
+    /// the partial tiles on the right and bottom edges, and a buffer too
+    /// short to hold the tile.
+    #[test]
+    fn first_pixel_matches_the_solid_encoding_of_the_extracted_tile() {
+        let (w, h) = (100u32, 70u32); // neither a multiple of 32
+        let stride = w * BPP + 12; // padded rows
+        let mut pixels = vec![0u8; (stride * h) as usize];
+        for (i, b) in pixels.iter_mut().enumerate() {
+            *b = (i as u32).wrapping_mul(2_654_435_761).to_le_bytes()[3];
+        }
+        let grid = TileGrid::new(w, h);
+        for (tx, ty) in grid.iter_coords() {
+            // The second buffer ends 40 bytes into row 32: tile (0,1) has
+            // its first pixel but not its first row, which `extract_tile`
+            // leaves zeroed.
+            let mid_row = (32 * stride + 40) as usize;
+            for buf in [&pixels[..], &pixels[..mid_row], &pixels[..0]] {
+                let tile = grid.extract_tile(buf, stride, tx, ty);
+                assert_eq!(
+                    grid.first_pixel(buf, stride, tx, ty),
+                    crate::encoder::solid::encode_solid(&tile),
+                    "tile ({tx},{ty}), buffer of {} bytes",
+                    buf.len()
+                );
+            }
+        }
     }
 }

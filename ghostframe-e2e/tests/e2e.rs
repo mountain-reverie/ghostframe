@@ -4853,10 +4853,23 @@ async fn e2e_progressive_refinement_firefox() -> Result<()> {
 ///   the default `CAPTURE_FPS=2` yields only ~6 frames per static half,
 ///   too few for Cdf53 classification to fire).
 /// - `GHOSTFRAME_INBOUND_LOSS_PROBABILITY=1.0` + predicate `ack`: drops
-///   every incoming ACK, so all emitted refinement passes accumulate in
-///   the scheduler's `cdf53_in_flight` map. This guarantees `snap_before`
-///   is non-empty when sampled inside a static phase (refinement passes
-///   stay pending forever until `bump_generation` clears them).
+///   every incoming ACK, so every emitted refinement pass stays in flight
+///   for as long as its tile's generation lives. Nothing but a bump can
+///   then take a (tile, gen) out of the snapshot, which is what makes its
+///   disappearance attributable.
+///
+/// What is checked is the transition itself, read from the server's own
+/// log rather than sampled: the snapshot is dumped once per frame, after
+/// the refinement encode and before the dispatch that bumps the tiles
+/// which turned Solid. So for a frame that dispatched the whole screen as
+/// Solid, everything its snapshot listed must be absent from the next
+/// frame's.
+///
+/// It used to sample "the last snapshot" twice, seven seconds apart. That
+/// passed for a reason unrelated to cancellation -- see the comment at the
+/// dump site in `io_bridge.rs` -- and would have passed with cancellation
+/// removed, since a leaked entry is evicted by ordinary traffic within a
+/// second.
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_refinement_cancel() -> Result<()> {
     let _setup = setup_e2e_webgpu_gpu_with_env(
@@ -4871,79 +4884,89 @@ async fn e2e_refinement_cancel() -> Result<()> {
         ],
     )
     .await?;
-    // The t-pattern cycles run on container wall-clock (started at container
-    // init, several seconds before setup() returns), so we can't align a
-    // single sleep to a known cycle moment. Instead poll: wait until the
-    // snapshot contains entries (= we're inside a static phase, refinement
-    // has fired, INBOUND ack loss prevents drain), capture that as
-    // snap_before, then sleep 1 full cycle (6s) so a static→motion flip
-    // (and the bump_generation it triggers) is guaranteed to have happened
-    // before reading snap_after.
-    tokio::time::sleep(Duration::from_secs(8)).await; // baseline settle
-    let mut snap_before: Vec<(u8, u8, u8, u8)> = Vec::new();
-    for _ in 0..30 {
-        let logs = helpers::read_server_logs_stripped("ghostframe-server");
-        let snap = parse_last_pending_snapshot(&logs);
-        if !snap.is_empty() {
-            snap_before = snap;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+    // Three full 6 s cycles: at least two static->motion flips whatever
+    // phase the pattern was in when setup returned.
+    tokio::time::sleep(Duration::from_secs(18)).await;
+    let logs = helpers::read_server_logs_stripped("ghostframe-server");
+
+    // 1920x1080 in 32 px tiles. A frame that sent this many Solid tiles and
+    // no Cdf53 ones bumped every tile on the screen.
+    const FULL_SCREEN_TILES: u32 = 2040;
+    let field = |line: &str, name: &str| -> Option<u32> {
+        let at = line.find(name)? + name.len();
+        let digits: String = line[at..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        digits.parse().ok()
+    };
+
+    struct Frame {
+        /// The snapshot dumped in this frame, before its dispatch.
+        pending: Vec<(u8, u8, u8, u8)>,
+        /// Whether that dispatch then bumped every tile on the screen.
+        bumped_everything: bool,
     }
-    eprintln!(
-        "BEFORE flip: {} (tile,gen) entries with pending refinement",
-        snap_before.len()
-    );
+    let mut frames: Vec<Frame> = Vec::new();
+    for line in logs.lines() {
+        if line.contains("cdf53.pending_snapshot") {
+            frames.push(Frame {
+                pending: parse_pending_snapshot_line(line),
+                bumped_everything: false,
+            });
+        } else if line.contains("process_frame_gpu: dispatch returned") {
+            if let Some(frame) = frames.last_mut() {
+                frame.bumped_everything = field(line, "codec_solid=") == Some(FULL_SCREEN_TILES)
+                    && field(line, "codec_cdf53=") == Some(0);
+            }
+        }
+    }
 
-    // Wait > 1 full cycle so motion-phase bump_generation is guaranteed in
-    // between the two samples (cycle = 6s; 7s buffer).
-    tokio::time::sleep(Duration::from_secs(7)).await;
-    let logs_after = helpers::read_server_logs_stripped("ghostframe-server");
-    let snap_after = parse_last_pending_snapshot(&logs_after);
-    eprintln!(
-        "AFTER flip: {} (tile,gen) entries with pending refinement",
-        snap_after.len()
-    );
-
-    // For every (tile, gen) that had pending passes BEFORE the flip:
-    //   assert that same (tile, gen) is NOT in snap_after.
-    // (A new entry with the same tile but a NEW gen is allowed.)
+    let mut flips = 0usize;
     let mut cancelled = 0usize;
-    let mut leaked = Vec::new();
-    for entry in &snap_before {
-        let same_gen_after = snap_after
-            .iter()
-            .find(|e| e.0 == entry.0 && e.1 == entry.1 && e.2 == entry.2);
-        if let Some(_still_pending) = same_gen_after {
-            leaked.push(*entry);
-        } else {
-            cancelled += 1;
+    let mut leaked: Vec<(u8, u8, u8, u8)> = Vec::new();
+    for pair in frames.windows(2) {
+        let (before, after) = (&pair[0].pending, &pair[1].pending);
+        if before.is_empty() || !pair[0].bumped_everything {
+            continue;
+        }
+        flips += 1;
+        for entry in before {
+            let survived = after
+                .iter()
+                .any(|e| e.0 == entry.0 && e.1 == entry.1 && e.2 == entry.2);
+            if survived {
+                leaked.push(*entry);
+            } else {
+                cancelled += 1;
+            }
         }
     }
     eprintln!(
-        "Cancelled (tile, gen) pairs: {cancelled}; leaked: {:?}",
-        leaked
+        "{} frames, {flips} static->motion flips, {cancelled} (tile, gen) pairs cancelled, {} leaked",
+        frames.len(),
+        leaked.len()
     );
 
     assert!(
-        !snap_before.is_empty(),
-        "snapshot BEFORE was empty — refinement wasn't in flight when sampled. Tighten timing."
+        flips >= 1 && cancelled >= 1,
+        "premise: no frame bumped the whole screen while refinement was in \
+         flight ({} frames logged, {flips} flips) -- the pattern did not \
+         produce a static->motion transition with Cdf53 pending",
+        frames.len()
     );
     assert!(
         leaked.is_empty(),
         "{} old-gen pending entries survived the bump_generation: {:?}",
         leaked.len(),
-        leaked,
+        &leaked[..leaked.len().min(16)],
     );
     Ok(())
 }
 
-/// Parse the LAST `cdf53.pending_snapshot [...]` log line into a list of
-/// (tile_x, tile_y, gen, passes_remaining) tuples. Returns empty Vec if
-/// no such line is present in the log slice.
-fn parse_last_pending_snapshot(logs: &str) -> Vec<(u8, u8, u8, u8)> {
-    let line = logs.lines().rfind(|l| l.contains("cdf53.pending_snapshot"));
-    let Some(line) = line else { return Vec::new() };
+/// Parse one `cdf53.pending_snapshot [...]` log line into a list of
+/// (tile_x, tile_y, gen, passes_remaining) tuples.
+fn parse_pending_snapshot_line(line: &str) -> Vec<(u8, u8, u8, u8)> {
     // Format: "... cdf53.pending_snapshot [(tx, ty, g, n), (tx, ty, g, n), ...]"
     let open = match line.find('[') {
         Some(i) => i,

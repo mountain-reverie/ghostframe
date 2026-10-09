@@ -2383,10 +2383,14 @@ impl IoBridge {
                     }
                 }
             }
-            let tile_data = grid.extract_tile(pixels, stride, tile_x, tile_y);
+            // Copied out only by the arms that send the pixels. Solid needs
+            // one pixel and PalRle arrives already encoded, and on a
+            // full-screen change this 4 KB copy per tile was most of what
+            // the loop cost once the bookkeeping above stopped scanning.
+            let extract_tile = || grid.extract_tile(pixels, stride, tile_x, tile_y);
 
             let (codec, payload) = match policy {
-                SchedulerEmissionPolicy::CpuRawOnly => (Codec::Raw, tile_data),
+                SchedulerEmissionPolicy::CpuRawOnly => (Codec::Raw, extract_tile()),
                 SchedulerEmissionPolicy::GpuClassifierDriven => {
                     use crate::tile::CodecState;
                     // Cdf53 tiles were already skipped above (before bump_generation);
@@ -2394,7 +2398,7 @@ impl IoBridge {
                     let codec_state = self.metrics_tracker.get(tile_x, tile_y).codec_state;
                     match codec_state {
                         CodecState::Solid => {
-                            let solid = crate::encoder::solid::encode_solid(&tile_data);
+                            let solid = grid.first_pixel(pixels, stride, tile_x, tile_y);
                             (Codec::Solid, solid.to_vec())
                         }
                         CodecState::PalRle { .. } => {
@@ -2405,7 +2409,7 @@ impl IoBridge {
                             };
                             match payload {
                                 Some(p) => (Codec::PalRle, p),
-                                None => (Codec::Raw, tile_data), // table-full fallback or no GPU prep
+                                None => (Codec::Raw, extract_tile()), // table-full fallback or no GPU prep
                             }
                         }
                         // Raw is the encoder of last resort: these states
@@ -2418,7 +2422,7 @@ impl IoBridge {
                         CodecState::H264 { .. }
                         | CodecState::Cdf53 { .. }
                         | CodecState::PixelPerfect
-                        | CodecState::Skip => (Codec::Raw, tile_data),
+                        | CodecState::Skip => (Codec::Raw, extract_tile()),
                     }
                 }
             };
@@ -5189,13 +5193,16 @@ impl IoBridge {
 
                 #[cfg(feature = "cdf53-diag")]
                 if self.diagnostics.cdf53_dump_pending {
-                    // The retransmit-cache role of fragment_coverage moved to
-                    // ReliableTileEmitter (Tasks 25-27); pass an empty slice
-                    // here so the snapshot only reflects scheduler-side queue
-                    // state. The metadata-sidecar role of fragment_coverage
-                    // is being retired in a follow-up task (see
-                    // fragment_coverage.rs module-level doc).
-                    let snap = self.scheduler.pending_refinement_snapshot(&[]);
+                    // Queued passes *and* emitted-but-unacknowledged ones.
+                    // This used to pass an empty slice for the second, which
+                    // left the snapshot showing only what had not been sent
+                    // yet -- a set that empties within a frame or two of
+                    // being filled, whether or not a bump cancelled
+                    // anything. `e2e_refinement_cancel` kept passing only
+                    // because slow tile frames pushed the server into H.264,
+                    // where this dump stops and its last line stays put.
+                    let in_flight = self.fragment_coverage.snapshot();
+                    let snap = self.scheduler.pending_refinement_snapshot(&in_flight);
                     tracing::info!(
                         target: "ghostframe::cdf53::diff",
                         "cdf53.pending_snapshot {:?}",
@@ -5229,6 +5236,10 @@ impl IoBridge {
                     "process_frame_gpu: about to dispatch"
                 );
 
+                // Real CPU time, deliberately not `now_std()`: this is what
+                // the frame cost the encode thread, which a paused tokio
+                // clock would report as zero.
+                let dispatch_started = std::time::Instant::now();
                 let stats = self.dispatch_dirty_tiles_via_scheduler(
                     &dirty_xy,
                     &grid,
@@ -5254,8 +5265,16 @@ impl IoBridge {
                 // stats log block is silencing execution. If neither fires,
                 // dispatch_dirty_tiles_via_scheduler is panicking/returning
                 // through an unwind.
+                // `dispatch_us` is here because its absence hid a quadratic:
+                // tile mode was spending 83 ms a frame on bookkeeping for
+                // tiles the cost model prices at 0.05 us each, and nothing
+                // in the log said where a frame's time went.
+                let dispatch_us = std::time::Instant::now()
+                    .duration_since(dispatch_started)
+                    .as_micros() as u64;
                 tracing::debug!(
                     frame_seq = seq,
+                    dispatch_us = dispatch_us,
                     dispatched_tiles = stats.tile_count,
                     wire_bytes = stats.total_wire_bytes,
                     codec_solid = stats.codec_histogram.solid,
@@ -11145,5 +11164,86 @@ mod tests {
         bridge.on_timeout(debounce_elapsed_us());
 
         assert_eq!(ctl.outputs(), vec![(1280, 800, 1500)]);
+    }
+
+    /// A full-screen change must cost in proportion to the screen.
+    ///
+    /// Every tile dirty on every frame, nothing acknowledged: the state a
+    /// scrolling or animating desktop puts the bridge in on a link slower
+    /// than the content. Three pieces of per-tile bookkeeping each scanned a
+    /// whole-session structure here (the retransmit cache, the scheduler
+    /// queues, the coverage map), so the frame cost grew with the *square*
+    /// of the tile count: 40-70 ms at 1080p, 0.5 s at 4K, 1.7 s across two
+    /// 4K displays, against a 33 ms frame. Measured after: 0.65 ms, 1.75 ms
+    /// and 3.2 ms.
+    ///
+    /// Asserted as a ratio between two screen sizes rather than as a
+    /// duration, so it holds in a debug build on a loaded machine. Eight
+    /// times the tiles is 8x the work if the path is linear and 64x if it
+    /// is quadratic; the old code measured 31x here and the fix 5x.
+    ///
+    /// For absolute numbers:
+    /// `cargo test --release -p ghostframe-lib full_screen_change -- --nocapture`
+    #[tokio::test]
+    async fn full_screen_change_costs_in_proportion_to_the_screen() {
+        async fn best_frame_us(w: u32, h: u32) -> (usize, u128) {
+            let (our_end, _peer) = UnixStream::pair().expect("pair");
+            let server = QuicServer::new().expect("server");
+            let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+            let grid = crate::tile::TileGrid::new(w, h);
+            bridge.metrics_tracker.resize(grid.cols, grid.rows);
+            let mut dirty = Vec::new();
+            for y in 0..grid.rows {
+                for x in 0..grid.cols {
+                    bridge.metrics_tracker.get_mut(x, y).codec_state =
+                        crate::tile::CodecState::Solid;
+                    dirty.push((x, y));
+                }
+            }
+            let pixels = vec![0x40u8; (w * h * 4) as usize];
+            let mut best = u128::MAX;
+            // The first frame is excluded: it runs against empty state,
+            // which is the one case the scans were cheap in.
+            for seq in 0..10u32 {
+                let t = std::time::Instant::now();
+                let _ = bridge.dispatch_dirty_tiles_via_scheduler(
+                    &dirty,
+                    &grid,
+                    TileDispatchFrame {
+                        pixels: &pixels,
+                        stride: w * 4,
+                        seq,
+                        timestamp_us: seq * 33_333,
+                    },
+                    1200,
+                    SchedulerEmissionPolicy::GpuClassifierDriven,
+                    None,
+                );
+                let spent = std::time::Instant::now().duration_since(t);
+                if seq > 0 {
+                    best = best.min(spent.as_micros());
+                }
+            }
+            assert_eq!(
+                bridge.scheduler.queue_len(),
+                dirty.len(),
+                "premise: the link is slower than the screen, so a backlog \
+                 of one item per tile is what each frame has to supersede"
+            );
+            (dirty.len(), best)
+        }
+
+        let (small_tiles, small) = best_frame_us(1920, 1080).await;
+        let (_, mid) = best_frame_us(3840, 2160).await;
+        let (large_tiles, large) = best_frame_us(7680, 2160).await;
+        eprintln!("full-screen dirty frame: 1080p {small} us, 4K {mid} us, 2x4K {large} us");
+        assert_eq!(large_tiles, 8 * small_tiles);
+        assert!(
+            large <= 16 * small.max(1),
+            "8x the tiles cost {large} us against {small} us ({}x): the \
+             dirty-tile path is no longer linear in the screen",
+            large / small.max(1)
+        );
     }
 }

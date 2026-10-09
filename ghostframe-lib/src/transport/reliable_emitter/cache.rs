@@ -74,6 +74,23 @@ pub struct RetransmitCache {
     /// Last-write-wins: emission is chronological, so the newest entry for a
     /// `(tile, pass)` is the one worth resending.
     by_content: HashMap<(u8, u8, u8), EmitKey>,
+    /// `(tile_x, tile_y) -> every cached EmitKey for that tile`.
+    ///
+    /// `cancel_for_tile` runs once per dirty tile per frame. Finding a
+    /// tile's entries by scanning `entries` made a full-screen change cost
+    /// tiles x cache-size key comparisons -- quadratic in the screen, since
+    /// the cache holds a few entries per tile -- which is what made tile
+    /// mode take tens of milliseconds a frame at 1080p and seconds at 4K.
+    ///
+    /// A tile holds one entry per unacknowledged pass, so the per-tile list
+    /// is a handful of keys and removing one from it is a short scan.
+    by_tile: HashMap<(u8, u8), SmallVec<[EmitKey; 4]>>,
+    /// Running total behind `bytes_outstanding`, which is read on every ACK
+    /// datagram and used to sum the whole cache each time. Fragments are
+    /// immutable once cached, so the total only moves on insert and removal.
+    bytes: usize,
+    #[cfg(test)]
+    pub(crate) keys_examined: std::cell::Cell<u64>,
     pub stats: CacheStats,
 }
 
@@ -94,6 +111,10 @@ impl RetransmitCache {
             entries: HashMap::new(),
             lru: LruCache::new(NonZeroUsize::new(CACHE_CAPACITY).unwrap()),
             by_content: HashMap::new(),
+            by_tile: HashMap::new(),
+            bytes: 0,
+            #[cfg(test)]
+            keys_examined: std::cell::Cell::new(0),
             stats: CacheStats::default(),
         }
     }
@@ -110,11 +131,31 @@ impl RetransmitCache {
     /// equivalent number as `TransportPacketsFeedback::data_in_flight`, and
     /// fed zero it has nothing to push back against.
     pub fn bytes_outstanding(&self) -> usize {
-        self.entries
-            .values()
-            .flat_map(|e| e.fragments.iter())
-            .map(|f| f.len())
-            .sum()
+        self.bytes
+    }
+
+    fn entry_bytes(entry: &CacheEntry) -> usize {
+        entry.fragments.iter().map(|f| f.len()).sum()
+    }
+
+    /// Take `key` out of every index and return its entry. The one place an
+    /// entry leaves the cache, so the indexes cannot drift from `entries`.
+    fn evict(&mut self, key: &EmitKey) -> Option<CacheEntry> {
+        let entry = self.entries.remove(key)?;
+        self.bytes -= Self::entry_bytes(&entry);
+        self.lru.pop(key);
+        self.forget_content(key);
+        let tile = (key.tile_x, key.tile_y);
+        if let Some(keys) = self.by_tile.get_mut(&tile) {
+            #[cfg(test)]
+            self.keys_examined
+                .set(self.keys_examined.get() + keys.len() as u64);
+            keys.retain(|k| k != key);
+            if keys.is_empty() {
+                self.by_tile.remove(&tile);
+            }
+        }
+        Some(entry)
     }
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
@@ -135,7 +176,16 @@ impl RetransmitCache {
         self.lru.put(key, ());
         self.by_content
             .insert((key.tile_x, key.tile_y, key.pass_idx), key);
-        self.entries.insert(key, entry);
+        self.bytes += Self::entry_bytes(&entry);
+        match self.entries.insert(key, entry) {
+            // Same key cached again: already indexed under its tile.
+            Some(replaced) => self.bytes -= Self::entry_bytes(&replaced),
+            None => self
+                .by_tile
+                .entry((key.tile_x, key.tile_y))
+                .or_default()
+                .push(key),
+        }
     }
 
     /// The newest cached `EmitKey` for this tile-pass, whatever frame it was
@@ -173,24 +223,24 @@ impl RetransmitCache {
     }
 
     pub fn remove(&mut self, key: &EmitKey) -> Option<CacheEntry> {
-        self.lru.pop(key);
-        self.forget_content(key);
-        self.entries.remove(key)
+        self.evict(key)
     }
 
     /// Drop every entry matching `(tile_x, tile_y)` across all frame_seq /
     /// pass_idx. Used by bump_generation supersession.
     pub fn cancel_for_tile(&mut self, tile_x: u8, tile_y: u8) {
-        let drop: Vec<EmitKey> = self
-            .entries
-            .keys()
-            .filter(|k| k.tile_x == tile_x && k.tile_y == tile_y)
-            .copied()
-            .collect();
-        for k in &drop {
+        let Some(keys) = self.by_tile.remove(&(tile_x, tile_y)) else {
+            return;
+        };
+        #[cfg(test)]
+        self.keys_examined
+            .set(self.keys_examined.get() + keys.len() as u64);
+        for k in &keys {
+            if let Some(entry) = self.entries.remove(k) {
+                self.bytes -= Self::entry_bytes(&entry);
+            }
             self.lru.pop(k);
             self.forget_content(k);
-            self.entries.remove(k);
         }
     }
 
@@ -221,15 +271,15 @@ impl RetransmitCache {
             .map(|(k, _)| *k)
             .collect();
         for k in &stale {
-            self.entries.remove(k);
-            self.lru.pop(k);
-            self.forget_content(k);
+            self.evict(k);
         }
         stale
     }
 
     pub fn clear(&mut self) {
         self.by_content.clear();
+        self.by_tile.clear();
+        self.bytes = 0;
         self.entries.clear();
         // LruCache has no clear(); rebuild it.
         self.lru = LruCache::new(NonZeroUsize::new(CACHE_CAPACITY).unwrap());
@@ -239,9 +289,7 @@ impl RetransmitCache {
     /// across any frame_seq / pass_idx. Used by io_bridge's stuck-tile
     /// resweep to skip tiles the emitter is still actively retransmitting.
     pub fn has_entries_for_tile(&self, tile_x: u8, tile_y: u8) -> bool {
-        self.entries
-            .keys()
-            .any(|k| k.tile_x == tile_x && k.tile_y == tile_y)
+        self.by_tile.contains_key(&(tile_x, tile_y))
     }
 }
 
@@ -396,5 +444,101 @@ mod tests {
         c.clear();
         assert_eq!(c.len(), 0);
         assert!(c.is_empty());
+    }
+
+    /// `cancel_for_tile` runs once per dirty tile per frame, so what it
+    /// costs per call decides whether a full-screen change is linear or
+    /// quadratic in the screen. It must touch the tile's own entries only.
+    #[test]
+    fn cancelling_a_tile_does_not_examine_other_tiles_entries() {
+        fn examined_with_other_tiles(others: u32) -> u64 {
+            let now = Instant::now();
+            let mut c = RetransmitCache::new();
+            for pass in 0..3u8 {
+                c.insert(EmitKey::new(1, 0, 0, pass), mk_entry(now));
+            }
+            for i in 0..others {
+                let (x, y) = (1 + (i % 200) as u8, (i / 200) as u8);
+                c.insert(EmitKey::new(1, x, y, 0), mk_entry(now));
+            }
+            c.keys_examined.set(0);
+            c.cancel_for_tile(0, 0);
+            assert_eq!(c.len(), others as usize, "only tile (0,0) is cancelled");
+            c.keys_examined.get()
+        }
+
+        let few = examined_with_other_tiles(4);
+        let many = examined_with_other_tiles(16_000);
+        // Absolute as well as relative: a counter stuck at zero would pass
+        // the comparison alone.
+        assert_eq!(few, 3, "the tile's three entries, and nothing else");
+        assert_eq!(
+            many, few,
+            "cancel_for_tile examined {many} keys with 16,000 other tiles \
+             cached versus {few} with 4 -- it is scanning the cache"
+        );
+    }
+
+    /// Same property for the acknowledgement path, which removes one entry.
+    #[test]
+    fn removing_an_entry_does_not_examine_other_tiles_entries() {
+        let now = Instant::now();
+        let mut c = RetransmitCache::new();
+        for i in 0..16_000u32 {
+            let (x, y) = ((i % 200) as u8, (i / 200) as u8);
+            c.insert(EmitKey::new(1, x, y, 0), mk_entry(now));
+            c.insert(EmitKey::new(1, x, y, 1), mk_entry(now));
+        }
+        c.keys_examined.set(0);
+        assert!(c.remove(&EmitKey::new(1, 7, 7, 1)).is_some());
+        assert_eq!(c.keys_examined.get(), 2, "the tile's own two entries");
+    }
+
+    /// Every way an entry can leave has to leave every index. A tile index
+    /// that kept a departed key would report the tile as still held -- and
+    /// the stranded-tile detector skips exactly those tiles, forever.
+    #[test]
+    fn the_tile_index_and_byte_total_follow_every_way_out() {
+        let t0 = Instant::now();
+        let mut c = RetransmitCache::new();
+        let acked = EmitKey::new(1, 1, 1, 0);
+        let retired = EmitKey::new(1, 2, 2, 0);
+        let cancelled = EmitKey::new(1, 3, 3, 0);
+        let kept = EmitKey::new(1, 4, 4, 0);
+        c.insert(acked, mk_entry(t0 + Duration::from_secs(100)));
+        c.insert(retired, mk_entry(t0));
+        c.insert(cancelled, mk_entry(t0 + Duration::from_secs(100)));
+        c.insert(kept, mk_entry(t0 + Duration::from_secs(100)));
+        // Caching the same key again replaces it; it must not be counted or
+        // indexed twice.
+        c.insert(kept, mk_entry(t0 + Duration::from_secs(100)));
+        assert_eq!(c.bytes_outstanding(), 12);
+
+        c.remove(&acked);
+        assert_eq!(
+            c.retire_older_than(t0 + Duration::from_secs(101), Duration::from_secs(50)),
+            vec![retired]
+        );
+        c.cancel_for_tile(3, 3);
+
+        for gone in [acked, retired, cancelled] {
+            assert!(!c.has_entries_for_tile(gone.tile_x, gone.tile_y));
+            assert!(c.lookup_content(gone.tile_x, gone.tile_y, 0).is_none());
+        }
+        assert!(c.has_entries_for_tile(4, 4));
+        assert_eq!(c.len(), 1);
+        assert_eq!(c.bytes_outstanding(), 3);
+
+        c.remove(&kept);
+        assert!(
+            !c.has_entries_for_tile(4, 4),
+            "one removal clears a twice-cached key"
+        );
+        assert_eq!(c.bytes_outstanding(), 0);
+
+        c.insert(kept, mk_entry(t0));
+        c.clear();
+        assert!(!c.has_entries_for_tile(4, 4));
+        assert_eq!(c.bytes_outstanding(), 0);
     }
 }

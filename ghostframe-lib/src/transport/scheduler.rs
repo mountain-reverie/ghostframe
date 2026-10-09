@@ -128,6 +128,10 @@ pub struct Scheduler {
     /// to the old O(n) scan.
     #[cfg(test)]
     pub(crate) mark_acked_comparisons: std::cell::Cell<u64>,
+    /// Work items examined by `bump_generation_collecting`; same contract
+    /// as `mark_acked_comparisons`.
+    #[cfg(test)]
+    pub(crate) bump_comparisons: std::cell::Cell<u64>,
 }
 
 impl Scheduler {
@@ -148,6 +152,8 @@ impl Scheduler {
             slots: SlotMap::new(cols, rows),
             #[cfg(test)]
             mark_acked_comparisons: std::cell::Cell::new(0),
+            #[cfg(test)]
+            bump_comparisons: std::cell::Cell::new(0),
         }
     }
 
@@ -604,10 +610,15 @@ impl Scheduler {
     /// Like `bump_generation` but returns the work that was superseded so
     /// callers can update downstream state (e.g. `PaletteTable::in_flight_carrying`).
     ///
-    /// Safe to call `bump_generation` internally after pre-marking entries
-    /// `Superseded`: `bump_generation`'s loop skips entries already in
-    /// `Superseded` or `Acked` state. If that guard ever changes, this
-    /// function's safety needs re-verification.
+    /// Finds the tile's work through its slot, not by walking the queues.
+    /// This runs once per dirty tile per frame, and the queues hold a
+    /// backlog of roughly one item per tile whenever the link is slower than
+    /// the screen, so a queue walk made a full-screen change quadratic in
+    /// the number of tiles. Every live item is reachable from its slot:
+    /// `enqueue*` files it there and supersedes whatever the slot held.
+    ///
+    /// The superseded items stay in their queue, marked, until the next
+    /// tick drops them -- as with plain `bump_generation`.
     #[must_use = "ResolvedTileWork is needed by IoBridge to update palette delivery state on supersession"]
     pub fn bump_generation_collecting(
         &mut self,
@@ -615,73 +626,40 @@ impl Scheduler {
         tile_y: u8,
     ) -> (u8, Vec<ResolvedTileWork>) {
         let mut resolved: Vec<ResolvedTileWork> = Vec::new();
-        {
-            let Scheduler {
-                work,
-                priority_order,
-                refinement_order,
-                ..
-            } = self;
-            for &h in priority_order
-                .iter()
-                .chain(refinement_order.iter().flatten())
-            {
-                if let Some(entry) = work.get_mut(h) {
-                    if entry.tile_x == tile_x
-                        && entry.tile_y == tile_y
-                        && entry.state != WorkState::Acked
-                        && entry.state != WorkState::Superseded
-                    {
-                        let palette_id = if entry.codec == Codec::PalRle {
-                            debug_assert!(
-                                entry.payload.len() >= 2,
-                                "PalRle TileWork has malformed payload: {} bytes",
-                                entry.payload.len()
-                            );
-                            entry.payload.get(1).copied()
-                        } else {
-                            None
-                        };
-                        resolved.push(ResolvedTileWork {
-                            tile_x,
-                            tile_y,
-                            generation: entry.generation,
-                            pass: entry.pass_idx,
-                            codec: entry.codec,
-                            palette_id,
-                            via_ack: false,
-                        });
-                        entry.state = WorkState::Superseded;
-                    }
-                }
+        for p in 0..PASS_SLOTS as u8 {
+            let Some(h) = self.slots.handle(tile_x, tile_y, p) else {
+                continue;
+            };
+            let Some(entry) = self.work.get_mut(h) else {
+                continue;
+            };
+            #[cfg(test)]
+            self.bump_comparisons.set(self.bump_comparisons.get() + 1);
+            if !matches!(entry.state, WorkState::Pending | WorkState::InFlight) {
+                continue;
             }
-        }
-        let new_gen = self.bump_generation(tile_x, tile_y);
-        let Scheduler {
-            work,
-            priority_order,
-            refinement_order,
-            ..
-        } = self;
-        priority_order.retain(|&h| match work.get(h) {
-            Some(w) if w.state == WorkState::Superseded => {
-                work.remove(h);
-                false
-            }
-            Some(_) => true,
-            None => false,
-        });
-        for bucket in refinement_order.iter_mut() {
-            bucket.retain(|&h| match work.get(h) {
-                Some(w) if w.state == WorkState::Superseded => {
-                    work.remove(h);
-                    false
-                }
-                Some(_) => true,
-                None => false,
+            let palette_id = if entry.codec == Codec::PalRle {
+                debug_assert!(
+                    entry.payload.len() >= 2,
+                    "PalRle TileWork has malformed payload: {} bytes",
+                    entry.payload.len()
+                );
+                entry.payload.get(1).copied()
+            } else {
+                None
+            };
+            resolved.push(ResolvedTileWork {
+                tile_x,
+                tile_y,
+                generation: entry.generation,
+                pass: entry.pass_idx,
+                codec: entry.codec,
+                palette_id,
+                via_ack: false,
             });
+            entry.state = WorkState::Superseded;
         }
-        (new_gen, resolved)
+        (self.slots.bump_generation(tile_x, tile_y), resolved)
     }
 
     /// Drain the queues per the M3.3a scheduling rule:
@@ -1456,6 +1434,66 @@ mod tests {
         assert_eq!(resolved[0].codec, Codec::PalRle);
         assert_eq!(resolved[0].palette_id, Some(9));
         assert!(!resolved[0].via_ack);
+    }
+
+    /// `bump_generation_collecting` runs once per dirty tile per frame, and
+    /// on a link slower than the screen the queue holds about one item per
+    /// tile. Walking the queue there made a full-screen change quadratic in
+    /// the number of tiles: 40-70 ms a frame at 1080p, seconds at 4K.
+    #[test]
+    fn bump_collecting_cost_does_not_grow_with_queue_depth() {
+        fn comparisons_with_queue_depth(depth: u16) -> u64 {
+            let mut s = Scheduler::new(200, 100);
+            let now = Instant::now();
+            for i in 0..depth {
+                let (x, y) = ((i % 200) as u8, (i / 200) as u8);
+                s.enqueue_at(TileWork::raw_for_test(x, y, 0, vec![0u8; 8]), now);
+            }
+            // The tile enqueued last: worst case for a front-to-back walk.
+            let last = depth - 1;
+            s.bump_comparisons.set(0);
+            let (_, resolved) =
+                s.bump_generation_collecting((last % 200) as u8, (last / 200) as u8);
+            assert_eq!(resolved.len(), 1, "the tile's own work is reported");
+            s.bump_comparisons.get()
+        }
+
+        let shallow = comparisons_with_queue_depth(4);
+        let deep = comparisons_with_queue_depth(16_000);
+        assert_eq!(shallow, 1, "one item is queued for the tile");
+        assert_eq!(
+            deep, shallow,
+            "bump_generation_collecting examined {deep} work items at depth \
+             16,000 versus {shallow} at depth 4 -- it is walking the queue"
+        );
+    }
+
+    /// The bump no longer edits the queues, so the tick has to be what
+    /// keeps superseded work off the wire and out of memory -- for both
+    /// queues, and for work that was already in flight.
+    #[test]
+    fn work_superseded_by_a_collecting_bump_is_dropped_by_the_next_tick() {
+        let mut s = Scheduler::new(4, 4);
+        s.enqueue(TileWork::raw_for_test(0, 0, 0, vec![1; 8])); // will be in flight
+        let _ = s.tick(usize::MAX);
+        s.enqueue_refinement(1, 0, 0, vec![vec![2; 8], vec![3; 8]]);
+        s.enqueue(TileWork::raw_for_test(2, 0, 0, vec![4; 8])); // untouched
+
+        let (_, in_flight) = s.bump_generation_collecting(0, 0);
+        let (_, refining) = s.bump_generation_collecting(1, 0);
+        assert_eq!(in_flight.len(), 1);
+        assert_eq!(refining.len(), 2, "both queued passes are reported");
+        assert!(!s.refinement_queue_holds_tile(1, 0));
+
+        let out = s.tick(usize::MAX);
+        let sent: Vec<(u8, u8)> = out.iter().map(|w| (w.tile_x, w.tile_y)).collect();
+        assert_eq!(sent, vec![(2, 0)], "only the tile nobody bumped is sent");
+        assert_eq!(s.queue_len(), 1);
+        assert_eq!(s.refinement_queue_len(), 0);
+
+        // A second bump finds nothing left to supersede.
+        let (_, again) = s.bump_generation_collecting(0, 0);
+        assert!(again.is_empty());
     }
 
     #[test]
