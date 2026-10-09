@@ -4687,33 +4687,36 @@ async fn e2e_cdf53_server_gpu_vs_cpu_diff() -> Result<()> {
 ///   the SSIM convergence claim measure H.264 steady-state rather than CDF
 ///   5/3 refinement (test would pass tautologically).
 ///
-/// Timing: the t-pattern's cycle clock starts at container init, not at
-/// `setup()` return, so a fixed sleep cannot reliably land in a static
-/// half. Instead the test baseline-settles 8 s and then polls server logs
-/// for the first `cdf53.pixelperfect` line — that line fires when all 14
-/// refinement passes for a tile have been ACKed, which only happens
-/// inside a static phase once refinement has reached its terminal state.
-/// Sampling SSIM from that moment captures the steady-state lossless
-/// frame and is robust to cycle alignment.
+/// # Timing
+///
+/// The t-pattern's cycle clock starts at container init, so where in the
+/// 12 s static / 12 s motion cycle the client connects is not under the
+/// test's control. Nothing here may assume a schedule.
+///
+/// It used to: settle 8 s, wait for any `cdf53.emit`, sleep 7 s, sample.
+/// The 7 s was sized on refinement being "still climbing 5 s after first
+/// emit". That figure was itself a symptom. The scheduler was re-sending
+/// every un-acknowledged tile on every frame (see
+/// `Scheduler::set_retry_after`), the browser was buried, and refinement
+/// took seconds to land. With that fixed a static half converges in about
+/// one second -- 720 PixelPerfect transitions at connect + 1 s -- and a
+/// sample taken 15 s after setup falls in the motion half whenever the
+/// client happened to connect early in a static one, which reads as
+/// "canvas is not stable". The test passed while the product was slow
+/// enough to match its sleep.
+///
+/// So the sample window is found, not scheduled: poll until the canvas has
+/// held still for three consecutive pairs, for up to more than one full
+/// cycle. Motion never produces that; a converged static half does within a
+/// second or two of starting.
 async fn e2e_progressive_refinement_body<B: helpers::BrowserSession>(
     browser: &mut B,
 ) -> Result<()> {
-    // The t-pattern cycles run on container wall-clock (started at container
-    // init, several seconds before setup() returns). Rather than try to align
-    // a fixed sleep to a known cycle moment, baseline-settle 8 s then poll
-    // for the first `cdf53.emit` line — that signals the classifier exited
-    // H264 and Cdf53 Phase B is firing in a static phase. Refinement passes
-    // typically complete within ~100 ms at 30 fps on a single static stripe,
-    // so a brief settle after the first emit gives SSIM time to stabilize.
-    //
-    // M3.3d: ACK plumbing is now wired end-to-end. The AckBatcher in the
-    // WebGPU client sends per-tile-pass ACKs on datagram receipt; the server
-    // dispatches them via dispatch_ack_datagram → record_cdf53_ack, and the
-    // PixelPerfect sweep fires once all 14 passes for a tile are ACKed.
-    // This test now also asserts pp_count > 0 (see end of test).
-    tokio::time::sleep(Duration::from_secs(8)).await;
+    // Premise: refinement fires at all. Without a `cdf53.emit` the classifier
+    // never left H264 (or never chose Cdf53) and a stable canvas below would
+    // be H.264 steady state, not CDF 5/3 convergence.
     let mut refinement_active = false;
-    for _ in 0..40 {
+    for _ in 0..60 {
         let logs = helpers::read_server_logs_stripped("ghostframe-server");
         if logs.lines().any(|l| l.contains("cdf53.emit")) {
             refinement_active = true;
@@ -4723,81 +4726,85 @@ async fn e2e_progressive_refinement_body<B: helpers::BrowserSession>(
     }
     assert!(
         refinement_active,
-        "no `cdf53.emit` log lines in 28 s of polling — refinement never \
+        "no `cdf53.emit` log lines in 30 s of polling — refinement never \
          fired, so the test cannot validate convergence. Check classifier \
          exit-sustain, that CAPTURE_FPS=30 is in effect inside the container, \
          and that the gradient stripe in the static half is classifying as \
          Cdf53 (Rule 8 fallback)."
     );
-    // Generous settle so all 14 passes finish emitting + crossing the
-    // network + integrating into the client WebGPU coefficient buffer +
-    // re-running the inverse wavelet for the affected tiles. Empirical
-    // observation: at 30 fps with 660+ Cdf53 tiles in the gradient stripe,
-    // pairwise SSIM is still climbing 5 s after first emit; extends to
-    // ~0.999 by ~7 s. The 7 s budget fits easily inside the 12 s static
-    // half (cycle 12 setup).
-    tokio::time::sleep(Duration::from_secs(7)).await;
 
-    // Capture 4 consecutive snapshots ~400 ms apart inside the post-emit
-    // settle window. They should all match each other very closely (steady-
-    // state, refinement-converged). This is robust to cross-run wall-clock
-    // alignment (no golden needed) and directly tests the convergence
-    // contract: refinement passes have rendered into the client canvas and
-    // subsequent captures are stable (no further visible change).
-    let mut snapshots: Vec<image::RgbaImage> = Vec::new();
-    let static_start = tokio::time::Instant::now();
-    let mut snapshot_times: Vec<u64> = Vec::new();
-    for _ in 0..4 {
-        let elapsed_ms = (tokio::time::Instant::now() - static_start).as_millis() as u64;
-        let png = browser.screenshot().await?;
-        snapshots.push(helpers::decode_screenshot(&png)?);
-        snapshot_times.push(elapsed_ms);
-        tokio::time::sleep(Duration::from_millis(400)).await;
-    }
-
-    // Pairwise SSIM between adjacent snapshots.
-    let mut pair_ssims: Vec<(u64, u64, f64)> = Vec::new();
-    for i in 0..snapshots.len() - 1 {
-        let a = &snapshots[i];
-        let b = &snapshots[i + 1];
-        if a.dimensions() != b.dimensions() {
-            return Err(anyhow!(
-                "snapshot dims differ across samples: {:?} vs {:?}",
-                a.dimensions(),
-                b.dimensions()
-            ));
-        }
-        let score = image_compare::rgba_hybrid_compare(a, b)
-            .context("ssim compare failed")?
-            .score;
-        pair_ssims.push((snapshot_times[i], snapshot_times[i + 1], score));
-    }
-
-    eprintln!("e2e_progressive_refinement pairwise stability:");
-    for (t0, t1, s) in &pair_ssims {
-        eprintln!("  t={t0:>5}ms vs t={t1:>5}ms  ssim={s:.5}");
-    }
-
-    // Bless mode is a no-op now (no golden involved). Kept as an early-return
+    // Bless mode is a no-op (no golden involved). Kept as an early return
     // for symmetry with other bless-aware tests.
     if std::env::var("GHOSTFRAME_BLESS_GOLDENS").is_ok() {
         return Ok(());
     }
 
-    // Spec target: ≥ 0.999. Per-pixel Δ ≤ 1 LSB across snapshots within the
-    // same static phase should give SSIM ≫ 0.999. We assert against the
-    // LAST adjacent pair — earlier pairs may include a sample taken before
-    // refinement finished propagating to the client integrator.
-    let &(t0, t1, last_pair_ssim) = pair_ssims.last().unwrap();
+    // Spec target: >= 0.999 between adjacent captures. Per-pixel delta <= 1
+    // LSB within one static phase gives SSIM far above that; a motion phase
+    // gives 0.6-0.98.
+    const STABLE: f64 = 0.999;
+    // Consecutive stable pairs required: four captures ~400 ms apart, i.e.
+    // the canvas has not changed for over a second.
+    const STABLE_PAIRS_NEEDED: usize = 3;
+    // One full 24 s cycle plus a static half's worth of margin, so a static
+    // half is reached wherever in the cycle the client connected.
+    const DEADLINE: Duration = Duration::from_secs(40);
+
+    let started = tokio::time::Instant::now();
+    let mut prev: Option<(u64, image::RgbaImage)> = None;
+    let mut stable_run = 0usize;
+    let mut history: Vec<(u64, u64, f64)> = Vec::new();
+    while stable_run < STABLE_PAIRS_NEEDED && started.elapsed() < DEADLINE {
+        let t = started.elapsed().as_millis() as u64;
+        let png = browser.screenshot().await?;
+        let shot = helpers::decode_screenshot(&png)?;
+        if let Some((t_prev, prev_shot)) = &prev {
+            if prev_shot.dimensions() != shot.dimensions() {
+                return Err(anyhow!(
+                    "snapshot dims differ across samples: {:?} vs {:?}",
+                    prev_shot.dimensions(),
+                    shot.dimensions()
+                ));
+            }
+            let score = image_compare::rgba_hybrid_compare(prev_shot, &shot)
+                .context("ssim compare failed")?
+                .score;
+            history.push((*t_prev, t, score));
+            // A still canvas only counts while the server is in TileCodec.
+            // The start of a static half is also still -- H.264 repeating
+            // one frame until the classifier's exit sustain elapses -- and
+            // accepting that would measure the wrong codec's steady state.
+            let in_tile_codec = helpers::read_server_logs_stripped("ghostframe-server")
+                .lines()
+                .rev()
+                .find(|l| l.contains("mode.decision"))
+                .is_some_and(|l| l.contains("to=TileCodec"));
+            stable_run = if score >= STABLE && in_tile_codec {
+                stable_run + 1
+            } else {
+                0
+            };
+        }
+        prev = Some((t, shot));
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+
+    eprintln!("e2e_progressive_refinement pairwise stability:");
+    for (t0, t1, s) in &history {
+        eprintln!("  t={t0:>5}ms vs t={t1:>5}ms  ssim={s:.5}");
+    }
     assert!(
-        last_pair_ssim >= 0.999,
-        "adjacent-sample SSIM at end of window (t={t0}ms vs t={t1}ms) = {last_pair_ssim:.5} < 0.999 \
-         — client canvas is not stable, refinement may not have converged or motion phase intruded"
+        stable_run >= STABLE_PAIRS_NEEDED,
+        "the canvas never held still for {STABLE_PAIRS_NEEDED} consecutive \
+         captures (ssim >= {STABLE}, server in TileCodec) in {DEADLINE:?}, \
+         which spans more than one full static/motion cycle. Either no \
+         static half converged, or the pattern is not cycling. Pairs seen: \
+         {history:?}"
     );
 
-    // M3.3d: ACKs are now per-datagram + correctly drive scheduler counter
-    // increments, so PixelPerfect transitions fire. Assert at least one was
-    // observed during the sample window.
+    // A still canvas is necessary, not sufficient: a refinement that stalled
+    // part-way is also still. The terminal state is the server seeing every
+    // pass of a tile acknowledged, which it reports as `cdf53.pixelperfect`.
     let logs = helpers::read_server_logs_stripped("ghostframe-server");
     let pp_count = logs
         .lines()

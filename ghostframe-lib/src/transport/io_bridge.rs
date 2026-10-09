@@ -2262,6 +2262,18 @@ impl IoBridge {
             .max(self.tick_budget_floor())
     }
 
+    /// How long the scheduler waits for a priority tile's acknowledgement
+    /// before sending it again: the reliable emitter's first-attempt
+    /// deadline, so the two retry mechanisms race the same clock.
+    ///
+    /// Not a function of QUIC RTT. See `Scheduler::set_retry_after`.
+    fn priority_retry_after(&self) -> std::time::Duration {
+        crate::transport::reliable_emitter::rto::rto_for_attempt(
+            self.reliable_emitter.ack_deadline,
+            0,
+        )
+    }
+
     /// The per-tick emission budget as the scheduler computes it outside a
     /// probe window: `base_budget_bytes` scaled by the AIMD multiplier, then
     /// bounded by goog_cc's pacer once that is trusted.
@@ -2309,16 +2321,6 @@ impl IoBridge {
         if self.scheduler.cols() != grid.cols || self.scheduler.rows() != grid.rows {
             self.scheduler.resize(grid.cols, grid.rows);
         }
-
-        // RTT estimate across connected sessions; default to 20 ms if none.
-        let rtt = self
-            .server
-            .connections
-            .values()
-            .map(|c| c.stats().path.rtt)
-            .min()
-            .unwrap_or_else(|| std::time::Duration::from_millis(20));
-        self.scheduler.set_rtt(rtt);
 
         use crate::transport::scheduler::{TileWork, WorkState};
 
@@ -2846,6 +2848,10 @@ impl IoBridge {
                 SCHEDULER_TICK_INTERVAL_US,
             ),
         };
+        // The scheduler re-sends an un-acknowledged priority tile once this
+        // has elapsed. Set here, on the path every emission shares, so the
+        // capture and injected paths cannot disagree about it.
+        self.scheduler.set_retry_after(self.priority_retry_after());
         // Retransmission since the last tick came out of the same link, so
         // it comes out of this budget: the estimate bounds the sum, not each
         // sender separately. Bounded by retransmission's own share so that a
@@ -10394,6 +10400,39 @@ mod tests {
             after, before,
             "stranded re-enqueue must not duplicate passes still Pending \
              in the refinement queue (before={before}, after={after})"
+        );
+    }
+
+    /// The scheduler's retry gate follows measured ACK latency and never
+    /// drops to the scale of the transport RTT.
+    #[tokio::test(start_paused = true)]
+    async fn the_priority_retry_gate_tracks_ack_latency_not_rtt() {
+        use crate::transport::reliable_emitter::rto::{
+            ACK_DEADLINE_COLD_START, ACK_DEADLINE_FLOOR,
+        };
+        let (ours, _peer) = tokio::net::UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("QuicServer::new");
+        let (_tx, rx) = mpsc::channel(8);
+        let mut bridge = IoBridge::new_with_injection_for_test(ours, server, rx, 4, 4);
+
+        // No samples yet: assume the worst, as the RTO does.
+        assert_eq!(bridge.priority_retry_after(), ACK_DEADLINE_COLD_START);
+
+        // A path so fast that 2 x RTT -- or 2 x ACK latency -- is under a
+        // frame. The gate must still clear a 33 ms tick comfortably.
+        bridge
+            .reliable_emitter
+            .set_ack_deadline(Some(std::time::Duration::from_millis(1)));
+        assert_eq!(bridge.priority_retry_after(), ACK_DEADLINE_FLOOR);
+        assert!(bridge.priority_retry_after() > std::time::Duration::from_micros(33_333));
+
+        // And it stretches when acknowledgements are genuinely slow.
+        bridge
+            .reliable_emitter
+            .set_ack_deadline(Some(std::time::Duration::from_millis(400)));
+        assert_eq!(
+            bridge.priority_retry_after(),
+            std::time::Duration::from_millis(800)
         );
     }
 

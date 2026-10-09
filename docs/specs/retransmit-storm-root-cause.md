@@ -242,3 +242,91 @@ emitted. 80,313 of 111,444 NACKs in a passing run were for passes still in
 the scheduler's queue. They are harmless now -- a miss costs a lookup -- but
 they are two thirds of the client's NACK traffic.
 
+## Addendum 2: the scheduler had its own retry timer, on the wrong clock
+
+`e2e_progressive_refinement_chromium` failed every run with a different
+storm from the ones above, on an unshaped link with no loss at all:
+
+    emitted_solid=395068  emitter_ack_hits=256  cache_pending_entries=182460
+
+The reliable emitter is not the only thing that resends. `Scheduler::
+drain_priority_queue` keeps a Solid/PalRle/Raw tile `InFlight` until it is
+acknowledged and sends it again once a gate has elapsed. That gate was
+`2 x RTT`, where RTT is quinn's transport round trip.
+
+An acknowledgement is not a transport event. It is an application datagram
+the client batches for 5 ms and writes when its event loop gets to it.
+Measured on that session: transport RTT of a few milliseconds, ACK latency
+p95 of **38.6 ms** -- longer than the 33 ms frame tick. So the gate had
+expired by every tick, and every un-acknowledged tile was sent again on
+every frame:
+
+    priority_queue_len=1128 drained_count=1128     (each of the first 60+ ticks)
+
+62,556 Solid datagrams in the first two seconds, for 1,128 Solid tiles.
+Each resend is a new transmission with its own `wire_seq`, so the ledger's
+16,384 tombstones turned over in under a second and the acknowledgements
+that did arrive named transmissions it had already forgotten
+(`ledger_unknown_acks=118627`). In the browser, instrumented at
+`datagrams.writable`: 131,842 tile datagrams received, 1,623 ACK writes
+pending at peak, the slowest taking **10.8 s** to resolve. The ACKs were
+being produced; they could not get out past the flood they were meant to
+stop.
+
+The knife-edge explains the test's history as a "contention flake". With
+ACK latency under one tick the first acknowledgement beats the gate and
+nothing happens; a few milliseconds over and it never recovers.
+
+`rto.rs` had already learned this for the emitter's timer -- its deadline
+is derived from measured ACK latency, floored at 150 ms, with the reasoning
+written out at `ACK_DEADLINE_FLOOR` -- but the scheduler's gate predates
+that and was not revisited. It now takes the same deadline
+(`IoBridge::priority_retry_after`).
+
+After: 3,444 Solid datagrams in the same two seconds, every one
+acknowledged, ACK write latency at most 0.4 s, and 720 tiles reaching
+PixelPerfect one second after the client connects.
+
+### The test was also timed against the bug
+
+It slept 8 s, waited for any `cdf53.emit`, slept 7 s, then sampled -- the
+7 s sized on refinement "still climbing 5 s after first emit". That was the
+storm. With refinement landing in a second, a sample taken 15 s after setup
+falls in the pattern's motion half whenever the client connected early in a
+static one. The test now polls for a canvas that has held still for three
+consecutive captures while the server is in TileCodec, for up to more than
+one full cycle.
+
+### Not addressed
+
+Two retry mechanisms now race the same deadline for priority tiles: the
+scheduler re-enqueues the tile under a new `EmitKey`, and the emitter's RTO
+replays the old one. One of them is redundant. The scheduler's has no
+backoff, so under total ACK loss it still resends every tile every 150 ms
+indefinitely, where the RTO backs off to 5 s. Removing the scheduler's
+retry outright is the cleaner end state; it was left because `mark_acked`
+and the PalRle palette refcounts hang off the `InFlight` state.
+
+The frame mode also thrashes in the pattern's motion half -- `TileCodec ->
+H264 reason="suspension"` then back on `cost_comparison` roughly every
+1.2 s. Not investigated.
+
+## Addendum 3: a flake the pacing change exposed
+
+The retransmit pacer (addendum 1) made a browserless scene,
+`probe_windows_are_abandoned_on_a_demand_starved_link`, fail about one run
+in three with "no virtual-time progress for 5000 consecutive iterations".
+Measured by bisection: 0 of 12 before that change, 4 of 12 after.
+
+The server was not at fault. `ClientNet::poll_timeout` converted quinn's
+next deadline to microseconds by truncation, and quinn's deadlines carry
+nanoseconds. A deadline 400 ns past a microsecond boundary was reported as
+the boundary; the harness called `on_timeout` there; `drive_outgoing`
+found the real deadline still 400 ns off and did nothing; the same
+microsecond was reported again. Every one of the 5000 iterations was that.
+It needs the virtual clock to land within a microsecond below a quinn
+timer, which the new pacing made much more likely by changing when the
+client's own packets go out.
+
+Fixed by rounding the deadline up (`deadline_us`). 0 of 30 afterwards.
+
