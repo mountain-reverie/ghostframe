@@ -112,17 +112,24 @@ e2e_input_forwarding_firefox
 # reproduction. Skipped in CI only so the suite stays green; it must keep
 # failing locally, because failing is its job.
 #
-# Reproduces the reported production defect. A production-scale screen
-# (1920x1080 = 2040 tiles) on a shaped link with 1% loss never finishes
-# refining on a screen that has not changed:
-#   tiles=2040 complete=0 partial=2040 gave_up=1587
-# Stranded tiles hold {0,5..10} and are missing {11,12,13} -- the three
-# finest bit-planes -- at sweep_attempts=6, the give-up limit. That is
-# detail which never arrives on a quiet screen.
+# A 1920x1080 screen whose every tile changes four times a second, behind
+# 8 Mbit with 1% loss, with the frame mode pinned to TileCodec so the server
+# cannot do the sensible thing and switch to H.264. Each change is ~10 MB of
+# passes against a link moving 1 MB/s, so `partial == 0` is unreachable by
+# construction and no fix is expected to turn this green:
+#   tiles=786 complete=0 partial=786 gave_up=550 pass-hist{1:786}
 #
-# Scale-dependent: the same shape at 768 tiles (VKMS's preferred 1024x768)
-# converges cleanly, which is why every earlier scene missed it.
+# What it is for is the *shape* of that failure, which has changed once
+# already. It used to read `tiles=35` and fail its own premise check: the
+# event loop polled frames ahead of the socket, a frame was always waiting,
+# and the server read no acknowledgements at all. That was a defect, is
+# fixed, and is pinned by `inbound_is_read_before_a_waiting_frame`.
 #
-# Delete this entry once a recovery path lands; it is that fix's gate.
+# What it shows now is the next limit, and that one is real and open: the
+# scheduler is ticked once per frame with a 33 ms budget, so at 550 ms per
+# frame it offers ~6% of the estimate, and the estimate itself sits at its
+# one-datagram floor. Only the first ~790 tiles in drain order ever receive
+# a pass. See docs/specs/retransmit-storm-root-cause.md, "What the overload
+# scene shows now".
 e2e_saturated_link_starves_tiles_into_giving_up
 

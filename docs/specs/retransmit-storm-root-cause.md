@@ -151,3 +151,94 @@ showed persistent stale tiles is the first one running that code.
    spends bandwidth on content the scheduler may have moved past. Coverage
    NACKs plus re-enqueue at current priority is the recovery path that
    respects the queue; the RTO is a third mechanism racing the other two.
+
+## Addendum: three more defects behind the same two scenes
+
+PR #111 let a coverage NACK find its pass. That made the storm *worse* on
+one axis -- every NACK now hit, and each hit was sent immediately -- and
+`e2e_production_scale_with_loss_converges` still ended with all 2040 tiles
+owed passes. Three separate defects were stacked behind it. Each was found
+by fixing the one in front and measuring again.
+
+### 1. Retransmission had no budget
+
+The scheduler's emission is budgeted against the link estimate. Replay from
+the retransmit cache was bounded only at 64 retransmissions *per call*, and
+it is called per frame and per `Event::DatagramsUnblocked`; NACKs were
+re-sent on arrival. Nine seconds after a full-screen change, on 8 Mbit:
+
+| | datagrams | rate |
+|---|---|---|
+| scheduler (new passes) | 11,154 | ~0.6 MB/s |
+| RTO replay | 14,081 | |
+| NACK replay | 15,808 | ~1.7 MB/s together |
+| link | | 1.0 MB/s |
+
+`quinn_send_buffer_space` fell monotonically from 16.7 MB to 254 bytes over
+those nine seconds -- 29,889 retransmissions at ~520 bytes is 15.6 MB --
+after which `clamp_to_quinn_capacity` gave the scheduler nothing, emission
+stopped at `refinement_queue_len=8366` and never resumed. Every
+acknowledgement was by then sixteen seconds stale behind the server's own
+retransmits, so every timer kept firing.
+
+Fixed by `retransmit_pacer`: replay draws on the same estimate, by elapsed
+time, and the scheduler's next tick gives back what replay used. NACKs are
+queued and deduplicated rather than sent on arrival. This is a narrower
+answer than remediation 5 above -- the RTO still replays refinement passes
+-- but it removes the property that made the question urgent.
+
+### 2. The stranded-tile detector re-encoded tiles that were merely queued
+
+With the flood gone the scene still failed, differently: frames went from
+16 ms to 118 ms the moment tiles crossed `IDLE_THRESHOLD`. The Phase 1.5-B
+detector selected any idle Cdf53 tile with unacknowledged passes and an
+empty retransmit cache -- which describes every tile still waiting in the
+refinement queue. Up to 512 of them per frame were handed to the GPU for a
+forward transform and re-encoded on the CPU, then discarded by a
+`refinement_queue_holds_tile` check that ran only afterwards. The capture
+rate fell from 30 fps to 8, and since the scheduler is ticked per frame,
+so did delivery. Before fix 1 this never triggered, because the cache was
+never empty.
+
+Fixed by making that check part of detection.
+
+### 3. The event loop read frames ahead of the socket
+
+`e2e_saturated_link_starves_tiles_into_giving_up` reported `tiles=35` and
+failed its premise check. `IoBridge::run`'s `select!` is biased and listed
+the frame arm before the inbound arm, so once processing a frame took
+longer than the capture interval a frame was always ready and the socket
+was never polled: 34 frames and 8 inbound packets in 18 s, zero
+acknowledgements read, quinn reduced to PTO probes, ~35 packets delivered
+in half a minute.
+
+Fixed by polling inbound first, with a streak limit so it cannot starve
+frames in turn.
+
+### What the overload scene shows now
+
+With the loop reading the network, that scene reaches its real assertion:
+
+    tiles=786 complete=0 partial=786 gave_up=550 pass-hist{1:786}
+
+It cannot pass -- the screen changes four times a second and each change is
+ten seconds of link -- but two things in how it fails are worth fixing and
+are **not** fixed here:
+
+- **The scheduler's budget is per frame, not per unit of time.** One 33 ms
+  slice of the estimate is granted per frame processed. At 550 ms per frame
+  that is 6% of the link. `base_budget_bytes` records that elapsed-time
+  billing was tried and "changed nothing", which was true while a 256 KiB
+  floor dominated the expression; the floor has since been reduced to one
+  datagram, so that measurement no longer holds and wants repeating.
+- **Pass-major drain restarts at the same tile after every supersede.**
+  Under sustained overload the first ~790 tiles in drain order receive pass
+  0 every frame and the remaining ~1250 receive nothing at all, ever. A
+  rotating start would spread the same bytes over the whole screen.
+
+Still open from the converge scene: the client's tail sweep requests every
+missing pass of every stalled tile, including passes the server has not yet
+emitted. 80,313 of 111,444 NACKs in a passing run were for passes still in
+the scheduler's queue. They are harmless now -- a miss costs a lookup -- but
+they are two thirds of the client's NACK traffic.
+

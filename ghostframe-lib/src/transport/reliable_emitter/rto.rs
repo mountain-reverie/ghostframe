@@ -65,6 +65,18 @@ impl RtoTimerWheel {
         Some(entry.key)
     }
 
+    /// Is the earliest deadline already past? May name an entry that has
+    /// since left the cache -- `pop_due` callers validate, and so this is an
+    /// upper bound on "work is waiting", which is all a diagnostic needs.
+    pub fn has_due(&self, now: Instant) -> bool {
+        if crate::config::no_rto() {
+            return false;
+        }
+        self.heap
+            .peek()
+            .is_some_and(|Reverse(top)| top.deadline <= now)
+    }
+
     pub fn len(&self) -> usize {
         self.heap.len()
     }
