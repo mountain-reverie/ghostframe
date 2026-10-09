@@ -396,3 +396,45 @@ fn datagram_counts_ignore_non_protocol_traffic() {
         "parity envelopes are counted on neither side"
     );
 }
+
+/// One Solid tile datagram for `(x, 0)` whose header carries `sent_us` as
+/// the sender's emit stamp, the way the server's emitter writes it.
+fn stamped_solid(frame_seq: u32, x: u8, sent_us: u32) -> Vec<u8> {
+    let mut dg = tile_datagrams(frame_seq, x, 0, Codec::Solid, 0, &[1, 2, 3, 255], 1200)
+        .pop()
+        .expect("one fragment");
+    dg[12..16].copy_from_slice(&sent_us.to_be_bytes());
+    dg
+}
+
+fn suspension_reported(core: &mut ClientCore, now_us: u64) -> bool {
+    ghostframe_protocol::feedback::ReceiverFeedback::decode(&core.encode_feedback(now_us))
+        .expect("feedback decodes")
+        .suspension_detected
+}
+
+/// The wiring from the datagram header to the suspension flag: the stamp
+/// the core reads is the one at `[12..16]`, and a sentinel in between does
+/// not stand in for a tile datagram.
+///
+/// A static screen, then one change nine seconds later, must not tell the
+/// server the path was suspended -- it answers that by forcing H.264.
+#[test]
+fn content_after_an_idle_screen_is_not_reported_as_a_suspension() {
+    let mut core = test_core();
+    core.handle_datagram(&stamped_solid(1, 0, 1_000_000), 50_000);
+    // The sender was quiet for 9.4 s; so, therefore, was the link.
+    core.handle_datagram(&stamped_solid(2, 1, 10_400_000), 9_450_000);
+    assert!(!suspension_reported(&mut core, 9_500_000));
+
+    // A frame-dimensions sentinel arriving late carries the capture clock,
+    // not an emit stamp, and must not be read as one.
+    let sentinel = ghostframe_protocol::protocol::build_frame_dimensions_datagram(3, 7, 64, 64);
+    core.handle_datagram(&sentinel, 12_000_000);
+    assert!(!suspension_reported(&mut core, 12_050_000));
+
+    // Whereas the path sitting on a datagram is still reported: sent 10 ms
+    // after the last tile datagram, delivered 3 s after it.
+    core.handle_datagram(&stamped_solid(4, 2, 10_410_000), 12_450_000);
+    assert!(suspension_reported(&mut core, 12_500_000));
+}
