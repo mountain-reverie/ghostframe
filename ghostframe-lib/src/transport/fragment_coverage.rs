@@ -85,15 +85,40 @@ pub type CoverageKey = (u32, u8, u8, u8);
 /// instead of a fixed const; at 4K @ 60 fps the worst case grows ~8× further.
 pub const FRAGMENT_COVERAGE_CAPACITY: usize = 60_000;
 
+/// One recorded emission, filed under its tile.
+struct Recorded {
+    frame_seq: u32,
+    pass_idx: u8,
+    /// Matches this record to its entry in `order`. A key can be taken and
+    /// recorded again, leaving an older `order` entry behind; the stamp is
+    /// how eviction tells that leftover from the live record.
+    stamp: u64,
+    coverage: CoverageList,
+}
+
 /// LRU-bounded map of `CoverageKey -> CoverageList`. Per-session state.
 /// Eviction policy is pure LRU: when capacity is reached, the oldest-inserted
 /// entry is dropped (which is equivalent to "the ACK never arrived" — the tile
 /// stays in its current codec_state and re-emits on the next dirty cycle).
+///
+/// Stored tile-major. Both hot operations name a tile: `take` runs once per
+/// acknowledged pass and `drop_cdf53_for_tile` once per dirty tile per
+/// frame. Keyed flat, each of them scanned the whole map -- so a full-screen
+/// change cost tiles x map-size, quadratic in the screen and growing with
+/// every unacknowledged frame. A tile holds a handful of records (one per
+/// pass in flight), so finding one inside its tile is a short scan.
 pub struct FragmentCoverageMap {
     capacity: usize,
-    // Insertion-order queue of keys. Front = oldest, back = newest.
-    order: std::collections::VecDeque<CoverageKey>,
-    entries: std::collections::HashMap<CoverageKey, CoverageList>,
+    len: usize,
+    next_stamp: u64,
+    // Insertion-order queue. Front = oldest, back = newest. Removal from
+    // the map does not touch it: an entry whose record is gone (or has been
+    // replaced under a newer stamp) is skipped when it reaches the front,
+    // and `compact_order` bounds how many such entries can pile up.
+    order: std::collections::VecDeque<(CoverageKey, u64)>,
+    tiles: std::collections::HashMap<(u8, u8), SmallVec<[Recorded; 2]>>,
+    #[cfg(test)]
+    pub(crate) records_examined: std::cell::Cell<u64>,
 }
 
 impl FragmentCoverageMap {
@@ -101,40 +126,99 @@ impl FragmentCoverageMap {
         assert!(capacity > 0, "FragmentCoverageMap capacity must be > 0");
         Self {
             capacity,
-            order: std::collections::VecDeque::with_capacity(capacity),
-            entries: std::collections::HashMap::with_capacity(capacity),
+            len: 0,
+            next_stamp: 0,
+            order: std::collections::VecDeque::new(),
+            tiles: std::collections::HashMap::new(),
+            #[cfg(test)]
+            records_examined: std::cell::Cell::new(0),
         }
     }
 
     /// Record coverage for a newly-emitted tile-pass work item. If the map is
     /// at capacity, evict the oldest entry.
     pub fn record(&mut self, key: CoverageKey, coverage: CoverageList) {
-        if let std::collections::hash_map::Entry::Occupied(mut e) = self.entries.entry(key) {
+        let (frame_seq, tile_x, tile_y, pass_idx) = key;
+        let records = self.tiles.entry((tile_x, tile_y)).or_default();
+        #[cfg(test)]
+        self.records_examined
+            .set(self.records_examined.get() + records.len() as u64);
+        if let Some(r) = records
+            .iter_mut()
+            .find(|r| r.frame_seq == frame_seq && r.pass_idx == pass_idx)
+        {
             // Same key re-emitted (e.g., NACK retransmit path) — overwrite
             // in place, do NOT re-queue (preserves insertion order).
-            e.insert(coverage);
+            r.coverage = coverage;
             return;
         }
-        if self.entries.len() >= self.capacity {
-            if let Some(oldest) = self.order.pop_front() {
-                self.entries.remove(&oldest);
-            }
+        let stamp = self.next_stamp;
+        self.next_stamp += 1;
+        records.push(Recorded {
+            frame_seq,
+            pass_idx,
+            stamp,
+            coverage,
+        });
+        self.len += 1;
+        self.order.push_back((key, stamp));
+        while self.len > self.capacity {
+            let Some((oldest, stamp)) = self.order.pop_front() else {
+                break;
+            };
+            self.remove_where(oldest, |r| r.stamp == stamp);
         }
-        self.order.push_back(key);
-        self.entries.insert(key, coverage);
+        self.compact_order();
+    }
+
+    /// Remove the record for `key` if `matches` accepts it.
+    fn remove_where(
+        &mut self,
+        key: CoverageKey,
+        matches: impl Fn(&Recorded) -> bool,
+    ) -> Option<CoverageList> {
+        let (frame_seq, tile_x, tile_y, pass_idx) = key;
+        let records = self.tiles.get_mut(&(tile_x, tile_y))?;
+        #[cfg(test)]
+        self.records_examined
+            .set(self.records_examined.get() + records.len() as u64);
+        let pos = records
+            .iter()
+            .position(|r| r.frame_seq == frame_seq && r.pass_idx == pass_idx && matches(r))?;
+        let taken = records.swap_remove(pos);
+        if records.is_empty() {
+            self.tiles.remove(&(tile_x, tile_y));
+        }
+        self.len -= 1;
+        Some(taken.coverage)
+    }
+
+    /// Rebuild `order` without its dead entries once they outnumber the
+    /// live ones. Each rebuild is paid for by the removals that made it
+    /// necessary, so the amortised cost per operation stays constant.
+    fn compact_order(&mut self) {
+        if self.order.len() <= 2 * self.len + 64 {
+            return;
+        }
+        let tiles = &self.tiles;
+        self.order
+            .retain(|&((frame_seq, tile_x, tile_y, pass_idx), stamp)| {
+                tiles.get(&(tile_x, tile_y)).is_some_and(|records| {
+                    records.iter().any(|r| {
+                        r.stamp == stamp && r.frame_seq == frame_seq && r.pass_idx == pass_idx
+                    })
+                })
+            });
     }
 
     /// Remove and return the coverage for a key. Returns None if the entry
     /// was evicted by LRU pressure or already taken.
     pub fn take(&mut self, key: CoverageKey) -> Option<CoverageList> {
-        let cov = self.entries.remove(&key)?;
-        // Find and remove key from the order queue. O(n) scan acceptable
-        // because the queue is bounded by `capacity` and take() is rare
-        // relative to record().
-        if let Some(pos) = self.order.iter().position(|&k| k == key) {
-            self.order.remove(pos);
+        let taken = self.remove_where(key, |_| true);
+        if taken.is_some() {
+            self.compact_order();
         }
-        Some(cov)
+        taken
     }
 
     /// Drop every **Cdf53** coverage entry for the given (tile_x, tile_y).
@@ -152,35 +236,31 @@ impl FragmentCoverageMap {
     /// side effects (PalRle `delivered`/`in_flight_carrying` bookkeeping,
     /// `ack_miss` telemetry on motion-region Solid flips, etc.).
     ///
-    /// O(n) over both `entries` and `order` (n = current map size, bounded
-    /// by `capacity`). Called per dirty tile per frame in the emission path,
-    /// so a much-larger map would warrant a secondary tile-keyed index.
+    /// Costs the tile's own records, not the map: see the type's doc.
     pub fn drop_cdf53_for_tile(&mut self, tile_x: u8, tile_y: u8) {
-        let mut dropped_keys: smallvec::SmallVec<[CoverageKey; 16]> = smallvec::SmallVec::new();
-        self.entries.retain(|&key, cov_list| {
-            let (_, tx, ty, _) = key;
-            let target =
-                tx == tile_x && ty == tile_y && cov_list.iter().any(|c| c.codec == Codec::Cdf53);
-            if target {
-                dropped_keys.push(key);
-                false
-            } else {
-                true
-            }
-        });
-        if !dropped_keys.is_empty() {
-            self.order.retain(|k| !dropped_keys.contains(k));
+        let Some(records) = self.tiles.get_mut(&(tile_x, tile_y)) else {
+            return;
+        };
+        #[cfg(test)]
+        self.records_examined
+            .set(self.records_examined.get() + records.len() as u64);
+        let before = records.len();
+        records.retain(|r| !r.coverage.iter().any(|c| c.codec == Codec::Cdf53));
+        self.len -= before - records.len();
+        if records.is_empty() {
+            self.tiles.remove(&(tile_x, tile_y));
         }
+        self.compact_order();
     }
 
     #[cfg(test)]
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.len
     }
 
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.len == 0
     }
 
     /// Diagnostic snapshot of all live coverage entries. Used by
@@ -188,9 +268,10 @@ impl FragmentCoverageMap {
     /// refinement_queue view of in-flight work.
     #[cfg(feature = "cdf53-diag")]
     pub fn snapshot(&self) -> Vec<FragmentCoverage> {
-        self.entries
+        self.tiles
             .values()
-            .flat_map(|list| list.iter().copied())
+            .flat_map(|records| records.iter())
+            .flat_map(|r| r.coverage.iter().copied())
             .collect()
     }
 }
@@ -409,5 +490,108 @@ mod tests {
             assert_eq!(taken[0].pass_idx, p);
         }
         assert_eq!(m.len(), 0);
+    }
+
+    fn cov(codec: Codec) -> CoverageList {
+        smallvec::smallvec![FragmentCoverage {
+            tile_x: 0,
+            tile_y: 0,
+            generation: 0,
+            pass_idx: 0,
+            codec,
+            palette_id: None,
+            palette_bundled: false,
+        }]
+    }
+
+    /// A map holding one frame of a 4K screen, plus `passes` records on
+    /// tile (0, 0).
+    fn loaded(other_tiles: u32, passes: u8) -> FragmentCoverageMap {
+        let mut m = FragmentCoverageMap::new(FRAGMENT_COVERAGE_CAPACITY);
+        for pass in 0..passes {
+            m.record((1, 0, 0, pass), cov(Codec::Cdf53));
+        }
+        for i in 0..other_tiles {
+            let (x, y) = (1 + (i % 200) as u8, (i / 200) as u8);
+            m.record((1, x, y, 0), cov(Codec::Solid));
+        }
+        m.records_examined.set(0);
+        m
+    }
+
+    /// `drop_cdf53_for_tile` runs once per dirty tile per frame. Scanning
+    /// the map there made a full-screen change quadratic in the screen.
+    #[test]
+    fn dropping_a_tile_does_not_examine_other_tiles_records() {
+        let examined = |others| {
+            let mut m = loaded(others, 3);
+            m.drop_cdf53_for_tile(0, 0);
+            assert_eq!(m.len(), others as usize);
+            m.records_examined.get()
+        };
+        let (few, many) = (examined(4), examined(16_000));
+        assert_eq!(few, 3, "the tile's three records, and nothing else");
+        assert_eq!(
+            many, few,
+            "drop_cdf53_for_tile examined {many} records with 16,000 other \
+             tiles recorded versus {few} with 4 -- it is scanning the map"
+        );
+    }
+
+    /// `take` runs once per acknowledged pass, and used to search the whole
+    /// insertion queue for the key it had just removed.
+    #[test]
+    fn taking_a_record_does_not_examine_other_tiles_records() {
+        let examined = |others| {
+            let mut m = loaded(others, 3);
+            assert!(m.take((1, 0, 0, 1)).is_some());
+            m.records_examined.get()
+        };
+        let (few, many) = (examined(4), examined(16_000));
+        assert_eq!(few, 3);
+        assert_eq!(many, few, "take is scanning the map");
+    }
+
+    /// The insertion queue is not edited on removal, so something has to
+    /// stop it growing: a session that records and acknowledges forever
+    /// while one old record stays unacknowledged at the front must not
+    /// accumulate a queue entry per acknowledgement.
+    #[test]
+    fn the_insertion_queue_stays_bounded_under_record_and_take() {
+        let mut m = FragmentCoverageMap::new(1_000);
+        m.record((0, 9, 9, 0), cov(Codec::Solid)); // never acknowledged
+        for seq in 1..=50_000u32 {
+            m.record((seq, 1, 1, 0), cov(Codec::Solid));
+            assert!(m.take((seq, 1, 1, 0)).is_some());
+        }
+        assert_eq!(m.len(), 1);
+        assert!(
+            m.order.len() <= 2 * m.len() + 64,
+            "{} queue entries for {} live records",
+            m.order.len(),
+            m.len()
+        );
+        assert!(m.take((0, 9, 9, 0)).is_some(), "the old record survived");
+    }
+
+    /// A key taken and recorded again leaves its first queue entry behind.
+    /// When that leftover reaches the front it must be skipped, not used to
+    /// evict the newer record that happens to carry the same key.
+    #[test]
+    fn a_stale_queue_entry_does_not_evict_the_record_that_reused_its_key() {
+        let mut m = FragmentCoverageMap::new(3);
+        m.record((0, 1, 1, 0), cov(Codec::Solid));
+        m.record((0, 2, 2, 0), cov(Codec::Solid));
+        assert!(m.take((0, 1, 1, 0)).is_some());
+        m.record((0, 1, 1, 0), cov(Codec::Solid)); // newest, same key
+        m.record((0, 3, 3, 0), cov(Codec::Solid));
+        // At capacity: the next record evicts the oldest *live* one, (2,2).
+        m.record((0, 4, 4, 0), cov(Codec::Solid));
+        assert_eq!(m.len(), 3);
+        assert!(m.take((0, 2, 2, 0)).is_none(), "(2,2) was the oldest");
+        assert!(
+            m.take((0, 1, 1, 0)).is_some(),
+            "the re-recorded key survived"
+        );
     }
 }

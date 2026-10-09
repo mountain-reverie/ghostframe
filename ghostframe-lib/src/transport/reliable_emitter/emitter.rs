@@ -627,9 +627,8 @@ impl ReliableTileEmitter {
     /// Is this tile-pass still in the retransmit cache, i.e. will `tick`
     /// re-send it if no acknowledgement arrives?
     ///
-    /// O(1), through the content index, unlike
-    /// `has_cache_entries_for_tile`'s scan -- this is asked once per
-    /// in-flight priority tile per scheduler tick.
+    /// O(1), through the content index -- this is asked once per in-flight
+    /// priority tile per scheduler tick.
     ///
     /// May answer `false` for a pass that is in fact cached under an older
     /// emission whose newer sibling has since been removed (the index
