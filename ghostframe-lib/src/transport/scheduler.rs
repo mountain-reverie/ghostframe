@@ -90,8 +90,9 @@ pub struct Scheduler {
     /// (`drain_refinement_pass_major`) is a walk over buckets rather than a
     /// repeated `min()` over the whole queue.
     refinement_order: [VecDeque<Handle>; PASS_SLOTS],
-    /// QUIC RTT estimate used to drive 2×RTT retry. Updated by `set_rtt`.
-    rtt: Duration,
+    /// How long an `InFlight` priority item waits for its acknowledgement
+    /// before `drain_priority_queue` sends it again. See `set_retry_after`.
+    retry_after: Duration,
     /// Fraction of tick budget allocated to refinement passes (default 0.2).
     /// Adjusted adaptively by `maybe_adjust_refinement_fraction`.
     refinement_bandwidth_fraction: f32,
@@ -137,7 +138,7 @@ impl Scheduler {
             work: Slab::new(),
             priority_order: VecDeque::new(),
             refinement_order: std::array::from_fn(|_| VecDeque::new()),
-            rtt: Duration::from_millis(20),
+            retry_after: Duration::from_millis(40),
             refinement_bandwidth_fraction: 0.2,
             last_refinement_budget: 0,
             delivery_window_emitted: 0,
@@ -178,8 +179,27 @@ impl Scheduler {
         self.slots.clear_handles();
     }
 
-    pub fn set_rtt(&mut self, rtt: Duration) {
-        self.rtt = rtt;
+    /// Set how long an un-acknowledged priority item waits before it is
+    /// sent again.
+    ///
+    /// This used to be `set_rtt`, with the gate fixed at `2 x RTT`. The
+    /// transport's round trip is the wrong clock: an acknowledgement is an
+    /// application datagram the client batches for 5 ms and sends when its
+    /// event loop gets to it, and on a low-latency path that dwarfs the RTT.
+    /// Measured on an e2e session: QUIC RTT of a few milliseconds, ACK
+    /// latency p95 of 38.6 ms -- longer than the 33 ms frame tick. So the
+    /// gate had always expired by the next tick and every un-acknowledged
+    /// tile was sent again on every frame: `drained_count=1128` on each of
+    /// the first 60+ ticks, 62,556 Solid datagrams in two seconds for a
+    /// screen with 1,128 Solid tiles. The browser, receiving 30,000
+    /// datagrams a second, took up to 10.8 s to get an acknowledgement out,
+    /// which kept the gate expiring.
+    ///
+    /// The caller now passes the reliable emitter's own first-attempt
+    /// deadline, which is derived from measured ACK latency and floored
+    /// well above a frame (`rto::ACK_DEADLINE_FLOOR`) for the same reason.
+    pub fn set_retry_after(&mut self, retry_after: Duration) {
+        self.retry_after = retry_after;
     }
 
     pub fn cols(&self) -> u32 {
@@ -710,12 +730,12 @@ impl Scheduler {
         }
 
         let mut emitted = Vec::new();
-        let rtt = self.rtt;
+        let retry_after = self.retry_after;
         Self::drain_priority_queue(
             &mut self.work,
             &mut self.priority_order,
             priority_budget,
-            rtt,
+            retry_after,
             now,
             &mut emitted,
         );
@@ -739,12 +759,10 @@ impl Scheduler {
         work: &mut Slab<TileWork>,
         order: &mut VecDeque<Handle>,
         budget: usize,
-        rtt: Duration,
+        retry_after: Duration,
         now: Instant,
         out: &mut Vec<TileWork>,
     ) {
-        let retry_after = 2 * rtt;
-
         // Drop terminal-state entries first, freeing their slab slot.
         order.retain(|&h| match work.get(h) {
             Some(w) if matches!(w.state, WorkState::Superseded | WorkState::Acked) => {
@@ -1123,7 +1141,7 @@ mod tests {
     #[test]
     fn tick_retries_inflight_after_2x_rtt() {
         let mut s = Scheduler::new(4, 4);
-        s.set_rtt(Duration::from_millis(5));
+        s.set_retry_after(Duration::from_millis(10));
         s.enqueue(TileWork::raw_for_test(0, 0, 0, vec![1]));
         let first = s.tick(usize::MAX);
         assert_eq!(first.len(), 1);
@@ -1137,6 +1155,32 @@ mod tests {
         assert_eq!(third.len(), 1, "InFlight work should retry after 2×RTT");
     }
 
+    /// The retry gate is the caller's ACK deadline, not a multiple of the
+    /// transport RTT, so a frame tick that lands before an acknowledgement
+    /// could possibly have returned does not re-send the tile.
+    #[test]
+    fn an_unacknowledged_tile_is_not_resent_on_the_next_frame_tick() {
+        let mut s = Scheduler::new(4, 4);
+        // What the bridge passes once it has ACK-latency samples: never
+        // below the emitter's 150 ms floor.
+        s.set_retry_after(Duration::from_millis(150));
+        let t0 = Instant::now();
+        s.enqueue_at(TileWork::raw_for_test(0, 0, 0, vec![1]), t0);
+        assert_eq!(s.tick_at(usize::MAX, t0).len(), 1);
+
+        // Four frames at 30 fps: the acknowledgement is still in flight.
+        for frame in 1..=4u64 {
+            let t = t0 + Duration::from_micros(frame * 33_333);
+            assert!(
+                s.tick_at(usize::MAX, t).is_empty(),
+                "frame {frame}: re-sent before its acknowledgement was due"
+            );
+        }
+        // Past the deadline it is still recovered.
+        let late = t0 + Duration::from_millis(150);
+        assert_eq!(s.tick_at(usize::MAX, late).len(), 1);
+    }
+
     #[test]
     fn inflight_work_becomes_retryable_after_two_rtts_of_injected_time() {
         // Companion to `tick_retries_inflight_after_2x_rtt`, but drives the
@@ -1147,7 +1191,7 @@ mod tests {
         // internally, this would fail even though the wall-clock sibling
         // test above keeps passing.
         let mut s = Scheduler::new(4, 4);
-        s.set_rtt(Duration::from_millis(50));
+        s.set_retry_after(Duration::from_millis(100));
         let t0 = Instant::now();
         s.enqueue_at(TileWork::raw_for_test(0, 0, 0, vec![1, 2, 3]), t0);
 
@@ -1173,7 +1217,7 @@ mod tests {
         // flip on ACK, Solid/Raw/PalRle items in priority_queue stay
         // InFlight and retry every 2×RTT forever.
         let mut s = Scheduler::new(4, 4);
-        s.set_rtt(Duration::from_millis(5));
+        s.set_retry_after(Duration::from_millis(10));
         s.enqueue(TileWork::raw_for_test(0, 0, 0, vec![1]));
         let first = s.tick(usize::MAX);
         assert_eq!(first.len(), 1, "first tick emits");
@@ -1194,7 +1238,7 @@ mod tests {
         // After bump_generation, an old-gen ACK has nothing to mark; the
         // current-gen InFlight entry must NOT be touched.
         let mut s = Scheduler::new(4, 4);
-        s.set_rtt(Duration::from_millis(5));
+        s.set_retry_after(Duration::from_millis(10));
         s.enqueue(TileWork::raw_for_test(0, 0, 0, vec![1]));
         let _ = s.tick(usize::MAX); // entry now InFlight at gen=0
         let gen1 = s.bump_generation(0, 0);
@@ -1219,7 +1263,7 @@ mod tests {
         // (tile_x, tile_y, generation, pass_idx) key. The first call marks
         // Acked; subsequent calls find no InFlight entry and must no-op.
         let mut s = Scheduler::new(4, 4);
-        s.set_rtt(Duration::from_millis(5));
+        s.set_retry_after(Duration::from_millis(10));
         s.enqueue(TileWork::raw_for_test(0, 0, 0, vec![1]));
         let _ = s.tick(usize::MAX);
         s.mark_acked(0, 0, 0, 0);
