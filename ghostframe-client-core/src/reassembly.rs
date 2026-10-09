@@ -88,9 +88,6 @@ impl ClientCore {
         };
         let frame_seq = dh.frame_seq & !TILE_DATAGRAM_FLAG;
 
-        // loss_tracker.onDatagram (main.ts:1105).
-        self.loss_tracker.on_datagram(now_us);
-
         let is_frame_dims_sentinel =
             th.tile_x == FRAME_DIMENSIONS_SENTINEL_X && th.tile_y == FRAME_DIMENSIONS_SENTINEL_Y;
         // Eviction notices use their own sentinel coordinates (0xFE, 0xFE),
@@ -102,6 +99,16 @@ impl ClientCore {
         let is_eviction_sentinel = th.tile_x == ghostframe_protocol::eviction::EVICTION_SENTINEL_X
             && th.tile_y == ghostframe_protocol::eviction::EVICTION_SENTINEL_Y;
         let is_sentinel = is_frame_dims_sentinel || is_eviction_sentinel;
+
+        // Sentinels are sent around the emitter and carry the capture
+        // clock in `timestamp_us`, not the emit stamp tile datagrams do, so
+        // their spacing means nothing next to a tile datagram's.
+        if is_sentinel {
+            self.loss_tracker.on_datagram(now_us);
+        } else {
+            self.loss_tracker
+                .on_datagram_sent_at(now_us, dh.timestamp_us);
+        }
 
         // ACK on receipt unless sentinel or Cdf53 (main.ts:1118-1145).
         if !is_sentinel && th.codec != Codec::Cdf53 {

@@ -4,8 +4,10 @@
 
 use ghostframe_protocol::feedback::ReceiverFeedback;
 
-/// Suspension threshold: 100 ms in microseconds (mirrors the `100` in
-/// feedback.ts `onDatagram`).
+/// Suspension threshold: how much longer a datagram may take to arrive
+/// after its predecessor than the sender spaced them, before the difference
+/// is called a stall in the path. 100 ms, from the initial spec's WiFi
+/// suspension detector.
 const SUSPENSION_GAP_US: u64 = 100_000;
 
 /// Client capability announcement, sent once on the feedback stream at
@@ -20,7 +22,9 @@ pub struct LossTracker {
     received: u32,
     lost: u32,
     recovered_fec: u32,
-    last_datagram_us: u64,
+    /// `(arrival, sender stamp)` of the newest timed datagram seen: the
+    /// baseline the next one's spacing is judged against.
+    last_timed: Option<(u64, u32)>,
     suspension: bool,
 }
 
@@ -30,22 +34,65 @@ impl LossTracker {
             received: 0,
             lost: 0,
             recovered_fec: 0,
-            last_datagram_us: 0,
+            last_timed: None,
             suspension: false,
         }
     }
 
-    /// Call for every received datagram (source or parity). Sets
-    /// `suspension_detected` if the gap since the previous datagram exceeds
-    /// 100 ms.
-    pub fn on_datagram(&mut self, now_us: u64) {
-        if self.last_datagram_us > 0
-            && now_us.saturating_sub(self.last_datagram_us) > SUSPENSION_GAP_US
-        {
+    /// Count a received datagram that carries no usable sender timestamp --
+    /// a frame-dimensions or eviction sentinel, which bypass the emitter and
+    /// are stamped on the capture clock instead.
+    ///
+    /// Says nothing about suspension, because it cannot: see
+    /// `on_datagram_sent_at`.
+    pub fn on_datagram(&mut self, _now_us: u64) {
+        self.received += 1;
+    }
+
+    /// Count a received datagram and judge whether the path stalled before
+    /// delivering it.
+    ///
+    /// `sent_us` is the sender's emit stamp from the datagram header
+    /// (microseconds on the sender's clock, wrapping at 2^32). A stall is an
+    /// arrival gap that exceeds the *send* gap by more than
+    /// `SUSPENSION_GAP_US`: the network sat on a datagram the sender had
+    /// already let go of. That is the WiFi-suspension signature the flag
+    /// exists to report -- a hole followed by a burst.
+    ///
+    /// This used to compare arrival times alone, so any 100 ms of quiet
+    /// counted, and a sender with nothing to say is quiet. On a static
+    /// screen the first datagram after the user touched anything arrived
+    /// "after a suspension", and the server answers that flag by forcing
+    /// H.264 with hysteresis bypassed. Measured: a 9.4 s idle screen, one
+    /// change, an immediate `TileCodec -> H264 reason="suspension"`.
+    ///
+    /// It then could not leave. Only tile datagrams are counted here, and
+    /// H.264 mode sends almost none, so each stray one arrived after a long
+    /// gap and re-raised the flag; when the classifier did get out, the
+    /// first tile datagram of the new mode arrived a full H.264 dwell after
+    /// the last and sent it straight back. That is the `suspension` /
+    /// `cost_comparison` flip every ~1.2 s seen on any changing content.
+    ///
+    /// A stamp older than the baseline is a retransmission or an FEC replay
+    /// overtaken by newer traffic. It is counted and otherwise ignored: its
+    /// lateness is its own, not the path's.
+    pub fn on_datagram_sent_at(&mut self, now_us: u64, sent_us: u32) {
+        self.received += 1;
+        let Some((prev_arrival, prev_sent)) = self.last_timed else {
+            self.last_timed = Some((now_us, sent_us));
+            return;
+        };
+        // Signed, so that the wrap at 2^32 us (71.6 min) reads as a small
+        // forward step rather than a huge backward one.
+        let send_gap = sent_us.wrapping_sub(prev_sent) as i32;
+        if send_gap < 0 {
+            return;
+        }
+        let arrival_gap = now_us.saturating_sub(prev_arrival);
+        if arrival_gap > send_gap as u64 + SUSPENSION_GAP_US {
             self.suspension = true;
         }
-        self.last_datagram_us = now_us;
-        self.received += 1;
+        self.last_timed = Some((now_us, sent_us));
     }
 
     /// Call when a stale assembly is evicted with missing fragments.
