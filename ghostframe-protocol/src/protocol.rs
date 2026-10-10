@@ -579,6 +579,20 @@ pub fn max_frame_fragment_payload(max_datagram_size: usize) -> usize {
     max_datagram_size.saturating_sub(FRAME_HEADER_SIZE)
 }
 
+/// As [`max_frame_fragment_payload`], for a frame whose fragments will be
+/// covered by FEC parity.
+///
+/// A parity datagram carries the XOR of its group's payloads, as long as the
+/// longest of them, behind its own [`crate::fec::PARITY_HEADER_SIZE`]-byte
+/// group header. Fragments cut to fill a datagram exactly therefore yield a
+/// parity that is three bytes too big to send: quinn refuses it as
+/// `TooLarge`, and every group holding a full-size fragment -- all of them
+/// but, at best, a frame's last -- goes out unprotected. Measured: 13 of 52
+/// H.264 datagrams in one session, every one a parity.
+pub fn max_fec_frame_fragment_payload(max_datagram_size: usize) -> usize {
+    max_frame_fragment_payload(max_datagram_size).saturating_sub(crate::fec::PARITY_HEADER_SIZE)
+}
+
 // ---------------------------------------------------------------------------
 // build_frame_parity_datagram
 // ---------------------------------------------------------------------------
@@ -1284,6 +1298,36 @@ mod tests {
             is_tile_datagram(&tile_buf),
             "tile datagram must have bit 31 = 1"
         );
+    }
+
+    /// Everything a FEC-protected frame puts on the wire has to fit the
+    /// datagram limit -- the parity too, which is the one that did not.
+    #[test]
+    fn a_protected_frames_parity_fits_the_datagram_limit() {
+        let max_datagram = 1198;
+        let payload = vec![0xA5u8; 10_000];
+        let datagrams = fragment_frame(
+            7,
+            0,
+            true,
+            &payload,
+            max_fec_frame_fragment_payload(max_datagram),
+        );
+        assert!(datagrams.len() > 2);
+        let sources: Vec<&[u8]> = datagrams.iter().map(|d| &d[FRAME_HEADER_SIZE..]).collect();
+        let parities = crate::fec::generate_parity(&sources, 4);
+        assert!(!parities.is_empty());
+        for (_, parity) in &parities {
+            let dg = build_frame_parity_datagram(7, 0, true, datagrams.len() as u16, parity);
+            assert!(
+                dg.len() <= max_datagram,
+                "parity datagram is {} bytes, limit {max_datagram}",
+                dg.len()
+            );
+        }
+        // And nothing was left on the table: the largest parity fills it.
+        let largest = parities.iter().map(|(_, p)| p.len()).max().unwrap();
+        assert_eq!(FRAME_HEADER_SIZE + largest, max_datagram);
     }
 
     #[test]
