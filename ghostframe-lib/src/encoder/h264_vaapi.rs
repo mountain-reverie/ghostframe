@@ -741,8 +741,10 @@ impl FullFrameEncoder {
                 self.encoder.send_frame(&hw_frame)?;
             } else {
                 // Software fallback: convert NV12 → YUV420P via swscale.
-                let scaler = self.scaler.get_or_insert_with(|| {
-                    scaling::Context::get(
+                // Propagate a failed swscale allocation instead of panicking
+                // the encoder thread (and with it the server).
+                if self.scaler.is_none() {
+                    self.scaler = Some(scaling::Context::get(
                         Pixel::NV12,
                         width,
                         height,
@@ -750,9 +752,9 @@ impl FullFrameEncoder {
                         width,
                         height,
                         scaling::Flags::FAST_BILINEAR,
-                    )
-                    .expect("swscale NV12→YUV420P context failed")
-                });
+                    )?);
+                }
+                let scaler = self.scaler.as_mut().expect("scaler set just above");
 
                 let mut yuv_frame = frame::Video::empty();
                 scaler.run(&sw_frame, &mut yuv_frame)?;
@@ -948,8 +950,8 @@ impl FullFrameEncoder {
             // Scale BGRA → YUV420P. The scaler is lazily created on first
             // use so it always matches the actual input pixel format
             // (BGRA here vs NV12 in `encode_nv12_buffer`).
-            let scaler = self.scaler.get_or_insert_with(|| {
-                scaling::Context::get(
+            if self.scaler.is_none() {
+                self.scaler = Some(scaling::Context::get(
                     Pixel::BGRA,
                     width,
                     height,
@@ -957,9 +959,9 @@ impl FullFrameEncoder {
                     width,
                     height,
                     scaling::Flags::FAST_BILINEAR,
-                )
-                .expect("swscale BGRA→YUV420P context failed")
-            });
+                )?);
+            }
+            let scaler = self.scaler.as_mut().expect("scaler set just above");
             let mut yuv_frame = frame::Video::empty();
             scaler.run(&bgra_frame, &mut yuv_frame)?;
             yuv_frame.set_pts(Some(pts));
