@@ -26,8 +26,8 @@ typedef enum gf_result {
   GF_ERR_INVALID = 2,
   /**
    * The call is not valid for the client's current state: `connect`
-   * called twice, input or a display-mode request sent while not
-   * connected, or the handle busy in `connect`/`disconnect`.
+   * called twice, input or a display-mode request sent before connect
+   * or after disconnect, or the handle busy in `connect`/`disconnect`.
    */
   GF_ERR_STATE = 3,
   /**
@@ -73,19 +73,23 @@ typedef enum gf_handle_type {
  *   handle may be running or start afterwards. The library cannot enforce
  *   this; calling it concurrently is undefined behaviour.
  * - `gf_client_connect` and `gf_client_disconnect` take the handle
- *   exclusively for their duration (`connect` blocks for seconds). While
- *   one runs, calls from other threads do not block and do not fail the
- *   process: `gf_client_next_event` and `gf_client_acquire_frame` return
+ *   exclusively for their duration (`connect` blocks for seconds; they
+ *   wait for each other rather than cancelling). While one runs, other
+ *   threads' calls do not block: `gf_client_acquire_frame` returns
  *   `GF_AGAIN`, `gf_client_push_*` and `gf_client_request_display_mode`
- *   return `GF_ERR_STATE`, and `gf_client_release_frame` is a no-op.
- *   `gf_client_event_fd` and `gf_client_supports_h264` always work, so the
- *   event fd can be put in a poll set before `connect`.
+ *   return `GF_ERR_STATE`, and `gf_client_release_frame` has no effect
+ *   (retry it afterwards). `gf_client_next_event`, `gf_client_event_fd`
+ *   and `gf_client_supports_h264` always work, so the event fd can be put
+ *   in a poll set before `connect`.
  * - Events are not tied to a thread: `gf_client_next_event` may be called
  *   from any thread, and each event is delivered to exactly one caller.
  *
  * Frames do not survive `gf_client_disconnect`: every `gf_frame` acquired
- * before it, with its fds and `damage` pointer, is invalid afterwards, and
- * frame ids restart on the next `gf_client_connect`.
+ * before it, with its fds and `damage` pointer, is invalid afterwards (do
+ * not release it), and frame ids restart on the next `gf_client_connect`.
+ * Like `gf_client_destroy`, disconnect must be externally synchronised
+ * against any thread still using an acquired frame (importing its fds or
+ * reading `damage`).
  */
 typedef struct gf_client gf_client;
 
@@ -283,8 +287,8 @@ int32_t gf_client_event_fd(const struct gf_client *c);
 bool gf_client_supports_h264(const struct gf_client *c);
 
 /**
- * Pop the oldest queued event. Never blocks. Returns `GF_AGAIN` when the
- * queue is empty (or while connect/disconnect is running).
+ * Pop the oldest queued event. Never blocks, even during connect.
+ * Returns `GF_AGAIN` when the queue is empty.
  *
  * `out->struct_size` must be `sizeof(gf_event)`. `out` is written only on
  * `GF_OK`; all of its fields are then initialised.
@@ -329,7 +333,8 @@ enum gf_result gf_client_disconnect(struct gf_client *c);
  *
  * `out->struct_size` must be `sizeof(gf_frame)`. `out` is written only on
  * `GF_OK`. Every frame returned must be passed to
- * `gf_client_release_frame` exactly once.
+ * `gf_client_release_frame` exactly once (unless `gf_client_disconnect`
+ * intervenes: see the threading contract on `gf_client`).
  *
  * # Safety
  * `c` and `out` must each be null or point to valid memory as documented
@@ -353,7 +358,7 @@ void gf_client_release_frame(const struct gf_client *c, uint32_t frame_id);
 /**
  * Ask the server to switch to `width` x `height`. Fire and forget: the
  * outcome arrives as `GF_EVENT_RESIZED`. Call it on every window resize;
- * the server debounces. `GF_ERR_STATE` when not connected.
+ * the server debounces. `GF_ERR_STATE` before connect or after disconnect.
  *
  * # Safety
  * `c` must be null or a valid, live `gf_client` pointer.
@@ -363,7 +368,7 @@ enum gf_result gf_client_request_display_mode(const struct gf_client *c,
                                               uint16_t height);
 
 /**
- * Send a pointer motion. `GF_ERR_STATE` when not connected.
+ * Send a pointer motion. `GF_ERR_STATE` before connect or after disconnect.
  *
  * # Safety
  * `c` must be null or a valid, live `gf_client` pointer.
@@ -371,8 +376,8 @@ enum gf_result gf_client_request_display_mode(const struct gf_client *c,
 enum gf_result gf_client_push_pointer_motion(const struct gf_client *c, int16_t x, int16_t y);
 
 /**
- * Send a pointer button press or release. `GF_ERR_STATE` when not
- * connected.
+ * Send a pointer button press or release. `GF_ERR_STATE` before connect
+ * or after disconnect.
  *
  * # Safety
  * `c` must be null or a valid, live `gf_client` pointer.
@@ -384,7 +389,7 @@ enum gf_result gf_client_push_pointer_button(const struct gf_client *c,
                                              bool down);
 
 /**
- * Send a wheel scroll. `GF_ERR_STATE` when not connected.
+ * Send a wheel scroll. `GF_ERR_STATE` before connect or after disconnect.
  *
  * # Safety
  * `c` must be null or a valid, live `gf_client` pointer.
@@ -392,8 +397,8 @@ enum gf_result gf_client_push_pointer_button(const struct gf_client *c,
 enum gf_result gf_client_push_wheel(const struct gf_client *c, int16_t dx, int16_t dy);
 
 /**
- * Send a key press or release (X11 keysym). `GF_ERR_STATE` when not
- * connected.
+ * Send a key press or release (X11 keysym). `GF_ERR_STATE` before connect
+ * or after disconnect.
  *
  * # Safety
  * `c` must be null or a valid, live `gf_client` pointer.

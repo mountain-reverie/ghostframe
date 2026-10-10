@@ -57,19 +57,23 @@ const MAX_PREFERRED_MODIFIERS: u32 = 256;
 ///   handle may be running or start afterwards. The library cannot enforce
 ///   this; calling it concurrently is undefined behaviour.
 /// - `gf_client_connect` and `gf_client_disconnect` take the handle
-///   exclusively for their duration (`connect` blocks for seconds). While
-///   one runs, calls from other threads do not block and do not fail the
-///   process: `gf_client_next_event` and `gf_client_acquire_frame` return
+///   exclusively for their duration (`connect` blocks for seconds; they
+///   wait for each other rather than cancelling). While one runs, other
+///   threads' calls do not block: `gf_client_acquire_frame` returns
 ///   `GF_AGAIN`, `gf_client_push_*` and `gf_client_request_display_mode`
-///   return `GF_ERR_STATE`, and `gf_client_release_frame` is a no-op.
-///   `gf_client_event_fd` and `gf_client_supports_h264` always work, so the
-///   event fd can be put in a poll set before `connect`.
+///   return `GF_ERR_STATE`, and `gf_client_release_frame` has no effect
+///   (retry it afterwards). `gf_client_next_event`, `gf_client_event_fd`
+///   and `gf_client_supports_h264` always work, so the event fd can be put
+///   in a poll set before `connect`.
 /// - Events are not tied to a thread: `gf_client_next_event` may be called
 ///   from any thread, and each event is delivered to exactly one caller.
 ///
 /// Frames do not survive `gf_client_disconnect`: every `gf_frame` acquired
-/// before it, with its fds and `damage` pointer, is invalid afterwards, and
-/// frame ids restart on the next `gf_client_connect`.
+/// before it, with its fds and `damage` pointer, is invalid afterwards (do
+/// not release it), and frame ids restart on the next `gf_client_connect`.
+/// Like `gf_client_destroy`, disconnect must be externally synchronised
+/// against any thread still using an acquired frame (importing its fds or
+/// reading `damage`).
 pub struct gf_client {
     // Read-locked (with `try_read`, never blocking) by every call;
     // write-locked only by connect/disconnect. This is what makes the
@@ -79,6 +83,10 @@ pub struct gf_client {
     // write lock: both are fixed for the `Client`'s life.
     event_fd: i32,
     supports_h264: bool,
+    // The event queue has its own lock, so events stay readable (and the
+    // level-triggered event fd stays drainable) while connect holds the
+    // write lock.
+    events: std::sync::Arc<ghostframe_client_native::event::EventQueue>,
     // Not part of the public contract: per-`frame_id` stash of the converted
     // damage list, so `gf_frame::damage` has somewhere stable to point until
     // `gf_client_release_frame`. `Client::acquire_frame` hands back an owned
@@ -252,6 +260,7 @@ pub unsafe extern "C" fn gf_client_create(
         let handle = Box::new(gf_client {
             event_fd: client.event_fd(),
             supports_h264: client.supports_h264(),
+            events: client.event_queue(),
             inner: RwLock::new(client),
             damage: Mutex::new(HashMap::new()),
         });
@@ -326,8 +335,8 @@ pub unsafe extern "C" fn gf_client_supports_h264(c: *const gf_client) -> bool {
     .unwrap_or(false)
 }
 
-/// Pop the oldest queued event. Never blocks. Returns `GF_AGAIN` when the
-/// queue is empty (or while connect/disconnect is running).
+/// Pop the oldest queued event. Never blocks, even during connect.
+/// Returns `GF_AGAIN` when the queue is empty.
 ///
 /// `out->struct_size` must be `sizeof(gf_event)`. `out` is written only on
 /// `GF_OK`; all of its fields are then initialised.
@@ -351,13 +360,9 @@ pub unsafe extern "C" fn gf_client_next_event(
         }
         // SAFETY: non-null per the checks above; validity is the caller's.
         let handle = unsafe { &*c };
-        let Some(guard) = handle.read() else {
+        let Some(ev) = handle.events.pop() else {
             return gf_result::GF_AGAIN;
         };
-        let Some(ev) = guard.next_event() else {
-            return gf_result::GF_AGAIN;
-        };
-        drop(guard);
 
         // Every field is written through a raw pointer: the caller's memory
         // may be uninitialised (a `malloc`ed `gf_event`), and a `&mut`
@@ -486,7 +491,8 @@ pub unsafe extern "C" fn gf_client_disconnect(c: *mut gf_client) -> gf_result {
 ///
 /// `out->struct_size` must be `sizeof(gf_frame)`. `out` is written only on
 /// `GF_OK`. Every frame returned must be passed to
-/// `gf_client_release_frame` exactly once.
+/// `gf_client_release_frame` exactly once (unless `gf_client_disconnect`
+/// intervenes: see the threading contract on `gf_client`).
 ///
 /// # Safety
 /// `c` and `out` must each be null or point to valid memory as documented
@@ -605,17 +611,23 @@ pub unsafe extern "C" fn gf_client_release_frame(c: *const gf_client, frame_id: 
         // never acquired may still be sitting unacquired in the library's
         // slot, and releasing its buffer would free a dmabuf that
         // `gf_client_acquire_frame` can still hand out.
-        let acquired = handle
-            .damage
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&frame_id)
-            .is_some();
-        if !acquired {
+        let mut store = handle.damage.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(damage) = store.remove(&frame_id) else {
             return;
-        }
-        if let Some(guard) = handle.read() {
-            guard.release_frame(frame_id);
+        };
+        drop(store);
+        match handle.read() {
+            Some(guard) => guard.release_frame(frame_id),
+            // connect/disconnect is running. Keep the frame acquirable-for-
+            // release so the caller can retry; dropping it here would leak
+            // the buffer for the rest of the session.
+            None => {
+                handle
+                    .damage
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(frame_id, damage);
+            }
         }
     });
 }
@@ -642,7 +654,7 @@ fn with_connected_client(c: *const gf_client, f: impl FnOnce(&Client)) -> gf_res
 
 /// Ask the server to switch to `width` x `height`. Fire and forget: the
 /// outcome arrives as `GF_EVENT_RESIZED`. Call it on every window resize;
-/// the server debounces. `GF_ERR_STATE` when not connected.
+/// the server debounces. `GF_ERR_STATE` before connect or after disconnect.
 ///
 /// # Safety
 /// `c` must be null or a valid, live `gf_client` pointer.
@@ -655,7 +667,7 @@ pub unsafe extern "C" fn gf_client_request_display_mode(
     with_connected_client(c, |cl| cl.request_display_mode(width, height))
 }
 
-/// Send a pointer motion. `GF_ERR_STATE` when not connected.
+/// Send a pointer motion. `GF_ERR_STATE` before connect or after disconnect.
 ///
 /// # Safety
 /// `c` must be null or a valid, live `gf_client` pointer.
@@ -668,8 +680,8 @@ pub unsafe extern "C" fn gf_client_push_pointer_motion(
     with_connected_client(c, |cl| cl.push_pointer_motion(x, y))
 }
 
-/// Send a pointer button press or release. `GF_ERR_STATE` when not
-/// connected.
+/// Send a pointer button press or release. `GF_ERR_STATE` before connect
+/// or after disconnect.
 ///
 /// # Safety
 /// `c` must be null or a valid, live `gf_client` pointer.
@@ -684,7 +696,7 @@ pub unsafe extern "C" fn gf_client_push_pointer_button(
     with_connected_client(c, |cl| cl.push_pointer_button(x, y, button, down))
 }
 
-/// Send a wheel scroll. `GF_ERR_STATE` when not connected.
+/// Send a wheel scroll. `GF_ERR_STATE` before connect or after disconnect.
 ///
 /// # Safety
 /// `c` must be null or a valid, live `gf_client` pointer.
@@ -693,8 +705,8 @@ pub unsafe extern "C" fn gf_client_push_wheel(c: *const gf_client, dx: i16, dy: 
     with_connected_client(c, |cl| cl.push_wheel(dx, dy))
 }
 
-/// Send a key press or release (X11 keysym). `GF_ERR_STATE` when not
-/// connected.
+/// Send a key press or release (X11 keysym). `GF_ERR_STATE` before connect
+/// or after disconnect.
 ///
 /// # Safety
 /// `c` must be null or a valid, live `gf_client` pointer.
@@ -779,7 +791,7 @@ mod tests {
     fn message_of(msg: &str) -> [u8; 256] {
         let mut dst = [0x55 as libc::c_char; 256];
         unsafe { fill_message(&mut dst, msg) };
-        dst.map(|b| b as u8)
+        dst.map(|b| b.to_ne_bytes()[0])
     }
 
     #[test]

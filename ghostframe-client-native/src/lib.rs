@@ -496,6 +496,12 @@ impl Client {
         self.queue.as_raw_fd()
     }
 
+    /// The event queue, shared so an embedder can drain it without taking
+    /// any lock of its own. Fixed for the `Client`'s life.
+    pub fn event_queue(&self) -> Arc<EventQueue> {
+        Arc::clone(&self.queue)
+    }
+
     /// Whether a session is up, i.e. whether `push_*` and
     /// `request_display_mode` will queue anything. Advisory: the state can
     /// change right after the call.
