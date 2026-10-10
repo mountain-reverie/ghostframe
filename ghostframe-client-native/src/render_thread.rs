@@ -72,6 +72,30 @@ fn handle_debug_map_frame(
     })
 }
 
+/// Withdraw a published frame the host has not acquired, releasing its buffer
+/// back to the ring.
+///
+/// The `published` slot holds the LATEST frame only. Publishing over a frame
+/// the host never acquired drops its `PublishedFrame` on the floor, but the
+/// ring still counts that buffer `in_flight` and only `release` clears it --
+/// and the host will never release a frame it was never handed. Each such
+/// overwrite therefore leaked one export buffer for good, until a host that
+/// presents slower than the server sends starved the ring (`publish` returning
+/// `None` forever).
+///
+/// Also run before a `FrameDimensions` resize: the unacquired frame names a
+/// buffer from the old ring, and handing out its fd afterwards is a
+/// use-after-close.
+fn withdraw_unacquired(
+    published: &Mutex<Option<PublishedFrame>>,
+    renderer: &mut Option<Renderer>,
+) {
+    let stale = published.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let (Some(pf), Some(r)) = (stale, renderer.as_mut()) {
+        r.release(pf.frame_id);
+    }
+}
+
 /// Route one core event to the renderer, lazily constructing it on the
 /// first `FrameDimensions` (the earliest point at which a size is known --
 /// see the design doc's "Allocation timing" note). Returns whether a
@@ -83,6 +107,7 @@ fn handle_core_event(
     renderer: &mut Option<Renderer>,
     ev: CoreEvent,
     queue: &EventQueue,
+    published: &Mutex<Option<PublishedFrame>>,
     export_buffers: usize,
     host_visible: bool,
     preferred_modifiers: &[u64],
@@ -117,6 +142,9 @@ fn handle_core_event(
         // `Renderer::new` already sized the framebuffer/ring to this
         // event's dimensions; there is nothing further to apply from it.
         return true;
+    }
+    if matches!(ev, CoreEvent::FrameDimensions { .. }) {
+        withdraw_unacquired(published, renderer);
     }
     renderer
         .as_mut()
@@ -376,6 +404,7 @@ pub(crate) fn run(
                     &mut renderer,
                     ev,
                     &queue,
+                    &published,
                     export_buffers,
                     host_visible,
                     &preferred_modifiers,
@@ -434,6 +463,7 @@ pub(crate) fn run(
                         &mut renderer,
                         ev,
                         &queue,
+                        &published,
                         export_buffers,
                         host_visible,
                         &preferred_modifiers,
@@ -448,6 +478,10 @@ pub(crate) fn run(
         }
 
         if got_event {
+            // The slot is latest-wins: whatever the host has not picked up is
+            // superseded by what we publish next. Release it first, so its
+            // buffer is free for this very publish.
+            withdraw_unacquired(&published, &mut renderer);
             if let Some(r) = renderer.as_mut() {
                 r.flush(&ctx);
                 let published_frame = r.publish(&ctx);
@@ -480,5 +514,80 @@ pub(crate) fn run(
         if shutdown {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn tile(x: u8) -> RenderMsg {
+        RenderMsg::Core(CoreEvent::TileReady {
+            frame_seq: 0,
+            tile_x: x,
+            tile_y: 0,
+            rgba: vec![0x80; 32 * 32 * 4],
+        })
+    }
+
+    /// Wait for the next `FrameReady`, or `None` after `timeout`.
+    fn next_frame_ready(queue: &EventQueue, timeout: Duration) -> Option<u32> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            match queue.pop() {
+                Some(ClientEvent::FrameReady { frame_id }) => return Some(frame_id),
+                Some(ClientEvent::Error { message }) => panic!("render thread error: {message}"),
+                Some(_) => {}
+                None => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        None
+    }
+
+    /// A host that never acquires a frame must not be able to starve the export
+    /// ring. Two buffers, a host that acquires nothing, and far more publishes
+    /// than buffers: every publish overwrites the unacquired frame in the
+    /// `published` slot, and unless that overwrite releases the superseded
+    /// frame's buffer, the ring runs dry after two and `FrameReady` stops.
+    #[test]
+    fn overwriting_an_unacquired_frame_releases_its_buffer() {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let queue = Arc::new(EventQueue::new().expect("event queue"));
+        let published = Arc::new(Mutex::new(None));
+        let handle = {
+            let (queue, published) = (Arc::clone(&queue), Arc::clone(&published));
+            std::thread::spawn(move || run(ready_tx, rx, queue, published, 2, false, vec![], false))
+        };
+        if ready_rx.recv().expect("ready").is_err() {
+            eprintln!("SKIP: no GPU adapter that can export dmabufs");
+            let _ = handle.join();
+            return;
+        }
+
+        tx.send(RenderMsg::Core(CoreEvent::FrameDimensions {
+            width: 128,
+            height: 128,
+        }))
+        .unwrap();
+        // Strictly more publishes than export buffers (2). Each batch is
+        // separated by waiting for its FrameReady so they cannot coalesce.
+        let publishes = 6;
+        let mut seen = 0;
+        for i in 0..publishes {
+            tx.send(tile((i % 4) as u8)).unwrap();
+            if next_frame_ready(&queue, Duration::from_secs(10)).is_none() {
+                break;
+            }
+            seen += 1;
+        }
+        tx.send(RenderMsg::Shutdown).unwrap();
+        handle.join().unwrap();
+        assert_eq!(
+            seen, publishes,
+            "ring starved after {seen} publishes with 2 buffers: an overwritten, \
+             never-acquired frame kept its buffer in flight"
+        );
     }
 }
