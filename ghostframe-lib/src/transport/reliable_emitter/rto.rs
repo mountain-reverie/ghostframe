@@ -163,19 +163,30 @@ pub const ACK_DEADLINE_CEILING: Duration = Duration::from_secs(2);
 /// `a_lossless_link_with_a_real_rtt_does_not_retransmit` in
 /// `browserless_runner.rs` for the regression gate.
 pub fn rto_for_attempt(ack_p95: Option<Duration>, attempts: u8) -> Duration {
+    rto_for_attempt_with(crate::config::emitter_config(), ack_p95, attempts)
+}
+
+/// [`rto_for_attempt`] against an explicit `EmitterConfig`. With
+/// `EmitterConfig::default()` the result is bit-identical to the original
+/// constants-only computation.
+pub fn rto_for_attempt_with(
+    cfg: &crate::config::EmitterConfig,
+    ack_p95: Option<Duration>,
+    attempts: u8,
+) -> Duration {
     // `None` is the tracker saying it has no trustworthy measurement yet,
     // which is a different fact from a fast path. Assume the worst until
     // told otherwise; see `ACK_DEADLINE_COLD_START` for why slow is the safe
     // direction to be wrong in.
     let base = match ack_p95 {
-        Some(p95) => (p95 * 2).clamp(ACK_DEADLINE_FLOOR, ACK_DEADLINE_CEILING),
-        None => ACK_DEADLINE_COLD_START,
+        Some(p95) => (p95 * 2).clamp(cfg.ack_deadline_floor, cfg.ack_deadline_ceiling),
+        None => cfg.ack_deadline_cold_start,
     };
     let shift = attempts.min(8) as u32;
     let backoff = base
         .checked_mul(RTO_BACKOFF_FACTOR.pow(shift))
-        .unwrap_or(RTO_BACKOFF_MAX);
-    backoff.min(RTO_BACKOFF_MAX)
+        .unwrap_or(cfg.rto_backoff_max);
+    backoff.min(cfg.rto_backoff_max)
 }
 
 #[cfg(test)]
@@ -310,5 +321,45 @@ mod tests {
         assert_eq!(w.pop_due(t0 + Duration::from_millis(35)), Some(k3));
         // At t0+100ms, k1 due
         assert_eq!(w.pop_due(t0 + Duration::from_millis(100)), Some(k1));
+    }
+
+    #[test]
+    fn config_overrides_move_every_term_of_the_rto() {
+        use crate::config::EmitterConfig;
+        let d = EmitterConfig::default();
+        // Default config reproduces the constants-only behaviour.
+        assert_eq!(rto_for_attempt_with(&d, None, 0), ACK_DEADLINE_COLD_START);
+        assert_eq!(
+            rto_for_attempt_with(&d, Some(Duration::from_millis(1)), 0),
+            ACK_DEADLINE_FLOOR
+        );
+        assert_eq!(
+            rto_for_attempt_with(&d, Some(Duration::from_secs(60)), 0),
+            ACK_DEADLINE_CEILING
+        );
+        assert_eq!(rto_for_attempt_with(&d, None, 255), RTO_BACKOFF_MAX);
+
+        let cfg = EmitterConfig {
+            rto_backoff_max: Duration::from_secs(9),
+            ack_deadline_floor: Duration::from_millis(300),
+            ack_deadline_cold_start: Duration::from_millis(400),
+            ack_deadline_ceiling: Duration::from_secs(4),
+        };
+        assert_eq!(
+            rto_for_attempt_with(&cfg, None, 0),
+            Duration::from_millis(400)
+        );
+        assert_eq!(
+            rto_for_attempt_with(&cfg, Some(Duration::from_millis(1)), 0),
+            Duration::from_millis(300)
+        );
+        assert_eq!(
+            rto_for_attempt_with(&cfg, Some(Duration::from_secs(60)), 0),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            rto_for_attempt_with(&cfg, None, 255),
+            Duration::from_secs(9)
+        );
     }
 }

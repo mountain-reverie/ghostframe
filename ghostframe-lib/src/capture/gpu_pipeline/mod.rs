@@ -51,7 +51,7 @@ const UNIQUE_COLORS_UNKNOWN_SENTINEL: u32 = u16::MAX as u32;
 /// M3.3c escalation cap: maximum number of idle-escalation candidates the
 /// io_bridge will dispatch in a single frame. Bounds GPU memory for the
 /// dedicated escalation_coefficients_buffer (K × 3072 × 4 = 6 MB at K=512).
-pub const MAX_ESCALATION_PER_FRAME: usize = 512;
+pub(crate) const MAX_ESCALATION_PER_FRAME: usize = 512;
 
 // ---------------------------------------------------------------------------
 // Public types
