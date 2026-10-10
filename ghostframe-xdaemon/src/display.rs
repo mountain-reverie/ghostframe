@@ -7,7 +7,6 @@
 //! modelines, millimetres -- stays inside this module; the trait itself
 //! must not gain an X concept. See the M4b design doc §5 and §7.
 
-use std::env;
 use std::sync::Mutex;
 
 use x11rb::connection::Connection;
@@ -51,7 +50,7 @@ impl XrandrDisplay {
     /// Errors if no DISPLAY, RandR is missing, or there is no connected
     /// output -- the caller (xdaemon's `main`) logs and continues with no
     /// display controller, exactly like `XTestInjector::new`.
-    pub fn new() -> anyhow::Result<Self> {
+    pub fn new(max_resolution: Option<String>) -> anyhow::Result<Self> {
         use anyhow::{anyhow, Context};
 
         let (conn, screen_num) =
@@ -113,7 +112,6 @@ impl XrandrDisplay {
             "XrandrDisplay connected"
         );
 
-        let max_resolution = env::var("GHOSTFRAME_ATTACH_MAX_RESOLUTION").ok();
         tracing::info!(
             max_resolution = ?max_resolution,
             "display controller ceiling clamp"
