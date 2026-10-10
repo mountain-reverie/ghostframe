@@ -39,9 +39,10 @@ impl LossTracker {
         }
     }
 
-    /// Count a received datagram that carries no usable sender timestamp --
-    /// a frame-dimensions or eviction sentinel, which bypass the emitter and
-    /// are stamped on the capture clock instead.
+    /// Count a datagram whose timing says nothing about the path: a
+    /// frame-dimensions or eviction sentinel, which bypass the emitter and
+    /// are stamped on the capture clock instead, or one rebuilt from FEC
+    /// parity, which was never delivered at all.
     ///
     /// Says nothing about suspension, because it cannot: see
     /// `on_datagram_sent_at`.
@@ -73,9 +74,13 @@ impl LossTracker {
     /// the last and sent it straight back. That is the `suspension` /
     /// `cost_comparison` flip every ~1.2 s seen on any changing content.
     ///
-    /// A stamp older than the baseline is a retransmission or an FEC replay
-    /// overtaken by newer traffic. It is counted and otherwise ignored: its
-    /// lateness is its own, not the path's.
+    /// A stamp older than the baseline is a datagram overtaken by newer
+    /// traffic. It is counted and otherwise ignored: its lateness is its
+    /// own, not the path's.
+    ///
+    /// Only for datagrams that came off the wire. One rebuilt from FEC
+    /// parity has a stamp but no arrival, and the caller must not time it:
+    /// see `on_datagram`.
     pub fn on_datagram_sent_at(&mut self, now_us: u64, sent_us: u32) {
         self.received += 1;
         let Some((prev_arrival, prev_sent)) = self.last_timed else {

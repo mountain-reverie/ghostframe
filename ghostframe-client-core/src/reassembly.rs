@@ -26,6 +26,15 @@ use crate::{Assembly, ClientCore, TileDelivery};
 /// Minimum bytes that carry a full tile header stack.
 const TILE_MIN: usize = DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE; // 24
 
+/// How a source tile datagram came to be in hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Provenance {
+    /// It came off the wire, just now.
+    Received,
+    /// It was reconstructed from FEC parity and the rest of its group.
+    Rebuilt,
+}
+
 impl ClientCore {
     /// Feed one received datagram. Returns decode/render events.
     pub fn handle_datagram(&mut self, bytes: &[u8], now_us: u64) -> Vec<Event> {
@@ -42,7 +51,7 @@ impl ClientCore {
         if bytes[0] == TILE_PARITY_ENVELOPE && !is_tile_datagram(bytes) {
             if let Ok(env) = TileParityEnvelope::decode(bytes) {
                 if let Some(recovered) = self.parity_decoder.receive_parity(&env) {
-                    self.handle_source_tile(&recovered, now_us, &mut events);
+                    self.handle_source_tile(&recovered, now_us, Provenance::Rebuilt, &mut events);
                 }
             }
             return events;
@@ -70,15 +79,21 @@ impl ClientCore {
         self.datagrams_tile = self.datagrams_tile.saturating_add(1);
         let wire_seq = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
         if let Some(replayed) = self.parity_decoder.record_source(wire_seq, bytes) {
-            self.handle_source_tile(&replayed, now_us, &mut events);
+            self.handle_source_tile(&replayed, now_us, Provenance::Rebuilt, &mut events);
         }
-        self.handle_source_tile(bytes, now_us, &mut events);
+        self.handle_source_tile(bytes, now_us, Provenance::Received, &mut events);
 
         events
     }
 
     /// Core per-source-tile pipeline (`handleSourceTileDatagram`).
-    fn handle_source_tile(&mut self, bytes: &[u8], now_us: u64, events: &mut Vec<Event>) {
+    fn handle_source_tile(
+        &mut self,
+        bytes: &[u8],
+        now_us: u64,
+        provenance: Provenance,
+        events: &mut Vec<Event>,
+    ) {
         if bytes.len() < TILE_MIN {
             return;
         }
@@ -103,7 +118,12 @@ impl ClientCore {
         // Sentinels are sent around the emitter and carry the capture
         // clock in `timestamp_us`, not the emit stamp tile datagrams do, so
         // their spacing means nothing next to a tile datagram's.
-        if is_sentinel {
+        //
+        // A datagram rebuilt from parity carries a real emit stamp but has
+        // no arrival to set against it: `now_us` is when the last piece of
+        // its group turned up, which can be a whole quiet spell after it
+        // was sent.
+        if is_sentinel || provenance == Provenance::Rebuilt {
             self.loss_tracker.on_datagram(now_us);
         } else {
             self.loss_tracker
