@@ -66,6 +66,10 @@ pub struct QuicServer {
     /// unrelated lines with it -- so the flood does not merely add noise, it
     /// destroys the log around the very event being diagnosed.
     unknown_conn_events: u64,
+    /// Handles accepted since the bridge last asked. The bridge arms its
+    /// never-HELLO deadline from this at accept time rather than on
+    /// `Event::Connected`, so a half-open handshake is covered too.
+    newly_accepted: Vec<ConnectionHandle>,
 }
 
 /// Bytes of un-ACKed datagrams quinn will hold before `send_datagram`
@@ -226,6 +230,7 @@ impl QuicServer {
             connections: HashMap::new(),
             cert_info: CertInfo { sha256_hex },
             unknown_conn_events: 0,
+            newly_accepted: Vec::new(),
         })
     }
 
@@ -267,6 +272,7 @@ impl QuicServer {
                         // etc.) is silent from the operator's perspective.
                         tracing::info!(?handle, %remote, "new QUIC connection accepted");
                         self.connections.insert(handle, conn);
+                        self.newly_accepted.push(handle);
                         None
                     }
                     Err(err) => {
@@ -330,18 +336,30 @@ impl QuicServer {
             .min()
     }
 
+    /// Handles accepted since the last call (oldest first).
+    pub fn take_accepted(&mut self) -> Vec<ConnectionHandle> {
+        std::mem::take(&mut self.newly_accepted)
+    }
+
     /// Fire all connection timeouts whose deadline has passed, then prune
     /// connections that have fully drained.
-    pub fn handle_timeout(&mut self, now: Instant) {
+    ///
+    /// Returns the handles that were pruned. A connection that idles out or
+    /// finishes closing is reaped here and never surfaces as
+    /// `Event::ConnectionLost`, so the caller must run its per-handle
+    /// cleanup for each returned handle.
+    pub fn handle_timeout(&mut self, now: Instant) -> Vec<ConnectionHandle> {
         for conn in self.connections.values_mut() {
             if conn.poll_timeout().is_some_and(|t| t <= now) {
                 conn.handle_timeout(now);
             }
         }
         // Prune drained connections.
+        let mut reaped = Vec::new();
         self.connections.retain(|handle, conn| {
             if conn.is_drained() {
                 tracing::debug!(?handle, "connection drained, removing");
+                reaped.push(*handle);
                 false
             } else {
                 true
@@ -349,6 +367,7 @@ impl QuicServer {
         });
         // Drain endpoint events produced by handle_timeout on connections.
         self.drain_endpoint_events();
+        reaped
     }
 
     /// Drain one application-level event from any connection.

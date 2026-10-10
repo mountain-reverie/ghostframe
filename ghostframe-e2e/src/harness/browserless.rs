@@ -418,6 +418,8 @@ async fn run_inner(mut scene: BrowserlessScene) -> anyhow::Result<BrowserlessRes
     // comment, chosen because it doesn't disturb the existing `spawn_local`
     // + abort shape the bring-up tests already depend on.
     let bwe_cell = bridge.bwe_publish_handle();
+    // Observes the server-side HELLO'd-session count; see `drive_session`.
+    let server_live_rx = bridge.connected_session_count_handle();
     // Same reasoning, same pattern, for the reliable emitter's retransmit
     // counters — see `emitter_stats_publish`'s doc comment in `io_bridge.rs`.
     let emitter_stats_cell = bridge.emitter_stats_publish_handle();
@@ -479,6 +481,7 @@ async fn run_inner(mut scene: BrowserlessScene) -> anyhow::Result<BrowserlessRes
         &mut framebuffer,
         &bwe_cell,
         &mut bwe_estimate_samples,
+        &server_live_rx,
     )
     .await;
 
@@ -591,6 +594,7 @@ async fn drive_session(
     framebuffer: &mut FrameBuffer,
     bwe_cell: &std::sync::Arc<std::sync::Mutex<ghostframe_lib::transport::bwe::BweSnapshot>>,
     bwe_samples: &mut Vec<(u64, u64)>,
+    server_live_rx: &tokio::sync::watch::Receiver<usize>,
 ) -> anyhow::Result<(Vec<ClientNetEvent>, u64, u64, u64, u64, u64)> {
     let seed = scene.seed;
 
@@ -863,6 +867,14 @@ async fn drive_session(
                 // returning the instant the session is ready.
                 break;
             }
+        }
+
+        // Injection starts only once the server has a live (HELLO'd)
+        // session. The client reports `SessionReady` before its HELLO has
+        // crossed the netsim, and the server only honours the HELLO'd
+        // session: injecting earlier would have `apply_injected_frame` see
+        // no live session and drop the frame.
+        if session_ready && next_inject_at_us.is_none() && *server_live_rx.borrow() >= 1 {
             next_inject_at_us = Some(now_us(base));
         }
 
