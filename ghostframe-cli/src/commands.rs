@@ -348,36 +348,6 @@ pub fn connect(
 /// a `Ctrl-C`-adjacent shutdown promptly.
 const POLL_TIMEOUT_MS: i32 = 100;
 
-/// Drive the render/event loop until the user quits, the window is closed,
-/// `should_quit` says to stop, or the connection drops. See the
-/// module-level pseudocode in the M2 plan for the shape this mirrors.
-///
-/// `pub`, and parameterised by `on_frame_presented`/`should_quit`, so a test
-/// can drive it directly against an already-connected `Client` and an
-/// already-open `Backend` -- built the same way `connect` builds them, just
-/// without `connect`'s login checks or its own tsnet node -- rather than
-/// spawning the CLI binary as a subprocess. That matters here because a
-/// second `tsnet.Server` per process is known not to converge a working
-/// peer datapath (see `ghostframe-e2e/tests/native_client.rs`'s module
-/// doc); a test wants to reuse a harness's existing node instead, which
-/// only the library path allows. `connect` itself calls this with no-op
-/// hooks (`&mut |_| {}`, `&mut || false`): production never quits early and
-/// has no use for a frame counter.
-///
-/// `on_frame_presented` is called with the running count immediately after
-/// each successful `backend.present`, which is the one place this loop
-/// knows a frame genuinely reached the display server -- a test asserting
-/// "a frame was presented" should assert on this, not merely on the
-/// process/loop staying alive (that would pass even with a black window).
-/// `should_quit` is polled once per iteration, before blocking in `poll`;
-/// returning `true` ends the loop the same way `ChordAction::Quit` or
-/// `WindowEvent::CloseRequested` would (`Ok(())`), without needing genuine
-/// synthetic input -- which a headless Weston has no protocol to deliver in
-/// this build (no `virtual-keyboard-unstable-v1` / `wlr-virtual-pointer`,
-/// and the headless backend has no real input devices for a compositor-side
-/// injection either). The prefix-chord -> quit *routing* itself is already
-/// covered without a display, by `ghostframe-cli/tests/event_loop.rs`'s
-/// `a_completed_quit_chord_yields_quit` and `close_requested_yields_quit`.
 /// Drive a session with no display server: drain events, cycle export buffers,
 /// stop when `should_quit` says so.
 ///
@@ -441,6 +411,36 @@ fn run_headless_loop(
     }
 }
 
+/// Drive the render/event loop until the user quits, the window is closed,
+/// `should_quit` says to stop, or the connection drops. See the
+/// module-level pseudocode in the M2 plan for the shape this mirrors.
+///
+/// `pub`, and parameterised by `on_frame_presented`/`should_quit`, so a test
+/// can drive it directly against an already-connected `Client` and an
+/// already-open `Backend` -- built the same way `connect` builds them, just
+/// without `connect`'s login checks or its own tsnet node -- rather than
+/// spawning the CLI binary as a subprocess. That matters here because a
+/// second `tsnet.Server` per process is known not to converge a working
+/// peer datapath (see `ghostframe-e2e/tests/native_client.rs`'s module
+/// doc); a test wants to reuse a harness's existing node instead, which
+/// only the library path allows. `connect` itself calls this with no-op
+/// hooks (`&mut |_| {}`, `&mut || false`): production never quits early and
+/// has no use for a frame counter.
+///
+/// `on_frame_presented` is called with the running count immediately after
+/// each successful `backend.present`, which is the one place this loop
+/// knows a frame genuinely reached the display server -- a test asserting
+/// "a frame was presented" should assert on this, not merely on the
+/// process/loop staying alive (that would pass even with a black window).
+/// `should_quit` is polled once per iteration, before blocking in `poll`;
+/// returning `true` ends the loop the same way `ChordAction::Quit` or
+/// `WindowEvent::CloseRequested` would (`Ok(())`), without needing genuine
+/// synthetic input -- which a headless Weston has no protocol to deliver in
+/// this build (no `virtual-keyboard-unstable-v1` / `wlr-virtual-pointer`,
+/// and the headless backend has no real input devices for a compositor-side
+/// injection either). The prefix-chord -> quit *routing* itself is already
+/// covered without a display, by `ghostframe-cli/tests/event_loop.rs`'s
+/// `a_completed_quit_chord_yields_quit` and `close_requested_yields_quit`.
 pub fn run_window_loop(
     client: &mut Client,
     backend: &mut dyn Backend,
