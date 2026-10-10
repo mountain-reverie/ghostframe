@@ -438,3 +438,52 @@ fn content_after_an_idle_screen_is_not_reported_as_a_suspension() {
     core.handle_datagram(&stamped_solid(4, 2, 10_410_000), 12_450_000);
     assert!(suspension_reported(&mut core, 12_500_000));
 }
+
+/// A datagram rebuilt from FEC parity did not arrive: it was reconstructed,
+/// whenever the last piece of its group happened to turn up. It still
+/// carries the stamp it was sent with, so timing it at the moment of its
+/// reconstruction reads the wait for that last piece as the path sitting
+/// on a datagram.
+///
+/// Which is how a healthy link reported a suspension at the start of every
+/// burst of motion: a parity group straddled the quiet before it, the first
+/// datagram of the new burst completed the group, and the replayed member
+/// of the old burst was measured against its own batch-mates. Measured:
+/// `arrival_gap=1978300 send_gap=0`, and an immediate
+/// `TileCodec -> H264 reason="suspension"`.
+#[test]
+fn a_datagram_rebuilt_from_parity_is_not_timed_as_an_arrival() {
+    use ghostframe_protocol::protocol::TileParityEnvelope;
+
+    let with_wire_seq = |mut dg: Vec<u8>, ws: u32| {
+        dg[8..12].copy_from_slice(&ws.to_be_bytes());
+        dg
+    };
+    // One batch, one stamp: wire_seqs 10 and 11 left the sender together.
+    let first = with_wire_seq(stamped_solid(1, 0, 1_000_000), 10);
+    let lost = with_wire_seq(stamped_solid(1, 1, 1_000_000), 11);
+    // The group's third member goes out with the next burst, 2 s on.
+    let last = with_wire_seq(stamped_solid(2, 2, 3_000_000), 12);
+
+    let parity_payload: Vec<u8> = (0..first.len())
+        .map(|i| first[i] ^ lost[i] ^ last[i])
+        .collect();
+    let mut parity = Vec::new();
+    TileParityEnvelope {
+        group_first_wire_seq: 10,
+        k: 3,
+        parity_idx: 0,
+        source_lens: vec![first.len() as u16; 3],
+        parity_payload,
+    }
+    .encode(&mut parity);
+
+    let mut core = test_core();
+    core.handle_datagram(&first, 50_000);
+    core.handle_datagram(&parity, 60_000);
+    assert_eq!(core.datagram_counts().0, 1);
+    // Delivered as promptly as the first was; completes the group, and
+    // wire_seq 11 is rebuilt and replayed on the spot.
+    core.handle_datagram(&last, 2_050_000);
+    assert!(!suspension_reported(&mut core, 2_100_000));
+}
