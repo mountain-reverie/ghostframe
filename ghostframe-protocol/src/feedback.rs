@@ -1,4 +1,4 @@
-pub const FEEDBACK_MSG_TYPE: u8 = 0x01;
+pub use crate::feedback_stream::FEEDBACK_MSG_TYPE;
 pub const FEEDBACK_SIZE: usize = 22;
 
 /// Loss / suspension report sent from the receiver back to the sender.

@@ -17,8 +17,7 @@
 //!
 //! Scale is thousandths: 1000 = 1.0, 1500 = 1.5.
 
-pub const DISPLAY_INFO_MSG_TYPE: u8 = 0x07;
-pub const DISPLAY_MODE_MSG_TYPE: u8 = 0x08;
+pub use ghostframe_protocol::feedback_stream::{DISPLAY_INFO_MSG_TYPE, DISPLAY_MODE_MSG_TYPE};
 pub const DISPLAY_INFO_SIZE: usize = 11;
 pub const DISPLAY_MODE_SIZE: usize = 5;
 

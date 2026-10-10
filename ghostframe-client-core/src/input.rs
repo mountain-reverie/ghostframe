@@ -12,7 +12,7 @@
 
 /// Input event message type. Wire layouts are documented at the top of
 /// this module; every encoder below emits this as byte 0.
-pub const INPUT_MSG_TYPE: u8 = 0x05;
+pub use ghostframe_protocol::feedback_stream::INPUT_MSG_TYPE;
 
 /// Encode a pointer-move event: [0x05, 0x01, x:i16 BE, y:i16 BE]
 pub fn encode_pointer_move(x: i16, y: i16) -> [u8; 6] {

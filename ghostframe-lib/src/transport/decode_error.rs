@@ -17,7 +17,7 @@
 //!   6 = RLE expansion overshot 1024 pixels (GPU shader)
 //!   7 = RLE expansion undershot 1024 pixels (GPU shader)
 
-pub const DECODE_ERROR_MSG_TYPE: u8 = 0x04;
+pub use ghostframe_protocol::feedback_stream::DECODE_ERROR_MSG_TYPE;
 pub const DECODE_ERROR_SIZE: usize = 5;
 
 pub const ERR_PAYLOAD_TOO_SHORT: u8 = 1;

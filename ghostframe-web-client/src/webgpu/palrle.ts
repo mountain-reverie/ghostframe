@@ -1,5 +1,11 @@
 import palrleWgsl from '../../../shaders/client/palrle_decode.wgsl?raw';
 import { createLabeledShaderModule } from './shader_module';
+import { protocol } from '../protocol_constants';
+
+/** Bytes of per-tile work record the PalRLE shader reads: 8 u32 words
+ *  (tile_x, tile_y, palette_id, count, ...). A shader struct size, not the
+ *  tile edge. */
+const TILE_WORK_BYTES = 8 * 4;
 
 /** A prevalidated PalRLE tile, ready for the GPU. Produced by the core,
  *  not derived here — the renderer no longer prevalidates. */
@@ -46,7 +52,7 @@ export class PalRlePipeline {
       if (this.errorsStaging) this.errorsStaging.destroy();
 
       this.tileWorkBuffer = this.device.createBuffer({
-        size: maxTiles * 32,
+        size: maxTiles * TILE_WORK_BYTES,
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
       });
       this.indicesBuffer = this.device.createBuffer({
@@ -87,16 +93,10 @@ export class PalRlePipeline {
     // e2e test can dump it post-run and compare against the server's
     // write_bytes log to detect (id, palette) drift.
     if (typeof window !== 'undefined') {
-      const count = (bgra.byteLength >>> 2);
-      let h = 0x811c9dc5 | 0;
-      // Match the server's fingerprint construction: count<<24 seed, then
-      // FNV-1a-ish mixing over (count * 4) BGRA bytes. Keep in sync with
-      // palette_fingerprint() in ghostframe-lib/src/encoder/pal_rle.rs.
-      let acc = (count & 0xff) << 24;
-      for (let i = 0; i < bgra.byteLength; i++) {
-        acc = Math.imul(acc, 0x01000193) + bgra[i];
-        acc = acc | 0;
-      }
+      // The same fingerprint the server logs for this palette, computed by
+      // the Rust function itself (`palette_fingerprint_bgra`) via wasm so
+      // the two sides cannot drift.
+      const acc = protocol().paletteFingerprint(bgra);
       const fpHex = (acc >>> 0).toString(16).padStart(8, '0');
       const c0 = bgra.length >= 4
         ? Array.from(bgra.slice(0, 4)).map(b => b.toString(16).padStart(2, '0')).join('')
@@ -107,10 +107,6 @@ export class PalRlePipeline {
       // Keep matched to the server-side FIFO cap (MAX_RECORDED_ENTRIES).
       // Trimmed in bulk, not with shift(): see `appendCapped` in diagnostics.ts.
       if (buf.length >= 2 * 32768) buf.splice(0, buf.length - 32768);
-      // Silence the unused-h warning — the mixed-int dance above is the
-      // important part; the seeded `h` is kept for parity with the spec but
-      // not exposed.
-      void h;
     }
   }
 

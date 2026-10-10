@@ -12,8 +12,7 @@
 //!                                    so it sends this bit clear)
 //!                            bits 2..7 reserved (must be 0; deserializer ignores)
 
-pub const HELLO_MSG_TYPE: u8 = 0x03;
-pub const HELLO_SIZE: usize = 2;
+pub use ghostframe_protocol::feedback_stream::{HELLO_MSG_TYPE, HELLO_SIZE};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ClientCapabilities {

@@ -4,6 +4,7 @@ import inverseL2Wgsl from '../../../shaders/client/cdf53_inverse_l2.wgsl?raw';
 import inverseL1Wgsl from '../../../shaders/client/cdf53_inverse_l1.wgsl?raw';
 import inverseL1Pass2Wgsl from '../../../shaders/client/cdf53_inverse_l1_pass2.wgsl?raw';
 import { createLabeledShaderModule } from './shader_module';
+import { protocol } from '../protocol_constants';
 
 /** A prevalidated Cdf53 tile pass, ready for the GPU. Produced by the core
  *  (`reassembly.rs`'s `prevalidate_cdf53`), not derived here. */
@@ -41,8 +42,8 @@ export interface PrevalidatedCdf53 {
  *
  * Cleared on `clearAllState()` (called from `WebGpuRenderer.onSessionReset`).
  */
-/** All 14 Cdf53 pass bits. */
-const FULL_PASS_MASK = (1 << 14) - 1;
+/** All Cdf53 pass bits (one per `cdf53PassCount`). */
+const fullPassMask = (): number => protocol().cdf53FullPassMask;
 
 /**
  * `passesProcessed` for a tile: how many leading bit-planes the inverse
@@ -72,13 +73,13 @@ export function computePassesProcessed(
   prevPassesProcessed: number,
   passIdx: number,
 ): number {
-  const present = presentPasses & FULL_PASS_MASK;
+  const present = presentPasses & fullPassMask();
   if (present === 0) {
     return Math.max(prevPassesProcessed, passIdx + 1);
   }
-  const resolved = (receivedMask | ~present) & FULL_PASS_MASK;
+  const resolved = (receivedMask | ~present) & fullPassMask();
   let k = 0;
-  while (k < 14 && (resolved & (1 << k)) !== 0) k++;
+  while (k < protocol().cdf53PassCount && (resolved & (1 << k)) !== 0) k++;
   return k;
 }
 
@@ -284,7 +285,7 @@ export class Cdf53Pipeline {
     });
     // Per-batch budget: a batch holds at most max_tiles × 14 passes;
     // each entry needs 5 u32 of tileWork + 96 u32 of bit-planes.
-    const maxBatchEntries = Math.max(maxTiles, 1) * 14;
+    const maxBatchEntries = Math.max(maxTiles, 1) * protocol().cdf53PassCount;
     this.tileWorkBuffer = this.device.createBuffer({
       size: maxBatchEntries * 5 * 4,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
@@ -400,9 +401,9 @@ export class Cdf53Pipeline {
         this.seenTiles.add(`${e.tileX},${e.tileY}`);
       }
     }
-    if (entries.length > this.maxTiles * 14) {
+    if (entries.length > this.maxTiles * protocol().cdf53PassCount) {
       throw new Error(
-        `Cdf53 batch ${entries.length} exceeds capacity ${this.maxTiles * 14}`,
+        `Cdf53 batch ${entries.length} exceeds capacity ${this.maxTiles * protocol().cdf53PassCount}`,
       );
     }
     // tileWork: 5 u32 per entry — tileX, tileY, gen, passIdx, bitPlanesOffset.
@@ -435,7 +436,7 @@ export class Cdf53Pipeline {
       // pass 0 teaches us it.
       this.receivedMaskCpu[tileIdx] |= 1 << e.passIdx;
       if (e.presentPasses != null) {
-        this.presentPassesCpu[tileIdx] = e.presentPasses & FULL_PASS_MASK;
+        this.presentPassesCpu[tileIdx] = e.presentPasses & fullPassMask();
       }
       // `passesProcessed` for the inverse shaders' midpoint reconstruction.
       //

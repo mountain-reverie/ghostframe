@@ -18,5 +18,6 @@ pub mod codec;
 pub mod eviction;
 pub mod fec;
 pub mod feedback;
+pub mod feedback_stream;
 pub mod protocol;
 pub mod tile;

@@ -17,6 +17,7 @@
 
 import debugGradientWgsl from '../../shaders/client/debug_gradient.wgsl?raw';
 import { createLabeledShaderModule } from './webgpu/shader_module';
+import { protocol } from './protocol_constants';
 import { frameRgba as losslessGoldenFrameRgba } from './lossless_golden';
 
 // ---------------------------------------------------------------------------
@@ -344,7 +345,7 @@ export function initDiagnostics({
     } => {
       const cov = window.__cdf53Coverage;
       if (!cov) return { refined: 0, partial: 0, total: 0 };
-      const FULL_MASK = (1 << 14) - 1;
+      const FULL_MASK = protocol().cdf53FullPassMask;
       let refined = 0;
       let partial = 0;
       for (const v of cov.values()) {

@@ -5,6 +5,7 @@ import { H264Pipeline } from './h264.js';
 import { PalRlePipeline, type PalRleTile } from './palrle.js';
 import { Cdf53Pipeline, type PrevalidatedCdf53 } from './cdf53.js';
 import { shouldSkipEncodePresent } from './idle_skip.js';
+import { protocol } from '../protocol_constants.js';
 
 export interface RawQueued {
   tileX: number;
@@ -135,9 +136,10 @@ export class WebGpuRenderer {
     }
     this.framebuffer.resize(width, height);
     this.solidPipeline.updateCanvasSize(width, height);
-    const maxTiles = Math.ceil(width / 32) * Math.ceil(height / 32);
+    const ts = protocol().tileSize;
+    const maxTiles = Math.ceil(width / ts) * Math.ceil(height / ts);
     this.palrlePipeline.resize(maxTiles, this.framebuffer.view);
-    const cols = Math.ceil(width / 32);
+    const cols = Math.ceil(width / ts);
     this.cdf53Pipeline.resize(maxTiles, this.framebuffer.view, cols);
   }
 
@@ -147,8 +149,9 @@ export class WebGpuRenderer {
    * format is rgba8unorm per Design D12).
    */
   writeRawTile(tileX: number, tileY: number, bgra: Uint8Array): void {
-    if (bgra.length !== 32 * 32 * 4) {
-      throw new Error(`writeRawTile: payload length ${bgra.length} != 4096`);
+    const ts = protocol().tileSize;
+    if (bgra.length !== protocol().tileBytes) {
+      throw new Error(`writeRawTile: payload length ${bgra.length} != ${protocol().tileBytes}`);
     }
     // Clip the destination extent to the framebuffer bounds — partial edge
     // tiles at non-32-aligned resolutions (e.g. 700×500 in e2e_edge_tiles)
@@ -156,18 +159,18 @@ export class WebGpuRenderer {
     // ("origin + size > texture.size") and silently drop the entire tile.
     const fbW = this.framebuffer.width;
     const fbH = this.framebuffer.height;
-    const dstX = tileX * 32;
-    const dstY = tileY * 32;
+    const dstX = tileX * ts;
+    const dstY = tileY * ts;
     if (dstX >= fbW || dstY >= fbH) return; // tile entirely outside framebuffer
-    const copyW = Math.min(32, fbW - dstX);
-    const copyH = Math.min(32, fbH - dstY);
+    const copyW = Math.min(ts, fbW - dstX);
+    const copyH = Math.min(ts, fbH - dstY);
 
     // BGRA→RGBA swap, only for the bytes we'll actually upload. Pack tightly
     // (bytesPerRow = copyW * 4) so writeTexture sees a contiguous source.
     const rgba = new Uint8Array(copyW * copyH * 4);
     for (let row = 0; row < copyH; row++) {
       for (let col = 0; col < copyW; col++) {
-        const srcOff = (row * 32 + col) * 4;
+        const srcOff = (row * ts + col) * 4;
         const dstOff = (row * copyW + col) * 4;
         rgba[dstOff + 0] = bgra[srcOff + 2]; // R from B-slot
         rgba[dstOff + 1] = bgra[srcOff + 1]; // G

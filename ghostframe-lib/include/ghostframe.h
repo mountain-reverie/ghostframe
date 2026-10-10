@@ -55,12 +55,6 @@
  */
 #define BweWrapper_INITIAL_BPS 2000000
 
-#define HELLO_MSG_TYPE 3
-
-#define HELLO_SIZE 2
-
-#define DECODE_ERROR_MSG_TYPE 4
-
 #define DECODE_ERROR_SIZE 5
 
 #define ERR_PAYLOAD_TOO_SHORT 1
@@ -76,10 +70,6 @@
 #define ERR_RLE_OVERSHOOT 6
 
 #define ERR_RLE_UNDERSHOOT 7
-
-#define DISPLAY_INFO_MSG_TYPE 7
-
-#define DISPLAY_MODE_MSG_TYPE 8
 
 #define DISPLAY_INFO_SIZE 11
 
@@ -105,13 +95,6 @@
  * instead of a fixed const; at 4K @ 60 fps the worst case grows ~8× further.
  */
 #define FRAGMENT_COVERAGE_CAPACITY 60000
-
-/**
- * Top-level feedback message type for input events. Routed by the first
- * byte in `IoBridge::dispatch_feedback_bytes`. Sub-kind byte at offset 1
- * selects the specific event (see `decode_input_msg`).
- */
-#define INPUT_MSG_TYPE 5
 
 #define FEC_GROUP_SIZE_K 10
 
@@ -210,9 +193,61 @@
  */
 #define PARITY_HEADER_SIZE 3
 
+#define FEEDBACK_SIZE 22
+
+/**
+ * Receiver loss/suspension report (see [`crate::feedback::ReceiverFeedback`]).
+ */
 #define FEEDBACK_MSG_TYPE 1
 
-#define FEEDBACK_SIZE 22
+/**
+ * One-shot capability advertisement, `[HELLO_MSG_TYPE, caps]`.
+ */
+#define HELLO_MSG_TYPE 3
+
+/**
+ * Encoded length of a HELLO message.
+ */
+#define HELLO_SIZE 2
+
+/**
+ * Per-tile decode failure report.
+ */
+#define DECODE_ERROR_MSG_TYPE 4
+
+/**
+ * Input event (pointer, wheel, key). A sub-kind byte follows.
+ */
+#define INPUT_MSG_TYPE 5
+
+/**
+ * Client display capability advertisement.
+ */
+#define DISPLAY_INFO_MSG_TYPE 7
+
+/**
+ * Client display mode request.
+ */
+#define DISPLAY_MODE_MSG_TYPE 8
+
+/**
+ * HELLO capability bit 0: the client can decode `indices_raw` PalRLE
+ * payloads (PalRLE flags bit 1).
+ */
+#define HELLO_CAP_INDICES_RAW 1
+
+/**
+ * HELLO capability bit 1: the client can decode H.264 and sample the
+ * resulting `GPUExternalTexture` (`texture_external`). Firefox WebGPU
+ * cannot, and sends this bit clear so the server never emits unplayable
+ * H.264.
+ */
+#define HELLO_CAP_SUPPORTS_H264 2
+
+/**
+ * HELLO capability bits that must be zero today; the server ignores them.
+ */
+#define HELLO_CAPS_RESERVED_MASK ~(HELLO_CAP_INDICES_RAW | HELLO_CAP_SUPPORTS_H264)
 
 #define DATAGRAM_HEADER_SIZE 16
 

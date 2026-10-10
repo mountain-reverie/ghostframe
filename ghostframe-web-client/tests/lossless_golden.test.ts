@@ -9,8 +9,11 @@ import {
   frameRgba,
   regionBoundarySolidPalrle,
   regionBoundaryPalrleCdf53,
-  TILE_SIZE,
 } from '../src/lossless_golden';
+import { protocol } from '../src/protocol_constants';
+
+// Read from Rust (installed by tests/setup.ts), not retyped.
+const TILE_SIZE = protocol().tileSize;
 
 const W = 1920;
 const H = 1080;

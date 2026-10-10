@@ -16,7 +16,19 @@ use ghostframe_client_core::{
 use ghostframe_protocol::ack::{
     ACK_BATCH_MSG_TYPE, ACK_ENTRY_SIZE, ACK_OVERLAP_COUNT, MAX_FRESH_ENTRIES_PER_BATCH,
 };
-use ghostframe_protocol::protocol::{TILE_NACK_ENVELOPE, TILE_PARITY_ENVELOPE};
+use ghostframe_protocol::codec::cdf53::CDF53_PASS_COUNT;
+use ghostframe_protocol::codec::pal_rle::palette_fingerprint_bgra;
+use ghostframe_protocol::eviction::{EvictionReason, EVICTION_SENTINEL_X, EVICTION_SENTINEL_Y};
+use ghostframe_protocol::feedback_stream::{
+    DISPLAY_INFO_MSG_TYPE, DISPLAY_MODE_MSG_TYPE, FEEDBACK_MSG_TYPE, HELLO_CAPS_RESERVED_MASK,
+    HELLO_CAP_INDICES_RAW, HELLO_CAP_SUPPORTS_H264,
+};
+use ghostframe_protocol::protocol::{
+    Codec, DATAGRAM_HEADER_SIZE, FRAME_DIMENSIONS_SENTINEL_X, FRAME_DIMENSIONS_SENTINEL_Y,
+    FRAME_HEADER_SIZE, TILE_DATAGRAM_FLAG, TILE_HEADER_SIZE, TILE_NACK_ENVELOPE,
+    TILE_PARITY_ENVELOPE,
+};
+use ghostframe_protocol::tile::{TILE_BYTES, TILE_SIZE};
 use wasm_bindgen::prelude::*;
 
 macro_rules! export_const {
@@ -149,4 +161,128 @@ pub fn pal_rle_variants() -> Result<JsValue, JsValue> {
         IndicesRaw: 2,
     };
     serde_wasm_bindgen::to_value(&variants).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+// ---- Feedback-stream message types the TS client does not own ----------
+export_const!("feedbackMsgType", feedback_msg_type, u8, FEEDBACK_MSG_TYPE);
+export_const!(
+    "displayInfoMsgType",
+    display_info_msg_type,
+    u8,
+    DISPLAY_INFO_MSG_TYPE
+);
+export_const!(
+    "displayModeMsgType",
+    display_mode_msg_type,
+    u8,
+    DISPLAY_MODE_MSG_TYPE
+);
+
+// ---- HELLO capability bits ---------------------------------------------
+export_const!(
+    "helloCapIndicesRaw",
+    hello_cap_indices_raw,
+    u8,
+    HELLO_CAP_INDICES_RAW
+);
+export_const!(
+    "helloCapSupportsH264",
+    hello_cap_supports_h264,
+    u8,
+    HELLO_CAP_SUPPORTS_H264
+);
+export_const!(
+    "helloCapsReservedMask",
+    hello_caps_reserved_mask,
+    u8,
+    HELLO_CAPS_RESERVED_MASK
+);
+
+// ---- Datagram geometry -------------------------------------------------
+export_const!(
+    "datagramHeaderSize",
+    datagram_header_size,
+    usize,
+    DATAGRAM_HEADER_SIZE
+);
+export_const!("tileHeaderSize", tile_header_size, usize, TILE_HEADER_SIZE);
+export_const!(
+    "frameHeaderSize",
+    frame_header_size,
+    usize,
+    FRAME_HEADER_SIZE
+);
+export_const!(
+    "tileDatagramFlag",
+    tile_datagram_flag,
+    u32,
+    TILE_DATAGRAM_FLAG
+);
+export_const!("tileSize", tile_size, u32, TILE_SIZE);
+export_const!("tileBytes", tile_bytes, usize, TILE_BYTES);
+export_const!("cdf53PassCount", cdf53_pass_count, usize, CDF53_PASS_COUNT);
+
+// ---- Sentinels and eviction -------------------------------------------
+export_const!(
+    "frameDimensionsSentinelX",
+    frame_dimensions_sentinel_x,
+    u8,
+    FRAME_DIMENSIONS_SENTINEL_X
+);
+export_const!(
+    "frameDimensionsSentinelY",
+    frame_dimensions_sentinel_y,
+    u8,
+    FRAME_DIMENSIONS_SENTINEL_Y
+);
+export_const!(
+    "evictionSentinelX",
+    eviction_sentinel_x,
+    u8,
+    EVICTION_SENTINEL_X
+);
+export_const!(
+    "evictionSentinelY",
+    eviction_sentinel_y,
+    u8,
+    EVICTION_SENTINEL_Y
+);
+export_const!(
+    "evictionReasonDisplaced",
+    eviction_reason_displaced,
+    u8,
+    EvictionReason::DisplacedByNewSession.to_byte()
+);
+
+/// The `Codec` discriminants (Skip=0 .. Cdf53=5), keyed by name.
+#[derive(Serialize)]
+#[allow(non_snake_case)]
+struct Codecs {
+    Skip: u8,
+    H264: u8,
+    PalRle: u8,
+    Solid: u8,
+    Raw: u8,
+    Cdf53: u8,
+}
+
+#[wasm_bindgen(js_name = codecs)]
+pub fn codecs() -> Result<JsValue, JsValue> {
+    let c = Codecs {
+        Skip: Codec::Skip as u8,
+        H264: Codec::H264 as u8,
+        PalRle: Codec::PalRle as u8,
+        Solid: Codec::Solid as u8,
+        Raw: Codec::Raw as u8,
+        Cdf53: Codec::Cdf53 as u8,
+    };
+    serde_wasm_bindgen::to_value(&c).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// The palette fingerprint the server logs for the same palette, over a
+/// block of `count * 4` BGRA bytes. The web client's atlas-write
+/// diagnostic calls this instead of keeping a TS copy that can drift.
+#[wasm_bindgen(js_name = paletteFingerprint)]
+pub fn palette_fingerprint(bgra: &[u8]) -> u32 {
+    palette_fingerprint_bgra(bgra)
 }
