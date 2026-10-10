@@ -22,8 +22,8 @@ pub enum gf_result {
     /// panic ever crosses the library boundary.
     GF_ERR_INVALID = 2,
     /// The call is not valid for the client's current state: `connect`
-    /// called twice, input or a display-mode request sent while not
-    /// connected, or the handle busy in `connect`/`disconnect`.
+    /// called twice, input or a display-mode request sent before connect
+    /// or after disconnect, or the handle busy in `connect`/`disconnect`.
     GF_ERR_STATE = 3,
     /// Network, tailnet or bootstrap failure.
     GF_ERR_IO = 4,
