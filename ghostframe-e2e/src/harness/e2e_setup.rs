@@ -185,14 +185,20 @@ pub async fn setup_e2e_server(spec: E2eServerSpec<'_>) -> Result<E2eServerSetup>
         None
     };
 
-    let page_url = if spec.url_query_extra.is_empty() {
-        format!("https://127.0.0.1:{}/", forwarder.port())
-    } else {
+    // `e2e=1` marks a test session (the web client gates its pixel readbacks
+    // on it) and `debug=1` installs the CDF53 GPU debug hooks. Both are
+    // absent from a production URL. Caller suffixes follow; a caller may add
+    // another `e2e=` value (e.g. `e2e=lossless`), which the client reads too.
+    let page_url = {
         let suffix = spec
             .url_query_extra
             .strip_prefix('&')
             .unwrap_or(spec.url_query_extra);
-        format!("https://127.0.0.1:{}/?{}", forwarder.port(), suffix)
+        let sep = if suffix.is_empty() { "" } else { "&" };
+        format!(
+            "https://127.0.0.1:{}/?e2e=1&debug=1{sep}{suffix}",
+            forwarder.port()
+        )
     };
 
     Ok(E2eServerSetup {
