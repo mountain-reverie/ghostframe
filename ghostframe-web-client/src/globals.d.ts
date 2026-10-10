@@ -44,9 +44,9 @@ interface Window {
   __ghostframe_framePaints: Array<{ seq: number; rafMsClient: number }> | undefined;
 
   // ----- GPU readback helpers (set at startup by diagnostics.ts) ---------------
-  __readPixel(x: number, y: number): Promise<number[]>;
-  __readPixelRect(x: number, y: number, w: number, h: number): Promise<number[]>;
-  __readGradientGolden(): Promise<{
+  __readPixel?: (x: number, y: number) => Promise<number[]>;
+  __readPixelRect?: (x: number, y: number, w: number, h: number) => Promise<number[]>;
+  __readGradientGolden?: () => Promise<{
     ok: boolean;
     mismatches: Array<{ x: number; y: number; got: number[]; want: number[] }>;
   }>;

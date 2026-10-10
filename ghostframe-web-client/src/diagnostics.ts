@@ -120,13 +120,20 @@ function fifoAppend<T>(arr: T[], item: T): void {
  *                     so they always use the up-to-date texture.
  * @param canvas       Fallback canvas for the 2-D read-back path (used
  *                     when the renderer isn't available yet).
+ * @param readbacks    Install the GPU pixel readback helpers
+ *                     (`__readPixel`, `__readPixelRect`, `__readGradientGolden`).
+ *                     Off unless the page URL has `?e2e`: they exist for the
+ *                     e2e suite, and a production session should not carry
+ *                     code that can map the framebuffer to the CPU.
  */
 export function initDiagnostics({
   getRenderer,
   canvas,
+  readbacks = false,
 }: {
   getRenderer: () => RendererRef | null;
   canvas: HTMLCanvasElement;
+  readbacks?: boolean;
 }): DiagnosticsHandle {
   // ---- stats counter -------------------------------------------------------
   const stats: { tileDatagrams: number; frameDatagrams: number } = {
@@ -139,7 +146,7 @@ export function initDiagnostics({
   }
 
   // ---- __readPixel ---------------------------------------------------------
-  if (typeof window !== 'undefined') {
+  if (readbacks && typeof window !== 'undefined') {
     window.__readPixel = async (x: number, y: number): Promise<number[]> => {
       const ref = getRenderer();
       if (!ref) {
@@ -173,7 +180,7 @@ export function initDiagnostics({
   }
 
   // ---- __readPixelRect -----------------------------------------------------
-  if (typeof window !== 'undefined') {
+  if (readbacks && typeof window !== 'undefined') {
     window.__readPixelRect = async (
       x: number, y: number, w: number, h: number,
     ): Promise<number[]> => {
@@ -221,7 +228,7 @@ export function initDiagnostics({
   // __readPixel at sample points.  Used by e2e_readpixel_correctness to
   // verify __readPixel before any production-codec pixel assertion is
   // trusted.  See spec/2026-05-15-m3.2c-verification-design.md §W2.
-  if (typeof window !== 'undefined') {
+  if (readbacks && typeof window !== 'undefined') {
     window.__readGradientGolden = async (): Promise<{
       ok: boolean;
       mismatches: Array<{ x: number; y: number; got: number[]; want: number[] }>;
@@ -266,9 +273,11 @@ export function initDiagnostics({
         [Math.min(256, fbW - 1), Math.min(256, fbH - 1)],
       ];
       const mismatches: Array<{ x: number; y: number; got: number[]; want: number[] }> = [];
+      // Installed in the same `readbacks` block as this function.
+      const readPixel = window.__readPixel!;
       for (const [x, y] of samplePoints) {
         if (x >= fbW || y >= fbH || x < 0 || y < 0) continue;
-        const got = await window.__readPixel(x, y);
+        const got = await readPixel(x, y);
         const want = [x & 0xFF, y & 0xFF, 0, 255];
         if (got[0] !== want[0] || got[1] !== want[1] || got[2] !== want[2] || got[3] !== want[3]) {
           mismatches.push({ x, y, got, want });
