@@ -23,10 +23,6 @@ const SRC = join(__dirname, '..', 'src');
 
 /** Files exempt from the sweep, with the reason. */
 const ALLOW: Record<string, string> = {
-  // Dead (zero importers) and deleted by the demolition PR, which removes
-  // these two entries with them.
-  'decoder.ts': 'dead pre-wasm wire parsing, removed in the next PR of the stack',
-  'feedback.ts': 'dead pre-wasm feedback encoders, removed in the next PR of the stack',
   'protocol_constants.ts': 'the one place that names the getters',
 };
 
@@ -88,6 +84,12 @@ export function scan(source: string): Hit[] {
     }
     // 2. enum Codec { ... } / const enum Codec.
     if (/\benum\s+Codec\b/.test(line)) push('retyped Codec enum');
+    // Codec table as an object literal, e.g. `{ Raw: 4, Solid: 3 }`.
+    if (/\b(?:Skip|H264|PalRle|Solid|Raw|Cdf53)\s*:\s*\d/.test(line)) push('retyped Codec table');
+    // A codec discriminant or message type passed/stored as a bare number.
+    if (/\bonDecodeError\(\s*\d/.test(line) || /\[0\]\s*=\s*(?:0[xX][0-9a-fA-F]+|\d)\b/.test(line)) {
+      push('wire discriminant written as a literal');
+    }
 
     // 3. magic numbers that have been retyped before.
     if (/\b(?:tile\w*|dst[XY]|cols|rows|maxTiles)\b[^;]*[*/%]\s*32\b/i.test(line) ||
@@ -123,6 +125,9 @@ describe('TypeScript sources do not retype protocol constants', () => {
       ['const EVICTION_REASON_DISPLACED = 1;', 'retyped constant EVICTION_REASON_DISPLACED'],
       ['export const FRAME_HEADER_SIZE = 14;', 'retyped constant FRAME_HEADER_SIZE'],
       ['export const enum Codec { Skip = 0 }', 'retyped Codec enum'],
+      ['const T = { Raw: 4, Solid: 3 };', 'retyped Codec table'],
+      ['onDecodeError(2, 0xFF, 0xFF, c);', 'wire discriminant written as a literal'],
+      ['buf[0] = 0x05;', 'wire discriminant written as a literal'],
       ['const dstX = tileX * 32;', 'tile edge 32 used as a literal'],
       ['const cols = Math.ceil(width / 32);', 'tile edge 32 used as a literal'],
       ['const FULL_PASS_MASK = (1 << 14) - 1;', 'CDF53 pass count 14 used as a literal'],

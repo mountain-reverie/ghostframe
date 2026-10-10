@@ -247,7 +247,7 @@
 /**
  * HELLO capability bits that must be zero today; the server ignores them.
  */
-#define HELLO_CAPS_RESERVED_MASK ~(HELLO_CAP_INDICES_RAW | HELLO_CAP_SUPPORTS_H264)
+#define HELLO_CAPS_RESERVED_MASK 252
 
 #define DATAGRAM_HEADER_SIZE 16
 
