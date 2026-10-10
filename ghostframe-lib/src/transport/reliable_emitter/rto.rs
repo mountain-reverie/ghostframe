@@ -179,7 +179,10 @@ pub fn rto_for_attempt_with(
     // told otherwise; see `ACK_DEADLINE_COLD_START` for why slow is the safe
     // direction to be wrong in.
     let base = match ack_p95 {
-        Some(p95) => (p95 * 2).clamp(cfg.ack_deadline_floor, cfg.ack_deadline_ceiling),
+        Some(p95) => (p95 * 2).clamp(
+            cfg.ack_deadline_floor.min(cfg.ack_deadline_ceiling),
+            cfg.ack_deadline_ceiling,
+        ),
         None => cfg.ack_deadline_cold_start,
     };
     let shift = attempts.min(8) as u32;

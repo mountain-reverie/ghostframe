@@ -553,7 +553,7 @@ impl Renderer {
             ppm.extend_from_slice(&px[..3]);
         }
 
-        let path = if every > 0 {
+        let path = if self.dump.every > 0 {
             format!("{prefix}.latest.ppm")
         } else {
             format!("{prefix}.{n}.ppm")
