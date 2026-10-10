@@ -126,7 +126,15 @@ jobs:
       # -- it would hide the failure from developers too. Xvfb comes from
       # _setup-system-deps. The tests draw only into a scratch pixmap of their
       # own, so they are also safe against a developer's live session.
-      - run: xvfb-run -a cargo test --workspace --bins
+      #
+      # -noreset, because Xvfb otherwise resets itself each time its last
+      # client disconnects, and a connection made during the reset is torn
+      # down. These tests are short-lived clients running in parallel, so one
+      # finishing while another connects fails the second with "Connection
+      # reset by peer". Measured with two threads connecting in a loop: 181 to
+      # 244 of 3000 connects refused without the flag, none with it.
+      # (-s replaces xvfb-run's default server arguments, hence the screen.)
+      - run: xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" cargo test --workspace --bins
       # Integration-test targets are not covered by --lib and CI names them
       # explicitly; a new tests/*.rs file runs nowhere until it is listed here.
       - run: cargo test -p ghostframe-lib --test bwe_bench
