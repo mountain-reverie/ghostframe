@@ -6,6 +6,7 @@
 //! loop) that runs on that runtime.
 
 use std::ffi::CStr;
+use std::io::Write;
 use std::os::raw::c_char;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -72,7 +73,9 @@ pub unsafe extern "C" fn gf_server_new(
 }
 
 /// Submit a frame for tiling and transmission.
-/// Returns 0 on success, -1 on failure.
+/// Returns 0 on success, -1 on failure (including a null argument, or a frame
+/// geometry that is zero, larger than 16384 per edge, has a stride below
+/// `width * 4`, or spans 4 GiB or more).
 ///
 /// # Safety
 /// `handle` must be a valid pointer from `gf_server_new`.
@@ -89,12 +92,11 @@ pub unsafe extern "C" fn gf_server_submit_frame(
     if handle.is_null() || pixels.is_null() {
         return -1;
     }
-    let Some(size) = frame_byte_len(stride, height) else {
-        return -1;
-    };
     let ffi = &*handle;
     guarded(-1, || {
-        let pixel_data = std::slice::from_raw_parts(pixels, size).to_vec();
+        let Some(pixel_data) = copy_frame(pixels, width, height, stride) else {
+            return -1;
+        };
 
         let frame = FrameSubmission {
             width,
@@ -119,17 +121,54 @@ pub unsafe extern "C" fn gf_server_submit_frame(
 /// Run an FFI body, returning `on_panic` if it unwinds. A panic crossing
 /// the C boundary aborts the whole process on Rust 1.81 and later.
 fn guarded<T>(on_panic: T, f: impl FnOnce() -> T) -> T {
-    catch_unwind(AssertUnwindSafe(f)).unwrap_or_else(|_| {
-        eprintln!("ghostframe ffi: panic caught at the C boundary");
-        on_panic
-    })
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(v) => v,
+        Err(payload) => {
+            // Leak the payload: its Drop could itself panic, outside the
+            // catch. Write via `writeln!` and ignore errors: `eprintln!`
+            // panics on a closed stderr.
+            std::mem::forget(payload);
+            let _ = writeln!(
+                std::io::stderr(),
+                "ghostframe ffi: panic caught at the C boundary"
+            );
+            on_panic
+        }
+    }
 }
 
-/// Byte length of a `stride * height` pixel buffer, or `None` if the product
-/// does not fit in `usize`. Computed in `usize`: the old `u32` product wrapped
-/// for e.g. 65536x65536 and produced a short `from_raw_parts` slice.
-fn frame_byte_len(stride: u32, height: u32) -> Option<usize> {
-    (stride as usize).checked_mul(height as usize)
+/// Largest frame edge accepted over the C boundary. Downstream tiling sizes
+/// its state from `cols * rows` in u32, so unbounded dimensions from a caller
+/// would wrap or demand gigabytes before any pixel is read.
+const MAX_FRAME_DIM: u32 = 16384;
+
+/// Validate a caller-supplied frame geometry and return the byte length of
+/// the pixel buffer (`stride * height`), or `None` if it is unusable.
+///
+/// Rejects zero or oversized dimensions, a stride too small for a BGRA row,
+/// and a total that does not fit in `u32` (the tiling code indexes with u32
+/// arithmetic). The product is formed in `usize` with checked arithmetic.
+fn frame_byte_len(width: u32, height: u32, stride: u32) -> Option<usize> {
+    if width == 0 || height == 0 || width > MAX_FRAME_DIM || height > MAX_FRAME_DIM {
+        return None;
+    }
+    if stride < width.checked_mul(4)? {
+        return None;
+    }
+    let len = (stride as usize).checked_mul(height as usize)?;
+    if len > u32::MAX as usize {
+        return None;
+    }
+    Some(len)
+}
+
+/// Validate the geometry and copy the caller's pixels.
+///
+/// # Safety
+/// `pixels` must be valid for `stride * height` bytes.
+unsafe fn copy_frame(pixels: *const u8, width: u32, height: u32, stride: u32) -> Option<Vec<u8>> {
+    let len = frame_byte_len(width, height, stride)?;
+    Some(std::slice::from_raw_parts(pixels, len).to_vec())
 }
 
 /// Number of WebTransport clients currently connected.
@@ -223,27 +262,66 @@ pub unsafe extern "C" fn gf_server_destroy(handle: GfServerHandle) {
 mod tests {
     use super::*;
 
-    /// `stride * height` must be computed in `usize`. 65536 * 65536 wraps to 0
-    /// in `u32`, which would have yielded an empty slice for a 16 GiB frame.
+    /// stride * height = 2^32 wraps to 0 in u32; it must be rejected, not accepted as
+    /// an empty or short buffer.
     #[test]
-    fn frame_byte_len_does_not_wrap_at_u32() {
-        assert_eq!(frame_byte_len(65536, 65536), Some(1usize << 32));
-        assert_eq!(frame_byte_len(0, u32::MAX), Some(0));
-        assert_eq!(
-            frame_byte_len(u32::MAX, u32::MAX),
-            (u32::MAX as usize).checked_mul(u32::MAX as usize)
-        );
+    fn frame_byte_len_rejects_what_u32_would_wrap() {
+        // 16384 rows of 262144 bytes = 2^32: wraps to 0 in u32.
+        assert_eq!(frame_byte_len(16384, 16384, 262144), None);
+        assert_eq!(frame_byte_len(u32::MAX, u32::MAX, u32::MAX), None);
     }
 
-    /// Null pixels and null handle are rejected before any dereference.
     #[test]
-    fn submit_frame_rejects_null() {
+    fn frame_byte_len_accepts_normal_and_rejects_degenerate() {
+        assert_eq!(frame_byte_len(1920, 1080, 1920 * 4), Some(1920 * 4 * 1080));
+        assert_eq!(frame_byte_len(1920, 1080, 8192), Some(8192 * 1080));
+        assert_eq!(frame_byte_len(0, 10, 40), None);
+        assert_eq!(frame_byte_len(10, 0, 40), None);
+        // Stride too small for the row: would read short rows.
+        assert_eq!(frame_byte_len(10, 10, 39), None);
+        assert_eq!(frame_byte_len(MAX_FRAME_DIM + 1, 10, u32::MAX), None);
+    }
+
+    /// `copy_frame` is what `gf_server_submit_frame` calls: a bad geometry
+    /// must yield None without touching the pointer, a good one the bytes.
+    #[test]
+    fn copy_frame_validates_before_reading() {
+        let dangling = std::ptr::NonNull::<u8>::dangling().as_ptr();
+        unsafe {
+            assert!(copy_frame(dangling, 65536, 65536, 65536).is_none());
+            assert!(copy_frame(dangling, 4, 4, 15).is_none());
+            let px: Vec<u8> = (0..32).collect();
+            assert_eq!(copy_frame(px.as_ptr(), 4, 2, 16).as_deref(), Some(&px[..]));
+        }
+    }
+
+    #[test]
+    fn submit_frame_rejects_null_handle_and_null_pixels() {
         let px = [0u8; 4];
         unsafe {
             assert_eq!(
                 gf_server_submit_frame(std::ptr::null_mut(), 1, 1, 4, px.as_ptr(), 0),
                 -1
             );
+            // Non-null but bogus handle is never dereferenced because pixels
+            // is checked in the same condition.
+            let bogus = std::ptr::NonNull::<FfiHandle>::dangling().as_ptr();
+            assert_eq!(
+                gf_server_submit_frame(bogus, 1, 1, 4, std::ptr::null(), 0),
+                -1
+            );
+        }
+    }
+
+    #[test]
+    fn server_new_rejects_null_strings() {
+        let s = c"x".as_ptr();
+        let n = std::ptr::null();
+        unsafe {
+            assert!(gf_server_new(n, s, s, s).is_null());
+            assert!(gf_server_new(s, n, s, s).is_null());
+            assert!(gf_server_new(s, s, n, s).is_null());
+            assert!(gf_server_new(s, s, s, n).is_null());
         }
     }
 
