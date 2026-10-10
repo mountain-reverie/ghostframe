@@ -3114,7 +3114,16 @@ async fn e2e_mode_switch_chromium() -> Result<()> {
     e2e_mode_switch_body(&mut setup.browser).await?;
 
     // The datagram counts say the mode flipped; only the server can say why.
-    let decisions = mode_decisions(&helpers::read_server_logs_stripped("ghostframe-server"));
+    let logs = helpers::read_server_logs_stripped("ghostframe-server");
+    // Every datagram of an H.264 frame has to fit the path, its FEC parity
+    // included. The parity used to come out three bytes over and be refused,
+    // so frames went out unprotected with nothing but this one log line to
+    // say so.
+    assert!(
+        !logs.contains("TooLarge"),
+        "the server built a datagram too large to send"
+    );
+    let decisions = mode_decisions(&logs);
     eprintln!("mode decisions: {decisions:?}");
     let entered: Vec<&str> = decisions
         .iter()

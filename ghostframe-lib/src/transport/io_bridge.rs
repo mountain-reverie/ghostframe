@@ -41,9 +41,9 @@ use crate::transport::ghostbridge::{
     encode_frame, parse_frame_rest, GhostbridgeConfig, GhostbridgeHandle, MAX_FRAME_LEN,
 };
 use crate::transport::protocol::{
-    build_frame_parity_datagram, fragment_frame, fragment_tile, max_fragment_payload,
-    max_frame_fragment_payload, Codec, FrameHeader, NackMessage, TileFragmentInputs,
-    FRAME_HEADER_SIZE, PING_PAYLOAD, PONG_PAYLOAD, TILE_DATAGRAM_FLAG,
+    build_frame_parity_datagram, fragment_frame, fragment_tile, max_fec_frame_fragment_payload,
+    max_fragment_payload, Codec, FrameHeader, NackMessage, TileFragmentInputs, FRAME_HEADER_SIZE,
+    PING_PAYLOAD, PONG_PAYLOAD, TILE_DATAGRAM_FLAG,
 };
 use crate::transport::quic::QuicServer;
 use crate::transport::webtransport::WebTransportServer;
@@ -4700,12 +4700,14 @@ impl IoBridge {
                 // header), not the raw datagram size — otherwise the on-wire
                 // datagram (header + chunk) overshoots the MTU and WebTransport
                 // returns TooLarge, dropping every H.264 datagram silently.
+                // And the limit leaves room for the parity's own header, or
+                // it is the parity that overshoots instead.
                 let datagrams = fragment_frame(
                     seq,
                     frame.timestamp_us,
                     encoded.is_keyframe,
                     &encoded.payload,
-                    max_frame_fragment_payload(max_dg_size),
+                    max_fec_frame_fragment_payload(max_dg_size),
                 );
 
                 self.cumulative_datagrams_emitted.h264 = self
