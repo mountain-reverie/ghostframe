@@ -17,8 +17,6 @@
 
 import debugGradientWgsl from '../../shaders/client/debug_gradient.wgsl?raw';
 import { createLabeledShaderModule } from './webgpu/shader_module';
-import { protocol } from './protocol_constants';
-import { frameRgba as losslessGoldenFrameRgba } from './lossless_golden';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -217,146 +215,6 @@ export function initDiagnostics({
     };
   }
 
-  // ---- __compareLosslessGolden ---------------------------------------------
-  // Whole-frame pixel-perfect comparator for the e2e_lossless_golden_png
-  // test. The expected buffer is computed in-browser via the TypeScript
-  // port of lossless_golden.rs (frameRgba is a pure function of canvas
-  // dimensions, so both implementations agree byte-for-byte).
-  //
-  // Why no buffer transfer? Shipping ~3-8 MB of RGBA over CDP either
-  // way (single eval or chunked) stalled CDP under the live datagram
-  // paint load: the JS main thread couldn't drain CDP requests fast
-  // enough, and even a trivial window.__reset...() call timed out
-  // against chromiumoxide's 30 s request budget. Computing the
-  // expected buffer in the browser sidesteps the transport entirely.
-  //
-  // GPU-reads the live framebuffer, walks every pixel JS-side, and
-  // returns only a tiny summary (~few hundred bytes) — small enough
-  // that the poll loop is robust even under sustained CDP contention.
-  //
-  // Returns { ready: false } when the renderer isn't configured yet.
-  let cachedExpected: Uint8Array | null = null;
-  let cachedExpectedW = 0;
-  let cachedExpectedH = 0;
-  if (typeof window !== 'undefined') {
-    window.__compareLosslessGolden = async (): Promise<{
-      ready: boolean;
-      width: number;
-      height: number;
-      match: boolean;
-      mismatchCount: number;
-      firstX?: number;
-      firstY?: number;
-      gotRGBA?: [number, number, number, number];
-      wantRGBA?: [number, number, number, number];
-    }> => {
-      const ref = getRenderer();
-      if (!ref) {
-        return { ready: false, width: 0, height: 0, match: false, mismatchCount: 0 };
-      }
-      const { device, texture } = ref;
-      const w = texture.width;
-      const h = texture.height;
-      if (w === 0 || h === 0) {
-        return { ready: false, width: w, height: h, match: false, mismatchCount: 0 };
-      }
-      // Compute the canonical expected buffer once per (w, h) — the
-      // pure function from lossless_golden.ts mirrors the Rust
-      // frame_rgba implementation. Canvas dimensions don't change
-      // during the test, so a single dimensions-keyed cache is enough.
-      if (
-        cachedExpected === null ||
-        cachedExpectedW !== w ||
-        cachedExpectedH !== h
-      ) {
-        cachedExpected = losslessGoldenFrameRgba(w, h);
-        cachedExpectedW = w;
-        cachedExpectedH = h;
-      }
-      const expected = cachedExpected;
-      // WebGPU requires bytesPerRow to be a multiple of 256.
-      const bytesPerRow = Math.ceil(w * 4 / 256) * 256;
-      const staging = device.createBuffer({
-        size: bytesPerRow * h,
-        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-      });
-      const enc = device.createCommandEncoder();
-      enc.copyTextureToBuffer(
-        { texture, origin: { x: 0, y: 0 } },
-        { buffer: staging, bytesPerRow },
-        [w, h],
-      );
-      device.queue.submit([enc.finish()]);
-      await staging.mapAsync(GPUMapMode.READ);
-      const raw = new Uint8Array(staging.getMappedRange());
-      const rowBytes = w * 4;
-      let mismatchCount = 0;
-      let firstX = -1;
-      let firstY = -1;
-      let gotRGBA: [number, number, number, number] | undefined;
-      let wantRGBA: [number, number, number, number] | undefined;
-      for (let row = 0; row < h; row++) {
-        const srcOff = row * bytesPerRow;
-        const dstOff = row * rowBytes;
-        for (let i = 0; i < rowBytes; i += 4) {
-          const g0 = raw[srcOff + i],     g1 = raw[srcOff + i + 1],
-                g2 = raw[srcOff + i + 2], g3 = raw[srcOff + i + 3];
-          const e0 = expected[dstOff + i],     e1 = expected[dstOff + i + 1],
-                e2 = expected[dstOff + i + 2], e3 = expected[dstOff + i + 3];
-          if (g0 !== e0 || g1 !== e1 || g2 !== e2 || g3 !== e3) {
-            if (firstX < 0) {
-              firstX = (i >> 2);
-              firstY = row;
-              gotRGBA = [g0, g1, g2, g3];
-              wantRGBA = [e0, e1, e2, e3];
-            }
-            mismatchCount += 4;
-          }
-        }
-      }
-      staging.unmap();
-      staging.destroy();
-      return {
-        ready: true,
-        width: w,
-        height: h,
-        match: mismatchCount === 0,
-        mismatchCount,
-        ...(firstX >= 0 ? { firstX, firstY, gotRGBA, wantRGBA } : {}),
-      };
-    };
-  }
-
-  // ---- __getCdf53Coverage --------------------------------------------------
-  // Read coverage counts from the same `__cdf53Coverage` Map used by the
-  // periodic stats log. Returns:
-  //   refined  — tiles where all 14 cdf53 passes (passMask == 0x3FFF) have
-  //              been received for the current generation.
-  //   partial  — tiles with 1..13 passes seen (some but not all).
-  //   total    — Map size (every tile that has ever received a cdf53 pass).
-  //
-  // Used by the lossless test as a fast "did the cdf53 path even fire?"
-  // sanity check before the slower full-framebuffer compare.
-  if (typeof window !== 'undefined') {
-    window.__getCdf53Coverage = (): {
-      refined: number;
-      partial: number;
-      total: number;
-    } => {
-      const cov = window.__cdf53Coverage;
-      if (!cov) return { refined: 0, partial: 0, total: 0 };
-      const FULL_MASK = protocol().cdf53FullPassMask;
-      let refined = 0;
-      let partial = 0;
-      for (const v of cov.values()) {
-        const mask = v.passMask & FULL_MASK;
-        if (mask === FULL_MASK) refined++;
-        else if (mask !== 0) partial++;
-      }
-      return { refined, partial, total: cov.size };
-    };
-  }
-
   // ---- __readGradientGolden ------------------------------------------------
   // Debug-only: dispatch a compute pipeline that writes a known gradient
   // (r=x&255, g=y&255, b=0, a=255) to the framebuffer, then read back via
@@ -470,7 +328,7 @@ export function initDiagnostics({
   // ---- frame paint FIFO (M3.5 bench) -----------------------------------
   const framePaints: Array<{ seq: number; rafMsClient: number }> = [];
   if (typeof window !== 'undefined') {
-    (window as any).__ghostframe_framePaints = framePaints;
+    window.__ghostframe_framePaints = framePaints;
   }
 
   function recordFramePainted(params: { seq: number; rafMsClient: number }): void {

@@ -2,7 +2,8 @@ import { FullFrameDecoder } from './decoder.js';
 import { WebGpuRenderer } from './webgpu/renderer.js';
 import { WebGpuUnavailableError } from './webgpu/init.js';
 import { attachInputCapture } from './input/wire';
-import { DecodeErrorBatcher } from './decode_error_batcher';
+import { createStatsLogger } from './stats_log.js';
+import { installCdf53Debug } from './cdf53_debug.js';
 import { initDiagnostics } from './diagnostics.js';
 import { bootstrap } from './bootstrap.js';
 import { initProtocol, protocol } from './protocol_constants.js';
@@ -15,9 +16,9 @@ import {
 import * as wasmExports from '../pkg-web/ghostframe_client_wasm.js';
 import init, {
   WasmClientCore,
+  WasmDecodeErrorBatcher,
   tileNackEnvelope,
   errorCodes,
-  prevalidateCdf53,
 } from '../pkg-web/ghostframe_client_wasm.js';
 
 /** Microsecond clock for every `now_us` parameter WasmClientCore expects. */
@@ -50,7 +51,7 @@ async function main() {
   // captures only the canvas, top-left aligned. Used by the lossless-
   // golden e2e to drop the canvas-top-finder heuristic. Status and log
   // divs are still wired up internally; we only hide them visually.
-  if (url.searchParams.get('e2e') === 'lossless') {
+  if (url.searchParams.getAll('e2e').includes('lossless')) {
     statusEl.style.display = 'none';
     logEl.style.display = 'none';
     canvasEl.style.position = 'fixed';
@@ -74,220 +75,8 @@ async function main() {
   }
   renderer.resize(0, 0);
 
-  // M3.3b diagnostic: a URL query param `cdf53watch=X,Y` activates the tile
-  // watcher BEFORE the datagram loop starts, so the initial cdf53 emission
-  // burst (most of the flow for a static gradient frame) is captured.
-  // Without this, set-watcher-via-hook misses the burst that happens between
-  // page load and the test's first evaluate.
-  const watchParam = url.searchParams.get('cdf53watch');
-  if (watchParam) {
-    const [wx, wy] = watchParam.split(',').map(s => Number(s.trim()));
-    if (Number.isFinite(wx) && Number.isFinite(wy)) {
-      renderer.cdf53Pipeline.setTileWatcher(wx, wy);
-      log(`Cdf53 tile watcher armed for (${wx},${wy})`);
-    }
-  }
-
-  // M3.3b diagnostic: test-only hook to drive Cdf53 inverse with hand-supplied
-  // coefficients (bypasses the integrate shader). Removed once the wavelet
-  // math is verified.
-  (window as any).__cdf53TestInverse = async (
-    coefficientsI16: number[],  // length 3072 (3 channels × 1024 i16 each)
-    targetTileIdx: number = 0,  // optional, default tile 0 for backward compat
-  ): Promise<number[]> => {
-    const pipe = renderer.cdf53Pipeline;
-    const device = renderer.device;
-
-    // Split signed i16 coefficients into magnitudes + signs.
-    const coefU32 = new Uint32Array(1536);
-    const signU32 = new Uint32Array(96);
-    for (let ch = 0; ch < 3; ch++) {
-      for (let i = 0; i < 1024; i++) {
-        const c = coefficientsI16[ch * 1024 + i];
-        const mag = (c < 0 ? -c : c) & 0xFFFF;
-        const wordIdx = ch * 512 + (i >> 1);
-        if ((i & 1) === 0) {
-          coefU32[wordIdx] = (coefU32[wordIdx] & 0xFFFF0000) | mag;
-        } else {
-          coefU32[wordIdx] = (coefU32[wordIdx] & 0x0000FFFF) | (mag << 16);
-        }
-        if (c < 0) {
-          const signWordIdx = ch * 32 + (i >> 5);
-          signU32[signWordIdx] |= 1 << (i & 31);
-        }
-      }
-    }
-    // Write into target tile region of each buffer.
-    device.queue.writeBuffer(pipe.coefficientBuffer, targetTileIdx * 6144, coefU32);
-    device.queue.writeBuffer(pipe.signBuffer, targetTileIdx * 384, signU32);
-    device.queue.writeBuffer(pipe.tileGenBuffer, targetTileIdx * 4, new Uint32Array([1]));
-
-    // Run inverse passes.
-    const encoder = device.createCommandEncoder();
-    pipe.encodeInverse(encoder);
-    device.queue.submit([encoder.finish()]);
-
-    // Read back the target tile's pixels via __readPixelRect.
-    const ts = protocol().tileSize;
-    const cols = Math.ceil(renderer.framebuffer.width / ts);
-    const tileX = targetTileIdx % cols;
-    const tileY = Math.floor(targetTileIdx / cols);
-    return await (window as any).__readPixelRect(tileX * ts, tileY * ts, ts, ts);
-  };
-
-  // M3.3b diagnostic: test-only hook to drive the Cdf53 integrate shader
-  // directly with hand-supplied RLE-encoded passes for tile 0, then read back
-  // the resulting coefficientBuffer + signBuffer. Used to isolate whether the
-  // integrate shader (or uploadBatch packing) is correct independently of the
-  // wire path.
-  (window as any).__cdf53TestIntegrate = async (
-    encodedPasses: number[][],  // 14 entries, each is the raw RLE-encoded payload as a number[]
-  ): Promise<{ coefficients: number[]; signs: number[] }> => {
-    const pipe = renderer.cdf53Pipeline;
-    const device = renderer.device;
-
-    // Reset per-tile state for tile 0.
-    device.queue.writeBuffer(pipe.coefficientBuffer, 0, new Uint8Array(6144));  // 1536 u32 × 4 B
-    device.queue.writeBuffer(pipe.signBuffer, 0, new Uint8Array(384));          // 96 u32 × 4 B
-    device.queue.writeBuffer(pipe.tileGenBuffer, 0, new Uint32Array([0]));      // force gen-bump on first pass
-
-    // Build the batch from the 14 encoded passes (all for tile 0, gen=1).
-    // `prevalidateCdf53` (wasm) returns a flat result — no nested `entry` to
-    // mutate, so tileX/tileY are filled in directly on construction.
-    const entries: Array<{ tileX: number; tileY: number; gen: number; passIdx: number; bitPlanes: Uint8Array }> = [];
-    for (let passIdx = 0; passIdx < encodedPasses.length; passIdx++) {
-      const payload = new Uint8Array(encodedPasses[passIdx]);
-      const r = prevalidateCdf53(payload, 1, passIdx);
-      if (!r.ok) throw new Error('prevalidate failed for pass ' + passIdx + ' err=' + r.code);
-      entries.push({
-        tileX: 0,
-        tileY: 0,
-        gen: r.generation,
-        passIdx: r.pass_idx,
-        bitPlanes: r.bit_planes,
-      });
-    }
-
-    // Upload + integrate.
-    pipe.uploadBatch(entries);
-    const encoder = device.createCommandEncoder();
-    pipe.encodeIntegrate(encoder, entries.length);
-    device.queue.submit([encoder.finish()]);
-
-    // Read back coefficientBuffer[0..1536] and signBuffer[0..96] via staging.
-    const coefStaging = device.createBuffer({
-      size: 6144, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-    });
-    const signStaging = device.createBuffer({
-      size: 384, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-    });
-    const copyEnc = device.createCommandEncoder();
-    copyEnc.copyBufferToBuffer(pipe.coefficientBuffer, 0, coefStaging, 0, 6144);
-    copyEnc.copyBufferToBuffer(pipe.signBuffer, 0, signStaging, 0, 384);
-    device.queue.submit([copyEnc.finish()]);
-
-    await coefStaging.mapAsync(GPUMapMode.READ);
-    await signStaging.mapAsync(GPUMapMode.READ);
-    const coefArr = Array.from(new Uint32Array(coefStaging.getMappedRange()));
-    const signArr = Array.from(new Uint32Array(signStaging.getMappedRange()));
-    coefStaging.unmap(); coefStaging.destroy();
-    signStaging.unmap(); signStaging.destroy();
-    return { coefficients: coefArr, signs: signArr };
-  };
-
-  // M3.3b diagnostic: dump per-tile GPU state (tileGen + coefficients + signs)
-  // for a single tile index. Used by e2e_cdf53_live_tile_state to inspect the
-  // live integrate path under real-world load.
-  (window as any).__cdf53DumpTileState = async (
-    tileIdx: number,
-  ): Promise<{ tileGen: number; coefficients: number[]; signs: number[] }> => {
-    const pipe = renderer.cdf53Pipeline;
-    const device = renderer.device;
-
-    const coefStaging = device.createBuffer({
-      size: 6144, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-    });
-    const signStaging = device.createBuffer({
-      size: 384, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-    });
-    const genStaging = device.createBuffer({
-      size: 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-    });
-    const enc = device.createCommandEncoder();
-    enc.copyBufferToBuffer(pipe.coefficientBuffer, tileIdx * 6144, coefStaging, 0, 6144);
-    enc.copyBufferToBuffer(pipe.signBuffer, tileIdx * 384, signStaging, 0, 384);
-    enc.copyBufferToBuffer(pipe.tileGenBuffer, tileIdx * 4, genStaging, 0, 4);
-    device.queue.submit([enc.finish()]);
-
-    await coefStaging.mapAsync(GPUMapMode.READ);
-    await signStaging.mapAsync(GPUMapMode.READ);
-    await genStaging.mapAsync(GPUMapMode.READ);
-    const coefArr = Array.from(new Uint32Array(coefStaging.getMappedRange()));
-    const signArr = Array.from(new Uint32Array(signStaging.getMappedRange()));
-    const tileGen = new Uint32Array(genStaging.getMappedRange())[0];
-    coefStaging.unmap(); coefStaging.destroy();
-    signStaging.unmap(); signStaging.destroy();
-    genStaging.unmap(); genStaging.destroy();
-    return { tileGen, coefficients: coefArr, signs: signArr };
-  };
-
-  // M3.3b diagnostic: per-tile JS-side upload watcher. Captures the bytes
-  // every uploadBatch hands off to the GPU for the watched (tileX, tileY),
-  // along with the (gen, passIdx) the renderer attributed to that entry.
-  // Used by `e2e_cdf53_tile_watcher` to verify the JS→GPU handoff is correct
-  // independent of the integrate shader's behavior.
-  (window as any).__cdf53SetTileWatcher = (tileX: number, tileY: number) => {
-    renderer.cdf53Pipeline.setTileWatcher(tileX, tileY);
-  };
-
-  // M3.3b queue-identity probe. Reports live state of renderer.cdf53Queue
-  // and the pipeline's totals, so we can confirm whether pushes and
-  // uploadBatch share the same array.
-  (window as any).__cdf53Probe = () => {
-    return {
-      cdf53QueueLengthNow: renderer.cdf53Queue.length,
-      uploadBatchCallsLifetime: renderer.cdf53Pipeline.uploadBatchCalls,
-      totalEntriesLifetime: renderer.cdf53Pipeline.totalEntries,
-      isQueueAnArray: Array.isArray(renderer.cdf53Queue),
-      pipelineCtorName: renderer.cdf53Pipeline.constructor.name,
-      // Spot-check: prove the same Cdf53Pipeline instance is bound through
-      // the renderer property accessor by storing a token and reading it back.
-      sameInstanceCheck: (() => {
-        (renderer.cdf53Pipeline as any).__token = 'probe-token-' + Date.now();
-        return (renderer.cdf53Pipeline as any).__token;
-      })(),
-      // Read the watcher state directly through renderer.cdf53Pipeline so we
-      // can tell if the watcher was reset somewhere after we set it.
-      tileWatcherXNow: (renderer.cdf53Pipeline as any).tileWatcherX,
-      tileWatcherYNow: (renderer.cdf53Pipeline as any).tileWatcherY,
-      uploadBatchWithWatcherNull: (renderer.cdf53Pipeline as any).uploadBatchWithWatcherNull,
-      uploadBatchWithWatcherSet: (renderer.cdf53Pipeline as any).uploadBatchWithWatcherSet,
-      entriesWhileWatcherNull: (renderer.cdf53Pipeline as any).entriesWhileWatcherNull,
-      entriesWhileWatcherSet: (renderer.cdf53Pipeline as any).entriesWhileWatcherSet,
-      seenTilesAddCalls: (renderer.cdf53Pipeline as any).seenTilesAddCalls,
-    };
-  };
-  (window as any).__cdf53GetTileWatcher = () => {
-    const pipe = renderer.cdf53Pipeline;
-    return {
-      captures: pipe.tileWatcherCaptures.map(c => ({
-        batchSize: c.batchSize,
-        entryIdx: c.entryIdx,
-        tileX: c.tileX,
-        tileY: c.tileY,
-        gen: c.gen,
-        passIdx: c.passIdx,
-        bitPlanesOffset: c.bitPlanesOffset,
-        bitPlanes: Array.from(c.bitPlanes),
-      })),
-      stats: {
-        uploadBatchCalls: pipe.uploadBatchCalls,
-        totalEntries: pipe.totalEntries,
-        distinctTilesSeen: pipe.seenTiles.size,
-        sampleTiles: Array.from(pipe.seenTiles).slice(0, 30),
-      },
-    };
-  };
+  // GPU debug hooks and the `cdf53watch` tile watcher: opt-in only.
+  if (url.searchParams.has('debug')) installCdf53Debug(renderer, url, log);
 
   // Wire all test/e2e diagnostic globals onto `window` via diagnostics.ts.
   // The getRenderer callback is called lazily (per __readPixel invocation)
@@ -386,7 +175,7 @@ async function main() {
   //
   // Exposed here rather than scraped from the log line so a test asserts on
   // structured state instead of parsing prose.
-  (window as any).__cdf53CoverageSummary = () => {
+  window.__cdf53CoverageSummary = () => {
     const summary = core.cdf53Coverage();
     return {
       summary,
@@ -454,8 +243,12 @@ async function main() {
   // feedback path is discoverable; subsequent writes are silent to avoid
   // spamming the console during normal teardown.
   let decodeErrorWriteLogged = false;
-  const decodeErrorBatcher = new DecodeErrorBatcher((bytes) => {
-    if (feedbackWriter) {
+  // Rate limiting (per-tile 1/s, 32/s global) is the wasm core's
+  // `DecodeErrorBatcher`, the same one the core's own pre-validation uses.
+  const decodeErrorBatcher = new WasmDecodeErrorBatcher();
+  const reportDecodeError = (codec: number, tileX: number, tileY: number, code: number) => {
+    const bytes = decodeErrorBatcher.report(codec, tileX, tileY, code, nowUs());
+    if (bytes && feedbackWriter) {
       feedbackWriter.write(bytes).catch((err) => {
         if (!decodeErrorWriteLogged) {
           console.warn('decode-error feedback write failed:', err);
@@ -463,7 +256,7 @@ async function main() {
         }
       });
     }
-  });
+  };
 
   // Receiver feedback is emitted by the core, not from here. ClientCore::
   // on_timeout queues a ReceiverFeedback Stream output on its own interval
@@ -479,33 +272,6 @@ async function main() {
 
   // Full-frame decoder state.
   let fullFrameDecoder: FullFrameDecoder | null = null;
-
-  // Reliable-tile-emitter FEC counters — RETIRED, not live.
-  //
-  // These used to be fed by the TS parity branch removed from the receive
-  // loop (0x04 TileParityEnvelope dispatch + the TS parity decoder's
-  // recordSource, both now deleted).
-  // Parity recovery is now internal to `WasmClientCore::handle_datagram`
-  // (ghostframe-client-core/src/reassembly.rs) and does not report itself
-  // as an event — a recovered source datagram is just folded back into
-  // reassembly with no `Event` marking that it happened. There is no
-  // `WasmEvent` variant to re-derive per-datagram parity-rx / recovered /
-  // unrecoverable counts from (see docs/specs/wasm-cutover-main-ts-map.md
-  // Part 2's event list — nothing there carries this).
-  //
-  // Left frozen at 0 these would misread as "no packet loss recovered" on
-  // a session that in fact recovered plenty internally. The `fec-coverage`
-  // log line below prints them as an explicit "n/a" instead, so a reader
-  // can tell "not measured" from "measured zero" — the same distinction
-  // the FEC-counter section of this task's brief calls out. This is a
-  // real observability loss versus pre-cutover: `nack_sent` (tile-level,
-  // still fed by drainTransmit below) remains the only wire-loss signal
-  // visible in this log line post-cutover.
-  const FEC_COUNTER_NOT_MEASURED = 'n/a(wasm-internal)';
-  /// Same sentinel, for counters orphaned by the wasm cutover whose readers
-  /// outlived their writers. Distinguishes "not measured" from "measured
-  /// zero" -- see the stats-line comment below for why that matters.
-  const COUNTER_NOT_MEASURED = 'n/a(wasm-internal)';
 
   let firstTileRendered = false;
   let frameDimensionsKnown = false;
@@ -620,6 +386,9 @@ async function main() {
             break;
         }
 
+        const tileNowMs = performance.now();
+        const firstRecvMsClient = noteFrameTileReceived(ev.frame_seq, tileNowMs);
+
         // Re-derive the `__ghostframeRecorded*` test globals.
         //
         // `diag.recordTile` lost its only caller when finishAssembly was
@@ -646,6 +415,8 @@ async function main() {
           // verbatim from the payload by the core, so the test now checks the
           // byte the server actually encoded.
           palRleFlag: d.codec === 'PalRle' ? d.wire_flags : undefined,
+          firstRecvMsClient,
+          lastPaintMsClient: tileNowMs,
         });
 
         if (!firstTileRendered) {
@@ -731,36 +502,33 @@ async function main() {
     }
   }
 
-  // M3.5 bench: per-frame_seq earliest datagram-receive timestamp.
-  // Keyed by frameSeq (uint32); cleared after the corresponding frame is painted.
+  // M3.5 bench: per-frame_seq earliest tile-receive timestamp. Keyed by
+  // frame_seq; cleared once the frame's paint has been recorded.
   const firstRecvMs = new Map<number, number>();
 
-  // M3.5 bench: per-frame painted-tile counters + rAF trigger set.
-  // A frame enters pendingFramePaintRaf when latestFrameSeq advances past it by
-  // >= 2 (matching the stale-eviction threshold), i.e. when the server has moved
-  // on and we know all tiles that will arrive have arrived.
-  const paintedTilesPerFrame = new Map<number, number>();
+  // A frame is "done" once the server has moved two sequences past it (the
+  // core's stale-assembly threshold): every tile that will arrive has. It
+  // then enters pendingFramePaintRaf and the next rAF tick records its
+  // paint time into window.__ghostframe_framePaints, which the bench
+  // harness (scene.rs read_client_diagnostics) turns into per-frame latency.
+  // Fed from TilePayload events -- the per-datagram path that used to feed
+  // it was deleted at the wasm cutover and this stayed empty until now.
+  let latestTileFrameSeq = 0;
   const pendingFramePaintRaf = new Set<number>();
-
-  // Per-tier recv counters (passes 0-3 critical vs 4-13 refinement).
-  // Updated in the per-pass receive path below; reported in the periodic
-  // stats line (Phase 1 Task 10). Bytes-since-startup; the periodic
-  // logger derives per-window rates from snapshot deltas.
-  let bytesRecvCritical = 0;
-  let bytesRecvRefinement = 0;
-  let bytesRecvCriticalSnapshot = 0;
-  let bytesRecvRefinementSnapshot = 0;
+  function noteFrameTileReceived(frameSeq: number, nowMs: number): number {
+    if (!firstRecvMs.has(frameSeq)) firstRecvMs.set(frameSeq, nowMs);
+    if (frameSeq > latestTileFrameSeq) {
+      latestTileFrameSeq = frameSeq;
+      for (const seq of firstRecvMs.keys()) {
+        if (seq + 2 <= latestTileFrameSeq) pendingFramePaintRaf.add(seq);
+      }
+    }
+    return firstRecvMs.get(frameSeq)!;
+  }
 
   // rAF loop — drains queues, flushes one frame per animation tick.
   let __rafTicks = 0;
-  // Periodic diagnostic: every ~2 seconds dump tile + queue + framebuffer
-  // counters to the page log. Lets us see at a glance whether tiles are
-  // arriving, queueing, draining, and the framebuffer is sized.
-  let __lastStatsMs = 0;
-  let __lastDrainCounts = { raw: 0, solid: 0, palrle: 0, cdf53: 0, h264: 0 };
-  // Idle suppression: skip emission when the snapshot is identical to
-  // the last one. No heartbeat; silence means nothing changed.
-  let __lastStatsLineKey = '';
+  const statsLog = createStatsLogger({ renderer, core, log, getNackSent: () => nackSent });
   function tick() {
     __rafTicks++;
     diag.recordRafTick(__rafTicks);
@@ -784,7 +552,6 @@ async function main() {
         diag.recordFramePainted({ seq, rafMsClient: rafMs });
         // Cleanup per-frame bench state.
         firstRecvMs.delete(seq);
-        paintedTilesPerFrame.delete(seq);
       }
       pendingFramePaintRaf.clear();
     }
@@ -800,210 +567,11 @@ async function main() {
     };
 
     renderer.encodeAndPresentFrame((codec, tx, ty, code) => {
-      decodeErrorBatcher.report({ codec, tileX: tx, tileY: ty, errorCode: code });
+      reportDecodeError(codec, tx, ty, code);
     });
 
-    // Track drained counts (queue clearing = drained this tick).
-    const w = window as any;
-    w.__rafDrainTotals = w.__rafDrainTotals ?? { raw: 0, solid: 0, palrle: 0, cdf53: 0, h264: 0 };
-    w.__rafDrainTotals.raw += beforeDrain.raw;
-    w.__rafDrainTotals.solid += beforeDrain.solid;
-    w.__rafDrainTotals.palrle += beforeDrain.palrle;
-    w.__rafDrainTotals.cdf53 += beforeDrain.cdf53;
-    w.__rafDrainTotals.h264 += beforeDrain.h264;
-    w.__rafTicks = __rafTicks;
-
-    // Once every ~2 s, log a one-liner summary so the page log shows
-    // what's happening without needing devtools. Useful when
-    // investigating "canvas is black but tiles seem to be arriving"
-    // failure modes. Identical snapshots are dropped entirely — no
-    // heartbeat, no liveness ping; if nothing's moving, the log stays
-    // silent.
-    const nowMs = performance.now();
-    if (nowMs - __lastStatsMs > 2000) {
-      const prevStatsMs = __lastStatsMs;
-      __lastStatsMs = nowMs;
-      const counts = w.__tileCounts ?? { raw: 0, solid: 0, palrle: 0, cdf53: 0, h264: 0, other: 0 };
-      const drained = w.__rafDrainTotals;
-      const drainDelta = {
-        raw: drained.raw - __lastDrainCounts.raw,
-        solid: drained.solid - __lastDrainCounts.solid,
-        palrle: drained.palrle - __lastDrainCounts.palrle,
-        cdf53: drained.cdf53 - __lastDrainCounts.cdf53,
-        h264: drained.h264 - __lastDrainCounts.h264,
-      };
-      __lastDrainCounts = { ...drained };
-      const fb = renderer.framebuffer;
-      const cdf53Fails = w.__cdf53PrevalidateFails ?? 0;
-      const cdf53Last = w.__cdf53LastFailCode ?? '-';
-
-      // cdf53 per-tile coverage summary. `refined` = tiles that have
-      // received all 14 passes for their current generation; `partial`
-      // = tiles with 1..13 passes; `missing` is implicit (never seen,
-      // not tracked). Use popcount on a 14-bit mask (passes 0..13).
-      // The histogram exposes the *distribution* of pass counts so we
-      // can tell e.g. "most are stuck at 8" (LL3 + a few bit-planes)
-      // vs "most are at 14 but a handful missing one or two passes".
-      // The Cdf53 pass histogram that used to be computed here is gone.
-      // It read `window.__cdf53Coverage`, whose sole writer (finishAssembly)
-      // was deleted in the wasm cutover's Phase 4b, so every value it derived
-      // -- tiles, refined, partial, the histogram -- was structurally zero.
-      // None of them were printed, so this was ~20 lines of dead arithmetic
-      // running on every stats tick, and a decoy for anyone reading the file
-      // while debugging convergence.
-      //
-      // The live equivalent is `core.cdf53Coverage()` below, read back from
-      // the wasm core, which is the state that actually exists.
-      // Compose the line + an identity key for idle suppression. The
-      // key excludes `raf:` (which always changes) and the cdf53fails
-      // counter (also bookkeeping that creeps) — we suppress only when
-      // nothing the user cares about has actually moved.
-      // `rx{}`, `cdf53-coverage` and `lastSeq` read `window.__tileCounts`,
-      // `window.__cdf53Coverage` and `window.__lastTileSeq`. All three were
-      // orphaned by the wasm cutover: every writer was deleted with the TS
-      // decode path, and only these readers remain. They are therefore
-      // structurally always zero/empty.
-      //
-      // Printed as literal `0`/`tiles=0` they read as measurements, and a
-      // reader reasonably concludes "no tiles were received" on a session
-      // that in fact decoded 1300 of them — which is exactly the wrong turn
-      // a live debugging session took. Print the same explicit "not
-      // measured" sentinel the FEC counters above already use, so the
-      // distinction between "measured zero" and "not measured" survives.
-      const statsLine =
-        `stats: rx=${COUNTER_NOT_MEASURED} ` +
-        `Δdrain{r:${drainDelta.raw} s:${drainDelta.solid} p:${drainDelta.palrle} c:${drainDelta.cdf53} h:${drainDelta.h264}} ` +
-        `fb:${fb.width}x${fb.height} ` +
-        `cdf53fails:${cdf53Fails}(last=${cdf53Last}) ` +
-        `raf:${__rafTicks} submit:${(window as unknown as { __gpuSubmitCount?: number }).__gpuSubmitCount ?? 0} lastSeq=${COUNTER_NOT_MEASURED}`;
-      // Per-tile Cdf53 coverage, read back from the wasm core -- the state
-      // that actually exists. This line reported `tiles=0 refined=0` for the
-      // whole post-cutover period because it was reading a `window` map whose
-      // only writer had been deleted; see COUNTER_NOT_MEASURED above.
-      //
-      // `gave_up` is the field to watch. It counts tiles that exhausted
-      // MAX_TAIL_SWEEP_ATTEMPTS and stopped asking for the passes they are
-      // missing, so they are stuck at a partial pass set and will render
-      // wrong for the rest of the session. `incomplete` then names them.
-      let coverageLine: string;
-      let incompleteLine: string | null = null;
-      try {
-        const cov = core.cdf53Coverage() as {
-          line: string;
-          partial: number;
-          gaveUp?: number;
-          gave_up?: number;
-        };
-        coverageLine = `cdf53-coverage: ${cov.line}`;
-        const stuck = cov.gave_up ?? cov.gaveUp ?? 0;
-        if (cov.partial > 0 || stuck > 0) {
-          const worst = core.cdf53IncompleteTiles(8) as Array<{
-            tile_x: number;
-            tile_y: number;
-            missing: number;
-            sweep_attempts: number;
-          }>;
-          incompleteLine =
-            'cdf53-incomplete: ' +
-            worst
-              .map(
-                t =>
-                  `(${t.tile_x},${t.tile_y}) missing=0b${t.missing
-                    .toString(2)
-                    .padStart(protocol().cdf53PassCount, '0')} sweeps=${t.sweep_attempts}`,
-              )
-              .join(' ');
-        }
-      } catch (e) {
-        coverageLine = `cdf53-coverage: unavailable (${String(e)})`;
-      }
-      // Reliable-tile-emitter coverage: FEC recoveries + parity / NACK traffic.
-      // Pairs with the server's reliability counters (Task 35) for side-by-side
-      // wire-loss inspection. `parity_rx` / `recovered` / `parity_unrecoverable`
-      // print an explicit "not measured" sentinel — see FEC_COUNTER_NOT_MEASURED's
-      // definition for why these can no longer be fed post-cutover; `nack_sent`
-      // stays live (fed by drainTransmit inspecting the core's own NACK output).
-      const fecCoverageLine =
-        `fec-coverage: recovered=${FEC_COUNTER_NOT_MEASURED} ` +
-        `parity_rx=${FEC_COUNTER_NOT_MEASURED} ` +
-        `parity_unrecoverable=${FEC_COUNTER_NOT_MEASURED} ` +
-        `nack_sent=${nackSent}`;
-      // Phase 1 Task 10: per-tier (passes 0-3 critical vs 4-13 refinement)
-      // receive rates over the last stats window, computed from the byte
-      // counters added in Task 6. The dt is the existing window duration
-      // (already captured by __lastStatsMs); fall back to 1 to avoid
-      // division by zero on the very first tick.
-      const dtMs = Math.max(1, nowMs - prevStatsMs);
-      const bpsCrit = Math.floor(((bytesRecvCritical - bytesRecvCriticalSnapshot) * 8 * 1000) / dtMs);
-      const bpsRefn = Math.floor(((bytesRecvRefinement - bytesRecvRefinementSnapshot) * 8 * 1000) / dtMs);
-      bytesRecvCriticalSnapshot = bytesRecvCritical;
-      bytesRecvRefinementSnapshot = bytesRecvRefinement;
-      // Same orphaning as `rx{}` above: `bytesRecvCritical` /
-      // `bytesRecvRefinement` have no increment site left post-cutover, so
-      // every derived rate here is structurally zero rather than measured.
-      void bpsCrit;
-      void bpsRefn;
-      const bweTierLine = `bwe-tier: ${COUNTER_NOT_MEASURED} (per-tier receive bytes are no longer counted client-side)`;
-      // Retired counters dropped from the dedup key entirely (see
-      // FEC_COUNTER_NOT_MEASURED) — they're constant now, so keeping them
-      // here would only ever contribute a no-op comparison. That now covers
-      // the cutover-orphaned ones too (`__tileCounts`, `__cdf53Coverage`,
-      // `__lastTileSeq`, the per-tier receive bytes): including them made
-      // the key look content-sensitive while contributing nothing.
-      const lineKey =
-        `drain:${drainDelta.raw}/${drainDelta.solid}/${drainDelta.palrle}/` +
-        `${drainDelta.cdf53}/${drainDelta.h264}|` +
-        `fb:${fb.width}x${fb.height}|fails:${cdf53Fails}|fec:${nackSent}`;
-      const statsChanged = lineKey !== __lastStatsLineKey;
-      if (statsChanged) {
-        __lastStatsLineKey = lineKey;
-        log(statsLine);
-        log(coverageLine);
-        if (incompleteLine) log(incompleteLine);
-        log(fecCoverageLine);
-        log(bweTierLine);
-      }
-
-      // Framebuffer readback: sample 4 known-position pixels and log
-      // them. Settles the "is the framebuffer texture actually written
-      // or is the blit broken" question.
-      //
-      //   (16,16)      = top-left background
-      //   (960, 540)   = dead center (likely wizard for our test)
-      //   (768, 992)   = first-tile area (24,31)*32
-      //   (1900,1060)  = bottom-right corner
-      //
-      // Stays async — we kick off the GPU mapAsync and let the result
-      // land in the next log line. Skipped when the stats line is
-      // suppressed (nothing's moving → framebuffer is the same →
-      // readback would produce identical output we'd then suppress
-      // anyway, and the GPU mapAsync isn't free).
-      const readPixel = (window as any).__readPixel as
-        | ((x: number, y: number) => Promise<number[]>)
-        | undefined;
-      if (statsChanged && readPixel && fb.width > 0 && fb.height > 0) {
-        const xs = [16, 960, 768, 1900];
-        const ys = [16, 540, 992, 1060];
-        Promise.all(
-          xs.map((x, i) =>
-            readPixel(Math.min(x, fb.width - 1), Math.min(ys[i], fb.height - 1)),
-          ),
-        )
-          .then(samples => {
-            const fmt = (px: number[]) =>
-              `[${px[0]},${px[1]},${px[2]},${px[3]}]`;
-            log(
-              `fb-pixels: tl(16,16)=${fmt(samples[0])} ` +
-              `ctr(960,540)=${fmt(samples[1])} ` +
-              `tile(768,992)=${fmt(samples[2])} ` +
-              `br(1900,1060)=${fmt(samples[3])}`,
-            );
-          })
-          .catch(err => {
-            log(`fb-pixels readback failed: ${err}`);
-          });
-      }
-    }
+    // Drain accounting + the ~2 s stats line live in stats_log.ts.
+    statsLog.onTick(beforeDrain, __rafTicks);
 
     requestAnimationFrame(tick);
   }

@@ -12,6 +12,7 @@ declare module '*.wgsl?raw' {
 
 interface Window {
   // ----- stats counters (set at startup, incremented in the datagram loop) -----
+  /** Datagram counts re-published from the wasm core each loop iteration. */
   __ghostframeStats: { tileDatagrams: number; frameDatagrams: number } | undefined;
   /** rAF tick counter; incremented every requestAnimationFrame callback. */
   __ghostframeRafTicks: number | undefined;
@@ -49,32 +50,27 @@ interface Window {
     ok: boolean;
     mismatches: Array<{ x: number; y: number; got: number[]; want: number[] }>;
   }>;
-  /**
-   * Compare the live framebuffer against the lossless-golden expected
-   * frame (computed in-browser via lossless_golden.ts, byte-equal to
-   * the Rust ghostframe-test-pattern::lossless_golden::frame_rgba()).
-   * Returns a small summary suitable for high-frequency polling; the
-   * framebuffer bytes never cross CDP, and no expected-buffer transfer
-   * is needed at all. The failure-path PNG artifact is captured
-   * Playwright-style via CDP Page.captureScreenshot.
-   */
-  __compareLosslessGolden(): Promise<{
-    ready: boolean;
-    width: number;
-    height: number;
-    match: boolean;
-    mismatchCount: number;
-    firstX?: number;
-    firstY?: number;
-    gotRGBA?: [number, number, number, number];
-    wantRGBA?: [number, number, number, number];
-  }>;
 
-  // ----- cdf53 coverage map (populated by main.ts datagram loop) -------------
-  /** Per-tile pass-coverage Map keyed by (tileX<<8 | tileY). */
-  __cdf53Coverage: Map<number, { generation: number; passMask: number }> | undefined;
-  /** Coverage counts derived from __cdf53Coverage. */
-  __getCdf53Coverage(): { refined: number; partial: number; total: number };
+  // ----- cdf53 protocol counters (cdf53_globals.ts, fed from core events) ----
+  __cdf53DispatchSeen: number | undefined;
+  __cdf53PushedToQueue: number | undefined;
+  __cdf53PrevalidateFails: number | undefined;
+  __cdf53LastFailCode: number | undefined;
+
+  /** Core-side CDF53 coverage + the worst incomplete tiles (main.ts). */
+  __cdf53CoverageSummary(): { summary: unknown; incomplete: unknown };
+
+  // ----- ?debug only (cdf53_debug.ts); absent in a normal session ------------
+  __cdf53TestInverse?: (coeffsI16: number[], tileIdx?: number) => Promise<number[]>;
+  __cdf53TestIntegrate?: (
+    encodedPasses: number[][],
+  ) => Promise<{ coefficients: number[]; signs: number[] }>;
+  __cdf53DumpTileState?: (
+    tileIdx: number,
+  ) => Promise<{ tileGen: number; coefficients: number[]; signs: number[] }>;
+  __cdf53SetTileWatcher?: (tileX: number, tileY: number) => void;
+  __cdf53GetTileWatcher?: () => unknown;
+  __cdf53Probe?: () => unknown;
 
   // ----- [H2-DIAG] client-side palette atlas writes -------------------------
   /** Per-call record of palrlePipeline.upsertPalette(); FIFO-capped. */
