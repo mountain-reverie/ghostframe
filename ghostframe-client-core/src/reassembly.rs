@@ -21,7 +21,11 @@ use crate::cdf53_coverage::apply_cdf53_arrival;
 use crate::cdf53_prevalidate::prevalidate_cdf53;
 use crate::event::{Event, PollOutput, TileData, TileKey};
 use crate::pal_rle_decode::{decode_pal_rle_tile, prevalidate_pal_rle};
-use crate::{Assembly, ClientCore, TileDelivery};
+use crate::{
+    Assembly, ClientCore, TileDelivery, MAX_ASSEMBLY_BYTES, MAX_FRAME_DIMENSION,
+    MAX_LIVE_ASSEMBLIES, MAX_TILE_FRAGMENTS,
+};
+use ghostframe_protocol::tile::TILE_SIZE;
 
 /// Minimum bytes that carry a full tile header stack.
 const TILE_MIN: usize = DATAGRAM_HEADER_SIZE + TILE_HEADER_SIZE; // 24
@@ -36,6 +40,90 @@ enum Provenance {
 }
 
 impl ClientCore {
+    /// Whether tile `(tile_x, tile_y)` lies inside the grid of the last
+    /// accepted frame size. With no size yet there is no grid to check
+    /// against, so the tile is let through (the coordinate space is still
+    /// bounded: `u8`, minus the two sentinel values).
+    pub(crate) fn tile_in_grid(&self, tile_x: u8, tile_y: u8) -> bool {
+        match self.frame_dims {
+            Some((w, h)) => {
+                (tile_x as u32) < w.div_ceil(TILE_SIZE) && (tile_y as u32) < h.div_ceil(TILE_SIZE)
+            }
+            None => true,
+        }
+    }
+
+    /// Whether storing this fragment fits the shared assembly budget.
+    ///
+    /// A new assembly pays its fixed and per-slot cost up front and counts
+    /// against `MAX_LIVE_ASSEMBLIES`; every stored fragment pays for its
+    /// bytes. Over budget the datagram is refused, not an older assembly: a
+    /// server that pins `frame_seq` and fans out keys must not be able to push
+    /// out real work, and the stale-frame sweep reclaims anything legitimate.
+    fn budget_admits(&self, key: &TileKey, frag_idx: u16, frag_total: u16, len: usize) -> bool {
+        match self.assemblies.get(key) {
+            None => {
+                self.assemblies.len() < MAX_LIVE_ASSEMBLIES
+                    && self.assembly_bytes + Assembly::base_cost(frag_total) + len
+                        <= MAX_ASSEMBLY_BYTES
+            }
+            Some(a) => {
+                let free = a
+                    .fragments
+                    .get(frag_idx as usize)
+                    .map(|f| f.is_none())
+                    .unwrap_or(false);
+                !free || self.assembly_bytes + len <= MAX_ASSEMBLY_BYTES
+            }
+        }
+    }
+
+    /// Drop everything keyed to tiles that a new grid no longer contains.
+    fn purge_outside_grid(&mut self) {
+        let off: Vec<TileKey> = self
+            .assemblies
+            .keys()
+            .filter(|k| !self.tile_in_grid(k.tile_x, k.tile_y))
+            .copied()
+            .collect();
+        for k in off {
+            self.remove_assembly(&k);
+            self.fragment_parity.remove(&k);
+        }
+        let dims = self.frame_dims;
+        let inside = |x: u8, y: u8| match dims {
+            Some((w, h)) => {
+                (x as u32) < w.div_ceil(TILE_SIZE) && (y as u32) < h.div_ceil(TILE_SIZE)
+            }
+            None => true,
+        };
+        self.cdf53_coverage.retain(|&(x, y), _| inside(x, y));
+        self.pending_nacks.retain(|&(x, y, _), _| inside(x, y));
+        self.cdf53_tile_state.retain_tiles(inside);
+    }
+
+    /// Parse and vet a frame-dimensions payload. Anything outside
+    /// `1..=MAX_FRAME_DIMENSION` per axis is dropped: the value is a network
+    /// `u32` that renderers turn into texture allocations.
+    fn accept_frame_dimensions(&mut self, payload: &[u8], events: &mut Vec<Event>) {
+        if payload.len() < 8 {
+            return;
+        }
+        let width = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        let height = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+        if !(1..=MAX_FRAME_DIMENSION).contains(&width)
+            || !(1..=MAX_FRAME_DIMENSION).contains(&height)
+        {
+            return;
+        }
+        let changed = self.frame_dims != Some((width, height));
+        self.frame_dims = Some((width, height));
+        if changed {
+            self.purge_outside_grid();
+        }
+        events.push(Event::FrameDimensions { width, height });
+    }
+
     /// Feed one received datagram. Returns decode/render events.
     pub fn handle_datagram(&mut self, bytes: &[u8], now_us: u64) -> Vec<Event> {
         let mut events = Vec::new();
@@ -130,6 +218,34 @@ impl ClientCore {
                 .on_datagram_sent_at(now_us, dh.timestamp_us);
         }
 
+        // Validate what the wire claims before it can size anything. These
+        // drop before the ACK on purpose: a tile refused here (for example
+        // one from a larger frame whose dimensions datagram has not arrived
+        // yet) is then retransmitted rather than counted delivered.
+        if !is_sentinel
+            && (dh.frag_total > MAX_TILE_FRAGMENTS || !self.tile_in_grid(th.tile_x, th.tile_y))
+        {
+            return;
+        }
+
+        let key = TileKey {
+            frame_seq,
+            tile_x: th.tile_x,
+            tile_y: th.tile_y,
+            pass_idx: th.pass,
+        };
+
+        // Budget check, also before the ACK and for the same reason: a
+        // fragment dropped for lack of budget must be retransmitted, not
+        // reported delivered. Applies only to fragments that would be stored.
+        if !is_sentinel
+            && dh.frag_idx < dh.frag_total
+            && th.codec != Codec::Skip
+            && !self.budget_admits(&key, dh.frag_idx, dh.frag_total, payload.len())
+        {
+            return;
+        }
+
         // ACK on receipt unless sentinel or Cdf53 (main.ts:1118-1145).
         if !is_sentinel && th.codec != Codec::Cdf53 {
             // Names the transmission, not the content. The server maps it
@@ -168,8 +284,9 @@ impl ClientCore {
             .filter(|k| k.frame_seq < threshold)
             .copied()
             .collect();
+        self.fragment_parity.evict_older_than(threshold);
         for k in stale {
-            if let Some(asm) = self.assemblies.remove(&k) {
+            if let Some(asm) = self.remove_assembly(&k) {
                 if asm.received < asm.fragments.len() {
                     self.loss_tracker
                         .on_stale_tile(asm.fragments.len(), asm.received);
@@ -178,15 +295,8 @@ impl ClientCore {
             self.fragment_parity.remove(&k);
         }
 
-        let key = TileKey {
-            frame_seq,
-            tile_x: th.tile_x,
-            tile_y: th.tile_y,
-            pass_idx: th.pass,
-        };
-
         // Legacy fragment-level parity (frag_idx >= frag_total). main.ts:1181-1209.
-        if dh.frag_idx >= dh.frag_total {
+        if !is_sentinel && dh.frag_idx >= dh.frag_total {
             self.fragment_parity.store(key, payload);
             let want_recover = self
                 .assemblies
@@ -198,6 +308,8 @@ impl ClientCore {
                 if let Some((idx, recovered)) = self.fragment_parity.try_recover(key, frags) {
                     if let Some(asm) = self.assemblies.get_mut(&key) {
                         if asm.fragments.get(idx).map(|f| f.is_none()).unwrap_or(false) {
+                            asm.cost += recovered.len();
+                            self.assembly_bytes += recovered.len();
                             asm.fragments[idx] = Some(recovered);
                             asm.received += 1;
                             self.loss_tracker.on_fec_recovery();
@@ -216,13 +328,7 @@ impl ClientCore {
         // the assembly/finish path.
         if is_sentinel {
             if is_frame_dims_sentinel {
-                if payload.len() >= 8 {
-                    let width =
-                        u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                    let height =
-                        u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
-                    events.push(Event::FrameDimensions { width, height });
-                }
+                self.accept_frame_dimensions(payload, events);
             } else if is_eviction_sentinel {
                 if let Some(reason) = ghostframe_protocol::eviction::parse_eviction(bytes) {
                     events.push(Event::Evicted { reason });
@@ -238,10 +344,15 @@ impl ClientCore {
         }
 
         // Insert fragment (ignore duplicates). main.ts:1232-1255.
+        // The budget was already checked, before the ACK, by `budget_admits`.
+        let is_new = !self.assemblies.contains_key(&key);
         let asm = self
             .assemblies
             .entry(key)
             .or_insert_with(|| Assembly::new(&th, frame_seq, dh.frag_total, now_us));
+        if is_new {
+            self.assembly_bytes += asm.cost;
+        }
         let fi = dh.frag_idx as usize;
         if fi < asm.fragments.len() && asm.fragments[fi].is_none() {
             asm.fragments[fi] = Some(payload.to_vec());
@@ -249,6 +360,8 @@ impl ClientCore {
                 asm.wire_seqs[fi] = Some(dh.wire_seq);
             }
             asm.received += 1;
+            asm.cost += payload.len();
+            self.assembly_bytes += payload.len();
         }
         let received = asm.received;
         let total = asm.fragments.len();
@@ -260,6 +373,8 @@ impl ClientCore {
             if let Some((idx, recovered)) = self.fragment_parity.try_recover(key, frags) {
                 if let Some(asm) = self.assemblies.get_mut(&key) {
                     if asm.fragments.get(idx).map(|f| f.is_none()).unwrap_or(false) {
+                        asm.cost += recovered.len();
+                        self.assembly_bytes += recovered.len();
                         asm.fragments[idx] = Some(recovered);
                         asm.received += 1;
                         self.loss_tracker.on_fec_recovery();
@@ -282,7 +397,7 @@ impl ClientCore {
     /// Concatenate a completed assembly's fragments and dispatch by codec
     /// (`finishAssembly`).
     fn finish_assembly(&mut self, key: TileKey, now_us: u64, events: &mut Vec<Event>) {
-        let asm = match self.assemblies.remove(&key) {
+        let asm = match self.remove_assembly(&key) {
             Some(a) => a,
             None => return,
         };
@@ -300,11 +415,7 @@ impl ClientCore {
         // Sentinel guard (main.ts:497). In practice sentinels never reach
         // here (single-fragment, handled inline), but mirror the reference.
         if tx == FRAME_DIMENSIONS_SENTINEL_X && ty == FRAME_DIMENSIONS_SENTINEL_Y {
-            if payload.len() >= 8 {
-                let width = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                let height = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
-                events.push(Event::FrameDimensions { width, height });
-            }
+            self.accept_frame_dimensions(&payload, events);
             return;
         }
 
