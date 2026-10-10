@@ -382,7 +382,7 @@ export class WebGpuRenderer {
             // caller can resolve from a saved index→tile map.
             // SIMPLIFICATION: emit a generic per-batch error without tile coords.
             // The DecodeErrorBatcher's per-key rate-limit still bounds spam.
-            onDecodeError(2, 0xFF, 0xFF, view[i]); // 0xFF placeholder tile coords
+            onDecodeError(protocol().codec.PalRle, 0xFF, 0xFF, view[i]); // 0xFF placeholder tile coords
           }
         }
         staging.unmap();
