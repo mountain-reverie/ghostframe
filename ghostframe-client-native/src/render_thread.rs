@@ -189,7 +189,7 @@ fn maybe_dump_export(
         }
     }
 
-    let path = if every > 0 {
+    let path = if dump.every > 0 {
         format!("{prefix}.latest.ppm")
     } else {
         format!("{prefix}.{n}.ppm")

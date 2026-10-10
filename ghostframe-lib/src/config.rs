@@ -214,12 +214,10 @@ impl TransportConfig {
     /// state. Keeping the parsing here means the crate reads the process
     /// environment in exactly one place.
     ///
-    /// Unlike `ClassifierConfig::from_lookup`, this function itself is
-    /// **not** gated behind `cfg(any(test, feature = "test-loss-injection"))`:
-    /// `fec_k` (`GHOSTFRAME_FEC_K`) has never been gated at its former
-    /// `io_bridge` read site, so a genuine production build honours it
-    /// today. Gating the whole function the way `ClassifierConfig` does
-    /// would silently stop that. Instead, the `#[cfg]` sits on the
+    /// This function itself is **not** gated behind
+    /// `cfg(any(test, feature = "test-loss-injection"))`: `fec_k`
+    /// (`GHOSTFRAME_FEC_K`) is honoured by production builds, and gating the
+    /// whole function would silently stop that. Instead, the `#[cfg]` sits on the
     /// individual field initialisers below — the two `LossInjector` fields
     /// (whose type only exists under the feature) and the four others that
     /// were gated at their old `io_bridge` sites, mirroring the shape of
@@ -259,8 +257,7 @@ impl TransportConfig {
     }
 
     /// Parse environment variables into a transport configuration. Reads the
-    /// real environment in every build — see `from_lookup`'s doc comment for
-    /// why this (unlike `ClassifierConfig::from_env`) is not gated.
+    /// real environment in every build — see `from_lookup`'s doc comment.
     pub fn from_env() -> Self {
         Self::from_lookup(|k| std::env::var(k).ok())
     }

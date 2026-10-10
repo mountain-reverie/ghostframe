@@ -526,10 +526,10 @@ impl Classifier {
         tentative_states: &[CodecState],
         prev_mode: FrameMode,
     ) -> (FrameMode, &'static str) {
-        // Test-only pin: when GHOSTFRAME_TEST_FORCE_FRAME_MODE is set,
-        // return that mode every call without running the cost model or
-        // hysteresis. Lets tests isolate one codec path end-to-end.
-        #[cfg(any(test, feature = "test-loss-injection"))]
+        // Mode pin: when GHOSTFRAME_FORCE_FRAME_MODE (or the older
+        // GHOSTFRAME_TEST_FORCE_FRAME_MODE) is set, return that mode every
+        // call without running the cost model or hysteresis. Lets tests
+        // isolate one codec path end-to-end.
         if let Some(forced) = self.force_frame_mode_override {
             self.state = ClassifierHysteresis::default();
             return (forced, "test_force");
@@ -552,31 +552,17 @@ impl Classifier {
             return (FrameMode::TileCodec, "h264_unsupported");
         }
 
-        let headroom_threshold = {
-            {
-                self.headroom_min_bpus_override
-                    .unwrap_or(HEADROOM_MIN_BYTES_PER_US)
-            }
-            #[cfg(not(any(test, feature = "test-loss-injection")))]
-            {
-                HEADROOM_MIN_BYTES_PER_US
-            }
-        };
+        let headroom_threshold = self
+            .headroom_min_bpus_override
+            .unwrap_or(HEADROOM_MIN_BYTES_PER_US);
         let headroom_force_h264 = ctx.bytes_per_us > 0.0 && ctx.bytes_per_us < headroom_threshold;
         if headroom_force_h264 {
             self.state = ClassifierHysteresis::default();
             return (FrameMode::H264, "headroom_guard");
         }
-        let loss_threshold = {
-            {
-                self.loss_override_threshold_override
-                    .unwrap_or(LOSS_OVERRIDE_THRESHOLD)
-            }
-            #[cfg(not(any(test, feature = "test-loss-injection")))]
-            {
-                LOSS_OVERRIDE_THRESHOLD
-            }
-        };
+        let loss_threshold = self
+            .loss_override_threshold_override
+            .unwrap_or(LOSS_OVERRIDE_THRESHOLD);
         let loss_force_h264 = ctx.loss_rate > loss_threshold;
         if loss_force_h264 {
             self.state = ClassifierHysteresis::default();
@@ -605,16 +591,9 @@ impl Classifier {
             .sum();
         let bytes_per_us = self.cost.bytes_per_us();
         let tile_codec_cost = non_h264_us + (all_tile_bytes as f32) / bytes_per_us;
-        let per_tile_bias = {
-            {
-                self.refinement_bias_us_override
-                    .unwrap_or(REFINEMENT_BIAS_PER_TILE_US)
-            }
-            #[cfg(not(any(test, feature = "test-loss-injection")))]
-            {
-                REFINEMENT_BIAS_PER_TILE_US
-            }
-        };
+        let per_tile_bias = self
+            .refinement_bias_us_override
+            .unwrap_or(REFINEMENT_BIAS_PER_TILE_US);
         let refinement_bias_us = self.refinement_deficit_tiles as f32 * per_tile_bias;
         let h264_cost = self.cost.h264_frame_us
             + (self.cost.h264_frame_bytes as f32) / bytes_per_us
