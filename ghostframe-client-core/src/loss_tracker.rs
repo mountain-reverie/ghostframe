@@ -3,6 +3,7 @@
 //! (`now_us: u64`) instead of using `performance.now()`.
 
 use ghostframe_protocol::feedback::ReceiverFeedback;
+use ghostframe_protocol::feedback_stream::{HELLO_CAP_INDICES_RAW, HELLO_CAP_SUPPORTS_H264};
 
 /// Suspension threshold: how much longer a datagram may take to arrive
 /// after its predecessor than the sender spaced them, before the difference
@@ -13,10 +14,10 @@ const SUSPENSION_GAP_US: u64 = 100_000;
 /// Client capability announcement, sent once on the feedback stream at
 /// construction. Wire layout `[HELLO_MSG_TYPE, caps]`, where caps bit0 =
 /// indices_raw_enabled and bit1 = supports_h264.
-pub const HELLO_MSG_TYPE: u8 = 0x03;
+pub use ghostframe_protocol::feedback_stream::HELLO_MSG_TYPE;
 
 /// Encoded length of a Hello message.
-pub const HELLO_SIZE: usize = 2;
+pub use ghostframe_protocol::feedback_stream::HELLO_SIZE;
 
 pub struct LossTracker {
     received: u32,
@@ -145,22 +146,20 @@ impl Default for LossTracker {
 pub fn encode_hello(indices_raw: bool, supports_h264: bool) -> Vec<u8> {
     let mut caps = 0u8;
     if indices_raw {
-        caps |= 0x01;
+        caps |= HELLO_CAP_INDICES_RAW;
     }
     if supports_h264 {
-        caps |= 0x02;
+        caps |= HELLO_CAP_SUPPORTS_H264;
     }
     vec![HELLO_MSG_TYPE, caps]
 }
 
-/// DisplayInfo message type. Mirrors `ghostframe_lib::transport::display`;
-/// duplicated here because `ghostframe-client-core` must not depend on
-/// `ghostframe-lib` (the server crate), so both sides are pinned together
-/// only by the byte-exact oracle tests in `tests/oracle_feedback.rs`.
-pub const DISPLAY_INFO_MSG_TYPE: u8 = 0x07;
+/// DisplayInfo message type. Defined once in
+/// `ghostframe_protocol::feedback_stream`, shared with the server.
+pub use ghostframe_protocol::feedback_stream::DISPLAY_INFO_MSG_TYPE;
 
-/// DisplayMode message type.
-pub const DISPLAY_MODE_MSG_TYPE: u8 = 0x08;
+/// DisplayMode message type (see `feedback_stream`).
+pub use ghostframe_protocol::feedback_stream::DISPLAY_MODE_MSG_TYPE;
 
 /// Encode a DisplayInfo message:
 /// `[0x07][max_w:u16][max_h:u16][scale_milli:u16][mm_w:u16][mm_h:u16]`, all

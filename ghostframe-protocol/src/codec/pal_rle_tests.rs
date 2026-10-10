@@ -719,3 +719,20 @@ proptest! {
         }
     }
 }
+
+/// Golden value computed independently (Python, 32-bit wrap) so a change to
+/// the mixing constants or the count seed fails here instead of silently
+/// desynchronising the server and web client diagnostics.
+#[test]
+fn palette_fingerprint_golden_and_forms_agree() {
+    let p = make_palette(&[[1, 2, 3, 4], [5, 6, 7, 8]]);
+    assert_eq!(palette_fingerprint(&p), 0xa938_8a74);
+    assert_eq!(
+        palette_fingerprint_bgra(&[1, 2, 3, 4, 5, 6, 7, 8]),
+        0xa938_8a74
+    );
+    // Colours past `count` must not contribute.
+    let mut q = p;
+    q.colors[5] = [9, 9, 9, 9];
+    assert_eq!(palette_fingerprint(&q), 0xa938_8a74);
+}

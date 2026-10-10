@@ -12,13 +12,16 @@
 // chromiumoxide's 30 s request timeout. Computing the expected buffer
 // in the browser sidesteps the transport entirely.
 
-// Tile size — matches ghostframe-lib::tile::TILE_SIZE. Region boundaries
-// are snapped to multiples of this so every tile lies entirely within
-// one codec zone.
-export const TILE_SIZE = 32;
+import { protocol } from './protocol_constants';
+
+// Tile size, read from `ghostframe-protocol`. Region boundaries are snapped
+// to multiples of this so every tile lies entirely within one codec zone.
+// A function, not a constant: the value only exists once the wasm module
+// has been initialised.
+const tileSize = (): number => protocol().tileSize;
 
 // Side length of each Solid-region block. Must be a multiple of
-// TILE_SIZE so each block covers a whole number of tiles.
+// tileSize() so each block covers a whole number of tiles.
 const SOLID_BLOCK = 64;
 
 // Four Solid-region colours (RGBA), arranged checkerboard-style on a
@@ -52,9 +55,9 @@ const PALRLE_PALETTE: ReadonlyArray<readonly [number, number, number, number]> =
   [0xFF, 0xFF, 0xFF, 0x00],
 ];
 
-// Snap v down to a multiple of TILE_SIZE.
+// Snap v down to a multiple of tileSize().
 function snapTile(v: number): number {
-  return v & ~(TILE_SIZE - 1);
+  return v & ~(tileSize() - 1);
 }
 
 // X-coordinate where the Solid region ends / PalRle region begins.
@@ -76,6 +79,7 @@ export function frameRgba(width: number, height: number): Uint8Array {
   const buf = new Uint8Array(width * height * 4);
   const boundaryLeft = regionBoundarySolidPalrle(width);
   const boundaryRight = regionBoundaryPalrleCdf53(width);
+  const ts = tileSize();
 
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
@@ -89,8 +93,8 @@ export function frameRgba(width: number, height: number): Uint8Array {
         [r, g, b, a] = SOLID_PALETTE[idx];
       } else if (x < boundaryRight) {
         // PalRle region.
-        const tx = Math.floor(x / TILE_SIZE);
-        const ty = Math.floor(y / TILE_SIZE);
+        const tx = Math.floor(x / ts);
+        const ty = Math.floor(y / ts);
         // u32 wrapping math: keep operands in u32 range with `>>> 0`.
         const base = ((Math.imul(tx, 5) + Math.imul(ty, 3)) >>> 0) % 16;
         const palIdx = [
@@ -99,8 +103,8 @@ export function frameRgba(width: number, height: number): Uint8Array {
           (base + 8) % 16,
           (base + 12) % 16,
         ];
-        const subX = Math.floor((x % TILE_SIZE) / (TILE_SIZE / 2));
-        const subY = Math.floor((y % TILE_SIZE) / (TILE_SIZE / 2));
+        const subX = Math.floor((x % ts) / (ts / 2));
+        const subY = Math.floor((y % ts) / (ts / 2));
         const which = subX | (subY << 1);
         [r, g, b, a] = PALRLE_PALETTE[palIdx[which]];
       } else {

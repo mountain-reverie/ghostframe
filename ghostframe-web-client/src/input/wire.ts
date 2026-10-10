@@ -11,14 +11,17 @@
 //
 // Spec: docs/superpowers/specs/2026-06-13-input-forwarding-design.md
 
+// Encoding and keysym translation live in Rust (ghostframe-client-core::input)
+// so the wire bytes and the key table have one definition. The wasm module is
+// initialised by main() before any listener here can fire.
 import {
   encodePointerMove,
   encodePointerButton,
   encodeWheel,
   encodeKeyDown,
   encodeKeyUp,
-} from './encode.js';
-import { keyboardEventToKeysym } from './keymap.js';
+  keyToKeysym,
+} from '../../pkg-web/ghostframe_client_wasm.js';
 
 /** Caller-provided lookup for the current framebuffer dimensions. The
  * web-client framebuffer module exposes `framebuffer.width/height`. */
@@ -148,16 +151,16 @@ export function attachInputCapture(
   );
 
   canvas.addEventListener('keydown', (e) => {
-    const sym = keyboardEventToKeysym(e);
-    if (sym !== null) {
+    const sym = keyToKeysym(e.key);
+    if (sym !== undefined) {
       void send(encodeKeyDown(sym));
       e.preventDefault();
     }
   });
 
   canvas.addEventListener('keyup', (e) => {
-    const sym = keyboardEventToKeysym(e);
-    if (sym !== null) {
+    const sym = keyToKeysym(e.key);
+    if (sym !== undefined) {
       void send(encodeKeyUp(sym));
       e.preventDefault();
     }

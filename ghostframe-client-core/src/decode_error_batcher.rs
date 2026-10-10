@@ -29,7 +29,7 @@ const GLOBAL_CAP: usize = 32;
 /// value, that makes this unambiguous
 /// only because the two travel on different channels: ACK batches are
 /// datagrams, decode errors are stream messages. Do not merge them.
-pub const DECODE_ERROR_MSG_TYPE: u8 = 0x04;
+pub use ghostframe_protocol::feedback_stream::DECODE_ERROR_MSG_TYPE;
 
 /// Encoded length of a decode-error report.
 pub const DECODE_ERROR_SIZE: usize = 5;

@@ -16,6 +16,8 @@
 // `ghostframe-web-client/tests/cdf53_globals.test.ts` for the proof that
 // each of the five actually moves.
 
+import { protocol } from './protocol_constants.js';
+
 /** Mirror of `WasmTileData` (boundary.rs), tagged on `codec`. `PalRle` and
  * `Cdf53` carry the core's prevalidated product, not the raw wire bytes —
  * see `TileData` in `event.rs`. */
@@ -83,21 +85,13 @@ export interface Cdf53ErrorCodes {
 // time: see `appendCapped` in diagnostics.ts for what `shift()` cost here.
 const MAX_H5_LOG = 32768;
 
-/** `ghostframe_protocol::protocol::Codec` discriminants (decoder.ts's
- * `Codec` enum), keyed by the `TileData`/`ProtocolTileData` tag. Used only
- * to keep `__h5_tilePushLog`'s `codec` field numeric, matching its
- * pre-cutover shape and `globals.d.ts`'s ambient declaration. */
-export const CODEC_DISCRIMINANT: Record<ProtocolTileData['codec'], number> = {
-  Raw: 4,
-  Solid: 3,
-  PalRle: 2,
-  Cdf53: 5,
-};
-
-/** `ghostframe_protocol::protocol::Codec::Cdf53`. `DecodeError` still
- * carries this as a raw numeric discriminant (boundary.rs's `codec: u8`) —
- * unlike `TilePayload`, it never had a `TileData` to move the tag into. */
-const CDF53_CODEC = CODEC_DISCRIMINANT.Cdf53;
+/** `ghostframe_protocol::protocol::Codec` discriminant for a `TileData` /
+ * `ProtocolTileData` tag, read from Rust. Used to keep `__h5_tilePushLog`'s
+ * `codec` field numeric, matching its pre-cutover shape and
+ * `globals.d.ts`'s ambient declaration. */
+export function codecDiscriminant(tag: ProtocolTileData['codec']): number {
+  return protocol().codec[tag];
+}
 
 /** First up to `n` bytes of `bytes`, as lowercase hex — mirrors the
  * pre-cutover `h5c0` computation (former main.ts:820-827) so the e2e
@@ -139,7 +133,7 @@ export function recordProtocolEvent(
       seq: ev.frame_seq,
       tx: ev.tile_x,
       ty: ev.tile_y,
-      codec: CODEC_DISCRIMINANT[d.codec],
+      codec: codecDiscriminant(d.codec),
       c0: hexPrefix(bytes),
       ts: nowMs,
     });
@@ -165,7 +159,9 @@ export function recordProtocolEvent(
       c0: `ERR:${ev.code}`,
       ts: nowMs,
     });
-    if (ev.codec === CDF53_CODEC) {
+    // `DecodeError` carries the codec as a raw numeric discriminant
+    // (boundary.rs's `codec: u8`), so compare against the Rust value.
+    if (ev.codec === protocol().codec.Cdf53) {
       globals.__cdf53DispatchSeen = (globals.__cdf53DispatchSeen ?? 0) + 1;
 
       const isCdf53Code =
