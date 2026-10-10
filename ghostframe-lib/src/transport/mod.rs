@@ -9,6 +9,7 @@ pub use ghostframe_protocol::feedback;
 pub mod fragment_coverage;
 pub mod input_inject;
 pub mod io_bridge;
+pub mod loss_window;
 pub use ghostframe_protocol::protocol;
 pub mod quic;
 /// The tsnet byte pump now lives in its own crate so a client can use it

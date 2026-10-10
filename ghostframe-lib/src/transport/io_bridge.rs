@@ -842,10 +842,6 @@ pub struct IoBridge {
     /// after every `dispatch_feedback_bytes` or `sample_quic_path_stats`.
     /// M3.6a wires it; M3.6b's policy reads the non-bytes_per_us fields.
     pub(crate) adaptation_context: crate::tile::classifier::AdaptationContext,
-    /// Sliding window of the last 5 `ReceiverFeedback` reports, used to
-    /// smooth `loss_rate` against single-window jitter.
-    pub(crate) feedback_history:
-        std::collections::VecDeque<crate::transport::feedback::ReceiverFeedback>,
     /// Last two windows' `suspension_detected` flag, OR'd into
     /// `adaptation_context.suspended` to debounce single-window flaps.
     pub(crate) recent_suspension_flags: [bool; 2],
@@ -1014,6 +1010,8 @@ pub struct IoBridge {
     /// that one is content-scoped and emptied by supersession, which is what
     /// hid most losses from the estimator.
     transmission_ledger: crate::transport::transmission_ledger::TransmissionLedger,
+    /// The ledger's verdicts as a rate: `adaptation_context.loss_rate`.
+    loss_window: crate::transport::loss_window::LossWindow,
     /// When quinn's `sent_packets` last advanced. `None` before the first
     /// packet. Used to tell a busy link from an idle one — see
     /// `apply_path_stats_snapshot`.
@@ -1522,7 +1520,6 @@ impl IoBridge {
             fec_enable_threshold: FEC_ENABLE_THRESHOLD,
             fec_disable_threshold: FEC_DISABLE_THRESHOLD,
             adaptation_context: crate::tile::classifier::AdaptationContext::default(),
-            feedback_history: std::collections::VecDeque::with_capacity(5),
             recent_suspension_flags: [false, false],
             cdf53_escalation_candidates_this_frame: Vec::new(),
             cdf53_stranded_candidates_this_frame: Vec::new(),
@@ -1556,6 +1553,7 @@ impl IoBridge {
             transmission_ledger: crate::transport::transmission_ledger::TransmissionLedger::new(
                 TRANSMISSION_LEDGER_CAPACITY,
             ),
+            loss_window: crate::transport::loss_window::LossWindow::new(),
             path_last_sent_at: None,
             last_drain_frame_context: None,
             cumulative_datagrams_emitted: CumulativeEmitCounters::default(),
@@ -3227,9 +3225,20 @@ impl IoBridge {
                         use crate::transport::transmission_ledger::Resolution;
                         let r = match self.transmission_ledger.resolve(e.wire_seq) {
                             Some(Resolution::Live(tx)) => {
+                                self.loss_window.record(tx.emit_us, false);
                                 Some((tx.key, tx, e.arrival_time_ms_lo16, false))
                             }
                             Some(Resolution::Late(tx)) => {
+                                self.loss_window.retract(tx.emit_us);
+                                if crate::transport::reliable_emitter::rto_probe_enabled() {
+                                    eprintln!(
+                                        "RTOPROBE late_ack ws={} age_us={}",
+                                        e.wire_seq,
+                                        self.reliable_emitter
+                                            .emit_us(now_for_samples)
+                                            .wrapping_sub(tx.emit_us)
+                                    );
+                                }
                                 Some((tx.key, tx, e.arrival_time_ms_lo16, true))
                             }
                             None => None,
@@ -5808,22 +5817,7 @@ impl IoBridge {
                     },
                 );
             }
-            // Anything outstanding past the horizon is lost. This is the
-            // complete loss signal: it does not care whether the content was
-            // superseded, which is precisely what NACK- and RTO-derived
-            // signals could not see.
-            let horizon = self.loss_horizon();
-            let __expired = self.transmission_ledger.expire(ledger_now, horizon);
-            if crate::transport::reliable_emitter::rto_probe_enabled() && !__expired.is_empty() {
-                eprintln!(
-                    "RTOPROBE expire n={} horizon_us={}",
-                    __expired.len(),
-                    horizon.as_micros()
-                );
-            }
-            for tx in __expired {
-                self.pending_losses.push((tx.emit_us, tx.wire_bytes));
-            }
+            self.expire_transmissions(ledger_now);
             // Reported only alongside an acknowledgement: goog_cc unwraps the
             // max receive time over a report's received packets, so a
             // loss-only report panics inside the library. A congested link can
@@ -6520,7 +6514,6 @@ impl IoBridge {
             fec_enable_threshold: FEC_ENABLE_THRESHOLD,
             fec_disable_threshold: FEC_DISABLE_THRESHOLD,
             adaptation_context: crate::tile::classifier::AdaptationContext::default(),
-            feedback_history: std::collections::VecDeque::with_capacity(5),
             recent_suspension_flags: [false, false],
             cdf53_escalation_candidates_this_frame: Vec::new(),
             cdf53_stranded_candidates_this_frame: Vec::new(),
@@ -6554,6 +6547,7 @@ impl IoBridge {
             transmission_ledger: crate::transport::transmission_ledger::TransmissionLedger::new(
                 TRANSMISSION_LEDGER_CAPACITY,
             ),
+            loss_window: crate::transport::loss_window::LossWindow::new(),
             path_last_sent_at: None,
             last_drain_frame_context: None,
             cumulative_datagrams_emitted: CumulativeEmitCounters::default(),
@@ -7045,23 +7039,57 @@ impl IoBridge {
         }
     }
 
-    /// Append `fb` to `feedback_history` (capped at 5), update suspension
-    /// debounce, recompute `adaptation_context.loss_rate` + `.suspended`,
-    /// then push the new context to the classifier. Called from
-    /// `dispatch_feedback_bytes`. Bumps `last_update_seq`.
+    /// Update the suspension debounce from `fb`, recompute
+    /// `adaptation_context.suspended`, then push the new context to the
+    /// classifier. Called from `dispatch_feedback_bytes`. Bumps
+    /// `last_update_seq`.
+    ///
+    /// `fb`'s loss counts are not read here. They cannot see the loss of a
+    /// tile that fit in one datagram, so `adaptation_context.loss_rate`
+    /// comes from the transmission ledger instead: see `refresh_loss_rate`.
     fn ingest_feedback_for_adaptation(&mut self, fb: crate::transport::feedback::ReceiverFeedback) {
-        if self.feedback_history.len() >= 5 {
-            self.feedback_history.pop_front();
-        }
         let suspended = fb.suspension_detected;
-        self.feedback_history.push_back(fb);
         self.recent_suspension_flags = [self.recent_suspension_flags[1], suspended];
-        self.adaptation_context.loss_rate =
-            crate::transport::feedback::ReceiverFeedback::smoothed_loss_rate(
-                &self.feedback_history,
-            );
         self.adaptation_context.suspended =
             self.recent_suspension_flags[0] || self.recent_suspension_flags[1];
+        self.adaptation_context.last_update_seq =
+            self.adaptation_context.last_update_seq.wrapping_add(1);
+        self.classifier
+            .set_adaptation_context(self.adaptation_context);
+    }
+
+    /// Declare lost everything outstanding past the horizon, and bring the
+    /// loss rate up to date.
+    ///
+    /// This is the complete loss signal: it does not care whether the
+    /// content was superseded, which is precisely what NACK- and RTO-derived
+    /// signals could not see.
+    fn expire_transmissions(&mut self, now: std::time::Instant) {
+        let horizon = self.loss_horizon();
+        let expired = self.transmission_ledger.expire(now, horizon);
+        if crate::transport::reliable_emitter::rto_probe_enabled() && !expired.is_empty() {
+            eprintln!(
+                "RTOPROBE expire n={} horizon_us={}",
+                expired.len(),
+                horizon.as_micros()
+            );
+        }
+        for tx in expired {
+            self.pending_losses.push((tx.emit_us, tx.wire_bytes));
+            self.loss_window.record(tx.emit_us, true);
+        }
+        self.refresh_loss_rate(now);
+    }
+
+    /// Re-read the sender-side loss rate and, if it moved, push it to the
+    /// classifier. Called once per loop turn, so it also runs while nothing
+    /// is being sent, which is what lets a held measurement lapse.
+    fn refresh_loss_rate(&mut self, now: std::time::Instant) {
+        let rate = self.loss_window.rate(self.reliable_emitter.emit_us(now));
+        if rate == self.adaptation_context.loss_rate {
+            return;
+        }
+        self.adaptation_context.loss_rate = rate;
         self.adaptation_context.last_update_seq =
             self.adaptation_context.last_update_seq.wrapping_add(1);
         self.classifier
@@ -8110,8 +8138,9 @@ mod tests {
         fb.encode(&mut buf);
         bridge.dispatch_feedback_bytes(ConnectionHandle(0), &buf);
         assert!(bridge.adaptation_context.last_update_seq > initial_seq);
-        // Single feedback in history: 200 / (800 + 200) = 0.20 — well above 0.
-        assert!(bridge.adaptation_context.loss_rate > 0.0);
+        // The feedback's own loss counts are deliberately not the source of
+        // `loss_rate`: see `the_classifiers_loss_rate_is_the_ledgers_verdict`.
+        assert_eq!(bridge.adaptation_context.loss_rate, 0.0);
         assert!(bridge.adaptation_context.suspended);
     }
 
@@ -8415,6 +8444,75 @@ mod tests {
         bridge.dispatch_ack_datagram(&ack_env.encode());
         assert_eq!(bridge.reliable_emitter.stats.ack_hit, 1);
         assert!(bridge.reliable_emitter.cache.get(&key).is_none());
+    }
+
+    /// `loss_override` reads `adaptation_context.loss_rate`. Every tile here
+    /// is one datagram, so a lost one leaves the client nothing to notice
+    /// and its `ReceiverFeedback` would report zero loss; the rate has to
+    /// come from what the server sent and never heard back about.
+    #[tokio::test(start_paused = true)]
+    async fn the_classifiers_loss_rate_is_the_ledgers_verdict() {
+        let (our_end, _peer) = UnixStream::pair().expect("pair");
+        let server = QuicServer::new().expect("server");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+
+        // 400 single-datagram transmissions, 1 ms apart; every fifth is
+        // never acknowledged.
+        let mut acked = Vec::new();
+        for wire_seq in 0..400u32 {
+            let now = now_std();
+            bridge.transmission_ledger.record(
+                wire_seq,
+                now,
+                crate::transport::transmission_ledger::Transmission {
+                    emit_us: bridge.reliable_emitter.emit_us(now),
+                    wire_bytes: 25,
+                    key: crate::transport::reliable_emitter::EmitKey::new(
+                        wire_seq,
+                        (wire_seq % 64) as u8,
+                        0,
+                        0,
+                    ),
+                },
+            );
+            if !wire_seq.is_multiple_of(5) {
+                acked.push(crate::transport::ack::AckEntry {
+                    wire_seq,
+                    arrival_time_ms_lo16: 0,
+                });
+            }
+            tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        }
+        for batch in acked.chunks(32) {
+            let env = crate::transport::ack::AckBatch {
+                entries: batch.to_vec(),
+            };
+            bridge.dispatch_ack_datagram(&env.encode());
+        }
+        // Acknowledgements alone say nothing about loss.
+        assert_eq!(bridge.adaptation_context.loss_rate, 0.0);
+
+        // Declared lost, but not yet beyond recall: still no reading.
+        tokio::time::advance(LOSS_HORIZON_FLOOR).await;
+        bridge.expire_transmissions(now_std());
+        assert_eq!(bridge.adaptation_context.loss_rate, 0.0);
+
+        // One of them turns up after all.
+        let late = crate::transport::ack::AckBatch {
+            entries: vec![crate::transport::ack::AckEntry {
+                wire_seq: 0,
+                arrival_time_ms_lo16: 0,
+            }],
+        };
+        bridge.dispatch_ack_datagram(&late.encode());
+
+        tokio::time::advance(crate::transport::loss_window::SETTLE).await;
+        bridge.expire_transmissions(now_std());
+        let rate = bridge.adaptation_context.loss_rate;
+        assert_eq!(rate, 79.0 / 400.0);
+        assert_eq!(bridge.classifier.adaptation_context().loss_rate, rate);
+        assert!(rate > crate::tile::classifier::LOSS_OVERRIDE_THRESHOLD);
     }
 
     /// dispatch_dirty_tiles_via_scheduler enqueues the right work in the

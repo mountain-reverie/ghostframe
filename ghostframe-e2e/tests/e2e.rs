@@ -3096,15 +3096,89 @@ async fn e2e_mode_switch_body<B: helpers::BrowserSession>(browser: &mut B) -> Re
 // h264Supported bit is plumbed and the server is gated against selecting
 // H.264 for Firefox clients — but until then, asserting on H.264-mode
 // telemetry would always fail on Firefox.
+//
+// `--motion video`: the motion half must be content H.264 is the right
+// answer to. The default bands are a screen of Solid tiles, which the tile
+// codec carries for less than one H.264 frame costs, so the cost model
+// rightly never leaves TileCodec for them. This test nonetheless passed on
+// bands for months, because the client's suspension detector mistook every
+// quiet static half for a network stall and the server answers that by
+// forcing H.264.
 #[tokio::test]
 async fn e2e_mode_switch_chromium() -> Result<()> {
     let mut setup = setup_e2e_webgpu_gpu_with_env(
-        "--drm-direct --mode-switch-cycle 3",
+        "--drm-direct --mode-switch-cycle 3 --motion video",
         &[("GHOSTFRAME_ENABLE_CDF53", "1")],
     )
     .await?;
     e2e_mode_switch_body(&mut setup.browser).await?;
+
+    // The datagram counts say the mode flipped; only the server can say why.
+    let decisions = mode_decisions(&helpers::read_server_logs_stripped("ghostframe-server"));
+    eprintln!("mode decisions: {decisions:?}");
+    let entered: Vec<&str> = decisions
+        .iter()
+        .filter(|d| d.from == "TileCodec" && d.to == "H264")
+        .map(|d| d.reason.as_str())
+        .collect();
+    // At least twice on the cost model's own judgement. A network override
+    // may account for other entries -- a client that stalls for 100 ms
+    // raises `suspension` legitimately -- but it must not be what the test
+    // is counting, which is how it passed before.
+    let by_cost = entered.iter().filter(|r| **r == "cost_comparison").count();
+    assert!(
+        by_cost >= 2,
+        "expected the cost model to choose H264 for video motion at least twice, \
+         got {by_cost}; decisions: {decisions:?}"
+    );
+    assert!(
+        decisions
+            .iter()
+            .any(|d| d.from == "H264" && d.to == "TileCodec"),
+        "expected the classifier to leave H264 for the static half; decisions: {decisions:?}"
+    );
     setup.browser.close().await
+}
+
+/// One `mode.decision` line from the server log. The classifier logs these
+/// only when the mode it returns differs from the last one it logged.
+#[derive(Debug)]
+struct ModeDecision {
+    from: String,
+    to: String,
+    reason: String,
+    /// The loss rate the classifier held when it decided.
+    loss_rate: f32,
+}
+
+fn mode_decisions(logs: &str) -> Vec<ModeDecision> {
+    let field = |line: &str, name: &str| -> Option<String> {
+        let at = line.find(name)? + name.len();
+        Some(
+            line[at..]
+                .trim_start_matches('"')
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect(),
+        )
+    };
+    logs.lines()
+        .filter(|l| l.contains("event=\"mode.decision\""))
+        .filter_map(|l| {
+            Some(ModeDecision {
+                from: field(l, " from=")?,
+                to: field(l, " to=")?,
+                reason: field(l, " reason=")?,
+                loss_rate: l
+                    .split(" loss_rate=")
+                    .nth(1)?
+                    .split_whitespace()
+                    .next()?
+                    .parse()
+                    .ok()?,
+            })
+        })
+        .collect()
 }
 
 /// M3.6b: Sample `__ghostframeStats` for `duration` and return
@@ -3175,34 +3249,33 @@ async fn e2e_headroom_guard_forces_h264() -> Result<()> {
 /// M3.6b: With GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY=0.15 (well above
 /// the LOSS_OVERRIDE_THRESHOLD=0.10), the classifier's loss_override
 /// must force H264 mode. Exercises the full pipeline:
-/// loss injection → ReceiverFeedback.loss_rate → AdaptationContext →
-/// loss_override → H264.
+/// loss injection -> unacknowledged transmissions -> the ledger's loss
+/// rate -> AdaptationContext -> loss_override -> H264.
+///
+/// The content is all-Solid motion, which the cost model keeps in TileCodec
+/// (four bytes a tile), so the cost comparison cannot explain H.264 here.
+/// And every tile is a single datagram, which is the case the client's own
+/// loss count is blind to: nothing is ever *partly* received.
+///
+/// `--motion-tick-ms 100` holds the motion to 10 changed frames a second,
+/// so that what goes unacknowledged is what the injector dropped and not a
+/// client struggling with ~23,000 one-tile datagrams a second -- which the
+/// assertion on the measured rate then checks.
 #[tokio::test]
 async fn e2e_loss_override_forces_h264() -> Result<()> {
     let setup = setup_e2e_webgpu_gpu_with_env(
-        "--drm-direct --mode-switch-cycle 2",
+        "--drm-direct --mode-switch-cycle 2 --motion-tick-ms 100",
         &[
             ("GHOSTFRAME_ENABLE_CDF53", "1"),
-            // OUTBOUND, not inbound. `AdaptationContext::loss_rate` is
-            // `ReceiverFeedback::smoothed_loss_rate` -- the *client's*
-            // observation of gaps in what reached it -- so only server->client
-            // loss can raise it. Inbound loss drops the client's ACKs and
-            // feedback on their way to the server, which cannot make the
-            // client see loss; it just delivers fewer feedback samples. With
-            // the wrong direction the override never engaged and the test
-            // measured whatever H264 the mode-switch cycle produced on its
-            // own: frame_total came in at 113-122 against a threshold of 250,
-            // consistently, with no sign of why.
-            //
-            // 0.15 against LOSS_OVERRIDE_THRESHOLD = 0.10.
+            // OUTBOUND, not inbound: it is the server's tile datagrams that
+            // have to go missing. 0.15 against LOSS_OVERRIDE_THRESHOLD = 0.10.
             ("GHOSTFRAME_OUTBOUND_LOSS_PROBABILITY", "0.15"),
             ("GHOSTFRAME_OUTBOUND_LOSS_SEED", "42"),
         ],
     )
     .await?;
 
-    // ReceiverFeedback is sent every 100ms; give 5-window smoothing
-    // time to settle above the override threshold.
+    // Long enough for a motion half to have been sent, lost and timed out.
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     let (tile_total, frame_total) =
@@ -3210,16 +3283,27 @@ async fn e2e_loss_override_forces_h264() -> Result<()> {
 
     eprintln!("M3.6b loss: tile={tile_total} frame={frame_total}");
 
-    // loss_override drives H264 ⇒ frame datagrams must be substantial.
-    // We do NOT assert frame > tile here: with cdf53 enabled, refinement
-    // tile floods accumulate even while the classifier is in H264 mode
-    // (same issue noted in e2e_mode_switch — ratio assertions don't survive
-    // the tile burst from H264→TileCodec handoff invalidations). The
-    // absolute frame count is the reliable signal.
+    let decisions = mode_decisions(&helpers::read_server_logs_stripped("ghostframe-server"));
+    eprintln!("mode decisions: {decisions:?}");
+    let first = decisions
+        .iter()
+        .find(|d| d.to == "H264")
+        .unwrap_or_else(|| panic!("15% loss never moved the classifier to H264: {decisions:?}"));
+    assert_eq!(
+        first.reason, "loss_override",
+        "the loss should be what put this content in H264; decisions: {decisions:?}"
+    );
+    // 0.15 was injected. A reading far from it is a different event that
+    // happens to share the label -- a stalled client reads as 1.0.
     assert!(
-        frame_total >= 250,
-        "loss_override should drive H264 — \
-         observed frame_total={frame_total} (expected >= 250)"
+        (0.10..0.25).contains(&first.loss_rate),
+        "the measured loss rate should be the injected 15%, got {}; decisions: {decisions:?}",
+        first.loss_rate
+    );
+    // And the override really changed what was sent.
+    assert!(
+        frame_total > 0,
+        "loss_override was decided but no H.264 frame datagram reached the client"
     );
 
     Ok(())
@@ -4881,6 +4965,12 @@ async fn e2e_refinement_cancel() -> Result<()> {
             ("GHOSTFRAME_INBOUND_LOSS_PROBABILITY", "1.0"),
             ("GHOSTFRAME_INBOUND_LOSS_PREDICATE", "ack"),
             ("GHOSTFRAME_INBOUND_LOSS_SEED", "1"),
+            // The server measures loss as transmissions nobody acknowledged,
+            // and this test has just arranged for that to be all of them.
+            // Left alone, `loss_override` would park the session in H.264
+            // and there would be no refinement to cancel. 1.0 is a threshold
+            // no rate can exceed.
+            ("GHOSTFRAME_TEST_LOSS_OVERRIDE_THRESHOLD", "1.0"),
         ],
     )
     .await?;

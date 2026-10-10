@@ -67,6 +67,19 @@ struct Args {
     #[arg(long)]
     mode_switch_cycle: Option<u64>,
 
+    /// What the motion half of `--drm-direct --mode-switch-cycle` paints:
+    /// `bands` (all-Solid tiles, which TileCodec should keep) or `video`
+    /// (all-Cdf53 tiles, which should drive the classifier into H.264).
+    #[arg(long, value_enum, default_value_t)]
+    motion: ghostframe_test_pattern::drm_direct::Motion,
+
+    /// Milliseconds between repaints in the motion half of `--drm-direct
+    /// --mode-switch-cycle`. The default repaints faster than capture, so
+    /// every captured frame is dirty; a longer tick lowers the rate of
+    /// changed frames below the capture rate.
+    #[arg(long)]
+    motion_tick_ms: Option<u64>,
+
     /// Draw `count` sequential text-like regions, each with a distinct
     /// 4-color palette, cycling over ~5 seconds. Drives e2e_palette_eviction.
     #[arg(long)]
@@ -206,7 +219,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .mode_switch_cycle
             .ok_or_else(|| "--drm-direct requires --mode-switch-cycle SECS".to_string())?;
         let half = std::time::Duration::from_secs(secs);
-        return ghostframe_test_pattern::drm_direct::run(&args.drm_device, half);
+        return ghostframe_test_pattern::drm_direct::run(
+            &args.drm_device,
+            half,
+            args.motion,
+            args.motion_tick_ms.map_or(
+                ghostframe_test_pattern::drm_direct::MOTION_TICK,
+                std::time::Duration::from_millis,
+            ),
+        );
     }
 
     let (conn, screen_num) = x11rb::connect(None)?;
