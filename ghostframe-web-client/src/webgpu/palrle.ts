@@ -105,7 +105,8 @@ export class PalRlePipeline {
       const buf = window.__h2_clientPaletteWrites;
       buf.push({ id: paletteId, len: bgra.byteLength, fp: fpHex, c0, ts: performance.now() });
       // Keep matched to the server-side FIFO cap (MAX_RECORDED_ENTRIES).
-      if (buf.length > 32768) buf.shift();
+      // Trimmed in bulk, not with shift(): see `appendCapped` in diagnostics.ts.
+      if (buf.length >= 2 * 32768) buf.splice(0, buf.length - 32768);
       // Silence the unused-h warning — the mixed-int dance above is the
       // important part; the seeded `h` is kept for parity with the spec but
       // not exposed.

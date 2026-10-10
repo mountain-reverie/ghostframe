@@ -79,6 +79,8 @@ export interface Cdf53ErrorCodes {
 
 /** Matches the pre-cutover FIFO cap on `__h5_tilePushLog` (former
  * main.ts:836). */
+// Trimmed back to this once it reaches twice it, never one entry at a
+// time: see `appendCapped` in diagnostics.ts for what `shift()` cost here.
 const MAX_H5_LOG = 32768;
 
 /** `ghostframe_protocol::protocol::Codec` discriminants (decoder.ts's
@@ -177,5 +179,5 @@ export function recordProtocolEvent(
     }
   }
 
-  if (log.length > MAX_H5_LOG) log.shift();
+  if (log.length >= 2 * MAX_H5_LOG) log.splice(0, log.length - MAX_H5_LOG);
 }

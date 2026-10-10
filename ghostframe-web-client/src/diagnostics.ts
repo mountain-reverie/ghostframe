@@ -82,9 +82,28 @@ interface RendererRef {
 // recent observations when exceeded.
 export const MAX_RECORDED_ENTRIES = 32768;
 
-function fifoAppend<T>(arr: T[], item: T): void {
+/**
+ * Append to a log that keeps its most recent `cap` entries.
+ *
+ * The log is trimmed back to `cap` only once it reaches twice that, so a
+ * reader sees between `cap` and `2 * cap` entries, newest last.
+ *
+ * It used to be `push` then `shift`, one out for each one in. Dropping the
+ * head of a 32768-element array makes V8 move the other 32767: 64 us a
+ * call, measured, against 0.5 us at the 4096 this cap had until it was
+ * raised. Every tile is recorded in up to four of these logs, so once a
+ * session had drawn its first ~30,000 tiles each further one cost a quarter
+ * of a millisecond of bookkeeping -- on a screen redrawing 23,000 tiles a
+ * second, the datagram loop fell two seconds behind and stopped
+ * acknowledging, and the server read a loss-free link as dead.
+ */
+export function appendCapped<T>(arr: T[], item: T, cap: number = MAX_RECORDED_ENTRIES): void {
   arr.push(item);
-  if (arr.length > MAX_RECORDED_ENTRIES) arr.shift();
+  if (arr.length >= 2 * cap) arr.splice(0, arr.length - cap);
+}
+
+function fifoAppend<T>(arr: T[], item: T): void {
+  appendCapped(arr, item);
 }
 
 // ---------------------------------------------------------------------------

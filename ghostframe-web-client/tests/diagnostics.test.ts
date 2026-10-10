@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach } from 'vitest';
-import { initDiagnostics } from '../src/diagnostics';
+import { MAX_RECORDED_ENTRIES, appendCapped, initDiagnostics } from '../src/diagnostics';
 
 // diagnostics.ts gates all window writes behind `typeof window !== 'undefined'`.
 // Vitest runs under Node (environment: 'node'), so we install a minimal window
@@ -72,5 +72,40 @@ describe('M3.5 bench instrumentation', () => {
     expect(paints).toHaveLength(2);
     expect(paints[0]).toEqual({ seq: 42, rafMsClient: 9999.9 });
     expect(paints[1]).toEqual({ seq: 43, rafMsClient: 10016.5 });
+  });
+});
+
+describe('appendCapped', () => {
+  it('keeps the newest entries, between cap and twice cap of them', () => {
+    const log: number[] = [];
+    for (let i = 0; i < 1000; i++) {
+      appendCapped(log, i, 64);
+      expect(log.length).toBeLessThan(128);
+      expect(log[log.length - 1]).toBe(i);
+      if (i >= 64) expect(log.length).toBeGreaterThanOrEqual(64);
+    }
+    // Contiguous, oldest first: nothing in the middle was dropped.
+    for (let i = 1; i < log.length; i++) expect(log[i]).toBe(log[i - 1] + 1);
+  });
+
+  // The regression this exists for. At the production cap, taking one entry
+  // off the front for each one added made V8 move 32767 elements per call:
+  // 64 us against 0.5 us at a cap of 4096. A ratio rather than a duration,
+  // so a slow runner slows both sides; the old code measured ~120x here.
+  it('costs the same per entry at the production cap as at a small one', () => {
+    const perEntry = (cap: number): number => {
+      const log: object[] = [];
+      for (let i = 0; i < cap; i++) log.push({ seq: i });
+      let best = Infinity;
+      for (let round = 0; round < 5; round++) {
+        const t = performance.now();
+        for (let i = 0; i < 100_000; i++) appendCapped(log, { seq: i }, cap);
+        best = Math.min(best, performance.now() - t);
+      }
+      return best;
+    };
+    const small = perEntry(4096);
+    const large = perEntry(MAX_RECORDED_ENTRIES);
+    expect(large).toBeLessThan(small * 10 + 5);
   });
 });
