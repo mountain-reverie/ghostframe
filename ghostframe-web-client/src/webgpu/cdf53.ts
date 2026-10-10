@@ -205,8 +205,6 @@ export class Cdf53Pipeline {
   private inverseMaskCpu: Uint32Array<ArrayBuffer> = new Uint32Array(0);
   /** Unique tiles that received a pass in the batch last uploaded. */
   private inverseTileCount = 0;
-  /** Set by resize(): the framebuffer is new, so repaint every tile once. */
-  private fullInverseNeeded = false;
   private inverseMaskBindGroups!: InverseBindGroups;
   private inverseAllBindGroups!: InverseBindGroups;
   // Scratch reused across batches (PC-L5): grown, never shrunk, never
@@ -273,9 +271,15 @@ export class Cdf53Pipeline {
   resize(maxTiles: number, framebufferView: GPUTextureView, frameCols: number): void {
     const viewChanged = this.framebufferView !== framebufferView;
     this.framebufferView = framebufferView;
-    // The framebuffer may be a new texture: whatever the previous inverse
-    // painted is gone, so repaint every tile once on the next frame.
-    this.fullInverseNeeded = true;
+    // No repaint is forced here: Framebuffer.resize preserves old content,
+    // and repainting from tileGen would lift tiles that have since moved to
+    // another codec, painting stale CDF53 over newer pixels.
+    if (frameCols !== this.cols && this.maxTiles > 0 && maxTiles === this.maxTiles) {
+      // Same tile count, different grid (e.g. 1920x1080 -> 1080x1920): the
+      // per-tile state is indexed by the old column count, so it is garbage.
+      this.cols = frameCols;
+      this.clearAllState();
+    }
     const colsBuf = new Uint32Array([frameCols, 0, 0, 0]);
     this.device.queue.writeBuffer(this.uniformsBuffer, 0, colsBuf);
     this.cols = frameCols;
@@ -429,7 +433,8 @@ export class Cdf53Pipeline {
   }
 
   // ---- Stubs filled by later tasks ----
-  uploadBatch(entries: readonly PrevalidatedCdf53[]): number {
+  uploadBatch(entriesIn: readonly PrevalidatedCdf53[]): number {
+    let entries = entriesIn;
     // M3.3b unconditional counters (not gated on watcher state). Used to
     // determine whether `entries` is non-empty when uploadBatch is called.
     this.uploadBatchCalls++;
@@ -442,6 +447,14 @@ export class Cdf53Pipeline {
       this.entriesWhileWatcherSet += entries.length;
     }
     if (entries.length === 0) return 0;
+    // Drop tiles outside the current grid (a resize can leave old-geometry
+    // tiles in flight, and the server is not trusted): an out-of-range index
+    // would make the span upload below throw and stall the render loop.
+    if (entries.some((e) => e.tileX >= this.cols || e.tileY * this.cols + e.tileX >= this.maxTiles)) {
+      entries = entries.filter((e) => e.tileX < this.cols && e.tileY * this.cols + e.tileX < this.maxTiles);
+      this.inverseTileCount = 0;
+      if (entries.length === 0) return 0;
+    }
     if (this.tileWatcherX !== null) {
       for (const e of entries) {
         this.seenTilesAddCalls++;
@@ -534,7 +547,9 @@ export class Cdf53Pipeline {
     // Inverse mask: gen for tiles in this batch, 0 elsewhere (see the
     // comment on `inverseMaskBuffer`). One upload of the whole array.
     this.inverseMaskCpu.fill(0);
-    for (const tileIdx of touchedTiles) this.inverseMaskCpu[tileIdx] = this.lastSeenGen[tileIdx];
+    // Any non-zero value admits the tile. Not the gen: the 4-bit wire
+    // generation wraps to 0, and a 0 would silently skip the lift.
+    for (const tileIdx of touchedTiles) this.inverseMaskCpu[tileIdx] = 1;
     this.device.queue.writeBuffer(this.inverseMaskBuffer, 0, this.inverseMaskCpu);
     this.inverseTileCount = touchedTiles.size;
     for (let i = 0; i < entries.length; i++) {
@@ -584,16 +599,9 @@ export class Cdf53Pipeline {
    * pass in the batch last passed to `uploadBatch`. Skipped entirely when
    * there are none: a frame that only moved Solid/PalRle/Raw/H.264 tiles has
    * no CDF53 work, and the ~10 ms full-grid lift it used to run repainted
-   * unchanged pixels. After a framebuffer change (`resize`) one full repaint
-   * runs instead, since the new texture holds none of the old output.
+   * unchanged pixels.
    */
   encodeInverse(encoder: GPUCommandEncoder): void {
-    if (this.fullInverseNeeded) {
-      this.fullInverseNeeded = false;
-      this.inverseTileCount = 0;
-      this.encodeInverseWith(encoder, this.inverseAllBindGroups);
-      return;
-    }
     if (this.inverseTileCount === 0) return;
     this.inverseTileCount = 0;
     this.encodeInverseWith(encoder, this.inverseMaskBindGroups);
