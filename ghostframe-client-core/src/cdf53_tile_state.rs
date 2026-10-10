@@ -40,6 +40,11 @@ impl Cdf53TileState {
         }
     }
 
+    /// Forget tiles for which `keep(x, y)` is false.
+    pub fn retain_tiles(&mut self, keep: impl Fn(u8, u8) -> bool) {
+        self.tiles.retain(|&(x, y), _| keep(x, y));
+    }
+
     /// Accumulate one accepted pass for tile `(tile_x, tile_y)`.
     ///
     /// A generation change relative to the tile's currently-held state
