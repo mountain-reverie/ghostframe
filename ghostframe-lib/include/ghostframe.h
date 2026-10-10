@@ -324,7 +324,9 @@ GfServerHandle gf_server_new(const char *hostname,
 
 /**
  * Submit a frame for tiling and transmission.
- * Returns 0 on success, -1 on failure.
+ * Returns 0 on success, -1 on failure (including a null argument, or a frame
+ * geometry that is zero, larger than 16384 per edge, has a stride below
+ * `width * 4`, or spans 4 GiB or more).
  *
  * # Safety
  * `handle` must be a valid pointer from `gf_server_new`.
