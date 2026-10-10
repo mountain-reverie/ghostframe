@@ -3651,6 +3651,123 @@ async fn e2e_cdf53_gradient_emission() -> Result<()> {
     Ok(())
 }
 
+/// Every `window.__*` global the suite polls must hold something real.
+///
+/// A global whose writer was deleted but whose reader survived reads as a
+/// measurement: `0` datagrams, `[]` paints, `frame_total=0`. That happened
+/// three times (the pre-wasm TS decode path, the wasm cutover, and again
+/// when `__ghostframeStats` and `__ghostframe_framePaints` went dark while
+/// four e2e sites and the bench kept deriving rates from them), and each
+/// time the gates went green on empty data for weeks.
+///
+/// This runs a scene that exercises every writer (solid + text + gradient +
+/// spinner, CDF53 enabled) and requires each polled global to be non-trivial
+/// at least once. Adding a new polled global means adding it to
+/// `GLOBAL_PROBES`; a polled global that is not listed is invisible to this
+/// guard, so keep the list in step with the `evaluate("window.__...")` calls.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_polled_globals_are_live() -> Result<()> {
+    // (name, JS expression that is true iff the global is non-trivial)
+    const GLOBAL_PROBES: &[(&str, &str)] = &[
+        (
+            "__ghostframeStats",
+            "(window.__ghostframeStats?.tileDatagrams ?? 0) > 0",
+        ),
+        (
+            "__ghostframeRafTicks",
+            "(window.__ghostframeRafTicks ?? 0) > 0",
+        ),
+        (
+            "__ghostframeRecordedCodecs",
+            "(window.__ghostframeRecordedCodecs?.length ?? 0) > 0",
+        ),
+        (
+            "__ghostframeRecordedTiles",
+            "(window.__ghostframeRecordedTiles?.length ?? 0) > 0",
+        ),
+        (
+            "__ghostframeRecordedFlags",
+            "(window.__ghostframeRecordedFlags?.length ?? 0) > 0",
+        ),
+        (
+            "__ghostframe_framePaints",
+            "(window.__ghostframe_framePaints?.length ?? 0) > 0",
+        ),
+        (
+            "__ghostframeRecordedTiles[].firstRecvMsClient",
+            "(window.__ghostframeRecordedTiles ?? []).some(t => t.firstRecvMsClient > 0)",
+        ),
+        (
+            "__ghostframeRenderer",
+            "!!window.__ghostframeRenderer?.texture",
+        ),
+        (
+            "__h5_tilePushLog",
+            "(window.__h5_tilePushLog?.length ?? 0) > 0",
+        ),
+        (
+            "__h2_clientPaletteWrites",
+            "(window.__h2_clientPaletteWrites?.length ?? 0) > 0",
+        ),
+        (
+            "__cdf53DispatchSeen",
+            "(window.__cdf53DispatchSeen ?? 0) > 0",
+        ),
+        (
+            "__cdf53PushedToQueue",
+            "(window.__cdf53PushedToQueue ?? 0) > 0",
+        ),
+        (
+            "__cdf53CoverageSummary",
+            "(window.__cdf53CoverageSummary?.().summary?.tiles ?? 0) > 0",
+        ),
+    ];
+
+    let setup =
+        setup_e2e_webgpu_gpu_with_env("--mixed", &[("GHOSTFRAME_ENABLE_CDF53", "1")]).await?;
+
+    let probe_js = format!(
+        "JSON.stringify({{{}}})",
+        GLOBAL_PROBES
+            .iter()
+            .map(|(name, expr)| format!("{name:?}: (() => {{ try {{ return !!({expr}); }} catch (e) {{ return false; }} }})()"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(45);
+    let mut ever_live: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    loop {
+        let json: String = setup
+            .page()
+            .evaluate(probe_js.as_str())
+            .await?
+            .into_value()?;
+        let now: std::collections::BTreeMap<String, bool> = serde_json::from_str(&json)?;
+        for (name, _) in GLOBAL_PROBES {
+            if now.get(*name).copied().unwrap_or(false) {
+                ever_live.insert(name);
+            }
+        }
+        if ever_live.len() == GLOBAL_PROBES.len() {
+            return Ok(());
+        }
+        if std::time::Instant::now() > deadline {
+            let dead: Vec<&str> = GLOBAL_PROBES
+                .iter()
+                .map(|(n, _)| *n)
+                .filter(|n| !ever_live.contains(n))
+                .collect();
+            panic!(
+                "polled window.__* globals never became non-trivial in 45 s: {dead:?}. \
+                 A writer was removed or never fed; fix the writer or delete the global \
+                 together with its readers."
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
 /// M3.3a: `--mixed` content drives the classifier through multiple codecs.
 /// Verify codec mixing with Cdf53 in the set.
 #[tokio::test(flavor = "multi_thread")]
