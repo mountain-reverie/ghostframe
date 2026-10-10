@@ -20,7 +20,7 @@ use std::pin::Pin;
 
 use bytes::BytesMut;
 use quinn_proto::{ConnectionHandle, Event, StreamEvent};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream as TokioUnixStream;
 use tokio::sync::mpsc;
@@ -592,6 +592,24 @@ const DISPLAY_MODE_DEBOUNCE_US: u64 = 250_000;
 /// behaviour, so a client that never negotiates sees no change.
 const DEFAULT_SCALE_MILLI: u16 = 1000;
 
+/// How long a freshly accepted connection may stay silent (no HELLO) before
+/// the server closes it. Armed at accept time so a half-open handshake is
+/// covered too.
+const HELLO_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long an evicted session keeps its QUIC connection open so the
+/// eviction notice can leave before CONNECTION_CLOSE.
+const EVICT_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+/// QUIC application close codes (ours).
+const CLOSE_CODE_EVICTED: u32 = 0x6701;
+const CLOSE_CODE_NO_HELLO: u32 = 0x6702;
+
+/// A pending server-initiated close of one connection.
+#[derive(Clone, Copy, Debug)]
+struct CloseDeadline {
+    at: std::time::Instant,
+    code: u32,
+}
+
 /// CVT rounds h_active UP to a multiple of 8 (verified: `cvt 1283 817 60 -r`
 /// yields a 1288-wide mode). Align requested widths DOWN to this instead:
 /// a mode wider than the client's window crops the remote desktop
@@ -698,15 +716,21 @@ pub struct IoBridge {
     /// remain last-writer-wins; this field only names that writer, which is
     /// what a later M4a task needs to tell an incumbent from a newcomer.
     last_hello_from: Option<ConnectionHandle>,
-    /// Per-handle "have we already fired on_session_reset for this
-    /// connection?" tracking. Set when `maybe_fire_session_reset` runs
-    /// for a handle; cleared on `Event::ConnectionLost` so a rare
-    /// reconnect-with-same-handle re-fires the reset.
-    session_resets_fired: HashSet<ConnectionHandle>,
-    /// Tracks whether ANY client has previously established a session
-    /// on THIS `IoBridge` instance. Initial value `false`. Flips to
-    /// `true` permanently after the first `maybe_fire_session_reset`
-    /// for a connected handle. Used to skip the reset body on the
+    /// Connections that must be closed at a deadline: either a fresh
+    /// connection that has not sent HELLO yet ([`HELLO_DEADLINE`]), or an
+    /// evicted session given [`EVICT_CLOSE_GRACE`] to flush its notice.
+    /// Swept by `sweep_close_deadlines`. Cleared per handle by
+    /// `forget_session` (eviction re-inserts its entry afterwards).
+    close_deadlines: HashMap<ConnectionHandle, CloseDeadline>,
+    /// Feedback-stream buffers discarded because the sender had not been
+    /// HELLO'd (lifetime count; rate-limited warn).
+    non_live_feedback_drops: u64,
+    /// Inbound datagrams dropped because the sender was not the live
+    /// session (lifetime count; rate-limited warn).
+    non_live_datagram_drops: u64,
+    /// Tracks whether ANY client has previously been the live (HELLO'd)
+    /// session on THIS `IoBridge` instance. Initial value `false`. Flips to
+    /// `true` permanently at the first HELLO takeover. Used to skip the reset body on the
     /// FIRST connect (where dirty_tracker / classifier / scheduler /
     /// etc. are in their initial-startup state and the test suite
     /// implicitly depends on that state surviving session
@@ -960,7 +984,10 @@ pub struct IoBridge {
     /// trailing partial in place for the next call. Cleared on garbage
     /// (unknown msg_type or unknown INPUT sub-kind) so a corrupt byte
     /// can't wedge the dispatcher forever.
-    feedback_recv_buf: Vec<u8>,
+    ///
+    /// Keyed by sender: one connection's partial message must never be
+    /// completed by another connection's bytes. Removed in `forget_session`.
+    feedback_recv_bufs: HashMap<ConnectionHandle, Vec<u8>>,
     /// Lifetime counter of `send_datagram` Errs (Blocked / TooLarge /
     /// Disabled / UnsupportedByPeer). The Blocked case fires whenever the
     /// QUIC send buffer is full — at session start while cwnd is small,
@@ -1473,7 +1500,9 @@ impl IoBridge {
             local_addr,
             wt_sessions: HashMap::new(),
             last_hello_from: None,
-            session_resets_fired: HashSet::new(),
+            close_deadlines: HashMap::new(),
+            non_live_feedback_drops: 0,
+            non_live_datagram_drops: 0,
             has_seen_prior_session: false,
             frame_rx: None,
             inject_rx: None,
@@ -1542,7 +1571,7 @@ impl IoBridge {
             display_controller: None,
             display_scale_milli: DEFAULT_SCALE_MILLI,
             pending_display_mode: None,
-            feedback_recv_buf: Vec::new(),
+            feedback_recv_bufs: HashMap::new(),
             datagram_send_errs: 0,
             datagram_send_err_first_logged: false,
             tick_budget_multiplier: 1.0,
@@ -1744,11 +1773,13 @@ impl IoBridge {
     /// frame. It also means `send` can never fail here for want of
     /// receivers — `send_if_modified` ignores the receiver count.
     fn refresh_connected_session_count(&mut self) {
-        let connected = self
-            .wt_sessions
-            .values()
-            .filter(|wt| wt.is_connected())
-            .count();
+        // Only the HELLO'd session counts: a connected-but-unidentified
+        // connection must not open the capture gate or receive data.
+        let connected = usize::from(
+            self.last_hello_from
+                .and_then(|h| self.wt_sessions.get(&h))
+                .is_some_and(|wt| wt.is_connected()),
+        );
         self.connected_session_count.send_if_modified(|current| {
             if *current == connected {
                 false
@@ -1770,6 +1801,25 @@ impl IoBridge {
         }
     }
 
+    /// Is `handle` the HELLO'd session? The authorisation predicate: only
+    /// the live session may have its feedback honoured or receive data.
+    fn is_live(&self, handle: ConnectionHandle) -> bool {
+        self.last_hello_from == Some(handle)
+    }
+
+    /// The live session's handle iff it can also be sent to: its WebTransport
+    /// session is connected and the quinn connection is still present.
+    fn live_send_handle(&self) -> Option<ConnectionHandle> {
+        self.live_connected_handle()
+            .filter(|h| self.server.connections.contains_key(h))
+    }
+
+    /// The live session's handle iff its WebTransport session is connected.
+    fn live_connected_handle(&self) -> Option<ConnectionHandle> {
+        let h = self.last_hello_from?;
+        self.wt_sessions.get(&h)?.is_connected().then_some(h)
+    }
+
     /// Compute the maximum datagram size from the smallest connected session.
     ///
     /// Side effect: calls `refresh_connected_session_count` so the capture
@@ -1777,11 +1827,8 @@ impl IoBridge {
     fn compute_max_datagram_size(&mut self) -> Option<usize> {
         self.refresh_connected_session_count();
         let mut min_size: Option<usize> = None;
-        for (handle, wt) in &self.wt_sessions {
-            if !wt.is_connected() {
-                continue;
-            }
-            if let Some(conn) = self.server.connections.get_mut(handle) {
+        if let Some(handle) = self.live_send_handle() {
+            if let Some(conn) = self.server.connections.get_mut(&handle) {
                 if let Some(sz) = conn.datagrams().max_size() {
                     let usable = sz.saturating_sub(Self::WT_VARINT_OVERHEAD);
                     min_size = Some(match min_size {
@@ -1836,11 +1883,13 @@ impl IoBridge {
         // corruption -- the client dedups on wire_seq and tile reassembly is
         // idempotent per frag_idx. Production runs a single session.
         let mut rejected = false;
-        for (handle, wt) in &mut self.wt_sessions {
-            if !wt.is_connected() {
-                continue;
-            }
-            if let Some(conn) = self.server.connections.get_mut(handle) {
+        // Only the HELLO'd session receives stream data.
+        if let Some(handle) = self.live_send_handle() {
+            let handle = &handle;
+            if let (Some(wt), Some(conn)) = (
+                self.wt_sessions.get_mut(handle),
+                self.server.connections.get_mut(handle),
+            ) {
                 if let Err(e) = wt.send_datagram(conn, dg) {
                     rejected = true;
                     self.datagram_send_errs = self.datagram_send_errs.saturating_add(1);
@@ -1891,12 +1940,8 @@ impl IoBridge {
     /// per-tick AIMD budget down to what quinn can actually accept.
     fn min_session_send_buffer_space(&mut self) -> usize {
         let mut min_space: Option<usize> = None;
-        let handles: Vec<quinn_proto::ConnectionHandle> = self
-            .wt_sessions
-            .iter()
-            .filter(|(_, wt)| wt.is_connected())
-            .map(|(h, _)| *h)
-            .collect();
+        let handles: Vec<quinn_proto::ConnectionHandle> =
+            self.live_send_handle().into_iter().collect();
         for handle in handles {
             if let Some(conn) = self.server.connections.get_mut(&handle) {
                 let space = conn.datagrams().send_buffer_space();
@@ -3503,6 +3548,54 @@ impl IoBridge {
         self.reliable_emitter.on_nack(&entries, now_std());
     }
 
+    /// Route one inbound (non-ping) datagram from `from`.
+    ///
+    /// Only the HELLO'd session's datagrams are honoured: an ACK or NACK
+    /// from anyone else would let an unauthenticated peer release the
+    /// retransmit cache or trigger retransmissions. Everything from a
+    /// non-live sender is dropped and counted.
+    pub(crate) fn dispatch_inbound_datagram(&mut self, from: ConnectionHandle, dg: &[u8]) {
+        if !self.is_live(from) {
+            self.non_live_datagram_drops = self.non_live_datagram_drops.saturating_add(1);
+            if self.non_live_datagram_drops == 1 || self.non_live_datagram_drops.is_multiple_of(64)
+            {
+                tracing::warn!(
+                    ?from,
+                    total = self.non_live_datagram_drops,
+                    "datagram from a session that has not sent HELLO; dropped (rate-limited)"
+                );
+            }
+            return;
+        }
+        // Route by discriminator. TileNack (`TILE_NACK_ENVELOPE`) routes into
+        // the reliable-tile emitter; ACK batches go to `dispatch_ack_datagram`.
+        // Other kinds (Hello, frame/tile fragments) are not dispatched on the
+        // inbound server path.
+        //
+        // The kinds are listed rather than caught by `_ =>`: a catch-all
+        // once fed every non-NACK kind into the ACK parser and hid a stale
+        // `classify_inbound` mapping for months. Listing them forces a
+        // decision about where a new inbound type goes.
+        use crate::transport::protocol::InboundKind as K;
+        match crate::transport::protocol::classify_inbound(dg) {
+            K::TileNack => self.dispatch_tile_nack_datagram(dg),
+            K::AckBatch => self.dispatch_ack_datagram(dg),
+            // Superseded ACK revisions still reach the ACK decoder, which
+            // rejects them by design -- that rejection is the intended
+            // handling, not a fallthrough.
+            K::AckBatchV1 => self.dispatch_ack_datagram(dg),
+            K::Empty
+            | K::Unknown
+            | K::Hello
+            | K::TileParity
+            | K::FrameFragment
+            | K::TileFragment => {
+                self.unroutable_inbound_datagrams =
+                    self.unroutable_inbound_datagrams.saturating_add(1);
+            }
+        }
+    }
+
     /// Parse a concatenated FEEDBACK-stream byte buffer, dispatching by
     /// message-type byte. Supports:
     /// - `0x01` FEEDBACK_MSG_TYPE  (22 bytes)  — `ReceiverFeedback`
@@ -3530,13 +3623,36 @@ impl IoBridge {
         // can't dispatch directly off `data` — we need to walk a
         // contiguous view that includes any leftover tail from the
         // previous call.
-        self.feedback_recv_buf.extend_from_slice(data);
-        let buf = std::mem::take(&mut self.feedback_recv_buf);
+        //
+        // The accumulator is per sender: bytes from one connection must
+        // never complete a partial message from another.
+        let mut buf = self.feedback_recv_bufs.remove(&from).unwrap_or_default();
+        buf.extend_from_slice(data);
         let mut offset = 0;
         let mut discard_tail = false;
 
         while offset < buf.len() {
             let msg_type = buf[offset];
+            // Authorisation, re-evaluated per message: HELLO is the only
+            // message a connection may send before it is the live session,
+            // and a HELLO earlier in this same buffer can make it live for
+            // what follows. Nothing else executes for a non-live sender.
+            if msg_type != HELLO_MSG_TYPE && !self.is_live(from) {
+                self.non_live_feedback_drops = self.non_live_feedback_drops.saturating_add(1);
+                if self.non_live_feedback_drops == 1
+                    || self.non_live_feedback_drops.is_multiple_of(64)
+                {
+                    tracing::warn!(
+                        ?from,
+                        msg_type,
+                        total = self.non_live_feedback_drops,
+                        "feedback-stream bytes from a session that has not sent HELLO; \
+                         discarded (rate-limited)"
+                    );
+                }
+                discard_tail = true;
+                break;
+            }
             match msg_type {
                 FEEDBACK_MSG_TYPE => {
                     if buf.len() - offset < FEEDBACK_SIZE {
@@ -3681,7 +3797,12 @@ impl IoBridge {
         // Garbage paths (`discard_tail = true`) intentionally drop the tail
         // so a corrupt byte doesn't wedge the dispatcher.
         if !discard_tail && offset < buf.len() {
-            self.feedback_recv_buf.extend_from_slice(&buf[offset..]);
+            debug_assert!(
+                buf.len() - offset < 64,
+                "retained feedback tail must be a partial message, not {} bytes",
+                buf.len() - offset
+            );
+            self.feedback_recv_bufs.insert(from, buf.split_off(offset));
         }
     }
 
@@ -3718,12 +3839,8 @@ impl IoBridge {
             .pending_display_mode
             .as_ref()
             .map(|p| self.epoch + std::time::Duration::from_micros(p.deadline_us));
-        match (quic, display) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        }
+        let close = self.close_deadlines.values().map(|d| d.at).min();
+        [quic, display, close].into_iter().flatten().min()
     }
 
     pub(crate) fn on_timeout(&mut self, now_us: u64) {
@@ -3804,46 +3921,12 @@ impl IoBridge {
         }
     }
 
-    /// Gate for `fire_session_reset`: fires the reset body exactly once per
-    /// connection handle when its `WebTransportServer` reports
-    /// `is_connected() == true`, AND when at least one prior session has
-    /// existed (i.e., this is a reconnect, not the first ever connect).
-    /// The first-connect case is intentionally skipped because the reset
-    /// body has RECONNECT-specific side effects (frame_mode → H264,
-    /// scheduler clear, force_dirty_frames=20, request_keyframe) that are
-    /// no-ops on a fresh server but break test setups that capture frames
-    /// before the client connects.
-    fn maybe_fire_session_reset(&mut self, handle: ConnectionHandle) {
-        let Some(wt) = self.wt_sessions.get(&handle) else {
-            return;
-        };
-        if !wt.is_connected() {
-            return;
-        }
-        if !self.session_resets_fired.insert(handle) {
-            return;
-        }
-        if self.has_seen_prior_session {
-            self.fire_session_reset(handle);
-        }
-        // Implicit lifecycle invariant: ConnectionHandle ordering is monotonic
-        // within an IoBridge instance. If this breaks (e.g. a future test
-        // recycles handles), the `has_seen_prior_session` latch logic will
-        // misclassify the new "first" connect as a reconnect. Debug-assert
-        // surfaces the violation rather than silently producing wrong behaviour.
-        #[cfg(debug_assertions)]
-        if !self.has_seen_prior_session {
-            debug_assert!(
-                self.session_resets_fired.len() == 1,
-                "has_seen_prior_session=false but session_resets_fired has >1 entry — \
-                 IoBridge state inconsistency (lifecycle violation?)"
-            );
-        }
-        self.has_seen_prior_session = true;
-    }
-
     /// Reset per-session state on a new WebTransport session. Called by
-    /// `maybe_fire_session_reset` (Task 3) once per new connection handle.
+    /// `apply_hello` when a new session takes over (not for the first-ever
+    /// session, where the reset body's RECONNECT-specific side effects --
+    /// frame_mode -> H264, scheduler clear, force_dirty_frames=20,
+    /// request_keyframe -- are no-ops that would break setups capturing
+    /// frames before the client connects).
     /// Preserves cross-session palette bytes (warm cache) and, when the
     /// cfg-gated test hook GHOSTFRAME_SKIP_PALETTE_SESSION_RESET=1 is
     /// active, also preserves `palette_table.delivered`.
@@ -3962,11 +4045,8 @@ impl IoBridge {
         // connects the content appears "unchanged" so nothing is ever sent.
         let max_frag = {
             let mut min_size: Option<usize> = None;
-            for (handle, wt) in &self.wt_sessions {
-                if !wt.is_connected() {
-                    continue;
-                }
-                if let Some(conn) = self.server.connections.get_mut(handle) {
+            if let Some(handle) = self.live_send_handle() {
+                if let Some(conn) = self.server.connections.get_mut(&handle) {
                     if let Some(sz) = conn.datagrams().max_size() {
                         let usable =
                             max_fragment_payload(sz.saturating_sub(Self::WT_VARINT_OVERHEAD));
@@ -5610,6 +5690,9 @@ impl IoBridge {
     /// next frame. Wired in once client-side NACK sending is integrated.
     #[allow(dead_code)]
     fn handle_nack(&mut self, nack: NackMessage, handle: ConnectionHandle) {
+        if !self.is_live(handle) {
+            return;
+        }
         if let Some(conn) = self.server.connections.get_mut(&handle) {
             let rtt = conn.stats().path.rtt;
             let frame_interval = std::time::Duration::from_micros(16_667); // ~60fps
@@ -5673,7 +5756,10 @@ impl IoBridge {
                     diag_timeout_arm += 1;
                     #[cfg(test)]
                     self.loop_arm_trace.push(LoopArm::Timeout);
-                    self.server.handle_timeout(now_std());
+                    let reaped = self.server.handle_timeout(now_std());
+                    for handle in reaped {
+                        self.on_connection_gone(handle, "reaped after drain");
+                    }
                 }
 
                 // 2. Inbound framed UDP packet from ghostbridge.
@@ -5764,6 +5850,10 @@ impl IoBridge {
                     inbound_streak = 0;
                 }
             }
+
+            // Arm/enforce close deadlines first, so a CONNECTION_CLOSE queued
+            // here leaves in the drain_outbound just below.
+            self.sweep_close_deadlines(now_std());
 
             // Always drain after either branch.
             //
@@ -6065,7 +6155,6 @@ impl IoBridge {
                     ) {
                         wt.on_stream_opened(conn, dir);
                     }
-                    self.maybe_fire_session_reset(handle);
                 }
 
                 Event::Stream(StreamEvent::Readable { id }) => {
@@ -6075,7 +6164,6 @@ impl IoBridge {
                     ) {
                         wt.on_stream_readable(conn, id);
                     }
-                    self.maybe_fire_session_reset(handle);
                 }
 
                 Event::DatagramReceived => {
@@ -6099,86 +6187,12 @@ impl IoBridge {
                         }
                     }
                     for dg in to_dispatch {
-                        // Route by discriminator. TileNack
-                        // (`TILE_NACK_ENVELOPE`) routes into the
-                        // reliable-tile emitter; everything else falls
-                        // through to `dispatch_ack_datagram`, which
-                        // re-checks the first byte against
-                        // `ACK_BATCH_MSG_TYPE` itself and ignores anything
-                        // else. Other kinds (Hello, frame/tile fragments)
-                        // are not dispatched on the inbound server path.
-                        //
-                        // Note the catch-all is load-bearing: it is why a
-                        // stale `classify_inbound` mapping for the ACK
-                        // discriminator went unnoticed from 2026-06-27
-                        // until 2026-09-15. Adding a second specific arm
-                        // here without checking what `classify_inbound`
-                        // actually returns for a live ACK would silently
-                        // swallow the ACK stream.
-                        {
-                            use crate::transport::protocol::InboundKind as K;
-                            match crate::transport::protocol::classify_inbound(&dg) {
-                                K::TileNack => self.dispatch_tile_nack_datagram(&dg),
-                                K::AckBatch => self.dispatch_ack_datagram(&dg),
-                                // Superseded ACK revisions still reach the ACK
-                                // decoder, which rejects them by design -- that
-                                // rejection is the intended handling, not a
-                                // fallthrough.
-                                K::AckBatchV1 => self.dispatch_ack_datagram(&dg),
-                                // Everything else is not an ACK and must not be
-                                // handed to the ACK parser. This arm used to be
-                                // `_ =>` feeding *every* non-NACK kind into
-                                // `dispatch_ack_datagram`, which quietly
-                                // undermined the INBOUND_DISCRIMINATORS registry
-                                // that exists precisely so routing is explicit.
-                                //
-                                // Listing the kinds means a new inbound type
-                                // cannot be added without a decision being made
-                                // here about where it goes.
-                                K::Empty
-                                | K::Unknown
-                                | K::Hello
-                                | K::TileParity
-                                | K::FrameFragment
-                                | K::TileFragment => {
-                                    self.unroutable_inbound_datagrams =
-                                        self.unroutable_inbound_datagrams.saturating_add(1);
-                                }
-                            }
-                        }
+                        self.dispatch_inbound_datagram(handle, &dg);
                     }
                 }
 
                 Event::ConnectionLost { reason } => {
-                    // Everything needed to reconstruct the gap later: how long
-                    // this session lasted, and how much undelivered state died
-                    // with it. clear_cache() below used to discard all of it
-                    // silently, so a log could show a session ending and give
-                    // no hint that thousands of un-ACKed passes went with it.
-                    let discarded = self.reliable_emitter.pending_cache_entries();
-                    let discarded_bytes = self.reliable_emitter.bytes_in_flight();
-                    let now = std::time::Instant::now();
-                    tracing::info!(
-                        ?handle,
-                        %reason,
-                        session_secs = self
-                            .session_started_at
-                            .map(|t| now.saturating_duration_since(t).as_secs_f32()),
-                        discarded_pending_entries = discarded,
-                        discarded_bytes,
-                        "connection lost"
-                    );
-                    self.session_started_at = None;
-                    self.last_disconnect_at = Some(now);
-                    self.forget_session(handle);
-                    // Delivery-guarantee invariant: when the session ends,
-                    // un-ACKed tile-passes are no longer deliverable and
-                    // must not occupy memory or fire spurious retransmits
-                    // for the next client. ReliableTileEmitter is shared
-                    // across sessions; the current design has one client
-                    // at a time. If we ever support concurrent multi-client
-                    // sessions, this clear should become per-session.
-                    self.reliable_emitter.clear_cache();
+                    self.on_connection_gone(handle, &reason.to_string());
                 }
 
                 Event::HandshakeDataReady => {
@@ -6472,7 +6486,9 @@ impl IoBridge {
             local_addr: "0.0.0.0:443".parse().unwrap(),
             wt_sessions: HashMap::new(),
             last_hello_from: None,
-            session_resets_fired: HashSet::new(),
+            close_deadlines: HashMap::new(),
+            non_live_feedback_drops: 0,
+            non_live_datagram_drops: 0,
             has_seen_prior_session: false,
             frame_rx: None,
             inject_rx: None,
@@ -6538,7 +6554,7 @@ impl IoBridge {
             display_controller: None,
             display_scale_milli: DEFAULT_SCALE_MILLI,
             pending_display_mode: None,
-            feedback_recv_buf: Vec::new(),
+            feedback_recv_bufs: HashMap::new(),
             datagram_send_errs: 0,
             datagram_send_err_first_logged: false,
             tick_budget_multiplier: 1.0,
@@ -6850,6 +6866,26 @@ impl IoBridge {
         // HELLO, not `from` itself.
         let incumbent = self.last_hello_from;
         self.last_hello_from = Some(from);
+        // The HELLO arrived: the never-HELLO deadline no longer applies.
+        self.close_deadlines.remove(&from);
+
+        // A different connection becoming the live session is a takeover
+        // (or the first ever). Per-session state of whoever came before
+        // must not leak into the new session.
+        if incumbent != Some(from) {
+            let now = std::time::Instant::now();
+            tracing::info!(
+                ?from,
+                gap_secs = self
+                    .last_disconnect_at
+                    .map(|t| now.saturating_duration_since(t).as_secs_f32()),
+                carried_pending_entries = self.reliable_emitter.pending_cache_entries(),
+                "session live"
+            );
+            self.session_started_at = Some(now);
+            self.pending_display_mode = None;
+            self.display_scale_milli = DEFAULT_SCALE_MILLI;
+        }
 
         // One client at a time. A second client identifying itself displaces
         // the incumbent, which is told why (M4a design §2, §3).
@@ -6862,6 +6898,15 @@ impl IoBridge {
             if incumbent != from {
                 self.evict_session(incumbent, EvictionReason::DisplacedByNewSession);
             }
+        }
+
+        // Reset per-session pipeline state for a new live session -- but not
+        // for the first one ever (see `fire_session_reset`).
+        if incumbent != Some(from) {
+            if self.has_seen_prior_session {
+                self.fire_session_reset(from);
+            }
+            self.has_seen_prior_session = true;
         }
 
         self.client_caps = msg.caps;
@@ -6890,12 +6935,53 @@ impl IoBridge {
         self.last_hello_from
     }
 
+    /// Cleanup for a connection that is gone, whether quinn reported
+    /// `ConnectionLost` or `QuicServer::handle_timeout` reaped it silently.
+    ///
+    /// Only the live session's loss touches server-wide state: a stale or
+    /// never-HELLO'd connection dying (a scanner timing out, an evicted
+    /// session finishing its close) must not wipe the live session's
+    /// retransmit cache or reset its clocks.
+    fn on_connection_gone(&mut self, handle: ConnectionHandle, reason: &str) {
+        // Must be read before forget_session clears it.
+        let was_live = self.last_hello_from == Some(handle);
+        // Everything needed to reconstruct the gap later: how long this
+        // session lasted, and how much undelivered state died with it.
+        // clear_cache() below used to discard all of it silently.
+        let discarded = self.reliable_emitter.pending_cache_entries();
+        let discarded_bytes = self.reliable_emitter.bytes_in_flight();
+        let now = std::time::Instant::now();
+        tracing::info!(
+            ?handle,
+            reason,
+            was_live,
+            session_secs = self
+                .session_started_at
+                .map(|t| now.saturating_duration_since(t).as_secs_f32()),
+            discarded_pending_entries = if was_live { discarded } else { 0 },
+            discarded_bytes = if was_live { discarded_bytes } else { 0 },
+            "connection lost"
+        );
+        self.forget_session(handle);
+        if was_live {
+            self.session_started_at = None;
+            self.last_disconnect_at = Some(now);
+            // Delivery-guarantee invariant: when the session ends,
+            // un-ACKed tile-passes are no longer deliverable and must not
+            // occupy memory or fire spurious retransmits for the next
+            // client. ReliableTileEmitter is shared across sessions; the
+            // design has one live client at a time.
+            self.reliable_emitter.clear_cache();
+        }
+    }
+
     /// Forget everything keyed by a connection handle. Every site that drops
     /// a session must go through here: quinn reuses handles from a slab, so
     /// a forgotten entry can alias a future connection.
     fn forget_session(&mut self, handle: ConnectionHandle) {
         self.wt_sessions.remove(&handle);
-        self.session_resets_fired.remove(&handle);
+        self.feedback_recv_bufs.remove(&handle);
+        self.close_deadlines.remove(&handle);
         if self.last_hello_from == Some(handle) {
             self.last_hello_from = None;
         }
@@ -6937,7 +7023,17 @@ impl IoBridge {
             carried_pending_entries = self.reliable_emitter.pending_cache_entries(),
             "connection established"
         );
-        self.session_started_at = Some(now);
+        // Backstop against a reused slab key: quinn recycles handles, so any
+        // state a previous holder left behind must not alias this
+        // connection. Keep the never-HELLO deadline armed at accept time.
+        let armed = self
+            .close_deadlines
+            .remove(&handle)
+            .filter(|d| d.code == CLOSE_CODE_NO_HELLO);
+        self.forget_session(handle);
+        if let Some(d) = armed {
+            self.close_deadlines.insert(handle, d);
+        }
         let wt = self.wt_sessions.entry(handle).or_default();
         if let Some(conn) = self.server.connections.get_mut(&handle) {
             wt.on_new_connection(conn);
@@ -7026,6 +7122,64 @@ impl IoBridge {
         // future multi-client design would need a per-session cache.
         self.reliable_emitter.clear_cache();
         self.forget_session(handle);
+        // Close the QUIC connection once the notice has had time to leave.
+        // Inserted AFTER forget_session, which clears the handle's entry;
+        // the sweep closes by handle and does not need `wt_sessions`.
+        self.close_deadlines.insert(
+            handle,
+            CloseDeadline {
+                at: std::time::Instant::now() + EVICT_CLOSE_GRACE,
+                code: CLOSE_CODE_EVICTED,
+            },
+        );
+    }
+
+    /// Arm the never-HELLO deadline for a freshly accepted connection.
+    fn arm_hello_deadline(&mut self, handle: ConnectionHandle, now: std::time::Instant) {
+        self.close_deadlines.insert(
+            handle,
+            CloseDeadline {
+                at: now + HELLO_DEADLINE,
+                code: CLOSE_CODE_NO_HELLO,
+            },
+        );
+    }
+
+    /// Arm deadlines for newly accepted connections, then close every
+    /// connection whose deadline has passed. Run before the first
+    /// `drain_outbound` of a turn so CONNECTION_CLOSE is transmitted.
+    ///
+    /// A local close emits no `ConnectionLost`, so the sweep does the
+    /// per-handle cleanup itself; the drained connection is later reaped by
+    /// `QuicServer::handle_timeout`, which runs `on_connection_gone` (a no-op
+    /// for server-wide state, the handle no longer being live).
+    fn sweep_close_deadlines(&mut self, now: std::time::Instant) {
+        for handle in self.server.take_accepted() {
+            self.arm_hello_deadline(handle, now);
+        }
+        let due: Vec<(ConnectionHandle, CloseDeadline)> = self
+            .close_deadlines
+            .iter()
+            .filter(|(_, d)| d.at <= now)
+            .map(|(h, d)| (*h, *d))
+            .collect();
+        for (handle, d) in due {
+            self.close_deadlines.remove(&handle);
+            if let Some(conn) = self.server.connections.get_mut(&handle) {
+                let reason: &'static [u8] = match d.code {
+                    CLOSE_CODE_EVICTED => b"evicted",
+                    CLOSE_CODE_NO_HELLO => b"no HELLO before deadline",
+                    _ => b"closed",
+                };
+                tracing::info!(?handle, code = d.code, "closing connection at deadline");
+                conn.close(
+                    now,
+                    quinn_proto::VarInt::from_u32(d.code),
+                    bytes::Bytes::from_static(reason),
+                );
+            }
+            self.forget_session(handle);
+        }
     }
 
     /// Update FEC parity state based on receiver feedback.
@@ -7243,15 +7397,17 @@ impl IoBridge {
         // Collect first to satisfy the borrow checker: the immutable borrow of
         // `self.server.connections` must end before `apply_path_stats_snapshot`
         // takes `&mut self`.
+        // Only the HELLO'd session's path feeds the classifier: an
+        // unauthenticated connection must not steer bandwidth estimates.
         let snapshots: Vec<(u64, f32, u64)> = self
-            .server
-            .connections
-            .values()
+            .last_hello_from
+            .and_then(|h| self.server.connections.get(&h))
             .map(|conn| {
                 let stats = conn.stats();
                 let rtt_us = stats.path.rtt.as_secs_f32() * 1_000_000.0;
                 (stats.path.cwnd, rtt_us, stats.path.sent_packets)
             })
+            .into_iter()
             .collect();
         for (cwnd, rtt_us, sent_packets) in snapshots {
             if sent_packets != self.path_sent_packets_last {
@@ -7378,6 +7534,12 @@ mod tests {
         IoBridge::new_with_stream_for_test(our_end, server)
     }
 
+    /// Test-only helper: make `h` the HELLO'd (live) session without
+    /// running `apply_hello`'s side effects.
+    fn make_live(bridge: &mut IoBridge, h: ConnectionHandle) {
+        bridge.last_hello_from = Some(h);
+    }
+
     /// Test-only helper: attach a fresh (disconnected) WebTransport session
     /// for `h` to `bridge`. Shared by `test_bridge_with_sessions` and any
     /// test that needs to attach a session mid-test (e.g. simulating a
@@ -7405,6 +7567,11 @@ mod tests {
         );
         bridge.on_connection_established(h);
         assert!(
+            bridge.session_started_at.is_none(),
+            "a connection that has not sent HELLO is not a session yet"
+        );
+        bridge.apply_hello(h, hello(false));
+        assert!(
             bridge.session_started_at.is_some(),
             "session_secs would report None for a live session"
         );
@@ -7415,6 +7582,7 @@ mod tests {
         let h = ConnectionHandle(4);
         let mut bridge = test_bridge_with_sessions(&[h]).await;
         bridge.on_connection_established(h);
+        bridge.apply_hello(h, hello(false));
         assert!(bridge.last_disconnect_at.is_none());
 
         bridge.evict_session(h, EvictionReason::DisplacedByNewSession);
@@ -7437,11 +7605,13 @@ mod tests {
         let h = ConnectionHandle(5);
         let mut bridge = test_bridge_with_sessions(&[h]).await;
         bridge.on_connection_established(h);
+        bridge.apply_hello(h, hello(false));
         bridge.evict_session(h, EvictionReason::DisplacedByNewSession);
         let disconnected_at = bridge.last_disconnect_at.expect("set by eviction");
 
         let h2 = ConnectionHandle(6);
         bridge.on_connection_established(h2);
+        bridge.apply_hello(h2, hello(false));
         let started_at = bridge.session_started_at.expect("set by connect");
         assert!(
             started_at >= disconnected_at,
@@ -7464,6 +7634,7 @@ mod tests {
     async fn refresh_publishes_transitions_but_not_unchanged_counts() {
         let h = ConnectionHandle(1);
         let mut bridge = test_bridge_with_sessions(&[h]).await;
+        make_live(&mut bridge, h);
         let mut rx = bridge.connected_session_count_handle();
 
         // Attached but not handshaked: not a consumer yet.
@@ -7544,7 +7715,10 @@ mod tests {
     /// dispatch feedback bytes against.
     async fn test_bridge_with_one_session() -> (IoBridge, ConnectionHandle) {
         let handle = ConnectionHandle(0);
-        let bridge = test_bridge_with_sessions(&[handle]).await;
+        let mut bridge = test_bridge_with_sessions(&[handle]).await;
+        // The one session is the HELLO'd one: feedback from anyone else is
+        // discarded, so tests that dispatch feedback need a live sender.
+        make_live(&mut bridge, handle);
         (bridge, handle)
     }
 
@@ -8128,6 +8302,7 @@ mod tests {
         let server = QuicServer::new().expect("server");
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
         let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+        make_live(&mut bridge, ConnectionHandle(0));
         let initial_seq = bridge.adaptation_context.last_update_seq;
         let fb = crate::transport::feedback::ReceiverFeedback {
             timestamp_ns: 1_000_000,
@@ -8565,71 +8740,69 @@ mod tests {
     // `lock_env()`: `from_lookup` never touches process env.
 
     #[tokio::test]
-    async fn maybe_fire_session_reset_skips_first_connect_fires_on_reconnect() {
+    async fn session_reset_skips_first_hello_fires_on_takeover_not_on_rehello() {
         // `fire_session_reset` reads `self.skip_palette_session_reset`, a
-        // plain struct field set once at construction time (here,
-        // `new_with_stream_for_test` defaults it via `LibConfig::default()`,
-        // i.e. `false`) — not a live env read, so this test does not race
-        // `config::tests::transport_config_parses_skip_palette_session_reset`.
-        // No `lock_env()` needed: nothing left in this module's test suite
-        // mutates process env (Task 4 moved every such test into
-        // `config.rs` alongside the `from_lookup` parsing it covers).
+        // plain struct field set once at construction time, not a live env
+        // read, so this test does not race the env-parsing tests in config.rs.
         let handle_a = ConnectionHandle(0);
-        let mut bridge = test_bridge_with_sessions(&[handle_a]).await;
-
+        let handle_b = ConnectionHandle(1);
+        let mut bridge = test_bridge_with_sessions(&[handle_a, handle_b]).await;
         bridge.palette_table.delivered.insert(7);
 
-        // Pre-connected → no fire.
-        bridge.maybe_fire_session_reset(handle_a);
-        assert!(
-            bridge.palette_table.delivered.contains(7),
-            "not-yet-connected: no fire"
-        );
-
-        // FIRST connect (no prior session): even though is_connected=true, the
-        // reset body is SKIPPED — has_seen_prior_session was false. Tests that
-        // rely on classifier/scheduler/dirty-tracker state surviving first
-        // connect (e.g. e2e_palrle_5pct_loss, e2e_solid_per_tile_pixels) keep
-        // their pre-existing behavior.
+        // Merely being connected (no HELLO) fires nothing and latches nothing.
         bridge
             .wt_sessions
             .get_mut(&handle_a)
             .expect("wt session")
             .test_set_connected(true);
-        bridge.maybe_fire_session_reset(handle_a);
+        assert!(!bridge.has_seen_prior_session);
+        assert!(bridge.palette_table.delivered.contains(7));
+
+        // FIRST ever HELLO: the reset body is skipped (tests that rely on
+        // classifier/scheduler state surviving first connect keep working),
+        // but the latch is set.
+        bridge.apply_hello(handle_a, hello(false));
         assert!(
             bridge.palette_table.delivered.contains(7),
-            "first connect: reset body skipped (has_seen_prior_session was false)"
+            "first HELLO: reset body skipped"
         );
+        assert!(bridge.has_seen_prior_session, "latch set by first HELLO");
+
+        // Re-HELLO from the SAME handle is not a new session: no reset.
+        bridge.apply_hello(handle_a, hello(false));
         assert!(
-            bridge.has_seen_prior_session,
-            "first connect: has_seen_prior_session must now be true"
+            bridge.palette_table.delivered.contains(7),
+            "re-HELLO from the live handle must not reset"
         );
 
-        // Simulate ConnectionLost on handle_a (per real wiring at Event::ConnectionLost).
-        bridge.forget_session(handle_a);
-
-        // RECONNECT (new handle_b): reset body fires now (has_seen_prior_session=true).
-        let handle_b = ConnectionHandle(1);
-        attach_session(&mut bridge, handle_b);
-        bridge
-            .wt_sessions
-            .get_mut(&handle_b)
-            .expect("wt session b")
-            .test_set_connected(true);
-        bridge.maybe_fire_session_reset(handle_b);
+        // Takeover by a new handle: reset fires.
+        bridge.apply_hello(handle_b, hello(false));
         assert!(
             !bridge.palette_table.delivered.contains(7),
-            "reconnect: reset body MUST fire (delivered cleared)"
+            "takeover: reset body MUST fire (delivered cleared)"
         );
 
-        // Re-arm delivered. Second call on handle_b: no re-fire (session_resets_fired gate).
+        // Re-arm; re-HELLO from the new live handle: still no re-fire.
         bridge.palette_table.delivered.insert(7);
-        bridge.maybe_fire_session_reset(handle_b);
-        assert!(
-            bridge.palette_table.delivered.contains(7),
-            "second call on same handle: must not re-fire"
-        );
+        bridge.apply_hello(handle_b, hello(false));
+        assert!(bridge.palette_table.delivered.contains(7));
+    }
+
+    #[tokio::test]
+    async fn takeover_clears_pending_display_mode_and_scale() {
+        let (mut bridge, a) = test_bridge_with_one_session().await;
+        let b = ConnectionHandle(9);
+        attach_session(&mut bridge, b);
+        bridge.apply_hello(a, hello(false));
+        bridge.display_scale_milli = 2000;
+        bridge.pending_display_mode = Some(PendingDisplayMode {
+            width: 800,
+            height: 600,
+            deadline_us: 1,
+        });
+        bridge.apply_hello(b, hello(false));
+        assert!(bridge.pending_display_mode.is_none());
+        assert_eq!(bridge.display_scale_milli, DEFAULT_SCALE_MILLI);
     }
 
     // Former home of `skip_palette_session_reset_from_env_parses`: moved to
@@ -9755,6 +9928,7 @@ mod tests {
             moves: Mutex::new(Vec::new()),
         });
         let mut bridge = make_bridge_for_test().await;
+        make_live(&mut bridge, ConnectionHandle(0));
         bridge.input_injector = Some(injector.clone() as Arc<dyn InputInjector>);
 
         // pointer-move (0x05 0x01 x=100 y=200) — 100 = 0x0064, 200 = 0x00c8
@@ -9794,6 +9968,7 @@ mod tests {
             buttons: Mutex::new(Vec::new()),
         });
         let mut bridge = make_bridge_for_test().await;
+        make_live(&mut bridge, ConnectionHandle(0));
         bridge.input_injector = Some(injector.clone() as Arc<dyn InputInjector>);
 
         // PointerButton x=100 y=200 button=1 down=true → 8 bytes total:
@@ -9834,6 +10009,7 @@ mod tests {
             moves: Mutex::new(Vec::new()),
         });
         let mut bridge = make_bridge_for_test().await;
+        make_live(&mut bridge, ConnectionHandle(0));
         bridge.input_injector = Some(injector.clone() as Arc<dyn InputInjector>);
 
         bridge.dispatch_feedback_bytes(ConnectionHandle(0), &[0xff, 0xaa, 0xbb]);
@@ -11345,5 +11521,482 @@ mod tests {
              dirty-tile path is no longer linear in the screen",
             large / small.max(1)
         );
+    }
+
+    // ── HELLO gating: only the live session is honoured ──────────────────
+
+    /// A bridge with two attached sessions: `live` has sent HELLO, `other`
+    /// has not. Distinct non-zero handles so "records the sender" cannot be
+    /// confused with "records handle 0".
+    async fn live_and_other() -> (IoBridge, ConnectionHandle, ConnectionHandle) {
+        let live = ConnectionHandle(11);
+        let other = ConnectionHandle(12);
+        let mut bridge = test_bridge_with_sessions(&[live, other]).await;
+        bridge.apply_hello(live, hello(false));
+        assert_eq!(bridge.last_hello_from(), Some(live));
+        (bridge, live, other)
+    }
+
+    #[tokio::test]
+    async fn gate_feedback_only_from_the_live_session() {
+        let (mut bridge, live, other) = live_and_other().await;
+        let fb = crate::transport::feedback::ReceiverFeedback {
+            timestamp_ns: 1,
+            datagrams_received: 10,
+            datagrams_lost: 0,
+            datagrams_recovered_fec: 0,
+            suspension_detected: true,
+        };
+        let mut buf = Vec::new();
+        fb.encode(&mut buf);
+
+        let seq0 = bridge.adaptation_context.last_update_seq;
+        bridge.dispatch_feedback_bytes(other, &buf);
+        assert_eq!(bridge.adaptation_context.last_update_seq, seq0);
+        assert!(
+            !bridge.adaptation_context.suspended,
+            "non-live feedback ignored"
+        );
+
+        bridge.dispatch_feedback_bytes(live, &buf);
+        assert!(bridge.adaptation_context.last_update_seq > seq0);
+        assert!(
+            bridge.adaptation_context.suspended,
+            "live feedback honoured"
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_decode_error_only_from_the_live_session() {
+        use crate::transport::decode_error::{DecodeErrorMsg, ERR_THIN_UNCACHED_PALETTE};
+        let (mut bridge, live, other) = live_and_other().await;
+        bridge.palette_table.delivered.insert(7);
+        bridge.metrics_tracker.resize(8, 8);
+        bridge.metrics_tracker.get_mut(3, 4).codec_state =
+            crate::tile::CodecState::PalRle { palette_id: 7 };
+        let mut buf = Vec::new();
+        DecodeErrorMsg {
+            codec: 2,
+            tile_x: 3,
+            tile_y: 4,
+            error_code: ERR_THIN_UNCACHED_PALETTE,
+        }
+        .encode(&mut buf);
+
+        bridge.dispatch_feedback_bytes(other, &buf);
+        assert!(
+            bridge.palette_table.delivered.contains(7),
+            "non-live DECODE_ERROR must not touch the palette"
+        );
+        bridge.dispatch_feedback_bytes(live, &buf);
+        assert!(
+            !bridge.palette_table.delivered.contains(7),
+            "live DECODE_ERROR is honoured"
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_display_info_only_from_the_live_session() {
+        use crate::transport::display::DisplayInfoMsg;
+        let (mut bridge, live, other) = live_and_other().await;
+        let mut buf = Vec::new();
+        DisplayInfoMsg {
+            max_width: 1920,
+            max_height: 1080,
+            scale_milli: 2000,
+            mm_width: 0,
+            mm_height: 0,
+        }
+        .encode(&mut buf);
+        bridge.dispatch_feedback_bytes(other, &buf);
+        assert_eq!(bridge.display_scale_milli, DEFAULT_SCALE_MILLI);
+        bridge.dispatch_feedback_bytes(live, &buf);
+        assert_eq!(bridge.display_scale_milli, 2000);
+    }
+
+    #[tokio::test]
+    async fn gate_display_mode_only_from_the_live_session() {
+        use crate::transport::display::DisplayModeMsg;
+        let (mut bridge, live, other) = live_and_other().await;
+        bridge.display_controller = Some(Arc::new(RecordingController::default()));
+        let mut buf = Vec::new();
+        DisplayModeMsg {
+            width: 1280,
+            height: 800,
+        }
+        .encode(&mut buf);
+        bridge.dispatch_feedback_bytes(other, &buf);
+        assert!(bridge.pending_display_mode.is_none());
+        bridge.dispatch_feedback_bytes(live, &buf);
+        assert!(bridge.pending_display_mode.is_some());
+    }
+
+    /// Records pointer moves; shared by the input gate tests.
+    #[derive(Default)]
+    struct MoveRecorder {
+        moves: std::sync::Mutex<Vec<(i16, i16)>>,
+    }
+    impl crate::transport::input_inject::InputInjector for MoveRecorder {
+        fn pointer_move(&self, x: i16, y: i16) {
+            self.moves.lock().unwrap().push((x, y));
+        }
+        fn pointer_button(&self, _: i16, _: i16, _: u8, _: bool) {}
+        fn wheel(&self, _: i16, _: i16) {}
+        fn key(&self, _: u32, _: bool) {}
+    }
+
+    #[tokio::test]
+    async fn gate_input_only_from_the_live_session() {
+        let (mut bridge, live, other) = live_and_other().await;
+        let rec = Arc::new(MoveRecorder::default());
+        bridge.input_injector =
+            Some(rec.clone() as Arc<dyn crate::transport::input_inject::InputInjector>);
+        let mv = [0x05, 0x01, 0x00, 0x64, 0x00, 0xc8];
+        bridge.dispatch_feedback_bytes(other, &mv);
+        assert!(
+            rec.moves.lock().unwrap().is_empty(),
+            "an unidentified connection must not inject input"
+        );
+        bridge.dispatch_feedback_bytes(live, &mv);
+        assert_eq!(rec.moves.lock().unwrap().clone(), vec![(100, 200)]);
+    }
+
+    #[tokio::test]
+    async fn gate_hello_then_display_info_in_one_buffer_is_accepted() {
+        use crate::transport::display::DisplayInfoMsg;
+        let (mut bridge, _live, other) = live_and_other().await;
+        let mut buf = Vec::new();
+        hello(false).encode(&mut buf);
+        DisplayInfoMsg {
+            max_width: 1920,
+            max_height: 1080,
+            scale_milli: 1500,
+            mm_width: 0,
+            mm_height: 0,
+        }
+        .encode(&mut buf);
+        bridge.dispatch_feedback_bytes(other, &buf);
+        assert_eq!(bridge.last_hello_from(), Some(other));
+        assert_eq!(
+            bridge.display_scale_milli, 1500,
+            "the gate is per message: a HELLO makes the sender live for what follows"
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_non_live_first_byte_non_hello_discards_the_buffer() {
+        let (mut bridge, live, other) = live_and_other().await;
+        let rec = Arc::new(MoveRecorder::default());
+        bridge.input_injector =
+            Some(rec.clone() as Arc<dyn crate::transport::input_inject::InputInjector>);
+        // A full INPUT followed by a HELLO: the HELLO must NOT be reached,
+        // the whole buffer goes.
+        let mut buf = vec![0x05, 0x01, 0x00, 0x64, 0x00, 0xc8];
+        hello(false).encode(&mut buf);
+        bridge.dispatch_feedback_bytes(other, &buf);
+        assert!(rec.moves.lock().unwrap().is_empty());
+        assert_eq!(bridge.non_live_feedback_drops, 1);
+        assert_eq!(bridge.last_hello_from(), Some(live), "no takeover");
+        assert!(
+            !bridge.feedback_recv_bufs.contains_key(&other),
+            "nothing retained for a non-live sender"
+        );
+
+        // A lone partial non-HELLO header is discarded too, not retained.
+        bridge.dispatch_feedback_bytes(other, &[crate::transport::feedback::FEEDBACK_MSG_TYPE]);
+        assert!(!bridge.feedback_recv_bufs.contains_key(&other));
+        assert_eq!(bridge.non_live_feedback_drops, 2);
+
+        // And the sender is not wedged: a HELLO still gets through.
+        let mut h = Vec::new();
+        hello(false).encode(&mut h);
+        bridge.dispatch_feedback_bytes(other, &h);
+        assert_eq!(bridge.last_hello_from(), Some(other));
+    }
+
+    #[tokio::test]
+    async fn feedback_buffers_are_per_handle() {
+        let (mut bridge, live, other) = live_and_other().await;
+        let rec = Arc::new(MoveRecorder::default());
+        bridge.input_injector =
+            Some(rec.clone() as Arc<dyn crate::transport::input_inject::InputInjector>);
+        let mut h = Vec::new();
+        hello(true).encode(&mut h);
+        assert_eq!(h.len(), 2);
+
+        // live: first half of a pointer move.
+        bridge.dispatch_feedback_bytes(live, &[0x05, 0x01, 0x00]);
+        // other: first byte of a HELLO, interleaved.
+        bridge.dispatch_feedback_bytes(other, &h[..1]);
+        assert_eq!(bridge.feedback_recv_bufs.len(), 2);
+        // live finishes its message; with one shared buffer this would have
+        // parsed other's HELLO byte as part of the move.
+        bridge.dispatch_feedback_bytes(live, &[0x64, 0x00, 0xc8]);
+        assert_eq!(rec.moves.lock().unwrap().clone(), vec![(100, 200)]);
+        // other finishes its HELLO.
+        bridge.dispatch_feedback_bytes(other, &h[1..]);
+        assert_eq!(bridge.last_hello_from(), Some(other));
+        assert!(bridge.current_client_caps().supports_h264);
+
+        // forget_session drops the handle's buffer.
+        bridge.dispatch_feedback_bytes(other, &[0x05, 0x01]);
+        assert!(bridge.feedback_recv_bufs.contains_key(&other));
+        bridge.forget_session(other);
+        assert!(!bridge.feedback_recv_bufs.contains_key(&other));
+    }
+
+    /// Seed one un-ACKed emitter entry and record its transmission, as the
+    /// production drain does. Returns its key and wire_seq.
+    fn seed_unacked_entry(
+        bridge: &mut IoBridge,
+        frame_seq: u32,
+    ) -> (crate::transport::reliable_emitter::EmitKey, u32) {
+        let key = crate::transport::reliable_emitter::EmitKey::new(frame_seq, 0, 0, 0);
+        let t = std::time::Instant::now();
+        bridge
+            .reliable_emitter
+            .submit_one(key, bytes::Bytes::from(vec![0u8; 25]), t, None, t);
+        let emitted = bridge.reliable_emitter.take_transmissions();
+        assert_eq!(emitted.len(), 1);
+        let ledger_now = now_std();
+        for e in &emitted {
+            bridge.transmission_ledger.record(
+                e.wire_seq,
+                ledger_now,
+                crate::transport::transmission_ledger::Transmission {
+                    emit_us: e.emit_us,
+                    wire_bytes: e.wire_bytes,
+                    key: e.key,
+                },
+            );
+        }
+        (key, emitted[0].wire_seq)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gate_ack_datagram_only_from_the_live_session() {
+        let (mut bridge, live, other) = live_and_other().await;
+        let (key, wire_seq) = seed_unacked_entry(&mut bridge, 1);
+        let dg = crate::transport::ack::AckBatch {
+            entries: vec![crate::transport::ack::AckEntry {
+                wire_seq,
+                arrival_time_ms_lo16: 0,
+            }],
+        }
+        .encode();
+
+        bridge.dispatch_inbound_datagram(other, &dg);
+        assert!(
+            bridge.reliable_emitter.cache.get(&key).is_some(),
+            "an ACK from a non-live session must not release the cache entry"
+        );
+        assert_eq!(bridge.non_live_datagram_drops, 1);
+
+        bridge.dispatch_inbound_datagram(live, &dg);
+        assert!(
+            bridge.reliable_emitter.cache.get(&key).is_none(),
+            "the live session's ACK releases it"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gate_nack_datagram_only_from_the_live_session() {
+        let (mut bridge, live, other) = live_and_other().await;
+        let (_key, _) = seed_unacked_entry(&mut bridge, 1);
+        let mut dg = Vec::new();
+        crate::transport::protocol::TileNackEnvelope {
+            entries: vec![crate::transport::protocol::TileNackEntry {
+                frame_seq: 1,
+                tile_x: 0,
+                tile_y: 0,
+                pass_idx: 0,
+                frag_idx: 0,
+            }],
+        }
+        .encode(&mut dg);
+
+        bridge.dispatch_inbound_datagram(other, &dg);
+        assert_eq!(bridge.reliable_emitter.stats.nack_hit, 0);
+        bridge.dispatch_inbound_datagram(live, &dg);
+        assert_eq!(bridge.reliable_emitter.stats.nack_hit, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connection_loss_of_a_stale_handle_keeps_the_live_sessions_cache() {
+        let (mut bridge, live, other) = live_and_other().await;
+        let (_key, _) = seed_unacked_entry(&mut bridge, 1);
+        assert_eq!(bridge.reliable_emitter.pending_cache_entries(), 1);
+        let started = bridge.session_started_at;
+        assert!(started.is_some());
+
+        bridge.on_connection_gone(other, "scanner timed out");
+        assert_eq!(
+            bridge.reliable_emitter.pending_cache_entries(),
+            1,
+            "a never-HELLO'd connection dying must not wipe the live cache"
+        );
+        assert_eq!(bridge.last_hello_from(), Some(live));
+        assert!(bridge.session_started_at.is_some());
+        assert!(bridge.last_disconnect_at.is_none());
+
+        bridge.on_connection_gone(live, "closed");
+        assert_eq!(bridge.reliable_emitter.pending_cache_entries(), 0);
+        assert_eq!(bridge.last_hello_from(), None);
+        assert!(bridge.session_started_at.is_none());
+        assert!(bridge.last_disconnect_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn connected_count_requires_hello() {
+        let h = ConnectionHandle(21);
+        let mut bridge = test_bridge_with_sessions(&[h]).await;
+        let rx = bridge.connected_session_count_handle();
+        bridge
+            .wt_sessions
+            .get_mut(&h)
+            .expect("attached")
+            .test_set_connected(true);
+        bridge.refresh_connected_session_count();
+        assert_eq!(
+            *rx.borrow(),
+            0,
+            "connected but never HELLO'd: must not open the capture gate"
+        );
+        bridge.apply_hello(h, hello(false));
+        bridge.refresh_connected_session_count();
+        assert_eq!(*rx.borrow(), 1);
+    }
+
+    #[tokio::test]
+    async fn only_the_live_connected_session_is_a_send_target() {
+        let (mut bridge, live, other) = live_and_other().await;
+        // Live but not connected: no target.
+        assert_eq!(bridge.live_connected_handle(), None);
+        // A connected non-live session is never a target.
+        bridge
+            .wt_sessions
+            .get_mut(&other)
+            .expect("attached")
+            .test_set_connected(true);
+        assert_eq!(bridge.live_connected_handle(), None);
+        // Live and connected: the target (a unit bridge has no quinn
+        // connection, so the full send handle stays None).
+        bridge
+            .wt_sessions
+            .get_mut(&live)
+            .expect("attached")
+            .test_set_connected(true);
+        assert_eq!(bridge.live_connected_handle(), Some(live));
+        assert_eq!(bridge.live_send_handle(), None);
+        // With no live session, send_to_all_sessions consumes, as before.
+        bridge.forget_session(live);
+        let out = bridge.send_to_all_sessions(&[1, 2, 3]);
+        assert!(matches!(
+            out,
+            crate::transport::reliable_emitter::traits::SendOutcome::Sent
+        ));
+        assert_eq!(bridge.compute_max_datagram_size(), None);
+    }
+
+    #[tokio::test]
+    async fn hello_deadline_is_armed_cleared_swept_and_wakes_the_loop() {
+        let h = ConnectionHandle(31);
+        let mut bridge = test_bridge_with_sessions(&[h]).await;
+        let t0 = std::time::Instant::now();
+        assert!(bridge.next_wake_deadline().is_none());
+
+        bridge.arm_hello_deadline(h, t0);
+        assert_eq!(
+            bridge.close_deadlines.get(&h).map(|d| d.code),
+            Some(CLOSE_CODE_NO_HELLO)
+        );
+        assert_eq!(
+            bridge.next_wake_deadline(),
+            Some(t0 + HELLO_DEADLINE),
+            "the loop must wake for the deadline even when nothing else is pending"
+        );
+
+        // A sweep before the deadline leaves it alone.
+        bridge.sweep_close_deadlines(t0 + HELLO_DEADLINE / 2);
+        assert!(bridge.close_deadlines.contains_key(&h));
+        assert!(bridge.wt_sessions.contains_key(&h));
+
+        // A sweep after it closes (no quinn conn in a unit bridge) and forgets.
+        bridge.sweep_close_deadlines(t0 + HELLO_DEADLINE + std::time::Duration::from_millis(1));
+        assert!(!bridge.close_deadlines.contains_key(&h));
+        assert!(
+            !bridge.wt_sessions.contains_key(&h),
+            "sweep forgets the handle"
+        );
+    }
+
+    #[tokio::test]
+    async fn hello_removes_the_never_hello_deadline() {
+        let h = ConnectionHandle(32);
+        let mut bridge = test_bridge_with_sessions(&[h]).await;
+        bridge.arm_hello_deadline(h, std::time::Instant::now());
+        bridge.apply_hello(h, hello(false));
+        assert!(!bridge.close_deadlines.contains_key(&h));
+        // And the deadline set up at accept survives on_connection_established.
+        let g = ConnectionHandle(33);
+        bridge.arm_hello_deadline(g, std::time::Instant::now());
+        bridge.on_connection_established(g);
+        assert!(bridge.close_deadlines.contains_key(&g));
+    }
+
+    #[tokio::test]
+    async fn eviction_schedules_a_close_after_forgetting_the_session() {
+        let (mut bridge, live, _other) = live_and_other().await;
+        let t0 = std::time::Instant::now();
+        bridge.evict_session(live, EvictionReason::DisplacedByNewSession);
+        assert!(!bridge.wt_sessions.contains_key(&live));
+        let d = bridge
+            .close_deadlines
+            .get(&live)
+            .copied()
+            .expect("forget_session must not swallow the eviction's close entry");
+        assert_eq!(d.code, CLOSE_CODE_EVICTED);
+        assert!(d.at >= t0 + EVICT_CLOSE_GRACE);
+        assert!(bridge.next_wake_deadline().is_some());
+        // The sweep can close a handle whose wt_sessions entry is gone.
+        bridge.sweep_close_deadlines(d.at);
+        assert!(!bridge.close_deadlines.contains_key(&live));
+    }
+
+    #[tokio::test]
+    async fn a_reused_handle_after_reap_is_not_live() {
+        let h = ConnectionHandle(41);
+        let mut bridge = test_bridge_with_sessions(&[h]).await;
+        bridge.apply_hello(h, hello(false));
+        bridge.dispatch_feedback_bytes(h, &[0x05, 0x01]);
+        assert!(bridge.is_live(h));
+
+        // Reaped by handle_timeout (no ConnectionLost): same cleanup.
+        bridge.on_connection_gone(h, "idle");
+        assert!(!bridge.is_live(h));
+        assert!(!bridge.wt_sessions.contains_key(&h));
+        assert!(!bridge.feedback_recv_bufs.contains_key(&h));
+
+        // quinn hands the slab key to a new connection: it starts clean.
+        bridge.on_connection_established(h);
+        assert!(!bridge.is_live(h));
+        let rec = Arc::new(MoveRecorder::default());
+        bridge.input_injector =
+            Some(rec.clone() as Arc<dyn crate::transport::input_inject::InputInjector>);
+        bridge.dispatch_feedback_bytes(h, &[0x05, 0x01, 0x00, 0x64, 0x00, 0xc8]);
+        assert!(rec.moves.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn establishing_over_a_stale_live_entry_clears_it() {
+        // Backstop: a reap that never reached the bridge must not leave the
+        // old holder's authority attached to the recycled key.
+        let h = ConnectionHandle(42);
+        let mut bridge = test_bridge_with_sessions(&[h]).await;
+        bridge.apply_hello(h, hello(false));
+        bridge.dispatch_feedback_bytes(h, &[0x05, 0x01]);
+        bridge.on_connection_established(h);
+        assert!(!bridge.is_live(h));
+        assert!(!bridge.feedback_recv_bufs.contains_key(&h));
     }
 }
