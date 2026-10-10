@@ -118,6 +118,23 @@ jobs:
             exit 1
           fi
 
+      - name: ghostframe-xdaemon reads env only in config.rs
+        run: |
+          # Same rule as ghostframe-lib above: every variable is parsed once,
+          # in ghostframe-xdaemon/src/config.rs, and passed down. tests/ is
+          # not scanned -- integration tests legitimately read PATH.
+          if grep -rn 'env::var' ghostframe-xdaemon/src --include='*.rs' \
+               | grep -v '^ghostframe-xdaemon/src/config.rs' \
+               | grep -vE ':[0-9]+: *(//|///|//!)'; then
+            echo "::error::ghostframe-xdaemon must read std::env only in config.rs"
+            exit 1
+          fi
+          if grep -rnE 'env::(set_var|remove_var)' ghostframe-xdaemon/src --include='*.rs' \
+               | grep -vE ':[0-9]+: *(//|///|//!)'; then
+            echo "::error::ghostframe-xdaemon must not mutate the process environment"
+            exit 1
+          fi
+
   unit:
     name: unit
     runs-on: ubuntu-24.04
