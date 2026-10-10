@@ -101,6 +101,17 @@ pub(crate) fn now_std() -> std::time::Instant {
     now_std_impl()
 }
 
+/// Path RTT of the live (HELLO'd) session only. An unauthenticated or
+/// evicted connection must not steer the loss horizon or the BWE reference.
+/// `None` when there is no live session or its connection is gone.
+fn select_live_rtt(
+    live: Option<ConnectionHandle>,
+    rtts: impl Iterator<Item = (ConnectionHandle, std::time::Duration)>,
+) -> Option<std::time::Duration> {
+    let live = live?;
+    rtts.filter(|(h, _)| *h == live).map(|(_, r)| r).min()
+}
+
 fn now_std_impl() -> std::time::Instant {
     tokio::time::Instant::now().into_std()
 }
@@ -6009,13 +6020,7 @@ impl IoBridge {
                     .set_ack_deadline(self.ack_latency_tracker.p95());
                 // quinn already measures path RTT for the scheduler; reuse it
                 // as the reference for the estimator's plausibility check.
-                if let Some(rtt) = self
-                    .server
-                    .connections
-                    .values()
-                    .map(|c| c.stats().path.rtt)
-                    .min()
-                {
+                if let Some(rtt) = self.live_path_rtt() {
                     self.bwe.note_path_rtt(rtt);
                 }
                 // Real in-flight bytes rather than a hardcoded zero, so
@@ -6861,6 +6866,12 @@ impl IoBridge {
         from: ConnectionHandle,
         msg: crate::transport::client_caps::HelloMsg,
     ) {
+        // A handle already forgotten (evicted earlier in the same collected
+        // feedback batch) may still have a HELLO queued behind it. It has no
+        // session to serve, so it must not become the live session.
+        if !self.wt_sessions.contains_key(&from) {
+            return;
+        }
         // Capture the previous value before overwriting it: the eviction
         // check below needs to know who held the session *before* this
         // HELLO, not `from` itself.
@@ -6882,22 +6893,22 @@ impl IoBridge {
                 carried_pending_entries = self.reliable_emitter.pending_cache_entries(),
                 "session live"
             );
+            // One client at a time. A second client identifying itself
+            // displaces the incumbent, which is told why (M4a design §2, §3).
+            //
+            // Keyed on HELLO rather than on session accept: a connection that
+            // never identifies itself -- a port scan, an abandoned handshake,
+            // a client that died mid-negotiation -- must not be able to kill
+            // a working session.
+            //
+            // Evict BEFORE stamping the new session: eviction clears
+            // `session_started_at`, which would erase the newcomer's stamp.
+            if let Some(incumbent) = incumbent {
+                self.evict_session(incumbent, EvictionReason::DisplacedByNewSession);
+            }
             self.session_started_at = Some(now);
             self.pending_display_mode = None;
             self.display_scale_milli = DEFAULT_SCALE_MILLI;
-        }
-
-        // One client at a time. A second client identifying itself displaces
-        // the incumbent, which is told why (M4a design §2, §3).
-        //
-        // Keyed on HELLO rather than on session accept: a connection that
-        // never identifies itself -- a port scan, an abandoned handshake, a
-        // client that died mid-negotiation -- must not be able to kill a
-        // working session.
-        if let Some(incumbent) = incumbent {
-            if incumbent != from {
-                self.evict_session(incumbent, EvictionReason::DisplacedByNewSession);
-            }
         }
 
         // Reset per-session pipeline state for a new live session -- but not
@@ -7128,7 +7139,7 @@ impl IoBridge {
         self.close_deadlines.insert(
             handle,
             CloseDeadline {
-                at: std::time::Instant::now() + EVICT_CLOSE_GRACE,
+                at: now_std() + EVICT_CLOSE_GRACE,
                 code: CLOSE_CODE_EVICTED,
             },
         );
@@ -7287,14 +7298,18 @@ impl IoBridge {
     /// derived one: the derived value is downstream of the very feedback this
     /// horizon governs, and `GoogCcDriver::note_path_rtt` already exists
     /// because that derivation has been seen to go implausible.
+    fn live_path_rtt(&self) -> Option<std::time::Duration> {
+        select_live_rtt(
+            self.last_hello_from,
+            self.server
+                .connections
+                .iter()
+                .map(|(h, c)| (*h, c.stats().path.rtt)),
+        )
+    }
+
     fn loss_horizon(&self) -> std::time::Duration {
-        let rtt = self
-            .server
-            .connections
-            .values()
-            .map(|c| c.stats().path.rtt)
-            .min()
-            .unwrap_or(LOSS_HORIZON_FLOOR);
+        let rtt = self.live_path_rtt().unwrap_or(LOSS_HORIZON_FLOOR);
         (rtt * LOSS_HORIZON_RTTS).clamp(LOSS_HORIZON_FLOOR, LOSS_HORIZON_CEIL)
     }
 
@@ -7785,6 +7800,7 @@ mod tests {
     async fn apply_hello_enables_indices_raw() {
         use crate::transport::client_caps::{ClientCapabilities, HelloMsg};
         let mut bridge = make_bridge_for_test().await;
+        attach_session(&mut bridge, ConnectionHandle(0));
         let msg = HelloMsg {
             caps: ClientCapabilities {
                 indices_raw_enabled: true,
@@ -7804,6 +7820,7 @@ mod tests {
         // arrival of its HELLO.
         use crate::transport::client_caps::{ClientCapabilities, HelloMsg};
         let mut bridge = make_bridge_for_test().await;
+        attach_session(&mut bridge, ConnectionHandle(0));
 
         bridge.apply_hello(
             ConnectionHandle(0),
@@ -9426,6 +9443,7 @@ mod tests {
         use crate::transport::feedback::ReceiverFeedback;
 
         let mut bridge = make_bridge_for_test().await;
+        attach_session(&mut bridge, ConnectionHandle(0));
 
         // Pre-populate palette_table slot 7 as delivered, so the decode-error
         // path can find a palette to clear. The metrics_tracker also needs
@@ -11961,6 +11979,84 @@ mod tests {
         // The sweep can close a handle whose wt_sessions entry is gone.
         bridge.sweep_close_deadlines(d.at);
         assert!(!bridge.close_deadlines.contains_key(&live));
+    }
+
+    #[test]
+    fn live_path_rtt_reads_only_the_live_sessions_connection() {
+        use std::time::Duration;
+        let live = ConnectionHandle(1);
+        let scanner = ConnectionHandle(2);
+        let rtts = vec![
+            (scanner, Duration::from_millis(1)),
+            (live, Duration::from_millis(80)),
+        ];
+        assert_eq!(
+            super::select_live_rtt(Some(live), rtts.clone().into_iter()),
+            Some(Duration::from_millis(80)),
+            "a lower-RTT stranger must not set the live session's horizon"
+        );
+        assert_eq!(
+            super::select_live_rtt(None, rtts.clone().into_iter()),
+            None,
+            "no live session means no RTT, so callers keep their fallback"
+        );
+        assert_eq!(
+            super::select_live_rtt(Some(ConnectionHandle(9)), rtts.into_iter()),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn loss_horizon_falls_back_to_the_floor_without_a_live_connection() {
+        let bridge = test_bridge_with_sessions(&[]).await;
+        assert_eq!(
+            bridge.loss_horizon(),
+            (LOSS_HORIZON_FLOOR * LOSS_HORIZON_RTTS).clamp(LOSS_HORIZON_FLOOR, LOSS_HORIZON_CEIL)
+        );
+    }
+
+    #[tokio::test]
+    async fn takeover_via_apply_hello_leaves_session_started_at_set() {
+        let first = ConnectionHandle(7);
+        let second = ConnectionHandle(9);
+        let mut bridge = test_bridge_with_sessions(&[first, second]).await;
+        bridge.apply_hello(first, hello(false));
+        assert!(bridge.session_started_at.is_some());
+        bridge.apply_hello(second, hello(false));
+        assert_eq!(bridge.last_hello_from(), Some(second));
+        assert!(
+            bridge.session_started_at.is_some(),
+            "evicting the incumbent must not erase the newcomer's start stamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn hello_from_a_forgotten_handle_is_ignored() {
+        let live = ConnectionHandle(7);
+        let gone = ConnectionHandle(9);
+        let mut bridge = test_bridge_with_sessions(&[live]).await;
+        bridge.apply_hello(live, hello(false));
+        // `gone` has no wt_sessions entry (evicted earlier in the batch).
+        bridge.apply_hello(gone, hello(true));
+        assert_eq!(bridge.last_hello_from(), Some(live));
+        assert!(
+            bridge.wt_sessions.contains_key(&live),
+            "a forgotten handle's HELLO must not evict the incumbent"
+        );
+        assert!(bridge.session_started_at.is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eviction_close_deadline_uses_the_virtual_clock() {
+        let (mut bridge, live, _other) = live_and_other().await;
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        let t0 = super::now_std();
+        bridge.evict_session(live, EvictionReason::DisplacedByNewSession);
+        let d = bridge.close_deadlines.get(&live).copied().expect("armed");
+        assert!(
+            d.at >= t0 + EVICT_CLOSE_GRACE,
+            "deadline must be on the same clock the sweep compares against"
+        );
     }
 
     #[tokio::test]
