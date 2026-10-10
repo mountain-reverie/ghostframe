@@ -19,6 +19,7 @@ describe('checkFrameDimensions', () => {
       [-1, 480],
       [NaN, 480],
       [640.5, 480],
+      [MAX_FRAME_DIMENSION, 4320], // fits per-axis but needs > 16383 tiles
     ]) {
       expect(checkFrameDimensions(w, h).ok, `${w}x${h}`).toBe(false);
     }

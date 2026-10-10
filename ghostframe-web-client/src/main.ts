@@ -597,9 +597,15 @@ async function main() {
       h264: renderer.h264Queue.length,
     };
 
-    renderer.encodeAndPresentFrame((codec, tx, ty, code) => {
-      reportDecodeError(codec, tx, ty, code);
-    });
+    // A throw here must not stop the rAF loop: it would freeze the client
+    // for the rest of the session on one bad frame.
+    try {
+      renderer.encodeAndPresentFrame((codec, tx, ty, code) => {
+        reportDecodeError(codec, tx, ty, code);
+      });
+    } catch (e) {
+      console.error('encodeAndPresentFrame failed; continuing', e);
+    }
 
     // Drain accounting + the ~2 s stats line live in stats_log.ts.
     statsLog.onTick(beforeDrain, __rafTicks);
@@ -620,7 +626,7 @@ async function main() {
   // rAF is paused in a hidden tab, so two fallbacks keep intake moving:
   // a backlog threshold and a timer. Neither fires in normal foreground use,
   // where the tick runs every ~16 ms.
-  const FLUSH_BACKLOG = 128;
+  const FLUSH_BACKLOG = 32;
   const FLUSH_FALLBACK_MS = 50;
   const pendingDatagrams: Uint8Array[] = [];
   const pendingArrivalsUs: number[] = [];
@@ -706,7 +712,9 @@ async function main() {
     // flushDatagrams.
     pendingDatagrams.push(value);
     pendingArrivalsUs.push(performance.now() * 1000);
-    if (pendingDatagrams.length >= FLUSH_BACKLOG) {
+    // Hidden tab: rAF is paused and timers are clamped to >= 1 s, so process
+    // immediately (the pre-batching behaviour) to keep ACKs prompt.
+    if (pendingDatagrams.length >= FLUSH_BACKLOG || document.hidden) {
       flushDatagrams();
     } else if (flushTimer === undefined) {
       flushTimer = setTimeout(flushDatagrams, FLUSH_FALLBACK_MS);
