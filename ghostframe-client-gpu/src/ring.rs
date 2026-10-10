@@ -57,8 +57,10 @@ pub struct ExportBuffer {
 /// that owns the underlying `ExportedImage`. `fd`/`planes`/`modifier` are
 /// exactly [`ExportedImage::raw_fd`]/`planes`/`modifier` for
 /// `buffer_id`, read at the moment of publish; the fd itself is owned by
-/// the `ExportedImage` (i.e. by this crate) for as long as that buffer
-/// lives, not by this struct or its eventual caller.
+/// the `ExportedImage` (i.e. by this crate), not by this struct or its
+/// eventual caller. It stays open until [`ExportRing::release`] of this
+/// frame's `frame_id` -- including across an [`ExportRing::resize`] -- or
+/// until the ring is dropped, whichever comes first.
 pub struct PublishedFrame {
     pub frame_id: u32,
     pub buffer_id: u32,
@@ -68,7 +70,8 @@ pub struct PublishedFrame {
     pub height: u32,
     pub modifier: u64,
     /// The dmabuf fd backing this buffer. Owned by the library's
-    /// `ExportedImage`, not by this struct -- do not close it.
+    /// `ExportedImage`, not by this struct -- do not close it. Valid until
+    /// this frame is released or the ring is dropped.
     pub fd: i32,
     pub planes: Vec<PlaneLayout>,
 }
@@ -84,6 +87,16 @@ pub struct ExportRing {
     /// (and so an unknown `frame_id` is trivially "not found" rather than
     /// requiring buffer-shape assumptions to detect).
     in_flight: HashMap<u32, u32>,
+    /// Buffers retired by [`ExportRing::resize`] while the host still held
+    /// them, keyed by the `frame_id` they were published under.
+    ///
+    /// The host was handed that buffer's dmabuf fd and the C contract says it
+    /// stays valid until the matching `release`. Closing it on resize would
+    /// leave the host importing a fd number the kernel is free to hand to the
+    /// next `open` -- fd confusion, triggerable by whoever controls the
+    /// server's resolution. So a retired buffer lives here until `release`
+    /// (or the ring's own drop) and only then closes.
+    graveyard: HashMap<u32, ExportBuffer>,
     width: u32,
     height: u32,
     /// Kept so [`ExportRing::resize`] can reallocate with the same
@@ -126,6 +139,7 @@ impl ExportRing {
             history: DirtyHistory::new(cols, rows, HISTORY_CAPACITY),
             next_frame_id: 0,
             in_flight: HashMap::new(),
+            graveyard: HashMap::new(),
             width,
             height,
             preferred_modifiers: preferred_modifiers.to_vec(),
@@ -258,6 +272,12 @@ impl ExportRing {
     /// ignored rather than panicking -- a host bug in release bookkeeping
     /// should not be able to crash the client.
     pub fn release(&mut self, frame_id: u32) {
+        // A frame published before the last resize: its buffer is in the
+        // graveyard, not in `buffers`. Dropping it closes its fd -- the
+        // moment the host says it is done with it, and not before.
+        if self.graveyard.remove(&frame_id).is_some() {
+            return;
+        }
         match self.in_flight.remove(&frame_id) {
             Some(buffer_id) => {
                 if let Some(buf) = self.buffers.get_mut(buffer_id as usize) {
@@ -270,8 +290,28 @@ impl ExportRing {
         }
     }
 
-    /// Reallocate every buffer at the new size and drop all history.
+    /// Number of retired buffers still held by the host. Test and
+    /// diagnostic use.
+    pub fn retired_in_flight(&self) -> usize {
+        self.graveyard.len()
+    }
+
+    /// Reallocate every buffer at the new size and drop all history. A
+    /// no-op when the size is unchanged.
+    ///
+    /// Buffers the host still holds (`in_flight`) are moved to the graveyard
+    /// rather than dropped, so their fds stay open until `release`.
+    /// `next_frame_id` is deliberately NOT reset: frame ids stay unique for
+    /// the life of the ring, so a late `release` of a pre-resize id can never
+    /// be mistaken for a post-resize frame (and the C shim's per-frame_id
+    /// damage list can never be overwritten under a held pointer).
     pub fn resize(&mut self, ctx: &WgpuContext, width: u32, height: u32) -> Result<(), GpuError> {
+        // The server repeats FrameDimensions (10 identical datagrams per
+        // session, for loss resilience). Reallocating on each would retire
+        // the buffers the host is presenting and force full reblits.
+        if width == self.width && height == self.height {
+            return Ok(());
+        }
         let count = self.buffers.len();
 
         let mut new_buffers = Vec::with_capacity(count);
@@ -292,13 +332,22 @@ impl ExportRing {
             });
         }
 
-        self.buffers = new_buffers;
+        // Everything fallible is done; from here the swap cannot fail.
+        let old: Vec<ExportBuffer> = std::mem::replace(&mut self.buffers, new_buffers);
+        let mut old: Vec<Option<ExportBuffer>> = old.into_iter().map(Some).collect();
+        for (frame_id, buffer_id) in self.in_flight.drain() {
+            if let Some(buf) = old.get_mut(buffer_id as usize).and_then(Option::take) {
+                self.graveyard.insert(frame_id, buf);
+            }
+        }
+        // Whatever is left was free; dropping it closes its fd, which no
+        // one else holds.
+        drop(old);
+
         self.width = width;
         self.height = height;
         let (cols, rows) = tile_grid(width, height);
         self.history.reset(cols, rows);
-        self.next_frame_id = 0;
-        self.in_flight.clear();
 
         Ok(())
     }

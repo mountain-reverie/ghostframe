@@ -481,11 +481,26 @@ impl Client {
             let _ = h.join();
         }
         self.wake_fd = None;
+        // The render thread is joined, so nothing can republish: whatever is
+        // still in the slot names a buffer whose dmabuf fd was closed when
+        // the renderer dropped. Handing it out would give the host a dead (or
+        // already reused) fd number.
+        self.published
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
     }
 
     /// The eventfd to add to the host's own `poll`/`epoll` set.
     pub fn event_fd(&self) -> RawFd {
         self.queue.as_raw_fd()
+    }
+
+    /// Whether a session is up, i.e. whether `push_*` and
+    /// `request_display_mode` will queue anything. Advisory: the state can
+    /// change right after the call.
+    pub fn is_connected(&self) -> bool {
+        self.net_cmd_tx.is_some()
     }
 
     /// Pop the oldest queued event, if any. Never blocks.
@@ -495,7 +510,7 @@ impl Client {
 
     /// The most recently published frame, if the render thread has
     /// produced one since the last call. Never blocks.
-    pub fn acquire_frame(&mut self) -> Option<PublishedFrame> {
+    pub fn acquire_frame(&self) -> Option<PublishedFrame> {
         self.published
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -504,7 +519,17 @@ impl Client {
 
     /// Return a previously acquired frame's buffer to the render thread's
     /// export ring so it can be reused.
-    pub fn release_frame(&mut self, frame_id: u32) {
+    ///
+    /// A frame still sitting unacquired in the `published` slot is withdrawn
+    /// first: releasing its buffer while the slot could still hand out its
+    /// fd would reopen the use-after-close this ring exists to prevent.
+    pub fn release_frame(&self, frame_id: u32) {
+        {
+            let mut slot = self.published.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.as_ref().is_some_and(|pf| pf.frame_id == frame_id) {
+                slot.take();
+            }
+        }
         if let Some(tx) = &self.render_tx {
             let _ = tx.send(RenderMsg::Release(frame_id));
         }
@@ -586,13 +611,16 @@ impl Client {
     /// Send one `NetCommand` to the net thread and wake its `epoll_wait`,
     /// so a queued command is never left waiting for the next unrelated
     /// wakeup (the UDP fd or the timerfd) to notice it.
-    fn send_net_command(&mut self, cmd: NetCommand) {
+    ///
+    /// Returns `false` when the command was not queued (not connected, or
+    /// the net thread has gone).
+    fn send_net_command(&self, cmd: NetCommand) -> bool {
         let Some(tx) = &self.net_cmd_tx else {
             tracing::warn!("push_*/request_display_mode called before connect(); dropping");
-            return;
+            return false;
         };
         if tx.send(cmd).is_err() {
-            return;
+            return false;
         }
         if let Some(wake) = &self.wake_fd {
             let one: u64 = 1;
@@ -605,9 +633,10 @@ impl Client {
                 );
             }
         }
+        true
     }
 
-    fn send_input(&mut self, bytes: Vec<u8>) {
+    fn send_input(&self, bytes: Vec<u8>) {
         self.send_net_command(NetCommand::SendInput(bytes));
     }
 
@@ -617,26 +646,39 @@ impl Client {
     /// (250 ms) display-mode requests, and debouncing again here would only
     /// make the effective delay the sum of both. Call this on every resize
     /// event and let the server collapse them.
-    pub fn request_display_mode(&mut self, width: u16, height: u16) {
+    ///
+    /// All of `request_display_mode` and `push_*` take `&self`: they only touch an `mpsc::Sender`
+    /// and an eventfd write, both safe from any thread. The lifecycle calls
+    /// (`connect`, `disconnect`, `attach_bridge`) stay `&mut self`; a
+    /// concurrent embedder (the C shim) serialises them behind a lock.
+    pub fn request_display_mode(&self, width: u16, height: u16) {
         self.send_net_command(NetCommand::RequestDisplayMode { width, height });
     }
 
-    pub fn push_key(&mut self, keysym: u32, down: bool) {
-        self.send_input(input::encode_key(keysym, down));
+    pub fn push_key(&self, keysym: u32, down: bool) {
+        self.send_input(input::encode_key(keysym, down))
     }
 
-    pub fn push_pointer_motion(&mut self, x: i16, y: i16) {
-        self.send_input(input::encode_motion(x, y));
+    pub fn push_pointer_motion(&self, x: i16, y: i16) {
+        self.send_input(input::encode_motion(x, y))
     }
 
-    pub fn push_pointer_button(&mut self, x: i16, y: i16, button: u8, down: bool) {
-        self.send_input(input::encode_button(x, y, button, down));
+    pub fn push_pointer_button(&self, x: i16, y: i16, button: u8, down: bool) {
+        self.send_input(input::encode_button(x, y, button, down))
     }
 
-    pub fn push_wheel(&mut self, dx: i16, dy: i16) {
+    pub fn push_wheel(&self, dx: i16, dy: i16) {
         self.send_input(input::encode_wheel(dx, dy));
     }
 }
+
+// The C shim shares a `Client` between threads behind an `RwLock`, which
+// requires both. Fails to compile if a future field makes `Client` !Send or
+// !Sync, instead of the shim quietly becoming unsound.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Client>();
+};
 
 impl Drop for Client {
     fn drop(&mut self) {

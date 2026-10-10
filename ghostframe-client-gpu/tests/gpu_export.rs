@@ -505,3 +505,92 @@ fn recycled_buffer_receives_only_its_damage_and_keeps_the_rest() {
         "partial blit clobbered a distant undamaged row"
     );
 }
+
+/// `true` while `fd` is an open descriptor naming the same file it did when
+/// `expect_ino` was recorded. Comparing the inode, not just `F_GETFD`, is
+/// what catches the actual defect: a closed fd number silently reused by
+/// another open.
+fn fd_names(fd: i32, expect_dev_ino: (u64, u64)) -> bool {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return false;
+    }
+    (st.st_dev as u64, st.st_ino as u64) == expect_dev_ino
+}
+
+fn dev_ino(fd: i32) -> (u64, u64) {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::fstat(fd, &mut st) }, 0, "fstat on live fd");
+    (st.st_dev as u64, st.st_ino as u64)
+}
+
+#[test]
+fn resize_while_a_frame_is_held_keeps_its_fd_open_until_release() {
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let fb = Framebuffer::new(&ctx.device, 64, 64);
+    let mut ring = ExportRing::new(&ctx, 64, 64, 2, &[], false).expect("ring");
+    ring.mark_dirty_all();
+    let held = ring.publish(&ctx.device, &ctx.queue, &fb).expect("publish");
+    let identity = dev_ino(held.fd);
+
+    ring.resize(&ctx, 128, 96).expect("resize");
+
+    assert_eq!(
+        ring.retired_in_flight(),
+        1,
+        "held buffer must be retired, not dropped"
+    );
+    assert!(
+        fd_names(held.fd, identity),
+        "resize closed a dmabuf fd the host still holds"
+    );
+
+    // A frame published after the resize must not reuse the held frame's id:
+    // the C shim keys its damage list by frame_id.
+    let fb2 = Framebuffer::new(&ctx.device, 128, 96);
+    ring.mark_dirty_all();
+    let fresh = ring
+        .publish(&ctx.device, &ctx.queue, &fb2)
+        .expect("publish 2");
+    assert_ne!(
+        fresh.frame_id, held.frame_id,
+        "frame_id reused across resize"
+    );
+    assert_eq!((fresh.width, fresh.height), (128, 96));
+    assert!(fd_names(held.fd, identity), "fd lost after a later publish");
+
+    ring.release(held.frame_id);
+    assert_eq!(
+        ring.retired_in_flight(),
+        0,
+        "release must drain the graveyard"
+    );
+    ring.release(held.frame_id); // double release stays harmless
+    ring.release(fresh.frame_id);
+}
+
+#[test]
+fn resize_with_nothing_held_retires_nothing() {
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let mut ring = ExportRing::new(&ctx, 64, 64, 2, &[], false).expect("ring");
+    ring.resize(&ctx, 96, 96).expect("resize");
+    assert_eq!(ring.retired_in_flight(), 0);
+}
+
+#[test]
+fn a_repeated_frame_dimensions_does_not_retire_held_buffers() {
+    // The server sends FrameDimensions 10 times per session; only a real
+    // size change may touch the buffers the host is presenting.
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let fb = Framebuffer::new(&ctx.device, 64, 64);
+    let mut ring = ExportRing::new(&ctx, 64, 64, 2, &[], false).expect("ring");
+    ring.mark_dirty_all();
+    let held = ring.publish(&ctx.device, &ctx.queue, &fb).expect("publish");
+    let identity = dev_ino(held.fd);
+    for _ in 0..10 {
+        ring.resize(&ctx, 64, 64).expect("resize");
+    }
+    assert_eq!(ring.retired_in_flight(), 0);
+    assert!(fd_names(held.fd, identity));
+    ring.release(held.frame_id);
+}
