@@ -83,6 +83,13 @@ export function computePassesProcessed(
   return k;
 }
 
+interface InverseBindGroups {
+  l3: GPUBindGroup;
+  l2: GPUBindGroup;
+  l1: GPUBindGroup;
+  l1p2: GPUBindGroup;
+}
+
 export class Cdf53Pipeline {
   // Persistent per-tile state.
   coefficientBuffer!: GPUBuffer;
@@ -92,9 +99,6 @@ export class Cdf53Pipeline {
   // Per-batch scratch.
   dirtyTilesBuffer!: GPUBuffer;
   dirtyTilesCount!: GPUBuffer;
-  // Identity tile list (slot i -> tile i) bound as the inverse stages'
-  // `dirtyList`. The web client still dispatches the full grid.
-  inverseTileList!: GPUBuffer;
   // Per-batch upload targets (sized to maxTiles × 14 worst case).
   tileWorkBuffer!: GPUBuffer;
   bitPlanesBuffer!: GPUBuffer;
@@ -115,7 +119,7 @@ export class Cdf53Pipeline {
   // CPU-side mirror of passesProcessedBuffer. Updated in uploadBatch each
   // time an entry arrives (max with passIdx + 1), then writeBuffer'd to the
   // GPU before the integrate dispatch.
-  private passesProcessedCpu: Uint32Array = new Uint32Array(0);
+  private passesProcessedCpu: Uint32Array<ArrayBuffer> = new Uint32Array(0);
   // Per-tile `present_passes` bitmap (0 = not yet known) and the mask of
   // passes actually received for the current generation.
   //
@@ -181,6 +185,37 @@ export class Cdf53Pipeline {
     this.tileWatcherCaptures = [];
   }
 
+  // ---- Dirty-tile inverse (PC-1) -------------------------------------
+  //
+  // The four inverse shaders are shared with the native client and use
+  // `wg.x` as the tile index, early-returning when their gen binding is 0.
+  // They used to be bound to `tileGenBuffer`, so every rAF tick lifted every
+  // tile that had ever received a pass (~10 ms/tick at 1080p) even when one
+  // tile changed.
+  //
+  // Rather than fork the shared shaders, bind them to `inverseMaskBuffer`
+  // instead: it holds the tile's gen for tiles that received a pass in the
+  // batch being presented and 0 elsewhere, so every clean tile's workgroup
+  // exits on its first instruction. The CPU already holds the exact unique
+  // set (`touchedTiles` in uploadBatch); the GPU-side `dirtyTilesBuffer`
+  // cannot serve, because it gets one entry per *pass*, so a tile with three
+  // passes in a batch appears three times and its workgroups would race on
+  // the in-place lifting in `workAreaBuffer`.
+  private inverseMaskBuffer!: GPUBuffer;
+  private inverseMaskCpu: Uint32Array<ArrayBuffer> = new Uint32Array(0);
+  /** Unique tiles that received a pass in the batch last uploaded. */
+  private inverseTileCount = 0;
+  /** Set by resize(): the framebuffer is new, so repaint every tile once. */
+  private fullInverseNeeded = false;
+  private inverseMaskBindGroups!: InverseBindGroups;
+  private inverseAllBindGroups!: InverseBindGroups;
+  // Scratch reused across batches (PC-L5): grown, never shrunk, never
+  // re-allocated per tick.
+  private static readonly COUNT_ZERO: Uint32Array<ArrayBuffer> = new Uint32Array([0, 0, 0, 0]);
+  private tileWorkScratch: Uint32Array<ArrayBuffer> = new Uint32Array(0);
+  private bitPlanesScratch: Uint8Array<ArrayBuffer> = new Uint8Array(0);
+  private dirtyZeroScratch: Uint32Array<ArrayBuffer> = new Uint32Array(0);
+
   private integratePipeline!: GPUComputePipeline;
   private integrateBindGroup!: GPUBindGroup;
   private uniformsBuffer: GPUBuffer;
@@ -188,10 +223,6 @@ export class Cdf53Pipeline {
   private inverseL2Pipeline!: GPUComputePipeline;
   private inverseL1Pipeline!: GPUComputePipeline;
   private inverseL1Pass2Pipeline!: GPUComputePipeline;
-  private inverseL3BindGroup!: GPUBindGroup;
-  private inverseL2BindGroup!: GPUBindGroup;
-  private inverseL1BindGroup!: GPUBindGroup;
-  private inverseL1Pass2BindGroup!: GPUBindGroup;
 
   constructor(private device: GPUDevice) {
     this.uniformsBuffer = device.createBuffer({
@@ -240,11 +271,23 @@ export class Cdf53Pipeline {
    * the same maxTiles; reallocates on growth.
    */
   resize(maxTiles: number, framebufferView: GPUTextureView, frameCols: number): void {
+    const viewChanged = this.framebufferView !== framebufferView;
     this.framebufferView = framebufferView;
+    // The framebuffer may be a new texture: whatever the previous inverse
+    // painted is gone, so repaint every tile once on the next frame.
+    this.fullInverseNeeded = true;
     const colsBuf = new Uint32Array([frameCols, 0, 0, 0]);
     this.device.queue.writeBuffer(this.uniformsBuffer, 0, colsBuf);
     this.cols = frameCols;
-    if (maxTiles === this.maxTiles) return;
+    if (maxTiles === this.maxTiles) {
+      if (viewChanged && this.maxTiles > 0) {
+        // Same allocation, new framebuffer view: the L1 pass-2 bind groups
+        // hold the view, so they must be rebuilt (they were not before).
+        this.inverseMaskBindGroups = this.makeInverseBindGroups(this.inverseMaskBuffer, framebufferView);
+        this.inverseAllBindGroups = this.makeInverseBindGroups(this.tileGenBuffer, framebufferView);
+      }
+      return;
+    }
     this.lastSeenGen = new Uint32Array(maxTiles);
     this.coefZeroPerTile = new Uint8Array(6144);
     this.signZeroPerTile = new Uint8Array(384);
@@ -255,10 +298,10 @@ export class Cdf53Pipeline {
     if (this.passesProcessedBuffer) this.passesProcessedBuffer.destroy();
     if (this.dirtyTilesBuffer) this.dirtyTilesBuffer.destroy();
     if (this.dirtyTilesCount) this.dirtyTilesCount.destroy();
-    if (this.inverseTileList) this.inverseTileList.destroy();
     if (this.tileWorkBuffer) this.tileWorkBuffer.destroy();
     if (this.bitPlanesBuffer) this.bitPlanesBuffer.destroy();
     if (this.workAreaBuffer) this.workAreaBuffer.destroy();
+    if (this.inverseMaskBuffer) this.inverseMaskBuffer.destroy();
 
     this.coefficientBuffer = this.device.createBuffer({
       size: maxTiles * 6144,
@@ -283,15 +326,6 @@ export class Cdf53Pipeline {
       size: Math.max(maxTiles, 1) * 4,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
     });
-    this.inverseTileList = this.device.createBuffer({
-      size: Math.max(maxTiles, 1) * 4,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    });
-    this.device.queue.writeBuffer(
-      this.inverseTileList,
-      0,
-      Uint32Array.from({ length: Math.max(maxTiles, 1) }, (_, i) => i),
-    );
     this.dirtyTilesCount = this.device.createBuffer({
       size: 16, // 4 u32: count, 3 padding (also reused as indirect-dispatch args buffer in later task)
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC | GPUBufferUsage.INDIRECT,
@@ -325,50 +359,46 @@ export class Cdf53Pipeline {
         { binding: 7, resource: { buffer: this.uniformsBuffer } },
       ],
     });
-    this.inverseL3BindGroup = this.device.createBindGroup({
-      layout: this.inverseL3Pipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: this.coefficientBuffer } },
-        { binding: 1, resource: { buffer: this.signBuffer } },
-        { binding: 2, resource: { buffer: this.tileGenBuffer } },  // was dirtyTilesBuffer
-        { binding: 3, resource: { buffer: this.workAreaBuffer } },
-        { binding: 4, resource: { buffer: this.passesProcessedBuffer } },
-        { binding: 5, resource: { buffer: this.inverseTileList } },
-      ],
+    this.inverseMaskBuffer = this.device.createBuffer({
+      size: Math.max(maxTiles, 1) * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
-    this.inverseL2BindGroup = this.device.createBindGroup({
-      layout: this.inverseL2Pipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: this.coefficientBuffer } },
-        { binding: 1, resource: { buffer: this.signBuffer } },
-        { binding: 2, resource: { buffer: this.tileGenBuffer } },  // was dirtyTilesBuffer
-        { binding: 3, resource: { buffer: this.workAreaBuffer } },
-        { binding: 4, resource: { buffer: this.passesProcessedBuffer } },
-        { binding: 5, resource: { buffer: this.inverseTileList } },
-      ],
-    });
-    this.inverseL1BindGroup = this.device.createBindGroup({
-      layout: this.inverseL1Pipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: this.coefficientBuffer } },
-        { binding: 1, resource: { buffer: this.signBuffer } },
-        { binding: 2, resource: { buffer: this.tileGenBuffer } },  // was dirtyTilesBuffer
-        { binding: 3, resource: { buffer: this.workAreaBuffer } },
-        { binding: 4, resource: { buffer: this.passesProcessedBuffer } },
-        { binding: 5, resource: { buffer: this.inverseTileList } },
-      ],
-    });
-    this.inverseL1Pass2BindGroup = this.device.createBindGroup({
-      layout: this.inverseL1Pass2Pipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: this.tileGenBuffer } },  // was dirtyTilesBuffer
-        { binding: 1, resource: { buffer: this.workAreaBuffer } },
-        { binding: 2, resource: framebufferView },
-        { binding: 3, resource: { buffer: this.uniformsBuffer } },
-        { binding: 4, resource: { buffer: this.inverseTileList } },
-      ],
-    });
+    this.inverseMaskCpu = new Uint32Array(Math.max(maxTiles, 1));
+    this.inverseTileCount = 0;
+    this.inverseMaskBindGroups = this.makeInverseBindGroups(this.inverseMaskBuffer, framebufferView);
+    this.inverseAllBindGroups = this.makeInverseBindGroups(this.tileGenBuffer, framebufferView);
     this.maxTiles = maxTiles;
+  }
+
+  private makeInverseBindGroups(
+    genBuffer: GPUBuffer,
+    framebufferView: GPUTextureView,
+  ): InverseBindGroups {
+    const common = (pipeline: GPUComputePipeline): GPUBindGroup =>
+      this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: this.coefficientBuffer } },
+          { binding: 1, resource: { buffer: this.signBuffer } },
+          { binding: 2, resource: { buffer: genBuffer } },
+          { binding: 3, resource: { buffer: this.workAreaBuffer } },
+          { binding: 4, resource: { buffer: this.passesProcessedBuffer } },
+        ],
+      });
+    return {
+      l3: common(this.inverseL3Pipeline),
+      l2: common(this.inverseL2Pipeline),
+      l1: common(this.inverseL1Pipeline),
+      l1p2: this.device.createBindGroup({
+        layout: this.inverseL1Pass2Pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: genBuffer } },
+          { binding: 1, resource: { buffer: this.workAreaBuffer } },
+          { binding: 2, resource: framebufferView },
+          { binding: 3, resource: { buffer: this.uniformsBuffer } },
+        ],
+      }),
+    };
   }
 
   /** Zero all persistent per-tile state. Called from onSessionReset. */
@@ -424,9 +454,17 @@ export class Cdf53Pipeline {
       );
     }
     // tileWork: 5 u32 per entry — tileX, tileY, gen, passIdx, bitPlanesOffset.
-    const tileWork = new Uint32Array(entries.length * 5);
-    // bitPlanes: 96 u32 = 384 bytes per entry, concatenated.
-    const bitPlanes = new Uint8Array(entries.length * 384);
+    // bitPlanes: 96 u32 = 384 bytes per entry, concatenated. Both come from
+    // grow-only scratch (PC-L5): a refinement burst used to allocate ~100 KB
+    // here every rAF. Only the used prefix is uploaded.
+    if (this.tileWorkScratch.length < entries.length * 5) {
+      this.tileWorkScratch = new Uint32Array(entries.length * 5);
+    }
+    if (this.bitPlanesScratch.length < entries.length * 384) {
+      this.bitPlanesScratch = new Uint8Array(entries.length * 384);
+    }
+    const tileWork = this.tileWorkScratch;
+    const bitPlanes = this.bitPlanesScratch;
     // Per-tile gen transitions: clear those tiles BEFORE the integrate pass
     // sees them. writeBuffer is queued onto the device queue and ordered
     // before any subsequent submit, so the integrate compute pass observes
@@ -473,14 +511,32 @@ export class Cdf53Pipeline {
       );
       touchedTiles.add(tileIdx);
     }
-    // Upload the (possibly sparse) passes-processed updates. For batch sizes
-    // that touch many tiles this is more efficient than writing the whole
-    // array; for small batches the per-tile writeBuffer overhead may be
-    // higher than a full upload — left as a future optimization.
+    // Upload the passes-processed updates in ONE writeBuffer covering the
+    // touched span (PC-M2), instead of a 4-byte write per touched tile. The
+    // CPU mirror is authoritative for every tile in the span (it is zeroed
+    // with the GPU copy and updated on every touch), so re-sending untouched
+    // entries inside the span is a no-op on the GPU.
+    let spanLo = Infinity;
+    let spanHi = -1;
     for (const tileIdx of touchedTiles) {
-      const tmp = new Uint32Array([this.passesProcessedCpu[tileIdx]]);
-      this.device.queue.writeBuffer(this.passesProcessedBuffer, tileIdx * 4, tmp);
+      if (tileIdx < spanLo) spanLo = tileIdx;
+      if (tileIdx > spanHi) spanHi = tileIdx;
     }
+    if (spanHi >= spanLo) {
+      this.device.queue.writeBuffer(
+        this.passesProcessedBuffer,
+        spanLo * 4,
+        this.passesProcessedCpu,
+        spanLo,
+        spanHi - spanLo + 1,
+      );
+    }
+    // Inverse mask: gen for tiles in this batch, 0 elsewhere (see the
+    // comment on `inverseMaskBuffer`). One upload of the whole array.
+    this.inverseMaskCpu.fill(0);
+    for (const tileIdx of touchedTiles) this.inverseMaskCpu[tileIdx] = this.lastSeenGen[tileIdx];
+    this.device.queue.writeBuffer(this.inverseMaskBuffer, 0, this.inverseMaskCpu);
+    this.inverseTileCount = touchedTiles.size;
     for (let i = 0; i < entries.length; i++) {
       const e = entries[i];
       tileWork[i * 5 + 0] = e.tileX;
@@ -506,13 +562,13 @@ export class Cdf53Pipeline {
         });
       }
     }
-    this.device.queue.writeBuffer(this.tileWorkBuffer, 0, tileWork);
-    this.device.queue.writeBuffer(this.bitPlanesBuffer, 0, bitPlanes);
+    this.device.queue.writeBuffer(this.tileWorkBuffer, 0, tileWork, 0, entries.length * 5);
+    this.device.queue.writeBuffer(this.bitPlanesBuffer, 0, bitPlanes, 0, entries.length * 384);
     // Reset per-batch atomic counter + the leading dirtyTilesBuffer region.
-    const countZero = new Uint32Array([0, 0, 0, 0]);
-    this.device.queue.writeBuffer(this.dirtyTilesCount, 0, countZero);
-    const dirtyZeros = new Uint32Array(Math.min(entries.length, this.maxTiles));
-    this.device.queue.writeBuffer(this.dirtyTilesBuffer, 0, dirtyZeros);
+    this.device.queue.writeBuffer(this.dirtyTilesCount, 0, Cdf53Pipeline.COUNT_ZERO);
+    const dirtyLen = Math.min(entries.length, this.maxTiles);
+    if (this.dirtyZeroScratch.length < dirtyLen) this.dirtyZeroScratch = new Uint32Array(dirtyLen);
+    this.device.queue.writeBuffer(this.dirtyTilesBuffer, 0, this.dirtyZeroScratch, 0, dirtyLen);
     return entries.length;
   }
   encodeIntegrate(encoder: GPUCommandEncoder, batchSize: number): void {
@@ -524,43 +580,67 @@ export class Cdf53Pipeline {
     pass.end();
   }
   /**
-   * Encode the four-pass inverse compute chain.
-   *
-   * Always dispatches one workgroup per possible tile slot. Each inverse
-   * shader uses `wg.x` directly as `tile_idx` and early-returns when
-   * `tileGen[tile_idx] == 0` (tile has never received any integrate pass).
-   * This keeps the framebuffer fresh across rAF ticks even when no new
-   * passes arrive this frame — the coefficient state for previously-
-   * integrated tiles is still in `coefficientBuffer + signBuffer`, so
-   * re-running the inverse reproduces the same pixels.
+   * Encode the four-pass inverse compute chain for the tiles that received a
+   * pass in the batch last passed to `uploadBatch`. Skipped entirely when
+   * there are none: a frame that only moved Solid/PalRle/Raw/H.264 tiles has
+   * no CDF53 work, and the ~10 ms full-grid lift it used to run repainted
+   * unchanged pixels. After a framebuffer change (`resize`) one full repaint
+   * runs instead, since the new texture holds none of the old output.
    */
   encodeInverse(encoder: GPUCommandEncoder): void {
+    if (this.fullInverseNeeded) {
+      this.fullInverseNeeded = false;
+      this.inverseTileCount = 0;
+      this.encodeInverseWith(encoder, this.inverseAllBindGroups);
+      return;
+    }
+    if (this.inverseTileCount === 0) return;
+    this.inverseTileCount = 0;
+    this.encodeInverseWith(encoder, this.inverseMaskBindGroups);
+  }
+
+  /** Lift every tile that has ever received a pass. The pre-PC-1 behaviour,
+   * kept for the `?debug` hooks, which write coefficient state directly and
+   * so bypass `uploadBatch`'s dirty tracking. */
+  encodeInverseAll(encoder: GPUCommandEncoder): void {
+    this.encodeInverseWith(encoder, this.inverseAllBindGroups);
+  }
+
+  /** Workgroups launched by the last `encodeInverse` call's shape, for tests
+   * and the stats line: the count of tiles the mask admits. */
+  get pendingInverseTiles(): number {
+    return this.inverseTileCount;
+  }
+
+  private encodeInverseWith(encoder: GPUCommandEncoder, bg: InverseBindGroups): void {
+    // One workgroup per possible tile slot; the shaders early-return when
+    // the bound gen buffer is 0 for the slot (see `inverseMaskBuffer`).
     const wgCap = Math.max(this.maxTiles, 1);
     {
       const pass = encoder.beginComputePass();
       pass.setPipeline(this.inverseL3Pipeline);
-      pass.setBindGroup(0, this.inverseL3BindGroup);
+      pass.setBindGroup(0, bg.l3);
       pass.dispatchWorkgroups(wgCap);
       pass.end();
     }
     {
       const pass = encoder.beginComputePass();
       pass.setPipeline(this.inverseL2Pipeline);
-      pass.setBindGroup(0, this.inverseL2BindGroup);
+      pass.setBindGroup(0, bg.l2);
       pass.dispatchWorkgroups(wgCap);
       pass.end();
     }
     {
       const pass = encoder.beginComputePass();
       pass.setPipeline(this.inverseL1Pipeline);
-      pass.setBindGroup(0, this.inverseL1BindGroup);
+      pass.setBindGroup(0, bg.l1);
       pass.dispatchWorkgroups(wgCap * 4);
       pass.end();
     }
     {
       const pass = encoder.beginComputePass();
       pass.setPipeline(this.inverseL1Pass2Pipeline);
-      pass.setBindGroup(0, this.inverseL1Pass2BindGroup);
+      pass.setBindGroup(0, bg.l1p2);
       pass.dispatchWorkgroups(wgCap);
       pass.end();
     }

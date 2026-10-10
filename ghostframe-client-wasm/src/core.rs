@@ -56,7 +56,48 @@ impl WasmClientCore {
     #[wasm_bindgen(js_name = handleDatagram)]
     pub fn handle_datagram(&mut self, bytes: &[u8], now_us: u64) -> Result<JsValue, JsValue> {
         let events = self.inner.handle_datagram(bytes, now_us);
-        let mirrored: Vec<WasmEvent> = events.iter().map(WasmEvent::from).collect();
+        let mirrored: Vec<WasmEvent> = events.into_iter().map(WasmEvent::from).collect();
+        to_js(&mirrored)
+    }
+
+    /// Feed a batch of inbound datagrams in one boundary crossing; returns
+    /// all resulting events, in arrival order, as one array.
+    ///
+    /// `concat` holds the datagrams back to back, `lens[i]` is the length of
+    /// the i-th, and `arrivals_us[i]` is the time it was *received* (µs on the
+    /// same clock as every other `now_us`). Per-datagram arrival stamps are
+    /// kept rather than one timestamp for the batch because ACK arrival times,
+    /// suspension detection and RTT sampling all read them: stamping a whole
+    /// rAF's worth of datagrams with one instant would make the path look
+    /// bursty when it is not.
+    ///
+    /// Times cross as `f64` (exact for any µs value below 2^53, ~285 years),
+    /// which spares the BigInt allocation the `u64` form costs per call.
+    /// Malformed batches (length arrays that disagree with `concat`) are
+    /// processed up to the first inconsistency rather than trapping.
+    #[wasm_bindgen(js_name = handleDatagrams)]
+    pub fn handle_datagrams(
+        &mut self,
+        concat: &[u8],
+        lens: &[u32],
+        arrivals_us: &[f64],
+    ) -> Result<JsValue, JsValue> {
+        let mut events = Vec::new();
+        let mut offset = 0usize;
+        for (len, at) in lens.iter().zip(arrivals_us.iter()) {
+            let len = *len as usize;
+            let Some(end) = offset.checked_add(len) else {
+                break;
+            };
+            let Some(datagram) = concat.get(offset..end) else {
+                break;
+            };
+            offset = end;
+            // `as u64` saturates and maps NaN to 0, so a hostile or buggy
+            // caller cannot wrap.
+            events.extend(self.inner.handle_datagram(datagram, *at as u64));
+        }
+        let mirrored: Vec<WasmEvent> = events.into_iter().map(WasmEvent::from).collect();
         to_js(&mirrored)
     }
 
@@ -65,7 +106,7 @@ impl WasmClientCore {
     #[wasm_bindgen(js_name = onTimeout)]
     pub fn on_timeout(&mut self, now_us: u64) -> Result<JsValue, JsValue> {
         let events = self.inner.on_timeout(now_us);
-        let mirrored: Vec<WasmEvent> = events.iter().map(WasmEvent::from).collect();
+        let mirrored: Vec<WasmEvent> = events.into_iter().map(WasmEvent::from).collect();
         to_js(&mirrored)
     }
 

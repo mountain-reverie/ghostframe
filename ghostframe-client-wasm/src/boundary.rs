@@ -110,12 +110,14 @@ pub enum WasmTileData {
     },
 }
 
-impl From<&TileData> for WasmTileData {
-    fn from(data: &TileData) -> Self {
+impl From<TileData> for WasmTileData {
+    /// By value: the payload `Vec`s move into the mirror instead of being
+    /// cloned. Every tile event used to copy its payload here and then again
+    /// inside serde-wasm-bindgen (PC-3); the second copy is the one the
+    /// JS `Uint8Array` needs, the first was pure overhead.
+    fn from(data: TileData) -> Self {
         match data {
-            TileData::Raw(bytes) => WasmTileData::Raw {
-                bytes: bytes.clone(),
-            },
+            TileData::Raw(bytes) => WasmTileData::Raw { bytes },
             TileData::Solid(quad) => WasmTileData::Solid {
                 bytes: quad.to_vec(),
             },
@@ -125,26 +127,32 @@ impl From<&TileData> for WasmTileData {
                 indices,
                 wire_flags,
             } => WasmTileData::PalRle {
-                palette_id: *palette_id,
-                count: *count,
-                indices: indices.clone(),
-                wire_flags: *wire_flags,
+                palette_id,
+                count,
+                indices,
+                wire_flags,
             },
             TileData::Cdf53 {
                 pass_idx,
                 bit_planes,
                 present_passes,
             } => WasmTileData::Cdf53 {
-                pass_idx: *pass_idx,
-                bit_planes: bit_planes.clone(),
-                present_passes: *present_passes,
+                pass_idx,
+                bit_planes,
+                present_passes,
             },
         }
     }
 }
 
-impl From<&Event> for WasmEvent {
-    fn from(ev: &Event) -> Self {
+impl From<&TileData> for WasmTileData {
+    fn from(data: &TileData) -> Self {
+        data.clone().into()
+    }
+}
+
+impl From<Event> for WasmEvent {
+    fn from(ev: Event) -> Self {
         match ev {
             Event::TileReady {
                 frame_seq,
@@ -152,10 +160,10 @@ impl From<&Event> for WasmEvent {
                 tile_y,
                 rgba,
             } => WasmEvent::TileReady {
-                frame_seq: *frame_seq,
-                tile_x: *tile_x,
-                tile_y: *tile_y,
-                rgba: rgba.clone(),
+                frame_seq,
+                tile_x,
+                tile_y,
+                rgba,
             },
             Event::TilePayload {
                 frame_seq,
@@ -164,30 +172,28 @@ impl From<&Event> for WasmEvent {
                 generation,
                 data,
             } => WasmEvent::TilePayload {
-                frame_seq: *frame_seq,
-                tile_x: *tile_x,
-                tile_y: *tile_y,
-                generation: *generation,
+                frame_seq,
+                tile_x,
+                tile_y,
+                generation,
                 data: data.into(),
             },
-            Event::PaletteUpdated { palette_id, colors } => WasmEvent::PaletteUpdated {
-                palette_id: *palette_id,
-                colors: colors.clone(),
-            },
-            Event::FrameDimensions { width, height } => WasmEvent::FrameDimensions {
-                width: *width,
-                height: *height,
-            },
+            Event::PaletteUpdated { palette_id, colors } => {
+                WasmEvent::PaletteUpdated { palette_id, colors }
+            }
+            Event::FrameDimensions { width, height } => {
+                WasmEvent::FrameDimensions { width, height }
+            }
             Event::NeedsH264 {
                 frame_seq,
                 timestamp_us,
                 is_keyframe,
                 payload,
             } => WasmEvent::NeedsH264 {
-                frame_seq: *frame_seq,
-                timestamp_us: *timestamp_us,
-                is_keyframe: *is_keyframe,
-                payload: payload.clone(),
+                frame_seq,
+                timestamp_us,
+                is_keyframe,
+                payload,
             },
             Event::DecodeError {
                 codec,
@@ -195,15 +201,21 @@ impl From<&Event> for WasmEvent {
                 tile_y,
                 code,
             } => WasmEvent::DecodeError {
-                codec: *codec as u8,
-                tile_x: *tile_x,
-                tile_y: *tile_y,
-                code: *code as u8,
+                codec: codec as u8,
+                tile_x,
+                tile_y,
+                code: code as u8,
             },
             Event::Evicted { reason } => WasmEvent::Evicted {
                 reason: reason.to_byte(),
             },
         }
+    }
+}
+
+impl From<&Event> for WasmEvent {
+    fn from(ev: &Event) -> Self {
+        ev.clone().into()
     }
 }
 

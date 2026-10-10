@@ -2,6 +2,7 @@ import { FullFrameDecoder } from './decoder.js';
 import { WebGpuRenderer } from './webgpu/renderer.js';
 import { WebGpuUnavailableError } from './webgpu/init.js';
 import { attachInputCapture } from './input/wire';
+import { checkFrameDimensions } from './frame_limits.js';
 import { createStatsLogger } from './stats_log.js';
 import { installCdf53Debug } from './cdf53_debug.js';
 import { initDiagnostics } from './diagnostics.js';
@@ -85,6 +86,8 @@ async function main() {
   const diag = initDiagnostics({
     canvas: canvasEl,
     getRenderer: () => window.__ghostframeRenderer ?? null,
+    // Pixel readbacks are for the e2e suite only (`?e2e` on the page URL).
+    readbacks: url.searchParams.has('e2e'),
   });
   const stats = diag.stats;
 
@@ -454,6 +457,14 @@ async function main() {
       }
 
       case 'FrameDimensions': {
+        const verdict = checkFrameDimensions(ev.width, ev.height);
+        if (!verdict.ok) {
+          // Keep the current framebuffer rather than allocate for a size the
+          // server has no business asking for.
+          console.error(`FrameDimensions rejected: ${verdict.reason}`);
+          log(`FrameDimensions rejected: ${verdict.reason}`);
+          break;
+        }
         const oldW = renderer.framebuffer.width;
         const oldH = renderer.framebuffer.height;
         renderer.resize(ev.width, ev.height);
@@ -559,6 +570,7 @@ async function main() {
     // `drainTransmit` is async; `tick()` is not (it's the rAF callback), so
     // this is a floating promise rather than an awaited call — deliberate,
     // logged rather than left an unhandled rejection.
+    flushDatagrams();
     for (const ev of core.onTimeout(nowUs())) handleEvent(ev);
     drainTransmit().catch((e) => console.warn('tick(): drainTransmit failed', e));
 
@@ -596,6 +608,72 @@ async function main() {
   }
   requestAnimationFrame(tick);
 
+  // ---- Inbound datagram batching (PC-3) -------------------------------
+  //
+  // Each datagram used to cost a wasm crossing with a BigInt timestamp, a
+  // serde round trip for its events, and an awaited drainTransmit() that
+  // serialised intake behind the ACK/NACK writes. Now the read loop only
+  // queues (with the arrival instant, which ACK timing and suspension
+  // detection need per datagram), and the queue is handed to the core in one
+  // `handleDatagrams` call from the rAF tick, followed by one drainTransmit.
+  //
+  // rAF is paused in a hidden tab, so two fallbacks keep intake moving:
+  // a backlog threshold and a timer. Neither fires in normal foreground use,
+  // where the tick runs every ~16 ms.
+  const FLUSH_BACKLOG = 128;
+  const FLUSH_FALLBACK_MS = 50;
+  const pendingDatagrams: Uint8Array[] = [];
+  const pendingArrivalsUs: number[] = [];
+  let flushTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function flushDatagrams(): void {
+    if (flushTimer !== undefined) {
+      clearTimeout(flushTimer);
+      flushTimer = undefined;
+    }
+    const n = pendingDatagrams.length;
+    if (n === 0) return;
+    let total = 0;
+    for (const d of pendingDatagrams) total += d.byteLength;
+    const concat = new Uint8Array(total);
+    const lens = new Uint32Array(n);
+    const arrivals = Float64Array.from(pendingArrivalsUs);
+    let off = 0;
+    for (let i = 0; i < n; i++) {
+      const d = pendingDatagrams[i];
+      concat.set(d, off);
+      lens[i] = d.byteLength;
+      off += d.byteLength;
+    }
+    pendingDatagrams.length = 0;
+    pendingArrivalsUs.length = 0;
+
+    for (const ev of core.handleDatagrams(concat, lens, arrivals) as WasmEvent[]) handleEvent(ev);
+
+    // Re-publish the datagram counters the e2e gates read off
+    // `window.__ghostframeStats`.
+    //
+    // `stats` was assigned from `diag.stats` at startup and then never
+    // written: the loop that used to increment it was the TypeScript decode
+    // path deleted at the wasm cutover (14aa7d4). Five e2e tests read these
+    // two numbers and saw 0 on sessions moving thousands of datagrams --
+    // `frame_total=0 (expected >= 250)` and `none observed` -- because the
+    // readers fall back to `{tileDatagrams:0, frameDatagrams:0}` when the
+    // global is missing or stale, which looks exactly like a measurement.
+    //
+    // Assigned from the core rather than incremented here on purpose: the
+    // core classifies tile vs frame in `handle_datagram`'s own dispatch, and
+    // a second copy of that discriminator in TypeScript is how the two drift.
+    const counts = core.datagramCounts() as {
+      tileDatagrams: number;
+      frameDatagrams: number;
+    };
+    stats.tileDatagrams = counts.tileDatagrams;
+    stats.frameDatagrams = counts.frameDatagrams;
+
+    drainTransmit().catch((e) => console.warn('flushDatagrams(): drainTransmit failed', e));
+  }
+
   // Receive datagrams. Parity envelopes, ping/pong text, frame-level H.264
   // reassembly and tile-level reassembly all used to be hand-routed here;
   // the wasm core now owns parity recovery and reassembly for both, so the
@@ -623,30 +701,16 @@ async function main() {
       continue;
     }
 
-    for (const ev of core.handleDatagram(value, nowUs()) as WasmEvent[]) handleEvent(ev);
-
-    // Re-publish the datagram counters the e2e gates read off
-    // `window.__ghostframeStats`.
-    //
-    // `stats` was assigned from `diag.stats` at startup and then never
-    // written: the loop that used to increment it was the TypeScript decode
-    // path deleted at the wasm cutover (14aa7d4). Five e2e tests read these
-    // two numbers and saw 0 on sessions moving thousands of datagrams --
-    // `frame_total=0 (expected >= 250)` and `none observed` -- because the
-    // readers fall back to `{tileDatagrams:0, frameDatagrams:0}` when the
-    // global is missing or stale, which looks exactly like a measurement.
-    //
-    // Assigned from the core rather than incremented here on purpose: the
-    // core classifies tile vs frame in `handle_datagram`'s own dispatch, and
-    // a second copy of that discriminator in TypeScript is how the two drift.
-    const counts = core.datagramCounts() as {
-      tileDatagrams: number;
-      frameDatagrams: number;
-    };
-    stats.tileDatagrams = counts.tileDatagrams;
-    stats.frameDatagrams = counts.frameDatagrams;
-
-    await drainTransmit();
+    // Queue, don't process: the batch crosses into wasm once per rAF tick
+    // (or sooner under backlog) instead of once per datagram. See
+    // flushDatagrams.
+    pendingDatagrams.push(value);
+    pendingArrivalsUs.push(performance.now() * 1000);
+    if (pendingDatagrams.length >= FLUSH_BACKLOG) {
+      flushDatagrams();
+    } else if (flushTimer === undefined) {
+      flushTimer = setTimeout(flushDatagrams, FLUSH_FALLBACK_MS);
+    }
   }
 }
 

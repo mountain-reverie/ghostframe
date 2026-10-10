@@ -69,7 +69,7 @@ export function installCdf53Debug(
 
     // Run inverse passes.
     const encoder = device.createCommandEncoder();
-    pipe.encodeInverse(encoder);
+    pipe.encodeInverseAll(encoder);
     device.queue.submit([encoder.finish()]);
 
     // Read back the target tile's pixels via __readPixelRect.
@@ -77,6 +77,9 @@ export function installCdf53Debug(
     const cols = Math.ceil(renderer.framebuffer.width / ts);
     const tileX = targetTileIdx % cols;
     const tileY = Math.floor(targetTileIdx / cols);
+    if (!window.__readPixelRect) {
+      throw new Error('__cdf53TestInverse needs the pixel readbacks: load the page with ?e2e as well as ?debug');
+    }
     return await window.__readPixelRect(tileX * ts, tileY * ts, ts, ts);
   };
 
