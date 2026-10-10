@@ -32,13 +32,13 @@ use drm::Device;
 /// in memory bytes are `[B=0xA0, G=0x40, R=0x20, X=0x00]`. Matches the
 /// X11-based mode_switch's intent (steel-blue-ish).
 const STATIC_BG_PIXEL: u32 = 0x00_20_40_A0;
-/// Motion paint interval. MUST be < capture interval so every captured frame
+/// Default motion paint interval. MUST be < capture interval so every captured frame
 /// sees a fresh paint and Vulkan SAD reports dirty tiles. With CAPTURE_FPS=30
 /// (33 ms), 50 ms paints would leave every-other capture seeing no change
 /// (empty dirty → classifier's `enter_streak` resets → never reaches sustain
 /// → mode never flips to H264). 16 ms (~60 Hz paint) safely beats any
 /// reasonable capture rate.
-const MOTION_TICK: Duration = Duration::from_millis(16);
+pub const MOTION_TICK: Duration = Duration::from_millis(16);
 /// Band height matches `ghostframe-lib::tile::TILE_SIZE` (32 px) so every
 /// motion-band exactly covers one tile row in the capture grid. Kept in sync
 /// manually since `ghostframe-test-pattern` has no `ghostframe-lib`
@@ -223,9 +223,31 @@ pub(crate) fn setup_dumb_scanout(
     })
 }
 
+/// What the motion half paints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum Motion {
+    /// One flat colour per tile row, recoloured every tick. Every tile is
+    /// dirty every frame, and every tile is `Solid`: four bytes each. This
+    /// is motion the tile codec is *right* to keep -- a whole screen of it
+    /// costs less than one H.264 frame -- so nothing but a network override
+    /// should move the classifier off TileCodec while it plays.
+    #[default]
+    Bands,
+    /// A scrolling per-pixel gradient: every tile is dirty every frame and
+    /// holds far more than 16 colours, so each classifies as `Cdf53`. A
+    /// screenful of those per frame is what H.264 exists for, and the cost
+    /// comparison is expected to enter it.
+    Video,
+}
+
 /// Become the DRM master, set up a dumb-buffer scanout, and run the
 /// static/motion paint loop.
-pub fn run(card_path: &str, half_cycle: Duration) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(
+    card_path: &str,
+    half_cycle: Duration,
+    motion: Motion,
+    motion_tick: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut scanout = setup_dumb_scanout(card_path)?;
     // Pre-fill with the static background before the first capture sees any pixels.
     fill_solid(
@@ -259,7 +281,11 @@ pub fn run(card_path: &str, half_cycle: Duration) -> Result<(), Box<dyn std::err
         // MOTION_TICK so the capture grid sees fresh dirty tiles every frame.
         let motion_deadline = cycle_start + cycle;
         while Instant::now() < motion_deadline {
-            paint_motion(
+            let paint = match motion {
+                Motion::Bands => paint_motion,
+                Motion::Video => paint_video,
+            };
+            paint(
                 &scanout.card,
                 &mut scanout.db,
                 scanout.pitch,
@@ -268,7 +294,7 @@ pub fn run(card_path: &str, half_cycle: Duration) -> Result<(), Box<dyn std::err
                 motion_phase,
             )?;
             motion_phase = motion_phase.wrapping_add(7);
-            thread::sleep(MOTION_TICK);
+            thread::sleep(motion_tick);
         }
     }
 }
@@ -324,6 +350,44 @@ pub(crate) fn msync_buffer(bytes: &mut [u8]) {
     }
 }
 
+/// Colour of pixel `(x, y)` in the `Motion::Video` frame at `phase`, packed
+/// XRGB8888. Red follows x and green follows y, so any 32x32 tile holds 1024
+/// distinct colours; all three channels slide with `phase`, so no pixel
+/// keeps its value from one frame to the next.
+pub fn video_pixel(x: u32, y: u32, phase: u8) -> u32 {
+    let p = phase as u32;
+    let r = (x + p) & 0xFF;
+    let g = (y + 2 * p) & 0xFF;
+    let b = ((x + y) / 2 + 3 * p) & 0xFF;
+    (r << 16) | (g << 8) | b
+}
+
+/// Paint the `Motion::Video` frame for `motion_phase`.
+fn paint_video(
+    card: &Card,
+    db: &mut drm::control::dumbbuffer::DumbBuffer,
+    pitch: u32,
+    width: u32,
+    height: u32,
+    motion_phase: u8,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut map = card
+        .map_dumb_buffer(db)
+        .map_err(|e| format!("map_dumb_buffer: {e}"))?;
+    let bytes = map.as_mut();
+    let row_pitch = pitch as usize;
+    let row_active = (width as usize) * 4;
+    for y in 0..height {
+        let row_start = (y as usize) * row_pitch;
+        let row = &mut bytes[row_start..row_start + row_active];
+        for (x, chunk) in row.chunks_exact_mut(4).enumerate() {
+            chunk.copy_from_slice(&video_pixel(x as u32, y, motion_phase).to_le_bytes());
+        }
+    }
+    msync_buffer(bytes);
+    Ok(())
+}
+
 /// Paint horizontal bands of shifting colours, each `BAND_H` rows tall.
 fn paint_motion(
     card: &Card,
@@ -363,4 +427,31 @@ fn paint_motion(
     }
     msync_buffer(bytes);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::video_pixel;
+    use std::collections::HashSet;
+
+    /// The two properties the classifier is supposed to react to. Sixteen is
+    /// the PalRle palette limit: at or under it a tile is cheap again and the
+    /// pattern stops being a reason to enter H.264.
+    #[test]
+    fn video_motion_gives_every_tile_many_colours_and_changes_every_pixel() {
+        for phase in [0u8, 7, 14, 249] {
+            for (tx, ty) in [(0u32, 0u32), (31, 23), (59, 33)] {
+                let colours: HashSet<u32> = (0..32)
+                    .flat_map(|dy| (0..32).map(move |dx| (dx, dy)))
+                    .map(|(dx, dy)| video_pixel(tx * 32 + dx, ty * 32 + dy, phase))
+                    .collect();
+                assert!(colours.len() > 16, "tile ({tx},{ty}) phase {phase}");
+            }
+            // The paint loop advances the phase by 7 per tick.
+            let next = phase.wrapping_add(7);
+            for (x, y) in [(0u32, 0u32), (1919, 1079), (640, 400)] {
+                assert_ne!(video_pixel(x, y, phase), video_pixel(x, y, next));
+            }
+        }
+    }
 }
