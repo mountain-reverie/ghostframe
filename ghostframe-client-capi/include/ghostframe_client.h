@@ -20,17 +20,23 @@ typedef enum gf_result {
   GF_AGAIN = 1,
   /**
    * A null pointer, a wrong `struct_size`, or another malformed
-   * argument. Also returned when a call caught an internal panic (see
-   * the module doc on `lib.rs` for why no panic may cross the FFI
-   * boundary).
+   * argument. Also returned when a call caught an internal panic: no
+   * panic ever crosses the library boundary.
    */
   GF_ERR_INVALID = 2,
   /**
-   * The call is not valid for the client's current state (e.g.
-   * `connect` called twice).
+   * The call is not valid for the client's current state: `connect`
+   * called twice, input or a display-mode request sent while not
+   * connected, or the handle busy in `connect`/`disconnect`.
    */
   GF_ERR_STATE = 3,
+  /**
+   * Network, tailnet or bootstrap failure.
+   */
   GF_ERR_IO = 4,
+  /**
+   * No usable GPU, or a GPU operation failed.
+   */
   GF_ERR_GPU = 5,
 } gf_result;
 
@@ -47,8 +53,8 @@ typedef enum gf_event_type {
  */
 typedef enum gf_handle_type {
   /**
-   * Linux dmabuf: `gf_plane::fd` is a PRIME fd. The only type M1
-   * produces.
+   * Linux dmabuf: `gf_plane::fd` is a PRIME fd. The only type produced
+   * today; the others are reserved.
    */
   GF_HANDLE_DMABUF = 0,
   GF_HANDLE_WIN32_NT = 1,
@@ -57,24 +63,39 @@ typedef enum gf_handle_type {
 } gf_handle_type;
 
 /**
- * The opaque handle behind every `gf_client *`.
+ * An embedded ghostframe session.
  *
- * Wraps the real [`Client`] plus the one piece of state this shim layer
- * owns itself: a per-`frame_id` stash of the converted [`gf_rect`] damage
- * list, so [`gf_frame::damage`] has somewhere stable to point until
- * [`gf_client_release_frame`] frees it. `ghostframe_client_native::Client::acquire_frame`
- * hands back an owned `Vec` that would otherwise be dropped the instant
- * this call returns.
+ * ## Threading contract
+ *
+ * - Every `gf_client_*` function may be called from any thread, including
+ *   concurrently with any other, EXCEPT `gf_client_destroy`.
+ * - `gf_client_destroy` must be the last call: no other call on the same
+ *   handle may be running or start afterwards. The library cannot enforce
+ *   this; calling it concurrently is undefined behaviour.
+ * - `gf_client_connect` and `gf_client_disconnect` take the handle
+ *   exclusively for their duration (`connect` blocks for seconds). While
+ *   one runs, calls from other threads do not block and do not fail the
+ *   process: `gf_client_next_event` and `gf_client_acquire_frame` return
+ *   `GF_AGAIN`, `gf_client_push_*` and `gf_client_request_display_mode`
+ *   return `GF_ERR_STATE`, and `gf_client_release_frame` is a no-op.
+ *   `gf_client_event_fd` and `gf_client_supports_h264` always work, so the
+ *   event fd can be put in a poll set before `connect`.
+ * - Events are not tied to a thread: `gf_client_next_event` may be called
+ *   from any thread, and each event is delivered to exactly one caller.
+ *
+ * Frames do not survive `gf_client_disconnect`: every `gf_frame` acquired
+ * before it, with its fds and `damage` pointer, is invalid afterwards, and
+ * frame ids restart on the next `gf_client_connect`.
  */
 typedef struct gf_client gf_client;
 
 /**
  * Configuration for [`crate::gf_client_create`].
  *
- * `struct_size` MUST be set to `sizeof(gf_client_config)` by the caller;
- * it is the forward-compatibility mechanism that lets a future ABI
- * revision add fields without silently misreading a caller built against
- * an older header. A mismatch is rejected with `GF_ERR_INVALID`.
+ * `struct_size` MUST be set to `sizeof(gf_client_config)` by the caller.
+ * This revision accepts exactly that size and rejects any other with
+ * `GF_ERR_INVALID`; the field lets a future revision recognise callers
+ * built against an older header.
  */
 typedef struct gf_client_config {
   uint32_t struct_size;
@@ -106,7 +127,7 @@ typedef struct gf_client_config {
  * One event popped by [`crate::gf_client_next_event`].
  *
  * `struct_size` MUST be set to `sizeof(gf_event)` by the caller before
- * the call -- see [`gf_client_config`]'s doc for why.
+ * the call; any other value is rejected with `GF_ERR_INVALID`.
  */
 typedef struct gf_event {
   uint32_t struct_size;
@@ -124,8 +145,10 @@ typedef struct gf_event {
    */
   uint32_t frame_id;
   /**
-   * Valid for `GF_EVENT_DISCONNECTED` and `GF_EVENT_ERROR`. NUL-terminated,
-   * truncated to 255 bytes + NUL if the underlying message is longer.
+   * Valid for `GF_EVENT_DISCONNECTED` and `GF_EVENT_ERROR`. NUL-terminated
+   * UTF-8, truncated to 255 bytes + NUL (never mid-character) if the
+   * underlying message is longer. Control characters are replaced by
+   * `?`: the text can originate on the network.
    * A fixed inline buffer rather than an owned pointer deliberately: a
    * `const char *` here would need its own ownership rule and free
    * function for what is only ever a short diagnostic string.
@@ -136,11 +159,7 @@ typedef struct gf_event {
    * session deliberately (eviction by another client) -- an ordinary
    * hand-off, safe for a host to treat as a clean exit. `false` for a
    * transport failure (idle timeout, reset, TLS failure, ...), which is
-   * not. Appended at the end of the struct per the `struct_size`
-   * forward-compatibility mechanism documented on the type -- a caller
-   * built against a header from before this field existed has
-   * `struct_size` too small to include it and this library never writes
-   * past what that caller promised was there.
+   * not.
    */
   bool disconnect_expected;
 } gf_event;
@@ -150,9 +169,11 @@ typedef struct gf_event {
  *
  * ## Ownership
  *
- * `fd` is owned by the library and remains valid until the `gf_client` is
- * destroyed. The caller must NOT close it -- `dup(2)` it first if a
- * longer-lived handle is needed than the frame it arrived on.
+ * `fd` is owned by the library. It stays open until the frame is passed
+ * to `gf_client_release_frame` (also across a server-driven resize), or
+ * until `gf_client_disconnect` / `gf_client_destroy`, whichever comes
+ * first. The caller must NOT close it -- `dup(2)` it first if a
+ * longer-lived handle is needed.
  */
 typedef struct gf_plane {
   int32_t fd;
@@ -175,14 +196,23 @@ typedef struct gf_rect {
  *
  * ## Ownership
  *
- * - `planes[i].fd`: owned by the library, valid until the `gf_client` is
- *   destroyed. Do not close it; `dup(2)` for a longer life.
+ * - `planes[i].fd`: owned by the library, valid until the matching
+ *   `gf_client_release_frame`, or `gf_client_disconnect` /
+ *   `gf_client_destroy`. Do not close it; `dup(2)` for a longer life.
  * - `acquire_fence_fd`: owned by the CALLER, who must close it. Always
- *   `-1` in M1 (the frame is already signalled by the time
- *   `gf_client_acquire_frame` returns it -- there is no fence to wait on
- *   yet).
+ *   `-1` today (the frame is already signalled by the time
+ *   `gf_client_acquire_frame` returns it -- there is no fence to wait on).
  * - `damage`: points into library memory. Valid only until the matching
  *   `gf_client_release_frame` call; do not retain the pointer past it.
+ *
+ * ## Identity
+ *
+ * `frame_id` is unique within a session and restarts at 0 after a
+ * reconnect. `buffer_id` names a slot in the library's buffer ring, NOT a
+ * stable image: after a resize the same `buffer_id` can name a different
+ * dmabuf of a different size. A host that caches imported images by
+ * `buffer_id` must re-import whenever `width`, `height`, `drm_modifier` or
+ * the plane fds differ from what it cached.
  */
 typedef struct gf_frame {
   uint32_t struct_size;
@@ -204,6 +234,13 @@ extern "C" {
 #endif // __cplusplus
 
 /**
+ * Create a client. Does not touch the network or the GPU; see
+ * `gf_client_connect`.
+ *
+ * `cfg->struct_size` must be `sizeof(gf_client_config)`. `*out` is written
+ * only on `GF_OK`. `n_export_buffers` above 16 and `n_preferred_modifiers`
+ * above 256 are rejected with `GF_ERR_INVALID`.
+ *
  * # Safety
  * `cfg` must be null or point to a valid, readable `gf_client_config`.
  * `out` must be null or point to a valid, writable `*mut gf_client`.
@@ -211,6 +248,10 @@ extern "C" {
 enum gf_result gf_client_create(const struct gf_client_config *cfg, struct gf_client **out);
 
 /**
+ * Destroy a client: disconnects if connected, closes every fd handed out
+ * in a `gf_frame`, frees the handle. Must be the last call on the handle;
+ * see the threading contract on `gf_client`.
+ *
  * # Safety
  * `c` must be null or a pointer previously returned by
  * [`gf_client_create`] and not yet passed to `gf_client_destroy`.
@@ -218,6 +259,10 @@ enum gf_result gf_client_create(const struct gf_client_config *cfg, struct gf_cl
 void gf_client_destroy(struct gf_client *c);
 
 /**
+ * The eventfd to add to the host's `poll`/`epoll` set; readable whenever
+ * `gf_client_next_event` has something to return. Valid for the life of the
+ * handle, including before `connect`. Returns -1 for a null client.
+ *
  * # Safety
  * `c` must be null or a valid, live `gf_client` pointer.
  */
@@ -238,15 +283,27 @@ int32_t gf_client_event_fd(const struct gf_client *c);
 bool gf_client_supports_h264(const struct gf_client *c);
 
 /**
- * Never blocks. Returns `GF_AGAIN` when the queue is empty.
+ * Pop the oldest queued event. Never blocks. Returns `GF_AGAIN` when the
+ * queue is empty (or while connect/disconnect is running).
+ *
+ * `out->struct_size` must be `sizeof(gf_event)`. `out` is written only on
+ * `GF_OK`; all of its fields are then initialised.
  *
  * # Safety
  * `c` and `out` must each be null or point to valid memory as documented
  * on their types.
  */
-enum gf_result gf_client_next_event(struct gf_client *c, struct gf_event *out);
+enum gf_result gf_client_next_event(const struct gf_client *c, struct gf_event *out);
 
 /**
+ * Bring the session up: join the tailnet, open the transport, start the
+ * library's threads. BLOCKS for seconds. Takes the handle exclusively for
+ * its duration (see the threading contract on `gf_client`).
+ *
+ * `host` must be NUL-terminated UTF-8. Returns `GF_ERR_STATE` if already
+ * connected, `GF_ERR_GPU` if no usable GPU, `GF_ERR_IO` for network and
+ * bootstrap failures.
+ *
  * # Safety
  * `c` and `host` must each be null or point to valid memory as documented
  * on their types; `host` must be NUL-terminated.
@@ -254,55 +311,98 @@ enum gf_result gf_client_next_event(struct gf_client *c, struct gf_event *out);
 enum gf_result gf_client_connect(struct gf_client *c, const char *host, uint16_t port);
 
 /**
+ * Tear the session down: stop the library's threads and close the
+ * tailnet session. Idempotent. Takes the handle exclusively for its
+ * duration.
+ *
+ * Invalidates every frame acquired before it: their fds are closed and
+ * their `damage` pointers freed. Do not use or release them afterwards.
+ *
  * # Safety
  * `c` must be null or a valid, live `gf_client` pointer.
  */
 enum gf_result gf_client_disconnect(struct gf_client *c);
 
 /**
- * Never blocks. Returns `GF_AGAIN` when no frame is ready.
+ * Take the newest ready frame. Never blocks. Returns `GF_AGAIN` when no
+ * frame is ready (or while connect/disconnect is running).
+ *
+ * `out->struct_size` must be `sizeof(gf_frame)`. `out` is written only on
+ * `GF_OK`. Every frame returned must be passed to
+ * `gf_client_release_frame` exactly once.
  *
  * # Safety
  * `c` and `out` must each be null or point to valid memory as documented
  * on their types.
  */
-enum gf_result gf_client_acquire_frame(struct gf_client *c, struct gf_frame *out);
+enum gf_result gf_client_acquire_frame(const struct gf_client *c, struct gf_frame *out);
 
 /**
+ * Return a frame to the library. Releasing a `frame_id` that was not
+ * acquired, or was already released, does nothing.
+ *
+ * After this call the frame's fds may be closed (immediately, if the
+ * session was resized since it was acquired) and its `damage` pointer is
+ * freed.
+ *
  * # Safety
  * `c` must be null or a valid, live `gf_client` pointer.
  */
-void gf_client_release_frame(struct gf_client *c, uint32_t frame_id);
+void gf_client_release_frame(const struct gf_client *c, uint32_t frame_id);
 
 /**
+ * Ask the server to switch to `width` x `height`. Fire and forget: the
+ * outcome arrives as `GF_EVENT_RESIZED`. Call it on every window resize;
+ * the server debounces. `GF_ERR_STATE` when not connected.
+ *
  * # Safety
  * `c` must be null or a valid, live `gf_client` pointer.
  */
-enum gf_result gf_client_push_pointer_motion(struct gf_client *c, int16_t x, int16_t y);
+enum gf_result gf_client_request_display_mode(const struct gf_client *c,
+                                              uint16_t width,
+                                              uint16_t height);
 
 /**
+ * Send a pointer motion. `GF_ERR_STATE` when not connected.
+ *
  * # Safety
  * `c` must be null or a valid, live `gf_client` pointer.
  */
-enum gf_result gf_client_push_pointer_button(struct gf_client *c,
+enum gf_result gf_client_push_pointer_motion(const struct gf_client *c, int16_t x, int16_t y);
+
+/**
+ * Send a pointer button press or release. `GF_ERR_STATE` when not
+ * connected.
+ *
+ * # Safety
+ * `c` must be null or a valid, live `gf_client` pointer.
+ */
+enum gf_result gf_client_push_pointer_button(const struct gf_client *c,
                                              int16_t x,
                                              int16_t y,
                                              uint8_t button,
                                              bool down);
 
 /**
+ * Send a wheel scroll. `GF_ERR_STATE` when not connected.
+ *
  * # Safety
  * `c` must be null or a valid, live `gf_client` pointer.
  */
-enum gf_result gf_client_push_wheel(struct gf_client *c, int16_t dx, int16_t dy);
+enum gf_result gf_client_push_wheel(const struct gf_client *c, int16_t dx, int16_t dy);
 
 /**
+ * Send a key press or release (X11 keysym). `GF_ERR_STATE` when not
+ * connected.
+ *
  * # Safety
  * `c` must be null or a valid, live `gf_client` pointer.
  */
-enum gf_result gf_client_push_key(struct gf_client *c, uint32_t keysym, bool down);
+enum gf_result gf_client_push_key(const struct gf_client *c, uint32_t keysym, bool down);
 
 /**
+ * Library version. Any pointer may be null.
+ *
  * # Safety
  * `major`, `minor` and `patch` must each be null or a valid, writable
  * `u32` pointer.
@@ -310,12 +410,16 @@ enum gf_result gf_client_push_key(struct gf_client *c, uint32_t keysym, bool dow
 void gf_version(uint32_t *major, uint32_t *minor, uint32_t *patch);
 
 /**
+ * A static, NUL-terminated name for a `gf_result` value, e.g. `"GF_OK"`.
+ * Takes the raw integer so a value that is not a valid `gf_result` (from a
+ * newer library, or corrupt) yields `"GF_ERR_UNKNOWN"` instead of
+ * undefined behaviour. Never returns null; the string is never freed.
+ *
  * # Safety
- * Callable with any `gf_result` value; marked `unsafe` for consistency
- * with the rest of this crate's `extern "C"` surface, not because this
- * particular function dereferences anything unchecked.
+ * Callable with any value; `unsafe` only for consistency with the rest of
+ * the `extern "C"` surface.
  */
-const char *gf_result_str(enum gf_result r);
+const char *gf_result_str(uint32_t r);
 
 #ifdef __cplusplus
 }  // extern "C"

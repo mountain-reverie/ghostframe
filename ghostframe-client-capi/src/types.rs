@@ -18,14 +18,16 @@ pub enum gf_result {
     /// Not an error -- callers poll again later.
     GF_AGAIN = 1,
     /// A null pointer, a wrong `struct_size`, or another malformed
-    /// argument. Also returned when a call caught an internal panic (see
-    /// the module doc on `lib.rs` for why no panic may cross the FFI
-    /// boundary).
+    /// argument. Also returned when a call caught an internal panic: no
+    /// panic ever crosses the library boundary.
     GF_ERR_INVALID = 2,
-    /// The call is not valid for the client's current state (e.g.
-    /// `connect` called twice).
+    /// The call is not valid for the client's current state: `connect`
+    /// called twice, input or a display-mode request sent while not
+    /// connected, or the handle busy in `connect`/`disconnect`.
     GF_ERR_STATE = 3,
+    /// Network, tailnet or bootstrap failure.
     GF_ERR_IO = 4,
+    /// No usable GPU, or a GPU operation failed.
     GF_ERR_GPU = 5,
 }
 
@@ -33,8 +35,8 @@ pub enum gf_result {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum gf_handle_type {
-    /// Linux dmabuf: `gf_plane::fd` is a PRIME fd. The only type M1
-    /// produces.
+    /// Linux dmabuf: `gf_plane::fd` is a PRIME fd. The only type produced
+    /// today; the others are reserved.
     GF_HANDLE_DMABUF = 0,
     GF_HANDLE_WIN32_NT = 1,
     GF_HANDLE_IOSURFACE = 2,
@@ -55,9 +57,11 @@ pub struct gf_rect {
 ///
 /// ## Ownership
 ///
-/// `fd` is owned by the library and remains valid until the `gf_client` is
-/// destroyed. The caller must NOT close it -- `dup(2)` it first if a
-/// longer-lived handle is needed than the frame it arrived on.
+/// `fd` is owned by the library. It stays open until the frame is passed
+/// to `gf_client_release_frame` (also across a server-driven resize), or
+/// until `gf_client_disconnect` / `gf_client_destroy`, whichever comes
+/// first. The caller must NOT close it -- `dup(2)` it first if a
+/// longer-lived handle is needed.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct gf_plane {
@@ -70,14 +74,23 @@ pub struct gf_plane {
 ///
 /// ## Ownership
 ///
-/// - `planes[i].fd`: owned by the library, valid until the `gf_client` is
-///   destroyed. Do not close it; `dup(2)` for a longer life.
+/// - `planes[i].fd`: owned by the library, valid until the matching
+///   `gf_client_release_frame`, or `gf_client_disconnect` /
+///   `gf_client_destroy`. Do not close it; `dup(2)` for a longer life.
 /// - `acquire_fence_fd`: owned by the CALLER, who must close it. Always
-///   `-1` in M1 (the frame is already signalled by the time
-///   `gf_client_acquire_frame` returns it -- there is no fence to wait on
-///   yet).
+///   `-1` today (the frame is already signalled by the time
+///   `gf_client_acquire_frame` returns it -- there is no fence to wait on).
 /// - `damage`: points into library memory. Valid only until the matching
 ///   `gf_client_release_frame` call; do not retain the pointer past it.
+///
+/// ## Identity
+///
+/// `frame_id` is unique within a session and restarts at 0 after a
+/// reconnect. `buffer_id` names a slot in the library's buffer ring, NOT a
+/// stable image: after a resize the same `buffer_id` can name a different
+/// dmabuf of a different size. A host that caches imported images by
+/// `buffer_id` must re-import whenever `width`, `height`, `drm_modifier` or
+/// the plane fds differ from what it cached.
 #[repr(C)]
 #[derive(Debug)]
 pub struct gf_frame {
@@ -97,10 +110,10 @@ pub struct gf_frame {
 
 /// Configuration for [`crate::gf_client_create`].
 ///
-/// `struct_size` MUST be set to `sizeof(gf_client_config)` by the caller;
-/// it is the forward-compatibility mechanism that lets a future ABI
-/// revision add fields without silently misreading a caller built against
-/// an older header. A mismatch is rejected with `GF_ERR_INVALID`.
+/// `struct_size` MUST be set to `sizeof(gf_client_config)` by the caller.
+/// This revision accepts exactly that size and rejects any other with
+/// `GF_ERR_INVALID`; the field lets a future revision recognise callers
+/// built against an older header.
 #[repr(C)]
 #[derive(Debug)]
 pub struct gf_client_config {
@@ -136,7 +149,7 @@ pub enum gf_event_type {
 /// One event popped by [`crate::gf_client_next_event`].
 ///
 /// `struct_size` MUST be set to `sizeof(gf_event)` by the caller before
-/// the call -- see [`gf_client_config`]'s doc for why.
+/// the call; any other value is rejected with `GF_ERR_INVALID`.
 #[repr(C)]
 #[derive(Debug)]
 pub struct gf_event {
@@ -148,8 +161,10 @@ pub struct gf_event {
     pub height: u32,
     /// Valid for `GF_EVENT_FRAME_READY`.
     pub frame_id: u32,
-    /// Valid for `GF_EVENT_DISCONNECTED` and `GF_EVENT_ERROR`. NUL-terminated,
-    /// truncated to 255 bytes + NUL if the underlying message is longer.
+    /// Valid for `GF_EVENT_DISCONNECTED` and `GF_EVENT_ERROR`. NUL-terminated
+    /// UTF-8, truncated to 255 bytes + NUL (never mid-character) if the
+    /// underlying message is longer. Control characters are replaced by
+    /// `?`: the text can originate on the network.
     /// A fixed inline buffer rather than an owned pointer deliberately: a
     /// `const char *` here would need its own ownership rule and free
     /// function for what is only ever a short diagnostic string.
@@ -158,10 +173,6 @@ pub struct gf_event {
     /// session deliberately (eviction by another client) -- an ordinary
     /// hand-off, safe for a host to treat as a clean exit. `false` for a
     /// transport failure (idle timeout, reset, TLS failure, ...), which is
-    /// not. Appended at the end of the struct per the `struct_size`
-    /// forward-compatibility mechanism documented on the type -- a caller
-    /// built against a header from before this field existed has
-    /// `struct_size` too small to include it and this library never writes
-    /// past what that caller promised was there.
+    /// not.
     pub disconnect_expected: bool,
 }
