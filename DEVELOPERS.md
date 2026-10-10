@@ -187,6 +187,17 @@ See [docs/m0-manual-smoke-test.md](docs/m0-manual-smoke-test.md) for the
 ping/pong smoke test that exercises `ghostframe-xdaemon` + the web client
 against a real Tailscale tailnet.
 
+## Environment variables
+
+Runtime knobs (`GHOSTFRAME_*`) are parsed once, in a crate's `config.rs`, and
+documented there: [`ghostframe-lib/src/config.rs`](ghostframe-lib/src/config.rs)
+holds the recipe for adding one, and
+[`ghostframe-client-gpu/src/config.rs`](ghostframe-client-gpu/src/config.rs)
+the `GHOSTFRAME_CLIENT_DUMP_*` frame-dump knobs. CI fails if `ghostframe-lib` or
+any `ghostframe-client-*` crate reads `std::env` anywhere else. Other crates
+(xdaemon, test-pattern, the Go bridge) have not been converted yet and read
+their variables at the point of use.
+
 ## Lint and format
 
 ```bash

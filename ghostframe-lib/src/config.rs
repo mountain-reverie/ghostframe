@@ -21,24 +21,90 @@
 
 use crate::tile::FrameMode;
 
-/// Test-only tuning knobs for the frame-mode classifier. All `None`/default
-/// means production behaviour: a production-relevant tunable would need
-/// wiring in `Classifier::new` and other codepaths that does not yet exist.
+/// Tuning knobs for the frame-mode classifier. All `None`/default means the
+/// compiled-in value: every field is an override of a constant that stays the
+/// default, and an unset or out-of-range variable changes nothing.
+///
+/// These used to compile only under `test-loss-injection` and carried
+/// `GHOSTFRAME_TEST_*` names. They are real operator knobs (a bench-tuned
+/// constant is wrong on other hardware), so they are now parsed in every
+/// build under unprefixed names. The old `GHOSTFRAME_TEST_*` names are still
+/// accepted as aliases, because the e2e and bench crates set them; the new
+/// name wins when both are present.
+///
+/// All four fields are **wired**: `Classifier::new` consumes them.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ClassifierConfig {
-    /// Pins the frame mode. Fed by `GHOSTFRAME_TEST_FORCE_FRAME_MODE`, or by
+    /// Pins the frame mode. Fed by `GHOSTFRAME_FORCE_FRAME_MODE`
+    /// (`h264` | `tile`; alias `GHOSTFRAME_TEST_FORCE_FRAME_MODE`), or by
     /// `GHOSTFRAME_FORCE_TILECODEC=1|true` as a high-level alias for
     /// `TileCodec`.
     pub force_frame_mode: Option<FrameMode>,
     /// Overrides `REFINEMENT_BIAS_PER_TILE_US`. Fed by
-    /// `GHOSTFRAME_TEST_REFINEMENT_BIAS_US`; accepts any value `> 0.0`.
+    /// `GHOSTFRAME_REFINEMENT_BIAS_US` (alias
+    /// `GHOSTFRAME_TEST_REFINEMENT_BIAS_US`); accepts any value `> 0.0`.
     pub refinement_bias_us: Option<f32>,
     /// Overrides `HEADROOM_MIN_BYTES_PER_US`. Fed by
-    /// `GHOSTFRAME_TEST_HEADROOM_MIN_BPUS`; accepts any value `> 0.0`.
+    /// `GHOSTFRAME_HEADROOM_MIN_BPUS` (alias
+    /// `GHOSTFRAME_TEST_HEADROOM_MIN_BPUS`); accepts any value `> 0.0`.
     pub headroom_min_bpus: Option<f32>,
     /// Overrides `LOSS_OVERRIDE_THRESHOLD`. Fed by
-    /// `GHOSTFRAME_TEST_LOSS_OVERRIDE_THRESHOLD`; accepts `(0.0, 1.0]`.
+    /// `GHOSTFRAME_LOSS_OVERRIDE_THRESHOLD` (alias
+    /// `GHOSTFRAME_TEST_LOSS_OVERRIDE_THRESHOLD`); accepts `(0.0, 1.0]`.
     pub loss_override_threshold: Option<f32>,
+    /// Per-codec encode-cost overrides. See `CostModelConfig`.
+    pub cost: CostModelConfig,
+}
+
+/// Overrides for the classifier's encode-cost model (`tile::CostModel`).
+///
+/// The defaults were bench-tuned on one machine (see
+/// `docs/specs/m3-codec-bench-results.md`); on other hardware the cost
+/// comparison mis-classifies. Each field is `None` for the compiled-in value;
+/// every accepted value must be finite and `> 0.0`, anything else is ignored.
+///
+/// All fields are **wired**: `Classifier::new` builds its `CostModel` from
+/// them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CostModelConfig {
+    /// `GHOSTFRAME_COST_SOLID_US` (compiled-in 0.05).
+    pub solid_us: Option<f32>,
+    /// `GHOSTFRAME_COST_PALRLE_US` (compiled-in 8.0).
+    pub palrle_us: Option<f32>,
+    /// `GHOSTFRAME_COST_CDF53_US` (compiled-in 90.0).
+    pub cdf53_us: Option<f32>,
+    /// `GHOSTFRAME_COST_H264_FRAME_US` (compiled-in 3000.0).
+    pub h264_frame_us: Option<f32>,
+    /// `GHOSTFRAME_COST_H264_FRAME_BYTES` (compiled-in 12000); a `u32 > 0`.
+    pub h264_frame_bytes: Option<u32>,
+    /// `GHOSTFRAME_COST_BYTES_PER_US` (compiled-in 12.5).
+    pub bytes_per_us: Option<f32>,
+}
+
+/// First variable of `names` that `get` can see. Used for env-name aliases:
+/// the preferred name goes first, so it wins when both are set.
+fn get_first(get: &impl Fn(&str) -> Option<String>, names: &[&str]) -> Option<String> {
+    names.iter().find_map(|n| get(n))
+}
+
+fn positive_f32(raw: Option<String>) -> Option<f32> {
+    raw.and_then(|s| s.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+}
+
+impl CostModelConfig {
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
+        Self {
+            solid_us: positive_f32(get("GHOSTFRAME_COST_SOLID_US")),
+            palrle_us: positive_f32(get("GHOSTFRAME_COST_PALRLE_US")),
+            cdf53_us: positive_f32(get("GHOSTFRAME_COST_CDF53_US")),
+            h264_frame_us: positive_f32(get("GHOSTFRAME_COST_H264_FRAME_US")),
+            h264_frame_bytes: get("GHOSTFRAME_COST_H264_FRAME_BYTES")
+                .and_then(|s| s.parse::<u32>().ok())
+                .filter(|v| *v > 0),
+            bytes_per_us: positive_f32(get("GHOSTFRAME_COST_BYTES_PER_US")),
+        }
+    }
 }
 
 impl ClassifierConfig {
@@ -46,20 +112,33 @@ impl ClassifierConfig {
     /// environment lookup; tests use a map so they never touch process-global
     /// state. Keeping the parsing here means the crate reads the process
     /// environment in exactly one place.
-    #[cfg(any(test, feature = "test-loss-injection"))]
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
         Self {
-            refinement_bias_us: get("GHOSTFRAME_TEST_REFINEMENT_BIAS_US")
-                .and_then(|s| s.parse::<f32>().ok())
-                .filter(|v| *v > 0.0),
-            loss_override_threshold: get("GHOSTFRAME_TEST_LOSS_OVERRIDE_THRESHOLD")
-                .and_then(|s| s.parse::<f32>().ok())
-                .filter(|v| *v > 0.0 && *v <= 1.0),
-            headroom_min_bpus: get("GHOSTFRAME_TEST_HEADROOM_MIN_BPUS")
-                .and_then(|s| s.parse::<f32>().ok())
-                .filter(|v| *v > 0.0),
+            refinement_bias_us: positive_f32(get_first(
+                &get,
+                &[
+                    "GHOSTFRAME_REFINEMENT_BIAS_US",
+                    "GHOSTFRAME_TEST_REFINEMENT_BIAS_US",
+                ],
+            )),
+            loss_override_threshold: get_first(
+                &get,
+                &[
+                    "GHOSTFRAME_LOSS_OVERRIDE_THRESHOLD",
+                    "GHOSTFRAME_TEST_LOSS_OVERRIDE_THRESHOLD",
+                ],
+            )
+            .and_then(|s| s.parse::<f32>().ok())
+            .filter(|v| *v > 0.0 && *v <= 1.0),
+            headroom_min_bpus: positive_f32(get_first(
+                &get,
+                &[
+                    "GHOSTFRAME_HEADROOM_MIN_BPUS",
+                    "GHOSTFRAME_TEST_HEADROOM_MIN_BPUS",
+                ],
+            )),
             // `GHOSTFRAME_FORCE_TILECODEC=1`/`true` is a high-level alias
-            // for `GHOSTFRAME_TEST_FORCE_FRAME_MODE=tile`. Used by the
+            // for `GHOSTFRAME_FORCE_FRAME_MODE=tile`. Used by the
             // `e2e_lossless_golden_png` test to bypass the H.264 forced-
             // start at session entry so the cdf53 first-paint burst gets
             // exercised (H.264 has its own FEC + parity + NACK and renders
@@ -68,26 +147,26 @@ impl ClassifierConfig {
                 .filter(|s| s == "1" || s == "true")
                 .map(|_| FrameMode::TileCodec)
                 .or_else(|| {
-                    get("GHOSTFRAME_TEST_FORCE_FRAME_MODE").and_then(|s| match s.as_str() {
+                    get_first(
+                        &get,
+                        &[
+                            "GHOSTFRAME_FORCE_FRAME_MODE",
+                            "GHOSTFRAME_TEST_FORCE_FRAME_MODE",
+                        ],
+                    )
+                    .and_then(|s| match s.as_str() {
                         "h264" | "H264" => Some(FrameMode::H264),
                         "tile" | "TileCodec" | "tilecodec" => Some(FrameMode::TileCodec),
                         _ => None,
                     })
                 }),
+            cost: CostModelConfig::from_lookup(&get),
         }
     }
 
     /// Parse environment variables into a classifier configuration.
-    #[cfg(any(test, feature = "test-loss-injection"))]
     pub fn from_env() -> Self {
         Self::from_lookup(|k| std::env::var(k).ok())
-    }
-
-    /// Production builds without `test-loss-injection` ignore the environment
-    /// entirely, exactly as today: the reads are not compiled.
-    #[cfg(not(any(test, feature = "test-loss-injection")))]
-    pub fn from_env() -> Self {
-        Self::default()
     }
 }
 
@@ -422,6 +501,105 @@ impl LibConfig {
 // process-global read that races other tests. CI enforces it -- grep for
 // `env::var` outside this file fails the build.
 
+/// Reliable-emitter retransmission-timer knobs: the RTO backoff ceiling and
+/// the first-attempt ACK-deadline band (see `rto::rto_for_attempt`).
+///
+/// These are the constants at the centre of the retransmit-storm report; field
+/// experiments on them used to need a rebuild. Defaults are the compiled-in
+/// constants in `transport/reliable_emitter/rto.rs`, so an unset environment
+/// changes nothing.
+///
+/// **Wired.** `rto_for_attempt` reads the process-wide copy returned by
+/// `emitter_config()` (parsed once, like `no_rto()`), so every caller picks
+/// the values up without a signature change. `rto_for_attempt_with` takes an
+/// explicit config and is what the tests drive.
+///
+/// There is deliberately no cache-capacity field: `RetransmitCache` is
+/// unbounded by design (an un-ACKed tile-pass is never dropped), and its
+/// `CACHE_CAPACITY` only sizes a vestigial LRU that never evicts an entry, so
+/// a knob for it would read from the environment and change nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmitterConfig {
+    /// `GHOSTFRAME_RTO_BACKOFF_MAX_MS` (default 5000). Any value `> 0`.
+    pub rto_backoff_max: std::time::Duration,
+    /// `GHOSTFRAME_ACK_DEADLINE_FLOOR_MS` (default 150). Any value `> 0`.
+    pub ack_deadline_floor: std::time::Duration,
+    /// `GHOSTFRAME_ACK_DEADLINE_COLD_START_MS` (default 1000). Any value `> 0`.
+    pub ack_deadline_cold_start: std::time::Duration,
+    /// `GHOSTFRAME_ACK_DEADLINE_CEILING_MS` (default 2000). Any value `> 0`.
+    /// If the floor ends up above the ceiling (a pair of overrides that
+    /// contradict each other, or one that contradicts a default), the whole
+    /// band reverts to its defaults rather than panicking in `Duration::clamp`.
+    pub ack_deadline_ceiling: std::time::Duration,
+}
+
+impl Default for EmitterConfig {
+    fn default() -> Self {
+        use crate::transport::reliable_emitter::rto;
+        Self {
+            rto_backoff_max: rto::RTO_BACKOFF_MAX,
+            ack_deadline_floor: rto::ACK_DEADLINE_FLOOR,
+            ack_deadline_cold_start: rto::ACK_DEADLINE_COLD_START,
+            ack_deadline_ceiling: rto::ACK_DEADLINE_CEILING,
+        }
+    }
+}
+
+impl EmitterConfig {
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
+        let ms = |name: &str, default: std::time::Duration| {
+            get(name)
+                .and_then(|s| s.parse::<u64>().ok())
+                .filter(|v| *v > 0)
+                .map(std::time::Duration::from_millis)
+                .unwrap_or(default)
+        };
+        let d = Self::default();
+        let mut cfg = Self {
+            rto_backoff_max: ms("GHOSTFRAME_RTO_BACKOFF_MAX_MS", d.rto_backoff_max),
+            ack_deadline_floor: ms("GHOSTFRAME_ACK_DEADLINE_FLOOR_MS", d.ack_deadline_floor),
+            ack_deadline_cold_start: ms(
+                "GHOSTFRAME_ACK_DEADLINE_COLD_START_MS",
+                d.ack_deadline_cold_start,
+            ),
+            ack_deadline_ceiling: ms("GHOSTFRAME_ACK_DEADLINE_CEILING_MS", d.ack_deadline_ceiling),
+        };
+        if cfg.ack_deadline_floor > cfg.ack_deadline_ceiling {
+            cfg.ack_deadline_floor = d.ack_deadline_floor;
+            cfg.ack_deadline_ceiling = d.ack_deadline_ceiling;
+        }
+        cfg
+    }
+
+    pub fn from_env() -> Self {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+}
+
+/// Process-wide `EmitterConfig`, parsed once. Cached for the same reason as
+/// `no_rto()`: `rto_for_attempt` runs on the scheduler tick.
+pub(crate) fn emitter_config() -> &'static EmitterConfig {
+    static CFG: std::sync::OnceLock<EmitterConfig> = std::sync::OnceLock::new();
+    CFG.get_or_init(EmitterConfig::from_env)
+}
+
+/// `GHOSTFRAME_VAAPI_DEVICE`: VA-API render node the H.264 encoders open,
+/// overriding the default `/dev/dri/renderD128` (wrong on multi-GPU hosts).
+/// `None` when unset or blank. Cached: a device that changed mid-process would
+/// make one session's contexts disagree with each other.
+///
+/// **Wired:** `encoder::vaapi_device::vaapi_device_path()` applies it at the
+/// three `h264_vaapi` context-creation sites.
+pub(crate) fn vaapi_device_override() -> Option<&'static str> {
+    static DEV: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    DEV.get_or_init(|| vaapi_device_from_lookup(|k| std::env::var(k).ok()))
+        .as_deref()
+}
+
+fn vaapi_device_from_lookup(get: impl Fn(&str) -> Option<String>) -> Option<String> {
+    get("GHOSTFRAME_VAAPI_DEVICE").filter(|s| !s.trim().is_empty())
+}
+
 /// Size of quinn's datagram send buffer, in bytes.
 ///
 /// 16 MiB by default. `GHOSTFRAME_DATAGRAM_SEND_BUFFER_BYTES` overrides it so
@@ -526,6 +704,146 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         move |key: &str| pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+    }
+
+    // -----------------------------------------------------------------
+    // Un-gated classifier overrides, CostModelConfig, EmitterConfig
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn classifier_config_accepts_new_names_and_old_aliases() {
+        let c = ClassifierConfig::from_lookup(lookup(&[
+            ("GHOSTFRAME_REFINEMENT_BIAS_US", "7.5"),
+            ("GHOSTFRAME_HEADROOM_MIN_BPUS", "0.5"),
+            ("GHOSTFRAME_LOSS_OVERRIDE_THRESHOLD", "0.2"),
+            ("GHOSTFRAME_FORCE_FRAME_MODE", "h264"),
+        ]));
+        assert_eq!(c.refinement_bias_us, Some(7.5));
+        assert_eq!(c.headroom_min_bpus, Some(0.5));
+        assert_eq!(c.loss_override_threshold, Some(0.2));
+        assert_eq!(c.force_frame_mode, Some(FrameMode::H264));
+
+        // The names the e2e and bench crates still set.
+        let c = ClassifierConfig::from_lookup(lookup(&[
+            ("GHOSTFRAME_TEST_REFINEMENT_BIAS_US", "1000"),
+            ("GHOSTFRAME_TEST_HEADROOM_MIN_BPUS", "0.05"),
+            ("GHOSTFRAME_TEST_LOSS_OVERRIDE_THRESHOLD", "0.5"),
+            ("GHOSTFRAME_TEST_FORCE_FRAME_MODE", "tile"),
+        ]));
+        assert_eq!(c.refinement_bias_us, Some(1000.0));
+        assert_eq!(c.headroom_min_bpus, Some(0.05));
+        assert_eq!(c.loss_override_threshold, Some(0.5));
+        assert_eq!(c.force_frame_mode, Some(FrameMode::TileCodec));
+
+        // New name wins when both are set.
+        let c = ClassifierConfig::from_lookup(lookup(&[
+            ("GHOSTFRAME_TEST_REFINEMENT_BIAS_US", "1"),
+            ("GHOSTFRAME_REFINEMENT_BIAS_US", "2"),
+        ]));
+        assert_eq!(c.refinement_bias_us, Some(2.0));
+    }
+
+    #[test]
+    fn cost_model_config_default_is_the_compiled_in_model() {
+        use crate::tile::classifier::CostModel;
+        // The literals are the values the model had before it was
+        // configurable. A retune must change this test deliberately.
+        let m = CostModel::from_config(&CostModelConfig::default());
+        assert_eq!(m.solid_us, 0.05);
+        assert_eq!(m.palrle_us, 8.0);
+        assert_eq!(m.cdf53_us, 90.0);
+        assert_eq!(m.h264_frame_us, 3000.0);
+        assert_eq!(m.h264_frame_bytes, 12_000);
+        assert_eq!(m.bytes_per_us(), 12.5);
+        assert_eq!(
+            CostModelConfig::from_lookup(lookup(&[])),
+            CostModelConfig::default()
+        );
+    }
+
+    #[test]
+    fn cost_model_config_parses_and_filters() {
+        let c = CostModelConfig::from_lookup(lookup(&[
+            ("GHOSTFRAME_COST_SOLID_US", "0.1"),
+            ("GHOSTFRAME_COST_PALRLE_US", "-3"),
+            ("GHOSTFRAME_COST_CDF53_US", "nan"),
+            ("GHOSTFRAME_COST_H264_FRAME_US", "4000"),
+            ("GHOSTFRAME_COST_H264_FRAME_BYTES", "0"),
+            ("GHOSTFRAME_COST_BYTES_PER_US", "25"),
+        ]));
+        assert_eq!(c.solid_us, Some(0.1));
+        assert_eq!(c.palrle_us, None, "non-positive is ignored");
+        assert_eq!(c.cdf53_us, None, "NaN is ignored");
+        assert_eq!(c.h264_frame_us, Some(4000.0));
+        assert_eq!(c.h264_frame_bytes, None, "zero bytes would divide by it");
+        assert_eq!(c.bytes_per_us, Some(25.0));
+        let m = crate::tile::classifier::CostModel::from_config(&c);
+        assert_eq!(m.solid_us, 0.1);
+        assert_eq!(m.palrle_us, 8.0, "an ignored override keeps the default");
+        assert_eq!(m.bytes_per_us(), 25.0);
+    }
+
+    #[test]
+    fn emitter_config_default_is_the_old_constants() {
+        use std::time::Duration;
+        let d = EmitterConfig::default();
+        assert_eq!(d.rto_backoff_max, Duration::from_secs(5));
+        assert_eq!(d.ack_deadline_floor, Duration::from_millis(150));
+        assert_eq!(d.ack_deadline_cold_start, Duration::from_secs(1));
+        assert_eq!(d.ack_deadline_ceiling, Duration::from_secs(2));
+        assert_eq!(EmitterConfig::from_lookup(lookup(&[])), d);
+    }
+
+    #[test]
+    fn emitter_config_parses_ms_and_rejects_nonsense() {
+        use std::time::Duration;
+        let c = EmitterConfig::from_lookup(lookup(&[
+            ("GHOSTFRAME_RTO_BACKOFF_MAX_MS", "10000"),
+            ("GHOSTFRAME_ACK_DEADLINE_FLOOR_MS", "0"),
+            ("GHOSTFRAME_ACK_DEADLINE_COLD_START_MS", "abc"),
+            ("GHOSTFRAME_ACK_DEADLINE_CEILING_MS", "3000"),
+        ]));
+        assert_eq!(c.rto_backoff_max, Duration::from_secs(10));
+        assert_eq!(
+            c.ack_deadline_floor,
+            Duration::from_millis(150),
+            "0 ignored"
+        );
+        assert_eq!(c.ack_deadline_cold_start, Duration::from_secs(1));
+        assert_eq!(c.ack_deadline_ceiling, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn emitter_config_inverted_band_reverts_instead_of_panicking() {
+        use crate::transport::reliable_emitter::rto::rto_for_attempt_with;
+        use std::time::Duration;
+        // floor 5 s > default ceiling 2 s: `Duration::clamp` would panic.
+        let c = EmitterConfig::from_lookup(lookup(&[("GHOSTFRAME_ACK_DEADLINE_FLOOR_MS", "5000")]));
+        assert_eq!(
+            c.ack_deadline_floor,
+            EmitterConfig::default().ack_deadline_floor
+        );
+        assert_eq!(
+            c.ack_deadline_ceiling,
+            EmitterConfig::default().ack_deadline_ceiling
+        );
+        let _ = rto_for_attempt_with(&c, Some(Duration::from_millis(10)), 0);
+    }
+
+    #[test]
+    fn vaapi_device_override_ignores_blank() {
+        assert_eq!(vaapi_device_from_lookup(lookup(&[])), None);
+        assert_eq!(
+            vaapi_device_from_lookup(lookup(&[("GHOSTFRAME_VAAPI_DEVICE", "  ")])),
+            None
+        );
+        assert_eq!(
+            vaapi_device_from_lookup(lookup(&[(
+                "GHOSTFRAME_VAAPI_DEVICE",
+                "/dev/dri/renderD129"
+            )])),
+            Some("/dev/dri/renderD129".to_string())
+        );
     }
 
     #[test]

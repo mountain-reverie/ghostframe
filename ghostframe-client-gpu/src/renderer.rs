@@ -62,6 +62,8 @@ pub struct Renderer {
     /// `GHOSTFRAME_CLIENT_DUMP_COUNT`. Counts attempts, not successes -- see
     /// `maybe_dump_framebuffer`.
     dumps_written: u64,
+    /// Dump sampling, read from the environment once at construction.
+    dump: crate::config::DumpConfig,
     /// Completed `flush` calls, so the dump can be deferred past a server's
     /// opening burst.
     flushes: u64,
@@ -208,6 +210,7 @@ impl Renderer {
             pending_cdf53: Vec::new(),
             pending_rgba: Vec::new(),
             dumps_written: 0,
+            dump: crate::config::DumpConfig::from_env(),
             flushes: 0,
             h264_decoder,
             h264_pipeline: None,
@@ -517,31 +520,17 @@ impl Renderer {
     /// `ghostframe-xdaemon` pulls in a PNG encoder for its own capture dump,
     /// but that is a server-side cost and this is a library.
     fn maybe_dump_framebuffer(&mut self, ctx: &WgpuContext) {
-        let Ok(prefix) = std::env::var("GHOSTFRAME_CLIENT_DUMP_FRAME") else {
+        let Some(prefix) = self.dump.frame_prefix.clone() else {
             return;
         };
         // `GHOSTFRAME_CLIENT_DUMP_EVERY=n` samples every nth flush instead,
         // overwriting `<prefix>.latest.ppm`, so a long session can be compared
         // against the export dump at the same moment rather than only during
         // the opening paint.
-        let every: u64 = std::env::var("GHOSTFRAME_CLIENT_DUMP_EVERY")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
         let n = self.dumps_written;
-        if every > 0 {
-            if !n.is_multiple_of(every) {
-                self.dumps_written += 1;
-                return;
-            }
-        } else {
-            let want: u64 = std::env::var("GHOSTFRAME_CLIENT_DUMP_COUNT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1);
-            if n >= want {
-                return;
-            }
+        if !self.dump.should_dump(n) {
+            self.dumps_written += 1;
+            return;
         }
         // Incremented regardless of outcome: a path that cannot be written will
         // not start working on the next flush, and retrying every flush would
