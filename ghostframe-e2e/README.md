@@ -49,9 +49,10 @@ path you are testing.
 
 Acts inside `IoBridge::send_to_all_sessions` (outbound) and on received
 datagrams (inbound), i.e. on ghostframe datagrams *before* QUIC encryption, so
-it can select by datagram kind. Present only in lib-based paths: the Docker
-e2e suite and anything that builds an `IoBridge` from the environment (this
-includes browserless scenes, whose `run_inner` builds `IoBridge` from env).
+it can select by datagram kind. Present only in the Docker e2e suite (a real
+server reading its environment). Browserless scenes build the `IoBridge` with a
+default config, so these variables do NOT act there; use the burst variables
+below or `NetProfile::loss`.
 `<DIR>` is `OUTBOUND` or `INBOUND`:
 
 - `GHOSTFRAME_<DIR>_LOSS_PROBABILITY` - f32 in `[0.0, 1.0]`, default `0.0`
@@ -67,7 +68,7 @@ Acts in the browserless harness's `NetSim`, on **QUIC packets** after
 encryption, so no predicate is possible. Browserless only: the Docker path
 cannot use these variables (the route there would be `tc netem ... loss
 gemodel` in `tests/containers/test-server/entrypoint.sh`). The names differ
-from the i.i.d. ones on purpose so the two can never double-inject.
+from the i.i.d. ones on purpose so one variable can never trigger both.
 
 - `GHOSTFRAME_<DIR>_BURST_LOSS_PROBABILITY` - long-run average loss in
   `(0, 1)`. Unset means no burst model for that direction.

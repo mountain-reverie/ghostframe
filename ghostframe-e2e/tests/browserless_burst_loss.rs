@@ -137,6 +137,11 @@ async fn iid_versus_burst_loss_at_equal_average_rate() {
     assert!(iid.s2c_datagrams_dropped > 0, "iid run dropped nothing");
     assert!(burst.s2c_datagrams_dropped > 0, "burst run dropped nothing");
     assert!(
+        burst.s2c_loss_runs >= 10,
+        "premise: only {} burst loss runs",
+        burst.s2c_loss_runs
+    );
+    assert!(
         burst.s2c_mean_loss_run() > iid.s2c_mean_loss_run() * 2.0,
         "measurement must move with the model: iid mean run {:.2}, burst {:.2}",
         iid.s2c_mean_loss_run(),
