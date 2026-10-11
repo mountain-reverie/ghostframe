@@ -185,9 +185,10 @@ pub async fn setup_e2e_server(spec: E2eServerSpec<'_>) -> Result<E2eServerSetup>
         None
     };
 
-    // `e2e=1` marks a test session (the web client gates its pixel readbacks
-    // on it) and `debug=1` installs the CDF53 GPU debug hooks. Both are
-    // absent from a production URL. Caller suffixes follow; a caller may add
+    // `e2e=1` marks a test session (nothing in the client gates on it yet;
+    // pixel readbacks are still installed unconditionally) and `debug=1`
+    // installs the CDF53 GPU debug hooks. Both are absent from a production
+    // URL. Caller suffixes follow; a caller may add
     // another `e2e=` value (e.g. `e2e=lossless`), which the client reads too.
     let page_url = {
         let suffix = spec
