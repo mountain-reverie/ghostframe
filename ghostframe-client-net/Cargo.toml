@@ -11,6 +11,9 @@ rustls = { workspace = true }
 web-transport-proto = { workspace = true }
 bytes = { workspace = true }
 sha2 = { workspace = true }
+# notAfter extraction for the pinning verifier. No `verify` feature: signature
+# checks go through the rustls provider, not this crate.
+x509-parser = { version = "0.18", default-features = false }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 url = "2"
@@ -23,9 +26,25 @@ url = "2"
 # `web-time` release.
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
 web-time = "=1.1.0"
+# wasm builds only compile this crate (the browser does its own TLS) and have no
+# C toolchain for aws-lc-sys, so they keep ring: no ML-KEM, never used at runtime.
+quinn-proto = { workspace = true, features = ["rustls-ring"] }
+rustls = { workspace = true, features = ["ring"] }
+
+# Native: aws-lc-rs (hybrid post-quantum key exchange).
+[target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
+quinn-proto = { workspace = true, features = ["rustls-aws-lc-rs"] }
+rustls = { workspace = true, features = ["aws_lc_rs"] }
 
 [dev-dependencies]
+# Makes quinn-proto's HandshakeData carry the negotiated key-exchange group so
+# the handshake test can read it. Tests only: with the feature on, quinn-proto
+# `expect`s a completed key exchange whenever handshake data is read, which
+# panics in the window after a HelloRetryRequest -- never enable it in a
+# shipped binary.
+quinn-proto = { workspace = true, features = ["__rustls-post-quantum-test"] }
 ghostframe-lib = { path = "../ghostframe-lib" }
 rcgen = { workspace = true }
+time = { workspace = true }
 proptest = "1"
 hex = { workspace = true }

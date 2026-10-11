@@ -24,6 +24,34 @@ pub struct CertInfo {
     pub sha256_hex: String,
 }
 
+/// The TLS provider for every ghostframe QUIC endpoint: aws-lc-rs with the
+/// hybrid post-quantum group X25519MLKEM768 **first** in the preference order,
+/// then the classical groups so a peer that does not offer it (older
+/// browsers) still connects.
+///
+/// The list is set explicitly rather than inherited from rustls's
+/// `prefer-post-quantum` cargo feature. Note the server cannot *enforce* a
+/// preference: rustls picks the first group in the **client's** list that the
+/// server supports, so the hybrid is used exactly when the client offers it
+/// first (Chrome >= 131, Firefox >= 132, and the native client do). What this
+/// provider guarantees is that the server *can* do it. The `ring` provider has
+/// no ML-KEM at all. Certificates stay ECDSA P-256 (browser pinning
+/// requires it); this changes key exchange only.
+///
+/// `ghostframe-client-net` carries an identical copy (this crate is not a
+/// dependency of the client); both have a test pinning the order.
+pub fn pq_provider() -> rustls::crypto::CryptoProvider {
+    use rustls::crypto::aws_lc_rs::{self, kx_group};
+    let mut provider = aws_lc_rs::default_provider();
+    provider.kx_groups = vec![
+        kx_group::X25519MLKEM768,
+        kx_group::X25519,
+        kx_group::SECP256R1,
+        kx_group::SECP384R1,
+    ];
+    provider
+}
+
 pub struct QuicServer {
     /// The quinn-proto endpoint state machine.
     pub(crate) endpoint: Endpoint,
@@ -156,13 +184,14 @@ impl QuicServer {
 
         // --- 3. Build rustls ServerConfig ---
         // rustls 0.23 with default-features=false: supply the crypto provider
-        // explicitly; do NOT call install_default().
+        // explicitly; do NOT call install_default(). The provider is aws-lc-rs
+        // with the hybrid X25519MLKEM768 group preferred (see `pq_provider`).
         let cert_chain: Vec<rustls::pki_types::CertificateDer<'static>> =
             vec![rustls::pki_types::CertificateDer::from(cert_der)];
         let private_key = rustls::pki_types::PrivateKeyDer::try_from(key_der)
             .map_err(|e| format!("invalid private key: {e}"))?;
 
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = Arc::new(pq_provider());
         let mut tls_config = rustls::ServerConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()?
             .with_no_client_auth()
@@ -366,6 +395,16 @@ impl QuicServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_prefers_the_hybrid_post_quantum_group() {
+        let p = pq_provider();
+        assert_eq!(p.kx_groups[0].name(), rustls::NamedGroup::X25519MLKEM768);
+        assert!(p
+            .kx_groups
+            .iter()
+            .any(|g| g.name() == rustls::NamedGroup::X25519));
+    }
 
     #[test]
     fn can_create_endpoint() {

@@ -39,7 +39,9 @@ cdf53-diag = ["ghostframe-protocol/cdf53-diag"]
 
 [dependencies]
 ghostframe-protocol = { path = "../ghostframe-protocol" }
-quinn-proto = { workspace = true }
+# aws-lc-rs for X25519MLKEM768 (see `transport::quic::pq_provider`). `ring` stays
+# on rustls only because ghostframe-e2e's harness names `rustls::crypto::ring`.
+quinn-proto = { workspace = true, features = ["rustls-aws-lc-rs"] }
 tokio = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
@@ -49,7 +51,7 @@ thiserror = { workspace = true }
 # it here is what keeps `ghostframe-xdaemon` serving a real client.
 ghostframe-tsnet = { path = "../ghostframe-tsnet", features = ["web-embed"] }
 tracing = { workspace = true }
-rustls = { workspace = true }
+rustls = { workspace = true, features = ["aws_lc_rs", "ring"] }
 rcgen = { workspace = true }
 rayon = "1.10"
 # Standalone Rust port of libwebrtc's Google Congestion Control, used for the

@@ -20,10 +20,15 @@ members = [
 
 [workspace.dependencies]
 # quinn-proto 0.11.14 — latest 0.11.x as of 2026-04-15
-quinn-proto = { version = "=0.11.14", default-features = false, features = ["rustls"] }
+# No provider feature here: each consumer picks its own, so the wasm build of
+# ghostframe-client-net never links a C crypto library (aws-lc-sys has no wasm
+# support). Server (ghostframe-lib) and native client (client-net, non-wasm)
+# use aws-lc-rs, the only rustls provider with the hybrid X25519MLKEM768 group.
+quinn-proto = { version = "=0.11.14", default-features = false }
 
-# rustls 0.23.38 — latest stable 0.23.x; requires explicit feature for ring or aws-lc-rs
-rustls = { version = "=0.23.38", default-features = false, features = ["ring", "std", "tls12"] }
+# rustls 0.23.38 — providers are always passed explicitly via
+# `builder_with_provider`, never `install_default`.
+rustls = { version = "=0.23.38", default-features = false, features = ["std", "tls12"] }
 
 # rcgen 0.14.7 — latest; NOTE: field renamed key_pair -> signing_key in 0.14.x
 rcgen = { version = "=0.14.7", default-features = false, features = ["crypto", "ring"] }

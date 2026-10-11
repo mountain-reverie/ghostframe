@@ -154,7 +154,7 @@ impl ClientNet {
         let now = self.instant(now_us);
 
         let verifier = Arc::new(tls::PinnedCertVerifier::new(self.config.server_cert_sha256));
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = Arc::new(tls::pq_provider());
         let mut client_tls = rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .map_err(|e| ClientNetError::Tls(e.to_string()))?
@@ -451,6 +451,17 @@ impl ClientNet {
 
     pub fn is_connected(&self) -> bool {
         self.connected
+    }
+
+    /// quinn-proto's TLS handshake data for the active connection, as the
+    /// type-erased value `crypto::Session::handshake_data` returns
+    /// (`quinn_proto::crypto::rustls::HandshakeData` for rustls). `None` before
+    /// TLS has produced it. Exists so tests can read what was negotiated.
+    pub fn tls_handshake_data(&mut self) -> Option<Box<dyn std::any::Any>> {
+        self.endpoint
+            .connection()?
+            .crypto_session()
+            .handshake_data()
     }
 
     /// Snapshot of `core`'s per-tile CDF 5/3 coverage state, for diagnostics
