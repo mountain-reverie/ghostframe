@@ -491,7 +491,7 @@ impl ClientNet {
     pub fn poll_transmit(&mut self) -> Option<UdpOut> {
         let (transmit, bytes) = self.endpoint.pop_outbound()?;
         Some(UdpOut {
-            payload: bytes.to_vec(),
+            payload: bytes,
             destination: transmit.destination,
         })
     }
