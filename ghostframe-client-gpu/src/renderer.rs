@@ -676,7 +676,6 @@ impl Renderer {
         self.ring.release(frame_id);
     }
 
-    /// The exported dmabuf image for a buffer id `publish` handed out.
     /// Take back a published frame the host never acquired.
     ///
     /// Releases its buffer, and marks the whole surface dirty. Releasing alone
@@ -691,6 +690,7 @@ impl Renderer {
         self.ring.mark_dirty_all();
     }
 
+    /// The exported dmabuf image for a buffer id `publish` handed out.
     pub fn export_buffer(&self, buffer_id: u32) -> &ExportedImage {
         self.ring.buffer(buffer_id)
     }
