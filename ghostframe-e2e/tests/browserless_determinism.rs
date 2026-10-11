@@ -193,3 +193,40 @@ async fn an_empty_scene_is_byte_identical() {
          and the s2c comparison above proves nothing"
     );
 }
+
+/// Many runs of the handshake-only scene, not two. quinn-proto skips one
+/// application-space packet number, drawn from `0..64` out of the endpoint
+/// RNG; when the client's skip lands among its first few 1-RTT packets the
+/// server's ACK carries an extra gap range, two bytes. With an entropy-seeded
+/// client that moved `bytes_delivered_s2c` in roughly 1 run in 60, so a
+/// pairwise comparison passes ~97% of the time while the cause is still
+/// there. 400 runs would all agree by chance under that bug about 0.1% of the
+/// time; the harness pins the client endpoint's RNG to the scene seed so they
+/// must agree always.
+#[tokio::test(start_paused = true)]
+async fn the_empty_scene_s2c_bytes_do_not_depend_on_the_skipped_packet_number() {
+    let mut counts = std::collections::BTreeMap::<u64, u32>::new();
+    for _ in 0..400 {
+        let r = run_browserless(BrowserlessScene {
+            seed: 0xDE7E_0003,
+            datagram_send_buffer_bytes: None,
+            tick_budget_floor_bytes: None,
+            load: SceneLoad::Script(vec![]),
+            cadence_us: DEFAULT_CADENCE_US,
+            net: NetProfile::perfect(),
+            drops: Default::default(),
+            duration: Duration::from_millis(800),
+            grid_cols: 4,
+            grid_rows: 4,
+        })
+        .await
+        .expect("run");
+        assert!(r.bytes_delivered_s2c > 0, "scene delivered nothing to the client");
+        *counts.entry(r.bytes_delivered_s2c).or_default() += 1;
+    }
+    assert_eq!(
+        counts.len(),
+        1,
+        "server->client byte count varied across identical handshake-only scenes: {counts:?}"
+    );
+}
