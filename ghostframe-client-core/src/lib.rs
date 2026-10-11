@@ -264,6 +264,11 @@ pub struct ClientCore {
     pub(crate) cdf53_coverage: HashMap<(u8, u8), CoverageEntry>,
     pub(crate) cdf53_tile_state: Cdf53TileState,
     pub(crate) latest_frame_seq: u32,
+    /// Stale-frame threshold the last sweep ran at.
+    pub(crate) swept_threshold: u32,
+    /// Set when an assembly or parity entry was stored below the current
+    /// threshold, so the next datagram still sweeps it as it always did.
+    pub(crate) stale_pending: bool,
     /// H.264 frame-level reassembly state (keyed by `frame_seq`).
     pub(crate) frame_assemblies: HashMap<u32, FrameAssembly>,
     pub(crate) latest_full_frame_seq: u32,
@@ -307,6 +312,8 @@ impl ClientCore {
             cdf53_coverage: HashMap::new(),
             cdf53_tile_state: Cdf53TileState::new(),
             latest_frame_seq: 0,
+            swept_threshold: 0,
+            stale_pending: false,
             frame_assemblies: HashMap::new(),
             latest_full_frame_seq: 0,
             pending_nacks: HashMap::new(),
