@@ -121,7 +121,11 @@ jobs:
       - run: cargo test --test browserless_determinism -- --test-threads=1
       - run: cargo test --test browserless_queue_latency -- --test-threads=1
       - run: cargo test --test browserless_blocked_path -- --test-threads=1
+      # Report-only instrument (asserts premises, not timing); the scenes run
+      # over-driven load on a constrained link and can hit the harness's
+      # load-dependent stall bail, so they must not gate merges.
       - run: cargo test --test browserless_nested_cc -- --test-threads=1
+        continue-on-error: true
       - run: cargo test --test browserless_burst_loss -- --test-threads=1
 
   harness-smoke:

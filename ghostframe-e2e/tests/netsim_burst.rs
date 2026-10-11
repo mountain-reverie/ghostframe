@@ -229,4 +229,16 @@ fn env_rejects_bad_values_instead_of_silently_disabling() {
     // Probability without a length is a configuration error, not "off".
     let only_p = lookup(&[("GHOSTFRAME_OUTBOUND_BURST_LOSS_PROBABILITY", "0.02")]);
     assert!(BurstConfig::from_lookup(BurstDirection::Outbound, only_p).is_err());
+    // Sibling variables without the probability must not silently disable it.
+    for k in [
+        "GHOSTFRAME_OUTBOUND_BURST_MEAN_LEN",
+        "GHOSTFRAME_OUTBOUND_BURST_SEED",
+        "GHOSTFRAME_OUTBOUND_BURST_LOSS_BAD",
+    ] {
+        let g = lookup(&[(k, "4")]);
+        assert!(
+            BurstConfig::from_lookup(BurstDirection::Outbound, g).is_err(),
+            "{k} alone must be an error"
+        );
+    }
 }

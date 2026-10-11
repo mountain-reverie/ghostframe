@@ -415,7 +415,7 @@ pub struct LinkOverrides {
 
 impl LinkOverrides {
     /// Burst-loss models from the `GHOSTFRAME_<DIR>_BURST_*` environment
-    /// variables (see `netsim::burst`), layered over `scene_net`. OUTBOUND is
+    /// variables (see `netsim::burst`), applied to a copy of `scene_net`, REPLACING its i.i.d. `loss` on that direction. OUTBOUND is
     /// server -> client, INBOUND client -> server. Empty when no burst
     /// variable is set. Panics on malformed values: a typo must not silently
     /// run a clean link.

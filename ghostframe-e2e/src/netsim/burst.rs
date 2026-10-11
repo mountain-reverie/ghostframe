@@ -171,6 +171,11 @@ impl BurstConfig {
         };
         let pn = name("LOSS_PROBABILITY");
         let Some(p_raw) = get(&pn) else {
+            for s in ["MEAN_LEN", "LOSS_BAD", "SEED"] {
+                if get(&name(s)).is_some() {
+                    return Err(format!("{} is set but {pn} is not", name(s)));
+                }
+            }
             return Ok(None);
         };
         let avg = parse_f64(&pn, p_raw)?;

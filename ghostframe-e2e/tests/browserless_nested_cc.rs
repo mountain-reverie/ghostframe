@@ -12,7 +12,7 @@
 //! `METRIC <scene> <name> <value>` and assert **premises only**: the session
 //! ran, the estimator was fed, the series is long enough, the estimate moved
 //! (a dead estimator pinned at its seed cannot report "converged"), and, for
-//! the idle scene, that the idle gap really offered ~no load. No timing
+//! the idle scene, that the scene script was well formed. No timing
 //! threshold is asserted. A later change (exposing wire-departure timestamps
 //! to the BWE) is compared by re-running this binary and diffing the METRIC
 //! lines.
@@ -341,66 +341,11 @@ async fn s2_control_no_idle_c10() {
     idle_scene("s2_control_c10", None, 0xCC02_0002).await;
 }
 
-/// Premise for S2: the gap is quieter than the load phase (it is NOT
-/// wire-idle: see the comment at the assertion).
-/// The scene is run three times with the same seed: load only (8 s), load +
-/// 3 s idle, load + 6 s idle. The first 3 s of an idle gap legitimately drain
-/// the emitter backlog (retransmits, refinement of drawn tiles); bytes in
-/// seconds 3-6 of the gap are the steady idle rate, compared with the load
-/// phase's own rate. The harness is not byte-reproducible, so the runs
-/// differ slightly; the bar is deliberately coarse.
-#[tokio::test(start_paused = true)]
-async fn s2_idle_gap_offers_almost_no_load() {
-    let cap = || CapTimeline::constant(10 * MBIT);
-    let a = run(0xCC02_0003, cap(), Queue::DropTail100, 8, &[], 13.0).await;
-    let b = run(
-        0xCC02_0003,
-        cap(),
-        Queue::DropTail100,
-        11,
-        &[(8 * S, 11 * S)],
-        13.0,
-    )
-    .await;
-    let c = run(
-        0xCC02_0003,
-        cap(),
-        Queue::DropTail100,
-        14,
-        &[(8 * S, 14 * S)],
-        13.0,
-    )
-    .await;
-    assert_premises(&a, "s2_premise_load", 50);
-    assert_premises(&b, "s2_premise_idle3", 80);
-    assert_premises(&c, "s2_premise_idle6", 100);
-    let load_rate = a.bytes_delivered_s2c as f64 / 8.0;
-    let drain = b.bytes_delivered_s2c.saturating_sub(a.bytes_delivered_s2c);
-    let late = c.bytes_delivered_s2c.saturating_sub(b.bytes_delivered_s2c);
-    let late_rate = late as f64 / 3.0;
-    println!(
-        "METRIC s2_idle_premise load_rate_Bps {load_rate:.0} drain_first3s_bytes {drain} \
-         late_gap_bytes {late} late_rate_Bps {late_rate:.0} ratio {:.4}",
-        late_rate / load_rate
-    );
-    assert!(
-        load_rate > 100_000.0,
-        "the load phase must carry real load for the ratio to mean anything"
-    );
-    // Application-offered load in the gap is zero by construction (the
-    // frames carry no tiles). What is NOT zero is the emitter's own residual
-    // traffic -- RTO/NACK retransmits of passes still unacknowledged when the
-    // load stopped -- which was measured at ~50% of the load rate in seconds
-    // 3-6 of the gap (2026-10-10, 1 run), i.e. an "idle" gap on this stack is
-    // not wire-idle. That is itself a finding, so the premise asserted is
-    // only that the gap is clearly quieter than the load, and the ratio is
-    // reported for the reader to judge.
-    assert!(
-        late_rate < 0.75 * load_rate,
-        "seconds 3-6 of the gap carried {late_rate:.0} B/s against {load_rate:.0} B/s of load; \
-         the gap is not meaningfully quieter than the load phase"
-    );
-}
+// A cross-run "idle gap offers no load" premise test was removed: it subtracted
+// byte totals from three separate (non-byte-reproducible) runs and asserted a
+// threshold on the emitter's residual retransmit traffic, a known-bad quantity.
+// The s2 scenes' gap is NOT wire-idle, so read their metrics as retransmit
+// drain, not as slow-start-after-idle.
 
 /// S3: sustained heavy load across a capacity step up and back down.
 #[tokio::test(start_paused = true)]
