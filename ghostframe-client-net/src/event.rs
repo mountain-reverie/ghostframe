@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 /// netsim in tests). This crate never owns a socket.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UdpOut {
-    pub payload: Vec<u8>,
+    pub payload: bytes::Bytes,
     pub destination: SocketAddr,
 }
 

@@ -792,7 +792,7 @@ async fn drive_session(
             for item in rule(
                 &mut net_c2s,
                 Direction::C2s,
-                out.payload,
+                out.payload.to_vec(),
                 t,
                 &mut bytes_dropped,
             ) {
