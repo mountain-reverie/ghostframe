@@ -86,9 +86,9 @@ function setup() {
   return { device, pipe, enc, first };
 }
 
-/** The gen buffer bound at the inverse shaders' gen slot (binding 2; 0 for pass 2). */
+/** The dirty-list buffer bound at binding 5 (binding 4 for pass 2). */
 function genBufferOf(pass: FakeEncoder['passes'][number], pipelineIdx: number): Buf {
-  const binding = pipelineIdx === 3 ? 0 : 2;
+  const binding = pipelineIdx === 3 ? 4 : 5;
   return pass.bindGroup.entries.find((e) => e.binding === binding)!.resource.buffer!;
 }
 
@@ -109,64 +109,71 @@ describe('Cdf53Pipeline dirty-tile inverse', () => {
     expect(pipe.pendingInverseTiles).toBe(0);
   });
 
-  it('masks the inverse to exactly the touched tiles, deduplicated', () => {
+  it('lists exactly the touched tiles, once each, and dispatches by list length', () => {
     const { pipe, enc, device } = setup();
     // Tile (1,0) gets three passes, tile (2,2) one: the GPU dirty list would
-    // hold tile (1,0) three times, the mask holds it once.
+    // hold tile (1,0) three times; the host list holds it once.
     pipe.uploadBatch([entry(1, 0, 5, 0), entry(1, 0, 5, 1), entry(1, 0, 5, 2), entry(2, 2, 7, 0)]);
     expect(pipe.pendingInverseTiles).toBe(2);
 
     const e = enc();
     pipe.encodeInverse(e);
-    expect(e.passes).toHaveLength(4);
+    // L3, L2, L1 (4 quadrants per tile), pass 2.
+    expect(e.passes.map((p) => p.groups)).toEqual([2, 2, 8, 2]);
 
-    // The inverse binds the mask buffer, not the persistent tileGen buffer.
     const bound = genBufferOf(e.passes[0], 0);
-    const lastMaskWrite = [...device.queue.writes].reverse().find((w) => w.buf === bound)!;
-    expect(lastMaskWrite).toBeDefined();
-    const mask = lastMaskWrite.words;
-    const nonZero = [...mask].map((v, i) => [i, v] as const).filter(([, v]) => v !== 0);
-    expect(nonZero).toEqual([
-      [0 * COLS + 1, 1],
-      [2 * COLS + 2, 1],
-    ]);
+    const write = [...device.queue.writes].reverse().find((w) => w.buf === bound)!;
+    expect(write).toBeDefined();
+    expect([...write.words].slice(0, 2).sort((a, b) => a - b)).toEqual([0 * COLS + 1, 2 * COLS + 2]);
     for (const [i, p] of e.passes.entries()) expect(genBufferOf(p, i)).toBe(bound);
   });
 
-  it('a later batch replaces the mask rather than accumulating', () => {
+  it('a later batch replaces the list rather than accumulating', () => {
     const { pipe, enc, device } = setup();
     pipe.uploadBatch([entry(0, 0, 1, 0)]);
     pipe.encodeInverse(enc());
     pipe.uploadBatch([entry(3, 2, 2, 0)]);
     const e = enc();
     pipe.encodeInverse(e);
+    expect(e.passes.map((p) => p.groups)).toEqual([1, 1, 4, 1]);
     const bound = genBufferOf(e.passes[0], 0);
-    const mask = [...device.queue.writes].reverse().find((w) => w.buf === bound)!.words;
-    expect([...mask].filter((v) => v !== 0)).toEqual([1]);
-    expect(mask[0]).toBe(0);
+    const write = [...device.queue.writes].reverse().find((w) => w.buf === bound)!;
+    expect([...write.words].slice(0, 1)).toEqual([2 * COLS + 3]);
+  });
+
+  it('an unrelated tile arriving does not re-lift tiles seen earlier', () => {
+    // The old full-grid lift repainted stale wavelet output over tiles that
+    // had since been overwritten by Solid/PalRle/Raw/H.264.
+    const { pipe, enc } = setup();
+    pipe.uploadBatch([entry(0, 0, 1, 0)]);
+    pipe.encodeInverse(enc());
+    pipe.uploadBatch([entry(3, 2, 1, 0)]);
+    const e = enc();
+    pipe.encodeInverse(e);
+    expect(e.passes[0].groups).toBe(1);
   });
 
   it('encodeInverseAll still lifts every tile (debug hooks write state directly)', () => {
     const { pipe, enc } = setup();
     const e = enc();
     pipe.encodeInverseAll(e);
-    expect(e.passes).toHaveLength(4);
-    // ...and binds the persistent gen buffer, not the mask.
+    expect(e.passes.map((p) => p.groups)).toEqual([MAX_TILES, MAX_TILES, MAX_TILES * 4, MAX_TILES]);
+    // ...and binds the identity list, not the dirty list.
     const withMask = enc();
     pipe.uploadBatch([entry(0, 0, 1, 0)]);
     pipe.encodeInverse(withMask);
     expect(genBufferOf(e.passes[0], 0)).not.toBe(genBufferOf(withMask.passes[0], 0));
   });
 
-  it('lifts generation-0 tiles (the 4-bit wire generation wraps to 0)', () => {
+  it("lists generation-0 tiles (the shader's own tileGen test decides)", () => {
     const { pipe, enc, device } = setup();
     pipe.uploadBatch([entry(2, 1, 0, 0)]);
     const e = enc();
     pipe.encodeInverse(e);
     expect(e.passes).toHaveLength(4);
     const bound = genBufferOf(e.passes[0], 0);
-    const mask = [...device.queue.writes].reverse().find((w) => w.buf === bound)!.words;
-    expect(mask[1 * COLS + 2]).not.toBe(0);
+    const list = [...device.queue.writes].reverse().find((w) => w.buf === bound)!.words;
+    expect(list[0]).toBe(1 * COLS + 2);
   });
 
   it('drops out-of-grid tiles instead of throwing', () => {
