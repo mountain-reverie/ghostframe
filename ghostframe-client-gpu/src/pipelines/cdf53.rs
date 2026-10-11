@@ -10,7 +10,8 @@
 //! CPU (mirroring `Cdf53Pipeline.uploadBatch` in the TS reference) using
 //! [`crate::pipelines::cdf53_passes::passes_processed`] for the sparse-K
 //! rule. [`Cdf53Pipeline::inverse`] runs the four-stage inverse lifting
-//! chain (L3 -> L2 -> L1 -> L1 pass2) for every tile slot, writing
+//! chain (L3 -> L2 -> L1 -> L1 pass2) for the tiles integrated since the
+//! last inverse (a host-built, deduplicated list), writing
 //! reconstructed pixels into the framebuffer.
 //!
 //! ## Generation
@@ -88,6 +89,10 @@ struct PersistentBuffers {
     #[allow(dead_code)]
     dirty_tiles: wgpu::Buffer,
     dirty_tiles_count: wgpu::Buffer,
+    /// Host-built, deduplicated list the inverse shaders index with their
+    /// workgroup id. Distinct from `dirty_tiles`, which the integrate shader
+    /// appends to once per *pass* (duplicates, and reset per batch).
+    inverse_list: wgpu::Buffer,
     tile_work: wgpu::Buffer,
     bit_planes: wgpu::Buffer,
     work_area: wgpu::Buffer,
@@ -123,6 +128,12 @@ pub struct Cdf53Pipeline {
     max_tiles: u32,
 
     tracks: Vec<TileTrack>,
+
+    /// Tiles integrated since the last `inverse`, each once, in first-seen
+    /// order. Accumulates across `integrate` calls so two integrates before
+    /// one inverse lose nothing (the shader-side list is reset per batch).
+    dirty: Vec<u32>,
+    dirty_mark: Vec<bool>,
 }
 
 impl Cdf53Pipeline {
@@ -189,6 +200,8 @@ impl Cdf53Pipeline {
             cols: 0,
             max_tiles: 0,
             tracks: Vec::new(),
+            dirty: Vec::new(),
+            dirty_mark: Vec::new(),
         }
     }
 
@@ -209,6 +222,9 @@ impl Cdf53Pipeline {
         }
 
         self.tracks = vec![TileTrack::default(); max_tiles as usize];
+        // Fresh buffers: tileGen is all zero, so nothing is inverted.
+        self.dirty.clear();
+        self.dirty_mark = vec![false; max_tiles as usize];
 
         let coefficient = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("ghostframe-cdf53-coefficient"),
@@ -258,6 +274,12 @@ impl Cdf53Pipeline {
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::INDIRECT,
+            mapped_at_creation: false,
+        });
+        let inverse_list = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ghostframe-cdf53-inverse-list"),
+            size: max_tiles as u64 * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         // Per-batch budget: a batch holds at most max_tiles x 14 passes.
@@ -345,6 +367,10 @@ impl Cdf53Pipeline {
                         binding: 4,
                         resource: passes_processed_buf.as_entire_binding(),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: inverse_list.as_entire_binding(),
+                    },
                 ],
             })
         };
@@ -368,6 +394,7 @@ impl Cdf53Pipeline {
             passes_processed: passes_processed_buf,
             dirty_tiles,
             dirty_tiles_count,
+            inverse_list,
             tile_work,
             bit_planes,
             work_area,
@@ -422,6 +449,10 @@ impl Cdf53Pipeline {
             );
             let tile_idx = *tile_y as u32 * self.cols + *tile_x as u32;
             let track = &mut self.tracks[tile_idx as usize];
+            if !self.dirty_mark[tile_idx as usize] {
+                self.dirty_mark[tile_idx as usize] = true;
+                self.dirty.push(tile_idx);
+            }
 
             if track.last_seen_gen != *generation as u32 && cleared_tiles.insert(tile_idx) {
                 queue.write_buffer(
@@ -483,20 +514,61 @@ impl Cdf53Pipeline {
         queue.submit(std::iter::once(encoder.finish()));
     }
 
-    /// Run the inverse levels for all dirty tiles into `fb`.
+    /// Run the inverse levels for the tiles integrated since the last call,
+    /// into `fb`. Does nothing (no encoder, no submit) when none were.
     ///
-    /// Always dispatches one workgroup per possible tile slot; each inverse
-    /// shader early-exits when `tileGen[tile_idx] == 0`. This keeps the
-    /// framebuffer fresh across repeated calls even when no new passes
-    /// arrived: the persistent coefficient/sign state for a previously
-    /// integrated tile is still there, so re-running the inverse reproduces
-    /// the same pixels.
+    /// Each tile is listed once however many passes of it arrived, and
+    /// workgroup N of every level maps to `list[N]`. Tiles not in the list
+    /// are left exactly as they are in `fb`: previously integrated tiles are
+    /// NOT re-inverted, so anything painted over one since (solid, PalRle,
+    /// raw) survives. Their coefficient state is persistent, so a later
+    /// batch touching one re-inverts it from everything integrated so far.
     pub fn inverse(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, fb: &Framebuffer) {
+        if self.dirty.is_empty() {
+            return;
+        }
+        let list = std::mem::take(&mut self.dirty);
+        for &t in &list {
+            self.dirty_mark[t as usize] = false;
+        }
+        self.run_inverse(device, queue, fb, &list);
+        self.dirty = list;
+        self.dirty.clear();
+    }
+
+    /// The pre-dirty-list behaviour: invert every tile slot, relying on the
+    /// shaders' `tileGen == 0` early-exit to skip never-integrated ones.
+    /// Kept only as the reference the dirty path is compared against.
+    #[doc(hidden)]
+    pub fn inverse_full_grid(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        fb: &Framebuffer,
+    ) {
+        for &t in &self.dirty {
+            self.dirty_mark[t as usize] = false;
+        }
+        self.dirty.clear();
+        let all: Vec<u32> = (0..self.max_tiles).collect();
+        self.run_inverse(device, queue, fb, &all);
+    }
+
+    fn run_inverse(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        fb: &Framebuffer,
+        list: &[u32],
+    ) {
         let buffers = self
             .buffers
             .as_ref()
             .expect("resize must be called before inverse");
-        let wg_cap = self.max_tiles.max(1);
+        debug_assert!(list.len() as u32 <= self.max_tiles);
+        let wg_cap = list.len() as u32;
+        let list_bytes: Vec<u8> = list.iter().flat_map(|t| t.to_le_bytes()).collect();
+        queue.write_buffer(&buffers.inverse_list, 0, &list_bytes);
 
         let fb_view = fb
             .texture()
@@ -520,6 +592,10 @@ impl Cdf53Pipeline {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: self.uniforms.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: buffers.inverse_list.as_entire_binding(),
                 },
             ],
         });
