@@ -594,7 +594,14 @@ async fn drive_session(
 ) -> anyhow::Result<(Vec<ClientNetEvent>, u64, u64, u64, u64, u64)> {
     let seed = scene.seed;
 
-    let mut client = ClientNet::new(cfg, now_us(base))
+    // Pin the client endpoint's RNG to the scene seed. Left to entropy,
+    // quinn-proto skips one application-space packet number drawn from
+    // `0..64`; when it lands among the client's first few 1-RTT packets the
+    // server's ACK gains a gap range (+2 bytes), so two identical scenes
+    // differed in `bytes_delivered_s2c` about 1 run in 60.
+    let mut rng_seed = [0u8; 32];
+    rng_seed[..8].copy_from_slice(&seed.to_le_bytes());
+    let mut client = ClientNet::with_rng_seed(cfg, now_us(base), rng_seed)
         .map_err(|e| anyhow!("seed {seed}: ClientNet::new failed: {e}"))?;
     client
         .connect(server_addr, now_us(base))

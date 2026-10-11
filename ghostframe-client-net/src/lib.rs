@@ -118,6 +118,28 @@ impl ClientNet {
     /// `base`, so the wasm/native split is confined to `clock.rs` and this
     /// one call site.
     pub fn new(config: ClientNetConfig, now_us: u64) -> Result<Self, ClientNetError> {
+        Self::build(config, now_us, None)
+    }
+
+    /// Like [`ClientNet::new`], but with the QUIC endpoint's RNG pinned to
+    /// `rng_seed`. For deterministic harnesses only: quinn-proto draws
+    /// connection IDs and the application-space packet number it deliberately
+    /// skips (uniform in `0..64`, RFC 9000 section 21.4 optimistic-ACK
+    /// defence) from that RNG, and a skipped number reaches the peer as an
+    /// extra ACK range. Production keeps the entropy seed.
+    pub fn with_rng_seed(
+        config: ClientNetConfig,
+        now_us: u64,
+        rng_seed: [u8; 32],
+    ) -> Result<Self, ClientNetError> {
+        Self::build(config, now_us, Some(rng_seed))
+    }
+
+    fn build(
+        config: ClientNetConfig,
+        now_us: u64,
+        rng_seed: Option<[u8; 32]>,
+    ) -> Result<Self, ClientNetError> {
         let core = ClientCore::new(
             ClientConfig {
                 indices_raw_enabled: config.indices_raw_enabled,
@@ -133,7 +155,7 @@ impl ClientNet {
             session_ready: false,
             pending_stream_out: Vec::new(),
             feedback_stream: None,
-            endpoint: ClientEndpoint::new(),
+            endpoint: ClientEndpoint::new(rng_seed),
             handshake: WebTransportHandshake::new(),
             core,
             events: Vec::new(),

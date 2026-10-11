@@ -33,10 +33,15 @@ pub(crate) struct ClientEndpoint {
 }
 
 impl ClientEndpoint {
-    pub(crate) fn new() -> Self {
+    /// `rng_seed` pins quinn-proto's endpoint RNG, which feeds connection IDs,
+    /// stateless-reset keys and, through the connection, the application-space
+    /// packet number that gets skipped. `None` keeps it entropy-seeded.
+    pub(crate) fn new(rng_seed: Option<[u8; 32]>) -> Self {
         // Client endpoints never accept incoming connections, so there is no
         // `ServerConfig`.
-        let endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None, false, None);
+        let mut config = EndpointConfig::default();
+        config.rng_seed(rng_seed);
+        let endpoint = Endpoint::new(Arc::new(config), None, false, None);
         let scratch = Vec::with_capacity(endpoint.config().get_max_udp_payload_size() as usize);
         Self {
             endpoint,
