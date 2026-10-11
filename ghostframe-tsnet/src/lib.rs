@@ -357,18 +357,26 @@ pub fn parse_frame_rest(rest: &[u8], payload_len: usize) -> io::Result<UdpPacket
 /// Visibility is `pub` so the E2E integration test harness can reuse the
 /// framing implementation without duplicating it.
 pub fn encode_frame(payload: &[u8], addr: &SocketAddr) -> Vec<u8> {
+    let mut frame = Vec::new();
+    encode_frame_into(&mut frame, payload, addr);
+    frame
+}
+
+/// Like [`encode_frame`], but encodes into `frame` (cleared first) so a hot
+/// send loop can reuse one allocation across packets.
+pub fn encode_frame_into(frame: &mut Vec<u8>, payload: &[u8], addr: &SocketAddr) {
     let host = addr.ip().to_string();
     let host_bytes = host.as_bytes();
     let total_len = (4 + 4 + payload.len() + 2 + host_bytes.len() + 1) as u32;
 
-    let mut frame = Vec::with_capacity(total_len as usize);
+    frame.clear();
+    frame.reserve(total_len as usize);
     frame.extend_from_slice(&total_len.to_be_bytes());
     frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
     frame.extend_from_slice(payload);
     frame.extend_from_slice(&addr.port().to_be_bytes());
     frame.extend_from_slice(host_bytes);
     frame.push(0);
-    frame
 }
 
 #[cfg(test)]
@@ -404,6 +412,18 @@ mod tests {
     #[test]
     fn roundtrip_empty_payload() {
         roundtrip(b"", "127.0.0.1:1");
+    }
+
+    #[test]
+    fn encode_frame_into_reuses_the_buffer_and_matches_encode_frame() {
+        let a: SocketAddr = "100.64.0.1:443".parse().unwrap();
+        let b: SocketAddr = "[fd7a::1]:9".parse().unwrap();
+        let mut buf = Vec::new();
+        // Longer first, so stale bytes would survive if the buffer were not cleared.
+        encode_frame_into(&mut buf, &[7u8; 64], &a);
+        assert_eq!(buf, encode_frame(&[7u8; 64], &a));
+        encode_frame_into(&mut buf, &[1, 2, 3], &b);
+        assert_eq!(buf, encode_frame(&[1, 2, 3], &b));
     }
 
     #[test]
