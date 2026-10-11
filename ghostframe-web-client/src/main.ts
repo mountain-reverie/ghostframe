@@ -244,7 +244,8 @@ async function main() {
   // spamming the console during normal teardown.
   let decodeErrorWriteLogged = false;
   // Rate limiting (per-tile 1/s, 32/s global) is the wasm core's
-  // `DecodeErrorBatcher`, the same one the core's own pre-validation uses.
+  // `DecodeErrorBatcher` (same code as the core's own pre-validation, but a
+  // separate instance, so the global cap is per instance).
   const decodeErrorBatcher = new WasmDecodeErrorBatcher();
   const reportDecodeError = (codec: number, tileX: number, tileY: number, code: number) => {
     const bytes = decodeErrorBatcher.report(codec, tileX, tileY, code, nowUs());
@@ -513,10 +514,28 @@ async function main() {
   // harness (scene.rs read_client_diagnostics) turns into per-frame latency.
   // Fed from TilePayload events -- the per-datagram path that used to feed
   // it was deleted at the wasm cutover and this stayed empty until now.
+  // Not a paint-latency measurement: "painted" is stamped on the first rAF
+  // after the server is two sequences ahead, so the sample is at least two
+  // frame intervals long (unbounded on a sparse scene). It proves the global
+  // is live and gives a coarse upper bound; do not read it as photon latency.
+  const MAX_PENDING_FRAME_STAMPS = 1024;
   let latestTileFrameSeq = 0;
   const pendingFramePaintRaf = new Set<number>();
   function noteFrameTileReceived(frameSeq: number, nowMs: number): number {
-    if (!firstRecvMs.has(frameSeq)) firstRecvMs.set(frameSeq, nowMs);
+    // A tile for a frame already two sequences behind was (or will never be)
+    // recorded; re-creating its entry would emit a duplicate paint record.
+    if (frameSeq + 2 <= latestTileFrameSeq) return nowMs;
+    if (!firstRecvMs.has(frameSeq)) {
+      firstRecvMs.set(frameSeq, nowMs);
+      // rAF (the only drain) stops in a hidden tab while datagrams keep
+      // arriving; bound the map so a long background does not grow it, and
+      // the scan below, without limit. Map iterates in insertion order.
+      if (firstRecvMs.size > MAX_PENDING_FRAME_STAMPS) {
+        const oldest = firstRecvMs.keys().next().value as number;
+        firstRecvMs.delete(oldest);
+        pendingFramePaintRaf.delete(oldest);
+      }
+    }
     if (frameSeq > latestTileFrameSeq) {
       latestTileFrameSeq = frameSeq;
       for (const seq of firstRecvMs.keys()) {

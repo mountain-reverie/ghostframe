@@ -37,6 +37,7 @@ e2e_palrle_5pct_loss
 e2e_palrle_exact_pixels
 e2e_palrle_oob_index
 e2e_palrle_session_reset
+e2e_polled_globals_are_live
 e2e_progressive_refinement
 e2e_refinement_cancel
 e2e_solid_per_tile_pixels

@@ -7,11 +7,11 @@ declare module '*.wgsl?raw' {
 
 // Type augmentation for test-instrumentation / e2e-readback properties
 // exposed on `window` by diagnostics.ts and renderer.ts.
-// Polled by Playwright in the ghostframe e2e suite
-// (see `ghostframe-lib/tests/e2e.rs`).
+// Polled over CDP by the ghostframe e2e suite (`ghostframe-e2e/tests/e2e.rs`;
+// `e2e_polled_globals_are_live` guards that each stays non-trivial).
 
 interface Window {
-  // ----- stats counters (set at startup, incremented in the datagram loop) -----
+  // ----- stats counters (set at startup, re-published from the core) -----
   /** Datagram counts re-published from the wasm core each loop iteration. */
   __ghostframeStats: { tileDatagrams: number; frameDatagrams: number } | undefined;
   /** rAF tick counter; incremented every requestAnimationFrame callback. */
