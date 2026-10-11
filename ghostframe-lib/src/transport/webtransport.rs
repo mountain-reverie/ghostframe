@@ -49,6 +49,9 @@ impl StreamBuf {
 /// most; without a cap a peer can feed an unterminated one without limit
 /// before any authorisation exists.
 pub(crate) const MAX_HELD_STREAM_BYTES: usize = 16 * 1024;
+/// Total bytes held across every undecoded stream of one connection. The
+/// per-stream cap alone lets a peer open many streams and park 16 KiB on each.
+pub(crate) const MAX_HELD_TOTAL_BYTES: usize = 64 * 1024;
 
 // ─── main struct ─────────────────────────────────────────────────────────────
 
@@ -270,10 +273,13 @@ impl WebTransportServer {
     /// Whatever the decoders could not consume is still held for `sid`.
     /// Bound it: past [`MAX_HELD_STREAM_BYTES`] the stream is abandoned.
     fn bound_held_stream(&mut self, sid: StreamId) {
-        if self
-            .stream_bufs
-            .get(&sid)
-            .is_some_and(|b| b.as_slice().len() > MAX_HELD_STREAM_BYTES)
+        let total: usize = self.stream_bufs.values().map(|b| b.as_slice().len()).sum();
+        if self.stream_bufs.contains_key(&sid)
+            && (self
+                .stream_bufs
+                .get(&sid)
+                .is_some_and(|b| b.as_slice().len() > MAX_HELD_STREAM_BYTES)
+                || total > MAX_HELD_TOTAL_BYTES)
         {
             tracing::warn!(
                 stream_id = ?sid,
@@ -549,6 +555,21 @@ mod tests {
         assert!(!wt.stream_bufs.contains_key(&s), "buffer must be dropped");
         assert!(wt.pending_bidi_streams.is_empty());
         assert!(wt.abandoned_streams.contains(&s));
+    }
+
+    #[test]
+    fn many_streams_each_under_the_per_stream_cap_hit_the_connection_budget() {
+        let mut wt = WebTransportServer::new();
+        let per = MAX_HELD_STREAM_BYTES; // each stream legal on its own
+        let n = MAX_HELD_TOTAL_BYTES / per + 1;
+        for i in 0..n {
+            let s = sid(4 * i as u64);
+            wt.stream_bufs.entry(s).or_default().extend(&vec![1; per]);
+            wt.bound_held_stream(s);
+        }
+        let held: usize = wt.stream_bufs.values().map(|b| b.as_slice().len()).sum();
+        assert!(held <= MAX_HELD_TOTAL_BYTES, "held {held}");
+        assert!(!wt.abandoned_streams.is_empty());
     }
 
     #[test]
