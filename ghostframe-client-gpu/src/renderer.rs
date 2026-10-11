@@ -22,6 +22,14 @@ use ghostframe_client_core::{DecodeErrorCode, Event, TileData};
 use ghostframe_protocol::protocol::Codec;
 use ghostframe_protocol::tile::TILE_SIZE;
 
+/// Whether `width x height` is a size this renderer will allocate for.
+/// The same bound `ClientCore` enforces; repeated here because the renderer
+/// is a public API and must not trust that every caller went through it.
+fn dimensions_valid(width: u32, height: u32) -> bool {
+    let range = 1..=ghostframe_client_core::MAX_FRAME_DIMENSION;
+    range.contains(&width) && range.contains(&height)
+}
+
 fn tile_grid(width: u32, height: u32) -> (u32, u32) {
     (width.div_ceil(TILE_SIZE), height.div_ceil(TILE_SIZE))
 }
@@ -145,6 +153,9 @@ impl Renderer {
     ) -> Result<Self, GpuError> {
         if export_buffers == 0 {
             return Err(GpuError::NoExportBuffers);
+        }
+        if !dimensions_valid(width, height) {
+            return Err(GpuError::InvalidDimensions { width, height });
         }
         let fb = Framebuffer::new(&ctx.device, width, height);
         let ring = ExportRing::new(
@@ -297,6 +308,13 @@ impl Renderer {
                 self.ring.mark_dirty(*tile_x as u32, *tile_y as u32);
             }
             Event::FrameDimensions { width, height } => {
+                // Ignore a size the renderer would not have been built with:
+                // keep the current framebuffer rather than allocate from a
+                // network-supplied number.
+                if !dimensions_valid(*width, *height) {
+                    tracing::warn!(width, height, "ignoring out-of-range FrameDimensions");
+                    return;
+                }
                 // Run any batched work against the OLD framebuffer size
                 // before resizing -- the pending tiles were addressed
                 // against it.
