@@ -106,7 +106,8 @@ impl ClientEndpoint {
             }
             Some(DatagramEvent::Response(transmit)) => {
                 let size = transmit.size;
-                self.outbound.extend(split_transmit(transmit, &self.scratch[..size]));
+                self.outbound
+                    .extend(split_transmit(transmit, &self.scratch[..size]));
             }
         }
     }
@@ -135,7 +136,8 @@ impl ClientEndpoint {
 
                 while let Some(transmit) = conn.poll_transmit(now, 10, &mut self.scratch) {
                     let size = transmit.size;
-                    self.outbound.extend(split_transmit(transmit, &self.scratch[..size]));
+                    self.outbound
+                        .extend(split_transmit(transmit, &self.scratch[..size]));
                     self.scratch.clear();
                 }
 
