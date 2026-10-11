@@ -70,6 +70,36 @@ pub struct QuicServer {
     /// never-HELLO deadline from this at accept time rather than on
     /// `Event::Connected`, so a half-open handshake is covered too.
     newly_accepted: Vec<ConnectionHandle>,
+    /// Initials refused because the connection table was full.
+    refused_connections: u64,
+}
+
+/// Connections the table holds before new Initials are refused outright.
+/// One client is live at a time (M4a); the slack covers a reconnect that
+/// overlaps its predecessor's drain, and an operator probing.
+pub(crate) const MAX_CONNECTIONS: usize = 16;
+/// Past this many connections, an Initial must prove its source address with
+/// a Retry round trip before a `Connection` is allocated for it. Below it the
+/// handshake stays one round trip faster.
+pub(crate) const RETRY_THRESHOLD: usize = 4;
+
+/// What to do with a first-flight Initial.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum Admission {
+    Accept,
+    Retry,
+    Refuse,
+}
+
+/// Admission decision for a new Initial given the current table size.
+pub(crate) fn admission(live: usize, validated: bool, may_retry: bool) -> Admission {
+    if live >= MAX_CONNECTIONS {
+        Admission::Refuse
+    } else if live >= RETRY_THRESHOLD && !validated && may_retry {
+        Admission::Retry
+    } else {
+        Admission::Accept
+    }
 }
 
 /// Bytes of un-ACKed datagrams quinn will hold before `send_datagram`
@@ -231,6 +261,7 @@ impl QuicServer {
             cert_info: CertInfo { sha256_hex },
             unknown_conn_events: 0,
             newly_accepted: Vec::new(),
+            refused_connections: 0,
         })
     }
 
@@ -264,6 +295,40 @@ impl QuicServer {
             None => None,
 
             Some(DatagramEvent::NewConnection(incoming)) => {
+                // Admission control. A spoofed-source Initial flood otherwise
+                // allocates a full `Connection` (TLS state, buffers) per
+                // packet, and a second ghostframe client is served by
+                // eviction, not by room for many.
+                match admission(
+                    self.connections.len(),
+                    incoming.remote_address_validated(),
+                    incoming.may_retry(),
+                ) {
+                    Admission::Refuse => {
+                        self.refused_connections = self.refused_connections.saturating_add(1);
+                        if self.refused_connections == 1
+                            || self.refused_connections.is_multiple_of(64)
+                        {
+                            tracing::warn!(
+                                %remote,
+                                live = self.connections.len(),
+                                total = self.refused_connections,
+                                "connection table full; refusing (rate-limited)"
+                            );
+                        }
+                        return Some(self.endpoint.refuse(incoming, buf));
+                    }
+                    Admission::Retry => match self.endpoint.retry(incoming, buf) {
+                        Ok(transmit) => return Some(transmit),
+                        // `may_retry` was checked by `admission`; nothing to
+                        // do but drop the packet.
+                        Err(e) => {
+                            self.endpoint.ignore(e.into_incoming());
+                            return None;
+                        }
+                    },
+                    Admission::Accept => {}
+                }
                 match self.endpoint.accept(incoming, now, buf, None) {
                     Ok((handle, conn)) => {
                         // INFO (not debug) so connection attempts are visible at
@@ -423,6 +488,42 @@ mod tests {
             .kx_groups
             .iter()
             .any(|g| g.name() == rustls::NamedGroup::X25519));
+    }
+
+    #[test]
+    fn admission_refuses_at_the_cap_whatever_the_source() {
+        for validated in [false, true] {
+            for may_retry in [false, true] {
+                assert_eq!(
+                    admission(MAX_CONNECTIONS, validated, may_retry),
+                    Admission::Refuse
+                );
+                assert_eq!(
+                    admission(MAX_CONNECTIONS + 1000, validated, may_retry),
+                    Admission::Refuse
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn admission_demands_address_validation_under_load_only() {
+        // Idle table: no extra round trip.
+        assert_eq!(admission(0, false, true), Admission::Accept);
+        assert_eq!(
+            admission(RETRY_THRESHOLD - 1, false, true),
+            Admission::Accept
+        );
+        // Loaded: an unvalidated source must Retry first.
+        assert_eq!(admission(RETRY_THRESHOLD, false, true), Admission::Retry);
+        assert_eq!(
+            admission(MAX_CONNECTIONS - 1, false, true),
+            Admission::Retry
+        );
+        // Already validated (it came back with a token): accepted.
+        assert_eq!(admission(RETRY_THRESHOLD, true, true), Admission::Accept);
+        // Cannot be retried (already retried once): accepted, not looped.
+        assert_eq!(admission(RETRY_THRESHOLD, false, false), Admission::Accept);
     }
 
     #[test]
