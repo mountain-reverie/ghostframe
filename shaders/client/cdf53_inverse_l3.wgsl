@@ -11,6 +11,9 @@
 @group(0) @binding(2) var<storage, read> tileGen: array<u32>;
 @group(0) @binding(3) var<storage, read_write> workArea: array<i32>;
 @group(0) @binding(4) var<storage, read> passesProcessed: array<u32>;
+// Dense list of the tiles to invert this flush (host-built, deduplicated);
+// workgroup N handles dirtyList[N]. Dispatch size == list length.
+@group(0) @binding(5) var<storage, read> dirtyList: array<u32>;
 
 fn unpack_i16(word: u32, lane: u32) -> i32 {
   // lane = 0 ⇒ low half, lane = 1 ⇒ high half. Sign-extend 16 → 32.
@@ -48,7 +51,7 @@ fn workarea_idx(tile_idx: u32, ch: u32, y: u32, x: u32) -> u32 {
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(workgroup_id) wg: vec3<u32>,
         @builtin(local_invocation_id) lid: vec3<u32>) {
-  let tile_idx = wg.x;
+  let tile_idx = dirtyList[wg.x];
   if (tileGen[tile_idx] == 0u) { return; }
 
   // Each invocation handles one (x, y) in the 8×8 LL3+detail area, for one of

@@ -14,6 +14,8 @@ struct Uniforms {
 @group(0) @binding(1) var<storage, read_write> workArea: array<i32>;
 @group(0) @binding(2) var framebuffer: texture_storage_2d<rgba8unorm, write>;
 @group(0) @binding(3) var<uniform> uniforms: Uniforms;
+// Dense host-built list of tiles to invert; workgroup N handles dirtyList[N].
+@group(0) @binding(4) var<storage, read> dirtyList: array<u32>;
 
 fn workarea_idx(tile_idx: u32, ch: u32, y: u32, x: u32) -> u32 {
   return tile_idx * 3072u + ch * 1024u + y * 32u + x;
@@ -22,7 +24,7 @@ fn workarea_idx(tile_idx: u32, ch: u32, y: u32, x: u32) -> u32 {
 @compute @workgroup_size(32, 1, 1)
 fn main(@builtin(workgroup_id) wg: vec3<u32>,
         @builtin(local_invocation_index) lid: u32) {
-  let tile_idx = wg.x;
+  let tile_idx = dirtyList[wg.x];
   if (tileGen[tile_idx] == 0u) { return; }
 
   // Inverse vertical pass — each invocation handles ONE column.
