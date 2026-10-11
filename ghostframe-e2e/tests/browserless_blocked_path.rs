@@ -238,8 +238,11 @@ async fn a_small_send_buffer_does_provoke_rejections() {
 /// can recover it, so under sustained rejection the delivered byte count
 /// falls far short of the same scene with a buffer that never rejects.
 ///
-/// Compares like with like: identical grid, identical link, identical seed;
-/// only the send-buffer size differs. A lossless rejection path would put
+/// Same grid, link and seed in both runs. The send-buffer size differs, and
+/// so does the per-tick budget floor: the small-buffer run is overdriven to
+/// make its rejections certain, so `ratio > 0.9` below is in effect an
+/// absolute "the squeezed run renders at least 90% of the grid" (the roomy
+/// run renders all of it), not a controlled comparison. A lossless rejection path would put
 /// the two within a modest factor -- the small-buffer run should be *paced*
 /// by the link, not *lossy*.
 #[tokio::test(start_paused = true)]
@@ -254,9 +257,9 @@ async fn work_rejected_by_a_full_send_buffer_still_reaches_the_client() {
     // Only the small-buffer run is overdriven. Whether the default pacing
     // rejects anything at all is not a property of the send buffer: it turned
     // out to hinge on how the sender's bandwidth estimate settles in the first
-    // second, which moves with the timing of quinn's MTU-discovery steps (and
-    // so with the handshake's byte count: swapping ring for the hybrid
-    // X25519MLKEM768 handshake took `send_errs` from 2-5 to 0). The premise
+    // second, which moved with the handshake shape under quinn's MTU discovery
+    // (swapping ring for the hybrid X25519MLKEM768 handshake took `send_errs` from 2-5 to 0; the mechanism
+    // is unexplained, quinn's cwnd/rtt capacity hint is the suspect). The premise
     // therefore has to be set explicitly, as
     // `a_small_send_buffer_does_provoke_rejections` does, rather than inherited
     // from an accident of the estimator. The roomy run keeps default pacing: it
