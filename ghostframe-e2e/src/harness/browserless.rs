@@ -210,6 +210,18 @@ pub struct BrowserlessResult {
     /// byte floor it had been clearing, with concurrency entirely unchanged.
     pub datagrams_delivered_s2c: u64,
     pub bytes_dropped: u64,
+    /// Server -> client datagrams the netsim ruled on, and how many of those
+    /// it dropped (count, not bytes; any cause: random/burst loss, cap,
+    /// bottleneck). `s2c_datagrams_dropped / s2c_datagrams_offered` is the
+    /// realised loss rate of the run.
+    pub s2c_datagrams_offered: u64,
+    pub s2c_datagrams_dropped: u64,
+    /// Number of maximal runs of consecutive s2c drops, and the longest one.
+    /// `s2c_datagrams_dropped / s2c_loss_runs` is the mean loss-run length
+    /// ([`BrowserlessResult::s2c_mean_loss_run`]). Runs are over the order
+    /// the netsim decided, which is the order the server transmitted.
+    pub s2c_loss_runs: u64,
+    pub s2c_loss_run_max: u64,
     /// Read from `FrameBuffer::stale_frame_tiles()` — a scene run only
     /// ever ingests via `FrameBuffer::apply_tile_ready` (real decoded
     /// `TileReady` events), never `FrameBuffer::apply`, so the `frame_seq`
@@ -349,6 +361,88 @@ pub struct BrowserlessResult {
     pub drops_fired: Vec<u32>,
 }
 
+impl BrowserlessResult {
+    /// Mean length of an s2c loss run; 0.0 when nothing was dropped.
+    pub fn s2c_mean_loss_run(&self) -> f64 {
+        if self.s2c_loss_runs == 0 {
+            0.0
+        } else {
+            self.s2c_datagrams_dropped as f64 / self.s2c_loss_runs as f64
+        }
+    }
+}
+
+/// Running tally of server -> client netsim verdicts.
+#[derive(Default)]
+struct S2cLoss {
+    offered: u64,
+    dropped: u64,
+    runs: u64,
+    run_max: u64,
+    cur_run: u64,
+}
+
+impl S2cLoss {
+    fn record(&mut self, dropped: bool) {
+        self.offered += 1;
+        if dropped {
+            self.dropped += 1;
+            if self.cur_run == 0 {
+                self.runs += 1;
+            }
+            self.cur_run += 1;
+            self.run_max = self.run_max.max(self.cur_run);
+        } else {
+            self.cur_run = 0;
+        }
+    }
+}
+
+/// Per-direction link overrides for [`run_browserless_with_links`].
+///
+/// `BrowserlessScene::net` applies the same profile to both directions. A
+/// burst-loss scene wants loss on one direction only, so this replaces a
+/// direction's profile (and XORs `*_seed_salt` into its `NetSim` seed).
+/// `None` keeps `scene.net`. Not a `BrowserlessScene` field so existing
+/// struct-literal scenes are untouched.
+#[derive(Clone, Default)]
+pub struct LinkOverrides {
+    pub c2s: Option<NetProfile>,
+    pub s2c: Option<NetProfile>,
+    pub c2s_seed_salt: u64,
+    pub s2c_seed_salt: u64,
+}
+
+impl LinkOverrides {
+    /// Burst-loss models from the `GHOSTFRAME_<DIR>_BURST_*` environment
+    /// variables (see `netsim::burst`), layered over `scene_net`. OUTBOUND is
+    /// server -> client, INBOUND client -> server. Empty when no burst
+    /// variable is set. Panics on malformed values: a typo must not silently
+    /// run a clean link.
+    pub fn from_burst_env(scene_net: &NetProfile) -> Self {
+        let mut o = Self::default();
+        for (dir, is_s2c) in [
+            (crate::netsim::BurstDirection::Outbound, true),
+            (crate::netsim::BurstDirection::Inbound, false),
+        ] {
+            let cfg = crate::netsim::BurstConfig::from_env(dir)
+                .unwrap_or_else(|e| panic!("bad burst-loss environment: {e}"));
+            if let Some(cfg) = cfg {
+                let mut p = scene_net.clone();
+                cfg.model.apply_to(&mut p);
+                if is_s2c {
+                    o.s2c = Some(p);
+                    o.s2c_seed_salt = cfg.seed;
+                } else {
+                    o.c2s = Some(p);
+                    o.c2s_seed_salt = cfg.seed;
+                }
+            }
+        }
+        o
+    }
+}
+
 /// The address the harness uses to identify the client, baked into every
 /// ghostbridge frame carrying client->server traffic. `IoBridge` echoes
 /// this straight back as the destination of server->client traffic, so it
@@ -372,12 +466,28 @@ fn server_addr() -> SocketAddr {
 /// iteration cap — this never blocks forever. Every failure path names
 /// `scene.seed`, since the seed is what makes a netsim failure
 /// reproducible.
+///
+/// Honours the `GHOSTFRAME_{OUTBOUND,INBOUND}_BURST_*` variables (off unless
+/// set); see [`LinkOverrides::from_burst_env`].
 pub async fn run_browserless(scene: BrowserlessScene) -> anyhow::Result<BrowserlessResult> {
-    let local = LocalSet::new();
-    local.run_until(run_inner(scene)).await
+    let links = LinkOverrides::from_burst_env(&scene.net);
+    run_browserless_with_links(scene, links).await
 }
 
-async fn run_inner(mut scene: BrowserlessScene) -> anyhow::Result<BrowserlessResult> {
+/// [`run_browserless`] with explicit per-direction link overrides and no
+/// environment lookup (scenes run in-process, so the env is process-global).
+pub async fn run_browserless_with_links(
+    scene: BrowserlessScene,
+    links: LinkOverrides,
+) -> anyhow::Result<BrowserlessResult> {
+    let local = LocalSet::new();
+    local.run_until(run_inner(scene, links)).await
+}
+
+async fn run_inner(
+    mut scene: BrowserlessScene,
+    links: LinkOverrides,
+) -> anyhow::Result<BrowserlessResult> {
     let seed = scene.seed;
 
     let (ours, peer) = tokio::net::UnixStream::pair()
@@ -474,6 +584,7 @@ async fn run_inner(mut scene: BrowserlessScene) -> anyhow::Result<BrowserlessRes
     };
 
     let mut framebuffer = FrameBuffer::new();
+    let mut s2c_loss = S2cLoss::default();
     let mut bwe_estimate_samples: Vec<(u64, u64)> = Vec::new();
     let outcome = drive_session(
         cfg,
@@ -487,6 +598,8 @@ async fn run_inner(mut scene: BrowserlessScene) -> anyhow::Result<BrowserlessRes
         &bwe_cell,
         &mut bwe_estimate_samples,
         &server_live_rx,
+        &links,
+        &mut s2c_loss,
     )
     .await;
 
@@ -537,6 +650,10 @@ async fn run_inner(mut scene: BrowserlessScene) -> anyhow::Result<BrowserlessRes
         bytes_delivered_c2s,
         datagrams_delivered_s2c,
         bytes_dropped,
+        s2c_datagrams_offered: s2c_loss.offered,
+        s2c_datagrams_dropped: s2c_loss.dropped,
+        s2c_loss_runs: s2c_loss.runs,
+        s2c_loss_run_max: s2c_loss.run_max,
         stale_generation_tiles,
         seed,
         bwe_estimate_bps: bwe_snapshot.bitrate_bps,
@@ -600,6 +717,8 @@ async fn drive_session(
     bwe_cell: &std::sync::Arc<std::sync::Mutex<ghostframe_lib::transport::bwe::BweSnapshot>>,
     bwe_samples: &mut Vec<(u64, u64)>,
     server_live_rx: &tokio::sync::watch::Receiver<usize>,
+    links: &LinkOverrides,
+    s2c_loss: &mut S2cLoss,
 ) -> anyhow::Result<(Vec<ClientNetEvent>, u64, u64, u64, u64, u64)> {
     let seed = scene.seed;
 
@@ -619,8 +738,14 @@ async fn drive_session(
     // Independent RNG streams per direction (see module docs on netsim.rs
     // for why the seeds must differ): scene.seed for client->server,
     // scene.seed XORed against a fixed constant for server->client.
-    let mut net_c2s = NetSim::new(scene.net.clone(), seed);
-    let mut net_s2c = NetSim::new(scene.net.clone(), seed ^ 0xA5A5_A5A5_A5A5_A5A5);
+    let mut net_c2s = NetSim::new(
+        links.c2s.clone().unwrap_or_else(|| scene.net.clone()),
+        seed ^ links.c2s_seed_salt,
+    );
+    let mut net_s2c = NetSim::new(
+        links.s2c.clone().unwrap_or_else(|| scene.net.clone()),
+        seed ^ 0xA5A5_A5A5_A5A5_A5A5 ^ links.s2c_seed_salt,
+    );
 
     // Datagrams `NetSim` has already ruled on whose propagation delay has
     // not yet elapsed. Delivery happens from the scene loop below, never
@@ -1025,8 +1150,10 @@ async fn drive_session(
                      (last events observed: {events:?}): {e}"
                 ))?;
                 let t = now_us(base);
-                for item in rule(&mut net_s2c, Direction::S2c, pkt.payload, t, &mut bytes_dropped)
-                {
+                let items = rule(&mut net_s2c, Direction::S2c, pkt.payload, t, &mut bytes_dropped);
+                // `rule` returns nothing exactly for `Verdict::Drop`.
+                s2c_loss.record(items.is_empty());
+                for item in items {
                     if item.at_us <= t {
                         // Its own arrival instant, for the same reason as
                         // in `flush_due`. Equal to `t` at zero delay, earlier
