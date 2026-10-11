@@ -146,10 +146,16 @@ fn handle_core_event(
     if matches!(ev, CoreEvent::FrameDimensions { .. }) {
         withdraw_unacquired(published, renderer);
     }
-    renderer
+    if let Err(e) = renderer
         .as_mut()
         .expect("renderer.is_none() handled above")
-        .apply_event(ctx, ev);
+        .apply_event(ctx, ev)
+    {
+        queue.push(ClientEvent::Error {
+            message: format!("renderer failed applying event: {e}"),
+        });
+        return false;
+    }
     true
 }
 
@@ -263,6 +269,8 @@ struct EventTally {
     frame_dimensions: u64,
     needs_h264: u64,
     decode_error: u64,
+    /// Tiles the GPU rejected after decode (see `Renderer::take_decode_errors`).
+    gpu_decode_errors: u64,
     palette_updated: u64,
     other: u64,
     publishes: u64,
@@ -318,6 +326,7 @@ impl EventTally {
             frame_dimensions = self.frame_dimensions,
             needs_h264 = self.needs_h264,
             decode_error = self.decode_error,
+            gpu_decode_errors = self.gpu_decode_errors,
             palette_updated = self.palette_updated,
             other = self.other,
             publishes = self.publishes,
@@ -483,9 +492,29 @@ pub(crate) fn run(
             // buffer is free for this very publish.
             withdraw_unacquired(&published, &mut renderer);
             if let Some(r) = renderer.as_mut() {
-                r.flush(&ctx);
-                let published_frame = r.publish(&ctx);
-                if published_frame.is_none() {
+                let flushed = r.flush(&ctx);
+                if let Err(e) = &flushed {
+                    // E.g. device loss while waiting on the GPU. Report it
+                    // and skip this publish rather than panic the thread.
+                    queue.push(ClientEvent::Error {
+                        message: format!("renderer flush failed: {e}"),
+                    });
+                }
+                // GPU-detected decode failures. They belong on the feedback
+                // stream as DECODE_ERROR, but `ClientCore` owns the
+                // rate-limited batcher and the net thread owns `ClientCore`;
+                // there is no render-to-net command for this yet, so they
+                // are logged and counted.
+                for err in r.take_decode_errors() {
+                    tally.gpu_decode_errors += 1;
+                    tracing::warn!(?err, "GPU tile decode error (not yet sent to server)");
+                }
+                let published_frame = if flushed.is_ok() {
+                    r.publish(&ctx)
+                } else {
+                    None
+                };
+                if flushed.is_ok() && published_frame.is_none() {
                     tally.publish_starved += 1;
                 }
                 if let Some(pf) = published_frame {
