@@ -92,6 +92,9 @@ export class Cdf53Pipeline {
   // Per-batch scratch.
   dirtyTilesBuffer!: GPUBuffer;
   dirtyTilesCount!: GPUBuffer;
+  // Identity tile list (slot i -> tile i) bound as the inverse stages'
+  // `dirtyList`. The web client still dispatches the full grid.
+  inverseTileList!: GPUBuffer;
   // Per-batch upload targets (sized to maxTiles × 14 worst case).
   tileWorkBuffer!: GPUBuffer;
   bitPlanesBuffer!: GPUBuffer;
@@ -252,6 +255,7 @@ export class Cdf53Pipeline {
     if (this.passesProcessedBuffer) this.passesProcessedBuffer.destroy();
     if (this.dirtyTilesBuffer) this.dirtyTilesBuffer.destroy();
     if (this.dirtyTilesCount) this.dirtyTilesCount.destroy();
+    if (this.inverseTileList) this.inverseTileList.destroy();
     if (this.tileWorkBuffer) this.tileWorkBuffer.destroy();
     if (this.bitPlanesBuffer) this.bitPlanesBuffer.destroy();
     if (this.workAreaBuffer) this.workAreaBuffer.destroy();
@@ -279,6 +283,15 @@ export class Cdf53Pipeline {
       size: Math.max(maxTiles, 1) * 4,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
     });
+    this.inverseTileList = this.device.createBuffer({
+      size: Math.max(maxTiles, 1) * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    this.device.queue.writeBuffer(
+      this.inverseTileList,
+      0,
+      Uint32Array.from({ length: Math.max(maxTiles, 1) }, (_, i) => i),
+    );
     this.dirtyTilesCount = this.device.createBuffer({
       size: 16, // 4 u32: count, 3 padding (also reused as indirect-dispatch args buffer in later task)
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC | GPUBufferUsage.INDIRECT,
@@ -320,6 +333,7 @@ export class Cdf53Pipeline {
         { binding: 2, resource: { buffer: this.tileGenBuffer } },  // was dirtyTilesBuffer
         { binding: 3, resource: { buffer: this.workAreaBuffer } },
         { binding: 4, resource: { buffer: this.passesProcessedBuffer } },
+        { binding: 5, resource: { buffer: this.inverseTileList } },
       ],
     });
     this.inverseL2BindGroup = this.device.createBindGroup({
@@ -330,6 +344,7 @@ export class Cdf53Pipeline {
         { binding: 2, resource: { buffer: this.tileGenBuffer } },  // was dirtyTilesBuffer
         { binding: 3, resource: { buffer: this.workAreaBuffer } },
         { binding: 4, resource: { buffer: this.passesProcessedBuffer } },
+        { binding: 5, resource: { buffer: this.inverseTileList } },
       ],
     });
     this.inverseL1BindGroup = this.device.createBindGroup({
@@ -340,6 +355,7 @@ export class Cdf53Pipeline {
         { binding: 2, resource: { buffer: this.tileGenBuffer } },  // was dirtyTilesBuffer
         { binding: 3, resource: { buffer: this.workAreaBuffer } },
         { binding: 4, resource: { buffer: this.passesProcessedBuffer } },
+        { binding: 5, resource: { buffer: this.inverseTileList } },
       ],
     });
     this.inverseL1Pass2BindGroup = this.device.createBindGroup({
@@ -349,6 +365,7 @@ export class Cdf53Pipeline {
         { binding: 1, resource: { buffer: this.workAreaBuffer } },
         { binding: 2, resource: framebufferView },
         { binding: 3, resource: { buffer: this.uniformsBuffer } },
+        { binding: 4, resource: { buffer: this.inverseTileList } },
       ],
     });
     this.maxTiles = maxTiles;
