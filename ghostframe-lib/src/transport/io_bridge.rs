@@ -3798,9 +3798,11 @@ impl IoBridge {
                     }
                     if let Some((msg, consumed)) = decode_input_msg(&buf[offset..]) {
                         let injected = self.input_injector.is_some();
-                        // Not `?msg`: at the default `ghostframe=debug` filter that
-                        // writes every keystroke the user types into the journal.
-                        tracing::trace!(injected, "input event dispatched");
+                        // `trace`, not `debug`: `?msg` carries the key codes, and at
+                        // the default `ghostframe=debug` filter a debug line would
+                        // write every keystroke into the journal. The input e2e
+                        // reads this line from a trace-level container log.
+                        tracing::trace!(?msg, injected, "input event dispatched");
                         if let Some(injector) = self.input_injector.as_ref() {
                             apply_input(injector.as_ref(), &msg);
                         }
