@@ -153,6 +153,17 @@ describe('Cdf53Pipeline dirty-tile inverse', () => {
     expect(e.passes[0].groups).toBe(1);
   });
 
+  it('a second encodeInverse without a new batch lifts nothing', () => {
+    // Otherwise every later present tick would re-lift the previous list over
+    // tiles since overwritten by Solid/PalRle/Raw/H.264.
+    const { pipe, enc } = setup();
+    pipe.uploadBatch([entry(0, 0, 1, 0)]);
+    pipe.encodeInverse(enc());
+    const e = enc();
+    pipe.encodeInverse(e);
+    expect(e.passes).toHaveLength(0);
+  });
+
   it('encodeInverseAll still lifts every tile (debug hooks write state directly)', () => {
     const { pipe, enc } = setup();
     const e = enc();
@@ -189,7 +200,7 @@ describe('Cdf53Pipeline dirty-tile inverse', () => {
 
   it('clears per-tile state when the grid width changes at the same tile count', () => {
     const { pipe, enc } = setup();
-    pipe.uploadBatch([entry(1, 1, 3, 0)]);
+    pipe.uploadBatch([entry(0, 0, 3, 0)]);
     pipe.encodeInverse(enc());
     // 4x3 -> 3x4: same MAX_TILES, different cols.
     pipe.resize(MAX_TILES, {} as GPUTextureView, ROWS);
@@ -197,7 +208,7 @@ describe('Cdf53Pipeline dirty-tile inverse', () => {
     // generation (state cleared), i.e. it triggers the gen-bump clear writes.
     const device2 = (pipe as unknown as { device: { queue: FakeQueue } }).device;
     const before = device2.queue.writes.length;
-    pipe.uploadBatch([entry(1, 1, 3, 0)]);
+    pipe.uploadBatch([entry(0, 0, 3, 0)]);
     const coefClears = device2.queue.writes.slice(before).filter((w) => w.words.length === 6144 / 4);
     expect(coefClears.length).toBeGreaterThanOrEqual(1);
   });

@@ -17,8 +17,8 @@ function scene(): Uint8Array[] {
   const raw = protocol().codec.Raw;
   for (let t = 0; t < 5; t++) {
     const payload = new Uint8Array(64).map((_, i) => (i * 7 + t * 13) & 0xff);
-    // Small fragments so each tile needs several datagrams, interleaved
-    // across tiles to exercise reassembly across the batch.
+    // Small fragments so each tile needs several datagrams, in
+    // sequence across the batch.
     out.push(...fragmentTile(1 + t, t, 2, raw, 1, 0, payload, 24));
   }
   // Interleave: round-robin over the per-tile fragment lists is enough to

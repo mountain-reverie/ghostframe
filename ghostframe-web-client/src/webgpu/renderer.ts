@@ -310,10 +310,17 @@ export class WebGpuRenderer {
     this.palrlePipeline.encodeDispatch(encoder, palRleCount);
 
     // ---- Step 7.5: upload Cdf53 batch + integrate + inverse ----
-    const cdf53Count = this.cdf53Pipeline.uploadBatch(this.cdf53Queue);
-    this.cdf53Pipeline.encodeIntegrate(encoder, cdf53Count);
-    this.cdf53Pipeline.encodeInverse(encoder);
-    this.cdf53Queue.length = 0;
+    // The queue is cleared even if uploadBatch throws (capacity overflow after
+    // a long hidden-tab period): otherwise it keeps growing and every later
+    // tick throws again.
+    let cdf53Count = 0;
+    try {
+      cdf53Count = this.cdf53Pipeline.uploadBatch(this.cdf53Queue);
+      this.cdf53Pipeline.encodeIntegrate(encoder, cdf53Count);
+      this.cdf53Pipeline.encodeInverse(encoder);
+    } finally {
+      this.cdf53Queue.length = 0;
+    }
 
     // ---- Step 8: Solid + H264 render pass on framebuffer ----
     // Drop queued H.264 frames if the browser doesn't support the

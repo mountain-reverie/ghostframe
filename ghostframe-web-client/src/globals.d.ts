@@ -66,6 +66,7 @@ interface Window {
     height: number;
     differingPixels: number;
     nonBlankPixels: number;
+    cdf53Entries: number;
   }>;
   __cdf53TestInverse?: (coeffsI16: number[], tileIdx?: number) => Promise<number[]>;
   __cdf53TestIntegrate?: (
