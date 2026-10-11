@@ -129,7 +129,7 @@ fn a_decoded_frame_lands_in_the_framebuffer() {
     let mut renderer = Renderer::new(&ctx, 640, 480, 3, &[], true, false).expect("renderer");
     renderer.apply_event(
         &ctx,
-        &Event::FrameDimensions {
+        Event::FrameDimensions {
             width: 640,
             height: 480,
         },
@@ -139,7 +139,7 @@ fn a_decoded_frame_lands_in_the_framebuffer() {
     for (i, au) in clip.iter().enumerate() {
         renderer.apply_event(
             &ctx,
-            &Event::NeedsH264 {
+            Event::NeedsH264 {
                 frame_seq: i as u32,
                 timestamp_us: i as u32 * 16_667,
                 is_keyframe: i == 0,
@@ -219,7 +219,7 @@ fn run_decode_and_publish_timing(paced: bool) {
     let mut renderer = Renderer::new(&ctx, WIDTH, HEIGHT, 3, &[], false, false).expect("renderer");
     renderer.apply_event(
         &ctx,
-        &Event::FrameDimensions {
+        Event::FrameDimensions {
             width: WIDTH,
             height: HEIGHT,
         },
@@ -240,7 +240,7 @@ fn run_decode_and_publish_timing(paced: bool) {
         }
         renderer.apply_event(
             &ctx,
-            &Event::NeedsH264 {
+            Event::NeedsH264 {
                 frame_seq: i as u32,
                 timestamp_us: i as u32 * 16_667,
                 is_keyframe: i == 0,
@@ -539,7 +539,7 @@ fn drive_clip(renderer: &mut Renderer, ctx: &WgpuContext, clip: &[Vec<u8>], star
     for (i, au) in clip.iter().enumerate() {
         renderer.apply_event(
             ctx,
-            &Event::NeedsH264 {
+            Event::NeedsH264 {
                 frame_seq: seq,
                 timestamp_us: seq.wrapping_mul(16_667),
                 is_keyframe: i == 0,
@@ -615,7 +615,7 @@ fn h264_mode_reentry_timing() {
     let mut renderer = Renderer::new(&ctx, WIDTH, HEIGHT, 3, &[], false, false).expect("renderer");
     renderer.apply_event(
         &ctx,
-        &Event::FrameDimensions {
+        Event::FrameDimensions {
             width: WIDTH,
             height: HEIGHT,
         },
@@ -750,7 +750,7 @@ fn h264_resolution_change_timing() {
     let mut renderer = Renderer::new(&ctx, W1, H1, 3, &[], false, false).expect("renderer");
     renderer.apply_event(
         &ctx,
-        &Event::FrameDimensions {
+        Event::FrameDimensions {
             width: W1,
             height: H1,
         },
@@ -764,7 +764,7 @@ fn h264_resolution_change_timing() {
     // dimensions change is announced before pixels at the new size arrive).
     renderer.apply_event(
         &ctx,
-        &Event::FrameDimensions {
+        Event::FrameDimensions {
             width: W2,
             height: H2,
         },
@@ -776,7 +776,7 @@ fn h264_resolution_change_timing() {
     // Resolution change 2: back to 1920x1080.
     renderer.apply_event(
         &ctx,
-        &Event::FrameDimensions {
+        Event::FrameDimensions {
             width: W1,
             height: H1,
         },
@@ -889,7 +889,7 @@ fn run_eager_open_scenario(open_h264_eagerly: bool) -> Option<EagerOpenScenario>
         Renderer::new(&ctx, WIDTH, HEIGHT, 3, &[], false, open_h264_eagerly).expect("renderer");
     renderer.apply_event(
         &ctx,
-        &Event::FrameDimensions {
+        Event::FrameDimensions {
             width: WIDTH,
             height: HEIGHT,
         },

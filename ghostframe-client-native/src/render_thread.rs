@@ -149,7 +149,7 @@ fn handle_core_event(
     renderer
         .as_mut()
         .expect("renderer.is_none() handled above")
-        .apply_event(ctx, &ev);
+        .apply_event(ctx, ev);
     true
 }
 
