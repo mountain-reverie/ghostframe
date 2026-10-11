@@ -23,10 +23,12 @@
 //! counters, and when a byte-count assertion is unavoidable give it
 //! order-of-magnitude margins rather than tight bounds.
 
+pub mod burst;
 pub mod profile;
 pub mod pump;
 pub mod rng;
 
+pub use burst::{BurstConfig, BurstDirection, GilbertElliott};
 /// `DropPlan`/`DropRule` now live in `ghostframe_lib::transport::drop_plan`:
 /// see that module's doc comment for why. Re-exported here so existing
 /// `ghostframe_e2e::netsim::{DropPlan, DropRule}` callers (scenes and tests)
