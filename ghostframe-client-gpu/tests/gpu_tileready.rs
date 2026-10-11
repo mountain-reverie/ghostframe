@@ -59,9 +59,9 @@ fn coalesced_and_isolated_tiles_land_at_their_own_coordinates() {
     let red = [0xFF, 0x00, 0x00, 0xFF];
     let green = [0x00, 0xFF, 0x00, 0xFF];
     let blue = [0x00, 0x00, 0xFF, 0xFF];
-    r.apply_event(&ctx, &tile_ready(1, 1, solid_tile(red)));
-    r.apply_event(&ctx, &tile_ready(2, 1, solid_tile(green)));
-    r.apply_event(&ctx, &tile_ready(10, 7, solid_tile(blue)));
+    r.apply_event(&ctx, tile_ready(1, 1, solid_tile(red)));
+    r.apply_event(&ctx, tile_ready(2, 1, solid_tile(green)));
+    r.apply_event(&ctx, tile_ready(10, 7, solid_tile(blue)));
     r.flush(&ctx);
 
     let fb = r.debug_read_framebuffer(&ctx);
@@ -100,8 +100,8 @@ fn every_pixel_of_a_coalesced_rectangle_comes_from_its_own_tile() {
 
     let a = [0x11, 0x22, 0x33, 0xFF];
     let b = [0x44, 0x55, 0x66, 0xFF];
-    r.apply_event(&ctx, &tile_ready(3, 4, solid_tile(a)));
-    r.apply_event(&ctx, &tile_ready(4, 4, solid_tile(b)));
+    r.apply_event(&ctx, tile_ready(3, 4, solid_tile(a)));
+    r.apply_event(&ctx, tile_ready(4, 4, solid_tile(b)));
     r.flush(&ctx);
     let fb = r.debug_read_framebuffer(&ctx);
 
@@ -134,7 +134,7 @@ fn edge_tiles_are_clamped_not_dropped() {
     let last_col = (W / TILE_SIZE - 1) as u8;
     let last_row = (H.div_ceil(TILE_SIZE) - 1) as u8;
     let colour = [0x9A, 0xBC, 0xDE, 0xFF];
-    r.apply_event(&ctx, &tile_ready(last_col, last_row, solid_tile(colour)));
+    r.apply_event(&ctx, tile_ready(last_col, last_row, solid_tile(colour)));
     r.flush(&ctx);
 
     let fb = r.debug_read_framebuffer(&ctx);
@@ -151,7 +151,7 @@ fn a_short_payload_writes_only_the_rows_it_has() {
     let mut r = renderer(&ctx);
 
     let base = [0x20, 0x40, 0x60, 0xFF];
-    r.apply_event(&ctx, &tile_ready(6, 6, solid_tile(base)));
+    r.apply_event(&ctx, tile_ready(6, 6, solid_tile(base)));
     r.flush(&ctx);
 
     let half = [0xAA, 0xBB, 0xCC, 0xFF];
@@ -162,7 +162,7 @@ fn a_short_payload_writes_only_the_rows_it_has() {
         .cycle()
         .take(rows * (TILE_SIZE * 4) as usize)
         .collect();
-    r.apply_event(&ctx, &tile_ready(6, 6, short));
+    r.apply_event(&ctx, tile_ready(6, 6, short));
     r.flush(&ctx);
 
     let fb = r.debug_read_framebuffer(&ctx);
@@ -196,14 +196,14 @@ fn hostile_dimensions_are_refused_without_allocating() {
     for (w, h) in [(100_000, 100_000), (0, 0), (u32::MAX, 1)] {
         r.apply_event(
             &ctx,
-            &Event::FrameDimensions {
+            Event::FrameDimensions {
                 width: w,
                 height: h,
             },
         );
     }
     let red = [0xFF, 0x00, 0x00, 0xFF];
-    r.apply_event(&ctx, &tile_ready(1, 1, solid_tile(red)));
+    r.apply_event(&ctx, tile_ready(1, 1, solid_tile(red)));
     r.flush(&ctx);
     let fb = r.debug_read_framebuffer(&ctx);
     assert_eq!(fb.len(), (W * H * 4) as usize, "framebuffer was resized");

@@ -239,7 +239,7 @@ impl Renderer {
     /// Every `Event` variant is matched explicitly -- see this crate's
     /// module doc on `clippy::wildcard_enum_match_arm` for why a `_ =>` arm
     /// is refused here.
-    pub fn apply_event(&mut self, ctx: &WgpuContext, ev: &Event) {
+    pub fn apply_event(&mut self, ctx: &WgpuContext, ev: Event) {
         match ev {
             Event::TileReady {
                 tile_x,
@@ -257,8 +257,8 @@ impl Renderer {
                 // regardless of size -- almost entirely CPU-side call overhead
                 // -- so a full 1920x1080 repaint spent 363ms just issuing 2040
                 // of them. See `upload_pending_rgba`.
-                self.pending_rgba.push((*tile_x, *tile_y, rgba.clone()));
-                self.ring.mark_dirty(*tile_x as u32, *tile_y as u32);
+                self.pending_rgba.push((tile_x, tile_y, rgba));
+                self.ring.mark_dirty(tile_x as u32, tile_y as u32);
             }
             Event::TilePayload {
                 tile_x,
@@ -269,10 +269,10 @@ impl Renderer {
             } => {
                 match data {
                     TileData::Raw(bgra) => {
-                        raw::upload_raw_tile(&ctx.queue, &self.fb, *tile_x, *tile_y, bgra);
+                        raw::upload_raw_tile(&ctx.queue, &self.fb, tile_x, tile_y, &bgra);
                     }
                     TileData::Solid(bgra) => {
-                        self.pending_solid.push((*tile_x, *tile_y, *bgra));
+                        self.pending_solid.push((tile_x, tile_y, bgra));
                     }
                     TileData::PalRle {
                         palette_id,
@@ -283,11 +283,11 @@ impl Renderer {
                         wire_flags: _,
                     } => {
                         self.pending_palrle.push((
-                            *tile_x,
-                            *tile_y,
-                            *palette_id,
-                            *count,
-                            indices.clone(),
+                            tile_x,
+                            tile_y,
+                            palette_id,
+                            count,
+                            indices,
                         ));
                     }
                     TileData::Cdf53 {
@@ -296,22 +296,22 @@ impl Renderer {
                         present_passes,
                     } => {
                         self.pending_cdf53.push((
-                            *tile_x,
-                            *tile_y,
-                            *generation,
-                            *pass_idx,
-                            bit_planes.clone(),
-                            *present_passes,
+                            tile_x,
+                            tile_y,
+                            generation,
+                            pass_idx,
+                            bit_planes,
+                            present_passes,
                         ));
                     }
                 }
-                self.ring.mark_dirty(*tile_x as u32, *tile_y as u32);
+                self.ring.mark_dirty(tile_x as u32, tile_y as u32);
             }
             Event::FrameDimensions { width, height } => {
                 // Ignore a size the renderer would not have been built with:
                 // keep the current framebuffer rather than allocate from a
                 // network-supplied number.
-                if !dimensions_valid(*width, *height) {
+                if !dimensions_valid(width, height) {
                     tracing::warn!(width, height, "ignoring out-of-range FrameDimensions");
                     return;
                 }
@@ -320,13 +320,13 @@ impl Renderer {
                 // against it.
                 self.flush(ctx);
 
-                self.fb.resize(&ctx.device, &ctx.queue, *width, *height);
-                if let Err(e) = self.ring.resize(ctx, *width, *height) {
+                self.fb.resize(&ctx.device, &ctx.queue, width, height);
+                if let Err(e) = self.ring.resize(ctx, width, height) {
                     tracing::error!(error = %e, width, height, "export ring resize failed");
                 }
                 self.solid
-                    .set_canvas_size(&ctx.device, &ctx.queue, *width, *height);
-                let (cols, rows) = tile_grid(*width, *height);
+                    .set_canvas_size(&ctx.device, &ctx.queue, width, height);
+                let (cols, rows) = tile_grid(width, height);
                 self.cdf53.resize(&ctx.device, &ctx.queue, cols, rows);
             }
             Event::NeedsH264 {
@@ -335,7 +335,7 @@ impl Renderer {
                 is_keyframe,
                 ..
             } => {
-                self.decode_h264(ctx, *frame_seq, *is_keyframe, payload);
+                self.decode_h264(ctx, frame_seq, is_keyframe, &payload);
             }
             Event::DecodeError {
                 codec,
@@ -348,7 +348,7 @@ impl Renderer {
                 // separate telemetry sink of its own for M1, so this is a
                 // deliberate no-op rather than a silent drop -- logged so a
                 // real decode failure is still visible locally.
-                log_decode_error(*codec, *tile_x, *tile_y, *code);
+                log_decode_error(codec, tile_x, tile_y, code);
             }
             Event::PaletteUpdated { palette_id, colors } => {
                 // `colors` reports only `count` entries (see the type doc
@@ -360,7 +360,7 @@ impl Renderer {
                 for (slot, c) in full.iter_mut().zip(colors.iter()) {
                     *slot = *c;
                 }
-                self.palrle.upload_palette(&ctx.queue, *palette_id, &full);
+                self.palrle.upload_palette(&ctx.queue, palette_id, &full);
             }
             Event::Evicted { .. } => {
                 // Terminal: the session is going away and the net thread

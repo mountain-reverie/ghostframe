@@ -61,7 +61,7 @@ fn gpu_decode_matches_cpu_decode_for_solid_palrle_and_cdf53() {
     let ctx = WgpuContext::new().expect("wgpu context");
     let mut renderer = Renderer::new(&ctx, 64, 64, 3, &[], false, false).expect("renderer");
     for ev in drain(&capture, TileDelivery::Payload) {
-        renderer.apply_event(&ctx, &ev);
+        renderer.apply_event(&ctx, ev);
     }
     renderer.flush(&ctx);
     let fb = renderer.debug_read_framebuffer(&ctx);
