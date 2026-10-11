@@ -33,9 +33,11 @@ pub(crate) struct ClientEndpoint {
 }
 
 impl ClientEndpoint {
-    /// `rng_seed` pins quinn-proto's endpoint RNG, which feeds connection IDs,
-    /// stateless-reset keys and, through the connection, the application-space
-    /// packet number that gets skipped. `None` keeps it entropy-seeded.
+    /// `rng_seed` pins quinn-proto's endpoint RNG, which seeds each
+    /// connection's RNG (and so the application-space packet number it skips,
+    /// path challenges, key-phase size) and the transport-parameter grease.
+    /// Connection IDs and the reset key use quinn's own thread RNG and stay
+    /// random. `None` keeps it entropy-seeded.
     pub(crate) fn new(rng_seed: Option<[u8; 32]>) -> Self {
         // Client endpoints never accept incoming connections, so there is no
         // `ServerConfig`.
