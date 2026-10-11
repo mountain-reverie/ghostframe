@@ -9,6 +9,7 @@
 
 pub mod browser;
 pub mod browserless;
+pub mod cc_probe;
 pub mod cleanup;
 pub mod containers;
 pub mod e2e_certs;
@@ -19,6 +20,7 @@ pub mod load_profile;
 pub mod net_shape;
 pub mod pixels;
 pub mod scene;
+pub mod scroll_scene;
 pub mod scene_tiles;
 pub mod transport;
 pub mod weston;
