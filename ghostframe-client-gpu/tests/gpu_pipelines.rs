@@ -280,7 +280,7 @@ fn palrle_reports_an_out_of_range_index() {
         .poll(wgpu::PollType::wait_indefinitely())
         .expect("poll");
 
-    let errors = pipe.take_errors(&ctx.device, &ctx.queue);
+    let errors = pipe.take_errors(&ctx.device, &ctx.queue).expect("gpu ok");
     assert_eq!(
         errors,
         vec![(0u32, 5u32)],
@@ -306,7 +306,10 @@ fn palrle_errors_do_not_leak_between_decodes() {
     ctx.device
         .poll(wgpu::PollType::wait_indefinitely())
         .expect("poll");
-    assert!(!pipe.take_errors(&ctx.device, &ctx.queue).is_empty());
+    assert!(!pipe
+        .take_errors(&ctx.device, &ctx.queue)
+        .expect("gpu ok")
+        .is_empty());
 
     // A clean decode must not still report the previous failure.
     pipe.decode(
@@ -319,7 +322,9 @@ fn palrle_errors_do_not_leak_between_decodes() {
         .poll(wgpu::PollType::wait_indefinitely())
         .expect("poll");
     assert!(
-        pipe.take_errors(&ctx.device, &ctx.queue).is_empty(),
+        pipe.take_errors(&ctx.device, &ctx.queue)
+            .expect("gpu ok")
+            .is_empty(),
         "stale error leaked"
     );
 }
@@ -472,4 +477,27 @@ fn cdf53_multiple_passes_at_a_new_generation_do_not_clear_each_other() {
         [0x80, 0x80, 0x80, 0xFF],
         "in-batch clear wiped passes from the same batch"
     );
+}
+
+/// Device loss while reading back errors must surface as `Err`, not panic
+/// the render thread.
+#[test]
+fn palrle_take_errors_after_device_loss_is_an_error_not_a_panic() {
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let fb = Framebuffer::new(&ctx.device, 64, 64);
+    let mut pipe = PalRlePipeline::new(&ctx.device);
+    pipe.decode(
+        &ctx.device,
+        &ctx.queue,
+        &fb,
+        &[(0u8, 0u8, 0u8, 1u8, vec![0x00u8; 512])],
+    );
+    ctx.device.destroy();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        pipe.take_errors(&ctx.device, &ctx.queue)
+    }));
+    match r {
+        Ok(res) => assert!(res.is_err(), "expected Err, got {res:?}"),
+        Err(_) => panic!("take_errors panicked on a destroyed device"),
+    }
 }

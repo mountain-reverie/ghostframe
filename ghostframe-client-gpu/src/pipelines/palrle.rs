@@ -12,6 +12,7 @@
 //! implementation this was ported from.
 
 use crate::framebuffer::Framebuffer;
+use crate::GpuError;
 
 const SHADER_SRC: &str = include_str!("../../../shaders/client/palrle_decode.wgsl");
 
@@ -240,9 +241,16 @@ impl PalRlePipeline {
 
     /// Read back and clear the per-tile error slots from the last `decode`.
     /// Returns (tile_index_within_batch, code) for each non-zero slot.
-    pub fn take_errors(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<(u32, u32)> {
+    ///
+    /// Fails (rather than panics) when the device cannot be polled or the
+    /// staging buffer cannot be mapped, e.g. after device loss.
+    pub fn take_errors(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Result<Vec<(u32, u32)>, GpuError> {
         if self.last_batch_size == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let errors_buffer = self
@@ -262,18 +270,25 @@ impl PalRlePipeline {
         queue.submit(std::iter::once(encoder.finish()));
 
         let slice = errors_staging.slice(0..read_bytes);
-        slice.map_async(wgpu::MapMode::Read, |r| {
-            r.expect("map palrle errors staging buffer")
+        let (map_tx, map_rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = map_tx.send(r);
         });
         device
             .poll(wgpu::PollType::wait_indefinitely())
-            .expect("poll take_errors");
+            .map_err(|e| GpuError::Device(format!("poll palrle errors: {e}")))?;
+        map_rx
+            .recv()
+            .map_err(|_| GpuError::Device("palrle errors map callback never ran".into()))?
+            .map_err(|e| GpuError::Device(format!("map palrle errors staging buffer: {e}")))?;
 
         let mut result = Vec::new();
         {
-            let mapped = slice.get_mapped_range().expect("get_mapped_range");
+            let mapped = slice
+                .get_mapped_range()
+                .map_err(|e| GpuError::Device(format!("palrle errors get_mapped_range: {e}")))?;
             for (i, chunk) in mapped.chunks_exact(ERROR_STRIDE as usize).enumerate() {
-                let code = u32::from_le_bytes(chunk.try_into().expect("4-byte chunk"));
+                let code = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                 if code != 0 {
                     result.push((i as u32, code));
                 }
@@ -281,6 +296,6 @@ impl PalRlePipeline {
         }
         errors_staging.unmap();
 
-        result
+        Ok(result)
     }
 }
