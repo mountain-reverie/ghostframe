@@ -99,6 +99,12 @@ pub struct Renderer {
     /// GPU-detected decode failures not yet drained by
     /// [`Renderer::take_decode_errors`].
     decode_errors: Vec<GpuDecodeError>,
+    /// Whether `flush` reads the PalRle error slots back. Off by default: the
+    /// readback is a blocking `poll(wait_indefinitely)` per flush, and until
+    /// there is a path from the render thread to `ClientCore`'s feedback
+    /// batcher the result cannot reach the server, so paying for it would be
+    /// pure cost. See [`Renderer::set_collect_decode_errors`].
+    collect_decode_errors: bool,
 
     /// How many PPM dumps have been written, against
     /// `GHOSTFRAME_CLIENT_DUMP_COUNT`. Counts attempts, not successes -- see
@@ -255,6 +261,7 @@ impl Renderer {
             pending_cdf53: Vec::new(),
             pending_rgba: Vec::new(),
             decode_errors: Vec::new(),
+            collect_decode_errors: false,
             dumps_written: 0,
             dump: crate::config::DumpConfig::from_env(),
             flushes: 0,
@@ -408,6 +415,10 @@ impl Renderer {
     /// The caller is expected to relay these as DECODE_ERROR feedback.
     ///
     /// [`flush`]: Renderer::flush
+    pub fn set_collect_decode_errors(&mut self, on: bool) {
+        self.collect_decode_errors = on;
+    }
+
     pub fn take_decode_errors(&mut self) -> Vec<GpuDecodeError> {
         std::mem::take(&mut self.decode_errors)
     }
@@ -426,7 +437,11 @@ impl Renderer {
             self.palrle
                 .decode(&ctx.device, &ctx.queue, &self.fb, &self.pending_palrle);
             let batch = std::mem::take(&mut self.pending_palrle);
-            let errors = self.palrle.take_errors(&ctx.device, &ctx.queue)?;
+            let errors = if self.collect_decode_errors {
+                self.palrle.take_errors(&ctx.device, &ctx.queue)?
+            } else {
+                Vec::new()
+            };
             for (i, code) in errors {
                 let Some((tile_x, tile_y, ..)) = batch.get(i as usize) else {
                     continue;
@@ -662,6 +677,20 @@ impl Renderer {
     }
 
     /// The exported dmabuf image for a buffer id `publish` handed out.
+    /// Take back a published frame the host never acquired.
+    ///
+    /// Releases its buffer, and marks the whole surface dirty. Releasing alone
+    /// under-reports damage: the next `publish` may reuse a different buffer
+    /// whose watermark predates the withdrawn frame, so it would report only
+    /// the changes since THAT buffer was filled, while the host is still
+    /// showing an even older frame. Re-damaging everything is the one answer
+    /// that is right whichever buffer comes next; it costs a full blit, and
+    /// only on frames the host was too slow to take.
+    pub fn withdraw_frame(&mut self, frame_id: u32) {
+        self.ring.release(frame_id);
+        self.ring.mark_dirty_all();
+    }
+
     pub fn export_buffer(&self, buffer_id: u32) -> &ExportedImage {
         self.ring.buffer(buffer_id)
     }

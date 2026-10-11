@@ -86,13 +86,10 @@ fn handle_debug_map_frame(
 /// Also run before a `FrameDimensions` resize: the unacquired frame names a
 /// buffer from the old ring, and handing out its fd afterwards is a
 /// use-after-close.
-fn withdraw_unacquired(
-    published: &Mutex<Option<PublishedFrame>>,
-    renderer: &mut Option<Renderer>,
-) {
+fn withdraw_unacquired(published: &Mutex<Option<PublishedFrame>>, renderer: &mut Option<Renderer>) {
     let stale = published.lock().unwrap_or_else(|e| e.into_inner()).take();
     if let (Some(pf), Some(r)) = (stale, renderer.as_mut()) {
-        r.release(pf.frame_id);
+        r.withdraw_frame(pf.frame_id);
     }
 }
 
@@ -397,6 +394,7 @@ pub(crate) fn run(
     let mut renderer: Option<Renderer> = None;
     let mut tally = EventTally::new();
     let mut export_dumps: u64 = 0;
+    let mut flush_error_reported = false;
     let dump_cfg = ghostframe_client_gpu::config::DumpConfig::from_env();
     let mut last_summary = std::time::Instant::now();
     // `0` means "the embedder didn't specify a count"; a `Renderer` with
@@ -512,19 +510,31 @@ pub(crate) fn run(
                 let flushed = r.flush(&ctx);
                 if let Err(e) = &flushed {
                     // E.g. device loss while waiting on the GPU. Report it
-                    // and skip this publish rather than panic the thread.
-                    queue.push(ClientEvent::Error {
-                        message: format!("renderer flush failed: {e}"),
-                    });
+                    // (once: the queue is unbounded and a lost device fails
+                    // every later flush) and skip this publish rather than
+                    // panic the thread.
+                    if !flush_error_reported {
+                        flush_error_reported = true;
+                        queue.push(ClientEvent::Error {
+                            message: format!("renderer flush failed: {e}"),
+                        });
+                    }
+                } else {
+                    flush_error_reported = false;
                 }
                 // GPU-detected decode failures. They belong on the feedback
                 // stream as DECODE_ERROR, but `ClientCore` owns the
                 // rate-limited batcher and the net thread owns `ClientCore`;
                 // there is no render-to-net command for this yet, so they
                 // are logged and counted.
-                for err in r.take_decode_errors() {
-                    tally.gpu_decode_errors += 1;
-                    tracing::warn!(?err, "GPU tile decode error (not yet sent to server)");
+                let gpu_errors = r.take_decode_errors();
+                if !gpu_errors.is_empty() {
+                    tally.gpu_decode_errors += gpu_errors.len() as u64;
+                    tracing::warn!(
+                        count = gpu_errors.len(),
+                        first = ?gpu_errors[0],
+                        "GPU tile decode errors (not yet sent to server)"
+                    );
                 }
                 let published_frame = if flushed.is_ok() {
                     r.publish(&ctx)
@@ -649,6 +659,18 @@ mod tests {
         }
         tx.send(RenderMsg::Shutdown).unwrap();
         handle.join().unwrap();
+        // Every publish after the first superseded a frame the host never saw,
+        // so the host's picture is older than any one buffer's watermark. Its
+        // damage must therefore cover the whole surface, not just the single
+        // tile this frame changed.
+        let last = published.lock().unwrap().take().expect("a published frame");
+        let damaged: u64 = last.damage.iter().map(|r| r.w as u64 * r.h as u64).sum();
+        assert_eq!(
+            damaged,
+            128 * 128,
+            "withdrawn frames lost their damage: {:?}",
+            last.damage
+        );
         assert_eq!(
             seen, publishes,
             "ring starved after {seen} publishes with 2 buffers: an overwritten, \

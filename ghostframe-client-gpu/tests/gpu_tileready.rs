@@ -232,6 +232,7 @@ fn gpu_palrle_failures_surface_as_decode_errors() {
 
     let ctx = WgpuContext::new().expect("wgpu context");
     let mut r = renderer(&ctx);
+    r.set_collect_decode_errors(true);
     r.apply_event(
         &ctx,
         Event::PaletteUpdated {

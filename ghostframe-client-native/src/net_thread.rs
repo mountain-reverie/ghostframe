@@ -495,7 +495,10 @@ mod tests {
         let addr: SocketAddr = "100.64.0.1:443".parse().unwrap();
         let mut stream = Vec::new();
         for i in 0u8..5 {
-            stream.extend(ghostframe_tsnet::encode_frame(&vec![i; 10 + i as usize], &addr));
+            stream.extend(ghostframe_tsnet::encode_frame(
+                &vec![i; 10 + i as usize],
+                &addr,
+            ));
         }
         let cut = stream.len() - 7; // inside the 5th frame
         let put = |bytes: &[u8]| {
