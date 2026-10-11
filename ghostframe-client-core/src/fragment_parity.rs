@@ -50,19 +50,16 @@ pub fn decode_parity_payload(payload: &[u8]) -> Option<ParityInfo> {
 /// XOR all received payloads together with `xor_data`, producing the
 /// recovered fragment. The result length matches `xor_data.len()`; shorter
 /// buffers are implicitly zero-padded (left-aligned, i.e. XOR from index 0).
-pub fn recover_fragment(received_payloads: &[Vec<u8>], xor_data: &[u8]) -> Vec<u8> {
+pub fn recover_fragment<B: AsRef<[u8]>>(received_payloads: &[B], xor_data: &[u8]) -> Vec<u8> {
     let max_len = xor_data.len();
-    let mut out = vec![0u8; max_len];
-    for buf in received_payloads
-        .iter()
-        .chain(std::iter::once(&xor_data.to_vec()))
-    {
-        for (i, b) in buf.iter().enumerate() {
-            if i < max_len {
-                out[i] ^= b;
-            }
+    // Start from the parity itself: XOR-ing it into zeros is a copy.
+    let mut out = xor_data.to_vec();
+    for buf in received_payloads {
+        for (o, b) in out.iter_mut().zip(buf.as_ref()) {
+            *o ^= b;
         }
     }
+    debug_assert_eq!(out.len(), max_len);
     out
 }
 
@@ -118,7 +115,7 @@ impl FragmentParity {
         for &(group_start_u16, ref parity) in group_map.iter() {
             let group_start = group_start_u16 as usize;
             let group_end = std::cmp::min(group_start + parity.group_len as usize, fragments.len());
-            let mut received: Vec<Vec<u8>> = Vec::new();
+            let mut received: Vec<&[u8]> = Vec::new();
             let mut missing_count = 0usize;
             let mut missing_idx = None;
             let mut ok = true;
@@ -137,7 +134,7 @@ impl FragmentParity {
                             break;
                         }
                     }
-                    Some(payload) => received.push(payload.clone()),
+                    Some(payload) => received.push(payload.as_slice()),
                 }
             }
             if ok && missing_count == 1 {
@@ -169,7 +166,7 @@ impl FragmentParity {
         let parity = group_map.get(&(group_start as u16))?;
 
         let group_end = std::cmp::min(group_start + parity.group_len as usize, fragments.len());
-        let mut received: Vec<Vec<u8>> = Vec::new();
+        let mut received: Vec<&[u8]> = Vec::new();
         let mut missing_count = 0usize;
         for frag in fragments.iter().take(group_end).skip(group_start) {
             match frag {
@@ -179,7 +176,7 @@ impl FragmentParity {
                         return None;
                     }
                 }
-                Some(payload) => received.push(payload.clone()),
+                Some(payload) => received.push(payload.as_slice()),
             }
         }
         if missing_count != 1 {
