@@ -1750,3 +1750,35 @@ async fn refinement_completes_when_a_second_frame_supersedes_the_first() {
         wrong
     );
 }
+
+/// A legitimate client on a lossy link must reach `SessionReady` even when
+/// its setup (QUIC handshake, HTTP/3, WebTransport CONNECT, then HELLO) takes
+/// longer than a handful of seconds to retransmit through 10 % loss.
+///
+/// Seed 0xB17E1000 is the pinned case: the server sees the client's HELLO
+/// 6.06 s after accepting the connection (the neighbouring seeds need under a
+/// second). The server's never-HELLO deadline used to be 5 s, which closed
+/// that client with "no HELLO before deadline" before its HELLO arrived.
+/// Mutation: set `HELLO_DEADLINE` back to 5 s in `io_bridge.rs` and this
+/// scene fails with exactly that close reason.
+#[tokio::test(start_paused = true)]
+async fn a_slow_lossy_handshake_is_not_closed_as_never_hello() {
+    let scene = BrowserlessScene {
+        seed: 0xB17E_1000,
+        tick_budget_floor_bytes: None,
+        datagram_send_buffer_bytes: None,
+        load: SceneLoad::Script(busy_frames_grid(2, 2, 2)),
+        cadence_us: DEFAULT_CADENCE_US,
+        net: NetProfile {
+            loss: 0.10,
+            ..NetProfile::perfect()
+        },
+        drops: Default::default(),
+        duration: Duration::from_secs(10),
+        grid_cols: 2,
+        grid_rows: 2,
+    };
+    run_browserless(scene)
+        .await
+        .expect("a legitimate client on a 10% loss link must get a session");
+}

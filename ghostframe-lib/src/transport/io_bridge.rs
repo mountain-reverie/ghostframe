@@ -610,10 +610,19 @@ const DISPLAY_MODE_DEBOUNCE_US: u64 = 250_000;
 /// behaviour, so a client that never negotiates sees no change.
 const DEFAULT_SCALE_MILLI: u16 = 1000;
 
-/// How long a freshly accepted connection may stay silent (no HELLO) before
-/// the server closes it. Armed at accept time so a half-open handshake is
+/// How long a freshly accepted connection may take to send HELLO before the
+/// server closes it. Armed at accept time so a half-open handshake is
 /// covered too.
-const HELLO_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+///
+/// The budget is the WHOLE setup, not just the HELLO: QUIC handshake, HTTP/3
+/// SETTINGS, the WebTransport CONNECT and its 200 (the client sends HELLO
+/// only after that), then HELLO itself, all of it reliable and therefore
+/// retransmitted with PTO backoff. On a 10 % loss link the browserless
+/// scene at seed 0xB17E1000 needs 6.06 s from accept to HELLO (the other
+/// four seeds need under a second); 5 s killed a legitimate client there.
+/// 20 s leaves ~3x headroom over that and still bounds a silent
+/// connection's hold on one of the `MAX_CONNECTIONS` slots.
+const HELLO_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 /// How long an evicted session keeps its QUIC connection open so the
 /// eviction notice can leave before CONNECTION_CLOSE.
 const EVICT_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(1);

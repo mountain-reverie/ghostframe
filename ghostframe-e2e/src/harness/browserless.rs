@@ -661,6 +661,8 @@ async fn drive_session(
     // see `inject_frame`.
     let mut generations: HashMap<(u8, u8), u8> = HashMap::new();
     let mut session_ready = false;
+    // Virtual time at which the client first reported `SessionReady`.
+    let mut session_ready_at_us: u64 = 0;
     let mut next_frame_idx: usize = 0;
     // Set once the session is ready and the scene has at least one frame;
     // `Some(t)` means "the next scheduled injection (a real scene frame, or
@@ -862,6 +864,7 @@ async fn drive_session(
 
         if !session_ready && events.contains(&ClientNetEvent::SessionReady) {
             session_ready = true;
+            session_ready_at_us = now_us(base);
             if frames.is_empty() {
                 // Nothing to inject: preserve task 15a's exact behavior of
                 // returning the instant the session is ready.
@@ -874,8 +877,24 @@ async fn drive_session(
         // crossed the netsim, and the server only honours the HELLO'd
         // session: injecting earlier would have `apply_injected_frame` see
         // no live session and drop the frame.
-        if session_ready && next_inject_at_us.is_none() && *server_live_rx.borrow() >= 1 {
-            next_inject_at_us = Some(now_us(base));
+        //
+        // The watch is written by the bridge task, which the real-socket pump
+        // schedules independently of this loop, so the iteration at which
+        // this loop first SEES the count is not deterministic. Using the
+        // moment of observation as the injection time made two same-seed runs
+        // inject at different virtual instants (`browserless_determinism`
+        // caught it as a differing BWE estimate). So the injection instant is
+        // fixed at `SessionReady + HELLO_GRACE_US`, and the watch only gates
+        // whether that instant has been reached in a state where injection
+        // can succeed. On a link where the HELLO lands within the grace the
+        // observation time no longer matters.
+        const HELLO_GRACE_US: u64 = 50_000;
+        if session_ready
+            && next_inject_at_us.is_none()
+            && now_us(base) >= session_ready_at_us + HELLO_GRACE_US
+            && *server_live_rx.borrow() >= 1
+        {
+            next_inject_at_us = Some(session_ready_at_us + HELLO_GRACE_US);
         }
 
         if session_ready {
