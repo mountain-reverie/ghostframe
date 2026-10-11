@@ -108,6 +108,9 @@ fn tiles_rendered(r: &BrowserlessResult, cols: u8, rows: u8) -> usize {
         .count()
 }
 
+/// Per-tick budget floor that makes the sender outrun a 2 Mbit link on purpose.
+const OVERDRIVE_FLOOR_BYTES: usize = 256 * 1024;
+
 fn report(name: &str, r: &BrowserlessResult) {
     println!(
         "{name}: send_errs={} emit_q_peak={} s2c_dg={} s2c_bytes={} \
@@ -246,10 +249,23 @@ async fn work_rejected_by_a_full_send_buffer_still_reaches_the_client() {
     // because the emitter's bounded RTO can cover that many. The browser
     // e2e at 2040 tiles measured 15,944 rejections and 11% delivery, so the
     // collapse needs the real tile count to appear.
-    let roomy = run_browserless(squeezed_scene(60, 34, None))
-        .await
-        .expect("roomy scene ran");
-    let squeezed = run_browserless(squeezed_scene(60, 34, Some(64 * 1024)))
+    let roomy_scene = squeezed_scene(60, 34, None);
+    let mut small_buffer_scene = squeezed_scene(60, 34, Some(64 * 1024));
+    // Only the small-buffer run is overdriven. Whether the default pacing
+    // rejects anything at all is not a property of the send buffer: it turned
+    // out to hinge on how the sender's bandwidth estimate settles in the first
+    // second, which moves with the timing of quinn's MTU-discovery steps (and
+    // so with the handshake's byte count: swapping ring for the hybrid
+    // X25519MLKEM768 handshake took `send_errs` from 2-5 to 0). The premise
+    // therefore has to be set explicitly, as
+    // `a_small_send_buffer_does_provoke_rejections` does, rather than inherited
+    // from an accident of the estimator. The roomy run keeps default pacing: it
+    // is the "buffer that never rejects" control, and overdriving it too
+    // floods the path (thousands of stale tiles) for reasons unrelated to the
+    // buffer.
+    small_buffer_scene.tick_budget_floor_bytes = Some(OVERDRIVE_FLOOR_BYTES);
+    let roomy = run_browserless(roomy_scene).await.expect("roomy scene ran");
+    let squeezed = run_browserless(small_buffer_scene)
         .await
         .expect("squeezed scene ran");
     report("roomy", &roomy);
