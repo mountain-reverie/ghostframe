@@ -62,6 +62,20 @@ impl Default for CostModel {
 }
 
 impl CostModel {
+    /// The compiled-in model with any `CostModelConfig` overrides applied.
+    /// With `CostModelConfig::default()` this is exactly `CostModel::default()`.
+    pub fn from_config(config: &crate::config::CostModelConfig) -> Self {
+        let base = Self::default();
+        Self {
+            solid_us: config.solid_us.unwrap_or(base.solid_us),
+            palrle_us: config.palrle_us.unwrap_or(base.palrle_us),
+            cdf53_us: config.cdf53_us.unwrap_or(base.cdf53_us),
+            h264_frame_us: config.h264_frame_us.unwrap_or(base.h264_frame_us),
+            h264_frame_bytes: config.h264_frame_bytes.unwrap_or(base.h264_frame_bytes),
+            bytes_per_us: config.bytes_per_us.unwrap_or(base.bytes_per_us),
+        }
+    }
+
     /// Bandwidth weighting in B/µs. Currently a hardcoded placeholder
     /// (~12.5 = 100 Mbps). Will be wired to the source-spec §6.5 estimator
     /// in M4+; this single accessor is the swap-in point (per design D17).
@@ -276,19 +290,19 @@ mod classify_tests;
 /// outstanding. Pulls the cost comparison toward TileCodec when there's
 /// PixelPerfect work left to deliver and bandwidth headroom permits.
 /// Retuned in M3.6c from the bandwidth × scene matrix.
-pub const REFINEMENT_BIAS_PER_TILE_US: f32 = 5.0;
+pub(crate) const REFINEMENT_BIAS_PER_TILE_US: f32 = 5.0;
 
 /// Minimum bandwidth (bytes per µs) below which the classifier
 /// hard-overrides to H264 regardless of the cost comparison. 0.25 B/µs
 /// ≈ 2 Mbps — below this, individual tile-codec emissions can't keep up
 /// with frame-rate. Retuned in M3.6c.
-pub const HEADROOM_MIN_BYTES_PER_US: f32 = 0.25;
+pub(crate) const HEADROOM_MIN_BYTES_PER_US: f32 = 0.25;
 
 /// Smoothed loss-rate threshold above which the classifier hard-overrides
 /// to H264. 10 % datagram loss makes per-tile reassembly + refinement
 /// unworkable; H264 full-frame's larger I-frame interval rides through
 /// better. Retuned in M3.6c.
-pub const LOSS_OVERRIDE_THRESHOLD: f32 = 0.10;
+pub(crate) const LOSS_OVERRIDE_THRESHOLD: f32 = 0.10;
 
 /// Hysteresis state for `Classifier::decide_frame_mode_at`.
 ///
@@ -341,30 +355,22 @@ pub struct Classifier {
     refinement_deficit_tiles: u32,
     /// M3.7a env-var override: when `Some`, `decide_inner` uses this
     /// instead of `REFINEMENT_BIAS_PER_TILE_US`. Populated from
-    /// `ClassifierConfig` in `Classifier::new` under
-    /// `cfg(any(test, feature = "test-loss-injection"))`. `None` in
-    /// production builds.
-    #[cfg(any(test, feature = "test-loss-injection"))]
+    /// `ClassifierConfig` in `Classifier::new`; `None` unless configured.
     refinement_bias_us_override: Option<f32>,
     /// M3.7a env-var override: when `Some`, `decide_inner` uses this
     /// instead of `LOSS_OVERRIDE_THRESHOLD`. Populated from
-    /// `ClassifierConfig` in `Classifier::new`
-    /// under `cfg(any(test, feature = "test-loss-injection"))`.
-    #[cfg(any(test, feature = "test-loss-injection"))]
+    /// `ClassifierConfig` in `Classifier::new`.
     loss_override_threshold_override: Option<f32>,
     /// M3.7b env-var override for HEADROOM_MIN_BYTES_PER_US. Populated
     /// from `ClassifierConfig` in `Classifier::new`.
-    /// Cfg-gated under `test-loss-injection`.
-    #[cfg(any(test, feature = "test-loss-injection"))]
     headroom_min_bpus_override: Option<f32>,
-    /// Test-only pin: when `Some`, `decide_inner` returns this mode every
+    /// Mode pin (`GHOSTFRAME_FORCE_FRAME_MODE`): when `Some`, `decide_inner` returns this mode every
     /// frame, bypassing all hysteresis, hard overrides, and cost paths.
     /// Lets tests isolate end-to-end behaviour of a specific codec path
     /// (e.g. H.264 colorspace) without depending on the M3.6 mode-switch
     /// policy firing on its own. Populated from
     /// `ClassifierConfig` in `Classifier::new` —
-    /// accepts `"h264"` or `"tile"`. `None` in production builds.
-    #[cfg(any(test, feature = "test-loss-injection"))]
+    /// accepts `"h264"` or `"tile"`. `None` unless configured.
     force_frame_mode_override: Option<FrameMode>,
     /// Last emitted mode (debounces the `mode.decision` event to fire
     /// only on transitions). `None` before the first decision.
@@ -396,20 +402,8 @@ impl Classifier {
     /// callers (including tests) no longer need an environment lock
     /// to avoid racing other threads' `std::env::set_var` calls.
     pub fn new(config: crate::config::ClassifierConfig) -> Self {
-        // Production builds compile none of the override assignments below, so
-        // every field of `config` is discarded. That is correct only while
-        // ClassifierConfig holds test-only knobs; assert it, so adding a
-        // production-relevant field here fails loudly in debug rather than
-        // being silently ignored in release.
-        #[cfg(not(any(test, feature = "test-loss-injection")))]
-        debug_assert_eq!(
-            config,
-            crate::config::ClassifierConfig::default(),
-            "ClassifierConfig gained a field that production silently ignores"
-        );
-        let _ = &config;
         Self {
-            cost: CostModel::default(),
+            cost: CostModel::from_config(&config.cost),
             enter_factor: 1.3,
             exit_factor: 0.6,
             motion_tile_threshold: 0.20,
@@ -421,13 +415,9 @@ impl Classifier {
             state: ClassifierHysteresis::default(),
             adaptation_context: AdaptationContext::default(),
             refinement_deficit_tiles: 0,
-            #[cfg(any(test, feature = "test-loss-injection"))]
             refinement_bias_us_override: config.refinement_bias_us,
-            #[cfg(any(test, feature = "test-loss-injection"))]
             loss_override_threshold_override: config.loss_override_threshold,
-            #[cfg(any(test, feature = "test-loss-injection"))]
             headroom_min_bpus_override: config.headroom_min_bpus,
-            #[cfg(any(test, feature = "test-loss-injection"))]
             force_frame_mode_override: config.force_frame_mode,
             last_emitted_mode: None,
             epoch: std::time::Instant::now(),
@@ -536,10 +526,10 @@ impl Classifier {
         tentative_states: &[CodecState],
         prev_mode: FrameMode,
     ) -> (FrameMode, &'static str) {
-        // Test-only pin: when GHOSTFRAME_TEST_FORCE_FRAME_MODE is set,
-        // return that mode every call without running the cost model or
-        // hysteresis. Lets tests isolate one codec path end-to-end.
-        #[cfg(any(test, feature = "test-loss-injection"))]
+        // Mode pin: when GHOSTFRAME_FORCE_FRAME_MODE (or the older
+        // GHOSTFRAME_TEST_FORCE_FRAME_MODE) is set, return that mode every
+        // call without running the cost model or hysteresis. Lets tests
+        // isolate one codec path end-to-end.
         if let Some(forced) = self.force_frame_mode_override {
             self.state = ClassifierHysteresis::default();
             return (forced, "test_force");
@@ -562,33 +552,17 @@ impl Classifier {
             return (FrameMode::TileCodec, "h264_unsupported");
         }
 
-        let headroom_threshold = {
-            #[cfg(any(test, feature = "test-loss-injection"))]
-            {
-                self.headroom_min_bpus_override
-                    .unwrap_or(HEADROOM_MIN_BYTES_PER_US)
-            }
-            #[cfg(not(any(test, feature = "test-loss-injection")))]
-            {
-                HEADROOM_MIN_BYTES_PER_US
-            }
-        };
+        let headroom_threshold = self
+            .headroom_min_bpus_override
+            .unwrap_or(HEADROOM_MIN_BYTES_PER_US);
         let headroom_force_h264 = ctx.bytes_per_us > 0.0 && ctx.bytes_per_us < headroom_threshold;
         if headroom_force_h264 {
             self.state = ClassifierHysteresis::default();
             return (FrameMode::H264, "headroom_guard");
         }
-        let loss_threshold = {
-            #[cfg(any(test, feature = "test-loss-injection"))]
-            {
-                self.loss_override_threshold_override
-                    .unwrap_or(LOSS_OVERRIDE_THRESHOLD)
-            }
-            #[cfg(not(any(test, feature = "test-loss-injection")))]
-            {
-                LOSS_OVERRIDE_THRESHOLD
-            }
-        };
+        let loss_threshold = self
+            .loss_override_threshold_override
+            .unwrap_or(LOSS_OVERRIDE_THRESHOLD);
         let loss_force_h264 = ctx.loss_rate > loss_threshold;
         if loss_force_h264 {
             self.state = ClassifierHysteresis::default();
@@ -617,17 +591,9 @@ impl Classifier {
             .sum();
         let bytes_per_us = self.cost.bytes_per_us();
         let tile_codec_cost = non_h264_us + (all_tile_bytes as f32) / bytes_per_us;
-        let per_tile_bias = {
-            #[cfg(any(test, feature = "test-loss-injection"))]
-            {
-                self.refinement_bias_us_override
-                    .unwrap_or(REFINEMENT_BIAS_PER_TILE_US)
-            }
-            #[cfg(not(any(test, feature = "test-loss-injection")))]
-            {
-                REFINEMENT_BIAS_PER_TILE_US
-            }
-        };
+        let per_tile_bias = self
+            .refinement_bias_us_override
+            .unwrap_or(REFINEMENT_BIAS_PER_TILE_US);
         let refinement_bias_us = self.refinement_deficit_tiles as f32 * per_tile_bias;
         let h264_cost = self.cost.h264_frame_us
             + (self.cost.h264_frame_bytes as f32) / bytes_per_us

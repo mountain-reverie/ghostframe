@@ -16,7 +16,7 @@ use crate::tile::{CodecState, MetricsTracker, TileMetrics};
 
 /// Threshold matching the spec: tile must be idle for > IDLE_THRESHOLD frames
 /// before becoming eligible for escalation. 30 frames ≈ 500 ms at 60 fps.
-pub const IDLE_THRESHOLD: u32 = 30;
+pub(crate) const IDLE_THRESHOLD: u32 = 30;
 
 /// Returns up to `k_max` tile indices (`y * cols + x`) eligible for
 /// idle-escalation, in row-major order. See module docs for eligibility.

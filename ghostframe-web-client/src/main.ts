@@ -5,12 +5,14 @@ import { attachInputCapture } from './input/wire';
 import { DecodeErrorBatcher } from './decode_error_batcher';
 import { initDiagnostics } from './diagnostics.js';
 import { bootstrap } from './bootstrap.js';
+import { initProtocol, protocol } from './protocol_constants.js';
 import { showDisconnectedOverlay } from './disconnect_overlay.js';
 import {
   recordProtocolEvent,
-  CODEC_DISCRIMINANT,
+  codecDiscriminant,
   type Cdf53ErrorCodes,
 } from './cdf53_globals.js';
+import * as wasmExports from '../pkg-web/ghostframe_client_wasm.js';
 import init, {
   WasmClientCore,
   tileNackEnvelope,
@@ -20,9 +22,6 @@ import init, {
 
 /** Microsecond clock for every `now_us` parameter WasmClientCore expects. */
 const nowUs = (): bigint => BigInt(Math.round(performance.now() * 1000));
-
-/** `EvictionReason::DisplacedByNewSession` -- ghostframe-protocol/src/eviction.rs. */
-const EVICTION_REASON_DISPLACED = 1;
 
 const statusEl = document.getElementById('status')!;
 const logEl = document.getElementById('log')!;
@@ -42,6 +41,8 @@ async function main() {
   // WasmClientCore construction. Awaited here rather than at module scope —
   // a top-level await fails the vite build for the configured target.
   await init();
+  // Read every wire constant from Rust once; TS must not retype them.
+  initProtocol(wasmExports);
 
   const url = new URL(window.location.href);
 
@@ -127,10 +128,11 @@ async function main() {
     device.queue.submit([encoder.finish()]);
 
     // Read back the target tile's pixels via __readPixelRect.
-    const cols = Math.ceil(renderer.framebuffer.width / 32);
+    const ts = protocol().tileSize;
+    const cols = Math.ceil(renderer.framebuffer.width / ts);
     const tileX = targetTileIdx % cols;
     const tileY = Math.floor(targetTileIdx / cols);
-    return await (window as any).__readPixelRect(tileX * 32, tileY * 32, 32, 32);
+    return await (window as any).__readPixelRect(tileX * ts, tileY * ts, ts, ts);
   };
 
   // M3.3b diagnostic: test-only hook to drive the Cdf53 integrate shader
@@ -633,7 +635,7 @@ async function main() {
           seq: ev.frame_seq,
           tileX: ev.tile_x,
           tileY: ev.tile_y,
-          codec: CODEC_DISCRIMINANT[d.codec],
+          codec: codecDiscriminant(d.codec),
           payloadLen: sampleBytes.byteLength,
           fbWidth: renderer.framebuffer.width,
           fbHeight: renderer.framebuffer.height,
@@ -720,7 +722,7 @@ async function main() {
         // reconnect -- two clients with retry logic evict each other
         // indefinitely (design doc §4).
         showDisconnectedOverlay(
-          ev.reason === EVICTION_REASON_DISPLACED
+          ev.reason === protocol().evictionReasonDisplaced
             ? 'Another session took over this desktop.'
             : 'The server ended this session.',
         );
@@ -908,7 +910,7 @@ async function main() {
                 t =>
                   `(${t.tile_x},${t.tile_y}) missing=0b${t.missing
                     .toString(2)
-                    .padStart(14, '0')} sweeps=${t.sweep_attempts}`,
+                    .padStart(protocol().cdf53PassCount, '0')} sweeps=${t.sweep_attempts}`,
               )
               .join(' ');
         }

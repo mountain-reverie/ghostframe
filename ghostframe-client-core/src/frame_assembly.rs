@@ -14,13 +14,15 @@
 use ghostframe_protocol::protocol::{decode_frame_datagram, FrameHeader};
 
 use crate::event::Event;
-use crate::ClientCore;
+use crate::{ClientCore, MAX_FRAME_FRAGMENTS, MAX_H264_ACCESS_UNIT_BYTES};
 
 /// One in-progress full-frame (H.264 access unit) assembly.
 pub(crate) struct FrameAssembly {
     pub header: FrameHeader,
     pub fragments: Vec<Option<Vec<u8>>>,
     pub received: usize,
+    /// Payload bytes buffered so far (bounded by `MAX_H264_ACCESS_UNIT_BYTES`).
+    pub bytes: usize,
 }
 
 impl ClientCore {
@@ -67,6 +69,11 @@ impl ClientCore {
         if fh.frag_total == 0 {
             return;
         }
+        // `frag_total` is an attacker-chosen u16 and sizes a Vec on first
+        // sight; refuse claims no real access unit makes.
+        if fh.frag_total > MAX_FRAME_FRAGMENTS {
+            return;
+        }
 
         let asm = self
             .frame_assemblies
@@ -75,10 +82,19 @@ impl ClientCore {
                 header: fh,
                 fragments: vec![None; fh.frag_total as usize],
                 received: 0,
+                bytes: 0,
             });
 
         let fi = fh.frag_idx as usize;
         if fi < asm.fragments.len() && asm.fragments[fi].is_none() {
+            // Bound the access unit itself, not only its fragment count: each
+            // fragment can carry a full datagram. An oversize unit is
+            // abandoned whole -- a truncated H.264 stream is undecodable.
+            if asm.bytes + payload.len() > MAX_H264_ACCESS_UNIT_BYTES {
+                self.frame_assemblies.remove(&fh.frame_seq);
+                return;
+            }
+            asm.bytes += payload.len();
             asm.fragments[fi] = Some(payload.to_vec());
             asm.received += 1;
         }

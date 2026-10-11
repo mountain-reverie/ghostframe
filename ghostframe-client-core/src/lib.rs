@@ -74,6 +74,67 @@ const TAIL_SWEEP_INTERVAL_US: u64 = 500_000;
 /// Periodic ReceiverFeedback cadence (main.ts:391-401, 100ms setInterval).
 const FEEDBACK_INTERVAL_US: u64 = 100_000;
 
+/// Largest frame dimension (either axis, in pixels) the core will pass on.
+///
+/// A `FrameDimensions` event is a network `u32` that drives texture and
+/// buffer allocation in every renderer, so the core refuses anything larger
+/// instead of trusting each renderer to. 8192 covers 4K, dual-screen layouts
+/// (7680x2160 side by side, 3840x4320 stacked) and 8K, with headroom; it is
+/// also the largest 2D texture most GPUs accept. Renderers add their own
+/// clamp against this same value as belt and braces.
+pub const MAX_FRAME_DIMENSION: u32 = 8192;
+
+/// Most source fragments one tile pass may claim (`frag_total`).
+///
+/// A 32x32 tile pass is at most a few KiB and a datagram carries ~1.1 KiB, so
+/// real passes fragment into single digits; the per-tile NACK entry also
+/// names a fragment in one byte. 64 is generous without being an allocation
+/// lever (`frag_total` is an attacker-chosen `u16`).
+pub const MAX_TILE_FRAGMENTS: u16 = 64;
+
+/// Most source fragments one H.264 access unit may claim.
+///
+/// [`MAX_H264_ACCESS_UNIT_BYTES`] at the smallest fragment worth sending
+/// (~1 KiB) is 16384; the largest legitimate access unit (an 8K keyframe at
+/// ~1.18 KiB per fragment) needs ~14k.
+pub const MAX_FRAME_FRAGMENTS: u16 = 16_384;
+
+/// Most payload bytes one H.264 access unit may buffer before it is dropped.
+pub const MAX_H264_ACCESS_UNIT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Byte budget for all live (incomplete) tile assemblies together.
+///
+/// Each assembly is charged [`ASSEMBLY_BASE_COST`], a slot cost per claimed
+/// fragment and the payload bytes buffered so far, so the budget bounds
+/// both the number of assemblies and the memory behind them. Sized so that
+/// a full 4K dual-screen frame (~16k tiles) with every tile one fragment
+/// short still fits; a hostile server that fans out keys hits it long before
+/// memory matters.
+pub const MAX_ASSEMBLY_BYTES: usize = 128 * 1024 * 1024;
+
+/// Most live tile assemblies, whatever their byte cost. Every datagram and
+/// timer pass scans the assembly map, so the count is bounded on its own.
+pub const MAX_LIVE_ASSEMBLIES: usize = 65_536;
+
+const _: () = assert!(
+    MAX_TILE_FRAGMENTS <= 256,
+    "NACK entries name a fragment in one byte"
+);
+
+/// Fixed cost charged per live assembly (struct, map slot, bookkeeping).
+const ASSEMBLY_BASE_COST: usize = 512;
+/// Cost charged per claimed fragment slot (`Option<Vec<u8>>` + `Option<u32>`).
+const ASSEMBLY_SLOT_COST: usize = 40;
+
+/// Snapshot of reassembly occupancy, for diagnostics and tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AssemblyStats {
+    pub tile_assemblies: usize,
+    pub tile_assembly_bytes: usize,
+    pub frame_assemblies: usize,
+    pub fragment_parity_keys: usize,
+}
+
 /// One coverage NACK awaiting the debounce window (main.ts:815, `PendingNack`).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PendingNack {
@@ -155,9 +216,16 @@ pub(crate) struct Assembly {
     /// A FEC-recovered fragment stays `None`: no transmission of it arrived,
     /// so there is nothing to acknowledge.
     pub wire_seqs: Vec<Option<u32>>,
+    /// Budget charged for this assembly so far (see [`MAX_ASSEMBLY_BYTES`]).
+    pub cost: usize,
 }
 
 impl Assembly {
+    /// Cost of an empty assembly claiming `frag_total` slots.
+    pub(crate) fn base_cost(frag_total: u16) -> usize {
+        ASSEMBLY_BASE_COST + frag_total as usize * ASSEMBLY_SLOT_COST
+    }
+
     fn new(header: &TileHeader, frame_seq: u32, frag_total: u16, now_us: u64) -> Self {
         Assembly {
             tile_x: header.tile_x,
@@ -171,6 +239,7 @@ impl Assembly {
             received: 0,
             partial_since_us: now_us,
             nacked_frag_idxs: HashSet::new(),
+            cost: Self::base_cost(frag_total),
         }
     }
 }
@@ -178,6 +247,11 @@ impl Assembly {
 pub struct ClientCore {
     pub(crate) outbox: VecDeque<PollOutput>,
     pub(crate) assemblies: HashMap<TileKey, Assembly>,
+    /// Sum of `Assembly::cost` over `assemblies`.
+    pub(crate) assembly_bytes: usize,
+    /// Frame size last accepted from the server, if any. Tile coordinates
+    /// are validated against the grid it implies.
+    pub(crate) frame_dims: Option<(u32, u32)>,
     pub(crate) parity_decoder: ParityDecoder,
     pub(crate) fragment_parity: FragmentParity,
     pub(crate) ack_batcher: AckBatcher,
@@ -220,6 +294,8 @@ impl ClientCore {
         let mut core = ClientCore {
             outbox: VecDeque::new(),
             assemblies: HashMap::new(),
+            assembly_bytes: 0,
+            frame_dims: None,
             parity_decoder: ParityDecoder::new(PARITY_WINDOW),
             fragment_parity: FragmentParity::new(),
             ack_batcher: AckBatcher::new(),
@@ -301,6 +377,23 @@ impl ClientCore {
             deadline = deadline.min(s);
         }
         Some(deadline)
+    }
+
+    /// Reassembly occupancy, for diagnostics and tests.
+    pub fn assembly_stats(&self) -> AssemblyStats {
+        AssemblyStats {
+            tile_assemblies: self.assemblies.len(),
+            tile_assembly_bytes: self.assembly_bytes,
+            frame_assemblies: self.frame_assemblies.len(),
+            fragment_parity_keys: self.fragment_parity.len(),
+        }
+    }
+
+    /// Remove a tile assembly, returning its budget.
+    pub(crate) fn remove_assembly(&mut self, key: &TileKey) -> Option<Assembly> {
+        let asm = self.assemblies.remove(key)?;
+        self.assembly_bytes = self.assembly_bytes.saturating_sub(asm.cost);
+        Some(asm)
     }
 
     /// Earliest `partial_since_us + ASSEMBLY_TIMEOUT_US` across incomplete

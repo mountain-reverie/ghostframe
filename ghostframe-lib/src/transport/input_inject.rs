@@ -11,7 +11,7 @@
 /// Top-level feedback message type for input events. Routed by the first
 /// byte in `IoBridge::dispatch_feedback_bytes`. Sub-kind byte at offset 1
 /// selects the specific event (see `decode_input_msg`).
-pub const INPUT_MSG_TYPE: u8 = 0x05;
+pub use ghostframe_protocol::feedback_stream::INPUT_MSG_TYPE;
 
 const SUB_POINTER_MOVE: u8 = 0x01;
 const SUB_POINTER_BUTTON: u8 = 0x02;

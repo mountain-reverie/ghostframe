@@ -101,6 +101,22 @@ jobs:
             echo "::error::ghostframe-lib must read std::env only in config.rs"
             exit 1
           fi
+      - name: client crates read env only in config.rs
+        run: |
+          # Same rule and same comment-line exclusion as the ghostframe-lib
+          # guard above, extended to every ghostframe-client-* crate.
+          # ghostframe-client-gpu/src/config.rs is the one sanctioned reader
+          # (GHOSTFRAME_CLIENT_DUMP_*). ghostframe-client-native/src/lib.rs
+          # is exempt for its single TS_CONTROL_URL read, which is a tailscale
+          # variable passed through to tsnet rather than a ghostframe knob;
+          # tracked for a proper config module in ghostframe-client-native.
+          if grep -rn 'env::var' ghostframe-client-*/src --include='*.rs' \
+               | grep -vE '^ghostframe-client-[a-z0-9]+/src/config\.rs' \
+               | grep -v '^ghostframe-client-native/src/lib.rs' \
+               | grep -vE ':[0-9]+: *(//|///|//!)'; then
+            echo "::error::ghostframe-client-* crates must read std::env only in config.rs"
+            exit 1
+          fi
 
   unit:
     name: unit

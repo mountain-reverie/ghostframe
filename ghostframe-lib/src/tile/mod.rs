@@ -3,7 +3,7 @@ pub use ghostframe_protocol::tile::{BPP, TILE_BYTES, TILE_SIZE};
 /// Sentinel value for `TileMetrics::unique_colors` indicating the GPU compute
 /// estimator has not run yet (M3.0 always uses this — backing lands in M3.3).
 /// Classifier rules consulting `unique_colors` treat the sentinel as "unknown".
-pub const UNIQUE_COLORS_UNKNOWN: u16 = u16::MAX;
+pub(crate) const UNIQUE_COLORS_UNKNOWN: u16 = u16::MAX;
 
 /// Sentinel value for `TileMetrics::edge_density` indicating the GPU compute
 /// estimator has not run yet (M3.0 always uses this — backing lands in M3.3).

@@ -3,63 +3,13 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-/**
- * M3.3c escalation cap: maximum number of idle-escalation candidates the
- * io_bridge will dispatch in a single frame. Bounds GPU memory for the
- * dedicated escalation_coefficients_buffer (K × 3072 × 4 = 6 MB at K=512).
- */
-#define MAX_ESCALATION_PER_FRAME 512
 
-/**
- * Sentinel value for `TileMetrics::unique_colors` indicating the GPU compute
- * estimator has not run yet (M3.0 always uses this — backing lands in M3.3).
- * Classifier rules consulting `unique_colors` treat the sentinel as "unknown".
- */
-#define UNIQUE_COLORS_UNKNOWN UINT16_MAX
-
-
-
-/**
- * Per-tile bias added to the H264 comparand when refinement passes are
- * outstanding. Pulls the cost comparison toward TileCodec when there's
- * PixelPerfect work left to deliver and bandwidth headroom permits.
- * Retuned in M3.6c from the bandwidth × scene matrix.
- */
-#define REFINEMENT_BIAS_PER_TILE_US 5.0
-
-/**
- * Minimum bandwidth (bytes per µs) below which the classifier
- * hard-overrides to H264 regardless of the cost comparison. 0.25 B/µs
- * ≈ 2 Mbps — below this, individual tile-codec emissions can't keep up
- * with frame-rate. Retuned in M3.6c.
- */
-#define HEADROOM_MIN_BYTES_PER_US 0.25
-
-/**
- * Smoothed loss-rate threshold above which the classifier hard-overrides
- * to H264. 10 % datagram loss makes per-tile reassembly + refinement
- * unworkable; H264 full-frame's larger I-frame interval rides through
- * better. Retuned in M3.6c.
- */
-#define LOSS_OVERRIDE_THRESHOLD 0.10
-
-/**
- * Threshold matching the spec: tile must be idle for > IDLE_THRESHOLD frames
- * before becoming eligible for escalation. 30 frames ≈ 500 ms at 60 fps.
- */
-#define IDLE_THRESHOLD 30
 
 /**
  * Initial bitrate seed. Sized for a typical broadband first-paint
  * burst (2 Mbps); the estimator will adapt within a few hundred ms.
  */
 #define BweWrapper_INITIAL_BPS 2000000
-
-#define HELLO_MSG_TYPE 3
-
-#define HELLO_SIZE 2
-
-#define DECODE_ERROR_MSG_TYPE 4
 
 #define DECODE_ERROR_SIZE 5
 
@@ -76,10 +26,6 @@
 #define ERR_RLE_OVERSHOOT 6
 
 #define ERR_RLE_UNDERSHOOT 7
-
-#define DISPLAY_INFO_MSG_TYPE 7
-
-#define DISPLAY_MODE_MSG_TYPE 8
 
 #define DISPLAY_INFO_SIZE 11
 
@@ -105,13 +51,6 @@
  * instead of a fixed const; at 4K @ 60 fps the worst case grows ~8× further.
  */
 #define FRAGMENT_COVERAGE_CAPACITY 60000
-
-/**
- * Top-level feedback message type for input events. Routed by the first
- * byte in `IoBridge::dispatch_feedback_bytes`. Sub-kind byte at offset 1
- * selects the specific event (see `decode_input_msg`).
- */
-#define INPUT_MSG_TYPE 5
 
 #define FEC_GROUP_SIZE_K 10
 
@@ -210,9 +149,61 @@
  */
 #define PARITY_HEADER_SIZE 3
 
+#define FEEDBACK_SIZE 22
+
+/**
+ * Receiver loss/suspension report (see [`crate::feedback::ReceiverFeedback`]).
+ */
 #define FEEDBACK_MSG_TYPE 1
 
-#define FEEDBACK_SIZE 22
+/**
+ * One-shot capability advertisement, `[HELLO_MSG_TYPE, caps]`.
+ */
+#define HELLO_MSG_TYPE 3
+
+/**
+ * Encoded length of a HELLO message.
+ */
+#define HELLO_SIZE 2
+
+/**
+ * Per-tile decode failure report.
+ */
+#define DECODE_ERROR_MSG_TYPE 4
+
+/**
+ * Input event (pointer, wheel, key). A sub-kind byte follows.
+ */
+#define INPUT_MSG_TYPE 5
+
+/**
+ * Client display capability advertisement.
+ */
+#define DISPLAY_INFO_MSG_TYPE 7
+
+/**
+ * Client display mode request.
+ */
+#define DISPLAY_MODE_MSG_TYPE 8
+
+/**
+ * HELLO capability bit 0: the client can decode `indices_raw` PalRLE
+ * payloads (PalRLE flags bit 1).
+ */
+#define HELLO_CAP_INDICES_RAW 1
+
+/**
+ * HELLO capability bit 1: the client can decode H.264 and sample the
+ * resulting `GPUExternalTexture` (`texture_external`). Firefox WebGPU
+ * cannot, and sends this bit clear so the server never emits unplayable
+ * H.264.
+ */
+#define HELLO_CAP_SUPPORTS_H264 2
+
+/**
+ * HELLO capability bits that must be zero today; the server ignores them.
+ */
+#define HELLO_CAPS_RESERVED_MASK 252
 
 #define DATAGRAM_HEADER_SIZE 16
 

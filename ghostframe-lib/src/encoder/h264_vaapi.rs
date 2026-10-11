@@ -27,7 +27,7 @@ use tracing::{info, warn};
 static FFMPEG_INIT: Once = Once::new();
 
 use super::nal_parser::is_keyframe_nal;
-use super::vaapi_device::{self, BufRef, VAAPI_DEVICE};
+use super::vaapi_device::{self, vaapi_device_path, BufRef};
 use super::EncodedTile;
 use crate::transport::protocol::Codec as GfCodec;
 
@@ -172,7 +172,7 @@ impl H264VaapiEncoder {
     ) -> Result<Self, ffmpeg::Error> {
         unsafe {
             // 1. Create HW device context.
-            let hw_device_ctx = vaapi_device::create_hw_device_ctx(VAAPI_DEVICE)?;
+            let hw_device_ctx = vaapi_device::create_hw_device_ctx(vaapi_device_path())?;
 
             // 2. Create HW frames context at the requested resolution.
             let hw_frames_ctx =
@@ -521,7 +521,7 @@ impl FullFrameEncoder {
         unsafe {
             // Create DRM device first, then derive VAAPI from it.
             // This enables DRM PRIME → VAAPI frame mapping for zero-copy DMA-BUF import.
-            let drm_device_ctx = vaapi_device::create_drm_device_ctx(VAAPI_DEVICE);
+            let drm_device_ctx = vaapi_device::create_drm_device_ctx(vaapi_device_path());
             let hw_device_ctx = if let Ok(drm_ctx) = drm_device_ctx.as_ref() {
                 // Derive VAAPI from DRM — enables DRM PRIME frame import
                 let mut vaapi_ctx: *mut ffi::AVBufferRef = ptr::null_mut();
@@ -533,12 +533,12 @@ impl FullFrameEncoder {
                 );
                 if ret < 0 || vaapi_ctx.is_null() {
                     // Fall back to direct VAAPI device
-                    vaapi_device::create_hw_device_ctx(VAAPI_DEVICE)?
+                    vaapi_device::create_hw_device_ctx(vaapi_device_path())?
                 } else {
                     vaapi_ctx
                 }
             } else {
-                vaapi_device::create_hw_device_ctx(VAAPI_DEVICE)?
+                vaapi_device::create_hw_device_ctx(vaapi_device_path())?
             };
 
             // NV12 hw_frames_ctx for encoder output

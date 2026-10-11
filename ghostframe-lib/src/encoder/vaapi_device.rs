@@ -12,8 +12,15 @@ use ffmpeg::frame;
 use ffmpeg_next as ffmpeg;
 use ffmpeg_sys_next as ffi;
 
-/// Default VA-API render device path.
+/// Default VA-API render device path. Use [`vaapi_device_path`] to open one:
+/// it honours the `GHOSTFRAME_VAAPI_DEVICE` override.
 pub const VAAPI_DEVICE: &str = "/dev/dri/renderD128";
+
+/// The render node to open: `GHOSTFRAME_VAAPI_DEVICE` if set, else
+/// [`VAAPI_DEVICE`].
+pub fn vaapi_device_path() -> &'static str {
+    crate::config::vaapi_device_override().unwrap_or(VAAPI_DEVICE)
+}
 
 /// RAII wrapper around `*mut AVBufferRef` so we don't leak hw contexts.
 pub struct BufRef(pub *mut ffi::AVBufferRef);

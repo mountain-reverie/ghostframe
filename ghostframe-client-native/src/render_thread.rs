@@ -145,8 +145,9 @@ fn maybe_dump_export(
     renderer: &ghostframe_client_gpu::renderer::Renderer,
     pf: &PublishedFrame,
     written: &mut u64,
+    dump: &ghostframe_client_gpu::config::DumpConfig,
 ) {
-    let Ok(prefix) = std::env::var("GHOSTFRAME_CLIENT_DUMP_EXPORT") else {
+    let Some(prefix) = dump.export_prefix.as_deref() else {
         return;
     };
     // `GHOSTFRAME_CLIENT_DUMP_EVERY=n` samples every nth publish instead,
@@ -155,24 +156,10 @@ fn maybe_dump_export(
     // cannot answer "what does a buffer hold once things have settled", which
     // is a different question and the one that matters for a steady-state
     // artefact.
-    let every: u64 = std::env::var("GHOSTFRAME_CLIENT_DUMP_EVERY")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
     let n = *written;
     *written += 1;
-    if every > 0 {
-        if !n.is_multiple_of(every) {
-            return;
-        }
-    } else {
-        let want: u64 = std::env::var("GHOSTFRAME_CLIENT_DUMP_COUNT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1);
-        if n >= want {
-            return;
-        }
+    if !dump.should_dump(n) {
+        return;
     }
 
     let exported = renderer.export_buffer(pf.buffer_id);
@@ -202,7 +189,7 @@ fn maybe_dump_export(
         }
     }
 
-    let path = if every > 0 {
+    let path = if dump.every > 0 {
         format!("{prefix}.latest.ppm")
     } else {
         format!("{prefix}.{n}.ppm")
@@ -356,6 +343,7 @@ pub(crate) fn run(
     let mut renderer: Option<Renderer> = None;
     let mut tally = EventTally::default();
     let mut export_dumps: u64 = 0;
+    let dump_cfg = ghostframe_client_gpu::config::DumpConfig::from_env();
     let mut last_summary = std::time::Instant::now();
     // `0` means "the embedder didn't specify a count"; a `Renderer` with
     // zero export buffers is a rejected config (it could never publish a
@@ -468,7 +456,7 @@ pub(crate) fn run(
                 }
                 if let Some(pf) = published_frame {
                     tally.publishes += 1;
-                    maybe_dump_export(r, &pf, &mut export_dumps);
+                    maybe_dump_export(r, &pf, &mut export_dumps, &dump_cfg);
                     let frame_id = pf.frame_id;
                     *published.lock().unwrap_or_else(|e| e.into_inner()) = Some(pf);
                     queue.push(ClientEvent::FrameReady { frame_id });

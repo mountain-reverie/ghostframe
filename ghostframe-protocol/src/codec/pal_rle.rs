@@ -350,17 +350,24 @@ pub fn encode_pal_rle_payload(
     out
 }
 
-/// Cheap 32-bit fingerprint of a palette's first 8 BGRA colour bytes.
-/// Stable across server/client so we can match log lines.
-fn palette_fingerprint(p: &PaletteEntry) -> u32 {
-    let mut acc: u32 = (p.count as u32) << 24;
-    let count = p.count as usize;
-    for i in 0..count {
-        for b in 0..4 {
-            acc = acc
-                .wrapping_mul(0x01000193)
-                .wrapping_add(p.colors[i][b] as u32);
-        }
+/// Cheap 32-bit fingerprint of a palette: the colour count seeded into the
+/// top byte, then an FNV-1a-style multiply-add over every BGRA byte of the
+/// first `count` colours. Stable across server and client so diagnostic
+/// logs on both sides can be matched; the web client calls the same code
+/// through the wasm export `paletteFingerprint`.
+pub fn palette_fingerprint(p: &PaletteEntry) -> u32 {
+    let count = (p.count as usize).min(MAX_PALETTE_COUNT);
+    palette_fingerprint_bgra(p.colors[..count].as_flattened())
+}
+
+/// [`palette_fingerprint`] over a palette block already laid out as
+/// `count * 4` BGRA bytes, which is the form the client uploads to the
+/// atlas. `count` is `bgra.len() / 4`, truncated to a byte exactly as the
+/// `PaletteEntry` field is.
+pub fn palette_fingerprint_bgra(bgra: &[u8]) -> u32 {
+    let mut acc: u32 = (((bgra.len() / 4) & 0xff) as u32) << 24;
+    for &b in bgra {
+        acc = acc.wrapping_mul(0x01000193).wrapping_add(b as u32);
     }
     acc
 }

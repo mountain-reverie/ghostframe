@@ -59,3 +59,22 @@ fn adaptation_context_with_zero_bytes_per_us_preserves_cost() {
     assert_eq!(c.adaptation_context().last_update_seq, 1);
     assert_eq!(c.adaptation_context().bytes_per_us, 0.0);
 }
+
+#[test]
+fn classifier_new_applies_cost_config_and_default_is_unchanged() {
+    use crate::config::{ClassifierConfig, CostModelConfig};
+    use crate::tile::classifier::Classifier;
+    let d = Classifier::new(ClassifierConfig::default());
+    let stock = CostModel::default();
+    assert_eq!(d.cost.cdf53_us, stock.cdf53_us);
+    assert_eq!(d.cost.h264_frame_bytes, stock.h264_frame_bytes);
+    let tuned = Classifier::new(ClassifierConfig {
+        cost: CostModelConfig {
+            cdf53_us: Some(500.0),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    assert_eq!(tuned.cost.cdf53_us, 500.0);
+    assert_eq!(tuned.cost.palrle_us, stock.palrle_us);
+}
