@@ -3911,6 +3911,11 @@ async fn e2e_cdf53_dirty_inverse_matches_full_grid() -> Result<()> {
     let h = r["height"].as_u64().unwrap();
     let differing = r["differingPixels"].as_u64().unwrap();
     let non_blank = r["nonBlankPixels"].as_u64().unwrap();
+    let cdf53_entries = r["cdf53Entries"].as_u64().unwrap();
+    assert!(
+        cdf53_entries > 0,
+        "no CDF53 tile reached the client: the full-grid lift had nothing to compare"
+    );
     eprintln!("full-grid diff: {w}x{h}, differing={differing}, nonBlank={non_blank}");
     assert!(
         non_blank * 2 > w * h,

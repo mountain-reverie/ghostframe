@@ -58,7 +58,13 @@ export function installCdf53Debug(
       ) differingPixels++;
       if (after[i] | after[i + 1] | after[i + 2]) nonBlankPixels++;
     }
-    return { width: w, height: h, differingPixels, nonBlankPixels };
+    return {
+      width: w,
+      height: h,
+      differingPixels,
+      nonBlankPixels,
+      cdf53Entries: renderer.cdf53Pipeline.totalEntries,
+    };
   };
 
   // M3.3b diagnostic: test-only hook to drive Cdf53 inverse with hand-supplied
