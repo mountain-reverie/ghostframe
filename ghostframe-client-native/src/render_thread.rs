@@ -265,6 +265,11 @@ struct EventTally {
     /// about that). If this is 0 while `tile_ready` is in the thousands, the
     /// client is working and the remote screen is blank.
     tile_ready_nonblack: u64,
+    /// Whether `record` scans each `TileReady` for non-black pixels. That is
+    /// a pass over every tile's bytes on the render thread, and the result
+    /// only reaches the debug-level summary, so it runs only when that level
+    /// was enabled when the tally was built.
+    scan_nonblack: bool,
     tile_payload: u64,
     frame_dimensions: u64,
     needs_h264: u64,
@@ -283,14 +288,26 @@ struct EventTally {
 }
 
 impl EventTally {
+    fn new() -> Self {
+        Self::with_scan(tracing::enabled!(tracing::Level::DEBUG))
+    }
+
+    fn with_scan(scan_nonblack: bool) -> Self {
+        EventTally {
+            scan_nonblack,
+            ..Self::default()
+        }
+    }
+
     fn record(&mut self, ev: &ghostframe_client_core::Event) {
         use ghostframe_client_core::Event as E;
         match ev {
             E::TileReady { rgba, .. } => {
                 self.tile_ready += 1;
-                if rgba
-                    .chunks_exact(4)
-                    .any(|p| p[0] != 0 || p[1] != 0 || p[2] != 0)
+                if self.scan_nonblack
+                    && rgba
+                        .chunks_exact(4)
+                        .any(|p| p[0] != 0 || p[1] != 0 || p[2] != 0)
                 {
                     self.tile_ready_nonblack += 1;
                 }
@@ -334,7 +351,7 @@ impl EventTally {
             releases = self.releases,
             "render thread: 1s summary"
         );
-        *self = Self::default();
+        *self = Self::with_scan(self.scan_nonblack);
     }
 }
 
@@ -378,7 +395,7 @@ pub(crate) fn run(
         }
     };
     let mut renderer: Option<Renderer> = None;
-    let mut tally = EventTally::default();
+    let mut tally = EventTally::new();
     let mut export_dumps: u64 = 0;
     let dump_cfg = ghostframe_client_gpu::config::DumpConfig::from_env();
     let mut last_summary = std::time::Instant::now();
@@ -550,6 +567,25 @@ pub(crate) fn run(
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn nonblack_scan_runs_only_when_enabled() {
+        let ev = CoreEvent::TileReady {
+            frame_seq: 0,
+            tile_x: 0,
+            tile_y: 0,
+            rgba: vec![9u8; 32 * 32 * 4],
+        };
+        let mut on = EventTally::with_scan(true);
+        let mut off = EventTally::with_scan(false);
+        on.record(&ev);
+        off.record(&ev);
+        assert_eq!((on.tile_ready, on.tile_ready_nonblack), (1, 1));
+        assert_eq!((off.tile_ready, off.tile_ready_nonblack), (1, 0));
+        // The setting survives the once-a-second reset.
+        on.flush_log();
+        assert!(on.scan_nonblack && on.tile_ready == 0);
+    }
 
     fn tile(x: u8) -> RenderMsg {
         RenderMsg::Core(CoreEvent::TileReady {
