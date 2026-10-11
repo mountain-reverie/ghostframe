@@ -3888,6 +3888,42 @@ async fn e2e_cdf53_lossless_buildup_chromium() -> Result<()> {
     setup.browser.close().await
 }
 
+/// PC-1 (web): the dirty-list CDF53 inverse must leave the framebuffer
+/// bit-identical to a full-grid inverse. Once a gradient has built up to
+/// lossless, every tile has received passes; the `?debug` hook reads the whole
+/// framebuffer, lifts every tile that has ever received a pass, reads it again
+/// and counts differing pixels. A tile the host-built list missed would be
+/// stale or blank before and correct after. Also requires the framebuffer to be
+/// non-blank, so an all-black screen cannot pass.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_cdf53_dirty_inverse_matches_full_grid() -> Result<()> {
+    let mut setup = setup_e2e_webgpu_gpu_with_env(
+        "--gradient --drm-direct",
+        &[("GHOSTFRAME_ENABLE_CDF53", "1")],
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_secs(15)).await;
+    let r: serde_json::Value = setup
+        .browser
+        .evaluate("(async () => await window.__cdf53FullGridDiff())()")
+        .await?;
+    let w = r["width"].as_u64().unwrap();
+    let h = r["height"].as_u64().unwrap();
+    let differing = r["differingPixels"].as_u64().unwrap();
+    let non_blank = r["nonBlankPixels"].as_u64().unwrap();
+    eprintln!("full-grid diff: {w}x{h}, differing={differing}, nonBlank={non_blank}");
+    assert!(
+        non_blank * 2 > w * h,
+        "framebuffer is mostly blank ({non_blank} of {} pixels lit): nothing to compare",
+        w * h
+    );
+    assert_eq!(
+        differing, 0,
+        "dirty-list inverse left {differing} pixels different from a full-grid inverse"
+    );
+    setup.browser.close().await
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_cdf53_lossless_buildup_firefox() -> Result<()> {
     let mut setup = setup_e2e_webgpu_gpu_with_env_firefox(

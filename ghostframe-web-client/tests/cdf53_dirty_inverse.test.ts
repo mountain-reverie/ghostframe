@@ -202,6 +202,33 @@ describe('Cdf53Pipeline dirty-tile inverse', () => {
     expect(coefClears.length).toBeGreaterThanOrEqual(1);
   });
 
+  it('rebuilds the pass-2 bind group when only the framebuffer view changes (same tile count)', () => {
+    // The L1 pass-2 bind group holds the framebuffer view. A resize that keeps
+    // the tile count must still re-point it, or the inverse paints into the
+    // destroyed texture and the screen stays blank.
+    const device = makeDevice();
+    const pipe = new Cdf53Pipeline(device);
+    const viewA = { id: 'A' } as unknown as GPUTextureView;
+    const viewB = { id: 'B' } as unknown as GPUTextureView;
+    pipe.resize(MAX_TILES, viewA, COLS);
+    pipe.uploadBatch([entry(1, 1, 1, 0)]);
+    pipe.resize(MAX_TILES, viewB, COLS);
+    const e = new FakeEncoder() as unknown as GPUCommandEncoder & FakeEncoder;
+    pipe.encodeInverse(e);
+    expect(e.passes).toHaveLength(4);
+    const viewOf = (p: FakeEncoder['passes'][number]) =>
+      p.bindGroup.entries.find((x) => x.binding === 2)!.resource as unknown;
+    expect(viewOf(e.passes[3])).toBe(viewB);
+    // Every bound buffer is still live (same allocation): the list binding
+    // must keep pointing at the dirty list the batch was written to.
+    const listBuf = genBufferOf(e.passes[0], 0);
+    const writes = (device as unknown as { queue: FakeQueue }).queue.writes;
+    expect(writes.some((w) => w.buf === listBuf && w.words[0] === 1 * COLS + 1)).toBe(true);
+    // And the encoded tile count survives the resize (a resize does not drop
+    // a batch that is already uploaded for the next present).
+    expect(e.passes[0].groups).toBe(1);
+  });
+
   it('passesProcessed goes up as one span write with the right contents', () => {
     const { pipe, device } = setup();
     const before = device.queue.writes.length;

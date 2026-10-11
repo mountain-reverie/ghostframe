@@ -33,6 +33,34 @@ export function installCdf53Debug(
     }
   }
 
+  // PC-1 proof hook: the framebuffer after the normal (dirty-list) inverse,
+  // versus the same framebuffer after lifting EVERY tile that has received a
+  // pass. If the host-built list ever missed a tile, that tile is stale or
+  // blank before the full-grid lift and correct after it, so it is counted
+  // here. Only meaningful once the stream has settled (no passes in flight).
+  window.__cdf53FullGridDiff = async () => {
+    if (!window.__readPixelRect) {
+      throw new Error('__cdf53FullGridDiff needs the pixel readbacks: load the page with ?e2e as well as ?debug');
+    }
+    const w = renderer.framebuffer.width;
+    const h = renderer.framebuffer.height;
+    const before = await window.__readPixelRect(0, 0, w, h);
+    const encoder = renderer.device.createCommandEncoder();
+    renderer.cdf53Pipeline.encodeInverseAll(encoder);
+    renderer.device.queue.submit([encoder.finish()]);
+    const after = await window.__readPixelRect(0, 0, w, h);
+    let differingPixels = 0;
+    let nonBlankPixels = 0;
+    for (let i = 0; i < before.length; i += 4) {
+      if (
+        before[i] !== after[i] || before[i + 1] !== after[i + 1] ||
+        before[i + 2] !== after[i + 2] || before[i + 3] !== after[i + 3]
+      ) differingPixels++;
+      if (after[i] | after[i + 1] | after[i + 2]) nonBlankPixels++;
+    }
+    return { width: w, height: h, differingPixels, nonBlankPixels };
+  };
+
   // M3.3b diagnostic: test-only hook to drive Cdf53 inverse with hand-supplied
   // coefficients (bypasses the integrate shader). Removed once the wavelet
   // math is verified.

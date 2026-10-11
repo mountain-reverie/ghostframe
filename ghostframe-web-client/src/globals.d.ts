@@ -61,6 +61,12 @@ interface Window {
   __cdf53CoverageSummary(): { summary: unknown; incomplete: unknown };
 
   // ----- ?debug only (cdf53_debug.ts); absent in a normal session ------------
+  __cdf53FullGridDiff?: () => Promise<{
+    width: number;
+    height: number;
+    differingPixels: number;
+    nonBlankPixels: number;
+  }>;
   __cdf53TestInverse?: (coeffsI16: number[], tileIdx?: number) => Promise<number[]>;
   __cdf53TestIntegrate?: (
     encodedPasses: number[][],
