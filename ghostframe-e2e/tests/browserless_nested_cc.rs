@@ -483,7 +483,11 @@ async fn s3_probe_under_load_capacity_steps() {
 /// achieves on an uncapped link, so "heavy" is a measured number rather than
 /// a guess. Needed because the capacity-hint and pacer terms make the offered
 /// load far smaller than the raw tile bytes would suggest.
+///
+/// `#[ignore]`d (~100 s): run with `-- --ignored --nocapture` when re-deriving
+/// the load profiles.
 #[tokio::test(start_paused = true)]
+#[ignore = "calibration printout, ~100 s; run on demand"]
 async fn calibrate_offered_load() {
     for tiles in [8usize, 16, 32, 64, 96, 160] {
         let profile = LoadProfile {
