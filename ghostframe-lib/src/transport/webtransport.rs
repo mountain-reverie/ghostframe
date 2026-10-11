@@ -44,6 +44,12 @@ impl StreamBuf {
     }
 }
 
+/// Bytes the handshake will hold for one stream while waiting for it to
+/// become a decodable SETTINGS or CONNECT. Both are a few hundred bytes at
+/// most; without a cap a peer can feed an unterminated one without limit
+/// before any authorisation exists.
+pub(crate) const MAX_HELD_STREAM_BYTES: usize = 16 * 1024;
+
 // ─── main struct ─────────────────────────────────────────────────────────────
 
 /// Sans-IO WebTransport handshake state for one QUIC connection.
@@ -70,6 +76,10 @@ pub struct WebTransportServer {
     /// Data received on non-session bidi streams after the session is established.
     /// Used for ReceiverFeedback messages from the client.
     feedback_queue: Vec<Vec<u8>>,
+    /// Streams abandoned for exceeding [`MAX_HELD_STREAM_BYTES`]. Their later
+    /// bytes are read (to keep flow control moving) and discarded, rather than
+    /// starting a fresh buffer that would mis-parse as a new message.
+    abandoned_streams: std::collections::HashSet<StreamId>,
 }
 
 impl WebTransportServer {
@@ -85,6 +95,7 @@ impl WebTransportServer {
             stream_bufs: HashMap::new(),
             pending_bidi_streams: Vec::new(),
             feedback_queue: Vec::new(),
+            abandoned_streams: std::collections::HashSet::new(),
         }
     }
 
@@ -237,6 +248,10 @@ impl WebTransportServer {
             return;
         }
 
+        if self.abandoned_streams.contains(&sid) {
+            return;
+        }
+
         // Accumulate into stream buffer.
         let buf = self.stream_bufs.entry(sid).or_default();
         buf.extend(&bytes);
@@ -247,6 +262,27 @@ impl WebTransportServer {
         } else {
             // Unidirectional: try to decode as SETTINGS.
             self.try_decode_settings(sid);
+        }
+
+        self.bound_held_stream(sid);
+    }
+
+    /// Whatever the decoders could not consume is still held for `sid`.
+    /// Bound it: past [`MAX_HELD_STREAM_BYTES`] the stream is abandoned.
+    fn bound_held_stream(&mut self, sid: StreamId) {
+        if self
+            .stream_bufs
+            .get(&sid)
+            .is_some_and(|b| b.as_slice().len() > MAX_HELD_STREAM_BYTES)
+        {
+            tracing::warn!(
+                stream_id = ?sid,
+                limit = MAX_HELD_STREAM_BYTES,
+                "undecodable handshake stream exceeded its buffer cap; abandoning it"
+            );
+            self.stream_bufs.remove(&sid);
+            self.pending_bidi_streams.retain(|&s| s != sid);
+            self.abandoned_streams.insert(sid);
         }
     }
 
@@ -493,6 +529,40 @@ mod tests {
     use super::*;
     use bytes::BytesMut;
     use web_transport_proto::{Settings, VarInt};
+
+    // ── Pre-handshake buffer cap ─────────────────────────────────────────────
+
+    fn sid(n: u64) -> StreamId {
+        StreamId::from(quinn_proto::VarInt::from_u64(n).unwrap())
+    }
+
+    #[test]
+    fn held_stream_over_the_cap_is_abandoned_and_stays_abandoned() {
+        let mut wt = WebTransportServer::new();
+        let s = sid(0); // client-initiated bidi
+        wt.pending_bidi_streams.push(s);
+        wt.stream_bufs
+            .entry(s)
+            .or_default()
+            .extend(&vec![0xAA; MAX_HELD_STREAM_BYTES + 1]);
+        wt.bound_held_stream(s);
+        assert!(!wt.stream_bufs.contains_key(&s), "buffer must be dropped");
+        assert!(wt.pending_bidi_streams.is_empty());
+        assert!(wt.abandoned_streams.contains(&s));
+    }
+
+    #[test]
+    fn held_stream_at_the_cap_is_kept() {
+        let mut wt = WebTransportServer::new();
+        let s = sid(4);
+        wt.stream_bufs
+            .entry(s)
+            .or_default()
+            .extend(&vec![0xAA; MAX_HELD_STREAM_BYTES]);
+        wt.bound_held_stream(s);
+        assert!(wt.stream_bufs.contains_key(&s));
+        assert!(wt.abandoned_streams.is_empty());
+    }
 
     // ── Construction ─────────────────────────────────────────────────────────
 

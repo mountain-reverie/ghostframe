@@ -403,6 +403,13 @@ pub fn select_pacing_mode(samples_seen: u64) -> PacingMode {
 /// microseconds. Pure arithmetic, factored out of `combine_pacing_budget` so
 /// it's independently checkable and so `bwe_bench.rs` can pin the unit
 /// conversion directly.
+/// Clamp a GPU-written compact-list count to the number of tiles on the grid,
+/// the most entries the list can legitimately hold. A buggy shader or a
+/// device fault must not turn the count into an out-of-bounds slice length.
+pub(crate) fn clamp_gpu_tile_count(raw: u32, tiles: usize) -> usize {
+    (raw as usize).min(tiles)
+}
+
 pub fn pacer_tick_budget_bytes(pacer_rate_bps: u64, tick_interval_us: f64) -> usize {
     (((pacer_rate_bps as f64) / 8.0) * tick_interval_us / 1_000_000.0) as usize
 }
@@ -613,6 +620,14 @@ const EVICT_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(1)
 /// QUIC application close codes (ours).
 const CLOSE_CODE_EVICTED: u32 = 0x6701;
 const CLOSE_CODE_NO_HELLO: u32 = 0x6702;
+const CLOSE_CODE_TAKEOVER_RATE_LIMITED: u32 = 0x6703;
+/// Minimum time between one HELLO displacing a live session and the next.
+/// Each takeover evicts the incumbent and runs the session reset (palette,
+/// classifier, scheduler, an all-tiles-dirty burst and an IDR), so two
+/// clients alternating HELLOs would keep the server permanently resetting.
+/// A refused newcomer is closed; the incumbent is untouched. A reconnect
+/// after the incumbent has gone is not a takeover and is never limited.
+const TAKEOVER_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// A pending server-initiated close of one connection.
 #[derive(Clone, Copy, Debug)]
@@ -861,6 +876,8 @@ pub struct IoBridge {
     /// When the last session ended, so the next connect can report how long
     /// the server was serving nobody. `None` before the first disconnect.
     last_disconnect_at: Option<std::time::Instant>,
+    /// When a HELLO last displaced a live incumbent; see `TAKEOVER_MIN_INTERVAL`.
+    last_takeover_at: Option<std::time::Instant>,
     /// Persistent palette table for PalRLE codec emission. M3.2a single-client
     /// invariant — flat server-wide state.
     pub(crate) palette_table: crate::encoder::pal_rle::PaletteTable,
@@ -1551,6 +1568,7 @@ impl IoBridge {
             loop_arm_trace: Vec::new(),
             session_started_at: None,
             last_disconnect_at: None,
+            last_takeover_at: None,
             palette_table: crate::encoder::pal_rle::PaletteTable::new(),
             client_caps: crate::transport::client_caps::ClientCapabilities::default(),
             // `fec_k` parses unconditionally in every build (see
@@ -3780,7 +3798,9 @@ impl IoBridge {
                     }
                     if let Some((msg, consumed)) = decode_input_msg(&buf[offset..]) {
                         let injected = self.input_injector.is_some();
-                        tracing::debug!(?msg, injected, "input event dispatched");
+                        // Not `?msg`: at the default `ghostframe=debug` filter that
+                        // writes every keystroke the user types into the journal.
+                        tracing::trace!(injected, "input event dispatched");
                         if let Some(injector) = self.input_injector.as_ref() {
                             apply_input(injector.as_ref(), &msg);
                         }
@@ -4961,12 +4981,23 @@ impl IoBridge {
                             gpu.cdf53_coefficients_ptr,
                         )
                     };
-                    let cdf53_count = unsafe { *cdf53_compact_count_ptr };
+                    // The count is written by the GPU; clamp it to the list's
+                    // capacity (one slot per tile) before it sizes a slice.
+                    let cdf53_count = clamp_gpu_tile_count(
+                        unsafe { *cdf53_compact_count_ptr },
+                        (grid.cols * grid.rows) as usize,
+                    );
                     if cdf53_count > 0 {
                         let cdf53_list = unsafe {
                             std::slice::from_raw_parts(cdf53_compact_list_ptr, cdf53_count as usize)
                         };
                         for (slot, &flat_tile_idx) in cdf53_list.iter().enumerate() {
+                            // Also GPU-written: an index off the grid would
+                            // wrap in the u8 casts below and address the
+                            // wrong tile.
+                            if flat_tile_idx >= grid.cols * grid.rows {
+                                continue;
+                            }
                             let tile_x = (flat_tile_idx % cols) as u8;
                             let tile_y = (flat_tile_idx / cols) as u8;
                             // Read 3 * 1024 = 3072 i32 values from the compact-slot
@@ -6531,6 +6562,7 @@ impl IoBridge {
             loop_arm_trace: Vec::new(),
             session_started_at: None,
             last_disconnect_at: None,
+            last_takeover_at: None,
             palette_table: crate::encoder::pal_rle::PaletteTable::new(),
             client_caps: crate::transport::client_caps::ClientCapabilities::default(),
             fec_k: lib_config.transport.fec_k.unwrap_or(0),
@@ -6876,6 +6908,26 @@ impl IoBridge {
         // check below needs to know who held the session *before* this
         // HELLO, not `from` itself.
         let incumbent = self.last_hello_from;
+        if incumbent.is_some_and(|i| i != from) {
+            let now = std::time::Instant::now();
+            if self.takeover_rate_limited(now) {
+                tracing::warn!(
+                    ?from,
+                    ?incumbent,
+                    "HELLO would displace the live session again within {:?}; closing the newcomer",
+                    TAKEOVER_MIN_INTERVAL
+                );
+                self.close_deadlines.insert(
+                    from,
+                    CloseDeadline {
+                        at: now,
+                        code: CLOSE_CODE_TAKEOVER_RATE_LIMITED,
+                    },
+                );
+                return;
+            }
+            self.last_takeover_at = Some(now);
+        }
         self.last_hello_from = Some(from);
         // The HELLO arrived: the never-HELLO deadline no longer applies.
         self.close_deadlines.remove(&from);
@@ -7145,6 +7197,11 @@ impl IoBridge {
         );
     }
 
+    fn takeover_rate_limited(&self, now: std::time::Instant) -> bool {
+        self.last_takeover_at
+            .is_some_and(|t| now.saturating_duration_since(t) < TAKEOVER_MIN_INTERVAL)
+    }
+
     /// Arm the never-HELLO deadline for a freshly accepted connection.
     fn arm_hello_deadline(&mut self, handle: ConnectionHandle, now: std::time::Instant) {
         self.close_deadlines.insert(
@@ -7180,6 +7237,7 @@ impl IoBridge {
                 let reason: &'static [u8] = match d.code {
                     CLOSE_CODE_EVICTED => b"evicted",
                     CLOSE_CODE_NO_HELLO => b"no HELLO before deadline",
+                    CLOSE_CODE_TAKEOVER_RATE_LIMITED => b"session takeover rate limit",
                     _ => b"closed",
                 };
                 tracing::info!(?handle, code = d.code, "closing connection at deadline");
@@ -11946,6 +12004,57 @@ mod tests {
             !bridge.wt_sessions.contains_key(&h),
             "sweep forgets the handle"
         );
+    }
+
+    #[test]
+    fn gpu_tile_count_is_clamped_to_the_grid() {
+        assert_eq!(clamp_gpu_tile_count(0, 100), 0);
+        assert_eq!(clamp_gpu_tile_count(100, 100), 100);
+        assert_eq!(clamp_gpu_tile_count(101, 100), 100);
+        assert_eq!(clamp_gpu_tile_count(u32::MAX, 100), 100);
+    }
+
+    #[tokio::test]
+    async fn a_second_takeover_inside_the_interval_is_refused_and_the_newcomer_closed() {
+        let (a, b, c) = (
+            ConnectionHandle(0),
+            ConnectionHandle(1),
+            ConnectionHandle(2),
+        );
+        let mut bridge = test_bridge_with_sessions(&[a, b, c]).await;
+        bridge.apply_hello(a, hello(false));
+        // First takeover (a -> b) is allowed.
+        bridge.apply_hello(b, hello(false));
+        assert!(bridge.is_live(b));
+        // An immediate second takeover (b -> c) is not.
+        bridge.apply_hello(c, hello(false));
+        assert!(bridge.is_live(b), "incumbent must be untouched");
+        assert!(!bridge.is_live(c), "newcomer must not become live");
+        assert_eq!(
+            bridge.close_deadlines.get(&c).map(|d| d.code),
+            Some(CLOSE_CODE_TAKEOVER_RATE_LIMITED)
+        );
+        // Once the interval has passed, c may take over.
+        bridge.last_takeover_at = Some(
+            std::time::Instant::now() - TAKEOVER_MIN_INTERVAL - std::time::Duration::from_millis(1),
+        );
+        bridge.apply_hello(c, hello(false));
+        assert!(bridge.is_live(c));
+    }
+
+    #[tokio::test]
+    async fn reconnect_after_the_incumbent_left_is_not_rate_limited() {
+        let (a, b, c) = (
+            ConnectionHandle(0),
+            ConnectionHandle(1),
+            ConnectionHandle(2),
+        );
+        let mut bridge = test_bridge_with_sessions(&[a, b, c]).await;
+        bridge.apply_hello(a, hello(false));
+        bridge.apply_hello(b, hello(false)); // takeover, stamps last_takeover_at
+        bridge.forget_session(b); // incumbent departs
+        bridge.apply_hello(c, hello(false)); // reconnect, not a takeover
+        assert!(bridge.is_live(c));
     }
 
     #[tokio::test]
