@@ -111,7 +111,7 @@ jobs:
       # documents that delivered bytes and datagram counts are not (QUIC
       # framing shifts with task-scheduling order). Running these serially
       # keeps that variance from compounding across nine concurrent scenes.
-      - run: cargo test --test netsim --test netsim_pump --test scene_tiles --test framebuffer
+      - run: cargo test --test netsim --test netsim_pump --test netsim_burst --test fec_burst_analysis --test scene_tiles --test framebuffer
       - run: cargo test --test browserless_runner -- --test-threads=1
       # Split out of browserless_runner: two 20s bottleneck scenes that both
       # pass in isolation and flaked ~1 run in 9 inside a 22-test sequential
@@ -121,6 +121,8 @@ jobs:
       - run: cargo test --test browserless_determinism -- --test-threads=1
       - run: cargo test --test browserless_queue_latency -- --test-threads=1
       - run: cargo test --test browserless_blocked_path -- --test-threads=1
+      - run: cargo test --test browserless_nested_cc -- --test-threads=1
+      - run: cargo test --test browserless_burst_loss -- --test-threads=1
 
   harness-smoke:
     name: harness-smoke
