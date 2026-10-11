@@ -4989,7 +4989,7 @@ impl IoBridge {
                     );
                     if cdf53_count > 0 {
                         let cdf53_list = unsafe {
-                            std::slice::from_raw_parts(cdf53_compact_list_ptr, cdf53_count as usize)
+                            std::slice::from_raw_parts(cdf53_compact_list_ptr, cdf53_count)
                         };
                         for (slot, &flat_tile_idx) in cdf53_list.iter().enumerate() {
                             // Also GPU-written: an index off the grid would
@@ -6212,7 +6212,7 @@ impl IoBridge {
                         if let Some(conn) = self.server.connections.get_mut(&handle) {
                             while let Some(payload) = wt.recv_datagram(conn) {
                                 if let Some(response) = handle_datagram_payload(&payload) {
-                                    tracing::debug!(?handle, "ping received, sending pong");
+                                    tracing::trace!(?handle, "ping received, sending pong");
                                     if let Err(e) = wt.send_datagram(conn, response) {
                                         tracing::warn!(?handle, error = ?e, "failed to send pong");
                                     }
@@ -6909,7 +6909,7 @@ impl IoBridge {
         // HELLO, not `from` itself.
         let incumbent = self.last_hello_from;
         if incumbent.is_some_and(|i| i != from) {
-            let now = std::time::Instant::now();
+            let now = now_std();
             if self.takeover_rate_limited(now) {
                 tracing::warn!(
                     ?from,
