@@ -20,8 +20,8 @@ pub mod load_profile;
 pub mod net_shape;
 pub mod pixels;
 pub mod scene;
-pub mod scroll_scene;
 pub mod scene_tiles;
+pub mod scroll_scene;
 pub mod transport;
 pub mod weston;
 
