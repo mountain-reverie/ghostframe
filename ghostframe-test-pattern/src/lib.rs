@@ -11,6 +11,7 @@ pub mod mixed;
 pub mod mode_switch;
 pub mod palette_churn;
 pub mod palrle_exact;
+pub mod scroll_text;
 pub mod solid_per_tile;
 pub mod subtle_drift;
 pub mod text_grid;

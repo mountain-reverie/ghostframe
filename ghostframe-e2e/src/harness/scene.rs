@@ -131,7 +131,7 @@ const DOCKER_HOST_IP: &str = "172.17.0.1";
 /// tears down the containers, browser, and compositor in reverse field order
 /// (Rust drops fields top-to-bottom, so `_xvfb` is listed last so it outlives
 /// `_browser`).
-struct ScenarioStack {
+pub(crate) struct ScenarioStack {
     /// headscale container (kept alive via RAII).
     _headscale: ContainerAsync<GenericImage>,
     /// ghostframe-server container (kept alive via RAII).
@@ -150,9 +150,9 @@ struct ScenarioStack {
     /// Weston compositor guard (must outlive `_browser`).
     _xvfb: crate::harness::weston::WestonGuard,
     /// The open browser page pointed at the web client.
-    page: chromiumoxide::Page,
+    pub(crate) page: chromiumoxide::Page,
     /// Docker container name, used to collect logs after the run.
-    server_container_name: String,
+    pub(crate) server_container_name: String,
     /// Host-namespace PID of the ghostframe-xdaemon process. On rootful
     /// Docker, container processes appear in `/proc` under their host PID.
     /// We locate this by reading the container root's host PID from
@@ -171,7 +171,7 @@ struct ScenarioStack {
 /// Mirrors `setup_e2e_inner_with_url_extra` in `tests/e2e.rs` but is
 /// self-contained inside the library so `codec_report` can call it without
 /// depending on `tests/`.
-async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioStack> {
+pub(crate) async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioStack> {
     crate::harness::cleanup::cleanup_stale_xvfb_sockets();
 
     let hs_server_url = format!("http://{DOCKER_HOST_IP}:{HEADSCALE_HOST_PORT}");
@@ -267,6 +267,9 @@ async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioStack> {
         // the scheduler's refinement loop to make progress within bench
         // scene-duration. e2e_progressive_refinement sets this to 30.
         "CAPTURE_FPS",
+        // Pin the DRM scanout mode (e.g. 1920x1080) for scenes that need
+        // production tile counts; unset keeps the connector's preferred mode.
+        "GHOSTFRAME_DRM_MODE",
     ] {
         if let Ok(val) = std::env::var(var) {
             server_image = server_image.with_env_var(var, val);
@@ -334,7 +337,13 @@ async fn launch_scenario_stack(spec: &SceneSpec) -> Result<ScenarioStack> {
 
     // Use localhost (not 127.0.0.1) so the URL matches the SAN that
     // looks most natural; both SANs are in the cert anyway.
-    let page_url = format!("https://127.0.0.1:{}/", forwarder.port());
+    // GHOSTFRAME_SCENE_PAGE_QUERY (e.g. `e2e=lossless`) is appended as the
+    // page's query string; scenes that screenshot the canvas use it to pin the
+    // canvas at (0, 0) and hide the page chrome.
+    let page_query = std::env::var("GHOSTFRAME_SCENE_PAGE_QUERY")
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
+    let page_url = format!("https://127.0.0.1:{}/{page_query}", forwarder.port());
     let page = browser.new_page(&page_url).await?;
 
     // Wait for "Receiving frames" before returning — ensures the stack is live.
@@ -541,7 +550,7 @@ pub async fn run_scene(spec: &SceneSpec) -> Result<SceneResult> {
 // Helper: monotonic clock
 // ---------------------------------------------------------------------------
 
-fn monotonic_now_ns() -> u64 {
+pub(crate) fn monotonic_now_ns() -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -656,7 +665,7 @@ async fn sample_proc_loop(
 // Helper: parse JSON server telemetry
 // ---------------------------------------------------------------------------
 
-fn parse_server_telemetry(
+pub(crate) fn parse_server_telemetry(
     stderr_lines: &str,
 ) -> (
     Vec<ServerTelemetryRecord>,

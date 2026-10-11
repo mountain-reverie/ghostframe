@@ -139,6 +139,32 @@ struct Args {
     #[arg(long)]
     subtle_drift: Option<u64>,
 
+    /// With `--drm-direct`: paint a text document that scrolls vertically
+    /// (`--scroll-rows-per-frame` pixel rows per frame at `--scroll-fps` for
+    /// `--scroll-secs` seconds), then hold the final frame. Logs
+    /// `scroll-event phase=start|stop mono_ns=...` for the bench harness.
+    /// `--scroll-rows-per-frame 0` is the static control.
+    #[arg(long)]
+    scroll_text: bool,
+
+    /// Pixel rows scrolled per frame by `--scroll-text`.
+    #[arg(long, default_value_t = ghostframe_test_pattern::scroll_text::DEFAULT_ROWS_PER_FRAME)]
+    scroll_rows_per_frame: u32,
+
+    /// Seconds of scrolling in `--scroll-text`.
+    #[arg(long, default_value_t = ghostframe_test_pattern::scroll_text::DEFAULT_SCROLL_SECS)]
+    scroll_secs: u64,
+
+    /// Paint rate (frames per second) of `--scroll-text`.
+    #[arg(long, default_value_t = ghostframe_test_pattern::scroll_text::DEFAULT_FPS)]
+    scroll_fps: u32,
+
+    /// `--scroll-text` waits for this file to exist before starting to scroll
+    /// (the harness creates it once the browser has converged). Unset: start
+    /// 1 s after the first paint.
+    #[arg(long)]
+    scroll_go_file: Option<String>,
+
     /// (Ignored — kept for CLI compat.) Window width.
     #[arg(long, default_value = "640")]
     width: u16,
@@ -201,6 +227,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             return ghostframe_test_pattern::tile_pattern::run(&args.drm_device, class_name);
         }
+    }
+
+    // DRM-direct scrolling-text mode (text-under-motion bench scene).
+    if args.drm_direct && args.scroll_text {
+        return ghostframe_test_pattern::scroll_text::run(
+            &args.drm_device,
+            &ghostframe_test_pattern::scroll_text::ScrollConfig {
+                rows_per_frame: args.scroll_rows_per_frame,
+                scroll_secs: args.scroll_secs,
+                fps: args.scroll_fps.max(1),
+                go_file: args.scroll_go_file.clone(),
+            },
+        );
     }
 
     // DRM-direct text-grid mode: paint text glyphs directly to scanout,
