@@ -162,6 +162,11 @@ async fn an_empty_scene_is_byte_identical() {
         "empty scene delivered nothing, so byte equality proves nothing \
          about handshake determinism"
     );
+    // (Root cause of the earlier rare 3050-vs-3052 flake: the client's
+    // randomly skipped packet number, now pinned by the harness seeding the
+    // client endpoint RNG; see `the_empty_scene_s2c_bytes_are_stable_across_many_runs`.
+    // The server endpoint is still entropy-seeded, which is why c2s moves.)
+    //
     // Only the server->client direction is reproducible, and this test is
     // how that was established. Asserting both directions failed roughly one
     // run in three: `s2c` measured 3050 on every run, while `c2s` moved
@@ -200,11 +205,12 @@ async fn an_empty_scene_is_byte_identical() {
 /// server's ACK carries an extra gap range, two bytes. With an entropy-seeded
 /// client that moved `bytes_delivered_s2c` in roughly 1 run in 60, so a
 /// pairwise comparison passes ~97% of the time while the cause is still
-/// there. 400 runs would all agree by chance under that bug about 0.1% of the
-/// time; the harness pins the client endpoint's RNG to the scene seed so they
-/// must agree always.
+/// there; 400 runs all agree by chance under that bug about 0.2% of the
+/// time. The harness pins the client endpoint's RNG to the scene seed, which
+/// fixes the skipped number (it does not remove the dependence: a different
+/// seed whose skip hits the trigger value would settle on 3052, stably).
 #[tokio::test(start_paused = true)]
-async fn the_empty_scene_s2c_bytes_do_not_depend_on_the_skipped_packet_number() {
+async fn the_empty_scene_s2c_bytes_are_stable_across_many_runs() {
     let mut counts = std::collections::BTreeMap::<u64, u32>::new();
     for _ in 0..400 {
         let r = run_browserless(BrowserlessScene {
@@ -221,7 +227,10 @@ async fn the_empty_scene_s2c_bytes_do_not_depend_on_the_skipped_packet_number() 
         })
         .await
         .expect("run");
-        assert!(r.bytes_delivered_s2c > 0, "scene delivered nothing to the client");
+        assert!(
+            r.bytes_delivered_s2c > 0,
+            "scene delivered nothing to the client"
+        );
         *counts.entry(r.bytes_delivered_s2c).or_default() += 1;
     }
     assert_eq!(

@@ -123,10 +123,9 @@ impl ClientNet {
 
     /// Like [`ClientNet::new`], but with the QUIC endpoint's RNG pinned to
     /// `rng_seed`. For deterministic harnesses only: quinn-proto draws
-    /// connection IDs and the application-space packet number it deliberately
-    /// skips (uniform in `0..64`, RFC 9000 section 21.4 optimistic-ACK
-    /// defence) from that RNG, and a skipped number reaches the peer as an
-    /// extra ACK range. Production keeps the entropy seed.
+    /// the application-space packet number it deliberately skips (uniform in
+    /// `0..64`, RFC 9000 section 21.4 optimistic-ACK defence) from that RNG,
+    /// and a skipped number reaches the peer as an extra ACK range. Production keeps the entropy seed.
     pub fn with_rng_seed(
         config: ClientNetConfig,
         now_us: u64,
