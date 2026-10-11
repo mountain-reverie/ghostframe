@@ -174,3 +174,38 @@ fn a_short_payload_writes_only_the_rows_it_has() {
         "bottom half must survive a short payload"
     );
 }
+
+/// A hostile server's dimensions must neither allocate nor panic. 100000^2
+/// RGBA would be 40 GB; the point is that it is refused before sizing.
+#[test]
+fn hostile_dimensions_are_refused_without_allocating() {
+    let ctx = WgpuContext::new().expect("wgpu context");
+
+    for (w, h) in [(100_000, 100_000), (0, 1080), (1920, 0), (8193, 1080)] {
+        match Renderer::new(&ctx, w, h, 3, &[], false, false) {
+            Err(ghostframe_client_gpu::GpuError::InvalidDimensions { width, height }) => {
+                assert_eq!((width, height), (w, h));
+            }
+            Err(e) => panic!("{w}x{h}: wrong error {e}"),
+            Ok(_) => panic!("{w}x{h} must be refused"),
+        }
+    }
+
+    // Mid-session: the framebuffer keeps its size and stays usable.
+    let mut r = renderer(&ctx);
+    for (w, h) in [(100_000, 100_000), (0, 0), (u32::MAX, 1)] {
+        r.apply_event(
+            &ctx,
+            &Event::FrameDimensions {
+                width: w,
+                height: h,
+            },
+        );
+    }
+    let red = [0xFF, 0x00, 0x00, 0xFF];
+    r.apply_event(&ctx, &tile_ready(1, 1, solid_tile(red)));
+    r.flush(&ctx);
+    let fb = r.debug_read_framebuffer(&ctx);
+    assert_eq!(fb.len(), (W * H * 4) as usize, "framebuffer was resized");
+    assert_eq!(px(&fb, 48, 48), red);
+}

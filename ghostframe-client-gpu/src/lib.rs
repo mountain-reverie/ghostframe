@@ -193,4 +193,13 @@ pub enum GpuError {
     /// harder to notice than a rejected config.
     #[error("export_buffers must be at least 1 (got 0); a client with zero export buffers can never publish a frame")]
     NoExportBuffers,
+
+    /// A frame size outside `1..=MAX_FRAME_DIMENSION` per axis. The value
+    /// originates on the network, so it is refused before any texture,
+    /// buffer or export image is sized from it.
+    #[error(
+        "frame dimensions {width}x{height} are outside 1..={max} per axis",
+        max = ghostframe_client_core::MAX_FRAME_DIMENSION
+    )]
+    InvalidDimensions { width: u32, height: u32 },
 }
