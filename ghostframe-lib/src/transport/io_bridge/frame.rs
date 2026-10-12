@@ -637,817 +637,7 @@ impl IoBridge {
                     &frame.pixels
                 };
 
-                let grid = TileGrid::new(frame.width, frame.height);
-
-                // Phase A — serial palette-table allocation per dirty PalRle-feasible tile.
-                let cols = grid.cols;
-                let palrle_compact_count = analysis.palrle_compact_count;
-                let preps = self.phase_a_palette_allocation(
-                    cols,
-                    analysis.palrle_compact_list_slice(),
-                    analysis.per_tile_frame_palette_id_slice(),
-                    analysis.folded_into_slice(),
-                    analysis.frame_palette_set_slice(),
-                    // No bulk slice helper exists for index_buffer (only per-tile); keep inline.
-                    if palrle_compact_count > 0 && !analysis.index_buffer.is_null() {
-                        unsafe {
-                            std::slice::from_raw_parts(
-                                analysis.index_buffer,
-                                (palrle_compact_count * 512) as usize,
-                            )
-                        }
-                    } else {
-                        &[]
-                    },
-                );
-
-                // Phase B — rayon parallel encode.
-                let caps = self.client_caps;
-                #[cfg(any(test, feature = "test-loss-injection"))]
-                let inject = self.oob_inject_at;
-                #[cfg(not(any(test, feature = "test-loss-injection")))]
-                let inject: Option<(u32, u32)> = None;
-                // Only consume the one-shot injection when the target tile
-                // is actually in this frame's preps — otherwise the hook
-                // would be silently spent on the first PalRle frame whose
-                // preps happen to exclude the injection target.
-                #[cfg(any(test, feature = "test-loss-injection"))]
-                let inject_will_fire = inject
-                    .map(|xy| preps.iter().any(|p| p.tile_xy == xy))
-                    .unwrap_or(false);
-                let mut palrle_payloads =
-                    IoBridge::phase_b_encode_payloads_with_caps(&preps, &caps, inject);
-                #[cfg(any(test, feature = "test-loss-injection"))]
-                if inject_will_fire {
-                    self.oob_inject_at = None;
-                }
-
-                // Phase B — Cdf53 encode bit-plane passes for high-color tiles,
-                // enqueue into the scheduler's refinement queue.
-                {
-                    // Extract raw pointers from the GPU processor up-front so that
-                    // the immutable borrow of self.gpu_frame_processor ends before
-                    // the mutable borrows of self.scheduler below.
-                    // SAFETY: cdf53_compact_count_ptr, cdf53_compact_list_ptr, and
-                    // cdf53_coefficients_ptr are HOST_VISIBLE | HOST_COHERENT mapped
-                    // GPU memory, valid until the next process_frame call. This block
-                    // runs inside the current process_frame_gpu invocation, before
-                    // any subsequent call.
-                    let (cdf53_compact_count_ptr, cdf53_compact_list_ptr, cdf53_coefficients_ptr) = {
-                        let gpu = self.gpu_frame_processor.as_ref().unwrap();
-                        (
-                            gpu.cdf53_compact_count_ptr,
-                            gpu.cdf53_compact_list_ptr,
-                            gpu.cdf53_coefficients_ptr,
-                        )
-                    };
-                    // The count is written by the GPU; clamp it to the list's
-                    // capacity (one slot per tile) before it sizes a slice.
-                    let cdf53_count = clamp_gpu_tile_count(
-                        unsafe { *cdf53_compact_count_ptr },
-                        (grid.cols * grid.rows) as usize,
-                    );
-                    if cdf53_count > 0 {
-                        let cdf53_list = unsafe {
-                            std::slice::from_raw_parts(cdf53_compact_list_ptr, cdf53_count)
-                        };
-                        for (slot, &flat_tile_idx) in cdf53_list.iter().enumerate() {
-                            // Also GPU-written: an index off the grid would
-                            // wrap in the u8 casts below and address the
-                            // wrong tile.
-                            if flat_tile_idx >= grid.cols * grid.rows {
-                                continue;
-                            }
-                            let tile_x = (flat_tile_idx % cols) as u8;
-                            let tile_y = (flat_tile_idx / cols) as u8;
-                            // Read 3 * 1024 = 3072 i32 values from the compact-slot
-                            // indexed coefficient buffer. The GPU writes i32-wide
-                            // values; CPU casts to i16 (actual coefficient bit-width;
-                            // high bits are sign-extension).
-                            let coeffs_i32 = unsafe {
-                                std::slice::from_raw_parts(
-                                    cdf53_coefficients_ptr
-                                        .add(slot * crate::encoder::cdf53::CDF53_TOTAL_COEFFS),
-                                    crate::encoder::cdf53::CDF53_TOTAL_COEFFS,
-                                )
-                            };
-                            let coeffs_i16: Vec<i16> =
-                                coeffs_i32.iter().map(|&v| v as i16).collect();
-                            // M3.3b diagnostic: when GHOSTFRAME_CDF53_DIFF_TILE=X,Y is
-                            // set, log a one-shot side-by-side comparison of GPU vs
-                            // CPU `cdf53::forward(tile_bgra)` for that tile. Gated
-                            // behind the `cdf53-diag` cargo feature so production
-                            // builds skip the config check entirely.
-                            #[cfg(feature = "cdf53-diag")]
-                            if let Some((target_x, target_y)) = self.diagnostics.cdf53_diff_tile {
-                                if tile_x as u32 == target_x && tile_y as u32 == target_y {
-                                    let tile_bgra = grid.extract_tile(
-                                        pixels,
-                                        frame.stride,
-                                        tile_x as u32,
-                                        tile_y as u32,
-                                    );
-                                    // Pick CPU reference based on which dispatches were skipped:
-                                    // SKIP_L2_L3 → L1-only; SKIP_L3 → L2-only; otherwise full.
-                                    let skip_l2_l3 = self.diagnostics.cdf53_skip_l2_l3;
-                                    let skip_l3 = self.diagnostics.cdf53_skip_l3;
-                                    let cpu_coeffs = if skip_l2_l3 {
-                                        crate::encoder::cdf53::forward_level1_only(&tile_bgra)
-                                    } else if skip_l3 {
-                                        crate::encoder::cdf53::forward_level2_only(&tile_bgra)
-                                    } else {
-                                        crate::encoder::cdf53::forward(&tile_bgra)
-                                    };
-                                    // B↔R swap hypothesis: build a fake tile where B and R are
-                                    // swapped in the BGRA buffer, then CPU-forward it. If the GPU
-                                    // result matches THIS, the shader's rgba8/bgra8 mismatch is
-                                    // swapping channel 0 (B) with channel 2 (R).
-                                    let mut tile_swapped = tile_bgra.clone();
-                                    for px in tile_swapped.chunks_exact_mut(4) {
-                                        px.swap(0, 2); // swap B and R bytes
-                                    }
-                                    let cpu_coeffs_swapped =
-                                        crate::encoder::cdf53::forward(&tile_swapped);
-                                    // Sample tile pixels (first 8 BGRA px).
-                                    let bgra_head: Vec<u8> =
-                                        tile_bgra.iter().take(32).copied().collect();
-                                    tracing::info!(
-                                        target: "ghostframe::cdf53::diff",
-                                        tile_x = tile_x,
-                                        tile_y = tile_y,
-                                        "cdf53.diff.tile_bgra_head_32 = {:?}",
-                                        bgra_head
-                                    );
-                                    let mut n_diff_per_ch = [0usize; 3];
-                                    let mut n_match_swapped_per_ch = [0usize; 3];
-                                    let mut shown = 0usize;
-                                    for i in 0..crate::encoder::cdf53::CDF53_TOTAL_COEFFS {
-                                        let ch = i / 1024;
-                                        if coeffs_i16[i] != cpu_coeffs[i] {
-                                            n_diff_per_ch[ch] += 1;
-                                            if shown < 100 {
-                                                tracing::info!(
-                                                    target: "ghostframe::cdf53::diff",
-                                                    tile_x = tile_x,
-                                                    tile_y = tile_y,
-                                                    "cdf53.diff coef[{i}] ch={} idx={} gpu={} cpu={} diff={} cpu_swap={}",
-                                                    ch,
-                                                    i % 1024,
-                                                    coeffs_i16[i],
-                                                    cpu_coeffs[i],
-                                                    coeffs_i16[i] as i32 - cpu_coeffs[i] as i32,
-                                                    cpu_coeffs_swapped[i],
-                                                );
-                                                shown += 1;
-                                            }
-                                        }
-                                        if coeffs_i16[i] == cpu_coeffs_swapped[i] {
-                                            n_match_swapped_per_ch[ch] += 1;
-                                        }
-                                    }
-                                    let n_diff = n_diff_per_ch.iter().sum::<usize>();
-                                    // Per-subband mismatches (channel 0 / B only — quickest signal).
-                                    // Subband ranges in per-channel layout:
-                                    //   [0..16] LL3, [16..32] HL3, [32..48] LH3, [48..64] HH3,
-                                    //   [64..128] HL2, [128..192] LH2, [192..256] HH2,
-                                    //   [256..512] HL1, [512..768] LH1, [768..1024] HH1.
-                                    // Per-channel per-subband breakdown. Subband boundaries
-                                    // are within each channel's 1024-coefficient block.
-                                    let mut sb_diff = [[0usize; 10]; 3];
-                                    let band_ranges = [
-                                        (0, 16),
-                                        (16, 32),
-                                        (32, 48),
-                                        (48, 64),
-                                        (64, 128),
-                                        (128, 192),
-                                        (192, 256),
-                                        (256, 512),
-                                        (512, 768),
-                                        (768, 1024),
-                                    ];
-                                    for ch in 0..3 {
-                                        let base = ch * 1024;
-                                        for (b, (lo, hi)) in band_ranges.iter().enumerate() {
-                                            for i in *lo..*hi {
-                                                if coeffs_i16[base + i] != cpu_coeffs[base + i] {
-                                                    sb_diff[ch][b] += 1;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    tracing::info!(
-                                        target: "ghostframe::cdf53::diff",
-                                        tile_x = tile_x,
-                                        tile_y = tile_y,
-                                        "cdf53.diff.summary total_diffs={n_diff}/3072 per_ch_diff={:?} per_ch_match_swapped={:?}",
-                                        n_diff_per_ch,
-                                        n_match_swapped_per_ch,
-                                    );
-                                    tracing::info!(
-                                        target: "ghostframe::cdf53::diff",
-                                        tile_x = tile_x,
-                                        tile_y = tile_y,
-                                        "cdf53.diff.subbands (LL3 HL3 LH3 HH3 HL2 LH2 HH2 HL1 LH1 HH1): ch0={:?} ch1={:?} ch2={:?}",
-                                        sb_diff[0], sb_diff[1], sb_diff[2],
-                                    );
-                                }
-                            }
-                            let (present_passes, passes) =
-                                crate::encoder::cdf53::encode_passes_sparse(&coeffs_i16);
-                            // Drop emitter retransmit state in lock-step (see
-                            // dispatch_dirty_tiles_via_scheduler for the
-                            // dangling-pointer rationale).
-                            self.reliable_emitter.cancel_for_tile(tile_x, tile_y);
-                            let gen = self.scheduler.bump_generation(tile_x, tile_y);
-                            self.bump_count_accumulator.cdf53_dirty_path = self
-                                .bump_count_accumulator
-                                .cdf53_dirty_path
-                                .saturating_add(1);
-                            // (Old generation Cdf53 in-flight coverage is now
-                            // dropped via the `reliable_emitter.cancel_for_tile`
-                            // call above; the fragment_coverage drop here
-                            // became redundant when Task 25 paired emitter
-                            // cancellation with every bump_generation site.)
-                            // New generation: tile is eligible for re-escalation.
-                            self.metrics_tracker
-                                .get_mut(tile_x as u32, tile_y as u32)
-                                .already_escalated_this_gen = false;
-                            // Diagnostic: one line per pass actually sent (sparse
-                            // encoding skips empty bit-planes) for the e2e log scan.
-                            for (pass_idx, payload) in &passes {
-                                // DEBUG, not INFO: this fires once per pass per tile. A full-screen first
-                                // frame emits ~9200 of them in ~300 ms, which overruns journald's default
-                                // RateLimitBurst (10000 per 30 s) and makes it silently discard everything
-                                // the daemon logs for the rest of the interval -- measured in production as
-                                // "Suppressed 23232 messages", a 20-second hole that reads exactly like a
-                                // stalled capture loop and cost a debugging session before the suppression
-                                // notice was found. The per-frame aggregate stays at INFO on the "dispatch
-                                // returned" line (codec_cdf53=N), and e2e runs RUST_LOG=ghostframe=trace,debug
-                                // so it still sees every line.
-                                tracing::debug!(
-                                    target: "ghostframe::cdf53",
-                                    tile_x = tile_x,
-                                    tile_y = tile_y,
-                                    gen = gen,
-                                    pass_idx = *pass_idx,
-                                    payload_size = payload.len(),
-                                    source = "dirty",
-                                    "cdf53.emit"
-                                );
-                            }
-                            let payloads: Vec<Vec<u8>> =
-                                passes.into_iter().map(|(_, p)| p).collect();
-                            self.scheduler.enqueue_refinement_subset_at(
-                                tile_x,
-                                tile_y,
-                                gen,
-                                present_passes,
-                                payloads,
-                                now_std(),
-                            );
-                            // Override the CPU classifier's codec_state so that
-                            // dispatch_dirty_tiles_via_scheduler's pre-check can
-                            // correctly identify this tile as Cdf53 and skip the
-                            // priority-queue enqueue (which would otherwise supersede
-                            // the refinement passes just enqueued above).
-                            // The CPU classifier produces Cdf53 (via Rules 3/5/8); the GPU compact
-                            // list and coefficient buffer are authoritative for Cdf53 emission.
-                            self.metrics_tracker
-                                .get_mut(tile_x as u32, tile_y as u32)
-                                .codec_state = crate::tile::CodecState::Cdf53 {
-                                passes_sent: 0,
-                                present_passes,
-                            };
-                        }
-                    }
-                }
-
-                // ---- M3.3c + Phase 1.5-B: post-fence Phase B for escalation candidates ----
-                // Runs after the GPU fence (the existing fence covers all
-                // compute work in this command buffer, including the
-                // escalation forward dispatches recorded above). Reads
-                // escalation coefficients per-slot, encodes 14 passes,
-                // enqueues into the scheduler.
-                //
-                // Two flavors live in the same merged list (stranded first,
-                // then H264):
-                //  - Stranded (Phase 1.5-B): tiles already in Cdf53 state
-                //    whose retransmit cache drained but the client never
-                //    ACKed every pass. Re-emit ONLY the unacked passes at
-                //    the EXISTING generation (no `cancel_for_tile`, no
-                //    `bump_generation`) so the client's already-delivered
-                //    passes don't get discarded by a fresh-gen reset.
-                //  - H264 (M3.3c): tiles in H264 state being promoted to
-                //    Cdf53 for the first time on this generation.
-                let escalation_candidates =
-                    std::mem::take(&mut self.cdf53_escalation_candidates_this_frame);
-                let stranded_candidates =
-                    std::mem::take(&mut self.cdf53_stranded_candidates_this_frame);
-                let stranded_count = stranded_candidates.len();
-                if !escalation_candidates.is_empty() {
-                    let gpu_coeffs_ptr = {
-                        let gpu = self.gpu_frame_processor.as_ref().unwrap();
-                        gpu.cdf53_escalation_coefficients_ptr
-                    };
-                    for (slot, &flat_tile_idx) in escalation_candidates.iter().enumerate() {
-                        let tile_x = (flat_tile_idx % cols) as u8;
-                        let tile_y = (flat_tile_idx / cols) as u8;
-                        let is_stranded = slot < stranded_count;
-                        let codec_state = self
-                            .metrics_tracker
-                            .get(tile_x as u32, tile_y as u32)
-                            .codec_state;
-                        if !is_stranded {
-                            // H264-escalation slot: skip if the dirty path
-                            // already promoted this tile to Cdf53 in this
-                            // SAME frame. Re-firing would bump again,
-                            // supersede the just-enqueued passes, emit 14
-                            // duplicate cdf53.emit lines, and waste a GPU
-                            // forward dispatch with the same coefficients.
-                            if matches!(codec_state, crate::tile::CodecState::Cdf53 { .. }) {
-                                continue;
-                            }
-                        }
-                        let coeffs_i32 = unsafe {
-                            std::slice::from_raw_parts(
-                                gpu_coeffs_ptr
-                                    .add(slot * crate::encoder::cdf53::CDF53_TOTAL_COEFFS),
-                                crate::encoder::cdf53::CDF53_TOTAL_COEFFS,
-                            )
-                        };
-                        let coeffs_i16: Vec<i16> = coeffs_i32.iter().map(|&v| v as i16).collect();
-                        let (present_passes, passes) =
-                            crate::encoder::cdf53::encode_passes_sparse(&coeffs_i16);
-                        if is_stranded {
-                            self.stranded_reenqueue(
-                                tile_x,
-                                tile_y,
-                                codec_state,
-                                present_passes,
-                                passes,
-                            );
-                            continue;
-                        }
-                        // H264 escalation path (existing).
-                        // Drop emitter retransmit state in lock-step (see
-                        // dispatch_dirty_tiles_via_scheduler for the
-                        // dangling-pointer rationale).
-                        self.reliable_emitter.cancel_for_tile(tile_x, tile_y);
-                        let gen = self.scheduler.bump_generation(tile_x, tile_y);
-                        self.bump_count_accumulator.cdf53_escalation_path = self
-                            .bump_count_accumulator
-                            .cdf53_escalation_path
-                            .saturating_add(1);
-                        // (Old generation Cdf53 in-flight coverage is now
-                        // dropped via the `reliable_emitter.cancel_for_tile`
-                        // call above; the fragment_coverage drop here
-                        // became redundant when Task 25 paired emitter
-                        // cancellation with every bump_generation site.)
-                        for (pass_idx, payload) in &passes {
-                            // DEBUG, not INFO: this fires once per pass per tile. A full-screen first
-                            // frame emits ~9200 of them in ~300 ms, which overruns journald's default
-                            // RateLimitBurst (10000 per 30 s) and makes it silently discard everything
-                            // the daemon logs for the rest of the interval -- measured in production as
-                            // "Suppressed 23232 messages", a 20-second hole that reads exactly like a
-                            // stalled capture loop and cost a debugging session before the suppression
-                            // notice was found. The per-frame aggregate stays at INFO on the "dispatch
-                            // returned" line (codec_cdf53=N), and e2e runs RUST_LOG=ghostframe=trace,debug
-                            // so it still sees every line.
-                            tracing::debug!(
-                                target: "ghostframe::cdf53",
-                                tile_x = tile_x,
-                                tile_y = tile_y,
-                                gen = gen,
-                                pass_idx = *pass_idx,
-                                payload_size = payload.len(),
-                                source = "escalation",
-                                "cdf53.emit"
-                            );
-                        }
-                        let payloads: Vec<Vec<u8>> = passes.into_iter().map(|(_, p)| p).collect();
-                        self.scheduler.enqueue_refinement_subset_at(
-                            tile_x,
-                            tile_y,
-                            gen,
-                            present_passes,
-                            payloads,
-                            now_std(),
-                        );
-
-                        let tm = self.metrics_tracker.get_mut(tile_x as u32, tile_y as u32);
-                        tm.codec_state = crate::tile::CodecState::Cdf53 {
-                            passes_sent: 0,
-                            present_passes,
-                        };
-                        tm.already_escalated_this_gen = true;
-                    }
-                }
-
-                #[cfg(feature = "cdf53-diag")]
-                if self.diagnostics.cdf53_dump_pending {
-                    // Queued passes *and* emitted-but-unacknowledged ones.
-                    // This used to pass an empty slice for the second, which
-                    // left the snapshot showing only what had not been sent
-                    // yet -- a set that empties within a frame or two of
-                    // being filled, whether or not a bump cancelled
-                    // anything. `e2e_refinement_cancel` kept passing only
-                    // because slow tile frames pushed the server into H.264,
-                    // where this dump stops and its last line stays put.
-                    let in_flight = self.fragment_coverage.snapshot();
-                    let snap = self.scheduler.pending_refinement_snapshot(&in_flight);
-                    tracing::info!(
-                        target: "ghostframe::cdf53::diff",
-                        "cdf53.pending_snapshot {:?}",
-                        snap
-                    );
-                }
-
-                // Diagnostic: pre-dispatch announce.
-                //
-                // DEBUG, not INFO. This fires once per captured frame -- ~29
-                // times a second, forever, including on a screen with nothing
-                // dirty and nothing to send. Paired with "dispatch returned"
-                // below it was two of the six log lines a live idle session
-                // wrote per frame (~207 lines/second measured), each costing
-                // formatting plus a journald write, and contributing to the
-                // RateLimitBurst exhaustion that silently swallowed 23232
-                // messages during a first-frame burst.
-                //
-                // Nothing consumes these two lines: the bench harness parses
-                // `frame.captured` / `frame.last_send` (still INFO), and the
-                // only other reference is a code comment. The per-frame
-                // aggregate a reader actually wants -- codec counts and wire
-                // bytes -- is on the `cumulative emit` line, which stays INFO
-                // and fires once every 30 frames.
-                tracing::debug!(
-                    target: LOG_TARGET,
-                    frame_seq = seq,
-                    dirty_tiles = dirty_xy.len(),
-                    priority_queue_len = self.scheduler.queue_len(),
-                    refinement_deficit_tiles = self.scheduler.refinement_deficit_tiles(),
-                    max_frag = max_frag,
-                    "process_frame_gpu: about to dispatch"
-                );
-
-                // Real CPU time, deliberately not `now_std()`: this is what
-                // the frame cost the encode thread, which a paused tokio
-                // clock would report as zero.
-                let dispatch_started = std::time::Instant::now();
-                let stats = self.dispatch_dirty_tiles_via_scheduler(
-                    &dirty_xy,
-                    &grid,
-                    TileDispatchFrame {
-                        pixels,
-                        stride: frame.stride,
-                        seq,
-                        timestamp_us: frame.timestamp_us,
-                    },
-                    max_frag,
-                    SchedulerEmissionPolicy::GpuClassifierDriven,
-                    Some(&mut palrle_payloads),
-                );
-
-                // Per-frame RTO sweep: fire any cached retransmits whose
-                // RTO deadline has elapsed, then drain the resulting
-                // queue (source + parity) to the wire. Cheap when nothing
-                // is due (no cache hits, no parity ready).
-                self.sweep_rto_retransmits();
-
-                // Diagnostic: post-dispatch summary. If THIS fires but
-                // frame.last_send below does not, something in the palrle
-                // stats log block is silencing execution. If neither fires,
-                // dispatch_dirty_tiles_via_scheduler is panicking/returning
-                // through an unwind.
-                // `dispatch_us` is here because its absence hid a quadratic:
-                // tile mode was spending 83 ms a frame on bookkeeping for
-                // tiles the cost model prices at 0.05 us each, and nothing
-                // in the log said where a frame's time went.
-                let dispatch_us = std::time::Instant::now()
-                    .duration_since(dispatch_started)
-                    .as_micros() as u64;
-                tracing::debug!(
-                    target: LOG_TARGET,
-                    frame_seq = seq,
-                    dispatch_us = dispatch_us,
-                    dispatched_tiles = stats.tile_count,
-                    wire_bytes = stats.total_wire_bytes,
-                    codec_solid = stats.codec_histogram.solid,
-                    codec_palrle = stats.codec_histogram.palrle,
-                    codec_cdf53 = stats.codec_histogram.cdf53,
-                    codec_raw = stats.codec_histogram.raw,
-                    codec_h264 = stats.codec_histogram.h264,
-                    refinement_deficit_after = self.scheduler.refinement_deficit_tiles(),
-                    send_datagram_errs_total = self.datagram_send_errs,
-                    "process_frame_gpu: dispatch returned"
-                );
-
-                // ---- Cumulative emit + color-histogram diagnostics ----
-                //
-                // Throttled to once per `CUMULATIVE_EMIT_LOG_INTERVAL_FRAMES`
-                // (~2 s at 30 fps) so the line lines up with the client's
-                // periodic `stats:` log. The numbers are directly comparable
-                // to the client's `rx{r:.. s:.. p:.. c:.. h:..}` totals:
-                //   - if (emitted - send_errs) == client.rx for every codec,
-                //     the wire is clean — any missing tile is server-side
-                //     (never emitted because the scheduler queue was empty
-                //     or the classifier picked a different codec for it).
-                //   - if (emitted - send_errs) >  client.rx, the gap is
-                //     UDP-level packet loss between the server's
-                //     `wt.send_datagram(...)` and the browser's
-                //     WebTransport reader.
-                //   - if send_errs > 0, we have QUIC backpressure — the new
-                //     buffer-space cap (commit 66486b1) should keep this at
-                //     0 in steady state, so any non-zero value is a regression.
-                if seq.wrapping_sub(self.last_cumulative_emit_log_frame)
-                    >= CUMULATIVE_EMIT_LOG_INTERVAL_FRAMES
-                {
-                    self.last_cumulative_emit_log_frame = seq;
-                    let c = self.cumulative_datagrams_emitted;
-                    let es = self.reliable_emitter.stats;
-                    tracing::info!(
-                        target: LOG_TARGET,
-                        frame_seq = seq,
-                        emitted_solid = c.solid,
-                        emitted_palrle = c.palrle,
-                        emitted_cdf53 = c.cdf53,
-                        emitted_raw = c.raw,
-                        emitted_h264 = c.h264,
-                        send_datagram_errs_total = self.datagram_send_errs,
-                        fec_parity_emitted = es.parity_emitted,
-                        rto_fired = es.rto_fired,
-                        rto_max_retransmits_reached = es.rto_max_retransmits_reached,
-                        // Split, not summed. This was logged as a single
-                        // `nack_received = nack_hit + nack_miss`, which cannot
-                        // distinguish "the client asked and we resent" from
-                        // "the client asked and we had nothing to send" --
-                        // and the second is the one that leaves a tile stuck
-                        // at a partial pass set for the rest of the session.
-                        //
-                        // `on_nack` treats a cache miss as `nack_miss += 1;
-                        // continue`, i.e. the request is dropped silently. A
-                        // client that keeps sweeping for the same pass and a
-                        // server whose cache no longer holds it will sit in
-                        // that loop until the client gives up, with nothing
-                        // in the log to say so.
-                        nack_received = es.nack_hit + es.nack_miss,
-                        nack_hit = es.nack_hit,
-                        nack_miss = es.nack_miss,
-                        // How many of those hits only landed because the
-                        // cache was searched by tile-pass instead of by the
-                        // `frame_seq` the client sent. A coverage NACK names
-                        // a pass the client never received, so it has no
-                        // frame to echo; on a refinement-heavy session this
-                        // should be most of `nack_hit`. Reading zero while
-                        // `nack_miss` climbs means the content index is not
-                        // being maintained, which is the shape that left
-                        // tiles stranded without their finest bit-planes.
-                        nack_resolved_by_content = es.nack_resolved_by_content,
-                        nack_deduped = es.nack_deduped,
-                        retransmit_budget_deferrals = es.retransmit_budget_deferrals,
-                        // Step A's counter: datagrams quinn refused. Never
-                        // surfaced before, and it is the difference between
-                        // "we never sent it" and "we sent it and it was lost".
-                        send_rejected = es.send_rejected,
-                        // `emitter_` prefix so `e2e_ack_telemetry_no_waste`'s
-                        // `ack_miss` log-line filter doesn't false-match this
-                        // structured field — the test counts per-ACK debug
-                        // events, not the aggregate counter.
-                        emitter_ack_hits = es.ack_hit,
-                        emitter_ack_misses = es.ack_miss,
-                        continuation_resumes = self.continuation_resumes,
-                        continuation_drained_bytes = self.continuation_drained_bytes,
-                        cache_lru_eviction = self.reliable_emitter.cache.stats.lru_eviction,
-                        retransmit_attempts_total = es.retransmit_attempts_total,
-                        // Per-window snapshot of un-ACKed tile-passes still in
-                        // the emitter cache awaiting RTO retry. Steady-state
-                        // ~0 when the link is healthy; persistent >0 means
-                        // the long-tail un-deliverable passes that the
-                        // client should be NACKing.
-                        cache_pending_entries = self.reliable_emitter.pending_cache_entries(),
-                        // Sustained growth here means acknowledgements are not
-                        // retiring content the normal way -- the sweep is a
-                        // backstop, not the intended mechanism.
-                        stuck_entries_retired = es.stuck_entries_retired,
-                        // Ledger stats. These existed but were never logged,
-                        // which left the field unable to tell the two halves
-                        // of an ACK failure apart: `emitter_ack_hits` frozen
-                        // could mean no ACK datagrams are arriving at all, or
-                        // that they arrive and resolve to nothing. An ACK that
-                        // fails to resolve is filtered out before `on_ack`, so
-                        // it lands in `ledger_unknown_acks` and in NEITHER
-                        // emitter counter -- invisible without this line.
-                        //
-                        // ledger_capacity_evictions > 0 means transmissions
-                        // outran acknowledgements badly enough that the cap,
-                        // not the horizon, bound the ledger; every evicted
-                        // record is an ACK that can no longer land, which
-                        // strands its cache entry permanently.
-                        ledger_records = self.transmission_ledger.len(),
-                        ledger_unknown_acks = self.transmission_ledger.stats().unknown_acks,
-                        ledger_capacity_evictions =
-                            self.transmission_ledger.stats().capacity_evictions,
-                        ledger_acked_after_declared_lost =
-                            self.transmission_ledger.stats().acked_after_declared_lost,
-                        ledger_tombstones = self.transmission_ledger.tombstone_len(),
-                        // BWE Stage 2.0: per-tier ACK round-trip latency
-                        // (emit -> ACK receipt, server clock only — see
-                        // `TierLatencyStats`'s doc comment). Cumulative
-                        // since startup, same semantics as the byte
-                        // counters above. This is the baseline the pacer
-                        // (Stage 2) is measured against: pass 0-3 latency
-                        // should drop without pass 4-13 throughput
-                        // regressing.
-                        critical_latency_count = self.critical_latency_stats.count,
-                        critical_latency_mean_us = self.critical_latency_stats.mean_us(),
-                        critical_latency_max_us = self.critical_latency_stats.max_us,
-                        // Bucket counts for `[0-5, 5-10, 10-20, 20-50,
-                        // 50-100, 100-200, 200-500, 500+]` ms (see
-                        // `LATENCY_BUCKET_BOUNDS_MS`), populated since
-                        // startup but never logged until now -- a mean
-                        // alone hid exactly the distribution shape (29 ms
-                        // mean, 103 ms max) that made a fixed 40 ms RTO
-                        // deadline fire constantly.
-                        critical_latency_buckets = ?self.critical_latency_stats.buckets,
-                        refinement_latency_count = self.refinement_latency_stats.count,
-                        refinement_latency_mean_us = self.refinement_latency_stats.mean_us(),
-                        refinement_latency_max_us = self.refinement_latency_stats.max_us,
-                        refinement_latency_buckets = ?self.refinement_latency_stats.buckets,
-                        // Current RTO policy inputs/output (see
-                        // `rto::rto_for_attempt`): the rolling p95 this
-                        // window's ack_deadline was derived from, and the
-                        // first-attempt deadline that derivation currently
-                        // yields.
-                        // -1 distinguishes "no measurement yet" from a
-                        // genuinely tiny p95 in the log, the same distinction
-                        // the Option carries in the code.
-                        rto_ack_latency_p95_us = self
-                            .ack_latency_tracker
-                            .p95()
-                            .map(|d| d.as_micros() as i64)
-                            .unwrap_or(-1),
-                        rto_first_attempt_deadline_us =
-                            crate::transport::reliable_emitter::rto::rto_for_attempt(
-                                self.ack_latency_tracker.p95(),
-                                0,
-                            )
-                            .as_micros() as u64,
-                        // BWE Stage 2.1: same population, measured from
-                        // `queued_at` (when the work became available to
-                        // the scheduler) instead of `last_sent_at`. This is
-                        // the interval scheduler prioritisation actually
-                        // shortens; always >= the corresponding
-                        // `*_latency_*_us` field above for the same sample.
-                        queued_critical_latency_count = self.queued_critical_latency_stats.count,
-                        queued_critical_latency_mean_us =
-                            self.queued_critical_latency_stats.mean_us(),
-                        queued_critical_latency_max_us = self.queued_critical_latency_stats.max_us,
-                        queued_refinement_latency_count =
-                            self.queued_refinement_latency_stats.count,
-                        queued_refinement_latency_mean_us =
-                            self.queued_refinement_latency_stats.mean_us(),
-                        queued_refinement_latency_max_us =
-                            self.queued_refinement_latency_stats.max_us,
-                        // The per-tick emission budget and the floor it is
-                        // clamped against. These were only ever logged at
-                        // `debug!`, on a per-frame site, which the xdaemon's
-                        // `ghostframe=info` default filter drops -- so a
-                        // deployed build could not show whether the budget
-                        // was tracking the path or pinned at its floor.
-                        //
-                        // That distinction is the whole point of the floor
-                        // change: a flat 256 KiB floor is 7.86 MB/s and beat
-                        // the bandwidth term on every link below ~70 Mbit/s,
-                        // making the estimate dead code. If
-                        // `base_budget_bytes` here equals
-                        // `tick_budget_floor_bytes`, the estimate is still
-                        // not binding and the same failure has returned.
-                        //
-                        // Logged on the existing 60-frame cadence rather
-                        // than per frame: journald's RateLimitBurst drops a
-                        // burst wholesale and leaves a hole that reads as a
-                        // stalled loop, which has already cost one
-                        // misdiagnosis here.
-                        base_budget_bytes = self.base_budget_bytes(),
-                        tick_budget_floor_bytes = self.tick_budget_floor(),
-                        bytes_per_us = self.adaptation_context.bytes_per_us,
-                        smoothed_rtt_us = self.adaptation_context.smoothed_rtt_us,
-                        "cumulative emit (datagrams handed to quinn since startup, per codec)"
-                    );
-
-                    // Per-window bump counts. Each bump_generation supersedes
-                    // the prior gen's still-Pending refinement passes. If
-                    // these stay non-zero after the initial burst, repeated
-                    // bumping explains the client-side "no tile reaches 14
-                    // passes" plateau — the refinement queue empties to
-                    // ALL Superseded entries before any single gen's
-                    // 14-pass burst finishes draining.
-                    let b = self.bump_count_accumulator;
-                    let refinement_queue_len = self.scheduler.refinement_queue_len();
-                    tracing::info!(
-                        target: LOG_TARGET,
-                        frame_seq = seq,
-                        bumps_priority_path = b.priority_path,
-                        bumps_cdf53_dirty_path = b.cdf53_dirty_path,
-                        bumps_cdf53_escalation_path = b.cdf53_escalation_path,
-                        refinement_queue_len = refinement_queue_len,
-                        "bump counts (since last cumulative log) + scheduler refinement queue depth"
-                    );
-                    self.bump_count_accumulator = BumpCountAccumulator::default();
-
-                    if self.diagnostics.diagnose_color_hist {
-                        let h = self.color_histogram_accumulator;
-                        tracing::info!(
-                            target: LOG_TARGET,
-                            frame_seq = seq,
-                            colors_1 = h.bucket_1,
-                            colors_2_to_4 = h.bucket_2_4,
-                            colors_5_to_16 = h.bucket_5_16,
-                            colors_overflow_17plus = h.bucket_overflow,
-                            colors_unknown_sentinel = h.bucket_unknown,
-                            "unique-colors histogram over dirty tiles \
-                             since last cumulative log (1=Solid eligible, \
-                             2..16=PalRle eligible, 17=Cdf53 forced)"
-                        );
-                        self.color_histogram_accumulator = UniqueColorHistogram::default();
-                    }
-                }
-
-                // ---- Phase 1 Task 9: periodic BWE snapshot log ----
-                // Fires at most once per ~1 s wall-clock. Outputs the
-                // estimator's current bandwidth estimate alongside the
-                // per-tier emit rates (derived from snapshot deltas of
-                // the cumulative byte counters added in Task 6). All
-                // values are observability — Phase 1 doesn't drive
-                // emission from any of this.
-                let now = now_std();
-                let bwe_log_due = self
-                    .bwe_log_last_at
-                    .is_none_or(|last| now.duration_since(last).as_millis() >= 1000);
-                if bwe_log_due {
-                    let prev_at = self.bwe_log_last_at;
-                    self.bwe_log_last_at = Some(now);
-                    let bwe_snap = self.bwe.snapshot();
-                    let (prev_crit, prev_refn) = self.bytes_emitted_snapshot;
-                    // Compute dt against the previous log's instant — on
-                    // the very first log, fall back to a sensible window
-                    // (1 s) so the first rate isn't divided by zero.
-                    let dt_ms = match prev_at {
-                        Some(p) => now.duration_since(p).as_millis().max(1) as u64,
-                        None => 1000,
-                    };
-                    let bps_crit = (self.bytes_emitted_critical.saturating_sub(prev_crit))
-                        .saturating_mul(8)
-                        .saturating_mul(1000)
-                        / dt_ms;
-                    let bps_refn = (self.bytes_emitted_refinement.saturating_sub(prev_refn))
-                        .saturating_mul(8)
-                        .saturating_mul(1000)
-                        / dt_ms;
-                    self.bytes_emitted_snapshot =
-                        (self.bytes_emitted_critical, self.bytes_emitted_refinement);
-                    tracing::info!(
-                        target: "ghostframe::bwe",
-                        bwe_estimate_bps = bwe_snap.bitrate_bps,
-                        bwe_samples_seen = bwe_snap.samples_seen,
-                        // BWE Stage 2.2 observability: which budget source
-                        // is actually governing emission right now, and
-                        // what goog_cc's pacer is asking for (0 = no
-                        // pacer_config absorbed yet).
-                        pacing_mode = ?select_pacing_mode(bwe_snap.samples_seen),
-                        pacer_rate_bps = bwe_snap.pacer_rate_bps.unwrap_or(0),
-                        bps_critical = bps_crit,
-                        bps_refinement = bps_refn,
-                        cumulative_bytes_critical = self.bytes_emitted_critical,
-                        cumulative_bytes_refinement = self.bytes_emitted_refinement,
-                        "bwe periodic snapshot"
-                    );
-                }
-
-                // Frame stats — emit per design Section 4.
-                tracing::debug!(
-                    target: "palrle.frame",
-                    reused_or_allocated = self.palette_table.stats_frame.reused_or_allocated,
-                    fell_back_to_raw = self.palette_table.stats_frame.fell_back_to_raw,
-                    unique_frame_palettes = analysis.frame_palette_set_count,
-                    "palrle frame stats"
-                );
-                self.palette_table.stats_frame = Default::default();
-
-                // M3.5 bench telemetry: timestamp of the last datagram handed to QUIC.
-                tracing::info!(
-                    target: "ghostframe::bench",
-                    frame_seq = seq,
-                    last_send_ns = monotonic_now_ns(),
-                    total_wire_bytes = stats.total_wire_bytes,
-                    tile_count = stats.tile_count,
-                    codec_solid = stats.codec_histogram.solid,
-                    codec_palrle = stats.codec_histogram.palrle,
-                    codec_cdf53 = stats.codec_histogram.cdf53,
-                    codec_raw = stats.codec_histogram.raw,
-                    codec_h264 = stats.codec_histogram.h264,
-                    "frame.last_send"
-                );
+                self.emit_tile_codec_frame(&dirty_xy, &frame, pixels, &analysis, seq, max_frag);
             }
         }
     }
@@ -1882,6 +1072,819 @@ impl IoBridge {
             codec_cdf53 = 0u16,
             codec_raw = 0u16,
             codec_h264 = 1u8,
+            "frame.last_send"
+        );
+    }
+
+    /// TileCodec arm of `process_frame_gpu`, after the pixel source is chosen:
+    /// PalRle phases A/B, Cdf53 passes for dirty and escalated tiles, scheduler
+    /// dispatch, RTO sweep and the per-frame logs. The early returns (no
+    /// fragment room, no pixel source) stay in the caller.
+    fn emit_tile_codec_frame(
+        &mut self,
+        dirty_xy: &[(u32, u32)],
+        frame: &FrameSubmission,
+        pixels: &[u8],
+        analysis: &crate::capture::gpu_pipeline::FrameAnalysis,
+        seq: u32,
+        max_frag: usize,
+    ) {
+        let grid = TileGrid::new(frame.width, frame.height);
+
+        // Phase A — serial palette-table allocation per dirty PalRle-feasible tile.
+        let cols = grid.cols;
+        let palrle_compact_count = analysis.palrle_compact_count;
+        let preps = self.phase_a_palette_allocation(
+            cols,
+            analysis.palrle_compact_list_slice(),
+            analysis.per_tile_frame_palette_id_slice(),
+            analysis.folded_into_slice(),
+            analysis.frame_palette_set_slice(),
+            // No bulk slice helper exists for index_buffer (only per-tile); keep inline.
+            if palrle_compact_count > 0 && !analysis.index_buffer.is_null() {
+                unsafe {
+                    std::slice::from_raw_parts(
+                        analysis.index_buffer,
+                        (palrle_compact_count * 512) as usize,
+                    )
+                }
+            } else {
+                &[]
+            },
+        );
+
+        // Phase B — rayon parallel encode.
+        let caps = self.client_caps;
+        #[cfg(any(test, feature = "test-loss-injection"))]
+        let inject = self.oob_inject_at;
+        #[cfg(not(any(test, feature = "test-loss-injection")))]
+        let inject: Option<(u32, u32)> = None;
+        // Only consume the one-shot injection when the target tile
+        // is actually in this frame's preps — otherwise the hook
+        // would be silently spent on the first PalRle frame whose
+        // preps happen to exclude the injection target.
+        #[cfg(any(test, feature = "test-loss-injection"))]
+        let inject_will_fire = inject
+            .map(|xy| preps.iter().any(|p| p.tile_xy == xy))
+            .unwrap_or(false);
+        let mut palrle_payloads =
+            IoBridge::phase_b_encode_payloads_with_caps(&preps, &caps, inject);
+        #[cfg(any(test, feature = "test-loss-injection"))]
+        if inject_will_fire {
+            self.oob_inject_at = None;
+        }
+
+        // Phase B — Cdf53 encode bit-plane passes for high-color tiles,
+        // enqueue into the scheduler's refinement queue.
+        {
+            // Extract raw pointers from the GPU processor up-front so that
+            // the immutable borrow of self.gpu_frame_processor ends before
+            // the mutable borrows of self.scheduler below.
+            // SAFETY: cdf53_compact_count_ptr, cdf53_compact_list_ptr, and
+            // cdf53_coefficients_ptr are HOST_VISIBLE | HOST_COHERENT mapped
+            // GPU memory, valid until the next process_frame call. This block
+            // runs inside the current process_frame_gpu invocation, before
+            // any subsequent call.
+            let (cdf53_compact_count_ptr, cdf53_compact_list_ptr, cdf53_coefficients_ptr) = {
+                let gpu = self.gpu_frame_processor.as_ref().unwrap();
+                (
+                    gpu.cdf53_compact_count_ptr,
+                    gpu.cdf53_compact_list_ptr,
+                    gpu.cdf53_coefficients_ptr,
+                )
+            };
+            // The count is written by the GPU; clamp it to the list's
+            // capacity (one slot per tile) before it sizes a slice.
+            let cdf53_count = clamp_gpu_tile_count(
+                unsafe { *cdf53_compact_count_ptr },
+                (grid.cols * grid.rows) as usize,
+            );
+            if cdf53_count > 0 {
+                let cdf53_list =
+                    unsafe { std::slice::from_raw_parts(cdf53_compact_list_ptr, cdf53_count) };
+                for (slot, &flat_tile_idx) in cdf53_list.iter().enumerate() {
+                    // Also GPU-written: an index off the grid would
+                    // wrap in the u8 casts below and address the
+                    // wrong tile.
+                    if flat_tile_idx >= grid.cols * grid.rows {
+                        continue;
+                    }
+                    let tile_x = (flat_tile_idx % cols) as u8;
+                    let tile_y = (flat_tile_idx / cols) as u8;
+                    // Read 3 * 1024 = 3072 i32 values from the compact-slot
+                    // indexed coefficient buffer. The GPU writes i32-wide
+                    // values; CPU casts to i16 (actual coefficient bit-width;
+                    // high bits are sign-extension).
+                    let coeffs_i32 = unsafe {
+                        std::slice::from_raw_parts(
+                            cdf53_coefficients_ptr
+                                .add(slot * crate::encoder::cdf53::CDF53_TOTAL_COEFFS),
+                            crate::encoder::cdf53::CDF53_TOTAL_COEFFS,
+                        )
+                    };
+                    let coeffs_i16: Vec<i16> = coeffs_i32.iter().map(|&v| v as i16).collect();
+                    // M3.3b diagnostic: when GHOSTFRAME_CDF53_DIFF_TILE=X,Y is
+                    // set, log a one-shot side-by-side comparison of GPU vs
+                    // CPU `cdf53::forward(tile_bgra)` for that tile. Gated
+                    // behind the `cdf53-diag` cargo feature so production
+                    // builds skip the config check entirely.
+                    #[cfg(feature = "cdf53-diag")]
+                    if let Some((target_x, target_y)) = self.diagnostics.cdf53_diff_tile {
+                        if tile_x as u32 == target_x && tile_y as u32 == target_y {
+                            let tile_bgra = grid.extract_tile(
+                                pixels,
+                                frame.stride,
+                                tile_x as u32,
+                                tile_y as u32,
+                            );
+                            // Pick CPU reference based on which dispatches were skipped:
+                            // SKIP_L2_L3 → L1-only; SKIP_L3 → L2-only; otherwise full.
+                            let skip_l2_l3 = self.diagnostics.cdf53_skip_l2_l3;
+                            let skip_l3 = self.diagnostics.cdf53_skip_l3;
+                            let cpu_coeffs = if skip_l2_l3 {
+                                crate::encoder::cdf53::forward_level1_only(&tile_bgra)
+                            } else if skip_l3 {
+                                crate::encoder::cdf53::forward_level2_only(&tile_bgra)
+                            } else {
+                                crate::encoder::cdf53::forward(&tile_bgra)
+                            };
+                            // B↔R swap hypothesis: build a fake tile where B and R are
+                            // swapped in the BGRA buffer, then CPU-forward it. If the GPU
+                            // result matches THIS, the shader's rgba8/bgra8 mismatch is
+                            // swapping channel 0 (B) with channel 2 (R).
+                            let mut tile_swapped = tile_bgra.clone();
+                            for px in tile_swapped.chunks_exact_mut(4) {
+                                px.swap(0, 2); // swap B and R bytes
+                            }
+                            let cpu_coeffs_swapped = crate::encoder::cdf53::forward(&tile_swapped);
+                            // Sample tile pixels (first 8 BGRA px).
+                            let bgra_head: Vec<u8> = tile_bgra.iter().take(32).copied().collect();
+                            tracing::info!(
+                                target: "ghostframe::cdf53::diff",
+                                tile_x = tile_x,
+                                tile_y = tile_y,
+                                "cdf53.diff.tile_bgra_head_32 = {:?}",
+                                bgra_head
+                            );
+                            let mut n_diff_per_ch = [0usize; 3];
+                            let mut n_match_swapped_per_ch = [0usize; 3];
+                            let mut shown = 0usize;
+                            for i in 0..crate::encoder::cdf53::CDF53_TOTAL_COEFFS {
+                                let ch = i / 1024;
+                                if coeffs_i16[i] != cpu_coeffs[i] {
+                                    n_diff_per_ch[ch] += 1;
+                                    if shown < 100 {
+                                        tracing::info!(
+                                            target: "ghostframe::cdf53::diff",
+                                            tile_x = tile_x,
+                                            tile_y = tile_y,
+                                            "cdf53.diff coef[{i}] ch={} idx={} gpu={} cpu={} diff={} cpu_swap={}",
+                                            ch,
+                                            i % 1024,
+                                            coeffs_i16[i],
+                                            cpu_coeffs[i],
+                                            coeffs_i16[i] as i32 - cpu_coeffs[i] as i32,
+                                            cpu_coeffs_swapped[i],
+                                        );
+                                        shown += 1;
+                                    }
+                                }
+                                if coeffs_i16[i] == cpu_coeffs_swapped[i] {
+                                    n_match_swapped_per_ch[ch] += 1;
+                                }
+                            }
+                            let n_diff = n_diff_per_ch.iter().sum::<usize>();
+                            // Per-subband mismatches (channel 0 / B only — quickest signal).
+                            // Subband ranges in per-channel layout:
+                            //   [0..16] LL3, [16..32] HL3, [32..48] LH3, [48..64] HH3,
+                            //   [64..128] HL2, [128..192] LH2, [192..256] HH2,
+                            //   [256..512] HL1, [512..768] LH1, [768..1024] HH1.
+                            // Per-channel per-subband breakdown. Subband boundaries
+                            // are within each channel's 1024-coefficient block.
+                            let mut sb_diff = [[0usize; 10]; 3];
+                            let band_ranges = [
+                                (0, 16),
+                                (16, 32),
+                                (32, 48),
+                                (48, 64),
+                                (64, 128),
+                                (128, 192),
+                                (192, 256),
+                                (256, 512),
+                                (512, 768),
+                                (768, 1024),
+                            ];
+                            for ch in 0..3 {
+                                let base = ch * 1024;
+                                for (b, (lo, hi)) in band_ranges.iter().enumerate() {
+                                    for i in *lo..*hi {
+                                        if coeffs_i16[base + i] != cpu_coeffs[base + i] {
+                                            sb_diff[ch][b] += 1;
+                                        }
+                                    }
+                                }
+                            }
+                            tracing::info!(
+                                target: "ghostframe::cdf53::diff",
+                                tile_x = tile_x,
+                                tile_y = tile_y,
+                                "cdf53.diff.summary total_diffs={n_diff}/3072 per_ch_diff={:?} per_ch_match_swapped={:?}",
+                                n_diff_per_ch,
+                                n_match_swapped_per_ch,
+                            );
+                            tracing::info!(
+                                target: "ghostframe::cdf53::diff",
+                                tile_x = tile_x,
+                                tile_y = tile_y,
+                                "cdf53.diff.subbands (LL3 HL3 LH3 HH3 HL2 LH2 HH2 HL1 LH1 HH1): ch0={:?} ch1={:?} ch2={:?}",
+                                sb_diff[0], sb_diff[1], sb_diff[2],
+                            );
+                        }
+                    }
+                    let (present_passes, passes) =
+                        crate::encoder::cdf53::encode_passes_sparse(&coeffs_i16);
+                    // Drop emitter retransmit state in lock-step (see
+                    // dispatch_dirty_tiles_via_scheduler for the
+                    // dangling-pointer rationale).
+                    self.reliable_emitter.cancel_for_tile(tile_x, tile_y);
+                    let gen = self.scheduler.bump_generation(tile_x, tile_y);
+                    self.bump_count_accumulator.cdf53_dirty_path = self
+                        .bump_count_accumulator
+                        .cdf53_dirty_path
+                        .saturating_add(1);
+                    // (Old generation Cdf53 in-flight coverage is now
+                    // dropped via the `reliable_emitter.cancel_for_tile`
+                    // call above; the fragment_coverage drop here
+                    // became redundant when Task 25 paired emitter
+                    // cancellation with every bump_generation site.)
+                    // New generation: tile is eligible for re-escalation.
+                    self.metrics_tracker
+                        .get_mut(tile_x as u32, tile_y as u32)
+                        .already_escalated_this_gen = false;
+                    // Diagnostic: one line per pass actually sent (sparse
+                    // encoding skips empty bit-planes) for the e2e log scan.
+                    for (pass_idx, payload) in &passes {
+                        // DEBUG, not INFO: this fires once per pass per tile. A full-screen first
+                        // frame emits ~9200 of them in ~300 ms, which overruns journald's default
+                        // RateLimitBurst (10000 per 30 s) and makes it silently discard everything
+                        // the daemon logs for the rest of the interval -- measured in production as
+                        // "Suppressed 23232 messages", a 20-second hole that reads exactly like a
+                        // stalled capture loop and cost a debugging session before the suppression
+                        // notice was found. The per-frame aggregate stays at INFO on the "dispatch
+                        // returned" line (codec_cdf53=N), and e2e runs RUST_LOG=ghostframe=trace,debug
+                        // so it still sees every line.
+                        tracing::debug!(
+                            target: "ghostframe::cdf53",
+                            tile_x = tile_x,
+                            tile_y = tile_y,
+                            gen = gen,
+                            pass_idx = *pass_idx,
+                            payload_size = payload.len(),
+                            source = "dirty",
+                            "cdf53.emit"
+                        );
+                    }
+                    let payloads: Vec<Vec<u8>> = passes.into_iter().map(|(_, p)| p).collect();
+                    self.scheduler.enqueue_refinement_subset_at(
+                        tile_x,
+                        tile_y,
+                        gen,
+                        present_passes,
+                        payloads,
+                        now_std(),
+                    );
+                    // Override the CPU classifier's codec_state so that
+                    // dispatch_dirty_tiles_via_scheduler's pre-check can
+                    // correctly identify this tile as Cdf53 and skip the
+                    // priority-queue enqueue (which would otherwise supersede
+                    // the refinement passes just enqueued above).
+                    // The CPU classifier produces Cdf53 (via Rules 3/5/8); the GPU compact
+                    // list and coefficient buffer are authoritative for Cdf53 emission.
+                    self.metrics_tracker
+                        .get_mut(tile_x as u32, tile_y as u32)
+                        .codec_state = crate::tile::CodecState::Cdf53 {
+                        passes_sent: 0,
+                        present_passes,
+                    };
+                }
+            }
+        }
+
+        // ---- M3.3c + Phase 1.5-B: post-fence Phase B for escalation candidates ----
+        // Runs after the GPU fence (the existing fence covers all
+        // compute work in this command buffer, including the
+        // escalation forward dispatches recorded above). Reads
+        // escalation coefficients per-slot, encodes 14 passes,
+        // enqueues into the scheduler.
+        //
+        // Two flavors live in the same merged list (stranded first,
+        // then H264):
+        //  - Stranded (Phase 1.5-B): tiles already in Cdf53 state
+        //    whose retransmit cache drained but the client never
+        //    ACKed every pass. Re-emit ONLY the unacked passes at
+        //    the EXISTING generation (no `cancel_for_tile`, no
+        //    `bump_generation`) so the client's already-delivered
+        //    passes don't get discarded by a fresh-gen reset.
+        //  - H264 (M3.3c): tiles in H264 state being promoted to
+        //    Cdf53 for the first time on this generation.
+        let escalation_candidates =
+            std::mem::take(&mut self.cdf53_escalation_candidates_this_frame);
+        let stranded_candidates = std::mem::take(&mut self.cdf53_stranded_candidates_this_frame);
+        let stranded_count = stranded_candidates.len();
+        if !escalation_candidates.is_empty() {
+            let gpu_coeffs_ptr = {
+                let gpu = self.gpu_frame_processor.as_ref().unwrap();
+                gpu.cdf53_escalation_coefficients_ptr
+            };
+            for (slot, &flat_tile_idx) in escalation_candidates.iter().enumerate() {
+                let tile_x = (flat_tile_idx % cols) as u8;
+                let tile_y = (flat_tile_idx / cols) as u8;
+                let is_stranded = slot < stranded_count;
+                let codec_state = self
+                    .metrics_tracker
+                    .get(tile_x as u32, tile_y as u32)
+                    .codec_state;
+                if !is_stranded {
+                    // H264-escalation slot: skip if the dirty path
+                    // already promoted this tile to Cdf53 in this
+                    // SAME frame. Re-firing would bump again,
+                    // supersede the just-enqueued passes, emit 14
+                    // duplicate cdf53.emit lines, and waste a GPU
+                    // forward dispatch with the same coefficients.
+                    if matches!(codec_state, crate::tile::CodecState::Cdf53 { .. }) {
+                        continue;
+                    }
+                }
+                let coeffs_i32 = unsafe {
+                    std::slice::from_raw_parts(
+                        gpu_coeffs_ptr.add(slot * crate::encoder::cdf53::CDF53_TOTAL_COEFFS),
+                        crate::encoder::cdf53::CDF53_TOTAL_COEFFS,
+                    )
+                };
+                let coeffs_i16: Vec<i16> = coeffs_i32.iter().map(|&v| v as i16).collect();
+                let (present_passes, passes) =
+                    crate::encoder::cdf53::encode_passes_sparse(&coeffs_i16);
+                if is_stranded {
+                    self.stranded_reenqueue(tile_x, tile_y, codec_state, present_passes, passes);
+                    continue;
+                }
+                // H264 escalation path (existing).
+                // Drop emitter retransmit state in lock-step (see
+                // dispatch_dirty_tiles_via_scheduler for the
+                // dangling-pointer rationale).
+                self.reliable_emitter.cancel_for_tile(tile_x, tile_y);
+                let gen = self.scheduler.bump_generation(tile_x, tile_y);
+                self.bump_count_accumulator.cdf53_escalation_path = self
+                    .bump_count_accumulator
+                    .cdf53_escalation_path
+                    .saturating_add(1);
+                // (Old generation Cdf53 in-flight coverage is now
+                // dropped via the `reliable_emitter.cancel_for_tile`
+                // call above; the fragment_coverage drop here
+                // became redundant when Task 25 paired emitter
+                // cancellation with every bump_generation site.)
+                for (pass_idx, payload) in &passes {
+                    // DEBUG, not INFO: this fires once per pass per tile. A full-screen first
+                    // frame emits ~9200 of them in ~300 ms, which overruns journald's default
+                    // RateLimitBurst (10000 per 30 s) and makes it silently discard everything
+                    // the daemon logs for the rest of the interval -- measured in production as
+                    // "Suppressed 23232 messages", a 20-second hole that reads exactly like a
+                    // stalled capture loop and cost a debugging session before the suppression
+                    // notice was found. The per-frame aggregate stays at INFO on the "dispatch
+                    // returned" line (codec_cdf53=N), and e2e runs RUST_LOG=ghostframe=trace,debug
+                    // so it still sees every line.
+                    tracing::debug!(
+                        target: "ghostframe::cdf53",
+                        tile_x = tile_x,
+                        tile_y = tile_y,
+                        gen = gen,
+                        pass_idx = *pass_idx,
+                        payload_size = payload.len(),
+                        source = "escalation",
+                        "cdf53.emit"
+                    );
+                }
+                let payloads: Vec<Vec<u8>> = passes.into_iter().map(|(_, p)| p).collect();
+                self.scheduler.enqueue_refinement_subset_at(
+                    tile_x,
+                    tile_y,
+                    gen,
+                    present_passes,
+                    payloads,
+                    now_std(),
+                );
+
+                let tm = self.metrics_tracker.get_mut(tile_x as u32, tile_y as u32);
+                tm.codec_state = crate::tile::CodecState::Cdf53 {
+                    passes_sent: 0,
+                    present_passes,
+                };
+                tm.already_escalated_this_gen = true;
+            }
+        }
+
+        #[cfg(feature = "cdf53-diag")]
+        if self.diagnostics.cdf53_dump_pending {
+            // Queued passes *and* emitted-but-unacknowledged ones.
+            // This used to pass an empty slice for the second, which
+            // left the snapshot showing only what had not been sent
+            // yet -- a set that empties within a frame or two of
+            // being filled, whether or not a bump cancelled
+            // anything. `e2e_refinement_cancel` kept passing only
+            // because slow tile frames pushed the server into H.264,
+            // where this dump stops and its last line stays put.
+            let in_flight = self.fragment_coverage.snapshot();
+            let snap = self.scheduler.pending_refinement_snapshot(&in_flight);
+            tracing::info!(
+                target: "ghostframe::cdf53::diff",
+                "cdf53.pending_snapshot {:?}",
+                snap
+            );
+        }
+
+        // Diagnostic: pre-dispatch announce.
+        //
+        // DEBUG, not INFO. This fires once per captured frame -- ~29
+        // times a second, forever, including on a screen with nothing
+        // dirty and nothing to send. Paired with "dispatch returned"
+        // below it was two of the six log lines a live idle session
+        // wrote per frame (~207 lines/second measured), each costing
+        // formatting plus a journald write, and contributing to the
+        // RateLimitBurst exhaustion that silently swallowed 23232
+        // messages during a first-frame burst.
+        //
+        // Nothing consumes these two lines: the bench harness parses
+        // `frame.captured` / `frame.last_send` (still INFO), and the
+        // only other reference is a code comment. The per-frame
+        // aggregate a reader actually wants -- codec counts and wire
+        // bytes -- is on the `cumulative emit` line, which stays INFO
+        // and fires once every 30 frames.
+        tracing::debug!(
+            target: LOG_TARGET,
+            frame_seq = seq,
+            dirty_tiles = dirty_xy.len(),
+            priority_queue_len = self.scheduler.queue_len(),
+            refinement_deficit_tiles = self.scheduler.refinement_deficit_tiles(),
+            max_frag = max_frag,
+            "process_frame_gpu: about to dispatch"
+        );
+
+        // Real CPU time, deliberately not `now_std()`: this is what
+        // the frame cost the encode thread, which a paused tokio
+        // clock would report as zero.
+        let dispatch_started = std::time::Instant::now();
+        let stats = self.dispatch_dirty_tiles_via_scheduler(
+            dirty_xy,
+            &grid,
+            TileDispatchFrame {
+                pixels,
+                stride: frame.stride,
+                seq,
+                timestamp_us: frame.timestamp_us,
+            },
+            max_frag,
+            SchedulerEmissionPolicy::GpuClassifierDriven,
+            Some(&mut palrle_payloads),
+        );
+
+        // Per-frame RTO sweep: fire any cached retransmits whose
+        // RTO deadline has elapsed, then drain the resulting
+        // queue (source + parity) to the wire. Cheap when nothing
+        // is due (no cache hits, no parity ready).
+        self.sweep_rto_retransmits();
+
+        // Diagnostic: post-dispatch summary. If THIS fires but
+        // frame.last_send below does not, something in the palrle
+        // stats log block is silencing execution. If neither fires,
+        // dispatch_dirty_tiles_via_scheduler is panicking/returning
+        // through an unwind.
+        // `dispatch_us` is here because its absence hid a quadratic:
+        // tile mode was spending 83 ms a frame on bookkeeping for
+        // tiles the cost model prices at 0.05 us each, and nothing
+        // in the log said where a frame's time went.
+        let dispatch_us = std::time::Instant::now()
+            .duration_since(dispatch_started)
+            .as_micros() as u64;
+        tracing::debug!(
+            target: LOG_TARGET,
+            frame_seq = seq,
+            dispatch_us = dispatch_us,
+            dispatched_tiles = stats.tile_count,
+            wire_bytes = stats.total_wire_bytes,
+            codec_solid = stats.codec_histogram.solid,
+            codec_palrle = stats.codec_histogram.palrle,
+            codec_cdf53 = stats.codec_histogram.cdf53,
+            codec_raw = stats.codec_histogram.raw,
+            codec_h264 = stats.codec_histogram.h264,
+            refinement_deficit_after = self.scheduler.refinement_deficit_tiles(),
+            send_datagram_errs_total = self.datagram_send_errs,
+            "process_frame_gpu: dispatch returned"
+        );
+
+        // ---- Cumulative emit + color-histogram diagnostics ----
+        //
+        // Throttled to once per `CUMULATIVE_EMIT_LOG_INTERVAL_FRAMES`
+        // (~2 s at 30 fps) so the line lines up with the client's
+        // periodic `stats:` log. The numbers are directly comparable
+        // to the client's `rx{r:.. s:.. p:.. c:.. h:..}` totals:
+        //   - if (emitted - send_errs) == client.rx for every codec,
+        //     the wire is clean — any missing tile is server-side
+        //     (never emitted because the scheduler queue was empty
+        //     or the classifier picked a different codec for it).
+        //   - if (emitted - send_errs) >  client.rx, the gap is
+        //     UDP-level packet loss between the server's
+        //     `wt.send_datagram(...)` and the browser's
+        //     WebTransport reader.
+        //   - if send_errs > 0, we have QUIC backpressure — the new
+        //     buffer-space cap (commit 66486b1) should keep this at
+        //     0 in steady state, so any non-zero value is a regression.
+        if seq.wrapping_sub(self.last_cumulative_emit_log_frame)
+            >= CUMULATIVE_EMIT_LOG_INTERVAL_FRAMES
+        {
+            self.last_cumulative_emit_log_frame = seq;
+            let c = self.cumulative_datagrams_emitted;
+            let es = self.reliable_emitter.stats;
+            tracing::info!(
+                target: LOG_TARGET,
+                frame_seq = seq,
+                emitted_solid = c.solid,
+                emitted_palrle = c.palrle,
+                emitted_cdf53 = c.cdf53,
+                emitted_raw = c.raw,
+                emitted_h264 = c.h264,
+                send_datagram_errs_total = self.datagram_send_errs,
+                fec_parity_emitted = es.parity_emitted,
+                rto_fired = es.rto_fired,
+                rto_max_retransmits_reached = es.rto_max_retransmits_reached,
+                // Split, not summed. This was logged as a single
+                // `nack_received = nack_hit + nack_miss`, which cannot
+                // distinguish "the client asked and we resent" from
+                // "the client asked and we had nothing to send" --
+                // and the second is the one that leaves a tile stuck
+                // at a partial pass set for the rest of the session.
+                //
+                // `on_nack` treats a cache miss as `nack_miss += 1;
+                // continue`, i.e. the request is dropped silently. A
+                // client that keeps sweeping for the same pass and a
+                // server whose cache no longer holds it will sit in
+                // that loop until the client gives up, with nothing
+                // in the log to say so.
+                nack_received = es.nack_hit + es.nack_miss,
+                nack_hit = es.nack_hit,
+                nack_miss = es.nack_miss,
+                // How many of those hits only landed because the
+                // cache was searched by tile-pass instead of by the
+                // `frame_seq` the client sent. A coverage NACK names
+                // a pass the client never received, so it has no
+                // frame to echo; on a refinement-heavy session this
+                // should be most of `nack_hit`. Reading zero while
+                // `nack_miss` climbs means the content index is not
+                // being maintained, which is the shape that left
+                // tiles stranded without their finest bit-planes.
+                nack_resolved_by_content = es.nack_resolved_by_content,
+                nack_deduped = es.nack_deduped,
+                retransmit_budget_deferrals = es.retransmit_budget_deferrals,
+                // Step A's counter: datagrams quinn refused. Never
+                // surfaced before, and it is the difference between
+                // "we never sent it" and "we sent it and it was lost".
+                send_rejected = es.send_rejected,
+                // `emitter_` prefix so `e2e_ack_telemetry_no_waste`'s
+                // `ack_miss` log-line filter doesn't false-match this
+                // structured field — the test counts per-ACK debug
+                // events, not the aggregate counter.
+                emitter_ack_hits = es.ack_hit,
+                emitter_ack_misses = es.ack_miss,
+                continuation_resumes = self.continuation_resumes,
+                continuation_drained_bytes = self.continuation_drained_bytes,
+                cache_lru_eviction = self.reliable_emitter.cache.stats.lru_eviction,
+                retransmit_attempts_total = es.retransmit_attempts_total,
+                // Per-window snapshot of un-ACKed tile-passes still in
+                // the emitter cache awaiting RTO retry. Steady-state
+                // ~0 when the link is healthy; persistent >0 means
+                // the long-tail un-deliverable passes that the
+                // client should be NACKing.
+                cache_pending_entries = self.reliable_emitter.pending_cache_entries(),
+                // Sustained growth here means acknowledgements are not
+                // retiring content the normal way -- the sweep is a
+                // backstop, not the intended mechanism.
+                stuck_entries_retired = es.stuck_entries_retired,
+                // Ledger stats. These existed but were never logged,
+                // which left the field unable to tell the two halves
+                // of an ACK failure apart: `emitter_ack_hits` frozen
+                // could mean no ACK datagrams are arriving at all, or
+                // that they arrive and resolve to nothing. An ACK that
+                // fails to resolve is filtered out before `on_ack`, so
+                // it lands in `ledger_unknown_acks` and in NEITHER
+                // emitter counter -- invisible without this line.
+                //
+                // ledger_capacity_evictions > 0 means transmissions
+                // outran acknowledgements badly enough that the cap,
+                // not the horizon, bound the ledger; every evicted
+                // record is an ACK that can no longer land, which
+                // strands its cache entry permanently.
+                ledger_records = self.transmission_ledger.len(),
+                ledger_unknown_acks = self.transmission_ledger.stats().unknown_acks,
+                ledger_capacity_evictions =
+                    self.transmission_ledger.stats().capacity_evictions,
+                ledger_acked_after_declared_lost =
+                    self.transmission_ledger.stats().acked_after_declared_lost,
+                ledger_tombstones = self.transmission_ledger.tombstone_len(),
+                // BWE Stage 2.0: per-tier ACK round-trip latency
+                // (emit -> ACK receipt, server clock only — see
+                // `TierLatencyStats`'s doc comment). Cumulative
+                // since startup, same semantics as the byte
+                // counters above. This is the baseline the pacer
+                // (Stage 2) is measured against: pass 0-3 latency
+                // should drop without pass 4-13 throughput
+                // regressing.
+                critical_latency_count = self.critical_latency_stats.count,
+                critical_latency_mean_us = self.critical_latency_stats.mean_us(),
+                critical_latency_max_us = self.critical_latency_stats.max_us,
+                // Bucket counts for `[0-5, 5-10, 10-20, 20-50,
+                // 50-100, 100-200, 200-500, 500+]` ms (see
+                // `LATENCY_BUCKET_BOUNDS_MS`), populated since
+                // startup but never logged until now -- a mean
+                // alone hid exactly the distribution shape (29 ms
+                // mean, 103 ms max) that made a fixed 40 ms RTO
+                // deadline fire constantly.
+                critical_latency_buckets = ?self.critical_latency_stats.buckets,
+                refinement_latency_count = self.refinement_latency_stats.count,
+                refinement_latency_mean_us = self.refinement_latency_stats.mean_us(),
+                refinement_latency_max_us = self.refinement_latency_stats.max_us,
+                refinement_latency_buckets = ?self.refinement_latency_stats.buckets,
+                // Current RTO policy inputs/output (see
+                // `rto::rto_for_attempt`): the rolling p95 this
+                // window's ack_deadline was derived from, and the
+                // first-attempt deadline that derivation currently
+                // yields.
+                // -1 distinguishes "no measurement yet" from a
+                // genuinely tiny p95 in the log, the same distinction
+                // the Option carries in the code.
+                rto_ack_latency_p95_us = self
+                    .ack_latency_tracker
+                    .p95()
+                    .map(|d| d.as_micros() as i64)
+                    .unwrap_or(-1),
+                rto_first_attempt_deadline_us =
+                    crate::transport::reliable_emitter::rto::rto_for_attempt(
+                        self.ack_latency_tracker.p95(),
+                        0,
+                    )
+                    .as_micros() as u64,
+                // BWE Stage 2.1: same population, measured from
+                // `queued_at` (when the work became available to
+                // the scheduler) instead of `last_sent_at`. This is
+                // the interval scheduler prioritisation actually
+                // shortens; always >= the corresponding
+                // `*_latency_*_us` field above for the same sample.
+                queued_critical_latency_count = self.queued_critical_latency_stats.count,
+                queued_critical_latency_mean_us =
+                    self.queued_critical_latency_stats.mean_us(),
+                queued_critical_latency_max_us = self.queued_critical_latency_stats.max_us,
+                queued_refinement_latency_count =
+                    self.queued_refinement_latency_stats.count,
+                queued_refinement_latency_mean_us =
+                    self.queued_refinement_latency_stats.mean_us(),
+                queued_refinement_latency_max_us =
+                    self.queued_refinement_latency_stats.max_us,
+                // The per-tick emission budget and the floor it is
+                // clamped against. These were only ever logged at
+                // `debug!`, on a per-frame site, which the xdaemon's
+                // `ghostframe=info` default filter drops -- so a
+                // deployed build could not show whether the budget
+                // was tracking the path or pinned at its floor.
+                //
+                // That distinction is the whole point of the floor
+                // change: a flat 256 KiB floor is 7.86 MB/s and beat
+                // the bandwidth term on every link below ~70 Mbit/s,
+                // making the estimate dead code. If
+                // `base_budget_bytes` here equals
+                // `tick_budget_floor_bytes`, the estimate is still
+                // not binding and the same failure has returned.
+                //
+                // Logged on the existing 60-frame cadence rather
+                // than per frame: journald's RateLimitBurst drops a
+                // burst wholesale and leaves a hole that reads as a
+                // stalled loop, which has already cost one
+                // misdiagnosis here.
+                base_budget_bytes = self.base_budget_bytes(),
+                tick_budget_floor_bytes = self.tick_budget_floor(),
+                bytes_per_us = self.adaptation_context.bytes_per_us,
+                smoothed_rtt_us = self.adaptation_context.smoothed_rtt_us,
+                "cumulative emit (datagrams handed to quinn since startup, per codec)"
+            );
+
+            // Per-window bump counts. Each bump_generation supersedes
+            // the prior gen's still-Pending refinement passes. If
+            // these stay non-zero after the initial burst, repeated
+            // bumping explains the client-side "no tile reaches 14
+            // passes" plateau — the refinement queue empties to
+            // ALL Superseded entries before any single gen's
+            // 14-pass burst finishes draining.
+            let b = self.bump_count_accumulator;
+            let refinement_queue_len = self.scheduler.refinement_queue_len();
+            tracing::info!(
+                target: LOG_TARGET,
+                frame_seq = seq,
+                bumps_priority_path = b.priority_path,
+                bumps_cdf53_dirty_path = b.cdf53_dirty_path,
+                bumps_cdf53_escalation_path = b.cdf53_escalation_path,
+                refinement_queue_len = refinement_queue_len,
+                "bump counts (since last cumulative log) + scheduler refinement queue depth"
+            );
+            self.bump_count_accumulator = BumpCountAccumulator::default();
+
+            if self.diagnostics.diagnose_color_hist {
+                let h = self.color_histogram_accumulator;
+                tracing::info!(
+                    target: LOG_TARGET,
+                    frame_seq = seq,
+                    colors_1 = h.bucket_1,
+                    colors_2_to_4 = h.bucket_2_4,
+                    colors_5_to_16 = h.bucket_5_16,
+                    colors_overflow_17plus = h.bucket_overflow,
+                    colors_unknown_sentinel = h.bucket_unknown,
+                    "unique-colors histogram over dirty tiles \
+                     since last cumulative log (1=Solid eligible, \
+                     2..16=PalRle eligible, 17=Cdf53 forced)"
+                );
+                self.color_histogram_accumulator = UniqueColorHistogram::default();
+            }
+        }
+
+        // ---- Phase 1 Task 9: periodic BWE snapshot log ----
+        // Fires at most once per ~1 s wall-clock. Outputs the
+        // estimator's current bandwidth estimate alongside the
+        // per-tier emit rates (derived from snapshot deltas of
+        // the cumulative byte counters added in Task 6). All
+        // values are observability — Phase 1 doesn't drive
+        // emission from any of this.
+        let now = now_std();
+        let bwe_log_due = self
+            .bwe_log_last_at
+            .is_none_or(|last| now.duration_since(last).as_millis() >= 1000);
+        if bwe_log_due {
+            let prev_at = self.bwe_log_last_at;
+            self.bwe_log_last_at = Some(now);
+            let bwe_snap = self.bwe.snapshot();
+            let (prev_crit, prev_refn) = self.bytes_emitted_snapshot;
+            // Compute dt against the previous log's instant — on
+            // the very first log, fall back to a sensible window
+            // (1 s) so the first rate isn't divided by zero.
+            let dt_ms = match prev_at {
+                Some(p) => now.duration_since(p).as_millis().max(1) as u64,
+                None => 1000,
+            };
+            let bps_crit = (self.bytes_emitted_critical.saturating_sub(prev_crit))
+                .saturating_mul(8)
+                .saturating_mul(1000)
+                / dt_ms;
+            let bps_refn = (self.bytes_emitted_refinement.saturating_sub(prev_refn))
+                .saturating_mul(8)
+                .saturating_mul(1000)
+                / dt_ms;
+            self.bytes_emitted_snapshot =
+                (self.bytes_emitted_critical, self.bytes_emitted_refinement);
+            tracing::info!(
+                target: "ghostframe::bwe",
+                bwe_estimate_bps = bwe_snap.bitrate_bps,
+                bwe_samples_seen = bwe_snap.samples_seen,
+                // BWE Stage 2.2 observability: which budget source
+                // is actually governing emission right now, and
+                // what goog_cc's pacer is asking for (0 = no
+                // pacer_config absorbed yet).
+                pacing_mode = ?select_pacing_mode(bwe_snap.samples_seen),
+                pacer_rate_bps = bwe_snap.pacer_rate_bps.unwrap_or(0),
+                bps_critical = bps_crit,
+                bps_refinement = bps_refn,
+                cumulative_bytes_critical = self.bytes_emitted_critical,
+                cumulative_bytes_refinement = self.bytes_emitted_refinement,
+                "bwe periodic snapshot"
+            );
+        }
+
+        // Frame stats — emit per design Section 4.
+        tracing::debug!(
+            target: "palrle.frame",
+            reused_or_allocated = self.palette_table.stats_frame.reused_or_allocated,
+            fell_back_to_raw = self.palette_table.stats_frame.fell_back_to_raw,
+            unique_frame_palettes = analysis.frame_palette_set_count,
+            "palrle frame stats"
+        );
+        self.palette_table.stats_frame = Default::default();
+
+        // M3.5 bench telemetry: timestamp of the last datagram handed to QUIC.
+        tracing::info!(
+            target: "ghostframe::bench",
+            frame_seq = seq,
+            last_send_ns = monotonic_now_ns(),
+            total_wire_bytes = stats.total_wire_bytes,
+            tile_count = stats.tile_count,
+            codec_solid = stats.codec_histogram.solid,
+            codec_palrle = stats.codec_histogram.palrle,
+            codec_cdf53 = stats.codec_histogram.cdf53,
+            codec_raw = stats.codec_histogram.raw,
+            codec_h264 = stats.codec_histogram.h264,
             "frame.last_send"
         );
     }
