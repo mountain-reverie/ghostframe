@@ -2170,9 +2170,10 @@ fn cdf53_forward_from_pixels_live_dims_matches_cpu_reference() {
 // output surface is hashed after every frame and compared with constants that
 // were captured from the pre-refactor code.
 //
-// Regenerate the table with `GOLDEN_PRINT=1 cargo test -p ghostframe-lib --lib
-// capture::gpu_pipeline::tests::golden -- --nocapture` and paste the printed
-// rows into `GOLDEN_EXPECTED`. Only DEFINED regions are hashed: stale slots
+// To regenerate the table, run `cargo test -p ghostframe-lib --lib
+// capture::gpu_pipeline::tests::golden -- --nocapture`: a mismatching run
+// prints the observed rows between GOLDEN_TABLE_BEGIN/END; paste them into
+// `GOLDEN_EXPECTED`. Only DEFINED regions are hashed: stale slots
 // (index_buffer slots >= palrle_compact_count, palette slots not referenced by
 // a compact tile, coefficient slots >= the compact count) are skipped, and
 // every surface whose order depends on GPU atomic-append order (the compact
@@ -2648,13 +2649,10 @@ const GOLDEN_EXPECTED: &[(usize, &str, u64)] = &[
 
 #[test]
 fn golden_from_pixels_sequence() {
-    if std::env::var("GHOSTFRAME_CDF53_SKIP_L2_L3").is_ok()
-        || std::env::var("GHOSTFRAME_CDF53_SKIP_L3").is_ok()
-    {
-        panic!(
-            "golden test requires the CDF53 L2/L3 stages enabled (unset GHOSTFRAME_CDF53_SKIP_*)"
-        );
-    }
+    // The `cdf53-diag` skip variables (GHOSTFRAME_CDF53_SKIP_*) change the
+    // coefficients, so a run with one set fails below as a golden mismatch.
+    // They are not checked here: this crate reads the environment only in
+    // config.rs, and CI enforces that on test code too.
     let mut p = match GpuFrameProcessor::new(64) {
         Ok(p) => p,
         Err(e) => {
@@ -2693,7 +2691,6 @@ fn golden_from_pixels_sequence() {
         s(200, 136, 2, 0, &[3, 4, 5]), // 11: resolution change back
     ];
 
-    let print = std::env::var("GOLDEN_PRINT").is_ok();
     let mut stats = GoldenStats::default();
     let mut got: Vec<(usize, &'static str, u64)> = Vec::new();
     for (i, st) in script.iter().enumerate() {
@@ -2710,14 +2707,6 @@ fn golden_from_pixels_sequence() {
         for (name, h) in rows {
             got.push((i, name, h));
         }
-    }
-
-    if print {
-        println!("GOLDEN_TABLE_BEGIN");
-        for (i, n, h) in &got {
-            println!("    ({i}, \"{n}\", 0x{h:016x}),");
-        }
-        println!("GOLDEN_TABLE_END");
     }
 
     // Non-vacuity: the script must actually exercise the stages.
@@ -2739,13 +2728,15 @@ fn golden_from_pixels_sequence() {
     assert!(stats.cdf_nonzero_tiles > 0, "CDF53 coefficients all zero");
     assert!(stats.esc_nonzero > 0, "escalation coefficients all zero");
 
-    if print {
-        return;
+    // On any mismatch, print the whole observed table before failing, so an
+    // intended change can be pasted into GOLDEN_EXPECTED from the test output.
+    if got.as_slice() != GOLDEN_EXPECTED {
+        eprintln!("GOLDEN_TABLE_BEGIN");
+        for (i, n, h) in &got {
+            eprintln!("    ({i}, \"{n}\", 0x{h:016x}),");
+        }
+        eprintln!("GOLDEN_TABLE_END");
     }
-    assert!(
-        !GOLDEN_EXPECTED.is_empty(),
-        "GOLDEN_EXPECTED is empty; run with GOLDEN_PRINT=1 and paste the table"
-    );
     for (k, g) in got.iter().enumerate() {
         match GOLDEN_EXPECTED.get(k) {
             Some(e) if e == g => {}
