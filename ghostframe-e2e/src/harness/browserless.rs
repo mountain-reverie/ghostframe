@@ -383,13 +383,18 @@ async fn run_inner(mut scene: BrowserlessScene) -> anyhow::Result<BrowserlessRes
     let (ours, peer) = tokio::net::UnixStream::pair()
         .map_err(|e| anyhow!("seed {seed}: UnixStream::pair failed: {e}"))?;
 
-    let server = match scene.datagram_send_buffer_bytes {
-        Some(bytes) => QuicServer::new_with_datagram_send_buffer(bytes)
-            .map_err(|e| anyhow!("seed {seed}: QuicServer::new failed: {e}"))?,
-        None => {
-            QuicServer::new().map_err(|e| anyhow!("seed {seed}: QuicServer::new failed: {e}"))?
-        }
-    };
+    // Pin the server endpoint's RNG from the scene seed, as `drive_session`
+    // does for the client. The client seed uses the low bytes, this one a
+    // distinct pattern so the two endpoints do not share a stream.
+    let mut server_rng_seed = [0u8; 32];
+    server_rng_seed[..8].copy_from_slice(&(seed ^ 0x5E4E_5E4E_5E4E_5E4E).to_le_bytes());
+    let server = QuicServer::new_with_rng_seed(
+        scene
+            .datagram_send_buffer_bytes
+            .unwrap_or_else(ghostframe_lib::config::datagram_send_buffer_bytes),
+        server_rng_seed,
+    )
+    .map_err(|e| anyhow!("seed {seed}: QuicServer::new failed: {e}"))?;
 
     // Cert hash MUST be taken before `server` moves into the bridge below.
     let mut server_cert_sha256 = [0u8; 32];
