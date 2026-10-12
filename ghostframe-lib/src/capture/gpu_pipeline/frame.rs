@@ -61,7 +61,6 @@ enum StageBinding {
 /// How `GpuFrameProcessor::record_stage` dispatches. `Skip` still binds
 /// and pushes (used by the cdf53-diag skip logic).
 #[derive(Clone, Copy)]
-#[allow(dead_code)] // Indirect/Skip: used from a later commit
 enum StageDispatch {
     Direct(u32, u32, u32),
     Indirect(vk::Buffer),
@@ -2804,107 +2803,22 @@ impl GpuFrameProcessor {
         &'a self,
         cmd: vk::CommandBuffer,
     ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
-        // Allocate one descriptor set from the pool. The returned guard frees
-        // it on drop, ensuring the bounded pool doesn't leak on early-exit.
-        let palette_fold_set_layouts = [self.palette_fold.dsl];
-        let palette_fold_ds_alloc = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(&palette_fold_set_layouts);
-        let guard = ScopedDescriptorSets {
-            device: &self.device,
-            pool: self.descriptor_pool,
-            sets: self
-                .device
-                .allocate_descriptor_sets(&palette_fold_ds_alloc)?,
-        };
-        let palette_fold_ds = guard.sets[0];
-
-        // Write the six palette_fold descriptors (all STORAGE_BUFFER):
-        //   binding 0 — analysis_buffer              (read)
-        //   binding 1 — palrle_compact_list_buffer   (read)
-        //   binding 2 — frame_palette_set_buffer     (read/write)
-        //   binding 3 — frame_palette_count_buffer   (read/write)
-        //   binding 4 — hash_table_buffer            (read/write scratch)
-        //   binding 5 — per_tile_frame_palette_id_buffer (write)
-        let palette_fold_analysis_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.analysis_buf.buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let palette_fold_compact_list_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.palrle_compact_list.buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let palette_fold_set_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.frame_palette_set.buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let palette_fold_count_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.frame_palette_count.buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let palette_fold_hash_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.hash_table.buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let palette_fold_per_tile_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.per_tile_frame_palette_id.buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let palette_fold_writes = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(palette_fold_ds)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&palette_fold_analysis_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(palette_fold_ds)
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&palette_fold_compact_list_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(palette_fold_ds)
-                .dst_binding(2)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&palette_fold_set_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(palette_fold_ds)
-                .dst_binding(3)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&palette_fold_count_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(palette_fold_ds)
-                .dst_binding(4)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&palette_fold_hash_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(palette_fold_ds)
-                .dst_binding(5)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&palette_fold_per_tile_info),
-        ];
-        self.device
-            .update_descriptor_sets(&palette_fold_writes, &[]);
-
-        // Bind + indirect dispatch. No push constants for this stage.
-        self.device.cmd_bind_pipeline(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.palette_fold.pipeline,
-        );
-        self.device.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.palette_fold.layout,
-            0,
-            &[palette_fold_ds],
-            &[],
-        );
         // palrle_indirect_args_buffer already barriered for INDIRECT_COMMAND_READ
         // by the Stage 1.5b barrier in the orchestrator.
-        self.device
-            .cmd_dispatch_indirect(cmd, self.palrle_indirect_args_buf.buffer, 0);
-
-        Ok(guard)
+        self.record_stage(
+            cmd,
+            &self.palette_fold,
+            &[
+                StageBinding::Buffer(self.analysis_buf.buffer),
+                StageBinding::Buffer(self.palrle_compact_list.buffer),
+                StageBinding::Buffer(self.frame_palette_set.buffer),
+                StageBinding::Buffer(self.frame_palette_count.buffer),
+                StageBinding::Buffer(self.hash_table.buffer),
+                StageBinding::Buffer(self.per_tile_frame_palette_id.buffer),
+            ],
+            &[],
+            StageDispatch::Indirect(self.palrle_indirect_args_buf.buffer),
+        )
     }
 
     /// Stage 2b init — zero out the `folded_into` array to the default-self
@@ -3003,117 +2917,22 @@ impl GpuFrameProcessor {
         current_view: vk::ImageView,
         push_constants: &[u32],
     ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
-        // Allocate one descriptor set from the pool. The returned guard frees
-        // it on drop, ensuring the bounded pool doesn't leak on early-exit.
-        let pal_rle_index_set_layouts = [self.pal_rle_index.dsl];
-        let pal_rle_index_ds_alloc = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(&pal_rle_index_set_layouts);
-        let guard = ScopedDescriptorSets {
-            device: &self.device,
-            pool: self.descriptor_pool,
-            sets: self
-                .device
-                .allocate_descriptor_sets(&pal_rle_index_ds_alloc)?,
-        };
-        let pal_rle_index_ds = guard.sets[0];
-
-        // Write the six pal_rle_index descriptors:
-        //   binding 0 — current frame image (STORAGE_IMAGE, read-only)
-        //   binding 1 — palrle_compact_list_buffer (STORAGE_BUFFER, read-only)
-        //   binding 2 — frame_palette_set_buffer (STORAGE_BUFFER, read-only)
-        //   binding 3 — per_tile_frame_palette_id_buffer (STORAGE_BUFFER, read-only)
-        //   binding 4 — folded_into_buffer (STORAGE_BUFFER, read-only)
-        //   binding 5 — index_buffer (STORAGE_BUFFER, read-write)
-        let pal_rle_index_image_info = [vk::DescriptorImageInfo::default()
-            .image_view(current_view)
-            .image_layout(vk::ImageLayout::GENERAL)];
-        let pal_rle_index_compact_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.palrle_compact_list.buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let pal_rle_index_fps_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.frame_palette_set.buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let pal_rle_index_ptfpi_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.per_tile_frame_palette_id.buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let pal_rle_index_folded_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.folded_into.buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let pal_rle_index_out_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.index.buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let pal_rle_index_writes = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(pal_rle_index_ds)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                .image_info(&pal_rle_index_image_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(pal_rle_index_ds)
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&pal_rle_index_compact_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(pal_rle_index_ds)
-                .dst_binding(2)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&pal_rle_index_fps_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(pal_rle_index_ds)
-                .dst_binding(3)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&pal_rle_index_ptfpi_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(pal_rle_index_ds)
-                .dst_binding(4)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&pal_rle_index_folded_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(pal_rle_index_ds)
-                .dst_binding(5)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&pal_rle_index_out_info),
-        ];
-        self.device
-            .update_descriptor_sets(&pal_rle_index_writes, &[]);
-
-        // Bind + push + indirect dispatch.
-        self.device.cmd_bind_pipeline(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.pal_rle_index.pipeline,
-        );
-        self.device.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.pal_rle_index.layout,
-            0,
-            &[pal_rle_index_ds],
-            &[],
-        );
-        let push_bytes = std::slice::from_raw_parts(
-            push_constants.as_ptr() as *const u8,
-            std::mem::size_of_val(push_constants),
-        );
-        self.device.cmd_push_constants(
-            cmd,
-            self.pal_rle_index.layout,
-            vk::ShaderStageFlags::COMPUTE,
-            0,
-            push_bytes,
-        );
         // palrle_indirect_args_buffer already barriered for INDIRECT_COMMAND_READ
         // by the preceding palrle_indirect_args stage barrier in the orchestrator.
-        self.device
-            .cmd_dispatch_indirect(cmd, self.palrle_indirect_args_buf.buffer, 0);
-
-        Ok(guard)
+        self.record_stage(
+            cmd,
+            &self.pal_rle_index,
+            &[
+                StageBinding::Image(current_view),
+                StageBinding::Buffer(self.palrle_compact_list.buffer),
+                StageBinding::Buffer(self.frame_palette_set.buffer),
+                StageBinding::Buffer(self.per_tile_frame_palette_id.buffer),
+                StageBinding::Buffer(self.folded_into.buffer),
+                StageBinding::Buffer(self.index.buffer),
+            ],
+            push_constants,
+            StageDispatch::Indirect(self.palrle_indirect_args_buf.buffer),
+        )
     }
 
     /// Stage 4c-L1 — CDF 5/3 forward wavelet, level 1.
@@ -3135,82 +2954,19 @@ impl GpuFrameProcessor {
         cols: u32,
         rows: u32,
     ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
-        let set_layouts = [self.cdf53_forward_l1.dsl];
-        let ds_alloc = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(&set_layouts);
-        let guard = ScopedDescriptorSets {
-            device: &self.device,
-            pool: self.descriptor_pool,
-            sets: self.device.allocate_descriptor_sets(&ds_alloc)?,
-        };
-        let ds = guard.sets[0];
-
-        // Binding 0: current frame STORAGE_IMAGE (read-only in shader, rgba8)
-        let image_info = [vk::DescriptorImageInfo::default()
-            .image_view(current_view)
-            .image_layout(vk::ImageLayout::GENERAL)];
-        // Binding 1: cdf53_compact_list (read-only)
-        let compact_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.cdf53_compact_list_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        // Binding 2: cdf53_coefficients (write)
-        let coeff_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.cdf53_coefficients_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let writes = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(ds)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                .image_info(&image_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(ds)
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&compact_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(ds)
-                .dst_binding(2)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&coeff_info),
-        ];
-        self.device.update_descriptor_sets(&writes, &[]);
-
-        let push_vals: [u32; 2] = [cols, rows];
-        let push_bytes = std::slice::from_raw_parts(
-            push_vals.as_ptr() as *const u8,
-            std::mem::size_of_val(&push_vals),
-        );
-
-        self.device.cmd_bind_pipeline(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.cdf53_forward_l1.pipeline,
-        );
-        self.device.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.cdf53_forward_l1.layout,
-            0,
-            &[ds],
-            &[],
-        );
-        self.device.cmd_push_constants(
-            cmd,
-            self.cdf53_forward_l1.layout,
-            vk::ShaderStageFlags::COMPUTE,
-            0,
-            push_bytes,
-        );
         // cdf53_dispatch_args_buffer already barriered for INDIRECT_COMMAND_READ
         // by the preceding cdf53_indirect_args stage barrier in the orchestrator.
-        self.device
-            .cmd_dispatch_indirect(cmd, self.cdf53_dispatch_args.buffer, 0);
-
-        Ok(guard)
+        self.record_stage(
+            cmd,
+            &self.cdf53_forward_l1,
+            &[
+                StageBinding::Image(current_view),
+                StageBinding::Buffer(self.cdf53_compact_list_buffer),
+                StageBinding::Buffer(self.cdf53_coefficients_buffer),
+            ],
+            &[cols, rows],
+            StageDispatch::Indirect(self.cdf53_dispatch_args.buffer),
+        )
     }
 
     /// Stage 4c-L2 — CDF 5/3 forward wavelet, level 2.
@@ -3231,67 +2987,6 @@ impl GpuFrameProcessor {
         cols: u32,
         rows: u32,
     ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
-        let set_layouts = [self.cdf53_forward_l2.dsl];
-        let ds_alloc = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(&set_layouts);
-        let guard = ScopedDescriptorSets {
-            device: &self.device,
-            pool: self.descriptor_pool,
-            sets: self.device.allocate_descriptor_sets(&ds_alloc)?,
-        };
-        let ds = guard.sets[0];
-
-        // Binding 0: cdf53_compact_list (read-only)
-        let compact_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.cdf53_compact_list_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        // Binding 1: cdf53_coefficients (read LL1, write L2 subbands)
-        let coeff_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.cdf53_coefficients_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let writes = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(ds)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&compact_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(ds)
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&coeff_info),
-        ];
-        self.device.update_descriptor_sets(&writes, &[]);
-
-        let push_vals: [u32; 2] = [cols, rows];
-        let push_bytes = std::slice::from_raw_parts(
-            push_vals.as_ptr() as *const u8,
-            std::mem::size_of_val(&push_vals),
-        );
-
-        self.device.cmd_bind_pipeline(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.cdf53_forward_l2.pipeline,
-        );
-        self.device.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.cdf53_forward_l2.layout,
-            0,
-            &[ds],
-            &[],
-        );
-        self.device.cmd_push_constants(
-            cmd,
-            self.cdf53_forward_l2.layout,
-            vk::ShaderStageFlags::COMPUTE,
-            0,
-            push_bytes,
-        );
         // M3.3b diagnostic: GHOSTFRAME_CDF53_SKIP_L2_L3=1 skips this stage's
         // dispatch (descriptor set is still bound). Leaves L1's LL1 output in
         // place at coefficients[0..256] so the host-side diff can verify L1
@@ -3301,12 +2996,21 @@ impl GpuFrameProcessor {
         let skip_l2 = std::env::var("GHOSTFRAME_CDF53_SKIP_L2_L3").is_ok();
         #[cfg(not(feature = "cdf53-diag"))]
         let skip_l2 = false;
-        if !skip_l2 {
-            self.device
-                .cmd_dispatch_indirect(cmd, self.cdf53_dispatch_args.buffer, 0);
-        }
-
-        Ok(guard)
+        let dispatch = if skip_l2 {
+            StageDispatch::Skip
+        } else {
+            StageDispatch::Indirect(self.cdf53_dispatch_args.buffer)
+        };
+        self.record_stage(
+            cmd,
+            &self.cdf53_forward_l2,
+            &[
+                StageBinding::Buffer(self.cdf53_compact_list_buffer),
+                StageBinding::Buffer(self.cdf53_coefficients_buffer),
+            ],
+            &[cols, rows],
+            dispatch,
+        )
     }
 
     /// Stage 4c-L3 — CDF 5/3 forward wavelet, level 3.
@@ -3327,67 +3031,6 @@ impl GpuFrameProcessor {
         cols: u32,
         rows: u32,
     ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
-        let set_layouts = [self.cdf53_forward_l3.dsl];
-        let ds_alloc = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(&set_layouts);
-        let guard = ScopedDescriptorSets {
-            device: &self.device,
-            pool: self.descriptor_pool,
-            sets: self.device.allocate_descriptor_sets(&ds_alloc)?,
-        };
-        let ds = guard.sets[0];
-
-        // Binding 0: cdf53_compact_list (read-only)
-        let compact_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.cdf53_compact_list_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        // Binding 1: cdf53_coefficients (read LL2, write L3 subbands)
-        let coeff_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.cdf53_coefficients_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let writes = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(ds)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&compact_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(ds)
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&coeff_info),
-        ];
-        self.device.update_descriptor_sets(&writes, &[]);
-
-        let push_vals: [u32; 2] = [cols, rows];
-        let push_bytes = std::slice::from_raw_parts(
-            push_vals.as_ptr() as *const u8,
-            std::mem::size_of_val(&push_vals),
-        );
-
-        self.device.cmd_bind_pipeline(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.cdf53_forward_l3.pipeline,
-        );
-        self.device.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.cdf53_forward_l3.layout,
-            0,
-            &[ds],
-            &[],
-        );
-        self.device.cmd_push_constants(
-            cmd,
-            self.cdf53_forward_l3.layout,
-            vk::ShaderStageFlags::COMPUTE,
-            0,
-            push_bytes,
-        );
         // M3.3b diagnostic: GHOSTFRAME_CDF53_SKIP_L2_L3=1 or
         // GHOSTFRAME_CDF53_SKIP_L3=1 skips this stage's dispatch (descriptor
         // set is still bound). With SKIP_L3 only, L2's output is preserved at
@@ -3398,12 +3041,21 @@ impl GpuFrameProcessor {
             || std::env::var("GHOSTFRAME_CDF53_SKIP_L3").is_ok();
         #[cfg(not(feature = "cdf53-diag"))]
         let skip_l3 = false;
-        if !skip_l3 {
-            self.device
-                .cmd_dispatch_indirect(cmd, self.cdf53_dispatch_args.buffer, 0);
-        }
-
-        Ok(guard)
+        let dispatch = if skip_l3 {
+            StageDispatch::Skip
+        } else {
+            StageDispatch::Indirect(self.cdf53_dispatch_args.buffer)
+        };
+        self.record_stage(
+            cmd,
+            &self.cdf53_forward_l3,
+            &[
+                StageBinding::Buffer(self.cdf53_compact_list_buffer),
+                StageBinding::Buffer(self.cdf53_coefficients_buffer),
+            ],
+            &[cols, rows],
+            dispatch,
+        )
     }
 
     /// Run the L1→L2→L3 CDF 5/3 forward chain a SECOND time, against the
