@@ -50,6 +50,29 @@ impl Drop for ScopedDescriptorSets<'_> {
     }
 }
 
+/// One descriptor binding for `GpuFrameProcessor::record_stage`; the
+/// position in the binding slice is the shader's binding number.
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // Image: used from the next commit
+enum StageBinding {
+    Image(vk::ImageView),
+    Buffer(vk::Buffer),
+}
+
+/// How `GpuFrameProcessor::record_stage` dispatches. `Skip` still binds
+/// and pushes (used by the cdf53-diag skip logic).
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // Indirect/Skip: used from a later commit
+enum StageDispatch {
+    Direct(u32, u32, u32),
+    Indirect(vk::Buffer),
+    Skip,
+}
+
+/// Largest descriptor-binding count of any compute stage (palette_fold,
+/// pal_rle_index).
+const MAX_STAGE_BINDINGS: usize = 6;
+
 struct ScopedCommandBuffers<'a> {
     device: &'a ash::Device,
     pool: vk::CommandPool,
@@ -2397,6 +2420,104 @@ impl GpuFrameProcessor {
         })
     }
 
+    /// Generic compute-stage recorder shared by every `run_*_stage`.
+    ///
+    /// Allocates one descriptor set from the shared pool, writes
+    /// `bindings` (index == binding number) in a single
+    /// `update_descriptor_sets`, binds the pipeline and set, pushes `push`
+    /// as raw `u32` words at offset 0 (skipped when empty), then dispatches.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as the wrappers: `cmd` is recording, image views are
+    /// in `GENERAL`, and the returned guard outlives `wait_for_fences`.
+    unsafe fn record_stage<'a>(
+        &'a self,
+        cmd: vk::CommandBuffer,
+        stage: &ComputeStage,
+        bindings: &[StageBinding],
+        push: &[u32],
+        dispatch: StageDispatch,
+    ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
+        debug_assert!(bindings.len() <= MAX_STAGE_BINDINGS);
+        // Allocate one descriptor set from the pool. The returned guard frees
+        // it on drop, ensuring the bounded pool doesn't leak on early-exit.
+        let set_layouts = [stage.dsl];
+        let ds_alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(&set_layouts);
+        let guard = ScopedDescriptorSets {
+            device: &self.device,
+            pool: self.descriptor_pool,
+            sets: self.device.allocate_descriptor_sets(&ds_alloc)?,
+        };
+        let ds = guard.sets[0];
+
+        let mut image_infos = [vk::DescriptorImageInfo::default(); MAX_STAGE_BINDINGS];
+        let mut buffer_infos = [vk::DescriptorBufferInfo::default(); MAX_STAGE_BINDINGS];
+        for (i, b) in bindings.iter().enumerate() {
+            match *b {
+                StageBinding::Image(view) => {
+                    image_infos[i] = vk::DescriptorImageInfo::default()
+                        .image_view(view)
+                        .image_layout(vk::ImageLayout::GENERAL);
+                }
+                StageBinding::Buffer(buffer) => {
+                    buffer_infos[i] = vk::DescriptorBufferInfo::default()
+                        .buffer(buffer)
+                        .offset(0)
+                        .range(vk::WHOLE_SIZE);
+                }
+            }
+        }
+        let mut writes = [vk::WriteDescriptorSet::default(); MAX_STAGE_BINDINGS];
+        for (i, b) in bindings.iter().enumerate() {
+            let w = vk::WriteDescriptorSet::default()
+                .dst_set(ds)
+                .dst_binding(i as u32);
+            writes[i] = match *b {
+                StageBinding::Image(_) => w
+                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                    .image_info(std::slice::from_ref(&image_infos[i])),
+                StageBinding::Buffer(_) => w
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(std::slice::from_ref(&buffer_infos[i])),
+            };
+        }
+        self.device
+            .update_descriptor_sets(&writes[..bindings.len()], &[]);
+
+        // Bind + push + dispatch.
+        self.device
+            .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, stage.pipeline);
+        self.device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            stage.layout,
+            0,
+            &[ds],
+            &[],
+        );
+        if !push.is_empty() {
+            let push_bytes =
+                std::slice::from_raw_parts(push.as_ptr() as *const u8, std::mem::size_of_val(push));
+            self.device.cmd_push_constants(
+                cmd,
+                stage.layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                push_bytes,
+            );
+        }
+        match dispatch {
+            StageDispatch::Direct(x, y, z) => self.device.cmd_dispatch(cmd, x, y, z),
+            StageDispatch::Indirect(buffer) => self.device.cmd_dispatch_indirect(cmd, buffer, 0),
+            StageDispatch::Skip => {}
+        }
+
+        Ok(guard)
+    }
+
     /// SAD (Sum of Absolute Differences) compute dispatch.
     ///
     /// Reads the current frame image (binding 0) and the previous-frame
@@ -2927,64 +3048,16 @@ impl GpuFrameProcessor {
         &'a self,
         cmd: vk::CommandBuffer,
     ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
-        // Allocate one descriptor set from the pool. The returned guard frees
-        // it on drop, ensuring the bounded pool doesn't leak on early-exit.
-        let palrle_indirect_args_set_layouts = [self.palrle_indirect_args.dsl];
-        let palrle_indirect_args_ds_alloc = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(&palrle_indirect_args_set_layouts);
-        let guard = ScopedDescriptorSets {
-            device: &self.device,
-            pool: self.descriptor_pool,
-            sets: self
-                .device
-                .allocate_descriptor_sets(&palrle_indirect_args_ds_alloc)?,
-        };
-        let palrle_indirect_args_ds = guard.sets[0];
-
-        // Write the two palrle_indirect_args descriptors (both STORAGE_BUFFER):
-        //   binding 0 — palrle_compact_count_buffer  (read)
-        //   binding 1 — palrle_indirect_args_buffer  (write)
-        let palrle_indirect_count_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.palrle_compact_count.buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let palrle_indirect_args_buf_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.palrle_indirect_args_buf.buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let palrle_indirect_args_writes = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(palrle_indirect_args_ds)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&palrle_indirect_count_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(palrle_indirect_args_ds)
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&palrle_indirect_args_buf_info),
-        ];
-        self.device
-            .update_descriptor_sets(&palrle_indirect_args_writes, &[]);
-
-        // Bind + dispatch. No push constants for this stage.
-        self.device.cmd_bind_pipeline(
+        self.record_stage(
             cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.palrle_indirect_args.pipeline,
-        );
-        self.device.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.palrle_indirect_args.layout,
-            0,
-            &[palrle_indirect_args_ds],
+            &self.palrle_indirect_args,
+            &[
+                StageBinding::Buffer(self.palrle_compact_count.buffer),
+                StageBinding::Buffer(self.palrle_indirect_args_buf.buffer),
+            ],
             &[],
-        );
-        self.device.cmd_dispatch(cmd, 1, 1, 1);
-
-        Ok(guard)
+            StageDispatch::Direct(1, 1, 1),
+        )
     }
 
     /// Stage 4b — cdf53 indirect-args writer.
@@ -3008,59 +3081,16 @@ impl GpuFrameProcessor {
         &'a self,
         cmd: vk::CommandBuffer,
     ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
-        let set_layouts = [self.cdf53_indirect_args.dsl];
-        let ds_alloc = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(&set_layouts);
-        let guard = ScopedDescriptorSets {
-            device: &self.device,
-            pool: self.descriptor_pool,
-            sets: self.device.allocate_descriptor_sets(&ds_alloc)?,
-        };
-        let ds = guard.sets[0];
-
-        // Write the two cdf53_indirect_args descriptors (both STORAGE_BUFFER):
-        //   binding 0 — cdf53_compact_count_buffer  (read)
-        //   binding 1 — cdf53_dispatch_args_buffer  (write)
-        let count_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.cdf53_compact_count_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let args_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.cdf53_dispatch_args.buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let writes = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(ds)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&count_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(ds)
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&args_info),
-        ];
-        self.device.update_descriptor_sets(&writes, &[]);
-
-        // Bind + dispatch. No push constants for this stage.
-        self.device.cmd_bind_pipeline(
+        self.record_stage(
             cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.cdf53_indirect_args.pipeline,
-        );
-        self.device.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.cdf53_indirect_args.layout,
-            0,
-            &[ds],
+            &self.cdf53_indirect_args,
+            &[
+                StageBinding::Buffer(self.cdf53_compact_count_buffer),
+                StageBinding::Buffer(self.cdf53_dispatch_args.buffer),
+            ],
             &[],
-        );
-        self.device.cmd_dispatch(cmd, 1, 1, 1);
-
-        Ok(guard)
+            StageDispatch::Direct(1, 1, 1),
+        )
     }
 
     /// Stage 2a — palette fold compute dispatch (builds the per-frame
@@ -3223,53 +3253,13 @@ impl GpuFrameProcessor {
         cmd: vk::CommandBuffer,
         workgroups: (u32, u32, u32),
     ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
-        // Allocate one descriptor set from the pool. The returned guard frees
-        // it on drop, ensuring the bounded pool doesn't leak on early-exit.
-        let palette_subset_fold_init_set_layouts = [self.palette_subset_fold_init.dsl];
-        let palette_subset_fold_init_ds_alloc = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(&palette_subset_fold_init_set_layouts);
-        let guard = ScopedDescriptorSets {
-            device: &self.device,
-            pool: self.descriptor_pool,
-            sets: self
-                .device
-                .allocate_descriptor_sets(&palette_subset_fold_init_ds_alloc)?,
-        };
-        let palette_subset_fold_init_ds = guard.sets[0];
-
-        // Write the single palette_subset_fold_init descriptor (STORAGE_BUFFER):
-        //   binding 0 — folded_into_buffer (write)
-        let palette_subset_fold_init_folded_into_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.folded_into.buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let palette_subset_fold_init_writes = [vk::WriteDescriptorSet::default()
-            .dst_set(palette_subset_fold_init_ds)
-            .dst_binding(0)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .buffer_info(&palette_subset_fold_init_folded_into_info)];
-        self.device
-            .update_descriptor_sets(&palette_subset_fold_init_writes, &[]);
-
-        // Bind + direct dispatch. No push constants for this stage.
-        self.device.cmd_bind_pipeline(
+        self.record_stage(
             cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.palette_subset_fold_init.pipeline,
-        );
-        self.device.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.palette_subset_fold_init.layout,
-            0,
-            &[palette_subset_fold_init_ds],
+            &self.palette_subset_fold_init,
+            &[StageBinding::Buffer(self.folded_into.buffer)],
             &[],
-        );
-        self.device
-            .cmd_dispatch(cmd, workgroups.0, workgroups.1, workgroups.2);
-
-        Ok(guard)
+            StageDispatch::Direct(workgroups.0, workgroups.1, workgroups.2),
+        )
     }
 
     /// Stage 2b — palette subset-fold compute dispatch (resolves subset
@@ -3293,65 +3283,17 @@ impl GpuFrameProcessor {
         &'a self,
         cmd: vk::CommandBuffer,
     ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
-        // Allocate one descriptor set from the pool. The returned guard frees
-        // it on drop, ensuring the bounded pool doesn't leak on early-exit.
-        let palette_subset_fold_set_layouts = [self.palette_subset_fold.dsl];
-        let palette_subset_fold_ds_alloc = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(&palette_subset_fold_set_layouts);
-        let guard = ScopedDescriptorSets {
-            device: &self.device,
-            pool: self.descriptor_pool,
-            sets: self
-                .device
-                .allocate_descriptor_sets(&palette_subset_fold_ds_alloc)?,
-        };
-        let palette_subset_fold_ds = guard.sets[0];
-
-        // Write the two palette_subset_fold descriptors (STORAGE_BUFFER):
-        //   binding 0 — frame_palette_set_buffer (read-only)
-        //   binding 1 — folded_into_buffer (read-write)
-        let subset_fold_set_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.frame_palette_set.buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let subset_fold_folded_into_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.folded_into.buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let subset_fold_writes = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(palette_subset_fold_ds)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&subset_fold_set_info),
-            vk::WriteDescriptorSet::default()
-                .dst_set(palette_subset_fold_ds)
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&subset_fold_folded_into_info),
-        ];
-        self.device.update_descriptor_sets(&subset_fold_writes, &[]);
-
-        // Bind + direct dispatch. No push constants for this stage.
         // One workgroup per palette slot so each slot evaluates its own row.
-        self.device.cmd_bind_pipeline(
+        self.record_stage(
             cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.palette_subset_fold.pipeline,
-        );
-        self.device.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.palette_subset_fold.layout,
-            0,
-            &[palette_subset_fold_ds],
+            &self.palette_subset_fold,
+            &[
+                StageBinding::Buffer(self.frame_palette_set.buffer),
+                StageBinding::Buffer(self.folded_into.buffer),
+            ],
             &[],
-        );
-        self.device
-            .cmd_dispatch(cmd, PALETTE_HASH_SLOTS as u32, 1, 1);
-
-        Ok(guard)
+            StageDispatch::Direct(PALETTE_HASH_SLOTS as u32, 1, 1),
+        )
     }
 
     /// Stage 3 — pal_rle_index compute dispatch (emits the nibble-packed
