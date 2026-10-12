@@ -22,7 +22,7 @@ use super::*;
 /// Which Phase B path started a Cdf53 generation; selects the bump
 /// counter and the `source` field of the `cdf53.emit` log line.
 #[derive(Clone, Copy)]
-enum Cdf53Source {
+pub(super) enum Cdf53Source {
     Dirty,
     Escalation,
 }
@@ -313,7 +313,7 @@ impl IoBridge {
     ///
     /// Callers own the `codec_state` and `already_escalated_this_gen`
     /// writes, which must follow this call.
-    fn enqueue_cdf53_generation(
+    pub(super) fn enqueue_cdf53_generation(
         &mut self,
         tile_x: u8,
         tile_y: u8,

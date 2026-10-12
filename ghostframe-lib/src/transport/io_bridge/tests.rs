@@ -4669,3 +4669,74 @@ async fn establishing_over_a_stale_live_entry_clears_it() {
     assert!(!bridge.is_live(h));
     assert!(!bridge.feedback_recv_bufs.contains_key(&h));
 }
+
+/// `enqueue_cdf53_generation` is shared by the dirty-tile and escalation
+/// paths; the `source` it is given must pick BOTH the bump counter and the
+/// `source` field of the `cdf53.emit` log line. Swapping either is invisible
+/// to every other test (the GPU callers need Vulkan), so pin them here.
+#[tokio::test]
+async fn enqueue_cdf53_generation_source_selects_counter_and_log_label() {
+    use std::sync::{Arc, Mutex};
+
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    use super::frame::Cdf53Source;
+
+    #[derive(Default, Clone)]
+    struct CapturingWriter(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for CapturingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingWriter {
+        type Writer = CapturingWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let _g = tracing_subscriber::fmt()
+        .json()
+        .with_writer(CapturingWriter(Arc::clone(&buf)))
+        .with_target(true)
+        .with_env_filter("ghostframe::cdf53=debug")
+        .set_default();
+
+    let mut bridge = make_bridge_for_test().await;
+    let passes = || vec![(0u8, vec![1u8]), (3u8, vec![2u8, 2])];
+    let present = 0b1001u16;
+
+    // Dirty: two passes, two bumps on tile (1,1), one on (2,2).
+    bridge.enqueue_cdf53_generation(1, 1, present, passes(), Cdf53Source::Dirty);
+    bridge.enqueue_cdf53_generation(1, 1, present, passes(), Cdf53Source::Dirty);
+    bridge.enqueue_cdf53_generation(2, 2, present, passes(), Cdf53Source::Dirty);
+    assert_eq!(bridge.bump_count_accumulator.cdf53_dirty_path, 3);
+    assert_eq!(bridge.bump_count_accumulator.cdf53_escalation_path, 0);
+    let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    assert_eq!(logs.matches("\"source\":\"dirty\"").count(), 6, "{logs}");
+    assert_eq!(
+        logs.matches("\"source\":\"escalation\"").count(),
+        0,
+        "{logs}"
+    );
+    buf.lock().unwrap().clear();
+
+    // Escalation: one bump, two log lines.
+    bridge.enqueue_cdf53_generation(3, 3, present, passes(), Cdf53Source::Escalation);
+    assert_eq!(bridge.bump_count_accumulator.cdf53_dirty_path, 3);
+    assert_eq!(bridge.bump_count_accumulator.cdf53_escalation_path, 1);
+    let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        logs.matches("\"source\":\"escalation\"").count(),
+        2,
+        "{logs}"
+    );
+    assert_eq!(logs.matches("\"source\":\"dirty\"").count(), 0, "{logs}");
+    assert_eq!(logs.matches("cdf53.emit").count(), 2, "{logs}");
+}
