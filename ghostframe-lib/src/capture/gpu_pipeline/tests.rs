@@ -2748,3 +2748,106 @@ fn golden_from_pixels_sequence() {
     }
     assert_eq!(got.len(), GOLDEN_EXPECTED.len(), "golden row count changed");
 }
+
+// ---------------------------------------------------------------------------
+// Per-frame cost microbenchmark (ignored; run with --ignored --nocapture)
+// ---------------------------------------------------------------------------
+
+/// A 1920x1080 BGRA frame whose tile `t` has content derived from
+/// `seed(t)`. Tiles with the same seed are byte-identical between frames.
+fn bench_frame(w: u32, h: u32, seed: impl Fn(u32) -> u64) -> Vec<u8> {
+    let cols = w.div_ceil(32);
+    let mut px = vec![0u8; (w * h * 4) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            let t = (y / 32) * cols + x / 32;
+            let (lx, ly) = (x % 32, y % 32);
+            let s = seed(t);
+            // A few colours per tile, arranged in 2x2 blocks: a palette-like
+            // tile, so the PalRLE / CDF stages have something to do.
+            let r = golden_mix(s ^ (((lx / 2) as u64) << 8) ^ ((ly / 2) as u64));
+            let col: u32 = 0xFF00_0000 | (((r % 5) as u32 * 50 + (s % 7) as u32) * 0x0001_0101);
+            let off = ((y * w + x) * 4) as usize;
+            px[off..off + 4].copy_from_slice(&col.to_le_bytes());
+        }
+    }
+    px
+}
+
+fn bench_report(label: &str, mut us: Vec<f64>) {
+    us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let n = us.len();
+    let mean = us.iter().sum::<f64>() / n as f64;
+    let median = us[n / 2];
+    let p99 = us[((n * 99).div_ceil(100)).saturating_sub(1).min(n - 1)];
+    println!("{label:<34} mean {mean:8.0}  median {median:8.0}  p99 {p99:8.0}  (us/frame, n={n})");
+}
+
+/// Times `process_frame_from_pixels` per frame at 1920x1080 on a real GPU
+/// processor. `steady` flips 8 tiles between two frame variants, `busy`
+/// flips every second tile. Each is run with an empty and a non-empty
+/// (64-tile) escalation list.
+///
+/// Run: cargo test -p ghostframe-lib --release --lib bench_process_frame \
+///   -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+fn bench_process_frame() {
+    const W: u32 = 1920;
+    const H: u32 = 1080;
+    const WARMUP: usize = 20;
+    const N: usize = 300;
+    let esc_list: Vec<u32> = (0..64).map(|i| i * 31).collect();
+
+    let base = |t: u32| 1 + t as u64;
+    let steady_b = bench_frame(W, H, |t| {
+        if t % 255 == 3 {
+            9_000 + t as u64
+        } else {
+            base(t)
+        }
+    });
+    let busy_b = bench_frame(W, H, |t| {
+        if t % 2 == 0 {
+            9_000 + t as u64
+        } else {
+            base(t)
+        }
+    });
+    let frame_a = bench_frame(W, H, base);
+
+    for (mode, alt) in [("steady", &steady_b), ("busy", &busy_b)] {
+        for esc in [false, true] {
+            let mut p = match GpuFrameProcessor::new(4096) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("Skipping bench_process_frame (no Vulkan?): {e}");
+                    return;
+                }
+            };
+            let mut us = Vec::with_capacity(N);
+            let mut dirty_total = 0usize;
+            for i in 0..WARMUP + N {
+                let px = if i % 2 == 0 { &frame_a } else { alt };
+                p.set_escalation_candidates(if esc { &esc_list } else { &[] });
+                let t0 = std::time::Instant::now();
+                let a = p
+                    .process_frame_from_pixels(px, W, H, W * 4)
+                    .expect("process_frame_from_pixels");
+                let dt = std::time::Instant::now().duration_since(t0);
+                if i >= WARMUP {
+                    us.push(dt.as_secs_f64() * 1e6);
+                    dirty_total += a.dirty_tiles.len();
+                }
+            }
+            // Non-vacuity: the mode must actually change tiles.
+            assert!(dirty_total > 0, "{mode}: no dirty tiles ever");
+            let label = format!(
+                "{mode}/{} (dirty/frame {})",
+                if esc { "esc64" } else { "esc0 " },
+                dirty_total / N
+            );
+            bench_report(&label, us);
+        }
+    }
+}
