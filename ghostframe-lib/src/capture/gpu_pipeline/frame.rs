@@ -216,8 +216,14 @@ impl GpuFrameProcessor {
         // (called by io_bridge before this frame), then immediately reset it to 0
         // so a caller that forgets set_escalation_candidates on the next frame
         // does not replay the current frame's list.
+        // A failed frame must not leave the previous frame's tier readable.
+        let prev_ingest = self.last_ingest.take();
         let escalation_count_this_frame = self.staged_escalation_count;
         self.staged_escalation_count = 0;
+
+        // Reject bad geometry before touching any other state: a zero dimension
+        // otherwise reaches ensure_nv12_buffer and creates zero-size buffers.
+        dmabuf_frame_bytes(width, height, stride)?;
 
         let geom = FrameGeometry::from_dims(width, height);
 
@@ -247,7 +253,27 @@ impl GpuFrameProcessor {
         // because PRIME-exported FBs share physical memory across imports
         // (active scanout BO doesn't change between captures), so a previous
         // import would always be byte-identical to a fresh one and SAD = 0.
-        let current = self.import_dmabuf(fd, width, height, stride)?;
+        let current = match self.import_dmabuf(fd, width, height, stride) {
+            Ok(c) => {
+                self.last_ingest = Some(IngestTier::DmabufBuffer);
+                c
+            }
+            Err(e) => {
+                // Not importable (see import_dmabuf). Read it through the CPU
+                // with DMA_BUF_IOCTL_SYNC and run the from-pixels path rather
+                // than analyse anything unvalidated.
+                // Warn on the transition only: a permanently unimportable
+                // source would otherwise log at frame rate.
+                if prev_ingest != Some(IngestTier::CpuMmap) {
+                    tracing::warn!("dma-buf GPU import refused ({e}); using CPU-mmap ingest");
+                }
+                let tight = read_dmabuf_tight(fd, width, height, stride)?;
+                // Re-stage what was consumed above; the delegate consumes it.
+                self.staged_escalation_count = escalation_count_this_frame;
+                self.last_ingest = Some(IngestTier::CpuMmap);
+                return self.process_frame_inner_from_pixels(&tight, width, height, width * 4);
+            }
+        };
         // Result must always destroy `current` at end. Use a closure-style
         // cleanup by carrying it forward and explicitly destroying.
         let result = self.process_frame_with_imported(&current, geom, escalation_count_this_frame);
@@ -465,6 +491,9 @@ impl GpuFrameProcessor {
                 })
                 .dst_access_mask(vk::AccessFlags::SHADER_READ),
         ];
+        // A dma-buf ingest acquires `current` itself (copy + GENERAL); only
+        // `prev` still needs the barrier then (element 1).
+        let acquired = self.record_acquire_current(cmd, current);
         self.device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::HOST,
@@ -472,7 +501,7 @@ impl GpuFrameProcessor {
             vk::DependencyFlags::empty(),
             &[],
             &[],
-            &barriers,
+            &barriers[usize::from(acquired)..],
         );
 
         // 2. SAD dispatch
@@ -707,15 +736,17 @@ impl GpuFrameProcessor {
             .subresource_range(subresource_range)
             .src_access_mask(vk::AccessFlags::HOST_WRITE)
             .dst_access_mask(vk::AccessFlags::SHADER_READ)];
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::HOST,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &img_barrier,
-        );
+        if !self.record_acquire_current(cmd, current) {
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::HOST,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &img_barrier,
+            );
+        }
 
         // NV12 dispatch
         let nv12_push: [u32; 5] = [width, height, nv12_y_stride, nv12_uv_offset, nv12_uv_stride];
@@ -833,49 +864,165 @@ impl GpuFrameProcessor {
 // ---------------------------------------------------------------------------
 
 impl GpuFrameProcessor {
-    /// Import a DMA-BUF fd as a VkImage + VkImageView.
-    unsafe fn import_dmabuf(
+    /// Import a DMA-BUF fd and return a pipeline image that will hold its
+    /// pixels once the frame's command buffer has run `record_acquire_current`.
+    ///
+    /// The dma-buf's memory is imported as a `VkBuffer`, not as a `VkImage`.
+    /// A LINEAR `VkImage` has a driver-chosen row pitch (RADV pads it to 256
+    /// bytes) and `VK_EXT_external_memory_dma_buf` has no way to tell the
+    /// driver the producer's pitch, so a zero-copy image import is only right
+    /// when the two happen to coincide. A buffer has no pitch: the copy into
+    /// the (driver-owned, OPTIMAL) pipeline image takes the real stride as
+    /// `bufferRowLength`, so any stride that is a multiple of 4 is exact on
+    /// any driver.
+    ///
+    /// Returns `Err` (caller takes the CPU-mmap path) when the input cannot be
+    /// imported safely: bad geometry, fd smaller than the frame, a fd that is
+    /// not a dma-buf, a driver without dma-buf buffer import, or a driver whose
+    /// buffer requirements exceed the fd. Nothing is ever analysed unvalidated.
+    pub(super) unsafe fn import_dmabuf(
         &self,
         fd: std::os::unix::io::RawFd,
         width: u32,
         height: u32,
         stride: u32,
     ) -> Result<PrevFrame, Box<dyn std::error::Error>> {
-        let size = (stride * height) as vk::DeviceSize;
+        use std::os::fd::{BorrowedFd, IntoRawFd};
 
-        // Dup the fd: Vulkan takes ownership of the duplicated fd.
-        let dup_fd = libc::dup(fd);
-        if dup_fd < 0 {
-            return Err(io::Error::last_os_error().into());
+        let need = dmabuf_frame_bytes(width, height, stride)?;
+        if !stride.is_multiple_of(4) {
+            // bufferRowLength is in texels; a stride that is not a whole
+            // number of texels cannot be expressed to the copy.
+            return Err(format!("dma-buf import: stride {stride} is not a multiple of 4").into());
         }
+
+        let fd_size = libc::lseek(fd, 0, libc::SEEK_END);
+        if fd_size < 0 {
+            return Err(format!(
+                "dma-buf import: cannot size fd: {}",
+                io::Error::last_os_error()
+            )
+            .into());
+        }
+        // Leave the offset where a dma-buf mmap/read expects it.
+        libc::lseek(fd, 0, libc::SEEK_SET);
+        if need > fd_size as u64 {
+            return Err(
+                format!("dma-buf import: frame needs {need} bytes, fd has {fd_size}").into(),
+            );
+        }
+
+        // --- Does the driver import dma-buf memory as a buffer at all? ---
+        let ext_buf_info = vk::PhysicalDeviceExternalBufferInfo::default()
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let mut ext_buf_props = vk::ExternalBufferProperties::default();
+        self.instance
+            .get_physical_device_external_buffer_properties(
+                self.physical_device,
+                &ext_buf_info,
+                &mut ext_buf_props,
+            );
+        let feats = ext_buf_props
+            .external_memory_properties
+            .external_memory_features;
+        if !feats.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE) {
+            return Err("dma-buf import: driver does not import dma-buf as a buffer".into());
+        }
+        let dedicated_only = feats.contains(vk::ExternalMemoryFeatureFlags::DEDICATED_ONLY);
+
+        // --- What the fd itself says it can be imported as. ---
+        let efd = ash::khr::external_memory_fd::Device::new(&self.instance, &self.device);
+        let mut fd_props = vk::MemoryFdPropertiesKHR::default();
+        efd.get_memory_fd_properties(
+            vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+            fd,
+            &mut fd_props,
+        )
+        .map_err(|e| format!("dma-buf import: vkGetMemoryFdProperties: {e:?} (not a dma-buf?)"))?;
+
+        // Owns the fd until Vulkan accepts it; owns each object until the
+        // PrevFrame is built. Drop order is reverse of creation.
+        struct Pending<'a> {
+            dev: &'a ash::Device,
+            fd: Option<std::os::fd::OwnedFd>,
+            buffer: vk::Buffer,
+            buf_mem: vk::DeviceMemory,
+            image: vk::Image,
+            img_mem: vk::DeviceMemory,
+            view: vk::ImageView,
+        }
+        impl Drop for Pending<'_> {
+            fn drop(&mut self) {
+                // Destroying/freeing VK_NULL_HANDLE is a legal no-op.
+                unsafe {
+                    self.dev.destroy_image_view(self.view, None);
+                    self.dev.destroy_image(self.image, None);
+                    self.dev.free_memory(self.img_mem, None);
+                    self.dev.destroy_buffer(self.buffer, None);
+                    self.dev.free_memory(self.buf_mem, None);
+                }
+            }
+        }
+        let mut p = Pending {
+            dev: &self.device,
+            fd: Some(BorrowedFd::borrow_raw(fd).try_clone_to_owned()?),
+            buffer: vk::Buffer::null(),
+            buf_mem: vk::DeviceMemory::null(),
+            image: vk::Image::null(),
+            img_mem: vk::DeviceMemory::null(),
+            view: vk::ImageView::null(),
+        };
+
+        // --- The buffer over the dma-buf. ---
+        let mut ext_buf_ci = vk::ExternalMemoryBufferCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let buf_ci = vk::BufferCreateInfo::default()
+            .size(need)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .push_next(&mut ext_buf_ci);
+        p.buffer = self.device.create_buffer(&buf_ci, None)?;
+        let buf_reqs = self.device.get_buffer_memory_requirements(p.buffer);
+        if buf_reqs.size > fd_size as u64 {
+            return Err(format!(
+                "dma-buf import: driver needs {} bytes for the buffer, fd has {fd_size}",
+                buf_reqs.size
+            )
+            .into());
+        }
+        // The memory type comes from the fd, intersected with what the buffer
+        // can live in. No DEVICE_LOCAL preference: an import is whatever the
+        // exporter's memory is.
+        let usable = fd_props.memory_type_bits & buf_reqs.memory_type_bits;
+        if usable == 0 {
+            return Err(format!(
+                "dma-buf import: no common memory type (fd {:#x}, buffer {:#x})",
+                fd_props.memory_type_bits, buf_reqs.memory_type_bits
+            )
+            .into());
+        }
+        let buf_mem_type = usable.trailing_zeros();
 
         let mut import_info = vk::ImportMemoryFdInfoKHR::default()
             .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
-            .fd(dup_fd);
-
-        let mem_props = self
-            .instance
-            .get_physical_device_memory_properties(self.physical_device);
-
-        let image_mem_type =
-            find_memory_type(&mem_props, u32::MAX, vk::MemoryPropertyFlags::DEVICE_LOCAL)
-                .or_else(|| {
-                    find_memory_type(&mem_props, u32::MAX, vk::MemoryPropertyFlags::empty())
-                })
-                .ok_or("no suitable memory type for DMA-BUF import")?;
-
+            .fd(std::os::fd::AsRawFd::as_raw_fd(p.fd.as_ref().unwrap()));
+        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().buffer(p.buffer);
         let mut alloc_info = vk::MemoryAllocateInfo::default()
-            .allocation_size(size)
-            .memory_type_index(image_mem_type);
-        alloc_info = alloc_info.push_next(&mut import_info);
+            .allocation_size(buf_reqs.size)
+            .memory_type_index(buf_mem_type)
+            .push_next(&mut import_info);
+        if dedicated_only {
+            alloc_info = alloc_info.push_next(&mut dedicated);
+        }
+        p.buf_mem = self.device.allocate_memory(&alloc_info, None)?;
+        // Vulkan owns the fd now; closing it would be a double close.
+        let _ = p.fd.take().unwrap().into_raw_fd();
+        self.device.bind_buffer_memory(p.buffer, p.buf_mem, 0)?;
 
-        let memory = self.device.allocate_memory(&alloc_info, None)?;
-
-        // Create VkImage backed by imported memory.
-        // STORAGE usage so the compute shader can use imageLoad.
-        let mut ext_mem_info = vk::ExternalMemoryImageCreateInfo::default()
-            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-
+        // --- The pipeline image the compute stages read. Owned, OPTIMAL: ---
+        // STORAGE for imageLoad, TRANSFER_DST for the ingest copy, and
+        // TRANSFER_SRC because record_snapshot_copy copies out of it.
         let image_ci = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(vk::Format::B8G8R8A8_UNORM)
@@ -887,18 +1034,40 @@ impl GpuFrameProcessor {
             .mip_levels(1)
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::LINEAR)
-            .usage(vk::ImageUsageFlags::STORAGE)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(
+                vk::ImageUsageFlags::STORAGE
+                    | vk::ImageUsageFlags::TRANSFER_DST
+                    | vk::ImageUsageFlags::TRANSFER_SRC,
+            )
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .initial_layout(vk::ImageLayout::PREINITIALIZED)
-            .push_next(&mut ext_mem_info);
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        p.image = self.device.create_image(&image_ci, None)?;
+        let img_reqs = self.device.get_image_memory_requirements(p.image);
+        let mem_props = self
+            .instance
+            .get_physical_device_memory_properties(self.physical_device);
+        let img_mem_type = find_memory_type(
+            &mem_props,
+            img_reqs.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )
+        .or_else(|| {
+            find_memory_type(
+                &mem_props,
+                img_reqs.memory_type_bits,
+                vk::MemoryPropertyFlags::empty(),
+            )
+        })
+        .ok_or("no memory type for the dma-buf ingest image")?;
+        let img_alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(img_reqs.size)
+            .memory_type_index(img_mem_type);
+        p.img_mem = self.device.allocate_memory(&img_alloc, None)?;
+        self.device.bind_image_memory(p.image, p.img_mem, 0)?;
 
-        let image = self.device.create_image(&image_ci, None)?;
-        self.device.bind_image_memory(image, memory, 0)?;
-
-        // Create VkImageView
         let view_ci = vk::ImageViewCreateInfo::default()
-            .image(image)
+            .image(p.image)
             .view_type(vk::ImageViewType::TYPE_2D)
             .format(vk::Format::B8G8R8A8_UNORM)
             .components(vk::ComponentMapping {
@@ -914,16 +1083,113 @@ impl GpuFrameProcessor {
                 base_array_layer: 0,
                 layer_count: 1,
             });
-        let view = self.device.create_image_view(&view_ci, None)?;
+        p.view = self.device.create_image_view(&view_ci, None)?;
 
-        Ok(PrevFrame {
-            image,
-            memory,
-            view,
-            layout: vk::ImageLayout::PREINITIALIZED,
+        let frame = PrevFrame {
+            image: p.image,
+            memory: p.img_mem,
+            view: p.view,
+            layout: vk::ImageLayout::UNDEFINED,
             width,
             height,
-        })
+            ingest: Some(BufferIngest {
+                buffer: p.buffer,
+                memory: p.buf_mem,
+                row_length_texels: stride / 4,
+            }),
+        };
+        // Ownership moves to the PrevFrame; disarm the guard.
+        std::mem::forget(p);
+        Ok(frame)
+    }
+
+    /// Record the acquisition of `current` into `cmd`, leaving it in GENERAL
+    /// with SHADER_READ visible. Returns `true` when this recorded everything
+    /// (dma-buf ingest); `false` when the image is host-written and the caller
+    /// still needs its own PREINITIALIZED -> GENERAL barrier.
+    pub(super) unsafe fn record_acquire_current(
+        &self,
+        cmd: vk::CommandBuffer,
+        current: &PrevFrame,
+    ) -> bool {
+        let Some(ing) = current.ingest.as_ref() else {
+            return false;
+        };
+        let range = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        // 1. Take the buffer from the foreign producer; image -> TRANSFER_DST.
+        let buf_acquire = [vk::BufferMemoryBarrier::default()
+            .src_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL)
+            .dst_queue_family_index(self.queue_family_index)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .buffer(ing.buffer)
+            .offset(0)
+            .size(vk::WHOLE_SIZE)];
+        let to_dst = [vk::ImageMemoryBarrier::default()
+            .old_layout(current.layout)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(current.image)
+            .subresource_range(range)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)];
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &buf_acquire,
+            &to_dst,
+        );
+        // 2. The copy. bufferRowLength is the real stride, in texels.
+        let region = [vk::BufferImageCopy::default()
+            .buffer_offset(0)
+            .buffer_row_length(ing.row_length_texels)
+            .buffer_image_height(0)
+            .image_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .image_extent(vk::Extent3D {
+                width: current.width,
+                height: current.height,
+                depth: 1,
+            })];
+        self.device.cmd_copy_buffer_to_image(
+            cmd,
+            ing.buffer,
+            current.image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &region,
+        );
+        // 3. Hand the image to the compute stages.
+        let to_general = [vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(current.image)
+            .subresource_range(range)
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)];
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &to_general,
+        );
+        true
     }
 
     /// Destroy all Vulkan resources held by a `PrevFrame`.
@@ -931,6 +1197,10 @@ impl GpuFrameProcessor {
         self.device.destroy_image_view(frame.view, None);
         self.device.destroy_image(frame.image, None);
         self.device.free_memory(frame.memory, None);
+        if let Some(ing) = frame.ingest {
+            self.device.destroy_buffer(ing.buffer, None);
+            self.device.free_memory(ing.memory, None);
+        }
     }
 
     /// Upload BGRA pixels from CPU memory into a HOST_VISIBLE LINEAR STORAGE
@@ -1066,6 +1336,7 @@ impl GpuFrameProcessor {
             layout: vk::ImageLayout::PREINITIALIZED,
             width,
             height,
+            ingest: None,
         })
     }
 
@@ -1156,6 +1427,7 @@ impl GpuFrameProcessor {
             layout: vk::ImageLayout::UNDEFINED,
             width,
             height,
+            ingest: None,
         })
     }
 
@@ -2699,4 +2971,81 @@ impl SharedStageGuards<'_> {
         drop(palrle_indirect_args_ds_guard);
         drop(palrle_compact_ds_guard);
     }
+}
+
+/// Read a dma-buf through the CPU, bracketed by `DMA_BUF_IOCTL_SYNC`, and
+/// return tightly packed rows (`width * 4` bytes each). Validates geometry and
+/// the fd's size first: mapping past the end of a dma-buf is a SIGBUS, not an
+/// error.
+fn read_dmabuf_tight(
+    fd: std::os::unix::io::RawFd,
+    width: u32,
+    height: u32,
+    stride: u32,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let row = u64::from(width) * 4;
+    if width == 0 || height == 0 || u64::from(stride) < row {
+        return Err(format!("dma-buf mmap: bad geometry {width}x{height} stride {stride}").into());
+    }
+    let need = u64::from(height - 1) * u64::from(stride) + row;
+    if row * u64::from(height) > u64::from(u32::MAX) {
+        return Err(format!("dma-buf mmap: {width}x{height} is too large").into());
+    }
+    // SAFETY: plain libc calls on a caller-owned fd; the mapping is read only
+    // within `need` bytes, which is checked against the fd size first.
+    unsafe {
+        let fd_size = libc::lseek(fd, 0, libc::SEEK_END);
+        libc::lseek(fd, 0, libc::SEEK_SET);
+        if fd_size < 0 || need > fd_size as u64 {
+            return Err(format!("dma-buf mmap: frame needs {need} bytes, fd has {fd_size}").into());
+        }
+        let len = need as usize;
+        let ptr = libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        );
+        if ptr == libc::MAP_FAILED {
+            return Err(format!("dma-buf mmap: {}", io::Error::last_os_error()).into());
+        }
+        // _IOW('b', 0, struct dma_buf_sync{u64 flags}); READ = 1, END = 4.
+        // Ignored on failure: memfds (ENOTTY) and some exporters have no sync.
+        let sync = |flags: u64| {
+            let s = flags;
+            libc::ioctl(fd, 0x4008_6200, &s);
+        };
+        sync(1);
+        let mut out = vec![0u8; (row as usize) * height as usize];
+        for y in 0..height as usize {
+            let src = (ptr as *const u8).add(y * stride as usize);
+            std::ptr::copy_nonoverlapping(
+                src,
+                out.as_mut_ptr().add(y * row as usize),
+                row as usize,
+            );
+        }
+        sync(1 | 4);
+        libc::munmap(ptr, len);
+        Ok(out)
+    }
+}
+
+/// Bytes a `width` x `height` BGRA frame occupies at `stride`: the last row
+/// need not be padded. Computed in u64 (`stride * height` wraps u32 at 4 GiB).
+fn dmabuf_frame_bytes(
+    width: u32,
+    height: u32,
+    stride: u32,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    if width == 0 || height == 0 {
+        return Err(format!("dma-buf: empty frame {width}x{height}").into());
+    }
+    let row = u64::from(width) * 4;
+    if u64::from(stride) < row {
+        return Err(format!("dma-buf: stride {stride} < width*4 {row}").into());
+    }
+    Ok(u64::from(height - 1) * u64::from(stride) + row)
 }
