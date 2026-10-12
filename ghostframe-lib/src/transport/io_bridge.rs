@@ -49,6 +49,16 @@ use crate::transport::quic::QuicServer;
 use crate::transport::webtransport::WebTransportServer;
 use ghostframe_protocol::eviction::{build_eviction_datagram, EvictionReason};
 
+/// Tracing target the moved-out code keeps logging under: the child modules
+/// would otherwise report `module_path!()` of the child.
+const LOG_TARGET: &str = "ghostframe_lib::transport::io_bridge";
+
+#[path = "io_bridge/display_mode.rs"]
+mod display_mode;
+use display_mode::{clamp_and_align_mode, PendingDisplayMode, DISPLAY_MODE_DEBOUNCE_US};
+#[cfg(test)]
+use display_mode::{MIN_MODE_HEIGHT, MIN_MODE_WIDTH};
+
 // ---------------------------------------------------------------------------
 // Clock discipline
 // ---------------------------------------------------------------------------
@@ -597,15 +607,6 @@ const FEC_DISABLE_THRESHOLD: f64 = 0.002;
 /// is 0.05^10 ≈ 9.7e-14.
 const FRAME_DIMENSIONS_RETRANSMITS: u8 = 10;
 
-/// How long to wait after the last `DisplayMode` before applying it.
-///
-/// **A guess, not a measurement.** Roughly the pause a person makes on
-/// releasing a window edge, and far longer than the 2.6-4.9 ms a resolution
-/// change costs (M3 spec §10.7), so being wrong means latency on the last
-/// resize rather than thrash. If it proves wrong, measure a real resize
-/// drag rather than guessing again.
-const DISPLAY_MODE_DEBOUNCE_US: u64 = 250_000;
-
 /// Scale before any `DisplayInfo` arrives. 1.0 -- the server's current
 /// behaviour, so a client that never negotiates sees no change.
 const DEFAULT_SCALE_MILLI: u16 = 1000;
@@ -643,46 +644,6 @@ const TAKEOVER_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 struct CloseDeadline {
     at: std::time::Instant,
     code: u32,
-}
-
-/// CVT rounds h_active UP to a multiple of 8 (verified: `cvt 1283 817 60 -r`
-/// yields a 1288-wide mode). Align requested widths DOWN to this instead:
-/// a mode wider than the client's window crops the remote desktop
-/// off-screen, while a narrower one leaves a harmless border.
-const MODE_WIDTH_GRANULARITY: u16 = 8;
-
-/// Floor so that aligning down, or a client dragging a window to nothing,
-/// cannot ask X for a degenerate mode.
-const MIN_MODE_WIDTH: u16 = 320;
-const MIN_MODE_HEIGHT: u16 = 240;
-
-/// A `DisplayMode` request awaiting the debounce deadline. Stores the
-/// already-clamped/aligned/floored size (see `clamp_and_align_mode`) so
-/// `on_timeout` only has to compare a deadline and call `set_output` --
-/// the decision of *what* to apply was made at dispatch time, `when` is
-/// decided here.
-struct PendingDisplayMode {
-    width: u16,
-    height: u16,
-    /// Microseconds since `IoBridge::epoch` (same clock as the classifier's
-    /// `now_us`, i.e. `now_std().duration_since(self.epoch)`, the same
-    /// epoch-relative clock the classifier's dwell timers use) at which this
-    /// becomes due.
-    deadline_us: u64,
-}
-
-/// Clamp a requested mode to the controller's ceiling, then align the width
-/// down to `MODE_WIDTH_GRANULARITY`, then apply the floors. Order matters:
-/// aligning down AFTER clamping guarantees the result never exceeds the
-/// ceiling even when the ceiling itself isn't a multiple of the granularity;
-/// aligning first and clamping second would not have that guarantee. Height
-/// is only clamped and floored -- CVT's granularity constraint is
-/// horizontal-only.
-fn clamp_and_align_mode(requested_w: u16, requested_h: u16, ceiling: (u16, u16)) -> (u16, u16) {
-    let w = requested_w.min(ceiling.0);
-    let h = requested_h.min(ceiling.1);
-    let w = (w / MODE_WIDTH_GRANULARITY) * MODE_WIDTH_GRANULARITY;
-    (w.max(MIN_MODE_WIDTH), h.max(MIN_MODE_HEIGHT))
 }
 
 /// One scene frame's worth of pre-encoded tile work, injected by the
@@ -3919,48 +3880,6 @@ impl IoBridge {
             .map(|p| self.epoch + std::time::Duration::from_micros(p.deadline_us));
         let close = self.close_deadlines.values().map(|d| d.at).min();
         [quic, display, close].into_iter().flatten().min()
-    }
-
-    pub(crate) fn on_timeout(&mut self, now_us: u64) {
-        let Some(pending) = self.pending_display_mode.as_ref() else {
-            return;
-        };
-        // Diagnostic for the open M4b defect: the e2e shows a pending mode
-        // stored and never applied, with no log from either arm below. This
-        // line distinguishes "deadline never reached" from "loop never woke"
-        // -- run the server with
-        // `RUST_LOG=ghostframe_lib::transport::io_bridge=trace` to see it.
-        // Left in (at trace) rather than deleted because reproducing the
-        // failure needs a container rebuild, which is expensive.
-        tracing::trace!(
-            now_us,
-            deadline_us = pending.deadline_us,
-            due = now_us >= pending.deadline_us,
-            has_controller = self.display_controller.is_some(),
-            "m4b-diag: on_timeout saw a pending display mode"
-        );
-        if now_us < pending.deadline_us {
-            return;
-        }
-        let PendingDisplayMode { width, height, .. } = self
-            .pending_display_mode
-            .take()
-            .expect("checked Some above");
-        if let Some(ctl) = self.display_controller.as_ref() {
-            match ctl.set_output(width, height, self.display_scale_milli) {
-                Ok(()) => {
-                    tracing::info!(
-                        width,
-                        height,
-                        scale_milli = self.display_scale_milli,
-                        "display mode applied"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(width, height, error = %e, "display mode apply failed");
-                }
-            }
-        }
     }
 
     /// React to a client-reported decode error. Most error codes are
