@@ -262,22 +262,13 @@ pub struct GpuFrameProcessor {
     command_pool: vk::CommandPool,
 
     // SAD pipeline
-    shader_module: vk::ShaderModule,
-    pipeline: vk::Pipeline,
-    pipeline_layout: vk::PipelineLayout,
-    descriptor_set_layout: vk::DescriptorSetLayout,
+    sad: ComputeStage,
 
     // NV12 pipeline
-    nv12_shader_module: vk::ShaderModule,
-    nv12_pipeline: vk::Pipeline,
-    nv12_pipeline_layout: vk::PipelineLayout,
-    nv12_descriptor_set_layout: vk::DescriptorSetLayout,
+    nv12: ComputeStage,
 
     // Tile-analysis pipeline (new)
-    analysis_shader_module: vk::ShaderModule,
-    analysis_pipeline: vk::Pipeline,
-    analysis_pipeline_layout: vk::PipelineLayout,
-    analysis_descriptor_set_layout: vk::DescriptorSetLayout,
+    analysis: ComputeStage,
     // HOST_VISIBLE | HOST_COHERENT, persistently mapped. Layout matches
     // `TileAnalysis` (80 bytes per tile).
     analysis_buffer: vk::Buffer,
@@ -285,10 +276,7 @@ pub struct GpuFrameProcessor {
     analysis_ptr: *mut TileAnalysis,
 
     // PalRLE compact pipeline (Stage 1.5)
-    palrle_compact_shader_module: vk::ShaderModule,
-    palrle_compact_pipeline: vk::Pipeline,
-    palrle_compact_pipeline_layout: vk::PipelineLayout,
-    palrle_compact_descriptor_set_layout: vk::DescriptorSetLayout,
+    palrle_compact: ComputeStage,
     // HOST_VISIBLE | HOST_COHERENT, persistently mapped. One u32 per tile.
     palrle_compact_list_buffer: vk::Buffer,
     palrle_compact_list_memory: vk::DeviceMemory,
@@ -303,10 +291,7 @@ pub struct GpuFrameProcessor {
     palrle_compact_count_ptr: *mut u32,
 
     // Cdf53 compact pipeline (Stage 4a, added M3.3a)
-    cdf53_compact_shader_module: vk::ShaderModule,
-    cdf53_compact_pipeline: vk::Pipeline,
-    cdf53_compact_pipeline_layout: vk::PipelineLayout,
-    cdf53_compact_descriptor_set_layout: vk::DescriptorSetLayout,
+    cdf53_compact: ComputeStage,
     // HOST_VISIBLE | HOST_COHERENT, persistently mapped. One u32 per tile.
     cdf53_compact_list_buffer: vk::Buffer,
     cdf53_compact_list_memory: vk::DeviceMemory,
@@ -323,10 +308,7 @@ pub struct GpuFrameProcessor {
     cdf53_dispatch_args_memory: vk::DeviceMemory,
     // No CPU pointer — HOST_VISIBLE only for simple alloc; read by GPU via
     // vkCmdDispatchIndirect. Written once per frame by cdf53_indirect_args shader.
-    cdf53_indirect_args_shader_module: vk::ShaderModule,
-    cdf53_indirect_args_pipeline: vk::Pipeline,
-    cdf53_indirect_args_pipeline_layout: vk::PipelineLayout,
-    cdf53_indirect_args_descriptor_set_layout: vk::DescriptorSetLayout,
+    cdf53_indirect_args: ComputeStage,
 
     // Cdf53 coefficient buffer (Stage 4c, added M3.3a Task 7)
     // max_tiles * 3 channels * 1024 i32 = max_tiles * 12 KiB.
@@ -359,38 +341,23 @@ pub struct GpuFrameProcessor {
     pub cdf53_escalation_coefficients_ptr: *const i32,
 
     // Cdf53 forward L1 pipeline (Stage 4c-L1, added M3.3a Task 7)
-    cdf53_forward_l1_shader_module: vk::ShaderModule,
-    cdf53_forward_l1_pipeline: vk::Pipeline,
-    cdf53_forward_l1_pipeline_layout: vk::PipelineLayout,
-    cdf53_forward_l1_descriptor_set_layout: vk::DescriptorSetLayout,
+    cdf53_forward_l1: ComputeStage,
 
     // Cdf53 forward L2 pipeline (Stage 4c-L2, added M3.3a Task 7)
-    cdf53_forward_l2_shader_module: vk::ShaderModule,
-    cdf53_forward_l2_pipeline: vk::Pipeline,
-    cdf53_forward_l2_pipeline_layout: vk::PipelineLayout,
-    cdf53_forward_l2_descriptor_set_layout: vk::DescriptorSetLayout,
+    cdf53_forward_l2: ComputeStage,
 
     // Cdf53 forward L3 pipeline (Stage 4c-L3, added M3.3a Task 7)
-    cdf53_forward_l3_shader_module: vk::ShaderModule,
-    cdf53_forward_l3_pipeline: vk::Pipeline,
-    cdf53_forward_l3_pipeline_layout: vk::PipelineLayout,
-    cdf53_forward_l3_descriptor_set_layout: vk::DescriptorSetLayout,
+    cdf53_forward_l3: ComputeStage,
 
     // PalRLE indirect-args pipeline (Stage 1.5b)
-    palrle_indirect_args_shader_module: vk::ShaderModule,
-    palrle_indirect_args_pipeline: vk::Pipeline,
-    palrle_indirect_args_pipeline_layout: vk::PipelineLayout,
-    palrle_indirect_args_descriptor_set_layout: vk::DescriptorSetLayout,
+    palrle_indirect_args: ComputeStage,
     // HOST_VISIBLE | HOST_COHERENT, size = 12 bytes. Written by shader; used as
     // INDIRECT_BUFFER for vkCmdDispatchIndirect in Task 10b.
     palrle_indirect_args_buffer: vk::Buffer,
     palrle_indirect_args_memory: vk::DeviceMemory,
 
     // palette_fold pipeline (Stage 2a)
-    palette_fold_shader_module: vk::ShaderModule,
-    palette_fold_pipeline: vk::Pipeline,
-    palette_fold_pipeline_layout: vk::PipelineLayout,
-    palette_fold_descriptor_set_layout: vk::DescriptorSetLayout,
+    palette_fold: ComputeStage,
     // HOST_VISIBLE | HOST_COHERENT, 256 * 80 = 20480 bytes. Persistently mapped.
     frame_palette_set_buffer: vk::Buffer,
     frame_palette_set_memory: vk::DeviceMemory,
@@ -415,16 +382,10 @@ pub struct GpuFrameProcessor {
     per_tile_frame_palette_id_ptr: *mut u8,
 
     // palette_subset_fold_init pipeline (Stage 2b init)
-    palette_subset_fold_init_shader_module: vk::ShaderModule,
-    palette_subset_fold_init_pipeline: vk::Pipeline,
-    palette_subset_fold_init_pipeline_layout: vk::PipelineLayout,
-    palette_subset_fold_init_descriptor_set_layout: vk::DescriptorSetLayout,
+    palette_subset_fold_init: ComputeStage,
 
     // palette_subset_fold pipeline (Stage 2b)
-    palette_subset_fold_shader_module: vk::ShaderModule,
-    palette_subset_fold_pipeline: vk::Pipeline,
-    palette_subset_fold_pipeline_layout: vk::PipelineLayout,
-    palette_subset_fold_descriptor_set_layout: vk::DescriptorSetLayout,
+    palette_subset_fold: ComputeStage,
 
     // Stage 2b output: folded_into[i] encodes the best superset for slot i.
     // 256 × 4 = 1024 bytes. HOST_VISIBLE | HOST_COHERENT | STORAGE_BUFFER | TRANSFER_DST.
@@ -436,10 +397,7 @@ pub struct GpuFrameProcessor {
     folded_into_ptr: *mut u32,
 
     // pal_rle_index pipeline (Stage 3)
-    pal_rle_index_shader_module: vk::ShaderModule,
-    pal_rle_index_pipeline: vk::Pipeline,
-    pal_rle_index_pipeline_layout: vk::PipelineLayout,
-    pal_rle_index_descriptor_set_layout: vk::DescriptorSetLayout,
+    pal_rle_index: ComputeStage,
     // HOST_VISIBLE | HOST_COHERENT, size = max_tiles * 512 bytes.
     // Each tile occupies 128 u32 entries (512 bytes) of packed 4-bit indices.
     // Persistently mapped for CPU readback after Stage 3 dispatch.
@@ -478,6 +436,30 @@ pub struct GpuFrameProcessor {
     /// so a frame that skips `set_escalation_candidates` doesn't replay the
     /// previous frame's list.
     staged_escalation_count: u32,
+}
+
+/// The four Vulkan objects that make up one compute stage. Plain data: it has
+/// no `Drop`, because `GpuFrameProcessor::drop` interleaves stage and buffer
+/// teardown in a specific order and calls [`ComputeStage::destroy`] in place.
+pub(super) struct ComputeStage {
+    pub(super) module: vk::ShaderModule,
+    pub(super) dsl: vk::DescriptorSetLayout,
+    pub(super) layout: vk::PipelineLayout,
+    pub(super) pipeline: vk::Pipeline,
+}
+
+impl ComputeStage {
+    /// Destroy pipeline, layout, descriptor-set layout, then shader module.
+    ///
+    /// # Safety
+    /// `d` must be the device that created these objects and none may still
+    /// be in use by the GPU.
+    pub(super) unsafe fn destroy(&self, d: &ash::Device) {
+        d.destroy_pipeline(self.pipeline, None);
+        d.destroy_pipeline_layout(self.layout, None);
+        d.destroy_descriptor_set_layout(self.dsl, None);
+        d.destroy_shader_module(self.module, None);
+    }
 }
 
 struct NV12Buffer {
@@ -750,40 +732,16 @@ impl Drop for GpuFrameProcessor {
                 .destroy_descriptor_pool(self.descriptor_pool, None);
 
             // NV12 pipeline
-            self.device.destroy_pipeline(self.nv12_pipeline, None);
-            self.device
-                .destroy_pipeline_layout(self.nv12_pipeline_layout, None);
-            self.device
-                .destroy_descriptor_set_layout(self.nv12_descriptor_set_layout, None);
-            self.device
-                .destroy_shader_module(self.nv12_shader_module, None);
+            self.nv12.destroy(&self.device);
 
             // SAD pipeline
-            self.device.destroy_pipeline(self.pipeline, None);
-            self.device
-                .destroy_pipeline_layout(self.pipeline_layout, None);
-            self.device
-                .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
-            self.device.destroy_shader_module(self.shader_module, None);
+            self.sad.destroy(&self.device);
 
             // Analysis pipeline
-            self.device.destroy_pipeline(self.analysis_pipeline, None);
-            self.device
-                .destroy_pipeline_layout(self.analysis_pipeline_layout, None);
-            self.device
-                .destroy_descriptor_set_layout(self.analysis_descriptor_set_layout, None);
-            self.device
-                .destroy_shader_module(self.analysis_shader_module, None);
+            self.analysis.destroy(&self.device);
 
             // PalRLE compact pipeline
-            self.device
-                .destroy_pipeline(self.palrle_compact_pipeline, None);
-            self.device
-                .destroy_pipeline_layout(self.palrle_compact_pipeline_layout, None);
-            self.device
-                .destroy_descriptor_set_layout(self.palrle_compact_descriptor_set_layout, None);
-            self.device
-                .destroy_shader_module(self.palrle_compact_shader_module, None);
+            self.palrle_compact.destroy(&self.device);
 
             // Cdf53 compact buffers (Stage 4a)
             self.device.unmap_memory(self.cdf53_compact_list_memory);
@@ -799,14 +757,7 @@ impl Drop for GpuFrameProcessor {
                 .free_memory(self.cdf53_compact_count_memory, None);
 
             // Cdf53 compact pipeline (Stage 4a)
-            self.device
-                .destroy_pipeline(self.cdf53_compact_pipeline, None);
-            self.device
-                .destroy_pipeline_layout(self.cdf53_compact_pipeline_layout, None);
-            self.device
-                .destroy_descriptor_set_layout(self.cdf53_compact_descriptor_set_layout, None);
-            self.device
-                .destroy_shader_module(self.cdf53_compact_shader_module, None);
+            self.cdf53_compact.destroy(&self.device);
 
             // Cdf53 indirect-args buffer (Stage 4b)
             self.device
@@ -815,16 +766,7 @@ impl Drop for GpuFrameProcessor {
                 .free_memory(self.cdf53_dispatch_args_memory, None);
 
             // Cdf53 indirect-args pipeline (Stage 4b)
-            self.device
-                .destroy_pipeline(self.cdf53_indirect_args_pipeline, None);
-            self.device
-                .destroy_pipeline_layout(self.cdf53_indirect_args_pipeline_layout, None);
-            self.device.destroy_descriptor_set_layout(
-                self.cdf53_indirect_args_descriptor_set_layout,
-                None,
-            );
-            self.device
-                .destroy_shader_module(self.cdf53_indirect_args_shader_module, None);
+            self.cdf53_indirect_args.destroy(&self.device);
 
             // Cdf53 coefficient buffer (Stage 4c)
             self.device.unmap_memory(self.cdf53_coefficients_memory);
@@ -854,80 +796,25 @@ impl Drop for GpuFrameProcessor {
                 .free_memory(self.cdf53_escalation_coefficients_memory, None);
 
             // Cdf53 forward L1 pipeline (Stage 4c-L1)
-            self.device
-                .destroy_pipeline(self.cdf53_forward_l1_pipeline, None);
-            self.device
-                .destroy_pipeline_layout(self.cdf53_forward_l1_pipeline_layout, None);
-            self.device
-                .destroy_descriptor_set_layout(self.cdf53_forward_l1_descriptor_set_layout, None);
-            self.device
-                .destroy_shader_module(self.cdf53_forward_l1_shader_module, None);
+            self.cdf53_forward_l1.destroy(&self.device);
 
             // Cdf53 forward L2 pipeline (Stage 4c-L2)
-            self.device
-                .destroy_pipeline(self.cdf53_forward_l2_pipeline, None);
-            self.device
-                .destroy_pipeline_layout(self.cdf53_forward_l2_pipeline_layout, None);
-            self.device
-                .destroy_descriptor_set_layout(self.cdf53_forward_l2_descriptor_set_layout, None);
-            self.device
-                .destroy_shader_module(self.cdf53_forward_l2_shader_module, None);
+            self.cdf53_forward_l2.destroy(&self.device);
 
             // Cdf53 forward L3 pipeline (Stage 4c-L3)
-            self.device
-                .destroy_pipeline(self.cdf53_forward_l3_pipeline, None);
-            self.device
-                .destroy_pipeline_layout(self.cdf53_forward_l3_pipeline_layout, None);
-            self.device
-                .destroy_descriptor_set_layout(self.cdf53_forward_l3_descriptor_set_layout, None);
-            self.device
-                .destroy_shader_module(self.cdf53_forward_l3_shader_module, None);
+            self.cdf53_forward_l3.destroy(&self.device);
 
             // PalRLE indirect-args pipeline
-            self.device
-                .destroy_pipeline(self.palrle_indirect_args_pipeline, None);
-            self.device
-                .destroy_pipeline_layout(self.palrle_indirect_args_pipeline_layout, None);
-            self.device.destroy_descriptor_set_layout(
-                self.palrle_indirect_args_descriptor_set_layout,
-                None,
-            );
-            self.device
-                .destroy_shader_module(self.palrle_indirect_args_shader_module, None);
+            self.palrle_indirect_args.destroy(&self.device);
 
             // palette_fold pipeline
-            self.device
-                .destroy_pipeline(self.palette_fold_pipeline, None);
-            self.device
-                .destroy_pipeline_layout(self.palette_fold_pipeline_layout, None);
-            self.device
-                .destroy_descriptor_set_layout(self.palette_fold_descriptor_set_layout, None);
-            self.device
-                .destroy_shader_module(self.palette_fold_shader_module, None);
+            self.palette_fold.destroy(&self.device);
 
             // palette_subset_fold_init pipeline
-            self.device
-                .destroy_pipeline(self.palette_subset_fold_init_pipeline, None);
-            self.device
-                .destroy_pipeline_layout(self.palette_subset_fold_init_pipeline_layout, None);
-            self.device.destroy_descriptor_set_layout(
-                self.palette_subset_fold_init_descriptor_set_layout,
-                None,
-            );
-            self.device
-                .destroy_shader_module(self.palette_subset_fold_init_shader_module, None);
+            self.palette_subset_fold_init.destroy(&self.device);
 
             // palette_subset_fold pipeline
-            self.device
-                .destroy_pipeline(self.palette_subset_fold_pipeline, None);
-            self.device
-                .destroy_pipeline_layout(self.palette_subset_fold_pipeline_layout, None);
-            self.device.destroy_descriptor_set_layout(
-                self.palette_subset_fold_descriptor_set_layout,
-                None,
-            );
-            self.device
-                .destroy_shader_module(self.palette_subset_fold_shader_module, None);
+            self.palette_subset_fold.destroy(&self.device);
 
             // folded_into buffer
             self.device.unmap_memory(self.folded_into_memory);
@@ -935,14 +822,7 @@ impl Drop for GpuFrameProcessor {
             self.device.free_memory(self.folded_into_memory, None);
 
             // pal_rle_index pipeline (Stage 3)
-            self.device
-                .destroy_pipeline(self.pal_rle_index_pipeline, None);
-            self.device
-                .destroy_pipeline_layout(self.pal_rle_index_pipeline_layout, None);
-            self.device
-                .destroy_descriptor_set_layout(self.pal_rle_index_descriptor_set_layout, None);
-            self.device
-                .destroy_shader_module(self.pal_rle_index_shader_module, None);
+            self.pal_rle_index.destroy(&self.device);
 
             // index_buffer (Stage 3 output)
             self.device.unmap_memory(self.index_buffer_memory);

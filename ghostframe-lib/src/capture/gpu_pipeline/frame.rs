@@ -2426,7 +2426,7 @@ impl GpuFrameProcessor {
     ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
         // Allocate one descriptor set from the pool. The returned guard frees
         // it on drop, ensuring the bounded pool doesn't leak on early-exit.
-        let sad_set_layouts = [self.descriptor_set_layout];
+        let sad_set_layouts = [self.sad.dsl];
         let sad_ds_alloc = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
             .set_layouts(&sad_set_layouts);
@@ -2472,11 +2472,11 @@ impl GpuFrameProcessor {
 
         // Bind + push + dispatch.
         self.device
-            .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline);
+            .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.sad.pipeline);
         self.device.cmd_bind_descriptor_sets(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
-            self.pipeline_layout,
+            self.sad.layout,
             0,
             &[sad_ds],
             &[],
@@ -2487,7 +2487,7 @@ impl GpuFrameProcessor {
         );
         self.device.cmd_push_constants(
             cmd,
-            self.pipeline_layout,
+            self.sad.layout,
             vk::ShaderStageFlags::COMPUTE,
             0,
             push_bytes,
@@ -2529,7 +2529,7 @@ impl GpuFrameProcessor {
     ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
         // Allocate one descriptor set from the pool. The returned guard frees
         // it on drop, ensuring the bounded pool doesn't leak on early-exit.
-        let nv12_set_layouts = [self.nv12_descriptor_set_layout];
+        let nv12_set_layouts = [self.nv12.dsl];
         let nv12_ds_alloc = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
             .set_layouts(&nv12_set_layouts);
@@ -2567,11 +2567,11 @@ impl GpuFrameProcessor {
         // Bind + push + dispatch.
         // NV12 shader: workgroup = 2x2 pixels, dispatch = (width/2, height/2, 1)
         self.device
-            .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.nv12_pipeline);
+            .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.nv12.pipeline);
         self.device.cmd_bind_descriptor_sets(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
-            self.nv12_pipeline_layout,
+            self.nv12.layout,
             0,
             &[nv12_ds],
             &[],
@@ -2582,7 +2582,7 @@ impl GpuFrameProcessor {
         );
         self.device.cmd_push_constants(
             cmd,
-            self.nv12_pipeline_layout,
+            self.nv12.layout,
             vk::ShaderStageFlags::COMPUTE,
             0,
             push_bytes,
@@ -2620,7 +2620,7 @@ impl GpuFrameProcessor {
     ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
         // Allocate one descriptor set from the pool. The returned guard frees
         // it on drop, ensuring the bounded pool doesn't leak on early-exit.
-        let analysis_set_layouts = [self.analysis_descriptor_set_layout];
+        let analysis_set_layouts = [self.analysis.dsl];
         let analysis_ds_alloc = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
             .set_layouts(&analysis_set_layouts);
@@ -2657,11 +2657,11 @@ impl GpuFrameProcessor {
 
         // Bind + push + dispatch.
         self.device
-            .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.analysis_pipeline);
+            .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.analysis.pipeline);
         self.device.cmd_bind_descriptor_sets(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
-            self.analysis_pipeline_layout,
+            self.analysis.layout,
             0,
             &[analysis_ds],
             &[],
@@ -2672,7 +2672,7 @@ impl GpuFrameProcessor {
         );
         self.device.cmd_push_constants(
             cmd,
-            self.analysis_pipeline_layout,
+            self.analysis.layout,
             vk::ShaderStageFlags::COMPUTE,
             0,
             push_bytes,
@@ -2711,7 +2711,7 @@ impl GpuFrameProcessor {
     ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
         // Allocate one descriptor set from the pool. The returned guard frees
         // it on drop, ensuring the bounded pool doesn't leak on early-exit.
-        let palrle_compact_set_layouts = [self.palrle_compact_descriptor_set_layout];
+        let palrle_compact_set_layouts = [self.palrle_compact.dsl];
         let palrle_compact_ds_alloc = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
             .set_layouts(&palrle_compact_set_layouts);
@@ -2774,12 +2774,12 @@ impl GpuFrameProcessor {
         self.device.cmd_bind_pipeline(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
-            self.palrle_compact_pipeline,
+            self.palrle_compact.pipeline,
         );
         self.device.cmd_bind_descriptor_sets(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
-            self.palrle_compact_pipeline_layout,
+            self.palrle_compact.layout,
             0,
             &[palrle_compact_ds],
             &[],
@@ -2790,7 +2790,7 @@ impl GpuFrameProcessor {
         );
         self.device.cmd_push_constants(
             cmd,
-            self.palrle_compact_pipeline_layout,
+            self.palrle_compact.layout,
             vk::ShaderStageFlags::COMPUTE,
             0,
             push_bytes,
@@ -2814,7 +2814,7 @@ impl GpuFrameProcessor {
         push_constants: &[u32],
         workgroups: (u32, u32, u32),
     ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
-        let cdf53_compact_set_layouts = [self.cdf53_compact_descriptor_set_layout];
+        let cdf53_compact_set_layouts = [self.cdf53_compact.dsl];
         let cdf53_compact_ds_alloc = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
             .set_layouts(&cdf53_compact_set_layouts);
@@ -2877,12 +2877,12 @@ impl GpuFrameProcessor {
         self.device.cmd_bind_pipeline(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
-            self.cdf53_compact_pipeline,
+            self.cdf53_compact.pipeline,
         );
         self.device.cmd_bind_descriptor_sets(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
-            self.cdf53_compact_pipeline_layout,
+            self.cdf53_compact.layout,
             0,
             &[cdf53_compact_ds],
             &[],
@@ -2893,7 +2893,7 @@ impl GpuFrameProcessor {
         );
         self.device.cmd_push_constants(
             cmd,
-            self.cdf53_compact_pipeline_layout,
+            self.cdf53_compact.layout,
             vk::ShaderStageFlags::COMPUTE,
             0,
             push_bytes,
@@ -2929,7 +2929,7 @@ impl GpuFrameProcessor {
     ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
         // Allocate one descriptor set from the pool. The returned guard frees
         // it on drop, ensuring the bounded pool doesn't leak on early-exit.
-        let palrle_indirect_args_set_layouts = [self.palrle_indirect_args_descriptor_set_layout];
+        let palrle_indirect_args_set_layouts = [self.palrle_indirect_args.dsl];
         let palrle_indirect_args_ds_alloc = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
             .set_layouts(&palrle_indirect_args_set_layouts);
@@ -2972,12 +2972,12 @@ impl GpuFrameProcessor {
         self.device.cmd_bind_pipeline(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
-            self.palrle_indirect_args_pipeline,
+            self.palrle_indirect_args.pipeline,
         );
         self.device.cmd_bind_descriptor_sets(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
-            self.palrle_indirect_args_pipeline_layout,
+            self.palrle_indirect_args.layout,
             0,
             &[palrle_indirect_args_ds],
             &[],
@@ -3008,7 +3008,7 @@ impl GpuFrameProcessor {
         &'a self,
         cmd: vk::CommandBuffer,
     ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
-        let set_layouts = [self.cdf53_indirect_args_descriptor_set_layout];
+        let set_layouts = [self.cdf53_indirect_args.dsl];
         let ds_alloc = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
             .set_layouts(&set_layouts);
@@ -3048,12 +3048,12 @@ impl GpuFrameProcessor {
         self.device.cmd_bind_pipeline(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
-            self.cdf53_indirect_args_pipeline,
+            self.cdf53_indirect_args.pipeline,
         );
         self.device.cmd_bind_descriptor_sets(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
-            self.cdf53_indirect_args_pipeline_layout,
+            self.cdf53_indirect_args.layout,
             0,
             &[ds],
             &[],
@@ -3098,7 +3098,7 @@ impl GpuFrameProcessor {
     ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
         // Allocate one descriptor set from the pool. The returned guard frees
         // it on drop, ensuring the bounded pool doesn't leak on early-exit.
-        let palette_fold_set_layouts = [self.palette_fold_descriptor_set_layout];
+        let palette_fold_set_layouts = [self.palette_fold.dsl];
         let palette_fold_ds_alloc = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
             .set_layouts(&palette_fold_set_layouts);
@@ -3181,12 +3181,12 @@ impl GpuFrameProcessor {
         self.device.cmd_bind_pipeline(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
-            self.palette_fold_pipeline,
+            self.palette_fold.pipeline,
         );
         self.device.cmd_bind_descriptor_sets(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
-            self.palette_fold_pipeline_layout,
+            self.palette_fold.layout,
             0,
             &[palette_fold_ds],
             &[],
@@ -3225,8 +3225,7 @@ impl GpuFrameProcessor {
     ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
         // Allocate one descriptor set from the pool. The returned guard frees
         // it on drop, ensuring the bounded pool doesn't leak on early-exit.
-        let palette_subset_fold_init_set_layouts =
-            [self.palette_subset_fold_init_descriptor_set_layout];
+        let palette_subset_fold_init_set_layouts = [self.palette_subset_fold_init.dsl];
         let palette_subset_fold_init_ds_alloc = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
             .set_layouts(&palette_subset_fold_init_set_layouts);
@@ -3257,12 +3256,12 @@ impl GpuFrameProcessor {
         self.device.cmd_bind_pipeline(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
-            self.palette_subset_fold_init_pipeline,
+            self.palette_subset_fold_init.pipeline,
         );
         self.device.cmd_bind_descriptor_sets(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
-            self.palette_subset_fold_init_pipeline_layout,
+            self.palette_subset_fold_init.layout,
             0,
             &[palette_subset_fold_init_ds],
             &[],
@@ -3296,7 +3295,7 @@ impl GpuFrameProcessor {
     ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
         // Allocate one descriptor set from the pool. The returned guard frees
         // it on drop, ensuring the bounded pool doesn't leak on early-exit.
-        let palette_subset_fold_set_layouts = [self.palette_subset_fold_descriptor_set_layout];
+        let palette_subset_fold_set_layouts = [self.palette_subset_fold.dsl];
         let palette_subset_fold_ds_alloc = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
             .set_layouts(&palette_subset_fold_set_layouts);
@@ -3339,12 +3338,12 @@ impl GpuFrameProcessor {
         self.device.cmd_bind_pipeline(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
-            self.palette_subset_fold_pipeline,
+            self.palette_subset_fold.pipeline,
         );
         self.device.cmd_bind_descriptor_sets(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
-            self.palette_subset_fold_pipeline_layout,
+            self.palette_subset_fold.layout,
             0,
             &[palette_subset_fold_ds],
             &[],
@@ -3386,7 +3385,7 @@ impl GpuFrameProcessor {
     ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
         // Allocate one descriptor set from the pool. The returned guard frees
         // it on drop, ensuring the bounded pool doesn't leak on early-exit.
-        let pal_rle_index_set_layouts = [self.pal_rle_index_descriptor_set_layout];
+        let pal_rle_index_set_layouts = [self.pal_rle_index.dsl];
         let pal_rle_index_ds_alloc = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
             .set_layouts(&pal_rle_index_set_layouts);
@@ -3468,12 +3467,12 @@ impl GpuFrameProcessor {
         self.device.cmd_bind_pipeline(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
-            self.pal_rle_index_pipeline,
+            self.pal_rle_index.pipeline,
         );
         self.device.cmd_bind_descriptor_sets(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
-            self.pal_rle_index_pipeline_layout,
+            self.pal_rle_index.layout,
             0,
             &[pal_rle_index_ds],
             &[],
@@ -3484,7 +3483,7 @@ impl GpuFrameProcessor {
         );
         self.device.cmd_push_constants(
             cmd,
-            self.pal_rle_index_pipeline_layout,
+            self.pal_rle_index.layout,
             vk::ShaderStageFlags::COMPUTE,
             0,
             push_bytes,
@@ -3516,7 +3515,7 @@ impl GpuFrameProcessor {
         cols: u32,
         rows: u32,
     ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
-        let set_layouts = [self.cdf53_forward_l1_descriptor_set_layout];
+        let set_layouts = [self.cdf53_forward_l1.dsl];
         let ds_alloc = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
             .set_layouts(&set_layouts);
@@ -3569,19 +3568,19 @@ impl GpuFrameProcessor {
         self.device.cmd_bind_pipeline(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
-            self.cdf53_forward_l1_pipeline,
+            self.cdf53_forward_l1.pipeline,
         );
         self.device.cmd_bind_descriptor_sets(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
-            self.cdf53_forward_l1_pipeline_layout,
+            self.cdf53_forward_l1.layout,
             0,
             &[ds],
             &[],
         );
         self.device.cmd_push_constants(
             cmd,
-            self.cdf53_forward_l1_pipeline_layout,
+            self.cdf53_forward_l1.layout,
             vk::ShaderStageFlags::COMPUTE,
             0,
             push_bytes,
@@ -3612,7 +3611,7 @@ impl GpuFrameProcessor {
         cols: u32,
         rows: u32,
     ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
-        let set_layouts = [self.cdf53_forward_l2_descriptor_set_layout];
+        let set_layouts = [self.cdf53_forward_l2.dsl];
         let ds_alloc = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
             .set_layouts(&set_layouts);
@@ -3656,19 +3655,19 @@ impl GpuFrameProcessor {
         self.device.cmd_bind_pipeline(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
-            self.cdf53_forward_l2_pipeline,
+            self.cdf53_forward_l2.pipeline,
         );
         self.device.cmd_bind_descriptor_sets(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
-            self.cdf53_forward_l2_pipeline_layout,
+            self.cdf53_forward_l2.layout,
             0,
             &[ds],
             &[],
         );
         self.device.cmd_push_constants(
             cmd,
-            self.cdf53_forward_l2_pipeline_layout,
+            self.cdf53_forward_l2.layout,
             vk::ShaderStageFlags::COMPUTE,
             0,
             push_bytes,
@@ -3708,7 +3707,7 @@ impl GpuFrameProcessor {
         cols: u32,
         rows: u32,
     ) -> Result<ScopedDescriptorSets<'a>, Box<dyn std::error::Error>> {
-        let set_layouts = [self.cdf53_forward_l3_descriptor_set_layout];
+        let set_layouts = [self.cdf53_forward_l3.dsl];
         let ds_alloc = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
             .set_layouts(&set_layouts);
@@ -3752,19 +3751,19 @@ impl GpuFrameProcessor {
         self.device.cmd_bind_pipeline(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
-            self.cdf53_forward_l3_pipeline,
+            self.cdf53_forward_l3.pipeline,
         );
         self.device.cmd_bind_descriptor_sets(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
-            self.cdf53_forward_l3_pipeline_layout,
+            self.cdf53_forward_l3.layout,
             0,
             &[ds],
             &[],
         );
         self.device.cmd_push_constants(
             cmd,
-            self.cdf53_forward_l3_pipeline_layout,
+            self.cdf53_forward_l3.layout,
             vk::ShaderStageFlags::COMPUTE,
             0,
             push_bytes,
@@ -3826,7 +3825,7 @@ impl GpuFrameProcessor {
         // Binding 0: current frame STORAGE_IMAGE (same layout as dirty L1)
         // Binding 1: cdf53_escalation_list_buffer  (replaces cdf53_compact_list_buffer)
         // Binding 2: cdf53_escalation_coefficients_buffer  (replaces cdf53_coefficients_buffer)
-        let set_layouts_l1 = [self.cdf53_forward_l1_descriptor_set_layout];
+        let set_layouts_l1 = [self.cdf53_forward_l1.dsl];
         let ds_alloc_l1 = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
             .set_layouts(&set_layouts_l1);
@@ -3876,19 +3875,19 @@ impl GpuFrameProcessor {
         self.device.cmd_bind_pipeline(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
-            self.cdf53_forward_l1_pipeline,
+            self.cdf53_forward_l1.pipeline,
         );
         self.device.cmd_bind_descriptor_sets(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
-            self.cdf53_forward_l1_pipeline_layout,
+            self.cdf53_forward_l1.layout,
             0,
             &[ds_l1],
             &[],
         );
         self.device.cmd_push_constants(
             cmd,
-            self.cdf53_forward_l1_pipeline_layout,
+            self.cdf53_forward_l1.layout,
             vk::ShaderStageFlags::COMPUTE,
             0,
             push_bytes,
@@ -3918,7 +3917,7 @@ impl GpuFrameProcessor {
         // ── L2 stage ─────────────────────────────────────────────────────────
         // Binding 0: cdf53_escalation_list_buffer  (read-only)
         // Binding 1: cdf53_escalation_coefficients_buffer  (read LL1, write L2 subbands)
-        let set_layouts_l2 = [self.cdf53_forward_l2_descriptor_set_layout];
+        let set_layouts_l2 = [self.cdf53_forward_l2.dsl];
         let ds_alloc_l2 = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
             .set_layouts(&set_layouts_l2);
@@ -3954,12 +3953,12 @@ impl GpuFrameProcessor {
         self.device.cmd_bind_pipeline(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
-            self.cdf53_forward_l2_pipeline,
+            self.cdf53_forward_l2.pipeline,
         );
         self.device.cmd_bind_descriptor_sets(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
-            self.cdf53_forward_l2_pipeline_layout,
+            self.cdf53_forward_l2.layout,
             0,
             &[ds_l2],
             &[],
@@ -3967,7 +3966,7 @@ impl GpuFrameProcessor {
         // push_bytes from L1 reused; cols/rows are the same for all three stages.
         self.device.cmd_push_constants(
             cmd,
-            self.cdf53_forward_l2_pipeline_layout,
+            self.cdf53_forward_l2.layout,
             vk::ShaderStageFlags::COMPUTE,
             0,
             push_bytes,
@@ -3997,7 +3996,7 @@ impl GpuFrameProcessor {
         // ── L3 stage ─────────────────────────────────────────────────────────
         // Binding 0: cdf53_escalation_list_buffer  (read-only)
         // Binding 1: cdf53_escalation_coefficients_buffer  (read LL2, write L3 subbands)
-        let set_layouts_l3 = [self.cdf53_forward_l3_descriptor_set_layout];
+        let set_layouts_l3 = [self.cdf53_forward_l3.dsl];
         let ds_alloc_l3 = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
             .set_layouts(&set_layouts_l3);
@@ -4033,12 +4032,12 @@ impl GpuFrameProcessor {
         self.device.cmd_bind_pipeline(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
-            self.cdf53_forward_l3_pipeline,
+            self.cdf53_forward_l3.pipeline,
         );
         self.device.cmd_bind_descriptor_sets(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
-            self.cdf53_forward_l3_pipeline_layout,
+            self.cdf53_forward_l3.layout,
             0,
             &[ds_l3],
             &[],
@@ -4046,7 +4045,7 @@ impl GpuFrameProcessor {
         // push_bytes from L1 reused; cols/rows are the same for all three stages.
         self.device.cmd_push_constants(
             cmd,
-            self.cdf53_forward_l3_pipeline_layout,
+            self.cdf53_forward_l3.layout,
             vk::ShaderStageFlags::COMPUTE,
             0,
             push_bytes,
