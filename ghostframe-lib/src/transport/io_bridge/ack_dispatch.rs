@@ -60,7 +60,7 @@ impl IoBridge {
         );
         if data[0] == crate::transport::ack::ACK_BATCH_MSG_TYPE {
             if let Ok(batch) = crate::transport::ack::AckBatch::decode(data) {
-                tracing::info!(
+                tracing::trace!(
                     target: "ghostframe::cdf53",
                     entry_count = batch.entries.len(),
                     "ack_batch_received"
