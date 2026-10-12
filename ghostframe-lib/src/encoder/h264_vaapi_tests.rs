@@ -1,4 +1,6 @@
 use super::*;
+use crate::encoder::EncodedTile;
+use crate::transport::protocol::Codec as GfCodec;
 
 /// Serialises the VA-API tests against each other.
 ///
