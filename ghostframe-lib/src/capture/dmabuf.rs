@@ -4,38 +4,278 @@
 //! VulkanReadback: imports DMA-BUF fd via Vulkan extensions for GPU-accelerated readback.
 
 use std::io;
+use std::ops::Deref;
+use std::os::unix::io::RawFd;
+use std::sync::{Mutex, MutexGuard};
 
-/// Read pixels from a DMA-BUF file descriptor via mmap.
-///
-/// Returns a `Vec<u8>` of BGRA pixel data, `stride * height` bytes.
-/// The caller is responsible for the fd's lifetime (this function does not close it).
-pub fn readback_dmabuf(
-    fd: std::os::unix::io::RawFd,
-    _width: u32,
-    height: u32,
+// ---------------------------------------------------------------------------
+// mmap readback with a persistent mapping and recycled buffers
+// ---------------------------------------------------------------------------
+
+/// Identity of what is mapped. Keyed by the file's `(st_dev, st_ino)`, never
+/// by the fd number: an fd number can be closed and reused for a different
+/// dma-buf, an inode cannot be recycled while the cached mapping holds a
+/// reference to the underlying file.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct MapKey {
+    dev: u64,
+    ino: u64,
     stride: u32,
-) -> io::Result<Vec<u8>> {
-    let size = (stride * height) as usize;
-    if size == 0 {
-        return Ok(Vec::new());
+    height: u32,
+}
+
+struct Mapping {
+    ptr: *const u8,
+    len: usize,
+    key: MapKey,
+}
+
+// SAFETY: the mapping is a plain read-only region owned by this value; it is
+// only ever touched through `&self`/`Drop`, and the cache holding it sits
+// behind a mutex.
+unsafe impl Send for Mapping {}
+
+impl Mapping {
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: `ptr` is a live PROT_READ mapping of `len` bytes owned by
+        // `self` and unmapped only in `Drop`.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
-    unsafe {
-        let ptr = libc::mmap(
+}
+
+impl Drop for Mapping {
+    fn drop(&mut self) {
+        // SAFETY: ptr/len are exactly what mmap returned/was given.
+        unsafe {
+            libc::munmap(self.ptr as *mut libc::c_void, self.len);
+        }
+    }
+}
+
+/// A recycled pixel buffer.
+struct Buf {
+    data: Vec<u8>,
+}
+
+/// Maximum number of idle buffers kept in the process-wide pool.
+const POOL_CAP: usize = 2;
+
+#[derive(Default)]
+struct State {
+    /// Single-entry mapping cache. Keeps the dma-buf alive (and therefore its
+    /// GPU memory) until it is replaced, [`release_cached_mapping`] is
+    /// called, or a readback fails, even if the caller has long since closed
+    /// its fd.
+    map: Option<Mapping>,
+    pool: Vec<Buf>,
+}
+
+/// Process-wide state. One mapping and one small pool for the whole process,
+/// not per thread: the bridge runs on a multi-thread runtime, and a
+/// thread-local would pin a mapping and buffers on every worker that ever
+/// read. Readbacks are serial per bridge, so the lock is uncontended; it is
+/// held across the copy. Nothing in the locked regions drops a
+/// [`ReadbackFrame`] (its `Drop` takes this lock too).
+static STATE: Mutex<State> = Mutex::new(State {
+    map: None,
+    pool: Vec::new(),
+});
+
+fn lock_state() -> MutexGuard<'static, State> {
+    // A panic while holding the lock cannot leave the state inconsistent
+    // enough to matter (worst case a stale cache entry that the key check
+    // rejects), so recover from poisoning.
+    STATE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Drop the pinned mapping (releasing the dma-buf reference it holds) and
+/// the pooled buffers. Call when capture stops or on a mode switch away from
+/// the tile codec, so an idle process does not keep a frame's worth of GPU
+/// memory pinned and ~2 frames of host memory allocated.
+pub fn release_cached_mapping() {
+    let mut st = lock_state();
+    st.map = None;
+    st.pool.clear();
+}
+
+/// A frame of BGRA pixels read back from a dma-buf: `stride * height` bytes,
+/// derefs to `[u8]`. Dropping it returns the allocation to the process-wide pool.
+pub struct ReadbackFrame {
+    buf: Option<Buf>,
+}
+
+impl ReadbackFrame {
+    fn new(buf: Buf) -> Self {
+        Self { buf: Some(buf) }
+    }
+}
+
+impl Deref for ReadbackFrame {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match &self.buf {
+            Some(b) => &b.data,
+            None => &[],
+        }
+    }
+}
+
+impl Drop for ReadbackFrame {
+    fn drop(&mut self) {
+        if let Some(buf) = self.buf.take() {
+            let mut st = lock_state();
+            if st.pool.len() >= POOL_CAP {
+                st.pool.remove(0);
+            }
+            st.pool.push(buf);
+        }
+    }
+}
+
+/// `DMA_BUF_IOCTL_SYNC` bracket around CPU reads. Errors are ignored, as in
+/// `ghostframe-xdaemon/src/drm_capture.rs`: it is a best-effort cache
+/// maintenance step and plain system memory is coherent without it. Returns
+/// whether the ioctl succeeded so the caller can keep START/END balanced
+/// (no END after a failed START).
+/// NOTE: the pre-pooling implementation issued no sync at all; this is new.
+fn dmabuf_sync(fd: RawFd, end: bool) -> bool {
+    #[repr(C)]
+    struct DmaBufSync {
+        flags: u64,
+    }
+    // _IOW('b', 0, struct dma_buf_sync)
+    const DMA_BUF_IOCTL_SYNC: libc::c_ulong = 0x40086200;
+    const DMA_BUF_SYNC_READ: u64 = 1 << 0;
+    const DMA_BUF_SYNC_START: u64 = 0;
+    const DMA_BUF_SYNC_END: u64 = 1 << 2;
+    let mut req = DmaBufSync {
+        flags: (if end {
+            DMA_BUF_SYNC_END
+        } else {
+            DMA_BUF_SYNC_START
+        }) | DMA_BUF_SYNC_READ,
+    };
+    // SAFETY: plain ioctl with a valid pointer to a 8-byte struct.
+    unsafe { libc::ioctl(fd, DMA_BUF_IOCTL_SYNC, &mut req) == 0 }
+}
+
+/// `(key, size, cacheable)`. A file that reports `st_size == 0` is not
+/// cacheable: some exporters share one inode across distinct buffers, so
+/// `(st_dev, st_ino)` is not a unique identity for them and a cached mapping
+/// could be served for the wrong buffer. Those are mapped per call.
+fn map_key_and_size(fd: RawFd, height: u32, stride: u32) -> io::Result<(MapKey, usize, bool)> {
+    // Widened on purpose: the old `(stride * height) as usize` multiplied in
+    // u32 and wrapped (release) / panicked (debug) above 4 GiB.
+    let size = (stride as u64)
+        .checked_mul(height as u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "frame size overflows"))?;
+    // SAFETY: zeroed stat is a valid out-parameter.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Best effort: mapping past the end of a file-backed fd succeeds and then
+    // SIGBUSes on access, so refuse a file that reports a smaller size. This
+    // does not cover a file that reports no size (st_size == 0) or one that
+    // is truncated after this check; those can still fault on access.
+    if st.st_size > 0 && (st.st_size as u64) < size as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "dma-buf smaller than stride * height",
+        ));
+    }
+    Ok((
+        MapKey {
+            dev: st.st_dev as u64,
+            ino: st.st_ino as u64,
+            stride,
+            height,
+        },
+        size,
+        st.st_size > 0,
+    ))
+}
+
+fn map_ro(fd: RawFd, size: usize, key: MapKey) -> io::Result<Mapping> {
+    // SAFETY: fresh read-only shared mapping of `size` bytes.
+    let ptr = unsafe {
+        libc::mmap(
             std::ptr::null_mut(),
             size,
             libc::PROT_READ,
             libc::MAP_SHARED,
             fd,
             0,
-        );
-        if ptr == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
-        }
-        let mut pixels = vec![0u8; size];
-        std::ptr::copy_nonoverlapping(ptr as *const u8, pixels.as_mut_ptr(), size);
-        libc::munmap(ptr, size);
-        Ok(pixels)
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(io::Error::last_os_error());
     }
+    Ok(Mapping {
+        ptr: ptr as *const u8,
+        len: size,
+        key,
+    })
+}
+
+/// Copy `src` into `buf`, bracketed by DMA_BUF_IOCTL_SYNC. No END is issued
+/// if START failed.
+fn copy_synced(fd: RawFd, src: &[u8], buf: &mut Buf) {
+    let started = dmabuf_sync(fd, false);
+    // No zero-fill: clear + extend writes each byte once.
+    buf.data.clear();
+    buf.data.reserve(src.len());
+    buf.data.extend_from_slice(src);
+    if started {
+        dmabuf_sync(fd, true);
+    }
+}
+
+fn readback_impl(fd: RawFd, height: u32, stride: u32) -> io::Result<ReadbackFrame> {
+    let (key, size, cacheable) = map_key_and_size(fd, height, stride)?;
+    if size == 0 {
+        return Ok(ReadbackFrame::new(Buf { data: Vec::new() }));
+    }
+    let mut st = lock_state();
+
+    if !cacheable {
+        // Map for this call only; the cache (if any) is left alone.
+        let mapping = map_ro(fd, size, key)?;
+        let mut buf = st.pool.pop().unwrap_or(Buf { data: Vec::new() });
+        copy_synced(fd, mapping.bytes(), &mut buf);
+        drop(mapping);
+        return Ok(ReadbackFrame::new(buf));
+    }
+
+    if st.map.as_ref().map(|m| m.key) != Some(key) {
+        // Unmap the old one before mapping the new one; on failure the
+        // cache stays empty.
+        st.map = None;
+        st.map = Some(map_ro(fd, size, key)?);
+    }
+
+    let mut buf = st.pool.pop().unwrap_or(Buf { data: Vec::new() });
+    let src = st.map.as_ref().map(|m| m.bytes()).unwrap_or(&[]);
+    copy_synced(fd, src, &mut buf);
+    Ok(ReadbackFrame::new(buf))
+}
+
+/// Read pixels from a DMA-BUF file descriptor via mmap.
+///
+/// Returns a [`ReadbackFrame`] (derefs to `[u8]`) of BGRA pixel data,
+/// exactly `stride * height` bytes. The caller is responsible for the fd's
+/// lifetime (this function does not close it), but note that a process-wide
+/// cache keeps the mapping, and with it the dma-buf, alive until a different
+/// buffer is read or [`release_cached_mapping`] is called. Every read is bracketed by
+/// `DMA_BUF_IOCTL_SYNC` (START|READ .. END|READ).
+pub fn readback_dmabuf(
+    fd: RawFd,
+    _width: u32,
+    height: u32,
+    stride: u32,
+) -> io::Result<ReadbackFrame> {
+    readback_impl(fd, height, stride)
 }
 
 // ---------------------------------------------------------------------------
@@ -400,8 +640,20 @@ fn find_memory_type(
 mod tests {
     use super::*;
 
+    /// The readback state is process-wide, so tests that read must not
+    /// interleave.
+    fn serial() -> MutexGuard<'static, ()> {
+        static L: Mutex<()> = Mutex::new(());
+        L.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn cached_key() -> Option<MapKey> {
+        lock_state().map.as_ref().map(|m| m.key)
+    }
+
     #[test]
     fn readback_from_memfd() {
+        let _g = serial();
         let width = 64u32;
         let height = 64u32;
         let stride = width * 4;
@@ -456,6 +708,9 @@ mod tests {
             for (i, b) in s.iter_mut().enumerate() {
                 *b = f(i);
             }
+        }
+        fn bytes(&self) -> &[u8] {
+            unsafe { std::slice::from_raw_parts(self.map, self.size) }
         }
         fn bytes_mut(&mut self) -> &mut [u8] {
             unsafe { std::slice::from_raw_parts_mut(self.map, self.size) }
@@ -597,6 +852,7 @@ mod tests {
     #[test]
     #[ignore = "microbenchmark; run with --ignored --nocapture"]
     fn bench_readback() {
+        let _g = serial();
         let size = 7680 * 1080;
         let mut m = new_memfd(size);
         bench_one("memfd static", &mut m, false);
@@ -610,6 +866,158 @@ mod tests {
         }
     }
 
+    const W: u32 = 1920;
+    const H: u32 = 1080;
+    const STRIDE: u32 = 7680;
+    const FRAME: usize = 7680 * 1080;
+
+    /// Run `f` on a memfd and, when the host has /dev/udmabuf, a udmabuf.
+    fn each_buf(size: usize, mut f: impl FnMut(&str, TestBuf)) {
+        f("memfd", new_memfd(size));
+        match new_udmabuf(size) {
+            Some(u) => f("udmabuf", u),
+            None => eprintln!("udmabuf unavailable: skipping that half"),
+        }
+    }
+
+    fn pattern(seed: usize) -> impl Fn(usize) -> u8 {
+        move |i| (i.wrapping_mul(31) ^ (i >> 7) ^ seed) as u8
+    }
+
+    #[test]
+    fn round_trip_is_byte_exact() {
+        let _g = serial();
+        each_buf(FRAME, |name, buf| {
+            buf.fill(pattern(1));
+            let f = readback_dmabuf(buf.fd, W, H, STRIDE).unwrap();
+            assert_eq!(f.len(), FRAME, "{name}");
+            assert!(*f == buf.bytes()[..FRAME], "{name}: bytes differ");
+        });
+    }
+
+    #[test]
+    fn different_buffer_same_size_returns_new_pixels() {
+        let _g = serial();
+        let a = new_memfd(FRAME);
+        let b = new_memfd(FRAME);
+        a.fill(pattern(1));
+        b.fill(pattern(2));
+        assert!(*readback_dmabuf(a.fd, W, H, STRIDE).unwrap() == a.bytes()[..FRAME]);
+        assert!(*readback_dmabuf(b.fd, W, H, STRIDE).unwrap() == b.bytes()[..FRAME]);
+        // ...and back again.
+        assert!(*readback_dmabuf(a.fd, W, H, STRIDE).unwrap() == a.bytes()[..FRAME]);
+    }
+
+    #[test]
+    fn fd_number_reused_by_another_buffer() {
+        let _g = serial();
+        let a = new_memfd(FRAME);
+        let b = new_memfd(FRAME);
+        a.fill(pattern(1));
+        b.fill(pattern(2));
+        let fd = a.fd;
+        assert!(*readback_dmabuf(fd, W, H, STRIDE).unwrap() == a.bytes()[..FRAME]);
+        // dup2: the same fd number now names B's file.
+        assert!(unsafe { libc::dup2(b.fd, fd) } == fd);
+        assert!(
+            *readback_dmabuf(fd, W, H, STRIDE).unwrap() == b.bytes()[..FRAME],
+            "fd number reused for a different buffer must not hit the cache"
+        );
+        // Close-and-reopen flavour: free the number, let a new memfd take it.
+        unsafe { libc::close(fd) };
+        let c = new_memfd(FRAME);
+        c.fill(pattern(3));
+        // Whatever number c got, reading it yields c.
+        assert!(*readback_dmabuf(c.fd, W, H, STRIDE).unwrap() == c.bytes()[..FRAME]);
+        // `a` still owns fd number `fd` in its Drop; it is already closed or
+        // reused, so leak the double close by forgetting the wrapper.
+        unsafe { libc::munmap(a.map as *mut libc::c_void, a.size) };
+        std::mem::forget(a);
+    }
+
+    #[test]
+    fn geometry_change_on_same_fd_remaps() {
+        let _g = serial();
+        each_buf(FRAME, |name, buf| {
+            buf.fill(pattern(5));
+            let full = readback_dmabuf(buf.fd, W, H, STRIDE).unwrap();
+            assert_eq!(full.len(), FRAME, "{name}");
+            let half = readback_dmabuf(buf.fd, W / 2, H / 2, STRIDE / 2).unwrap();
+            assert_eq!(half.len(), (STRIDE / 2 * (H / 2)) as usize, "{name}");
+            assert!(*half == buf.bytes()[..half.len()], "{name}: half");
+            // Same size, different shape: still a fresh key.
+            let tall = readback_dmabuf(buf.fd, W / 2, H * 2, STRIDE / 2).unwrap();
+            assert_eq!(tall.len(), FRAME, "{name}");
+            assert!(*tall == buf.bytes()[..FRAME], "{name}: tall");
+            drop((full, half, tall));
+            let again = readback_dmabuf(buf.fd, W, H, STRIDE).unwrap();
+            assert!(*again == buf.bytes()[..FRAME], "{name}: again");
+        });
+    }
+
+    #[test]
+    fn producer_writes_between_frames_are_seen() {
+        let _g = serial();
+        each_buf(FRAME, |name, mut buf| {
+            buf.fill(pattern(7));
+            let mut seed = 0x1234_5678u64;
+            for n in 0..40 {
+                // xorshift: scattered single-byte writes plus a block.
+                for _ in 0..50 {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    let i = (seed % FRAME as u64) as usize;
+                    buf.bytes_mut()[i] = buf.bytes()[i].wrapping_add(1 + n as u8);
+                }
+                let o = (n * 200_000) % (FRAME - 4096);
+                buf.bytes_mut()[o..o + 4096].fill(n as u8);
+                let f = readback_dmabuf(buf.fd, W, H, STRIDE).unwrap();
+                assert!(*f == buf.bytes()[..FRAME], "{name}: stale at frame {n}");
+            }
+        });
+    }
+
+    #[test]
+    fn buffers_are_recycled() {
+        let _g = serial();
+        let buf = new_memfd(FRAME);
+        buf.fill(pattern(9));
+        let f1 = readback_dmabuf(buf.fd, W, H, STRIDE).unwrap();
+        let p1 = f1.as_ptr();
+        drop(f1);
+        let f2 = readback_dmabuf(buf.fd, W, H, STRIDE).unwrap();
+        assert_eq!(f2.as_ptr(), p1, "dropped frame's allocation is reused");
+        // A frame still held is never handed out again.
+        let f3 = readback_dmabuf(buf.fd, W, H, STRIDE).unwrap();
+        assert_ne!(f3.as_ptr(), f2.as_ptr());
+        assert!(*f2 == *f3);
+    }
+
+    #[test]
+    fn degenerate_inputs() {
+        let _g = serial();
+        let buf = new_memfd(FRAME);
+        buf.fill(pattern(1));
+        assert!(readback_dmabuf(buf.fd, 0, 0, 0).unwrap().is_empty());
+        assert!(readback_dmabuf(buf.fd, W, 0, STRIDE).unwrap().is_empty());
+        // u32 product wraps to a small number; must be rejected, not read.
+        let e = readback_dmabuf(buf.fd, 0, 65_537, 65_536);
+        assert!(e.is_err(), "stride*height > file size must fail");
+        assert!(readback_dmabuf(buf.fd, 0, u32::MAX, u32::MAX).is_err());
+        // mmap failure (a pipe cannot be mapped) errs without disturbing
+        // later reads.
+        assert!(readback_dmabuf(buf.fd, W, H, STRIDE).is_ok());
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        assert!(readback_dmabuf(fds[0], 0, 16, 16).is_err());
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        assert!(*readback_dmabuf(buf.fd, W, H, STRIDE).unwrap() == buf.bytes()[..FRAME]);
+    }
+
     #[test]
     fn vulkan_device_creates_successfully() {
         match VulkanReadback::new() {
@@ -621,5 +1029,61 @@ mod tests {
                 eprintln!("Skipping Vulkan test (no GPU?): {e}");
             }
         }
+    }
+
+    #[test]
+    fn pool_and_mapping_are_shared_across_threads() {
+        let _g = serial();
+        let buf = new_memfd(FRAME);
+        buf.fill(pattern(21));
+        let fd = buf.fd;
+        // Read on one thread, drop on another: Send, and the allocation goes
+        // back to the one process-wide pool.
+        let f = std::thread::spawn(move || readback_dmabuf(fd, W, H, STRIDE).unwrap())
+            .join()
+            .unwrap();
+        let p = f.as_ptr();
+        std::thread::spawn(move || drop(f)).join().unwrap();
+        let g = readback_dmabuf(fd, W, H, STRIDE).unwrap();
+        assert_eq!(g.as_ptr(), p, "pool is not per thread");
+        assert!(*g == buf.bytes()[..FRAME]);
+        assert!(cached_key().is_some());
+    }
+
+    #[test]
+    fn release_drops_mapping_and_pool_and_reads_still_work() {
+        let _g = serial();
+        let buf = new_memfd(FRAME);
+        buf.fill(pattern(22));
+        drop(readback_dmabuf(buf.fd, W, H, STRIDE).unwrap());
+        assert!(cached_key().is_some());
+        release_cached_mapping();
+        assert!(cached_key().is_none());
+        assert!(lock_state().pool.is_empty());
+        assert!(*readback_dmabuf(buf.fd, W, H, STRIDE).unwrap() == buf.bytes()[..FRAME]);
+        assert!(cached_key().is_some());
+    }
+
+    /// A file reporting st_size == 0 has no trustworthy identity: it must be
+    /// mapped per call and never enter (or evict from) the cache.
+    #[test]
+    fn zero_st_size_is_not_cached() {
+        let _g = serial();
+        let buf = new_memfd(FRAME);
+        buf.fill(pattern(23));
+        drop(readback_dmabuf(buf.fd, W, H, STRIDE).unwrap());
+        let before = cached_key();
+        assert!(before.is_some());
+        let path = std::ffi::CString::new("/dev/zero").unwrap();
+        let z = unsafe { libc::open(path.as_ptr(), libc::O_RDWR) };
+        if z < 0 {
+            eprintln!("/dev/zero unavailable: skipping");
+            return;
+        }
+        let f = readback_dmabuf(z, 0, 16, 4096).unwrap();
+        assert_eq!(f.len(), 16 * 4096);
+        assert!(f.iter().all(|&b| b == 0));
+        unsafe { libc::close(z) };
+        assert_eq!(cached_key(), before, "uncacheable read touched the cache");
     }
 }
