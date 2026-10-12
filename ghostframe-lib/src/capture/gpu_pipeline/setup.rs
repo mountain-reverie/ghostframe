@@ -594,17 +594,15 @@ impl GpuFrameProcessor {
         )?;
 
         // --- frame_palette_set buffer ---
-        // 256 PaletteEntry slots × 80 bytes = 20480 bytes.
+        // FRAME_PALETTE_SET_BYTES (256 PaletteEntry slots × 80 bytes).
         // HOST_VISIBLE | HOST_COHERENT, STORAGE_BUFFER | TRANSFER_DST.
         // TRANSFER_DST allows Task 12b to zero-fill between frames via
         // cmd_fill_buffer so Stage 2b can safely check count == 0 per slot.
-        let frame_palette_set_size =
-            (PALETTE_HASH_SLOTS * std::mem::size_of::<FramePaletteEntryRaw>()) as vk::DeviceSize;
         let (frame_palette_set_buffer, frame_palette_set_memory, frame_palette_set_ptr) =
             alloc_host_buffer_mapped::<FramePaletteEntryRaw>(
                 &device,
                 &mem_props,
-                frame_palette_set_size,
+                FRAME_PALETTE_SET_BYTES,
                 vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
                 "frame_palette_set buffer",
             )?;

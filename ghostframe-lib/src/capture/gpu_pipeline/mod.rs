@@ -36,6 +36,12 @@ const PER_TILE_INDEX_BYTES: vk::DeviceSize = 512;
 /// `folded_into_buffer` (resolved fold-into IDs).
 const PALETTE_SLOT_U32_BYTES: vk::DeviceSize = (PALETTE_HASH_SLOTS as vk::DeviceSize) * 4;
 
+/// Byte size of the frame palette set buffer: one 80-byte
+/// [`FramePaletteEntryRaw`] per palette hash slot.
+pub(crate) const FRAME_PALETTE_SET_BYTES: vk::DeviceSize =
+    (PALETTE_HASH_SLOTS * std::mem::size_of::<FramePaletteEntryRaw>()) as vk::DeviceSize;
+const _: () = assert!(FRAME_PALETTE_SET_BYTES == 20480);
+
 /// Pixels-per-tile dimension (matches shader local_size_x/y).
 const TILE_SIZE: u32 = 32;
 
@@ -351,7 +357,7 @@ pub struct GpuFrameProcessor {
 
     // palette_fold pipeline (Stage 2a)
     palette_fold: ComputeStage,
-    // HOST_VISIBLE | HOST_COHERENT, 256 * 80 = 20480 bytes. Persistently mapped.
+    // HOST_VISIBLE | HOST_COHERENT, FRAME_PALETTE_SET_BYTES. Persistently mapped.
     // Persistent CPU mapping of the frame palette set buffer; pointed to by
     // FrameAnalysis::frame_palette_set.
     frame_palette_set: HostBuffer<FramePaletteEntryRaw>,

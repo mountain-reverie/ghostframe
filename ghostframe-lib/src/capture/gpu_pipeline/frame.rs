@@ -2423,8 +2423,13 @@ impl GpuFrameProcessor {
         //   hash_table (atomic CAS state, must start empty)
         //   per_tile_frame_palette_id (output, must start zero for atomicAnd/Or pattern)
         let pal_id_bytes = ((self.max_tiles + 3) & !3u32) as vk::DeviceSize;
-        self.device
-            .cmd_fill_buffer(cmd, self.frame_palette_set.buffer, 0, 20480, 0);
+        self.device.cmd_fill_buffer(
+            cmd,
+            self.frame_palette_set.buffer,
+            0,
+            FRAME_PALETTE_SET_BYTES,
+            0,
+        );
         self.device
             .cmd_fill_buffer(cmd, self.frame_palette_count.buffer, 0, 4, 0);
         self.device
@@ -2444,7 +2449,7 @@ impl GpuFrameProcessor {
                 self.frame_palette_set.buffer,
                 vk::AccessFlags::TRANSFER_WRITE,
                 vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-                20480,
+                FRAME_PALETTE_SET_BYTES,
             ),
             buf_barrier(
                 self.frame_palette_count.buffer,
