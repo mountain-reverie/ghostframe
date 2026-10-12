@@ -525,420 +525,8 @@ impl GpuFrameProcessor {
             &[],
         );
 
-        // Stage 1.5: zero compact_count, dispatch compact scan, dispatch indirect-args writer.
-        self.device
-            .cmd_fill_buffer(cmd, self.palrle_compact_count.buffer, 0, 4, 0);
-
-        // Barrier: transfer-write → shader-read/write
-        let buf_barrier_fill = buf_barrier(
-            self.palrle_compact_count.buffer,
-            vk::AccessFlags::TRANSFER_WRITE,
-            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-            4,
-        );
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            std::slice::from_ref(&buf_barrier_fill),
-            &[],
-        );
-
-        // Stage 1.5a: palrle_compact dispatch.
-        // tile_idx = gl_WorkGroupID.x; bound check `tile_idx < cols * rows` is in the shader.
-        let palrle_compact_push: [u32; 3] = [cols, rows, SAD_THRESHOLD];
-        let palrle_compact_ds_guard =
-            self.run_palrle_compact_stage(cmd, &palrle_compact_push, (cols * rows, 1, 1))?;
-
-        // Barrier between Stage 1.5a and 1.5b: shader write → shader read on count.
-        let buf_barrier_count = buf_barrier(
-            self.palrle_compact_count.buffer,
-            vk::AccessFlags::SHADER_WRITE,
-            vk::AccessFlags::SHADER_READ,
-            4,
-        );
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            std::slice::from_ref(&buf_barrier_count),
-            &[],
-        );
-
-        // Stage 1.5b: indirect-args writer.
-        let palrle_indirect_args_ds_guard = self.run_palrle_indirect_args_stage(cmd)?;
-
-        // Barrier for future stages (Task 11+) to consume indirect args.
-        let buf_barrier_args = buf_barrier(
-            self.palrle_indirect_args_buf.buffer,
-            vk::AccessFlags::SHADER_WRITE,
-            vk::AccessFlags::INDIRECT_COMMAND_READ | vk::AccessFlags::SHADER_READ,
-            12,
-        );
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::DRAW_INDIRECT | vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            std::slice::from_ref(&buf_barrier_args),
-            &[],
-        );
-
-        // Stage 4a: cdf53_compact dispatch.
-        // Zero the atomic count, then dispatch one workgroup per tile.
-        // Reads sad_buffer + analysis_buffer (both already visible via the
-        // buf_barrier_inputs above); writes cdf53_compact_list + count.
-        self.device
-            .cmd_fill_buffer(cmd, self.cdf53_compact_count_buffer, 0, 4, 0);
-        let buf_barrier_cdf53_fill = buf_barrier(
-            self.cdf53_compact_count_buffer,
-            vk::AccessFlags::TRANSFER_WRITE,
-            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-            4,
-        );
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            std::slice::from_ref(&buf_barrier_cdf53_fill),
-            &[],
-        );
-        let cdf53_compact_push: [u32; 4] =
-            [cols, rows, SAD_THRESHOLD, UNIQUE_COLORS_UNKNOWN_SENTINEL];
-        let cdf53_compact_ds_guard =
-            self.run_cdf53_compact_stage(cmd, &cdf53_compact_push, (cols * rows, 1, 1))?;
-        // Barrier between Stage 4a and 4b: shader write → shader read on count.
-        let buf_barrier_cdf53_count = buf_barrier(
-            self.cdf53_compact_count_buffer,
-            vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
-            vk::AccessFlags::SHADER_READ,
-            4,
-        );
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            std::slice::from_ref(&buf_barrier_cdf53_count),
-            &[],
-        );
-
-        // Stage 4b: cdf53_indirect_args writer.
-        let cdf53_indirect_args_ds_guard = self.run_cdf53_indirect_args_stage(cmd)?;
-
-        // Barrier: dispatch_args SHADER_WRITE → INDIRECT_COMMAND_READ | SHADER_READ
-        // for Stage 4c (cdf53_forward, Task 7) via vkCmdDispatchIndirect.
-        let buf_barrier_cdf53_args = buf_barrier(
-            self.cdf53_dispatch_args.buffer,
-            vk::AccessFlags::SHADER_WRITE,
-            vk::AccessFlags::INDIRECT_COMMAND_READ | vk::AccessFlags::SHADER_READ,
-            12,
-        );
-        // Barrier: compact_list + compact_count → HOST_READ (CPU readback after fence).
-        let buf_barrier_cdf53_list_host = buf_barrier(
-            self.cdf53_compact_list_buffer,
-            vk::AccessFlags::SHADER_WRITE,
-            vk::AccessFlags::HOST_READ,
-            vk::WHOLE_SIZE,
-        );
-        let buf_barrier_cdf53_count_host = buf_barrier(
-            self.cdf53_compact_count_buffer,
-            vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::SHADER_READ,
-            vk::AccessFlags::HOST_READ,
-            4,
-        );
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::DRAW_INDIRECT
-                | vk::PipelineStageFlags::COMPUTE_SHADER
-                | vk::PipelineStageFlags::HOST,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[
-                buf_barrier_cdf53_args,
-                buf_barrier_cdf53_list_host,
-                buf_barrier_cdf53_count_host,
-            ],
-            &[],
-        );
-
-        // ============================================================
-        // Stage 4c: cdf53_forward L1 → L2 → L3 (per-tile wavelet transform)
-        // ============================================================
-
-        // Stage 4c-L1: 32×32 BGRA tile → 4 × 16×16 subbands.
-        let cdf53_forward_l1_ds_guard =
-            self.run_cdf53_forward_l1_stage(cmd, current.view, cols, rows)?;
-
-        // Barrier L1 → L2: coefficient writes from L1 must be visible to L2.
-        let buf_barrier_l1_to_l2 = buf_barrier(
-            self.cdf53_coefficients_buffer,
-            vk::AccessFlags::SHADER_WRITE,
-            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-            vk::WHOLE_SIZE,
-        );
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            std::slice::from_ref(&buf_barrier_l1_to_l2),
-            &[],
-        );
-
-        // Stage 4c-L2: 16×16 LL1 → 4 × 8×8 subbands.
-        let cdf53_forward_l2_ds_guard = self.run_cdf53_forward_l2_stage(cmd, cols, rows)?;
-
-        // Barrier L2 → L3: coefficient writes from L2 must be visible to L3.
-        let buf_barrier_l2_to_l3 = buf_barrier(
-            self.cdf53_coefficients_buffer,
-            vk::AccessFlags::SHADER_WRITE,
-            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-            vk::WHOLE_SIZE,
-        );
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            std::slice::from_ref(&buf_barrier_l2_to_l3),
-            &[],
-        );
-
-        // Stage 4c-L3: 8×8 LL2 → 4 × 4×4 subbands. Final wavelet coefficients.
-        let cdf53_forward_l3_ds_guard = self.run_cdf53_forward_l3_stage(cmd, cols, rows)?;
-
-        // Barrier L3 → HOST_READ: Phase B reads coefficient buffer after fence.
-        let buf_barrier_l3_host = buf_barrier(
-            self.cdf53_coefficients_buffer,
-            vk::AccessFlags::SHADER_WRITE,
-            vk::AccessFlags::HOST_READ,
-            vk::WHOLE_SIZE,
-        );
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::HOST,
-            vk::DependencyFlags::empty(),
-            &[],
-            std::slice::from_ref(&buf_barrier_l3_host),
-            &[],
-        );
-
-        // ============================================================
-        // Stage 4d: cdf53_forward escalation (idle-escalation candidates)
-        // ============================================================
-        let _cdf53_escalation_ds_guards = if escalation_count > 0 {
-            let guards = self.run_cdf53_forward_escalation_stages(
-                cmd,
-                current.view,
-                cols,
-                rows,
-                escalation_count,
-            )?;
-            // L3 → HOST_READ barrier so Phase B can read after fence.
-            let buf_barrier_esc_host = buf_barrier(
-                self.cdf53_escalation_coefficients_buffer,
-                vk::AccessFlags::SHADER_WRITE,
-                vk::AccessFlags::HOST_READ,
-                vk::WHOLE_SIZE,
-            );
-            self.device.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::HOST,
-                vk::DependencyFlags::empty(),
-                &[],
-                std::slice::from_ref(&buf_barrier_esc_host),
-                &[],
-            );
-            Some(guards)
-        } else {
-            None
-        };
-
-        // ============================================================
-        // Stage 2a: palette_fold (intra-frame palette dedup)
-        // ============================================================
-
-        // Zero the four buffers that Stage 2a uses as state/output, plus
-        // frame_palette_set_buffer which Stage 2b reads (count==0 per slot check):
-        //   frame_palette_set (Stage 2b checks count==0 to detect empty slots)
-        //   frame_palette_count (atomic write target)
-        //   hash_table (atomic CAS state, must start empty)
-        //   per_tile_frame_palette_id (output, must start zero for atomicAnd/Or pattern)
-        let pal_id_bytes = ((self.max_tiles + 3) & !3u32) as vk::DeviceSize;
-        self.device
-            .cmd_fill_buffer(cmd, self.frame_palette_set.buffer, 0, 20480, 0);
-        self.device
-            .cmd_fill_buffer(cmd, self.frame_palette_count.buffer, 0, 4, 0);
-        self.device
-            .cmd_fill_buffer(cmd, self.hash_table.buffer, 0, PALETTE_SLOT_U32_BYTES, 0);
-        self.device.cmd_fill_buffer(
-            cmd,
-            self.per_tile_frame_palette_id.buffer,
-            0,
-            pal_id_bytes,
-            0,
-        );
-
-        // Barrier: zero-fills + compact_list write must be visible to Stage 2a.
-        // srcStageMask covers TRANSFER (zero-fills) and COMPUTE_SHADER (compact_list write).
-        let stage_2a_input_barriers = [
-            buf_barrier(
-                self.frame_palette_set.buffer,
-                vk::AccessFlags::TRANSFER_WRITE,
-                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-                20480,
-            ),
-            buf_barrier(
-                self.frame_palette_count.buffer,
-                vk::AccessFlags::TRANSFER_WRITE,
-                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-                4,
-            ),
-            buf_barrier(
-                self.hash_table.buffer,
-                vk::AccessFlags::TRANSFER_WRITE,
-                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-                PALETTE_SLOT_U32_BYTES,
-            ),
-            buf_barrier(
-                self.per_tile_frame_palette_id.buffer,
-                vk::AccessFlags::TRANSFER_WRITE,
-                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-                pal_id_bytes,
-            ),
-            buf_barrier(
-                self.palrle_compact_list.buffer,
-                vk::AccessFlags::SHADER_WRITE,
-                vk::AccessFlags::SHADER_READ,
-                vk::WHOLE_SIZE,
-            ),
-        ];
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &stage_2a_input_barriers,
-            &[],
-        );
-
-        // Stage 2a: palette fold (indirect dispatch via helper).
-        let palette_fold_ds_guard = self.run_palette_fold_stage(cmd)?;
-
-        // Barrier: Stage 2a outputs available to downstream stages and HOST readback.
-        let stage_2a_output_barriers = [
-            buf_barrier(
-                self.frame_palette_set.buffer,
-                vk::AccessFlags::SHADER_WRITE,
-                vk::AccessFlags::SHADER_READ,
-                vk::WHOLE_SIZE,
-            ),
-            buf_barrier(
-                self.frame_palette_count.buffer,
-                vk::AccessFlags::SHADER_WRITE,
-                vk::AccessFlags::SHADER_READ,
-                4,
-            ),
-            buf_barrier(
-                self.per_tile_frame_palette_id.buffer,
-                vk::AccessFlags::SHADER_WRITE,
-                vk::AccessFlags::SHADER_READ,
-                pal_id_bytes,
-            ),
-        ];
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &stage_2a_output_barriers,
-            &[],
-        );
-
-        // ============================================================
-        // Stage 2b init: write default-self sentinel to folded_into
-        // ============================================================
-        let palette_subset_fold_init_ds_guard =
-            self.run_palette_subset_fold_init_stage(cmd, (1, 1, 1))?;
-
-        // Barrier between init and fold: folded_into writes must be visible.
-        let stage_2b_init_to_fold_barrier = buf_barrier(
-            self.folded_into.buffer,
-            vk::AccessFlags::SHADER_WRITE,
-            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-            PALETTE_SLOT_U32_BYTES,
-        );
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            std::slice::from_ref(&stage_2b_init_to_fold_barrier),
-            &[],
-        );
-
-        // ============================================================
-        // Stage 2b fold: atomicMin-based subset detection
-        // ============================================================
-        let palette_subset_fold_ds_guard = self.run_palette_subset_fold_stage(cmd)?;
-
-        // Barrier for Stage 3 consumers and HOST readback.
-        let stage_2b_output_barrier = buf_barrier(
-            self.folded_into.buffer,
-            vk::AccessFlags::SHADER_WRITE,
-            vk::AccessFlags::SHADER_READ,
-            PALETTE_SLOT_U32_BYTES,
-        );
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            std::slice::from_ref(&stage_2b_output_barrier),
-            &[],
-        );
-
-        // ============================================================
-        // Stage 3: pal_rle_index — per-pixel binary search → 4-bit index stream
-        // ============================================================
-        //
-        // Barrier chain visibility for Stage 3 inputs:
-        //   - current_frame image: layout GENERAL (set at top of frame, valid
-        //     through end of compute section).
-        //   - palrle_compact_list: written by Stage 1.5a, barriered for
-        //     SHADER_READ in stage_2a_input_barriers; visibility propagates
-        //     transitively because no intervening writer touches it.
-        //   - frame_palette_set & per_tile_frame_palette_id: written by Stage 2a,
-        //     barriered for SHADER_READ in stage_2a_output_barriers. Visibility
-        //     remains valid for Stage 3 because Stage 2b (which executes
-        //     between Stage 2a's barrier and this dispatch) does NOT write
-        //     these buffers — only folded_into.
-        //   - folded_into: written by Stage 2b fold, barriered for SHADER_READ
-        //     in stage_2b_output_barrier directly above.
-        //
-        // All five inputs are correctly visible at COMPUTE_SHADER stage by
-        // Vulkan execution-dependency rules.
-        let pal_rle_index_push: [u32; 1] = [cols];
-        let pal_rle_index_ds_guard =
-            self.run_pal_rle_index_stage(cmd, current.view, &pal_rle_index_push)?;
+        let guards = self.record_shared_stages(cmd, current.view, cols, rows, escalation_count)?;
+        let pal_id_bytes = guards.pal_id_bytes;
 
         // 5a. Snapshot copy: current (DMA-BUF) → prev_image (owned). This
         // makes prev_image a true point-in-time snapshot of THIS frame for
@@ -1159,36 +747,14 @@ impl GpuFrameProcessor {
         let _ = (
             &nv12_ds_guard,
             &analysis_ds_guard,
-            &palrle_compact_ds_guard,
-            &palrle_indirect_args_ds_guard,
-            &cdf53_compact_ds_guard,
-            &cdf53_indirect_args_ds_guard,
-            &cdf53_forward_l1_ds_guard,
-            &cdf53_forward_l2_ds_guard,
-            &cdf53_forward_l3_ds_guard,
-            &_cdf53_escalation_ds_guards,
-            &palette_fold_ds_guard,
-            &palette_subset_fold_init_ds_guard,
-            &palette_subset_fold_ds_guard,
-            &pal_rle_index_ds_guard,
+            &guards,
             &cmd_guard,
             &fence_guard,
         );
         drop(sad_ds_guard);
         drop(nv12_ds_guard);
         drop(analysis_ds_guard);
-        drop(palrle_compact_ds_guard);
-        drop(palrle_indirect_args_ds_guard);
-        drop(cdf53_compact_ds_guard);
-        drop(cdf53_indirect_args_ds_guard);
-        drop(cdf53_forward_l1_ds_guard);
-        drop(cdf53_forward_l2_ds_guard);
-        drop(cdf53_forward_l3_ds_guard);
-        drop(_cdf53_escalation_ds_guards);
-        drop(palette_fold_ds_guard);
-        drop(palette_subset_fold_init_ds_guard);
-        drop(palette_subset_fold_ds_guard);
-        drop(pal_rle_index_ds_guard);
+        guards.release_forward();
 
         // 9. prev_image is persistent (own-allocated, layout still GENERAL
         // after the post-copy barrier). It now holds a snapshot of THIS frame
@@ -1368,393 +934,8 @@ impl GpuFrameProcessor {
             &[],
         );
 
-        // Stage 1.5: zero compact_count, dispatch compact scan, dispatch indirect-args writer.
-        self.device
-            .cmd_fill_buffer(cmd, self.palrle_compact_count.buffer, 0, 4, 0);
-
-        // Barrier: transfer-write → shader-read/write
-        let buf_barrier_fill = buf_barrier(
-            self.palrle_compact_count.buffer,
-            vk::AccessFlags::TRANSFER_WRITE,
-            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-            4,
-        );
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            std::slice::from_ref(&buf_barrier_fill),
-            &[],
-        );
-
-        // Stage 1.5a: palrle_compact dispatch.
-        // tile_idx = gl_WorkGroupID.x; bound check `tile_idx < cols * rows` is in the shader.
-        let palrle_compact_push: [u32; 3] = [cols, rows, SAD_THRESHOLD];
-        let palrle_compact_ds_guard =
-            self.run_palrle_compact_stage(cmd, &palrle_compact_push, (cols * rows, 1, 1))?;
-
-        // Barrier between Stage 1.5a and 1.5b: shader write → shader read on count.
-        let buf_barrier_count = buf_barrier(
-            self.palrle_compact_count.buffer,
-            vk::AccessFlags::SHADER_WRITE,
-            vk::AccessFlags::SHADER_READ,
-            4,
-        );
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            std::slice::from_ref(&buf_barrier_count),
-            &[],
-        );
-
-        // Stage 1.5b: indirect-args writer.
-        let palrle_indirect_args_ds_guard = self.run_palrle_indirect_args_stage(cmd)?;
-
-        // Barrier for future stages to consume indirect args.
-        let buf_barrier_args = buf_barrier(
-            self.palrle_indirect_args_buf.buffer,
-            vk::AccessFlags::SHADER_WRITE,
-            vk::AccessFlags::INDIRECT_COMMAND_READ | vk::AccessFlags::SHADER_READ,
-            12,
-        );
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::DRAW_INDIRECT | vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            std::slice::from_ref(&buf_barrier_args),
-            &[],
-        );
-
-        // Stage 4a: cdf53_compact dispatch (first-frame path).
-        self.device
-            .cmd_fill_buffer(cmd, self.cdf53_compact_count_buffer, 0, 4, 0);
-        let buf_barrier_cdf53_fill = buf_barrier(
-            self.cdf53_compact_count_buffer,
-            vk::AccessFlags::TRANSFER_WRITE,
-            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-            4,
-        );
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            std::slice::from_ref(&buf_barrier_cdf53_fill),
-            &[],
-        );
-        let cdf53_compact_push: [u32; 4] =
-            [cols, rows, SAD_THRESHOLD, UNIQUE_COLORS_UNKNOWN_SENTINEL];
-        let cdf53_compact_ds_guard =
-            self.run_cdf53_compact_stage(cmd, &cdf53_compact_push, (cols * rows, 1, 1))?;
-        // Barrier between Stage 4a and 4b: shader write → shader read on count
-        // (first-frame path).
-        let buf_barrier_cdf53_count = buf_barrier(
-            self.cdf53_compact_count_buffer,
-            vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
-            vk::AccessFlags::SHADER_READ,
-            4,
-        );
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            std::slice::from_ref(&buf_barrier_cdf53_count),
-            &[],
-        );
-
-        // Stage 4b: cdf53_indirect_args writer (first-frame path).
-        let cdf53_indirect_args_ds_guard = self.run_cdf53_indirect_args_stage(cmd)?;
-
-        // Barrier: dispatch_args SHADER_WRITE → INDIRECT_COMMAND_READ | SHADER_READ
-        // for Stage 4c (cdf53_forward, Task 7) via vkCmdDispatchIndirect.
-        let buf_barrier_cdf53_args = buf_barrier(
-            self.cdf53_dispatch_args.buffer,
-            vk::AccessFlags::SHADER_WRITE,
-            vk::AccessFlags::INDIRECT_COMMAND_READ | vk::AccessFlags::SHADER_READ,
-            12,
-        );
-        // Barrier: compact_list + compact_count → HOST_READ (CPU readback after fence).
-        let buf_barrier_cdf53_list_host = buf_barrier(
-            self.cdf53_compact_list_buffer,
-            vk::AccessFlags::SHADER_WRITE,
-            vk::AccessFlags::HOST_READ,
-            vk::WHOLE_SIZE,
-        );
-        let buf_barrier_cdf53_count_host = buf_barrier(
-            self.cdf53_compact_count_buffer,
-            vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::SHADER_READ,
-            vk::AccessFlags::HOST_READ,
-            4,
-        );
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::DRAW_INDIRECT
-                | vk::PipelineStageFlags::COMPUTE_SHADER
-                | vk::PipelineStageFlags::HOST,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[
-                buf_barrier_cdf53_args,
-                buf_barrier_cdf53_list_host,
-                buf_barrier_cdf53_count_host,
-            ],
-            &[],
-        );
-
-        // ============================================================
-        // Stage 4c: cdf53_forward L1 → L2 → L3 (first-frame path)
-        // ============================================================
-
-        // Stage 4c-L1: 32×32 BGRA tile → 4 × 16×16 subbands.
-        let cdf53_forward_l1_ds_guard =
-            self.run_cdf53_forward_l1_stage(cmd, current.view, cols, rows)?;
-
-        // Barrier L1 → L2
-        let buf_barrier_l1_to_l2 = buf_barrier(
-            self.cdf53_coefficients_buffer,
-            vk::AccessFlags::SHADER_WRITE,
-            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-            vk::WHOLE_SIZE,
-        );
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            std::slice::from_ref(&buf_barrier_l1_to_l2),
-            &[],
-        );
-
-        // Stage 4c-L2: 16×16 LL1 → 4 × 8×8 subbands.
-        let cdf53_forward_l2_ds_guard = self.run_cdf53_forward_l2_stage(cmd, cols, rows)?;
-
-        // Barrier L2 → L3
-        let buf_barrier_l2_to_l3 = buf_barrier(
-            self.cdf53_coefficients_buffer,
-            vk::AccessFlags::SHADER_WRITE,
-            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-            vk::WHOLE_SIZE,
-        );
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            std::slice::from_ref(&buf_barrier_l2_to_l3),
-            &[],
-        );
-
-        // Stage 4c-L3: 8×8 LL2 → final LL3/HL3/LH3/HH3 subbands.
-        let cdf53_forward_l3_ds_guard = self.run_cdf53_forward_l3_stage(cmd, cols, rows)?;
-
-        // Barrier L3 → HOST_READ: Phase B reads coefficient buffer after fence.
-        let buf_barrier_l3_host = buf_barrier(
-            self.cdf53_coefficients_buffer,
-            vk::AccessFlags::SHADER_WRITE,
-            vk::AccessFlags::HOST_READ,
-            vk::WHOLE_SIZE,
-        );
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::HOST,
-            vk::DependencyFlags::empty(),
-            &[],
-            std::slice::from_ref(&buf_barrier_l3_host),
-            &[],
-        );
-
-        // ============================================================
-        // Stage 4d: cdf53_forward escalation (idle-escalation candidates)
-        // ============================================================
-        let _cdf53_escalation_ds_guards = if escalation_count > 0 {
-            let guards = self.run_cdf53_forward_escalation_stages(
-                cmd,
-                current.view,
-                cols,
-                rows,
-                escalation_count,
-            )?;
-            // L3 → HOST_READ barrier so Phase B can read after fence.
-            let buf_barrier_esc_host = buf_barrier(
-                self.cdf53_escalation_coefficients_buffer,
-                vk::AccessFlags::SHADER_WRITE,
-                vk::AccessFlags::HOST_READ,
-                vk::WHOLE_SIZE,
-            );
-            self.device.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::HOST,
-                vk::DependencyFlags::empty(),
-                &[],
-                std::slice::from_ref(&buf_barrier_esc_host),
-                &[],
-            );
-            Some(guards)
-        } else {
-            None
-        };
-
-        // ============================================================
-        // Stage 2a: palette_fold (intra-frame palette dedup)
-        // ============================================================
-        let pal_id_bytes = ((self.max_tiles + 3) & !3u32) as vk::DeviceSize;
-        self.device
-            .cmd_fill_buffer(cmd, self.frame_palette_set.buffer, 0, 20480, 0);
-        self.device
-            .cmd_fill_buffer(cmd, self.frame_palette_count.buffer, 0, 4, 0);
-        self.device
-            .cmd_fill_buffer(cmd, self.hash_table.buffer, 0, PALETTE_SLOT_U32_BYTES, 0);
-        self.device.cmd_fill_buffer(
-            cmd,
-            self.per_tile_frame_palette_id.buffer,
-            0,
-            pal_id_bytes,
-            0,
-        );
-
-        // Barrier: zero-fills + compact_list write must be visible to Stage 2a.
-        let stage_2a_input_barriers = [
-            buf_barrier(
-                self.frame_palette_set.buffer,
-                vk::AccessFlags::TRANSFER_WRITE,
-                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-                20480,
-            ),
-            buf_barrier(
-                self.frame_palette_count.buffer,
-                vk::AccessFlags::TRANSFER_WRITE,
-                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-                4,
-            ),
-            buf_barrier(
-                self.hash_table.buffer,
-                vk::AccessFlags::TRANSFER_WRITE,
-                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-                PALETTE_SLOT_U32_BYTES,
-            ),
-            buf_barrier(
-                self.per_tile_frame_palette_id.buffer,
-                vk::AccessFlags::TRANSFER_WRITE,
-                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-                pal_id_bytes,
-            ),
-            buf_barrier(
-                self.palrle_compact_list.buffer,
-                vk::AccessFlags::SHADER_WRITE,
-                vk::AccessFlags::SHADER_READ,
-                vk::WHOLE_SIZE,
-            ),
-        ];
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &stage_2a_input_barriers,
-            &[],
-        );
-
-        // Stage 2a: palette fold (indirect dispatch via helper).
-        let palette_fold_ds_guard = self.run_palette_fold_stage(cmd)?;
-
-        // Barrier: Stage 2a outputs available to downstream stages.
-        let stage_2a_output_barriers = [
-            buf_barrier(
-                self.frame_palette_set.buffer,
-                vk::AccessFlags::SHADER_WRITE,
-                vk::AccessFlags::SHADER_READ,
-                vk::WHOLE_SIZE,
-            ),
-            buf_barrier(
-                self.frame_palette_count.buffer,
-                vk::AccessFlags::SHADER_WRITE,
-                vk::AccessFlags::SHADER_READ,
-                4,
-            ),
-            buf_barrier(
-                self.per_tile_frame_palette_id.buffer,
-                vk::AccessFlags::SHADER_WRITE,
-                vk::AccessFlags::SHADER_READ,
-                pal_id_bytes,
-            ),
-        ];
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &stage_2a_output_barriers,
-            &[],
-        );
-
-        // ============================================================
-        // Stage 2b init: write default-self sentinel to folded_into
-        // ============================================================
-        let palette_subset_fold_init_ds_guard =
-            self.run_palette_subset_fold_init_stage(cmd, (1, 1, 1))?;
-
-        // Barrier between init and fold: folded_into writes must be visible.
-        let stage_2b_init_to_fold_barrier = buf_barrier(
-            self.folded_into.buffer,
-            vk::AccessFlags::SHADER_WRITE,
-            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-            PALETTE_SLOT_U32_BYTES,
-        );
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            std::slice::from_ref(&stage_2b_init_to_fold_barrier),
-            &[],
-        );
-
-        // ============================================================
-        // Stage 2b fold: atomicMin-based subset detection
-        // ============================================================
-        let palette_subset_fold_ds_guard = self.run_palette_subset_fold_stage(cmd)?;
-
-        // Barrier for Stage 3 consumers and HOST readback.
-        let stage_2b_output_barrier = buf_barrier(
-            self.folded_into.buffer,
-            vk::AccessFlags::SHADER_WRITE,
-            vk::AccessFlags::SHADER_READ,
-            PALETTE_SLOT_U32_BYTES,
-        );
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            std::slice::from_ref(&stage_2b_output_barrier),
-            &[],
-        );
-
-        // ============================================================
-        // Stage 3: pal_rle_index
-        // ============================================================
-        let pal_rle_index_push: [u32; 1] = [cols];
-        let pal_rle_index_ds_guard =
-            self.run_pal_rle_index_stage(cmd, current.view, &pal_rle_index_push)?;
+        let guards = self.record_shared_stages(cmd, current.view, cols, rows, escalation_count)?;
+        let pal_id_bytes = guards.pal_id_bytes;
 
         // Snapshot copy: current (GENERAL) → snapshot (TRANSFER_DST_OPTIMAL).
         // Inside this `Some` arm the `PrevFrame` is always freshly allocated
@@ -1948,21 +1129,12 @@ impl GpuFrameProcessor {
         let _ = (
             &nv12_ds_guard,
             &analysis_ds_guard,
-            &palrle_compact_ds_guard,
-            &palrle_indirect_args_ds_guard,
-            &cdf53_compact_ds_guard,
-            &cdf53_indirect_args_ds_guard,
-            &cdf53_forward_l1_ds_guard,
-            &cdf53_forward_l2_ds_guard,
-            &cdf53_forward_l3_ds_guard,
-            &_cdf53_escalation_ds_guards,
-            &palette_fold_ds_guard,
-            &palette_subset_fold_init_ds_guard,
-            &palette_subset_fold_ds_guard,
-            &pal_rle_index_ds_guard,
+            &guards,
             &cmd_guard,
             &fence_guard,
         );
+        drop(fence_guard);
+        guards.release_reverse();
 
         Ok(())
     }
@@ -3079,5 +2251,554 @@ impl GpuFrameProcessor {
         );
 
         Ok((l1_guard, l2_guard, l3_guard))
+    }
+
+    /// The stages both frame paths record identically, from the palrle_compact
+    /// count fill through `pal_rle_index`: Stage 1.5a/b, 4a/b, 4c L1-L3, 4d
+    /// escalation, 2a, 2b init, 2b and 3, with their internal barriers and
+    /// fills. The caller records everything before (image transition, SAD /
+    /// NV12 / analysis, the path-specific `inputs` buffer barrier) and after
+    /// (snapshot copy, HOST_READ barrier, submit).
+    ///
+    /// Each descriptor-set guard is a local until the final struct is built,
+    /// so an early `?` unwinds them in reverse declaration order as before.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as the `run_*_stage` helpers: `cmd` is recording,
+    /// `current_view` is in GENERAL layout, and the returned guards must stay
+    /// alive until `wait_for_fences` returns.
+    unsafe fn record_shared_stages<'a>(
+        &'a self,
+        cmd: vk::CommandBuffer,
+        current_view: vk::ImageView,
+        cols: u32,
+        rows: u32,
+        escalation_count: u32,
+    ) -> Result<SharedStageGuards<'a>, Box<dyn std::error::Error>> {
+        // Stage 1.5: zero compact_count, dispatch compact scan, dispatch indirect-args writer.
+        self.device
+            .cmd_fill_buffer(cmd, self.palrle_compact_count.buffer, 0, 4, 0);
+
+        // Barrier: transfer-write → shader-read/write
+        let buf_barrier_fill = buf_barrier(
+            self.palrle_compact_count.buffer,
+            vk::AccessFlags::TRANSFER_WRITE,
+            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+            4,
+        );
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            std::slice::from_ref(&buf_barrier_fill),
+            &[],
+        );
+
+        // Stage 1.5a: palrle_compact dispatch.
+        // tile_idx = gl_WorkGroupID.x; bound check `tile_idx < cols * rows` is in the shader.
+        let palrle_compact_push: [u32; 3] = [cols, rows, SAD_THRESHOLD];
+        let palrle_compact_ds_guard =
+            self.run_palrle_compact_stage(cmd, &palrle_compact_push, (cols * rows, 1, 1))?;
+
+        // Barrier between Stage 1.5a and 1.5b: shader write → shader read on count.
+        let buf_barrier_count = buf_barrier(
+            self.palrle_compact_count.buffer,
+            vk::AccessFlags::SHADER_WRITE,
+            vk::AccessFlags::SHADER_READ,
+            4,
+        );
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            std::slice::from_ref(&buf_barrier_count),
+            &[],
+        );
+
+        // Stage 1.5b: indirect-args writer.
+        let palrle_indirect_args_ds_guard = self.run_palrle_indirect_args_stage(cmd)?;
+
+        // Barrier for future stages (Task 11+) to consume indirect args.
+        let buf_barrier_args = buf_barrier(
+            self.palrle_indirect_args_buf.buffer,
+            vk::AccessFlags::SHADER_WRITE,
+            vk::AccessFlags::INDIRECT_COMMAND_READ | vk::AccessFlags::SHADER_READ,
+            12,
+        );
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::DRAW_INDIRECT | vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            std::slice::from_ref(&buf_barrier_args),
+            &[],
+        );
+
+        // Stage 4a: cdf53_compact dispatch.
+        // Zero the atomic count, then dispatch one workgroup per tile.
+        // Reads sad_buffer + analysis_buffer (both already visible via the
+        // buf_barrier_inputs above); writes cdf53_compact_list + count.
+        self.device
+            .cmd_fill_buffer(cmd, self.cdf53_compact_count_buffer, 0, 4, 0);
+        let buf_barrier_cdf53_fill = buf_barrier(
+            self.cdf53_compact_count_buffer,
+            vk::AccessFlags::TRANSFER_WRITE,
+            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+            4,
+        );
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            std::slice::from_ref(&buf_barrier_cdf53_fill),
+            &[],
+        );
+        let cdf53_compact_push: [u32; 4] =
+            [cols, rows, SAD_THRESHOLD, UNIQUE_COLORS_UNKNOWN_SENTINEL];
+        let cdf53_compact_ds_guard =
+            self.run_cdf53_compact_stage(cmd, &cdf53_compact_push, (cols * rows, 1, 1))?;
+        // Barrier between Stage 4a and 4b: shader write → shader read on count.
+        let buf_barrier_cdf53_count = buf_barrier(
+            self.cdf53_compact_count_buffer,
+            vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
+            vk::AccessFlags::SHADER_READ,
+            4,
+        );
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            std::slice::from_ref(&buf_barrier_cdf53_count),
+            &[],
+        );
+
+        // Stage 4b: cdf53_indirect_args writer.
+        let cdf53_indirect_args_ds_guard = self.run_cdf53_indirect_args_stage(cmd)?;
+
+        // Barrier: dispatch_args SHADER_WRITE → INDIRECT_COMMAND_READ | SHADER_READ
+        // for Stage 4c (cdf53_forward, Task 7) via vkCmdDispatchIndirect.
+        let buf_barrier_cdf53_args = buf_barrier(
+            self.cdf53_dispatch_args.buffer,
+            vk::AccessFlags::SHADER_WRITE,
+            vk::AccessFlags::INDIRECT_COMMAND_READ | vk::AccessFlags::SHADER_READ,
+            12,
+        );
+        // Barrier: compact_list + compact_count → HOST_READ (CPU readback after fence).
+        let buf_barrier_cdf53_list_host = buf_barrier(
+            self.cdf53_compact_list_buffer,
+            vk::AccessFlags::SHADER_WRITE,
+            vk::AccessFlags::HOST_READ,
+            vk::WHOLE_SIZE,
+        );
+        let buf_barrier_cdf53_count_host = buf_barrier(
+            self.cdf53_compact_count_buffer,
+            vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::SHADER_READ,
+            vk::AccessFlags::HOST_READ,
+            4,
+        );
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::DRAW_INDIRECT
+                | vk::PipelineStageFlags::COMPUTE_SHADER
+                | vk::PipelineStageFlags::HOST,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[
+                buf_barrier_cdf53_args,
+                buf_barrier_cdf53_list_host,
+                buf_barrier_cdf53_count_host,
+            ],
+            &[],
+        );
+
+        // ============================================================
+        // Stage 4c: cdf53_forward L1 → L2 → L3 (per-tile wavelet transform)
+        // ============================================================
+
+        // Stage 4c-L1: 32×32 BGRA tile → 4 × 16×16 subbands.
+        let cdf53_forward_l1_ds_guard =
+            self.run_cdf53_forward_l1_stage(cmd, current_view, cols, rows)?;
+
+        // Barrier L1 → L2: coefficient writes from L1 must be visible to L2.
+        let buf_barrier_l1_to_l2 = buf_barrier(
+            self.cdf53_coefficients_buffer,
+            vk::AccessFlags::SHADER_WRITE,
+            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+            vk::WHOLE_SIZE,
+        );
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            std::slice::from_ref(&buf_barrier_l1_to_l2),
+            &[],
+        );
+
+        // Stage 4c-L2: 16×16 LL1 → 4 × 8×8 subbands.
+        let cdf53_forward_l2_ds_guard = self.run_cdf53_forward_l2_stage(cmd, cols, rows)?;
+
+        // Barrier L2 → L3: coefficient writes from L2 must be visible to L3.
+        let buf_barrier_l2_to_l3 = buf_barrier(
+            self.cdf53_coefficients_buffer,
+            vk::AccessFlags::SHADER_WRITE,
+            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+            vk::WHOLE_SIZE,
+        );
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            std::slice::from_ref(&buf_barrier_l2_to_l3),
+            &[],
+        );
+
+        // Stage 4c-L3: 8×8 LL2 → 4 × 4×4 subbands. Final wavelet coefficients.
+        let cdf53_forward_l3_ds_guard = self.run_cdf53_forward_l3_stage(cmd, cols, rows)?;
+
+        // Barrier L3 → HOST_READ: Phase B reads coefficient buffer after fence.
+        let buf_barrier_l3_host = buf_barrier(
+            self.cdf53_coefficients_buffer,
+            vk::AccessFlags::SHADER_WRITE,
+            vk::AccessFlags::HOST_READ,
+            vk::WHOLE_SIZE,
+        );
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::HOST,
+            vk::DependencyFlags::empty(),
+            &[],
+            std::slice::from_ref(&buf_barrier_l3_host),
+            &[],
+        );
+
+        // ============================================================
+        // Stage 4d: cdf53_forward escalation (idle-escalation candidates)
+        // ============================================================
+        let cdf53_escalation_ds_guards = if escalation_count > 0 {
+            let guards = self.run_cdf53_forward_escalation_stages(
+                cmd,
+                current_view,
+                cols,
+                rows,
+                escalation_count,
+            )?;
+            // L3 → HOST_READ barrier so Phase B can read after fence.
+            let buf_barrier_esc_host = buf_barrier(
+                self.cdf53_escalation_coefficients_buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::HOST_READ,
+                vk::WHOLE_SIZE,
+            );
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[],
+                std::slice::from_ref(&buf_barrier_esc_host),
+                &[],
+            );
+            Some(guards)
+        } else {
+            None
+        };
+
+        // ============================================================
+        // Stage 2a: palette_fold (intra-frame palette dedup)
+        // ============================================================
+
+        // Zero the four buffers that Stage 2a uses as state/output, plus
+        // frame_palette_set_buffer which Stage 2b reads (count==0 per slot check):
+        //   frame_palette_set (Stage 2b checks count==0 to detect empty slots)
+        //   frame_palette_count (atomic write target)
+        //   hash_table (atomic CAS state, must start empty)
+        //   per_tile_frame_palette_id (output, must start zero for atomicAnd/Or pattern)
+        let pal_id_bytes = ((self.max_tiles + 3) & !3u32) as vk::DeviceSize;
+        self.device
+            .cmd_fill_buffer(cmd, self.frame_palette_set.buffer, 0, 20480, 0);
+        self.device
+            .cmd_fill_buffer(cmd, self.frame_palette_count.buffer, 0, 4, 0);
+        self.device
+            .cmd_fill_buffer(cmd, self.hash_table.buffer, 0, PALETTE_SLOT_U32_BYTES, 0);
+        self.device.cmd_fill_buffer(
+            cmd,
+            self.per_tile_frame_palette_id.buffer,
+            0,
+            pal_id_bytes,
+            0,
+        );
+
+        // Barrier: zero-fills + compact_list write must be visible to Stage 2a.
+        // srcStageMask covers TRANSFER (zero-fills) and COMPUTE_SHADER (compact_list write).
+        let stage_2a_input_barriers = [
+            buf_barrier(
+                self.frame_palette_set.buffer,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                20480,
+            ),
+            buf_barrier(
+                self.frame_palette_count.buffer,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                4,
+            ),
+            buf_barrier(
+                self.hash_table.buffer,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                PALETTE_SLOT_U32_BYTES,
+            ),
+            buf_barrier(
+                self.per_tile_frame_palette_id.buffer,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                pal_id_bytes,
+            ),
+            buf_barrier(
+                self.palrle_compact_list.buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::SHADER_READ,
+                vk::WHOLE_SIZE,
+            ),
+        ];
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &stage_2a_input_barriers,
+            &[],
+        );
+
+        // Stage 2a: palette fold (indirect dispatch via helper).
+        let palette_fold_ds_guard = self.run_palette_fold_stage(cmd)?;
+
+        // Barrier: Stage 2a outputs available to downstream stages and HOST readback.
+        let stage_2a_output_barriers = [
+            buf_barrier(
+                self.frame_palette_set.buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::SHADER_READ,
+                vk::WHOLE_SIZE,
+            ),
+            buf_barrier(
+                self.frame_palette_count.buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::SHADER_READ,
+                4,
+            ),
+            buf_barrier(
+                self.per_tile_frame_palette_id.buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::SHADER_READ,
+                pal_id_bytes,
+            ),
+        ];
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &stage_2a_output_barriers,
+            &[],
+        );
+
+        // ============================================================
+        // Stage 2b init: write default-self sentinel to folded_into
+        // ============================================================
+        let palette_subset_fold_init_ds_guard =
+            self.run_palette_subset_fold_init_stage(cmd, (1, 1, 1))?;
+
+        // Barrier between init and fold: folded_into writes must be visible.
+        let stage_2b_init_to_fold_barrier = buf_barrier(
+            self.folded_into.buffer,
+            vk::AccessFlags::SHADER_WRITE,
+            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+            PALETTE_SLOT_U32_BYTES,
+        );
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            std::slice::from_ref(&stage_2b_init_to_fold_barrier),
+            &[],
+        );
+
+        // ============================================================
+        // Stage 2b fold: atomicMin-based subset detection
+        // ============================================================
+        let palette_subset_fold_ds_guard = self.run_palette_subset_fold_stage(cmd)?;
+
+        // Barrier for Stage 3 consumers and HOST readback.
+        let stage_2b_output_barrier = buf_barrier(
+            self.folded_into.buffer,
+            vk::AccessFlags::SHADER_WRITE,
+            vk::AccessFlags::SHADER_READ,
+            PALETTE_SLOT_U32_BYTES,
+        );
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            std::slice::from_ref(&stage_2b_output_barrier),
+            &[],
+        );
+
+        // ============================================================
+        // Stage 3: pal_rle_index — per-pixel binary search → 4-bit index stream
+        // ============================================================
+        //
+        // Barrier chain visibility for Stage 3 inputs:
+        //   - current_frame image: layout GENERAL (set at top of frame, valid
+        //     through end of compute section).
+        //   - palrle_compact_list: written by Stage 1.5a, barriered for
+        //     SHADER_READ in stage_2a_input_barriers; visibility propagates
+        //     transitively because no intervening writer touches it.
+        //   - frame_palette_set & per_tile_frame_palette_id: written by Stage 2a,
+        //     barriered for SHADER_READ in stage_2a_output_barriers. Visibility
+        //     remains valid for Stage 3 because Stage 2b (which executes
+        //     between Stage 2a's barrier and this dispatch) does NOT write
+        //     these buffers — only folded_into.
+        //   - folded_into: written by Stage 2b fold, barriered for SHADER_READ
+        //     in stage_2b_output_barrier directly above.
+        //
+        // All five inputs are correctly visible at COMPUTE_SHADER stage by
+        // Vulkan execution-dependency rules.
+        let pal_rle_index_push: [u32; 1] = [cols];
+        let pal_rle_index_ds_guard =
+            self.run_pal_rle_index_stage(cmd, current_view, &pal_rle_index_push)?;
+
+        Ok(SharedStageGuards {
+            palrle_compact_ds_guard,
+            palrle_indirect_args_ds_guard,
+            cdf53_compact_ds_guard,
+            cdf53_indirect_args_ds_guard,
+            cdf53_forward_l1_ds_guard,
+            cdf53_forward_l2_ds_guard,
+            cdf53_forward_l3_ds_guard,
+            cdf53_escalation_ds_guards,
+            palette_fold_ds_guard,
+            palette_subset_fold_init_ds_guard,
+            palette_subset_fold_ds_guard,
+            pal_rle_index_ds_guard,
+            pal_id_bytes,
+        })
+    }
+}
+
+/// Descriptor-set guards of the stages recorded by `record_shared_stages`,
+/// fields declared in REVERSE creation order, so that the implicit drop (an
+/// error after `record_shared_stages` returned) frees them in the reverse
+/// order the pre-refactor locals unwound in. Deliberately has no `Drop`
+/// logic of its own on the success path: callers release it explicitly with
+/// `release_forward` or `release_reverse` after `wait_for_fences`, matching
+/// the free order each path had before the stages were shared.
+struct SharedStageGuards<'a> {
+    pal_rle_index_ds_guard: ScopedDescriptorSets<'a>,
+    palette_subset_fold_ds_guard: ScopedDescriptorSets<'a>,
+    palette_subset_fold_init_ds_guard: ScopedDescriptorSets<'a>,
+    palette_fold_ds_guard: ScopedDescriptorSets<'a>,
+    cdf53_escalation_ds_guards: Option<(
+        ScopedDescriptorSets<'a>,
+        ScopedDescriptorSets<'a>,
+        ScopedDescriptorSets<'a>,
+    )>,
+    cdf53_forward_l3_ds_guard: ScopedDescriptorSets<'a>,
+    cdf53_forward_l2_ds_guard: ScopedDescriptorSets<'a>,
+    cdf53_forward_l1_ds_guard: ScopedDescriptorSets<'a>,
+    cdf53_indirect_args_ds_guard: ScopedDescriptorSets<'a>,
+    cdf53_compact_ds_guard: ScopedDescriptorSets<'a>,
+    palrle_indirect_args_ds_guard: ScopedDescriptorSets<'a>,
+    palrle_compact_ds_guard: ScopedDescriptorSets<'a>,
+    /// Not a guard: the Stage 2a per-tile palette-id buffer size, which the
+    /// callers' final HOST_READ barrier reuses.
+    pal_id_bytes: vk::DeviceSize,
+}
+
+impl SharedStageGuards<'_> {
+    /// Free in creation order (the steady-state path's explicit drops).
+    fn release_forward(self) {
+        let Self {
+            palrle_compact_ds_guard,
+            palrle_indirect_args_ds_guard,
+            cdf53_compact_ds_guard,
+            cdf53_indirect_args_ds_guard,
+            cdf53_forward_l1_ds_guard,
+            cdf53_forward_l2_ds_guard,
+            cdf53_forward_l3_ds_guard,
+            cdf53_escalation_ds_guards,
+            palette_fold_ds_guard,
+            palette_subset_fold_init_ds_guard,
+            palette_subset_fold_ds_guard,
+            pal_rle_index_ds_guard,
+            pal_id_bytes: _,
+        } = self;
+        drop(palrle_compact_ds_guard);
+        drop(palrle_indirect_args_ds_guard);
+        drop(cdf53_compact_ds_guard);
+        drop(cdf53_indirect_args_ds_guard);
+        drop(cdf53_forward_l1_ds_guard);
+        drop(cdf53_forward_l2_ds_guard);
+        drop(cdf53_forward_l3_ds_guard);
+        drop(cdf53_escalation_ds_guards);
+        drop(palette_fold_ds_guard);
+        drop(palette_subset_fold_init_ds_guard);
+        drop(palette_subset_fold_ds_guard);
+        drop(pal_rle_index_ds_guard);
+    }
+
+    /// Free in reverse creation order (the first-frame path's scope-end
+    /// order). The escalation triple still frees l1, l2, l3 as a tuple.
+    fn release_reverse(self) {
+        let Self {
+            palrle_compact_ds_guard,
+            palrle_indirect_args_ds_guard,
+            cdf53_compact_ds_guard,
+            cdf53_indirect_args_ds_guard,
+            cdf53_forward_l1_ds_guard,
+            cdf53_forward_l2_ds_guard,
+            cdf53_forward_l3_ds_guard,
+            cdf53_escalation_ds_guards,
+            palette_fold_ds_guard,
+            palette_subset_fold_init_ds_guard,
+            palette_subset_fold_ds_guard,
+            pal_rle_index_ds_guard,
+            pal_id_bytes: _,
+        } = self;
+        drop(pal_rle_index_ds_guard);
+        drop(palette_subset_fold_ds_guard);
+        drop(palette_subset_fold_init_ds_guard);
+        drop(palette_fold_ds_guard);
+        drop(cdf53_escalation_ds_guards);
+        drop(cdf53_forward_l3_ds_guard);
+        drop(cdf53_forward_l2_ds_guard);
+        drop(cdf53_forward_l1_ds_guard);
+        drop(cdf53_indirect_args_ds_guard);
+        drop(cdf53_compact_ds_guard);
+        drop(palrle_indirect_args_ds_guard);
+        drop(palrle_compact_ds_guard);
     }
 }
