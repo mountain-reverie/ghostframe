@@ -2477,10 +2477,10 @@ unsafe fn golden_surfaces(
 
     // Indirect dispatch arguments written by the two *_indirect_args shaders.
     let mut f = Fnv::new();
-    for v in golden_read_args(p, p.palrle_indirect_args_memory) {
+    for v in golden_read_args(p, p.palrle_indirect_args_buf.memory) {
         f.u32(v);
     }
-    for v in golden_read_args(p, p.cdf53_dispatch_args_memory) {
+    for v in golden_read_args(p, p.cdf53_dispatch_args.memory) {
         f.u32(v);
     }
     rows.push(("indirect_args", f.0));

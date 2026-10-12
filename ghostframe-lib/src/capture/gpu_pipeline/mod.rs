@@ -271,24 +271,16 @@ pub struct GpuFrameProcessor {
     analysis: ComputeStage,
     // HOST_VISIBLE | HOST_COHERENT, persistently mapped. Layout matches
     // `TileAnalysis` (80 bytes per tile).
-    analysis_buffer: vk::Buffer,
-    analysis_memory: vk::DeviceMemory,
-    analysis_ptr: *mut TileAnalysis,
+    analysis_buf: HostBuffer<TileAnalysis>,
 
     // PalRLE compact pipeline (Stage 1.5)
     palrle_compact: ComputeStage,
     // HOST_VISIBLE | HOST_COHERENT, persistently mapped. One u32 per tile.
-    palrle_compact_list_buffer: vk::Buffer,
-    palrle_compact_list_memory: vk::DeviceMemory,
     // Task 10b will read this pointer to retrieve the compact tile index list.
-    #[allow(dead_code)]
-    palrle_compact_list_ptr: *mut u32,
+    palrle_compact_list: HostBuffer<u32>,
     // HOST_VISIBLE | HOST_COHERENT | TRANSFER_DST, persistently mapped. 4 bytes.
-    palrle_compact_count_buffer: vk::Buffer,
-    palrle_compact_count_memory: vk::DeviceMemory,
     // Task 10b will read this pointer to retrieve the compact tile count.
-    #[allow(dead_code)]
-    palrle_compact_count_ptr: *mut u32,
+    palrle_compact_count: HostBuffer<u32>,
 
     // Cdf53 compact pipeline (Stage 4a, added M3.3a)
     cdf53_compact: ComputeStage,
@@ -304,8 +296,7 @@ pub struct GpuFrameProcessor {
     pub cdf53_compact_count_ptr: *const u32,
 
     // Cdf53 indirect-args pipeline (Stage 4b, added M3.3a)
-    cdf53_dispatch_args_buffer: vk::Buffer,
-    cdf53_dispatch_args_memory: vk::DeviceMemory,
+    cdf53_dispatch_args: HostBuffer<u32>,
     // No CPU pointer — HOST_VISIBLE only for simple alloc; read by GPU via
     // vkCmdDispatchIndirect. Written once per frame by cdf53_indirect_args shader.
     cdf53_indirect_args: ComputeStage,
@@ -325,15 +316,11 @@ pub struct GpuFrameProcessor {
     // the cdf53_forward_l{1,2,3} shaders reads them and writes coefficients
     // into the dedicated escalation_coefficients_buffer. K = MAX_ESCALATION_PER_FRAME
     // bounds the dispatch + the buffer sizes.
-    pub(crate) cdf53_escalation_list_buffer: vk::Buffer,
-    pub(crate) cdf53_escalation_list_memory: vk::DeviceMemory,
     /// CPU writes tile-idx values via this pointer (host-coherent).
-    pub cdf53_escalation_list_ptr: *mut u32,
+    cdf53_escalation_list: HostBuffer<u32>,
 
-    pub(crate) cdf53_escalation_count_buffer: vk::Buffer,
-    pub(crate) cdf53_escalation_count_memory: vk::DeviceMemory,
     /// CPU writes per-frame escalation count via this pointer (host-coherent).
-    pub cdf53_escalation_count_ptr: *mut u32,
+    cdf53_escalation_count: HostBuffer<u32>,
 
     pub(crate) cdf53_escalation_coefficients_buffer: vk::Buffer,
     pub(crate) cdf53_escalation_coefficients_memory: vk::DeviceMemory,
@@ -353,33 +340,25 @@ pub struct GpuFrameProcessor {
     palrle_indirect_args: ComputeStage,
     // HOST_VISIBLE | HOST_COHERENT, size = 12 bytes. Written by shader; used as
     // INDIRECT_BUFFER for vkCmdDispatchIndirect in Task 10b.
-    palrle_indirect_args_buffer: vk::Buffer,
-    palrle_indirect_args_memory: vk::DeviceMemory,
+    palrle_indirect_args_buf: HostBuffer<u32>,
 
     // palette_fold pipeline (Stage 2a)
     palette_fold: ComputeStage,
     // HOST_VISIBLE | HOST_COHERENT, 256 * 80 = 20480 bytes. Persistently mapped.
-    frame_palette_set_buffer: vk::Buffer,
-    frame_palette_set_memory: vk::DeviceMemory,
     // Persistent CPU mapping of the frame palette set buffer; pointed to by
     // FrameAnalysis::frame_palette_set.
-    frame_palette_set_ptr: *mut FramePaletteEntryRaw,
+    frame_palette_set: HostBuffer<FramePaletteEntryRaw>,
     // HOST_VISIBLE | HOST_COHERENT | TRANSFER_DST, 4 bytes. Persistently mapped.
-    frame_palette_count_buffer: vk::Buffer,
-    frame_palette_count_memory: vk::DeviceMemory,
     // Persistent CPU mapping of the frame palette count buffer; pointed to by
     // FrameAnalysis::frame_palette_set_count (high-water mark of claimed slot IDs).
-    frame_palette_count_ptr: *mut u32,
+    frame_palette_count: HostBuffer<u32>,
     // HOST_VISIBLE | HOST_COHERENT | TRANSFER_DST, 256 * 4 = 1024 bytes.
     // No persistent CPU mapping needed (Stage 2a is the only consumer).
-    hash_table_buffer: vk::Buffer,
-    hash_table_memory: vk::DeviceMemory,
+    hash_table: HostBuffer<u32>,
     // HOST_VISIBLE | HOST_COHERENT | TRANSFER_DST, (max_tiles+3)/4*4 bytes. Persistently mapped.
-    per_tile_frame_palette_id_buffer: vk::Buffer,
-    per_tile_frame_palette_id_memory: vk::DeviceMemory,
     // Persistent CPU mapping of the per-tile frame palette ID buffer; pointed
     // to by FrameAnalysis::per_tile_frame_palette_id.
-    per_tile_frame_palette_id_ptr: *mut u8,
+    per_tile_frame_palette_id: HostBuffer<u8>,
 
     // palette_subset_fold_init pipeline (Stage 2b init)
     palette_subset_fold_init: ComputeStage,
@@ -390,30 +369,24 @@ pub struct GpuFrameProcessor {
     // Stage 2b output: folded_into[i] encodes the best superset for slot i.
     // 256 × 4 = 1024 bytes. HOST_VISIBLE | HOST_COHERENT | STORAGE_BUFFER | TRANSFER_DST.
     // Persistently mapped; Task 12b will read this after the Stage 2b dispatch.
-    folded_into_buffer: vk::Buffer,
-    folded_into_memory: vk::DeviceMemory,
     // Persistent CPU mapping of the folded_into buffer; pointed to by
     // FrameAnalysis::folded_into after Stage 2b dispatch.
-    folded_into_ptr: *mut u32,
+    folded_into: HostBuffer<u32>,
 
     // pal_rle_index pipeline (Stage 3)
     pal_rle_index: ComputeStage,
     // HOST_VISIBLE | HOST_COHERENT, size = max_tiles * 512 bytes.
     // Each tile occupies 128 u32 entries (512 bytes) of packed 4-bit indices.
     // Persistently mapped for CPU readback after Stage 3 dispatch.
-    index_buffer: vk::Buffer,
-    index_buffer_memory: vk::DeviceMemory,
     // Persistent CPU mapping of the index buffer; pointed to by
     // FrameAnalysis::index_buffer after Stage 3 dispatch.
-    index_buffer_ptr: *mut u8,
+    index: HostBuffer<u8>,
 
     descriptor_pool: vk::DescriptorPool,
     prev_image: Option<PrevFrame>,
 
     // SAD output buffer (HOST_VISIBLE, persistently mapped)
-    sad_buffer: vk::Buffer,
-    sad_memory: vk::DeviceMemory,
-    sad_ptr: *mut u32,
+    sad_buf: HostBuffer<u32>,
     max_tiles: u32,
 
     // NV12 output buffer (HOST_VISIBLE | HOST_COHERENT, persistently mapped)
@@ -459,6 +432,33 @@ impl ComputeStage {
         d.destroy_pipeline_layout(self.layout, None);
         d.destroy_descriptor_set_layout(self.dsl, None);
         d.destroy_shader_module(self.module, None);
+    }
+}
+
+/// A HOST_VISIBLE buffer, its memory and its persistent CPU mapping. Plain
+/// data with no `Drop`: `GpuFrameProcessor::drop` interleaves buffer and
+/// stage teardown in a fixed order and calls [`HostBuffer::destroy`] in place.
+///
+/// `ptr` is null for buffers that are not mapped at drop time (mapped only
+/// transiently in setup, or never); `destroy` then skips the unmap.
+pub(super) struct HostBuffer<T> {
+    pub(super) buffer: vk::Buffer,
+    pub(super) memory: vk::DeviceMemory,
+    pub(super) ptr: *mut T,
+}
+
+impl<T> HostBuffer<T> {
+    /// Unmap (only if `ptr` is non-null), destroy the buffer, free the memory.
+    ///
+    /// # Safety
+    /// `d` must be the device that created these objects, the memory must be
+    /// mapped iff `ptr` is non-null, and the GPU must be done with the buffer.
+    pub(super) unsafe fn destroy(&self, d: &ash::Device) {
+        if !self.ptr.is_null() {
+            d.unmap_memory(self.memory);
+        }
+        d.destroy_buffer(self.buffer, None);
+        d.free_memory(self.memory, None);
     }
 }
 
@@ -620,8 +620,8 @@ impl GpuFrameProcessor {
         // persistently-mapped pointer into a buffer of MAX_ESCALATION_PER_FRAME
         // u32 entries, allocated in setup.rs. Writing `n` entries is within bounds.
         unsafe {
-            std::ptr::copy_nonoverlapping(candidates.as_ptr(), self.cdf53_escalation_list_ptr, n);
-            *self.cdf53_escalation_count_ptr = n as u32;
+            std::ptr::copy_nonoverlapping(candidates.as_ptr(), self.cdf53_escalation_list.ptr, n);
+            *self.cdf53_escalation_count.ptr = n as u32;
         }
         self.staged_escalation_count = n as u32;
     }
@@ -676,57 +676,29 @@ impl Drop for GpuFrameProcessor {
             }
 
             // SAD resources
-            self.device.unmap_memory(self.sad_memory);
-            self.device.destroy_buffer(self.sad_buffer, None);
-            self.device.free_memory(self.sad_memory, None);
+            self.sad_buf.destroy(&self.device);
 
             // Analysis buffer
-            self.device.unmap_memory(self.analysis_memory);
-            self.device.destroy_buffer(self.analysis_buffer, None);
-            self.device.free_memory(self.analysis_memory, None);
+            self.analysis_buf.destroy(&self.device);
 
             // PalRLE compact list buffer
-            self.device.unmap_memory(self.palrle_compact_list_memory);
-            self.device
-                .destroy_buffer(self.palrle_compact_list_buffer, None);
-            self.device
-                .free_memory(self.palrle_compact_list_memory, None);
+            self.palrle_compact_list.destroy(&self.device);
 
             // PalRLE compact count buffer
-            self.device.unmap_memory(self.palrle_compact_count_memory);
-            self.device
-                .destroy_buffer(self.palrle_compact_count_buffer, None);
-            self.device
-                .free_memory(self.palrle_compact_count_memory, None);
+            self.palrle_compact_count.destroy(&self.device);
 
             // PalRLE indirect args buffer (no CPU mapping to unmap)
-            self.device
-                .destroy_buffer(self.palrle_indirect_args_buffer, None);
-            self.device
-                .free_memory(self.palrle_indirect_args_memory, None);
+            self.palrle_indirect_args_buf.destroy(&self.device);
 
             // palette_fold buffers
-            self.device
-                .unmap_memory(self.per_tile_frame_palette_id_memory);
-            self.device
-                .destroy_buffer(self.per_tile_frame_palette_id_buffer, None);
-            self.device
-                .free_memory(self.per_tile_frame_palette_id_memory, None);
+            self.per_tile_frame_palette_id.destroy(&self.device);
 
             // hash_table buffer (no persistent CPU mapping)
-            self.device.destroy_buffer(self.hash_table_buffer, None);
-            self.device.free_memory(self.hash_table_memory, None);
+            self.hash_table.destroy(&self.device);
 
-            self.device.unmap_memory(self.frame_palette_count_memory);
-            self.device
-                .destroy_buffer(self.frame_palette_count_buffer, None);
-            self.device
-                .free_memory(self.frame_palette_count_memory, None);
+            self.frame_palette_count.destroy(&self.device);
 
-            self.device.unmap_memory(self.frame_palette_set_memory);
-            self.device
-                .destroy_buffer(self.frame_palette_set_buffer, None);
-            self.device.free_memory(self.frame_palette_set_memory, None);
+            self.frame_palette_set.destroy(&self.device);
 
             self.device
                 .destroy_descriptor_pool(self.descriptor_pool, None);
@@ -760,10 +732,7 @@ impl Drop for GpuFrameProcessor {
             self.cdf53_compact.destroy(&self.device);
 
             // Cdf53 indirect-args buffer (Stage 4b)
-            self.device
-                .destroy_buffer(self.cdf53_dispatch_args_buffer, None);
-            self.device
-                .free_memory(self.cdf53_dispatch_args_memory, None);
+            self.cdf53_dispatch_args.destroy(&self.device);
 
             // Cdf53 indirect-args pipeline (Stage 4b)
             self.cdf53_indirect_args.destroy(&self.device);
@@ -776,17 +745,9 @@ impl Drop for GpuFrameProcessor {
                 .free_memory(self.cdf53_coefficients_memory, None);
 
             // M3.3c escalation buffers
-            self.device.unmap_memory(self.cdf53_escalation_list_memory);
-            self.device
-                .destroy_buffer(self.cdf53_escalation_list_buffer, None);
-            self.device
-                .free_memory(self.cdf53_escalation_list_memory, None);
+            self.cdf53_escalation_list.destroy(&self.device);
 
-            self.device.unmap_memory(self.cdf53_escalation_count_memory);
-            self.device
-                .destroy_buffer(self.cdf53_escalation_count_buffer, None);
-            self.device
-                .free_memory(self.cdf53_escalation_count_memory, None);
+            self.cdf53_escalation_count.destroy(&self.device);
 
             self.device
                 .unmap_memory(self.cdf53_escalation_coefficients_memory);
@@ -817,17 +778,13 @@ impl Drop for GpuFrameProcessor {
             self.palette_subset_fold.destroy(&self.device);
 
             // folded_into buffer
-            self.device.unmap_memory(self.folded_into_memory);
-            self.device.destroy_buffer(self.folded_into_buffer, None);
-            self.device.free_memory(self.folded_into_memory, None);
+            self.folded_into.destroy(&self.device);
 
             // pal_rle_index pipeline (Stage 3)
             self.pal_rle_index.destroy(&self.device);
 
             // index_buffer (Stage 3 output)
-            self.device.unmap_memory(self.index_buffer_memory);
-            self.device.destroy_buffer(self.index_buffer, None);
-            self.device.free_memory(self.index_buffer_memory, None);
+            self.index.destroy(&self.device);
 
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_device(None);

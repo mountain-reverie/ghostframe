@@ -333,15 +333,15 @@ impl GpuFrameProcessor {
                 nv12_y_stride,
                 nv12_uv_stride,
                 nv12_uv_offset,
-                tile_analysis: self.analysis_ptr as *const TileAnalysis,
+                tile_analysis: self.analysis_buf.ptr as *const TileAnalysis,
                 tile_analysis_len: cols * rows,
-                palrle_compact_list: self.palrle_compact_list_ptr as *const u32,
-                palrle_compact_count: *self.palrle_compact_count_ptr,
-                frame_palette_set: self.frame_palette_set_ptr as *const FramePaletteEntryRaw,
-                frame_palette_set_count: *self.frame_palette_count_ptr,
-                per_tile_frame_palette_id: self.per_tile_frame_palette_id_ptr as *const u8,
-                folded_into: self.folded_into_ptr as *const u32,
-                index_buffer: self.index_buffer_ptr as *const u8,
+                palrle_compact_list: self.palrle_compact_list.ptr as *const u32,
+                palrle_compact_count: *self.palrle_compact_count.ptr,
+                frame_palette_set: self.frame_palette_set.ptr as *const FramePaletteEntryRaw,
+                frame_palette_set_count: *self.frame_palette_count.ptr,
+                per_tile_frame_palette_id: self.per_tile_frame_palette_id.ptr as *const u8,
+                folded_into: self.folded_into.ptr as *const u32,
+                index_buffer: self.index.ptr as *const u8,
             });
         }
 
@@ -469,7 +469,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::SHADER_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.sad_buffer)
+                .buffer(self.sad_buf.buffer)
                 .offset(0)
                 .size(vk::WHOLE_SIZE),
             vk::BufferMemoryBarrier::default()
@@ -477,7 +477,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::SHADER_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.analysis_buffer)
+                .buffer(self.analysis_buf.buffer)
                 .offset(0)
                 .size(vk::WHOLE_SIZE),
         ];
@@ -493,7 +493,7 @@ impl GpuFrameProcessor {
 
         // Stage 1.5: zero compact_count, dispatch compact scan, dispatch indirect-args writer.
         self.device
-            .cmd_fill_buffer(cmd, self.palrle_compact_count_buffer, 0, 4, 0);
+            .cmd_fill_buffer(cmd, self.palrle_compact_count.buffer, 0, 4, 0);
 
         // Barrier: transfer-write → shader-read/write
         let buf_barrier_fill = vk::BufferMemoryBarrier::default()
@@ -501,7 +501,7 @@ impl GpuFrameProcessor {
             .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.palrle_compact_count_buffer)
+            .buffer(self.palrle_compact_count.buffer)
             .offset(0)
             .size(4);
         self.device.cmd_pipeline_barrier(
@@ -526,7 +526,7 @@ impl GpuFrameProcessor {
             .dst_access_mask(vk::AccessFlags::SHADER_READ)
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.palrle_compact_count_buffer)
+            .buffer(self.palrle_compact_count.buffer)
             .offset(0)
             .size(4);
         self.device.cmd_pipeline_barrier(
@@ -548,7 +548,7 @@ impl GpuFrameProcessor {
             .dst_access_mask(vk::AccessFlags::INDIRECT_COMMAND_READ | vk::AccessFlags::SHADER_READ)
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.palrle_indirect_args_buffer)
+            .buffer(self.palrle_indirect_args_buf.buffer)
             .offset(0)
             .size(12);
         self.device.cmd_pipeline_barrier(
@@ -617,7 +617,7 @@ impl GpuFrameProcessor {
             .dst_access_mask(vk::AccessFlags::INDIRECT_COMMAND_READ | vk::AccessFlags::SHADER_READ)
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.cdf53_dispatch_args_buffer)
+            .buffer(self.cdf53_dispatch_args.buffer)
             .offset(0)
             .size(12);
         // Barrier: compact_list + compact_count → HOST_READ (CPU readback after fence).
@@ -770,14 +770,14 @@ impl GpuFrameProcessor {
         //   per_tile_frame_palette_id (output, must start zero for atomicAnd/Or pattern)
         let pal_id_bytes = ((self.max_tiles + 3) & !3u32) as vk::DeviceSize;
         self.device
-            .cmd_fill_buffer(cmd, self.frame_palette_set_buffer, 0, 20480, 0);
+            .cmd_fill_buffer(cmd, self.frame_palette_set.buffer, 0, 20480, 0);
         self.device
-            .cmd_fill_buffer(cmd, self.frame_palette_count_buffer, 0, 4, 0);
+            .cmd_fill_buffer(cmd, self.frame_palette_count.buffer, 0, 4, 0);
         self.device
-            .cmd_fill_buffer(cmd, self.hash_table_buffer, 0, PALETTE_SLOT_U32_BYTES, 0);
+            .cmd_fill_buffer(cmd, self.hash_table.buffer, 0, PALETTE_SLOT_U32_BYTES, 0);
         self.device.cmd_fill_buffer(
             cmd,
-            self.per_tile_frame_palette_id_buffer,
+            self.per_tile_frame_palette_id.buffer,
             0,
             pal_id_bytes,
             0,
@@ -791,7 +791,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.frame_palette_set_buffer)
+                .buffer(self.frame_palette_set.buffer)
                 .offset(0)
                 .size(20480),
             vk::BufferMemoryBarrier::default()
@@ -799,7 +799,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.frame_palette_count_buffer)
+                .buffer(self.frame_palette_count.buffer)
                 .offset(0)
                 .size(4),
             vk::BufferMemoryBarrier::default()
@@ -807,7 +807,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.hash_table_buffer)
+                .buffer(self.hash_table.buffer)
                 .offset(0)
                 .size(PALETTE_SLOT_U32_BYTES),
             vk::BufferMemoryBarrier::default()
@@ -815,7 +815,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.per_tile_frame_palette_id_buffer)
+                .buffer(self.per_tile_frame_palette_id.buffer)
                 .offset(0)
                 .size(pal_id_bytes),
             vk::BufferMemoryBarrier::default()
@@ -823,7 +823,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::SHADER_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.palrle_compact_list_buffer)
+                .buffer(self.palrle_compact_list.buffer)
                 .offset(0)
                 .size(vk::WHOLE_SIZE),
         ];
@@ -847,7 +847,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::SHADER_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.frame_palette_set_buffer)
+                .buffer(self.frame_palette_set.buffer)
                 .offset(0)
                 .size(vk::WHOLE_SIZE),
             vk::BufferMemoryBarrier::default()
@@ -855,7 +855,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::SHADER_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.frame_palette_count_buffer)
+                .buffer(self.frame_palette_count.buffer)
                 .offset(0)
                 .size(4),
             vk::BufferMemoryBarrier::default()
@@ -863,7 +863,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::SHADER_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.per_tile_frame_palette_id_buffer)
+                .buffer(self.per_tile_frame_palette_id.buffer)
                 .offset(0)
                 .size(pal_id_bytes),
         ];
@@ -889,7 +889,7 @@ impl GpuFrameProcessor {
             .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.folded_into_buffer)
+            .buffer(self.folded_into.buffer)
             .offset(0)
             .size(PALETTE_SLOT_U32_BYTES);
         self.device.cmd_pipeline_barrier(
@@ -913,7 +913,7 @@ impl GpuFrameProcessor {
             .dst_access_mask(vk::AccessFlags::SHADER_READ)
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.folded_into_buffer)
+            .buffer(self.folded_into.buffer)
             .offset(0)
             .size(PALETTE_SLOT_U32_BYTES);
         self.device.cmd_pipeline_barrier(
@@ -1045,7 +1045,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::HOST_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.sad_buffer)
+                .buffer(self.sad_buf.buffer)
                 .offset(0)
                 .size(vk::WHOLE_SIZE),
             vk::BufferMemoryBarrier::default()
@@ -1061,7 +1061,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::HOST_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.analysis_buffer)
+                .buffer(self.analysis_buf.buffer)
                 .offset(0)
                 .size(vk::WHOLE_SIZE),
             vk::BufferMemoryBarrier::default()
@@ -1069,7 +1069,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::HOST_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.palrle_compact_list_buffer)
+                .buffer(self.palrle_compact_list.buffer)
                 .offset(0)
                 .size(vk::WHOLE_SIZE),
             vk::BufferMemoryBarrier::default()
@@ -1077,7 +1077,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::HOST_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.palrle_compact_count_buffer)
+                .buffer(self.palrle_compact_count.buffer)
                 .offset(0)
                 .size(vk::WHOLE_SIZE),
             // Stage 2a outputs
@@ -1086,7 +1086,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::HOST_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.frame_palette_set_buffer)
+                .buffer(self.frame_palette_set.buffer)
                 .offset(0)
                 .size(vk::WHOLE_SIZE),
             vk::BufferMemoryBarrier::default()
@@ -1094,7 +1094,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::HOST_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.frame_palette_count_buffer)
+                .buffer(self.frame_palette_count.buffer)
                 .offset(0)
                 .size(4),
             vk::BufferMemoryBarrier::default()
@@ -1102,7 +1102,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::HOST_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.per_tile_frame_palette_id_buffer)
+                .buffer(self.per_tile_frame_palette_id.buffer)
                 .offset(0)
                 .size(pal_id_bytes),
             // Stage 2b output
@@ -1111,7 +1111,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::HOST_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.folded_into_buffer)
+                .buffer(self.folded_into.buffer)
                 .offset(0)
                 .size(PALETTE_SLOT_U32_BYTES),
             // Stage 3 output
@@ -1120,7 +1120,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::HOST_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.index_buffer)
+                .buffer(self.index.buffer)
                 .offset(0)
                 .size(vk::WHOLE_SIZE),
         ];
@@ -1149,7 +1149,7 @@ impl GpuFrameProcessor {
             .wait_for_fences(&[fence_guard.fence], true, u64::MAX)?;
 
         // 7. Read SAD values
-        let sad_slice = std::slice::from_raw_parts(self.sad_ptr, tile_count as usize);
+        let sad_slice = std::slice::from_raw_parts(self.sad_buf.ptr, tile_count as usize);
         let dirty: Vec<u32> = (0..tile_count)
             .filter(|&i| sad_slice[i as usize] > SAD_THRESHOLD)
             .collect();
@@ -1236,15 +1236,15 @@ impl GpuFrameProcessor {
             nv12_y_stride,
             nv12_uv_stride,
             nv12_uv_offset,
-            tile_analysis: self.analysis_ptr as *const TileAnalysis,
+            tile_analysis: self.analysis_buf.ptr as *const TileAnalysis,
             tile_analysis_len: cols * rows,
-            palrle_compact_list: self.palrle_compact_list_ptr as *const u32,
-            palrle_compact_count: *self.palrle_compact_count_ptr,
-            frame_palette_set: self.frame_palette_set_ptr as *const FramePaletteEntryRaw,
-            frame_palette_set_count: *self.frame_palette_count_ptr,
-            per_tile_frame_palette_id: self.per_tile_frame_palette_id_ptr as *const u8,
-            folded_into: self.folded_into_ptr as *const u32,
-            index_buffer: self.index_buffer_ptr as *const u8,
+            palrle_compact_list: self.palrle_compact_list.ptr as *const u32,
+            palrle_compact_count: *self.palrle_compact_count.ptr,
+            frame_palette_set: self.frame_palette_set.ptr as *const FramePaletteEntryRaw,
+            frame_palette_set_count: *self.frame_palette_count.ptr,
+            per_tile_frame_palette_id: self.per_tile_frame_palette_id.ptr as *const u8,
+            folded_into: self.folded_into.ptr as *const u32,
+            index_buffer: self.index.ptr as *const u8,
         })
     }
 
@@ -1350,7 +1350,7 @@ impl GpuFrameProcessor {
 
         // Analysis dispatch. No barrier needed vs NV12 — both read `current`
         // read-only (read-after-read is hazard-free) and write to disjoint
-        // buffers (`nv12_buffer` vs `self.analysis_buffer`). The
+        // buffers (`nv12_buffer` vs `self.analysis_buf.buffer`). The
         // COMPUTE→HOST buffer barrier below covers both writes. This mirrors
         // the subsequent-frames branch comment at the SAD/NV12/Analysis
         // dispatch trio.
@@ -1368,7 +1368,7 @@ impl GpuFrameProcessor {
         // 0xFFFFFFFF > 64 is always TRUE).
         // ============================================================
         self.device
-            .cmd_fill_buffer(cmd, self.sad_buffer, 0, vk::WHOLE_SIZE, 0xFFFF_FFFFu32);
+            .cmd_fill_buffer(cmd, self.sad_buf.buffer, 0, vk::WHOLE_SIZE, 0xFFFF_FFFFu32);
 
         // Inter-dispatch barrier: analysis write + sad pre-fill must be
         // visible to Stage 1.5a reads.
@@ -1380,7 +1380,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::SHADER_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.sad_buffer)
+                .buffer(self.sad_buf.buffer)
                 .offset(0)
                 .size(vk::WHOLE_SIZE),
             vk::BufferMemoryBarrier::default()
@@ -1388,7 +1388,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::SHADER_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.analysis_buffer)
+                .buffer(self.analysis_buf.buffer)
                 .offset(0)
                 .size(vk::WHOLE_SIZE),
         ];
@@ -1404,7 +1404,7 @@ impl GpuFrameProcessor {
 
         // Stage 1.5: zero compact_count, dispatch compact scan, dispatch indirect-args writer.
         self.device
-            .cmd_fill_buffer(cmd, self.palrle_compact_count_buffer, 0, 4, 0);
+            .cmd_fill_buffer(cmd, self.palrle_compact_count.buffer, 0, 4, 0);
 
         // Barrier: transfer-write → shader-read/write
         let buf_barrier_fill = vk::BufferMemoryBarrier::default()
@@ -1412,7 +1412,7 @@ impl GpuFrameProcessor {
             .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.palrle_compact_count_buffer)
+            .buffer(self.palrle_compact_count.buffer)
             .offset(0)
             .size(4);
         self.device.cmd_pipeline_barrier(
@@ -1437,7 +1437,7 @@ impl GpuFrameProcessor {
             .dst_access_mask(vk::AccessFlags::SHADER_READ)
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.palrle_compact_count_buffer)
+            .buffer(self.palrle_compact_count.buffer)
             .offset(0)
             .size(4);
         self.device.cmd_pipeline_barrier(
@@ -1459,7 +1459,7 @@ impl GpuFrameProcessor {
             .dst_access_mask(vk::AccessFlags::INDIRECT_COMMAND_READ | vk::AccessFlags::SHADER_READ)
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.palrle_indirect_args_buffer)
+            .buffer(self.palrle_indirect_args_buf.buffer)
             .offset(0)
             .size(12);
         self.device.cmd_pipeline_barrier(
@@ -1526,7 +1526,7 @@ impl GpuFrameProcessor {
             .dst_access_mask(vk::AccessFlags::INDIRECT_COMMAND_READ | vk::AccessFlags::SHADER_READ)
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.cdf53_dispatch_args_buffer)
+            .buffer(self.cdf53_dispatch_args.buffer)
             .offset(0)
             .size(12);
         // Barrier: compact_list + compact_count → HOST_READ (CPU readback after fence).
@@ -1672,14 +1672,14 @@ impl GpuFrameProcessor {
         // ============================================================
         let pal_id_bytes = ((self.max_tiles + 3) & !3u32) as vk::DeviceSize;
         self.device
-            .cmd_fill_buffer(cmd, self.frame_palette_set_buffer, 0, 20480, 0);
+            .cmd_fill_buffer(cmd, self.frame_palette_set.buffer, 0, 20480, 0);
         self.device
-            .cmd_fill_buffer(cmd, self.frame_palette_count_buffer, 0, 4, 0);
+            .cmd_fill_buffer(cmd, self.frame_palette_count.buffer, 0, 4, 0);
         self.device
-            .cmd_fill_buffer(cmd, self.hash_table_buffer, 0, PALETTE_SLOT_U32_BYTES, 0);
+            .cmd_fill_buffer(cmd, self.hash_table.buffer, 0, PALETTE_SLOT_U32_BYTES, 0);
         self.device.cmd_fill_buffer(
             cmd,
-            self.per_tile_frame_palette_id_buffer,
+            self.per_tile_frame_palette_id.buffer,
             0,
             pal_id_bytes,
             0,
@@ -1692,7 +1692,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.frame_palette_set_buffer)
+                .buffer(self.frame_palette_set.buffer)
                 .offset(0)
                 .size(20480),
             vk::BufferMemoryBarrier::default()
@@ -1700,7 +1700,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.frame_palette_count_buffer)
+                .buffer(self.frame_palette_count.buffer)
                 .offset(0)
                 .size(4),
             vk::BufferMemoryBarrier::default()
@@ -1708,7 +1708,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.hash_table_buffer)
+                .buffer(self.hash_table.buffer)
                 .offset(0)
                 .size(PALETTE_SLOT_U32_BYTES),
             vk::BufferMemoryBarrier::default()
@@ -1716,7 +1716,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.per_tile_frame_palette_id_buffer)
+                .buffer(self.per_tile_frame_palette_id.buffer)
                 .offset(0)
                 .size(pal_id_bytes),
             vk::BufferMemoryBarrier::default()
@@ -1724,7 +1724,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::SHADER_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.palrle_compact_list_buffer)
+                .buffer(self.palrle_compact_list.buffer)
                 .offset(0)
                 .size(vk::WHOLE_SIZE),
         ];
@@ -1748,7 +1748,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::SHADER_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.frame_palette_set_buffer)
+                .buffer(self.frame_palette_set.buffer)
                 .offset(0)
                 .size(vk::WHOLE_SIZE),
             vk::BufferMemoryBarrier::default()
@@ -1756,7 +1756,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::SHADER_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.frame_palette_count_buffer)
+                .buffer(self.frame_palette_count.buffer)
                 .offset(0)
                 .size(4),
             vk::BufferMemoryBarrier::default()
@@ -1764,7 +1764,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::SHADER_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.per_tile_frame_palette_id_buffer)
+                .buffer(self.per_tile_frame_palette_id.buffer)
                 .offset(0)
                 .size(pal_id_bytes),
         ];
@@ -1790,7 +1790,7 @@ impl GpuFrameProcessor {
             .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.folded_into_buffer)
+            .buffer(self.folded_into.buffer)
             .offset(0)
             .size(PALETTE_SLOT_U32_BYTES);
         self.device.cmd_pipeline_barrier(
@@ -1814,7 +1814,7 @@ impl GpuFrameProcessor {
             .dst_access_mask(vk::AccessFlags::SHADER_READ)
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.folded_into_buffer)
+            .buffer(self.folded_into.buffer)
             .offset(0)
             .size(PALETTE_SLOT_U32_BYTES);
         self.device.cmd_pipeline_barrier(
@@ -1937,7 +1937,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::HOST_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.sad_buffer)
+                .buffer(self.sad_buf.buffer)
                 .offset(0)
                 .size(vk::WHOLE_SIZE),
             vk::BufferMemoryBarrier::default()
@@ -1953,7 +1953,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::HOST_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.analysis_buffer)
+                .buffer(self.analysis_buf.buffer)
                 .offset(0)
                 .size(vk::WHOLE_SIZE),
             vk::BufferMemoryBarrier::default()
@@ -1961,7 +1961,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::HOST_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.palrle_compact_list_buffer)
+                .buffer(self.palrle_compact_list.buffer)
                 .offset(0)
                 .size(vk::WHOLE_SIZE),
             vk::BufferMemoryBarrier::default()
@@ -1969,7 +1969,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::HOST_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.palrle_compact_count_buffer)
+                .buffer(self.palrle_compact_count.buffer)
                 .offset(0)
                 .size(vk::WHOLE_SIZE),
             // Stage 2a outputs
@@ -1978,7 +1978,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::HOST_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.frame_palette_set_buffer)
+                .buffer(self.frame_palette_set.buffer)
                 .offset(0)
                 .size(vk::WHOLE_SIZE),
             vk::BufferMemoryBarrier::default()
@@ -1986,7 +1986,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::HOST_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.frame_palette_count_buffer)
+                .buffer(self.frame_palette_count.buffer)
                 .offset(0)
                 .size(4),
             vk::BufferMemoryBarrier::default()
@@ -1994,7 +1994,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::HOST_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.per_tile_frame_palette_id_buffer)
+                .buffer(self.per_tile_frame_palette_id.buffer)
                 .offset(0)
                 .size(pal_id_bytes),
             // Stage 2b output
@@ -2003,7 +2003,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::HOST_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.folded_into_buffer)
+                .buffer(self.folded_into.buffer)
                 .offset(0)
                 .size(PALETTE_SLOT_U32_BYTES),
             // Stage 3 output
@@ -2012,7 +2012,7 @@ impl GpuFrameProcessor {
                 .dst_access_mask(vk::AccessFlags::HOST_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.index_buffer)
+                .buffer(self.index.buffer)
                 .offset(0)
                 .size(vk::WHOLE_SIZE),
         ];
@@ -2448,7 +2448,7 @@ impl GpuFrameProcessor {
             .image_view(prev_view)
             .image_layout(vk::ImageLayout::GENERAL)];
         let sad_buffer_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.sad_buffer)
+            .buffer(self.sad_buf.buffer)
             .offset(0)
             .range(vk::WHOLE_SIZE)];
         let sad_writes = [
@@ -2638,7 +2638,7 @@ impl GpuFrameProcessor {
             .image_view(current_view)
             .image_layout(vk::ImageLayout::GENERAL)];
         let analysis_buffer_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.analysis_buffer)
+            .buffer(self.analysis_buf.buffer)
             .offset(0)
             .range(vk::WHOLE_SIZE)];
         let analysis_writes = [
@@ -2730,19 +2730,19 @@ impl GpuFrameProcessor {
         //   binding 2 — palrle_compact_list_buffer (write)
         //   binding 3 — palrle_compact_count_buffer (atomic write)
         let palrle_compact_sad_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.sad_buffer)
+            .buffer(self.sad_buf.buffer)
             .offset(0)
             .range(vk::WHOLE_SIZE)];
         let palrle_compact_analysis_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.analysis_buffer)
+            .buffer(self.analysis_buf.buffer)
             .offset(0)
             .range(vk::WHOLE_SIZE)];
         let palrle_compact_list_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.palrle_compact_list_buffer)
+            .buffer(self.palrle_compact_list.buffer)
             .offset(0)
             .range(vk::WHOLE_SIZE)];
         let palrle_compact_count_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.palrle_compact_count_buffer)
+            .buffer(self.palrle_compact_count.buffer)
             .offset(0)
             .range(vk::WHOLE_SIZE)];
         let palrle_compact_writes = [
@@ -2833,11 +2833,11 @@ impl GpuFrameProcessor {
         //   binding 2 — cdf53_compact_list_buffer     (write)
         //   binding 3 — cdf53_compact_count_buffer    (atomic write)
         let cdf53_sad_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.sad_buffer)
+            .buffer(self.sad_buf.buffer)
             .offset(0)
             .range(vk::WHOLE_SIZE)];
         let cdf53_analysis_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.analysis_buffer)
+            .buffer(self.analysis_buf.buffer)
             .offset(0)
             .range(vk::WHOLE_SIZE)];
         let cdf53_list_info = [vk::DescriptorBufferInfo::default()
@@ -2946,11 +2946,11 @@ impl GpuFrameProcessor {
         //   binding 0 — palrle_compact_count_buffer  (read)
         //   binding 1 — palrle_indirect_args_buffer  (write)
         let palrle_indirect_count_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.palrle_compact_count_buffer)
+            .buffer(self.palrle_compact_count.buffer)
             .offset(0)
             .range(vk::WHOLE_SIZE)];
         let palrle_indirect_args_buf_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.palrle_indirect_args_buffer)
+            .buffer(self.palrle_indirect_args_buf.buffer)
             .offset(0)
             .range(vk::WHOLE_SIZE)];
         let palrle_indirect_args_writes = [
@@ -3027,7 +3027,7 @@ impl GpuFrameProcessor {
             .offset(0)
             .range(vk::WHOLE_SIZE)];
         let args_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.cdf53_dispatch_args_buffer)
+            .buffer(self.cdf53_dispatch_args.buffer)
             .offset(0)
             .range(vk::WHOLE_SIZE)];
         let writes = [
@@ -3072,7 +3072,7 @@ impl GpuFrameProcessor {
     /// No push constants.
     ///
     /// Uses `cmd_dispatch_indirect` reading from
-    /// `self.palrle_indirect_args_buffer` at offset 0 (the workgroup
+    /// `self.palrle_indirect_args_buf.buffer` at offset 0 (the workgroup
     /// count is determined at runtime by the palrle_indirect_args stage,
     /// not at record time — there is no fixed `(x, y, z)` tuple).
     ///
@@ -3119,27 +3119,27 @@ impl GpuFrameProcessor {
         //   binding 4 — hash_table_buffer            (read/write scratch)
         //   binding 5 — per_tile_frame_palette_id_buffer (write)
         let palette_fold_analysis_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.analysis_buffer)
+            .buffer(self.analysis_buf.buffer)
             .offset(0)
             .range(vk::WHOLE_SIZE)];
         let palette_fold_compact_list_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.palrle_compact_list_buffer)
+            .buffer(self.palrle_compact_list.buffer)
             .offset(0)
             .range(vk::WHOLE_SIZE)];
         let palette_fold_set_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.frame_palette_set_buffer)
+            .buffer(self.frame_palette_set.buffer)
             .offset(0)
             .range(vk::WHOLE_SIZE)];
         let palette_fold_count_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.frame_palette_count_buffer)
+            .buffer(self.frame_palette_count.buffer)
             .offset(0)
             .range(vk::WHOLE_SIZE)];
         let palette_fold_hash_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.hash_table_buffer)
+            .buffer(self.hash_table.buffer)
             .offset(0)
             .range(vk::WHOLE_SIZE)];
         let palette_fold_per_tile_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.per_tile_frame_palette_id_buffer)
+            .buffer(self.per_tile_frame_palette_id.buffer)
             .offset(0)
             .range(vk::WHOLE_SIZE)];
         let palette_fold_writes = [
@@ -3194,7 +3194,7 @@ impl GpuFrameProcessor {
         // palrle_indirect_args_buffer already barriered for INDIRECT_COMMAND_READ
         // by the Stage 1.5b barrier in the orchestrator.
         self.device
-            .cmd_dispatch_indirect(cmd, self.palrle_indirect_args_buffer, 0);
+            .cmd_dispatch_indirect(cmd, self.palrle_indirect_args_buf.buffer, 0);
 
         Ok(guard)
     }
@@ -3241,7 +3241,7 @@ impl GpuFrameProcessor {
         // Write the single palette_subset_fold_init descriptor (STORAGE_BUFFER):
         //   binding 0 — folded_into_buffer (write)
         let palette_subset_fold_init_folded_into_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.folded_into_buffer)
+            .buffer(self.folded_into.buffer)
             .offset(0)
             .range(vk::WHOLE_SIZE)];
         let palette_subset_fold_init_writes = [vk::WriteDescriptorSet::default()
@@ -3312,11 +3312,11 @@ impl GpuFrameProcessor {
         //   binding 0 — frame_palette_set_buffer (read-only)
         //   binding 1 — folded_into_buffer (read-write)
         let subset_fold_set_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.frame_palette_set_buffer)
+            .buffer(self.frame_palette_set.buffer)
             .offset(0)
             .range(vk::WHOLE_SIZE)];
         let subset_fold_folded_into_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.folded_into_buffer)
+            .buffer(self.folded_into.buffer)
             .offset(0)
             .range(vk::WHOLE_SIZE)];
         let subset_fold_writes = [
@@ -3363,7 +3363,7 @@ impl GpuFrameProcessor {
     /// index_buffer (5, r/w). Push constants `[cols]` (4 bytes).
     ///
     /// Uses `cmd_dispatch_indirect` against
-    /// `self.palrle_indirect_args_buffer` at offset 0 — the workgroup count
+    /// `self.palrle_indirect_args_buf.buffer` at offset 0 — the workgroup count
     /// was computed at runtime by the preceding palrle_indirect_args stage.
     ///
     /// Caller must invoke `cmd_pipeline_barrier` AFTER this call so the
@@ -3409,23 +3409,23 @@ impl GpuFrameProcessor {
             .image_view(current_view)
             .image_layout(vk::ImageLayout::GENERAL)];
         let pal_rle_index_compact_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.palrle_compact_list_buffer)
+            .buffer(self.palrle_compact_list.buffer)
             .offset(0)
             .range(vk::WHOLE_SIZE)];
         let pal_rle_index_fps_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.frame_palette_set_buffer)
+            .buffer(self.frame_palette_set.buffer)
             .offset(0)
             .range(vk::WHOLE_SIZE)];
         let pal_rle_index_ptfpi_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.per_tile_frame_palette_id_buffer)
+            .buffer(self.per_tile_frame_palette_id.buffer)
             .offset(0)
             .range(vk::WHOLE_SIZE)];
         let pal_rle_index_folded_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.folded_into_buffer)
+            .buffer(self.folded_into.buffer)
             .offset(0)
             .range(vk::WHOLE_SIZE)];
         let pal_rle_index_out_info = [vk::DescriptorBufferInfo::default()
-            .buffer(self.index_buffer)
+            .buffer(self.index.buffer)
             .offset(0)
             .range(vk::WHOLE_SIZE)];
         let pal_rle_index_writes = [
@@ -3491,7 +3491,7 @@ impl GpuFrameProcessor {
         // palrle_indirect_args_buffer already barriered for INDIRECT_COMMAND_READ
         // by the preceding palrle_indirect_args stage barrier in the orchestrator.
         self.device
-            .cmd_dispatch_indirect(cmd, self.palrle_indirect_args_buffer, 0);
+            .cmd_dispatch_indirect(cmd, self.palrle_indirect_args_buf.buffer, 0);
 
         Ok(guard)
     }
@@ -3588,7 +3588,7 @@ impl GpuFrameProcessor {
         // cdf53_dispatch_args_buffer already barriered for INDIRECT_COMMAND_READ
         // by the preceding cdf53_indirect_args stage barrier in the orchestrator.
         self.device
-            .cmd_dispatch_indirect(cmd, self.cdf53_dispatch_args_buffer, 0);
+            .cmd_dispatch_indirect(cmd, self.cdf53_dispatch_args.buffer, 0);
 
         Ok(guard)
     }
@@ -3683,7 +3683,7 @@ impl GpuFrameProcessor {
         let skip_l2 = false;
         if !skip_l2 {
             self.device
-                .cmd_dispatch_indirect(cmd, self.cdf53_dispatch_args_buffer, 0);
+                .cmd_dispatch_indirect(cmd, self.cdf53_dispatch_args.buffer, 0);
         }
 
         Ok(guard)
@@ -3780,7 +3780,7 @@ impl GpuFrameProcessor {
         let skip_l3 = false;
         if !skip_l3 {
             self.device
-                .cmd_dispatch_indirect(cmd, self.cdf53_dispatch_args_buffer, 0);
+                .cmd_dispatch_indirect(cmd, self.cdf53_dispatch_args.buffer, 0);
         }
 
         Ok(guard)
@@ -3840,7 +3840,7 @@ impl GpuFrameProcessor {
             .image_view(current_view)
             .image_layout(vk::ImageLayout::GENERAL)];
         let esc_list_info_l1 = [vk::DescriptorBufferInfo::default()
-            .buffer(self.cdf53_escalation_list_buffer)
+            .buffer(self.cdf53_escalation_list.buffer)
             .offset(0)
             .range(vk::WHOLE_SIZE)];
         let esc_coeff_info_l1 = [vk::DescriptorBufferInfo::default()
@@ -3929,7 +3929,7 @@ impl GpuFrameProcessor {
         let ds_l2 = l2_guard.sets[0];
 
         let esc_list_info_l2 = [vk::DescriptorBufferInfo::default()
-            .buffer(self.cdf53_escalation_list_buffer)
+            .buffer(self.cdf53_escalation_list.buffer)
             .offset(0)
             .range(vk::WHOLE_SIZE)];
         let esc_coeff_info_l2 = [vk::DescriptorBufferInfo::default()
@@ -4008,7 +4008,7 @@ impl GpuFrameProcessor {
         let ds_l3 = l3_guard.sets[0];
 
         let esc_list_info_l3 = [vk::DescriptorBufferInfo::default()
-            .buffer(self.cdf53_escalation_list_buffer)
+            .buffer(self.cdf53_escalation_list.buffer)
             .offset(0)
             .range(vk::WHOLE_SIZE)];
         let esc_coeff_info_l3 = [vk::DescriptorBufferInfo::default()
