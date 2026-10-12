@@ -21,14 +21,14 @@ Status at 2026-10-11.
 
 | WS | Branch | Findings | PR | State |
 |---|---|---|---|---|
-| A1 | `security/session-gating` | P0-1, P0-2, transport SEC-M/L | #129 | in-review; endpoint slab leak, slot-holding, PalRLE count clamp recorded as not fixed |
+| A1 | `security/session-gating` | P0-1, P0-2, transport SEC-M/L | #129 | merged; endpoint slab leak, slot-holding, PalRLE count clamp recorded as not fixed |
 | A2 | `security/client-core-hardening` | P0-3, P0-4, client-core SEC-M | #120 | merged |
-| A3 | `hardening/ffi-xdaemon-cli` | P0-5, xdaemon/cli availability + quality | #126 | in-review |
+| A3 | `hardening/ffi-xdaemon-cli` | P0-5, xdaemon/cli availability + quality | #126 | merged |
 | A4 | `capi/contracts` | P0-6, P0-7, capi F4–F11 | #119 | merged |
-| A5 | `perf/native-client` | native PC-1, PC-M1/M3–M7/M9–M11, Q-M10, published-frame leak | #122 | in-review, blocked: the pushed branch has merge commits; a linear rebuild exists locally (`a5-linear`) and awaits a push. PC-4, PC-M8, Q-M7 delivery deferred |
-| A6 | `web/constants` → `web/demolition` → `web/perf` | R-1, R-2, Q-H1–H3, web PC-1, PC-3 | #121 (constants), #127 (demolition) | constants merged; demolition in-review; perf local, waits on #122's shaders |
+| A5 | `perf/native-client` | native PC-1, PC-M1/M3–M7/M9–M11, Q-M10, published-frame leak | #122 | merged; PC-4, PC-M8, Q-M7 delivery deferred |
+| A6 | `web/constants` → `web/demolition` → `web/perf` | R-1, R-2, Q-H1–H3, web PC-1, PC-3 | #121 (constants), #127 (demolition), #131 (perf) | constants and demolition merged; perf in-review |
 | A7 | `config/lib-plumbing` | R-3, Q-M4 | #123 | merged |
-| A8 | `harness/burst-loss-and-scenes` | protocol §5 instruments | #128 | in-review; §5.3 competitive baseline dropped (optional) |
+| A8 | `harness/burst-loss-and-scenes` | protocol §5 instruments | #128 | merged; §5.3 competitive baseline dropped (optional) |
 | A9 | `crypto/pqc-provider` | protocol §4.1, SEC-L5 | #124 | merged; Chrome's hashed-WebTransport path stays classical |
 
 ## Found during Wave A, scheduled later
@@ -47,6 +47,10 @@ Status at 2026-10-11.
 | Scenes: estimate never follows a 5→15 Mbit step; settles at 0.37 of a 10 Mbit drop-tail link | PR #128 | WS-D1 entry evidence |
 | Scroll scene: H.264 on 99 % of frames while scrolling, exact 9.4 s after (n=1) | PR #128 | WS-D2 entry evidence |
 | Idle-gap scene is not wire-idle (retransmit drain), so it does not isolate slow-start-after-idle | PR #128 | WS-D1 step 1 |
+| Web renderer paints in fixed codec order with no `frame_seq` in its queues: two frames in one rAF can leave an older Solid/H.264 draw over a newer CDF53 tile | PR #131 review | WS-C7 `web/render-queue-frame-seq` |
+| Web dimension clamp rejects 8K (32 400 tiles > 65 535-workgroup L1 dispatch needs chunking) | PR #131 | unscheduled |
+| `HELLO_DEADLINE` is 20 s armed at accept; arming at session-ready would allow a short one | PR #129 | owner decision; candidate for WS-B1 |
+| quinn endpoint slab entry leaks for connections removed before `Drained`; PalRLE GPU counts unclamped; connect/HELLO/close loop not rate-limited | PR #129 review | unscheduled |
 
 ## Waves B–D
 
