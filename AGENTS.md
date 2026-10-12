@@ -11,7 +11,7 @@ command.
 
 ```bash
 just build-release      # build-web THEN cargo build --release -- the order matters
-just ci-local           # the real gate: fmt, clippy --workspace --all-targets,
+just ci-local           # the real gate: fmt, env-read guard, clippy --workspace --all-targets,
                         # unit tests, web build, tsc, release build,
                         # cbindgen header diff, go vet
 just lint               # clippy --workspace --all-targets -- -D warnings

@@ -109,6 +109,8 @@ test-client-gles:
 ci-client: build-client
     @echo "=== fmt-check ==="
     just fmt-check
+    @echo "=== env reads only in config.rs ==="
+    ci/check-env-reads.sh
     @echo "=== clippy + unit tests (native client) ==="
     just test-client
     @echo "=== cbindgen header up-to-date ==="
@@ -193,6 +195,8 @@ fmt:
 ci-local:
     @echo "=== fmt-check ==="
     just fmt-check
+    @echo "=== env reads only in config.rs ==="
+    ci/check-env-reads.sh
     @echo "=== clippy ==="
     cargo clippy --workspace --all-targets -- -D warnings
     @echo "=== unit tests ==="
