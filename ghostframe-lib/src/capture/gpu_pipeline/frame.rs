@@ -14,6 +14,23 @@ use std::io;
 use super::super::pipeline_builder::{alloc_host_buffer_mapped, find_memory_type};
 use super::*;
 
+/// Build a whole-queue-family-ignoring [`vk::BufferMemoryBarrier`] at offset 0.
+fn buf_barrier(
+    buffer: vk::Buffer,
+    src_access: vk::AccessFlags,
+    dst_access: vk::AccessFlags,
+    size: vk::DeviceSize,
+) -> vk::BufferMemoryBarrier<'static> {
+    vk::BufferMemoryBarrier::default()
+        .src_access_mask(src_access)
+        .dst_access_mask(dst_access)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .buffer(buffer)
+        .offset(0)
+        .size(size)
+}
+
 // ---------------------------------------------------------------------------
 // RAII guards for per-frame transient Vulkan resources
 // ---------------------------------------------------------------------------
@@ -485,22 +502,18 @@ impl GpuFrameProcessor {
 
         // Inter-dispatch barrier: SAD + tile_analysis writes must be visible to Stage 1.5a reads.
         let buf_barrier_inputs = [
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.sad_buf.buffer)
-                .offset(0)
-                .size(vk::WHOLE_SIZE),
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.analysis_buf.buffer)
-                .offset(0)
-                .size(vk::WHOLE_SIZE),
+            buf_barrier(
+                self.sad_buf.buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::SHADER_READ,
+                vk::WHOLE_SIZE,
+            ),
+            buf_barrier(
+                self.analysis_buf.buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::SHADER_READ,
+                vk::WHOLE_SIZE,
+            ),
         ];
         self.device.cmd_pipeline_barrier(
             cmd,
@@ -517,14 +530,12 @@ impl GpuFrameProcessor {
             .cmd_fill_buffer(cmd, self.palrle_compact_count.buffer, 0, 4, 0);
 
         // Barrier: transfer-write → shader-read/write
-        let buf_barrier_fill = vk::BufferMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.palrle_compact_count.buffer)
-            .offset(0)
-            .size(4);
+        let buf_barrier_fill = buf_barrier(
+            self.palrle_compact_count.buffer,
+            vk::AccessFlags::TRANSFER_WRITE,
+            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+            4,
+        );
         self.device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::TRANSFER,
@@ -542,14 +553,12 @@ impl GpuFrameProcessor {
             self.run_palrle_compact_stage(cmd, &palrle_compact_push, (cols * rows, 1, 1))?;
 
         // Barrier between Stage 1.5a and 1.5b: shader write → shader read on count.
-        let buf_barrier_count = vk::BufferMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.palrle_compact_count.buffer)
-            .offset(0)
-            .size(4);
+        let buf_barrier_count = buf_barrier(
+            self.palrle_compact_count.buffer,
+            vk::AccessFlags::SHADER_WRITE,
+            vk::AccessFlags::SHADER_READ,
+            4,
+        );
         self.device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -564,14 +573,12 @@ impl GpuFrameProcessor {
         let palrle_indirect_args_ds_guard = self.run_palrle_indirect_args_stage(cmd)?;
 
         // Barrier for future stages (Task 11+) to consume indirect args.
-        let buf_barrier_args = vk::BufferMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::INDIRECT_COMMAND_READ | vk::AccessFlags::SHADER_READ)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.palrle_indirect_args_buf.buffer)
-            .offset(0)
-            .size(12);
+        let buf_barrier_args = buf_barrier(
+            self.palrle_indirect_args_buf.buffer,
+            vk::AccessFlags::SHADER_WRITE,
+            vk::AccessFlags::INDIRECT_COMMAND_READ | vk::AccessFlags::SHADER_READ,
+            12,
+        );
         self.device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -588,14 +595,12 @@ impl GpuFrameProcessor {
         // buf_barrier_inputs above); writes cdf53_compact_list + count.
         self.device
             .cmd_fill_buffer(cmd, self.cdf53_compact_count_buffer, 0, 4, 0);
-        let buf_barrier_cdf53_fill = vk::BufferMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.cdf53_compact_count_buffer)
-            .offset(0)
-            .size(4);
+        let buf_barrier_cdf53_fill = buf_barrier(
+            self.cdf53_compact_count_buffer,
+            vk::AccessFlags::TRANSFER_WRITE,
+            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+            4,
+        );
         self.device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::TRANSFER,
@@ -610,14 +615,12 @@ impl GpuFrameProcessor {
         let cdf53_compact_ds_guard =
             self.run_cdf53_compact_stage(cmd, &cdf53_compact_push, (cols * rows, 1, 1))?;
         // Barrier between Stage 4a and 4b: shader write → shader read on count.
-        let buf_barrier_cdf53_count = vk::BufferMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.cdf53_compact_count_buffer)
-            .offset(0)
-            .size(4);
+        let buf_barrier_cdf53_count = buf_barrier(
+            self.cdf53_compact_count_buffer,
+            vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
+            vk::AccessFlags::SHADER_READ,
+            4,
+        );
         self.device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
@@ -633,31 +636,25 @@ impl GpuFrameProcessor {
 
         // Barrier: dispatch_args SHADER_WRITE → INDIRECT_COMMAND_READ | SHADER_READ
         // for Stage 4c (cdf53_forward, Task 7) via vkCmdDispatchIndirect.
-        let buf_barrier_cdf53_args = vk::BufferMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::INDIRECT_COMMAND_READ | vk::AccessFlags::SHADER_READ)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.cdf53_dispatch_args.buffer)
-            .offset(0)
-            .size(12);
+        let buf_barrier_cdf53_args = buf_barrier(
+            self.cdf53_dispatch_args.buffer,
+            vk::AccessFlags::SHADER_WRITE,
+            vk::AccessFlags::INDIRECT_COMMAND_READ | vk::AccessFlags::SHADER_READ,
+            12,
+        );
         // Barrier: compact_list + compact_count → HOST_READ (CPU readback after fence).
-        let buf_barrier_cdf53_list_host = vk::BufferMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::HOST_READ)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.cdf53_compact_list_buffer)
-            .offset(0)
-            .size(vk::WHOLE_SIZE);
-        let buf_barrier_cdf53_count_host = vk::BufferMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::SHADER_READ)
-            .dst_access_mask(vk::AccessFlags::HOST_READ)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.cdf53_compact_count_buffer)
-            .offset(0)
-            .size(4);
+        let buf_barrier_cdf53_list_host = buf_barrier(
+            self.cdf53_compact_list_buffer,
+            vk::AccessFlags::SHADER_WRITE,
+            vk::AccessFlags::HOST_READ,
+            vk::WHOLE_SIZE,
+        );
+        let buf_barrier_cdf53_count_host = buf_barrier(
+            self.cdf53_compact_count_buffer,
+            vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::SHADER_READ,
+            vk::AccessFlags::HOST_READ,
+            4,
+        );
         self.device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -683,14 +680,12 @@ impl GpuFrameProcessor {
             self.run_cdf53_forward_l1_stage(cmd, current.view, cols, rows)?;
 
         // Barrier L1 → L2: coefficient writes from L1 must be visible to L2.
-        let buf_barrier_l1_to_l2 = vk::BufferMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.cdf53_coefficients_buffer)
-            .offset(0)
-            .size(vk::WHOLE_SIZE);
+        let buf_barrier_l1_to_l2 = buf_barrier(
+            self.cdf53_coefficients_buffer,
+            vk::AccessFlags::SHADER_WRITE,
+            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+            vk::WHOLE_SIZE,
+        );
         self.device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -705,14 +700,12 @@ impl GpuFrameProcessor {
         let cdf53_forward_l2_ds_guard = self.run_cdf53_forward_l2_stage(cmd, cols, rows)?;
 
         // Barrier L2 → L3: coefficient writes from L2 must be visible to L3.
-        let buf_barrier_l2_to_l3 = vk::BufferMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.cdf53_coefficients_buffer)
-            .offset(0)
-            .size(vk::WHOLE_SIZE);
+        let buf_barrier_l2_to_l3 = buf_barrier(
+            self.cdf53_coefficients_buffer,
+            vk::AccessFlags::SHADER_WRITE,
+            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+            vk::WHOLE_SIZE,
+        );
         self.device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -727,14 +720,12 @@ impl GpuFrameProcessor {
         let cdf53_forward_l3_ds_guard = self.run_cdf53_forward_l3_stage(cmd, cols, rows)?;
 
         // Barrier L3 → HOST_READ: Phase B reads coefficient buffer after fence.
-        let buf_barrier_l3_host = vk::BufferMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::HOST_READ)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.cdf53_coefficients_buffer)
-            .offset(0)
-            .size(vk::WHOLE_SIZE);
+        let buf_barrier_l3_host = buf_barrier(
+            self.cdf53_coefficients_buffer,
+            vk::AccessFlags::SHADER_WRITE,
+            vk::AccessFlags::HOST_READ,
+            vk::WHOLE_SIZE,
+        );
         self.device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -757,14 +748,12 @@ impl GpuFrameProcessor {
                 escalation_count,
             )?;
             // L3 → HOST_READ barrier so Phase B can read after fence.
-            let buf_barrier_esc_host = vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.cdf53_escalation_coefficients_buffer)
-                .offset(0)
-                .size(vk::WHOLE_SIZE);
+            let buf_barrier_esc_host = buf_barrier(
+                self.cdf53_escalation_coefficients_buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::HOST_READ,
+                vk::WHOLE_SIZE,
+            );
             self.device.cmd_pipeline_barrier(
                 cmd,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -807,46 +796,36 @@ impl GpuFrameProcessor {
         // Barrier: zero-fills + compact_list write must be visible to Stage 2a.
         // srcStageMask covers TRANSFER (zero-fills) and COMPUTE_SHADER (compact_list write).
         let stage_2a_input_barriers = [
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.frame_palette_set.buffer)
-                .offset(0)
-                .size(20480),
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.frame_palette_count.buffer)
-                .offset(0)
-                .size(4),
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.hash_table.buffer)
-                .offset(0)
-                .size(PALETTE_SLOT_U32_BYTES),
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.per_tile_frame_palette_id.buffer)
-                .offset(0)
-                .size(pal_id_bytes),
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.palrle_compact_list.buffer)
-                .offset(0)
-                .size(vk::WHOLE_SIZE),
+            buf_barrier(
+                self.frame_palette_set.buffer,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                20480,
+            ),
+            buf_barrier(
+                self.frame_palette_count.buffer,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                4,
+            ),
+            buf_barrier(
+                self.hash_table.buffer,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                PALETTE_SLOT_U32_BYTES,
+            ),
+            buf_barrier(
+                self.per_tile_frame_palette_id.buffer,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                pal_id_bytes,
+            ),
+            buf_barrier(
+                self.palrle_compact_list.buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::SHADER_READ,
+                vk::WHOLE_SIZE,
+            ),
         ];
         self.device.cmd_pipeline_barrier(
             cmd,
@@ -863,30 +842,24 @@ impl GpuFrameProcessor {
 
         // Barrier: Stage 2a outputs available to downstream stages and HOST readback.
         let stage_2a_output_barriers = [
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.frame_palette_set.buffer)
-                .offset(0)
-                .size(vk::WHOLE_SIZE),
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.frame_palette_count.buffer)
-                .offset(0)
-                .size(4),
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.per_tile_frame_palette_id.buffer)
-                .offset(0)
-                .size(pal_id_bytes),
+            buf_barrier(
+                self.frame_palette_set.buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::SHADER_READ,
+                vk::WHOLE_SIZE,
+            ),
+            buf_barrier(
+                self.frame_palette_count.buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::SHADER_READ,
+                4,
+            ),
+            buf_barrier(
+                self.per_tile_frame_palette_id.buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::SHADER_READ,
+                pal_id_bytes,
+            ),
         ];
         self.device.cmd_pipeline_barrier(
             cmd,
@@ -905,14 +878,12 @@ impl GpuFrameProcessor {
             self.run_palette_subset_fold_init_stage(cmd, (1, 1, 1))?;
 
         // Barrier between init and fold: folded_into writes must be visible.
-        let stage_2b_init_to_fold_barrier = vk::BufferMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.folded_into.buffer)
-            .offset(0)
-            .size(PALETTE_SLOT_U32_BYTES);
+        let stage_2b_init_to_fold_barrier = buf_barrier(
+            self.folded_into.buffer,
+            vk::AccessFlags::SHADER_WRITE,
+            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+            PALETTE_SLOT_U32_BYTES,
+        );
         self.device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -929,14 +900,12 @@ impl GpuFrameProcessor {
         let palette_subset_fold_ds_guard = self.run_palette_subset_fold_stage(cmd)?;
 
         // Barrier for Stage 3 consumers and HOST readback.
-        let stage_2b_output_barrier = vk::BufferMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.folded_into.buffer)
-            .offset(0)
-            .size(PALETTE_SLOT_U32_BYTES);
+        let stage_2b_output_barrier = buf_barrier(
+            self.folded_into.buffer,
+            vk::AccessFlags::SHADER_WRITE,
+            vk::AccessFlags::SHADER_READ,
+            PALETTE_SLOT_U32_BYTES,
+        );
         self.device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -1061,89 +1030,69 @@ impl GpuFrameProcessor {
         //    Stage 2a outputs (frame_palette_set, frame_palette_count,
         //    per_tile_frame_palette_id) → HOST_READ.
         let buf_barriers = [
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.sad_buf.buffer)
-                .offset(0)
-                .size(vk::WHOLE_SIZE),
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(nv12_buffer)
-                .offset(0)
-                .size(vk::WHOLE_SIZE),
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.analysis_buf.buffer)
-                .offset(0)
-                .size(vk::WHOLE_SIZE),
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.palrle_compact_list.buffer)
-                .offset(0)
-                .size(vk::WHOLE_SIZE),
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.palrle_compact_count.buffer)
-                .offset(0)
-                .size(vk::WHOLE_SIZE),
+            buf_barrier(
+                self.sad_buf.buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::HOST_READ,
+                vk::WHOLE_SIZE,
+            ),
+            buf_barrier(
+                nv12_buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::HOST_READ,
+                vk::WHOLE_SIZE,
+            ),
+            buf_barrier(
+                self.analysis_buf.buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::HOST_READ,
+                vk::WHOLE_SIZE,
+            ),
+            buf_barrier(
+                self.palrle_compact_list.buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::HOST_READ,
+                vk::WHOLE_SIZE,
+            ),
+            buf_barrier(
+                self.palrle_compact_count.buffer,
+                vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::HOST_READ,
+                vk::WHOLE_SIZE,
+            ),
             // Stage 2a outputs
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.frame_palette_set.buffer)
-                .offset(0)
-                .size(vk::WHOLE_SIZE),
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.frame_palette_count.buffer)
-                .offset(0)
-                .size(4),
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.per_tile_frame_palette_id.buffer)
-                .offset(0)
-                .size(pal_id_bytes),
+            buf_barrier(
+                self.frame_palette_set.buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::HOST_READ,
+                vk::WHOLE_SIZE,
+            ),
+            buf_barrier(
+                self.frame_palette_count.buffer,
+                vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::HOST_READ,
+                4,
+            ),
+            buf_barrier(
+                self.per_tile_frame_palette_id.buffer,
+                vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::HOST_READ,
+                pal_id_bytes,
+            ),
             // Stage 2b output
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.folded_into.buffer)
-                .offset(0)
-                .size(PALETTE_SLOT_U32_BYTES),
+            buf_barrier(
+                self.folded_into.buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::HOST_READ,
+                PALETTE_SLOT_U32_BYTES,
+            ),
             // Stage 3 output
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.index.buffer)
-                .offset(0)
-                .size(vk::WHOLE_SIZE),
+            buf_barrier(
+                self.index.buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::HOST_READ,
+                vk::WHOLE_SIZE,
+            ),
         ];
         self.device.cmd_pipeline_barrier(
             cmd,
@@ -1396,22 +1345,18 @@ impl GpuFrameProcessor {
         // srcStageMask covers COMPUTE_SHADER (analysis write) and TRANSFER
         // (cmd_fill_buffer).
         let buf_barrier_inputs = [
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.sad_buf.buffer)
-                .offset(0)
-                .size(vk::WHOLE_SIZE),
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.analysis_buf.buffer)
-                .offset(0)
-                .size(vk::WHOLE_SIZE),
+            buf_barrier(
+                self.sad_buf.buffer,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::SHADER_READ,
+                vk::WHOLE_SIZE,
+            ),
+            buf_barrier(
+                self.analysis_buf.buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::SHADER_READ,
+                vk::WHOLE_SIZE,
+            ),
         ];
         self.device.cmd_pipeline_barrier(
             cmd,
@@ -1428,14 +1373,12 @@ impl GpuFrameProcessor {
             .cmd_fill_buffer(cmd, self.palrle_compact_count.buffer, 0, 4, 0);
 
         // Barrier: transfer-write → shader-read/write
-        let buf_barrier_fill = vk::BufferMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.palrle_compact_count.buffer)
-            .offset(0)
-            .size(4);
+        let buf_barrier_fill = buf_barrier(
+            self.palrle_compact_count.buffer,
+            vk::AccessFlags::TRANSFER_WRITE,
+            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+            4,
+        );
         self.device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::TRANSFER,
@@ -1453,14 +1396,12 @@ impl GpuFrameProcessor {
             self.run_palrle_compact_stage(cmd, &palrle_compact_push, (cols * rows, 1, 1))?;
 
         // Barrier between Stage 1.5a and 1.5b: shader write → shader read on count.
-        let buf_barrier_count = vk::BufferMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.palrle_compact_count.buffer)
-            .offset(0)
-            .size(4);
+        let buf_barrier_count = buf_barrier(
+            self.palrle_compact_count.buffer,
+            vk::AccessFlags::SHADER_WRITE,
+            vk::AccessFlags::SHADER_READ,
+            4,
+        );
         self.device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -1475,14 +1416,12 @@ impl GpuFrameProcessor {
         let palrle_indirect_args_ds_guard = self.run_palrle_indirect_args_stage(cmd)?;
 
         // Barrier for future stages to consume indirect args.
-        let buf_barrier_args = vk::BufferMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::INDIRECT_COMMAND_READ | vk::AccessFlags::SHADER_READ)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.palrle_indirect_args_buf.buffer)
-            .offset(0)
-            .size(12);
+        let buf_barrier_args = buf_barrier(
+            self.palrle_indirect_args_buf.buffer,
+            vk::AccessFlags::SHADER_WRITE,
+            vk::AccessFlags::INDIRECT_COMMAND_READ | vk::AccessFlags::SHADER_READ,
+            12,
+        );
         self.device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -1496,14 +1435,12 @@ impl GpuFrameProcessor {
         // Stage 4a: cdf53_compact dispatch (first-frame path).
         self.device
             .cmd_fill_buffer(cmd, self.cdf53_compact_count_buffer, 0, 4, 0);
-        let buf_barrier_cdf53_fill = vk::BufferMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.cdf53_compact_count_buffer)
-            .offset(0)
-            .size(4);
+        let buf_barrier_cdf53_fill = buf_barrier(
+            self.cdf53_compact_count_buffer,
+            vk::AccessFlags::TRANSFER_WRITE,
+            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+            4,
+        );
         self.device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::TRANSFER,
@@ -1519,14 +1456,12 @@ impl GpuFrameProcessor {
             self.run_cdf53_compact_stage(cmd, &cdf53_compact_push, (cols * rows, 1, 1))?;
         // Barrier between Stage 4a and 4b: shader write → shader read on count
         // (first-frame path).
-        let buf_barrier_cdf53_count = vk::BufferMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.cdf53_compact_count_buffer)
-            .offset(0)
-            .size(4);
+        let buf_barrier_cdf53_count = buf_barrier(
+            self.cdf53_compact_count_buffer,
+            vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
+            vk::AccessFlags::SHADER_READ,
+            4,
+        );
         self.device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
@@ -1542,31 +1477,25 @@ impl GpuFrameProcessor {
 
         // Barrier: dispatch_args SHADER_WRITE → INDIRECT_COMMAND_READ | SHADER_READ
         // for Stage 4c (cdf53_forward, Task 7) via vkCmdDispatchIndirect.
-        let buf_barrier_cdf53_args = vk::BufferMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::INDIRECT_COMMAND_READ | vk::AccessFlags::SHADER_READ)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.cdf53_dispatch_args.buffer)
-            .offset(0)
-            .size(12);
+        let buf_barrier_cdf53_args = buf_barrier(
+            self.cdf53_dispatch_args.buffer,
+            vk::AccessFlags::SHADER_WRITE,
+            vk::AccessFlags::INDIRECT_COMMAND_READ | vk::AccessFlags::SHADER_READ,
+            12,
+        );
         // Barrier: compact_list + compact_count → HOST_READ (CPU readback after fence).
-        let buf_barrier_cdf53_list_host = vk::BufferMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::HOST_READ)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.cdf53_compact_list_buffer)
-            .offset(0)
-            .size(vk::WHOLE_SIZE);
-        let buf_barrier_cdf53_count_host = vk::BufferMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::SHADER_READ)
-            .dst_access_mask(vk::AccessFlags::HOST_READ)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.cdf53_compact_count_buffer)
-            .offset(0)
-            .size(4);
+        let buf_barrier_cdf53_list_host = buf_barrier(
+            self.cdf53_compact_list_buffer,
+            vk::AccessFlags::SHADER_WRITE,
+            vk::AccessFlags::HOST_READ,
+            vk::WHOLE_SIZE,
+        );
+        let buf_barrier_cdf53_count_host = buf_barrier(
+            self.cdf53_compact_count_buffer,
+            vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::SHADER_READ,
+            vk::AccessFlags::HOST_READ,
+            4,
+        );
         self.device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -1592,14 +1521,12 @@ impl GpuFrameProcessor {
             self.run_cdf53_forward_l1_stage(cmd, current.view, cols, rows)?;
 
         // Barrier L1 → L2
-        let buf_barrier_l1_to_l2 = vk::BufferMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.cdf53_coefficients_buffer)
-            .offset(0)
-            .size(vk::WHOLE_SIZE);
+        let buf_barrier_l1_to_l2 = buf_barrier(
+            self.cdf53_coefficients_buffer,
+            vk::AccessFlags::SHADER_WRITE,
+            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+            vk::WHOLE_SIZE,
+        );
         self.device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -1614,14 +1541,12 @@ impl GpuFrameProcessor {
         let cdf53_forward_l2_ds_guard = self.run_cdf53_forward_l2_stage(cmd, cols, rows)?;
 
         // Barrier L2 → L3
-        let buf_barrier_l2_to_l3 = vk::BufferMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.cdf53_coefficients_buffer)
-            .offset(0)
-            .size(vk::WHOLE_SIZE);
+        let buf_barrier_l2_to_l3 = buf_barrier(
+            self.cdf53_coefficients_buffer,
+            vk::AccessFlags::SHADER_WRITE,
+            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+            vk::WHOLE_SIZE,
+        );
         self.device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -1636,14 +1561,12 @@ impl GpuFrameProcessor {
         let cdf53_forward_l3_ds_guard = self.run_cdf53_forward_l3_stage(cmd, cols, rows)?;
 
         // Barrier L3 → HOST_READ: Phase B reads coefficient buffer after fence.
-        let buf_barrier_l3_host = vk::BufferMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::HOST_READ)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.cdf53_coefficients_buffer)
-            .offset(0)
-            .size(vk::WHOLE_SIZE);
+        let buf_barrier_l3_host = buf_barrier(
+            self.cdf53_coefficients_buffer,
+            vk::AccessFlags::SHADER_WRITE,
+            vk::AccessFlags::HOST_READ,
+            vk::WHOLE_SIZE,
+        );
         self.device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -1666,14 +1589,12 @@ impl GpuFrameProcessor {
                 escalation_count,
             )?;
             // L3 → HOST_READ barrier so Phase B can read after fence.
-            let buf_barrier_esc_host = vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.cdf53_escalation_coefficients_buffer)
-                .offset(0)
-                .size(vk::WHOLE_SIZE);
+            let buf_barrier_esc_host = buf_barrier(
+                self.cdf53_escalation_coefficients_buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::HOST_READ,
+                vk::WHOLE_SIZE,
+            );
             self.device.cmd_pipeline_barrier(
                 cmd,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -1708,46 +1629,36 @@ impl GpuFrameProcessor {
 
         // Barrier: zero-fills + compact_list write must be visible to Stage 2a.
         let stage_2a_input_barriers = [
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.frame_palette_set.buffer)
-                .offset(0)
-                .size(20480),
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.frame_palette_count.buffer)
-                .offset(0)
-                .size(4),
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.hash_table.buffer)
-                .offset(0)
-                .size(PALETTE_SLOT_U32_BYTES),
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.per_tile_frame_palette_id.buffer)
-                .offset(0)
-                .size(pal_id_bytes),
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.palrle_compact_list.buffer)
-                .offset(0)
-                .size(vk::WHOLE_SIZE),
+            buf_barrier(
+                self.frame_palette_set.buffer,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                20480,
+            ),
+            buf_barrier(
+                self.frame_palette_count.buffer,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                4,
+            ),
+            buf_barrier(
+                self.hash_table.buffer,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                PALETTE_SLOT_U32_BYTES,
+            ),
+            buf_barrier(
+                self.per_tile_frame_palette_id.buffer,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                pal_id_bytes,
+            ),
+            buf_barrier(
+                self.palrle_compact_list.buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::SHADER_READ,
+                vk::WHOLE_SIZE,
+            ),
         ];
         self.device.cmd_pipeline_barrier(
             cmd,
@@ -1764,30 +1675,24 @@ impl GpuFrameProcessor {
 
         // Barrier: Stage 2a outputs available to downstream stages.
         let stage_2a_output_barriers = [
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.frame_palette_set.buffer)
-                .offset(0)
-                .size(vk::WHOLE_SIZE),
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.frame_palette_count.buffer)
-                .offset(0)
-                .size(4),
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.per_tile_frame_palette_id.buffer)
-                .offset(0)
-                .size(pal_id_bytes),
+            buf_barrier(
+                self.frame_palette_set.buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::SHADER_READ,
+                vk::WHOLE_SIZE,
+            ),
+            buf_barrier(
+                self.frame_palette_count.buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::SHADER_READ,
+                4,
+            ),
+            buf_barrier(
+                self.per_tile_frame_palette_id.buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::SHADER_READ,
+                pal_id_bytes,
+            ),
         ];
         self.device.cmd_pipeline_barrier(
             cmd,
@@ -1806,14 +1711,12 @@ impl GpuFrameProcessor {
             self.run_palette_subset_fold_init_stage(cmd, (1, 1, 1))?;
 
         // Barrier between init and fold: folded_into writes must be visible.
-        let stage_2b_init_to_fold_barrier = vk::BufferMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.folded_into.buffer)
-            .offset(0)
-            .size(PALETTE_SLOT_U32_BYTES);
+        let stage_2b_init_to_fold_barrier = buf_barrier(
+            self.folded_into.buffer,
+            vk::AccessFlags::SHADER_WRITE,
+            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+            PALETTE_SLOT_U32_BYTES,
+        );
         self.device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -1830,14 +1733,12 @@ impl GpuFrameProcessor {
         let palette_subset_fold_ds_guard = self.run_palette_subset_fold_stage(cmd)?;
 
         // Barrier for Stage 3 consumers and HOST readback.
-        let stage_2b_output_barrier = vk::BufferMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.folded_into.buffer)
-            .offset(0)
-            .size(PALETTE_SLOT_U32_BYTES);
+        let stage_2b_output_barrier = buf_barrier(
+            self.folded_into.buffer,
+            vk::AccessFlags::SHADER_WRITE,
+            vk::AccessFlags::SHADER_READ,
+            PALETTE_SLOT_U32_BYTES,
+        );
         self.device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -1953,89 +1854,69 @@ impl GpuFrameProcessor {
         // srcStageMask covers both COMPUTE_SHADER (shader writes) and TRANSFER
         // (cmd_fill_buffer on sad_buffer and palrle_compact_count_buffer).
         let buf_barrier = [
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.sad_buf.buffer)
-                .offset(0)
-                .size(vk::WHOLE_SIZE),
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(nv12_buffer)
-                .offset(0)
-                .size(vk::WHOLE_SIZE),
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.analysis_buf.buffer)
-                .offset(0)
-                .size(vk::WHOLE_SIZE),
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.palrle_compact_list.buffer)
-                .offset(0)
-                .size(vk::WHOLE_SIZE),
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.palrle_compact_count.buffer)
-                .offset(0)
-                .size(vk::WHOLE_SIZE),
+            buf_barrier(
+                self.sad_buf.buffer,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::HOST_READ,
+                vk::WHOLE_SIZE,
+            ),
+            buf_barrier(
+                nv12_buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::HOST_READ,
+                vk::WHOLE_SIZE,
+            ),
+            buf_barrier(
+                self.analysis_buf.buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::HOST_READ,
+                vk::WHOLE_SIZE,
+            ),
+            buf_barrier(
+                self.palrle_compact_list.buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::HOST_READ,
+                vk::WHOLE_SIZE,
+            ),
+            buf_barrier(
+                self.palrle_compact_count.buffer,
+                vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::HOST_READ,
+                vk::WHOLE_SIZE,
+            ),
             // Stage 2a outputs
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.frame_palette_set.buffer)
-                .offset(0)
-                .size(vk::WHOLE_SIZE),
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.frame_palette_count.buffer)
-                .offset(0)
-                .size(4),
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.per_tile_frame_palette_id.buffer)
-                .offset(0)
-                .size(pal_id_bytes),
+            buf_barrier(
+                self.frame_palette_set.buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::HOST_READ,
+                vk::WHOLE_SIZE,
+            ),
+            buf_barrier(
+                self.frame_palette_count.buffer,
+                vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::HOST_READ,
+                4,
+            ),
+            buf_barrier(
+                self.per_tile_frame_palette_id.buffer,
+                vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::HOST_READ,
+                pal_id_bytes,
+            ),
             // Stage 2b output
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.folded_into.buffer)
-                .offset(0)
-                .size(PALETTE_SLOT_U32_BYTES),
+            buf_barrier(
+                self.folded_into.buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::HOST_READ,
+                PALETTE_SLOT_U32_BYTES,
+            ),
             // Stage 3 output
-            vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.index.buffer)
-                .offset(0)
-                .size(vk::WHOLE_SIZE),
+            buf_barrier(
+                self.index.buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::HOST_READ,
+                vk::WHOLE_SIZE,
+            ),
         ];
         self.device.cmd_pipeline_barrier(
             cmd,
