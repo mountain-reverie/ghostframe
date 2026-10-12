@@ -1467,74 +1467,36 @@ fn validate_frame_header(total_len: usize, payload_len: usize) -> io::Result<usi
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "frame total_len underflow"))
 }
 
+/// The three constructor inputs that differ between the production and test
+/// `IoBridge` literals. Deliberately has no `Default`: each caller spells all
+/// three out. See [`IoBridge::base`].
+struct BaseDiffs {
+    handle: Option<GhostbridgeHandle>,
+    local_addr: SocketAddr,
+    gpu_frame_processor: Option<GpuFrameProcessor>,
+}
+
 impl IoBridge {
-    /// Create a new `IoBridge` by connecting to ghostbridge and opening a UDP
-    /// listener on `listen_addr` (e.g. `":443"`).
+    /// The one place every `IoBridge` field gets its initial value.
     ///
-    /// `lib_config` supplies every `GHOSTFRAME_*`-derived setting the bridge
-    /// needs (transport fault-injection/pacing/FEC knobs, diagnostics
-    /// toggles); the caller is expected to build it once via
-    /// `crate::config::LibConfig::from_env()` at the executable boundary.
-    /// Taken by value (not `&LibConfig`) because `TransportConfig` carries
-    /// `LossInjector`s that must never be cloned — see `TransportConfig`'s
-    /// doc comment.
-    pub async fn new(
-        ghostbridge_config: &GhostbridgeConfig,
-        listen_addr: &str,
+    /// Production (`new`) and the test/harness constructor
+    /// (`new_with_lib_config_for_test`) used to carry two complete copies of
+    /// this literal, which is how a field added to one could silently be
+    /// missing or different in the other. Exactly three values legitimately
+    /// differ between them and they are passed in explicitly via
+    /// [`BaseDiffs`]: the tsnet handle, the bound address, and the GPU frame
+    /// processor. Everything else is identical by construction.
+    fn base(
+        stream: TokioUnixStream,
+        server: QuicServer,
         lib_config: crate::config::LibConfig,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let handle = GhostbridgeHandle::connect(ghostbridge_config)?;
-        handle.up()?;
-        let ips = handle.get_ips()?;
-        tracing::info!(?ips, "ghostbridge node joined tailnet");
-
-        // tsnet.ListenPacket rejects a bare ":port" address with "address
-        // must be a valid IP". Bind instead to our first IPv4 tailnet IP on
-        // the caller-supplied port.
-        let port = parse_listen_port(listen_addr)?;
-        let bind_ip = ips
-            .iter()
-            .find(|ip| ip.is_ipv4())
-            .or_else(|| ips.first())
-            .copied()
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::AddrNotAvailable,
-                    "tsnet node reported no tailnet IPs",
-                )
-            })?;
-        let bind = format!("{bind_ip}:{port}");
-        tracing::info!(%bind, "binding UDP listener on tailnet IP");
-
-        let udp = handle.listen_udp(&bind)?;
-        let raw_fd = udp.into_raw_fd();
-
-        // Wrap the non-blocking ghostbridge fd as a tokio UnixStream.
-        let std_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(raw_fd) };
-        std_stream.set_nonblocking(true)?;
-        let stream = TokioUnixStream::from_std(std_stream)?;
-
-        let server = QuicServer::new()?;
-        tracing::info!(cert_sha256 = %server.cert_info().sha256_hex, "QUIC server ready");
-
-        // local_addr is the tailnet-rooted socket we bound; quinn-proto uses
-        // its IP as the `local_ip` hint for inbound packets.
-        let local_addr = SocketAddr::new(bind_ip, port);
-
-        let gpu_frame_processor = GpuFrameProcessor::new(2048 * 2).ok();
-        if gpu_frame_processor.is_some() {
-            tracing::info!("GPU dirty tracker initialized (Vulkan compute SAD)");
-        }
-
-        // Warm rayon's global thread pool so the first PalRLE-heavy frame
-        // doesn't pay thread-spin-up latency on the hot path (design Section 4).
-        rayon::iter::IntoParallelIterator::into_par_iter(0..1u32).for_each(|_| {});
-
-        let bridge = Self {
-            _handle: Some(handle),
+        diffs: BaseDiffs,
+    ) -> Self {
+        Self {
+            _handle: diffs.handle,
             stream,
             server,
-            local_addr,
+            local_addr: diffs.local_addr,
             wt_sessions: HashMap::new(),
             last_hello_from: None,
             close_deadlines: HashMap::new(),
@@ -1590,7 +1552,7 @@ impl IoBridge {
             recent_suspension_flags: [false, false],
             cdf53_escalation_candidates_this_frame: Vec::new(),
             cdf53_stranded_candidates_this_frame: Vec::new(),
-            gpu_frame_processor,
+            gpu_frame_processor: diffs.gpu_frame_processor,
             full_frame_encoder: None,
             recent_frame_fragments: HashMap::new(),
             fragment_coverage: crate::transport::fragment_coverage::FragmentCoverageMap::new(
@@ -1690,7 +1652,81 @@ impl IoBridge {
             bytes_emitted_snapshot: (0, 0),
             bwe_log_last_at: None,
             diagnostics: lib_config.diagnostics,
-        };
+        }
+    }
+
+    /// Create a new `IoBridge` by connecting to ghostbridge and opening a UDP
+    /// listener on `listen_addr` (e.g. `":443"`).
+    ///
+    /// `lib_config` supplies every `GHOSTFRAME_*`-derived setting the bridge
+    /// needs (transport fault-injection/pacing/FEC knobs, diagnostics
+    /// toggles); the caller is expected to build it once via
+    /// `crate::config::LibConfig::from_env()` at the executable boundary.
+    /// Taken by value (not `&LibConfig`) because `TransportConfig` carries
+    /// `LossInjector`s that must never be cloned — see `TransportConfig`'s
+    /// doc comment.
+    pub async fn new(
+        ghostbridge_config: &GhostbridgeConfig,
+        listen_addr: &str,
+        lib_config: crate::config::LibConfig,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let handle = GhostbridgeHandle::connect(ghostbridge_config)?;
+        handle.up()?;
+        let ips = handle.get_ips()?;
+        tracing::info!(?ips, "ghostbridge node joined tailnet");
+
+        // tsnet.ListenPacket rejects a bare ":port" address with "address
+        // must be a valid IP". Bind instead to our first IPv4 tailnet IP on
+        // the caller-supplied port.
+        let port = parse_listen_port(listen_addr)?;
+        let bind_ip = ips
+            .iter()
+            .find(|ip| ip.is_ipv4())
+            .or_else(|| ips.first())
+            .copied()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    "tsnet node reported no tailnet IPs",
+                )
+            })?;
+        let bind = format!("{bind_ip}:{port}");
+        tracing::info!(%bind, "binding UDP listener on tailnet IP");
+
+        let udp = handle.listen_udp(&bind)?;
+        let raw_fd = udp.into_raw_fd();
+
+        // Wrap the non-blocking ghostbridge fd as a tokio UnixStream.
+        let std_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(raw_fd) };
+        std_stream.set_nonblocking(true)?;
+        let stream = TokioUnixStream::from_std(std_stream)?;
+
+        let server = QuicServer::new()?;
+        tracing::info!(cert_sha256 = %server.cert_info().sha256_hex, "QUIC server ready");
+
+        // local_addr is the tailnet-rooted socket we bound; quinn-proto uses
+        // its IP as the `local_ip` hint for inbound packets.
+        let local_addr = SocketAddr::new(bind_ip, port);
+
+        let gpu_frame_processor = GpuFrameProcessor::new(2048 * 2).ok();
+        if gpu_frame_processor.is_some() {
+            tracing::info!("GPU dirty tracker initialized (Vulkan compute SAD)");
+        }
+
+        // Warm rayon's global thread pool so the first PalRLE-heavy frame
+        // doesn't pay thread-spin-up latency on the hot path (design Section 4).
+        rayon::iter::IntoParallelIterator::into_par_iter(0..1u32).for_each(|_| {});
+
+        let bridge = Self::base(
+            stream,
+            server,
+            lib_config,
+            BaseDiffs {
+                handle: Some(handle),
+                local_addr,
+                gpu_frame_processor,
+            },
+        );
         Ok(bridge)
     }
 
@@ -6526,164 +6562,17 @@ impl IoBridge {
         // doesn't pay thread-spin-up latency on the hot path (design Section 4).
         rayon::iter::IntoParallelIterator::into_par_iter(0..1u32).for_each(|_| {});
 
-        IoBridge {
-            _handle: None,
+        let local_addr = "0.0.0.0:443".parse().unwrap();
+        Self::base(
             stream,
             server,
-            local_addr: "0.0.0.0:443".parse().unwrap(),
-            wt_sessions: HashMap::new(),
-            last_hello_from: None,
-            close_deadlines: HashMap::new(),
-            non_live_feedback_drops: 0,
-            non_live_datagram_drops: 0,
-            has_seen_prior_session: false,
-            frame_rx: None,
-            inject_rx: None,
-            frame_seq: 0,
-            dirty_tracker: DirtyTracker::new(0, 0),
-            metrics_tracker: crate::tile::MetricsTracker::new(0, 0),
-            classifier: crate::tile::Classifier::new(lib_config.classifier),
-            epoch: now_std(),
-            bwe_epoch: now_std(),
-            frame_mode: crate::tile::FrameMode::TileCodec,
-            scheduler: crate::transport::scheduler::Scheduler::new(0, 0),
-            #[cfg(any(test, feature = "test-loss-injection"))]
-            outbound_loss: lib_config.transport.outbound_loss,
-            #[cfg(any(test, feature = "test-loss-injection"))]
-            inbound_loss: lib_config.transport.inbound_loss,
-            #[cfg(any(test, feature = "test-loss-injection"))]
-            outbound_bandwidth_cap: lib_config
-                .transport
-                .outbound_bandwidth_cap_bps
-                .map(crate::transport::bandwidth_cap::BandwidthCap::new),
-            #[cfg(any(test, feature = "test-loss-injection"))]
-            test_force_bytes_per_us: lib_config.transport.test_force_bytes_per_us,
-            #[cfg(any(test, feature = "test-loss-injection"))]
-            oob_inject_at: lib_config.transport.oob_inject_at,
-            #[cfg(any(test, feature = "test-loss-injection"))]
-            skip_palette_session_reset: lib_config.transport.skip_palette_session_reset,
-            #[cfg(any(test, feature = "test-loss-injection"))]
-            drop_plan: None,
-            tick_budget_floor_bytes: None,
-            last_max_datagram_size: None,
-            force_dirty_frames: 0,
-            stuck_sweep_counter: 0,
-            retransmit_pacer: crate::transport::retransmit_pacer::RetransmitPacer::new(),
-            #[cfg(test)]
-            loop_arm_trace: Vec::new(),
-            session_started_at: None,
-            last_disconnect_at: None,
-            last_takeover_at: None,
-            palette_table: crate::encoder::pal_rle::PaletteTable::new(),
-            client_caps: crate::transport::client_caps::ClientCapabilities::default(),
-            fec_k: lib_config.transport.fec_k.unwrap_or(0),
-            fec_enable_threshold: FEC_ENABLE_THRESHOLD,
-            fec_disable_threshold: FEC_DISABLE_THRESHOLD,
-            adaptation_context: crate::tile::classifier::AdaptationContext::default(),
-            recent_suspension_flags: [false, false],
-            cdf53_escalation_candidates_this_frame: Vec::new(),
-            cdf53_stranded_candidates_this_frame: Vec::new(),
-            gpu_frame_processor: None,
-            full_frame_encoder: None,
-            recent_frame_fragments: HashMap::new(),
-            fragment_coverage: crate::transport::fragment_coverage::FragmentCoverageMap::new(
-                crate::transport::fragment_coverage::FRAGMENT_COVERAGE_CAPACITY,
-            ),
-            unroutable_inbound_datagrams: 0,
-            #[cfg(any(test, feature = "browserless-harness"))]
-            send_errs_publish: std::sync::Arc::new(std::sync::Mutex::new(0)),
-            continuation_resumes: 0,
-            continuation_drained_bytes: 0,
-            last_emitted_dimensions: None,
-            dimensions_retransmits_left: 0,
-            connected_session_count: watch::Sender::new(0),
-            was_idle: true,
-            input_injector: None,
-            display_controller: None,
-            display_scale_milli: DEFAULT_SCALE_MILLI,
-            pending_display_mode: None,
-            feedback_recv_bufs: HashMap::new(),
-            datagram_send_errs: 0,
-            datagram_send_err_first_logged: false,
-            tick_budget_multiplier: 1.0,
-            scheduler_continuation: None,
-            capacity_hint_window: std::collections::VecDeque::new(),
-            path_sent_packets_last: 0,
-            pending_losses: Vec::new(),
-            transmission_ledger: crate::transport::transmission_ledger::TransmissionLedger::new(
-                TRANSMISSION_LEDGER_CAPACITY,
-            ),
-            loss_window: crate::transport::loss_window::LossWindow::new(),
-            path_last_sent_at: None,
-            last_drain_frame_context: None,
-            cumulative_datagrams_emitted: CumulativeEmitCounters::default(),
-            last_cumulative_emit_log_frame: 0,
-            color_histogram_accumulator: UniqueColorHistogram::default(),
-            bump_count_accumulator: BumpCountAccumulator::default(),
-            reliable_emitter: crate::transport::reliable_emitter::ReliableTileEmitter::new(
-                now_std(),
-            ),
-            bwe_samples_buffer: Vec::with_capacity(BWE_SAMPLES_BUFFER_CAPACITY),
-            bwe: crate::transport::bwe::BweWrapper::new(
-                crate::transport::bwe::BweWrapper::INITIAL_BPS,
-                now_std(),
-            ),
-            active_probe: None,
-            probes_completed: 0,
-            probes_abandoned: 0,
-            // Throwaway estimator solely to obtain the same starting
-            // `BweSnapshot` (`bwe.snapshot()` right above is unavailable
-            // here — `self` doesn't exist yet inside this literal). Cheap:
-            // `BweWrapper::new` just seeds a GoogCC controller's initial
-            // state, and this field only exists under `cfg(test)` /
-            // `browserless-harness` anyway.
-            #[cfg(any(test, feature = "browserless-harness"))]
-            bwe_publish: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::transport::bwe::BweWrapper::new(
-                    crate::transport::bwe::BweWrapper::INITIAL_BPS,
-                    now_std(),
-                )
-                .snapshot(),
-            )),
-            // Same cfg-gate and same reasoning as `bwe_publish` above; seeded
-            // with `EmitterStats::default()` since there's no throwaway
-            // instance needed here (unlike the BWE estimator, default stats
-            // are simply all-zero).
-            #[cfg(any(test, feature = "browserless-harness"))]
-            emitter_stats_publish: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::transport::reliable_emitter::emitter::EmitterStats::default(),
-            )),
-            // Same cfg-gate and reasoning again, for the per-tier latency
-            // stats — see `latency_stats_publish`'s doc comment.
-            #[cfg(any(test, feature = "browserless-harness"))]
-            latency_stats_publish: std::sync::Arc::new(std::sync::Mutex::new((
-                TierLatencyStats::default(),
-                TierLatencyStats::default(),
-            ))),
-            // Same cfg-gate and reasoning, for the `queued_at -> ACK`
-            // per-tier latency stats (BWE Stage 2.1) — see
-            // `queued_latency_stats_publish`'s doc comment.
-            #[cfg(any(test, feature = "browserless-harness"))]
-            queued_latency_stats_publish: std::sync::Arc::new(std::sync::Mutex::new((
-                TierLatencyStats::default(),
-                TierLatencyStats::default(),
-            ))),
-            // Same cfg-gate and reasoning, for the probe-window counters —
-            // see `probe_stats_publish`'s doc comment. Both start at zero,
-            // matching `probes_completed`/`probes_abandoned` above.
-            #[cfg(any(test, feature = "browserless-harness"))]
-            probe_stats_publish: std::sync::Arc::new(std::sync::Mutex::new((0u64, 0u64))),
-            bytes_emitted_critical: 0,
-            bytes_emitted_refinement: 0,
-            critical_latency_stats: TierLatencyStats::default(),
-            refinement_latency_stats: TierLatencyStats::default(),
-            queued_critical_latency_stats: TierLatencyStats::default(),
-            queued_refinement_latency_stats: TierLatencyStats::default(),
-            ack_latency_tracker: crate::transport::ack_latency::AckLatencyTracker::new(),
-            bytes_emitted_snapshot: (0, 0),
-            bwe_log_last_at: None,
-            diagnostics: lib_config.diagnostics,
-        }
+            lib_config,
+            BaseDiffs {
+                handle: None,
+                local_addr,
+                gpu_frame_processor: None,
+            },
+        )
     }
 
     /// Frame-carrying variant of the test constructor, accepting a pre-built
