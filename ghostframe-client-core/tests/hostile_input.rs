@@ -250,6 +250,24 @@ fn budget_returns_to_zero_on_completion_and_on_stale_sweep() {
     assert_eq!(s.tile_assembly_bytes, 0, "{s:?}");
 }
 
+/// The stale sweep only runs when the threshold moves or something stale was
+/// stored. A fragment of an already-stale frame arriving after the window has
+/// settled must still be reclaimed by the next datagram, not linger.
+#[test]
+fn a_late_fragment_of_a_stale_frame_is_swept_without_the_window_moving() {
+    let mut core = test_core();
+    core.handle_datagram(&tile_dgs(20, 0, 5, 0, &[5u8; 64], 64)[0], 0);
+    // Window has settled at frame 20; frame 2 is stale. It is stored...
+    let late = tile_dgs(2, 1, 1, 0, &[5u8; 4096], 1176);
+    core.handle_datagram(&late[0], 0);
+    assert_eq!(stats(&core).tile_assemblies, 1, "{:?}", stats(&core));
+    // ...and the next datagram, same frame as the settled window, sweeps it.
+    core.handle_datagram(&tile_dgs(20, 0, 6, 0, &[5u8; 64], 64)[0], 0);
+    let s = stats(&core);
+    assert_eq!(s.tile_assemblies, 0, "{s:?}");
+    assert_eq!(s.tile_assembly_bytes, 0, "{s:?}");
+}
+
 #[test]
 fn a_full_4k_dual_screen_frame_of_one_short_tiles_fits_the_budget() {
     // Largest legitimate in-flight load: every tile of a 2 x 3840x2160

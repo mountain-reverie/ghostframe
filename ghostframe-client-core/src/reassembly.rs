@@ -278,21 +278,35 @@ impl ClientCore {
         // Evict stale assemblies: frame_seq < latest_frame_seq - 2
         // (saturating to avoid underflow when latest < 2). main.ts:1160-1177.
         let threshold = self.latest_frame_seq.saturating_sub(2);
-        let stale: Vec<TileKey> = self
-            .assemblies
-            .keys()
-            .filter(|k| k.frame_seq < threshold)
-            .copied()
-            .collect();
-        self.fragment_parity.evict_older_than(threshold);
-        for k in stale {
-            if let Some(asm) = self.remove_assembly(&k) {
-                if asm.received < asm.fragments.len() {
-                    self.loss_tracker
-                        .on_stale_tile(asm.fragments.len(), asm.received);
+        //
+        // Only when something can be stale: the threshold moved, or an entry
+        // was stored below it last datagram. Otherwise every key already
+        // satisfies `frame_seq >= threshold` and the scan finds nothing; it
+        // used to run, O(live assemblies), on every datagram.
+        if threshold != self.swept_threshold || self.stale_pending {
+            self.swept_threshold = threshold;
+            self.stale_pending = false;
+            let stale: Vec<TileKey> = self
+                .assemblies
+                .keys()
+                .filter(|k| k.frame_seq < threshold)
+                .copied()
+                .collect();
+            self.fragment_parity.evict_older_than(threshold);
+            for k in stale {
+                if let Some(asm) = self.remove_assembly(&k) {
+                    if asm.received < asm.fragments.len() {
+                        self.loss_tracker
+                            .on_stale_tile(asm.fragments.len(), asm.received);
+                    }
                 }
+                self.fragment_parity.remove(&k);
             }
-            self.fragment_parity.remove(&k);
+        }
+        // Anything stored from here on that is already below the threshold
+        // must be swept by the next datagram, as the unconditional sweep did.
+        if frame_seq < threshold {
+            self.stale_pending = true;
         }
 
         // Legacy fragment-level parity (frag_idx >= frag_total). main.ts:1181-1209.
@@ -403,10 +417,18 @@ impl ClientCore {
         };
         self.fragment_parity.remove(&key);
 
-        let mut payload = Vec::new();
-        for b in asm.fragments.iter().flatten() {
-            payload.extend_from_slice(b);
-        }
+        let mut asm = asm;
+        let mut fragments = std::mem::take(&mut asm.fragments);
+        let payload = if fragments.len() == 1 {
+            // Single fragment: take it, no copy.
+            fragments.pop().flatten().unwrap_or_default()
+        } else {
+            let mut p = Vec::with_capacity(fragments.iter().flatten().map(Vec::len).sum());
+            for b in fragments.iter().flatten() {
+                p.extend_from_slice(b);
+            }
+            p
+        };
 
         let tx = asm.tile_x;
         let ty = asm.tile_y;

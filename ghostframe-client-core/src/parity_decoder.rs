@@ -182,7 +182,8 @@ impl ParityDecoder {
             return None; // wire-supplied length longer than the XOR result
         }
         let start = out.len() - len;
-        let recovered = out[start..].to_vec();
+        out.drain(..start);
+        let recovered = out;
 
         // A recovered buffer is reconstructed, not received. If the group's
         // membership was ever wrong the XOR yields plausible-looking bytes

@@ -59,10 +59,13 @@ fn coalesced_and_isolated_tiles_land_at_their_own_coordinates() {
     let red = [0xFF, 0x00, 0x00, 0xFF];
     let green = [0x00, 0xFF, 0x00, 0xFF];
     let blue = [0x00, 0x00, 0xFF, 0xFF];
-    r.apply_event(&ctx, &tile_ready(1, 1, solid_tile(red)));
-    r.apply_event(&ctx, &tile_ready(2, 1, solid_tile(green)));
-    r.apply_event(&ctx, &tile_ready(10, 7, solid_tile(blue)));
-    r.flush(&ctx);
+    r.apply_event(&ctx, tile_ready(1, 1, solid_tile(red)))
+        .expect("gpu ok");
+    r.apply_event(&ctx, tile_ready(2, 1, solid_tile(green)))
+        .expect("gpu ok");
+    r.apply_event(&ctx, tile_ready(10, 7, solid_tile(blue)))
+        .expect("gpu ok");
+    r.flush(&ctx).expect("gpu ok");
 
     let fb = r.debug_read_framebuffer(&ctx);
 
@@ -100,9 +103,11 @@ fn every_pixel_of_a_coalesced_rectangle_comes_from_its_own_tile() {
 
     let a = [0x11, 0x22, 0x33, 0xFF];
     let b = [0x44, 0x55, 0x66, 0xFF];
-    r.apply_event(&ctx, &tile_ready(3, 4, solid_tile(a)));
-    r.apply_event(&ctx, &tile_ready(4, 4, solid_tile(b)));
-    r.flush(&ctx);
+    r.apply_event(&ctx, tile_ready(3, 4, solid_tile(a)))
+        .expect("gpu ok");
+    r.apply_event(&ctx, tile_ready(4, 4, solid_tile(b)))
+        .expect("gpu ok");
+    r.flush(&ctx).expect("gpu ok");
     let fb = r.debug_read_framebuffer(&ctx);
 
     for (tx, want) in [(3u32, a), (4u32, b)] {
@@ -134,8 +139,9 @@ fn edge_tiles_are_clamped_not_dropped() {
     let last_col = (W / TILE_SIZE - 1) as u8;
     let last_row = (H.div_ceil(TILE_SIZE) - 1) as u8;
     let colour = [0x9A, 0xBC, 0xDE, 0xFF];
-    r.apply_event(&ctx, &tile_ready(last_col, last_row, solid_tile(colour)));
-    r.flush(&ctx);
+    r.apply_event(&ctx, tile_ready(last_col, last_row, solid_tile(colour)))
+        .expect("gpu ok");
+    r.flush(&ctx).expect("gpu ok");
 
     let fb = r.debug_read_framebuffer(&ctx);
     assert_eq!(px(&fb, W - 1, H - 1), colour, "bottom-right pixel");
@@ -151,8 +157,9 @@ fn a_short_payload_writes_only_the_rows_it_has() {
     let mut r = renderer(&ctx);
 
     let base = [0x20, 0x40, 0x60, 0xFF];
-    r.apply_event(&ctx, &tile_ready(6, 6, solid_tile(base)));
-    r.flush(&ctx);
+    r.apply_event(&ctx, tile_ready(6, 6, solid_tile(base)))
+        .expect("gpu ok");
+    r.flush(&ctx).expect("gpu ok");
 
     let half = [0xAA, 0xBB, 0xCC, 0xFF];
     let rows = (TILE_SIZE / 2) as usize;
@@ -162,8 +169,9 @@ fn a_short_payload_writes_only_the_rows_it_has() {
         .cycle()
         .take(rows * (TILE_SIZE * 4) as usize)
         .collect();
-    r.apply_event(&ctx, &tile_ready(6, 6, short));
-    r.flush(&ctx);
+    r.apply_event(&ctx, tile_ready(6, 6, short))
+        .expect("gpu ok");
+    r.flush(&ctx).expect("gpu ok");
 
     let fb = r.debug_read_framebuffer(&ctx);
     let (x0, y0) = (6 * TILE_SIZE, 6 * TILE_SIZE);
@@ -173,4 +181,96 @@ fn a_short_payload_writes_only_the_rows_it_has() {
         base,
         "bottom half must survive a short payload"
     );
+}
+
+/// A hostile server's dimensions must neither allocate nor panic. 100000^2
+/// RGBA would be 40 GB; the point is that it is refused before sizing.
+#[test]
+fn hostile_dimensions_are_refused_without_allocating() {
+    let ctx = WgpuContext::new().expect("wgpu context");
+
+    for (w, h) in [(100_000, 100_000), (0, 1080), (1920, 0), (8193, 1080)] {
+        match Renderer::new(&ctx, w, h, 3, &[], false, false) {
+            Err(ghostframe_client_gpu::GpuError::InvalidDimensions { width, height }) => {
+                assert_eq!((width, height), (w, h));
+            }
+            Err(e) => panic!("{w}x{h}: wrong error {e}"),
+            Ok(_) => panic!("{w}x{h} must be refused"),
+        }
+    }
+
+    // Mid-session: the framebuffer keeps its size and stays usable.
+    let mut r = renderer(&ctx);
+    for (w, h) in [(100_000, 100_000), (0, 0), (u32::MAX, 1)] {
+        r.apply_event(
+            &ctx,
+            Event::FrameDimensions {
+                width: w,
+                height: h,
+            },
+        )
+        .expect("gpu ok");
+    }
+    let red = [0xFF, 0x00, 0x00, 0xFF];
+    r.apply_event(&ctx, tile_ready(1, 1, solid_tile(red)))
+        .expect("gpu ok");
+    r.flush(&ctx).expect("gpu ok");
+    let fb = r.debug_read_framebuffer(&ctx);
+    assert_eq!(fb.len(), (W * H * 4) as usize, "framebuffer was resized");
+    assert_eq!(px(&fb, 48, 48), red);
+}
+
+/// A PalRle tile the shader rejects must come out of the renderer as a
+/// decode error naming that tile, and a clean tile in the same batch must not.
+/// Before this, the native renderer never read the GPU's error slots back, so
+/// the server could never learn a tile had failed to decode.
+#[test]
+fn gpu_palrle_failures_surface_as_decode_errors() {
+    use ghostframe_client_core::{DecodeErrorCode, TileData};
+    use ghostframe_client_gpu::renderer::GpuDecodeError;
+    use ghostframe_protocol::protocol::Codec;
+
+    let ctx = WgpuContext::new().expect("wgpu context");
+    let mut r = renderer(&ctx);
+    r.set_collect_decode_errors(true);
+    r.apply_event(
+        &ctx,
+        Event::PaletteUpdated {
+            palette_id: 0,
+            colors: vec![[1, 2, 3, 0xFF]],
+        },
+    )
+    .expect("palette");
+    let payload = |tile_x, tile_y, fill: u8| Event::TilePayload {
+        frame_seq: 0,
+        tile_x,
+        tile_y,
+        generation: 0,
+        data: TileData::PalRle {
+            palette_id: 0,
+            count: 1,
+            indices: vec![fill; 512],
+            wire_flags: 0,
+        },
+    };
+    // Tile (3,5) indexes past `count`; tile (4,5) is fine.
+    r.apply_event(&ctx, payload(3, 5, 0x77)).expect("apply");
+    r.apply_event(&ctx, payload(4, 5, 0x00)).expect("apply");
+    r.flush(&ctx).expect("flush");
+
+    assert_eq!(
+        r.take_decode_errors(),
+        vec![GpuDecodeError {
+            codec: Codec::PalRle,
+            tile_x: 3,
+            tile_y: 5,
+            code: DecodeErrorCode::IndexOob,
+        }]
+    );
+    assert!(r.take_decode_errors().is_empty(), "drained");
+
+    // A clean batch afterwards reports nothing (no stale slot).
+    r.apply_event(&ctx, payload(4, 5, 0x00)).expect("apply");
+    r.flush(&ctx).expect("flush");
+    assert!(r.take_decode_errors().is_empty());
 }

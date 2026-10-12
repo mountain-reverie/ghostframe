@@ -47,7 +47,7 @@ export class WebGpuRenderer {
   private framebufferDirty: boolean = false;
 
   // Test/diag instrumentation: increments on every real device.queue.submit
-  // call. Wired to window.__gpuSubmitCount in encodeAndPresentFrame so the
+  // call. Read by stats_log.ts so the
   // page log can show a sliding submit rate next to the existing raf:N
   // counter. An idle page should grow raf without growing submit.
   public submitCount: number = 0;
@@ -360,7 +360,6 @@ export class WebGpuRenderer {
     this.device.queue.submit([encoder.finish()]);
     this.submitCount++;
     this.framebufferDirty = false;
-    (window as unknown as { __gpuSubmitCount?: number }).__gpuSubmitCount = this.submitCount;
 
     // ---- Step 12: zero errors for next tick ----
     if (palRleCount > 0) {

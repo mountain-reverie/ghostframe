@@ -22,8 +22,47 @@ use ghostframe_client_core::{DecodeErrorCode, Event, TileData};
 use ghostframe_protocol::protocol::Codec;
 use ghostframe_protocol::tile::TILE_SIZE;
 
+/// Whether `width x height` is a size this renderer will allocate for.
+/// The same bound `ClientCore` enforces; repeated here because the renderer
+/// is a public API and must not trust that every caller went through it.
+fn dimensions_valid(width: u32, height: u32) -> bool {
+    let range = 1..=ghostframe_client_core::MAX_FRAME_DIMENSION;
+    range.contains(&width) && range.contains(&height)
+}
+
 fn tile_grid(width: u32, height: u32) -> (u32, u32) {
     (width.div_ceil(TILE_SIZE), height.div_ceil(TILE_SIZE))
+}
+
+/// Upper bound on [`GpuDecodeError`]s held between two drains.
+const MAX_PENDING_DECODE_ERRORS: usize = 1024;
+
+/// A tile the GPU decode rejected; the shape `ClientCore`'s
+/// `DecodeErrorBatcher::report` takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpuDecodeError {
+    pub codec: Codec,
+    pub tile_x: u8,
+    pub tile_y: u8,
+    pub code: DecodeErrorCode,
+}
+
+/// Map a shader error code to the wire enum. `None` for a code the shader
+/// does not define.
+fn decode_error_code(code: u32) -> Option<DecodeErrorCode> {
+    Some(match code {
+        1 => DecodeErrorCode::PayloadTooShort,
+        2 => DecodeErrorCode::CountOutOfRange,
+        3 => DecodeErrorCode::ThinUncachedPalette,
+        4 => DecodeErrorCode::BundledTruncated,
+        5 => DecodeErrorCode::IndexOob,
+        6 => DecodeErrorCode::RleOvershoot,
+        7 => DecodeErrorCode::RleUndershoot,
+        8 => DecodeErrorCode::Cdf53BadPass,
+        9 => DecodeErrorCode::Cdf53Truncated,
+        10 => DecodeErrorCode::Cdf53RleLength,
+        _ => return None,
+    })
 }
 
 /// Which route the most recent H.264 frame took to reach the framebuffer.
@@ -57,6 +96,15 @@ pub struct Renderer {
     pending_cdf53: Vec<Cdf53PassEntry>,
     /// `TileReady` tiles awaiting upload, batched by [`Renderer::flush`].
     pending_rgba: Vec<(u8, u8, Vec<u8>)>,
+    /// GPU-detected decode failures not yet drained by
+    /// [`Renderer::take_decode_errors`].
+    decode_errors: Vec<GpuDecodeError>,
+    /// Whether `flush` reads the PalRle error slots back. Off by default: the
+    /// readback is a blocking `poll(wait_indefinitely)` per flush, and until
+    /// there is a path from the render thread to `ClientCore`'s feedback
+    /// batcher the result cannot reach the server, so paying for it would be
+    /// pure cost. See [`Renderer::set_collect_decode_errors`].
+    collect_decode_errors: bool,
 
     /// How many PPM dumps have been written, against
     /// `GHOSTFRAME_CLIENT_DUMP_COUNT`. Counts attempts, not successes -- see
@@ -146,6 +194,9 @@ impl Renderer {
         if export_buffers == 0 {
             return Err(GpuError::NoExportBuffers);
         }
+        if !dimensions_valid(width, height) {
+            return Err(GpuError::InvalidDimensions { width, height });
+        }
         let fb = Framebuffer::new(&ctx.device, width, height);
         let ring = ExportRing::new(
             ctx,
@@ -209,6 +260,8 @@ impl Renderer {
             pending_palrle: Vec::new(),
             pending_cdf53: Vec::new(),
             pending_rgba: Vec::new(),
+            decode_errors: Vec::new(),
+            collect_decode_errors: false,
             dumps_written: 0,
             dump: crate::config::DumpConfig::from_env(),
             flushes: 0,
@@ -228,7 +281,7 @@ impl Renderer {
     /// Every `Event` variant is matched explicitly -- see this crate's
     /// module doc on `clippy::wildcard_enum_match_arm` for why a `_ =>` arm
     /// is refused here.
-    pub fn apply_event(&mut self, ctx: &WgpuContext, ev: &Event) {
+    pub fn apply_event(&mut self, ctx: &WgpuContext, ev: Event) -> Result<(), GpuError> {
         match ev {
             Event::TileReady {
                 tile_x,
@@ -246,8 +299,8 @@ impl Renderer {
                 // regardless of size -- almost entirely CPU-side call overhead
                 // -- so a full 1920x1080 repaint spent 363ms just issuing 2040
                 // of them. See `upload_pending_rgba`.
-                self.pending_rgba.push((*tile_x, *tile_y, rgba.clone()));
-                self.ring.mark_dirty(*tile_x as u32, *tile_y as u32);
+                self.pending_rgba.push((tile_x, tile_y, rgba));
+                self.ring.mark_dirty(tile_x as u32, tile_y as u32);
             }
             Event::TilePayload {
                 tile_x,
@@ -258,10 +311,10 @@ impl Renderer {
             } => {
                 match data {
                     TileData::Raw(bgra) => {
-                        raw::upload_raw_tile(&ctx.queue, &self.fb, *tile_x, *tile_y, bgra);
+                        raw::upload_raw_tile(&ctx.queue, &self.fb, tile_x, tile_y, &bgra);
                     }
                     TileData::Solid(bgra) => {
-                        self.pending_solid.push((*tile_x, *tile_y, *bgra));
+                        self.pending_solid.push((tile_x, tile_y, bgra));
                     }
                     TileData::PalRle {
                         palette_id,
@@ -271,13 +324,8 @@ impl Renderer {
                         // from `count` and the indices themselves.
                         wire_flags: _,
                     } => {
-                        self.pending_palrle.push((
-                            *tile_x,
-                            *tile_y,
-                            *palette_id,
-                            *count,
-                            indices.clone(),
-                        ));
+                        self.pending_palrle
+                            .push((tile_x, tile_y, palette_id, count, indices));
                     }
                     TileData::Cdf53 {
                         pass_idx,
@@ -285,30 +333,37 @@ impl Renderer {
                         present_passes,
                     } => {
                         self.pending_cdf53.push((
-                            *tile_x,
-                            *tile_y,
-                            *generation,
-                            *pass_idx,
-                            bit_planes.clone(),
-                            *present_passes,
+                            tile_x,
+                            tile_y,
+                            generation,
+                            pass_idx,
+                            bit_planes,
+                            present_passes,
                         ));
                     }
                 }
-                self.ring.mark_dirty(*tile_x as u32, *tile_y as u32);
+                self.ring.mark_dirty(tile_x as u32, tile_y as u32);
             }
             Event::FrameDimensions { width, height } => {
+                // Ignore a size the renderer would not have been built with:
+                // keep the current framebuffer rather than allocate from a
+                // network-supplied number.
+                if !dimensions_valid(width, height) {
+                    tracing::warn!(width, height, "ignoring out-of-range FrameDimensions");
+                    return Ok(());
+                }
                 // Run any batched work against the OLD framebuffer size
                 // before resizing -- the pending tiles were addressed
                 // against it.
-                self.flush(ctx);
+                self.flush(ctx)?;
 
-                self.fb.resize(&ctx.device, &ctx.queue, *width, *height);
-                if let Err(e) = self.ring.resize(ctx, *width, *height) {
+                self.fb.resize(&ctx.device, &ctx.queue, width, height);
+                if let Err(e) = self.ring.resize(ctx, width, height) {
                     tracing::error!(error = %e, width, height, "export ring resize failed");
                 }
                 self.solid
-                    .set_canvas_size(&ctx.device, &ctx.queue, *width, *height);
-                let (cols, rows) = tile_grid(*width, *height);
+                    .set_canvas_size(&ctx.device, &ctx.queue, width, height);
+                let (cols, rows) = tile_grid(width, height);
                 self.cdf53.resize(&ctx.device, &ctx.queue, cols, rows);
             }
             Event::NeedsH264 {
@@ -317,7 +372,7 @@ impl Renderer {
                 is_keyframe,
                 ..
             } => {
-                self.decode_h264(ctx, *frame_seq, *is_keyframe, payload);
+                self.decode_h264(ctx, frame_seq, is_keyframe, &payload)?;
             }
             Event::DecodeError {
                 codec,
@@ -330,7 +385,7 @@ impl Renderer {
                 // separate telemetry sink of its own for M1, so this is a
                 // deliberate no-op rather than a silent drop -- logged so a
                 // real decode failure is still visible locally.
-                log_decode_error(*codec, *tile_x, *tile_y, *code);
+                log_decode_error(codec, tile_x, tile_y, code);
             }
             Event::PaletteUpdated { palette_id, colors } => {
                 // `colors` reports only `count` entries (see the type doc
@@ -342,7 +397,7 @@ impl Renderer {
                 for (slot, c) in full.iter_mut().zip(colors.iter()) {
                     *slot = *c;
                 }
-                self.palrle.upload_palette(&ctx.queue, *palette_id, &full);
+                self.palrle.upload_palette(&ctx.queue, palette_id, &full);
             }
             Event::Evicted { .. } => {
                 // Terminal: the session is going away and the net thread
@@ -350,10 +405,29 @@ impl Renderer {
                 // `ClientEvent::Disconnected`. Nothing left to paint.
             }
         }
+        Ok(())
+    }
+
+    /// Take the GPU-detected tile decode failures accumulated by [`flush`].
+    ///
+    /// The shader validates PalRle payloads on the device (an index past the
+    /// palette count, say), so only the readback after the decode can tell.
+    /// The caller is expected to relay these as DECODE_ERROR feedback.
+    ///
+    /// [`flush`]: Renderer::flush
+    pub fn set_collect_decode_errors(&mut self, on: bool) {
+        self.collect_decode_errors = on;
+    }
+
+    pub fn take_decode_errors(&mut self) -> Vec<GpuDecodeError> {
+        std::mem::take(&mut self.decode_errors)
     }
 
     /// Submit all batched work.
-    pub fn flush(&mut self, ctx: &WgpuContext) {
+    ///
+    /// Fails if the device cannot be waited on (e.g. it was lost); the
+    /// batched work of the failing stage is dropped.
+    pub fn flush(&mut self, ctx: &WgpuContext) -> Result<(), GpuError> {
         if !self.pending_solid.is_empty() {
             self.solid
                 .draw(&ctx.device, &ctx.queue, &self.fb, &self.pending_solid);
@@ -362,7 +436,31 @@ impl Renderer {
         if !self.pending_palrle.is_empty() {
             self.palrle
                 .decode(&ctx.device, &ctx.queue, &self.fb, &self.pending_palrle);
-            self.pending_palrle.clear();
+            let batch = std::mem::take(&mut self.pending_palrle);
+            let errors = if self.collect_decode_errors {
+                self.palrle.take_errors(&ctx.device, &ctx.queue)?
+            } else {
+                Vec::new()
+            };
+            for (i, code) in errors {
+                let Some((tile_x, tile_y, ..)) = batch.get(i as usize) else {
+                    continue;
+                };
+                let Some(code) = decode_error_code(code) else {
+                    tracing::warn!(code, tile_x, tile_y, "unknown GPU palrle error code");
+                    continue;
+                };
+                // Bounded: a hostile stream of bad tiles must not grow this
+                // without limit between two drains.
+                if self.decode_errors.len() < MAX_PENDING_DECODE_ERRORS {
+                    self.decode_errors.push(GpuDecodeError {
+                        codec: Codec::PalRle,
+                        tile_x: *tile_x,
+                        tile_y: *tile_y,
+                        code,
+                    });
+                }
+            }
         }
         self.upload_pending_rgba(ctx);
 
@@ -375,6 +473,7 @@ impl Renderer {
 
         self.flushes = self.flushes.saturating_add(1);
         self.maybe_dump_framebuffer(ctx);
+        Ok(())
     }
 
     /// Upload every buffered `TileReady` tile, coalesced into as few
@@ -577,6 +676,20 @@ impl Renderer {
         self.ring.release(frame_id);
     }
 
+    /// Take back a published frame the host never acquired.
+    ///
+    /// Releases its buffer, and marks the whole surface dirty. Releasing alone
+    /// under-reports damage: the next `publish` may reuse a different buffer
+    /// whose watermark predates the withdrawn frame, so it would report only
+    /// the changes since THAT buffer was filled, while the host is still
+    /// showing an even older frame. Re-damaging everything is the one answer
+    /// that is right whichever buffer comes next; it costs a full blit, and
+    /// only on frames the host was too slow to take.
+    pub fn withdraw_frame(&mut self, frame_id: u32) {
+        self.ring.release(frame_id);
+        self.ring.mark_dirty_all();
+    }
+
     /// The exported dmabuf image for a buffer id `publish` handed out.
     pub fn export_buffer(&self, buffer_id: u32) -> &ExportedImage {
         self.ring.buffer(buffer_id)
@@ -595,9 +708,15 @@ impl Renderer {
     /// first keyframe after that resets the decoder before it is decoded --
     /// see that field's doc for why an IDR alone does not already guarantee
     /// this.
-    fn decode_h264(&mut self, ctx: &WgpuContext, frame_seq: u32, is_keyframe: bool, au: &[u8]) {
+    fn decode_h264(
+        &mut self,
+        ctx: &WgpuContext,
+        frame_seq: u32,
+        is_keyframe: bool,
+        au: &[u8],
+    ) -> Result<(), GpuError> {
         if self.h264_unavailable {
-            return;
+            return Ok(());
         }
         if self.h264_decoder.is_none() {
             // Timed separately from `decoder.decode()` below: this is the
@@ -628,7 +747,7 @@ impl Renderer {
                          was advertised without hardware to back it"
                     );
                     self.h264_unavailable = true;
-                    return;
+                    return Ok(());
                 }
             }
         }
@@ -643,7 +762,7 @@ impl Renderer {
         // produces -- would draw the H.264 frame first and then paint the
         // older, now-stale tiles over it when the batch's `flush` finally
         // runs.
-        self.flush(ctx);
+        self.flush(ctx)?;
 
         if self.h264_pipeline.is_none() {
             self.h264_pipeline = Some(crate::pipelines::h264_nv12::H264Nv12Pipeline::new(
@@ -702,7 +821,7 @@ impl Renderer {
                 // wait for the next keyframe and reset on it rather than
                 // trust whatever the decoder emits from here.
                 self.h264_needs_reset = true;
-                return;
+                return Ok(());
             }
         };
         #[allow(
@@ -732,6 +851,7 @@ impl Renderer {
         if any_blitted {
             self.ring.mark_dirty_all();
         }
+        Ok(())
     }
 
     /// Drain and blit any frames still buffered by B-frame reordering.

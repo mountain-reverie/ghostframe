@@ -72,6 +72,27 @@ fn handle_debug_map_frame(
     })
 }
 
+/// Withdraw a published frame the host has not acquired, releasing its buffer
+/// back to the ring.
+///
+/// The `published` slot holds the LATEST frame only. Publishing over a frame
+/// the host never acquired drops its `PublishedFrame` on the floor, but the
+/// ring still counts that buffer `in_flight` and only `release` clears it --
+/// and the host will never release a frame it was never handed. Each such
+/// overwrite therefore leaked one export buffer for good, until a host that
+/// presents slower than the server sends starved the ring (`publish` returning
+/// `None` forever).
+///
+/// Also run before a `FrameDimensions` resize: the unacquired frame names a
+/// buffer from the old ring, and handing out its fd afterwards is a
+/// use-after-close.
+fn withdraw_unacquired(published: &Mutex<Option<PublishedFrame>>, renderer: &mut Option<Renderer>) {
+    let stale = published.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let (Some(pf), Some(r)) = (stale, renderer.as_mut()) {
+        r.withdraw_frame(pf.frame_id);
+    }
+}
+
 /// Route one core event to the renderer, lazily constructing it on the
 /// first `FrameDimensions` (the earliest point at which a size is known --
 /// see the design doc's "Allocation timing" note). Returns whether a
@@ -83,6 +104,7 @@ fn handle_core_event(
     renderer: &mut Option<Renderer>,
     ev: CoreEvent,
     queue: &EventQueue,
+    published: &Mutex<Option<PublishedFrame>>,
     export_buffers: usize,
     host_visible: bool,
     preferred_modifiers: &[u64],
@@ -118,10 +140,19 @@ fn handle_core_event(
         // event's dimensions; there is nothing further to apply from it.
         return true;
     }
-    renderer
+    if matches!(ev, CoreEvent::FrameDimensions { .. }) {
+        withdraw_unacquired(published, renderer);
+    }
+    if let Err(e) = renderer
         .as_mut()
         .expect("renderer.is_none() handled above")
-        .apply_event(ctx, &ev);
+        .apply_event(ctx, ev)
+    {
+        queue.push(ClientEvent::Error {
+            message: format!("renderer failed applying event: {e}"),
+        });
+        return false;
+    }
     true
 }
 
@@ -231,10 +262,17 @@ struct EventTally {
     /// about that). If this is 0 while `tile_ready` is in the thousands, the
     /// client is working and the remote screen is blank.
     tile_ready_nonblack: u64,
+    /// Whether `record` scans each `TileReady` for non-black pixels. That is
+    /// a pass over every tile's bytes on the render thread, and the result
+    /// only reaches the debug-level summary, so it runs only when that level
+    /// was enabled when the tally was built.
+    scan_nonblack: bool,
     tile_payload: u64,
     frame_dimensions: u64,
     needs_h264: u64,
     decode_error: u64,
+    /// Tiles the GPU rejected after decode (see `Renderer::take_decode_errors`).
+    gpu_decode_errors: u64,
     palette_updated: u64,
     other: u64,
     publishes: u64,
@@ -247,14 +285,26 @@ struct EventTally {
 }
 
 impl EventTally {
+    fn new() -> Self {
+        Self::with_scan(tracing::enabled!(tracing::Level::DEBUG))
+    }
+
+    fn with_scan(scan_nonblack: bool) -> Self {
+        EventTally {
+            scan_nonblack,
+            ..Self::default()
+        }
+    }
+
     fn record(&mut self, ev: &ghostframe_client_core::Event) {
         use ghostframe_client_core::Event as E;
         match ev {
             E::TileReady { rgba, .. } => {
                 self.tile_ready += 1;
-                if rgba
-                    .chunks_exact(4)
-                    .any(|p| p[0] != 0 || p[1] != 0 || p[2] != 0)
+                if self.scan_nonblack
+                    && rgba
+                        .chunks_exact(4)
+                        .any(|p| p[0] != 0 || p[1] != 0 || p[2] != 0)
                 {
                     self.tile_ready_nonblack += 1;
                 }
@@ -290,6 +340,7 @@ impl EventTally {
             frame_dimensions = self.frame_dimensions,
             needs_h264 = self.needs_h264,
             decode_error = self.decode_error,
+            gpu_decode_errors = self.gpu_decode_errors,
             palette_updated = self.palette_updated,
             other = self.other,
             publishes = self.publishes,
@@ -297,7 +348,7 @@ impl EventTally {
             releases = self.releases,
             "render thread: 1s summary"
         );
-        *self = Self::default();
+        *self = Self::with_scan(self.scan_nonblack);
     }
 }
 
@@ -341,8 +392,9 @@ pub(crate) fn run(
         }
     };
     let mut renderer: Option<Renderer> = None;
-    let mut tally = EventTally::default();
+    let mut tally = EventTally::new();
     let mut export_dumps: u64 = 0;
+    let mut flush_error_reported = false;
     let dump_cfg = ghostframe_client_gpu::config::DumpConfig::from_env();
     let mut last_summary = std::time::Instant::now();
     // `0` means "the embedder didn't specify a count"; a `Renderer` with
@@ -376,6 +428,7 @@ pub(crate) fn run(
                     &mut renderer,
                     ev,
                     &queue,
+                    &published,
                     export_buffers,
                     host_visible,
                     &preferred_modifiers,
@@ -434,6 +487,7 @@ pub(crate) fn run(
                         &mut renderer,
                         ev,
                         &queue,
+                        &published,
                         export_buffers,
                         host_visible,
                         &preferred_modifiers,
@@ -448,10 +502,46 @@ pub(crate) fn run(
         }
 
         if got_event {
+            // The slot is latest-wins: whatever the host has not picked up is
+            // superseded by what we publish next. Release it first, so its
+            // buffer is free for this very publish.
+            withdraw_unacquired(&published, &mut renderer);
             if let Some(r) = renderer.as_mut() {
-                r.flush(&ctx);
-                let published_frame = r.publish(&ctx);
-                if published_frame.is_none() {
+                let flushed = r.flush(&ctx);
+                if let Err(e) = &flushed {
+                    // E.g. device loss while waiting on the GPU. Report it
+                    // (once: the queue is unbounded and a lost device fails
+                    // every later flush) and skip this publish rather than
+                    // panic the thread.
+                    if !flush_error_reported {
+                        flush_error_reported = true;
+                        queue.push(ClientEvent::Error {
+                            message: format!("renderer flush failed: {e}"),
+                        });
+                    }
+                } else {
+                    flush_error_reported = false;
+                }
+                // GPU-detected decode failures. They belong on the feedback
+                // stream as DECODE_ERROR, but `ClientCore` owns the
+                // rate-limited batcher and the net thread owns `ClientCore`;
+                // there is no render-to-net command for this yet, so they
+                // are logged and counted.
+                let gpu_errors = r.take_decode_errors();
+                if !gpu_errors.is_empty() {
+                    tally.gpu_decode_errors += gpu_errors.len() as u64;
+                    tracing::warn!(
+                        count = gpu_errors.len(),
+                        first = ?gpu_errors[0],
+                        "GPU tile decode errors (not yet sent to server)"
+                    );
+                }
+                let published_frame = if flushed.is_ok() {
+                    r.publish(&ctx)
+                } else {
+                    None
+                };
+                if flushed.is_ok() && published_frame.is_none() {
                     tally.publish_starved += 1;
                 }
                 if let Some(pf) = published_frame {
@@ -480,5 +570,111 @@ pub(crate) fn run(
         if shutdown {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn nonblack_scan_runs_only_when_enabled() {
+        let ev = CoreEvent::TileReady {
+            frame_seq: 0,
+            tile_x: 0,
+            tile_y: 0,
+            rgba: vec![9u8; 32 * 32 * 4],
+        };
+        let mut on = EventTally::with_scan(true);
+        let mut off = EventTally::with_scan(false);
+        on.record(&ev);
+        off.record(&ev);
+        assert_eq!((on.tile_ready, on.tile_ready_nonblack), (1, 1));
+        assert_eq!((off.tile_ready, off.tile_ready_nonblack), (1, 0));
+        // The setting survives the once-a-second reset.
+        on.flush_log();
+        assert!(on.scan_nonblack && on.tile_ready == 0);
+    }
+
+    fn tile(x: u8) -> RenderMsg {
+        RenderMsg::Core(CoreEvent::TileReady {
+            frame_seq: 0,
+            tile_x: x,
+            tile_y: 0,
+            rgba: vec![0x80; 32 * 32 * 4],
+        })
+    }
+
+    /// Wait for the next `FrameReady`, or `None` after `timeout`.
+    fn next_frame_ready(queue: &EventQueue, timeout: Duration) -> Option<u32> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            match queue.pop() {
+                Some(ClientEvent::FrameReady { frame_id }) => return Some(frame_id),
+                Some(ClientEvent::Error { message }) => panic!("render thread error: {message}"),
+                Some(_) => {}
+                None => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        None
+    }
+
+    /// A host that never acquires a frame must not be able to starve the export
+    /// ring. Two buffers, a host that acquires nothing, and far more publishes
+    /// than buffers: every publish overwrites the unacquired frame in the
+    /// `published` slot, and unless that overwrite releases the superseded
+    /// frame's buffer, the ring runs dry after two and `FrameReady` stops.
+    #[test]
+    fn overwriting_an_unacquired_frame_releases_its_buffer() {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let queue = Arc::new(EventQueue::new().expect("event queue"));
+        let published = Arc::new(Mutex::new(None));
+        let handle = {
+            let (queue, published) = (Arc::clone(&queue), Arc::clone(&published));
+            std::thread::spawn(move || run(ready_tx, rx, queue, published, 2, false, vec![], false))
+        };
+        if ready_rx.recv().expect("ready").is_err() {
+            eprintln!("SKIP: no GPU adapter that can export dmabufs");
+            let _ = handle.join();
+            return;
+        }
+
+        tx.send(RenderMsg::Core(CoreEvent::FrameDimensions {
+            width: 128,
+            height: 128,
+        }))
+        .unwrap();
+        // Strictly more publishes than export buffers (2). Each batch is
+        // separated by waiting for its FrameReady so they cannot coalesce.
+        let publishes = 6;
+        let mut seen = 0;
+        for i in 0..publishes {
+            tx.send(tile((i % 4) as u8)).unwrap();
+            if next_frame_ready(&queue, Duration::from_secs(10)).is_none() {
+                break;
+            }
+            seen += 1;
+        }
+        tx.send(RenderMsg::Shutdown).unwrap();
+        handle.join().unwrap();
+        // Every publish after the first superseded a frame the host never saw,
+        // so the host's picture is older than any one buffer's watermark. Its
+        // damage must therefore cover the whole surface, not just the single
+        // tile this frame changed.
+        let last = published.lock().unwrap().take().expect("a published frame");
+        let damaged: u64 = last.damage.iter().map(|r| r.w as u64 * r.h as u64).sum();
+        assert_eq!(
+            damaged,
+            128 * 128,
+            "withdrawn frames lost their damage: {:?}",
+            last.damage
+        );
+        assert_eq!(
+            seen, publishes,
+            "ring starved after {seen} publishes with 2 buffers: an overwritten, \
+             never-acquired frame kept its buffer in flight"
+        );
     }
 }

@@ -95,27 +95,32 @@ impl FrameReader {
             }
         }
 
+        // Walk the buffer with a cursor and drain the consumed prefix once,
+        // so a burst of N frames costs one memmove, not N.
         let mut packets = Vec::new();
+        let mut pos = 0usize;
         loop {
-            if self.buf.len() < 8 {
+            let avail = &self.buf[pos..];
+            if avail.len() < 8 {
                 break;
             }
-            let total_len = u32::from_be_bytes(self.buf[0..4].try_into().unwrap()) as usize;
-            let payload_len = u32::from_be_bytes(self.buf[4..8].try_into().unwrap()) as usize;
+            let total_len = u32::from_be_bytes(avail[0..4].try_into().unwrap()) as usize;
+            let payload_len = u32::from_be_bytes(avail[4..8].try_into().unwrap()) as usize;
             if !(8..=MAX_FRAME_LEN).contains(&total_len) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("frame total_len {total_len} out of range"),
                 ));
             }
-            if self.buf.len() < total_len {
+            if avail.len() < total_len {
                 break; // rest of the frame hasn't arrived yet
             }
-            let rest = &self.buf[8..total_len];
+            let rest = &avail[8..total_len];
             let pkt = parse_frame_rest(rest, payload_len)?;
             packets.push(pkt);
-            self.buf.drain(..total_len);
+            pos += total_len;
         }
+        self.buf.drain(..pos);
         Ok(packets)
     }
 }
@@ -127,8 +132,13 @@ impl FrameReader {
 /// still needs *a* `SocketAddr` to serialize -- passing the real
 /// destination costs nothing and keeps this call site honest about what
 /// it's sending to.
-fn write_frame(fd: RawFd, payload: &[u8], destination: &SocketAddr) -> std::io::Result<()> {
-    let frame = ghostframe_tsnet::encode_frame(payload, destination);
+fn write_frame(
+    fd: RawFd,
+    frame: &mut Vec<u8>,
+    payload: &[u8],
+    destination: &SocketAddr,
+) -> std::io::Result<()> {
+    ghostframe_tsnet::encode_frame_into(frame, payload, destination);
     let mut off = 0;
     while off < frame.len() {
         // SAFETY: `fd` is valid and open; the slice is valid for its length.
@@ -346,6 +356,7 @@ pub(crate) fn run(args: NetThreadArgs) {
     arm_timer(timer_fd.as_raw_fd(), client_net.poll_timeout(), base);
 
     let mut reader = FrameReader::new();
+    let mut frame_buf: Vec<u8> = Vec::new();
     let mut events = [libc::epoll_event { events: 0, u64: 0 }; 8];
 
     'outer: loop {
@@ -449,7 +460,7 @@ pub(crate) fn run(args: NetThreadArgs) {
         }
 
         while let Some(out) = client_net.poll_transmit() {
-            if let Err(e) = write_frame(udp_raw, &out.payload, &out.destination) {
+            if let Err(e) = write_frame(udp_raw, &mut frame_buf, &out.payload, &out.destination) {
                 tracing::warn!(error = %e, "udp frame write failed");
             }
         }
@@ -463,6 +474,54 @@ mod tests {
     use super::*;
     use ghostframe_client_core::Event;
     use ghostframe_protocol::eviction::EvictionReason;
+
+    /// A burst of frames plus a partial tail: every complete frame comes out
+    /// in order, the tail is kept, and completing it later yields exactly one
+    /// more packet (the single end-of-burst drain must keep the tail intact).
+    #[test]
+    fn frame_reader_handles_a_burst_and_keeps_the_partial_tail() {
+        let mut fds = [0i32; 2];
+        // SAFETY: valid 2-element array.
+        let rc = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_NONBLOCK,
+                0,
+                fds.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, 0);
+        let (rd, wr) = (fds[0], fds[1]);
+        let addr: SocketAddr = "100.64.0.1:443".parse().unwrap();
+        let mut stream = Vec::new();
+        for i in 0u8..5 {
+            stream.extend(ghostframe_tsnet::encode_frame(
+                &vec![i; 10 + i as usize],
+                &addr,
+            ));
+        }
+        let cut = stream.len() - 7; // inside the 5th frame
+        let put = |bytes: &[u8]| {
+            let n = unsafe { libc::write(wr, bytes.as_ptr() as *const libc::c_void, bytes.len()) };
+            assert_eq!(n as usize, bytes.len());
+        };
+        put(&stream[..cut]);
+        let mut r = FrameReader::new();
+        let first = r.poll(rd).unwrap();
+        assert_eq!(first.len(), 4);
+        for (i, p) in first.iter().enumerate() {
+            assert_eq!(p.payload, vec![i as u8; 10 + i]);
+        }
+        put(&stream[cut..]);
+        let second = r.poll(rd).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].payload, vec![4u8; 14]);
+        assert!(r.buf.is_empty());
+        unsafe {
+            libc::close(rd);
+            libc::close(wr);
+        }
+    }
 
     #[test]
     fn eviction_becomes_a_disconnect_naming_the_cause() {

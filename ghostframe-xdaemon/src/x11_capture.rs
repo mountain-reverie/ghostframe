@@ -63,26 +63,13 @@
 
 use std::io;
 
+use crate::util::monotonic_now_ns;
 use ghostframe_lib::FrameSubmission;
 use x11rb::connection::Connection;
 use x11rb::protocol::composite::ConnectionExt as CompositeExt;
 use x11rb::protocol::xfixes::{ConnectionExt as XfixesExt, GetCursorImageReply};
 use x11rb::protocol::xproto::{ConnectionExt, ImageFormat, MapState};
 use x11rb::rust_connection::RustConnection;
-
-/// Read CLOCK_MONOTONIC and return the value as nanoseconds.
-fn monotonic_now_ns() -> u64 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: clock_gettime is async-signal-safe; CLOCK_MONOTONIC always
-    // available on Linux.
-    unsafe {
-        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
-    }
-    (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
-}
 
 /// Selected capture strategy. Logged at startup and via `source()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +91,8 @@ pub struct X11Capture {
     width: u16,
     height: u16,
     strategy: Strategy,
+    /// One-shot raw-frame dump target (`GHOSTFRAME_DUMP_FIRST_FRAME`); taken on first use.
+    dump_first_frame: Option<String>,
     /// Reusable target buffer for per-window composition. Allocated to
     /// `width * height * 4` once; cleared (memset to 0) each frame.
     target: Vec<u8>,
@@ -115,7 +104,7 @@ pub struct X11Capture {
 
 impl X11Capture {
     /// Connect to `$DISPLAY` and pick a capture strategy.
-    pub fn new() -> io::Result<Self> {
+    pub fn new(cfg: &crate::config::XdaemonConfig) -> io::Result<Self> {
         let (conn, screen_num) = x11rb::connect(None)
             .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
         let screen = &conn.setup().roots[screen_num];
@@ -123,7 +112,7 @@ impl X11Capture {
         let width = screen.width_in_pixels;
         let height = screen.height_in_pixels;
 
-        let strategy = pick_strategy(&conn, root);
+        let strategy = pick_strategy(&conn, root, cfg.force_root_get_image);
         tracing::info!(width, height, ?strategy, "X11 capture connected to display");
 
         let buf_size = (width as usize) * (height as usize) * 4;
@@ -133,6 +122,7 @@ impl X11Capture {
             width,
             height,
             strategy,
+            dump_first_frame: cfg.dump_first_frame.clone(),
             target: vec![0u8; buf_size],
             first_composite_logged: false,
         })
@@ -207,14 +197,13 @@ impl X11Capture {
         // subsequent frames are not re-dumped. Only fires on the CPU
         // path (pixels.len() > 0); the DMA-BUF path would write 0 bytes.
         if !frame.pixels.is_empty() {
-            if let Ok(path) = std::env::var("GHOSTFRAME_DUMP_FIRST_FRAME") {
+            if let Some(path) = self.dump_first_frame.take() {
                 let header = format!(
                     "ghostframe-bgra width={} height={} stride={}\n",
                     frame.width, frame.height, frame.stride
                 );
                 let _ = std::fs::write(format!("{path}.meta"), header.as_bytes());
                 let _ = std::fs::write(&path, &frame.pixels);
-                std::env::remove_var("GHOSTFRAME_DUMP_FIRST_FRAME");
                 tracing::info!(
                     path = %path,
                     width = frame.width,
@@ -287,11 +276,14 @@ impl X11Capture {
             if geom.width == 0 || geom.height == 0 {
                 continue;
             }
-            if geom.x >= self.width as i16
-                || geom.y >= self.height as i16
-                || (geom.x + geom.width as i16) <= 0
-                || (geom.y + geom.height as i16) <= 0
-            {
+            if window_is_offscreen(
+                geom.x,
+                geom.y,
+                geom.width,
+                geom.height,
+                self.width,
+                self.height,
+            ) {
                 continue;
             }
 
@@ -444,6 +436,15 @@ fn resize_needed(current: (u16, u16), actual: (u16, u16)) -> Option<(u16, u16)> 
     Some(actual)
 }
 
+/// True if a window at (`x`, `y`) of size `w` x `h` lies entirely outside a
+/// `screen_w` x `screen_h` screen. Done in i32: the sum `x + w as i16` and the
+/// `screen as i16` cast overflowed (debug panic, release wrap) for windows
+/// near the i16 limits or screens wider than 32767.
+fn window_is_offscreen(x: i16, y: i16, w: u16, h: u16, screen_w: u16, screen_h: u16) -> bool {
+    let (x, y, w, h) = (i32::from(x), i32::from(y), i32::from(w), i32::from(h));
+    x >= i32::from(screen_w) || y >= i32::from(screen_h) || x + w <= 0 || y + h <= 0
+}
+
 /// Pick a strategy by probing COMPOSITE + `_NET_WM_CM_S0`.
 ///
 /// `GHOSTFRAME_FORCE_ROOT_GET_IMAGE=1` is a diagnostic escape hatch:
@@ -451,11 +452,8 @@ fn resize_needed(current: (u16, u16), actual: (u16, u16)) -> Option<(u16, u16)> 
 /// presence. Lets operators reproduce exactly what `xwd -root` /
 /// `import -window root` do, to verify whether their compositor's
 /// rendering is reachable via the legacy path.
-fn pick_strategy(conn: &RustConnection, root: u32) -> Strategy {
-    if std::env::var("GHOSTFRAME_FORCE_ROOT_GET_IMAGE")
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false)
-    {
+fn pick_strategy(conn: &RustConnection, root: u32, force_root_get_image: bool) -> Strategy {
+    if force_root_get_image {
         tracing::info!(
             "GHOSTFRAME_FORCE_ROOT_GET_IMAGE set; bypassing compositor probe and \
              using plain GetImage(root) — same call `import -window root` makes"
@@ -856,6 +854,19 @@ mod fraction_matching_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offscreen_check_does_not_overflow_i16() {
+        // x + w = 65534 overflows i16; the window is still visible.
+        assert!(!window_is_offscreen(-1, 0, 65535, 10, 100, 100));
+        assert!(!window_is_offscreen(32767 - 5, 0, 65535, 10, 40000, 100));
+        // Screen wider than i16::MAX: `as i16` used to make this negative.
+        assert!(!window_is_offscreen(10, 10, 20, 20, 40000, 40000));
+        assert!(window_is_offscreen(100, 0, 10, 10, 100, 100));
+        assert!(window_is_offscreen(-20, 0, 20, 10, 100, 100));
+        assert!(window_is_offscreen(0, -10, 10, 10, 100, 100));
+        assert!(!window_is_offscreen(-19, 0, 20, 10, 100, 100));
+    }
 
     fn make_solid(w: i32, h: i32, color: [u8; 4]) -> Vec<u8> {
         let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];

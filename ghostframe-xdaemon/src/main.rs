@@ -1,11 +1,12 @@
+mod config;
 mod cvt;
 mod display;
 mod drm_capture;
 mod input_inject;
+mod util;
 mod x11_capture;
 mod xdamage;
 
-use std::env;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -37,7 +38,7 @@ fn state_dir_seeded(state_dir: &Path) -> bool {
 /// operator's session will accept a new client. Either way, without this gate
 /// the daemon would bring up tsnet (a ~5s operation) against an X server it
 /// cannot talk to, and the only symptom downstream would be "no frames".
-fn wait_for_x11(timeout: Duration) -> Result<(), String> {
+fn wait_for_x11(timeout: Duration, display: Option<&str>) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     let mut attempt: u32 = 0;
     let last_err = loop {
@@ -56,7 +57,7 @@ fn wait_for_x11(timeout: Duration) -> Result<(), String> {
         }
         std::thread::sleep(Duration::from_millis(250));
     };
-    let display = env::var("DISPLAY").unwrap_or_else(|_| "(unset)".into());
+    let display = display.unwrap_or("(unset)");
     Err(format!(
         "X11 display {display} not ready after {:?} ({attempt} attempt(s)); \
          last error: {last_err}",
@@ -66,7 +67,7 @@ fn wait_for_x11(timeout: Duration) -> Result<(), String> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let log_format = std::env::var("GHOSTFRAME_LOG_FORMAT").unwrap_or_else(|_| "text".into());
+    let cfg = config::XdaemonConfig::from_env();
     // Default to INFO, not DEBUG. `ghostframe=debug` as a *default* means a
     // deployed daemon writes every DEBUG line forever: measured on a live
     // session at ~207 lines/second on a screen with nothing to send, six per
@@ -82,26 +83,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "ghostframe=info".into());
 
-    match log_format.as_str() {
-        "json" => {
-            tracing_subscriber::fmt()
-                .json()
-                .with_env_filter(env_filter)
-                .init();
-        }
-        _ => {
-            tracing_subscriber::fmt().with_env_filter(env_filter).init();
-        }
+    if cfg.log_json {
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(env_filter)
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
     }
 
-    let init_mode = env::args().any(|a| a == "--init");
+    let init_mode = std::env::args().any(|a| a == "--init");
 
-    let hostname = env::var("TS_HOSTNAME").unwrap_or_else(|_| "ghostframe-server".into());
-    let state_dir = env::var("TS_STATE_DIR").unwrap_or_else(|_| "/tmp/ghostframe-ts".into());
+    let hostname = cfg.ts_hostname.clone();
+    let state_dir = cfg.ts_state_dir.clone();
     let state_dir_path = std::path::PathBuf::from(&state_dir);
     let seeded = state_dir_seeded(&state_dir_path);
 
-    let authkey = match (init_mode, env::var("TS_AUTHKEY").ok(), seeded) {
+    let authkey = match (init_mode, cfg.ts_authkey.clone(), seeded) {
         (true, Some(k), _) if !k.is_empty() => k,
         (true, _, _) => {
             eprintln!("error: --init requires TS_AUTHKEY to be set and non-empty");
@@ -121,11 +119,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             std::process::exit(2);
         }
     };
-    let control_url = env::var("TS_CONTROL_URL").unwrap_or_default();
-    let capture_fps: u64 = env::var("CAPTURE_FPS")
-        .unwrap_or_else(|_| "30".into())
-        .parse()
-        .expect("CAPTURE_FPS must be a positive integer");
+    let control_url = cfg.ts_control_url.clone();
+    let capture_fps = cfg.capture_fps;
 
     let config = GhostbridgeConfig {
         hostname,
@@ -142,17 +137,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // anywhere in the container, so blocking on a non-existent display :99
     // would just time out after 10 s and abort startup. The DRM-direct
     // entrypoint sets this env var; production never does.
-    let skip_x11_wait = std::env::var("GHOSTFRAME_NO_X11_WAIT")
-        .ok()
-        .filter(|v| !v.is_empty() && v != "0")
-        .is_some();
+    let skip_x11_wait = cfg.no_x11_wait;
     if !init_mode && !skip_x11_wait {
-        if let Err(msg) = wait_for_x11(Duration::from_secs(10)) {
+        if let Err(msg) = wait_for_x11(Duration::from_secs(10), cfg.display.as_deref()) {
             // Name both deployments. This hint used to point only at
             // ghostframe-xorg.service, which does not exist in attach mode --
             // so the one message an operator gets on the most common startup
             // failure sent them looking for a unit that was never installed.
-            let dpy = env::var("DISPLAY").unwrap_or_else(|_| "(unset)".into());
+            let dpy = cfg.display.as_deref().unwrap_or("(unset)");
             tracing::error!(
                 "{msg}\n\
                  - headless mode (ghostframe runs its own X server): check it with\n\
@@ -174,7 +166,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let input_injector: Option<
         std::sync::Arc<dyn ghostframe_lib::transport::input_inject::InputInjector>,
     > = if !init_mode {
-        match input_inject::XTestInjector::new() {
+        match input_inject::XTestInjector::new(cfg.display.as_deref()) {
             Ok(inj) => {
                 tracing::info!("XTest input injector ready");
                 Some(std::sync::Arc::new(inj))
@@ -201,7 +193,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let display_controller: Option<
         std::sync::Arc<dyn ghostframe_lib::transport::display::DisplayController>,
     > = if !init_mode {
-        match display::XrandrDisplay::new() {
+        match display::XrandrDisplay::new(cfg.attach_max_resolution.clone()) {
             Ok(ctl) => {
                 tracing::info!("XRandR display controller ready");
                 Some(std::sync::Arc::new(ctl))
@@ -261,13 +253,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // the guest Xorg on :1, producing solid-black or host-screen captures
     // for the guest-mode install. See packaging/systemd/
     // ghostframe-xdaemon.service which sets the env var by default.
-    let force_x11 = std::env::var("GHOSTFRAME_X11_CAPTURE_ONLY")
-        .ok()
-        .filter(|v| !v.is_empty() && v != "0")
-        .is_some();
+    let force_x11 = cfg.x11_capture_only;
     let mut backend = if force_x11 {
         tracing::info!("GHOSTFRAME_X11_CAPTURE_ONLY set; skipping DRM probe");
-        let capture = x11_capture::X11Capture::new()?;
+        let capture = x11_capture::X11Capture::new(&cfg)?;
         CaptureBackend::X11 {
             capture: Box::new(capture),
         }
@@ -294,7 +283,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Err(e) => {
                 tracing::warn!("DRM capture unavailable: {e}");
                 tracing::info!("Falling back to X11 capture");
-                let capture = x11_capture::X11Capture::new()?;
+                let capture = x11_capture::X11Capture::new(&cfg)?;
                 CaptureBackend::X11 {
                     capture: Box::new(capture),
                 }
@@ -332,10 +321,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // as a PNG to this directory (filename: frame_<count>.png). Useful for
     // visually verifying the server's view of the desktop alongside trace
     // logs.  Disabled when the env var is absent.
-    let capture_dump_dir = env::var("GHOSTFRAME_CAPTURE_DUMP_DIR")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(std::path::PathBuf::from);
+    let capture_dump_dir = cfg.capture_dump_dir.clone();
     if let Some(dir) = &capture_dump_dir {
         if let Err(e) = std::fs::create_dir_all(dir) {
             tracing::warn!(?dir, error = %e, "could not create capture-dump dir; PNG dump disabled");
@@ -347,10 +333,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Heartbeat cadence — emit one debug line every Nth iteration so we can
     // tell from logs whether the capture loop is alive, blocked on
     // submit_frame (= IoBridge backpressure), or has exited.
-    let heartbeat_every: u64 = env::var("GHOSTFRAME_CAPTURE_HEARTBEAT_EVERY")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5);
+    let heartbeat_every = cfg.heartbeat_every;
+    let mut capture_failures = CaptureFailures::default();
 
     loop {
         let loop_iter_start = std::time::Instant::now();
@@ -535,6 +519,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     "[CAP] iter done"
                 );
             }
+            capture_failures.record_success();
         } else {
             tracing::trace!(
                 target: "ghostframe::xdaemon::capture",
@@ -542,6 +527,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 capture_us = capture_us,
                 "[CAP] capture returned None (no submission this iter)"
             );
+            // A capture that fails every iteration used to warn 30x/s forever
+            // while the process stayed up, so systemd (Restart=on-failure)
+            // never got a failure to act on. Exit non-zero instead.
+            if capture_failures.record_failure() {
+                tracing::error!(
+                    consecutive = capture_failures.consecutive,
+                    "capture failed on every attempt; exiting so the service manager restarts us"
+                );
+                return Err(format!(
+                    "capture failed {} consecutive times",
+                    capture_failures.consecutive
+                )
+                .into());
+            }
         }
 
         #[allow(
@@ -556,6 +555,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     tracing::warn!(frames = frame_count, "capture loop exited");
     Ok(())
+}
+
+/// Consecutive failed captures tolerated before the daemon exits (about ten
+/// seconds at the default 30 fps). Transient failures (a mode switch, a
+/// momentary DRM master loss) clear well inside this.
+const MAX_CONSECUTIVE_CAPTURE_FAILURES: u32 = 300;
+
+#[derive(Debug, Default)]
+struct CaptureFailures {
+    consecutive: u32,
+}
+
+impl CaptureFailures {
+    fn record_success(&mut self) {
+        self.consecutive = 0;
+    }
+
+    /// Returns true once the failure budget is exhausted.
+    fn record_failure(&mut self) -> bool {
+        self.consecutive = self.consecutive.saturating_add(1);
+        self.consecutive >= MAX_CONSECUTIVE_CAPTURE_FAILURES
+    }
 }
 
 /// Write a captured BGRA frame to `<dir>/frame_<count>.png`.  Best-effort:
@@ -625,6 +646,20 @@ mod tests {
         ));
         fs::create_dir_all(&base).unwrap();
         base
+    }
+
+    #[test]
+    fn capture_failures_trip_after_budget_and_reset_on_success() {
+        let mut f = CaptureFailures::default();
+        for _ in 0..MAX_CONSECUTIVE_CAPTURE_FAILURES - 1 {
+            assert!(!f.record_failure());
+        }
+        // A success in the middle of a streak restarts the count.
+        f.record_success();
+        for _ in 0..MAX_CONSECUTIVE_CAPTURE_FAILURES - 1 {
+            assert!(!f.record_failure());
+        }
+        assert!(f.record_failure(), "budget exhausted must trip");
     }
 
     #[test]

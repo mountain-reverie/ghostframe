@@ -59,6 +59,7 @@
 //! On real hardware where xdaemon is the only DRM client (e.g. headless
 //! servers without an X server), the writeback path works as designed.
 
+use crate::util::monotonic_now_ns;
 use std::fs::File;
 use std::num::NonZeroU32;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
@@ -379,21 +380,6 @@ fn test_writeback_commit(
         }
     }
     Ok(())
-}
-
-/// Read CLOCK_MONOTONIC and return the value as nanoseconds since the epoch.
-/// Used to timestamp capture completion for M3.5 bench telemetry.
-fn monotonic_now_ns() -> u64 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: clock_gettime is async-signal-safe and writes only to the
-    // caller-owned timespec. CLOCK_MONOTONIC is always available on Linux.
-    unsafe {
-        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
-    }
-    (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
 }
 
 fn capture_via_writeback(

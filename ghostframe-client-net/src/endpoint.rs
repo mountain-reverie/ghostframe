@@ -26,19 +26,32 @@ pub(crate) struct ClientEndpoint {
     conn: Option<(ConnectionHandle, Connection)>,
     conn_events: VecDeque<ConnectionEvent>,
     timeout: Option<Instant>,
+    /// Scratch for quinn-proto's `handle` / `poll_transmit` output, reused
+    /// across calls instead of allocating a max-UDP-payload `Vec` per
+    /// datagram. Always cleared before use.
+    scratch: Vec<u8>,
 }
 
 impl ClientEndpoint {
-    pub(crate) fn new() -> Self {
+    /// `rng_seed` pins quinn-proto's endpoint RNG, which seeds each
+    /// connection's RNG (and so the application-space packet number it skips,
+    /// path challenges, key-phase size) and the transport-parameter grease.
+    /// Connection IDs and the reset key use quinn's own thread RNG and stay
+    /// random. `None` keeps it entropy-seeded.
+    pub(crate) fn new(rng_seed: Option<[u8; 32]>) -> Self {
         // Client endpoints never accept incoming connections, so there is no
         // `ServerConfig`.
-        let endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None, false, None);
+        let mut config = EndpointConfig::default();
+        config.rng_seed(rng_seed);
+        let endpoint = Endpoint::new(Arc::new(config), None, false, None);
+        let scratch = Vec::with_capacity(endpoint.config().get_max_udp_payload_size() as usize);
         Self {
             endpoint,
             outbound: VecDeque::new(),
             conn: None,
             conn_events: VecDeque::new(),
             timeout: None,
+            scratch,
         }
     }
 
@@ -69,12 +82,11 @@ impl ClientEndpoint {
         ecn: Option<quinn_proto::EcnCodepoint>,
         packet: BytesMut,
     ) {
-        let buf_size = self.endpoint.config().get_max_udp_payload_size() as usize;
-        let mut buf = Vec::with_capacity(buf_size);
+        self.scratch.clear();
 
         match self
             .endpoint
-            .handle(now, remote, None, ecn, packet, &mut buf)
+            .handle(now, remote, None, ecn, packet, &mut self.scratch)
         {
             None => {}
             Some(DatagramEvent::NewConnection(_incoming)) => {
@@ -101,7 +113,8 @@ impl ClientEndpoint {
             }
             Some(DatagramEvent::Response(transmit)) => {
                 let size = transmit.size;
-                self.outbound.extend(split_transmit(transmit, &buf[..size]));
+                self.outbound
+                    .extend(split_transmit(transmit, &self.scratch[..size]));
             }
         }
     }
@@ -109,8 +122,7 @@ impl ClientEndpoint {
     /// Dispatch queued connection events, poll endpoint events, drain transmits.
     /// Loops until there are no more endpoint events to process.
     pub(crate) fn drive_outgoing(&mut self, now: Instant) {
-        let buf_size = self.endpoint.config().get_max_udp_payload_size() as usize;
-        let mut buf = Vec::with_capacity(buf_size);
+        self.scratch.clear();
 
         loop {
             let mut endpoint_events: Vec<(ConnectionHandle, quinn_proto::EndpointEvent)> = vec![];
@@ -129,10 +141,11 @@ impl ClientEndpoint {
                     endpoint_events.push((*ch, event));
                 }
 
-                while let Some(transmit) = conn.poll_transmit(now, 10, &mut buf) {
+                while let Some(transmit) = conn.poll_transmit(now, 10, &mut self.scratch) {
                     let size = transmit.size;
-                    self.outbound.extend(split_transmit(transmit, &buf[..size]));
-                    buf.clear();
+                    self.outbound
+                        .extend(split_transmit(transmit, &self.scratch[..size]));
+                    self.scratch.clear();
                 }
 
                 self.timeout = conn.poll_timeout();

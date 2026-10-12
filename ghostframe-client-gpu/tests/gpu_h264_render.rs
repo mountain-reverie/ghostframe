@@ -127,32 +127,36 @@ fn a_decoded_frame_lands_in_the_framebuffer() {
     };
 
     let mut renderer = Renderer::new(&ctx, 640, 480, 3, &[], true, false).expect("renderer");
-    renderer.apply_event(
-        &ctx,
-        &Event::FrameDimensions {
-            width: 640,
-            height: 480,
-        },
-    );
+    renderer
+        .apply_event(
+            &ctx,
+            Event::FrameDimensions {
+                width: 640,
+                height: 480,
+            },
+        )
+        .expect("gpu ok");
 
     let clip = gradient_clip(640, 480, 4);
     for (i, au) in clip.iter().enumerate() {
-        renderer.apply_event(
-            &ctx,
-            &Event::NeedsH264 {
-                frame_seq: i as u32,
-                timestamp_us: i as u32 * 16_667,
-                is_keyframe: i == 0,
-                payload: au.clone(),
-            },
-        );
+        renderer
+            .apply_event(
+                &ctx,
+                Event::NeedsH264 {
+                    frame_seq: i as u32,
+                    timestamp_us: i as u32 * 16_667,
+                    is_keyframe: i == 0,
+                    payload: au.clone(),
+                },
+            )
+            .expect("gpu ok");
     }
     // libx264 defaults to B-frames, so the last access unit(s) fed above can
     // still be buffered by reordering rather than decoded yet -- drain them
     // so the assertions below see the whole clip, not however much of it
     // happened to have already left the decoder.
     renderer.finish_h264(&ctx);
-    renderer.flush(&ctx);
+    renderer.flush(&ctx).expect("gpu ok");
 
     let pixels = renderer.debug_read_framebuffer(&ctx);
     assert_looks_like_gradient(&pixels, 640, 480);
@@ -217,13 +221,15 @@ fn run_decode_and_publish_timing(paced: bool) {
     );
 
     let mut renderer = Renderer::new(&ctx, WIDTH, HEIGHT, 3, &[], false, false).expect("renderer");
-    renderer.apply_event(
-        &ctx,
-        &Event::FrameDimensions {
-            width: WIDTH,
-            height: HEIGHT,
-        },
-    );
+    renderer
+        .apply_event(
+            &ctx,
+            Event::FrameDimensions {
+                width: WIDTH,
+                height: HEIGHT,
+            },
+        )
+        .expect("gpu ok");
 
     let clip = gradient_clip(WIDTH, HEIGHT, FRAME_COUNT);
     // Real wall-clock scheduling on purpose: this reproduces production's
@@ -238,28 +244,30 @@ fn run_decode_and_publish_timing(paced: bool) {
                 std::thread::sleep(deadline - now);
             }
         }
-        renderer.apply_event(
-            &ctx,
-            &Event::NeedsH264 {
-                frame_seq: i as u32,
-                timestamp_us: i as u32 * 16_667,
-                is_keyframe: i == 0,
-                payload: au.clone(),
-            },
-        );
+        renderer
+            .apply_event(
+                &ctx,
+                Event::NeedsH264 {
+                    frame_seq: i as u32,
+                    timestamp_us: i as u32 * 16_667,
+                    is_keyframe: i == 0,
+                    payload: au.clone(),
+                },
+            )
+            .expect("gpu ok");
         // Mirrors `render_thread.rs`'s real per-event loop (decode ->
         // flush -> publish -> release) rather than batching every frame's
         // decode ahead of a single flush/publish, so `ring::publish`'s
         // `poll_us` samples are the same shape the production render
         // thread produces: one publish per decoded frame, interleaved with
         // decode work, not decode work run in isolation from it.
-        renderer.flush(&ctx);
+        renderer.flush(&ctx).expect("gpu ok");
         if let Some(pf) = renderer.publish(&ctx) {
             renderer.release(pf.frame_id);
         }
     }
     renderer.finish_h264(&ctx);
-    renderer.flush(&ctx);
+    renderer.flush(&ctx).expect("gpu ok");
 
     let pixels = renderer.debug_read_framebuffer(&ctx);
     assert_looks_like_gradient(&pixels, WIDTH, HEIGHT);
@@ -537,16 +545,18 @@ fn report_percentiles(label: &str, mut values: Vec<u64>) {
 fn drive_clip(renderer: &mut Renderer, ctx: &WgpuContext, clip: &[Vec<u8>], start_seq: u32) -> u32 {
     let mut seq = start_seq;
     for (i, au) in clip.iter().enumerate() {
-        renderer.apply_event(
-            ctx,
-            &Event::NeedsH264 {
-                frame_seq: seq,
-                timestamp_us: seq.wrapping_mul(16_667),
-                is_keyframe: i == 0,
-                payload: au.clone(),
-            },
-        );
-        renderer.flush(ctx);
+        renderer
+            .apply_event(
+                ctx,
+                Event::NeedsH264 {
+                    frame_seq: seq,
+                    timestamp_us: seq.wrapping_mul(16_667),
+                    is_keyframe: i == 0,
+                    payload: au.clone(),
+                },
+            )
+            .expect("gpu ok");
+        renderer.flush(ctx).expect("gpu ok");
         if let Some(pf) = renderer.publish(ctx) {
             renderer.release(pf.frame_id);
         }
@@ -613,13 +623,15 @@ fn h264_mode_reentry_timing() {
     eprintln!("=== h264_mode_reentry_timing ({WIDTH}x{HEIGHT}) ===");
 
     let mut renderer = Renderer::new(&ctx, WIDTH, HEIGHT, 3, &[], false, false).expect("renderer");
-    renderer.apply_event(
-        &ctx,
-        &Event::FrameDimensions {
-            width: WIDTH,
-            height: HEIGHT,
-        },
-    );
+    renderer
+        .apply_event(
+            &ctx,
+            Event::FrameDimensions {
+                width: WIDTH,
+                height: HEIGHT,
+            },
+        )
+        .expect("gpu ok");
 
     let warmup_clip = gradient_clip(WIDTH, HEIGHT, WARMUP_FRAMES);
     let mut seq = drive_clip(&mut renderer, &ctx, &warmup_clip, 0);
@@ -642,7 +654,7 @@ fn h264_mode_reentry_timing() {
     }
 
     renderer.finish_h264(&ctx);
-    renderer.flush(&ctx);
+    renderer.flush(&ctx).expect("gpu ok");
     let pixels = renderer.debug_read_framebuffer(&ctx);
     assert_looks_like_gradient(&pixels, WIDTH, HEIGHT);
 
@@ -748,13 +760,15 @@ fn h264_resolution_change_timing() {
     eprintln!("=== h264_resolution_change_timing ({W1}x{H1} <-> {W2}x{H2}) ===");
 
     let mut renderer = Renderer::new(&ctx, W1, H1, 3, &[], false, false).expect("renderer");
-    renderer.apply_event(
-        &ctx,
-        &Event::FrameDimensions {
-            width: W1,
-            height: H1,
-        },
-    );
+    renderer
+        .apply_event(
+            &ctx,
+            Event::FrameDimensions {
+                width: W1,
+                height: H1,
+            },
+        )
+        .expect("gpu ok");
 
     let clip_1080 = gradient_clip(W1, H1, WARMUP_FRAMES);
     let mut seq = drive_clip(&mut renderer, &ctx, &clip_1080, 0);
@@ -762,32 +776,36 @@ fn h264_resolution_change_timing() {
     // Resolution change 1: 1920x1080 -> 1280x720. `FrameDimensions` first,
     // same order the server's own event stream guarantees (the tile/H.264
     // dimensions change is announced before pixels at the new size arrive).
-    renderer.apply_event(
-        &ctx,
-        &Event::FrameDimensions {
-            width: W2,
-            height: H2,
-        },
-    );
+    renderer
+        .apply_event(
+            &ctx,
+            Event::FrameDimensions {
+                width: W2,
+                height: H2,
+            },
+        )
+        .expect("gpu ok");
     let clip_720 = gradient_clip(W2, H2, POST_RESIZE_FRAMES);
     let resize1_first_seq = seq;
     seq = drive_clip(&mut renderer, &ctx, &clip_720, seq);
 
     // Resolution change 2: back to 1920x1080.
-    renderer.apply_event(
-        &ctx,
-        &Event::FrameDimensions {
-            width: W1,
-            height: H1,
-        },
-    );
+    renderer
+        .apply_event(
+            &ctx,
+            Event::FrameDimensions {
+                width: W1,
+                height: H1,
+            },
+        )
+        .expect("gpu ok");
     let clip_1080_again = gradient_clip(W1, H1, POST_RESIZE_FRAMES);
     let resize2_first_seq = seq;
     seq = drive_clip(&mut renderer, &ctx, &clip_1080_again, seq);
     let _ = seq;
 
     renderer.finish_h264(&ctx);
-    renderer.flush(&ctx);
+    renderer.flush(&ctx).expect("gpu ok");
     let pixels = renderer.debug_read_framebuffer(&ctx);
     assert_looks_like_gradient(&pixels, W1, H1);
 
@@ -887,18 +905,20 @@ fn run_eager_open_scenario(open_h264_eagerly: bool) -> Option<EagerOpenScenario>
 
     let mut renderer =
         Renderer::new(&ctx, WIDTH, HEIGHT, 3, &[], false, open_h264_eagerly).expect("renderer");
-    renderer.apply_event(
-        &ctx,
-        &Event::FrameDimensions {
-            width: WIDTH,
-            height: HEIGHT,
-        },
-    );
+    renderer
+        .apply_event(
+            &ctx,
+            Event::FrameDimensions {
+                width: WIDTH,
+                height: HEIGHT,
+            },
+        )
+        .expect("gpu ok");
 
     let clip = gradient_clip(WIDTH, HEIGHT, EAGER_OPEN_SCENARIO_FRAMES);
     drive_clip(&mut renderer, &ctx, &clip, 0);
     renderer.finish_h264(&ctx);
-    renderer.flush(&ctx);
+    renderer.flush(&ctx).expect("gpu ok");
 
     let pixels = renderer.debug_read_framebuffer(&ctx);
     assert_looks_like_gradient(&pixels, WIDTH, HEIGHT);
