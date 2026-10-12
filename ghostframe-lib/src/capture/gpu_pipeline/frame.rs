@@ -88,40 +88,58 @@ enum StageDispatch {
 /// pal_rle_index).
 const MAX_STAGE_BINDINGS: usize = 6;
 
-struct ScopedCommandBuffers<'a> {
-    device: &'a ash::Device,
-    pool: vk::CommandPool,
-    bufs: Vec<vk::CommandBuffer>,
-}
+// ---------------------------------------------------------------------------
+// Persistent per-processor command buffer + fence
+// ---------------------------------------------------------------------------
 
-impl Drop for ScopedCommandBuffers<'_> {
-    fn drop(&mut self) {
-        if !self.bufs.is_empty() {
-            // SAFETY: bufs/pool came from allocate_command_buffers on
-            // `self.device`. Free is the matching deallocation. Caller is
-            // responsible for ensuring the buffers are no longer in use
-            // (we only drop after wait_for_fences).
-            unsafe {
-                self.device.free_command_buffers(self.pool, &self.bufs);
-            }
+impl GpuFrameProcessor {
+    /// Hand out the processor's single command buffer, reset and ready for
+    /// `begin_command_buffer`.
+    ///
+    /// Invariant: every frame submits `frame_cmd` once and waits on
+    /// `frame_fence` before returning, so at frame start nothing is in
+    /// flight. The one exception is a previous frame whose `queue_submit`
+    /// succeeded but whose `wait_for_fences` failed (`frame_fence_pending`):
+    /// then the GPU may still own the buffer, so we wait again first, and if
+    /// that fails too (device lost) we return the error without touching
+    /// either object.
+    ///
+    /// Both resets are unconditionally safe after that: resetting a command
+    /// buffer left in the recording/executable state by an early `?` return
+    /// is legal (the pool has RESET_COMMAND_BUFFER), and resetting a fence
+    /// that is signalled (normal case) or unsignalled (previous frame failed
+    /// before/at submit) is legal as long as it is not attached to a pending
+    /// submission, which the wait above rules out.
+    pub(super) unsafe fn begin_frame_cmd(
+        &self,
+    ) -> Result<vk::CommandBuffer, Box<dyn std::error::Error>> {
+        if self.frame_fence_pending.get() {
+            self.device
+                .wait_for_fences(&[self.frame_fence], true, u64::MAX)?;
+            self.frame_fence_pending.set(false);
         }
+        self.device.reset_fences(&[self.frame_fence])?;
+        self.device
+            .reset_command_buffer(self.frame_cmd, vk::CommandBufferResetFlags::empty())?;
+        Ok(self.frame_cmd)
     }
-}
 
-struct ScopedFence<'a> {
-    device: &'a ash::Device,
-    fence: vk::Fence,
-}
-
-impl Drop for ScopedFence<'_> {
-    fn drop(&mut self) {
-        if self.fence != vk::Fence::null() {
-            // SAFETY: fence was created via create_fence on `self.device`.
-            // Caller must wait_for_fences before dropping (we do).
-            unsafe {
-                self.device.destroy_fence(self.fence, None);
-            }
-        }
+    /// End-of-frame: submit `cmd` (already `end_command_buffer`ed) and block
+    /// until the GPU is done with it.
+    unsafe fn submit_frame_cmd_and_wait(
+        &self,
+        cmd: vk::CommandBuffer,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cmds = [cmd];
+        let submit_info = vk::SubmitInfo::default().command_buffers(&cmds);
+        self.device
+            .queue_submit(self.queue, &[submit_info], self.frame_fence)?;
+        // Submitted: until the wait returns the GPU owns cmd and the fence.
+        self.frame_fence_pending.set(true);
+        self.device
+            .wait_for_fences(&[self.frame_fence], true, u64::MAX)?;
+        self.frame_fence_pending.set(false);
+        Ok(())
     }
 }
 
@@ -408,17 +426,8 @@ impl GpuFrameProcessor {
 
         // Note: pal_rle_index descriptor set is allocated inside run_pal_rle_index_stage (called below).
 
-        // --- Command buffer (RAII-guarded) ---
-        let cmd_alloc = vk::CommandBufferAllocateInfo::default()
-            .command_pool(self.command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let cmd_guard = ScopedCommandBuffers {
-            device: &self.device,
-            pool: self.command_pool,
-            bufs: self.device.allocate_command_buffers(&cmd_alloc)?,
-        };
-        let cmd = cmd_guard.bufs[0];
+        // --- Command buffer (persistent; reset per frame) ---
+        let cmd = self.begin_frame_cmd()?;
 
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
@@ -552,17 +561,8 @@ impl GpuFrameProcessor {
 
         self.device.end_command_buffer(cmd)?;
 
-        // 6. Submit and wait. Fence is RAII-guarded so an early `?` can't leak it.
-        let fence_ci = vk::FenceCreateInfo::default();
-        let fence_guard = ScopedFence {
-            device: &self.device,
-            fence: self.device.create_fence(&fence_ci, None)?,
-        };
-        let submit_info = vk::SubmitInfo::default().command_buffers(&cmd_guard.bufs);
-        self.device
-            .queue_submit(self.queue, &[submit_info], fence_guard.fence)?;
-        self.device
-            .wait_for_fences(&[fence_guard.fence], true, u64::MAX)?;
+        // 6. Submit and wait on the persistent fence.
+        self.submit_frame_cmd_and_wait(cmd)?;
 
         // 7. Read SAD values
         let sad_slice = std::slice::from_raw_parts(self.sad_buf.ptr, tile_count as usize);
@@ -586,8 +586,8 @@ impl GpuFrameProcessor {
             );
         }
 
-        // 8. Per-frame transients (descriptor sets, command buffer, fence) are
-        //    freed when their RAII guards drop at end of scope. We touch the
+        // 8. Per-frame descriptor sets are freed when their RAII guards drop
+        //    at end of scope. We touch the
         //    guards here to keep them alive past the `wait_for_fences` above.
         //    sad_ds_guard, nv12_ds_guard, analysis_ds_guard,
         //    palrle_compact_ds_guard, palrle_indirect_args_ds_guard,
@@ -602,13 +602,7 @@ impl GpuFrameProcessor {
         //    GPU-safety: these drops must NOT move above the `wait_for_fences` at
         //    step 6 — releasing descriptor sets while the GPU is still using them
         //    is undefined behaviour (use-after-free in the descriptor pool).
-        let _ = (
-            &nv12_ds_guard,
-            &analysis_ds_guard,
-            &guards,
-            &cmd_guard,
-            &fence_guard,
-        );
+        let _ = (&nv12_ds_guard, &analysis_ds_guard, &guards);
         drop(sad_ds_guard);
         drop(nv12_ds_guard);
         drop(analysis_ds_guard);
@@ -690,16 +684,7 @@ impl GpuFrameProcessor {
         // Note: palette_subset_fold descriptor set is allocated inside run_palette_subset_fold_stage (called below).
         // Note: pal_rle_index descriptor set is allocated inside run_pal_rle_index_stage (called below).
 
-        let cmd_alloc = vk::CommandBufferAllocateInfo::default()
-            .command_pool(self.command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let cmd_guard = ScopedCommandBuffers {
-            device: &self.device,
-            pool: self.command_pool,
-            bufs: self.device.allocate_command_buffers(&cmd_alloc)?,
-        };
-        let cmd = cmd_guard.bufs[0];
+        let cmd = self.begin_frame_cmd()?;
 
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
@@ -831,29 +816,12 @@ impl GpuFrameProcessor {
 
         self.device.end_command_buffer(cmd)?;
 
-        // Fence is RAII-guarded so an early `?` can't leak it.
-        let fence_ci = vk::FenceCreateInfo::default();
-        let fence_guard = ScopedFence {
-            device: &self.device,
-            fence: self.device.create_fence(&fence_ci, None)?,
-        };
-        let submit_info = vk::SubmitInfo::default().command_buffers(&cmd_guard.bufs);
-        self.device
-            .queue_submit(self.queue, &[submit_info], fence_guard.fence)?;
-        self.device
-            .wait_for_fences(&[fence_guard.fence], true, u64::MAX)?;
+        self.submit_frame_cmd_and_wait(cmd)?;
 
-        // Per-frame transients (descriptor sets, command buffer, fence) are
-        // freed when their RAII guards drop at end of scope. Touch them here
+        // Per-frame descriptor sets are freed when their RAII guards drop at
+        // end of scope. Touch them here
         // to keep them alive past `wait_for_fences`.
-        let _ = (
-            &nv12_ds_guard,
-            &analysis_ds_guard,
-            &guards,
-            &cmd_guard,
-            &fence_guard,
-        );
-        drop(fence_guard);
+        let _ = (&nv12_ds_guard, &analysis_ds_guard, &guards);
         guards.release_reverse();
 
         Ok(())

@@ -260,6 +260,13 @@ pub struct GpuFrameProcessor {
     #[allow(dead_code)]
     queue_family_index: u32,
     command_pool: vk::CommandPool,
+    /// Persistent per-frame command buffer (allocated once from `command_pool`,
+    /// which has RESET_COMMAND_BUFFER) and its fence; see `begin_frame_cmd`.
+    frame_cmd: vk::CommandBuffer,
+    frame_fence: vk::Fence,
+    /// True between a successful `queue_submit` and the matching successful
+    /// `wait_for_fences`.
+    frame_fence_pending: std::cell::Cell<bool>,
 
     // SAD pipeline
     sad: ComputeStage,
@@ -786,6 +793,12 @@ impl Drop for GpuFrameProcessor {
             // index_buffer (Stage 3 output)
             self.index.destroy(&self.device);
 
+            // Persistent per-frame command buffer + fence: device_wait_idle
+            // above means nothing is in flight. Fence before the device is
+            // destroyed; command buffer before its pool.
+            self.device.destroy_fence(self.frame_fence, None);
+            self.device
+                .free_command_buffers(self.command_pool, &[self.frame_cmd]);
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);

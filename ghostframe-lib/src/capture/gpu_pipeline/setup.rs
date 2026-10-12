@@ -800,6 +800,15 @@ impl GpuFrameProcessor {
         )?;
         let cdf53_escalation_coefficients_ptr = cdf53_escalation_coefficients_ptr_mut as *const i32;
 
+        // Persistent per-frame command buffer + fence (see begin_frame_cmd).
+        let frame_cmd = device.allocate_command_buffers(
+            &vk::CommandBufferAllocateInfo::default()
+                .command_pool(command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1),
+        )?[0];
+        let frame_fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
+
         Ok(Self {
             _entry: entry,
             instance,
@@ -808,6 +817,9 @@ impl GpuFrameProcessor {
             queue,
             queue_family_index,
             command_pool,
+            frame_cmd,
+            frame_fence,
+            frame_fence_pending: std::cell::Cell::new(false),
             sad: ComputeStage {
                 module: shader_module,
                 pipeline,
