@@ -402,6 +402,9 @@ pub struct GpuFrameProcessor {
     /// `force_dirty_frames` no-commit semantics.
     force_all_dirty_remaining: u32,
 
+    /// Which ingest path the last `process_frame` took (`None` before the first).
+    last_ingest: Option<IngestTier>,
+
     /// Staged count from the most recent `set_escalation_candidates` call.
     /// Copied from the HOST_COHERENT pointer into a plain field so the
     /// command-buffer recording paths can read it without a raw-pointer
@@ -534,6 +537,31 @@ struct PrevFrame {
     width: u32,
     #[allow(dead_code)]
     height: u32,
+    /// Set when `image` was filled from an imported dma-buf `VkBuffer`
+    /// (see `import_dmabuf`). The copy into `image` is recorded in the frame's
+    /// command buffer by `record_acquire_current`; `None` for images the host
+    /// wrote directly (`import_pixels`) and for owned snapshots.
+    ingest: Option<BufferIngest>,
+}
+
+/// The imported dma-buf, as a `VkBuffer` (buffers have no row pitch), plus the
+/// row length the copy into the pipeline image must use.
+struct BufferIngest {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    /// `bufferRowLength` for `vkCmdCopyBufferToImage`, in texels (`stride / 4`).
+    row_length_texels: u32,
+}
+
+/// How the most recent `process_frame` obtained its pixels. Exposed so tests
+/// can prove which path ran instead of trusting that "it worked".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IngestTier {
+    /// dma-buf imported as a `VkBuffer`, copied to the pipeline image on the GPU.
+    DmabufBuffer,
+    /// dma-buf could not be imported; pixels were read with mmap +
+    /// `DMA_BUF_IOCTL_SYNC` and uploaded like `process_frame_from_pixels`.
+    CpuMmap,
 }
 
 // Safety: GpuFrameProcessor is used from a single tokio task; Vulkan objects are
@@ -602,6 +630,11 @@ impl GpuFrameProcessor {
     ) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
         let analysis = self.process_frame(fd, width, height, stride)?;
         Ok(analysis.dirty_tiles)
+    }
+
+    /// Which ingest path the most recent `process_frame` took.
+    pub fn last_ingest_tier(&self) -> Option<IngestTier> {
+        self.last_ingest
     }
 
     /// Stage the per-frame idle-escalation candidate list. Must be called
@@ -795,6 +828,13 @@ impl Drop for GpuFrameProcessor {
 
 mod frame;
 mod setup;
+
+#[cfg(test)]
+#[path = "../../../tests/support/dmabuf_fixture.rs"]
+pub(crate) mod dmabuf_fixture;
+
+#[cfg(test)]
+mod ingest_tests;
 
 #[cfg(test)]
 mod tests;
