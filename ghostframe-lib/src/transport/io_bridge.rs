@@ -1375,13 +1375,8 @@ impl IoBridge {
                         break;
                     }
                     let sub_kind = buf[offset + 1];
-                    let required = match sub_kind {
-                        // PointerMove / Wheel / KeyDown / KeyUp: 6 bytes
-                        0x01 | 0x03 | 0x04 | 0x05 => 6,
-                        // PointerButton: 8 bytes
-                        0x02 => 8,
-                        _ => 0,
-                    };
+                    let required =
+                        crate::transport::input_inject::required_len(sub_kind).unwrap_or(0);
                     if required == 0 {
                         tracing::warn!(sub_kind, "unknown INPUT sub-kind; clearing feedback buf");
                         discard_tail = true;
