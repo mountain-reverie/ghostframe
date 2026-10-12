@@ -84,56 +84,10 @@ jobs:
       # machine, where the 11 oracles compare against a software golden.
       - run: cargo clippy -p ghostframe-client-h264 --no-default-features --features gstreamer-backend --all-targets -- -D warnings
       - run: cargo clippy -p ghostframe-client-h264 --no-default-features --features gstreamer-backend,test-support --all-targets -- -D warnings
-      - name: ghostframe-lib reads env only in config.rs
-        run: |
-          # Comment lines are excluded deliberately: the guard constrains code,
-          # not prose. Matching comments would push authors to stop naming
-          # `env::var` in documentation, which is the opposite of useful.
-          #
-          # gpu_pipeline/frame.rs is exempt: its three cdf53-diag reads sit in
-          # the Vulkan dispatch path, where threading config through is a much
-          # larger change. They are feature-gated and race nothing; tracked as
-          # deferred work in docs/superpowers/plans/2026-09-08-lib-config.md.
-          if grep -rn 'env::var' ghostframe-lib/src --include='*.rs' \
-               | grep -v '^ghostframe-lib/src/config.rs' \
-               | grep -v '^ghostframe-lib/src/capture/gpu_pipeline/frame.rs' \
-               | grep -vE ':[0-9]+: *(//|///|//!)'; then
-            echo "::error::ghostframe-lib must read std::env only in config.rs"
-            exit 1
-          fi
-      - name: client crates read env only in config.rs
-        run: |
-          # Same rule and same comment-line exclusion as the ghostframe-lib
-          # guard above, extended to every ghostframe-client-* crate.
-          # ghostframe-client-gpu/src/config.rs is the one sanctioned reader
-          # (GHOSTFRAME_CLIENT_DUMP_*). ghostframe-client-native/src/lib.rs
-          # is exempt for its single TS_CONTROL_URL read, which is a tailscale
-          # variable passed through to tsnet rather than a ghostframe knob;
-          # tracked for a proper config module in ghostframe-client-native.
-          if grep -rn 'env::var' ghostframe-client-*/src --include='*.rs' \
-               | grep -vE '^ghostframe-client-[a-z0-9]+/src/config\.rs' \
-               | grep -v '^ghostframe-client-native/src/lib.rs' \
-               | grep -vE ':[0-9]+: *(//|///|//!)'; then
-            echo "::error::ghostframe-client-* crates must read std::env only in config.rs"
-            exit 1
-          fi
-
-      - name: ghostframe-xdaemon reads env only in config.rs
-        run: |
-          # Same rule as ghostframe-lib above: every variable is parsed once,
-          # in ghostframe-xdaemon/src/config.rs, and passed down. tests/ is
-          # not scanned -- integration tests legitimately read PATH.
-          if grep -rn 'env::var' ghostframe-xdaemon/src --include='*.rs' \
-               | grep -v '^ghostframe-xdaemon/src/config.rs' \
-               | grep -vE ':[0-9]+: *(//|///|//!)'; then
-            echo "::error::ghostframe-xdaemon must read std::env only in config.rs"
-            exit 1
-          fi
-          if grep -rnE 'env::(set_var|remove_var)' ghostframe-xdaemon/src --include='*.rs' \
-               | grep -vE ':[0-9]+: *(//|///|//!)'; then
-            echo "::error::ghostframe-xdaemon must not mutate the process environment"
-            exit 1
-          fi
+      # One script, shared with `just ci-local`, so the local gate and this
+      # job cannot drift apart. The rule and its exemptions are documented there.
+      - name: crates read env only in config.rs
+        run: ci/check-env-reads.sh
 
   unit:
     name: unit
