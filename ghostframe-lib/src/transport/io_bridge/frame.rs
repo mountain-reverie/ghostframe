@@ -502,57 +502,7 @@ impl IoBridge {
         // very first frame the tracker has cols=0, rows=0 (constructed via
         // MetricsTracker::new(0, 0)), so detect_escalation_candidates iterates
         // 0 tiles and returns empty — safe.
-        {
-            let _caps = self.client_caps;
-            // Gate on self.frame_mode (the PREVIOUS frame's mode). Skipping
-            // escalation while the previous frame was H264 avoids ~5 ms of
-            // wasted GPU forward + 6 MB of HOST_COHERENT writes per frame:
-            // the post-fence Phase B that consumes the coefficients lives
-            // inside the FrameMode::TileCodec arm below, so under H264 the
-            // forward dispatch's output is silently dropped.
-            //
-            // One-frame-late on the H264->TileCodec transition: prev_mode is
-            // still H264 on the transition frame, so escalation fires on the
-            // SECOND TileCodec frame. Acceptable — refinement queries run
-            // every frame and there are plenty of cycles to escalate.
-            let frame_mode_eligible = matches!(self.frame_mode, crate::tile::FrameMode::TileCodec);
-            let h264_candidates = if frame_mode_eligible {
-                crate::tile::detect_escalation_candidates(
-                    &self.metrics_tracker,
-                    crate::capture::gpu_pipeline::MAX_ESCALATION_PER_FRAME,
-                )
-            } else {
-                Vec::new()
-            };
-            // Phase 1.5-B: detect stranded CDF53 tiles whose retransmit
-            // cache has drained but the client hasn't ACKed every pass.
-            // These need re-emission at the EXISTING generation (no
-            // bump). Dispatched by Phase B based on `codec_state ==
-            // Cdf53`. Inlined here (not in escalation.rs) to avoid a
-            // tile/ → transport/ layering dependency: the eligibility
-            // check needs the scheduler's per-(tile, gen) ACK bitmap
-            // and the reliable_emitter's cache occupancy, both
-            // transport-layer state.
-            let stranded_candidates = if frame_mode_eligible {
-                self.detect_stranded_cdf53_tiles(
-                    crate::capture::gpu_pipeline::MAX_ESCALATION_PER_FRAME
-                        .saturating_sub(h264_candidates.len()),
-                )
-            } else {
-                Vec::new()
-            };
-            // Merge: stranded first (more time-sensitive — client has
-            // been waiting > 30 frames), then H264 escalation.
-            let mut candidates =
-                Vec::with_capacity(stranded_candidates.len() + h264_candidates.len());
-            candidates.extend(&stranded_candidates);
-            candidates.extend(&h264_candidates);
-            candidates.truncate(crate::capture::gpu_pipeline::MAX_ESCALATION_PER_FRAME);
-            let processor = self.gpu_frame_processor.as_mut().unwrap();
-            processor.set_escalation_candidates(&candidates);
-            self.cdf53_escalation_candidates_this_frame = candidates;
-            self.cdf53_stranded_candidates_this_frame = stranded_candidates;
-        }
+        self.collect_escalation_candidates();
 
         // GPU pipeline: Vulkan SAD dirty detection + NV12 conversion.
         // Dispatch to the DMA-BUF path if a fd was provided; otherwise upload
@@ -1843,6 +1793,59 @@ impl IoBridge {
                 );
             }
         }
+    }
+
+    /// Per-frame idle-escalation sweep and stranded-tile detection; stores the
+    /// merged candidate list on the bridge and hands it to the GPU processor.
+    fn collect_escalation_candidates(&mut self) {
+        let _caps = self.client_caps;
+        // Gate on self.frame_mode (the PREVIOUS frame's mode). Skipping
+        // escalation while the previous frame was H264 avoids ~5 ms of
+        // wasted GPU forward + 6 MB of HOST_COHERENT writes per frame:
+        // the post-fence Phase B that consumes the coefficients lives
+        // inside the FrameMode::TileCodec arm below, so under H264 the
+        // forward dispatch's output is silently dropped.
+        //
+        // One-frame-late on the H264->TileCodec transition: prev_mode is
+        // still H264 on the transition frame, so escalation fires on the
+        // SECOND TileCodec frame. Acceptable — refinement queries run
+        // every frame and there are plenty of cycles to escalate.
+        let frame_mode_eligible = matches!(self.frame_mode, crate::tile::FrameMode::TileCodec);
+        let h264_candidates = if frame_mode_eligible {
+            crate::tile::detect_escalation_candidates(
+                &self.metrics_tracker,
+                crate::capture::gpu_pipeline::MAX_ESCALATION_PER_FRAME,
+            )
+        } else {
+            Vec::new()
+        };
+        // Phase 1.5-B: detect stranded CDF53 tiles whose retransmit
+        // cache has drained but the client hasn't ACKed every pass.
+        // These need re-emission at the EXISTING generation (no
+        // bump). Dispatched by Phase B based on `codec_state ==
+        // Cdf53`. Inlined here (not in escalation.rs) to avoid a
+        // tile/ → transport/ layering dependency: the eligibility
+        // check needs the scheduler's per-(tile, gen) ACK bitmap
+        // and the reliable_emitter's cache occupancy, both
+        // transport-layer state.
+        let stranded_candidates = if frame_mode_eligible {
+            self.detect_stranded_cdf53_tiles(
+                crate::capture::gpu_pipeline::MAX_ESCALATION_PER_FRAME
+                    .saturating_sub(h264_candidates.len()),
+            )
+        } else {
+            Vec::new()
+        };
+        // Merge: stranded first (more time-sensitive — client has
+        // been waiting > 30 frames), then H264 escalation.
+        let mut candidates = Vec::with_capacity(stranded_candidates.len() + h264_candidates.len());
+        candidates.extend(&stranded_candidates);
+        candidates.extend(&h264_candidates);
+        candidates.truncate(crate::capture::gpu_pipeline::MAX_ESCALATION_PER_FRAME);
+        let processor = self.gpu_frame_processor.as_mut().unwrap();
+        processor.set_escalation_candidates(&candidates);
+        self.cdf53_escalation_candidates_this_frame = candidates;
+        self.cdf53_stranded_candidates_this_frame = stranded_candidates;
     }
 
     /// Phase A: serially walk the GPU's compact list, map each tile's
