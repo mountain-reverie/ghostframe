@@ -564,175 +564,9 @@ impl IoBridge {
         // matching the row-major layout used by MetricsTracker / TileGrid.
         let cols = frame.width.div_ceil(crate::tile::TILE_SIZE);
         let rows = frame.height.div_ceil(crate::tile::TILE_SIZE);
-        let dirty_xy: Vec<(u32, u32)> = analysis
-            .dirty_tiles
-            .iter()
-            .map(|&idx| (idx % cols, idx / cols))
-            .collect();
-
-        // Keep metrics_tracker AND scheduler grids in sync with dirty-detection
-        // (before the early return on empty dirty_xy, so the scheduler stays
-        // consistent even when no tiles are dispatched this frame).
-        if self.metrics_tracker.cols() != cols || self.metrics_tracker.rows() != rows {
-            self.metrics_tracker.resize(cols, rows);
-            self.scheduler.resize(cols, rows);
-        }
-        // Always update per-tile metrics — idle_frames advances on every frame,
-        // EMA decays toward 0 when tiles aren't dirty.
-        self.metrics_tracker.record_frame(&dirty_xy);
-
-        // Populate GPU-derived metrics (unique_colors, edge_density) for the dirty
-        // tiles from the tile_analysis buffer. The classifier rule for PalRLE
-        // (and Solid, post-M3.1) reads these.
-        populate_gpu_metrics(
-            &mut self.metrics_tracker,
-            &dirty_xy,
-            cols,
-            analysis.tile_analysis_slice(),
-        );
-
-        // Classify each dirty tile. Empty dirty_xy → empty tentative — that's
-        // the no-motion signal the classifier needs to exit H264 after exit_sustain.
-        use crate::tile::{classifier::classify_tile, FrameMode};
-        let tentative: Vec<crate::tile::CodecState> = dirty_xy
-            .iter()
-            .map(|&(tx, ty)| {
-                let m = self.metrics_tracker.get(tx, ty);
-                let prev = m.codec_state;
-                classify_tile(m, &prev)
-            })
-            .collect();
-
-        // Capture previous mode before evaluating the classifier, so the
-        // keyframe-request guard below can compare prev vs. new.
-        let prev_mode = self.frame_mode;
-
-        // Always evaluate mode — empty tentative drives the exit-sustain counter.
-        let deficit = self.scheduler.refinement_deficit_tiles();
-        self.classifier.set_refinement_deficit_tiles(deficit);
-        // `decide_frame_mode` (no `_at`) reads `Classifier`'s own
-        // `Instant::now()`-seeded epoch via `.elapsed()` — a 14th time
-        // source invisible to this file, and one that saturates to 0 (or
-        // drifts independently of frame counts) under the browserless
-        // harness's paused clock. Route the dwell timers through the
-        // bridge's own `now_std()` epoch instead, so `enter_sustain_micros`
-        // / `exit_sustain_micros` advance with virtual time exactly like
-        // every other deadline in this file.
-        let now_us = now_std().duration_since(self.epoch).as_micros() as u64;
-        let new_mode = self
-            .classifier
-            .decide_frame_mode_at(now_us, &tentative, prev_mode);
-
-        // Persist tentative state back into per-tile metrics for dirty tiles only.
-        for (i, &(tx, ty)) in dirty_xy.iter().enumerate() {
-            self.metrics_tracker.get_mut(tx, ty).codec_state = tentative[i];
-        }
-
-        // Accumulate the per-dirty-tile unique-color histogram. Cheap
-        // (one u32 increment per tile, no allocation), so always-on; the
-        // log emission is gated by the env var, and the accumulator is
-        // reset there. See `DiagnosticsConfig::from_lookup`'s doc comment for
-        // the motivation (verify the "is the textured background really
-        // > 16 colors per 32×32 tile?" hypothesis).
-        for &(tx, ty) in &dirty_xy {
-            let uc = self.metrics_tracker.get(tx, ty).unique_colors;
-            if uc == crate::tile::UNIQUE_COLORS_UNKNOWN {
-                self.color_histogram_accumulator.bucket_unknown = self
-                    .color_histogram_accumulator
-                    .bucket_unknown
-                    .saturating_add(1);
-            } else if uc == 1 {
-                self.color_histogram_accumulator.bucket_1 =
-                    self.color_histogram_accumulator.bucket_1.saturating_add(1);
-            } else if uc <= 4 {
-                self.color_histogram_accumulator.bucket_2_4 = self
-                    .color_histogram_accumulator
-                    .bucket_2_4
-                    .saturating_add(1);
-            } else if uc <= 16 {
-                self.color_histogram_accumulator.bucket_5_16 = self
-                    .color_histogram_accumulator
-                    .bucket_5_16
-                    .saturating_add(1);
-            } else {
-                self.color_histogram_accumulator.bucket_overflow = self
-                    .color_histogram_accumulator
-                    .bucket_overflow
-                    .saturating_add(1);
-            }
-        }
-
-        // Per-tile diagnostic tracing: emit one log line per dirty tile when
-        // GHOSTFRAME_DIAGNOSE_TILES=1 (or =true).  Parseable by downstream awk.
-        if self.diagnostics.diagnose_tiles {
-            for &(tx, ty) in &dirty_xy {
-                let m = self.metrics_tracker.get(tx, ty);
-                tracing::info!(
-                    target: "ghostframe::diagnose",
-                    tile_x = tx,
-                    tile_y = ty,
-                    unique_colors = m.unique_colors,
-                    codec_state = ?m.codec_state,
-                    "per-tile"
-                );
-            }
-        }
-
-        if new_mode != self.frame_mode {
-            tracing::info!(
-                target: LOG_TARGET,
-                prev = ?self.frame_mode,
-                new = ?new_mode,
-                seq,
-                "classifier flipped frame mode"
-            );
-
-            // H264 → TileCodec architectural invariant: invalidate the GPU SAD
-            // baseline so the next TileCodec frame re-emits every tile,
-            // overwriting whatever the H.264 phase rendered. Without this,
-            // static content produces 0 dirty tiles on mode entry (prev_image
-            // is current relative to the static screen) and the lossless tile
-            // codecs never get a chance to upgrade the canvas from the H.264
-            // lossy render. Symmetric to the existing `request_keyframe()` on
-            // TileCodec → H264 in the `FrameMode::H264` match arm below: each
-            // direction of the mode flip resets the state that the entering mode
-            // relies on (H.264 GOP for the H264 direction, GPU SAD baseline for
-            // the TileCodec direction).
-            //
-            // force_frames = 1 (not 20) because we're past QUIC slow-start by
-            // the time exit_sustain elapses; ACK-based retries handle
-            // individual datagram drops on the lossless tiles.
-            if prev_mode == FrameMode::H264 && new_mode == FrameMode::TileCodec {
-                if let Some(p) = self.gpu_frame_processor.as_mut() {
-                    p.invalidate_baseline(1);
-                    tracing::info!(
-                        target: LOG_TARGET,
-                        seq,
-                        "H264→TileCodec handoff: invalidate_baseline(1) — lossless repaint"
-                    );
-                }
-            }
-        }
-
-        // Update frame mode for next frame's hysteresis reference.
-        self.frame_mode = new_mode;
-
-        // M3.5 bench telemetry — emit after classifier picks the mode for this frame.
-        // target: "ghostframe::bench" lets the bench filter independently of the
-        // default ghostframe:: target.
-        {
-            let mode_str = match new_mode {
-                FrameMode::H264 => "h264",
-                FrameMode::TileCodec => "tile",
-            };
-            tracing::info!(
-                target: "ghostframe::bench",
-                frame_seq = seq,
-                capture_done_ns = frame.capture_done_ns,
-                mode = mode_str,
-                "frame.captured"
-            );
-        }
+        let (dirty_xy, prev_mode, new_mode) =
+            self.classify_dirty_tiles(&analysis, &frame, cols, rows, seq);
+        use crate::tile::FrameMode;
 
         // ---- M3.3c: PixelPerfect transition sweep ----
         // Runs every frame, unconditionally, before the dirty-tile early return.
@@ -1846,6 +1680,192 @@ impl IoBridge {
         processor.set_escalation_candidates(&candidates);
         self.cdf53_escalation_candidates_this_frame = candidates;
         self.cdf53_stranded_candidates_this_frame = stranded_candidates;
+    }
+
+    /// Dirty-tile bookkeeping, per-tile classification and frame-mode decision
+    /// for one GPU frame. Returns `(dirty_xy, prev_mode, new_mode)`.
+    fn classify_dirty_tiles(
+        &mut self,
+        analysis: &crate::capture::gpu_pipeline::FrameAnalysis,
+        frame: &FrameSubmission,
+        cols: u32,
+        rows: u32,
+        seq: u32,
+    ) -> (
+        Vec<(u32, u32)>,
+        crate::tile::FrameMode,
+        crate::tile::FrameMode,
+    ) {
+        let dirty_xy: Vec<(u32, u32)> = analysis
+            .dirty_tiles
+            .iter()
+            .map(|&idx| (idx % cols, idx / cols))
+            .collect();
+
+        // Keep metrics_tracker AND scheduler grids in sync with dirty-detection
+        // (before the early return on empty dirty_xy, so the scheduler stays
+        // consistent even when no tiles are dispatched this frame).
+        if self.metrics_tracker.cols() != cols || self.metrics_tracker.rows() != rows {
+            self.metrics_tracker.resize(cols, rows);
+            self.scheduler.resize(cols, rows);
+        }
+        // Always update per-tile metrics — idle_frames advances on every frame,
+        // EMA decays toward 0 when tiles aren't dirty.
+        self.metrics_tracker.record_frame(&dirty_xy);
+
+        // Populate GPU-derived metrics (unique_colors, edge_density) for the dirty
+        // tiles from the tile_analysis buffer. The classifier rule for PalRLE
+        // (and Solid, post-M3.1) reads these.
+        populate_gpu_metrics(
+            &mut self.metrics_tracker,
+            &dirty_xy,
+            cols,
+            analysis.tile_analysis_slice(),
+        );
+
+        // Classify each dirty tile. Empty dirty_xy → empty tentative — that's
+        // the no-motion signal the classifier needs to exit H264 after exit_sustain.
+        use crate::tile::{classifier::classify_tile, FrameMode};
+        let tentative: Vec<crate::tile::CodecState> = dirty_xy
+            .iter()
+            .map(|&(tx, ty)| {
+                let m = self.metrics_tracker.get(tx, ty);
+                let prev = m.codec_state;
+                classify_tile(m, &prev)
+            })
+            .collect();
+
+        // Capture previous mode before evaluating the classifier, so the
+        // keyframe-request guard below can compare prev vs. new.
+        let prev_mode = self.frame_mode;
+
+        // Always evaluate mode — empty tentative drives the exit-sustain counter.
+        let deficit = self.scheduler.refinement_deficit_tiles();
+        self.classifier.set_refinement_deficit_tiles(deficit);
+        // `decide_frame_mode` (no `_at`) reads `Classifier`'s own
+        // `Instant::now()`-seeded epoch via `.elapsed()` — a 14th time
+        // source invisible to this file, and one that saturates to 0 (or
+        // drifts independently of frame counts) under the browserless
+        // harness's paused clock. Route the dwell timers through the
+        // bridge's own `now_std()` epoch instead, so `enter_sustain_micros`
+        // / `exit_sustain_micros` advance with virtual time exactly like
+        // every other deadline in this file.
+        let now_us = now_std().duration_since(self.epoch).as_micros() as u64;
+        let new_mode = self
+            .classifier
+            .decide_frame_mode_at(now_us, &tentative, prev_mode);
+
+        // Persist tentative state back into per-tile metrics for dirty tiles only.
+        for (i, &(tx, ty)) in dirty_xy.iter().enumerate() {
+            self.metrics_tracker.get_mut(tx, ty).codec_state = tentative[i];
+        }
+
+        // Accumulate the per-dirty-tile unique-color histogram. Cheap
+        // (one u32 increment per tile, no allocation), so always-on; the
+        // log emission is gated by the env var, and the accumulator is
+        // reset there. See `DiagnosticsConfig::from_lookup`'s doc comment for
+        // the motivation (verify the "is the textured background really
+        // > 16 colors per 32×32 tile?" hypothesis).
+        for &(tx, ty) in &dirty_xy {
+            let uc = self.metrics_tracker.get(tx, ty).unique_colors;
+            if uc == crate::tile::UNIQUE_COLORS_UNKNOWN {
+                self.color_histogram_accumulator.bucket_unknown = self
+                    .color_histogram_accumulator
+                    .bucket_unknown
+                    .saturating_add(1);
+            } else if uc == 1 {
+                self.color_histogram_accumulator.bucket_1 =
+                    self.color_histogram_accumulator.bucket_1.saturating_add(1);
+            } else if uc <= 4 {
+                self.color_histogram_accumulator.bucket_2_4 = self
+                    .color_histogram_accumulator
+                    .bucket_2_4
+                    .saturating_add(1);
+            } else if uc <= 16 {
+                self.color_histogram_accumulator.bucket_5_16 = self
+                    .color_histogram_accumulator
+                    .bucket_5_16
+                    .saturating_add(1);
+            } else {
+                self.color_histogram_accumulator.bucket_overflow = self
+                    .color_histogram_accumulator
+                    .bucket_overflow
+                    .saturating_add(1);
+            }
+        }
+
+        // Per-tile diagnostic tracing: emit one log line per dirty tile when
+        // GHOSTFRAME_DIAGNOSE_TILES=1 (or =true).  Parseable by downstream awk.
+        if self.diagnostics.diagnose_tiles {
+            for &(tx, ty) in &dirty_xy {
+                let m = self.metrics_tracker.get(tx, ty);
+                tracing::info!(
+                    target: "ghostframe::diagnose",
+                    tile_x = tx,
+                    tile_y = ty,
+                    unique_colors = m.unique_colors,
+                    codec_state = ?m.codec_state,
+                    "per-tile"
+                );
+            }
+        }
+
+        if new_mode != self.frame_mode {
+            tracing::info!(
+                target: LOG_TARGET,
+                prev = ?self.frame_mode,
+                new = ?new_mode,
+                seq,
+                "classifier flipped frame mode"
+            );
+
+            // H264 → TileCodec architectural invariant: invalidate the GPU SAD
+            // baseline so the next TileCodec frame re-emits every tile,
+            // overwriting whatever the H.264 phase rendered. Without this,
+            // static content produces 0 dirty tiles on mode entry (prev_image
+            // is current relative to the static screen) and the lossless tile
+            // codecs never get a chance to upgrade the canvas from the H.264
+            // lossy render. Symmetric to the existing `request_keyframe()` on
+            // TileCodec → H264 in the `FrameMode::H264` match arm below: each
+            // direction of the mode flip resets the state that the entering mode
+            // relies on (H.264 GOP for the H264 direction, GPU SAD baseline for
+            // the TileCodec direction).
+            //
+            // force_frames = 1 (not 20) because we're past QUIC slow-start by
+            // the time exit_sustain elapses; ACK-based retries handle
+            // individual datagram drops on the lossless tiles.
+            if prev_mode == FrameMode::H264 && new_mode == FrameMode::TileCodec {
+                if let Some(p) = self.gpu_frame_processor.as_mut() {
+                    p.invalidate_baseline(1);
+                    tracing::info!(
+                        target: LOG_TARGET,
+                        seq,
+                        "H264→TileCodec handoff: invalidate_baseline(1) — lossless repaint"
+                    );
+                }
+            }
+        }
+
+        // Update frame mode for next frame's hysteresis reference.
+        self.frame_mode = new_mode;
+
+        // M3.5 bench telemetry — emit after classifier picks the mode for this frame.
+        // target: "ghostframe::bench" lets the bench filter independently of the
+        // default ghostframe:: target.
+        {
+            let mode_str = match new_mode {
+                FrameMode::H264 => "h264",
+                FrameMode::TileCodec => "tile",
+            };
+            tracing::info!(
+                target: "ghostframe::bench",
+                frame_seq = seq,
+                capture_done_ns = frame.capture_done_ns,
+                mode = mode_str,
+                "frame.captured"
+            );
+        }
+        (dirty_xy, prev_mode, new_mode)
     }
 
     /// Phase A: serially walk the GPU's compact list, map each tile's
