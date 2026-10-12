@@ -191,6 +191,28 @@ impl QuicServer {
     pub fn new_with_datagram_send_buffer(
         datagram_send_buffer: usize,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::build(datagram_send_buffer, None)
+    }
+
+    /// `new_with_datagram_send_buffer`, with the QUIC endpoint's RNG pinned.
+    ///
+    /// The endpoint RNG picks connection IDs, the stateless-reset key and
+    /// the point at which a connection skips a packet number. Entropy-seeded,
+    /// two same-seed browserless scenes differ in the server's wire image, so
+    /// the harness pins it, as it already does for the client.
+    /// Harness-only: production must never run with a predictable RNG.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub fn new_with_rng_seed(
+        datagram_send_buffer: usize,
+        rng_seed: [u8; 32],
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::build(datagram_send_buffer, Some(rng_seed))
+    }
+
+    fn build(
+        datagram_send_buffer: usize,
+        rng_seed: Option<[u8; 32]>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         // --- 1. Generate self-signed cert ---
         // SANs include both "localhost" (DNS) and "127.0.0.1" (IP) so that
         // Chromium's cert-hash pinning works when the E2E forwarder is bound to
@@ -252,7 +274,7 @@ impl QuicServer {
             Arc::new(EndpointConfig::default()),
             Some(Arc::new(server_config)),
             /* allow_mtud */ true,
-            /* rng_seed */ None,
+            rng_seed,
         );
 
         Ok(Self {
