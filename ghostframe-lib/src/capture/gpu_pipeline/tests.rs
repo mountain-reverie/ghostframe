@@ -2851,3 +2851,74 @@ fn bench_process_frame() {
         }
     }
 }
+
+/// The persistent command buffer / fence must survive every state a frame
+/// can leave them in: normal completion, an abandoned recording (early `?`
+/// return), an unsignalled fence (failed before submit), a submitted but
+/// un-waited fence, and a resolution change.
+#[test]
+fn persistent_cmd_and_fence_survive_abnormal_frame_ends() {
+    let mut p = match GpuFrameProcessor::new(64) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Skipping (no Vulkan?): {e}");
+            return;
+        }
+    };
+    let (w, h) = (200u32, 136u32);
+    let px = golden_render(w, h, 0);
+    let run = |p: &mut GpuFrameProcessor, w, h, px: &[u8]| {
+        p.process_frame_from_pixels(px, w, h, w * 4)
+            .expect("frame")
+            .dirty_tiles
+            .len()
+    };
+
+    // First frame: everything dirty; second identical frame: nothing dirty.
+    let tiles = (w.div_ceil(32) * h.div_ceil(32)) as usize;
+    assert_eq!(run(&mut p, w, h, &px), tiles);
+    assert_eq!(run(&mut p, w, h, &px), 0);
+
+    // Abandon a recording mid-frame (what an early `?` leaves behind).
+    unsafe {
+        let cmd = p.begin_frame_cmd().unwrap();
+        p.device
+            .begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())
+            .unwrap();
+    }
+    assert_eq!(run(&mut p, w, h, &px), 0);
+
+    // Fence left unsignalled (reset, never submitted), twice in a row.
+    unsafe {
+        p.begin_frame_cmd().unwrap();
+        p.begin_frame_cmd().unwrap();
+    }
+    assert_eq!(run(&mut p, w, h, &px), 0);
+
+    // Submitted but not waited for (wait failed): next frame must wait.
+    unsafe {
+        let cmd = p.begin_frame_cmd().unwrap();
+        p.device
+            .begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())
+            .unwrap();
+        p.device.end_command_buffer(cmd).unwrap();
+        let cmds = [cmd];
+        p.device
+            .queue_submit(
+                p.queue,
+                &[vk::SubmitInfo::default().command_buffers(&cmds)],
+                p.frame_fence,
+            )
+            .unwrap();
+        p.frame_fence_pending.set(true);
+    }
+    assert_eq!(run(&mut p, w, h, &px), 0);
+    assert!(!p.frame_fence_pending.get());
+
+    // Resize and back: dirty counts are those of a first frame each time.
+    let px2 = golden_render(192, 128, 0);
+    assert_eq!(run(&mut p, 192, 128, &px2), 6 * 4);
+    assert_eq!(run(&mut p, 192, 128, &px2), 0);
+    assert_eq!(run(&mut p, w, h, &px), tiles);
+    assert_eq!(run(&mut p, w, h, &px), 0);
+}
