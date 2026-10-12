@@ -1637,200 +1637,7 @@ impl IoBridge {
                 }
             }
 
-            // Arm/enforce close deadlines first, so a CONNECTION_CLOSE queued
-            // here leaves in the drain_outbound just below.
-            self.sweep_close_deadlines(now_std());
-
-            // Always drain after either branch.
-            //
-            // Ordering is critical: drain_app_events may write new stream
-            // data (e.g. HTTP/3 SETTINGS on Connected, or a 200 response
-            // on CONNECT), so we must call drain_outbound *again* after
-            // drain_app_events to flush any newly-queued transmits.
-            // Without this second flush, the data sits in quinn-proto's
-            // send buffer until the next loop iteration — which may never
-            // come if the peer is waiting for that data (deadlock).
-            self.drain_outbound().await?;
-            self.server.drain_endpoint_events();
-            self.drain_app_events();
-            self.server.drain_endpoint_events();
-            self.drain_outbound().await?;
-
-            // M3.6a: sample QUIC path stats once per tick so the classifier's
-            // bandwidth estimate stays current. No-op when no connections.
-            self.sample_all_path_stats();
-
-            // BWE Stage 2.4: open/close the probe cluster window. See
-            // `poll_probe_window`'s doc comment for why this runs
-            // unconditionally rather than only alongside the BWE drain
-            // below.
-            self.poll_probe_window(now_std());
-
-            // M4b: fire the DisplayMode debounce timer, if one is pending.
-            // Same epoch-relative clock the classifier's dwell timers use
-            // (`self.epoch`; see `dispatch_feedback_bytes`'s DisplayMode
-            // arm) -- not a second timing mechanism. Cheap no-op when
-            // nothing is pending.
-            let display_now_us = now_std().duration_since(self.epoch).as_micros() as u64;
-            self.on_timeout(display_now_us);
-
-            // Phase 1 Task 8: drain accumulated BWE samples (populated by
-            // the ACK-receive path in Task 5) into the estimator. Cheap
-            // on empty. The wire_seq we feed is a Phase 1 placeholder
-            // (composed from emit/arrival timestamps); Phase 2 will plumb
-            // the real cache-entry wire_seq through `BweSample` if the
-            // estimator backend needs strict packet-sequence identity.
-            // Everything the emitter put on the wire becomes an outstanding
-            // record. `wire_seq` is allocated inside the emitter, so this is
-            // the only place that knows which value each datagram carried.
-            let ledger_now = now_std();
-            for e in self.reliable_emitter.take_transmissions() {
-                self.transmission_ledger.record(
-                    e.wire_seq,
-                    ledger_now,
-                    crate::transport::transmission_ledger::Transmission {
-                        emit_us: e.emit_us,
-                        wire_bytes: e.wire_bytes,
-                        key: e.key,
-                    },
-                );
-            }
-            self.expire_transmissions(ledger_now);
-            // Reported only alongside an acknowledgement: goog_cc unwraps the
-            // max receive time over a report's received packets, so a
-            // loss-only report panics inside the library. A congested link can
-            // spend whole ticks with nothing acknowledged, so they accumulate
-            // here rather than being dropped.
-            //
-            // Bounded: if acknowledgements never resume the session is dead
-            // and the backlog is worthless. Oldest go first — a stale loss
-            // describes a send time the estimator has long since moved past.
-            let overflow = self.pending_losses.len().saturating_sub(MAX_PENDING_LOSSES);
-            if overflow > 0 {
-                self.pending_losses.drain(..overflow);
-            }
-            if !self.bwe_samples_buffer.is_empty() {
-                use crate::transport::bwe::AckArrival;
-                let mut records: Vec<AckArrival> =
-                    Vec::with_capacity(self.bwe_samples_buffer.len());
-                // BWE Stage 2.0: accumulate per-tier ACK round-trip latency
-                // while draining, instead of discarding `tier` and
-                // `received_at` in a bare `.map()`. Both `received_at` and
-                // `server_emit_us` are on the *server's* monotonic clock
-                // (`self.bwe_epoch`), so this is an emit-to-ACK-receipt
-                // round trip, not a one-way delay — deliberately: pacing
-                // (Stage 2) reduces queueing delay for critical passes, and
-                // this round trip is what surfaces that. Do NOT substitute
-                // `client_arrival_ms_lo16` here — it's on the client's clock
-                // with an unknown epoch, which is exactly what
-                // `implausible_rtt_samples` (Stage 1) exists to detect.
-                for s in self.bwe_samples_buffer.drain(..) {
-                    let elapsed_since_epoch_us = s
-                        .received_at
-                        .saturating_duration_since(self.bwe_epoch)
-                        .as_micros() as u64;
-                    // `server_emit_us` comes from `ReliableTileEmitter::emit_us`,
-                    // which is `u32` microseconds because that is what the
-                    // datagram header carries at bytes [12..16]. It wraps every
-                    // 2^32 us = 71.6 minutes, while `elapsed_since_epoch_us` is
-                    // u64 and never does. Subtracting one from the other breaks
-                    // at the first wrap: the u64 keeps climbing while the u32
-                    // resets, so the difference becomes the elapsed session time
-                    // instead of a round trip.
-                    //
-                    // Observed in production: a daemon up 81 minutes reported
-                    // `critical_latency_mean_us=2448007853` -- 2448 seconds --
-                    // having read a steady 19375 us for the preceding hour. The
-                    // same corruption reaches `BweSample::server_emit_us`, so
-                    // goog_cc's timing input is garbage past the first wrap.
-                    //
-                    // Do the subtraction in wrapping u32, which is correct
-                    // across a wrap because the true delta is milliseconds.
-                    let ack_latency_us = (elapsed_since_epoch_us as u32)
-                        .wrapping_sub(s.server_emit_us as u32)
-                        as u64;
-                    match s.tier {
-                        PassTier::Critical => self.critical_latency_stats.record(ack_latency_us),
-                        PassTier::Refinement => {
-                            self.refinement_latency_stats.record(ack_latency_us)
-                        }
-                    }
-                    // Feed the RTO policy's rolling tracker with the same
-                    // per-sample latency, regardless of tier -- the RTO
-                    // applies uniformly to every emitted tile-pass, so its
-                    // deadline should track the whole population rather
-                    // than either tier alone. See `ack_latency_tracker`'s
-                    // doc comment.
-                    self.ack_latency_tracker.record(ack_latency_us);
-                    // BWE Stage 2.1: `queued_at -> ACK`, alongside (not
-                    // instead of) the `last_sent_at -> ACK` pair above.
-                    // Starts earlier (when the work was queued rather than
-                    // when it last left the wire), so this is always >=
-                    // `ack_latency_us` for the same sample.
-                    let queued_latency_us =
-                        elapsed_since_epoch_us.saturating_sub(s.queued_since_epoch_us);
-                    match s.tier {
-                        PassTier::Critical => {
-                            self.queued_critical_latency_stats.record(queued_latency_us)
-                        }
-                        PassTier::Refinement => self
-                            .queued_refinement_latency_stats
-                            .record(queued_latency_us),
-                    }
-                    records.push(AckArrival {
-                        wire_seq: (((s.server_emit_us / 1000) as u32) << 16)
-                            | (s.client_arrival_ms_lo16 as u32),
-                        server_emit_us: s.server_emit_us,
-                        client_arrival_ms_lo16: s.client_arrival_ms_lo16,
-                        size_bytes: s.size_bytes,
-                        probe: s.probe,
-                    });
-                }
-                // Once per drain is enough: this is a cheap setter, and the
-                // tracker only just received new samples above. Derives the
-                // emitter's next first-attempt RTO deadline from the
-                // rolling p95 -- see `rto::rto_for_attempt`'s doc comment
-                // for the floor/ceiling this feeds into.
-                self.reliable_emitter
-                    .set_ack_deadline(self.ack_latency_tracker.p95());
-                // quinn already measures path RTT for the scheduler; reuse it
-                // as the reference for the estimator's plausibility check.
-                if let Some(rtt) = self.live_path_rtt() {
-                    self.bwe.note_path_rtt(rtt);
-                }
-                // Real in-flight bytes rather than a hardcoded zero, so
-                // goog_cc's congestion-window pushback has something to act
-                // on. Read before `update` so it reflects the state the
-                // feedback describes.
-                let in_flight = self.reliable_emitter.bytes_in_flight();
-                let losses = std::mem::take(&mut self.pending_losses);
-                self.bwe.update(&records, &losses, now_std(), in_flight);
-            }
-
-            // Republish into `bwe_publish` every iteration, not only when
-            // `bwe_samples_buffer` had something to drain: the browserless
-            // harness reads this after `bridge_handle.abort()`, at a point
-            // in virtual time it does not control relative to this loop, so
-            // the cell must always hold *a* current snapshot rather than
-            // only being current on iterations that happened to update the
-            // estimate. See `bwe_publish`'s doc comment.
-            #[cfg(any(test, feature = "browserless-harness"))]
-            {
-                *self.bwe_publish.lock().unwrap() = self.bwe.snapshot();
-                *self.emitter_stats_publish.lock().unwrap() = self.reliable_emitter.stats;
-                #[cfg(any(test, feature = "browserless-harness"))]
-                {
-                    *self.send_errs_publish.lock().unwrap() = self.datagram_send_errs;
-                }
-                *self.latency_stats_publish.lock().unwrap() =
-                    (self.critical_latency_stats, self.refinement_latency_stats);
-                *self.queued_latency_stats_publish.lock().unwrap() = (
-                    self.queued_critical_latency_stats,
-                    self.queued_refinement_latency_stats,
-                );
-                *self.probe_stats_publish.lock().unwrap() =
-                    (self.probes_completed, self.probes_abandoned);
-            }
+            self.post_turn().await?;
 
             // [BRIDGE-DIAG] heartbeat every 2s of virtual time (tokio's
             // clock, which is the wall clock in production but follows
@@ -1855,6 +1662,201 @@ impl IoBridge {
                 diag_last_heartbeat = now_std();
             }
         }
+    }
+
+    /// Housekeeping run once per `run` loop turn, after the `select!`.
+    async fn post_turn(&mut self) -> io::Result<()> {
+        // Arm/enforce close deadlines first, so a CONNECTION_CLOSE queued
+        // here leaves in the drain_outbound just below.
+        self.sweep_close_deadlines(now_std());
+
+        // Always drain after either branch.
+        //
+        // Ordering is critical: drain_app_events may write new stream
+        // data (e.g. HTTP/3 SETTINGS on Connected, or a 200 response
+        // on CONNECT), so we must call drain_outbound *again* after
+        // drain_app_events to flush any newly-queued transmits.
+        // Without this second flush, the data sits in quinn-proto's
+        // send buffer until the next loop iteration — which may never
+        // come if the peer is waiting for that data (deadlock).
+        self.drain_outbound().await?;
+        self.server.drain_endpoint_events();
+        self.drain_app_events();
+        self.server.drain_endpoint_events();
+        self.drain_outbound().await?;
+
+        // M3.6a: sample QUIC path stats once per tick so the classifier's
+        // bandwidth estimate stays current. No-op when no connections.
+        self.sample_all_path_stats();
+
+        // BWE Stage 2.4: open/close the probe cluster window. See
+        // `poll_probe_window`'s doc comment for why this runs
+        // unconditionally rather than only alongside the BWE drain
+        // below.
+        self.poll_probe_window(now_std());
+
+        // M4b: fire the DisplayMode debounce timer, if one is pending.
+        // Same epoch-relative clock the classifier's dwell timers use
+        // (`self.epoch`; see `dispatch_feedback_bytes`'s DisplayMode
+        // arm) -- not a second timing mechanism. Cheap no-op when
+        // nothing is pending.
+        let display_now_us = now_std().duration_since(self.epoch).as_micros() as u64;
+        self.on_timeout(display_now_us);
+
+        // Phase 1 Task 8: drain accumulated BWE samples (populated by
+        // the ACK-receive path in Task 5) into the estimator. Cheap
+        // on empty. The wire_seq we feed is a Phase 1 placeholder
+        // (composed from emit/arrival timestamps); Phase 2 will plumb
+        // the real cache-entry wire_seq through `BweSample` if the
+        // estimator backend needs strict packet-sequence identity.
+        // Everything the emitter put on the wire becomes an outstanding
+        // record. `wire_seq` is allocated inside the emitter, so this is
+        // the only place that knows which value each datagram carried.
+        let ledger_now = now_std();
+        for e in self.reliable_emitter.take_transmissions() {
+            self.transmission_ledger.record(
+                e.wire_seq,
+                ledger_now,
+                crate::transport::transmission_ledger::Transmission {
+                    emit_us: e.emit_us,
+                    wire_bytes: e.wire_bytes,
+                    key: e.key,
+                },
+            );
+        }
+        self.expire_transmissions(ledger_now);
+        // Reported only alongside an acknowledgement: goog_cc unwraps the
+        // max receive time over a report's received packets, so a
+        // loss-only report panics inside the library. A congested link can
+        // spend whole ticks with nothing acknowledged, so they accumulate
+        // here rather than being dropped.
+        //
+        // Bounded: if acknowledgements never resume the session is dead
+        // and the backlog is worthless. Oldest go first — a stale loss
+        // describes a send time the estimator has long since moved past.
+        let overflow = self.pending_losses.len().saturating_sub(MAX_PENDING_LOSSES);
+        if overflow > 0 {
+            self.pending_losses.drain(..overflow);
+        }
+        if !self.bwe_samples_buffer.is_empty() {
+            use crate::transport::bwe::AckArrival;
+            let mut records: Vec<AckArrival> = Vec::with_capacity(self.bwe_samples_buffer.len());
+            // BWE Stage 2.0: accumulate per-tier ACK round-trip latency
+            // while draining, instead of discarding `tier` and
+            // `received_at` in a bare `.map()`. Both `received_at` and
+            // `server_emit_us` are on the *server's* monotonic clock
+            // (`self.bwe_epoch`), so this is an emit-to-ACK-receipt
+            // round trip, not a one-way delay — deliberately: pacing
+            // (Stage 2) reduces queueing delay for critical passes, and
+            // this round trip is what surfaces that. Do NOT substitute
+            // `client_arrival_ms_lo16` here — it's on the client's clock
+            // with an unknown epoch, which is exactly what
+            // `implausible_rtt_samples` (Stage 1) exists to detect.
+            for s in self.bwe_samples_buffer.drain(..) {
+                let elapsed_since_epoch_us = s
+                    .received_at
+                    .saturating_duration_since(self.bwe_epoch)
+                    .as_micros() as u64;
+                // `server_emit_us` comes from `ReliableTileEmitter::emit_us`,
+                // which is `u32` microseconds because that is what the
+                // datagram header carries at bytes [12..16]. It wraps every
+                // 2^32 us = 71.6 minutes, while `elapsed_since_epoch_us` is
+                // u64 and never does. Subtracting one from the other breaks
+                // at the first wrap: the u64 keeps climbing while the u32
+                // resets, so the difference becomes the elapsed session time
+                // instead of a round trip.
+                //
+                // Observed in production: a daemon up 81 minutes reported
+                // `critical_latency_mean_us=2448007853` -- 2448 seconds --
+                // having read a steady 19375 us for the preceding hour. The
+                // same corruption reaches `BweSample::server_emit_us`, so
+                // goog_cc's timing input is garbage past the first wrap.
+                //
+                // Do the subtraction in wrapping u32, which is correct
+                // across a wrap because the true delta is milliseconds.
+                let ack_latency_us =
+                    (elapsed_since_epoch_us as u32).wrapping_sub(s.server_emit_us as u32) as u64;
+                match s.tier {
+                    PassTier::Critical => self.critical_latency_stats.record(ack_latency_us),
+                    PassTier::Refinement => self.refinement_latency_stats.record(ack_latency_us),
+                }
+                // Feed the RTO policy's rolling tracker with the same
+                // per-sample latency, regardless of tier -- the RTO
+                // applies uniformly to every emitted tile-pass, so its
+                // deadline should track the whole population rather
+                // than either tier alone. See `ack_latency_tracker`'s
+                // doc comment.
+                self.ack_latency_tracker.record(ack_latency_us);
+                // BWE Stage 2.1: `queued_at -> ACK`, alongside (not
+                // instead of) the `last_sent_at -> ACK` pair above.
+                // Starts earlier (when the work was queued rather than
+                // when it last left the wire), so this is always >=
+                // `ack_latency_us` for the same sample.
+                let queued_latency_us =
+                    elapsed_since_epoch_us.saturating_sub(s.queued_since_epoch_us);
+                match s.tier {
+                    PassTier::Critical => {
+                        self.queued_critical_latency_stats.record(queued_latency_us)
+                    }
+                    PassTier::Refinement => self
+                        .queued_refinement_latency_stats
+                        .record(queued_latency_us),
+                }
+                records.push(AckArrival {
+                    wire_seq: (((s.server_emit_us / 1000) as u32) << 16)
+                        | (s.client_arrival_ms_lo16 as u32),
+                    server_emit_us: s.server_emit_us,
+                    client_arrival_ms_lo16: s.client_arrival_ms_lo16,
+                    size_bytes: s.size_bytes,
+                    probe: s.probe,
+                });
+            }
+            // Once per drain is enough: this is a cheap setter, and the
+            // tracker only just received new samples above. Derives the
+            // emitter's next first-attempt RTO deadline from the
+            // rolling p95 -- see `rto::rto_for_attempt`'s doc comment
+            // for the floor/ceiling this feeds into.
+            self.reliable_emitter
+                .set_ack_deadline(self.ack_latency_tracker.p95());
+            // quinn already measures path RTT for the scheduler; reuse it
+            // as the reference for the estimator's plausibility check.
+            if let Some(rtt) = self.live_path_rtt() {
+                self.bwe.note_path_rtt(rtt);
+            }
+            // Real in-flight bytes rather than a hardcoded zero, so
+            // goog_cc's congestion-window pushback has something to act
+            // on. Read before `update` so it reflects the state the
+            // feedback describes.
+            let in_flight = self.reliable_emitter.bytes_in_flight();
+            let losses = std::mem::take(&mut self.pending_losses);
+            self.bwe.update(&records, &losses, now_std(), in_flight);
+        }
+
+        // Republish into `bwe_publish` every iteration, not only when
+        // `bwe_samples_buffer` had something to drain: the browserless
+        // harness reads this after `bridge_handle.abort()`, at a point
+        // in virtual time it does not control relative to this loop, so
+        // the cell must always hold *a* current snapshot rather than
+        // only being current on iterations that happened to update the
+        // estimate. See `bwe_publish`'s doc comment.
+        #[cfg(any(test, feature = "browserless-harness"))]
+        {
+            *self.bwe_publish.lock().unwrap() = self.bwe.snapshot();
+            *self.emitter_stats_publish.lock().unwrap() = self.reliable_emitter.stats;
+            #[cfg(any(test, feature = "browserless-harness"))]
+            {
+                *self.send_errs_publish.lock().unwrap() = self.datagram_send_errs;
+            }
+            *self.latency_stats_publish.lock().unwrap() =
+                (self.critical_latency_stats, self.refinement_latency_stats);
+            *self.queued_latency_stats_publish.lock().unwrap() = (
+                self.queued_critical_latency_stats,
+                self.queued_refinement_latency_stats,
+            );
+            *self.probe_stats_publish.lock().unwrap() =
+                (self.probes_completed, self.probes_abandoned);
+        }
+        Ok(())
     }
 
     /// Parse one inbound frame and feed it to quinn-proto.
