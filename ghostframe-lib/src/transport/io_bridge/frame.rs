@@ -593,123 +593,7 @@ impl IoBridge {
         //    queue stagnates and the wizard never finishes refining.
         match new_mode {
             FrameMode::H264 => {
-                if dirty_xy.is_empty() {
-                    return;
-                }
-                // Lazily initialize full-frame encoder
-                let needs_init = match &self.full_frame_encoder {
-                    Some(enc) => enc.width() != frame.width || enc.height() != frame.height,
-                    None => true,
-                };
-                if needs_init {
-                    match FullFrameEncoder::new(frame.width, frame.height) {
-                        Ok(enc) => {
-                            self.full_frame_encoder = Some(enc);
-                        }
-                        Err(e) => {
-                            tracing::warn!(target: LOG_TARGET, "Full-frame encoder init failed: {e}");
-                            return;
-                        }
-                    }
-                }
-
-                // Re-entry into H264: force IDR for a fresh client anchor.
-                if prev_mode == FrameMode::TileCodec {
-                    if let Some(enc) = self.full_frame_encoder.as_mut() {
-                        enc.request_keyframe();
-                    }
-                }
-
-                // Encode from the GPU-computed NV12 HOST_VISIBLE buffer
-                let encoder = self.full_frame_encoder.as_mut().unwrap();
-                let encoded = match encoder.encode_nv12_buffer(
-                    analysis.nv12_data,
-                    analysis.nv12_width,
-                    analysis.nv12_height,
-                    analysis.nv12_y_stride,
-                    analysis.nv12_uv_stride,
-                    analysis.nv12_uv_offset,
-                ) {
-                    Ok(Some(enc)) => enc,
-                    Ok(None) => {
-                        return;
-                    }
-                    Err(e) => {
-                        tracing::warn!(target: LOG_TARGET, "NV12 encode failed: {e}");
-                        return;
-                    }
-                };
-
-                // Fragment and send. `fragment_frame` chunks the payload at the
-                // per-fragment payload limit (datagram size minus the frame
-                // header), not the raw datagram size — otherwise the on-wire
-                // datagram (header + chunk) overshoots the MTU and WebTransport
-                // returns TooLarge, dropping every H.264 datagram silently.
-                // And the limit leaves room for the parity's own header, or
-                // it is the parity that overshoots instead.
-                let datagrams = fragment_frame(
-                    seq,
-                    frame.timestamp_us,
-                    encoded.is_keyframe,
-                    &encoded.payload,
-                    max_fec_frame_fragment_payload(max_dg_size),
-                );
-
-                self.cumulative_datagrams_emitted.h264 = self
-                    .cumulative_datagrams_emitted
-                    .h264
-                    .saturating_add(datagrams.len() as u64);
-
-                for dg in &datagrams {
-                    self.send_to_all_sessions(dg);
-                }
-
-                // FEC parity
-                let fec_k = fec_group_size(encoded.is_keyframe);
-                if datagrams.len() > 1 {
-                    let source_payloads: Vec<&[u8]> = datagrams
-                        .iter()
-                        .map(|dg| &dg[FRAME_HEADER_SIZE..])
-                        .collect();
-                    let parities = fec::generate_parity(&source_payloads, fec_k);
-                    for (_group_start, parity_payload) in &parities {
-                        let parity_dg = build_frame_parity_datagram(
-                            seq,
-                            frame.timestamp_us,
-                            encoded.is_keyframe,
-                            datagrams.len() as u16,
-                            parity_payload,
-                        );
-                        self.send_to_all_sessions(&parity_dg);
-                    }
-                }
-
-                // Store fragments for NACK
-                let oldest_kept = seq.wrapping_sub(3);
-                self.recent_frame_fragments
-                    .retain(|(s, _), _| s.wrapping_sub(oldest_kept) <= 3);
-                for dg in &datagrams {
-                    if let Ok(hdr) = FrameHeader::decode(dg) {
-                        self.recent_frame_fragments
-                            .insert((hdr.frame_seq, hdr.frag_idx), dg.clone());
-                    }
-                }
-
-                // M3.5 bench telemetry: H264 frame completed — all fragments sent.
-                let h264_wire_bytes: u32 = datagrams.iter().map(|dg| dg.len() as u32).sum();
-                tracing::info!(
-                    target: "ghostframe::bench",
-                    frame_seq = seq,
-                    last_send_ns = monotonic_now_ns(),
-                    total_wire_bytes = h264_wire_bytes,
-                    tile_count = 0u16,
-                    codec_solid = 0u16,
-                    codec_palrle = 0u16,
-                    codec_cdf53 = 0u16,
-                    codec_raw = 0u16,
-                    codec_h264 = 1u8,
-                    "frame.last_send"
-                );
+                self.emit_h264_frame(&dirty_xy, &frame, &analysis, prev_mode, seq, max_dg_size);
             }
             FrameMode::TileCodec => {
                 let max_frag = max_fragment_payload(max_dg_size);
@@ -1868,6 +1752,138 @@ impl IoBridge {
                 "cdf53.sweep_summary"
             );
         }
+    }
+
+    /// H.264 arm of `process_frame_gpu`: encode the GPU-produced NV12 frame,
+    /// fragment it, send it with FEC parity and keep fragments for NACK. Its
+    /// `return`s are tail returns of the whole frame (nothing follows the arm).
+    fn emit_h264_frame(
+        &mut self,
+        dirty_xy: &[(u32, u32)],
+        frame: &FrameSubmission,
+        analysis: &crate::capture::gpu_pipeline::FrameAnalysis,
+        prev_mode: crate::tile::FrameMode,
+        seq: u32,
+        max_dg_size: usize,
+    ) {
+        use crate::tile::FrameMode;
+        if dirty_xy.is_empty() {
+            return;
+        }
+        // Lazily initialize full-frame encoder
+        let needs_init = match &self.full_frame_encoder {
+            Some(enc) => enc.width() != frame.width || enc.height() != frame.height,
+            None => true,
+        };
+        if needs_init {
+            match FullFrameEncoder::new(frame.width, frame.height) {
+                Ok(enc) => {
+                    self.full_frame_encoder = Some(enc);
+                }
+                Err(e) => {
+                    tracing::warn!(target: LOG_TARGET, "Full-frame encoder init failed: {e}");
+                    return;
+                }
+            }
+        }
+
+        // Re-entry into H264: force IDR for a fresh client anchor.
+        if prev_mode == FrameMode::TileCodec {
+            if let Some(enc) = self.full_frame_encoder.as_mut() {
+                enc.request_keyframe();
+            }
+        }
+
+        // Encode from the GPU-computed NV12 HOST_VISIBLE buffer
+        let encoder = self.full_frame_encoder.as_mut().unwrap();
+        let encoded = match encoder.encode_nv12_buffer(
+            analysis.nv12_data,
+            analysis.nv12_width,
+            analysis.nv12_height,
+            analysis.nv12_y_stride,
+            analysis.nv12_uv_stride,
+            analysis.nv12_uv_offset,
+        ) {
+            Ok(Some(enc)) => enc,
+            Ok(None) => {
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(target: LOG_TARGET, "NV12 encode failed: {e}");
+                return;
+            }
+        };
+
+        // Fragment and send. `fragment_frame` chunks the payload at the
+        // per-fragment payload limit (datagram size minus the frame
+        // header), not the raw datagram size — otherwise the on-wire
+        // datagram (header + chunk) overshoots the MTU and WebTransport
+        // returns TooLarge, dropping every H.264 datagram silently.
+        // And the limit leaves room for the parity's own header, or
+        // it is the parity that overshoots instead.
+        let datagrams = fragment_frame(
+            seq,
+            frame.timestamp_us,
+            encoded.is_keyframe,
+            &encoded.payload,
+            max_fec_frame_fragment_payload(max_dg_size),
+        );
+
+        self.cumulative_datagrams_emitted.h264 = self
+            .cumulative_datagrams_emitted
+            .h264
+            .saturating_add(datagrams.len() as u64);
+
+        for dg in &datagrams {
+            self.send_to_all_sessions(dg);
+        }
+
+        // FEC parity
+        let fec_k = fec_group_size(encoded.is_keyframe);
+        if datagrams.len() > 1 {
+            let source_payloads: Vec<&[u8]> = datagrams
+                .iter()
+                .map(|dg| &dg[FRAME_HEADER_SIZE..])
+                .collect();
+            let parities = fec::generate_parity(&source_payloads, fec_k);
+            for (_group_start, parity_payload) in &parities {
+                let parity_dg = build_frame_parity_datagram(
+                    seq,
+                    frame.timestamp_us,
+                    encoded.is_keyframe,
+                    datagrams.len() as u16,
+                    parity_payload,
+                );
+                self.send_to_all_sessions(&parity_dg);
+            }
+        }
+
+        // Store fragments for NACK
+        let oldest_kept = seq.wrapping_sub(3);
+        self.recent_frame_fragments
+            .retain(|(s, _), _| s.wrapping_sub(oldest_kept) <= 3);
+        for dg in &datagrams {
+            if let Ok(hdr) = FrameHeader::decode(dg) {
+                self.recent_frame_fragments
+                    .insert((hdr.frame_seq, hdr.frag_idx), dg.clone());
+            }
+        }
+
+        // M3.5 bench telemetry: H264 frame completed — all fragments sent.
+        let h264_wire_bytes: u32 = datagrams.iter().map(|dg| dg.len() as u32).sum();
+        tracing::info!(
+            target: "ghostframe::bench",
+            frame_seq = seq,
+            last_send_ns = monotonic_now_ns(),
+            total_wire_bytes = h264_wire_bytes,
+            tile_count = 0u16,
+            codec_solid = 0u16,
+            codec_palrle = 0u16,
+            codec_cdf53 = 0u16,
+            codec_raw = 0u16,
+            codec_h264 = 1u8,
+            "frame.last_send"
+        );
     }
 
     /// Phase A: serially walk the GPU's compact list, map each tile's
