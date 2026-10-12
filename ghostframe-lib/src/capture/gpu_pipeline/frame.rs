@@ -528,168 +528,26 @@ impl GpuFrameProcessor {
         let guards = self.record_shared_stages(cmd, current.view, cols, rows, escalation_count)?;
         let pal_id_bytes = guards.pal_id_bytes;
 
-        // 5a. Snapshot copy: current (DMA-BUF) → prev_image (owned). This
+        // 5a. Snapshot copy: current (DMA-BUF) -> prev_image (owned). This
         // makes prev_image a true point-in-time snapshot of THIS frame for
         // the next frame's SAD comparison. Must run AFTER all three shader
         // dispatches (SAD, NV12, analysis), since they all read from current.
-        let copy_barriers = [
-            // current: SHADER_READ → TRANSFER_READ
-            vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::GENERAL)
-                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(current.image)
-                .subresource_range(subresource_range)
-                .src_access_mask(vk::AccessFlags::SHADER_READ)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_READ),
-            // prev_image: SHADER_READ → TRANSFER_WRITE
-            vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::GENERAL)
-                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(prev_image)
-                .subresource_range(subresource_range)
-                .src_access_mask(vk::AccessFlags::SHADER_READ)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE),
-        ];
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &copy_barriers,
-        );
-
-        let copy_region = [vk::ImageCopy::default()
-            .src_subresource(vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            })
-            .src_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
-            .dst_subresource(vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            })
-            .dst_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
-            .extent(vk::Extent3D {
-                width,
-                height,
-                depth: 1,
-            })];
-        self.device.cmd_copy_image(
+        self.record_snapshot_copy(
             cmd,
             current.image,
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             prev_image,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &copy_region,
+            vk::ImageLayout::GENERAL,
+            vk::AccessFlags::SHADER_READ,
+            width,
+            height,
         );
 
-        // 5b. Restore prev_image to GENERAL for next frame's SAD pass.
-        let post_copy_barrier = [vk::ImageMemoryBarrier::default()
-            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .new_layout(vk::ImageLayout::GENERAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(prev_image)
-            .subresource_range(subresource_range)
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ)];
-        self.device.cmd_pipeline_barrier(
+        // 5. Barriers: every output buffer -> HOST_READ.
+        self.record_host_readback_barriers(
             cmd,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &post_copy_barrier,
-        );
-
-        // 5. Barriers: SAD buffer → HOST_READ; NV12 buffer → HOST_READ;
-        //    analysis buffer → HOST_READ; palrle compact list + count → HOST_READ;
-        //    Stage 2a outputs (frame_palette_set, frame_palette_count,
-        //    per_tile_frame_palette_id) → HOST_READ.
-        let buf_barriers = [
-            buf_barrier(
-                self.sad_buf.buffer,
-                vk::AccessFlags::SHADER_WRITE,
-                vk::AccessFlags::HOST_READ,
-                vk::WHOLE_SIZE,
-            ),
-            buf_barrier(
-                nv12_buffer,
-                vk::AccessFlags::SHADER_WRITE,
-                vk::AccessFlags::HOST_READ,
-                vk::WHOLE_SIZE,
-            ),
-            buf_barrier(
-                self.analysis_buf.buffer,
-                vk::AccessFlags::SHADER_WRITE,
-                vk::AccessFlags::HOST_READ,
-                vk::WHOLE_SIZE,
-            ),
-            buf_barrier(
-                self.palrle_compact_list.buffer,
-                vk::AccessFlags::SHADER_WRITE,
-                vk::AccessFlags::HOST_READ,
-                vk::WHOLE_SIZE,
-            ),
-            buf_barrier(
-                self.palrle_compact_count.buffer,
-                vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
-                vk::AccessFlags::HOST_READ,
-                vk::WHOLE_SIZE,
-            ),
-            // Stage 2a outputs
-            buf_barrier(
-                self.frame_palette_set.buffer,
-                vk::AccessFlags::SHADER_WRITE,
-                vk::AccessFlags::HOST_READ,
-                vk::WHOLE_SIZE,
-            ),
-            buf_barrier(
-                self.frame_palette_count.buffer,
-                vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
-                vk::AccessFlags::HOST_READ,
-                4,
-            ),
-            buf_barrier(
-                self.per_tile_frame_palette_id.buffer,
-                vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
-                vk::AccessFlags::HOST_READ,
-                pal_id_bytes,
-            ),
-            // Stage 2b output
-            buf_barrier(
-                self.folded_into.buffer,
-                vk::AccessFlags::SHADER_WRITE,
-                vk::AccessFlags::HOST_READ,
-                PALETTE_SLOT_U32_BYTES,
-            ),
-            // Stage 3 output
-            buf_barrier(
-                self.index.buffer,
-                vk::AccessFlags::SHADER_WRITE,
-                vk::AccessFlags::HOST_READ,
-                vk::WHOLE_SIZE,
-            ),
-        ];
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::HOST,
-            vk::DependencyFlags::empty(),
-            &[],
-            &buf_barriers,
-            &[],
+            nv12_buffer,
+            vk::AccessFlags::SHADER_WRITE,
+            pal_id_bytes,
         );
 
         self.device.end_command_buffer(cmd)?;
@@ -950,163 +808,25 @@ impl GpuFrameProcessor {
         // `TRANSFER_SRC_OPTIMAL` happens), and the subsequent `buf_barrier`
         // targets buffers only — it doesn't depend on `current`'s layout.
         if let Some(snap) = snapshot {
-            let snap_barriers = [
-                vk::ImageMemoryBarrier::default()
-                    .old_layout(vk::ImageLayout::GENERAL)
-                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(current.image)
-                    .subresource_range(subresource_range)
-                    .src_access_mask(vk::AccessFlags::SHADER_READ)
-                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ),
-                vk::ImageMemoryBarrier::default()
-                    .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(snap.image)
-                    .subresource_range(subresource_range)
-                    .src_access_mask(vk::AccessFlags::empty())
-                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE),
-            ];
-            self.device.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &snap_barriers,
-            );
-
-            let copy_region = [vk::ImageCopy::default()
-                .src_subresource(vk::ImageSubresourceLayers {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    mip_level: 0,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })
-                .src_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
-                .dst_subresource(vk::ImageSubresourceLayers {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    mip_level: 0,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })
-                .dst_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
-                .extent(vk::Extent3D {
-                    width,
-                    height,
-                    depth: 1,
-                })];
-            self.device.cmd_copy_image(
+            self.record_snapshot_copy(
                 cmd,
                 current.image,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 snap.image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &copy_region,
-            );
-
-            // Restore snapshot to GENERAL for next frame's SAD pass.
-            let post_copy_barrier = [vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .new_layout(vk::ImageLayout::GENERAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(snap.image)
-                .subresource_range(subresource_range)
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ)];
-            self.device.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &post_copy_barrier,
+                vk::ImageLayout::UNDEFINED,
+                vk::AccessFlags::empty(),
+                width,
+                height,
             );
         }
 
-        // All output buffers → HOST_READ. These are HOST_VISIBLE | HOST_COHERENT
-        // and consumed via raw pointer on return.
-        // srcStageMask covers both COMPUTE_SHADER (shader writes) and TRANSFER
-        // (cmd_fill_buffer on sad_buffer and palrle_compact_count_buffer).
-        let buf_barrier = [
-            buf_barrier(
-                self.sad_buf.buffer,
-                vk::AccessFlags::TRANSFER_WRITE,
-                vk::AccessFlags::HOST_READ,
-                vk::WHOLE_SIZE,
-            ),
-            buf_barrier(
-                nv12_buffer,
-                vk::AccessFlags::SHADER_WRITE,
-                vk::AccessFlags::HOST_READ,
-                vk::WHOLE_SIZE,
-            ),
-            buf_barrier(
-                self.analysis_buf.buffer,
-                vk::AccessFlags::SHADER_WRITE,
-                vk::AccessFlags::HOST_READ,
-                vk::WHOLE_SIZE,
-            ),
-            buf_barrier(
-                self.palrle_compact_list.buffer,
-                vk::AccessFlags::SHADER_WRITE,
-                vk::AccessFlags::HOST_READ,
-                vk::WHOLE_SIZE,
-            ),
-            buf_barrier(
-                self.palrle_compact_count.buffer,
-                vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
-                vk::AccessFlags::HOST_READ,
-                vk::WHOLE_SIZE,
-            ),
-            // Stage 2a outputs
-            buf_barrier(
-                self.frame_palette_set.buffer,
-                vk::AccessFlags::SHADER_WRITE,
-                vk::AccessFlags::HOST_READ,
-                vk::WHOLE_SIZE,
-            ),
-            buf_barrier(
-                self.frame_palette_count.buffer,
-                vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
-                vk::AccessFlags::HOST_READ,
-                4,
-            ),
-            buf_barrier(
-                self.per_tile_frame_palette_id.buffer,
-                vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
-                vk::AccessFlags::HOST_READ,
-                pal_id_bytes,
-            ),
-            // Stage 2b output
-            buf_barrier(
-                self.folded_into.buffer,
-                vk::AccessFlags::SHADER_WRITE,
-                vk::AccessFlags::HOST_READ,
-                PALETTE_SLOT_U32_BYTES,
-            ),
-            // Stage 3 output
-            buf_barrier(
-                self.index.buffer,
-                vk::AccessFlags::SHADER_WRITE,
-                vk::AccessFlags::HOST_READ,
-                vk::WHOLE_SIZE,
-            ),
-        ];
-        self.device.cmd_pipeline_barrier(
+        // All output buffers -> HOST_READ. srcStageMask covers both
+        // COMPUTE_SHADER (shader writes) and TRANSFER (cmd_fill_buffer on
+        // sad_buffer and palrle_compact_count_buffer).
+        self.record_host_readback_barriers(
             cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::HOST,
-            vk::DependencyFlags::empty(),
-            &[],
-            &buf_barrier,
-            &[],
+            nv12_buffer,
+            vk::AccessFlags::TRANSFER_WRITE,
+            pal_id_bytes,
         );
 
         self.device.end_command_buffer(cmd)?;
@@ -2251,6 +1971,211 @@ impl GpuFrameProcessor {
         );
 
         Ok((l1_guard, l2_guard, l3_guard))
+    }
+
+    /// Snapshot copy: `current_image` (GENERAL) -> `dst_image`, then restore
+    /// `dst_image` to GENERAL for the next frame's SAD pass. Must be recorded
+    /// after every shader dispatch that reads `current_image`.
+    ///
+    /// The steady-state path passes its persistent `prev_image` (GENERAL,
+    /// SHADER_READ); the first-frame path passes the freshly allocated
+    /// snapshot (UNDEFINED, empty access: no prior access to wait on).
+    ///
+    /// # Safety
+    ///
+    /// `cmd` is recording and both images are valid for this device.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn record_snapshot_copy(
+        &self,
+        cmd: vk::CommandBuffer,
+        current_image: vk::Image,
+        dst_image: vk::Image,
+        dst_old_layout: vk::ImageLayout,
+        dst_src_access: vk::AccessFlags,
+        width: u32,
+        height: u32,
+    ) {
+        let subresource_range = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        let copy_barriers = [
+            // current: SHADER_READ → TRANSFER_READ
+            vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(current_image)
+                .subresource_range(subresource_range)
+                .src_access_mask(vk::AccessFlags::SHADER_READ)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ),
+            // dst: dst_src_access → TRANSFER_WRITE
+            vk::ImageMemoryBarrier::default()
+                .old_layout(dst_old_layout)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(dst_image)
+                .subresource_range(subresource_range)
+                .src_access_mask(dst_src_access)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE),
+        ];
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &copy_barriers,
+        );
+
+        let copy_region = [vk::ImageCopy::default()
+            .src_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .src_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+            .dst_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .dst_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })];
+        self.device.cmd_copy_image(
+            cmd,
+            current_image,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            dst_image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &copy_region,
+        );
+
+        // Restore the destination to GENERAL for the next frame's SAD pass.
+        let post_copy_barrier = [vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(dst_image)
+            .subresource_range(subresource_range)
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)];
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &post_copy_barrier,
+        );
+    }
+
+    /// Final barriers making every output buffer visible to the host:
+    /// SAD, NV12, analysis, palrle compact list + count, Stage 2a outputs,
+    /// Stage 2b output and Stage 3 output -> HOST_READ.
+    ///
+    /// `sad_src_access` is how the paths differ: the steady-state path's SAD
+    /// shader wrote the buffer (SHADER_WRITE); the first-frame path
+    /// pre-filled it with `cmd_fill_buffer` (TRANSFER_WRITE).
+    ///
+    /// # Safety
+    ///
+    /// `cmd` is recording.
+    unsafe fn record_host_readback_barriers(
+        &self,
+        cmd: vk::CommandBuffer,
+        nv12_buffer: vk::Buffer,
+        sad_src_access: vk::AccessFlags,
+        pal_id_bytes: vk::DeviceSize,
+    ) {
+        let buf_barriers = [
+            buf_barrier(
+                self.sad_buf.buffer,
+                sad_src_access,
+                vk::AccessFlags::HOST_READ,
+                vk::WHOLE_SIZE,
+            ),
+            buf_barrier(
+                nv12_buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::HOST_READ,
+                vk::WHOLE_SIZE,
+            ),
+            buf_barrier(
+                self.analysis_buf.buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::HOST_READ,
+                vk::WHOLE_SIZE,
+            ),
+            buf_barrier(
+                self.palrle_compact_list.buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::HOST_READ,
+                vk::WHOLE_SIZE,
+            ),
+            buf_barrier(
+                self.palrle_compact_count.buffer,
+                vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::HOST_READ,
+                vk::WHOLE_SIZE,
+            ),
+            // Stage 2a outputs
+            buf_barrier(
+                self.frame_palette_set.buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::HOST_READ,
+                vk::WHOLE_SIZE,
+            ),
+            buf_barrier(
+                self.frame_palette_count.buffer,
+                vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::HOST_READ,
+                4,
+            ),
+            buf_barrier(
+                self.per_tile_frame_palette_id.buffer,
+                vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::HOST_READ,
+                pal_id_bytes,
+            ),
+            // Stage 2b output
+            buf_barrier(
+                self.folded_into.buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::HOST_READ,
+                PALETTE_SLOT_U32_BYTES,
+            ),
+            // Stage 3 output
+            buf_barrier(
+                self.index.buffer,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::AccessFlags::HOST_READ,
+                vk::WHOLE_SIZE,
+            ),
+        ];
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::HOST,
+            vk::DependencyFlags::empty(),
+            &[],
+            &buf_barriers,
+            &[],
+        );
     }
 
     /// The stages both frame paths record identically, from the palrle_compact
