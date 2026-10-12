@@ -4,7 +4,7 @@
 //! VulkanReadback: imports DMA-BUF fd via Vulkan extensions for GPU-accelerated readback.
 
 use std::io;
-use std::ops::Deref;
+use std::ops::{Deref, Range};
 use std::os::unix::io::RawFd;
 use std::sync::{Mutex, MutexGuard};
 
@@ -52,22 +52,28 @@ impl Drop for Mapping {
     }
 }
 
-/// A recycled pixel buffer.
+/// A recycled pixel buffer. `stamp` says "my bytes are a complete copy of the
+/// mapping for `key` as of readback call number `seq`"; it is what lets the
+/// row-mode API prove continuity.
 struct Buf {
     data: Vec<u8>,
+    stamp: Option<(MapKey, u64)>,
 }
 
 /// Maximum number of idle buffers kept in the process-wide pool.
 const POOL_CAP: usize = 2;
 
-#[derive(Default)]
 struct State {
     /// Single-entry mapping cache. Keeps the dma-buf alive (and therefore its
     /// GPU memory) until it is replaced, [`release_cached_mapping`] is
-    /// called, or a readback fails, even if the caller has long since closed
-    /// its fd.
+    /// called, or a mapping attempt for a cacheable buffer fails, even if the
+    /// caller has long since closed its fd.
     map: Option<Mapping>,
     pool: Vec<Buf>,
+    /// Incremented by every readback call (success or not, including early
+    /// failures) and by [`invalidate`]. A buffer is continuous with the next
+    /// call only if its stamp carries the current value.
+    seq: u64,
 }
 
 /// Process-wide state. One mapping and one small pool for the whole process,
@@ -79,27 +85,32 @@ struct State {
 static STATE: Mutex<State> = Mutex::new(State {
     map: None,
     pool: Vec::new(),
+    seq: 0,
 });
 
 fn lock_state() -> MutexGuard<'static, State> {
     // A panic while holding the lock cannot leave the state inconsistent
     // enough to matter (worst case a stale cache entry that the key check
-    // rejects), so recover from poisoning.
+    // rejects, and continuity stamps that fail to match), so recover from
+    // poisoning.
     STATE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Drop the pinned mapping (releasing the dma-buf reference it holds) and
 /// the pooled buffers. Call when capture stops or on a mode switch away from
 /// the tile codec, so an idle process does not keep a frame's worth of GPU
-/// memory pinned and ~2 frames of host memory allocated.
+/// memory pinned and ~2 frames of host memory allocated. The next row-mode
+/// readback is a full copy.
 pub fn release_cached_mapping() {
     let mut st = lock_state();
     st.map = None;
     st.pool.clear();
+    st.seq = st.seq.wrapping_add(1);
 }
 
 /// A frame of BGRA pixels read back from a dma-buf: `stride * height` bytes,
-/// derefs to `[u8]`. Dropping it returns the allocation to the process-wide pool.
+/// derefs to `[u8]`. Dropping it returns the allocation to the process-wide
+/// pool.
 pub struct ReadbackFrame {
     buf: Option<Buf>,
 }
@@ -130,6 +141,14 @@ impl Drop for ReadbackFrame {
             st.pool.push(buf);
         }
     }
+}
+
+/// Declare that the caller dropped (did not read back) a frame, or otherwise
+/// lost continuity with the producer. The next [`readback_dmabuf_rows`] call
+/// does a full copy.
+pub fn invalidate() {
+    let mut st = lock_state();
+    st.seq = st.seq.wrapping_add(1);
 }
 
 /// `DMA_BUF_IOCTL_SYNC` bracket around CPU reads. Errors are ignored, as in
@@ -197,6 +216,24 @@ fn map_key_and_size(fd: RawFd, height: u32, stride: u32) -> io::Result<(MapKey, 
     ))
 }
 
+/// Sort, clamp to `height`, drop empty and merge overlapping/adjacent ranges.
+fn merge_rows(rows: &[Range<u32>], height: u32) -> Vec<(usize, usize)> {
+    let mut v: Vec<(usize, usize)> = rows
+        .iter()
+        .map(|r| (r.start.min(height) as usize, r.end.min(height) as usize))
+        .filter(|(a, b)| a < b)
+        .collect();
+    v.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(v.len());
+    for (a, b) in v {
+        match out.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => out.push((a, b)),
+        }
+    }
+    out
+}
+
 fn map_ro(fd: RawFd, size: usize, key: MapKey) -> io::Result<Mapping> {
     // SAFETY: fresh read-only shared mapping of `size` bytes.
     let ptr = unsafe {
@@ -219,31 +256,62 @@ fn map_ro(fd: RawFd, size: usize, key: MapKey) -> io::Result<Mapping> {
     })
 }
 
-/// Copy `src` into `buf`, bracketed by DMA_BUF_IOCTL_SYNC. No END is issued
+/// Copy `src` (all of it, or only `rows` of `stride`-byte pixel rows when
+/// `row_mode`) into `buf`, bracketed by DMA_BUF_IOCTL_SYNC. No END is issued
 /// if START failed.
-fn copy_synced(fd: RawFd, src: &[u8], buf: &mut Buf) {
+fn copy_synced(fd: RawFd, src: &[u8], buf: &mut Buf, row_mode: Option<(&[Range<u32>], u32, u32)>) {
     let started = dmabuf_sync(fd, false);
-    // No zero-fill: clear + extend writes each byte once.
-    buf.data.clear();
-    buf.data.reserve(src.len());
-    buf.data.extend_from_slice(src);
+    match row_mode {
+        Some((rows, height, stride)) => {
+            debug_assert_eq!(buf.data.len(), src.len());
+            for (a, b) in merge_rows(rows, height) {
+                let (lo, hi) = (a * stride as usize, b * stride as usize);
+                buf.data[lo..hi].copy_from_slice(&src[lo..hi]);
+            }
+        }
+        None => {
+            // No zero-fill: clear + extend writes each byte once.
+            buf.data.clear();
+            buf.data.reserve(src.len());
+            buf.data.extend_from_slice(src);
+        }
+    }
     if started {
         dmabuf_sync(fd, true);
     }
 }
 
-fn readback_impl(fd: RawFd, height: u32, stride: u32) -> io::Result<ReadbackFrame> {
+fn readback_impl(
+    fd: RawFd,
+    height: u32,
+    stride: u32,
+    rows: Option<&[Range<u32>]>,
+) -> io::Result<ReadbackFrame> {
+    let mut st = lock_state();
+    // Bump the sequence before anything can fail: every call, including one
+    // that errors out early (bad fd, size overflow, st_size rejection), breaks
+    // continuity for the next rows call.
+    let prev_seq = st.seq;
+    st.seq = prev_seq.wrapping_add(1);
+    let new_seq = st.seq;
+
     let (key, size, cacheable) = map_key_and_size(fd, height, stride)?;
     if size == 0 {
-        return Ok(ReadbackFrame::new(Buf { data: Vec::new() }));
+        return Ok(ReadbackFrame::new(Buf {
+            data: Vec::new(),
+            stamp: None,
+        }));
     }
-    let mut st = lock_state();
 
     if !cacheable {
-        // Map for this call only; the cache (if any) is left alone.
+        // Map for this call only; the cache (if any) is left alone, and the
+        // result is never stamped, so the next rows call is a full copy.
         let mapping = map_ro(fd, size, key)?;
-        let mut buf = st.pool.pop().unwrap_or(Buf { data: Vec::new() });
-        copy_synced(fd, mapping.bytes(), &mut buf);
+        let mut buf = Buf {
+            data: st.pool.pop().map(|b| b.data).unwrap_or_default(),
+            stamp: None,
+        };
+        copy_synced(fd, mapping.bytes(), &mut buf, None);
         drop(mapping);
         return Ok(ReadbackFrame::new(buf));
     }
@@ -255,9 +323,31 @@ fn readback_impl(fd: RawFd, height: u32, stride: u32) -> io::Result<ReadbackFram
         st.map = Some(map_ro(fd, size, key)?);
     }
 
-    let mut buf = st.pool.pop().unwrap_or(Buf { data: Vec::new() });
+    // Row mode needs the buffer that is a complete copy as of the
+    // immediately preceding call for this very key.
+    let reuse = match rows {
+        Some(_) => st
+            .pool
+            .iter()
+            .position(|b| b.stamp == Some((key, prev_seq)))
+            .map(|i| st.pool.swap_remove(i)),
+        None => None,
+    };
+    let row_mode = reuse.is_some();
+    let mut buf = reuse.unwrap_or_else(|| Buf {
+        data: st.pool.pop().map(|b| b.data).unwrap_or_default(),
+        stamp: None,
+    });
+    buf.stamp = None;
+
     let src = st.map.as_ref().map(|m| m.bytes()).unwrap_or(&[]);
-    copy_synced(fd, src, &mut buf);
+    let mode = match (row_mode, rows) {
+        (true, Some(r)) => Some((r, height, stride)),
+        _ => None,
+    };
+    copy_synced(fd, src, &mut buf, mode);
+
+    buf.stamp = Some((key, new_seq));
     Ok(ReadbackFrame::new(buf))
 }
 
@@ -275,7 +365,37 @@ pub fn readback_dmabuf(
     height: u32,
     stride: u32,
 ) -> io::Result<ReadbackFrame> {
-    readback_impl(fd, height, stride)
+    readback_impl(fd, height, stride, None)
+}
+
+/// Like [`readback_dmabuf`], but copies only `rows` (half-open pixel-row
+/// ranges, clamped to `height`, merged) when it can prove that is enough.
+///
+/// The shortcut is taken only if the recycled buffer being reused is the very
+/// buffer returned by the immediately preceding readback call (process-wide)
+/// (full or rows), that call covered the whole frame (a full copy, or a rows
+/// call that itself satisfied this rule) and the mapping key (inode, stride,
+/// height) is unchanged. Otherwise this is a full copy. The previous frame
+/// must have been dropped so its buffer is back in the pool; a frame still
+/// held forces a full copy into a different buffer. The state is
+/// process-wide: there must be one logical reader per process (two readers of
+/// the same buffer would each count the other's call as the previous one).
+///
+/// CONTRACT for the caller: `rows` must cover every pixel row the producer
+/// changed since the previous readback call. If the caller
+/// skips a readback (drops a frame, errors out, switches fd and back), the
+/// next dirty set is relative to the skipped frame and would leave stale
+/// rows in the buffer. Call [`invalidate`] whenever a frame was dropped.
+/// Failed readbacks and key changes invalidate automatically; rows the caller
+/// did not list are NOT refreshed, even if they changed.
+pub fn readback_dmabuf_rows(
+    fd: RawFd,
+    _width: u32,
+    height: u32,
+    stride: u32,
+    rows: &[Range<u32>],
+) -> io::Result<ReadbackFrame> {
+    readback_impl(fd, height, stride, Some(rows))
 }
 
 // ---------------------------------------------------------------------------
@@ -821,29 +941,38 @@ mod tests {
     /// `dirty` mutates 3 tile rows of the source between frames so content
     /// differs. Run: `cargo test -p ghostframe-lib --release --lib
     /// bench_readback -- --ignored --nocapture`.
-    fn bench_one(label: &str, buf: &mut TestBuf, dirty: bool) {
+    fn bench_one(label: &str, buf: &mut TestBuf, dirty: bool, rows_mode: bool) {
         const N: usize = 300;
         let (w, h, stride) = (1920u32, 1080u32, 7680u32);
         buf.fill(|i| (i % 251) as u8);
+        invalidate();
         let mut us = Vec::with_capacity(N);
         let mut sink = 0usize;
         for f in 0..N {
+            let mut ranges: Vec<Range<u32>> = Vec::new();
             if dirty {
                 // 3 tile rows (32 px each) change per frame.
                 let b = buf.bytes_mut();
                 for t in 0..3usize {
                     let row0 = ((f * 7 + t * 11) % 34) * 32;
-                    let (a, e) = (row0 * 7680, ((row0 + 32).min(1080)) * 7680);
-                    for x in &mut b[a..e] {
+                    let row1 = (row0 + 32).min(1080);
+                    ranges.push(row0 as u32..row1 as u32);
+                    for x in &mut b[row0 * 7680..row1 * 7680] {
                         *x = x.wrapping_add(1);
                     }
                 }
             }
             let t0 = std::time::Instant::now();
-            let p = readback_dmabuf(buf.fd, w, h, stride).unwrap();
+            let p = if rows_mode {
+                readback_dmabuf_rows(buf.fd, w, h, stride, &ranges).unwrap()
+            } else {
+                readback_dmabuf(buf.fd, w, h, stride).unwrap()
+            };
             us.push(std::time::Instant::now().duration_since(t0).as_secs_f64() * 1e6);
             sink += p[(f * 4099) % p.len()] as usize;
             assert_eq!(p.len(), 7680 * 1080);
+            // Outside the timed region: the fast path must still be exact.
+            assert!(*p == buf.bytes()[..7680 * 1080], "{label}: frame {f}");
         }
         std::hint::black_box(sink);
         report(label, us);
@@ -855,12 +984,16 @@ mod tests {
         let _g = serial();
         let size = 7680 * 1080;
         let mut m = new_memfd(size);
-        bench_one("memfd static", &mut m, false);
-        bench_one("memfd dirty-source", &mut m, true);
+        bench_one("memfd static", &mut m, false, false);
+        bench_one("memfd dirty-source", &mut m, true, false);
+        bench_one("memfd rows static", &mut m, false, true);
+        bench_one("memfd rows 3-of-34 dirty", &mut m, true, true);
         match new_udmabuf(size) {
             Some(mut u) => {
-                bench_one("udmabuf static", &mut u, false);
-                bench_one("udmabuf dirty-source", &mut u, true);
+                bench_one("udmabuf static", &mut u, false, false);
+                bench_one("udmabuf dirty-source", &mut u, true, false);
+                bench_one("udmabuf rows static", &mut u, false, true);
+                bench_one("udmabuf rows 3-of-34 dirty", &mut u, true, true);
             }
             None => println!("BENCH udmabuf: unavailable"),
         }
@@ -1018,6 +1151,156 @@ mod tests {
         assert!(*readback_dmabuf(buf.fd, W, H, STRIDE).unwrap() == buf.bytes()[..FRAME]);
     }
 
+    /// Mutate `rows` of the producer and also the unlisted `canary` rows.
+    fn poke(buf: &mut TestBuf, rows: &[u32], canary: &[u32], tag: u8) {
+        for &r in rows.iter().chain(canary) {
+            let (a, b) = (r as usize * 7680, (r as usize + 1) * 7680);
+            for (i, x) in buf.bytes_mut()[a..b].iter_mut().enumerate() {
+                *x = (i as u8).wrapping_mul(3) ^ tag ^ r as u8;
+            }
+        }
+    }
+
+    /// `got` equals `src` except on `stale` rows, which must equal `old`.
+    fn assert_rows_eq(got: &[u8], src: &[u8], old: &[u8], stale: &[u32], what: &str) {
+        for r in 0..1080usize {
+            let (a, b) = (r * 7680, (r + 1) * 7680);
+            let want = if stale.contains(&(r as u32)) {
+                old
+            } else {
+                src
+            };
+            assert!(got[a..b] == want[a..b], "{what}: row {r} wrong");
+        }
+    }
+
+    type Case = (&'static [u32], &'static [u32], Vec<Range<u32>>);
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init, clippy::reversed_empty_ranges)]
+    fn dirty_rows_copy_exactly_the_listed_rows() {
+        let _g = serial();
+        each_buf(FRAME, |name, mut buf| {
+            invalidate();
+            buf.fill(pattern(11));
+            let f0 = readback_dmabuf_rows(buf.fd, W, H, STRIDE, &[]).unwrap();
+            assert!(*f0 == buf.bytes()[..FRAME], "{name}: first call is full");
+            drop(f0);
+            // (rows changed, unlisted neighbour row that must stay stale,
+            //  ranges handed to the API)
+            let cases: [Case; 6] = [
+                (
+                    &[0, 539, 1079],
+                    &[1, 540, 1078],
+                    vec![0..1, 539..540, 1079..1080],
+                ),
+                (&[31], &[32, 30], vec![31..32]),
+                (&[32], &[31, 33], vec![32..33]),
+                (&[1056, 1060, 1079], &[1055], vec![1056..1080]),
+                // overlapping, unsorted, empty, reversed and over-long ranges
+                (
+                    &[10, 11, 12, 13, 1079],
+                    &[14, 9],
+                    vec![12..14, 10..12, 5..5, 9..3, 1079..9999],
+                ),
+                (&[0, 1079], &[2], vec![1079..1080, 0..1]),
+            ];
+            for (n, (rows, canary, ranges)) in cases.iter().enumerate() {
+                let before = buf.bytes()[..FRAME].to_vec();
+                poke(&mut buf, rows, canary, 0x40 + n as u8);
+                let f = readback_dmabuf_rows(buf.fd, W, H, STRIDE, ranges).unwrap();
+                assert_rows_eq(
+                    &f,
+                    &buf.bytes()[..FRAME],
+                    &before,
+                    canary,
+                    &format!("{name} case {n}"),
+                );
+                drop(f);
+                // The canary rows were not refreshed; list them now, as a
+                // caller whose dirty set included them would.
+                let ranges: Vec<Range<u32>> = canary.iter().map(|&r| r..r + 1).collect();
+                let f = readback_dmabuf_rows(buf.fd, W, H, STRIDE, &ranges).unwrap();
+                assert!(*f == buf.bytes()[..FRAME], "{name} case {n}: catch-up");
+            }
+        });
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    fn rows_mode_falls_back_to_full_copy_when_continuity_is_unproven() {
+        let _g = serial();
+        let mut a = new_memfd(FRAME);
+        let b = new_memfd(FRAME);
+        a.fill(pattern(1));
+        b.fill(pattern(2));
+        let canary = [100u32];
+
+        // Prime with a full frame, then show the shortcut IS taken (row stale).
+        invalidate();
+        drop(readback_dmabuf_rows(a.fd, W, H, STRIDE, &[]).unwrap());
+        poke(&mut a, &[], &canary, 1);
+        let f = readback_dmabuf_rows(a.fd, W, H, STRIDE, &[]).unwrap();
+        assert!(*f != a.bytes()[..FRAME], "precondition: shortcut taken");
+        drop(f);
+
+        // 1. invalidate(): the unlisted row now shows up.
+        invalidate();
+        let f = readback_dmabuf_rows(a.fd, W, H, STRIDE, &[]).unwrap();
+        assert!(*f == a.bytes()[..FRAME], "after invalidate()");
+        drop(f);
+
+        // 2. different mapping key (other inode): full copy of B.
+        poke(&mut a, &[], &canary, 2);
+        let f = readback_dmabuf_rows(b.fd, W, H, STRIDE, &[]).unwrap();
+        assert!(*f == b.bytes()[..FRAME], "other inode");
+        drop(f);
+        // ...and switching back is also unproven for A.
+        let f = readback_dmabuf_rows(a.fd, W, H, STRIDE, &[]).unwrap();
+        assert!(*f == a.bytes()[..FRAME], "back to A");
+        drop(f);
+
+        // 3. different geometry on the same fd.
+        poke(&mut a, &[], &canary, 3);
+        let f = readback_dmabuf_rows(a.fd, W / 2, H * 2, STRIDE / 2, &[]).unwrap();
+        assert!(*f == a.bytes()[..FRAME], "other geometry");
+        drop(f);
+
+        // 4. the previous frame is still held: its buffer is not reusable.
+        let held = readback_dmabuf_rows(a.fd, W / 2, H * 2, STRIDE / 2, &[]).unwrap();
+        poke(&mut a, &[], &canary, 4);
+        let f = readback_dmabuf_rows(a.fd, W / 2, H * 2, STRIDE / 2, &[]).unwrap();
+        assert!(*f == a.bytes()[..FRAME], "held previous frame");
+        assert!(*held != *f);
+        drop((held, f));
+
+        // 5. a failed readback in between (pipe: mmap fails).
+        let f = readback_dmabuf_rows(a.fd, W, H, STRIDE, &[]).unwrap();
+        drop(f);
+        let mut p = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(p.as_mut_ptr()) }, 0);
+        assert!(readback_dmabuf_rows(p[0], 0, 16, 16, &[]).is_err());
+        unsafe {
+            libc::close(p[0]);
+            libc::close(p[1]);
+        }
+        poke(&mut a, &[], &canary, 5);
+        let f = readback_dmabuf_rows(a.fd, W, H, STRIDE, &[]).unwrap();
+        assert!(*f == a.bytes()[..FRAME], "after failed readback");
+    }
+
+    #[test]
+    #[allow(clippy::reversed_empty_ranges)]
+    fn merge_rows_clamps_sorts_and_merges() {
+        assert_eq!(merge_rows(&[], 10), vec![]);
+        assert_eq!(merge_rows(&[3..3, 9..2], 10), vec![]);
+        assert_eq!(
+            merge_rows(&[5..7, 0..2, 2..3, 6..9], 10),
+            vec![(0, 3), (5, 9)]
+        );
+        assert_eq!(merge_rows(&[8..50, 20..30], 10), vec![(8, 10)]);
+    }
+
     #[test]
     fn vulkan_device_creates_successfully() {
         match VulkanReadback::new() {
@@ -1085,5 +1368,88 @@ mod tests {
         assert!(f.iter().all(|&b| b == 0));
         unsafe { libc::close(z) };
         assert_eq!(cached_key(), before, "uncacheable read touched the cache");
+    }
+
+    /// Continuity is process-wide: frame 1 on thread A, frames 2..5 on thread
+    /// B, then a rows call on A (with an empty dirty set, as if nothing
+    /// changed since *its* last call) must still be exact. With per-thread
+    /// state, A's old buffer still matched A's own stamp and was reused four
+    /// frames stale.
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    fn rows_continuity_survives_thread_hopping() {
+        use std::sync::mpsc::channel;
+        let _g = serial();
+        let mut a = new_memfd(FRAME);
+        a.fill(pattern(31));
+        let fd = a.fd;
+        let (to_a, a_rx) = channel::<()>();
+        let (a_done, from_a) = channel::<Option<Vec<u8>>>();
+        std::thread::scope(|sc| {
+            // Thread A: one long-lived thread, so thread-local state would
+            // persist on it between its two calls.
+            sc.spawn(move || {
+                invalidate();
+                drop(readback_dmabuf_rows(fd, W, H, STRIDE, &[]).unwrap());
+                a_done.send(None).unwrap();
+                a_rx.recv().unwrap();
+                let f = readback_dmabuf_rows(fd, W, H, STRIDE, &[]).unwrap();
+                a_done.send(Some(f.to_vec())).unwrap();
+            });
+            assert!(from_a.recv().unwrap().is_none());
+            for n in 0..4u32 {
+                let r = n * 100 + 3;
+                poke(&mut a, &[r], &[], 0x50 + n as u8);
+                // Thread B.
+                sc.spawn(move || {
+                    drop(readback_dmabuf_rows(fd, W, H, STRIDE, &[r..r + 1]).unwrap());
+                })
+                .join()
+                .unwrap();
+            }
+            to_a.send(()).unwrap();
+            let got = from_a.recv().unwrap().unwrap();
+            assert!(
+                got == a.bytes()[..FRAME],
+                "stale buffer from another thread reused"
+            );
+        });
+    }
+
+    /// Any call, including one that fails before touching the mapping,
+    /// breaks continuity.
+    #[test]
+    fn early_failure_breaks_row_continuity() {
+        let _g = serial();
+        let mut a = new_memfd(FRAME);
+        a.fill(pattern(41));
+        let canary = [200u32];
+        invalidate();
+        drop(readback_dmabuf_rows(a.fd, W, H, STRIDE, &[]).unwrap());
+        poke(&mut a, &[], &canary, 1);
+        // Precondition: the shortcut is taken (the unlisted row stays stale).
+        let f = readback_dmabuf_rows(a.fd, W, H, STRIDE, &[]).unwrap();
+        assert!(*f != a.bytes()[..FRAME], "precondition: shortcut taken");
+        drop(f);
+
+        // Bad fd: fstat fails with EBADF before any mapping work.
+        poke(&mut a, &[], &canary, 2);
+        assert!(readback_dmabuf_rows(-1, W, H, STRIDE, &[]).is_err());
+        let f = readback_dmabuf_rows(a.fd, W, H, STRIDE, &[]).unwrap();
+        assert!(*f == a.bytes()[..FRAME], "after fstat failure");
+        drop(f);
+
+        // Absurd geometry, rejected by the st_size check.
+        poke(&mut a, &[], &canary, 3);
+        assert!(readback_dmabuf_rows(a.fd, 0, u32::MAX, u32::MAX, &[]).is_err());
+        let f = readback_dmabuf_rows(a.fd, W, H, STRIDE, &[]).unwrap();
+        assert!(*f == a.bytes()[..FRAME], "after size rejection");
+        drop(f);
+
+        // st_size rejection (file smaller than stride * height).
+        poke(&mut a, &[], &canary, 4);
+        assert!(readback_dmabuf_rows(a.fd, 0, 65_537, 65_536, &[]).is_err());
+        let f = readback_dmabuf_rows(a.fd, W, H, STRIDE, &[]).unwrap();
+        assert!(*f == a.bytes()[..FRAME], "after st_size rejection");
     }
 }
