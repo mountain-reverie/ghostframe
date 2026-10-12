@@ -19,6 +19,23 @@
 
 use super::*;
 
+/// Which Phase B path started a Cdf53 generation; selects the bump
+/// counter and the `source` field of the `cdf53.emit` log line.
+#[derive(Clone, Copy)]
+enum Cdf53Source {
+    Dirty,
+    Escalation,
+}
+
+impl Cdf53Source {
+    fn label(self) -> &'static str {
+        match self {
+            Cdf53Source::Dirty => "dirty",
+            Cdf53Source::Escalation => "escalation",
+        }
+    }
+}
+
 /// Bytes a `pacer_rate_bps` rate (bits per second, from
 /// `BweSnapshot::pacer_rate_bps`) affords over one tick of `tick_interval_us`
 /// microseconds. Pure arithmetic, factored out of `combine_pacing_budget` so
@@ -286,6 +303,71 @@ impl IoBridge {
             codec_raw = stats.codec_histogram.raw,
             codec_h264 = stats.codec_histogram.h264,
             "frame.last_send"
+        );
+    }
+
+    /// Start a new Cdf53 generation for one tile and queue its passes:
+    /// cancel emitter retransmit state, bump the scheduler generation,
+    /// count the bump against `source`, log one `cdf53.emit` line per
+    /// pass, and enqueue the payloads as refinement work.
+    ///
+    /// Callers own the `codec_state` and `already_escalated_this_gen`
+    /// writes, which must follow this call.
+    fn enqueue_cdf53_generation(
+        &mut self,
+        tile_x: u8,
+        tile_y: u8,
+        present_passes: u16,
+        passes: Vec<(u8, Vec<u8>)>,
+        source: Cdf53Source,
+    ) {
+        // Drop emitter retransmit state in lock-step (see
+        // dispatch_dirty_tiles_via_scheduler for the
+        // dangling-pointer rationale).
+        self.reliable_emitter.cancel_for_tile(tile_x, tile_y);
+        let gen = self.scheduler.bump_generation(tile_x, tile_y);
+        let counter = match source {
+            Cdf53Source::Dirty => &mut self.bump_count_accumulator.cdf53_dirty_path,
+            Cdf53Source::Escalation => &mut self.bump_count_accumulator.cdf53_escalation_path,
+        };
+        *counter = counter.saturating_add(1);
+        // (Old generation Cdf53 in-flight coverage is now
+        // dropped via the `reliable_emitter.cancel_for_tile`
+        // call above; the fragment_coverage drop here
+        // became redundant when Task 25 paired emitter
+        // cancellation with every bump_generation site.)
+        let source_label = source.label();
+        // Diagnostic: one line per pass actually sent (sparse
+        // encoding skips empty bit-planes) for the e2e log scan.
+        for (pass_idx, payload) in &passes {
+            // DEBUG, not INFO: this fires once per pass per tile. A full-screen first
+            // frame emits ~9200 of them in ~300 ms, which overruns journald's default
+            // RateLimitBurst (10000 per 30 s) and makes it silently discard everything
+            // the daemon logs for the rest of the interval -- measured in production as
+            // "Suppressed 23232 messages", a 20-second hole that reads exactly like a
+            // stalled capture loop and cost a debugging session before the suppression
+            // notice was found. The per-frame aggregate stays at INFO on the "dispatch
+            // returned" line (codec_cdf53=N), and e2e runs RUST_LOG=ghostframe=trace,debug
+            // so it still sees every line.
+            tracing::debug!(
+                target: "ghostframe::cdf53",
+                tile_x = tile_x,
+                tile_y = tile_y,
+                gen = gen,
+                pass_idx = *pass_idx,
+                payload_size = payload.len(),
+                source = source_label,
+                "cdf53.emit"
+            );
+        }
+        let payloads: Vec<Vec<u8>> = passes.into_iter().map(|(_, p)| p).collect();
+        self.scheduler.enqueue_refinement_subset_at(
+            tile_x,
+            tile_y,
+            gen,
+            present_passes,
+            payloads,
+            now_std(),
         );
     }
 
@@ -1293,55 +1375,12 @@ impl IoBridge {
                     }
                     let (present_passes, passes) =
                         crate::encoder::cdf53::encode_passes_sparse(&coeffs_i16);
-                    // Drop emitter retransmit state in lock-step (see
-                    // dispatch_dirty_tiles_via_scheduler for the
-                    // dangling-pointer rationale).
-                    self.reliable_emitter.cancel_for_tile(tile_x, tile_y);
-                    let gen = self.scheduler.bump_generation(tile_x, tile_y);
-                    self.bump_count_accumulator.cdf53_dirty_path = self
-                        .bump_count_accumulator
-                        .cdf53_dirty_path
-                        .saturating_add(1);
-                    // (Old generation Cdf53 in-flight coverage is now
-                    // dropped via the `reliable_emitter.cancel_for_tile`
-                    // call above; the fragment_coverage drop here
-                    // became redundant when Task 25 paired emitter
-                    // cancellation with every bump_generation site.)
-                    // New generation: tile is eligible for re-escalation.
-                    self.metrics_tracker
-                        .get_mut(tile_x as u32, tile_y as u32)
-                        .already_escalated_this_gen = false;
-                    // Diagnostic: one line per pass actually sent (sparse
-                    // encoding skips empty bit-planes) for the e2e log scan.
-                    for (pass_idx, payload) in &passes {
-                        // DEBUG, not INFO: this fires once per pass per tile. A full-screen first
-                        // frame emits ~9200 of them in ~300 ms, which overruns journald's default
-                        // RateLimitBurst (10000 per 30 s) and makes it silently discard everything
-                        // the daemon logs for the rest of the interval -- measured in production as
-                        // "Suppressed 23232 messages", a 20-second hole that reads exactly like a
-                        // stalled capture loop and cost a debugging session before the suppression
-                        // notice was found. The per-frame aggregate stays at INFO on the "dispatch
-                        // returned" line (codec_cdf53=N), and e2e runs RUST_LOG=ghostframe=trace,debug
-                        // so it still sees every line.
-                        tracing::debug!(
-                            target: "ghostframe::cdf53",
-                            tile_x = tile_x,
-                            tile_y = tile_y,
-                            gen = gen,
-                            pass_idx = *pass_idx,
-                            payload_size = payload.len(),
-                            source = "dirty",
-                            "cdf53.emit"
-                        );
-                    }
-                    let payloads: Vec<Vec<u8>> = passes.into_iter().map(|(_, p)| p).collect();
-                    self.scheduler.enqueue_refinement_subset_at(
+                    self.enqueue_cdf53_generation(
                         tile_x,
                         tile_y,
-                        gen,
                         present_passes,
-                        payloads,
-                        now_std(),
+                        passes,
+                        Cdf53Source::Dirty,
                     );
                     // Override the CPU classifier's codec_state so that
                     // dispatch_dirty_tiles_via_scheduler's pre-check can
@@ -1356,6 +1395,10 @@ impl IoBridge {
                         passes_sent: 0,
                         present_passes,
                     };
+                    // New generation: tile is eligible for re-escalation.
+                    self.metrics_tracker
+                        .get_mut(tile_x as u32, tile_y as u32)
+                        .already_escalated_this_gen = false;
                 }
             }
         }
@@ -1419,49 +1462,12 @@ impl IoBridge {
                     continue;
                 }
                 // H264 escalation path (existing).
-                // Drop emitter retransmit state in lock-step (see
-                // dispatch_dirty_tiles_via_scheduler for the
-                // dangling-pointer rationale).
-                self.reliable_emitter.cancel_for_tile(tile_x, tile_y);
-                let gen = self.scheduler.bump_generation(tile_x, tile_y);
-                self.bump_count_accumulator.cdf53_escalation_path = self
-                    .bump_count_accumulator
-                    .cdf53_escalation_path
-                    .saturating_add(1);
-                // (Old generation Cdf53 in-flight coverage is now
-                // dropped via the `reliable_emitter.cancel_for_tile`
-                // call above; the fragment_coverage drop here
-                // became redundant when Task 25 paired emitter
-                // cancellation with every bump_generation site.)
-                for (pass_idx, payload) in &passes {
-                    // DEBUG, not INFO: this fires once per pass per tile. A full-screen first
-                    // frame emits ~9200 of them in ~300 ms, which overruns journald's default
-                    // RateLimitBurst (10000 per 30 s) and makes it silently discard everything
-                    // the daemon logs for the rest of the interval -- measured in production as
-                    // "Suppressed 23232 messages", a 20-second hole that reads exactly like a
-                    // stalled capture loop and cost a debugging session before the suppression
-                    // notice was found. The per-frame aggregate stays at INFO on the "dispatch
-                    // returned" line (codec_cdf53=N), and e2e runs RUST_LOG=ghostframe=trace,debug
-                    // so it still sees every line.
-                    tracing::debug!(
-                        target: "ghostframe::cdf53",
-                        tile_x = tile_x,
-                        tile_y = tile_y,
-                        gen = gen,
-                        pass_idx = *pass_idx,
-                        payload_size = payload.len(),
-                        source = "escalation",
-                        "cdf53.emit"
-                    );
-                }
-                let payloads: Vec<Vec<u8>> = passes.into_iter().map(|(_, p)| p).collect();
-                self.scheduler.enqueue_refinement_subset_at(
+                self.enqueue_cdf53_generation(
                     tile_x,
                     tile_y,
-                    gen,
                     present_passes,
-                    payloads,
-                    now_std(),
+                    passes,
+                    Cdf53Source::Escalation,
                 );
 
                 let tm = self.metrics_tracker.get_mut(tile_x as u32, tile_y as u32);
