@@ -441,21 +441,23 @@ impl ReliableTileEmitter {
             // with the same fingerprint, while the live palette has moved on.
             let attempts = entry.attempts;
             let frag_count = frags.len();
-            let (fp, codec_byte, palette_id_byte, flags_byte) = first_fragment_fp(&frags);
-            tracing::trace!(
-                target: "emitter.h3",
-                frame_seq = key.frame_seq,
-                tile_x = key.tile_x,
-                tile_y = key.tile_y,
-                pass_idx = key.pass_idx,
-                attempts = attempts,
-                frag_count = frag_count,
-                codec = codec_byte,
-                palrle_flags = flags_byte,
-                palette_id = palette_id_byte,
-                fp = format_args!("{:08x}", fp),
-                "[H3-SRV] retransmit"
-            );
+            if tracing::enabled!(target: "emitter.h3", tracing::Level::TRACE) {
+                let (fp, codec_byte, palette_id_byte, flags_byte) = first_fragment_fp(&frags);
+                tracing::trace!(
+                    target: "emitter.h3",
+                    frame_seq = key.frame_seq,
+                    tile_x = key.tile_x,
+                    tile_y = key.tile_y,
+                    pass_idx = key.pass_idx,
+                    attempts = attempts,
+                    frag_count = frag_count,
+                    codec = codec_byte,
+                    palrle_flags = flags_byte,
+                    palette_id = palette_id_byte,
+                    fp = format_args!("{:08x}", fp),
+                    "[H3-SRV] retransmit"
+                );
+            }
             for mut bytes in frags {
                 // Re-stamp emit time on retransmit so the BWE consumer sees
                 // the actual on-wire moment, not the original send. Tile
@@ -721,6 +723,13 @@ impl ReliableTileEmitter {
     }
 }
 
+// Test-only count of fingerprints computed on this thread, so a test can
+// prove the work is skipped when no subscriber wants the trace line.
+#[cfg(test)]
+thread_local! {
+    static FP_COMPUTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// [H3-DIAG] FNV-1a fingerprint of the first fragment's bytes, plus the
 /// peeked codec / palrle-flags / palette_id bytes from a tile datagram
 /// layout: 16-byte DatagramHeader + 8-byte TileHeader + payload.
@@ -729,6 +738,8 @@ impl ReliableTileEmitter {
 /// non-PalRle codecs the palette_id / flags bytes are meaningless but
 /// still surfaced to keep the log shape stable.
 fn first_fragment_fp(frags: &[Vec<u8>]) -> (u32, u8, u8, u8) {
+    #[cfg(test)]
+    FP_COMPUTED.with(|c| c.set(c.get() + 1));
     let Some(f) = frags.first() else {
         return (0, 0xFF, 0xFF, 0xFF);
     };
@@ -982,6 +993,64 @@ mod tests {
         assert!(entry.last_sent_at > entry_first_sent);
         assert_eq!(e.stats.rto_fired, 1);
         assert_eq!(e.stats.retransmit_attempts_total, 1);
+    }
+
+    /// The [H3-SRV] retransmit line needs an FNV pass over the first
+    /// fragment. That must only be paid when something is listening at TRACE
+    /// on `emitter.h3`: this runs once per retransmit, and a storm is
+    /// exactly when retransmits are many.
+    #[test]
+    fn the_retransmit_fingerprint_is_only_computed_when_traced() {
+        fn one_rto_retransmit() {
+            let mut e = ReliableTileEmitter::new(Instant::now());
+            let mut sender = CollectSender::default();
+            let t0 = Instant::now();
+            let key = EmitKey::new(1, 0, 0, 0);
+            e.submit_one(key, fake_source(1, 0, 0), t0, None, t0);
+            e.drain(&mut sender, t0);
+            let t1 = t0 + Duration::from_millis(1_100);
+            e.tick(t1, usize::MAX);
+            e.drain(&mut sender, t1);
+            assert_eq!(
+                e.stats.retransmit_attempts_total, 1,
+                "premise: it retransmitted"
+            );
+        }
+
+        // Nobody listening: no fingerprint.
+        FP_COMPUTED.with(|c| c.set(0));
+        tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+            one_rto_retransmit()
+        });
+        assert_eq!(FP_COMPUTED.with(|c| c.get()), 0);
+
+        // Listening at TRACE: fingerprint computed and the line is emitted.
+        #[derive(Clone, Default)]
+        struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Sink;
+            fn make_writer(&'a self) -> Sink {
+                self.clone()
+            }
+        }
+        let sink = Sink::default();
+        let sub = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(sink.clone())
+            .finish();
+        tracing::subscriber::with_default(sub, one_rto_retransmit);
+        assert_eq!(FP_COMPUTED.with(|c| c.get()), 1);
+        let out = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        assert!(out.contains("[H3-SRV] retransmit"), "got: {out}");
     }
 
     #[test]
