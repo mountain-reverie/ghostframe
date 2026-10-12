@@ -13,6 +13,129 @@ use super::super::pipeline_builder::{
 };
 use super::*;
 
+const SAD_BINDINGS: [BindingSpec; 3] = [
+    BindingSpec::storage_image(0),
+    BindingSpec::storage_image(1),
+    BindingSpec::storage_buffer(2),
+];
+const NV12_BINDINGS: [BindingSpec; 2] = [
+    BindingSpec::storage_image(0),
+    BindingSpec::storage_buffer(1),
+];
+const ANALYSIS_BINDINGS: [BindingSpec; 2] = [
+    BindingSpec::storage_image(0),
+    BindingSpec::storage_buffer(1),
+];
+const PALRLE_COMPACT_BINDINGS: [BindingSpec; 4] = [
+    BindingSpec::storage_buffer(0),
+    BindingSpec::storage_buffer(1),
+    BindingSpec::storage_buffer(2),
+    BindingSpec::storage_buffer(3),
+];
+const CDF53_COMPACT_BINDINGS: [BindingSpec; 4] = [
+    BindingSpec::storage_buffer(0),
+    BindingSpec::storage_buffer(1),
+    BindingSpec::storage_buffer(2),
+    BindingSpec::storage_buffer(3),
+];
+const PALRLE_INDIRECT_ARGS_BINDINGS: [BindingSpec; 2] = [
+    BindingSpec::storage_buffer(0),
+    BindingSpec::storage_buffer(1),
+];
+const PAL_RLE_INDEX_BINDINGS: [BindingSpec; 6] = [
+    BindingSpec::storage_image(0),
+    BindingSpec::storage_buffer(1),
+    BindingSpec::storage_buffer(2),
+    BindingSpec::storage_buffer(3),
+    BindingSpec::storage_buffer(4),
+    BindingSpec::storage_buffer(5),
+];
+const CDF53_FORWARD_L1_BINDINGS: [BindingSpec; 3] = [
+    BindingSpec::storage_image(0),
+    BindingSpec::storage_buffer(1),
+    BindingSpec::storage_buffer(2),
+];
+const CDF53_FORWARD_L2_BINDINGS: [BindingSpec; 2] = [
+    BindingSpec::storage_buffer(0),
+    BindingSpec::storage_buffer(1),
+];
+const CDF53_FORWARD_L3_BINDINGS: [BindingSpec; 2] = [
+    BindingSpec::storage_buffer(0),
+    BindingSpec::storage_buffer(1),
+];
+const CDF53_INDIRECT_ARGS_BINDINGS: [BindingSpec; 2] = [
+    BindingSpec::storage_buffer(0),
+    BindingSpec::storage_buffer(1),
+];
+const PALETTE_FOLD_BINDINGS: [BindingSpec; 6] = [
+    BindingSpec::storage_buffer(0),
+    BindingSpec::storage_buffer(1),
+    BindingSpec::storage_buffer(2),
+    BindingSpec::storage_buffer(3),
+    BindingSpec::storage_buffer(4),
+    BindingSpec::storage_buffer(5),
+];
+const PALETTE_SUBSET_FOLD_INIT_BINDINGS: [BindingSpec; 1] = [BindingSpec::storage_buffer(0)];
+const PALETTE_SUBSET_FOLD_BINDINGS: [BindingSpec; 2] = [
+    BindingSpec::storage_buffer(0),
+    BindingSpec::storage_buffer(1),
+];
+
+/// Number of `record_stage` descriptor sets each stage holds at once, i.e.
+/// how many times a stage's layout is allocated from the shared pool per
+/// frame. The cdf53 forward stages run twice (refinement and escalation).
+const STAGE_POOL_USES: [(&[BindingSpec], u32); 14] = [
+    (&SAD_BINDINGS, 1),
+    (&NV12_BINDINGS, 1),
+    (&ANALYSIS_BINDINGS, 1),
+    (&PALRLE_COMPACT_BINDINGS, 1),
+    (&CDF53_COMPACT_BINDINGS, 1),
+    (&PALRLE_INDIRECT_ARGS_BINDINGS, 1),
+    (&PAL_RLE_INDEX_BINDINGS, 1),
+    (&CDF53_FORWARD_L1_BINDINGS, 2),
+    (&CDF53_FORWARD_L2_BINDINGS, 2),
+    (&CDF53_FORWARD_L3_BINDINGS, 2),
+    (&CDF53_INDIRECT_ARGS_BINDINGS, 1),
+    (&PALETTE_FOLD_BINDINGS, 1),
+    (&PALETTE_SUBSET_FOLD_INIT_BINDINGS, 1),
+    (&PALETTE_SUBSET_FOLD_BINDINGS, 1),
+];
+
+/// Descriptor totals `(storage_images, storage_buffers, sets)` derived from
+/// [`STAGE_POOL_USES`].
+const fn derive_pool_need() -> (u32, u32, u32) {
+    let (mut images, mut buffers, mut sets) = (0u32, 0u32, 0u32);
+    let mut s = 0;
+    while s < STAGE_POOL_USES.len() {
+        let (specs, uses) = STAGE_POOL_USES[s];
+        let mut b = 0;
+        while b < specs.len() {
+            let ty = specs[b].descriptor_type.as_raw();
+            if ty == vk::DescriptorType::STORAGE_IMAGE.as_raw() {
+                images += uses;
+            } else if ty == vk::DescriptorType::STORAGE_BUFFER.as_raw() {
+                buffers += uses;
+            } else {
+                panic!("descriptor pool: unhandled descriptor type");
+            }
+            b += 1;
+        }
+        sets += uses;
+        s += 1;
+    }
+    (images, buffers, sets)
+}
+
+const POOL_NEED: (u32, u32, u32) = derive_pool_need();
+/// Slack kept on top of the derived need. Deliberate: it preserves the
+/// pre-derivation pool sizes exactly, and leaves room for a stage or two
+/// without touching the pool.
+const POOL_IMAGE_HEADROOM: u32 = 1;
+const POOL_SET_HEADROOM: u32 = 3;
+const POOL_STORAGE_IMAGES: u32 = POOL_NEED.0 + POOL_IMAGE_HEADROOM;
+const POOL_STORAGE_BUFFERS: u32 = POOL_NEED.1;
+const POOL_MAX_SETS: u32 = POOL_NEED.2 + POOL_SET_HEADROOM;
+
 impl GpuFrameProcessor {
     pub(super) unsafe fn new_inner(max_tiles: u32) -> Result<Self, Box<dyn std::error::Error>> {
         // --- Entry ---
@@ -120,16 +243,7 @@ impl GpuFrameProcessor {
         //   2: STORAGE_BUFFER (SAD output)
         // Push constants: 3 × u32 = 12 bytes (frame_width, frame_height, cols).
         let (descriptor_set_layout, pipeline_layout, pipeline) =
-            pipeline_builder::build_compute_pipeline(
-                &device,
-                &[
-                    BindingSpec::storage_image(0),
-                    BindingSpec::storage_image(1),
-                    BindingSpec::storage_buffer(2),
-                ],
-                12,
-                shader_module,
-            )?;
+            pipeline_builder::build_compute_pipeline(&device, &SAD_BINDINGS, 12, shader_module)?;
 
         // --- NV12 compute pipeline ---
         // Bindings:
@@ -139,10 +253,7 @@ impl GpuFrameProcessor {
         let (nv12_descriptor_set_layout, nv12_pipeline_layout, nv12_pipeline) =
             pipeline_builder::build_compute_pipeline(
                 &device,
-                &[
-                    BindingSpec::storage_image(0),
-                    BindingSpec::storage_buffer(1),
-                ],
+                &NV12_BINDINGS,
                 20,
                 nv12_shader_module,
             )?;
@@ -157,10 +268,7 @@ impl GpuFrameProcessor {
         let (analysis_descriptor_set_layout, analysis_pipeline_layout, analysis_pipeline) =
             pipeline_builder::build_compute_pipeline(
                 &device,
-                &[
-                    BindingSpec::storage_image(0),
-                    BindingSpec::storage_buffer(1),
-                ],
+                &ANALYSIS_BINDINGS,
                 12,
                 analysis_shader_module,
             )?;
@@ -187,12 +295,7 @@ impl GpuFrameProcessor {
             palrle_compact_pipeline,
         ) = pipeline_builder::build_compute_pipeline(
             &device,
-            &[
-                BindingSpec::storage_buffer(0),
-                BindingSpec::storage_buffer(1),
-                BindingSpec::storage_buffer(2),
-                BindingSpec::storage_buffer(3),
-            ],
+            &PALRLE_COMPACT_BINDINGS,
             12,
             palrle_compact_shader_module,
         )?;
@@ -220,12 +323,7 @@ impl GpuFrameProcessor {
             cdf53_compact_pipeline,
         ) = pipeline_builder::build_compute_pipeline(
             &device,
-            &[
-                BindingSpec::storage_buffer(0),
-                BindingSpec::storage_buffer(1),
-                BindingSpec::storage_buffer(2),
-                BindingSpec::storage_buffer(3),
-            ],
+            &CDF53_COMPACT_BINDINGS,
             16,
             cdf53_compact_shader_module,
         )?;
@@ -250,10 +348,7 @@ impl GpuFrameProcessor {
             palrle_indirect_args_pipeline,
         ) = pipeline_builder::build_compute_pipeline(
             &device,
-            &[
-                BindingSpec::storage_buffer(0),
-                BindingSpec::storage_buffer(1),
-            ],
+            &PALRLE_INDIRECT_ARGS_BINDINGS,
             0,
             palrle_indirect_args_shader_module,
         )?;
@@ -282,14 +377,7 @@ impl GpuFrameProcessor {
             pal_rle_index_pipeline,
         ) = pipeline_builder::build_compute_pipeline(
             &device,
-            &[
-                BindingSpec::storage_image(0),
-                BindingSpec::storage_buffer(1),
-                BindingSpec::storage_buffer(2),
-                BindingSpec::storage_buffer(3),
-                BindingSpec::storage_buffer(4),
-                BindingSpec::storage_buffer(5),
-            ],
+            &PAL_RLE_INDEX_BINDINGS,
             4,
             pal_rle_index_shader_module,
         )?;
@@ -315,11 +403,7 @@ impl GpuFrameProcessor {
             cdf53_forward_l1_pipeline,
         ) = pipeline_builder::build_compute_pipeline(
             &device,
-            &[
-                BindingSpec::storage_image(0),
-                BindingSpec::storage_buffer(1),
-                BindingSpec::storage_buffer(2),
-            ],
+            &CDF53_FORWARD_L1_BINDINGS,
             8,
             cdf53_forward_l1_shader_module,
         )?;
@@ -344,10 +428,7 @@ impl GpuFrameProcessor {
             cdf53_forward_l2_pipeline,
         ) = pipeline_builder::build_compute_pipeline(
             &device,
-            &[
-                BindingSpec::storage_buffer(0),
-                BindingSpec::storage_buffer(1),
-            ],
+            &CDF53_FORWARD_L2_BINDINGS,
             8,
             cdf53_forward_l2_shader_module,
         )?;
@@ -372,47 +453,28 @@ impl GpuFrameProcessor {
             cdf53_forward_l3_pipeline,
         ) = pipeline_builder::build_compute_pipeline(
             &device,
-            &[
-                BindingSpec::storage_buffer(0),
-                BindingSpec::storage_buffer(1),
-            ],
+            &CDF53_FORWARD_L3_BINDINGS,
             8,
             cdf53_forward_l3_shader_module,
         )?;
 
         // --- Descriptor pool ---
-        // 17 sets: SAD (2 STORAGE_IMAGE + 1 STORAGE_BUFFER)
-        //        + NV12 (1 STORAGE_IMAGE + 1 STORAGE_BUFFER)
-        //        + Analysis (1 STORAGE_IMAGE + 1 STORAGE_BUFFER)
-        //        + palrle_compact (4 STORAGE_BUFFER)
-        //        + palrle_indirect_args (2 STORAGE_BUFFER)
-        //        + palette_fold (6 STORAGE_BUFFER)
-        //        + palette_subset_fold_init (1 STORAGE_BUFFER)
-        //        + palette_subset_fold (2 STORAGE_BUFFER)
-        //        + pal_rle_index (1 STORAGE_IMAGE + 5 STORAGE_BUFFER)
-        //        + cdf53_compact (4 STORAGE_BUFFER)   ← added M3.3a Task 5
-        //        + cdf53_indirect_args (2 STORAGE_BUFFER)  ← added M3.3a Task 6
-        //        + cdf53_forward_l1 (1 STORAGE_IMAGE + 2 STORAGE_BUFFER) ← Task 7
-        //        + cdf53_forward_l2 (2 STORAGE_BUFFER)   ← Task 7
-        //        + cdf53_forward_l3 (2 STORAGE_BUFFER)   ← Task 7
-        //        + cdf53_forward_l1 (escalation) (1 STORAGE_IMAGE + 2 STORAGE_BUFFER) ← Task 8
-        //        + cdf53_forward_l2 (escalation) (2 STORAGE_BUFFER)  ← Task 8
-        //        + cdf53_forward_l3 (escalation) (2 STORAGE_BUFFER)  ← Task 8
-        // Total: 8 STORAGE_IMAGE, 41 STORAGE_BUFFER, 17 required sets.
-        // max_sets=20: +3 headroom for future pipeline stages (e.g. M3.3d+).
+        // Sized from the per-stage binding tables (STAGE_POOL_USES): the same
+        // specs that build each stage's layout. See POOL_*_HEADROOM for the
+        // deliberate slack.
         let pool_sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_IMAGE,
-                descriptor_count: 8,
+                descriptor_count: POOL_STORAGE_IMAGES,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: 41,
+                descriptor_count: POOL_STORAGE_BUFFERS,
             },
         ];
         let dp_ci = vk::DescriptorPoolCreateInfo::default()
             .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
-            .max_sets(20)
+            .max_sets(POOL_MAX_SETS)
             .pool_sizes(&pool_sizes);
         let descriptor_pool = device.create_descriptor_pool(&dp_ci, None)?;
 
@@ -550,10 +612,7 @@ impl GpuFrameProcessor {
             cdf53_indirect_args_pipeline,
         ) = pipeline_builder::build_compute_pipeline(
             &device,
-            &[
-                BindingSpec::storage_buffer(0),
-                BindingSpec::storage_buffer(1),
-            ],
+            &CDF53_INDIRECT_ARGS_BINDINGS,
             0,
             cdf53_indirect_args_shader_module,
         )?;
@@ -581,14 +640,7 @@ impl GpuFrameProcessor {
             palette_fold_pipeline,
         ) = pipeline_builder::build_compute_pipeline(
             &device,
-            &[
-                BindingSpec::storage_buffer(0),
-                BindingSpec::storage_buffer(1),
-                BindingSpec::storage_buffer(2),
-                BindingSpec::storage_buffer(3),
-                BindingSpec::storage_buffer(4),
-                BindingSpec::storage_buffer(5),
-            ],
+            &PALETTE_FOLD_BINDINGS,
             0,
             palette_fold_shader_module,
         )?;
@@ -666,7 +718,7 @@ impl GpuFrameProcessor {
             palette_subset_fold_init_pipeline,
         ) = pipeline_builder::build_compute_pipeline(
             &device,
-            &[BindingSpec::storage_buffer(0)],
+            &PALETTE_SUBSET_FOLD_INIT_BINDINGS,
             0,
             palette_subset_fold_init_shader_module,
         )?;
@@ -691,10 +743,7 @@ impl GpuFrameProcessor {
             palette_subset_fold_pipeline,
         ) = pipeline_builder::build_compute_pipeline(
             &device,
-            &[
-                BindingSpec::storage_buffer(0),
-                BindingSpec::storage_buffer(1),
-            ],
+            &PALETTE_SUBSET_FOLD_BINDINGS,
             0,
             palette_subset_fold_shader_module,
         )?;
@@ -993,5 +1042,22 @@ impl GpuFrameProcessor {
             force_all_dirty_remaining: 0,
             staged_escalation_count: 0,
         })
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    #[test]
+    fn pool_sizes_follow_the_stage_binding_table() {
+        assert_eq!(POOL_NEED, (7, 41, 17));
+        assert_eq!(
+            (POOL_STORAGE_IMAGES, POOL_STORAGE_BUFFERS, POOL_MAX_SETS),
+            (8, 41, 20)
+        );
+        assert!(POOL_STORAGE_IMAGES >= POOL_NEED.0);
+        assert!(POOL_STORAGE_BUFFERS >= POOL_NEED.1);
+        assert!(POOL_MAX_SETS >= POOL_NEED.2);
     }
 }
