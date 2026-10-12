@@ -2158,3 +2158,602 @@ fn cdf53_forward_from_pixels_live_dims_matches_cpu_reference() {
         mismatches.join("\n  ")
     );
 }
+
+// ---------------------------------------------------------------------------
+// Golden characterization test
+// ---------------------------------------------------------------------------
+//
+// Pins the exact byte outputs of the GPU frame pipeline for a deterministic
+// scripted sequence driven through `process_frame_from_pixels` (the path that
+// actually runs on hosts where a memfd is not accepted as a DMA-BUF). It is a
+// safety net for zero-behaviour-change refactors of `frame.rs`: every defined
+// output surface is hashed after every frame and compared with constants that
+// were captured from the pre-refactor code.
+//
+// Regenerate the table with `GOLDEN_PRINT=1 cargo test -p ghostframe-lib --lib
+// capture::gpu_pipeline::tests::golden -- --nocapture` and paste the printed
+// rows into `GOLDEN_EXPECTED`. Only DEFINED regions are hashed: stale slots
+// (index_buffer slots >= palrle_compact_count, palette slots not referenced by
+// a compact tile, coefficient slots >= the compact count) are skipped, and
+// every surface whose order depends on GPU atomic-append order (the compact
+// lists) is canonicalised by sorting on the flat tile index.
+
+struct Fnv(u64);
+
+impl Fnv {
+    fn new() -> Self {
+        Fnv(0xcbf2_9ce4_8422_2325)
+    }
+    fn bytes(&mut self, b: &[u8]) {
+        for &x in b {
+            self.0 ^= x as u64;
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    fn u32(&mut self, v: u32) {
+        self.bytes(&v.to_le_bytes());
+    }
+    fn i32s(&mut self, v: &[i32]) {
+        for &x in v {
+            self.bytes(&x.to_le_bytes());
+        }
+    }
+}
+
+fn golden_mix(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Fixed-seed LCG (no rand crate).
+struct GoldenLcg(u64);
+impl GoldenLcg {
+    fn next(&mut self) -> u32 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (self.0 >> 33) as u32
+    }
+}
+
+#[derive(Clone, Copy)]
+enum GoldenKind {
+    Solid(u32),
+    /// Text-like palette tile: pixels drawn from `colors` in 2x2 blocks.
+    Pal(&'static [u32], u64),
+    Grad(u32),
+    Noise,
+}
+
+const GC_WHITE: u32 = 0xFFFF_FFFF;
+const GC_BLACK: u32 = 0xFF00_0000;
+const GC_RED: u32 = 0xFF00_00C8;
+const GC_BLUE: u32 = 0xFFC8_0000;
+const GC_GREEN: u32 = 0xFF00_C800;
+const GC_GREY: u32 = 0xFF80_8080;
+static GP2: [u32; 2] = [GC_WHITE, GC_BLACK];
+static GP3: [u32; 3] = [GC_WHITE, GC_BLACK, GC_RED];
+static GP4: [u32; 4] = [GC_WHITE, GC_BLACK, GC_RED, GC_BLUE];
+static GP3B: [u32; 3] = [GC_BLUE, GC_GREEN, GC_GREY];
+static GP9: [u32; 9] = [
+    GC_WHITE,
+    GC_BLACK,
+    GC_RED,
+    GC_BLUE,
+    GC_GREEN,
+    GC_GREY,
+    0xFF10_2030,
+    0xFF30_2010,
+    0xFF55_AA55,
+];
+
+/// Tile content for the scripted frames. `ver` selects the script revision;
+/// `cols` makes the layout meaningful at both frame sizes.
+fn golden_kind(tx: u32, ty: u32, cols: u32, ver: u32) -> GoldenKind {
+    let idx = ty * cols + tx;
+    let base = match idx {
+        0 => GoldenKind::Grad(0),
+        1 => GoldenKind::Solid(GC_WHITE),
+        2 => GoldenKind::Pal(&GP2, 11),
+        3 => GoldenKind::Pal(&GP3, 12),
+        4 => GoldenKind::Pal(&GP4, 13),
+        5 => GoldenKind::Pal(&GP2, 14),
+        6 => GoldenKind::Noise,
+        7 => GoldenKind::Grad(50),
+        8 => GoldenKind::Solid(GC_BLUE),
+        9 => GoldenKind::Pal(&GP3B, 15),
+        10 => GoldenKind::Pal(&GP9, 16),
+        _ => GoldenKind::Solid(0xFF00_0000 | ((idx * 0x0007_0509) & 0x00FF_FFFF)),
+    };
+    // Modifications relative to the base layout.
+    match (ver, idx) {
+        (0, _) => base,
+        (1, 1) => GoldenKind::Pal(&GP2, 21),
+        (1, 3) => GoldenKind::Pal(&GP4, 22),
+        (1, 5) => GoldenKind::Pal(&GP3, 23),
+        (1, 7) => GoldenKind::Grad(90),
+        (1, 12) => GoldenKind::Pal(&GP9, 24),
+        (1, 20) => GoldenKind::Solid(GC_GREY),
+        (1, 23) => GoldenKind::Grad(200),
+        (1, 34 | 18) => GoldenKind::Pal(&GP2, 25),
+        (2, 0) => GoldenKind::Grad(33),
+        (2, 2) => GoldenKind::Pal(&GP3, 31),
+        (2, 6) => GoldenKind::Noise,
+        (2, 15) => GoldenKind::Pal(&GP4, 32),
+        _ => base,
+    }
+}
+
+fn golden_render(w: u32, h: u32, ver: u32) -> Vec<u8> {
+    let cols = w.div_ceil(32);
+    let mut px = vec![0u8; (w * h * 4) as usize];
+    let mut lcg = GoldenLcg(0x5eed_0000_0000_0000 ^ ((w as u64) << 16) ^ h as u64);
+    for y in 0..h {
+        for x in 0..w {
+            let (tx, ty, lx, ly) = (x / 32, y / 32, x % 32, y % 32);
+            let col: u32 = match golden_kind(tx, ty, cols, ver) {
+                GoldenKind::Solid(c) => c,
+                GoldenKind::Pal(cs, seed) => {
+                    let r = golden_mix(
+                        seed ^ ((tx as u64) << 40)
+                            ^ ((ty as u64) << 32)
+                            ^ (((lx / 2) as u64) << 8)
+                            ^ ((ly / 2) as u64),
+                    );
+                    cs[(r % cs.len() as u64) as usize]
+                }
+                GoldenKind::Grad(s) => {
+                    0xFF00_0000
+                        | ((lx + ly + s) % 256) << 16
+                        | ((ly * 3) % 256) << 8
+                        | ((lx * 3 + s) % 256)
+                }
+                GoldenKind::Noise => {
+                    let v = lcg.next();
+                    0xFF00_0000 | (v & 0x00FF_FFFF)
+                }
+            };
+            let off = ((y * w + x) * 4) as usize;
+            px[off..off + 4].copy_from_slice(&col.to_le_bytes());
+        }
+    }
+    px
+}
+
+unsafe fn golden_read_args(p: &GpuFrameProcessor, mem: vk::DeviceMemory) -> [u32; 3] {
+    let ptr = p
+        .device
+        .map_memory(mem, 0, 12, vk::MemoryMapFlags::empty())
+        .expect("map indirect-args memory") as *const u32;
+    let range = vk::MappedMemoryRange::default()
+        .memory(mem)
+        .offset(0)
+        .size(vk::WHOLE_SIZE);
+    p.device.invalidate_mapped_memory_ranges(&[range]).ok();
+    let out = [*ptr, *ptr.add(1), *ptr.add(2)];
+    p.device.unmap_memory(mem);
+    out
+}
+
+/// Hash every defined output of the last `process_frame_from_pixels` call.
+/// Returns `(surface, hash)` rows plus a few counters for the non-vacuity
+/// check.
+unsafe fn golden_surfaces(
+    p: &GpuFrameProcessor,
+    a: &FrameAnalysis,
+    w: u32,
+    h: u32,
+    esc_count: usize,
+    stats: &mut GoldenStats,
+) -> Vec<(&'static str, u64)> {
+    let mut rows: Vec<(&'static str, u64)> = Vec::new();
+    let cols = w.div_ceil(32);
+    let tiles = (cols * h.div_ceil(32)) as usize;
+
+    // dirty_tiles
+    let mut f = Fnv::new();
+    f.u32(a.dirty_tiles.len() as u32);
+    for &t in &a.dirty_tiles {
+        f.u32(t);
+    }
+    rows.push(("dirty", f.0));
+    stats.dirty += a.dirty_tiles.len();
+
+    // NV12: Y rows (w bytes each) then UV rows (2*ceil(w/2) bytes each).
+    let mut f = Fnv::new();
+    for y in 0..h as usize {
+        f.bytes(std::slice::from_raw_parts(
+            a.nv12_data.add(y * a.nv12_y_stride as usize),
+            w as usize,
+        ));
+    }
+    rows.push(("nv12_y", f.0));
+    let mut f = Fnv::new();
+    for y in 0..h.div_ceil(2) as usize {
+        f.bytes(std::slice::from_raw_parts(
+            a.nv12_data
+                .add(a.nv12_uv_offset as usize + y * a.nv12_uv_stride as usize),
+            (w.div_ceil(2) * 2) as usize,
+        ));
+    }
+    rows.push(("nv12_uv", f.0));
+
+    // tile_analysis (colors only valid for count 1..=16).
+    let ta = a.tile_analysis_slice();
+    assert_eq!(ta.len(), tiles);
+    let mut f = Fnv::new();
+    for t in ta {
+        f.u32(t.count);
+        f.u32(t.edge_density_thou);
+        if (1..=16).contains(&t.count) {
+            for &c in &t.colors[..t.count as usize] {
+                f.u32(c);
+            }
+        }
+        stats.analysed_colors += t.count as usize;
+    }
+    rows.push(("tile_analysis", f.0));
+
+    // PalRLE compact + palette set + folded_into + index buffer, sorted by tile.
+    let n = a.palrle_compact_count as usize;
+    stats.palrle_max = stats.palrle_max.max(n);
+    let list = a.palrle_compact_list_slice();
+    let pids = a.per_tile_frame_palette_id_slice();
+    let pset = a.frame_palette_set_slice();
+    let folded = a.folded_into_slice();
+    assert_eq!(list.len(), n);
+    assert_eq!(pids.len(), n);
+    let pal_hash = |f: &mut Fnv, id: usize| {
+        let e = &pset[id];
+        f.u32(e.count);
+        for &c in &e.colors[..(e.count as usize).min(16)] {
+            f.u32(c);
+        }
+    };
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&c| list[c]);
+    let mut f_list = Fnv::new();
+    let mut f_pal = Fnv::new();
+    let mut f_fold = Fnv::new();
+    let mut f_idx = Fnv::new();
+    f_list.u32(n as u32);
+    f_pal.u32(a.frame_palette_set_count);
+    for &c in &order {
+        let tile = list[c];
+        f_list.u32(tile);
+        f_pal.u32(tile);
+        pal_hash(&mut f_pal, pids[c] as usize);
+        let fold_id = (folded[pids[c] as usize] & 0xFF) as usize;
+        f_fold.u32(tile);
+        f_fold.u32(folded[pids[c] as usize] >> 8);
+        f_fold.u32((fold_id != pids[c] as usize) as u32);
+        pal_hash(&mut f_fold, fold_id);
+        if fold_id != pids[c] as usize {
+            stats.folds += 1;
+        }
+        f_idx.u32(tile);
+        f_idx.bytes(a.index_buffer_slice_for(c));
+    }
+    rows.push(("palrle_list", f_list.0));
+    rows.push(("palette_set", f_pal.0));
+    rows.push(("folded_into", f_fold.0));
+    rows.push(("index_buffer", f_idx.0));
+
+    // CDF 5/3 forward (L1+L2+L3) for the compact tiles, sorted by tile.
+    let cn = *p.cdf53_compact_count_ptr as usize;
+    stats.cdf_max = stats.cdf_max.max(cn);
+    let clist = std::slice::from_raw_parts(p.cdf53_compact_list_ptr, cn);
+    let mut corder: Vec<usize> = (0..cn).collect();
+    corder.sort_by_key(|&c| clist[c]);
+    let mut f_cl = Fnv::new();
+    let mut f_cc = Fnv::new();
+    f_cl.u32(cn as u32);
+    for &c in &corder {
+        f_cl.u32(clist[c]);
+        f_cc.u32(clist[c]);
+        let co = std::slice::from_raw_parts(p.cdf53_coefficients_ptr.add(c * 3072), 3072);
+        if co.iter().any(|&v| v != 0) {
+            stats.cdf_nonzero_tiles += 1;
+        }
+        f_cc.i32s(co);
+    }
+    rows.push(("cdf53_list", f_cl.0));
+    rows.push(("cdf53_coeffs", f_cc.0));
+
+    // Escalation forward pass (candidate order is CPU-defined, so raw order).
+    let mut f = Fnv::new();
+    f.u32(esc_count as u32);
+    if esc_count > 0 {
+        let co = std::slice::from_raw_parts(p.cdf53_escalation_coefficients_ptr, esc_count * 3072);
+        if co.iter().any(|&v| v != 0) {
+            stats.esc_nonzero += 1;
+        }
+        f.i32s(co);
+    }
+    rows.push(("escalation", f.0));
+
+    // Indirect dispatch arguments written by the two *_indirect_args shaders.
+    let mut f = Fnv::new();
+    for v in golden_read_args(p, p.palrle_indirect_args_memory) {
+        f.u32(v);
+    }
+    for v in golden_read_args(p, p.cdf53_dispatch_args_memory) {
+        f.u32(v);
+    }
+    rows.push(("indirect_args", f.0));
+    rows
+}
+
+#[derive(Default)]
+struct GoldenStats {
+    dirty: usize,
+    analysed_colors: usize,
+    palrle_max: usize,
+    folds: usize,
+    cdf_max: usize,
+    cdf_nonzero_tiles: usize,
+    esc_nonzero: usize,
+}
+
+/// `(frame, surface, fnv1a64)` captured from the unmodified pipeline.
+const GOLDEN_EXPECTED: &[(usize, &str, u64)] = &[
+    (0, "dirty", 0x1fbd886ecf874ea5),
+    (0, "nv12_y", 0x24f2470444498a7f),
+    (0, "nv12_uv", 0x423e9028983ab29a),
+    (0, "tile_analysis", 0x16818eaa08c2599d),
+    (0, "palrle_list", 0x17db082b36de5477),
+    (0, "palette_set", 0xb954be5aee491cb1),
+    (0, "folded_into", 0xd2c24be1f366bc71),
+    (0, "index_buffer", 0x6e409381c03a249f),
+    (0, "cdf53_list", 0x7d183f858df0e7d7),
+    (0, "cdf53_coeffs", 0xee49e08b3800f02e),
+    (0, "escalation", 0x8a00d4cb41533a7f),
+    (0, "indirect_args", 0x8df210e64d643c96),
+    (1, "dirty", 0x4d25767f9dce13f5),
+    (1, "nv12_y", 0x24f2470444498a7f),
+    (1, "nv12_uv", 0x423e9028983ab29a),
+    (1, "tile_analysis", 0x16818eaa08c2599d),
+    (1, "palrle_list", 0x4d25767f9dce13f5),
+    (1, "palette_set", 0x4d25767f9dce13f5),
+    (1, "folded_into", 0xcbf29ce484222325),
+    (1, "index_buffer", 0xcbf29ce484222325),
+    (1, "cdf53_list", 0x4d25767f9dce13f5),
+    (1, "cdf53_coeffs", 0xcbf29ce484222325),
+    (1, "escalation", 0x4d25767f9dce13f5),
+    (1, "indirect_args", 0x6fa37ebc366034e5),
+    (2, "dirty", 0x1ff8f72c544488b3),
+    (2, "nv12_y", 0x82ab1602c67f7b63),
+    (2, "nv12_uv", 0x41dfe811a83af449),
+    (2, "tile_analysis", 0x3a4037f02a40b784),
+    (2, "palrle_list", 0x6807a5070ed3b4cd),
+    (2, "palette_set", 0xd0d95b98821c08b1),
+    (2, "folded_into", 0x4ace64933a4683b6),
+    (2, "index_buffer", 0xe43745c26e188452),
+    (2, "cdf53_list", 0xc6433a907e3e2df7),
+    (2, "cdf53_coeffs", 0xeaf3c8d6d5c822c2),
+    (2, "escalation", 0x1715fcc7dac20932),
+    (2, "indirect_args", 0x3582fdfddc3de0a0),
+    (3, "dirty", 0x4d25767f9dce13f5),
+    (3, "nv12_y", 0x82ab1602c67f7b63),
+    (3, "nv12_uv", 0x41dfe811a83af449),
+    (3, "tile_analysis", 0x3a4037f02a40b784),
+    (3, "palrle_list", 0x4d25767f9dce13f5),
+    (3, "palette_set", 0x4d25767f9dce13f5),
+    (3, "folded_into", 0xcbf29ce484222325),
+    (3, "index_buffer", 0xcbf29ce484222325),
+    (3, "cdf53_list", 0x4d25767f9dce13f5),
+    (3, "cdf53_coeffs", 0xcbf29ce484222325),
+    (3, "escalation", 0xa6e941a0ec6bb586),
+    (3, "indirect_args", 0x6fa37ebc366034e5),
+    (4, "dirty", 0x1fbd886ecf874ea5),
+    (4, "nv12_y", 0x8f932450acfcca1a),
+    (4, "nv12_uv", 0x7dc97916e172d80c),
+    (4, "tile_analysis", 0xc2d90ea20009311b),
+    (4, "palrle_list", 0x17db082b36de5477),
+    (4, "palette_set", 0x86de5e095e93cbf7),
+    (4, "folded_into", 0xa0f87e7569508665),
+    (4, "index_buffer", 0xc1b1a0401286e97b),
+    (4, "cdf53_list", 0x7d183f858df0e7d7),
+    (4, "cdf53_coeffs", 0x5ab2ab9919fb0fee),
+    (4, "escalation", 0xb69f9634eb15b371),
+    (4, "indirect_args", 0x8df210e64d643c96),
+    (5, "dirty", 0x1fbd886ecf874ea5),
+    (5, "nv12_y", 0x8f932450acfcca1a),
+    (5, "nv12_uv", 0x7dc97916e172d80c),
+    (5, "tile_analysis", 0xc2d90ea20009311b),
+    (5, "palrle_list", 0x17db082b36de5477),
+    (5, "palette_set", 0x86de5e095e93cbf7),
+    (5, "folded_into", 0xa0f87e7569508665),
+    (5, "index_buffer", 0xc1b1a0401286e97b),
+    (5, "cdf53_list", 0x7d183f858df0e7d7),
+    (5, "cdf53_coeffs", 0x5ab2ab9919fb0fee),
+    (5, "escalation", 0x4d25767f9dce13f5),
+    (5, "indirect_args", 0x8df210e64d643c96),
+    (6, "dirty", 0x1fbd886ecf874ea5),
+    (6, "nv12_y", 0x8f932450acfcca1a),
+    (6, "nv12_uv", 0x7dc97916e172d80c),
+    (6, "tile_analysis", 0xc2d90ea20009311b),
+    (6, "palrle_list", 0x17db082b36de5477),
+    (6, "palette_set", 0x86de5e095e93cbf7),
+    (6, "folded_into", 0xa0f87e7569508665),
+    (6, "index_buffer", 0xc1b1a0401286e97b),
+    (6, "cdf53_list", 0x7d183f858df0e7d7),
+    (6, "cdf53_coeffs", 0x5ab2ab9919fb0fee),
+    (6, "escalation", 0xf6ccfe9dcf8b9e4f),
+    (6, "indirect_args", 0x8df210e64d643c96),
+    (7, "dirty", 0xfb3dbba6c0a52cab),
+    (7, "nv12_y", 0x82ab1602c67f7b63),
+    (7, "nv12_uv", 0x41dfe811a83af449),
+    (7, "tile_analysis", 0x3a4037f02a40b784),
+    (7, "palrle_list", 0xb985458588aec3ee),
+    (7, "palette_set", 0x83c52a18f31abb94),
+    (7, "folded_into", 0x844be3727db0d6bb),
+    (7, "index_buffer", 0xc8519dc04141749f),
+    (7, "cdf53_list", 0x5c72edf88918efc6),
+    (7, "cdf53_coeffs", 0x76d2cb63f90362d0),
+    (7, "escalation", 0x70eadc68f2818f23),
+    (7, "indirect_args", 0x8460f6739ef508bf),
+    (8, "dirty", 0xd714d758fe1693cd),
+    (8, "nv12_y", 0x44dbc2870e5b60f5),
+    (8, "nv12_uv", 0xacf8430ffdaf489c),
+    (8, "tile_analysis", 0x5a43dd969c383d8d),
+    (8, "palrle_list", 0x753aca7fd1e1d381),
+    (8, "palette_set", 0x5e2a06d866358bb7),
+    (8, "folded_into", 0x2274cef655c982a8),
+    (8, "index_buffer", 0xafffc5cbd0d15a70),
+    (8, "cdf53_list", 0x7d183f858df0e7d7),
+    (8, "cdf53_coeffs", 0x0cedc4a74a231b31),
+    (8, "escalation", 0x5921fc86d680a393),
+    (8, "indirect_args", 0x1eff9b62949cb243),
+    (9, "dirty", 0xc7a3dfd7f80248f0),
+    (9, "nv12_y", 0x7369b8fe727e9bc5),
+    (9, "nv12_uv", 0xc60c35a986695217),
+    (9, "tile_analysis", 0x3b8910e57f50668b),
+    (9, "palrle_list", 0xd16d91085891afce),
+    (9, "palette_set", 0x6a44f14e5f1eee08),
+    (9, "folded_into", 0x4f2a976eab7c74ec),
+    (9, "index_buffer", 0x2678fc675d6dca50),
+    (9, "cdf53_list", 0xc6433a907e3e2df7),
+    (9, "cdf53_coeffs", 0xeaf3c8d6d5c822c2),
+    (9, "escalation", 0xd81f8f53fee936ac),
+    (9, "indirect_args", 0x37cd250405efeec1),
+    (10, "dirty", 0x4d25767f9dce13f5),
+    (10, "nv12_y", 0x7369b8fe727e9bc5),
+    (10, "nv12_uv", 0xc60c35a986695217),
+    (10, "tile_analysis", 0x3b8910e57f50668b),
+    (10, "palrle_list", 0x4d25767f9dce13f5),
+    (10, "palette_set", 0x4d25767f9dce13f5),
+    (10, "folded_into", 0xcbf29ce484222325),
+    (10, "index_buffer", 0xcbf29ce484222325),
+    (10, "cdf53_list", 0x4d25767f9dce13f5),
+    (10, "cdf53_coeffs", 0xcbf29ce484222325),
+    (10, "escalation", 0x4d25767f9dce13f5),
+    (10, "indirect_args", 0x6fa37ebc366034e5),
+    (11, "dirty", 0x1fbd886ecf874ea5),
+    (11, "nv12_y", 0x8f932450acfcca1a),
+    (11, "nv12_uv", 0x7dc97916e172d80c),
+    (11, "tile_analysis", 0xc2d90ea20009311b),
+    (11, "palrle_list", 0x17db082b36de5477),
+    (11, "palette_set", 0x86de5e095e93cbf7),
+    (11, "folded_into", 0xa0f87e7569508665),
+    (11, "index_buffer", 0xc1b1a0401286e97b),
+    (11, "cdf53_list", 0x7d183f858df0e7d7),
+    (11, "cdf53_coeffs", 0x5ab2ab9919fb0fee),
+    (11, "escalation", 0x1d2759b0f18c6fb3),
+    (11, "indirect_args", 0x8df210e64d643c96),
+];
+
+#[test]
+fn golden_from_pixels_sequence() {
+    if std::env::var("GHOSTFRAME_CDF53_SKIP_L2_L3").is_ok()
+        || std::env::var("GHOSTFRAME_CDF53_SKIP_L3").is_ok()
+    {
+        panic!(
+            "golden test requires the CDF53 L2/L3 stages enabled (unset GHOSTFRAME_CDF53_SKIP_*)"
+        );
+    }
+    let mut p = match GpuFrameProcessor::new(64) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Skipping golden_from_pixels_sequence (no Vulkan?): {e}");
+            return;
+        }
+    };
+
+    // (width, height, script version, invalidate_baseline(n) before, escalation candidates)
+    struct Step {
+        w: u32,
+        h: u32,
+        ver: u32,
+        invalidate: u32,
+        esc: &'static [u32],
+    }
+    let s = |w, h, ver, invalidate, esc| Step {
+        w,
+        h,
+        ver,
+        invalidate,
+        esc,
+    };
+    let script = [
+        s(200, 136, 0, 0, &[0, 7, 3]), // 0: first-frame path (+ escalation)
+        s(200, 136, 0, 0, &[]),        // 1: identical -> nothing dirty
+        s(200, 136, 1, 0, &[1, 5, 17, 34]), // 2: a few changed tiles
+        s(200, 136, 1, 0, &[0]),       // 3: identical again
+        s(200, 136, 2, 2, &[7, 23]),   // 4: no_commit cushion 1/2
+        s(200, 136, 2, 0, &[]),        // 5: no_commit cushion 2/2
+        s(200, 136, 2, 0, &[2]),       // 6: first real snapshot
+        s(200, 136, 1, 0, &[0, 6]),    // 7: steady, changes vs 6
+        s(192, 128, 0, 0, &[0, 7]),    // 8: resolution change (tile aligned)
+        s(192, 128, 1, 0, &[1]),       // 9: steady at aligned size
+        s(192, 128, 1, 0, &[]),        // 10: identical
+        s(200, 136, 2, 0, &[3, 4, 5]), // 11: resolution change back
+    ];
+
+    let print = std::env::var("GOLDEN_PRINT").is_ok();
+    let mut stats = GoldenStats::default();
+    let mut got: Vec<(usize, &'static str, u64)> = Vec::new();
+    for (i, st) in script.iter().enumerate() {
+        if st.invalidate > 0 {
+            p.invalidate_baseline(st.invalidate);
+        }
+        let px = golden_render(st.w, st.h, st.ver);
+        p.set_escalation_candidates(st.esc);
+        let a = match p.process_frame_from_pixels(&px, st.w, st.h, st.w * 4) {
+            Ok(a) => a,
+            Err(e) => panic!("golden frame {i}: process_frame_from_pixels failed: {e}"),
+        };
+        let rows = unsafe { golden_surfaces(&p, &a, st.w, st.h, st.esc.len(), &mut stats) };
+        for (name, h) in rows {
+            got.push((i, name, h));
+        }
+    }
+
+    if print {
+        println!("GOLDEN_TABLE_BEGIN");
+        for (i, n, h) in &got {
+            println!("    ({i}, \"{n}\", 0x{h:016x}),");
+        }
+        println!("GOLDEN_TABLE_END");
+    }
+
+    // Non-vacuity: the script must actually exercise the stages.
+    eprintln!(
+        "golden stats: dirty={} colors={} palrle_max={} folds={} cdf_max={} cdf_nonzero_tiles={} esc_nonzero={}",
+        stats.dirty,
+        stats.analysed_colors,
+        stats.palrle_max,
+        stats.folds,
+        stats.cdf_max,
+        stats.cdf_nonzero_tiles,
+        stats.esc_nonzero
+    );
+    assert!(stats.dirty > 0, "no dirty tiles ever reported");
+    assert!(stats.analysed_colors > 0, "tile analysis never populated");
+    assert!(stats.palrle_max >= 4, "PalRLE compact list never populated");
+    assert!(stats.folds > 0, "palette subset fold never triggered");
+    assert!(stats.cdf_max > 0, "CDF53 compact list never populated");
+    assert!(stats.cdf_nonzero_tiles > 0, "CDF53 coefficients all zero");
+    assert!(stats.esc_nonzero > 0, "escalation coefficients all zero");
+
+    if print {
+        return;
+    }
+    assert!(
+        !GOLDEN_EXPECTED.is_empty(),
+        "GOLDEN_EXPECTED is empty; run with GOLDEN_PRINT=1 and paste the table"
+    );
+    for (k, g) in got.iter().enumerate() {
+        match GOLDEN_EXPECTED.get(k) {
+            Some(e) if e == g => {}
+            e => panic!(
+                "golden mismatch at (frame {}, surface {}): got 0x{:016x}, expected {:x?}",
+                g.0, g.1, g.2, e
+            ),
+        }
+    }
+    assert_eq!(got.len(), GOLDEN_EXPECTED.len(), "golden row count changed");
+}
