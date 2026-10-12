@@ -2482,6 +2482,68 @@ async fn dispatch_feedback_bytes_routes_input_to_injector() {
 }
 
 #[tokio::test]
+async fn dispatch_feedback_bytes_sizes_every_input_kind_and_clears_on_unknown() {
+    // The dispatcher pre-sizes an INPUT message with `required_len` before it
+    // has the whole thing. Every known sub-kind, delivered as exactly
+    // `required_len` bytes, must reach the injector once; an unknown sub-kind
+    // must discard the buffer (so the garbage tail is not replayed) without
+    // injecting, and the next well-formed message must still go through.
+    use crate::transport::input_inject::{required_len, InputInjector};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[derive(Default)]
+    struct Counting {
+        calls: AtomicUsize,
+    }
+    impl InputInjector for Counting {
+        fn pointer_move(&self, _: i16, _: i16) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+        }
+        fn pointer_button(&self, _: i16, _: i16, _: u8, _: bool) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+        }
+        fn wheel(&self, _: i16, _: i16) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+        }
+        fn key(&self, _: u32, _: bool) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let injector = Arc::new(Counting::default());
+    let mut bridge = make_bridge_for_test().await;
+    make_live(&mut bridge, ConnectionHandle(0));
+    bridge.input_injector = Some(injector.clone() as Arc<dyn InputInjector>);
+
+    for sub_kind in 1u8..=5 {
+        let n = required_len(sub_kind).expect("known sub-kind");
+        let mut msg = vec![0u8; n];
+        msg[0] = 0x05;
+        msg[1] = sub_kind;
+        let before = injector.calls.load(Ordering::SeqCst);
+        bridge.dispatch_feedback_bytes(ConnectionHandle(0), &msg);
+        assert_eq!(
+            injector.calls.load(Ordering::SeqCst),
+            before + 1,
+            "sub-kind {sub_kind:#04x} sized at {n} bytes must inject exactly once"
+        );
+    }
+
+    // Unknown sub-kind followed by a valid pointer-move in the same read:
+    // the whole tail is discarded, nothing is injected.
+    let before = injector.calls.load(Ordering::SeqCst);
+    bridge.dispatch_feedback_bytes(
+        ConnectionHandle(0),
+        &[0x05, 0x7f, 0x05, 0x01, 0x00, 0x64, 0x00, 0xc8],
+    );
+    assert_eq!(injector.calls.load(Ordering::SeqCst), before);
+    // And nothing is left behind to corrupt the next message.
+    bridge.dispatch_feedback_bytes(ConnectionHandle(0), &[0x05, 0x01, 0x00, 0x64, 0x00, 0xc8]);
+    assert_eq!(injector.calls.load(Ordering::SeqCst), before + 1);
+}
+
+#[tokio::test]
 async fn dispatch_feedback_bytes_silently_skips_input_when_no_injector() {
     // input_injector is None on the test bridge — must not panic.
     let mut bridge = make_bridge_for_test().await;

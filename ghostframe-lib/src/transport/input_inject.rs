@@ -19,6 +19,22 @@ const SUB_WHEEL: u8 = 0x03;
 const SUB_KEY_DOWN: u8 = 0x04;
 const SUB_KEY_UP: u8 = 0x05;
 
+/// Wire size in bytes of an INPUT message with this sub-kind byte, or `None`
+/// for a sub-kind this build does not know.
+///
+/// The feedback-stream dispatcher needs the size *before* it has a complete
+/// message (to decide between "wait for more bytes" and "drop the buffer"),
+/// so the sizes live here, next to the decoder that consumes them, rather
+/// than as a second hard-coded table in `IoBridge::dispatch_feedback_bytes`.
+/// `required_len_matches_decoder_consumed_length` pins the two together.
+pub(crate) fn required_len(sub_kind: u8) -> Option<usize> {
+    match sub_kind {
+        SUB_POINTER_MOVE | SUB_WHEEL | SUB_KEY_DOWN | SUB_KEY_UP => Some(6),
+        SUB_POINTER_BUTTON => Some(8),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputMsg {
     PointerMove {
@@ -127,6 +143,40 @@ pub fn apply_input(injector: &dyn InputInjector, msg: &InputMsg) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// For every sub-kind the dispatcher pre-sizes with `required_len`, a
+    /// buffer of exactly that length must decode and consume exactly that
+    /// many bytes; one byte fewer must not decode. An unknown sub-kind has
+    /// no length and does not decode.
+    #[test]
+    fn required_len_matches_decoder_consumed_length() {
+        let mut known = 0;
+        for sub_kind in 0u8..=255 {
+            match required_len(sub_kind) {
+                Some(n) => {
+                    known += 1;
+                    let mut buf = vec![0u8; n];
+                    buf[0] = INPUT_MSG_TYPE;
+                    buf[1] = sub_kind;
+                    let (_, consumed) = decode_input_msg(&buf)
+                        .unwrap_or_else(|| panic!("sub-kind {sub_kind:#04x} must decode"));
+                    assert_eq!(consumed, n, "sub-kind {sub_kind:#04x}");
+                    assert!(
+                        decode_input_msg(&buf[..n - 1]).is_none(),
+                        "sub-kind {sub_kind:#04x}: one byte short must not decode"
+                    );
+                }
+                None => {
+                    let buf = [INPUT_MSG_TYPE, sub_kind, 0, 0, 0, 0, 0, 0, 0, 0];
+                    assert!(
+                        decode_input_msg(&buf).is_none(),
+                        "sub-kind {sub_kind:#04x} has no length so must not decode"
+                    );
+                }
+            }
+        }
+        assert_eq!(known, 5, "the five INPUT sub-kinds");
+    }
 
     #[test]
     fn decode_pointer_move() {
