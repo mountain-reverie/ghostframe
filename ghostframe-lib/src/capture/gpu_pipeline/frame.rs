@@ -3097,74 +3097,17 @@ impl GpuFrameProcessor {
         // Binding 0: current frame STORAGE_IMAGE (same layout as dirty L1)
         // Binding 1: cdf53_escalation_list_buffer  (replaces cdf53_compact_list_buffer)
         // Binding 2: cdf53_escalation_coefficients_buffer  (replaces cdf53_coefficients_buffer)
-        let set_layouts_l1 = [self.cdf53_forward_l1.dsl];
-        let ds_alloc_l1 = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(&set_layouts_l1);
-        let l1_guard = ScopedDescriptorSets {
-            device: &self.device,
-            pool: self.descriptor_pool,
-            sets: self.device.allocate_descriptor_sets(&ds_alloc_l1)?,
-        };
-        let ds_l1 = l1_guard.sets[0];
-
-        let image_info_l1 = [vk::DescriptorImageInfo::default()
-            .image_view(current_view)
-            .image_layout(vk::ImageLayout::GENERAL)];
-        let esc_list_info_l1 = [vk::DescriptorBufferInfo::default()
-            .buffer(self.cdf53_escalation_list.buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let esc_coeff_info_l1 = [vk::DescriptorBufferInfo::default()
-            .buffer(self.cdf53_escalation_coefficients_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let writes_l1 = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(ds_l1)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                .image_info(&image_info_l1),
-            vk::WriteDescriptorSet::default()
-                .dst_set(ds_l1)
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&esc_list_info_l1),
-            vk::WriteDescriptorSet::default()
-                .dst_set(ds_l1)
-                .dst_binding(2)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&esc_coeff_info_l1),
-        ];
-        self.device.update_descriptor_sets(&writes_l1, &[]);
-
-        let push_vals: [u32; 2] = [cols, rows];
-        let push_bytes = std::slice::from_raw_parts(
-            push_vals.as_ptr() as *const u8,
-            std::mem::size_of_val(&push_vals),
-        );
-
-        self.device.cmd_bind_pipeline(
+        let l1_guard = self.record_stage(
             cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.cdf53_forward_l1.pipeline,
-        );
-        self.device.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.cdf53_forward_l1.layout,
-            0,
-            &[ds_l1],
-            &[],
-        );
-        self.device.cmd_push_constants(
-            cmd,
-            self.cdf53_forward_l1.layout,
-            vk::ShaderStageFlags::COMPUTE,
-            0,
-            push_bytes,
-        );
-        self.device.cmd_dispatch(cmd, count, 1, 1);
+            &self.cdf53_forward_l1,
+            &[
+                StageBinding::Image(current_view),
+                StageBinding::Buffer(self.cdf53_escalation_list.buffer),
+                StageBinding::Buffer(self.cdf53_escalation_coefficients_buffer),
+            ],
+            &[cols, rows],
+            StageDispatch::Direct(count, 1, 1),
+        )?;
 
         // Barrier L1 → L2: escalation coefficient writes from L1 must be
         // visible to L2.
@@ -3189,61 +3132,16 @@ impl GpuFrameProcessor {
         // ── L2 stage ─────────────────────────────────────────────────────────
         // Binding 0: cdf53_escalation_list_buffer  (read-only)
         // Binding 1: cdf53_escalation_coefficients_buffer  (read LL1, write L2 subbands)
-        let set_layouts_l2 = [self.cdf53_forward_l2.dsl];
-        let ds_alloc_l2 = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(&set_layouts_l2);
-        let l2_guard = ScopedDescriptorSets {
-            device: &self.device,
-            pool: self.descriptor_pool,
-            sets: self.device.allocate_descriptor_sets(&ds_alloc_l2)?,
-        };
-        let ds_l2 = l2_guard.sets[0];
-
-        let esc_list_info_l2 = [vk::DescriptorBufferInfo::default()
-            .buffer(self.cdf53_escalation_list.buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let esc_coeff_info_l2 = [vk::DescriptorBufferInfo::default()
-            .buffer(self.cdf53_escalation_coefficients_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let writes_l2 = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(ds_l2)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&esc_list_info_l2),
-            vk::WriteDescriptorSet::default()
-                .dst_set(ds_l2)
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&esc_coeff_info_l2),
-        ];
-        self.device.update_descriptor_sets(&writes_l2, &[]);
-
-        self.device.cmd_bind_pipeline(
+        let l2_guard = self.record_stage(
             cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.cdf53_forward_l2.pipeline,
-        );
-        self.device.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.cdf53_forward_l2.layout,
-            0,
-            &[ds_l2],
-            &[],
-        );
-        // push_bytes from L1 reused; cols/rows are the same for all three stages.
-        self.device.cmd_push_constants(
-            cmd,
-            self.cdf53_forward_l2.layout,
-            vk::ShaderStageFlags::COMPUTE,
-            0,
-            push_bytes,
-        );
-        self.device.cmd_dispatch(cmd, count, 1, 1);
+            &self.cdf53_forward_l2,
+            &[
+                StageBinding::Buffer(self.cdf53_escalation_list.buffer),
+                StageBinding::Buffer(self.cdf53_escalation_coefficients_buffer),
+            ],
+            &[cols, rows],
+            StageDispatch::Direct(count, 1, 1),
+        )?;
 
         // Barrier L2 → L3: escalation coefficient writes from L2 must be
         // visible to L3.
@@ -3268,61 +3166,16 @@ impl GpuFrameProcessor {
         // ── L3 stage ─────────────────────────────────────────────────────────
         // Binding 0: cdf53_escalation_list_buffer  (read-only)
         // Binding 1: cdf53_escalation_coefficients_buffer  (read LL2, write L3 subbands)
-        let set_layouts_l3 = [self.cdf53_forward_l3.dsl];
-        let ds_alloc_l3 = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(&set_layouts_l3);
-        let l3_guard = ScopedDescriptorSets {
-            device: &self.device,
-            pool: self.descriptor_pool,
-            sets: self.device.allocate_descriptor_sets(&ds_alloc_l3)?,
-        };
-        let ds_l3 = l3_guard.sets[0];
-
-        let esc_list_info_l3 = [vk::DescriptorBufferInfo::default()
-            .buffer(self.cdf53_escalation_list.buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let esc_coeff_info_l3 = [vk::DescriptorBufferInfo::default()
-            .buffer(self.cdf53_escalation_coefficients_buffer)
-            .offset(0)
-            .range(vk::WHOLE_SIZE)];
-        let writes_l3 = [
-            vk::WriteDescriptorSet::default()
-                .dst_set(ds_l3)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&esc_list_info_l3),
-            vk::WriteDescriptorSet::default()
-                .dst_set(ds_l3)
-                .dst_binding(1)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&esc_coeff_info_l3),
-        ];
-        self.device.update_descriptor_sets(&writes_l3, &[]);
-
-        self.device.cmd_bind_pipeline(
+        let l3_guard = self.record_stage(
             cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.cdf53_forward_l3.pipeline,
-        );
-        self.device.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.cdf53_forward_l3.layout,
-            0,
-            &[ds_l3],
-            &[],
-        );
-        // push_bytes from L1 reused; cols/rows are the same for all three stages.
-        self.device.cmd_push_constants(
-            cmd,
-            self.cdf53_forward_l3.layout,
-            vk::ShaderStageFlags::COMPUTE,
-            0,
-            push_bytes,
-        );
-        self.device.cmd_dispatch(cmd, count, 1, 1);
+            &self.cdf53_forward_l3,
+            &[
+                StageBinding::Buffer(self.cdf53_escalation_list.buffer),
+                StageBinding::Buffer(self.cdf53_escalation_coefficients_buffer),
+            ],
+            &[cols, rows],
+            StageDispatch::Direct(count, 1, 1),
+        )?;
 
         // Barrier L3 → HOST_READ: Phase B reads escalation coefficient buffer
         // after fence.
