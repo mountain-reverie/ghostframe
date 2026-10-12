@@ -4802,3 +4802,55 @@ async fn enqueue_cdf53_generation_source_selects_counter_and_log_label() {
     assert_eq!(logs.matches("\"source\":\"dirty\"").count(), 0, "{logs}");
     assert_eq!(logs.matches("cdf53.emit").count(), 2, "{logs}");
 }
+
+/// `ack_batch_received` fires once per ACK batch, which is every few
+/// milliseconds on a busy session. The production default filter is
+/// `ghostframe=debug,info`, which lets INFO *and* DEBUG through for this
+/// target and feeds journald's rate limit, so it is TRACE: invisible at
+/// DEBUG, present at the TRACE filter the e2e containers run under.
+#[tokio::test]
+async fn ack_batch_received_is_a_trace_event() {
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default, Clone)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+        type Writer = Sink;
+        fn make_writer(&'a self) -> Sink {
+            self.clone()
+        }
+    }
+
+    let batch = crate::transport::ack::AckBatch {
+        entries: vec![crate::transport::ack::AckEntry {
+            wire_seq: 1,
+            arrival_time_ms_lo16: 0,
+        }],
+    };
+    let wire = batch.encode();
+
+    let mut bridge = make_bridge_for_test().await;
+    let captured = |max: tracing::Level, bridge: &mut IoBridge| {
+        let sink = Sink::default();
+        let sub = tracing_subscriber::fmt()
+            .with_max_level(max)
+            .with_writer(sink.clone())
+            .finish();
+        tracing::subscriber::with_default(sub, || bridge.dispatch_ack_datagram(&wire));
+        let out = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        out
+    };
+    let at_debug = captured(tracing::Level::DEBUG, &mut bridge);
+    assert!(!at_debug.contains("ack_batch_received"), "got: {at_debug}");
+    let at_trace = captured(tracing::Level::TRACE, &mut bridge);
+    assert!(at_trace.contains("ack_batch_received"), "got: {at_trace}");
+}
