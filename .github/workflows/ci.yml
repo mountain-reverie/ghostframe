@@ -101,7 +101,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-fast
-      - run: cargo test --workspace --lib
+      # `dmabuf_real_*` need a real dma-buf (udmabuf or a DRM dumb buffer) AND a
+      # real Vulkan GPU. A hosted runner has neither: _setup-system-deps
+      # deliberately installs no Vulkan ICD for this job, and nothing grants
+      # access to /dev/udmabuf. (Not verified on a runner: that /dev/udmabuf is
+      # absent or unreadable there, and that no software ICD is present.) The
+      # tests FAIL rather than self-skip when their input cannot be built, so
+      # the exemption lives here, by name prefix, and not in the tests: a
+      # developer with a GPU must always see them run. Same rule as
+      # ci/skip-list.txt, which is the e2e-only counterpart.
+      - run: cargo test --workspace --lib -- --skip dmabuf_real_
       # --lib skips binary crates entirely, so ghostframe-xdaemon's tests (the
       # display clamp, the capture resize logic) and codec_report's ran nowhere
       # in CI. No hardware needed.

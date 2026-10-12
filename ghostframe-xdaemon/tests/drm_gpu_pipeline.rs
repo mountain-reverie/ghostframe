@@ -119,13 +119,70 @@ fn drm_capture_to_gpu_pipeline() {
         }
     };
 
-    let analysis = match processor.process_frame(raw_fd, width, height, stride) {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("Skipping: process_frame failed on real DMA-BUF: {e}");
-            return;
+    let read_tight = |fd: i32| -> Vec<u8> {
+        let raw = ghostframe_lib::capture::dmabuf::readback_dmabuf(fd, width, height, stride)
+            .expect("mmap of the PRIME fd");
+        let mut out = Vec::with_capacity(width as usize * height as usize * 4);
+        for y in 0..height as usize {
+            out.extend_from_slice(&raw[y * stride as usize..][..width as usize * 4]);
         }
+        out
     };
+    let before = read_tight(raw_fd);
+    // A real PRIME fd that the GPU path cannot ingest is the bug this test
+    // exists to catch, so it fails rather than skips.
+    let analysis = processor
+        .process_frame(raw_fd, width, height, stride)
+        .expect("process_frame failed on a real PRIME DMA-BUF");
+
+    // Pixel check. The live framebuffer can change under us, so build the
+    // reference from one mmap read of the same fd before and one after the GPU pass
+    // and compare only if they are identical (a static frame). The reference
+    // goes through the CPU-pixels path of a second processor; any stride or
+    // row-offset error in the dma-buf import shows up as a Y-plane or tile
+    // difference. Both reads happen through the CPU, so a tiled scanout buffer
+    // is "garbage" identically on both sides and still compares equal.
+    assert_eq!(
+        processor.last_ingest_tier(),
+        Some(ghostframe_lib::capture::gpu_pipeline::IngestTier::DmabufBuffer),
+        "a real PRIME fd should import through the GPU buffer tier"
+    );
+    let y_len = (analysis.nv12_y_stride * analysis.nv12_height) as usize;
+    // SAFETY: nv12_data covers the Y plane; no further process_frame on `processor` yet.
+    let gpu_y = unsafe { std::slice::from_raw_parts(analysis.nv12_data, y_len) }.to_vec();
+    let gpu_tiles: Vec<(u32, u32)> = analysis
+        .tile_analysis_slice()
+        .iter()
+        .map(|t| (t.count, t.edge_density_thou))
+        .collect();
+    let after = read_tight(raw_fd);
+    if before == after {
+        let mut reference = GpuFrameProcessor::new(4096).expect("reference processor");
+        let r = reference
+            .process_frame_from_pixels(&before, width, height, width * 4)
+            .expect("reference process_frame_from_pixels");
+        let ref_y = unsafe { std::slice::from_raw_parts(r.nv12_data, y_len) };
+        let ref_tiles: Vec<(u32, u32)> = r
+            .tile_analysis_slice()
+            .iter()
+            .map(|t| (t.count, t.edge_density_thou))
+            .collect();
+        assert_eq!(
+            gpu_y.as_slice(),
+            ref_y,
+            "dma-buf import Y plane != CPU reference"
+        );
+        assert_eq!(
+            gpu_tiles, ref_tiles,
+            "dma-buf import tile analysis != CPU reference"
+        );
+        let distinct = gpu_y.iter().collect::<std::collections::HashSet<_>>().len();
+        eprintln!(
+            "pixel check: dma-buf import matches the CPU reference ({distinct} distinct Y values)"
+        );
+    } else {
+        eprintln!("pixel check skipped: framebuffer changed between two reads");
+    }
 
     let cols = width.div_ceil(32);
     let rows = height.div_ceil(32);
