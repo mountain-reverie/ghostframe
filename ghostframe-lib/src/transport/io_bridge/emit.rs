@@ -47,24 +47,25 @@ impl crate::transport::reliable_emitter::traits::DatagramSender for IoBridgeSend
 }
 
 impl IoBridge {
+    /// The live connection's raw QUIC `datagrams().max_size()`, before any
+    /// overhead is subtracted. `None` with no live send handle, no such
+    /// connection, or datagrams unsupported. Pure lookup: callers keep their
+    /// own side effects and arithmetic.
+    pub(super) fn live_max_datagram_size_raw(&mut self) -> Option<usize> {
+        let handle = self.live_send_handle()?;
+        let conn = self.server.connections.get_mut(&handle)?;
+        conn.datagrams().max_size()
+    }
+
     /// Compute the maximum datagram size from the smallest connected session.
     ///
     /// Side effect: calls `refresh_connected_session_count` so the capture
     /// gate's atomic stays current per frame.
     pub(super) fn compute_max_datagram_size(&mut self) -> Option<usize> {
         self.refresh_connected_session_count();
-        let mut min_size: Option<usize> = None;
-        if let Some(handle) = self.live_send_handle() {
-            if let Some(conn) = self.server.connections.get_mut(&handle) {
-                if let Some(sz) = conn.datagrams().max_size() {
-                    let usable = sz.saturating_sub(Self::WT_VARINT_OVERHEAD);
-                    min_size = Some(match min_size {
-                        Some(prev) => prev.min(usable),
-                        None => usable,
-                    });
-                }
-            }
-        }
+        let min_size = self
+            .live_max_datagram_size_raw()
+            .map(|sz| sz.saturating_sub(Self::WT_VARINT_OVERHEAD));
         let out = min_size.filter(|&sz| sz > 0);
         // Cached so `tick_budget_floor` can size itself in datagrams from
         // `&self`. Calling `compute_max_datagram_size` there instead would

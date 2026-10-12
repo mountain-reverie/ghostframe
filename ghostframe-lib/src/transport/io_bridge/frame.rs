@@ -183,19 +183,9 @@ impl IoBridge {
         // frame state even when no client is listening, and once a client
         // connects the content appears "unchanged" so nothing is ever sent.
         let max_frag = {
-            let mut min_size: Option<usize> = None;
-            if let Some(handle) = self.live_send_handle() {
-                if let Some(conn) = self.server.connections.get_mut(&handle) {
-                    if let Some(sz) = conn.datagrams().max_size() {
-                        let usable =
-                            max_fragment_payload(sz.saturating_sub(Self::WT_VARINT_OVERHEAD));
-                        min_size = Some(match min_size {
-                            Some(prev) => prev.min(usable),
-                            None => usable,
-                        });
-                    }
-                }
-            }
+            let min_size = self
+                .live_max_datagram_size_raw()
+                .map(|sz| max_fragment_payload(sz.saturating_sub(Self::WT_VARINT_OVERHEAD)));
             match min_size {
                 Some(0) | None => {
                     // No connected sessions or MTU too small — skip frame
