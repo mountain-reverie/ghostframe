@@ -441,6 +441,175 @@ mod tests {
         unsafe { libc::close(fd) };
     }
 
+    // ---- shared helpers for the readback benchmark / tests ----------------
+
+    /// A shareable buffer plus a writable "producer" mapping of it.
+    struct TestBuf {
+        fd: i32,
+        map: *mut u8,
+        size: usize,
+    }
+
+    impl TestBuf {
+        fn fill(&self, f: impl Fn(usize) -> u8) {
+            let s = unsafe { std::slice::from_raw_parts_mut(self.map, self.size) };
+            for (i, b) in s.iter_mut().enumerate() {
+                *b = f(i);
+            }
+        }
+        fn bytes_mut(&mut self) -> &mut [u8] {
+            unsafe { std::slice::from_raw_parts_mut(self.map, self.size) }
+        }
+    }
+
+    impl Drop for TestBuf {
+        fn drop(&mut self) {
+            unsafe {
+                libc::munmap(self.map as *mut libc::c_void, self.size);
+                libc::close(self.fd);
+            }
+        }
+    }
+
+    fn map_rw(fd: i32, size: usize) -> *mut u8 {
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        assert_ne!(p, libc::MAP_FAILED, "producer mmap");
+        p as *mut u8
+    }
+
+    fn page_align(n: usize) -> usize {
+        (n + 4095) & !4095
+    }
+
+    fn memfd_sealed(size: usize, sealing: bool) -> i32 {
+        let name = std::ffi::CString::new("gf-test").unwrap();
+        let flags = if sealing { libc::MFD_ALLOW_SEALING } else { 0 };
+        let fd = unsafe { libc::memfd_create(name.as_ptr(), flags) };
+        assert!(fd >= 0);
+        assert_eq!(unsafe { libc::ftruncate(fd, size as i64) }, 0);
+        fd
+    }
+
+    fn new_memfd(size: usize) -> TestBuf {
+        let fd = memfd_sealed(size, false);
+        TestBuf {
+            fd,
+            map: map_rw(fd, size),
+            size,
+        }
+    }
+
+    /// A real dma-buf (system memory) via /dev/udmabuf; `None` if the host
+    /// does not provide it or we may not open it.
+    fn new_udmabuf(size: usize) -> Option<TestBuf> {
+        #[repr(C)]
+        struct UdmabufCreate {
+            memfd: u32,
+            flags: u32,
+            offset: u64,
+            size: u64,
+        }
+        // _IOW('u', 0x42, struct udmabuf_create)
+        const UDMABUF_CREATE: libc::c_ulong = 0x40187542;
+        let size = page_align(size);
+        let dev = std::ffi::CString::new("/dev/udmabuf").unwrap();
+        let udev = unsafe { libc::open(dev.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+        if udev < 0 {
+            return None;
+        }
+        let mfd = memfd_sealed(size, true);
+        unsafe {
+            libc::fcntl(mfd, libc::F_ADD_SEALS, libc::F_SEAL_SHRINK);
+        }
+        let mut c = UdmabufCreate {
+            memfd: mfd as u32,
+            flags: 0,
+            offset: 0,
+            size: size as u64,
+        };
+        let fd = unsafe { libc::ioctl(udev, UDMABUF_CREATE, &mut c) };
+        unsafe {
+            libc::close(udev);
+            libc::close(mfd);
+        }
+        if fd < 0 {
+            return None;
+        }
+        Some(TestBuf {
+            fd,
+            map: map_rw(fd, size),
+            size,
+        })
+    }
+
+    fn report(label: &str, mut us: Vec<f64>) {
+        us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let n = us.len();
+        let mean = us.iter().sum::<f64>() / n as f64;
+        println!(
+            "BENCH {label}: n={n} mean={mean:.0}us median={:.0}us p99={:.0}us",
+            us[n / 2],
+            us[(n * 99) / 100]
+        );
+    }
+
+    /// Time `readback_dmabuf` for N frames of 1920x1080 (stride 7680).
+    /// `dirty` mutates 3 tile rows of the source between frames so content
+    /// differs. Run: `cargo test -p ghostframe-lib --release --lib
+    /// bench_readback -- --ignored --nocapture`.
+    fn bench_one(label: &str, buf: &mut TestBuf, dirty: bool) {
+        const N: usize = 300;
+        let (w, h, stride) = (1920u32, 1080u32, 7680u32);
+        buf.fill(|i| (i % 251) as u8);
+        let mut us = Vec::with_capacity(N);
+        let mut sink = 0usize;
+        for f in 0..N {
+            if dirty {
+                // 3 tile rows (32 px each) change per frame.
+                let b = buf.bytes_mut();
+                for t in 0..3usize {
+                    let row0 = ((f * 7 + t * 11) % 34) * 32;
+                    let (a, e) = (row0 * 7680, ((row0 + 32).min(1080)) * 7680);
+                    for x in &mut b[a..e] {
+                        *x = x.wrapping_add(1);
+                    }
+                }
+            }
+            let t0 = std::time::Instant::now();
+            let p = readback_dmabuf(buf.fd, w, h, stride).unwrap();
+            us.push(std::time::Instant::now().duration_since(t0).as_secs_f64() * 1e6);
+            sink += p[(f * 4099) % p.len()] as usize;
+            assert_eq!(p.len(), 7680 * 1080);
+        }
+        std::hint::black_box(sink);
+        report(label, us);
+    }
+
+    #[test]
+    #[ignore = "microbenchmark; run with --ignored --nocapture"]
+    fn bench_readback() {
+        let size = 7680 * 1080;
+        let mut m = new_memfd(size);
+        bench_one("memfd static", &mut m, false);
+        bench_one("memfd dirty-source", &mut m, true);
+        match new_udmabuf(size) {
+            Some(mut u) => {
+                bench_one("udmabuf static", &mut u, false);
+                bench_one("udmabuf dirty-source", &mut u, true);
+            }
+            None => println!("BENCH udmabuf: unavailable"),
+        }
+    }
+
     #[test]
     fn vulkan_device_creates_successfully() {
         match VulkanReadback::new() {
