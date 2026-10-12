@@ -1598,6 +1598,88 @@ impl IoBridge {
         //   - if send_errs > 0, we have QUIC backpressure — the new
         //     buffer-space cap (commit 66486b1) should keep this at
         //     0 in steady state, so any non-zero value is a regression.
+        self.log_cumulative_emit(seq);
+
+        // ---- Phase 1 Task 9: periodic BWE snapshot log ----
+        // Fires at most once per ~1 s wall-clock. Outputs the
+        // estimator's current bandwidth estimate alongside the
+        // per-tier emit rates (derived from snapshot deltas of
+        // the cumulative byte counters added in Task 6). All
+        // values are observability — Phase 1 doesn't drive
+        // emission from any of this.
+        let now = now_std();
+        let bwe_log_due = self
+            .bwe_log_last_at
+            .is_none_or(|last| now.duration_since(last).as_millis() >= 1000);
+        if bwe_log_due {
+            let prev_at = self.bwe_log_last_at;
+            self.bwe_log_last_at = Some(now);
+            let bwe_snap = self.bwe.snapshot();
+            let (prev_crit, prev_refn) = self.bytes_emitted_snapshot;
+            // Compute dt against the previous log's instant — on
+            // the very first log, fall back to a sensible window
+            // (1 s) so the first rate isn't divided by zero.
+            let dt_ms = match prev_at {
+                Some(p) => now.duration_since(p).as_millis().max(1) as u64,
+                None => 1000,
+            };
+            let bps_crit = (self.bytes_emitted_critical.saturating_sub(prev_crit))
+                .saturating_mul(8)
+                .saturating_mul(1000)
+                / dt_ms;
+            let bps_refn = (self.bytes_emitted_refinement.saturating_sub(prev_refn))
+                .saturating_mul(8)
+                .saturating_mul(1000)
+                / dt_ms;
+            self.bytes_emitted_snapshot =
+                (self.bytes_emitted_critical, self.bytes_emitted_refinement);
+            tracing::info!(
+                target: "ghostframe::bwe",
+                bwe_estimate_bps = bwe_snap.bitrate_bps,
+                bwe_samples_seen = bwe_snap.samples_seen,
+                // BWE Stage 2.2 observability: which budget source
+                // is actually governing emission right now, and
+                // what goog_cc's pacer is asking for (0 = no
+                // pacer_config absorbed yet).
+                pacing_mode = ?select_pacing_mode(bwe_snap.samples_seen),
+                pacer_rate_bps = bwe_snap.pacer_rate_bps.unwrap_or(0),
+                bps_critical = bps_crit,
+                bps_refinement = bps_refn,
+                cumulative_bytes_critical = self.bytes_emitted_critical,
+                cumulative_bytes_refinement = self.bytes_emitted_refinement,
+                "bwe periodic snapshot"
+            );
+        }
+
+        // Frame stats — emit per design Section 4.
+        tracing::debug!(
+            target: "palrle.frame",
+            reused_or_allocated = self.palette_table.stats_frame.reused_or_allocated,
+            fell_back_to_raw = self.palette_table.stats_frame.fell_back_to_raw,
+            unique_frame_palettes = analysis.frame_palette_set_count,
+            "palrle frame stats"
+        );
+        self.palette_table.stats_frame = Default::default();
+
+        // M3.5 bench telemetry: timestamp of the last datagram handed to QUIC.
+        tracing::info!(
+            target: "ghostframe::bench",
+            frame_seq = seq,
+            last_send_ns = monotonic_now_ns(),
+            total_wire_bytes = stats.total_wire_bytes,
+            tile_count = stats.tile_count,
+            codec_solid = stats.codec_histogram.solid,
+            codec_palrle = stats.codec_histogram.palrle,
+            codec_cdf53 = stats.codec_histogram.cdf53,
+            codec_raw = stats.codec_histogram.raw,
+            codec_h264 = stats.codec_histogram.h264,
+            "frame.last_send"
+        );
+    }
+
+    /// Throttled cumulative per-codec emission line and bump-count/histogram
+    /// diagnostics; the comment above its call site explains the numbers.
+    fn log_cumulative_emit(&mut self, seq: u32) {
         if seq.wrapping_sub(self.last_cumulative_emit_log_frame)
             >= CUMULATIVE_EMIT_LOG_INTERVAL_FRAMES
         {
@@ -1811,82 +1893,6 @@ impl IoBridge {
                 self.color_histogram_accumulator = UniqueColorHistogram::default();
             }
         }
-
-        // ---- Phase 1 Task 9: periodic BWE snapshot log ----
-        // Fires at most once per ~1 s wall-clock. Outputs the
-        // estimator's current bandwidth estimate alongside the
-        // per-tier emit rates (derived from snapshot deltas of
-        // the cumulative byte counters added in Task 6). All
-        // values are observability — Phase 1 doesn't drive
-        // emission from any of this.
-        let now = now_std();
-        let bwe_log_due = self
-            .bwe_log_last_at
-            .is_none_or(|last| now.duration_since(last).as_millis() >= 1000);
-        if bwe_log_due {
-            let prev_at = self.bwe_log_last_at;
-            self.bwe_log_last_at = Some(now);
-            let bwe_snap = self.bwe.snapshot();
-            let (prev_crit, prev_refn) = self.bytes_emitted_snapshot;
-            // Compute dt against the previous log's instant — on
-            // the very first log, fall back to a sensible window
-            // (1 s) so the first rate isn't divided by zero.
-            let dt_ms = match prev_at {
-                Some(p) => now.duration_since(p).as_millis().max(1) as u64,
-                None => 1000,
-            };
-            let bps_crit = (self.bytes_emitted_critical.saturating_sub(prev_crit))
-                .saturating_mul(8)
-                .saturating_mul(1000)
-                / dt_ms;
-            let bps_refn = (self.bytes_emitted_refinement.saturating_sub(prev_refn))
-                .saturating_mul(8)
-                .saturating_mul(1000)
-                / dt_ms;
-            self.bytes_emitted_snapshot =
-                (self.bytes_emitted_critical, self.bytes_emitted_refinement);
-            tracing::info!(
-                target: "ghostframe::bwe",
-                bwe_estimate_bps = bwe_snap.bitrate_bps,
-                bwe_samples_seen = bwe_snap.samples_seen,
-                // BWE Stage 2.2 observability: which budget source
-                // is actually governing emission right now, and
-                // what goog_cc's pacer is asking for (0 = no
-                // pacer_config absorbed yet).
-                pacing_mode = ?select_pacing_mode(bwe_snap.samples_seen),
-                pacer_rate_bps = bwe_snap.pacer_rate_bps.unwrap_or(0),
-                bps_critical = bps_crit,
-                bps_refinement = bps_refn,
-                cumulative_bytes_critical = self.bytes_emitted_critical,
-                cumulative_bytes_refinement = self.bytes_emitted_refinement,
-                "bwe periodic snapshot"
-            );
-        }
-
-        // Frame stats — emit per design Section 4.
-        tracing::debug!(
-            target: "palrle.frame",
-            reused_or_allocated = self.palette_table.stats_frame.reused_or_allocated,
-            fell_back_to_raw = self.palette_table.stats_frame.fell_back_to_raw,
-            unique_frame_palettes = analysis.frame_palette_set_count,
-            "palrle frame stats"
-        );
-        self.palette_table.stats_frame = Default::default();
-
-        // M3.5 bench telemetry: timestamp of the last datagram handed to QUIC.
-        tracing::info!(
-            target: "ghostframe::bench",
-            frame_seq = seq,
-            last_send_ns = monotonic_now_ns(),
-            total_wire_bytes = stats.total_wire_bytes,
-            tile_count = stats.tile_count,
-            codec_solid = stats.codec_histogram.solid,
-            codec_palrle = stats.codec_histogram.palrle,
-            codec_cdf53 = stats.codec_histogram.cdf53,
-            codec_raw = stats.codec_histogram.raw,
-            codec_h264 = stats.codec_histogram.h264,
-            "frame.last_send"
-        );
     }
 
     /// Phase A: serially walk the GPU's compact list, map each tile's
