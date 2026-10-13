@@ -49,7 +49,6 @@ fn run(steps: u32, capacity_bps: impl Fn(u32) -> u64) -> Vec<u64> {
             queue_free_us = arrive_us;
             let arrival_ms = arrive_us / 1_000 + 15; // + propagation
             batch.push(AckArrival {
-                wire_seq: step * 1_000 + i as u32,
                 server_emit_us: send_us,
                 client_arrival_ms_lo16: (arrival_ms & 0xFFFF) as u16,
                 size_bytes: PKT_BYTES,
@@ -108,7 +107,6 @@ fn real_pacer_rate_bps() -> u64 {
             .map(|i| {
                 let emit_us = ((step * 20 + i) as u64) * 1_000;
                 AckArrival {
-                    wire_seq: step * 12 + i,
                     server_emit_us: emit_us,
                     client_arrival_ms_lo16: ((emit_us / 1_000 + 15) & 0xFFFF) as u16,
                     size_bytes: PKT_BYTES,
@@ -198,7 +196,6 @@ fn pacing_mode_reaches_paced_after_enough_real_feedback() {
             .map(|i| {
                 let emit_us = ((step * 20 + i) as u64) * 1_000;
                 AckArrival {
-                    wire_seq: step * 12 + i,
                     server_emit_us: emit_us,
                     client_arrival_ms_lo16: ((emit_us / 1_000 + 15) & 0xFFFF) as u16,
                     size_bytes: PKT_BYTES,
@@ -268,7 +265,6 @@ fn request_a_real_probe(seed_bps: u64) -> (BweWrapper, Instant, ProbeRequest) {
     // Any non-empty batch trips `on_process_interval`; the content doesn't
     // matter to the probe path, only that `update()` runs once.
     let seed_batch = vec![AckArrival {
-        wire_seq: 0,
         server_emit_us: 0,
         client_arrival_ms_lo16: 15,
         size_bytes: PKT_BYTES,
@@ -304,7 +300,6 @@ fn tagged_probe_packet(
     let send_us = 100_000 + (i as u64) * 1_000;
     let arrival_ms = send_us / 1_000 + 10 + i as u64;
     AckArrival {
-        wire_seq: 1_000 + i,
         server_emit_us: send_us,
         client_arrival_ms_lo16: (arrival_ms & 0xFFFF) as u16,
         size_bytes: pkt_bytes,
@@ -570,7 +565,6 @@ fn untagged_traffic_tracks_normally_around_a_pending_probe() {
             .map(|i| {
                 let emit_us = ((step * 20 + i) as u64) * 1_000;
                 AckArrival {
-                    wire_seq: step * 12 + i,
                     server_emit_us: emit_us,
                     client_arrival_ms_lo16: ((emit_us / 1_000 + 15) & 0xFFFF) as u16,
                     size_bytes: PKT_BYTES,

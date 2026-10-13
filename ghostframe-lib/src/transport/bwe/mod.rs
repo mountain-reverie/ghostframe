@@ -27,16 +27,10 @@ mod timeline;
 /// `BweSample`s the io_bridge accumulates at ACK-receive time.
 #[derive(Debug, Clone, Copy)]
 pub struct AckArrival {
-    /// Per-session monotonic seq we feed the estimator as packet identity.
-    /// In Phase 1 this is `(emit_lo16 << 16) | arrival_lo16` — a stable
-    /// per-sample identifier. Phase 2 will replace it with the actual
-    /// wire_seq from the cache entry once plumbed through `BweSample`.
-    pub wire_seq: u32,
-    /// Server-side send time in microseconds since the bridge's BWE epoch,
-    /// taken from the retransmit cache's `last_sent_at`, so a retransmitted
-    /// pass reports when it actually went out rather than when it first did.
-    /// Monotonic and full-precision — unlike the arrival series this never
-    /// crosses the wire, so it needs no unwrapping.
+    /// Server-side send time in microseconds on the emitter's clock, from the
+    /// transmission ledger, so a retransmitted pass reports when it actually
+    /// went out rather than when it first did. Full width: the datagram
+    /// header's `u32` stamp wraps every 71.6 minutes, this does not.
     pub server_emit_us: u64,
     /// Low 16 bits of the client's arrival time in ms.
     pub client_arrival_ms_lo16: u16,
@@ -224,7 +218,6 @@ mod tests {
             .map(|i| {
                 let emit_us = (i as u64) * 1_000;
                 AckArrival {
-                    wire_seq: i,
                     server_emit_us: emit_us,
                     client_arrival_ms_lo16: ((emit_us / 1_000 + 15) & 0xFFFF) as u16,
                     size_bytes: 1200,
@@ -249,14 +242,12 @@ mod tests {
         let mut bwe = BweWrapper::new(BweWrapper::INITIAL_BPS, Instant::now());
         let records = vec![
             AckArrival {
-                wire_seq: 1,
                 server_emit_us: 100,
                 client_arrival_ms_lo16: 110,
                 size_bytes: 1200,
                 probe: None,
             },
             AckArrival {
-                wire_seq: 2,
                 server_emit_us: 120,
                 client_arrival_ms_lo16: 135,
                 size_bytes: 1200,
@@ -305,7 +296,6 @@ mod tests {
     #[test]
     fn ack_arrival_carries_packet_size() {
         let a = AckArrival {
-            wire_seq: 1,
             server_emit_us: 10,
             client_arrival_ms_lo16: 25,
             size_bytes: 1200,
@@ -321,7 +311,6 @@ mod tests {
     #[test]
     fn ack_arrival_emit_time_is_monotonic_micros() {
         let a = AckArrival {
-            wire_seq: 1,
             server_emit_us: 5_000_000,
             client_arrival_ms_lo16: 25,
             size_bytes: 1200,
@@ -346,7 +335,6 @@ mod tests {
                     // One-way delay grows 10 ms per step. Volume is constant.
                     let arrival_ms = emit_us / 1_000 + 15 + (step as u64) * 10;
                     AckArrival {
-                        wire_seq: step * 12 + i,
                         server_emit_us: emit_us,
                         client_arrival_ms_lo16: (arrival_ms & 0xFFFF) as u16,
                         size_bytes: 1200,
@@ -385,7 +373,6 @@ mod tests {
                     let emit_us = ((step * 20 + i) as u64) * 1_000;
                     let arrival_ms = emit_us / 1_000 + 15;
                     AckArrival {
-                        wire_seq: step * 12 + i,
                         server_emit_us: emit_us,
                         client_arrival_ms_lo16: (arrival_ms & 0xFFFF) as u16,
                         size_bytes: 1200,
