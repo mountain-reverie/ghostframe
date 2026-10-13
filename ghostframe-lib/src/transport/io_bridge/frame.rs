@@ -1930,6 +1930,7 @@ impl IoBridge {
                 tick_budget_floor_bytes = self.tick_budget_floor(),
                 bytes_per_us = self.adaptation_context.bytes_per_us,
                 smoothed_rtt_us = self.adaptation_context.smoothed_rtt_us,
+                pending_losses_retracted = self.pending_losses_retracted,
                 "cumulative emit (datagrams handed to quinn since startup, per codec)"
             );
 

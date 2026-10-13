@@ -162,6 +162,12 @@ impl IoBridge {
                     }
                     Some(Resolution::Late(tx)) => {
                         self.loss_window.retract(tx.emit_us as u32);
+                        // Withdrawn from `pending_losses` once per turn (see
+                        // `retract_late_acked_losses`); only worth noting when
+                        // something is waiting there.
+                        if !self.pending_losses.is_empty() {
+                            self.late_acked.insert(e.wire_seq);
+                        }
                         if crate::transport::reliable_emitter::rto_probe_enabled() {
                             eprintln!(
                                 "RTOPROBE late_ack ws={} age_us={}",

@@ -137,10 +137,12 @@ impl TransmissionLedger {
     /// outstanding and has no tombstone — already resolved, or the
     /// acknowledgement is unknown to this ledger entirely.
     ///
-    /// Not retracting an expiry is deliberate: goog_cc has no retraction, and
-    /// an acknowledgement arriving after the horizon is genuinely a late
-    /// arrival rather than evidence the loss report was wrong. The tombstone
-    /// still lets the content be released — see `Resolution::Late`.
+    /// goog_cc has no retraction, so a loss that has already been reported to
+    /// it stays reported. A loss still waiting in the bridge's
+    /// `pending_losses` can be withdrawn by the caller when the late
+    /// acknowledgement arrives (see `IoBridge::retract_late_acked_losses`);
+    /// this ledger only classifies the acknowledgement as `Resolution::Late`,
+    /// which also lets the content be released.
     pub fn resolve(&mut self, wire_seq: u32) -> Option<Resolution> {
         if let Some((_, tx)) = self.records.remove(&wire_seq) {
             return Some(Resolution::Live(tx));
@@ -155,6 +157,19 @@ impl TransmissionLedger {
 
     /// Classify everything outstanding longer than `horizon` as lost.
     pub fn expire(&mut self, now: Instant, horizon: std::time::Duration) -> Vec<Transmission> {
+        self.expire_with_seq(now, horizon)
+            .into_iter()
+            .map(|(_, tx)| tx)
+            .collect()
+    }
+
+    /// [`Self::expire`], with each lost transmission's `wire_seq` so the
+    /// caller can later match a late acknowledgement to it exactly.
+    pub fn expire_with_seq(
+        &mut self,
+        now: Instant,
+        horizon: std::time::Duration,
+    ) -> Vec<(u32, Transmission)> {
         let mut lost = Vec::new();
         while let Some(front) = self.order.front().copied() {
             match self.records.get(&front) {
@@ -182,7 +197,7 @@ impl TransmissionLedger {
                                 break;
                             }
                         }
-                        lost.push(tx);
+                        lost.push((front, tx));
                     }
                 }
             }

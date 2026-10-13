@@ -76,8 +76,8 @@ pub(crate) use ack_dispatch::handle_datagram_payload;
 mod bwe_glue;
 pub use bwe_glue::TierLatencyStats;
 use bwe_glue::{
-    pass_tier, ActiveProbe, BweSample, PassTier, BWE_SAMPLES_BUFFER_CAPACITY, MAX_PENDING_LOSSES,
-    TRANSMISSION_LEDGER_CAPACITY,
+    pass_tier, ActiveProbe, BweSample, PassTier, PendingLoss, BWE_SAMPLES_BUFFER_CAPACITY,
+    MAX_PENDING_LOSSES, TRANSMISSION_LEDGER_CAPACITY,
 };
 #[cfg(test)]
 use bwe_glue::{select_live_rtt, LOSS_HORIZON_CEIL, LOSS_HORIZON_FLOOR, LOSS_HORIZON_RTTS};
@@ -580,7 +580,12 @@ pub struct IoBridge {
     path_sent_packets_last: u64,
     /// Losses awaiting a feedback report with at least one acknowledgement to
     /// travel in. See the drain site.
-    pending_losses: Vec<(u64, usize)>,
+    pending_losses: Vec<PendingLoss>,
+    /// `wire_seq`s acknowledged late this turn while a loss was pending;
+    /// drained by `retract_late_acked_losses`.
+    late_acked: std::collections::HashSet<u32>,
+    /// Pending losses withdrawn because the transmission was acknowledged late.
+    pending_losses_retracted: u64,
     /// Per-transmission accounting. Deliberately not the retransmit cache:
     /// that one is content-scoped and emptied by supersession, which is what
     /// hid most losses from the estimator.
@@ -1028,6 +1033,8 @@ impl IoBridge {
             capacity_hint_window: std::collections::VecDeque::new(),
             path_sent_packets_last: 0,
             pending_losses: Vec::new(),
+            late_acked: std::collections::HashSet::new(),
+            pending_losses_retracted: 0,
             transmission_ledger: crate::transport::transmission_ledger::TransmissionLedger::new(
                 TRANSMISSION_LEDGER_CAPACITY,
             ),
@@ -1722,6 +1729,7 @@ impl IoBridge {
             );
         }
         self.expire_transmissions(ledger_now);
+        self.retract_late_acked_losses();
         // Reported only alongside an acknowledgement: goog_cc unwraps the
         // max receive time over a report's received packets, so a
         // loss-only report panics inside the library. A congested link can
@@ -1820,7 +1828,10 @@ impl IoBridge {
             // on. Read before `update` so it reflects the state the
             // feedback describes.
             let in_flight = self.reliable_emitter.bytes_in_flight();
-            let losses = std::mem::take(&mut self.pending_losses);
+            let losses: Vec<(u64, usize)> = std::mem::take(&mut self.pending_losses)
+                .into_iter()
+                .map(|l| (l.emit_us, l.wire_bytes))
+                .collect();
             self.bwe.update(&records, &losses, now_std(), in_flight);
         }
 
