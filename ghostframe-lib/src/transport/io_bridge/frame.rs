@@ -1346,12 +1346,12 @@ impl IoBridge {
                                 (512, 768),
                                 (768, 1024),
                             ];
-                            for ch in 0..3 {
+                            for (ch, ch_diff) in sb_diff.iter_mut().enumerate() {
                                 let base = ch * 1024;
                                 for (b, (lo, hi)) in band_ranges.iter().enumerate() {
                                     for i in *lo..*hi {
                                         if coeffs_i16[base + i] != cpu_coeffs[base + i] {
-                                            sb_diff[ch][b] += 1;
+                                            ch_diff[b] += 1;
                                         }
                                     }
                                 }

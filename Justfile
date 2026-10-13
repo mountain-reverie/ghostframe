@@ -183,6 +183,7 @@ test-packaging:
 
 lint:
     cargo clippy --workspace --all-targets -- -D warnings
+    cargo clippy -p ghostframe-lib --all-targets --features cdf53-diag -- -D warnings
 
 fmt-check:
     cargo fmt --all -- --check
@@ -199,6 +200,7 @@ ci-local:
     ci/check-env-reads.sh
     @echo "=== clippy ==="
     cargo clippy --workspace --all-targets -- -D warnings
+    cargo clippy -p ghostframe-lib --all-targets --features cdf53-diag -- -D warnings
     @echo "=== unit tests ==="
     cargo test --workspace --lib
     cargo test --workspace --bins

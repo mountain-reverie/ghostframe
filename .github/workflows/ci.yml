@@ -50,6 +50,9 @@ jobs:
         with:
           shared-key: ci-fast
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # `cdf53-diag` is off in every other build, so nothing else compiles
+      # its cfg-gated code or tests; it rotted once already.
+      - run: cargo clippy -p ghostframe-lib --all-targets --features cdf53-diag -- -D warnings
       # The GLES backend is mutually exclusive with the default `vulkan`
       # feature, so --workspace above never compiles it. No runner has a Mali
       # GPU, so its tests cannot run here -- which is exactly why the compile
