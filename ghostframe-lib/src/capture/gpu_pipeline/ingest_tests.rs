@@ -40,15 +40,8 @@ fn collect(a: &FrameAnalysis) -> Out {
     }
     for y in 0..h.div_ceil(2) {
         nv12.extend_from_slice(
-            &raw[a.nv12_uv_offset as usize + y * a.nv12_uv_stride as usize..][..w],
+            &raw[a.nv12_uv_offset as usize + y * a.nv12_uv_stride as usize..][..w.div_ceil(2) * 2],
         );
-    }
-    // KNOWN PRODUCT BUG (reported, not this stream's): for odd widths the NV12
-    // UV rows are `width` bytes apart but hold ceil(w/2) pairs, so the last V
-    // byte of row n is the first U byte of row n+1 and two invocations race to
-    // write it. Compare only the Y plane there.
-    if w % 2 == 1 {
-        nv12.truncate(w * h);
     }
     let tiles = a
         .tile_analysis_slice()

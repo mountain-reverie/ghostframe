@@ -2290,3 +2290,162 @@ fn persistent_cmd_and_fence_survive_abnormal_frame_ends() {
     assert_eq!(run(&mut p, w, h, &px), tiles);
     assert_eq!(run(&mut p, w, h, &px), 0);
 }
+
+// ---------------------------------------------------------------------------
+// G1: odd-width NV12 (GPU tests carry the dmabuf_real_ prefix: CI skips that prefix, it has no GPU)
+// ---------------------------------------------------------------------------
+
+/// Convert `w x h` position-dependent pixels (`w` may be odd) and return the
+/// Y rows (`w` bytes each) and the UV rows (`2 * ceil(w/2)` bytes each).
+/// Reads are bounds-checked against the allocation the analysis describes, so
+/// a layout that is too small shows up as a wrong or missing byte rather than
+/// a read past the buffer.
+fn nv12_planes(p: &mut GpuFrameProcessor, px: &[u8], w: u32, h: u32) -> (Vec<u8>, Vec<Option<u8>>) {
+    let a = p
+        .process_frame_from_pixels(px, w, h, w * 4)
+        .expect("process_frame_from_pixels failed");
+    let total = a.nv12_uv_offset as usize + a.nv12_uv_stride as usize * h.div_ceil(2) as usize;
+    let raw = unsafe { std::slice::from_raw_parts(a.nv12_data, total) };
+    let mut y_plane = Vec::new();
+    for y in 0..h as usize {
+        y_plane.extend_from_slice(&raw[y * a.nv12_y_stride as usize..][..w as usize]);
+    }
+    let mut uv = Vec::new();
+    for y in 0..h.div_ceil(2) as usize {
+        for x in 0..(w.div_ceil(2) * 2) as usize {
+            uv.push(
+                raw.get(a.nv12_uv_offset as usize + y * a.nv12_uv_stride as usize + x)
+                    .copied(),
+            );
+        }
+    }
+    (y_plane, uv)
+}
+
+#[test]
+fn dmabuf_real_odd_width_nv12_matches_the_even_width_conversion_of_the_same_pixels() {
+    // The UV pair of chroma column k comes from pixel column 2k only, so an
+    // odd-width frame and the same pixels padded with one extra column must
+    // produce identical Y (first w columns) and identical UV (all pairs).
+    // On master the odd-width UV rows are `w` bytes apart but hold w+1 bytes
+    // (the last V and the next row's first U are the same byte), so UV differs.
+    let mut p = GpuFrameProcessor::new(4096).expect(NEEDS_GPU);
+    for (w, h) in [(33u32, 17u32), (65, 33), (1365, 40), (7, 9)] {
+        let pix = |x: u32, y: u32| -> [u8; 4] {
+            [
+                (x.wrapping_mul(7) ^ y.wrapping_mul(13)) as u8,
+                x.wrapping_mul(3).wrapping_add(y.wrapping_mul(5)) as u8,
+                (x ^ y.wrapping_mul(11)).wrapping_add(31) as u8,
+                255,
+            ]
+        };
+        let mut odd = Vec::new();
+        let mut even = Vec::new();
+        for y in 0..h {
+            for x in 0..w + 1 {
+                let b = pix(x, y);
+                even.extend_from_slice(&b);
+                if x < w {
+                    odd.extend_from_slice(&b);
+                }
+            }
+        }
+        let (want_y, want_uv) = nv12_planes(&mut p, &even, w + 1, h);
+        // Repeat: the old layout was a race, so one pass can pass by luck.
+        for round in 0..20 {
+            let (got_y, got_uv) = nv12_planes(&mut p, &odd, w, h);
+            assert!(
+                want_uv.iter().any(|b| b != &want_uv[0]),
+                "reference UV plane is flat; the comparison proves nothing"
+            );
+            for y in 0..h as usize {
+                assert_eq!(
+                    got_y[y * w as usize..][..w as usize],
+                    want_y[y * (w as usize + 1)..][..w as usize],
+                    "{w}x{h} round {round}: Y row {y}"
+                );
+            }
+            let bad: Vec<_> = (0..got_uv.len())
+                .filter(|&i| got_uv[i] != want_uv[i])
+                .take(8)
+                .collect();
+            assert!(
+                bad.is_empty(),
+                "{w}x{h} round {round}: UV differs at {bad:?} (first got {:?}, want {:?})",
+                bad.first().map(|&i| got_uv[i]),
+                bad.first().map(|&i| want_uv[i])
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// G2: from-pixels with a padded stride
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dmabuf_real_from_pixels_padded_stride_never_leaks_padding() {
+    // `import_pixels` copies min(stride, gpu_row_pitch) bytes per row. The
+    // padding between w*4 and stride is poison; whichever of the two is
+    // larger, the output must equal that of the tight frame.
+    let mut p = GpuFrameProcessor::new(4096).expect(NEEDS_GPU);
+    for (w, h, extra) in [
+        (32u32, 32u32, 4u32),
+        (32, 32, 4096),
+        (100, 40, 60),
+        (64, 64, 1 << 16),
+        (33, 17, 2000),
+    ] {
+        let mut tight = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                tight.extend_from_slice(&[
+                    (x.wrapping_mul(7) ^ y.wrapping_mul(13)) as u8,
+                    x.wrapping_mul(3).wrapping_add(y.wrapping_mul(5)) as u8,
+                    (x ^ y.wrapping_mul(11)).wrapping_add(31) as u8,
+                    255,
+                ]);
+            }
+        }
+        let stride = w * 4 + extra;
+        let mut padded = vec![0xA5u8; (stride * h) as usize];
+        for y in 0..h as usize {
+            padded[y * stride as usize..][..w as usize * 4]
+                .copy_from_slice(&tight[y * w as usize * 4..][..w as usize * 4]);
+        }
+        let (want_y, want_uv) = nv12_planes(&mut p, &tight, w, h);
+        let a = p
+            .process_frame_from_pixels(&padded, w, h, stride)
+            .expect("padded from_pixels failed");
+        let mut got_y = Vec::new();
+        for y in 0..h as usize {
+            got_y.extend_from_slice(unsafe {
+                std::slice::from_raw_parts(
+                    a.nv12_data.add(y * a.nv12_y_stride as usize),
+                    w as usize,
+                )
+            });
+        }
+        assert_eq!(got_y, want_y, "{w}x{h}+{extra}: Y differs");
+        let mut got_uv = Vec::new();
+        for y in 0..h.div_ceil(2) as usize {
+            for x in 0..(w.div_ceil(2) * 2) as usize {
+                got_uv.push(Some(unsafe {
+                    *a.nv12_data
+                        .add(a.nv12_uv_offset as usize + y * a.nv12_uv_stride as usize + x)
+                }));
+            }
+        }
+        assert_eq!(got_uv, want_uv, "{w}x{h}+{extra}: UV differs");
+    }
+}
+
+#[test]
+fn dmabuf_real_from_pixels_rejects_a_stride_shorter_than_a_row() {
+    let mut p = GpuFrameProcessor::new(4096).expect(NEEDS_GPU);
+    let px = vec![0x55u8; 64 * 64 * 4];
+    assert!(p
+        .process_frame_from_pixels(&px, 64, 64, 64 * 4 - 4)
+        .is_err());
+    assert!(p.process_frame_from_pixels(&px, 64, 64, 64 * 4).is_ok());
+}
