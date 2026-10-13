@@ -117,11 +117,14 @@ pub struct FrameAnalysis {
     /// Number of valid entries in `palrle_compact_list`.
     pub palrle_compact_count: u32,
     /// Pointer to the per-frame palette set (Stage 2a output).
-    /// 256 slots of `FramePaletteEntryRaw`; only entries 0..frame_palette_set_count
-    /// whose hash slot was claimed contain valid data.
+    /// 256 slots of `FramePaletteEntryRaw`; only the hash slots a tile claimed
+    /// (below `frame_palette_set_count`) contain valid data.
     /// Valid until next process_frame call.
     pub frame_palette_set: *const FramePaletteEntryRaw,
-    /// Number of unique palettes in this frame.
+    /// High-water mark of claimed hash slots (highest claimed slot id + 1),
+    /// NOT a count of unique palettes: slots are hash-indexed, so it is
+    /// usually larger than the number of distinct palettes. Observability only;
+    /// resolve palettes through `per_tile_frame_palette_id`.
     pub frame_palette_set_count: u32,
     /// Pointer to per-tile frame palette ID array (Stage 2a output).
     /// Length = `palrle_compact_count`. Each byte is the frame palette slot
@@ -792,7 +795,6 @@ impl Drop for GpuFrameProcessor {
 
             // M3.3c escalation buffers
             self.cdf53_escalation_list.destroy(&self.device);
-
 
             self.device
                 .unmap_memory(self.cdf53_escalation_coefficients_memory);
