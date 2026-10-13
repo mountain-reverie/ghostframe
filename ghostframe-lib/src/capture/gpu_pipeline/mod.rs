@@ -336,9 +336,6 @@ pub struct GpuFrameProcessor {
     /// CPU writes tile-idx values via this pointer (host-coherent).
     cdf53_escalation_list: HostBuffer<u32>,
 
-    /// CPU writes per-frame escalation count via this pointer (host-coherent).
-    cdf53_escalation_count: HostBuffer<u32>,
-
     pub(crate) cdf53_escalation_coefficients_buffer: vk::Buffer,
     pub(crate) cdf53_escalation_coefficients_memory: vk::DeviceMemory,
     /// CPU reads escalation forward coefficients via this pointer post-fence.
@@ -671,7 +668,6 @@ impl GpuFrameProcessor {
         // u32 entries, allocated in setup.rs. Writing `n` entries is within bounds.
         unsafe {
             std::ptr::copy_nonoverlapping(candidates.as_ptr(), self.cdf53_escalation_list.ptr, n);
-            *self.cdf53_escalation_count.ptr = n as u32;
         }
         self.staged_escalation_count = n as u32;
     }
@@ -797,7 +793,6 @@ impl Drop for GpuFrameProcessor {
             // M3.3c escalation buffers
             self.cdf53_escalation_list.destroy(&self.device);
 
-            self.cdf53_escalation_count.destroy(&self.device);
 
             self.device
                 .unmap_memory(self.cdf53_escalation_coefficients_memory);
