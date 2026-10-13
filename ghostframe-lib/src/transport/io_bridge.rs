@@ -212,10 +212,6 @@ pub(crate) struct FrameSendStats {
 
 // ---------------------------------------------------------------------------
 
-/// FEC parity defaults — enable when loss exceeds this threshold.
-const FEC_ENABLE_THRESHOLD: f64 = 0.005;
-/// FEC parity defaults — disable when loss drops below this threshold (hysteresis).
-const FEC_DISABLE_THRESHOLD: f64 = 0.002;
 /// Number of frames the server re-emits the frame-dimensions datagram after
 /// any dimension change. At 5% packet loss, probability of all 10 being lost
 /// is 0.05^10 ≈ 9.7e-14.
@@ -403,12 +399,6 @@ pub struct IoBridge {
     /// Capabilities advertised by the connected client via HELLO. Defaults to
     /// all-disabled until the client sends a HELLO message.
     client_caps: crate::transport::client_caps::ClientCapabilities,
-    /// FEC parity group size. 0 = disabled.
-    fec_k: usize,
-    /// Loss rate threshold to enable FEC (0.005 = 0.5%).
-    fec_enable_threshold: f64,
-    /// Loss rate threshold to disable FEC (hysteresis).
-    fec_disable_threshold: f64,
     /// Live signal vector pushed to `classifier.set_adaptation_context()`
     /// after every `dispatch_feedback_bytes` or `sample_quic_path_stats`.
     /// M3.6a wires it; M3.6b's policy reads the non-bytes_per_us fields.
@@ -991,12 +981,6 @@ impl IoBridge {
             last_takeover_at: None,
             palette_table: crate::encoder::pal_rle::PaletteTable::new(),
             client_caps: crate::transport::client_caps::ClientCapabilities::default(),
-            // `fec_k` parses unconditionally in every build (see
-            // `TransportConfig::from_lookup`'s doc comment), so this reads
-            // straight from the config with no `#[cfg]` needed.
-            fec_k: lib_config.transport.fec_k.unwrap_or(0),
-            fec_enable_threshold: FEC_ENABLE_THRESHOLD,
-            fec_disable_threshold: FEC_DISABLE_THRESHOLD,
             adaptation_context: crate::tile::classifier::AdaptationContext::default(),
             recent_suspension_flags: [false, false],
             cdf53_escalation_candidates_this_frame: Vec::new(),
@@ -1294,7 +1278,6 @@ impl IoBridge {
                             loss_rate = %format!("{:.2}%", fb.loss_rate() * 100.0),
                             "receiver feedback"
                         );
-                        self.update_fec_from_feedback(&fb);
                         self.ingest_feedback_for_adaptation(fb);
                     }
                     offset += FEEDBACK_SIZE;
@@ -2062,19 +2045,6 @@ impl IoBridge {
         // 0 until a frame triggered `compute_max_datagram_size`, which can't
         // happen because the gate suppresses frames).
         self.refresh_connected_session_count();
-    }
-
-    /// Update FEC parity state based on receiver feedback.
-    /// Enables parity (K=4) when loss exceeds threshold, disables when it drops.
-    fn update_fec_from_feedback(&mut self, fb: &ReceiverFeedback) {
-        let loss = fb.loss_rate();
-        if self.fec_k == 0 && loss >= self.fec_enable_threshold {
-            self.fec_k = 4;
-            tracing::info!(loss_rate = %format!("{:.2}%", loss * 100.0), "FEC enabled (K=4)");
-        } else if self.fec_k > 0 && loss < self.fec_disable_threshold {
-            self.fec_k = 0;
-            tracing::info!(loss_rate = %format!("{:.2}%", loss * 100.0), "FEC disabled");
-        }
     }
 }
 
