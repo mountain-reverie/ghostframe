@@ -54,14 +54,14 @@ Status at 2026-10-11.
 
 ## Wave B
 
-Status at 2026-10-12. Base 9d01c41.
+Complete at 2026-10-13: every Wave B PR is merged. Base 9d01c41.
 
 | WS | Branch | Findings | PR | State |
 |---|---|---|---|---|
 | B1 | `refactor/io-bridge-split` | Q-1 steps 1–2 (test module, single `base()`) | #133 | merged |
-| B1 | `refactor/io-bridge-modules` | Q-1 step 3, Q-M8 (five pure-move modules) | | in-progress, local |
-| B1 | `refactor/io-bridge-functions` | Q-H2, Q-H5, Q-M1, Q-M5, Q-M7, three more moves | | local, waits on modules |
-| B1 | `refactor/io-bridge-behaviour` | Q-M6, PS-M10, PS-M11 | | local, waits on functions |
+| B1 | `refactor/io-bridge-modules` | Q-1 step 3, Q-M8 (five pure-move modules) | #139 | merged |
+| B1 | `refactor/io-bridge-functions` | Q-H2, Q-H5, Q-M1, Q-M5, Q-M7, three more moves | #140 | merged; `io_bridge.rs` 12,218 → ~2,100 lines |
+| B1 | `refactor/io-bridge-behaviour` | Q-M6, PS-M10, PS-M11 | #141 | merged |
 | B2 | `refactor/gpu-pipeline` | Q-2 (`ComputeStage`, `HostBuffer<T>`, shared stage recording) | #134 | merged |
 | B2 | `perf/gpu-capture-riders` | PS-4, PS-L6 (command buffer and fence), dead `VulkanReadback`, pool sizes, encoder move | #136 | merged; dirty-rows readback is API only, persistent descriptor sets withheld (no measured gain), raw-pointer accessors not done |
 | B3 | `fix/dmabuf-import` | not in the reviews: dma-buf import assumed image pitch == stride; 21 tests skipped silently | #137 | merged; explicit-modifier and zero-copy tiers not shipped |
@@ -71,7 +71,7 @@ Decisions: Q-M2 (delete the RTO probe) is closed as **kept** — WS-D1 needs it.
 
 ## Suspected during Wave B
 
-Scheduled as Wave V in the [plan](2026-10-10-remediation-orchestration-plan.md), section 4b. "Read" means read from code and never run; "observed" means seen in a test run. Line numbers are from before the io_bridge split.
+Scheduled as Wave V in the [plan](2026-10-10-remediation-orchestration-plan.md), section 4b. "Read" means read from code and never run; "observed" means seen in a test run. Line numbers are from before the io_bridge split; the code is now under `transport/io_bridge/`.
 
 ### Transport (WS-V1)
 
@@ -87,7 +87,7 @@ Scheduled as Wave V in the [plan](2026-10-10-remediation-orchestration-plan.md),
 | T8 | `fec_k` is write-only; the H.264 path uses a local `fec_group_size()` | read | WS-B1 |
 | T9 | Hygiene: `_ =>` catch-all on `SchedulerEmissionPolicy`; `let _caps = self.client_caps;`; redundant nested cfg in `post_turn`; docs attached to the wrong item (`pacer_tick_budget_bytes`, `apply_path_stats_snapshot`, `base_budget_bytes`, `WT_VARINT_OVERHEAD`); references to a non-existent `SCHEDULER_TICK_BUDGET_FLOOR_BYTES` | read | WS-B1 |
 | T10 | `post_turn`'s `poll_probe_window` and `on_timeout` each read `now_std()` separately from the rest of the turn | read; a note for WS-D1, not a bug by itself | WS-B1 |
-| T11 | Q-H5 mutation gap: the dirty-path `already_escalated_this_gen = false` reorder is caught by no unit test, only by the e2e CDF53 tests | mutation run | WS-B1 |
+| T11 | `already_escalated_this_gen` has no test at all: removing the dirty-path reset, or writing `false` on the escalation path, leaves all 11 `e2e_cdf53_` tests green (and no unit test reaches the GPU-only path). Smallest test: factor the "commit tile to CDF53" lines into one method taking `escalated: bool` and assert the escalation sweep returns the tile after a dirty commit and not after an escalation commit | mutation run, [#140 comment](https://github.com/mountain-reverie/ghostframe/pull/140#issuecomment-6143941114) | WS-B1 |
 
 ### GPU capture (WS-V2)
 
@@ -115,9 +115,14 @@ Scheduled as Wave V in the [plan](2026-10-10-remediation-orchestration-plan.md),
 | E2 | `native_client_renders_the_test_pattern_into_an_exported_dmabuf` reads blue for red | fails on master, PR #124 |
 | E3 | `e2e_decode_error_thin_uncached` | 2 of 2 on 9d01c41 |
 | E4 | `e2e_saturated_link_starves_tiles_into_giving_up` | 2 of 2 on 9d01c41 |
-| E5 | `e2e_palrle_oob_index` ("expected 'client decode error' tracing line in server logs") | 1 of 2 on 9d01c41, 3 of 3 on the io_bridge behaviour branch: too few runs to call |
+| E5 | `e2e_palrle_oob_index` (`e2e.rs:1127`, "expected 'client decode error' tracing line in server logs") | intermittent on master: 6 of 16 failed on c4555f3 run alone, 2 of 16 on #141; the two blocks of each side disagree, so the rate itself is unstable |
 | E6 | `e2e_progressive_refinement_chromium` failed 2 of 4 on #133 under shared-host load, then 12 of 12 clean | not reproduced; record only |
 | E7 | The `*_firefox` tests cannot run on the dev host (no geckodriver) | gap, not a failure |
+| E8 | `e2e_h264_forced_solid_red` failed once inside the ~30-minute full sweep on #141 | then 5 of 5 alone on #141 and on master; the sweep was not repeated, so "load flake" is a guess |
+| E9 | `e2e_multi_pattern` failed once run alone on #141 ("solid: only 6/9 samples were red", `e2e.rs:2642`) | then 5 of 5 on #141 and on master; same class as E8 (red samples in an H.264 phase) |
+| E10 | `e2e_palette_eviction_chromium` failed once in a six-test batch on #139 ("final palette region should be visible after churn", rgb=(13,0,0), `e2e.rs:2544`) | then 15 of 15 batches on #139 and 5 of 5 on master |
+
+E6 and E8–E10 share a shape: a pixel or stillness assertion that fails once on a loaded host and never when re-run. AGENTS.md's rule applies: a knife-edge timing flake has been a product bug here before, so WS-V3 treats them as one investigation (what the server was doing in the failing run), not as four tests to retry.
 
 ### Build (WS-V4)
 
