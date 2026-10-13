@@ -157,18 +157,18 @@ impl IoBridge {
                 use crate::transport::transmission_ledger::Resolution;
                 let r = match self.transmission_ledger.resolve(e.wire_seq) {
                     Some(Resolution::Live(tx)) => {
-                        self.loss_window.record(tx.emit_us, false);
+                        self.loss_window.record(tx.emit_us as u32, false);
                         Some((tx.key, tx, e.arrival_time_ms_lo16, false))
                     }
                     Some(Resolution::Late(tx)) => {
-                        self.loss_window.retract(tx.emit_us);
+                        self.loss_window.retract(tx.emit_us as u32);
                         if crate::transport::reliable_emitter::rto_probe_enabled() {
                             eprintln!(
                                 "RTOPROBE late_ack ws={} age_us={}",
                                 e.wire_seq,
                                 self.reliable_emitter
                                     .emit_us(now_for_samples)
-                                    .wrapping_sub(tx.emit_us)
+                                    .wrapping_sub(tx.emit_us as u32)
                             );
                         }
                         Some((tx.key, tx, e.arrival_time_ms_lo16, true))
@@ -221,7 +221,7 @@ impl IoBridge {
                     "RTOPROBE ack codec={} pass={} latency_us={}",
                     codec,
                     k.pass_idx,
-                    ack_us - tx.emit_us as i64
+                    ack_us.wrapping_sub(tx.emit_us as u32 as i64) as i32 as i64
                 );
             }
         }
@@ -244,7 +244,7 @@ impl IoBridge {
                 break;
             }
             let cache_entry = self.reliable_emitter.cache.get(emit_key);
-            let server_emit_us = tx.emit_us as u64;
+            let server_emit_us = tx.emit_us;
             let queued_since_epoch_us = cache_entry
                 .map(|entry| {
                     entry

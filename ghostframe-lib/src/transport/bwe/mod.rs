@@ -149,7 +149,7 @@ impl BweWrapper {
     pub fn update(
         &mut self,
         records: &[AckArrival],
-        losses: &[(u32, usize)],
+        losses: &[(u64, usize)],
         now: Instant,
         data_in_flight_bytes: usize,
     ) -> BweSnapshot {

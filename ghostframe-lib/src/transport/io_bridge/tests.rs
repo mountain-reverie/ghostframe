@@ -1186,7 +1186,7 @@ async fn the_classifiers_loss_rate_is_the_ledgers_verdict() {
             wire_seq,
             now,
             crate::transport::transmission_ledger::Transmission {
-                emit_us: bridge.reliable_emitter.emit_us(now),
+                emit_us: bridge.reliable_emitter.emit_us64(now),
                 wire_bytes: 25,
                 key: crate::transport::reliable_emitter::EmitKey::new(
                     wire_seq,
@@ -5016,4 +5016,149 @@ async fn escalation_commit_marks_the_generation_used_and_a_dirty_commit_clears_i
         vec![0u32],
         "the dirty-committed tile may escalate again; the escalated one may not"
     );
+}
+
+// ---- T5: the sample's send time must survive the 32-bit emit clock wrapping ----
+
+/// The datagram header carries the emit stamp as a `u32` of microseconds, which
+/// wraps at 2^32 us = 71.6 min. `BweSample::server_emit_us` is documented as
+/// full-precision and is what goog_cc turns into a send time. 80 minutes into a
+/// session it must be ~4.8e9 us, not the wrapped ~5.05e8. Driven through the
+/// real emitter, ledger and ACK path.
+#[tokio::test]
+async fn bwe_sample_send_time_is_not_the_wrapped_emit_clock() {
+    use crate::transport::ack::{AckBatch, AckEntry};
+    let mut bridge = make_bridge_for_test().await;
+    let base = super::now_std()
+        .checked_sub(std::time::Duration::from_secs(80 * 60))
+        .expect("host uptime exceeds 80 minutes");
+    bridge.bwe_epoch = base;
+    bridge.reliable_emitter.time_base = base;
+
+    let now = super::now_std();
+    let mut frag = vec![0u8; 20];
+    frag[0] = 0x80; // stamped
+    bridge.reliable_emitter.submit_one(
+        crate::transport::reliable_emitter::EmitKey::new(1, 1, 2, 0),
+        bytes::Bytes::from(frag),
+        now,
+        None,
+        now,
+    );
+    let sent = bridge.reliable_emitter.take_transmissions();
+    assert_eq!(sent.len(), 1);
+    let true_us = now.duration_since(base).as_micros() as u64;
+    assert!(
+        true_us > u32::MAX as u64,
+        "the fixture must be past the wrap"
+    );
+    bridge.transmission_ledger.record(
+        sent[0].wire_seq,
+        now,
+        crate::transport::transmission_ledger::Transmission {
+            emit_us: sent[0].emit_us,
+            wire_bytes: sent[0].wire_bytes,
+            key: sent[0].key,
+        },
+    );
+    let batch = AckBatch {
+        entries: vec![AckEntry {
+            wire_seq: sent[0].wire_seq,
+            arrival_time_ms_lo16: 1,
+        }],
+    };
+    bridge.dispatch_ack_datagram(&batch.encode());
+
+    assert_eq!(bridge.bwe_samples_buffer.len(), 1);
+    let s = &bridge.bwe_samples_buffer[0];
+    let err = s.server_emit_us.abs_diff(true_us);
+    assert!(
+        err < 1_000_000,
+        "server_emit_us {} is {} us from the true send time {}",
+        s.server_emit_us,
+        err,
+        true_us
+    );
+}
+
+/// The loss path has the same clock: a transmission declared lost 80 minutes
+/// in must reach goog_cc with a send time on the same (unwrapped) axis as the
+/// acknowledged ones in the same report.
+#[tokio::test]
+async fn pending_loss_send_time_is_not_the_wrapped_emit_clock() {
+    let mut bridge = make_bridge_for_test().await;
+    let base = super::now_std()
+        .checked_sub(std::time::Duration::from_secs(80 * 60))
+        .expect("host uptime exceeds 80 minutes");
+    bridge.bwe_epoch = base;
+    bridge.reliable_emitter.time_base = base;
+    let now = super::now_std();
+    let mut frag = vec![0u8; 20];
+    frag[0] = 0x80;
+    bridge.reliable_emitter.submit_one(
+        crate::transport::reliable_emitter::EmitKey::new(1, 1, 2, 0),
+        bytes::Bytes::from(frag),
+        now,
+        None,
+        now,
+    );
+    for e in bridge.reliable_emitter.take_transmissions() {
+        bridge.transmission_ledger.record(
+            e.wire_seq,
+            now,
+            crate::transport::transmission_ledger::Transmission {
+                emit_us: e.emit_us,
+                wire_bytes: e.wire_bytes,
+                key: e.key,
+            },
+        );
+    }
+    bridge.expire_transmissions(now + std::time::Duration::from_secs(60));
+    assert_eq!(bridge.pending_losses.len(), 1);
+    let true_us = now.duration_since(base).as_micros() as u64;
+    assert!(
+        bridge.pending_losses[0].0.abs_diff(true_us) < 1_000_000,
+        "pending loss send time {} vs true {}",
+        bridge.pending_losses[0].0,
+        true_us
+    );
+}
+
+/// Before the wrap the widened stamp is exactly what the header carries, so the
+/// estimator's input for every session shorter than 71.6 minutes is unchanged.
+#[tokio::test]
+async fn pre_wrap_sample_send_time_equals_the_header_stamp() {
+    use crate::transport::ack::{AckBatch, AckEntry};
+    let mut bridge = make_bridge_for_test().await;
+    let now = super::now_std();
+    bridge.reliable_emitter.time_base = now - std::time::Duration::from_millis(1234);
+    let mut frag = vec![0u8; 20];
+    frag[0] = 0x80;
+    bridge.reliable_emitter.submit_one(
+        crate::transport::reliable_emitter::EmitKey::new(1, 1, 2, 0),
+        bytes::Bytes::from(frag),
+        now,
+        None,
+        now,
+    );
+    let sent = bridge.reliable_emitter.take_transmissions();
+    let e = sent[0];
+    assert_eq!(e.emit_us, 1_234_000);
+    bridge.transmission_ledger.record(
+        e.wire_seq,
+        now,
+        crate::transport::transmission_ledger::Transmission {
+            emit_us: e.emit_us,
+            wire_bytes: e.wire_bytes,
+            key: e.key,
+        },
+    );
+    let batch = AckBatch {
+        entries: vec![AckEntry {
+            wire_seq: e.wire_seq,
+            arrival_time_ms_lo16: 1,
+        }],
+    };
+    bridge.dispatch_ack_datagram(&batch.encode());
+    assert_eq!(bridge.bwe_samples_buffer[0].server_emit_us, 1_234_000);
 }

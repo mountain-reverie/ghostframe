@@ -23,7 +23,7 @@ use crate::transport::reliable_emitter::EmitKey;
 pub struct Transmission {
     /// Clock-relative microseconds, the same value stamped into the datagram
     /// header — so the estimator sees the epoch its other inputs use.
-    pub emit_us: u32,
+    pub emit_us: u64,
     pub wire_bytes: usize,
     /// Content identity, for the consumers that still think in tile-passes.
     pub key: EmitKey,
@@ -198,7 +198,7 @@ mod tests {
 
     fn tx(n: u32) -> Transmission {
         Transmission {
-            emit_us: n * 1000,
+            emit_us: n as u64 * 1000,
             wire_bytes: 1200,
             key: EmitKey::new(n, 0, 0, 0),
         }
@@ -328,7 +328,7 @@ mod tests {
                     let ws = next_ws;
                     next_ws += 1;
                     l.record(ws, now, Transmission {
-                        emit_us: ws,
+                        emit_us: ws as u64,
                         wire_bytes: 1200,
                         key: EmitKey::new(ws, 0, 0, 0),
                     });
@@ -336,7 +336,7 @@ mod tests {
                     slot_ws.insert(slot, ws);
                 }
                 for tx in l.expire(now, horizon) {
-                    let ws = tx.emit_us;
+                    let ws = tx.emit_us as u32;
                     proptest::prop_assert!(
                         outstanding.remove(&ws),
                         "expired a transmission that was not outstanding"
@@ -351,7 +351,7 @@ mod tests {
 
             // Drain whatever is still in flight; nothing may be left unknown.
             for tx in l.expire(now + horizon * 2, horizon) {
-                let ws = tx.emit_us;
+                let ws = tx.emit_us as u32;
                 proptest::prop_assert!(outstanding.remove(&ws));
                 proptest::prop_assert!(classified.insert(ws));
             }
