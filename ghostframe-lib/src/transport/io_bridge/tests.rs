@@ -5018,6 +5018,111 @@ async fn escalation_commit_marks_the_generation_used_and_a_dirty_commit_clears_i
     );
 }
 
+// ---- T4: a late ACK must retract the loss it contradicts ----
+
+fn ledger_tx(
+    emit_us: u64,
+    bytes: usize,
+    frame_seq: u32,
+) -> crate::transport::transmission_ledger::Transmission {
+    crate::transport::transmission_ledger::Transmission {
+        emit_us,
+        wire_bytes: bytes,
+        key: crate::transport::reliable_emitter::EmitKey::new(frame_seq, 1, 2, 0),
+    }
+}
+
+/// A transmission declared lost sits in `pending_losses` until the next
+/// acknowledgement lets goog_cc take a report. If that same transmission is
+/// then acknowledged late, `loss_window` is corrected but the pending loss was
+/// left to reach the estimator as a loss of a packet that arrived.
+#[tokio::test]
+async fn a_late_ack_retracts_the_pending_loss_it_contradicts() {
+    use crate::transport::ack::{AckBatch, AckEntry};
+    let mut bridge = make_bridge_for_test().await;
+    let t0 = super::now_std();
+    bridge
+        .transmission_ledger
+        .record(41, t0, ledger_tx(1_000, 1_200, 1));
+    bridge
+        .transmission_ledger
+        .record(42, t0, ledger_tx(2_000, 900, 2));
+    bridge.expire_transmissions(t0 + std::time::Duration::from_secs(60));
+    assert_eq!(bridge.pending_losses.len(), 2, "both declared lost");
+
+    // Only wire_seq 41 turns out to have arrived.
+    let batch = AckBatch {
+        entries: vec![AckEntry {
+            wire_seq: 41,
+            arrival_time_ms_lo16: 7,
+        }],
+    };
+    bridge.dispatch_ack_datagram(&batch.encode());
+    bridge.retract_late_acked_losses();
+
+    let left: Vec<u32> = bridge.pending_losses.iter().map(|l| l.wire_seq).collect();
+    assert_eq!(
+        left,
+        vec![42],
+        "the loss of the acknowledged transmission must not reach the estimator"
+    );
+    assert_eq!(bridge.pending_losses_retracted, 1);
+    assert!(bridge.late_acked.is_empty(), "bounded to one turn");
+}
+
+/// Identical (emit_us, bytes) twins are told apart by wire_seq: acknowledging
+/// one withdraws that one, not whichever matches first.
+#[tokio::test]
+async fn a_late_ack_withdraws_its_own_loss_among_identical_twins() {
+    use crate::transport::ack::{AckBatch, AckEntry};
+    let mut bridge = make_bridge_for_test().await;
+    let t0 = super::now_std();
+    for ws in [10, 11, 12] {
+        bridge
+            .transmission_ledger
+            .record(ws, t0, ledger_tx(5_000, 1_200, ws));
+    }
+    bridge.expire_transmissions(t0 + std::time::Duration::from_secs(60));
+    let batch = AckBatch {
+        entries: vec![AckEntry {
+            wire_seq: 11,
+            arrival_time_ms_lo16: 1,
+        }],
+    };
+    bridge.dispatch_ack_datagram(&batch.encode());
+    bridge.retract_late_acked_losses();
+    let left: Vec<u32> = bridge.pending_losses.iter().map(|l| l.wire_seq).collect();
+    assert_eq!(left, vec![10, 12]);
+}
+
+/// A loss already handed to the estimator cannot be taken back: a late ack for
+/// it is a no-op and leaves nothing behind.
+#[tokio::test]
+async fn a_late_ack_for_an_already_flushed_loss_is_a_no_op() {
+    use crate::transport::ack::{AckBatch, AckEntry};
+    let mut bridge = make_bridge_for_test().await;
+    let t0 = super::now_std();
+    bridge
+        .transmission_ledger
+        .record(1, t0, ledger_tx(1_000, 1_200, 1));
+    bridge
+        .transmission_ledger
+        .record(2, t0, ledger_tx(2_000, 1_200, 2));
+    bridge.expire_transmissions(t0 + std::time::Duration::from_secs(60));
+    bridge.pending_losses.retain(|l| l.wire_seq != 1); // wire_seq 1 was flushed
+    let batch = AckBatch {
+        entries: vec![AckEntry {
+            wire_seq: 1,
+            arrival_time_ms_lo16: 1,
+        }],
+    };
+    bridge.dispatch_ack_datagram(&batch.encode());
+    bridge.retract_late_acked_losses();
+    assert_eq!(bridge.pending_losses.len(), 1);
+    assert_eq!(bridge.pending_losses_retracted, 0);
+    assert!(bridge.late_acked.is_empty());
+}
+
 // ---- T5: the sample's send time must survive the 32-bit emit clock wrapping ----
 
 /// The datagram header carries the emit stamp as a `u32` of microseconds, which
@@ -5117,9 +5222,9 @@ async fn pending_loss_send_time_is_not_the_wrapped_emit_clock() {
     assert_eq!(bridge.pending_losses.len(), 1);
     let true_us = now.duration_since(base).as_micros() as u64;
     assert!(
-        bridge.pending_losses[0].0.abs_diff(true_us) < 1_000_000,
+        bridge.pending_losses[0].emit_us.abs_diff(true_us) < 1_000_000,
         "pending loss send time {} vs true {}",
-        bridge.pending_losses[0].0,
+        bridge.pending_losses[0].emit_us,
         true_us
     );
 }

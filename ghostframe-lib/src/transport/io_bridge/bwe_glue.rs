@@ -70,6 +70,15 @@ const PATH_IDLE_AFTER: std::time::Duration = std::time::Duration::from_millis(25
 /// bound.
 pub(super) const MAX_PENDING_LOSSES: usize = 4096;
 
+/// A transmission declared lost whose report has not yet gone to goog_cc. The
+/// `wire_seq` is what lets a late acknowledgement withdraw exactly this loss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PendingLoss {
+    pub(super) wire_seq: u32,
+    pub(super) emit_us: u64,
+    pub(super) wire_bytes: usize,
+}
+
 /// Outstanding transmissions the ledger will hold. Sized by send rate x
 /// horizon rather than session length — roughly 2000 packets/s at 20 Mbps
 /// against a horizon measured in hundreds of milliseconds. The cap is a
@@ -410,6 +419,30 @@ impl IoBridge {
             .set_adaptation_context(self.adaptation_context);
     }
 
+    /// Withdraw the pending loss of every transmission that has since been
+    /// acknowledged late, one pass over `pending_losses` per call.
+    ///
+    /// A loss declared in a turn with no live acknowledgement waits in
+    /// `pending_losses` for the next one. If the "lost" datagram turns up in
+    /// the meantime it did not get lost, and reporting it to goog_cc would
+    /// feed the loss-based estimator a loss that never happened. A loss
+    /// that has already been handed to goog_cc cannot be taken back, and
+    /// stays reported. The retracted transmission is deliberately fed to the
+    /// estimator as neither lost nor delivered: its arrival time reflects the
+    /// stall, not the path.
+    ///
+    /// `late_acked` is cleared unconditionally, so it is bounded by one turn's
+    /// acknowledgements however long nothing is flushed.
+    pub(super) fn retract_late_acked_losses(&mut self) {
+        if self.late_acked.is_empty() {
+            return;
+        }
+        let before = self.pending_losses.len();
+        let late = std::mem::take(&mut self.late_acked);
+        self.pending_losses.retain(|l| !late.contains(&l.wire_seq));
+        self.pending_losses_retracted += (before - self.pending_losses.len()) as u64;
+    }
+
     /// Declare lost everything outstanding past the horizon, and bring the
     /// loss rate up to date.
     ///
@@ -418,7 +451,7 @@ impl IoBridge {
     /// signals could not see.
     pub(super) fn expire_transmissions(&mut self, now: std::time::Instant) {
         let horizon = self.loss_horizon();
-        let expired = self.transmission_ledger.expire(now, horizon);
+        let expired = self.transmission_ledger.expire_with_seq(now, horizon);
         if crate::transport::reliable_emitter::rto_probe_enabled() && !expired.is_empty() {
             eprintln!(
                 "RTOPROBE expire n={} horizon_us={}",
@@ -426,8 +459,12 @@ impl IoBridge {
                 horizon.as_micros()
             );
         }
-        for tx in expired {
-            self.pending_losses.push((tx.emit_us, tx.wire_bytes));
+        for (wire_seq, tx) in expired {
+            self.pending_losses.push(PendingLoss {
+                wire_seq,
+                emit_us: tx.emit_us,
+                wire_bytes: tx.wire_bytes,
+            });
             self.loss_window.record(tx.emit_us as u32, true);
         }
         self.refresh_loss_rate(now);
