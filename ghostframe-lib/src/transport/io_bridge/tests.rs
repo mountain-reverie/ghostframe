@@ -4854,3 +4854,166 @@ async fn ack_batch_received_is_a_trace_event() {
     let at_trace = captured(tracing::Level::TRACE, &mut bridge);
     assert!(at_trace.contains("ack_batch_received"), "got: {at_trace}");
 }
+
+// ---- GPU-failure fallback (T1, T2), PalRle count clamp (T3), escalation flag (T11) ----
+
+/// A `ghostframe::bench` log capture for the next lines of one test. The CPU
+/// pipeline logs `frame.captured` before it looks for a connected session, so
+/// whether that line appears says whether the CPU pipeline was entered, and
+/// with which `frame_seq`, even on a bridge with no session.
+#[derive(Default, Clone)]
+struct BenchLogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+impl std::io::Write for BenchLogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BenchLogCapture {
+    type Writer = BenchLogCapture;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+impl BenchLogCapture {
+    fn install(&self) -> tracing::subscriber::DefaultGuard {
+        use tracing_subscriber::util::SubscriberInitExt;
+        tracing_subscriber::fmt()
+            .json()
+            .with_writer(self.clone())
+            .with_target(true)
+            .with_env_filter("ghostframe::bench=info")
+            .set_default()
+    }
+    fn text(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
+
+fn frame_for_fallback(pixels: Vec<u8>, dmabuf: bool) -> crate::server::FrameSubmission {
+    crate::server::FrameSubmission {
+        width: 64,
+        height: 64,
+        stride: 64 * 4,
+        pixels,
+        // Any fd will do: the fallback only looks at whether one is present.
+        dmabuf_fd: dmabuf
+            .then(|| std::os::fd::OwnedFd::from(std::fs::File::open("/dev/null").unwrap())),
+        timestamp_us: 0,
+        damage_tiles: None,
+        capture_done_ns: 0,
+    }
+}
+
+/// T1. A DMA-BUF-only frame has no CPU pixels. When the GPU processor fails
+/// on it and the DMA-BUF cannot be read back either (here the fd is
+/// /dev/null), the CPU pipeline must not run: it would read the empty buffer
+/// as black and send black tiles for the whole screen. Does not drive
+/// `process_frame_gpu`'s error arm itself: that needs a failing Vulkan device.
+#[tokio::test]
+async fn gpu_failure_on_a_dmabuf_only_frame_does_not_enter_the_cpu_pipeline() {
+    let cap = BenchLogCapture::default();
+    let _g = cap.install();
+    let mut bridge = make_bridge_for_test().await;
+    bridge.frame_seq = 7;
+
+    bridge.fall_back_to_cpu_after_gpu_error(frame_for_fallback(Vec::new(), true), 7);
+
+    assert!(
+        !cap.text().contains("frame.captured"),
+        "the CPU pipeline ran on an empty pixel buffer: {}",
+        cap.text()
+    );
+}
+
+/// T2. A frame that does carry pixels falls back to the CPU pipeline under the
+/// sequence number `process_frame_gpu` already assigned and announced: no second
+/// `frame_seq` increment. (The "no second frame-dimensions datagram" half is
+/// structural: it is the `emit_dimensions = false` argument, which a bridge
+/// without a connected session returns before reaching, so it is not asserted.)
+#[tokio::test]
+async fn gpu_failure_fallback_reuses_the_sequence_number_and_dimensions() {
+    let cap = BenchLogCapture::default();
+    let _g = cap.install();
+    let mut bridge = make_bridge_for_test().await;
+    // What process_frame_gpu has done by the time its processor fails.
+    bridge.frame_seq = 7;
+
+    bridge.fall_back_to_cpu_after_gpu_error(frame_for_fallback(vec![0x55; 64 * 64 * 4], false), 7);
+
+    let logs = cap.text();
+    assert!(
+        logs.contains("\"frame_seq\":7"),
+        "the CPU pipeline must run under the GPU path's seq: {logs}"
+    );
+    assert_eq!(bridge.frame_seq, 7, "frame_seq must not advance again");
+}
+
+/// T3. A PalRle compact count the GPU wrote past the grid must not size the
+/// index-buffer slice. `u32::MAX * 512` overflows `u32` (a panic here, a wrapped
+/// short slice in a release build) and, widened, would read far past the buffer.
+#[test]
+fn an_out_of_range_palrle_count_is_clamped_before_it_sizes_the_index_slice() {
+    let grid = TileGrid::new(64, 64); // 2x2 = 4 tiles
+    let index = vec![0u8; 4 * 512]; // exactly the grid's worth
+    let analysis = crate::capture::gpu_pipeline::FrameAnalysis {
+        dirty_tiles: Vec::new(),
+        nv12_data: std::ptr::null(),
+        nv12_width: 0,
+        nv12_height: 0,
+        nv12_y_stride: 0,
+        nv12_uv_stride: 0,
+        nv12_uv_offset: 0,
+        tile_analysis: std::ptr::null(),
+        tile_analysis_len: 0,
+        palrle_compact_list: std::ptr::null(),
+        palrle_compact_count: u32::MAX,
+        frame_palette_set: std::ptr::null(),
+        frame_palette_set_count: 0,
+        per_tile_frame_palette_id: std::ptr::null(),
+        folded_into: std::ptr::null(),
+        index_buffer: index.as_ptr(),
+    };
+    // The slice Phase A is handed is the grid's worth, not what the GPU claimed.
+    let tiles = (grid.cols * grid.rows) as usize;
+    assert_eq!(palrle_index_slice(&analysis, tiles).len(), tiles * 512);
+}
+
+/// T11. `already_escalated_this_gen` is what stops the idle-escalation sweep
+/// from re-promoting a tile it already promoted. A dirty commit starts a new
+/// generation (eligible again); an escalation commit uses it up.
+#[tokio::test]
+async fn escalation_commit_marks_the_generation_used_and_a_dirty_commit_clears_it() {
+    use crate::tile::{detect_escalation_candidates, CodecState};
+    use crate::transport::io_bridge::frame::Cdf53Source;
+
+    let mut bridge = make_bridge_for_test().await;
+    bridge.metrics_tracker.resize(2, 2);
+    bridge.scheduler.resize(2, 2);
+    let (present, passes) = crate::encoder::cdf53::encode_passes_sparse(&[0i16; 3072]);
+
+    // Tile (0,0): dirty commit over a stale `true`. Tile (1,0): escalation.
+    bridge
+        .metrics_tracker
+        .get_mut(0, 0)
+        .already_escalated_this_gen = true;
+    bridge.commit_tile_to_cdf53(0, 0, present, passes.clone(), Cdf53Source::Dirty);
+    bridge.commit_tile_to_cdf53(1, 0, present, passes, Cdf53Source::Escalation);
+
+    // Later both tiles are re-encoded as H.264 and sit idle; only the sweep's
+    // view of them is under test.
+    for x in 0..2 {
+        let m = bridge.metrics_tracker.get_mut(x, 0);
+        assert!(matches!(m.codec_state, CodecState::Cdf53 { .. }));
+        m.codec_state = CodecState::H264 { frames_in_h264: 5 };
+        m.idle_frames = 31;
+    }
+    assert_eq!(
+        detect_escalation_candidates(&bridge.metrics_tracker, 16),
+        vec![0u32],
+        "the dirty-committed tile may escalate again; the escalated one may not"
+    );
+}

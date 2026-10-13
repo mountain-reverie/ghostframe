@@ -48,6 +48,24 @@ pub(crate) fn clamp_gpu_tile_count(raw: u32, tiles: usize) -> usize {
     (raw as usize).min(tiles)
 }
 
+/// The PalRle index buffer's valid bytes: 512 per compact slot, at most one
+/// slot per tile. The compact count is written by the GPU, so it is clamped to
+/// `tiles` before it sizes a slice over GPU memory. No bulk helper exists on
+/// `FrameAnalysis` for this buffer (only the per-slot `index_buffer_slice_for`).
+pub(crate) fn palrle_index_slice(
+    analysis: &crate::capture::gpu_pipeline::FrameAnalysis,
+    tiles: usize,
+) -> &[u8] {
+    let count = clamp_gpu_tile_count(analysis.palrle_compact_count, tiles);
+    if count == 0 || analysis.index_buffer.is_null() {
+        return &[];
+    }
+    // SAFETY: the buffer holds one 512-byte slot per tile and `count` is at
+    // most the tile count. Valid until the next process_frame call, which the
+    // returned borrow of `analysis` cannot outlive.
+    unsafe { std::slice::from_raw_parts(analysis.index_buffer, count * 512) }
+}
+
 /// Read CLOCK_MONOTONIC and return nanoseconds since the epoch.
 /// Used for the `frame.last_send` telemetry event (and symmetric to the
 /// capture-side `capture_done_ns` populated by `xdaemon`).
@@ -166,9 +184,16 @@ impl IoBridge {
 
     /// CPU-side tile-based pipeline (original implementation).
     fn process_frame_cpu(&mut self, frame: FrameSubmission) {
-        let grid = TileGrid::new(frame.width, frame.height);
         self.frame_seq = self.frame_seq.wrapping_add(1);
         let seq = self.frame_seq;
+        self.process_frame_cpu_at(frame, seq, true);
+    }
+
+    /// The CPU pipeline for a frame whose sequence number is already
+    /// assigned. `emit_dimensions` is false when the caller (the GPU path
+    /// falling back) has already announced this frame's dimensions.
+    fn process_frame_cpu_at(&mut self, frame: FrameSubmission, seq: u32, emit_dimensions: bool) {
+        let grid = TileGrid::new(frame.width, frame.height);
 
         // M3.5 bench telemetry — CPU path is always tile codec.
         tracing::info!(
@@ -215,7 +240,9 @@ impl IoBridge {
 
         // Emit frame-dimensions datagram on first frame, on dimension change,
         // and N more times after any change to absorb datagram loss.
-        self.emit_frame_dimensions(seq, frame.timestamp_us, frame.width, frame.height);
+        if emit_dimensions {
+            self.emit_frame_dimensions(seq, frame.timestamp_us, frame.width, frame.height);
+        }
 
         // During QUIC slow-start after a new session connects, datagrams may
         // be silently dropped by congestion control. Use no-commit mode so
@@ -304,6 +331,62 @@ impl IoBridge {
             codec_h264 = stats.codec_histogram.h264,
             "frame.last_send"
         );
+    }
+
+    /// Phase A over this frame's GPU-written PalRle compact list.
+    pub(super) fn palrle_phase_a(
+        &mut self,
+        analysis: &crate::capture::gpu_pipeline::FrameAnalysis,
+        grid: &TileGrid,
+    ) -> Vec<PalRleTileWorkPrep> {
+        let cols = grid.cols;
+        let tiles = (grid.cols * grid.rows) as usize;
+        // GPU-written, so clamp it to the list's capacity (one slot per
+        // tile) before it sizes a slice, as the Cdf53 count is below.
+        let palrle_compact_count = clamp_gpu_tile_count(
+            analysis.palrle_compact_count,
+            (grid.cols * grid.rows) as usize,
+        );
+        let compact_list = analysis.palrle_compact_list_slice();
+        let palette_ids = analysis.per_tile_frame_palette_id_slice();
+        self.phase_a_palette_allocation(
+            cols,
+            &compact_list[..palrle_compact_count.min(compact_list.len())],
+            &palette_ids[..palrle_compact_count.min(palette_ids.len())],
+            analysis.folded_into_slice(),
+            analysis.frame_palette_set_slice(),
+            palrle_index_slice(analysis, tiles),
+        )
+    }
+
+    /// Commit a tile to Cdf53: start a new generation
+    /// ([`Self::enqueue_cdf53_generation`]), then write the tile's
+    /// `codec_state` and `already_escalated_this_gen`.
+    ///
+    /// `codec_state` is overridden so that `dispatch_dirty_tiles_via_scheduler`'s
+    /// pre-check identifies the tile as Cdf53 and skips the priority-queue
+    /// enqueue, which would otherwise supersede the refinement passes just
+    /// enqueued. The GPU compact list and coefficient buffer are authoritative
+    /// for Cdf53 emission, whatever the CPU classifier said.
+    ///
+    /// `already_escalated_this_gen` is `true` only for an escalation commit: a
+    /// dirty commit is a new generation, so the tile is eligible for
+    /// re-escalation once it goes idle again.
+    pub(super) fn commit_tile_to_cdf53(
+        &mut self,
+        tile_x: u8,
+        tile_y: u8,
+        present_passes: u16,
+        passes: Vec<(u8, Vec<u8>)>,
+        source: Cdf53Source,
+    ) {
+        self.enqueue_cdf53_generation(tile_x, tile_y, present_passes, passes, source);
+        let tm = self.metrics_tracker.get_mut(tile_x as u32, tile_y as u32);
+        tm.codec_state = crate::tile::CodecState::Cdf53 {
+            passes_sent: 0,
+            present_passes,
+        };
+        tm.already_escalated_this_gen = matches!(source, Cdf53Source::Escalation);
     }
 
     /// Start a new Cdf53 generation for one tile and queue its passes:
@@ -540,6 +623,46 @@ impl IoBridge {
         out
     }
 
+    /// Hand a frame to the CPU pipeline after the GPU processor failed on it.
+    ///
+    /// `seq` is the number `process_frame_gpu` already assigned and announced
+    /// (frame dimensions included), so neither is repeated here. A frame that
+    /// arrived as a DMA-BUF alone has no CPU pixels, and the CPU pipeline would
+    /// read an empty buffer as black and send black tiles for the whole
+    /// screen. Such a frame is read back from the DMA-BUF first (the same
+    /// readback the tile-codec path uses), so a failure that repeats every
+    /// frame degrades to the CPU pipeline instead of freezing the stream. If
+    /// the readback fails too, the frame is dropped rather than sent black.
+    pub(super) fn fall_back_to_cpu_after_gpu_error(
+        &mut self,
+        mut frame: FrameSubmission,
+        seq: u32,
+    ) {
+        if frame.pixels.is_empty() {
+            let readback = frame.dmabuf_fd.as_ref().map(|fd| {
+                crate::capture::dmabuf::readback_dmabuf(
+                    fd.as_raw_fd(),
+                    frame.width,
+                    frame.height,
+                    frame.stride,
+                )
+            });
+            match readback {
+                Some(Ok(pixels)) => frame.pixels = pixels.to_vec(),
+                _ => {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        seq,
+                        "GPU process_frame failed and the DMA-BUF could not be read back; \
+                         skipping the frame to avoid emitting zero-filled tiles",
+                    );
+                    return;
+                }
+            }
+        }
+        self.process_frame_cpu_at(frame, seq, false);
+    }
+
     /// GPU-accelerated full-frame pipeline: Vulkan compute dirty detection +
     /// VA-API VPP BGRA→NV12 conversion + H.264 encoding (true zero-copy).
     fn process_frame_gpu(&mut self, frame: FrameSubmission) {
@@ -593,7 +716,7 @@ impl IoBridge {
             Ok(a) => a,
             Err(e) => {
                 tracing::warn!(target: LOG_TARGET, "GPU process_frame failed: {e}, falling back to CPU path");
-                self.process_frame_cpu(frame);
+                self.fall_back_to_cpu_after_gpu_error(frame, seq);
                 return;
             }
         };
@@ -1165,25 +1288,7 @@ impl IoBridge {
 
         // Phase A — serial palette-table allocation per dirty PalRle-feasible tile.
         let cols = grid.cols;
-        let palrle_compact_count = analysis.palrle_compact_count;
-        let preps = self.phase_a_palette_allocation(
-            cols,
-            analysis.palrle_compact_list_slice(),
-            analysis.per_tile_frame_palette_id_slice(),
-            analysis.folded_into_slice(),
-            analysis.frame_palette_set_slice(),
-            // No bulk slice helper exists for index_buffer (only per-tile); keep inline.
-            if palrle_compact_count > 0 && !analysis.index_buffer.is_null() {
-                unsafe {
-                    std::slice::from_raw_parts(
-                        analysis.index_buffer,
-                        (palrle_compact_count * 512) as usize,
-                    )
-                }
-            } else {
-                &[]
-            },
-        );
+        let preps = self.palrle_phase_a(analysis, &grid);
 
         // Phase B — rayon parallel encode.
         let caps = self.client_caps;
@@ -1375,30 +1480,13 @@ impl IoBridge {
                     }
                     let (present_passes, passes) =
                         crate::encoder::cdf53::encode_passes_sparse(&coeffs_i16);
-                    self.enqueue_cdf53_generation(
+                    self.commit_tile_to_cdf53(
                         tile_x,
                         tile_y,
                         present_passes,
                         passes,
                         Cdf53Source::Dirty,
                     );
-                    // Override the CPU classifier's codec_state so that
-                    // dispatch_dirty_tiles_via_scheduler's pre-check can
-                    // correctly identify this tile as Cdf53 and skip the
-                    // priority-queue enqueue (which would otherwise supersede
-                    // the refinement passes just enqueued above).
-                    // The CPU classifier produces Cdf53 (via Rules 3/5/8); the GPU compact
-                    // list and coefficient buffer are authoritative for Cdf53 emission.
-                    self.metrics_tracker
-                        .get_mut(tile_x as u32, tile_y as u32)
-                        .codec_state = crate::tile::CodecState::Cdf53 {
-                        passes_sent: 0,
-                        present_passes,
-                    };
-                    // New generation: tile is eligible for re-escalation.
-                    self.metrics_tracker
-                        .get_mut(tile_x as u32, tile_y as u32)
-                        .already_escalated_this_gen = false;
                 }
             }
         }
@@ -1462,20 +1550,13 @@ impl IoBridge {
                     continue;
                 }
                 // H264 escalation path (existing).
-                self.enqueue_cdf53_generation(
+                self.commit_tile_to_cdf53(
                     tile_x,
                     tile_y,
                     present_passes,
                     passes,
                     Cdf53Source::Escalation,
                 );
-
-                let tm = self.metrics_tracker.get_mut(tile_x as u32, tile_y as u32);
-                tm.codec_state = crate::tile::CodecState::Cdf53 {
-                    passes_sent: 0,
-                    present_passes,
-                };
-                tm.already_escalated_this_gen = true;
             }
         }
 
