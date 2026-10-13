@@ -2111,8 +2111,8 @@ impl GpuFrameProcessor {
     /// indirect-args buffer is needed.
     ///
     /// SAFETY:
-    ///   - `count` MUST equal the value in `cdf53_escalation_count_buffer`
-    ///     written by the host before this call.
+    ///   - `count` MUST equal the number of entries the host wrote to
+    ///     `cdf53_escalation_list_buffer` (`set_escalation_candidates`).
     ///   - The `cdf53_escalation_list_buffer` MUST be filled with `count` valid
     ///     tile-idx values before the dispatch (host writeBuffer is ordered
     ///     before the subsequent submit, so this happens naturally).
@@ -2221,26 +2221,8 @@ impl GpuFrameProcessor {
             StageDispatch::Direct(count, 1, 1),
         )?;
 
-        // Barrier L3 → HOST_READ: Phase B reads escalation coefficient buffer
-        // after fence.
-        let buf_barrier_esc_l3_host = vk::BufferMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::HOST_READ)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .buffer(self.cdf53_escalation_coefficients_buffer)
-            .offset(0)
-            .size(vk::WHOLE_SIZE);
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::HOST,
-            vk::DependencyFlags::empty(),
-            &[],
-            std::slice::from_ref(&buf_barrier_esc_l3_host),
-            &[],
-        );
-
+        // The L3 -> HOST_READ barrier for the escalation coefficients is
+        // recorded once, by the caller, after this returns.
         Ok((l1_guard, l2_guard, l3_guard))
     }
 
