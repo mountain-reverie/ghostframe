@@ -3,50 +3,36 @@
 //!
 //! Owns, as logic over `IoBridge` fields that stay in `io_bridge.rs`:
 //! - `send_to_all_sessions`, the single fan-out point to the live WebTransport
-//!   sessions, and `IoBridgeSenderAdapter`, the raw-pointer `DatagramSender`
-//!   that threads it into `ReliableTileEmitter::drain`;
+//!   sessions, and `drain_reliable_emitter`, which feeds the reliable
+//!   emitter's queue into it;
 //! - `drain_scheduler_into_quinn` (including the AIMD multiplier update) and
 //!   `dispatch_dirty_tiles_via_scheduler`, which feed scheduler output through
 //!   the emitter;
 //! - `emit_frame_dimensions` and `compute_max_datagram_size`;
 //! - `apply_injected_frame`, the browserless harness' stand-in for capture.
 //!
-//! Not here: `sweep_rto_retransmits` (in `pacing.rs`) also builds an
-//! `IoBridgeSenderAdapter` over `self`, so the struct and its `bridge` field
-//! are `pub(super)`. Every raw-pointer aliasing site and the methods it
-//! aliases otherwise live in this file.
 
 use super::*;
 
-/// `DatagramSender` impl that forwards every emit to
-/// `IoBridge::send_to_all_sessions` via a raw pointer.
-///
-/// SAFETY: This adapter is constructed inside `&mut self` methods on
-/// `IoBridge` (`drain_scheduler_into_quinn`, `process_frame_gpu`) and
-/// lives only for the duration of the enclosing call. The pointer
-/// targets the same `IoBridge` whose `&mut self` borrow created it, and
-/// `ReliableTileEmitter::drain` is single-threaded — there is no
-/// re-entrant or concurrent access to the bridge while the adapter is
-/// live. The pointer is never stored, never shared across threads, and
-/// never outlives the stack frame.
-///
-/// The raw-pointer pattern is the cleanest way to thread
-/// `send_to_all_sessions` (which needs `&mut self`) into
-/// `emitter.drain` while the emitter itself is already borrowed
-/// `&mut self.reliable_emitter`.
-pub(super) struct IoBridgeSenderAdapter {
-    pub(super) bridge: *mut IoBridge,
-}
-
-impl crate::transport::reliable_emitter::traits::DatagramSender for IoBridgeSenderAdapter {
-    fn send(&mut self, dg: &[u8]) -> crate::transport::reliable_emitter::traits::SendOutcome {
-        // SAFETY: see struct doc — the pointer is valid for the duration
-        // of the surrounding `&mut self` call on `IoBridge`.
-        unsafe { (*self.bridge).send_to_all_sessions(dg) }
-    }
-}
-
 impl IoBridge {
+    /// Put everything the reliable emitter has queued (source and parity) on
+    /// the wire through `send_to_all_sessions`, stopping at the first datagram
+    /// quinn refuses. No borrow of the emitter is held across a send: the
+    /// emission is taken out first and its outcome handed back afterwards.
+    pub(super) fn drain_reliable_emitter(&mut self, now: std::time::Instant) {
+        use crate::transport::reliable_emitter::emission_queue::Emission;
+        while let Some(emission) = self.reliable_emitter.next_emission(now) {
+            let outcome = match &emission {
+                Emission::Source(bytes) | Emission::Parity(bytes) => {
+                    self.send_to_all_sessions(bytes)
+                }
+            };
+            if !self.reliable_emitter.settle_emission(emission, outcome) {
+                return;
+            }
+        }
+    }
+
     /// The live connection's raw QUIC `datagrams().max_size()`, before any
     /// overhead is subtracted. `None` with no live send handle, no such
     /// connection, or datagrams unsupported. Pure lookup: callers keep their
@@ -647,12 +633,7 @@ impl IoBridge {
         }
         // Submit the batch (stamps wire_seq, caches, schedules RTO + parity).
         self.reliable_emitter.submit_batch(items, now);
-        // Drain everything queued to the wire via the adapter. The
-        // adapter routes each datagram to `send_to_all_sessions` — the
-        // same wire path as before this refactor.
-        let bridge_ptr: *mut IoBridge = self as *mut IoBridge;
-        let mut adapter = IoBridgeSenderAdapter { bridge: bridge_ptr };
-        self.reliable_emitter.drain(&mut adapter, now);
+        self.drain_reliable_emitter(now);
         (stats, total_wire_bytes_sent, drained_count)
     }
 

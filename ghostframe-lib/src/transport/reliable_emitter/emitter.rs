@@ -703,29 +703,47 @@ impl ReliableTileEmitter {
     }
 
     pub fn drain<S: DatagramSender>(&mut self, sender: &mut S, now: Instant) {
-        let next = self.alloc.peek();
-        while let Some(emission) = self.queue.pop(next, now) {
+        while let Some(emission) = self.next_emission(now) {
             let outcome = match &emission {
                 Emission::Source(bytes) => sender.send(bytes),
                 Emission::Parity(bytes) => sender.send(bytes),
             };
-            match outcome {
-                SendOutcome::Sent => {
-                    if matches!(emission, Emission::Parity(_)) {
-                        self.stats.parity_emitted += 1;
-                    }
+            if !self.settle_emission(emission, outcome) {
+                return;
+            }
+        }
+    }
+
+    /// Take the next emission due to go on the wire. Paired with
+    /// [`Self::settle_emission`]: this is [`Self::drain`] split in two so a
+    /// caller whose sender needs `&mut` access to the structure that owns this
+    /// emitter can send between the halves, with no borrow of the emitter live
+    /// across the send.
+    pub(crate) fn next_emission(&mut self, now: Instant) -> Option<Emission> {
+        let next = self.alloc.peek();
+        self.queue.pop(next, now)
+    }
+
+    /// Record the outcome of sending an emission from [`Self::next_emission`].
+    /// Returns false when the caller must stop draining.
+    pub(crate) fn settle_emission(&mut self, emission: Emission, outcome: SendOutcome) -> bool {
+        match outcome {
+            SendOutcome::Sent => {
+                if matches!(emission, Emission::Parity(_)) {
+                    self.stats.parity_emitted += 1;
                 }
-                SendOutcome::Rejected => {
-                    self.queue.push_front(emission);
-                    self.stats.send_rejected += 1;
-                    self.note_emission_queue_depth();
-                    // The `return` is not an optimisation, it is required.
-                    // `push_front` puts this emission back at the head, so
-                    // continuing the loop would pop the very same one and
-                    // offer it again -- an infinite loop. Verified by
-                    // removing it: the browserless gate stopped terminating.
-                    return;
-                }
+                true
+            }
+            SendOutcome::Rejected => {
+                self.queue.push_front(emission);
+                self.stats.send_rejected += 1;
+                self.note_emission_queue_depth();
+                // Stopping is not an optimisation, it is required.
+                // `push_front` puts this emission back at the head, so
+                // continuing would pop the very same one and offer it again
+                // -- an infinite loop. Verified by removing it: the
+                // browserless gate stopped terminating.
+                false
             }
         }
     }

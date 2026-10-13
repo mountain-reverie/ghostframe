@@ -367,18 +367,9 @@ impl IoBridge {
     /// `Event::DatagramsUnblocked` handler, and `apply_injected_frame`'s
     /// post-drain mirror of the same behavior for injected scenes.
     ///
-    /// Builds a raw `*mut IoBridge` to hand to `IoBridgeSenderAdapter` so
-    /// `reliable_emitter.drain` can route emitted datagrams back through
-    /// `send_to_all_sessions` while `self.reliable_emitter` is itself
-    /// borrowed. This aliases a `&mut IoBridge` over a live
-    /// `&mut self.reliable_emitter` borrow, which is Stacked-Borrows-unsound
-    /// in the abstract — pre-existing in this codebase and not fixed here.
-    /// It is sound in practice because `send_to_all_sessions` only touches
-    /// `wt_sessions`, `server`, and `datagram_send_errs`, and never touches
-    /// `reliable_emitter`, so the two "overlapping" borrows never actually
-    /// alias the same field. Confining the pointer construction to this one
-    /// method (instead of the three call sites that used to each build
-    /// their own) keeps that invariant auditable in a single place.
+    /// The drain goes through [`IoBridge::drain_reliable_emitter`], which holds
+    /// no borrow of the emitter across a send. (It used to hand the emitter a
+    /// raw `*mut IoBridge`; see the commit that removed it.)
     pub(super) fn sweep_rto_retransmits(&mut self) {
         let tick_now = now_std();
         self.stuck_sweep_counter = self.stuck_sweep_counter.wrapping_add(1);
@@ -439,9 +430,7 @@ impl IoBridge {
             self.reliable_emitter
                 .tick_budgeted(tick_now, RTO_RETRANSMITS_PER_TICK, allowance);
         self.retransmit_pacer.spend(spent);
-        let bridge_ptr: *mut IoBridge = self as *mut IoBridge;
-        let mut adapter = IoBridgeSenderAdapter { bridge: bridge_ptr };
-        self.reliable_emitter.drain(&mut adapter, tick_now);
+        self.drain_reliable_emitter(tick_now);
     }
 
     /// Build the continuation a scheduler drain should leave behind, given
