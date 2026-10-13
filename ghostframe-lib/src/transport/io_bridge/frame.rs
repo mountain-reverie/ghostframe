@@ -1243,17 +1243,6 @@ impl IoBridge {
             }
         }
 
-        // Store fragments for NACK
-        let oldest_kept = seq.wrapping_sub(3);
-        self.recent_frame_fragments
-            .retain(|(s, _), _| s.wrapping_sub(oldest_kept) <= 3);
-        for dg in &datagrams {
-            if let Ok(hdr) = FrameHeader::decode(dg) {
-                self.recent_frame_fragments
-                    .insert((hdr.frame_seq, hdr.frag_idx), dg.clone());
-            }
-        }
-
         // M3.5 bench telemetry: H264 frame completed — all fragments sent.
         let h264_wire_bytes: u32 = datagrams.iter().map(|dg| dg.len() as u32).sum();
         tracing::info!(
