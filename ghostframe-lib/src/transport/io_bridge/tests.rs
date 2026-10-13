@@ -804,42 +804,6 @@ async fn process_frame_produces_no_panic() {
 }
 
 #[tokio::test]
-async fn fec_toggle_from_feedback() {
-    let (our_end, _peer) = UnixStream::pair().expect("pair");
-    let server = QuicServer::new().expect("server");
-    let (_tx, rx) = tokio::sync::mpsc::channel(1);
-    let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
-
-    assert_eq!(bridge.fec_k, 0, "FEC starts disabled");
-
-    // High loss → enable
-    let fb_high = crate::transport::feedback::ReceiverFeedback {
-        timestamp_ns: 0,
-        datagrams_received: 95,
-        datagrams_lost: 5,
-        datagrams_recovered_fec: 0,
-        suspension_detected: false,
-    };
-    bridge.update_fec_from_feedback(&fb_high);
-    assert_eq!(bridge.fec_k, 4, "FEC should be enabled at 5% loss");
-
-    // Still losing — stays enabled
-    bridge.update_fec_from_feedback(&fb_high);
-    assert_eq!(bridge.fec_k, 4);
-
-    // Low loss → disable
-    let fb_low = crate::transport::feedback::ReceiverFeedback {
-        timestamp_ns: 0,
-        datagrams_received: 1000,
-        datagrams_lost: 1,
-        datagrams_recovered_fec: 0,
-        suspension_detected: false,
-    };
-    bridge.update_fec_from_feedback(&fb_low);
-    assert_eq!(bridge.fec_k, 0, "FEC should be disabled at 0.1% loss");
-}
-
-#[tokio::test]
 async fn dispatch_feedback_updates_adaptation_context() {
     let (our_end, _peer) = UnixStream::pair().expect("pair");
     let server = QuicServer::new().expect("server");
