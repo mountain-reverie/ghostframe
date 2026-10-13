@@ -554,6 +554,9 @@ impl IoBridge {
         }
     }
 
+    /// Turn one `(cwnd, smoothed RTT)` sample into `bytes_per_us`, publish it
+    /// to the classifier, and (while the path is being filled) to the
+    /// estimator as a capacity hint. Ignores a non-positive RTT.
     pub(crate) fn apply_path_stats_snapshot(&mut self, cwnd_bytes: u64, smoothed_rtt_us: f32) {
         if smoothed_rtt_us <= 0.0 {
             return;

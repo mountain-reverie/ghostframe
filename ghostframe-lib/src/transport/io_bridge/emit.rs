@@ -355,7 +355,7 @@ impl IoBridge {
             SchedulerEmissionPolicy::CpuRawOnly => {
                 self.drain_scheduler_into_quinn(seq, timestamp_us, max_frag, usize::MAX)
             }
-            _ => {
+            SchedulerEmissionPolicy::GpuClassifierDriven => {
                 let aimd_budget =
                     ((base_budget_bytes as f64) * self.tick_budget_multiplier) as usize;
                 self.emit_via_scheduler(seq, timestamp_us, max_frag, aimd_budget)
@@ -451,8 +451,8 @@ impl IoBridge {
         // Build per-fragment (EmitKey, Bytes) items for the reliable
         // emitter. The emitter stamps wire_seq into bytes[8..12], caches
         // for retransmit, schedules RTO, and queues parity per FEC group.
-        // The actual wire write happens in `reliable_emitter.drain(&mut
-        // adapter, now)` below.
+        // The actual wire write happens in `drain_reliable_emitter(now)`
+        // below.
         let frame_seq_with_flag = seq | TILE_DATAGRAM_FLAG;
         let mut items: Vec<(
             crate::transport::reliable_emitter::EmitKey,

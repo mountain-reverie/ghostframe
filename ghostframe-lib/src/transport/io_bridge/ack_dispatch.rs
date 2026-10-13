@@ -6,7 +6,8 @@
 //! `dispatch_ack_datagram` (decoding an ACK batch and applying it to the
 //! retransmit cache, transmission ledger, fragment coverage, palette table and
 //! the `bwe_samples_buffer`), `dispatch_tile_nack_datagram` (tile NACKs into
-//! the reliable emitter) and the `handle_datagram_payload` ping reply. The fields themselves stay on `IoBridge`.
+//! the reliable emitter) and the `handle_datagram_payload` ping reply. The
+//! fields themselves stay on `IoBridge`.
 //!
 //! Must not: run the per-tick pacing or scheduler logic, or interpret
 //! FEEDBACK-stream messages (`dispatch_feedback_bytes` stays in `io_bridge.rs`);

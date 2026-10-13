@@ -36,11 +36,6 @@ impl Cdf53Source {
     }
 }
 
-/// Bytes a `pacer_rate_bps` rate (bits per second, from
-/// `BweSnapshot::pacer_rate_bps`) affords over one tick of `tick_interval_us`
-/// microseconds. Pure arithmetic, factored out of `combine_pacing_budget` so
-/// it's independently checkable and so `bwe_bench.rs` can pin the unit
-/// conversion directly.
 /// Clamp a GPU-written compact-list count to the number of tiles on the grid,
 /// the most entries the list can legitimately hold. A buggy shader or a
 /// device fault must not turn the count into an out-of-bounds slice length.
@@ -840,7 +835,6 @@ impl IoBridge {
     /// Per-frame idle-escalation sweep and stranded-tile detection; stores the
     /// merged candidate list on the bridge and hands it to the GPU processor.
     fn collect_escalation_candidates(&mut self) {
-        let _caps = self.client_caps;
         // Gate on self.frame_mode (the PREVIOUS frame's mode). Skipping
         // escalation while the previous frame was H264 avoids ~5 ms of
         // wasted GPU forward + 6 MB of HOST_COHERENT writes per frame:
