@@ -1830,6 +1830,7 @@ mod tests {
                     pass_idx,
                     codec: crate::transport::protocol::Codec::Cdf53,
                     palette_id: None,
+                    palette_bundled: false,
                 },
             )
             .collect();
