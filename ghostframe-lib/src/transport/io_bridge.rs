@@ -100,6 +100,8 @@ use emit::IoBridgeSenderAdapter;
 #[path = "io_bridge/frame.rs"]
 mod frame;
 #[cfg(test)]
+use frame::palrle_index_slice;
+#[cfg(test)]
 use frame::{clamp_gpu_tile_count, monotonic_now_ns, populate_gpu_metrics, PalRleTileWorkPrep};
 
 #[path = "io_bridge/harness.rs"]
