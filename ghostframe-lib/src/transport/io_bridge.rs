@@ -95,7 +95,6 @@ use pacing::{
 
 #[path = "io_bridge/emit.rs"]
 mod emit;
-use emit::IoBridgeSenderAdapter;
 
 #[path = "io_bridge/frame.rs"]
 mod frame;
@@ -643,7 +642,7 @@ pub struct IoBridge {
     /// Reliable tile emitter — owns wire_seq allocation, retransmit
     /// caching, FEC parity scheduling, and RTO bookkeeping. Fed by
     /// `drain_scheduler_into_quinn` via `submit_batch`; drained to the
-    /// wire via the `IoBridgeSenderAdapter` trait impl wrapping
+    /// wire by `drain_reliable_emitter`, through
     /// `send_to_all_sessions`. Cancellation on bump_generation is wired
     /// by direct paired `cancel_for_tile` calls at every
     /// `scheduler.bump_generation*` site (see
