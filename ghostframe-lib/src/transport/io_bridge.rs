@@ -358,10 +358,10 @@ pub struct IoBridge {
     pub(crate) drop_plan:
         Option<std::sync::Arc<std::sync::Mutex<crate::transport::drop_plan::DropPlan>>>,
 
-    /// Lower bound applied to `base_budget_bytes`, defaulting to
-    /// `SCHEDULER_TICK_BUDGET_FLOOR_BYTES`.
+    /// Lower bound applied to `base_budget_bytes`; `None` derives it from the
+    /// live MTU (`tick_budget_floor`).
     ///
-    /// A field rather than the bare constant because the constant is not a
+    /// A field rather than a bare constant because a flat floor is not a
     /// neutral safety net: 256 KiB per 33.3 ms tick is 7.86 MB/s, so the
     /// floor only stops dominating above ~70 Mbit/s. Every link this system
     /// has been measured on is below that, which means the bandwidth-derived
@@ -1202,8 +1202,6 @@ impl IoBridge {
         self._handle.as_ref()
     }
 
-    /// Fragment a captured frame and send the resulting datagrams to all
-    /// connected WebTransport sessions.
     /// Maximum bytes for the WebTransport VarInt session-ID prefix.
     /// A quarter-stream-id up to 63 encodes in 1 byte; we budget 2 for safety.
     const WT_VARINT_OVERHEAD: usize = 2;
@@ -1674,6 +1672,10 @@ impl IoBridge {
         // `poll_probe_window`'s doc comment for why this runs
         // unconditionally rather than only alongside the BWE drain
         // below.
+        // Note for whoever reworks the turn clock: this and the `on_timeout`
+        // read below each call `now_std()` themselves rather than sharing the
+        // turn's one `now`, so within a turn they can disagree by the
+        // microseconds between the reads. Harmless today; not a bug.
         self.poll_probe_window(now_std());
 
         // M4b: fire the DisplayMode debounce timer, if one is pending.
@@ -1818,10 +1820,7 @@ impl IoBridge {
         {
             *self.bwe_publish.lock().unwrap() = self.bwe.snapshot();
             *self.emitter_stats_publish.lock().unwrap() = self.reliable_emitter.stats;
-            #[cfg(any(test, feature = "browserless-harness"))]
-            {
-                *self.send_errs_publish.lock().unwrap() = self.datagram_send_errs;
-            }
+            *self.send_errs_publish.lock().unwrap() = self.datagram_send_errs;
             *self.latency_stats_publish.lock().unwrap() =
                 (self.critical_latency_stats, self.refinement_latency_stats);
             *self.queued_latency_stats_publish.lock().unwrap() = (

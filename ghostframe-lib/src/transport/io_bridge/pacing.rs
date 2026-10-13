@@ -236,6 +236,11 @@ pub fn select_pacing_mode(samples_seen: u64) -> PacingMode {
     }
 }
 
+/// Bytes a `pacer_rate_bps` rate (bits per second, from
+/// `BweSnapshot::pacer_rate_bps`) affords over one tick of `tick_interval_us`
+/// microseconds. Pure arithmetic, factored out of `combine_pacing_budget` so
+/// it's independently checkable and so `bwe_bench.rs` can pin the unit
+/// conversion directly.
 pub fn pacer_tick_budget_bytes(pacer_rate_bps: u64, tick_interval_us: f64) -> usize {
     (((pacer_rate_bps as f64) / 8.0) * tick_interval_us / 1_000_000.0) as usize
 }
@@ -469,20 +474,6 @@ impl IoBridge {
         }
     }
 
-    /// Per-tick emission budget before any pacing override or AIMD
-    /// modulation: measured QUIC bandwidth (`adaptation_context.bytes_per_us`)
-    /// × the capture tick interval × a fixed headroom fraction, floored so
-    /// the first frames of a session (before `bytes_per_us` is populated
-    /// from path stats) still emit promptly. See the long comment on
-    /// `SCHEDULER_TICK_BUDGET_FLOOR_BYTES`.
-    ///
-    /// Shared by `dispatch_dirty_tiles_via_scheduler` (which further scales
-    /// this by `tick_budget_multiplier`, the AIMD ramp/backoff fed by
-    /// observed `send_datagram` errors) and `apply_injected_frame` (which
-    /// does not — see that call site's comment for why). Both callers must
-    /// derive from the same production numbers rather than each computing
-    /// their own idea of "the budget", which is exactly the split that
-    /// generated Stage 2's defects.
     /// Lower bound for `base_budget_bytes`: one datagram at the live MTU,
     /// unless a test has pinned it. Sized in datagrams so it scales with the
     /// path rather than with a constant chosen for a link speed we do not
@@ -496,16 +487,30 @@ impl IoBridge {
             .saturating_mul(SCHEDULER_TICK_BUDGET_FLOOR_DATAGRAMS)
     }
 
+    /// Per-tick emission budget before any pacing override or AIMD
+    /// modulation: measured QUIC bandwidth (`adaptation_context.bytes_per_us`)
+    /// × the capture tick interval × a fixed headroom fraction, floored by
+    /// `tick_budget_floor` so the first frames of a session (before
+    /// `bytes_per_us` is populated from path stats) still emit promptly.
+    ///
+    /// Shared by `dispatch_dirty_tiles_via_scheduler` (which further scales
+    /// this by `tick_budget_multiplier`, the AIMD ramp/backoff fed by
+    /// observed `send_datagram` errors) and `apply_injected_frame` (which
+    /// does not — see that call site's comment for why). Both callers must
+    /// derive from the same production numbers rather than each computing
+    /// their own idea of "the budget", which is exactly the split that
+    /// generated Stage 2's defects.
     pub(super) fn base_budget_bytes(&self) -> usize {
         // Billing a fixed 33 ms slice per call looks wrong -- ticks are
         // frame-driven, so at 5 fps this grants 5 x 33 ms of bandwidth per
         // second of wall clock. Replacing it with elapsed-time billing was
-        // implemented and measured, and changed nothing: the
-        // `SCHEDULER_TICK_BUDGET_FLOOR_BYTES` floor below dominates at every
-        // realistic interval (33 ms computes ~30 KB, 250 ms ~225 KB, both
-        // under the 256 KB floor), so this expression's first term never
-        // decides the budget. Reverted rather than kept, because unvalidated
-        // arithmetic in the send path is a liability.
+        // implemented and measured, and changed nothing: the floor
+        // (`tick_budget_floor`, then a flat 256 KB) dominated at every
+        // realistic interval (33 ms computes ~30 KB, 250 ms ~225 KB), so this
+        // expression's first term never decided the budget. (The floor is
+        // now one datagram at the live MTU, so this term can bind.) Reverted
+        // rather than kept, because unvalidated arithmetic in the
+        // send path is a liability.
         (((self.adaptation_context.bytes_per_us as f64)
             * SCHEDULER_TICK_INTERVAL_US
             * SCHEDULER_TICK_BUDGET_FRACTION) as usize)
