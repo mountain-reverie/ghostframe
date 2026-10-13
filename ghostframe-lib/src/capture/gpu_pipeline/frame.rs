@@ -169,7 +169,11 @@ impl GpuFrameProcessor {
         // Y plane: width * height bytes, stride = width (packed).
         // UV plane: width * (height/2) bytes (interleaved U,V, half height).
         let y_stride = width;
-        let uv_stride = width; // interleaved U,V, so stride = width bytes
+        // Interleaved U,V: ceil(width/2) pairs per row, so the stride is
+        // width rounded UP to even. For odd widths `width` bytes would put
+        // the last V on the next row's first U (and one byte past the
+        // buffer on the last row).
+        let uv_stride = width.next_multiple_of(2);
         let uv_offset = y_stride * height; // UV follows immediately after Y
         let total = (uv_offset + uv_stride * height.div_ceil(2)) as vk::DeviceSize;
 
@@ -1218,6 +1222,15 @@ impl GpuFrameProcessor {
         height: u32,
         stride: u32,
     ) -> Result<PrevFrame, Box<dyn std::error::Error>> {
+        // A stride below one row of pixels would leave the tail of every GPU
+        // row uninitialised and the frame would be garbage, not an error.
+        if (stride as u64) < (width as u64) * 4 {
+            return Err(format!(
+                "import_pixels: stride {stride} < width*4 = {}",
+                (width as u64) * 4
+            )
+            .into());
+        }
         let required = (stride as usize) * (height as usize);
         if pixels.len() < required {
             return Err(format!(
@@ -1294,7 +1307,8 @@ impl GpuFrameProcessor {
                 .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())?
                 as *mut u8;
         let src_row_pitch = stride as usize;
-        let copy_bytes_per_row = src_row_pitch.min(gpu_row_pitch);
+        // Copy the pixels, not the source padding.
+        let copy_bytes_per_row = (width as usize * 4).min(gpu_row_pitch);
         for row in 0..(height as usize) {
             let src = pixels.as_ptr().add(row * src_row_pitch);
             let dst = map_ptr.add(gpu_offset + row * gpu_row_pitch);
