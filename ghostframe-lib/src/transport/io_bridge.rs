@@ -580,7 +580,7 @@ pub struct IoBridge {
     path_sent_packets_last: u64,
     /// Losses awaiting a feedback report with at least one acknowledgement to
     /// travel in. See the drain site.
-    pending_losses: Vec<(u32, usize)>,
+    pending_losses: Vec<(u64, usize)>,
     /// Per-transmission accounting. Deliberately not the retransmit cache:
     /// that one is content-scoped and emptied by supersession, which is what
     /// hid most losses from the estimator.
@@ -1754,23 +1754,18 @@ impl IoBridge {
                     .received_at
                     .saturating_duration_since(self.bwe_epoch)
                     .as_micros() as u64;
-                // `server_emit_us` comes from `ReliableTileEmitter::emit_us`,
-                // which is `u32` microseconds because that is what the
-                // datagram header carries at bytes [12..16]. It wraps every
-                // 2^32 us = 71.6 minutes, while `elapsed_since_epoch_us` is
-                // u64 and never does. Subtracting one from the other breaks
-                // at the first wrap: the u64 keeps climbing while the u32
-                // resets, so the difference becomes the elapsed session time
-                // instead of a round trip.
+                // `server_emit_us` is `ReliableTileEmitter::emit_us64`: the
+                // emitter's clock at full width. The datagram header carries
+                // only its low 32 bits, which wrap every 2^32 us = 71.6
+                // minutes, while `elapsed_since_epoch_us` is measured from
+                // `bwe_epoch`. A daemon up 81 minutes once reported
+                // `critical_latency_mean_us=2448007853` here, back when this
+                // field was the wrapped u32; goog_cc's send times were
+                // corrupted the same way.
                 //
-                // Observed in production: a daemon up 81 minutes reported
-                // `critical_latency_mean_us=2448007853` -- 2448 seconds --
-                // having read a steady 19375 us for the preceding hour. The
-                // same corruption reaches `BweSample::server_emit_us`, so
-                // goog_cc's timing input is garbage past the first wrap.
-                //
-                // Do the subtraction in wrapping u32, which is correct
-                // across a wrap because the true delta is milliseconds.
+                // The two epochs differ by a few microseconds (`bwe_epoch`
+                // is taken first), so the difference is still taken in
+                // wrapping u32, which is exact for a delta of milliseconds.
                 let ack_latency_us =
                     (elapsed_since_epoch_us as u32).wrapping_sub(s.server_emit_us as u32) as u64;
                 match s.tier {

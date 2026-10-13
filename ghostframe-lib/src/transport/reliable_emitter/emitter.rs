@@ -59,8 +59,10 @@ pub struct EmittedDatagram {
     /// Unique per transmission, retransmissions included.
     pub wire_seq: u32,
     /// The stamp written into this datagram's header, in the emitter's
-    /// clock-relative microseconds.
-    pub emit_us: u32,
+    /// clock-relative microseconds, kept at full width: the header carries
+    /// only the low 32 bits (a wrap every 71.6 minutes), and the estimator
+    /// must not inherit that wrap. 0 for a datagram that was not stamped.
+    pub emit_us: u64,
     pub wire_bytes: usize,
     /// The content this transmission was carrying, so an acknowledgement can
     /// be mapped back to the tile-pass every delivery consumer expects.
@@ -180,11 +182,11 @@ impl ReliableTileEmitter {
         // (which set TILE_DATAGRAM_FLAG = 0x80 in byte 0). Used by the
         // client's per-tier latency tracking and echoed back via the ACK
         // envelope for the BWE delay-gradient input.
-        let mut stamped_emit_us = 0u32;
+        let mut stamped_emit_us = 0u64;
         if bytes.len() >= 16 && (bytes[0] & 0x80) != 0 {
-            let emit_us = self.emit_us(now);
+            let emit_us = self.emit_us64(now);
             stamped_emit_us = emit_us;
-            bytes[12..16].copy_from_slice(&emit_us.to_be_bytes());
+            bytes[12..16].copy_from_slice(&(emit_us as u32).to_be_bytes());
         }
         self.transmissions.push(EmittedDatagram {
             wire_seq,
@@ -329,7 +331,7 @@ impl ReliableTileEmitter {
     ) -> usize {
         let mut count = 0;
         let mut spent = 0usize;
-        let emit_us_now = self.emit_us(now);
+        let emit_us_now = self.emit_us64(now);
         while count < max_retransmits && spent < max_bytes {
             let Some((key, frag_idx)) = self.pending_nacks.pop_front() else {
                 break;
@@ -360,7 +362,7 @@ impl ReliableTileEmitter {
                 bytes[8..12].copy_from_slice(&ws.to_be_bytes());
             }
             if bytes.len() >= 16 && (bytes[0] & 0x80) != 0 {
-                bytes[12..16].copy_from_slice(&emit_us_now.to_be_bytes());
+                bytes[12..16].copy_from_slice(&(emit_us_now as u32).to_be_bytes());
             }
             entry.attempts = entry.attempts.saturating_add(1);
             entry.last_sent_at = now;
@@ -477,10 +479,10 @@ impl ReliableTileEmitter {
                     ws = self.alloc.allocate();
                     bytes[8..12].copy_from_slice(&ws.to_be_bytes());
                 }
-                let mut stamped = 0u32;
+                let mut stamped = 0u64;
                 if bytes.len() >= 16 && (bytes[0] & 0x80) != 0 {
-                    stamped = self.emit_us(now);
-                    bytes[12..16].copy_from_slice(&stamped.to_be_bytes());
+                    stamped = self.emit_us64(now);
+                    bytes[12..16].copy_from_slice(&(stamped as u32).to_be_bytes());
                 }
                 self.transmissions.push(EmittedDatagram {
                     wire_seq: ws,
@@ -659,7 +661,13 @@ impl ReliableTileEmitter {
     /// `duration_since` saturates to zero rather than panicking if `now`
     /// somehow precedes `time_base`.
     pub(crate) fn emit_us(&self, now: Instant) -> u32 {
-        now.duration_since(self.time_base).as_micros() as u32
+        self.emit_us64(now) as u32
+    }
+
+    /// [`Self::emit_us`] before the truncation to the 32 bits the datagram
+    /// header carries.
+    pub(crate) fn emit_us64(&self, now: Instant) -> u64 {
+        now.duration_since(self.time_base).as_micros() as u64
     }
 
     /// Drain emissions to a sender until the queue is empty.

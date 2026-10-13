@@ -271,7 +271,7 @@ impl GoogCcDriver {
     pub(crate) fn update(
         &mut self,
         records: &[AckArrival],
-        losses: &[(u32, usize)],
+        losses: &[(u64, usize)],
         now: Instant,
         data_in_flight_bytes: usize,
     ) -> BweSnapshot {
@@ -350,7 +350,7 @@ impl GoogCcDriver {
         // in 5 runs out of 6, a sustained 4x overestimate of a degraded
         // link.
         for &(emit_us, size_bytes) in losses {
-            let send_ms = (emit_us as u64 / 1_000) as i64;
+            let send_ms = (emit_us / 1_000) as i64;
             send_ms_max = send_ms_max.max(send_ms);
             let sent = SentPacket {
                 send_time: Timestamp::from_millis(send_ms),

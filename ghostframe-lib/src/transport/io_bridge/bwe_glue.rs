@@ -211,11 +211,11 @@ pub(super) struct ActiveProbe {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct BweSample {
     pub(super) tier: PassTier,
-    /// Server-side send time in microseconds since the bridge's BWE epoch,
-    /// taken from the retransmit cache's `last_sent_at`, so a retransmitted
-    /// pass reports when it actually went out rather than when it first did.
-    /// Monotonic and full-precision — unlike the arrival series this never
-    /// crosses the wire, so it needs no unwrapping.
+    /// Server-side send time in microseconds on the emitter's clock
+    /// (`ReliableTileEmitter::time_base`), taken from the transmission ledger,
+    /// so a retransmitted pass reports when it actually went out rather than
+    /// when it first did. Full width: the datagram header's `u32` stamp wraps
+    /// every 71.6 minutes, this does not.
     pub(super) server_emit_us: u64,
     /// When the underlying `TileWork` became available to the scheduler
     /// (`CacheEntry::queued_at`, ultimately `TileWork::queued_at`), in
@@ -428,7 +428,7 @@ impl IoBridge {
         }
         for tx in expired {
             self.pending_losses.push((tx.emit_us, tx.wire_bytes));
-            self.loss_window.record(tx.emit_us, true);
+            self.loss_window.record(tx.emit_us as u32, true);
         }
         self.refresh_loss_rate(now);
     }
