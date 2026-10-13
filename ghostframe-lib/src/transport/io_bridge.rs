@@ -1686,10 +1686,7 @@ impl IoBridge {
 
         // Phase 1 Task 8: drain accumulated BWE samples (populated by
         // the ACK-receive path in Task 5) into the estimator. Cheap
-        // on empty. The wire_seq we feed is a Phase 1 placeholder
-        // (composed from emit/arrival timestamps); Phase 2 will plumb
-        // the real cache-entry wire_seq through `BweSample` if the
-        // estimator backend needs strict packet-sequence identity.
+        // on empty.
         // Everything the emitter put on the wire becomes an outstanding
         // record. `wire_seq` is allocated inside the emitter, so this is
         // the only place that knows which value each datagram carried.
@@ -1780,8 +1777,6 @@ impl IoBridge {
                         .record(queued_latency_us),
                 }
                 records.push(AckArrival {
-                    wire_seq: (((s.server_emit_us / 1000) as u32) << 16)
-                        | (s.client_arrival_ms_lo16 as u32),
                     server_emit_us: s.server_emit_us,
                     client_arrival_ms_lo16: s.client_arrival_ms_lo16,
                     size_bytes: s.size_bytes,

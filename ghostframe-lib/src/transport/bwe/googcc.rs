@@ -599,7 +599,6 @@ mod tests {
                 .map(|i| {
                     let emit_us = ((step * 20 + i) as u64) * 1_000;
                     AckArrival {
-                        wire_seq: step * 12 + i,
                         server_emit_us: emit_us,
                         // 15 ms one-way delay, constant.
                         client_arrival_ms_lo16: ((emit_us / 1_000 + 15) & 0xFFFF) as u16,
@@ -647,7 +646,6 @@ mod tests {
                         // Constant 15 ms one-way delay; only the epoch differs.
                         let arrival_ms = emit_us / 1_000 + 15 + offset_ms;
                         AckArrival {
-                            wire_seq: step * 12 + i,
                             server_emit_us: emit_us,
                             client_arrival_ms_lo16: (arrival_ms & 0xFFFF) as u16,
                             size_bytes: 1200,
@@ -726,7 +724,6 @@ mod tests {
             .map(|i| {
                 let emit_us = (i as u64) * 1_000;
                 AckArrival {
-                    wire_seq: i,
                     server_emit_us: emit_us,
                     client_arrival_ms_lo16: ((emit_us / 1_000 + 15) & 0xFFFF) as u16,
                     size_bytes: 1200,
@@ -824,7 +821,6 @@ mod tests {
             bytes_sent_before: 0,
         };
         let records = vec![AckArrival {
-            wire_seq: 1,
             server_emit_us: 0,
             client_arrival_ms_lo16: 15,
             size_bytes: 1200,
