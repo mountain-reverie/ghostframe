@@ -18,6 +18,13 @@ const SAD_BINDINGS: [BindingSpec; 3] = [
     BindingSpec::storage_image(1),
     BindingSpec::storage_buffer(2),
 ];
+/// The SAD buffer is written by the SAD shader and `cmd_fill_buffer`ed with
+/// 0xFFFFFFFF on a first frame (no previous image to diff against), so it
+/// needs TRANSFER_DST (VUID-vkCmdFillBuffer-dstBuffer-00029).
+pub(super) const SAD_BUFFER_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
+    vk::BufferUsageFlags::STORAGE_BUFFER.as_raw() | vk::BufferUsageFlags::TRANSFER_DST.as_raw(),
+);
+
 const NV12_BINDINGS: [BindingSpec; 2] = [
     BindingSpec::storage_image(0),
     BindingSpec::storage_buffer(1),
@@ -485,7 +492,7 @@ impl GpuFrameProcessor {
             &device,
             &mem_props,
             sad_buf_size,
-            vk::BufferUsageFlags::STORAGE_BUFFER,
+            SAD_BUFFER_USAGE,
             "SAD buffer",
         )?;
 

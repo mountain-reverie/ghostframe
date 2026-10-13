@@ -11,7 +11,9 @@
 use ash::vk;
 use std::io;
 
-use super::super::pipeline_builder::{alloc_host_buffer_mapped, find_memory_type};
+use super::super::pipeline_builder::{
+    alloc_host_buffer_mapped, fail_point, find_memory_type, note_released, Defer,
+};
 use super::*;
 
 /// Build a whole-queue-family-ignoring [`vk::BufferMemoryBarrier`] at offset 0.
@@ -412,13 +414,19 @@ impl GpuFrameProcessor {
             // Run NV12 conversion + tile_analysis + snapshot copy in one cmd
             // buffer. The snapshot is what we will compare future frames
             // against.
-            self.run_first_frame_passes(
+            if let Err(e) = self.run_first_frame_passes(
                 current,
                 snapshot.as_ref(),
                 geom,
                 nv12_layout,
                 escalation_count,
-            )?;
+            ) {
+                // The snapshot is not stored yet; nobody else will free it.
+                if let Some(snap) = snapshot {
+                    self.destroy_prev_frame(snap);
+                }
+                return Err(e);
+            }
 
             if let Some(mut snap) = snapshot {
                 snap.layout = vk::ImageLayout::GENERAL;
@@ -439,7 +447,7 @@ impl GpuFrameProcessor {
                 tile_analysis: self.analysis_buf.ptr as *const TileAnalysis,
                 tile_analysis_len: cols * rows,
                 palrle_compact_list: self.palrle_compact_list.ptr as *const u32,
-                palrle_compact_count: *self.palrle_compact_count.ptr,
+                palrle_compact_count: clamp_gpu_count(*self.palrle_compact_count.ptr, cols * rows),
                 frame_palette_set: self.frame_palette_set.ptr as *const FramePaletteEntryRaw,
                 frame_palette_set_count: *self.frame_palette_count.ptr,
                 per_tile_frame_palette_id: self.per_tile_frame_palette_id.ptr as *const u8,
@@ -677,7 +685,7 @@ impl GpuFrameProcessor {
             tile_analysis: self.analysis_buf.ptr as *const TileAnalysis,
             tile_analysis_len: cols * rows,
             palrle_compact_list: self.palrle_compact_list.ptr as *const u32,
-            palrle_compact_count: *self.palrle_compact_count.ptr,
+            palrle_compact_count: clamp_gpu_count(*self.palrle_compact_count.ptr, cols * rows),
             frame_palette_set: self.frame_palette_set.ptr as *const FramePaletteEntryRaw,
             frame_palette_set_count: *self.frame_palette_count.ptr,
             per_tile_frame_palette_id: self.per_tile_frame_palette_id.ptr as *const u8,
@@ -723,6 +731,7 @@ impl GpuFrameProcessor {
             uv_offset: nv12_uv_offset,
             uv_stride: nv12_uv_stride,
         } = nv12;
+        fail_point("run_first_frame_passes")?;
         // Note: NV12 descriptor set is allocated inside run_nv12_stage (called below).
         // Note: analysis descriptor set is allocated inside run_analysis_stage (called below).
         // Note: palrle_compact descriptor set is allocated inside run_palrle_compact_stage (called below).
@@ -1215,6 +1224,7 @@ impl GpuFrameProcessor {
 
     /// Destroy all Vulkan resources held by a `PrevFrame`.
     pub(super) unsafe fn destroy_prev_frame(&self, frame: PrevFrame) {
+        note_released();
         self.device.destroy_image_view(frame.view, None);
         self.device.destroy_image(frame.image, None);
         self.device.free_memory(frame.memory, None);
@@ -1232,7 +1242,7 @@ impl GpuFrameProcessor {
     ///
     /// The result is a transient image: the caller passes it to
     /// `process_frame_with_imported` and then calls `destroy_prev_frame`.
-    unsafe fn import_pixels(
+    pub(super) unsafe fn import_pixels(
         &self,
         pixels: &[u8],
         width: u32,
@@ -1275,6 +1285,8 @@ impl GpuFrameProcessor {
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::PREINITIALIZED);
         let image = self.device.create_image(&image_ci, None)?;
+        // Every `?` below releases what exists so far (disarmed on success).
+        let image_guard = Defer::new(|| self.device.destroy_image(image, None));
 
         let mem_reqs = self.device.get_image_memory_requirements(image);
         let mem_props = self
@@ -1286,27 +1298,15 @@ impl GpuFrameProcessor {
             mem_reqs.memory_type_bits,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )
-        .ok_or_else(|| {
-            // Image creation succeeded; release it before bubbling up.
-            self.device.destroy_image(image, None);
-            "no HOST_VISIBLE+HOST_COHERENT memory type for LINEAR STORAGE image"
-        })?;
+        .ok_or("no HOST_VISIBLE+HOST_COHERENT memory type for LINEAR STORAGE image")?;
 
         let alloc_info = vk::MemoryAllocateInfo::default()
             .allocation_size(mem_reqs.size)
             .memory_type_index(mem_type);
-        let memory = match self.device.allocate_memory(&alloc_info, None) {
-            Ok(m) => m,
-            Err(e) => {
-                self.device.destroy_image(image, None);
-                return Err(e.into());
-            }
-        };
-        if let Err(e) = self.device.bind_image_memory(image, memory, 0) {
-            self.device.free_memory(memory, None);
-            self.device.destroy_image(image, None);
-            return Err(e.into());
-        }
+        let memory = self.device.allocate_memory(&alloc_info, None)?;
+        let memory_guard = Defer::new(|| self.device.free_memory(memory, None));
+        self.device.bind_image_memory(image, memory, 0)?;
+        fail_point("import_pixels:map")?;
 
         // Query subresource layout so we can copy row-by-row at the GPU's
         // expected row pitch (LINEAR images may pad rows for alignment).
@@ -1351,14 +1351,9 @@ impl GpuFrameProcessor {
                 base_array_layer: 0,
                 layer_count: 1,
             });
-        let view = match self.device.create_image_view(&view_ci, None) {
-            Ok(v) => v,
-            Err(e) => {
-                self.device.free_memory(memory, None);
-                self.device.destroy_image(image, None);
-                return Err(e.into());
-            }
-        };
+        let view = self.device.create_image_view(&view_ci, None)?;
+        image_guard.disarm();
+        memory_guard.disarm();
 
         Ok(PrevFrame {
             image,
@@ -1382,7 +1377,7 @@ impl GpuFrameProcessor {
     /// → no dirty tiles ever detected. We instead `cmdCopyImage(current →
     /// prev_snapshot)` after each frame to capture a true point-in-time
     /// snapshot independent of the live FB.
-    unsafe fn allocate_owned_image(
+    pub(super) unsafe fn allocate_owned_image(
         &self,
         width: u32,
         height: u32,
@@ -1407,6 +1402,7 @@ impl GpuFrameProcessor {
             .initial_layout(vk::ImageLayout::UNDEFINED);
 
         let image = self.device.create_image(&image_ci, None)?;
+        let image_guard = Defer::new(|| self.device.destroy_image(image, None));
         let mem_reqs = self.device.get_image_memory_requirements(image);
 
         let mem_props = self
@@ -1430,6 +1426,8 @@ impl GpuFrameProcessor {
             .allocation_size(mem_reqs.size)
             .memory_type_index(mem_type);
         let memory = self.device.allocate_memory(&alloc_info, None)?;
+        let memory_guard = Defer::new(|| self.device.free_memory(memory, None));
+        fail_point("allocate_owned_image:bind")?;
         self.device.bind_image_memory(image, memory, 0)?;
 
         let view_ci = vk::ImageViewCreateInfo::default()
@@ -1450,6 +1448,8 @@ impl GpuFrameProcessor {
                 layer_count: 1,
             });
         let view = self.device.create_image_view(&view_ci, None)?;
+        image_guard.disarm();
+        memory_guard.disarm();
 
         Ok(PrevFrame {
             image,

@@ -2470,3 +2470,131 @@ fn dmabuf_real_nv12_buffer_is_a_whole_number_of_words_and_bad_input_costs_nothin
     assert!(p.process_frame_from_pixels(&px, 0, 17, 0).is_err());
     assert_eq!(p.staged_escalation_count, 3);
 }
+
+#[test]
+fn sad_buffer_can_be_the_destination_of_cmd_fill_buffer() {
+    // First frames fill `sad_buf` with cmd_fill_buffer. RADV tolerates a
+    // buffer created without TRANSFER_DST, a validation layer does not.
+    assert!(setup::SAD_BUFFER_USAGE.contains(vk::BufferUsageFlags::TRANSFER_DST));
+    assert!(setup::SAD_BUFFER_USAGE.contains(vk::BufferUsageFlags::STORAGE_BUFFER));
+}
+
+// ---------------------------------------------------------------------------
+// G5: error paths release what they created
+// ---------------------------------------------------------------------------
+
+mod error_path_cleanup {
+    use super::super::super::pipeline_builder::{
+        alloc_host_buffer, alloc_host_buffer_mapped, inject_failure, released_count,
+    };
+    use super::*;
+
+    fn mem_props(p: &GpuFrameProcessor) -> vk::PhysicalDeviceMemoryProperties {
+        unsafe {
+            p.instance
+                .get_physical_device_memory_properties(p.physical_device)
+        }
+    }
+
+    #[test]
+    fn dmabuf_real_allocate_owned_image_releases_image_and_memory_when_it_fails_after_allocating() {
+        let p = GpuFrameProcessor::new(256).expect(NEEDS_GPU);
+        let before = released_count();
+        inject_failure("allocate_owned_image:bind");
+        assert!(unsafe { p.allocate_owned_image(64, 64) }.is_err());
+        assert_eq!(released_count() - before, 2, "image + memory");
+        // The failure was consumed: the same call now succeeds and releases nothing.
+        let ok = unsafe { p.allocate_owned_image(64, 64) }.expect("second call");
+        assert_eq!(released_count() - before, 2);
+        unsafe { p.destroy_prev_frame(ok) };
+    }
+
+    #[test]
+    fn dmabuf_real_import_pixels_releases_image_and_memory_when_it_fails_after_allocating() {
+        let p = GpuFrameProcessor::new(256).expect(NEEDS_GPU);
+        let px = vec![0x40u8; 64 * 64 * 4];
+        let before = released_count();
+        inject_failure("import_pixels:map");
+        assert!(unsafe { p.import_pixels(&px, 64, 64, 256) }.is_err());
+        assert_eq!(released_count() - before, 2, "image + memory");
+    }
+
+    #[test]
+    fn dmabuf_real_host_buffer_helpers_release_what_they_created_when_they_fail() {
+        let p = GpuFrameProcessor::new(256).expect(NEEDS_GPU);
+        let props = mem_props(&p);
+        let usage = vk::BufferUsageFlags::STORAGE_BUFFER;
+        let before = released_count();
+        inject_failure("alloc_host_buffer:bind");
+        assert!(unsafe { alloc_host_buffer(&p.device, &props, 4096, usage, "t") }.is_err());
+        assert_eq!(released_count() - before, 2, "buffer + memory");
+        let before = released_count();
+        inject_failure("alloc_host_buffer:map");
+        assert!(
+            unsafe { alloc_host_buffer_mapped::<u32>(&p.device, &props, 4096, usage, "t") }
+                .is_err()
+        );
+        assert_eq!(released_count() - before, 2, "buffer + memory");
+    }
+
+    #[test]
+    fn dmabuf_real_first_frame_snapshot_is_released_when_the_first_frame_passes_fail() {
+        let mut p = GpuFrameProcessor::new(256).expect(NEEDS_GPU);
+        let px = vec![0x40u8; 64 * 64 * 4];
+        let before = released_count();
+        inject_failure("run_first_frame_passes");
+        assert!(p.process_frame_from_pixels(&px, 64, 64, 256).is_err());
+        // The snapshot, plus the transient `current` image (that one was
+        // already freed on this path).
+        assert_eq!(released_count() - before, 2, "snapshot + current");
+        // The processor is still usable and the next frame is a first frame.
+        let a = p
+            .process_frame_from_pixels(&px, 64, 64, 256)
+            .expect("frame after a failed first frame");
+        assert_eq!(a.dirty_tiles.len(), 4);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// G6: GPU-written counts are clamped
+// ---------------------------------------------------------------------------
+
+#[test]
+fn frame_analysis_slices_clamp_an_oversized_gpu_count() {
+    // Four tiles' worth of backing memory; the "GPU" claims a billion entries.
+    let list = [7u32, 8, 9, 10];
+    let ids = [1u8, 2, 3, 4];
+    let index = vec![0xEEu8; 4 * 512];
+    let ta = [TileAnalysis {
+        count: 1,
+        edge_density_thou: 0,
+        _pad: [0; 2],
+        colors: [0; 16],
+    }; 4];
+    let analysis = FrameAnalysis {
+        dirty_tiles: vec![],
+        nv12_data: std::ptr::null(),
+        nv12_width: 0,
+        nv12_height: 0,
+        nv12_y_stride: 0,
+        nv12_uv_stride: 0,
+        nv12_uv_offset: 0,
+        tile_analysis: ta.as_ptr(),
+        tile_analysis_len: 4,
+        palrle_compact_list: list.as_ptr(),
+        palrle_compact_count: 1_000_000_000,
+        frame_palette_set: std::ptr::null(),
+        frame_palette_set_count: 0,
+        per_tile_frame_palette_id: ids.as_ptr(),
+        folded_into: std::ptr::null(),
+        index_buffer: index.as_ptr(),
+    };
+    assert_eq!(analysis.palrle_compact_list_slice(), &list);
+    assert_eq!(analysis.per_tile_frame_palette_id_slice(), &ids);
+    assert_eq!(analysis.index_buffer_slice_for(3).len(), 512);
+    // Past the backing memory: empty, not a wild read.
+    assert!(analysis.index_buffer_slice_for(4).is_empty());
+    assert!(analysis.index_buffer_slice_for(900_000_000).is_empty());
+    assert_eq!(clamp_gpu_count(u32::MAX, 4), 4);
+    assert_eq!(clamp_gpu_count(3, 4), 3);
+}

@@ -142,7 +142,18 @@ pub struct FrameAnalysis {
     pub index_buffer: *const u8,
 }
 
+/// A GPU-written compact count is untrusted: the compact lists hold at most
+/// one entry per tile, so anything above the tile count is a corrupt value.
+pub(crate) fn clamp_gpu_count(raw: u32, tile_count: u32) -> u32 {
+    raw.min(tile_count)
+}
+
 impl FrameAnalysis {
+    /// `palrle_compact_count` limited to what the compact list can hold.
+    fn compact_len(&self) -> usize {
+        clamp_gpu_count(self.palrle_compact_count, self.tile_analysis_len) as usize
+    }
+
     pub fn tile_analysis_slice(&self) -> &[TileAnalysis] {
         if self.tile_analysis.is_null() || self.tile_analysis_len == 0 {
             return &[];
@@ -156,16 +167,14 @@ impl FrameAnalysis {
     }
 
     pub fn palrle_compact_list_slice(&self) -> &[u32] {
-        if self.palrle_compact_list.is_null() || self.palrle_compact_count == 0 {
+        if self.palrle_compact_list.is_null() || self.compact_len() == 0 {
             return &[];
         }
         // SAFETY: pointer is into HOST_VISIBLE mapped GPU memory owned by
         // GpuFrameProcessor. The borrow checker prevents the returned slice
         // from outliving the &self borrow; the caller must not hold this
         // FrameAnalysis across a subsequent process_frame() call.
-        unsafe {
-            std::slice::from_raw_parts(self.palrle_compact_list, self.palrle_compact_count as usize)
-        }
+        unsafe { std::slice::from_raw_parts(self.palrle_compact_list, self.compact_len()) }
     }
 
     /// Returns the full 256-entry frame palette set buffer (the entire hash
@@ -191,7 +200,7 @@ impl FrameAnalysis {
     }
 
     pub fn per_tile_frame_palette_id_slice(&self) -> &[u8] {
-        if self.per_tile_frame_palette_id.is_null() || self.palrle_compact_count == 0 {
+        if self.per_tile_frame_palette_id.is_null() || self.compact_len() == 0 {
             return &[];
         }
         // SAFETY: pointer is into HOST_VISIBLE mapped GPU memory owned by
@@ -199,12 +208,7 @@ impl FrameAnalysis {
         // from outliving the &self borrow; the caller must not hold this
         // FrameAnalysis across a subsequent process_frame() call.
         // Length = palrle_compact_count (one byte per compact slot).
-        unsafe {
-            std::slice::from_raw_parts(
-                self.per_tile_frame_palette_id,
-                self.palrle_compact_count as usize,
-            )
-        }
+        unsafe { std::slice::from_raw_parts(self.per_tile_frame_palette_id, self.compact_len()) }
     }
 
     /// Returns the full `PALETTE_HASH_SLOTS`-entry folded_into array. Each entry is
@@ -230,7 +234,7 @@ impl FrameAnalysis {
         if self.index_buffer.is_null() {
             return &[];
         }
-        if (c as u32) >= self.palrle_compact_count {
+        if c >= self.compact_len() {
             return &[];
         }
         // SAFETY: same lifetime contract as other slice helpers; c is
