@@ -21,6 +21,73 @@
 
 use ash::vk;
 
+// ---------------------------------------------------------------------------
+// Error-path cleanup
+// ---------------------------------------------------------------------------
+
+/// Runs a cleanup closure on drop unless [`Defer::disarm`]ed. Wraps a freshly
+/// created Vulkan object so every `?` after its creation releases it; call
+/// `disarm` once ownership has been handed to the caller.
+pub(super) struct Defer<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> Defer<F> {
+    pub(super) fn new(f: F) -> Self {
+        Self(Some(f))
+    }
+
+    pub(super) fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl<F: FnOnce()> Drop for Defer<F> {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            note_released();
+            f();
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static RELEASED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FAIL_AT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+/// Count one error-path release (tests assert on the delta).
+#[inline]
+pub(super) fn note_released() {
+    #[cfg(test)]
+    RELEASED.with(|c| c.set(c.get() + 1));
+}
+
+/// Releases counted on this thread so far (test builds only).
+#[cfg(test)]
+pub(super) fn released_count() -> usize {
+    RELEASED.with(|c| c.get())
+}
+
+/// Make the next [`fail_point`] with this name return an error on this thread.
+#[cfg(test)]
+pub(super) fn inject_failure(name: &'static str) {
+    FAIL_AT.with(|c| c.set(Some(name)));
+}
+
+/// A named place where tests can force an error right after a resource was
+/// created, to exercise the cleanup of everything made so far. Compiles to
+/// `Ok(())` outside test builds.
+#[inline]
+pub(super) fn fail_point(name: &'static str) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(test)]
+    if FAIL_AT.with(|c| c.get()) == Some(name) {
+        FAIL_AT.with(|c| c.set(None));
+        return Err(format!("injected failure at {name}").into());
+    }
+    let _ = name;
+    Ok(())
+}
+
 /// A descriptor binding spec used by [`build_compute_pipeline`].
 ///
 /// `descriptor_count` is implicitly 1 and stage flags are implicitly
@@ -133,6 +200,7 @@ pub unsafe fn alloc_host_buffer(
         .usage(usage)
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
     let buffer = device.create_buffer(&buf_ci, None)?;
+    let buffer_guard = Defer::new(|| device.destroy_buffer(buffer, None));
     let reqs = device.get_buffer_memory_requirements(buffer);
     let mem_type = find_memory_type(
         mem_props,
@@ -144,7 +212,11 @@ pub unsafe fn alloc_host_buffer(
         .allocation_size(reqs.size)
         .memory_type_index(mem_type);
     let memory = device.allocate_memory(&alloc_ci, None)?;
+    let memory_guard = Defer::new(|| device.free_memory(memory, None));
+    fail_point("alloc_host_buffer:bind")?;
     device.bind_buffer_memory(buffer, memory, 0)?;
+    buffer_guard.disarm();
+    memory_guard.disarm();
     Ok((buffer, memory))
 }
 
@@ -169,7 +241,12 @@ pub unsafe fn alloc_host_buffer_mapped<T>(
     label: &str,
 ) -> Result<(vk::Buffer, vk::DeviceMemory, *mut T), Box<dyn std::error::Error>> {
     let (buffer, memory) = alloc_host_buffer(device, mem_props, size, usage, label)?;
+    let buffer_guard = Defer::new(|| device.destroy_buffer(buffer, None));
+    let memory_guard = Defer::new(|| device.free_memory(memory, None));
+    fail_point("alloc_host_buffer:map")?;
     let ptr = device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty())? as *mut T;
+    buffer_guard.disarm();
+    memory_guard.disarm();
     Ok((buffer, memory, ptr))
 }
 
