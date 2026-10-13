@@ -175,7 +175,26 @@ fn dmabuf_sync(fd: RawFd, end: bool) -> bool {
         }) | DMA_BUF_SYNC_READ,
     };
     // SAFETY: plain ioctl with a valid pointer to a 8-byte struct.
-    unsafe { libc::ioctl(fd, DMA_BUF_IOCTL_SYNC, &mut req) == 0 }
+    retry_on_eintr(|| unsafe { libc::ioctl(fd, DMA_BUF_IOCTL_SYNC, &mut req) }) == 0
+}
+
+/// Run a syscall wrapper until it stops failing with EINTR. A signal landing
+/// during `DMA_BUF_IOCTL_SYNC` (it can wait on the producer's fence) must not
+/// read as "no sync available".
+pub(crate) fn retry_on_eintr(mut call: impl FnMut() -> libc::c_int) -> libc::c_int {
+    loop {
+        let r = call();
+        if r == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        return r;
+    }
+}
+
+/// `DMA_BUF_IOCTL_SYNC` with START/END + READ, for the CPU-read fallback.
+/// Best effort, EINTR retried; memfds (ENOTTY) and some exporters have no sync.
+pub(crate) fn dmabuf_sync_read(fd: RawFd, end: bool) -> bool {
+    dmabuf_sync(fd, end)
 }
 
 /// `(key, size, cacheable)`. A file that reports `st_size == 0` is not
@@ -401,6 +420,29 @@ pub fn readback_dmabuf_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_on_eintr_retries_only_eintr() {
+        let mut calls = 0;
+        let r = retry_on_eintr(|| {
+            calls += 1;
+            if calls < 3 {
+                unsafe { *libc::__errno_location() = libc::EINTR };
+                -1
+            } else {
+                0
+            }
+        });
+        assert_eq!((r, calls), (0, 3));
+        // Any other errno is returned as is, once.
+        let mut calls = 0;
+        let r = retry_on_eintr(|| {
+            calls += 1;
+            unsafe { *libc::__errno_location() = libc::ENOTTY };
+            -1
+        });
+        assert_eq!((r, calls), (-1, 1));
+    }
 
     /// The readback state is process-wide, so tests that read must not
     /// interleave.
