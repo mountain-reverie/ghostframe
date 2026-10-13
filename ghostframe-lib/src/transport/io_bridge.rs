@@ -42,8 +42,8 @@ use crate::transport::ghostbridge::{
 };
 use crate::transport::protocol::{
     build_frame_parity_datagram, fragment_frame, fragment_tile, max_fec_frame_fragment_payload,
-    max_fragment_payload, Codec, FrameHeader, NackMessage, TileFragmentInputs, FRAME_HEADER_SIZE,
-    PING_PAYLOAD, PONG_PAYLOAD, TILE_DATAGRAM_FLAG,
+    max_fragment_payload, Codec, TileFragmentInputs, FRAME_HEADER_SIZE, PING_PAYLOAD, PONG_PAYLOAD,
+    TILE_DATAGRAM_FLAG,
 };
 use crate::transport::quic::QuicServer;
 use crate::transport::webtransport::WebTransportServer;
@@ -436,14 +436,10 @@ pub struct IoBridge {
     gpu_frame_processor: Option<GpuFrameProcessor>,
     /// Full-frame H.264 encoder (VA-API zero-copy).
     full_frame_encoder: Option<FullFrameEncoder>,
-    /// Recent frame fragments for NACK retransmission. Key: (frame_seq, frag_idx).
-    recent_frame_fragments: HashMap<(u32, u16), Vec<u8>>,
     /// Per-tile-pass coverage map: (frame_seq, tile_x, tile_y, pass_idx) ->
     /// tile metadata for a work item. Populated at emit time; consumed by
     /// dispatch_ack_datagram on incoming ACKs. LRU-bounded by
-    /// FRAGMENT_COVERAGE_CAPACITY. Independent of `recent_frame_fragments`
-    /// (different lifetime semantics: retransmit window is RTT-bounded;
-    /// coverage retention is until-ACKed-or-evicted).
+    /// FRAGMENT_COVERAGE_CAPACITY. Retention is until-ACKed-or-evicted.
     fragment_coverage: crate::transport::fragment_coverage::FragmentCoverageMap,
     /// Times `resume_scheduler_continuation` actually drained work, and the
     /// bytes it moved.
@@ -1007,7 +1003,6 @@ impl IoBridge {
             cdf53_stranded_candidates_this_frame: Vec::new(),
             gpu_frame_processor: diffs.gpu_frame_processor,
             full_frame_encoder: None,
-            recent_frame_fragments: HashMap::new(),
             fragment_coverage: crate::transport::fragment_coverage::FragmentCoverageMap::new(
                 crate::transport::fragment_coverage::FRAGMENT_COVERAGE_CAPACITY,
             ),

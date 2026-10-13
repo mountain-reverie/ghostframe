@@ -6,9 +6,7 @@
 //! `dispatch_ack_datagram` (decoding an ACK batch and applying it to the
 //! retransmit cache, transmission ledger, fragment coverage, palette table and
 //! the `bwe_samples_buffer`), `dispatch_tile_nack_datagram` (tile NACKs into
-//! the reliable emitter), `handle_nack` (a fragment-NACK retransmit helper
-//! that is `allow(dead_code)`, not called today) and the
-//! `handle_datagram_payload` ping reply. The fields themselves stay on `IoBridge`.
+//! the reliable emitter) and the `handle_datagram_payload` ping reply. The fields themselves stay on `IoBridge`.
 //!
 //! Must not: run the per-tick pacing or scheduler logic, or interpret
 //! FEEDBACK-stream messages (`dispatch_feedback_bytes` stays in `io_bridge.rs`);
@@ -466,45 +464,6 @@ impl IoBridge {
             | K::TileFragment => {
                 self.unroutable_inbound_datagrams =
                     self.unroutable_inbound_datagrams.saturating_add(1);
-            }
-        }
-    }
-
-    /// Handle a NACK by retransmitting the requested fragment, but only if
-    /// QUIC RTT is low enough for the retransmission to arrive before the
-    /// next frame. Wired in once client-side NACK sending is integrated.
-    #[allow(dead_code)]
-    fn handle_nack(&mut self, nack: NackMessage, handle: ConnectionHandle) {
-        if !self.is_live(handle) {
-            return;
-        }
-        if let Some(conn) = self.server.connections.get_mut(&handle) {
-            let rtt = conn.stats().path.rtt;
-            let frame_interval = std::time::Duration::from_micros(16_667); // ~60fps
-
-            if rtt < frame_interval {
-                if let Some(dg) = self
-                    .recent_frame_fragments
-                    .get(&(nack.frame_seq, nack.frag_idx))
-                {
-                    let dg = dg.clone();
-                    if let Some(wt) = self.wt_sessions.get_mut(&handle) {
-                        let _ = wt.send_datagram(conn, &dg);
-                        tracing::trace!(
-                            target: LOG_TARGET,
-                            frame_seq = nack.frame_seq,
-                            frag_idx = nack.frag_idx,
-                            "NACK retransmit"
-                        );
-                    }
-                }
-            } else {
-                tracing::trace!(
-                    target: LOG_TARGET,
-                    ?rtt,
-                    frame_seq = nack.frame_seq,
-                    "NACK skipped — RTT too high for retransmission"
-                );
             }
         }
     }
