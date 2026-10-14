@@ -1087,7 +1087,7 @@ async fn e2e_palrle_exact_pixels() -> Result<()> {
 /// (ERR_INDEX_OOB).
 ///
 /// The server-side test hook GHOSTFRAME_INJECT_OOB_PALRLE replaces the
-/// next PalRle payload for tile (15, 11) with a hand-built bundled
+/// next PalRle payload for tile (5, 5) with a hand-built bundled
 /// payload whose single RLE byte references palette index 2 against a
 /// count=1 palette. The client's compute shader detects the OOB,
 /// atomically writes 5 to its per-tile error slot, and main.ts forwards
@@ -1095,25 +1095,34 @@ async fn e2e_palrle_exact_pixels() -> Result<()> {
 /// handle_decode_error logs the message via tracing::warn — we
 /// substring-match the rendered log line.
 ///
-/// Test pattern: `--solid-per-tile --drm-direct` is the most reliable
-/// PalRle-emitting pattern that ships today. The 64×64 motion region is
-/// centred on the scanout; for VKMS's typical 1024×768 mode it lands at
-/// pixels (480..544, 352..416), i.e. tiles (15..17, 11..13). The four
-/// motion-region tiles classify as `PalRle` (Rule 3: high-freq low-mag,
-/// few colours) every frame, while the corners stay `Solid` and the BG
-/// stays `Skip`. Tile (15, 11) is one of those four — empirically
-/// verified with GHOSTFRAME_DIAGNOSE_TILES=1 against the same harness.
+/// Test pattern: `--palrle-exact --drm-direct` paints four 32x32 tiles
+/// that are genuinely two-colour (red/blue), at tile coords (5,5), (10,5),
+/// (5,10), (10,10). They classify as `PalRle` on the first dirty pass.
+/// Tile (5,5) is the checkerboard. (This used `--solid-per-tile` and tile
+/// (15,11) until 9bfaff2 sent single-colour tiles to Solid: that pattern's
+/// motion region is a whole-tile 2-colour *flip*, so each tile is one
+/// colour per frame and never PalRle.)
 ///
 /// IMPORTANT: the server-side hook consumes `oob_inject_at` on the
 /// FIRST PalRle-bearing frame regardless of whether the target tile is
 /// in the per-frame `preps`. Pinning to a tile that is *reliably* PalRle
-/// on the very first dirty pass is required — the motion-region tiles
-/// satisfy that constraint; first-frame-Solid tiles (corners, BG) do not.
+/// on the very first dirty pass is required — the four painted tiles
+/// satisfy that constraint; first-frame-Solid tiles (BG) do not.
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_palrle_oob_index() -> Result<()> {
+    // `--palrle-exact`, not `--solid-per-tile`: since 9bfaff2 (Rule 3 sends
+    // single-colour tiles to Solid) the solid-per-tile motion region, a
+    // 2-colour flip of whole tiles, never classifies as PalRle, so the hook
+    // below never found a PalRle payload to replace and this test passed only
+    // when capture happened to catch a half-painted tile. `--palrle-exact`
+    // paints four tiles that are genuinely two-colour; tile (5,5) is the
+    // checkerboard.
     let _setup = setup_e2e_webgpu_gpu_with_env(
-        "--solid-per-tile --drm-direct",
-        &[("GHOSTFRAME_INJECT_OOB_PALRLE", "15,11")],
+        "--palrle-exact --drm-direct",
+        &[
+            ("GHOSTFRAME_INJECT_OOB_PALRLE", "5,5"),
+            ("CAPTURE_FPS_DRM_DIRECT", "2"),
+        ],
     )
     .await?;
 
