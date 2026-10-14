@@ -253,6 +253,26 @@ impl FragmentCoverageMap {
         self.compact_order();
     }
 
+    /// Mark every PalRle record of a tile as no longer carrying a palette.
+    ///
+    /// Called when the tile's in-flight work is superseded: the supersession
+    /// has already given back each bundled emission's `in_flight_carrying`
+    /// count and palette reference, so the acknowledgement of one of those
+    /// emissions, which still arrives and still marks the palette delivered,
+    /// must not give them back a second time.
+    pub fn unbundle_palrle_for_tile(&mut self, tile_x: u8, tile_y: u8) {
+        let Some(records) = self.tiles.get_mut(&(tile_x, tile_y)) else {
+            return;
+        };
+        for r in records.iter_mut() {
+            for c in r.coverage.iter_mut() {
+                if c.codec == Codec::PalRle {
+                    c.palette_bundled = false;
+                }
+            }
+        }
+    }
+
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.len

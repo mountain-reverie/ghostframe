@@ -33,6 +33,41 @@ impl IoBridge {
         }
     }
 
+    /// Give back what superseded PalRle work was holding on its palette.
+    ///
+    /// Every superseded item gives back the palette reference Phase A took.
+    /// Only a *bundled* one raised `in_flight_carrying`, so only it lowers it.
+    /// The emissions in flight are still acknowledged later, and that
+    /// acknowledgement would give the same count and reference back again, so
+    /// the tile's PalRle coverage is unbundled here: a double release drives
+    /// the count below the number of bundled emissions really outstanding.
+    pub(super) fn settle_superseded_palettes(
+        &mut self,
+        tile_x: u8,
+        tile_y: u8,
+        superseded: &[crate::transport::scheduler::ResolvedTileWork],
+    ) {
+        let mut any_bundled = false;
+        for s in superseded {
+            let Some(pid) = s.palette_id else { continue };
+            let pid_usize = pid as usize;
+            if s.palette_bundled {
+                any_bundled = true;
+                let cnt = self.palette_table.in_flight_carrying[pid_usize];
+                self.palette_table.in_flight_carrying[pid_usize] = cnt.saturating_sub(1);
+            }
+            // Release the acquire from Phase A. Supersession means the tile
+            // work is dropped without ever being ACKed.
+            if self.palette_table.ref_count[pid_usize] > 0 {
+                self.palette_table.release(pid);
+            }
+        }
+        if any_bundled {
+            self.fragment_coverage
+                .unbundle_palrle_for_tile(tile_x, tile_y);
+        }
+    }
+
     /// The live connection's raw QUIC `datagrams().max_size()`, before any
     /// overhead is subtracted. `None` with no live send handle, no such
     /// connection, or datagrams unsupported. Pure lookup: callers keep their
@@ -238,18 +273,7 @@ impl IoBridge {
                     .get_mut(tile_x, tile_y)
                     .already_escalated_this_gen = false;
             }
-            for s in superseded {
-                if let Some(pid) = s.palette_id {
-                    let pid_usize = pid as usize;
-                    let cnt = self.palette_table.in_flight_carrying[pid_usize];
-                    self.palette_table.in_flight_carrying[pid_usize] = cnt.saturating_sub(1);
-                    // Release the acquire from Phase A. Supersession means the tile
-                    // work is dropped without ever being ACKed.
-                    if self.palette_table.ref_count[pid_usize] > 0 {
-                        self.palette_table.release(pid);
-                    }
-                }
-            }
+            self.settle_superseded_palettes(tile_x as u8, tile_y as u8, &superseded);
             // Copied out only by the arms that send the pixels. Solid needs
             // one pixel and PalRle arrives already encoded, and on a
             // full-screen change this 4 KB copy per tile was most of what

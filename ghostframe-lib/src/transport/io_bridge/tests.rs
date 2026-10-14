@@ -5336,3 +5336,102 @@ async fn phase_a_skips_compact_list_entries_it_cannot_resolve() {
         bridge.phase_a_palette_allocation(2, &[0, 1], &ids, &folded, &palette_set, &indices);
     assert_eq!(preps.len(), 1);
 }
+
+// ---- T12: a superseded bundled emission is settled once, not twice ----
+
+/// Two bundled emissions (A, B) of one palette are outstanding. A's tile is
+/// re-encoded, which supersedes A and gives A's count and reference back; A's
+/// datagram is then acknowledged anyway. That acknowledgement must not give
+/// them back again, or the count reads 0 while B still carries the palette.
+#[tokio::test(flavor = "multi_thread")]
+async fn acking_a_superseded_bundled_emission_does_not_release_its_palette_twice() {
+    use crate::transport::protocol::Codec;
+    use crate::transport::scheduler::ResolvedTileWork;
+    let (our_end, _peer) = UnixStream::pair().expect("pair");
+    let server = QuicServer::new().expect("server");
+    let (_tx, rx) = tokio::sync::mpsc::channel(1);
+    let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+
+    bridge.palette_table.ref_count[9] = 2;
+    bridge.palette_table.slot_state[9] = crate::encoder::pal_rle::SlotState::Held;
+    bridge.palette_table.in_flight_carrying[9] = 2;
+    let cov: crate::transport::fragment_coverage::CoverageList =
+        smallvec::smallvec![crate::transport::fragment_coverage::FragmentCoverage {
+            tile_x: 2,
+            tile_y: 3,
+            generation: 0,
+            pass_idx: 0,
+            codec: Codec::PalRle,
+            palette_id: Some(9),
+            palette_bundled: true,
+        }];
+    bridge.fragment_coverage.record((301, 2, 3, 0), cov);
+    bridge.seed_transmission_for_test(
+        2001,
+        crate::transport::reliable_emitter::EmitKey::new(301, 2, 3, 0),
+    );
+
+    // A's tile is re-encoded: its in-flight work is superseded.
+    let superseded = [ResolvedTileWork {
+        tile_x: 2,
+        tile_y: 3,
+        generation: 0,
+        pass: 0,
+        codec: Codec::PalRle,
+        palette_id: Some(9),
+        palette_bundled: true,
+        via_ack: false,
+    }];
+    bridge.settle_superseded_palettes(2, 3, &superseded);
+    assert_eq!(bridge.palette_table.in_flight_carrying[9], 1);
+    assert_eq!(bridge.palette_table.ref_count[9], 1);
+
+    // The superseded datagram turns out to have arrived.
+    let batch = crate::transport::ack::AckBatch {
+        entries: vec![crate::transport::ack::AckEntry {
+            wire_seq: 2001,
+            arrival_time_ms_lo16: 0,
+        }],
+    };
+    bridge.dispatch_ack_datagram(&batch.encode());
+
+    assert_eq!(
+        bridge.palette_table.in_flight_carrying[9], 1,
+        "B is still carrying the palette"
+    );
+    assert_eq!(
+        bridge.palette_table.ref_count[9], 1,
+        "B still holds its reference"
+    );
+    assert!(
+        bridge.palette_table.delivered.contains(9),
+        "the ack still proves the receiver has the palette"
+    );
+}
+
+/// A superseded *thin* emission never raised the carry count, so it must not
+/// lower it either (it would take down a bundled emission's count).
+#[tokio::test(flavor = "multi_thread")]
+async fn superseding_a_thin_emission_leaves_the_carry_count_alone() {
+    use crate::transport::protocol::Codec;
+    use crate::transport::scheduler::ResolvedTileWork;
+    let (our_end, _peer) = UnixStream::pair().expect("pair");
+    let server = QuicServer::new().expect("server");
+    let (_tx, rx) = tokio::sync::mpsc::channel(1);
+    let mut bridge = IoBridge::new_with_frames_for_test(our_end, server, rx);
+    bridge.palette_table.ref_count[9] = 2;
+    bridge.palette_table.slot_state[9] = crate::encoder::pal_rle::SlotState::Held;
+    bridge.palette_table.in_flight_carrying[9] = 1; // one bundled emission elsewhere
+    let thin = [ResolvedTileWork {
+        tile_x: 2,
+        tile_y: 3,
+        generation: 0,
+        pass: 0,
+        codec: Codec::PalRle,
+        palette_id: Some(9),
+        palette_bundled: false,
+        via_ack: false,
+    }];
+    bridge.settle_superseded_palettes(2, 3, &thin);
+    assert_eq!(bridge.palette_table.in_flight_carrying[9], 1);
+}
