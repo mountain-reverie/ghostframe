@@ -242,8 +242,11 @@ impl IoBridge {
     ) {
         for (emit_key, tx, arrival_lo16, late) in resolved.iter() {
             if *late {
-                // Already counted as a loss when it expired. Feeding
-                // its timing now would report the same bytes twice.
+                // Declared lost when it expired: either already reported to
+                // the estimator (feeding its timing now would report the same
+                // bytes twice) or withdrawn from `pending_losses` this turn
+                // (see `retract_late_acked_losses`). Its arrival time reflects
+                // the stall rather than the path, so it is not fed as delivered.
                 continue;
             }
             if self.bwe_samples_buffer.len() >= BWE_SAMPLES_BUFFER_CAPACITY {

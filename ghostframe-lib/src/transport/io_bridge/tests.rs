@@ -5123,6 +5123,45 @@ async fn a_late_ack_for_an_already_flushed_loss_is_a_no_op() {
     assert!(bridge.late_acked.is_empty());
 }
 
+/// The same, through the production turn: a loss expires in one `post_turn`,
+/// its late ACK is dispatched, and the next `post_turn` must withdraw it. The
+/// unit tests above call `retract_late_acked_losses` by hand; this one fails
+/// if `post_turn` stops calling it.
+#[tokio::test]
+async fn post_turn_withdraws_the_loss_of_a_late_acked_transmission() {
+    use crate::transport::ack::{AckBatch, AckEntry};
+    let mut bridge = make_bridge_for_test().await;
+    let long_ago = super::now_std()
+        .checked_sub(std::time::Duration::from_secs(60))
+        .expect("monotonic clock has 60 s of history");
+    bridge
+        .transmission_ledger
+        .record(41, long_ago, ledger_tx(1_000, 1_200, 1));
+    bridge
+        .transmission_ledger
+        .record(42, long_ago, ledger_tx(2_000, 900, 2));
+
+    bridge.post_turn().await.expect("post_turn");
+    assert_eq!(
+        bridge.pending_losses.len(),
+        2,
+        "both expired, no sample to flush them"
+    );
+
+    let batch = AckBatch {
+        entries: vec![AckEntry {
+            wire_seq: 41,
+            arrival_time_ms_lo16: 7,
+        }],
+    };
+    bridge.dispatch_ack_datagram(&batch.encode());
+    bridge.post_turn().await.expect("post_turn");
+
+    let left: Vec<u32> = bridge.pending_losses.iter().map(|l| l.wire_seq).collect();
+    assert_eq!(left, vec![42]);
+    assert_eq!(bridge.pending_losses_retracted, 1);
+}
+
 // ---- T5: the sample's send time must survive the 32-bit emit clock wrapping ----
 
 /// The datagram header carries the emit stamp as a `u32` of microseconds, which
