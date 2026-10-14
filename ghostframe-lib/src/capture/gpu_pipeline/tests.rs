@@ -2449,3 +2449,24 @@ fn dmabuf_real_from_pixels_rejects_a_stride_shorter_than_a_row() {
         .is_err());
     assert!(p.process_frame_from_pixels(&px, 64, 64, 64 * 4).is_ok());
 }
+
+#[test]
+fn dmabuf_real_nv12_buffer_is_a_whole_number_of_words_and_bad_input_costs_nothing() {
+    // The NV12 shader writes u32 words: 33x17 needs 33*17 + 34*9 = 867 bytes.
+    let mut p = GpuFrameProcessor::new(4096).expect(NEEDS_GPU);
+    let px = vec![0x33u8; 33 * 17 * 4];
+    p.process_frame_from_pixels(&px, 33, 17, 33 * 4).unwrap();
+    let nv12 = p.nv12_buffer.as_ref().unwrap();
+    assert!(
+        nv12.size >= 867 && nv12.size.is_multiple_of(4),
+        "size {}",
+        nv12.size
+    );
+    // A rejected frame consumes no staged state.
+    p.set_escalation_candidates(&[1, 2, 3]);
+    assert!(p
+        .process_frame_from_pixels(&px, 33, 17, 33 * 4 - 1)
+        .is_err());
+    assert!(p.process_frame_from_pixels(&px, 0, 17, 0).is_err());
+    assert_eq!(p.staged_escalation_count, 3);
+}

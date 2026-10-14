@@ -175,7 +175,11 @@ impl GpuFrameProcessor {
         // buffer on the last row).
         let uv_stride = width.next_multiple_of(2);
         let uv_offset = y_stride * height; // UV follows immediately after Y
-        let total = (uv_offset + uv_stride * height.div_ceil(2)) as vk::DeviceSize;
+                                           // The shader writes whole u32 words (atomicAnd/Or on `data[addr / 4]`),
+                                           // so the buffer must be a whole number of words or the last 1-3 UV
+                                           // bytes fall in a word past the descriptor range.
+        let total =
+            ((uv_offset + uv_stride * height.div_ceil(2)) as vk::DeviceSize).next_multiple_of(4);
 
         let mem_props = self
             .instance
@@ -299,6 +303,19 @@ impl GpuFrameProcessor {
         height: u32,
         stride: u32,
     ) -> Result<FrameAnalysis, Box<dyn std::error::Error>> {
+        // Reject bad input before any state changes (staged escalation count,
+        // baseline, NV12 buffer): a rejected frame must cost nothing.
+        if width == 0 || height == 0 {
+            return Err(format!("from-pixels frame has a zero dimension: {width}x{height}").into());
+        }
+        if (stride as u64) < (width as u64) * 4 {
+            return Err(format!(
+                "from-pixels stride {stride} < width*4 = {}",
+                (width as u64) * 4
+            )
+            .into());
+        }
+
         let escalation_count_this_frame = self.staged_escalation_count;
         self.staged_escalation_count = 0;
 
