@@ -3501,18 +3501,16 @@ async fn e2e_indices_raw_handshake() -> Result<()> {
 /// force_rebundle.
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_decode_error_thin_uncached() -> Result<()> {
-    // Don't lower CAPTURE_FPS_DRM_DIRECT here: the test depends on
-    // the central 64×64 motion region cycling fast enough that the
-    // classifier picks PalRle for the moving tiles.  At 2 fps the
-    // animation doesn't update often enough for the classifier to
-    // observe the 2-color flip — no PalRle is emitted at all,
-    // delivered/thin/decode-error machinery never gets exercised,
-    // and the test fails for the wrong reason.  The test does only
-    // ~10 evaluate() calls in total (small sleep windows), so the
-    // CDP-saturation problem the bulk-fix targeted doesn't apply
-    // here.
+    // `--palrle-exact` (static, four genuinely two-colour tiles), at the
+    // default capture rate. Not `--solid-per-tile`: since 9bfaff2 its
+    // motion tiles are single-colour per frame and take Solid, so no palette
+    // is ever delivered. Not CAPTURE_FPS_DRM_DIRECT=2 either: a session reset
+    // puts the server in H.264 until `exit_sustain_frames = 30` static frames
+    // have passed (15 s at 2 fps, 1 s at 30), and thin PalRle can only be
+    // emitted after that handoff. Phase 3 below waits 6 s. The test does
+    // only ~10 evaluate() calls, so 30 fps does not saturate CDP here.
     let setup = setup_e2e_webgpu_gpu_with_env(
-        "--solid-per-tile --drm-direct",
+        "--palrle-exact --drm-direct",
         &[("GHOSTFRAME_SKIP_PALETTE_SESSION_RESET", "1")],
     )
     .await?;
