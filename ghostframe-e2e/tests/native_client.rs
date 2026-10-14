@@ -184,10 +184,16 @@ async fn native_client_renders_the_test_pattern_into_an_exported_dmabuf() {
         "pixel at ({x},{y}): {px:?} (stride={}, offset={})",
         f.stride, f.offset
     );
+    // The export is BGRA, bytes B,G,R,A in memory (`DRM_FORMAT_ARGB8888`):
+    // X11/DRI3 infers XRGB8888 from depth 24 / bpp 32 and there is no depth
+    // that means RGBA, so 5afdf5a moved the export to BGRA. Red is therefore
+    // (B=0x00, G=0x00, R=0xFF) in byte order. This asserts the bytes the
+    // exported dmabuf actually holds; converting to RGBA first would mask a
+    // genuine channel-order regression.
     assert_eq!(
         (px[0], px[1], px[2]),
-        (0xFF, 0x00, 0x00),
-        "expected solid red (R=0xFF,G=0x00,B=0x00) at ({x},{y}), got {px:?}"
+        (0x00, 0x00, 0xFF),
+        "expected solid red in BGRA byte order (B=0x00,G=0x00,R=0xFF) at ({x},{y}), got {px:?}"
     );
 
     client.release_frame(frame.frame_id);
