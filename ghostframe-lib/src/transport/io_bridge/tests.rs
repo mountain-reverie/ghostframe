@@ -5271,3 +5271,66 @@ async fn pre_wrap_sample_send_time_equals_the_emitted_stamp() {
     bridge.dispatch_ack_datagram(&batch.encode());
     assert_eq!(bridge.bwe_samples_buffer[0].server_emit_us, 1_234_000);
 }
+
+// ---- T14: the GPU-written compact list is not trusted ----
+
+/// An index off the grid used to reach `metrics_tracker.get` and panic; short
+/// side buffers used to panic on indexing. All of them must just skip the tile
+/// and leave the palette table untouched.
+#[tokio::test]
+async fn phase_a_skips_compact_list_entries_it_cannot_resolve() {
+    use crate::tile::CodecState;
+    let mut bridge = make_bridge_for_test().await;
+    bridge.metrics_tracker.resize(2, 2);
+    for t in 0..4u32 {
+        bridge.metrics_tracker.get_mut(t % 2, t / 2).codec_state =
+            CodecState::PalRle { palette_id: 0 };
+    }
+    let palette_set = vec![
+        crate::capture::gpu_pipeline::FramePaletteEntryRaw {
+            count: 1,
+            _pad: [0; 3],
+            colors: [0; 16],
+        };
+        256
+    ];
+    let folded: Vec<u32> = (0..256).collect();
+    let ids = [0u8; 1];
+    let indices = vec![0u8; 512];
+
+    // Off the grid.
+    let preps = bridge.phase_a_palette_allocation(
+        2,
+        &[4, u32::MAX],
+        &[0, 0],
+        &folded,
+        &palette_set,
+        &indices,
+    );
+    assert!(preps.is_empty(), "off-grid tiles produce no work");
+    // Zero columns.
+    assert!(bridge
+        .phase_a_palette_allocation(0, &[0], &[0], &folded, &palette_set, &indices)
+        .is_empty());
+    // In-grid tile 0 but a side buffer is empty: folded, palette set, indices.
+    assert!(bridge
+        .phase_a_palette_allocation(2, &[0], &[0], &[], &palette_set, &indices)
+        .is_empty());
+    assert!(bridge
+        .phase_a_palette_allocation(2, &[0], &[0], &folded, &[], &indices)
+        .is_empty());
+    assert!(bridge
+        .phase_a_palette_allocation(2, &[0], &[0], &folded, &palette_set, &[])
+        .is_empty());
+    // Nothing was acquired by any of the skipped entries.
+    assert!(bridge
+        .palette_table
+        .in_flight_carrying
+        .iter()
+        .all(|&c| c == 0));
+    assert!(bridge.palette_table.ref_count.iter().all(|&c| c == 0));
+    // A palette-id slice shorter than the list: the second entry is skipped, the first still works.
+    let preps =
+        bridge.phase_a_palette_allocation(2, &[0, 1], &ids, &folded, &palette_set, &indices);
+    assert_eq!(preps.len(), 1);
+}
