@@ -1227,9 +1227,22 @@ async fn e2e_palrle_session_reset_body<B: helpers::BrowserSession>(
     );
 
     // Protocol-layer: post-reset codec stream should include PalRle.
-    let codec_list: Vec<u8> = browser
-        .evaluate("window.__ghostframeRecordedCodecs || []")
-        .await?;
+    //
+    // PalRle only arrives after the H.264 -> TileCodec handoff, which needs
+    // `exit_sustain_frames = 30` static frames. At the 2 fps this test pins
+    // for CDP responsiveness that is ~15 s, not the ~1 s the 4 s wait above
+    // assumes, so poll rather than read once.
+    let mut codec_list: Vec<u8> = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(40);
+    while std::time::Instant::now() < deadline {
+        codec_list = browser
+            .evaluate("window.__ghostframeRecordedCodecs || []")
+            .await?;
+        if codec_list.contains(&2u8) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
     assert!(
         codec_list.contains(&2u8),
         "e2e_palrle_session_reset: expected Codec::PalRle (2) post-reset; saw codecs: {:?}",
