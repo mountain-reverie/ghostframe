@@ -1972,9 +1972,18 @@ impl IoBridge {
         use crate::tile::CodecState;
 
         let mut preps: Vec<PalRleTileWorkPrep> = Vec::with_capacity(compact_list.len());
+        if cols == 0 {
+            return preps;
+        }
         for (c, &tile_idx) in compact_list.iter().enumerate() {
             let tx = tile_idx % cols;
             let ty = tile_idx / cols;
+
+            // The list is written by the GPU. An index off the grid would
+            // panic in `metrics_tracker`; skip it like the Cdf53 path does.
+            if tx >= self.metrics_tracker.cols() || ty >= self.metrics_tracker.rows() {
+                continue;
+            }
 
             // Honour the classifier's actual decision.
             if !matches!(
@@ -1984,15 +1993,28 @@ impl IoBridge {
                 continue;
             }
 
-            let pal_id_local = per_tile_frame_palette_id[c];
+            // Also GPU-written, and sized separately from the list: a short
+            // slice must skip the tile, not panic.
+            let Some(&pal_id_local) = per_tile_frame_palette_id.get(c) else {
+                continue;
+            };
             if pal_id_local == 0xFF {
                 // Stage 2a sentinel — frame-palette-set overflow.
                 self.metrics_tracker.get_mut(tx, ty).codec_state = CodecState::Skip;
                 self.palette_table.stats_frame.fell_back_to_raw += 1;
                 continue;
             }
-            let effective = (folded_into[pal_id_local as usize] & 0xFF) as usize;
-            let raw = &frame_palette_set[effective];
+            let Some(&folded) = folded_into.get(pal_id_local as usize) else {
+                continue;
+            };
+            let Some(raw) = frame_palette_set.get((folded & 0xFF) as usize) else {
+                continue;
+            };
+            // Before the palette is acquired, so a short buffer leaves no
+            // reference or carry count behind.
+            let Some(tile_indices) = index_buffer.get(c * 512..(c + 1) * 512) else {
+                continue;
+            };
             let mut palette = PaletteEntry {
                 count: raw.count as u8,
                 ..Default::default()
@@ -2014,7 +2036,7 @@ impl IoBridge {
                         self.palette_table.in_flight_carrying[id as usize] += 1;
                     }
                     let mut indices = [0u8; 512];
-                    indices.copy_from_slice(&index_buffer[c * 512..(c + 1) * 512]);
+                    indices.copy_from_slice(tile_indices);
                     self.metrics_tracker.get_mut(tx, ty).codec_state =
                         CodecState::PalRle { palette_id: id };
                     self.palette_table.stats_frame.reused_or_allocated += 1;
