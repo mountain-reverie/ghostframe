@@ -38,6 +38,10 @@ pub struct ResolvedTileWork {
     /// For `Codec::PalRle`, the persistent palette id (payload byte [1]).
     /// For other codecs, `None`.
     pub palette_id: Option<u8>,
+    /// For `Codec::PalRle`, whether the emission carried the palette inline
+    /// (payload flags bit 0). Only a bundled emission raised
+    /// `PaletteTable::in_flight_carrying`, so only it may lower it.
+    pub palette_bundled: bool,
     /// Whether the resolved work was an ACK (true) or a supersession (false).
     pub via_ack: bool,
 }
@@ -648,6 +652,8 @@ impl Scheduler {
             } else {
                 None
             };
+            let palette_bundled =
+                entry.codec == Codec::PalRle && entry.payload.first().is_some_and(|f| f & 1 != 0);
             resolved.push(ResolvedTileWork {
                 tile_x,
                 tile_y,
@@ -655,6 +661,7 @@ impl Scheduler {
                 pass: entry.pass_idx,
                 codec: entry.codec,
                 palette_id,
+                palette_bundled,
                 via_ack: false,
             });
             entry.state = WorkState::Superseded;
