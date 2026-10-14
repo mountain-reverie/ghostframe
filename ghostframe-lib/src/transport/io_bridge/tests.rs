@@ -5175,7 +5175,7 @@ async fn bwe_sample_send_time_is_not_the_wrapped_emit_clock() {
     let mut bridge = make_bridge_for_test().await;
     let base = super::now_std()
         .checked_sub(std::time::Duration::from_secs(80 * 60))
-        .expect("host uptime exceeds 80 minutes");
+        .expect("monotonic clock has 80 minutes of history");
     bridge.bwe_epoch = base;
     bridge.reliable_emitter.time_base = base;
 
@@ -5233,7 +5233,7 @@ async fn pending_loss_send_time_is_not_the_wrapped_emit_clock() {
     let mut bridge = make_bridge_for_test().await;
     let base = super::now_std()
         .checked_sub(std::time::Duration::from_secs(80 * 60))
-        .expect("host uptime exceeds 80 minutes");
+        .expect("monotonic clock has 80 minutes of history");
     bridge.bwe_epoch = base;
     bridge.reliable_emitter.time_base = base;
     let now = super::now_std();
@@ -5268,10 +5268,11 @@ async fn pending_loss_send_time_is_not_the_wrapped_emit_clock() {
     );
 }
 
-/// Before the wrap the widened stamp is exactly what the header carries, so the
+/// Before the wrap the widened stamp is exactly the emitter's stamp (whose low
+/// 32 bits are what the header carries; see the emitter's boundary tests), so the
 /// estimator's input for every session shorter than 71.6 minutes is unchanged.
 #[tokio::test]
-async fn pre_wrap_sample_send_time_equals_the_header_stamp() {
+async fn pre_wrap_sample_send_time_equals_the_emitted_stamp() {
     use crate::transport::ack::{AckBatch, AckEntry};
     let mut bridge = make_bridge_for_test().await;
     let now = super::now_std();

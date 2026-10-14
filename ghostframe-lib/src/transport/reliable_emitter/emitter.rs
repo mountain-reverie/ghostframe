@@ -1848,6 +1848,64 @@ mod tests {
         );
     }
 
+    /// The emit stamp is kept at full width: `EmittedDatagram::emit_us` is the
+    /// true microseconds since `time_base`, and the header carries its low 32
+    /// bits. Swept across the 2^32 boundary and a second wrap.
+    #[test]
+    fn emit_stamp_is_full_width_across_the_32_bit_wrap() {
+        const W: u64 = 1 << 32;
+        let now = Instant::now();
+        for elapsed_us in [0, 1, W - 1, W, W + 1, 2 * W - 1, 2 * W, 2 * W + 5] {
+            let base = now
+                .checked_sub(Duration::from_micros(elapsed_us))
+                .expect("monotonic clock has this much history");
+            let mut e = ReliableTileEmitter::new(base);
+            e.submit_one(
+                EmitKey::new(1, 0, 0, 0),
+                fake_source(1, 0, 0),
+                now,
+                None,
+                now,
+            );
+            let mut sender = CollectSender::default();
+            e.drain(&mut sender, now);
+            let sent = e.take_transmissions();
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0].emit_us, elapsed_us, "full width at {elapsed_us}");
+            let header = u32::from_be_bytes(sender.sent[0][12..16].try_into().unwrap());
+            assert_eq!(
+                header, elapsed_us as u32,
+                "header is the low 32 bits at {elapsed_us}"
+            );
+        }
+    }
+
+    /// A retransmission whose first transmission was before the wrap and whose
+    /// resend is after it: each carries its own time, and they are ordered.
+    #[test]
+    fn a_retransmit_straddling_the_wrap_keeps_both_send_times() {
+        const W: u64 = 1 << 32;
+        let now = Instant::now();
+        let first_us = W - 500;
+        let base = now.checked_sub(Duration::from_micros(first_us)).unwrap();
+        let mut e = ReliableTileEmitter::new(base);
+        let mut sender = CollectSender::default();
+        let key = EmitKey::new(1, 0, 0, 0);
+        e.submit_one(key, fake_source(1, 0, 0), now, None, now);
+        e.drain(&mut sender, now);
+        let later = now + Duration::from_millis(2); // 1.5 ms past the wrap
+        e.on_nack(&[(key, 0u8)], later);
+        e.tick(later, usize::MAX);
+        e.drain(&mut sender, later);
+        let sent = e.take_transmissions();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0].emit_us, first_us);
+        assert_eq!(sent[1].emit_us, first_us + 2_000);
+        assert!(sent[1].emit_us > W, "the resend is past the wrap");
+        let hdr1 = u32::from_be_bytes(sender.sent[1][12..16].try_into().unwrap());
+        assert_eq!(hdr1, (first_us + 2_000) as u32);
+    }
+
     /// Regression test for the `on_nack` mixed-clock hazard: `on_nack` used
     /// to stamp `last_sent_at` via a private `smoothed_rtt_clock_now()`
     /// stub that read the real wall clock (`Instant::now()`) instead of a
