@@ -17,7 +17,7 @@ jobs:
     name: fmt
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -27,7 +27,7 @@ jobs:
     name: packaging
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Pure bash: it sources packaging/install.sh and exercises its
       # mode-switch cleanup against a throwaway unit dir. No toolchain.
       - name: mode-switch cleanup
@@ -39,7 +39,7 @@ jobs:
     name: clippy
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/workflows/_setup-system-deps
       - uses: ./.github/workflows/_setup-go
       - uses: ./.github/workflows/_build-web-client
@@ -96,7 +96,7 @@ jobs:
     name: unit
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/workflows/_setup-system-deps
       - uses: ./.github/workflows/_setup-go
       - uses: ./.github/workflows/_build-web-client
@@ -147,7 +147,7 @@ jobs:
     name: build-release
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/workflows/_setup-system-deps
       - uses: ./.github/workflows/_setup-go
       - uses: ./.github/workflows/_build-web-client
@@ -161,20 +161,20 @@ jobs:
     name: web-client
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
       - name: Cache wasm-pack
         id: cache-wasm-pack
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cargo/bin/wasm-pack
           key: wasm-pack-0.15.0-${{ runner.os }}
       - name: Install wasm-pack
         if: steps.cache-wasm-pack.outputs.cache-hit != 'true'
         run: cargo install wasm-pack --version 0.15.0 --locked
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '20'
           cache: npm
@@ -186,7 +186,7 @@ jobs:
           npm run build
           npx tsc --noEmit
       - name: upload dist artifact for e2e.yml
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: web-client-dist
           path: ghostframe-web-client/dist/
@@ -197,7 +197,7 @@ jobs:
     name: cbindgen-check
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/workflows/_setup-system-deps
       - uses: ./.github/workflows/_setup-go
       - uses: ./.github/workflows/_build-web-client
@@ -233,7 +233,7 @@ jobs:
     name: go-vet
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/workflows/_setup-go
       - uses: ./.github/workflows/_build-web-client
       - working-directory: ghostbridge
