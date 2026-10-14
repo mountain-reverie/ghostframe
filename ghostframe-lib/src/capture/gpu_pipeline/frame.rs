@@ -3026,10 +3026,9 @@ fn read_dmabuf_tight(
         }
         // _IOW('b', 0, struct dma_buf_sync{u64 flags}); READ = 1, END = 4.
         // Ignored on failure: memfds (ENOTTY) and some exporters have no sync.
-        let sync = |end: bool| {
-            super::super::dmabuf::dmabuf_sync_read(fd, end);
-        };
-        sync(false);
+        let sync = |end: bool| super::super::dmabuf::dmabuf_sync_read(fd, end);
+        // No END after a failed START (memfds and some exporters have no sync).
+        let started = sync(false);
         let mut out = vec![0u8; (row as usize) * height as usize];
         for y in 0..height as usize {
             let src = (ptr as *const u8).add(y * stride as usize);
@@ -3039,7 +3038,9 @@ fn read_dmabuf_tight(
                 row as usize,
             );
         }
-        sync(true);
+        if started {
+            sync(true);
+        }
         libc::munmap(ptr, len);
         Ok(out)
     }
