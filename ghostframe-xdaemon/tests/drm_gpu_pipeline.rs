@@ -18,22 +18,79 @@ use ghostframe_lib::capture::gpu_pipeline::GpuFrameProcessor;
 use ghostframe_lib::encoder::h264_vaapi::FullFrameEncoder;
 use ghostframe_lib::transport::protocol::{decode_frame_datagram, fragment_frame};
 
+struct Card(std::fs::File);
+impl std::os::fd::AsFd for Card {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+impl drm::Device for Card {}
+impl drm::control::Device for Card {}
+
+/// (fd, width, height, stride, keep-alive owner of the card and buffer).
+type PatternedBuffer = (
+    std::os::fd::OwnedFd,
+    u32,
+    u32,
+    u32,
+    (Card, drm::control::dumbbuffer::DumbBuffer),
+);
+
+/// A dumb buffer that this test paints itself (a diagonal gradient plus
+/// stripes, so Y varies in both axes), exported as a PRIME fd. Used when the
+/// live scanout is blank, where the dma-buf-vs-CPU comparison would pass
+/// whatever the import did with strides. The live framebuffer is never
+/// written. The `Card` and buffer are returned so they outlive the fd's use.
+fn patterned_dumb_buffer() -> Option<PatternedBuffer> {
+    use drm::buffer::DrmFourcc;
+    use drm::control::Device as ControlDevice;
+    for i in 0..10u32 {
+        let Ok(f) = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(format!("/dev/dri/card{i}"))
+        else {
+            continue;
+        };
+        let card = Card(f);
+        let (w, h) = (1024u32, 768u32);
+        let Ok(mut db) = card.create_dumb_buffer((w, h), DrmFourcc::Xrgb8888, 32) else {
+            continue;
+        };
+        let stride = db.pitch();
+        {
+            let Ok(mut map) = card.map_dumb_buffer(&mut db) else {
+                continue;
+            };
+            let bytes: &mut [u8] = map.as_mut();
+            for y in 0..h as usize {
+                for x in 0..w as usize {
+                    let o = y * stride as usize + x * 4;
+                    bytes[o] = (x * 255 / w as usize) as u8;
+                    bytes[o + 1] = (y * 255 / h as usize) as u8;
+                    bytes[o + 2] = if (x / 32 + y / 32) % 2 == 0 {
+                        0xE0
+                    } else {
+                        0x20
+                    };
+                    bytes[o + 3] = 0;
+                }
+            }
+        }
+        use drm::buffer::Buffer;
+        let Ok(fd) = card.buffer_to_prime_fd(db.handle(), 0) else {
+            continue;
+        };
+        return Some((fd, w, h, stride, (card, db)));
+    }
+    None
+}
+
 /// Attempt DRM framebuffer capture using the drm crate directly.
 /// Returns (OwnedFd, width, height, stride) or None if no DRM device.
 fn try_drm_capture() -> Option<(std::os::fd::OwnedFd, u32, u32, u32)> {
     use drm::control::Device as ControlDevice;
-    use drm::Device;
     use std::fs::File;
-    use std::os::fd::{AsFd, BorrowedFd};
-
-    struct Card(File);
-    impl AsFd for Card {
-        fn as_fd(&self) -> BorrowedFd<'_> {
-            self.0.as_fd()
-        }
-    }
-    impl Device for Card {}
-    impl ControlDevice for Card {}
 
     for i in 0..10u32 {
         let path = format!("/dev/dri/card{i}");
@@ -108,6 +165,30 @@ fn drm_capture_to_gpu_pipeline() {
         }
     };
 
+    // A blank live scanout (a headless or VKMS host) makes the pixel check
+    // below vacuous, so paint a known pattern into a buffer of our own and
+    // run the same pipeline on that instead. Never write to the live one.
+    let live_is_blank = {
+        let raw = ghostframe_lib::capture::dmabuf::readback_dmabuf(
+            dmabuf_fd.as_raw_fd(),
+            width,
+            height,
+            stride,
+        )
+        .expect("mmap of the PRIME fd");
+        raw.iter().collect::<std::collections::HashSet<_>>().len() <= 1
+    };
+    let mut _own_buffer = None;
+    let (dmabuf_fd, width, height, stride) = if live_is_blank {
+        eprintln!("live framebuffer is blank: using a self-painted dumb buffer");
+        let (fd, w, h, st, keep) = patterned_dumb_buffer()
+            .expect("live scanout is blank and no dumb buffer could be created to replace it");
+        _own_buffer = Some(keep);
+        (fd, w, h, st)
+    } else {
+        (dmabuf_fd, width, height, stride)
+    };
+
     let raw_fd = dmabuf_fd.as_raw_fd();
 
     // 2. GPU dirty detection + NV12 conversion via Vulkan compute
@@ -177,6 +258,15 @@ fn drm_capture_to_gpu_pipeline() {
             "dma-buf import tile analysis != CPU reference"
         );
         let distinct = gpu_y.iter().collect::<std::collections::HashSet<_>>().len();
+        // A blank framebuffer converts to one flat Y value on both sides, so
+        // the equality checks above would pass whatever the import did with
+        // strides or offsets. Refuse to call that a pixel check.
+        assert!(
+            distinct > 1,
+            "the live framebuffer is blank ({distinct} distinct Y value): the \
+             dma-buf-vs-CPU pixel check is vacuous. Put something on the \
+             scanout (any window or desktop) and re-run."
+        );
         eprintln!(
             "pixel check: dma-buf import matches the CPU reference ({distinct} distinct Y values)"
         );
