@@ -17,7 +17,7 @@ jobs:
     outputs:
       conclusion: ${{ steps.run-tests.outcome }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: ./.github/workflows/_setup-system-deps
         with:
@@ -29,7 +29,7 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '20'
 
@@ -39,7 +39,7 @@ jobs:
 
       - name: Cache wasm-pack
         id: cache-wasm-pack
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cargo/bin/wasm-pack
           key: wasm-pack-0.15.0-${{ runner.os }}
@@ -47,7 +47,7 @@ jobs:
         if: steps.cache-wasm-pack.outputs.cache-hit != 'true'
         run: cargo install wasm-pack --version 0.15.0 --locked
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - name: Build web client
         working-directory: ghostframe-web-client
@@ -88,7 +88,7 @@ jobs:
 
       - name: Upload nextest report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: nightly-nextest-report
           path: target/nextest/
@@ -101,7 +101,7 @@ jobs:
     if: failure() || needs.e2e-sweep.outputs.conclusion == 'failure'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Open or comment on nightly-failure issue
         env:
           GH_TOKEN: ${{ github.token }}
