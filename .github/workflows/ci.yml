@@ -113,6 +113,11 @@ jobs:
       # the exemption lives here, by name prefix, and not in the tests: a
       # developer with a GPU must always see them run. Same rule as
       # ci/skip-list.txt, which is the e2e-only counterpart.
+      # Note `--lib` never reaches ghostframe-lib/tests/gpu_pipeline.rs (an
+      # integration test holding only `dmabuf_real_*` tests): that file runs
+      # in no CI job at all and is local-only, because hosted runners have no
+      # GPU or udmabuf. Run it by hand with
+      # `cargo test -p ghostframe-lib --test gpu_pipeline` on a GPU host.
       - run: cargo test --workspace --lib -- --skip dmabuf_real_
       # --lib skips binary crates entirely, so ghostframe-xdaemon's tests (the
       # display clamp, the capture resize logic) and codec_report's ran nowhere
