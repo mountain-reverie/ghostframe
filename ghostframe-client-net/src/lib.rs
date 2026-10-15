@@ -45,7 +45,8 @@ pub use event::{ClientNetError, ClientNetEvent, UdpOut};
 pub struct ClientNetConfig {
     /// SNI name presented in the TLS handshake.
     pub server_name: String,
-    /// The only certificate this client will accept, by SHA-256 of its DER.
+    /// The certificate this client will accept, by SHA-256 of its DER.
+    /// More can be allowed with [`ClientNet::with_extra_cert_pins`].
     pub server_cert_sha256: [u8; 32],
     pub indices_raw_enabled: bool,
     pub supports_h264: bool,
@@ -58,6 +59,8 @@ pub struct ClientNetConfig {
 
 pub struct ClientNet {
     config: ClientNetConfig,
+    /// Further acceptable certificate hashes (the server's successor cert).
+    extra_cert_pins: Vec<[u8; 32]>,
     connected: bool,
     /// The WebTransport CONNECT was accepted (status 200): datagrams may
     /// now flow both ways. Mirrors `WebTransportServer`'s own `connected`
@@ -100,6 +103,13 @@ pub struct ClientNet {
 }
 
 impl ClientNet {
+    /// Also accept these certificate hashes, besides `server_cert_sha256`.
+    /// The server publishes its current and next cert; pin both.
+    pub fn with_extra_cert_pins(mut self, pins: Vec<[u8; 32]>) -> Self {
+        self.extra_cert_pins = pins;
+        self
+    }
+
     /// `now_us` seeds `ClientCore`'s internal deadlines (assembly timeout,
     /// tail sweep, feedback cadence — see `ClientCore::new`); it is
     /// otherwise unused here (there is nothing else to schedule before
@@ -150,6 +160,7 @@ impl ClientNet {
         );
         Ok(Self {
             config,
+            extra_cert_pins: Vec::new(),
             connected: false,
             session_ready: false,
             pending_stream_out: Vec::new(),
@@ -174,7 +185,9 @@ impl ClientNet {
     pub fn connect(&mut self, remote: SocketAddr, now_us: u64) -> Result<(), ClientNetError> {
         let now = self.instant(now_us);
 
-        let verifier = Arc::new(tls::PinnedCertVerifier::new(self.config.server_cert_sha256));
+        let mut pins = vec![self.config.server_cert_sha256];
+        pins.extend_from_slice(&self.extra_cert_pins);
+        let verifier = Arc::new(tls::PinnedCertVerifier::with_hashes(pins));
         let provider = Arc::new(tls::pq_provider());
         let mut client_tls = rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()

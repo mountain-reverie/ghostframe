@@ -147,3 +147,25 @@ fn provider_prefers_the_hybrid_post_quantum_group() {
     // A classical fallback must remain for peers without the hybrid.
     assert!(p.kx_groups.iter().any(|g| g.name() == NamedGroup::X25519));
 }
+
+#[test]
+fn accepts_either_of_two_pinned_hashes() {
+    let (der_a, hash_a) = cert_expiring_in(5);
+    let (der_b, hash_b) = cert_expiring_in(5);
+    let (der_c, _) = cert_expiring_in(5);
+    let name = ServerName::try_from("localhost").unwrap();
+    let v = PinnedCertVerifier::with_hashes(vec![hash_a, hash_b]);
+    let ok = |der: &[u8]| {
+        v.verify_server_cert(
+            &CertificateDer::from(der.to_vec()),
+            &[],
+            &name,
+            &[],
+            UnixTime::now(),
+        )
+        .is_ok()
+    };
+    assert!(ok(&der_a));
+    assert!(ok(&der_b), "the successor cert must be accepted");
+    assert!(!ok(&der_c), "an unlisted cert must still be refused");
+}

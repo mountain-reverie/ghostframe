@@ -30,7 +30,7 @@
 //!
 //! So the transport-touching part ([`fetch_cert_hash`]) is now a thin shell
 //! that dials and configures the socket, and everything protocol-shaped
-//! lives in [`fetch_cert_hash_over`], which is generic over `Read + Write`.
+//! lives in [`fetch_cert_hashes_over`], which is generic over `Read + Write`.
 //! The tests below exercise keep-alive, missing `Content-Length`, non-200,
 //! truncation, oversized bodies and split reads against in-memory streams,
 //! with no network at all.
@@ -81,8 +81,11 @@ const MAX_RESPONSE_BYTES: usize = 8 * 1024;
 /// Fetch `/config.json` over the tailnet and pin the server certificate.
 ///
 /// Dials, configures the socket, and delegates the exchange to
-/// [`fetch_cert_hash_over`]. Everything testable lives there.
-pub fn fetch_cert_hash(bridge: &GhostbridgeHandle, host: &str) -> Result<[u8; 32], ClientError> {
+/// [`fetch_cert_hashes_over`]. Everything testable lives there.
+pub fn fetch_cert_hashes(
+    bridge: &GhostbridgeHandle,
+    host: &str,
+) -> Result<Vec<[u8; 32]>, ClientError> {
     let target = format!("{host}:{CONFIG_HTTP_PORT}");
     let stream = bridge.dial_tcp(&target)?;
 
@@ -94,17 +97,17 @@ pub fn fetch_cert_hash(bridge: &GhostbridgeHandle, host: &str) -> Result<[u8; 32
     stream.set_read_timeout(Some(READ_TIMEOUT))?;
     stream.set_write_timeout(Some(READ_TIMEOUT))?;
 
-    fetch_cert_hash_over(stream, host, Instant::now() + CONFIG_FETCH_TIMEOUT)
+    fetch_cert_hashes_over(stream, host, Instant::now() + CONFIG_FETCH_TIMEOUT)
 }
 
 /// The HTTP exchange, independent of any socket.
 ///
 /// `deadline` bounds the whole read loop, not each read.
-fn fetch_cert_hash_over<S: Read + Write>(
+fn fetch_cert_hashes_over<S: Read + Write>(
     mut stream: S,
     host: &str,
     deadline: Instant,
-) -> Result<[u8; 32], ClientError> {
+) -> Result<Vec<[u8; 32]>, ClientError> {
     let request = format!("GET /config.json HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     stream.write_all(request.as_bytes())?;
 
@@ -114,7 +117,7 @@ fn fetch_cert_hash_over<S: Read + Write>(
 
     let body_str = std::str::from_utf8(body)
         .map_err(|_| ClientError::Bootstrap("config.json body is not valid UTF-8".into()))?;
-    parse_cert_hash(body_str)
+    parse_cert_hashes(body_str)
 }
 
 /// Read one HTTP/1.1 response: headers, then exactly `Content-Length` body
@@ -266,16 +269,60 @@ fn parse_cert_hash(body: &str) -> Result<[u8; 32], ClientError> {
         .ok_or_else(|| ClientError::Bootstrap("config.json certHash is unterminated".into()))?;
     let hex = &tail[..close];
 
-    if hex.len() != 64 {
+    decode_hash(hex, "certHash")
+}
+
+fn decode_hash(hex: &str, what: &str) -> Result<[u8; 32], ClientError> {
+    if hex.len() != 64 || !hex.is_ascii() {
         return Err(ClientError::Bootstrap(format!(
-            "config.json certHash is {} hex chars, expected 64",
+            "config.json {what} is {} chars, expected 64 hex",
             hex.len()
         )));
     }
     let mut out = [0u8; 32];
     for (i, byte) in out.iter_mut().enumerate() {
         *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
-            .map_err(|_| ClientError::Bootstrap("config.json certHash is not valid hex".into()))?;
+            .map_err(|_| ClientError::Bootstrap(format!("config.json {what} is not valid hex")))?;
+    }
+    Ok(out)
+}
+
+/// Every hash the client may pin, current first: the `certHashes` array when
+/// the server sends one (current + next certificate), else just `certHash`.
+/// Any malformed element fails the whole parse: a half-trusted list is worse
+/// than none.
+fn parse_cert_hashes(body: &str) -> Result<Vec<[u8; 32]>, ClientError> {
+    let current = parse_cert_hash(body)?;
+    const KEY: &str = "\"certHashes\"";
+    let Some(key_pos) = body.find(KEY) else {
+        return Ok(vec![current]);
+    };
+    let after = &body[key_pos + KEY.len()..];
+    let open = after
+        .find('[')
+        .ok_or_else(|| ClientError::Bootstrap("config.json certHashes is not an array".into()))?;
+    let inner = &after[open + 1..];
+    let close = inner
+        .find(']')
+        .ok_or_else(|| ClientError::Bootstrap("config.json certHashes is unterminated".into()))?;
+    let mut out = Vec::new();
+    for item in inner[..close].split(',') {
+        let item = item.trim();
+        let hex = item
+            .strip_prefix('"')
+            .and_then(|r| r.strip_suffix('"'))
+            .ok_or_else(|| {
+                ClientError::Bootstrap("config.json certHashes element is not a string".into())
+            })?;
+        out.push(decode_hash(hex, "certHashes element")?);
+    }
+    if out.is_empty() {
+        return Ok(vec![current]);
+    }
+    // The scalar is the cert being served now; make sure it is pinned even
+    // if a server lists it elsewhere.
+    if !out.contains(&current) {
+        out.insert(0, current);
     }
     Ok(out)
 }
@@ -367,29 +414,29 @@ mod tests {
         // that sends a complete response and holds the socket open blocked
         // until timeout and discarded a reply it already had.
         let body = format!(r#"{{"certHash":"{HASH}"}}"#);
-        let got = fetch_cert_hash_over(FakeStream::new(&body, true), "h", far()).expect("fetch");
-        assert_eq!(got[0], 0x00);
-        assert_eq!(got[31], 0xff);
+        let got = fetch_cert_hashes_over(FakeStream::new(&body, true), "h", far()).expect("fetch");
+        assert_eq!(got[0][0], 0x00);
+        assert_eq!(got[0][31], 0xff);
     }
 
     #[test]
     fn closing_peer_also_works() {
         let body = format!(r#"{{"certHash":"{HASH}"}}"#);
-        assert!(fetch_cert_hash_over(FakeStream::new(&body, false), "h", far()).is_ok());
+        assert!(fetch_cert_hashes_over(FakeStream::new(&body, false), "h", far()).is_ok());
     }
 
     #[test]
     fn body_split_across_many_reads_is_reassembled() {
         let body = format!(r#"{{"certHash":"{HASH}"}}"#);
         let s = FakeStream::new(&body, true).in_slices_of(7);
-        assert!(fetch_cert_hash_over(s, "h", far()).is_ok());
+        assert!(fetch_cert_hashes_over(s, "h", far()).is_ok());
     }
 
     #[test]
     fn the_request_is_well_formed() {
         let body = format!(r#"{{"certHash":"{HASH}"}}"#);
         let mut s = FakeStream::new(&body, true);
-        let _ = fetch_cert_hash_over(&mut s, "myhost", far());
+        let _ = fetch_cert_hashes_over(&mut s, "myhost", far());
         let sent = String::from_utf8(s.written.clone()).expect("utf8");
         assert!(
             sent.starts_with("GET /config.json HTTP/1.1\r\n"),
@@ -405,7 +452,7 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{}",
             true,
         );
-        let err = fetch_cert_hash_over(s, "h", far()).expect_err("must fail");
+        let err = fetch_cert_hashes_over(s, "h", far()).expect_err("must fail");
         assert!(format!("{err}").contains("Content-Length"), "{err}");
     }
 
@@ -416,14 +463,14 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Length: 200\r\n\r\n{\"cert",
             false,
         );
-        let err = fetch_cert_hash_over(s, "h", far()).expect_err("must fail");
+        let err = fetch_cert_hashes_over(s, "h", far()).expect_err("must fail");
         assert!(format!("{err}").contains("truncated"), "{err}");
     }
 
     #[test]
     fn an_oversized_content_length_is_rejected_before_reading_it() {
         let s = FakeStream::raw("HTTP/1.1 200 OK\r\nContent-Length: 99999999\r\n\r\n", true);
-        let err = fetch_cert_hash_over(s, "h", far()).expect_err("must fail");
+        let err = fetch_cert_hashes_over(s, "h", far()).expect_err("must fail");
         assert!(format!("{err}").contains("cap"), "{err}");
     }
 
@@ -433,7 +480,7 @@ mod tests {
             "HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\n\r\n{}",
             false,
         );
-        let err = fetch_cert_hash_over(s, "h", far()).expect_err("must fail");
+        let err = fetch_cert_hashes_over(s, "h", far()).expect_err("must fail");
         assert!(format!("{err}").contains("404"), "{err}");
     }
 
@@ -444,7 +491,7 @@ mod tests {
             "HTTP/1.1 500 Error 200 something\r\nContent-Length: 2\r\n\r\n{}",
             false,
         );
-        let err = fetch_cert_hash_over(s, "h", far()).expect_err("must reject");
+        let err = fetch_cert_hashes_over(s, "h", far()).expect_err("must reject");
         assert!(format!("{err}").contains("500"), "{err}");
     }
 
@@ -452,7 +499,7 @@ mod tests {
     fn an_expired_deadline_fails_with_context() {
         let body = format!(r#"{{"certHash":"{HASH}"}}"#);
         let s = FakeStream::new(&body, true).in_slices_of(1);
-        let err = fetch_cert_hash_over(s, "h", Instant::now()).expect_err("must time out");
+        let err = fetch_cert_hashes_over(s, "h", Instant::now()).expect_err("must time out");
         let msg = format!("{err}");
         assert!(msg.contains("exceeded"), "{msg}");
         assert!(msg.contains("bytes"), "{msg}");
@@ -461,6 +508,28 @@ mod tests {
     /// The server now also sends `certHashes`; the native client must keep
     /// reading the current hash from `certHash`, not trip over the longer key
     /// that shares its prefix.
+    #[test]
+    fn parses_the_full_pin_list_current_first() {
+        let other = "ab".repeat(32);
+        let body = format!(r#"{{"certHash":"{HASH}","certHashes":["{HASH}","{other}"]}}"#);
+        let hs = parse_cert_hashes(&body).expect("parse");
+        assert_eq!(hs.len(), 2);
+        assert_eq!(hs[0][0], 0x00);
+        assert_eq!(hs[1][0], 0xab);
+    }
+
+    #[test]
+    fn legacy_body_without_the_list_pins_one_hash() {
+        let hs = parse_cert_hashes(&format!(r#"{{"certHash":"{HASH}"}}"#)).expect("parse");
+        assert_eq!(hs.len(), 1);
+    }
+
+    #[test]
+    fn a_malformed_list_element_fails_the_whole_parse() {
+        let body = format!(r#"{{"certHash":"{HASH}","certHashes":["{HASH}","zz"]}}"#);
+        assert!(parse_cert_hashes(&body).is_err());
+    }
+
     #[test]
     fn parses_current_hash_when_certhashes_list_is_present() {
         let other = "ab".repeat(32);

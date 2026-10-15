@@ -328,7 +328,10 @@ impl Client {
             }
         };
 
-        let cert_hash = bootstrap::fetch_cert_hash(&bridge, host)?;
+        // Current first, then the successor cert: a fetch just before a
+        // rotation must still connect.
+        let mut cert_hashes = bootstrap::fetch_cert_hashes(&bridge, host)?;
+        let cert_hash = cert_hashes.remove(0);
 
         let udp_fd = bridge.dial_udp(&format!("{host}:{port}"))?.into_raw_fd();
         // SAFETY: `into_raw_fd` just handed us sole ownership of a freshly
@@ -357,7 +360,7 @@ impl Client {
             supports_h264: self.effective_h264,
             display: self.config.display,
         };
-        let mut client_net = ClientNet::new(net_config, 0)?;
+        let mut client_net = ClientNet::new(net_config, 0)?.with_extra_cert_pins(cert_hashes);
         client_net.connect(remote, 0)?;
 
         // SAFETY: eventfd(2) with documented flags; the return value is
