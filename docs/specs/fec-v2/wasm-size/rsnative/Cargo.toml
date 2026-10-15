@@ -1,0 +1,9 @@
+[package]
+name = "rsnative"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+reed-solomon-simd = "=3.1.0"
+[profile.release]
+lto = true
+codegen-units = 1

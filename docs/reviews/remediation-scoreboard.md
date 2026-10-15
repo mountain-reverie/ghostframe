@@ -175,3 +175,26 @@ Owner decisions and items added 2026-10-15:
 - New stream after C7 merges: the native client (`ghostframe-client-gpu`) has the same paint-order fault, worse (Raw uploaded on arrival, CDF53 lifted last, H.264 blitted immediately, no `frame_seq` anywhere).
 - Design item, not scheduled: C7 orders paints within one rAF tick only. Late H.264 output and an old-`frame_seq` CDF53 retransmit can still repaint over newer tiles; closing it needs a last-painted sequence kept per tile across ticks.
 - `just lint-client` was broken on master by 2a0b373 (#159 fixes it); CI does not run that recipe.
+
+### FEC v2 and loss-adaptive repair (owner decisions 2026-10-15)
+
+Design: [`docs/specs/fec-v2/fec-v2-design.md`](../specs/fec-v2/fec-v2-design.md), built on C3's phase-1 study. Findings:
+- Most retransmission today is a transport defect, not missing FEC. In C3's lossy browserless scenes 86–98 % of retransmissions are RTO fires, 2.7–26 per datagram the network lost; a perfect FEC would avoid 4–34 % of them. The suspected cascade (quinn Cubic backoff, datagrams queued where quinn's RTT cannot see them, ledger horizon at 3x RTT, RTO deadline stuck at its 150 ms floor) fits the numbers but is not yet instrumented.
+- Tile XOR FEC recovers ≤0.8 % because ~11 tile datagrams share one QUIC packet; H.264 parity is sent and dropped by every client; there is no pre-FEC loss metric. FEC-rebuilt datagrams are ACKed under their original `wire_seq`, so the server's only loss rate is post-FEC.
+- Kyber (kymux) was read from source: unforked quinn with default Cubic, static mode choice, static 30 % RaptorQ per frame (minimum 2 repair symbols), no loss estimation or adaptive retransmission of its own.
+
+Owner decisions (all as recommended in the design):
+- Treat the retransmission storm as a transport defect; tile FEC work waits for WS-D1, with exit gate ≤1.2 retransmissions per lost datagram with FEC off.
+- Reconstruction first, everywhere FEC protects: the receiver closes each block's recovery window and only then sends `REPAIR_REQUEST(block, m)`, deadline-gated; the sender answers with new repair symbols, never re-sent sources, and runs no RTO on protected blocks beyond one last-resort timer for lost feedback. QUIC streams for refinement passes are rejected (quinn's stream recovery cannot see FEC).
+- Bundles sized to one QUIC packet are the fix for coalescing (one bundle = one packet = one FEC symbol = one ACK).
+- In-house GF(2^8) Cauchy RS whose first repair row is XOR (~5 KB gzip wasm), not `reed-solomon-simd` or RaptorQ; wasm SIMD decided in D3 after measurement.
+- One HELLO bit (bit 2) for all of FEC v2; legacy path kept two releases for old native clients.
+- Recovered counts as not received for the bandwidth estimator; parity is billed against the estimate.
+- Overhead: off below 0.3 % loss, capped at 25 %, none on refinement passes; H.264 frames get at least 2 repair symbols; redundancy chosen from loss, burst length and RTT relative to each class's deadline.
+- Accept higher repair latency under bursts at low RTT in exchange for no wasted repairs.
+
+Schedule:
+- Wave C: C3 PRs 1–3 (client decoder duplicate fix, client consumes the existing H.264 parity, tile FEC off by default after C4 and an A/B with large datagrams), C3-M (measurement only: pre-FEC loss and burst counters, `datagrams_recovered_fec`, quinn path stats, spurious RTOs, retransmission causes), C3-W (`congestionControl: "low-latency"` in the web client).
+- C4: per-fragment retransmit cache and ACKs for Raw.
+- WS-D1: RTO/ledger fixes plus a per-class timer and ledger-timeout hook (no behaviour change).
+- New stream D3 "fec-v2" after D1: formats and codec, client (recovery window, repair request), server bundling, FEC emission with the last-resort timer, RTT-dependent adaptation table, delete the legacy path. H.264 per-frame RS needs only the codec PR and can pair with C5.
