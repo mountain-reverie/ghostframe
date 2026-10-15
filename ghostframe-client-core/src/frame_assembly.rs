@@ -11,6 +11,9 @@
 //! pipeline, so it cannot grow unboundedly under a flood of distinct
 //! `frame_seq` values.
 
+use std::collections::HashMap;
+
+use ghostframe_protocol::fec::decode_parity_payload;
 use ghostframe_protocol::protocol::{decode_frame_datagram, FrameHeader};
 
 use crate::event::Event;
@@ -23,6 +26,85 @@ pub(crate) struct FrameAssembly {
     pub received: usize,
     /// Payload bytes buffered so far (bounded by `MAX_H264_ACCESS_UNIT_BYTES`).
     pub bytes: usize,
+    /// XOR parities held for groups that still have a fragment missing,
+    /// keyed by `group_start`: `(group_len, xor)`. Kept so a source that
+    /// arrives after its parity can still complete the group; dropped as soon
+    /// as the group is complete. NOT charged to `bytes`: parity must never be
+    /// able to push a real frame over the access-unit budget. Bounded by
+    /// count (see `MAX_XOR_GROUP`, and the per-frame cap at the call site).
+    pub parities: HashMap<u16, (u8, Vec<u8>)>,
+}
+
+/// Largest XOR group the client will read. The server uses 2 and 5; the cap
+/// bounds the per-fragment parity lookup.
+const MAX_XOR_GROUP: u8 = 16;
+
+fn group_missing(asm: &FrameAssembly, group_start: u16, group_len: u8) -> usize {
+    let (start, end) = (
+        group_start as usize,
+        group_start as usize + group_len as usize,
+    );
+    if end > asm.fragments.len() {
+        return 0;
+    }
+    asm.fragments[start..end]
+        .iter()
+        .filter(|f| f.is_none())
+        .count()
+}
+
+/// Rebuild the one missing fragment of `group_start..group_start+group_len`
+/// from the group's XOR parity, if exactly one is missing. Returns the index
+/// of the fragment rebuilt.
+///
+/// Every source but the frame's last is full-size, so the parity (as long as
+/// the group's longest source) is the missing fragment's exact length. The
+/// last fragment is short and comes back zero-padded; a NAL ends in a
+/// non-zero byte (RBSP stop bit, or an emulation-prevention 0x03), so its
+/// trailing zeros are padding and are stripped.
+fn recover_group(
+    asm: &mut FrameAssembly,
+    group_start: u16,
+    group_len: u8,
+    xor: &[u8],
+) -> Option<usize> {
+    let start = group_start as usize;
+    let end = start + group_len as usize;
+    if !(2..=MAX_XOR_GROUP).contains(&group_len) || end > asm.fragments.len() {
+        return None;
+    }
+    let mut missing = None;
+    for i in start..end {
+        if asm.fragments[i].is_none() {
+            if missing.is_some() {
+                return None;
+            }
+            missing = Some(i);
+        }
+    }
+    let missing = missing?;
+    let mut out = xor.to_vec();
+    for f in asm.fragments[start..end].iter().flatten() {
+        // A source longer than the parity cannot belong to this group.
+        if f.len() > out.len() {
+            return None;
+        }
+        for (o, b) in out.iter_mut().zip(f) {
+            *o ^= b;
+        }
+    }
+    if missing == asm.fragments.len() - 1 {
+        while out.last() == Some(&0) {
+            out.pop();
+        }
+    }
+    if out.is_empty() || asm.bytes + out.len() > MAX_H264_ACCESS_UNIT_BYTES {
+        return None;
+    }
+    asm.bytes += out.len();
+    asm.fragments[missing] = Some(out);
+    asm.received += 1;
+    Some(missing)
 }
 
 impl ClientCore {
@@ -43,6 +125,47 @@ impl ClientCore {
         if fh.frame_seq < self.latest_full_frame_seq.saturating_sub(2) {
             return;
         }
+        // XOR parity (frag_idx == frag_total) is handled before anything that
+        // moves `latest_full_frame_seq` or evicts: it carries no frame data of
+        // its own and must never be able to advance the window and so drop
+        // real frames. It only helps a frame that already has an assembly
+        // (parity follows its sources); anything else is ignored.
+        if fh.is_parity() {
+            if fh.frag_idx != fh.frag_total {
+                return; // a different parity scheme: not ours to read
+            }
+            let Some((group_start, group_len, xor)) = decode_parity_payload(payload) else {
+                return;
+            };
+            let Some(asm) = self.frame_assemblies.get_mut(&fh.frame_seq) else {
+                return;
+            };
+            if fh.frag_total as usize != asm.fragments.len() {
+                return;
+            }
+            // Bound what a hostile peer can park here: one parity per group,
+            // at most one per two fragments.
+            if asm.parities.contains_key(&group_start)
+                || asm.parities.len() > asm.fragments.len() / 2
+            {
+                return;
+            }
+            if recover_group(asm, group_start, group_len, xor).is_some() {
+                self.h264_fragments_recovered += 1;
+            } else if group_missing(asm, group_start, group_len) > 0
+                && (2..=MAX_XOR_GROUP).contains(&group_len)
+            {
+                // Two or more missing: wait for a late source. A complete
+                // group (nothing missing) has nothing to wait for.
+                asm.parities.insert(group_start, (group_len, xor.to_vec()));
+            }
+            self.finish_frame_if_complete(fh.frame_seq, events);
+            return;
+        }
+        if fh.frag_idx >= fh.frag_total {
+            return;
+        }
+
         if fh.frame_seq > self.latest_full_frame_seq {
             self.latest_full_frame_seq = fh.frame_seq;
         }
@@ -59,11 +182,6 @@ impl ClientCore {
             self.frame_assemblies.remove(&seq);
         }
 
-        // Skip parity fragments: this crate does not do FEC recovery for
-        // H.264 frames, just drops parity (frag_idx >= frag_total).
-        if fh.is_parity() {
-            return;
-        }
         // A frag_total of 0 is malformed (no valid fragment index can ever
         // satisfy frag_idx < frag_total); drop defensively.
         if fh.frag_total == 0 {
@@ -83,6 +201,7 @@ impl ClientCore {
                 fragments: vec![None; fh.frag_total as usize],
                 received: 0,
                 bytes: 0,
+                parities: HashMap::new(),
             });
 
         let fi = fh.frag_idx as usize;
@@ -97,10 +216,35 @@ impl ClientCore {
             asm.bytes += payload.len();
             asm.fragments[fi] = Some(payload.to_vec());
             asm.received += 1;
+            // A parity that arrived earlier may now have exactly one missing.
+            for g in fi.saturating_sub(MAX_XOR_GROUP as usize - 1)..=fi {
+                let Ok(g16) = u16::try_from(g) else { break };
+                let Some(&(l, _)) = asm.parities.get(&g16) else {
+                    continue;
+                };
+                if fi >= g + l as usize {
+                    continue;
+                }
+                let Some((_, xor)) = asm.parities.remove(&g16) else {
+                    continue;
+                };
+                if recover_group(asm, g16, l, &xor).is_some() {
+                    self.h264_fragments_recovered += 1;
+                } else if group_missing(asm, g16, l) > 0 {
+                    asm.parities.insert(g16, (l, xor));
+                }
+            }
         }
+        self.finish_frame_if_complete(fh.frame_seq, events);
+    }
 
-        if asm.received == asm.fragments.len() {
-            let asm = match self.frame_assemblies.remove(&fh.frame_seq) {
+    fn finish_frame_if_complete(&mut self, frame_seq: u32, events: &mut Vec<Event>) {
+        let complete = self
+            .frame_assemblies
+            .get(&frame_seq)
+            .is_some_and(|a| a.received == a.fragments.len());
+        if complete {
+            let asm = match self.frame_assemblies.remove(&frame_seq) {
                 Some(a) => a,
                 None => return,
             };

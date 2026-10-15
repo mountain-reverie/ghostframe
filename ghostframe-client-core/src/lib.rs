@@ -272,6 +272,8 @@ pub struct ClientCore {
     /// H.264 frame-level reassembly state (keyed by `frame_seq`).
     pub(crate) frame_assemblies: HashMap<u32, FrameAssembly>,
     pub(crate) latest_full_frame_seq: u32,
+    /// H.264 fragments rebuilt from XOR parity (cumulative).
+    pub(crate) h264_fragments_recovered: u64,
     /// Coverage NACKs awaiting the debounce window before being handed to
     /// `nack_batcher` (main.ts `pendingNacks` / `queuePassNack`).
     pub(crate) pending_nacks: HashMap<(u8, u8, u8), PendingNack>,
@@ -316,6 +318,7 @@ impl ClientCore {
             stale_pending: false,
             frame_assemblies: HashMap::new(),
             latest_full_frame_seq: 0,
+            h264_fragments_recovered: 0,
             pending_nacks: HashMap::new(),
             pending_nack_deadline_us: None,
             next_tail_sweep_us: now_us + TAIL_SWEEP_INTERVAL_US,
@@ -384,6 +387,11 @@ impl ClientCore {
             deadline = deadline.min(s);
         }
         Some(deadline)
+    }
+
+    /// H.264 fragments rebuilt from XOR parity since the core was created.
+    pub fn h264_fragments_recovered(&self) -> u64 {
+        self.h264_fragments_recovered
     }
 
     /// Reassembly occupancy, for diagnostics and tests.
