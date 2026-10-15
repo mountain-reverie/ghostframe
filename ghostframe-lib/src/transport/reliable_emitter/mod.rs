@@ -43,16 +43,12 @@ pub const FEC_PARITY_PER_GROUP_R: usize = 1;
 pub const PARITY_INTERLEAVE_OFFSET: u32 = (2 * FEC_GROUP_SIZE_K) as u32;
 pub const END_OF_STREAM_PARITY_FLUSH_MS: u64 = 5;
 pub const RTO_BACKOFF_FACTOR: u32 = 2;
-// Sized for the first-paint burst: at 1920×1080 with 32×32 tiles the
-// worst case is ~2040 dirty tiles × 14 cdf53 passes ≈ 28 K tile-passes
-// submitted before any ACK can return. The original 8 K cap was a guess
-// that fit a typical *post-paint* working set but undersized the burst —
-// at 48 % wire loss on evangeline the LRU evicted ~16 K entries before
-// they could retry, so half the first-paint burst saw exactly one
-// emission attempt with no retransmit coverage. Bumped to 32 K so the
-// whole first-paint burst stays cached for indefinite retransmits.
-// Memory cost: ~500 B/entry × 32 K = ~16 MB per session, well below
-// any realistic ceiling.
+// Historical sizing of the retransmit cache, kept only as the scale the cache
+// tests exercise. The cache no longer has a capacity: an LRU bound of 8 K
+// evicted ~16 K entries of a first-paint burst at 48 % wire loss and left
+// half of it with no retransmit coverage, it was raised to 32 K, and the LRU
+// was then deleted because it never evicted. A first-paint burst at 1080p is
+// ~2040 tiles x 14 cdf53 passes ~= 28 K tile-passes (~500 B each, ~16 MB).
 pub const CACHE_CAPACITY: usize = 32768;
 
 /// Gate for the acknowledgement-ordering measurement.

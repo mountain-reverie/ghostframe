@@ -404,10 +404,6 @@ mod tests {
             c.insert(k, mk_entry(now));
         }
         assert_eq!(c.len(), target);
-        assert_eq!(
-            c.stats.lru_eviction, 0,
-            "no LRU eviction — entries stay until cancel/clear"
-        );
         // The very first inserted entry must still be present.
         let first = EmitKey {
             frame_seq: 0,

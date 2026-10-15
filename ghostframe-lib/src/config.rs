@@ -502,9 +502,9 @@ impl LibConfig {
 /// explicit config and is what the tests drive.
 ///
 /// There is deliberately no cache-capacity field: `RetransmitCache` is
-/// unbounded by design (an un-ACKed tile-pass is never dropped), and its
-/// `CACHE_CAPACITY` only sizes a vestigial LRU that never evicts an entry, so
-/// a knob for it would read from the environment and change nothing.
+/// unbounded by design (an un-ACKed tile-pass is never dropped) and has no
+/// capacity at all, so a knob for one would read from the environment and
+/// change nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EmitterConfig {
     /// `GHOSTFRAME_RTO_BACKOFF_MAX_MS` (default 5000). Any value `> 0`.

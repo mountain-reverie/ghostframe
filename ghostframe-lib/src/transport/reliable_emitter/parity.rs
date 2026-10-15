@@ -26,7 +26,7 @@ pub struct GroupBuilder {
     first_wire_seq: Option<u32>,
     last_wire_seq: Option<u32>,
     source_lens: Vec<u16>,
-    sources: Vec<Bytes>,
+    pub(crate) sources: Vec<Bytes>,
 }
 
 impl GroupBuilder {
@@ -98,6 +98,15 @@ pub fn xor_payloads(sources: &[&[u8]]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_group_holds_the_callers_allocation_not_a_copy() {
+        let mut g = GroupBuilder::new(3);
+        let src = Bytes::from(vec![7u8; 32]);
+        let ptr = src.as_ptr();
+        assert!(g.add(0, src).is_none());
+        assert_eq!(g.sources[0].as_ptr(), ptr);
+    }
 
     #[test]
     fn xor_of_two_equal_length_buffers_recovers_either() {
