@@ -1,0 +1,80 @@
+packets=60000 datagrams/packet(unbundled)=11; delay in packet slots
+scheme                     model     resid  recov  d_p50  d_p95
+none                       iid1     0.0093      -      -      -
+xor10_dg (today)           iid1     0.0093  0.000    nan    nan
+xor10_dg_s12 (C3)          iid1     0.0008  0.918    6.2   11.6
+bundle_xor10 (10%)         iid1     0.0008  0.911    5.0   10.0
+bundle_xor5 (20%)          iid1     0.0005  0.948    3.0    5.0
+bundle_rs20_2 (10%)        iid1     0.0001  0.994   11.0   19.0
+bundle_rs10_2 (20%)        iid1     0.0000  0.998    5.0   10.0
+bundle_rs20_4 (20%)        iid1     0.0000  1.000   11.0   20.0
+bundle_rs10_2_d4 (20%)     iid1     0.0000  1.000   24.0   40.0
+bundle_rs10_2_d8 (20%)     iid1     0.0000  1.000   40.0   80.0
+bundle_rlc_w30_r10 (10%)   iid1     0.0000  1.000    7.0   17.0
+bundle_rlc_w20_r5 (20%)    iid1     0.0000  1.000    4.0    8.0
+
+none                       iid2     0.0195      -      -      -
+xor10_dg (today)           iid2     0.0195  0.000    nan    nan
+xor10_dg_s12 (C3)          iid2     0.0038  0.800    7.3   11.6
+bundle_xor10 (10%)         iid2     0.0034  0.829    5.0   10.0
+bundle_xor5 (20%)          iid2     0.0019  0.901    3.0    5.0
+bundle_rs20_2 (10%)        iid2     0.0012  0.940   11.0   20.0
+bundle_rs10_2 (20%)        iid2     0.0004  0.977    6.0   10.0
+bundle_rs20_4 (20%)        iid2     0.0001  0.996   11.0   20.0
+bundle_rs10_2_d4 (20%)     iid2     0.0003  0.983   24.0   40.0
+bundle_rs10_2_d8 (20%)     iid2     0.0001  0.994   48.0   80.0
+bundle_rlc_w30_r10 (10%)   iid2     0.0001  0.994    8.0   22.0
+bundle_rlc_w20_r5 (20%)    iid2     0.0000  1.000    4.0   11.0
+
+none                       iid5     0.0499      -      -      -
+xor10_dg (today)           iid5     0.0499  0.000    nan    nan
+xor10_dg_s12 (C3)          iid5     0.0202  0.596    6.2   11.6
+bundle_xor10 (10%)         iid5     0.0200  0.600    6.0   10.0
+bundle_xor5 (20%)          iid5     0.0114  0.771    3.0    5.0
+bundle_rs20_2 (10%)        iid5     0.0142  0.715   11.0   20.0
+bundle_rs10_2 (20%)        iid5     0.0057  0.884    6.0   10.0
+bundle_rs20_4 (20%)        iid5     0.0015  0.970   12.0   20.0
+bundle_rs10_2_d4 (20%)     iid5     0.0049  0.902   24.0   40.0
+bundle_rs10_2_d8 (20%)     iid5     0.0049  0.901   48.0   80.0
+bundle_rlc_w30_r10 (10%)   iid5     0.0068  0.864   10.0   43.0
+bundle_rlc_w20_r5 (20%)    iid5     0.0002  0.996    5.0   17.0
+
+none                       ge2_b3   0.0200      -      -      -
+xor10_dg (today)           ge2_b3   0.0200  0.000    nan    nan
+xor10_dg_s12 (C3)          ge2_b3   0.0170  0.142    7.3   11.6
+bundle_xor10 (10%)         ge2_b3   0.0176  0.127    6.0   10.0
+bundle_xor5 (20%)          ge2_b3   0.0171  0.141    4.0    5.0
+bundle_rs20_2 (10%)        ge2_b3   0.0157  0.237   12.0   20.0
+bundle_rs10_2 (20%)        ge2_b3   0.0144  0.273    7.0   11.0
+bundle_rs20_4 (20%)        ge2_b3   0.0096  0.521   14.0   22.0
+bundle_rs10_2_d4 (20%)     ge2_b3   0.0029  0.860   20.0   40.0
+bundle_rs10_2_d8 (20%)     ge2_b3   0.0008  0.962   48.0   80.0
+bundle_rlc_w30_r10 (10%)   ge2_b3   0.0124  0.386   20.0   33.0
+bundle_rlc_w20_r5 (20%)    ge2_b3   0.0086  0.570   15.0   26.0
+
+none                       ge5_b3   0.0512      -      -      -
+xor10_dg (today)           ge5_b3   0.0512  0.000    nan    nan
+xor10_dg_s12 (C3)          ge5_b3   0.0448  0.125    7.3   11.6
+bundle_xor10 (10%)         ge5_b3   0.0451  0.114    7.0   10.0
+bundle_xor5 (20%)          ge5_b3   0.0440  0.141    4.0    5.0
+bundle_rs20_2 (10%)        ge5_b3   0.0400  0.219   12.0   21.0
+bundle_rs10_2 (20%)        ge5_b3   0.0376  0.266    7.0   11.0
+bundle_rs20_4 (20%)        ge5_b3   0.0269  0.477   12.0   21.0
+bundle_rs10_2_d4 (20%)     ge5_b3   0.0135  0.736   24.0   40.0
+bundle_rs10_2_d8 (20%)     ge5_b3   0.0065  0.873   48.0   80.0
+bundle_rlc_w30_r10 (10%)   ge5_b3   0.0347  0.319   21.0   39.0
+bundle_rlc_w20_r5 (20%)    ge5_b3   0.0238  0.535   15.0   27.0
+
+none                       ge2_b8   0.0198      -      -      -
+xor10_dg (today)           ge2_b8   0.0198  0.000    nan    nan
+xor10_dg_s12 (C3)          ge2_b8   0.0189  0.043   11.6   11.6
+bundle_xor10 (10%)         ge2_b8   0.0194  0.024    6.0   10.0
+bundle_xor5 (20%)          ge2_b8   0.0188  0.049    5.0    5.0
+bundle_rs20_2 (10%)        ge2_b8   0.0190  0.046   14.0   21.0
+bundle_rs10_2 (20%)        ge2_b8   0.0182  0.075   10.0   11.0
+bundle_rs20_4 (20%)        ge2_b8   0.0164  0.168   15.0   22.0
+bundle_rs10_2_d4 (20%)     ge2_b8   0.0111  0.410   24.0   40.0
+bundle_rs10_2_d8 (20%)     ge2_b8   0.0056  0.707   48.0   80.0
+bundle_rlc_w30_r10 (10%)   ge2_b8   0.0184  0.076   20.0   33.0
+bundle_rlc_w20_r5 (20%)    ge2_b8   0.0164  0.169   20.0   27.0
+
