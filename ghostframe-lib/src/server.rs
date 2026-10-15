@@ -120,19 +120,14 @@ impl GhostframeServer {
         if let Some(bridge_handle) = bridge.ghostbridge() {
             // Publish every hash a client may need to pin (current + next),
             // and keep the list fresh as the certificate rotates.
-            let schedule = crate::transport::quic::active_cert_schedule();
-            let initial = schedule
-                .as_ref()
-                .map(|s| s.hashes_hex())
-                .unwrap_or_else(|| vec![cert_hash.clone()]);
+            let schedule = bridge.cert_schedule();
+            let initial = schedule.hashes_hex();
             bridge_handle.start_web_server(&initial.join(","))?;
-            if let Some(schedule) = schedule {
-                cert_task = Some(tokio::spawn(publish_cert_hashes(
-                    schedule,
-                    bridge_handle.cert_hash_publisher(),
-                    initial,
-                )));
-            }
+            cert_task = Some(tokio::spawn(publish_cert_hashes(
+                schedule,
+                bridge_handle.cert_hash_publisher(),
+                initial,
+            )));
             // Stable readiness signal: emitted only after the :80 + :443
             // listeners are bound on tsnet. The e2e harness greps for this
             // line; production operators see it as confirmation the daemon
