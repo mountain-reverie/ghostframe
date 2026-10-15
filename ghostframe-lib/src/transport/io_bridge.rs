@@ -38,7 +38,8 @@ use crate::transport::fec;
 use crate::transport::fec::fec_group_size;
 use crate::transport::feedback::ReceiverFeedback;
 use crate::transport::ghostbridge::{
-    encode_frame, parse_frame_rest, GhostbridgeConfig, GhostbridgeHandle, MAX_FRAME_LEN,
+    encode_frame, encode_frame_append, parse_frame_rest, GhostbridgeConfig, GhostbridgeHandle,
+    MAX_FRAME_LEN,
 };
 use crate::transport::protocol::{
     build_frame_parity_datagram, fragment_frame, fragment_tile, max_fec_frame_fragment_payload,
@@ -166,6 +167,9 @@ fn now_std_impl() -> std::time::Instant {
 /// Sized above a 1500-byte MTU with headroom for ECN/padding; quinn-proto may
 /// write a full datagram into this buffer in a single call.
 const QUIC_SCRATCH: usize = 2048;
+
+/// `drain_outbound` flushes its gathered frames once they reach this size.
+const OUTBOUND_BATCH_BYTES: usize = 64 * 1024;
 
 // Period (in frames) between cumulative-emit log lines. 60 frames ≈ 2 s
 // at the daemon's 30 fps capture rate, which is the same cadence as
@@ -1871,9 +1875,15 @@ impl IoBridge {
     }
 
     /// Write all pending outbound QUIC transmits back to ghostbridge.
+    ///
+    /// Frames are gathered into one buffer and written in chunks of up to
+    /// `OUTBOUND_BATCH_BYTES`, not one `write` syscall per packet: a full-screen
+    /// frame is thousands of packets. The bytes on the socket are the same, in
+    /// the same order.
     async fn drain_outbound(&mut self) -> io::Result<()> {
         let now = now_std();
         let mut buf: Vec<u8> = Vec::with_capacity(QUIC_SCRATCH);
+        let mut batch: Vec<u8> = Vec::new();
 
         loop {
             buf.clear();
@@ -1882,10 +1892,16 @@ impl IoBridge {
                 Some(transmit) => {
                     let payload = &buf[..transmit.size];
                     tracing::trace!(size = transmit.size, dst = %transmit.destination, "outbound transmit");
-                    let frame = encode_frame(payload, &transmit.destination);
-                    self.stream.write_all(&frame).await?;
+                    encode_frame_append(&mut batch, payload, &transmit.destination);
+                    if batch.len() >= OUTBOUND_BATCH_BYTES {
+                        self.stream.write_all(&batch).await?;
+                        batch.clear();
+                    }
                 }
             }
+        }
+        if !batch.is_empty() {
+            self.stream.write_all(&batch).await?;
         }
 
         Ok(())
