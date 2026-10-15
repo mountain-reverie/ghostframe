@@ -498,12 +498,12 @@ impl IoBridge {
                 &work.payload,
                 max_frag,
             );
-            // Record fragment coverage (legacy path — retained alongside
-            // the new emitter pipeline for Task 25; Task 28 deletes).
-            // Sub-option (a) per spec: only the FINAL fragment carries
-            // the tile entry; intermediate fragments contribute nothing
-            // (client can't usefully process the tile until assembly
-            // completes anyway).
+            // Record fragment coverage: one record per tile-pass (not per
+            // fragment), keyed (frame_seq, tile, pass). It is kept
+            // alongside the retransmit cache on purpose, not as a
+            // leftover: it outlives the cache entry after supersession,
+            // `retire_stuck` and `clear_cache`, and late ACKs read it
+            // (see the `fragment_coverage` module docs).
             let n = datagrams.len();
             // Declared outside the `if n > 0` block so that the per-tier
             // byte counters below (Phase 1 Task 6) can read it after the

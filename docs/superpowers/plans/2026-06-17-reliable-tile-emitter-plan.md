@@ -4,7 +4,7 @@
 
 **Goal:** Add a codec-agnostic loss-recovery layer (`ReliableTileEmitter`) between the scheduler and WebTransport transport that absorbs the ~44 % UDP loss observed on the evangeline tailnet via per-emission-batch XOR FEC parity plus ACK/NACK/RTO-driven retransmission.
 
-**Architecture:** New module `ghostframe-lib/src/transport/reliable_emitter.rs` owns retransmit cache, FEC parity emission, RTO timer wheel, and ACK/NACK handling. The scheduler keeps its prioritization role; the emitter wraps emission. Source datagrams carry a new `wire_seq` field; two new envelope types (`0x04 TILE_PARITY`, `0x05 TILE_NACK`) added. Existing `fragment_coverage.rs` is fully replaced and deleted. Client mirrors with `parity_decoder.ts` + `nack.ts`.
+**Architecture:** New module `ghostframe-lib/src/transport/reliable_emitter.rs` owns retransmit cache, FEC parity emission, RTO timer wheel, and ACK/NACK handling. The scheduler keeps its prioritization role; the emitter wraps emission. Source datagrams carry a new `wire_seq` field; two new envelope types (`0x04 TILE_PARITY`, `0x05 TILE_NACK`) added. Existing `fragment_coverage.rs` is fully replaced and deleted. *(Superseded 2026-10: the module is kept, Task 28 is withdrawn; see the design spec §8.4.)* Client mirrors with `parity_decoder.ts` + `nack.ts`.
 
 **Tech Stack:** Rust (cargo, tokio, quinn-proto, lru, proptest, smallvec), TypeScript (vitest), Docker e2e harness.
 
@@ -3330,6 +3330,13 @@ concern."
 ---
 
 ### Task 28: Delete `fragment_coverage.rs` and its callers
+
+> **Withdrawn (2026-10).** Not executed and not to be executed as written.
+> Coverage holds ACK metadata that must outlive the retransmit cache entry
+> in five cases (dirty supersession, Cdf53 commit, stuck retirement,
+> session loss, eviction). Deleting it, or moving its metadata onto
+> `CacheEntry`, changes what a late ACK does in each of them. See the design
+> spec §8.4 and `io_bridge/coverage_pin_tests.rs`.
 
 **Files:**
 - Delete: `ghostframe-lib/src/transport/fragment_coverage.rs`

@@ -11,29 +11,50 @@
 //! See `docs/superpowers/specs/2026-06-01-m3.3d-datagram-level-ack-design.md`
 //! for the design rationale.
 //!
-//! ## DEFERRED RETIREMENT
+//! ## Why this is not retired into the retransmit cache
 //!
-//! Tasks 25-27 migrated the per-emission *retransmit cache* role of this
-//! module to `ReliableTileEmitter::RetransmitCache`. What remains here is
-//! the per-(frame_seq, tile, pass) **metadata sidecar** that
-//! `dispatch_ack_datagram` consumes on ACK: each entry carries
-//! `(codec, palette_id, generation)` which drive
-//! `scheduler.mark_acked`, `scheduler.record_cdf53_ack`,
-//! `palette_table.delivered`, and `palette_table.release` /
-//! `in_flight_carrying`.
+//! Tasks 25-27 moved the *retransmit* role (fragment bytes, RTO, NACK) to
+//! `ReliableTileEmitter::RetransmitCache`. This module keeps the
+//! per-emission **ACK metadata**: `(codec, generation, pass_idx,
+//! palette_id, palette_bundled)`. `apply_ack_coverage` (`ack_dispatch.rs`)
+//! consumes it to drive `scheduler.mark_acked`,
+//! `scheduler.record_cdf53_ack`, `palette_table.delivered`, and the
+//! bundled-palette `in_flight_carrying` / `release` pair.
 //!
-//! `CacheEntry` in the emitter only stores raw fragment bytes — it has
-//! no equivalent sidecar today. Full retirement therefore requires:
-//!   1. Widen `CacheEntry` with `codec: Codec`, `palette_id: Option<u8>`,
-//!      `generation: u8`.
-//!   2. Plumb those fields through `submit_one` / `submit_batch` from
-//!      every caller in `drain_scheduler_into_quinn`.
-//!   3. Have `dispatch_ack_datagram` consume the metadata from
-//!      `RetransmitCache::remove(&key)` instead of `fragment_coverage.take()`.
-//!   4. Delete this module + its callers.
+//! An earlier version of this comment described a four-step retirement
+//! (widen `CacheEntry` with this metadata and consume it from
+//! `RetransmitCache::remove`). That plan is withdrawn. A coverage record is
+//! **not** a mirror of the cache entry: it outlives it in five cases.
 //!
-//! Tracked as a follow-up to Task 28 in the implementation plan; see
-//! `docs/superpowers/plans/2026-06-17-reliable-tile-emitter-plan.md`.
+//! 1. Dirty-path supersession: `cancel_for_tile` drops the tile's cache
+//!    entries, `drop_cdf53_for_tile` drops only Cdf53 coverage. PalRle,
+//!    Solid and Raw records survive; PalRle ones are unbundled by
+//!    `unbundle_palrle_for_tile`.
+//! 2. Cdf53 commit (`commit_tile_to_cdf53` -> `enqueue_cdf53_generation`):
+//!    `cancel_for_tile` only. All coverage for the tile survives.
+//! 3. Stuck-entry retirement (`retire_stuck`): cache only, until the
+//!    forced re-dirty supersedes the tile (then case 1 or 2).
+//! 4. Live session gone (`on_connection_gone`): `clear_cache` only.
+//! 5. Eviction by a new session (`evict_session`): `clear_cache` only.
+//!
+//! In cases 1-3, a late ACK that the ledger can still resolve applies the
+//! surviving record. That is what does these things after the cache entry
+//! is gone:
+//! - stops the scheduler retrying a retired emission;
+//! - after a commit, credits a Cdf53 pass to the delivery window (not to
+//!   completeness, since the generation moved);
+//! - gives back a bundled palette's carry and reference when nothing else
+//!   did.
+//!
+//! In cases 4 and 5 the record survives, but no production ACK reaches it.
+//! The HELLO gate drops the old session's datagrams, and the next session
+//! reset clears the scheduler and the palette counts.
+//!
+//! Metadata stored on `CacheEntry` would vanish at all five points.
+//! `io_bridge/coverage_pin_tests.rs` pins cases 1-3, plus case 4 at the
+//! emitter level only; case 5 has no pin.
+//! Full description: reliable-tile-emitter design spec, §8.4
+//! (`docs/superpowers/specs/2026-06-17-reliable-tile-emitter-design.md`).
 
 use smallvec::SmallVec;
 
