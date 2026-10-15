@@ -12,6 +12,8 @@ const TILE_WORK_BYTES = 8 * 4;
 export interface PalRleTile {
   tileX: number;
   tileY: number;
+  /** `frame_seq` of the server frame this tile came from. */
+  frameSeq: number;
   paletteId: number;
   count: number;
   /** 512 bytes: two 4-bit indices per byte, low nibble first. */

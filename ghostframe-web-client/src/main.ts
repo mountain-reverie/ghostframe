@@ -276,6 +276,9 @@ async function main() {
 
   // Full-frame decoder state.
   let fullFrameDecoder: FullFrameDecoder | null = null;
+  // frame_seq of each chunk handed to the decoder, oldest first.
+  const h264PendingSeqs: number[] = [];
+  let h264LastSeq = 0;
 
   let firstTileRendered = false;
   let frameDimensionsKnown = false;
@@ -357,17 +360,18 @@ async function main() {
         let sampleBytes: Uint8Array;
         switch (d.codec) {
           case 'Raw':
-            renderer.pushRaw({ tileX: ev.tile_x, tileY: ev.tile_y, bgra: d.bytes });
+            renderer.pushRaw({ tileX: ev.tile_x, tileY: ev.tile_y, frameSeq: ev.frame_seq, bgra: d.bytes });
             sampleBytes = d.bytes;
             break;
           case 'Solid':
-            renderer.pushSolid({ tileX: ev.tile_x, tileY: ev.tile_y, bgra: d.bytes });
+            renderer.pushSolid({ tileX: ev.tile_x, tileY: ev.tile_y, frameSeq: ev.frame_seq, bgra: d.bytes });
             sampleBytes = d.bytes;
             break;
           case 'PalRle':
             renderer.pushPalRle({
               tileX: ev.tile_x,
               tileY: ev.tile_y,
+              frameSeq: ev.frame_seq,
               paletteId: d.palette_id,
               count: d.count,
               indices: d.indices,
@@ -381,6 +385,7 @@ async function main() {
             renderer.pushCdf53({
               tileX: ev.tile_x,
               tileY: ev.tile_y,
+              frameSeq: ev.frame_seq,
               gen: ev.generation,
               passIdx: d.pass_idx,
               bitPlanes: d.bit_planes,
@@ -480,9 +485,17 @@ async function main() {
       case 'NeedsH264': {
         if (!fullFrameDecoder) {
           fullFrameDecoder = new FullFrameDecoder((frame: VideoFrame) => {
-            renderer.pushH264(frame);
+            // The decoder is in-order (baseline, no B-frames), so output N is
+            // input N. When it outputs more frames than we submitted a seq
+            // for (it should not), fall back to the newest known seq.
+            const seq = h264PendingSeqs.shift() ?? h264LastSeq;
+            renderer.pushH264(frame, seq);
           }, 1920, 1080);
         }
+        h264PendingSeqs.push(ev.frame_seq);
+        h264LastSeq = ev.frame_seq;
+        // A decode error drops an output; do not let the FIFO grow without bound.
+        if (h264PendingSeqs.length > 256) h264PendingSeqs.shift();
         fullFrameDecoder.decode(ev.payload, ev.is_keyframe);
 
         if (!firstTileRendered) {
@@ -570,8 +583,14 @@ async function main() {
     // `drainTransmit` is async; `tick()` is not (it's the rAF callback), so
     // this is a floating promise rather than an awaited call — deliberate,
     // logged rather than left an unhandled rejection.
-    flushDatagrams();
-    for (const ev of core.onTimeout(nowUs())) handleEvent(ev);
+    // A throw from either must not stop the rAF loop (the draw below still
+    // has to run and the next tick has to be scheduled).
+    try {
+      flushDatagrams();
+      for (const ev of core.onTimeout(nowUs())) handleEvent(ev);
+    } catch (e) {
+      console.error('tick(): intake failed; continuing', e);
+    }
     drainTransmit().catch((e) => console.warn('tick(): drainTransmit failed', e));
 
     // M3.5 bench: emit recordFramePainted for all frames whose last tile was

@@ -4,6 +4,8 @@ import { createLabeledShaderModule } from './shader_module';
 export interface SolidTile {
   tileX: number;
   tileY: number;
+  /** `frame_seq` of the server frame this tile came from. */
+  frameSeq: number;
   bgra: Uint8Array; // 4 bytes
 }
 
