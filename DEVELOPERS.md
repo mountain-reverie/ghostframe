@@ -165,9 +165,9 @@ a local headscale, then drive Chromium against it:
 just test-e2e
 ```
 
-That target builds the web client, builds the release binaries used inside
-the containers, builds the two container images
-(`ghostframe/test-server`, `ghostframe/test-headscale`), then runs
+That target builds the web client, builds the two container images
+(`ghostframe/test-server`, `ghostframe/test-headscale`; the server binaries are
+compiled inside the image, with a persistent BuildKit cache), then runs
 `cargo test --test e2e`.
 
 After any change to `ghostframe-lib` or `ghostframe-xdaemon`, rebuild the
@@ -177,6 +177,16 @@ the stale binary baked into the image:
 ```bash
 just containers-build
 ```
+
+The in-image Rust build keeps its target dir and cargo registry in BuildKit
+cache mounts, which nothing bounds. To reclaim the disk:
+
+```bash
+docker buildx du                                  # what the cache holds
+docker builder prune --filter type=exec.cachemount  # drop the Rust caches
+```
+
+The next `containers-build` then recompiles the workspace from scratch.
 
 E2e tests use `--test-threads=1` and depend on the Docker daemon being
 reachable by the current user.
