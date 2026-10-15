@@ -67,9 +67,11 @@ impl IoBridge {
                 // Route every ACKed key into the reliable-tile emitter as
                 // well — it owns the retransmit cache + RTO heap and needs
                 // to drop the matching CacheEntry so `tick` stops re-firing
-                // it. Runs alongside the legacy scheduler/coverage path
-                // below; Task 28 will retire the legacy bookkeeping once
-                // the emitter is the sole source of truth.
+                // it. Runs alongside the scheduler/coverage path below,
+                // which is not legacy: the coverage record outlives the
+                // cache entry in several cases, and `apply_ack_coverage`
+                // reads it for exactly those late ACKs (see the
+                // `fragment_coverage` module docs).
                 //
                 // Phase 1 Task 5: we ALSO extract OWD samples here, before
                 // on_ack removes the cache entries. The cache lookup below

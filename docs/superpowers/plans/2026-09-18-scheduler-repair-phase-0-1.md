@@ -1930,6 +1930,6 @@ recorded in the task sections above.
 
 ## Not in this plan
 
-Phase 2 (ledger tombstones, versioned-handle resolution, loss deadline on `ack_p99` — the phase that actually fixes the production bug), Phase 3 (ownership move, deleting the emitter cache and RTO wheel, `AckLatencyTracker`, the gated safety sweep, `in_flight` send-order queue), and Phase 4 (retiring `fragment_coverage`). Each gets its own plan.
+Phase 2 (ledger tombstones, versioned-handle resolution, loss deadline on `ack_p99` — the phase that actually fixes the production bug), Phase 3 (ownership move, deleting the emitter cache and RTO wheel, `AckLatencyTracker`, the gated safety sweep, `in_flight` send-order queue), and Phase 4 (retiring `fragment_coverage`). Each gets its own plan. *(2026-10: Phase 4 as "move coverage into the emitter cache" is withdrawn: coverage outlives the cache entry. See the reliable-tile-emitter design spec §8.4.)*
 
 `in_flight: VecDeque<Handle>` is deliberately **not** added here: nothing reads it until Phase 3's safety sweep exists.

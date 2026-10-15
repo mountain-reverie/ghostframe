@@ -39,8 +39,11 @@ Four structures hold overlapping identity for a single emission:
 That split is not incidental. The PalRle `in_flight_carrying` underflow fixed
 in PR #92 existed because `palette_bundled` had to be re-derived from payload
 bytes — the fact lived in a different structure from the work item it
-described. `fragment_coverage`'s own header already records its intended
-retirement and lists the steps; this design subsumes them.
+described. `fragment_coverage` was once planned for deletion by folding its metadata
+into the cache; that plan was rejected in October 2026 because the record
+outlives the cache entry in five cases (see the module docs and the
+reliable-tile-emitter design, §8.4). Moving the metadata onto the slab
+entry (Phase 4) must preserve those cases explicitly.
 
 ## Architecture
 
@@ -211,8 +214,9 @@ the emitter cache, the RTO wheel, `rto_for_attempt`, `cancel_for_tile` and the
 the gated safety sweep.
 
 **Phase 4 — collapse `fragment_coverage`.** Its metadata moves onto the slab
-entry; delete the module and its callers, completing the retirement its own
-header already describes.
+entry; delete the module and its callers. This is the only retirement route still
+open; it must first decide each late-ACK case listed in the
+`fragment_coverage` module docs.
 
 ## Open uncertainties
 

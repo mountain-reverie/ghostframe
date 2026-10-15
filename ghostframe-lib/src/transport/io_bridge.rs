@@ -459,7 +459,9 @@ pub struct IoBridge {
     /// Per-tile-pass coverage map: (frame_seq, tile_x, tile_y, pass_idx) ->
     /// tile metadata for a work item. Populated at emit time; consumed by
     /// dispatch_ack_datagram on incoming ACKs. LRU-bounded by
-    /// FRAGMENT_COVERAGE_CAPACITY. Retention is until-ACKed-or-evicted.
+    /// FRAGMENT_COVERAGE_CAPACITY. Retention is until-ACKed-or-evicted,
+    /// which can be longer than the emitter's cache entry for the same key: see
+    /// the `fragment_coverage` module doc for the five cases.
     fragment_coverage: crate::transport::fragment_coverage::FragmentCoverageMap,
     /// Times `resume_scheduler_continuation` actually drained work, and the
     /// bytes it moved.
@@ -663,9 +665,9 @@ pub struct IoBridge {
     /// by direct paired `cancel_for_tile` calls at every
     /// `scheduler.bump_generation*` site (see
     /// `dispatch_dirty_tiles_via_scheduler`, dirty-cdf53 Phase B, and
-    /// escalation Phase B). Task 28 will retire the legacy
-    /// `fragment_coverage` path that currently coexists with the new
-    /// emitter pipeline.
+    /// escalation Phase B). `fragment_coverage` is not retired into it:
+    /// the emitter owns retransmission, coverage owns the ACK metadata,
+    /// and coverage outlives the cache entry (see that module's doc).
     pub(crate) reliable_emitter: crate::transport::reliable_emitter::ReliableTileEmitter,
     /// Rolling buffer of one-way-delay samples derived from ACK
     /// envelopes (Phase 1 Task 5). Drained periodically into the Bwe

@@ -95,8 +95,10 @@ Existing modules touched:
 - `ghostframe-lib/src/transport/protocol.rs` — adds parsing/encoding for the
   two new envelope types and the 4-byte `wire_seq` extension to the
   tile-fragment `DatagramHeader`.
-- `ghostframe-lib/src/transport/fragment_coverage.rs` — **deleted** at the
-  end of the migration; the emitter's `RetransmitCache` replaces it.
+- `ghostframe-lib/src/transport/fragment_coverage.rs` — originally planned
+  for deletion at the end of the migration. **Kept** (2026-10): it holds
+  per-emission metadata that must outlive the `RetransmitCache` entry. See
+  §8.4.
 
 New file: `ghostframe-web-client/src/parity_decoder.ts`. Owns the
 sliding-window source buffer, parity reception, and XOR recovery.
@@ -432,7 +434,8 @@ Three surgical changes in `io_bridge.rs`:
 3. `dispatch_ack_datagram` and a new `dispatch_nack_datagram` route into
    `emitter.on_ack` / `emitter.on_nack`.
 
-The existing `FragmentCoverageMap` and its callers are deleted: see §8.4.
+`FragmentCoverageMap` and its callers stay. The emitter took over its
+retransmit role, not its ACK-metadata role: see §8.4.
 
 ### 6.9 Observability counters
 
@@ -561,11 +564,21 @@ Extends the existing periodic `cdf53-coverage` log line with a new
 
 ### 8.1 Cancellation on `bump_generation`
 
-`scheduler.bump_generation*` already marks pending refinement work as
-`Superseded` and calls `fragment_coverage.drop_cdf53_for_tile`. The new
-flow additionally calls `emitter.cancel_for_tile(tile_x, tile_y)`. Late
-ACKs/NACKs for the cancelled generation become silent misses (counted but
-not error-flagged).
+Every `scheduler.bump_generation*` site is paired with
+`emitter.cancel_for_tile(tile_x, tile_y)`. Coverage is handled by IoBridge,
+not the scheduler, and not on every path. The dirty path
+(`dispatch_dirty_tiles_via_scheduler`) pairs
+`scheduler.bump_generation_collecting` with
+`fragment_coverage.drop_cdf53_for_tile`. The Cdf53 commit path bumps the
+generation without dropping any coverage (§8.4, case 2).
+
+A late NACK can no longer resend the cancelled emission. It counts as
+`nack_miss`, unless the tile has since been re-emitted at that `pass_idx`.
+In that case the content fallback (`lookup_content`) resends the newer
+emission. A late ACK is not a full miss either. The emitter-side `on_ack`
+misses, but the ACK still resolves through the transmission ledger, and
+still applies the coverage record if one survived the cancellation
+(§8.4).
 
 ### 8.2 Retransmit retirement
 
@@ -609,25 +622,114 @@ identically to MAX_RETRANSMITS reached. The `cache_lru_eviction` counter
 should stay at zero under the pacing-fixed steady state; non-zero indicates
 the burst exceeded design parameters and is a signal to retune knobs.
 
-### 8.4 Migration: replacing FragmentCoverageMap
+### 8.4 FragmentCoverageMap: kept, not replaced
 
-The current `FragmentCoverageMap` (60K-entry LRU in
-`transport/fragment_coverage.rs`) is fully subsumed by the emitter's
-`RetransmitCache`. Migration steps:
+**Correction (2026-10).** An earlier version of this section said
+`FragmentCoverageMap` was "fully subsumed" by `RetransmitCache` and listed
+steps to fold it in and delete it. That was wrong, and the module stays.
+The emitter took over the *retransmit* role (fragment bytes, RTO, NACK).
+Coverage still holds the per-emission *ACK metadata*: `codec`,
+`generation`, `pass_idx`, `palette_id`, `palette_bundled`. The cache entry
+does not mirror it. The two have different lifetimes, and an ACK can
+arrive after the cache entry is gone and still needs that metadata.
 
-1. `fragment_coverage.record(...)` → folded into
-   `emitter.submit_batch(...)`'s natural recording at emit time.
-2. `fragment_coverage.take(...)` → folded into
-   `emitter.on_ack(...)`'s cache removal.
-3. `fragment_coverage.drop_cdf53_for_tile(...)` → folded into
-   `emitter.cancel_for_tile(...)`.
-4. `pending_refinement_snapshot()` diagnostic accessor → exposed as
-   `emitter.diagnostic_snapshot()` with the same shape.
-5. The `cdf53_passes_acked` map *stays in the scheduler* — it's a different
-   concern (PixelPerfect promotion). The emitter calls
-   `scheduler.record_cdf53_ack(key)` from its `on_ack` path.
+A coverage record is created at emit time
+(`io_bridge/emit.rs`, `fragment_coverage.record`) and removed by one of:
 
-At the end of migration, `fragment_coverage.rs` and its tests are deleted.
+- the ACK that names it (`ack_dispatch.rs`, `apply_ack_coverage` →
+  `take`);
+- `drop_cdf53_for_tile` on the dirty path, for Cdf53 records only;
+- LRU eviction at `FRAGMENT_COVERAGE_CAPACITY`.
+
+The cache entry for the same `EmitKey` can disappear sooner. These are the
+five cases where coverage outlives the cache entry:
+
+1. **Dirty-path supersession**
+   (`dispatch_dirty_tiles_via_scheduler`, `io_bridge/emit.rs`).
+   `reliable_emitter.cancel_for_tile` drops every cache entry for the tile.
+   `drop_cdf53_for_tile` drops only the Cdf53 coverage. PalRle, Solid and
+   Raw coverage survives. `settle_superseded_palettes` gives back the
+   palette carry and reference and unbundles the surviving PalRle records
+   (`unbundle_palrle_for_tile`).
+2. **Cdf53 commit** (`commit_tile_to_cdf53` → `enqueue_cdf53_generation`,
+   dirty and escalation sources, `io_bridge/frame.rs`). This calls
+   `cancel_for_tile` and bumps the generation, but drops **no** coverage.
+   Every record for the tile, Cdf53 included, survives.
+3. **Stuck-entry retirement** (`retire_stuck`, from the pacing sweep in
+   `io_bridge/pacing.rs`). Cache entries older than `STUCK_ENTRY_AGE` are
+   removed, and the next frames are forced fully dirty. Coverage is not
+   touched until that re-dirty supersedes the tile; case 1 or case 2 then
+   applies.
+4. **Live session gone** (`on_connection_gone`, from `ConnectionLost` or
+   a silent reap, `io_bridge/session.rs`). If the lost handle was the live
+   session, `clear_cache` empties the whole cache. Coverage is not
+   touched.
+5. **Eviction by a new session** (`evict_session`,
+   `io_bridge/session.rs`). Same as 4: `clear_cache`, coverage untouched.
+
+**What a late ACK reads.** An ACK names a `wire_seq`. The transmission
+ledger resolves it to an `EmitKey`, as `Live` or `Late` (`Late` means
+already declared lost). This works only while the ledger still holds the
+record or its tombstone, and both are capacity-bounded. Both kinds go
+through `apply_ack_coverage`, which `take`s the coverage record for that
+key and never reads the cache. If the ledger can still resolve the ACK and
+the coverage record survived, the ACK applies all of it:
+
+- `scheduler.mark_acked(tile, generation, pass_idx)` runs for every codec,
+  so a retired or orphaned emission stops being retried by the scheduler.
+- For Cdf53, `scheduler.record_cdf53_ack` runs. This feeds the delivery
+  window and live-generation completeness. After case 2 the generation
+  has moved, so a late ACK feeds the window but not completeness (the
+  bytes did reach the client). After case 1 the Cdf53 record was dropped,
+  so the late ACK feeds neither.
+- For PalRle, the palette is recorded in `palette_table.delivered`,
+  whether the emission was thin or bundled. A bundled emission also gives
+  back `in_flight_carrying` and the palette reference. After case 1 the
+  record was unbundled, so a late ACK records delivery without giving them
+  back a second time. After case 2, and after case 3 until the re-dirty
+  reaches the tile, nothing has given them back yet, so the late ACK is
+  the only thing that does.
+
+**Cases 4 and 5 in production.** The record survives, but nothing in
+production reads it through an ACK. `dispatch_inbound_datagram` drops
+every datagram from a session that is not the live HELLO'd one, so ACKs
+from the old session never reach `dispatch_ack_datagram`. A new client
+cannot ACK `wire_seq`s it never received. The next session's
+`fire_session_reset` clears the scheduler and `on_session_reset` zeroes
+the palette counts; that, not a late ACK, gives the carry and reference
+back. The record stays until LRU eviction, and `snapshot()` keeps
+reporting it.
+
+On the ACK path, the cache entry itself is read only by the BWE sample
+code (`record_ack_bwe_samples`, for `queued_at` and `probe`) and the RTO
+probe log. Both run before `on_ack` removes the entry, and both treat a
+missing entry as optional. The BWE code falls back to the ledger's emit
+time.
+
+Coverage has one reader outside the ACK path, and it is diagnostic only.
+Under the `cdf53-diag` feature, the `cdf53_dump_pending` dump in
+`io_bridge/frame.rs` passes `fragment_coverage.snapshot()` to
+`Scheduler::pending_refinement_snapshot`.
+
+The reverse can also happen. Coverage is LRU-bounded and the cache is not,
+so a coverage record can be evicted while its cache entry is still live.
+The ACK then logs `ack_miss` and skips the bookkeeping; the scheduler
+fallback retry described in `Scheduler::tick_at_with` covers that.
+
+**Consequence for any future retirement.** Moving the metadata onto
+`CacheEntry` (the old four-step plan) would remove it at exactly the five
+points above. Every late-ACK behaviour listed here would then change. The
+end-to-end pins in `io_bridge/coverage_pin_tests.rs` cover each case,
+without depending on where the metadata is stored. A redesign has to keep
+them green, for example by putting the metadata in a store with
+coverage's lifetime (such as the ledger), not the cache's. The pins cover
+cases 1-3 and the emitter-level half of case 4: that test calls
+`clear_cache` and `dispatch_ack_datagram` directly, bypassing the HELLO
+gate. Case 5 has no pin of its own.
+
+`io_bridge/frame.rs` (in `enqueue_cdf53_generation`) still has a comment
+saying old-generation Cdf53 coverage is dropped by `cancel_for_tile`. That
+comment is wrong; case 2 is the counterexample.
 
 ### 8.5 Session lifecycle
 
@@ -846,4 +948,4 @@ side terms are exposed counters. A non-zero gap is a regression signal.
 - Existing H264 FEC: `ghostframe-lib/src/transport/fec.rs`,
   `ghostframe-web-client/src/fec.ts`.
 - Existing fragment coverage tracking:
-  `ghostframe-lib/src/transport/fragment_coverage.rs` (to be deleted post-migration).
+  `ghostframe-lib/src/transport/fragment_coverage.rs` (kept; see §8.4).
