@@ -1256,3 +1256,91 @@ mod tests_passes {
         }
     }
 }
+
+/// How large can one pass payload get? This decides whether a tile datagram
+/// can ever need fragmenting once the Raw codec (4096 B) is gone.
+///
+/// Each pass is three RLE-coded 128-byte bit-planes with a 2-byte length each,
+/// plus a 2-byte `present_passes` prefix on pass 0. `rle_encode` costs 1 byte
+/// per input byte at most, except a literal of `0x7F` or `0x80..=0xFF`, which
+/// costs 2. So a plane is at most 256 bytes and a pass at most
+/// `3 * (2 + 256) + 2 = 776` bytes, whatever the pixels are.
+#[cfg(test)]
+mod tests_pass_size_bound {
+    use super::*;
+
+    /// The proven ceiling on one pass payload, in bytes.
+    const MAX_PASS_PAYLOAD: usize = 3 * (2 + 2 * BIT_PLANE_BYTES_PER_CHANNEL) + 2;
+
+    /// The smallest tile fragment payload the server can be handed: a 1200 B
+    /// QUIC datagram less the 2 B WebTransport varint and the 24 B tile
+    /// headers is 1174, and the real floor quinn reports is a little lower;
+    /// 1136 is the figure used when measuring.
+    const TYPICAL_FRAGMENT_PAYLOAD: usize = 1136;
+
+    fn max_pass(coeffs: &[i16]) -> usize {
+        let (_, passes) = encode_passes_sparse(coeffs);
+        passes.iter().map(|(_, p)| p.len()).max().unwrap()
+    }
+
+    #[test]
+    fn the_ceiling_is_below_one_datagram() {
+        assert_eq!(MAX_PASS_PAYLOAD, 776);
+        const { assert!(MAX_PASS_PAYLOAD < TYPICAL_FRAGMENT_PAYLOAD) };
+    }
+
+    /// Every coefficient negative with all magnitude bits set: every plane
+    /// byte is 0xFF, each costing the 2-byte escape. The ceiling is reached,
+    /// not merely bounded, so the arithmetic above is not vacuous.
+    #[test]
+    fn all_ones_planes_reach_exactly_the_ceiling() {
+        let coeffs = vec![-8191i16; CDF53_TOTAL_COEFFS];
+        assert_eq!(max_pass(&coeffs), MAX_PASS_PAYLOAD);
+    }
+
+    #[test]
+    fn adversarial_patterns_stay_under_the_ceiling() {
+        let patterns: Vec<Vec<i16>> = vec![
+            vec![0; CDF53_TOTAL_COEFFS],
+            vec![i16::MAX; CDF53_TOTAL_COEFFS],
+            vec![i16::MIN + 1; CDF53_TOTAL_COEFFS],
+            (0..CDF53_TOTAL_COEFFS)
+                .map(|i| if i % 2 == 0 { 8191 } else { -8191 })
+                .collect(),
+            // Bytes just under the escape threshold: 0x7E literal planes.
+            vec![0x7E7E; CDF53_TOTAL_COEFFS],
+            (0..CDF53_TOTAL_COEFFS).map(|i| (i * 37) as i16).collect(),
+        ];
+        for (i, p) in patterns.iter().enumerate() {
+            assert!(max_pass(p) <= MAX_PASS_PAYLOAD, "pattern {i}");
+        }
+    }
+
+    #[test]
+    fn random_coefficients_stay_under_the_ceiling() {
+        use proptest::prelude::*;
+        proptest!(ProptestConfig::with_cases(500), |(
+            coeffs in proptest::collection::vec(any::<i16>(), CDF53_TOTAL_COEFFS),
+        )| {
+            prop_assert!(max_pass(&coeffs) <= MAX_PASS_PAYLOAD);
+        });
+    }
+
+    /// Real tiles, through the real forward transform, with the most
+    /// expensive content: full-range noise in every channel.
+    #[test]
+    fn full_range_noise_tiles_stay_under_the_ceiling() {
+        let mut s = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..50 {
+            let tile: Vec<u8> = (0..32 * 32 * 4)
+                .map(|_| {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    (s >> 11) as u8
+                })
+                .collect();
+            assert!(max_pass(&forward(&tile)) <= MAX_PASS_PAYLOAD);
+        }
+    }
+}
