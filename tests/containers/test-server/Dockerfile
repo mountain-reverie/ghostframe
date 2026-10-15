@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # Stage 1: Build ghostframe binaries inside the container so shared libraries
 # match the runtime environment exactly.
-FROM ubuntu:24.04 AS builder
+FROM ubuntu:26.04 AS builder
 
 RUN apt-get update -o Acquire::AllowInsecureRepositories=true && apt-get install -y --allow-unauthenticated --no-install-recommends \
     build-essential \
@@ -137,7 +137,7 @@ RUN --mount=type=cache,id=ghostframe-cargo-registry,target=/root/.cargo/registry
     && cp target/release/ghostframe-xdaemon target/release/ghostframe-test-pattern /out/
 
 # Stage 2: Runtime image
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 
 RUN apt-get update -o Acquire::AllowInsecureRepositories=true && apt-get install -y --allow-unauthenticated --no-install-recommends \
     ca-certificates \
