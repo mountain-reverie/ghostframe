@@ -408,7 +408,7 @@ pub fn encode_frame_into(frame: &mut Vec<u8>, payload: &[u8], addr: &SocketAddr)
 /// syscall. The bytes appended are exactly those [`encode_frame`] returns.
 pub fn encode_frame_append(frame: &mut Vec<u8>, payload: &[u8], addr: &SocketAddr) {
     use std::fmt::Write;
-    // The longest IP literal is a 45-byte IPv6 with an embedded IPv4 tail;
+    // The longest IP literal text is 39 bytes (IPv6; `::ffff:a.b.c.d` is 22);
     // formatting into the stack avoids a `String` per packet.
     struct Host {
         buf: [u8; 48],
@@ -514,6 +514,14 @@ mod tests {
             want.push(0);
         }
         assert_eq!(batch, want);
+    }
+
+    #[test]
+    fn the_longest_ip_literals_round_trip() {
+        // 39 characters, the longest non-mapped IPv6 text form.
+        roundtrip(b"x", "[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:1");
+        // The longest `::ffff:a.b.c.d` form.
+        roundtrip(b"x", "[::ffff:255.255.255.255]:65535");
     }
 
     #[test]
