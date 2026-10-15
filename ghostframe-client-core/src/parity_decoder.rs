@@ -42,6 +42,10 @@ pub struct ParityDecoder {
     /// horizon is measured back from.
     newest_wire_seq: Option<u32>,
     window_capacity: usize,
+    /// Highest `wire_seq` the window has evicted (by signed distance). A
+    /// source at or below it may well have been received and then forgotten,
+    /// so its absence from `window` says nothing about whether it arrived.
+    max_evicted: Option<u32>,
 }
 
 impl ParityDecoder {
@@ -52,6 +56,7 @@ impl ParityDecoder {
             pending_parities: OrderedMap::new(),
             newest_wire_seq: None,
             window_capacity,
+            max_evicted: None,
         }
     }
 
@@ -74,6 +79,10 @@ impl ParityDecoder {
                 match self.order.pop_front() {
                     Some(oldest) => {
                         self.window.remove(&oldest);
+                        self.max_evicted = Some(match self.max_evicted {
+                            Some(m) if (oldest.wrapping_sub(m) as i32) <= 0 => m,
+                            _ => oldest,
+                        });
                     }
                     None => break,
                 }
@@ -91,6 +100,10 @@ impl ParityDecoder {
         // carry a full parity payload.
         let mut recovered: Option<(u32, Vec<u8>)> = None;
         for (gfws, parity) in self.pending_parities.iter() {
+            // Only a group containing the arriving source can have changed.
+            if !Self::covers(parity, wire_seq) {
+                continue;
+            }
             if let Some(result) = self.try_recover(parity) {
                 recovered = Some((*gfws, result));
                 break;
@@ -103,7 +116,11 @@ impl ParityDecoder {
 
     pub fn receive_parity(&mut self, env: &TileParityEnvelope) -> Option<Vec<u8>> {
         let result = self.try_recover(env);
-        if result.is_none() {
+        // A parity whose group is already complete can never recover
+        // anything: buffering it only waits for the window to evict one of
+        // its sources, at which point that source looks "exactly one
+        // missing" and gets rebuilt although it arrived long ago.
+        if result.is_none() && self.missing_in_window(env) > 0 {
             // Matches JS `Map.set` on an existing key: updates the value in
             // place, keeping its original insertion position.
             self.pending_parities
@@ -144,12 +161,28 @@ impl ParityDecoder {
         }
     }
 
+    /// Whether `ws` is one of `parity`'s `k` sources.
+    fn covers(parity: &TileParityEnvelope, ws: u32) -> bool {
+        (ws.wrapping_sub(parity.group_first_wire_seq)) < u32::from(parity.k)
+    }
+
+    /// How many of the group's sources are absent from the window.
+    fn missing_in_window(&self, parity: &TileParityEnvelope) -> usize {
+        (0..u32::from(parity.k))
+            .filter(|i| {
+                !self
+                    .window
+                    .contains_key(&parity.group_first_wire_seq.wrapping_add(*i))
+            })
+            .count()
+    }
+
     fn try_recover(&self, parity: &TileParityEnvelope) -> Option<Vec<u8>> {
         let mut missing: Option<u32> = None;
         let mut missing_count = 0usize;
         let mut received: Vec<&Vec<u8>> = Vec::new();
         for i in 0..parity.k as u32 {
-            let ws = parity.group_first_wire_seq + i;
+            let ws = parity.group_first_wire_seq.wrapping_add(i);
             match self.window.get(&ws) {
                 None => {
                     missing_count += 1;
@@ -162,6 +195,13 @@ impl ParityDecoder {
             return None;
         }
         let missing_ws = missing?;
+        // The window forgets old sources. One that is absent only because it
+        // was evicted was probably received; rebuilding it is a duplicate.
+        if let Some(m) = self.max_evicted {
+            if (missing_ws.wrapping_sub(m) as i32) <= 0 {
+                return None;
+            }
+        }
 
         let target_len = received
             .iter()
@@ -294,6 +334,51 @@ mod tests {
         assert!(
             d.receive_parity(&env).is_none(),
             "a reconstruction that is not a tile datagram must not be returned"
+        );
+    }
+
+    #[test]
+    fn a_parity_for_a_complete_group_is_not_kept_to_rebuild_an_evicted_source() {
+        // Every source of [0,4) arrives, then its parity: nothing to recover.
+        // Sliding the window past source 0 must not turn that parity into a
+        // "recovery" of source 0, which was received.
+        let mut d = ParityDecoder::new(8);
+        for ws in 0..4 {
+            assert!(d.record_source(ws, &src(ws)).is_none());
+        }
+        assert!(d.receive_parity(&parity_for(0, 4)).is_none());
+        assert_eq!(
+            d.pending_parities.len(),
+            0,
+            "a complete group is not buffered"
+        );
+        let mut rebuilt = 0;
+        for ws in 4..40 {
+            if d.record_source(ws, &src(ws)).is_some() {
+                rebuilt += 1;
+            }
+        }
+        assert_eq!(rebuilt, 0, "duplicates rebuilt from an evicted window slot");
+    }
+
+    #[test]
+    fn a_source_missing_only_because_the_window_forgot_it_is_not_rebuilt() {
+        // Group [0,4): 0 arrived but the 3-entry window has since forgotten
+        // it, 2 is genuinely late. The parity sees two missing and is
+        // buffered. When 2 lands, "exactly one missing" is source 0, which was
+        // received, so rebuilding it is a duplicate.
+        let mut d = ParityDecoder::new(3);
+        d.record_source(0, &src(0));
+        d.record_source(4, &src(4));
+        d.record_source(5, &src(5));
+        d.record_source(1, &src(1)); // evicts 0
+        d.record_source(3, &src(3)); // evicts 4
+        assert!(!d.has_source(0), "premise: 0 was evicted");
+        assert!(d.receive_parity(&parity_for(0, 4)).is_none());
+        assert_eq!(d.pending_parities.len(), 1, "premise: parity buffered");
+        assert!(
+            d.record_source(2, &src(2)).is_none(),
+            "rebuilt a source that had arrived"
         );
     }
 
