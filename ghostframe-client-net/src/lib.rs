@@ -105,6 +105,13 @@ pub struct ClientNet {
 impl ClientNet {
     /// Also accept these certificate hashes, besides `server_cert_sha256`.
     /// The server publishes its current and next cert; pin both.
+    /// Every certificate hash this client will accept.
+    pub fn cert_pins(&self) -> Vec<[u8; 32]> {
+        let mut pins = vec![self.config.server_cert_sha256];
+        pins.extend_from_slice(&self.extra_cert_pins);
+        pins
+    }
+
     pub fn with_extra_cert_pins(mut self, pins: Vec<[u8; 32]>) -> Self {
         self.extra_cert_pins = pins;
         self
@@ -185,9 +192,7 @@ impl ClientNet {
     pub fn connect(&mut self, remote: SocketAddr, now_us: u64) -> Result<(), ClientNetError> {
         let now = self.instant(now_us);
 
-        let mut pins = vec![self.config.server_cert_sha256];
-        pins.extend_from_slice(&self.extra_cert_pins);
-        let verifier = Arc::new(tls::PinnedCertVerifier::with_hashes(pins));
+        let verifier = Arc::new(tls::PinnedCertVerifier::with_hashes(self.cert_pins()));
         let provider = Arc::new(tls::pq_provider());
         let mut client_tls = rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()

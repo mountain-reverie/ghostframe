@@ -28,7 +28,7 @@
 //! could be unit-tested and every framing bug needed Docker and a live
 //! server to observe.
 //!
-//! So the transport-touching part ([`fetch_cert_hash`]) is now a thin shell
+//! So the transport-touching part ([`fetch_cert_hashes`]) is now a thin shell
 //! that dials and configures the socket, and everything protocol-shaped
 //! lives in [`fetch_cert_hashes_over`], which is generic over `Read + Write`.
 //! The tests below exercise keep-alive, missing `Content-Length`, non-200,
@@ -273,7 +273,7 @@ fn parse_cert_hash(body: &str) -> Result<[u8; 32], ClientError> {
 }
 
 fn decode_hash(hex: &str, what: &str) -> Result<[u8; 32], ClientError> {
-    if hex.len() != 64 || !hex.is_ascii() {
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(ClientError::Bootstrap(format!(
             "config.json {what} is {} chars, expected 64 hex",
             hex.len()
@@ -287,7 +287,18 @@ fn decode_hash(hex: &str, what: &str) -> Result<[u8; 32], ClientError> {
     Ok(out)
 }
 
-/// Every hash the client may pin, current first: the `certHashes` array when
+/// Split a fetched pin list into the primary pin and the extras.
+/// `parse_cert_hashes` never returns an empty list, so this is `None` only
+/// for a list built elsewhere.
+pub fn split_pins(mut hashes: Vec<[u8; 32]>) -> Option<([u8; 32], Vec<[u8; 32]>)> {
+    if hashes.is_empty() {
+        return None;
+    }
+    let primary = hashes.remove(0);
+    Some((primary, hashes))
+}
+
+/// Every hash the client may pin: the `certHashes` array when
 /// the server sends one (current + next certificate), else just `certHash`.
 /// Any malformed element fails the whole parse: a half-trusted list is worse
 /// than none.
@@ -297,14 +308,25 @@ fn parse_cert_hashes(body: &str) -> Result<Vec<[u8; 32]>, ClientError> {
     let Some(key_pos) = body.find(KEY) else {
         return Ok(vec![current]);
     };
-    let after = &body[key_pos + KEY.len()..];
-    let open = after
-        .find('[')
+    // Anchored: `"certHashes"` `:` `[` with only whitespace between, so a
+    // later field's array cannot be mistaken for this one.
+    let after = body[key_pos + KEY.len()..].trim_start();
+    let after = after
+        .strip_prefix(':')
+        .ok_or_else(|| ClientError::Bootstrap("config.json certHashes has no value".into()))?
+        .trim_start();
+    if after.starts_with("null") {
+        return Ok(vec![current]);
+    }
+    let inner = after
+        .strip_prefix('[')
         .ok_or_else(|| ClientError::Bootstrap("config.json certHashes is not an array".into()))?;
-    let inner = &after[open + 1..];
     let close = inner
         .find(']')
         .ok_or_else(|| ClientError::Bootstrap("config.json certHashes is unterminated".into()))?;
+    if inner[..close].trim().is_empty() {
+        return Ok(vec![current]);
+    }
     let mut out = Vec::new();
     for item in inner[..close].split(',') {
         let item = item.trim();
@@ -315,9 +337,6 @@ fn parse_cert_hashes(body: &str) -> Result<Vec<[u8; 32]>, ClientError> {
                 ClientError::Bootstrap("config.json certHashes element is not a string".into())
             })?;
         out.push(decode_hash(hex, "certHashes element")?);
-    }
-    if out.is_empty() {
-        return Ok(vec![current]);
     }
     // The scalar is the cert being served now; make sure it is pinned even
     // if a server lists it elsewhere.
@@ -505,9 +524,6 @@ mod tests {
         assert!(msg.contains("bytes"), "{msg}");
     }
 
-    /// The server now also sends `certHashes`; the native client must keep
-    /// reading the current hash from `certHash`, not trip over the longer key
-    /// that shares its prefix.
     #[test]
     fn parses_the_full_pin_list_current_first() {
         let other = "ab".repeat(32);
@@ -516,6 +532,52 @@ mod tests {
         assert_eq!(hs.len(), 2);
         assert_eq!(hs[0][0], 0x00);
         assert_eq!(hs[1][0], 0xab);
+    }
+
+    #[test]
+    fn empty_or_null_list_falls_back_to_the_scalar() {
+        for list in ["[]", "[ ]", "null"] {
+            let body = format!(r#"{{"certHash":"{HASH}","certHashes":{list}}}"#);
+            assert_eq!(
+                parse_cert_hashes(&body).expect("fallback").len(),
+                1,
+                "{list}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_later_fields_array_is_not_mistaken_for_the_list() {
+        let other = "ab".repeat(32);
+        let body = format!(r#"{{"certHash":"{HASH}","certHashes":7,"x":["{other}"]}}"#);
+        assert!(parse_cert_hashes(&body).is_err());
+    }
+
+    #[test]
+    fn sign_prefixed_and_non_ascii_hashes_are_refused() {
+        let plus = format!("+f{}", "0".repeat(62));
+        assert!(parse_cert_hash(&format!(r#"{{"certHash":"{plus}"}}"#)).is_err());
+        // 64 bytes, multibyte: must be an error, not a slicing panic.
+        let wide = format!("{}é", "0".repeat(62));
+        assert_eq!(wide.len(), 64);
+        assert!(parse_cert_hash(&format!(r#"{{"certHash":"{wide}"}}"#)).is_err());
+    }
+
+    #[test]
+    fn a_list_that_omits_the_served_cert_still_pins_it() {
+        let other = "ab".repeat(32);
+        let body = format!(r#"{{"certHash":"{HASH}","certHashes":["{other}"]}}"#);
+        let hs = parse_cert_hashes(&body).expect("parse");
+        assert_eq!(hs.len(), 2);
+        assert_eq!(hs[0][0], 0x00, "the served cert is pinned, and first");
+    }
+
+    #[test]
+    fn split_pins_keeps_every_extra() {
+        let (p, rest) = split_pins(vec![[1; 32], [2; 32], [3; 32]]).expect("split");
+        assert_eq!(p, [1; 32]);
+        assert_eq!(rest, vec![[2; 32], [3; 32]]);
+        assert!(split_pins(vec![]).is_none());
     }
 
     #[test]
@@ -530,6 +592,9 @@ mod tests {
         assert!(parse_cert_hashes(&body).is_err());
     }
 
+    /// The server now also sends `certHashes`; the native client must keep
+    /// reading the current hash from `certHash`, not trip over the longer key
+    /// that shares its prefix.
     #[test]
     fn parses_current_hash_when_certhashes_list_is_present() {
         let other = "ab".repeat(32);

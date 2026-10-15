@@ -193,7 +193,8 @@ impl GhostframeServer {
     /// Return the SHA-256 hex fingerprint of the server's TLS certificate.
     ///
     /// Pass this to the WebTransport client as the `serverCertificateHashes`
-    /// value.
+    /// value. A startup snapshot: the daemon rotates its certificate, so
+    /// anything long-lived must read `/config.json` instead.
     pub fn cert_hash(&self) -> &str {
         &self.cert_hash
     }
