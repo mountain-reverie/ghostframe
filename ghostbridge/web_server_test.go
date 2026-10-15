@@ -22,7 +22,7 @@ import (
 )
 
 func TestRedirectHandler(t *testing.T) {
-	h := newRedirectHandler("deadbeef")
+	h := newRedirectHandler(newCertHashStore("deadbeef"))
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
@@ -114,7 +114,7 @@ func TestLoadStaticCertFromEnv_BothSet(t *testing.T) {
 // while the server waits for a ClientHello.
 func TestRedirectHandlerServesConfigJSONPlain(t *testing.T) {
 	const hash = "deadbeefcafebabe1234567890abcdef0011223344556677889900aabbccddeeff"
-	srv := httptest.NewServer(newRedirectHandler(hash))
+	srv := httptest.NewServer(newRedirectHandler(newCertHashStore(hash)))
 	defer srv.Close()
 
 	client := &http.Client{
@@ -129,8 +129,54 @@ func TestRedirectHandlerServesConfigJSONPlain(t *testing.T) {
 		t.Fatalf("status %d, want 200 (a redirect here hangs a plaintext client)", resp.StatusCode)
 	}
 	body, _ := io.ReadAll(resp.Body)
-	want := `{"certHash":"` + hash + `"}`
+	want := `{"certHash":"` + hash + `","certHashes":["` + hash + `"]}`
 	if strings.TrimSpace(string(body)) != want {
 		t.Fatalf("body %q, want %q", string(body), want)
+	}
+}
+
+// The hash list must follow rotation: a /config.json fetched after the
+// server swapped certificates has to carry the new hashes, and must never be
+// cacheable. A handler that captured the startup string would fail this.
+func TestConfigJSONFollowsRotation(t *testing.T) {
+	a := strings.Repeat("a", 64)
+	b := strings.Repeat("b", 64)
+	c := strings.Repeat("c", 64)
+	store := newCertHashStore(a, b)
+	srv := httptest.NewServer(newRedirectHandler(store))
+	defer srv.Close()
+
+	get := func() (string, string) {
+		resp, err := http.Get(srv.URL + "/config.json")
+		if err != nil {
+			t.Fatalf("GET: %v", err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		return strings.TrimSpace(string(body)), resp.Header.Get("Cache-Control")
+	}
+	body, cc := get()
+	if want := `{"certHash":"` + a + `","certHashes":["` + a + `","` + b + `"]}`; body != want {
+		t.Fatalf("before rotation: %q, want %q", body, want)
+	}
+	if cc != "no-store" {
+		t.Fatalf("Cache-Control %q, want no-store", cc)
+	}
+	store.set([]string{b, c})
+	body, _ = get()
+	if want := `{"certHash":"` + b + `","certHashes":["` + b + `","` + c + `"]}`; body != want {
+		t.Fatalf("after rotation: %q, want %q", body, want)
+	}
+}
+
+func TestParseCertHashList(t *testing.T) {
+	a := strings.Repeat("a", 64)
+	if got, err := parseCertHashList(a + "," + a); err != nil || len(got) != 2 {
+		t.Fatalf("two hashes: %v %v", got, err)
+	}
+	for _, bad := range []string{"", "abc", a + ",", a + ",short"} {
+		if _, err := parseCertHashList(bad); err == nil {
+			t.Fatalf("%q accepted", bad)
+		}
 	}
 }

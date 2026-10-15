@@ -15,7 +15,7 @@ import (
 )
 
 func TestServeIndex(t *testing.T) {
-	mux := newWebMux("deadbeef")
+	mux := newWebMux(newCertHashStore("deadbeef"))
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
@@ -38,7 +38,7 @@ func TestServeIndex(t *testing.T) {
 }
 
 func TestServeConfigJSON(t *testing.T) {
-	mux := newWebMux("deadbeefcafebabe1234567890abcdef0011223344556677889900aabbccddeeff")
+	mux := newWebMux(newCertHashStore("deadbeefcafebabe1234567890abcdef0011223344556677889900aabbccddeeff"))
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
@@ -54,7 +54,7 @@ func TestServeConfigJSON(t *testing.T) {
 		t.Fatalf("GET /config.json: content-type %q, want application/json", ct)
 	}
 	body, _ := io.ReadAll(resp.Body)
-	want := `{"certHash":"deadbeefcafebabe1234567890abcdef0011223344556677889900aabbccddeeff"}`
+	want := `{"certHash":"deadbeefcafebabe1234567890abcdef0011223344556677889900aabbccddeeff","certHashes":["deadbeefcafebabe1234567890abcdef0011223344556677889900aabbccddeeff"]}`
 	if strings.TrimSpace(string(body)) != want {
 		t.Fatalf("GET /config.json: body %q, want %q", string(body), want)
 	}

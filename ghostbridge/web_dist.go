@@ -13,7 +13,6 @@ package main
 
 import (
 	"embed"
-	"encoding/json"
 	"io/fs"
 	"net/http"
 )
@@ -44,15 +43,11 @@ func distFS() fs.FS {
 const hstsHeader = "max-age=31536000; includeSubDomains"
 
 // newWebMux builds the HTTP handler mux for the embedded SPA + config.
-// certHashHex is the lowercase-hex SHA-256 of the WebTransport server cert.
-func newWebMux(certHashHex string) http.Handler {
+// hashes holds the lowercase-hex SHA-256 of the WebTransport server certs.
+func newWebMux(hashes *certHashStore) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/config.json", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Cache-Control", "no-store")
-		_ = json.NewEncoder(w).Encode(struct {
-			CertHash string `json:"certHash"`
-		}{CertHash: certHashHex})
+		writeConfigJSON(w, hashes)
 	})
 	mux.Handle("/", http.FileServer(http.FS(distFS())))
 	// Wrap so every HTTPS response carries HSTS.

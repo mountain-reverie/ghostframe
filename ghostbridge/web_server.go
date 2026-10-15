@@ -10,6 +10,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
+	"sync"
 	"time"
 
 	"tailscale.com/tsnet"
@@ -17,6 +19,65 @@ import (
 
 // The embedded SPA and the mux that serves it live in the build-tagged
 // pair web_dist.go / web_dist_noweb.go.
+
+// certHashStore holds the WebTransport certificate hashes published at
+// /config.json. The daemon rotates its certificate in-process, so the list
+// changes while the process runs; handlers read it on every request, which is
+// what makes a per-session fetch return the hashes of the day rather than the
+// ones from startup.
+type certHashStore struct {
+	mu     sync.RWMutex
+	hashes []string
+}
+
+func newCertHashStore(hashes ...string) *certHashStore {
+	s := &certHashStore{}
+	s.set(hashes)
+	return s
+}
+
+func (s *certHashStore) set(hashes []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.hashes = append([]string(nil), hashes...)
+}
+
+func (s *certHashStore) get() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append([]string(nil), s.hashes...)
+}
+
+// parseCertHashList splits a comma-separated list of 64-hex-char SHA-256
+// hashes, the form Rust passes across the FFI. It rejects an empty list or
+// any element of the wrong length.
+func parseCertHashList(csv string) ([]string, error) {
+	parts := strings.Split(csv, ",")
+	for _, p := range parts {
+		if len(p) != 64 {
+			return nil, fmt.Errorf("certHash length %d, want 64", len(p))
+		}
+	}
+	return parts, nil
+}
+
+// writeConfigJSON writes the /config.json body. `certHash` (the hash being
+// served now) is kept for older clients; `certHashes` is the full list a
+// client should pin, current first. Never cacheable: a cached copy is
+// exactly the stale pin rotation exists to avoid.
+func writeConfigJSON(w http.ResponseWriter, hashes *certHashStore) {
+	list := hashes.get()
+	first := ""
+	if len(list) > 0 {
+		first = list[0]
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(struct {
+		CertHash   string   `json:"certHash"`
+		CertHashes []string `json:"certHashes"`
+	}{CertHash: first, CertHashes: list})
+}
 
 // newRedirectHandler returns an HTTP handler that 301-redirects every
 // request to the same host:path on https://, EXCEPT /config.json, which it
@@ -39,14 +100,10 @@ import (
 // Without this, a native client's plaintext GET to :443 blocks forever --
 // the server is waiting for a ClientHello and the client is waiting for a
 // response. That failure is silent and reads like a network fault.
-func newRedirectHandler(certHashHex string) http.Handler {
+func newRedirectHandler(hashes *certHashStore) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/config.json" {
-			w.Header().Set("Content-Type", "application/json")
-			w.Header().Set("Cache-Control", "no-store")
-			_ = json.NewEncoder(w).Encode(struct {
-				CertHash string `json:"certHash"`
-			}{CertHash: certHashHex})
+			writeConfigJSON(w, hashes)
 			return
 		}
 		target := "https://" + r.Host + r.URL.RequestURI()
@@ -107,7 +164,7 @@ func (l *loggingListener) Accept() (net.Conn, error) {
 func startWebListeners(
 	ctx context.Context,
 	srv *tsnet.Server,
-	certHashHex string,
+	hashes *certHashStore,
 	staticCert *tls.Certificate,
 ) error {
 	// A noweb archive has no SPA to serve. Fail the bind instead of coming
@@ -159,7 +216,7 @@ func startWebListeners(
 	// it's easy to spot when triaging connection failures.
 	tlsErrLog := log.New(log.Writer(), "ghostbridge: :443 http: ", log.LstdFlags)
 	tlsServer := &http.Server{
-		Handler:           newWebMux(certHashHex),
+		Handler:           newWebMux(hashes),
 		ErrorLog:          tlsErrLog,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
@@ -167,7 +224,7 @@ func startWebListeners(
 		IdleTimeout:       60 * time.Second,
 	}
 	redirServer := &http.Server{
-		Handler:           newRedirectHandler(certHashHex),
+		Handler:           newRedirectHandler(hashes),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,

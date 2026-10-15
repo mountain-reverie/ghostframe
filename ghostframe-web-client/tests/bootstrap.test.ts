@@ -45,4 +45,43 @@ describe('bootstrap', () => {
     vi.stubGlobal('WebTransport', class {});
     await expect(bootstrap()).rejects.toThrow(/config.json/);
   });
+
+  it('pins every hash in certHashes, so a fetch just before a rotation still connects', async () => {
+    vi.stubGlobal('location', { origin: 'https://example.ts.net', host: 'example.ts.net' });
+    const a = 'aa'.repeat(32);
+    const b = 'bb'.repeat(32);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ certHash: a, certHashes: [a, b] }),
+    }));
+    const ctorSpy = vi.fn();
+    vi.stubGlobal('WebTransport', class { constructor(...args: unknown[]) { ctorSpy(...args); } });
+
+    const res = await bootstrap();
+
+    const pins = ctorSpy.mock.calls[0][1].serverCertificateHashes;
+    expect(pins).toHaveLength(2);
+    expect(new Uint8Array(pins[0].value)[0]).toBe(0xaa);
+    expect(new Uint8Array(pins[1].value)[0]).toBe(0xbb);
+    expect(res.certHashes).toEqual([a, b]);
+  });
+
+  it('fetches config.json afresh on every call and forbids the HTTP cache', async () => {
+    vi.stubGlobal('location', { origin: 'https://example.ts.net', host: 'example.ts.net' });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ certHashes: ['11'.repeat(32)] }) })
+      .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ certHashes: ['22'.repeat(32)] }) });
+    vi.stubGlobal('fetch', fetchMock);
+    const ctorSpy = vi.fn();
+    vi.stubGlobal('WebTransport', class { constructor(...args: unknown[]) { ctorSpy(...args); } });
+
+    await bootstrap();
+    await bootstrap();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    for (const call of fetchMock.mock.calls) {
+      expect(call[1]).toMatchObject({ cache: 'no-store' });
+    }
+    expect(new Uint8Array(ctorSpy.mock.calls[1][1].serverCertificateHashes[0].value)[0]).toBe(0x22);
+  });
 });

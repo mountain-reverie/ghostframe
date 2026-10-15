@@ -21,7 +21,13 @@ use quinn_proto::{
 /// Printed by the xdaemon at startup (`CERT_HASH_SHA256=<hex>`) so the E2E
 /// test and the browser client can pin the certificate via `certificateHashes`.
 pub struct CertInfo {
+    /// Hash of the certificate that was current when the server was built.
+    /// A snapshot: the daemon rotates certificates in-process, so anything
+    /// that outlives startup (publishing to clients) must read
+    /// [`CertSchedule::hashes_hex`] from `schedule` instead.
     pub sha256_hex: String,
+    /// The live certificate rotation state.
+    pub schedule: Arc<CertSchedule>,
 }
 
 /// The TLS provider for every ghostframe QUIC endpoint: aws-lc-rs with the
@@ -173,6 +179,205 @@ fn datagram_send_buffer_bytes() -> usize {
     crate::config::datagram_send_buffer_bytes()
 }
 
+// -----------------------------------------------------------------------------
+// Certificate lifetime and rotation.
+// -----------------------------------------------------------------------------
+//
+// Browsers accept a `serverCertificateHashes` certificate only if it is valid
+// for at most 14 days. A cert generated once at startup therefore guarantees
+// an outage on day 13 of any daemon that stays up, and a client holding the
+// hash it fetched before that edge cannot connect after it.
+//
+// The schedule keeps two certificates: `current` (served) and `next` (already
+// generated, advertised but not yet served). The hash list published to
+// clients is always `[current, next]`, so a client that fetched just before a
+// rotation still holds a pin that matches what the server serves after it
+// (the libp2p pattern). Each cert is served for `CERT_SERVE_PERIOD` and is
+// valid for `CERT_VALIDITY`, leaving it a margin before expiry.
+
+/// Wall clock used for certificate validity and rotation. Injectable so tests
+/// move time without sleeping.
+pub type CertClock = Arc<dyn Fn() -> time::OffsetDateTime + Send + Sync>;
+
+/// Maximum span the W3C spec allows for a pinned cert is 14 days; stay under.
+pub const CERT_VALIDITY: time::Duration = time::Duration::days(13);
+/// How far `notBefore` precedes the moment a cert starts being served, so a
+/// client whose clock runs behind does not see a not-yet-valid cert.
+pub const CERT_BACKDATE: time::Duration = time::Duration::hours(1);
+/// How long one certificate is served before the successor takes over.
+pub const CERT_SERVE_PERIOD: time::Duration = time::Duration::days(7);
+
+fn system_clock() -> CertClock {
+    Arc::new(time::OffsetDateTime::now_utc)
+}
+
+struct CertSlot {
+    certified: Arc<rustls::sign::CertifiedKey>,
+    hex: String,
+    serve_from: time::OffsetDateTime,
+    not_before: time::OffsetDateTime,
+    not_after: time::OffsetDateTime,
+}
+
+struct ScheduleState {
+    current: CertSlot,
+    next: CertSlot,
+}
+
+/// Two-cert rotation state; doubles as the rustls certificate resolver.
+pub struct CertSchedule {
+    clock: CertClock,
+    state: std::sync::Mutex<ScheduleState>,
+}
+
+impl std::fmt::Debug for CertSchedule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CertSchedule").finish_non_exhaustive()
+    }
+}
+
+type BoxErr = Box<dyn std::error::Error + Send + Sync>;
+
+impl CertSchedule {
+    pub fn new(clock: CertClock) -> Result<Self, BoxErr> {
+        let now = clock();
+        let current = Self::make_slot(now)?;
+        let next = Self::make_slot(now + CERT_SERVE_PERIOD)?;
+        Ok(Self {
+            clock,
+            state: std::sync::Mutex::new(ScheduleState { current, next }),
+        })
+    }
+
+    /// Generate a cert that starts being served at `serve_from`.
+    fn make_slot(serve_from: time::OffsetDateTime) -> Result<CertSlot, BoxErr> {
+        // SANs include both "localhost" (DNS) and "127.0.0.1" (IP) so that
+        // Chromium's cert-hash pinning works when the E2E forwarder is bound
+        // to 127.0.0.1.
+        let mut params =
+            rcgen::CertificateParams::new(vec!["localhost".into(), "127.0.0.1".into()])?;
+        params.not_before = serve_from - CERT_BACKDATE;
+        params.not_after = params.not_before + CERT_VALIDITY;
+        let key_pair = rcgen::KeyPair::generate()?;
+        let cert = params.self_signed(&key_pair)?;
+        let der = cert.der().to_vec();
+        let hex = {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(&der))
+        };
+        let key = rustls::pki_types::PrivateKeyDer::try_from(key_pair.serialize_der())
+            .map_err(|e| format!("invalid private key: {e}"))?;
+        let signing_key = pq_provider().key_provider.load_private_key(key)?;
+        let certified = rustls::sign::CertifiedKey::new(
+            vec![rustls::pki_types::CertificateDer::from(der)],
+            signing_key,
+        );
+        Ok(CertSlot {
+            certified: Arc::new(certified),
+            hex,
+            serve_from,
+            not_before: params.not_before,
+            not_after: params.not_after,
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ScheduleState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Roll forward to `now`. Cheap when nothing is due.
+    fn advance_locked(&self, st: &mut ScheduleState) {
+        let now = (self.clock)();
+        if now < st.next.serve_from {
+            return;
+        }
+        // Asleep for more than a whole period (suspend, clock step): the
+        // successor is itself near expiry, so start over from now.
+        let rebuilt = if now >= st.next.serve_from + CERT_SERVE_PERIOD {
+            Self::make_slot(now).and_then(|c| Ok((c, Self::make_slot(now + CERT_SERVE_PERIOD)?)))
+        } else {
+            Self::make_slot(st.next.serve_from + CERT_SERVE_PERIOD).map(|n| {
+                (
+                    CertSlot {
+                        certified: st.next.certified.clone(),
+                        hex: st.next.hex.clone(),
+                        serve_from: st.next.serve_from,
+                        not_before: st.next.not_before,
+                        not_after: st.next.not_after,
+                    },
+                    n,
+                )
+            })
+        };
+        match rebuilt {
+            Ok((current, next)) => {
+                tracing::info!(
+                    current = %current.hex,
+                    next = %next.hex,
+                    "TLS certificate rotated"
+                );
+                st.current = current;
+                st.next = next;
+            }
+            // Keep serving what we have; the next handshake retries.
+            Err(e) => tracing::error!(error = %e, "TLS certificate rotation failed"),
+        }
+    }
+
+    /// Hash of the cert being served now.
+    pub fn current_hex(&self) -> String {
+        let mut st = self.lock();
+        self.advance_locked(&mut st);
+        st.current.hex.clone()
+    }
+
+    /// Hashes to publish to clients: `[current, next]`.
+    pub fn hashes_hex(&self) -> Vec<String> {
+        let mut st = self.lock();
+        self.advance_locked(&mut st);
+        vec![st.current.hex.clone(), st.next.hex.clone()]
+    }
+
+    /// `(notBefore, notAfter)` of the cert being served now.
+    pub fn current_validity(&self) -> (time::OffsetDateTime, time::OffsetDateTime) {
+        let mut st = self.lock();
+        self.advance_locked(&mut st);
+        (st.current.not_before, st.current.not_after)
+    }
+
+    /// Time until the next rotation is due, so a publisher can sleep to it.
+    pub fn until_next_rotation(&self) -> std::time::Duration {
+        let st = self.lock();
+        (st.next.serve_from - (self.clock)())
+            .try_into()
+            .unwrap_or(std::time::Duration::ZERO)
+    }
+}
+
+impl rustls::server::ResolvesServerCert for CertSchedule {
+    fn resolve(
+        &self,
+        _client_hello: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        let mut st = self.lock();
+        self.advance_locked(&mut st);
+        Some(st.current.certified.clone())
+    }
+}
+
+/// The schedule of the most recently built production-clock `QuicServer`.
+/// The daemon has one; `GhostframeServer` reads it to publish the hash list
+/// without reaching into `IoBridge`.
+static ACTIVE_SCHEDULE: std::sync::Mutex<Option<Arc<CertSchedule>>> = std::sync::Mutex::new(None);
+
+/// See [`ACTIVE_SCHEDULE`].
+pub fn active_cert_schedule() -> Option<Arc<CertSchedule>> {
+    ACTIVE_SCHEDULE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 impl QuicServer {
     /// Construct a new `QuicServer` with a freshly-generated self-signed cert.
     ///
@@ -191,7 +396,7 @@ impl QuicServer {
     pub fn new_with_datagram_send_buffer(
         datagram_send_buffer: usize,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::build(datagram_send_buffer, None)
+        Self::build(datagram_send_buffer, None, None)
     }
 
     /// `new_with_datagram_send_buffer`, with the QUIC endpoint's RNG pinned.
@@ -206,52 +411,39 @@ impl QuicServer {
         datagram_send_buffer: usize,
         rng_seed: [u8; 32],
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::build(datagram_send_buffer, Some(rng_seed))
+        Self::build(datagram_send_buffer, Some(rng_seed), None)
+    }
+
+    /// `new`, with the certificate clock injected. Tests only: the schedule
+    /// then rotates on the injected time, with no sleeping.
+    #[cfg(any(test, feature = "browserless-harness"))]
+    pub fn new_with_cert_clock(
+        clock: CertClock,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::build(datagram_send_buffer_bytes(), None, Some(clock))
     }
 
     fn build(
         datagram_send_buffer: usize,
         rng_seed: Option<[u8; 32]>,
+        clock: Option<CertClock>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        // --- 1. Generate self-signed cert ---
-        // SANs include both "localhost" (DNS) and "127.0.0.1" (IP) so that
-        // Chromium's cert-hash pinning works when the E2E forwarder is bound to
-        // 127.0.0.1 (Task 9).
-        //
-        // W3C WebTransport spec requires serverCertificateHashes certs to have a
-        // validity period of at most 14 days. `generate_simple_self_signed` uses
-        // the rcgen default (~1 year), which Chrome rejects with
-        // CERTIFICATE_VERIFY_FAILED.
-        let mut params =
-            rcgen::CertificateParams::new(vec!["localhost".into(), "127.0.0.1".into()])?;
-        let now = time::OffsetDateTime::now_utc();
-        params.not_before = now;
-        params.not_after = now + time::Duration::days(13);
-        let key_pair = rcgen::KeyPair::generate()?;
-        let cert = params.self_signed(&key_pair)?;
-        let cert_der = cert.der().to_vec();
-        let key_der = key_pair.serialize_der();
-
-        // --- 2. SHA-256 fingerprint for browser certificateHashes ---
-        let sha256_hex = {
-            use sha2::{Digest, Sha256};
-            hex::encode(Sha256::digest(&cert_der))
-        };
+        // --- 1. Self-signed certs, rotated in-process (see `CertSchedule`) ---
+        // The schedule is also the rustls certificate resolver, so the cert is
+        // chosen per handshake from the clock and never goes stale on a
+        // long-running daemon.
+        let schedule = Arc::new(CertSchedule::new(clock.unwrap_or_else(system_clock))?);
+        let sha256_hex = schedule.current_hex();
 
         // --- 3. Build rustls ServerConfig ---
         // rustls 0.23 with default-features=false: supply the crypto provider
         // explicitly; do NOT call install_default(). The provider is aws-lc-rs
         // with the hybrid X25519MLKEM768 group preferred (see `pq_provider`).
-        let cert_chain: Vec<rustls::pki_types::CertificateDer<'static>> =
-            vec![rustls::pki_types::CertificateDer::from(cert_der)];
-        let private_key = rustls::pki_types::PrivateKeyDer::try_from(key_der)
-            .map_err(|e| format!("invalid private key: {e}"))?;
-
         let provider = Arc::new(pq_provider());
         let mut tls_config = rustls::ServerConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()?
             .with_no_client_auth()
-            .with_single_cert(cert_chain, private_key)?;
+            .with_cert_resolver(schedule.clone());
         // HTTP/3 ALPN token required by WebTransport.
         tls_config.alpn_protocols = vec![b"h3".to_vec()];
 
@@ -277,10 +469,15 @@ impl QuicServer {
             rng_seed,
         );
 
+        *ACTIVE_SCHEDULE.lock().unwrap_or_else(|e| e.into_inner()) = Some(schedule.clone());
+
         Ok(Self {
             endpoint,
             connections: HashMap::new(),
-            cert_info: CertInfo { sha256_hex },
+            cert_info: CertInfo {
+                sha256_hex,
+                schedule,
+            },
             unknown_conn_events: 0,
             newly_accepted: Vec::new(),
             refused_connections: 0,
@@ -501,6 +698,107 @@ impl QuicServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A clock the test moves by hand.
+    fn manual_clock() -> (CertClock, Arc<std::sync::atomic::AtomicI64>) {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        let base = time::OffsetDateTime::now_utc().unix_timestamp();
+        let off = Arc::new(AtomicI64::new(0));
+        let o = off.clone();
+        let clock: CertClock = Arc::new(move || {
+            time::OffsetDateTime::from_unix_timestamp(base + o.load(Ordering::SeqCst)).unwrap()
+        });
+        (clock, off)
+    }
+
+    const HOUR: i64 = 3600;
+    const DAY: i64 = 24 * HOUR;
+
+    #[test]
+    fn served_cert_is_valid_at_every_moment_of_a_long_run() {
+        use std::sync::atomic::Ordering;
+        let (clock, off) = manual_clock();
+        let sched = CertSchedule::new(clock.clone()).unwrap();
+        // 60 days in 30-minute steps: far past the old single 13-day cert.
+        for step in 0..(60 * 48) {
+            off.store(step * 1800, Ordering::SeqCst);
+            let now = clock();
+            let (nb, na) = sched.current_validity();
+            assert!(
+                nb <= now && now <= na,
+                "served cert not valid at +{step} half-hours"
+            );
+            assert!(
+                na - nb <= time::Duration::days(14),
+                "browser rejects > 14 days"
+            );
+        }
+    }
+
+    #[test]
+    fn not_before_is_backdated_for_client_clock_skew() {
+        let (clock, _off) = manual_clock();
+        let sched = CertSchedule::new(clock.clone()).unwrap();
+        let (nb, _) = sched.current_validity();
+        assert!(
+            clock() - nb >= time::Duration::minutes(59),
+            "notBefore not backdated"
+        );
+    }
+
+    #[test]
+    fn advertised_pair_always_contains_the_hash_served_after_rotation() {
+        use std::sync::atomic::Ordering;
+        let (clock, off) = manual_clock();
+        let sched = CertSchedule::new(clock).unwrap();
+        // A client fetches at t0 and connects at t0 + gap, for gaps spanning
+        // a rotation. Its pinned list must contain what is served then.
+        let mut t0 = 0;
+        while t0 < 30 * DAY {
+            off.store(t0, Ordering::SeqCst);
+            let fetched = sched.hashes_hex();
+            assert_eq!(fetched.len(), 2);
+            assert_ne!(fetched[0], fetched[1]);
+            for gap in [0, HOUR, 3 * DAY, 6 * DAY] {
+                off.store(t0 + gap, Ordering::SeqCst);
+                let served = sched.current_hex();
+                assert!(
+                    fetched.contains(&served),
+                    "client fetched at +{t0}s, connects at +{gap}s later: served {served} not in {fetched:?}"
+                );
+            }
+            t0 += 11 * HOUR;
+        }
+    }
+
+    #[test]
+    fn rotation_happens_and_a_long_sleep_does_not_serve_expired() {
+        use std::sync::atomic::Ordering;
+        let (clock, off) = manual_clock();
+        let sched = CertSchedule::new(clock.clone()).unwrap();
+        let first = sched.current_hex();
+        off.store(8 * DAY, Ordering::SeqCst);
+        assert_ne!(
+            sched.current_hex(),
+            first,
+            "no rotation after one serve period"
+        );
+        // Suspend for a month: must come back with a valid cert.
+        off.store(40 * DAY, Ordering::SeqCst);
+        let (nb, na) = sched.current_validity();
+        assert!(nb <= clock() && clock() <= na);
+    }
+
+    #[test]
+    fn quic_server_exposes_live_hashes() {
+        use std::sync::atomic::Ordering;
+        let (clock, off) = manual_clock();
+        let server = QuicServer::new_with_cert_clock(clock).unwrap();
+        let before = server.cert_info().schedule.hashes_hex();
+        off.store(8 * DAY, Ordering::SeqCst);
+        let after = server.cert_info().schedule.hashes_hex();
+        assert_eq!(after[0], before[1], "next became current");
+    }
 
     #[test]
     fn provider_prefers_the_hybrid_post_quantum_group() {
