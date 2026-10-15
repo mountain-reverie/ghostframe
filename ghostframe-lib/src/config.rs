@@ -214,6 +214,12 @@ impl TransportConfig {
     /// two `LossInjector` fields (whose type only exists under the feature)
     /// and the others that were gated at their old `io_bridge` sites, mirroring
     /// the shape of `IoBridge`'s own struct literal.
+    // Every read of `get` below is behind the test-loss-injection cfg, so a
+    // build without it (the client crates) leaves the parameter unused.
+    #[cfg_attr(
+        not(any(test, feature = "test-loss-injection")),
+        allow(unused_variables)
+    )]
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
         Self {
             #[cfg(any(test, feature = "test-loss-injection"))]
