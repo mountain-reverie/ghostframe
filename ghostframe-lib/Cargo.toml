@@ -63,7 +63,6 @@ goog_cc = "=0.1.4"
 web-transport-proto = { workspace = true }
 sha2 = { workspace = true }
 smallvec = "1"
-lru = "0.12"
 hex = { workspace = true }
 libc = { workspace = true }
 time = { workspace = true }
