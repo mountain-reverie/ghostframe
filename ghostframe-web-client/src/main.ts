@@ -276,9 +276,6 @@ async function main() {
 
   // Full-frame decoder state.
   let fullFrameDecoder: FullFrameDecoder | null = null;
-  // frame_seq of each chunk handed to the decoder, oldest first.
-  const h264PendingSeqs: number[] = [];
-  let h264LastSeq = 0;
 
   let firstTileRendered = false;
   let frameDimensionsKnown = false;
@@ -484,19 +481,11 @@ async function main() {
 
       case 'NeedsH264': {
         if (!fullFrameDecoder) {
-          fullFrameDecoder = new FullFrameDecoder((frame: VideoFrame) => {
-            // The decoder is in-order (baseline, no B-frames), so output N is
-            // input N. When it outputs more frames than we submitted a seq
-            // for (it should not), fall back to the newest known seq.
-            const seq = h264PendingSeqs.shift() ?? h264LastSeq;
-            renderer.pushH264(frame, seq);
+          fullFrameDecoder = new FullFrameDecoder((frame: VideoFrame, frameSeq: number) => {
+            renderer.pushH264(frame, frameSeq);
           }, 1920, 1080);
         }
-        h264PendingSeqs.push(ev.frame_seq);
-        h264LastSeq = ev.frame_seq;
-        // A decode error drops an output; do not let the FIFO grow without bound.
-        if (h264PendingSeqs.length > 256) h264PendingSeqs.shift();
-        fullFrameDecoder.decode(ev.payload, ev.is_keyframe);
+        fullFrameDecoder.decode(ev.payload, ev.is_keyframe, ev.frame_seq);
 
         if (!firstTileRendered) {
           firstTileRendered = true;

@@ -6,7 +6,8 @@ export class FullFrameDecoder {
   private latestFrame: VideoFrame | null = null;
 
   constructor(
-    private onFrame: (frame: VideoFrame) => void,
+    /** `frameSeq` is the value given to `decode()` for the chunk this frame came from. */
+    private onFrame: (frame: VideoFrame, frameSeq: number) => void,
     width: number,
     height: number,
   ) {
@@ -15,7 +16,9 @@ export class FullFrameDecoder {
         // M3.2b: the rAF tick is the sole closer of consumed VideoFrames.
         // Do NOT auto-close the previous frame here.
         this.latestFrame = frame;
-        this.onFrame(frame);
+        // The chunk's timestamp carries its frame_seq through the decoder, so
+        // the association survives a chunk that was rejected or dropped.
+        this.onFrame(frame, frame.timestamp);
       },
       error: (e: DOMException) => {
         console.error('Full-frame H264 decode error:', e.message);
@@ -30,11 +33,11 @@ export class FullFrameDecoder {
     });
   }
 
-  decode(nalData: Uint8Array, isKeyframe: boolean) {
+  decode(nalData: Uint8Array, isKeyframe: boolean, frameSeq: number) {
     if (this.decoder.state === 'closed') return;
     const chunk = new EncodedVideoChunk({
       type: isKeyframe ? 'key' : 'delta',
-      timestamp: 0,
+      timestamp: frameSeq,
       data: nalData,
     });
     this.decoder.decode(chunk);
