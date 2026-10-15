@@ -166,3 +166,11 @@ Build infra: the e2e image caches its Rust build in BuildKit cache mounts, so a 
 ## Waves C–D
 
 Wave C started 2026-10-15 with C1 (`perf/server-copy-chain`), C2 (`perf/event-loop-unblock`, design phase first), C6 (`ops/cert-rotation`) and C7 (`web/render-queue-frame-seq`). C3 and C4 follow C1, which owns the same emitter files. C5 changes the VA-API encoder, the block behind all three host crashes, so it runs last and only with the owner present. WS-D1 entry evidence now includes E4 and the T4 caveat above.
+
+Owner decisions and items added 2026-10-15:
+- C2 runs before WS-D1: D1's baselines are taken on the loop structure that ships.
+- C6: certificates are backdated by 1 day (validity 13 days from notBefore, served 7).
+- C7 also fixes the H.264 decoder that stayed dead for the session after one async decode error, and carries the H.264 `frame_seq` through `EncodedVideoChunk.timestamp` instead of a side FIFO.
+- New stream after C7 merges: the native client (`ghostframe-client-gpu`) has the same paint-order fault, worse (Raw uploaded on arrival, CDF53 lifted last, H.264 blitted immediately, no `frame_seq` anywhere).
+- Design item, not scheduled: C7 orders paints within one rAF tick only. Late H.264 output and an old-`frame_seq` CDF53 retransmit can still repaint over newer tiles; closing it needs a last-painted sequence kept per tile across ticks.
+- `just lint-client` was broken on master by 2a0b373 (#159 fixes it); CI does not run that recipe.
