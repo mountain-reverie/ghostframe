@@ -130,6 +130,39 @@ E6 and E8–E10 share a shape: a pixel or stillness assertion that fails once on
 |---|---|---|
 | B1 | `--features cdf53-diag` does not build: `scheduler.rs:1826` lacks `palette_bundled`; clippy error at `io_bridge.rs:5120`. CI never builds the feature | observed on two branches; not confirmed on master |
 
+### Wave V outcomes (2026-10-15)
+
+Every item was reproduced before it was fixed, or closed with the reason it could not be.
+
+| ID | Outcome | PR |
+|---|---|---|
+| B1 | fixed; the feature builds, lints and is gated in CI | #143 |
+| T1, T2, T3, T11 | fixed, each with a test that failed first | #144 |
+| T4 | fixed: a late ACK now withdraws the pending loss too. Caveat for WS-D1: a late-ACKed stall now reads as neither loss nor delay to the estimator. nested_cc `s2_idle8s_c10`, 12 runs a side, final estimate median 5.24 → 5.51 Mbps, no regression | #146 |
+| T5 | fixed (estimator send times past the 71.6 min wrap; boundary vectors in #147); `AckArrival::wire_seq` deleted | #146, #147, #154 |
+| T6, T7, T8, T9, T10 | deleted or cleaned (T7: the emitter drain no longer goes through a raw pointer). With T8, `TransportConfig::fec_k`, `GHOSTFRAME_FEC_K` and `e2e_fec_parity_enabled` deleted (owner's call) | #154 |
+| T12 | fixed: a superseded bundled PalRle emission lowered the palette carry count twice. Open: thin emissions take a palette reference the ACK path never releases | #157 |
+| T13 | not-reproduced: the `msg_type=64` bytes are the bidirectional-stream prefix. A prefix coalesced with HELLO would lose HELLO until `HELLO_DEADLINE` (inferred, untested) | — |
+| T14 | fixed: the GPU-written PalRle compact list is validated before use | #154 |
+| G1, G2 | fixed | #150 |
+| G3, G5, G6 | fixed (from the spec; no validation layer on the host) | #151 |
+| G4 | not a bug: `DRAW_INDIRECT` is the defined stage for indirect dispatch parameters and is valid on compute queues | #151 |
+| G7, G9, G10 | fixed (G10: EINTR retry; `QUEUE_FAMILY_FOREIGN_EXT` not changed, no evidence it matters on RADV) | #152 |
+| G8 | needs-owner-decision: no offset or modifier is carried; the xdaemon modesetting CPU path ignores both today | — |
+| G11 | recorded: a content check would cost about one CPU-mmap ingest per frame | — |
+| G12 | recorded: edge density is unused by the classifier, so the blind spots cost nothing today | — |
+| G13 | fixed: the xdaemon live-framebuffer check no longer passes on a blank scanout; `gpu_pipeline.rs` documented as local-only | #149 |
+| G14 | VCE faults (three host crashes, 2026-10-13/14/15): a test handed a memfd to the VA driver, and GPU tests ran in parallel within one binary; both fixed test-side. Host tests now skip VA-API by default (`gf-gpu-run`). A solo run of the encoder tests on the real encoder is still owed | #153 |
+| `new_inner` leaks | needs-owner-decision | — |
+| E1, E2, E3, E5 | fixed | #148 |
+| E4 | deferred to WS-D1 (needs the bandwidth estimator work); still fails on master | — |
+| E6, E8–E10 | idle: 24 of 24 clean. Loaded: `e2e_palette_eviction_chromium` failed 1 of 6 (rgb=(11,0,0) at `e2e.rs:2544`, server side normal), the others 6 of 6. The loaded phase was suspended after the host crashes; resume only on the owner's go-ahead | — |
+| E7 | gap: no geckodriver on the dev host | — |
+
+CI infra errors seen on #148 (`e2e_tile_skip` "Address already in use", `e2e_webgpu_fallback_swiftshader` `gbridge_dial_udp (rc=-3)`): likely a tsnet node teardown race; acted on only if they recur.
+
+Build infra: the e2e image caches its Rust build in BuildKit cache mounts, so a rebuild after one ghostframe-lib change takes 159 s instead of 716 s (#156).
+
 ## Waves C–D
 
-Not started. Wave V runs first on the transport files (see the plan, section 4b).
+Wave C started 2026-10-15 with C1 (`perf/server-copy-chain`), C2 (`perf/event-loop-unblock`, design phase first), C6 (`ops/cert-rotation`) and C7 (`web/render-queue-frame-seq`). C3 and C4 follow C1, which owns the same emitter files. C5 changes the VA-API encoder, the block behind all three host crashes, so it runs last and only with the owner present. WS-D1 entry evidence now includes E4 and the T4 caveat above.
