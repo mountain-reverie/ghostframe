@@ -20,10 +20,15 @@
 //    lift (stale CDF53 under it) unless some CDF53 entry is newer than it, in
 //    which case it is drawn before the lift.
 //
-// Known limit: an H.264 frame sandwiched between an older and a newer CDF53
-// entry inside ONE tick cannot be honoured: the lift is a single dispatch, so
-// the older lift lands over the H.264 frame. That needs the server to switch
-// codec mode twice within a single rAF interval.
+// Known limits:
+//  - An H.264 frame with CDF53 entries both older and newer than it in ONE tick
+//    cannot be honoured: the lift is a single dispatch, so the older lift lands
+//    over the H.264 frame. One mode switch plus a late CDF53 retransmit of
+//    another tile is enough to hit it.
+//  - Ordering is resolved within a tick only. H.264 output is asynchronous, so
+//    a frame can arrive a tick after newer tiles were painted, and a late CDF53
+//    retransmit keeps its old frame_seq. Closing that needs a last-painted seq
+//    kept across ticks.
 
 export interface SeqTile {
   tileX: number;
