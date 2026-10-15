@@ -203,7 +203,7 @@ pub type CertClock = Arc<dyn Fn() -> time::OffsetDateTime + Send + Sync>;
 pub(crate) const CERT_VALIDITY: time::Duration = time::Duration::days(13);
 /// How far `notBefore` precedes the moment a cert starts being served, so a
 /// client whose clock runs behind does not see a not-yet-valid cert.
-pub(crate) const CERT_BACKDATE: time::Duration = time::Duration::hours(1);
+pub(crate) const CERT_BACKDATE: time::Duration = time::Duration::days(1);
 /// How long one certificate is served before the successor takes over.
 pub(crate) const CERT_SERVE_PERIOD: time::Duration = time::Duration::days(7);
 
@@ -745,9 +745,32 @@ mod tests {
         let sched = CertSchedule::new(clock.clone()).unwrap();
         let (nb, _) = sched.current_validity();
         assert!(
-            clock() - nb >= time::Duration::minutes(59),
+            clock() - nb >= time::Duration::hours(23),
             "notBefore not backdated"
         );
+    }
+
+    #[test]
+    fn served_window_sits_inside_validity_with_margin_for_current_and_next() {
+        use std::sync::atomic::Ordering;
+        let (clock, off) = manual_clock();
+        let sched = CertSchedule::new(clock.clone()).unwrap();
+        // Current cert: at the very end of its serve period it must still
+        // have days left, and the total span must stay under Chrome's 14.
+        off.store(7 * DAY - 1, Ordering::SeqCst);
+        let (nb, na) = sched.current_validity();
+        assert!(
+            na - clock() >= time::Duration::days(4),
+            "no margin left at end of serve"
+        );
+        assert!(na - nb <= time::Duration::days(13));
+        // Next cert (just promoted): valid already, whole serve period ahead
+        // inside its window with margin.
+        off.store(7 * DAY, Ordering::SeqCst);
+        let (nb, na) = sched.current_validity();
+        assert!(nb <= clock(), "promoted cert not yet valid");
+        assert!(na - (clock() + CERT_SERVE_PERIOD) >= time::Duration::days(4));
+        assert!(na - nb <= time::Duration::days(13));
     }
 
     #[test]
