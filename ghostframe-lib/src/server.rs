@@ -214,12 +214,19 @@ async fn publish_cert_hashes(
     mut last: Vec<String>,
 ) {
     use std::time::Duration;
+    let mut rotations = schedule.subscribe_rotations();
     loop {
+        // Wake on a rotation notification (which also covers a resume from
+        // suspend, where a monotonic sleep would not have elapsed), or when
+        // the next rotation is due, capped so nothing can strand us.
         let wait = schedule
             .until_next_rotation()
             .saturating_add(Duration::from_secs(1))
             .clamp(Duration::from_secs(1), Duration::from_secs(3600));
-        tokio::time::sleep(wait).await;
+        tokio::select! {
+            _ = rotations.changed() => {}
+            _ = tokio::time::sleep(wait) => {}
+        }
         let now = schedule.hashes_hex();
         if now == last {
             continue;
@@ -229,9 +236,11 @@ async fn publish_cert_hashes(
                 tracing::info!(current = %now[0], next = %now[1], "published rotated cert hashes");
                 last = now;
             }
+            // -1: the handle is gone, so the daemon is shutting down.
+            Err(crate::transport::ghostbridge::WebServerError::Other(-1)) => return,
             Err(e) => {
-                tracing::warn!(error = %e, "could not publish rotated cert hashes; stopping");
-                return;
+                tracing::error!(error = %e, "could not publish rotated cert hashes; retrying");
+                tokio::time::sleep(Duration::from_secs(30)).await;
             }
         }
     }
