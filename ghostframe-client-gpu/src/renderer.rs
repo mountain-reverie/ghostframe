@@ -10,6 +10,7 @@
 
 use crate::export::ExportedImage;
 use crate::framebuffer::Framebuffer;
+use crate::paint_order::SeqLedger;
 use crate::pipelines::cdf53::{Cdf53PassEntry, Cdf53Pipeline};
 use crate::pipelines::palrle::PalRlePipeline;
 use crate::pipelines::raw;
@@ -91,11 +92,16 @@ pub struct Renderer {
     palrle: PalRlePipeline,
     cdf53: Cdf53Pipeline,
 
-    pending_solid: Vec<(u8, u8, [u8; 4])>,
-    pending_palrle: Vec<(u8, u8, u8, u8, Vec<u8>)>,
+    /// Every pending stateless entry carries the `frame_seq` it came from
+    /// (first field); `batch_seq` holds the newest per tile. See
+    /// [`crate::paint_order`].
+    pending_raw: Vec<(u32, u8, u8, Vec<u8>)>,
+    pending_solid: Vec<(u32, u8, u8, [u8; 4])>,
+    pending_palrle: Vec<(u32, u8, u8, u8, u8, Vec<u8>)>,
     pending_cdf53: Vec<Cdf53PassEntry>,
     /// `TileReady` tiles awaiting upload, batched by [`Renderer::flush`].
-    pending_rgba: Vec<(u8, u8, Vec<u8>)>,
+    pending_rgba: Vec<(u32, u8, u8, Vec<u8>)>,
+    batch_seq: SeqLedger,
     /// GPU-detected decode failures not yet drained by
     /// [`Renderer::take_decode_errors`].
     decode_errors: Vec<GpuDecodeError>,
@@ -256,10 +262,12 @@ impl Renderer {
             solid,
             palrle,
             cdf53,
+            pending_raw: Vec::new(),
             pending_solid: Vec::new(),
             pending_palrle: Vec::new(),
             pending_cdf53: Vec::new(),
             pending_rgba: Vec::new(),
+            batch_seq: SeqLedger::default(),
             decode_errors: Vec::new(),
             collect_decode_errors: false,
             dumps_written: 0,
@@ -287,7 +295,7 @@ impl Renderer {
                 tile_x,
                 tile_y,
                 rgba,
-                ..
+                frame_seq,
             } => {
                 // Not the path this crate exists to test (that's
                 // `TilePayload`, decoded by the real WGSL below), but a
@@ -299,22 +307,29 @@ impl Renderer {
                 // regardless of size -- almost entirely CPU-side call overhead
                 // -- so a full 1920x1080 repaint spent 363ms just issuing 2040
                 // of them. See `upload_pending_rgba`.
-                self.pending_rgba.push((tile_x, tile_y, rgba));
+                self.batch_seq.note(tile_x, tile_y, frame_seq);
+                self.pending_rgba.push((frame_seq, tile_x, tile_y, rgba));
                 self.ring.mark_dirty(tile_x as u32, tile_y as u32);
             }
             Event::TilePayload {
+                frame_seq,
                 tile_x,
                 tile_y,
                 generation,
                 data,
-                ..
             } => {
+                // Every codec counts towards the tile's newest frame_seq,
+                // CDF 5/3 included: see `crate::paint_order`.
+                self.batch_seq.note(tile_x, tile_y, frame_seq);
                 match data {
                     TileData::Raw(bgra) => {
-                        raw::upload_raw_tile(&ctx.queue, &self.fb, tile_x, tile_y, &bgra);
+                        // Batched, not uploaded here: an immediate write
+                        // would land before everything `flush` draws, and
+                        // an older Solid would then cover it.
+                        self.pending_raw.push((frame_seq, tile_x, tile_y, bgra));
                     }
                     TileData::Solid(bgra) => {
-                        self.pending_solid.push((tile_x, tile_y, bgra));
+                        self.pending_solid.push((frame_seq, tile_x, tile_y, bgra));
                     }
                     TileData::PalRle {
                         palette_id,
@@ -325,7 +340,7 @@ impl Renderer {
                         wire_flags: _,
                     } => {
                         self.pending_palrle
-                            .push((tile_x, tile_y, palette_id, count, indices));
+                            .push((frame_seq, tile_x, tile_y, palette_id, count, indices));
                     }
                     TileData::Cdf53 {
                         pass_idx,
@@ -428,15 +443,44 @@ impl Renderer {
     /// Fails if the device cannot be waited on (e.g. it was lost); the
     /// batched work of the failing stage is dropped.
     pub fn flush(&mut self, ctx: &WgpuContext) -> Result<(), GpuError> {
-        if !self.pending_solid.is_empty() {
-            self.solid
-                .draw(&ctx.device, &ctx.queue, &self.fb, &self.pending_solid);
-            self.pending_solid.clear();
+        // Order within a batch is by `frame_seq`, not by codec (see
+        // `crate::paint_order`). The CDF 5/3 lift goes first so that a newer
+        // stateless entry lands on top of an older pass; a stateless entry
+        // older than anything else for its tile is dropped, so a newer pass
+        // is not covered either. Passes are never dropped.
+        if !self.pending_cdf53.is_empty() {
+            self.cdf53
+                .integrate(&ctx.device, &ctx.queue, &self.pending_cdf53);
+            self.pending_cdf53.clear();
+            self.cdf53.inverse(&ctx.device, &ctx.queue, &self.fb);
         }
-        if !self.pending_palrle.is_empty() {
+
+        let ledger = &self.batch_seq;
+        let solid: Vec<(u8, u8, [u8; 4])> = std::mem::take(&mut self.pending_solid)
+            .into_iter()
+            .filter(|&(seq, tx, ty, _)| !ledger.superseded(tx, ty, seq))
+            .map(|(_, tx, ty, c)| (tx, ty, c))
+            .collect();
+        let palrle_batch: Vec<(u8, u8, u8, u8, Vec<u8>)> = std::mem::take(&mut self.pending_palrle)
+            .into_iter()
+            .filter(|&(seq, tx, ty, ..)| !ledger.superseded(tx, ty, seq))
+            .map(|(_, tx, ty, id, n, idx)| (tx, ty, id, n, idx))
+            .collect();
+        self.pending_rgba
+            .retain(|&(seq, tx, ty, _)| !ledger.superseded(tx, ty, seq));
+        let raw_tiles: Vec<_> = std::mem::take(&mut self.pending_raw)
+            .into_iter()
+            .filter(|&(seq, tx, ty, _)| !ledger.superseded(tx, ty, seq))
+            .collect();
+        self.batch_seq.clear();
+
+        if !solid.is_empty() {
+            self.solid.draw(&ctx.device, &ctx.queue, &self.fb, &solid);
+        }
+        if !palrle_batch.is_empty() {
             self.palrle
-                .decode(&ctx.device, &ctx.queue, &self.fb, &self.pending_palrle);
-            let batch = std::mem::take(&mut self.pending_palrle);
+                .decode(&ctx.device, &ctx.queue, &self.fb, &palrle_batch);
+            let batch = palrle_batch;
             let errors = if self.collect_decode_errors {
                 self.palrle.take_errors(&ctx.device, &ctx.queue)?
             } else {
@@ -463,12 +507,8 @@ impl Renderer {
             }
         }
         self.upload_pending_rgba(ctx);
-
-        if !self.pending_cdf53.is_empty() {
-            self.cdf53
-                .integrate(&ctx.device, &ctx.queue, &self.pending_cdf53);
-            self.pending_cdf53.clear();
-            self.cdf53.inverse(&ctx.device, &ctx.queue, &self.fb);
+        for (_, tx, ty, bgra) in &raw_tiles {
+            raw::upload_raw_tile(&ctx.queue, &self.fb, *tx, *ty, bgra);
         }
 
         self.flushes = self.flushes.saturating_add(1);
@@ -506,8 +546,8 @@ impl Renderer {
         // Short payloads keep the old one-call-each path; see the doc above.
         let (full, short): (Vec<_>, Vec<_>) = pending
             .into_iter()
-            .partition(|(_, _, rgba)| rgba.len() >= full_tile_bytes);
-        for (tx, ty, rgba) in &short {
+            .partition(|(_, _, _, rgba)| rgba.len() >= full_tile_bytes);
+        for (_, tx, ty, rgba) in &short {
             upload_rgba_tile(&ctx.queue, &self.fb, *tx, *ty, rgba);
         }
         if full.is_empty() {
@@ -520,7 +560,7 @@ impl Renderer {
             std::collections::HashMap::with_capacity(full.len());
         let (cols, rows) = tile_grid(self.fb.width, self.fb.height);
         let mut grid = crate::dirty::DirtyGrid::new(cols, rows);
-        for (tx, ty, rgba) in &full {
+        for (_, tx, ty, rgba) in &full {
             let (tx, ty) = (*tx as u32, *ty as u32);
             if tx >= cols || ty >= rows {
                 continue;

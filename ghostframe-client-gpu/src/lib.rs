@@ -85,6 +85,7 @@ pub mod nv12_reference;
 // dev-dependency (both rejected -- see this module's own doc).
 #[cfg(test)]
 mod nv12_oracle_tests;
+pub(crate) mod paint_order;
 pub mod pipelines;
 pub mod renderer;
 pub mod ring;
