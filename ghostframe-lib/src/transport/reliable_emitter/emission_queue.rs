@@ -4,14 +4,15 @@
 //! sources in the kernel UDP write window.
 
 use crate::transport::reliable_emitter::END_OF_STREAM_PARITY_FLUSH_MS;
+use bytes::Bytes;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub enum Emission {
-    Source(Vec<u8>),
-    Parity(Vec<u8>),
+    Source(Bytes),
+    Parity(Bytes),
 }
 
 pub struct EmissionQueue {
@@ -65,7 +66,7 @@ impl EmissionQueue {
         self.end_of_stream_idle_since = None;
     }
 
-    pub fn push_source(&mut self, bytes: Vec<u8>) {
+    pub fn push_source(&mut self, bytes: Bytes) {
         self.queue.push_back(Emission::Source(bytes));
         self.end_of_stream_idle_since = None;
     }
@@ -86,7 +87,7 @@ impl EmissionQueue {
                 break;
             }
             let Reverse((_, bytes)) = self.pending_parity.pop().unwrap();
-            self.queue.push_back(Emission::Parity(bytes));
+            self.queue.push_back(Emission::Parity(Bytes::from(bytes)));
         }
         // Check end-of-stream flush.
         self.maybe_flush_pending(now);
@@ -108,7 +109,7 @@ impl EmissionQueue {
         }
         // Flush every pending parity unconditionally.
         while let Some(Reverse((_, bytes))) = self.pending_parity.pop() {
-            self.queue.push_back(Emission::Parity(bytes));
+            self.queue.push_back(Emission::Parity(Bytes::from(bytes)));
         }
         self.end_of_stream_idle_since = None;
     }
@@ -132,8 +133,8 @@ mod tests {
     fn source_only_pops_in_order() {
         let mut q = EmissionQueue::new();
         let t = epoch();
-        q.push_source(vec![1]);
-        q.push_source(vec![2]);
+        q.push_source(Bytes::from_static(&[1]));
+        q.push_source(Bytes::from_static(&[2]));
         assert!(matches!(q.pop(2, t), Some(Emission::Source(_))));
         assert!(matches!(q.pop(2, t), Some(Emission::Source(_))));
         assert!(q.pop(2, t).is_none());
@@ -143,7 +144,7 @@ mod tests {
     fn parity_emits_after_offset_wire_seq() {
         let mut q = EmissionQueue::new();
         let t = epoch();
-        q.push_source(vec![0]); // wire_seq 0
+        q.push_source(Bytes::from_static(&[0])); // wire_seq 0
         q.schedule_parity(PARITY_INTERLEAVE_OFFSET, vec![0xAA]); // emit after wire_seq 20
                                                                  // next_wire_seq = 1 (allocator about to hand out 1): parity not yet
         let e = q.pop(1, t).unwrap();
