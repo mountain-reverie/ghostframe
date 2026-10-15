@@ -420,9 +420,9 @@ impl QuicServer {
         Self::build(datagram_send_buffer, Some(rng_seed), None)
     }
 
-    /// `new`, with the certificate clock injected. Tests only: the schedule
-    /// then rotates on the injected time, with no sleeping.
-    #[cfg(any(test, feature = "browserless-harness"))]
+    /// `new`, with the certificate clock injected, so a test can move the
+    /// rotation schedule without sleeping. Harmless in production: it only
+    /// decides when this process rotates its own certificate.
     pub fn new_with_cert_clock(
         clock: CertClock,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
