@@ -300,38 +300,39 @@ export class WebGpuRenderer {
     // Paint order is no longer fixed by codec: `planPaint` drops every
     // stateless entry a newer frame supersedes and fixes where the CDF53
     // lift and the H.264 draw sit relative to each other. See paint_order.ts.
+    // H.264 frames are only drawn when the pipeline exists; frames that are
+    // never drawn must not make planPaint drop tiles they would not cover.
+    const drawH264 = this.h264Pipeline !== null;
     const plan = planPaint({
       raw: this.rawQueue,
       solid: this.solidQueue,
       palRle: this.palRleQueue,
       cdf53: this.cdf53Queue,
-      h264Seqs: this.h264Seqs,
+      h264Seqs: drawH264 ? this.h264Seqs : [],
     });
-    this.palRleQueue = [];
-    this.rawQueue.length = 0;
-    this.h264Seqs.length = 0;
 
-    const solidCount = this.solidPipeline.packAndUpload(plan.solid);
-    this.solidQueue.length = 0;
-
-    const palRleCount = this.palrlePipeline.uploadBatch(plan.palRle);
-
-    // Upload the Cdf53 batch. The queue is cleared even if uploadBatch throws
-    // (capacity overflow after a long hidden-tab period): otherwise it keeps
-    // growing and every later tick throws again.
+    // Upload the Cdf53 batch first. The queues are cleared even if
+    // uploadBatch throws (capacity overflow after a long hidden-tab period):
+    // otherwise they keep growing and every later tick throws again. The
+    // H.264 queue and its seqs are left alone here so they stay index-aligned.
     let cdf53Count = 0;
     try {
       cdf53Count = this.cdf53Pipeline.uploadBatch(this.cdf53Queue);
     } finally {
       this.cdf53Queue.length = 0;
+      this.palRleQueue = [];
+      this.rawQueue.length = 0;
+      this.solidQueue.length = 0;
     }
+
+    const solidCount = this.solidPipeline.packAndUpload(plan.solid);
+    const palRleCount = this.palrlePipeline.uploadBatch(plan.palRle);
 
     let encoder = this.device.createCommandEncoder();
 
     // Drop queued H.264 frames if the browser doesn't support the
     // h264_blit shader (probed at startup). Warn once so the operator
     // sees why the stream looks frozen on Firefox.
-    const drawH264 = this.h264Pipeline !== null;
     if (!drawH264 && this.h264Queue.length > 0 && !this.h264DropWarned) {
       console.warn(
         `[renderer] dropping ${this.h264Queue.length} H.264 frame(s) -- pipeline unsupported on this browser`,
@@ -371,6 +372,7 @@ export class WebGpuRenderer {
     // frames so they don't leak GPU memory in the WebCodecs decoder.)
     this.videoFramesToClose.push(...this.h264Queue);
     this.h264Queue.length = 0;
+    this.h264Seqs.length = 0;
 
     // ---- Step 6: direct Raw uploads ----
     // `writeTexture` executes at the front of the next submit, i.e. BEFORE

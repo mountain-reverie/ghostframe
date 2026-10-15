@@ -160,6 +160,34 @@ describe('newest frame_seq wins a tile within one tick', () => {
     present();
     expect(tl.screen(0, 0)).toBe(6);
   });
+  it('older Solid does not survive under a newer H.264 frame, and does not cover it', () => {
+    r.pushSolid(solid(5));
+    r.pushH264(h264(6), 6);
+    present();
+    expect(tl.screen(0, 0)).toBe(6);
+  });
+  it('newer Raw lands after an older H.264 frame', () => {
+    r.pushH264(h264(5), 5);
+    r.pushRaw(raw(6));
+    present();
+    expect(tl.screen(0, 0)).toBe(6);
+  });
+  it('H.264 frames that cannot be drawn do not suppress tiles', () => {
+    (r as any).h264Pipeline = null;
+    r.pushSolid(solid(5));
+    r.pushH264(h264(6), 6);
+    present();
+    expect(tl.screen(0, 0)).toBe(5);
+  });
+  it('keeps h264Queue and h264Seqs aligned when the CDF53 upload throws', () => {
+    (r as any).cdf53Pipeline.uploadBatch = () => { throw new Error('capacity'); };
+    r.pushH264(h264(5), 5);
+    r.pushCdf53(cdf(6));
+    expect(() => present()).toThrow();
+    expect(r.h264Seqs).toEqual([5]);
+    expect(r.h264Queue).toHaveLength(1);
+    expect(r.cdf53Queue).toHaveLength(0);
+  });
   it('never drops a CDF53 pass, even one a newer frame supersedes', () => {
     let uploaded = 0;
     (r as any).cdf53Pipeline.uploadBatch = (t: unknown[]) => { uploaded = t.length; return t.length; };

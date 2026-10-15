@@ -527,6 +527,17 @@ async function main() {
     }
   }
 
+  // One throwing event must not discard the rest of its batch: the core has
+  // already accepted (and ACKed) those tiles, so a lost CDF53 pass would never
+  // be retransmitted.
+  function handleSafely(ev: WasmEvent): void {
+    try {
+      handleEvent(ev);
+    } catch (e) {
+      console.error('handleEvent failed; continuing', ev.kind, e);
+    }
+  }
+
   // M3.5 bench: per-frame_seq earliest tile-receive timestamp. Keyed by
   // frame_seq; cleared once the frame's paint has been recorded.
   const firstRecvMs = new Map<number, number>();
@@ -587,9 +598,13 @@ async function main() {
     // has to run and the next tick has to be scheduled).
     try {
       flushDatagrams();
-      for (const ev of core.onTimeout(nowUs())) handleEvent(ev);
     } catch (e) {
-      console.error('tick(): intake failed; continuing', e);
+      console.error('tick(): flushDatagrams failed; continuing', e);
+    }
+    try {
+      for (const ev of core.onTimeout(nowUs())) handleSafely(ev);
+    } catch (e) {
+      console.error('tick(): onTimeout failed; continuing', e);
     }
     drainTransmit().catch((e) => console.warn('tick(): drainTransmit failed', e));
 
@@ -673,7 +688,7 @@ async function main() {
     pendingDatagrams.length = 0;
     pendingArrivalsUs.length = 0;
 
-    for (const ev of core.handleDatagrams(concat, lens, arrivals) as WasmEvent[]) handleEvent(ev);
+    for (const ev of core.handleDatagrams(concat, lens, arrivals) as WasmEvent[]) handleSafely(ev);
 
     // Re-publish the datagram counters the e2e gates read off
     // `window.__ghostframeStats`.
@@ -734,7 +749,11 @@ async function main() {
     // Hidden tab: rAF is paused and timers are clamped to >= 1 s, so process
     // immediately (the pre-batching behaviour) to keep ACKs prompt.
     if (pendingDatagrams.length >= FLUSH_BACKLOG || document.hidden) {
-      flushDatagrams();
+      try {
+        flushDatagrams();
+      } catch (e) {
+        console.error('flushDatagrams failed; continuing', e);
+      }
     } else if (flushTimer === undefined) {
       flushTimer = setTimeout(flushDatagrams, FLUSH_FALLBACK_MS);
     }
