@@ -974,6 +974,8 @@ async fn iobridge_holds_scheduler_zero_sized_on_construction() {
 /// Verifies via `keyframe_pending()` that the call site flips the flag.
 #[tokio::test]
 async fn session_reconnect_requests_keyframe_on_existing_encoder() {
+    // Opening a real encoder drives the GPU: never beside other GPU tests.
+    let _gpu = crate::gpu_test_lock::lock();
     let (our_end, _peer) = UnixStream::pair().expect("pair");
     let server = QuicServer::new().expect("server");
     let (_tx, rx) = tokio::sync::mpsc::channel(1);
