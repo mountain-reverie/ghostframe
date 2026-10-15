@@ -17,6 +17,8 @@ pub mod capture;
 pub mod config;
 pub mod encoder;
 pub mod ffi;
+#[cfg(test)]
+pub(crate) mod gpu_test_lock;
 pub mod server;
 pub mod tile;
 pub mod transport;

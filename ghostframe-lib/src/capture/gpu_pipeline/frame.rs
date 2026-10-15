@@ -222,6 +222,8 @@ impl GpuFrameProcessor {
         height: u32,
         stride: u32,
     ) -> Result<FrameAnalysis, Box<dyn std::error::Error>> {
+        #[cfg(test)]
+        let _gpu = crate::gpu_test_lock::lock();
         // Capture the escalation count staged by set_escalation_candidates
         // (called by io_bridge before this frame), then immediately reset it to 0
         // so a caller that forgets set_escalation_candidates on the next frame
@@ -305,6 +307,8 @@ impl GpuFrameProcessor {
         height: u32,
         stride: u32,
     ) -> Result<FrameAnalysis, Box<dyn std::error::Error>> {
+        #[cfg(test)]
+        let _gpu = crate::gpu_test_lock::lock();
         // Reject bad input before any state changes (staged escalation count,
         // baseline, NV12 buffer): a rejected frame must cost nothing.
         if width == 0 || height == 0 {

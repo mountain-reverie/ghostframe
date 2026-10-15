@@ -2,26 +2,16 @@ use super::*;
 use crate::encoder::EncodedTile;
 use crate::transport::protocol::Codec as GfCodec;
 
-/// Serialises the VA-API tests against each other.
+/// Serialises everything in this test binary that drives the GPU.
 ///
-/// Each test in this module builds an `H264VaapiEncoder`, which allocates
-/// VA-API surfaces from DRM objects. Running five of them concurrently (plus
-/// the rest of a ~360-test suite competing for CPU) makes surface allocation
-/// fail intermittently with `Failed to create surface from DRM object: 2
-/// (resource allocation failed)`, surfacing as a bogus
-/// `assert!(!encoded.payload.is_empty())` panic. Measured before this lock:
-/// ~50% failure across full-suite runs, 100% pass in isolation.
-///
-/// The lock is only held while a test is actually using the encoder, so the
-/// rest of the suite still runs in parallel. Poisoning is ignored: a panic in
-/// one VA-API test must not cascade into spurious failures in the others,
-/// which would obscure the real failure.
-static VAAPI_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn lock_vaapi() -> std::sync::MutexGuard<'static, ()> {
-    VAAPI_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+/// Each test here builds an encoder, which allocates VA-API surfaces. Running
+/// them concurrently with each other (surface allocation fails intermittently
+/// with `Failed to create surface from DRM object: 2`) or with the Vulkan
+/// capture tests (a VCE VM fault during such a mix crashed the host on
+/// 2026-10-14) is not safe. This is the one lock `GpuFrameProcessor::new`
+/// also takes in test builds; it is reentrant per thread.
+fn lock_vaapi() -> crate::gpu_test_lock::GpuTestGuard {
+    crate::gpu_test_lock::lock()
 }
 
 #[test]
@@ -145,33 +135,8 @@ fn encode_multiple_frames_produces_smaller_p_frames() {
 // FullFrameEncoder tests
 // -----------------------------------------------------------------------
 
-/// Create a memfd of the given size, fill it with `fill_fn`, and return
-/// the raw file descriptor.  The caller is responsible for closing it.
-fn make_bgra_memfd(width: u32, height: u32, fill_fn: impl Fn(usize) -> [u8; 4]) -> RawFd {
-    use std::ffi::CString;
-    let name = CString::new("test_frame").unwrap();
-    let fd = unsafe { libc::syscall(libc::SYS_memfd_create, name.as_ptr(), 0) as RawFd };
-    assert!(fd >= 0, "memfd_create failed");
-
-    let stride = width * 4;
-    let total = (height * stride) as usize;
-    let mut buf = vec![0u8; total];
-    for (i, pixel) in buf.chunks_exact_mut(4).enumerate() {
-        let rgba = fill_fn(i);
-        pixel.copy_from_slice(&rgba);
-    }
-
-    // Write the buffer to the memfd.
-    let written = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, total) };
-    assert_eq!(written as usize, total, "write to memfd failed");
-    // Seek back to beginning so mmap can read from offset 0.
-    unsafe { libc::lseek(fd, 0, libc::SEEK_SET) };
-
-    fd
-}
-
 #[test]
-fn full_frame_encode_from_memfd() {
+fn dmabuf_real_full_frame_encode_from_dmabuf() {
     let _vaapi = lock_vaapi();
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -200,8 +165,15 @@ fn full_frame_encode_from_memfd() {
     assert_eq!(encoder.width(), width);
     assert_eq!(encoder.height(), height);
 
-    // Solid red BGRA pixels.
-    let fd = make_bgra_memfd(width, height, |_| [0, 0, 255, 255]);
+    // Solid red BGRA pixels in a REAL dma-buf (udmabuf), so
+    // `try_drm_prime_import` hands the VA driver what it is built for. A plain
+    // memfd is not a dma-buf and must never reach the hardware.
+    let dmabuf = crate::capture::gpu_pipeline::dmabuf_fixture::udmabuf_solid(
+        width,
+        height,
+        [0, 0, 255, 255],
+    );
+    let fd = dmabuf.raw();
 
     let stride = width * 4;
 
@@ -210,8 +182,6 @@ fn full_frame_encode_from_memfd() {
     let mut got_output = false;
     let mut got_keyframe = false;
     for _ in 0..3 {
-        // Re-seek before each encode call (mmap reads from beginning).
-        unsafe { libc::lseek(fd, 0, libc::SEEK_SET) };
         match encoder.encode_frame(fd, width, height, stride) {
             Ok(Some(encoded)) => {
                 assert!(
@@ -229,7 +199,7 @@ fn full_frame_encode_from_memfd() {
         }
     }
 
-    unsafe { libc::close(fd) };
+    drop(dmabuf);
 
     assert!(
         got_output,
@@ -254,16 +224,18 @@ fn full_frame_keyframe_interval() {
         }
     };
 
-    let fd = make_bgra_memfd(width, height, |_| [0, 255, 0, 255]); // solid green
-    let stride = width * 4;
+    // This test is about the GOP, so it feeds the production entry point
+    // (`encode_nv12_buffer`) with ordinary heap memory: no file descriptor is
+    // ever handed to the VA driver.
+    let nv12 = vec![128u8; (width * height * 3 / 2) as usize];
 
     let mut keyframe_pts: Vec<i64> = Vec::new();
     let mut output_idx: i64 = 0;
 
     // Encode 14 frames (more than one full GOP of 11).
     for _ in 0..14 {
-        unsafe { libc::lseek(fd, 0, libc::SEEK_SET) };
-        match encoder.encode_frame(fd, width, height, stride) {
+        match encoder.encode_nv12_buffer(nv12.as_ptr(), width, height, width, width, width * height)
+        {
             Ok(Some(encoded)) => {
                 assert!(!encoded.payload.is_empty());
                 if encoded.is_keyframe {
@@ -272,11 +244,9 @@ fn full_frame_keyframe_interval() {
                 output_idx += 1;
             }
             Ok(None) => {}
-            Err(e) => panic!("encode_frame failed: {e}"),
+            Err(e) => panic!("encode_nv12_buffer failed: {e}"),
         }
     }
-
-    unsafe { libc::close(fd) };
 
     eprintln!("keyframe output indices: {keyframe_pts:?}");
 

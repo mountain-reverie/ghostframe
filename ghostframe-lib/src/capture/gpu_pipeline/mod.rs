@@ -592,6 +592,11 @@ unsafe impl Send for GpuFrameProcessor {}
 impl GpuFrameProcessor {
     /// Create a new `GpuFrameProcessor` capable of tracking up to `max_tiles` tiles.
     pub fn new(max_tiles: u32) -> Result<Self, Box<dyn std::error::Error>> {
+        // Test builds: GPU use is mutually exclusive with the VA-API encoder
+        // tests, per call (never for the processor's lifetime: tests move
+        // processors between threads and tasks).
+        #[cfg(test)]
+        let _gpu = crate::gpu_test_lock::lock();
         unsafe { Self::new_inner(max_tiles) }
     }
 
@@ -710,6 +715,8 @@ impl GpuFrameProcessor {
 
 impl Drop for GpuFrameProcessor {
     fn drop(&mut self) {
+        #[cfg(test)]
+        let _gpu = crate::gpu_test_lock::lock();
         unsafe {
             self.device.device_wait_idle().ok();
 
